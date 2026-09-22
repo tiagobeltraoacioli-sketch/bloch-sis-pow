@@ -188,9 +188,9 @@ HARDENED=(
 
 # ── Resolve the pin ──────────────────────────────────────────────────────────
 # rustup only applies rust-toolchain.toml to invocations at or below its
-# directory; this script runs from the repo root, which has no pin, so the pin
-# has to be applied explicitly.
-TOOLCHAIN_FILE=crates/bloch-pos-node/rust-toolchain.toml
+# directory. Read the root pin explicitly so scoring never follows a drifting
+# runner default.
+TOOLCHAIN_FILE=rust-toolchain.toml
 CHANNEL="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
   "$TOOLCHAIN_FILE" 2>/dev/null | head -1)"
 if [ -z "$CHANNEL" ]; then
@@ -240,14 +240,17 @@ ratchet "bloch-pos-committee — Genesis-4 consensus, LIVE" \
 
 # No lib target: this crate is a binary. --bins, not --lib.
 ratchet "bloch-pos-node — the bloch-pos binary, LIVE" \
-  bloch-pos-node 8 0 0 --bins --no-deps
+  bloch-pos-node 1 0 0 --bins --no-deps
 
 # ── CLOSED: Genesis-3 ────────────────────────────────────────────────────────
+# 2026-09-17: strict shared snapshot-row decoding removes five unchecked
+# index/length operations; measured 200 (down from 205), same pinned compiler.
 ratchet "bloch — Genesis-3 consensus/pow/reorg, closed chain" \
-  bloch 59 205 0 --lib --no-deps --no-default-features --features node
+  bloch 59 200 0 --manifest-path legacy/genesis3-node/Cargo.toml --lib --no-deps --no-default-features --features node
 
+# 2026-09-17: checked wallet import indices remove three arithmetic findings.
 ratchet "bloch-crypto — tokenomics/emission/sighash" \
-  bloch-crypto 18 77 0 --lib --no-deps --all-features
+  bloch-crypto 17 74 0 --lib --no-deps --all-features
 
 ratchet "bloch-euvm — eUTXO VM, Genesis-3, never wired into Genesis-4" \
   bloch-euvm 0 30 0 --lib --no-deps

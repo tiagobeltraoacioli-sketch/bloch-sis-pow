@@ -1,0 +1,31 @@
+Validation wave 21 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Implementation: 725c029
+
+PASS
+
+cargo test --locked -p bloch-pos-committee --test spec_reconcile
+  9 passed, 0 failed, including TX-20 classification and all 30 published
+  component names/tag bytes.
+
+cargo test --locked -p bloch-pos-committee component_tags_are_pairwise_distinct
+  1 passed; the uniqueness check consumes STATE_COMPONENT_TAGS directly.
+
+cargo test --locked -p bloch-pos-committee --doc
+  2 passed, 0 failed.
+
+python3 scripts/check-comment-constants.py
+  430 files; 565 resolvable constants; 46 claims; 0 contradictions.
+
+bash scripts/ci-banned-words.sh
+  Passed.
+
+git diff --check
+  Passed before the implementation commit and before this evidence checkpoint.
+
+LIMIT
+
+The new registry names already-existing component constants. It does not
+change component bytes, tree folding, accepted blocks, activation schedules or
+fleet binaries. `StateRoots` remains source-compatible rather than being
+deleted or reshaped.

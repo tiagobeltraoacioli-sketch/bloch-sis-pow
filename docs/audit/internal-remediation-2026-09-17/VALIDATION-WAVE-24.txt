@@ -1,0 +1,28 @@
+Validation wave 24 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Implementation: 647c752
+
+PASS
+
+cargo test --locked -p bloch-pos-committee
+  624 passed, 0 failed, 6 ignored across library, integration and doc tests.
+  Includes:
+  - spec_reconcile: 10 passed
+  - wire_tag_registry: 9 passed
+  - doc tests: 2 passed
+
+python3 scripts/check-comment-constants.py
+  430 files; 565 resolvable constants; 46 claims; 0 contradictions.
+
+bash scripts/ci-banned-words.sh
+  Passed.
+
+git diff --check
+  Passed before the implementation commit.
+
+LIMIT
+
+The registry describes and guards the existing formats. It does not alter a
+domain tag, preimage, signature, transaction id, block id, state root,
+activation schedule or fleet binary. Shared legacy domains remain shared where
+changing them would require a coordinated protocol flag day.

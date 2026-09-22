@@ -186,14 +186,12 @@
 //!   validation, the canonical-address idempotency fix) are Genesis-3 code
 //!   that is not ported yet.
 //!
-//! - **The channel to the engine is unbounded.** During a cold sync the
-//!   in-flight ceiling is roughly `MAX_PAGES_WITHOUT_PROGRESS × MAX_SYNC_BLOCKS`
-//!   blocks per serving peer — a real bound, but a generous one (tens of MB),
-//!   and it is a bound on *memory*, not backpressure. Genesis-3 learned the
-//!   other side of this: a bounded channel that sheds under load dropped the
-//!   very sync replies the orphan pool was waiting on, in silence. Neither
-//!   answer is free; this one is chosen because a syncing node that stalls is
-//!   worse than one that is briefly fat, and it is named rather than assumed.
+//! - **The engine channel is admission-bounded before its first hop.** Source
+//!   reservations and a shared encoded-byte/event budget survive forwarding
+//!   through processing. Overload can shed a page; sync from the applied head
+//!   remains the recovery path, not a promise of lossless delivery. Directed
+//!   outgoing sync also shares one request window across all three callers.
+
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -218,6 +216,7 @@ use libp2p::{identify, identity, noise, yamux, PeerId, StreamProtocol, SwarmBuil
 pub use libp2p::Multiaddr;
 
 use crate::net::NetEvent;
+mod sync_requests;
 
 // ── Protocol identity: a Genesis-4 node must never speak to a Genesis-3 one ──
 
@@ -242,10 +241,13 @@ pub const TOPIC_TXS: &str = "bloch-g4/txs/1";
 
 // ── Bounds that are load-bearing, each pinned by an assertion ────────────────
 
-/// Largest gossip frame. A block with the full validator set attesting is
-/// dominated by hybrid signatures (~4.6 KB each), so this is generous rather
-/// than tight; `codec::MAX_FIELD_LEN` (8 MiB) remains the decoder's own cap.
+/// Largest gossip frame. This is smaller than the maximum consensus-valid
+/// body; local producers therefore pack to MAX_PROPOSAL_ENVELOPE_BYTES.
+/// Increasing receive limits or supporting older oversized blocks needs a
+/// separately qualified transport migration, not a consensus gate change.
 pub const MAX_GOSSIP_BYTES: usize = 4 * 1024 * 1024;
+/// Producer payload allowance with room for topic/author/transport framing.
+pub(crate) const MAX_PROPOSAL_ENVELOPE_BYTES: usize = MAX_GOSSIP_BYTES.saturating_sub(1024);
 
 /// Gossipsub's duplicate-cache retention. See [`REGOSSIP_SUPPRESS_TTL`].
 pub const DUPLICATE_CACHE_TIME: Duration = Duration::from_secs(30);
@@ -260,10 +262,22 @@ pub const DUPLICATE_CACHE_TIME: Duration = Duration::from_secs(30);
 /// against a 30 s cache and measured exactly that.
 pub const REGOSSIP_SUPPRESS_TTL: Duration = Duration::from_secs(30);
 
+/// Maximum distinct block IDs retained solely to suppress local re-gossip.
+/// At capacity, a new ID is treated as fresh but not remembered: hostile
+/// churn cannot displace already-retained suppression state.
+const RECENT_BLOCKS_MAX: usize = 4_096;
+
 const _: () = assert!(
     REGOSSIP_SUPPRESS_TTL.as_secs() >= DUPLICATE_CACHE_TIME.as_secs(),
     "re-gossip suppression shorter than the duplicate cache is pure waste"
 );
+
+#[cfg(test)]
+std::thread_local! {
+    /// Test-only proof that the expiry hint skips premature full-map scans.
+    static RECENT_BLOCK_EXPIRY_SCANS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Concurrent request-response substreams per connection before new inbound
 /// streams are dropped. libp2p's default is 100; a node catching up opens a
@@ -333,11 +347,10 @@ const MAX_PAGES_WITHOUT_PROGRESS: u32 = 64;
 /// how many a well-formed identify message may carry. Without a bound, one
 /// peer advertising many addresses — or many short-lived peers advertising a
 /// few each — grows this map for the life of the process. "A few hundred" is
-/// generous headroom over any real deployment: `--max-peers` defaults to 64
-/// connected peers, so 512 is 8 addresses remembered per peer at the current
-/// default, and the map is ALSO pruned of a peer's own entries the moment its
-/// last connection closes (`Loop::forget_peer`), so a stable mesh never gets
-/// close to the cap at all.
+/// generous headroom over the default connected-peer count and allows several
+/// remembered addresses per peer. The map is ALSO pruned of a peer's own
+/// entries the moment its last connection closes (`Loop::forget_peer`), so a
+/// stable mesh never gets close to the cap at all.
 const MAX_DIALED_ADDRS: usize = 512;
 
 // ── What one peer may make this node do (the serving side) ──────────────────
@@ -543,12 +556,48 @@ const REDIAL_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug, Default)]
 pub struct Origin {
     inner: Option<(MessageId, PeerId)>,
+    /// The peer and advertised slot for a block awaiting the engine's
+    /// admission verdict. Unlike `inner`, this is also present for directed
+    /// sync responses, which have no gossipsub message id.
+    block_hint: Option<(PeerId, u64)>,
+    reservation: Option<Arc<crate::net::SourceReservation>>,
 }
 
 impl Origin {
+    pub(crate) fn set_reservation(&mut self, guard: Arc<crate::net::SourceReservation>) {
+        self.reservation = Some(guard);
+    }
+
+    /// Opaque transport admission identity used only for node-local expensive
+    /// work fairness. Devnet contributes its normalized IP; libp2p contributes
+    /// its authenticated peer id through the same reservation type.
+    pub(crate) fn verification_source(&self) -> Option<[u8; 32]> {
+        self.reservation.as_ref().map(|guard| guard.verification_source())
+    }
+
+    /// Exact wire charge retained by the transport reservation after
+    /// canonical decoding. `None` is local/source-free work, which falls back
+    /// to computing its canonical size at queue admission.
+    pub(crate) fn reserved_bytes(&self) -> Option<usize> {
+        self.reservation.as_ref().map(|guard| guard.bytes())
+    }
+
     /// No provenance: devnet transport, or a message this node produced.
     pub fn none() -> Self {
-        Origin { inner: None }
+        Origin {
+            inner: None,
+            block_hint: None,
+            reservation: None,
+        }
+    }
+
+    /// A directed-sync block has peer provenance but no gossipsub message id.
+    fn sync_block(peer: PeerId, slot: u64) -> Self {
+        Origin {
+            inner: None,
+            block_hint: Some((peer, slot)),
+            reservation: None,
+        }
     }
 }
 
@@ -605,12 +654,16 @@ const SYNC_TAG_GET_BLOCKS: u8 = 0x01;
 const SYNC_TAG_BLOCKS: u8 = 0x01;
 
 pub fn encode_sync_request(req: &SyncRequest) -> Vec<u8> {
+    sync_request_bytes(req).to_vec()
+}
+
+fn sync_request_bytes(req: &SyncRequest) -> [u8; 13] {
     match req {
         SyncRequest::GetBlocks { after_slot, limit } => {
-            let mut out = Vec::with_capacity(13);
-            out.push(SYNC_TAG_GET_BLOCKS);
-            out.extend_from_slice(&after_slot.to_le_bytes());
-            out.extend_from_slice(&limit.to_le_bytes());
+            let mut out = [0u8; 13];
+            out[0] = SYNC_TAG_GET_BLOCKS;
+            out[1..9].copy_from_slice(&after_slot.to_le_bytes());
+            out[9..13].copy_from_slice(&limit.to_le_bytes());
             out
         }
     }
@@ -668,7 +721,8 @@ pub fn decode_sync_response(buf: &[u8]) -> Result<SyncResponse, crate::codec::De
 }
 
 /// Delimited-by-EOF codec: request-response opens a fresh substream per
-/// message and closes the write half, so `read_to_end` frames it exactly.
+/// message and closes the write half, so a sentinel read after the declared
+/// fields distinguishes the exact message from `encode(x) || junk`.
 #[derive(Clone, Default)]
 pub struct SyncCodec;
 
@@ -682,16 +736,14 @@ impl RrCodec for SyncCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let buf = read_capped(io).await?;
-        decode_sync_request(&buf).map_err(bad_data)
+        read_sync_request(io).await
     }
 
     async fn read_response<T>(&mut self, _: &StreamProtocol, io: &mut T) -> io::Result<SyncResponse>
     where
         T: AsyncRead + Unpin + Send,
     {
-        let buf = read_capped(io).await?;
-        decode_sync_response(&buf).map_err(bad_data)
+        read_sync_response(io).await
     }
 
     async fn write_request<T>(
@@ -703,7 +755,7 @@ impl RrCodec for SyncCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        io.write_all(&encode_sync_request(&req)).await
+        write_sync_request(io, &req).await
     }
 
     async fn write_response<T>(
@@ -715,20 +767,122 @@ impl RrCodec for SyncCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        io.write_all(&encode_sync_response(&resp)).await
+        write_sync_response(io, resp).await
     }
 }
 
-async fn read_capped<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    // `take(cap)` manufactures EOF at the cap. A valid cap-sized prefix
-    // followed by junk would therefore decode successfully. Read one sentinel
-    // byte so only actual EOF can terminate an accepted frame.
-    io.take(MAX_SYNC_FRAME + 1).read_to_end(&mut buf).await?;
-    if buf.len() as u64 > MAX_SYNC_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "sync frame over byte cap"));
+async fn read_sync_request<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<SyncRequest> {
+    let mut bytes = [0u8; 13];
+    read_sync_exact(io, &mut bytes).await?;
+    let mut sentinel = [0u8; 1];
+    match io.read(&mut sentinel).await {
+        Ok(0) => decode_sync_request(&bytes).map_err(bad_data),
+        Ok(_) => Err(bad_data(crate::codec::DecodeErr("trailing bytes"))),
+        Err(e) => Err(e),
     }
-    Ok(buf)
+}
+
+async fn write_sync_request<T: AsyncWrite + Unpin + Send>(
+    io: &mut T,
+    request: &SyncRequest,
+) -> io::Result<()> {
+    io.write_all(&sync_request_bytes(request)).await
+}
+
+async fn write_sync_response<T>(io: &mut T, resp: SyncResponse) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+{
+    let SyncResponse::Blocks { envelopes } = resp;
+    let envelope_count = sync_wire_len(envelopes.len())?;
+    // Validate every fixed-width wire length before emitting the header. A
+    // directly constructed impossible response must fail without leaving a
+    // predictable partial response on the substream.
+    for envelope in &envelopes {
+        sync_wire_len(envelope.len())?;
+    }
+    let mut header = [0u8; 5];
+    header[0] = SYNC_TAG_BLOCKS;
+    header[1..].copy_from_slice(&envelope_count.to_le_bytes());
+    io.write_all(&header).await?;
+    for envelope in envelopes {
+        let envelope_len = sync_wire_len(envelope.len())?;
+        io.write_all(&envelope_len.to_le_bytes()).await?;
+        io.write_all(&envelope).await?;
+    }
+    Ok(())
+}
+
+fn sync_wire_len(len: usize) -> io::Result<u32> {
+    u32::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "sync field length exceeds u32"))
+}
+
+async fn read_sync_response<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<SyncResponse> {
+    let mut header = [0u8; 5];
+    read_sync_exact(io, &mut header).await?;
+    if header[0] != SYNC_TAG_BLOCKS {
+        return Err(bad_data(crate::codec::DecodeErr("unknown sync response tag")));
+    }
+    let count = u32::from_le_bytes(header[1..5].try_into().map_err(|_| {
+        bad_data(crate::codec::DecodeErr("truncated"))
+    })?) as usize;
+    if count > MAX_SYNC_BLOCKS {
+        return Err(bad_data(crate::codec::DecodeErr(
+            "sync response over the block cap",
+        )));
+    }
+
+    let mut wire_bytes = header.len() as u64;
+    let mut envelopes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut len4 = [0u8; 4];
+        read_sync_exact(io, &mut len4).await?;
+        wire_bytes = wire_bytes.checked_add(len4.len() as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "sync frame length overflow")
+        })?;
+        let len = u32::from_le_bytes(len4) as usize;
+        if len > crate::codec::MAX_FIELD_LEN {
+            return Err(bad_data(crate::codec::DecodeErr("length over cap")));
+        }
+        let frame_end = wire_bytes.checked_add(len as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "sync frame length overflow")
+        })?;
+        // Refuse a declared over-cap field before allocating or reading it.
+        if frame_end > MAX_SYNC_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sync frame over byte cap",
+            ));
+        }
+        let mut envelope = vec![0u8; len];
+        read_sync_exact(io, &mut envelope).await?;
+        wire_bytes = frame_end;
+        envelopes.push(envelope);
+    }
+
+    // Request-response frames by EOF. Reading one sentinel after the declared
+    // fields keeps `encode(x) || junk` invalid, including when `x` occupies
+    // exactly MAX_SYNC_FRAME bytes.
+    let mut sentinel = [0u8; 1];
+    match io.read(&mut sentinel).await {
+        Ok(0) => Ok(SyncResponse::Blocks { envelopes }),
+        Ok(_) => Err(bad_data(crate::codec::DecodeErr("trailing bytes"))),
+        Err(e) => Err(e),
+    }
+}
+
+async fn read_sync_exact<T: AsyncRead + Unpin + Send>(
+    io: &mut T,
+    bytes: &mut [u8],
+) -> io::Result<()> {
+    io.read_exact(bytes).await.map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            bad_data(crate::codec::DecodeErr("truncated"))
+        } else {
+            e
+        }
+    })
 }
 
 fn bad_data(e: crate::codec::DecodeErr) -> io::Error {
@@ -873,6 +1027,10 @@ enum Command {
     /// A typed frame from the engine (`net::FRAME_*` byte, then payload),
     /// routed to a topic or to the directed-sync path by that byte.
     Broadcast(Vec<u8>),
+    /// A local block whose bytes and suppression id were derived together.
+    BroadcastBlock(crate::net::PreparedBlockBroadcast),
+    /// One admitted transaction whose canonical payload is already owned.
+    BroadcastTransaction(crate::net::PreparedTransactionBroadcast),
     /// The engine's verdict on a gossip message it was handed.
     Report(Origin, Verdict),
 }
@@ -887,6 +1045,9 @@ pub struct Handle {
     /// than asked for, because the RPC thread must not block on the swarm's
     /// command channel to answer a status question.
     peers_live: Arc<AtomicUsize>,
+    /// One confirmed bound address per requested listener. In particular, a
+    /// caller that requested `/tcp/0` gets the kernel-selected port here.
+    listen_addrs: Vec<Multiaddr>,
 }
 
 impl Handle {
@@ -896,6 +1057,17 @@ impl Handle {
         let _ = self.cmd.send(Command::Broadcast(frame));
     }
 
+    pub(crate) fn broadcast_block(&self, prepared: crate::net::PreparedBlockBroadcast) {
+        let _ = self.cmd.send(Command::BroadcastBlock(prepared));
+    }
+
+    pub(crate) fn broadcast_transaction(
+        &self,
+        prepared: crate::net::PreparedTransactionBroadcast,
+    ) {
+        let _ = self.cmd.send(Command::BroadcastTransaction(prepared));
+    }
+
     /// Peers with a live connection right now. `0` on a swarm that is bound
     /// and that nobody has reached — the state a node on the wrong transport
     /// sits in while its log says `applied` and `finalized`.
@@ -903,10 +1075,16 @@ impl Handle {
         self.peers_live.load(Ordering::Acquire)
     }
 
+    /// One address per listener, confirmed by libp2p's `NewListenAddr` event
+    /// before [`start`] returned.
+    pub fn listen_addrs(&self) -> &[Multiaddr] {
+        &self.listen_addrs
+    }
+
     /// Report the engine's decision on a gossip message. A no-op for an
     /// [`Origin::none`].
     pub fn report(&self, origin: &Origin, verdict: Verdict) {
-        if origin.inner.is_some() {
+        if origin.inner.is_some() || origin.block_hint.is_some() {
             let _ = self.cmd.send(Command::Report(origin.clone(), verdict));
         }
     }
@@ -943,12 +1121,7 @@ fn load_or_create_identity(path: &std::path::Path) -> io::Result<identity::Keypa
             let bytes = kp
                 .to_protobuf_encoding()
                 .map_err(|e| io::Error::other(format!("p2p identity: {e}")))?;
-            std::fs::write(path, &bytes)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-            }
+            crate::store::atomic_private_write(path, &bytes)?;
             Ok(kp)
         }
         Err(e) => Err(e),
@@ -965,13 +1138,15 @@ pub fn start(
     cfg: Config,
     events: EngineSender<NetEvent>,
     head_slot: Arc<AtomicU64>,
+    budget: Arc<crate::net::QueueBudget>,
 ) -> io::Result<Handle> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     let keypair = load_or_create_identity(&cfg.data_dir.join("p2p_identity.bin"))?;
     let peer_id = PeerId::from(keypair.public());
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<()>>();
+    let (ready_tx, ready_rx) =
+        std::sync::mpsc::channel::<io::Result<Vec<Multiaddr>>>();
     let peers_live = Arc::new(AtomicUsize::new(0));
     let peers_live_swarm = peers_live.clone();
 
@@ -985,9 +1160,19 @@ pub fn start(
         };
         rt.block_on(async move {
             match build_swarm(&keypair, &cfg) {
-                Ok(swarm) => {
-                    let _ = ready_tx.send(Ok(()));
-                    run_swarm(swarm, cfg, cmd_rx, events, head_slot, peers_live_swarm).await;
+                Ok((swarm, listeners)) => {
+                    run_swarm(
+                        swarm,
+                        cfg,
+                        cmd_rx,
+                        events,
+                        head_slot,
+                        peers_live_swarm,
+                        budget,
+                        ready_tx,
+                        listeners,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -997,7 +1182,7 @@ pub fn start(
     })?;
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(Handle { cmd: cmd_tx, peer_id, peers_live }),
+        Ok(Ok(listen_addrs)) => Ok(Handle { cmd: cmd_tx, peer_id, peers_live, listen_addrs }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::other("p2p thread died before it started")),
     }
@@ -1005,14 +1190,17 @@ pub fn start(
 
 type Swarm = libp2p::Swarm<G4Behaviour>;
 
-fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
+type ListenerId = libp2p::core::transport::ListenerId;
+
+fn build_swarm(
+    keypair: &identity::Keypair,
+    cfg: &Config,
+) -> io::Result<(Swarm, Vec<ListenerId>)> {
     let gs_cfg = gossipsub_config().map_err(io::Error::other)?;
     let mut gs = gossipsub::Behaviour::new(MessageAuthenticity::Signed(keypair.clone()), gs_cfg)
         .map_err(|e| io::Error::other(format!("gossipsub: {e}")))?;
     if let Err(e) = gs.with_peer_score(peer_score_params(cfg.behind_proxy), peer_score_thresholds()) {
-        // Non-fatal, but say it: with scoring off, every `Reject` this node
-        // reports is log-only and a hostile peer pays nothing.
-        eprintln!("p2p: peer scoring DISABLED ({e}) — rejections carry no penalty");
+        return Err(io::Error::other(format!("peer scoring configuration failed: {e}")));
     }
 
     let max_peers = cfg.max_peers as u32;
@@ -1059,24 +1247,36 @@ fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
             .subscribe(&IdentTopic::new(t))
             .map_err(|e| io::Error::other(format!("subscribe {t}: {e}")))?;
     }
+    let mut listeners = Vec::with_capacity(cfg.listen.len());
     for addr in &cfg.listen {
-        swarm.listen_on(addr.clone()).map_err(|e| io::Error::other(e.to_string()))?;
+        listeners.push(
+            swarm
+                .listen_on(addr.clone())
+                .map_err(|e| io::Error::other(e.to_string()))?,
+        );
     }
-    Ok(swarm)
+    Ok((swarm, listeners))
 }
 
 /// State the swarm loop owns.
 struct Loop {
+    outgoing_sync: sync_requests::Requests,
+    budget: Arc<crate::net::QueueBudget>,
     events: EngineSender<NetEvent>,
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
-    /// Highest block slot each peer has been seen forwarding. A relayer holds
-    /// what it relays, so this is a sound (if conservative) hint for choosing
-    /// who to ask for missing blocks.
+    /// Height hints from blocks the engine admitted. An admitted block is not
+    /// proof of canonical progress, so one sync slot still ignores these
+    /// claims and rotates across the connected set.
     peer_head: HashMap<PeerId, u64>,
+    sync_rotation: usize,
     /// Blocks published or received within [`REGOSSIP_SUPPRESS_TTL`]. Pruned
     /// on insert, so it stays bounded by the TTL and not by uptime.
     recent_blocks: HashMap<[u8; 32], Instant>,
+    /// Conservative lower bound on the oldest retained timestamp. Refreshing
+    /// an ID may leave this stale and early, causing one harmless extra scan;
+    /// insertion and a completed scan ensure it is never later than reality.
+    recent_blocks_expiry_hint: Option<Instant>,
     /// Full sync pages chased since the engine's applied head last moved,
     /// PER PEER (R1 A3-M3 — see [`MAX_PAGES_WITHOUT_PROGRESS`]). Evicted on
     /// disconnect by [`Loop::forget_peer`], so identity churn cannot grow
@@ -1126,14 +1326,79 @@ struct Topics {
 }
 
 impl Loop {
-    fn note_block(&mut self, id: [u8; 32]) -> bool {
-        let now = Instant::now();
-        self.recent_blocks.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
-        self.recent_blocks.insert(id, now).is_none()
+    /// Update the height preference only after the engine has admitted the
+    /// block. Decoding an envelope is deliberately insufficient: otherwise a
+    /// peer can steer two sync fanout slots with an arbitrary header slot.
+    fn note_block_verdict(&mut self, peer: PeerId, slot: u64, verdict: Verdict) {
+        if verdict != Verdict::Accept {
+            return;
+        }
+        let e = self.peer_head.entry(peer).or_insert(0);
+        *e = (*e).max(slot);
     }
 
-    fn emit(&self, ev: NetEvent) -> bool {
-        self.events.send(ev).is_ok()
+    fn note_block(&mut self, id: [u8; 32]) -> bool {
+        self.note_block_at(id, Instant::now())
+    }
+
+    /// Record one block at an explicit instant so expiry behavior is
+    /// deterministic under test. Production supplies only `Instant::now()`.
+    fn note_block_at(&mut self, id: [u8; 32], now: Instant) -> bool {
+        if self
+            .recent_blocks_expiry_hint
+            .is_some_and(|oldest| {
+                now.saturating_duration_since(oldest) >= REGOSSIP_SUPPRESS_TTL
+            })
+        {
+            #[cfg(test)]
+            RECENT_BLOCK_EXPIRY_SCANS.with(|scans| scans.set(scans.get().saturating_add(1)));
+
+            let mut next_oldest: Option<Instant> = None;
+            self.recent_blocks.retain(|_, timestamp| {
+                let keep = now.saturating_duration_since(*timestamp) < REGOSSIP_SUPPRESS_TTL;
+                if keep {
+                    next_oldest = Some(
+                        next_oldest.map_or(*timestamp, |oldest| oldest.min(*timestamp)),
+                    );
+                }
+                keep
+            });
+            self.recent_blocks_expiry_hint = next_oldest;
+        }
+
+        let at_capacity = self.recent_blocks.len() >= RECENT_BLOCKS_MAX;
+        let fresh = match self.recent_blocks.entry(id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(now);
+                false
+            }
+            std::collections::hash_map::Entry::Vacant(_) if at_capacity => {
+                // Suppression is an optimization, not an admission verdict.
+                // Drop-new preserves retained work and lets the unchanged
+                // publish path decide how to handle this unremembered ID.
+                return true;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(now);
+                true
+            }
+        };
+        self.recent_blocks_expiry_hint = Some(
+            self.recent_blocks_expiry_hint
+                .map_or(now, |oldest| oldest.min(now)),
+        );
+        fresh
+    }
+
+    fn emit(&self, mut ev: NetEvent, peer: PeerId) -> Option<bool> {
+        // Gossip reserves from its bounded frame length before decoding. Sync
+        // responses arrive already decoded, so they reserve here instead.
+        if !has_source_reservation(&ev)
+            && !self.budget.admit_peer(&mut ev, peer.to_bytes())
+        {
+            return None;
+        }
+        Some(self.events.send(ev).is_ok())
     }
 
     /// May this node chase another full page FROM `peer`? Advancing the
@@ -1188,6 +1453,7 @@ impl Loop {
     /// `SwarmEvent`, and so a future new per-peer map has exactly one place
     /// to be wired into disconnect cleanup.
     fn forget_peer(&mut self, peer: &PeerId) {
+        self.outgoing_sync.forget(peer);
         self.peer_head.remove(peer);
         self.chase.remove(peer);
         self.sync_limiter.forget(peer);
@@ -1204,13 +1470,20 @@ async fn run_swarm(
     events: EngineSender<NetEvent>,
     head_slot: Arc<AtomicU64>,
     peers_live: Arc<AtomicUsize>,
+    budget: Arc<crate::net::QueueBudget>,
+    ready_tx: std::sync::mpsc::Sender<io::Result<Vec<Multiaddr>>>,
+    listeners: Vec<ListenerId>,
 ) {
     let mut st = Loop {
+        outgoing_sync: sync_requests::Requests::default(),
+        budget,
         events,
         data_dir: cfg.data_dir.clone(),
         head_slot,
         peer_head: HashMap::new(),
+        sync_rotation: 0,
         recent_blocks: HashMap::new(),
+        recent_blocks_expiry_hint: None,
         chase: HashMap::new(),
         dialed: HashMap::new(),
         dialed_order: VecDeque::new(),
@@ -1222,6 +1495,22 @@ async fn run_swarm(
         },
         peers_live,
     };
+
+    // `listen_on` only queues a bind. Keep processing every swarm event while
+    // waiting for the corresponding NewListenAddr events so a connection on
+    // an already-bound listener cannot disappear from peer bookkeeping while
+    // a second listener is still coming up.
+    let mut ready = Some((
+        ready_tx,
+        listeners,
+        vec![None; cfg.listen.len()],
+    ));
+    if cfg.listen.is_empty() {
+        let Some((tx, _, _)) = ready.take() else { return };
+        let _ = tx.send(Ok(Vec::new()));
+    }
+    let ready_timeout = tokio::time::sleep(Duration::from_secs(30));
+    tokio::pin!(ready_timeout);
 
     // A node's own listen address commonly appears in a peer list that was
     // written once and handed to every node in a fleet. Dialling yourself is
@@ -1250,9 +1539,55 @@ async fn run_swarm(
     loop {
         tokio::select! {
             ev = swarm.select_next_some() => {
+                let mut startup_error = None;
+                let mut startup_complete = false;
+                if let Some((_, listener_ids, addresses)) = ready.as_mut() {
+                    match &ev {
+                        SwarmEvent::NewListenAddr { listener_id, address } => {
+                            if let Some(at) = listener_ids.iter().position(|id| id == listener_id) {
+                                if addresses[at].is_none() {
+                                    addresses[at] = Some(address.clone());
+                                    startup_complete = addresses.iter().all(Option::is_some);
+                                }
+                            }
+                        }
+                        SwarmEvent::ListenerError { listener_id, error }
+                            if listener_ids.contains(listener_id) =>
+                        {
+                            // Non-fatal by libp2p's contract. ListenerClosed
+                            // or the bounded timeout below decides startup.
+                            eprintln!("p2p: listener error before ready ({listener_id:?}): {error}");
+                        }
+                        SwarmEvent::ListenerClosed { listener_id, reason, .. }
+                            if listener_ids.contains(listener_id) =>
+                        {
+                            startup_error = Some(match reason {
+                                Ok(()) => format!("p2p listener {listener_id:?} closed before binding"),
+                                Err(e) => format!("p2p listener {listener_id:?} failed to bind: {e}"),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                if startup_complete {
+                    let Some((tx, _, addresses)) = ready.take() else { return };
+                    let _ = tx.send(Ok(addresses.into_iter().flatten().collect()));
+                } else if let Some(error) = startup_error {
+                    let Some((tx, _, _)) = ready.take() else { return };
+                    let _ = tx.send(Err(io::Error::other(error)));
+                    return;
+                }
                 if !handle_swarm_event(&mut swarm, &mut st, &resp_tx, ev) {
                     return; // engine gone
                 }
+            }
+            _ = &mut ready_timeout, if ready.is_some() => {
+                let Some((tx, _, _)) = ready.take() else { return };
+                let _ = tx.send(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "p2p listener did not bind within 30s",
+                )));
+                return;
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
@@ -1301,6 +1636,11 @@ fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
 fn handle_command(swarm: &mut Swarm, st: &mut Loop, cmd: Command) {
     match cmd {
         Command::Report(origin, verdict) => {
+            if let Some((source, slot)) = origin.block_hint {
+                if swarm.is_connected(&source) {
+                    st.note_block_verdict(source, slot, verdict);
+                }
+            }
             if let Some((msg_id, source)) = origin.inner {
                 swarm
                     .behaviour_mut()
@@ -1308,46 +1648,90 @@ fn handle_command(swarm: &mut Swarm, st: &mut Loop, cmd: Command) {
                     .report_message_validation_result(&msg_id, &source, verdict.into());
             }
         }
-        Command::Broadcast(frame) => {
-            let Some((&tag, payload)) = frame.split_first() else { return };
-            match tag {
-                crate::net::FRAME_BLOCK => {
-                    // Re-gossip suppression. A block this node produced has a
-                    // content hash nobody has seen, so its own announcement is
-                    // never suppressed; a block that arrived on the mesh in the
-                    // last TTL would be refused by gossipsub's duplicate cache
-                    // anyway, after paying the hash of the whole body.
-                    if let Ok(env) = crate::codec::decode_envelope(payload) {
-                        let id = *env.block_id().as_bytes();
-                        if !st.note_block(id) {
-                            return;
-                        }
-                    }
-                    publish(swarm, st.topics.blocks.clone(), payload.to_vec(), "blocks");
-                }
-                crate::net::FRAME_ATT => {
-                    publish(swarm, st.topics.attestations.clone(), payload.to_vec(), "attestations");
-                }
-                crate::net::FRAME_TX => {
-                    publish(swarm, st.topics.txs.clone(), payload.to_vec(), "txs");
-                }
-                crate::net::FRAME_GET_BLOCKS => {
-                    if payload.len() != 8 {
-                        return;
-                    }
-                    // `payload.len() != 8` already returned above, so this
-                    // conversion cannot fail; the `else` arm keeps it
-                    // panic-free by construction rather than by an `unwrap`.
-                    let Ok(after_bytes) = payload.try_into() else {
-                        return;
-                    };
-                    let after = u64::from_le_bytes(after_bytes);
-                    request_blocks(swarm, st, after);
-                }
-                _ => {}
+        Command::Broadcast(frame) => handle_broadcast(swarm, st, frame),
+        Command::BroadcastBlock(prepared) => {
+            let id = prepared.id();
+            if let Some(payload) =
+                prepared_block_payload_if_fresh(st, prepared.into_payload(), id)
+            {
+                publish(swarm, st.topics.blocks.clone(), payload, "blocks");
             }
         }
+        Command::BroadcastTransaction(prepared) => {
+            publish(
+                swarm,
+                st.topics.txs.clone(),
+                prepared.into_payload(),
+                "txs",
+            );
+        }
     }
+}
+
+fn handle_broadcast(
+    swarm: &mut Swarm,
+    st: &mut Loop,
+    frame: Vec<u8>,
+) {
+    let Some((&tag, payload)) = frame.split_first() else { return };
+    match tag {
+        crate::net::FRAME_BLOCK => {
+            // Re-gossip suppression. A block this node produced has a
+            // content hash nobody has seen, so its own announcement is
+            // never suppressed; a block that arrived on the mesh in the
+            // last TTL would be refused by gossipsub's duplicate cache
+            // anyway, after paying the hash of the whole body.
+            if !outbound_block_is_fresh(st, payload, None) {
+                return;
+            }
+            publish(swarm, st.topics.blocks.clone(), payload.to_vec(), "blocks");
+        }
+        crate::net::FRAME_ATT => {
+            publish(swarm, st.topics.attestations.clone(), payload.to_vec(), "attestations");
+        }
+        crate::net::FRAME_TX => {
+            publish(swarm, st.topics.txs.clone(), payload.to_vec(), "txs");
+        }
+        crate::net::FRAME_GET_BLOCKS => {
+            if payload.len() != 8 {
+                return;
+            }
+            // `payload.len() != 8` already returned above, so this conversion
+            // cannot fail; the `else` arm keeps it panic-free by construction
+            // rather than by an `unwrap`.
+            let Ok(after_bytes) = payload.try_into() else { return };
+            let after = u64::from_le_bytes(after_bytes);
+            request_blocks(swarm, st, after);
+        }
+        _ => {}
+    }
+}
+
+/// Consume the canonical payload carried by the private typed command. A
+/// fresh block returns the same allocation for direct handoff to gossipsub;
+/// suppression drops it without exposing a raw frame/id pairing API.
+fn prepared_block_payload_if_fresh(
+    st: &mut Loop,
+    payload: Vec<u8>,
+    id: [u8; 32],
+) -> Option<Vec<u8>> {
+    outbound_block_is_fresh(st, &payload, Some(id)).then_some(payload)
+}
+
+/// Apply outbound block suppression. Local production supplies the id already
+/// bound to the encoded bytes by `PreparedBlockBroadcast`; the generic frame
+/// API retains its historical best-effort decode and malformed-frame publish.
+fn outbound_block_is_fresh(
+    st: &mut Loop,
+    payload: &[u8],
+    prepared_block_id: Option<[u8; 32]>,
+) -> bool {
+    let id = prepared_block_id.or_else(|| {
+        crate::codec::decode_envelope(payload)
+            .ok()
+            .map(|env| *env.block_id().as_bytes())
+    });
+    id.map_or(true, |id| st.note_block(id))
 }
 
 /// Per-message wire tracing, off unless `BLOCH_P2P_TRACE` is set.
@@ -1375,26 +1759,52 @@ fn publish(swarm: &mut Swarm, topic: IdentTopic, data: Vec<u8>, name: &str) {
     }
 }
 
-/// Direct a `get-blocks` at the peers most likely to hold what we are missing.
-///
-/// Not a broadcast: the Genesis-3 root cause was exactly that, and it produced
-/// O(peers × blocks) amplification that stalled the chain. Not a single peer
-/// either — a silent one would stall recovery — so [`SYNC_FANOUT`] peers,
-/// preferring the highest observed head.
-fn request_blocks(swarm: &mut Swarm, st: &Loop, after_slot: u64) {
-    let mut peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
-    if peers.is_empty() {
-        return;
-    }
-    peers.sort_by_key(|p| {
-        // Descending by observed head, then by PeerId so ties are stable and
-        // the choice is not a function of HashMap iteration order.
-        (std::cmp::Reverse(st.peer_head.get(p).copied().unwrap_or(0)), p.to_bytes())
-    });
-    let req = SyncRequest::GetBlocks { after_slot, limit: MAX_SYNC_BLOCKS as u32 };
-    for p in peers.into_iter().take(SYNC_FANOUT) {
-        swarm.behaviour_mut().sync.send_request(&p, req.clone());
-    }
+/// Reserve one existing fanout slot for exploration independent of untrusted
+/// height claims. A stable set of high-claiming peers cannot monopolize sync.
+fn sync_targets(mut peers: Vec<PeerId>, heads: &HashMap<PeerId, u64>, rotation: &mut usize) -> Vec<PeerId> {
+    if peers.is_empty() { return peers; }
+    peers.sort_by_key(|p| p.to_bytes());
+    let at = rotation.checked_rem(peers.len()).unwrap_or(0);
+    let Some(explore) = peers.get(at).copied() else { return Vec::new() };
+    *rotation = at.checked_add(1).and_then(|n| n.checked_rem(peers.len())).unwrap_or(0);
+    peers.retain(|p| *p != explore);
+    peers.sort_by_key(|p| (std::cmp::Reverse(heads.get(p).copied().unwrap_or(0)), p.to_bytes()));
+    peers.truncate(SYNC_FANOUT.saturating_sub(1));
+    // Exploration comes first so even one free request slot cannot be
+    // consumed only by the untrusted-height preference.
+    peers.insert(0, explore);
+    peers
+}
+
+/// Keep bounded directed sync while giving every stable connected peer a turn.
+/// Height preference remains a heuristic, not a validated statement of state.
+fn request_blocks(swarm: &mut Swarm, st: &mut Loop, after_slot: u64) {
+    let available = swarm.connected_peers().copied()
+        .filter(|peer| !st.outgoing_sync.contains(peer)).collect();
+    let peers = sync_targets(available, &st.peer_head, &mut st.sync_rotation);
+    for peer in peers { request_peer_blocks(swarm, st, peer, after_slot); }
+}
+
+fn request_peer_blocks(swarm: &mut Swarm, st: &mut Loop, peer: PeerId, after_slot: u64) -> bool {
+    let queued = st.outgoing_sync.enqueue(peer, after_slot);
+    pump_sync_requests(swarm, st);
+    queued
+}
+
+fn pump_sync_requests(swarm: &mut Swarm, st: &mut Loop) {
+    st.outgoing_sync.dispatch(|peer, after_slot| swarm.behaviour_mut().sync.send_request(
+        &peer, SyncRequest::GetBlocks { after_slot, limit: MAX_SYNC_BLOCKS as u32 },
+    ));
+}
+
+/// Bound peer-controlled connection churn diagnostics. This helper owns only
+/// formatting/output: connection counters, cleanup and sync scheduling must
+/// remain outside its closure so suppression can never suppress state work.
+fn connection_diagnostic(output: impl FnOnce()) {
+    crate::net::rejection_log::emit(
+        crate::net::rejection_log::Class::Connection,
+        output,
+    );
 }
 
 /// Returns false when the engine's receiver is gone (the node is shutting
@@ -1414,7 +1824,7 @@ fn handle_swarm_event(
             println!("p2p: listening on {address}");
         }
         SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, num_established, .. } => {
-            println!("p2p: connected {peer_id}");
+            connection_diagnostic(|| println!("p2p: connected {peer_id}"));
             if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
                 st.note_dialed(address.clone(), peer_id);
             }
@@ -1449,10 +1859,7 @@ fn handle_swarm_event(
                 // a number an operator can compare against a peer list.
                 st.peers_live.fetch_add(1, Ordering::AcqRel);
                 let after = st.head_slot.load(Ordering::Relaxed);
-                swarm.behaviour_mut().sync.send_request(
-                    &peer_id,
-                    SyncRequest::GetBlocks { after_slot: after, limit: MAX_SYNC_BLOCKS as u32 },
-                );
+                request_peer_blocks(swarm, st, peer_id, after);
             }
         }
         SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
@@ -1467,13 +1874,18 @@ fn handle_swarm_event(
                     |n| Some(n.saturating_sub(1)),
                 );
                 st.forget_peer(&peer_id);
+                pump_sync_requests(swarm, st);
                 // The cause is the whole diagnostic value of this line. A bare
                 // "disconnected" is what made the Genesis-3 yamux stream-cap
                 // failure take days to find: the transport was terminating
                 // connections and the log said only that peers came and went.
                 match cause {
-                    Some(e) => println!("p2p: disconnected {peer_id}: {e}"),
-                    None => println!("p2p: disconnected {peer_id} (closed cleanly)"),
+                    Some(e) => connection_diagnostic(|| {
+                        println!("p2p: disconnected {peer_id}: {e}")
+                    }),
+                    None => connection_diagnostic(|| {
+                        println!("p2p: disconnected {peer_id} (closed cleanly)")
+                    }),
                 }
             }
         }
@@ -1485,22 +1897,26 @@ fn handle_swarm_event(
             // simultaneous dial from both ends — noise that reads exactly like
             // a real outage and would teach an operator to ignore the line.
             if swarm.connected_peers().next().is_none() {
-                eprintln!("p2p: NO PEERS — dial failed ({peer_id:?}): {error}");
+                connection_diagnostic(|| {
+                    eprintln!("p2p: NO PEERS — dial failed ({peer_id:?}): {error}")
+                });
             } else {
                 trace(|| format!("dial failed ({peer_id:?}): {error}"));
             }
         }
         SwarmEvent::IncomingConnectionError { error, send_back_addr, .. } => {
-            eprintln!("p2p: inbound connection from {send_back_addr} failed: {error}");
+            connection_diagnostic(|| {
+                eprintln!("p2p: inbound connection from {send_back_addr} failed: {error}")
+            });
         }
         SwarmEvent::Behaviour(G4BehaviourEvent::Identify(identify::Event::Received {
             peer_id,
             info,
             ..
         })) => {
-            for addr in info.listen_addrs {
-                st.note_dialed(addr, peer_id);
-            }
+            // Identify addresses are untrusted hints, not proof that this
+            // peer owns configured addresses. Do not overwrite redial state.
+            let _ = (peer_id, info);
         }
         SwarmEvent::Behaviour(G4BehaviourEvent::Gossipsub(gossipsub::Event::Message {
             propagation_source,
@@ -1517,26 +1933,34 @@ fn handle_swarm_event(
             request_response::Message::Request { request, channel, .. } => {
                 serve_sync(st, resp_tx.clone(), peer, request, channel);
             }
-            request_response::Message::Response { response, .. } => {
+            request_response::Message::Response { request_id, response } => {
+                // Ignore an old connection generation without releasing a
+                // newer request under the same authenticated peer identity.
+                if !st.outgoing_sync.finish(&peer, request_id) { return true; }
                 let SyncResponse::Blocks { envelopes } = response;
                 let was_full = envelopes.len() >= MAX_SYNC_BLOCKS;
                 let mut highest = 0u64;
+                let mut page_complete = true;
                 for bytes in envelopes {
-                    match crate::codec::decode_envelope(&bytes) {
-                        Ok(env) => {
-                            let slot = env.header.slot;
+                    match admit_sync_envelope(st, peer, &bytes) {
+                        SyncEnvelopeAdmission::Admitted { slot, engine_alive } => {
                             highest = highest.max(slot);
-                            let e = st.peer_head.entry(peer).or_insert(0);
-                            *e = (*e).max(slot);
-                            // Directed sync, not gossip: there is no message
-                            // id to report a verdict against, so `Origin::none`
-                            // and the engine's report is a no-op.
-                            if !st.emit(NetEvent::Block(env, Origin::none())) {
+                            if !engine_alive {
                                 return false;
                             }
                         }
-                        Err(e) => {
-                            eprintln!("p2p: undecodable block in sync response from {peer}: {e}");
+                        SyncEnvelopeAdmission::Saturated => {
+                            // The remainder of this page is recoverable from
+                            // the applied head. Do not decode work that cannot
+                            // enter the engine, and do not page-chase past the
+                            // gap this local overload just created.
+                            page_complete = false;
+                            break;
+                        }
+                        SyncEnvelopeAdmission::Malformed(e) => {
+                            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!("p2p: undecodable block in sync response from {peer}: {e}"));
+                            page_complete = false;
+                            break;
                         }
                     }
                 }
@@ -1545,26 +1969,24 @@ fn handle_swarm_event(
                 // engine's sync timer — that is the difference between "a
                 // request from genesis is accepted" and "a node can actually
                 // sync from genesis". A short page ends the walk.
-                if was_full && highest > 0 && st.may_chase_page(peer) {
-                    swarm.behaviour_mut().sync.send_request(
-                        &peer,
-                        SyncRequest::GetBlocks {
-                            after_slot: highest,
-                            limit: MAX_SYNC_BLOCKS as u32,
-                        },
-                    );
+                if was_full && page_complete && highest > 0 && st.may_chase_page(peer) {
+                    request_peer_blocks(swarm, st, peer, highest);
                 }
+                pump_sync_requests(swarm, st);
             }
         },
         SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::OutboundFailure {
             peer,
+            request_id,
             error,
             ..
         })) => {
+            st.outgoing_sync.finish(&peer, request_id);
+            pump_sync_requests(swarm, st);
             // A peer that does not speak /bloch-g4/sync/1 is not a Genesis-4
             // node. Nothing to fall back to — deliberately: Genesis-3
             // compatibility is not a goal, it is the thing the prefix prevents.
-            eprintln!("p2p: sync request to {peer} failed: {error}");
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Sync, || eprintln!("p2p: sync request to {peer} failed: {error}"));
         }
         _ => {}
     }
@@ -1596,6 +2018,28 @@ fn on_gossip(
             .report_message_validation_result(&message_id, &source, v.into());
     };
 
+    // Charge the bounded wire bytes before any canonical decoder allocates or
+    // walks attacker-controlled collections. Saturation is local overload,
+    // not proof of peer misconduct, so it is Ignore rather than Reject.
+    let class = if topic == st.topics.blocks.hash() {
+        crate::net::EventClass::Block
+    } else if topic == st.topics.attestations.hash() {
+        crate::net::EventClass::Attestation
+    } else if topic == st.topics.txs.hash() {
+        crate::net::EventClass::Transaction
+    } else {
+        report(swarm, Verdict::Ignore);
+        return true;
+    };
+    let Some(reservation) = st.budget.reserve_peer_frame(
+        class,
+        message.data.len(),
+        source.to_bytes(),
+    ) else {
+        report(swarm, Verdict::Ignore);
+        return true;
+    };
+
     if topic == st.topics.blocks.hash() {
         match crate::codec::decode_envelope(&message.data) {
             Ok(env) => {
@@ -1611,16 +2055,29 @@ fn on_gossip(
                     format!("← block slot {} from {source}", env.header.slot)
                 });
                 let slot = env.header.slot;
-                let e = st.peer_head.entry(source).or_insert(0);
-                *e = (*e).max(slot);
-                st.note_block(*env.block_id().as_bytes());
-                let origin = Origin { inner: Some((message_id, source)) };
-                return st.emit(NetEvent::Block(env, origin));
+                let block_id = *env.block_id().as_bytes();
+                let origin = Origin {
+                    inner: Some((message_id.clone(), source)),
+                    block_hint: Some((source, slot)),
+                    reservation: None,
+                };
+                let mut event = NetEvent::Block(env, origin);
+                if crate::net::queued_bytes(&event) != message.data.len() {
+                    report(swarm, Verdict::Reject);
+                    return true;
+                }
+                let NetEvent::Block(_, origin) = &mut event else { unreachable!() };
+                origin.set_reservation(reservation);
+                st.note_block(block_id);
+                return match st.emit(event, source) {
+                    Some(alive) => alive,
+                    None => { report(swarm, Verdict::Ignore); true }
+                };
             }
             Err(e) => {
                 // Undecodable bytes on the block topic cannot come from a
                 // compliant node: that is a Reject, and P4 counts it.
-                eprintln!("p2p: undecodable block from {source}: {e}");
+                crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!("p2p: undecodable block from {source}: {e}"));
                 report(swarm, Verdict::Reject);
             }
         }
@@ -1630,11 +2087,25 @@ fn on_gossip(
             Ok(att) => {
                 // No verdict yet. The engine decides through `gossip.rs` and
                 // calls `Handle::report`, which is what finally relays it.
-                let origin = Origin { inner: Some((message_id, source)) };
-                return st.emit(NetEvent::Attestation(att, origin));
+                let origin = Origin {
+                    inner: Some((message_id.clone(), source)),
+                    block_hint: None,
+                    reservation: None,
+                };
+                let mut event = NetEvent::Attestation(att, origin);
+                if crate::net::queued_bytes(&event) != message.data.len() {
+                    report(swarm, Verdict::Reject);
+                    return true;
+                }
+                let NetEvent::Attestation(_, origin) = &mut event else { unreachable!() };
+                origin.set_reservation(reservation);
+                return match st.emit(event, source) {
+                    Some(alive) => alive,
+                    None => { report(swarm, Verdict::Ignore); true }
+                };
             }
             Err(e) => {
-                eprintln!("p2p: undecodable attestation from {source}: {e}");
+                crate::net::rejection_log::emit(crate::net::rejection_log::Class::Attestation, || eprintln!("p2p: undecodable attestation from {source}: {e}"));
                 report(swarm, Verdict::Reject);
             }
         }
@@ -1643,20 +2114,78 @@ fn on_gossip(
             Ok(tx) => {
                 // Decode is not authorization. In particular, funded admission
                 // needs the engine's UTXO view before gossipsub may relay it.
-                let origin = Origin { inner: Some((message_id, source)) };
-                return st.emit(NetEvent::Transaction(tx, origin));
+                let origin = Origin {
+                    inner: Some((message_id.clone(), source)),
+                    block_hint: None,
+                    reservation: None,
+                };
+                let mut event = NetEvent::Transaction(tx, origin);
+                if crate::net::queued_bytes(&event) != message.data.len() {
+                    report(swarm, Verdict::Reject);
+                    return true;
+                }
+                let NetEvent::Transaction(_, origin) = &mut event else { unreachable!() };
+                origin.set_reservation(reservation);
+                return match st.emit(event, source) {
+                    Some(alive) => alive,
+                    None => { report(swarm, Verdict::Ignore); true }
+                };
             }
             Err(e) => {
-                eprintln!("p2p: undecodable transaction from {source}: {e}");
+                crate::net::rejection_log::emit(crate::net::rejection_log::Class::Transaction, || eprintln!("p2p: undecodable transaction from {source}: {e}"));
                 report(swarm, Verdict::Reject);
             }
         }
-    } else {
-        // A topic we never subscribed to cannot reach here; if it somehow
-        // does, ignoring it is the answer that penalizes nobody.
-        report(swarm, Verdict::Ignore);
     }
     true
+}
+
+/// Result of charging and decoding one block from a directed sync page.
+///
+/// The response frame is already bounded by [`MAX_SYNC_FRAME`] and
+/// [`MAX_SYNC_BLOCKS`], but the envelope decoder still walks and allocates
+/// attacker-controlled collections. Charge its bounded encoded length before
+/// that work, exactly as the gossip receive path does. The guard travels with
+/// the event so [`Loop::emit`] neither double-charges nor loses the reservation
+/// on channel failure.
+enum SyncEnvelopeAdmission {
+    Admitted { slot: u64, engine_alive: bool },
+    Saturated,
+    Malformed(crate::codec::DecodeErr),
+}
+
+fn admit_sync_envelope(st: &Loop, peer: PeerId, bytes: &[u8]) -> SyncEnvelopeAdmission {
+    let Some(reservation) = st.budget.reserve_peer_frame(
+        crate::net::EventClass::Block,
+        bytes.len(),
+        peer.to_bytes(),
+    ) else {
+        return SyncEnvelopeAdmission::Saturated;
+    };
+    let env = match crate::codec::decode_envelope(bytes) {
+        Ok(env) => env,
+        Err(e) => return SyncEnvelopeAdmission::Malformed(e),
+    };
+    let slot = env.header.slot;
+    let origin = Origin::sync_block(peer, slot);
+    let mut event = NetEvent::Block(env, origin);
+    if crate::net::queued_bytes(&event) != bytes.len() {
+        return SyncEnvelopeAdmission::Malformed(crate::codec::DecodeErr(
+            "sync envelope is not canonical",
+        ));
+    }
+    let NetEvent::Block(_, origin) = &mut event else { unreachable!() };
+    origin.set_reservation(reservation);
+    let engine_alive = st.emit(event, peer).unwrap_or(false);
+    SyncEnvelopeAdmission::Admitted { slot, engine_alive }
+}
+
+fn has_source_reservation(ev: &NetEvent) -> bool {
+    match ev {
+        NetEvent::Block(_, origin)
+        | NetEvent::Attestation(_, origin)
+        | NetEvent::Transaction(_, origin) => origin.reservation.is_some(),
+    }
 }
 
 /// Answer a `get-blocks` off the blocking pool, capped in both blocks and
@@ -1704,7 +2233,7 @@ fn serve_sync(
 /// per refusal it provoked, and the in-flight cap it had just tripped would
 /// stop binding. Pinned by `refused_requests_do_not_free_in_flight_slots`.
 fn refusal_answer(peer: PeerId, why: SyncRefusal) -> (Option<SyncPermit>, SyncResponse) {
-    eprintln!("p2p: refusing get-blocks from {peer}: {why:?}");
+    crate::net::rejection_log::emit(crate::net::rejection_log::Class::Sync, || eprintln!("p2p: refusing get-blocks from {peer}: {why:?}"));
     (None, SyncResponse::Blocks { envelopes: Vec::new() })
 }
 
@@ -1724,29 +2253,14 @@ fn read_sync_page(
     limit: usize,
 ) -> Vec<Vec<u8>> {
     let _ = permit; // held for the whole read; see `SyncPermit`
-    match crate::store::Store::blocks_after(dir, after_slot, limit) {
-        Ok(all) => {
-            let mut out = Vec::new();
-            let mut bytes = 0usize;
-            for b in all.into_iter() {
-                // Byte cap as well as block cap: one answer must never become
-                // a history dump. Leave slack for the framing.
-                // `bytes` only ever accumulates `b.len() + 4` for blocks that
-                // passed this same check, so it stays far below
-                // `MAX_SYNC_FRAME` (8 MiB); saturating keeps a pathological
-                // single block (larger than `usize::MAX`, impossible in
-                // practice) failing this check safely instead of wrapping
-                // small and passing it.
-                if bytes.saturating_add(b.len()).saturating_add(4)
-                    > (MAX_SYNC_FRAME as usize).saturating_sub(1024)
-                {
-                    break;
-                }
-                bytes = bytes.saturating_add(b.len()).saturating_add(4);
-                out.push(b);
-            }
-            out
-        }
+    match crate::store::Store::blocks_after_p2p(
+        dir,
+        after_slot,
+        limit,
+        (MAX_SYNC_FRAME as usize).saturating_sub(1024),
+        4,
+    ) {
+        Ok(page) => page,
         Err(e) => {
             eprintln!("p2p: serving get-blocks failed: {e}");
             Vec::new()
@@ -1760,8 +2274,226 @@ fn read_sync_page(
 mod tests {
     use super::*;
 
+    struct ShortAsyncReader {
+        bytes: Vec<u8>,
+        at: usize,
+        fail_at: Option<usize>,
+    }
+
+    impl AsyncRead for ShortAsyncReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            out: &mut [u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            if self.fail_at == Some(self.at) {
+                return std::task::Poll::Ready(Err(io::Error::other(
+                    "injected response read failure",
+                )));
+            }
+            if self.at == self.bytes.len() {
+                return std::task::Poll::Ready(Ok(0));
+            }
+            // Split fixed headers byte by byte, but keep the large case cheap
+            // while still exercising repeated payload reads.
+            let cap = if out.len() <= 5 { 1 } else { 4_093 };
+            let available = self.bytes.len().saturating_sub(self.at);
+            let take = out.len().min(available).min(cap);
+            let end = self.at.saturating_add(take);
+            out[..take].copy_from_slice(&self.bytes[self.at..end]);
+            self.at = end;
+            std::task::Poll::Ready(Ok(take))
+        }
+    }
+
     #[test]
-    fn audit_sync_cap_requires_actual_eof() {
+    fn sync_wire_len_rejects_u32_overflow_without_payload_allocation() {
+        assert_eq!(sync_wire_len(u32::MAX as usize).unwrap(), u32::MAX);
+        if let Some(over) = (u32::MAX as usize).checked_add(1) {
+            assert_eq!(sync_wire_len(over).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn sync_request_streams_fixed_oracle_across_short_io_and_preserves_errors() {
+        struct OneByteReader {
+            bytes: Vec<u8>,
+            at: usize,
+            fail_at: Option<usize>,
+        }
+
+        impl AsyncRead for OneByteReader {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                out: &mut [u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                if self.fail_at == Some(self.at) {
+                    return std::task::Poll::Ready(Err(io::Error::other(
+                        "injected request read failure",
+                    )));
+                }
+                if self.at == self.bytes.len() {
+                    return std::task::Poll::Ready(Ok(0));
+                }
+                out[0] = self.bytes[self.at];
+                self.at = self.at.saturating_add(1);
+                std::task::Poll::Ready(Ok(1))
+            }
+        }
+
+        #[derive(Default)]
+        struct OneByteWriter {
+            bytes: Vec<u8>,
+            writes: usize,
+        }
+
+        impl AsyncWrite for OneByteWriter {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                self.writes = self.writes.saturating_add(1);
+                self.bytes.push(bytes[0]);
+                std::task::Poll::Ready(Ok(1))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        futures::executor::block_on(async {
+            let request = SyncRequest::GetBlocks { after_slot: 4242, limit: 64 };
+            let oracle = encode_sync_request(&request);
+            assert_eq!(oracle.as_slice(), sync_request_bytes(&request));
+
+            let mut reader = OneByteReader { bytes: oracle.clone(), at: 0, fail_at: None };
+            assert_eq!(read_sync_request(&mut reader).await.unwrap(), request);
+
+            let mut writer = OneByteWriter::default();
+            write_sync_request(&mut writer, &request).await.unwrap();
+            assert_eq!(writer.bytes, oracle);
+            assert_eq!(writer.writes, 13, "fixture must force every byte through write_all");
+
+            for truncated in [Vec::new(), writer.bytes[..12].to_vec()] {
+                let mut reader = OneByteReader { bytes: truncated, at: 0, fail_at: None };
+                assert_eq!(
+                    read_sync_request(&mut reader).await.unwrap_err().kind(),
+                    io::ErrorKind::InvalidData,
+                );
+            }
+
+            let mut trailing = writer.bytes.clone();
+            trailing.push(0xA5);
+            let mut reader = OneByteReader { bytes: trailing, at: 0, fail_at: None };
+            assert_eq!(
+                read_sync_request(&mut reader).await.unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+            );
+
+            let mut reader = OneByteReader {
+                bytes: writer.bytes,
+                at: 0,
+                fail_at: Some(5),
+            };
+            assert_eq!(
+                read_sync_request(&mut reader).await.unwrap_err().kind(),
+                io::ErrorKind::Other,
+            );
+        });
+    }
+
+    #[test]
+    fn sync_response_writer_streams_oracle_bytes_across_short_writes() {
+        #[derive(Default)]
+        struct ShortAsyncWriter {
+            bytes: Vec<u8>,
+            writes: Vec<(usize, usize)>,
+        }
+
+        impl AsyncWrite for ShortAsyncWriter {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                // Split every codec header and also make a large envelope
+                // cross many polls without making the regression expensive.
+                let cap = if bytes.len() <= 5 { 1 } else { 4_093 };
+                let accepted = bytes.len().min(cap);
+                self.writes.push((bytes.len(), accepted));
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                std::task::Poll::Ready(Ok(accepted))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let cases = [
+            SyncResponse::Blocks { envelopes: Vec::new() },
+            SyncResponse::Blocks {
+                envelopes: vec![vec![1, 2, 3], Vec::new(), vec![9; 100]],
+            },
+            SyncResponse::Blocks { envelopes: vec![vec![0xA5; 1 << 20]] },
+        ];
+        for response in cases {
+            let expected = encode_sync_response(&response);
+            let expected_response = response.clone();
+            let mut writer = ShortAsyncWriter::default();
+            futures::executor::block_on(write_sync_response(&mut writer, response)).unwrap();
+
+            assert_eq!(writer.bytes, expected, "streamed response diverged from codec oracle");
+            assert_eq!(decode_sync_response(&writer.bytes).unwrap(), expected_response);
+            assert!(writer.writes.iter().any(|(offered, accepted)| accepted < offered),
+                "fixture must exercise AsyncWrite short-write retries");
+        }
+    }
+
+    #[test]
+    fn sync_response_reader_streams_oracle_values_across_short_reads() {
+        futures::executor::block_on(async {
+            let cases = [
+                SyncResponse::Blocks { envelopes: Vec::new() },
+                SyncResponse::Blocks {
+                    envelopes: vec![vec![1, 2, 3], Vec::new(), vec![9; 100]],
+                },
+                SyncResponse::Blocks { envelopes: vec![vec![0xA5; 1 << 20]] },
+            ];
+            for expected in cases {
+                let wire = encode_sync_response(&expected);
+                let oracle = decode_sync_response(&wire).unwrap();
+                let mut reader = ShortAsyncReader { bytes: wire, at: 0, fail_at: None };
+                assert_eq!(read_sync_response(&mut reader).await.unwrap(), oracle);
+            }
+        });
+    }
+
+    #[test]
+    fn audit_streaming_sync_cap_requires_actual_eof() {
         futures::executor::block_on(async {
             // A syntactically valid response that ends exactly at the cap.
             // The envelope is opaque at this framing layer (decoded later).
@@ -1770,26 +2502,65 @@ mod tests {
             };
             let mut wire = encode_sync_response(&response);
             assert_eq!(wire.len() as u64, MAX_SYNC_FRAME);
-            let accepted = read_capped(&mut futures::io::Cursor::new(&wire)).await.unwrap();
-            assert!(decode_sync_response(&accepted).is_ok());
+            assert_eq!(
+                read_sync_response(&mut futures::io::Cursor::new(&wire)).await.unwrap(),
+                response,
+            );
 
             // Previously both distinct streams produced the same accepted
             // bytes: `take(cap)` hid this trailing byte from strict decoding.
             wire.push(0xA5);
-            let error = read_capped(&mut futures::io::Cursor::new(&wire)).await.unwrap_err();
+            let error = read_sync_response(&mut futures::io::Cursor::new(&wire)).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+            // Declared wire length is cap + 1. Only the framing bytes exist:
+            // refusal must happen before allocating or reading the body.
+            let over_len = (MAX_SYNC_FRAME - 8) as u32;
+            let mut over = vec![SYNC_TAG_BLOCKS];
+            over.extend_from_slice(&1u32.to_le_bytes());
+            over.extend_from_slice(&over_len.to_le_bytes());
+            let error = read_sync_response(&mut futures::io::Cursor::new(over)).await.unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         });
     }
 
     #[test]
-    fn audit_sync_short_frames_still_use_strict_decoding() {
+    fn audit_streaming_sync_rejects_caps_truncation_and_preserves_io_errors() {
         futures::executor::block_on(async {
-            let mut wire = encode_sync_response(&SyncResponse::Blocks { envelopes: Vec::new() });
-            let accepted = read_capped(&mut futures::io::Cursor::new(&wire)).await.unwrap();
-            assert!(decode_sync_response(&accepted).is_ok());
-            wire.push(0);
-            let accepted = read_capped(&mut futures::io::Cursor::new(&wire)).await.unwrap();
-            assert!(decode_sync_response(&accepted).is_err());
+            let mut over_count = vec![SYNC_TAG_BLOCKS];
+            over_count.extend_from_slice(&((MAX_SYNC_BLOCKS as u32) + 1).to_le_bytes());
+            assert_eq!(
+                read_sync_response(&mut futures::io::Cursor::new(over_count))
+                    .await.unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+            );
+
+            let mut one_missing_len = vec![SYNC_TAG_BLOCKS];
+            one_missing_len.extend_from_slice(&1u32.to_le_bytes());
+            let mut one_short_body = one_missing_len.clone();
+            one_short_body.extend_from_slice(&3u32.to_le_bytes());
+            one_short_body.extend_from_slice(&[1, 2]);
+            for truncated in [Vec::new(), vec![SYNC_TAG_BLOCKS], one_missing_len, one_short_body] {
+                assert_eq!(
+                    read_sync_response(&mut futures::io::Cursor::new(truncated))
+                        .await.unwrap_err().kind(),
+                    io::ErrorKind::InvalidData,
+                );
+            }
+
+            let mut failing = ShortAsyncReader {
+                bytes: {
+                    let mut bytes = vec![SYNC_TAG_BLOCKS];
+                    bytes.extend_from_slice(&1u32.to_le_bytes());
+                    bytes
+                },
+                at: 0,
+                fail_at: Some(5),
+            };
+            assert_eq!(
+                read_sync_response(&mut failing).await.unwrap_err().kind(),
+                io::ErrorKind::Other,
+            );
         });
     }
 
@@ -1968,17 +2739,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sync_exploration_cannot_be_steered_out_by_forged_heights() {
+        let peers: Vec<_> = (0..8).map(|_| PeerId::random()).collect();
+        let heads: HashMap<_, _> = peers.iter().take(SYNC_FANOUT).map(|p| (*p, u64::MAX)).collect();
+        let mut rotation = 0;
+        let mut reached = std::collections::HashSet::new();
+        let mut first_choices = std::collections::HashSet::new();
+        for _ in 0..peers.len() {
+            let selected = sync_targets(peers.clone(), &heads, &mut rotation);
+            assert_eq!(selected.len(), SYNC_FANOUT);
+            first_choices.insert(selected[0]);
+            let unique: std::collections::HashSet<_> = selected.iter().copied().collect();
+            assert_eq!(unique.len(), selected.len());
+            reached.extend(selected);
+        }
+        assert_eq!(reached.len(), peers.len(), "unclaimed peers must get requests despite maximum forged claims");
+        assert_eq!(first_choices.len(), peers.len(), "even one free request slot must rotate independently of claimed height");
+        let one = sync_targets(vec![peers[0]], &heads, &mut rotation);
+        assert_eq!(one, vec![peers[0]]);
+        assert!(sync_targets(Vec::new(), &heads, &mut rotation).is_empty());
+    }
+
     /// A `Loop` with no swarm attached — every field is a plain value or a
     /// channel, so the per-peer bookkeeping (`may_chase_page`, `note_dialed`,
     /// `forget_peer`) is testable without a real libp2p transport.
     fn test_loop() -> Loop {
         let (events, _rx) = std::sync::mpsc::channel();
         Loop {
+            outgoing_sync: sync_requests::Requests::default(),
+            budget: crate::net::QueueBudget::new(),
             events,
             data_dir: PathBuf::from("/tmp/bloch-p2p-test"),
             head_slot: Arc::new(AtomicU64::new(0)),
             peer_head: HashMap::new(),
+            sync_rotation: 0,
             recent_blocks: HashMap::new(),
+            recent_blocks_expiry_hint: None,
             chase: HashMap::new(),
             dialed: HashMap::new(),
             dialed_order: VecDeque::new(),
@@ -1990,6 +2787,473 @@ mod tests {
             },
             peers_live: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[test]
+    fn connection_log_suppression_never_suppresses_disconnect_state_work() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _enter = runtime.enter();
+        let key = identity::Keypair::generate_ed25519();
+        let cfg = Config { listen: Vec::new(), peers: Vec::new(), data_dir: PathBuf::new(), max_peers: 8, behind_proxy: true };
+        let (mut swarm, _) = build_swarm(&key, &cfg).unwrap();
+        let mut state = test_loop();
+        let peer = PeerId::random();
+        let waiting = PeerId::random();
+        let address: Multiaddr = "/ip4/127.0.0.1/tcp/19444".parse().unwrap();
+
+        state.peers_live.store(1, Ordering::Release);
+        state.peer_head.insert(peer, 99);
+        state.note_dialed(address.clone(), peer);
+        let permit = state.sync_limiter.begin(peer, Instant::now()).unwrap();
+        state.sync_limiter.release(permit);
+        let active = swarm.behaviour_mut().sync.send_request(
+            &peer,
+            SyncRequest::GetBlocks { after_slot: 0, limit: MAX_SYNC_BLOCKS as u32 },
+        );
+        assert!(state.outgoing_sync.start(peer, || active));
+        assert!(state.outgoing_sync.enqueue(waiting, 7));
+
+        // Saturate the production connection diagnostic immediately before
+        // the close event. Other parallel tests may have consumed some burst,
+        // so pin the invariant rather than assuming a fresh global window:
+        // at most BURST callbacks run, and every remaining call is counted.
+        let callbacks = std::cell::Cell::new(0u64);
+        let suppressed_before = crate::net::rejection_log::suppressed_total();
+        for _ in 0..100 {
+            connection_diagnostic(|| callbacks.set(callbacks.get().saturating_add(1)));
+        }
+        let suppressed_after = crate::net::rejection_log::suppressed_total();
+        assert!(callbacks.get() <= 8, "the connection burst must remain bounded");
+        assert!(
+            suppressed_after.saturating_sub(suppressed_before)
+                >= 100u64.saturating_sub(callbacks.get()),
+            "every callback denied by this burst must increment the shared suppression metric",
+        );
+
+        let (resp_tx, _resp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let suppressed_before_close = crate::net::rejection_log::suppressed_total();
+        assert!(handle_swarm_event(
+            &mut swarm,
+            &mut state,
+            &resp_tx,
+            SwarmEvent::ConnectionClosed {
+                peer_id: peer,
+                connection_id: libp2p::swarm::ConnectionId::new_unchecked(1),
+                endpoint: libp2p::core::ConnectedPoint::Listener {
+                    local_addr: address.clone(),
+                    send_back_addr: address,
+                },
+                num_established: 0,
+                cause: None,
+            },
+        ));
+        let suppressed_after_close = crate::net::rejection_log::suppressed_total();
+        assert!(
+            suppressed_after_close.saturating_sub(suppressed_before_close) >= 1,
+            "the synthetic close must hit the saturated diagnostic window",
+        );
+
+        assert_eq!(state.peers_live.load(Ordering::Acquire), 0);
+        assert!(!state.peer_head.contains_key(&peer));
+        assert!(!state.dialed.values().any(|remembered| *remembered == peer));
+        assert_eq!(state.sync_limiter.tracked(), 0);
+        assert!(!state.outgoing_sync.contains(&peer));
+        assert!(state.outgoing_sync.contains(&waiting),
+            "disconnect cleanup must still pump the next queued sync request while logging is suppressed");
+    }
+
+    #[test]
+    fn sync_height_hint_requires_engine_acceptance_and_is_monotonic() {
+        let mut state = test_loop();
+        let peer = PeerId::random();
+
+        state.note_block_verdict(peer, u64::MAX, Verdict::Ignore);
+        state.note_block_verdict(peer, u64::MAX, Verdict::Reject);
+        assert!(
+            !state.peer_head.contains_key(&peer),
+            "decoded or rejected headers must not steer sync selection",
+        );
+
+        state.note_block_verdict(peer, 41, Verdict::Accept);
+        assert_eq!(state.peer_head.get(&peer), Some(&41));
+        state.note_block_verdict(peer, 7, Verdict::Accept);
+        assert_eq!(
+            state.peer_head.get(&peer),
+            Some(&41),
+            "an older admitted block must not lower the peer's hint",
+        );
+        state.forget_peer(&peer);
+        assert!(
+            !state.peer_head.contains_key(&peer),
+            "disconnect must remove a judged height hint",
+        );
+    }
+
+    #[test]
+    fn directed_sync_origin_reports_every_engine_verdict() {
+        let (cmd, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = Handle {
+            cmd,
+            peer_id: PeerId::random(),
+            peers_live: Arc::new(AtomicUsize::new(0)),
+            listen_addrs: Vec::new(),
+        };
+        let source = PeerId::random();
+        let origin = Origin::sync_block(source, 99);
+
+        for expected in [Verdict::Accept, Verdict::Ignore, Verdict::Reject] {
+            handle.report(&origin, expected);
+            match rx.try_recv().expect("directed-sync verdict was dropped") {
+                Command::Report(reported, actual) => {
+                    assert_eq!(actual, expected);
+                    assert_eq!(reported.block_hint, Some((source, 99)));
+                    assert!(reported.inner.is_none());
+                }
+                Command::Broadcast(_)
+                | Command::BroadcastBlock(_)
+                | Command::BroadcastTransaction(_) => {
+                    panic!("verdict became a broadcast")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_transaction_command_moves_same_payload_allocation() {
+        let (cmd, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = Handle {
+            cmd,
+            peer_id: PeerId::random(),
+            peers_live: Arc::new(AtomicUsize::new(0)),
+            listen_addrs: Vec::new(),
+        };
+        let payload = vec![0x5C; 1 << 20];
+        let prepared = crate::net::PreparedTransactionBroadcast::new(&payload);
+        let original_ptr = prepared.payload().as_ptr();
+        let original_len = prepared.payload().len();
+
+        handle.broadcast_transaction(prepared);
+        let Command::BroadcastTransaction(received) =
+            rx.try_recv().expect("prepared transaction command was dropped")
+        else {
+            panic!("prepared transaction changed command variant");
+        };
+        let moved = received.into_payload();
+        assert_eq!(moved.as_ptr(), original_ptr, "command recopied transaction");
+        assert_eq!(moved.len(), original_len);
+    }
+
+    #[test]
+    fn prepared_block_id_suppresses_without_decode_and_generic_fallback_is_unchanged() {
+        let mut state = test_loop();
+        let prepared = envelope(71);
+        let prepared_id = *prepared.block_id().as_bytes();
+        let deliberately_undecodable = [0xFF];
+
+        assert!(outbound_block_is_fresh(
+            &mut state,
+            &deliberately_undecodable,
+            Some(prepared_id),
+        ));
+        assert!(!outbound_block_is_fresh(
+            &mut state,
+            &deliberately_undecodable,
+            Some(prepared_id),
+        ));
+
+        let fallback = envelope(72);
+        let fallback_id = *fallback.block_id().as_bytes();
+        let fallback_payload = crate::codec::encode_envelope(&fallback);
+        assert!(outbound_block_is_fresh(&mut state, &fallback_payload, None));
+        assert!(!outbound_block_is_fresh(&mut state, &fallback_payload, None));
+        assert!(state.recent_blocks.contains_key(&fallback_id));
+
+        let remembered = state.recent_blocks.len();
+        assert!(outbound_block_is_fresh(&mut state, &[0xFF], None));
+        assert_eq!(state.recent_blocks.len(), remembered,
+            "a malformed generic frame remains publishable without inventing a suppression id");
+    }
+
+    #[test]
+    fn prepared_block_payload_moves_same_allocation_and_suppresses_duplicate() {
+        let mut state = test_loop();
+        let env = envelope(73);
+        let id = *env.block_id().as_bytes();
+        let payload = crate::codec::encode_envelope(&env);
+        let original_ptr = payload.as_ptr();
+        let original_len = payload.len();
+        let original_capacity = payload.capacity();
+
+        let moved = prepared_block_payload_if_fresh(&mut state, payload, id)
+            .expect("fresh prepared block");
+        assert_eq!(moved.as_ptr(), original_ptr, "typed handoff recopied payload");
+        assert_eq!(moved.len(), original_len);
+        assert_eq!(moved.capacity(), original_capacity);
+
+        let duplicate = crate::codec::encode_envelope(&env);
+        assert!(prepared_block_payload_if_fresh(&mut state, duplicate, id).is_none());
+    }
+
+    #[test]
+    fn recent_block_expiry_hint_skips_early_scans_and_preserves_refresh() {
+        RECENT_BLOCK_EXPIRY_SCANS.with(|scans| scans.set(0));
+        let mut state = test_loop();
+        let start = Instant::now();
+
+        for byte in 0..100u8 {
+            let mut id = [0u8; 32];
+            id[0] = byte;
+            assert!(state.note_block_at(id, start));
+        }
+        assert_eq!(
+            RECENT_BLOCK_EXPIRY_SCANS.with(std::cell::Cell::get),
+            0,
+            "nothing can expire before the shared TTL boundary",
+        );
+        assert_eq!(state.recent_blocks_expiry_hint, Some(start));
+
+        let boundary = start + REGOSSIP_SUPPRESS_TTL;
+        let mut boundary_id = [0u8; 32];
+        boundary_id[0] = 200;
+        assert!(state.note_block_at(boundary_id, boundary));
+        assert_eq!(RECENT_BLOCK_EXPIRY_SCANS.with(std::cell::Cell::get), 1);
+        assert_eq!(state.recent_blocks.len(), 1);
+        assert!(state.recent_blocks.contains_key(&boundary_id));
+        assert_eq!(state.recent_blocks_expiry_hint, Some(boundary));
+
+        // Refreshing the sole ID keeps duplicate suppression but deliberately
+        // leaves the lower-bound hint early. Reaching that stale boundary can
+        // only cause one safe scan; the refreshed ID remains suppressed until
+        // its own exact equality boundary.
+        RECENT_BLOCK_EXPIRY_SCANS.with(|scans| scans.set(0));
+        let mut refreshed = test_loop();
+        let original = [7u8; 32];
+        assert!(refreshed.note_block_at(original, start));
+        let refreshed_at = start + Duration::from_secs(1);
+        assert!(!refreshed.note_block_at(original, refreshed_at));
+        assert_eq!(refreshed.recent_blocks_expiry_hint, Some(start));
+
+        let stale_boundary = start + REGOSSIP_SUPPRESS_TTL;
+        assert!(refreshed.note_block_at([8u8; 32], stale_boundary));
+        assert_eq!(RECENT_BLOCK_EXPIRY_SCANS.with(std::cell::Cell::get), 1);
+        assert!(refreshed.recent_blocks.contains_key(&original));
+        assert_eq!(refreshed.recent_blocks_expiry_hint, Some(refreshed_at));
+
+        let real_boundary = refreshed_at + REGOSSIP_SUPPRESS_TTL;
+        assert!(refreshed.note_block_at([9u8; 32], real_boundary));
+        assert_eq!(RECENT_BLOCK_EXPIRY_SCANS.with(std::cell::Cell::get), 2);
+        assert!(!refreshed.recent_blocks.contains_key(&original));
+        assert!(refreshed.recent_blocks.contains_key(&[8u8; 32]));
+        assert!(refreshed.recent_blocks.contains_key(&[9u8; 32]));
+        assert_eq!(refreshed.recent_blocks_expiry_hint, Some(stale_boundary));
+    }
+
+    #[test]
+    fn recent_block_cache_count_cap_is_drop_new_and_reopens_at_expiry() {
+        let mut state = test_loop();
+        let start = Instant::now();
+        for n in 0..RECENT_BLOCKS_MAX as u64 {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&n.to_le_bytes());
+            assert!(state.note_block_at(id, start));
+        }
+        assert_eq!(state.recent_blocks.len(), RECENT_BLOCKS_MAX);
+        assert_eq!(state.recent_blocks_expiry_hint, Some(start));
+
+        let overflow = [0xFF; 32];
+        assert!(
+            state.note_block_at(overflow, start + Duration::from_secs(1)),
+            "an unremembered ID remains fresh at the local suppression boundary",
+        );
+        assert_eq!(state.recent_blocks.len(), RECENT_BLOCKS_MAX);
+        assert!(!state.recent_blocks.contains_key(&overflow));
+
+        let mut retained = [0u8; 32];
+        retained[..8].copy_from_slice(&1u64.to_le_bytes());
+        let refreshed_at = start + Duration::from_secs(1);
+        assert!(
+            !state.note_block_at(retained, refreshed_at),
+            "an existing ID refreshes and remains suppressed even at capacity",
+        );
+        assert_eq!(state.recent_blocks.len(), RECENT_BLOCKS_MAX);
+        assert_eq!(state.recent_blocks.get(&retained), Some(&refreshed_at));
+
+        let boundary = start + REGOSSIP_SUPPRESS_TTL;
+        let reopened = [0xFE; 32];
+        assert!(state.note_block_at(reopened, boundary));
+        assert_eq!(
+            state.recent_blocks.len(),
+            2,
+            "expired entries leave while the refreshed survivor and newcomer remain",
+        );
+        assert!(state.recent_blocks.contains_key(&retained));
+        assert!(state.recent_blocks.contains_key(&reopened));
+        assert_eq!(state.recent_blocks_expiry_hint, Some(refreshed_at));
+    }
+
+    #[test]
+    fn outbound_sync_swarm_response_failure_and_disconnect_release_reservations() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _enter = runtime.enter();
+        let key = identity::Keypair::generate_ed25519();
+        let cfg = Config { listen: Vec::new(), peers: Vec::new(), data_dir: PathBuf::new(), max_peers: 8, behind_proxy: true };
+        let (mut swarm, _) = build_swarm(&key, &cfg).unwrap();
+        let mut st = test_loop();
+        let peer = PeerId::random();
+        let (resp_tx, _resp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let connection_id = libp2p::swarm::ConnectionId::new_unchecked(1);
+        let issue = |st: &mut Loop, swarm: &mut Swarm| {
+            let mut id = None;
+            assert!(st.outgoing_sync.start(peer, || {
+                let request = swarm.behaviour_mut().sync.send_request(&peer,
+                    SyncRequest::GetBlocks { after_slot: 0, limit: MAX_SYNC_BLOCKS as u32 });
+                id = Some(request);
+                request
+            }));
+            id.unwrap()
+        };
+        let failed = issue(&mut st, &mut swarm);
+        assert!(handle_swarm_event(&mut swarm, &mut st, &resp_tx,
+            SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::OutboundFailure {
+                peer, connection_id, request_id: failed, error: request_response::OutboundFailure::Timeout,
+            }))));
+        assert!(!st.outgoing_sync.contains(&peer));
+        let completed = issue(&mut st, &mut swarm);
+        assert!(handle_swarm_event(&mut swarm, &mut st, &resp_tx,
+            SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::Message {
+                peer, connection_id, message: request_response::Message::Response {
+                    request_id: completed, response: SyncResponse::Blocks { envelopes: Vec::new() },
+                },
+            }))));
+        assert!(!st.outgoing_sync.contains(&peer));
+        let disconnected = issue(&mut st, &mut swarm);
+        st.forget_peer(&peer);
+        assert!(!st.outgoing_sync.contains(&peer));
+        issue(&mut st, &mut swarm);
+        assert!(handle_swarm_event(&mut swarm, &mut st, &resp_tx,
+            SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::OutboundFailure {
+                peer, connection_id, request_id: disconnected, error: request_response::OutboundFailure::ConnectionClosed,
+            }))));
+        assert!(st.outgoing_sync.contains(&peer), "a late failure must not release the new request");
+    }
+
+    #[test]
+    fn source_admission_bounds_the_first_channel_and_preserves_other_peer_capacity() {
+        let mut st = test_loop();
+        let (tx, rx) = std::sync::mpsc::channel();
+        st.events = tx;
+        let flooder = PeerId::random();
+        let honest = PeerId::random();
+        let event = || NetEvent::Transaction(
+            bloch_pos_committee::transition::PosTransaction::Exit { validator: 0 },
+            Origin::none(),
+        );
+        let mut admitted = 0;
+        while st.emit(event(), flooder) == Some(true) { admitted += 1; }
+        assert_eq!(admitted, 128, "transaction count quota must retain half the per-peer slots");
+        assert_eq!(st.emit(event(), honest), Some(true));
+        drop(rx.recv().unwrap());
+        assert_eq!(st.emit(event(), flooder), Some(true));
+        drop(rx);
+        assert_eq!(st.emit(event(), flooder), Some(false));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        st.events = tx;
+        assert_eq!(st.emit(event(), flooder), Some(true));
+    }
+
+    /// Gossip admission is charged from the bounded frame length before its
+    /// decoder runs. A malformed frame has no event to carry the guard, so
+    /// dropping that guard must restore capacity; a valid decoded event that
+    /// does carry it must not be charged a second time by `Loop::emit`.
+    #[test]
+    fn predecode_peer_admission_releases_failures_and_is_not_charged_twice() {
+        let mut st = test_loop();
+        let (events, rx) = std::sync::mpsc::channel();
+        st.events = events;
+        st.budget = Arc::new(crate::net::QueueBudget::with_caps(2, 1_024));
+        let peer = PeerId::random();
+        let class = crate::net::EventClass::Transaction;
+
+        let malformed = st
+            .budget
+            .reserve_peer_frame(class, 1, peer.to_bytes())
+            .expect("first bounded frame is admitted before decode");
+        assert!(
+            st.budget.reserve_peer_frame(class, 1, peer.to_bytes()).is_none(),
+            "the predecode reservation must consume the one transaction slot",
+        );
+        drop(malformed);
+
+        let guard = st
+            .budget
+            .reserve_peer_frame(class, 1, peer.to_bytes())
+            .expect("failed decode released its predecode reservation");
+        let event = NetEvent::Transaction(
+            bloch_pos_committee::transition::PosTransaction::Exit { validator: 0 },
+            Origin {
+                inner: None,
+                block_hint: None,
+                reservation: Some(guard),
+            },
+        );
+        assert_eq!(
+            st.emit(event, peer),
+            Some(true),
+            "an event carrying the predecode guard must bypass a duplicate source charge",
+        );
+        drop(rx.recv().expect("pre-reserved event reached the first channel"));
+    }
+
+    /// Directed sync has the same predecode admission property as gossip.
+    /// A saturated peer must not buy an envelope decode, malformed input must
+    /// release its tentative charge, and a valid event must carry that charge
+    /// through the engine channel instead of taking it twice.
+    #[test]
+    fn sync_envelopes_reserve_before_decode_and_release_every_exit() {
+        let mut st = test_loop();
+        let (events, rx) = std::sync::mpsc::channel();
+        st.events = events;
+        st.budget = Arc::new(crate::net::QueueBudget::with_caps(1, 1 << 20));
+        let peer = PeerId::random();
+        let class = crate::net::EventClass::Block;
+
+        let held = st
+            .budget
+            .reserve_peer_frame(class, 1, peer.to_bytes())
+            .expect("first block allowance");
+        assert!(matches!(
+            admit_sync_envelope(&st, peer, &[0xff]),
+            SyncEnvelopeAdmission::Saturated
+        ));
+        drop(held);
+
+        assert!(matches!(
+            admit_sync_envelope(&st, peer, &[0xff]),
+            SyncEnvelopeAdmission::Malformed(_)
+        ));
+        let bytes = crate::codec::encode_envelope(&envelope(73));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            admit_sync_envelope(&st, peer, &trailing),
+            SyncEnvelopeAdmission::Malformed(_)
+        ));
+        assert!(matches!(
+            admit_sync_envelope(&st, peer, &bytes),
+            SyncEnvelopeAdmission::Admitted { slot: 73, engine_alive: true }
+        ));
+        assert!(matches!(
+            admit_sync_envelope(&st, peer, &[0xff]),
+            SyncEnvelopeAdmission::Saturated
+        ));
+
+        let event = rx.recv().expect("pre-reserved sync block reached engine");
+        assert!(matches!(event, NetEvent::Block(_, _)));
+        drop(event);
+        assert!(matches!(
+            admit_sync_envelope(&st, peer, &[0xff]),
+            SyncEnvelopeAdmission::Malformed(_)
+        ));
     }
 
     /// R1 A3-M3: the sync-chase budget is PER PEER. A peer that never lets
@@ -2332,17 +3596,6 @@ mod tests {
         }
     }
 
-    /// A port nobody is listening on right now. Racy in principle; in practice
-    /// the window between closing this listener and the swarm binding is
-    /// microseconds, and the alternative (fixed ports) collides between
-    /// parallel test binaries for certain.
-    fn free_port() -> u16 {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let p = l.local_addr().expect("addr").port();
-        drop(l);
-        p
-    }
-
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "bloch-pos-p2p-{tag}-{}-{:?}",
@@ -2352,6 +3605,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("mkdir");
         d
+    }
+
+    #[test]
+    fn start_waits_for_the_listener_to_bind() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("occupy port");
+        let port = occupied.local_addr().expect("occupied address").port();
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}")
+            .parse()
+            .expect("multiaddr");
+        let dir = tmpdir("bind-readiness");
+        let (events, _rx) = std::sync::mpsc::channel();
+
+        let result = start(
+            Config {
+                listen: vec![addr],
+                peers: Vec::new(),
+                data_dir: dir,
+                max_peers: 1,
+                behind_proxy: true,
+            },
+            events,
+            Arc::new(AtomicU64::new(0)),
+            crate::net::QueueBudget::new(),
+        );
+
+        let error = match result {
+            Ok(_) => panic!("start reported ready without owning its port"),
+            Err(error) => error,
+        };
+        assert_ne!(
+            error.kind(),
+            io::ErrorKind::TimedOut,
+            "occupied port was noticed only by the generic startup timeout: {error}",
+        );
     }
 
     struct Node {
@@ -2370,13 +3657,12 @@ mod tests {
         for slot in 1..=blocks {
             store.append(&envelope(slot)).expect("append");
         }
-        let port = free_port();
-        let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}").parse().expect("addr");
+        let requested_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().expect("addr");
         let (tx, rx) = std::sync::mpsc::channel();
         let head = Arc::new(AtomicU64::new(blocks));
         let handle = start(
             Config {
-                listen: vec![addr.clone()],
+                listen: vec![requested_addr],
                 peers: peers.to_vec(),
                 data_dir: dir.clone(),
                 max_peers: 16,
@@ -2393,8 +3679,14 @@ mod tests {
             },
             tx,
             head.clone(),
+            crate::net::QueueBudget::new(),
         )
         .expect("p2p starts");
+        let addr = handle
+            .listen_addrs()
+            .first()
+            .cloned()
+            .expect("p2p start confirms its listen address");
         Node { handle, rx, head, addr, _dir: dir }
     }
 
@@ -2475,6 +3767,16 @@ mod tests {
         // a's dial, and it must still be able to publish back.
         b.handle.broadcast(crate::net::block_frame(&envelope(500)));
         assert_eq!(collect_blocks(&a.rx, 1, 20), vec![500], "reverse direction never delivered");
+
+        // The producer's maximum envelope must fit the real gossipsub codec,
+        // not merely our block encoder. Signature bytes are synthetic here:
+        // this fixture exercises transport delivery, not block validation.
+        let mut boundary = envelope(501);
+        let original_size = crate::codec::encode_envelope(&boundary).len();
+        boundary.proposer_sig.resize(boundary.proposer_sig.len() + MAX_PROPOSAL_ENVELOPE_BYTES - original_size, 0);
+        assert_eq!(crate::codec::encode_envelope(&boundary).len(), MAX_PROPOSAL_ENVELOPE_BYTES);
+        b.handle.broadcast(crate::net::block_frame(&boundary));
+        assert_eq!(collect_blocks(&a.rx, 1, 20), vec![501], "producer-sized gossip frame did not fit actual transport");
     }
 
     /// The exchange's question, at the transport layer: a node with an EMPTY

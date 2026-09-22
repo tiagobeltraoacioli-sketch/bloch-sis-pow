@@ -264,6 +264,28 @@ fn handle_subscribe(session: &Arc<Session>, req: &StratumRequest) -> StratumResp
 /// signing something that means anything on-chain.
 pub const AUTH_DOMAIN: &[u8] = b"bloch-pool-authorize-v1";
 
+fn verify_ownership_proof(
+    canonical: bool,
+    public_key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> bool {
+    if canonical {
+        return bloch_crypto::crypto::verify_enveloped_canonical(
+            public_key,
+            message,
+            signature,
+        );
+    }
+    // Prefer the two unambiguous matching-format policies. The generic final
+    // fallback preserves any historical mixed-format proof this reference
+    // pool previously accepted, while valid raw signatures that happen to
+    // start with envelope magic succeed through the explicit raw path first.
+    bloch_crypto::crypto::verify_enveloped(public_key, message, signature)
+        || bloch_crypto::crypto::verify_legacy_hybrid_raw(public_key, message, signature)
+        || bloch_crypto::crypto::verify(public_key, message, signature)
+}
+
 /// mining.authorize [address, password, pubkey_hex?, signature_hex?] —
 /// the username must be a valid Bloch bech32 address (bloch1q… /
 /// bloch1t…), same rule as the node. When the pool requires the
@@ -327,7 +349,12 @@ fn handle_authorize(
         // scheme, reused verbatim from bloch-crypto).
         let mut msg = AUTH_DOMAIN.to_vec();
         msg.extend_from_slice(&session.challenge);
-        if !bloch_crypto::crypto::verify(&pubkey, &msg, &sig) {
+        if !verify_ownership_proof(
+            pool.cfg.canonical_auth_proof,
+            &pubkey,
+            &msg,
+            &sig,
+        ) {
             warn!("stratum: session {} ownership proof failed for {}", session.id, username);
             return StratumResponse::error(
                 req.id.clone(),
@@ -336,7 +363,9 @@ fn handle_authorize(
         info!("stratum: session {} proved ownership of {}", session.id, username);
     }
 
-    *session.address.lock() = Some(username.to_string());
+    // The parsed identity, not user-controlled hex casing, keys all new
+    // shares and credits. Existing journals require separate reconciliation.
+    *session.address.lock() = Some(addr.to_string());
     *session.state.lock() = SessionState::Authorized;
     info!("stratum: session {} authorized {}", session.id, username);
 
@@ -548,6 +577,41 @@ async fn submit_found_block(
 mod tests {
     use super::*;
 
+    #[test]
+    fn audit_authorized_case_aliases_share_one_accounting_identity() {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        let canonical = Address::from_pubkey(&pk, bloch_crypto::address::Network::Testnet).to_string();
+        let uppercase_payload = format!("bloch1t{}", canonical[7..].to_ascii_uppercase());
+        assert_ne!(canonical, uppercase_payload);
+        let pool = Arc::new(PoolState::new(crate::state::Config {
+            node_rpc: "http://127.0.0.1:1".into(), pool_address: canonical.clone(),
+            pool_spk: vec![], fee_bps: 0, share_bits: 0x2100ffff, pplns_window: 100,
+            listen: "127.0.0.1:0".into(), dashboard: "127.0.0.1:0".into(),
+            refresh_secs: 5, coinbase_tag: "audit".into(), confirm_depth: 6,
+            journal: None, require_auth_proof: true,
+            canonical_auth_proof: false,
+        }).unwrap());
+        for (index, name) in [canonical.as_str(), uppercase_payload.as_str()].iter().enumerate() {
+            let session = Arc::new(Session::new(index as u64 + 1, "local fixture".into()));
+            *session.state.lock() = SessionState::Subscribed;
+            let mut message = AUTH_DOMAIN.to_vec();
+            message.extend_from_slice(&session.challenge);
+            let signature = bloch_crypto::crypto::sign(&sk, &message).unwrap();
+            let request = StratumRequest {
+                id: Some(json!(1)), method: methods::AUTHORIZE.into(),
+                params: json!([name, "x", hex::encode(&pk), hex::encode(signature)]),
+            };
+            assert!(handle_authorize(&pool, &session, &request).error.is_none());
+            let identity = session.address.lock().clone().unwrap();
+            assert_eq!(identity, canonical);
+            pool.ledger.lock().record_share(&identity, 10, 0x2100ffff);
+        }
+        let ledger = pool.ledger.lock();
+        assert_eq!(ledger.miners.len(), 1);
+        assert_eq!(ledger.miners[&canonical].shares, 2);
+        assert_eq!(ledger.window_contributions(), vec![(canonical, 20)]);
+    }
+
     /// The authorize ownership proof end to end: a wallet keypair signs
     /// the domain-separated challenge and the pool-side checks (pubkey
     /// hashes to the address; hybrid signature verifies) accept it —
@@ -570,6 +634,49 @@ mod tests {
         let mut other = AUTH_DOMAIN.to_vec();
         other.extend_from_slice(&[8u8; 32]);
         assert!(!bloch_crypto::crypto::verify(&pk, &other, &sig));
+    }
+
+    #[test]
+    fn ownership_policy_accepts_genuine_magic_prefixed_raw_fixture_explicitly() {
+        let (enveloped_pk, enveloped_sk) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[0x65; 32]).unwrap();
+        let challenge = [0x65; 32];
+        let mut message = AUTH_DOMAIN.to_vec();
+        message.extend_from_slice(&challenge);
+        let signing_seed: [u8; 32] = hex::decode(
+            "9821a8fe2a4aa8343f55a5ae16b8370ab220f2eb4cf051df7ddf98a291635f67",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        let enveloped_sig = pqcrypto_internals::with_seeded_rng_scope(
+            &signing_seed,
+            || bloch_crypto::crypto::sign(&enveloped_sk, &message).unwrap(),
+        );
+        assert!(verify_ownership_proof(
+            true,
+            &enveloped_pk,
+            &message,
+            &enveloped_sig,
+        ));
+
+        let raw_pk = &enveloped_pk[bloch_crypto::crypto::SUITE_HEADER_LEN..];
+        let raw_sig = &enveloped_sig[bloch_crypto::crypto::SUITE_HEADER_LEN..];
+        assert_eq!(&raw_sig[..2], &[0xb1, 0x0c]);
+        assert!(bloch_crypto::crypto::verify_legacy_hybrid_raw(
+            raw_pk,
+            &message,
+            raw_sig,
+        ));
+        assert!(
+            !bloch_crypto::crypto::verify(raw_pk, &message, raw_sig),
+            "generic autodetection demonstrates the historical collision"
+        );
+        assert!(
+            verify_ownership_proof(false, raw_pk, &message, raw_sig),
+            "compatible pool policy must select the explicit raw verifier"
+        );
+        assert!(!verify_ownership_proof(true, raw_pk, &message, raw_sig));
     }
 
     // ── Framing: an over-long line must die DURING accumulation ──────────

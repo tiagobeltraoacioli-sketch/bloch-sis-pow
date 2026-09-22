@@ -155,3 +155,27 @@ test("T-6: an oversized integer under an UNRECOGNIZED key is left as a (rounded)
 test("T-6: assertJsonSourceAccessAvailable does not throw on this test runtime (node >= 21 required for exact amounts)", () => {
   assert.doesNotThrow(() => assertJsonSourceAccessAvailable());
 });
+
+test("LG-04: hex case variants share the same address cooldown", async () => {
+  await withServer(async (base) => {
+    const address = encodeAddress(randomBytes(20), "testnet");
+    const upper = address.slice(0, 7) + address.slice(7).toUpperCase();
+    const post = (a: string) => fetch(`${base}/api/faucet`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ address: a }),
+    });
+    assert.equal((await post(address)).status, 200);
+    assert.equal((await post(upper)).status, 429);
+  });
+});
+
+test("LG-05: cross-site and form-shaped submissions cannot dispense funds", async () => {
+  await withServer(async (base) => {
+    const address = encodeAddress(randomBytes(20), "testnet");
+    for (const type of ["text/plain", "application/x-www-form-urlencoded"]) {
+      const r = await fetch(`${base}/api/faucet`, { method: "POST", headers: { "content-type": type }, body: JSON.stringify({ address }) });
+      assert.equal(r.status, 415);
+    }
+    const r = await fetch(`${base}/api/faucet`, { method: "POST", headers: { "content-type": "application/json", "sec-fetch-site": "cross-site" }, body: JSON.stringify({ address }) });
+    assert.equal(r.status, 403);
+  });
+});

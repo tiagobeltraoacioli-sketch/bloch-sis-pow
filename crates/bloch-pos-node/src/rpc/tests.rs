@@ -23,6 +23,9 @@ use bloch_pos_committee::header::{BlockHeaderV4, Body, VERSION_G4};
 use bloch_pos_committee::state_root::{EutxoEntry, EvmCommitment};
 use bloch_pos_committee::transition::GenesisValidator;
 
+#[path = "../../build_source_digest.rs"]
+mod build_source_digest_tests;
+
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
 fn entry(txid: u8, vout: u32, value: u64, script: u8) -> EutxoEntry {
@@ -592,7 +595,7 @@ fn ledger_reads_use_the_script_index_and_stop_at_the_page() {
     assert_eq!(st.utxo_count_for_script(&[0x77; 32]), OTHERS as usize);
 }
 
-/// **H6, half (b).** The ledger reads are answered off the published head, so
+/// **H6, half (b).** State-only reads are answered off the published head, so
 /// a large query cannot occupy the consensus thread.
 ///
 /// Proved by taking the consensus thread away: the receiver is dropped, so
@@ -601,7 +604,8 @@ fn ledger_reads_use_the_script_index_and_stop_at_the_page() {
 /// chain store and legitimately belongs on the loop — still fails, so the test
 /// is pinning a *split*, not a backend that answers everything locally.
 #[test]
-fn ledger_reads_are_served_off_the_published_head() {
+fn state_only_reads_are_served_off_the_published_head() {
+    use sha3::{Digest, Sha3_256};
     use std::sync::Mutex as StdMutex;
 
     let st = Arc::new(state_with_balances());
@@ -623,6 +627,31 @@ fn ledger_reads_are_served_off_the_published_head() {
     assert_eq!(u.get("total").unwrap().as_u64(), Some(3));
     assert_eq!(u.get("returned").unwrap().as_u64(), Some(2));
 
+    let validator = backend
+        .call(RpcRequest::Validator(0))
+        .expect("getvalidator must not need the consensus thread");
+    assert_eq!(validator.get("index").unwrap().as_u64(), Some(0));
+
+    let count = backend
+        .call(RpcRequest::ValidatorCount)
+        .expect("getvalidatorcount must not need the consensus thread");
+    assert_eq!(count.get("total").unwrap().as_u64(), Some(2));
+
+    let key_hash: [u8; 32] = Sha3_256::digest(&st.validator_record(1).unwrap().pubkey).into();
+    let by_key = backend
+        .call(RpcRequest::ValidatorByKey(key_hash))
+        .expect("getvalidatorbykey must not need the consensus thread");
+    assert_eq!(by_key.get("index").unwrap().as_u64(), Some(1));
+
+    let validators = backend
+        .call(RpcRequest::Validators)
+        .expect("getvalidators must not need the consensus thread");
+    let Json::Arr(entries) = validators else { panic!("getvalidators must return an array") };
+    assert_eq!(entries.len(), 2);
+
+    let missing = backend.call(RpcRequest::Validator(u32::MAX)).unwrap_err();
+    assert_eq!(missing.code, VALIDATOR_NOT_FOUND);
+
     assert!(
         backend.call(RpcRequest::ChainInfo).is_err(),
         "a read that needs the chain store must still go to the loop — a backend that \
@@ -640,6 +669,95 @@ fn a_backend_without_a_head_still_routes_balance_to_the_loop() {
     drop(rx);
     let backend = EngineBackend::new(tx);
     assert!(backend.call(RpcRequest::Balance([0xAB; 32])).is_err());
+}
+
+#[test]
+fn rpc_connection_admission_releases_per_ip_and_global_slots_together() {
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let limits = Arc::new(crate::connection_limit::Limits::default());
+    let crowded: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+    let mapped: std::net::IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+    let mut held = Vec::new();
+
+    for _ in 0..MAX_CONNECTIONS_PER_IP {
+        held.push(reserve_connection(crowded, &live, &limits).expect("source has room"));
+    }
+    assert!(
+        reserve_connection(mapped, &live, &limits).is_none(),
+        "IPv4-mapped IPv6 must share the source cap",
+    );
+    assert!(
+        reserve_connection("192.0.2.2".parse().unwrap(), &live, &limits).is_some(),
+        "one source must not consume the global allowance",
+    );
+    drop(held.pop());
+    assert!(
+        reserve_connection(crowded, &live, &limits).is_some(),
+        "dropping the combined guard restores both charges",
+    );
+    drop(held);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let limits = Arc::new(crate::connection_limit::Limits::default());
+    let mut all = Vec::new();
+    for octet in 1..=MAX_CONNECTIONS {
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, octet as u8));
+        all.push(reserve_connection(ip, &live, &limits).expect("global budget has room"));
+    }
+    assert!(
+        reserve_connection("203.0.113.1".parse().unwrap(), &live, &limits).is_none(),
+        "distinct sources must still obey the global worker cap",
+    );
+    drop(all);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(reserve_connection("203.0.113.1".parse().unwrap(), &live, &limits).is_some());
+}
+
+/// Process identity is compiled into the RPC module. It must remain available
+/// without a published head or a listening consensus thread, while a genuine
+/// engine read still fails in that setup. This pins both sides of the split.
+#[test]
+fn build_info_is_answered_before_the_engine_queue() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(rx);
+    let backend = EngineBackend::new(tx);
+
+    let info = backend
+        .call(RpcRequest::BuildInfo)
+        .expect("compiled build identity must not need the consensus thread");
+    assert_eq!(info, build_info_json(), "local dispatch must use the canonical formatter");
+
+    assert!(
+        backend.call(RpcRequest::ChainInfo).is_err(),
+        "chain-owned reads must still cross the unavailable engine queue"
+    );
+}
+
+/// The block-count polling response is one complete published generation and
+/// does not consume engine queue capacity. A chain-owned query without such a
+/// publication still proves the dropped receiver is genuinely unavailable.
+#[test]
+fn block_count_is_answered_from_the_published_canonical_summary() {
+    use std::sync::Mutex as StdMutex;
+
+    let state = Arc::new(state_with_balances());
+    let head: crate::engine::SharedHead = Arc::new(StdMutex::new(state));
+    let expected = block_count_json(17, 23, Some(11), 2, 1);
+    let published: SharedBlockCount = Arc::new(StdMutex::new(expected.clone()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(rx);
+
+    let backend = EngineBackend::with_published(tx, head, published);
+    assert_eq!(
+        backend.call(RpcRequest::BlockCount),
+        Ok(expected),
+        "published block count must not need a listening consensus thread"
+    );
+    assert!(
+        backend.call(RpcRequest::ChainInfo).is_err(),
+        "other chain-owned reads must still cross the unavailable queue"
+    );
 }
 
 #[test]
@@ -679,6 +797,27 @@ fn sendrawtransaction_reply_names_the_kind_and_disclaims_the_hash() {
     let dup = submitted_json(&tx, Admitted::Duplicate);
     assert_eq!(dup.get("status").unwrap().as_str(), Some("duplicate"));
     assert_eq!(dup.get("accepted"), Some(&Json::Bool(true)));
+}
+
+#[test]
+fn prepared_submission_reuses_large_canonical_owner_with_exact_reply_parity() {
+    let tx = test_transfer(8_192, 500_000, 7);
+    let oracle = tx.canonical_bytes();
+    assert!(
+        oracle.len() > 400 * 1024,
+        "fixture must make a proportional copy material"
+    );
+    assert!(
+        oracle.len().saturating_mul(2) < MAX_BODY_BYTES,
+        "fixture's hex form must remain inside the real RPC body cap"
+    );
+
+    let prepared = PreparedSubmission::new(&tx, &oracle);
+    assert_eq!(
+        prepared.into_json(Admitted::New),
+        submitted_json(&tx, Admitted::New),
+        "the reused canonical owner must not change any RPC receipt field",
+    );
 }
 
 // ─── 2. Routing and the JSON-RPC envelope ───────────────────────────────────
@@ -1410,23 +1549,44 @@ fn a_cors_simple_request_shape_is_refused() {
 /// The operator allowlist (`BLOCH_RPC_HOST_ALLOWLIST`) accepts an extra
 /// hostname, and only that name — not an arbitrary caller's choice.
 ///
-/// Env-var tests share the process, so this constructs [`HostPolicy`]
-/// directly instead of spawning a real server bound under the ambient
-/// (possibly test-polluted) environment.
+/// Exercise the parsed value directly: mutating process-global environment
+/// from a parallel test can change the policy used by unrelated RPC servers.
 #[test]
 fn the_host_allowlist_env_var_adds_exactly_the_named_hosts() {
-    // SAFETY (`set_var`/`remove_var` unsafe since Rust 2024): this test does
-    // not spawn threads that read the environment concurrently with the
-    // mutation below.
-    unsafe {
-        std::env::set_var(RPC_HOST_ALLOWLIST_ENV, " rpc.internal , 10.0.0.5 ");
-    }
-    let hosts = HostPolicy::new("127.0.0.1");
+    let hosts = HostPolicy::with_extra("127.0.0.1", Some(" rpc.internal , 10.0.0.5 "));
     assert!(hosts.allows(Some("rpc.internal")), "an allowlisted host must be accepted");
     assert!(hosts.allows(Some("10.0.0.5:8080")), "allowlist entries ignore a port too");
     assert!(!hosts.allows(Some("evil.example")), "an unlisted host must still be refused");
-    unsafe {
-        std::env::remove_var(RPC_HOST_ALLOWLIST_ENV);
+}
+
+#[test]
+fn host_policy_rejects_malformed_authorities_instead_of_allowed_prefixes() {
+    let hosts = HostPolicy {
+        allowed: vec!["localhost".into(), "::1".into()],
+    };
+
+    for valid in ["localhost", "LOCALHOST:8080", "[::1]", "[::1]:8080"] {
+        assert!(hosts.allows(Some(valid)), "valid Host authority was refused: {valid}");
+    }
+    for malformed in [
+        "",
+        "localhost:",
+        "localhost:anything",
+        "localhost:65536",
+        "localhost:80:90",
+        "local host",
+        "user@localhost",
+        "[::1",
+        "[::1]suffix",
+        "[::1]:",
+        "[::1]:anything",
+        "[::1]:65536",
+        "[::1]::8080",
+    ] {
+        assert!(
+            !hosts.allows(Some(malformed)),
+            "malformed Host authority extracted an allowed prefix: {malformed}",
+        );
     }
 }
 
@@ -1526,8 +1686,18 @@ fn getbuildinfo_reports_the_fields_a_partner_compares() {
         "source_files",
         "source_bytes",
         "rustc",
+        "cargo",
         "profile",
         "target",
+        "build_environment_digest",
+        "build_environment_digest_alg",
+        "build_environment_scope",
+        "build_environment_fields",
+        "build_tool_binaries_hashed",
+        "build_sysroot_components_hashed",
+        "build_configured_tool_binaries_hashed",
+        "build_default_linker_binaries_hashed",
+        "build_linker_binaries_hashed",
         "digest_note",
     ] {
         let f = v.get(k).unwrap_or_else(|| panic!("getbuildinfo has no `{k}`"));
@@ -1536,6 +1706,13 @@ fn getbuildinfo_reports_the_fields_a_partner_compares() {
     }
 
     assert_eq!(v.get("source_digest_alg").unwrap().as_str(), Some("sha3-256"));
+    assert_eq!(
+        v.get("build_environment_digest_alg").unwrap().as_str(),
+        Some("sha3-256")
+    );
+    let source_scope = v.get("source_digest_scope").unwrap().as_str().unwrap();
+    assert!(source_scope.contains("macros"));
+    assert!(source_scope.contains("rust-toolchain.toml"));
 
     // `commit_source` is the field that separates evidence from assertion.
     // Anything outside this set means the build script grew a case nobody
@@ -1547,8 +1724,8 @@ fn getbuildinfo_reports_the_fields_a_partner_compares() {
     );
     let ts = v.get("tree_state").unwrap().as_str().unwrap();
     assert!(
-        ["clean", "modified", "unverified", "unknown"].contains(&ts),
-        "tree_state must be clean|modified|unverified|unknown, got {ts}"
+        ["clean", "asserted-clean", "modified", "unverified", "unknown"].contains(&ts),
+        "tree_state must be clean|asserted-clean|modified|unverified|unknown, got {ts}"
     );
 
     // The bound rides with the answer, so a client cannot read the digest as
@@ -1584,6 +1761,96 @@ fn getbuildinfo_digest_is_computed_not_typed() {
     let bytes: u64 = v.get("source_bytes").unwrap().as_str().unwrap().parse().unwrap();
     assert!(files > 100, "digest scope covers only {files} files — it lost the tree");
     assert!(bytes > 1_000_000, "digest scope covers only {bytes} bytes — it lost the tree");
+}
+
+/// Compiler flags and wrappers are build inputs even though they are not
+/// source. Their values must be comparable without being exposed verbatim.
+#[test]
+fn getbuildinfo_carries_a_bounded_build_environment_fingerprint() {
+    let v = build_info_json();
+    let d = v
+        .get("build_environment_digest")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert_eq!(d.len(), 64, "sha3-256 is 64 hex characters, got {d:?}");
+    assert!(
+        d.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "environment digest must be lowercase hex: {d}"
+    );
+    let fields: usize = v
+        .get("build_environment_fields")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(fields >= 4, "compiler, Cargo, profile and target must be bound");
+    let scope = v
+        .get("build_environment_scope")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert!(scope.contains("values hashed"));
+    assert!(scope.contains("not directly disclosed"));
+    assert!(scope.contains("executable bytes"));
+    assert!(scope.contains("configured linker/compiler/archive/wrapper bytes"));
+    assert!(scope.contains("compiler delegated by known wrappers"));
+    assert!(scope.contains("C compiler and archiver selected by cc-rs even when"));
+    assert!(scope.contains("selected freestanding or WASI native input-tree contents"));
+    assert!(scope.contains("explicitly selected linker"));
+    assert!(scope.contains("platform default linker observed from a target link probe"));
+    assert!(scope.contains("implicit native search and dynamic loader variables"));
+    assert_eq!(
+        v.get("build_tool_binaries_hashed").unwrap().as_str(),
+        Some("2"),
+        "workspace builds must bind both selected tool executables",
+    );
+    let sysroot_components: usize = v
+        .get("build_sysroot_components_hashed")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        sysroot_components >= 2,
+        "workspace builds must bind rustc and at least one target libstd component",
+    );
+    let configured_tool_binaries: usize = v
+        .get("build_configured_tool_binaries_hashed")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        configured_tool_binaries <= fields,
+        "configured tool fingerprints must be part of the environment fields",
+    );
+    let configured_linker_binaries: usize = env!("BLOCH_BUILD_CONFIGURED_LINKER_BINARIES")
+        .parse()
+        .unwrap();
+    assert!(
+        configured_linker_binaries <= configured_tool_binaries,
+        "configured linker fingerprints must be part of the configured tool fingerprints",
+    );
+    let default_linker_binaries: usize = v
+        .get("build_default_linker_binaries_hashed")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        default_linker_binaries == 1 || configured_linker_binaries > 0,
+        "a native workspace build must bind either its configured linker or rustc's observed default linker",
+    );
+    assert_eq!(
+        v.get("build_linker_binaries_hashed").unwrap().as_str(),
+        Some("1"),
+        "a native workspace build must bind exactly one effective linker",
+    );
 }
 
 /// Nothing here is anything an operator would refuse to publish.
@@ -1780,3 +2047,66 @@ fn errors_without_structured_detail_emit_no_data_member() {
 // every local and remote ref, it appeared only in the five files of its own
 // branch, so there is no compatibility claim to honour and an alias would
 // simply re-create the second name.
+
+#[test]
+fn audit_flat_json_amplification_and_composite_ids_are_refused() {
+    let many = format!("[{}0]", "0,".repeat(16_384));
+    assert_eq!(parse_json(&many), Err("too many JSON values"));
+    let backend = Spy::new();
+    for id in ["[]".to_owned(), "{}".to_owned(), format!("\"{}\"", "a".repeat(257))] {
+        let reply = handle_body(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"getchaininfo\"}}"), backend.as_ref());
+        assert!(reply.contains("-32600"), "{reply}");
+    }
+}
+
+#[test]
+fn audit_timed_out_rpc_work_remains_bounded_until_engine_drops_it() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let backend = std::sync::Arc::new(EngineBackend::new(tx));
+    let mut callers = Vec::new();
+    for _ in 0..16 {
+        let backend = backend.clone();
+        callers.push(std::thread::spawn(move || backend.call(RpcRequest::ChainInfo)));
+    }
+    let pending: Vec<_> = (0..16).map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
+    let refused = backend.call(RpcRequest::ChainInfo).unwrap_err();
+    assert!(refused.message.contains("queue is full"));
+    for caller in callers { assert!(caller.join().unwrap().is_err()); }
+    assert!(backend.call(RpcRequest::ChainInfo).unwrap_err().message.contains("queue is full"));
+    drop(pending);
+    let next = {
+        let backend = backend.clone();
+        std::thread::spawn(move || backend.call(RpcRequest::ChainInfo))
+    };
+    let crate::engine::EngineEvent::Rpc(call) = rx.recv_timeout(Duration::from_secs(5)).unwrap() else {
+        panic!("expected an RPC request");
+    };
+    call.reply.send(Ok(Json::Null)).unwrap();
+    assert_eq!(next.join().unwrap().unwrap(), Json::Null);
+}
+
+#[test]
+fn rpc_source_identity_survives_queueing_and_normalizes_mapped_ipv4() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let backend = std::sync::Arc::new(EngineBackend::new(tx));
+    let ipv4: std::net::IpAddr = "192.0.2.61".parse().unwrap();
+    let mapped: std::net::IpAddr = "::ffff:192.0.2.61".parse().unwrap();
+    let expected = crate::net::verification_source_for_ip(ipv4);
+
+    // More than the per-source queue cap: sequential completion must release
+    // each permit, including across the two normalized address forms.
+    for source in [ipv4, mapped].into_iter().cycle().take(32) {
+        let worker = {
+            let backend = backend.clone();
+            std::thread::spawn(move || backend.call_from(RpcRequest::ChainInfo, source))
+        };
+        let crate::engine::EngineEvent::Rpc(call) =
+            rx.recv_timeout(Duration::from_secs(5)).expect("queued RPC call")
+        else {
+            panic!("expected an RPC request");
+        };
+        assert_eq!(call.verification_source, Some(expected));
+        call.reply.send(Ok(Json::Null)).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), Json::Null);
+    }
+}

@@ -27,6 +27,20 @@
   boot.loader.efi.canTouchEfiVariables = lib.mkDefault false;
   boot.initrd.systemd.tpm2.enable = lib.mkDefault true;
 
+  # Appliance images have no implicit remote-administration surface.  The
+  # base profile enables sshd by default for conventional hosts; an attested
+  # image must instead opt in in a deployment-specific module with an
+  # equally specific network policy (see cloud.nix's wg0-only exception).
+  services.openssh = {
+    enable = false;
+    openFirewall = false;
+    settings = {
+      PermitRootLogin = "no";
+      PasswordAuthentication = false;
+      KbdInteractiveAuthentication = false;
+    };
+  };
+
   # Read-only, immutable rootfs. The store is already immutable; this seals the
   # whole root and forbids in-place mutation. Mutable state lives on a separate
   # writable partition mounted at the node's data dir.

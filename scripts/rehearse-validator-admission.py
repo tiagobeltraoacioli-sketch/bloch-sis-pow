@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run the funded-admission node test in an isolated, compile-time devnet.
 
-The checked-out source is never edited. The shipping activation remains
-unarmed; there is no feature, environment variable or node option that can
+The checked-out source is never edited. The shipping activation schedule remains
+unchanged; there is no feature, environment variable or node option that can
 change consensus on a running network. CI tests the positive path by compiling
 a disposable copy with the five co-activated ADR-041 constants changed to epoch zero.
 """
@@ -34,13 +34,10 @@ def main():
     source = (ROOT / PARAMS).read_text()
     armed = source
     for gate in GATES:
-        # `u64::MAX` before the flag day, the armed epoch after it: the
-        # rehearsal keeps running across the arming commit, since epoch zero
-        # is below any real L and the copy is what changes, never the tree.
-        pattern = re.compile(rf"^pub const {gate}_ACTIVATION_EPOCH: u64 = (u64::MAX|\d[\d_]*);$", re.M)
-        if len(pattern.findall(armed)) != 1:
-            raise SystemExit(f"Expected exactly one {gate} activation constant; review the rehearsal.")
-        armed = pattern.sub(f"pub const {gate}_ACTIVATION_EPOCH: u64 = 0;", armed, count=1)
+        old = f"pub const {gate}_ACTIVATION_EPOCH: u64 = 2_884;"
+        if source.count(old) != 1:
+            raise SystemExit(f"Expected exactly one scheduled {gate} constant; review the rehearsal.")
+        armed = armed.replace(old, f"pub const {gate}_ACTIVATION_EPOCH: u64 = 0;")
     pin = re.search(r'^channel\s*=\s*"([^"]+)"', (ROOT / "crates/bloch-pos-node/rust-toolchain.toml").read_text(), re.M)
     if not pin:
         raise SystemExit("Missing pinned toolchain")
@@ -77,6 +74,12 @@ def main():
                         "--skip", "funded_pre_activation_compatibility_rehearsal",
                         "--skip", "funded_joining_network_fixture",
                         "--skip", "funded_joining_network_evidence"]
+        if not args.randao_only and not args.audit_mempool:
+            subprocess.run(
+                ["cargo", f"+{pin.group(1)}", "build", "--locked", "-p", "bloch-pos-node", "--bin", "bloch-pos"],
+                cwd=checkout, env=env, check=True,
+            )
+            env["BLOCH_PAYOUT_TEST_BIN"] = str(Path(env["CARGO_TARGET_DIR"]) / "debug" / "bloch-pos")
         if not args.randao_only:
             subprocess.run(
                 ["cargo", f"+{pin.group(1)}", "test", "--locked", "-p", "bloch-pos-node",
@@ -97,9 +100,9 @@ def main():
     if (ROOT / PARAMS).read_text() != source:
         raise SystemExit("Shipping activation source changed during the rehearsal")
     if args.audit_mempool:
-        print("Mempool regression passed: invalid funding refused before relay. Shipping source remains unarmed.")
+        print("Mempool regression passed: invalid funding refused before relay. Shipping source remains unchanged.")
     else:
-        print("Validator lifecycle rehearsal passed; the shipping source remains unarmed.")
+        print("Validator lifecycle rehearsal passed; the shipping source remains unchanged.")
 
 
 if __name__ == "__main__":

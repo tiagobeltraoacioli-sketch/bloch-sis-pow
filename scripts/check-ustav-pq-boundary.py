@@ -2,7 +2,7 @@
 """Tripwire against classical signature libraries entering the native Ustav tree.
 
 Run from the repository root; optional arguments select Cargo/toolchain, e.g.
-python3 scripts/check-ustav-pq-boundary.py cargo +1.94.1
+python3 scripts/check-ustav-pq-boundary.py cargo +"$(python3 scripts/pinned-rust-toolchain.py)"
 This is a dependency regression guard, not a cryptographic proof or binary audit.
 """
 import subprocess

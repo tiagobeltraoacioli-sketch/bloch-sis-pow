@@ -61,6 +61,9 @@ zeroize      = "1"
 # Already a transitive dep (pinned at 0.10.9 in Cargo.lock).
 sha2         = "0.10"
 
+[dev-dependencies]
+pqcrypto-internals = "0.2"
+
 # Standalone workspaces do not inherit the node workspace's [patch] table, so
 # the vendored pqcrypto-internals fork (seeded-RNG API used by bloch-crypto)
 # must be re-declared here, path-adjusted for the pool's location.

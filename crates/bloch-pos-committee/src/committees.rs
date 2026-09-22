@@ -129,16 +129,19 @@ pub fn seed_mix(
 ) -> Option<[u8; 32]> {
     match seed_epoch(epoch) {
         None => Some(*genesis_mix),
-        Some(e) => boundary_mixes.get(e as usize).copied(),
+        Some(e) => boundary_mixes.get(usize::try_from(e).ok()?).copied(),
     }
 }
 
-/// [`epoch_committees`] with the F6 look-ahead applied — the safe entry point.
+/// [`epoch_committees`] with the post-F6 look-ahead applied — a reference
+/// helper, not the shipped transition's unconditional entry point.
 ///
-/// Callers that already hold the correct seed (because the beacon layer
-/// selected it) may call [`epoch_committees`] directly; every other caller
-/// should go through here so the mix-to-epoch binding is decided in exactly
-/// one place. `None` propagates [`seed_mix`]'s missing-history failure.
+/// The production transition must honor
+/// [`crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH`]: below that gate it uses
+/// the legacy `epoch - 1` boundary, while this helper always models the
+/// post-gate rule. Callers that already hold the seed selected by that live
+/// rule may call [`epoch_committees`] directly. `None` propagates
+/// [`seed_mix`]'s missing-history failure.
 pub fn seeded_epoch_committees(
     genesis_mix: &[u8; 32],
     boundary_mixes: &[[u8; 32]],
@@ -175,11 +178,12 @@ fn mutation_restores_zero_stake_filter() -> bool {
 
 /// Partition the active set into one committee per slot of `epoch`.
 ///
-/// `beacon_mix` must be the seed selected by [`seed_mix`] — the mix at the
-/// close of epoch `epoch − 1 − MIN_SEED_LOOKAHEAD_EPOCHS`, not the current
-/// mix. Passing a later mix reintroduces finding F6: the trailing proposers
-/// of the previous epoch regain the power to re-sort this epoch's partition
-/// by withholding reveals. [`seeded_epoch_committees`] does the selection.
+/// `beacon_mix` must be the seed selected by the transition's active rule. At
+/// and after [`crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH`] that is the mix
+/// at the close of `epoch − 1 − MIN_SEED_LOOKAHEAD_EPOCHS`; before the gate
+/// it is the legacy `epoch − 1` mix and F6 remains open. Passing an arbitrary
+/// later mix can likewise give the previous epoch's trailing proposers power
+/// to re-sort this epoch's partition by withholding reveals.
 ///
 /// Returns `SLOTS_PER_EPOCH` committees, each sorted ascending, together
 /// covering every eligible validator exactly once. Committee `i` serves slot
@@ -569,6 +573,17 @@ mod tests {
 
     fn set(n: u32) -> Vec<Validator> {
         (0..n).map(|index| Validator { index, effective_stake: STAKE }).collect()
+    }
+
+    /// A 64-bit epoch must never wrap onto an existing slice entry on a
+    /// 32-bit target. On 64-bit targets it is simply out of range; either way
+    /// missing history is `None`, never the wrong consensus seed.
+    #[test]
+    fn seed_mix_refuses_an_epoch_that_cannot_be_a_slice_index() {
+        let mixes = [[0x22; 32]];
+        let boundary_epoch = u32::MAX as u64 + 1;
+        let epoch = boundary_epoch + MIN_SEED_LOOKAHEAD_EPOCHS + 1;
+        assert_eq!(seed_mix(&[0x11; 32], &mixes, epoch), None);
     }
 
     /// `transition::with_leak_applied`'s exact shape: `saturating_sub`, so a

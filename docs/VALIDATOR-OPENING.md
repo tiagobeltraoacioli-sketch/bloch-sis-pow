@@ -1,11 +1,29 @@
 # Validator opening release checklist
 
-Status: **blocked by conflicting live finalized checkpoints observed on
+Current status, September 14, 2026: **technical admission is active at epoch
+2884; the 64-validator runtime audit and a fresh keyless synchronization have
+passed. Controlled mainnet exit, withdrawal and payout-spend qualification
+and independent production key-generation qualification remain pending.**
+See the [current public evidence](https://blochl1.com/releases/2026-09-14/onboarding-verification.json).
+The historical checklists below retain their original scope; they are not a
+current fleet outage report. Public onboarding availability does not satisfy
+the outstanding ADR-041 settlement criterion.
+
+The September 14 rerun and its retained-log hashes are recorded in
+[source qualification evidence](audit/reproducers/validator-qualification-2026-09-14.json).
+It covers key custody regressions, the offline CLI, withdrawal-guard
+mutations and the isolated full lifecycle. It does not qualify production
+key generation independently or claim a settled mainnet payout.
+The [current operator procedure](https://blochl1.com/docs/validator-qualification.md)
+lists the public funding/identity inputs and settlement evidence still needed.
+
+Historical status, September 13: **blocked by conflicting live finalized checkpoints observed on
 2026-09-13 UTC**. The read-only survey found 56 RPCs on one finalized history,
 six on another and one stale node. Index 63 was subsequently located inactive
 on HOST-006, with an older masked copy on CLASSIC-003. See the
 [preflight and approved recovery reference](audit/VALIDATOR-ACTIVATION-PREFLIGHT-2026-09-13.md).
-No finite lifecycle epoch is configured. The earlier four-process devnet did not reconverge
+The isolated candidate schedules leak recovery at epoch 2880 and the lifecycle
+at epoch 2884 on 2026-09-14; this is not a completed deployment. The earlier four-process devnet did not reconverge
 after a 300-slot partition; its two groups reported conflicting finalized
 roots at epoch 13 under historical pre-1,400/pre-2,700 rules. This does not
 establish a new defect in the current mainnet regime. See the scope below.
@@ -24,6 +42,12 @@ Implementation reference: `21a9311` (ADR-041), merged in `22b8b7f`.
 - Withdrawals pay backed stake to committed credentials; unissued genesis
   principal is written off. Evidence submission and automatic withdrawal and
   RANDAO renewal are implemented.
+- The lifecycle boundary also makes every lifecycle transaction consume the
+  existing block gas and byte budgets. This includes `ExitV2`,
+  `RandaoRecommit`, and `SlashingEvidence`, even though the standalone
+  `STAKING_TX_METERING_ACTIVATION_EPOCH` remains inert: the charge deliberately
+  opens when `WITHDRAWAL_ACTIVATION_EPOCH` opens. This does not charge a money
+  fee and does not add a transaction-count cap.
 
 These are implementation findings, not deployment or independent-audit claims.
 The September 8 admission review describes an older base; its reproductions
@@ -208,3 +232,15 @@ its deadline slot 1012 without a false duplicate report. See
 [protected rehearsal evidence](audit/reproducers/validator-joining-network-protected-2026-09-13.json).
 The current CI rehearsal uses default observation; the earlier bypassed run
 above remains historical evidence.
+
+
+### Monday candidate schedule
+
+The operator selected Monday, 2026-09-14 and delegated the best technical time.
+The candidate uses epoch 2880 at 21:31:19 UTC (18:31:19 America/Sao_Paulo)
+for leak recovery and lifecycle epoch 2884 at 22:35:19 UTC (19:35:19 local).
+Every signer and serving archival must be upgraded before the first boundary.
+Qualification or readiness failure requires a coordinated postponement before
+that boundary; a partial fleet must never cross it. Source scheduling alone
+does not authorize announcing broad external-validator opening before the
+ADR-041 controlled withdrawal-and-spend qualification.

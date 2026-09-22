@@ -1,5 +1,10 @@
 # coherence-prover (Coherence C2b-prover) — SP1 scaffold
 
+> **Activation blocked — CR-01 (2026-09-17).** The current spend statement does
+> not prove recipient spending authority and permits multiple nullifiers for
+> one note. A valid proof of this statement does not make the pool safe. See
+> [the executable evidence and versioned-upgrade requirements](AUTHORIZATION-BLOCKER.md).
+
 The zero-knowledge half of the shielded pool: prove the C1 spend statement
 (`src/coherence::check_spend`) with **SP1** (hash-STARK / FRI, Plonky3) and verify
 the **raw FRI proof** — never SP1's default Groth16 wrapper (that curve SNARK

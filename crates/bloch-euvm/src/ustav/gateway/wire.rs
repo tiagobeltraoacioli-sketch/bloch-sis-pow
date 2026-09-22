@@ -216,7 +216,7 @@ pub fn apply_encoded(
     if bytes.len() > MAX_ENCODED_BYTES {
         return Err(Error::TooLarge);
     }
-    let decoding_gas = 100 + (bytes.len() as u64).div_ceil(32);
+    let decoding_gas = 100u64.saturating_add((bytes.len() as u64).div_ceil(32));
     let remaining = gas_limit.checked_sub(decoding_gas).ok_or(Error::OutOfGas)?;
     let e = decode(bytes)?;
     if e.domain != *gateway.native().domain() {
@@ -246,6 +246,7 @@ pub fn apply_encoded(
             (receipt, Some(release))
         }
     };
-    receipt.gas_used += decoding_gas;
+    debug_assert!(receipt.gas_used <= remaining);
+    receipt.gas_used = receipt.gas_used.saturating_add(decoding_gas);
     Ok(Applied { receipt, release })
 }

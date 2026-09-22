@@ -1,0 +1,41 @@
+Validation wave 10 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Implementation commit: 1f06ef7
+
+PASS
+
+cargo test -p bloch-pos-node --bin bloch-pos --offline engine::admission::tests:: -- --test-threads=1
+  2 passed; source accounting and per-slot/per-identity renewal.
+
+cargo test -p bloch-pos-node --bin bloch-pos --offline \
+  engine::validator_lifecycle::verification_budget_tests::wrapper_stops_before_crypto_and_reopens_on_the_next_slot -- --exact
+  1 passed; exact cached failures do not spend budget, a third distinct
+  authorization is refused before crypto, and the next slot reopens.
+
+cargo test -p bloch-pos-node --bin bloch-pos --offline \
+  engine::validator_admission_tests::admission_negative_cache_funded_authorization_remains_retryable_at_actual_gate -- --exact
+  1 passed with loopback access. State-aware funded authorization retains
+  exact-failure caching and accepts corrected signatures/keys.
+
+cargo test -p bloch-pos-node --bin bloch-pos --offline engine::verification::tests:: -- --test-threads=1
+  2 passed; failure-cache keying and bounded FIFO behavior unchanged.
+
+cargo test -p bloch-pos-node --offline -- --test-threads=4
+  584 passed; 0 failed; 25 ignored across unit and integration binaries.
+  Required loopback socket access outside the restricted sandbox.
+
+git diff --check
+  Passed before implementation commit and repeated for the documentation
+  checkpoint.
+
+CORRECTED TEST ENVIRONMENT FAILURE
+
+The focused funded-deposit regression first failed before its assertions because
+the restricted sandbox denied the fixture's ephemeral loopback bind. The same
+test passed outside that socket restriction. No assertion failure was hidden.
+
+NOT A CLOSURE CLAIM
+
+No production traffic benchmark, peer authentication, cross-node reputation,
+deployment or fleet observation was performed. An unauthenticated sender can
+consume a target's allowance until the next slot, so ST-05 remains partial.

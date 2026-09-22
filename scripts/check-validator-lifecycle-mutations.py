@@ -49,7 +49,10 @@ def main():
                 shutil.copy2(origin, destination)
         env = os.environ.copy()
         env["CARGO_TARGET_DIR"] = str(ROOT / "target" / "validator-lifecycle-mutations")
-        command = ["cargo", "+1.94.1", "test", "--locked", "-p", "bloch-pos-committee",
+        toolchain = subprocess.check_output(
+            ["python3", "-I", str(ROOT / "scripts/pinned-rust-toolchain.py")], text=True
+        ).strip()
+        command = ["cargo", f"+{toolchain}", "test", "--locked", "-p", "bloch-pos-committee",
                    "--lib", "transition::tests::validator_lifecycle::", "--", "--nocapture"]
         for name, old, new in [("control", None, None), *MUTATIONS]:
             (checkout / FILE).write_text(source if old is None else source.replace(old, new))

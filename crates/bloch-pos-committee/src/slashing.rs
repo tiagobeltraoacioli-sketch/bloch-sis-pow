@@ -1,26 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+//! Source schedule: lifecycle epoch 2884, 2026-09-14 22:35:19 UTC.
+//! Evidence is refused before that epoch; valid evidence can apply penalties
+//! at and after it. The wire decoder carries both signed envelopes and the
+//! node observation hook submits detected pairs through ordinary admission.
+//! A source schedule does not establish which binary a fleet runs, deployed
+//! readiness, or an economic settlement guarantee.
+//!
 //! Slashing execution — the state machine behind §7.3.
 //!
-//! > **NOT REACHABLE FROM THE NETWORK (stated 2026-09-01; mechanism changed
-//! > 2026-09-05, verdict unchanged).** Everything in this module is complete,
-//! > unit-tested and correct, and nothing can invoke it on the live chain.
-//! > What stands in the way moved once. As first stated, evidence rode on
-//! > wire tag `0x05` and `transition::PosTransaction::from_canonical_bytes`
-//! > refused that tag unconditionally — the encoder folded the nested
-//! > messages in as the signing roots they were signed over, so the envelopes
-//! > were unrecoverable by construction (Round-2 finding F-02). Since
-//! > 2026-09-05 the tag DECODES (the envelopes travel whole), and what stands
-//! > in the way is the flag day: the transition refuses the evidence
-//! > transaction at every epoch below
-//! > `params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`, which ships INERT at
-//! > `u64::MAX` and is the founder's to arm — after a full fleet rollout of
-//! > the decoder, since the released binaries still refuse the tag at decode.
-//! > Nothing constructs the transaction outside tests. Read the penalties
-//! > below as a *design*, and do not let them back a finality guarantee
-//! > anywhere: the retraction on `bloch-pos-node`'s `rpc::Finality` says why,
-//! > and `crates/bloch-pos-node/tests/slashing_backed_finality_claims.rs`
-//! > keeps this note, that codec and that gate in step.
+//! Historical note: before 2026-09-05, tag `0x05` was structurally
+//! unreachable because `PosTransaction::from_canonical_bytes` refused it.
+//! Later revisions decoded the envelopes but kept the activation epoch at
+//! `u64::MAX`. Neither description is current for this source: the constant is
+//! 2884 and release tests pin it to the lifecycle schedule. Do not infer from
+//! source reachability that a particular deployed network has upgraded or
+//! that finality is economically settled; that requires binary inventory and
+//! finalized-chain evidence. The retraction on `bloch-pos-node`'s
+//! `rpc::Finality` and `slashing_backed_finality_claims.rs` preserve that
+//! operational boundary.
 //!
 //! [`crate::attestation`] supplies *detection* (`surrounds`, `is_double_vote`)
 //! and [`crate::delegation::apply_slash`] supplies the pro-rata *arithmetic*.
@@ -285,6 +283,7 @@ pub struct SlashingOutcome {
 /// `PartialEq` because this is a component of the transition's committed
 /// state, and committed states are compared whole in the determinism tests.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct SlashingState {
     /// Identities of applied evidence. Successful applications only — failed
     /// evidence is not recorded, so a forged submission cannot squat an id
@@ -354,6 +353,14 @@ impl SlashingState {
         self.window.range(floor..=epoch).map(|(_, s)| *s).sum()
     }
 
+    fn priced_window_sat(&self, epoch: u64) -> u128 {
+        let historical_floor = epoch.saturating_sub(CORRELATION_WINDOW_EPOCHS - 1);
+        let floor = crate::params::slashing_economics_v2_start(epoch)
+            .map(|activation| historical_floor.max(activation))
+            .unwrap_or(historical_floor);
+        self.window.range(floor..=epoch).map(|(_, s)| *s).sum()
+    }
+
     /// Effective penalty for an offence judged at `epoch`, given the total
     /// active stake. `base + 3 × slashed_share`, capped at 100%.
     ///
@@ -367,7 +374,7 @@ impl SlashingState {
             return base_bps.min(10_000);
         }
         let amplification =
-            CORRELATION_MULTIPLIER * 10_000 * self.slashed_in_window(epoch) / total_active_sat;
+            CORRELATION_MULTIPLIER * 10_000 * self.priced_window_sat(epoch) / total_active_sat;
         (base_bps + amplification).min(10_000)
     }
 
@@ -388,6 +395,37 @@ impl SlashingState {
         own_bond_sat: u128,
         delegations: &[Delegation],
         total_active_sat: u128,
+        including_proposer: u32,
+        verifier: &dyn SignatureVerifier,
+        keys: &dyn KeyLookup,
+    ) -> Result<SlashingOutcome, EvidenceError> {
+        self.process_with_effective_exposure(
+            evidence,
+            epoch,
+            own_bond_sat,
+            delegations,
+            total_active_sat,
+            0,
+            including_proposer,
+            verifier,
+            keys,
+        )
+    }
+
+    /// Transition entry point for the inactive ST-03 candidate. The extra
+    /// exposure is the offender's weight from the same frozen consensus
+    /// roster whose sum is `total_active_sat`; the legacy public entry point
+    /// above supplies zero because the value is ignored while the gate is
+    /// inert.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn process_with_effective_exposure(
+        &mut self,
+        evidence: &SlashingEvidence,
+        epoch: u64,
+        own_bond_sat: u128,
+        delegations: &[Delegation],
+        total_active_sat: u128,
+        offender_effective_sat: u128,
         including_proposer: u32,
         verifier: &dyn SignatureVerifier,
         keys: &dyn KeyLookup,
@@ -435,6 +473,7 @@ impl SlashingState {
             own_bond_sat,
             delegations,
             total_active_sat,
+            offender_effective_sat,
             including_proposer,
         ))
     }
@@ -464,6 +503,34 @@ impl SlashingState {
         own_bond_sat: u128,
         delegations: &[Delegation],
         total_active_sat: u128,
+        including_proposer: u32,
+        verifier: &dyn SignatureVerifier,
+        keys: &dyn KeyLookup,
+    ) -> Result<SlashingOutcome, EvidenceError> {
+        self.process_proposer_with_effective_exposure(
+            first,
+            second,
+            epoch,
+            own_bond_sat,
+            delegations,
+            total_active_sat,
+            0,
+            including_proposer,
+            verifier,
+            keys,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn process_proposer_with_effective_exposure(
+        &mut self,
+        first: &ProposalEnvelope,
+        second: &ProposalEnvelope,
+        epoch: u64,
+        own_bond_sat: u128,
+        delegations: &[Delegation],
+        total_active_sat: u128,
+        offender_effective_sat: u128,
         including_proposer: u32,
         verifier: &dyn SignatureVerifier,
         keys: &dyn KeyLookup,
@@ -526,6 +593,7 @@ impl SlashingState {
             own_bond_sat,
             delegations,
             total_active_sat,
+            offender_effective_sat,
             including_proposer,
         ))
     }
@@ -545,6 +613,7 @@ impl SlashingState {
         own_bond_sat: u128,
         delegations: &[Delegation],
         total_active_sat: u128,
+        offender_effective_sat: u128,
         including_proposer: u32,
     ) -> SlashingOutcome {
         // 5. Price the offence from the window as it stood before this slash.
@@ -576,13 +645,20 @@ impl SlashingState {
         // 7. Commit: mark the evidence spent, eject the validator, feed the
         //    window so the *next* correlated offence costs more, and prune
         //    entries the window can no longer see (bounded state). The
-        //    correlation window is still fed the FULL total — correlation
-        //    amplification prices how much stake was put at risk across the
-        //    network, which is the pro-rata sum, not only what this crate can
-        //    prove was already debited.
+        //    legacy rule feeds the full raw-bond loss. The inactive ST-03
+        //    candidate instead feeds the penalty applied to the offender's
+        //    effective consensus exposure. That numerator and
+        //    `total_active_sat` then come from the same capped/leaked roster;
+        //    a raw founder bond cannot be divided by a much smaller effective
+        //    denominator and spuriously saturate the next penalty.
         self.applied.insert(id);
         self.ejected.insert(validator);
-        *self.window.entry(epoch).or_insert(0) += total_slashed_sat;
+        let window_loss_sat = if crate::params::slashing_economics_v2_active(epoch) {
+            offender_effective_sat.saturating_mul(penalty_bps.min(10_000)) / 10_000
+        } else {
+            total_slashed_sat
+        };
+        *self.window.entry(epoch).or_insert(0) += window_loss_sat;
         let floor = epoch.saturating_sub(CORRELATION_WINDOW_EPOCHS - 1);
         self.window.retain(|e, _| *e >= floor);
 
@@ -800,6 +876,56 @@ mod tests {
         assert_eq!(second.penalty_bps, 950);
         assert!(second.penalty_bps > first.penalty_bps);
         assert_eq!(second.total_slashed_sat, 9_500); // 9.5% of 100k
+    }
+
+    /// ST-03 reproducer and candidate boundary. A founder-sized raw bond can
+    /// be much larger than its capped/leaked consensus weight. Feeding the
+    /// raw loss to a window divided by effective total stake saturates the
+    /// very next offence; the inactive candidate records the loss applied to
+    /// effective exposure instead, so numerator and denominator share units.
+    #[test]
+    fn effective_exposure_candidate_prevents_raw_bond_amplification() {
+        const EFFECTIVE_TOTAL: u128 = 414_000;
+        const EFFECTIVE_OFFENDER: u128 = 138_000;
+        const RAW_BOND: u128 = 5_700_000;
+
+        let mut legacy = SlashingState::new();
+        let first = legacy
+            .process(
+                &double_vote(7),
+                10,
+                RAW_BOND,
+                &[],
+                EFFECTIVE_TOTAL,
+                99,
+                &RootEchoVerifier,
+                &AnyKey,
+            )
+            .unwrap();
+        assert_eq!(first.total_slashed_sat, 285_000);
+        assert_eq!(legacy.penalty_bps(500, 10, EFFECTIVE_TOTAL), 10_000);
+
+        let _candidate = crate::params::slashing_economics_v2_rehearsal::open_at(10);
+        let mut staged = SlashingState::new();
+        // A future activation cannot reinterpret already-committed legacy
+        // raw-loss entries as effective losses. They remain in state for
+        // replay and state-root continuity, but V2 prices only its own units.
+        staged.window.insert(9, 285_000);
+        staged
+            .process_with_effective_exposure(
+                &double_vote(7),
+                10,
+                RAW_BOND,
+                &[],
+                EFFECTIVE_TOTAL,
+                EFFECTIVE_OFFENDER,
+                99,
+                &RootEchoVerifier,
+                &AnyKey,
+            )
+            .unwrap();
+        assert_eq!(staged.window[&10], 6_900);
+        assert_eq!(staged.penalty_bps(500, 10, EFFECTIVE_TOTAL), 1_000);
     }
 
     #[test]

@@ -2,13 +2,13 @@
 
 //! Justification and finality — the Casper-style gadget (§5.1, §6.5.2).
 //!
-//! One checkpoint per epoch (`EPOCHS_PER_CHECKPOINT = 1`). The **full epoch
-//! committee of 128** votes once at the epoch boundary; those votes — and only
-//! those — drive justification and finality. The per-slot subcommittee of 8
-//! exists purely to give LMD-GHOST intra-epoch fork-choice weight (§6.5.2) and
-//! must never be fed into this module: its members are not in the epoch
-//! committee for that epoch (different sortition role tag), so its votes are
-//! rejected here by the membership check rather than by caller discipline.
+//! One checkpoint per epoch (`EPOCHS_PER_CHECKPOINT = 1`). The active registry
+//! is deterministically partitioned across that epoch's slots, and each
+//! validator's slot attestation carries both intra-epoch fork-choice weight and
+//! its epoch justification vote. [`crate::finality::votes_from_partition`]
+//! admits only the member assigned to that attestation's slot; those admitted
+//! votes — and only those — drive justification and finality. The older sampled
+//! 8/128 committee design survives only in reference sortition APIs.
 //!
 //! ## The rules
 //!
@@ -23,9 +23,10 @@
 //!   checkpoint becomes finalized. A justified checkpoint whose next epoch also
 //!   justifies (building on it) is final.
 //! - **Inactivity leak.** After `INACTIVITY_LEAK_THRESHOLD_EPOCHS` (4) epochs
-//!   without finality, committee members who fail to cast a valid vote bleed
-//!   stake quadratically, until the remaining live stake is again ≥ 2/3 of the
-//!   (shrunken) total and finality resumes.
+//!   without finality, an accounting accumulator quadratically discounts the
+//!   quorum weight of members who fail to cast a valid vote, until the live
+//!   weight is again ≥ 2/3 of the adjusted total and finality resumes. It does
+//!   not debit `ValidatorRecord::staked_sat`, burn coins or change supply.
 //!
 //! ## Why the source must be the highest justified checkpoint
 //!
@@ -68,9 +69,10 @@
 //! ledger is a function of the attestations *this node heard*. Two nodes that
 //! heard different subsets hold different denominators, so "two disjoint 2/3
 //! quorums out of one total" never has to happen — each side is a 2/3 quorum
-//! out of its OWN, smaller total. With no floor on that denominator (which is
-//! the shipped configuration BELOW epoch 2700; the gate was armed at 2700 on
-//! 2026-09-06) a set of any size finalizes alone once the stall is long enough:
+//! out of its OWN, smaller total. For blocks below epoch 2880 the source uses
+//! no floor on that denominator; the replacement gate was scheduled at 2880
+//! after the epoch-2700 deadline was missed. Under that pre-gate rule, a set of
+//! any size finalizes alone once the stall is long enough:
 //! one node needs 28 epochs, four need 25.
 //!
 //! That is not a hypothetical — it is the 2026-08-24 incident, three nodes
@@ -90,6 +92,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// A checkpoint: the block root chosen at an epoch boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct Checkpoint {
     pub epoch: u64,
     pub root: [u8; 32],
@@ -162,6 +165,7 @@ pub enum FinalityError {
 /// Justification/finality state. A pure function of `(genesis, vote history)`:
 /// see the module docs for why this is load-bearing and not a platitude.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct FinalityState {
     /// Every justified checkpoint, keyed by epoch. At most one per epoch — the
     /// disjoint-quorums argument in the module docs. Kept whole (not pruned at
@@ -211,40 +215,24 @@ impl FinalityState {
     /// Shipping this alone would leave the defect intact — a fresh ledger
     /// starts diverging again the first time two nodes' zero-sets differ.
     ///
-    /// # Why it is presently identical to [`FinalityState::new`]
+    /// # Relaunch and restart are different operations
     ///
-    /// Because `new` already starts empty, and — verified across the whole
-    /// workspace on 2026-08-24 — **nothing ever reconstructs `leaked` from
-    /// committed state**. `leaked` is *written* into the state root as
-    /// [`crate::state_root::LeakRecord`]s and is never read back; the only
-    /// production constructors are `new` (from `CommittedState::genesis`) and
-    /// [`crate::ws::anchor`], both of which start empty. So a
-    /// relaunch-from-genesis already inherits nothing.
-    ///
-    /// That makes this a *pin*, not a patch, and the pin is the point: it
-    /// gives the relaunch one named call site, and
-    /// `the_relaunch_opens_its_books_with_an_empty_leak_ledger` fails the
-    /// build the day someone adds a restore path and quietly wires it here.
-    ///
-    /// # Known asymmetry, stated rather than fixed (LATENT — no live caller)
-    ///
-    /// Because the ledger is committed but never restored, a node that boots
-    /// from a weak-subjectivity checkpoint holds `leaked = {}` while a node
-    /// that replayed the same history holds the accrued balance. Once
-    /// [`crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH`] binds, those two
-    /// nodes derive **different** consensus rosters from the same chain — the
-    /// §5.5 failure shape exactly. It is latent today only because
-    /// [`crate::ws::anchor`] has no caller in the node. Fixing it means either
-    /// restoring the ledger from the checkpoint or dropping it from the state
-    /// root; both are consensus changes and neither belongs in this relaunch.
+    /// Relaunch opens new genesis books and therefore deliberately starts
+    /// with an empty leak ledger. The feature-gated local restart cache instead
+    /// preserves the complete FinalityState, including `leaked` and the epoch
+    /// cursor. It must never call this constructor to restore an existing chain.
+    /// A bare weak-subjectivity anchor also starts empty and is not sufficient
+    /// state for continuing execution of a historical chain.
     pub fn relaunch(genesis: Checkpoint) -> Self {
         let st = Self::new(genesis);
         debug_assert!(st.leaked.is_empty(), "a relaunch must not inherit a leak balance");
         st
     }
 
-    /// Total stake the inactivity leak has destroyed, across every validator.
-    /// Zero on a state that has inherited nothing — which is what makes
+    /// Total quorum weight currently discounted by the inactivity leak across
+    /// every validator. This is not a coin burn: the bonded `staked_sat` and
+    /// supply accounting remain unchanged. Zero on a state that has inherited
+    /// nothing — which is what makes
     /// "the relaunch starts clean" a number the caller can assert on rather
     /// than a property it has to take on trust.
     pub fn leaked_total(&self) -> u128 {
@@ -519,8 +507,8 @@ impl FinalityState {
         if leaking {
             // Linear-in-time per-epoch bite ⇒ quadratic cumulative loss, the
             // classic Casper shape: the longer the stall, the faster absent
-            // stake evaporates, so recovery time is bounded instead of
-            // drifting with the size of the absent fraction.
+            // quorum weight is discounted, so recovery time is bounded
+            // instead of drifting with the size of the absent fraction.
             // Cannot underflow: `leaking` is exactly
             // `since_finality > INACTIVITY_LEAK_THRESHOLD_EPOCHS`.
             #[allow(clippy::arithmetic_side_effects)]
@@ -1040,7 +1028,7 @@ mod tests {
     #[test]
     fn a_partitioned_minority_finalizes_because_the_leak_shrinks_the_denominator() {
         let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
-        let (epoch, destroyed_pct) = run_partition(false);
+        let (epoch, discounted_pct) = run_partition(false);
         let epoch = epoch.expect(
             "a 4-of-64 partition must eventually self-finalize — if it never does, the \
              leak-adjusted denominator is not the mechanism and this analysis is wrong",
@@ -1055,7 +1043,8 @@ mod tests {
         );
         println!(
             "FALSE QUORUM: 4 of 64 validators (6.25%) first justified at epoch {epoch} of \
-             non-finality, after the leak destroyed {destroyed_pct:.1}% of total network stake"
+             non-finality, after the leak discounted {discounted_pct:.1}% of total network \
+             quorum weight"
         );
     }
 
@@ -1463,6 +1452,78 @@ mod tests {
         );
     }
 
+    /// FC-07 attack regression: the one-half denominator floor permits two
+    /// disjoint one-third partitions to finalize different checkpoints after
+    /// the absent stake leaks. Each validator signs on only one branch, so
+    /// neither branch observes an equivocator and there is no double vote to
+    /// slash. This pins the accepted residual; it is not a candidate fix.
+    #[test]
+    fn disjoint_one_third_partitions_finalize_conflicting_checkpoints_without_equivocation() {
+        let _gates = crate::params::rehearsal::gates_open_guard();
+        let committee = [
+            validator(0, STAKE_EACH),
+            validator(1, STAKE_EACH),
+            validator(2, STAKE_EACH),
+        ];
+        let branch_root = |marker: u8, epoch: u64| {
+            let mut out = [marker; 32];
+            out[..8].copy_from_slice(&epoch.to_le_bytes());
+            out
+        };
+        let mut left = FinalityState::new(genesis());
+        let mut right = FinalityState::new(genesis());
+        let mut left_finalized = None;
+        let mut right_finalized = None;
+
+        for epoch in 1..=128 {
+            let left_vote = [vote(
+                0,
+                epoch,
+                branch_root(0xA1, epoch),
+                left.current_justified(),
+            )];
+            let right_vote = [vote(
+                1,
+                epoch,
+                branch_root(0xB2, epoch),
+                right.current_justified(),
+            )];
+            let left_out = left
+                .process_epoch(&EpochVotes {
+                    epoch,
+                    active_set: &committee,
+                    attestations: &left_vote,
+                })
+                .unwrap();
+            let right_out = right
+                .process_epoch(&EpochVotes {
+                    epoch,
+                    active_set: &committee,
+                    attestations: &right_vote,
+                })
+                .unwrap();
+
+            assert!(left_out.equivocators.is_empty());
+            assert!(right_out.equivocators.is_empty());
+            left_finalized = left_finalized.or(left_out.finalized);
+            right_finalized = right_finalized.or(right_out.finalized);
+            if left_finalized.is_some() && right_finalized.is_some() {
+                break;
+            }
+        }
+
+        let left_finalized = left_finalized.expect("one third must finalize under the 1/2 floor");
+        let right_finalized =
+            right_finalized.expect("the disjoint one third must also finalize under the 1/2 floor");
+        assert_eq!(left_finalized.epoch, right_finalized.epoch);
+        assert_ne!(left_finalized.root, right_finalized.root);
+        assert_eq!(
+            (left_finalized.epoch, right_finalized.epoch),
+            (18, 18),
+            "the symmetric branches must cross the floor on the same measured schedule",
+        );
+    }
+
     // ── TASK 1: zeroing the leak accumulator for the relaunch ──────────────
     //
     // SECOND LINE OF DEFENCE. Dev A's roster unification is the fix. These
@@ -1618,50 +1679,16 @@ mod tests {
         );
     }
 
-    /// **The ledger is committed but never restored** — stated as a finding,
-    /// not fixed here.
-    ///
-    /// `transition.rs` writes every entry into the state root as a
-    /// `LeakRecord`. Nothing anywhere reads them back into a `FinalityState`:
-    /// the ledger is rebuilt only by replaying history. So a checkpoint-booted
-    /// node and a replaying node hold different ledgers for the same chain,
-    /// and once `LEAKED_ROSTER_ACTIVATION_EPOCH` binds they derive different
-    /// consensus rosters from it — the §5.5 shape again. Latent only because
-    /// `ws::anchor` has no caller in the node.
+    /// A WS trust anchor alone is not a restart-state snapshot. The local
+    /// cache codec preserves this ledger separately; it never calls anchor().
     #[test]
-    fn the_leak_ledger_is_committed_but_never_restored() {
-        let transition = include_str!("transition.rs");
-        assert!(
-            transition.contains(".leaked_stakes()"),
-            "the write side vanished; then this finding is stale and must be re-derived"
-        );
-        // Same stripping as `the_leak_ledger_shrinks_only_under_a_governed_rule`,
-        // and for the same reason: `include_str!` reads THIS test too, so the
-        // needles below would otherwise match their own assertion and report a
-        // restore path that does not exist. That is exactly what happened on
-        // the first recorded run of `scripts/prova-relanca.sh` — the gate went
-        // red against an unchanged tree. A self-matching guard is a false
-        // alarm, and a false alarm gets deleted rather than answered.
-        let finality: String = include_str!("finality.rs")
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with("//") && !t.contains("concat!(")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        for needle in [concat!("fn from", "_committed"), concat!("fn with", "_leaked")] {
-            assert!(
-                !finality.contains(needle),
-                "a restore path appeared (`{needle}`). GOOD — but the relaunch must now \
-                 decide what it restores FROM, and `relaunch()` must be re-read before it \
-                 is trusted."
-            );
-        }
-        println!(
-            "FINDING (latent): `leaked` is committed as LeakRecord and never read back; \
-             a ws-checkpoint boot and a replay boot disagree on the ledger by construction"
-        );
+    fn a_bare_ws_anchor_does_not_restore_the_leak_ledger() {
+        let cp = ws_fixture();
+        let mut historical = crate::ws::anchor(&cp);
+        historical.leaked.insert(7, 123);
+        let bare = crate::ws::anchor(&cp);
+        assert!(bare.leaked.is_empty());
+        assert_ne!(bare, historical);
     }
 
     /// Minimal checkpoint fixture; `anchor` reads only `epoch`/`block_root`.
@@ -1879,9 +1906,9 @@ mod tests {
                 })
                 .unwrap();
             if out.justified.is_some() {
-                let destroyed: u64 = (0..64u32).map(|v| st.leaked_of(v)).sum();
+                let discounted: u64 = (0..64u32).map(|v| st.leaked_of(v)).sum();
                 let total = STAKE_EACH as u128 * 64;
-                return (Some(e), destroyed as f64 / total as f64 * 100.0);
+                return (Some(e), discounted as f64 / total as f64 * 100.0);
             }
         }
         (None, 0.0)
@@ -1996,4 +2023,22 @@ mod tests_hook {
     /// Thread-local; see `params::rehearsal::TlFlag`.
     pub(super) static DISABLE_LEAK_RECOVERY: crate::params::rehearsal::TlFlag =
         crate::params::rehearsal::TlFlag(&DISABLE_LEAK_RECOVERY_TL);
+}
+
+#[cfg(all(test, feature = "local-state-cache"))]
+mod local_cache_tests {
+    use super::*;
+    #[test]
+    fn local_cache_preserves_leak_and_finality_history() {
+        let mut state = FinalityState::new(Checkpoint { epoch: 0, root: [1; 32] });
+        state.leaked.insert(7, 123456);
+        state.justified.insert(10, [2; 32]);
+        state.current_justified = Checkpoint { epoch: 10, root: [2; 32] };
+        state.finalized = Checkpoint { epoch: 9, root: [3; 32] };
+        state.next_epoch = 11;
+        let encoded = bincode::serialize(&state).unwrap();
+        let restored: FinalityState = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.leaked.get(&7), Some(&123456));
+    }
 }

@@ -21,9 +21,10 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 PARAMS = Path("crates/bloch-pos-committee/src/params.rs")
 CURRENT = {"LEAKED_ROSTER": "1400", "TRANSFER_WITNESS_DEDUP": "800",
-           "BLOCK_BYTES_V2": "800", "LEAK_RECOVERY": "2_700"}
+           "BLOCK_BYTES_V2": "800", "LEAK_RECOVERY": "2_880"}
 LIFECYCLE = ("FUNDED_VALIDATOR_ADMISSION", "EXIT_AUTH", "WITHDRAWAL",
              "SLASHING_EVIDENCE", "RANDAO_RECOMMIT")
+SHIPPING_LIFECYCLE = "2_884"
 TEST = "engine::validator_admission_tests::funded_activation_boundary_rehearsal"
 
 
@@ -31,13 +32,13 @@ def rewrite_params(source, activation):
     if not 2 <= activation <= 16:
         raise ValueError("Rehearsal activation must be between epochs 2 and 16")
     finite = dict(re.findall(r"^pub const ([A-Z0-9_]+)_ACTIVATION_EPOCH: u64 = ([0-9_]+);$", source, re.M))
-    if finite != CURRENT:
+    if finite != {**CURRENT, **{name: SHIPPING_LIFECYCLE for name in LIFECYCLE}}:
         raise ValueError("Finite shipping gates changed; review the current-regime inventory")
     result = source
     # Keep a pre-gate epoch: existing boundary tests compile expressions for
     # the slot preceding the byte-accounting flag day, even when filtered out.
     overrides = {**{name: (value, 1) for name, value in CURRENT.items()},
-                 **{name: ("u64::MAX", activation) for name in LIFECYCLE}}
+                 **{name: (SHIPPING_LIFECYCLE, activation) for name in LIFECYCLE}}
     for name, (old, new) in overrides.items():
         anchor = f"pub const {name}_ACTIVATION_EPOCH: u64 = {old};"
         if result.count(anchor) != 1:

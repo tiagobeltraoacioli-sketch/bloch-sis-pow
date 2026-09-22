@@ -15,7 +15,7 @@
 //! block time and uses a 2-day half-life. Both are protocol constants
 //! and changing them is a hard fork.
 
-use crate::error::BitsError;
+use crate::error::{AsertError, BitsError};
 use crate::params::AUX_HASH_LEN;
 
 /// Target block time in seconds (= 30s). Hard-fork constant.
@@ -202,6 +202,34 @@ pub fn hash_meets_target(hash: &[u8], target: &Target) -> bool {
     false
 }
 
+/// Checked ASERT adjustment for callers validating untrusted inputs.
+///
+/// Rejects height regression, invalid/zero anchor targets, and every arithmetic
+/// overflow rather than panicking or using the compatibility target sentinel.
+/// On accepted inputs the integer arithmetic, rounding and regime bounds are
+/// identical to [`asert_next_bits`]. This API does not activate a consensus
+/// rule or migrate historical replay callers.
+pub fn try_asert_next_bits(
+    anchor_bits: u32,
+    anchor_timestamp: i64,
+    anchor_height: u64,
+    prev_timestamp: i64,
+    new_height: u64,
+) -> Result<u32, AsertError> {
+    let delta = new_height.checked_sub(anchor_height).ok_or(AsertError::HeightBeforeAnchor)?;
+    let height_delta = i64::try_from(delta).map_err(|_| AsertError::ArithmeticOverflow)?;
+    let time_delta = prev_timestamp.checked_sub(anchor_timestamp).ok_or(AsertError::ArithmeticOverflow)?;
+    let schedule = TARGET_BLOCK_TIME.checked_mul(height_delta).ok_or(AsertError::ArithmeticOverflow)?;
+    let exp_num = time_delta.checked_sub(schedule).ok_or(AsertError::ArithmeticOverflow)?;
+    let exponent = exp_num.checked_mul(1000).ok_or(AsertError::ArithmeticOverflow)? / ASERT_HALFLIFE;
+    let target = try_bits_to_target(anchor_bits).map_err(AsertError::InvalidAnchor)?;
+    if target == Target::MIN {
+        return Err(AsertError::ZeroAnchorTarget);
+    }
+    let bound = if anchor_height > 0 { 260_000 } else { 2_000 };
+    Ok(target_to_bits(&scale_target_by_pow2_milli(&target, exponent, bound)))
+}
+
 /// ASERT difficulty adjustment.
 ///
 /// Computes the new compact "bits" target for a block at `new_height`
@@ -216,6 +244,12 @@ pub fn hash_meets_target(hash: &[u8], target: &Target) -> bool {
 ///
 /// # Returns
 /// New compact bits for the block.
+///
+/// Historical compatibility entry point: arithmetic is intentionally unchanged.
+/// Invalid heights or extreme timestamps can panic in checked builds or wrap
+/// in unchecked builds. New input-validation callers should use
+/// [`try_asert_next_bits`]; moving historical consensus callers requires a
+/// separate compatibility review.
 ///
 /// # Algorithm
 /// ASERT corrects toward an absolute schedule: each block's expected
@@ -501,5 +535,47 @@ mod tests {
             .map(|(x, y)| (*x as i32 - *y as i32).abs())
             .sum::<i32>();
         assert!(diff < 256, "on-schedule ASERT drifted: diff={diff}");
+    }
+}
+
+#[cfg(test)]
+mod audit_checked_asert_tests {
+    use super::*;
+
+    #[test]
+    fn checked_asert_rejects_height_and_all_arithmetic_overflow_shapes() {
+        assert_eq!(try_asert_next_bits(0x1d00ffff, 0, 2, 0, 1), Err(AsertError::HeightBeforeAnchor));
+        for (anchor_time, anchor_height, previous_time, height) in [
+            (0, 0, 0, u64::MAX), // height conversion
+            (i64::MIN, 0, i64::MAX, 1), // timestamp subtraction
+            (0, 0, 0, i64::MAX as u64), // schedule multiplication
+            (0, 0, i64::MIN, 1), // exponent subtraction
+            (0, 0, i64::MAX, 0), // exponent multiplication
+        ] {
+            assert_eq!(try_asert_next_bits(0x1d00ffff, anchor_time, anchor_height, previous_time, height),
+                Err(AsertError::ArithmeticOverflow));
+        }
+    }
+
+    #[test]
+    fn checked_asert_rejects_invalid_and_rounded_zero_anchor() {
+        for bits in [0, 0x1d80ffff, 0xff00ffff, 0x22000100] {
+            assert!(matches!(try_asert_next_bits(bits, 0, 0, 30, 1), Err(AsertError::InvalidAnchor(_))));
+        }
+        assert_eq!(try_asert_next_bits(0x01000001, 0, 0, 30, 1), Err(AsertError::ZeroAnchorTarget));
+    }
+
+    #[test]
+    fn checked_asert_matches_historical_arithmetic_in_both_regimes() {
+        for anchor_height in [0, 12345] {
+            for delta in [0, 1, 2880, 1_000_000] {
+                for drift in [-10_000_000, -172_800, -1, 0, 1, 172_800, 10_000_000] {
+                    let previous_time = 1000 + delta as i64 * TARGET_BLOCK_TIME + drift;
+                    let args = (0x1d00ffff, 1000, anchor_height, previous_time, anchor_height + delta);
+                    assert_eq!(try_asert_next_bits(args.0, args.1, args.2, args.3, args.4),
+                        Ok(asert_next_bits(args.0, args.1, args.2, args.3, args.4)));
+                }
+            }
+        }
     }
 }

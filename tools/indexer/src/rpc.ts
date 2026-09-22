@@ -15,7 +15,7 @@
 import { parseSats, parseJsonExactIntegers } from "./sats.js";
 
 export interface JsonRpcTransport {
-  call(method: string, params: unknown[]): Promise<unknown>;
+  call(method: string, params: unknown[], signal?: AbortSignal): Promise<unknown>;
 }
 
 export class RpcError extends Error {
@@ -38,22 +38,58 @@ export function unwrapResult(result: unknown, method: string): unknown {
  * the connection and never answers stalled the poll loop indefinitely — no
  * progress, no error, no log. */
 const RPC_TIMEOUT_MS = 10_000;
+export const MAX_RPC_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+/** Bound streamed/decompressed bytes even when Content-Length is absent or false. */
+export async function readBoundedResponse(res: Response, method: string): Promise<string> {
+  const declared = res.headers.get("content-length");
+  if (declared !== null && Number(declared) > MAX_RPC_RESPONSE_BYTES) {
+    await res.body?.cancel();
+    throw new RpcError("RPC response exceeds 8 MiB", method);
+  }
+  const reader = res.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      size += chunk.value.byteLength;
+      if (size > MAX_RPC_RESPONSE_BYTES) {
+        await reader.cancel();
+        throw new RpcError("RPC response exceeds 8 MiB", method);
+      }
+      chunks.push(chunk.value);
+    }
+  } finally { reader.releaseLock(); }
+  return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, size));
+}
 
 export class HttpTransport implements JsonRpcTransport {
-  constructor(private readonly url: string, private readonly apiKey?: string) {}
-  async call(method: string, params: unknown[]): Promise<unknown> {
+  constructor(private readonly url: string, private readonly apiKey?: string) {
+    const parsed = new URL(url);
+    const local = ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname.toLowerCase().replace(/\.$/, ""));
+    if (parsed.username || parsed.password || parsed.hash
+        || (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && local))) {
+      throw new Error("RPC requires HTTPS outside loopback, without URL credentials or fragments");
+    }
+  }
+  async call(method: string, params: unknown[], signal?: AbortSignal): Promise<unknown> {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (this.apiKey) headers["x-api-key"] = this.apiKey;
     const res = await fetch(this.url, {
       method: "POST",
       headers,
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-      signal: AbortSignal.timeout(RPC_TIMEOUT_MS),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(RPC_TIMEOUT_MS)]) : AbortSignal.timeout(RPC_TIMEOUT_MS),
+      redirect: "error",
     });
+    const text = await readBoundedResponse(res, method);
     if (!res.ok) {
       let detail = `${res.status} ${res.statusText}`;
       try {
-        const j = parseJsonExactIntegers(await res.text()) as { error?: { code?: number; message?: string } };
+        const j = parseJsonExactIntegers(text) as { error?: { code?: number; message?: string } };
         if (j.error?.message) detail = j.error.message;
         throw new RpcError(detail, method, j.error?.code);
       } catch (e) {
@@ -64,10 +100,17 @@ export class HttpTransport implements JsonRpcTransport {
     // NOT res.json(): that routes every JSON number through a double, which
     // silently rounds satoshi amounts above 2^53. parseJsonExactIntegers keeps
     // oversized integer literals as their raw digit strings for parseSats.
-    const body = parseJsonExactIntegers(await res.text()) as {
+    const body = parseJsonExactIntegers(text) as {
+      jsonrpc?: unknown;
+      id?: unknown;
       result?: unknown;
       error?: { code?: number; message?: string };
     };
+    if (!body || typeof body !== "object" || Array.isArray(body) || body.jsonrpc !== "2.0" || body.id !== 1
+        || Object.hasOwn(body, "result") === Object.hasOwn(body, "error")
+        || (Object.hasOwn(body, "error") && (!body.error || typeof body.error !== "object" || Array.isArray(body.error)))) {
+      throw new RpcError("invalid JSON-RPC response envelope", method);
+    }
     if (body.error) throw new RpcError(body.error.message ?? "rpc error", method, body.error.code);
     return unwrapResult(body.result, method);
   }
@@ -107,22 +150,30 @@ interface WireTx {
  * sequences stay `number`.
  */
 export function normalizeTx(raw: WireTx, where = "tx"): Tx {
-  const txid = String(raw.txid ?? "");
+  const uint = (value: unknown, field: string): number => {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff) {
+      throw new RpcError(`invalid ${field}`, "getblockbyheight");
+    }
+    return value;
+  };
+  if (!raw || typeof raw !== "object" || typeof raw.txid !== "string" || !raw.txid
+      || typeof raw.coinbase !== "boolean" || !Array.isArray(raw.inputs) || !Array.isArray(raw.outputs)) {
+    throw new RpcError("invalid transaction shape", "getblockbyheight");
+  }
+  const txid = raw.txid;
   return {
     txid,
-    coinbase: raw.coinbase === true,
-    inputs: (raw.inputs ?? []).map((i) => ({
-      prev_txid: String(i.prev_txid ?? ""),
-      prev_index: Number(i.prev_index ?? 0),
-      sequence: i.sequence === undefined ? undefined : Number(i.sequence),
-    })),
-    outputs: (raw.outputs ?? []).map((o, i) => {
-      const index = o.index === undefined ? i : Number(o.index);
-      return {
-        index,
-        value: parseSats(o.value, `${where} ${txid}:${index} value`),
-        script_pubkey: String(o.script_pubkey ?? ""),
-      };
+    coinbase: raw.coinbase,
+    inputs: raw.inputs.map(i => {
+      if (!i || typeof i.prev_txid !== "string" || !i.prev_txid) throw new RpcError("invalid transaction input", "getblockbyheight");
+      return { prev_txid: i.prev_txid, prev_index: uint(i.prev_index, "input index"),
+        sequence: i.sequence === undefined ? undefined : uint(i.sequence, "sequence") };
+    }),
+    outputs: raw.outputs.map((o, position) => {
+      if (!o || typeof o.script_pubkey !== "string") throw new RpcError("invalid transaction output", "getblockbyheight");
+      const index = uint(o.index, "output index");
+      if (index !== position) throw new RpcError("output indices do not match wire positions", "getblockbyheight");
+      return { index, value: parseSats(o.value, `${where} ${txid}:${index} value`), script_pubkey: o.script_pubkey };
     }),
   };
 }
@@ -154,25 +205,33 @@ export class RpcClient {
   }
 
   /** Returns null when the height is not present (node error "height not found"). */
-  async getBlockHash(height: number): Promise<string | null> {
+  async getBlockHash(height: number, signal?: AbortSignal): Promise<string | null> {
     try {
-      return (await this.transport.call("getblockhash", [height])) as string;
+      const hash = await this.transport.call("getblockhash", [height], signal);
+      if (typeof hash !== "string" || hash.length === 0) throw new RpcError("invalid block hash response", "getblockhash");
+      return hash;
     } catch (e) {
-      if (e instanceof RpcError && /not found/i.test(e.message)) return null;
+      if (e instanceof RpcError && /^height not found$/i.test(e.message)) return null;
       throw e;
     }
   }
 
   /** Returns null when the height is not present. Always requests verbose=true. */
-  async getBlockByHeight(height: number): Promise<Block | null> {
+  async getBlockByHeight(height: number, signal?: AbortSignal): Promise<Block | null> {
     try {
-      const raw = (await this.transport.call("getblockbyheight", [height, true])) as {
+      const raw = (await this.transport.call("getblockbyheight", [height, true], signal)) as {
         hash: string;
         height: number;
         parents?: string[];
         timestamp?: number;
         transactions?: WireTx[];
       };
+      if (!raw || typeof raw !== "object" || typeof raw.hash !== "string" || !raw.hash
+          || !Number.isSafeInteger(raw.height) || raw.height < 0
+          || !Array.isArray(raw.parents) || !raw.parents.every(p => typeof p === "string" && p.length > 0)
+          || !Array.isArray(raw.transactions)) {
+        throw new RpcError("invalid verbose block shape", "getblockbyheight");
+      }
       return {
         hash: raw.hash,
         height: raw.height,
@@ -181,7 +240,7 @@ export class RpcClient {
         transactions: (raw.transactions ?? []).map((t) => normalizeTx(t, `block ${height}`)),
       };
     } catch (e) {
-      if (e instanceof RpcError && /not found/i.test(e.message)) return null;
+      if (e instanceof RpcError && /^height not found$/i.test(e.message)) return null;
       throw e;
     }
   }

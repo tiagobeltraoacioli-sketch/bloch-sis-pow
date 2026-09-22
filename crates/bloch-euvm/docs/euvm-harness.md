@@ -98,8 +98,8 @@ activation. Nothing in `harness.rs` special-cases it, and nothing would need to.
 - **`lib.rs` is untouched.** The only integration-phase change queued is one line,
   `pub mod harness;`, added by the integrator — confirmed absent from the tracked
   `lib.rs` as of this note.
-- **Test count independently reproduced.** Copying the crate to a scratch directory,
-  adding `pub mod harness;` there, and running `cargo test` reproduces **24 passed, 0
+- **Independent local test rerun recorded.** Copying the crate to a scratch directory,
+  adding `pub mod harness;` there, and running `cargo test` produced **24 passed, 0
   failed** (17 pre-existing lib.rs tests + 7 new harness tests) — matching the dev
   report.
 - **Known modeling gap (flagged in the module's own doc comment, worth restating

@@ -1,10 +1,10 @@
 //! Coherence shielded-spend prover service (SP1 / hash-STARK / FRI).
 //!
-//! Deployed on a server with the SP1 toolchain (Fly.io / Akash GPU). A wallet
-//! POSTs the public inputs + private witness to `/prove` and gets back a RAW
-//! FRI proof (post-quantum) that `check_spend` held — never a Groth16/PLONK
-//! wrap. `/verify` checks a proof (the node verifies FRI locally in production;
-//! this endpoint is for tooling/tests).
+//! Experimental candidate service requiring a separately built SP1 guest.
+//! It produces raw core proofs of the implemented check_spend relation only.
+//! See ../AUTHORIZATION-BLOCKER.md: the relation does not establish complete
+//! spend authorization, and this service does not activate node verification.
+//! Helper/unit codec tests are not an actual SP1 proof qualification.
 //!
 //! SECURITY (Round-2 audit P123):
 //! - P-2: the prover client is built EXPLICITLY (`.cpu()` / `.cuda()`), never
@@ -25,17 +25,21 @@ use std::time::Duration;
 
 use axum::{
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
-    routing::{get, post},
-    Json, Router,
+    http::StatusCode,
+    routing::post,
+    Json,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use bincode::Options as _;
 use coherence_core::{check_spend, SpendPublic, SpendWitness};
 use serde::{Deserialize, Serialize};
 use sp1_sdk::{Prover, ProverClient, SP1Stdin};
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
+mod request_guard;
+mod wire;
+use request_guard::{AccessPolicy, guarded_routes, run_bounded};
+#[cfg(test)]
+use request_guard::{forwarded_proto_is_https, token_matches};
 
 /// P-4 fix: pre-decode ceiling on the base64 wire form of a `/verify` proof,
 /// checked BEFORE any base64 decode is attempted (cheapest-check-first). Sized
@@ -43,20 +47,16 @@ use tower_http::timeout::TimeoutLayer;
 /// (~4/3) plus JSON/whitespace overhead.
 const MAX_VERIFY_B64_LEN: usize = 24 * 1024 * 1024; // 24 MiB
 /// P-4 fix: ceiling on the DECODED proof bytes handed to `bincode`. bincode 1.x's
-/// default configuration applies no length limit at all, so an attacker-chosen
-/// stream under this cap can still drive large speculative allocations during
-/// decode; `bincode::DefaultOptions::with_limit` bounds that directly. 16 MiB is
-/// generous headroom over a realistic SP1 core proof (P-9: multi-megabyte,
-/// growing with shard count) while still bounding the worst case.
+/// default configuration applies no byte limit. The configured limit bounds
+/// bytes consumed, not all allocations or CPU work caused by decoded structures.
 const MAX_VERIFY_PROOF_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
 /// P-4 fix: wall-clock deadline for `/verify` — cheap relative to `/prove`, so a
-/// short timeout is appropriate; a hung verify (e.g. a pathological proof shape)
-/// must not hold a connection (and, on `hard_limit = 1`, the whole machine) open
-/// indefinitely.
+/// short HTTP timeout is appropriate. A timed-out native worker continues;
+/// its separate worker permit remains held until it actually exits.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 /// P-4 fix: wall-clock deadline for `/prove`. Generous — CPU proving of a real
-/// spend circuit can legitimately take minutes — but finite: an unbounded
-/// `block_in_place` call had no wall-clock cap at all before this fix.
+/// spend circuit can legitimately take minutes. This bounds response waiting,
+/// not native computation. Worker-owned slots prevent timed-out work piling up.
 const PROVE_TIMEOUT: Duration = Duration::from_secs(1800); // 30 min
 /// P-4 fix: per-route concurrency ceiling. `fly.toml` already runs one machine
 /// (`hard_limit = 1`), so this is defence in depth against a future deployment
@@ -68,7 +68,12 @@ const MAX_CONCURRENT_VERIFIES: usize = 8;
 
 /// The guest ELF, built by `cargo prove build` in ../program (baked at image
 /// build time).
+#[cfg(not(test))]
 const ELF: &[u8] = include_bytes!("../../program/elf/riscv32im-succinct-zkvm-elf");
+
+// Unit helpers never set up or prove this placeholder. Production still requires the ELF.
+#[cfg(test)]
+const ELF: &[u8] = &[];
 
 /// EXPLICIT prover backend — never `ProverClient::from_env()` (audit P123 P-2:
 /// `SP1_PROVER=mock` must not be able to select a proof-fabricating backend).
@@ -92,12 +97,8 @@ struct AppState {
     client: ProverImpl,
     pk: sp1_sdk::SP1ProvingKey,
     vk: sp1_sdk::SP1VerifyingKey,
-    /// Bearer token guarding `/prove`. `None` ONLY via the debug-build
-    /// `PROVER_ALLOW_UNAUTHENTICATED=1` opt-out.
-    auth_token: Option<String>,
-    /// When false (debug-build `PROVER_ALLOW_PLAINTEXT=1` opt-out), the
-    /// `x-forwarded-proto: https` requirement is skipped.
-    require_tls: bool,
+    prove_slots: Arc<tokio::sync::Semaphore>,
+    verify_slots: Arc<tokio::sync::Semaphore>,
 }
 
 // ── pure, unit-tested security decisions (audit P123 P-2/P-3) ─────────────────
@@ -165,44 +166,6 @@ fn require_tls(allow_plain_env: Option<&str>, debug_build: bool) -> Result<bool,
     }
 }
 
-/// TRUE iff the request arrived over TLS according to the fronting proxy
-/// (`x-forwarded-proto: https`, possibly a list — first value wins, as set by
-/// the edge). Absent or non-https ⇒ plaintext ⇒ reject when TLS is required.
-fn forwarded_proto_is_https(header: Option<&str>) -> bool {
-    header
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .is_some_and(|v| v.eq_ignore_ascii_case("https"))
-}
-
-/// Constant-time-ish bearer-token check (no early exit on content mismatch).
-fn token_matches(expected: &str, presented: &str) -> bool {
-    let (a, b) = (expected.as_bytes(), presented.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    match &state.auth_token {
-        None => true, // debug-only explicit opt-out
-        Some(tok) => headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|h| h.strip_prefix("Bearer "))
-            .map(|presented| token_matches(tok, presented))
-            .unwrap_or(false),
-    }
-}
-
-fn tls_ok(state: &AppState, headers: &HeaderMap) -> bool {
-    !state.require_tls
-        || forwarded_proto_is_https(
-            headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()),
-        )
-}
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -243,28 +206,22 @@ async fn main() {
     let (pk, vk) = client.setup(ELF);
     tracing::info!(vkey = %sp1_sdk::HashableKey::bytes32(&vk), "guest vkey (pin this in the node)");
 
-    let state = Arc::new(AppState { client, pk, vk, auth_token, require_tls: req_tls });
+    let policy = Arc::new(AccessPolicy { auth_token, require_tls: req_tls });
+    let state = Arc::new(AppState { client, pk, vk,
+        prove_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROVES)),
+        verify_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_VERIFIES)) });
 
-    let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route(
-            "/prove",
-            post(prove)
-                // Witnesses + proofs are large; allow a generous body.
-                .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
-                .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, PROVE_TIMEOUT))
-                .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_PROVES)),
-        )
-        .route(
-            "/verify",
-            post(verify)
-                // P-4 fix: /verify carries no witness, only a proof — a much
-                // smaller body limit than /prove's, scoped to this route only.
-                .layer(DefaultBodyLimit::max(MAX_VERIFY_B64_LEN + 4096))
-                .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, VERIFY_TIMEOUT))
-                .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_VERIFIES)),
-        )
-        .with_state(state);
+    let app = guarded_routes(
+        post(prove)
+            .layer::<_, std::convert::Infallible>(DefaultBodyLimit::max(64 * 1024 * 1024))
+            .layer::<_, std::convert::Infallible>(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, PROVE_TIMEOUT))
+            .layer::<_, std::convert::Infallible>(ConcurrencyLimitLayer::new(MAX_CONCURRENT_PROVES)),
+        post(verify)
+            .layer::<_, std::convert::Infallible>(DefaultBodyLimit::max(MAX_VERIFY_B64_LEN + 4096))
+            .layer::<_, std::convert::Infallible>(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, VERIFY_TIMEOUT))
+            .layer::<_, std::convert::Infallible>(ConcurrencyLimitLayer::new(MAX_CONCURRENT_VERIFIES)),
+        policy,
+    ).with_state(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let addr = format!("0.0.0.0:{port}");
@@ -302,20 +259,12 @@ struct VerifyResp {
 }
 
 async fn prove(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<ProveReq>,
+    State(state): State<Arc<AppState>>, Json(req): Json<ProveReq>,
 ) -> Result<Json<ProveResp>, (StatusCode, String)> {
-    if !tls_ok(&state, &headers) {
-        // The private witness must never transit plaintext (audit P123 P-3).
-        return Err((
-            StatusCode::UPGRADE_REQUIRED,
-            "TLS required: /prove carries the private witness; use https".into(),
-        ));
-    }
-    if !authorized(&state, &headers) {
-        return Err((StatusCode::UNAUTHORIZED, "bad or missing bearer token".into()));
-    }
+    run_bounded(state.prove_slots.clone(), move || prove_sync(&state, req)).await?
+}
+
+fn prove_sync(state: &AppState, req: ProveReq) -> Result<Json<ProveResp>, (StatusCode, String)> {
     // Fail fast: don't burn GPU minutes on a witness that won't satisfy the
     // statement (the guest would abort anyway).
     if let Err(e) = check_spend(&req.public, &req.witness) {
@@ -328,7 +277,7 @@ async fn prove(
 
     let (client, pk) = (&state.client, &state.pk);
     // POST-QUANTUM: the CORE STARK/FRI proof. Never .groth16()/.plonk().
-    let proof = tokio::task::block_in_place(|| client.prove(pk, &stdin).core().run())
+    let proof = client.prove(pk, &stdin).core().run()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("prove failed: {e}")))?;
 
     let bytes = bincode_proof(&proof).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -336,19 +285,12 @@ async fn prove(
 }
 
 async fn verify(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<VerifyReq>,
+    State(state): State<Arc<AppState>>, Json(req): Json<VerifyReq>,
 ) -> Result<Json<VerifyResp>, (StatusCode, String)> {
-    if !tls_ok(&state, &headers) {
-        return Err((StatusCode::UPGRADE_REQUIRED, "TLS required; use https".into()));
-    }
-    // P-4 fix: `/verify` used to have NO auth check at all (`authorized()` was
-    // called only from `prove`), so an unauthenticated caller could reach it —
-    // and on a scale-to-zero deployment, wake a billed GPU machine for free.
-    if !authorized(&state, &headers) {
-        return Err((StatusCode::UNAUTHORIZED, "bad or missing bearer token".into()));
-    }
+    run_bounded(state.verify_slots.clone(), move || verify_sync(&state, req)).await?
+}
+
+fn verify_sync(state: &AppState, req: VerifyReq) -> Result<Json<VerifyResp>, (StatusCode, String)> {
     // P-4 fix: cheapest check first — reject an oversized wire payload before
     // spending a single cycle on base64.
     if req.proof_b64.len() > MAX_VERIFY_B64_LEN {
@@ -404,25 +346,37 @@ async fn verify(
 
 // SP1 proofs are serializable; bincode v1 wire format (the node reads the same).
 fn bincode_proof(p: &sp1_sdk::SP1ProofWithPublicValues) -> Result<Vec<u8>, String> {
-    bincode::serialize(p).map_err(|e| format!("serialize proof: {e}"))
+    wire::encode_bounded(p, MAX_VERIFY_PROOF_BYTES)
 }
 
 /// P-4 fix: decode with an explicit size limit. bincode 1.x's default
 /// (`bincode::deserialize`, used here previously) applies NO length limit, so a
-/// crafted stream well under a body-size cap can still drive large speculative
-/// allocations and deep nested decodes during deserialization itself — the body
-/// limit bounds bytes read off the wire, not memory bincode may try to allocate
-/// while interpreting them. `with_limit` bounds the latter directly.
+/// decoding budget is expressed in bytes consumed; it is not a total allocator
+/// or CPU budget. Fixed-int encoding matches bincode::serialize; trailing bytes
+/// are rejected explicitly.
 fn unbincode_proof_bounded(b: &[u8]) -> Result<sp1_sdk::SP1ProofWithPublicValues, String> {
-    bincode::DefaultOptions::new()
-        .with_limit(MAX_VERIFY_PROOF_BYTES)
-        .deserialize(b)
-        .map_err(|e| format!("deserialize proof: {e}"))
+    wire::decode_bounded(b, MAX_VERIFY_PROOF_BYTES)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actual_sp1_container_uses_existing_fixed_int_wire() {
+        // A codec fixture only: empty Core shards are intentionally NOT a valid proof.
+        let proof = sp1_sdk::SP1ProofWithPublicValues {
+            proof: sp1_sdk::SP1Proof::Core(vec![]),
+            public_values: sp1_sdk::SP1PublicValues::from(&[1, 2, 3]),
+            sp1_version: "codec-fixture".into(), tee_proof: None,
+        };
+        let encoded = bincode_proof(&proof).unwrap();
+        let decoded = unbincode_proof_bounded(&encoded).unwrap();
+        assert_eq!(bincode_proof(&decoded).unwrap(), encoded);
+        assert_eq!(decoded.public_values.as_slice(), &[1, 2, 3]);
+        let mut trailing = encoded; trailing.push(0);
+        assert!(unbincode_proof_bounded(&trailing).is_err());
+    }
 
     // ── P-2: mock env refused ────────────────────────────────────────────────
     #[test]

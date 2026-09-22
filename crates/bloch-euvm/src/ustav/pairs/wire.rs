@@ -106,7 +106,7 @@ pub fn apply_encoded_pair(
     if bytes.len() > MAX_ENCODED_BYTES {
         return Err(Error::TooLarge);
     }
-    let decoding_gas = 100 + (bytes.len() as u64).div_ceil(32);
+    let decoding_gas = 100u64.saturating_add((bytes.len() as u64).div_ceil(32));
     let remaining = gas_limit.checked_sub(decoding_gas).ok_or(Error::OutOfGas)?;
     let decoded = decode_pair(bytes)?;
     if decoded.domain != *ledger.domain() {
@@ -119,6 +119,7 @@ pub fn apply_encoded_pair(
         verifier,
         remaining,
     )?;
-    receipt.gas_used += decoding_gas; // Bounded by gas_limit by construction.
+    debug_assert!(receipt.gas_used <= remaining);
+    receipt.gas_used = receipt.gas_used.saturating_add(decoding_gas);
     Ok(receipt)
 }

@@ -67,7 +67,7 @@
 //! *is*.
 
 use crate::attestation::Attestation;
-use crate::params::{DS_BLOCK, DS_PROPOSE};
+use crate::params::{DS_BLOCK, DS_NETSIG2, DS_PROPOSE};
 use sha3::{Digest, Sha3_256};
 
 /// Genesis-4 header version tag (§5.3).
@@ -226,6 +226,23 @@ impl BlockHeaderV4 {
         let mut h = Sha3_256::new();
         h.update(DS_PROPOSE);
         h.update(self.canonical_serialize());
+        h.finalize().into()
+    }
+
+    /// Candidate genesis-bound proposal root.
+    ///
+    /// Production consensus deliberately continues to use
+    /// [`Self::proposal_signing_root`] while the validator-network-binding
+    /// flag day is unarmed. This method exists so a future coordinated
+    /// activation cannot invent a second, tooling-only preimage.
+    pub fn network_bound_proposal_signing_root(
+        &self,
+        network_domain: &[u8; 32],
+    ) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(DS_NETSIG2);
+        h.update(network_domain);
+        h.update(self.proposal_signing_root());
         h.finalize().into()
     }
 }
@@ -413,6 +430,21 @@ mod tests {
     }
 
     #[test]
+    fn candidate_root_binds_proposal_to_one_genesis_without_changing_legacy_root() {
+        let header = base_header();
+        let legacy = header.proposal_signing_root();
+        let a = header.network_bound_proposal_signing_root(&[0xA1; 32]);
+        let b = header.network_bound_proposal_signing_root(&[0xB2; 32]);
+        assert_ne!(a, b);
+        assert_ne!(a, legacy);
+        assert_eq!(
+            header.proposal_signing_root(),
+            legacy,
+            "candidate must not mutate replay roots",
+        );
+    }
+
+    #[test]
     fn round_trip() {
         let h = base_header();
         let enc = h.canonical_serialize();
@@ -575,6 +607,44 @@ mod tests {
         code
     }
 
+    /// Recursively enumerate Rust sources below `dir` in stable path order.
+    /// Consensus modules live below `src/transition/**` as well as directly
+    /// below `src/`; a top-level-only scan silently loses coverage whenever a
+    /// file is split into a submodule.
+    fn rust_sources_below(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fn visit(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+                .map(|entry| entry.expect("source directory entry"))
+                .collect();
+            entries.sort_by_key(|entry| entry.path());
+            for entry in entries {
+                let path = entry.path();
+                let kind = entry
+                    .file_type()
+                    .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+                if kind.is_dir() {
+                    visit(&path, out);
+                } else if kind.is_file()
+                    && path.extension().and_then(|e| e.to_str()) == Some("rs")
+                {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut paths = Vec::new();
+        visit(dir, &mut paths);
+        paths
+    }
+
+    /// Make whitespace irrelevant to the deliberately narrow source scan.
+    /// Without this, `BlockId (` or `for\nBlockId` evade patterns that catch
+    /// the semantically identical compact spelling.
+    fn compact_scan_code(code: &str) -> String {
+        code.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
     /// Strip `//` comments and the contents of `"…"` string literals from one
     /// line of Rust source, so the scan below only ever looks at *code*.
     /// Naive (no raw-string or escape handling) but strict in the safe
@@ -644,24 +714,25 @@ mod tests {
         let mut construction_sites = 0usize;
         let mut files = 0usize;
 
-        for entry in std::fs::read_dir(&src_dir).expect("read src/") {
-            let path = entry.expect("dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
+        for path in rust_sources_below(&src_dir) {
             files += 1;
             let text = std::fs::read_to_string(&path).expect("read source file");
-            let fname = path.file_name().unwrap().to_string_lossy().into_owned();
+            let fname = path
+                .strip_prefix(&src_dir)
+                .expect("source below src/")
+                .display()
+                .to_string();
 
-            let code: String = canonicalize_blockid_paths(
+            let code = canonicalize_blockid_paths(
                 text.lines().map(strip_line).collect::<Vec<_>>().join("\n"),
             );
+            let compact = compact_scan_code(&code);
 
             // (b) The only manual `impl … for BlockId` allowed is the Debug
             // formatter. Anything else (From, TryFrom, Default, Deserialize,
             // FromStr, …) is a smuggled constructor.
-            for (i, _) in code.match_indices("for BlockId") {
-                let before = code[..i].trim_end();
+            for (i, _) in compact.match_indices("forBlockId") {
+                let before = &compact[..i];
                 assert!(
                     before.ends_with("Debug"),
                     "{fname}: forbidden trait impl on BlockId (only fmt::Debug is allowed) \
@@ -673,28 +744,25 @@ mod tests {
             // `use … as` rename or a type alias would let an impl target it
             // without ever writing the token the scan above looks for.
             assert!(
-                !code.contains("BlockId as "),
+                !compact.contains("BlockIdas"),
                 "{fname}: renaming BlockId hides it from the 5.4 identity scan"
             );
-            for (i, _) in code.match_indices("= BlockId") {
-                let after = &code[i + "= BlockId".len()..];
-                assert!(
-                    !after.trim_start().starts_with(';'),
-                    "{fname}: type alias of BlockId hides it from the 5.4 identity scan"
-                );
-            }
+            assert!(
+                !compact.contains("=BlockId;"),
+                "{fname}: type alias of BlockId hides it from the 5.4 identity scan"
+            );
 
             // (a) Count raw tuple-struct constructions `BlockId(expr)`.
             // The type declaration `struct BlockId([u8; 32]);` is not a
             // construction; everything else that isn't the empty `BlockId()`
             // type-path form is.
-            construction_sites += code
+            construction_sites += compact
                 .match_indices("BlockId(")
                 .filter(|(i, _)| {
-                    let before = code[..*i].trim_end();
-                    let after = &code[i + "BlockId(".len()..];
+                    let before = &compact[..*i];
+                    let after = &compact[i + "BlockId(".len()..];
                     !before.ends_with("struct")
-                        && !after.trim_start().is_empty()
+                        && !after.is_empty()
                         && !after.starts_with(')')
                 })
                 .count();
@@ -712,12 +780,47 @@ mod tests {
             );
         }
 
-        assert!(files >= 5, "source scan looked at too few files - wrong directory?");
+        assert!(
+            files >= 29,
+            "recursive source scan looked at too few files ({files}) - wrong directory?"
+        );
         assert_eq!(
             construction_sites, 1,
             "expected exactly ONE BlockId construction site (inside BlockId::of); \
              found {construction_sites}. 5.4: one and only one derivation path."
         );
+    }
+
+    #[test]
+    fn derivation_scan_covers_nested_sources_and_spacing_variants() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let paths = rust_sources_below(&src_dir);
+        assert!(
+            paths.ends_with(&[src_dir.join("ws.rs")]),
+            "recursive enumeration must be stable"
+        );
+        assert!(
+            paths.contains(&src_dir.join("transition/funded.rs"))
+                && paths.contains(&src_dir.join("transition/lifecycle/tests.rs")),
+            "nested consensus modules must be inside the identity tripwire"
+        );
+
+        for spelling in [
+            "BlockId (digest)",
+            "BlockId\n( digest )",
+            "impl From<X> for\nBlockId",
+            "type Alias =\nBlockId ;",
+            "use crate::header::BlockId\nas Alias;",
+        ] {
+            let compact = compact_scan_code(&canonicalize_blockid_paths(spelling.into()));
+            assert!(
+                compact.contains("BlockId(")
+                    || compact.contains("forBlockId")
+                    || compact.contains("=BlockId;")
+                    || compact.contains("BlockIdas"),
+                "spacing variant escaped normalization: {spelling:?}"
+            );
+        }
     }
 
     /// The legacy Genesis-3 identity (`"BLOCH-BLOCK-ID-V1"` tag) and the

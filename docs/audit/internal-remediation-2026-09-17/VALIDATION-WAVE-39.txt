@@ -1,0 +1,28 @@
+Validation wave 39 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Evidence reconciliation only; no new implementation commit.
+
+PASS
+
+cargo test --locked --offline --manifest-path \
+  legacy/genesis3-node/Cargo.toml --lib \
+  corrupted_rows_refuse_export_and_valid_rows_preserve_both_vout_modes
+  1 passed; 0 failed; 397 filtered out.
+
+cargo test --locked --offline --manifest-path \
+  legacy/genesis3-node/Cargo.toml --bin bloch-snapshot-utxo decode_vout_tests
+  4 passed; 0 failed; 0 filtered out.
+
+Ledger parser
+  200 rows; 200 unique finding IDs.
+  66 IMPLEMENTED; 88 PARTIAL; 32 OPEN; 7 BASE CHANGED;
+  4 PROTOCOL DECISION; 1 UNARMED CANDIDATE;
+  1 REFUTED IN AUDIT; 1 VERIFIED POSITIVE.
+
+git diff --check
+  Passed after the documentation update.
+
+BOUNDARY
+
+Canonical decoding is available for new exports. The historical artifact and
+the Genesis-4 opening state retain 38 mislabelled outpoints; LG-02 is PARTIAL.

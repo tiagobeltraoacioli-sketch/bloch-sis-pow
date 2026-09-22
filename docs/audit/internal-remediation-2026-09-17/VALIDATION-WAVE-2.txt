@@ -1,0 +1,153 @@
+Second-wave validation — 2026-09-17
+Worktree: bloch-audit-remediation; first-wave parent 203b410; Rust 1.94.1; macOS x86_64.
+Builds used the shared local CARGO_TARGET_DIR cache. No production binary was published.
+Log names below refer to /private/tmp; SHA256 identifies the exact original log bytes.
+Summary extracts preserve failed attempts and ignored counts explicitly.
+
+bloch-audit-wave2-full-final.log
+Command: cargo test -p bloch-pos-node -p bloch-pos-committee -p bloch-pq-vault --offline -- --test-threads=4
+Outcome/scope: Committee passed; initial node run failed two obsolete exploit-acceptance assertions. Superseded for node by the next log.
+SHA256 5763ae5888397047cf2074e9175034aaba992079b678df042ce887e6f05dc920
+test result: ok. 426 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 126.76s
+test result: ok. 109 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.85s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 2 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 18.62s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: FAILED. 405 passed; 2 failed; 19 ignored; 0 measured; 0 filtered out; finished in 121.30s
+
+bloch-audit-wave2-node-final.log
+Command: cargo test -p bloch-pos-node -p bloch-pq-vault --offline -- --test-threads=4
+Outcome/scope: Passed. Recovery-fence harness also imports production module tests; do not sum these as unique cases.
+SHA256 91361a2889c6ae27607d87480ef43dfa451956019931ed2728a62661cddc965c
+test result: ok. 407 passed; 0 failed; 19 ignored; 0 measured; 0 filtered out; finished in 91.62s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 53.50s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.03s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.23s
+test result: ok. 0 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.97s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.79s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.30s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.97s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+bloch-audit-validator-metrics-final.log
+Command: cargo test -p bloch-pos-node --offline --bin bloch-pos audit_validator_activity_tracks_registry_changes_and_signer_halt
+Outcome/scope: Passed final metric code; loopback access required by fixture. Earlier sandbox failure is not passing evidence.
+SHA256 c878e5771e04589e0b9448685503f68110bdab9914c9bb5d7be9016ee4a1c510
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 426 filtered out; finished in 1.85s
+
+bloch-audit-keys-cli-final.log
+Command: cargo test -p bloch-pos-node --offline --test keys_seal_cli -- --test-threads=4
+Outcome/scope: Passed after full public-hash output change.
+SHA256 77921cf0d1226243a33623947714ea3b56915854aa23d06f0eb7d12a2f72e085
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.24s
+
+bloch-audit-ustav-native.log
+Command: cargo test --locked --offline -p bloch-euvm -p bloch-ustav
+Outcome/scope: Passed; ignored cases remain unqualified.
+SHA256 656395a9b00a92015d9870e0b1c0c42fdfa58b97940e4e97cbb3dc4236e31bb3
+test result: ok. 305 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.18s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.25s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.97s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.21s
+test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+bloch-audit-ustav-boundary.log
+Command: python3 scripts/check-ustav-pq-boundary.py cargo +1.94.1
+Outcome/scope: Passed supported dependency denylist check, not complete cryptographic isolation proof.
+SHA256 52cb0d626cb291d8a12835edd2a5fe58256cc4f353f9d8fd857f62233db14740
+Ustav native dependency boundary: OK (no listed classical signature libraries)
+
+audit-vault-wave2.log
+Command: cargo test -p bloch-pq-vault --offline
+Outcome/scope: Focused vault tests; also passed in integrated node/vault run.
+SHA256 b2b797263182fb5895c97aea7d1980d1cf5b2582652ea985a7d0e8fdabd676a4
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+audit-shield-wave2.log
+Command: cargo test --manifest-path services/pq-shield-api/Cargo.toml --offline
+Outcome/scope: Passed.
+SHA256 af26bebc3fbd8548effbe68dad832c9dda192c148083604968c851c8541a53d8
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+audit-anchoring-wave2.log
+Command: cargo test --manifest-path anchoring/Cargo.toml --offline
+Outcome/scope: Passed.
+SHA256 c130b8ac025f81e033808831ad2be2c589e018738e0536bcf4a921a713885540
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+audit-coherence-cr01-final.log
+Command: cargo test -p coherence-core --offline
+Outcome/scope: Passed including characterization tests demonstrating unresolved unsafe V1 authorization.
+SHA256 13fcd6a80b855042ab4c068710c71992b1a1ea0467a0ab1a90e7fce0f981b0cf
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+audit-indexer-overlay-final.log
+Command: npm test (tools/indexer, Node v24.21.0)
+Outcome/scope: Passed offline selftests plus 25 security/regression tests.
+SHA256 f9f3a3faa0f98eece01c5c9dbee83272e1309d2d68b86a4496782f457e5e2ce2
+ℹ tests 25
+ℹ pass 25
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+
+bloch-audit-legacy-export.log
+Command: cargo test --manifest-path legacy/genesis3-node/Cargo.toml --offline --lib snapshot_row_tests
+Outcome/scope: Passed targeted regression; not a full legacy chain replay.
+SHA256 b1177ea9a186007adc1ffc46e59e484c70c77916ff5b7bae61150f50c6ca8601
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 397 filtered out; finished in 0.00s
+
+bloch-audit-hardened-wave2-final.log
+Command: bash scripts/hardened-clippy.sh
+Outcome/scope: Passed final source; existing ratchet baselines remain accepted debt, not zero vulnerabilities.
+SHA256 0eeb55352b8a2c4f83b56531d70aed73210e330782ba74fa71af9e4fa5fb973e
+hardened-clippy: toolchain 1.94.1 (pinned by rust-toolchain.toml)
+hardened-clippy: OK
+
+bloch-audit-score-selftest.log
+Command: bash scripts/hardened-clippy.selftest.sh
+Outcome/scope: Selftest evidence; final scorer Python regressions additionally passed 9 cases.
+SHA256 0ed78536c7c23f5813944a99987267229ac86565f8bbef2a09c4d86911f465a9
+See command scope above; detailed output is in the identified local log.
+
+Additional checks:
+- check-tests-blocking.selftest.py: 37 cases passed; check-tests-blocking.py passed both checked-in pipelines.
+- hardened-clippy-score.test.py: 9 cases passed after adding actual Cargo package-ID forms.
+- Ruby YAML.load_file parsed monitoring rules and Prometheus configuration; promtool runtime evaluation was not run.
+- bash -n scripts/ws-ceremony-drill.sh passed. Disposable mock keygen failure cleaned its generated secret; existing workdir was refused and preserved; new directory mode was 0700.
+- git diff --check passed.
+
+Not established: hosted CI, Nix/systemd evaluation on Linux, production recovery SLA, live fleet versions, activated consensus recovery, Bitcoin Core differential equivalence, mixed-RPC-branch indexer consistency, or closure of the remaining audit findings.

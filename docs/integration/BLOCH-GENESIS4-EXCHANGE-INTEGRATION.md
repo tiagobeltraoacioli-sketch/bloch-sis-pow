@@ -1,3 +1,13 @@
+> **Candidate schedule update — 2026-09-13.** The operator selected Monday,
+> 2026-09-14: leak recovery at epoch 2880 (21:31:19 UTC), followed by
+> lifecycle epoch 2884 (22:35:19 UTC). Earlier statements below about an
+> unarmed slashing gate or unreachable penalties describe the historical
+> pre-release configuration. Evidence is refused before epoch 2884; at and
+> after it, valid evidence can apply the configured penalties. This candidate
+> schedule does not establish fleet deployment, cross-node agreement or a
+> settlement guarantee. See `docs/VALIDATOR-OPENING.md` and the September 13
+> activation preflight for the release conditions and retained evidence.
+
 # Bloch Genesis-4 — Exchange & Integrator Guide
 
 > **Superseded for integrators (2026-09-07).** The current, code-verified exchange
@@ -377,18 +387,27 @@ serves reads without taking on consensus duties. This is the right mode for an e
 Description=Bloch Genesis-4 node
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
 
 [Service]
 Type=simple
 User=bloch
 ExecStart=/usr/local/bin/bloch-pos-quatro run --data-dir /var/lib/bloch/data …
-Restart=always
-RestartSec=5
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=78
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+Weak-subjectivity policy refusal exits with status 78 and requires operator
+review of the supplied checkpoint and signer arrangement. The sample supervisor
+does not restart that refusal. Other startup failures are rate-limited; repair
+the cause before resetting a failed unit. This behavior applies to the updated
+binary; older binaries returning only status 1 still rely on the restart limit.
 
 ### Confirm your node agrees with the network
 

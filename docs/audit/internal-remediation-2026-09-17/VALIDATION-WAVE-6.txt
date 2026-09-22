@@ -1,0 +1,86 @@
+Sixth-wave local validation — 2026-09-17
+Base 5cf75ed; Rust 1.94.1, macOS x86_64, shared Cargo target, two build jobs and four test threads.
+No Linux/GPU build, deployment, production recovery SLA or hosted CI qualification.
+Initial node run failed on sandbox-denied loopback binds; escalated rerun passed.
+Initial hardened gate caught crypto arithmetic 75 vs 74; sentinel addition fixed, baseline unchanged.
+Historical scan and SP1 recipe work are excluded from this sixth-wave commit and tracked in the ongoing session.
+
+cargo test --locked --offline -p bloch-pos-node;447 unit plus 101 integration tests passed, 19 unit and 6 performance tests ignored; local loopback permission enabled
+/private/tmp/bloch-wave6-node-full-final.log
+SHA256 5a5c0727887a4e3d61dfd6de3ab87478518efb2a5f2e53f2c8e510f89e6d60d1
+
+bash scripts/hardened-clippy.sh;all five gates passed; no baseline increased
+/private/tmp/bloch-wave6-hardened-final.log
+SHA256 2c05705db7389dc48aa5bac18c77f74964267beae268b004f886c0b7072d3d84
+
+npm --prefix tools/indexer test;selftest and 43 node:test cases passed; Node 24.21.0
+/private/tmp/bloch-wave6-indexer-final.log
+SHA256 068c7a1e54f7180d83789196735e6104f026c8bef2a63f1e00180c2cdb862f0f
+
+python3 scripts/pos-release-integrity.selftest.py;14 checks passed, including staged lock and six ambient override cases
+/private/tmp/bloch-wave6-release-guard.log
+SHA256 4ccf5dd6dafa59710b39783b006fcf187c377bbad885d47e83fd1627eff77201
+
+cargo test --locked --offline -p bloch-crypto;175 unit and one integration test passed, two unit and two doc tests ignored
+/private/tmp/audit-wallet-bounded-segment4.log
+SHA256 9c103927aa7a1619a6f29270c485e095e640b0f6e81ee85dc3f87db8034e324a
+
+cargo test --locked --offline -p bloch-crypto wallet::encryption;16 passed after RAII cleanup
+/private/tmp/audit-wallet-kdf-cleanup-segment5.log
+SHA256 8ecf1ecef6421d0e1e6de839191fe9c9cf20a8353c556a02f3b70a41e3bbc501
+
+cargo test --locked --offline -p bloch-crypto wallet_input_budget_tests;one passed after sentinel arithmetic fix
+/private/tmp/audit-wallet-budget-gatefix.log
+SHA256 754463ca9f5f35d2c085b8f964cb1098ae128ca7462c62240bab403c682798df
+
+anchoring tests;23 unit and one doc test passed
+/private/tmp/audit-anchoring-strict-segment2-final.log
+SHA256 2a1ef9bb6110ba21bfa9569d9f9516589eb984a73116a5cf7d3ff8a968b24216
+
+cargo test --locked --offline -p bloch-pq-vault;31 unit tests passed
+/private/tmp/audit-vault-separated-segment3.log
+SHA256 e761abce2025be655619bf1b26dc88735cd4ce5002503f0ef36af9575b62ac9b
+
+node ws_lifecycle tests;3 passed
+/private/tmp/bloch-wave6-ws-lifecycle.log
+SHA256 d943217416ee44d0cfb66b81d32661ca716187aa8637dbcc9b749e7211eba151
+
+node ws_boot tests;32 passed
+/private/tmp/bloch-wave6-ws-boot-pin.log
+SHA256 b835b4a319a499e4a3eb1ceab0080caf82efd280fbf3747f76974685ecfa8899
+
+node slashprot tests;14 passed
+/private/tmp/bloch-wave6-recommit-final.log
+SHA256 8020b67de6c71da577f129fcebd1cc6fd7f0d2cf9013f5801aea8186fd51d27b
+
+recovery_fence 67 and slashing_protection_cli 2 passed
+/private/tmp/bloch-wave6-recommit-cli.log
+SHA256 6e16f7ec951645cb65926a4ec9f11069ba6aa78203d99262393e9a37ba07e822
+
+Isolated short-chain automatic RANDAO lifecycle rehearsal; one passed, no shipping activation constants changed
+/private/tmp/bloch-wave6-randao-rehearsal-final.log
+SHA256 105be64f85d00517af65ca96486aac7719b960da33aa4ccd35fca51b87583604
+
+capacity3 passed
+/private/tmp/bloch-audit-wave6-capacity-final.log
+SHA256 0885bb9e7d66ec3b8b4d31bb62c162dc31d9890987d5bd3bc51f11151c8b627b
+
+Active funded epoch 2884 real-signature qualification: one passed
+/private/tmp/bloch-audit-wave6-active-funded.log
+SHA256 2a317b542dcdbad8894fc470390124e8a6301589a734c7131d1ecdee65eb9ef0
+
+transfer compatibility: 21 passed
+/private/tmp/bloch-audit-wave6-transfer-compat.log
+SHA256 62bf69c6f6da6ad6b87dc6e3d478af2ee195da9e5757b87d3952a0ecccac141a
+
+source_ selection: 8 passed
+/private/tmp/bloch-audit-wave6-source-budget.log
+SHA256 c2581a35c3ca7ecc19c89311ad4207a0024e87b7f2f616dcc560559570515a8e
+
+net:: selection: 27 passed
+/private/tmp/bloch-audit-wave6-net.log
+SHA256 96642d308055f3fdc102c2dffb62671a42cd91d86213a8328d535208d172251e
+
+p2p:: selection23 passed
+/private/tmp/bloch-audit-wave6-p2p.log
+SHA256 0c6a686b2eb9d70d6a2bf222070e11e20afe5f1cfd1a241222f04773165a45e7

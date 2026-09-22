@@ -51,7 +51,7 @@ perf-timing = ["bloch-pos-committee/perf-timing"]
 
 [dependencies]
 # The frozen consensus math (pure, sha3-only).
-bloch-pos-committee = { path = "../bloch-pos-committee" }
+bloch-pos-committee = { path = "../bloch-pos-committee", features = ["local-state-cache"] }
 # The hybrid ML-DSA-65 ‖ Falcon-1024 suite (M2: keys/ + KeyVerifier). Path
 # dependency, one-way; pulls the PQClean FFI tree, which is why this crate's
 # build stopped being instant at M2 — planned in the integration doc §6.
@@ -90,7 +90,7 @@ futures = "0.3"
 async-trait = "0.1"
 
 # Same vendored fork the root workspace patches in (root Cargo.toml
-# [patch.crates-io]): bloch-crypto calls `with_seeded_rng`, which only exists
+# [patch.crates-io]): bloch-crypto calls `with_seeded_rng_scope`, which only exists
 # in the vendored pqcrypto-internals 0.2.11 fork. A standalone workspace does
 # not inherit the root's patch table, so it is restated here.
 [patch.crates-io]
@@ -101,4 +101,9 @@ pqcrypto-internals = { path = "../pqcrypto-internals" }
 # FILES rather than from a string someone typed. Same version the crate already
 # depends on at runtime, so this adds no package to Cargo.lock.
 [build-dependencies]
+cc = "1.2.60"
 sha3 = "0.10"
+
+[dev-dependencies]
+# Deterministic adversarial signature fixtures in offline-tool tests only.
+pqcrypto-internals = { path = "../pqcrypto-internals" }

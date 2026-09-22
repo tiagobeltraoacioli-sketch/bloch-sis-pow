@@ -172,7 +172,7 @@ impl PoolLedger {
         let mut gas = gas_limit;
         charge(
             &mut gas,
-            100 + crate::ustav::registration_cost(&token.registration),
+            100u64.saturating_add(crate::ustav::registration_cost(&token.registration)),
         )?;
         let mut staged = crate::ustav::Ledger::new(*self.gateway.native.domain());
         staged.tokens.insert(tx.asset, token.clone());
@@ -185,7 +185,7 @@ impl PoolLedger {
             if output.asset != tx.asset {
                 return Err(NativeError::WrongAsset.into());
             }
-            charge(&mut gas, words(output.output.owner.len()) + 1)?;
+            charge(&mut gas, words(output.output.owner.len()).saturating_add(1))?;
             staged.outputs.insert(*id, output.clone());
         }
         for index in 0..tx.outputs.len() {
@@ -208,7 +208,13 @@ impl PoolLedger {
             return Err(Error::ResourceLimit);
         }
         let mut receipt = staged.apply(tx, w, height, verifier, gas)?;
-        receipt.gas_used += gas_limit - gas;
+        let verification_gas = gas_limit
+            .checked_sub(gas)
+            .ok_or(NativeError::ArithmeticOverflow)?;
+        receipt.gas_used = receipt
+            .gas_used
+            .checked_add(verification_gas)
+            .ok_or(NativeError::ArithmeticOverflow)?;
         Ok(TransferPlan {
             ledger: self,
             inputs: tx.inputs.clone(),
@@ -355,7 +361,7 @@ impl PoolLedger {
         if bytes.len() > wire::MAX_ENCODED_BYTES {
             return Err(Error::Wire(wire::Error::TooLarge));
         }
-        let decoding_gas = 100 + (bytes.len() as u64).div_ceil(32);
+        let decoding_gas = 100u64.saturating_add((bytes.len() as u64).div_ceil(32));
         let remaining = gas_limit
             .checked_sub(decoding_gas)
             .ok_or(Error::Wire(wire::Error::OutOfGas))?;
@@ -387,7 +393,8 @@ impl PoolLedger {
                 (receipt, Some(release))
             }
         };
-        receipt.gas_used += decoding_gas;
+        debug_assert!(receipt.gas_used <= remaining);
+        receipt.gas_used = receipt.gas_used.saturating_add(decoding_gas);
         Ok(wire::Applied { receipt, release })
     }
     pub fn settle_pair(
@@ -430,7 +437,10 @@ impl PoolLedger {
             return Err(Error::ResourceLimit);
         }
         let mut gas = gas_limit;
-        charge(&mut gas, 1200 + words(creator.len() + signature.len()))?;
+        charge(
+            &mut gas,
+            1200u64.saturating_add(words(creator.len().saturating_add(signature.len()))),
+        )?;
         if !verifier.valid_pq_key(creator) || !verifier.verify_pq(&message, creator, signature) {
             return Err(Error::Unauthorized);
         }
@@ -472,8 +482,13 @@ impl PoolLedger {
         let count = action.funding.iter().map(Vec::len).sum::<usize>();
         charge(
             &mut gas,
-            1500 + words(action.owner.len() + signature.len())
-                + (50 + words(action.owner.len())) * count as u64,
+            1500u64
+                .saturating_add(words(action.owner.len().saturating_add(signature.len())))
+                .saturating_add(
+                    50u64
+                        .saturating_add(words(action.owner.len()))
+                        .saturating_mul(count as u64),
+                ),
         )?;
         if !verifier.valid_pq_key(&action.owner)
             || !verifier.verify_pq(&message, &action.owner, signature)
@@ -548,8 +563,13 @@ impl PoolLedger {
                 .checked_add(transition.user_credit[i])
                 .ok_or(NativeError::ArithmeticOverflow)?;
             // Explicit conservation including authenticated old pool backing.
-            if u128::from(pool.state.reserves()[i]) + u128::from(available[i])
-                != u128::from(transition.next.reserves()[i]) + u128::from(payout)
+            let before = u128::from(pool.state.reserves()[i])
+                .checked_add(u128::from(available[i]))
+                .ok_or(NativeError::ArithmeticOverflow)?;
+            let after = u128::from(transition.next.reserves()[i])
+                .checked_add(u128::from(payout))
+                .ok_or(NativeError::ArithmeticOverflow)?;
+            if before != after
             {
                 return Err(Error::InvalidFunding);
             }
@@ -566,7 +586,9 @@ impl PoolLedger {
             if payout > 0 {
                 let id = OutPoint {
                     transaction: message,
-                    index: (i + 2) as u32,
+                    index: i
+                        .checked_add(2)
+                        .ok_or(NativeError::ArithmeticOverflow)? as u32,
                 };
                 payouts[i] = Some(id);
                 outputs.push((
@@ -600,8 +622,15 @@ impl PoolLedger {
         }
         charge(
             &mut gas,
-            100 * outputs.len() as u64 + words(action.owner.len()) * outputs.len() as u64,
+            100u64
+                .saturating_mul(outputs.len() as u64)
+                .saturating_add(
+                    words(action.owner.len()).saturating_mul(outputs.len() as u64),
+                ),
         )?;
+        let gas_used = gas_limit
+            .checked_sub(gas)
+            .ok_or(NativeError::ArithmeticOverflow)?;
         // Complete validation above; all following changes are infallible and
         // leave native supply/mint counters and bridge source liabilities intact.
         for id in spent {
@@ -630,7 +659,7 @@ impl PoolLedger {
             reserves: reserve_ids,
             payouts,
             lp_balance: new_position,
-            gas_used: gas_limit - gas,
+            gas_used,
         })
     }
 
@@ -751,7 +780,10 @@ impl PoolLedger {
             if amount == 0 || !verifier.valid_pq_key(&key) || !ledger.pools.contains_key(&pool) {
                 return Err(Error::InvalidSnapshot);
             }
-            *totals.entry(pool).or_default() += u128::from(amount);
+            let total = totals.entry(pool).or_default();
+            *total = total
+                .checked_add(u128::from(amount))
+                .ok_or(Error::InvalidSnapshot)?;
             ledger.positions.insert((pool, key), amount);
         }
         for (id, pool) in &ledger.pools {

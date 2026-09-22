@@ -43,7 +43,7 @@ tower          = { version = "0.4", features = ["limit", "util"] }
 tower-http     = { version = "0.6", features = ["timeout"] }
 
 # Mirror the parent workspace's vendored pqcrypto-internals fork (adds
-# `with_seeded_rng`, required by bloch-crypto). A detached workspace does not
+# `with_seeded_rng_scope`, required by bloch-crypto). A detached workspace does not
 # inherit the parent's [patch], so we restate it here with a re-based path.
 [patch.crates-io]
 pqcrypto-internals = { path = "../../crates/pqcrypto-internals" }

@@ -25,7 +25,8 @@
 // are decimal strings. Load is dual-tolerant: a state file written by the old
 // `number`-typed build still reads back exactly.
 
-import { mkdirSync, readFileSync, writeFileSync, existsSync, renameSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, renameSync, openSync, closeSync, fsyncSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { parseSats, formatSats, parseJsonExactIntegers } from "./sats.js";
 
@@ -76,6 +77,10 @@ export interface IndexStore {
   getBalance(address: string): bigint;
   getUtxosForAddress(address: string): Array<{ key: string; utxo: Utxo }>;
   getHistory(address: string): HistoryEntry[];
+  getSnapshotId(): string;
+  getUtxoCount(address: string): number;
+  getUtxoPage(address: string, offset: number, limit: number): Array<{ key: string; utxo: Utxo }>;
+  getHistoryPage(address: string, offset: number, limit: number): HistoryEntry[];
   getUtxo(txid: string, index: number): Utxo | undefined;
   persist(): void;
   /** T-7 fix: `false` iff the on-disk state file existed but failed to load
@@ -141,24 +146,37 @@ function parseSignedSats(raw: unknown, context: string): bigint {
 function serializeUtxo(u: Utxo): Record<string, unknown> {
   return { address: u.address, value: formatSats(u.value), height: u.height };
 }
+function record(raw: unknown, context: string): Record<string, unknown> {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${context}: expected object`);
+  return raw as Record<string, unknown>;
+}
+function counter(raw: unknown, context: string): number {
+  if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw < 0) throw new Error(`${context}: expected nonnegative safe integer`);
+  return raw;
+}
+function text(raw: unknown, context: string): string {
+  if (typeof raw !== "string" || raw.length === 0) throw new Error(`${context}: expected nonempty string`);
+  return raw;
+}
+function heightKey(raw: string): number {
+  if (!/^(0|[1-9][0-9]*)$/.test(raw)) throw new Error("invalid height key");
+  return counter(Number(raw), "height key");
+}
 function deserializeUtxo(raw: unknown, context: string): Utxo {
-  const o = raw as { address?: unknown; value?: unknown; height?: unknown };
-  return {
-    address: String(o.address ?? ""),
-    value: parseSats(o.value, `${context}.value`),
-    height: Number(o.height ?? 0),
-  };
+  const value = record(raw, context);
+  return { address: text(value.address, `${context}.address`),
+    value: parseSats(value.value, `${context}.value`), height: counter(value.height, `${context}.height`) };
 }
 
 /** State -> plain JSON-safe object. Amounts become decimal strings. */
 export function serializeState(s: StoreState): unknown {
-  const utxos: Record<string, unknown> = {};
+  const utxos: Record<string, unknown> = Object.create(null);
   for (const [k, u] of Object.entries(s.utxos)) utxos[k] = serializeUtxo(u);
 
-  const balances: Record<string, string> = {};
+  const balances: Record<string, string> = Object.create(null);
   for (const [a, v] of Object.entries(s.balances)) balances[a] = formatSats(v);
 
-  const history: Record<string, unknown[]> = {};
+  const history: Record<string, unknown[]> = Object.create(null);
   for (const [a, entries] of Object.entries(s.history)) {
     history[a] = entries.map((e) => ({
       txid: e.txid,
@@ -168,9 +186,9 @@ export function serializeState(s: StoreState): unknown {
     }));
   }
 
-  const undo: Record<string, unknown> = {};
+  const undo: Record<string, unknown> = Object.create(null);
   for (const [h, u] of Object.entries(s.undo)) {
-    const deltas: Record<string, string> = {};
+    const deltas: Record<string, string> = Object.create(null);
     for (const [a, d] of Object.entries(u.deltas)) deltas[a] = d.toString(10); // signed
     undo[h] = {
       height: u.height,
@@ -200,69 +218,77 @@ export function serializeState(s: StoreState): unknown {
  * the same exact `bigint`.
  */
 export function deserializeState(raw: unknown): StoreState {
-  const r = (raw ?? {}) as Record<string, unknown>;
+  const r = record(raw, "snapshot");
   const s = emptyState();
-
-  s.indexedTip = (r.indexedTip as Tip | null) ?? null;
-  s.reorgsHandled = Number(r.reorgsHandled ?? 0);
-  s.blocksApplied = Number(r.blocksApplied ?? 0);
-  s.blocksRolledBack = Number(r.blocksRolledBack ?? 0);
-  // T-1 fix: do not adopt the raw parsed object as-is (it inherits from
-  // Object.prototype like any JSON.parse result) — copy its OWN keys onto a
-  // null-prototype object instead.
-  s.chain = Object.assign(Object.create(null), (r.chain as Record<number, string>) ?? {});
-
-  for (const [k, u] of Object.entries((r.utxos as Record<string, unknown>) ?? {})) {
-    s.utxos[k] = deserializeUtxo(u, `utxo ${k}`);
+  if (r.indexedTip !== null) {
+    const tip = record(r.indexedTip, "indexedTip");
+    s.indexedTip = { height: counter(tip.height, "indexedTip.height"), hash: text(tip.hash, "indexedTip.hash") };
   }
-  for (const [a, v] of Object.entries((r.balances as Record<string, unknown>) ?? {})) {
-    s.balances[a] = parseSats(v, `balance ${a}`);
+  s.reorgsHandled = counter(r.reorgsHandled, "reorgsHandled");
+  s.blocksApplied = counter(r.blocksApplied, "blocksApplied");
+  s.blocksRolledBack = counter(r.blocksRolledBack, "blocksRolledBack");
+  let maximumHeight = -1;
+  for (const [key, hash] of Object.entries(record(r.chain, "chain"))) {
+    const height = heightKey(key);
+    s.chain[height] = text(hash, `chain ${key}`);
+    maximumHeight = Math.max(maximumHeight, height);
   }
-  for (const [a, entries] of Object.entries((r.history as Record<string, unknown[]>) ?? {})) {
-    s.history[a] = (entries ?? []).map((e) => {
-      const h = e as { txid?: unknown; height?: unknown; direction?: unknown; amountSats?: unknown };
-      return {
-        txid: String(h.txid ?? ""),
-        height: Number(h.height ?? 0),
-        direction: h.direction === "out" ? "out" : "in",
-        amountSats: parseSats(h.amountSats, `history ${a}.amountSats`),
-      };
+  if (s.indexedTip === null ? maximumHeight !== -1
+      : maximumHeight !== s.indexedTip.height || s.chain[s.indexedTip.height] !== s.indexedTip.hash) {
+    throw new Error("indexedTip does not match indexed chain");
+  }
+  for (const [key, value] of Object.entries(record(r.utxos, "utxos"))) {
+    const utxo = deserializeUtxo(value, `utxo ${key}`);
+    if (utxo.height > maximumHeight) throw new Error("UTXO above indexed tip");
+    s.utxos[key] = utxo;
+  }
+  for (const [address, value] of Object.entries(record(r.balances, "balances"))) {
+    s.balances[address] = parseSats(value, `balance ${address}`);
+  }
+  for (const [address, entries] of Object.entries(record(r.history, "history"))) {
+    if (!Array.isArray(entries)) throw new Error("history must contain arrays");
+    s.history[address] = entries.map((entry) => {
+      const value = record(entry, "history entry");
+      if (value.direction !== "in" && value.direction !== "out") throw new Error("invalid history direction");
+      const height = counter(value.height, "history height");
+      if (height > maximumHeight) throw new Error("history above indexed tip");
+      return { txid: text(value.txid, "history txid"), height, direction: value.direction,
+        amountSats: parseSats(value.amountSats, `history ${address}.amountSats`) };
     });
   }
-  for (const [h, u] of Object.entries((r.undo as Record<string, unknown>) ?? {})) {
-    const rec = (u ?? {}) as {
-      height?: unknown;
-      hash?: unknown;
-      created?: unknown;
-      spent?: Array<{ key?: unknown; utxo?: unknown }>;
-      deltas?: Record<string, unknown>;
-    };
-    const deltas: Record<string, bigint> = {};
-    for (const [a, d] of Object.entries(rec.deltas ?? {})) {
-      deltas[a] = parseSignedSats(d, `undo ${h} delta ${a}`);
+  for (const [key, value] of Object.entries(record(r.undo, "undo"))) {
+    const height = heightKey(key);
+    const undo = record(value, `undo ${key}`);
+    const hash = text(undo.hash, "undo hash");
+    if (counter(undo.height, "undo height") !== height || s.chain[height] !== hash) throw new Error("undo does not match indexed chain");
+    if (!Array.isArray(undo.created) || !Array.isArray(undo.spent)) throw new Error("invalid undo arrays");
+    const deltas: Record<string, bigint> = Object.create(null);
+    for (const [address, delta] of Object.entries(record(undo.deltas, "undo deltas"))) {
+      deltas[address] = parseSignedSats(delta, `undo ${key} delta ${address}`);
     }
-    s.undo[Number(h)] = {
-      height: Number(rec.height ?? Number(h)),
-      hash: String(rec.hash ?? ""),
-      created: (rec.created as string[]) ?? [],
-      spent: (rec.spent ?? []).map((sp) => ({
-        key: String(sp.key ?? ""),
-        utxo: deserializeUtxo(sp.utxo, `undo ${h} spent ${String(sp.key)}`),
-      })),
-      deltas,
-    };
+    s.undo[height] = { height, hash, created: undo.created.map((entry) => text(entry, "created key")),
+      spent: undo.spent.map((entry) => {
+        const spent = record(entry, "spent entry");
+        return { key: text(spent.key, "spent key"), utxo: deserializeUtxo(spent.utxo, "spent utxo") };
+      }), deltas };
   }
   return s;
 }
 
 export class JsonStore implements IndexStore {
   state: StoreState;
-  // T-8 fix: address -> Set of "txid:index" utxo keys, maintained
+  // Address -> dense UTXO-key array and positions, maintained in O(1).
+  // Pages are O(page size); swap-removal is safe because cursors bind a revision.
+  // The previous Set required scanning all preceding keys for an offset page.
+  // The derived index is maintained
   // incrementally alongside `state.utxos` (applyBlock / rollbackBlock).
   // NOT part of `StoreState` / the persisted format — it is fully derivable
   // from `state.utxos` and is rebuilt from it on every load, so this adds
   // no on-disk compatibility surface.
-  private readonly utxosByAddress: Map<string, Set<string>> = new Map();
+  private readonly utxosByAddress = new Map<string, { keys: string[]; positions: Map<string, number> }>();
+  private readonly generation = randomUUID();
+  private revision = 0n;
+  private persistedSnapshot: string | null = null;
   // T-7 fix: false iff the state file existed but failed to parse/load.
   private loadOk = true;
 
@@ -278,19 +304,44 @@ export class JsonStore implements IndexStore {
   }
 
   private indexUtxo(key: string, address: string): void {
-    let set = this.utxosByAddress.get(address);
-    if (!set) {
-      set = new Set();
-      this.utxosByAddress.set(address, set);
+    let index = this.utxosByAddress.get(address);
+    if (!index) {
+      index = { keys: [], positions: new Map() };
+      this.utxosByAddress.set(address, index);
     }
-    set.add(key);
+    if (index.positions.has(key)) return;
+    index.positions.set(key, index.keys.length);
+    index.keys.push(key);
   }
 
   private unindexUtxo(key: string, address: string): void {
-    const set = this.utxosByAddress.get(address);
-    if (!set) return;
-    set.delete(key);
-    if (set.size === 0) this.utxosByAddress.delete(address);
+    const index = this.utxosByAddress.get(address);
+    const position = index?.positions.get(key);
+    if (!index || position === undefined) return;
+    const last = index.keys.pop()!;
+    index.positions.delete(key);
+    if (position < index.keys.length) {
+      index.keys[position] = last;
+      index.positions.set(last, position);
+    }
+    if (index.keys.length === 0) this.utxosByAddress.delete(address);
+  }
+
+  getSnapshotId(): string {
+    return `${this.generation}:${this.revision}`;
+  }
+
+  getUtxoCount(address: string): number {
+    return this.utxosByAddress.get(address)?.keys.length ?? 0;
+  }
+
+  getUtxoPage(address: string, offset: number, limit: number): Array<{ key: string; utxo: Utxo }> {
+    const keys = this.utxosByAddress.get(address)?.keys ?? [];
+    return keys.slice(offset, offset + limit).map((key) => ({ key, utxo: this.state.utxos[key]! }));
+  }
+
+  getHistoryPage(address: string, offset: number, limit: number): HistoryEntry[] {
+    return this.getHistory(address).slice(offset, offset + limit);
   }
 
   indexOk(): boolean {
@@ -383,21 +434,41 @@ export class JsonStore implements IndexStore {
       throw new Error(`refusing to apply height ${height}: already indexed (should roll back first)`);
     }
 
-    type PlannedSpend = { kind: "spend"; key: string; utxo: Utxo; txid: string };
+    if (!Number.isSafeInteger(this.state.blocksApplied + 1)) throw new Error("blocksApplied counter exhausted");
+
+    type PlannedSpend = { kind: "spend"; key: string; utxo: Utxo; txid: string; restoreOnUndo: boolean };
     type PlannedCreate = { kind: "create"; key: string; address: string; value: bigint; txid: string };
     const plan: Array<PlannedSpend | PlannedCreate> = [];
 
-    // PHASE 1 — plan. Reads `this.state.utxos` but never mutates anything.
+    // The overlay models preceding transactions in this block without touching
+    // committed state. A null entry is a spend tombstone, not a missing lookup.
+    const overlay = new Map<string, Utxo | null>();
+    const consumed = new Set<string>();
+    const created = new Set<string>();
+
+    // PHASE 1 — plan against the overlay; committed state stays unchanged.
     for (const tx of txs) {
       if (!tx.coinbase) {
         for (const inp of tx.inputs) {
           const key = `${inp.prev_txid}:${inp.prev_index}`;
-          const utxo = Object.hasOwn(this.state.utxos, key) ? this.state.utxos[key] : undefined;
-          if (!utxo) continue; // input we never indexed (e.g. pre-genesis); skip defensively
-          plan.push({ kind: "spend", key, utxo, txid: tx.txid });
+          if (consumed.has(key)) throw new Error(`duplicate spend of outpoint ${key} in block ${height}`);
+          consumed.add(key);
+          const utxo = overlay.has(key) ? overlay.get(key)
+            : Object.hasOwn(this.state.utxos, key) ? this.state.utxos[key] : undefined;
+          overlay.set(key, null);
+          if (!utxo) continue; // preserve compatibility for inputs outside indexed history
+          plan.push({ kind: "spend", key, utxo, txid: tx.txid, restoreOnUndo: !created.has(key) });
         }
       }
       for (const out of tx.outputs) {
+        const key = `${tx.txid}:${out.index}`;
+        if (created.has(key) || Object.hasOwn(this.state.utxos, key)) {
+          throw new Error(`duplicate created outpoint ${key} in block ${height}`);
+        }
+        if (consumed.has(key)) throw new Error(`outpoint ${key} is spent before creation in block ${height}`);
+        if (typeof out.value !== "bigint" || out.value < 0n) {
+          throw new Error(`invalid value for outpoint ${key}`);
+        }
         // T-2 fix: an unrecognised script_pubkey (anything not exactly
         // 20 bytes — an OP_RETURN-style output, an eUVM validator output,
         // an empty script, an RPC schema change) used to make
@@ -420,15 +491,19 @@ export class JsonStore implements IndexStore {
               `indexed as ${address}`,
           );
         }
-        plan.push({ kind: "create", key: `${tx.txid}:${out.index}`, address, value: out.value, txid: tx.txid });
+        created.add(key);
+        overlay.set(key, { address, value: out.value, height });
+        plan.push({ kind: "create", key, address, value: out.value, txid: tx.txid });
       }
     }
 
     // PHASE 2 — apply. Every value here was already validated in phase 1.
-    const undo: UndoRecord = { height, hash, created: [], spent: [], deltas: {} };
+    const undo: UndoRecord = { height, hash, created: [], spent: [], deltas: Object.create(null) };
     for (const op of plan) {
       if (op.kind === "spend") {
-        undo.spent.push({ key: op.key, utxo: op.utxo });
+        // A same-block intermediate output did not exist before this block.
+        // Restoring it on rollback would create an unbacked UTXO.
+        if (op.restoreOnUndo) undo.spent.push({ key: op.key, utxo: op.utxo });
         delete this.state.utxos[op.key];
         this.unindexUtxo(op.key, op.utxo.address); // T-8: keep the secondary index in sync
         this.bump(undo.deltas, op.utxo.address, -op.utxo.value);
@@ -446,6 +521,7 @@ export class JsonStore implements IndexStore {
     this.state.undo[height] = undo;
     this.state.indexedTip = { height, hash };
     this.state.blocksApplied += 1;
+    this.revision += 1n;
   }
 
   /** Reverse exactly one block using its undo record. */
@@ -483,12 +559,23 @@ export class JsonStore implements IndexStore {
     delete this.state.chain[height];
     delete this.state.undo[height];
     this.state.blocksRolledBack += 1;
+    this.revision += 1n;
   }
 
   /** Roll back every block ABOVE forkHeight (keep heights <= forkHeight). */
   rollbackTo(forkHeight: number): void {
     const tip = this.state.indexedTip;
     if (!tip) return;
+    if (!Number.isSafeInteger(forkHeight) || forkHeight < -1 || forkHeight > tip.height) throw new Error("invalid rollback height");
+    if (!Number.isSafeInteger(this.state.reorgsHandled + 1)
+        || !Number.isSafeInteger(this.state.blocksRolledBack + tip.height - forkHeight)) {
+      throw new Error("rollback counter exhausted");
+    }
+    for (let h = tip.height; h > forkHeight; h--) {
+      if (this.state.chain[h] !== undefined && !Object.hasOwn(this.state.undo, h)) {
+        throw new Error(`no undo record for height ${h}`);
+      }
+    }
     for (let h = tip.height; h > forkHeight; h--) {
       if (this.state.chain[h] !== undefined) this.rollbackBlock(h);
     }
@@ -499,6 +586,7 @@ export class JsonStore implements IndexStore {
       this.state.indexedTip = hash !== undefined ? { height: forkHeight, hash } : null;
     }
     this.state.reorgsHandled += 1;
+    this.revision += 1n;
   }
 
   getBalance(address: string): bigint {
@@ -513,17 +601,10 @@ export class JsonStore implements IndexStore {
     // on every call — a cheap unauthenticated CPU DoS against
     // `/address/:addr/utxos` and `/address/:addr/balance` (which calls this
     // too, for `utxoCount`) once the UTXO set is realistically large. The
-    // secondary `utxosByAddress` index turns this into an O(this address's
+    // secondary `utxosByAddress` index turns this compatibility helper into an O(this address's
     // own UTXO count) lookup, maintained incrementally in applyBlock /
     // rollbackBlock rather than rebuilt per request.
-    const keys = this.utxosByAddress.get(address);
-    if (!keys) return [];
-    const out: Array<{ key: string; utxo: Utxo }> = [];
-    for (const key of keys) {
-      const utxo = this.state.utxos[key];
-      if (utxo) out.push({ key, utxo });
-    }
-    return out;
+    return this.getUtxoPage(address, 0, this.getUtxoCount(address));
   }
 
   getHistory(address: string): HistoryEntry[] {
@@ -534,21 +615,28 @@ export class JsonStore implements IndexStore {
   }
 
   persist(): void {
-    if (!this.filePath) return; // ephemeral
+    if (!this.filePath) return;
+    if (!this.loadOk) throw new Error("refusing to overwrite an unreadable index snapshot");
+    // Mutations must use applyBlock/rollbackTo; state is exposed for inspection.
+    const snapshot = this.getSnapshotId();
+    if (snapshot === this.persistedSnapshot) return; // polling without changes must not rewrite the index
     mkdirSync(dirname(this.filePath), { recursive: true });
-    // JSON.stringify(this.state) would THROW here: the state holds bigints.
     const bytes = JSON.stringify(serializeState(this.state));
-    // T-7 fix (audit finding): write-then-rename instead of a bare
-    // writeFileSync onto the live path. A crash or a full disk mid-write
-    // used to leave a TRUNCATED file at the real path — which `open()`
-    // then reads on next start, hits a JSON parse error, and (before the
-    // T-7 `indexOk` fix above) silently substituted an empty state with no
-    // externally visible sign the index was gone. `rename(2)` on the same
-    // filesystem is atomic: the live path either still holds the last
-    // complete write, or holds the new complete write — never a partial
-    // one, regardless of when a crash lands.
-    const tmpPath = `${this.filePath}.tmp`;
-    writeFileSync(tmpPath, bytes);
-    renameSync(tmpPath, this.filePath);
+    const tmpPath = `${this.filePath}.tmp-${randomUUID()}`;
+    let fd: number | undefined;
+    try {
+      fd = openSync(tmpPath, "wx", 0o600);
+      writeFileSync(fd, bytes);
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = undefined;
+      renameSync(tmpPath, this.filePath);
+      const directory = openSync(dirname(this.filePath), "r");
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+      this.persistedSnapshot = snapshot;
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+      if (existsSync(tmpPath)) unlinkSync(tmpPath);
+    }
   }
 }

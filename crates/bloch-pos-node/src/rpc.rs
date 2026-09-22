@@ -64,7 +64,7 @@
 //! from reading it.
 
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -86,10 +86,45 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Largest request head (request line + headers) accepted before the body.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 
-/// Connections served concurrently. Past this the listener answers 503 and
-/// closes, rather than spawning threads until the process dies — the node's
-/// consensus thread must survive its RPC port being hammered.
+/// Connections served concurrently. Past this the listener closes the
+/// accepted socket instead of spawning more threads — the node's consensus
+/// thread must survive its RPC port being hammered.
 const MAX_CONNECTIONS: usize = 64;
+
+/// Concurrent workers retained by one normalized source address.
+const MAX_CONNECTIONS_PER_IP: usize = 8;
+
+/// Own both listener admission charges through the complete worker lifetime.
+/// In particular, an unwind inside request parsing or a backend cannot leak a
+/// global slot while the per-IP guard is released automatically.
+struct RpcConnectionPermit {
+    _ip: crate::connection_limit::Permit,
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for RpcConnectionPermit {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn reserve_connection(
+    ip: IpAddr,
+    live: &Arc<AtomicUsize>,
+    ip_limits: &Arc<crate::connection_limit::Limits>,
+) -> Option<RpcConnectionPermit> {
+    let ip_permit = ip_limits.reserve(ip, MAX_CONNECTIONS_PER_IP)?;
+    // Reserve before spawning: incrementing inside the worker would let an
+    // unbounded burst spawn first and count later.
+    if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+        live.fetch_sub(1, Ordering::SeqCst);
+        return None;
+    }
+    Some(RpcConnectionPermit {
+        _ip: ip_permit,
+        live: Arc::clone(live),
+    })
+}
 
 /// Total time allowed to receive a request, and per-write response timeout.
 /// Occasional bytes must not renew a connection's request budget.
@@ -516,11 +551,12 @@ struct Parser<'a> {
     b: &'a [u8],
     i: usize,
     depth: u32,
+    values: usize,
 }
 
 /// Parse one JSON value from `text`, which must contain nothing else.
 pub fn parse_json(text: &str) -> Result<Json, &'static str> {
-    let mut p = Parser { b: text.as_bytes(), i: 0, depth: 0 };
+    let mut p = Parser { b: text.as_bytes(), i: 0, depth: 0, values: 0 };
     p.ws();
     let v = p.value()?;
     p.ws();
@@ -561,6 +597,8 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self) -> Result<Json, &'static str> {
+        self.values = self.values.saturating_add(1);
+        if self.values > 16_384 { return Err("too many JSON values"); }
         // Same refusal for the (unreachable) u32 overflow as for the depth cap.
         self.depth = self.depth.checked_add(1).ok_or("nesting too deep")?;
         if self.depth > MAX_DEPTH {
@@ -900,6 +938,12 @@ pub enum RpcRequest {
 /// and JSON layers are exercised without standing up a node.
 pub trait RpcBackend: Send + Sync + 'static {
     fn call(&self, req: RpcRequest) -> RpcResult;
+
+    /// HTTP entry point with the socket peer's address. Test and embedded
+    /// backends retain the source-free `call` contract by default.
+    fn call_from(&self, req: RpcRequest, _source: IpAddr) -> RpcResult {
+        self.call(req)
+    }
 }
 
 /// One in-flight request handed to the consensus thread, with the channel it
@@ -907,11 +951,21 @@ pub trait RpcBackend: Send + Sync + 'static {
 pub struct RpcCall {
     pub req: RpcRequest,
     pub reply: Sender<RpcResult>,
+    pub(crate) verification_source: Option<[u8; 32]>,
+    _permit: crate::connection_limit::Permit,
 }
 
+/// One complete `getblockcount` answer published after a canonical change.
+///
+/// The mutex bundles height, slot and finality into one generation: readers
+/// see either the previous committed answer or the next one, never fields from
+/// both. The value is already-derived, small JSON so a polling client performs
+/// no chain lookup and cannot occupy the consensus thread.
+pub(crate) type SharedBlockCount = Arc<Mutex<Json>>;
+
 /// The production backend: hand the request to the engine's event loop and wait
-/// — except for the two ledger reads, which are answered from the published
-/// head (see [`Self::from_head`]).
+/// — except for process-local and state-only reads, which are answered before
+/// the queue (see [`Self::locally`] and [`Self::from_head`]).
 ///
 /// Nearly everything goes through the consensus thread rather than through a
 /// shared snapshot of state, and that is a deliberate cost. The engine's whole
@@ -921,8 +975,8 @@ pub struct RpcCall {
 /// queries behind the loop means a query can never observe a half-applied
 /// block, and it means no reader can be looking at last epoch's answer.
 ///
-/// **The exception, and why it does not reopen that.** `getbalance` and
-/// `getutxos` are served from an `Arc<CommittedState>` the consensus thread
+/// **The exception, and why it does not reopen that.** Ledger and validator
+/// registry reads are served from an `Arc<CommittedState>` the consensus thread
 /// publishes — the identical value it holds, not a copy shaped like it, so
 /// there is nothing to drift and no half-applied state to observe. They earn
 /// the exception because they were the only reads whose cost scaled with the
@@ -930,6 +984,11 @@ pub struct RpcCall {
 /// the slot loop while the node missed its duties. The `expected_bits` lesson
 /// is about a second *derivation* of a consensus value; this is the same
 /// value, handed over by reference.
+///
+/// `getblockcount` is the other narrow exception. Its six-field answer is
+/// derived by the engine's own formatter and published whole only after a
+/// canonical mutation finishes. It is not independently recomputed by the RPC
+/// thread, and the one-value mutex prevents mixed height/finality generations.
 pub struct EngineBackend {
     /// `Mutex` because `mpsc::Sender` only became `Sync` in Rust 1.72 and this
     /// crate pins no MSRV. The lock is held exactly long enough to clone.
@@ -940,11 +999,19 @@ pub struct EngineBackend {
     /// backend, and a backend with no handle behaves exactly as it did before
     /// this field existed: everything goes through the loop.
     head: Option<crate::engine::SharedHead>,
+    /// Complete canonical summary for the polling-only `getblockcount` call.
+    block_count: Option<SharedBlockCount>,
+    pending: Arc<crate::connection_limit::Limits>,
 }
 
 impl EngineBackend {
     pub fn new(engine: Sender<crate::engine::EngineEvent>) -> Self {
-        EngineBackend { engine: Mutex::new(engine), head: None }
+        EngineBackend {
+            engine: Mutex::new(engine),
+            head: None,
+            block_count: None,
+            pending: Arc::default(),
+        }
     }
 
     /// The production constructor: the channel to the loop, plus the handle on
@@ -953,7 +1020,56 @@ impl EngineBackend {
         engine: Sender<crate::engine::EngineEvent>,
         head: crate::engine::SharedHead,
     ) -> Self {
-        EngineBackend { engine: Mutex::new(engine), head: Some(head) }
+        EngineBackend {
+            engine: Mutex::new(engine),
+            head: Some(head),
+            block_count: None,
+            pending: Arc::default(),
+        }
+    }
+
+    /// Production constructor with both immutable-state and canonical-summary
+    /// publication. Kept separate from [`Self::with_head`] so existing callers
+    /// that only publish state retain their exact routing behavior.
+    pub(crate) fn with_published(
+        engine: Sender<crate::engine::EngineEvent>,
+        head: crate::engine::SharedHead,
+        block_count: SharedBlockCount,
+    ) -> Self {
+        EngineBackend {
+            engine: Mutex::new(engine),
+            head: Some(head),
+            block_count: Some(block_count),
+            pending: Arc::default(),
+        }
+    }
+
+    /// Answer requests whose complete input is compiled into this process.
+    ///
+    /// `getbuildinfo` does not observe the chain, mempool or engine at all.
+    /// Routing it through the consensus thread let a caller consume the same
+    /// bounded queue permits as real engine work and made a static response
+    /// wait behind block processing. Keeping this dispatch separate from
+    /// [`Self::from_head`] is intentional: it works even for a backend without
+    /// a published chain-state handle and cannot acquire that handle's lock.
+    fn locally(req: &RpcRequest) -> Option<RpcResult> {
+        match req {
+            RpcRequest::BuildInfo => Some(Ok(build_info_json())),
+            _ => None,
+        }
+    }
+
+    /// Answer the canonical polling summary without entering the engine queue.
+    fn from_block_count(&self, req: &RpcRequest) -> Option<RpcResult> {
+        if !matches!(req, RpcRequest::BlockCount) {
+            return None;
+        }
+        let published = self.block_count.as_ref()?;
+        let answer = match published.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        Some(Ok(answer))
     }
 
     /// Answer `req` from the published head, or `None` if it is not one of the
@@ -961,13 +1077,13 @@ impl EngineBackend {
     ///
     /// # Which requests, and why only these
     ///
-    /// `getbalance` and `getutxos` read the eUTXO set and nothing else. They
-    /// touch no mempool, no block store and no fork-choice store — the three
-    /// things that live only on the consensus thread — so a committed state is
-    /// a complete answer to them.
+    /// These requests read the committed eUTXO set or validator registry and
+    /// nothing else. They touch no mempool, block store or fork-choice store —
+    /// the three things that live only on the consensus thread — so a
+    /// committed state is a complete answer to them.
     ///
-    /// They are also the only two reads whose cost is set by the size of the
-    /// **ledger** rather than by the size of the answer, which is what makes
+    /// The ledger reads are the requests whose cost is set by the size of the
+    /// ledger rather than by the size of the answer, which is what first made
     /// this necessary rather than merely nice: on 2026-08-21 a balance query
     /// over the founder's 452,726 outputs sat in the slot loop for its whole
     /// duration, and the node missed duties while an honest holder waited for
@@ -990,7 +1106,14 @@ impl EngineBackend {
         // Matched BEFORE the state is cloned, so a request that must go to the
         // loop does not even touch the lock.
         match req {
-            RpcRequest::Balance(_) | RpcRequest::Utxos { .. } => {}
+            RpcRequest::Balance(_)
+            | RpcRequest::Utxos { .. }
+            | RpcRequest::TxOut { .. }
+            | RpcRequest::Validator(_)
+            | RpcRequest::ValidatorCount
+            | RpcRequest::ValidatorByKey(_)
+            | RpcRequest::ValidatorAdmission
+            | RpcRequest::Validators => {}
             _ => return None,
         }
         // The lock is held for one `Arc::clone` and dropped. The query below
@@ -1005,6 +1128,12 @@ impl EngineBackend {
             Arc::clone(&guard)
         };
         match req {
+            RpcRequest::Validator(index) => Some(validator_record_json(&state, *index)),
+            RpcRequest::ValidatorCount => Some(Ok(validator_count_json(&state))),
+            RpcRequest::ValidatorByKey(hash) => Some(validator_by_key_json(&state, hash)),
+            RpcRequest::ValidatorAdmission => Some(Ok(validator_admission_json(&state))),
+            RpcRequest::Validators => Some(Ok(validator_registry_json(&state))),
+            RpcRequest::TxOut { txid, vout } => Some(Ok(txout_json(&state, txid, *vout))),
             RpcRequest::Balance(script_hash) => Some(Ok(balance_json(&state, script_hash))),
             RpcRequest::Utxos { script_hash, limit } => {
                 Some(Ok(utxos_json(&state, script_hash, *limit)))
@@ -1012,13 +1141,23 @@ impl EngineBackend {
             _ => None,
         }
     }
-}
 
-impl RpcBackend for EngineBackend {
-    fn call(&self, req: RpcRequest) -> RpcResult {
+    fn call_attributed(&self, req: RpcRequest, source: Option<IpAddr>) -> RpcResult {
+        if let Some(answered) = Self::locally(&req) {
+            return answered;
+        }
+        if let Some(answered) = self.from_block_count(&req) {
+            return answered;
+        }
         if let Some(answered) = self.from_head(&req) {
             return answered;
         }
+        // Reservation travels with the queued request, so HTTP timeouts do
+        // not free capacity while the consensus thread still owes the work.
+        let queue_source = source.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let permit = self.pending.reserve(queue_source, 16)
+            .ok_or_else(|| RpcError::unavailable("RPC engine queue is full; retry later"))?;
+        let verification_source = source.map(crate::net::verification_source_for_ip);
         let (tx, rx) = mpsc::channel::<RpcResult>();
         let sender = match self.engine.lock() {
             Ok(guard) => guard.clone(),
@@ -1026,7 +1165,12 @@ impl RpcBackend for EngineBackend {
             // itself is still fine, but saying so honestly beats unwrapping.
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        if sender.send(crate::engine::EngineEvent::Rpc(RpcCall { req, reply: tx })).is_err() {
+        if sender.send(crate::engine::EngineEvent::Rpc(RpcCall {
+            req,
+            reply: tx,
+            verification_source,
+            _permit: permit,
+        })).is_err() {
             return Err(RpcError::unavailable("node is shutting down"));
         }
         match rx.recv_timeout(ENGINE_TIMEOUT) {
@@ -1039,6 +1183,16 @@ impl RpcBackend for EngineBackend {
                 Err(RpcError::unavailable("node is shutting down"))
             }
         }
+    }
+}
+
+impl RpcBackend for EngineBackend {
+    fn call(&self, req: RpcRequest) -> RpcResult {
+        self.call_attributed(req, None)
+    }
+
+    fn call_from(&self, req: RpcRequest, source: IpAddr) -> RpcResult {
+        self.call_attributed(req, Some(source))
     }
 }
 
@@ -1228,6 +1382,14 @@ fn envelope(id: Json, outcome: RpcResult) -> String {
 /// "malformed input crashes the node" and "anyone can stop the validator" are
 /// the same sentence.
 pub fn handle_body(body: &str, backend: &dyn RpcBackend) -> String {
+    handle_body_from(body, backend, None)
+}
+
+fn handle_body_from(
+    body: &str,
+    backend: &dyn RpcBackend,
+    source: Option<IpAddr>,
+) -> String {
     let request = match parse_json(body) {
         Ok(v) => v,
         Err(why) => return envelope(Json::Null, Err(RpcError::parse_error(why))),
@@ -1248,12 +1410,13 @@ pub fn handle_body(body: &str, backend: &dyn RpcBackend) -> String {
         );
     }
 
-    // Echo the id whatever it is, including absent (null). A client correlating
-    // responses must get its id back even when the rest of the request was
-    // nonsense — that is the only thing tying an error to the call that caused
-    // it. Ids that are objects or arrays are out of spec but are echoed rather
-    // than rewritten, because rewriting one breaks correlation silently.
-    let id = request.get("id").cloned().unwrap_or(Json::Null);
+    // JSON-RPC identifiers are scalar and bounded before cloning/echoing.
+    let id = match request.get("id") {
+        None | Some(Json::Null) => Json::Null,
+        Some(Json::Str(v)) if v.len() <= 256 => Json::Str(v.clone()),
+        Some(Json::Num(v)) if v.len() <= 128 => Json::Num(v.clone()),
+        _ => return envelope(Json::Null, Err(RpcError::invalid_request("invalid or oversized request id"))),
+    };
 
     if let Some(v) = request.get("jsonrpc") {
         if v.as_str() != Some("2.0") {
@@ -1266,7 +1429,10 @@ pub fn handle_body(body: &str, backend: &dyn RpcBackend) -> String {
     };
 
     let params = request.get("params").filter(|p| !matches!(p, Json::Null));
-    let outcome = route(method, params).and_then(|req| backend.call(req));
+    let outcome = route(method, params).and_then(|req| match source {
+        Some(source) => backend.call_from(req, source),
+        None => backend.call(req),
+    });
     envelope(id, outcome)
 }
 
@@ -1292,31 +1458,32 @@ pub fn serve(
     // Computed once per bind, not per request (R1 A3-M4): env and the bound
     // address are both fixed for the life of this listener.
     let hosts = Arc::new(HostPolicy::new(bind_addr));
+    let ip_limits = Arc::new(crate::connection_limit::Limits::default());
     thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(sock) = conn else { continue };
-            // Reserve a slot before spawning: incrementing inside the thread
-            // would let an unbounded burst spawn first and count later.
-            if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-                live.fetch_sub(1, Ordering::SeqCst);
-                let mut sock = sock;
-                let _ = respond(&mut sock, 503, "{\"error\":\"too many connections\"}");
+            let Ok(address) = sock.peer_addr() else { continue };
+            let Some(permit) = reserve_connection(address.ip(), &live, &ip_limits) else {
                 continue;
-            }
+            };
             let backend = backend.clone();
-            let live = live.clone();
             let hosts = hosts.clone();
             thread::spawn(move || {
+                let _permit = permit;
                 let mut sock = sock;
-                serve_connection(&mut sock, backend.as_ref(), &hosts);
-                live.fetch_sub(1, Ordering::SeqCst);
+                serve_connection(&mut sock, backend.as_ref(), &hosts, address.ip());
             });
         }
     });
     Ok(local)
 }
 
-fn serve_connection(sock: &mut TcpStream, backend: &dyn RpcBackend, hosts: &HostPolicy) {
+fn serve_connection(
+    sock: &mut TcpStream,
+    backend: &dyn RpcBackend,
+    hosts: &HostPolicy,
+    source: IpAddr,
+) {
     let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
     let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
     match read_request(sock, hosts) {
@@ -1324,7 +1491,7 @@ fn serve_connection(sock: &mut TcpStream, backend: &dyn RpcBackend, hosts: &Host
             // The body must be text before it can be JSON. Invalid UTF-8 is a
             // parse error with a JSON-RPC shape, not a dropped connection.
             let response = match std::str::from_utf8(&body) {
-                Ok(text) => handle_body(text, backend),
+                Ok(text) => handle_body_from(text, backend, Some(source)),
                 Err(_) => envelope(Json::Null, Err(RpcError::parse_error("body is not UTF-8"))),
             };
             let _ = respond(sock, 200, &response);
@@ -1394,6 +1561,11 @@ struct HostPolicy {
 
 impl HostPolicy {
     fn new(bind_addr: &str) -> Self {
+        let extra = std::env::var(RPC_HOST_ALLOWLIST_ENV).ok();
+        Self::with_extra(bind_addr, extra.as_deref())
+    }
+
+    fn with_extra(bind_addr: &str, extra: Option<&str>) -> Self {
         let mut allowed = vec!["127.0.0.1".to_string(), "localhost".to_string(), "::1".to_string()];
         // An operator who bound a specific, literal address made an explicit
         // decision to trust that name — `0.0.0.0`/`::` are wildcard BIND
@@ -1402,7 +1574,7 @@ impl HostPolicy {
         if bind_addr != "0.0.0.0" && bind_addr != "::" && !allowed.iter().any(|a| a == bind_addr) {
             allowed.push(bind_addr.to_string());
         }
-        if let Ok(extra) = std::env::var(RPC_HOST_ALLOWLIST_ENV) {
+        if let Some(extra) = extra {
             allowed.extend(
                 extra
                     .split(',')
@@ -1415,21 +1587,61 @@ impl HostPolicy {
 
     fn allows(&self, host: Option<&str>) -> bool {
         let Some(h) = host else { return false };
-        let name = host_name_only(h).to_ascii_lowercase();
+        let Some(name) = host_name_only(h) else { return false };
+        let name = name.to_ascii_lowercase();
         self.allowed.iter().any(|a| *a == name)
     }
 }
 
 /// The hostname portion of an HTTP `Host` header value, with a trailing
 /// `:<port>` stripped. Handles the IPv6 literal form (`[::1]:8080` or bare
-/// `[::1]`), which a naive split on `:` would mangle into `[` and a garbled
-/// remainder.
-fn host_name_only(host: &str) -> &str {
+/// `[::1]`), and rejects malformed authorities rather than extracting an
+/// allowed prefix from them.
+fn host_name_only(host: &str) -> Option<&str> {
     let host = host.trim();
-    if let Some(rest) = host.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(rest);
+    if host.is_empty() {
+        return None;
     }
-    host.split_once(':').map_or(host, |(name, _)| name)
+    if let Some(rest) = host.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let name = &rest[..close];
+        if name.parse::<std::net::Ipv6Addr>().is_err()
+            || !valid_host_port_suffix(&rest[close.saturating_add(1)..])
+        {
+            return None;
+        }
+        return Some(name);
+    }
+    if host.contains('[') || host.contains(']') {
+        return None;
+    }
+    let (name, suffix) = match host.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host, None),
+    };
+    if name.is_empty()
+        || !name.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=%".contains(&b)
+        })
+        || suffix.is_some_and(|port| {
+            port.is_empty()
+                || !port.bytes().all(|b| b.is_ascii_digit())
+                || port.parse::<u16>().is_err()
+        })
+    {
+        return None;
+    }
+    Some(name)
+}
+
+fn valid_host_port_suffix(suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    let Some(port) = suffix.strip_prefix(':') else { return false };
+    !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
 }
 
 /// `Content-Type`, ignoring `;`-separated parameters (e.g. `; charset=utf-8`)
@@ -1789,145 +2001,26 @@ pub fn chain_info_json(
 
 /// How a block stands relative to this node's own checkpoints.
 ///
-/// # This is the field an exchange reads — and what it does NOT buy
+/// The coordinated release schedules lifecycle epoch 2884 for 2026-09-14
+/// 22:35:19 UTC. Before that epoch, slashing evidence is consensus-invalid.
+/// At and after it, valid evidence can apply the configured penalties. A
+/// scheduled source constant does not prove that deployed nodes have upgraded,
+/// that a particular proof was included, or that a payment has settled.
 ///
-/// The integration question was "how many confirmations should we require, and
-/// what does the guarantee rest on". Under PoS there is no answer in that
-/// currency: depth is not security (R1), and a chain with no difficulty cannot
-/// price a reorg in work. [`Finality::Finalized`] is the right field to read.
-/// What it rests on is far narrower than an earlier revision of this comment
-/// claimed, and the difference is the one that decides customer money.
+/// Historical retraction: an earlier revision said "Credit here" and called
+/// finality "economic by intent and cryptographic by nothing". Neither slogan
+/// describes the scheduled release. The node's finalized latch refuses a
+/// protocol reorg below its own finalized checkpoint. It does not establish
+/// agreement between independent nodes or a universal one-third-stake cost.
+/// The one-half quorum-denominator floor retains the limitations documented
+/// in `finality.rs`; an epoch schedule does not remove them.
 ///
-/// ## RETRACTION (2026-09-01): finality here is NOT backed by a slashing cost
-///
-/// This comment used to say that "a finalised checkpoint cannot be reverted
-/// unless at least one third of the total stake is slashed, which is a bonded,
-/// attributable, on-chain cost rather than a probabilistic one", and
-/// [`Finality::Finalized`] used to be annotated "Credit here". That is
-/// Casper's guarantee on paper. It is not this binary's. **No stake on
-/// Genesis-4 can be slashed at all**, for four independent reasons, any one of
-/// which is sufficient on its own:
-///
-/// 1. **Evidence could not be decoded — CORRECTED 2026-09-05: it decodes,
-///    and the block is still refused.** As first stated,
-///    `PosTransaction::from_canonical_bytes` returned
-///    `TxDecodeError::EvidenceNotDecodable` for wire tag `0x05`
-///    unconditionally, with no gate: the encoder folded the nested messages
-///    in as the signing roots they were signed over — hashes — so the
-///    envelopes were unrecoverable by construction (Round-2 finding F-02).
-///    The codec now carries both envelopes whole and decodes them, and what
-///    refuses the transaction moved from the decoder to the transition:
-///    every epoch below `SLASHING_EVIDENCE_ACTIVATION_EPOCH` answers
-///    `TxReject::EvidenceNotActive`. Break 1 is closed as a wire format;
-///    break 4 (the unarmed flag day) is now the load-bearing one.
-/// 2. **That decoder is the only one on every ingress path**: block body,
-///    gossip and `sendrawtransaction`. Before 2026-09-05 that meant a block
-///    carrying evidence was rejected by every peer at decode; it now means
-///    every ingress path reaches the same transition gate, and the released
-///    fleet binaries — which predate the format — still refuse at decode.
-///    Either way a proposer that included evidence today would produce a
-///    block its peers refuse.
-/// 3. ADR-041 connects observed proposer/attestation evidence to ordinary
-///    admission. The node reports a refusal while activation remains disabled;
-///    implementing the observation hook does not activate penalties.
-/// 4. **The activation constant exists on this lineage and is not armed.**
-///    An earlier draft of this break said no such constant existed on the
-///    release lineage, while one sat off-lineage at `d21c3370:params.rs:638`.
-///    Since 2026-09-05 `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is defined in
-///    `bloch-pos-committee::params`, value exactly `u64::MAX`: no epoch any
-///    chain reaches activates it, so there is no flag day SCHEDULED — but
-///    there is now, for the first time on this lineage, a flag day to
-///    schedule. Arming it is a founder decision with a hard precondition
-///    (full fleet rollout of the evidence decoder), and until that day this
-///    break keeps the retraction below in force on its own.
-///
-/// Read from the live chain on 2026-09-02 at height 34,665, epoch 1736, from
-/// two keyless archival observers whose responses were byte-for-byte
-/// identical: `getvalidatorcount` 64 total and 64 active; zero records with
-/// `"slashed": true`; zero with a non-null `"exit_epoch"`; 64 of 64 in state
-/// `active`. Equivocation on this fleet is *detected* — the node captures each
-/// pair and logs it — and none of it has ever been prosecuted.
-///
-/// The scale of that is larger than the registry can show. Replay of
-/// `blocks.log` puts **48 validators** with provable double-signing, derived
-/// seven independent ways: two forensic pipelines written separately (one
-/// producing the pair table with slot, both roots, and the blocks carrying
-/// each half), the committed state reproduced, and six independently kept
-/// logs deriving the same set in slot order. The two indices recorded in
-/// `deploy/FLAG-DAY-EPOCH-800.md` (16 and 35) are *within* that set — an
-/// earlier incident, not a competing count.
-///
-/// **Do not put that number in integrator-facing material.** Not because it is
-/// doubtful, but because no RPC method exposes equivocation evidence, so the
-/// recipient has no way to check it: every one of those 48 reads
-/// `"slashed": false`, and the registry an exchange can query will agree with
-/// the retraction while disagreeing with the forensics. A figure the reader
-/// cannot verify does not belong in a document they are meant to act on.
-/// Nothing above depends on it. `slashing.rs` is complete; nothing reaches it
-/// below the unarmed flag day.
-///
-/// So Genesis-4 finality today is **economic by intent and cryptographic by
-/// nothing**. Reverting a finalised checkpoint costs an attacker no bonded
-/// stake — only the coordination of the validators who would have to do it.
-///
-/// ## What an integrator can actually rely on
-///
-/// `Finalized` still carries real information: it is this node's own
-/// judgement, computed from a chain it validated itself, and it is strictly
-/// stronger than `Justified` or `Canonical`. It is not a settlement guarantee.
-/// Three limits bound it, and they compound:
-///
-/// - **No slashing cost**, per the retraction above.
-/// - **`finalized` is not a latch.** It has been measured *descending* across
-///   reorgs that break no rule: fork choice walks from the *justified* root
-///   and the state committed there finalises two epochs below the head, so the
-///   deepest cut the algorithm may legitimately propose is itself a finality
-///   rewind (finalized epoch 6 -> 4 -> 2 -> 0 in three in-rules cuts).
-/// - **The quorum denominator has no floor until epoch 2700.** It is
-///   leak-adjusted unconditionally today; the floor and the recovery rule are
-///   written and gated behind `LEAK_RECOVERY_ACTIVATION_EPOCH`, which was
-///   **armed at epoch 2_700 (2026-09-12 21:31 UTC)** — an earlier revision of
-///   this note said `u64::MAX`, which was true when written and is not any
-///   more (`bloch-pos-committee/src/params.rs`, `LEAK_RECOVERY_ACTIVATION_EPOCH`).
-///   Below 2700 a partitioned minority holding 6.25% of stake has been shown
-///   to self-finalise once the absent majority leaked away. The per-node
-///   finality latch (`Engine::ratchet_finalized`, audit round 3 F-03 and
-///   round 4 M-1) now refuses a downward move of this node's own finalized
-///   checkpoint and counts the refusals in `finality_rewinds_refused`; it is
-///   node-local and does not make finality a cross-node guarantee.
-///
-/// **Current honest guidance**, until this note is withdrawn: credit at
-/// **`finalized` plus a margin** — this note's original figure was 3 epochs;
-/// `SECURITY.md` ("Guidance for integrators", 2026-09-06) and
-/// `docs/integration/BLOCH-G4-TECHNICAL-INTEGRATION-REFERENCE-v2.md` §11.3
-/// now recommend ~30 epochs for large or irreversible credits, and are the
-/// documents to hand an integrator — require **two independently
-/// operated nodes to agree on the same finalized root AND epoch** — the epoch
-/// alone is not enough — and **re-verify immediately before releasing funds**.
-/// Two nodes agreeing does not mitigate the rewind, because both rewind
-/// independently; it catches divergence, which is a different failure. The
-/// margin of 3 bounds a single legal cut with one epoch to spare. It does not
-/// bound a repeated ratchet: **no depth is provably safe today**, and saying
-/// so is worth more than quoting a number that sounds like it is. This is the
-/// same rule as `docs/integration/BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` §5,
-/// and that document is the one an integrator should be handed.
-///
-/// There is no machine-readable form of this note on this release: the node
-/// serves no `getcapabilities` method, so a client cannot branch on a
-/// `slashing_enforced` flag and must be told in prose. Do not synthesise one.
-///
-/// This note is withdrawn when evidence has a wire shape that survives the
-/// codec, the slashing path is reachable from the network and armed, the
-/// finality latch ships, and the denominator floor is armed. The promise
-/// returning and enforcement arriving are kept in step by
-/// `tests/slashing_backed_finality_claims.rs`, which fails either way round.
-///
-/// One caveat, stated because it bounds the guarantee: this is **this node's**
-/// view, computed from the chain it has validated itself. That is the property
-/// an integrator wants — it means the answer does not depend on trusting the
-/// producer, and it is why running your own node and reading its RPC is the
-/// correct deployment. It also means a node that is not synced reports its own
-/// staleness, which `getchaininfo`'s `behind_by_slots` is there to expose.
+/// `finalized: true` is this node's classification, not a settlement guarantee.
+/// Compare the release and independent finalized checkpoints, and follow the
+/// controlled withdrawal-and-spend qualification in ADR-041 before broad
+/// external-validator opening. Historical retractions in the integration
+/// documents apply to the earlier unarmed release.
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finality {
     /// At or below the finalised checkpoint. The strongest classification
@@ -1935,8 +2028,8 @@ pub enum Finality {
     /// the answering node: the engine refuses any reorg below its own
     /// highest finalized checkpoint, so a block this node once reported
     /// `finalized` never later leaves ITS canonical chain. It is still
-    /// backed by no slashing cost (none can be applied on this network), so
-    /// it is not an economic guarantee across nodes. Read the retraction on
+    /// not an economic guarantee across nodes. Evidence is refused before
+    /// lifecycle epoch 2884 and protocol-gated afterwards. Read the status on
     /// [`Finality`] before crediting anything on it.
     Finalized,
     /// At or below the justified checkpoint but above the finalised one. One
@@ -2062,60 +2155,83 @@ pub enum Admitted {
 /// to `tx_hash`, and building deposit crediting on it would be building on a
 /// number this node invented. Take the txid from the eUTXO set instead
 /// (`listunspent`, `gettxout`), where it is the consensus one.
+pub(crate) struct PreparedSubmission {
+    kind: &'static str,
+    bytes: u64,
+    hash: [u8; 32],
+}
+
+impl PreparedSubmission {
+    /// Called by the private engine admission seam with the exact canonical
+    /// owner it is about to retain. Fields remain private so the rendered
+    /// receipt cannot later be edited away from that binding.
+    pub(crate) fn new(tx: &PosTransaction, canonical: &[u8]) -> Self {
+        use sha3::{Digest, Sha3_256};
+        let hash: [u8; 32] = Sha3_256::digest(canonical).into();
+        let kind = match tx {
+            PosTransaction::Transfer { .. } => "transfer",
+            PosTransaction::TransferV2 { .. } => "transfer_v2",
+            PosTransaction::Deposit { .. } => "deposit",
+            PosTransaction::FundedDeposit(_) => "funded_deposit",
+            PosTransaction::Exit { .. } => "exit",
+            // Distinct from "exit" on purpose: the two are different messages with
+            // different rules (one authenticated, one not) and an operator reading
+            // this field needs to see which one the chain took.
+            PosTransaction::ExitV2 { .. } => "exit_v2",
+            PosTransaction::Withdraw { .. } => "withdraw",
+            PosTransaction::Delegate { .. } => "delegate",
+            PosTransaction::SlashingEvidence(_) => "slashing_evidence",
+            // Unreachable today twice over — the wire byte (0x0A) is undecodable
+            // and `admissible` refuses the shape below its flag day — but this
+            // match is exhaustive on purpose, and an operator reading the field
+            // post-activation needs the honest name.
+            PosTransaction::RandaoRecommit { .. } => "randao_recommit",
+        };
+        Self {
+            kind,
+            bytes: canonical.len() as u64,
+            hash,
+        }
+    }
+
+    pub(crate) fn into_json(self, outcome: Admitted) -> Json {
+        Json::obj(vec![
+            ("accepted", Json::Bool(true)),
+            (
+                "status",
+                Json::s(match outcome {
+                    Admitted::New => "accepted",
+                    Admitted::Duplicate => "duplicate",
+                }),
+            ),
+            ("kind", Json::s(self.kind)),
+            ("bytes", Json::u(self.bytes)),
+            ("tx_hash", Json::hex(&self.hash)),
+            (
+                "tx_hash_note",
+                Json::s(
+                    "local correlation handle only (SHA3-256 of the canonical bytes); \
+                     not a consensus transaction id — no block commits to it",
+                ),
+            ),
+            (
+                "confirmation",
+                Json::s(
+                    "this transport does not confirm: watch for the transaction in a \
+                     block via `getblockbyslot`. `finalized: true` on that block is \
+                     the strongest signal this chain offers, but it is NOT a \
+                     settlement guarantee across nodes; evidence penalties depend on \
+                     the activated protocol rules. See `docs/integration/\
+                     BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` \u{a7}5",
+                ),
+            ),
+        ])
+    }
+}
+
 pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
-    use sha3::{Digest, Sha3_256};
-    let bytes = tx.canonical_bytes();
-    let hash: [u8; 32] = Sha3_256::digest(&bytes).into();
-    let kind = match tx {
-        PosTransaction::Transfer { .. } => "transfer",
-        PosTransaction::TransferV2 { .. } => "transfer_v2",
-        PosTransaction::Deposit { .. } => "deposit",
-        PosTransaction::FundedDeposit(_) => "funded_deposit",
-        PosTransaction::Exit { .. } => "exit",
-        // Distinct from "exit" on purpose: the two are different messages with
-        // different rules (one authenticated, one not) and an operator reading
-        // this field needs to see which one the chain took.
-        PosTransaction::ExitV2 { .. } => "exit_v2",
-        PosTransaction::Withdraw { .. } => "withdraw",
-        PosTransaction::Delegate { .. } => "delegate",
-        PosTransaction::SlashingEvidence(_) => "slashing_evidence",
-        // Unreachable today twice over — the wire byte (0x0A) is undecodable
-        // and `admissible` refuses the shape below its flag day — but this
-        // match is exhaustive on purpose, and an operator reading the field
-        // post-activation needs the honest name.
-        PosTransaction::RandaoRecommit { .. } => "randao_recommit",
-    };
-    Json::obj(vec![
-        ("accepted", Json::Bool(true)),
-        (
-            "status",
-            Json::s(match outcome {
-                Admitted::New => "accepted",
-                Admitted::Duplicate => "duplicate",
-            }),
-        ),
-        ("kind", Json::s(kind)),
-        ("bytes", Json::u(bytes.len() as u64)),
-        ("tx_hash", Json::hex(&hash)),
-        (
-            "tx_hash_note",
-            Json::s(
-                "local correlation handle only (SHA3-256 of the canonical bytes); \
-                 not a consensus transaction id — no block commits to it",
-            ),
-        ),
-        (
-            "confirmation",
-            Json::s(
-                "this transport does not confirm: watch for the transaction in a \
-                 block via `getblockbyslot`. `finalized: true` on that block is \
-                 the strongest signal this chain offers, but it is NOT a \
-                 settlement guarantee — no slashing penalty backs it and it is \
-                 not a latch; see `docs/integration/\
-                 BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` \u{a7}5",
-            ),
-        ),
-    ])
+    let canonical = tx.canonical_bytes();
+    PreparedSubmission::new(tx, &canonical).into_json(outcome)
 }
 
 /// Lifecycle of one validator as of `current_epoch`.
@@ -2236,6 +2352,68 @@ pub fn validators_json(entries: &[(ValidatorRecord, Option<u64>)], current_epoch
             })
             .collect(),
     )
+}
+
+/// State-only answer for `getvalidator`. Shared by the published-head backend
+/// and the engine fallback so moving the read off the consensus thread cannot
+/// create a second response derivation.
+pub fn validator_record_json(state: &CommittedState, index: u32) -> RpcResult {
+    let rec = state.validator_record(index).ok_or_else(|| {
+        RpcError::new(
+            VALIDATOR_NOT_FOUND,
+            format!(
+                "validator {index} is not in the committed registry ({} registered)",
+                state.validator_count()
+            ),
+        )
+    })?;
+    let effective = state
+        .active_validators()
+        .iter()
+        .find(|v| v.index == index)
+        .map(|v| v.effective_stake);
+    Ok(validator_lifecycle_json(state, &rec, effective))
+}
+
+/// State-only answer for `getvalidatorbykey`.
+pub fn validator_by_key_json(state: &CommittedState, hash: &[u8; 32]) -> RpcResult {
+    let index = state.validator_index_by_hash(hash).ok_or_else(|| {
+        RpcError::new(
+            VALIDATOR_NOT_FOUND,
+            "validator public-key hash is not registered",
+        )
+    })?;
+    validator_record_json(state, index)
+}
+
+/// State-only answer for `getvalidatorcount`.
+pub fn validator_count_json(state: &CommittedState) -> Json {
+    Json::obj(vec![
+        ("total", Json::u(state.validator_count() as u64)),
+        ("active", Json::u(state.active_validators().len() as u64)),
+        (
+            "total_active_stake_sat",
+            Json::sat(state.total_active_stake_sat()),
+        ),
+    ])
+}
+
+/// State-only answer for `getvalidators`.
+pub fn validator_registry_json(state: &CommittedState) -> Json {
+    let active = state.active_validators();
+    let current_epoch = epoch_of(state.slot());
+    let entries: Vec<(ValidatorRecord, Option<u64>)> =
+        (0..state.validator_count() as u32)
+            .filter_map(|index| {
+                let rec = state.validator_record(index)?;
+                let effective = active
+                    .iter()
+                    .find(|v| v.index == index)
+                    .map(|v| v.effective_stake);
+                Some((rec, effective))
+            })
+            .collect();
+    validators_json(&entries, current_epoch)
 }
 
 /// `gettxstatus` (R4 F-11): one of `pending | included | justified |
@@ -2482,16 +2660,66 @@ pub fn build_info_json() -> Json {
         (
             "source_digest_scope",
             Json::s(
-                "workspace crates dir: rs, toml, c, h, S, s; \
-                 plus workspace Cargo.toml and Cargo.lock; \
+                "workspace crates dir: rs, toml, c, h, S, s, macros; \
+                 plus workspace Cargo.toml, Cargo.lock and rust-toolchain.toml; \
                  relative paths, sorted, length-prefixed",
             ),
         ),
         ("source_files", Json::s(env!("BLOCH_SOURCE_FILES"))),
         ("source_bytes", Json::s(env!("BLOCH_SOURCE_BYTES"))),
         ("rustc", Json::s(env!("BLOCH_BUILD_RUSTC"))),
+        ("cargo", Json::s(env!("BLOCH_BUILD_CARGO"))),
         ("profile", Json::s(env!("BLOCH_BUILD_PROFILE"))),
         ("target", Json::s(env!("BLOCH_BUILD_TARGET"))),
+        (
+            "build_environment_digest",
+            Json::s(env!("BLOCH_BUILD_ENV_DIGEST")),
+        ),
+        ("build_environment_digest_alg", Json::s("sha3-256")),
+        (
+            "build_environment_scope",
+            Json::s(
+                "rustc and cargo executable bytes plus version output; \
+                 selected rustc driver and target libstd sysroot components; \
+                 explicitly configured linker/compiler/archive/wrapper bytes, \
+                 including an unambiguous compiler delegated by known wrappers \
+                 plus the C compiler and archiver selected by cc-rs even when \
+                 unconfigured, \
+                 selected freestanding or WASI native input-tree contents, \
+                 and either the explicitly selected linker (including effective \
+                 Rust flags) or the platform default linker observed from a \
+                 target link probe; \
+                 host; target; profile; \
+                 selected Rust/C codegen, implicit native search and dynamic \
+                 loader variables, including absent exact host/target forms; \
+                 sorted, length-prefixed; values hashed, \
+                 not directly disclosed",
+            ),
+        ),
+        (
+            "build_environment_fields",
+            Json::s(env!("BLOCH_BUILD_ENV_FIELDS")),
+        ),
+        (
+            "build_tool_binaries_hashed",
+            Json::s(env!("BLOCH_BUILD_TOOL_BINARIES")),
+        ),
+        (
+            "build_sysroot_components_hashed",
+            Json::s(env!("BLOCH_BUILD_SYSROOT_COMPONENTS")),
+        ),
+        (
+            "build_configured_tool_binaries_hashed",
+            Json::s(env!("BLOCH_BUILD_CONFIGURED_TOOL_BINARIES")),
+        ),
+        (
+            "build_default_linker_binaries_hashed",
+            Json::s(env!("BLOCH_BUILD_DEFAULT_LINKER_BINARIES")),
+        ),
+        (
+            "build_linker_binaries_hashed",
+            Json::s(env!("BLOCH_BUILD_LINKER_BINARIES")),
+        ),
         // The bound rides with the answer. A client that reads `source_digest`
         // and stops reading has been told, in the response itself, what it is
         // allowed to conclude.

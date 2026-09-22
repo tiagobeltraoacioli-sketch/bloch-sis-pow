@@ -1,21 +1,20 @@
 # VENDOR.toml — hash pin for the vendored PQClean C sources (audit finding G3).
 #
-# This crate is a fork of upstream `pqcrypto-internals` 0.2.11 (rustpq/pqcrypto)
-# that changes ONLY `src/lib.rs` (see README.md "What changes"). Everything
-# under `cfiles/` and `include/` is claimed to be byte-for-byte identical to
-# upstream 0.2.11's vendored copy of the PQClean reference/optimized C sources.
+# This fork is based on upstream pqcrypto-internals 0.2.11. Local changes
+# include Rust sources, Cargo metadata, the build script and documentation;
+# see README.md. This manifest pins only this repository's recorded cfiles/
+# and include/ baseline, not an independently verified upstream release.
 #
-# That claim was previously undocumented and unverified in-tree — nothing
+# The recorded baseline provides an integrity tripwire — otherwise nothing
 # would notice if one of these files were edited, replaced, or corrupted by a
 # future change. This file pins a SHA-256 of every file under `cfiles/` and
-# `include/` at the point the fork was taken; `tests/vendor_pin.rs` recomputes
+# `include/` as recorded in this repository; `tests/vendor_pin.rs` recomputes
 # them on every `cargo test` and fails if any file's hash (or the file list
 # itself) has drifted.
 #
 # This is a TRIPWIRE, not a provenance guarantee: it proves "this checkout's
 # vendored C is byte-identical to what this repository recorded", not "these
-# hashes match some external upstream release" (this sandbox has no network
-# access to re-verify against crates.io/GitHub). If a hash legitimately needs
+# hashes match some external upstream release". If a hash legitimately needs
 # to change (a deliberate upstream sync), update BOTH the file and this
 # manifest in the same commit, with the reason in the commit message.
 #

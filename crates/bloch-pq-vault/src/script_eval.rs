@@ -64,16 +64,22 @@ pub fn eval<C: Verification>(
     initial_stack: Vec<Vec<u8>>,
     ctx: &EvalCtx,
 ) -> Result<bool, EvalError> {
+    if witness_script.len() > 10_000 || initial_stack.len() > 1_000
+        || initial_stack.iter().any(|item| item.len() > 520) {
+        return Err(EvalError::ScriptError);
+    }
     let mut stack: Vec<Vec<u8>> = initial_stack;
     // Conditional-execution stack (OP_IF/ELSE/ENDIF). `exec()` is the AND of all frames.
     let mut cond: Vec<bool> = Vec::new();
     let executing = |cond: &[bool]| cond.iter().all(|&b| b);
 
     for ins in witness_script.instructions() {
+        if stack.len() > 1_000 { return Err(EvalError::ScriptError); }
         let ins = ins.map_err(|_| EvalError::ScriptError)?;
         match ins {
             Instruction::PushBytes(pb) => {
                 if executing(&cond) {
+                    if pb.len() > 520 { return Err(EvalError::ScriptError); }
                     stack.push(pb.as_bytes().to_vec());
                 }
             }
@@ -82,7 +88,9 @@ pub fn eval<C: Verification>(
                 // Flow-control opcodes must run even inside a non-executing branch.
                 if o == op::OP_IF {
                     let take = if executing(&cond) {
-                        cast_bool(&stack.pop().ok_or(EvalError::ScriptError)?)
+                        let selector = stack.pop().ok_or(EvalError::ScriptError)?;
+                        if !selector.is_empty() && selector != [1] { return Err(EvalError::ScriptError); }
+                        !selector.is_empty()
                     } else {
                         false
                     };
@@ -129,7 +137,7 @@ pub fn eval<C: Verification>(
                 } else if o == op::OP_CSV {
                     // BIP-112: read (do NOT pop) the required relative locktime, check it
                     // against the input's nSequence, then (BIP-68 maturity) confirmations.
-                    let required = decode_scriptnum(stack.last().ok_or(EvalError::ScriptError)?);
+                    let required = decode_scriptnum(stack.last().ok_or(EvalError::ScriptError)?)?;
                     check_csv(required, ctx)?;
                 } else if (0x51..=0x60).contains(&code) {
                     // OP_PUSHNUM_1 ..= OP_PUSHNUM_16 → push scriptnum N.
@@ -143,7 +151,8 @@ pub fn eval<C: Verification>(
             }
         }
     }
-    Ok(stack.last().map(|v| cast_bool(v)).unwrap_or(false))
+    if !cond.is_empty() || stack.len() != 1 { return Err(EvalError::ScriptError); }
+    Ok(cast_bool(&stack[0]))
 }
 
 /// BIP-112 (in-script) + BIP-68 (maturity) check for a block-based relative timelock.
@@ -170,7 +179,9 @@ fn check_csv(required: i64, ctx: &EvalCtx) -> Result<(), EvalError> {
     }
     // BIP-68 maturity — enforced by the network at tx acceptance, modelled here so a
     // pre-Δ spend is rejected and a post-Δ one accepted.
-    if (ctx.confirmations as i64) < required {
+    // The script operand is only a lower bound. BIP-68 maturity follows
+    // the actual input sequence, which a signer may set higher.
+    if (ctx.confirmations as i64) < seq_blocks {
         return Err(EvalError::Immature);
     }
     Ok(())
@@ -184,7 +195,9 @@ fn check_ecdsa<C: Verification>(
     pk_bytes: &[u8],
     sig_bytes: &[u8],
 ) -> bool {
-    if sig_bytes.is_empty() {
+    // This evaluator receives a precomputed SIGHASH_ALL digest, so accepting
+    // another trailing type would verify the wrong Bitcoin signature message.
+    if sig_bytes.last() != Some(&1) || pk_bytes.len() != 33 {
         return false;
     }
     // strip the trailing sighash-type byte
@@ -203,9 +216,10 @@ fn check_ecdsa<C: Verification>(
 
 /// Minimal Bitcoin `CScriptNum` (little-endian, sign-magnitude) decode — enough for the
 /// small non-negative Δ values the vault uses.
-fn decode_scriptnum(b: &[u8]) -> i64 {
+fn decode_scriptnum(b: &[u8]) -> Result<i64, EvalError> {
+    if b.len() > 5 { return Err(EvalError::ScriptError); }
     if b.is_empty() {
-        return 0;
+        return Ok(0);
     }
     let mut acc: i64 = 0;
     for (i, &byte) in b.iter().enumerate() {
@@ -213,9 +227,9 @@ fn decode_scriptnum(b: &[u8]) -> i64 {
     }
     if b[b.len() - 1] & 0x80 != 0 {
         let neg = acc & !(0x80i64 << (8 * (b.len() - 1)));
-        -neg
+        Ok(-neg)
     } else {
-        acc
+        Ok(acc)
     }
 }
 
@@ -230,4 +244,39 @@ fn cast_bool(b: &[u8]) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+    fn context() -> EvalCtx {
+        EvalCtx { input_sequence: Sequence::from_height(144), confirmations:144,
+            tx_version:2, sighash:[1;32] }
+    }
+    #[test]
+    fn malformed_witnesses_and_scripts_fail_closed_without_panicking() {
+        let secp = Secp256k1::verification_only();
+        // Oversized script numbers previously shifted by >=64 bits and panicked.
+        let csv = ScriptBuf::from_bytes(vec![op::OP_CSV.to_u8()]);
+        assert_eq!(eval(&secp, &csv, vec![vec![1;9]], &context()), Err(EvalError::ScriptError));
+        let unbalanced = ScriptBuf::from_bytes(vec![op::OP_IF.to_u8(), 0x51]);
+        assert_eq!(eval(&secp, &unbalanced, vec![vec![1]], &context()), Err(EvalError::ScriptError));
+        let balanced = ScriptBuf::from_bytes(vec![op::OP_IF.to_u8(), 0x51, op::OP_ENDIF.to_u8()]);
+        assert_eq!(eval(&secp, &balanced, vec![vec![2]], &context()), Err(EvalError::ScriptError));
+        let push_true = ScriptBuf::from_bytes(vec![0x51]);
+        assert_eq!(eval(&secp, &push_true, vec![vec![1]], &context()), Err(EvalError::ScriptError));
+        assert_eq!(eval(&secp, &push_true, vec![vec![1;521]], &context()), Err(EvalError::ScriptError));
+    }
+    #[test]
+    fn signature_type_must_match_the_precomputed_sighash_all_digest() {
+        let secp = Secp256k1::new();
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&[42;32]).unwrap();
+        let pk = sk.public_key(&secp).serialize();
+        let mut signature = crate::ecdsa_witness_sig(&context().sighash, &sk);
+        assert!(check_ecdsa(&secp, &context().sighash, &pk, &signature));
+        for unsupported in [0,2,3,0x81] {
+            *signature.last_mut().unwrap() = unsupported;
+            assert!(!check_ecdsa(&secp, &context().sighash, &pk, &signature));
+        }
+    }
 }

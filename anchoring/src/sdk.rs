@@ -104,8 +104,42 @@ impl<T: RpcTransport, S: TxSigner> AnchorClient<T, S> {
         &self.rpc
     }
 
+    /// Retrieve a reference and check an expected commitment plus explicit
+    /// minimum height and positive confirmation depth. The caller supplies
+    /// the height cutoff from its own policy; no wall-clock freshness is inferred.
+    /// These are checks of RPC assertions, NOT a Merkle proof, signer binding,
+    /// authenticated chain selection, or consensus finality. Re-query before
+    /// relying on a previously cached reference; a later reorg can invalidate it.
+    pub fn reference_matching_policy(
+        &self,
+        txid: &Txid,
+        expected: &Commitment,
+        minimum_height: u64,
+        minimum_confirmations: u32,
+    ) -> Result<InclusionReference> {
+        if minimum_confirmations == 0 {
+            return Err(AnchorError::ReferencePolicy("minimum confirmations must be positive"));
+        }
+        let reference = self.build_reference_with_codec_policy(txid, false)?;
+        if &reference.commitment != expected {
+            return Err(AnchorError::CommitmentMismatch);
+        }
+        if !reference.anchor.height.is_some_and(|height| height >= minimum_height) {
+            return Err(AnchorError::ReferencePolicy("missing or older-than-required block height"));
+        }
+        if reference.anchor.confirmations < u64::from(minimum_confirmations) {
+            return Err(AnchorError::ReferencePolicy("insufficient confirmation depth"));
+        }
+        Ok(reference)
+    }
+
     fn build_reference(&self, txid: &Txid) -> Result<InclusionReference> {
-        let tx = self.rpc.get_transaction(txid)?;
+        self.build_reference_with_codec_policy(txid, true)
+    }
+
+    fn build_reference_with_codec_policy(&self, txid: &Txid, allow_reference_codec: bool) -> Result<InclusionReference> {
+        let tx = if allow_reference_codec { self.rpc.get_transaction(txid)? }
+            else { self.rpc.get_transaction_outputs_only(txid)? };
         let (commitment, carriers) = convention::decode(&tx.output_scripts)?;
         Ok(InclusionReference {
             commitment,
@@ -259,6 +293,24 @@ mod tests {
         let reference = c.prove_by_txid(&anchor.txid).unwrap();
         assert_eq!(reference.commitment, commitment);
         assert_eq!(reference.carrier_scripts.len(), 2);
+    }
+
+    #[test]
+    fn reference_policy_checks_expected_data_height_and_current_depth() {
+        let c = client();
+        let commitment = Commitment::hash_payload(b"caller expected checkpoint");
+        let anchor = c.submit_commitment(&commitment).unwrap();
+        let initial = c.prove_by_txid(&anchor.txid).unwrap();
+        let height = initial.anchor.height.unwrap();
+        assert!(c.reference_matching_policy(&anchor.txid, &commitment, height, 1).is_ok());
+        assert!(matches!(c.reference_matching_policy(&anchor.txid, &Commitment::hash_payload(b"other"), height, 1),
+            Err(AnchorError::CommitmentMismatch)));
+        assert!(matches!(c.reference_matching_policy(&anchor.txid, &commitment, height + 1, 1),
+            Err(AnchorError::ReferencePolicy(_))));
+        assert!(c.reference_matching_policy(&anchor.txid, &commitment, height, 0).is_err());
+        assert!(c.reference_matching_policy(&anchor.txid, &commitment, height, 2).is_err());
+        c.rpc().transport().mine(1);
+        assert!(c.reference_matching_policy(&anchor.txid, &commitment, height, 2).is_ok());
     }
 
     #[test]

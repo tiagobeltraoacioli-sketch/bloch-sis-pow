@@ -1,0 +1,36 @@
+Validation wave 41 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Classification reconciliation only; no consensus gate was armed.
+
+PASS
+
+cargo test --locked --offline -p bloch-pos-committee \
+  observe_alone_misses_a_same_slot_pair_split_by_a_later_vote_in_four_of_six_orders
+  1 passed; 0 failed.
+
+cargo test --locked --offline -p bloch-pos-committee \
+  fc_horizon_post_activation_bars_all_six_orders
+  1 passed; 0 failed.
+
+cargo test --locked --offline -p bloch-pos-node \
+  an_unconnected_block_is_parked_not_stored
+  1 passed; 0 failed. Requires local ephemeral loopback access.
+
+cargo test --locked --offline -p bloch-pos-node \
+  finalized_pruning_removes_high_slot_descendants_without_capping_live_branches
+  1 passed; 0 failed. Requires local ephemeral loopback access.
+
+The two node tests first failed in the restricted sandbox at the fixture's
+ephemeral loopback bind, before the test body. Re-running with loopback access
+passed; this was an environment refusal, not a product assertion failure.
+
+Ledger parser
+  200 rows; 200 unique finding IDs.
+  66 IMPLEMENTED; 89 PARTIAL; 30 OPEN; 7 BASE CHANGED;
+  4 PROTOCOL DECISION; 1 UNARMED CANDIDATE;
+  1 REFUTED IN AUDIT; 2 VERIFIED POSITIVE.
+
+BOUNDARY
+
+The order-independent horizon is an activation rehearsal. Its production
+epoch remains u64::MAX and FC-06 is not closed.

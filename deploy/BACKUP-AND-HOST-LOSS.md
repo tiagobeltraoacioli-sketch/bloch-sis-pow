@@ -89,18 +89,19 @@ down:
    Revoke, don't merely stop advertising — an allowlist entry that is simply
    unused but still present is one misconfiguration away from letting the
    old host back in.
-2. **Confirm no attestations from that validator index for N slots**, where
-   N is chosen so that the confirmation window is longer than any plausible
-   network partition that could make a live host look silent
-   (`deploy/monitoring/rules.yml`'s equivocation and finality-stall windows
-   are the reference points — do not pick N shorter than those). Check via
-   two independently-operated nodes' RPC (never trust the lost host's own
-   report — it is the thing being fenced):
+2. **Observe two independently operated nodes, without treating silence as
+   proof of fencing.** There is no `bloch-pos-cli getvalidatorstatus` command.
+   The supported registry call is JSON-RPC `getvalidator`, for example:
    ```sh
-   bloch-pos-cli getvalidatorstatus --rpc-bind <node-A-rpc> --index <N>
-   bloch-pos-cli getvalidatorstatus --rpc-bind <node-B-rpc> --index <N>
+   curl --fail --silent --show-error -H 'Content-Type: application/json' \
+     --data '{"jsonrpc":"2.0","id":1,"method":"getvalidator","params":[65]}' \
+     http://127.0.0.1:8080/
    ```
-   Confirm both agree the index has produced nothing for the full window.
+   Run against independently operated endpoints through their approved access
+   paths. This returns registry state, **not a last-signed watermark or proof
+   that the old host is dead**. Inspect included attestations/proposals and
+   signing logs as corroboration. An unseen or withheld signature remains
+   possible; actual process/host/key fencing is required.
 3. **If the host is reachable at all**, stop the validator process on it and
    confirm the stop (process exit, not just "the API says it's stopping") —
    do not proceed on the assumption that revoking network access alone
@@ -115,19 +116,41 @@ down:
    its passphrase from separate custody) to the **new** host only. Never to
    the old host, even if it becomes reachable again later — a host that was
    fenced stays retired (see "Exit and replace" below).
-2. Do **not** restore the old host's `slashprot` watermark alongside it if
-   there is any doubt about whether the old host produced a signature after
-   the last watermark checkpoint was taken — the watermark's entire purpose
-   is refusing to re-sign anything already signed, and a watermark older
-   than the actual last signature is worse than none, because it creates
-   false confidence rather than an honest gap. If the old host's true last
-   signed slot cannot be established with certainty, treat the watermark as
-   unknown and initialize a fresh one that refuses to sign anything at or
-   before the highest slot/epoch this validator index is known to have
-   attested or proposed at (queried from peers, per Step 1.2) — conservative
-   in the direction of refusing to sign, never permissive.
-3. Start the validator on the new host and confirm it begins attesting from
-   a slot after the fencing window, never before.
+2. Preserve every available slashing-protection record. Never discard one
+   because it may be old: merge backups monotonically into the replacement
+   host. Stop the replacement node first; the tool acquires its data-dir lock.
+   Use the SHA3-256 of the suite-enveloped validator public key printed by
+   `keys inspect`, and SHA3-256 of the exact genesis manifest bytes (the store
+   binding, **not** the genesis block ID).
+   ```sh
+   bloch-pos slashing-protection export --data-dir /path/to/stopped-node \
+     --validator-pubkey-sha3 PUBLIC_KEY_HASH --genesis-digest MANIFEST_DIGEST \
+     --out /private/backup/signing-watermarks.bin
+   bloch-pos slashing-protection import --data-dir /path/to/replacement \
+     --validator-pubkey-sha3 PUBLIC_KEY_HASH --genesis-digest MANIFEST_DIGEST \
+     --in /private/backup/signing-watermarks.bin
+   ```
+   Export requires a bound record; an old unbound record must be reviewed and
+   bound through the established node migration procedure, not relabeled by
+   editing bytes. Import rejects another key/network, corrupt/trailing data,
+   and cannot lower existing watermarks.
+3. If the complete last-signed history is unavailable, **do not infer a safe
+   signing floor from the highest included on-chain message alone**. Retain
+   the known record and establish an upper bound on every signature the old
+   host could have produced, including unpublished messages. If that bound
+   cannot be established, keep signing disabled and arrange a protocol-level
+   identity replacement. Once independently fenced and the bound is known:
+   ```sh
+   bloch-pos slashing-protection set-floor --data-dir /path/to/replacement \
+     --validator-pubkey-sha3 PUBLIC_KEY_HASH --genesis-digest MANIFEST_DIGEST \
+     --min-slot FIRST_PERMITTED_SLOT
+   ```
+   This only raises local watermarks. It does not fence any other host and
+   cannot prove the chosen floor is sufficient. The conservative source/target
+   epoch floors may postpone attestations until finality catches up; that is
+   a safety refusal, not a reason to delete the record.
+4. Start the replacement only after the preceding conditions hold. Retain
+   doppelganger protection and confirm new duties exceed the merged history.
 
 ### Step 3 — Exit and replace, do not un-fence
 
@@ -153,6 +176,6 @@ claim.
 - [ ] `validator.key` is not in any routine/automated backup path on this host.
 - [ ] Exactly one sealed offline copy exists per key, logged with its SHA-256, date, and source host.
 - [ ] The copy's passphrase is stored separately from the copy itself.
-- [ ] Host-loss response starts with fencing (network revocation + N-slot silence confirmation on two independent nodes), never with restore.
+- [ ] Host-loss response starts with fencing (verified process/host/key fencing + independent chain observations), never with restore.
 - [ ] A fenced host is never re-admitted under its old key.
 - [ ] Any key replacement goes through the ordinary deposit/exit gate, not an out-of-band shortcut.

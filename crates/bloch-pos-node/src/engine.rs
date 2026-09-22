@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+//! Candidate schedule: lifecycle epoch 2884, 2026-09-14 22:35:19 UTC.
+//! Scheduling evidence penalties does not establish deployed readiness or
+//! an economic settlement guarantee across nodes.
+//!
 //! The consensus engine: one thread owning all consensus state, driven by the
 //! slot timer and by network events — nothing else mutates state
 //! (integration plan §1.1). The wall clock enters exactly here, at the timer;
@@ -12,7 +16,7 @@
 //! `ParentState`/`ChainState`, with its own frozen error order and no caller.
 //! It was deleted on 2026-08-12 (the checklist comparison is in `derive.rs`
 //! where it stood); `derive` keeps only the shared derivation functions, which
-//! `produce.rs` stamps with and `transition` checks against.
+//! this engine uses while assembling a header and `transition` checks against.
 //!
 //! This engine binds `Transition`/`CommittedState`: the seam that implements
 //! the frozen `StateTransition`/`StateReader` traits, composes finality, and —
@@ -23,7 +27,7 @@
 //!
 //! ## Producer = validator, structurally
 //!
-//! The producer fills `state_root` by running `Transition::compute_post_state`
+//! The engine's producer fills `state_root` by running `Transition::compute_post_state`
 //! — the *same* function `apply_block` is defined as — on the same parent
 //! state, then every block (own or peer) passes `apply_block` under the real
 //! hybrid verifier before it is stored or broadcast. A node that rejects its
@@ -78,22 +82,27 @@
 //! and, on a devnet, free; when it stops being free the fix is an incremental
 //! store with a test proving it equals the rebuild, not a cache with a comment.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bloch_pos_committee::attestation::{Attestation, AttestationData, KeyLookup, SignatureVerifier};
 use bloch_pos_committee::beacon::{mix_in, RandaoChain};
 use bloch_pos_committee::fee_market;
 use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
-use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
+use bloch_pos_committee::gossip::{
+    AttestationPool, AuthenticatedPendingAttestation, GossipDecision,
+};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
-use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition, ValidatorRecord};
-use bloch_pos_committee::params::{MAX_ATTESTATIONS_PER_BLOCK, SLOTS_PER_EPOCH};
+use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
+use bloch_pos_committee::params::{
+    MAX_ATTESTATIONS_PER_BLOCK, MAX_EPOCH_ADVANCE, SLOTS_PER_EPOCH,
+};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
 use bloch_pos_committee::interfaces::TransitionError;
@@ -101,6 +110,8 @@ use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 use sha3::{Digest, Sha3_256};
 
 mod validator_lifecycle;
+mod admission;
+mod proposal_wire;
 #[cfg(test)]
 mod devnet_tools_tests;
 
@@ -122,6 +133,270 @@ use crate::store::Store;
 pub enum EngineEvent {
     Net(NetEvent),
     Rpc(RpcCall),
+}
+
+/// Maximum work admitted by the network queue plus the RPC listener's 64
+/// concurrent workers. Draining this much into the local scheduler makes a
+/// high-priority class visible even when it arrived behind the largest legal
+/// lower-priority backlog, while the per-turn processing limit below still
+/// returns to slot duties after bounded work.
+const ENGINE_SCHEDULER_CAP: usize = net::ENGINE_QUEUE_CAP + 64;
+const ENGINE_EVENTS_PER_TURN: usize = 32;
+/// Maximum events from each class between two slot/duty checks. Blocks have
+/// the smallest slice because one admitted block can execute a transition,
+/// rebuild fork choice, and release parked descendants. The other classes
+/// retain the eight-event share they received under a fully mixed round.
+const ENGINE_EVENTS_PER_CLASS_PER_TURN: [usize; 4] = [1, 8, 8, 8];
+/// Authenticated attestations re-judged for one newly available block root
+/// between slot-loop control points. One is the smallest useful unit: each
+/// entry must complete its hybrid verification before its verdict is known.
+const HELD_ATTESTATIONS_PER_TURN: usize = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredBlockClass {
+    Future,
+    Orphan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredWorkClass {
+    Block,
+    HeldAttestation,
+}
+
+/// Round-robin cursor shared by the two kinds of deferred consensus work.
+/// A block transition and a held-attestation verification slice must not run
+/// additively before the slot loop regains its duty/control point.
+#[derive(Default)]
+struct DeferredWorkScheduler {
+    cursor: usize,
+}
+
+impl DeferredWorkScheduler {
+    fn next(&mut self, block_ready: bool, held_ready: bool) -> Option<DeferredWorkClass> {
+        let ready = [block_ready, held_ready];
+        for offset in 0..ready.len() {
+            let class = self.cursor.saturating_add(offset) % ready.len();
+            if ready[class] {
+                self.cursor = class.saturating_add(1) % ready.len();
+                return Some(if class == 0 {
+                    DeferredWorkClass::Block
+                } else {
+                    DeferredWorkClass::HeldAttestation
+                });
+            }
+        }
+        None
+    }
+}
+
+/// Round-robin cursor shared by the two local queues whose release can run a
+/// full block transition. It turns their two independent one-block slices into
+/// one aggregate one-block slice without changing either queue's FIFO order.
+#[derive(Default)]
+struct DeferredBlockScheduler {
+    cursor: usize,
+}
+
+impl DeferredBlockScheduler {
+    fn next(&mut self, future_ready: bool, orphan_ready: bool) -> Option<DeferredBlockClass> {
+        let ready = [future_ready, orphan_ready];
+        for offset in 0..ready.len() {
+            let class = self.cursor.saturating_add(offset) % ready.len();
+            if ready[class] {
+                self.cursor = class.saturating_add(1) % ready.len();
+                return Some(if class == 0 {
+                    DeferredBlockClass::Future
+                } else {
+                    DeferredBlockClass::Orphan
+                });
+            }
+        }
+        None
+    }
+}
+
+/// Node-local fair scheduler for already-admitted work. FIFO is preserved
+/// inside each class; strict round-robin between non-empty classes prevents a
+/// transaction, attestation, block, or RPC flood from starving the others.
+struct FairQueue<T> {
+    classes: [VecDeque<T>; 4],
+    cursor: usize,
+}
+
+impl<T> Default for FairQueue<T> {
+    fn default() -> Self {
+        Self {
+            classes: std::array::from_fn(|_| VecDeque::new()),
+            cursor: 0,
+        }
+    }
+}
+
+impl<T> FairQueue<T> {
+    fn len(&self) -> usize {
+        self.classes.iter().fold(0usize, |total, queue| {
+            total.saturating_add(queue.len())
+        })
+    }
+
+    fn is_empty(&self) -> bool { self.len() == 0 }
+
+    fn push(&mut self, class: usize, event: T) {
+        self.classes[class % self.classes.len()].push_back(event);
+    }
+
+    fn pop_batch(&mut self, limit: usize, class_limits: [usize; 4]) -> Vec<T> {
+        let mut batch = Vec::with_capacity(limit.min(self.len()));
+        let mut used = [0usize; 4];
+        while batch.len() < limit && !self.is_empty() {
+            let mut found = false;
+            for offset in 0..4 {
+                let class = self.cursor.saturating_add(offset) % 4;
+                if used[class] >= class_limits[class] {
+                    continue;
+                }
+                let next = self.classes[class].pop_front();
+                if let Some(event) = next {
+                    batch.push(event);
+                    used[class] = used[class].saturating_add(1);
+                    self.cursor = class.saturating_add(1) % 4;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                break;
+            }
+        }
+        batch
+    }
+}
+
+fn engine_event_class(event: &EngineEvent) -> usize {
+    match event {
+        EngineEvent::Net(NetEvent::Block(..)) => 0,
+        EngineEvent::Net(NetEvent::Attestation(..)) => 1,
+        EngineEvent::Net(NetEvent::Transaction(..)) => 2,
+        EngineEvent::Rpc(_) => 3,
+    }
+}
+
+#[cfg(test)]
+mod fair_engine_queue_tests {
+    use super::{
+        DeferredBlockClass, DeferredBlockScheduler, DeferredWorkClass,
+        DeferredWorkScheduler, FairQueue,
+        ENGINE_EVENTS_PER_CLASS_PER_TURN,
+    };
+
+    #[test]
+    fn lower_priority_backlog_cannot_hide_other_admitted_classes() {
+        let mut queue = FairQueue::default();
+        for sequence in 0..4096 {
+            queue.push(2, (2usize, sequence));
+        }
+        queue.push(3, (3, 0));
+        queue.push(1, (1, 0));
+        queue.push(0, (0, 0));
+
+        assert_eq!(
+            queue.pop_batch(4, ENGINE_EVENTS_PER_CLASS_PER_TURN),
+            vec![(0, 0), (1, 0), (2, 0), (3, 0)],
+            "every admitted class must receive headroom in the first turn",
+        );
+        assert_eq!(
+            queue.pop_batch(2, ENGINE_EVENTS_PER_CLASS_PER_TURN),
+            vec![(2, 1), (2, 2)],
+        );
+    }
+
+    #[test]
+    fn sustained_mixed_backlog_is_cost_sliced_and_fifo_per_class() {
+        let mut queue = FairQueue::default();
+        for class in 0..4 {
+            for sequence in 0..64 {
+                queue.push(class, (class, sequence));
+            }
+        }
+
+        for turn in 0..8 {
+            let batch = queue.pop_batch(32, ENGINE_EVENTS_PER_CLASS_PER_TURN);
+            let mut counts = [0usize; 4];
+            for (class, sequence) in batch {
+                let expected_start = if class == 0 { turn } else { turn * 8 };
+                assert_eq!(sequence, expected_start + counts[class]);
+                counts[class] = counts[class].saturating_add(1);
+            }
+            assert_eq!(counts, ENGINE_EVENTS_PER_CLASS_PER_TURN);
+        }
+        assert_eq!(queue.len(), 56, "only the expensive block tail remains");
+    }
+
+    #[test]
+    fn block_flood_yields_to_the_slot_loop_after_one_event() {
+        let mut queue = FairQueue::default();
+        for sequence in 0..4096 {
+            queue.push(0, (0usize, sequence));
+        }
+        queue.push(1, (1, 0));
+        queue.push(2, (2, 0));
+        queue.push(3, (3, 0));
+
+        assert_eq!(
+            queue.pop_batch(32, ENGINE_EVENTS_PER_CLASS_PER_TURN),
+            vec![(0, 0), (1, 0), (2, 0), (3, 0)],
+            "one expensive block and every other present class make progress",
+        );
+        assert_eq!(
+            queue.pop_batch(32, ENGINE_EVENTS_PER_CLASS_PER_TURN),
+            vec![(0, 1)],
+            "a block-only tail must return to duty checks after every block",
+        );
+    }
+
+    #[test]
+    fn deferred_block_classes_share_one_fair_slice() {
+        let mut scheduler = DeferredBlockScheduler::default();
+        for turn in 0..128 {
+            let expected = if turn % 2 == 0 {
+                DeferredBlockClass::Future
+            } else {
+                DeferredBlockClass::Orphan
+            };
+            assert_eq!(scheduler.next(true, true), Some(expected));
+        }
+        assert_eq!(scheduler.next(true, false), Some(DeferredBlockClass::Future));
+        assert_eq!(
+            scheduler.next(true, true),
+            Some(DeferredBlockClass::Orphan),
+            "a class that becomes ready gets the next shared turn",
+        );
+        assert_eq!(scheduler.next(false, false), None);
+    }
+
+    #[test]
+    fn deferred_blocks_and_held_attestations_share_one_fair_slice() {
+        let mut scheduler = DeferredWorkScheduler::default();
+        for turn in 0..256 {
+            let expected = if turn % 2 == 0 {
+                DeferredWorkClass::Block
+            } else {
+                DeferredWorkClass::HeldAttestation
+            };
+            assert_eq!(scheduler.next(true, true), Some(expected));
+        }
+        assert_eq!(
+            scheduler.next(false, true),
+            Some(DeferredWorkClass::HeldAttestation),
+        );
+        assert_eq!(
+            scheduler.next(true, true),
+            Some(DeferredWorkClass::Block),
+            "a block tail cannot be starved by sustained replay pressure",
+        );
+        assert_eq!(scheduler.next(false, false), None);
+    }
 }
 
 /// Which transport the node runs.
@@ -196,6 +471,125 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Whether the local committed head is stale enough that validator duties
+/// must stop and the sync path must run first.
+///
+/// A one-slot gap is normal: at the start of wall slot `s`, the newest block
+/// can only be from `s - 1`. A larger gap alone is not enough either — an
+/// honest chain can have empty slots. Requiring two slots without canonical
+/// progress preserves that recovery path while refusing to manufacture a
+/// duty view by rolling an actually stale head across epochs.
+fn node_is_behind(
+    head_slot: u64,
+    wall_slot: u64,
+    now_ms: u64,
+    last_applied_ms: u64,
+    stale_after_ms: u64,
+) -> bool {
+    head_slot.saturating_add(1) < wall_slot
+        && now_ms.saturating_sub(last_applied_ms) > stale_after_ms
+}
+
+/// Remaining wall-clock epochs before a single block extending `head_slot`
+/// would exceed the consensus epoch-walk ceiling.
+///
+/// This is deliberately a pure observation. Feeding it back into block
+/// validity, fork choice or duties would turn a local clock into consensus.
+/// At zero, the current wall epoch is the last one inside the ceiling when
+/// the gap is exactly `MAX_EPOCH_ADVANCE`; a larger gap is already outside.
+fn epoch_advance_headroom_epochs(head_slot: u64, wall_slot: u64) -> u64 {
+    let gap = epoch_of(wall_slot).saturating_sub(epoch_of(head_slot));
+    MAX_EPOCH_ADVANCE.saturating_sub(gap)
+}
+
+const EPOCH_ADVANCE_EARLY_WARNING_EPOCHS: u64 = 512;
+const EPOCH_ADVANCE_CRITICAL_WARNING_EPOCHS: u64 = 128;
+
+/// Monotone severity for rate-limiting the operator warning while a head is
+/// stalled. A catching-up head lowers the level, allowing a later independent
+/// outage to warn again.
+fn epoch_advance_risk_level(headroom: u64) -> u8 {
+    if headroom == 0 {
+        3
+    } else if headroom <= EPOCH_ADVANCE_CRITICAL_WARNING_EPOCHS {
+        2
+    } else if headroom <= EPOCH_ADVANCE_EARLY_WARNING_EPOCHS {
+        1
+    } else {
+        0
+    }
+}
+
+/// A bounded stale-head quarantine for the slot loop.
+///
+/// Once the ordinary lag heuristic fires, a fresh block must not immediately
+/// make duties eligible while a multi-page catch-up is still in progress:
+/// `last_applied_ms` becomes fresh after the *first* page, not after the node
+/// reaches the tip. This guard remembers the wall tip we were trying to reach
+/// and extends its quarantine whenever canonical progress arrives.
+///
+/// The timeout is equally important. Slot numbers may be skipped legitimately;
+/// without an end-of-sync marker from both transports, requiring the head to
+/// reach `wall - 1` forever would make two empty slots halt every validator.
+/// After one quiet window the guard permits recovery duties and waits one more
+/// window before another stale-head probe can quarantine them again.
+#[derive(Default)]
+struct DutySyncGate {
+    target_slot: Option<u64>,
+    observed_head: u64,
+    last_progress_ms: u64,
+    retry_after_ms: u64,
+}
+
+impl DutySyncGate {
+    fn update(
+        &mut self,
+        behind: bool,
+        head_slot: u64,
+        wall_slot: u64,
+        now_ms: u64,
+        quiet_window_ms: u64,
+    ) -> bool {
+        if let Some(target) = self.target_slot {
+            if head_slot >= target {
+                self.target_slot = None;
+            } else if head_slot > self.observed_head {
+                self.observed_head = head_slot;
+                self.last_progress_ms = now_ms;
+            } else if now_ms.saturating_sub(self.last_progress_ms) > quiet_window_ms {
+                self.target_slot = None;
+                self.retry_after_ms = now_ms.saturating_add(quiet_window_ms);
+            }
+        }
+
+        if self.target_slot.is_none() && behind && now_ms >= self.retry_after_ms {
+            self.target_slot = Some(wall_slot.saturating_sub(1));
+            self.observed_head = head_slot;
+            self.last_progress_ms = now_ms;
+        }
+        self.target_slot.is_some()
+    }
+}
+
+/// One gate for every local signing path driven by the slot loop.
+///
+/// Keeping the decision outside `attest`/`propose` is intentional: neither
+/// method may call `rolled_to` (or consume a
+/// slashing-protection watermark) until this predicate has passed.
+fn validator_duties_blocked(
+    in_boot_grace: bool,
+    stale_head_quarantined: bool,
+    ready_future_blocks_pending: bool,
+    held_attestations_pending: bool,
+    deferred_orphans_pending: bool,
+) -> bool {
+    in_boot_grace
+        || stale_head_quarantined
+        || ready_future_blocks_pending
+        || held_attestations_pending
+        || deferred_orphans_pending
+}
+
 const NO_TXS: [PosTransaction; 0] = [];
 
 /// Ceiling on mempool entries. Past this, [`Engine::on_transaction`] evicts
@@ -222,6 +616,32 @@ const MEMPOOL_MAX: usize = 4_096;
 /// time as parents confirm, not all at once) while still bounding one
 /// source's worst case to 64 / 4,096 ≈ 1.6% of total mempool capacity.
 const MEMPOOL_MAX_PER_SOURCE: usize = 64;
+
+/// Expensive lifecycle authorization calls allowed for one identity in one
+/// wall slot. The consensus validator performs cheap state/shape checks before
+/// invoking the budgeted verifier. Two calls cover the largest transaction
+/// (four algorithm checks because every authorization is hybrid); a fresh
+/// allowance arrives after 30 seconds.
+const LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = 2;
+
+/// Expensive lifecycle authorization calls allowed across all identities in
+/// one wall slot. This is deliberately a node-local relay ceiling: it bounds
+/// identity cycling on the unauthenticated transport without changing block
+/// validity. 256 calls retain two attempts for 128 independent identities in
+/// 30 seconds; overload is retryable in the next slot.
+const LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT: usize = 256;
+
+/// New hybrid verifications allowed across block, attestation and transaction
+/// network admission in one wall slot. Consensus execution and this node's own
+/// proposal are deliberately outside this node-local relay budget. At the
+/// 30-second cadence, 1,024 leaves large honest burst headroom while making
+/// unique-signature CPU finite even as the bounded transport queue drains.
+const GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT: usize = 1_024;
+
+/// Share one normalized transport source may spend from the aggregate relay
+/// verification allowance in one wall slot. Eight independent sources can
+/// fill the aggregate ceiling; one alone cannot starve all remaining peers.
+const GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = 128;
 
 /// Doppelgänger protection window (R6 HIGH-8, node half): slots this node
 /// observes the network for its OWN validator index attesting or proposing
@@ -300,6 +720,17 @@ const REJECTION_TTL_SLOTS: u64 = 128;
 /// At the cap the entry expiring SOONEST is evicted first: it is the one whose
 /// door was about to reopen anyway, so the eviction costs the least protection.
 const REJECTION_MAX: usize = 4_096;
+/// Canonical-key bytes retained by the rejection cache. Match the aggregate
+/// mempool payload budget: a sequence of rejected transactions must not turn
+/// the count-bounded retry barrier into a larger payload store than the pool
+/// it protects. This bounds encoded bytes, not map/allocator overhead.
+const REJECTION_BYTES_MAX: usize = admission::MAX_MEMPOOL_BYTES;
+
+#[cfg(test)]
+std::thread_local! {
+    /// Test-only proof that the expiry hint actually skips full-map scans.
+    static REJECTION_EXPIRY_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Transactions a proposal will carry at most, independent of the consensus
 /// byte cap it is also checked against.
@@ -335,6 +766,25 @@ const MAX_TXS_PER_BLOCK: usize = 256;
 /// up to 64 ahead of wall clock, so the walk is at most two `close_epoch`
 /// turns. That is the point — bounded, not zero.
 const MAX_FUTURE_SLOTS: u64 = 2 * bloch_pos_committee::params::SLOTS_PER_EPOCH;
+
+/// Authenticated future blocks reprocessed between two slot-loop turns.
+/// One block can execute a transition and rebuild fork choice, so releasing
+/// the whole 32-entry pool at a slot boundary would bypass the scheduler's
+/// one-block slice. Duties remain gated until every now-eligible block has
+/// crossed this one-at-a-time path.
+const FUTURE_BLOCKS_PER_TURN: usize = 1;
+
+/// Retention ceilings for authenticated near-future gossip. The global count
+/// and byte bounds cap the pool; the source share prevents one normalized
+/// transport identity (including the unattributed `None` bucket) from owning
+/// every slot until the clock catches up.
+const FUTURE_BLOCKS_MAX: usize = 32;
+const FUTURE_BLOCK_BYTES_MAX: usize = 16 * 1024 * 1024;
+const FUTURE_BLOCKS_PER_SOURCE: usize = 8;
+const FUTURE_BLOCK_BYTES_PER_SOURCE: usize = FUTURE_BLOCK_BYTES_MAX / 4;
+const _: () = assert!(
+    FUTURE_BLOCK_BYTES_PER_SOURCE >= crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES
+);
 
 /// How many recently-applied canonical post-states are retained so a reorg
 /// can start from the fork point instead of from genesis.
@@ -375,13 +825,39 @@ const REORG_STATE_WINDOW: usize = 2;
 /// recovered by the `get_blocks` request the parking sets `needs_sync` for —
 /// which is why evicting here costs a round trip and never a fork.
 const ORPHAN_MAX: usize = 256;
+/// Combined retained wire bytes across blocked and ready orphan queues. Two
+/// maximum sync responses leave room for a legitimate recovery page while
+/// bounding retained serialized payload independently of entry count (the
+/// decoded objects still have allocator/capacity overhead).
+const ORPHAN_BYTES_MAX: usize = 2 * crate::p2p::MAX_SYNC_FRAME as usize;
+/// Combined waiting + ready-to-promote share for one normalized gossip
+/// source. `Gossip(None)` is one collective unattributed bucket; no identity
+/// is fabricated. Local production is exempt from a transport-fairness rule.
+const ORPHANS_PER_SOURCE: usize = 32;
+/// A gossip source may retain one complete maximum gossip frame. This is at
+/// least one producer-sized proposal, so the share cannot reject every legal
+/// envelope merely because it is large. Local production remains exempt.
+const ORPHAN_BYTES_PER_SOURCE: usize = crate::p2p::MAX_GOSSIP_BYTES;
+const _: () = assert!(ORPHAN_BYTES_PER_SOURCE >= crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES);
+const _: () = assert!(ORPHAN_BYTES_PER_SOURCE <= ORPHAN_BYTES_MAX);
+const _: () = assert!(ORPHAN_BYTES_MAX >= crate::p2p::MAX_SYNC_FRAME as usize);
+/// Parked blocks re-tried between two slot-loop control points. One promotion
+/// can execute a transition, rebuild fork choice, and unlock more work, so it
+/// receives the same one-block slice as ordinary admitted blocks.
+const ORPHAN_PROMOTIONS_PER_TURN: usize = 1;
+
+/// Distinct authenticated proposals retained per genesis validator duty.
+/// One is the protocol intent; two preserve the complete equivocation pair.
+/// A third proposal signed by the same key for the same slot proves nothing
+/// new and is ignored as node-local retention pressure, never peer fault.
+const MAX_PROPOSALS_PER_GENESIS_DUTY: usize = 2;
 
 /// Cap on [`Engine::parked_refused_finality`] (R3 M-1). Same order as
 /// [`ORPHAN_MAX`] and the same FIFO-eviction shape, for the same reason:
-/// remembering a refusal must cost this node a bounded amount of memory, not
-/// one entry per byte a peer chooses to keep re-sending. 512 rather than 256
-/// because a refused BRANCH can be several blocks deep, where an orphan is
-/// always exactly one.
+/// remembering refusals must cost this node a bounded number of fixed-size
+/// identities, independent of the bodies a peer chose to send. 512 rather
+/// than 256 because a refused BRANCH can be several blocks deep, where an
+/// orphan is always exactly one.
 const MAX_PARKED_REFUSED_FINALITY: usize = 512;
 
 /// Cap on [`Engine::tx_slot_index`] (R4 F-11, `gettxstatus`). A public chain
@@ -406,9 +882,9 @@ const MAX_TX_SLOT_INDEX: usize = 65_536;
 /// It is NOT a consensus rule and is deliberately not applied to boot replay:
 /// the log is this node's own history, its slots are by construction in the
 /// past, and making replay depend on the wall clock is how a node with a
-/// skewed clock refuses to restart. That exemption is carried by
-/// [`Source::Replay`] — NOT by `live == false`, which is a separate rule
-/// about gossip arriving while this node is still catching up. Tolerance is generous
+/// skewed clock refuses to restart. That exemption is carried by the
+/// dedicated boot-replay path — NOT by `live == false`, which is a separate
+/// rule about gossip arriving while this node is still catching up. Tolerance is generous
 /// because the cost of being wrong is asymmetric — a dropped block is
 /// re-requested by the sync path, and 8 slots is four minutes at the fleet's
 /// 30 s cadence, far more skew than NTP ever leaves.
@@ -421,26 +897,16 @@ const FUTURE_SLOT_TOLERANCE: u64 = 8;
 ///
 /// A producer chose the slot it is proposing for; re-judging its own block
 /// against the clock is how a node refuses to produce when the box is loaded
-/// enough that the two disagree by a few slots. A block coming off this
-/// node's own log was already judged when it first arrived, and the log is
-/// the record of what this node COMMITTED to — re-judging it against a clock
-/// the log knows nothing about is how a node refuses to restart. Every other
-/// gate applies identically to all three: a locally built or replayed block
-/// still has to authenticate and still has to connect.
+/// enough that the two disagree by a few slots. Boot replay has a dedicated
+/// linear path because the log is already the selected canonical chain; that
+/// path still requires exact parent continuity and runs the full transition.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Source {
     /// Arrived over the network, or was promoted out of the orphan pool
     /// after arriving over the network.
-    Gossip,
+    Gossip(Option<[u8; 32]>),
     /// Built by this node's own `propose`.
     Local,
-    /// Read back out of this node's own block log by the boot replay loop.
-    ///
-    /// Replay is not a second opinion about whether these blocks are
-    /// admissible — they were judged when they first arrived, and the log is
-    /// what this node already committed to. It is the same transition run
-    /// over the same inputs to get back to the same state.
-    Replay,
 }
 
 impl Source {
@@ -457,10 +923,70 @@ impl Source {
     /// clock rule it was never meant to answer to.
     fn bounded_by_wall_clock(self) -> bool {
         match self {
-            Source::Gossip => true,
-            Source::Local | Source::Replay => false,
+            Source::Gossip(_) => true,
+            Source::Local => false,
         }
     }
+
+    /// Stable, node-local transport identity used only for admission
+    /// fairness. Missing attribution still receives the aggregate cap.
+    fn verification_source(self) -> Option<[u8; 32]> {
+        match self {
+            Source::Gossip(source) => source,
+            Source::Local => None,
+        }
+    }
+}
+
+fn retention_bytes_fit(held: usize, incoming: usize, cap: usize) -> bool {
+    held.checked_add(incoming).is_some_and(|total| total <= cap)
+}
+
+fn future_retention_totals<'a>(
+    retained: impl Iterator<Item = (&'a Source, &'a usize)>,
+    incoming_source: Source,
+) -> (usize, usize, usize) {
+    retained.fold((0usize, 0usize, 0usize), |acc, (held_source, block_bytes)| {
+        let same_source = usize::from(*held_source == incoming_source);
+        (
+            acc.0.saturating_add(*block_bytes),
+            acc.1.saturating_add(same_source),
+            acc.2.saturating_add(block_bytes.saturating_mul(same_source)),
+        )
+    })
+}
+
+/// A budget refusal is this node's load state, never evidence that the bytes
+/// or their forwarding peer are bad. The pure gossip policy sees the budgeted
+/// verifier's `false`; translate only when that verifier records exhaustion.
+fn locally_limited_gossip_decision(
+    decision: GossipDecision,
+    limited: bool,
+) -> GossipDecision {
+    if limited {
+        GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Unjudgeable)
+    } else {
+        decision
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn local_verification_exhaustion_never_becomes_a_peer_reject() {
+    let rejected = GossipDecision::Reject(
+        bloch_pos_committee::attestation::RejectReason::BadSignature,
+    );
+    assert!(matches!(
+        locally_limited_gossip_decision(rejected, true),
+        GossipDecision::Ignore(_)
+    ));
+    let rejected = GossipDecision::Reject(
+        bloch_pos_committee::attestation::RejectReason::BadSignature,
+    );
+    assert!(matches!(
+        locally_limited_gossip_decision(rejected, false),
+        GossipDecision::Reject(_)
+    ));
 }
 
 /// Decode a block body's transactions.
@@ -501,12 +1027,10 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
 }
 
 /// The spend-authority hash of this transaction's FIRST input — its "source"
-/// for [`MEMPOOL_MAX_PER_SOURCE`] (R7 M6). `None` for a transaction with no
-/// eUTXO inputs (every non-transfer message, and a structurally-empty
-/// transfer `admissible` would refuse anyway), which exempts it from the
-/// per-source cap entirely rather than grouping every such message under one
-/// shared bucket — a bucket that shape would make USELESS as a spam bound
-/// the moment two unrelated staking messages arrived close together.
+/// for [`MEMPOOL_MAX_PER_SOURCE`] (R7 M6). Lifecycle messages use their
+/// validator identity, domain-separated from spend keys. `None` remains only
+/// for legacy staking shapes that admission refuses and structurally-empty
+/// transfers.
 ///
 /// Hashed exactly like every other script-hash site in this codebase
 /// (`Sha3_256::digest(pubkey)`) — see `rpc.rs`'s `validator_json` and this
@@ -523,8 +1047,33 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
             Some(Sha3_256::digest(pk).into())
         }
         PosTransaction::FundedDeposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::ExitV2 { pubkey_hash, .. } =>
+            Some(lifecycle_source_hash(b"exit", pubkey_hash)),
+        PosTransaction::Withdraw { validator }
+        | PosTransaction::RandaoRecommit { validator, .. } =>
+            Some(validator_lifecycle_source(*validator)),
+        PosTransaction::SlashingEvidence(evidence) => {
+            let validator = match evidence {
+                bloch_pos_committee::interfaces::SlashingEvidence::AttestationOffence { first, .. } => first.validator,
+                bloch_pos_committee::interfaces::SlashingEvidence::ProposerEquivocation { first, .. } => first.header.proposer_index,
+            };
+            Some(validator_lifecycle_source(validator))
+        }
         _ => None,
     }
+}
+
+fn lifecycle_source_hash(domain: &[u8], identity: &[u8]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(b"bloch/mempool/lifecycle-source/v1");
+    h.update((domain.len() as u64).to_le_bytes());
+    h.update(domain);
+    h.update(identity);
+    h.finalize().into()
+}
+
+fn validator_lifecycle_source(validator: u32) -> [u8; 32] {
+    lifecycle_source_hash(b"validator-index", &validator.to_le_bytes())
 }
 
 /// The canonical committed state, plus the memo of epoch-rolled copies of it.
@@ -860,20 +1409,26 @@ pub use state_cell::SharedHead;
 #[cfg(test)]
 mod replay_bench;
 
+#[cfg(test)]
+mod proposal_revalidation_tests;
+
+#[cfg(test)]
+mod ws_lifecycle_tests;
+
+mod local_cache;
+mod verification;
+
 struct Engine {
     manifest: Manifest,
-    /// Validator indices below this were registered AT GENESIS and are
-    /// therefore identical on every branch of every fork; indices at or above
-    /// it were (or would be) added by an on-chain `Deposit`, whose
-    /// index-to-key mapping is a property of ONE branch. `ingest_judged` uses
-    /// the line to decide whether a signature failure against this node's
-    /// head registry is a provable forgery (`Reject`) or merely a key this
-    /// node may not hold (`Ignore`, parked) — external audit 2026-09-07, O04.
-    genesis_validator_count: u32,
+    /// Explicit genesis membership is branch-independent even for sparse manifests.
+    /// A failed signature at any other index may belong to a different branch's
+    /// deposited key and must remain retryable (external audit O04 / EN-21).
+    genesis_validator_indices: BTreeSet<u32>,
     state: StateCell,
     tr: Transition<HybridVerifier>,
     tr_probe: Transition<ProbeVerifier>,
     verifier: HybridVerifier,
+    gossip_verifier: verification::GossipVerifier<HybridVerifier>,
     /// The validator this node signs as, or `None` in observer mode.
     ///
     /// An observer follows the chain, applies every block and serves the RPC,
@@ -944,6 +1499,10 @@ struct Engine {
     /// Hold verb — the one that keeps an attestation racing ahead of its block
     /// from being scored as an offence — did not exist here at all.
     att_pool: AttestationPool,
+    /// Block roots whose authenticated held attestations became judgeable.
+    /// FIFO by block landing; the front root stays in place until its own
+    /// attestation FIFO is drained in bounded slices.
+    held_release_roots: VecDeque<[u8; 32]>,
     /// Wall-clock slot, refreshed by the slot loop. `att_pool` never reads a
     /// clock (that is its determinism rule), so the node supplies one.
     wall_slot: u64,
@@ -974,7 +1533,21 @@ struct Engine {
     /// `admissible`, which refuses deposits, delegations and exits, refuses a
     /// transfer with no inputs or no outputs, and verifies every spend
     /// signature.
-    mempool: BTreeMap<Vec<u8>, PosTransaction>,
+    mempool: admission::Mempool,
+    /// Authenticated near-future envelopes, their source/proof, and the exact
+    /// canonical encoded length computed once at admission. Entries are owned
+    /// and immutable until removal, so the cached length cannot drift; byte
+    /// preflight can sum fixed-size metadata instead of serializing every
+    /// retained body for every new arrival.
+    future_blocks: BTreeMap<
+        [u8; 32],
+        (
+            BlockEnvelope,
+            Source,
+            Option<AuthenticatedBlockAdmission>,
+            usize,
+        ),
+    >,
     /// Head slot at which each live mempool key was admitted, for
     /// [`MEMPOOL_TTL_SLOTS`].
     ///
@@ -1028,6 +1601,12 @@ struct Engine {
     /// does not have. Each node learns from its own proposals, and convergence
     /// is the fleet arriving at the same answer separately.
     rejected: BTreeMap<Vec<u8>, (u64, u64)>,
+    /// Exact sum of canonical key lengths in `rejected`.
+    rejected_bytes: usize,
+    /// Conservative lower bound on the earliest retained expiry. Point
+    /// removals may leave it stale and too early, causing one harmless extra
+    /// scan; insertion and a completed scan ensure it is never too late.
+    rejected_expiry_hint: Option<u64>,
     /// Total re-offers this node has barred since boot, across all keys.
     rejected_hits: u64,
     /// Transactions the epoch sweep found spending inputs this chain does not
@@ -1057,6 +1636,9 @@ struct Engine {
     slashprot: SlashingProtection,
     net: net::Net,
     head_slot: Arc<AtomicU64>,
+    /// Complete `getblockcount` response published after each canonical
+    /// change. This is a response snapshot, not mutable consensus state.
+    block_count: rpc::SharedBlockCount,
     /// False during boot replay: no log appends, no broadcasts, no logs.
     live: bool,
     needs_sync: bool,
@@ -1065,7 +1647,7 @@ struct Engine {
     /// The weak-subjectivity anchor this node booted under (epoch, root), and
     /// whether it is the node's ONLY defense (it had no finality of its own).
     /// `None` until `ws_boot::boot` has run.
-    ws_anchor: Option<(u64, [u8; 32])>,
+    ws_anchor: Option<bloch_pos_committee::ws::WeakSubjectivityCheckpoint>,
     ws_anchor_hard: bool,
     /// A forward WS_CONFLICT is announced once, not every block.
     ws_conflict_reported: bool,
@@ -1095,8 +1677,8 @@ struct Engine {
     /// `/metrics` as `bloch_pos_finality_rewinds_refused_total` and in
     /// `getchaininfo` (finding R3 M-1 — previously neither).
     finality_rewinds_refused: u64,
-    /// Blocks refused by the finality latch, PARKED rather than deleted (R3
-    /// M-1).
+    /// Block identities refused by the finality latch, PARKED rather than
+    /// forgotten (R3 M-1).
     ///
     /// The pre-fix behaviour deleted a refused branch's blocks from
     /// `self.blocks` outright. If the block(s) ever arrived again — and
@@ -1105,7 +1687,8 @@ struct Engine {
     /// refused — deletion meant re-authenticating them from scratch and
     /// running the whole `advance` cycle again, only to refuse and delete
     /// them again: a silent, unbounded-in-time loop with no trace beyond the
-    /// refusal counter. Parking them here means [`Engine::ingest_one`] can
+    /// refusal counter. Parking their identities here means
+    /// [`Engine::ingest_one`] can
     /// recognise a re-offer BEFORE any signature work and drop it at the
     /// door — the refusal becomes a fact this node remembers cheaply,
     /// instead of a verdict it re-derives expensively, forever.
@@ -1121,7 +1704,10 @@ struct Engine {
     /// bytes arriving, which is exactly the busy-loop deletion was trying to
     /// avoid — parking fixes the re-authentication cost without
     /// reintroducing that one.
-    parked_refused_finality: VecDeque<([u8; 32], BlockEnvelope)>,
+    /// Full envelopes are deliberately not retained: no later path reads
+    /// their header, signature or body, and a branch below this process's
+    /// finality latch can never become adoptable without a restart/override.
+    parked_refused_finality: VecDeque<[u8; 32]>,
     /// Set once at boot from `BLOCH_ALLOW_FINALITY_REWIND=1` /
     /// `--allow-finality-rewind` (R3 M-1): an operator's explicit,
     /// deliberate acknowledgement that a rewind below this node's own
@@ -1164,15 +1750,32 @@ struct Engine {
     /// Blocks whose parent this node has never seen, oldest first, with their
     /// ids so a repeat gossip is recognised without re-hashing.
     ///
-    /// Bounded by [`ORPHAN_MAX`] with FIFO eviction. FIFO and not
-    /// lowest-slot-first on purpose: the oldest entry is the one whose parent
-    /// has had the longest to arrive and has not, so it is the one least
-    /// likely to ever connect.
+    /// Bounded by [`ORPHAN_MAX`] with FIFO eviction and by
+    /// [`ORPHANS_PER_SOURCE`] across this queue plus `deferred_orphans`. FIFO
+    /// and not lowest-slot-first on purpose: the oldest entry is the one whose
+    /// parent has had the longest to arrive and has not, so it is the one
+    /// least likely to ever connect.
     ///
     /// Parking sets `needs_sync`, so the gap the orphan is evidence of is
     /// asked for over the wire. That is what makes eviction cheap: the worst
     /// case is a round trip, never a missed branch.
-    orphans: VecDeque<([u8; 32], BlockEnvelope)>,
+    orphans: VecDeque<(
+        [u8; 32],
+        BlockEnvelope,
+        Source,
+        Option<AuthenticatedBlockAdmission>,
+        usize,
+    )>,
+    /// Previously parked blocks made judgeable by a landed parent or registry
+    /// growth. FIFO preserves the old worklist's breadth-first ordering while
+    /// promotion is cooperatively sliced by the slot loop.
+    deferred_orphans: VecDeque<(
+        [u8; 32],
+        BlockEnvelope,
+        Source,
+        Option<AuthenticatedBlockAdmission>,
+        usize,
+    )>,
     /// Orphans dropped at the cap, and orphans later connected. Counted so
     /// "the bound is holding" is a measurement rather than an inference — a
     /// pool with evictions and zero admissions is a node that is not syncing.
@@ -1182,6 +1785,12 @@ struct Engine {
     /// checkpoint. Same reason: pruning that never fires is pruning that is
     /// not wired.
     blocks_pruned: u64,
+    /// Authenticated genesis-key proposal ids observed above the finalized
+    /// floor, and their per-duty counts. This prevents deferred promotion
+    /// from charging the same proposal twice while bounding equivocation
+    /// variants before they enter fork-choice retention.
+    proposal_admission_seen: BTreeMap<[u8; 32], (u32, u64)>,
+    proposal_admission_counts: BTreeMap<(u32, u64), usize>,
     /// Envelopes turned away at the door, by reason.
     rejected_unsigned: u64,
     rejected_future: u64,
@@ -1203,9 +1812,9 @@ struct ForkChoiceInputs {
 
 /// Why a transaction was turned away at the door.
 ///
-/// The distinction is load-bearing, not cosmetic: three of these mean "ask me
-/// again in a moment" and one means "these bytes will never be admitted,
-/// stop sending them". Collapsing them into one RPC code is how an operator
+/// The distinction is load-bearing, not cosmetic: some mean "ask me again in
+/// a moment" and `Invalid` means "these bytes will never be admitted, stop
+/// sending them". Collapsing them into one RPC code is how an operator
 /// ends up growing the mempool to fix a bad signature — or, the way it
 /// actually happened, how an exchange told "never resubmit after -32008"
 /// writes off transactions that a self-lifting bar would have admitted an
@@ -1225,6 +1834,8 @@ enum Refusal {
     AtCapacity,
     /// `admissible` refused it on its merits. Retrying is pointless.
     Invalid(&'static str),
+    /// Validity may change after synchronization, inclusion, or fee movement.
+    StateDependent(&'static str),
     /// This node's own proposer already tried to build a block with it and the
     /// transition refused. Distinct from `Invalid`, and the difference is not
     /// cosmetic: `Invalid` is a verdict on the bytes, which no passage of time
@@ -1240,6 +1851,13 @@ enum Refusal {
     /// transactions to clear", not "retry later" (which reads as "the whole
     /// network is busy") and not "these bytes are invalid" (they are not).
     TooManyFromSource,
+    /// The per-identity or aggregate lifecycle hybrid-verification allowance
+    /// is exhausted for the wall slot. The caller may retry next slot.
+    LifecycleVerificationLimited { until_slot: u64 },
+    /// Per-source or aggregate block/attestation/transaction admission
+    /// verification is exhausted for this wall slot. This is local load,
+    /// never invalid bytes.
+    GossipVerificationLimited { until_slot: u64 },
 }
 
 impl Refusal {
@@ -1248,12 +1866,18 @@ impl Refusal {
     fn reason(&self) -> &'static str {
         match self {
             Refusal::AtCapacity => "mempool is at capacity",
-            Refusal::Invalid(why) => why,
+            Refusal::Invalid(why) | Refusal::StateDependent(why) => why,
             Refusal::PreviouslyRefused { .. } => {
                 "this node's proposer already had the transition refuse this transaction"
             }
             Refusal::TooManyFromSource => {
                 "this source already has MEMPOOL_MAX_PER_SOURCE transactions pending"
+            }
+            Refusal::LifecycleVerificationLimited { .. } => {
+                "lifecycle authorization verification allowance is exhausted for this slot"
+            }
+            Refusal::GossipVerificationLimited { .. } => {
+                "network admission verification allowance is exhausted for this slot"
             }
         }
     }
@@ -1285,6 +1909,64 @@ fn culprit_index(err: &TransitionError, len: usize) -> Option<usize> {
     }
 }
 
+/// Separates fresh wire input from a pool-issued, opaque authentication proof.
+/// Only the latter may use the held-replay fast path.
+enum AttestationAdmission {
+    Fresh {
+        att: Attestation,
+        verification_source: Option<[u8; 32]>,
+    },
+    Pending(AuthenticatedPendingAttestation),
+}
+
+/// Local, non-forgeable evidence that this exact signed header already passed
+/// gossip authentication under one registry key. Construction is private and
+/// the type is move-only. Promotion consumes it; a block that is parked again
+/// receives a fresh binding only after this proof matches the current key or
+/// a fresh verification succeeds.
+struct AuthenticatedBlockAdmission {
+    block_id: [u8; 32],
+    signing_root: [u8; 32],
+    signature_sha3: [u8; 32],
+    pubkey_sha3: [u8; 32],
+}
+
+impl AuthenticatedBlockAdmission {
+    fn new(env: &BlockEnvelope, pubkey: &[u8]) -> Self {
+        Self {
+            block_id: *env.block_id().as_bytes(),
+            signing_root: env.header.proposal_signing_root(),
+            signature_sha3: Sha3_256::digest(&env.proposer_sig).into(),
+            pubkey_sha3: Sha3_256::digest(pubkey).into(),
+        }
+    }
+
+    fn matches(&self, env: &BlockEnvelope, pubkey: &[u8]) -> bool {
+        let signature_sha3: [u8; 32] = Sha3_256::digest(&env.proposer_sig).into();
+        let pubkey_sha3: [u8; 32] = Sha3_256::digest(pubkey).into();
+        self.block_id == *env.block_id().as_bytes()
+            && self.signing_root == env.header.proposal_signing_root()
+            && self.signature_sha3 == signature_sha3
+            && self.pubkey_sha3 == pubkey_sha3
+    }
+}
+
+impl AttestationAdmission {
+    fn attestation(&self) -> &Attestation {
+        match self {
+            Self::Fresh { att, .. } => att,
+            Self::Pending(pending) => pending.attestation(),
+        }
+    }
+
+    fn verification_source(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Fresh { verification_source, .. } => *verification_source,
+            Self::Pending(pending) => pending.verification_source(),
+        }
+    }
+}
+
 impl Engine {
     // ── Derivations over the canonical chain ────────────────────────────────
 
@@ -1306,6 +1988,30 @@ impl Engine {
     /// Canonical height of the head: `chain.len() - 1`, genesis being height 0.
     fn head_height(&self) -> u64 {
         (self.chain.len() as u64).saturating_sub(1)
+    }
+
+    /// One derivation shared by the engine fallback and published RPC path.
+    fn block_count_reply(&self) -> Json {
+        let fin = self.state.finality();
+        rpc::block_count_json(
+            self.head_height(),
+            self.head_slot_now(),
+            self.finalized_height(),
+            fin.justified.epoch,
+            fin.finalized.epoch,
+        )
+    }
+
+    /// Publish only after state and canonical chain have both moved. Readers
+    /// clone one complete response under the short lock, so they cannot mix a
+    /// new height with old finality (or vice versa).
+    fn publish_block_count(&self) {
+        let next = self.block_count_reply();
+        let mut published = match self.block_count.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *published = next;
     }
 
     /// The committed state root at the head, READ rather than recomputed.
@@ -1523,7 +2229,10 @@ impl Engine {
         // history lives in `ParentState::chain.randao_mixes`, whose retention
         // is a separate question from `boundary_mixes`'. Arming this flag day
         // is not safe until that is closed.
-        let lookahead = if epoch < bloch_pos_committee::params::ANCESTRY_SEED_ACTIVATION_EPOCH {
+        let lookahead = if !bloch_pos_committee::params::epoch_gate_active(
+            epoch,
+            bloch_pos_committee::params::ANCESTRY_SEED_ACTIVATION_EPOCH,
+        ) {
             0
         } else {
             committees::MIN_SEED_LOOKAHEAD_EPOCHS
@@ -1578,58 +2287,52 @@ impl Engine {
     /// (`anchor_is_hard`) has only the anchor between it and a forged
     /// history, so a contradiction is fatal: it is following a chain that
     /// disagrees with the one thing it trusted.
-    fn enforce_ws_anchor(&mut self) {
-        let Some((epoch, root)) = self.ws_anchor else {
-            return;
-        };
-        if self.ws_conflict_reported {
-            return;
-        }
-        let Some(local) = self.own_finalized_root_at(epoch) else {
-            return;
-        };
-        use bloch_pos_committee::ws::{cross_check, WeakSubjectivityCheckpoint, WS_FORMAT_VERSION};
-        // Only `epoch`/`block_root` are read by cross_check; the rest of the
-        // artifact is not re-litigated here (it was verified at boot).
-        let probe = WeakSubjectivityCheckpoint {
-            version: WS_FORMAT_VERSION,
-            network_id: 0,
-            genesis_root: [0u8; 32],
-            epoch,
-            block_root: root,
-            state_root: [0u8; 32],
-            validator_set_root: [0u8; 32],
-            issued_at: 0,
-            signer_set_id: 0,
-        };
-        if let bloch_pos_committee::ws::CrossCheck::Conflict {
-            local_root,
-            published_root,
-        } = cross_check(Some(local), &probe)
-        {
-            self.ws_conflict_reported = true;
-            eprintln!(
-                "WS_CONFLICT at epoch {epoch}: this node finalized {} where its \
-                 weak-subjectivity anchor says {}.",
-                crate::codec::hex32(&local_root),
-                crate::codec::hex32(&published_root),
-            );
-            if self.ws_anchor_hard {
-                eprintln!(
-                    "FATAL: this node synced with no finality of its own — the anchor \
-                     was its only defense against a forged history, and the chain it \
-                     followed contradicts it. Stopping rather than serving a history \
-                     nothing vouches for. Re-check the checkpoint digest across \
-                     independent publication channels before restarting."
-                );
-                std::process::exit(1);
+    /// A missing canonical block is pending evidence, not agreement. The state
+    /// check runs before finality reaches the publication epoch: once this exact
+    /// block is validated, its immutable header root cannot later change.
+    fn ws_anchor_conflict(&self) -> Option<String> {
+        let checkpoint = self.ws_anchor?;
+        let root = checkpoint.block_root;
+        let epoch = checkpoint.epoch;
+        let reserved_genesis = checkpoint.signer_set_id == bloch_pos_committee::ws::WS_GENESIS_SIGNER_SET_ID
+            && epoch == 0 && root == *self.manifest.genesis_id().as_bytes();
+        // The release anchor's manifest-derived state was checked at boot.
+        // Recomputing its whole state after every block would defeat replay
+        // performance. Published genesis-boundary artifacts use the historical
+        // header convention, not the release anchor's different state root.
+        if !reserved_genesis && self.canonical.contains(&root) {
+            let local_state = if root == *self.manifest.genesis_id().as_bytes() {
+                Some(self.manifest.genesis_header().state_root)
+            } else {
+                self.blocks.get(&root).map(|block| block.header.state_root)
+            };
+            if let Some(local_state) = local_state {
+                if checkpoint.state_root != local_state {
+                    return Some(format!("WS_STATE_CONFLICT at epoch {epoch}: published state {} differs from locally validated block {} state {}",
+                        crate::codec::hex32(&checkpoint.state_root), crate::codec::hex32(&root), crate::codec::hex32(&local_state)));
+                }
             }
-            eprintln!(
-                "Own finality stands: NOT reorganizing (a checkpoint can never override \
-                 a running node's finality). Alert the operator and compare the \
-                 published digest across independent channels."
-            );
         }
+        let local = self.own_finalized_root_at(epoch)?;
+        if local != root {
+            return Some(format!("WS_CONFLICT at epoch {epoch}: this node finalized {} where its weak-subjectivity anchor says {}",
+                crate::codec::hex32(&local), crate::codec::hex32(&root)));
+        }
+        None
+    }
+
+    fn enforce_ws_anchor(&mut self) {
+        if self.ws_conflict_reported { return; }
+        let Some(conflict) = self.ws_anchor_conflict() else { return; };
+        self.ws_conflict_reported = true;
+        eprintln!("{conflict}");
+        if self.ws_anchor_hard {
+            eprintln!("FATAL: this node booted without own finality and its checkpoint contradicts validated local evidence. Verify the original artifact and publication channels before restarting.");
+            // A checkpoint contradiction needs operator action, not an
+            // unattended restart loop (same service policy as boot refusal).
+            std::process::exit(78);
+        }
+        eprintln!("Own finality stands: NOT reorganizing or exiting. Alert the operator and compare the published digest across independent channels.");
     }
 
     /// This validator's RANDAO chain, positioned at its committed reveal
@@ -1684,6 +2387,24 @@ impl Engine {
         }
         let rec = rolled.validator_record(keys.index)?;
         (rec.pubkey == keys.pubkey).then_some(keys.index)
+    }
+
+    /// Publish participation eligibility, not a scheduled or completed duty.
+    /// Read the current registry on every turn so activation, exit and reorg
+    /// key mappings cannot leave a boot-time value behind. These are the same
+    /// activation/exit bounds used by duty_roster_at; no state is advanced.
+    fn refresh_validator_activity(
+        &self,
+        metrics: &crate::metrics::NodeMetrics,
+        slot: u64,
+        duties_blocked: bool,
+    ) {
+        let epoch = epoch_of(slot);
+        let eligible = !duties_blocked && !self.doppelganger_blocks_duties(slot)
+            && self.duty_index(&self.state)
+                .and_then(|index| self.state.validator_record(index))
+                .is_some_and(|record| record.activation_epoch <= epoch && epoch < record.exit_epoch);
+        crate::metrics::NodeMetrics::set(&metrics.validator_active, u64::from(eligible));
     }
 
     /// Doppelgänger protection (R6 HIGH-8): true if `attest`/`propose` must
@@ -1805,9 +2526,14 @@ impl Engine {
             validator: index,
             signature,
         };
+        // Encode while the locally signed value is still borrowed, then move
+        // its sole owned signature allocation into the pool. The frame is the
+        // independent wire owner and is broadcast only after pool insertion,
+        // preserving the former publish order without cloning `att`.
+        let frame = net::att_frame(&att);
         self.pool
-            .insert((att.validator, att.data.signing_root()), att.clone());
-        self.net.broadcast(net::att_frame(&att));
+            .insert((att.validator, att.data.signing_root()), att);
+        self.net.broadcast(frame);
         println!(
             "[slot {slot}] attested (epoch {e}, head {}, target {})",
             crate::codec::hex8(&data.head),
@@ -1935,9 +2661,17 @@ impl Engine {
         // a block with fewer transactions is always better than no block.
         //
         // Each refusal drops exactly one transaction and retries, so the loop
-        // is bounded by the selection size and terminates: the empty selection
-        // always computes.
+        // is bounded by the selection size and terminates. If the empty
+        // selection also fails, the fault is not attributable to a transaction.
         let mut txs = self.select_transactions(bloch_pos_committee::epoch_of(slot));
+        // Local production policy: never sign a block our smallest supported
+        // gossip transport cannot carry. Incoming consensus acceptance stays
+        // unchanged, and the pool keeps omitted votes for a later proposal.
+        if !proposal_wire::fit(&header, &mut atts, &txs) {
+            eprintln!("[slot {slot}] proposal transaction body exceeds local gossip budget");
+            return;
+        }
+        header.attestation_root = derive::attestation_root(&atts);
         let (post, tx_bytes) = loop {
             let tx_bytes: Vec<Vec<u8>> = txs.iter().map(PosTransaction::canonical_bytes).collect();
             header.body_root = derive::body_root(&tx_bytes);
@@ -1951,58 +2685,10 @@ impl Engine {
             {
                 Ok(p) => break (p, tx_bytes),
                 Err(err) => {
-                    // WHICH transaction, when the transition says which.
-                    //
-                    // `TransitionError::Transfer(u32, _)` and `Transaction(u32)`
-                    // both carry "the index into the body list" — the doc on the
-                    // variant says so in those words. Popping the TAIL instead
-                    // was a defect with a cost that compounds: if the offender
-                    // sits early in the selection, the loop discards every good
-                    // transaction behind it one at a time, re-running the whole
-                    // transition each round (O(k^2) for k = MAX_TXS_PER_BLOCK),
-                    // and — since the rejection cache landed on 2026-08-30 —
-                    // BARS each of those innocent transactions for
-                    // REJECTION_TTL_SLOTS. One bad transaction could bar up to
-                    // 255 legitimate ones for ~64 minutes. The cache did not
-                    // create the defect; it turned a wasted slot into an hour
-                    // of censorship, which is why the two are fixed together.
-                    //
-                    // The tail is still the fallback for the errors that name
-                    // no index (`Shielded`, root mismatches): dropping SOMEthing
-                    // and retrying is what keeps the node producing, and that is
-                    // the whole point of this loop.
-                    let bad = match culprit_index(&err, txs.len()) {
-                        Some(i) => txs.remove(i),
-                        None => match txs.pop() {
-                            Some(t) => t,
-                            None => {
-                                // Empty and still refused: the fault is not in
-                                // any transaction, so proposing is genuinely
-                                // impossible.
-                                eprintln!(
-                                    "[slot {slot}] produce refused with no transactions: {err:?}"
-                                );
-                                return;
-                            }
-                        },
-                    };
-                    eprintln!(
-                        "[slot {slot}] dropping a transaction the transition refuses ({err:?}); \
-                         proposing without it"
-                    );
-                    // Out of the mempool too, or the next proposer inherits the
-                    // same halt this loop just avoided.
-                    //
-                    // And barred from returning: removal alone is not enough,
-                    // because the peers that still hold it re-offer it and the
-                    // structural admission check has no way to see what the
-                    // transition just saw. Without the bar the node cleans
-                    // itself and refills — observed on the live chain, mempool
-                    // 0 at slot 47,878 and 21 of the same transactions back
-                    // 383 slots later.
-                    let bad_key = bad.canonical_bytes();
-                    self.mempool.remove(&bad_key);
-                    self.reject_transaction(bad_key, slot);
+                    if !self.drop_failed_proposal_transaction(&mut txs, &err, slot) {
+                        eprintln!("[slot {slot}] produce refused with no transactions: {err:?}");
+                        return;
+                    }
                 }
             }
         };
@@ -2044,10 +2730,11 @@ impl Engine {
             env.body.transactions.len(),
             self.mempool.len()
         );
-        // Captured before `env` moves into ingest: if the transition refuses
-        // this block, these are the bytes to drop from the mempool.
-        let produced_txs: Vec<Vec<u8>> = env.body.transactions.clone();
-        let env_tx_count = produced_txs.len();
+        // Keep only the count on the successful path. `txs` is the exact
+        // decoded selection from which `env.body.transactions` was encoded;
+        // if the real transition refuses our probe-approved block, re-encode
+        // that selection only in the exceptional cleanup below.
+        let env_tx_count = txs.len();
         self.ingest_from(env, Source::Local);
         // h28080: a producer whose own node did not adopt its block is a
         // producer/validator split inside one process. It must be LOUD — but it
@@ -2071,8 +2758,8 @@ impl Engine {
                 crate::codec::hex8(id.as_bytes()),
                 env_tx_count,
             );
-            for encoded in &produced_txs {
-                self.mempool.remove(encoded);
+            for tx in &txs {
+                self.mempool.remove(&tx.canonical_bytes());
             }
             return;
         }
@@ -2080,14 +2767,14 @@ impl Engine {
         // `blocks` (`prune` never removes a canonical id), so this is `Some`.
         // If it were not, the slot is lost the same way as the case above —
         // loudly, and without killing the node.
-        let Some(env) = self.blocks.get(id.as_bytes()).cloned() else {
+        let Some(env) = self.blocks.get(id.as_bytes()) else {
             eprintln!(
                 "[slot {slot}] own block {} adopted as head but not stored — not broadcast",
                 crate::codec::hex8(id.as_bytes()),
             );
             return;
         };
-        self.net.broadcast(net::block_frame(&env));
+        self.net.broadcast_block(env);
     }
 
     // ── Block ingestion: store, then advance canonical as far as possible ──
@@ -2136,7 +2823,17 @@ impl Engine {
     /// score, not a ban. The much tighter [`FUTURE_SLOT_TOLERANCE`] is NOT
     /// charged to anyone, which is why it maps to `Ignore`.
     fn ingest_judged(&mut self, env: BlockEnvelope) -> Verdict {
-        self.ingest_from_judged(env, Source::Gossip)
+        self.ingest_judged_from_source(env, None)
+    }
+
+    /// Judge one transported block while retaining the transport attribution
+    /// through any deferred admission path.
+    fn ingest_judged_from_source(
+        &mut self,
+        env: BlockEnvelope,
+        verification_source: Option<[u8; 32]>,
+    ) -> Verdict {
+        self.ingest_from_judged(env, Source::Gossip(verification_source))
     }
 
     /// Repair a missing branch ancestor, not just a missing newer block.
@@ -2146,7 +2843,8 @@ impl Engine {
     /// backwards until they connect, without rewinding consensus state.
     fn sync_after_slot(&self) -> u64 {
         if !self.needs_sync && self.orphans.is_empty() { return self.state.slot(); }
-        let missing_before = self.orphans.iter().map(|(_, env)| env.header.slot.saturating_sub(1))
+        let missing_before = self.orphans.iter()
+            .map(|(_, env, _, _, _)| env.header.slot.saturating_sub(1))
             .min().unwrap_or(self.state.slot()).min(self.state.slot());
         let finalized = self.state.finality().finalized.root;
         let floor = self.chain.iter().rev().find(|(_, id)| *id.as_bytes() == finalized)
@@ -2175,71 +2873,145 @@ impl Engine {
     /// logic — or a log whose head slot simply sits ahead of a fresh box's
     /// clock — and a node would refuse to replay its own FINALIZED log.
     ///
-    /// There is no peer to report to and nothing to relay, so no verdict:
-    /// these blocks are this node's committed history, being re-run through
-    /// the same transition to arrive back at the same state.
-    fn ingest_replay(&mut self, env: BlockEnvelope) {
-        self.ingest_from(env, Source::Replay);
+    /// There is no peer to report to, nothing to relay and no branch to
+    /// choose: `blocks.log` is the already-selected canonical chain. Running
+    /// every prefix through `advance` used to recompute LMD-GHOST over every
+    /// previously decoded block, making cold replay quadratic before useful
+    /// transition work was even counted. Replay now requires the next frame
+    /// to extend the current head and applies it directly through the same
+    /// full consensus transition as live canonical adoption.
+    ///
+    /// `false` is a fail-closed replay refusal. The caller must stop boot; it
+    /// must never continue from a partial durable history.
+    fn ingest_replay(&mut self, env: BlockEnvelope) -> bool {
+        let id = *env.block_id().as_bytes();
+        if env.header.parent != *self.head_id().as_bytes()
+            || self.blocks.contains_key(&id)
+            || self.canonical.contains(&id)
+        {
+            return false;
+        }
+        if !self.apply_canonical(&env) {
+            return false;
+        }
+        // Rebuild the bounded recent proposal window used by live
+        // equivocation detection, but only after the transition authenticated
+        // the proposer. Orphan release and branch pruning are intentionally
+        // absent: a canonical log contains neither collection, and scanning
+        // the growing canonical map to prove that after every frame was the
+        // other quadratic replay cost this path removes.
+        self.observe_proposer_equivocation(&env);
+        let _ = self.admit_proposal_variant(
+            id,
+            env.header.proposer_index,
+            env.header.slot,
+            Source::Local,
+        );
+        self.blocks.insert(id, env);
+        true
     }
 
-    /// Ingest `env` and then everything it unblocks.
+    /// Ingest the caller's envelope and queue anything it unblocks.
     ///
-    /// The orphan pool means one arrival can connect a chain of parked
-    /// blocks, and that promotion is a WORKLIST rather than recursion on
-    /// purpose: `ingest_one` calls `advance`, which calls `apply_block`, and
-    /// [`ORPHAN_MAX`] nested copies of that stack is a crash a peer chooses
-    /// the depth of. Here the depth is one frame no matter how long the
-    /// parked chain is.
+    /// The verdict belongs only to the caller's envelope. Previously this
+    /// method synchronously drained a bounded orphan worklist; the same FIFO
+    /// now lives on `Engine` so the slot loop can give each promotion a fresh
+    /// control turn without losing breadth-first ordering.
     fn ingest_from_judged(&mut self, env: BlockEnvelope, src: Source) -> Verdict {
-        let mut queue: VecDeque<BlockEnvelope> = VecDeque::new();
-        queue.push_back(env);
-        // The verdict belongs to the envelope the CALLER handed in — the
-        // first one out of the queue — and to no other. Blocks promoted out
-        // of the orphan pool below arrived on their own gossip message and
-        // were judged then; charging their outcome to the peer that relayed
-        // the block which merely unblocked them would punish it for the one
-        // thing it did right.
-        let mut verdict: Option<Verdict> = None;
-        // Bounded: every iteration either drops the envelope or takes one
-        // entry out of `orphans`, and `orphans` is capped.
-        while let Some(next) = queue.pop_front() {
-            let (v, landing) = self.ingest_one(next, src);
-            verdict.get_or_insert(v);
-            let Some((landed, grew_registry)) = landing else {
-                continue;
-            };
-            // Whatever was waiting on the block that just landed can be
-            // tried now, in arrival order.
-            //
-            // `grew_registry` widens that to the WHOLE pool for one reason:
-            // a block carrying a `Deposit` registers a validator index, and
-            // blocks parked for an unregistered proposer are exactly the ones
-            // that identity was missing for. Without this they would sit
-            // until eviction even though the node can now check them.
-            // Deposits are rare (and gated off entirely today), so the sweep
-            // is not on any hot path.
-            let mut i = 0;
-            while i < self.orphans.len() {
-                if grew_registry || self.orphans[i].1.header.parent == landed {
-                    // `i < len` (loop guard), so `remove` is `Some`; the
-                    // `else` is unreachable and ends the sweep.
-                    let Some((_, env)) = self.orphans.remove(i) else {
-                        break;
-                    };
-                    self.orphans_admitted = self.orphans_admitted.saturating_add(1);
-                    queue.push_back(env);
-                } else {
-                    // cannot overflow: i < self.orphans.len().
-                    #[allow(clippy::arithmetic_side_effects)]
-                    {
-                        i += 1;
-                    }
+        let (verdict, landing) = self.ingest_one(env, src);
+        if let Some((landed, grew_registry)) = landing {
+            self.schedule_unblocked_orphans(landed, grew_registry);
+        }
+        verdict
+    }
+
+    fn schedule_unblocked_orphans(&mut self, landed: [u8; 32], grew_registry: bool) {
+        let mut i = 0;
+        while i < self.orphans.len() {
+            if grew_registry || self.orphans[i].1.header.parent == landed {
+                let Some((_, env, orphan_source, authentication, retained_bytes)) = self.orphans.remove(i) else {
+                    break;
+                };
+                self.orphans_admitted = self.orphans_admitted.saturating_add(1);
+                let id = *env.block_id().as_bytes();
+                self.deferred_orphans
+                    .push_back((id, env, orphan_source, authentication, retained_bytes));
+            } else {
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    i += 1;
                 }
             }
         }
-        // An empty queue cannot happen — one envelope always goes in — but
-        // `Ignore` is the answer that charges nobody if it ever did.
-        verdict.unwrap_or(Verdict::Ignore)
+    }
+
+    /// Promote at most one previously parked block. Its prior gossip verdict
+    /// was already `Ignore`; no result here is attributed to the parent relay.
+    fn release_orphan_turn(&mut self) -> bool {
+        for _ in 0..ORPHAN_PROMOTIONS_PER_TURN {
+            let Some((_, env, source, authentication, _)) = self.deferred_orphans.pop_front() else {
+                break;
+            };
+            let (_, landing) = self.ingest_one_deferred(env, source, authentication);
+            if let Some((landed, grew_registry)) = landing {
+                self.schedule_unblocked_orphans(landed, grew_registry);
+            }
+        }
+        !self.deferred_orphans.is_empty()
+    }
+
+    /// Release at most one block across both locally deferred block classes.
+    /// Recompute the tails after release because a future block can become an
+    /// orphan, and a promoted orphan can make more descendants ready.
+    fn release_deferred_block_turn(
+        &mut self,
+        slot: u64,
+        scheduler: &mut DeferredBlockScheduler,
+    ) -> (bool, bool) {
+        let future_ready = self.ready_future_block_pending(slot);
+        let orphan_ready = !self.deferred_orphans.is_empty();
+        match scheduler.next(future_ready, orphan_ready) {
+            Some(DeferredBlockClass::Future) => {
+                self.release_future_blocks(slot, FUTURE_BLOCKS_PER_TURN);
+            }
+            Some(DeferredBlockClass::Orphan) => {
+                self.release_orphan_turn();
+            }
+            None => {}
+        }
+        (
+            self.ready_future_block_pending(slot),
+            !self.deferred_orphans.is_empty(),
+        )
+    }
+
+    /// Release one bounded class of deferred consensus work. Block work keeps
+    /// its inner future/orphan round robin; held attestations keep their
+    /// per-root FIFO and one-verification slice. The outer cursor ensures those
+    /// two budgets cannot compose in one control turn.
+    fn release_deferred_work_turn(
+        &mut self,
+        slot: u64,
+        scheduler: &mut DeferredWorkScheduler,
+        block_scheduler: &mut DeferredBlockScheduler,
+    ) -> (bool, bool, bool) {
+        let block_ready = self.ready_future_block_pending(slot)
+            || !self.deferred_orphans.is_empty();
+        let held_ready = !self.held_release_roots.is_empty();
+        match scheduler.next(block_ready, held_ready) {
+            Some(DeferredWorkClass::Block) => {
+                self.release_deferred_block_turn(slot, block_scheduler);
+            }
+            Some(DeferredWorkClass::HeldAttestation) => {
+                self.release_held_turn();
+            }
+            None => {}
+        }
+        (
+            self.ready_future_block_pending(slot),
+            !self.deferred_orphans.is_empty(),
+            !self.held_release_roots.is_empty(),
+        )
     }
 
     /// One envelope through the door.
@@ -2261,10 +3033,38 @@ impl Engine {
         env: BlockEnvelope,
         src: Source,
     ) -> (Verdict, Option<([u8; 32], bool)>) {
+        self.ingest_one_deferred(env, src, None)
+    }
+
+    fn ingest_one_deferred(
+        &mut self,
+        env: BlockEnvelope,
+        src: Source,
+        prior_authentication: Option<AuthenticatedBlockAdmission>,
+    ) -> (Verdict, Option<([u8; 32], bool)>) {
         let id = *env.block_id().as_bytes();
         if self.blocks.contains_key(&id) || self.canonical.contains(&id) {
             // Already known: a duplicate is an honest race, not a violation,
             // and it is not this node's job to relay it a second time.
+            return (Verdict::Ignore, None);
+        }
+        // Parked entries have already traversed admission. Suppress exact
+        // repeats across waiting, ready-to-promote, and future queues before
+        // hashing bodies or verifying hybrid signatures. The ready queue is
+        // load-bearing here: its parent is now known, so a repeated envelope
+        // would otherwise bypass cooperative promotion and enter immediately.
+        // Compare signatures too: branch-dependent identities may park an
+        // envelope whose signature is not authentic under the eventual parent
+        // state.
+        let same_envelope = |seen: &[u8; 32], held: &BlockEnvelope| {
+            *seen == id && held.proposer_sig == env.proposer_sig
+        };
+        if self.orphans.iter().any(|(seen, held, _, _, _)| same_envelope(seen, held))
+            || self.deferred_orphans.iter()
+                .any(|(seen, held, _, _, _)| same_envelope(seen, held))
+            || self.future_blocks.get(&id)
+                .is_some_and(|(held, _, _, _)| held.proposer_sig == env.proposer_sig)
+        {
             return (Verdict::Ignore, None);
         }
         // R3 M-1: already judged and refused by the finality latch. Dropped
@@ -2273,32 +3073,12 @@ impl Engine {
         // the same verdict — this is what turns "sync re-fetches and
         // re-refuses forever" into a bounded, cheap no-op. See
         // `Engine::parked_refused_finality`'s doc.
-        if self.parked_refused_finality.iter().any(|(seen, _)| *seen == id) {
-            return (Verdict::Ignore, None);
-        }
-        // A cheap early reject before the block reaches the transition, using
-        // the same `derive::*` functions the transition checks with — one
-        // definition, called twice, not two definitions. The transition is the
-        // authority (step 3b); this only avoids paying for a state clone on a
-        // block that is obviously mismatched.
-        if env.header.attestation_root != derive::attestation_root(&env.body.attestations)
-            || env.header.body_root != derive::body_root(&env.body.transactions)
+        if self.parked_refused_finality.iter()
+            .any(|seen| *seen == id || *seen == env.header.parent)
         {
-            eprintln!(
-                "reject {}: body/attestation commitment mismatch",
-                crate::codec::hex8(&id)
-            );
-            return (Verdict::Reject, None);
-        }
-        // A block carrying transactions used to be rejected here, because the
-        // node had no tx codec and failing closed was the honest response. The
-        // codec exists now (`PosTransaction::from_canonical_bytes`), so the
-        // check that replaces it is decodability: bytes this build cannot read
-        // must not reach the transition, since the proposer's post-state would
-        // then be unreproducible.
-        if let Err(e) = body_transactions(&env) {
-            eprintln!("reject {}: {e}", crate::codec::hex8(&id));
-            return (Verdict::Reject, None);
+            // A child cannot make a locally finality-conflicting ancestor
+            // adoptable. Do not convert it into a missing-parent sync request.
+            return (Verdict::Ignore, None);
         }
         if env.header.slot == 0 {
             // genesis is synthesized, never received
@@ -2314,44 +3094,39 @@ impl Engine {
         // Gossip only, for the same reason the tolerance below is: this bounds
         // what an UNTRUSTED `slot` can make this node walk, and neither the
         // producer's own proposal (`Source::Local`) nor a block read back out
-        // of this node's own log (`Source::Replay`) is untrusted. Removing the
+        // of this node's own log (the dedicated replay path) is untrusted. Removing the
         // `Local` exemption would refuse the node's own block on a loaded box
-        // — the h28080 shape; removing the `Replay` one would let a skewed
-        // clock stop a node from replaying its own FINALIZED log. And the path
+        // — the h28080 shape; routing replay back through this door would let
+        // a skewed clock stop the node replaying its own FINALIZED log. The path
         // that skips this door is not unguarded: `params::MAX_EPOCH_ADVANCE`
         // is the CONSENSUS ceiling on the same walk and applies to every
         // source.
         //
-        // Both exemptions are carried by `src` and by nothing else. In
-        // particular replay does NOT lean on `self.live`: replay happens to
-        // run before `live` is set (`run`, after the replay loop), so the
-        // tolerance below is skipped for it too — but that is an ordering
-        // coincidence, not the rule, and it never covered THIS check at all.
-        // Boot replay routes through `ingest` -> `ingest_judged`, which used
-        // to hand it `Source::Gossip`, so a replayed block was subject to this
-        // horizon and only the wall clock's usual agreement with the log kept
-        // that from mattering.
+        // Both live-admission exemptions are carried by `src` and by nothing
+        // else. Boot replay does not lean on `self.live`: its dedicated
+        // canonical-extension path never enters this gossip/local admission
+        // function, so a skewed wall clock cannot reject durable history.
         //
         // It is also not shadowed by the much tighter `FUTURE_SLOT_TOLERANCE`
         // below, which is skipped entirely while `!self.live` — during boot
         // and sync this horizon is the only thing bounding a gossiped slot.
         let horizon = self.wall_slot().saturating_add(MAX_FUTURE_SLOTS);
         if src.bounded_by_wall_clock() && env.header.slot > horizon {
-            eprintln!(
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
                 "reject {}: slot {} is past this node's horizon {} (wall {} + {})",
                 crate::codec::hex8(&id),
                 env.header.slot,
                 horizon,
                 self.wall_slot(),
                 MAX_FUTURE_SLOTS,
-            );
+            ));
             return (Verdict::Reject, None);
         }
         // A slot the clock will never reach is a write into `blocks` that no
         // `advance` will ever consume. Gossip only — boot replay reads this
         // node's own log and must not depend on the wall clock, which is why
-        // it is `Source::Replay` and exempt by SOURCE here, exactly as it is
-        // at the horizon above (see [`FUTURE_SLOT_TOLERANCE`]).
+        // it never enters this gossip/local admission path, exactly as at the
+        // horizon above (see [`FUTURE_SLOT_TOLERANCE`]).
         //
         // `self.live` stays, and it is a rule about GOSSIP during sync, not
         // about replay: a node catching up is fetching blocks that are in the
@@ -2365,13 +3140,21 @@ impl Engine {
             && env.header.slot > self.wall_slot().saturating_add(FUTURE_SLOT_TOLERANCE)
         {
             self.rejected_future = self.rejected_future.saturating_add(1);
-            eprintln!(
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
                 "reject {}: slot {} is more than {FUTURE_SLOT_TOLERANCE} ahead of wall slot {}",
                 crate::codec::hex8(&id),
                 env.header.slot,
                 self.wall_slot(),
-            );
+            ));
             return (Verdict::Ignore, None);
+        }
+        // Every valid transition advances its parent's slot. Enforce the
+        // header-only invariant before admitting a fork-choice edge, even
+        // when that branch is not selected for execution (EN-15).
+        if self.blocks.get(&env.header.parent)
+            .is_some_and(|parent| env.header.slot <= parent.header.slot)
+        {
+            return (Verdict::Reject, None);
         }
         // The proposer is authenticated BEFORE the block takes a byte of
         // `blocks`, and the three outcomes are deliberately not two.
@@ -2392,14 +3175,14 @@ impl Engine {
         // miniature.
         //
         // So:
-        //   * GENESIS index (`i < genesis_validator_count`), signature fails
+        //   * GENESIS index (present in the manifest), signature fails
         //     → REFUSED, and `Reject`: the genesis registry is in the manifest
         //     every node booted from, records are append-only per index
         //     (transition step 7's note: "records never removed"), so the key
         //     this node holds at `i` is the key EVERY branch holds at `i`, and
         //     this is a forgery the transition would have rejected too —
         //     provable, and safe to charge to the peer that relayed it.
-        //   * DEPOSIT-ADDED index (`i >= genesis_validator_count`), signature
+        //   * DEPOSIT-ADDED index (absent from the manifest), signature
         //     fails against the HEAD's key → PARKED, `Ignore`, never `Reject`
         //     (external audit 2026-09-07, O04). "Append-only per index" is a
         //     fact about one branch: two branches that each admit a different
@@ -2410,11 +3193,8 @@ impl Engine {
         //     simply not applied yet. The transition judges it against the
         //     parent-derived registry when the branch is applied; until then
         //     it may not weigh on fork choice, which is exactly what parking
-        //     buys. Today `genesis_validator_count` is the whole registry
-        //     (`DEPOSIT_ACTIVATION_EPOCH` is `u64::MAX`, so no index above it
-        //     exists on any branch) and this arm is unreachable; it is here so
-        //     that opening deposits does not silently turn the head-registry
-        //     shortcut into a fork.
+        //     buys. Manifest membership is explicit: genesis indices need
+        //     not be dense or ordered.
         //   * unregistered index → PARKED, never stored, `Ignore`. No verdict
         //     is passed on it: it simply may not weigh on fork choice under an
         //     identity this node cannot check, and the orphan pool is
@@ -2428,32 +3208,132 @@ impl Engine {
         // fork-choice tie, and `advance` — which only ever removes the block
         // it tried to apply — never touches the rest.
         let authenticated = match KeyLookup::pubkey(&*self.state, env.header.proposer_index) {
-            Some(pk) => self.verifier.verify_with_key(
-                pk,
-                &env.header.proposal_signing_root(),
-                &env.proposer_sig,
-            ),
+            Some(pk) if src.bounded_by_wall_clock() => {
+                let proof_matches = prior_authentication
+                    .as_ref()
+                    .is_some_and(|proof| proof.matches(&env, pk));
+                if proof_matches {
+                    true
+                } else {
+                    let verifier = self.gossip_verifier.budgeted_for_source(
+                        self.wall_slot(),
+                        GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+                        src.verification_source(),
+                        GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+                    );
+                    let verified = verifier.verify_with_key(
+                        pk,
+                        &env.header.proposal_signing_root(),
+                        &env.proposer_sig,
+                    );
+                    if verifier.limited() {
+                        // Local overload is not proof of a forgery. Ignore so an
+                        // honest relay is not scored; sync retries from the
+                        // applied head on its ordinary timer.
+                        return (Verdict::Ignore, None);
+                    }
+                    verified
+                }
+            }
+            Some(pk) => prior_authentication
+                .as_ref()
+                .is_some_and(|proof| proof.matches(&env, pk))
+                || self.gossip_verifier.verify_with_key(
+                    pk,
+                    &env.header.proposal_signing_root(),
+                    &env.proposer_sig,
+                ),
             None => {
                 // Unknown identity: hold it, ask for the gap, decide nothing.
-                self.park_orphan(id, env);
+                self.park_orphan(id, env, src);
                 return (Verdict::Ignore, None);
             }
         };
         if !authenticated {
-            if env.header.proposer_index >= self.genesis_validator_count {
+            if !self.genesis_validator_indices.contains(&env.header.proposer_index) {
                 // O04: a deposit-added identity whose key this branch may not
                 // hold. Not a verdict on the block, and not a charge on the
                 // peer — hold it and let the transition judge it in context.
-                self.park_orphan(id, env);
+                self.park_orphan(id, env, src);
                 return (Verdict::Ignore, None);
             }
             self.rejected_unsigned = self.rejected_unsigned.saturating_add(1);
-            eprintln!(
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
                 "reject {}: proposer {} signature does not verify",
                 crate::codec::hex8(&id),
                 env.header.proposer_index,
-            );
+            ));
             return (Verdict::Reject, None);
+        }
+        let Some(authenticated_pubkey) = KeyLookup::pubkey(&*self.state, env.header.proposer_index)
+        else {
+            return (Verdict::Ignore, None);
+        };
+        let authenticated = AuthenticatedBlockAdmission::new(&env, authenticated_pubkey);
+
+        if !self.admit_proposal_variant(
+            id,
+            env.header.proposer_index,
+            env.header.slot,
+            src,
+        ) {
+            // The signature proves the key equivocated, not that the relay is
+            // malicious. Two variants retain the complete evidence pair; a
+            // third is local retention pressure and is silently ignored.
+            return (Verdict::Ignore, None);
+        }
+
+        // TX-16: authenticate the fixed-size header BEFORE hashing or decoding
+        // the attacker-sized body. The proposal signature commits to
+        // `body_root` and `attestation_root`; only a registered proposer can
+        // therefore buy the Merkle work and transaction decoding below. The
+        // transition remains authoritative and repeats these checks against
+        // the parent state when the block is applied.
+        if env.header.attestation_root != derive::attestation_root(&env.body.attestations)
+            || env.header.body_root != derive::body_root(&env.body.transactions)
+        {
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
+                "reject {}: body/attestation commitment mismatch",
+                crate::codec::hex8(&id)
+            ));
+            return (Verdict::Reject, None);
+        }
+        // A block carrying transactions used to be rejected here, because the
+        // node had no tx codec and failing closed was the honest response. The
+        // codec exists now (`PosTransaction::from_canonical_bytes`), so bytes
+        // this build cannot read must not reach the transition. Retain the
+        // decoded vector for the registry-growth scan instead of parsing the
+        // same untrusted bytes twice.
+        let decoded_transactions = match body_transactions(&env) {
+            Ok(txs) => txs,
+            Err(e) => {
+                crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!("reject {}: {e}", crate::codec::hex8(&id)));
+                return (Verdict::Reject, None);
+            }
+        };
+        // Authenticated near-future blocks must not enter fork choice until
+        // their signed slot. Bound both count and payload memory (EN-05).
+        if src.bounded_by_wall_clock() && self.live && env.header.slot > self.wall_slot() {
+            // Cache the exact canonical length with the immutable envelope.
+            // Re-encoding every retained body here made each new future
+            // admission allocate and copy up to the complete 16-MiB pool.
+            let bytes = crate::codec::encoded_envelope_len(&env);
+            let (held, held_by_source, held_bytes_by_source) = future_retention_totals(
+                self.future_blocks.values().map(|(_, source, _, bytes)| (source, bytes)),
+                src,
+            );
+            if self.future_blocks.len() < FUTURE_BLOCKS_MAX
+                && retention_bytes_fit(held, bytes, FUTURE_BLOCK_BYTES_MAX)
+                && held_by_source < FUTURE_BLOCKS_PER_SOURCE
+                && retention_bytes_fit(
+                    held_bytes_by_source,
+                    bytes,
+                    FUTURE_BLOCK_BYTES_PER_SOURCE,
+                )
+            {
+                self.future_blocks.insert(id, (env, src, Some(authenticated), bytes));
+            }
+            return (Verdict::Ignore, None);
         }
         // A block that connects to nothing cannot be judged, so it is parked
         // rather than stored: `blocks` is a fork-choice input and an entry
@@ -2461,18 +3341,14 @@ impl Engine {
         if !self.canonical.contains(&env.header.parent)
             && !self.blocks.contains_key(&env.header.parent)
         {
-            self.park_orphan(id, env);
+            self.park_orphan_authenticated(id, env, src, Some(authenticated));
             return (Verdict::Ignore, None);
         }
         // Read before `env` moves: whether this block could have registered a
         // validator index. Decoding already succeeded above, so this is a
         // scan of a decoded list, not a second parse.
-        let grew_registry = body_transactions(&env)
-            .map(|txs| {
-                txs.iter()
-                    .any(|tx| matches!(tx, PosTransaction::Deposit { .. } | PosTransaction::FundedDeposit(_)))
-            })
-            .unwrap_or(false);
+        let grew_registry = decoded_transactions.iter()
+            .any(|tx| matches!(tx, PosTransaction::Deposit { .. } | PosTransaction::FundedDeposit(_)));
         // Read before `env` moves — R6 HIGH-8: an authenticated (this door's
         // signature check already ran, above) proposal by `proposer_index`
         // is exactly the class of sighting doppelgänger protection exists to
@@ -2488,7 +3364,7 @@ impl Engine {
         // The block is queryable now, so attestations parked on it can be
         // re-run. `advance()` first: an attestation released here votes on
         // fork choice, and it should see the chain the block already moved.
-        self.release_held(id);
+        self.schedule_held_release(id);
         // After `advance`, because that is what can have moved finality.
         self.prune_below_finalized();
         (Verdict::Accept, Some((id, grew_registry)))
@@ -2496,26 +3372,134 @@ impl Engine {
 
     /// Park a block whose parent is unknown, and ask the mesh for the gap.
     ///
-    /// Deduplicated by id, so a mesh that hands the same orphan back on every
-    /// heartbeat occupies one slot rather than the whole pool.
-    fn park_orphan(&mut self, id: [u8; 32], env: BlockEnvelope) {
-        if self.orphans.iter().any(|(seen, _)| *seen == id) {
+    /// Deduplicated by id across both waiting and ready-to-promote tails, so a
+    /// mesh that hands the same orphan back on every heartbeat occupies one
+    /// slot rather than the whole pool.
+    fn park_orphan(&mut self, id: [u8; 32], env: BlockEnvelope, src: Source) {
+        self.park_orphan_authenticated(id, env, src, None);
+    }
+
+    fn park_orphan_authenticated(
+        &mut self,
+        id: [u8; 32],
+        env: BlockEnvelope,
+        src: Source,
+        authentication: Option<AuthenticatedBlockAdmission>,
+    ) {
+        if self.orphans.iter().any(|(seen, _, _, _, _)| *seen == id)
+            || self.deferred_orphans.iter().any(|(seen, _, _, _, _)| *seen == id)
+        {
             return;
         }
-        // FIFO: at the cap the OLDEST goes, since its parent has had the
-        // longest to arrive and has not.
-        while self.orphans.len() >= ORPHAN_MAX {
-            if self.orphans.pop_front().is_some() {
+        // Promotion must not reopen a source's share: count both the blocked
+        // and ready FIFOs. This is retention fairness only; dropping at the
+        // share is local Ignore pressure and never peer guilt.
+        if src.bounded_by_wall_clock()
+            && self.orphans.iter()
+                .chain(self.deferred_orphans.iter())
+                .filter(|(_, _, held_source, _, _)| *held_source == src)
+                .count()
+                >= ORPHANS_PER_SOURCE
+        {
+            self.orphans_evicted = self.orphans_evicted.saturating_add(1);
+            return;
+        }
+        // Charge exact codec bytes only after deduplication and the cheaper
+        // entry-count share. The length helper does not allocate another
+        // frame-sized buffer.
+        let retained_bytes = crate::codec::encoded_envelope_len(&env);
+        if src.bounded_by_wall_clock() {
+            let source_bytes = self.orphans.iter()
+                .chain(self.deferred_orphans.iter())
+                .filter(|(_, _, held_source, _, _)| *held_source == src)
+                .fold(0usize, |sum, (_, _, _, _, bytes)| sum.saturating_add(*bytes));
+            if !retention_bytes_fit(source_bytes, retained_bytes, ORPHAN_BYTES_PER_SOURCE) {
                 self.orphans_evicted = self.orphans_evicted.saturating_add(1);
+                return;
             }
         }
-        self.orphans.push_back((id, env));
+        // An internally constructed object larger than the whole budget can
+        // never fit. Refuse it before the FIFO loop so it cannot flush every
+        // waiting entry and then be refused anyway.
+        if retained_bytes > ORPHAN_BYTES_MAX {
+            self.orphans_evicted = self.orphans_evicted.saturating_add(1);
+            return;
+        }
+        // Ready-to-promote work is deliberately immutable under new
+        // admission. If it leaves no possible room for this entry, refuse
+        // before evicting any still-waiting orphan to no useful effect.
+        let deferred_bytes = self.deferred_orphans.iter()
+            .fold(0usize, |sum, (_, _, _, _, bytes)| sum.saturating_add(*bytes));
+        if self.deferred_orphans.len() >= ORPHAN_MAX
+            || !retention_bytes_fit(deferred_bytes, retained_bytes, ORPHAN_BYTES_MAX)
+        {
+            self.orphans_evicted = self.orphans_evicted.saturating_add(1);
+            return;
+        }
+        // Compute the combined byte charge once. Re-summing both queues after
+        // every FIFO pop made one admissible large orphan turn a full
+        // 256-entry queue into quadratic metadata work. Envelope bytes are
+        // immutable while retained, so subtracting the cached charge of the
+        // entry removed below is exactly the same accounting without the
+        // repeated scans.
+        let waiting_bytes = self.orphans.iter()
+            .fold(0usize, |sum, (_, _, _, _, bytes)| sum.saturating_add(*bytes));
+        let mut held_bytes = deferred_bytes.saturating_add(waiting_bytes);
+        // The parked and ready-to-promote queues share one hard cap. Prefer
+        // evicting the oldest still-blocked orphan; a connected block already
+        // queued for its bounded promotion turn must not be displaced by new
+        // remote work. If the ready tail alone fills the cap, drop the new
+        // orphan (still an Ignore verdict, never peer guilt).
+        while self.orphans.len().saturating_add(self.deferred_orphans.len()) >= ORPHAN_MAX
+            || !retention_bytes_fit(held_bytes, retained_bytes, ORPHAN_BYTES_MAX)
+        {
+            if let Some((_, _, _, _, evicted_bytes)) = self.orphans.pop_front() {
+                held_bytes = held_bytes.saturating_sub(evicted_bytes);
+                self.orphans_evicted = self.orphans_evicted.saturating_add(1);
+            } else {
+                self.orphans_evicted = self.orphans_evicted.saturating_add(1);
+                return;
+            }
+        }
+        self.orphans.push_back((id, env, src, authentication, retained_bytes));
         // The gap is real and the sync loop is the thing that closes it.
         self.needs_sync = true;
     }
 
+    /// Record one authenticated proposal, returning false only when gossip
+    /// would add a third distinct variant for one genesis-key duty.
+    ///
+    /// Genesis membership matters: those keys are immutable on every branch,
+    /// so authentication at the head is branch-independent. Deposit-added
+    /// indices may name different keys on competing branches and remain
+    /// outside this local cap until parent-derived admission exists.
+    fn admit_proposal_variant(
+        &mut self,
+        id: [u8; 32],
+        proposer: u32,
+        slot: u64,
+        src: Source,
+    ) -> bool {
+        if !self.genesis_validator_indices.contains(&proposer) {
+            return true;
+        }
+        if self.proposal_admission_seen.contains_key(&id) {
+            return true;
+        }
+        let duty = (proposer, slot);
+        let count = self.proposal_admission_counts.get(&duty).copied().unwrap_or(0);
+        if src.bounded_by_wall_clock() && count >= MAX_PROPOSALS_PER_GENESIS_DUTY {
+            return false;
+        }
+        self.proposal_admission_seen.insert(id, duty);
+        self.proposal_admission_counts
+            .insert(duty, count.saturating_add(1));
+        true
+    }
+
     /// Drop non-canonical blocks — stored and parked — that sit below the
-    /// finalized checkpoint.
+    /// finalized checkpoint, and descendants made unreachable by that removal.
+    /// Still-connected above-floor branches are not count-capped.
     ///
     /// **Why this cannot lose a branch.** `lmd_ghost_head` starts its descent
     /// at the justified root and only ever walks to children, so the head is
@@ -2537,25 +3521,66 @@ impl Engine {
         let Some(floor) = first_slot_of_epoch(finalized_epoch) else {
             return;
         };
-        let doomed: Vec<[u8; 32]> = self
-            .blocks
-            .iter()
+        self.proposal_admission_seen.retain(|_, (_, slot)| *slot >= floor);
+        self.proposal_admission_counts.retain(|(_, slot), _| *slot >= floor);
+        let mut pending: VecDeque<[u8; 32]> = self.blocks.iter()
             .filter(|(id, env)| env.header.slot < floor && !self.canonical.contains(*id))
-            .map(|(id, _)| *id)
-            .collect();
-        for id in doomed {
-            self.blocks.remove(&id);
-            self.blocks_pruned = self.blocks_pruned.saturating_add(1);
+            .map(|(id, _)| *id).collect();
+        pending.extend(self.orphans.iter()
+            .filter(|(_, env, _, _, _)| env.header.slot < floor).map(|(id, _, _, _, _)| *id));
+        if pending.is_empty() { return; }
+
+        // A descendant cannot reconnect once its already-finalized-away
+        // ancestor is removed. Traverse edges once instead of repeatedly
+        // scanning the whole map, and never remove a canonical envelope.
+        let mut children: BTreeMap<[u8; 32], Vec<[u8; 32]>> = BTreeMap::new();
+        for (id, env) in &self.blocks {
+            if !self.canonical.contains(id) {
+                children.entry(env.header.parent).or_default().push(*id);
+            }
         }
-        // Parked blocks under the floor can never connect to a branch that
-        // could win, so holding them only costs slots other orphans need.
+        for (id, env, _, _, _) in &self.orphans {
+            children.entry(env.header.parent).or_default().push(*id);
+        }
+        let mut doomed = BTreeSet::new();
+        while let Some(id) = pending.pop_front() {
+            if self.canonical.contains(&id) || !doomed.insert(id) { continue; }
+            if let Some(descendants) = children.remove(&id) {
+                pending.extend(descendants);
+            }
+        }
+        for id in &doomed {
+            if self.blocks.remove(id).is_some() {
+                self.blocks_pruned = self.blocks_pruned.saturating_add(1);
+            }
+        }
         let before = self.orphans.len();
-        self.orphans.retain(|(_, env)| env.header.slot >= floor);
-        // `retain` only shrinks, so `before - len` is the eviction count; both
-        // are counters, saturating by design.
-        self.orphans_evicted = self
-            .orphans_evicted
+        self.orphans.retain(|(id, _, _, _, _)| !doomed.contains(id));
+        self.orphans_evicted = self.orphans_evicted
             .saturating_add(before.saturating_sub(self.orphans.len()) as u64);
+    }
+
+    /// Reduce the current proposal after a probe refusal. Only an indexed
+    /// error identifies a transaction that may be removed and barred globally.
+    /// For block-wide errors, omit the tail for this proposal only (EN-16).
+    fn drop_failed_proposal_transaction(
+        &mut self,
+        txs: &mut Vec<PosTransaction>,
+        err: &TransitionError,
+        slot: u64,
+    ) -> bool {
+        if let Some(index) = culprit_index(err, txs.len()) {
+            let bad = txs.remove(index).canonical_bytes();
+            self.mempool.remove(&bad);
+            self.reject_transaction(bad, slot);
+            eprintln!("[slot {slot}] removing indexed transaction refused by transition: {err:?}");
+            true
+        } else if txs.pop().is_some() {
+            eprintln!("[slot {slot}] narrowing proposal after unattributed refusal: {err:?}");
+            true
+        } else {
+            false
+        }
     }
 
     // ── Transaction-status index (R4 F-11, `gettxstatus`) ───────────────────
@@ -2589,32 +3614,26 @@ impl Engine {
             let id = tx.txid();
             if self.tx_slot_index.get(&id) == Some(&slot) {
                 self.tx_slot_index.remove(&id);
-                // Left in `tx_slot_index_order`: the FIFO eviction loop in
-                // `note_tx_slots` tolerates a stale id there (it is simply a
-                // no-op removal when its turn comes), and the order queue's
-                // OWN length is what bounds memory, so this costs nothing
-                // beyond one wasted future eviction slot.
+                // The reorg caller compacts the FIFO once after removing the
+                // entire losing tail, before reinserting adopted identities.
             }
         }
     }
 
     /// `pending | included | justified | finalized | unknown` for `txid`
     /// (R4 F-11). Cheapest check first: the bounded index (`O(log n)`
-    /// lookup) before the mempool (`O(mempool_len)` scan, since the mempool
-    /// is keyed by canonical bytes, not by txid).
+    /// lookup) before the cached mempool identity index (`O(log n)`).
     fn tx_status(&self, txid: &[u8; 32]) -> &'static str {
         if let Some(&slot) = self.tx_slot_index.get(txid) {
-            let fin = self.state.finality();
-            let e = epoch_of(slot);
-            return if e <= fin.finalized.epoch {
-                "finalized"
-            } else if e <= fin.justified.epoch {
-                "justified"
-            } else {
-                "included"
+            // A checkpoint names a block, not every block in its epoch.
+            // Share the exact boundary semantics used by the block RPC.
+            return match self.finality_of(slot, true) {
+                Finality::Finalized => "finalized",
+                Finality::Justified => "justified",
+                _ => "included",
             };
         }
-        if self.mempool.values().any(|tx| &tx.txid() == txid) {
+        if self.mempool.has_txid(txid) {
             return "pending";
         }
         "unknown"
@@ -2669,11 +3688,12 @@ impl Engine {
     fn forkchoice_head(&self) -> [u8; 32] {
         // Instrumentation only; compiled out without `perf-timing`.
         let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::ForkChoice);
-        lmd_ghost_head(
+        lmd_ghost_head_at_epoch(
             &self.blocks,
             self.pool.values(),
             &self.state.active_validators(),
             self.state.finality().justified.root,
+            epoch_of(self.state.slot()),
         )
     }
 
@@ -2706,6 +3726,32 @@ impl Engine {
             }
         }
         None
+    }
+
+    /// Release at most `limit` authenticated future blocks whose slot arrived.
+    /// Returns whether another eligible block remains, allowing the caller to
+    /// gate duties and immediately give it a fresh bounded loop turn.
+    fn release_future_blocks(&mut self, slot: u64, limit: usize) -> bool {
+        let ready: Vec<_> = self.future_blocks.iter()
+            .filter(|(_, (block, _, _, _))| block.header.slot <= slot)
+            .map(|(id, _)| *id)
+            .take(limit)
+            .collect();
+        for id in ready {
+            if let Some((block, source, authentication, _)) = self.future_blocks.remove(&id) {
+                let (_, landing) = self.ingest_one_deferred(block, source, authentication);
+                if let Some((landed, grew_registry)) = landing {
+                    self.schedule_unblocked_orphans(landed, grew_registry);
+                }
+            }
+        }
+        self.ready_future_block_pending(slot)
+    }
+
+    fn ready_future_block_pending(&self, slot: u64) -> bool {
+        self.future_blocks
+            .values()
+            .any(|(block, _, _, _)| block.header.slot <= slot)
     }
 
     /// Make the canonical chain equal the LMD-GHOST head.
@@ -2961,8 +4007,28 @@ impl Engine {
     /// this call reclaims the space. A node that stops proposing therefore
     /// stops growing this, which is the correct shape — it also stops learning.
     fn reject_transaction(&mut self, key: Vec<u8>, slot: u64) {
-        self.rejected.retain(|_, (until, _)| *until > slot);
-        while self.rejected.len() >= REJECTION_MAX {
+        self.reject_transaction_bounded(key, slot, REJECTION_BYTES_MAX);
+    }
+
+    /// Shared implementation with an explicit byte limit so boundary tests do
+    /// not need multi-megabyte fixtures. Production always supplies
+    /// [`REJECTION_BYTES_MAX`].
+    fn reject_transaction_bounded(&mut self, key: Vec<u8>, slot: u64, bytes_cap: usize) {
+        self.purge_expired_rejections(slot);
+
+        // Re-barring the same key replaces its expiry/hit record. Remove it
+        // before capacity planning so replacement cannot evict an unrelated
+        // entry merely because the cache was exactly full.
+        self.remove_rejected(&key);
+
+        // All production keys passed through the byte-bounded mempool. Keep
+        // this defensive guard fail-bounded if that invariant ever changes.
+        if key.len() > bytes_cap {
+            return;
+        }
+        while self.rejected.len() >= REJECTION_MAX
+            || self.rejected_bytes.saturating_add(key.len()) > bytes_cap
+        {
             // Evict the soonest to lapse: it is the entry closest to being
             // worthless anyway. `BTreeMap` is ordered by KEY, not by value, so
             // the minimum has to be found rather than popped.
@@ -2974,9 +4040,59 @@ impl Engine {
             else {
                 break;
             };
-            self.rejected.remove(&victim);
+            self.remove_rejected(&victim);
         }
-        self.rejected.insert(key, (slot.saturating_add(REJECTION_TTL_SLOTS), 0));
+        self.rejected_bytes = self
+            .rejected_bytes
+            .checked_add(key.len())
+            .expect("admitted rejection-key bytes fit the configured cap");
+        let until = slot.saturating_add(REJECTION_TTL_SLOTS);
+        self.rejected_expiry_hint = Some(
+            self.rejected_expiry_hint
+                .map_or(until, |hint| hint.min(until)),
+        );
+        self.rejected.insert(key, (until, 0));
+        debug_assert_eq!(
+            self.rejected_bytes,
+            self.rejected.keys().map(Vec::len).sum::<usize>(),
+        );
+    }
+
+    /// Purge only when the conservative hint proves that at least one expiry
+    /// may have arrived. A stale early hint can buy one redundant scan, but a
+    /// late hint is impossible: every insertion takes the minimum and a scan
+    /// recomputes the exact next expiry.
+    fn purge_expired_rejections(&mut self, slot: u64) {
+        if !self.rejected_expiry_hint.is_some_and(|until| until <= slot) {
+            return;
+        }
+        #[cfg(test)]
+        REJECTION_EXPIRY_SCANS.with(|scans| scans.set(scans.get().saturating_add(1)));
+
+        let mut retained_bytes = 0usize;
+        let mut next_expiry: Option<u64> = None;
+        self.rejected.retain(|retained, (until, _)| {
+            let keep = *until > slot;
+            if keep {
+                retained_bytes = retained_bytes
+                    .checked_add(retained.len())
+                    .expect("retained rejection-key bytes fit usize");
+                next_expiry = Some(next_expiry.map_or(*until, |next| next.min(*until)));
+            }
+            keep
+        });
+        self.rejected_bytes = retained_bytes;
+        self.rejected_expiry_hint = next_expiry;
+    }
+
+    /// Remove one cached refusal and its exact encoded-byte charge.
+    fn remove_rejected(&mut self, key: &[u8]) -> Option<(u64, u64)> {
+        let removed = self.rejected.remove(key)?;
+        self.rejected_bytes = self
+            .rejected_bytes
+            .checked_sub(key.len())
+            .expect("rejection cache byte accounting matches its keys");
+        Some(removed)
     }
 
     /// Whether `key` is barred as of `slot`, without mutating anything.
@@ -3031,9 +4147,43 @@ impl Engine {
     /// peer is not waiting on a verdict, and a duplicate arriving twice over a
     /// full mesh is the normal case rather than a fault.
     fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, Refusal> {
+        self.on_transaction_from(tx, None)
+    }
+
+    fn on_transaction_from(
+        &mut self,
+        tx: PosTransaction,
+        verification_source: Option<[u8; 32]>,
+    ) -> Result<Admitted, Refusal> {
         let key = tx.canonical_bytes();
-        if self.mempool.contains_key(&key) {
-            return Ok(Admitted::Duplicate);
+        self.on_transaction_from_canonical(tx, key, verification_source, |_, _| ())
+            .map(|(outcome, ())| outcome)
+    }
+
+    /// Admit a transaction with canonical bytes derived from that same value
+    /// at the RPC edge. Private so no external caller can forge the binding;
+    /// ordinary gossip continues through `on_transaction_from` above.
+    fn on_transaction_from_canonical<R>(
+        &mut self,
+        tx: PosTransaction,
+        key: Vec<u8>,
+        verification_source: Option<[u8; 32]>,
+        prepare_result: impl FnOnce(&PosTransaction, &[u8]) -> R,
+    ) -> Result<(Admitted, R), Refusal> {
+        // Identity is witness-free but not free: transfers fold every input
+        // and output, and funded deposits build their intent preimage. Keep
+        // this one derivation bound to `tx` through both duplicate indexes and
+        // the eventual mempool identity insertion.
+        let txid = tx.txid();
+        // A recent canonical inclusion remains a duplicate even if gossip
+        // re-offers it after its pending entry was removed.
+        if self.tx_slot_index.contains_key(&txid) {
+            let prepared = prepare_result(&tx, &key);
+            return Ok((Admitted::Duplicate, prepared));
+        }
+        if self.mempool.has_txid(&txid) {
+            let prepared = prepare_result(&tx, &key);
+            return Ok((Admitted::Duplicate, prepared));
         }
         // Before capacity, and before the structural check: a transaction this
         // node's own proposer already watched the transition refuse must not
@@ -3045,53 +4195,10 @@ impl Engine {
             self.note_bar(&key, until_slot);
             return Err(Refusal::PreviouslyRefused { until_slot });
         }
-        // R7 M6: per-source cap, before capacity — a source at its own cap
-        // must be refused as such even when the mempool overall has room,
-        // and must not instead be told to look at the (irrelevant) overall
-        // capacity.
-        if let Some(source) = tx_source_hash(&tx) {
-            let from_source =
-                self.mempool.values().filter(|t| tx_source_hash(t) == Some(source)).count();
-            if from_source >= MEMPOOL_MAX_PER_SOURCE {
-                return Err(Refusal::TooManyFromSource);
-            }
-        }
-        // R7 M6: at capacity, decide WHETHER an eviction is even possible —
-        // read-only, cheap, no crypto paid — but do not COMMIT it yet. The
-        // incoming transaction must still pass `admissible` below before any
-        // real entry is actually removed: otherwise a transaction that
-        // CLAIMS a high `tip_millisat_per_gas` but carries a garbage
-        // signature would evict a real, paying transaction for free and
-        // then itself be refused as `Invalid` — a targeted eviction that
-        // costs the attacker nothing, since `tip_millisat_per_gas` sits
-        // inside the signed root and checking it against the signature is
-        // exactly the expensive step this ordering must not skip.
-        let evict_at_capacity: Option<Vec<u8>> = if self.mempool.len() >= MEMPOOL_MAX {
-            // `min_by_key` breaks ties by iteration order (`BTreeMap`,
-            // ascending canonical bytes) — deterministic, and irrelevant to
-            // security: a tie for LOWEST fee is the one place grinding buys
-            // nothing, since every tied candidate is equally eligible for
-            // eviction regardless of which one this picks.
-            let lowest = self
-                .mempool
-                .iter()
-                .min_by_key(|(_, t)| tx_tip_rate(t))
-                .map(|(k, t)| (k.clone(), tx_tip_rate(t)));
-            match lowest {
-                // Strictly greater, not `>=`: a flood of minimum-fee
-                // transactions must not be able to evict a real payer merely
-                // by arriving. Today's `AtCapacity` at least costs such a
-                // flood nothing extra; letting a TIE evict would make it
-                // actively clear out everyone who already paid, which is
-                // strictly worse than the refusal it replaces.
-                Some((lowest_key, lowest_rate)) if tx_tip_rate(&tx) > lowest_rate => {
-                    Some(lowest_key)
-                }
-                _ => return Err(Refusal::AtCapacity),
-            }
-        } else {
-            None
-        };
+        admission::check_transfer(&self.state, &tx, key.len(), epoch_of(self.wall_slot()))?;
+        // Plan capacity cleanup without mutating the pool. A forged incoming
+        // signature must never evict either stale or currently paying entries.
+        let capacity = self.plan_mempool_capacity(&tx, key.len(), epoch_of(self.wall_slot()))?;
         // Refuse the shapes consensus can never apply.
         //
         // Admission used to check duplicate-and-capacity only, so anything
@@ -3129,29 +4236,57 @@ impl Engine {
                 return Err(Refusal::Invalid("funded deposit belongs to a different genesis manifest"));
             }
         }
-        admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
-        if self.funded_mempool_conflict(&tx) {
+        let verifier = self.gossip_verifier.budgeted_for_source(
+            self.wall_slot(),
+            GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+            verification_source,
+            GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+        );
+        let admission = admissible_with_network_verifier(
+            &tx,
+            epoch_of(self.wall_slot()),
+            self.state.admission_network_domain().as_ref(),
+            &verifier,
+        );
+        let limited = verifier.limited();
+        drop(verifier);
+        if limited {
+            return Err(Refusal::GossipVerificationLimited {
+                until_slot: self.wall_slot().saturating_add(1),
+            });
+        }
+        admission.map_err(Refusal::Invalid)?;
+        if self.funded_mempool_conflict(&tx, &capacity.stale) {
             return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
         }
         self.validate_lifecycle_admission(&tx)?;
-        // R7 M6: only now, with the incoming transaction confirmed
-        // admissible, actually commit the eviction decided above.
-        if let Some(lowest_key) = evict_at_capacity {
+        // Commit only after every incoming admission check succeeds. Removing
+        // state-dependent failures under pressure is retention, never a bar.
+        for stale in &capacity.stale {
+            self.mempool.remove(stale);
+            self.mempool_admitted_at.remove(stale);
+            self.mempool_suspect.remove(stale);
+        }
+        if let Some(lowest_key) = capacity.lower_fee {
             self.mempool.remove(&lowest_key);
             self.mempool_admitted_at.remove(&lowest_key);
+            self.mempool_suspect.remove(&lowest_key);
             self.mempool_evicted_low_fee = self.mempool_evicted_low_fee.saturating_add(1);
         }
-        let mut frame = vec![net::FRAME_TX];
-        frame.extend_from_slice(&key);
+        // Construct caller output only once admission has succeeded. The RPC
+        // receipt hashes `key`; invalid submissions must not buy that extra
+        // proportional work merely because the optimized success path exists.
+        let prepared = prepare_result(&tx, &key);
+        let broadcast = net::PreparedTransactionBroadcast::new(&key);
         // The retention clock starts at the head this node is on, not at the
         // wall slot: the TTL is "this many blocks of chain went by and never
         // took it", and a node whose clock runs ahead of its head must not
         // expire transactions it never had a chance to include.
         self.mempool_admitted_at
             .insert(key.clone(), self.head_slot_now());
-        self.mempool.insert(key, tx);
-        self.net.broadcast(frame);
-        Ok(Admitted::New)
+        self.mempool.insert_with_txid(key, tx, txid);
+        self.net.broadcast_transaction(broadcast);
+        Ok((Admitted::New, prepared))
     }
 
     /// Transactions for the block this node is about to propose.
@@ -3175,6 +4310,36 @@ impl Engine {
     /// it builds a block every other node rejects — so the epoch comes from
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
+        // Admission is a historical observation, not a reservation of inputs or
+        // fees. Recheck against this proposal's parent and fee epoch before a
+        // stale high-tip transaction can consume candidate capacity (EN-06).
+        // Do not evict/bar failures here: fees and fork-local UTXOs can change
+        // again, making the exact same signed transaction eligible later.
+        let mut funded_context = None;
+        let candidates = self.mempool.iter().filter(|(encoded, tx)| {
+            self.candidate_is_backed(tx, encoded.len(), epoch, &mut funded_context)
+        }).collect();
+        Self::pack_transactions(epoch, candidates)
+    }
+
+    /// Immutable signatures were checked at admission. Re-evaluate only the
+    /// parent/epoch-dependent backing shared by selection and capacity policy.
+    fn candidate_is_backed(&self, tx: &PosTransaction, encoded: usize, epoch: u64,
+        funded_context: &mut Option<(Arc<CommittedState>, u128)>) -> bool {
+        if admission::check_transfer(&self.state, tx, encoded, epoch).is_err() { return false; }
+        if matches!(tx, PosTransaction::FundedDeposit(_)) {
+            if !bloch_pos_committee::params::funded_validator_admission_active(epoch) { return false; }
+            let (rolled, total) = funded_context.get_or_insert_with(|| {
+                let rolled = self.rolled_to(epoch);
+                let total = rolled.active_validators().iter().fold(0u128, |sum, v| sum.saturating_add(u128::from(v.effective_stake)));
+                (rolled, total)
+            });
+            return rolled.validate_lifecycle_transaction(tx, *total, self.state.next_base_fee_at(epoch), &ProbeVerifier).is_ok();
+        }
+        true
+    }
+
+    fn pack_transactions(epoch: u64, mut ordered: Vec<(&Vec<u8>, &PosTransaction)>) -> Vec<PosTransaction> {
         let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
         let mut out = Vec::new();
         let mut bytes = 0u64;
@@ -3189,11 +4354,14 @@ impl Engine {
         // matter) is exactly where two proposers can disagree for free
         // without it costing security: candidates tied on fee are
         // interchangeable by construction.
-        let mut ordered: Vec<(&Vec<u8>, &PosTransaction)> = self.mempool.iter().collect();
+        let mut reserved = BTreeSet::new();
         ordered.sort_by(|(ka, ta), (kb, tb)| {
             tx_tip_rate(tb).cmp(&tx_tip_rate(ta)).then_with(|| ka.cmp(kb))
         });
         for (encoded, tx) in ordered {
+            // Legacy unauthenticated exits are never proposed, even if a
+            // caller bypassed ordinary admission (TX-01).
+            if matches!(tx, PosTransaction::Exit { .. }) { continue; }
             if out.len() >= MAX_TXS_PER_BLOCK {
                 break;
             }
@@ -3218,8 +4386,13 @@ impl Engine {
             };
             let n = (encoded.len() as u64).max(declared);
             if bytes.saturating_add(n) > cap {
-                break;
+                continue;
             }
+            let points = Self::spent_outpoints(tx).unwrap_or_default();
+            if points.iter().any(|point| reserved.contains(point)) {
+                continue;
+            }
+            reserved.extend(points);
             bytes = bytes.saturating_add(n); // checked against `cap` just above
             out.push(tx.clone());
         }
@@ -3237,7 +4410,7 @@ impl Engine {
         let txs = match body_transactions(env) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("apply refused: {e}");
+                crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!("apply refused: {e}"));
                 return false;
             }
         };
@@ -3310,6 +4483,13 @@ impl Engine {
                         eprintln!("FATAL: block log append failed: {e}");
                         std::process::exit(1);
                     }
+                    if self.chain.len().checked_sub(1)
+                        .and_then(|height| height.checked_rem(local_cache::INTERVAL)) == Some(0)
+                    {
+                        if let Err(e) = self.write_local_cache() {
+                            eprintln!("state-cache: write failed; block log remains durable: {e}");
+                        }
+                    }
                     let after = self.state.finality();
                     // The head root is FREE here, and it used to cost a whole
                     // state-root computation.
@@ -3352,20 +4532,25 @@ impl Engine {
                             after.finalized.epoch,
                             crate::codec::hex8(&after.finalized.root)
                         );
-                        // New own finality may now reach the anchor's epoch.
-                        self.enforce_ws_anchor();
                     }
+                    // A newly available block can expose a false checkpoint
+                    // state root even before finality advances to its epoch.
+                    self.enforce_ws_anchor();
                 }
+                // Match the old queued-RPC visibility boundary: publish only
+                // after all synchronous apply work (including the durable
+                // live append) has completed successfully.
+                self.publish_block_count();
                 true
             }
             Err(err) => {
                 crate::metrics::NodeMetrics::inc(&crate::metrics::NODE.blocks_rejected_total);
                 if self.live {
-                    eprintln!(
+                    crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
                         "reject {} at slot {}: {err:?}",
                         crate::codec::hex8(id.as_bytes()),
                         env.header.slot
-                    );
+                    ));
                 }
                 false
             }
@@ -3417,17 +4602,16 @@ impl Engine {
             .iter()
             .position(|(_, cid)| cid.as_bytes() == &id)
             .expect("replay target is canonical");
-        let prefix: Vec<BlockEnvelope> = self.chain[1..=cut]
-            .iter()
-            .map(|(_, cid)| {
-                self.blocks
-                    .get(cid.as_bytes())
-                    .expect("canonical block stored")
-                    .clone()
-            })
-            .collect();
         let mut st = self.manifest.genesis_state();
-        for env in &prefix {
+        // Borrow each stored envelope in canonical order. The transition only
+        // reads the block, so cloning the whole prefix (including every body,
+        // transaction, attestation and signature) into a temporary Vec added
+        // work proportional to retained history without changing the fold.
+        for (_, cid) in &self.chain[1..=cut] {
+            let env = self
+                .blocks
+                .get(cid.as_bytes())
+                .expect("canonical block stored");
             let envelope = ProposalEnvelope {
                 header: env.header.clone(),
                 proposer_sig: env.proposer_sig.clone(),
@@ -3509,9 +4693,9 @@ impl Engine {
     /// and re-refusing the same head on every tick, forever, even with no new
     /// bytes arriving. That much is unchanged from before this fix.
     ///
-    /// What changes is that the blocks are not simply dropped: they are
-    /// parked in [`Engine::parked_refused_finality`], bounded and FIFO, so a
-    /// re-offer of the SAME branch is recognised and refused at the door
+    /// What changes is that the blocks are not simply forgotten: their
+    /// identities are parked in [`Engine::parked_refused_finality`], bounded
+    /// and FIFO, so a re-offer of the SAME branch is recognised at the door
     /// (`ingest_one`) before any signature work — never re-authenticated,
     /// never re-run through a whole `advance` cycle, never silently
     /// re-refused in a way this node cannot distinguish from the first time.
@@ -3521,8 +4705,8 @@ impl Engine {
         if self.live {
             eprintln!(
                 "FINALITY_LATCH: refused a reorg below this node's finalized checkpoint \
-                 (height {floor}, {}); parking the {} conflicting block(s) (cap {}, {} \
-                 currently parked) instead of deleting them, so a re-offer is refused at \
+                 (height {floor}, {}); parking identities for {} conflicting block(s) \
+                 (cap {}, {} currently parked) instead of forgetting them, so a re-offer is refused at \
                  the door rather than re-judged from scratch. Refusals so far: {}. If this \
                  rewind is EXPECTED, restart with --allow-finality-rewind or \
                  BLOCH_ALLOW_FINALITY_REWIND=1.",
@@ -3533,17 +4717,52 @@ impl Engine {
                 self.finality_rewinds_refused,
             );
         }
+        // The FIFO remains the ordering authority; this temporary index only
+        // replaces a full identity scan for every block in a refused branch.
+        // Keep it synchronized with every pop and push so an ID evicted by an
+        // earlier block can legitimately reappear later in the same branch.
+        let mut parked_ids: BTreeSet<[u8; 32]> =
+            self.parked_refused_finality.iter().copied().collect();
         for env in branch {
             let id = *env.block_id().as_bytes();
             self.blocks.remove(&id);
-            if self.parked_refused_finality.iter().any(|(seen, _)| *seen == id) {
+            if parked_ids.contains(&id) {
                 continue;
             }
             while self.parked_refused_finality.len() >= MAX_PARKED_REFUSED_FINALITY {
-                self.parked_refused_finality.pop_front();
+                if let Some(oldest) = self.parked_refused_finality.pop_front() {
+                    parked_ids.remove(&oldest);
+                }
             }
-            self.parked_refused_finality.push_back((id, env.clone()));
+            self.parked_refused_finality.push_back(id);
+            parked_ids.insert(id);
         }
+        // Entries may have arrived before the parent was refused. Remove the
+        // entire bounded pending subtree, including reverse arrival order.
+        // Retain unrelated gaps; they still need normal synchronization.
+        let mut refused: BTreeSet<[u8; 32]> = branch.iter()
+            .map(|env| *env.block_id().as_bytes()).collect();
+        let mut pending: VecDeque<[u8; 32]> = refused.iter().copied().collect();
+        let mut children: BTreeMap<[u8; 32], Vec<[u8; 32]>> = BTreeMap::new();
+        for (id, env, _, _, _) in &self.orphans {
+            children.entry(env.header.parent).or_default().push(*id);
+        }
+        let mut doomed = BTreeSet::new();
+        while let Some(parent) = pending.pop_front() {
+            if let Some(descendants) = children.remove(&parent) {
+                for id in descendants {
+                    doomed.insert(id);
+                    if refused.insert(id) {
+                        pending.push_back(id);
+                    }
+                }
+            }
+        }
+        let before = self.orphans.len();
+        self.orphans.retain(|(id, _, _, _, _)| !doomed.contains(id));
+        self.orphans_evicted = self.orphans_evicted
+            .saturating_add(before.saturating_sub(self.orphans.len()) as u64);
+
     }
 
     /// Adopt `branch`, attached at canonical `ancestor`. True if adopted;
@@ -3592,6 +4811,7 @@ impl Engine {
         // Post-states of the branch, so the ring is refilled for the branch
         // that just won without recomputing anything.
         let mut applied: Vec<([u8; 32], Arc<CommittedState>)> = Vec::with_capacity(branch.len());
+        let mut included_txs = Vec::with_capacity(branch.len());
         for env in &branch {
             let envelope = ProposalEnvelope {
                 header: env.header.clone(),
@@ -3600,7 +4820,7 @@ impl Engine {
             let txs = match body_transactions(env) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("reorg candidate rejected at slot {}: {e}", env.header.slot);
+                    crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!("reorg candidate rejected at slot {}: {e}", env.header.slot));
                     return false;
                 }
             };
@@ -3610,21 +4830,19 @@ impl Engine {
                 .apply_block(pre, &envelope, &env.body.attestations, &txs)
             {
                 Ok(post) => {
-                    // R4 F-11: the whole branch is guaranteed adopted from
-                    // here — every remaining block in it either validates
-                    // too or this function returns `false` before any of
-                    // this is observable — so recording now, rather than in
-                    // a second pass after `self.chain` is rebuilt below, does
-                    // not risk indexing a branch that never lands.
-                    self.note_tx_slots(env.header.slot, &txs);
+                    // Keep candidate metadata private until every block passes.
+                    // A later refusal must not report these transactions as
+                    // included, reject their resubmission as duplicates, or
+                    // evict genuine canonical records from the bounded index.
+                    included_txs.push((env.header.slot, txs));
                     applied.push((*env.block_id().as_bytes(), Arc::new(post)));
                 }
                 Err(err) => {
-                    eprintln!(
+                    crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
                         "reorg candidate {} invalid at slot {}: {err:?}",
                         crate::codec::hex8(env.block_id().as_bytes()),
                         env.header.slot
-                    );
+                    ));
                     self.blocks.remove(env.block_id().as_bytes());
                     return false;
                 }
@@ -3642,6 +4860,13 @@ impl Engine {
             .collect();
         for (slot, txs) in stale {
             self.forget_tx_slots_if_stale(slot, &txs);
+        }
+        // Remove stale FIFO identities once for the whole losing tail. If an
+        // adopted transaction is reinserted while its old queue ID remains,
+        // that old ID could later evict the fresh canonical inclusion.
+        self.tx_slot_index_order.retain(|id| self.tx_slot_index.contains_key(id));
+        for (slot, txs) in included_txs {
+            self.note_tx_slots(slot, &txs);
         }
         let st = applied
             .last()
@@ -3683,8 +4908,8 @@ impl Engine {
                 .iter()
                 .map(|(_, id)| self.blocks.get(id.as_bytes()).expect("stored").clone())
                 .collect();
-            if let Err(e) = self.store.rewrite(&canonical_envs) {
-                eprintln!("FATAL: block log rewrite failed: {e}");
+            if let Err(e) = self.store.rewrite_async(canonical_envs) {
+                eprintln!("FATAL: could not start block log rewrite: {e}");
                 std::process::exit(1);
             }
             // Free for the same reason as `apply_canonical`'s: every block
@@ -3701,7 +4926,7 @@ impl Engine {
                     .unwrap_or_else(|| self.state.state_root()),
             };
             println!(
-                "REORG: adopted branch of {} blocks at ancestor {} (head slot {} -> {}), root {}",
+                "REORG: adopted branch of {} blocks at ancestor {} (head slot {} -> {}), root {}; durable log publication queued",
                 branch.len(),
                 crate::codec::hex8(&ancestor),
                 old_head,
@@ -3711,6 +4936,10 @@ impl Engine {
             // A reorg can move the finalized root at the anchor's epoch.
             self.enforce_ws_anchor();
         }
+        // The old queued reply could run only after `do_reorg` returned. Keep
+        // that visibility boundary: the asynchronous rewrite is at least
+        // accepted (or the process fail-stops) before readers see this head.
+        self.publish_block_count();
         true
     }
 
@@ -3745,7 +4974,12 @@ impl Engine {
         // `att_pool` is moved out for the call so the lookups below can borrow
         // the chain immutably; it is put back before returning.
         let mut pool = std::mem::take(&mut self.att_pool);
-        let decision = self.judge(&mut pool, att.clone(), e);
+        let decision = self.judge_from(
+            &mut pool,
+            att.clone(),
+            e,
+            origin.verification_source(),
+        );
         self.att_pool = pool;
         self.apply_decision(att, decision, &origin);
     }
@@ -3753,6 +4987,43 @@ impl Engine {
     /// One pass of the pure pipeline: window → checkpoint sanity → dedup and
     /// equivocation cap → committee membership → blocks known → signature.
     fn judge(&self, pool: &mut AttestationPool, att: Attestation, epoch: u64) -> GossipDecision {
+        self.judge_from(pool, att, epoch, None)
+    }
+
+    fn judge_from(
+        &self,
+        pool: &mut AttestationPool,
+        att: Attestation,
+        epoch: u64,
+        verification_source: Option<[u8; 32]>,
+    ) -> GossipDecision {
+        self.judge_admission(
+            pool,
+            AttestationAdmission::Fresh { att, verification_source },
+            epoch,
+        )
+    }
+
+    fn judge_pending(
+        &self,
+        pool: &mut AttestationPool,
+        pending: AuthenticatedPendingAttestation,
+        epoch: u64,
+    ) -> GossipDecision {
+        self.judge_admission(pool, AttestationAdmission::Pending(pending), epoch)
+    }
+
+    fn judge_admission(
+        &self,
+        pool: &mut AttestationPool,
+        admission: AttestationAdmission,
+        epoch: u64,
+    ) -> GossipDecision {
+        // A forward projection cannot reconstruct a historical roster. Never
+        // silently judge an older duty against the current registry.
+        if epoch < epoch_of(self.state.slot()) {
+            return GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Unjudgeable);
+        }
         let rolled = self.rolled_to(epoch);
         let roster = rolled.active_validators();
         // THE SEED COMES FROM THE ATTESTATION'S BRANCH, not from this node's
@@ -3787,9 +5058,10 @@ impl Engine {
         // every boundary vote.
         let known_root =
             |root: &[u8; 32]| self.canonical.contains(root) || self.blocks.contains_key(root);
-        let seed = match self.seed_for_attestation(&att.data.target_root, epoch) {
+        let target_root = admission.attestation().data.target_root;
+        let seed = match self.seed_for_attestation(&target_root, epoch) {
             Some(seed) => Some(seed),
-            None if !known_root(&att.data.target_root) => None,
+            None if !known_root(&target_root) => None,
             None => {
                 return GossipDecision::Ignore(
                     bloch_pos_committee::gossip::IgnoreReason::Unjudgeable,
@@ -3818,7 +5090,32 @@ impl Engine {
         // therefore `committees_at`. Membership and key must come from one
         // snapshot; the old code took membership from here and the key from a
         // boot-time genesis table, which is the inconsistency being removed.
-        pool.process(att, self.wall_slot, &committees_at, &known, &self.verifier, &*rolled)
+        let verifier = self.gossip_verifier.budgeted_for_source(
+            self.wall_slot(),
+            GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+            admission.verification_source(),
+            GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+        );
+        let decision = match admission {
+            AttestationAdmission::Fresh { att, verification_source } => pool.process_from_source(
+                att,
+                self.wall_slot,
+                &committees_at,
+                &known,
+                &verifier,
+                &*rolled,
+                verification_source,
+            ),
+            AttestationAdmission::Pending(pending) => pool.process_authenticated_pending(
+                pending,
+                self.wall_slot,
+                &committees_at,
+                &known,
+                &verifier,
+                &*rolled,
+            ),
+        };
+        locally_limited_gossip_decision(decision, verifier.limited())
     }
 
     fn apply_decision(&mut self, att: Attestation, decision: GossipDecision, origin: &Origin) {
@@ -3843,63 +5140,50 @@ impl Engine {
                 self.net.report(origin, Verdict::Ignore);
             }
             GossipDecision::Reject(reason) => {
-                eprintln!("attestation from v{} REJECTED: {reason:?}", att.validator);
+                crate::net::rejection_log::emit(crate::net::rejection_log::Class::Attestation, || eprintln!("attestation from v{} REJECTED: {reason:?}", att.validator));
                 self.net.report(origin, Verdict::Reject);
             }
         }
     }
 
-    /// A block landed: replay every attestation that was waiting on it.
-    ///
-    /// Called after the block is queryable, which is what
-    /// [`AttestationPool::on_block`] requires — earlier and the waiters would
-    /// simply be re-held. Released Accepts are relayed here, since they were
-    /// deliberately not relayed while parked.
-    fn release_held(&mut self, root: [u8; 32]) {
-        if self.att_pool.pending_len() == 0 {
+    /// A block landed: queue its authenticated waiters for bounded replay.
+    fn schedule_held_release(&mut self, root: [u8; 32]) {
+        if self.att_pool.pending_for_root(&root) == 0
+            || self.held_release_roots.contains(&root)
+        {
             return;
         }
-        let mut pool = std::mem::take(&mut self.att_pool);
-        let released = {
-            let rolled_epoch = epoch_of(self.wall_slot);
-            let rolled = self.rolled_to(rolled_epoch);
-            let roster = rolled.active_validators();
-            // Anchored to the BLOCK THAT JUST ARRIVED, not to this node's
-            // head. Everything released by this call was parked waiting for
-            // `root`, so `root` is on the released attestation's own branch
-            // (it is either its head or its target, and the target is an
-            // ancestor of the head), and the boundary mix read off `root`'s
-            // ancestry is the one that branch's transition will use. Judging
-            // the release against this node's head is the same defect the
-            // ingest path was fixed for on 2026-08-24, left standing on the
-            // path that decides whether a parked vote is ever counted.
-            //
-            // KNOWN GAP, deliberately not papered over: `on_block` re-runs the
-            // whole pipeline through ONE `CommitteeLookup` closure that sees
-            // only a slot, so a single seed serves every attestation released
-            // in this batch. That is right whenever they are on one branch,
-            // which is the case that actually occurs (they were all waiting on
-            // the same root); it is wrong if a future caller batches roots.
-            // Fixing it properly means letting the lookup see the attestation,
-            // which is a `gossip.rs` signature change.
-            let seed = self
-                .seed_for_attestation(&root, rolled_epoch)
-                .unwrap_or_else(|| Self::seed_for(&rolled, rolled_epoch));
-            let committees_at = |slot: u64| committees::committee_for_slot(&seed, slot, &roster);
-            let known = |r: &[u8; 32]| self.canonical.contains(r) || self.blocks.contains_key(r);
-            pool.on_block(
-                &root,
-                self.wall_slot,
-                &committees_at,
-                &known,
-                &self.verifier,
-                // Same snapshot `roster` and the seed came from.
-                &*rolled,
-            )
+        self.held_release_roots.push_back(root);
+    }
+
+    /// Replay one FIFO entry for the earliest landed root. Returns whether a
+    /// ready tail remains, so the slot loop can gate duties and immediately
+    /// provide the next slice a fresh control turn.
+    fn release_held_turn(&mut self) -> bool {
+        let Some(root) = self.held_release_roots.front().copied() else {
+            return false;
         };
+        let mut pool = std::mem::take(&mut self.att_pool);
+        let (waiting, root_remains) = pool.take_authenticated_waiting_on_limit(
+            &root,
+            HELD_ATTESTATIONS_PER_TURN,
+        );
+        let released: Vec<_> = waiting.into_iter().map(|pending| {
+            let att = pending.attestation().clone();
+            let epoch = epoch_of(att.data.slot);
+            let decision = self.judge_pending(&mut pool, pending, epoch);
+            (att, decision)
+        }).collect();
         self.att_pool = pool;
+        if !root_remains {
+            self.held_release_roots.pop_front();
+        }
         for (att, decision) in released {
-            if let GossipDecision::Accept { .. } = decision {
+            if let GossipDecision::Accept { slashing_candidate } = decision {
+                if let Some(evidence) = slashing_candidate {
+                    self.report_equivocation((*evidence).into());
+                }
+                self.note_possible_doppelganger(att.validator, att.data.slot);
                 let frame = net::att_frame(&att);
                 self.pool
                     .insert((att.validator, att.data.signing_root()), att);
@@ -3911,14 +5195,15 @@ impl Engine {
                 }
             }
         }
+        !self.held_release_roots.is_empty()
     }
 
     // ── RPC service ─────────────────────────────────────────────────────────
     //
-    // Answered on the consensus thread, between duties. Every method reads the
-    // committed state this thread owns, so no query can observe a half-applied
-    // block and no reader can be served a stale copy. The formatting lives in
-    // `rpc.rs` as free functions of their inputs; what is here is only the
+    // Engine fallbacks are answered on the consensus thread, between duties.
+    // Published-head and published-block-count routes bypass this function;
+    // each sees one complete committed generation. The formatting lives in
+    // `rpc.rs` as free functions of its inputs; what is here is only the
     // lookup — which block, which record, which outputs.
 
     /// The slot the wall clock is in, by the manifest's own cadence.
@@ -3947,18 +5232,30 @@ impl Engine {
     /// Canonical height of a block id — its position on the canonical chain,
     /// genesis at 0. `None` for a block this node has stored but not adopted.
     fn height_of(&self, id: &[u8; 32]) -> Option<u64> {
-        self.chain
-            .iter()
-            .position(|(_, cid)| cid.as_bytes() == id)
-            .map(|p| p as u64)
+        if !self.canonical.contains(id) { return None; }
+        if self.chain.first().is_some_and(|(_, root)| root.as_bytes() == id) {
+            return Some(0);
+        }
+        // Canonical envelopes survive finalized-floor pruning. Their slots
+        // locate the authoritative chain position without another mutable index.
+        if let Some(envelope) = self.blocks.get(id) {
+            if let Ok(position) = self.chain.binary_search_by_key(&envelope.header.slot, |(slot, _)| *slot) {
+                if self.chain.get(position).is_some_and(|(_, root)| root.as_bytes() == id) {
+                    return Some(position as u64);
+                }
+            }
+        }
+        // Preserve canonical lookup if a future retention policy omits an old
+        // envelope; missing optional storage must not erase canonical history.
+        self.chain.iter().position(|(_, root)| root.as_bytes() == id).map(|p| p as u64)
     }
 
     /// Slot of a canonical block named by root, if this node has it canonical.
     fn slot_of_canonical_root(&self, root: &[u8; 32]) -> Option<u64> {
-        self.chain
-            .iter()
-            .find(|(_, id)| id.as_bytes() == root)
-            .map(|(s, _)| *s)
+        self.height_of(root)
+            .and_then(|height| usize::try_from(height).ok())
+            .and_then(|position| self.chain.get(position))
+            .map(|(slot, _)| *slot)
     }
 
     /// Where a block stands against this node's own checkpoints.
@@ -4013,12 +5310,15 @@ impl Engine {
         }
     }
 
-    /// Look up one block by id, genesis included.
-    fn envelope_by_id(&self, id: &[u8; 32]) -> Option<BlockEnvelope> {
+    /// Look up one block by id, genesis included. Genesis has no stored
+    /// envelope and remains synthesized; every retained block is immutable
+    /// here, so borrow it rather than copying its potentially large body just
+    /// to render header fields and body counts.
+    fn envelope_by_id<'a>(&'a self, id: &[u8; 32]) -> Option<Cow<'a, BlockEnvelope>> {
         if self.chain[0].1.as_bytes() == id {
-            return Some(self.genesis_envelope());
+            return Some(Cow::Owned(self.genesis_envelope()));
         }
-        self.blocks.get(id).cloned()
+        self.blocks.get(id).map(Cow::Borrowed)
     }
 
     fn block_reply(&self, env: &BlockEnvelope) -> Json {
@@ -4033,6 +5333,14 @@ impl Engine {
     }
 
     fn serve_rpc(&mut self, req: RpcRequest) -> RpcResult {
+        self.serve_rpc_from(req, None)
+    }
+
+    fn serve_rpc_from(
+        &mut self,
+        req: RpcRequest,
+        verification_source: Option<[u8; 32]>,
+    ) -> RpcResult {
         match req {
             RpcRequest::ChainInfo => Ok(rpc::chain_info_json(
                 &self.state,
@@ -4051,19 +5359,11 @@ impl Engine {
                 self.net.peer_counts(),
             )),
 
-            RpcRequest::BlockCount => {
-                let fin = self.state.finality();
-                Ok(rpc::block_count_json(
-                    self.head_height(),
-                    self.head_slot_now(),
-                    self.finalized_height(),
-                    fin.justified.epoch,
-                    fin.finalized.epoch,
-                ))
-            }
+            RpcRequest::BlockCount => Ok(self.block_count_reply()),
 
             RpcRequest::BlockBySlot(slot) => {
-                let Some((_, id)) = self.chain.iter().find(|(s, _)| *s == slot) else {
+                let Some((_, id)) = self.chain.binary_search_by_key(&slot, |(s, _)| *s)
+                    .ok().and_then(|position| self.chain.get(position)) else {
                     // A slot with no canonical block is the ordinary PoS case —
                     // a proposer missed its turn — and is reported as its own
                     // code so a scanner advances instead of alerting.
@@ -4083,7 +5383,7 @@ impl Engine {
                         format!("slot {slot} names a block this node no longer stores"),
                     )
                 })?;
-                Ok(self.block_reply(&env))
+                Ok(self.block_reply(env.as_ref()))
             }
 
             RpcRequest::BlockById(id) => {
@@ -4096,45 +5396,14 @@ impl Engine {
                         ),
                     )
                 })?;
-                Ok(self.block_reply(&env))
+                Ok(self.block_reply(env.as_ref()))
             }
 
-            RpcRequest::ValidatorByKey(hash) => {
-                let index = self.state.validator_index_by_hash(&hash).ok_or_else(||
-                    RpcError::new(rpc::VALIDATOR_NOT_FOUND, "validator public-key hash is not registered"))?;
-                self.serve_rpc(RpcRequest::Validator(index))
-            }
+            RpcRequest::ValidatorByKey(hash) => rpc::validator_by_key_json(&self.state, &hash),
             RpcRequest::ValidatorAdmission => Ok(rpc::validator_admission_json(&self.state)),
-            RpcRequest::Validator(index) => {
-                let rec = self.state.validator_record(index).ok_or_else(|| {
-                    RpcError::new(
-                        rpc::VALIDATOR_NOT_FOUND,
-                        format!(
-                            "validator {index} is not in the committed registry ({} registered)",
-                            self.state.validator_count()
-                        ),
-                    )
-                })?;
-                let effective = self
-                    .state
-                    .active_validators()
-                    .iter()
-                    .find(|v| v.index == index)
-                    .map(|v| v.effective_stake);
-                Ok(rpc::validator_lifecycle_json(&self.state, &rec, effective))
-            }
+            RpcRequest::Validator(index) => rpc::validator_record_json(&self.state, index),
 
-            RpcRequest::ValidatorCount => Ok(Json::obj(vec![
-                ("total", Json::u(self.state.validator_count() as u64)),
-                (
-                    "active",
-                    Json::u(self.state.active_validators().len() as u64),
-                ),
-                (
-                    "total_active_stake_sat",
-                    Json::sat(self.state.total_active_stake_sat()),
-                ),
-            ])),
+            RpcRequest::ValidatorCount => Ok(rpc::validator_count_json(&self.state)),
 
             RpcRequest::Balance(script_hash) => Ok(rpc::balance_json(&self.state, &script_hash)),
 
@@ -4144,75 +5413,100 @@ impl Engine {
 
             RpcRequest::TxOut { txid, vout } => Ok(rpc::txout_json(&self.state, &txid, vout)),
 
-            RpcRequest::SendRawTransaction(tx) => match self.on_transaction(tx.clone()) {
-                Ok(outcome) => Ok(rpc::submitted_json(&tx, outcome)),
-                // The three refusals are not the same fact and must not
-                // carry the same advice, and each has its own code:
-                // MEMPOOL_FULL (-32003), TX_REFUSED_RETRYABLE (-32009),
-                // TX_REFUSED (-32008). "Retry later" is correct for a full
-                // mempool and actively harmful for a refused transaction:
-                // the founder's consolidation sweep submits hundreds of
-                // thousands of transfers through this method, and an
-                // operator told to retry bytes that can NEVER be admitted
-                // chases capacity while the real fault — an unverifiable
-                // signature, an empty witness table — goes unread. Before
-                // this, every refusal returned MEMPOOL_FULL with the words
-                // "the transaction was not judged invalid" appended, which
-                // for an invalid transaction was simply false.
-                Err(Refusal::AtCapacity) => Err(RpcError::new(
-                    rpc::MEMPOOL_FULL,
-                    format!(
-                        "mempool is at capacity ({MEMPOOL_MAX} entries); retry later — \
-                         the transaction was not judged invalid"
-                    ),
-                )),
-                //
-                // And the two REFUSALS are not the same fact either, which is
-                // the split this arm exists for. `PreviouslyRefused` is a
-                // verdict on the bytes AGAINST A STATE: the bar lifts by
-                // itself after REJECTION_TTL_SLOTS, so the correct advice is
-                // "resubmit after slot N". `Invalid` is a verdict on the bytes
-                // and the correct advice is "stop". They shared TX_REFUSED
-                // until now, distinguishable only by reading the English —
-                // and the `Refusal` enum's own doc says a caller that must act
-                // on the difference has to match the variant, which is exactly
-                // what this boundary was throwing away. An exchange following
-                // our published "-32008 means never resubmit" guidance
-                // permanently abandoned transactions this node would have
-                // taken ~64 minutes later.
-                //
-                // The deadline goes in `error.data.until_slot` as well as in
-                // the sentence: the codes are stable, the wording is not.
-                Err(Refusal::PreviouslyRefused { until_slot }) => {
-                    Err(RpcError::tx_refused_retryable(
-                        until_slot,
+            RpcRequest::SendRawTransaction(tx) => {
+                let canonical = tx.canonical_bytes();
+                match self.on_transaction_from_canonical(
+                    tx,
+                    canonical,
+                    verification_source,
+                    rpc::PreparedSubmission::new,
+                ) {
+                    Ok((outcome, receipt)) => Ok(receipt.into_json(outcome)),
+                    // The refusals are not the same fact and must not
+                    // carry the same advice, and each has its own code:
+                    // MEMPOOL_FULL (-32003), TX_REFUSED_RETRYABLE (-32009),
+                    // TX_REFUSED (-32008). "Retry later" is correct for a full
+                    // mempool and actively harmful for a refused transaction:
+                    // the founder's consolidation sweep submits hundreds of
+                    // thousands of transfers through this method, and an
+                    // operator told to retry bytes that can NEVER be admitted
+                    // chases capacity while the real fault — an unverifiable
+                    // signature, an empty witness table — goes unread. Before
+                    // this, every refusal returned MEMPOOL_FULL with the words
+                    // "the transaction was not judged invalid" appended, which
+                    // for an invalid transaction was simply false.
+                    Err(Refusal::AtCapacity) => Err(RpcError::new(
+                        rpc::MEMPOOL_FULL,
                         format!(
-                            "this node's proposer already had the transition refuse this \
+                            "mempool is at capacity ({MEMPOOL_MAX} entries); retry later — \
+                         the transaction was not judged invalid"
+                        ),
+                    )),
+                    //
+                    // And the two REFUSALS are not the same fact either, which is
+                    // the split this arm exists for. `PreviouslyRefused` is a
+                    // verdict on the bytes AGAINST A STATE: the bar lifts by
+                    // itself after REJECTION_TTL_SLOTS, so the correct advice is
+                    // "resubmit after slot N". `Invalid` is a verdict on the bytes
+                    // and the correct advice is "stop". They shared TX_REFUSED
+                    // until now, distinguishable only by reading the English —
+                    // and the `Refusal` enum's own doc says a caller that must act
+                    // on the difference has to match the variant, which is exactly
+                    // what this boundary was throwing away. An exchange following
+                    // our published "-32008 means never resubmit" guidance
+                    // permanently abandoned transactions this node would have
+                    // taken ~64 minutes later.
+                    //
+                    // The deadline goes in `error.data.until_slot` as well as in
+                    // the sentence: the codes are stable, the wording is not.
+                    Err(Refusal::PreviouslyRefused { until_slot }) => {
+                        Err(RpcError::tx_refused_retryable(
+                            until_slot,
+                            format!(
+                                "this node's proposer already had the transition refuse this \
                              transaction, so it is barred until slot {until_slot}. The usual \
                              cause is that it spends an output this chain does not have — \
                              either it was built against a node on a different branch, or its \
                              parent transaction has not landed yet. This bar lifts on its own: \
                              resubmit the same bytes from slot {until_slot}, or sooner once \
                              the parent confirms. See `error.data.until_slot`."
-                        ),
-                    ))
-                }
-                Err(Refusal::Invalid(why)) => Err(RpcError::new(
-                    rpc::TX_REFUSED,
-                    format!("{why} — this transaction cannot be admitted; retrying \
+                            ),
+                        ))
+                    }
+                    Err(Refusal::StateDependent(why)) => Err(RpcError::tx_refused_retryable(
+                        self.wall_slot().saturating_add(1), why,
+                    )),
+                    Err(Refusal::Invalid(why)) => Err(RpcError::new(
+                        rpc::TX_REFUSED,
+                        format!("{why} — this transaction cannot be admitted; retrying \
                              the same bytes will not help"),
-                )),
-                // R7 M6: a third, distinct shape — see `rpc::TX_REFUSED_SOURCE_CAP`'s
-                // own doc for why this is neither `MEMPOOL_FULL` nor `TX_REFUSED`.
-                Err(Refusal::TooManyFromSource) => Err(RpcError::new(
-                    rpc::TX_REFUSED_SOURCE_CAP,
-                    format!(
-                        "{} pending transactions already sharing this source \
+                    )),
+                    // R7 M6: a third, distinct shape — see `rpc::TX_REFUSED_SOURCE_CAP`'s
+                    // own doc for why this is neither `MEMPOOL_FULL` nor `TX_REFUSED`.
+                    Err(Refusal::TooManyFromSource) => Err(RpcError::new(
+                        rpc::TX_REFUSED_SOURCE_CAP,
+                        format!(
+                            "{} pending transactions already sharing this source \
                          (MEMPOOL_MAX_PER_SOURCE); wait for one to clear before \
                          submitting another",
-                        MEMPOOL_MAX_PER_SOURCE,
-                    ),
-                )),
+                            MEMPOOL_MAX_PER_SOURCE,
+                        ),
+                    )),
+                    Err(Refusal::LifecycleVerificationLimited { until_slot }) => {
+                        Err(RpcError::tx_refused_retryable(
+                            until_slot,
+                            format!("lifecycle authorization verification allowance is exhausted for \
+                                 this slot; retry from slot {until_slot}"),
+                        ))
+                    }
+                    Err(Refusal::GossipVerificationLimited { until_slot }) => {
+                        Err(RpcError::tx_refused_retryable(
+                            until_slot,
+                            format!("network admission verification allowance is exhausted for \
+                                 this slot; retry from slot {until_slot}"),
+                        ))
+                    }
+                }
             },
 
             // Identity of the binary, not of the chain: no state read, no
@@ -4221,7 +5515,7 @@ impl Engine {
             RpcRequest::MempoolInfo => Ok(rpc::mempool_info_json(
                 self.mempool.len(),
                 MEMPOOL_MAX,
-                self.mempool.keys().map(Vec::len).sum(),
+                self.mempool.bytes(),
                 self.state.next_base_fee(),
                 self.rejected.len(),
                 self.rejected_hits,
@@ -4230,19 +5524,7 @@ impl Engine {
             )),
 
             // R4 F-11.
-            RpcRequest::Validators => {
-                let active = self.state.active_validators();
-                let current_epoch = epoch_of(self.state.slot());
-                let entries: Vec<(ValidatorRecord, Option<u64>)> = (0..self.state.validator_count()
-                    as u32)
-                    .filter_map(|i| {
-                        let rec = self.state.validator_record(i)?;
-                        let effective = active.iter().find(|v| v.index == i).map(|v| v.effective_stake);
-                        Some((rec, effective))
-                    })
-                    .collect();
-                Ok(rpc::validators_json(&entries, current_epoch))
-            }
+            RpcRequest::Validators => Ok(rpc::validator_registry_json(&self.state)),
 
             RpcRequest::TxStatus(txid) => Ok(rpc::tx_status_json(self.tx_status(&txid))),
         }
@@ -4290,9 +5572,8 @@ pub(crate) enum KeystoreIdentity {
 /// **That fix is now made, in [`check_registry_identity`] below, and this
 /// function is no longer authoritative.** It survives as a *fast pre-pass*
 /// only: the registry is not reachable here (the store is not open, the log
-/// is not read, and `CommittedState` has no on-disk form — boot is a full
-/// replay), so the authoritative check cannot run until replay finishes,
-/// which on the live fleet is ~21 minutes of silence. Keeping a cheap
+/// and neither replay nor the local restart cache has reconstructed the
+/// committed registry), so the authoritative check waits for state recovery. Keeping a cheap
 /// manifest look first means a genesis operator who mistyped a seed still
 /// learns it in a second instead of after a replay.
 ///
@@ -4360,9 +5641,9 @@ pub(crate) enum RegistryIdentity {
 ///
 /// # Why this had to move past replay
 ///
-/// `CommittedState` has no serialized form; the node persists its *inputs*
-/// (manifest digest + every block envelope) and rebuilds state by replaying
-/// them. So at the point `run` loads the keystore there is no registry to
+/// The committed registry is reconstructed by full replay or a compatible
+/// local cache plus verified tail replay. At the point `run` loads the
+/// keystore neither recovery path has run, so there is no registry to
 /// consult — no `Store`, no log, no `Engine`. The only registry that exists
 /// before replay is the manifest's, i.e. the height-0 one, which by
 /// construction cannot contain anyone added since height 0. Any gate placed
@@ -4399,26 +5680,6 @@ pub(crate) enum RegistryIdentity {
 /// its own. So the duty path re-checks the *key*, not just the index, every
 /// time it is about to sign: see `Engine::duty_index`.
 pub(crate) fn check_registry_identity(
-    state: &dyn StateReader,
-    index: u32,
-    pubkey: &[u8],
-    randao_seed: [u8; 32],
-) -> RegistryIdentity {
-    let Some(rec) = state.validator_record(index) else {
-        return RegistryIdentity::PendingActivation;
-    };
-    if rec.pubkey != pubkey {
-        return RegistryIdentity::WrongValidator;
-    }
-    if RandaoChain::generate(randao_seed).commitment() != rec.randao_commitment {
-        return RegistryIdentity::RandaoMismatch;
-    }
-    RegistryIdentity::Active
-}
-
-/// Start the devnet TCP mesh. Called by the `Devnet` and `Dual` arms of
-/// [`run`] with identical arguments.
-fn check_joining_registry_identity(
     state: &CommittedState, index: u32, pubkey: &[u8], randao_seed: [u8; 32],
 ) -> RegistryIdentity {
     let Some(rec) = state.validator_record(index) else { return RegistryIdentity::PendingActivation };
@@ -4463,6 +5724,7 @@ fn start_libp2p(
     cfg: &Config,
     net_tx: mpsc::Sender<NetEvent>,
     head_slot: &Arc<AtomicU64>,
+    inflight: &Arc<net::QueueBudget>,
 ) -> io::Result<crate::p2p::Handle> {
     let parse = |s: &str, what: &str| -> io::Result<crate::p2p::Multiaddr> {
         s.parse().map_err(|e| {
@@ -4490,9 +5752,58 @@ fn start_libp2p(
         },
         net_tx,
         head_slot.clone(),
+        inflight.clone(),
     )?;
     println!("p2p: node identity {}", handle.peer_id);
     Ok(handle)
+}
+
+/// Parse a boot-time boolean without the dangerous "presence means true"
+/// convention. Safety overrides must not arm because an orchestrator rendered
+/// `NAME=0`, nor silently fall back because it rendered a typo.
+fn parse_boot_switch(name: &str, value: Option<std::ffi::OsString>) -> io::Result<bool> {
+    match value {
+        None => Ok(false),
+        Some(value) => match value.to_str() {
+            Some("1" | "true") => Ok(true),
+            Some("0" | "false") => Ok(false),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be exactly 0, 1, false or true"),
+            )),
+        },
+    }
+}
+
+#[cfg(test)]
+mod boot_switch_tests {
+    use super::parse_boot_switch;
+    use std::ffi::OsString;
+
+    #[test]
+    fn absent_and_explicit_false_switches_stay_off() {
+        assert!(!parse_boot_switch("TEST_SWITCH", None).unwrap());
+        for value in ["0", "false"] {
+            assert!(!parse_boot_switch("TEST_SWITCH", Some(OsString::from(value))).unwrap());
+        }
+    }
+
+    #[test]
+    fn only_explicit_true_switches_arm() {
+        for value in ["1", "true"] {
+            assert!(parse_boot_switch("TEST_SWITCH", Some(OsString::from(value))).unwrap());
+        }
+    }
+
+    #[test]
+    fn ambiguous_switch_values_fail_closed() {
+        for value in ["", "TRUE", "yes", "2", " true"] {
+            let error = parse_boot_switch("TEST_SWITCH", Some(OsString::from(value)))
+                .expect_err("ambiguous boot switch must be rejected");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("TEST_SWITCH"));
+        }
+    }
 }
 
 pub fn run(cfg: Config) -> io::Result<()> {
@@ -4675,7 +5986,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         crate::codec::hex8(&digest),
     );
 
-    let logged = store.read_all()?;
+    let mut logged = store.read_all()?;
     let head_slot = Arc::new(AtomicU64::new(0));
     // Network events queued but not yet handled. The transport reads it to
     // decide when to shed rather than queue — see `net::send_to_engine`. It is
@@ -4728,7 +6039,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 if !inflight.try_reserve(&ev) {
                     continue; // shed and counted; the transport stays healthy
                 }
-                let size = net::queued_bytes(&ev);
+                let size = net::charged_bytes(&ev);
                 if tx.send(EngineEvent::Net(ev)).is_err() {
                     inflight.release_raw(size);
                     return; // engine gone; nothing left to deliver to
@@ -4744,7 +6055,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         Transport::Devnet => {
             net::Net::Devnet(start_devnet(&cfg, tx.clone(), &head_slot, &inflight)?)
         }
-        Transport::Libp2p => net::Net::Libp2p(start_libp2p(&cfg, net_tx, &head_slot)?),
+        Transport::Libp2p => net::Net::Libp2p(start_libp2p(&cfg, net_tx, &head_slot, &inflight)?),
         Transport::Dual => {
             // Devnet FIRST. Binding its `TcpListener` is the cheap synchronous
             // failure — a port already in use — and a node that cannot bind
@@ -4752,7 +6063,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             // that looks like it is bridging two populations and is not.
             // `?` on either line aborts the whole start.
             let mesh = start_devnet(&cfg, tx.clone(), &head_slot, &inflight)?;
-            let handle = start_libp2p(&cfg, net_tx, &head_slot)?;
+            let handle = start_libp2p(&cfg, net_tx, &head_slot, &inflight)?;
             net::Net::Both(mesh, handle)
         }
     };
@@ -4786,8 +6097,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // it might. Logged loudly HERE too (not only when it fires): an operator
     // who set this should see it confirmed immediately, not only discover it
     // was armed the first time a rewind actually happens.
-    let allow_finality_rewind = std::env::var_os("BLOCH_ALLOW_FINALITY_REWIND")
-        .is_some_and(|v| v == "1" || v == "true");
+    let allow_finality_rewind = parse_boot_switch(
+        "BLOCH_ALLOW_FINALITY_REWIND",
+        std::env::var_os("BLOCH_ALLOW_FINALITY_REWIND"),
+    )?;
     if allow_finality_rewind {
         println!(
             "FINALITY_LATCH: BLOCH_ALLOW_FINALITY_REWIND is set — this node will ALLOW a \
@@ -4799,12 +6112,16 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
     // Read the opt-out once, but arm observation only after replay and the
     // weak-subjectivity gate. Time spent reading disk is not live observation.
-    let no_doppelganger_check = std::env::var_os("BLOCH_NO_DOPPELGANGER").is_some();
+    let no_doppelganger_check = parse_boot_switch(
+        "BLOCH_NO_DOPPELGANGER",
+        std::env::var_os("BLOCH_NO_DOPPELGANGER"),
+    )?;
 
     let mut engine = Engine {
         state: StateCell::new(genesis_state),
         tr: Transition::new(verifier.clone()),
         tr_probe: Transition::new(ProbeVerifier),
+        gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
         verifier,
         keys,
         blocks: BTreeMap::new(),
@@ -4814,12 +6131,16 @@ pub fn run(cfg: Config) -> io::Result<()> {
         recent_states: VecDeque::new(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
+        held_release_roots: VecDeque::new(),
         wall_slot: 0,
-        mempool: BTreeMap::new(),
+        mempool: admission::Mempool::default(),
+            future_blocks: BTreeMap::new(),
         mempool_admitted_at: BTreeMap::new(),
         mempool_expired: 0,
         mempool_evicted_low_fee: 0,
         rejected: BTreeMap::new(),
+        rejected_bytes: 0,
+        rejected_expiry_hint: None,
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
         mempool_swept_epoch: u64::MAX,
@@ -4827,12 +6148,16 @@ pub fn run(cfg: Config) -> io::Result<()> {
         slashprot,
         net,
         head_slot,
+        block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
         live: false,
         needs_sync: false,
         orphans: VecDeque::new(),
+        deferred_orphans: VecDeque::new(),
         orphans_evicted: 0,
         orphans_admitted: 0,
         blocks_pruned: 0,
+        proposal_admission_seen: BTreeMap::new(),
+        proposal_admission_counts: BTreeMap::new(),
         rejected_unsigned: 0,
         rejected_future: 0,
         last_applied_ms: now_ms(),
@@ -4849,24 +6174,41 @@ pub fn run(cfg: Config) -> io::Result<()> {
         tx_slot_index_order: VecDeque::new(),
         doppelganger_observe_until: None,
         doppelganger_halted: false,
-        genesis_validator_count: manifest.validators.len() as u32,
+        genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
         manifest,
     };
 
-    // ── Replay: restart returns to the same state, by re-running the same
-    // transition over the same inputs. ──
-    //
-    // Progress is reported while this runs, and that is not a nicety. Replay
-    // re-applies the whole chain, and every block re-derives the state root
-    // over the full committed state — 0.59s per block at Genesis-4's carryover
-    // size, so a 12,200-block chain is hours. Throughout, the RPC does not
-    // answer and the node logs nothing, which makes "still working" and
-    // "wedged" indistinguishable from the outside. That ambiguity cost real
-    // hours of investigation on 2026-08-21: a validator was down and there was
-    // no way to tell whether it was progressing, stuck, or minutes from
-    // finishing. An operator needs a rate and a remainder to decide whether to
-    // wait or intervene, and neither existed.
+    // Recovery uses a build-bound cache of this node's own committed state
+    // when available, then verifies the remaining log tail normally. A missing
+    // or incompatible cache retains full replay as the reference path. The
+    // historical 0.59 s/block estimate predates the incremental eUTXO tree and
+    // must not be treated as a restart SLA for this binary.
+    let recovery_started = std::time::Instant::now();
+    let force_replay = parse_boot_switch(
+        "BLOCH_REPLAY_FROM_GENESIS",
+        std::env::var_os("BLOCH_REPLAY_FROM_GENESIS"),
+    )?;
+    let require_cache = parse_boot_switch(
+        "BLOCH_REQUIRE_STATE_CACHE",
+        std::env::var_os("BLOCH_REQUIRE_STATE_CACHE"),
+    )?;
+    if force_replay && require_cache {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--replay-from-genesis conflicts with --require-state-cache"));
+    }
+    let skipped = if force_replay { 0 } else {
+        match engine.restore_local_cache(&mut logged) {
+            Ok(n) => n,
+            Err(e) if require_cache => return Err(e),
+            Err(e) => { println!("state-cache: unavailable ({e}); replaying from genesis"); 0 }
+        }
+    };
     let n_logged = logged.len();
+    let replay_limit = match std::env::var("BLOCH_MAX_REPLAY_BLOCKS") {
+        Ok(value) => Some(value.parse::<usize>().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid --max-replay-blocks"))?),
+        Err(_) if require_cache => Some(2 * local_cache::INTERVAL - 1),
+        Err(_) => None,
+    };
+    local_cache::check_replay_budget(n_logged, replay_limit)?;
     if n_logged > 0 {
         println!(
             "replaying {n_logged} blocks from the log — the RPC stays silent until this finishes"
@@ -4878,7 +6220,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // `ingest_replay`, not `ingest`: these blocks are this node's own
         // committed log, and must not be judged against a wall clock the log
         // knows nothing about. See `Engine::ingest_replay`.
-        engine.ingest_replay(env);
+        let expected_id = env.block_id();
+        if !engine.ingest_replay(env) || engine.state.head() != expected_id {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "durable block log failed consensus replay; refusing to serve a partial head"));
+        }
         // Time-based, not every-N-blocks: block cost varies by an order of
         // magnitude with how many transactions a block carries, so a fixed
         // count reports in bursts and then goes quiet exactly when the work is
@@ -4898,6 +6244,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
             last_report = std::time::Instant::now();
         }
     }
+    println!("recovery: mode={} skipped_blocks={skipped} replayed_blocks={n_logged} elapsed_ms={}",
+        if skipped > 0 { "local-cache" } else { "full-replay" }, recovery_started.elapsed().as_millis());
     engine.live = true;
     if n_logged > 0 {
         println!(
@@ -4925,14 +6273,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
             engine.state.validator_index_by_pubkey(&keys.pubkey)
         } else { Some(keys.index) };
         let identity = match registered_index {
-            Some(index) => check_joining_registry_identity(&engine.state, index, &keys.pubkey,
+            Some(index) => check_registry_identity(&engine.state, index, &keys.pubkey,
                 keys.randao_seed_for(&engine.state.admission_network_domain().unwrap_or([0; 32]),
                     engine.state.validator_randao_generation(index))),
             None => RegistryIdentity::PendingActivation,
         };
         match identity {
             RegistryIdentity::Active => {
-                crate::metrics::NodeMetrics::set(&crate::metrics::NODE.validator_active, 1);
                 println!(
                     "validator {} is registered and its key matches the committed \
                      registry at head slot {}",
@@ -4941,7 +6288,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 );
             }
             RegistryIdentity::Inactive => {
-                crate::metrics::NodeMetrics::set(&crate::metrics::NODE.validator_active, 0);
                 println!("validator {} has exited; following the chain for withdrawal", registered_index.unwrap_or(keys.index));
             }
             RegistryIdentity::PendingActivation => {
@@ -5042,6 +6388,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
             (fin.epoch, fin.root),
             |e| local_at.iter().find(|(k, _)| *k == e).map(|(_, r)| *r),
             |root| canonical.contains(root),
+            |root| {
+                if *root == genesis_root { return Some(engine.manifest.genesis_header().state_root); }
+                if !canonical.contains(root) { return None; }
+                engine.blocks.get(root).map(|block| block.header.state_root)
+            },
         )?;
         match outcome {
             Ok(ws) => {
@@ -5054,11 +6405,30 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     crate::codec::hex8(&ws.anchor_root),
                     if ws.anchor_is_hard { "WITHOUT" } else { "with" },
                 );
-                engine.ws_anchor = Some((ws.anchor_epoch, ws.anchor_root));
+                engine.ws_anchor = Some(ws.checkpoint);
                 engine.ws_anchor_hard = ws.anchor_is_hard;
                 engine.enforce_ws_anchor();
             }
-            Err(msg) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg)),
+            Err(msg) => return Err(crate::ws_boot::boot_refused(msg)),
+        }
+    }
+
+    if engine.keys.is_some() {
+        if no_doppelganger_check {
+            println!("DOPPELGANGER PROTECTION: DISABLED (BLOCH_NO_DOPPELGANGER is set).");
+        } else {
+            #[allow(clippy::arithmetic_side_effects)]
+            let observation_start = now_ms().saturating_sub(engine.manifest.genesis_time_ms)
+                / engine.manifest.slot_ms.max(1);
+            engine.start_doppelganger_observation(observation_start);
+        }
+    }
+
+    // Seed the first cache only after identity and weak-subjectivity checks.
+    // On a cache hit with no tail, the existing durable file already suffices.
+    if skipped == 0 || n_logged > 0 {
+        if let Err(e) = engine.write_local_cache() {
+            eprintln!("state-cache: initial write failed; next restart may require full replay: {e}");
         }
     }
 
@@ -5085,12 +6455,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
     if let Some(port) = cfg.rpc_port {
         // The reads that are bounded by the size of the ledger rather than by
         // the size of the answer (`getbalance`, `getutxos`) are served from
-        // this handle, off the slot loop. Everything else still goes through
-        // the loop, which is where anything touching the mempool or the chain
-        // store belongs.
-        let backend = Arc::new(crate::rpc::EngineBackend::with_head(
+        // this handle, off the slot loop. The small block-count polling answer
+        // is also published whole after canonical changes. Everything that
+        // still touches the mempool or block store stays on the loop.
+        let backend = Arc::new(crate::rpc::EngineBackend::with_published(
             tx.clone(),
             engine.state.published_head(),
+            Arc::clone(&engine.block_count),
         ));
         match crate::rpc::serve(&cfg.rpc_bind, port, backend) {
             Ok(addr) => {
@@ -5126,6 +6497,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut last_attested: u64 = engine.state.slot();
     let mut last_built: u64 = engine.state.slot();
     let mut last_sync_req: u64 = 0;
+    let mut duty_sync_gate = DutySyncGate::default();
 
     // Metrics baseline (C-R6-2). The finality clock starts NOW: replay stamps
     // nothing (it re-finalizes the past), and a `last_finality_advance_unix`
@@ -5142,9 +6514,32 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // Two slots of wall time, the grace/sync/rate-limit window used below.
     let two_slots_ms = slot_ms.saturating_mul(2);
     let mut finality_stalled = false;
-    let mut metrics_sampled_slot: u64 = 0;
+    // Sentinel guarantees one sample immediately, including at genesis slot
+    // zero; otherwise disk and committed-bar gauges would retain defaults for
+    // the entire first slot.
+    let mut metrics_sampled_slot: u64 = u64::MAX;
+    let mut epoch_advance_warning_level: u8 = 0;
+    let mut reported_fc_equivocators = None;
+    let mut admitted_work = FairQueue::default();
+    let mut deferred_work_scheduler = DeferredWorkScheduler::default();
+    let mut deferred_block_scheduler = DeferredBlockScheduler::default();
+    let mut engine_channel_open = true;
 
     loop {
+        match engine.store.poll_rewrite() {
+            Ok(true) => {
+                if let Err(e) = engine.write_local_cache() {
+                    eprintln!("state-cache: post-reorg write failed; restart may require full replay: {e}");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("FATAL: block log rewrite failed: {e}"),
+                ));
+            }
+        }
         let now = now_ms();
         if now < genesis_ms {
             // cannot underflow: now < genesis_ms.
@@ -5169,9 +6564,33 @@ pub fn run(cfg: Config) -> io::Result<()> {
             // it — without the call its `seen` map grows with uptime.
             engine.att_pool.prune(slot);
         }
+        // Future blocks, promoted orphans, and held attestations already
+        // reported `Ignore`; replay is local and silent. Future/orphan work
+        // shares an inner one-block slice, while that aggregate block class
+        // and the held-attestation slice share an outer round robin. Thus no
+        // two deferred consensus budgets compose before the next duty/control
+        // point. Keep duties gated and spin while any eligible tail remains.
+        let (
+            ready_future_blocks_pending,
+            deferred_orphans_pending,
+            held_attestations_pending,
+        ) = engine.release_deferred_work_turn(
+            slot,
+            &mut deferred_work_scheduler,
+            &mut deferred_block_scheduler,
+        );
 
         if let Some(stop) = cfg.stop_at_slot {
-            if slot >= stop {
+            if slot >= stop
+                && !ready_future_blocks_pending
+                && !held_attestations_pending
+                && !deferred_orphans_pending
+            {
+                if engine.store.flush_rewrite()? {
+                    if let Err(e) = engine.write_local_cache() {
+                        eprintln!("state-cache: shutdown post-reorg write failed; restart may require full replay: {e}");
+                    }
+                }
                 let fin = engine.state.finality();
                 println!(
                     "STOP at slot {stop}: head slot {}, {} blocks, state root {}, justified e{} ({}), finalized e{} ({})",
@@ -5191,6 +6610,55 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // duties, so a restarted proposer does not build on a stale head.
         let in_grace = now.saturating_sub(engine.booted_ms) < two_slots_ms;
 
+        // Decide freshness BEFORE any duty can roll the local state forward.
+        // `rolled_to` is only a deterministic view of THIS head; it cannot
+        // invent the RANDAO mix, registry or finality changes in blocks this
+        // node has not received. Signing from that artificial view both
+        // emits invalid work and consumes slash-protection watermarks that a
+        // later correct duty needs. The stateful gate below also survives the
+        // first successful sync page, whose fresh timestamp alone would make
+        // the stateless `behind` heuristic briefly false during catch-up.
+        let behind = node_is_behind(
+            engine.state.slot(),
+            slot,
+            now,
+            engine.last_applied_ms,
+            two_slots_ms,
+        );
+        let sync_needed = behind || engine.needs_sync;
+        let stale_head_quarantined = duty_sync_gate.update(
+            behind,
+            engine.state.slot(),
+            slot,
+            now,
+            two_slots_ms,
+        );
+        // A reorg is visible in memory before its replacement log finishes.
+        // Do not spend a signing watermark or broadcast locally produced work
+        // until that canonical generation is durable. RPC/network handling
+        // remains responsive while the writer runs.
+        let duties_blocked = validator_duties_blocked(
+            in_grace,
+            stale_head_quarantined,
+            ready_future_blocks_pending,
+            held_attestations_pending,
+            deferred_orphans_pending,
+        )
+            || engine.store.rewrite_pending();
+
+        // Ask for the missing history before considering local signatures.
+        // Rate-limited; idempotent on the receiving side (dedup discards
+        // repeats). The duty gate was settled above before the request latch
+        // can be cleared, so requesting sync cannot accidentally enable the
+        // duties immediately below it.
+        if sync_needed && now.saturating_sub(last_sync_req) > two_slots_ms {
+            engine
+                .net
+                .broadcast(net::get_blocks_frame(engine.sync_after_slot()));
+            engine.needs_sync = false;
+            last_sync_req = now;
+        }
+
         // `slot` here IS `wall_slot()` — same expression, computed once per
         // turn above. It is what reaches the slashing-protection watermark, so
         // "refuse unless the slot exceeds the watermark" is literally "refuse
@@ -5202,27 +6670,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // this function's stack — a restart forgets them entirely. They stop
         // duplicate work within one run; `slashprot` is what stops a second
         // signature across runs and across processes.
-        if !in_grace && slot > last_attested {
+        if !duties_blocked && slot > last_attested {
             engine.maintain_validator_lifecycle(wall_epoch);
             engine.attest(slot);
             last_attested = slot;
         }
         let propose_at = slot_start.saturating_add(slot_ms / 3); // a deadline
-        if !in_grace && now >= propose_at && slot > last_built {
+        if !duties_blocked && now >= propose_at && slot > last_built {
             engine.propose(slot);
             last_built = slot;
-        }
-
-        // Sync when behind or when a stored branch has holes. Rate-limited;
-        // idempotent on the receiving side (dedup discards repeats).
-        let behind = engine.state.slot().saturating_add(1) < slot
-            && now.saturating_sub(engine.last_applied_ms) > two_slots_ms;
-        if (behind || engine.needs_sync) && now.saturating_sub(last_sync_req) > two_slots_ms {
-            engine
-                .net
-                .broadcast(net::get_blocks_frame(engine.sync_after_slot()));
-            engine.needs_sync = false;
-            last_sync_req = now;
         }
 
         // ── Metrics turn (C-R6-2): pure exports of state already computed ──
@@ -5232,15 +6688,38 @@ pub fn run(cfg: Config) -> io::Result<()> {
         {
             use crate::metrics::{NodeMetrics, NODE};
             let head = engine.state.slot();
+            engine.refresh_validator_activity(&NODE, slot, duties_blocked);
             NodeMetrics::set(&NODE.heartbeat_unix, crate::metrics::now_unix());
             NodeMetrics::set(&NODE.head_slot, head);
             NodeMetrics::set(&NODE.wall_slot, slot);
             NodeMetrics::set(&NODE.behind_by_slots, slot.saturating_sub(head));
+            let epoch_headroom = epoch_advance_headroom_epochs(head, slot);
+            NodeMetrics::set(&NODE.epoch_advance_headroom_epochs, epoch_headroom);
+            let risk_level = epoch_advance_risk_level(epoch_headroom);
+            if risk_level > epoch_advance_warning_level {
+                let gap = wall_epoch.saturating_sub(epoch_of(head));
+                let urgency = match risk_level {
+                    1 => "EARLY WARNING",
+                    2 => "CRITICAL WARNING",
+                    _ => "RECOVERY CEILING REACHED",
+                };
+                eprintln!(
+                    "{urgency}: canonical head is {gap} epochs behind the wall clock; \
+                     {epoch_headroom} epochs remain before a single restart block exceeds \
+                     consensus MAX_EPOCH_ADVANCE={MAX_EPOCH_ADVANCE}. Restore canonical \
+                     progress before the headroom reaches zero; changing the constant \
+                     requires a coordinated consensus release."
+                );
+            }
+            epoch_advance_warning_level = risk_level;
             let fin = engine.state.finality();
             NodeMetrics::set(&NODE.finalized_epoch, fin.finalized.epoch);
             NodeMetrics::set(&NODE.justified_epoch, fin.justified.epoch);
             NodeMetrics::set(&NODE.mempool_size, engine.mempool.len() as u64);
-            NodeMetrics::set(&NODE.is_syncing, u64::from(behind || engine.needs_sync));
+            NodeMetrics::set(
+                &NODE.is_syncing,
+                u64::from(sync_needed || stale_head_quarantined),
+            );
             let (devnet_peers, p2p_peers) = engine.net.peer_counts();
             NodeMetrics::set(
                 &NODE.peer_count,
@@ -5265,11 +6744,16 @@ pub fn run(cfg: Config) -> io::Result<()> {
             NodeMetrics::set(&NODE.slot_secs, (engine.manifest.slot_ms / 1000).max(1));
             NodeMetrics::set(&NODE.last_applied_unix, engine.last_applied_ms / 1000);
             // Blocks parked rather than admitted: orphans waiting on a
-            // missing parent, plus branches the finality latch refused (R3
+            // missing parent, connected orphans awaiting their cooperative
+            // promotion turn, plus branches the finality latch refused (R3
             // M-1) rather than deleted.
             NodeMetrics::set(
                 &NODE.blocks_parked,
-                engine.orphans.len().saturating_add(engine.parked_refused_finality.len()) as u64,
+                engine
+                    .orphans
+                    .len()
+                    .saturating_add(engine.deferred_orphans.len())
+                    .saturating_add(engine.parked_refused_finality.len()) as u64,
             );
             // Once per slot, not per turn: `peer_counts` is cheap but
             // `statvfs` is a syscall against the data volume.
@@ -5279,6 +6763,29 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     &NODE.data_dir_fs_free_bytes,
                     crate::metrics::fs_free_bytes(&cfg.data_dir),
                 );
+                let summary = engine.state.forkchoice_equivocator_summary();
+                NodeMetrics::set(&NODE.forkchoice_equivocators, summary.total);
+                NodeMetrics::set(&NODE.forkchoice_equivocators_active, summary.active);
+                NodeMetrics::set(
+                    &NODE.forkchoice_equivocator_active_stake_sat,
+                    summary.active_stake_sat,
+                );
+                // Report the canonical-state value at boot and whenever a
+                // block/reorg changes it. The metrics above are the durable
+                // alerting surface; this bounded diagnostic makes the bar
+                // visible even on a fleet that has not installed a rule yet.
+                if reported_fc_equivocators != Some(summary) {
+                    if summary.total > 0 {
+                        eprintln!(
+                            "WARNING: canonical state permanently bars {} fork-choice \
+                             equivocator(s); {} remain active, excluding {} sat of \
+                             leak-adjusted weight. No automatic expiry or recovery is \
+                             active; investigate slashing/ejection and network quorum.",
+                            summary.total, summary.active, summary.active_stake_sat,
+                        );
+                    }
+                    reported_fc_equivocators = Some(summary);
+                }
             }
             // Finality stall: count the EDGE into the stalled condition, so a
             // three-hour stall is one incident, not ten thousand scrapes.
@@ -5295,37 +6802,65 @@ pub fn run(cfg: Config) -> io::Result<()> {
             finality_stalled = stalled_now;
         }
 
+        if ready_future_blocks_pending
+            || held_attestations_pending
+            || deferred_orphans_pending
+        {
+            // Do not sleep or process a second admitted-work batch before the
+            // next slot/duty check. All deferred pools are capped, so this
+            // immediate drain is itself bounded.
+            continue;
+        }
+
         let next_deadline = if slot > last_built && now < propose_at {
             propose_at
         } else {
             slot_start.saturating_add(slot_ms) // a deadline
         };
         let wait = next_deadline.saturating_sub(now_ms()).clamp(1, 500);
-        match rx.recv_timeout(Duration::from_millis(wait)) {
-            Ok(ev) => {
-                let mut pending = vec![ev];
-                while let Ok(more) = rx.try_recv() {
-                    pending.push(more);
+        if admitted_work.is_empty() && engine_channel_open {
+            match rx.recv_timeout(Duration::from_millis(wait)) {
+                Ok(event) => admitted_work.push(engine_event_class(&event), event),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => engine_channel_open = false,
+            }
+        }
+        while engine_channel_open && admitted_work.len() < ENGINE_SCHEDULER_CAP {
+            match rx.try_recv() {
+                Ok(event) => admitted_work.push(engine_event_class(&event), event),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    engine_channel_open = false;
+                    break;
                 }
-                // Queue telemetry, before the batch is worked: what the
-                // transports hold for this engine right now, and what they
-                // have shed since start (O06).
-                {
-                    use crate::metrics::{NodeMetrics, NODE};
-                    NodeMetrics::set(&NODE.net_queue_inflight, inflight.inflight() as u64);
-                    NodeMetrics::set(&NODE.net_queue_bytes, inflight.inflight_bytes() as u64);
-                    let (sb, sa, st) = inflight.shed();
-                    NodeMetrics::set(&NODE.net_shed_blocks_total, sb);
-                    NodeMetrics::set(&NODE.net_shed_attestations_total, sa);
-                    NodeMetrics::set(&NODE.net_shed_transactions_total, st);
-                }
-                for ev in pending {
+            }
+        }
+        if !admitted_work.is_empty() {
+            let pending = admitted_work.pop_batch(
+                ENGINE_EVENTS_PER_TURN,
+                ENGINE_EVENTS_PER_CLASS_PER_TURN,
+            );
+            // Queue telemetry, before the batch is worked: what the
+            // transports hold for this engine right now, and what they
+            // have shed since start (O06).
+            {
+                use crate::metrics::{NodeMetrics, NODE};
+                NodeMetrics::set(&NODE.net_queue_inflight, inflight.inflight() as u64);
+                NodeMetrics::set(&NODE.net_queue_bytes, inflight.inflight_bytes() as u64);
+                let (sb, sa, st) = inflight.shed();
+                NodeMetrics::set(&NODE.net_shed_blocks_total, sb);
+                NodeMetrics::set(&NODE.net_shed_attestations_total, sa);
+                NodeMetrics::set(&NODE.net_shed_transactions_total, st);
+            }
+            for ev in pending {
                     // Every `EngineEvent::Net` was reserved in the budget by
-                    // the transport; releasing it here — after handling, not
-                    // on dequeue — is what makes the cap mean "work the engine
-                    // has not done yet". The release charges the same pure
-                    // size function the reservation did, so the two cancel
-                    // exactly (see `net::queued_bytes`).
+                    // the transport; releasing it as the event leaves this
+                    // queue, immediately before handling, keeps accounting
+                    // independent of handler success. The release uses the
+                    // exact validated wire charge carried by the transport
+                    // reservation, so it cancels admission without
+                    // reserializing the payload.
+                    // Source-free work falls back to its canonical size.
                     if let EngineEvent::Net(ref net_ev) = ev {
                         inflight.release(net_ev);
                     }
@@ -5334,14 +6869,20 @@ pub fn run(cfg: Config) -> io::Result<()> {
                             // Judge first, THEN speak. Nothing is relayed
                             // until the engine has an answer — the same
                             // contract the attestation arm below runs on.
-                            let verdict = engine.ingest_judged(env);
+                            let verdict = engine.ingest_judged_from_source(
+                                env,
+                                origin.verification_source(),
+                            );
                             engine.net.report(&origin, verdict);
                         }
                         EngineEvent::Net(NetEvent::Attestation(att, origin)) => {
                             engine.on_attestation(att, origin, wall_epoch)
                         }
                         EngineEvent::Net(NetEvent::Transaction(tx, origin)) => {
-                            let verdict = match engine.on_transaction(tx) {
+                            let verdict = match engine.on_transaction_from(
+                                tx,
+                                origin.verification_source(),
+                            ) {
                                 Ok(_) => Verdict::Accept,
                                 // A peer may have a different head, fee, epoch
                                 // or pending input. Refuse relay without scoring
@@ -5351,21 +6892,22 @@ pub fn run(cfg: Config) -> io::Result<()> {
                             engine.net.report(&origin, verdict);
                         }
                         EngineEvent::Rpc(call) => {
-                            let result = engine.serve_rpc(call.req);
+                            let result = engine.serve_rpc_from(
+                                call.req,
+                                call.verification_source,
+                            );
                             // A client that hung up between asking and being
                             // answered is normal, not an error worth logging.
                             let _ = call.reply.send(result);
                         }
                     }
-                }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "network channel closed",
-                ));
-            }
+        }
+        if !engine_channel_open && admitted_work.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "network channel closed",
+            ));
         }
     }
 }
@@ -5387,6 +6929,34 @@ pub fn lmd_ghost_head<'a>(
     let (fc, parents, children) = forkchoice_store(blocks, pool, validators);
     let tree = BlockTree { parents: &parents };
     fc.head(&tree, justified, &children)
+}
+
+/// LMD-GHOST with epoch-gated FC-05 candidate selection. The gate is inert,
+/// so production currently takes the exact [`lmd_ghost_head`] path above.
+pub fn lmd_ghost_head_at_epoch<'a>(
+    blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
+    pool: impl Iterator<Item = &'a Attestation>,
+    validators: &[bloch_pos_committee::sample::Validator],
+    justified: [u8; 32],
+    epoch: u64,
+) -> [u8; 32] {
+    if !bloch_pos_committee::params::forkchoice_slot_tiebreak_active(epoch) {
+        return lmd_ghost_head(blocks, pool, validators, justified);
+    }
+    lmd_ghost_head_with_slot_tiebreak(blocks, pool, validators, justified)
+}
+
+fn lmd_ghost_head_with_slot_tiebreak<'a>(
+    blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
+    pool: impl Iterator<Item = &'a Attestation>,
+    validators: &[bloch_pos_committee::sample::Validator],
+    justified: [u8; 32],
+) -> [u8; 32] {
+    let (fc, parents, children) = forkchoice_store(blocks, pool, validators);
+    let slots: HashMap<[u8; 32], u64> =
+        blocks.iter().map(|(id, env)| (*id, env.header.slot)).collect();
+    let tree = BlockTree { parents: &parents };
+    fc.head_with_slot_tiebreak(&tree, justified, &children, &slots)
 }
 
 /// [`lmd_ghost_head`] through the pre-2026-08-23 O(V·D²) fork choice.
@@ -5554,14 +7124,31 @@ fn declared_size_bound(tx: &PosTransaction, declared: u64) -> Result<(), &'stati
 }
 
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
+    admissible_with_verifier(tx, wall_epoch, &HybridVerifier::new())
+}
+
+fn admissible_with_verifier(tx: &PosTransaction, wall_epoch: u64, verifier: &dyn SignatureVerifier) -> Result<(), &'static str> {
+    admissible_with_network_verifier(tx, wall_epoch, None, verifier)
+}
+
+fn admissible_with_network_verifier(
+    tx: &PosTransaction,
+    wall_epoch: u64,
+    network_domain: Option<&[u8; 32]>,
+    verifier: &dyn SignatureVerifier,
+) -> Result<(), &'static str> {
     match tx {
         PosTransaction::FundedDeposit(deposit) => {
             if !bloch_pos_committee::params::funded_validator_admission_active(wall_epoch) {
                 return Err("funded validator admission is not active: FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH is unarmed or not reached");
             }
             if wall_epoch > deposit.valid_until_epoch { return Err("funded deposit has expired"); }
-            deposit.verify_authorizations(&HybridVerifier::new())
-                .map_err(|_| "invalid funded deposit shape or hybrid PQ authorization")
+            // Shape only here. The state-aware lifecycle door resolves and
+            // prices committed funding before its budgeted verifier checks
+            // both authorizations. Verifying here as well used to charge four
+            // hybrid calls per valid deposit and left the first two unbounded.
+            deposit.validate_shape()
+                .map_err(|_| "invalid funded deposit shape")
         }
 
         // Staking messages are refused outright until bonding is funded from
@@ -5625,6 +7212,23 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             if outputs.is_empty() {
                 return Err("transfer has no outputs — it pays no one and cannot apply");
             }
+            // CR-03 — NODE-LOCAL POLICY, live ungated. `crypto::verify`
+            // intentionally knows suite 0x0002 for crypto-agility, but this
+            // chain promises hybrid ML-DSA-65 || Falcon-1024 authorisation.
+            // Refuse NEW non-hybrid spends before they enter the mempool.
+            // Consensus remains unchanged because an already-created 0x0002
+            // output cannot safely be declared nonexistent without a state
+            // inventory and a flag day. The shared classifier also preserves
+            // exact-length legacy raw hybrid keys, including magic collisions.
+            if inputs
+                .iter()
+                .any(|i| !bloch_crypto::crypto::is_hybrid_public_key(&i.pubkey))
+            {
+                return Err(
+                    "transfer uses a non-hybrid public-key suite — live spends require \
+                     ML-DSA-65 and Falcon-1024",
+                );
+            }
             // H-R7-3, the mempool half — NODE-LOCAL POLICY, live ungated.
             // Every output is a permanent ~76-byte `EutxoEntry` on every
             // node, priced only by the one-time fee on its bytes (~6.4 sat
@@ -5673,9 +7277,11 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             // Refusing at the mempool door is what stops it PROPAGATING. The
             // signature is the expensive check and it is deliberately last, after
             // the two free ones above.
-            let signing_root = tx.spend_signing_root();
+            let signing_root = tx
+                .checked_signing_root_for_network(wall_epoch, network_domain)
+                .ok_or("network-bound spend gate requires a committed genesis domain")?;
             for i in inputs {
-                if !bloch_crypto::crypto::verify(&i.pubkey, &signing_root, &i.signature) {
+                if !verifier.verify_with_key(&i.pubkey, &signing_root, &i.signature) {
                     return Err("transfer carries a signature that does not verify");
                 }
             }
@@ -5773,6 +7379,18 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
                     "deduplicated transfer carries no witness keys — nothing authorises it",
                 );
             }
+            // Same CR-03 admission policy as V1, once per witness-table key.
+            // Keep it before pricing/table walks and, crucially, before any
+            // expensive signature verification.
+            if keys
+                .iter()
+                .any(|k| !bloch_crypto::crypto::is_hybrid_public_key(&k.pubkey))
+            {
+                return Err(
+                    "transfer uses a non-hybrid public-key suite — live spends require \
+                     ML-DSA-65 and Falcon-1024",
+                );
+            }
             // The two price bounds, on the V2 class term (one verification
             // per TABLE entry) — mirroring `apply_transfer_v2`.
             price_bounds(
@@ -5820,9 +7438,11 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             // per key authorises all of that key's inputs. Admitting an
             // unverified table would hand an attacker free propagation of
             // garbage that every proposer then pays to drop.
-            let signing_root = tx.spend_signing_root();
+            let signing_root = tx
+                .checked_signing_root_for_network(wall_epoch, network_domain)
+                .ok_or("network-bound spend gate requires a committed genesis domain")?;
             for k in keys {
-                if !bloch_crypto::crypto::verify(&k.pubkey, &signing_root, &k.signature) {
+                if !verifier.verify_with_key(&k.pubkey, &signing_root, &k.signature) {
                     return Err("transfer carries a signature that does not verify");
                 }
             }
@@ -5879,7 +7499,7 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // ingress could construct one. Named explicitly for the reason the
         // `ExitV2` arm states: a variant that reaches `_` is a variant the
         // mempool admits, and consensus refuses this one at every epoch below
-        // the INERT `SLASHING_EVIDENCE_ACTIVATION_EPOCH`
+        // the scheduled `SLASHING_EVIDENCE_ACTIVATION_EPOCH` (2884)
         // (`TxReject::EvidenceNotActive`), so admitting it pre-gate would
         // relay transactions no block can carry — the mempool-stuffing class.
         //
@@ -5909,9 +7529,8 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         }
         // The RANDAO re-commit (H-R7-1) — named explicitly for the same
         // reason ExitV2 is: a variant that reaches `_` is a variant the
-        // mempool ADMITS, and this shape is consensus-refused at every epoch
-        // (`RANDAO_RECOMMIT_ACTIVATION_EPOCH` is `u64::MAX`) with its wire
-        // byte (0x0A) unassigned besides. Pre-activation the refusal is
+        // mempool ADMITS, and this shape is consensus-refused before
+        // `RANDAO_RECOMMIT_ACTIVATION_EPOCH` (2884). Pre-activation the refusal is
         // unconditional; post-activation the signature half still belongs to
         // consensus alone (this function is stateless — no registry to
         // resolve the validator's committed key against).
@@ -5930,13 +7549,11 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
 /// of `admissible` so it can be TESTED.
 ///
 /// It cannot be tested through `admissible` itself, and that is not an
-/// oversight in the test: `EXIT_AUTH_ACTIVATION_EPOCH` is `u64::MAX`, so the
-/// flag-day check in front of these rules refuses at every epoch any chain can
-/// reach, and no argument to `admissible` ever gets past it. Rules that only
-/// run after a flag day are exactly the rules that get to the flag day
-/// unexercised. Extracting them makes them a pure function of three values and
-/// therefore checkable today, on the tree the fleet runs, without arming
-/// anything.
+/// oversight in the test: fixtures below `EXIT_AUTH_ACTIVATION_EPOCH` (2884)
+/// cannot reach these rules through `admissible`. Rules that only run after a
+/// flag day are exactly the rules that can reach the boundary unexercised.
+/// Extracting them makes them a pure function of three values and therefore
+/// checkable without changing the production schedule.
 ///
 /// Both rules mirror consensus (`CommittedState::apply_exit_v2`) rather than
 /// inventing relay policy:
@@ -6107,7 +7724,7 @@ mod forkchoice_tests {
     }
 
     /// Tag 0x05 decodes since 2026-09-05 (F-02), so it can now arrive at the
-    /// mempool door — and below the inert flag day consensus refuses it
+    /// mempool door — and below the scheduled flag day consensus refuses it
     /// (`TxReject::EvidenceNotActive`), so admission would relay a
     /// transaction no block can carry. Goes red if the arm falls back into
     /// the `_ => Ok(())` catch-all, and goes red at any wall epoch below the
@@ -6132,7 +7749,7 @@ mod forkchoice_tests {
                 second: attest(0xBB),
             },
         );
-        for wall_epoch in [0u64, 2_700, u64::MAX - 1] {
+        for wall_epoch in [0u64, 2_700, bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH.saturating_sub(1)] {
             let err = admissible(&ev, wall_epoch)
                 .expect_err("evidence must not be admitted below its flag day");
             assert!(
@@ -6198,6 +7815,77 @@ mod forkchoice_tests {
         assert_eq!(
             lmd_ghost_head(&blocks, pool_flipped.iter(), &validators, g),
             a3
+        );
+    }
+
+    /// FC-05 attack regression. With no votes, a next-slot sibling can grind
+    /// `body_root` until its block id is larger and therefore win today's
+    /// root tiebreak. The inactive candidate instead keeps the earlier-slot
+    /// honest sibling. Same-slot siblings deliberately retain the historical
+    /// root fallback; the final assertion records that residual rather than
+    /// claiming this narrow candidate is proposer boost.
+    #[test]
+    fn next_slot_body_grind_cannot_win_the_inactive_slot_tiebreak_candidate() {
+        let g = [0x99u8; 32];
+        let honest_header = header(g, 10, 0x11);
+        let honest = *BlockId::of(&honest_header).as_bytes();
+
+        let (attacker_header, attacker) = (1u8..=u8::MAX)
+            .find_map(|marker| {
+                let mut h = header(g, 11, 0x22);
+                h.body_root = [marker; 32];
+                let id = *BlockId::of(&h).as_bytes();
+                (id > honest).then_some((h, id))
+            })
+            .expect("a one-byte body-root grind must find a root above the honest block");
+
+        let envelope = |header: BlockHeaderV4| BlockEnvelope {
+            header,
+            proposer_sig: Vec::new(),
+            body: Body { transactions: Vec::new(), attestations: Vec::new() },
+        };
+        let mut blocks = BTreeMap::new();
+        blocks.insert(honest, envelope(honest_header.clone()));
+        blocks.insert(attacker, envelope(attacker_header));
+        let validators = vals(2);
+
+        assert_eq!(
+            lmd_ghost_head(&blocks, [].iter(), &validators, g),
+            attacker,
+            "control: today's zero-weight tie must be grindable through the larger root"
+        );
+        assert_eq!(
+            bloch_pos_committee::params::FORKCHOICE_SLOT_TIEBREAK_ACTIVATION_EPOCH,
+            u64::MAX,
+            "the candidate must remain inactive"
+        );
+        assert_eq!(
+            lmd_ghost_head_at_epoch(&blocks, [].iter(), &validators, g, u64::MAX),
+            attacker,
+            "the u64::MAX sentinel must preserve today's root tiebreak"
+        );
+        assert_eq!(
+            lmd_ghost_head_with_slot_tiebreak(&blocks, [].iter(), &validators, g),
+            honest,
+            "the candidate must prefer the signed earlier slot over a ground next-slot root"
+        );
+
+        let mut same_slot_attacker = honest_header;
+        same_slot_attacker.body_root = blocks[&attacker].header.body_root;
+        same_slot_attacker.slot = 10;
+        let same_slot_id = *BlockId::of(&same_slot_attacker).as_bytes();
+        let mut same_slot_blocks = BTreeMap::new();
+        same_slot_blocks.insert(honest, envelope(header(g, 10, 0x11)));
+        same_slot_blocks.insert(same_slot_id, envelope(same_slot_attacker));
+        assert_eq!(
+            lmd_ghost_head_with_slot_tiebreak(
+                &same_slot_blocks,
+                [].iter(),
+                &validators,
+                g,
+            ),
+            honest.max(same_slot_id),
+            "same-slot equal-weight siblings retain the documented root-grinding residual"
         );
     }
 
@@ -6673,16 +8361,9 @@ mod admission_authorisation {
         );
     }
 
-    /// The AUTHENTICATED exit is refused by the mempool too, at every epoch a
-    /// chain can reach — and refused by NAME, not by falling through to the
-    /// catch-all.
-    ///
-    /// That distinction is the whole test. `admissible` ends in `_ => Ok(())`,
-    /// so a new `PosTransaction` variant is admitted by default; a variant
-    /// consensus refuses (`EXIT_AUTH_ACTIVATION_EPOCH` is `u64::MAX`, so
-    /// `apply_exit_v2`'s gate never opens) but the mempool relays would be a
-    /// proposer building blocks nobody accepts. The `u64::MAX - 1` case is the
-    /// point: no reachable epoch admits it.
+    /// Before the scheduled lifecycle epoch, the mempool refuses ExitV2 by
+    /// naming the gate. After the boundary the signature and state rules still
+    /// apply; enabling the format is not permission to accept an invalid exit.
     #[test]
     fn authenticated_exits_are_refused_until_the_flag_day() {
         let tx = PosTransaction::ExitV2 {
@@ -6690,9 +8371,9 @@ mod admission_authorisation {
             epoch: 0,
             signature: vec![1u8; 64],
         };
-        for epoch in [0u64, 1, 800, 1400, u64::MAX - 1] {
+        for epoch in [0u64, 1, 800, 1400, bloch_pos_committee::params::EXIT_AUTH_ACTIVATION_EPOCH.saturating_sub(1)] {
             let err = admissible(&tx, epoch)
-                .expect_err("ExitV2 is consensus-invalid at every reachable epoch");
+                .expect_err("ExitV2 is consensus-invalid below the lifecycle boundary");
             assert!(
                 err.contains("EXIT_AUTH_ACTIVATION_EPOCH"),
                 "the refusal must name the gate that causes it, got: {err}"
@@ -6912,6 +8593,44 @@ mod admission_authorisation {
         tx
     }
 
+    /// CR-03: suite 0x0002 remains a supported crypto-agility primitive, but
+    /// it is not a live transfer suite. Both wire formats must refuse it at
+    /// admission, before an attacker earns even one signature verification.
+    #[test]
+    fn non_hybrid_transfer_keys_are_refused_before_signature_verification() {
+        struct MustNotVerify;
+        impl bloch_pos_committee::attestation::SignatureVerifier for MustNotVerify {
+            fn verify_with_key(&self, _: &[u8], _: &[u8; 32], _: &[u8]) -> bool {
+                panic!("suite policy must run before signature verification")
+            }
+        }
+
+        let mut v1 = signed_transfer().0;
+        if let PosTransaction::Transfer { inputs, .. } = &mut v1 {
+            assert_eq!(&inputs[0].pubkey[..2], &[0xb1, 0x0c]);
+            inputs[0].pubkey[2..4]
+                .copy_from_slice(&bloch_crypto::crypto::SUITE_MLDSA65_ONLY.to_le_bytes());
+        }
+        let err = admissible_with_verifier(&v1, 0, &MustNotVerify)
+            .expect_err("suite 0x0002 must not enter the V1 mempool");
+        assert!(err.contains("non-hybrid"), "wrong refusal: {err}");
+
+        let mut v2 = signed_transfer_v2(2);
+        if let PosTransaction::TransferV2 { keys, .. } = &mut v2 {
+            assert_eq!(&keys[0].pubkey[..2], &[0xb1, 0x0c]);
+            keys[0].pubkey[2..4]
+                .copy_from_slice(&bloch_crypto::crypto::SUITE_MLDSA65_ONLY.to_le_bytes());
+        }
+        let err = admissible_with_verifier(&v2, V2_FLAG_DAY, &MustNotVerify)
+            .expect_err("suite 0x0002 must not enter the V2 mempool");
+        assert!(err.contains("non-hybrid"), "wrong refusal: {err}");
+
+        // Controls: the untouched hybrid fixtures still traverse the real
+        // verifier successfully in both encodings.
+        assert!(admissible(&signed_transfer().0, 0).is_ok());
+        assert!(admissible(&signed_transfer_v2(2), V2_FLAG_DAY).is_ok());
+    }
+
     /// The flag day itself, with the unit pinned: both epochs are DERIVED
     /// FROM SLOTS via `epoch_of`, because the gate compares EPOCHS against
     /// `params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` and a call
@@ -7128,10 +8847,11 @@ mod admission_authorisation {
 /// does not duplicate: standing up a proposing validator here would re-test
 /// consensus to prove an admission property.
 ///
-/// No mocked clock anywhere: the wall epoch is real `now_ms()` against a
-/// manifest whose `genesis_time_ms` is placed in the past — the same knob
-/// production uses — so `wall_slot()`/`epoch_of` run the very code the live
-/// node runs.
+/// Every harness starts from real `now_ms()` against a manifest whose
+/// `genesis_time_ms` is placed in the past — the same knob production uses —
+/// so `wall_slot()`/`epoch_of` first run the live path.  The one long
+/// pre-activation pressure test pins its thread-local clock only after proving
+/// that real-clock epoch, so scheduler delay cannot change eras mid-test.
 #[cfg(test)]
 mod transfer_v2_end_to_end {
     use super::*;
@@ -7141,12 +8861,12 @@ mod transfer_v2_end_to_end {
     use bloch_pos_committee::SLOTS_PER_EPOCH;
     use sha3::{Digest, Sha3_256};
 
-    /// A real `Engine`: real `Store` on disk, real devnet transport bound to
-    /// an ephemeral port with zero peers (broadcast walks an empty peer
-    /// list, so gossiping an admitted transaction is a no-op instead of a
-    /// hang), observer mode (no keystore), and a genesis state that actually
-    /// HOLDS `entries` — the outputs the sweep spends. `epochs_past` places
-    /// `genesis_time_ms` so the node's real wall epoch is at least that
+    /// A real `Engine`: real `Store` on disk, a transport-shaped inert devnet
+    /// sink with zero peers (broadcast is a no-op without a socket or
+    /// background thread), observer mode (no keystore), and a genesis state
+    /// that actually HOLDS `entries` — the outputs the sweep spends.
+    /// `epochs_past` places `genesis_time_ms` so the node's real wall epoch is
+    /// at least that
     /// (+2 slots of margin so the epoch cannot regress mid-test).
     fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
         let slot_ms = 500u64;
@@ -7195,30 +8915,17 @@ mod transfer_v2_end_to_end {
         ));
         std::fs::create_dir_all(&dir).expect("create the test data dir");
         let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
-        let (events, _rx) = mpsc::channel::<EngineEvent>();
-        // `_rx` drops here: nothing dials this node, and the accept loop
-        // exits quietly on a closed channel.
         let head_slot = Arc::new(AtomicU64::new(0));
         let inflight = net::QueueBudget::new();
-        let net = net::Net::Devnet(
-            net::start(
-                "127.0.0.1",
-                0, // ephemeral port: bind for real, listen to nobody
-                Vec::new(),
-                events,
-                dir.clone(),
-                head_slot.clone(),
-                inflight,
-            )
-            .expect("bind the devnet transport on an ephemeral port"),
-        );
+        let net = net::Net::Devnet(net::DevnetMesh::inert(head_slot.clone(), inflight));
         let verifier = HybridVerifier::new();
         Engine {
-            genesis_validator_count: manifest.validators.len() as u32,
+            genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
             tr_probe: Transition::new(ProbeVerifier),
+            gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: None,
             blocks: BTreeMap::new(),
@@ -7228,25 +8935,33 @@ mod transfer_v2_end_to_end {
             recent_states: VecDeque::new(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
+            held_release_roots: VecDeque::new(),
             wall_slot: 0,
-            mempool: BTreeMap::new(),
+            mempool: admission::Mempool::default(),
+            future_blocks: BTreeMap::new(),
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
-        rejected_hits: 0,
-        mempool_suspect: BTreeSet::new(),
-        mempool_swept_epoch: u64::MAX,
+            rejected_bytes: 0,
+            rejected_expiry_hint: None,
+            rejected_hits: 0,
+            mempool_suspect: BTreeSet::new(),
+            mempool_swept_epoch: u64::MAX,
             store,
             slashprot: SlashingProtection::open(&dir).expect("open slashing protection"),
             net,
             head_slot,
+            block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
             orphans: VecDeque::new(),
+            deferred_orphans: VecDeque::new(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            proposal_admission_seen: BTreeMap::new(),
+            proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
             rejected_future: 0,
             last_applied_ms: now_ms(),
@@ -7272,7 +8987,7 @@ mod transfer_v2_end_to_end {
     /// signature — the whole economy of the format. Returns the entries so
     /// the engine's genesis can hold the very outputs being swept.
     fn sweep_fixture(n: u32) -> (Vec<EutxoEntry>, PosTransaction) {
-        sweep_fixture_declaring(n, 0)
+        sweep_fixture_declaring(n, 9_000 + u64::from(n) * 40)
     }
 
     /// [`sweep_fixture`] with the declared `tx_bytes` as a knob — the
@@ -7305,7 +9020,9 @@ mod transfer_v2_end_to_end {
             }],
             inputs,
             outputs: vec![TransferOutput {
-                value: 1_000,
+                value: (u64::from(n) * 8_400 * 100_000_000).saturating_sub(
+                    fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, declared,
+                        fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS, 0).base_fee_sat as u64),
                 script_hash,
             }],
             // Admission polices only the declared size's CEILING
@@ -7380,6 +9097,96 @@ mod transfer_v2_end_to_end {
         );
         let selected_rpc = rpc_node.select_transactions(epoch_of(rpc_node.wall_slot()));
         assert_eq!(selected_rpc, vec![tx]);
+    }
+
+    #[test]
+    fn rpc_submission_moves_one_prepared_transaction_and_canonical_owner() {
+        let source = include_str!("engine.rs");
+        let arm = source
+            .split("RpcRequest::SendRawTransaction(tx) => {")
+            .nth(1)
+            .expect("sendrawtransaction engine arm exists")
+            .split("RpcRequest::BuildInfo")
+            .next()
+            .expect("build-info arm follows sendrawtransaction");
+        assert!(arm.contains("rpc::PreparedSubmission::new"));
+        assert!(arm.contains("on_transaction_from_canonical("));
+        assert_eq!(
+            arm.matches("tx.canonical_bytes()").count(),
+            1,
+            "RPC submission must derive exactly one canonical owner"
+        );
+        assert!(
+            !arm.contains("tx.clone()"),
+            "RPC submission again clones the proportional transaction before admission"
+        );
+        assert!(
+            !arm.contains("rpc::submitted_json(&tx"),
+            "RPC submission again re-encodes the retained transaction for its receipt"
+        );
+    }
+
+    #[test]
+    fn transaction_admission_derives_one_txid_for_checks_and_insertion() {
+        let source = include_str!("engine.rs");
+        let admission = source
+            .split("fn on_transaction_from_canonical<R>(")
+            .nth(1)
+            .expect("canonical transaction admission exists")
+            .split("/// Transactions for the block")
+            .next()
+            .expect("transaction selection follows admission");
+        assert_eq!(
+            admission.matches(".txid()").count(),
+            1,
+            "admission must not repeat the proportional transaction identity fold",
+        );
+        assert!(admission.contains("contains_key(&txid)"));
+        assert!(admission.contains("has_txid(&txid)"));
+        assert!(admission.contains("insert_with_txid(key, tx, txid)"));
+    }
+
+    #[test]
+    fn rpc_source_exhaustion_is_retryable_and_leaves_other_source_headroom() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let noisy = [0xA1; 32];
+        let honest = [0xA2; 32];
+        let slot = node.wall_slot();
+
+        // Distinct malformed inputs spend this source's real-crypto allowance
+        // without populating the exact-failure cache for the next input.
+        for n in 0..GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT {
+            let mut root = [0u8; 32];
+            root[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            let verifier = node.gossip_verifier.budgeted_for_source(
+                slot,
+                GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+                Some(noisy),
+                GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+            );
+            assert!(!verifier.verify_with_key(b"malformed", &root, b"malformed"));
+            assert!(!verifier.limited());
+        }
+
+        let RpcResult::Err(limited) = node.serve_rpc_from(
+            RpcRequest::SendRawTransaction(tx.clone()),
+            Some(noisy),
+        ) else {
+            panic!("an exhausted source must receive a retryable RPC error");
+        };
+        assert_eq!(limited.code, rpc::TX_REFUSED_RETRYABLE);
+        assert_eq!(
+            limited.data.as_ref().and_then(|data| data.get("until_slot"))
+                .and_then(Json::as_u64),
+            Some(slot.saturating_add(1)),
+        );
+        assert!(node.mempool.is_empty(), "overload cannot partially admit the transaction");
+
+        assert!(
+            node.serve_rpc_from(RpcRequest::SendRawTransaction(tx), Some(honest)).is_ok(),
+            "another RPC source retains aggregate headroom",
+        );
     }
 
     /// **H-R7-2, the mempool door**: a validly-signed transfer declaring far
@@ -7480,7 +9287,9 @@ mod transfer_v2_end_to_end {
         }
         assert_eq!(node.mempool.len(), 11, "fixture: all eleven must be distinct");
 
-        let selected = node.select_transactions(epoch);
+        // Exercise the byte packer independently of eligibility; these
+        // synthetic transactions intentionally have no committed inputs.
+        let selected = Engine::pack_transactions(epoch, node.mempool.iter().collect());
         assert!(!selected.is_empty(), "an empty selection would prove nothing");
         // The property the transition enforces at step 10b: the sum of the
         // sizes consensus counts must fit the cap. `max` mirrors the packer:
@@ -7686,6 +9495,28 @@ mod transfer_v2_end_to_end {
         assert_eq!(culprit_index(&TransitionError::CoherenceRootMismatch, 8), None);
     }
 
+    #[test]
+    fn audit_unattributed_proposal_errors_do_not_bar_innocent_transactions() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let key = tx.canonical_bytes();
+        node.mempool.insert(key.clone(), tx.clone());
+        let slot = node.wall_slot();
+        for err in [TransitionError::AttestationRootMismatch,
+            TransitionError::BlockGasLimitExceeded, TransitionError::Transaction(99)] {
+            let mut selection = vec![tx.clone()];
+            assert!(node.drop_failed_proposal_transaction(&mut selection, &err, slot));
+            assert!(selection.is_empty());
+            assert!(node.mempool.contains_key(&key));
+            assert!(node.is_rejected(&key, slot).is_none());
+        }
+        let mut selection = vec![tx];
+        assert!(node.drop_failed_proposal_transaction(
+            &mut selection, &TransitionError::Transaction(0), slot));
+        assert!(!node.mempool.contains_key(&key));
+        assert!(node.is_rejected(&key, slot).is_some());
+    }
+
     /// **The bar is what makes the drop stick.** Removing a refused
     /// transaction from the mempool does not remove it from the network: the
     /// peers still holding it re-offer it, and the structural admission check
@@ -7879,6 +9710,110 @@ mod transfer_v2_end_to_end {
         assert_eq!(node.on_transaction(tx), Ok(Admitted::New));
     }
 
+    #[test]
+    fn rejection_cache_byte_boundary_eviction_expiry_and_replacement_are_exact() {
+        let (entries, _) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let cap = 10;
+        let first = vec![0xA1; 6];
+        let second = vec![0xB2; 4];
+        let plus_one = vec![0xC3; 1];
+        let refill = vec![0xD4; 5];
+        let after_expiry = vec![0xE5; 1];
+
+        node.reject_transaction_bounded(first.clone(), 10, cap);
+        node.reject_transaction_bounded(second.clone(), 11, cap);
+        assert_eq!(node.rejected_bytes, cap, "the exact byte boundary is admitted");
+        assert_eq!(
+            node.rejected_bytes,
+            node.rejected.keys().map(Vec::len).sum::<usize>(),
+        );
+
+        node.reject_transaction_bounded(plus_one.clone(), 12, cap);
+        assert!(!node.rejected.contains_key(&first), "+1 evicts the earliest expiry");
+        assert!(node.rejected.contains_key(&second));
+        assert!(node.rejected.contains_key(&plus_one));
+        assert_eq!(node.rejected_bytes, 5);
+        node.reject_transaction_bounded(refill.clone(), 13, cap);
+        assert_eq!(node.rejected_bytes, cap, "eviction reopens the exact charge");
+
+        node.reject_transaction_bounded(second.clone(), 20, cap);
+        assert_eq!(node.rejected_bytes, cap, "replacement must not double-charge");
+        assert!(node.rejected.contains_key(&plus_one));
+        assert!(node.rejected.contains_key(&refill));
+        assert_eq!(node.rejected.get(&second), Some(&(148, 0)));
+
+        // `plus_one` expires exactly at slot 140. Its one byte reopens enough
+        // room for another one-byte key without displacing `refill`.
+        node.reject_transaction_bounded(after_expiry.clone(), 140, cap);
+        assert!(!node.rejected.contains_key(&plus_one));
+        assert!(node.rejected.contains_key(&refill));
+        assert!(node.rejected.contains_key(&after_expiry));
+        assert_eq!(node.rejected_bytes, cap);
+        assert_eq!(
+            node.rejected_bytes,
+            node.rejected.keys().map(Vec::len).sum::<usize>(),
+            "cached charge must equal every retained canonical key",
+        );
+
+        let retained = node.rejected.keys().cloned().collect::<Vec<_>>();
+        node.reject_transaction_bounded(vec![0xFF; cap + 1], 140, cap);
+        assert_eq!(node.rejected.keys().cloned().collect::<Vec<_>>(), retained);
+        assert_eq!(node.rejected_bytes, cap, "an individually oversized key is drop-new");
+    }
+
+    #[test]
+    fn rejection_expiry_hint_skips_early_scans_and_never_hides_a_boundary() {
+        let (entries, _) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let cap = 4_096;
+        REJECTION_EXPIRY_SCANS.with(|scans| scans.set(0));
+
+        for id in 0..100u64 {
+            node.reject_transaction_bounded(id.to_le_bytes().to_vec(), 10, cap);
+        }
+        assert_eq!(
+            REJECTION_EXPIRY_SCANS.with(std::cell::Cell::get),
+            0,
+            "no entry can expire before the shared slot-138 boundary",
+        );
+        assert_eq!(node.rejected_expiry_hint, Some(138));
+        assert_eq!(node.rejected_bytes, 800);
+
+        let late = 1_000u64.to_le_bytes().to_vec();
+        node.reject_transaction_bounded(late.clone(), 137, cap);
+        assert_eq!(REJECTION_EXPIRY_SCANS.with(std::cell::Cell::get), 0);
+        node.reject_transaction_bounded(1_001u64.to_le_bytes().to_vec(), 138, cap);
+        assert_eq!(REJECTION_EXPIRY_SCANS.with(std::cell::Cell::get), 1);
+        assert_eq!(node.rejected.len(), 2, "all slot-138 expiries leave together");
+        assert!(node.rejected.contains_key(&late));
+        assert_eq!(node.rejected_expiry_hint, Some(265));
+        assert_eq!(node.rejected_bytes, 16);
+
+        // Replacing the key named by the hint deliberately leaves the old
+        // lower bound behind. At 265 that can only cause an extra safe scan;
+        // the actual slot-266 expiry remains visible on the following call.
+        node.reject_transaction_bounded(late.clone(), 140, cap);
+        assert_eq!(node.rejected_expiry_hint, Some(265));
+        node.reject_transaction_bounded(1_002u64.to_le_bytes().to_vec(), 264, cap);
+        assert_eq!(REJECTION_EXPIRY_SCANS.with(std::cell::Cell::get), 1);
+        node.reject_transaction_bounded(1_003u64.to_le_bytes().to_vec(), 265, cap);
+        assert_eq!(REJECTION_EXPIRY_SCANS.with(std::cell::Cell::get), 2);
+        assert_eq!(node.rejected_expiry_hint, Some(266));
+        assert!(node.rejected.contains_key(&late));
+
+        let boundary = 1_001u64.to_le_bytes().to_vec();
+        node.reject_transaction_bounded(1_004u64.to_le_bytes().to_vec(), 266, cap);
+        assert_eq!(REJECTION_EXPIRY_SCANS.with(std::cell::Cell::get), 3);
+        assert!(!node.rejected.contains_key(&boundary));
+        assert!(node.rejected.contains_key(&late));
+        assert_eq!(
+            node.rejected_bytes,
+            node.rejected.keys().map(Vec::len).sum::<usize>(),
+        );
+        assert_eq!(node.rejected_expiry_hint, Some(268));
+    }
+
     /// **The bar answers before capacity, and the order is the message.** A
     /// mempool filled to `MEMPOOL_MAX` answering `AtCapacity` tells the sender
     /// to retry later; for a transaction this node has already watched the
@@ -7893,7 +9828,8 @@ mod transfer_v2_end_to_end {
         node.reject_transaction(key, slot);
         // Fill to the cap with anything: the point is which check speaks first.
         for i in 0..MEMPOOL_MAX as u64 {
-            node.mempool.insert(i.to_le_bytes().to_vec(), tx.clone());
+            let filler = PosTransaction::Exit { validator: i as u32 };
+            node.mempool.insert(filler.canonical_bytes(), filler);
         }
         assert!(node.mempool.len() >= MEMPOOL_MAX, "harness: the mempool must be full");
         assert!(
@@ -8035,6 +9971,11 @@ mod transfer_v2_end_to_end {
             0,
             "harness: a fresh genesis must put the wall clock in epoch 0"
         );
+        // Prove the real-clock harness above, then pin the rest of this
+        // deliberately pre-activation scenario.  Filling MEMPOOL_MAX performs
+        // enough hashing that a loaded CI runner can otherwise cross the
+        // 16-second epoch boundary while this single test is still running.
+        let _clock = validator_lifecycle::clock_at(0);
 
         // Gossip path: refused with today's string.
         let err = node
@@ -8076,21 +10017,15 @@ mod transfer_v2_end_to_end {
             e.message
         );
 
-        // THE CONTROL: a genuinely full mempool still reports MEMPOOL_FULL,
-        // and there "retry later" is the correct advice. Without this half,
-        // the assertion above could be satisfied by never reporting a full
-        // mempool at all.
-        //
-        // Each filler entry gets a DISTINCT source (R7 M6's per-source cap,
-        // `MEMPOOL_MAX_PER_SOURCE` = 64, is far below `MEMPOOL_MAX` = 4,096):
-        // without this, every filler shares `tx`'s one source and the fill
-        // trips the per-source cap at 64 entries rather than ever reaching
-        // real capacity, which is a different, more specific refusal
-        // (`TX_REFUSED_SOURCE_CAP`) than the one this control is for.
+        // Under pressure, temporarily unbacked entries may be planned for
+        // cleanup, but an inactive-format incoming transaction must still be
+        // refused without committing those evictions. These placeholders have
+        // distinct sources and intentionally unbacked ownership.
         let mut full = node;
         for i in 0..MEMPOOL_MAX {
             let mut filler = tx.clone();
-            if let PosTransaction::TransferV2 { keys, .. } = &mut filler {
+            if let PosTransaction::TransferV2 { keys, outputs, .. } = &mut filler {
+                outputs[0].script_hash = Sha3_256::digest((i as u32).to_le_bytes()).into();
                 if let Some(k) = keys.first_mut() {
                     k.pubkey = (i as u32).to_le_bytes().to_vec();
                 }
@@ -8101,12 +10036,71 @@ mod transfer_v2_end_to_end {
         else {
             panic!("a full mempool must produce an RPC error");
         };
-        assert_eq!(e2.code, rpc::MEMPOOL_FULL, "full is not refused: {e2:?}");
-        assert!(
-            e2.message.contains("retry later"),
-            "a full mempool SHOULD advise retrying: {}",
-            e2.message
-        );
+        assert_eq!(e2.code, rpc::TX_REFUSED, "an inactive format stays refused: {e2:?}");
+        assert_eq!(full.mempool.len(), MEMPOOL_MAX, "refused incoming bytes must not commit planned cleanup");
+    }
+    #[test]
+    fn audit_admission_rejects_unowned_missing_duplicate_and_unfunded_spends() {
+        let (entries, good) = sweep_fixture(2);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        for attack in 0..4 {
+            let mut bad = good.clone();
+            if let PosTransaction::TransferV2 { inputs, keys, outputs, .. } = &mut bad {
+                match attack {
+                    0 => keys[0].pubkey[8] ^= 1,
+                    1 => inputs[0].txid = [0xFA; 32],
+                    2 => inputs[1] = inputs[0].clone(),
+                    _ => outputs[0].value += 1,
+                }
+            }
+            assert!(matches!(node.on_transaction(bad), Err(Refusal::Invalid(_) | Refusal::StateDependent(_))));
+            assert!(node.mempool.is_empty());
+        }
+        assert_eq!(node.on_transaction(good), Ok(Admitted::New));
+    }
+
+    #[test]
+    fn audit_signature_variants_share_one_pending_identity() {
+        let (entries, tx) = sweep_fixture(2);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        assert_eq!(node.on_transaction(tx.clone()), Ok(Admitted::New));
+        let bytes = node.mempool.bytes();
+        let mut variant = tx.clone();
+        if let PosTransaction::TransferV2 { keys, .. } = &mut variant { keys[0].signature.push(0); }
+        assert_eq!(node.on_transaction(variant), Ok(Admitted::Duplicate));
+        assert_eq!(node.mempool.bytes(), bytes);
+        assert_eq!(node.mempool.source_count(&tx_source_hash(&tx).unwrap()), 1);
+        node.mempool.remove(&tx.canonical_bytes());
+        assert!(!node.mempool.has_txid(&tx.txid()));
+        assert_eq!(node.mempool.bytes(), 0);
+        assert_eq!(node.mempool.source_count(&tx_source_hash(&tx).unwrap()), 0);
+    }
+
+    #[test]
+    fn audit_byte_limit_refuses_before_count_capacity() {
+        let (entries, tx) = sweep_fixture(2);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let filler = PosTransaction::Exit { validator: 123 };
+        node.mempool.insert(vec![0; admission::MAX_MEMPOOL_BYTES], filler);
+        assert_eq!(node.mempool.len(), 1);
+        assert_eq!(node.on_transaction(tx), Err(Refusal::AtCapacity));
+        assert_eq!(node.mempool.len(), 1);
+    }
+
+    #[test]
+    fn audit_oversized_first_transaction_cannot_censor_the_rest() {
+        let (entries, good) = sweep_fixture(2);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let mut oversized = good.clone();
+        if let PosTransaction::TransferV2 { tx_bytes, tip_millisat_per_gas, .. } = &mut oversized {
+            *tx_bytes = fee_market::max_block_tx_bytes(V2_FLAG_DAY + 1) + 1;
+            *tip_millisat_per_gas = 100;
+        }
+        assert!(matches!(node.on_transaction(oversized.clone()), Err(Refusal::Invalid(_))));
+        // Also defend selection against an old/bypassed admission path.
+        node.mempool.insert(oversized.canonical_bytes(), oversized);
+        node.mempool.insert(good.canonical_bytes(), good.clone());
+        assert_eq!(node.select_transactions(V2_FLAG_DAY + 1), vec![good]);
     }
 }
 
@@ -8184,28 +10178,17 @@ mod perf_support {
         let genesis_id = manifest.genesis_id();
         let state = manifest.genesis_state();
         let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
-        let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
         let inflight = net::QueueBudget::new();
-        let net = net::Net::Devnet(
-            net::start(
-                "127.0.0.1",
-                0, // ephemeral port: bind for real, listen to nobody
-                Vec::new(),
-                events,
-                dir.clone(),
-                head_slot.clone(),
-                inflight,
-            )
-            .expect("bind the devnet transport on an ephemeral port"),
-        );
+        let net = net::Net::Devnet(net::DevnetMesh::inert(head_slot.clone(), inflight));
         let verifier = HybridVerifier::new();
         let engine = Engine {
-            genesis_validator_count: manifest.validators.len() as u32,
+            genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
             tr_probe: Transition::new(ProbeVerifier),
+            gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: Some(ks),
             blocks: BTreeMap::new(),
@@ -8215,25 +10198,33 @@ mod perf_support {
             recent_states: VecDeque::new(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
+            held_release_roots: VecDeque::new(),
             wall_slot: 0,
-            mempool: BTreeMap::new(),
+            mempool: admission::Mempool::default(),
+            future_blocks: BTreeMap::new(),
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
-        rejected_hits: 0,
-        mempool_suspect: BTreeSet::new(),
-        mempool_swept_epoch: u64::MAX,
+            rejected_bytes: 0,
+            rejected_expiry_hint: None,
+            rejected_hits: 0,
+            mempool_suspect: BTreeSet::new(),
+            mempool_swept_epoch: u64::MAX,
             store,
             slashprot: SlashingProtection::open(&dir).expect("open slashing protection"),
             net,
             head_slot,
+            block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
             orphans: VecDeque::new(),
+            deferred_orphans: VecDeque::new(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            proposal_admission_seen: BTreeMap::new(),
+            proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
             rejected_future: 0,
             last_applied_ms: now_ms(),
@@ -8261,6 +10252,257 @@ mod perf_support {
     }
 }
 
+#[cfg(test)]
+mod local_attestation_ownership {
+    #[test]
+    fn locally_signed_attestation_prepares_frame_then_moves_into_pool() {
+        let source = include_str!("engine.rs");
+        let start = source.find("    fn attest(&mut self, slot: u64)").expect("attest");
+        let end = source[start..]
+            .find("    fn propose(&mut self, slot: u64)")
+            .map(|offset| start + offset)
+            .expect("end of attest");
+        let attest = &source[start..end];
+
+        assert!(!attest.contains("att.clone()"));
+        let frame = attest
+            .find("let frame = net::att_frame(&att);")
+            .expect("canonical owned frame");
+        let insert = attest
+            .find(".insert((att.validator, att.data.signing_root()), att);")
+            .expect("move into pool under the original key");
+        let broadcast = attest
+            .find("self.net.broadcast(frame);")
+            .expect("broadcast prepared owner");
+        assert!(
+            frame < insert && insert < broadcast,
+            "frame preparation, pool ownership and publication order changed"
+        );
+    }
+}
+
+/// The proposer keeps the decoded selection alive through local ingestion so
+/// the normal, adopted-block path does not need a second owned copy of every
+/// canonical transaction body. These tests pin both sides: the ordinary body
+/// is unchanged, and the h28080 fail-safe still removes exactly what the
+/// refused proposal carried.
+#[cfg(test)]
+mod proposal_body_ownership {
+    use super::*;
+    use bloch_pos_committee::state_root::EutxoEntry;
+    use bloch_pos_committee::transition::{TransferInput, TransferOutput};
+
+    const INPUT_VALUE: u64 = 10_000_000_000;
+
+    fn funded_transfer(seed: u8) -> (EutxoEntry, PosTransaction) {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[seed; 32])
+            .expect("hybrid keypair from fixed seed");
+        let script_hash: [u8; 32] = Sha3_256::digest(&pk).into();
+        let entry = EutxoEntry {
+            txid: [seed.wrapping_add(1); 32],
+            vout: 0,
+            value: INPUT_VALUE,
+            script_hash,
+        };
+        let mut tx = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: entry.txid,
+                vout: entry.vout,
+                pubkey: pk,
+                signature: Vec::new(),
+            }],
+            outputs: vec![TransferOutput {
+                value: 1,
+                script_hash: [seed.wrapping_add(2); 32],
+            }],
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        };
+
+        // Falcon's compressed signature has a small variable encoded length.
+        // Sign once to size the canonical transaction, reserve ample declared
+        // slack (the over-declaration gate is intentionally inactive today),
+        // then set the fee/value and sign the final witness-free root.
+        let sizing_sig = bloch_crypto::crypto::sign(&sk, &tx.spend_signing_root())
+            .expect("sizing signature");
+        let PosTransaction::Transfer { inputs, .. } = &mut tx else {
+            unreachable!()
+        };
+        inputs[0].signature = sizing_sig;
+        let declared = tx.canonical_bytes().len() as u64 + 1_024;
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: 1 },
+            declared,
+            fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+            0,
+        );
+        let PosTransaction::Transfer {
+            outputs,
+            tx_bytes,
+            ..
+        } = &mut tx
+        else {
+            unreachable!()
+        };
+        *tx_bytes = declared;
+        outputs[0].value = INPUT_VALUE - charge.base_fee_sat as u64;
+        let signature = bloch_crypto::crypto::sign(&sk, &tx.spend_signing_root())
+            .expect("final transfer signature");
+        let PosTransaction::Transfer { inputs, .. } = &mut tx else {
+            unreachable!()
+        };
+        inputs[0].signature = signature;
+        assert!(tx.canonical_bytes().len() as u64 <= declared);
+        (entry, tx)
+    }
+
+    #[test]
+    fn adopted_proposal_keeps_the_exact_canonical_body_without_a_cleanup_copy() {
+        let (entry, tx) = funded_transfer(0x61);
+        let encoded = tx.canonical_bytes();
+        let (mut engine, _dir) = perf_support::proposing_engine_funded(&[entry]);
+        assert_eq!(
+            engine.state.next_base_fee_at(0),
+            fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+            "fixture fee must match the transaction"
+        );
+        engine.mempool.insert(encoded.clone(), tx);
+
+        engine.propose(1);
+
+        assert_eq!(engine.state.slot(), 1, "the proposal must be adopted");
+        let head = *engine.head_id().as_bytes();
+        assert_eq!(
+            engine.blocks.get(&head).expect("stored adopted block").body.transactions,
+            vec![encoded.clone()],
+            "the stored/broadcast body must retain the original canonical bytes"
+        );
+        assert!(!engine.mempool.contains_key(&encoded));
+    }
+
+    #[test]
+    fn refused_own_block_reencodes_only_its_selection_for_exact_cleanup() {
+        let (entry, mut bad) = funded_transfer(0x71);
+        let PosTransaction::Transfer { inputs, .. } = &mut bad else {
+            unreachable!()
+        };
+        inputs[0].signature[0] ^= 0x80;
+        let refused_key = bad.canonical_bytes();
+        let skipped = PosTransaction::Exit { validator: 123 };
+        let skipped_key = skipped.canonical_bytes();
+        let (mut engine, _dir) = perf_support::proposing_engine_funded(&[entry]);
+        engine.mempool.insert(refused_key.clone(), bad);
+        engine.mempool.insert(skipped_key.clone(), skipped);
+        let genesis = *engine.head_id().as_bytes();
+
+        engine.propose(1);
+
+        assert_eq!(*engine.head_id().as_bytes(), genesis, "bad signature must refuse the block");
+        assert!(
+            !engine.mempool.contains_key(&refused_key),
+            "the exact canonical transaction carried by the refused block must be dropped"
+        );
+        assert!(
+            engine.mempool.contains_key(&skipped_key),
+            "an entry excluded from the proposal must not be collateral cleanup"
+        );
+    }
+
+    #[test]
+    fn proposal_cleanup_has_no_eager_body_clone() {
+        let source = include_str!("engine.rs");
+        let start = source.find("    fn propose(&mut self, slot: u64)").expect("propose");
+        let end = source[start..]
+            .find("    // ── Block ingestion")
+            .map(|offset| start + offset)
+            .expect("end of propose");
+        let propose = &source[start..end];
+        assert!(!propose.contains("env.body.transactions.clone()"));
+        assert!(!propose.contains("produced_txs"));
+        assert!(propose.contains("let env_tx_count = txs.len();"));
+
+        let ingest = propose.find("self.ingest_from(env, Source::Local);").expect("local ingest");
+        let refused = propose.find("if self.head_id() != id").expect("refusal guard");
+        let cleanup = propose[refused..]
+            .find("self.mempool.remove(&tx.canonical_bytes());")
+            .map(|offset| refused + offset)
+            .expect("lazy canonical cleanup");
+        assert!(ingest < refused && refused < cleanup);
+        assert!(
+            !propose[ingest..refused].contains("canonical_bytes()"),
+            "cleanup encoding must not run before the refusal is known"
+        );
+    }
+}
+
+/// Block RPC lookup is a read of immutable retained data. Genesis is the one
+/// exception because it has no stored envelope and must be synthesized.
+#[cfg(test)]
+mod rpc_block_lookup_ownership {
+    use super::*;
+
+    #[test]
+    fn genesis_is_owned_stored_body_is_borrowed_and_both_rpc_routes_match() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let genesis_id = *engine.manifest.genesis_id().as_bytes();
+        let genesis_lookup = engine.envelope_by_id(&genesis_id).expect("genesis lookup");
+        assert!(matches!(genesis_lookup, Cow::Owned(_)), "genesis has no stored owner");
+        let genesis_json = engine.block_reply(genesis_lookup.as_ref());
+        drop(genesis_lookup);
+        assert_eq!(
+            engine.serve_rpc(RpcRequest::BlockById(genesis_id)),
+            Ok(genesis_json.clone()),
+        );
+        assert_eq!(
+            engine.serve_rpc(RpcRequest::BlockBySlot(0)),
+            Ok(genesis_json),
+        );
+
+        // The payload is deliberately material and absent from block JSON:
+        // only its count is rendered. The lookup must therefore retain the
+        // exact store owner, not reproduce its allocation.
+        let mut stored = engine.genesis_envelope();
+        stored.header.slot = 9;
+        stored.header.parent = genesis_id;
+        stored.body.transactions = vec![vec![0xA5; 1 << 20]];
+        stored.header.body_root = derive::body_root(&stored.body.transactions);
+        let stored_id = *stored.block_id().as_bytes();
+        engine.blocks.insert(stored_id, stored);
+        engine.chain.push((9, BlockId::of(&engine.blocks[&stored_id].header)));
+        engine.canonical.insert(stored_id);
+
+        let authoritative = engine.blocks.get(&stored_id).expect("stored block");
+        let lookup = engine.envelope_by_id(&stored_id).expect("stored lookup");
+        let Cow::Borrowed(borrowed) = lookup else {
+            panic!("a retained block body must not be cloned for an RPC summary")
+        };
+        assert!(std::ptr::eq(borrowed, authoritative));
+        assert_eq!(
+            borrowed.body.transactions[0].as_ptr(),
+            authoritative.body.transactions[0].as_ptr(),
+            "the proportional body allocation must remain the store's exact owner",
+        );
+        let stored_json = engine.block_reply(borrowed);
+
+        assert_eq!(
+            engine.serve_rpc(RpcRequest::BlockById(stored_id)),
+            Ok(stored_json.clone()),
+        );
+        assert_eq!(
+            engine.serve_rpc(RpcRequest::BlockBySlot(9)),
+            Ok(stored_json),
+        );
+        assert_eq!(
+            engine.serve_rpc(RpcRequest::BlockBySlot(8)).unwrap_err().code,
+            rpc::SLOT_EMPTY,
+        );
+        assert_eq!(
+            engine.serve_rpc(RpcRequest::BlockById([0xFF; 32])).unwrap_err().code,
+            rpc::BLOCK_NOT_FOUND,
+        );
+    }
+}
+
 /// Doppelgänger protection (R6 HIGH-8, node half): `Engine::note_possible_doppelganger`
 /// and `Engine::doppelganger_blocks_duties`.
 #[cfg(test)]
@@ -8282,7 +10524,7 @@ mod doppelganger_tests {
         // Even an accidentally pre-armed window must not classify disk history
         // as gossip. Keep live=true to test the explicit replay source guard.
         engine.start_doppelganger_observation(0);
-        engine.ingest_replay(block);
+        assert!(engine.ingest_replay(block));
         assert_eq!(engine.state.slot(), 1, "replay must actually accept the block");
         assert!(!engine.doppelganger_halted);
     }
@@ -8542,14 +10784,11 @@ mod bench {
 
     /// The opening-ledger size this bench sizes its state to.
     ///
-    /// It does NOT agree with `CARRYOVER-SNAPSHOT.md`, which records 452,726
-    /// rows, nor with `engine/replay_bench.rs`'s `CARRYOVER_N`, which is that
-    /// same 452,726 — a gap of 593 outputs. The constant is left at 452,133
-    /// rather than quietly moved: this is an `#[ignore]`d measurement that
-    /// asserts nothing, so the gap costs nothing today, and editing a figure to
-    /// match a document is exactly how a wrong figure becomes load-bearing.
-    /// Which of the two is stale is for the founder to settle.
-    const MAINNET_EUTXOS: u32 = 452_133;
+    /// This is the terminal artifact's committed row count, shared with
+    /// `CARRYOVER-SNAPSHOT.md`, `CARRYOVER_MEASURED_UTXOS` and replay_bench's
+    /// `CARRYOVER_N`. The earlier 452,133 measurement was taken 590 heights
+    /// before terminal and must not size a benchmark presented as mainnet.
+    const MAINNET_EUTXOS: u32 = 452_726;
 
     fn mainnet_sized_state(n: u32) -> CommittedState {
         let entries: Vec<EutxoEntry> = (0..n)
@@ -8688,7 +10927,7 @@ mod bench {
     ///
     /// Sized at 452,726 eUTXO leaves — the Genesis-4 carryover's own count,
     /// the same constant `tests/replay_hotpath_perf.rs` calls `CARRYOVER_N`.
-    /// The 452,133 above it is Genesis-3's and is left alone.
+    /// The benchmark constant above uses the same terminal count.
     ///
     /// BEFORE is not a paraphrase: it is `state.state_root()` followed by the
     /// same `chain_info_json` call, which is exactly what the old body did
@@ -9126,6 +11365,30 @@ mod rolled_memo_tests {
             "this engine is the whole committee, so exactly one slot of epoch 1 is its duty; \
              finding none means the test never exercised the attest path at all",
         );
+        let stored = engine
+            .pool
+            .values()
+            .find(|att| att.data.slot == attested_at)
+            .expect("the signed duty moved into the pool");
+        let keys = engine.keys.as_ref().expect("proposing fixture has keys");
+        assert!(
+            engine.verifier.verify_with_key(
+                &keys.pubkey,
+                &stored.data.signing_root(),
+                &stored.signature,
+            ),
+            "moving the locally signed attestation must preserve its hybrid signature"
+        );
+        let frame = net::att_frame(stored);
+        assert_eq!(frame.first(), Some(&net::FRAME_ATT));
+        let mut reader = crate::codec::Reader::new(&frame[1..]);
+        let decoded = crate::codec::decode_attestation(&mut reader)
+            .expect("the prepared wire owner remains canonical");
+        reader.finish().expect("the prepared frame has no trailing bytes");
+        assert_eq!(
+            &decoded, stored,
+            "pool ownership and the canonical broadcast frame must carry the same duty"
+        );
 
         // What a restart would load.
         let next_boot = SlashingProtection::open(&dir.0).expect("the next boot reads the file");
@@ -9382,6 +11645,15 @@ mod reorg_state_tests {
             engine.do_reorg(fork_point, Vec::new()),
             "handing the rival back must succeed"
         );
+        let published = match engine.block_count.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        assert_eq!(
+            published,
+            engine.block_count_reply(),
+            "a successful reorg must publish one complete new block-count generation"
+        );
         assert_eq!(
             *engine.head_id().as_bytes(),
             fork_point,
@@ -9550,6 +11822,49 @@ mod reorg_state_tests {
             saw_hit && saw_fallback,
             "the sweep must exercise BOTH the retained snapshot and the replay fallback \
              (hit: {saw_hit}, fallback: {saw_fallback})"
+        );
+    }
+
+    /// The deep-reorg fallback must borrow canonical bodies from the block
+    /// store instead of first cloning the entire prefix into a temporary
+    /// aggregate. The behavioural half above proves the borrowed fold is the
+    /// same state transition; this pins the ownership property that removes
+    /// the proportional body copy.
+    #[test]
+    fn replay_fallback_does_not_clone_a_prefix_aggregate() {
+        let source = include_str!("engine.rs");
+        let replay = source
+            .split("fn replay_to(&self")
+            .nth(1)
+            .expect("replay_to exists")
+            .split("// ── The finality latch")
+            .next()
+            .expect("finality section follows replay_to");
+        assert!(
+            !replay.contains("let prefix: Vec<BlockEnvelope>"),
+            "replay_to again materializes an owned canonical-prefix aggregate"
+        );
+
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        for slot in 1..=6 {
+            engine.propose(slot);
+        }
+        let target = *engine.chain[1].1.as_bytes();
+        assert!(
+            !engine.recent_states.iter().any(|(id, _)| *id == target),
+            "fixture must force the deep replay fallback"
+        );
+        let replayed = engine.replay_to(target);
+        let committed = engine
+            .blocks
+            .get(&target)
+            .expect("canonical target remains stored")
+            .header
+            .state_root;
+        assert_eq!(
+            replayed.state_root(),
+            committed,
+            "borrowed replay diverged from the state root committed by the canonical block"
         );
     }
 }
@@ -9915,30 +12230,19 @@ mod duty_view_anchor {
         let genesis_id = manifest.genesis_id();
         let state = manifest.genesis_state();
         let store = Store::open(&dir.0, &[0u8; 32]).expect("open the test store");
-        let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
         let inflight = net::QueueBudget::new();
-        let net = net::Net::Devnet(
-            net::start(
-                "127.0.0.1",
-                0,
-                Vec::new(),
-                events,
-                dir.0.clone(),
-                head_slot.clone(),
-                inflight,
-            )
-            .expect("bind the devnet transport on an ephemeral port"),
-        );
+        let net = net::Net::Devnet(net::DevnetMesh::inert(head_slot.clone(), inflight));
         let verifier = HybridVerifier::new();
         let ks0 = Keystore::load_with(&dir.0.join("v0"), &crate::keys::Unlock::PlaintextOptIn)
             .expect("re-load validator 0");
         let engine = Engine {
-            genesis_validator_count: manifest.validators.len() as u32,
+            genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
             tr_probe: Transition::new(ProbeVerifier),
+            gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: Some(ks0),
             blocks: BTreeMap::new(),
@@ -9948,25 +12252,33 @@ mod duty_view_anchor {
             recent_states: VecDeque::new(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
+            held_release_roots: VecDeque::new(),
             wall_slot: 0,
-            mempool: BTreeMap::new(),
+            mempool: admission::Mempool::default(),
+            future_blocks: BTreeMap::new(),
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
-        rejected_hits: 0,
-        mempool_suspect: BTreeSet::new(),
-        mempool_swept_epoch: u64::MAX,
+            rejected_bytes: 0,
+            rejected_expiry_hint: None,
+            rejected_hits: 0,
+            mempool_suspect: BTreeSet::new(),
+            mempool_swept_epoch: u64::MAX,
             store,
             slashprot: SlashingProtection::open(&dir.0).expect("open slashing protection"),
             net,
             head_slot,
+            block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
             orphans: VecDeque::new(),
+            deferred_orphans: VecDeque::new(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            proposal_admission_seen: BTreeMap::new(),
+            proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
             rejected_future: 0,
             last_applied_ms: now_ms(),
@@ -10188,20 +12500,17 @@ mod slot_horizon {
         ));
         std::fs::create_dir_all(&dir).expect("create the test data dir");
         let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
-        let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
         let inflight = net::QueueBudget::new();
-        let net = net::Net::Devnet(
-            net::start("127.0.0.1", 0, Vec::new(), events, dir.clone(), head_slot.clone(), inflight)
-                .expect("bind the devnet transport on an ephemeral port"),
-        );
+        let net = net::Net::Devnet(net::DevnetMesh::inert(head_slot.clone(), inflight));
         let verifier = HybridVerifier::new();
         Engine {
-            genesis_validator_count: manifest.validators.len() as u32,
+            genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
             tr_probe: Transition::new(ProbeVerifier),
+            gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: None,
             blocks: BTreeMap::new(),
@@ -10211,18 +12520,23 @@ mod slot_horizon {
             recent_states: VecDeque::new(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
+            held_release_roots: VecDeque::new(),
             wall_slot: 0,
-            mempool: BTreeMap::new(),
+            mempool: admission::Mempool::default(),
+            future_blocks: BTreeMap::new(),
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
+            rejected_bytes: 0,
+            rejected_expiry_hint: None,
             rejected_hits: 0,
             mempool_suspect: BTreeSet::new(),
             mempool_swept_epoch: u64::MAX,
             store,
             net,
             head_slot,
+            block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
             last_applied_ms: now_ms(),
@@ -10240,18 +12554,21 @@ mod slot_horizon {
             doppelganger_observe_until: None,
             doppelganger_halted: false,
             orphans: VecDeque::new(),
+            deferred_orphans: VecDeque::new(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            proposal_admission_seen: BTreeMap::new(),
+            proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
             rejected_future: 0,
             slashprot: SlashingProtection::open(&dir).expect("open slashing protection"),
         }
     }
 
-    /// An envelope that clears every check `ingest_judged` runs BEFORE the
-    /// horizon — the body/attestation commitments and the tx decode — so the
-    /// horizon is the only thing left that can refuse it. It names a parent
+    /// An envelope that clears the structural checks `ingest_judged` can run
+    /// around the horizon. The horizon deliberately precedes authentication,
+    /// so an absurd slot is the only thing left that can refuse it. It names a parent
     /// this node does not have, which is on purpose: a block that fails the
     /// horizon must never be stored, and one that passes it must be stored
     /// even though it cannot be applied. That separates "did the door let it
@@ -10468,6 +12785,35 @@ mod ingest_admission_tests {
         env
     }
 
+    fn padded_repointed(
+        engine: &Engine,
+        template: &BlockEnvelope,
+        parent: [u8; 32],
+        slot: u64,
+        signature_bytes: usize,
+    ) -> BlockEnvelope {
+        let mut env = repointed(engine, template, parent, slot);
+        env.body.attestations.push(Attestation {
+            data: AttestationData {
+                slot,
+                head: parent,
+                source_epoch: 0,
+                source_root: [0; 32],
+                target_epoch: epoch_of(slot),
+                target_root: parent,
+            },
+            validator: 0,
+            signature: vec![0xA5; signature_bytes],
+        });
+        env.header.attestation_root = derive::attestation_root(&env.body.attestations);
+        env.proposer_sig = engine
+            .keys
+            .as_ref()
+            .expect("the proposing fixture holds a keystore")
+            .sign(&env.header.proposal_signing_root());
+        env
+    }
+
     /// One real proposal to use as a template, and the store size to compare
     /// against.
     fn fixture() -> (Engine, perf_support::TestDir, BlockEnvelope, usize) {
@@ -10490,6 +12836,7 @@ mod ingest_admission_tests {
     /// (`path_to_canonical` → `None`), and nothing ever removed it.
     #[test]
     fn an_unconnected_block_is_parked_not_stored() {
+        let _clock = validator_lifecycle::clock_at(32);
         let (mut engine, _dir, template, stored) = fixture();
         engine.needs_sync = false;
 
@@ -10535,7 +12882,8 @@ mod ingest_admission_tests {
             if i == 0 {
                 first_parent = env.header.parent;
             }
-            engine.ingest(env);
+            let source_group = i / ORPHANS_PER_SOURCE;
+            engine.ingest_judged_from_source(env, Some([source_group as u8; 32]));
         }
 
         assert_eq!(
@@ -10556,7 +12904,7 @@ mod ingest_admission_tests {
             !engine
                 .orphans
                 .iter()
-                .any(|(_, env)| env.header.parent == first_parent),
+                .any(|(_, env, _, _, _)| env.header.parent == first_parent),
             "FIFO: the oldest entry is the one evicted"
         );
     }
@@ -10566,6 +12914,7 @@ mod ingest_admission_tests {
     /// with copies of itself.
     #[test]
     fn the_same_orphan_offered_repeatedly_occupies_one_slot() {
+        let _clock = validator_lifecycle::clock_at(32);
         let (mut engine, _dir, template, _stored) = fixture();
         let orphan = repointed(&engine, &template, [0x9A; 32], 2);
         for _ in 0..16 {
@@ -10573,6 +12922,1130 @@ mod ingest_admission_tests {
         }
         assert_eq!(engine.orphans.len(), 1, "dedup by block id");
         assert_eq!(engine.orphans_evicted, 0, "and nothing was pushed out");
+    }
+
+    fn orphan_with_encoded_len(
+        template: &BlockEnvelope,
+        parent: [u8; 32],
+        target: usize,
+    ) -> BlockEnvelope {
+        let mut env = template.clone();
+        env.header.proposer_index = 7;
+        env.header.parent = parent;
+        env.header.slot = 2;
+        env.proposer_sig.clear();
+        env.body.attestations.clear();
+        env.body.transactions.clear();
+        let base = crate::codec::encoded_envelope_len(&env);
+        assert!(target >= base);
+        env.proposer_sig.resize(target - base, 0xA5);
+        assert_eq!(crate::codec::encoded_envelope_len(&env), target);
+        env
+    }
+
+    #[test]
+    fn orphan_source_byte_share_counts_both_queues_and_reopens_exactly() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        let half_share = ORPHAN_BYTES_PER_SOURCE / 2;
+        let landed = [0x81; 32];
+
+        assert!(retention_bytes_fit(0, ORPHAN_BYTES_PER_SOURCE, ORPHAN_BYTES_PER_SOURCE));
+        assert!(!retention_bytes_fit(0, ORPHAN_BYTES_PER_SOURCE + 1, ORPHAN_BYTES_PER_SOURCE));
+        assert!(!retention_bytes_fit(usize::MAX, 1, usize::MAX));
+
+        let first = orphan_with_encoded_len(&template, landed, half_share);
+        let second = orphan_with_encoded_len(&template, [0x82; 32], half_share);
+        let second_duplicate = second.clone();
+        engine.park_orphan(*first.block_id().as_bytes(), first, Source::Gossip(None));
+        engine.park_orphan(*second.block_id().as_bytes(), second, Source::Gossip(None));
+        engine.schedule_unblocked_orphans(landed, false);
+        assert_eq!(engine.orphans.len(), 1);
+        assert_eq!(engine.deferred_orphans.len(), 1);
+        assert_eq!(
+            engine.orphans.iter().chain(engine.deferred_orphans.iter())
+                .map(|(_, _, _, _, bytes)| *bytes).sum::<usize>(),
+            ORPHAN_BYTES_PER_SOURCE,
+        );
+
+        let before_duplicate = engine.orphans_evicted;
+        engine.park_orphan(
+            *second_duplicate.block_id().as_bytes(),
+            second_duplicate,
+            Source::Gossip(None),
+        );
+        assert_eq!(engine.orphans_evicted, before_duplicate, "dedup precedes byte charge");
+
+        let excess = orphan_with_encoded_len(&template, [0x83; 32], half_share);
+        engine.park_orphan(*excess.block_id().as_bytes(), excess, Source::Gossip(None));
+        assert_eq!(engine.orphans_evicted, before_duplicate + 1);
+        assert_eq!(engine.orphans.len() + engine.deferred_orphans.len(), 2);
+
+        engine.deferred_orphans.pop_front().expect("one exact half-share leaves");
+        let reopened = orphan_with_encoded_len(&template, [0x84; 32], half_share);
+        engine.park_orphan(*reopened.block_id().as_bytes(), reopened, Source::Gossip(None));
+        assert_eq!(
+            engine.orphans.iter().chain(engine.deferred_orphans.iter())
+                .map(|(_, _, _, _, bytes)| *bytes).sum::<usize>(),
+            ORPHAN_BYTES_PER_SOURCE,
+            "removal reopens exactly the bytes carried by the removed entry",
+        );
+    }
+
+    #[test]
+    fn deferred_only_global_byte_cap_drops_local_then_reopens() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        let landed = [0x91; 32];
+        let slice = ORPHAN_BYTES_MAX / 8;
+        assert_eq!(slice * 8, ORPHAN_BYTES_MAX);
+
+        for i in 0..8u8 {
+            let mut env = orphan_with_encoded_len(&template, landed, slice);
+            env.header.slot = u64::from(i).saturating_add(2);
+            let source = Source::Gossip(Some([i / 2; 32]));
+            engine.park_orphan(*env.block_id().as_bytes(), env, source);
+        }
+        engine.schedule_unblocked_orphans(landed, false);
+        assert!(engine.orphans.is_empty());
+        assert_eq!(engine.deferred_orphans.len(), 8);
+        assert_eq!(
+            engine.deferred_orphans.iter().map(|(_, _, _, _, bytes)| *bytes).sum::<usize>(),
+            ORPHAN_BYTES_MAX,
+        );
+
+        let local = orphan_with_encoded_len(&template, [0x92; 32], slice);
+        let before = engine.orphans_evicted;
+        engine.park_orphan(*local.block_id().as_bytes(), local, Source::Local);
+        assert_eq!(engine.orphans_evicted, before + 1);
+        assert!(engine.orphans.is_empty(), "ready work is never displaced by new local work");
+
+        engine.deferred_orphans.pop_front().expect("one byte slice leaves");
+        let reopened = orphan_with_encoded_len(&template, [0x93; 32], slice);
+        engine.park_orphan(*reopened.block_id().as_bytes(), reopened, Source::Local);
+        assert_eq!(engine.orphans.len(), 1, "Local is globally bounded but has no source share");
+        assert_eq!(
+            engine.orphans.iter().chain(engine.deferred_orphans.iter())
+                .map(|(_, _, _, _, bytes)| *bytes).sum::<usize>(),
+            ORPHAN_BYTES_MAX,
+        );
+    }
+
+    #[test]
+    fn waiting_global_byte_cap_rejects_oversize_then_evicts_fifo() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        let slice = ORPHAN_BYTES_MAX / 8;
+        for i in 0..8u8 {
+            let mut parent = [0xA1; 32];
+            parent[1] = i;
+            let env = orphan_with_encoded_len(&template, parent, slice);
+            engine.park_orphan(
+                *env.block_id().as_bytes(),
+                env,
+                Source::Gossip(Some([i / 2; 32])),
+            );
+        }
+        let oldest = engine.orphans.front().expect("full waiting FIFO").0;
+        let before_ids: Vec<[u8; 32]> = engine.orphans.iter().map(|(id, _, _, _, _)| *id).collect();
+        let before = engine.orphans_evicted;
+
+        let oversize = orphan_with_encoded_len(&template, [0xA2; 32], ORPHAN_BYTES_MAX + 1);
+        engine.park_orphan(*oversize.block_id().as_bytes(), oversize, Source::Local);
+        assert_eq!(engine.orphans_evicted, before + 1);
+        assert_eq!(
+            engine.orphans.iter().map(|(id, _, _, _, _)| *id).collect::<Vec<_>>(),
+            before_ids,
+            "global-cap+1 is refused before it can flush retained work",
+        );
+
+        let incoming = orphan_with_encoded_len(&template, [0xA3; 32], slice);
+        let incoming_id = *incoming.block_id().as_bytes();
+        engine.park_orphan(incoming_id, incoming, Source::Local);
+        assert_eq!(engine.orphans_evicted, before + 2);
+        assert!(!engine.orphans.iter().any(|(id, _, _, _, _)| *id == oldest));
+        assert!(engine.orphans.iter().any(|(id, _, _, _, _)| *id == incoming_id));
+        assert_eq!(
+            engine.orphans.iter().map(|(_, _, _, _, bytes)| *bytes).sum::<usize>(),
+            ORPHAN_BYTES_MAX,
+            "one equal-sized FIFO eviction admits the new waiting entry at the exact cap",
+        );
+    }
+
+    #[test]
+    fn full_orphan_byte_cap_evicts_many_waiting_entries_in_exact_fifo_order() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        const LARGE_ENTRIES: usize = 8;
+        let tiny_entries = ORPHAN_MAX - LARGE_ENTRIES;
+        let tiny_bytes = 1024usize;
+        let tiny_total = tiny_entries.saturating_mul(tiny_bytes);
+        let large_total = ORPHAN_BYTES_MAX.saturating_sub(tiny_total);
+        let large_bytes = large_total / LARGE_ENTRIES;
+        let large_remainder = large_total % LARGE_ENTRIES;
+
+        assert_eq!(large_remainder, 0);
+        assert!(
+            (tiny_entries / LARGE_ENTRIES).saturating_mul(tiny_bytes) + large_bytes
+                <= ORPHAN_BYTES_PER_SOURCE,
+        );
+        assert!(large_bytes.saturating_add(1) <= crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES);
+        for i in 0..tiny_entries {
+            let mut parent = [0xC1; 32];
+            parent[..2].copy_from_slice(&(i as u16).to_le_bytes());
+            let env = orphan_with_encoded_len(&template, parent, tiny_bytes);
+            let source = Source::Gossip(Some([(i % LARGE_ENTRIES) as u8; 32]));
+            engine.park_orphan(*env.block_id().as_bytes(), env, source);
+        }
+
+        let mut large_ids = Vec::with_capacity(LARGE_ENTRIES);
+        let mut first_large_bytes = 0usize;
+        for i in 0..LARGE_ENTRIES {
+            let mut parent = [0xD1; 32];
+            parent[0] = 0xD1u8.saturating_add(i as u8);
+            let bytes = large_bytes + usize::from(i < large_remainder);
+            if i == 0 { first_large_bytes = bytes; }
+            let env = orphan_with_encoded_len(&template, parent, bytes);
+            large_ids.push(*env.block_id().as_bytes());
+            engine.park_orphan(
+                *env.block_id().as_bytes(),
+                env,
+                Source::Gossip(Some([i as u8; 32])),
+            );
+        }
+        assert_eq!(engine.orphans.len(), ORPHAN_MAX);
+        assert_eq!(
+            engine.orphans.iter().map(|(_, _, _, _, bytes)| *bytes).sum::<usize>(),
+            ORPHAN_BYTES_MAX,
+            "the reachable fixture fills both the count and encoded-byte caps exactly",
+        );
+
+        let incoming = orphan_with_encoded_len(&template, [0xEF; 32], first_large_bytes);
+        let incoming_id = *incoming.block_id().as_bytes();
+        let evicted_before = engine.orphans_evicted;
+        engine.park_orphan(incoming_id, incoming, Source::Gossip(Some([0xEF; 32])));
+
+        let expected_evictions = tiny_entries + 1;
+        assert_eq!(
+            engine.orphans_evicted - evicted_before,
+            expected_evictions as u64,
+            "248 tiny entries and the oldest large entry leave before the incoming block fits",
+        );
+        assert_eq!(engine.orphans.len(), LARGE_ENTRIES);
+        assert_eq!(
+            engine.orphans.iter().map(|(id, _, _, _, _)| *id).collect::<Vec<_>>(),
+            large_ids[1..].iter().copied().chain(std::iter::once(incoming_id)).collect::<Vec<_>>(),
+            "FIFO eviction preserves the untouched suffix and appends the newcomer",
+        );
+        assert_eq!(
+            engine.orphans.iter().map(|(_, _, _, _, bytes)| *bytes).sum::<usize>(),
+            ORPHAN_BYTES_MAX - tiny_total,
+            "subtracting cached charges reopens exactly the bytes evicted",
+        );
+        assert!(engine.needs_sync, "admitted orphan still requests recovery");
+    }
+
+    #[test]
+    fn immutable_deferred_bytes_do_not_flush_waiting_work_uselessly() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        let landed = [0xB1; 32];
+        let slice = ORPHAN_BYTES_MAX / 16;
+
+        for i in 0..15u8 {
+            let mut env = orphan_with_encoded_len(&template, landed, slice);
+            env.header.slot = u64::from(i).saturating_add(2);
+            engine.park_orphan(
+                *env.block_id().as_bytes(),
+                env,
+                Source::Gossip(Some([i / 4; 32])),
+            );
+        }
+        engine.schedule_unblocked_orphans(landed, false);
+        assert_eq!(engine.deferred_orphans.len(), 15);
+
+        let waiting = orphan_with_encoded_len(&template, [0xB2; 32], slice);
+        let waiting_id = *waiting.block_id().as_bytes();
+        engine.park_orphan(waiting_id, waiting, Source::Local);
+        assert_eq!(engine.orphans.len(), 1);
+        let before = engine.orphans_evicted;
+
+        let impossible = orphan_with_encoded_len(&template, [0xB3; 32], slice * 4);
+        engine.park_orphan(*impossible.block_id().as_bytes(), impossible, Source::Local);
+        assert_eq!(engine.orphans_evicted, before + 1);
+        assert_eq!(engine.orphans.len(), 1);
+        assert_eq!(engine.orphans[0].0, waiting_id, "immutable deferred bytes make admission impossible, so waiting work is untouched");
+    }
+
+    #[test]
+    fn one_source_cannot_fill_combined_orphan_queues_and_capacity_reopens() {
+        let (mut engine, _dir, template, stored) = fixture();
+        let source_a = [0xA1; 32];
+        let source_b = [0xB1; 32];
+        let landed = [0xC1; 32];
+
+        for i in 0..ORPHANS_PER_SOURCE {
+            let mut env = template.clone();
+            env.header.proposer_index = 7;
+            env.header.parent = if i == 0 { landed } else { [i as u8; 32] };
+            env.header.slot = 2;
+            assert_eq!(
+                engine.ingest_judged_from_source(env, Some(source_a)),
+                Verdict::Ignore,
+            );
+        }
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE);
+        assert_eq!(engine.blocks.len(), stored);
+
+        let mut excess = template.clone();
+        excess.header.proposer_index = 7;
+        excess.header.parent = [0xD1; 32];
+        excess.header.slot = 2;
+        let evicted_before_excess = engine.orphans_evicted;
+        assert_eq!(
+            engine.ingest_judged_from_source(excess, Some(source_a)),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE);
+        assert_eq!(engine.orphans_evicted, evicted_before_excess + 1);
+
+        let mut independent = template.clone();
+        independent.header.proposer_index = 7;
+        independent.header.parent = [0xE1; 32];
+        independent.header.slot = 2;
+        assert_eq!(
+            engine.ingest_judged_from_source(independent, Some(source_b)),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE + 1);
+
+        engine.schedule_unblocked_orphans(landed, false);
+        assert_eq!(engine.deferred_orphans.len(), 1);
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE);
+        let mut still_full = template.clone();
+        still_full.header.proposer_index = 7;
+        still_full.header.parent = [0xD2; 32];
+        still_full.header.slot = 2;
+        let evicted_before_combined_excess = engine.orphans_evicted;
+        engine.ingest_judged_from_source(still_full, Some(source_a));
+        assert_eq!(
+            engine.orphans.len() + engine.deferred_orphans.len(),
+            ORPHANS_PER_SOURCE + 1,
+            "moving work to the ready FIFO must not reopen source capacity",
+        );
+        assert_eq!(engine.orphans_evicted, evicted_before_combined_excess + 1);
+
+        engine.deferred_orphans.pop_front().expect("one source-A entry leaves");
+        let mut reopened = template;
+        reopened.header.proposer_index = 7;
+        reopened.header.parent = [0xD3; 32];
+        reopened.header.slot = 2;
+        engine.ingest_judged_from_source(reopened, Some(source_a));
+        assert_eq!(
+            engine.orphans.iter()
+                .chain(engine.deferred_orphans.iter())
+                .filter(|(_, _, source, _, _)| *source == Source::Gossip(Some(source_a)))
+                .count(),
+            ORPHANS_PER_SOURCE,
+            "one departed entry must reopen exactly one slot for its source",
+        );
+
+        // Missing attribution is one honest collective bucket, not an
+        // invented identity per call. Local production is outside this
+        // transport-fairness rule.
+        for i in 0..ORPHANS_PER_SOURCE {
+            let mut env = engine.orphans[0].1.clone();
+            env.header.parent = [0x60; 32];
+            env.header.parent[1] = i as u8;
+            let id = *env.block_id().as_bytes();
+            engine.park_orphan(id, env, Source::Gossip(None));
+        }
+        let before = engine.orphans.len() + engine.deferred_orphans.len();
+        let mut unattributed_excess = engine.orphans[0].1.clone();
+        unattributed_excess.header.parent = [0x61; 32];
+        let excess_id = *unattributed_excess.block_id().as_bytes();
+        let evicted_before_unattributed = engine.orphans_evicted;
+        engine.park_orphan(
+            excess_id,
+            unattributed_excess.clone(),
+            Source::Gossip(None),
+        );
+        assert_eq!(engine.orphans.len() + engine.deferred_orphans.len(), before);
+        assert_eq!(engine.orphans_evicted, evicted_before_unattributed + 1);
+        let local_id = *unattributed_excess.block_id().as_bytes();
+        let evicted_before_local = engine.orphans_evicted;
+        engine.park_orphan(local_id, unattributed_excess, Source::Local);
+        assert_eq!(
+            engine.orphans.len() + engine.deferred_orphans.len(),
+            before + 1,
+            "local production is not charged to the unattributed transport bucket",
+        );
+        assert_eq!(engine.orphans_evicted, evicted_before_local);
+    }
+
+    #[test]
+    fn deferred_orphan_tail_shares_the_hard_cap_and_deduplication() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        let landed = [0xA7; 32];
+
+        for i in 0..ORPHAN_MAX {
+            let mut env = template.clone();
+            env.header.parent = landed;
+            env.header.slot = (i as u64).saturating_add(2);
+            let id = *env.block_id().as_bytes();
+            let source_group = i / ORPHANS_PER_SOURCE;
+            engine.park_orphan(
+                id,
+                env,
+                Source::Gossip(Some([source_group as u8; 32])),
+            );
+        }
+        engine.schedule_unblocked_orphans(landed, false);
+        assert!(engine.orphans.is_empty());
+        assert_eq!(engine.deferred_orphans.len(), ORPHAN_MAX);
+
+        let duplicate = engine.deferred_orphans[ORPHAN_MAX / 2].1.clone();
+        let duplicate_id = *duplicate.block_id().as_bytes();
+        engine.park_orphan(duplicate_id, duplicate, Source::Gossip(Some([0xD8; 32])));
+        assert_eq!(engine.deferred_orphans.len(), ORPHAN_MAX, "ready tail deduplicates");
+        assert_eq!(engine.orphans_evicted, 0, "a duplicate is not an eviction");
+
+        let mut fresh = template.clone();
+        fresh.header.parent = [0xB8; 32];
+        fresh.header.slot = (ORPHAN_MAX as u64).saturating_add(20);
+        let fresh_id = *fresh.block_id().as_bytes();
+        engine.park_orphan(fresh_id, fresh.clone(), Source::Gossip(Some([0xD9; 32])));
+        assert!(engine.orphans.is_empty(), "new work cannot exceed a full ready tail");
+        assert_eq!(engine.deferred_orphans.len(), ORPHAN_MAX);
+        assert_eq!(engine.orphans_evicted, 1, "the bounded drop is observable");
+
+        engine.deferred_orphans.pop_front().expect("one promotion turn");
+        engine.park_orphan(fresh_id, fresh, Source::Gossip(Some([0xD9; 32])));
+        assert_eq!(engine.orphans.len(), 1);
+        assert_eq!(
+            engine.orphans.len().saturating_add(engine.deferred_orphans.len()),
+            ORPHAN_MAX,
+            "one released slot admits exactly one new orphan",
+        );
+    }
+
+    #[test]
+    fn third_genesis_key_proposal_for_one_duty_is_ignored_without_peer_blame() {
+        // Building the real hybrid-signature fixture can cross a wall-clock
+        // slot in an unoptimised/full-suite run. Pin the test clock so the
+        // retained evidence pair deterministically exercises the future pool
+        // instead of racing into the equally valid orphan path.
+        let _clock = validator_lifecycle::clock_at(0);
+        let (mut engine, _dir, template, stored) = fixture();
+        let slot = template.header.slot;
+        let first_equivocation = repointed(&engine, &template, [0xA1; 32], slot);
+        let third_variant = repointed(&engine, &template, [0xA2; 32], slot);
+
+        assert_eq!(
+            engine.ingest_judged_from_source(first_equivocation, Some([0x11; 32])),
+            Verdict::Ignore,
+            "the second distinct proposal is retained as the evidence pair",
+        );
+        assert_eq!(engine.future_blocks.len(), 1);
+        assert_eq!(engine.blocks.len(), stored);
+
+        assert_eq!(
+            engine.ingest_judged_from_source(third_variant, Some([0x22; 32])),
+            Verdict::Ignore,
+            "a third signed variant is retention pressure, not forwarding-peer guilt",
+        );
+        assert_eq!(engine.future_blocks.len(), 1, "the third variant must not consume retention");
+        assert_eq!(engine.blocks.len(), stored, "the third variant must not reach fork choice");
+
+        let next_duty = repointed(&engine, &template, [0xA3; 32], slot.saturating_add(1));
+        assert_eq!(
+            engine.ingest_judged_from_source(next_duty, Some([0x22; 32])),
+            Verdict::Ignore,
+            "the cap is scoped to one proposer duty, not a durable key ban",
+        );
+        assert_eq!(engine.future_blocks.len(), 2);
+    }
+
+    #[test]
+    fn ready_future_block_release_is_sliced_and_gates_duties() {
+        let _clock = validator_lifecycle::clock_at(0);
+        let (mut engine, _dir, template, stored) = fixture();
+        let first = repointed(&engine, &template, [0xB1; 32], template.header.slot);
+        let second = repointed(
+            &engine,
+            &template,
+            [0xB2; 32],
+            template.header.slot.saturating_add(1),
+        );
+
+        assert_eq!(engine.ingest_judged(first), Verdict::Ignore);
+        assert_eq!(engine.ingest_judged(second), Verdict::Ignore);
+        assert_eq!(engine.future_blocks.len(), 2);
+        assert_eq!(engine.blocks.len(), stored);
+
+        let release_slot = template.header.slot.saturating_add(1);
+        let _release_clock = validator_lifecycle::clock_at(release_slot);
+        let pending = engine.release_future_blocks(release_slot, FUTURE_BLOCKS_PER_TURN);
+        assert!(pending, "one ready block must remain for a fresh loop turn");
+        assert_eq!(engine.future_blocks.len(), 1);
+        assert!(
+            validator_duties_blocked(false, false, pending, false, false),
+            "duties cannot sign from a partially released future view",
+        );
+
+        let pending = engine.release_future_blocks(release_slot, FUTURE_BLOCKS_PER_TURN);
+        assert!(!pending);
+        assert!(engine.future_blocks.is_empty());
+        assert_eq!(engine.orphans.len(), 2, "neither ready block was stranded");
+        assert!(!validator_duties_blocked(false, false, pending, false, false));
+    }
+
+    #[test]
+    fn future_and_orphan_releases_share_one_block_transition_turn() {
+        let _clock = validator_lifecycle::clock_at(3);
+        let (mut engine, _dir, _template, _) = fixture();
+        let parent = *engine.head_id().as_bytes();
+
+        engine.propose(2);
+        let future = engine.blocks[engine.head_id().as_bytes()].clone();
+        engine.propose(3);
+        let orphan = engine.blocks[engine.head_id().as_bytes()].clone();
+        assert!(engine.do_reorg(parent, Vec::new()));
+        let future_id = *future.block_id().as_bytes();
+        let orphan_id = *orphan.block_id().as_bytes();
+        assert_ne!(future_id, orphan_id, "the two release classes need distinct work");
+        engine.blocks.remove(&future_id).expect("stored future fixture");
+        engine.blocks.remove(&orphan_id).expect("stored orphan fixture");
+        let future_bytes = crate::codec::encoded_envelope_len(&future);
+
+        engine.future_blocks.insert(
+            future_id,
+            (future, Source::Gossip(Some([0xF4; 32])), None, future_bytes),
+        );
+        engine.park_orphan(
+            orphan_id,
+            orphan,
+            Source::Gossip(Some([0x04; 32])),
+        );
+        assert_eq!(engine.future_blocks.len(), 1);
+        assert_eq!(engine.orphans.len(), 1);
+        assert!(engine.deferred_orphans.is_empty());
+
+        let mut scheduler = DeferredBlockScheduler::default();
+        let pending = engine.release_deferred_block_turn(3, &mut scheduler);
+        assert_eq!(pending, (false, true));
+        assert!(engine.future_blocks.is_empty());
+        assert!(engine.orphans.is_empty(), "landing the parent unlocks its child");
+        assert_eq!(engine.deferred_orphans.len(), 1);
+        assert!(engine.blocks.contains_key(&future_id));
+        assert_eq!(
+            engine.deferred_orphans[0].0,
+            orphan_id,
+            "the second expensive class must wait for another control turn",
+        );
+
+        let pending = engine.release_deferred_block_turn(3, &mut scheduler);
+        assert_eq!(pending, (false, false));
+        assert!(engine.deferred_orphans.is_empty());
+        assert!(engine.blocks.contains_key(&orphan_id));
+    }
+
+    #[test]
+    fn deferred_block_and_held_replay_take_separate_control_turns() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let (mut engine, _dir, template, _) = fixture();
+        engine.wall_slot = 32;
+        let genesis = *engine.manifest.genesis_id().as_bytes();
+        let parent = *engine.head_id().as_bytes();
+
+        engine.propose(2);
+        let future = engine.blocks[engine.head_id().as_bytes()].clone();
+        assert!(engine.do_reorg(parent, Vec::new()));
+        let future_id = *future.block_id().as_bytes();
+        engine.blocks.remove(&future_id).expect("stored future fixture");
+        let future_bytes = crate::codec::encoded_envelope_len(&future);
+        engine.future_blocks.insert(
+            future_id,
+            (future, Source::Gossip(Some([0xB1; 32])), None, future_bytes),
+        );
+
+        // Hold a valid attestation on a block that is not queryable yet, then
+        // make that exact block queryable without dispatching either release
+        // path. This isolates the outer scheduler from block-ingest effects.
+        let held_block = repointed(&engine, &template, [0xA7; 32], 32);
+        let held_id = *held_block.block_id().as_bytes();
+        let data = AttestationData {
+            slot: 32,
+            head: held_id,
+            source_epoch: 0,
+            source_root: genesis,
+            target_epoch: 1,
+            target_root: parent,
+        };
+        let att = Attestation {
+            data,
+            validator: 0,
+            signature: engine
+                .keys
+                .as_ref()
+                .expect("the proposing fixture holds a keystore")
+                .sign(&data.signing_root()),
+        };
+        let mut pool = AttestationPool::new();
+        let decision = engine.judge(&mut pool, att.clone(), 1);
+        assert!(
+            matches!(decision, GossipDecision::Hold { .. }),
+            "unexpected held-attestation fixture decision: {decision:?}",
+        );
+        engine.att_pool = pool;
+        engine.blocks.insert(held_id, held_block);
+        engine.schedule_held_release(held_id);
+        assert_eq!(engine.att_pool.pending_for_root(&held_id), 1);
+
+        let mut scheduler = DeferredWorkScheduler::default();
+        let mut block_scheduler = DeferredBlockScheduler::default();
+        assert_eq!(
+            engine.release_deferred_work_turn(32, &mut scheduler, &mut block_scheduler),
+            (false, false, true),
+            "the first turn releases one block but not the ready attestation slice",
+        );
+        assert!(engine.blocks.contains_key(&future_id));
+        assert_eq!(engine.att_pool.pending_for_root(&held_id), 1);
+
+        assert_eq!(
+            engine.release_deferred_work_turn(32, &mut scheduler, &mut block_scheduler),
+            (false, false, false),
+            "the next turn advances held replay without a second block release",
+        );
+        assert!(engine.pool.contains_key(&(0, data.signing_root())));
+    }
+
+    #[test]
+    fn authenticated_held_replay_skips_second_verification_and_preserves_root_fifo() {
+        let _clock = validator_lifecycle::clock_at(63);
+        let (mut engine, _dir, template, _) = fixture();
+        let validator = engine.manifest.validators[0].clone();
+        engine.manifest.validators = (0..64)
+            .map(|index| {
+                let mut record = validator.clone();
+                record.index = index;
+                record
+            })
+            .collect();
+        engine.manifest.pre_state_root = std::sync::OnceLock::new();
+        engine.state.set(engine.manifest.genesis_state());
+        let genesis_id = engine.manifest.genesis_id();
+        engine.chain = vec![(0, genesis_id)];
+        engine.canonical = [*genesis_id.as_bytes()].into_iter().collect();
+        engine.blocks.clear();
+        engine.wall_slot = 63;
+        let genesis = *genesis_id.as_bytes();
+        let target = *engine.head_id().as_bytes();
+        let seed = engine
+            .seed_for_attestation(&target, 1)
+            .expect("genesis has an epoch-1 committee seed");
+        let roster = engine.rolled_to(1).active_validators();
+
+        let first_block = repointed(&engine, &template, [0xA8; 32], 63);
+        let first_root = *first_block.block_id().as_bytes();
+        let second_block = repointed(&engine, &template, [0xA9; 32], 63);
+        let second_root = *second_block.block_id().as_bytes();
+
+        let make_attestation = |slot, head, member| {
+            let data = AttestationData {
+                slot,
+                head,
+                source_epoch: 0,
+                source_root: genesis,
+                target_epoch: 1,
+                target_root: target,
+            };
+            let validator = *committees::committee_for_slot(&seed, slot, &roster)
+                .get(member)
+                .expect("the 64-validator fixture has two members in every slot");
+            Attestation {
+                data,
+                validator,
+                signature: engine
+                    .keys
+                    .as_ref()
+                    .expect("the proposing fixture holds a keystore")
+                    .sign(&data.signing_root()),
+            }
+        };
+        let first_root_atts: Vec<_> = (32..64)
+            .map(|slot| make_attestation(slot, first_root, 0))
+            .collect();
+        let second_root_att = make_attestation(63, second_root, 1);
+
+        let mut pool = AttestationPool::new();
+        for (index, att) in first_root_atts
+            .iter()
+            .chain(std::iter::once(&second_root_att))
+            .enumerate()
+        {
+            // This fixture intentionally reaches the root-wide outer bound,
+            // so distribute its authenticated entries across attributed
+            // sources instead of exercising the smaller source-free bucket.
+            let source_group = index
+                / bloch_pos_committee::gossip::MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT;
+            let source = [0x40 + source_group as u8; 32];
+            let decision = engine.judge_from(&mut pool, att.clone(), 1, Some(source));
+            assert!(
+                matches!(decision, GossipDecision::Hold { .. }),
+                "unexpected held-attestation fixture decision: {decision:?}",
+            );
+        }
+        engine.att_pool = pool;
+        engine.blocks.insert(first_root, first_block);
+        engine.blocks.insert(second_root, second_block);
+        engine.schedule_held_release(first_root);
+        engine.schedule_held_release(second_root);
+
+        for (turn, att) in first_root_atts.iter().enumerate() {
+            assert!(engine.release_held_turn());
+            assert_eq!(
+                engine.att_pool.pending_for_root(&first_root),
+                first_root_atts.len() - turn - 1,
+                "one control turn must consume exactly one authenticated waiter",
+            );
+            assert_eq!(engine.att_pool.pending_for_root(&second_root), 1);
+            assert!(engine
+                .pool
+                .contains_key(&(att.validator, att.data.signing_root())));
+            assert_eq!(
+                engine.held_release_roots.front(),
+                Some(if turn + 1 == first_root_atts.len() {
+                    &second_root
+                } else {
+                    &first_root
+                }),
+                "the later root must wait for the complete FIFO tail",
+            );
+        }
+
+        assert!(!engine.release_held_turn());
+        assert_eq!(engine.att_pool.pending_for_root(&second_root), 0);
+        assert!(engine
+            .pool
+            .contains_key(&(second_root_att.validator, second_root_att.data.signing_root())));
+    }
+
+    #[test]
+    fn one_source_cannot_occupy_the_future_pool_and_capacity_reopens() {
+        let _clock = validator_lifecycle::clock_at(0);
+        let (mut engine, _dir, template, stored) = fixture();
+        let source_a = [0x31; 32];
+        let source_b = [0x32; 32];
+
+        for offset in 0..FUTURE_BLOCKS_PER_SOURCE {
+            let block = repointed(
+                &engine,
+                &template,
+                [0xC0u8.saturating_add(offset as u8); 32],
+                (offset as u64).saturating_add(1),
+            );
+            assert_eq!(
+                engine.ingest_judged_from_source(block, Some(source_a)),
+                Verdict::Ignore,
+            );
+        }
+        assert_eq!(engine.future_blocks.len(), FUTURE_BLOCKS_PER_SOURCE);
+
+        let excess_a = repointed(&engine, &template, [0xD0; 32], 2);
+        let excess_a_id = *excess_a.block_id().as_bytes();
+        assert_eq!(
+            engine.ingest_judged_from_source(excess_a, Some(source_a)),
+            Verdict::Ignore,
+            "source-local retention pressure is never peer guilt",
+        );
+        assert_eq!(engine.future_blocks.len(), FUTURE_BLOCKS_PER_SOURCE);
+        assert!(!engine.future_blocks.contains_key(&excess_a_id));
+
+        let independent = repointed(&engine, &template, [0xE0; 32], 3);
+        assert_eq!(
+            engine.ingest_judged_from_source(independent, Some(source_b)),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.future_blocks.len(), FUTURE_BLOCKS_PER_SOURCE + 1);
+        assert_eq!(engine.blocks.len(), stored);
+
+        let _release_clock = validator_lifecycle::clock_at(1);
+        assert!(!engine.release_future_blocks(1, FUTURE_BLOCKS_PER_TURN));
+        assert_eq!(
+            engine.future_blocks.values()
+                .filter(|(_, source, _, _)| *source == Source::Gossip(Some(source_a)))
+                .count(),
+            FUTURE_BLOCKS_PER_SOURCE - 1,
+        );
+
+        let reopened = repointed(&engine, &template, [0xF0; 32], 4);
+        assert_eq!(
+            engine.ingest_judged_from_source(reopened, Some(source_a)),
+            Verdict::Ignore,
+        );
+        assert_eq!(
+            engine.future_blocks.values()
+                .filter(|(_, source, _, _)| *source == Source::Gossip(Some(source_a)))
+                .count(),
+            FUTURE_BLOCKS_PER_SOURCE,
+            "release must reopen capacity without a stale quota cache",
+        );
+        assert_eq!(
+            engine.future_blocks.values()
+                .filter(|(_, source, _, _)| *source == Source::Gossip(Some(source_b)))
+                .count(),
+            1,
+            "an independent source keeps its reserved share",
+        );
+    }
+
+    #[test]
+    fn one_source_cannot_occupy_the_future_byte_budget_and_capacity_reopens() {
+        let _clock = validator_lifecycle::clock_at(0);
+        let (mut engine, _dir, template, stored) = fixture();
+        let source_a = [0x41; 32];
+        let source_b = [0x42; 32];
+        let padding = 3 * 1024 * 1024;
+
+        let first_a = padded_repointed(&engine, &template, [0xA1; 32], 1, padding);
+        let first_a_duplicate = first_a.clone();
+        let envelope_bytes = crate::codec::encoded_envelope_len(&first_a);
+        assert!(envelope_bytes <= FUTURE_BLOCK_BYTES_PER_SOURCE);
+        assert!(envelope_bytes.saturating_mul(2) > FUTURE_BLOCK_BYTES_PER_SOURCE);
+        assert!(envelope_bytes <= crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES);
+        assert_eq!(
+            engine.ingest_judged_from_source(first_a, Some(source_a)),
+            Verdict::Ignore,
+        );
+        assert_eq!(
+            engine.future_blocks.values().next().expect("first large future").3,
+            envelope_bytes,
+            "admission caches the exact canonical length beside the immutable envelope",
+        );
+        assert_eq!(
+            engine.ingest_judged_from_source(first_a_duplicate, Some(source_a)),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.future_blocks.len(), 1, "dedup precedes byte charging");
+        assert_eq!(engine.future_blocks.values().next().unwrap().3, envelope_bytes);
+
+        let excess_a = padded_repointed(&engine, &template, [0xA2; 32], 2, padding);
+        let excess_a_id = *excess_a.block_id().as_bytes();
+        assert_eq!(
+            engine.ingest_judged_from_source(excess_a, Some(source_a)),
+            Verdict::Ignore,
+            "source byte pressure is local overload, never peer guilt",
+        );
+        assert_eq!(engine.future_blocks.len(), 1);
+        assert!(!engine.future_blocks.contains_key(&excess_a_id));
+
+        let first_b = padded_repointed(&engine, &template, [0xB1; 32], 3, padding);
+        assert_eq!(
+            engine.ingest_judged_from_source(first_b, Some(source_b)),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.future_blocks.len(), 2);
+        assert!(engine.future_blocks.values().all(|(env, _, _, retained_bytes)| {
+            *retained_bytes == crate::codec::encode_envelope(env).len()
+        }), "every retained future entry must cache its exact wire length");
+        assert_eq!(engine.blocks.len(), stored);
+
+        let _release_clock = validator_lifecycle::clock_at(1);
+        assert!(!engine.release_future_blocks(1, FUTURE_BLOCKS_PER_TURN));
+        assert_eq!(engine.future_blocks.len(), 1);
+
+        let reopened_a = padded_repointed(&engine, &template, [0xA4; 32], 4, padding);
+        assert_eq!(
+            engine.ingest_judged_from_source(reopened_a, Some(source_a)),
+            Verdict::Ignore,
+        );
+        assert_eq!(
+            engine.future_blocks.values()
+                .filter(|(_, source, _, _)| *source == Source::Gossip(Some(source_a)))
+                .count(),
+            1,
+            "releasing the large envelope must reopen its byte allowance",
+        );
+        assert_eq!(
+            engine.future_blocks.values()
+                .filter(|(_, source, _, _)| *source == Source::Gossip(Some(source_b)))
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn future_cached_length_accounting_pins_global_source_exact_and_plus_one() {
+        let source_a = Source::Gossip(Some([0xA1; 32]));
+        let entry_bytes = FUTURE_BLOCK_BYTES_MAX / 8;
+        assert_eq!(entry_bytes * 8, FUTURE_BLOCK_BYTES_MAX);
+        assert!(entry_bytes <= crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES);
+        let retained = [
+            (source_a, entry_bytes),
+            (source_a, entry_bytes),
+            (Source::Gossip(Some([0xB1; 32])), entry_bytes),
+            (Source::Gossip(Some([0xC1; 32])), entry_bytes),
+            (Source::Gossip(Some([0xD1; 32])), entry_bytes),
+            (Source::Gossip(Some([0xE1; 32])), entry_bytes),
+            (Source::Gossip(Some([0xF1; 32])), entry_bytes),
+            (Source::Gossip(Some([0x71; 32])), entry_bytes),
+        ];
+        let (global, source_count, source_bytes) = future_retention_totals(
+            retained.iter().map(|(source, bytes)| (source, bytes)),
+            source_a,
+        );
+        assert_eq!(global, FUTURE_BLOCK_BYTES_MAX);
+        assert_eq!(source_count, 2);
+        assert_eq!(source_bytes, FUTURE_BLOCK_BYTES_PER_SOURCE);
+        assert!(retention_bytes_fit(0, global, FUTURE_BLOCK_BYTES_MAX));
+        assert!(!retention_bytes_fit(global, 1, FUTURE_BLOCK_BYTES_MAX));
+        assert!(retention_bytes_fit(0, source_bytes, FUTURE_BLOCK_BYTES_PER_SOURCE));
+        assert!(!retention_bytes_fit(
+            source_bytes,
+            1,
+            FUTURE_BLOCK_BYTES_PER_SOURCE,
+        ));
+
+        let (reopened_global, reopened_count, reopened_source_bytes) =
+            future_retention_totals(
+                retained
+                    .iter()
+                    .filter(|(source, _)| *source != source_a)
+                    .map(|(source, bytes)| (source, bytes)),
+                source_a,
+            );
+        assert_eq!(
+            reopened_global,
+            FUTURE_BLOCK_BYTES_MAX - FUTURE_BLOCK_BYTES_PER_SOURCE,
+        );
+        assert_eq!((reopened_count, reopened_source_bytes), (0, 0));
+        assert!(retention_bytes_fit(
+            reopened_global,
+            FUTURE_BLOCK_BYTES_PER_SOURCE,
+            FUTURE_BLOCK_BYTES_MAX,
+        ));
+        assert!(retention_bytes_fit(
+            reopened_source_bytes,
+            FUTURE_BLOCK_BYTES_PER_SOURCE,
+            FUTURE_BLOCK_BYTES_PER_SOURCE,
+        ));
+        assert!(reopened_count.saturating_add(2) <= FUTURE_BLOCKS_PER_SOURCE);
+    }
+
+    #[test]
+    fn repeated_deferred_orphan_cannot_bypass_its_promotion_slice() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let genesis = *engine.head_id().as_bytes();
+
+        engine.propose(1);
+        let parent = engine.blocks[engine.head_id().as_bytes()].clone();
+        engine.propose(2);
+        let child = engine.blocks[engine.head_id().as_bytes()].clone();
+        assert!(engine.do_reorg(genesis, Vec::new()));
+        engine.blocks.remove(parent.block_id().as_bytes()).expect("stored parent");
+        engine.blocks.remove(child.block_id().as_bytes()).expect("stored child");
+
+        let child_source = Source::Gossip(Some([0x73; 32]));
+        assert_eq!(
+            engine.ingest_from_judged(child.clone(), child_source),
+            Verdict::Ignore,
+        );
+        assert_eq!(
+            engine.ingest_from_judged(parent.clone(), Source::Gossip(Some([0x74; 32]))),
+            Verdict::Accept,
+        );
+        assert!(engine.orphans.is_empty());
+        assert_eq!(engine.deferred_orphans.len(), 1);
+        assert_eq!(engine.deferred_orphans[0].2, child_source);
+        assert_eq!(*engine.head_id().as_bytes(), *parent.block_id().as_bytes());
+
+        // Keep the already authenticated signed header, but make the body
+        // inconsistent with its commitment. Without the deferred-queue check,
+        // each delivery reaches body hashing and returns Reject; an unchanged
+        // duplicate can go further and enter immediately because its parent is
+        // now known, bypassing the one-block cooperative slice.
+        let mut replay = child.clone();
+        replay.body.transactions.push(vec![0xFF]);
+        assert_eq!(*replay.block_id().as_bytes(), *child.block_id().as_bytes());
+        for sequence in 0..ENGINE_EVENTS_PER_TURN.saturating_mul(2) {
+            let (verdict, landing) = engine.ingest_one(
+                replay.clone(),
+                Source::Gossip(Some([(sequence & 0xFF) as u8; 32])),
+            );
+            assert_eq!(verdict, Verdict::Ignore, "repeat {sequence} must be a cheap no-op");
+            assert!(landing.is_none());
+        }
+        assert_eq!(engine.deferred_orphans.len(), 1, "the FIFO copy remains unique");
+        assert_eq!(
+            crate::codec::encode_envelope(&engine.deferred_orphans[0].1),
+            crate::codec::encode_envelope(&child),
+            "reoffers cannot replace the authenticated FIFO copy",
+        );
+        assert_eq!(*engine.head_id().as_bytes(), *parent.block_id().as_bytes());
+
+        assert!(!engine.release_orphan_turn());
+        assert_eq!(*engine.head_id().as_bytes(), *child.block_id().as_bytes());
+    }
+
+    #[test]
+    fn audit_duplicate_parked_header_stops_before_body_revalidation() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let (mut engine, _dir, template, _) = fixture();
+        let orphan = repointed(&engine, &template, [0x9A; 32], 2);
+        engine.ingest(orphan.clone());
+        let mut duplicate = orphan;
+        // The already parked signed header is sufficient to ignore a repeat;
+        // even an altered body must not make us repeat admission work.
+        duplicate.body.transactions.push(vec![0xFF]);
+        assert!(matches!(engine.ingest_one(duplicate, Source::Gossip(None)).0, Verdict::Ignore));
+        assert_eq!(engine.orphans.len(), 1);
+        assert!(engine.orphans[0].1.body.transactions.is_empty());
+    }
+
+    #[test]
+    fn audit_finality_refusal_discards_pending_descendants_but_keeps_other_gaps() {
+        let (mut engine, _dir, template, _) = fixture();
+        let refused = repointed(&engine, &template, [0xA1; 32], 2);
+        let child = repointed(&engine, &template, *refused.block_id().as_bytes(), 3);
+        let grandchild = repointed(&engine, &template, *child.block_id().as_bytes(), 4);
+        let unrelated = repointed(&engine, &template, [0xB1; 32], 5);
+        for orphan in [grandchild, child.clone(), unrelated.clone()] {
+            engine.park_orphan(*orphan.block_id().as_bytes(), orphan, Source::Gossip(None));
+        }
+        engine.refuse_finality_rewind((1, [0xC1; 32]), &[refused]);
+        assert_eq!(engine.orphans.len(), 1);
+        assert_eq!(engine.orphans[0].0, *unrelated.block_id().as_bytes());
+        engine.needs_sync = false;
+        assert!(matches!(engine.ingest_one(child, Source::Gossip(None)).0, Verdict::Ignore));
+        assert!(!engine.needs_sync, "a refused parent is not a missing sync gap");
+    }
+
+    #[test]
+    fn finality_refusal_removes_reverse_arrival_tree_once_and_preserves_survivor() {
+        let (mut engine, _dir, template, _) = fixture();
+        let refused = repointed(&engine, &template, [0xA2; 32], 2);
+        let refused_id = *refused.block_id().as_bytes();
+
+        // 253 blocks form a chain. Two more branch from its middle, so the
+        // traversal must handle multiple children as well as reverse arrival.
+        let mut descendants = Vec::with_capacity(ORPHAN_MAX - 1);
+        let mut parent = refused_id;
+        for i in 0..(ORPHAN_MAX - 3) {
+            let env = repointed(&engine, &template, parent, (i as u64).saturating_add(3));
+            parent = *env.block_id().as_bytes();
+            descendants.push(env);
+        }
+        let branch_parent = *descendants[ORPHAN_MAX / 2].block_id().as_bytes();
+        for slot in [10_000, 10_001] {
+            descendants.push(repointed(&engine, &template, branch_parent, slot));
+        }
+        assert_eq!(descendants.len(), ORPHAN_MAX - 1);
+        let branch_ids: Vec<_> = descendants[descendants.len() - 2..]
+            .iter()
+            .map(|env| *env.block_id().as_bytes())
+            .collect();
+
+        // The direct child lands last. The old `position + remove` loop
+        // therefore walked nearly the whole shrinking queue per discovery.
+        for orphan in descendants.into_iter().rev() {
+            engine.park_orphan(*orphan.block_id().as_bytes(), orphan, Source::Local);
+        }
+        let unrelated = repointed(&engine, &template, [0xB2; 32], 20_000);
+        let unrelated_id = *unrelated.block_id().as_bytes();
+        let unrelated_bytes = crate::codec::encoded_envelope_len(&unrelated);
+        let unrelated_source = Source::Gossip(Some([0xB2; 32]));
+        engine.park_orphan(unrelated_id, unrelated.clone(), unrelated_source);
+        assert_eq!(engine.orphans.len(), ORPHAN_MAX);
+
+        engine.needs_sync = false;
+        let evicted_before = engine.orphans_evicted;
+        engine.refuse_finality_rewind((1, [0xC2; 32]), &[refused]);
+
+        assert_eq!(engine.orphans_evicted - evicted_before, (ORPHAN_MAX - 1) as u64);
+        assert_eq!(engine.orphans.len(), 1);
+        let (id, retained, source, authentication, bytes) = &engine.orphans[0];
+        assert_eq!(*id, unrelated_id);
+        assert_eq!(crate::codec::encode_envelope(retained), crate::codec::encode_envelope(&unrelated));
+        assert_eq!(*source, unrelated_source);
+        assert!(authentication.is_none());
+        assert_eq!(*bytes, unrelated_bytes);
+        assert!(!engine.needs_sync, "finality cleanup does not fabricate a new sync gap");
+        assert_eq!(engine.parked_refused_finality.len(), 1);
+        assert_eq!(engine.parked_refused_finality[0], refused_id);
+        assert!(branch_ids.iter().all(|id| !engine.parked_refused_finality.contains(id)));
+    }
+
+    #[test]
+    fn audit_noncanonical_edges_must_advance_the_parent_slot() {
+        let (mut engine, _dir, template, stored) = fixture();
+        let parent = *template.block_id().as_bytes();
+        let non_increasing = repointed(&engine, &template, parent, template.header.slot);
+        assert!(matches!(engine.ingest_one(non_increasing, Source::Gossip(None)).0, Verdict::Reject));
+        assert_eq!(engine.blocks.len(), stored);
+    }
+
+    #[test]
+    fn audit_held_boundary_attestation_uses_its_own_epoch_seed() {
+        let (mut engine, _dir, template, _) = fixture();
+        let validator = engine.manifest.validators[0].clone();
+        engine.manifest.validators = (0..64).map(|index| {
+            let mut record = validator.clone();
+            record.index = index;
+            record
+        }).collect();
+        engine.manifest.pre_state_root = std::sync::OnceLock::new();
+        engine.state.set(engine.manifest.genesis_state());
+        let genesis = engine.manifest.genesis_id();
+        engine.chain = vec![(0, genesis)];
+        engine.canonical = [*genesis.as_bytes()].into_iter().collect();
+        engine.blocks.clear();
+        engine.wall_slot = 63;
+        // Explicit ancestry fixture: epoch 2 sees the slot-40 mix, whereas
+        // the wall epoch (1) sees genesis. This tests gossip context, not
+        // block-transition validity.
+        let mut target = template.clone();
+        target.header.parent = *genesis.as_bytes();
+        target.header.slot = 40;
+        target.header.randao_mix = [0xAD; 32];
+        let target_id = *target.block_id().as_bytes();
+        engine.blocks.insert(target_id, target);
+        let mut head = template;
+        head.header.parent = target_id;
+        head.header.slot = 64;
+        let head_id = *head.block_id().as_bytes();
+        let rolled = engine.rolled_to(2);
+        let roster = rolled.active_validators();
+        let correct = committees::committee_for_slot(&[0xAD; 32], 64, &roster);
+        let wrong = committees::committee_for_slot(&engine.manifest.genesis_mix(), 64, &roster);
+        let validator = *correct.iter().find(|index| !wrong.contains(index))
+            .expect("distinct boundary seeds must exercise different membership");
+        let data = AttestationData {
+            slot: 64, head: head_id, source_epoch: 0,
+            source_root: *genesis.as_bytes(), target_epoch: 2, target_root: target_id,
+        };
+        let att = Attestation { data, validator,
+            signature: engine.keys.as_ref().unwrap().sign(&data.signing_root()) };
+        let mut pool = AttestationPool::new();
+        assert!(matches!(engine.judge(&mut pool, att.clone(), 2), GossipDecision::Hold { .. }));
+        engine.att_pool = pool;
+        engine.blocks.insert(head_id, head);
+        engine.schedule_held_release(head_id);
+        assert!(!engine.release_held_turn());
+        assert!(engine.pool.contains_key(&(validator, data.signing_root())));
+        assert_eq!(engine.att_pool.pending_len(), 0);
+    }
+
+    #[test]
+    fn audit_old_epoch_attestations_are_unjudgeable_after_head_advances() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.propose(64);
+        assert_eq!(epoch_of(engine.state.slot()), 2);
+        let data = AttestationData {
+            slot: 32, head: *engine.head_id().as_bytes(), source_epoch: 0,
+            source_root: *engine.chain[0].1.as_bytes(), target_epoch: 1,
+            target_root: *engine.head_id().as_bytes(),
+        };
+        let att = Attestation { data, validator: 0, signature: Vec::new() };
+        let decision = engine.judge(&mut AttestationPool::new(), att, 1);
+        assert!(matches!(decision, GossipDecision::Ignore(
+            bloch_pos_committee::gossip::IgnoreReason::Unjudgeable)));
     }
 
     /// **A forged signature under a key this node HAS registered is refused at
@@ -10597,6 +14070,29 @@ mod ingest_admission_tests {
         assert_eq!(engine.rejected_unsigned, 1, "and it must be counted");
     }
 
+    /// TX-16: an unauthenticated sender must not buy Merkle hashing or body
+    /// decoding. Combining a forged proposer signature with a body whose
+    /// bytes disagree with the signed root pins the precedence: signature
+    /// rejection must win. Moving the commitment/decode checks back above the
+    /// identity gate makes this return first without incrementing the forged
+    /// signature counter.
+    #[test]
+    fn forged_proposer_is_refused_before_malformed_body_work() {
+        let (mut engine, _dir, template, stored) = fixture();
+
+        let mut forged = repointed(&engine, &template, [0x9A; 32], 2);
+        forged.proposer_sig.fill(0);
+        forged.body.transactions.push(vec![0xFF; 4096]);
+        // Keep the signed header's original empty body_root on purpose.
+        let verdict = engine.ingest_judged(forged);
+
+        assert_eq!(verdict, Verdict::Reject);
+        assert_eq!(engine.rejected_unsigned, 1,
+            "authentication must run before body hashing or decoding");
+        assert_eq!(engine.blocks.len(), stored);
+        assert!(engine.orphans.is_empty());
+    }
+
     /// **O04 (external audit 2026-09-07): a signature failure under a
     /// DEPOSIT-ADDED index is not a provable forgery, so it is parked, not
     /// refused, and the relaying peer is not charged.**
@@ -10609,14 +14105,14 @@ mod ingest_admission_tests {
     /// still holds for genesis indices.
     ///
     /// The fixture's registry is entirely genesis-registered, so the branch
-    /// is simulated by lowering `genesis_validator_count` to zero: every index
+    /// is simulated by clearing genesis membership: every index
     /// is then "deposit-added" from the engine's point of view. Before the fix
     /// this block was `Reject`ed and counted as unsigned; now it is `Ignore`d
     /// and parked.
     #[test]
     fn a_failed_signature_under_a_deposit_added_index_is_parked_not_refused() {
         let (mut engine, _dir, template, stored) = fixture();
-        engine.genesis_validator_count = 0;
+        engine.genesis_validator_indices.clear();
 
         let mut other_key = repointed(&engine, &template, [0x9A; 32], 2);
         let n = other_key.proposer_sig.len();
@@ -10629,13 +14125,45 @@ mod ingest_admission_tests {
         assert_eq!(engine.rejected_unsigned, 0, "not a forgery, not counted as one");
 
         // The genesis line restored, the identical envelope IS a provable
-        // forgery again — the two rules meet exactly at `genesis_validator_count`.
+        // forgery again — the two rules use exact manifest membership.
         let (mut engine, _dir, template, stored) = fixture();
-        assert!(engine.genesis_validator_count > template.header.proposer_index);
+        assert!(engine.genesis_validator_indices.contains(&template.header.proposer_index));
         let mut forged = repointed(&engine, &template, [0x9A; 32], 2);
         forged.proposer_sig = vec![0u8; n];
         let verdict = engine.ingest_judged(forged);
         assert!(matches!(verdict, Verdict::Reject));
+        assert_eq!(engine.blocks.len(), stored);
+        assert_eq!(engine.rejected_unsigned, 1);
+    }
+
+    #[test]
+    fn rejection_logging_burst_preserves_every_forgery_verdict_and_counter() {
+        let (mut engine, _dir, template, stored) = fixture();
+        let mut forged = repointed(&engine, &template, [0x9A; 32], 2);
+        forged.proposer_sig.fill(0);
+        let before = crate::net::rejection_log::suppressed_total();
+        for _ in 0..100 {
+            assert!(matches!(engine.ingest_judged(forged.clone()), Verdict::Reject));
+        }
+        assert_eq!(engine.rejected_unsigned, 100);
+        assert_eq!(engine.blocks.len(), stored);
+        assert!(engine.orphans.is_empty());
+        assert!(crate::net::rejection_log::suppressed_total() > before);
+    }
+
+    #[test]
+    fn sparse_genesis_membership_rejects_forgery_at_high_index() {
+        let (mut engine, _dir, mut envelope, stored) = fixture();
+        let high_index = 91;
+        engine.manifest.validators[0].index = high_index;
+        engine.genesis_validator_indices = engine.manifest.validators.iter().map(|v| v.index).collect();
+        engine.state = StateCell::new(engine.manifest.genesis_state());
+        envelope.header.proposer_index = high_index;
+        envelope.header.parent = [0x9A; 32];
+        envelope.header.slot = 2;
+        envelope.proposer_sig.fill(0);
+        assert!(matches!(engine.ingest_judged(envelope), Verdict::Reject));
+        assert!(engine.orphans.is_empty(), "a sparse genesis identity is still branch-independent");
         assert_eq!(engine.blocks.len(), stored);
         assert_eq!(engine.rejected_unsigned, 1);
     }
@@ -10684,9 +14212,28 @@ mod ingest_admission_tests {
             [0x9B; 32],
             engine.wall_slot() + FUTURE_SLOT_TOLERANCE,
         );
-        engine.ingest(near);
-        assert_eq!(engine.orphans.len(), 1, "inside the tolerance it is held");
+        let release_slot = near.header.slot;
+        let future_source = [0xC1; 32];
+        engine.ingest_judged_from_source(near, Some(future_source));
+        assert_eq!(engine.future_blocks.len(), 1, "inside the tolerance it waits for its slot");
+        assert_eq!(
+            engine.future_blocks.values().next().expect("held future block").1,
+            Source::Gossip(Some(future_source)),
+            "future holding must retain the source that paid for later verification",
+        );
+        assert_eq!(engine.blocks.len(), stored, "future gossip cannot enter fork choice");
         assert_eq!(engine.rejected_future, 1, "and nothing more was refused");
+        assert!(!engine.release_future_blocks(release_slot - 1, FUTURE_BLOCKS_PER_TURN));
+        assert_eq!(engine.future_blocks.len(), 1);
+        let _clock = validator_lifecycle::clock_at(release_slot);
+        assert!(!engine.release_future_blocks(release_slot, FUTURE_BLOCKS_PER_TURN));
+        assert!(engine.future_blocks.is_empty());
+        assert_eq!(engine.orphans.len(), 1, "at its slot the unknown-parent block follows normal ingestion");
+        assert_eq!(
+            engine.orphans[0].2,
+            Source::Gossip(Some(future_source)),
+            "future release into the orphan pool must preserve attribution",
+        );
     }
 
     /// **The pool is not a black hole.** Out-of-order delivery — the child
@@ -10698,6 +14245,7 @@ mod ingest_admission_tests {
     /// be as strict as it is.
     #[test]
     fn an_orphan_is_admitted_when_its_parent_lands() {
+        let _clock = validator_lifecycle::clock_at(32);
         let (mut engine, _dir) = perf_support::proposing_engine();
         let genesis = *engine.head_id().as_bytes();
 
@@ -10730,9 +14278,13 @@ mod ingest_admission_tests {
             .expect("stored until now");
         assert_eq!(*engine.head_id().as_bytes(), genesis);
 
-        // The child first.
-        engine.ingest(b2.clone());
+        // The child first. Its source must survive parking; the parent below
+        // is deliberately attributed to a different transport identity.
+        let child_source = [0xD1; 32];
+        let parent_source = [0xD2; 32];
+        engine.ingest_judged_from_source(b2.clone(), Some(child_source));
         assert_eq!(engine.orphans.len(), 1, "the child has nowhere to attach yet");
+        assert_eq!(engine.orphans[0].2, Source::Gossip(Some(child_source)));
         assert_eq!(
             *engine.head_id().as_bytes(),
             genesis,
@@ -10740,15 +14292,154 @@ mod ingest_admission_tests {
         );
 
         // Then the parent, which must pull the child in behind it.
-        engine.ingest(b1.clone());
-        assert!(engine.orphans.is_empty(), "the child was promoted");
+        engine.ingest_judged_from_source(b1.clone(), Some(parent_source));
+        assert!(engine.orphans.is_empty(), "the child left the parked pool");
+        assert_eq!(engine.deferred_orphans.len(), 1, "promotion is scheduled");
         assert!(engine.orphans_admitted >= 1, "and the promotion was counted");
+        assert_eq!(*engine.head_id().as_bytes(), *b1.block_id().as_bytes());
+        assert!(!engine.release_orphan_turn(), "the one-child tail is drained");
         assert_eq!(
             *engine.head_id().as_bytes(),
             *b2.block_id().as_bytes(),
             "out-of-order delivery must still land on the same head as in-order \
              delivery — a bounded pool that never releases is just a slower leak"
         );
+    }
+
+    #[test]
+    fn authenticated_future_to_orphan_to_connected_skips_both_reverifications() {
+        let clock = validator_lifecycle::clock_at(1);
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let genesis = *engine.head_id().as_bytes();
+
+        engine.propose(1);
+        let parent = engine.blocks[engine.head_id().as_bytes()].clone();
+        engine.propose(2);
+        let child = engine.blocks[engine.head_id().as_bytes()].clone();
+        assert!(engine.do_reorg(genesis, Vec::new()));
+        engine.blocks.remove(parent.block_id().as_bytes()).expect("stored parent");
+        engine.blocks.remove(child.block_id().as_bytes()).expect("stored child");
+
+        let child_source = [0xD3; 32];
+        assert_eq!(
+            engine.ingest_judged_from_source(child.clone(), Some(child_source)),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.future_blocks.len(), 1);
+        assert_eq!(engine.gossip_verifier.budget_used_at(1), 1);
+
+        // The slot arrives while the parent is still absent. Releasing the
+        // future block must validate its private proof and park it with a
+        // freshly bound proof, without touching gossip crypto.
+        engine.gossip_verifier.set_panic_on_verification(true);
+        drop(clock);
+        let _clock = validator_lifecycle::clock_at(2);
+        assert!(!engine.release_future_blocks(2, FUTURE_BLOCKS_PER_TURN));
+        assert_eq!(engine.orphans.len(), 1);
+        assert!(engine.orphans[0].3.is_some());
+        assert_eq!(engine.gossip_verifier.budget_used_at(2), 0);
+
+        // The parent itself is fresh input and must still authenticate. Once
+        // it lands, the child's second promotion validates the fresh binding
+        // and reaches consensus transition without another gossip verification.
+        engine.gossip_verifier.set_panic_on_verification(false);
+        assert_eq!(
+            engine.ingest_judged_from_source(parent, Some([0xD4; 32])),
+            Verdict::Accept,
+        );
+        assert_eq!(engine.gossip_verifier.budget_used_at(2), 1);
+        assert_eq!(engine.deferred_orphans.len(), 1);
+        engine.gossip_verifier.set_panic_on_verification(true);
+        assert!(!engine.release_orphan_turn());
+        assert_eq!(engine.gossip_verifier.budget_used_at(2), 1);
+        assert_eq!(*engine.head_id().as_bytes(), *child.block_id().as_bytes());
+    }
+
+    #[test]
+    fn deferred_block_registry_key_change_reverifies_and_fails_closed() {
+        let clock = validator_lifecycle::clock_at(1);
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let (other_registry, _other_dir) = perf_support::proposing_engine();
+        let genesis = *engine.head_id().as_bytes();
+        let old_key = KeyLookup::pubkey(&*engine.state, 0).expect("original registry key").to_vec();
+        let new_key = KeyLookup::pubkey(&*other_registry.state, 0)
+            .expect("replacement registry key")
+            .to_vec();
+        assert_ne!(old_key, new_key, "control requires a real registry-key change");
+
+        engine.propose(2);
+        let future = engine.blocks[engine.head_id().as_bytes()].clone();
+        assert!(engine.do_reorg(genesis, Vec::new()));
+        engine.blocks.remove(future.block_id().as_bytes()).expect("stored future fixture");
+        assert_eq!(
+            engine.ingest_judged_from_source(future.clone(), Some([0xD5; 32])),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.gossip_verifier.budget_used_at(1), 1);
+        assert!(engine.future_blocks
+            .get(future.block_id().as_bytes())
+            .expect("future block retained")
+            .2
+            .is_some());
+
+        // Replace only the local registry projection. The queued proof is
+        // still bound to the old key and therefore cannot authorize release.
+        engine.state.set_arc(other_registry.state.arc());
+        let rejected_before = engine.rejected_unsigned;
+
+        drop(clock);
+        let _clock = validator_lifecycle::clock_at(2);
+        assert!(!engine.release_future_blocks(2, FUTURE_BLOCKS_PER_TURN));
+        assert_eq!(
+            engine.gossip_verifier.budget_used_at(2),
+            1,
+            "a changed current-key binding must pay fresh verification",
+        );
+        assert!(!engine.blocks.contains_key(future.block_id().as_bytes()));
+        assert_eq!(engine.rejected_unsigned, rejected_before + 1);
+    }
+
+    #[test]
+    fn reverse_orphan_chain_promotes_one_block_per_control_turn() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let genesis = *engine.head_id().as_bytes();
+        let mut chain = Vec::new();
+        for slot in 1..=5 {
+            engine.propose(slot);
+            chain.push(engine.blocks[engine.head_id().as_bytes()].clone());
+        }
+        assert!(engine.do_reorg(genesis, Vec::new()));
+        for block in &chain {
+            engine.blocks.remove(block.block_id().as_bytes()).expect("stored proposal");
+        }
+
+        let source = [0xE1; 32];
+        for block in chain[1..].iter().rev() {
+            assert_eq!(
+                engine.ingest_judged_from_source(block.clone(), Some(source)),
+                Verdict::Ignore,
+            );
+        }
+        assert_eq!(engine.orphans.len(), 4);
+
+        assert_eq!(
+            engine.ingest_judged_from_source(chain[0].clone(), Some([0xE2; 32])),
+            Verdict::Accept,
+        );
+        assert_eq!(engine.deferred_orphans.len(), 1);
+        assert_eq!(engine.orphans.len(), 3);
+        assert_eq!(*engine.head_id().as_bytes(), *chain[0].block_id().as_bytes());
+
+        for expected in &chain[1..4] {
+            assert!(engine.release_orphan_turn(), "a later child remains queued");
+            assert_eq!(engine.deferred_orphans.len(), 1);
+            assert_eq!(*engine.head_id().as_bytes(), *expected.block_id().as_bytes());
+        }
+        assert!(!engine.release_orphan_turn(), "the final child drains the tail");
+        assert!(engine.deferred_orphans.is_empty());
+        assert!(engine.orphans.is_empty());
+        assert_eq!(*engine.head_id().as_bytes(), *chain[4].block_id().as_bytes());
     }
 
     /// **The slot bound is a rule about PEERS, not about this node's own
@@ -10789,7 +14480,8 @@ mod ingest_admission_tests {
     }
 
     /// **A node must be able to replay its own log whatever its clock says —
-    /// and that must be true BY SOURCE, not by an accident of ordering.**
+    /// and that must be true by its dedicated path, not by an accident of
+    /// ordering.**
     ///
     /// The two halves are the same envelope, byte for byte, and they must get
     /// opposite answers:
@@ -10809,10 +14501,10 @@ mod ingest_admission_tests {
     /// node's log and its clock usually agree. `live` is set AFTER the replay
     /// loop, and it guards the OTHER check.
     ///
-    /// Mutation check: give replay `Source::Gossip` again (or drop `Replay`
-    /// from `Source::bounded_by_wall_clock`'s exempt arm) and the first half
-    /// fails — the head stays at genesis, the node having refused to replay
-    /// its own log. Drop the `Gossip` arm and the second half fails.
+    /// Mutation check: route replay through `Source::Gossip` again and the
+    /// first half fails — the head stays at genesis, the node having refused
+    /// to replay its own log. Drop the `Gossip` bound and the second half
+    /// fails.
     #[test]
     fn boot_replay_applies_a_block_the_same_node_would_reject_from_gossip() {
         let (mut engine, _dir) = perf_support::proposing_engine();
@@ -10853,11 +14545,11 @@ mod ingest_admission_tests {
         forget(&mut engine);
 
         // ── Half one: the boot path. `live` is false here exactly as it is
-        // during `run`'s replay loop, but the exemption under test is the one
-        // carried by `Source::Replay` — the horizon this block is past is not
+        // during `run`'s replay loop, but the exemption under test is the
+        // dedicated replay path — the horizon this block is past is not
         // guarded by `live` at all.
         engine.live = false;
-        engine.ingest_replay(env.clone());
+        assert!(engine.ingest_replay(env.clone()));
         assert_eq!(
             engine.head_slot_now(),
             far,
@@ -10892,11 +14584,109 @@ mod ingest_admission_tests {
         );
     }
 
+    #[test]
+    fn boot_replay_is_linear_canonical_extension_and_fails_closed() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.propose(1);
+        let first = engine.blocks.get(engine.head_id().as_bytes()).unwrap().clone();
+        engine.propose(2);
+        let second = engine.blocks.get(engine.head_id().as_bytes()).unwrap().clone();
+        let final_head = second.block_id();
+        let genesis = engine.manifest.genesis_id();
+
+        engine.state = StateCell::new(engine.manifest.genesis_state());
+        engine.blocks.clear();
+        engine.chain.truncate(1);
+        engine.canonical = BTreeSet::from([*genesis.as_bytes()]);
+        engine.recent_states.clear();
+        engine.finalized_latch = None;
+        engine.head_slot.store(0, Ordering::Relaxed);
+        engine.live = false;
+
+        assert!(!engine.ingest_replay(second.clone()), "a log gap must stop replay");
+        assert_eq!(engine.state.head(), genesis, "a refused frame must not move state");
+        assert!(engine.blocks.is_empty(), "a refused frame must not become fork-choice input");
+        assert_eq!(engine.chain.len(), 1);
+        assert_eq!(engine.canonical, BTreeSet::from([*genesis.as_bytes()]));
+        assert!(engine.recent_states.is_empty());
+        assert_eq!(engine.head_slot.load(Ordering::Relaxed), 0);
+        assert!(engine.finalized_latch.is_none());
+        assert!(engine.tx_slot_index.is_empty());
+
+        let mut forged = first.clone();
+        forged.proposer_sig[0] ^= 1;
+        assert!(!engine.ingest_replay(forged), "direct replay must retain full signature verification");
+        assert_eq!(engine.state.head(), genesis);
+        assert!(engine.blocks.is_empty());
+        assert_eq!(engine.chain.len(), 1);
+        assert_eq!(engine.canonical, BTreeSet::from([*genesis.as_bytes()]));
+        assert!(engine.recent_states.is_empty());
+        assert_eq!(engine.head_slot.load(Ordering::Relaxed), 0);
+        assert!(engine.finalized_latch.is_none());
+        assert!(engine.tx_slot_index.is_empty());
+
+        assert!(engine.ingest_replay(first));
+        assert!(engine.ingest_replay(second));
+        assert_eq!(engine.state.head(), final_head);
+        assert_eq!(engine.chain.len(), 3);
+        assert_eq!(engine.blocks.len(), 2);
+    }
+
+    #[test]
+    fn finalized_pruning_removes_high_slot_descendants_without_capping_live_branches() {
+        let (mut engine, _dir) = finality_latch_tests::engine_with_own_finality();
+        let floor = first_slot_of_epoch(engine.state.finality().finalized.epoch).unwrap();
+        assert!(floor > 2);
+        let genesis = *engine.chain[0].1.as_bytes();
+        let template = engine.blocks.get(engine.head_id().as_bytes()).unwrap().clone();
+        let root = repointed(&engine, &template, genesis, 2);
+        let child = repointed(&engine, &template, *root.block_id().as_bytes(), floor + 10);
+        let grandchild = repointed(&engine, &template, *child.block_id().as_bytes(), floor + 20);
+        let root_id = *root.block_id().as_bytes();
+        let child_id = *child.block_id().as_bytes();
+        let grandchild_id = *grandchild.block_id().as_bytes();
+        for env in [root, child, grandchild] { engine.blocks.insert(*env.block_id().as_bytes(), env); }
+        let retained = repointed(&engine, &template, *engine.head_id().as_bytes(), floor + 200);
+        let retained_id = *retained.block_id().as_bytes();
+        engine.blocks.insert(retained_id, retained);
+        let orphan = repointed(&engine, &template, grandchild_id, floor + 30);
+        let orphan_child = repointed(&engine, &template, *orphan.block_id().as_bytes(), floor + 40);
+        // Reverse arrival order must not leave a pending descendant behind.
+        let push_orphan = |engine: &mut Engine, env: BlockEnvelope| {
+            let id = *env.block_id().as_bytes();
+            let retained_bytes = crate::codec::encoded_envelope_len(&env);
+            engine.orphans.push_back((id, env, Source::Gossip(None), None, retained_bytes));
+        };
+        push_orphan(&mut engine, orphan_child);
+        push_orphan(&mut engine, orphan);
+        let old_gap = repointed(&engine, &template, [0x71; 32], 1);
+        let gap_child = repointed(&engine, &template, *old_gap.block_id().as_bytes(), floor + 50);
+        push_orphan(&mut engine, gap_child);
+        push_orphan(&mut engine, old_gap);
+        let unrelated = repointed(&engine, &template, [0x72; 32], floor + 60);
+        let unrelated_id = *unrelated.block_id().as_bytes();
+        push_orphan(&mut engine, unrelated);
+        let canonical = engine.canonical.clone();
+        let chosen_head = engine.forkchoice_head();
+        let before_blocks = engine.blocks_pruned;
+        let before_orphans = engine.orphans_evicted;
+        engine.prune_below_finalized();
+        for id in [root_id, child_id, grandchild_id] { assert!(!engine.blocks.contains_key(&id)); }
+        assert!(engine.blocks.contains_key(&retained_id), "no arbitrary cap on a still-connected branch");
+        assert_eq!(engine.orphans.len(), 1);
+        assert_eq!(engine.orphans[0].0, unrelated_id);
+        assert_eq!(engine.canonical, canonical);
+        assert_eq!(engine.forkchoice_head(), chosen_head);
+        assert_eq!(engine.blocks_pruned - before_blocks, 3);
+        assert_eq!(engine.orphans_evicted - before_orphans, 4);
+    }
+
     /// **Pruning is finality-shaped, not slot-shaped.** With nothing finalized
     /// there is no floor, so nothing may be dropped; this pins that the sweep
     /// cannot start eating a live branch on a chain that has not finalized.
     #[test]
     fn nothing_is_pruned_before_the_chain_finalizes_anything() {
+        let _clock = validator_lifecycle::clock_at(32);
         let (mut engine, _dir, template, stored) = fixture();
         assert_eq!(
             engine.state.finality().finalized.epoch,
@@ -11083,6 +14873,33 @@ mod tx_status_tests {
     }
 
     #[test]
+    fn included_reoffer_does_not_reenter_mempool() {
+        let mut e = engine_at_wall_slot(0);
+        let tx = parked_transfer(1);
+        e.note_tx_slots(epoch1_slot(), std::slice::from_ref(&tx));
+        assert!(matches!(e.on_transaction(tx), Ok(Admitted::Duplicate)));
+        assert!(e.mempool.is_empty());
+        assert!(e.mempool_admitted_at.is_empty());
+    }
+
+    #[test]
+    fn adopted_head_revalidation_removes_included_entries_and_tracking() {
+        let mut e = engine_at_wall_slot(0);
+        let included = parked_transfer(1);
+        let pending = parked_transfer(2);
+        let included_key = admit(&mut e, included.clone());
+        let pending_key = admit(&mut e, pending);
+        e.mempool_suspect.insert(included_key.clone());
+        e.note_tx_slots(epoch1_slot(), std::slice::from_ref(&included));
+        e.revalidate_lifecycle_mempool();
+        assert!(!e.mempool.contains_key(&included_key));
+        assert!(!e.mempool_admitted_at.contains_key(&included_key));
+        assert!(!e.mempool_suspect.contains(&included_key));
+        assert!(e.mempool.contains_key(&pending_key));
+        assert_eq!(e.tx_status(&included.txid()), "included");
+    }
+
+    #[test]
     fn unknown_when_never_seen() {
         let e = engine_at_wall_slot(0);
         let tx = parked_transfer(1);
@@ -11234,7 +15051,7 @@ mod finality_latch_tests {
     /// walks epochs as fast as it can sign. This is the expensive fixture —
     /// a couple of epochs of real hybrid signatures — so only the ratchet
     /// test pays for it; the refusal tests arm the latch by hand instead.
-    fn engine_with_own_finality() -> (Engine, perf_support::TestDir) {
+    pub(super) fn engine_with_own_finality() -> (Engine, perf_support::TestDir) {
         let (mut engine, dir) = perf_support::proposing_engine();
         for slot in 1..=(4 * SLOTS_PER_EPOCH) {
             engine.attest(slot);
@@ -11401,8 +15218,127 @@ mod finality_latch_tests {
         engine.refuse_finality_rewind(latch, &[env]);
 
         assert!(
-            engine.parked_refused_finality.iter().any(|(id, _)| *id == evil_id),
+            engine.parked_refused_finality.contains(&evil_id),
             "a refused block must be parked, not merely dropped"
+        );
+    }
+
+    #[test]
+    fn refused_finality_parks_only_ids_with_exact_fifo_and_descendant_door() {
+        let (mut engine, _dir, _floor, _root) = latched_engine();
+        let template = engine.blocks
+            .get(engine.chain[1].1.as_bytes())
+            .expect("block 1 stored")
+            .clone();
+        let mut branch = Vec::with_capacity(MAX_PARKED_REFUSED_FINALITY + 1);
+        for i in 0..=MAX_PARKED_REFUSED_FINALITY {
+            let mut env = template.clone();
+            env.header.slot = (i as u64).saturating_add(10_000);
+            env.header.parent = [0xD4; 32];
+            if i == 1 {
+                env.body.transactions.push(vec![0xA5; 3 * 1024 * 1024]);
+                assert!(
+                    crate::codec::encoded_envelope_len(&env)
+                        <= crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES,
+                    "the large control remains a transport-admissible envelope",
+                );
+            }
+            branch.push(env);
+        }
+        let oldest = *branch[0].block_id().as_bytes();
+        let large_id = *branch[1].block_id().as_bytes();
+        let newest = *branch.last().expect("cap+1 branch").block_id().as_bytes();
+        let before_refusals = engine.finality_rewinds_refused;
+        engine.refuse_finality_rewind(
+            engine.finalized_latch.expect("fixture is latched"),
+            &branch,
+        );
+
+        assert_eq!(engine.finality_rewinds_refused, before_refusals + 1);
+        assert_eq!(engine.parked_refused_finality.len(), MAX_PARKED_REFUSED_FINALITY);
+        assert!(!engine.parked_refused_finality.contains(&oldest), "cap+1 evicts FIFO oldest");
+        assert!(engine.parked_refused_finality.contains(&large_id));
+        assert!(engine.parked_refused_finality.contains(&newest));
+        assert_eq!(
+            std::mem::size_of_val(&engine.parked_refused_finality[0]),
+            std::mem::size_of::<[u8; 32]>(),
+            "parked entries retain identity only, never the large body",
+        );
+
+        let order_before = engine.parked_refused_finality.clone();
+        let mut same_id_variant = branch[1].clone();
+        same_id_variant.body.transactions.push(vec![0x5A]);
+        assert_eq!(*same_id_variant.block_id().as_bytes(), large_id);
+        engine.refuse_finality_rewind(
+            engine.finalized_latch.expect("fixture stays latched"),
+            &[same_id_variant],
+        );
+        assert_eq!(engine.parked_refused_finality, order_before, "exact-id dedup preserves FIFO");
+
+        let mut child = template;
+        child.header.parent = large_id;
+        child.header.slot = 20_000;
+        child.header.proposer_index = u32::MAX;
+        engine.needs_sync = false;
+        let rejected_before = engine.rejected_unsigned;
+        assert_eq!(engine.ingest_one(child, Source::Gossip(None)).0, Verdict::Ignore);
+        assert_eq!(engine.rejected_unsigned, rejected_before, "descendant door precedes crypto");
+        assert!(!engine.needs_sync, "a refused parent is not converted into a sync gap");
+    }
+
+    #[test]
+    fn refused_finality_identity_index_matches_sequential_fifo_reappearance() {
+        let (mut engine, _dir, _floor, _root) = latched_engine();
+        let template = engine.blocks
+            .get(engine.chain[1].1.as_bytes())
+            .expect("block 1 stored")
+            .clone();
+        let mut reappearing = template.clone();
+        reappearing.header.parent = [0x71; 32];
+        reappearing.header.slot = 30_000;
+        reappearing.header.randao_mix = [0x72; 32];
+        let reappearing_id = *reappearing.block_id().as_bytes();
+
+        let mut initial = VecDeque::with_capacity(MAX_PARKED_REFUSED_FINALITY);
+        initial.push_back(reappearing_id);
+        for i in 1..MAX_PARKED_REFUSED_FINALITY {
+            let mut id = [0x73; 32];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert_ne!(id, reappearing_id);
+            initial.push_back(id);
+        }
+        assert_eq!(initial.iter().copied().collect::<BTreeSet<_>>().len(), initial.len());
+        engine.parked_refused_finality = initial.clone();
+
+        let mut newcomer = template;
+        newcomer.header.parent = [0x74; 32];
+        newcomer.header.slot = 30_001;
+        newcomer.header.randao_mix = [0x75; 32];
+        let newcomer_id = *newcomer.block_id().as_bytes();
+        assert!(!initial.contains(&newcomer_id));
+        let branch = [reappearing.clone(), newcomer, reappearing];
+
+        let mut oracle = initial;
+        for env in &branch {
+            let id = *env.block_id().as_bytes();
+            if oracle.contains(&id) { continue; }
+            while oracle.len() >= MAX_PARKED_REFUSED_FINALITY {
+                oracle.pop_front();
+            }
+            oracle.push_back(id);
+        }
+
+        engine.refuse_finality_rewind(
+            engine.finalized_latch.expect("fixture is latched"),
+            &branch,
+        );
+        assert_eq!(engine.parked_refused_finality, oracle);
+        assert_eq!(engine.parked_refused_finality.len(), MAX_PARKED_REFUSED_FINALITY);
+        assert_eq!(engine.parked_refused_finality.back(), Some(&reappearing_id));
+        assert_eq!(
+            engine.parked_refused_finality.iter().filter(|id| **id == reappearing_id).count(),
+            1,
+            "an ID skipped while present may be appended after an intermediate eviction",
         );
     }
 
@@ -11436,7 +15372,7 @@ mod finality_latch_tests {
 
         let rejected_unsigned_before = engine.rejected_unsigned;
         let orphans_before = engine.orphans.len();
-        let (verdict, released) = engine.ingest_one(env, Source::Gossip);
+        let (verdict, released) = engine.ingest_one(env, Source::Gossip(None));
 
         assert_eq!(verdict, Verdict::Ignore, "a re-offered parked block must be ignored");
         assert!(released.is_none());
@@ -11517,5 +15453,157 @@ mod branch_gap_repair_tests {
             assert_eq!(node.head_id(), head);
             assert_eq!(node.state.state_root(), root);
         }
+    }
+}
+
+#[cfg(test)]
+mod validator_activity_tests {
+    use super::*;
+
+    #[test]
+    fn audit_validator_activity_tracks_registry_changes_and_signer_halt() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let (other_registry, _other_dir) = perf_support::proposing_engine();
+        let active = engine.state.arc();
+        engine.keys.as_mut().unwrap().index = crate::keys::AUTO_VALIDATOR_INDEX;
+        let metrics = crate::metrics::NodeMetrics::new();
+        let value = || metrics.validator_active.load(Ordering::Relaxed);
+        // A head whose registry does not yet contain this joining key must
+        // report pending. Later matching committed state must enable it
+        // without restarting or replacing the loaded key.
+        engine.state.set_arc(other_registry.state.arc());
+        engine.refresh_validator_activity(&metrics, 32, false);
+        assert_eq!(value(), 0);
+        engine.state.set_arc(active.clone());
+        engine.refresh_validator_activity(&metrics, 32, false);
+        assert_eq!(value(), 1);
+        engine.state.set_arc(other_registry.state.arc());
+        engine.refresh_validator_activity(&metrics, 32, false);
+        assert_eq!(value(), 0, "a changed registry cannot retain boot-time eligibility");
+        engine.state.set_arc(active);
+        engine.refresh_validator_activity(&metrics, 32, true);
+        assert_eq!(value(), 0, "boot grace is a signing gate");
+        engine.start_doppelganger_observation(100);
+        engine.refresh_validator_activity(&metrics, 100, false);
+        assert_eq!(value(), 0);
+        engine.refresh_validator_activity(&metrics, 164, false);
+        assert_eq!(value(), 1, "an observation window expires without restart");
+        engine.start_doppelganger_observation(200);
+        let index = engine.duty_index(&engine.state).unwrap();
+        engine.note_possible_doppelganger(index, 200);
+        assert!(engine.doppelganger_halted);
+        engine.refresh_validator_activity(&metrics, 1000, false);
+        assert_eq!(value(), 0, "a detected duplicate must remain visibly halted");
+    }
+}
+
+#[cfg(test)]
+mod stale_head_duty_gate_tests {
+    use super::*;
+
+    #[test]
+    fn epoch_advance_headroom_is_exact_and_saturating() {
+        let head_epoch = 10;
+        let head = head_epoch * SLOTS_PER_EPOCH + (SLOTS_PER_EPOCH - 1);
+
+        assert_eq!(
+            epoch_advance_headroom_epochs(head, head),
+            MAX_EPOCH_ADVANCE,
+            "a current head has the entire consensus gap available"
+        );
+        assert_eq!(
+            epoch_advance_headroom_epochs(
+                head,
+                (head_epoch + MAX_EPOCH_ADVANCE) * SLOTS_PER_EPOCH,
+            ),
+            0,
+            "exactly at the ceiling, no additional wall epoch remains"
+        );
+        assert_eq!(
+            epoch_advance_headroom_epochs(
+                head,
+                (head_epoch + MAX_EPOCH_ADVANCE + 1) * SLOTS_PER_EPOCH,
+            ),
+            0,
+            "past the ceiling the operator gauge saturates instead of wrapping"
+        );
+        assert_eq!(
+            epoch_advance_headroom_epochs(head, 0),
+            MAX_EPOCH_ADVANCE,
+            "a wall clock behind the head must not manufacture a warning"
+        );
+    }
+
+    #[test]
+    fn epoch_advance_warning_levels_cross_only_the_documented_thresholds() {
+        assert_eq!(epoch_advance_risk_level(EPOCH_ADVANCE_EARLY_WARNING_EPOCHS + 1), 0);
+        assert_eq!(epoch_advance_risk_level(EPOCH_ADVANCE_EARLY_WARNING_EPOCHS), 1);
+        assert_eq!(epoch_advance_risk_level(EPOCH_ADVANCE_CRITICAL_WARNING_EPOCHS + 1), 1);
+        assert_eq!(epoch_advance_risk_level(EPOCH_ADVANCE_CRITICAL_WARNING_EPOCHS), 2);
+        assert_eq!(epoch_advance_risk_level(1), 2);
+        assert_eq!(epoch_advance_risk_level(0), 3);
+    }
+
+    #[test]
+    fn a_normal_one_slot_head_gap_does_not_block_duties() {
+        assert!(!node_is_behind(99, 100, 50_000, 0, 20_000));
+        assert!(!validator_duties_blocked(false, false, false, false, false));
+    }
+
+    #[test]
+    fn distance_without_a_stalled_head_does_not_claim_sync_lag() {
+        assert!(!node_is_behind(90, 100, 50_000, 40_000, 20_000));
+        assert!(!node_is_behind(90, 100, 50_000, 30_000, 20_000));
+    }
+
+    #[test]
+    fn a_stalled_distant_head_blocks_every_slot_loop_duty() {
+        let behind = node_is_behind(90, 100, 50_001, 30_000, 20_000);
+        assert!(behind);
+        let mut gate = DutySyncGate::default();
+        assert!(gate.update(behind, 90, 100, 50_001, 20_000));
+        assert!(validator_duties_blocked(false, true, false, false, false));
+    }
+
+    #[test]
+    fn boot_grace_uses_the_same_final_gate() {
+        assert!(validator_duties_blocked(true, false, false, false, false));
+    }
+
+    #[test]
+    fn deferred_attestation_tail_uses_the_same_final_gate() {
+        assert!(validator_duties_blocked(false, false, false, true, false));
+    }
+
+    #[test]
+    fn deferred_orphan_tail_uses_the_same_final_gate() {
+        assert!(validator_duties_blocked(false, false, false, false, true));
+    }
+
+    #[test]
+    fn first_sync_progress_does_not_reenable_stale_duties() {
+        let mut gate = DutySyncGate::default();
+        assert!(gate.update(true, 10, 100, 1_000, 20_000));
+        // Applying the first page refreshes `last_applied_ms`, making the
+        // outer `behind` heuristic false. The remembered target still blocks.
+        assert!(gate.update(false, 42, 100, 2_000, 20_000));
+        assert!(gate.update(false, 98, 100, 3_000, 20_000));
+        assert!(!gate.update(false, 99, 100, 3_001, 20_000));
+    }
+
+    #[test]
+    fn quiet_sparse_chain_escapes_quarantine_with_a_retry_cooldown() {
+        let mut gate = DutySyncGate::default();
+        assert!(gate.update(true, 10, 100, 1_000, 20_000));
+        assert!(!gate.update(true, 10, 101, 21_001, 20_000));
+        // Still behind, but do not immediately re-arm and create a permanent
+        // halt when the missing slots were genuinely empty.
+        assert!(!gate.update(true, 10, 101, 30_000, 20_000));
+        assert!(gate.update(true, 10, 102, 41_001, 20_000));
+    }
+
+    #[test]
+    fn clock_regression_cannot_fabricate_elapsed_staleness() {
+        assert!(!node_is_behind(1, 100, 10, 20, 1));
     }
 }

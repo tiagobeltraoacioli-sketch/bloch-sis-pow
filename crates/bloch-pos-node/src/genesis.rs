@@ -60,10 +60,11 @@ const MANIFEST_MAGIC_V2: &[u8; 8] = b"BPOSMAN2";
 ///    whatever block happened to expose it.
 ///
 /// [`ManifestFormat::V2Bound`] closes that: `state_root` carries the genesis
-/// state's own root and `randao_mix` is seeded from the carryover digest, the
-/// way `genesis4-ceremony::genesis_header` has always assembled the published
-/// header. Two manifests that describe different ledgers then have different
-/// genesis ids, which is the property the block graph was missing.
+/// state's own root and `randao_mix` is seeded from the canonical manifest
+/// digest. The digest covers the cohort as well as the ledger, validator set,
+/// carryover commitment and clock. Two manifests that describe different
+/// networks then have different genesis ids, which is the property the block
+/// graph was missing.
 ///
 /// # Why v1 is still here
 ///
@@ -274,10 +275,9 @@ pub mod alloc_purpose {
 //
 // sorted by (txid, vout) — the tool sorts explicitly so the artifact does not
 // depend on a RocksDB iteration detail — with a trailing newline on every
-// line. Measured on the real file (2026-08-13, h39,328): 452,133 lines, ~54 MB,
-// 16 distinct addresses, 380,574,600,000,000,000 G3 satoshis; column 1 is 64
-// hex characters and column 4 is 40 in every single row. It only grows until
-// Genesis-3 halts.
+// line. Measured on the terminal file (h39,918): 452,726 lines, ~54 MB,
+// 16 distinct addresses, 381,074,400,000,000,000 G3 satoshis; column 1 is 64
+// hex characters and column 4 is 40 in every single row.
 //
 // Three properties this reader is built around:
 //
@@ -305,7 +305,7 @@ pub const MAX_CARRYOVER_ENTRIES: u64 = 16_000_000;
 const MAX_SNAPSHOT_LINE: usize = 4_096;
 
 /// A Genesis-3 address as the snapshot carries it: hash160, 20 bytes. Measured
-/// across all 452,133 rows of the 2026-08-13 snapshot — every one is 40 hex
+/// across all 452,726 rows of the terminal snapshot — every one is 40 hex
 /// characters, not one is a longer script.
 const G3_ADDRESS_BYTES: usize = 20;
 const G3_ADDRESS_HEX: usize = G3_ADDRESS_BYTES * 2;
@@ -486,7 +486,7 @@ fn canonical_u64(s: &str) -> Option<u64> {
 ///
 /// ## Who owns a carried output — founder decision, 2026-08-13
 ///
-/// The snapshot's fourth column is 20 bytes in every one of the 452,133 rows:
+/// The snapshot's fourth column is 20 bytes in every one of the 452,726 rows:
 /// a Genesis-3 hash160 address, not a script. The committed column
 /// (`EutxoEntry::script_hash`) is 32. The conversion is therefore a consensus
 /// rule — it decides who owns each output — and it was decided, not inferred:
@@ -525,14 +525,14 @@ fn canonical_u64(s: &str) -> Option<u64> {
 /// writes down, and the whole point of the 2026-08-12 decision is that every
 /// balance moves by the same ratio.
 ///
-/// Measured on the real snapshot (2026-08-13, 452,133 outputs): the aggregate
-/// is exact — 380,574,600,000,000,000 G3 sat × 100/21 =
-/// 1,812,260,000,000,000,000 with no remainder — and 452,021 rows split
+/// Measured on the terminal snapshot (height 39,918, 452,726 outputs): the
+/// aggregate is exact — 381,074,400,000,000,000 G3 sat × 100/21 =
+/// 1,814,640,000,000,000,000 with no remainder — and 452,615 rows split
 /// exactly, because a Genesis-3 coinbase of 8,400 BLCH is divisible by 21.
-/// **112 rows leave a remainder, and truncating them row by row loses 59
-/// satoshis** across the whole ledger: 0.00000059 BLOCH. Tiny, and fatal
+/// **111 rows leave a remainder, and truncating them row by row loses 57
+/// satoshis** across the whole ledger: 0.00000057 BLOCH. Tiny, and fatal
 /// anyway — [`Manifest::check_supply`] demands equality, so a launch would
-/// stop on a rounding error 59 satoshis wide.
+/// stop on a rounding error 57 satoshis wide.
 ///
 /// **The rule, stated: the largest output absorbs the whole remainder.** The
 /// remainder is `split_g3_sat(total) - Σ split_g3_sat(value_i)` — the exact
@@ -543,14 +543,18 @@ fn canonical_u64(s: &str) -> Option<u64> {
 /// state roots, so "the largest" is not enough on its own and the tie-break
 /// is part of the rule.
 ///
-/// On the real snapshot that lands the 59 satoshis on the founder's address
-/// (`e986db51…`, which holds 425,599 of the 452,133 outputs) — the same
-/// posture as the 100 B split, where the founder absorbs the rounding. The
-/// alternative considered and rejected was to declare the truncated sum as
-/// the carryover total, which closes by construction but leaves
-/// `CARRYOVER_TOTAL_BLOCH` a non-round 18,122,599,999.99999941. What is *not*
-/// acceptable is dropping the remainder, the one option that cannot close the
-/// accounting at all.
+/// On the terminal snapshot that lands the 57 satoshis on its largest single
+/// output, owned by address `cb339d2e…`, not on the founder address. The
+/// recipient follows from the committed ordering/value rule; it is not an
+/// allocation choice. The alternative considered and rejected was to declare
+/// the truncated sum as the carryover total, which would leave it a non-round
+/// 18,146,399,999.99999943 BLOCH. What is *not* acceptable is dropping the
+/// remainder, the one option that cannot close the accounting at all.
+///
+/// The terminal artifact also contains one zero-value Genesis-3 anchor
+/// coinbase. It is retained because its row is part of the committed digest,
+/// set root and count. It creates no spendable value; adding or removing such
+/// a row from mainnet fails those commitments.
 pub fn read_carryover_snapshot<R: BufRead>(
     mut src: R,
 ) -> Result<CarryoverSnapshot, CarryoverError> {
@@ -675,8 +679,8 @@ pub fn read_carryover_snapshot<R: BufRead>(
                 what: format!("value must be a canonical u64 decimal of satoshis, got {value_s:?}"),
             });
         };
-        // The address column: exactly 20 bytes in all 452,133 rows of the
-        // measured snapshot, a Genesis-3 hash160. Any other length has no
+        // The address column: exactly 20 bytes in all 452,726 rows of the
+        // terminal snapshot, a Genesis-3 hash160. Any other length has no
         // decided conversion into the 32-byte committed field, and guessing
         // one would hand the output to an owner nobody chose.
         if script_s.len() != G3_ADDRESS_HEX || !hex_into(script_s, &mut hexbuf) {
@@ -833,6 +837,27 @@ pub fn load_carryover(
 }
 
 impl Manifest {
+    /// Validate newly assembled operator input before publication. Historical
+    /// decoding and state construction intentionally retain their old meaning.
+    pub fn validate_new_validator_set(&self) -> Result<(), String> {
+        let mut indices = std::collections::BTreeSet::new();
+        let mut public_keys = std::collections::BTreeSet::new();
+        for validator in &self.validators {
+            if !indices.insert(validator.index) {
+                return Err(format!("duplicate genesis validator index {}", validator.index));
+            }
+            if !public_keys.insert(validator.pubkey.as_slice()) {
+                return Err(format!("duplicate genesis validator public key at index {}", validator.index));
+            }
+        }
+        let mut cohort = std::collections::BTreeSet::new();
+        for index in &self.cohort {
+            if !indices.contains(index) { return Err(format!("genesis cohort names unknown validator index {index}")); }
+            if !cohort.insert(*index) { return Err(format!("duplicate genesis cohort index {index}")); }
+        }
+        Ok(())
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         // The magic IS the format: everything after it is byte-identical
@@ -1239,9 +1264,10 @@ impl Manifest {
     /// manifest. Genesis is a block, so its id derives from a header through
     /// the single §5.4 path — never from a label.
     ///
-    /// Under [`ManifestFormat::V2Bound`] it commits to the ledger: the genesis
-    /// state root in `state_root` and a carryover-seeded `randao_mix`, so no
-    /// two manifests describing different chains can share a genesis id.
+    /// Under [`ManifestFormat::V2Bound`] it commits to the canonical manifest:
+    /// the genesis state root in `state_root` and a manifest-digest-seeded
+    /// `randao_mix`, so no two manifests describing different chains can
+    /// share a genesis id.
     /// Under [`ManifestFormat::V1Unbound`] every field is a constant and the
     /// id is the same for every network — see [`ManifestFormat`] for why that
     /// rule is still reachable and what it costs.
@@ -1256,26 +1282,24 @@ impl Manifest {
     /// The beacon mix genesis opens with.
     ///
     /// Under [`ManifestFormat::V2Bound`] this is one §6.3 mixing step over the
-    /// carryover digest AND the chain's clock:
-    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest ‖ genesis_time_ms ‖ slot_ms)`.
-    /// The beacon's origin entropy is then pinned to the artifact the chain
-    /// opens with and to the cadence it opens at, instead of being a constant
-    /// an operator can reuse across networks. A manifest with no carryover (a
-    /// devnet) mixes over a zero digest: the ledger binding then rests
-    /// entirely on `state_root`, which is where it belongs anyway, and the
-    /// clock terms still separate two devnets launched at different times.
+    /// canonical manifest digest:
+    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ SHA3-256(Manifest::encode()))`.
+    /// The beacon's origin entropy is then pinned to every encoded network
+    /// parameter, including the genesis cohort, validator set, carryover
+    /// commitment, allocations and clock. A manifest with no carryover (a
+    /// devnet) is still fully bound rather than falling back to a constant.
     ///
-    /// The two clock terms are the gap the first cut of this fix left open
-    /// (see the body). Correcting the expression is free today because no
-    /// `BPOSMAN2` manifest has ever been published — the format is inert
-    /// until a founder publishes one.
+    /// The full digest closes the cohort gap left by the earlier ledger-and-
+    /// clock expression. Correcting the expression is free today because no
+    /// `BPOSMAN2` manifest has ever been published — the format is inert until
+    /// a founder publishes one.
     ///
     /// # Before any `BPOSMAN2` manifest is published
     ///
     /// `tools/genesis4-ceremony::genesis_header` assembles the header the
     /// ceremony PUBLISHES, and it does not agree with this function. It mixes
-    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest)` with no clock terms, and
-    /// it also differs in three fields this one leaves zero
+    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest)` rather than the manifest
+    /// digest, and it also differs in three fields this one leaves zero
     /// (`proposer_index`, `coherence_root`, and the state root it computes
     /// from its own `Genesis`). That disagreement PREDATES this correction —
     /// the tool has never matched the v1 rule the live chain runs either —
@@ -1290,35 +1314,20 @@ impl Manifest {
         match self.format {
             ManifestFormat::V1Unbound => GENESIS_MIX,
             ManifestFormat::V2Bound => {
-                let digest = self.carryover.as_ref().map(|c| c.digest).unwrap_or([0u8; 32]);
+                let manifest_digest: [u8; 32] = Sha3_256::digest(self.encode()).into();
                 let mut h = Sha3_256::new();
                 h.update(bloch_pos_committee::params::DS_RANDAO);
                 h.update(GENESIS_MIX);
-                h.update(digest);
-                // The CLOSED GAP. The first cut of this fix mixed over the
-                // carryover digest alone, which binds the ledger and stops
-                // there. `state_root` binds the ledger too, so between them
-                // the ONLY manifest fields left out of the genesis id were
-                // these two -- and they are the two that define the chain's
-                // clock. Measured on the b2 branch: two manifests differing
-                // only in `slot_ms` produced the SAME genesis block id under
-                // the bound format, and so did two differing only in
-                // `genesis_time_ms`.
-                //
-                // That is the finding's own sentence unfulfilled. A node on
-                // `slot_ms = 1_000` and a node on `slot_ms = 30_000` compute
-                // different slots for the same instant, therefore different
-                // epochs, committees and duties: they are not one network
-                // that disagrees, they are two networks. Leaving them sharing
-                // a genesis id reproduces exactly what C5 exists to close --
-                // a substituted manifest that pairs at height 0 and diverges
-                // later, as somebody else's block being blamed.
-                //
-                // Fixed widths, little-endian, declaration order: the same
-                // encoding `Manifest::encode` writes them in, so there is one
-                // reading of these bytes in the codebase and not two.
-                h.update(self.genesis_time_ms.to_le_bytes());
-                h.update(self.slot_ms.to_le_bytes());
+                // SR-01. The cohort changes duty weights at every epoch, but
+                // `CommittedState::compute_root` intentionally excludes it.
+                // The old V2 expression covered carryover and the clock only,
+                // so two networks with different cohorts still paired at
+                // block zero. Hashing the canonical encoding binds every
+                // manifest field without duplicating a second field list that
+                // can drift again. Loaded carryover entries are represented by
+                // their four-field commitment in that encoding and are also
+                // checked independently before state construction.
+                h.update(manifest_digest);
                 h.finalize().into()
             }
         }
@@ -1362,12 +1371,14 @@ impl Manifest {
     /// The cut: the state is built against [`Self::anchor_header`]'s id — the
     /// header with `state_root` still zero — and its root is what the final
     /// header carries. Every ledger fact is inside it: the validator registry
-    /// with its stakes, commissions and RANDAO commitments; the genesis
-    /// cohort; every opening balance (the whole carryover plus the vested
+    /// with its stakes, commissions and RANDAO commitments; every opening
+    /// balance (the whole carryover plus the vested
     /// allocations, through the eUTXO subtree); `issued_sat`; the taint,
     /// coherence and EVM commitments; epoch-0 participation. The only input
     /// NOT under it is the 32 bytes that are the answer — and those are
-    /// determined by everything that is.
+    /// determined by everything that is. The genesis cohort is deliberately
+    /// outside this state root; V2 binds it through the manifest digest in
+    /// [`Self::genesis_mix`] instead.
     ///
     /// So `genesis_id` becomes a function of the ledger, which is the whole
     /// point: substituting a manifest now moves the genesis block id, and a
@@ -1473,7 +1484,7 @@ impl Manifest {
     /// If the manifest commits to a carryover and none was ingested. That
     /// combination is the bug this path exists to make impossible — a mainnet
     /// launched from it opens with a state root nobody else computes and
-    /// 452,133 outputs missing, and it would do so silently, which is the one
+    /// 452,726 outputs missing, and it would do so silently, which is the one
     /// outcome worse than not starting. It also panics on a duplicated
     /// outpoint between the two sets: `CommittedState::genesis` keys its map
     /// by `(txid, vout)`, so a collision would drop an output and leave the
@@ -1710,6 +1721,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn audit_new_genesis_refuses_aliasing_without_reinterpreting_historical_bytes() {
+        let mut manifest = sample();
+        assert!(manifest.validate_new_validator_set().is_ok());
+        manifest.validators[1].index = manifest.validators[0].index;
+        assert!(manifest.validate_new_validator_set().unwrap_err().contains("duplicate genesis validator index"));
+        assert!(Manifest::decode(&manifest.encode()).is_ok(), "historical decode remains unchanged");
+        manifest = sample();
+        manifest.validators[1].pubkey = manifest.validators[0].pubkey.clone();
+        assert!(manifest.validate_new_validator_set().unwrap_err().contains("duplicate genesis validator public key"));
+        manifest = sample();
+        manifest.cohort = vec![0, 0];
+        assert!(manifest.validate_new_validator_set().unwrap_err().contains("duplicate genesis cohort"));
+        manifest.cohort = vec![99];
+        assert!(manifest.validate_new_validator_set().unwrap_err().contains("unknown validator"));
+    }
+
     // ── Carryover fixtures ──────────────────────────────────────────────
     //
     // A hand-built snapshot in the shape `bloch-snapshot-utxo` writes:
@@ -1723,7 +1751,7 @@ mod tests {
     //     BLCH is, so most real rows cross the split with no remainder at all;
     //   - three small values that are NOT, so the per-row truncation and the
     //     dust rule are live in every test that uses this file rather than
-    //     being dead code until the real 452,133-line snapshot arrives.
+    //     being dead code until the real 452,726-line snapshot arrives.
     //
     // The arithmetic, in full, because a fixture whose numbers are asserted
     // but not derived is a fixture that can agree with a broken split:
@@ -1830,6 +1858,7 @@ mod tests {
     /// participate; fixing only the verifier produces a validator everyone can
     /// verify and that cannot start.
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_refuses_a_deposit_added_validator() {
         use crate::engine::{check_keystore_identity, KeystoreIdentity};
         let m = sample(); // three genesis validators: indices 0, 1, 2
@@ -1844,6 +1873,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_admits_a_genesis_validator() {
         use crate::engine::{check_keystore_identity, KeystoreIdentity};
         let m = sample();
@@ -1857,6 +1887,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_rejects_a_wrong_key_at_a_real_index() {
         use crate::engine::{check_keystore_identity, KeystoreIdentity};
         let m = sample();
@@ -1875,6 +1906,7 @@ mod tests {
     /// old expression would have indexed position 9 of a 3-element vector and
     /// panicked. The extracted version uses the record it already found.
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_does_not_index_the_manifest_by_position() {
         use crate::engine::{check_keystore_identity, KeystoreIdentity};
         let mut m = sample();
@@ -1899,6 +1931,7 @@ mod tests {
     /// A manifest validator whose committed RANDAO commitment really is the
     /// head of the chain `seed` generates — so `RandaoMismatch` in these tests
     /// means what it says, rather than being an artifact of a filler fixture.
+    #[cfg(not(bloch_indexer))]
     fn validator_with_seed(index: u32, key_seed: u8, randao_seed: [u8; 32]) -> ManifestValidator {
         ManifestValidator {
             index,
@@ -1913,6 +1946,7 @@ mod tests {
 
     /// A registry that has taken a deposit: genesis indices 0..3, plus one
     /// newcomer at the index a deposit would allocate next.
+    #[cfg(not(bloch_indexer))]
     fn registry_with_newcomer(seed: [u8; 32]) -> bloch_pos_committee::transition::CommittedState {
         let mut m = sample();
         m.validators.push(validator_with_seed(3, 0x7E, seed));
@@ -1921,6 +1955,7 @@ mod tests {
 
     /// The point of the whole exercise: the newcomer's own node boots.
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_registry_admits_a_deposit_added_validator() {
         use crate::engine::{check_registry_identity, RegistryIdentity};
         let seed = [0x7Eu8; 32];
@@ -1935,6 +1970,7 @@ mod tests {
     /// keystore and its deposit being applied, and the old gate turned it into
     /// a refusal to boot.
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_registry_pends_an_unregistered_validator() {
         use crate::engine::{check_registry_identity, RegistryIdentity};
         let m = sample();
@@ -1950,6 +1986,7 @@ mod tests {
     /// minted for an index before depositing can be beaten to it. Booting
     /// there would sign under another validator's identity.
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_registry_refuses_an_index_owned_by_another_key() {
         use crate::engine::{check_registry_identity, RegistryIdentity};
         let seed = [0x7Eu8; 32];
@@ -1968,6 +2005,7 @@ mod tests {
     /// Right key, unusable RANDAO chain: every block this node proposed would
     /// carry a reveal the network refuses, so it must not start.
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_registry_refuses_a_seed_that_does_not_open_the_commitment() {
         use crate::engine::{check_registry_identity, RegistryIdentity};
         assert_eq!(
@@ -1986,6 +2024,7 @@ mod tests {
     /// validator the registry gate admits. Shipping only the pre-pass verdict
     /// is what closed the network.
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_the_manifest_prepass_and_the_registry_gate_disagree_by_design() {
         use crate::engine::{
             check_keystore_identity, check_registry_identity, KeystoreIdentity, RegistryIdentity,
@@ -2314,31 +2353,55 @@ mod tests {
             "the fixture must differ in balances alone for this test to mean anything"
         );
         assert_ne!(a.genesis_pre_state_root(), b.genesis_pre_state_root());
-        // A changed cohort must move it too — same commitment, other half.
+        // A changed validator stake must move it too — same commitment,
+        // registry half.
         let mut c = bound(mainnet_sample());
         c.validators[1].stake_sat += 1;
         assert_ne!(a.genesis_pre_state_root(), c.genesis_pre_state_root());
     }
 
-    /// The mix is seeded by the carryover digest, by the same expression
-    /// `genesis4-ceremony::genesis_header` publishes:
-    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest)`.
+    /// SR-01: the cohort changes consensus duties but is intentionally absent
+    /// from `CommittedState::compute_root`. The V2 manifest digest must carry
+    /// it into both the genesis header and the state root (through the opening
+    /// mix). V1 remains frozen for historical replay.
+    #[test]
+    fn bound_genesis_identity_follows_the_genesis_cohort() {
+        let a = bound(mainnet_sample());
+        let mut b = bound(mainnet_sample());
+        b.cohort = vec![1];
+
+        assert_ne!(
+            a.encode(),
+            b.encode(),
+            "fixture must differ in cohort membership"
+        );
+        assert_ne!(a.genesis_mix(), b.genesis_mix());
+        assert_ne!(a.genesis_pre_state_root(), b.genesis_pre_state_root());
+        assert_ne!(a.genesis_id().as_bytes(), b.genesis_id().as_bytes());
+
+        let legacy_a = mainnet_sample();
+        let mut legacy_b = mainnet_sample();
+        legacy_b.cohort = vec![1];
+        assert_eq!(
+            legacy_a.genesis_id().as_bytes(),
+            legacy_b.genesis_id().as_bytes(),
+            "BPOSMAN1 replay identity is consensus-frozen"
+        );
+    }
+
+    /// The V2 mix is seeded by the digest of the canonical manifest bytes:
+    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ SHA3-256(Manifest::encode()))`.
     ///
     /// Written out by hand rather than called through `genesis_mix`, so this
     /// pins the formula and not the implementation of it.
     #[test]
-    fn bound_genesis_mix_is_seeded_by_the_carryover_digest() {
+    fn bound_genesis_mix_is_seeded_by_the_manifest_digest() {
         let m = bound(mainnet_sample());
         let mut h = Sha3_256::new();
         h.update(bloch_pos_committee::params::DS_RANDAO);
         h.update([0u8; 32]);
-        h.update(m.carryover.as_ref().expect("the mainnet fixture commits to a carryover").digest);
-        // The clock terms, in the widths and order `Manifest::encode` writes
-        // them. Pinned here by hand for the same reason the rest of the
-        // expression is: a formula a test derives through the function it is
-        // checking pins nothing.
-        h.update(m.genesis_time_ms.to_le_bytes());
-        h.update(m.slot_ms.to_le_bytes());
+        let manifest_digest: [u8; 32] = Sha3_256::digest(m.encode()).into();
+        h.update(manifest_digest);
         let want: [u8; 32] = h.finalize().into();
 
         assert_eq!(m.genesis_mix(), want);
@@ -2541,6 +2604,24 @@ mod tests {
         assert_ne!(s.entries[0].script_hash, s.entries[2].script_hash);
     }
 
+    /// The published terminal artifact contains the zero-value Genesis-3
+    /// anchor coinbase. Its value remains zero after the split, but the row is
+    /// still identity-bearing committed state and must not be silently
+    /// dropped by a parser that otherwise accepts the published bytes.
+    #[test]
+    fn committed_zero_value_anchor_is_preserved() {
+        let row = concat!(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "\t0\t0\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        );
+        let snapshot = read(row).expect("the historical zero-value row is canonical");
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].value, 0);
+        assert_eq!(snapshot.g3_total_sat, 0);
+        assert_eq!(snapshot.total_sat, 0);
+        assert_eq!(snapshot.dust_sat, 0);
+    }
+
     /// The ownership rule, pinned in the only way that catches the failure
     /// that matters: the Genesis-3 address occupies the FIRST 20 bytes and the
     /// LAST 12 are zero.
@@ -2667,7 +2748,7 @@ mod tests {
 
     /// The accounting closes at scale, on a file where almost every row
     /// truncates. Four rows can be reasoned about by hand; 20,000 cannot, and
-    /// the real snapshot is 452,133 — the case where a per-row dust rule
+    /// the terminal snapshot is 452,726 — the case where a per-row dust rule
     /// either closes the total or quietly loses a few hundred thousand
     /// satoshis. Also the shape a streaming reader is for: this file is
     /// ~1.4 MB, the real one is ~54 MB, and neither is ever held as a
@@ -2854,7 +2935,7 @@ mod tests {
         assert_ne!(
             with.genesis_state().state_root(),
             without.genesis_state().state_root(),
-            "452,133 outputs must not be invisible at the state root"
+            "452,726 outputs must not be invisible at the state root"
         );
         // And the carried outputs are actually in the committed set, not
         // merely different-looking: carryover first, then allocations.
@@ -3319,7 +3400,34 @@ mod blp02_hybrid_suite {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../genesis/mainnet.manifest");
         let Ok(bytes) = std::fs::read(path) else { return };
         match Manifest::decode(&bytes) {
-            Ok(m) => assert_eq!(m.validators.len(), 64, "the live set is 64 validators"),
+            Ok(m) => {
+                assert_eq!(m.validators.len(), 64, "the live set is 64 validators");
+
+                // ST-11 tripwire: these two immutable manifest-derived values
+                // are consensus inputs even though historical state roots do
+                // not carry them. Pin the published mainnet encoding so a
+                // format or manifest edit cannot silently move funded-deposit
+                // authorization or genesis-principal write-off semantics.
+                let expected_domain = [
+                    0xf4, 0x7d, 0x3e, 0x49, 0x8f, 0xf9, 0x78, 0xe3, 0x44, 0x71, 0xda, 0xff,
+                    0xf5, 0xf9, 0x4f, 0xe1, 0x39, 0xfc, 0x3f, 0xf4, 0x89, 0xb1, 0xa0, 0x0f,
+                    0x46, 0x9c, 0x03, 0x02, 0x58, 0x31, 0x19, 0x66,
+                ];
+                assert_eq!(
+                    <[u8; 32]>::from(Sha3_256::digest(m.encode())),
+                    expected_domain,
+                    "the live admission network domain is a release identity",
+                );
+
+                let principal = m.validators.iter().try_fold(0u128, |sum, validator| {
+                    sum.checked_add(validator.stake_sat)
+                });
+                assert_eq!(
+                    principal,
+                    Some(1_600_000u128 * bloch_pos_committee::tokenomics_v4::SAT_PER_BLOCH),
+                    "the live genesis principal is the 64-validator launch bond",
+                );
+            }
             Err(e) => panic!("the live Genesis-4 manifest must decode, got: {}", e.0),
         }
     }

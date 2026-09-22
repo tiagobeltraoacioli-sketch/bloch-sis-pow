@@ -53,60 +53,98 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
 
+# Do not let the hosted runner's inherited shell/Python/Rust environment
+# choose what these reviewed commands execute. Keep rustup's conventional
+# shims and locally installed CI tools reachable, without inheriting a PATH
+# suffix or loading shell profiles.
+defaults:
+  run:
+    shell: /usr/bin/env -u BASH_ENV -u ENV -u PYTHONHOME -u PYTHONPATH -u CARGO_HOME -u RUSTUP_HOME -u RUSTUP_TOOLCHAIN -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u RUSTC -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u CARGO_BUILD_RUSTFLAGS -u CARGO_BUILD_RUSTC -u CARGO_BUILD_RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER PATH=/home/runner/.cargo/bin:/home/runner/.local/bin:/usr/local/bin:/usr/bin:/bin /bin/bash --noprofile --norc -euo pipefail {0}
+
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # cargo test over the live crates — BLOCKING. One invocation, so a failure
-  # in any crate fails the job; --locked so the gate tests the committed
-  # dependency graph, not whatever resolves on the runner today.
+  # cargo test over the live crates — BLOCKING. One named step per crate makes
+  # a failure attributable from the job summary while every step remains in the
+  # same blocking job; --locked tests the committed dependency graph.
   cargo-test:
     name: cargo test — live crates (blocking)
     runs-on: ubuntu-latest
-    # Measured 2026-09-05 on an 8-core dev machine: ~51 min of test wall time
-    # alone (the committee's 8,192-step SHAKE reveal chains and the Module-SIS
-    # mining test are ~23 min EACH in a debug build) before compile. 60 would
-    # gate by luck on a 2-core hosted runner.
+    # The committee's 8,192-step SHAKE reveal chains remain intentionally
+    # expensive. The former ~19-minute debug SIS suite is now ~2 minutes via
+    # the root package profile (LD-03), but 120 minutes preserves headroom for
+    # the full eight-crate suite on a 2-core hosted runner.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Pinned toolchain (crates/bloch-pos-node/rust-toolchain.toml)
         id: pin
         run: |
-          ch="$(sed -n 's/^channel *= *"\(.*\)".*/\1/p' crates/bloch-pos-node/rust-toolchain.toml)"
-          if [ -z "$ch" ]; then
-            echo "cannot read the toolchain pin — refusing to test on a floating toolchain" >&2
-            exit 1
-          fi
+          ch="$(python3 -I scripts/pinned-rust-toolchain.py)"
           rustup toolchain install "$ch" --profile minimal --no-self-update
           echo "toolchain=$ch" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install C toolchain (rocksdb bindgen, blst, PQClean)
         run: sudo apt-get update && sudo apt-get install -y clang cmake
       - name: Funded validator admission (isolated epoch-zero rehearsal)
-        run: python3 scripts/rehearse-validator-admission.py
+        run: python3 -I scripts/rehearse-validator-admission.py
       - name: Validator withdrawal guard mutations
-        run: python3 scripts/check-validator-lifecycle-mutations.py
+        run: python3 -I scripts/check-validator-lifecycle-mutations.py
+      - name: Public bootnode RPC refusal regression
+        run: bash deploy/bootnodes/verify-bootnodes.selftest.sh
+      - name: Retired consensus isolation
+        run: |
+          python3 -I scripts/check-live-node-retired-isolation.py --selftest
+          python3 -I scripts/check-live-node-retired-isolation.py
       - name: Finite validator activation boundary and replay
-        run: python3 scripts/rehearse-validator-activation.py --output "$RUNNER_TEMP/validator-activation"
+        run: python3 -I scripts/rehearse-validator-activation.py --output "$RUNNER_TEMP/validator-activation"
       - name: Funded validator joining between independent processes
-        run: python3 scripts/rehearse-validator-joining-network.py --output "$RUNNER_TEMP/validator-joining-network"
+        run: python3 -I scripts/rehearse-validator-joining-network.py --output "$RUNNER_TEMP/validator-joining-network"
       - name: Input-boundary regressions (before the full suite)
         run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node --bin bloch-pos audit_
       - name: Entropy guard regressions and thread-affinity doctests
         run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p pqcrypto-internals
-      - name: cargo test (live crates)
+      - name: cargo test — bloch-pos-committee
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-committee
+      - name: cargo test — bloch-pos-node
         run: |
-          cargo +${{ steps.pin.outputs.toolchain }} test --locked \
-            -p bloch-pos-committee \
-            -p bloch-pos-node \
-            -p bloch-crypto \
-            -p coherence-core \
-            -p bloch-sis-pow \
-            -p bloch-pq-vault \
-            -p pqcrypto-internals \
-            -p genesis4-ceremony
+          log="$RUNNER_TEMP/bloch-pos-node-test.log"
+          if cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node 2>&1 | tee "$log"; then
+            status=${PIPESTATUS[0]}
+          else
+            status=${PIPESTATUS[0]}
+          fi
+          if (( status != 0 )); then
+            diagnostic="$(
+              awk '
+                index($0, "failures:") { capture = 1 }
+                capture { print }
+                index($0, "test result: FAILED") { exit }
+              ' "$log"
+            )"
+            if [[ -z "$diagnostic" ]]; then
+              diagnostic="$(tail -n 80 "$log")"
+            fi
+            diagnostic="${diagnostic//'%'/'%25'}"
+            diagnostic="${diagnostic//$'\r'/'%0D'}"
+            diagnostic="${diagnostic//$'\n'/'%0A'}"
+            printf '::error title=bloch-pos-node tests failed::%s\n' "$diagnostic"
+          fi
+          exit "$status"
+      - name: cargo test — bloch-crypto
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-crypto
+      - name: cargo test — coherence-core
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p coherence-core
+      - name: cargo test — bloch-sis-pow
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-sis-pow
+      - name: cargo test — bloch-pq-vault
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pq-vault
+      - name: cargo test — pqcrypto-internals
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p pqcrypto-internals
+      - name: cargo test — genesis4-ceremony
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p genesis4-ceremony
 
   # ADR-041 lifecycle flag-day guards (deploy/FLAG-DAY-LIFECYCLE.md). Three
   # things, each blocking, none of which the cargo-test job above measures:
@@ -130,9 +168,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: arming tool selftest (the tool must be able to refuse)
-        run: python3 scripts/arm-lifecycle-epoch.selftest.py
+        run: python3 -I scripts/arm-lifecycle-epoch.selftest.py
       - name: constants, runbook and tripwires agree
-        run: python3 scripts/arm-lifecycle-epoch.py --verify
+        run: python3 -I scripts/arm-lifecycle-epoch.py --verify
       - name: Pinned toolchain (crates/bloch-pos-node/rust-toolchain.toml)
         run: |
           ch="$(sed -n 's/^channel *= *"\(.*\)".*/\1/p' crates/bloch-pos-node/rust-toolchain.toml)"
@@ -145,7 +183,7 @@ jobs:
       - name: Install C toolchain (rocksdb bindgen, blst, PQClean)
         run: sudo apt-get update && sudo apt-get install -y clang cmake
       - name: ADR-041 withdrawal guard mutations (each must kill a test)
-        run: python3 scripts/check-validator-lifecycle-mutations.py
+        run: python3 -I scripts/check-validator-lifecycle-mutations.py
 
   # tests-blocking guard — the regression test for finding TEST1 itself. Fails
   # if this workflow or GitLab's build-and-test loses a live crate, loses its
@@ -157,10 +195,20 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: selftest (the guard must be able to fail)
-        run: python3 scripts/check-tests-blocking.selftest.py
+        run: python3 -I scripts/check-tests-blocking.selftest.py
       - name: guard
-        run: python3 scripts/check-tests-blocking.py
+        run: python3 -I scripts/check-tests-blocking.py
+      - name: Rust toolchain pin parser and consumer selftest
+        run: python3 -I scripts/pinned-rust-toolchain.test.py
       - name: Partition report rejects missing evidence
-        run: python3 scripts/devnet-particao-report.test.py
+        run: python3 -I scripts/devnet-particao-report.test.py
       - name: Activation rehearsal refuses unexpected gate changes
-        run: python3 scripts/rehearse-validator-activation.test.py
+        run: python3 -I scripts/rehearse-validator-activation.test.py
+      - name: Attested-image remote-access guard selftest
+        run: python3 -I scripts/check-attested-ssh.selftest.py
+      - name: Attested-image remote-access guard
+        run: python3 -I scripts/check-attested-ssh.py
+      - name: Installer ISO hardening guard selftest
+        run: python3 -I scripts/check-iso-hardening.selftest.py
+      - name: Installer ISO hardening guard
+        run: python3 -I scripts/check-iso-hardening.py

@@ -17,7 +17,7 @@ L1, no rollups*) is taken as given.
 | Question | Decision |
 |---|---|
 | One state root or two? | **One.** `BlockHeaderV4.state_root` stays the single commitment; the header layout does not change (`ENCODED_LEN` untouched). |
-| New leaves? | **Exactly one**: a singleton `EvmCommitment` leaf under component tag `0x09`, the same carried-foreign-root posture as the taint and Coherence leaves. Per-account EVM state does **not** enter the SMT. |
+| New leaves? | The design reserved one singleton `EvmCommitment` leaf under append-only component tag `0x10`; it is all-zero with no production writer today. Per-account EVM state does **not** enter the SMT. |
 | EVM tx spends a UTXO? | **No.** Value crosses through two native protocol operations — deposit outputs and a withdrawal precompile — with a deterministic per-block phase order (§4). |
 | Contract receives from the shielded pool? | **Not directly.** Coherence is C1-frozen; the path is unshield → transparent → deposit, two transactions (§4.4). |
 | EVM implementation | **revm**, exact-version pinned, `SpecId::CANCUN`, single-threaded in body order; a version bump is a height-gated hard fork with regenerated KATs (§5). |
@@ -25,15 +25,16 @@ L1, no rollups*) is taken as given.
 
 ## 2. One root, one new leaf
 
-### 2.1 Why the closed list opens here — and closes again
+### 2.1 The compatibility DTO and the live component registry
 
-The `state_root` leaf list is closed on purpose, and the closure rule states
-its own amendment procedure
-(`crates/bloch-pos-committee/src/interfaces.rs::StateRoots`): *"a consensus
-rule that needs a value not represented here must first add its component —
-visibly, in a spec change."* This document is that spec change. The list is
-not being made open-ended; it is being amended once, from seven components to
-eight, and is closed again at eight.
+This section originally treated `interfaces.rs::StateRoots` as the exhaustive
+live tree and claimed it re-closed at eight components. That never became the
+production architecture. `StateRoots` is now a 14-field legacy DTO with no
+production `StateCommitment` implementation; production folds
+`state_root::ConsensusState`, whose append-only `STATE_COMPONENT_TAGS`
+registry contains 30 components. The EVM reservation is tag `0x10`, not
+`0x09`, and remains design-only/all-zero until a coordinated admission path
+and writer exist.
 
 The precedent is already inside the tree: the taint root and the two Coherence
 roots are *carried foreign roots* — commitments maintained by another
@@ -202,7 +203,7 @@ That linkability is not new — an unshield to a transparent address has always
 been visible; the pool's privacy properties are unchanged because the EVM
 never touches the accumulator or nullifier set. The Coherence roots' leaf
 positions and the accumulator's carried-never-recomputed rule are untouched
-by this entire design (the new tag `0x09` derives a fresh SMT key; existing
+by this entire design (the reserved tag `0x10` derives a fresh SMT key; existing
 leaf keys — which are what "leaf positions are consensus" pins — are
 byte-identical before and after).
 
@@ -363,7 +364,7 @@ withdrawal outputs are locked by caller-chosen (normally PQ) scripts.
 **Implemented on this wave (all in `crates/bloch-pos-committee`, 271 tests
 green from the crate directory):**
 
-- `state_root.rs`: `TAG_EVM_COMMITMENT = 0x09`, the `EvmCommitment` struct
+- `state_root.rs`: `TAG_EVM_COMMITMENT = 0x10`, the `EvmCommitment` struct
   with canonical 80-byte serialization, the singleton leaf insert, the
   `ConsensusState.evm` field; tests extended — per-field load-bearing
   mutations for all four fields, plus `evm_commitment_fields_do_not_alias`
@@ -373,9 +374,9 @@ green from the crate directory):**
 - `transition.rs`: `CommittedState` carries the commitment;
   `CommittedState::genesis` takes it as an explicit input (it is execution-
   layer data, so consensus receives it, never invents it).
-- `interfaces.rs`: `StateRoots` gains the `evm` component with the
-  carried-never-recomputed contract in its doc. **This amends the frozen
-  interface**; flagged here per the fleet brief rather than done silently.
+- `interfaces.rs`: the legacy `StateRoots` DTO gained the `evm` field with the
+  carried-never-recomputed contract in its doc. This did not make the DTO the
+  production component registry.
 - `docs/specs/BLOCH-POS-NODE-INTEGRATION.md`'s `state_roots` storage-row size
   updated to include the 80-byte commitment.
 

@@ -1,0 +1,29 @@
+Validation wave 40 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Classification correction only; no new implementation commit.
+
+PASS
+
+cargo test --locked --offline --manifest-path pool-proxy/Cargo.toml
+  207 unit tests passed; 0 failed.
+  3 integration tests passed; 0 failed.
+  0 binary tests; 2 doc tests ignored.
+
+The suite uses ephemeral loopback sockets. A sandboxed attempt produced 35
+PermissionDenied bind failures and 172 passes; the same suite with local socket
+access passed completely.
+
+Ledger parser
+  200 rows; 200 unique finding IDs.
+  66 IMPLEMENTED; 88 PARTIAL; 31 OPEN; 7 BASE CHANGED;
+  4 PROTOCOL DECISION; 1 UNARMED CANDIDATE;
+  1 REFUTED IN AUDIT; 2 VERIFIED POSITIVE.
+
+git diff --check
+  Passed after the documentation update.
+
+BOUNDARY
+
+LG-11 is the audit's own verified-positive conclusion. It is not approval to
+redeploy the retired PoW pool/proxy without a fresh residual and operational
+review.

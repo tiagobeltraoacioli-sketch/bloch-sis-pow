@@ -16,3 +16,5 @@ bloch-euvm = { path = "../bloch-euvm" }
 # seed instead of reusing it verbatim.
 sha3 = "0.10"
 thiserror = "2"
+
+zeroize = "1"

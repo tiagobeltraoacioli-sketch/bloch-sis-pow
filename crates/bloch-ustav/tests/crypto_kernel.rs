@@ -132,6 +132,33 @@ fn malformed_keys_suites_and_each_tampered_signature_leg_fail() {
 }
 
 #[test]
+fn canonical_verifier_rejects_padded_falcon_without_raw_fallback() {
+    let message = [63; 32];
+    let padded_len = crypto::SUITE_HEADER_LEN
+        + crypto::MLDSA_SIG_LEN
+        + crypto::falcon::padded_signature_len();
+    let compact = (0..64)
+        .map(|_| signed(&message))
+        .find(|candidate| candidate.len() < padded_len)
+        .expect("compact fixture must leave room for Falcon padding");
+
+    assert!(BlochVerifier.verify_pq(&message, &keys().0, &compact));
+    assert!(CanonicalBlochVerifier.verify_pq(&message, &keys().0, &compact));
+
+    let mut padded = compact.clone();
+    padded.resize(padded_len, 0);
+    assert!(
+        BlochVerifier.verify_pq(&message, &keys().0, &padded),
+        "compatibility verifier must retain padded Falcon acceptance"
+    );
+    assert!(!CanonicalBlochVerifier.verify_pq(&message, &keys().0, &padded));
+
+    let raw = &compact[crypto::SUITE_HEADER_LEN..];
+    assert!(!BlochVerifier.verify_pq(&message, &keys().0, raw));
+    assert!(!CanonicalBlochVerifier.verify_pq(&message, &keys().0, raw));
+}
+
+#[test]
 fn native_custody_requires_two_real_pq_custodians_plus_owner() {
     let custodian = crypto::generate_keypair_from_seed(&[18; 32]).unwrap();
     let mut r = registration();

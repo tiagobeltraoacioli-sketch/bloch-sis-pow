@@ -153,6 +153,8 @@ pub use forkchoice::{BlockTree, LatestMessage, Store};
 pub use gossip::{
     AttestationPool, BlockLookup, CommitteeLookup, GossipDecision, IgnoreReason,
     ATTESTATION_WINDOW_SLOTS, MAX_EQUIVOCATIONS_PER_DUTY, MAX_PENDING_ATTESTATIONS,
+    MAX_PENDING_ATTESTATIONS_PER_ROOT, MAX_PENDING_ATTESTATIONS_PER_SOURCE,
+    MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT, MAX_PENDING_ATTESTATION_ROOTS,
 };
 pub use params::{RANDAO_CHAIN_LENGTH, SLOTS_PER_EPOCH};
 // `COMMITTEE_SIZE` / `SLOT_SUBCOMMITTEE_SIZE` used to be re-exported flat here
@@ -183,7 +185,7 @@ pub use state_root::{
     build_state_tree, state_root, verify_inclusion, BaseFeeRecord, CheckpointRecord,
     ConsensusState, DelegationRecord, DelegatorFeeRecord, DepositQueueRecord, EutxoEntry,
     FcEquivocatorRecord, FcMessageRecord, FcRecentVoteRecord, FinalityRecord, InclusionProof, LeakRecord,
-    ParticipationRecord, PendingFeeRecord, PendingVoteRecord, RandaoMix, Smt,
+    ParticipationRecord, PendingFeeRecord, PendingVoteRecord, RandaoMix, Smt, STATE_COMPONENT_TAGS,
 };
 pub use header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, DecodeError, VERSION_G4};
 pub use interfaces::{
@@ -198,8 +200,8 @@ pub use fee_market::{
 pub use finality::{EpochOutcome, EpochVotes, FinalityError};
 // `validate_block` used to be re-exported here. It was a second, uncalled
 // block validator; the node runs `transition::Transition::apply_block`, and
-// two validation stacks with divergent error orders is the condition that
-// produced this week's defects. Deleted 2026-08-12 — the comparison of the two
+// two validation stacks with divergent checks and accepted sets is the condition
+// that produced this week's defects. Deleted 2026-08-12 — the comparison of the two
 // checklists is in `derive.rs` where the function stood.
 //
 // `produce::{produce, ProduceError, ProducerRandao, ProposerSigner}` and

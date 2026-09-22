@@ -18,10 +18,11 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+    pull_policy: never
     image: bloch:latest  # local build only: docker build -t bloch . — never pulled from a registry (the protocol is ownerless)
     container_name: bloch-node1
     ports:
-      - "16210:16210"
+      - "127.0.0.1:16210:16210"
       - "16110:16110"
     volumes:
       - node1-data:/bloch-data
@@ -35,10 +36,12 @@ services:
       --data-dir /bloch-data
 
   node2:
+    build: { context: .., dockerfile: Dockerfile }
+    pull_policy: never
     image: bloch:latest  # local build only: docker build -t bloch . — never pulled from a registry (the protocol is ownerless)
     container_name: bloch-node2
     ports:
-      - "16211:16210"
+      - "127.0.0.1:16211:16210"
       - "16111:16110"
     volumes:
       - node2-data:/bloch-data
@@ -55,10 +58,12 @@ services:
       - node1
 
   node3:
+    build: { context: .., dockerfile: Dockerfile }
+    pull_policy: never
     image: bloch:latest  # local build only: docker build -t bloch . — never pulled from a registry (the protocol is ownerless)
     container_name: bloch-node3
     ports:
-      - "16212:16210"
+      - "127.0.0.1:16212:16210"
       - "16112:16110"
     volumes:
       - node3-data:/bloch-data

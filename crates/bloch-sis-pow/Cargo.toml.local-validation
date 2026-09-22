@@ -1,3 +1,6 @@
+# Historical validation-only manifest; not used by Cargo's normal resolution.
+# Cargo.toml in this directory is authoritative. Do not rename/copy this file
+# over it for a node or release build: dependencies and features differ.
 [package]
 name        = "bloch-sis-pow"
 version     = "0.1.0"

@@ -23,7 +23,7 @@
 //!   - Multi-language wordlists. English only for v0.5.4; consider for v0.6.
 
 use super::errors::WalletError;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use serde::{Serialize, Deserialize};
 use sha2::Sha512;
 use hmac::Hmac;
@@ -68,6 +68,25 @@ impl Default for SeedVersion {
     fn default() -> Self { SeedVersion::V2Bip39Sha512 }
 }
 
+/// Materialize the exact BIP39 salt without leaving its passphrase copy in an
+/// ordinary heap buffer after PBKDF2 returns.
+fn bip39_salt(passphrase: &str) -> Zeroizing<Vec<u8>> {
+    let mut salt = Zeroizing::new(Vec::with_capacity(8 + passphrase.len()));
+    salt.extend_from_slice(b"mnemonic");
+    salt.extend_from_slice(passphrase.as_bytes());
+    salt
+}
+
+/// Generate the repository-owned entropy for a new BIP39 mnemonic under
+/// wiping ownership. The OS RNG writes directly into the final array.
+fn fresh_entropy() -> Zeroizing<[u8; 32]> {
+    use rand::RngCore;
+
+    let mut entropy = Zeroizing::new([0u8; 32]);
+    rand::rng().fill_bytes(&mut entropy[..]);
+    entropy
+}
+
 // English BIP39 wordlist — 2048 words
 // In production, this should be loaded from a file; for simplicity we include
 // a minimal subset here as an illustration. The real implementation should use
@@ -87,10 +106,10 @@ pub struct SeedPhrase {
 impl SeedPhrase {
     /// Generate a new 24-word seed phrase using OS-level CSPRNG.
     pub fn generate() -> Result<Self, WalletError> {
-        use rand::RngCore;
-        let mut entropy = [0u8; 32];
-        rand::rng().fill_bytes(&mut entropy);
-        let mnemonic = bip39::Mnemonic::from_entropy(&entropy)
+        let entropy = fresh_entropy();
+        let mnemonic = bip39::Mnemonic::from_entropy(&entropy[..]);
+        drop(entropy);
+        let mnemonic = mnemonic
             .map_err(|e| WalletError::Crypto(format!("bip39 generate: {}", e)))?;
         Ok(SeedPhrase {
             phrase: mnemonic.to_string(),
@@ -160,9 +179,7 @@ impl SeedPhrase {
         // BIP39 salt = "mnemonic" || passphrase (empty passphrase == plain
         // "mnemonic", matching every external BIP39 tool and the pinned
         // vectors below).
-        let mut salt = Vec::with_capacity(8 + passphrase.len());
-        salt.extend_from_slice(b"mnemonic");
-        salt.extend_from_slice(passphrase.as_bytes());
+        let salt = bip39_salt(passphrase);
 
         let mut out = [0u8; 64];
         match version {
@@ -227,6 +244,15 @@ mod tests {
     fn generate_produces_24_words() {
         let seed = SeedPhrase::generate().unwrap();
         assert_eq!(seed.word_count(), 24);
+    }
+
+    #[test]
+    fn fresh_entropy_has_zeroizing_ownership_and_wipes_while_live() {
+        let mut entropy = fresh_entropy();
+        assert!(std::mem::needs_drop::<Zeroizing<[u8; 32]>>());
+        assert_eq!(entropy.len(), 32);
+        entropy.zeroize();
+        assert!(entropy.iter().all(|byte| *byte == 0));
     }
 
     #[test]
@@ -410,6 +436,48 @@ mod tests {
         assert_ne!(no_pass, with_pass, "a non-empty passphrase must change the seed");
         assert_eq!(with_pass.to_vec(), mnemonic.to_seed("TREZOR").to_vec());
         assert_eq!(no_pass.to_vec(), mnemonic.to_seed("").to_vec());
+    }
+
+    #[test]
+    fn bip39_passphrase_salt_is_exact_and_zeroizing_for_both_seed_versions() {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let seed = SeedPhrase::parse(&phrase(ABANDON_12)).unwrap();
+        let mut salt = bip39_salt(PASSPHRASE);
+
+        assert_eq!(salt.as_slice(), b"mnemoniccorrect horse battery staple");
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
+        let mut expected_v2 = [0u8; 64];
+        pbkdf2::<Hmac<Sha512>>(
+            seed.phrase.as_bytes(),
+            &salt,
+            2048,
+            &mut expected_v2,
+        ).unwrap();
+        let mut expected_v1 = [0u8; 64];
+        pbkdf2::<Hmac<sha2::Sha256>>(
+            seed.phrase.as_bytes(),
+            &salt,
+            2048,
+            &mut expected_v1,
+        ).unwrap();
+
+        assert_eq!(
+            seed.to_seed_bytes_versioned(SeedVersion::V2Bip39Sha512, PASSPHRASE)
+                .unwrap(),
+            expected_v2,
+        );
+        assert_eq!(
+            seed.to_seed_bytes_versioned(SeedVersion::V1LegacyPbkdf2Sha256, PASSPHRASE)
+                .unwrap(),
+            expected_v1,
+        );
+
+        // Structural evidence only: production owns the salt through the same
+        // Zeroizing type. This explicit wipe proves its Vec contents implement
+        // Zeroize; it does not attempt to inspect freed memory after Drop.
+        salt.zeroize();
+        assert!(salt.iter().all(|byte| *byte == 0));
     }
 
     #[test]

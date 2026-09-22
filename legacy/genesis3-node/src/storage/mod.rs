@@ -69,6 +69,25 @@ pub fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, StorageErro
         .map_err(|e| StorageError::DeserializeFailed(e.to_string()))
 }
 
+/// Decode one exported UTXO row without silently omitting corrupt ledger data.
+/// Historical exports retain their big-endian vout interpretation; canonical
+/// exports are explicit and must never replace the published genesis artifact.
+pub fn decode_snapshot_row(key: &[u8], value: &[u8], canonical_vout: bool)
+    -> Result<(Vec<u8>, u32, u64, Vec<u8>), StorageError>
+{
+    if key.len() != 36 {
+        return Err(StorageError::DeserializeFailed("UTXO snapshot key must be exactly 36 bytes".into()));
+    }
+    let suffix = [key[32], key[33], key[34], key[35]];
+    let vout = if canonical_vout { u32::from_le_bytes(suffix) } else { u32::from_be_bytes(suffix) };
+    let (output, used): (TxOutput, usize) = bincode::serde::decode_from_slice(value, bincode::config::standard())
+        .map_err(|e| StorageError::DeserializeFailed(format!("UTXO snapshot value: {e}")))?;
+    if used != value.len() {
+        return Err(StorageError::DeserializeFailed("UTXO snapshot value has trailing bytes".into()));
+    }
+    Ok((key[..32].to_vec(), vout, output.value, output.script_pubkey))
+}
+
 pub struct Storage { db: DB }
 
 impl Storage {
@@ -318,43 +337,10 @@ impl Storage {
         let mut out: Vec<(Vec<u8>, u32, u64, Vec<u8>)> = Vec::new();
         for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
             let (key, val) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
-            // Anything shorter than txid(32) ‖ vout(4) is not ours — skip
-            // rather than guess, so a malformed row can never silently enter
-            // a commitment.
-            if key.len() < 36 { continue; }
-            let txid = key[..key.len() - 4].to_vec();
-            // DOC-DRIFT FIX (Legacy M-3): this used to say "key = txid ‖ vout
-            // (4B BE)" — describing what a reader SHOULD do, not what
-            // `utxo_key` (below) actually writes: `index.to_le_bytes()`,
-            // LITTLE-endian. This decode has always been (and, for
-            // reproducibility, MUST stay) big-endian anyway —
-            // `derive_carryover_root` (below) rebuilds the published
-            // carry-over snapshot's exact commitment via this function, and
-            // `bloch-snapshot-utxo`'s default (non-`--canonical-vout`) mode
-            // uses the identical big-endian misread — so any vout whose LE
-            // and BE byte-swaps differ (any vout != 0 that isn't a byte
-            // palindrome) is reported as the WRONG number here (38 live
-            // outpoints with real vout 1 read back as 16_777_216). This does
-            // NOT affect consensus correctness: `get_utxo`/`delete_utxo`
-            // both build and look up the SAME key via `utxo_key`, so the
-            // encoding round-trips correctly there — only code that parses
-            // the raw key bytes back into a vout NUMBER (this function, and
-            // `bloch-snapshot-utxo`) sees the mismatch. See
-            // `legacy/README.md` and `bloch-snapshot-utxo.rs`'s
-            // `--canonical-vout` flag for a correctly-decoding path for NEW
-            // exports (which the shared carry-over-verification path here
-            // deliberately does NOT take, so it keeps matching the tool's
-            // default).
-            let vout = u32::from_be_bytes([key[key.len()-4], key[key.len()-3],
-                                           key[key.len()-2], key[key.len()-1]]);
-            // Same codec every other UTXO read in this file uses — never a
-            // second decoder, or a snapshot could disagree with the node that
-            // produced it while both look correct.
-            let output: TxOutput = match decode::<TxOutput>(&val) {
-                Ok(o)  => o,
-                Err(_) => continue,
-            };
-            out.push((txid, vout, output.value, output.script_pubkey));
+            // Fail the whole export on corruption; a partial ledger cannot
+            // be advertised as a complete carryover set. Preserve historical
+            // vout decoding for reproducibility (Legacy M-3).
+            out.push(decode_snapshot_row(&key, &val, false)?);
         }
         // RocksDB already yields keys in byte order; sort explicitly so the
         // guarantee is in THIS function rather than in an engine detail.
@@ -1493,3 +1479,23 @@ mod sprint_f_tests {
     }
 }
 
+
+#[cfg(test)]
+mod snapshot_row_tests {
+    use super::*;
+    #[test]
+    fn corrupted_rows_refuse_export_and_valid_rows_preserve_both_vout_modes() {
+        let mut key = vec![7; 32];
+        key.extend_from_slice(&1u32.to_le_bytes());
+        let output = TxOutput { value: 42, script_pubkey: vec![3; 20] };
+        let bytes = encode(&output).unwrap();
+        assert_eq!(decode_snapshot_row(&key, &bytes, false).unwrap().1, 16_777_216);
+        assert_eq!(decode_snapshot_row(&key, &bytes, true).unwrap().1, 1);
+        assert!(decode_snapshot_row(&key[..35], &bytes, false).is_err());
+        let mut long_key = key.clone(); long_key.push(0);
+        assert!(decode_snapshot_row(&long_key, &bytes, false).is_err());
+        assert!(decode_snapshot_row(&key, &[], false).is_err());
+        let mut trailing = bytes; trailing.push(0);
+        assert!(decode_snapshot_row(&key, &trailing, false).is_err());
+    }
+}

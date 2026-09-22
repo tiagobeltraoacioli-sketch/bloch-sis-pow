@@ -8,7 +8,8 @@
 //!   - `BlockHeight` = zero-based index. Genesis = 0.
 //!   - `BlockCount`  = 1-based cardinality. Chain with only genesis = 1.
 //!
-//! Invariant: `BlockCount == BlockHeight + 1` for any non-empty chain.
+//! Invariant: `BlockCount == BlockHeight + 1` for every representable count;
+//! the synthetic `BlockHeight(u64::MAX)` boundary saturates to `u64::MAX`.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,10 +28,11 @@ impl BlockHeight {
     /// Height of the genesis block.
     pub const GENESIS: Self = Self(0);
 
-    /// Convert to 1-based cardinality (Bitcoin `getblockcount` semantics).
+    /// Convert to 1-based cardinality (Bitcoin `getblockcount` semantics),
+    /// saturating only at the unrepresentable `u64::MAX + 1` boundary.
     #[inline]
     pub const fn as_count(self) -> BlockCount {
-        BlockCount(self.0 + 1)
+        BlockCount(self.0.saturating_add(1))
     }
 
     /// Saturating successor. Useful in fork-choice / replay loops.
@@ -142,6 +144,7 @@ mod tests {
 
     #[test]
     fn saturating_arithmetic() {
+        assert_eq!(BlockHeight(u64::MAX).as_count(), BlockCount(u64::MAX));
         assert_eq!(BlockHeight::GENESIS.saturating_prev(), BlockHeight::GENESIS);
         assert_eq!(BlockHeight(5).saturating_prev(), BlockHeight(4));
         assert_eq!(BlockHeight(u64::MAX).next(), BlockHeight(u64::MAX));

@@ -21,7 +21,12 @@
 # this script asks for at the tty — see the block below. The passphrase is a
 # separate carry-out from the keystores and from this machine: without it the
 # 64 files are unopenable, including by you.
+set +x # A caller may have enabled tracing; never trace secret-bearing expansions.
+set +a # Inherited allexport must never export subsequently read passphrases.
 set -euo pipefail
+# Remove inherited credentials before even the isolation probes spawn children.
+unset KEYPASS KEYPASS2 BLOCH_KEYSTORE_PASSPHRASE BLOCH_KEYSTORE_PASSPHRASE_FILE
+unset BLOCH_KEYSTORE_PASSPHRASE_FD BLOCH_KEYSTORE_ALLOW_PLAINTEXT
 
 BIN="${1:?usage: $0 <bloch-pos-binary> <output-dir> [count]}"
 OUT="${2:?usage: $0 <bloch-pos-binary> <output-dir> [count]}"
@@ -122,9 +127,8 @@ if [ -e "$OUT" ]; then
     exit 1
 fi
 
-mkdir -p "$OUT"
-chmod 700 "$OUT"
 umask 077
+mkdir -m 700 -- "$OUT"
 
 echo "Bloch Genesis-4 key ceremony"
 echo "  binary : $BIN"
@@ -149,18 +153,40 @@ echo
 # CARRY THIS PASSPHRASE OUT SEPARATELY FROM THE KEYSTORES, on paper, split if
 # your policy says so. It is not in cohort.tsv and it is not in DIGESTS.txt.
 # Lose it and the 64 genesis validators are gone with it.
+# Unset first: an inherited/exported KEYPASS would otherwise retain its
+# export attribute when read assigns it. Secret values never enter child env.
+unset KEYPASS KEYPASS2 BLOCH_KEYSTORE_PASSPHRASE BLOCH_KEYSTORE_PASSPHRASE_FILE
+unset BLOCH_KEYSTORE_PASSPHRASE_FD BLOCH_KEYSTORE_ALLOW_PLAINTEXT
+cleanup_passphrase() {
+    if [ -n "${KEYTTY-}" ]; then stty "$KEYTTY" 2>/dev/null || true; fi
+    unset KEYPASS KEYPASS2 KEYTTY
+}
+trap cleanup_passphrase EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+[ -t 0 ] || { echo "FATAL: passphrase entry requires a controlling terminal." >&2; exit 1; }
+KEYTTY="$(stty -g)"
+# Disable echo before even printing a prompt; read -s alone can print its
+# prompt before applying its temporary terminal mode.
+stty -echo
 read -r -s -p "  keystore passphrase: " KEYPASS; echo
 read -r -s -p "  confirm            : " KEYPASS2; echo
-[ -n "$KEYPASS" ] || { echo "FATAL: an empty passphrase is not a passphrase."; exit 1; }
+[ "${#KEYPASS}" -ge 12 ] || { echo "FATAL: passphrase must contain at least 12 characters."; exit 1; }
 [ "$KEYPASS" = "$KEYPASS2" ] || { echo "FATAL: the two passphrases differ. Nothing was written."; exit 1; }
 unset KEYPASS2
-export BLOCH_KEYSTORE_PASSPHRASE="$KEYPASS"
-unset KEYPASS
+stty "$KEYTTY"
+unset KEYTTY
+run_with_passphrase() {
+    # printf is a Bash builtin: the value never becomes an external argv.
+    # The consumer owns/closes stdin, requires EOF, and bounds its read.
+    builtin printf '%s' "$KEYPASS" | BLOCH_KEYSTORE_PASSPHRASE_FD=0 "$BIN" "$@"
+}
 echo
 
 for i in $(seq 0 $((COUNT - 1))); do
     n=$(printf "%02d" "$i")
-    "$BIN" keygen --dir "$OUT/v$n" --index "$i" >/dev/null
+    run_with_passphrase keygen --dir "$OUT/v$n" --index "$i" >/dev/null
     printf "\r  generated %d/%d" "$((i + 1))" "$COUNT"
 done
 echo
@@ -196,10 +222,12 @@ echo "  all $COUNT keystores present, sealed (BPOSKEY2), mode 0600"
     echo -e "index\tpubkey_hex\trandao_commitment_hex\tstake_sat\twithdrawal_credentials_hex\tcommission_bps"
     for i in $(seq 0 $((COUNT - 1))); do
         n=$(printf "%02d" "$i")
-        "$BIN" keygen-public --dir "$OUT/v$n" 2>/dev/null \
-            || echo -e "$i\tTODO_RUN_keygen-public\tTODO\t\tTODO\t"
+        run_with_passphrase keygen-public --dir "$OUT/v$n"
     done
 } > "$OUT/cohort.tsv"
+# No further command needs the passphrase. Bash cannot promise zeroization
+# of prior allocations; unset bounds its live variable lifetime.
+unset KEYPASS
 
 # Portable sha256 of a FILE. Prefers sha256sum, falls back to shasum (macOS
 # has no sha256sum by default), falls back to openssl. Prints the hex digest

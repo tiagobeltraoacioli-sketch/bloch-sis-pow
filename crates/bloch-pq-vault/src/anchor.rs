@@ -5,17 +5,16 @@
 //! `bloch-crypto`), binding
 //! `{btc_vault_address, H(r), pq_recovery_pubkey, designated_safe_destination, policy}`.
 //!
-//! **Division of labour (spec §2.3):** Bitcoin enforces the hash + timelock half; Bloch
-//! enforces the PQ half; the shared `recovery_hash = H(r)` and `designated_safe_dest`
-//! are the hinge. Bitcoin never sees a PQ signature — so revealing `r` on Bitcoin is not
-//! by itself a proof of PQ authorization. This anchor is what makes the *legitimate*
-//! recovery flow PQ-authorized and auditable; a compliant watchtower fee-bumps a
-//! clawback **only** to the anchored `designated_safe_dest`.
+//! **Current division of labour (spec §2.3):** Bitcoin enforces only the hash, timelock
+//! and classical signatures. This module can sign and verify a separate PQ commitment
+//! off chain and compile candidate guard programs. No code here posts, orders or enforces
+//! anchors on Bloch consensus, and Bitcoin never sees the PQ signature. A relying party
+//! must authenticate the anchor and separately enforce its `designated_safe_dest` policy.
 //!
 //! ## Mapping onto `bloch-euvm` (spec §3.2)
-//! The anchor is an ordinary Bloch eUTXO whose *datum* carries these fields and whose
-//! *guard program* is the existing, audited-compiler custody/governance validator — no
-//! new opcode, no new module kind. [`anchor_guard_governance`] emits a `Governance`
+//! The proposed integration represents the anchor as a Bloch eUTXO whose *datum* carries
+//! these fields and whose *guard program* uses the existing audited-compiler
+//! custody/governance validator. [`anchor_guard_governance`] emits a `Governance`
 //! 1-of-1 over the PQ key (minimum); [`anchor_guard_custody`] emits the `Custody` 2-of-2
 //! (BTC key AND PQ key — the same hybrid identity that owns the BTC vault owns its
 //! anchor), reusing `bloch_btc_wallet::hybrid_wbtc_validator`.
@@ -88,6 +87,22 @@ pub struct PqShieldAnchor {
 }
 
 impl PqShieldAnchor {
+    /// Check the Bitcoin addresses against an explicitly selected network.
+    /// This checks syntax/network only: freshness, ownership and correspondence
+    /// to the actual vault script require independent caller verification.
+    /// Signature verification alone intentionally remains format-compatible;
+    /// Bitcoin relying parties should use [`verify_bitcoin_anchor`].
+    pub fn validate_bitcoin_addresses(&self, network: bitcoin::Network) -> Result<(), String> {
+        if self.target_chain != TargetChain::Bitcoin {
+            return Err("Bitcoin address validation requires the Bitcoin target chain".into());
+        }
+        for bytes in [&self.btc_vault_address, &self.designated_safe_dest] {
+            let text = std::str::from_utf8(bytes).map_err(|_| "address is not UTF-8")?;
+            crate::validate_destination(text, network)?;
+        }
+        Ok(())
+    }
+
     /// Deterministic serialization of the **committed fields** (everything the PQ
     /// signature covers). Length-prefixed (`u32` LE) byte fields; scalars LE. A change in
     /// any field changes these bytes and therefore invalidates the signature.
@@ -150,6 +165,20 @@ pub enum AnchorError {
     CharterAuditDenied(AuditReport),
 }
 
+/// Additive errors from [`verify_bitcoin_anchor`]. Keeping chain/address
+/// policy outside [`AnchorError`] avoids breaking existing exhaustive matches
+/// over the historical generic verifier and codec error type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BitcoinAnchorError {
+    /// The generic version/trusted-key/signature verifier failed.
+    Anchor(AnchorError),
+    /// The Bitcoin-specific checked verifier was used for another target chain.
+    WrongTargetChain(TargetChain),
+    /// A committed Bitcoin address is malformed or not valid for the requested
+    /// network encoding family.
+    InvalidAddress,
+}
+
 /// Sign a `PqShieldAnchor` with the owner's PQ secret key (ML-DSA-65 ‖ Falcon-1024).
 /// The `pq_secret` MUST correspond to `anchor.pq_recovery_pubkey`; [`verify_anchor`]
 /// enforces that binding — against an *externally trusted* key — at verification time.
@@ -172,7 +201,7 @@ pub fn sign_anchor(
 /// Verifying under `signed.anchor.pq_recovery_pubkey` is *self-certifying* and decides
 /// nothing: anyone can generate a PQ keypair, write their own `designated_safe_dest`
 /// into an anchor, sign it with their own secret, and publish a blob that "verifies".
-/// A watchtower that fee-bumps a clawback to that destination would be paying an
+/// A watchtower that acts on a clawback to that destination would be paying an
 /// attacker. Authenticity here means "signed by **the** owner", so the owner's identity
 /// has to be an input, not a self-declaration.
 ///
@@ -184,6 +213,35 @@ pub fn verify_anchor(
     signed: &SignedAnchor,
     trusted_pq_pubkey: &[u8],
 ) -> Result<(), AnchorError> {
+    verify_anchor_with(
+        signed,
+        trusted_pq_pubkey,
+        bloch_crypto::crypto::verify_enveloped,
+    )
+}
+
+/// Verify an anchor while also requiring canonical primitive encodings.
+///
+/// This opt-in policy preserves [`verify_anchor`] for previously accepted
+/// artifacts, but lets new relying-party boundaries reject Falcon's alternate
+/// zero-padded representation. The anchor format already requires explicit
+/// suite envelopes, so this never guesses between raw and enveloped bytes.
+pub fn verify_anchor_canonical(
+    signed: &SignedAnchor,
+    trusted_pq_pubkey: &[u8],
+) -> Result<(), AnchorError> {
+    verify_anchor_with(
+        signed,
+        trusted_pq_pubkey,
+        bloch_crypto::crypto::verify_enveloped_canonical,
+    )
+}
+
+fn verify_anchor_with(
+    signed: &SignedAnchor,
+    trusted_pq_pubkey: &[u8],
+    verify_signature: fn(&[u8], &[u8], &[u8]) -> bool,
+) -> Result<(), AnchorError> {
     if signed.anchor.version != ANCHOR_VERSION {
         return Err(AnchorError::UnsupportedVersion(signed.anchor.version));
     }
@@ -192,7 +250,7 @@ pub fn verify_anchor(
         return Err(AnchorError::UntrustedKey);
     }
     // Verify under the caller's copy, so the anchor's own bytes cannot steer the check.
-    let ok = bloch_crypto::crypto::verify(
+    let ok = verify_signature(
         trusted_pq_pubkey,
         &signed.anchor.commitment_bytes(),
         &signed.signature,
@@ -202,6 +260,75 @@ pub fn verify_anchor(
     } else {
         Err(AnchorError::BadSignature)
     }
+}
+
+/// Verify a Bitcoin anchor's signature, externally trusted owner key and both
+/// committed addresses against the caller's expected network.
+///
+/// This is the checked low-level entry point for Bitcoin relying parties. The
+/// generic [`verify_anchor`] remains format-compatible for historical and
+/// non-Bitcoin anchors, and therefore does not infer address semantics. In
+/// particular, the network is an input here rather than guessed from attacker-
+/// supplied strings: a syntactically valid testnet anchor must not authorize a
+/// mainnet watchtower action. Some legacy test-network address encodings are
+/// shared by testnet, signet and regtest; callers needing an exact test-chain
+/// identity must bind it separately from the address string.
+pub fn verify_bitcoin_anchor(
+    signed: &SignedAnchor,
+    trusted_pq_pubkey: &[u8],
+    expected_network: bitcoin::Network,
+) -> Result<(), BitcoinAnchorError> {
+    verify_bitcoin_anchor_with(
+        signed,
+        trusted_pq_pubkey,
+        expected_network,
+        verify_anchor,
+    )
+}
+
+fn verify_bitcoin_anchor_with(
+    signed: &SignedAnchor,
+    trusted_pq_pubkey: &[u8],
+    expected_network: bitcoin::Network,
+    verify_signature: fn(&SignedAnchor, &[u8]) -> Result<(), AnchorError>,
+) -> Result<(), BitcoinAnchorError> {
+    // Preserve the generic verifier's cheap identity/version error precedence
+    // without paying for a hybrid verification before address validation.
+    if signed.anchor.version != ANCHOR_VERSION {
+        return Err(BitcoinAnchorError::Anchor(AnchorError::UnsupportedVersion(
+            signed.anchor.version,
+        )));
+    }
+    if signed.anchor.pq_recovery_pubkey.as_slice() != trusted_pq_pubkey {
+        return Err(BitcoinAnchorError::Anchor(AnchorError::UntrustedKey));
+    }
+    if signed.anchor.target_chain != TargetChain::Bitcoin {
+        return Err(BitcoinAnchorError::WrongTargetChain(
+            signed.anchor.target_chain,
+        ));
+    }
+    signed
+        .anchor
+        .validate_bitcoin_addresses(expected_network)
+        .map_err(|_| BitcoinAnchorError::InvalidAddress)?;
+    verify_signature(signed, trusted_pq_pubkey).map_err(BitcoinAnchorError::Anchor)
+}
+
+/// Bitcoin-specific checked verification with canonical signature encoding.
+///
+/// Address/network and external-key checks are identical to
+/// [`verify_bitcoin_anchor`]; only the final signature policy is stricter.
+pub fn verify_bitcoin_anchor_canonical(
+    signed: &SignedAnchor,
+    trusted_pq_pubkey: &[u8],
+    expected_network: bitcoin::Network,
+) -> Result<(), BitcoinAnchorError> {
+    verify_bitcoin_anchor_with(
+        signed,
+        trusted_pq_pubkey,
+        expected_network,
+        verify_anchor_canonical,
+    )
 }
 
 impl SignedAnchor {
@@ -240,6 +367,7 @@ impl SignedAnchor {
             .map_err(|_| AnchorError::CsvDelayOutOfRange(wide_delay))?;
         let policy = c.get_bytes()?;
         let signature = c.get_bytes()?;
+        if c.i != bytes.len() { return Err(AnchorError::Malformed); }
         Ok(SignedAnchor {
             anchor: PqShieldAnchor {
                 version,
@@ -371,6 +499,15 @@ impl Cursor<'_> {
 mod tests {
     use super::*;
 
+    fn bitcoin_address(network: bitcoin::Network, opcode: u8) -> Vec<u8> {
+        bitcoin::Address::p2wsh(
+            &bitcoin::ScriptBuf::from_bytes(vec![opcode]),
+            network,
+        )
+        .to_string()
+        .into_bytes()
+    }
+
     fn sample(pq_pubkey: Vec<u8>) -> PqShieldAnchor {
         PqShieldAnchor {
             version: ANCHOR_VERSION,
@@ -393,6 +530,15 @@ mod tests {
         let signed = sign_anchor(&anchor, &sk).unwrap();
         assert!(verify_anchor(&signed, &pk).is_ok(), "honest anchor must verify");
 
+        // This format has always documented an enveloped signature. Refuse a
+        // stripped raw body instead of invoking the generic legacy heuristic.
+        let mut raw_signature = signed.clone();
+        raw_signature.signature.drain(..bloch_crypto::crypto::SUITE_HEADER_LEN);
+        assert_eq!(
+            verify_anchor(&raw_signature, &pk),
+            Err(AnchorError::BadSignature),
+        );
+
         // tamper the safe destination → verify fails closed
         let mut t1 = signed.clone();
         t1.anchor.designated_safe_dest = b"bcrt1qATTACKERdestination".to_vec();
@@ -409,10 +555,122 @@ mod tests {
         assert_eq!(verify_anchor(&t3, &pk), Err(AnchorError::BadSignature));
     }
 
+    #[test]
+    fn canonical_anchor_policy_rejects_padded_falcon_encoding() {
+        let (pk, sk) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[57u8; 32]).unwrap();
+        let mut anchor = sample(pk.clone());
+        anchor.btc_vault_address = bitcoin_address(bitcoin::Network::Regtest, 0x55);
+        anchor.designated_safe_dest = bitcoin_address(bitcoin::Network::Regtest, 0x56);
+        let padded_len = bloch_crypto::crypto::SUITE_HEADER_LEN
+            + bloch_crypto::crypto::MLDSA_SIG_LEN
+            + bloch_crypto::crypto::falcon::padded_signature_len();
+        let signed = (0..64)
+            .map(|_| sign_anchor(&anchor, &sk).unwrap())
+            .find(|candidate| candidate.signature.len() < padded_len)
+            .expect("compact fixture must leave room for Falcon padding");
+
+        assert_eq!(verify_anchor_canonical(&signed, &pk), Ok(()));
+        assert_eq!(
+            verify_bitcoin_anchor_canonical(&signed, &pk, bitcoin::Network::Regtest),
+            Ok(()),
+        );
+
+        let mut padded = signed;
+        padded.signature.resize(padded_len, 0);
+
+        assert_eq!(
+            verify_anchor(&padded, &pk),
+            Ok(()),
+            "compatibility boundary must preserve historical padded acceptance"
+        );
+        assert_eq!(
+            verify_anchor_canonical(&padded, &pk),
+            Err(AnchorError::BadSignature),
+        );
+        assert_eq!(
+            verify_bitcoin_anchor_canonical(&padded, &pk, bitcoin::Network::Regtest),
+            Err(BitcoinAnchorError::Anchor(AnchorError::BadSignature)),
+        );
+    }
+
+    #[test]
+    fn checked_bitcoin_verify_binds_both_addresses_to_expected_network() {
+        let (pk, sk) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[53u8; 32]).unwrap();
+        let mut anchor = sample(pk.clone());
+        anchor.btc_vault_address = bitcoin_address(bitcoin::Network::Regtest, 0x51);
+        anchor.designated_safe_dest = bitcoin_address(bitcoin::Network::Regtest, 0x52);
+        let signed = sign_anchor(&anchor, &sk).unwrap();
+
+        assert_eq!(
+            verify_bitcoin_anchor(&signed, &pk, bitcoin::Network::Regtest),
+            Ok(()),
+        );
+        assert_eq!(
+            verify_bitcoin_anchor(&signed, &pk, bitcoin::Network::Bitcoin),
+            Err(BitcoinAnchorError::InvalidAddress),
+        );
+
+        let mut mixed = anchor.clone();
+        mixed.designated_safe_dest = bitcoin_address(bitcoin::Network::Bitcoin, 0x52);
+        let mixed = sign_anchor(&mixed, &sk).unwrap();
+        assert_eq!(
+            verify_bitcoin_anchor(&mixed, &pk, bitcoin::Network::Regtest),
+            Err(BitcoinAnchorError::InvalidAddress),
+        );
+
+        let mut malformed = anchor.clone();
+        malformed.btc_vault_address = vec![0xff, 0xfe];
+        let malformed = sign_anchor(&malformed, &sk).unwrap();
+        assert_eq!(
+            verify_bitcoin_anchor(&malformed, &pk, bitcoin::Network::Regtest),
+            Err(BitcoinAnchorError::InvalidAddress),
+        );
+
+        let mut other_chain = anchor;
+        other_chain.target_chain = TargetChain::EthereumL1;
+        let other_chain = sign_anchor(&other_chain, &sk).unwrap();
+        assert_eq!(
+            verify_bitcoin_anchor(&other_chain, &pk, bitcoin::Network::Regtest),
+            Err(BitcoinAnchorError::WrongTargetChain(TargetChain::EthereumL1)),
+        );
+    }
+
+    #[test]
+    fn checked_bitcoin_verify_retains_trust_and_signature_checks() {
+        let (pk, sk) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[54u8; 32]).unwrap();
+        let (other_pk, _) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[55u8; 32]).unwrap();
+        let mut anchor = sample(pk.clone());
+        anchor.btc_vault_address = bitcoin_address(bitcoin::Network::Regtest, 0x53);
+        anchor.designated_safe_dest = bitcoin_address(bitcoin::Network::Regtest, 0x54);
+        let signed = sign_anchor(&anchor, &sk).unwrap();
+
+        assert_eq!(
+            verify_bitcoin_anchor(&signed, &other_pk, bitcoin::Network::Regtest),
+            Err(BitcoinAnchorError::Anchor(AnchorError::UntrustedKey)),
+        );
+        let mut bad_signature = signed;
+        let last = bad_signature.signature.len() - 1;
+        bad_signature.signature[last] ^= 1;
+        assert_eq!(
+            verify_bitcoin_anchor(&bad_signature, &pk, bitcoin::Network::Regtest),
+            Err(BitcoinAnchorError::Anchor(AnchorError::BadSignature)),
+        );
+
+        // Historical generic verification remains byte/behavior compatible;
+        // callers must opt into chain-specific address semantics explicitly.
+        let legacy = sign_anchor(&sample(pk.clone()), &sk).unwrap();
+        assert_eq!(verify_anchor(&legacy, &pk), Ok(()));
+    }
+
     /// REGRESSION (K-M6-anchor-selfcert). The attacker holds no part of the owner's PQ
     /// key. They mint a *perfectly signed* anchor under their own key, naming their own
-    /// `designated_safe_dest` — the address a compliant watchtower would fee-bump a
-    /// clawback to. Under the old self-certifying `verify_anchor(&signed)` this returned
+    /// `designated_safe_dest` — the address a compliant watchtower would treat as the
+    /// authorized clawback destination. Under the old self-certifying
+    /// `verify_anchor(&signed)` this returned
     /// `Ok(())`, because the blob supplied both the claim and the key that judged it.
     #[test]
     fn forged_anchor_signed_by_attacker_key_is_rejected() {
@@ -518,6 +776,9 @@ mod tests {
         assert!(verify_anchor(&back, &pk).is_ok());
         // deterministic
         assert_eq!(signed.serialize(), back.serialize());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(matches!(SignedAnchor::deserialize(&trailing), Err(AnchorError::Malformed)));
     }
 
     #[test]

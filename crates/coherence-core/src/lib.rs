@@ -6,6 +6,12 @@
 //! SHAKE-256 note commitments, hash-derived nullifiers, a SHAKE-256 incremental
 //! Merkle accumulator, and `check_spend` — the exact statement the ZK circuit
 //! proves. No node/std-heavy dependencies, so it compiles for the zkVM target.
+//!
+//! SECURITY / CR-01: the current statement does not bind `nk` to recipient
+//! spending authority. A note plaintext holder can choose multiple nullifiers
+//! for one note. This is an unauthenticated research statement, not a safe
+//! funded-pool verifier. See `tests/known_unsafe_v1_authorization.rs` and
+//! `../coherence-prover/AUTHORIZATION-BLOCKER.md`.
 
 // I-4: no `unsafe` is needed anywhere in this crate (including the zkVM
 // guest target), so forbid it outright rather than merely avoid it.
@@ -399,6 +405,8 @@ pub enum SpendError {
     /// merely non-member. See [`verify_path`] for why this must be rejected.
     PositionOutOfRange(usize),
     Nullifier(usize),
+    /// The same commitment-tree position occurs more than once in this spend.
+    DuplicateInputPosition(usize),
     OutputCommitment(usize),
     /// public.nullifiers.len() != witness.inputs.len().
     NullifierCountMismatch { public: usize, witness: usize },
@@ -408,7 +416,12 @@ pub enum SpendError {
     Unbalanced { inputs: u128, outputs: u128, fee: u64 },
 }
 
-/// The EXACT statement the ZK circuit proves (runs on the PRIVATE witness).
+/// The current statement the ZK circuit proves (runs on the PRIVATE witness).
+///
+/// SECURITY: this does not prove spending authority. `nk` is witness-chosen and
+/// is not bound to `note.pk_d`; successful verification does not establish that
+/// the recipient authorized this spend or that a note has one unique nullifier.
+/// Do not activate a funded pool with this statement (internal audit CR-01).
 pub fn check_spend(public: &SpendPublic, w: &SpendWitness) -> Result<(), SpendError> {
     // Bind the public vectors to the witness EXACTLY (C2 fix). Without these
     // binds a prover could append extra public out_commitments beyond the
@@ -426,6 +439,16 @@ pub fn check_spend(public: &SpendPublic, w: &SpendWitness) -> Result<(), SpendEr
             public: public.nullifiers.len(),
             witness: w.inputs.len(),
         });
+    }
+    // A leaf is one funded input. Reject repeated positions before membership
+    // work so witness-chosen nullifier keys cannot count one leaf twice. This
+    // is defense in depth only: CR-01 still permits different nullifiers in
+    // separate spends until a versioned recipient-authorization statement lands.
+    let mut positions = std::collections::BTreeSet::new();
+    for (i, input) in w.inputs.iter().enumerate() {
+        if !positions.insert(input.position) {
+            return Err(SpendError::DuplicateInputPosition(i));
+        }
     }
     let mut in_sum: u128 = 0;
     for (i, inp) in w.inputs.iter().enumerate() {

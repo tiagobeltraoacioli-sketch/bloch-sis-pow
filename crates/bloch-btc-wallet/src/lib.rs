@@ -21,7 +21,8 @@
 #![forbid(unsafe_code)]
 
 use bitcoin::bip32::{DerivationPath, Xpriv};
-use bitcoin::key::{CompressedPublicKey, TapTweak};
+use bitcoin::key::CompressedPublicKey;
+use zeroize::Zeroizing;
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Address, KnownHrp, NetworkKind};
 use std::str::FromStr;
@@ -174,9 +175,11 @@ pub fn derive_identity_versioned(
     let (btc_pubkey, btc_p2wpkh, _) = derive_btc(seed, &format!("m/84'/{coin}/0'/0/0"), mainnet)?;
     let (_, _, btc_p2tr) = derive_btc(seed, &format!("m/86'/{coin}/0'/0/0"), mainnet)?;
 
-    let pq_seed_bytes = pq_seed(seed, pq_kdf);
-    let (pq_pubkey, _pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed_bytes)
+    let pq_seed_bytes = Zeroizing::new(pq_seed(seed, pq_kdf));
+    let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed_bytes[..])
         .map_err(|e| IdentityError::PqKeygen(e.to_string()))?;
+    let _pq_secret = Zeroizing::new(pq_secret);
+
     let net = if mainnet {
         bloch_crypto::address::Network::Mainnet
     } else {
@@ -269,6 +272,79 @@ mod tests {
     }
 
     // ── I-13 regression tests ────────────────────────────────────────────────
+
+    /// BV-17: execute the exact helper-produced custody program, not a manually
+    /// reconstructed look-alike. The historical VM supports both signature
+    /// families; either missing leg must fail the 2-of-2 guard.
+    #[test]
+    fn hybrid_validator_executes_and_requires_both_signature_legs() {
+        use bloch_euvm::{run, Ctx, SigVerifier, Val, VmError};
+
+        struct HybridVerifier {
+            btc_ok: bool,
+            pq_ok: bool,
+        }
+
+        impl SigVerifier for HybridVerifier {
+            fn verify(&self, msg: &[u8], pk: &[u8], sig: &[u8]) -> bool {
+                self.pq_ok && msg == b"sighash" && pk == b"pq-pubkey" && sig == b"pq-signature"
+            }
+
+            fn verify_ecdsa(&self, msg: &[u8], pk: &[u8], sig: &[u8]) -> bool {
+                self.btc_ok
+                    && msg == b"sighash"
+                    && pk == b"btc-pubkey"
+                    && sig == b"btc-signature"
+            }
+        }
+
+        let program = hybrid_wbtc_validator(b"btc-pubkey", b"pq-pubkey");
+        let stack = vec![
+            Val::Int(0), // datum
+            Val::Bytes(b"btc-signature".to_vec()),
+            Val::Bytes(b"pq-signature".to_vec()),
+        ];
+        let ctx = Ctx {
+            fields: vec![Val::Bytes(b"sighash".to_vec())],
+            ..Default::default()
+        };
+
+        let mut gas = 10_000;
+        assert_eq!(
+            run(
+                &program,
+                stack.clone(),
+                &ctx,
+                &HybridVerifier { btc_ok: true, pq_ok: true },
+                &mut gas,
+            ),
+            Ok(true)
+        );
+
+        let mut gas = 10_000;
+        assert_eq!(
+            run(
+                &program,
+                stack.clone(),
+                &ctx,
+                &HybridVerifier { btc_ok: false, pq_ok: true },
+                &mut gas,
+            ),
+            Err(VmError::Assert),
+        );
+
+        let mut gas = 10_000;
+        assert_eq!(
+            run(
+                &program,
+                stack,
+                &ctx,
+                &HybridVerifier { btc_ok: true, pq_ok: false },
+                &mut gas,
+            ),
+            Ok(false),
+        );
+    }
 
     /// I-13: a seed shorter than 32 bytes must return `Err`, never panic.
     /// Before the fix, `Xpriv::new_master`/`generate_keypair_from_seed` were

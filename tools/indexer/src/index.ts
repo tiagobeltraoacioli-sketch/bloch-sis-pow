@@ -28,7 +28,7 @@ function main(): void {
       setTimeout(() => {
         console.log("[bloch-indexer] (stub) triggering scripted reorg at height 3…");
         scenario.doReorg();
-      }, cfg.pollMs * 3);
+      }, cfg.pollMs * 3).unref();
     };
   } else {
     transport = new HttpTransport(cfg.rpcUrl, cfg.rpcApiKey);
@@ -36,19 +36,26 @@ function main(): void {
 
   const rpc = new RpcClient(transport);
   const store = JsonStore.open(cfg.dataFile, (spk) => encodeAddress(spk, cfg.network));
-  const indexer = new Indexer(rpc, store, (m) => console.log(`[bloch-indexer] ${m}`));
+  const indexer = new Indexer(rpc, store, (m) => console.log(`[bloch-indexer] ${m}`), cfg.syncTimeoutMs);
 
   const api = createReadApi(cfg, store);
   api.listen(cfg.apiPort, cfg.apiHost, () => {
     console.log(`[bloch-indexer] reorg-safe reference indexer (SCAFFOLD, unaudited, testnet-only).`);
     console.log(`[bloch-indexer] read API on http://${cfg.apiHost}:${cfg.apiPort}`);
-    console.log(`[bloch-indexer] source: ${cfg.stub ? "OFFLINE STUB CHAIN (scripted reorg)" : cfg.rpcUrl}`);
+    console.log(`[bloch-indexer] source: ${cfg.stub ? "OFFLINE STUB CHAIN (scripted reorg)" : new URL(cfg.rpcUrl).origin}`);
     console.log(`[bloch-indexer] network: ${cfg.network}; data: ${cfg.dataFile}`);
     console.log(`[bloch-indexer] BLCH is not a security; test BLCH has no value.`);
     onStart?.();
   });
 
-  void indexer.run(cfg.pollMs);
+  const shutdown = new AbortController();
+  const stop = () => { shutdown.abort(); api.close(); api.closeAllConnections(); };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  void indexer.run(cfg.pollMs, undefined, shutdown.signal).finally(() => {
+    process.removeListener("SIGINT", stop);
+    process.removeListener("SIGTERM", stop);
+  });
 }
 
 main();

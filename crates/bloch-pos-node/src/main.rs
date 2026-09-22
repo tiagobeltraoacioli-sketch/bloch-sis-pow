@@ -45,6 +45,7 @@
 //! rule once integration review starts).
 
 mod codec;
+mod connection_limit;
 mod devnet_tools;
 mod engine;
 mod genesis;
@@ -54,10 +55,12 @@ mod net;
 mod p2p;
 mod rpc;
 mod slashprot;
+mod slashing_cli;
 mod store;
 mod ws_boot;
 mod validator_deposit;
 mod validator_lifecycle;
+mod validator_payout;
 mod ws_tool;
 
 use std::path::PathBuf;
@@ -90,6 +93,24 @@ const DEFAULT_RPC_PORT: u16 = 16310;
 /// different binaries is the exact failure this replaces.
 const VERSION: &str = env!("BLOCH_BUILD_VERSION");
 
+/// Treat the opt-in as a switch only, never as another option's value.
+fn plaintext_opt_in_flag(args: &[String]) -> bool {
+    if !matches!(args.first().map(String::as_str), Some("run" | "keygen" | "keygen-public")) {
+        return false;
+    }
+    let switches = ["--allow-finality-rewind", "--no-doppelganger-check", "--replay-from-genesis",
+        "--require-state-cache", "--behind-proxy", "--bind-genesis"];
+    let mut rest = args.iter().skip(1);
+    while let Some(arg) = rest.next() {
+        if arg == "--" { break; }
+        if arg == "--allow-plaintext-keystore" { return true; }
+        if arg.starts_with("--") && !switches.contains(&arg.as_str()) && !arg.contains('=') {
+            rest.next(); // a value is data even when it spells a security switch
+        }
+    }
+    false
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Audit I-H1. The keystore is sealed (Argon2id + XChaCha20-Poly1305) and
@@ -99,7 +120,7 @@ fn main() {
     // process — never inferred from the file that happened to be on disk.
     // Applies to `run`, `keygen` and `keygen-public` alike, which is why it is
     // read before the subcommand dispatch rather than inside one of them.
-    if args.iter().any(|a| a == "--allow-plaintext-keystore") {
+    if plaintext_opt_in_flag(&args) {
         keys::allow_plaintext_at_rest();
     }
     match args.first().map(String::as_str) {
@@ -137,6 +158,63 @@ fn main() {
         Some("keygen") => keygen(&args[1..]),
         Some("keygen-public") => keygen_public(&args[1..]),
         Some("keys") => keys_cmd(&args[1..]),
+        Some("block-log-inspect") => {
+            let parameters = &args[1..];
+            if parameters.len() != 2 || parameters[0] != "--data-dir" {
+                eprintln!("usage: bloch-pos block-log-inspect --data-dir <stopped-node-or-copy>");
+                exit(2);
+            }
+            match store::inspect_log(std::path::Path::new(&parameters[1])) {
+                Ok(report) => {
+                    println!("log_bytes={} decoded_frames={} valid_prefix_bytes={}",
+                        report.log_bytes, report.decoded_frames, report.valid_prefix_bytes);
+                    println!("Framing/codec inspection only; consensus execution and checksums are not verified. No files modified.");
+                    if let Some(issue) = report.issue {
+                        eprintln!("block-log-inspect: offset {}: {issue}", report.valid_prefix_bytes);
+                        exit(1);
+                    }
+                }
+                Err(error) => { eprintln!("block-log-inspect: {error}"); exit(2); }
+            }
+        }
+        Some("block-log-repair-tail") => {
+            let parameters = &args[1..];
+            if parameters.len() != 6
+                || parameters[0] != "--data-dir"
+                || parameters[2] != "--truncate-to"
+                || parameters[4] != "--backup"
+            {
+                eprintln!("usage: bloch-pos block-log-repair-tail --data-dir <stopped-node> --truncate-to <inspected-offset> --backup <new-file>");
+                exit(2);
+            }
+            let truncate_to = match parameters[3].parse::<u64>() {
+                Ok(value) => value,
+                Err(_) => {
+                    eprintln!("block-log-repair-tail: invalid --truncate-to offset");
+                    exit(2);
+                }
+            };
+            match store::repair_log_tail_offline(
+                std::path::Path::new(&parameters[1]),
+                truncate_to,
+                std::path::Path::new(&parameters[5]),
+            ) {
+                Ok(report) => println!(
+                    "block-log-repair-tail: retained_bytes={} removed_bytes={} original_bytes={} backup={}",
+                    report.retained_bytes, report.backup_bytes, report.original_bytes, parameters[5]
+                ),
+                Err(error) => {
+                    eprintln!("block-log-repair-tail: {error}");
+                    exit(2);
+                }
+            }
+        }
+        Some("slashing-protection") => {
+            if let Err(error) = slashing_cli::run(&args[1..]) {
+                eprintln!("slashing-protection: {error}");
+                exit(2);
+            }
+        }
         Some("genesis") => genesis_cmd(&args[1..]),
         Some("genesis-mainnet") => genesis_mainnet(&args[1..]),
         Some("submit-tx") => submit_tx(&args[1..]),
@@ -149,6 +227,12 @@ fn main() {
         Some("validator-lifecycle") => {
             if let Err(error) = validator_lifecycle::run(&args[1..]) {
                 eprintln!("validator-lifecycle: {error}");
+                exit(2);
+            }
+        }
+        Some("validator-payout") => {
+            if let Err(error) = validator_payout::run(&args[1..]) {
+                eprintln!("validator-payout: {error}");
                 exit(2);
             }
         }
@@ -184,6 +268,11 @@ fn print_help() {
         "{NAME} {VERSION} — Bloch Genesis-4 Proof-of-Stake node\n\
          \n\
          USAGE:\n\
+           bloch-pos block-log-inspect --data-dir <stopped-node-or-copy>\n\
+               Read-only bounded block-log framing/codec diagnosis. No repair.\n\
+           bloch-pos block-log-repair-tail --data-dir <stopped-node> \\\n               --truncate-to <inspected-offset> --backup <new-file>\n\
+               Repair only an incomplete/all-zero tail after exact offset\n\
+               confirmation and a durable raw-byte backup.\n\
            bloch-pos selfcheck\n\
                Verify the frozen consensus parameters this binary links.\n\
            bloch-pos buildinfo\n\
@@ -227,8 +316,9 @@ fn print_help() {
                secret. Also reports whether the data dir lock is free.\n\
            bloch-pos validator-deposit --help
            bloch-pos validator-lifecycle --help
+           bloch-pos validator-payout --help
 \
-               Prepare, inspect and separately sign a funded PQ deposit offline.
+               Prepare, inspect and sign funded deposits or withdrawal payouts offline.
 \
                Use keygen --index auto for a joining devnet validator.
 \
@@ -257,11 +347,16 @@ fn print_help() {
                it in a block.\n\
            bloch-pos ws-checkpoint --genesis <manifest> --rpc <a>[,<b>...]\n\
                                    --epoch <E> --signer-set-id <n>\n\
-                                   --out <prefix>\n\
+                                   --out <prefix> [--publication-dir <0700 registry>]\n\
                Derive the weak-subjectivity checkpoint for a FINALIZED\n\
                epoch from running nodes (all --rpc endpoints must agree),\n\
                writing <prefix>.bin (154 canonical bytes) + <prefix>.json\n\
                and printing the ws digest the signers sign.\n\
+           bloch-pos slashing-protection <export|import|set-floor>\n\
+               --data-dir <dir> --validator-pubkey-sha3 <hex32>\n\
+               --genesis-digest <hex32> [--out <file>|--in <file>|--min-slot <n>]\n\
+               Offline only: stop this node and fence any previous signer.\n\
+               Import merges monotone watermarks; it never lowers protection.\n\
            bloch-pos ws-keygen --out <prefix>\n\
            bloch-pos ws-signer-set --id <n> --threshold <m>\n\
                                    --min-external <k> --adopted-epoch <e>\n\
@@ -288,12 +383,17 @@ fn print_help() {
                                  [--genesis <manifest>] --out <env.bin>\n\
            bloch-pos ws-verify --envelope <env.bin> --signer-set <set.bin>\n\
                                --genesis <manifest> [--rpc <a>] [--now-epoch <n>]\n\
+                               [--require-fresh]\n\
            bloch-pos ws-verify --checkpoint <cp.bin>\n\
            bloch-pos ws-verify --partial <partialfile>\n\
                The two read-only forms need no arrangement and no manifest:\n\
                the first prints the 154 bytes and the digest they hash to\n\
                (what a signer runs BEFORE signing), the second prints which\n\
                digest a partial was actually made over.\n\
+               With --require-fresh, envelope verification also requires an\n\
+               RPC/current epoch and refuses an artifact outside the boot\n\
+               weak-subjectivity window. An expired envelope is refused\n\
+               whenever either clock option is supplied.\n\
                The rest of the signing ceremony (BLOCH-WEAK-SUBJECTIVITY.md\n\
                section 6): per-signer keypairs, the signer-arrangement file\n\
                that --ws-signer-set consumes, offline signing of the ws\n\
@@ -364,10 +464,12 @@ fn print_help() {
                graylists a whole mesh that shares one proxy address.\n\
          \n\
                          [--stop-at-slot <n>]\n\
-                         [--ws-checkpoint <file>] [--ws-signer-set <file>]\n\
+                         [--replay-from-genesis | --require-state-cache] [--max-replay-blocks <n>]\n\
+                         [--ws-checkpoint <file> --ws-signer-set <file>\n\
+                          --ws-signer-set-sha3 <independently-verified-hex32>]\n\
                          [--carryover <snapshot.tsv>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
-               data persists in <dir> and is replayed on restart.\n\
+               data persists in <dir>; a compatible local state cache skips its replay prefix.\n\
                --carryover is the Genesis-3 balance snapshot\n\
                (bloch-snapshot-utxo's TSV). Required exactly when the\n\
                manifest carries a carryover commitment, and checked against\n\
@@ -375,9 +477,9 @@ fn print_help() {
                total — before a single balance is admitted. A devnet\n\
                manifest commits to none and the flag is then refused.\n\
                          [--rpc-bind <ip>] [--rpc-port <n>|off]\n\
-                         [--metrics-bind <ip>] [--metrics-port <n>]\n\
+                         [--metrics-bind <ip>] [--metrics-port <n>] [--allow-public-metrics]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
-               data persists in <dir> and is replayed on restart.\n\
+               data persists in <dir>; a compatible local state cache skips its replay prefix.\n\
                \n\
                JSON-RPC 2.0 over HTTP is served on --rpc-bind:--rpc-port,\n\
                default 127.0.0.1:16310 (`--rpc-port off` disables it). It\n\
@@ -390,7 +492,9 @@ fn print_help() {
                text: restarts, disk space, finality stalls, peers,\n\
                behind-by-slots, is-syncing, validator-active) on\n\
                --metrics-bind (default 127.0.0.1). Read-only, GET-only,\n\
-               unauthenticated — firewall it like the RPC.\n\
+               unauthenticated. A non-loopback bind is refused unless\n\
+               --allow-public-metrics explicitly acknowledges the exposure;\n\
+               that flag adds no authentication, so firewall it like RPC.\n\
                  Methods: getbuildinfo, getchaininfo, getblockcount,\n\
                  getblockbyslot, getblockbyid, getvalidator,\n\
                  getvalidatorcount, getbalance, gettxout, getutxos (alias\n\
@@ -640,6 +744,55 @@ fn arg_after(args: &[String], i: usize) -> Option<&String> {
     args.get(i..).and_then(|rest| rest.get(1))
 }
 
+/// True only when `name` is a standalone run-command switch.
+///
+/// An exact argv search is insufficient for a safety acknowledgement: in
+/// `--metrics-bind --allow-public-metrics`, the latter token is malformed data
+/// for the former option, not an operator opt-in. Stop at `--` for the same
+/// reason. This parser intentionally needs to know only which run flags do not
+/// consume a following value; every other `--flag` consumes one token here.
+fn run_switch(args: &[String], name: &str) -> bool {
+    const SWITCHES: &[&str] = &[
+        "--allow-finality-rewind",
+        "--allow-plaintext-keystore",
+        "--allow-public-metrics",
+        "--behind-proxy",
+        "--bind-genesis",
+        "--no-doppelganger-check",
+        "--replay-from-genesis",
+        "--require-state-cache",
+    ];
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--" { break; }
+        if arg == name { return true; }
+        if arg.starts_with("--") && !SWITCHES.contains(&arg.as_str()) && !arg.contains('=') {
+            rest.next();
+        }
+    }
+    false
+}
+
+/// Validate the metrics listener's exposure posture before the engine starts.
+/// Metrics are intentionally unauthenticated; an explicit flag acknowledges a
+/// routable bind but does not pretend to make it private.
+fn metrics_bind_plan(args: &[String], port: Option<u16>) -> Result<String, String> {
+    let bind = arg_value(args, "--metrics-bind").unwrap_or_else(|| "127.0.0.1".to_string());
+    if port.is_none() {
+        return Ok(bind);
+    }
+    let ip = bind.parse::<std::net::IpAddr>().map_err(|_| {
+        format!("--metrics-bind must be an IP address when metrics are enabled (got `{bind}`)")
+    })?;
+    if !ip.is_loopback() && !run_switch(args, "--allow-public-metrics") {
+        return Err(format!(
+            "refusing unauthenticated metrics on non-loopback {bind}; bind loopback or add \
+             --allow-public-metrics and firewall the port"
+        ));
+    }
+    Ok(bind)
+}
+
 /// `now + start_in seconds` as Unix milliseconds, for a manifest's
 /// `genesis_time_ms`. A system clock before 1970, or a `--start-in` that puts
 /// genesis past u64 milliseconds, is refused here — where it used to be a
@@ -790,14 +943,14 @@ fn keys_seal(args: &[String]) {
             }
         }
     } else {
-        let first = match keys::read_passphrase_from_tty("New keystore passphrase: ") {
+        let first = match keys::read_passphrase_from_tty_before_threads("New keystore passphrase: ") {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("keys seal: {e}");
                 exit(1);
             }
         };
-        let again = match keys::read_passphrase_from_tty("Repeat passphrase: ") {
+        let again = match keys::read_passphrase_from_tty_before_threads("Repeat passphrase: ") {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("keys seal: {e}");
@@ -843,7 +996,7 @@ fn keys_inspect(args: &[String]) {
             println!("file      : {}", dir.join("validator.key").display());
             println!("format    : {}", info.format);
             println!("index     : {}", info.index);
-            println!("pubkey    : sha3-256 {} ({} bytes)", codec::hex8(&info.pubkey_sha3), info.pubkey_len);
+            println!("pubkey    : sha3-256 {} ({} bytes)", codec::hex32(&info.pubkey_sha3), info.pubkey_len);
             match info.kdf {
                 Some(k) => println!("kdf       : Argon2id m={} KiB t={} p={}", k.m_cost, k.t_cost, k.p_cost),
                 None => println!("kdf       : none (PLAINTEXT — run `bloch-pos keys seal`)"),
@@ -861,16 +1014,7 @@ fn keys_inspect(args: &[String]) {
             exit(1);
         }
     }
-    // Whether a node is running over the dir, via the same lock the node
-    // takes. Taking and releasing it here is harmless: without a running node
-    // nothing else contends for it, and with one it is refused.
-    match store::DirLock::acquire(&dir) {
-        Ok(lock) => println!("data dir  : lock free ({})", lock.path().display()),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            println!("data dir  : IN USE by a running node — `keys seal` will refuse until it stops")
-        }
-        Err(e) => println!("data dir  : lock check failed ({e})"),
-    }
+    println!("data dir  : lock not probed (inspection is read-only)");
 }
 
 fn keygen(args: &[String]) {
@@ -1066,6 +1210,10 @@ fn genesis_mainnet(args: &[String]) {
     };
 
     // The check that makes this a claim rather than an assertion.
+    if let Err(e) = manifest.validate_new_validator_set() {
+        eprintln!("genesis-mainnet: {e}");
+        exit(1);
+    }
     if let Err(e) = manifest.check_supply() {
         eprintln!("genesis-mainnet: {e}");
         exit(1);
@@ -1179,6 +1327,10 @@ fn genesis_cmd(args: &[String]) {
         format: manifest_format(args),
         pre_state_root: std::sync::OnceLock::new(),
     };
+    if let Err(e) = manifest.validate_new_validator_set() {
+        eprintln!("genesis: {e}");
+        exit(1);
+    }
     if let Err(e) = manifest.check_supply() {
         eprintln!("genesis: {e}");
         exit(1);
@@ -1464,6 +1616,18 @@ fn run_cmd(args: &[String]) {
     if args.iter().any(|a| a == "--no-doppelganger-check") {
         unsafe { std::env::set_var("BLOCH_NO_DOPPELGANGER", "1") };
     }
+    if let Some(value) = arg_value(args, "--max-replay-blocks") {
+        if value.parse::<usize>().is_err() {
+            eprintln!("run: --max-replay-blocks must be a non-negative integer"); exit(2);
+        }
+        unsafe { std::env::set_var("BLOCH_MAX_REPLAY_BLOCKS", value) };
+    }
+    if args.iter().any(|a| a == "--replay-from-genesis") {
+        unsafe { std::env::set_var("BLOCH_REPLAY_FROM_GENESIS", "1") };
+    }
+    if args.iter().any(|a| a == "--require-state-cache") {
+        unsafe { std::env::set_var("BLOCH_REQUIRE_STATE_CACHE", "1") };
+    }
     // The transport is decided by a pure function (`decide_transport`) and
     // then ANNOUNCED. Nothing below re-derives it, and nothing silently drops
     // a flag: what the operator asked for either becomes the plan or becomes
@@ -1501,10 +1665,10 @@ fn run_cmd(args: &[String]) {
     };
     let stop_at_slot = arg_value(args, "--stop-at-slot").and_then(|s| s.parse::<u64>().ok());
 
-    let ws = ws_boot::WsConfig {
-        checkpoint: arg_value(args, "--ws-checkpoint").map(PathBuf::from),
-        signer_set: arg_value(args, "--ws-signer-set").map(PathBuf::from),
-    };
+    let ws = ws_boot::WsConfig::from_args(args).unwrap_or_else(|error| {
+        eprintln!("weak subjectivity configuration: {error}");
+        exit(2);
+    });
 
     // RPC. A malformed --rpc-port is refused rather than silently falling back
     // to the default: an operator who typed a port meant that port, and a node
@@ -1537,6 +1701,10 @@ fn run_cmd(args: &[String]) {
             }
         },
     };
+    let metrics_bind = metrics_bind_plan(args, metrics_port).unwrap_or_else(|error| {
+        eprintln!("run: {error}");
+        exit(2);
+    });
 
     let cfg = engine::Config {
         data_dir: PathBuf::from(data_dir),
@@ -1566,12 +1734,14 @@ fn run_cmd(args: &[String]) {
         // Loopback unless asked otherwise, like the RPC: /metrics is
         // read-only but still maps the node's peers, lag and validator
         // status for anyone who can reach it.
-        metrics_bind: arg_value(args, "--metrics-bind").unwrap_or_else(|| "127.0.0.1".to_string()),
+        metrics_bind,
         metrics_port,
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");
-        exit(1);
+        // Policy refusal requires an operator to repair checkpoint/trust
+        // configuration; restarting the same inputs cannot repair it.
+        exit(if ws_boot::is_non_retryable(&e) { 78 } else { 1 });
     }
 }
 
@@ -1854,5 +2024,89 @@ mod transport_tests {
             let plan = decide_transport(&argv(line)).unwrap();
             assert!(plan.summary.contains(want), "{line} → {}", plan.summary);
         }
+    }
+}
+
+#[cfg(test)]
+mod plaintext_flag_tests {
+    #[test]
+    fn opt_in_must_be_a_switch_on_a_keystore_command() {
+        let args = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(super::plaintext_opt_in_flag(&args(&["run", "--data-dir", "data", "--allow-plaintext-keystore"])));
+        assert!(!super::plaintext_opt_in_flag(&args(&["run", "--data-dir", "--allow-plaintext-keystore"])));
+        assert!(!super::plaintext_opt_in_flag(&args(&["run", "--", "--allow-plaintext-keystore"])));
+        assert!(!super::plaintext_opt_in_flag(&args(&["slashing-protection", "--allow-plaintext-keystore"])));
+    }
+}
+
+#[cfg(test)]
+mod metrics_bind_tests {
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn enabled_metrics_default_and_explicit_loopback_are_allowed() {
+        assert_eq!(
+            super::metrics_bind_plan(&args(&["--metrics-port", "9100"]), Some(9100)).unwrap(),
+            "127.0.0.1"
+        );
+        for bind in ["127.0.0.2", "::1"] {
+            let plan = super::metrics_bind_plan(
+                &args(&["--metrics-port", "9100", "--metrics-bind", bind]),
+                Some(9100),
+            )
+            .unwrap();
+            assert_eq!(plan, bind);
+        }
+    }
+
+    #[test]
+    fn enabled_metrics_refuse_every_non_loopback_without_acknowledgement() {
+        for bind in ["0.0.0.0", "::", "10.8.0.4", "203.0.113.7"] {
+            let error = super::metrics_bind_plan(
+                &args(&["--metrics-port", "9100", "--metrics-bind", bind]),
+                Some(9100),
+            )
+            .expect_err(bind);
+            assert!(error.contains("--allow-public-metrics"), "{bind}: {error}");
+        }
+    }
+
+    #[test]
+    fn explicit_public_metrics_acknowledgement_allows_the_bind() {
+        let plan = super::metrics_bind_plan(
+            &args(&[
+                "--metrics-bind", "0.0.0.0", "--metrics-port", "9100",
+                "--allow-public-metrics",
+            ]),
+            Some(9100),
+        )
+        .unwrap();
+        assert_eq!(plan, "0.0.0.0");
+    }
+
+    #[test]
+    fn acknowledgement_as_an_option_value_is_not_a_switch() {
+        let malformed = args(&[
+            "--metrics-bind", "--allow-public-metrics", "--metrics-port", "9100",
+        ]);
+        assert!(!super::run_switch(&malformed, "--allow-public-metrics"));
+        assert!(super::metrics_bind_plan(&malformed, Some(9100)).is_err());
+
+        let after_separator = args(&[
+            "--metrics-bind", "0.0.0.0", "--metrics-port", "9100", "--",
+            "--allow-public-metrics",
+        ]);
+        assert!(!super::run_switch(&after_separator, "--allow-public-metrics"));
+        assert!(super::metrics_bind_plan(&after_separator, Some(9100)).is_err());
+    }
+
+    #[test]
+    fn disabled_metrics_do_not_turn_an_unused_bind_into_an_exposure() {
+        assert_eq!(
+            super::metrics_bind_plan(&args(&["--metrics-bind", "metrics.internal"]), None).unwrap(),
+            "metrics.internal"
+        );
     }
 }

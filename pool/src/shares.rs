@@ -31,6 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use bloch_crypto::address::Address;
 use bloch_sis_pow::bits_to_target;
 
 use crate::payout::{split_reward, Payout};
@@ -49,6 +50,21 @@ pub fn work_from_bits(bits: u32) -> u128 {
 
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// Collapse historical case aliases without rewriting the append-only journal.
+///
+/// Older pool builds keyed accounting directly by the user-supplied address
+/// spelling. Valid Bloch addresses are hex-backed and the parser accepts upper
+/// case payload digits, so one address could appear under several map keys.
+/// Replay is the safe reconciliation point: every derived balance is rebuilt
+/// from the immutable event log, and valid addresses converge to the canonical
+/// lower-case display form. Non-address identifiers are retained for backwards
+/// compatibility with reference/test journals rather than silently discarded.
+fn canonical_accounting_identity(raw: &str) -> String {
+    Address::parse(raw)
+        .map(|address| address.to_string())
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 /// One accepted share in the PPLNS window.
@@ -196,7 +212,9 @@ impl ShareLedger {
         let Ok(v) = serde_json::from_str::<Value>(line) else { return };
         match v.get("t").and_then(|t| t.as_str()) {
             Some("share") => {
-                let addr   = v.get("a").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                let addr = canonical_accounting_identity(
+                    v.get("a").and_then(|x| x.as_str()).unwrap_or_default(),
+                );
                 let weight = v.get("w").and_then(|x| x.as_str())
                     .and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
                 let unix   = v.get("u").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -208,7 +226,7 @@ impl ShareLedger {
             Some("block") => {
                 let payouts: Vec<(String, u64)> = v.get("po").and_then(|p| p.as_array())
                     .map(|arr| arr.iter().filter_map(|e| {
-                        let a = e.get(0)?.as_str()?.to_string();
+                        let a = canonical_accounting_identity(e.get(0)?.as_str()?);
                         let s = e.get(1)?.as_str()?.parse::<u64>().ok()?;
                         Some((a, s))
                     }).collect())
@@ -219,7 +237,9 @@ impl ShareLedger {
                     reward_sat:    v.get("r").and_then(|x| x.as_str())
                                        .and_then(|s| s.parse().ok()).unwrap_or(0),
                     unix:          v.get("u").and_then(|x| x.as_u64()).unwrap_or(0),
-                    finder:        v.get("f").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+                    finder:        canonical_accounting_identity(
+                        v.get("f").and_then(|x| x.as_str()).unwrap_or_default(),
+                    ),
                     status:        BlockStatus::Pending,
                     pool_take_sat: v.get("pt").and_then(|x| x.as_str())
                                        .and_then(|s| s.parse().ok()).unwrap_or(0),
@@ -594,6 +614,49 @@ mod tests {
         let contribs = l.window_contributions();
         assert_eq!(contribs.len(), 2);
         assert_eq!(contribs[0], ("alice".to_string(), 30));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn historical_address_aliases_reconcile_during_replay() {
+        let canonical = Address::from_hash(
+            [7u8; 20],
+            bloch_crypto::address::Network::Mainnet,
+        )
+        .to_string();
+        let alias = format!("bloch1q{}", canonical[7..].to_ascii_uppercase());
+        assert_ne!(alias, canonical);
+        assert_eq!(Address::parse(&alias).unwrap().to_string(), canonical);
+
+        let path = std::env::temp_dir().join(format!(
+            "bloch-pool-alias-replay-test-{}.jsonl",
+            std::process::id(),
+        ));
+        let path_s = path.to_str().unwrap().to_string();
+        let events = [
+            json!({"t":"share", "a":canonical, "w":"30", "u":1, "bb":0x2100ffffu32}),
+            json!({"t":"share", "a":alias, "w":"10", "u":2, "bb":0x2100ffffu32}),
+            json!({"t":"block", "h":7, "hash":"aa", "r":"100", "u":3,
+                "f":alias, "pt":"0", "po":[[alias, "100"]]}),
+            json!({"t":"confirm", "hash":"aa"}),
+        ];
+        let contents = events
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&path, contents).unwrap();
+
+        let ledger = ShareLedger::with_journal(0x2100ffff, 0, 100, &path_s).unwrap();
+        assert_eq!(ledger.miners.len(), 1);
+        assert_eq!(ledger.miners[&canonical].shares, 2);
+        assert_eq!(ledger.miners[&canonical].credited_sat, 100);
+        assert_eq!(ledger.miners[&canonical].blocks_found, 1);
+        assert_eq!(ledger.window_contributions(), vec![(canonical.clone(), 40)]);
+        assert_eq!(ledger.blocks_found[0].finder, canonical);
+        assert_eq!(ledger.blocks_found[0].payouts[0].0, canonical);
 
         let _ = std::fs::remove_file(&path);
     }

@@ -1,0 +1,19 @@
+Validation wave 35 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Evidence reconciliation only; no new implementation commit.
+
+PASS
+
+cargo test --locked --offline -p bloch-pos-node --bin bloch-pos doppelganger
+  9 passed; 0 failed; 499 filtered out.
+
+The tests required ephemeral loopback sockets and ran with local socket access;
+no internet endpoint or deployed service was contacted.
+
+git diff --check
+  Passed after the documentation update.
+
+BOUNDARY
+
+Detection state is not durable or externally coordinated, the observation
+window is finite and the explicit operator bypass remains. KS-18 is PARTIAL.

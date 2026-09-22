@@ -1,3 +1,19 @@
+> **Candidate schedule update — 2026-09-13.** The operator selected Monday,
+> 2026-09-14: leak recovery at epoch 2880 (21:31:19 UTC), followed by
+> lifecycle epoch 2884 (22:35:19 UTC). Earlier statements below about an
+> unarmed slashing gate or unreachable penalties describe the historical
+> pre-release configuration. Evidence is refused before epoch 2884; at and
+> after it, valid evidence can apply the configured penalties. This candidate
+> schedule does not establish fleet deployment, cross-node agreement or a
+> settlement guarantee. See `docs/VALIDATOR-OPENING.md` and the September 13
+> activation preflight for the release conditions and retained evidence.
+
+> **Carryover status update — 2026-09-17.** This is a historical implementation
+> plan written before Genesis-3 stopped. Its 452,133-row/height-39,328 figures
+> describe an interim snapshot. The committed terminal artifact is height
+> 39,918, 452,726 rows and 3,810,744,000 Genesis-3 BLCH; after the ×100/21 split
+> it is 18,146,400,000 BLOCH. `CARRYOVER-SNAPSHOT.md` is authoritative.
+
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 
 # Genesis-4 — Integration Plan for the Four Remaining Items
@@ -149,9 +165,11 @@ So the rule ships as a manifest format, `genesis::ManifestFormat`:
   `unbound_genesis_identity_is_frozen`.
 - **`BPOSMAN2` / `V2Bound`** — `state_root` carries the genesis state's own
   root (`Manifest::genesis_pre_state_root`) and `randao_mix` is
-  `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest)`, the expression
-  `genesis4-ceremony::genesis_header` has always published. Two manifests
-  describing different ledgers then have different genesis ids.
+  `SHA3-256(DS_RANDAO ‖ 0 ‖ SHA3-256(Manifest::encode()))`. The canonical
+  manifest digest binds the genesis cohort as well as the validator set,
+  carryover commitment, allocations and clock. Two manifests describing
+  different networks then have different genesis ids. The ceremony tool's
+  older carryover-only expression must be reconciled before publication.
 
 Emit one with `bloch-pos genesis --bind-genesis` / `genesis-mainnet
 --bind-genesis`. Nothing selects it by default, because a manifest carrying it
@@ -162,9 +180,11 @@ deployment.
 The self-reference is cut at the anchor: `CommittedState::genesis` seeds its
 checkpoints with the genesis block id, so the root committed is that of the
 state anchored at the *pre-commitment* header's id (the same header with
-`state_root` still zero). Every ledger fact — registry, cohort, all opening
-balances, `issued_sat`, the carried roots — is under it; only the 32 bytes
-that are the answer are not.
+`state_root` still zero). Every ledger fact — registry, all opening balances,
+`issued_sat`, the carried roots — is under it; only the 32 bytes that are the
+answer are not. The cohort is intentionally absent from the state-root
+inventory and is instead bound by the canonical manifest digest in the V2
+mix.
 
 ---
 
@@ -299,11 +319,10 @@ The pieces that already exist and are waiting:
 
 1. **A txid derivation.** Domain-separated, per §5.4 discipline. This is a new
    consensus primitive and needs a KAT.
-2. **A spend signing root** and a `DS_SPEND` domain tag. `params.rs:73-97`
-   currently has `DS_ATTEST`, `DS_BLOCK`, `DS_STATE`, `DS_DEPOSIT`,
-   `DS_PROPOSE`, `DS_BODY`. A new tag must be 16 bytes, zero-padded, and
-   pairwise-distinct — `header.rs:734` (`domain_tag_shape`) and `main.rs`'s
-   selfcheck both police this.
+2. **Resolved:** the witness-free spend root and `DS_SPEND` shipped; the inert
+   network-bound successor uses `DS_SPEND2`. All shipped separators are listed
+   by `params::DOMAIN_TAGS`, which records their preimage shapes and is checked
+   for 16-byte uniqueness and spec coverage.
 3. **Accessors on `eutxos`** and on `EutxoEntry::entry_key`/`serialize`, which
    are private (`state_root.rs:419`, `:425`).
 4. **The fee debit.** Today fees are computed and *credited* to the proposer
@@ -340,13 +359,10 @@ open item 3 in `BLOCH-POS-NODE-INTEGRATION.md` §8 and is marked there as
 
 - `body_root` for every block containing a transfer → block identity. Expected;
   pre-launch it is free.
-- `derive::ChainState` (`derive.rs:66`) carries a **second** `eutxos: Vec<EutxoEntry>`
-  (`:70`) rooted independently (`:134-137`). `derive::validate_block` was
-  deleted, but `ChainState` is still `pub` and re-exported (`lib.rs:119`). Any
-  new eUTXO component must be threaded through both or they silently diverge —
-  this is precisely the failure `tests/one_state_root.rs` was written about.
-  **Consider deleting `ChainState` as part of this item** rather than
-  maintaining a second carrier.
+- **Resolved:** `derive::validate_block`, `ChainState`, `ParentState` and the
+  separate producer were deleted. The node produces and validates through
+  `Transition::compute_post_state` / `Transition::apply_block`; `derive`
+  retains only shared header/body commitment helpers.
 - The field-coverage test `every_committed_state_field_is_bound_by_the_root`
   (`transition.rs:3448`, mutation list `:3462-3568`) has **no entry for
   `eutxos`** (nor `issued_sat`). eUTXO sensitivity is pinned one layer down at
@@ -426,24 +442,17 @@ it. Two adaptations are required, and both are decisions, not typing:
 
 ### 5.3 Three decisions that block this item
 
-**D1 — the dust rule for the 100/21 split. Unresolved in code, and the code
-says so.** `tokenomics_v4.rs:57-67`:
+**D1 — the dust rule for the 100/21 split (resolved after this plan).**
+`genesis.rs::read_carryover_snapshot` applies the split per output, then gives
+the accumulated remainder to the highest-value output, ties broken by the
+lowest `(txid, vout)`. The terminal artifact has 452,726 outputs totalling
+3,810,744,000 Genesis-3 BLCH. Its aggregate split is 18,146,400,000 BLOCH;
+111 rows have a fractional remainder and the deterministic adjustment is 57
+satoshis.
 
-> *"This is the function the carryover rebuild must apply per balance. It
-> truncates: a balance not divisible by 21 loses up to 20/21 of a satoshi. The
-> ceremony pins the artifact's TOTAL against `CARRYOVER_TOTAL_BLOCH` exactly,
-> so the builder must state its dust rule (who absorbs the sub-satoshi
-> remainders) and make the rows sum to the pinned figure — **truncate-and-hope
-> does not close the accounting**."*
-
-Concretely: the snapshot is 452,133 outputs totalling 3,805,746,000 BLCH
-(pre-split). `CARRYOVER_TOTAL_BLOCH = 18_122_600_000` (`tokenomics_v4.rs:187`),
-and `3,805,746,000 × 100 / 21 = 18,122,600,000` **exactly** at the aggregate.
-Per row it does not divide: truncating each of 452,133 rows loses under 1 sat
-each, so the row sum can fall short of the pinned total by up to ~452,133 sat
-(≈0.0045 BLCH). `check_supply` demands **exact** equality (`genesis.rs:253`),
-so even a 1-sat shortfall is a hard refusal. Someone must name who absorbs the
-remainder. This is a founder/tokenomics call, not a DEV call.
+The recipient is address `cb339d2e…`, which owns the artifact's largest single
+output; it is not the founder address. `Manifest::check_supply` continues to
+require exact equality, so dropping the adjustment remains a hard refusal.
 
 **D2 — which hash, and over what.** The legacy loader digests with
 **SHAKE-256 over the file's raw bytes** (`src/storage/mod.rs:1172-1175`).
@@ -479,10 +488,9 @@ Breaks: `state_root` of block 1 onward (expected, §2). Also:
   claim at `genesis.rs:100-102` that vesting "is enforced by every node" is
   **not implemented**. Not item 3's job to build, but the doc comment should
   stop asserting it.
-- **The test fixture carries stale figures.** `mainnet_sample()`
-  (`genesis.rs:414-417`) still uses `entry_count: 413_743` and
-  `17_970_880_000` BLCH — the pre-re-measurement numbers. Should be 452,133 and
-  18,122,600,000 to match `tokenomics_v4.rs:187/:201`.
+- **Historical observation, since resolved:** `mainnet_sample()` used
+  pre-terminal figures when this plan was written. Current tests bind the
+  terminal count (452,726) and 18,146,400,000 BLOCH total.
 - **`check_supply` must start being called at load**, or the whole commitment
   apparatus stays decorative.
 

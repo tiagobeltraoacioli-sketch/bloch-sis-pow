@@ -43,7 +43,7 @@
 use super::errors::WalletError;
 use crate::address::Network;
 use serde::{Serialize, Deserialize};
-use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit, Payload}};
+use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, AeadInPlace, KeyInit, Payload}};
 use sha3::{Sha3_256, Digest};
 use argon2::{Argon2, Algorithm, Version, Params};
 use rand::RngCore;
@@ -70,6 +70,30 @@ pub const KEYFILE_VERSION_V2: u32 = 2;
 /// accepts; 128 leaves headroom without letting a corrupt field run away.
 const V2_SEED_MIN: usize = 32;
 const V2_SEED_MAX: usize = 128;
+
+// `base64::STANDARD` requires canonical padding, so fixed decoded fields have
+// one accepted encoded length. Check that shape before asking the decoder to
+// allocate output; the decoded-length checks below remain authoritative.
+const KEYFILE_SALT_B64_LEN: usize = 24; // 16 decoded bytes
+const KEYFILE_NONCE_B64_LEN: usize = 16; // 12 decoded bytes
+
+fn validate_fixed_base64_lengths(salt_b64: &str, nonce_b64: &str) -> Result<(), WalletError> {
+    if salt_b64.len() != KEYFILE_SALT_B64_LEN {
+        return Err(WalletError::Parse(format!(
+            "keyfile salt Base64 has invalid encoded length: expected {} bytes, got {}",
+            KEYFILE_SALT_B64_LEN,
+            salt_b64.len()
+        )));
+    }
+    if nonce_b64.len() != KEYFILE_NONCE_B64_LEN {
+        return Err(WalletError::Parse(format!(
+            "keyfile nonce Base64 has invalid encoded length: expected {} bytes, got {}",
+            KEYFILE_NONCE_B64_LEN,
+            nonce_b64.len()
+        )));
+    }
+    Ok(())
+}
 
 /// KDF parameters. Tuned for ~4 seconds on modern CPU (2026).
 ///
@@ -186,11 +210,11 @@ impl EncryptedKeyfile {
         rand::rng().fill_bytes(&mut nonce_bytes);
 
         // Derive encryption key via Argon2id
-        let mut key = [0u8; 32];
-        derive_key(password, &salt, params, &mut key)?;
+        let mut key = Zeroizing::new([0u8; 32]);
+        derive_key(password, &salt, params, &mut *key)?;
 
         // Encrypt with AES-256-GCM
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*key));
         let nonce = Nonce::from_slice(&nonce_bytes);
         // SECURITY (audit M2): bind the public key + network into the AEAD as
         // AAD so they cannot be swapped without breaking the GCM tag. Otherwise
@@ -235,6 +259,16 @@ impl EncryptedKeyfile {
 
     /// Decrypt with password. Returns (secret, public, network).
     pub fn decrypt(&self, password: &str) -> Result<(Vec<u8>, Vec<u8>, Network), WalletError> {
+        let (mut secret, public, network) = self.decrypt_zeroizing(password)?;
+        Ok((std::mem::take(&mut *secret), public, network))
+    }
+
+    /// Repository-internal v1 decrypt path that retains wiping ownership until
+    /// the final wallet takes ownership of the authenticated secret.
+    pub(super) fn decrypt_zeroizing(
+        &self,
+        password: &str,
+    ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Network), WalletError> {
         // Version check
         if self.version != KEYFILE_VERSION {
             return Err(WalletError::UnsupportedVersion(self.version));
@@ -248,10 +282,32 @@ impl EncryptedKeyfile {
             return Err(WalletError::Parse(format!("unknown cipher: {}", self.cipher.algo)));
         }
 
+        // SECURITY (audit L1): reject absurd KDF params from the untrusted
+        // keyfile before decoding attacker-controlled payloads or handing
+        // them to Argon2. m_cost near u32::MAX (KiB) forces a multi-terabyte
+        // allocation; large t_cost is a CPU slow-loris.
+        const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
+        const MAX_T_COST: u32 = 16;
+        const MAX_P_COST: u32 = 16;
+        if self.kdf.m_cost > MAX_M_COST_KIB
+            || self.kdf.t_cost > MAX_T_COST
+            || self.kdf.p_cost > MAX_P_COST
+        {
+            return Err(WalletError::Parse(format!(
+                "KDF params out of bounds (m_cost={} KiB, t_cost={}, p_cost={})",
+                self.kdf.m_cost, self.kdf.t_cost, self.kdf.p_cost
+            )));
+        }
+
+        validate_fixed_base64_lengths(&self.kdf.salt_b64, &self.cipher.nonce_b64)?;
+
         // Decode base64
         let salt = B64.decode(&self.kdf.salt_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
         let nonce_bytes = B64.decode(&self.cipher.nonce_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
-        let ciphertext = B64.decode(&self.cipher.ciphertext_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
+        let mut ciphertext = Zeroizing::new(
+            B64.decode(&self.cipher.ciphertext_b64)
+                .map_err(|e| WalletError::Parse(e.to_string()))?,
+        );
         let public = B64.decode(&self.meta.public_key_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
 
         // SECURITY (audit M): length-guard fields decoded from the untrusted
@@ -283,47 +339,27 @@ impl EncryptedKeyfile {
             )));
         }
 
-        // SECURITY (audit L1): reject absurd KDF params from the untrusted
-        // keyfile BEFORE handing them to Argon2. m_cost near u32::MAX (KiB)
-        // forces a multi-terabyte allocation that OOM-kills the process on any
-        // unlock attempt; large t_cost is a CPU slow-loris.
-        const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
-        const MAX_T_COST: u32 = 16;
-        const MAX_P_COST: u32 = 16;
-        if self.kdf.m_cost > MAX_M_COST_KIB
-            || self.kdf.t_cost > MAX_T_COST
-            || self.kdf.p_cost > MAX_P_COST
-        {
-            return Err(WalletError::Parse(format!(
-                "KDF params out of bounds (m_cost={} KiB, t_cost={}, p_cost={})",
-                self.kdf.m_cost, self.kdf.t_cost, self.kdf.p_cost
-            )));
-        }
-
         // Derive key
         let params = KdfParams {
             m_cost: self.kdf.m_cost,
             t_cost: self.kdf.t_cost,
             p_cost: self.kdf.p_cost,
         };
-        let mut key = [0u8; 32];
-        derive_key(password, &salt, params, &mut key)?;
+        let mut key = Zeroizing::new([0u8; 32]);
+        derive_key(password, &salt, params, &mut *key)?;
 
         // Decrypt
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-        let nonce = Nonce::from_slice(&nonce_bytes);
         // SECURITY (audit M2): verify against the same public+network AAD used
         // at encrypt time. A tampered public key or flipped network breaks the
         // GCM tag → WrongPassword, so a swapped receive address cannot pass as
         // "integrity OK".
         let net: Network = self.network.into();
         let aad = keyfile_aad(&public, net);
-        let secret = cipher.decrypt(nonce, Payload { msg: ciphertext.as_ref(), aad: &aad })
-            .map_err(|_| WalletError::WrongPassword)?;
+        decrypt_keyfile_ciphertext_in_place(&*key, &nonce_bytes, &aad, &mut ciphertext)?;
 
         key.zeroize();
 
-        Ok((secret, public, net))
+        Ok((ciphertext, public, net))
     }
 
     // ── v2: master seed encrypted at rest (P4) ────────────────────────────────
@@ -366,8 +402,8 @@ impl EncryptedKeyfile {
         rand::rng().fill_bytes(&mut salt);
         rand::rng().fill_bytes(&mut nonce_bytes);
 
-        let mut key = [0u8; 32];
-        derive_key(password, &salt, params, &mut key)?;
+        let mut key = Zeroizing::new([0u8; 32]);
+        derive_key(password, &salt, params, &mut *key)?;
 
         // Plaintext: [4B seed_len LE][seed][secret]. Zeroizing so the buffer
         // wipes on every exit path.
@@ -376,7 +412,7 @@ impl EncryptedKeyfile {
         plain.extend_from_slice(master_seed);
         plain.extend_from_slice(secret);
 
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*key));
         let nonce = Nonce::from_slice(&nonce_bytes);
         // v2 AAD domain: binds version + public key + network (audit M2 for v1,
         // extended with the version so cross-version replay breaks the tag).
@@ -433,9 +469,29 @@ impl EncryptedKeyfile {
             return Err(WalletError::Parse(format!("unknown cipher: {}", self.cipher.algo)));
         }
 
+        // KDF-parameter bounds (audit L1): reject OOM/slow-loris params from
+        // the untrusted file before decoding attacker-controlled payloads or
+        // handing the parameters to Argon2.
+        const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
+        const MAX_T_COST: u32 = 16;
+        const MAX_P_COST: u32 = 16;
+        if self.kdf.m_cost > MAX_M_COST_KIB
+            || self.kdf.t_cost > MAX_T_COST
+            || self.kdf.p_cost > MAX_P_COST
+        {
+            return Err(WalletError::Parse(format!(
+                "KDF params out of bounds (m_cost={} KiB, t_cost={}, p_cost={})",
+                self.kdf.m_cost, self.kdf.t_cost, self.kdf.p_cost)));
+        }
+
+        validate_fixed_base64_lengths(&self.kdf.salt_b64, &self.cipher.nonce_b64)?;
+
         let salt = B64.decode(&self.kdf.salt_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
         let nonce_bytes = B64.decode(&self.cipher.nonce_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
-        let ciphertext = B64.decode(&self.cipher.ciphertext_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
+        let mut ciphertext = Zeroizing::new(
+            B64.decode(&self.cipher.ciphertext_b64)
+                .map_err(|e| WalletError::Parse(e.to_string()))?,
+        );
         let public = B64.decode(&self.meta.public_key_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
 
         // Length guards (audit M): Nonce::from_slice panics off-length; salt is
@@ -459,35 +515,18 @@ impl EncryptedKeyfile {
                 ciphertext.len(), GCM_TAG_LEN)));
         }
 
-        // KDF-parameter bounds (audit L1): reject OOM/slow-loris params from
-        // the untrusted file before Argon2 sees them.
-        const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
-        const MAX_T_COST: u32 = 16;
-        const MAX_P_COST: u32 = 16;
-        if self.kdf.m_cost > MAX_M_COST_KIB
-            || self.kdf.t_cost > MAX_T_COST
-            || self.kdf.p_cost > MAX_P_COST
-        {
-            return Err(WalletError::Parse(format!(
-                "KDF params out of bounds (m_cost={} KiB, t_cost={}, p_cost={})",
-                self.kdf.m_cost, self.kdf.t_cost, self.kdf.p_cost)));
-        }
-
         let params = KdfParams {
             m_cost: self.kdf.m_cost,
             t_cost: self.kdf.t_cost,
             p_cost: self.kdf.p_cost,
         };
-        let mut key = [0u8; 32];
-        derive_key(password, &salt, params, &mut key)?;
+        let mut key = Zeroizing::new([0u8; 32]);
+        derive_key(password, &salt, params, &mut *key)?;
 
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-        let nonce = Nonce::from_slice(&nonce_bytes);
         let net: Network = self.network.into();
         let aad = keyfile_aad_v2(&public, net);
-        let plain = Zeroizing::new(
-            cipher.decrypt(nonce, Payload { msg: ciphertext.as_ref(), aad: &aad })
-                .map_err(|_| WalletError::WrongPassword)?);
+        decrypt_keyfile_ciphertext_in_place(&*key, &nonce_bytes, &aad, &mut ciphertext)?;
+        let plain = ciphertext;
         key.zeroize();
 
         // Parse [4B seed_len LE][seed][secret] with bounds checks — the
@@ -501,11 +540,43 @@ impl EncryptedKeyfile {
             return Err(WalletError::Parse(format!(
                 "v2 payload seed length {} out of bounds", seed_len)));
         }
-        let master_seed = Zeroizing::new(plain[4..4 + seed_len].to_vec());
-        let secret = Zeroizing::new(plain[4 + seed_len..].to_vec());
+        let (master_seed, secret) = split_v2_plaintext(plain, seed_len);
 
         Ok((master_seed, secret, public, net))
     }
+}
+
+/// Split the authenticated v2 layout while retaining the original plaintext
+/// allocation for the usually much larger private key. The seed requires its
+/// own owner because the compatibility API returns both values independently;
+/// the shifted key overwrites former header/seed prefix, wipes remaining old
+/// logical tail, then truncates the reused allocation.
+fn split_v2_plaintext(
+    mut plain: Zeroizing<Vec<u8>>,
+    seed_len: usize,
+) -> (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>) {
+    let secret_offset = 4 + seed_len;
+    let master_seed = Zeroizing::new(plain[4..secret_offset].to_vec());
+    let secret_len = plain.len() - secret_offset;
+    plain.copy_within(secret_offset.., 0);
+    plain[secret_len..].zeroize();
+    plain.truncate(secret_len);
+    (master_seed, plain)
+}
+
+/// Authenticate and decrypt a validated keyfile payload without allocating a
+/// second plaintext buffer. Callers retain the `Zeroizing<Vec<u8>>` owner so a
+/// failed authentication wipes the still-encrypted bytes on early return.
+fn decrypt_keyfile_ciphertext_in_place(
+    key: &[u8; 32],
+    nonce_bytes: &[u8],
+    aad: &[u8],
+    ciphertext: &mut Vec<u8>,
+) -> Result<(), WalletError> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .decrypt_in_place(Nonce::from_slice(nonce_bytes), aad, ciphertext)
+        .map_err(|_| WalletError::WrongPassword)
 }
 
 /// AAD that binds the public key + network into the keyfile AEAD (audit M2),
@@ -547,6 +618,11 @@ fn derive_key(
     argon.hash_password_into(password.as_bytes(), salt, output)
         .map_err(|e| WalletError::Crypto(format!("argon2: {}", e)))?;
     Ok(())
+}
+
+/// Own the repository-created denylist comparison copy under wiping drop.
+fn normalized_password_for_denylist(password: &str) -> Zeroizing<String> {
+    Zeroizing::new(password.trim().to_lowercase())
 }
 
 /// Reject passwords that would defeat the Argon2id hardening anyway.
@@ -601,7 +677,7 @@ pub(crate) fn validate_password_strength(password: &str) -> Result<(), WalletErr
         ));
     }
 
-    let normalized = password.trim().to_lowercase();
+    let normalized = normalized_password_for_denylist(password);
     if DENYLIST.iter().any(|banned| *banned == normalized.as_str()) {
         return Err(WalletError::WeakPassword(
             "password appears on the list of commonly breached passwords; \
@@ -637,6 +713,43 @@ mod tests {
         assert_eq!(decrypted_secret, secret);
         assert_eq!(decrypted_public, public);
         assert!(matches!(decrypted_network, Network::Mainnet));
+    }
+
+    #[test]
+    fn v1_internal_decrypt_preserves_public_bytes_under_zeroizing_ownership() {
+        let _: fn(
+            &EncryptedKeyfile,
+            &str,
+        ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Network), WalletError> =
+            EncryptedKeyfile::decrypt_zeroizing;
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
+        let secret = b"authenticated v1 keyfile secret";
+        let public = b"authenticated v1 public key";
+        let password = "correct horse battery staple";
+        let fast_params = KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 };
+        let keyfile = EncryptedKeyfile::encrypt_with_params(
+            secret,
+            public,
+            Network::Testnet,
+            password,
+            fast_params,
+        )
+        .unwrap();
+
+        let (mut protected, protected_public, protected_network) =
+            keyfile.decrypt_zeroizing(password).unwrap();
+        let (compatible, compatible_public, compatible_network) =
+            keyfile.decrypt(password).unwrap();
+        assert_eq!(&protected[..], secret);
+        assert_eq!(protected.as_slice(), compatible.as_slice());
+        assert_eq!(protected_public, compatible_public);
+        assert_eq!(protected_public, public);
+        assert!(matches!(protected_network, Network::Testnet));
+        assert!(matches!(compatible_network, Network::Testnet));
+
+        protected.zeroize();
+        assert!(protected.is_empty());
     }
 
     #[test]
@@ -679,6 +792,28 @@ mod tests {
             Err(other) => panic!("expected WeakPassword error, got different error: {}", other),
             Ok(_)      => panic!("expected WeakPassword error, got Ok(_)"),
         }
+    }
+
+    #[test]
+    fn denylist_normalization_has_zeroizing_ownership_and_preserves_policy() {
+        let _: fn(&str) -> Zeroizing<String> = normalized_password_for_denylist;
+        assert!(std::mem::needs_drop::<Zeroizing<String>>());
+
+        let mut normalized = normalized_password_for_denylist("  PASSWORD1234  ");
+        assert_eq!(normalized.as_str(), "password1234");
+        normalized.zeroize();
+        assert!(normalized.is_empty());
+
+        assert_eq!(
+            normalized_password_for_denylist("  ÄBCdef-Unique-42!  ").as_str(),
+            "äbcdef-unique-42!",
+        );
+
+        assert!(matches!(
+            validate_password_strength("  PASSWORD1234  "),
+            Err(WalletError::WeakPassword(_))
+        ));
+        assert!(validate_password_strength("  Unique-Diceware-42!  ").is_ok());
     }
 
     /// Sprint T.3: length-boundary check — exactly 11 chars must be rejected,
@@ -757,6 +892,145 @@ mod tests {
     }
 
     #[test]
+    fn kdf_bounds_precede_payload_base64_decoding_for_both_versions() {
+        let fast_params = KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 };
+        let password = "password-abcd-12";
+        let expected = format!(
+            "KDF params out of bounds (m_cost={} KiB, t_cost=1, p_cost=1)",
+            u32::MAX,
+        );
+        let assert_expected = |error| match error {
+            WalletError::Parse(message) => assert_eq!(message, expected),
+            other => panic!("expected exact KDF Parse error, got {other}"),
+        };
+
+        let mut v1 = EncryptedKeyfile::encrypt_with_params(
+            b"secret",
+            b"public",
+            Network::Mainnet,
+            password,
+            fast_params,
+        )
+        .unwrap();
+        v1.kdf.m_cost = u32::MAX;
+        v1.cipher.ciphertext_b64 = "!".repeat(64 * 1024);
+        assert_expected(v1.decrypt(password).unwrap_err());
+
+        let mut v2 = EncryptedKeyfile::encrypt_seed_v2_with_params(
+            &[0x17; 64],
+            b"secret",
+            b"public",
+            Network::Testnet,
+            password,
+            fast_params,
+        )
+        .unwrap();
+        v2.kdf.m_cost = u32::MAX;
+        v2.cipher.ciphertext_b64 = "!".repeat(64 * 1024);
+        assert_expected(v2.decrypt_v2(password).unwrap_err());
+    }
+
+    #[test]
+    fn fixed_base64_lengths_precede_decode_for_both_keyfile_versions() {
+        const PASSWORD: &str = "password-abcd-12";
+        let fast_params = KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 };
+
+        let make = |v2: bool| {
+            if v2 {
+                EncryptedKeyfile::encrypt_seed_v2_with_params(
+                    &[0x17; 64],
+                    b"secret",
+                    b"public",
+                    Network::Testnet,
+                    PASSWORD,
+                    fast_params,
+                )
+                .unwrap()
+            } else {
+                EncryptedKeyfile::encrypt_with_params(
+                    b"secret",
+                    b"public",
+                    Network::Mainnet,
+                    PASSWORD,
+                    fast_params,
+                )
+                .unwrap()
+            }
+        };
+        let decrypt_error = |keyfile: &EncryptedKeyfile, v2: bool| {
+            if v2 {
+                keyfile.decrypt_v2(PASSWORD).unwrap_err()
+            } else {
+                keyfile.decrypt(PASSWORD).unwrap_err()
+            }
+        };
+
+        // Authentic canonical encodings at the exact lengths still traverse
+        // the unchanged decoder/KDF/AES paths for both schema versions.
+        let v1 = make(false);
+        assert_eq!(v1.kdf.salt_b64.len(), KEYFILE_SALT_B64_LEN);
+        assert_eq!(v1.cipher.nonce_b64.len(), KEYFILE_NONCE_B64_LEN);
+        assert_eq!(v1.decrypt(PASSWORD).unwrap().0, b"secret");
+        let v2 = make(true);
+        assert_eq!(v2.kdf.salt_b64.len(), KEYFILE_SALT_B64_LEN);
+        assert_eq!(v2.cipher.nonce_b64.len(), KEYFILE_NONCE_B64_LEN);
+        let (seed, secret, ..) = v2.decrypt_v2(PASSWORD).unwrap();
+        assert_eq!(&seed[..], &[0x17; 64]);
+        assert_eq!(&secret[..], b"secret");
+
+        for v2 in [false, true] {
+            for salt in [true, false] {
+                let (field, exact, expected) = if salt {
+                    (
+                        "salt",
+                        KEYFILE_SALT_B64_LEN,
+                        format!(
+                            "keyfile salt Base64 has invalid encoded length: expected {} bytes, got {}",
+                            KEYFILE_SALT_B64_LEN,
+                            KEYFILE_SALT_B64_LEN + 1
+                        ),
+                    )
+                } else {
+                    (
+                        "nonce",
+                        KEYFILE_NONCE_B64_LEN,
+                        format!(
+                            "keyfile nonce Base64 has invalid encoded length: expected {} bytes, got {}",
+                            KEYFILE_NONCE_B64_LEN,
+                            KEYFILE_NONCE_B64_LEN + 1
+                        ),
+                    )
+                };
+
+                let mut at_exact = make(v2);
+                if salt {
+                    at_exact.kdf.salt_b64 = "!".repeat(exact);
+                } else {
+                    at_exact.cipher.nonce_b64 = "!".repeat(exact);
+                }
+                let WalletError::Parse(message) = decrypt_error(&at_exact, v2) else {
+                    panic!("exact-length {field} sentinel must reach the Base64 decoder")
+                };
+                assert!(
+                    !message.contains("invalid encoded length"),
+                    "exact-length {field} sentinel must pass the shape preflight: {message}",
+                );
+
+                let mut one_over = make(v2);
+                if salt {
+                    one_over.kdf.salt_b64 = "!".repeat(exact + 1);
+                } else {
+                    one_over.cipher.nonce_b64 = "!".repeat(exact + 1);
+                }
+                let WalletError::Parse(message) = decrypt_error(&one_over, v2) else {
+                    panic!("one-over {field} sentinel must fail the encoded-length preflight")
+                };
+                assert_eq!(message, expected);
+            }
+        }
+    }
+
+    #[test]
     fn different_encrypts_produce_different_ciphertext() {
         let fast_params = KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 };
         let k1 = EncryptedKeyfile::encrypt_with_params(
@@ -771,6 +1045,62 @@ mod tests {
         assert_ne!(k1.kdf.salt_b64, k2.kdf.salt_b64);
     }
 
+    #[test]
+    fn keyfile_decryption_reuses_ciphertext_allocation_at_tag_boundary() {
+        let key = [0x84; 32];
+        let nonce = [0x48; 12];
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let v1_aad = keyfile_aad(b"public", Network::Mainnet);
+        let v2_aad = keyfile_aad_v2(b"public", Network::Testnet);
+
+        for (aad, plaintext) in [
+            (v1_aad.as_slice(), b"".as_slice()),
+            (v2_aad.as_slice(), b"seed and secret payload".as_slice()),
+        ] {
+            let mut buffer = Zeroizing::new(
+                cipher.encrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload { msg: plaintext, aad },
+                ).unwrap(),
+            );
+            let allocation = buffer.as_ptr();
+            let capacity = buffer.capacity();
+            let encrypted_len = buffer.len();
+
+            decrypt_keyfile_ciphertext_in_place(&key, &nonce, aad, &mut buffer).unwrap();
+
+            assert_eq!(buffer.as_ptr(), allocation);
+            assert_eq!(buffer.capacity(), capacity);
+            assert_eq!(buffer.as_slice(), plaintext);
+            assert_eq!(encrypted_len, plaintext.len() + 16);
+        }
+
+        // Authentication failure keeps the allocation under the production
+        // caller's Zeroizing owner until `?` returns and Drop wipes it.
+        let mut tampered = Zeroizing::new(
+            cipher.encrypt(
+                Nonce::from_slice(&nonce),
+                Payload { msg: b"authenticated keyfile secret", aad: &v1_aad },
+            ).unwrap(),
+        );
+        let tag_byte = tampered.len() - 1;
+        tampered[tag_byte] ^= 1;
+        let allocation = tampered.as_ptr();
+        let capacity = tampered.capacity();
+        assert!(matches!(
+            decrypt_keyfile_ciphertext_in_place(
+                &key,
+                &nonce,
+                &v1_aad,
+                &mut tampered,
+            ),
+            Err(WalletError::WrongPassword),
+        ));
+        assert_eq!(tampered.as_ptr(), allocation);
+        assert_eq!(tampered.capacity(), capacity);
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+    }
+
     // ── v2 (master seed at rest) ─────────────────────────────────────────────
 
     fn v2_fixture() -> (EncryptedKeyfile, Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -782,6 +1112,34 @@ mod tests {
             &seed, &secret, &public, Network::Testnet, "password-abcd-12", fast_params
         ).unwrap();
         (kf, seed, secret, public)
+    }
+
+    #[test]
+    fn v2_plaintext_split_reuses_secret_allocation_and_wipes_live_owners() {
+        let seed = [0x42u8; 64];
+        // Longer than the header+seed prefix so the in-place move exercises
+        // the overlapping copy shape used by real hybrid private keys.
+        let secret = [0xA5u8; 192];
+        let mut layout = Vec::with_capacity(512);
+        layout.extend_from_slice(&(seed.len() as u32).to_le_bytes());
+        layout.extend_from_slice(&seed);
+        layout.extend_from_slice(&secret);
+        let allocation = layout.as_ptr();
+        let capacity = layout.capacity();
+
+        let (mut split_seed, mut split_secret) =
+            split_v2_plaintext(Zeroizing::new(layout), seed.len());
+
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+        assert_eq!(split_seed.as_slice(), seed);
+        assert_eq!(split_secret.as_slice(), secret);
+        assert_eq!(split_secret.as_ptr(), allocation);
+        assert_eq!(split_secret.capacity(), capacity);
+
+        split_seed.zeroize();
+        split_secret.zeroize();
+        assert!(split_seed.is_empty());
+        assert!(split_secret.is_empty());
     }
 
     #[test]

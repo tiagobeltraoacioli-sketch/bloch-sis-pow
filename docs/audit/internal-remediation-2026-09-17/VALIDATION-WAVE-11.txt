@@ -1,0 +1,30 @@
+Validation wave 11 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Implementation commit: a3d4612
+
+PASS
+
+cargo test -p bloch-pos-node stale_head_duty_gate_tests --locked
+  7 passed; normal head distance, time threshold, quarantine, multi-page
+  progress, sparse-chain escape/cooldown and clock regression are pinned.
+
+cargo test -p bloch-pos-node --locked
+  591 passed; 0 failed; 25 ignored across unit and integration binaries.
+  The suite ran outside the restricted sandbox so loopback-dependent network,
+  RPC and cold-start tests were included.
+
+git diff --check
+  Passed before the implementation commit.
+
+KNOWN WORKSPACE FORMAT BASELINE
+
+cargo fmt --all -- --check still reports the repository-wide pre-existing
+format drift documented by prior waves. No bulk formatter rewrite was mixed
+into this security change.
+
+NOT A CLOSURE CLAIM
+
+Neither transport supplies authenticated end-of-sync/tip evidence to the
+engine. The quiet-window escape is required to recover from genuinely empty
+slots and leaves a bounded stale-signing residual when no peer responds. EN-10
+is partial pending a protocol-level completion signal and fleet qualification.

@@ -1,0 +1,26 @@
+Validation wave 31 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Implementation: 7851d80
+
+PASS
+
+python3 scripts/check-live-node-retired-isolation.py --selftest
+  Clean, direct, transitive and missing-root cases behaved as documented.
+
+python3 scripts/check-live-node-retired-isolation.py
+  The locked bloch-pos-node graph reached none of bloch, bloch-euvm or
+  bloch-ffg.
+
+ruby -e 'require "yaml"; YAML.load_file(...)'
+  .github/workflows/tests.yml and .gitlab-ci.yml parsed successfully.
+
+python3 scripts/check-tests-blocking.py
+  Both pipelines still covered all 8 live crates in blocking test jobs.
+
+git diff --check
+  Passed before the implementation commit and after the documentation update.
+
+BOUNDARY
+
+This proves reachability in the checked-in, locked default package graph. It
+does not evaluate the retired crates themselves or any separately built binary.

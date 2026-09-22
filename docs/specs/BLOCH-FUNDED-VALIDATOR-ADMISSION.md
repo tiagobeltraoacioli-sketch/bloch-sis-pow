@@ -1,9 +1,11 @@
 # Funded validator admission
 
-Status: implemented, **not activated on mainnet**. The
-`FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH` is `u64::MAX`. This work prepares
-registration and node onboarding for a coordinated consensus release; merging
-it does not open deposits on the running network.
+Status: **candidate schedule, not a completed mainnet activation**. The
+funded-admission gate is epoch 2884, Monday 2026-09-14 at 22:35:19 UTC
+(19:35:19 America/Sao_Paulo), co-activated with the other ADR-041 lifecycle
+gates. Complete fleet qualification is required before the boundary. Merging
+or building this source does not open deposits on a running node; check its
+`getvalidatoradmission` response and submit only after `active` is true.
 
 The legacy `Deposit` (0x02) and `Delegate` (0x04) create bonds without consuming
 UTXOs. Their gate remains closed. New registration uses **0x0B**, a fresh wire
@@ -157,6 +159,11 @@ Each signing invocation uses the existing sealed-keystore passphrase sourcing;
 there is no passphrase argument. Inspect all inputs, the network domain,
 validator hash, withdrawal script, commission and fee budget on each signing
 machine. Rebuilding any intent field invalidates both signatures.
+`inspect` authenticates every signature already present before reporting the
+artifact. It uses the format's suite-enveloped key as trusted metadata, checks
+enveloped and legacy raw signatures explicitly, then retains generic detection
+only as a compatibility fallback. Inspection compatibility does not relax the
+consensus requirement below that completed deposits carry suite envelopes.
 
 ## Wire and hash contract
 
@@ -194,7 +201,8 @@ Historical roots and pre-activation validity remain unchanged.
 The admission flag day also refuses unauthenticated legacy `Exit` messages
 for every validator. Authenticated exits, backed withdrawals, slashing evidence
 submission and automatic RANDAO recommit are implemented under ADR-041, but
-all five activation epochs remain unarmed. Mempool admission validates funded
+all five gates are scheduled together at epoch 2884 on 2026-09-14 in this
+release candidate. Deployment readiness remains a prerequisite. Mempool admission validates funded
 state before eviction or relay and revalidates lifecycle messages on head changes.
 Implementation does not establish mainnet release readiness. Follow the
 [release checklist](../VALIDATOR-OPENING.md), including process-level network

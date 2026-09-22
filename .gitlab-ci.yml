@@ -14,6 +14,7 @@
 stages:
   - check
   - test
+  - package
   - nix
 
 variables:
@@ -27,7 +28,8 @@ default:
   tags:
     - bloch-linux-aarch64
   before_script:
-    - export PATH="$HOME/.cargo/bin:$PATH"
+    - unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTFLAGS CARGO_BUILD_RUSTC CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
+    - export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
     - rustc --version && cargo --version
     - clang --version | head -1 || true
     - cmake --version | head -1 || true
@@ -81,7 +83,7 @@ clippy-hardened:
   stage: check
   script:
     - bash scripts/hardened-clippy.selftest.sh
-    - rustup component add clippy || true
+    - python3 -I scripts/hardened-clippy-score.test.py
     - bash scripts/hardened-clippy.sh
 
 # Consensus invariants, called out from the workspace run for visibility.
@@ -100,7 +102,7 @@ consensus-tests:
     # independence of GhostDAG colouring, and V2 emission monotonicity + value
     # conservation. Retained because Genesis-4's opening ledger is the output
     # of these rules.
-    - cargo test -p bloch ghostdag_proptest
+    - cargo test --manifest-path legacy/genesis3-node/Cargo.toml -p bloch ghostdag_proptest
     - cargo test -p bloch-crypto --lib tokenomics
 
 # Miri — UB / provenance / uninit-read check on the pure-Rust consensus + emission
@@ -246,21 +248,15 @@ doc-sweep:
     - python3 tools/doc-sweep/check_stale.py --ci
   allow_failure: false
 
-# Deploy-image pin guard (finding MED-7, Round 1). Every Dockerfile in this
-# repo pins its base images by digest ("Update the digest deliberately, never
-# float the tag" — Dockerfile:27); the deploy/ Akash SDLs and docker-compose
-# files that pull the BUILT node/pool image do not: `bloch:latest`,
-# `docker.io/blochv/bloch:0.1`, and similar bare, mutable tags. This job wires
-# the check in; it does not itself pin anything, and pinning deploy/ YAML is
-# NOT this workstream's ownership (CI/supply-chain) — it belongs to whoever
-# owns the deployment/ops configs. See scripts/check-deploy-image-pins.py's
-# own docstring for that boundary stated the same way.
+# Deploy-image pin guard (finding MED-7, Round 1). Explicit deploy image
+# scalars require a SHA-256 digest, the non-pullable template sentinel, or the
+# single reviewed same-service local-build/never-pull shape. YAML inheritance
+# is refused rather than partially interpreted. The selftest mutates every
+# accepted boundary; the current deploy tree passes. Registry signatures and
+# generated deployment output remain separate release checks.
 #
-# STAGE: `nix` (terminal), same reasoning as doc-sweep and repro-inputs-guard
-# just above (finding N-2) — this job is RED ON THIS REVISION (12 unpinned
-# images across deploy/) and a currently-red, non-`allow_failure` job in
-# `check` or `test` would block every job behind it. Pure Python 3, no
-# toolchain, no build, no Nix.
+# STAGE: `nix` (terminal), matching the other pure structural guards. Pure
+# Python 3; no toolchain, build or Nix evaluation is needed.
 # Local run: python3 scripts/check-deploy-image-pins.py
 deploy-image-pins:
   stage: nix
@@ -316,8 +312,10 @@ iso-hardening-guard:
   stage: check
   before_script: []
   script:
-    - python3 scripts/check-iso-hardening.selftest.py
-    - python3 scripts/check-iso-hardening.py
+    - python3 -I scripts/check-iso-hardening.selftest.py
+    - python3 -I scripts/check-iso-hardening.py
+    - python3 -I scripts/check-attested-ssh.selftest.py
+    - python3 -I scripts/check-attested-ssh.py
   allow_failure: false
 
 # Scanner-posture guard (finding I-H4, 2026-09-04). BLOCKING.
@@ -340,10 +338,10 @@ iso-hardening-guard:
 # (cargo-geiger) is NOT flagged. Pure Python 3, no toolchain, no build.
 scanners-blocking-guard:
   stage: check
-  before_script: []
   script:
-    - python3 scripts/check-scanners-blocking.selftest.py
-    - python3 scripts/check-scanners-blocking.py
+    - python3 -I scripts/ci-install-scanner.test.py
+    - python3 -I scripts/check-scanners-blocking.selftest.py
+    - python3 -I scripts/check-scanners-blocking.py
   allow_failure: false
 
 # tests-blocking guard — the regression test for finding TEST1-ci-runs-tests.
@@ -355,8 +353,16 @@ tests-blocking-guard:
   stage: check
   before_script: []
   script:
-    - python3 scripts/check-tests-blocking.selftest.py
-    - python3 scripts/check-tests-blocking.py
+    - python3 -I scripts/check-tests-blocking.selftest.py
+    - python3 -I scripts/check-tests-blocking.py
+    - python3 -I scripts/pinned-rust-toolchain.test.py
+    - python3 -I scripts/devnet-particao-report.test.py
+    - python3 -I scripts/rehearse-validator-activation.test.py
+    - python3 -I scripts/check-attested-ssh.selftest.py
+    - python3 -I scripts/check-attested-ssh.py
+    - python3 -I scripts/check-iso-hardening.selftest.py
+    - python3 -I scripts/check-iso-hardening.py
+  timeout: 10m
   allow_failure: false
 
 # Falcon constant-time guard (PoS finding F1, BLOCH-FALCON-ONLINE-SIGNING.md
@@ -382,9 +388,10 @@ falcon-clean-guard:
 # proves, on every pipeline: (1) the root Cargo.lock — the ONE lockfile cargo
 # reads for the PoS crates, which are members of the root virtual workspace —
 # resolves with --locked, does not drift across the build, and has no dead
-# per-member lockfile shadowing it; (2) two clean builds of bloch-pos at
-# the same commit are bit-identical (same-path determinism — the path-scoped
-# caveat and the canonical /build rule are deploy/RELEASE-INTEGRITY.md §3);
+# per-member lockfile shadowing it; (2) two clean builds of bloch-pos at the
+# same commit and source path, using independent fresh target dirs, are
+# bit-identical (the source-path caveat and canonical /build rule are in
+# deploy/RELEASE-INTEGRITY.md §3);
 # (3) `bloch-pos --version` reports the exact commit being built, so a fleet
 # binary can always be traced to source. Runbook + measured baseline:
 # deploy/RELEASE-INTEGRITY.md. ~1 min: the PoS workspace is small by design.
@@ -399,8 +406,32 @@ pos-release-integrity:
   stage: check
   script:
     - python3 scripts/pos-release-integrity.selftest.py
+    - bash -n scripts/build-pos-release-container.sh scripts/compare-pos-release-builds.sh scripts/compare-pos-release-builds.selftest.sh
+    - bash scripts/compare-pos-release-builds.selftest.sh
     - rustup toolchain install "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/bloch-pos-node/rust-toolchain.toml)" --profile minimal || true
     - bash scripts/pos-release-integrity.sh
+  allow_failure: false
+
+# Retain the exact Genesis-4 binary judged by a repository-owned pipeline.
+# This closes the source-side half of INF-01: a commit now produces a named
+# binary, checksum and machine-readable build identity instead of relying on an
+# off-repository build script. It deliberately remains an UNSIGNED CANDIDATE.
+# Signing, publication, canonical-container cross-builder equality and fleet
+# rollout are separate release-owner gates in deploy/RELEASE-INTEGRITY.md.
+pos-release-candidate:
+  stage: package
+  script:
+    - bash scripts/package-pos-release-candidate.sh "$CI_PROJECT_DIR/dist/pos-release-candidate"
+    - test "$(awk -F= '$1 == "source_commit" { print $2 }' dist/pos-release-candidate/BUILD-INFO)" = "$CI_COMMIT_SHA"
+    - test "$(awk -F= '$1 == "artifact_kind" { print $2 }' dist/pos-release-candidate/BUILD-INFO)" = "unsigned-release-candidate"
+  artifacts:
+    name: "bloch-pos-${CI_COMMIT_SHA}"
+    expire_in: 14 days
+    when: on_success
+    paths:
+      - dist/pos-release-candidate/bloch-pos
+      - dist/pos-release-candidate/SHA256SUMS
+      - dist/pos-release-candidate/BUILD-INFO
   allow_failure: false
 
 # Rollback-package integrity (audit I-H3) — the signing half of G8 §5.
@@ -413,15 +444,17 @@ pos-release-integrity:
 # end-to-end with a disposable keypair and replays the tampering cases —
 # including the one the old design could not catch: swap the binary, recompute
 # SHA256SUMS, leave the signature alone. It touches no box, no service and no
-# release key (install.sh is only ever invoked with --verify-only).
+# release key. The authentication selftest invokes install.sh only with
+# --verify-only; the argv companion uses harmless command/filesystem shims to
+# prove an inactive service is refused before staging or restart.
 # Fails closed: without minisign the selftest cannot prove the property, so it
 # fails rather than skipping.
 rollback-package-integrity:
   stage: check
-  before_script: []
   script:
-    - command -v minisign >/dev/null || sudo apt-get install -y minisign || true
+    - command -v minisign >/dev/null || { echo "minisign must be provisioned on the runner" >&2; exit 1; }
     - bash deploy/rollback/make-rollback-package.selftest.sh
+    - bash deploy/rollback/make-rollback-package.argv.selftest.sh
   allow_failure: false
 
 # Supply-chain — RUSTSEC advisories, permissive-license + no-git-dep policy.
@@ -508,14 +541,13 @@ cargo-audit:
 # Local run: osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock
 osv-scanner:
   stage: check
-  before_script: []
   script:
-    - export PATH="$HOME/.local/bin:$PATH"
-    - bash scripts/ci-install-scanner.sh osv-scanner
+    - CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh osv-scanner
     # Every workspace lockfile (finding SC2-sharks-shamir), mirroring
     # scripts/audit-all-lockfiles.sh — a root-only scan misses the
     # standalone workspaces' pins.
-    - osv-scanner --config=osv-scanner.toml
+    - >-
+        "$HOME/.local/bin/osv-scanner" --config=osv-scanner.toml
         --lockfile=Cargo.lock
         --lockfile=pool/Cargo.lock
         --lockfile=pool-proxy/Cargo.lock
@@ -523,12 +555,14 @@ osv-scanner:
         --lockfile=euvm-tooling/Cargo.lock
         --lockfile=crates/coherence-prover/script/Cargo.lock
         --lockfile=crates/coherence-prover/service/Cargo.lock
+        --lockfile=crates/coherence-prover/program/Cargo.lock
         --lockfile=fuzz/Cargo.lock
         --lockfile=spikes/prover-cost/Cargo.lock
         --lockfile=spikes/prover-cost/rv32/Cargo.lock
         --lockfile=spikes/prover-cost/rv32f/Cargo.lock
         --lockfile=spikes/prover-cost/rv32h/Cargo.lock
         --lockfile=spikes/prover-cost/rv32k/Cargo.lock
+        --lockfile=tools/bloch-devkit/templates/svm/Cargo.lock
   allow_failure: false
 
 # cargo-geiger — quantifies `unsafe` across the dependency tree (own code +
@@ -605,21 +639,25 @@ fuzz-smoke:
 # scripts/ci-install-scanner.sh installs a PINNED gitleaks and fails if it
 # cannot.
 #
-# Scope, stated rather than implied: `--no-git` scans the WORKING TREE, so the
-# gate is on what a merge would introduce. Measured 2026-09-04 the tree is clean
-# under .gitleaks.toml (nine findings triaged there as doc/type-alias/public-key
-# shapes, each exempted by line pattern, not by muting the file). A full-history
-# scan reports 55 findings across 2,216 commits — history is immutable, so a
-# blocking job over it could never go green; that triage is separate work and is
-# written down in .gitleaks.toml instead of being hidden behind allow_failure.
-# Local run: gitleaks detect --no-git --source . --config .gitleaks.toml --redact
+# Tree and reachable-history scans are separate blocking jobs. Their reviewed
+# redacted baselines name exact benign findings, not whole files or rules.
+# See docs/audit/internal-remediation-2026-09-17/HISTORY-SCAN.md.
 secret-scan:
   stage: check
-  before_script: []
   script:
-    - export PATH="$HOME/.local/bin:$PATH"
-    - bash scripts/ci-install-scanner.sh gitleaks
-    - gitleaks detect --no-git --source . --config .gitleaks.toml --no-banner --redact
+    - CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
+    - bash scripts/scan-secrets.sh tree
+  allow_failure: false
+
+secret-history-scan:
+  stage: check
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
+    - bash scripts/scan-secrets.sh history
+    - python3 -I scripts/scan-secrets.test.py
+  timeout: 15m
   allow_failure: false
 
 # Build + full test suite (the gate).
@@ -648,11 +686,19 @@ secret-scan:
 build-and-test:
   stage: test
   script:
-    - cargo build --workspace --all-targets
+    - bash deploy/bootnodes/verify-bootnodes.selftest.sh
+    - python3 -I scripts/check-live-node-retired-isolation.py --selftest
+    - python3 -I scripts/check-live-node-retired-isolation.py
+    - python3 -I scripts/pinned-rust-toolchain.py
+    - python3 -I scripts/rehearse-validator-admission.py
+    - python3 -I scripts/check-validator-lifecycle-mutations.py
+    - python3 -I scripts/rehearse-validator-activation.py --output "$CI_PROJECT_DIR/.ci-validator-activation"
+    - python3 -I scripts/rehearse-validator-joining-network.py --output "$CI_PROJECT_DIR/.ci-validator-joining-network"
+    - cargo build --locked --workspace --all-targets
     - cargo test --locked -p bloch-pos-committee -p bloch-pos-node -p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault -p pqcrypto-internals -p genesis4-ceremony
-  # Memory-hard (Argon2) wallet tests + a testnet Module-SIS mining test;
-  # measured 2026-09-05: ~51 min of test wall time alone in a debug build
-  # (two ~23 min suites), before compile. 60m gated by luck.
+  # Memory-hard wallet tests and long consensus reveal-chain tests still need
+  # CI headroom. The former ~19-minute debug SIS suite is now ~2 minutes via
+  # the root package profile (LD-03); keep 120m for the full eight-crate job.
   timeout: 120m
 
 # workspace-tests — the FULL suite: everything build-and-test gates (now
@@ -677,9 +723,9 @@ lean-build:
     # `-p bloch` is required now that the repo root is a virtual manifest:
     # there is no root package for a bare `--lib` to resolve to. The package
     # is the same one, at legacy/genesis3-node/.
-    - cargo build -p bloch --no-default-features --lib
-    - "! cargo tree -p bloch --no-default-features -e no-dev -i rocksdb >/dev/null 2>&1 && echo 'ok: no rocksdb in lean graph'"
-    - "! cargo tree -p bloch --no-default-features -e no-dev -i libp2p  >/dev/null 2>&1 && echo 'ok: no libp2p in lean graph'"
+    - cargo build --manifest-path legacy/genesis3-node/Cargo.toml -p bloch --no-default-features --lib
+    - "! cargo tree --manifest-path legacy/genesis3-node/Cargo.toml -p bloch --no-default-features -e no-dev -i rocksdb >/dev/null 2>&1 && echo 'ok: no rocksdb in lean graph'"
+    - "! cargo tree --manifest-path legacy/genesis3-node/Cargo.toml -p bloch --no-default-features -e no-dev -i libp2p  >/dev/null 2>&1 && echo 'ok: no libp2p in lean graph'"
   allow_failure: true   # informational until verified on the new Linux runner
 
 # Postern Wallet core (separate build root) — golden byte-compat + UniFFI wrapper.
@@ -809,3 +855,12 @@ repro:
 # rather than a gap. Deleting an inert placeholder is not lowering coverage;
 # re-add it, properly wired (no `when: never`), the day the `mainnet` feature
 # and its guard test actually land.
+
+# Both CI providers must gate the native Ustav boundary and kernel tests.
+ustav-native:
+  stage: test
+  timeout: 45m
+  script:
+    - python3 scripts/check-ustav-pq-boundary.py cargo +"$(python3 scripts/pinned-rust-toolchain.py)"
+    - python3 scripts/check-pq-shield-claims.py
+    - cargo +"$(python3 scripts/pinned-rust-toolchain.py)" test --locked -p bloch-euvm -p bloch-ustav

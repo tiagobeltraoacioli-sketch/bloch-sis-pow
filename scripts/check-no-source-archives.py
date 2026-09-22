@@ -65,6 +65,8 @@ requires a rationale for an ignored advisory.
 Pure Python 3. No toolchain, no build, no network.
 """
 
+from __future__ import annotations
+
 import os
 import subprocess
 import sys
@@ -138,7 +140,7 @@ def members(path: str) -> tuple[list[str] | None, str | None]:
 
     # Single-file compression carries exactly one member and its name is the
     # path with the compression suffix removed. `carryover.tsv.gz` is the
-    # Genesis-1 carryover UTXO set (452,726 rows of real data) and must stay;
+    # Genesis-3 terminal carryover UTXO set (452,726 rows) and must stay;
     # `transition.rs.gz` would be the hazard this guard exists for. Judging by
     # the inner name separates them without an allowlist entry for either.
     for ext in SOLO_COMPRESSED_EXTS:

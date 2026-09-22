@@ -1,0 +1,31 @@
+Validation wave 19 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Implementation: 28e2da9
+
+PASS
+
+cargo test --locked -p bloch-pos-committee
+  Library: 433 passed, 4 ignored.
+  Integration suites: 185 passed, 2 ignored.
+  Doc tests: 2 passed.
+  Aggregate: 620 passed, 0 failed, 6 ignored.
+
+cargo test --locked -p bloch-pos-committee delegate_wire_eligibility_cannot_choose_committed_state
+  1 passed; false remains syntactically decodable, is rejected atomically by
+  transition validation, and true is re-derived into committed state.
+
+python3 scripts/check-comment-constants.py
+  430 files; 565 resolvable constants; 46 claims; 0 contradictions.
+
+bash scripts/ci-banned-words.sh
+  Passed.
+
+git diff --check
+  Passed before the implementation commit and before this evidence checkpoint.
+
+LIMIT
+
+No wire encoding, activation schedule or fleet binary changed. The legacy
+bonding gate remains inert. Workspace-wide rustfmt remains the inherited
+baseline described by prior waves; this wave did not perform a broad formatting
+rewrite.

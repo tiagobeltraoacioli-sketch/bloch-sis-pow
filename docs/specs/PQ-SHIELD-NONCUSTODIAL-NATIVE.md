@@ -1,9 +1,10 @@
 # PQ-Shield — a non-custodial, native, opt-in post-quantum *defensive vault* for coins that have no PQ signature scheme
 
-> **STATUS: DESIGN ONLY. Unaudited. Not built, not wired, not booted.**
-> No code in this repo implements this yet. This document specifies a design and,
-> more importantly, states precisely what it **cannot** do. Read §0 and §9 before
-> anything else. Designed ≠ built ≠ booted.
+> **STATUS: EXPERIMENTAL PRIMITIVES. Unaudited, not wired, not booted.**
+> The repository implements Bitcoin scripts, unsigned transaction builders,
+> off-chain anchor signing/verification and candidate guard programs. It does
+> not post or order anchors on Bloch consensus, enforce a Bitcoin covenant, or
+> constitute a deployed product. Read §0 and §9 before anything else.
 
 > **Honest-disclosure discipline** (house style, cf. `COHERENCE-v0.2.md §4`,
 > `BLOCH-SIS-ATTESTATION.md §0/§5`): we make *integrity/defense* claims, not
@@ -36,8 +37,8 @@ natively, on the coin as it exists today, is a **defensive vault** that:
 
 1. **protects the spend/reveal window** — the only moment a not-yet-spent coin's
    key is exposed on-chain — with a mandatory delay, and
-2. gives the owner a **PQ-authorized recovery / clawback path** that is
-   publicly auditable and provably tied to the owner's post-quantum key.
+2. binds the setup preimage to PQ secret material and lets the owner distribute
+   a separately PQ-signed recovery policy for off-chain verification.
 
 Everything below is framed around **that achievable goal and only that goal.**
 
@@ -95,7 +96,7 @@ moves it" during the window is a defender *hold*, not yet a win.
 
 ---
 
-## 2. The Bitcoin construction — commit-delay-reveal vault + PQ-gated clawback
+## 2. The Bitcoin construction — commit-delay-reveal + hashlocked recovery
 
 **Opcode budget: existing Bitcoin only. No soft fork.** We use exactly:
 `OP_CHECKSIG`/`OP_CHECKSIGVERIFY` (BIP-340/341/342 for Taproot, else ECDSA),
@@ -126,14 +127,13 @@ Two design tensions, both disclosed:
    to address X" is a **covenant**. Bitcoin has **no covenant opcode** in
    consensus today (`OP_CTV`/BIP-119, `OP_VAULT`/BIP-345 are **proposals**, i.e.
    soft forks we cannot ship unilaterally — same category as BIP-360). **Without
-   a covenant, the commit-delay-reveal structure below is enforced by
-   *pre-signed transactions + secure deletion of the trigger key*, NOT by
-   consensus.** This is the Revault-style vault pattern. Its guarantee is
-   **operational** (the owner must actually delete/withhold the bypass key),
-   **not** a consensus guarantee. We state this plainly because it is the single
-   most important caveat in the construction. A covenant soft fork (or moving to
-   Bloch's eUTXO, which *does* have covenant-grade validators) removes this
-   caveat; on stock Bitcoin it stands.
+   a covenant, a separate-deposit construction can only approximate the shape
+   with a pre-signed transaction and deletion of an independently generated
+   deposit key; this is NOT enforced by consensus.** Historical `VaultParams`
+   reuses its retained hot key for the deposit and branch A, so it cannot perform
+   that deletion ceremony. Opt-in `SeparatedDepositV1` separates the public
+   roles but cannot prove independent generation or deletion. A covenant soft
+   fork is the real native fix.
 
 ### 2.1 The three outputs
 
@@ -146,8 +146,8 @@ Two design tensions, both disclosed:
    │     OP_SHA256 <H(r)> OP_EQUALVERIFY         │   ← hash-gate binds the spend to the
    │     <hot_pubkey> OP_CHECKSIG                │     PQ-derived preimage r (see §2.3)
    └───────────────────────────────────────────┘
-                     │  spent ONLY by the pre-signed UNVAULT tx U
-                     │  (trigger key deleted ⇒ U is the sole spend — see §2.0(2))
+                     │  intended spend: pre-signed UNVAULT tx U
+                     │  (sole-spend needs a separate key actually deleted; §2.0(2))
                      ▼
    ┌───────────────────────────────────────────┐
    │ T = TRIGGER / unvault output               │   ← broadcasting U == "unvault trigger";
@@ -164,14 +164,14 @@ Two design tensions, both disclosed:
         │ branch A after Δ                │ branch B any time during Δ
         ▼                                 ▼
    final destination                 FRESH COLD address / new vault
-   (hot-key signed)                  (recovery-key signed, PQ-authorized)
+   (hot-key signed)                  (recovery-key signed, PQ-seeded hashlock)
 ```
 
 - **Normal ("unvault") path = commit-delay-reveal.** To spend normally the owner
   **broadcasts U** (the commit/trigger — this is the only moment a pubkey is
   revealed), then **waits the CSV delay Δ** on branch A before the funds can
   reach their destination. Δ is the defensive window.
-- **Clawback path = immediate + PQ-gated.** Branch B has **no** CSV delay, so
+- **Recovery path = immediate + hashlocked.** Branch B has **no** CSV delay, so
   during Δ *only the party who can satisfy branch B can move the coin
   immediately.* Branch B requires revealing the preimage `r` **and** a signature
   under `recovery_pubkey`.
@@ -192,7 +192,9 @@ attacker address) is CSV-locked for Δ for **everyone**, attacker included. Bran
 B (immediate) is the owner's edge — it is gated by `recovery_sk`, which the
 attacker cannot forge from anything revealed. So **if the owner is watching, they
 claw back within Δ and win the coin outright.** The attacker only wins if the
-owner fails to claw back within Δ (offline, or out-fee'd — see next).
+owner fails to claw back within Δ (offline, or out-fee'd — see next). After U
+reveals `r`, Bitcoin authorizes this path with the recovery signature, not a PQ
+signature.
 
 **What Δ does NOT buy (the honest teeth of it):**
 
@@ -204,16 +206,17 @@ owner fails to claw back within Δ (offline, or out-fee'd — see next).
   race is again "who lands a branch-B spend first, with higher fee." This is the
   **same fee-bumping / preimage-stealing race as Lightning/atomic-swaps** and we
   do not pretend to have solved it. Mitigation is *operational*: the owner's
-  watchtower pre-signs the branch-B clawback and stands ready to RBF it above the
-  attacker. Δ only has to be long enough for the watchtower to land one
-  fee-competitive transaction.
+  owner pre-signs a ladder of branch-B replacements at setup and the watchtower
+  can broadcast one of those fixed alternatives. The RBF bit alone does not let
+  a keyless watchtower create a higher-fee replacement. Δ only has to be long
+  enough for one pre-authorized, fee-competitive transaction to land.
 - **Choosing Δ is a UX tax.** Δ blocks of delay on *every* normal withdrawal.
   Δ = 144 (~1 day) is a defensible default for a cold vault; Δ = 6 (~1h) is
   barely a window; Δ = 1008 (~1 week) is strong but painful. There is **no free
   lunch**: the security of the window scales with how long you are willing to
   wait to spend your own money, and with your watchtower's uptime.
 
-### 2.3 Binding the preimage to the PQ key (how Bitcoin checks a hash while Bloch checks PQ)
+### 2.3 Binding the preimage to the PQ key and recording an off-chain commitment
 
 Bitcoin can only check `SHA256(r) == H(r)`. It **cannot** verify an ML-DSA/Falcon
 signature. So the "PQ authorization" of a clawback is achieved by a **split
@@ -224,34 +227,29 @@ enforcement** that the two chains jointly pin:
   Its commitment `H(r) = SHA256(r)` goes into branch B (and the deposit
   hash-gate). *Ability to reveal `r` ⇒ possession of `pq_sk` at setup time.* That
   is the concrete "preimage bound to the PQ key."
-- **Anchor.** At vault creation the owner signs (ML-DSA-65 ‖ Falcon-1024, via
-  `bloch_crypto::crypto::sign`) a record on Bloch binding
+- **Anchor commitment.** At vault creation the owner can sign (ML-DSA-65 ‖
+  Falcon-1024, via `bloch_crypto::crypto::sign`) a record binding
   `{btc_vault_address, H(r), pq_recovery_pubkey, designated_safe_destination, policy}`
-  (§3). This is the **publicly auditable proof** that the PQ-key holder set up
-  this recovery and *pre-designated where a clawback may send*.
-- **Division of labour (say it plainly):** **Bitcoin enforces the hash + timelock
-  half; Bloch enforces the PQ half; the shared value `H(r)` and the shared
-  `designated_safe_destination` are the hinge.** Revealing `r` on Bitcoin is
-  *not*, by itself, a proof-to-Bitcoin of PQ authorization — Bitcoin never sees a
-  PQ sig. The PQ authorization is what the **Bloch anchor** attests and what a
-  compliant watchtower/relayer enforces (it will co-sign / fee-bump a clawback
-  **only** to the anchored `designated_safe_destination`). A dishonest holder of
-  `r` could send branch B anywhere; the guarantee is that *the legitimate,
-  anchored recovery flow is PQ-authorized and auditable*, not that Bitcoin
-  refuses other destinations (it cannot — no covenant, §2.0(2)).
+  (§3). Current code can serialize, sign and verify this commitment off chain;
+  it does not post or order it on Bloch.
+- **Division of labour (say it plainly):** Bitcoin enforces the hash, timelock
+  and classical signatures. A relying party can separately authenticate the PQ
+  commitment and apply its destination policy. Revealing `r` on Bitcoin is not
+  proof of current PQ-key possession, and neither Bitcoin nor current Bloch
+  consensus enforces `designated_safe_destination` for this construction.
 
 ---
 
-## 3. Bloch as the PQ registry/anchor (the part Bitcoin structurally cannot do)
+## 3. Proposed Bloch PQ registry/anchor integration
 
-Bloch is PQ-native (its eUTXO validators verify ML-DSA‖Falcon via
-`Op::VerifySig`, see `crates/bloch-euvm`). We use it as the **PQ enforcement and
-audit plane** the coin itself lacks.
+The repository contains PQ verifier and guard-program primitives, plus the
+anchor codec. It does not contain a consensus-wired datum publication, ordering,
+rotation or revocation flow. This section specifies that future integration.
 
 ### 3.1 Record format — the `PqShieldAnchor` datum
 
-A Bloch eUTXO whose datum carries the commitment, guarded so that **only the
-owner's PQ key can create/rotate/revoke it.** Reusing the existing
+A proposed Bloch eUTXO datum carrying the commitment, guarded so that **only the
+owner's PQ key can create/rotate/revoke it.** It would reuse the existing
 `bloch-euvm` machinery in `crates/bloch-euvm/src/modules.rs`:
 
 ```
@@ -305,12 +303,13 @@ sign. `crates/bloch-btc-wallet/src/lib.rs::hybrid_wbtc_validator` emits the same
    (ML-DSA-65‖Falcon-1024), and a `bloch_address`. No new key ceremony.
 2. **Derive the recovery secret** `r = HKDF(pq_sk, "pq-shield/v1" ‖ vault_id)`;
    compute `H(r)`.
-3. **Construct the vault + pre-sign** — build V (deposit, P2WSH), the pre-signed
-   **U** (unvault → T), and, ideally, a pre-signed branch-B clawback tx to
-   `designated_safe_dest`. **Securely delete the trigger bypass key** so U is the
-   only spend of V (§2.0(2)).
-4. **Anchor on Bloch** — sign and post the `PqShieldAnchor` (§3). *This must
-   happen before/at deposit; the anchor is the recovery authority.*
+3. **Construct + pre-sign** — for the opt-in separate-deposit form, build V, U
+   and a ladder of branch-B recovery transactions, then delete the independently
+   generated deposit key. The legacy shared-hot-key form cannot provide this
+   property (§2.0(2)).
+4. **Authenticate the anchor commitment off chain** — sign and distribute the
+   `PqShieldAnchor` (§3). Posting/ordering it on Bloch is future integration,
+   not functionality supplied by these crates.
 5. **Deposit BTC** to V. Funds now sit hidden at rest.
 6. **Later — normal spend:** broadcast U (commit), wait Δ, then branch A to the
    destination. **Or — under attack:** the owner/watchtower detects an
@@ -323,16 +322,18 @@ A watchtower (the user's own daemon, or a service they hire) watches the chain
 for **any** spend of V / appearance of T. Its **only** powers are:
 
 - **alert** the owner, and
-- **broadcast / RBF the *pre-authorized* branch-B clawback** — which can send
+- **broadcast one of the *pre-authorized* branch-B replacements** — which can send
   **only** to `designated_safe_dest` (that address is baked into the pre-signed
   clawback tx and the anchor).
 
-It **never** holds `hot_sk`, never holds `pq_sk`, and **cannot** move funds
-anywhere except the owner's own pre-committed cold address. So a malicious or
-compromised watchtower can *grief* (trigger a clawback the owner didn't want,
-sending funds to the owner's *own* cold address — annoying, not theft) but
-**cannot steal.** That is the non-custodial guarantee. Multiple independent
-watchtowers can run in parallel for liveness.
+Under this narrow model it receives only a finite set of pre-signed replacement
+transactions: it never holds `hot_sk`, `recovery_sk`, `pq_sk`, or a signing
+oracle. Those transactions cannot be redirected away from the owner's
+pre-committed cold address. A malicious or compromised watchtower can *grief*
+(broadcast a recovery the owner did not want), but the supplied transactions do
+not let it steal. Giving a service `recovery_sk` or an equivalent signing oracle
+would make it custodial and theft-capable. Multiple independent broadcasters can
+run in parallel for liveness.
 
 ### 4.2 Key loss & backup
 
@@ -419,8 +420,9 @@ solution — funds guarded by an actual PQ signature, no window, no watchtower.
 migrate into it and retire the vault.
 
 ### 8.2 vs. this vault (honest positioning)
-Our vault = **defense-in-depth for the transition era**: at-rest hiding (P2WSH)
-+ a mandatory delay on the exposure window + a PQ-authorized, audited clawback.
+Our construction = **defense-in-depth for the transition era**: at-rest hiding
+(P2WSH) + a mandatory delay on the exposure window + hashlocked classical
+recovery with a separately signed, off-chain PQ policy.
 It reduces the attack surface to "CRQC that also wins a fee race within Δ against
 a watching owner." It does not eliminate it.
 
@@ -446,12 +448,11 @@ and adds no custodian.** The two are complementary, not substitutes.
    fee race within Δ, **or** simply strikes while the owner is **not watching**,
    **still steals the coin.** We reduce the odds; we do not zero them.
 2. **The covenant caveat is real and structural.** On stock Bitcoin the
-   commit-delay-reveal shape is enforced by **pre-signed txs + secure deletion of
-   the bypass key**, not by consensus (§2.0(2)). If the owner fails to delete
-   that key (or their signing device retains it), the vault can be bypassed —
-   including by a CRQC that derives it. This is an *operational* trust
-   assumption. A covenant soft fork or moving to Bloch's eUTXO removes it;
-   nothing we can ship unilaterally does.
+   commit-delay-reveal shape is never enforced by Bitcoin consensus (§2.0(2)).
+   The legacy construction retains a direct hot-key bypass. The separate-key
+   form relies on correct pre-signing and actual deletion of an independently
+   generated deposit key, which this repository cannot verify. A covenant soft
+   fork is the native fix; nothing we can ship unilaterally supplies one.
 3. **Taproot is not quantum-safe at rest** (§0.1). If you instantiate the vault
    as Taproot, you get **spend-window protection only**; the deposit output key
    is CRQC-spendable at rest. Use **P2WSH** if you want at-rest hiding. The

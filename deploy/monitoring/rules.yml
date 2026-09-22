@@ -2,10 +2,8 @@
 #
 # Alerting rules for a Bloch validator/archival node. Metric names below are
 # read from crates/bloch-pos-node/src/metrics.rs as shipped (verify against
-# that file if this rule set and the binary ever drift). Where an alert needs
-# a metric the node does not export today, it is marked "expected from patch
-# node-b" and left disabled (or best-effort approximated) rather than
-# silently referencing a series that will never fire.
+# that file if this rule set and the binary ever drift). Validator-only
+# alerts require a role="validator" TARGET label, not an external label.
 #
 # SLOTS_PER_EPOCH = 32 (crates/bloch-pos-committee/src/params.rs), block time
 # target 30s (crates/bloch-crypto/src/core/mod.rs; also
@@ -17,12 +15,13 @@ groups:
   - name: bloch-pos-node.rules
     rules:
       # ── Finality stall: finalized_epoch not advancing for > 3 epochs ──
-      # bloch_pos_last_finality_advance_unix is stamped at boot to boot time
-      # and updated whenever finalized_epoch advances (metrics.rs doc
-      # comment). time() - that gauge is therefore exactly "seconds since
-      # finality last moved," with no rate()/increase() needed.
+      # The finality clock starts after replay/WS checks and is zero before
+      # the live loop. Gate that sentinel out: startup has its own heartbeat
+      # alert and must not look like an eternal finality stall.
       - alert: BlochFinalityStalled
-        expr: (time() - bloch_pos_last_finality_advance_unix) > (3 * 32 * 30)
+        expr: >
+          (bloch_pos_last_finality_advance_unix > 0)
+          and (time() - bloch_pos_last_finality_advance_unix > (3 * 32 * 30))
         for: 5m
         labels:
           severity: critical
@@ -35,48 +34,33 @@ groups:
             fleet-wide stall and a local one look identical from here alone.
 
       # ── Finality rewinds refused > 0 ──
-      # NOT YET EXPORTED. Round-3 audit M-1: the engine's downward finality
-      # ratchet counts `finality_rewinds_refused` internally
-      # (engine.rs:2958) but metrics.rs does not export it. This is exactly
-      # the counter that would reveal a silent, permanent, self-inflicted
-      # partition (M-1's failure mode) — until it exists, this alert cannot
-      # fire and that gap is itself a finding, not a config oversight.
-      # Metric name expected from patch node-b: bloch_pos_finality_rewinds_refused_total
       - alert: BlochFinalityRewindRefused
         expr: increase(bloch_pos_finality_rewinds_refused_total[10m]) > 0
         for: 0m
         labels:
           severity: critical
-          status: "DISABLED — metric does not exist yet (expected from patch node-b)"
         annotations:
           summary: "A finality rewind was refused on {{ $labels.host_id }} (M-1)"
           description: >
             The engine's downward finality ratchet refused a rewind — per
             Round-3 audit M-1, this can mean the node has deleted blocks from
             its own canonical branch and will refuse them again on re-sync, a
-            silent permanent partition. THIS RULE IS INERT until
-            bloch_pos_finality_rewinds_refused_total is exported; do not
-            assume coverage here without confirming the metric exists on the
-            running binary.
+            possible persistent partition. Compare finalized roots with an
+            independent node before taking recovery action.
 
       # ── Equivocations observed > 0 ──
-      # NOT YET EXPORTED. Round-3 audit NEW-1: no counter exists for
-      # attestation equivocations observed (whether accepted, held, or
-      # rejected). Metric name expected from patch node-b:
-      # bloch_pos_equivocations_observed_total
       - alert: BlochEquivocationObserved
         expr: increase(bloch_pos_equivocations_observed_total[10m]) > 0
         for: 0m
         labels:
           severity: critical
-          status: "DISABLED — metric does not exist yet (expected from patch node-b)"
         annotations:
           summary: "An equivocation was observed on {{ $labels.host_id }}"
           description: >
             A validator produced two conflicting attestations/proposals for
             the same slot — the exact condition slashing exists to punish and
-            the 2026-08-21 double-sign incident produced. THIS RULE IS INERT
-            until bloch_pos_equivocations_observed_total is exported.
+            the 2026-08-21 double-sign incident produced. Investigate the
+            validator identity and preserve the evidence.
 
       # ── Head slot lagging wall slot by > 2 epochs ──
       - alert: BlochHeadLaggingWallClock
@@ -146,25 +130,73 @@ groups:
             cause a validator to miss its slot even while otherwise healthy.
 
       # ── keystore_sealed == 0 ──
-      # NOT YET EXPORTED. No gauge exists today distinguishing a sealed
-      # (BPOSKEY2) from a plaintext (BPOSKEY1) keystore at runtime — the node
-      # already refuses to load plaintext without an explicit opt-in
-      # (keys.rs), but that refusal is a boot-time exit, not an exported
-      # fact an already-running node's metrics can be alerted on. Metric name
-      # expected from patch node-b: bloch_pos_keystore_sealed (1=sealed,
-      # 0=plaintext-opt-in).
       - alert: BlochKeystoreNotSealed
-        expr: bloch_pos_keystore_sealed == 0
+        expr: >
+          (bloch_pos_keystore_sealed{role="validator"} == 0)
+          and on(job, instance) (bloch_pos_heartbeat_unix > 0)
         for: 0m
         labels:
           severity: critical
-          status: "DISABLED — metric does not exist yet (expected from patch node-b)"
         annotations:
           summary: "{{ $labels.host_id }} is running with an unsealed (plaintext) keystore"
           description: >
-            Relevant ahead of the epoch-2700 flag day
-            (deploy/FLAG-DAY-EPOCH-2700.md) — every fleet keystore is
-            plaintext today. THIS RULE IS INERT until
-            bloch_pos_keystore_sealed is exported; until then, confirm
-            sealed status by reading validator.key's magic bytes directly
-            per that runbook.
+            After startup, the node reports an opted-in plaintext validator
+            keystore. The heartbeat gate excludes the initial unset gauge.
+            Arrange explicit sealing using the keystore runbook; do not
+            replace its public identity or restart automatically.
+
+      - alert: BlochMetricsUnavailable
+        expr: up{job="bloch-pos-node"} == 0 or absent(up{job="bloch-pos-node"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node metrics scrape is unavailable"
+          description: "Check the process and configured metrics port. Other alerts cannot observe an unreachable exporter."
+
+      - alert: BlochHeartbeatMissing
+        expr: up{job="bloch-pos-node"} == 1 unless on(job, instance) bloch_pos_heartbeat_unix
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Reachable exporter omits the engine heartbeat"
+          description: "Check the running binary and scrape endpoint; missing series are not a healthy zero."
+
+      - alert: BlochHeartbeatStale
+        expr: >
+          ((bloch_pos_heartbeat_unix > 0) and (time() - bloch_pos_heartbeat_unix > 120))
+          or ((bloch_pos_heartbeat_unix == 0) and (time() - bloch_pos_process_start_unix > 1200))
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Engine heartbeat is stale or startup exceeds 20 minutes"
+          description: "Inspect replay progress, head lag and health status before intervening. Do not restart automatically from this alert."
+
+      - alert: BlochStoreAppendFailure
+        expr: bloch_pos_store_append_failures_total > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node could not persist canonical chain data"
+          description: "Check disk capacity, filesystem errors and process logs. Fatal exit may precede the next scrape, so this counter alert is best-effort. Preserve chain and signing protection files."
+
+      - alert: BlochValidatorInactive
+        expr: (bloch_pos_validator_active{role="validator"} == 0) and (time() - bloch_pos_process_start_unix > 1200)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Expected validator remains inactive after startup grace"
+          description: "The key is not epoch-eligible or startup/doppelganger gates block participation. Check registry and signing logs. This is not a missed-duty count. Archival nodes must use role=archival."
+
+      - alert: BlochRepeatedRestarts
+        expr: changes(bloch_pos_process_start_unix[30m]) >= 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "At least three observed process restarts in 30 minutes"
+          description: "Inspect OOM, disk, checkpoint and startup errors. Restarts entirely between scrapes may be missed."

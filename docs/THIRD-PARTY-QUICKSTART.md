@@ -33,7 +33,7 @@ Genesis-4 started at epoch 0. So:
 | If your node's first sync starts | What it needs |
 |---|---|
 | **before epoch 2016** — i.e. before **2026-09-05 07:07:19 UTC** | the genesis manifest and nothing else. The genesis block is its own trust anchor. |
-| **after** that instant | a **signed checkpoint** (`--ws-checkpoint` + `--ws-signer-set`) |
+| **after** that instant | a **signed checkpoint** (`--ws-checkpoint` + `--ws-signer-set` + independently obtained `--ws-signer-set-sha3`) |
 
 **No signed checkpoint exists today, and — updated 2026-09-06 — the deadline
 above has already passed.** The signing keys have not been generated — the
@@ -683,13 +683,17 @@ happened, a fresh node past the window adds two flags:
 ./bloch-pos run \
   ... \
   --ws-checkpoint  /var/lib/bloch/wscheckpoint-<epoch>.envelope.bin \
-  --ws-signer-set  /var/lib/bloch/signer-set-1.bin
+  --ws-signer-set  /var/lib/bloch/signer-set-1.bin \
+  --ws-signer-set-sha3 <fingerprint-from-an-independent-channel>
 ```
 
 - `--ws-checkpoint` takes the **envelope** (checkpoint + quorum signatures),
   not the bare 154-byte checkpoint.
 - `--ws-signer-set` takes the signer arrangement. Release builds will hard-code
   the published sets and the flag becomes an override.
+- `--ws-signer-set-sha3` is mandatory for an external arrangement. Obtain the
+  fingerprint independently; a hash delivered beside the same untrusted files
+  does not authenticate them.
 
 Understand what this does and does not buy you. The checkpoint is **32 bytes
 of trust about one fact**: which finalized root is real at one epoch. It is a

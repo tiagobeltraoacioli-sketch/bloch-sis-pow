@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use super::*;
+use crate::codec;
 use crate::keys::{Unlock, AUTO_VALIDATOR_INDEX};
 use bloch_pos_committee::{
     staking,
@@ -10,6 +11,54 @@ fn authorize(tx: &mut FundedDeposit, funding: &Keystore, joining: &Keystore) {
     tx.tx_bytes = tx.reserved_tx_bytes();
     tx.funding_signature = funding.sign(&tx.funding_root());
     tx.proof_of_possession = joining.sign(&tx.possession_root());
+}
+
+
+/// Exercise the separately built CLI against the payout created by this rehearsal.
+/// All private material is freshly generated disposable devnet material.
+fn payout_from_cli(dir: &std::path::Path, funding: &Keystore,
+    paid: &bloch_pos_committee::state_root::EutxoEntry, base_fee: u128, epoch: u64) -> PosTransaction {
+    use std::io::Write;
+    let binary = std::env::var_os("BLOCH_PAYOUT_TEST_BIN")
+        .expect("run through scripts/rehearse-validator-admission.py to build the matching CLI");
+    let work = dir.join("payout-cli");
+    std::fs::create_dir(&work).unwrap();
+    let keystore = work.join("sealed-withdrawal");
+    let pass = "disposable lifecycle payout rehearsal passphrase";
+    funding.save_with(&keystore, &Unlock::passphrase(pass)).unwrap();
+    let passfile = work.join("passphrase");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+    options.open(&passfile).unwrap().write_all(pass.as_bytes()).unwrap();
+    let public = work.join("withdrawal.pub.hex");
+    std::fs::write(&public, codec::hex(&funding.pubkey)).unwrap();
+    let draft = work.join("draft.hex");
+    let ready = work.join("ready.hex");
+    let common = vec!["--validator".to_owned(), "1".into(), "--input-value".into(), paid.value.to_string(),
+        "--withdrawal-script".into(), codec::hex(&paid.script_hash), "--destination".into(), codec::hex(&[0x94;32]),
+        "--base-fee".into(), base_fee.to_string(), "--epoch".into(), epoch.to_string(),
+        "--max-fee".into(), (paid.value - 1).to_string()];
+    let path = |p: &std::path::Path| p.to_str().unwrap().to_owned();
+    let invoke = |command: &str, extra: Vec<String>| {
+        let result = std::process::Command::new(&binary).arg("validator-payout").arg(command)
+            .args(&common).args(extra)
+            .env_remove("BLOCH_KEYSTORE_PASSPHRASE").env_remove("BLOCH_KEYSTORE_ALLOW_PLAINTEXT")
+            .env("BLOCH_KEYSTORE_PASSPHRASE_FILE", &passfile).output().unwrap();
+        assert!(result.status.success(), "CLI {command}: {}", String::from_utf8_lossy(&result.stderr));
+    };
+    let read = |p: &std::path::Path| PosTransaction::from_canonical_bytes(
+        &codec::unhex(std::fs::read_to_string(p).unwrap().trim()).unwrap()).unwrap();
+    invoke("prepare", vec!["--pubkey".into(), path(&public), "--tip".into(), "5".into(), "--out".into(), path(&draft)]);
+    invoke("inspect", vec!["--tx".into(), path(&draft)]);
+    let unsigned = read(&draft);
+    invoke("sign", vec!["--tx".into(), path(&draft), "--dir".into(), path(&keystore),
+        "--expected-root".into(), codec::hex(&unsigned.checked_signing_root(epoch)), "--out".into(), path(&ready)]);
+    invoke("inspect", vec!["--tx".into(), path(&ready)]);
+    let signed = read(&ready);
+    assert_eq!(unsigned.txid(), signed.txid());
+    assert_eq!(signed.canonical_bytes()[0], 0x06);
+    signed
 }
 
 fn fixture() -> (
@@ -177,7 +226,7 @@ fn funded_mempool_gate_source_outpoints_and_budget_are_wired() {
         .unwrap()
         .to_string();
     assert!(terms.contains("\"active\":false"));
-    assert!(terms.contains("\"activation_epoch\":null"));
+    assert!(terms.contains(&format!("\"activation_epoch\":{}", bloch_pos_committee::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH)));
     assert!(terms.contains(&crate::codec::hex(&tx.network_domain)));
 }
 
@@ -223,20 +272,30 @@ fn funded_validator_two_nodes_rehearsal() {
     };
     joiner.slashprot = SlashingProtection::open_bound(&joiner_dir.0, binding).unwrap();
     assert_eq!(joiner.duty_index(&joiner.state), None);
-    let mut invalid = tx.clone();
-    invalid.proof_of_possession[100] ^= 1;
-    assert!(founder
-        .on_transaction(PosTransaction::FundedDeposit(invalid))
-        .is_err());
-    let mut wrong_network = tx.clone();
-    wrong_network.network_domain[0] ^= 1;
-    authorize(&mut wrong_network, &funding, joiner.keys.as_ref().unwrap());
-    assert!(founder
-        .on_transaction(PosTransaction::FundedDeposit(wrong_network))
-        .is_err());
-    assert!(founder
-        .on_transaction(PosTransaction::FundedDeposit(tx.clone()))
-        .is_ok());
+    {
+        let _clock = super::validator_lifecycle::clock_at(1);
+        let mut invalid = tx.clone();
+        invalid.proof_of_possession[100] ^= 1;
+        assert!(founder
+            .on_transaction(PosTransaction::FundedDeposit(invalid))
+            .is_err());
+        let mut wrong_network = tx.clone();
+        wrong_network.network_domain[0] ^= 1;
+        authorize(&mut wrong_network, &funding, joiner.keys.as_ref().unwrap());
+        assert!(founder
+            .on_transaction(PosTransaction::FundedDeposit(wrong_network))
+            .is_err());
+        assert!(matches!(
+            founder.on_transaction(PosTransaction::FundedDeposit(tx.clone())),
+            Err(Refusal::LifecycleVerificationLimited { until_slot: 2 })
+        ));
+    }
+    {
+        let _clock = super::validator_lifecycle::clock_at(2);
+        assert!(founder
+            .on_transaction(PosTransaction::FundedDeposit(tx.clone()))
+            .is_ok());
+    }
     let mut saw_joiner_propose = false;
     let mut saw_joiner_attest = false;
     let mut history = Vec::new();
@@ -244,7 +303,7 @@ fn funded_validator_two_nodes_rehearsal() {
     // Selection is stake-weighted and uses fresh keys. Wait for an actual
     // joining proposer instead of assuming one appears in a fixed 154-slot
     // window. The bound remains below one full RANDAO chain.
-    for slot in 1..=4096u64 {
+    for slot in 2..=4096u64 {
         let _clock = super::validator_lifecycle::clock_at(slot);
         founder.wall_slot = slot;
         joiner.wall_slot = slot;
@@ -310,19 +369,29 @@ fn funded_validator_two_nodes_rehearsal() {
     assert!(by_key.contains("\"state\":\"active\""));
     // Exit is authorized by both PQ algorithms and is valid only for the
     // current inclusion epoch. Funding authority cannot sign a validator exit.
-    let _clock = super::validator_lifecycle::clock_at(exit_slot);
     let exit_epoch = epoch_of(exit_slot);
     let root = staking::ExitTx { pubkey_hash: hash, epoch: exit_epoch, signature: Vec::new() }.signing_root();
     let exit = PosTransaction::ExitV2 { pubkey_hash: hash, epoch: exit_epoch,
         signature: joiner.keys.as_ref().unwrap().sign(&root) };
-    for offset in [14, 4 + 3309 + 10] {
-        let mut forged = exit.clone();
-        if let PosTransaction::ExitV2 { signature, .. } = &mut forged { signature[offset] ^= 1; }
-        assert!(founder.on_transaction(forged).is_err());
+    {
+        let _clock = super::validator_lifecycle::clock_at(exit_slot);
+        for offset in [14, 4 + 3309 + 10] {
+            let mut forged = exit.clone();
+            if let PosTransaction::ExitV2 { signature, .. } = &mut forged { signature[offset] ^= 1; }
+            assert!(founder.on_transaction(forged).is_err());
+        }
+        assert!(matches!(
+            founder.on_transaction(exit.clone()),
+            Err(Refusal::LifecycleVerificationLimited { until_slot }) if until_slot == exit_slot + 1
+        ));
     }
-    founder.on_transaction(exit.clone()).unwrap();
-    joiner.on_transaction(exit).unwrap();
-    drive_pair(&mut founder, &mut joiner, exit_slot, &mut history);
+    let exit_admission_slot = exit_slot + 1;
+    {
+        let _clock = super::validator_lifecycle::clock_at(exit_admission_slot);
+        founder.on_transaction(exit.clone()).unwrap();
+        joiner.on_transaction(exit).unwrap();
+    }
+    drive_pair(&mut founder, &mut joiner, exit_admission_slot, &mut history);
     let rec = founder.state.validator_record(1).unwrap();
     assert_eq!(rec.exit_epoch, exit_epoch + staking::EXIT_DELAY_EPOCHS);
     let maturity = rec.withdrawable_epoch;
@@ -333,9 +402,12 @@ fn funded_validator_two_nodes_rehearsal() {
     let mut conflicting = history.iter().rev().find(|env| env.header.proposer_index == 1).unwrap().clone();
     conflicting.header.state_root[0] ^= 1;
     conflicting.proposer_sig = joiner.keys.as_ref().unwrap().sign(&conflicting.header.proposal_signing_root());
-    let _ = founder.ingest_judged(conflicting);
-    assert!(founder.mempool.values().any(|tx| matches!(tx, PosTransaction::SlashingEvidence(_))));
-    drive_pair(&mut founder, &mut joiner, exit_slot + 1, &mut history);
+    {
+        let _clock = super::validator_lifecycle::clock_at(exit_admission_slot + 1);
+        let _ = founder.ingest_judged(conflicting);
+        assert!(founder.mempool.values().any(|tx| matches!(tx, PosTransaction::SlashingEvidence(_))));
+    }
+    drive_pair(&mut founder, &mut joiner, exit_admission_slot + 1, &mut history);
     let rec = founder.state.validator_record(1).unwrap();
     assert!(rec.slashed);
     assert!(rec.staked_sat < stake_before_slash);
@@ -360,28 +432,51 @@ fn funded_validator_two_nodes_rehearsal() {
     assert!(u128::from(paid.value) >= bonded_residue);
     assert_eq!(paid.script_hash, tx.withdrawal_credentials);
     assert_eq!(founder.state.validator_record(1).unwrap().staked_sat, 0);
-    assert!(founder.on_transaction(withdrawal.clone()).is_err());
-    let mut spend = PosTransaction::TransferV2 {
-        keys: vec![bloch_pos_committee::transition::WitnessKey {
-            pubkey: funding.pubkey.clone(), signature: vec![0; ADMISSION_PQ_SIGNATURE_MAX],
-        }],
-        inputs: vec![bloch_pos_committee::transition::TransferInputV2 { txid: withdrawal.txid(), vout: 0, key_index: 0 }],
-        outputs: vec![TransferOutput { value: paid.value, script_hash: [0x94; 32] }],
-        tx_bytes: 0, tip_millisat_per_gas: 5,
-    };
-    let reserved = spend.canonical_bytes().len() as u64;
-    let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, reserved, founder.state.next_base_fee(), 5);
-    if let PosTransaction::TransferV2 { tx_bytes, outputs, .. } = &mut spend {
-        *tx_bytes = reserved;
-        outputs[0].value -= u64::try_from(charge.base_fee_sat + charge.priority_fee_sat).unwrap();
+    assert_eq!(
+        founder.on_transaction(withdrawal.clone()),
+        Ok(Admitted::Duplicate),
+        "included withdrawal is classified as an already-committed duplicate"
+    );
+    assert!(
+        !founder.mempool.has_txid(&withdrawal.txid()),
+        "included withdrawal is not reinserted into the pending pool"
+    );
+    let spend_slot = maturity * SLOTS_PER_EPOCH + 2;
+    let _payout_clock = super::validator_lifecycle::clock_at(spend_slot);
+    let spend = payout_from_cli(&_founder_dir.0, &funding, &paid, founder.state.next_base_fee(), epoch_of(spend_slot));
+    // Alterations of the signed CLI intent must fail at the real mempool door.
+    for case in 0..3 {
+        let mut altered = spend.clone();
+        if let PosTransaction::TransferV2 { keys, outputs, .. } = &mut altered {
+            match case {
+                0 => outputs[0].script_hash[0] ^= 1,
+                1 => outputs[0].value -= 1,
+                _ => keys[0].signature[20] ^= 1,
+            }
+        }
+        let refusal = founder.on_transaction(altered).unwrap_err();
+        let expected = if case == 1 {
+            "transfer value is not conserved at the current base fee"
+        } else {
+            "signature that does not verify"
+        };
+        assert!(format!("{refusal:?}").contains(expected), "{refusal:?}");
     }
-    let root = spend.spend_signing_root();
-    if let PosTransaction::TransferV2 { keys, .. } = &mut spend { keys[0].signature = funding.sign(&root); }
     let _clock = super::validator_lifecycle::clock_at(maturity * SLOTS_PER_EPOCH + 2);
     founder.on_transaction(spend.clone()).unwrap();
     drive_pair(&mut founder, &mut joiner, maturity * SLOTS_PER_EPOCH + 2, &mut history);
     assert!(founder.state.utxo(&withdrawal.txid(), 0).is_none());
     assert!(founder.state.utxo(&spend.txid(), 0).is_some());
+    let spend_block = founder.head_id();
+    for epoch in maturity + 1..=maturity + 4 {
+        drive_pair(&mut founder, &mut joiner, epoch * SLOTS_PER_EPOCH, &mut history);
+    }
+    assert!(founder.state.finality().finalized.epoch > epoch_of(spend_slot), "payout spend must finalize");
+    assert!(founder.chain.iter().any(|(_, id)| *id == spend_block));
+    println!("PAYOUT_CLI_EVIDENCE {{\"deposit_txid\":\"{}\",\"withdrawal_txid\":\"{}\",\"spend_txid\":\"{}\",\"spend_slot\":{},\"spend_block\":\"{}\",\"head_block\":\"{}\",\"state_root\":\"{}\",\"finalized_epoch\":{},\"finalized_root\":\"{}\"}}",
+        codec::hex(&PosTransaction::FundedDeposit(tx.clone()).txid()), codec::hex(&withdrawal.txid()), codec::hex(&spend.txid()),
+        spend_slot, codec::hex(spend_block.as_bytes()), codec::hex(founder.head_id().as_bytes()), codec::hex(&founder.state.state_root()),
+        founder.state.finality().finalized.epoch, codec::hex(&founder.state.finality().finalized.root));
     let (mut replay, _replay_dir) = perf_support::proposing_engine();
     replay.manifest = Manifest::decode(&founder.manifest.encode()).unwrap();
     replay.state = StateCell::new(replay.manifest.genesis_state());
@@ -389,12 +484,13 @@ fn funded_validator_two_nodes_rehearsal() {
     replay.canonical = BTreeSet::from([*replay.manifest.genesis_id().as_bytes()]);
     replay.keys = None;
     for env in history {
-        replay.ingest_replay(env);
+        assert!(replay.ingest_replay(env));
     }
     assert_eq!(replay.state.state_root(), joiner.state.state_root());
+    println!("PAYOUT_CLI_REPLAY_VERIFIED {}", codec::hex(&replay.state.state_root()));
     let keys = joiner.keys.as_ref().unwrap();
     assert_eq!(
-        check_joining_registry_identity(&replay.state, 1, &keys.pubkey, keys.randao_seed),
+        check_registry_identity(&replay.state, 1, &keys.pubkey, keys.randao_seed),
         RegistryIdentity::Inactive
     );
     let wm = joiner.slashprot.watermarks();
@@ -450,7 +546,15 @@ fn funded_activation_boundary_rehearsal() {
     assert!(history.last().unwrap().body.transactions.contains(&tx.canonical_bytes()));
     assert!(founder.state.is_funded_validator(1));
     assert_eq!(founder.state.validator_record(1).unwrap().activation_epoch, u64::MAX);
-    assert!(founder.on_transaction(tx).is_err(), "included funding cannot be replayed");
+    assert_eq!(
+        founder.on_transaction(tx.clone()),
+        Ok(Admitted::Duplicate),
+        "included funding is classified as an already-committed duplicate"
+    );
+    assert!(
+        !founder.mempool.has_txid(&tx.txid()),
+        "included funding is not reinserted into the pending pool"
+    );
     let (mut replay, _replay_dir) = perf_support::proposing_engine();
     replay.manifest = Manifest::decode(&founder.manifest.encode()).unwrap();
     replay.state = StateCell::new(replay.manifest.genesis_state());
@@ -466,7 +570,7 @@ fn funded_activation_boundary_rehearsal() {
                            crate::codec::encode_envelope(envelope)).unwrap();
         }
     }
-    for envelope in history { replay.ingest_replay(envelope); }
+    for envelope in history { assert!(replay.ingest_replay(envelope)); }
     assert_eq!(replay.head_id(), founder.head_id());
     assert_eq!(replay.state.state_root(), founder.state.state_root());
     assert!(replay.state.is_funded_validator(1));
@@ -494,7 +598,7 @@ fn funded_pre_activation_compatibility_rehearsal() {
         assert!(epoch_of(envelope.header.slot) < activation);
         let root = envelope.header.state_root;
         let slot = envelope.header.slot;
-        replay.ingest_replay(envelope);
+        assert!(replay.ingest_replay(envelope));
         assert_eq!(replay.state.slot(), slot);
         assert_eq!(replay.state.state_root(), root,
                    "unarmed and armed builds must agree below L at slot {slot}");
@@ -596,17 +700,25 @@ fn randao_automatic_recommit_rehearsal() {
     record.pubkey = joining.pubkey.clone();
     record.randao_commitment = RandaoChain::generate(joining.randao_seed).commitment();
     first.manifest.validators.push(record);
-    first.genesis_validator_count = 2;
+    first.genesis_validator_indices = BTreeSet::from([0, 1]);
     first.state = StateCell::new(first.manifest.genesis_state());
     first.chain = vec![(0, first.manifest.genesis_id())];
     first.canonical = BTreeSet::from([*first.manifest.genesis_id().as_bytes()]);
     let (mut second, _second_dir) = perf_support::proposing_engine();
     second.manifest = Manifest::decode(&first.manifest.encode()).unwrap();
-    second.genesis_validator_count = 2;
+    second.genesis_validator_indices = BTreeSet::from([0, 1]);
     second.state = StateCell::new(second.manifest.genesis_state());
     second.chain = first.chain.clone();
     second.canonical = first.canonical.clone();
     second.keys = Some(joining);
+    // Match production's identity-bound durable signer initialization.
+    for (engine, directory) in [(&mut first, &_dir.0), (&mut second, &_second_dir.0)] {
+        let keys = engine.keys.as_ref().unwrap();
+        engine.slashprot = SlashingProtection::open_bound(directory, crate::slashprot::Binding {
+            validator_pubkey_sha3: <sha3::Sha3_256 as sha3::Digest>::digest(&keys.pubkey).into(),
+            genesis_digest: <sha3::Sha3_256 as sha3::Digest>::digest(engine.manifest.encode()).into(),
+        }).unwrap();
+    }
     let mut history = Vec::new();
     let mut produced = 0;
     for slot in 1..=160 { produced += usize::from(try_drive_pair(&mut first, &mut second, slot, &mut history)); }
@@ -628,7 +740,102 @@ fn randao_automatic_recommit_rehearsal() {
         let keys = engine.keys.as_ref().unwrap();
         let index = replay.validator_index_by_pubkey(&keys.pubkey).unwrap();
         let seed = keys.randao_seed_for(&replay.admission_network_domain().unwrap(), replay.validator_randao_generation(index));
-        assert_eq!(check_joining_registry_identity(&replay, index, &keys.pubkey, seed), RegistryIdentity::Active);
-        assert_eq!(check_joining_registry_identity(&replay, index, &keys.pubkey, keys.randao_seed), RegistryIdentity::RandaoMismatch);
+        assert_eq!(check_registry_identity(&replay, index, &keys.pubkey, seed), RegistryIdentity::Active);
+        assert_eq!(check_registry_identity(&replay, index, &keys.pubkey, keys.randao_seed), RegistryIdentity::RandaoMismatch);
     }
+}
+
+#[test]
+fn proposal_selection_keeps_inactive_funded_candidates_out_without_mutation() {
+    assert!(10 < bloch_pos_committee::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH);
+    let (mut engine, _dir, _funding, _joining, tx) = fixture();
+    for expiry in [100, 101, 102] {
+        let mut candidate = tx.clone();
+        candidate.valid_until_epoch = expiry;
+        let candidate = PosTransaction::FundedDeposit(candidate);
+        engine.mempool.insert(candidate.canonical_bytes(), candidate);
+    }
+    let root = engine.state.state_root();
+    assert!(engine.select_transactions(10).is_empty());
+    assert_eq!(engine.mempool.len(), 3);
+    assert_eq!(engine.state.state_root(), root);
+    assert!(engine.rejected.is_empty());
+}
+
+#[test]
+fn active_funded_proposal_selection_uses_actual_gate_and_filters_conflicting_intents() {
+    let activation = bloch_pos_committee::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH;
+    assert_eq!(activation, 2_884);
+    let (mut engine, _dir, funding, joining, mut first) = fixture();
+    first.valid_until_epoch = activation.saturating_add(100);
+    authorize(&mut first, &funding, &joining);
+    let mut alternative = first.clone();
+    alternative.valid_until_epoch = alternative.valid_until_epoch.saturating_add(1);
+    authorize(&mut alternative, &funding, &joining);
+    let first = PosTransaction::FundedDeposit(first);
+    let alternative = PosTransaction::FundedDeposit(alternative);
+    let rolled = engine.rolled_to(activation);
+    let total = rolled.active_validators().iter().map(|v| u128::from(v.effective_stake)).sum();
+    let price = engine.state.next_base_fee_at(activation);
+    for candidate in [&first, &alternative] {
+        assert!(rolled.validate_lifecycle_transaction(candidate, total, price, &engine.verifier).is_ok(),
+            "each real signed funded candidate must be independently valid at the actual activation epoch");
+        engine.mempool.insert(candidate.canonical_bytes(), candidate.clone());
+    }
+    let selected = engine.select_transactions(activation);
+    assert_eq!(selected.len(), 1, "shared inputs cannot be spent by both independently valid intents");
+    assert!(selected.contains(&first) || selected.contains(&alternative));
+    assert_eq!(engine.select_transactions(activation), selected, "reusing the cached epoch view must preserve selection");
+    assert_eq!(engine.mempool.len(), 2, "conflicting intent selection is not eviction");
+    assert!(engine.rejected.is_empty());
+}
+
+#[test]
+fn admission_negative_cache_funded_authorization_remains_retryable_at_actual_gate() {
+    let activation = bloch_pos_committee::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH;
+    assert_eq!(activation, 2_884);
+    let (engine, _dir, funding, joining, mut deposit) = fixture();
+    deposit.valid_until_epoch = activation + 100;
+    authorize(&mut deposit, &funding, &joining);
+    let valid = PosTransaction::FundedDeposit(deposit.clone());
+    let (verifier, calls) = verification::counted_hybrid();
+    assert!(admissible_with_verifier(&valid, activation - 1, &verifier).is_err());
+    assert!(admissible_with_verifier(&valid, deposit.valid_until_epoch + 1, &verifier).is_err());
+    assert_eq!(calls.get(), 0, "epoch/expiry refusals must not become cached crypto failures");
+    let rolled = engine.rolled_to(activation);
+    let total = rolled.active_validators().iter().map(|v| u128::from(v.effective_stake)).sum();
+    let base_fee = engine.state.next_base_fee_at(activation);
+    let stateful = |tx: &PosTransaction| {
+        rolled.validate_lifecycle_transaction(tx, total, base_fee, &verifier)
+    };
+    let mut forged = deposit.clone();
+    let last = forged.funding_signature.last_mut().unwrap();
+    *last ^= 1;
+    let forged = PosTransaction::FundedDeposit(forged);
+    for _ in 0..16 { assert!(stateful(&forged).is_err()); }
+    assert_eq!(calls.get(), 1);
+    assert!(stateful(&valid).is_ok());
+    assert_eq!(calls.get(), 3, "corrected funding signature and joining proof must both run");
+    let mut changed = deposit.clone();
+    changed.valid_until_epoch += 1;
+    assert!(stateful(&PosTransaction::FundedDeposit(changed.clone())).is_err());
+    assert_eq!(calls.get(), 4, "a changed funding root must not reuse old verification");
+    authorize(&mut changed, &funding, &joining);
+    let changed = PosTransaction::FundedDeposit(changed);
+    assert!(stateful(&changed).is_ok());
+    assert_eq!(calls.get(), 6);
+    assert!(stateful(&changed).is_ok(),
+        "the corrected real funded candidate must still pass state validation at epoch2884");
+    assert_eq!(admissible(&changed, activation), admissible_with_verifier(&changed, activation, &verifier));
+    let next_joining = Keystore::generate_with(&_dir.0.join("next-joining"), AUTO_VALIDATOR_INDEX, &Unlock::PlaintextOptIn).unwrap();
+    let mut other_key = deposit;
+    other_key.validator_pubkey = next_joining.pubkey.clone();
+    other_key.randao_commitment = RandaoChain::generate(next_joining.randao_seed).commitment();
+    let before = calls.get();
+    assert!(stateful(&PosTransaction::FundedDeposit(other_key.clone())).is_err());
+    assert!(calls.get() > before, "a different joining key/root must receive its own crypto check");
+    authorize(&mut other_key, &funding, &next_joining);
+    let other_key = PosTransaction::FundedDeposit(other_key);
+    assert!(admissible_with_verifier(&other_key, activation, &verifier).is_ok());
+    assert!(stateful(&other_key).is_ok());
 }

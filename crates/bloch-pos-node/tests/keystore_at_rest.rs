@@ -50,6 +50,9 @@ fn run(args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let mut c = Command::new(BIN);
     c.env_remove("BLOCH_KEYSTORE_PASSPHRASE")
         .env_remove("BLOCH_KEYSTORE_PASSPHRASE_FILE")
+        .env_remove("BLOCH_KEYSTORE_PASSPHRASE_FD")
+        .env_remove("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF")
+        .env_remove("BLOCH_KEYSTORE_EXPECT_KDF")
         .env_remove("BLOCH_KEYSTORE_ALLOW_PLAINTEXT");
     for (k, v) in env {
         c.env(k, v);
@@ -130,6 +133,31 @@ fn the_binary_reopens_a_sealed_keystore_only_with_the_passphrase() {
     );
     let row = String::from_utf8_lossy(&ok.stdout);
     assert!(row.starts_with("0\t"), "unexpected cohort row: {row:?}");
+    let recovery = run(&["keygen-public", "--dir", dir.to_str().unwrap()],
+        &[("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE),
+          ("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF", "1"),
+          ("BLOCH_KEYSTORE_EXPECT_KDF", "65536,3,1")]);
+    assert!(recovery.status.success(), "explicit bounded recovery must preserve ordinary decoding");
+    assert_eq!(recovery.stdout, ok.stdout);
+    let missing_expectation = run(&["keygen-public", "--dir", dir.to_str().unwrap()],
+        &[("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE), ("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF", "1")]);
+    assert!(!missing_expectation.status.success());
+    assert!(stderr(&missing_expectation).contains("expensive KDF recovery requires BLOCH_KEYSTORE_EXPECT_KDF"));
+    let wrong_expectation = run(&["keygen-public", "--dir", dir.to_str().unwrap()],
+        &[("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE),
+          ("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF", "1"),
+          ("BLOCH_KEYSTORE_EXPECT_KDF", "65536,4,1")]);
+    assert!(!wrong_expectation.status.success());
+    assert!(stderr(&wrong_expectation).contains("does not match BLOCH_KEYSTORE_EXPECT_KDF"));
+    let expectation_without_opt_in = run(&["keygen-public", "--dir", dir.to_str().unwrap()],
+        &[("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE),
+          ("BLOCH_KEYSTORE_EXPECT_KDF", "65536,3,1")]);
+    assert!(!expectation_without_opt_in.status.success());
+    assert!(stderr(&expectation_without_opt_in).contains("requires BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1"));
+    let invalid = run(&["keygen-public", "--dir", dir.to_str().unwrap()],
+        &[("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE), ("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF", "2")]);
+    assert!(!invalid.status.success());
+    assert!(stderr(&invalid).contains("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF must be 0 or 1"));
 
     for env in [
         vec![],
@@ -225,4 +253,41 @@ fn the_plaintext_opt_in_is_the_only_route_to_a_plaintext_file() {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn inherited_pipe_credentials_seal_and_reopen_without_secret_environment() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = tmp_dir("inherited-pipe");
+    let invoke = |arguments: &[&str], conflict: bool| {
+        let mut command = Command::new(BIN);
+        command.args(arguments).env_remove("BLOCH_KEYSTORE_PASSPHRASE")
+            .env_remove("BLOCH_KEYSTORE_PASSPHRASE_FILE")
+            .env_remove("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF")
+            .env_remove("BLOCH_KEYSTORE_EXPECT_KDF")
+            .env_remove("BLOCH_KEYSTORE_ALLOW_PLAINTEXT")
+            .env("BLOCH_KEYSTORE_PASSPHRASE_FD", "0")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if conflict { command.env("BLOCH_KEYSTORE_PASSPHRASE", "unused-conflicting-value"); }
+        let mut child = command.spawn().unwrap();
+        if !conflict {
+            child.stdin.take().unwrap().write_all(PASSPHRASE.as_bytes()).unwrap();
+        } else { drop(child.stdin.take()); }
+        let output = child.wait_with_output().unwrap();
+        assert!(!contains(&output.stdout, PASSPHRASE.as_bytes()));
+        assert!(!contains(&output.stderr, PASSPHRASE.as_bytes()));
+        output
+    };
+    let path = dir.to_str().unwrap();
+    let generated = invoke(&["keygen", "--dir", path, "--index", "0"], false);
+    assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
+    assert_eq!(&std::fs::read(dir.join("validator.key")).unwrap()[..8], SEALED_MAGIC);
+    let opened = invoke(&["keygen-public", "--dir", path], false);
+    assert!(opened.status.success(), "{}", String::from_utf8_lossy(&opened.stderr));
+    let refused = invoke(&["keygen-public", "--dir", path], true);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("cannot be combined"));
+    std::fs::remove_dir_all(dir).unwrap();
 }

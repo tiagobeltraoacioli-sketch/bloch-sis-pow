@@ -44,6 +44,9 @@ pub struct Config {
     /// authorize time (hybrid ML-DSA-65 ‖ Falcon-1024 signature over a
     /// per-session challenge). Default on; `--no-auth-proof` disables.
     pub require_auth_proof: bool,
+    /// Require explicit suite envelopes and canonical Falcon encoding for
+    /// ownership proofs. Off by default so historical raw proofs remain usable.
+    pub canonical_auth_proof: bool,
 }
 
 /// Session state machine — mirrors the node's stratum session.

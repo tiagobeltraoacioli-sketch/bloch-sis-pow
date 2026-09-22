@@ -32,9 +32,9 @@ ignore = [
     "RUSTSEC-2026-0162", # pqcrypto-traits  unmaintained (PQClean archived)
     "RUSTSEC-2024-0381", # pqcrypto-kyber   superseded by pqcrypto-mlkem (transitive)
     # ── Transitive, no first-party call path ──────────────────────────────
-    "RUSTSEC-2025-0141", # bincode 1.3.3 unmaintained — transitive only; the
-                         # wire format uses bincode 2.x. 1.x is pulled by a dep
-                         # and carries no first-party (de)serialization path.
+    "RUSTSEC-2025-0141", # bincode 1.3.3 unmaintained — first-party restart cache;
+                         # checksummed, build-bound and validated on restore.
+                         # Accepted maintenance risk, not unreachable code.
     "RUSTSEC-2024-0436", # paste unmaintained — transitive proc-macro helper,
                          # compile-time only, no runtime attack surface.
     "RUSTSEC-2026-0163", # pqcrypto-internals unmaintained (PQClean archived) —
@@ -110,6 +110,9 @@ allow-wildcard-paths = true # path deps in the workspace are fine
 #
 # Why these exist (all semver-major splits, not unifiable by `cargo update`;
 # the pins live in dependencies this workspace deliberately does not move):
+#   * bincode — Genesis-4's local state cache still uses the 1.3 wire format,
+#     while bloch-crypto and the frozen Genesis-3 node use the incompatible 2.x
+#     API.  Changing either serializer is a reviewed data-format migration.
 #   * secp256k1(-sys), bitcoin_hashes, hex-conservative — rust-bitcoin
 #     lineages pinned by stratum-sv2 (legacy Genesis-3 pool, kept buildable
 #     for audit) vs bitcoin 0.32 (bloch-btc-wallet / bloch-pq-vault).
@@ -124,6 +127,7 @@ allow-wildcard-paths = true # path deps in the workspace are fine
 #     surface shared between the copies.
 skip = [
     { crate = "bindgen@=0.69.5" },
+    { crate = "bincode@=1.3.3" },
     { crate = "bitcoin_hashes@=0.13.1" },
     { crate = "block-buffer@=0.9.0" },
     { crate = "block-buffer@=0.10.4" },
@@ -155,29 +159,6 @@ skip = [
     { crate = "windows-sys@=0.52.0" },
     { crate = "windows-sys@=0.59.0" },
     { crate = "wit-bindgen@=0.51.0" },
-]
-
-# ── Target-gated OS-shim subtree (N-5, Round 3) ────────────────────────────
-# `multiple-versions = "deny"` (above) went red on this exact allowlist:
-# windows-sys 0.60.2/0.61.2, windows-targets 0.52.6/0.53.5, and all eight
-# windows_{aarch64,i686,x86_64}_{gnu,gnullvm,msvc} crates at 0.52.6/0.53.1 —
-# ten duplicate pairs the `skip` list above was never extended to cover
-# because it was written against an older lock (the two `windows-sys` entries
-# above still pin 0.52.0/0.59.0, versions the CURRENT lock resolves
-# differently). Per-crate `skip` entries would mean re-deriving this list by
-# hand on every windows-targets bump; `skip-tree` on the single newer
-# `windows-sys` root instead prunes windows-targets 0.53.5 and its eight
-# platform crates in one rule, the same "target-gated, never co-linked"
-# rationale as the `skip` entries above (these are OS ABI shims selected by
-# `cfg(windows)`, not code that runs together). Only the 0.60.2 side is
-# skip-tree'd — 0.61.2 is left as the sole non-skipped `windows-sys` version,
-# so a THIRD `windows-sys` release still trips `multiple-versions = "deny"`
-# rather than silently being absorbed.
-#
-# Verified: `cargo deny --offline check bans` -> `bans ok` after this rule
-# (10 error[duplicate] windows* pairs gone; 0 remaining warnings).
-skip-tree = [
-    "windows-sys@0.60.2",
 ]
 
 [licenses]
@@ -231,6 +212,9 @@ name = "bloch-pos-node"
 allow = ["AGPL-3.0-or-later"]
 [[licenses.exceptions]]
 name = "genesis4-ceremony"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "bloch-indexer"
 allow = ["AGPL-3.0-or-later"]
 
 # Shared protocol crates — used by both eras.

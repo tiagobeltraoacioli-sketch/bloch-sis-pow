@@ -77,6 +77,21 @@ fn apply(state: &mut CommittedState, tx: &FundedDeposit) -> Result<fee_market::T
     )
 }
 
+fn cancellation_exit(tx: &FundedDeposit, epoch: u64) -> PosTransaction {
+    let pubkey_hash: [u8; 32] = Sha3_256::digest(&tx.validator_pubkey).into();
+    let root = staking::ExitTx {
+        pubkey_hash,
+        epoch,
+        signature: Vec::new(),
+    }
+    .signing_root();
+    PosTransaction::ExitV2 {
+        pubkey_hash,
+        epoch,
+        signature: toy_sign(&tx.validator_pubkey, &root),
+    }
+}
+
 #[test]
 fn funded_wire_roundtrip_and_witness_independent_identity() {
     let tx = deposit(20);
@@ -131,8 +146,26 @@ fn funded_decoder_bounds_lengths_before_allocating() {
 }
 
 #[test]
-fn funded_gate_is_closed_even_at_maximum_epoch_and_legacy_stays_closed() {
-    assert!(!crate::params::funded_validator_admission_active(u64::MAX));
+fn funded_decoder_parses_bounded_wire_shape_and_the_judge_rejects_semantics() {
+    let mut invalid = deposit(21);
+    invalid.inputs.clear();
+    let wire = PosTransaction::FundedDeposit(invalid.clone());
+    let decoded = PosTransaction::from_canonical_bytes(&wire.canonical_bytes())
+        .expect("zero inputs are bounded, syntactically decodable bytes");
+    assert_eq!(decoded, wire);
+    let PosTransaction::FundedDeposit(decoded) = decoded else {
+        panic!("funded tag must decode as a funded deposit");
+    };
+    assert_eq!(decoded.validate_shape(), Err(FundedDepositReject::Shape));
+}
+
+#[test]
+fn funded_gate_obeys_the_scheduled_boundary_and_legacy_stays_closed() {
+    let gate = crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH;
+    assert!(!crate::params::funded_validator_admission_active(gate - 1));
+    assert!(crate::params::funded_validator_admission_active(gate));
+    assert!(crate::params::funded_validator_admission_active(u64::MAX));
+    assert!(!CommittedState::unfunded_bonding_active(u64::MAX / crate::params::SLOTS_PER_EPOCH));
     let tx = deposit(22);
     let (_, mut state, _) = fixture(std::slice::from_ref(&tx));
     let root = state.state_root();
@@ -155,6 +188,35 @@ fn funded_gate_is_closed_even_at_maximum_epoch_and_legacy_stays_closed() {
         );
     });
     assert!(!crate::params::funded_validator_admission_active(0));
+}
+
+#[test]
+fn activation_queue_v2_is_inert_and_caps_the_permanent_registry_when_rehearsed() {
+    assert_eq!(crate::params::ACTIVATION_QUEUE_V2_ACTIVATION_EPOCH, u64::MAX);
+    assert!(!crate::params::activation_queue_v2_active(0));
+    assert!(!crate::params::activation_queue_v2_active(u64::MAX));
+
+    run(|| {
+        let tx = deposit(70);
+        let (_, mut state, _) = fixture(std::slice::from_ref(&tx));
+        let template = state.validator_record(0).unwrap().clone();
+        while state.validators.len() < staking::MAX_VALIDATOR_REGISTRY_ENTRIES {
+            let index = state.validators.len() as u32;
+            state.validators.insert(index, ValidatorRecord { index, ..template.clone() });
+        }
+        assert_eq!(state.validators.len(), staking::MAX_VALIDATOR_REGISTRY_ENTRIES);
+        let history_before = state.deposit_history.len();
+
+        let _gate = crate::params::activation_queue_v2_rehearsal::open();
+        assert!(crate::params::activation_queue_v2_active(state.epoch));
+        assert_eq!(
+            apply(&mut state, &tx),
+            Err(TxReject::FundedDeposit(FundedDepositReject::RegistryCapacity)),
+            "the armed candidate must reject before growing permanent registry/history state"
+        );
+        assert_eq!(state.validators.len(), staking::MAX_VALIDATOR_REGISTRY_ENTRIES);
+        assert_eq!(state.deposit_history.len(), history_before);
+    });
 }
 
 #[test]
@@ -491,6 +553,118 @@ fn unfinalized_funding_never_activates_even_after_the_delay() {
         assert_eq!(state.finality().finalized.epoch, 0);
         assert_eq!(state.validator_record(8).unwrap().activation_epoch, u64::MAX);
         assert_eq!(state.active_validators().len(), 8);
+    });
+}
+
+#[test]
+fn queued_funded_cancellation_is_inert_and_preserves_principal_when_rehearsed() {
+    assert_eq!(
+        crate::params::FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH,
+        u64::MAX
+    );
+    assert!(!crate::params::funded_validator_cancellation_active(0));
+    assert!(!crate::params::funded_validator_cancellation_active(u64::MAX));
+
+    run(|| {
+        let tx = deposit(48);
+        let (_transition, mut state, _) = fixture(std::slice::from_ref(&tx));
+        apply(&mut state, &tx).unwrap();
+        let index = state.validator_index_by_pubkey(&tx.validator_pubkey).unwrap();
+        state.epoch = staking::ACTIVATION_DELAY_EPOCHS;
+        let exit = cancellation_exit(&tx, state.epoch);
+
+        let _exit_gate = crate::params::rehearsal::exit_auth_gate_open_guard();
+        let root = state.state_root();
+        assert_eq!(
+            state.apply_transaction(&exit, 0, 0, &AuthVerifier),
+            Err(TxReject::StakingRule),
+            "the candidate must remain unreachable while its own gate is inert"
+        );
+        assert_eq!(state.state_root(), root);
+
+        let _cancellation_gate = crate::params::funded_cancellation_rehearsal::open();
+        let mut unbacked = state.clone();
+        unbacked.funded_validators.remove(&index);
+        assert_eq!(
+            unbacked.apply_transaction(&exit, 0, 0, &AuthVerifier),
+            Err(TxReject::StakingRule),
+            "the candidate must never release an unbacked legacy registration"
+        );
+        let mut unauthorized = state.clone();
+        let mut forged = exit.clone();
+        let PosTransaction::ExitV2 { signature, .. } = &mut forged else {
+            unreachable!()
+        };
+        signature[10] ^= 1;
+        assert_eq!(
+            unauthorized.apply_transaction(&forged, 0, 0, &AuthVerifier),
+            Err(TxReject::StakingRule),
+            "only the registered validator key may cancel the registration"
+        );
+        let mut too_early = state.clone();
+        too_early.epoch -= 1;
+        assert_eq!(
+            too_early.apply_transaction(
+                &cancellation_exit(&tx, too_early.epoch),
+                0,
+                0,
+                &AuthVerifier,
+            ),
+            Err(TxReject::StakingRule),
+            "cancellation must not bypass the ordinary activation delay"
+        );
+
+        state.apply_transaction(&exit, 0, 0, &AuthVerifier).unwrap();
+        let scheduled = state.validator_record(index).unwrap();
+        assert_eq!(scheduled.activation_epoch, u64::MAX);
+        assert_eq!(
+            scheduled.exit_epoch,
+            state.epoch + staking::EXIT_DELAY_EPOCHS
+        );
+        assert_eq!(
+            scheduled.withdrawable_epoch,
+            scheduled.exit_epoch + staking::WITHDRAWAL_DELAY_EPOCHS
+        );
+        assert_eq!(
+            state.apply_transaction(&exit, 0, 0, &AuthVerifier),
+            Err(TxReject::StakingRule),
+            "the signed cancellation must remain one-shot"
+        );
+
+        state.finality_engine = finality::FinalityState::new(finality::Checkpoint {
+            epoch: state.epoch + 1,
+            root: [0xF1; 32],
+        });
+        state.activate_finalized_deposits(state.epoch + 1);
+        assert_eq!(
+            state.validator_record(index).unwrap().activation_epoch,
+            u64::MAX,
+            "later finality must not activate a registration that already cancelled"
+        );
+
+        let history_len = state.deposit_history.len();
+        let registry_len = state.validators.len();
+        let before = state.accounted_supply_sat();
+        let issued = state.issued_sat();
+        state.epoch = state.validator_record(index).unwrap().withdrawable_epoch;
+        let withdrawal = PosTransaction::Withdraw { validator: index };
+        let _withdrawal_gate = crate::params::rehearsal::withdrawal_gate_open_guard();
+        state
+            .apply_transaction(&withdrawal, 0, 0, &AuthVerifier)
+            .unwrap();
+
+        let output = state
+            .utxo(&withdrawal.txid(), 0)
+            .expect("funded principal returns to the committed withdrawal script");
+        assert_eq!(u128::from(output.value), tx.amount_sat);
+        assert_eq!(output.script_hash, tx.withdrawal_credentials);
+        assert_eq!(state.accounted_supply_sat(), before);
+        assert_eq!(state.issued_sat(), issued);
+        assert_eq!(state.deposit_history.len(), history_len);
+        assert_eq!(state.validators.len(), registry_len);
+        assert_eq!(state.validator_index_by_pubkey(&tx.validator_pubkey), Some(index));
+        assert!(state.is_funded_validator(index));
+        assert_eq!(state.validator_record(index).unwrap().staked_sat, 0);
     });
 }
 

@@ -58,8 +58,8 @@ impl std::fmt::Display for Txid {
     }
 }
 
-/// PoW-depth finality, per roadmap §1.3. Bloch has **no BFT and no validator
-/// set** — finality is purely burial depth.
+/// Historical Genesis-3 scaffold depth classification. This is not Genesis-4
+/// validator finality, an authenticated consensus verdict, or an inclusion proof.
 ///
 /// * `0` confirmations           → [`Finality::Mempool`]
 /// * `1..=99` confirmations      → [`Finality::Confirmed`]
@@ -92,11 +92,9 @@ impl Finality {
 
 /// The receipt for a submitted commitment: where and how deeply it is anchored.
 ///
-/// Note the honesty rail on the base chain itself: under the current
-/// **k=4 relaxed-PoW, low-hashrate regime the chain is trivially forgeable and
-/// 51%-attackable** (roadmap "Read this first"). Confirmations here are a
-/// *depth signal*, not a security guarantee, until the protocol track closes
-/// k=8 + audit + a proven multi-node network.
+/// Confirmation depth is an assertion reported by the configured RPC, not a
+/// verified chain-security or finality guarantee. This scaffold does not
+/// authenticate headers, selected-chain membership or Genesis-4 finality.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Anchor {
     /// The transaction that carries the commitment.
@@ -123,7 +121,7 @@ impl Anchor {
 ///
 /// This is an **inclusion *reference*, not a full SPV/Merkle proof.** Today's
 /// RPC surface (roadmap §1.2) lets you retrieve the transaction and confirm its
-/// block + depth; it does not expose a Merkle branch. So this proves:
+/// block + depth; it does not expose a Merkle branch. This records RPC claims:
 ///
 /// 1. a transaction with this `txid` exists and is mined at `height`,
 /// 2. its outputs decode — via the documented convention — to *this* commitment,

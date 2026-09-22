@@ -525,22 +525,24 @@ merge blocker for DEV-1, and A4 audits for it explicitly.
 One hash function, many uses; every use gets a tag. Tags are ASCII, fixed
 length 16, right-padded with `0x00` (so no tag can be a prefix of another).
 The table below is the **complete** registry as shipped
-(`crates/bloch-pos-committee/src/params.rs`); an earlier revision listed only
-the first eight and an independent implementer would have derived incompatible
-digests for every message in the missing six domains. Each `\0` below is one
+(`crates/bloch-pos-committee/src/params.rs`, `DOMAIN_TAGS`); an earlier revision
+listed only the first eight and later omitted `DS_SPEND2`. An independent
+implementer would derive incompatible digests in a missing domain. Each `\0` below is one
 zero byte; every tag is exactly 16 bytes.
 
 | Constant | Tag (16 bytes) | Use |
 |---|---|---|
 | `DS_BLOCK` | `BLCH4:BLOCK\0\0\0\0\0` | Block identity (§5.4) |
-| `DS_BODY` | `BLCH4:BODY\0\0\0\0\0\0` | Transaction Merkle tree (`body_root`) |
-| `DS_STATE` | `BLCH4:STATE\0\0\0\0\0` | State SMT nodes (`state_root`; see marker bytes below) |
+| `DS_BODY` | `BLCH4:BODY\0\0\0\0\0\0` | Transaction and attestation Merkle trees; marker then kind byte separates shapes |
+| `DS_STATE` | `BLCH4:STATE\0\0\0\0\0` | State SMT leaf/node/empty/key/value shapes; see marker bytes below |
 | `DS_ATTEST` | `BLCH4:ATTEST\0\0\0\0` | Attestation signing root |
-| `DS_RANDAO` | `BLCH4:RANDAO\0\0\0\0` | Beacon mixing (§6.3) |
-| `DS_SORTITION` | `BLCH4:SORTIT\0\0\0\0` | Sortition draw |
-| `DS_DEPOSIT` | `BLCH4:DEPOSIT\0\0\0` | Deposit proof-of-possession signing root (§7.1) |
-| `DS_SLASH` | `BLCH4:SLASH\0\0\0\0\0` | Slashing-evidence signing roots (§7.3) |
+| `DS_RANDAO` | `BLCH4:RANDAO\0\0\0\0` | 80-byte beacon mixing and 60-byte recommitment preimages (§6.3) |
+| `DS_SORTITION` | `BLCH4:SORTIT\0\0\0\0` | Weighted draw roles `0x01`/`0x02` and epoch-partition role `0x03` |
+| `DS_DEPOSIT` | `BLCH4:DEPOSIT\0\0\0` | Frozen legacy fixed-width and funded length-prefixed PoP roots (§7.1) |
+| `DS_SLASH` | `BLCH4:SLASH\0\0\0\0\0` | Evidence identity over nested `DS_ATTEST` or `DS_PROPOSE` roots (§7.3) |
 | `DS_SPEND` | `BLCH4:SPEND\0\0\0\0\0` | eUTXO spend-authorisation signing root (witness-free) |
+| `DS_SPEND2` | `BLCH4:SPEND2\0\0\0\0` | Network-bound eUTXO spend-authorisation root behind its inert flag day |
+| `DS_NETSIG2` | `BLCH4:NETSIG2\0\0\0` | Candidate outer fold for genesis-bound attestation/proposal roots; activation remains inert |
 | `DS_TXID` | `BLCH4:TXID\0\0\0\0\0\0` | Transaction identity: `txid = SHA3-256(DS_TXID ‖ spend signing root)` |
 | `DS_PROPOSE` | `BLCH4:PROPOSE\0\0\0` | Proposer signature over the header — deliberately **not** the block-id domain |
 | `DS_EXIT` | `BLCH4:EXIT\0\0\0\0\0\0` | Voluntary-exit signing root (§7.2) |
@@ -571,7 +573,7 @@ state component, mixed into key derivation so entries from different
 components can never occupy the same leaf even when their natural keys
 coincide. The registry is **append-only** (reusing or renumbering a tag
 silently re-keys every leaf of the component it named) and is, as shipped,
-exactly these 22:
+exactly these 30:
 
 | Tag | Component |
 |---:|---|
@@ -597,6 +599,31 @@ exactly these 22:
 | `0x14` | `TAG_ISSUED_SUPPLY` — cumulative issued supply (hard-cap counter, singleton) |
 | `0x15` | `TAG_BASE_FEE` — L1 fee-market price leaf (singleton) |
 | `0x16` | `TAG_DELEGATOR_FEE_REWARD` — delegator fee-reward ledger |
+| `0x17` | `TAG_VALIDATOR_FEE_REWARD` — validator fee-reward ledger |
+| `0x18` | `TAG_DELEGATOR_ISSUANCE_REWARD` — delegator issuance-reward ledger |
+| `0x19` | `TAG_PROPOSED_CURRENT` — current-epoch proposal participation |
+| `0x1A` | `TAG_FC_RECENT_VOTE` — retained fork-choice equivocation-window votes |
+| `0x1B` | `TAG_WRITTEN_OFF` — ADR-041 cumulative written-off supply |
+| `0x1C` | `TAG_STAKE_LOW_WATER` — ADR-041 validator stake low-water marks |
+| `0x1D` | `TAG_RANDAO_GENERATION` — ADR-041 validator RANDAO generations |
+| `0x1E` | `TAG_FUNDED_VALIDATOR` — ADR-041 funded-validator membership |
+
+The ADR-041 encodings above document the existing implementation; they do not
+change activation gates. `0x1B` uses an empty entry key and a little-endian
+`u128` value, omitted when zero. `0x1C` uses a little-endian `u32` validator
+index as its entry key and a little-endian `u128` floor value; a recorded zero
+floor is present and differs from absence. `0x1D` uses the same validator-key
+encoding and a little-endian `u32` generation, omitted when zero. `0x1E` uses
+the validator-key encoding and the one-byte value `0x01` for each member.
+These are state component tags, a separate namespace from transaction kinds.
+Entries with distinct keys are iteration-order independent; conflicting duplicate
+keys are not an alternative canonical representation of the same state.
+
+The state-root implementation has a bounded thread-local singleton-subtree
+memo with interior mutability. It caches a pure hash indexed by the complete
+(key, value hash, depth) tuple. Cache hits, misses and generation rotation affect
+performance only; no authoritative consensus state is read from this memo.
+
 
 Fixed-length digests use SHA3-256. Variable-length or multi-output derivation
 uses SHAKE-256. SHA-256d survives **only** in the historical verification path

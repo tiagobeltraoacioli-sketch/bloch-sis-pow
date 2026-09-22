@@ -1,0 +1,25 @@
+Validation wave 14 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Implementation commit: bbf4cc5
+
+PASS
+
+cargo test -p bloch-pos-committee single_derivation_path
+  1 passed; all 29 nested/top-level source files scanned and exactly one
+  BlockId construction site found.
+
+cargo test -p bloch-pos-committee derivation_scan_covers_nested_sources_and_spacing_variants
+  1 passed; nested funded/lifecycle modules covered and whitespace evasions
+  normalized into the tripwire patterns.
+
+cargo test -p bloch-pos-committee
+  618 passed; 0 failed; 6 ignored across unit, integration and doc tests.
+
+git diff --check
+  Passed before the implementation commit and before this evidence checkpoint.
+
+NO CONSENSUS CHANGE
+
+The production identity type, encoding, domain separator and digest are
+unchanged. This wave only strengthens a test that rejects future alternate
+derivation paths.

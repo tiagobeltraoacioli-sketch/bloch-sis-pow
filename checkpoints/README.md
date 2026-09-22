@@ -112,11 +112,13 @@ bloch-pos ws-envelope --checkpoint wscheckpoint-<epoch>.bin \
 
 bloch-pos ws-verify --envelope checkpoints/wscheckpoint-<epoch>.envelope.bin \
   --signer-set checkpoints/signer-set-1.bin \
-  --genesis genesis/mainnet.manifest
+  --genesis genesis/mainnet.manifest --rpc <a node you run> --require-fresh
 ```
 
 `ws-verify` enforces every §2.2 rule, including that no quorum of purely
-internal keys verifies. Publish the envelope, the signer-set file, and the
+internal keys verifies, and this release-gate form refuses an expired artifact
+or a missing clock instead of printing a cryptographic-only acceptance.
+Publish the envelope, the signer-set file, and the
 64-hex `ws_digest` on every channel (site, release pages, explorer,
 announcement channel) — the digest fits in a chat message, which is the
 out-of-band property the whole mechanism needs.

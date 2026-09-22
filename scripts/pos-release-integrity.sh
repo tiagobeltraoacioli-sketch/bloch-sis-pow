@@ -19,11 +19,10 @@
 #      crates — the root Cargo.lock — resolves with --locked and does not drift
 #      during the build, and no member carries a dead lockfile beside it.
 #   2. The build is deterministic where determinism is promised: two clean
-#      builds of bloch-pos from the same source path, same toolchain, same
-#      stamp produce bit-identical binaries. (Path-INdependence is measured
-#      and known-false on stable cargo — -Cmetadata hashes the absolute
-#      manifest path — which is why releases build at the canonical /build
-#      path in a container; see deploy/RELEASE-INTEGRITY.md §3.)
+#      builds of bloch-pos from the same source path into independent fresh
+#      target dirs, with the same toolchain and stamp, produce bit-identical
+#      binaries. Source-path independence is known-false on stable Cargo,
+#      which is why releases build at canonical /build; see the runbook §3.
 #   3. The stamp is live: `bloch-pos --version` reports the exact commit the
 #      CI is building. A binary that cannot say what it is cannot be compared
 #      against a fleet, which is how the G3 divergence stayed invisible.
@@ -50,7 +49,7 @@ fail() { echo "pos-release-integrity: FAIL — $*" >&2; exit 1; }
 # before a minute of building — and section 3, which is the real point: the
 # build must not have touched it.
 assert_root_lock_undrifted() { # $1 = what a difference would mean
-  git diff --exit-code -- "$REPO_ROOT/Cargo.lock" >/dev/null \
+  git diff --exit-code HEAD -- "$REPO_ROOT/Cargo.lock" >/dev/null \
     || fail "the committed root Cargo.lock differs from the working tree: $1"
 }
 
@@ -62,6 +61,23 @@ case "${1:-}" in
   "")           : ;;
   *)            fail "unknown argument '$1' (only --locks-only is accepted)." ;;
 esac
+
+if [ "$LOCKS_ONLY" = 0 ]; then
+# A same-path comparison can pass twice with the same injected compiler flags
+# or wrapper. Refuse environment overrides before calling that result the
+# default release profile. Values are deliberately never printed.
+while IFS= read -r variable; do
+  case "$variable" in
+    RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|RUSTC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|\
+    CARGO_BUILD_RUSTFLAGS|CARGO_BUILD_RUSTC|CARGO_BUILD_RUSTC_WRAPPER|\
+    CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_TARGET|\
+    CARGO_PROFILE_*|CARGO_TARGET_*_RUSTFLAGS|CARGO_TARGET_*_LINKER)
+      [ -z "${!variable}" ] || fail "unset build override $variable before the release check"
+      ;;
+  esac
+done < <(compgen -e)
+
+fi
 
 # ── 1. Lockfile honesty ──────────────────────────────────────────────────────
 # THIS SECTION USED TO AIM AT FILES CARGO NEVER OPENS. It resolved --locked
@@ -94,9 +110,8 @@ esac
 LOCK_META="$(mktemp "${TMPDIR:-/tmp}/pos-lock-meta.XXXXXX")"
 trap 'rm -f "$LOCK_META"' EXIT
 ( cd "$NODE_DIR" && cargo metadata --format-version 1 --locked ) > "$LOCK_META" \
-  || fail "the root Cargo.lock is stale — it does not resolve with --locked. \
-Commit the lockfile change deliberately (cargo update -p <crate>), never as a \
-build side effect."
+  || fail "locked metadata resolution failed; inspect Cargo's error above for network, toolchain or lockfile causes. \
+Do not rewrite Cargo.lock to bypass a download or environment failure."
 
 LOCK_META_PATH="$LOCK_META" REPO_ROOT="$REPO_ROOT" python3 - <<'PY' \
   || fail "workspace/lockfile layout is not what this guard assumes (above)."
@@ -156,6 +171,14 @@ if [ "$LOCKS_ONLY" = 1 ]; then
   exit 0
 fi
 
+# A commit stamp cannot identify bytes read from tracked local edits. Keep
+# untracked CI output out of scope, but refuse both worktree and index changes
+# before selecting a toolchain or starting either release build.
+git diff --quiet -- \
+  || fail "tracked working tree differs from HEAD; commit or restore it before the release check"
+git diff --cached --quiet -- \
+  || fail "index differs from HEAD; commit or restore it before the release check"
+
 # ── 0. Preconditions ─────────────────────────────────────────────────────────
 [ -f "$NODE_DIR/rust-toolchain.toml" ] \
   || fail "crates/bloch-pos-node/rust-toolchain.toml is missing. The release \
@@ -170,22 +193,28 @@ echo "pinned toolchain: $PINNED"
 ACTIVE="$(cd "$NODE_DIR" && rustc --version)"
 echo "active toolchain in crate dir: $ACTIVE"
 case "$ACTIVE" in
-  *"$PINNED"*) : ;;
+  "rustc $PINNED "*) : ;;
   *) fail "active rustc ($ACTIVE) is not the pinned $PINNED. Install it: \
 rustup toolchain install $PINNED" ;;
 esac
 
+
 # ── 2. Deterministic double build ────────────────────────────────────────────
-# Same source path, two fresh target dirs. BLOCH_BUILD_COMMIT is passed
-# explicitly so the stamp is identical even on a dirty CI tree, and so this is
-# the same code path a container release build uses.
+# Same clean source path, two independent fresh target dirs. This catches any
+# regression in the narrow normalization of Cargo-injected profile-root loader
+# paths while retaining the same stamp and code path as the container build.
+# Cargo currently hard-links the top-level release binary to the hashed copy in
+# `release/deps/`, so the validation below first proves every link stays inside
+# one build tree, then copies the binary into a standalone file for hashing and
+# version checks.
 COMMIT="$(git rev-parse --short=12 HEAD)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pos-repro.XXXXXX")"
 trap 'rm -rf "$WORK" "$LOCK_META"' EXIT
 
 build() { # $1 = target dir
   ( cd "$NODE_DIR" && \
-    BLOCH_BUILD_COMMIT="$COMMIT" cargo build --release --locked \
+    BLOCH_BUILD_COMMIT="$COMMIT" BLOCH_BUILD_TREE_ASSERTION=clean \
+      cargo build --release --locked \
       --target-dir "$1" )
 }
 
@@ -193,28 +222,89 @@ echo "building bloch-pos twice at commit $COMMIT …"
 build "$WORK/t1"
 build "$WORK/t2"
 
+assert_release_binary_file() { # $1 = path, $2 = target dir, $3 = diagnostic context
+  [ -f "$1" ] && [ ! -L "$1" ] \
+    || fail "$3 is not a regular non-symlink file"
+  local total_link_count target_link_count
+  total_link_count="$(
+    python3 - <<'PY' "$1"
+import os, sys
+print(os.stat(sys.argv[1]).st_nlink)
+PY
+  )"
+  target_link_count="$(
+    find "$2" -samefile "$1" -exec printf x \; \
+      | wc -c | tr -d '[:space:]'
+  )"
+  [ "$target_link_count" = "$total_link_count" ] \
+    || fail "$3 must not have hard links outside its target directory"
+}
+materialize_release_binary_file() { # $1 = source path, $2 = target dir, $3 = copy path, $4 = diagnostic context
+  assert_release_binary_file "$1" "$2" "$4"
+  cp -p -- "$1" "$3" \
+    || fail "could not materialize standalone copy for $4"
+  [ -f "$3" ] && [ ! -L "$3" ] \
+    || fail "standalone copy for $4 is not a regular non-symlink file"
+  local unexpected_link_count
+  unexpected_link_count="$(
+    find "$3" ! -links 1 -exec printf x \; \
+      | wc -c | tr -d '[:space:]'
+  )"
+  [ "$unexpected_link_count" = 0 ] \
+    || fail "standalone copy for $4 must have exactly one hard link"
+}
+BIN1="$WORK/bloch-pos.1"
+BIN2="$WORK/bloch-pos.2"
+materialize_release_binary_file "$WORK/t1/release/bloch-pos" "$WORK/t1" "$BIN1" \
+  'release build 1 output'
+materialize_release_binary_file "$WORK/t2/release/bloch-pos" "$WORK/t2" "$BIN2" \
+  'release build 2 output'
+
 sha() { # portable sha256 of $1
   if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}';
   else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
-H1="$(sha "$WORK/t1/release/bloch-pos")"
-H2="$(sha "$WORK/t2/release/bloch-pos")"
+validated_sha256_file() { # $1 = file, $2 = diagnostic context
+  local digest
+  digest="$(sha "$1")" || fail "SHA-256 tool failed for $2"
+  case "$digest" in
+    ''|*[!0123456789abcdef]*)
+      fail "SHA-256 tool returned a non-lowercase hexadecimal digest for $2" ;;
+  esac
+  [ "${#digest}" -eq 64 ] \
+    || fail "SHA-256 tool returned a digest that is not exactly 64 characters for $2"
+  printf '%s\n' "$digest"
+}
+H1="$(validated_sha256_file "$BIN1" 'release build 1')"
+H2="$(validated_sha256_file "$BIN2" 'release build 2')"
 echo "build 1 sha256: $H1"
 echo "build 2 sha256: $H2"
 [ "$H1" = "$H2" ] || fail "two clean builds of the same commit differ. The \
 build is non-deterministic — find the input that changed (toolchain, \
 lockfile, RUSTFLAGS, env leaking into build.rs) BEFORE cutting any release. \
 Compare with: diff <(nm t1/release/bloch-pos) <(nm t2/release/bloch-pos)"
-echo "determinism: ok (bit-identical, same path)"
+echo "determinism: ok (bit-identical, same source path and independent target dirs)"
 
 # ── 3. Stamp is live and truthful ────────────────────────────────────────────
-VOUT="$("$WORK/t1/release/bloch-pos" --version)"
-echo "--version: $VOUT"
-case "$VOUT" in
-  *"$COMMIT"*) : ;;
-  *) fail "--version does not contain the built commit $COMMIT. The build.rs \
-stamp is broken or bypassed; a fleet running this binary is unidentifiable." ;;
+VERSION_FILE="$WORK/binary-version"
+"$BIN1" --version > "$VERSION_FILE" \
+  || fail "release binary --version failed"
+[ "$(wc -l < "$VERSION_FILE" | tr -d '[:space:]')" = 2 ] \
+  || fail "binary version output must contain exactly two newline-terminated lines"
+BINARY_VERSION="$(sed -n '1p' "$VERSION_FILE")"
+SOURCE_IDENTITY="$(sed -n '2p' "$VERSION_FILE")"
+cmp -s <(printf '%s\n%s\n' "$BINARY_VERSION" "$SOURCE_IDENTITY") "$VERSION_FILE" \
+  || fail "binary version output must contain exactly two canonical text lines"
+case "$BINARY_VERSION" in
+  *"($COMMIT)"*) : ;;
+  *) fail "binary version line does not contain ($COMMIT). The build.rs stamp \
+is broken or bypassed; a fleet running this binary is unidentifiable." ;;
 esac
+LC_ALL=C grep -Eq \
+  '^source-digest sha3-256:[0-9a-f]{64} \([0-9]+ files, [0-9]+ bytes\) commit-source:asserted tree:asserted-clean$' \
+  <<< "$SOURCE_IDENTITY" \
+  || fail "binary source identity line is not the exact asserted clean-source format"
+printf '%s\n' "--version: $BINARY_VERSION" "source identity: $SOURCE_IDENTITY"
 
 # The lockfile must not have been rewritten by the builds above. Section 1
 # proved it was clean going in, so a difference here is the build's doing.
@@ -222,7 +312,7 @@ assert_root_lock_undrifted "a build rewrote it. Find what resolved differently \
 before cutting any release."
 
 echo
-echo "pos-release-integrity: PASS — locked, deterministic (same-path),"
+echo "pos-release-integrity: PASS — locked, deterministic (independent target dirs),"
 echo "commit-stamped. Reference hashes for THIS runner's platform:"
 echo "  bloch-pos @ $COMMIT : $H1"
 echo "NOTE: this hash is platform- and path-scoped. The publishable reference"

@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! The **anchoring convention** — how a 32-byte commitment is embedded in a
-//! Bloch transaction using ONLY today's primitives.
+//! historical Genesis-3-shaped reference transaction.
 //!
 //! ## Why a convention at all?
 //!
-//! Bloch today has **no data-carrier / `OP_RETURN` output and no script system**
+//! The historical model here has **no data-carrier / `OP_RETURN` output or script system**
 //! (roadmap §1.6). The single output form is a **fixed 20-byte P2PKH**
 //! `script_pubkey = SHA3-256(pubkey)[..20]` (roadmap §1.3). There is no opcode
 //! to say "these bytes are data, not a spend."
 //!
-//! So this reference embeds the commitment the only way today's model allows:
+//! So this reference embeds the commitment a way this historical model allows:
 //! it writes the commitment bytes **into the 20-byte `script_pubkey` fields of a
-//! small number of provably-unspendable P2PKH outputs** (a "burn" anchor). A
+//! small number of P2PKH-shaped outputs with no known spending keys** (a "burn" anchor). A
 //! reader recovers the commitment by reading those outputs straight back off the
 //! chain — no script execution required.
 //!
@@ -29,8 +29,8 @@
 //! `commitment = carrier[0][4..20] ‖ carrier[1][0..16]`.
 //!
 //! Each carrier output is funded with a tiny `dust` value that is **economically
-//! burned** — no keypair is known for these hashes, so the coins are
-//! unspendable. That is the honest cost of the current model.
+//! treated as burned** — the builder knows no keys for these hashes. This is
+//! not a proof of unspendability, and the convention authenticates no signer.
 //!
 //! ## What a data-carrier GIP would fix
 //!
@@ -102,22 +102,24 @@ pub fn encode_default(commitment: &Commitment) -> [AnchorOutput; CARRIER_OUTPUTS
 /// `scripts` is the ordered list of every output `script_pubkey` in the tx.
 /// Returns [`AnchorError::NoAnchor`] if no valid v1 anchor is present.
 pub fn decode(scripts: &[Vec<u8>]) -> Result<(Commitment, Vec<Vec<u8>>)> {
+    let mut found = None;
     for (i, s0) in scripts.iter().enumerate() {
         if s0.len() != SCRIPT_PUBKEY_LEN || s0[..4] != ANCHOR_MAGIC {
             continue;
         }
         // The next output must be the second carrier.
         let s1 = match scripts.get(i + 1) {
-            Some(s) if s.len() == SCRIPT_PUBKEY_LEN => s,
+            Some(s) if s.len() == SCRIPT_PUBKEY_LEN && s[16..20] == [0; 4] => s,
             _ => continue,
         };
         let mut bytes = [0u8; COMMITMENT_LEN];
         bytes[0..16].copy_from_slice(&s0[4..20]);
         bytes[16..32].copy_from_slice(&s1[0..16]);
         let commitment = Commitment::from_bytes(bytes);
-        return Ok((commitment, vec![s0.clone(), s1.clone()]));
+        if found.is_some() { return Err(AnchorError::AmbiguousAnchor); }
+        found = Some((commitment, vec![s0.clone(), s1.clone()]));
     }
-    Err(AnchorError::NoAnchor)
+    found.ok_or(AnchorError::NoAnchor)
 }
 
 #[cfg(test)]
@@ -151,5 +153,21 @@ mod tests {
     fn decode_rejects_when_absent() {
         let scripts = vec![vec![1u8; SCRIPT_PUBKEY_LEN], vec![2u8; SCRIPT_PUBKEY_LEN]];
         assert!(matches!(decode(&scripts), Err(AnchorError::NoAnchor)));
+    }
+}
+
+#[cfg(test)]
+mod audit_ambiguity {
+    use super::*;
+    #[test]
+    fn rejects_noncanonical_padding_and_ambiguous_pairs() {
+        let encoded = encode_default(&Commitment::hash_payload(b"test"));
+        let pair: Vec<Vec<u8>> = encoded.iter().map(|out| out.script_pubkey.to_vec()).collect();
+        let mut bad_padding = pair.clone();
+        bad_padding[1][19] = 1;
+        assert!(matches!(decode(&bad_padding), Err(AnchorError::NoAnchor)));
+        let mut ambiguous = pair.clone();
+        ambiguous.extend(pair);
+        assert!(matches!(decode(&ambiguous), Err(AnchorError::AmbiguousAnchor)));
     }
 }

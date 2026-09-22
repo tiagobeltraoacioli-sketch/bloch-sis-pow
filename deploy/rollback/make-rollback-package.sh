@@ -52,12 +52,45 @@ if [ -z "$OUTDIR" ]; then OUTDIR="$(cd "$(dirname "$0")" && pwd)/dist"; fi
 
 [ -f "$BIN" ] || { echo "no such binary: $BIN" >&2; exit 1; }
 
-sha() {
+# Keep the caller-supplied identity narrow enough that it can be matched as a
+# complete token rather than as an arbitrary substring of --version output.
+# The hexadecimal range admits the abbreviated/full SHA-1 identities used
+# today and a future full SHA-256 object id without claiming which hash Git
+# uses for this release.
+case "$STAMP" in
+  *$'\n'*|*$'\r'*)
+    echo "FAIL: rollback stamp must be one canonical version-and-commit token." >&2
+    exit 1
+    ;;
+esac
+if ! printf '%s\n' "$STAMP" \
+    | LC_ALL=C grep -Eq '^[A-Za-z0-9][A-Za-z0-9._+-]* \([0-9a-f]{7,64}\)$'; then
+  echo "FAIL: rollback stamp must be one canonical version-and-commit token." >&2
+  exit 1
+fi
+
+sha256_file() {
   if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}';
   else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
-HASH="$(sha "$BIN")"
-
+validated_sha256_file() { # $1 = file, $2 = diagnostic context
+  local digest
+  digest="$(sha256_file "$1")" || {
+    echo "FAIL: SHA-256 tool failed for $2." >&2
+    return 1
+  }
+  case "$digest" in
+    ''|*[!0123456789abcdef]*)
+      echo "FAIL: SHA-256 tool returned a non-lowercase hexadecimal digest for $2." >&2
+      return 1
+      ;;
+  esac
+  if [ "${#digest}" -ne 64 ]; then
+    echo "FAIL: SHA-256 tool returned a digest that is not exactly 64 characters for $2." >&2
+    return 1
+  fi
+  printf '%s\n' "$digest"
+}
 # ── signing key, resolved BEFORE anything is assembled ───────────────────────
 # Fail closed and fail early: an unsigned rollback package must not exist even
 # transiently, because a tarball on disk is indistinguishable from a released
@@ -78,12 +111,34 @@ SECKEY="${BLOCH_ROLLBACK_SECKEY:-}"
 }
 [ -f "$SECKEY" ] || { echo "FAIL: no such minisign secret key: $SECKEY" >&2; exit 1; }
 
-# Short id for filenames: the parenthesised commit if present, else the hash.
-ID="$(printf '%s' "$STAMP" | sed -n 's/.*(\([0-9a-f]\{7,\}\)).*/\1/p')"
-ID="${ID:-${HASH:0:12}}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/bloch-pos-rollback.XXXXXX")"
-PKGDIR="$WORK/bloch-pos-rollback-$ID"
-mkdir -p "$PKGDIR" "$OUTDIR"
+PUBLICATION_COMPLETE=0
+FINAL_PUB=
+FINAL_TARBALL=
+TEMP_PUB=
+TEMP_TARBALL=
+cleanup() {
+  rc=$?
+  trap - EXIT HUP INT TERM
+  if [ "$PUBLICATION_COMPLETE" != 1 ]; then
+    if [ -n "$TEMP_TARBALL" ] && [ -n "$FINAL_TARBALL" ] \
+        && [ -e "$TEMP_TARBALL" ] && [ -e "$FINAL_TARBALL" ] \
+        && [ "$TEMP_TARBALL" -ef "$FINAL_TARBALL" ]; then
+      rm -f -- "$FINAL_TARBALL"
+    fi
+    if [ -n "$TEMP_PUB" ] && [ -n "$FINAL_PUB" ] \
+        && [ -e "$TEMP_PUB" ] && [ -e "$FINAL_PUB" ] \
+        && [ "$TEMP_PUB" -ef "$FINAL_PUB" ]; then
+      rm -f -- "$FINAL_PUB"
+    fi
+  fi
+  [ -z "$TEMP_TARBALL" ] || rm -f -- "$TEMP_TARBALL"
+  [ -z "$TEMP_PUB" ] || rm -f -- "$TEMP_PUB"
+  rm -rf -- "$WORK"
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
 PUBFILE="${BLOCH_ROLLBACK_PUBKEY:-}"
 if [ -z "$PUBFILE" ]; then
@@ -95,19 +150,57 @@ fi
 PUBLINE="$(grep -v '^untrusted comment:' "$PUBFILE" | tr -d '[:space:]')"
 [ -n "$PUBLINE" ] || { echo "FAIL: $PUBFILE holds no minisign public key line" >&2; exit 1; }
 
-# If the binary runs on this host, refuse a stamp that contradicts it — a
-# rollback package whose label lies is worse than none.
-if V="$("$BIN" --version 2>/dev/null)"; then
-  case "$V" in
-    *"$STAMP"*) : ;;
+# Copy the caller-controlled path exactly once into the private work directory.
+# Every identity and package byte below comes from this snapshot, never from a
+# path that can be swapped between hashing, version inspection and assembly.
+SNAPSHOT="$WORK/input-bloch-pos"
+cp "$BIN" "$SNAPSHOT"
+chmod 0755 "$SNAPSHOT"
+
+# If the private snapshot runs on this host, refuse a stamp that contradicts
+# the first version line. Require the complete validated token, bounded by
+# ASCII spaces, so a truncated identity, a larger token or a later decoy line
+# cannot satisfy the check. Compute the byte identity only after execution
+# because even an executable that rewrites itself during --version must leave
+# one consistently named byte set.
+if V="$("$SNAPSHOT" --version 2>/dev/null)"; then
+  VERSION_FIRST_LINE="${V%%$'\n'*}"
+  case " $VERSION_FIRST_LINE " in
+    *" $STAMP "*) : ;;
     *) echo "STAMP MISMATCH: --version says '$V', you said '$STAMP'." >&2; exit 1 ;;
   esac
 fi
+HASH="$(validated_sha256_file "$SNAPSHOT" 'the rollback binary')"
 
-cp "$BIN" "$PKGDIR/bloch-pos"
-chmod 0755 "$PKGDIR/bloch-pos"
+# Short id for filenames: the parenthesised commit if present, else the hash.
+ID="$(printf '%s' "$STAMP" | sed -n 's/.*(\([0-9a-f]\{7,\}\)).*/\1/p')"
+ID="${ID:-${HASH:0:12}}"
+PKGDIR="$WORK/bloch-pos-rollback-$ID"
+mkdir -p "$PKGDIR" "$OUTDIR"
+
+mv "$SNAPSHOT" "$PKGDIR/bloch-pos"
 
 printf 'stamp: %s\n' "$STAMP" > "$PKGDIR/STAMP"
+
+# Preserve the running service's effective argv without serialising it through
+# shell/systemd quoting. The installer snapshots /proc/PID/cmdline verbatim;
+# this signed launcher reads that NUL-delimited data into an array and execs it
+# without eval, discarding only the old executable name (argv[0]).
+cat > "$PKGDIR/rollback-launcher" <<'LAUNCHER'
+#!/bin/bash
+set -euo pipefail
+SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+ROLLBACK_ARGV=()
+while IFS= read -r -d '' arg; do
+  ROLLBACK_ARGV+=("$arg")
+done
+[ "${#ROLLBACK_ARGV[@]}" -ge 1 ] && [ -n "${ROLLBACK_ARGV[0]}" ] || {
+  echo "FAIL: rollback argv snapshot has no non-empty argv[0]." >&2
+  exit 1
+}
+exec "$SELF_DIR/bloch-pos" "${ROLLBACK_ARGV[@]:1}" </dev/null
+LAUNCHER
+chmod 0755 "$PKGDIR/rollback-launcher"
 
 # ── the drop-in ──────────────────────────────────────────────────────────────
 # 99- so it sorts LAST: systemd merges up to N drop-ins and for ExecStart the
@@ -118,11 +211,12 @@ cat > "$PKGDIR/99-rollback.conf" <<EOF
 # Installed by bloch-pos-rollback-$ID — REMOVE this file to leave rollback.
 [Service]
 ExecStart=
-ExecStart=/opt/bloch/releases/rollback-$ID/bloch-pos
+ExecStart=/opt/bloch/releases/rollback-$ID/rollback-launcher
+StandardInput=file:/opt/bloch/releases/rollback-$ID/argv.nul
 EOF
 
 # ── install.sh (runs ON the box, BY the operator, never by CI) ───────────────
-# The two constants are baked at assembly time. They are NOT a trust root —
+# The three constants are baked at assembly time. They are NOT a trust root —
 # they live inside the tarball like everything else. They exist so that a
 # package signed by the wrong key, or carrying a signature over some other
 # package, fails with a sentence an operator can act on at 03:00 instead of a
@@ -132,6 +226,8 @@ EOF
   printf '# Generated by make-rollback-package.sh for bloch-pos-rollback-%s.\n' "$ID"
   printf 'PACKAGE_SIGNING_PUBKEY=%s\n' "$PUBLINE"
   printf 'PACKAGE_BINARY_SHA256=%s\n' "$HASH"
+  # STAMP's validated alphabet excludes apostrophes and shell metacharacters.
+  printf "PACKAGE_STAMP='%s'\n" "$STAMP"
   cat <<'INSTALL'
 # Apply the bloch-pos rollback on THIS box. Run as root (or sudo).
 #   ./install.sh [service-name]        default service: bloch-pos.service
@@ -148,6 +244,11 @@ cd "$(dirname "$0")"
 VERIFY_ONLY=0
 if [ "${1:-}" = "--verify-only" ]; then VERIFY_ONLY=1; shift; fi
 SVC="${1:-bloch-pos.service}"
+if ! printf '%s\n' "$SVC" | LC_ALL=C grep -Eq '^[A-Za-z0-9_.@:-]+\.service$' \
+   || [ "${SVC#-}" != "$SVC" ]; then
+  echo "FAIL: invalid systemd service name: $SVC" >&2
+  exit 1
+fi
 ID="$(basename "$(pwd)" | sed 's/^bloch-pos-rollback-//')"
 DEST="/opt/bloch/releases/rollback-$ID"
 
@@ -197,34 +298,99 @@ echo "== verify package contents against the SIGNED manifest =="
 sha256sum -c SHA256SUMS
 echo "packaged stamp: $(cat STAMP)"
 
+verify_binary_identity() { # $1 = authenticated packaged/installed binary
+  local binary version_output version_first_line post_version_hash
+  binary="$1"
+  version_output="$("$binary" --version 2>/dev/null)" || {
+    echo "FAIL: rollback binary --version failed: $binary" >&2
+    return 1
+  }
+  version_first_line="${version_output%%$'\n'*}"
+  case " $version_first_line " in
+    *" $PACKAGE_STAMP "*) : ;;
+    *)
+      echo "FAIL: rollback binary first version line does not report the packaged stamp." >&2
+      echo "  version: $version_first_line" >&2
+      echo "  packaged stamp: $PACKAGE_STAMP" >&2
+      return 1
+      ;;
+  esac
+  post_version_hash="$(sha256sum "$binary" | awk '{print $1}')" || {
+    echo "FAIL: could not hash rollback binary after --version: $binary" >&2
+    return 1
+  }
+  if [ "$post_version_hash" != "$PACKAGE_BINARY_SHA256" ]; then
+    echo "FAIL: rollback binary changed while reporting its version." >&2
+    echo "  expected: $PACKAGE_BINARY_SHA256" >&2
+    echo "  observed: $post_version_hash" >&2
+    return 1
+  fi
+}
+
 if [ "$VERIFY_ONLY" = 1 ]; then
-  echo "PACKAGE VERIFIED (signature + manifest). Nothing was installed (--verify-only)."
+  verify_binary_identity ./bloch-pos
+  echo "PACKAGE VERIFIED (signature + manifest + runtime identity). Nothing was installed (--verify-only)."
   exit 0
 fi
 
-echo "== stage binary =="
+echo "== capture effective argv from the running service =="
+OLDPID="$(systemctl show -p ExecMainPID --value -- "$SVC" || true)"
+[ -n "${OLDPID:-}" ] && [ "$OLDPID" != "0" ] \
+  && [ -e "/proc/$OLDPID/exe" ] && [ -r "/proc/$OLDPID/cmdline" ] || {
+  echo "FAIL: $SVC is not running; effective argv cannot be recovered safely." >&2
+  echo "This installer will not guess the service arguments." >&2
+  exit 1
+}
+# /proc/PID/stat field 22 is the process start time. Remove the parenthesised
+# comm first (it may contain spaces), making it field 20 of the remaining text.
+OLD_STAT="$(cat "/proc/$OLDPID/stat")"
+OLD_START="$(printf '%s\n' "${OLD_STAT##*) }" | awk '{print $20}')"
+[ -n "$OLD_START" ] || { echo "FAIL: cannot identify $SVC main process." >&2; exit 1; }
+ARGV_TMP="$(mktemp "${TMPDIR:-/tmp}/bloch-rollback-argv.XXXXXX")"
+trap 'rm -f -- "${ARGV_TMP:-}"' EXIT
+trap 'exit 1' HUP INT TERM
+cp -- "/proc/$OLDPID/cmdline" "$ARGV_TMP"
+ARGV_COUNT=0
+ARGV0=
+while IFS= read -r -d '' arg; do
+  ARGV_COUNT=$((ARGV_COUNT + 1))
+  if [ "$ARGV_COUNT" -eq 1 ]; then ARGV0="$arg"; fi
+done < "$ARGV_TMP"
+[ "$ARGV_COUNT" -ge 1 ] && [ -n "$ARGV0" ] || {
+  echo "FAIL: /proc/$OLDPID/cmdline has no non-empty argv[0]." >&2
+  exit 1
+}
+CHECKPID="$(systemctl show -p ExecMainPID --value -- "$SVC" || true)"
+NEW_STAT="$(cat "/proc/$OLDPID/stat" 2>/dev/null || true)"
+NEW_START="$(printf '%s\n' "${NEW_STAT##*) }" | awk '{print $20}')"
+if [ "$CHECKPID" != "$OLDPID" ] || [ -z "$NEW_START" ] || [ "$NEW_START" != "$OLD_START" ]; then
+  echo "FAIL: $SVC restarted while its effective argv was being captured." >&2
+  exit 1
+fi
+echo "was: $(readlink "/proc/$OLDPID/exe")  sha256=$(sha256sum "/proc/$OLDPID/exe" | awk '{print $1}')  argc=$ARGV_COUNT"
+
+echo "== stage binary, launcher and captured argv =="
 mkdir -p "$DEST"
 install -m 0755 bloch-pos "$DEST/bloch-pos"
-"$DEST/bloch-pos" --version
-
-echo "== record what was running (for the incident log) =="
-OLDPID="$(systemctl show "$SVC" -p ExecMainPID --value || true)"
-if [ -n "${OLDPID:-}" ] && [ "$OLDPID" != "0" ] && [ -e "/proc/$OLDPID/exe" ]; then
-  echo "was: $(readlink "/proc/$OLDPID/exe")  sha256=$(sha256sum "/proc/$OLDPID/exe" | awk '{print $1}')"
-else
-  echo "was: $SVC not running"
-fi
+install -m 0755 rollback-launcher "$DEST/rollback-launcher"
+install -m 0600 "$ARGV_TMP" "$DEST/argv.nul"
+rm -f -- "$ARGV_TMP"
+trap - EXIT HUP INT TERM
+verify_binary_identity "$DEST/bloch-pos"
 
 echo "== install drop-in (wins over every stacked drop-in: sorts last) =="
 mkdir -p "/etc/systemd/system/$SVC.d"
 install -m 0644 99-rollback.conf "/etc/systemd/system/$SVC.d/99-rollback.conf"
 systemctl daemon-reload
-systemctl restart "$SVC"
+systemctl restart -- "$SVC"
 
 echo "== PROVE it (the authoritative check: /proc, never the unit file) =="
 sleep 2
-PID="$(systemctl show "$SVC" -p ExecMainPID --value)"
+PID="$(systemctl show -p ExecMainPID --value -- "$SVC")"
 [ -n "$PID" ] && [ "$PID" != "0" ] || { echo "FAIL: $SVC has no main PID after restart"; exit 1; }
+RUN_STAT="$(cat "/proc/$PID/stat" 2>/dev/null || true)"
+RUN_START="$(printf '%s\n' "${RUN_STAT##*) }" | awk '{print $20}')"
+[ -n "$RUN_START" ] || { echo "FAIL: cannot identify restarted $SVC process." >&2; exit 1; }
 RUN_HASH="$(sha256sum "/proc/$PID/exe" | awk '{print $1}')"
 # The bloch-pos row of the SIGNED manifest — not the whole file: it now covers
 # install.sh, the drop-in and the README too.
@@ -236,7 +402,42 @@ if [ "$RUN_HASH" != "$PKG_HASH" ]; then
   echo "  systemd-delta --type=extended | grep $SVC ; systemctl cat $SVC"
   exit 1
 fi
-echo "ROLLBACK APPLIED AND VERIFIED: $SVC runs the packaged binary."
+
+# Prove the launcher preserved every effective argument. Bash arrays retain
+# empty arguments, whitespace and metacharacters without eval or re-quoting;
+# argv cannot itself contain NUL. Ignore argv[0], which intentionally changed
+# from the old executable path to the rollback binary path. Never print the
+# argument values: command lines may contain operational secrets.
+RUN_ARGV_TMP="$(mktemp "${TMPDIR:-/tmp}/bloch-rollback-running-argv.XXXXXX")"
+trap 'rm -f -- "${RUN_ARGV_TMP:-}"' EXIT
+trap 'exit 1' HUP INT TERM
+cp -- "/proc/$PID/cmdline" "$RUN_ARGV_TMP"
+CHECKPID="$(systemctl show -p ExecMainPID --value -- "$SVC" || true)"
+CHECK_STAT="$(cat "/proc/$PID/stat" 2>/dev/null || true)"
+CHECK_START="$(printf '%s\n' "${CHECK_STAT##*) }" | awk '{print $20}')"
+if [ "$CHECKPID" != "$PID" ] || [ -z "$CHECK_START" ] || [ "$CHECK_START" != "$RUN_START" ]; then
+  echo "FAIL: $SVC restarted while its post-rollback argv was being verified." >&2
+  exit 1
+fi
+EXPECTED_ARGV=()
+while IFS= read -r -d '' arg; do EXPECTED_ARGV+=("$arg"); done < "$DEST/argv.nul"
+RUNNING_ARGV=()
+while IFS= read -r -d '' arg; do RUNNING_ARGV+=("$arg"); done < "$RUN_ARGV_TMP"
+rm -f -- "$RUN_ARGV_TMP"
+trap - EXIT HUP INT TERM
+if [ "${#EXPECTED_ARGV[@]}" -ne "${#RUNNING_ARGV[@]}" ]; then
+  echo "FAIL: restarted $SVC argument count differs from the captured command." >&2
+  exit 1
+fi
+ARG_INDEX=1
+while [ "$ARG_INDEX" -lt "${#EXPECTED_ARGV[@]}" ]; do
+  if [ "${EXPECTED_ARGV[$ARG_INDEX]}" != "${RUNNING_ARGV[$ARG_INDEX]}" ]; then
+    echo "FAIL: restarted $SVC argument $ARG_INDEX differs from the captured command." >&2
+    exit 1
+  fi
+  ARG_INDEX=$((ARG_INDEX + 1))
+done
+echo "ROLLBACK APPLIED AND VERIFIED: $SVC runs the packaged binary with the captured argv."
 echo "To leave rollback later: rm /etc/systemd/system/$SVC.d/99-rollback.conf && systemctl daemon-reload && systemctl restart $SVC"
 INSTALL
 } > "$PKGDIR/install.sh"
@@ -264,6 +465,11 @@ Apply on a box:   sudo ./install.sh [service-name]     (default bloch-pos.servic
 Leave rollback:   rm /etc/systemd/system/<svc>.d/99-rollback.conf
                   systemctl daemon-reload && systemctl restart <svc>
 
+The service must be running when install.sh is applied. The installer snapshots
+its effective NUL-delimited argv from /proc/<main-pid>/cmdline and the signed
+launcher passes those arguments to the rollback binary without shell parsing.
+It refuses to guess arguments for an inactive service.
+
 This package must have been TESTED on a scratch host before it counts for
 gate G8 — the procedure is deploy/RELEASE-INTEGRITY.md §5.3. Applying it to
 the live fleet is an operator decision, never automation.
@@ -271,8 +477,9 @@ EOF
 
 # ── the manifest: every file that reaches root, not just the binary ──────────
 : > "$PKGDIR/SHA256SUMS"
-for f in bloch-pos STAMP 99-rollback.conf install.sh README; do
-  printf '%s  %s\n' "$(sha "$PKGDIR/$f")" "$f" >> "$PKGDIR/SHA256SUMS"
+for f in bloch-pos STAMP rollback-launcher 99-rollback.conf install.sh README; do
+  file_hash="$(validated_sha256_file "$PKGDIR/$f" "rollback manifest entry $f")"
+  printf '%s  %s\n' "$file_hash" "$f" >> "$PKGDIR/SHA256SUMS"
 done
 
 # ── the detached signature (audit I-H3) ─────────────────────────────────────
@@ -288,25 +495,50 @@ minisign -V -q -p "$PUBFILE" -x "$PKGDIR/SHA256SUMS.minisig" -m "$PKGDIR/SHA256S
   exit 1
 }
 
-TARBALL="$OUTDIR/bloch-pos-rollback-$ID.tar.gz"
+PRIVATE_TARBALL="$WORK/bloch-pos-rollback-$ID.tar.gz"
 # Deterministic-ish tar: sorted names, fixed owner. (GNU tar options guarded
 # for bsdtar on macOS; the tarball hash is recorded either way.)
 if tar --version 2>/dev/null | grep -q GNU; then
   tar --sort=name --owner=0 --group=0 --numeric-owner \
-      -C "$(dirname "$PKGDIR")" -czf "$TARBALL" "$(basename "$PKGDIR")"
+      -C "$(dirname "$PKGDIR")" -czf "$PRIVATE_TARBALL" "$(basename "$PKGDIR")"
 else
   ( cd "$(dirname "$PKGDIR")" && find "$(basename "$PKGDIR")" | sort \
-    | tar -czf "$TARBALL" -T - )
+    | tar -czf "$PRIVATE_TARBALL" -T - )
 fi
+package_hash="$(validated_sha256_file "$PRIVATE_TARBALL" 'the rollback tarball')"
 
 # The public key is published BESIDE the tarball, never inside it: a key that
-# travels with the bytes it authenticates authenticates nothing.
-cp "$PUBFILE" "$OUTDIR/bloch-pos-rollback-$ID.pub"
+# travels with the bytes it authenticates authenticates nothing. Refuse to
+# overwrite either final name. Copy both validated inputs to exclusive
+# temporary names on the output filesystem, then hard-link the public key
+# first and the tarball last. `ln` creates each final name atomically without
+# overwrite. The tarball is the completion artifact. On failure, the EXIT trap
+# removes a final name only when `-ef` proves it still aliases this invocation's
+# temporary inode.
+FINAL_TARBALL="$OUTDIR/bloch-pos-rollback-$ID.tar.gz"
+FINAL_PUB="$OUTDIR/bloch-pos-rollback-$ID.pub"
+for destination in "$FINAL_TARBALL" "$FINAL_PUB"; do
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    echo "FAIL: refusing to overwrite existing rollback publication: $destination" >&2
+    exit 1
+  fi
+done
+TEMP_PUB="$(mktemp "$OUTDIR/.bloch-pos-rollback-$ID.pub.XXXXXX")"
+TEMP_TARBALL="$(mktemp "$OUTDIR/.bloch-pos-rollback-$ID.tar.gz.XXXXXX")"
+cp -p "$PUBFILE" "$TEMP_PUB"
+cp -p "$PRIVATE_TARBALL" "$TEMP_TARBALL"
 
-echo "rollback package: $TARBALL"
-echo "sha256(package):  $(sha "$TARBALL")"
+ln "$TEMP_PUB" "$FINAL_PUB"
+ln "$TEMP_TARBALL" "$FINAL_TARBALL"
+PUBLICATION_COMPLETE=1
+rm -f -- "$TEMP_PUB" "$TEMP_TARBALL"
+TEMP_PUB=
+TEMP_TARBALL=
+
+echo "rollback package: $FINAL_TARBALL"
+echo "sha256(package):  $package_hash"
 echo "signing pubkey:   $PUBLINE"
-echo "                  (also written to $OUTDIR/bloch-pos-rollback-$ID.pub)"
+echo "                  (also written to $FINAL_PUB)"
 echo
 echo "Next (G8): test it on a SCRATCH host per deploy/RELEASE-INTEGRITY.md §5.3,"
 echo "then stage it in the release store alongside the release it protects."

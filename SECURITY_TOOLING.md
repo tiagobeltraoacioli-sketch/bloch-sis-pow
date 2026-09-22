@@ -1,3 +1,13 @@
+> **Candidate schedule update — 2026-09-13.** The operator selected Monday,
+> 2026-09-14: leak recovery at epoch 2880 (21:31:19 UTC), followed by
+> lifecycle epoch 2884 (22:35:19 UTC). Earlier statements below about an
+> unarmed slashing gate or unreachable penalties describe the historical
+> pre-release configuration. Evidence is refused before epoch 2884; at and
+> after it, valid evidence can apply the configured penalties. This candidate
+> schedule does not establish fleet deployment, cross-node agreement or a
+> settlement guarantee. See `docs/VALIDATOR-OPENING.md` and the September 13
+> activation preflight for the release conditions and retained evidence.
+
 # Security Tooling — Bloch Protocol
 
 > **Genesis-3-era document — sealed 2026-08-12, scope table corrected
@@ -90,6 +100,13 @@ No Solidity is deployed yet (the L2 is a Rust revm scaffold). The Solidity toolc
 > **Green again 2026-09-05 (finding SC1-advisories).** Measured 2026-09-04, `cargo audit --deny warnings` failed on four advisories: **RUSTSEC-2026-0220** (ruint), **RUSTSEC-2026-0221** (event-listener), **RUSTSEC-2026-0253** (lru), **RUSTSEC-2026-0258** (h2). Three were closed by in-semver `Cargo.lock` bumps, not ignore entries: **h2 0.4.13 → 0.4.19** (fix ≥ 0.4.16), **ruint 1.19.0 → 1.20.0**, **event-listener 5.4.1 → 5.4.2**; the **yanked chacha20 0.10.1** was re-pinned to **0.10.2** in the same pass. The lru advisory is the one residual whose fix (lru ≥ 0.18.2) is **unreachable** — `sp1-prover 4.2.1` pins `lru ^0.12.4` — so it carries a **named, dated, expiring exception**: `RUSTSEC-2026-0253` in `audit.toml`/`.cargo/audit.toml` + `deny.toml` (host-side proving only; the UB needs a panicking `Drop`/`Hash` impl inside the cache), and a `[[IgnoredVulns]]` entry in `osv-scanner.toml` with `ignoreUntil = 2026-12-01`, after which the blocking osv-scanner job goes red again. **REMOVE all four mirror entries the moment SP1 repins lru ≥ 0.18.2.**
 
 > **Scanner posture, corrected 2026-09-04 (finding I-H4).** Until this date the two scanners that back that claim on the GHSA side could not make it. `osv-scanner` and `secret-scan` were `allow_failure: true` in `.gitlab-ci.yml` / `continue-on-error: true` in `.github/workflows/security.yml`, **and** each opened with `if ! command -v <tool>; then echo skipping; exit 0; fi` — so on a runner without the tool the job went green having scanned nothing, and the log line that said so was informational prose, not a warning. osv-scanner is the only tool here that reads the OSV.dev DB, so the GHSA-only residuals below — yamux included — had no gate at all. Both jobs are now BLOCKING, install a pinned binary via `scripts/ci-install-scanner.sh` (which exits non-zero rather than skipping), and the residuals are explicit and expiring in `osv-scanner.toml`. `scripts/check-scanners-blocking.py` (with a selftest that proves it can still fail) holds both pipelines to that posture.
+
+Secret scanning now has separate blocking tracked-tree and full-depth reachable-
+history jobs on both CI providers. Exact redacted baselines contain individually
+reviewed noncredentials; a finding reintroduced in a new commit remains new.
+See [current scope and triage](docs/audit/internal-remediation-2026-09-17/HISTORY-SCAN.md).
+This does not certify unreachable history, credential rotation or hosted job execution.
+
 
 1. **Unmaintained-notice** (no runtime vuln): the vendored `pqcrypto-*` PQ crates (PQClean archived — frozen under Cargo.lock by design), and SP1/zk host-side toolchain crates (backoff, ansi_term, instant, derivative, lru, …) that never touch the consensus/P2P runtime.
 
