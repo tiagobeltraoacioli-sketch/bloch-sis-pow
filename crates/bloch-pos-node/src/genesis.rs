@@ -1858,6 +1858,7 @@ mod tests {
     /// participate; fixing only the verifier produces a validator everyone can
     /// verify and that cannot start.
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_refuses_a_deposit_added_validator() {
         use crate::engine::{check_keystore_identity, KeystoreIdentity};
         let m = sample(); // three genesis validators: indices 0, 1, 2
@@ -1872,6 +1873,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_admits_a_genesis_validator() {
         use crate::engine::{check_keystore_identity, KeystoreIdentity};
         let m = sample();
@@ -1885,6 +1887,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_rejects_a_wrong_key_at_a_real_index() {
         use crate::engine::{check_keystore_identity, KeystoreIdentity};
         let m = sample();
@@ -1903,6 +1906,7 @@ mod tests {
     /// old expression would have indexed position 9 of a 3-element vector and
     /// panicked. The extracted version uses the record it already found.
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_does_not_index_the_manifest_by_position() {
         use crate::engine::{check_keystore_identity, KeystoreIdentity};
         let mut m = sample();
@@ -1927,6 +1931,7 @@ mod tests {
     /// A manifest validator whose committed RANDAO commitment really is the
     /// head of the chain `seed` generates — so `RandaoMismatch` in these tests
     /// means what it says, rather than being an artifact of a filler fixture.
+    #[cfg(not(bloch_indexer))]
     fn validator_with_seed(index: u32, key_seed: u8, randao_seed: [u8; 32]) -> ManifestValidator {
         ManifestValidator {
             index,
@@ -1941,6 +1946,7 @@ mod tests {
 
     /// A registry that has taken a deposit: genesis indices 0..3, plus one
     /// newcomer at the index a deposit would allocate next.
+    #[cfg(not(bloch_indexer))]
     fn registry_with_newcomer(seed: [u8; 32]) -> bloch_pos_committee::transition::CommittedState {
         let mut m = sample();
         m.validators.push(validator_with_seed(3, 0x7E, seed));
@@ -1949,6 +1955,7 @@ mod tests {
 
     /// The point of the whole exercise: the newcomer's own node boots.
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_registry_admits_a_deposit_added_validator() {
         use crate::engine::{check_registry_identity, RegistryIdentity};
         let seed = [0x7Eu8; 32];
@@ -1963,6 +1970,7 @@ mod tests {
     /// keystore and its deposit being applied, and the old gate turned it into
     /// a refusal to boot.
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_registry_pends_an_unregistered_validator() {
         use crate::engine::{check_registry_identity, RegistryIdentity};
         let m = sample();
@@ -1978,6 +1986,7 @@ mod tests {
     /// minted for an index before depositing can be beaten to it. Booting
     /// there would sign under another validator's identity.
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_registry_refuses_an_index_owned_by_another_key() {
         use crate::engine::{check_registry_identity, RegistryIdentity};
         let seed = [0x7Eu8; 32];
@@ -1996,6 +2005,7 @@ mod tests {
     /// Right key, unusable RANDAO chain: every block this node proposed would
     /// carry a reveal the network refuses, so it must not start.
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_registry_refuses_a_seed_that_does_not_open_the_commitment() {
         use crate::engine::{check_registry_identity, RegistryIdentity};
         assert_eq!(
@@ -2014,6 +2024,7 @@ mod tests {
     /// validator the registry gate admits. Shipping only the pre-pass verdict
     /// is what closed the network.
     #[test]
+    #[cfg(not(bloch_indexer))]
     fn gate3_the_manifest_prepass_and_the_registry_gate_disagree_by_design() {
         use crate::engine::{
             check_keystore_identity, check_registry_identity, KeystoreIdentity, RegistryIdentity,

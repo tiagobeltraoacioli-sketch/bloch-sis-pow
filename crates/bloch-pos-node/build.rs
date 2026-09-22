@@ -499,6 +499,11 @@ fn build_environment_digest(
 }
 
 fn main() {
+    // `genesis.rs` is also compiled verbatim by the standalone indexer.  That
+    // consumer defines this cfg so node-only tests in the shared source do not
+    // try to import its intentionally absent `engine` module.
+    println!("cargo:rustc-check-cfg=cfg(bloch_indexer)");
+
     let pkg = env!("CARGO_PKG_VERSION");
 
     // Ran and exited 0, whatever it printed. `None` means "git could not
