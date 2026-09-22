@@ -55,7 +55,10 @@
   .hero-note { color: var(--muted); font-size: .75rem; margin-top: 19px; }
   .hero-art { position: absolute; inset: 0 -52px 0 39%; pointer-events: none; overflow: hidden; }
   .quantum-art { width: 100%; height: 100%; object-fit: cover; object-position: 63% 50%; opacity: .32; filter: saturate(.75); mask-image: linear-gradient(90deg, transparent, #000 22%, #000 83%, transparent), linear-gradient(0deg, transparent, #000 15%, #000 85%, transparent); mask-composite: intersect; }
-  .sphere-canvas { position: absolute; width: min(700px, 78vw); aspect-ratio: 1; height: auto; right: clamp(-70px, 1vw, 18px); top: 50%; translate: 0 -50%; filter: drop-shadow(0 0 42px #8fcf4a20); }
+  .sphere-canvas { position: absolute; width: min(700px, 78vw); aspect-ratio: 1; height: auto; right: clamp(-70px, 1vw, 18px); top: 50%; translate: 0 -50%; filter: drop-shadow(0 0 42px #8fcf4a20); pointer-events: auto; touch-action: pan-y; cursor: grab; border-radius: 50%; }
+  .sphere-canvas:focus-visible { outline: 2px solid var(--accent); outline-offset: -18px; }
+  .validator-tooltip { position: absolute; z-index: 3; translate: -50% calc(-100% - 14px); padding: 7px 10px; border: 1px solid #667852; border-radius: 5px; background: #101510ed; color: var(--text); box-shadow: 0 8px 24px #0008; font: .72rem/1.35 "SFMono-Regular", Consolas, monospace; white-space: nowrap; pointer-events: none; }
+  .validator-tooltip[hidden] { display: none; }
   .hero-art figcaption { position: absolute; display: flex; flex-direction: column; gap: 5px; right: 68px; bottom: 94px; color: #becfa5; font-size: .75rem; }
   .hero-art figcaption span:last-child { color: #808e78; font-size: .75rem; }
   .hero-bottom { display: flex; align-items: center; justify-content: space-between; gap: 16px; position: absolute; inset: auto 0 25px; color: var(--muted); font-size: .75rem; }

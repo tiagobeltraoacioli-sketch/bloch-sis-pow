@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; connect-src 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; connect-src https://blochl1.com">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#101211">
   <meta name="description" content="Postern Labs builds Bloch Protocol and the tools around it: post-quantum infrastructure, a native wallet, an explorer, and the Postern DEX preview.">
@@ -31,7 +31,7 @@
         <div class="hero-actions"><a class="button button-primary" href="#ecosystem">Explore the ecosystem <span aria-hidden="true">↗</span></a><a class="button button-outline" href="protocol.html">Discover Bloch <span aria-hidden="true">→</span></a></div>
         <p class="hero-note">Lattice-based signatures. Source you can inspect.</p>
       </div>
-      <figure class="hero-art"><canvas class="sphere-canvas" id="sphere" aria-hidden="true"></canvas><figcaption><span>01 / THE POST-QUANTUM FRONTIER</span><span>POSTERN LABS</span></figcaption></figure>
+      <figure class="hero-art"><canvas class="sphere-canvas" id="sphere" tabindex="0" aria-label="Interactive Bloch validator globe. Use the arrow keys to select a validator and Enter to open it in the explorer." aria-describedby="validator-sphere-status"></canvas><span class="validator-tooltip" id="validator-sphere-tooltip" role="tooltip" hidden></span><figcaption><span>01 / THE VALIDATOR NETWORK</span><span id="validator-sphere-status" aria-live="polite">140 validators · select a point to inspect</span></figcaption></figure>
       <div class="hero-bottom"><span>RESEARCH → PROTOCOL → PRODUCTS</span><a href="#ecosystem">Explore below <span aria-hidden="true">↓</span></a></div>
     </section>
     <section class="protocol-strip" aria-label="Bloch protocol parameters">
