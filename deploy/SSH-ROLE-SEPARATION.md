@@ -83,7 +83,10 @@ command="/opt/bloch/ssh-verify-readonly.sh"
 ssh-ed25519 AAAA... verify-ro@fleet
 ```
 
-where `ssh-verify-readonly.sh` runs **exactly** the three read-only checks
+Install the repository-owned
+`deploy/bootnodes/ssh-verify-readonly.sh` at that root-owned path, mode 0755.
+It accepts only the literal original command `verify` and never evaluates it.
+The wrapper runs **exactly** the three read-only checks
 the script needs (a `find` for `validator.key` under the node's data
 directory, `systemctl cat` of the unit file grepped for `--transport`, and
 one `curl` to loopback RPC) and nothing else — not a shell, not `$SSH_ORIGINAL_COMMAND`
@@ -93,7 +96,8 @@ key via a dedicated variable (`BLOCH_VERIFY_RO_KEY`), separate from whatever
 key an operator uses to actually manage a validator, so that running the
 verify script — including by a third party rehearsing the quickstart, per
 `docs/THIRD-PARTY-QUICKSTART.md` — never requires or risks the fleet's
-management key.
+management key. `--deep` now fails closed when that variable is absent or not
+a regular file; it does not fall back to `BLOCH_FLEET_KEY`.
 
 ## Rotation schedule
 

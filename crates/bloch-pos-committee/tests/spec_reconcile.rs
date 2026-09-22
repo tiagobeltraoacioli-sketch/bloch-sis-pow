@@ -15,10 +15,12 @@
 //! hard-coded, so a *code* change that invalidates a published figure also
 //! fails here and forces the spec to move in the same commit.
 
+use bloch_pos_committee::fee_market;
 use bloch_pos_committee::header::BlockHeaderV4;
 use bloch_pos_committee::params;
 use bloch_pos_committee::staking::MIN_DEPOSIT_SAT;
 use bloch_pos_committee::tokenomics_v4 as tk;
+use bloch_pos_committee::STATE_COMPONENT_TAGS;
 
 use std::fs;
 use std::path::PathBuf;
@@ -31,8 +33,65 @@ fn spec(name: &str) -> String {
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
+fn committee_source(name: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src").join(name);
+    fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
 const MIGRATION: &str = "BLOCH-POS-SHA3-LATTICE-MIGRATION.md";
 const TOKENOMICS: &str = "BLOCH-TOKENOMICS-V4.md";
+const FEE_MARKET: &str = "BLOCH-L1-FEE-MARKET.md";
+
+/// FC-14 — source-level protocol prose must describe the gated seed rule and
+/// the inactivity leak as quorum accounting, not as an unconditional F6 rule
+/// or a coin burn. These exact stale descriptions caused the audit finding.
+#[test]
+fn fc14_source_prose_matches_the_live_protocol_shape() {
+    let schedule = committee_source("schedule.rs");
+    let committees = committee_source("committees.rs");
+    let finality = committee_source("finality.rs");
+
+    for (name, text) in [("schedule.rs", &schedule), ("committees.rs", &committees)] {
+        assert!(
+            text.contains("ANCESTRY_SEED_ACTIVATION_EPOCH"),
+            "{name} describes seed selection without naming its activation gate"
+        );
+    }
+    assert!(
+        schedule.contains("second rule is not active in a shipped build"),
+        "schedule.rs again presents the post-F6 look-ahead as unconditional"
+    );
+    assert!(
+        finality.contains("not debit `ValidatorRecord::staked_sat`")
+            && finality.contains("burn coins or change supply"),
+        "finality.rs no longer states that the leak only discounts quorum weight"
+    );
+    assert!(
+        finality.contains("older sampled") && finality.contains("reference sortition APIs"),
+        "finality.rs again presents the retired sampled 8/128 committee as live"
+    );
+}
+
+fn comma_u128(value: u128) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i != 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn hex_prefix(bytes: &[u8], take: usize) -> String {
+    bytes
+        .iter()
+        .take(take)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 /// Render a 16-byte domain tag the way the spec table writes it:
 /// printable ASCII prefix, then one `\0` per padding byte.
@@ -94,63 +153,50 @@ fn f05_header_wire_layout_matches_code() {
 fn f06_domain_and_state_tags_all_published() {
     let doc = spec(MIGRATION);
 
-    let tags: [(&str, &[u8; 16]); 14] = [
-        ("DS_BLOCK", &params::DS_BLOCK),
-        ("DS_BODY", &params::DS_BODY),
-        ("DS_STATE", &params::DS_STATE),
-        ("DS_ATTEST", &params::DS_ATTEST),
-        ("DS_RANDAO", &params::DS_RANDAO),
-        ("DS_SORTITION", &params::DS_SORTITION),
-        ("DS_DEPOSIT", &params::DS_DEPOSIT),
-        ("DS_SLASH", &params::DS_SLASH),
-        ("DS_SPEND", &params::DS_SPEND),
-        ("DS_TXID", &params::DS_TXID),
-        ("DS_PROPOSE", &params::DS_PROPOSE),
-        ("DS_EXIT", &params::DS_EXIT),
-        ("DS_WSCKPT", &params::DS_WSCKPT),
-        ("DS_COHERENCE", &params::DS_COHERENCE),
-    ];
-    for (name, bytes) in tags {
-        let rendered = format!("| `{name}` | `{}` |", render_tag(bytes));
+    assert_eq!(params::DOMAIN_TAGS.len(), 16, "review every new domain tag");
+    for tag in params::DOMAIN_TAGS {
+        assert!(
+            !tag.preimage_shapes.is_empty(),
+            "{} has no registered preimage",
+            tag.name
+        );
+        let rendered = format!(
+            "| `{}` | `{}` |",
+            tag.name,
+            render_tag(&tag.bytes)
+        );
         assert!(
             doc.contains(&rendered),
-            "{MIGRATION} §6.1 registry missing or byte-inexact for {name}: expected row start {rendered:?}"
+            "{MIGRATION} §6.1 registry missing or byte-inexact for {}: expected row start {rendered:?}",
+            tag.name
         );
     }
 
-    // State-tree preimage markers 0x00..0x04 and the 22 component tags.
+    for (i, left) in params::DOMAIN_TAGS.iter().enumerate() {
+        for right in &params::DOMAIN_TAGS[i + 1..] {
+            assert_ne!(left.name, right.name, "duplicate domain name");
+            assert_ne!(
+                left.bytes, right.bytes,
+                "{} and {} share a domain",
+                left.name, right.name
+            );
+        }
+    }
+
+    // State-tree preimage markers 0x00..0x04 and every live component tag.
     for marker in ["MARK_LEAF", "MARK_NODE", "MARK_EMPTY", "MARK_KEY", "MARK_VALUE"] {
         assert!(doc.contains(marker), "{MIGRATION} missing state-tree marker {marker}");
     }
-    for tag in [
-        "TAG_EUTXO",
-        "TAG_VALIDATOR",
-        "TAG_PARTICIPATION_CURRENT",
-        "TAG_PARTICIPATION_PREVIOUS",
-        "TAG_RANDAO",
-        "TAG_TAINT_ROOT",
-        "TAG_COHERENCE_ACCUMULATOR",
-        "TAG_COHERENCE_NULLIFIERS",
-        "TAG_FINALITY",
-        "TAG_PENDING_VOTE",
-        "TAG_FC_MESSAGE",
-        "TAG_FC_EQUIVOCATOR",
-        "TAG_DEPOSIT_QUEUE",
-        "TAG_DELEGATION",
-        "TAG_PENDING_FEE",
-        "TAG_EVM_COMMITMENT",
-        "TAG_SLASH_APPLIED",
-        "TAG_SLASH_WINDOW",
-        "TAG_DELEGATOR_SLASH_LOSS",
-        "TAG_ISSUED_SUPPLY",
-        "TAG_BASE_FEE",
-        "TAG_DELEGATOR_FEE_REWARD",
-    ] {
-        assert!(doc.contains(tag), "{MIGRATION} missing state component tag {tag}");
+    for (name, tag) in STATE_COMPONENT_TAGS {
+        let row = format!("| `0x{tag:02X}` | `{name}`");
+        assert!(
+            doc.contains(&row),
+            "{MIGRATION} missing or misnumbering state component row {row:?}"
+        );
     }
     assert!(
-        doc.contains("| `0x16` | `TAG_DELEGATOR_FEE_REWARD`"),
-        "{MIGRATION} component-tag table must number the registry up to 0x16"
+        doc.contains("| `0x1E` | `TAG_FUNDED_VALIDATOR`"),
+        "{MIGRATION} component-tag table must number the live registry through 0x1E"
     );
 }
 
@@ -288,5 +334,171 @@ fn f12_emission_table_matches_shipped_curve() {
     assert!(
         !doc.contains("4,151.90"),
         "{TOKENOMICS} still carries the draft year-1 reward the chain does not pay"
+    );
+}
+
+/// TX-19 — the fee-market spec must distinguish deployed transaction classes
+/// from reserved costing variants and publish the active epoch-aware byte cap.
+#[test]
+fn tx19_fee_market_scope_and_caps_match_code() {
+    let doc = spec(FEE_MARKET);
+
+    assert!(
+        doc.contains("EVM transaction — **design only**")
+            && doc.contains("Coherence shielded — **design only**")
+            && doc.contains("no `PosTransaction` variant admits either one"),
+        "{FEE_MARKET} presents reserved costing variants as deployed L1 transactions"
+    );
+    assert!(
+        !doc.contains("A Genesis-4 block can carry three transaction classes")
+            && !doc.contains("crate treats transactions as opaque bytes"),
+        "{FEE_MARKET} retained a stale transaction-scope claim"
+    );
+
+    for claim in [
+        format!(
+            "`BLOCK_BYTES_V2_ACTIVATION_EPOCH = {}`",
+            params::BLOCK_BYTES_V2_ACTIVATION_EPOCH
+        ),
+        comma_u128(fee_market::MAX_BLOCK_TX_BYTES as u128),
+        comma_u128(fee_market::MAX_BLOCK_TX_BYTES_V2 as u128),
+        format!("`TAG_BASE_FEE = 0x{:02x}`", 0x15),
+    ] {
+        assert!(
+            doc.contains(&claim),
+            "{FEE_MARKET} missing live claim {claim:?}"
+        );
+    }
+
+    let annual_blch = tk::INITIAL_ANNUAL_SAT / tk::SAT_PER_BLOCH;
+    assert!(
+        doc.contains(&comma_u128(annual_blch))
+            && doc.contains(&format!("**{} bps**", tk::annual_inflation_bps(0)))
+            && doc.contains(&format!("{} bps in year 5", tk::annual_inflation_bps(4)))
+            && doc.contains(&format!("{} bps in year 10", tk::annual_inflation_bps(9))),
+        "{FEE_MARKET} inflation prose diverges from the shipped integer recurrence"
+    );
+}
+
+/// TX-19 — terminal carryover and allocation facts in tokenomics are derived
+/// from the same constants used to construct Genesis-4.
+#[test]
+fn tx19_tokenomics_terminal_facts_match_code() {
+    let doc = spec(TOKENOMICS);
+    let other_holders = tk::CARRYOVER_TOTAL_BLOCH - tk::LARGEST_CARRYOVER_ADDRESS_BLOCH;
+
+    for claim in [
+        "Status:     FINAL — shipped constants are code authority".to_owned(),
+        comma_u128(tk::CARRYOVER_TOTAL_BLOCH),
+        comma_u128(tk::VALIDATOR_EMISSION_BLOCH),
+        comma_u128(other_holders),
+        format!("`{}…`", hex_prefix(&tk::CARRYOVER_MEASURED_ROOT, 8)),
+        format!(
+            "`{}…`",
+            hex_prefix(&tk::CARRYOVER_MEASURED_FILE_SHA3_256, 8)
+        ),
+        format!("`{}…`", hex_prefix(&tk::CARRYOVER_MEASURED_FILE_SHA256, 8)),
+    ] {
+        assert!(
+            doc.contains(&claim),
+            "{TOKENOMICS} missing terminal claim {claim:?}"
+        );
+    }
+
+    for stale in [
+        "Status:     DRAFT",
+        "| Addresses | 15 |",
+        "| The other 14 |",
+        "23,970,850,000 BLCH",
+        "17.970.850.000",
+        "43.029.120.000",
+        "280d604b32525f03",
+        "92918209a106f297",
+    ] {
+        assert!(
+            !doc.contains(stale),
+            "{TOKENOMICS} retained stale claim {stale:?}"
+        );
+    }
+}
+
+/// TX-20 — the frozen Phase-1 DTO must not be presented as the schema that
+/// production uses, and local diagnostic precedence is not consensus data.
+#[test]
+fn tx20_legacy_interfaces_are_classified_accurately() {
+    assert_eq!(
+        STATE_COMPONENT_TAGS.len(),
+        30,
+        "update the interface reconciliation when the append-only registry grows"
+    );
+
+    let doc = spec("BLOCH-POS-INTERFACES.md");
+    for claim in [
+        "DTO with 14 top-level fields",
+        "`STATE_COMPONENT_TAGS` registry",
+        "currently contains 30 components",
+        "winning error for a multiply-invalid block is not consensus data",
+    ] {
+        assert!(doc.contains(claim), "interface spec missing TX-20 claim {claim:?}");
+    }
+
+    let source = include_str!("../src/interfaces.rs");
+    let transition = include_str!("../src/transition.rs");
+    for stale in [
+        "closed again at\neight components",
+        "error order is consensus-\n    /// visible",
+        "Frozen error order (consensus-visible",
+    ] {
+        assert!(
+            !source.contains(stale) && !transition.contains(stale),
+            "legacy consensus-interface claim returned: {stale:?}"
+        );
+    }
+}
+
+/// TX-21 — comments about deleted code do not constitute a second validation
+/// stack. Scan executable source so the retired symbols cannot return quietly.
+#[test]
+fn tx21_only_one_block_validation_stack_is_compiled() {
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !crate_root.join("src/produce.rs").exists(),
+        "the deleted parallel producer module returned"
+    );
+
+    let executable_lines = |text: String| {
+        text.lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//") && !trimmed.is_empty()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let derive = executable_lines(
+        fs::read_to_string(crate_root.join("src/derive.rs")).expect("read derive source"),
+    );
+    let lib = executable_lines(
+        fs::read_to_string(crate_root.join("src/lib.rs")).expect("read crate source"),
+    );
+    for retired in [
+        "fn validate_block",
+        "struct ParentState",
+        "struct ChainState",
+        "fn post_state_root",
+        "fn post_chain_state",
+    ] {
+        assert!(!derive.contains(retired), "retired derivation returned: {retired}");
+    }
+    assert!(
+        !lib.contains("mod produce"),
+        "the deleted producer module is compiled again"
+    );
+
+    let engine = fs::read_to_string(crate_root.join("../bloch-pos-node/src/engine.rs"))
+        .expect("read node engine source");
+    assert!(
+        engine.contains(".compute_post_state(") && engine.contains(".apply_block("),
+        "node production and validation no longer share Transition"
     );
 }

@@ -43,6 +43,7 @@
 use crate::attestation::{Attestation, KeyLookup, RejectReason, SignatureVerifier};
 use crate::params::SLOTS_PER_EPOCH;
 use crate::slashing::SlashingEvidence;
+use sha3::{Digest, Sha3_256};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Acceptance window, in slots: two epochs, matching the seen-cache retention
@@ -61,11 +62,35 @@ pub const CLOCK_SKEW_SLOTS: u64 = 1;
 
 /// Capacity of the pending (unknown-head) pool, in attestations (spec §6.3:
 /// 256 ≈ 1.2 MB of hybrid-signed attestations — a mirror of the block orphan
-/// pool). Bounded because entries are held *before* signature verification
-/// (see the pipeline order note below), so the pool must stay cheap to fill
-/// and cheap to evict. Eviction is FIFO by insertion sequence: deterministic,
-/// and under flood the newest — most likely still relevant — entries survive.
+/// pool). Entries are authenticated before hold, but still carry full hybrid
+/// signatures and must be re-judged when their block lands, so retention and
+/// release work remain bounded. Eviction is FIFO by insertion sequence:
+/// deterministic, and under flood the newest — most likely still relevant —
+/// entries survive.
 pub const MAX_PENDING_ATTESTATIONS: usize = 256;
+/// Pending attestations one missing block root may release in a single block
+/// ingestion. This is a node-local work/retention slice: the global pool still
+/// accepts other roots, and overflow is Ignore rather than peer fault.
+pub const MAX_PENDING_ATTESTATIONS_PER_ROOT: usize = 32;
+/// Distinct missing roots represented in the pending pool. Without this
+/// aggregate bound, one valid duty per invented root can turn one later sync
+/// page into hundreds of independently queued replay roots.
+pub const MAX_PENDING_ATTESTATION_ROOTS: usize = 32;
+/// Pending attestations attributed to one normalized transport source across
+/// all missing roots. Unattributed/local input does not acquire a fabricated
+/// identity; it shares the separate collective limits below.
+pub const MAX_PENDING_ATTESTATIONS_PER_SOURCE: usize = 32;
+/// Pending attestations one attributed source may park for one missing root.
+pub const MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT: usize = 8;
+/// Pending attestations whose caller supplied no transport identity. These
+/// entries share one collective bucket rather than bypassing source fairness:
+/// no synthetic peer identity is invented, while embedded/local ingress can
+/// no longer occupy the entire aggregate pool.
+pub const MAX_PENDING_UNATTRIBUTED_ATTESTATIONS: usize = 32;
+/// Unattributed pending attestations parked for one missing root. This mirrors
+/// the attributed per-source/root share and leaves root headroom for traffic
+/// carrying a real normalized source.
+pub const MAX_PENDING_UNATTRIBUTED_ATTESTATIONS_PER_ROOT: usize = 8;
 
 /// Distinct attestations accepted per duty before further ones are ignored
 /// (spec §6.2). Two, because slashing evidence needs exactly a conflicting
@@ -129,6 +154,25 @@ pub enum IgnoreReason {
     /// cost one hybrid verification; that is the intended trade (a bounded,
     /// self-funded cost, not a free one).
     PendingDutyLimit,
+    /// This missing block root already has
+    /// [`MAX_PENDING_ATTESTATIONS_PER_ROOT`] authenticated waiters parked.
+    /// The cap prevents one later block arrival from replaying the entire
+    /// global pending pool in one non-preemptible engine event.
+    PendingRootLimit,
+    /// The aggregate pending pool already represents the maximum number of
+    /// distinct missing roots. Capacity pressure is local state, not guilt.
+    PendingRootSetLimit,
+    /// This attributed transport source already occupies its aggregate share
+    /// of the pending pool across missing roots.
+    PendingSourceLimit,
+    /// This attributed transport source already occupies its share for this
+    /// missing root.
+    PendingSourceRootLimit,
+    /// Source-free callers collectively exhausted their pending-pool share.
+    /// No identity is fabricated; all unattributed ingress shares this cap.
+    PendingUnattributedLimit,
+    /// Source-free callers collectively exhausted their share for this root.
+    PendingUnattributedRootLimit,
 }
 
 /// The decision on one arriving attestation. The node maps this onto
@@ -207,6 +251,33 @@ struct DutyRecord {
 struct PendingEntry {
     att: Attestation,
     missing_root: [u8; 32],
+    verification_source: Option<[u8; 32]>,
+    /// Binds the local authentication proof to the registry key that was
+    /// actually used. A changed projection must verify again, never inherit
+    /// trust from a different key at the same validator index.
+    verified_pubkey_sha3: [u8; 32],
+}
+
+/// A pending attestation carrying proof that this pool authenticated it.
+///
+/// Fields and construction stay private so callers cannot manufacture a
+/// signature-verification bypass. Consuming the token permits exactly one
+/// replay through [`AttestationPool::process_authenticated_pending`].
+#[derive(Debug)]
+pub struct AuthenticatedPendingAttestation {
+    att: Attestation,
+    verification_source: Option<[u8; 32]>,
+    verified_pubkey_sha3: [u8; 32],
+}
+
+impl AuthenticatedPendingAttestation {
+    pub fn attestation(&self) -> &Attestation {
+        &self.att
+    }
+
+    pub fn verification_source(&self) -> Option<[u8; 32]> {
+        self.verification_source
+    }
 }
 
 /// The attestation pool: dedup, equivocation capture, and the pending
@@ -230,9 +301,17 @@ pub struct AttestationPool {
     /// — the global FIFO cap ([`MAX_PENDING_ATTESTATIONS`]) and the
     /// accepted-side cap (`DutyRecord::accepted`, same limit). Entries are
     /// removed from this map the moment they leave `pending` (release or
-    /// eviction), in [`AttestationPool::evict`], so it never drifts from
+    /// eviction), in [`AttestationPool::remove_pending`], so it never drifts from
     /// `pending`'s actual contents.
     pending_by_duty: BTreeMap<DutyKey, usize>,
+    /// Attributed-source indexes. These are admission/replay fairness only
+    /// and never affect attestation validity.
+    pending_by_source: BTreeMap<[u8; 32], usize>,
+    pending_by_source_root: BTreeMap<([u8; 32], [u8; 32]), usize>,
+    /// Source-free ingress is not assigned a synthetic identity. All such
+    /// entries instead share one bounded aggregate/root bucket.
+    pending_unattributed: usize,
+    pending_unattributed_by_root: BTreeMap<[u8; 32], usize>,
     /// Monotone insertion counter. Never reused, so FIFO order is total and
     /// deterministic across identical histories.
     next_seq: u64,
@@ -258,9 +337,11 @@ impl AttestationPool {
     ///   4. duty membership      → non-member: Reject (cannot be honest skew:
     ///      membership is a deterministic function of committed state both
     ///      sides can compute)
-    ///   5. hybrid signature     → bad: Reject; unresolvable key: Ignore
-    ///   6. head/target known?   → unknown: Hold (capped per duty)
-    ///   7. Accept
+    ///   5. key resolution       → unavailable: Ignore
+    ///   6. pending preflight    → full: Ignore, before expensive crypto
+    ///   7. hybrid signature     → bad: Reject
+    ///   8. head/target known?   → unknown: Hold (already preflighted)
+    ///   9. Accept
     ///
     /// ## R3 NEW-1 — why signature verification moved *before* Hold
     ///
@@ -276,20 +357,17 @@ impl AttestationPool {
     /// parked — at zero cost to the attacker and zero peer-score cost
     /// (Hold → Ignore is, correctly, never a penalty).
     ///
-    /// The fix verifies the signature first whenever the key is resolvable,
-    /// which is always safe to do *before* knowing whether the referenced
-    /// blocks are known: `keys` is a registry projection at a fixed epoch
+    /// The fix verifies the signature before an entry is stored whenever the
+    /// key is resolvable. `keys` is a registry projection at a fixed epoch
     /// (`rolled_to(epoch)`, or the block's pre-state) that does not depend on
-    /// `att.data.head` or `att.data.target_root` having been imported — i.e.
-    /// key resolution and signature verification are head-independent. So
-    /// this reordering cannot turn an honest race into a Reject: a bad
-    /// signature was always going to be Reject once checked (step 6 in the
-    /// old order), and a good signature was always going to reach Hold; only
-    /// *which pool state* an unverifiable frame can occupy changes — from
-    /// "parked, unverified" to "never parked". An unresolvable key (this
-    /// node is behind — see [`IgnoreReason::UnknownValidator`]) still cannot
-    /// be checked, so it still cannot be parked; it Ignores exactly as
-    /// before, just one step earlier.
+    /// `att.data.head` or `att.data.target_root` having been imported. A local
+    /// capacity preflight may now Ignore a frame before that verification,
+    /// but only when the frame could not be stored anyway; it never Accepts
+    /// or Holds unverified input. Thus the ordering cannot turn an honest race
+    /// into a Reject: a bad signature is rejected whenever capacity exists,
+    /// a good signature reaches Hold, and saturation stays a non-penalizing
+    /// Ignore. An unresolvable key (this node is behind — see
+    /// [`IgnoreReason::UnknownValidator`]) still cannot be checked or parked.
     ///
     /// This is *not* a consensus-relevant change and needs no activation
     /// gate: `AttestationPool` is node-local, ephemeral relay/scoring state
@@ -314,6 +392,72 @@ impl AttestationPool {
         blocks: &impl BlockLookup,
         verifier: &dyn SignatureVerifier,
         keys: &dyn KeyLookup,
+    ) -> GossipDecision {
+        self.process_from_source(att, current_slot, committees, blocks, verifier, keys, None)
+    }
+
+    /// [`Self::process`] with the normalized transport identity retained for
+    /// node-local pending/replay fairness. `None` deliberately means
+    /// unattributed; callers must not invent an identity for local input.
+    pub fn process_from_source(
+        &mut self,
+        att: Attestation,
+        current_slot: u64,
+        committees: &impl CommitteeLookup,
+        blocks: &impl BlockLookup,
+        verifier: &dyn SignatureVerifier,
+        keys: &dyn KeyLookup,
+        verification_source: Option<[u8; 32]>,
+    ) -> GossipDecision {
+        self.process_inner(
+            att,
+            current_slot,
+            committees,
+            blocks,
+            verifier,
+            keys,
+            verification_source,
+            None,
+        )
+    }
+
+    /// Re-judge a waiter extracted from this pool without repeating its
+    /// hybrid verification when the current registry resolves the identical
+    /// public key. Mutable policy and chain-view checks still run in full.
+    /// If the key fingerprint changed, verification runs again and fails
+    /// closed. The opaque, consumed token is the authority for this fast path.
+    pub fn process_authenticated_pending(
+        &mut self,
+        pending: AuthenticatedPendingAttestation,
+        current_slot: u64,
+        committees: &impl CommitteeLookup,
+        blocks: &impl BlockLookup,
+        verifier: &dyn SignatureVerifier,
+        keys: &dyn KeyLookup,
+    ) -> GossipDecision {
+        self.process_inner(
+            pending.att,
+            current_slot,
+            committees,
+            blocks,
+            verifier,
+            keys,
+            pending.verification_source,
+            Some(pending.verified_pubkey_sha3),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_inner(
+        &mut self,
+        att: Attestation,
+        current_slot: u64,
+        committees: &impl CommitteeLookup,
+        blocks: &impl BlockLookup,
+        verifier: &dyn SignatureVerifier,
+        keys: &dyn KeyLookup,
+        verification_source: Option<[u8; 32]>,
+        authenticated_pubkey_sha3: Option<[u8; 32]>,
     ) -> GossipDecision {
         let slot = att.data.slot;
 
@@ -377,13 +521,9 @@ impl AttestationPool {
             return GossipDecision::Reject(RejectReason::NotInCommittee);
         }
 
-        // 5. Signature — moved before the head/target check (R3 NEW-1; see
-        //    the long comment on this function for the replay-safety and
-        //    ordering argument). Both halves of the hybrid suite, via the
-        //    injected verifier. Only verified attestations are ever recorded
-        //    or parked, so every equivocation pair we hand to slashing
-        //    already carries two valid signatures — a forger cannot frame a
-        //    validator here.
+        // 5. Resolve the key before local-capacity preflight. An unavailable
+        //    key remains UnknownValidator even when the pending pool is full:
+        //    that verdict describes this node's lag, not traffic pressure.
         //
         //    The key comes from the SAME state snapshot that drew the
         //    committee checked in step 4 — `rolled_to(epoch)` at the node.
@@ -417,11 +557,46 @@ impl AttestationPool {
             // that can never be cashed in by this node.
             return GossipDecision::Ignore(IgnoreReason::UnknownValidator);
         };
-        if !verifier.verify_with_key(pubkey, &data_hash, &att.signature) {
+
+        // 6. Compute the same first missing root that Hold would use and
+        //    preflight every pending-only limit before the expensive hybrid
+        //    verification. This is safe because capacity pressure is a local
+        //    Ignore, never a validity judgment or peer penalty. A frame that
+        //    cannot possibly be retained must not buy repeated consensus-
+        //    thread crypto merely by arriving at a saturated bucket.
+        //
+        //    Known-root attestations deliberately bypass this preflight and
+        //    still authenticate below: pending pressure cannot become a way
+        //    to sneak an invalid message into the accepted path. Pending
+        //    counters cannot change between preflight and `hold` because this
+        //    method owns `&mut self`. The production caller also lends one
+        //    immutable engine chain view for the whole call; other BlockLookup
+        //    implementations must likewise return snapshot-stable answers
+        //    while `process` is running.
+        let missing_root = [att.data.head, att.data.target_root]
+            .into_iter()
+            .find(|root| !blocks.is_known(root));
+        if let Some(root) = missing_root {
+            if let Some(reason) = self.pending_capacity_reason(duty, root, verification_source) {
+                return GossipDecision::Ignore(reason);
+            }
+        }
+
+        // 7. Signature. An opaque pending token proves that this exact
+        //    attestation already passed both halves of the hybrid suite. It
+        //    is reusable only while the current registry resolves the exact
+        //    same key fingerprint; a defensive key mismatch takes the normal
+        //    verification path. Only verified attestations are recorded or
+        //    parked, so a forger cannot frame a validator.
+        let current_pubkey_sha3: [u8; 32] = Sha3_256::digest(pubkey).into();
+        let already_authenticated = authenticated_pubkey_sha3 == Some(current_pubkey_sha3);
+        if !already_authenticated
+            && !verifier.verify_with_key(pubkey, &data_hash, &att.signature)
+        {
             return GossipDecision::Reject(RejectReason::BadSignature);
         }
 
-        // 6. Referenced blocks. The attestation votes for the head produced
+        // 8. Referenced blocks. The attestation votes for the head produced
         //    in its own slot, so arriving before that block is *guaranteed*
         //    ordinary propagation timing — milliseconds of race, every
         //    boundary. Hold, count nothing against anyone — but only up to
@@ -433,17 +608,18 @@ impl AttestationPool {
         //    capacity. The target root gets the same treatment as the head:
         //    at an epoch boundary the target IS the block just produced, and
         //    it races too.
-        for root in [att.data.head, att.data.target_root] {
-            if !blocks.is_known(&root) {
-                let pending_for_duty = *self.pending_by_duty.get(&duty).unwrap_or(&0);
-                if pending_for_duty >= MAX_EQUIVOCATIONS_PER_DUTY {
-                    return GossipDecision::Ignore(IgnoreReason::PendingDutyLimit);
-                }
-                return self.hold(duty, att, root, data_hash);
-            }
+        if let Some(root) = missing_root {
+            return self.hold(
+                duty,
+                att,
+                root,
+                data_hash,
+                verification_source,
+                current_pubkey_sha3,
+            );
         }
 
-        // 7. Record. Second distinct data for the duty = equivocation:
+        // 9. Record. Second distinct data for the duty = equivocation:
         //    capture the pair for the slashing pool but still Accept — both
         //    messages must propagate, because the rest of the network needs
         //    the same evidence (spec §6.2: "both are needed as slashing
@@ -456,15 +632,63 @@ impl AttestationPool {
         GossipDecision::Accept { slashing_candidate }
     }
 
+    /// Return the local pending-capacity refusal for an otherwise novel
+    /// attestation, in stable priority order. This performs no authentication
+    /// and must therefore only produce Ignore decisions; `hold` remains
+    /// reachable solely after a successful signature verification.
+    fn pending_capacity_reason(
+        &self,
+        duty: DutyKey,
+        root: [u8; 32],
+        verification_source: Option<[u8; 32]>,
+    ) -> Option<IgnoreReason> {
+        if self.pending_by_duty.get(&duty).copied().unwrap_or(0)
+            >= MAX_EQUIVOCATIONS_PER_DUTY
+        {
+            return Some(IgnoreReason::PendingDutyLimit);
+        }
+        if self.pending_by_root.get(&root).map_or(0, BTreeSet::len)
+            >= MAX_PENDING_ATTESTATIONS_PER_ROOT
+        {
+            return Some(IgnoreReason::PendingRootLimit);
+        }
+        if !self.pending_by_root.contains_key(&root)
+            && self.pending_by_root.len() >= MAX_PENDING_ATTESTATION_ROOTS
+        {
+            return Some(IgnoreReason::PendingRootSetLimit);
+        }
+        if let Some(source) = verification_source {
+            if self.pending_by_source.get(&source).copied().unwrap_or(0)
+                >= MAX_PENDING_ATTESTATIONS_PER_SOURCE
+            {
+                return Some(IgnoreReason::PendingSourceLimit);
+            }
+            if self.pending_by_source_root.get(&(source, root)).copied().unwrap_or(0)
+                >= MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT
+            {
+                return Some(IgnoreReason::PendingSourceRootLimit);
+            }
+        } else {
+            if self.pending_unattributed >= MAX_PENDING_UNATTRIBUTED_ATTESTATIONS {
+                return Some(IgnoreReason::PendingUnattributedLimit);
+            }
+            if self.pending_unattributed_by_root.get(&root).copied().unwrap_or(0)
+                >= MAX_PENDING_UNATTRIBUTED_ATTESTATIONS_PER_ROOT
+            {
+                return Some(IgnoreReason::PendingUnattributedRootLimit);
+            }
+        }
+        None
+    }
+
     /// A block was imported: re-run every attestation that was waiting on it.
     ///
     /// Call *after* the block is queryable through the [`BlockLookup`], or
     /// the waiters will simply be re-held. Entries are replayed in insertion
-    /// order (deterministic), and each goes through the full pipeline again —
-    /// so an attestation still missing its *other* root is re-held under that
-    /// root, and one whose signature turns out bad is rejected now. Returns
-    /// each released attestation with its final decision; the node relays the
-    /// Accepts (they were never relayed while parked).
+    /// order (deterministic), and each goes through every mutable policy and
+    /// chain-view check again. The paid signature proof is reused only while
+    /// bound to the same registry key; a changed key is verified normally.
+    /// An attestation still missing its *other* root is re-held under it.
     pub fn on_block(
         &mut self,
         root: &[u8; 32],
@@ -474,25 +698,91 @@ impl AttestationPool {
         verifier: &dyn SignatureVerifier,
         keys: &dyn KeyLookup,
     ) -> Vec<(Attestation, GossipDecision)> {
-        let seqs = match self.pending_by_root.remove(root) {
-            Some(s) => s,
-            None => return Vec::new(),
-        };
+        self.take_authenticated_waiting_on_limit(root, usize::MAX)
+            .0
+            .into_iter()
+            .map(|pending| {
+                let att = pending.attestation().clone();
+                let decision = self.process_authenticated_pending(
+                    pending,
+                    current_slot,
+                    committees,
+                    blocks,
+                    verifier,
+                    keys,
+                );
+                (att, decision)
+            }).collect()
+    }
+
+    /// Extract waiters in FIFO order, removing every pending index before
+    /// revalidation. Callers with epoch-dependent context must judge each
+    /// returned attestation separately and must not count it before acceptance.
+    pub fn take_waiting_on(&mut self, root: &[u8; 32]) -> Vec<Attestation> {
+        self.take_waiting_on_limit(root, usize::MAX).0
+    }
+
+    /// Extract at most `limit` waiters for one root in FIFO order, leaving the
+    /// tail fully indexed for a later engine turn. The boolean reports whether
+    /// such a tail remains.
+    pub fn take_waiting_on_limit(
+        &mut self,
+        root: &[u8; 32],
+        limit: usize,
+    ) -> (Vec<Attestation>, bool) {
+        let (waiting, remains) = self.take_waiting_on_limit_with_sources(root, limit);
+        (waiting.into_iter().map(|(att, _)| att).collect(), remains)
+    }
+
+    /// Source-preserving form of [`Self::take_waiting_on_limit`]. The node
+    /// feeds this identity back into both verification budgeting and any
+    /// second hold when the attestation's other root is still missing.
+    pub fn take_waiting_on_limit_with_sources(
+        &mut self,
+        root: &[u8; 32],
+        limit: usize,
+    ) -> (Vec<(Attestation, Option<[u8; 32]>)>, bool) {
+        let (waiting, remains) = self.take_authenticated_waiting_on_limit(root, limit);
+        (
+            waiting
+                .into_iter()
+                .map(|pending| (pending.att, pending.verification_source))
+                .collect(),
+            remains,
+        )
+    }
+
+    /// Authenticated, source-preserving extraction for internal replay.
+    /// Tokens are opaque and consumed by the only API allowed to reuse the
+    /// signature proof, preventing a general verification bypass.
+    pub fn take_authenticated_waiting_on_limit(
+        &mut self,
+        root: &[u8; 32],
+        limit: usize,
+    ) -> (Vec<AuthenticatedPendingAttestation>, bool) {
+        let seqs: Vec<u64> = self.pending_by_root.get(root)
+            .into_iter()
+            .flat_map(|entries| entries.iter().take(limit))
+            .copied()
+            .collect();
         let mut out = Vec::with_capacity(seqs.len());
         for seq in seqs {
-            // BTreeSet iterates ascending: FIFO replay.
-            let entry = match self.pending.remove(&seq) {
-                Some(e) => e,
-                None => continue, // evicted after indexing; nothing to do
-            };
-            let key = (entry.att.data.slot, entry.att.validator, entry.att.data.signing_root());
-            self.pending_keys.remove(&key);
-            let att = entry.att;
-            let decision =
-                self.process(att.clone(), current_slot, committees, blocks, verifier, keys);
-            out.push((att, decision));
+            if let Some(entry) = self.remove_pending(seq) {
+                out.push(AuthenticatedPendingAttestation {
+                    att: entry.att,
+                    verification_source: entry.verification_source,
+                    verified_pubkey_sha3: entry.verified_pubkey_sha3,
+                });
+            }
         }
-        out
+        let remains = self.pending_by_root.get(root).is_some_and(|entries| !entries.is_empty());
+        (out, remains)
+    }
+
+    /// Current waiters for one missing root. Used by the engine to avoid
+    /// queueing empty release work when an unrelated block lands.
+    pub fn pending_for_root(&self, root: &[u8; 32]) -> usize {
+        self.pending_by_root.get(root).map_or(0, BTreeSet::len)
     }
 
     /// Drop everything the acceptance window has moved past. Deterministic:
@@ -549,6 +839,8 @@ impl AttestationPool {
         att: Attestation,
         missing_root: [u8; 32],
         data_hash: [u8; 32],
+        verification_source: Option<[u8; 32]>,
+        verified_pubkey_sha3: [u8; 32],
     ) -> GossipDecision {
         while self.pending.len() >= MAX_PENDING_ATTESTATIONS {
             // Oldest first. `keys().next()` on a BTreeMap is the smallest
@@ -565,42 +857,87 @@ impl AttestationPool {
         self.pending_keys.insert((att.data.slot, att.validator, data_hash));
         self.pending_by_root.entry(missing_root).or_default().insert(seq);
         // Cannot overflow: this count is the number of pending entries for one
-        // duty (incremented here, decremented in `evict` for the same entry),
+        // duty (incremented here, decremented in `remove_pending` for the same entry),
         // so it is <= pending.len() < MAX_PENDING_ATTESTATIONS (256) after the
         // eviction loop above.
         #[allow(clippy::arithmetic_side_effects)]
         {
             *self.pending_by_duty.entry(duty).or_insert(0) += 1;
+            if let Some(source) = verification_source {
+                *self.pending_by_source.entry(source).or_insert(0) += 1;
+                *self.pending_by_source_root.entry((source, missing_root)).or_insert(0) += 1;
+            } else {
+                self.pending_unattributed += 1;
+                *self.pending_unattributed_by_root.entry(missing_root).or_insert(0) += 1;
+            }
         }
-        self.pending.insert(seq, PendingEntry { att, missing_root });
+        self.pending.insert(
+            seq,
+            PendingEntry {
+                att,
+                missing_root,
+                verification_source,
+                verified_pubkey_sha3,
+            },
+        );
         GossipDecision::Hold { missing_root }
     }
 
-    /// Remove one pending entry and every index pointing at it, including the
-    /// per-duty pending count (R3 NEW-1) — recomputed from the entry itself
-    /// rather than threaded through, so `evict` stays the single place that
-    /// can never leave `pending_by_duty` out of sync with `pending`.
+    /// Discard one pending entry through the same removal authority used by
+    /// ownership-preserving extraction.
     fn evict(&mut self, seq: u64) {
-        if let Some(entry) = self.pending.remove(&seq) {
-            let duty: DutyKey = (entry.att.data.slot, entry.att.validator);
-            if let Some(count) = self.pending_by_duty.get_mut(&duty) {
+        drop(self.remove_pending(seq));
+    }
+
+    /// Remove one pending entry and every index pointing at it, including the
+    /// per-duty pending count (R3 NEW-1), and return its sole owned payload.
+    /// Recomputed from the entry itself rather than threaded through, so this
+    /// remains the single place that cannot leave any pending index out of
+    /// sync. Extraction moves that owner; eviction simply drops it.
+    fn remove_pending(&mut self, seq: u64) -> Option<PendingEntry> {
+        let entry = self.pending.remove(&seq)?;
+        let duty: DutyKey = (entry.att.data.slot, entry.att.validator);
+        if let Some(count) = self.pending_by_duty.get_mut(&duty) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.pending_by_duty.remove(&duty);
+            }
+        }
+        if let Some(source) = entry.verification_source {
+            if let Some(count) = self.pending_by_source.get_mut(&source) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
-                    self.pending_by_duty.remove(&duty);
+                    self.pending_by_source.remove(&source);
                 }
             }
-            self.pending_keys.remove(&(
-                entry.att.data.slot,
-                entry.att.validator,
-                entry.att.data.signing_root(),
-            ));
-            if let Some(set) = self.pending_by_root.get_mut(&entry.missing_root) {
-                set.remove(&seq);
-                if set.is_empty() {
-                    self.pending_by_root.remove(&entry.missing_root);
+            let source_root = (source, entry.missing_root);
+            if let Some(count) = self.pending_by_source_root.get_mut(&source_root) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.pending_by_source_root.remove(&source_root);
+                }
+            }
+        } else {
+            self.pending_unattributed = self.pending_unattributed.saturating_sub(1);
+            if let Some(count) = self.pending_unattributed_by_root.get_mut(&entry.missing_root) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.pending_unattributed_by_root.remove(&entry.missing_root);
                 }
             }
         }
+        self.pending_keys.remove(&(
+            entry.att.data.slot,
+            entry.att.validator,
+            entry.att.data.signing_root(),
+        ));
+        if let Some(set) = self.pending_by_root.get_mut(&entry.missing_root) {
+            set.remove(&seq);
+            if set.is_empty() {
+                self.pending_by_root.remove(&entry.missing_root);
+            }
+        }
+        Some(entry)
     }
 }
 
@@ -608,6 +945,7 @@ impl AttestationPool {
 mod tests {
     use super::*;
     use crate::attestation::AttestationData;
+    use std::cell::Cell;
     use std::collections::BTreeSet;
 
     /// A signature is "valid" iff it equals the signing root — same device as
@@ -625,9 +963,40 @@ mod tests {
         }
     }
 
+    struct FixedKey(&'static [u8]);
+    impl crate::attestation::KeyLookup for FixedKey {
+        fn pubkey(&self, _v: u32) -> Option<&[u8]> {
+            Some(self.0)
+        }
+    }
+
     impl SignatureVerifier for RootEchoVerifier {
         fn verify_with_key(&self, _pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
             sig == root
+        }
+    }
+
+    struct AcceptAllVerifier;
+    impl SignatureVerifier for AcceptAllVerifier {
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
+        }
+    }
+
+    /// Proves that a path ended before expensive cryptography. Any accidental
+    /// verification is a test failure, not merely an incremented counter.
+    struct PanicVerifier;
+    impl SignatureVerifier for PanicVerifier {
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            panic!("this path must finish before signature verification")
+        }
+    }
+
+    struct CountingRejectVerifier(Cell<usize>);
+    impl SignatureVerifier for CountingRejectVerifier {
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            self.0.set(self.0.get() + 1);
+            false
         }
     }
 
@@ -764,11 +1133,124 @@ mod tests {
 
         // Block arrives, becomes queryable, waiters are replayed.
         blocks.insert(root(0xAA));
-        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
+        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &PanicVerifier, &AnyKey);
         assert_eq!(released.len(), 1);
         assert!(is_accept(&released[0].1));
         assert_eq!(pool.pending_len(), 0);
         assert_eq!(pool.accepted_hashes(CURRENT_SLOT, 1).len(), 1);
+    }
+
+    #[test]
+    fn authenticated_extraction_moves_signature_owners_and_cleans_indexes_in_fifo_order() {
+        let mut pool = AttestationPool::new();
+        let blocks = [root(0x22)].into_iter().collect::<BTreeSet<_>>();
+        let first_source = [0x51; 32];
+        for (validator, source, fill) in [
+            (1, Some(first_source), 0xA5),
+            (2, None, 0x5A),
+        ] {
+            let mut pending = att(validator, CURRENT_SLOT, 0xAA);
+            pending.signature = vec![fill; 4_589];
+            assert!(matches!(
+                pool.process_from_source(
+                    pending,
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&blocks),
+                    &AcceptAllVerifier,
+                    &AnyKey,
+                    source,
+                ),
+                GossipDecision::Hold { missing_root } if missing_root == root(0xAA)
+            ));
+        }
+
+        let retained: Vec<_> = pool
+            .pending
+            .values()
+            .map(|entry| {
+                (
+                    entry.att.validator,
+                    entry.att.signature.as_ptr(),
+                    entry.att.signature.clone(),
+                    entry.att.data.signing_root(),
+                )
+            })
+            .collect();
+        assert_eq!(pool.pending_by_root.get(&root(0xAA)).map(BTreeSet::len), Some(2));
+
+        let (first, remains) = pool.take_authenticated_waiting_on_limit(&root(0xAA), 1);
+        assert!(remains, "the second FIFO entry must remain indexed");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].att.validator, retained[0].0);
+        assert_eq!(first[0].att.signature.as_ptr(), retained[0].1, "signature owner was cloned");
+        assert_eq!(first[0].att.signature, retained[0].2);
+        assert_eq!(first[0].verification_source, Some(first_source));
+        let expected_pubkey_sha3: [u8; 32] = Sha3_256::digest(b"placeholder-key").into();
+        assert_eq!(
+            first[0].verified_pubkey_sha3,
+            expected_pubkey_sha3,
+        );
+        assert!(!pool.pending_by_duty.contains_key(&(CURRENT_SLOT, 1)));
+        assert_eq!(pool.pending_by_duty.get(&(CURRENT_SLOT, 2)), Some(&1));
+        assert!(!pool.pending_by_source.contains_key(&first_source));
+        assert!(!pool.pending_by_source_root.contains_key(&(first_source, root(0xAA))));
+        assert!(!pool.pending_keys.contains(&(CURRENT_SLOT, 1, retained[0].3)));
+        assert!(pool.pending_keys.contains(&(CURRENT_SLOT, 2, retained[1].3)));
+        assert_eq!(pool.pending_unattributed, 1);
+        assert_eq!(pool.pending_unattributed_by_root.get(&root(0xAA)), Some(&1));
+        assert_eq!(pool.pending_len(), 1);
+
+        let (second, remains) = pool.take_authenticated_waiting_on_limit(&root(0xAA), 1);
+        assert!(!remains);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].att.validator, retained[1].0);
+        assert_eq!(second[0].att.signature.as_ptr(), retained[1].1, "signature owner was cloned");
+        assert_eq!(second[0].att.signature, retained[1].2);
+        assert_eq!(second[0].verification_source, None);
+        assert_eq!(pool.pending_len(), 0);
+        assert!(pool.pending_by_root.is_empty());
+        assert!(pool.pending_by_duty.is_empty());
+        assert!(pool.pending_by_source.is_empty());
+        assert!(pool.pending_by_source_root.is_empty());
+        assert!(pool.pending_keys.is_empty());
+        assert_eq!(pool.pending_unattributed, 0);
+        assert!(pool.pending_unattributed_by_root.is_empty());
+    }
+
+    #[test]
+    fn authenticated_replay_reverifies_and_fails_closed_if_registry_key_changes() {
+        let mut pool = AttestationPool::new();
+        let mut blocks = [root(0x22)].into_iter().collect::<BTreeSet<_>>();
+        let a = att(1, CURRENT_SLOT, 0xAA);
+        assert!(matches!(
+            pool.process(
+                a,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &FixedKey(b"registry-key-a"),
+            ),
+            GossipDecision::Hold { .. }
+        ));
+
+        blocks.insert(root(0xAA));
+        let verifier = CountingRejectVerifier(Cell::new(0));
+        let released = pool.on_block(
+            &root(0xAA),
+            CURRENT_SLOT,
+            &committees(),
+            &known(&blocks),
+            &verifier,
+            &FixedKey(b"registry-key-b"),
+        );
+        assert_eq!(verifier.0.get(), 1, "changed key must spend a fresh verification");
+        assert!(matches!(
+            released.as_slice(),
+            [(_, GossipDecision::Reject(RejectReason::BadSignature))]
+        ));
+        assert!(pool.accepted_hashes(CURRENT_SLOT, 1).is_empty());
     }
 
     #[test]
@@ -799,24 +1281,51 @@ mod tests {
         // Head arrives but the target (an epoch-boundary block, racing too)
         // has not: the full pipeline re-runs and re-holds under the target.
         blocks.insert(root(0xAA));
-        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
+        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &PanicVerifier, &AnyKey);
         assert_eq!(released.len(), 1);
         assert!(matches!(released[0].1, GossipDecision::Hold { missing_root } if missing_root == root(0x22)));
         assert_eq!(pool.pending_len(), 1);
 
         blocks.insert(root(0x22));
-        let released = pool.on_block(&root(0x22), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
+        let released = pool.on_block(&root(0x22), CURRENT_SLOT, &committees(), &known(&blocks), &PanicVerifier, &AnyKey);
         assert_eq!(released.len(), 1);
         assert!(is_accept(&released[0].1));
     }
 
     #[test]
+    fn audit_released_waiters_do_not_leak_per_duty_capacity() {
+        let mut pool = AttestationPool::new();
+        let mut blocks = BTreeSet::new();
+        for head in [0xAA, 0xBB] {
+            assert!(matches!(pool.process(att(1, CURRENT_SLOT, head), CURRENT_SLOT,
+                &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey),
+                GossipDecision::Hold { .. }));
+        }
+        assert_eq!(pool.pending_by_duty.get(&(CURRENT_SLOT, 1)), Some(&2));
+        for head in [0xAA, 0xBB] {
+            blocks.insert(root(head));
+            let released = pool.on_block(&root(head), CURRENT_SLOT, &committees(),
+                &known(&blocks), &RootEchoVerifier, &AnyKey);
+            assert!(matches!(released[0].1, GossipDecision::Hold { .. }));
+            assert_eq!(pool.pending_by_duty.get(&(CURRENT_SLOT, 1)), Some(&2));
+        }
+        blocks.insert(root(0x22));
+        let released = pool.on_block(&root(0x22), CURRENT_SLOT, &committees(),
+            &known(&blocks), &RootEchoVerifier, &AnyKey);
+        assert_eq!(released.len(), 2);
+        assert!(released.iter().all(|(_, decision)| is_accept(decision)));
+        assert!(pool.pending_by_duty.is_empty());
+        assert!(pool.pending_keys.is_empty());
+        assert!(pool.pending_by_root.is_empty());
+    }
+
+    #[test]
     fn forged_signature_is_rejected_before_parking_not_after() {
-        // R3 NEW-1: signature verification now runs BEFORE the head/target
-        // check, precisely so a forgery can never occupy a pending slot —
-        // the opposite of this test's pre-fix name and premise. A forged
-        // frame with an unknown head must Reject immediately, and the pool
-        // must stay empty (nothing was ever parked to release later).
+        // R3 NEW-1: signature verification now runs before parking, precisely
+        // so a forgery can never occupy a pending slot. Capacity preflight may
+        // inspect the head first, but this empty pool has room, so a forged
+        // frame with an unknown head must Reject and nothing can be released
+        // later.
         let mut pool = AttestationPool::new();
         let blocks = [root(0x22)].into_iter().collect::<BTreeSet<_>>(); // head 0xAA unknown
         let mut a = att(1, CURRENT_SLOT, 0xAA);
@@ -914,14 +1423,16 @@ mod tests {
         let blocks = BTreeSet::new(); // nothing known: every distinct variant would hold
         let heads = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE];
         let mut parked = 0usize;
-        for &h in &heads {
+        for &h in heads.iter().take(MAX_EQUIVOCATIONS_PER_DUTY) {
             let a = att(1, CURRENT_SLOT, h);
             let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
-            if matches!(d, GossipDecision::Hold { .. }) {
-                parked += 1;
-            } else {
-                assert!(matches!(d, GossipDecision::Ignore(IgnoreReason::PendingDutyLimit)), "unexpected: {d:?}");
-            }
+            assert!(matches!(d, GossipDecision::Hold { .. }), "unexpected: {d:?}");
+            parked += 1;
+        }
+        for &h in heads.iter().skip(MAX_EQUIVOCATIONS_PER_DUTY) {
+            let d = pool.process(att(1, CURRENT_SLOT, h), CURRENT_SLOT,
+                &committees(), &known(&blocks), &PanicVerifier, &AnyKey);
+            assert!(matches!(d, GossipDecision::Ignore(IgnoreReason::PendingDutyLimit)), "unexpected: {d:?}");
         }
         assert_eq!(parked, MAX_EQUIVOCATIONS_PER_DUTY);
         assert_eq!(pool.pending_len(), MAX_EQUIVOCATIONS_PER_DUTY);
@@ -932,6 +1443,459 @@ mod tests {
             GossipDecision::Hold { .. }
         ));
         assert_eq!(pool.pending_len(), MAX_EQUIVOCATIONS_PER_DUTY + 1);
+    }
+
+    #[test]
+    fn one_landed_root_releases_only_its_bounded_pending_share() {
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new();
+
+        for i in 0..MAX_PENDING_ATTESTATIONS_PER_ROOT {
+            let validator = 1 + (i % 8) as u32;
+            let slot = CURRENT_SLOT.saturating_sub((i / 8) as u64);
+            let decision = pool.process_from_source(
+                att(validator, slot, 0xAA),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some([0x10 + (i / MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT) as u8; 32]),
+            );
+            assert!(matches!(decision, GossipDecision::Hold { missing_root } if missing_root == root(0xAA)));
+        }
+        assert_eq!(pool.pending_len(), MAX_PENDING_ATTESTATIONS_PER_ROOT);
+
+        let overflow = att(1, CURRENT_SLOT - 4, 0xAA);
+        assert!(matches!(
+            pool.process_from_source(
+                overflow.clone(),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &PanicVerifier,
+                &AnyKey,
+                Some([0xEE; 32]),
+            ),
+            GossipDecision::Ignore(IgnoreReason::PendingRootLimit),
+        ));
+        assert_eq!(pool.pending_len(), MAX_PENDING_ATTESTATIONS_PER_ROOT);
+
+        let independent = att(2, CURRENT_SLOT - 4, 0xBB);
+        assert!(matches!(
+            pool.process_from_source(
+                independent,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some([0xEE; 32]),
+            ),
+            GossipDecision::Hold { missing_root } if missing_root == root(0xBB),
+        ));
+        assert_eq!(pool.pending_len(), MAX_PENDING_ATTESTATIONS_PER_ROOT + 1);
+
+        let released = pool.take_waiting_on(&root(0xAA));
+        assert_eq!(released.len(), MAX_PENDING_ATTESTATIONS_PER_ROOT);
+        assert_eq!(pool.pending_len(), 1, "the independent root remains parked");
+        assert!(matches!(
+            pool.process_from_source(
+                overflow,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some([0xEE; 32]),
+            ),
+            GossipDecision::Hold { missing_root } if missing_root == root(0xAA),
+        ));
+        assert_eq!(pool.pending_len(), 2, "release reopens root capacity");
+    }
+
+    #[test]
+    fn multi_root_flood_is_aggregate_bounded_and_release_reopens_capacity() {
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new();
+
+        for i in 0..MAX_PENDING_ATTESTATION_ROOTS {
+            let validator = 1 + (i % 8) as u32;
+            let slot = CURRENT_SLOT.saturating_sub((i / 8) as u64);
+            assert!(matches!(
+                pool.process(
+                    att(validator, slot, 0x40 + i as u8),
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&blocks),
+                    &RootEchoVerifier,
+                    &AnyKey,
+                ),
+                GossipDecision::Hold { .. }
+            ));
+        }
+        assert_eq!(pool.pending_by_root.len(), MAX_PENDING_ATTESTATION_ROOTS);
+
+        let overflow = att(1, CURRENT_SLOT - 4, 0xE0);
+        assert!(matches!(
+            pool.process(
+                overflow.clone(),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &PanicVerifier,
+                &AnyKey,
+            ),
+            GossipDecision::Ignore(IgnoreReason::PendingRootSetLimit),
+        ));
+        assert_eq!(pool.pending_len(), MAX_PENDING_ATTESTATION_ROOTS);
+
+        assert_eq!(pool.take_waiting_on(&root(0x40)).len(), 1);
+        assert!(matches!(
+            pool.process(
+                overflow,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+            ),
+            GossipDecision::Hold { missing_root } if missing_root == root(0xE0),
+        ));
+    }
+
+    #[test]
+    fn attributed_source_is_bounded_across_roots_and_identity_survives_release() {
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new();
+        let source_a = [0xA1; 32];
+        let source_b = [0xB2; 32];
+
+        for i in 0..MAX_PENDING_ATTESTATIONS_PER_SOURCE {
+            let validator = 1 + (i % 8) as u32;
+            let slot = CURRENT_SLOT.saturating_sub((i / 8) as u64);
+            assert!(matches!(
+                pool.process_from_source(
+                    att(validator, slot, 0x40 + i as u8),
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&blocks),
+                    &RootEchoVerifier,
+                    &AnyKey,
+                    Some(source_a),
+                ),
+                GossipDecision::Hold { .. }
+            ));
+        }
+
+        let overflow = att(1, CURRENT_SLOT - 4, 0x40);
+        assert!(matches!(
+            pool.process_from_source(
+                overflow.clone(),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &PanicVerifier,
+                &AnyKey,
+                Some(source_a),
+            ),
+            GossipDecision::Ignore(IgnoreReason::PendingSourceLimit),
+        ));
+        assert!(matches!(
+            pool.process_from_source(
+                overflow.clone(),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some(source_b),
+            ),
+            GossipDecision::Hold { .. },
+        ));
+
+        let (released, remains) = pool.take_waiting_on_limit_with_sources(&root(0x40), 1);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].1, Some(source_a));
+        assert!(remains, "source B's later waiter must remain in root FIFO");
+        let recovery = att(2, CURRENT_SLOT - 4, 0x41);
+        assert!(matches!(
+            pool.process_from_source(
+                recovery,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some(source_a),
+            ),
+            GossipDecision::Hold { .. },
+        ));
+    }
+
+    #[test]
+    fn unattributed_ingress_has_collective_bounds_and_cannot_consume_source_headroom() {
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new();
+
+        // Thirty-two distinct duties spread across five roots stay below the
+        // eight-entry root share while filling the collective source-free
+        // bucket. Before this bound, the same pattern could continue until it
+        // occupied all 256 global entries.
+        for i in 0..MAX_PENDING_UNATTRIBUTED_ATTESTATIONS {
+            let validator = 1 + (i % 8) as u32;
+            let slot = CURRENT_SLOT.saturating_sub((i / 8) as u64);
+            let head = 0x40 + (i % 5) as u8;
+            assert!(matches!(
+                pool.process(
+                    att(validator, slot, head),
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&blocks),
+                    &RootEchoVerifier,
+                    &AnyKey,
+                ),
+                GossipDecision::Hold { .. }
+            ));
+        }
+        assert_eq!(pool.pending_unattributed, MAX_PENDING_UNATTRIBUTED_ATTESTATIONS);
+
+        let overflow = att(1, CURRENT_SLOT - 4, 0x42);
+        assert!(matches!(
+            pool.process(
+                overflow.clone(),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &PanicVerifier,
+                &AnyKey,
+            ),
+            GossipDecision::Ignore(IgnoreReason::PendingUnattributedLimit),
+        ));
+
+        // Source-free pressure must not consume an attributed source's own
+        // share when the independent aggregate/root bounds have headroom.
+        assert!(matches!(
+            pool.process_from_source(
+                overflow,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some([0xA5; 32]),
+            ),
+            GossipDecision::Hold { .. },
+        ));
+    }
+
+    #[test]
+    fn unattributed_root_share_reopens_exactly_when_an_entry_leaves() {
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new();
+        for i in 0..MAX_PENDING_UNATTRIBUTED_ATTESTATIONS_PER_ROOT {
+            assert!(matches!(
+                pool.process(
+                    att(1 + i as u32, CURRENT_SLOT, 0xAA),
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&blocks),
+                    &RootEchoVerifier,
+                    &AnyKey,
+                ),
+                GossipDecision::Hold { .. }
+            ));
+        }
+        let overflow = att(1, CURRENT_SLOT - 1, 0xAA);
+        assert!(matches!(
+            pool.process(
+                overflow.clone(),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &PanicVerifier,
+                &AnyKey,
+            ),
+            GossipDecision::Ignore(IgnoreReason::PendingUnattributedRootLimit),
+        ));
+
+        let (released, remains) = pool.take_waiting_on_limit(&root(0xAA), 1);
+        assert_eq!(released.len(), 1);
+        assert!(remains);
+        assert_eq!(pool.pending_unattributed, 7);
+        assert_eq!(pool.pending_unattributed_by_root.get(&root(0xAA)), Some(&7));
+        assert!(matches!(
+            pool.process(
+                overflow,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+            ),
+            GossipDecision::Hold { .. },
+        ));
+    }
+
+    #[test]
+    fn one_source_cannot_fill_one_root_and_other_sources_keep_headroom() {
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new();
+        let source_a = [0xA1; 32];
+        let source_b = [0xB2; 32];
+
+        for i in 0..MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT {
+            assert!(matches!(
+                pool.process_from_source(
+                    att(1 + i as u32, CURRENT_SLOT, 0xAA),
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&blocks),
+                    &RootEchoVerifier,
+                    &AnyKey,
+                    Some(source_a),
+                ),
+                GossipDecision::Hold { .. }
+            ));
+        }
+
+        let overflow = att(1, CURRENT_SLOT - 1, 0xAA);
+        assert!(matches!(
+            pool.process_from_source(
+                overflow,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some(source_a),
+            ),
+            GossipDecision::Ignore(IgnoreReason::PendingSourceRootLimit),
+        ));
+        assert!(matches!(
+            pool.process_from_source(
+                att(2, CURRENT_SLOT - 1, 0xAA),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some(source_b),
+            ),
+            GossipDecision::Hold { .. },
+        ));
+    }
+
+    #[test]
+    fn saturated_pending_source_stops_before_crypto_but_known_roots_still_authenticate() {
+        let mut pool = AttestationPool::new();
+        let unknown = BTreeSet::new();
+        let source = [0xA1; 32];
+
+        // Fill one source/root share with valid authenticated duties.
+        for validator in 1..=MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT as u32 {
+            assert!(matches!(
+                pool.process_from_source(
+                    att(validator, CURRENT_SLOT, 0xAA),
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&unknown),
+                    &RootEchoVerifier,
+                    &AnyKey,
+                    Some(source),
+                ),
+                GossipDecision::Hold { .. }
+            ));
+        }
+
+        // A fresh duty for the saturated source/root is a local-capacity
+        // Ignore and must never reach hybrid verification. Before this
+        // preflight, every distinct re-offer paid that cost before discovering
+        // it could not be retained.
+        let overflow = att(1, CURRENT_SLOT - 1, 0xAA);
+        assert!(matches!(
+            pool.process_from_source(
+                overflow,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&unknown),
+                &PanicVerifier,
+                &AnyKey,
+                Some(source),
+            ),
+            GossipDecision::Ignore(IgnoreReason::PendingSourceRootLimit)
+        ));
+        assert_eq!(pool.pending_len(), MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT);
+
+        // Capacity is pending-only. If both roots are known, a malformed
+        // signature must still be authenticated and rejected rather than
+        // inheriting the saturated source's Ignore outcome.
+        let all_known = default_known();
+        let mut forged = att(2, CURRENT_SLOT - 1, 0xBB);
+        forged.signature = vec![0xEE; 32];
+        assert!(matches!(
+            pool.process_from_source(
+                forged,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&all_known),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some(source),
+            ),
+            GossipDecision::Reject(RejectReason::BadSignature)
+        ));
+    }
+
+    #[test]
+    fn pending_root_release_is_sliced_fifo_without_stranding_tail() {
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new();
+        for i in 0..10usize {
+            let validator = 1 + (i % 8) as u32;
+            let slot = CURRENT_SLOT.saturating_sub((i / 8) as u64);
+            assert!(matches!(
+                pool.process_from_source(
+                    att(validator, slot, 0xAA),
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&blocks),
+                    &RootEchoVerifier,
+                    &AnyKey,
+                    Some([0x20 + (i / MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT) as u8; 32]),
+                ),
+                GossipDecision::Hold { .. },
+            ));
+        }
+        assert!(matches!(
+            pool.process_from_source(
+                att(3, CURRENT_SLOT - 1, 0xBB),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some([0x30; 32]),
+            ),
+            GossipDecision::Hold { .. },
+        ));
+
+        let (first, remains) = pool.take_waiting_on_limit(&root(0xAA), 4);
+        assert!(remains);
+        assert_eq!(first.iter().map(|att| att.validator).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(pool.pending_for_root(&root(0xAA)), 6);
+        assert_eq!(pool.pending_for_root(&root(0xBB)), 1);
+
+        let (second, remains) = pool.take_waiting_on_limit(&root(0xAA), 4);
+        assert!(remains);
+        assert_eq!(second.iter().map(|att| att.validator).collect::<Vec<_>>(), vec![5, 6, 7, 8]);
+        assert_eq!(pool.pending_for_root(&root(0xAA)), 2);
+
+        let (last, remains) = pool.take_waiting_on_limit(&root(0xAA), 4);
+        assert!(!remains);
+        assert_eq!(last.iter().map(|att| att.validator).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(pool.pending_for_root(&root(0xAA)), 0);
+        assert_eq!(pool.pending_for_root(&root(0xBB)), 1, "other roots stay indexed");
     }
 
     #[test]
@@ -987,15 +1951,22 @@ mod tests {
             let v = 1 + (i / window) as u32;
             assert!(v <= 8, "test committee only has 8 members");
             let slot = CURRENT_SLOT - (i % window);
-            // Distinct head per i too, belt-and-suspenders against collapsing
-            // any two entries into one dedup key.
+            // Exercise the global FIFO without bypassing the independent
+            // distinct-root bound: 32 roots each carry eight distinct duties.
             let mut d0 = data(slot, 0xAA);
             d0.head = {
                 let mut h = [0u8; 32];
-                h[..8].copy_from_slice(&i.to_le_bytes());
+                let root_index = i % MAX_PENDING_ATTESTATION_ROOTS as u64;
+                h[..8].copy_from_slice(&root_index.to_le_bytes());
                 h
             };
-            let d = pool.process(signed(v, d0), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
+            let source_number = i / MAX_PENDING_ATTESTATIONS_PER_SOURCE as u64;
+            let mut source = [0u8; 32];
+            source[..8].copy_from_slice(&source_number.to_le_bytes());
+            let d = pool.process_from_source(
+                signed(v, d0), CURRENT_SLOT, &committees(), &known(&blocks),
+                &RootEchoVerifier, &AnyKey, Some(source),
+            );
             assert!(matches!(d, GossipDecision::Hold { .. }));
         }
         // Never exceeds capacity, and the evictees are exactly the oldest 8.

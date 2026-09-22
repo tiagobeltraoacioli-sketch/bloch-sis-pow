@@ -41,9 +41,15 @@ change). Behaviour:
 - A build from a dirty tree is marked `+dirty` **loudly** — an unmarked dirty
   build is exactly what made the fleet unidentifiable.
 - A build with no `.git` (container, CI export) takes the commit from the
-  `BLOCH_BUILD_COMMIT` env var; the caller asserts the tree state, so no
-  `+dirty` second-guessing. A build with neither stamps `unknown+nogit`,
-  which any release gate must treat as a hard failure.
+  `BLOCH_BUILD_COMMIT` env var. It reports `tree:unverified` unless the outer
+  recipe also opts into `BLOCH_BUILD_TREE_ASSERTION=clean`, in which case it
+  reports `tree:asserted-clean`. The latter is an explicitly labelled caller
+  assertion, not Git evidence: release scripts may use it only after
+  materializing `git archive <captured-oid>` (or proving tracked worktree and
+  index cleanliness). An assertion without a 12- or 40-character lowercase
+  hexadecimal asserted commit, or any value other than exact `clean`, fails
+  the build. A build with neither stamps `unknown+nogit`, which any release
+  gate must treat as a hard failure.
 - The stamp re-derives when HEAD moves (`rerun-if-changed` on the resolved
   git dir's `HEAD`/`index` — resolved via `--absolute-git-dir`, so it is
   correct in linked worktrees, unlike the G3 original).
@@ -57,13 +63,22 @@ Inputs that define the binary, and where each is pinned:
 | Source | git commit | the stamp (§1) |
 | Compiler | `crates/bloch-pos-node/rust-toolchain.toml` (`1.94.1`) | rustup + a hard assert in `scripts/pos-release-integrity.sh` |
 | Dependency graph | the committed **root** `Cargo.lock`. `bloch-pos-node` and `bloch-pos-committee` are `members` of the root virtual workspace, so cargo resolves them — and every other member — against that one file; a member's own `Cargo.lock` is never read (six such dead files were deleted on 2026-09-04) | `cargo metadata --locked`, resolved from the node crate dir so the toolchain pin still applies, + `git diff --exit-code` on the root lock before **and** after the build |
-| Stamp | `BLOCH_BUILD_COMMIT=<commit-12>` passed explicitly | release script / CI guard |
+| Stamp | `BLOCH_BUILD_COMMIT=<commit-12>` and `BLOCH_BUILD_TREE_ASSERTION=clean` passed explicitly after the outer recipe proves/materializes clean source | release script / CI guard |
 | Profile & flags | default `release` profile, no `RUSTFLAGS` | any `RUSTFLAGS` changes the unit hash — a release build must run with `RUSTFLAGS` unset (the guard builds with a clean invocation) |
 | Build path | **canonical `/build` in the release container** | §3 — measured to matter |
 | Platform | the fleet target (x86_64/aarch64 Linux, per box) | the release container image, pinned by digest like `deploy/repro/build.sh` does for G3 |
 
 Toolchain bumps are a release-integrity event: their own commit, followed by a
 green `pos-release-integrity` run and a new reference hash.
+
+The local guard compares the root lockfile with HEAD, including staged changes.
+Its full-build path refuses nonempty compiler/flags/wrapper/target/profile
+environment overrides before compiling and checks the compiler version token
+exactly. The corresponding regressions run without building a release binary.
+This does not make the host hermetic: Cargo configuration and system libraries
+remain separate release inputs. The canonical-container candidate under
+`deploy/pos-release/` removes those host inputs from the release recipe, but it
+is not qualified until two independent Linux builders reproduce its bytes.
 
 ## 3. Reproducibility: what was measured on 2026-08-12 (not estimated)
 
@@ -81,8 +96,12 @@ in this worktree). Five builds:
 
 Findings, with the concrete cause:
 
-1. **Same path ⇒ bit-identical.** Clean double builds match exactly. No
-   timestamp, parallelism or incremental nondeterminism was observed.
+1. **Same source path with independent fresh targets ⇒ bit-identical.** Clean
+   double builds match exactly. The build identity normalizes only the
+   Cargo-injected profile-root entries in `LD_LIBRARY_PATH` (Linux) and
+   `DYLD_FALLBACK_LIBRARY_PATH` (macOS); external loader paths and their order
+   remain significant. The CI gate keeps `t1` and `t2` independent so a
+   regression in that normalization fails byte comparison.
 2. **Different path ⇒ different binary, and NOT because of embedded path
    strings.** `strings` shows zero occurrences of either source path in
    either binary. The difference is in mangled symbol hashes:
@@ -106,13 +125,23 @@ already embodies for G3:
 > match, and that mismatch alone is not evidence of tampering — rebuild in
 > the container to compare honestly.
 
-Honest-claim ladder (mirrors `REPRO.md`): today `bloch-pos` has earned
-**"deterministic, same-path, single host — measured"**. It has **not** yet
-earned "reproducible": that requires the two-independent-builder bit-for-bit
-match of the canonical container build, and the `bloch-pos` release container
-does not exist yet (§8.1). Do not use the word "reproducible" in any public
-artifact for `bloch-pos` until that is green — the trademark/earned-word gate
-applies.
+Honest-claim ladder (mirrors `REPRO.md`): the last executed evidence for
+`bloch-pos` has earned
+**"deterministic, same-source-path with independent targets, single host —
+measured"**. GitLab retains an
+unsigned release candidate with its source commit, toolchain, target, version
+and SHA256 (`scripts/package-pos-release-candidate.sh`), but that is not the
+canonical release. A canonical-container candidate now exists at
+`deploy/pos-release/Dockerfile`: it fixes `/build`, the Rust base-image digest,
+the Debian archive timestamp, the committed source archive, Cargo lock and
+build stamp. It has **not** yet earned "reproducible": that requires two
+independent Linux builders to run `scripts/build-pos-release-container.sh` and
+pass `scripts/compare-pos-release-builds.sh` byte for byte, with separately
+authenticated records establishing that the two outputs really came from
+independent builders. The comparator refuses one path supplied twice but
+cannot authenticate builder identity. Do not use the word
+"reproducible" in any public artifact for `bloch-pos` until that is green — the
+trademark/earned-word gate applies.
 
 ## 4. Fleet-vs-release verification (the sweep that would have caught f819e87f)
 
@@ -173,11 +202,12 @@ Contents (verified by extracting the test package):
 | File | Purpose |
 |---|---|
 | `bloch-pos` | the known-good canonical binary |
-| `SHA256SUMS` | manifest over **every** file in the package — the binary, `STAMP`, the drop-in, `README` and `install.sh` itself; all of them reach root |
+| `SHA256SUMS` | manifest over **every** file in the package — the binary, `STAMP`, launcher, drop-in, `README` and `install.sh` itself; all of them reach root |
 | `SHA256SUMS.minisig` | **detached minisign signature over that manifest** (§5.4) — the only thing in the package that a tampered tarball cannot forge |
 | `STAMP` | the release identity; `install.sh` prints it and refuses on hash mismatch |
-| `99-rollback.conf` | systemd drop-in — `ExecStart=` reset + rollback path; named `99-` so it sorts after every stacked drop-in and therefore wins |
-| `install.sh` | **verify the detached signature against an out-of-band key → `sha256sum -c` the signed manifest** → stage to `/opt/bloch/releases/rollback-<id>/` → record what WAS running (incident log) → install drop-in → restart → **prove via `/proc` that the running hash equals the packaged hash**, failing loudly if any generator still overrides it. `./install.sh --verify-only` runs the two verification steps and stops |
+| `rollback-launcher` | signed launcher that reads the captured NUL-delimited argv from standard input into an array and `exec`s the rollback binary without `eval`, shell re-parsing or systemd argument re-quoting; systemd opens the root-only staged `argv.nul` via `StandardInput=file:` before applying the unit's `User=` |
+| `99-rollback.conf` | systemd drop-in — `ExecStart=` reset + rollback launcher path; named `99-` so it sorts after every stacked drop-in and therefore wins |
+| `install.sh` | **verify the detached signature against an out-of-band key → `sha256sum -c` the signed manifest** → require a running service and snapshot its effective `/proc/<pid>/cmdline` → stage to `/opt/bloch/releases/rollback-<id>/` → install drop-in → restart → **prove via `/proc` that the running hash equals the packaged hash and every argument after argv[0] is byte-for-byte unchanged**, failing loudly if either differs. `./install.sh --verify-only` runs the package verification and stops |
 | `README` | apply / un-apply instructions, and how to verify the package by hand |
 
 The signing public key is **published beside the tarball, never inside it**
@@ -211,7 +241,12 @@ A package that has not passed this on a scratch host does not count for G8:
 2. Run `sudo ./install.sh bloch-pos-scratch.service` from the extracted
    package. It must end with `ROLLBACK APPLIED AND VERIFIED` — that line is
    printed only after the running `/proc/PID/exe` hash equals the packaged
-   hash, i.e. after proving it beat the stacked drop-ins.
+   hash, i.e. after proving it beat the stacked drop-ins. Give the scratch
+   unit arguments containing spaces, an empty argument, glob characters,
+   quotes, `$()` text and `%` specifier-like text; compare the NUL-delimited
+   `/proc/PID/cmdline` before and after (ignoring argv[0]) and require an exact
+   match. The installer performs this comparison itself and fails closed on a
+   mismatch. This proves arguments are data, not shell or systemd syntax.
 3. Corrupt one byte of the packaged `bloch-pos` and re-run: `install.sh` must
    refuse at the `sha256sum -c` step. (Negative test — a rollback that
    installs corrupt bytes is worse than the outage.)
@@ -282,15 +317,17 @@ the whole flow with a disposable keypair generated into a temp dir.
 
 ## 6. What CI proves automatically (and what it cannot)
 
-`pos-release-integrity` (`.gitlab-ci.yml`, `check` stage, **blocking**, ~1
-min, script `scripts/pos-release-integrity.sh`, modelled on
+`pos-release-integrity` (`.gitlab-ci.yml`, `check` stage, and
+`.github/workflows/security.yml`, both **blocking**, script
+`scripts/pos-release-integrity.sh`, modelled on
 `falcon-clean-guard`) proves on every pipeline:
 
 1. pinned toolchain present and active for the crate directory;
 2. the root `Cargo.lock` resolves `--locked`, is not rewritten by the build,
    and is not shadowed by a lockfile inside any workspace member;
-3. two clean same-path builds of `bloch-pos` are **bit-identical** (fails =
-   nondeterminism regression — catch it before any release is cut);
+3. two clean builds of `bloch-pos`, from the same source path into independent
+   fresh target directories, are **bit-identical** (fails = nondeterminism or
+   target-path normalization regression — catch it before any release is cut);
 4. `bloch-pos --version` contains the exact commit under build (fails = the
    stamp broke, fleet binaries become untraceable again).
 
@@ -349,15 +386,17 @@ releases.
 
 ## 8. Not done here — stated, not narrowed away
 
-1. **No `bloch-pos` release container exists yet.** `Dockerfile` /
-   `deploy/repro/build.sh` build the Genesis-3 `bloch` node. The canonical
-   `/build` container (pinned base digest, `BLOCH_BUILD_COMMIT`,
-   `SOURCE_DATE_EPOCH`) for `bloch-pos` is specified here but not written —
-   deliberately, while the crate is a skeleton whose dependency set changes
-   per integration milestone. It must exist before the first real release.
-2. **No two-builder measurement.** Same-path determinism is measured (§3);
-   cross-builder container reproducibility is not — it needs the container
-   from (1) plus a second host.
+1. **The `bloch-pos` release-container candidate has not been built and
+   independently reproduced.** `deploy/pos-release/Dockerfile` and
+   `scripts/build-pos-release-container.sh` now define the canonical `/build`
+   recipe and export an explicitly unsigned, unauthorized candidate.
+   `scripts/compare-pos-release-builds.sh` refuses byte or provenance
+   disagreement. This macOS worktree had no Docker/BuildKit engine, so it did
+   not execute the Linux build.
+2. **No two-builder measurement.** Same-source-path determinism with
+   independent targets is measured (§3);
+   cross-builder container reproducibility still needs two independent Linux
+   hosts to build the same commit and retain the passing comparison record.
 3. **The measurement platform was macOS x86_64, not the fleet's Linux.** The
    findings (path-dependent `-Cmetadata`, same-path determinism) are
    compiler-level and expected to hold on Linux, but the Linux numbers have

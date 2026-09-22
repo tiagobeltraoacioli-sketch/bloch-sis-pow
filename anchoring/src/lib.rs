@@ -18,10 +18,10 @@
 //! pre-production.** The base chain is **ownerless, neutral, and agnostic**:
 //! anyone can build L2s, finality gadgets (FFGs), and RWA systems — **no
 //! category is reserved and Postern Labs holds no privilege.** Base
-//! mainnet-beta currently runs a **relaxed k=4 PoW regime → work is trivially
-//! forgeable and the low-hashrate network is 51%-attackable**; treat everything
-//! here as **experimental**. **BLCH is neutral gas — not a security, with no
-//! value claim from anyone.** RWA builders own their **own legal and regulatory
+//! interfaces model historical Genesis-3 PoW, not Genesis-4 validator finality.
+//! No live consensus transaction codec or authenticated inclusion verifier is
+//! implemented here. Treat this as an **experimental offline reference**.
+//! This crate makes no economic value claim. RWA builders own their **own legal and regulatory
 //! responsibility**.
 //!
 //! ## Shape of the crate

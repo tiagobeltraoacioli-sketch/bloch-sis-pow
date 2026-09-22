@@ -6,7 +6,8 @@ pub const MAX_CHARTER_MODULES: usize = 64;
 pub const MAX_CHARTER_BYTES: usize = 270_336;
 pub const MAX_KEY_BYTES: usize = 8192;
 pub const MAX_KEY_BYTES_TOTAL: usize = 262_144;
-// Structural ceiling only; the semantic quorum ceiling remains 253 (KRP-042).
+// Structural ceiling only; KRP-042 enforces a separate, stricter semantic
+// quorum ceiling after decoding.
 const MAX_SIGNER_ENTRIES: usize = 1024;
 
 /// Visit borrowed keys without constructing an intermediate vector. The caller

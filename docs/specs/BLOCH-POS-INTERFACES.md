@@ -7,8 +7,16 @@
 >
 > - **a maquinaria de taint** — dissolvida: o carryover atravessa como um conjunto so, sem lista de exclusao, entao nao ha classe de moeda a marcar.
 > - **o comite amostrado (128 por epoca + 8 por slot)** — substituido por particao do conjunto ativo: o quorum amostrado nao tinha denominador coerente (achado F1).
-> - **o supply de 100 bilhoes** — revertido para 21 bilhoes, o nominal da V2.
-> - **a fase hibrida de PoW** — apagada: a Genesis-3 para na altura 80.000 e a Genesis-4 nasce de uma snapshot.
+> - **o supply de 100 bilhoes** — vigente como split puro ×100/21; o retorno
+>   intermediario a 21 bilhoes tambem foi superado.
+> - **a fase hibrida de PoW** — apagada: a Genesis-3 parou na altura terminal
+>   39.918 e a Genesis-4 nasceu da snapshot assinada.
+> - **`StateRoots`** — preservado como DTO legado de 14 campos, sem
+>   implementacao de producao. Nao e a lista exaustiva do SMT vivo; essa
+>   autoridade e `state_root::STATE_COMPONENT_TAGS` (30 componentes).
+> - **ordem de erros** — precedencia de diagnostico e postura de DoS, nao dado
+>   de consenso. Consenso observa aceitacao/rejeicao e o estado filho; o erro
+>   local nao entra no bloco nem no state root.
 > - **o "L2 anchor" como consumidor** — decisao do fundador (2026-08-11): EVM na base (L1), sem rollup; o `bloch-l2-evm` sera substituido, entao onde este doc lista "L2 anchor" como consumidor de `FinalityGadget`/checkpoints, leia o EVM nativo e demais consumidores internos.
 >
 > O texto NAO foi reescrito, de proposito: o raciocinio que produziu cada
@@ -87,8 +95,8 @@ Plus three injected capability traits that keep the crate standalone:
 | Trait | Role |
 |---|---|
 | `KeyVerifier` | Hybrid signature verification by raw pubkey (deposits, evidence). The registry-index flavour already existed as `attestation::SignatureVerifier`. The PQ stack is never linked here; the verifier stays a caller decision. |
-| `StakeEligibility` | DEV-3's taint tracking behind one question: `deposit_input_status(utxo) → Eligible / Tainted / Shielded / Unknown`. Answers must come from the taint state committed at the parent block (`StateRoots::taint_root`). |
-| `StateReader` | Read access to one block's committed state — the **only** door consensus rules may reach through for chain data. Its method list is deliberately closed: a rule that needs a value not exposed must first make that value committed state (visible under `StateRoots`), which is §5.5 expressed as an API. |
+| `StakeEligibility` | DEV-3's taint tracking behind one question: `deposit_input_status(utxo) → Eligible / Tainted / Shielded / Unknown`. Answers must come from the taint component committed at the parent block; the oracle is retired/empty in Genesis-4. |
+| `StateReader` | Read access to one block's committed state — the **only** door consensus rules may reach through for chain data. A rule that needs a new value must first commit it through the live state-root component registry, which is §5.5 expressed as an API. |
 
 ### 2.1 `ProposerDuties` — block production
 
@@ -109,8 +117,10 @@ validation.
 DEV-1's concrete state object and the node's eUTXO transaction format (out of
 scope per §1.2 of the design). Epoch processing is a separate method because
 it must run even when the boundary slot is empty — a withheld proposal must
-not skip the epoch's reward and queue accounting. Error **order** is declared
-part of the frozen contract: which reject a node reports is consensus-visible.
+not skip the epoch's reward and queue accounting. Validation stays
+cheap-first and deterministic for DoS resistance and stable diagnostics, but
+the winning error for a multiply-invalid block is not consensus data. Only
+acceptance and the accepted child state are consensus-visible.
 
 ### 2.3 `RandomnessBeacon` — commit-reveal
 
@@ -163,29 +173,23 @@ functions are the only place consensus bytes become digests; every one is a
 consensus constant in function form and is pinned by A1 KATs. `BlockId` is a
 newtype with, in spirit, a single constructor (`StateCommitment::block_id`) —
 the type-level ban on the `pow_hash`/`block_hash` split that stalled tip
-selection (§5.4); A2 owns the property test. `StateRoots` is the closed list
-of committed components (§5.5), including the two Coherence roots, which are
-**carried, never recomputed** — the accumulator is C1-frozen and incremental,
-and re-rooting it would retroactively de-anonymise the pool (§6.6.1).
+selection (§5.4); A2 owns the property test. `StateRoots` is a frozen Phase-1
+DTO with 14 top-level fields, retained for compatibility but never implemented
+on the production path. It is not the live component schema. Production folds
+`state_root::ConsensusState`; the append-only `STATE_COMPONENT_TAGS` registry
+currently contains 30 components and is the count/name/tag authority.
 Attestations get their own tree, separate from transactions, so a finalized
 epoch's signatures can be pruned (§6.5.1) without disturbing the transaction
 commitment.
 
-**Extended once, 2026-08-11.** The transition implementation recorded here
-(rather than smuggled in) that its committed state held consensus-relevant
-values the closed list did not bind: finality bookkeeping, per-validator
-RANDAO chain positions, the deposit/delegation queues, pending fee rewards
-and fork-choice latest messages. §5.5's hard rule is senior to the freeze, so
-the list was opened along its own prescribed path — visibly, in a spec change
-— and now carries `finality_root`, `pending_votes_root`, `forkchoice_root`,
-`deposit_queue_root`, `delegation_root` and `pending_fees_root`; the registry
-component gained the RANDAO chain head/position, withdrawable-epoch and
-withdrawal-credential columns. What stays outside the root stays for a stated
-reconstruction reason (`transition.rs` module docs, pinned by test): the
-block id and slot are header-bound, the genesis constants are chain identity,
-the pubkey index is derived from the registry. As an interfaces change this
-carries the two-reviewer rule; the crate-side extension and its tests landed
-with the change.
+**Reconciled 2026-09-17.** The DTO was extended during early design, but later
+transition components continued in the concrete SMT without matching fields.
+No adapter ever folded `StateRoots`, and no production `StateCommitment`
+implementation exists. The compatibility type therefore remains frozen while
+the concrete registry is explicitly append-only. What stays outside the live
+root still needs a reconstruction argument (`transition.rs` module docs,
+pinned by tests): the block id and slot are header-bound, genesis constants are
+chain identity, and the pubkey index is derived from the registry.
 
 ---
 

@@ -75,8 +75,15 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> Result<u64> {
             .get(*pos)
             .ok_or_else(|| AnchorError::TxDecode("truncated varint".into()))?;
         *pos += 1;
-        result |= ((byte & 0x7f) as u64) << shift;
+        let payload = byte & 0x7f;
+        if shift == 63 && payload > 1 {
+            return Err(AnchorError::TxDecode("varint overflow".into()));
+        }
+        result |= (payload as u64) << shift;
         if byte & 0x80 == 0 {
+            if shift > 0 && payload == 0 {
+                return Err(AnchorError::TxDecode("noncanonical varint".into()));
+            }
             break;
         }
         shift += 7;
@@ -122,12 +129,13 @@ impl Transaction {
         out
     }
 
-    /// Serialize and hex-encode (what `sendrawtransaction` expects).
+    /// Serialize and hex-encode the mock codec; NOT consensus broadcast bytes.
     pub fn to_hex(&self) -> String {
         hex::encode(self.serialize())
     }
 
-    /// Parse from the minimal wire bytes.
+    /// Parse exactly one canonical minimal-codec transaction, with no trailing
+    /// bytes or overlong/overflowing LEB128 fields. This is NOT a consensus decoder.
     pub fn deserialize(buf: &[u8]) -> Result<Self> {
         let mut pos = 0usize;
         let version = u32::from_le_bytes(
@@ -136,6 +144,11 @@ impl Transaction {
                 .map_err(|_| AnchorError::TxDecode("version".into()))?,
         );
         let in_count = read_varint(buf, &mut pos)?;
+        // Even an empty-script input needs 32+4+1+4 bytes. Reject impossible
+        // counts before allocating or iterating over attacker-supplied counts.
+        if in_count > (buf.len().saturating_sub(pos) / 41) as u64 {
+            return Err(AnchorError::TxDecode("input count exceeds remaining bytes".into()));
+        }
         let mut inputs = Vec::with_capacity(in_count.min(1024) as usize);
         for _ in 0..in_count {
             let prev_txid: [u8; 32] = read_bytes(buf, &mut pos, 32)?
@@ -146,7 +159,8 @@ impl Transaction {
                     .try_into()
                     .map_err(|_| AnchorError::TxDecode("prev_index".into()))?,
             );
-            let sig_len = read_varint(buf, &mut pos)? as usize;
+            let sig_len = usize::try_from(read_varint(buf, &mut pos)?)
+                .map_err(|_| AnchorError::TxDecode("signature length exceeds platform range".into()))?;
             let script_sig = read_bytes(buf, &mut pos, sig_len)?.to_vec();
             let sequence = u32::from_le_bytes(
                 read_bytes(buf, &mut pos, 4)?
@@ -161,6 +175,9 @@ impl Transaction {
             });
         }
         let out_count = read_varint(buf, &mut pos)?;
+        if out_count > (buf.len().saturating_sub(pos) / 9) as u64 {
+            return Err(AnchorError::TxDecode("output count exceeds remaining bytes".into()));
+        }
         let mut outputs = Vec::with_capacity(out_count.min(1024) as usize);
         for _ in 0..out_count {
             let value = u64::from_le_bytes(
@@ -168,7 +185,8 @@ impl Transaction {
                     .try_into()
                     .map_err(|_| AnchorError::TxDecode("value".into()))?,
             );
-            let spk_len = read_varint(buf, &mut pos)? as usize;
+            let spk_len = usize::try_from(read_varint(buf, &mut pos)?)
+                .map_err(|_| AnchorError::TxDecode("script length exceeds platform range".into()))?;
             if spk_len > 10_000 {
                 return Err(AnchorError::TxDecode("implausible script_pubkey length".into()));
             }
@@ -183,6 +201,9 @@ impl Transaction {
                 .try_into()
                 .map_err(|_| AnchorError::TxDecode("locktime".into()))?,
         );
+        if pos != buf.len() {
+            return Err(AnchorError::TxDecode("trailing transaction bytes".into()));
+        }
         Ok(Transaction {
             version,
             inputs,
@@ -249,6 +270,39 @@ mod tests {
         let back = Transaction::from_hex(&hex).unwrap();
         assert_eq!(tx, back);
         assert_eq!(back.output_scripts().len(), 2);
+    }
+
+    #[test]
+    fn strict_varints_reject_aliases_and_tenth_byte_overflow() {
+        for value in [0, 1, 127, 128, u32::MAX as u64, u64::MAX] {
+            let mut bytes = Vec::new();
+            write_varint(&mut bytes, value);
+            let mut pos = 0;
+            assert_eq!(read_varint(&bytes, &mut pos).unwrap(), value);
+            assert_eq!(pos, bytes.len());
+        }
+        for bytes in [vec![0x80, 0], vec![0x81, 0],
+            [vec![0xff; 9], vec![2]].concat(), vec![0x80; 10]] {
+            assert!(read_varint(&bytes, &mut 0).is_err());
+        }
+    }
+
+    #[test]
+    fn strict_transaction_rejects_trailing_bytes_and_impossible_counts() {
+        let tx = Transaction { version: 1, inputs: vec![], outputs: vec![], locktime: 0 };
+        let bytes = tx.serialize();
+        assert_eq!(Transaction::deserialize(&bytes).unwrap(), tx);
+        let mut trailing = bytes.clone(); trailing.push(0);
+        assert!(Transaction::deserialize(&trailing).is_err());
+        let mut alias = bytes.clone(); alias.splice(4..5, [0x80, 0]);
+        assert!(Transaction::deserialize(&alias).is_err());
+        for output_count in [false, true] {
+            let mut huge = 1u32.to_le_bytes().to_vec();
+            if output_count { huge.push(0); }
+            write_varint(&mut huge, u64::MAX);
+            huge.extend_from_slice(&0u32.to_le_bytes());
+            assert!(Transaction::deserialize(&huge).is_err());
+        }
     }
 
     #[test]

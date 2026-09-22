@@ -243,8 +243,8 @@ pub fn attestation_root(attestations: &[Attestation]) -> [u8; 32] {
 // (`bloch-pos-node/src/engine.rs` binds that seam explicitly). Nothing outside
 // this crate's own tests ever called this one.
 //
-// Two validation stacks with divergent error orders is precisely the condition
-// that produced this week's defects: two block-identity functions, two state
+// Two validation stacks with divergent checks and accepted sets is precisely
+// the condition that produced this week's defects: two block-identity functions, two state
 // -root derivations (`state_root::randao_window` exists because of it), and a
 // header that committed to nothing — that last one *because* the three
 // commitment checks lived only here, in the stack nobody ran, so the stack that

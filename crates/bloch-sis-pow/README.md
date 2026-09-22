@@ -186,3 +186,18 @@ For security issues, **do not** open a public issue. Email
 ## License
 
 Dual MIT / Apache-2.0. See `LICENSE-MIT` and `LICENSE-APACHE`.
+
+## Checked difficulty inputs (CR-12, 2026-09-17)
+
+`difficulty::try_asert_next_bits` rejects a height before its anchor, invalid
+compact anchor bits, anchors rounded to a zero target, and arithmetic outside
+the historical `i64` range. Valid inputs use the same integer approximation,
+rounding and genesis/reanchored bounds as `asert_next_bits`.
+
+Historical `asert_next_bits` and `bits_to_target` remain unchanged for replay
+compatibility. The former can panic/wrap on invalid arithmetic inputs; the
+latter returns `Target::MIN` on invalid encodings. New input-validation code
+should use `try_asert_next_bits` and `try_bits_to_target` and handle errors
+explicitly. CR-12 remains partial until downstream historical callers receive
+a separate compatibility review and are migrated where appropriate. This
+change activates no consensus rule and modifies no recorded difficulty.

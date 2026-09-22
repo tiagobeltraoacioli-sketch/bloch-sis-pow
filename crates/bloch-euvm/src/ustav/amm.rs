@@ -177,11 +177,16 @@ impl PoolState {
                 return Err(Error::InvalidSnapshot);
             }
         } else {
-            let product = u128::from(snapshot.reserves[0]) * u128::from(snapshot.reserves[1]);
+            let product = u128::from(snapshot.reserves[0])
+                .checked_mul(u128::from(snapshot.reserves[1]))
+                .ok_or(Error::InvalidSnapshot)?;
+            let squared_supply = u128::from(snapshot.lp_supply)
+                .checked_mul(u128::from(snapshot.lp_supply))
+                .ok_or(Error::InvalidSnapshot)?;
             if snapshot.reserves.contains(&0)
                 || snapshot.revision == 0
                 || snapshot.lp_supply < MINIMUM_LIQUIDITY
-                || product < u128::from(snapshot.lp_supply) * u128::from(snapshot.lp_supply)
+                || product < squared_supply
                 || (snapshot.revision == 1
                     && (snapshot.lp_supply <= MINIMUM_LIQUIDITY
                         || snapshot.lp_supply != sqrt(product)))
@@ -292,7 +297,10 @@ impl PoolState {
                     return Err(Error::InvalidAction);
                 }
                 if self.lp_supply == 0 {
-                    let root = sqrt(u128::from(maximum[0]) * u128::from(maximum[1]));
+                    let product = u128::from(maximum[0])
+                        .checked_mul(u128::from(maximum[1]))
+                        .ok_or(Error::Overflow)?;
+                    let root = sqrt(product);
                     t.lp_mint = root
                         .checked_sub(MINIMUM_LIQUIDITY)
                         .filter(|v| *v > 0)
@@ -303,10 +311,14 @@ impl PoolState {
                     // Only the limiting side must fit LP accounting; a large
                     // unused maximum on the other side must not reject an add.
                     let candidates = [
-                        u128::from(maximum[0]) * u128::from(self.lp_supply)
-                            / u128::from(self.reserves[0]),
-                        u128::from(maximum[1]) * u128::from(self.lp_supply)
-                            / u128::from(self.reserves[1]),
+                        u128::from(maximum[0])
+                            .checked_mul(u128::from(self.lp_supply))
+                            .and_then(|v| v.checked_div(u128::from(self.reserves[0])))
+                            .ok_or(Error::Overflow)?,
+                        u128::from(maximum[1])
+                            .checked_mul(u128::from(self.lp_supply))
+                            .and_then(|v| v.checked_div(u128::from(self.reserves[1])))
+                            .ok_or(Error::Overflow)?,
                     ];
                     t.lp_mint = u64::try_from(candidates[0].min(candidates[1]))
                         .map_err(|_| Error::Overflow)?;
@@ -342,17 +354,28 @@ impl PoolState {
                     return Err(Error::InvalidAction);
                 }
                 let i = usize::from(input_index);
-                let o = 1 - i;
+                let o = 1usize.checked_sub(i).ok_or(Error::InvalidAction)?;
                 if self.reserves.contains(&0) {
                     return Err(Error::InsufficientLiquidity);
                 }
-                let effective = u128::from(amount) * (BPS - u128::from(self.fee_bps));
+                let fee_multiplier = BPS
+                    .checked_sub(u128::from(self.fee_bps))
+                    .ok_or(Error::Overflow)?;
+                let effective = u128::from(amount)
+                    .checked_mul(fee_multiplier)
+                    .ok_or(Error::Overflow)?;
                 // Full u64 triple products can exceed u128; reject instead of wrapping.
                 let numerator = effective
                     .checked_mul(u128::from(self.reserves[o]))
                     .ok_or(Error::Overflow)?;
-                let denominator = u128::from(self.reserves[i]) * BPS + effective;
-                let out = u64::try_from(numerator / denominator).map_err(|_| Error::Overflow)?;
+                let denominator = u128::from(self.reserves[i])
+                    .checked_mul(BPS)
+                    .and_then(|v| v.checked_add(effective))
+                    .ok_or(Error::Overflow)?;
+                let out = u64::try_from(
+                    numerator.checked_div(denominator).ok_or(Error::Overflow)?,
+                )
+                .map_err(|_| Error::Overflow)?;
                 if out == 0 || out >= self.reserves[o] {
                     return Err(Error::InsufficientLiquidity);
                 }
@@ -364,9 +387,14 @@ impl PoolState {
                 t.next.reserves[i] = self.reserves[i]
                     .checked_add(amount)
                     .ok_or(Error::Overflow)?;
-                t.next.reserves[o] = self.reserves[o] - out;
-                if u128::from(t.next.reserves[0]) * u128::from(t.next.reserves[1])
-                    < u128::from(self.reserves[0]) * u128::from(self.reserves[1])
+                t.next.reserves[o] = self.reserves[o].checked_sub(out).ok_or(Error::Overflow)?;
+                let next_product = u128::from(t.next.reserves[0])
+                    .checked_mul(u128::from(t.next.reserves[1]))
+                    .ok_or(Error::Overflow)?;
+                let previous_product = u128::from(self.reserves[0])
+                    .checked_mul(u128::from(self.reserves[1]))
+                    .ok_or(Error::Overflow)?;
+                if next_product < previous_product
                 {
                     return Err(Error::InvalidAction);
                 }
@@ -384,10 +412,10 @@ impl PoolState {
                         return Err(Error::Slippage);
                     }
                     t.user_credit[i] = out;
-                    t.next.reserves[i] = self.reserves[i] - out;
+                    t.next.reserves[i] = self.reserves[i].checked_sub(out).ok_or(Error::Overflow)?;
                 }
                 t.lp_burn = lp;
-                t.next.lp_supply = self.lp_supply - lp;
+                t.next.lp_supply = self.lp_supply.checked_sub(lp).ok_or(Error::Overflow)?;
             }
         }
         t.next.revision = self.revision.checked_add(1).ok_or(Error::Overflow)?;
@@ -398,26 +426,39 @@ fn mul_div(a: u64, b: u64, d: u64) -> Result<u64, Error> {
     if d == 0 {
         return Err(Error::InsufficientLiquidity);
     }
-    u64::try_from(u128::from(a) * u128::from(b) / u128::from(d)).map_err(|_| Error::Overflow)
+    let value = u128::from(a)
+        .checked_mul(u128::from(b))
+        .and_then(|v| v.checked_div(u128::from(d)))
+        .ok_or(Error::Overflow)?;
+    u64::try_from(value).map_err(|_| Error::Overflow)
 }
 fn mul_div_ceil(a: u64, b: u64, d: u64) -> Result<u64, Error> {
     if d == 0 {
         return Err(Error::InsufficientLiquidity);
     }
-    let product = u128::from(a) * u128::from(b);
+    let product = u128::from(a)
+        .checked_mul(u128::from(b))
+        .ok_or(Error::Overflow)?;
     let divisor = u128::from(d);
-    u64::try_from(product / divisor + u128::from(product % divisor != 0))
+    let quotient = product.checked_div(divisor).ok_or(Error::Overflow)?;
+    let remainder = product.checked_rem(divisor).ok_or(Error::Overflow)?;
+    u64::try_from(
+        quotient
+            .checked_add(u128::from(remainder != 0))
+            .ok_or(Error::Overflow)?,
+    )
         .map_err(|_| Error::Overflow)
 }
 fn sqrt(n: u128) -> u64 {
     let mut low = 0u128;
     let mut high = u128::from(u64::MAX);
     while low < high {
-        let mid = low + (high - low + 1) / 2;
-        if mid * mid <= n {
+        let half_span = high.saturating_sub(low).saturating_add(1).div_euclid(2);
+        let mid = low.saturating_add(half_span);
+        if mid.saturating_mul(mid) <= n {
             low = mid;
         } else {
-            high = mid - 1;
+            high = mid.saturating_sub(1);
         }
     }
     low as u64

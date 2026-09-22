@@ -143,10 +143,10 @@ pqcrypto-mldsa   = "0.1"
 pqcrypto-falcon  = { version = "0.4", default-features = false, features = ["std"] }
 pqcrypto-traits  = "0.3"
 pqcrypto-kyber   = "0.8"
-# Sprint T.1: direct dep on pqcrypto-internals so we can call `with_seeded_rng`
+# Sprint T.1: direct dep on pqcrypto-internals so KATs can call `with_seeded_rng_scope`
 # from the pqcrypto-internals fork (see [patch.crates-io] at bottom). Upstream also
 # exposes this as `pub extern "C" fn PQCRYPTO_RUST_randombytes` — we depend on
-# the forked Rust API `with_seeded_rng` / `SeededRngGuard` which the upstream
+# the forked Rust API `with_seeded_rng_scope` which the upstream
 # crate does NOT provide. The fork is a strict superset of upstream 0.2.11.
 pqcrypto-internals = "0.2"
 hkdf             = "0.12"

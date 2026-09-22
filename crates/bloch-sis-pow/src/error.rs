@@ -89,6 +89,34 @@ impl fmt::Display for BitsError {
 #[cfg(feature = "std")]
 impl std::error::Error for BitsError {}
 
+/// Invalid input to the checked ASERT API. Historical replay uses its own
+/// compatibility entry point; callers of the checked API must handle errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsertError {
+    /// The requested height precedes the fixed anchor.
+    HeightBeforeAnchor,
+    /// A height/timestamp intermediate cannot be represented by historical i64 arithmetic.
+    ArithmeticOverflow,
+    /// Invalid compact anchor encoding.
+    InvalidAnchor(BitsError),
+    /// The anchor decodes to zero after compact right-shift rounding.
+    ZeroAnchorTarget,
+}
+
+impl fmt::Display for AsertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HeightBeforeAnchor => f.write_str("ASERT height precedes anchor"),
+            Self::ArithmeticOverflow => f.write_str("ASERT arithmetic exceeds i64 range"),
+            Self::InvalidAnchor(error) => write!(f, "invalid ASERT anchor: {error}"),
+            Self::ZeroAnchorTarget => f.write_str("ASERT anchor target is zero"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for AsertError {}
+
 /// Errors from the verifier (verify side).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyError {

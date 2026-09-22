@@ -3,7 +3,7 @@
 # Flag day — the ADR-041 validator lifecycle (epoch **L**)
 
 ```
-LIFECYCLE_EPOCH = unarmed
+LIFECYCLE_EPOCH = 2884
 ```
 
 That line is machine-read. `scripts/arm-lifecycle-epoch.py --write` flips it
@@ -320,8 +320,11 @@ minor):
 5. Release notes carry: L and its UTC time, the §4.2 measured list as
    retired, the VAD-04 harness verdict (§3.3), and the §6 sweep tables.
 
-`getbuildinfo` on the shipped binary must report the release commit and a
-`tree_state` of clean — those two fields are what the fleet sweep compares.
+`getbuildinfo` on the shipped canonical-container binary must report the
+release commit and a `tree_state` of `asserted-clean` — the container receives
+an archived commit rather than a `.git` directory, so the release recipe's
+clean-tree assertion is explicit. Those two fields are what the fleet sweep
+compares.
 
 ---
 

@@ -72,7 +72,7 @@ impl<T: RpcTransport> BlochRpc<T> {
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
         let id = {
             let mut g = self.id.borrow_mut();
-            *g += 1;
+            *g = g.checked_add(1).ok_or_else(|| AnchorError::BadResponse("RPC request ID exhausted".into()))?;
             *g
         };
         let body = json!({
@@ -84,6 +84,14 @@ impl<T: RpcTransport> BlochRpc<T> {
         .to_string();
 
         let resp = self.transport.request(&body)?;
+
+        if resp.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+            || resp.get("id").and_then(Value::as_u64) != Some(id) {
+            return Err(AnchorError::BadResponse("wrong JSON-RPC version or response ID".into()));
+        }
+        if resp.get("error").is_some_and(|error| !error.is_null()) && resp.get("result").is_some() {
+            return Err(AnchorError::BadResponse("response contains both result and error".into()));
+        }
 
         // Standard JSON-RPC error object.
         if let Some(err) = resp.get("error") {
@@ -129,14 +137,9 @@ impl<T: RpcTransport> BlochRpc<T> {
     /// `gettxstatus` — confirmation depth + (optional) height.
     pub fn get_tx_status(&self, txid: &Txid) -> Result<TxStatus> {
         let result = self.call("gettxstatus", json!([txid.to_hex()]))?;
-        let confirmations = result
-            .get("confirmations")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let height = result
-            .get("height")
-            .and_then(Value::as_u64)
-            .or_else(|| result.get("blockheight").and_then(Value::as_u64));
+        let confirmations = result.get("confirmations").and_then(Value::as_u64)
+            .ok_or_else(|| AnchorError::BadResponse("missing or invalid confirmations".into()))?;
+        let height = parse_height(&result)?;
         Ok(TxStatus {
             confirmations,
             height,
@@ -147,16 +150,21 @@ impl<T: RpcTransport> BlochRpc<T> {
     /// depth. Accepts either an `outputs`/`vout` array of `{script_pubkey: hex}`
     /// objects, or a raw `hex` field parsed with the minimal codec.
     pub fn get_transaction(&self, txid: &Txid) -> Result<RetrievedTx> {
+        self.get_transaction_inner(txid, true)
+    }
+
+    /// Require explicit decoded outputs from RPC. Never guess that node raw
+    /// bytes use this crate's incompatible mock transaction codec.
+    pub fn get_transaction_outputs_only(&self, txid: &Txid) -> Result<RetrievedTx> {
+        self.get_transaction_inner(txid, false)
+    }
+
+    fn get_transaction_inner(&self, txid: &Txid, allow_reference_codec: bool) -> Result<RetrievedTx> {
         let result = self.call("gettransaction", json!([txid.to_hex()]))?;
 
-        let confirmations = result
-            .get("confirmations")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let height = result
-            .get("height")
-            .and_then(Value::as_u64)
-            .or_else(|| result.get("blockheight").and_then(Value::as_u64));
+        let confirmations = result.get("confirmations").and_then(Value::as_u64)
+            .ok_or_else(|| AnchorError::BadResponse("missing or invalid confirmations".into()))?;
+        let height = parse_height(&result)?;
 
         // Preferred: explicit output list.
         let outputs = result
@@ -181,7 +189,10 @@ impl<T: RpcTransport> BlochRpc<T> {
             });
         }
 
-        // Fallback: raw tx hex.
+        if !allow_reference_codec {
+            return Err(AnchorError::BadResponse("explicit decoded outputs required; mock-codec fallback disabled".into()));
+        }
+        // Historical reference-only fallback; never a consensus decoder.
         if let Some(raw) = result.get("hex").and_then(Value::as_str) {
             let tx = crate::tx::Transaction::from_hex(raw)?;
             return Ok(RetrievedTx {
@@ -195,6 +206,20 @@ impl<T: RpcTransport> BlochRpc<T> {
             "gettransaction had neither outputs nor hex".into(),
         ))
     }
+}
+
+fn parse_height(result: &Value) -> Result<Option<u64>> {
+    let mut height = None;
+    for key in ["height", "blockheight"] {
+        if let Some(value) = result.get(key).filter(|value| !value.is_null()) {
+            let parsed = value.as_u64().ok_or_else(|| AnchorError::BadResponse(format!("invalid {key}")))?;
+            if height.is_some_and(|previous| previous != parsed) {
+                return Err(AnchorError::BadResponse("conflicting height fields".into()));
+            }
+            height = Some(parsed);
+        }
+    }
+    Ok(height)
 }
 
 // ─────────────────────────── in-memory mock node ───────────────────────────
@@ -292,6 +317,9 @@ impl RpcTransport for MockTransport {
                         let confs = Self::confirmations_of(&st, *mined);
                         ok(json!({
                             "hex": raw,
+                            "outputs": crate::tx::Transaction::from_hex(raw)?.outputs.iter()
+                                .map(|output| json!({"script_pubkey": hex::encode(&output.script_pubkey)}))
+                                .collect::<Vec<_>>(),
                             "confirmations": confs,
                             "height": mined,
                         }))
@@ -336,6 +364,23 @@ mod tests {
     }
 
     #[test]
+    fn strict_output_reader_never_guesses_mock_codec_for_rpc_hex() {
+        struct HexOnly;
+        impl RpcTransport for HexOnly {
+            fn request(&self, body: &str) -> Result<Value> {
+                let request: Value = serde_json::from_str(body).map_err(|e| AnchorError::Transport(e.to_string()))?;
+                let tx = crate::tx::Transaction { version: 1, inputs: vec![], outputs: vec![], locktime: 0 };
+                Ok(json!({"jsonrpc":"2.0", "id":request["id"],
+                    "result":{"hex":tx.to_hex(), "height":1, "confirmations":1}}))
+            }
+        }
+        let rpc = BlochRpc::new(HexOnly);
+        let id = Txid::from_bytes([1; 32]);
+        assert!(rpc.get_transaction(&id).is_ok(), "historical mock codec compatibility");
+        assert!(matches!(rpc.get_transaction_outputs_only(&id), Err(AnchorError::BadResponse(_))));
+    }
+
+    #[test]
     fn result_error_quirk_is_surfaced() {
         let rpc = BlochRpc::new(MockTransport::new(0));
         let missing = Txid::from_bytes([0u8; 32]);
@@ -344,5 +389,39 @@ mod tests {
             rpc.get_transaction(&missing),
             Err(AnchorError::Rpc(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod audit_envelope {
+    use super::*;
+    struct Fixed(Value);
+    impl RpcTransport for Fixed {
+        fn request(&self, _: &str) -> Result<Value> { Ok(self.0.clone()) }
+    }
+    #[test]
+    fn refuses_cross_request_and_malformed_envelopes() {
+        for response in [json!({"result": 12}),
+            json!({"jsonrpc":"2.0", "id":2, "result":12}),
+            json!({"jsonrpc":"1.0", "id":1, "result":12}),
+            json!({"jsonrpc":"2.0", "id":1, "result":12, "error":{"code":-1}})] {
+            assert!(BlochRpc::new(Fixed(response)).get_block_count().is_err());
+        }
+        assert_eq!(BlochRpc::new(Fixed(json!({"jsonrpc":"2.0", "id":1, "result":12})))
+            .get_block_count().unwrap(), 12);
+    }
+}
+
+#[cfg(test)]
+mod audit_status {
+    use super::*;
+    #[test]
+    fn refuses_invalid_or_conflicting_height_metadata() {
+        for value in [json!({"height":"3"}), json!({"height":-1}),
+            json!({"height":3, "blockheight":4})] {
+            assert!(parse_height(&value).is_err());
+        }
+        assert_eq!(parse_height(&json!({"height":null})).unwrap(), None);
+        assert_eq!(parse_height(&json!({"height":3,"blockheight":3})).unwrap(), Some(3));
     }
 }

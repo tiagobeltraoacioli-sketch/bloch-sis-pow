@@ -7,22 +7,13 @@
 //! (`spikes/prover-cost/RESULTS.md`): 7,274,849 RV32IM instructions per
 //! ML-DSA-65 ‖ Falcon-1024 verification, and a 4,589-byte signature.
 //!
-//! These are LIVE consensus constants, and several of the activation heights
-//! below are bound, not inert: `LEAKED_ROSTER_ACTIVATION_EPOCH` (1400),
-//! `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` (800) and
-//! `BLOCK_BYTES_V2_ACTIVATION_EPOCH` (800) are all epochs the chain is past.
-//! `LEAK_RECOVERY_ACTIVATION_EPOCH` is armed at 2700 (2026-09-06);
-//! `ANCESTRY_SEED_ACTIVATION_EPOCH`, `DEPOSIT_ACTIVATION_EPOCH`,
-//! `EXIT_AUTH_ACTIVATION_EPOCH`, `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`,
-//! `SLASHING_EVIDENCE_ACTIVATION_EPOCH`, `DUST_RULE_ACTIVATION_EPOCH`,
-//! `RANDAO_RECOMMIT_ACTIVATION_EPOCH` and `TX_BYTES_BOUND_ACTIVATION_EPOCH`
-//! are the ones still at `u64::MAX`.
-//!
-//! Until 2026-09-02 this header said nothing here was active and that the
-//! crate held no activation height at all because it was not wired into the
-//! node. All three clauses were false: the crate is a path-dependency of
-//! `bloch-pos-node`, and this file has five activation constants, three of
-//! them bound.
+//! These constants are live consensus rules. Epochs 800 and 1400 are already
+//! historical. The coordinated recovery release schedules leak recovery at
+//! epoch 2880 (2026-09-14 21:31:19 UTC), followed by all five ADR-041 lifecycle
+//! gates at epoch 2884 (2026-09-14 22:35:19 UTC). Every validating node must
+//! carry this schedule before the first boundary. Other unarmed gates remain
+//! at `u64::MAX`; in particular, legacy unfunded admission stays disabled.
+//! See `docs/VALIDATOR-OPENING.md` for qualification and rollout requirements.
 
 /// Full committee, voting once at each epoch boundary for justification and
 /// finality. At 4,589 B per signature this is ≈ 588 KB in the epoch-boundary
@@ -121,6 +112,10 @@ pub const SLOT_DURATION_SECS: u64 = 30;
 /// trade — a bounded DoS in exchange for a liveness ceiling — and it is the
 /// reason the value is 4,096 rather than the ~10 that history alone would
 /// justify. Raising or lowering it is a consensus change and a founder call.
+///
+/// This bound alone does not guarantee recovery after an outage: before
+/// DUTY_ROSTER_RECOVERY_ACTIVATION_EPOCH, roughly 60 empty epochs can exhaust
+/// every duty weight (FC-01). The 45-day number is only the epoch-walk bound.
 ///
 /// # This is the backstop, not the first line
 ///
@@ -1194,17 +1189,17 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// that never leaked, so blocks before the first bite replay unchanged and the
 /// break point is the first epoch boundary that accrues one.
 ///
-/// **ARMED at epoch 2700** (founder decision, 2026-09-06; ≈2026-09-12 wall
-/// clock at 90 epochs/day from epoch ~2070). Below 2700 the shipped arithmetic
-/// is unchanged — the unfloored, leak-adjusted denominator of the 2026-08-24
-/// incident. At and after 2700 the denominator floor and the leak recovery are
-/// in force.
+/// **Scheduled at epoch 2880**, 2026-09-14 21:31:19 UTC. The epoch-2700
+/// deployment deadline was missed by the legacy signing fleet. Exact replay
+/// with 2700 stops at slot 86431 and cannot reproduce the operator-approved
+/// epoch-2713 checkpoint. This coordinated replacement preserves that history
+/// and applies the same recovery and one-half floor policy prospectively.
+/// See the 2026-09-13 activation preflight for retained replay evidence.
 ///
-/// DEPLOYMENT DEADLINE: every validator must run a binary carrying this value
-/// BEFORE epoch 2700. A fleet split across old/new binaries at that boundary
-/// diverges — this is a flag day, and the coordinated rebuild is the
-/// operational half of the decision.
-pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = 2_700;
+/// Every validator must carry this value BEFORE epoch 2880. Postpone the
+/// coordinated release before that boundary if fleet qualification fails;
+/// a partially upgraded fleet must not cross it.
+pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = 2_880;
 
 /// Flag day for **unfunded bonding**: the epoch at and after which the legacy
 /// `Deposit` and `Delegate` messages are valid. Below it they are refused by
@@ -1282,19 +1277,17 @@ pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = 2_700;
 ///
 /// Deposits open by a different route: a funded, authenticated message that
 /// spends transparent eUTXO inputs and carries a proof of possession — the form
-/// `staking::validate_deposit` and `DepositTx` already describe and nothing
-/// encodes. That form needs a wire tag, the tag space above the released range
-/// is contested across live lineages, and the registry that resolves it is the
-/// founder's to assign. When it lands it brings its OWN activation constant.
-/// This one stays `u64::MAX` and the legacy arm stays refused, permanently.
+/// is implemented by wire tag `0x0B`, with its own activation constant at
+/// lifecycle epoch 2884 (2026-09-14). This constant stays `u64::MAX`, so the
+/// legacy unfunded arm remains refused.
 ///
 /// `deposit_gate_is_inert` pins the value, so arming it means deleting a test
 /// that says all of the above out loud.
 pub const DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Flag day for the **authenticated voluntary exit** (§7.2) and the per-epoch
-/// exit churn cap. `u64::MAX` = INERT: no epoch reaches it, so on every node
-/// running this crate today the rule below is written down and does nothing.
+/// exit churn cap, coordinated at lifecycle epoch 2884 (2026-09-14).
+/// The historical rules remain in force before that boundary.
 ///
 /// # The hole it closes
 ///
@@ -1329,20 +1322,11 @@ pub const DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// block's own header slot by `compute_post_state`'s boundary walk, never
 /// node-local. The 2026-08-08 `expected_bits` fork is the standing reason.
 ///
-/// # ARMING THIS IS A FOUNDER DECISION, AND IT HAS A PRECONDITION
-///
-/// Two, actually. (1) The whole fleet must already be running a binary that
-/// carries this rule, because the first post-gate block changes the verdict on
-/// legacy `Exit` — a node without the rule accepts what a node with it
-/// refuses. (2) `ExitV2` has **no decoder arm**: wire byte `0x08` is
-/// CONTESTED across live lineages (`SignedExit`, `Withdraw`, `ExitV2` all
-/// claim it — see `tests/wire_tag_registry.rs`), and this tree refuses to
-/// decode it until the founder rules on the byte. Arming this constant
-/// without that ruling retires the legacy message and puts nothing in its
-/// place: voluntary exit would simply stop existing.
-///
-/// `exit_auth_gate_is_inert` pins the value.
-pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// ADR-041 assigned ExitV2 the fresh tag `0x0C`; the decoder and signature
+/// verification are implemented. The operator scheduled the coordinated
+/// lifecycle boundary at epoch 2884. All nodes must be upgraded before it:
+/// the legacy exit becomes invalid at the same boundary that enables ExitV2.
+pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = 2_884;
 
 /// Flag day for the **fee-to-stake decoupling** (finding C-R2-2, 2026-09-05).
 ///
@@ -1378,11 +1362,10 @@ pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = u64::MAX;
 pub const FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Flag day for the **slashing-evidence transaction** (§7.3), wire tag `0x05`.
-/// `u64::MAX` = INERT: no epoch reaches it, so on every node running this
-/// crate today a block that carries tag `0x05` is refused by the transition
-/// (`TxReject::EvidenceNotActive`) at every reachable epoch — exactly the
-/// verdict an older binary reaches at its decoder, so a mixed fleet agrees on
-/// every block until the day.
+/// Scheduled with the ADR-041 lifecycle at epoch 2884. Before that epoch,
+/// tag `0x05` is refused by the transition (`TxReject::EvidenceNotActive`).
+/// Scheduling this gate is not evidence that a running fleet has upgraded or
+/// that a particular finalized block carries an economic settlement guarantee.
 ///
 /// # The hole it exists to close (F-02, Round 2)
 ///
@@ -1396,12 +1379,12 @@ pub const FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// economic cost, and the Casper security argument did not hold on the live
 /// chain. The wire format now carries both envelopes whole (the header or
 /// attestation plus its signature, re-verified by every node), so evidence
-/// decodes — and THIS constant is what keeps the change inert until the
-/// founder schedules it.
+/// decodes, and this constant gates its inclusion until the coordinated
+/// lifecycle boundary.
 ///
 /// # What the gate switches at one epoch
 ///
-/// - **below** (every epoch today): a block carrying a `SlashingEvidence`
+/// - **below**: a block carrying a `SlashingEvidence`
 ///   transaction is consensus-INVALID (`EvidenceNotActive`), and the node's
 ///   mempool refuses to admit or relay one (`admissible`);
 /// - **at and above**: the evidence transaction becomes valid where the pair
@@ -1413,16 +1396,63 @@ pub const FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// boundary walk — committed state, never a clock. The 2026-08-08
 /// `expected_bits` fork is the standing reason.
 ///
-/// # ARMING THIS IS A FOUNDER DECISION, AND IT HAS A PRECONDITION
+/// # Deployment precondition and evidence boundary
 ///
-/// The whole fleet must already run a binary whose decoder understands the
+/// The schedule requires the whole fleet to run a binary whose decoder understands the
 /// evidence wire format: below the gate old and new binaries agree (both
 /// refuse the block, one at decode and one at the transition), but the first
 /// post-gate block that carries evidence is accepted only by nodes that can
 /// decode it. Same rollout discipline as `LEAKED_ROSTER_ACTIVATION_EPOCH`.
 ///
-/// `slashing_evidence_gate_is_inert` pins the value.
-pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// The release tests pin this gate to the same epoch as funded admission.
+pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = 2_884;
+
+/// Candidate ST-03/ST-04 slashing-economics rules. `u64::MAX` means INERT.
+///
+/// Once armed, the correlation window records the penalty applied to the
+/// offender's effective consensus exposure, measured from the same frozen
+/// roster as the `total_active` denominator. This removes the current
+/// raw-bond/effective-stake unit mismatch. The same flag day also makes a
+/// slash lock the residue for at least the delay a same-epoch voluntary exit
+/// would have imposed; self-slashing can no longer release funds earlier.
+///
+/// This candidate deliberately does not cap or queue slashing ejections.
+/// Evidence still ejects at E+1 so a churn limit cannot buy immunity for a
+/// proven equivocator. Activation therefore remains an economic and liveness
+/// policy decision requiring historical replay, adversarial simulation and a
+/// coordinated release; this source does not make that decision.
+pub const SLASHING_ECONOMICS_V2_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn slashing_economics_v2_active(epoch: u64) -> bool {
+    slashing_economics_v2_start(epoch).is_some()
+}
+
+/// First epoch whose effective-exposure window entries belong to V2. At a
+/// future flag day, legacy raw-loss entries remain committed for replay but
+/// are not mixed into the new unit system.
+pub(crate) fn slashing_economics_v2_start(epoch: u64) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(start) = slashing_economics_v2_rehearsal::start() {
+        return (epoch >= start).then_some(start);
+    }
+    epoch_gate_active(epoch, SLASHING_ECONOMICS_V2_ACTIVATION_EPOCH)
+        .then_some(SLASHING_ECONOMICS_V2_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod slashing_economics_v2_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static START: Cell<Option<u64>> = const { Cell::new(None) }; }
+    pub fn start() -> Option<u64> { START.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        open_at(0)
+    }
+    pub fn open_at(epoch: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore { fn drop(&mut self) { START.with(|v| v.set(self.0)); } }
+        Restore(START.with(|v| v.replace(Some(epoch))))
+    }
+}
 
 /// **Flag day for the transfer dust rule — SHIPS INERT (`u64::MAX`).**
 ///
@@ -1472,8 +1502,8 @@ pub const MIN_TRANSFER_OUTPUT_SAT: u64 = 1_000;
 pub const MAX_TRANSFER_OUTPUTS: usize = 256;
 
 /// Flag day for the RANDAO **re-commit** transaction
-/// ([`crate::transition::PosTransaction::RandaoRecommit`]) — INERT at
-/// `u64::MAX`. **Do not arm without the founder's ruling.**
+/// ([`crate::transition::PosTransaction::RandaoRecommit`]), scheduled at
+/// epoch 2884 with the other ADR-041 lifecycle gates.
 ///
 /// # Why this exists: every RANDAO chain is terminal today
 ///
@@ -1502,19 +1532,11 @@ pub const MAX_TRANSFER_OUTPUTS: usize = 256;
 /// the `Deposit`/`ExitV2` gates, so today's fleet behaviour is unchanged
 /// byte for byte.
 ///
-/// # Arming has the same unmet precondition as `EXIT_AUTH_ACTIVATION_EPOCH`
-///
-/// The transaction's wire byte (`0x0A`) is claimed encode-side only: the
-/// decoder deliberately refuses it until the founder assigns the byte
-/// (`tests/wire_tag_registry.rs`). Arming this constant without that
-/// assignment activates rules nothing on the wire can reach. Both decisions
-/// — the byte and the flag day — are the founder's, and both have a hard
-/// deadline: they must be armed, with the fleet rebuilt, **before the first
-/// chain exhausts (~2027-02-11)**, or proposal liveness starts decaying
-/// validator by validator.
-///
-/// `randao_recommit_gate_is_inert` pins the value.
-pub const RANDAO_RECOMMIT_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// ADR-041 released the `0x0A` decoder and bound this gate to the lifecycle
+/// epoch. Every validator must upgrade before the boundary and before its
+/// existing RANDAO chain exhausts. The node automatically submits a valid
+/// recommit after exhaustion; this does not reset the old reveal history.
+pub const RANDAO_RECOMMIT_ACTIVATION_EPOCH: u64 = 2_884;
 
 /// Flag day for the **declared-size ceiling** on transfers (audit H-R7-2,
 /// 2026-09-05): at and above this epoch, a `Transfer`/`TransferV2` whose
@@ -1612,8 +1634,8 @@ pub const ATTESTATION_DEDUP_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///    `att.data.target_epoch == st.epoch` or `att.data.source_epoch` to name
 ///    the CURRENT justified checkpoint, and a validator with two DISTINCT
 ///    signing roots in the epoch (an in-block equivocator, caught by
-///    [`SLASHING_EVIDENCE_ACTIVATION_EPOCH`] once THAT arms, not by the
-///    reward pass) still earns full credit for whichever landed last. At and
+///    [`SLASHING_EVIDENCE_ACTIVATION_EPOCH`] from epoch 2884 onward, not by
+///    the reward pass) still earns full credit for whichever landed last. At and
 ///    above the gate, `close_epoch`'s credit loop additionally requires the
 ///    target/source binding and withholds credit from a two-signing-root
 ///    validator.
@@ -1732,6 +1754,23 @@ pub const REWARDS_V2_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// `forkchoice_equivocation_horizon_gate_is_inert` pins the inert value.
 pub const FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Candidate FC-05 fork-choice tiebreak. `u64::MAX` means INERT.
+///
+/// Once armed, equal-weight siblings from different slots prefer the earlier
+/// slot before falling back to the historical larger-root order. Slot is a
+/// signed, validated header field, so the next-slot proposer cannot grind its
+/// body root to displace an earlier honest sibling at zero weight. Same-slot
+/// siblings still need a deterministic root fallback and remain grindable;
+/// balancing attacks and a full proposer-boost design remain residual.
+///
+/// This changes the selected head, so activation requires attack simulation,
+/// historical replay and a coordinated fleet flag day.
+pub const FORKCHOICE_SLOT_TIEBREAK_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub fn forkchoice_slot_tiebreak_active(epoch: u64) -> bool {
+    epoch_gate_active(epoch, FORKCHOICE_SLOT_TIEBREAK_ACTIVATION_EPOCH)
+}
+
 /// How many slots of per-validator vote history the committed
 /// `fc_recent_votes` component retains once
 /// [`FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH`] binds: after the
@@ -1762,8 +1801,7 @@ pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 /// `u64::MAX` = INERT, below it every staking variant (`Deposit`, `Exit`,
 /// `Delegate`, `ExitV2`, `RandaoRecommit`, `SlashingEvidence`) is charged
 /// `fee_market::TxCharge { gas: 0, tx_bytes: 0, .. }` exactly as today, and
-/// no transaction-COUNT cap exists to consult (see "Not yet closed by this
-/// gate" below).
+/// [`MAX_TRANSACTIONS_PER_BLOCK`] is not consulted.
 ///
 /// # The hole this closes
 ///
@@ -1796,12 +1834,11 @@ pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 ///   what makes them bind on a staking-only body; no new cap is needed for
 ///   that half.
 ///
-/// **Not yet closed by this gate**: a consensus `MAX_TRANSACTIONS_PER_BLOCK`
-/// bound on transaction COUNT (of any kind), independent of the two byte/gas
-/// caps. That needs a new `TransitionError` variant, and `TransitionError`
-/// is defined in `interfaces.rs`, outside this pass's ownership; the
-/// metering half above is complete and gated, the count half is not — flagged
-/// here rather than silently dropped.
+/// The same gate also enables [`MAX_TRANSACTIONS_PER_BLOCK`], a count bound
+/// independent of byte/gas accounting. It covers every transaction class:
+/// otherwise a mixed body could evade the resource ceiling merely by changing
+/// tags. The check precedes canonical serialization, so an armed node does not
+/// allocate and hash an attacker-selected number of transactions first.
 ///
 /// The gate reads `CommittedState::epoch` — committed state rolled to the
 /// judged block's own `epoch_of(header.slot)`, never a clock. The 2026-08-08
@@ -1817,13 +1854,24 @@ pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 /// `staking_tx_metering_gate_is_inert` pins the value.
 pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Candidate consensus ceiling on transaction count, consulted only when
+/// [`STAKING_TX_METERING_ACTIVATION_EPOCH`] is armed.
+///
+/// The reference producer already stops at 256 transactions and its mempool
+/// holds at most 4,096. Matching the latter gives the candidate 16x headroom
+/// over an honest proposal while placing an implementation-independent bound
+/// on per-transaction dispatch and state-map work. This number is not a claim
+/// about historical non-reference producers, which is why the rule is not
+/// active without a coordinated protocol decision and replay qualification.
+pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 4_096;
+
 /// ADR-041 lifecycle release epoch for withdrawals (tag 0x0D).
-/// Disabled at u64::MAX. Must equal funded admission, authenticated exit,
+/// Scheduled at epoch 2884. Must equal funded admission, authenticated exit,
 /// slashing evidence and RANDAO renewal; compile-time assertions enforce it.
 /// Withdrawal pays the registered script, writes off unissued genesis
 /// principal, and consumes block capacity even with legacy metering disabled.
 /// Arming requires the release ceremony and rehearsals in ADR-041.
-pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = u64::MAX;
+pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = 2_884;
 
 /// Flag day for **network-bound transfer signing** (audit A2-3 / R7 M2,
 /// 2026-09-06): `u64::MAX` = INERT, below it `DS_SPEND`'s preimage is
@@ -1851,8 +1899,8 @@ pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///   `(n_spends, spend points, outputs, tx_bytes, tip)` preimage under
 ///   `DS_SPEND`, byte for byte;
 /// - **at and above**: the fold additionally covers a network-binding value
-///   (see [`crate::transition::PosTransaction::network_binding`]) under a NEW, distinct
-///   16-byte tag, `DS_SPEND2` (`b"BLCH4:SPEND2\0\0\0\0"` — not a prefix of
+///   (the committed genesis-manifest digest) under a NEW, distinct 16-byte
+///   tag, `DS_SPEND2` (`b"BLCH4:SPEND2\0\0\0\0"` — not a prefix of
 ///   `DS_SPEND` and not prefixed by it, since both are exactly 16 bytes with
 ///   different content), so a signature becomes a statement about one
 ///   transfer on ONE chain. V1 and V2 share the fold (one function, both
@@ -1875,8 +1923,35 @@ pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// `sighash_network_binding_gate_is_inert` pins the value.
 pub const SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Candidate flag day for genesis-bound validator duty signatures.
+///
+/// This remains deliberately unarmed. Attestation and proposal candidate roots
+/// are available for interoperability fixtures, but production signing,
+/// validation, gossip identity, and slashing evidence continue to use the
+/// historical roots until a coordinated activation specification covers all
+/// of those consumers and mixed-version behavior.
+pub const VALIDATOR_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// One shipped domain separator and the preimage shapes that use it.
+///
+/// `preimage_shapes` is an audit registry, not an encoding layer. Some frozen
+/// domains intentionally serve multiple structurally disjoint shapes; the
+/// descriptions name the marker, role byte, length or nested-domain property
+/// that keeps those shapes apart without changing historical digest bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DomainTag {
+    pub name: &'static str,
+    pub bytes: [u8; 16],
+    pub preimage_shapes: &'static [&'static str],
+}
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
-/// no tag can be a prefix of another.
+/// no tag can be a prefix of another. [`DOMAIN_TAGS`] below is the complete
+/// machine-readable registry.
+///
+/// Sortition covers weighted slot/epoch draws, the epoch partition and the
+/// inactive activation-queue candidate. Their final role bytes
+/// (`0x01`, `0x02`, `0x03`, `0x04`) are disjoint subdomains.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
 /// Attestation signing root domain.
 pub const DS_ATTEST: [u8; 16] = *b"BLCH4:ATTEST\0\0\0\0";
@@ -1884,13 +1959,18 @@ pub const DS_ATTEST: [u8; 16] = *b"BLCH4:ATTEST\0\0\0\0";
 /// `SHA3-256(DS_BLOCK ‖ canonical header)` — the tag is what guarantees a block
 /// id can never collide with any other domain's digest of the same bytes.
 pub const DS_BLOCK: [u8; 16] = *b"BLCH4:BLOCK\0\0\0\0\0";
-/// Transaction Merkle tree (`body_root`).
+/// Transaction/attestation Merkle trees (`body_root`). A marker byte separates
+/// leaf/node/empty and a following kind byte separates the two trees.
 pub const DS_BODY: [u8; 16] = *b"BLCH4:BODY\0\0\0\0\0\0";
-/// State SMT nodes (`state_root`).
+/// State SMT (`state_root`). Its next byte separates leaf, node, empty, key
+/// derivation and value hashing.
 pub const DS_STATE: [u8; 16] = *b"BLCH4:STATE\0\0\0\0\0";
-/// Beacon mixing (§6.3): `mix' = SHA3-256(DS_RANDAO ‖ mix ‖ reveal)`.
+/// Beacon mixing and recommitment (§6.3). Their fixed preimages are 80 and 60
+/// bytes including the tag, respectively, so neither is a prefix of the other.
 pub const DS_RANDAO: [u8; 16] = *b"BLCH4:RANDAO\0\0\0\0";
-/// Deposit message signing root (§7.1 proof of possession).
+/// Deposit proof-of-possession roots. The legacy fixed-width deposit and the
+/// funded wire deposit are frozen uses; the latter length-prefixes both
+/// variable-width fields and covers its additional commission field.
 pub const DS_DEPOSIT: [u8; 16] = *b"BLCH4:DEPOSIT\0\0\0";
 /// The signing root an eUTXO spend authorisation covers: the domain under
 /// which an output's owner authorises *this* transfer and no other.
@@ -1912,6 +1992,11 @@ pub const DS_SPEND: [u8; 16] = *b"BLCH4:SPEND\0\0\0\0\0";
 /// (`'2'` vs `DS_SPEND`'s trailing `\0`), so neither can ever be mistaken
 /// for the other.
 pub const DS_SPEND2: [u8; 16] = *b"BLCH4:SPEND2\0\0\0\0";
+/// Candidate outer domain for genesis-bound attestation and proposal roots.
+/// The nested legacy root retains the role-specific `DS_ATTEST`/`DS_PROPOSE`
+/// separation; this tag adds one canonical network identity without changing
+/// any historical root.
+pub const DS_NETSIG2: [u8; 16] = *b"BLCH4:NETSIG2\0\0\0";
 /// Transaction identity: `txid = SHA3-256(DS_TXID ‖ spend signing root)`.
 ///
 /// Derived from the witness-free signing root, so a transaction's id — and
@@ -1921,24 +2006,18 @@ pub const DS_SPEND2: [u8; 16] = *b"BLCH4:SPEND2\0\0\0\0";
 /// which is the malleability class that made Bitcoin's chained-transaction
 /// wallets unsafe before segwit.
 pub const DS_TXID: [u8; 16] = *b"BLCH4:TXID\0\0\0\0\0\0";
-/// Slashing evidence and voluntary-exit signing roots (§7.2, §7.3).
+/// Slashing-evidence anti-replay identities (§7.3). Proposal and attestation
+/// evidence share the same outer `(validator, low root, high root)` shape;
+/// their nested roots use distinct `DS_PROPOSE` and `DS_ATTEST` domains.
 pub const DS_SLASH: [u8; 16] = *b"BLCH4:SLASH\0\0\0\0\0";
 /// Proposer signature domain over the header.
 ///
-/// **Not in the §6.1 table** — the spec assigns a tag to block identity but
-/// none to the proposer's signature, leaving the signature to cover the same
-/// domain-tagged bytes as the id. Signing the id would work, but a signature
+/// The §6.1 registry assigns this separately from block identity. A signature
 /// domain that is also an identifier domain invites exactly the cross-protocol
-/// replay games domain separation exists to end, so this crate freezes a
-/// distinct tag and the spec table needs the row added (flagged in
-/// `BLOCH-POS-INTERFACES.md`).
+/// replay games domain separation exists to end.
 pub const DS_PROPOSE: [u8; 16] = *b"BLCH4:PROPOSE\0\0\0";
-/// Deposit proof-of-possession domain (§6.1, §7.1). A PoP bound to its own
-/// domain cannot be replayed as an attestation or a block signature — the tag
-/// is what makes a signature mean one thing only.
-/// Voluntary-exit signing domain (§7.2). Not in the §6.1 table by name, but
-/// the exit is "a hybrid-signed message" and every signed message gets its own
-/// tag; all tags are fixed 16 bytes, so no tag can prefix another.
+/// Voluntary-exit signing domain (§7.2). Every signed message gets its own tag;
+/// all tags are fixed 16 bytes, so no tag can prefix another.
 pub const DS_EXIT: [u8; 16] = *b"BLCH4:EXIT\0\0\0\0\0\0";
 /// Weak-subjectivity checkpoint digest domain
 /// (`BLOCH-WEAK-SUBJECTIVITY.md` §2.1). The checkpoint is signed and verified
@@ -1955,26 +2034,206 @@ pub const DS_WSCKPT: [u8; 16] = *b"BLCH4:WSCKPT\0\0\0\0";
 /// Coherence already is, and this tag is on the "rest of the chain" side of
 /// that line.
 pub const DS_COHERENCE: [u8; 16] = *b"BLCH4:COHERE\0\0\0\0";
-/// State SMT node domain (§6.1) — every hash in [`crate::state_root`] starts
-/// with this tag so a state-tree node can never collide with a block id, a
-/// transaction Merkle node, or any other SHA3 use in the protocol.
-/// Slashing-evidence identity domain (anti-replay key, §7.3).
+
+/// Complete authority for shipped `BLCH4:*` domain separators and their live
+/// preimage shapes. Tests consume this registry for uniqueness and spec/code
+/// reconciliation, so a new constant cannot remain invisible in prose.
+pub const DOMAIN_TAGS: &[DomainTag] = &[
+    DomainTag {
+        name: "DS_SORTITION",
+        bytes: DS_SORTITION,
+        preimage_shapes: &[
+            "weighted draw: mix|index|role(01/02)",
+            "epoch partition: mix|epoch|role(03)",
+            "activation queue: mix|pubkey_hash|role(04)",
+        ],
+    },
+    DomainTag {
+        name: "DS_ATTEST",
+        bytes: DS_ATTEST,
+        preimage_shapes: &["attestation signing root"],
+    },
+    DomainTag {
+        name: "DS_BLOCK",
+        bytes: DS_BLOCK,
+        preimage_shapes: &["canonical block-header identity"],
+    },
+    DomainTag {
+        name: "DS_BODY",
+        bytes: DS_BODY,
+        preimage_shapes: &[
+            "transaction tree: marker|kind(01)|payload",
+            "attestation tree: marker|kind(02)|payload",
+        ],
+    },
+    DomainTag {
+        name: "DS_STATE",
+        bytes: DS_STATE,
+        preimage_shapes: &[
+            "leaf marker(00)",
+            "node marker(01)",
+            "empty marker(02)",
+            "key marker(03)",
+            "value marker(04)",
+        ],
+    },
+    DomainTag {
+        name: "DS_RANDAO",
+        bytes: DS_RANDAO,
+        preimage_shapes: &[
+            "mix|reveal (80 bytes including tag)",
+            "validator|epoch|commitment (60 bytes including tag)",
+        ],
+    },
+    DomainTag {
+        name: "DS_DEPOSIT",
+        bytes: DS_DEPOSIT,
+        preimage_shapes: &[
+            "legacy fixed-width deposit PoP",
+            "length-prefixed funded deposit PoP",
+        ],
+    },
+    DomainTag {
+        name: "DS_SPEND",
+        bytes: DS_SPEND,
+        preimage_shapes: &["legacy witness-free spend authorization"],
+    },
+    DomainTag {
+        name: "DS_SPEND2",
+        bytes: DS_SPEND2,
+        preimage_shapes: &["network-bound witness-free spend authorization"],
+    },
+    DomainTag {
+        name: "DS_NETSIG2",
+        bytes: DS_NETSIG2,
+        preimage_shapes: &[
+            "candidate network-bound attestation root over DS_ATTEST root",
+            "candidate network-bound proposal root over DS_PROPOSE root",
+        ],
+    },
+    DomainTag {
+        name: "DS_TXID",
+        bytes: DS_TXID,
+        preimage_shapes: &["transaction identity over spend root"],
+    },
+    DomainTag {
+        name: "DS_SLASH",
+        bytes: DS_SLASH,
+        preimage_shapes: &[
+            "attestation evidence identity over DS_ATTEST roots",
+            "proposal evidence identity over DS_PROPOSE roots",
+        ],
+    },
+    DomainTag {
+        name: "DS_PROPOSE",
+        bytes: DS_PROPOSE,
+        preimage_shapes: &["proposal signature over canonical header"],
+    },
+    DomainTag {
+        name: "DS_EXIT",
+        bytes: DS_EXIT,
+        preimage_shapes: &["voluntary-exit signing root"],
+    },
+    DomainTag {
+        name: "DS_WSCKPT",
+        bytes: DS_WSCKPT,
+        preimage_shapes: &["weak-subjectivity checkpoint digest"],
+    },
+    DomainTag {
+        name: "DS_COHERENCE",
+        bytes: DS_COHERENCE,
+        preimage_shapes: &["accumulator|nullifier header binding"],
+    },
+];
 
 /// Role tags, mixed into the sortition seed so the per-slot subcommittee is not
 /// a predictable subset of the epoch committee.
 pub(crate) const ROLE_SLOT: u8 = 0x01;
 pub(crate) const ROLE_EPOCH: u8 = 0x02;
+/// Candidate activation-queue permutation, separated from proposer,
+/// committee and epoch-partition draws under [`DS_SORTITION`].
+pub(crate) const ROLE_ACTIVATION_QUEUE: u8 = 0x04;
 
-/// Independent flag day for funded validator admission (wire 0x0B).
-/// Deliberately unarmed pending a coordinated consensus release. This never
-/// enables the unfunded legacy Deposit/Delegate formats. No runtime override.
-pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// ADR-041 lifecycle epoch for funded validator admission (wire 0x0B).
+/// Scheduled at epoch 2884, 2026-09-14 22:35:19 UTC. This never enables
+/// unfunded legacy Deposit/Delegate formats. No runtime override exists.
+pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = 2_884;
+
+/// Candidate ST-16 cancellation path for funded validators that remain in the
+/// activation queue. `u64::MAX` means INERT.
+///
+/// Once armed, an authenticated `ExitV2` may schedule the normal delayed
+/// withdrawal for a funded registration whose activation epoch is still the
+/// sentinel, after the ordinary activation delay has elapsed. It does not
+/// delete or reuse the registry index, public key or deposit-history entry.
+/// The existing exit signature, epoch replay binding, churn ceiling and
+/// withdrawal accounting remain authoritative.
+///
+/// This changes block validity and queue membership. Activation therefore
+/// requires historical replay, mixed-fleet and economic qualification plus a
+/// coordinated epoch. It must not precede authenticated exit or withdrawal.
+pub const FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn funded_validator_cancellation_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if funded_cancellation_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod funded_cancellation_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+/// Candidate ST-13 activation-queue rules. `u64::MAX` means INERT.
+///
+/// Once armed, this binds two changes together: funded registration refuses
+/// to grow the permanent validator/deposit-history state beyond
+/// [`crate::staking::MAX_VALIDATOR_REGISTRY_ENTRIES`], and same-deposit-epoch
+/// activation priority is keyed by the activation epoch's beacon seed instead
+/// of the applicant-chosen public-key hash. Both alter block validity or a
+/// committed activation epoch, so neither may ship live without historical
+/// replay, resource qualification and a coordinated protocol activation.
+///
+/// The seed is only fixed at the boundary immediately before activation. With
+/// the eight-epoch activation delay an applicant cannot know it when choosing
+/// a key. Residual beacon withholding influence remains the separate FC-04
+/// problem; this candidate does not claim unbiased randomness.
+pub const ACTIVATION_QUEUE_V2_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn activation_queue_v2_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if activation_queue_v2_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, ACTIVATION_QUEUE_V2_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod activation_queue_v2_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
 
 pub fn funded_validator_admission_active(epoch: u64) -> bool {
     #[cfg(test)]
     if funded_admission_rehearsal::enabled() { return true; }
-    FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH != u64::MAX
-        && epoch.checked_sub(FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH).is_some()
+    epoch_gate_active(epoch, FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH)
 }
 
 #[cfg(test)]
@@ -1995,6 +2254,29 @@ pub const fn epoch_gate_active(epoch: u64, activation: u64) -> bool {
     activation != u64::MAX && epoch >= activation
 }
 
+const fn gate_is_inert_or_not_before(gate: u64, prerequisite: u64) -> bool {
+    gate == u64::MAX || gate >= prerequisite
+}
+
+#[cfg(test)]
+mod epoch_gate_tests {
+    use super::epoch_gate_active;
+
+    #[test]
+    fn max_is_an_unarmed_sentinel_even_at_the_synthetic_boundary() {
+        for epoch in [0, u64::MAX - 1, u64::MAX] {
+            assert!(!epoch_gate_active(epoch, u64::MAX));
+        }
+    }
+
+    #[test]
+    fn a_finite_gate_opens_at_its_activation_epoch() {
+        assert!(!epoch_gate_active(41, 42));
+        assert!(epoch_gate_active(42, 42));
+        assert!(epoch_gate_active(u64::MAX, 42));
+    }
+}
+
 // ADR-041: one lifecycle release. A partially armed build must not compile.
 const _: () = {
     assert!(FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH == EXIT_AUTH_ACTIVATION_EPOCH);
@@ -2002,5 +2284,35 @@ const _: () = {
     assert!(WITHDRAWAL_ACTIVATION_EPOCH == SLASHING_EVIDENCE_ACTIVATION_EPOCH);
     assert!(SLASHING_EVIDENCE_ACTIVATION_EPOCH == RANDAO_RECOMMIT_ACTIVATION_EPOCH);
     assert!(DEPOSIT_ACTIVATION_EPOCH == u64::MAX);
+    assert!(gate_is_inert_or_not_before(
+        FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH,
+        EXIT_AUTH_ACTIVATION_EPOCH,
+    ));
+    assert!(gate_is_inert_or_not_before(
+        FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH,
+        WITHDRAWAL_ACTIVATION_EPOCH,
+    ));
     assert!(crate::slashing::CORRELATION_WINDOW_EPOCHS >= 2 * crate::staking::WITHDRAWAL_DELAY_EPOCHS);
 };
+
+/// Candidate FC-01 recovery rule, deliberately UNARMED. Activation changes
+/// proposer weights after complete inactivity and requires a coordinated
+/// release, historical replay qualification and a fresh WS checkpoint.
+pub const DUTY_ROSTER_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn duty_roster_recovery_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if audit_recovery_test::forced() { return true; }
+    epoch_gate_active(epoch, DUTY_ROSTER_RECOVERY_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod audit_recovery_test {
+    thread_local! { static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    pub fn forced() -> bool { ENABLED.with(|v| v.get()) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}

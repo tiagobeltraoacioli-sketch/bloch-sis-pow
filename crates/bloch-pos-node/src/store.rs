@@ -20,16 +20,36 @@
 //! RocksDB layer with block-id-keyed state remains M-later work.
 //!
 //! Log frame: `u32 LE length ‖ envelope bytes` (codec::encode_envelope).
-//! Appends are single `write_all` calls followed by fsync, so a crash leaves
-//! at most one truncated trailing frame, which replay detects and drops.
+//! Appends stream the prefix and encoded envelope under one exclusive writer,
+//! then fsync, so a crash leaves at most one truncated trailing frame, which
+//! replay detects and drops.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use bloch_pos_committee::header::BlockEnvelope;
 
 const META_MAGIC: &[u8; 8] = b"BPOSMETA";
+
+// Serving threads must not combine an index from one log generation with a
+// replacement log. DirLock excludes external writers; this per-directory guard
+// coordinates local readers without serializing unrelated stores. Weak entries
+// are removed on lookup, so historical directories do not accumulate forever.
+fn log_generation(dir: &Path) -> io::Result<std::sync::Arc<std::sync::RwLock<()>>> {
+    use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+    static GENERATIONS: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, Weak<RwLock<()>>>>> = OnceLock::new();
+    let path = fs::canonicalize(dir)?;
+    let mut generations = GENERATIONS.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+        .lock().map_err(|_| io::Error::other("log generation registry poisoned; restart required"))?;
+    generations.retain(|_, generation| generation.strong_count() > 0);
+    if let Some(generation) = generations.get(&path).and_then(Weak::upgrade) { return Ok(generation); }
+    let generation = Arc::new(RwLock::new(()));
+    generations.insert(path, Arc::downgrade(&generation));
+    Ok(generation)
+}
+
 
 thread_local! {
     /// Frame-body bytes [`Store::blocks_after`] has actually read on this
@@ -80,14 +100,14 @@ pub fn sync_frames_scanned() -> u64 {
 // reads it; the frames served are still the log's own bytes, still filtered
 // by the same `slot > after_slot` predicate over the header actually read
 // back from the log. Every way it can be wrong ends in the same place — the
-// full scan the code did before:
+// recovery path below:
 //
 //   * missing, empty, wrong magic, or torn  → rebuilt on `open`;
 //   * behind the log (crash between the log fsync and the index append, or
 //     an index from an older binary) → the unindexed tail is scanned;
 //   * ahead of the log, out of order, or pointing at a frame that does not
-//     carry the slot it claims → distrusted, and the answer is scanned from
-//     byte zero.
+//     carry the slot it claims → distrusted, and serving fails closed until
+//     `Store::open` rebuilds the disposable index.
 //
 // The log is written first and fsynced first, so the index can only ever lag
 // it. There is no state in which a lost or damaged index can make this node
@@ -99,6 +119,13 @@ const IDX_MAGIC: &[u8; 8] = b"BPOSIDX1";
 
 /// One index record: `slot u64 LE ‖ offset u64 LE ‖ frame_len u32 LE`.
 const IDX_ENTRY_LEN: u64 = 8 + 8 + 4;
+const INDEX_WRITE_BUFFER_BYTES: usize = 8 * 1024;
+
+/// Maximum complete frames one network request may inspect beyond the last
+/// valid index record. A normal crash window is one frame; 4,096 is over a day
+/// of 30-second slots while still making a persistent index-append failure a
+/// bounded local fault repaired by restart instead of remote O(chain) work.
+const MAX_UNINDEXED_TAIL_SCAN_FRAMES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct IdxEntry {
@@ -143,8 +170,7 @@ impl IdxEntry {
         // decide whether the index is trustworthy — a corrupt on-disk index
         // record that would otherwise wrap around to a small value instead
         // saturates to a value that reliably reads as "past the log", which
-        // is the same "distrust the index, fall back to a full scan"
-        // behaviour those callers already give a merely-stale index.
+        // makes callers distrust the index and fail boundedly.
         self.offset.saturating_add(4).saturating_add(self.len as u64)
     }
 }
@@ -174,14 +200,14 @@ fn idx_read(idx: &mut File, i: u64) -> io::Result<IdxEntry> {
     IdxEntry::decode(&b)
 }
 
-/// Index records for every **complete** frame in `blocks.log` at or after
-/// `from`. Header-only reads: a rebuild of a 145 MB log touches one header
-/// per block and no body.
+/// Stream one index record for every **complete** frame in `blocks.log` at or
+/// after `from`. Header-only reads: a rebuild of a 145 MB log touches one
+/// header per block and no body.
 ///
 /// A torn trailing frame (crash mid-append) ends the scan without an error,
 /// exactly as `read_all` and `blocks_after` treat it — it is not indexed, so
 /// it cannot be served, which is the same answer the log itself gives.
-fn scan_index(log_path: &Path, from: u64) -> io::Result<Vec<IdxEntry>> {
+fn scan_index_into<W: Write>(log_path: &Path, from: u64, writer: &mut W) -> io::Result<()> {
     let log_len = fs::metadata(log_path)?.len();
     let mut f = io::BufReader::new(File::open(log_path)?);
     if from > 0 {
@@ -189,8 +215,8 @@ fn scan_index(log_path: &Path, from: u64) -> io::Result<Vec<IdxEntry>> {
     }
     let hdr_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
     let mut at = from;
-    let mut out = Vec::new();
     let mut len4 = [0u8; 4];
+    let mut hdr = [0u8; bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN];
     loop {
         match f.read_exact(&mut len4) {
             Ok(()) => {}
@@ -209,15 +235,14 @@ fn scan_index(log_path: &Path, from: u64) -> io::Result<Vec<IdxEntry>> {
         // below; `len <= MAX_FIELD_LEN` was just checked), so this cannot
         // overflow in practice — `checked_add` makes that explicit rather
         // than assumed, and treats the unreachable overflow case exactly
-        // like a truncated trailing frame: stop indexing, the full scan in
-        // `blocks_after` remains the authority.
+        // like a truncated trailing frame: stop indexing and let open-time
+        // repair or a bounded serving error preserve the log as authority.
         let Some(frame_end) = at.checked_add(4).and_then(|v| v.checked_add(len as u64)) else {
             break;
         };
         if frame_end > log_len {
             break; // truncated trailing frame
         }
-        let mut hdr = vec![0u8; hdr_len];
         match f.read_exact(&mut hdr) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -227,7 +252,7 @@ fn scan_index(log_path: &Path, from: u64) -> io::Result<Vec<IdxEntry>> {
         else {
             break;
         };
-        out.push(IdxEntry { slot: header.slot, offset: at, len: len as u32 });
+        writer.write_all(&IdxEntry { slot: header.slot, offset: at, len: len as u32 }.encode())?;
         // `len >= hdr_len` was already checked above (the `len < hdr_len`
         // arm breaks first), so this subtraction cannot underflow; written
         // as `checked_sub` so that invariant is enforced, not assumed.
@@ -239,7 +264,7 @@ fn scan_index(log_path: &Path, from: u64) -> io::Result<Vec<IdxEntry>> {
         }
         at = frame_end;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Bring `idx` in line with a log of `log_len` bytes: rebuild it if it is
@@ -291,15 +316,10 @@ fn repair_index(idx: &mut File, log_path: &Path, log_len: u64) -> io::Result<()>
         covered = 0;
     }
     if covered < log_len {
-        let tail = scan_index(log_path, covered)?;
-        // Capacity hint only: saturating is the intended semantics (a
-        // saturated hint under-reserves, it does not corrupt the buffer).
-        let mut buf = Vec::with_capacity(tail.len().saturating_mul(IDX_ENTRY_LEN as usize));
-        for e in &tail {
-            buf.extend_from_slice(&e.encode());
-        }
         idx.seek(SeekFrom::End(0))?;
-        idx.write_all(&buf)?;
+        let mut buffered = BufWriter::with_capacity(INDEX_WRITE_BUFFER_BYTES, &mut *idx);
+        scan_index_into(log_path, covered, &mut buffered)?;
+        buffered.flush()?;
     }
     idx.sync_data()
 }
@@ -312,12 +332,13 @@ enum Start {
     /// to return zero bytes.
     Nothing,
     /// Seek here. `expect_slot` is what the index says the frame at that
-    /// offset carries; a mismatch means the index lies and the caller falls
-    /// back to the full scan.
+    /// offset carries; a mismatch means the index lies and serving fails
+    /// closed until the next index rebuild.
     At { offset: u64, expect_slot: Option<u64> },
 }
 
-/// Consult the index. `Ok(None)` means "no usable index" — scan from zero.
+/// Consult the index. `Ok(None)` means "no usable index"; network serving
+/// fails boundedly until `Store::open` rebuilds it.
 fn index_start(dir: &Path, after_slot: u64, log_len: u64) -> io::Result<Option<Start>> {
     let mut idx = File::open(dir.join("blocks.idx"))?;
     if idx.metadata()?.len() < 8 {
@@ -330,7 +351,14 @@ fn index_start(dir: &Path, after_slot: u64, log_len: u64) -> io::Result<Option<S
     }
     let n = idx_count(&idx)?;
     if n == 0 {
-        // Freshly created index over a log that may already have frames.
+        if log_len != 0 {
+            // An open store always indexes every complete frame before it is
+            // exposed. Magic without records beside a non-empty log is thus
+            // either corruption or an index-append failure, not permission
+            // for a remote request to scan the entire history.
+            return Ok(None);
+        }
+        // A genuinely empty log and freshly created index agree.
         return Ok(Some(Start::At { offset: 0, expect_slot: None }));
     }
     // Guarded by the `n == 0` return just above: n >= 1 here.
@@ -393,12 +421,37 @@ pub struct Store {
     /// Append handle for the derived slot → offset index. Written after the
     /// log's own fsync, so it can lag the log and never lead it.
     idx: File,
+    /// After one append failure, retain a contiguous indexed prefix instead
+    /// of burying its missing entry under later successful index appends.
+    index_append_enabled: bool,
     /// Bytes in `blocks.log`, so an append knows the offset it is writing at
     /// without asking the filesystem.
     log_len: u64,
     /// Exclusive ownership of `dir`, held for as long as the store is. Never
     /// read; its `Drop` is the whole point. See [`DirLock`].
     _lock: DirLock,
+    generation: std::sync::Arc<std::sync::RwLock<()>>,
+    /// A whole-log replacement being written and published by the dedicated
+    /// reorg writer. Ordinary appends join it first, preserving log order.
+    pending_rewrite: Option<mpsc::Receiver<io::Result<u64>>>,
+    /// Completion can be observed after an append had to join the writer.
+    rewrite_completed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PageBytes {
+    max: usize,
+    per_frame: usize,
+    first_must_fit: bool,
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Keep the data-dir lock alive until a background publisher has
+        // stopped touching the directory. Errors cannot be returned from
+        // Drop; live operation observes them through poll/append and exits.
+        let _ = self.finish_pending_rewrite();
+    }
 }
 
 /// Exclusive ownership of a data dir, for the lifetime of this `Store`.
@@ -635,7 +688,405 @@ pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// Exclusive, private staging for a streamed atomic replacement. A legacy
+/// predictable `.tmp` path is never opened or truncated. Cleanup owns only the
+/// exact file successfully created by this value; publication disarms cleanup.
+pub(crate) struct PrivateStagingFile {
+    path: Option<PathBuf>,
+    file: File,
+}
+
+impl PrivateStagingFile {
+    pub(crate) fn create_for(destination: &Path) -> io::Result<Self> {
+        let dir = destination.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent directory"))?;
+        let suffix = format!(".write-{}-{}.tmp", std::process::id(), {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        });
+        let mut name = destination.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing filename"))?.to_os_string();
+        name.push(suffix);
+        let path = dir.join(name);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        Ok(Self { path: Some(path), file })
+    }
+
+    pub(crate) fn file_mut(&mut self) -> &mut File { &mut self.file }
+
+    pub(crate) fn publish(mut self, destination: &Path) -> io::Result<()> {
+        let dir = destination.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent directory"))?;
+        self.file.sync_all()?;
+        let path = self.path.as_ref().ok_or_else(|| io::Error::other("staging file already published"))?;
+        fs::rename(path, destination)?;
+        self.path = None;
+        fsync_dir(dir)
+    }
+}
+
+impl Drop for PrivateStagingFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() { let _ = fs::remove_file(path); }
+    }
+}
+
+/// Persist a private file without exposing a truncated destination after a crash.
+pub(crate) fn atomic_private_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut staging = PrivateStagingFile::create_for(path)?;
+    staging.file_mut().write_all(bytes)?;
+    staging.publish(path)
+}
+
+/// A crash can leave an incomplete final frame. Remove only that frame before
+/// any append; merely ignoring it during replay would bury later valid blocks
+/// behind its unfinished length prefix on every subsequent restart.
+fn repair_log_tail(log: &mut File, dir: &Path) -> io::Result<u64> {
+    let length = log.metadata()?.len();
+    let mut at = 0u64;
+    while at < length {
+        if length.saturating_sub(at) < 4 { break; }
+        log.seek(SeekFrom::Start(at))?;
+        let mut prefix = [0; 4]; log.read_exact(&mut prefix)?;
+        let size = u32::from_le_bytes(prefix) as u64;
+        if size > crate::codec::MAX_FIELD_LEN as u64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "oversized block log frame; refusing automatic repair"));
+        }
+        let end = at.checked_add(4).and_then(|n| n.checked_add(size))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "block log length overflow"))?;
+        if end > length { break; }
+        at = end;
+    }
+    if at != length {
+        // An index is not authoritative enough to justify deleting bytes, but
+        // evidence of a later committed frame is enough to STOP automatic
+        // repair. A corrupted earlier length prefix must not discard history.
+        if let Ok(mut idx) = File::open(dir.join("blocks.idx")) {
+            let mut magic = [0u8; 8];
+            if idx.read_exact(&mut magic).is_ok() && &magic == IDX_MAGIC {
+                let count = idx_count(&idx)?;
+                if let Some(last) = count.checked_sub(1) {
+                    if idx_read(&mut idx, last)?.end() > at {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData,
+                            "incomplete frame overlaps indexed history; refusing automatic log truncation"));
+                    }
+                }
+            }
+        }
+        eprintln!("store: removing {} incomplete trailing log bytes before append", length.saturating_sub(at));
+        log.set_len(at)?;
+        log.sync_all()?;
+    }
+    Ok(at)
+}
+
+/// Framing/codec diagnosis only: a decoded frame is not proof of valid consensus
+/// execution. Inspect a stopped node or an immutable copy; never change the log.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LogInspection {
+    pub log_bytes: u64,
+    pub decoded_frames: u64,
+    pub valid_prefix_bytes: u64,
+    pub issue: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct LogRepair {
+    pub original_bytes: u64,
+    pub retained_bytes: u64,
+    pub backup_bytes: u64,
+}
+
+pub fn inspect_log(dir: &Path) -> io::Result<LogInspection> {
+    let mut log = File::open(dir.join("blocks.log"))?;
+    let length = log.metadata()?.len();
+    let mut report = LogInspection { log_bytes: length, decoded_frames: 0, valid_prefix_bytes: 0, issue: None };
+    // Inspection discards each owned decoded envelope, so its raw frame can
+    // reuse the same logical-high-water scratch for the next record. The
+    // existing frame cap remains the input bound; allocator capacity is not.
+    let mut payload = Vec::new();
+    while report.valid_prefix_bytes < length {
+        let remaining = length.saturating_sub(report.valid_prefix_bytes);
+        if remaining < 4 {
+            report.issue = Some("incomplete trailing length prefix".into());
+            break;
+        }
+        let mut prefix = [0; 4];
+        log.read_exact(&mut prefix)?;
+        let size = u32::from_le_bytes(prefix) as usize;
+        if size > crate::codec::MAX_FIELD_LEN {
+            report.issue = Some("frame length exceeds codec cap; cannot infer a safe truncation".into());
+            break;
+        }
+        if (size as u64) > remaining.saturating_sub(4) {
+            report.issue = Some("incomplete frame body; may be a torn append or corrupted length, not permission to truncate".into());
+            break;
+        }
+        read_frame_payload(&mut log, &mut payload, size)?;
+        if let Err(error) = crate::codec::decode_envelope(&payload) {
+            report.issue = Some(format!("invalid envelope: {error}; preserve the original log and restore from a verified backup"));
+            break;
+        }
+        report.valid_prefix_bytes = report.valid_prefix_bytes.saturating_add(4).saturating_add(size as u64);
+        report.decoded_frames = report.decoded_frames.saturating_add(1);
+    }
+    if log.metadata()?.len() != length {
+        return Err(io::Error::new(io::ErrorKind::WouldBlock, "block log changed during inspection; stop the node or inspect an immutable copy"));
+    }
+    Ok(report)
+}
+
+/// Offline, operator-confirmed recovery of an unambiguously damaged trailing
+/// write. The ordinary log format remains unchanged and no decoded or
+/// consensus-invalid complete frame is ever removed by this function.
+///
+/// `expected_prefix` must exactly match a fresh [`inspect_log`] result. The
+/// removable suffix must be either an incomplete length/body or entirely
+/// zero-filled after the last decodable frame. A durable, exclusively-created
+/// backup of the removed raw bytes is completed before truncation.
+pub fn repair_log_tail_offline(
+    dir: &Path,
+    expected_prefix: u64,
+    backup_path: &Path,
+) -> io::Result<LogRepair> {
+    let _lock = DirLock::acquire(dir)?;
+    let report = inspect_log(dir)?;
+    if report.valid_prefix_bytes != expected_prefix {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "confirmed prefix {expected_prefix} does not match freshly inspected prefix {}",
+                report.valid_prefix_bytes
+            ),
+        ));
+    }
+    let Some(issue) = report.issue.as_deref() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "block log has no damaged tail",
+        ));
+    };
+    if expected_prefix >= report.log_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inspection did not identify a non-empty damaged tail",
+        ));
+    }
+
+    let mut log = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("blocks.log"))?;
+    if log.metadata()?.len() != report.log_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "block log changed after inspection; retry against a stopped node",
+        ));
+    }
+    log.seek(SeekFrom::Start(expected_prefix))?;
+    let structurally_incomplete = issue == "incomplete trailing length prefix"
+        || issue.starts_with("incomplete frame body;");
+    let mut all_zero = true;
+    let mut remaining = report.log_bytes.saturating_sub(expected_prefix);
+    let mut buffer = [0u8; 8192];
+    while remaining > 0 {
+        let take = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "damaged tail length does not fit memory indexing",
+                )
+            })?;
+        log.read_exact(&mut buffer[..take])?;
+        all_zero &= buffer[..take].iter().all(|byte| *byte == 0);
+        remaining = remaining.saturating_sub(take as u64);
+    }
+    if !structurally_incomplete && !all_zero {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refusing repair: suffix is not an incomplete frame or an all-zero power-loss tail",
+        ));
+    }
+
+    let backup_parent = backup_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let reserved_name = matches!(
+        backup_path.file_name().and_then(|name| name.to_str()),
+        Some("blocks.log" | "blocks.idx" | "meta.bin" | "LOCK")
+    );
+    if reserved_name && fs::canonicalize(backup_parent)? == fs::canonicalize(dir)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "backup must not use a store-managed filename in the data directory",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut backup = options.open(backup_path)?;
+    log.seek(SeekFrom::Start(expected_prefix))?;
+    let removed = report.log_bytes.saturating_sub(expected_prefix);
+    let copied = io::copy(&mut (&log).take(removed), &mut backup)?;
+    if copied != removed {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "block log changed while copying the damaged tail"));
+    }
+    backup.sync_all()?;
+    fsync_dir(backup_parent)?;
+
+    if log.metadata()?.len() != report.log_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "block log changed before truncation; backup retained, log unchanged by this tool",
+        ));
+    }
+    log.set_len(expected_prefix)?;
+    log.sync_all()?;
+    fsync_dir(dir)?;
+    Ok(LogRepair {
+        original_bytes: report.log_bytes,
+        retained_bytes: expected_prefix,
+        backup_bytes: copied,
+    })
+}
+
+fn write_log_envelope<W: Write>(
+    writer: &mut W,
+    env: &BlockEnvelope,
+) -> io::Result<(usize, u32)> {
+    // Full preflight before the prefix or any canonical field reaches the
+    // writer. `encoded_envelope_len` includes every per-item length prefix,
+    // so passing this 8 MiB cap also proves every component length and both
+    // collection counts fit their u32 wire fields.
+    let payload_len = crate::codec::encoded_envelope_len(env);
+    if payload_len > crate::codec::MAX_FIELD_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "block envelope exceeds the existing 8 MiB log frame limit",
+        ));
+    }
+    let payload_len_u32 = u32::try_from(payload_len).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "block log frame length exceeds u32")
+    })?;
+    let frame_len = 4usize.checked_add(payload_len).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "block log frame length overflow")
+    })?;
+    writer.write_all(&payload_len_u32.to_le_bytes())?;
+    crate::codec::write_envelope(writer, env)?;
+    Ok((frame_len, payload_len_u32))
+}
+
+/// Decode the complete prefix of a framed log without retaining a second,
+/// whole-file byte buffer alongside the decoded envelopes. `length` is the
+/// stable file length observed before the scan; the data-directory lock keeps
+/// the normal writer out while boot replay reads it.
+fn read_log_frames<R: Read>(reader: R, length: u64) -> io::Result<Vec<BlockEnvelope>> {
+    let mut reader = io::BufReader::new(reader);
+    let mut out = Vec::new();
+    // `decode_envelope` owns every variable field it returns, so this raw
+    // frame can be overwritten after each decode. Keep one high-water
+    // allocation under the logical frame cap instead of allocating once per
+    // historical block; allocator capacity itself is not an RSS bound.
+    let mut payload = Vec::new();
+    let mut at = 0u64;
+    while length.saturating_sub(at) >= 4 {
+        let mut prefix = [0u8; 4];
+        reader.read_exact(&mut prefix)?;
+        let len = u32::from_le_bytes(prefix) as usize;
+        if len > crate::codec::MAX_FIELD_LEN {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame over cap"));
+        }
+        let Some(frame_end) = at
+            .checked_add(4)
+            .and_then(|body_at| body_at.checked_add(len as u64))
+        else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame length overflow"));
+        };
+        if frame_end > length {
+            eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
+            return Ok(out);
+        }
+        read_frame_payload(&mut reader, &mut payload, len)?;
+        let env = crate::codec::decode_envelope(&payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        out.push(env);
+        at = frame_end;
+    }
+    if at < length {
+        eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
+    }
+    Ok(out)
+}
+
+fn read_frame_payload<R: Read>(
+    reader: &mut R,
+    payload: &mut Vec<u8>,
+    len: usize,
+) -> io::Result<()> {
+    payload.resize(len, 0);
+    reader.read_exact(payload)
+}
+
+/// Durable reorg publication using handles owned only by the writer thread.
+/// Staging deliberately happens before the generation write lock, so bounded
+/// sync readers remain available during the expensive encoding and write.
+fn rewrite_files(
+    dir: &Path,
+    generation: &std::sync::Arc<std::sync::RwLock<()>>,
+    envs: &[BlockEnvelope],
+) -> io::Result<u64> {
+    let destination = dir.join("blocks.log");
+    let mut staging = PrivateStagingFile::create_for(&destination)?;
+    for env in envs {
+        write_log_envelope(staging.file_mut(), env)?;
+    }
+    staging.file_mut().sync_all()?;
+
+    let index_path = dir.join("blocks.idx");
+    let mut idx = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&index_path)?;
+    publish_staged_rewrite(dir, generation, staging, &mut idx)
+}
+
+/// The short publication transaction shared by synchronous tests/tools and
+/// the asynchronous live writer. Keeping this ordering in one function makes
+/// the existing forced-index-failure regression cover both entry points.
+fn publish_staged_rewrite(
+    dir: &Path,
+    generation: &std::sync::Arc<std::sync::RwLock<()>>,
+    staging: PrivateStagingFile,
+    idx: &mut File,
+) -> io::Result<u64> {
+    let destination = dir.join("blocks.log");
+    let _generation = generation
+        .write()
+        .map_err(|_| io::Error::other("log generation guard poisoned; restart required"))?;
+    // This ordering is the crash-safety contract: an old-generation index is
+    // made durably unusable before the new authoritative log can appear.
+    idx.set_len(0)?;
+    idx.sync_all()?;
+    staging.publish(&destination)?;
+    let log_len = fs::metadata(&destination)?.len();
+    idx.set_len(0)?;
+    repair_index(idx, &destination, log_len)?;
+    Ok(log_len)
+}
+
 impl Store {
+    pub(crate) fn directory(&self) -> &Path { &self.dir }
+
     /// Open (or initialize) a data dir for the network identified by
     /// `genesis_digest`. A dir initialized for any other genesis — or holding
     /// anything that is not a bloch-pos meta — is a **refusal, not a
@@ -646,6 +1097,9 @@ impl Store {
         // process over the same dir is a double-signing hazard, not a
         // file-format one. See [`DirLock`].
         let _lock = DirLock::acquire(dir)?;
+        let generation = log_generation(dir)?;
+        let _generation = generation.write()
+            .map_err(|_| io::Error::other("log generation guard poisoned; restart required"))?;
         let meta_path = dir.join("meta.bin");
         match fs::read(&meta_path) {
             Ok(bytes) => {
@@ -670,29 +1124,22 @@ impl Store {
                 out.extend_from_slice(META_MAGIC);
                 out.extend_from_slice(&bloch_pos_committee::header::VERSION_G4.to_le_bytes());
                 out.extend_from_slice(genesis_digest);
-                // audit KS-10, 2026-09-16: temp + fsync + rename + dir fsync,
-                // the shape `rewrite` below already uses. This was a bare
-                // `fs::write`, so a crash on first boot could leave an empty
-                // `meta.bin` that the next open refused as "a different
-                // network or schema" — fail-closed, but a misleading message
-                // for a first-boot crash, and an operator-only recovery.
-                let tmp = dir.join("meta.bin.tmp");
-                {
-                    let mut f = File::create(&tmp)?;
-                    f.write_all(&out)?;
-                    f.sync_all()?;
-                }
-                fs::rename(&tmp, &meta_path)?;
-                fsync_dir(dir)?;
+                // audit KS-10, 2026-09-16: staged, fsync'd, renamed, and the
+                // directory fsync'd. This was a bare `fs::write`, so a crash
+                // on first boot could leave an empty `meta.bin` that the next
+                // open refused as "a different network or schema": fail-closed,
+                // but a misleading message for a first-boot crash, and an
+                // operator-only recovery.
+                atomic_private_write(&meta_path, &out)?;
             }
             Err(e) => return Err(e),
         }
-        let log = OpenOptions::new()
+        let mut log = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(dir.join("blocks.log"))?;
-        let log_len = log.metadata()?.len();
+        let log_len = repair_log_tail(&mut log, dir)?;
         // The index is rebuilt (or caught up) here, on the same boot that
         // already replays the whole log. A data dir written by a binary that
         // predates the index is therefore indexed the first time this one
@@ -702,21 +1149,35 @@ impl Store {
             .read(true)
             .write(true)
             .open(dir.join("blocks.idx"))?;
+        // The index is disposable: a crash after an older writer renamed a
+        // reorg log can leave a perfectly sized index describing another chain.
+        // Rebuild from header-only log reads; covered length is not identity.
+        idx.set_len(0)?;
         repair_index(&mut idx, &dir.join("blocks.log"), log_len)?;
-        Ok(Store { dir: dir.to_path_buf(), log, idx, log_len, _lock })
+        Ok(Store {
+            dir: dir.to_path_buf(),
+            log,
+            idx,
+            index_append_enabled: true,
+            log_len,
+            _lock,
+            generation: std::sync::Arc::clone(&generation),
+            pending_rewrite: None,
+            rewrite_completed: false,
+        })
     }
 
-    /// Append one applied block. One write, then fsync — the block is only
+    /// Append one applied block. Prefix and payload writes, then fsync — the block is only
     /// broadcast after this returns, so anything the network has seen from
     /// us is durable locally (the producer-side equivocation fence across
     /// restarts).
     pub fn append(&mut self, env: &BlockEnvelope) -> io::Result<()> {
-        let payload = crate::codec::encode_envelope(env);
-        // Capacity hint only: saturating is the intended semantics.
-        let mut frame = Vec::with_capacity(4usize.saturating_add(payload.len()));
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&payload);
-        self.log.write_all(&frame)?;
+        // A block applied after a reorg belongs after the replacement log.
+        // Joining here preserves that order if it arrives before the writer's
+        // normal completion poll. The consensus thread is otherwise free
+        // while the rewrite runs.
+        self.finish_pending_rewrite()?;
+        let (frame_len, payload_len) = write_log_envelope(&mut self.log, env)?;
         self.log.sync_data()?;
         // Index AFTER the log is durable. A crash in between leaves the index
         // one record short, which the next `open` fixes and which
@@ -724,23 +1185,23 @@ impl Store {
         // so this write is deliberately not fsynced. An index entry that
         // cannot be written is not worth failing an applied block over: log
         // it, and let the next open rebuild.
-        let entry =
-            IdxEntry { slot: env.header.slot, offset: self.log_len, len: payload.len() as u32 };
+        let entry = IdxEntry { slot: env.header.slot, offset: self.log_len, len: payload_len };
         // `log_len` tracks bytes actually fsynced to `blocks.log` on this
         // disk; reaching anywhere near u64::MAX (18 exabytes) is not a
         // condition a real deployment's storage can produce.
         #[allow(clippy::arithmetic_side_effects)]
         {
-            self.log_len += frame.len() as u64;
+            self.log_len += frame_len as u64;
         }
         // Seek to the end explicitly rather than trusting the handle's cursor:
         // `repair_index` reads records through this same handle, and a record
         // written at a stale cursor would not append to the index, it would
         // OVERWRITE part of it.
-        if let Err(e) =
-            self.idx.seek(SeekFrom::End(0)).and_then(|_| self.idx.write_all(&entry.encode()))
-        {
-            eprintln!("store: block-index append failed ({e}); it will be rebuilt on next open");
+        if self.index_append_enabled {
+            if let Err(e) = self.idx.seek(SeekFrom::End(0)).and_then(|_| self.idx.write_all(&entry.encode())) {
+                self.index_append_enabled = false;
+                eprintln!("store: block-index append failed ({e}); retaining its valid prefix and scanning the unindexed tail until restart or reorg rebuild");
+            }
         }
         Ok(())
     }
@@ -750,45 +1211,9 @@ impl Store {
     /// body is an error, because silently skipping mid-chain data would make
     /// replay diverge from what the network saw.
     pub fn read_all(&self) -> io::Result<Vec<BlockEnvelope>> {
-        let mut f = File::open(self.dir.join("blocks.log"))?;
-        let mut bytes = Vec::new();
-        f.read_to_end(&mut bytes)?;
-        let mut out = Vec::new();
-        let mut at = 0usize;
-        // `at` never exceeds `bytes.len()` (it only ever advances to a value
-        // already checked against `bytes.len()` below), and `bytes.len()` is
-        // this process's own in-memory copy of one local file — nowhere near
-        // `usize::MAX`. So every `saturating_add` here is exact, never an
-        // actual saturation; it is used instead of `+` purely to keep this
-        // loop over on-disk bytes free of raw arithmetic operators clippy
-        // must otherwise trust are pre-bounded.
-        while bytes.len().saturating_sub(at) >= 4 {
-            let body_at = at.saturating_add(4);
-            // `body_at - at == 4` exactly (see above), so this slice is
-            // always exactly 4 bytes and `try_into` cannot fail; the `else`
-            // arm is unreachable but keeps the conversion panic-free by
-            // construction.
-            let Ok(len_bytes) = bytes[at..body_at].try_into() else {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt log length prefix"));
-            };
-            let len = u32::from_le_bytes(len_bytes) as usize;
-            if len > crate::codec::MAX_FIELD_LEN {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame over cap"));
-            }
-            let frame_end = body_at.saturating_add(len);
-            if frame_end > bytes.len() {
-                eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
-                break;
-            }
-            let env = crate::codec::decode_envelope(&bytes[body_at..frame_end])
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            out.push(env);
-            at = frame_end;
-        }
-        if at.saturating_add(4) > bytes.len() && at < bytes.len() {
-            eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
-        }
-        Ok(out)
+        let file = File::open(self.dir.join("blocks.log"))?;
+        let length = file.metadata()?.len();
+        read_log_frames(file, length)
     }
 
     /// Replace the whole log with `envs` (a reorg adopted a different
@@ -796,31 +1221,105 @@ impl Store {
     /// crash mid-rewrite leaves either the old log or the new one — never a
     /// half-written file.
     pub fn rewrite(&mut self, envs: &[BlockEnvelope]) -> io::Result<()> {
-        let tmp = self.dir.join("blocks.log.tmp");
-        {
-            let mut f = File::create(&tmp)?;
-            for env in envs {
-                let payload = crate::codec::encode_envelope(env);
-                f.write_all(&(payload.len() as u32).to_le_bytes())?;
-                f.write_all(&payload)?;
-            }
-            f.sync_data()?;
+        self.finish_pending_rewrite()?;
+        let destination = self.dir.join("blocks.log");
+        let mut staging = PrivateStagingFile::create_for(&destination)?;
+        for env in envs {
+            write_log_envelope(staging.file_mut(), env)?;
         }
-        fs::rename(&tmp, self.dir.join("blocks.log"))?;
-        // The rename must be durable too, or a crash can resurrect the
-        // pre-reorg log (M-6). Same discipline as slashprot's watermark write.
-        fsync_dir(&self.dir)?;
+        staging.file_mut().sync_all()?;
+        let generation = std::sync::Arc::clone(&self.generation);
+        publish_staged_rewrite(&self.dir, &generation, staging, &mut self.idx)?;
+        self.reopen_after_rewrite()?;
+        Ok(())
+    }
+
+    /// Start a durable whole-log replacement on a dedicated writer thread.
+    ///
+    /// The worker performs encoding, file writes, fsyncs, index invalidation,
+    /// atomic publication and index reconstruction. The caller must poll with
+    /// [`Store::poll_rewrite`] and fail-stop on an error. [`Store::append`]
+    /// also joins the worker before writing, so a post-reorg block can never
+    /// land in the old generation or before the replacement.
+    pub fn rewrite_async(&mut self, envs: Vec<BlockEnvelope>) -> io::Result<()> {
+        self.finish_pending_rewrite()?;
+        let dir = self.dir.clone();
+        let generation = std::sync::Arc::clone(&self.generation);
+        let (tx, rx) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("block-log-reorg-writer".into())
+            .spawn(move || {
+                let result = rewrite_files(&dir, &generation, &envs);
+                let _ = tx.send(result);
+            })?;
+        self.pending_rewrite = Some(rx);
+        Ok(())
+    }
+
+    pub fn rewrite_pending(&self) -> bool {
+        self.pending_rewrite.is_some()
+    }
+
+    /// Poll the reorg writer without waiting. `true` means a rewrite became
+    /// durable since the preceding poll (including one joined by `append`).
+    pub fn poll_rewrite(&mut self) -> io::Result<bool> {
+        if let Some(rx) = self.pending_rewrite.as_ref() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.pending_rewrite = None;
+                    self.complete_rewrite(result?)?;
+                }
+                Err(mpsc::TryRecvError::Empty) => return Ok(false),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_rewrite = None;
+                    return Err(io::Error::other("block-log reorg writer terminated without a result"));
+                }
+            }
+        }
+        Ok(std::mem::take(&mut self.rewrite_completed))
+    }
+
+    /// Wait for durable reorg publication during an orderly shutdown.
+    pub fn flush_rewrite(&mut self) -> io::Result<bool> {
+        self.finish_pending_rewrite()?;
+        Ok(std::mem::take(&mut self.rewrite_completed))
+    }
+
+    fn finish_pending_rewrite(&mut self) -> io::Result<()> {
+        let Some(rx) = self.pending_rewrite.take() else { return Ok(()) };
+        let result = rx.recv().map_err(|_| {
+            io::Error::other("block-log reorg writer terminated without a result")
+        })?;
+        self.complete_rewrite(result?)
+    }
+
+    fn complete_rewrite(&mut self, log_len: u64) -> io::Result<()> {
+        self.reopen_after_rewrite()?;
+        if self.log_len != log_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "published block-log length changed before writer completion",
+            ));
+        }
+        self.rewrite_completed = true;
+        Ok(())
+    }
+
+    fn reopen_after_rewrite(&mut self) -> io::Result<()> {
         self.log = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(self.dir.join("blocks.log"))?;
         self.log_len = self.log.metadata()?.len();
-        // A reorg replaces the log, so every offset in the index is now a lie
-        // about a different branch. Throw it away and re-derive it from the
-        // log that won.
-        self.idx.set_len(0)?;
-        repair_index(&mut self.idx, &self.dir.join("blocks.log"), self.log_len)?;
+        self.idx = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.dir.join("blocks.idx"))?;
+        self.idx.seek(SeekFrom::End(0))?;
+        self.index_append_enabled = true;
         Ok(())
     }
 
@@ -849,52 +1348,114 @@ impl Store {
     /// What comes back is unchanged by all three: the log's own bytes, in log
     /// order, filtered by the same `slot > after_slot` predicate over headers
     /// read back from the log itself. The index is a hint about *where to
-    /// start*; every way it can be wrong falls back to the full scan.
+    /// start*. Detected index/header discrepancies fail the request with a
+    /// bounded error; startup rebuild and generation locking repair the
+    /// disposable index without reopening a whole-history scan to callers.
     ///
     /// Reads the log file fresh so a reader thread never touches the append
     /// handle.
     pub fn blocks_after(dir: &Path, after_slot: u64, limit: usize) -> io::Result<Vec<Vec<u8>>> {
+        Self::blocks_after_inner(dir, after_slot, limit, PageBytes {
+            max: crate::codec::MAX_FIELD_LEN,
+            per_frame: 0,
+            first_must_fit: false,
+        })
+    }
+
+    /// Read a directed libp2p page with its smaller, framing-aware budget.
+    /// Unlike the generic page, its old post-filter also refused an oversized
+    /// first frame; checking it here preserves that empty-page result without
+    /// reading the body. Private so the public store/devnet page stays unchanged.
+    pub(crate) fn blocks_after_p2p(
+        dir: &Path,
+        after_slot: u64,
+        limit: usize,
+        max_bytes: usize,
+        per_frame_bytes: usize,
+    ) -> io::Result<Vec<Vec<u8>>> {
+        Self::blocks_after_inner(dir, after_slot, limit, PageBytes {
+            max: max_bytes,
+            per_frame: per_frame_bytes,
+            first_must_fit: true,
+        })
+    }
+
+    fn blocks_after_inner(
+        dir: &Path,
+        after_slot: u64,
+        limit: usize,
+        page_bytes: PageBytes,
+    ) -> io::Result<Vec<Vec<u8>>> {
+        let generation = log_generation(dir)?;
+        let _generation = generation.read()
+            .map_err(|_| io::Error::other("log generation guard poisoned; restart required"))?;
         let log_path = dir.join("blocks.log");
         let log_len = fs::metadata(&log_path)?.len();
-        // A missing or unreadable index is not an error: it is the state
-        // every pre-index data dir is in, and the answer is the scan this
-        // function has always done.
-        match index_start(dir, after_slot, log_len).unwrap_or(None) {
+        // `Store::open` creates or rebuilds this derived index before network
+        // serving starts. A later missing/corrupt index is therefore a local
+        // fault, not a reason to let a remote request reopen the historical
+        // O(chain length) scan. Fail boundedly and let restart/open repair it.
+        match index_start(dir, after_slot, log_len)? {
             Some(Start::Nothing) => return Ok(Vec::new()),
             Some(Start::At { offset, expect_slot }) => {
                 if let Some(page) =
-                    Self::scan_page(&log_path, offset, expect_slot, after_slot, limit)?
+                    Self::scan_page(
+                        &log_path,
+                        offset,
+                        expect_slot,
+                        after_slot,
+                        limit,
+                        MAX_UNINDEXED_TAIL_SCAN_FRAMES,
+                        page_bytes,
+                    )?
                 {
                     return Ok(page);
                 }
-                eprintln!(
-                    "store: block index disagrees with the log at offset {offset}; \
-                     serving from a full scan (it will be rebuilt on next open)"
-                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "block index disagrees with the log at offset {offset}; \
+                         restart to rebuild the derived index"
+                    ),
+                ));
             }
-            None => {}
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "block index is unusable; restart to rebuild the derived index",
+                ));
+            }
         }
-        Ok(Self::scan_page(&log_path, 0, None, after_slot, limit)?.unwrap_or_default())
     }
 
-    /// The scan itself, from `from` to the cap. Returns `Ok(None)` — and only
-    /// then — when `expect_slot` is set and the frame at `from` does not carry
-    /// it, which is the caller's signal that the index is not describing this
-    /// log and the answer must be re-derived from byte zero.
+    /// The scan itself, from `from` to the page cap. A scan beyond the valid
+    /// index prefix also has a frame-work cap; indexed hits are already bounded
+    /// by the response count/byte limits and do not spend that allowance.
+    /// Returns `Ok(None)` — and only then — when `expect_slot` is set and the
+    /// frame at `from` does not carry it, which is the caller's signal that the
+    /// index is not describing this log and serving must fail closed until the
+    /// index is rebuilt.
     fn scan_page(
         log_path: &Path,
         from: u64,
         expect_slot: Option<u64>,
         after_slot: u64,
         limit: usize,
+        max_unindexed_frames: usize,
+        page_limit: PageBytes,
     ) -> io::Result<Option<Vec<Vec<u8>>>> {
         let mut f = io::BufReader::new(File::open(log_path)?);
         if from > 0 {
             f.seek(SeekFrom::Start(from))?;
         }
+        let unindexed_tail = expect_slot.is_none();
         let mut expect = expect_slot;
+        let mut unindexed_frames = 0usize;
         let mut out = Vec::new();
+        let mut page_bytes = 0usize;
         let mut len4 = [0u8; 4];
+        let hdr_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
+        let mut hdr_buf = [0u8; bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN];
         loop {
             if out.len() >= limit {
                 break;
@@ -906,6 +1467,16 @@ impl Store {
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             }
+            if unindexed_tail && unindexed_frames >= max_unindexed_frames {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unindexed block-log tail exceeds the {max_unindexed_frames}-frame \
+                         serving bound; restart to rebuild the derived index"
+                    ),
+                ));
+            }
+            unindexed_frames = unindexed_frames.saturating_add(1);
             let len = u32::from_le_bytes(len4) as usize;
             if len > crate::codec::MAX_FIELD_LEN {
                 if expect.is_some() {
@@ -923,7 +1494,6 @@ impl Store {
             // predicate over the same headers. Only the reads that produced
             // nothing are gone. Not a consensus change -- this function
             // serves bytes off the log and computes no state.
-            let hdr_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
             if len < hdr_len {
                 if expect.is_some() {
                     return Ok(None);
@@ -933,7 +1503,6 @@ impl Store {
                     "log frame shorter than a header",
                 ));
             }
-            let mut hdr_buf = vec![0u8; hdr_len];
             match f.read_exact(&mut hdr_buf) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -965,9 +1534,13 @@ impl Store {
             // guard, not merely assumed.
             let rest = len.saturating_sub(hdr_len);
             if header.slot > after_slot {
+                let next_page_bytes = page_bytes.saturating_add(len).saturating_add(page_limit.per_frame);
+                if (page_limit.first_must_fit || !out.is_empty()) && next_page_bytes > page_limit.max { break; }
+                page_bytes = next_page_bytes;
                 // Wanted: read the body and hand back the whole frame, byte
                 // for byte identical to what the old path pushed.
-                let mut payload = hdr_buf;
+                let mut payload = Vec::with_capacity(len);
+                payload.extend_from_slice(&hdr_buf);
                 payload.resize(len, 0);
                 match f.read_exact(&mut payload[hdr_len..]) {
                     Ok(()) => {}
@@ -998,6 +1571,722 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BoundedRead {
+        inner: io::Cursor<Vec<u8>>,
+        max_request: usize,
+        largest_request: usize,
+    }
+
+    impl Read for BoundedRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.len() > self.max_request {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "reader was asked for a whole-log-sized buffer",
+                ));
+            }
+            self.largest_request = self.largest_request.max(buf.len());
+            self.inner.read(buf)
+        }
+    }
+
+    fn index_log_fixture(count: u64) -> (Vec<u8>, Vec<IdxEntry>) {
+        let mut log = Vec::new();
+        let mut entries = Vec::new();
+        let mut offset = 0u64;
+        for slot in 1..=count {
+            let payload = crate::codec::encode_envelope(&sample_envelope(slot));
+            entries.push(IdxEntry { slot, offset, len: payload.len() as u32 });
+            log.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            log.extend_from_slice(&payload);
+            offset = offset.saturating_add(4).saturating_add(payload.len() as u64);
+        }
+        (log, entries)
+    }
+
+    #[test]
+    fn replay_log_decode_streams_bounded_frames_and_preserves_tail_refusals() {
+        let envelopes: Vec<_> = (1..=128).map(sample_envelope).collect();
+        let mut bytes = Vec::new();
+        for envelope in &envelopes {
+            let payload = crate::codec::encode_envelope(envelope);
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+        }
+        assert!(bytes.len() > 8 * 1024, "fixture must exceed the bounded reader request");
+        let mut reader = BoundedRead {
+            inner: io::Cursor::new(bytes.clone()),
+            max_request: 8 * 1024,
+            largest_request: 0,
+        };
+        let decoded = read_log_frames(&mut reader, bytes.len() as u64).unwrap();
+        assert_eq!(
+            decoded.iter().map(|env| env.header.slot).collect::<Vec<_>>(),
+            (1..=128).collect::<Vec<_>>(),
+        );
+        assert!(reader.largest_request <= reader.max_request);
+
+        let mut torn = bytes.clone();
+        torn.extend_from_slice(&[3, 0]);
+        assert_eq!(read_log_frames(io::Cursor::new(&torn), torn.len() as u64).unwrap().len(), 128);
+
+        let mut zero_frame = bytes;
+        zero_frame.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            read_log_frames(io::Cursor::new(&zero_frame), zero_frame.len() as u64)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+            "a complete zero-length frame remains corruption, not a truncatable tail",
+        );
+    }
+
+    #[test]
+    fn replay_scratch_reuses_high_water_and_preserves_mixed_frames() {
+        let empty = sample_envelope(201);
+        let mut large = sample_envelope(202);
+        large.body.transactions = vec![vec![0xA5; 1 << 20]];
+        let mut small = sample_envelope(203);
+        small.proposer_sig.extend_from_slice(&[0x5C; 31]);
+        let expected = [empty, large, small];
+
+        let mut log = Vec::new();
+        for envelope in &expected {
+            let encoded = crate::codec::encode_envelope(envelope);
+            log.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            log.extend_from_slice(&encoded);
+        }
+        let decoded = read_log_frames(io::Cursor::new(&log), log.len() as u64)
+            .expect("mixed replay frames");
+        assert_eq!(decoded.len(), expected.len());
+        for (actual, expected) in decoded.iter().zip(&expected) {
+            assert_eq!(actual.header, expected.header);
+            assert_eq!(actual.proposer_sig, expected.proposer_sig);
+            assert_eq!(actual.body.transactions, expected.body.transactions);
+            assert_eq!(actual.body.attestations, expected.body.attestations);
+        }
+
+        let large_raw = vec![0xD1; 1 << 20];
+        let small_raw = vec![0xD2; 37];
+        let mut raw = large_raw.clone();
+        raw.extend_from_slice(&small_raw);
+        let mut reader = io::Cursor::new(raw);
+        let mut scratch = Vec::new();
+        read_frame_payload(&mut reader, &mut scratch, large_raw.len()).unwrap();
+        let high_water_ptr = scratch.as_ptr();
+        let high_water_capacity = scratch.capacity();
+        assert_eq!(scratch, large_raw);
+        read_frame_payload(&mut reader, &mut scratch, small_raw.len()).unwrap();
+        assert_eq!(scratch.as_ptr(), high_water_ptr, "smaller frame reallocated scratch");
+        assert_eq!(scratch.capacity(), high_water_capacity);
+        assert_eq!(scratch, small_raw);
+
+        let over_cap = ((crate::codec::MAX_FIELD_LEN + 1) as u32).to_le_bytes();
+        assert_eq!(
+            read_log_frames(io::Cursor::new(over_cap), 4).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "over-cap prefix must fail before any payload read or resize",
+        );
+    }
+
+    #[test]
+    fn log_frame_writer_streams_prefix_then_payload_across_short_writes() {
+        #[derive(Default)]
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            offered: Vec<usize>,
+        }
+
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.offered.push(bytes.len());
+                let cap = if self.offered.len() <= 2 { 2 } else { 257 };
+                let accepted = bytes.len().min(cap);
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                Ok(accepted)
+            }
+
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+
+        let envelope = sample_envelope(11);
+        let payload = crate::codec::encode_envelope(&envelope);
+        let mut writer = ShortWriter::default();
+        let (frame_len, payload_len) =
+            write_log_envelope(&mut writer, &envelope).expect("stream frame");
+
+        assert_eq!(frame_len, 4usize.saturating_add(payload.len()));
+        assert_eq!(payload_len as usize, payload.len());
+        assert_eq!(&writer.bytes[..4], &(payload.len() as u32).to_le_bytes());
+        assert_eq!(&writer.bytes[4..], payload.as_slice());
+        assert_eq!(
+            writer.offered[..2],
+            [4, 2],
+            "canonical payload must begin only after the complete prefix",
+        );
+    }
+
+    #[test]
+    fn log_frame_writer_partial_canonical_failure_remains_a_recoverable_torn_tail() {
+        struct PartialThenFail {
+            bytes: Vec<u8>,
+            remaining: usize,
+        }
+
+        impl Write for PartialThenFail {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected body failure"));
+                }
+                let accepted = bytes.len().min(self.remaining);
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                self.remaining = self.remaining.saturating_sub(accepted);
+                Ok(accepted)
+            }
+
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+
+        let envelope = sample_envelope(12);
+        let payload = crate::codec::encode_envelope(&envelope);
+        let mut writer = PartialThenFail { bytes: Vec::new(), remaining: 41 };
+        let error =
+            write_log_envelope(&mut writer, &envelope).expect_err("body write must fail");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(&writer.bytes[..4], &(payload.len() as u32).to_le_bytes());
+        assert_eq!(&writer.bytes[4..], &payload[..37]);
+        assert!(
+            read_log_frames(io::Cursor::new(&writer.bytes), writer.bytes.len() as u64)
+                .expect("partial canonical tail remains recoverable")
+                .is_empty(),
+        );
+    }
+
+    #[test]
+    fn persistence_refuses_oversized_frames_before_mutation_and_accepts_exact_limit() {
+        let dir = std::env::temp_dir().join(format!("bloch-store-frame-cap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x77; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        let before_log = fs::read(dir.join("blocks.log")).unwrap();
+        let before_index = fs::read(dir.join("blocks.idx")).unwrap();
+        let mut boundary = sample_envelope(2);
+        let overhead = crate::codec::encode_envelope(&boundary).len() - boundary.proposer_sig.len();
+        boundary.proposer_sig.resize(crate::codec::MAX_FIELD_LEN - overhead + 1, 0xAA);
+        #[derive(Default)]
+        struct CountingWriter(usize);
+        impl Write for CountingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0 = self.0.saturating_add(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let mut untouched = CountingWriter::default();
+        assert_eq!(
+            write_log_envelope(&mut untouched, &boundary).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        assert_eq!(untouched.0, 0, "over-cap preflight must precede every write");
+        assert_eq!(store.append(&boundary).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert!(store.rewrite(&[sample_envelope(3), boundary.clone()]).is_err());
+        assert_eq!(fs::read(dir.join("blocks.log")).unwrap(), before_log);
+        assert_eq!(fs::read(dir.join("blocks.idx")).unwrap(), before_index);
+        assert!(!fs::read_dir(&dir).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().contains(".write-")));
+        boundary.proposer_sig.pop();
+        assert_eq!(crate::codec::encode_envelope(&boundary).len(), crate::codec::MAX_FIELD_LEN);
+        store.append(&boundary).unwrap();
+        drop(store);
+        let reopened = Store::open(&dir, &[0x77; 32]).unwrap();
+        let frames = reopened.read_all().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(crate::codec::encode_envelope(&frames[1]), crate::codec::encode_envelope(&boundary));
+        drop(reopened);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_index_append_never_turns_a_later_entry_into_a_gap() {
+        let dir = std::env::temp_dir().join(format!("bloch-store-index-gap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x76; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        let working = std::mem::replace(&mut store.idx, File::open(dir.join("blocks.idx")).unwrap());
+        store.append(&sample_envelope(2)).unwrap(); // log succeeds, index fails
+        store.idx = working;
+        store.append(&sample_envelope(3)).unwrap();
+        let page = Store::blocks_after(&dir, 1, 10).unwrap();
+        let slots: Vec<_> = page.iter().map(|bytes| crate::codec::decode_envelope(bytes).unwrap().header.slot).collect();
+        assert!(!store.index_append_enabled);
+        store.rewrite(&[sample_envelope(1), sample_envelope(2), sample_envelope(3)]).unwrap();
+        assert!(store.index_append_enabled);
+        store.append(&sample_envelope(4)).unwrap();
+        assert_eq!(idx_count(&store.idx).unwrap(), 4);
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+        assert_eq!(slots, vec![2, 3], "an index write failure must not hide the missing frame behind a later index entry");
+    }
+
+    #[test]
+    fn index_repair_writer_is_fixed_bounded_and_byte_exact() {
+        #[derive(Default)]
+        struct RecordingWriter {
+            bytes: Vec<u8>,
+            largest: usize,
+            writes: usize,
+        }
+
+        impl Write for RecordingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.largest = self.largest.max(bytes.len());
+                self.writes = self.writes.saturating_add(1);
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+
+        let dir = std::env::temp_dir().join(format!("bloch-index-stream-exact-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (log, entries) = index_log_fixture(1_000);
+        let log_path = dir.join("blocks.log");
+        fs::write(&log_path, log).unwrap();
+        let mut expected = Vec::new();
+        for entry in &entries { expected.extend_from_slice(&entry.encode()); }
+        let mut writer = RecordingWriter::default();
+        {
+            let mut buffered = BufWriter::with_capacity(INDEX_WRITE_BUFFER_BYTES, &mut writer);
+            scan_index_into(&log_path, 0, &mut buffered).expect("scan index entries");
+            buffered.flush().expect("flush index entries");
+        }
+
+        assert_eq!(writer.bytes, expected, "buffering must not change index bytes or order");
+        assert!(writer.largest <= INDEX_WRITE_BUFFER_BYTES);
+        assert!(writer.writes > 1, "fixture must cross the fixed buffer boundary");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn partial_buffered_index_record_is_truncated_and_rebuilt() {
+        struct FailInsideRecord {
+            bytes: Vec<u8>,
+            remaining: usize,
+        }
+
+        impl Write for FailInsideRecord {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected index failure"));
+                }
+                let accepted = bytes.len().min(self.remaining);
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                self.remaining = self.remaining.saturating_sub(accepted);
+                Ok(accepted)
+            }
+
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+
+        let dir = std::env::temp_dir().join(format!("bloch-index-buffer-fault-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (log, entries) = index_log_fixture(500);
+        let log_path = dir.join("blocks.log");
+        fs::write(&log_path, &log).unwrap();
+
+        let mut failed = FailInsideRecord {
+            bytes: Vec::new(),
+            remaining: INDEX_WRITE_BUFFER_BYTES.saturating_add(7),
+        };
+        {
+            let mut buffered = BufWriter::with_capacity(INDEX_WRITE_BUFFER_BYTES, &mut failed);
+            scan_index_into(&log_path, 0, &mut buffered).expect("scan reaches final flush");
+            assert_eq!(
+                buffered.flush().unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe,
+            );
+        }
+        assert_ne!(failed.bytes.len() % IDX_ENTRY_LEN as usize, 0, "fault must split a record");
+        let idx_path = dir.join("blocks.idx");
+        let mut damaged = IDX_MAGIC.to_vec();
+        damaged.extend_from_slice(&failed.bytes);
+        fs::write(&idx_path, damaged).unwrap();
+
+        let mut idx = OpenOptions::new().read(true).write(true).open(&idx_path).unwrap();
+        repair_index(&mut idx, &log_path, log.len() as u64).expect("repair partial index");
+        let mut expected = IDX_MAGIC.to_vec();
+        for entry in &entries { expected.extend_from_slice(&entry.encode()); }
+        assert_eq!(fs::read(&idx_path).unwrap(), expected);
+
+        drop(idx);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn streamed_index_scan_preserves_torn_and_corrupt_log_prefixes() {
+        let dir = std::env::temp_dir().join(format!("bloch-index-stream-prefix-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (valid, entries) = index_log_fixture(2);
+        let mut expected = IDX_MAGIC.to_vec();
+        for entry in &entries { expected.extend_from_slice(&entry.encode()); }
+
+        let mut torn = valid.clone();
+        torn.extend_from_slice(&[5, 0, 0, 0, 0xAA]);
+        let mut corrupt = valid;
+        corrupt.extend_from_slice(&1u32.to_le_bytes());
+        corrupt.push(0xFF);
+
+        for (name, log) in [("torn", torn), ("corrupt", corrupt)] {
+            let log_path = dir.join(format!("{name}.log"));
+            let idx_path = dir.join(format!("{name}.idx"));
+            fs::write(&log_path, &log).unwrap();
+            let mut idx = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&idx_path)
+                .unwrap();
+            repair_index(&mut idx, &log_path, log.len() as u64).expect("repair valid prefix");
+            assert_eq!(fs::read(&idx_path).unwrap(), expected, "{name} tail changed valid prefix");
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_staging_ignores_legacy_symlinks_and_cleans_only_its_own_file() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("bloch-store-private-stage-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x75; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        let victim = dir.join("unrelated-file");
+        fs::write(&victim, b"must remain intact").unwrap();
+        let legacy = dir.join("blocks.log.tmp");
+        symlink(&victim, &legacy).unwrap();
+        store.rewrite(&[sample_envelope(100)]).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"must remain intact");
+        assert!(fs::symlink_metadata(&legacy).unwrap().file_type().is_symlink());
+        assert_eq!(fs::metadata(dir.join("blocks.log")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(store.read_all().unwrap()[0].header.slot, 100);
+        let destination = dir.join("abandoned-state");
+        let staging = PrivateStagingFile::create_for(&destination).unwrap();
+        let owned = staging.path.clone().unwrap();
+        assert!(owned.exists());
+        drop(staging);
+        assert!(!owned.exists());
+        assert!(legacy.is_symlink());
+        assert_eq!(fs::read(&victim).unwrap(), b"must remain intact");
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rewrite_refuses_before_publication_if_index_cannot_be_invalidated() {
+        let dir = std::env::temp_dir().join(format!("bloch-store-index-invalidate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x74; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        let before = fs::read(dir.join("blocks.log")).unwrap();
+        // A real read-only descriptor forces set_len failure before log rename.
+        store.idx = File::open(dir.join("blocks.idx")).unwrap();
+        assert!(store.rewrite(&[sample_envelope(100)]).is_err());
+        assert_eq!(fs::read(dir.join("blocks.log")).unwrap(), before);
+        let page = Store::blocks_after(&dir, 0, 10).unwrap();
+        assert_eq!(crate::codec::decode_envelope(&page[0]).unwrap().header.slot, 1);
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generation_guards_share_aliases_but_not_unrelated_stores() {
+        let first = std::env::temp_dir().join(format!("bloch-store-generation-a-{}", std::process::id()));
+        let second = std::env::temp_dir().join(format!("bloch-store-generation-b-{}", std::process::id()));
+        fs::create_dir_all(&first).unwrap(); fs::create_dir_all(&second).unwrap();
+        let a = log_generation(&first).unwrap();
+        let alias = log_generation(&first.join(".")).unwrap();
+        let b = log_generation(&second).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &alias));
+        assert!(!std::sync::Arc::ptr_eq(&a, &b));
+        let held = a.write().unwrap();
+        assert!(alias.try_read().is_err());
+        assert!(b.try_read().is_ok(), "one store's rewrite must not block unrelated serving");
+        drop(held); drop(a); drop(alias); drop(b);
+        let _ = fs::remove_dir_all(first); let _ = fs::remove_dir_all(second);
+    }
+
+    #[test]
+    fn asynchronous_rewrite_publishes_then_orders_the_next_append() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-async-rewrite-order-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x72; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+
+        store.rewrite_async(vec![sample_envelope(100), sample_envelope(200)]).unwrap();
+        // `append` must join the writer before it writes. This pins the
+        // generation ordering even when the normal loop has not polled yet.
+        store.append(&sample_envelope(300)).unwrap();
+        assert!(store.poll_rewrite().unwrap(), "joined completion remains observable");
+        assert!(!store.poll_rewrite().unwrap(), "completion is reported once");
+
+        let slots: Vec<_> = store.read_all().unwrap().into_iter()
+            .map(|env| env.header.slot).collect();
+        assert_eq!(slots, vec![100, 200, 300]);
+        let served: Vec<_> = Store::blocks_after(&dir, 0, 10).unwrap().into_iter()
+            .map(|bytes| crate::codec::decode_envelope(&bytes).unwrap().header.slot)
+            .collect();
+        assert_eq!(served, slots, "rebuilt index and authoritative log agree");
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn asynchronous_rewrite_returns_before_durable_publication() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-async-rewrite-responsive-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x69; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        let generation = std::sync::Arc::clone(&store.generation);
+        let reader = generation.read().unwrap();
+
+        // The writer can stage, but cannot enter its publication transaction
+        // while this reader holds the generation. Returning here proves the
+        // caller did not perform or wait for durable publication itself.
+        store.rewrite_async(vec![sample_envelope(100)]).unwrap();
+        assert!(store.rewrite_pending());
+        assert!(!store.poll_rewrite().unwrap());
+        drop(reader);
+        while !store.poll_rewrite().unwrap() {
+            std::thread::yield_now();
+        }
+        assert_eq!(store.read_all().unwrap()[0].header.slot, 100);
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn asynchronous_rewrite_reports_failure_without_replacing_the_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-async-rewrite-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x71; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        let before_log = fs::read(dir.join("blocks.log")).unwrap();
+        let before_index = fs::read(dir.join("blocks.idx")).unwrap();
+        let mut oversized = sample_envelope(2);
+        oversized.proposer_sig.resize(crate::codec::MAX_FIELD_LEN, 0xAA);
+
+        store.rewrite_async(vec![oversized]).unwrap();
+        let error = loop {
+            match store.poll_rewrite() {
+                Ok(false) => std::thread::yield_now(),
+                Ok(true) => panic!("oversized asynchronous rewrite succeeded"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(dir.join("blocks.log")).unwrap(), before_log);
+        assert_eq!(fs::read(dir.join("blocks.idx")).unwrap(), before_index);
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dropping_store_joins_the_reorg_writer_before_releasing_the_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-async-rewrite-drop-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x70; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        let replacement: Vec<_> = (100..400).map(sample_envelope).collect();
+        store.rewrite_async(replacement).unwrap();
+        drop(store); // must not release DirLock while the worker still writes
+
+        let reopened = Store::open(&dir, &[0x70; 32]).unwrap();
+        let frames = reopened.read_all().unwrap();
+        assert_eq!(frames.len(), 300);
+        assert_eq!(frames.first().unwrap().header.slot, 100);
+        assert_eq!(frames.last().unwrap().header.slot, 399);
+        drop(reopened);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restart_rebuilds_same_length_index_left_by_interrupted_reorg() {
+        let dir = std::env::temp_dir().join(format!("bloch-store-reorg-index-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x73; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        store.append(&sample_envelope(2)).unwrap();
+        let old_index = fs::read(dir.join("blocks.idx")).unwrap();
+        let old_length = fs::metadata(dir.join("blocks.log")).unwrap().len();
+        store.rewrite(&[sample_envelope(100), sample_envelope(200)]).unwrap();
+        assert_eq!(fs::metadata(dir.join("blocks.log")).unwrap().len(), old_length);
+        drop(store);
+        // Exact crash residue: replacement log was published, old index had
+        // not yet been invalidated. Its offsets and covered length still fit.
+        fs::write(dir.join("blocks.idx"), old_index).unwrap();
+        let store = Store::open(&dir, &[0x73; 32]).unwrap();
+        let page = Store::blocks_after(&dir, 50, 10).unwrap();
+        let slots: Vec<_> = page.iter().map(|bytes| crate::codec::decode_envelope(bytes).unwrap().header.slot).collect();
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(slots, vec![100, 200], "an index from the old log must not hide replacement blocks");
+    }
+
+    #[test]
+    fn audit_log_diagnostic_is_bounded_and_does_not_repair_or_hide_corruption() {
+        let dir = std::env::temp_dir().join(format!("bloch-store-diagnostic-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blocks.log");
+        let payload = crate::codec::encode_envelope(&sample_envelope(1));
+        let mut valid = (payload.len() as u32).to_le_bytes().to_vec();
+        valid.extend_from_slice(&payload);
+        fs::write(&path, &valid).unwrap();
+        let good = inspect_log(&dir).unwrap();
+        assert_eq!(good.decoded_frames, 1);
+        assert_eq!(good.valid_prefix_bytes, valid.len() as u64);
+        assert_eq!(good.issue, None);
+        for suffix in [&[0u8][..], &[0u8; 4][..], &[255u8; 4][..], &[5, 0, 0, 0, 1][..]] {
+            let mut damaged = valid.clone();
+            damaged.extend_from_slice(suffix);
+            fs::write(&path, &damaged).unwrap();
+            let report = inspect_log(&dir).unwrap();
+            assert_eq!(report.decoded_frames, 1);
+            assert_eq!(report.valid_prefix_bytes, valid.len() as u64);
+            assert!(report.issue.is_some());
+            assert_eq!(fs::read(&path).unwrap(), damaged);
+            assert!(!dir.join("LOCK").exists());
+            assert!(!dir.join("blocks.idx").exists());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inspection_scratch_preserves_mixed_prefix_and_first_corruption() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-inspection-scratch-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blocks.log");
+
+        let empty = sample_envelope(301);
+        let mut large = sample_envelope(302);
+        large.body.transactions = vec![vec![0xA5; 1 << 20]];
+        let mut small = sample_envelope(303);
+        small.proposer_sig.extend_from_slice(&[0x5C; 29]);
+        let mut valid = Vec::new();
+        for envelope in [&empty, &large, &small] {
+            let payload = crate::codec::encode_envelope(envelope);
+            valid.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            valid.extend_from_slice(&payload);
+        }
+        fs::write(&path, &valid).unwrap();
+        assert_eq!(
+            inspect_log(&dir).unwrap(),
+            LogInspection {
+                log_bytes: valid.len() as u64,
+                decoded_frames: 3,
+                valid_prefix_bytes: valid.len() as u64,
+                issue: None,
+            }
+        );
+
+        let mut corrupt = valid.clone();
+        corrupt.extend_from_slice(&1u32.to_le_bytes());
+        corrupt.push(0xFF);
+        fs::write(&path, &corrupt).unwrap();
+        assert_eq!(
+            inspect_log(&dir).unwrap(),
+            LogInspection {
+                log_bytes: corrupt.len() as u64,
+                decoded_frames: 3,
+                valid_prefix_bytes: valid.len() as u64,
+                issue: Some(
+                    "invalid envelope: decode error: truncated; preserve the original log and restore from a verified backup"
+                        .into(),
+                ),
+            },
+            "inspection must stop at the same first undecodable frame",
+        );
+        assert_eq!(fs::read(&path).unwrap(), corrupt, "inspection mutated the log");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn offline_tail_repair_backs_up_only_confirmed_incomplete_or_zero_suffixes() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-tail-repair-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blocks.log");
+        let payload = crate::codec::encode_envelope(&sample_envelope(1));
+        let mut valid = (payload.len() as u32).to_le_bytes().to_vec();
+        valid.extend_from_slice(&payload);
+
+        let mut damaged = valid.clone();
+        damaged.extend_from_slice(&[0u8; 12]);
+        fs::write(&path, &damaged).unwrap();
+        let backup = dir.join("zero-tail.backup");
+        let live_lock = DirLock::acquire(&dir).unwrap();
+        let live_error =
+            repair_log_tail_offline(&dir, valid.len() as u64, &backup).unwrap_err();
+        assert_eq!(live_error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+        assert!(!backup.exists());
+        drop(live_lock);
+
+        let repaired = repair_log_tail_offline(&dir, valid.len() as u64, &backup).unwrap();
+        assert_eq!(repaired.retained_bytes, valid.len() as u64);
+        assert_eq!(repaired.backup_bytes, 12);
+        assert_eq!(fs::read(&path).unwrap(), valid);
+        assert_eq!(fs::read(&backup).unwrap(), [0u8; 12]);
+
+        fs::write(&path, &damaged).unwrap();
+        let existing = repair_log_tail_offline(&dir, valid.len() as u64, &backup).unwrap_err();
+        assert_eq!(existing.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+
+        let mut corrupt = valid.clone();
+        corrupt.extend_from_slice(&[1, 0, 0, 0, 0xff]);
+        fs::write(&path, &corrupt).unwrap();
+        let refused_backup = dir.join("corrupt-tail.backup");
+        let error =
+            repair_log_tail_offline(&dir, valid.len() as u64, &refused_backup).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
+        assert!(!refused_backup.exists());
+
+        let mut incomplete = valid.clone();
+        incomplete.extend_from_slice(&[5, 0, 0, 0, 0xaa]);
+        fs::write(&path, &incomplete).unwrap();
+        let incomplete_backup = dir.join("incomplete-tail.backup");
+        repair_log_tail_offline(&dir, valid.len() as u64, &incomplete_backup).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), valid);
+        assert_eq!(fs::read(&incomplete_backup).unwrap(), [5, 0, 0, 0, 0xaa]);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     /// The from-genesis path, at the store level: `after_slot = 0` must return
     /// the chain from its beginning, and the cap must be a cap.
@@ -1094,6 +2383,135 @@ mod tests {
             "the skip path read at least as much as the bodies it skipped"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fixed_header_scan_preserves_skipped_and_served_frames_exactly() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-pos-fixed-header-scan-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x89; 32]).expect("open");
+        let mut logged = Vec::new();
+        for slot in 1..=6u64 {
+            let mut env = sample_envelope(slot);
+            env.proposer_sig = vec![slot as u8; slot as usize * 257];
+            logged.push(crate::codec::encode_envelope(&env));
+            store.append(&env).expect("append");
+        }
+        drop(store);
+
+        let headers_before = sync_frames_scanned();
+        let bodies_before = sync_body_bytes_read();
+        let page = Store::scan_page(
+            &dir.join("blocks.log"),
+            0,
+            None,
+            3,
+            100,
+            MAX_UNINDEXED_TAIL_SCAN_FRAMES,
+            PageBytes { max: crate::codec::MAX_FIELD_LEN, per_frame: 0, first_must_fit: false },
+        )
+        .expect("bounded scan")
+        .expect("no index mismatch in an unindexed scan");
+
+        assert_eq!(page, logged[3..], "served frames must remain byte-for-byte exact");
+        assert_eq!(
+            sync_frames_scanned() - headers_before,
+            logged.len() as u64,
+            "three skipped and three served frames must each parse exactly one header",
+        );
+        let header_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
+        let returned_body_bytes: u64 = logged[3..]
+            .iter()
+            .map(|frame| frame.len().saturating_sub(header_len) as u64)
+            .sum();
+        assert_eq!(
+            sync_body_bytes_read() - bodies_before,
+            returned_body_bytes,
+            "skipped bodies must remain seek-only while served bodies are read exactly once",
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p2p_byte_preflight_matches_postfilter_and_skips_the_boundary_body() {
+        let dir = std::env::temp_dir().join(format!("bloch-p2p-page-boundary-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x4A; 32]).expect("open");
+        let first = sample_envelope(1);
+        let mut second = sample_envelope(2);
+        second.proposer_sig.extend_from_slice(&[0x5B; 257]);
+        let first_bytes = crate::codec::encode_envelope(&first);
+        let second_bytes = crate::codec::encode_envelope(&second);
+        store.append(&first).expect("append first");
+        store.append(&second).expect("append second");
+
+        let overhead = 4usize;
+        let exact_cap = first_bytes.len().saturating_add(overhead);
+        let generic = Store::blocks_after(&dir, 0, 10).expect("generic page");
+        assert_eq!(generic, vec![first_bytes.clone(), second_bytes]);
+        let mut charged = 0usize;
+        let oracle: Vec<_> = generic.into_iter().take_while(|frame| {
+            let next = charged.saturating_add(frame.len()).saturating_add(overhead);
+            if next > exact_cap { false } else { charged = next; true }
+        }).collect();
+
+        let headers_before = sync_frames_scanned();
+        let bodies_before = sync_body_bytes_read();
+        let bounded = Store::blocks_after_p2p(&dir, 0, 10, exact_cap, overhead).expect("bounded page");
+        assert_eq!(bounded, oracle, "preflight must return the old post-filter prefix");
+        assert_eq!(bounded, vec![first_bytes.clone()], "equality is admitted; the next frame is not");
+        assert_eq!(sync_frames_scanned() - headers_before, 2, "only the rejected frame's header is needed");
+        let header_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
+        assert_eq!(
+            sync_body_bytes_read() - bodies_before,
+            first_bytes.len().saturating_sub(header_len) as u64,
+            "the body rejected at the boundary must not be read",
+        );
+
+        let bodies_before = sync_body_bytes_read();
+        let plus_one = Store::blocks_after_p2p(&dir, 0, 10, exact_cap.saturating_sub(1), overhead)
+            .expect("one byte over");
+        assert!(plus_one.is_empty(), "a first frame one byte over is refused");
+        assert_eq!(sync_body_bytes_read() - bodies_before, 0, "a refused first body stays unread");
+
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p2p_real_cap_first_oversized_is_empty_but_generic_wrapper_still_serves_it() {
+        let dir = std::env::temp_dir().join(format!("bloch-p2p-first-oversized-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x4B; 32]).expect("open");
+        let max = (crate::p2p::MAX_SYNC_FRAME as usize).saturating_sub(1024);
+        let target_len = max.saturating_sub(4).saturating_add(1);
+        let mut oversized = sample_envelope(1);
+        let base = crate::codec::encode_envelope(&oversized).len();
+        oversized.proposer_sig.resize(
+            oversized.proposer_sig.len().saturating_add(target_len.saturating_sub(base)),
+            0x6C,
+        );
+        let encoded = crate::codec::encode_envelope(&oversized);
+        assert_eq!(encoded.len().saturating_add(4), max.saturating_add(1));
+        assert!(encoded.len() <= crate::codec::MAX_FIELD_LEN);
+        store.append(&oversized).expect("append historical frame");
+
+        assert_eq!(
+            Store::blocks_after(&dir, 0, 1).expect("generic page"),
+            vec![encoded],
+            "the public store/devnet first-frame behavior is unchanged",
+        );
+        let bodies_before = sync_body_bytes_read();
+        let bounded = Store::blocks_after_p2p(&dir, 0, 1, max, 4).expect("p2p page");
+        assert!(bounded.is_empty(), "the old p2p post-filter returned an empty page here");
+        assert_eq!(sync_body_bytes_read() - bodies_before, 0, "the oversized first body stays unread");
+
+        drop(store);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1352,11 +2770,62 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// An index that points somewhere the log does not agree with is a hint
-    /// that is wrong, not a source of truth. The answer must be re-derived
-    /// from the log, unchanged.
     #[test]
-    fn a_lying_index_falls_back_to_the_full_scan() {
+    fn an_excessive_unindexed_tail_fails_at_the_scan_bound() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-pos-idx-tail-bound-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[15u8; 32]).expect("open");
+        for slot in 1..=4u64 {
+            store.append(&sample_envelope(slot)).expect("append");
+        }
+        drop(store);
+
+        // Leave one indexed frame and three valid log frames beyond it. The
+        // production allowance is intentionally generous, so inject a bound
+        // of two here to reach the same branch without creating thousands of
+        // fsynced blocks in a unit test.
+        let idx_path = dir.join("blocks.idx");
+        let idx = OpenOptions::new().write(true).open(&idx_path).expect("open idx");
+        idx.set_len(8 + IDX_ENTRY_LEN).expect("truncate idx");
+        drop(idx);
+        let mut idx = File::open(&idx_path).expect("read idx");
+        let covered = idx_read(&mut idx, 0).expect("first record").end();
+
+        let before = sync_frames_scanned();
+        let error = Store::scan_page(
+            &dir.join("blocks.log"),
+            covered,
+            None,
+            u64::MAX,
+            100,
+            2,
+            PageBytes { max: crate::codec::MAX_FIELD_LEN, per_frame: 0, first_must_fit: false },
+        )
+        .expect_err("the third unindexed frame must exceed the injected bound");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("restart to rebuild the derived index"));
+        assert_eq!(
+            sync_frames_scanned() - before,
+            2,
+            "the frame past the allowance must not have its header parsed",
+        );
+
+        // The same valid tail remains below the production allowance and is
+        // served unchanged, preserving the ordinary one-append crash window.
+        let page = Store::blocks_after(&dir, 1, 100).expect("short tail remains compatible");
+        assert_eq!(page.len(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An index that points somewhere the log does not agree with is a local
+    /// fault, not a source of truth and not permission for a remote caller to
+    /// trigger a whole-history scan. Restart/open repairs the disposable
+    /// index.
+    #[test]
+    fn a_lying_index_fails_boundedly_until_restart_rebuilds_it() {
         let dir = std::env::temp_dir().join(format!("bloch-pos-idx-lie-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut store = Store::open(&dir, &[13u8; 32]).expect("open");
@@ -1376,9 +2845,51 @@ mod tests {
         raw[at + 8..at + 16].copy_from_slice(&3u64.to_le_bytes());
         fs::write(&idx_path, &raw).expect("write idx");
 
-        let page = Store::blocks_after(&dir, 5, 100).expect("scan");
-        assert_eq!(page, logged[5..], "a wrong index changed the answer instead of being ignored");
+        let before = sync_frames_scanned();
+        let error = Store::blocks_after(&dir, 5, 100).unwrap_err();
+        let scanned = sync_frames_scanned() - before;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("restart to rebuild"));
+        assert!(scanned <= 1, "corrupt index reopened a whole-log scan: {scanned} frames");
 
+        let store = Store::open(&dir, &[13u8; 32]).expect("restart rebuild");
+        let page = Store::blocks_after(&dir, 5, 100).expect("serve after rebuild");
+        assert_eq!(page, logged[5..], "rebuild changed the authoritative log answer");
+        drop(store);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_or_bad_magic_index_never_reopens_the_full_scan() {
+        let dir = std::env::temp_dir().join(format!("bloch-pos-idx-unusable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x13; 32]).expect("open");
+        for slot in 1..=64u64 {
+            store.append(&sample_envelope(slot)).expect("append");
+        }
+        drop(store);
+
+        for replacement in [None, Some(b"BADINDEX".as_slice()), Some(IDX_MAGIC.as_slice())] {
+            let idx_path = dir.join("blocks.idx");
+            match replacement {
+                None => fs::remove_file(&idx_path).expect("remove index"),
+                Some(bytes) => fs::write(&idx_path, bytes).expect("replace index"),
+            }
+            let before = sync_frames_scanned();
+            let error = Store::blocks_after(&dir, 32, 16).unwrap_err();
+            assert!(matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData));
+            assert_eq!(
+                sync_frames_scanned() - before,
+                0,
+                "unusable index must fail before any log-header scan"
+            );
+            let rebuilt = Store::open(&dir, &[0x13; 32]).expect("rebuild index on restart");
+            drop(rebuilt);
+        }
+
+        let page = Store::blocks_after(&dir, 60, 16).expect("serve after rebuild");
+        assert_eq!(page.len(), 4);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1456,6 +2967,47 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn recovery_never_truncates_indexed_history_after_length_corruption() {
+        let dir = std::env::temp_dir().join(format!("bloch-length-corrupt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        {
+            let mut store = Store::open(&dir, &[0; 32]).unwrap();
+            store.append(&sample_envelope(1)).unwrap();
+            store.append(&sample_envelope(2)).unwrap();
+        }
+        let path = dir.join("blocks.log");
+        let mut bytes = fs::read(&path).unwrap();
+        let corrupt_length = (bytes.len() + 1) as u32;
+        bytes[..4].copy_from_slice(&corrupt_length.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        assert!(Store::open(&dir, &[0; 32]).is_err());
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn restart_repairs_torn_tail_before_accepting_new_blocks() {
+        for tail in [vec![4u8, 0], vec![100, 0, 0, 0, 42]] {
+            let dir = std::env::temp_dir().join(format!("bloch-tail-{}-{}", std::process::id(), tail.len()));
+            let _ = fs::remove_dir_all(&dir);
+            {
+                let mut store = Store::open(&dir, &[0; 32]).unwrap();
+                store.append(&sample_envelope(1)).unwrap();
+            }
+            OpenOptions::new().append(true).open(dir.join("blocks.log")).unwrap().write_all(&tail).unwrap();
+            {
+                let mut store = Store::open(&dir, &[0; 32]).unwrap();
+                store.append(&sample_envelope(2)).unwrap();
+                let blocks = store.read_all().unwrap();
+                assert_eq!(blocks.iter().map(|b| b.header.slot).collect::<Vec<_>>(), vec![1, 2]);
+            }
+            let store = Store::open(&dir, &[0; 32]).unwrap();
+            assert_eq!(store.read_all().unwrap().len(), 2);
+            drop(store); fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     fn sample_envelope(slot: u64) -> BlockEnvelope {
         use bloch_pos_committee::header::{BlockHeaderV4, Body, VERSION_G4};
         BlockEnvelope {
@@ -1492,7 +3044,14 @@ mod tests {
             assert_eq!(meta.len(), 44);
             assert_eq!(&meta[..8], META_MAGIC);
             assert_eq!(&meta[12..], &genesis);
-            assert!(!dir.join("meta.bin.tmp").exists(), "temp file left behind");
+            // The staging file carries a per-process unique name, so look
+            // for the suffix rather than one fixed path.
+            let leftover: Vec<String> = fs::read_dir(&dir)
+                .expect("read dir")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".tmp"))
+                .collect();
+            assert!(leftover.is_empty(), "temp file left behind: {leftover:?}");
         }
         let _again = Store::open(&dir, &genesis).expect("the installed meta.bin is accepted");
         let _ = fs::remove_dir_all(&dir);

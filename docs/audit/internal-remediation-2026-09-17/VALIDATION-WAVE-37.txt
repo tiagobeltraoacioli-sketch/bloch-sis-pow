@@ -1,0 +1,30 @@
+Validation wave 37 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Implementation: ac1d289
+
+PASS
+
+cargo test --locked --offline --manifest-path crates/bloch-btc-wallet/Cargo.toml
+  8 passed; 0 failed; 0 ignored.
+
+cargo test --locked --offline -p bloch-euvm \
+  finding_c_ecdsa_only_validator_unspendable_under_pq_only_verifier
+  1 passed; 0 failed; 4 filtered in audit_activation.
+
+cargo test --locked --offline -p bloch-euvm \
+  classical_custody_is_rejected_even_with_a_permissive_host
+  1 passed; 0 failed; 20 filtered in ustav_kernel.
+
+Ledger parser
+  200 rows; 200 unique finding IDs.
+  66 IMPLEMENTED; 86 PARTIAL; 34 OPEN; 7 BASE CHANGED;
+  4 PROTOCOL DECISION; 1 UNARMED CANDIDATE;
+  1 REFUTED IN AUDIT; 1 VERIFIED POSITIVE.
+
+git diff --check
+  Passed after the documentation update.
+
+BOUNDARY
+
+The historical VM executes the hybrid guard. Native Ustav remains PQ-only and
+rejects classical custody by design; BV-17 is PARTIAL.

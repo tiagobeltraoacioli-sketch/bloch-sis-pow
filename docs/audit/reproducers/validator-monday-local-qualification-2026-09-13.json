@@ -1,0 +1,133 @@
+{
+  "status": "local-qualification-passed-native-canary-pending",
+  "leak_recovery_epoch": 2880,
+  "lifecycle_epoch": 2884,
+  "production_migrations_completed": 0,
+  "full_lifecycle": {
+    "passed": 3,
+    "failed": 0,
+    "log_sha256": "36a979b8a104a8211597663d8b851462889a0eb93ebeea29c3b2fe34cc549777"
+  },
+  "full_suite": {
+    "status": "passed",
+    "exit_code": 0,
+    "passed": 1015,
+    "failed": 0,
+    "ignored": 30,
+    "targets": 23,
+    "log_sha256": "1567c3f4296303374acfb5d8e13bc6ca57b6d046ca56d385e66fe58b61a89952",
+    "source_commit": "e7261e6c74194662cdec0fa77e2124c5eda9da21",
+    "environment": "Sockets permitted; the sandboxed attempt was rejected by OS socket permissions."
+  },
+  "hardened_clippy": "passed",
+  "finite_boundary": {
+    "status": "passed",
+    "activation_epoch": 4,
+    "regime": "finite shipping gates compressed to epoch one",
+    "source_commit": "4eec48be5bb063969e148c6986dc356698a35492",
+    "shipping_params_sha256": "da75e4bc2f24179cc29511f9864179e3796d780f9cef6d85ef0fdcbd9a758a3b",
+    "completed": [
+      "finite-boundary-and-replay",
+      "unarmed-build-pre-activation-compatibility"
+    ],
+    "network": false,
+    "shipping_source_unchanged": true
+  },
+  "joining": {
+    "status": "passed",
+    "activation_epoch": 4,
+    "throwaway_devnet": true,
+    "source_commit": "4eec48be5bb063969e148c6986dc356698a35492",
+    "shipping_params_sha256": "da75e4bc2f24179cc29511f9864179e3796d780f9cef6d85ef0fdcbd9a758a3b",
+    "regime": "finite shipping gates compressed to epoch one; lifecycle at epoch four",
+    "devnet_only_flags": [
+      "--allow-plaintext-keystore"
+    ],
+    "completed": [
+      "network-pre-activation-refusal",
+      "network-post-activation-admission",
+      "network-finalized-registration-and-activation",
+      "joining-proposal-attestation-and-terminal-agreement",
+      "joining-duties-included-in-both-committed-logs",
+      "default-doppelganger-observation-before-duties"
+    ],
+    "binary_sha256": "9b088f1e155052c408b7dc06ecb4cb9c1f7ad38d27f9678012a470b41fba4281",
+    "pre_activation_refusal": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "error": {
+        "code": -32008,
+        "message": "funded validator admission is not active: FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH is unarmed or not reached \u2014 this transaction cannot be admitted; retrying the same bytes will not help"
+      }
+    },
+    "submission": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "accepted": true,
+        "status": "accepted",
+        "kind": "funded_deposit",
+        "bytes": 16939,
+        "tx_hash": "69c9e2ce54b4c3fd85b08efe81f9e25c3285cdaff84e7c7c165fcf7146b5a84a",
+        "tx_hash_note": "local correlation handle only (SHA3-256 of the canonical bytes); not a consensus transaction id \u2014 no block commits to it",
+        "confirmation": "this transport does not confirm: watch for the transaction in a block via `getblockbyslot`. `finalized: true` on that block is the strongest signal this chain offers, but it is NOT a settlement guarantee across nodes; evidence penalties depend on the activated protocol rules. See `docs/integration/BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` \u00a75"
+      }
+    },
+    "active_records": [
+      {
+        "index": 1,
+        "pubkey_hash": "8efd7824087697fde00420e765bb0487bc6f3999a048a783aa76312e23ddc788",
+        "pubkey_bytes": 3749,
+        "state": "active",
+        "own_stake_sat": "2500000000000",
+        "effective_stake_sat": "2500000000000",
+        "commission_bps": "500",
+        "randao_commitment": "749450e86a39a995099e2cd0a2c83c36fa5d42ceab05c99304033c83d6800bce",
+        "slashed": false,
+        "activation_epoch": 12,
+        "exit_epoch": null,
+        "withdrawable_epoch": null,
+        "withdrawal_credentials": "a809845c78a0d17960fbc19444bf2eaaad7c3db0de1e0d0a5c48e63ee8c2cb7c",
+        "funded": true,
+        "withdrawal_payout_sat": "2500000000000",
+        "unbacked_principal_sat": "0",
+        "randao_generation": 0,
+        "randao_reveals_used": 0
+      },
+      {
+        "index": 1,
+        "pubkey_hash": "8efd7824087697fde00420e765bb0487bc6f3999a048a783aa76312e23ddc788",
+        "pubkey_bytes": 3749,
+        "state": "active",
+        "own_stake_sat": "2500000000000",
+        "effective_stake_sat": "2500000000000",
+        "commission_bps": "500",
+        "randao_commitment": "749450e86a39a995099e2cd0a2c83c36fa5d42ceab05c99304033c83d6800bce",
+        "slashed": false,
+        "activation_epoch": 12,
+        "exit_epoch": null,
+        "withdrawable_epoch": null,
+        "withdrawal_credentials": "a809845c78a0d17960fbc19444bf2eaaad7c3db0de1e0d0a5c48e63ee8c2cb7c",
+        "funded": true,
+        "withdrawal_payout_sat": "2500000000000",
+        "unbacked_principal_sat": "0",
+        "randao_generation": 0,
+        "randao_reveals_used": 0
+      }
+    ],
+    "activation_observed_epoch": 12,
+    "terminal": [
+      [
+        "703",
+        "640",
+        "7cefba697887638485033a617ccabf47d3c08c13c19d0d04e868639099c69780"
+      ],
+      [
+        "703",
+        "640",
+        "7cefba697887638485033a617ccabf47d3c08c13c19d0d04e868639099c69780"
+      ]
+    ],
+    "shipping_source_unchanged": true
+  }
+}

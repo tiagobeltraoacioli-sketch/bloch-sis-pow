@@ -850,10 +850,11 @@ Three unreleased additions exist and collide with nothing — `DS_FUND` (5 tips)
 `DS_DEPOSIT_FUND` (11 tips), `DS_NFSET` (1 tip). This is the only one of the
 three re-measured byte/string namespaces that is clean.
 
-14 allocated: `DS_SORTITION`, `DS_ATTEST`, `DS_BLOCK`, `DS_BODY`, `DS_STATE`,
-`DS_RANDAO`, `DS_DEPOSIT`, `DS_SPEND`, `DS_TXID`, `DS_SLASH`, `DS_PROPOSE`,
-`DS_EXIT`, `DS_WSCKPT`, `DS_COHERENCE`. **Verified all 14 values distinct**
-(2026-09-01).
+16 allocated: `DS_SORTITION`, `DS_ATTEST`, `DS_BLOCK`, `DS_BODY`, `DS_STATE`,
+`DS_RANDAO`, `DS_DEPOSIT`, `DS_SPEND`, `DS_SPEND2`, `DS_NETSIG2`, `DS_TXID`, `DS_SLASH`,
+`DS_PROPOSE`, `DS_EXIT`, `DS_WSCKPT`, `DS_COHERENCE`. `params::DOMAIN_TAGS`
+is the machine-readable authority and records every live preimage shape.
+All 16 values are pairwise distinct.
 
 Lower risk than the `u8` namespaces because the values are self-describing
 strings, and a duplicate is visible on the line that declares it. **The real

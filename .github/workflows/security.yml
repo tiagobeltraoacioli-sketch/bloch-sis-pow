@@ -11,9 +11,11 @@
 # blst, pqcrypto/PQClean).
 #
 # Gating philosophy (identical to GitLab):
-#   BLOCKING     — cargo-audit, cargo-deny, clippy-hardened. A known
-#                  high-severity advisory, a supply-chain/license violation, or
-#                  a panic/overflow in consensus code must fail the pipeline.
+#   BLOCKING     — cargo-audit, cargo-deny, clippy-hardened and rollback
+#                  package authentication. A known high-severity advisory, a
+#                  supply-chain/license violation, a panic/overflow in
+#                  consensus code, or an unauthenticated rollback path must
+#                  fail the pipeline.
 #   REPORT-ONLY  — cargo-geiger, miri, cargo-fuzz smoke (early-warning surfaces;
 #                  nightly-dependent or known-noisy, triaged in
 #                  SECURITY_TOOLING.md, not yet hard gates). These use
@@ -52,6 +54,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+
+# Every `run:` starts from a reviewed executable search path and without
+# inherited shell/Python/Rust compiler-substitution channels. The fixed path
+# retains rustup's normal shims and the checked scanner-install destination.
+defaults:
+  run:
+    shell: /usr/bin/env -u BASH_ENV -u ENV -u PYTHONHOME -u PYTHONPATH -u CARGO_HOME -u RUSTUP_HOME -u RUSTUP_TOOLCHAIN -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u RUSTC -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u CARGO_BUILD_RUSTFLAGS -u CARGO_BUILD_RUSTC -u CARGO_BUILD_RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER PATH=/home/runner/.cargo/bin:/home/runner/.local/bin:/usr/local/bin:/usr/bin:/bin /bin/bash --noprofile --norc -euo pipefail {0}
 
 concurrency:
   group: security-${{ github.ref }}
@@ -146,7 +155,9 @@ jobs:
       # findings. Prove the counting half against hand-written logs before it
       # is allowed to judge the tree. Pure bash + python3, no toolchain.
       - name: hardened clippy — self-test
-        run: bash scripts/hardened-clippy.selftest.sh
+        run: |
+          bash scripts/hardened-clippy.selftest.sh
+          python3 -I scripts/hardened-clippy-score.test.py
       - name: Install C toolchain (rocksdb/blst/PQClean)
         run: sudo apt-get update && sudo apt-get install -y clang cmake
       - name: hardened clippy
@@ -178,12 +189,16 @@ jobs:
             --lockfile=pool-proxy/Cargo.lock
             --lockfile=services/pq-shield-api/Cargo.lock
             --lockfile=euvm-tooling/Cargo.lock
+            --lockfile=crates/coherence-prover/script/Cargo.lock
+            --lockfile=crates/coherence-prover/service/Cargo.lock
+            --lockfile=crates/coherence-prover/program/Cargo.lock
             --lockfile=fuzz/Cargo.lock
             --lockfile=spikes/prover-cost/Cargo.lock
             --lockfile=spikes/prover-cost/rv32/Cargo.lock
             --lockfile=spikes/prover-cost/rv32f/Cargo.lock
             --lockfile=spikes/prover-cost/rv32h/Cargo.lock
             --lockfile=spikes/prover-cost/rv32k/Cargo.lock
+            --lockfile=tools/bloch-devkit/templates/svm/Cargo.lock
 
   # gitleaks — catch committed credentials before they reach history (the
   # project has its own PAT-rotation lesson). BLOCKING since 2026-09-04 (finding
@@ -193,8 +208,8 @@ jobs:
   # Runs the SAME command as .gitlab-ci.yml through the same pinned installer,
   # rather than gitleaks-action: this file claims to mirror the GitLab security
   # stage, and two scanners with different scopes and different configs do not
-  # mirror each other. `--no-git` scans the working tree — the scope, and the
-  # 55-finding history backlog it excludes, are written out in .gitleaks.toml.
+  # mirror each other. Tree and full-history scans have separate, reviewed
+  # redacted baselines; see docs/audit/internal-remediation-2026-09-17/HISTORY-SCAN.md.
   secret-scan:
     name: gitleaks (blocking)
     runs-on: ubuntu-latest
@@ -202,26 +217,92 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install gitleaks (pinned; fails if it cannot)
         run: |
-          bash scripts/ci-install-scanner.sh gitleaks
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
       - name: gitleaks detect
-        run: gitleaks detect --no-git --source . --config .gitleaks.toml --no-banner --redact
+        run: bash scripts/scan-secrets.sh tree
+
+  secret-history-scan:
+    name: gitleaks history (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Install verified gitleaks
+        run: CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
+      - name: Scan reachable history against reviewed findings
+        run: bash scripts/scan-secrets.sh history
+      - name: Exercise baseline and shallow-checkout refusals
+        run: python3 -I scripts/scan-secrets.test.py
+
+  # Release-integrity gate (G8). This is the blocking GitHub counterpart of
+  # `.gitlab-ci.yml:pos-release-integrity`: certify the lockfile/layout guard,
+  # exercise the release-build comparator, then prove that two clean builds
+  # are byte-identical and carry the exact source commit stamp. It emits no
+  # signed or deployable artifact; canonical cross-builder reproduction stays
+  # a release-time gate in deploy/RELEASE-INTEGRITY.md.
+  pos-release-integrity:
+    name: pos-release-integrity (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Pinned toolchain (crates/bloch-pos-node/rust-toolchain.toml)
+        run: |
+          ch="$(python3 -I scripts/pinned-rust-toolchain.py)"
+          rustup toolchain install "$ch" --profile minimal --no-self-update
+      - name: Install C toolchain (rocksdb bindgen, blst, PQClean)
+        run: sudo apt-get update && sudo apt-get install -y clang cmake
+      - name: Certify lockfile and workspace-layout refusals
+        run: python3 -I scripts/pos-release-integrity.selftest.py
+      - name: Release helper syntax and comparator regressions
+        run: |
+          bash -n scripts/pos-release-integrity.sh
+          bash -n scripts/build-pos-release-container.sh
+          bash -n scripts/compare-pos-release-builds.sh
+          bash -n scripts/compare-pos-release-builds.selftest.sh
+          bash scripts/compare-pos-release-builds.selftest.sh
+      - name: Locked deterministic commit-stamped release build
+        run: bash scripts/pos-release-integrity.sh
 
   # scanners-blocking guard — the regression test for finding I-H4 itself. Fails
-  # if either CI file re-acquires a scanner escape hatch (`continue-on-error` /
+  # if either CI file re-acquires a required-job escape (`continue-on-error` /
   # `allow_failure: true`, an `exit 0` skip, `when: manual`) or drops a required
-  # scanner job entirely. Pure Python 3, no toolchain.
+  # security job entirely. This also holds rollback-package authentication in
+  # both pipelines. Pure Python 3, no toolchain.
   scanners-blocking-guard:
     name: scanners-blocking guard (blocking)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Offline scanner installer regressions
+        run: python3 -I scripts/ci-install-scanner.test.py
       - name: selftest (the guard must be able to fail)
-        run: python3 scripts/check-scanners-blocking.selftest.py
+        run: python3 -I scripts/check-scanners-blocking.selftest.py
       - name: guard
-        run: python3 scripts/check-scanners-blocking.py
+        run: python3 -I scripts/check-scanners-blocking.py
 
-  # ── REPORT-ONLY (early-warning; continue-on-error) ──────────────────────────
+  # Rollback-package authentication (audit I-H3 / INF-09). GitLab runs this
+  # disposable-key end-to-end test; the GitHub mirror must exercise the same
+  # root-execution boundary. It proves that a rewritten manifest, edited
+  # installer, missing signature, wrong trust root, cross-package signature and
+  # unsafe/lost service arguments are refused before staging. No fleet service
+  # or release key is touched.
+  rollback-package-integrity:
+    name: rollback package integrity (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Authenticate rollback package and rejection paths
+        run: bash deploy/rollback/make-rollback-package.selftest.sh
+      - name: Preserve rollback service arguments without shell parsing
+        run: bash deploy/rollback/make-rollback-package.argv.selftest.sh
+
+  # ── REPORT-ONLY jobs begin here ───────────────────────────────────────────────
 
   # clippy (full, pedantic) — informational; the fork is not yet pedantic-clean.
   clippy:
@@ -258,7 +339,14 @@ jobs:
       - name: Install cargo-geiger
         # PINNED (I-M12): see cargo-audit job above.
         run: cargo install cargo-geiger --version 0.13.0 --locked
-      - run: cargo geiger --manifest-path "$GITHUB_WORKSPACE/crates/bloch-pos-node/Cargo.toml" --package bloch-pos-node --all-features --output-format Ascii
+      - name: Report unsafe usage
+        run: |
+          if cargo geiger --manifest-path "$GITHUB_WORKSPACE/crates/bloch-pos-node/Cargo.toml" --package bloch-pos-node --all-features --output-format Ascii; then
+            :
+          else
+            status=$?
+            echo "::notice title=cargo-geiger report-only::cargo-geiger exited ${status} after emitting its report; known metadata/parser warnings are non-blocking"
+          fi
 
   # miri — UB / provenance / uninit-read on the pure-Rust consensus + emission
   # unit tests. Scoped to FFI-free crates (the node's C FFI — PQClean, rocksdb,

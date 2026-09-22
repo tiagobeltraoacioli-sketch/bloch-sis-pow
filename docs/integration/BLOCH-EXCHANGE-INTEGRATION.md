@@ -1,3 +1,13 @@
+> **Candidate schedule update — 2026-09-13.** The operator selected Monday,
+> 2026-09-14: leak recovery at epoch 2880 (21:31:19 UTC), followed by
+> lifecycle epoch 2884 (22:35:19 UTC). Earlier statements below about an
+> unarmed slashing gate or unreachable penalties describe the historical
+> pre-release configuration. Evidence is refused before epoch 2884; at and
+> after it, valid evidence can apply the configured penalties. This candidate
+> schedule does not establish fleet deployment, cross-node agreement or a
+> settlement guarantee. See `docs/VALIDATOR-OPENING.md` and the September 13
+> activation preflight for the release conditions and retained evidence.
+
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 
 # Bloch (BLCH) — Exchange Integration Specification
@@ -1011,7 +1021,8 @@ pub const fn split_g3_sat(g3_sat: u128) -> u128 {
 A **×100/21 split**, applied per balance, in `u128`, multiply-first so there is
 exactly one rounding step at the end. Rust integer division **truncates toward
 zero**, so every balance rounds **down** by up to 20/21 of a satoshi. There is
-no remainder handling in the code — the dropped fraction goes nowhere.
+an additional deterministic ledger-closing step after all rows are split; see
+§10.5.
 
 Verified arithmetic:
 
@@ -1021,16 +1032,15 @@ Verified arithmetic:
 | 21 sat | 100 sat | exact |
 | 840,000,000,000 sat (8,400 BLCH) | 4,000,000,000,000 sat (40,000 BLCH) | exact — the legacy coinbase amount |
 | 260,000,000,000 sat (2,600 BLCH) | 1,238,095,238,095 sat | 5/21 dropped |
-| Whole measured supply, 3,805,746,000 BLCH | **18,122,600,000 BLCH** | exact, zero aggregate dust |
+| Whole terminal supply, 3,810,744,000 BLCH | **18,146,400,000 BLCH** | exact, zero aggregate dust |
 
 Note the asymmetry: the 8,400-BLCH coinbase rows that dominate the ledger scale
 **exactly**, but Emission-V3-era rows (2,600 BLCH, and the 60-BLCH tail floor)
 do not. Those are the rows that will produce per-row dust in the real terminal
 snapshot.
 
-> ⚠️ **`split_g3_sat` currently has zero callers.** Grep across the workspace
-> finds only its definition and prose references. The rule is specified and
-> unit-tested arithmetic; it has not yet been applied to a real snapshot.
+`read_carryover_snapshot` calls `split_g3_sat` for every output and checks the
+result against the manifest commitment before genesis state is built.
 
 **No dust threshold and no minimum balance.** The only value floor is a
 structural rejection of `value == 0` rows in the snapshot parser
@@ -1120,30 +1130,28 @@ the Genesis-4 manifest commits `entry_count` = number of outputs.
 This matters for the dust rule. Truncating per row loses satoshis, but
 `Manifest::check_supply()` (`crates/bloch-pos-node/src/genesis.rs:240-261`)
 refuses any manifest where `carryover.total_sat + Σ allocations ≠
-GENESIS_ISSUED_SAT` **exactly**. Someone must therefore absorb the accumulated
-remainder. The code comment states this requirement and says "truncate-and-hope
-does not close the accounting" — **and the rule is not implemented anywhere.**
+GENESIS_ISSUED_SAT` **exactly**. The implemented rule gives the accumulated
+remainder to the highest-value output, ties broken by the lowest `(txid,
+vout)`. On the terminal artifact 111 rows leave remainders totalling 57
+satoshis; address `cb339d2e…`, which owns the largest single output, receives
+that adjustment.
 
-Practical consequence for you: whether a balance is split per-UTXO or summed
-per-address first changes the final satoshi. **Until the dust rule is published,
-a Genesis-4 opening balance cannot be predicted to the satoshi from a Genesis-3
-balance.** It can be predicted to well within a satoshi, which is immaterial for
-trading, but do not build an exact-match reconciliation test against it yet.
+Practical consequence for you: apply the split per UTXO, then the deterministic
+57-satoshi adjustment. Summing per address first produces a different ledger.
 
 ### 10.6 Supply figures
 
 | Quantity | Value |
 |---|---|
 | Genesis-4 hard cap (`TOTAL_SUPPLY_BLOCH`) | **100,000,000,000 BLCH** = 10^19 sat |
-| Carryover after the split (**provisional**) | 18,122,600,000 BLCH |
-| Genesis issued at launch (`GENESIS_ISSUED_SAT`) | 57,122,600,000 BLCH |
-| Validator emission over 40 years | 42,877,400,000 BLCH |
+| Carryover after the split (terminal) | 18,146,400,000 BLCH |
+| Genesis issued at launch (`GENESIS_ISSUED_SAT`) | 57,146,400,000 BLCH |
+| Validator emission over 40 years | 42,853,600,000 BLCH |
 | Founder / VC / Team / Marketing / Liquidity | 10 B / 10 B / 10 B / 4 B / 5 B BLCH |
 
-> ⚠️ **The carryover figure is provisional and will change.** It is pinned to a
-> measurement at height 39,328 and grows with every Genesis-3 block until the
-> halt. Re-pinning it is a launch-day ceremony step. Do not publish
-> 18,122,600,000 as final.
+> The carryover is pinned to the terminal height 39,918 artifact: 452,726
+> outputs totalling 3,810,744,000 Genesis-3 BLCH before the split. It is no
+> longer the provisional height-39,328 measurement used by earlier editions.
 
 > ⚠️ 10^19 sat is **54.21% of `u64::MAX`** and **1,110× JavaScript's 2^53**.
 > Genesis-4 will emit all satoshi amounts as **decimal strings**
@@ -1305,8 +1313,8 @@ don't match your node".
 |---|---|---|---|
 | D18 | The Genesis-4 snapshot is "signed" | **No signing mechanism exists in the code.** The tool emits a SHAKE-256 root; trust rests on independent reproduction (§10.4). The word "signed" appears in prose only. | **High** |
 | D19 | The snapshot commitment has one hash function | **Three are named**: SHAKE-256 (tool), SHA-256 (runbook), **SHA3-256** (`genesis.rs:85`, the manifest field). Unresolved (§10.4). | **High** |
-| D20 | The ×100/21 split is applied | `split_g3_sat` has **zero callers**. Carryover ingestion is not implemented — `CarryoverCommitment` is validated but never creates balances (§11.2). | **High** |
-| D21 | The per-row dust rule is defined | Truncation loses satoshis, `check_supply()` demands exact reconciliation, and **the rule that closes the gap is unimplemented** — the source comment says so (§10.5). | Medium |
+| D20 | The ×100/21 split is applied | **Resolved after this table was first written:** `read_carryover_snapshot` applies `split_g3_sat` to every committed row and ingestion seeds the opening state (§10.2). | Closed |
+| D21 | The per-row dust rule is defined | **Resolved:** the 57-satoshi terminal remainder goes to the highest-value output, ties by lowest outpoint; `check_supply()` requires exact reconciliation (§10.5). | Closed |
 | D22 | `crates/bloch-pos-node/Cargo.toml:5` says Genesis-3 halts at height **80,000** | The constant is **50,000**, lowered 2026-08-12. Stale metadata. | Medium |
 | D23 | `tokenomics_v4.rs` comments match its constants | Stale after the 2026-08-13 re-pin: flat reward (1,022.63 vs 1,019.03 BLCH/slot), halving figures, year-1 inflation (436 vs 435 bps), emission dust (176,880 vs 772,880 sat). **Constants and asserts are correct; comments lag.** | Medium |
 | D24 | The terminal height is enforced everywhere | `is_past_terminal_height` appears **zero times in `src/rpc/mod.rs`**. `getblocktemplate` and `createauxblock` keep issuing templates past height 50,000; the resulting blocks are then rejected by `accept_block`. **Merged miners will burn work at the halt** unless the pool checks height itself. | **High** (for miners, not for exchanges) |

@@ -27,7 +27,7 @@ version: "2.0"
 services:
   prover:
     # ← replace with your pushed image (Docker Hub / ghcr.io / etc.)
-    image: docker.io/YOUR_USER/bloch-sp1-prover:latest
+    image: REPLACE_WITH_DIGEST_PINNED_IMAGE  # operator image required; cannot be pulled
     expose:
       # Internal only: reachable from the TLS sidecar, never `global`.
       - port: 8080

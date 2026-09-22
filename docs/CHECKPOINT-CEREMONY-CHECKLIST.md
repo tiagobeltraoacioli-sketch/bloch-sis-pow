@@ -241,9 +241,11 @@ signatures. Do not publish. Go back to §2.
 - `wscheckpoint-<epoch>.envelope.bin`
 - `signer-set-1.bin`
 - the ws digest, **in the announcement text**
+- the signer-set SHA3-256 fingerprint, **through an independently authenticated
+  channel** (and preferably repeated in every independent announcement)
 
-Agreement of the digest across independent channels is the evidence. The
-artifact's own say-so is not.
+Agreement of the digest and signer-arrangement fingerprint across independent
+channels is the evidence. The artifacts' own say-so is not.
 
 ---
 
@@ -252,11 +254,13 @@ artifact's own say-so is not.
 ```
 bloch-pos run --data-dir <dir> \
               --ws-checkpoint wscheckpoint-<epoch>.envelope.bin \
-              --ws-signer-set signer-set-1.bin
+              --ws-signer-set signer-set-1.bin \
+              --ws-signer-set-sha3 <fingerprint-from-an-independent-channel>
 ```
 
-Both flags are required together. Before starting, they should run the §7
-`ws-verify` themselves and compare the digest against a second channel.
+All three flags are required together. Before starting, they should run the §7
+`ws-verify` themselves and compare the digest and arrangement fingerprint
+against independent channels.
 
 ---
 

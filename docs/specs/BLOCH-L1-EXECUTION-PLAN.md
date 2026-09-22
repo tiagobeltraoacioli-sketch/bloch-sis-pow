@@ -49,7 +49,11 @@ Inherited from the node-integration plan, unchanged:
 
 The one rule this plan adds:
 
-> **SR-2: the closed `StateRoots` component list is re-frozen exactly once.**
+> **SR-2 historical plan (superseded):** this document originally treated the
+> closed `StateRoots` DTO as the live component registry and planned one
+> re-freeze. Production instead uses the append-only `STATE_COMPONENT_TAGS`
+> registry and concrete state fold; `StateRoots` remains a compatibility DTO.
+>
 > Three demands on that list already exist: (1) the pending extension DEV-1
 > flagged in `crates/bloch-pos-committee/src/transition.rs` (module docs,
 > "What is honestly not committed yet") — finality bookkeeping,
@@ -265,7 +269,7 @@ charter serialization and registry root.
 
 ## 4. Track X — the serialized integration points
 
-### X1 — SR-2: the single StateRoots re-freeze
+### X1 — SR-2: historical StateRoots re-freeze plan (superseded)
 
 | Deliverable | one PR: `interfaces.rs` + `state_root.rs` + commitment KATs |
 |---|---|

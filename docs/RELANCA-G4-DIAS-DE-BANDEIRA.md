@@ -358,14 +358,14 @@ Tudo abaixo, simultaneamente verdadeiro, **até E\*−180 (48 h antes)**.
    ainda não divergiram; duas raízes iguais na mesma altura, com o mesmo log e o
    mesmo binário, não podem. Se duas raízes diferem aí, a dobra não é
    determinística e **nada pode ser armado**.
-5. **Sem divergência de fronteira.** Nenhuma linha
-   `BLOCH-CONSENSUS-DIVERGENCE boundary_partition_dropped_votes` no stderr do
-   replay, exceto as explicáveis por slashing no meio de época — a única causa
-   legítima conhecida. O detector é incondicional e não fatal (está no binário de
-   release, sem `cfg`) e é limitado por backoff de potência de dois: as 8
-   primeiras ocorrências saem, depois cada dobra. **Uma linha já é o evento.**
+5. **Sem divergência de fronteira.** A série Prometheus
+   `bloch_pos_boundary_vote_drops_total` permanece em zero durante o replay.
+   O detector é incondicional e não fatal (está no binário de release, sem
+   `cfg`); o caminho de consenso incrementa apenas um contador atômico e nunca
+   bloqueia escrevendo em stderr. **Um incremento já é o evento.**
    ```sh
-   grep -c "BLOCH-CONSENSUS-DIVERGENCE" /home/ubuntu/g4/nNN/node.log
+   curl -fsS http://127.0.0.1:METRICS_PORT/metrics | \
+     grep '^bloch_pos_boundary_vote_drops_total '
    ```
 6. **Soak de 90 épocas (24 h)** com 1–5 valendo e **nenhum nó reiniciado** na
    janela.
@@ -408,10 +408,10 @@ mainnet em duas cadeias que finalizam histórias diferentes.
    (o de `the_block_cap_gate_reads_the_epoch_from_the_blocks_own_header`,
    `transition.rs:4939`), ou a suíte está vermelha. **Leitura de código: não
    compilei nada** (§8).
-3. **`leaked` não é legível por RPC**, e `BOUNDARY_VOTE_DROPS` também não. A
-   métrica direta do que o portão 1.2 faz **não é observável remotamente**; o §4
-   se vira com sinais indiretos. Expor os dois em `getchaininfo` é trabalho
-   pequeno e deveria entrar antes do tag.
+3. **`leaked` não é legível por RPC.** `BOUNDARY_VOTE_DROPS`, porém, é exposto
+   em `/metrics` como `bloch_pos_boundary_vote_drops_total`. O endpoint de
+   métricas é desligado por padrão e deve permanecer em loopback ou atrás do
+   monitoramento autorizado.
 
 ---
 
@@ -523,8 +523,8 @@ nada.
   participar, e isso não é constante do código. O que se afirma é a direção e o
   alarme: um atraso que **aumenta** depois de E\* significa que a composição do
   comitê andou contra um nó que discorda — trate como sinal de fork, não jitter.
-- **`BOUNDARY_VOTE_DROPS` em zero.** Sem RPC (débito 3), a conferência é
-  `grep BLOCH-CONSENSUS-DIVERGENCE` no log de cada nó.
+- **`BOUNDARY_VOTE_DROPS` em zero.** Confira
+  `bloch_pos_boundary_vote_drops_total` no `/metrics` de cada nó.
 - **Nenhum `apply refused:`** depois de E\*. Ver §6.
 
 ---

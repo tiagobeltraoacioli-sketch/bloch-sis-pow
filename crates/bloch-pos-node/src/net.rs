@@ -85,9 +85,8 @@
 //! Sync requests still go out on outbound connections only, and are answered
 //! by the peer's inbound handler on the same socket.
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
@@ -109,6 +108,10 @@ pub const FRAME_GET_BLOCKS: u8 = 0x03;
 pub const FRAME_TX: u8 = 0x04;
 
 pub use crate::p2p::{Origin, Verdict};
+mod source_budget;
+pub(crate) mod rejection_log;
+pub(crate) use source_budget::Reservation as SourceReservation;
+pub(crate) use source_budget::verification_source_for_ip;
 
 /// What the engine receives from a transport.
 pub enum NetEvent {
@@ -127,6 +130,67 @@ pub enum NetEvent {
     Transaction(bloch_pos_committee::transition::PosTransaction, Origin),
 }
 
+/// One locally-produced block announcement, encoded together with the exact
+/// identity derived from the same borrowed envelope. Fields stay private so
+/// the libp2p suppression hint cannot be paired with unrelated wire bytes.
+pub(crate) struct PreparedBlockBroadcast {
+    payload: Vec<u8>,
+    id: [u8; 32],
+}
+
+impl PreparedBlockBroadcast {
+    fn new(env: &BlockEnvelope) -> Self {
+        Self {
+            payload: crate::codec::encode_envelope(env),
+            id: *env.block_id().as_bytes(),
+        }
+    }
+
+    fn devnet_frame(&self) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(1usize.saturating_add(self.payload.len()));
+        frame.push(FRAME_BLOCK);
+        frame.extend_from_slice(&self.payload);
+        frame
+    }
+
+    #[cfg(test)]
+    fn payload(&self) -> &[u8] { &self.payload }
+    pub(crate) fn id(&self) -> [u8; 32] { self.id }
+    pub(crate) fn into_payload(self) -> Vec<u8> { self.payload }
+}
+
+/// One canonical transaction payload prepared for transport-specific
+/// ownership. Construction copies from the engine's canonical mempool key
+/// into a buffer with at least one spare byte, so devnet can prepend its frame
+/// tag in place while libp2p can take the untagged payload without a recopy.
+pub(crate) struct PreparedTransactionBroadcast {
+    payload: Vec<u8>,
+}
+
+impl PreparedTransactionBroadcast {
+    pub(crate) fn new(canonical: &[u8]) -> Self {
+        let mut payload = Vec::with_capacity(canonical.len().saturating_add(1));
+        payload.extend_from_slice(canonical);
+        Self { payload }
+    }
+
+    fn devnet_frame(&self) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(self.payload.len().saturating_add(1));
+        frame.push(FRAME_TX);
+        frame.extend_from_slice(&self.payload);
+        frame
+    }
+
+    fn into_devnet_frame(mut self) -> Vec<u8> {
+        self.payload.insert(0, FRAME_TX);
+        self.payload
+    }
+
+    #[cfg(test)]
+    pub(crate) fn payload(&self) -> &[u8] { &self.payload }
+    pub(crate) fn into_payload(self) -> Vec<u8> { self.payload }
+}
+
 /// The transport the engine holds, chosen at startup.
 ///
 /// `Devnet` and `Libp2p` are what they always were. [`Net::Both`] is the
@@ -141,6 +205,35 @@ pub enum Net {
 }
 
 impl Net {
+    /// Publish a locally-produced block without cloning its retained envelope
+    /// or making libp2p decode the just-encoded body solely for suppression.
+    /// The private prepared value binds the canonical payload and id to one
+    /// envelope and lets libp2p take ownership without recopying that payload.
+    pub(crate) fn broadcast_block(&self, env: &BlockEnvelope) {
+        match self {
+            Net::Devnet(m) => m.broadcast(block_frame(env)),
+            Net::Libp2p(h) => h.broadcast_block(PreparedBlockBroadcast::new(env)),
+            Net::Both(m, h) => {
+                let prepared = PreparedBlockBroadcast::new(env);
+                m.broadcast(prepared.devnet_frame());
+                h.broadcast_block(prepared);
+            }
+        }
+    }
+
+    /// Publish one already-admitted canonical transaction without making the
+    /// libp2p command loop copy the complete payload away from a routing tag.
+    pub(crate) fn broadcast_transaction(&self, prepared: PreparedTransactionBroadcast) {
+        match self {
+            Net::Devnet(m) => m.broadcast(prepared.into_devnet_frame()),
+            Net::Libp2p(h) => h.broadcast_transaction(prepared),
+            Net::Both(m, h) => {
+                m.broadcast(prepared.devnet_frame());
+                h.broadcast_transaction(prepared);
+            }
+        }
+    }
+
     /// Publish one frame (a `FRAME_*` type byte followed by its payload, no
     /// length prefix). The devnet mesh sends it to every peer; libp2p routes
     /// it by that type byte onto the matching gossip topic, or onto the
@@ -152,7 +245,7 @@ impl Net {
             Net::Both(m, h) => {
                 // The SAME bytes on both wires. `frame` was built once by the
                 // caller (`block_frame`, `att_frame`, `get_blocks_frame`, or
-                // the transaction frame in `on_transaction`) and each
+                // another generic raw-frame caller) and each
                 // transport gets a copy of it, so there is no second encoding
                 // that could disagree with the first.
                 //
@@ -212,7 +305,9 @@ impl Net {
     }
 }
 
-/// How many peers may be answering our history request at the same time.
+/// Concurrent request leases shared by engine and periodic synchronization.
+/// This bounds request issuance, not outstanding responses: the legacy wire
+/// has no page-completion marker, and late blocks remain subject to QueueBudget.
 ///
 /// **Why this is not "all of them".** Every outbound dialer used to send
 /// `FRAME_GET_BLOCKS` the moment it connected, and `serve_get_blocks` answered
@@ -228,6 +323,10 @@ impl Net {
 /// or lying; the rest stay connected and still deliver broadcasts, they just do
 /// not each dump a copy of history.
 const SYNC_FANOUT: usize = 2;
+/// One request per lease; expiration permits another connection's turn even
+/// when peers stay silent or the applied head has not moved.
+const SYNC_LEASE: Duration = Duration::from_secs(5);
+const MAX_SYNC_SERVING_WORKERS: usize = 4;
 
 /// Blocks in one `FRAME_GET_BLOCKS` answer.
 ///
@@ -239,19 +338,6 @@ const SYNC_FANOUT: usize = 2;
 /// costs a few more round trips and removes the burst that was taking nodes
 /// down.
 const SYNC_PAGE_BLOCKS: usize = 512;
-
-/// Bytes of block payload in one `FRAME_GET_BLOCKS` answer (audit NET-17 /
-/// NET-05, 2026-09-16).
-///
-/// [`SYNC_PAGE_BLOCKS`] bounds a COUNT, and a count of 512 blocks that may
-/// each be [`crate::codec::MAX_FIELD_LEN`] (8 MiB) bounds nothing useful — the
-/// same "bounded counts do not establish a safe memory budget" shape as
-/// [`ENGINE_QUEUE_BYTES_CAP`], on the serving side. The production transport
-/// stops a page at `MAX_SYNC_FRAME − 1 KiB` (`p2p::read_sync_page`); this is
-/// that number, so the two transports serve the same worst-case page
-/// whichever wire a peer asks over. Each block is its own frame here, so the
-/// 4-byte length prefix is charged per block exactly as libp2p charges it.
-const SYNC_PAGE_BYTES: usize = (crate::p2p::MAX_SYNC_FRAME as usize).saturating_sub(1024);
 
 /// Network events queued for the engine before the transport starts shedding.
 ///
@@ -303,25 +389,32 @@ pub fn class_of(ev: &NetEvent) -> EventClass {
 
 /// The bytes an event is charged to the budget: its canonical wire size.
 ///
-/// A PURE function of the event value, evaluated identically at reservation
-/// (`try_reserve`) and at release (`release`). That is the whole accounting
-/// invariant: because both sides compute the same number from the same value,
-/// `bytes` after a release equals `bytes` before the matching reservation,
-/// with no ticket to thread through the engine's event type. Encoding a block
-/// costs one allocation the size of the block; the engine already encodes
-/// every block it stores, and the hybrid signature check it runs on each is
-/// four orders of magnitude more expensive, so this is not on the critical
-/// path.
+/// A pure canonical-size function used at source-free admission and to prove
+/// decoded transport bytes are canonical. Transport reservations retain that
+/// proved size for later engine-queue reserve/release, avoiding repeated
+/// serialization of the same immutable payload.
 pub fn queued_bytes(ev: &NetEvent) -> usize {
     match ev {
-        NetEvent::Block(env, _) => crate::codec::encode_envelope(env).len(),
-        NetEvent::Attestation(att, _) => {
-            let mut b = Vec::new();
-            crate::codec::encode_attestation(&mut b, att);
-            b.len()
-        }
+        // The shared canonical-length authority avoids allocating and copying
+        // the complete block body merely to charge its immutable queue entry.
+        NetEvent::Block(env, _) => crate::codec::encoded_envelope_len(env),
+        // As for blocks, sizing shares the codec's exact length authority and
+        // never needs a second owner of the signature bytes.
+        NetEvent::Attestation(att, _) => crate::codec::encoded_attestation_len(att),
         NetEvent::Transaction(tx, _) => tx.canonical_bytes().len(),
     }
+}
+
+/// Bytes charged to the engine-facing queue. Transport-originated events
+/// carry the exact validated wire charge in their private reservation;
+/// source-free/local events still compute their canonical size here.
+pub(crate) fn charged_bytes(ev: &NetEvent) -> usize {
+    let retained = match ev {
+        NetEvent::Block(_, origin)
+        | NetEvent::Attestation(_, origin)
+        | NetEvent::Transaction(_, origin) => origin.reserved_bytes(),
+    };
+    retained.unwrap_or_else(|| queued_bytes(ev))
 }
 
 /// Per-class share of [`ENGINE_QUEUE_BYTES_CAP`] a class may fill.
@@ -331,8 +424,8 @@ pub fn queued_bytes(ev: &NetEvent) -> usize {
 /// consist of, and a node that sheds blocks while queuing transactions has its
 /// priorities inverted); attestations up to three quarters; transactions up to
 /// half. So under memory pressure transactions are shed first, attestations
-/// second, blocks last — and a flood of one class can never exclude a higher
-/// class from the budget.
+/// second, blocks last. The same shares reserve event-count headroom, so
+/// many tiny lower-priority messages cannot consume the block allowance.
 fn class_bytes_cap(class: EventClass, bytes_cap: usize) -> usize {
     match class {
         EventClass::Block => bytes_cap,
@@ -342,6 +435,12 @@ fn class_bytes_cap(class: EventClass, bytes_cap: usize) -> usize {
         EventClass::Attestation => bytes_cap.checked_div(4).unwrap_or(0).saturating_mul(3),
         EventClass::Transaction => bytes_cap.checked_div(2).unwrap_or(0),
     }
+}
+
+/// Count thresholds use the byte policy's shares, retaining one usable slot
+/// for nonzero tiny test budgets. A zero budget never admits an event.
+fn class_count_cap(class: EventClass, count_cap: usize) -> usize {
+    class_bytes_cap(class, count_cap).max(usize::from(count_cap != 0))
 }
 
 /// The admission budget shared by every transport that feeds the engine.
@@ -362,6 +461,7 @@ fn class_bytes_cap(class: EventClass, bytes_cap: usize) -> usize {
 /// counter to `usize::MAX`, which is the failure that once made a dual-
 /// transport node shed every frame forever (see `engine::run`).
 pub struct QueueBudget {
+    sources: Arc<Mutex<source_budget::Registry>>,
     count: std::sync::atomic::AtomicUsize,
     bytes: std::sync::atomic::AtomicUsize,
     count_cap: usize,
@@ -382,6 +482,7 @@ impl QueueBudget {
     /// with anything but the two constants.
     pub fn with_caps(count_cap: usize, bytes_cap: usize) -> QueueBudget {
         QueueBudget {
+            sources: Arc::new(Mutex::new(source_budget::Registry::default())),
             count: std::sync::atomic::AtomicUsize::new(0),
             bytes: std::sync::atomic::AtomicUsize::new(0),
             count_cap,
@@ -392,6 +493,57 @@ impl QueueBudget {
         }
     }
 
+    /// Reserve before either transport's first engine-facing channel. The
+    /// Origin guard survives forwarding and handling, including error paths.
+    fn admit_source(&self, ev: &mut NetEvent, source: source_budget::Source) -> bool {
+        let class = class_of(ev);
+        let Some(guard) = self.reserve_source_frame(source, class, queued_bytes(ev)) else {
+            return false;
+        };
+        match ev {
+            NetEvent::Block(_, origin) | NetEvent::Attestation(_, origin)
+                | NetEvent::Transaction(_, origin) => origin.set_reservation(guard),
+        }
+        true
+    }
+
+    pub(crate) fn admit_peer(&self, ev: &mut NetEvent, peer: Vec<u8>) -> bool {
+        self.admit_source(ev, source_budget::Source::Peer(peer))
+    }
+
+    /// Reserve a libp2p peer's bounded first-hop allowance before parsing its
+    /// gossip payload. `size` is the already-bounded gossipsub frame length;
+    /// callers must verify that a successfully decoded canonical value has the
+    /// same class and encoded size before attaching the returned guard.
+    pub(crate) fn reserve_peer_frame(
+        &self,
+        class: EventClass,
+        size: usize,
+        peer: Vec<u8>,
+    ) -> Option<Arc<SourceReservation>> {
+        self.reserve_source_frame(source_budget::Source::Peer(peer), class, size)
+    }
+
+    fn reserve_source_frame(
+        &self,
+        source: source_budget::Source,
+        class: EventClass,
+        size: usize,
+    ) -> Option<Arc<SourceReservation>> {
+        let guard = source_budget::Registry::reserve(
+            &self.sources,
+            source,
+            class,
+            size,
+            self.count_cap,
+            self.bytes_cap,
+        );
+        if guard.is_none() {
+            self.shed_counter(class).fetch_add(1, Ordering::Relaxed);
+        }
+        guard
+    }
+
     /// Reserve room for `ev`, or record a shed and return `false`.
     ///
     /// Count first (cheap, and the invariant everything else already relies
@@ -400,7 +552,7 @@ impl QueueBudget {
     /// invariants hold under any interleaving of any number of callers.
     pub fn try_reserve(&self, ev: &NetEvent) -> bool {
         let class = class_of(ev);
-        let size = queued_bytes(ev);
+        let size = charged_bytes(ev);
         let admitted = self.reserve_raw(class, size);
         if !admitted {
             self.shed_counter(class).fetch_add(1, Ordering::Relaxed);
@@ -409,7 +561,7 @@ impl QueueBudget {
     }
 
     fn reserve_raw(&self, class: EventClass, size: usize) -> bool {
-        let count_cap = self.count_cap;
+        let count_cap = class_count_cap(class, self.count_cap);
         if self
             .count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -435,10 +587,10 @@ impl QueueBudget {
         reserved
     }
 
-    /// Release the reservation made for `ev` — the same pure size function,
-    /// so the two calls cancel exactly.
+    /// Release the reservation made for `ev` using the same retained charge
+    /// as admission. Source-free work falls back to its canonical size.
     pub fn release(&self, ev: &NetEvent) {
-        self.release_raw(queued_bytes(ev));
+        self.release_raw(charged_bytes(ev));
     }
 
     /// Release a reservation whose event has already been moved away (the
@@ -516,10 +668,9 @@ const OUTBOUND_QUEUE_DEPTH: usize = 256;
 /// header): binding a routable address is opt-in and, once bound, ANY TCP
 /// connection this node accepts costs two threads (one reader, one writer)
 /// and one bounded queue for as long as it stays open — before this bound,
-/// forever. `engine::Config::max_peers` defaults to 64 configured/dialed
-/// peers; this is double that, generous headroom for inbound connections
-/// from peers that dialed first, past which a new connection is closed
-/// immediately, before either thread is spawned.
+/// forever. This ceiling leaves generous headroom over the default configured
+/// peer count for inbound connections from peers that dialed first; past it a
+/// new connection is closed immediately, before either thread is spawned.
 const MAX_INBOUND_CONNECTIONS: usize = 128;
 
 /// Inbound TCP connections this transport will hold from ONE source address
@@ -529,15 +680,14 @@ const MAX_INBOUND_CONNECTIONS: usize = 128;
 /// host that opens 128 sockets to a public bootnode and sends a 5-byte frame
 /// on each every ~100 s holds every slot for as long as it likes, and every
 /// third party following the quickstart is refused at accept — the only
-/// public onboarding path, denied for the price of 128 idle sockets. The
-/// fleet peer list has exactly ONE connection per peer host in each
-/// direction (each side dials the other once), so an honest host never needs
-/// more than one inbound slot here; four leaves room for a host that runs a
-/// couple of nodes or an injector (`send_transaction` opens and closes its
-/// own) next to its validator, and still means a single source can take at
-/// most 4 of 128 slots. Checked at accept, alongside the global cap, and
-/// released when the connection ends.
-const MAX_INBOUND_PER_IP: usize = 4;
+/// public onboarding path, denied for the price of 128 idle sockets. This
+/// accommodates several validators, or an injector (`send_transaction` opens
+/// and closes its own connection) next to a validator, on one host, and
+/// still means a single source can take at most a quarter of the global
+/// allowance. Checked at accept, alongside the global cap, through
+/// [`crate::connection_limit::Limits`]; the permit is released when the
+/// connection ends.
+const MAX_INBOUND_PER_IP: usize = 32;
 
 /// The devnet transport's tunables, as one value, so [`start`] has exactly
 /// one production setting and the tests that need a small number have a
@@ -592,13 +742,14 @@ const DEVNET_IO_TIMEOUT: Duration = Duration::from_secs(120);
 /// The accepting side closes an inbound connection [`DEVNET_IO_TIMEOUT`]
 /// after the last decodable frame it read — that is, after this dialer's
 /// last write. The dialer's reader thread notices that close once the FIN
-/// arrives and the writer loop re-dials (see [`ReaderOpen`]); this closes
-/// the window before the FIN has arrived, and the race between the peer's
-/// close and this node's next write, deterministically: a socket this node
-/// has not written to for this long is one the peer is about to close, and
-/// a frame due for it is written on a new socket. Fifteen seconds under the
-/// peer's deadline covers scheduling skew between two hosts; a connection
-/// that holds a sync slot writes every 5 s and never comes near it.
+/// arrives and closes the connection, so the writer re-dials (see
+/// `run_connection_writer`); this closes the window before the FIN has
+/// arrived, and the race between the peer's close and this node's next
+/// write, deterministically: a socket this node has not written to for this
+/// long is one the peer is about to close, and a frame due for it is written
+/// on a new socket. Fifteen seconds under the peer's deadline covers
+/// scheduling skew between two hosts; a connection that holds a sync lease
+/// writes every 5 s and never comes near it.
 const DIAL_STALE_AFTER: Duration = Duration::from_secs(105);
 
 /// Sustained `get-blocks` answers this transport will build per source
@@ -610,22 +761,33 @@ const DIAL_STALE_AFTER: Duration = Duration::from_secs(105);
 /// issue `get-blocks` back to back forever, each one paying a
 /// `Store::blocks_after` disk read.
 ///
-/// Per source ADDRESS, not per connection (audit NET-05, 2026-09-16): a
-/// per-connection bucket multiplies by however many connections one host
-/// may hold, and the budget it bought was 128 × 8 × 512 blocks/s from one
-/// host. Every connection from one address now draws on ONE bucket, and the
-/// bucket outlives the connection (see [`InboundByIp`]) so closing and
+/// Per source ADDRESS as well as per connection (audit NET-05, 2026-09-16):
+/// a per-connection bucket alone multiplies by however many connections one
+/// host may hold, and the budget it bought was 128 × 8 × 512 blocks/s from
+/// one host. Every connection from one address also draws on ONE shared
+/// bucket that outlives the connection (see [`SyncBudget`]), so closing and
 /// re-dialing does not refill it.
 const GET_BLOCKS_ANSWERS_PER_SEC: f64 = 8.0;
 const GET_BLOCKS_BURST: f64 = 32.0;
 
+/// One immutable wire frame shared by the bounded devnet writer queues.
+/// Conversion happens once before fanout; queue clones only retain the same
+/// allocation, including attempts refused because a writer queue is full.
+type SharedFrame = Arc<[u8]>;
+
 /// The devnet TCP mesh: one queue per peer we dialed, plus one per peer that
 /// dialed us.
 pub struct DevnetMesh {
+    /// Address selected by the kernel for the inbound listener.  Besides
+    /// reporting the configured endpoint, this lets callers request port 0
+    /// without probing, dropping and racing to re-bind an ephemeral port.
+    listen_addr: SocketAddr,
     /// Bounded per [`OUTBOUND_QUEUE_DEPTH`] (R3 M-4 / R1 A3-M2) — see that
     /// constant's doc for why an unbounded queue here was a memory leak
     /// waiting on a peer that never connects.
-    peers: Vec<SyncSender<Vec<u8>>>,
+    peers: Vec<SyncSender<SharedFrame>>,
+    /// One request scheduler for both connection directions and both triggers.
+    sync: Arc<SyncScheduler>,
     /// Broadcast queues for connections we did NOT dial.
     ///
     /// **Why this exists.** The module header describes a full mesh in which
@@ -684,21 +846,10 @@ impl Drop for ConnCount {
     }
 }
 
-/// Clears a dialer's "reader is running" flag when its reader thread leaves,
-/// by any path (audit NET-09, 2026-09-16). A guard, like [`ConnCount`], so an
-/// unwind clears it too; a flag that stayed set would leave the writer loop
-/// trusting a socket whose other half is gone.
-struct ReaderOpen(Arc<AtomicBool>);
-
-impl Drop for ReaderOpen {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
+#[derive(Clone)]
 struct InboundPeer {
-    frames: SyncSender<Vec<u8>>,
-    connection: Weak<InboundConnection>,
+    frames: SyncSender<SharedFrame>,
+    connection: Weak<Connection>,
 }
 
 impl InboundPeer {
@@ -709,20 +860,30 @@ impl InboundPeer {
 
 /// Both workers share one counted lifetime. Exiting either half shuts down
 /// the socket; capacity is released only after BOTH workers have stopped.
-struct InboundConnection {
+struct Connection {
     socket: TcpStream,
     closed: AtomicBool,
-    _counts: (ConnCount, ConnCount),
-    /// The source address's slot under [`MAX_INBOUND_PER_IP`] (audit NET-03,
-    /// 2026-09-16), released on the same terms as `_counts`: after BOTH
-    /// workers have stopped. `None` only for the tests that build a
-    /// connection by hand without an accept loop.
-    _ip_slot: Option<IpSlot>,
+    pending_sync: Mutex<Option<(u64, Instant)>>,
+    serving_sync: AtomicBool,
+    _counts: (ConnCount, Option<ConnCount>),
+    _ip_permit: Option<crate::connection_limit::Permit>,
 }
 
-struct InboundHalf(Arc<InboundConnection>);
+impl Connection {
+    /// Consume one queued authorization only for its matching request. Old
+    /// frames left in a dialer's queue cannot bypass a new connection's lease.
+    fn take_sync_request(&self, frame: &[u8], now: Instant) -> bool {
+        let Ok(mut pending) = self.pending_sync.lock() else { return false };
+        let Some((after, at)) = *pending else { return false };
+        if frame != get_blocks_frame(after) { return false; }
+        *pending = None;
+        now.saturating_duration_since(at) < SYNC_LEASE
+    }
+}
 
-impl Drop for InboundHalf {
+struct ConnectionHalf(Arc<Connection>);
+
+impl Drop for ConnectionHalf {
     fn drop(&mut self) {
         self.0.closed.store(true, Ordering::Release);
         let _ = self.0.socket.shutdown(Shutdown::Both);
@@ -730,15 +891,89 @@ impl Drop for InboundHalf {
 }
 
 fn run_inbound_writer(
-    rx: Receiver<Vec<u8>>,
+    rx: Receiver<SharedFrame>,
     socket: Arc<Mutex<TcpStream>>,
-    half: InboundHalf,
+    half: ConnectionHalf,
 ) {
+    // The accepting side is the one that closes an idle connection, so it
+    // has no stale deadline to stay under and no reconnect to carry a frame
+    // to.
+    run_connection_writer(&rx, socket, half, None, &mut None);
+}
+
+/// Drain `rx` into `socket` until the connection closes.
+///
+/// `stale_after` and `pending` are the dialer's (audit NET-09, 2026-09-16);
+/// the inbound writer passes neither. The accepting side closes a connection
+/// [`DEVNET_IO_TIMEOUT`] after the last decodable frame it read, that is,
+/// after this writer's last write, which on a connection that holds no sync
+/// lease is the honest cadence (one attestation per ~16 min). The reader half
+/// notices that close once the FIN arrives and drops its [`ConnectionHalf`],
+/// which is what `closed` reports here. Before this, nothing told the writer,
+/// and by TCP semantics its FIRST write into the dead socket succeeded locally
+/// (the peer answers RST) and only the SECOND failed, so the first frame after
+/// an idle period, most likely this node's own attestation or proposal, was
+/// lost every time. Two things close that window:
+///
+/// - A socket this node has not written to for `stale_after` is not written
+///   to again, whether or not the peer's FIN has arrived yet: its idle close
+///   is due, and racing it loses the frame. See [`DIAL_STALE_AFTER`].
+/// - A frame taken off the queue and not delivered, because the socket was
+///   closed or stale or the write failed, is handed back in `pending` and
+///   written first on the next socket. A `get-blocks` frame is never carried:
+///   its authorization belongs to the connection it was issued for
+///   (`take_sync_request`), and the scheduler re-issues it.
+///
+/// Chosen over a keepalive frame: a keepalive is a new type byte on a wire
+/// this change must not alter, and it would have to count as decodable on the
+/// inbound side (see `run_inbound_reader`) or it would not renew anything.
+/// Returning here reuses the dial/re-dial path that already exists for a
+/// failed write, costs one TCP handshake per idle close, and keeps the wire
+/// exactly as it was.
+fn run_connection_writer(
+    rx: &Receiver<SharedFrame>,
+    socket: Arc<Mutex<TcpStream>>,
+    half: ConnectionHalf,
+    stale_after: Option<Duration>,
+    pending: &mut Option<SharedFrame>,
+) {
+    let mut last_write = Instant::now();
+    if let Some(frame) = pending.take() {
+        let Ok(mut writer) = socket.lock() else {
+            *pending = Some(frame);
+            return;
+        };
+        if half.0.closed.load(Ordering::Acquire)
+            || write_frame(&mut *writer, frame.as_ref()).is_err()
+        {
+            *pending = Some(frame);
+            return;
+        }
+        last_write = Instant::now();
+    }
     while !half.0.closed.load(Ordering::Acquire) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(frame) => {
                 let Ok(mut writer) = socket.lock() else { return };
-                if write_frame(&mut writer, &frame).is_err() { return; }
+                let carry = frame.first() != Some(&FRAME_GET_BLOCKS);
+                if half.0.closed.load(Ordering::Acquire)
+                    || stale_after.is_some_and(|stale| last_write.elapsed() >= stale)
+                {
+                    if carry {
+                        *pending = Some(frame);
+                    }
+                    return;
+                }
+                if !carry && !half.0.take_sync_request(frame.as_ref(), Instant::now()) {
+                    continue;
+                }
+                if write_frame(&mut *writer, frame.as_ref()).is_err() {
+                    if carry {
+                        *pending = Some(frame);
+                    }
+                    return;
+                }
+                last_write = Instant::now();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -746,15 +981,116 @@ fn run_inbound_writer(
     }
 }
 
+#[derive(Clone)]
+struct SyncResponder {
+    socket: Arc<Mutex<TcpStream>>,
+    data_dir: PathBuf,
+    budget: Arc<Mutex<SyncBudget>>,
+}
+
+struct SyncServingGuard(Arc<Connection>, Arc<Mutex<SyncBudget>>);
+impl Drop for SyncServingGuard {
+    fn drop(&mut self) {
+        self.0.serving_sync.store(false, Ordering::Release);
+        if let Ok(mut budget) = self.1.lock() { budget.serving = budget.serving.saturating_sub(1); }
+    }
+}
+
+impl SyncResponder {
+    fn reserve(&self, connection: &Arc<Connection>, ip: std::net::IpAddr, limiter: &mut GetBlocksLimiter) -> Option<SyncServingGuard> {
+        let now = Instant::now();
+        if connection.closed.load(Ordering::Acquire) || !limiter.admit(now) { return None; }
+        let mut budget = self.budget.lock().ok()?;
+        if !budget.admit(ip, now) || budget.serving >= MAX_SYNC_SERVING_WORKERS { return None; }
+        if connection.serving_sync.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() { return None; }
+        budget.serving = budget.serving.saturating_add(1);
+        Some(SyncServingGuard(connection.clone(), self.budget.clone()))
+    }
+
+    fn answer(&self, connection: &Arc<Connection>, ip: std::net::IpAddr, frame: Vec<u8>, limiter: &mut GetBlocksLimiter) {
+        if frame.len() != 9 { return; }
+        let Some(guard) = self.reserve(connection, ip, limiter) else { return };
+        let responder = self.clone();
+        // One worker per active connection, with no page queue. Keeping the
+        // reader free is necessary when both peers request pages together:
+        // synchronous serving on both readers can deadlock their TCP buffers.
+        thread::spawn(move || {
+            let _guard = guard;
+            if !_guard.0.closed.load(Ordering::Acquire) {
+                serve_get_blocks(&responder.socket, &responder.data_dir, &frame, &_guard.0);
+            }
+        });
+    }
+}
+
+/// A reader ending for any reason closes both socket halves. In particular,
+/// an idle legacy peer can exceed the frame deadline while its TCP connection
+/// still accepts writes; retaining that writer would silently lose all inbound
+/// data and keep a sync permit occupied until the process restarts.
+fn run_outbound_reader(
+    mut socket: TcpStream,
+    events: Sender<EngineEvent>,
+    budget: Arc<QueueBudget>,
+    _half: ConnectionHalf,
+    responder: SyncResponder,
+) {
+    let Ok(address) = socket.peer_addr() else { return };
+    let mut limiter = GetBlocksLimiter::new();
+    loop {
+        match read_frame(&mut socket) {
+            Ok(frame) => {
+                if frame.first() == Some(&FRAME_GET_BLOCKS) {
+                    responder.answer(&_half.0, address.ip(), frame, &mut limiter);
+                } else if !decode_and_send_from_ip(&events, &budget, address.ip(), &frame) {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 impl DevnetMesh {
+    /// A transport-shaped sink for engine unit tests that do not exercise I/O.
+    ///
+    /// Using [`start`] for those fixtures leaves its blocking accept thread
+    /// alive after the fixture is dropped: the listener owns no shutdown
+    /// channel and nobody connects to wake it.  Keep those tests faithful to
+    /// the `DevnetMesh` broadcast semantics (zero peers means a no-op) without
+    /// opening a socket or spawning either background loop.
+    #[cfg(test)]
+    pub(crate) fn inert(head: Arc<AtomicU64>, budget: Arc<QueueBudget>) -> Self {
+        Self {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            peers: Vec::new(),
+            sync: SyncScheduler::new(head, budget),
+            inbound: Arc::new(Mutex::new(Vec::new())),
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
     /// TCP connections established right now. See [`DevnetMesh::live`].
     pub fn peer_count(&self) -> usize {
         self.live.load(Ordering::Acquire)
     }
 
+    /// Address actually bound by the inbound listener.
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.listen_addr
+    }
+
     /// Broadcast one frame (type byte + payload, no length prefix) to every
     /// peer, dialed or dialing.
     pub fn broadcast(&self, frame: Vec<u8>) {
+        if frame.first() == Some(&FRAME_GET_BLOCKS) {
+            if let Some(bytes) = frame.get(1..9).filter(|_| frame.len() == 9) {
+                if let Ok(bytes) = bytes.try_into() {
+                    self.sync.pump(Instant::now(), Some(u64::from_le_bytes(bytes)));
+                }
+            }
+            return;
+        }
+        let frame: SharedFrame = frame.into();
         // `try_send`, not `send` (R3 M-4 / R1 A3-M2): the queue is bounded now,
         // so a peer whose dialer is stuck (unreachable address, or reachable
         // but not draining fast enough) gets this frame DROPPED rather than
@@ -775,6 +1111,99 @@ impl DevnetMesh {
     }
 }
 
+struct SyncPeer {
+    peer: InboundPeer,
+    requested_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct SyncSchedule {
+    peers: std::collections::VecDeque<SyncPeer>,
+    requested_after: Option<u64>,
+}
+
+/// Shared request leases, not response-completion accounting: the legacy wire
+/// has no request ID or end-of-page frame. Late responses remain bounded by
+/// QueueBudget admission; expiration never disconnects an honest slow peer.
+struct SyncScheduler {
+    schedule: Mutex<SyncSchedule>,
+    head: Arc<AtomicU64>,
+    budget: Arc<QueueBudget>,
+}
+
+impl SyncScheduler {
+    fn new(head: Arc<AtomicU64>, budget: Arc<QueueBudget>) -> Arc<Self> {
+        Arc::new(Self { schedule: Mutex::new(SyncSchedule::default()), head, budget })
+    }
+
+    fn register(&self, peer: InboundPeer, now: Instant) {
+        if let Ok(mut schedule) = self.schedule.lock() {
+            schedule.peers.retain(|p| p.peer.is_open());
+            // Existing waiters keep their place; a new connection joins before
+            // peers which already consumed this round's lease.
+            let waiting = schedule.peers.iter().position(|p| p.requested_at.is_some()).unwrap_or(schedule.peers.len());
+            schedule.peers.insert(waiting, SyncPeer { peer, requested_at: None });
+        }
+        self.pump(now, None);
+    }
+
+    fn pump(&self, now: Instant, requested_after: Option<u64>) {
+        let Ok(mut schedule) = self.schedule.lock() else { return };
+        if let Some(after) = requested_after {
+            schedule.requested_after = Some(schedule.requested_after.map_or(after, |old| old.min(after)));
+        }
+        schedule.peers.retain(|p| p.peer.is_open());
+        for peer in &mut schedule.peers {
+            if peer.requested_at.is_some_and(|at| now.saturating_duration_since(at) >= SYNC_LEASE) {
+                peer.requested_at = None;
+            }
+        }
+        // Slow state application must pause additional fetching, not destroy
+        // lease eligibility. Once the consumer drains, FIFO rotation resumes.
+        if self.budget.inflight() >= self.budget.count_cap.checked_div(2).unwrap_or(0)
+            || self.budget.inflight_bytes() >= self.budget.bytes_cap.checked_div(2).unwrap_or(0) {
+            return;
+        }
+        let mut active = schedule.peers.iter().filter(|p| p.requested_at.is_some()).count();
+        let after = schedule.requested_after.unwrap_or_else(|| self.head.load(Ordering::Acquire));
+        let frame: SharedFrame = get_blocks_frame(after).into();
+        let mut sent = false;
+        for _ in 0..schedule.peers.len() {
+            if active >= SYNC_FANOUT { break; }
+            let Some(mut peer) = schedule.peers.pop_front() else { break };
+            if peer.requested_at.is_none() {
+                if let Some(connection) = peer.peer.connection.upgrade() {
+                    if let Ok(mut pending) = connection.pending_sync.lock() {
+                        // Do not pile up requests behind a stalled writer. It
+                        // clears the old authorization on send or expiry.
+                        if pending.is_none() {
+                            *pending = Some((after, now));
+                            if peer.peer.frames.try_send(frame.clone()).is_ok() {
+                                peer.requested_at = Some(now);
+                                active = active.saturating_add(1);
+                                sent = true;
+                            } else {
+                                *pending = None;
+                            }
+                        }
+                    }
+                }
+            }
+            schedule.peers.push_back(peer);
+        }
+        if sent { schedule.requested_after = None; }
+    }
+
+    fn start_timer(scheduler: &Arc<Self>) {
+        let weak = Arc::downgrade(scheduler);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(250));
+            let Some(scheduler) = weak.upgrade() else { return };
+            scheduler.pump(Instant::now(), None);
+        });
+    }
+}
+
 /// Hand one network event to the engine, or drop it if the engine is behind.
 ///
 /// The engine consumes on a single thread, and during replay it does not
@@ -788,6 +1217,101 @@ impl DevnetMesh {
 /// a round trip. Keeping all of them costs the process.
 ///
 /// Returns false when the engine is gone, so callers can stop their thread.
+#[cfg(test)]
+fn send_from_ip(events: &Sender<EngineEvent>, budget: &QueueBudget, ip: std::net::IpAddr, mut ev: NetEvent) -> bool {
+    // One NAT address shares a burst allowance across connections. This is not
+    // a validator identity: no score, persistent ban, or disconnect follows.
+    if !budget.admit_source(&mut ev, source_budget::Source::ip(ip)) { return true; }
+    send_to_engine(events, budget, ev)
+}
+
+/// Class and payload bytes available from the fixed one-byte frame tag,
+/// before any payload parsing or allocation performed by `decode_event`.
+fn framed_event_shape(frame: &[u8]) -> Option<(EventClass, usize)> {
+    let class = match frame.first()? {
+        &FRAME_BLOCK => EventClass::Block,
+        &FRAME_ATT => EventClass::Attestation,
+        &FRAME_TX => EventClass::Transaction,
+        _ => return None,
+    };
+    Some((class, frame.len().saturating_sub(1)))
+}
+
+/// What became of one data frame handed to [`admit_frame_from_ip`]. The
+/// inbound reader anchors its idle deadline on this (audit NET-03 / NET-05,
+/// 2026-09-16); `decode_and_send_from_ip` folds it to "is the engine still
+/// there".
+enum FrameOutcome {
+    /// Decoded and queued for the engine.
+    Delivered,
+    /// Refused by a budget (the source's or the engine queue's) and dropped.
+    /// The refusal may come before decoding, so this says nothing about the
+    /// payload beyond its type byte and size.
+    Shed,
+    /// Nothing this node could use: an unknown type byte, a payload that
+    /// does not decode, or one whose canonical size disagrees with the wire.
+    Undecodable,
+    /// The engine is gone; the caller stops its thread.
+    EngineGone,
+}
+
+/// Admit a legacy devnet frame before decoding it. False when the engine is
+/// gone, so callers can stop their thread.
+fn decode_and_send_from_ip(
+    events: &Sender<EngineEvent>,
+    budget: &QueueBudget,
+    ip: IpAddr,
+    frame: &[u8],
+) -> bool {
+    !matches!(admit_frame_from_ip(events, budget, ip, frame), FrameOutcome::EngineGone)
+}
+
+/// [`decode_and_send_from_ip`], reporting what happened to the frame.
+fn admit_frame_from_ip(
+    events: &Sender<EngineEvent>,
+    budget: &QueueBudget,
+    ip: IpAddr,
+    frame: &[u8],
+) -> FrameOutcome {
+    let Some((class, size)) = framed_event_shape(frame) else { return FrameOutcome::Undecodable };
+    let Some(source_guard) = source_budget::Registry::reserve(
+        &budget.sources,
+        source_budget::Source::ip(ip),
+        class,
+        size,
+        budget.count_cap,
+        budget.bytes_cap,
+    ) else {
+        budget.shed_counter(class).fetch_add(1, Ordering::Relaxed);
+        return FrameOutcome::Shed;
+    };
+    if !budget.reserve_raw(class, size) {
+        budget.shed_counter(class).fetch_add(1, Ordering::Relaxed);
+        return FrameOutcome::Shed;
+    }
+
+    let Some(mut event) = decode_event(frame) else {
+        budget.release_raw(size);
+        return FrameOutcome::Undecodable;
+    };
+    // All three decoders are canonical. A future permissive decoder must not
+    // release a different byte charge from the one reserved before it ran.
+    if class_of(&event) != class || queued_bytes(&event) != size {
+        budget.release_raw(size);
+        return FrameOutcome::Undecodable;
+    }
+    match &mut event {
+        NetEvent::Block(_, origin)
+        | NetEvent::Attestation(_, origin)
+        | NetEvent::Transaction(_, origin) => origin.set_reservation(source_guard),
+    }
+    if events.send(EngineEvent::Net(event)).is_err() {
+        budget.release_raw(size);
+        return FrameOutcome::EngineGone;
+    }
+    FrameOutcome::Delivered
+}
+
 fn send_to_engine(events: &Sender<EngineEvent>, budget: &QueueBudget, ev: NetEvent) -> bool {
     // Atomic reservation of BOTH the count and the bytes (O06): the old
     // `load >= CAP` followed by `fetch_add` let concurrent readers overshoot
@@ -795,7 +1319,7 @@ fn send_to_engine(events: &Sender<EngineEvent>, budget: &QueueBudget, ev: NetEve
     if !budget.try_reserve(&ev) {
         return true; // shed, but the connection stays healthy
     }
-    let size = queued_bytes(&ev);
+    let size = charged_bytes(&ev);
     if events.send(EngineEvent::Net(ev)).is_err() {
         budget.release_raw(size);
         return false;
@@ -804,8 +1328,11 @@ fn send_to_engine(events: &Sender<EngineEvent>, budget: &QueueBudget, ev: NetEve
 }
 
 pub fn block_frame(env: &BlockEnvelope) -> Vec<u8> {
-    let mut f = vec![FRAME_BLOCK];
-    f.extend_from_slice(&crate::codec::encode_envelope(env));
+    let frame_len = 1usize.saturating_add(crate::codec::encoded_envelope_len(env));
+    let mut f = Vec::with_capacity(frame_len);
+    f.push(FRAME_BLOCK);
+    crate::codec::write_envelope(&mut f, env).expect("writing to Vec cannot fail");
+    debug_assert_eq!(f.len(), frame_len);
     f
 }
 
@@ -829,11 +1356,35 @@ pub fn get_blocks_frame(after_slot: u64) -> Vec<u8> {
 /// Confirmation is seeing the transaction land in a block.
 pub fn send_transaction(addr: &str, tx_bytes: &[u8]) -> std::io::Result<()> {
     let mut sock = TcpStream::connect(addr)?;
-    // Capacity hint only: saturating is the intended semantics.
-    let mut frame = Vec::with_capacity(1usize.saturating_add(tx_bytes.len()));
-    frame.push(FRAME_TX);
-    frame.extend_from_slice(tx_bytes);
-    write_frame(&mut sock, &frame)
+    write_typed_frame(&mut sock, FRAME_TX, tx_bytes)
+}
+
+fn write_frame<W: Write>(writer: &mut W, frame: &[u8]) -> std::io::Result<()> {
+    // Keep the prefix and payload under the caller's existing whole-frame
+    // lock, but do not allocate and copy the complete payload merely to join
+    // these two immutable slices. `write_all` already handles short writes;
+    // an error in either phase remains a partial-frame connection failure.
+    writer.write_all(&(frame.len() as u32).to_le_bytes())?;
+    writer.write_all(frame)
+}
+
+fn write_typed_frame<W: Write>(
+    writer: &mut W,
+    frame_type: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    // Production payloads are bounded by MAX_FIELD_LEN before they reach this
+    // sync-serving edge. Keep overflow fail-closed rather than wrapping a
+    // length prefix if that invariant ever changes.
+    let frame_len = payload.len().checked_add(1).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame length overflow")
+    })?;
+    let frame_len = u32::try_from(frame_len).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame length exceeds u32")
+    })?;
+    writer.write_all(&frame_len.to_le_bytes())?;
+    writer.write_all(&[frame_type])?;
+    writer.write_all(payload)
 }
 
 /// Send one block envelope to a running node and disconnect — the
@@ -844,14 +1395,6 @@ pub fn send_transaction(addr: &str, tx_bytes: &[u8]) -> std::io::Result<()> {
 pub fn send_block(addr: &str, env: &BlockEnvelope) -> std::io::Result<()> {
     let mut sock = TcpStream::connect(addr)?;
     write_frame(&mut sock, &block_frame(env))
-}
-
-fn write_frame(sock: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
-    // Capacity hint only: saturating is the intended semantics.
-    let mut buf = Vec::with_capacity(4usize.saturating_add(frame.len()));
-    buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-    buf.extend_from_slice(frame);
-    sock.write_all(&buf)
 }
 
 fn read_frame(sock: &mut TcpStream) -> std::io::Result<Vec<u8>> {
@@ -917,14 +1460,11 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
     }
 }
 
-/// Admission for `get-blocks` on the devnet transport (R3 M-4 / R1 A3-M2): a
-/// token bucket, same shape and same values as the production transport's
-/// [`crate::p2p::SyncLimiter`], simplified because a devnet connection has
-/// exactly one reader thread and therefore exactly one `get-blocks` in flight
-/// at a time BY CONSTRUCTION — `serve_get_blocks` runs inline in that thread,
-/// so there is no concurrency to cap here, only rate. One bucket per source
-/// address, held in [`InboundByIp`] (audit NET-05, 2026-09-16); it used to be
-/// one per connection.
+/// Per-connection admission for `get-blocks` on the devnet transport (R3 M-4
+/// / R1 A3-M2): a token bucket, same shape and same values as the production
+/// transport's [`crate::p2p::SyncLimiter`]. This bucket limits request rate;
+/// SyncResponder separately limits serving to one worker per connection and
+/// MAX_SYNC_SERVING_WORKERS globally, including disconnected generations.
 ///
 /// Time is a parameter, not a call to `Instant::now()` inside, for the same
 /// reason `SyncLimiter` takes one: testable refill arithmetic without
@@ -932,17 +1472,13 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
 struct GetBlocksLimiter {
     tokens: f64,
     last: Instant,
+    rate: f64,
+    capacity: f64,
 }
 
 impl GetBlocksLimiter {
     fn new() -> Self {
-        GetBlocksLimiter { tokens: GET_BLOCKS_BURST, last: Instant::now() }
-    }
-
-    fn refill(&mut self, now: Instant) {
-        let dt = now.saturating_duration_since(self.last).as_secs_f64();
-        self.last = now;
-        self.tokens = (self.tokens + dt * GET_BLOCKS_ANSWERS_PER_SEC).min(GET_BLOCKS_BURST);
+        GetBlocksLimiter { tokens: GET_BLOCKS_BURST, last: Instant::now(), rate: GET_BLOCKS_ANSWERS_PER_SEC, capacity: GET_BLOCKS_BURST }
     }
 
     /// Admit one request now, or refuse. Refusing costs the peer nothing but
@@ -951,124 +1487,35 @@ impl GetBlocksLimiter {
     /// tip has not moved", which is indistinguishable from the truth and
     /// costs this node one comparison.
     fn admit(&mut self, now: Instant) -> bool {
-        self.refill(now);
+        let dt = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + dt * self.rate).min(self.capacity);
         if self.tokens < 1.0 {
             return false;
         }
         self.tokens -= 1.0;
         true
     }
-
-    /// True once nothing of the burst is spent any more — the state a fresh
-    /// bucket starts in, so an entry in this state carries no information
-    /// worth keeping.
-    fn is_full(&mut self, now: Instant) -> bool {
-        self.refill(now);
-        self.tokens >= GET_BLOCKS_BURST
-    }
 }
 
-/// What this node holds against one inbound source address.
-struct PerIp {
-    /// Inbound connections from this address up right now.
-    conns: usize,
-    /// The address's `get-blocks` budget, shared by every one of `conns`.
-    get_blocks: GetBlocksLimiter,
+/// Shared across connections, including reconnects. Idle address records
+/// expire and the map itself is bounded, so IP rotation cannot grow memory.
+struct SyncBudget {
+    addresses: std::collections::BTreeMap<std::net::IpAddr, GetBlocksLimiter>,
+    global: GetBlocksLimiter,
+    serving: usize,
 }
-
-/// Per-source-address accounting for the inbound side (audit NET-03 and
-/// NET-05, 2026-09-16): the connection count that [`MAX_INBOUND_PER_IP`]
-/// binds, and the `get-blocks` bucket that [`GET_BLOCKS_ANSWERS_PER_SEC`]
-/// refills. One table, one lock, keyed by the address `accept` reported —
-/// which this transport cannot verify, but which an attacker cannot forge
-/// either, since a TCP connection only completes to the address that
-/// answered the handshake.
-///
-/// An entry lives while the address has a connection up OR its bucket is
-/// not full: dropping the entry with the last connection would hand a
-/// re-dialing peer a fresh burst, and that is exactly the budget the
-/// per-connection limiter used to hand out. Entries whose bucket has refilled
-/// are pruned on the next accept, so the table holds at most the connected
-/// addresses plus those that spent budget in the last
-/// `GET_BLOCKS_BURST / GET_BLOCKS_ANSWERS_PER_SEC` (4) seconds.
-struct InboundByIp {
-    max_per_ip: usize,
-    by_ip: Mutex<HashMap<IpAddr, PerIp>>,
-}
-
-impl InboundByIp {
-    fn new(max_per_ip: usize) -> Arc<Self> {
-        Arc::new(InboundByIp { max_per_ip, by_ip: Mutex::new(HashMap::new()) })
-    }
-
-    /// Take one of `ip`'s [`MAX_INBOUND_PER_IP`] slots, or refuse. The slot
-    /// is a guard, for the same reason [`ConnCount`] is one: the connection
-    /// workers leave by several returns and by unwinding, and a slot that
-    /// leaks on one of them is a slot that address never gets back.
-    fn try_admit(self: &Arc<Self>, ip: IpAddr, now: Instant) -> Option<IpSlot> {
-        let mut by_ip = self.by_ip.lock().ok()?;
-        by_ip.retain(|_, s| s.conns > 0 || !s.get_blocks.is_full(now));
-        let entry = by_ip
-            .entry(ip)
-            .or_insert_with(|| PerIp { conns: 0, get_blocks: GetBlocksLimiter::new() });
-        if entry.conns >= self.max_per_ip {
-            return None;
+impl SyncBudget {
+    fn new() -> Self { Self { serving: 0, addresses: Default::default(), global: GetBlocksLimiter { tokens: 128.0, last: Instant::now(), rate: 64.0, capacity: 128.0 } } }
+    fn admit(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
+        let ip = match ip { std::net::IpAddr::V6(v) => v.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip), _ => ip };
+        if !self.addresses.contains_key(&ip) {
+            self.addresses.retain(|_, bucket| now.saturating_duration_since(bucket.last) < Duration::from_secs(60));
+            if self.addresses.len() >= 1024 { return false; }
         }
-        entry.conns = entry.conns.saturating_add(1);
-        Some(IpSlot { table: self.clone(), ip })
+        if !self.addresses.entry(ip).or_insert_with(GetBlocksLimiter::new).admit(now) { return false; }
+        self.global.admit(now)
     }
-
-    /// One `get-blocks` from `ip`, against the bucket every connection from
-    /// that address shares. An address with no entry has never been admitted
-    /// here; it is refused rather than given a bucket, since only
-    /// `try_admit` creates entries and only its holders ask.
-    fn admit_get_blocks(&self, ip: IpAddr, now: Instant) -> bool {
-        let Ok(mut by_ip) = self.by_ip.lock() else { return false };
-        by_ip.get_mut(&ip).is_some_and(|s| s.get_blocks.admit(now))
-    }
-
-    fn release(&self, ip: IpAddr, now: Instant) {
-        let Ok(mut by_ip) = self.by_ip.lock() else { return };
-        if let Some(s) = by_ip.get_mut(&ip) {
-            s.conns = s.conns.saturating_sub(1);
-            if s.conns == 0 && s.get_blocks.is_full(now) {
-                by_ip.remove(&ip);
-            }
-        }
-    }
-}
-
-/// Holds one of an address's inbound slots for the lifetime of a connection.
-struct IpSlot {
-    table: Arc<InboundByIp>,
-    ip: IpAddr,
-}
-
-impl Drop for IpSlot {
-    fn drop(&mut self) {
-        self.table.release(self.ip, Instant::now());
-    }
-}
-
-/// The blocks of one `get-blocks` answer that fit under [`SYNC_PAGE_BYTES`]
-/// (audit NET-17 / NET-05, 2026-09-16), in log order, stopping at the first
-/// that does not — the same arithmetic as `p2p::read_sync_page`, so the two
-/// transports serve the same worst-case page. The page stops here even when
-/// fewer than [`SYNC_PAGE_BLOCKS`] have gone out, and the requester's next
-/// ask starts from wherever its head got to. Each block is charged its
-/// length plus the 4-byte prefix `write_frame` puts in front of it.
-/// Saturating for the same reason as there: a block larger than `usize::MAX`
-/// is impossible, and must still fail this check rather than wrap past it.
-fn page_within_bytes(blocks: Vec<Vec<u8>>) -> impl Iterator<Item = Vec<u8>> {
-    let mut bytes = 0usize;
-    blocks.into_iter().take_while(move |b| {
-        let next = bytes.saturating_add(b.len()).saturating_add(4);
-        if next > SYNC_PAGE_BYTES {
-            return false;
-        }
-        bytes = next;
-        true
-    })
 }
 
 /// Serve one get-blocks request on `sock` from the local block log.
@@ -1087,19 +1534,13 @@ fn serve_get_blocks(
     sock: &Arc<Mutex<TcpStream>>,
     data_dir: &PathBuf,
     frame: &[u8],
-    by_ip: &InboundByIp,
-    ip: IpAddr,
+    connection: &Connection,
 ) {
-    if frame.len() != 9 {
+    if frame.len() != 9 || connection.closed.load(Ordering::Acquire) {
         return;
     }
-    // R3 M-4 / R1 A3-M2: rate-limited BEFORE the disk is touched — the whole
-    // point is that `Store::blocks_after` below is the expensive step this
-    // guards. Against the source ADDRESS's bucket (audit NET-05, 2026-09-16),
-    // so a second connection from the same host draws on the same budget.
-    if !by_ip.admit_get_blocks(ip, Instant::now()) {
-        return;
-    }
+    // SyncResponder admits rate limits and the per-connection worker permit
+    // before this function can touch disk.
     // `frame.len() != 9` already returned above, so `frame[1..9]` is always
     // exactly 8 bytes and the conversion cannot fail; the `else` arm keeps it
     // panic-free by construction rather than by an `unwrap`.
@@ -1116,15 +1557,13 @@ fn serve_get_blocks(
     // large enough to kill the receiver.
     match crate::store::Store::blocks_after(data_dir, after, SYNC_PAGE_BLOCKS) {
         Ok(blocks) => {
-            // Byte cap as well as block cap (audit NET-17 / NET-05,
-            // 2026-09-16): see `page_within_bytes`.
-            for b in page_within_bytes(blocks) {
-                // Capacity hint only: saturating is the intended semantics.
-                let mut f = Vec::with_capacity(1usize.saturating_add(b.len()));
-                f.push(FRAME_BLOCK);
-                f.extend_from_slice(&b);
+            for b in blocks {
                 let Ok(mut w) = sock.lock() else { return };
-                if write_frame(&mut w, &f).is_err() {
+                if connection.closed.load(Ordering::Acquire) { return; }
+                if write_typed_frame(&mut *w, FRAME_BLOCK, &b).is_err() {
+                    // A partial frame cannot be followed by more framed data.
+                    connection.closed.store(true, Ordering::Release);
+                    let _ = connection.socket.shutdown(Shutdown::Both);
                     return;
                 }
             }
@@ -1134,50 +1573,51 @@ fn serve_get_blocks(
 }
 
 /// The inbound reader loop: data frames go to the engine, get-blocks is
-/// answered in place from the log. Returns when the connection is done —
-/// the caller's [`InboundHalf`] then shuts the socket down.
+/// handed to the bounded serving worker. Returns when the connection is
+/// done; the [`ConnectionHalf`] it holds then shuts the socket down.
 ///
-/// The deadline is anchored at the last DECODABLE frame (audit NET-03,
-/// 2026-09-16), not at the last frame. `read_frame` renewed a full
+/// The deadline is anchored at the last DECODABLE frame (audit NET-03 /
+/// NET-05, 2026-09-16), not at the last frame. `read_frame` renewed a full
 /// [`DEVNET_IO_TIMEOUT`] on every frame, and a 5-byte frame of an unknown
 /// type decodes to nothing and cost nothing, so one such frame per ~100 s
-/// held a slot forever. Now a frame that neither the engine nor
-/// `serve_get_blocks` can use leaves the deadline where it was, and a peer
-/// that sends only those is closed at the moment a silent peer would be.
-/// `idle` is [`DEVNET_IO_TIMEOUT`] in production and a parameter here so the
-/// test does not wait two minutes.
-#[allow(clippy::too_many_arguments)]
+/// held a slot forever. Now a frame that neither the engine nor the sync
+/// responder can use leaves the deadline where it was, and a peer that sends
+/// only those is closed at the moment a silent peer would be. A frame the
+/// budget refused before decoding DOES renew it: its bytes were charged to
+/// the source, and an honest peer whose frames are shed while the engine
+/// replays must not be closed for that. `idle` is [`DEVNET_IO_TIMEOUT`] in
+/// production and a parameter here so the test does not wait two minutes.
 fn run_inbound_reader(
-    mut rsock: TcpStream,
-    wsock: Arc<Mutex<TcpStream>>,
-    data_dir: PathBuf,
+    mut socket: TcpStream,
+    half: ConnectionHalf,
     events: Sender<EngineEvent>,
-    inflight: Arc<QueueBudget>,
-    by_ip: Arc<InboundByIp>,
+    budget: Arc<QueueBudget>,
+    responder: SyncResponder,
     ip: IpAddr,
     idle: Duration,
 ) {
+    // Per-connection (R3 M-4 / R1 A3-M2): see [`GetBlocksLimiter`].
+    let mut limiter = GetBlocksLimiter::new();
     let mut last_decodable = Instant::now();
     loop {
         let Some(deadline) = last_decodable.checked_add(idle) else { return };
-        match read_frame_until(&mut rsock, deadline) {
-            Ok(frame) => {
-                let decodable = if frame.first() == Some(&FRAME_GET_BLOCKS) {
-                    serve_get_blocks(&wsock, &data_dir, &frame, &by_ip, ip);
-                    frame.len() == 9
-                } else if let Some(ev) = decode_event(&frame) {
-                    if !send_to_engine(&events, &inflight, ev) {
-                        return;
-                    }
-                    true
-                } else {
-                    false
-                };
-                if decodable {
-                    last_decodable = Instant::now();
-                }
+        let Ok(frame) = read_frame_until(&mut socket, deadline) else { return };
+        let decodable = if frame.first() == Some(&FRAME_GET_BLOCKS) {
+            // Well-formed or not is decided here; whether it is ANSWERED is
+            // the responder's budget, and a refusal there is still a frame
+            // this node could have used.
+            let well_formed = frame.len() == 9;
+            responder.answer(&half.0, ip, frame, &mut limiter);
+            well_formed
+        } else {
+            match admit_frame_from_ip(&events, &budget, ip, &frame) {
+                FrameOutcome::Delivered | FrameOutcome::Shed => true,
+                FrameOutcome::Undecodable => false,
+                FrameOutcome::EngineGone => return,
             }
-            Err(_) => return,
+        };
+        if decodable {
+            last_decodable = Instant::now();
         }
     }
 }
@@ -1226,12 +1666,9 @@ fn start_with_tuning(
     tuning: DevnetTuning,
 ) -> std::io::Result<DevnetMesh> {
     // Inbound: accept, then per-connection: read frames; data frames go to
-    // the engine, get-blocks is answered in place from the log.
+    // the engine; get-blocks is answered by a globally bounded serving worker.
     let listener = TcpListener::bind((bind_addr, listen_port))?;
-    // Per source address (audit NET-03 / NET-05, 2026-09-16): the slot count
-    // the accept loop checks and the `get-blocks` bucket the reader threads
-    // draw on, keyed by the address each connection came from.
-    let by_ip = InboundByIp::new(tuning.max_inbound_per_ip);
+    let listen_addr = listener.local_addr()?;
     let inbound: Arc<Mutex<Vec<InboundPeer>>> = Arc::new(Mutex::new(Vec::new()));
     let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Counted separately from `live` (R3 M-4 / R1 A3-M2): `live` also holds
@@ -1242,6 +1679,10 @@ fn start_with_tuning(
     // inbound flood must not have that flood count against the outbound
     // side's accounting either.
     let inbound_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ip_limits = Arc::new(crate::connection_limit::Limits::default());
+    let sync_budget = Arc::new(Mutex::new(SyncBudget::new()));
+    let sync = SyncScheduler::new(head_slot.clone(), inflight.clone());
+    SyncScheduler::start_timer(&sync);
     {
         let events = events.clone();
         let data_dir = data_dir.clone();
@@ -1249,7 +1690,8 @@ fn start_with_tuning(
         let inflight = inflight.clone();
         let live = live.clone();
         let inbound_live = inbound_live.clone();
-        let by_ip = by_ip.clone();
+        let scheduler = Arc::downgrade(&sync);
+        let sync_budget = sync_budget.clone();
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(sock) = conn else { continue };
@@ -1265,14 +1707,15 @@ fn start_with_tuning(
                 if inbound_live.load(Ordering::Acquire) >= MAX_INBOUND_CONNECTIONS {
                     continue;
                 }
+                let Ok(address) = sock.peer_addr() else { continue };
                 // Audit NET-03 (2026-09-16): and past THIS address's share of
-                // the cap, the same immediate close. A socket whose peer
-                // address cannot be read is one this node cannot account
-                // for, and is closed the same way. The slot is a guard that
-                // travels with the connection below, so every early `continue`
+                // the cap, the same immediate close, so one host cannot
+                // consume the global allowance. A socket whose peer address
+                // cannot be read is one this node cannot account for, and is
+                // closed the same way. The permit is a guard that travels
+                // with the connection below, so every early `continue`
                 // between here and the spawn hands it straight back.
-                let Ok(peer_ip) = sock.peer_addr().map(|a| a.ip()) else { continue };
-                let Some(ip_slot) = by_ip.try_admit(peer_ip, Instant::now()) else { continue };
+                let Some(ip_permit) = ip_limits.reserve(address.ip(), tuning.max_inbound_per_ip) else { continue };
                 // R3 M-4 / R1 A3-M2: bounded so a peer that stops reading or
                 // never writes cannot hold a thread and a queue open forever.
                 if sock.set_read_timeout(Some(DEVNET_IO_TIMEOUT)).is_err()
@@ -1285,41 +1728,40 @@ fn start_with_tuning(
                 // broadcast must not wait behind it.
                 let Ok(rsock) = sock.try_clone() else { continue };
                 let Ok(shutdown_socket) = sock.try_clone() else { continue };
-                let connection = Arc::new(InboundConnection {
+                let connection = Arc::new(Connection {
                     socket: shutdown_socket,
-                    closed: AtomicBool::new(false),
-                    _counts: (ConnCount::new(&live), ConnCount::new(&inbound_live)),
-                    _ip_slot: Some(ip_slot),
+                    closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
+                    _counts: (ConnCount::new(&live), Some(ConnCount::new(&inbound_live))),
+                    _ip_permit: Some(ip_permit),
                 });
                 let wsock = Arc::new(Mutex::new(sock));
 
                 // One writer thread per connection, fed by a bounded queue, so
                 // a peer that stops reading fills its own queue and is dropped
                 // from there rather than blocking this node's broadcast loop.
-                let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(INBOUND_QUEUE_DEPTH);
+                let (tx, rx) = mpsc::sync_channel::<SharedFrame>(INBOUND_QUEUE_DEPTH);
                 {
                     let wsock = wsock.clone();
-                    let half = InboundHalf(connection.clone());
+                    let half = ConnectionHalf(connection.clone());
                     thread::spawn(move || {
                         run_inbound_writer(rx, wsock, half);
                     });
                 }
-                if let Ok(mut reg) = inbound.lock() {
-                    reg.push(InboundPeer { frames: tx, connection: Arc::downgrade(&connection) });
-                }
+                let peer = InboundPeer { frames: tx, connection: Arc::downgrade(&connection) };
+                if let Ok(mut reg) = inbound.lock() { reg.push(peer.clone()); }
+                if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer, Instant::now()); }
 
                 let events = events.clone();
                 let data_dir = data_dir.clone();
                 let inflight = inflight.clone();
-                let by_ip = by_ip.clone();
                 // Counted from here to wherever this thread leaves. The guard
-                // is moved into the closure, so every `return` inside the
-                // reader and any unwind releases it.
-                let half = InboundHalf(connection);
+                // is moved into the reader, so every `return` inside it and
+                // any unwind releases it.
+                let half = ConnectionHalf(connection);
+                let responder = SyncResponder { socket: wsock, data_dir: data_dir.clone(), budget: sync_budget.clone() };
                 thread::spawn(move || {
-                    let _half = half;
                     run_inbound_reader(
-                        rsock, wsock, data_dir, events, inflight, by_ip, peer_ip,
+                        rsock, half, events, inflight, responder, address.ip(),
                         tuning.inbound_idle,
                     );
                 });
@@ -1327,217 +1769,486 @@ fn start_with_tuning(
         });
     }
 
-    // Outbound: one dialer per peer with a frame queue; a reader thread on
-    // the same socket receives the peer's sync responses.
-    //
-    // `sync_slots` is what keeps a corrected peer list from being a denial of
-    // service against ourselves: at most `SYNC_FANOUT` dialers may be asking
-    // for history at any moment, however many peers are configured.
-    let sync_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Both triggers use the same scheduler. Dialers only write queued frames;
+    // they never acquire lifetime sync slots or independently request pages.
     let mut peers = Vec::new();
     for addr in peer_addrs {
         // R3 M-4 / R1 A3-M2: bounded — see [`OUTBOUND_QUEUE_DEPTH`].
-        let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) =
+        let (tx, rx): (SyncSender<SharedFrame>, Receiver<SharedFrame>) =
             mpsc::sync_channel(OUTBOUND_QUEUE_DEPTH);
-        peers.push(tx);
+        peers.push(tx.clone());
+        let scheduler = Arc::downgrade(&sync);
+        let data_dir = data_dir.clone();
+        let sync_budget = sync_budget.clone();
         let events = events.clone();
-        let head_slot = head_slot.clone();
-        let sync_slots = sync_slots.clone();
         let inflight = inflight.clone();
         let live = live.clone();
         thread::spawn(move || {
             // Audit NET-09 (2026-09-16): a frame taken off the queue and not
-            // delivered — because the socket turned out to be dead, or the
-            // write failed — is carried across the reconnect and written
-            // first on the new socket, so no broadcast is lost to an idle
-            // close. `None` between reconnects; `Some` survives failed dials.
-            let mut pending: Option<Vec<u8>> = None;
+            // delivered, because the socket turned out to be dead or stale
+            // or the write failed, is carried across the reconnect and
+            // written first on the new socket, so no broadcast is lost to an
+            // idle close. `None` between reconnects; `Some` survives failed
+            // dials. See `run_connection_writer`.
+            let mut pending: Option<SharedFrame> = None;
             loop {
-            let Ok(sock) = TcpStream::connect(&addr) else {
-                thread::sleep(Duration::from_millis(300));
-                continue;
-            };
-            // Counted from a SUCCESSFUL connect, and released when this
-            // connection's inner loop breaks to reconnect. A dialer retrying a
-            // peer that is down therefore contributes nothing, which is the
-            // difference between this number and `peers.len()`.
-            let _counted = ConnCount::new(&live);
-            let mut wsock = sock;
-            // Audit NET-09 (2026-09-16): when this node last wrote to this
-            // socket — the moment the peer's idle deadline is anchored at.
-            // See [`DIAL_STALE_AFTER`].
-            let mut last_write = Instant::now();
-            // R3 M-4 / R1 A3-M2: same bound as the inbound side — see
-            // [`DEVNET_IO_TIMEOUT`]. Best-effort; a platform that refuses the
-            // option gets an unbounded-latency socket, not a broken one.
-            let _ = wsock.set_read_timeout(Some(DEVNET_IO_TIMEOUT));
-            let _ = wsock.set_write_timeout(Some(DEVNET_IO_TIMEOUT));
-            // Audit NET-09 (2026-09-16): the reader half is what notices the
-            // peer closing this socket — the accepting side closes it after
-            // `DEVNET_IO_TIMEOUT` idle, which on a connection that holds no
-            // sync slot is the honest cadence (one attestation per ~16 min).
-            // Before this, the reader returned silently and nothing told the
-            // writer loop; by TCP semantics the writer's FIRST write into the
-            // dead socket then succeeded locally (the peer answers RST) and
-            // only the SECOND failed, so the first frame after an idle period
-            // — this node's own attestation or proposal, most likely — was
-            // lost, every time. The writer loop below reads this flag before
-            // every write and on every idle tick, and re-dials instead.
-            //
-            // Chosen over a keepalive frame: a keepalive is a new type byte
-            // on a wire this change must not alter, and it would have to
-            // count as decodable on the inbound side (see
-            // `run_inbound_reader`) or it would not renew anything. The
-            // reconnect reuses the dial/re-dial path that already exists two
-            // lines below for a failed write, costs one TCP handshake per
-            // idle close, and keeps the wire exactly as it was.
-            let reader_open = Arc::new(AtomicBool::new(true));
-            // Reader half: the peer answers our get-blocks on this socket.
-            if let Ok(mut rsock) = wsock.try_clone() {
-                let events = events.clone();
-                let inflight = inflight.clone();
-                let open = ReaderOpen(reader_open.clone());
-                thread::spawn(move || {
-                    let _open = open;
-                    loop {
-                        match read_frame(&mut rsock) {
-                            Ok(frame) => {
-                                if let Some(ev) = decode_event(&frame) {
-                                    if !send_to_engine(&events, &inflight, ev) {
-                                        return;
-                                    }
-                                }
-                            }
-                            Err(_) => return,
-                        }
-                    }
-                });
-            }
-            // Claim one of the `SYNC_FANOUT` sync slots before asking for
-            // history. A dialer that cannot claim one stays connected and keeps
-            // receiving broadcasts — it just does not add another concurrent
-            // copy of the chain to a node that may still be replaying.
-            let holds_slot = sync_slots
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                    // `n` only ever takes small values near `SYNC_FANOUT`
-                    // (== 2): this same closure is the only place that
-                    // increments it, and only when `n < SYNC_FANOUT`; the
-                    // rest of this module only decrements it. Nowhere near
-                    // overflowing `usize`.
-                    #[allow(clippy::arithmetic_side_effects)]
-                    let next = n + 1;
-                    (n < SYNC_FANOUT).then_some(next)
-                })
-                .is_ok();
-            if holds_slot
-                && write_frame(&mut wsock, &get_blocks_frame(head_slot.load(Ordering::Relaxed)))
-                    .is_err()
-            {
-                sync_slots.fetch_sub(1, Ordering::AcqRel);
-                continue;
-            }
-            let drop_slot = |held: &mut bool| {
-                if *held {
-                    sync_slots.fetch_sub(1, Ordering::AcqRel);
-                    *held = false;
-                }
-            };
-            let mut held = holds_slot;
-            // Audit NET-09 (2026-09-16): the frame the previous socket did
-            // not deliver goes first on this one.
-            if let Some(frame) = pending.take() {
-                if write_frame(&mut wsock, &frame).is_err() {
-                    pending = Some(frame);
-                    drop_slot(&mut held);
+                let Ok(sock) = TcpStream::connect(&addr) else {
+                    thread::sleep(Duration::from_millis(300));
                     continue;
+                };
+                // Both halves own one connected lifetime. A read timeout must
+                // close the writer too: otherwise it can keep sending forever
+                // while no worker consumes the peer's blocks or sync replies.
+                let Ok(rsock) = sock.try_clone() else { continue };
+                let Ok(shutdown_socket) = sock.try_clone() else { continue };
+                let connection = Arc::new(Connection {
+                    socket: shutdown_socket,
+                    closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
+                    _counts: (ConnCount::new(&live), None),
+                    _ip_permit: None,
+                });
+                if let Some(scheduler) = scheduler.upgrade() {
+                    scheduler.register(InboundPeer { frames: tx.clone(), connection: Arc::downgrade(&connection) }, Instant::now());
                 }
-                last_write = Instant::now();
-            }
-            loop {
-                match rx.recv_timeout(Duration::from_secs(5)) {
-                    Ok(frame) => {
-                        // Audit NET-09 (2026-09-16): a socket whose reader
-                        // has gone, or that this node has not written to
-                        // for `dial_stale_after` (so the peer's idle close
-                        // is due, whether or not its FIN has arrived yet),
-                        // is not written to — the write would succeed and
-                        // deliver nothing. The frame is kept for the next
-                        // socket either way.
-                        if !reader_open.load(Ordering::Acquire)
-                            || last_write.elapsed() >= tuning.dial_stale_after
-                            || write_frame(&mut wsock, &frame).is_err()
-                        {
-                            pending = Some(frame);
-                            drop_slot(&mut held);
-                            break; // reconnect
-                        }
-                        last_write = Instant::now();
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        // Audit NET-09 (2026-09-16): re-dial a closed socket
-                        // on the idle tick too, so a peer that closed us is
-                        // back within five seconds whether or not this node
-                        // has anything to say yet.
-                        if !reader_open.load(Ordering::Acquire) {
-                            drop_slot(&mut held);
-                            break; // reconnect
-                        }
-                        // The idle tick is the sync pump: while this dialer
-                        // holds a slot, re-ask from wherever the engine has got
-                        // to. Each answer is one page, so this walks the chain
-                        // forward instead of demanding it at once, and a node
-                        // that falls behind later notices on the next tick.
-                        //
-                        // It asks on EVERY tick, not only when the head moved.
-                        // The first version released the slot the moment a tick
-                        // found the head unchanged, on the theory that an
-                        // unchanged head meant "caught up". Two things made
-                        // that wrong, and the canary showed both:
-                        //
-                        //   - Nothing re-acquired the slot. `held` went false
-                        //     and no path set it back inside the connection
-                        //     loop, so a stable TCP connection meant the node
-                        //     never asked again — it could only fall further
-                        //     behind, silently, forever.
-                        //   - Five seconds is shorter than the work. Applying
-                        //     one block costs ~0.9s of state root at this
-                        //     state size, so a 512-block page takes minutes.
-                        //     The head is *supposed* to look unchanged on the
-                        //     next tick. The release fired on the first tick
-                        //     essentially always, which turned the sync pump
-                        //     off after a single request.
-                        //
-                        // Asking unconditionally costs a request every five
-                        // seconds from at most SYNC_FANOUT peers, and an
-                        // already-caught-up node gets an empty page back. That
-                        // is the cheap end of the trade; the other end was a
-                        // validator attesting to a head it could no longer
-                        // advance, which is what this was measured doing.
-                        if held {
-                            let at = head_slot.load(Ordering::Relaxed);
-                            if write_frame(&mut wsock, &get_blocks_frame(at)).is_err() {
-                                drop_slot(&mut held);
-                                break;
-                            }
-                            last_write = Instant::now();
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        drop_slot(&mut held);
-                        return;
-                    }
+                let writer_half = ConnectionHalf(connection.clone());
+                let reader_half = ConnectionHalf(connection);
+                let wsock = sock;
+                // R3 M-4 / R1 A3-M2: same bound as the inbound side — see
+                // [`DEVNET_IO_TIMEOUT`]. Best-effort; a platform that refuses the
+                // option gets an unbounded-latency socket, not a broken one.
+                let _ = wsock.set_read_timeout(Some(DEVNET_IO_TIMEOUT));
+                let _ = wsock.set_write_timeout(Some(DEVNET_IO_TIMEOUT));
+                let wsock = Arc::new(Mutex::new(wsock));
+                // Reader half also answers reverse-direction requests, so an
+                // inbound-only connection can participate in recovery.
+                {
+                    let events = events.clone();
+                    let inflight = inflight.clone();
+                    let responder = SyncResponder { socket: wsock.clone(), data_dir: data_dir.clone(), budget: sync_budget.clone() };
+                    thread::spawn(move || {
+                        run_outbound_reader(rsock, events, inflight, reader_half, responder);
+                    });
                 }
-            }
+                // Audit NET-09 (2026-09-16): the reader half is what notices
+                // the peer closing this socket; dropping its `ConnectionHalf`
+                // is what `run_connection_writer` sees as `closed`, and the
+                // stale deadline covers the close that is due but not yet
+                // seen. Either way the loop re-dials.
+                run_connection_writer(
+                    &rx,
+                    wsock,
+                    writer_half,
+                    Some(tuning.dial_stale_after),
+                    &mut pending,
+                );
             }
         });
     }
 
-    Ok(DevnetMesh { peers, inbound, live })
+    Ok(DevnetMesh { listen_addr, peers, sync, inbound, live })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn audit_sync_budget_is_shared_across_reconnections_and_addresses() {
+        let mut budget = super::SyncBudget::new();
+        let ip = "127.0.0.1".parse().unwrap();
+        let now = std::time::Instant::now();
+        for _ in 0..super::GET_BLOCKS_BURST as usize { assert!(budget.admit(ip, now)); }
+        assert!(!budget.admit(ip, now));
+        for host in 2..=4 {
+            let other = format!("127.0.0.{host}").parse().unwrap();
+            for _ in 0..32 { assert!(budget.admit(other, now)); }
+        }
+        assert!(!budget.admit("127.0.0.5".parse().unwrap(), now));
+        assert!(budget.admit(ip, now + std::time::Duration::from_secs(1)));
+    }
+
     use super::*;
+
+    struct SyncTestPeer {
+        peer: InboundPeer,
+        received: Receiver<SharedFrame>,
+        connection: Arc<Connection>,
+        _remote: TcpStream,
+    }
+
+    impl SyncTestPeer {
+        fn receive(&self) -> Result<SharedFrame, mpsc::TryRecvError> {
+            let frame = self.received.try_recv()?;
+            if frame.first() == Some(&FRAME_GET_BLOCKS) {
+                assert!(self.connection.take_sync_request(frame.as_ref(), Instant::now()));
+            }
+            Ok(frame)
+        }
+    }
+
+    fn sync_test_peer() -> SyncTestPeer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connection = Arc::new(Connection { socket, closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
+            _counts: (ConnCount::new(&live), None), _ip_permit: None });
+        let (frames, received) = mpsc::sync_channel(1);
+        let peer = InboundPeer { frames, connection: Arc::downgrade(&connection) };
+        SyncTestPeer { peer, received, connection, _remote: remote }
+    }
+
+    #[test]
+    fn shared_sync_leases_rotate_without_head_progress_and_bound_both_triggers() {
+        let now = Instant::now();
+        let scheduler = SyncScheduler::new(Arc::new(AtomicU64::new(42)), QueueBudget::new());
+        let peers: Vec<_> = (0..3).map(|_| sync_test_peer()).collect();
+        for peer in &peers { scheduler.register(peer.peer.clone(), now); }
+        assert_eq!(peers[0].receive().unwrap().as_ref(), get_blocks_frame(42).as_slice());
+        assert_eq!(peers[1].receive().unwrap().as_ref(), get_blocks_frame(42).as_slice());
+        assert!(peers[2].receive().is_err());
+        for _ in 0..100 {
+            scheduler.pump(now, Some(7));
+            scheduler.pump(now, None);
+        }
+        assert!(peers.iter().all(|p| p.receive().is_err()), "engine and timer must share the two leases");
+        scheduler.pump(now + SYNC_LEASE, None);
+        assert_eq!(peers[2].receive().unwrap().as_ref(), get_blocks_frame(7).as_slice(), "a silent first pair cannot exclude the next peer");
+        let mut covered = std::collections::BTreeSet::new();
+        for turn in 1..=6u32 {
+            scheduler.pump(now + SYNC_LEASE * turn, None);
+            for (index, peer) in peers.iter().enumerate() {
+                if peer.receive().is_ok() { covered.insert(index); }
+                assert!(peer.peer.is_open(), "lease expiration must not disconnect slow honest peers");
+            }
+            assert!(scheduler.schedule.lock().unwrap().peers.iter().filter(|p| p.requested_at.is_some()).count() <= SYNC_FANOUT);
+        }
+        assert_eq!(covered.len(), peers.len(), "all connections must reacquire without a head change");
+    }
+
+    #[test]
+    fn shared_sync_backpressure_disconnect_and_full_queue_preserve_reacquisition() {
+        let now = Instant::now();
+        let budget = Arc::new(QueueBudget::with_caps(4, 100));
+        let scheduler = SyncScheduler::new(Arc::new(AtomicU64::new(42)), budget.clone());
+        let first = sync_test_peer();
+        let second = sync_test_peer();
+        let third = sync_test_peer();
+        first.peer.frames.try_send(vec![FRAME_ATT].into()).unwrap(); // saturated writer
+        scheduler.register(first.peer.clone(), now);
+        scheduler.register(second.peer.clone(), now);
+        scheduler.register(third.peer.clone(), now);
+        assert_eq!(second.receive().unwrap().as_ref(), get_blocks_frame(42).as_slice());
+        assert_eq!(third.receive().unwrap().as_ref(), get_blocks_frame(42).as_slice());
+        assert_eq!(first.receive().unwrap().as_ref(), [FRAME_ATT]);
+        assert!(budget.reserve_raw(EventClass::Block, 60)); // slow application
+        scheduler.pump(now + SYNC_LEASE, Some(3));
+        assert!(first.receive().is_err());
+        assert!(second.receive().is_err());
+        assert!(third.receive().is_err());
+        assert!(budget.reserve_raw(EventClass::Block, 40));
+        assert!(!budget.reserve_raw(EventClass::Block, 1), "late replies still obey the byte cap");
+        budget.release_raw(60);
+        budget.release_raw(40);
+        scheduler.pump(now + SYNC_LEASE, None);
+        assert_eq!(first.receive().unwrap().as_ref(), get_blocks_frame(3).as_slice());
+        assert_eq!(second.receive().unwrap().as_ref(), get_blocks_frame(3).as_slice());
+        second.connection.closed.store(true, Ordering::Release);
+        scheduler.pump(now + SYNC_LEASE, None);
+        assert_eq!(third.receive().unwrap().as_ref(), get_blocks_frame(42).as_slice(), "disconnect frees its lease without waiting for expiry");
+        let replacement = sync_test_peer();
+        scheduler.register(replacement.peer.clone(), now + SYNC_LEASE);
+        scheduler.pump(now + SYNC_LEASE * 2, None);
+        assert_eq!(replacement.receive().unwrap().as_ref(), get_blocks_frame(42).as_slice(), "reconnection enters the fair queue");
+    }
+
+    #[test]
+    fn shared_sync_stalled_writer_cannot_accumulate_or_flush_expired_requests() {
+        let now = Instant::now();
+        let scheduler = SyncScheduler::new(Arc::new(AtomicU64::new(42)), QueueBudget::new());
+        let peer = sync_test_peer();
+        scheduler.register(peer.peer.clone(), now);
+        for turn in 1..=5 { scheduler.pump(now + SYNC_LEASE * turn, Some(3)); }
+        let stale = peer.received.try_recv().unwrap();
+        assert_eq!(stale.as_ref(), get_blocks_frame(42).as_slice());
+        assert!(peer.received.try_recv().is_err(), "only one authorization may wait behind a blocked writer");
+        assert!(!peer.connection.take_sync_request(stale.as_ref(), now + SYNC_LEASE * 5));
+        scheduler.pump(now + SYNC_LEASE * 5, None);
+        let fresh = peer.received.try_recv().unwrap();
+        assert_eq!(fresh.as_ref(), get_blocks_frame(3).as_slice());
+        assert!(!peer.connection.take_sync_request(stale.as_ref(), now + SYNC_LEASE * 5), "a stale frame must not consume a different request's authorization");
+        assert!(peer.connection.take_sync_request(fresh.as_ref(), now + SYNC_LEASE * 5));
+        assert!(!peer.connection.take_sync_request(fresh.as_ref(), now + SYNC_LEASE * 5), "authorization is single use");
+    }
+
+    fn sync_test_block() -> BlockEnvelope {
+        use bloch_pos_committee::header::{BlockHeaderV4, Body, VERSION_G4};
+        BlockEnvelope {
+            header: BlockHeaderV4 { version: VERSION_G4, parent: [1; 32], state_root: [2; 32],
+                body_root: [3; 32], slot: 43, proposer_index: 0, randao_reveal: [4; 32],
+                randao_mix: [5; 32], justified_root: [6; 32], finalized_root: [7; 32],
+                attestation_root: [8; 32], coherence_root: [9; 32] },
+            proposer_sig: vec![0xAA; 32],
+            body: Body { transactions: Vec::new(), attestations: Vec::new() },
+        }
+    }
+
+    #[test]
+    fn block_frame_matches_canonical_oracle_for_empty_full_and_large_bodies() {
+        let empty = sync_test_block();
+        let mut full = sync_test_block();
+        full.proposer_sig = vec![0xBB; 4_589];
+        full.body.attestations.push(sample_attestation());
+        full.body.transactions.push(vec![0xCC; 4_097]);
+        let mut large = full.clone();
+        large.body.transactions.push(vec![0xA5; 1 << 20]);
+
+        for env in [empty, full, large] {
+            let payload = crate::codec::encode_envelope(&env);
+            let mut expected = Vec::with_capacity(1usize.saturating_add(payload.len()));
+            expected.push(FRAME_BLOCK);
+            expected.extend_from_slice(&payload);
+            let frame = block_frame(&env);
+
+            assert_eq!(frame, expected);
+            assert_eq!(frame.len(), 1usize.saturating_add(crate::codec::encoded_envelope_len(&env)));
+            let decoded = crate::codec::decode_envelope(&frame[1..]).expect("canonical payload");
+            assert_eq!(decoded.header, env.header);
+            assert_eq!(decoded.proposer_sig, env.proposer_sig);
+            assert_eq!(decoded.body.transactions, env.body.transactions);
+            assert_eq!(decoded.body.attestations.len(), env.body.attestations.len());
+        }
+    }
+
+    #[test]
+    fn block_queue_charge_matches_canonical_length_for_empty_full_and_large_bodies() {
+        let empty = sync_test_block();
+        let mut full = sync_test_block();
+        full.proposer_sig = vec![0xBB; 4_589];
+        full.body.attestations.push(sample_attestation());
+        full.body.transactions.push(vec![0xCC; 4_097]);
+        let mut large = full.clone();
+        large.body.transactions.push(vec![0xA5; 1 << 20]);
+
+        for env in [empty, full, large] {
+            let canonical_len = crate::codec::encode_envelope(&env).len();
+            let calculated_len = crate::codec::encoded_envelope_len(&env);
+            let event = NetEvent::Block(env, Origin::none());
+
+            assert_eq!(calculated_len, canonical_len);
+            assert_eq!(queued_bytes(&event), canonical_len);
+            assert_eq!(charged_bytes(&event), canonical_len);
+        }
+    }
+
+    #[test]
+    fn attestation_queue_charge_matches_canonical_length_without_payload_owner() {
+        let mut attestation = sample_attestation();
+        for signature_len in [0, 4_589, 1 << 20] {
+            attestation.signature.resize(signature_len, 0xA5);
+            let mut canonical = Vec::new();
+            crate::codec::encode_attestation(&mut canonical, &attestation);
+            let event = NetEvent::Attestation(attestation.clone(), Origin::none());
+
+            assert_eq!(
+                crate::codec::encoded_attestation_len(&attestation),
+                canonical.len(),
+            );
+            assert_eq!(queued_bytes(&event), canonical.len());
+            assert_eq!(charged_bytes(&event), canonical.len());
+        }
+    }
+
+    #[test]
+    fn prepared_block_broadcast_binds_large_wire_bytes_and_exact_id() {
+        let mut env = sync_test_block();
+        env.body.transactions = vec![vec![0xA5; 1 << 20]];
+        let payload = crate::codec::encode_envelope(&env);
+        let mut expected_frame = vec![FRAME_BLOCK];
+        expected_frame.extend_from_slice(&payload);
+        let expected_id = *env.block_id().as_bytes();
+
+        let prepared = PreparedBlockBroadcast::new(&env);
+        assert_eq!(prepared.id(), expected_id);
+        assert_eq!(prepared.payload(), payload.as_slice());
+        assert_eq!(prepared.devnet_frame(), expected_frame);
+        assert_eq!(prepared.into_payload(), payload);
+    }
+
+    #[test]
+    fn prepared_transaction_broadcast_preserves_large_payload_and_transport_bytes() {
+        let payload = vec![0xA7; 1 << 20];
+        let prepared = PreparedTransactionBroadcast::new(&payload);
+        let libp2p_ptr = prepared.payload().as_ptr();
+        let devnet = prepared.devnet_frame();
+        let libp2p = prepared.into_payload();
+
+        assert_eq!(libp2p.as_ptr(), libp2p_ptr, "libp2p payload was recopied");
+        assert_eq!(libp2p, payload);
+        assert_eq!(devnet.len(), payload.len() + 1);
+        assert_eq!(devnet[0], FRAME_TX);
+        assert_eq!(&devnet[1..], payload.as_slice());
+
+        let prepared = PreparedTransactionBroadcast::new(&payload);
+        let devnet_ptr = prepared.payload().as_ptr();
+        let devnet = prepared.into_devnet_frame();
+        assert_eq!(devnet.as_ptr(), devnet_ptr, "devnet tag insertion reallocated");
+        assert_eq!(devnet[0], FRAME_TX);
+        assert_eq!(&devnet[1..], payload.as_slice());
+    }
+
+    #[test]
+    fn shared_sync_two_silent_outbound_peers_cannot_starve_responsive_inbound() {
+        let silent_a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_b = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (events, received) = mpsc::channel();
+        let mesh = start("127.0.0.1", 0,
+            vec![silent_a.local_addr().unwrap().to_string(), silent_b.local_addr().unwrap().to_string()],
+            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
+        let port = mesh.listen_addr().port();
+        let (mut a, _) = silent_a.accept().unwrap();
+        let (mut b, _) = silent_b.accept().unwrap();
+        for socket in [&mut a, &mut b] {
+            assert_eq!(read_frame_until(socket, Instant::now() + Duration::from_secs(3)).unwrap(), get_blocks_frame(42));
+        }
+        let mut responder = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        for _ in 0..20 { mesh.broadcast(get_blocks_frame(42)); }
+        assert_eq!(read_frame_until(&mut responder, Instant::now() + Duration::from_secs(8)).unwrap(), get_blocks_frame(42));
+        let block = sync_test_block();
+        write_frame(&mut responder, &block_frame(&block)).unwrap();
+        match received.recv_timeout(Duration::from_secs(2)).unwrap() {
+            EngineEvent::Net(NetEvent::Block(actual, _)) => assert_eq!(actual.block_id(), block.block_id()),
+            _ => panic!("responsive peer did not deliver the missing block"),
+        }
+        assert_eq!(mesh.peer_count(), 3, "rotation must preserve silent and responsive connections");
+    }
+
+    #[test]
+    fn shared_sync_outbound_reader_serves_reverse_direction_requests() {
+        let dir = std::env::temp_dir().join(format!("bloch-reverse-sync-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let block = sync_test_block();
+        let mut store = crate::store::Store::open(&dir, &[7; 32]).unwrap();
+        store.append(&block).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (events, _received) = mpsc::channel();
+        let _mesh = start("127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
+            events, dir.clone(), Arc::new(AtomicU64::new(43)), QueueBudget::new()).unwrap();
+        let (mut remote, _) = listener.accept().unwrap();
+        assert_eq!(read_frame_until(&mut remote, Instant::now() + Duration::from_secs(3)).unwrap(), get_blocks_frame(43));
+        write_frame(&mut remote, &get_blocks_frame(42)).unwrap();
+        assert_eq!(read_frame_until(&mut remote, Instant::now() + Duration::from_secs(3)).unwrap(), block_frame(&block));
+        drop(remote);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shared_sync_bidirectional_large_pages_keep_both_readers_draining() {
+        let base = std::env::temp_dir().join(format!("bloch-duplex-sync-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let left_dir = base.join("left");
+        let right_dir = base.join("right");
+        let mut block = sync_test_block();
+        // Larger than ordinary TCP send buffers: two synchronous serving
+        // readers would each block writing before either drained the other.
+        block.body.transactions.push(vec![0xA5; 4 * 1024 * 1024]);
+        let mut left_store = crate::store::Store::open(&left_dir, &[7; 32]).unwrap();
+        let mut right_store = crate::store::Store::open(&right_dir, &[7; 32]).unwrap();
+        left_store.append(&block).unwrap();
+        right_store.append(&block).unwrap();
+        let (left_tx, left_rx) = mpsc::channel();
+        let (right_tx, right_rx) = mpsc::channel();
+        let left = start("127.0.0.1", 0, Vec::new(), left_tx, left_dir,
+            Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
+        let port = left.listen_addr().port();
+        let right = start("127.0.0.1", 0, vec![format!("127.0.0.1:{port}")], right_tx, right_dir,
+            Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
+        for received in [left_rx, right_rx] {
+            match received.recv_timeout(Duration::from_secs(8)).unwrap() {
+                EngineEvent::Net(NetEvent::Block(actual, _)) => assert_eq!(actual.body.transactions, block.body.transactions),
+                _ => panic!("a bidirectional page was not delivered"),
+            }
+        }
+        assert_eq!(left.peer_count(), 1);
+        assert_eq!(right.peer_count(), 1);
+        drop((left, right, left_store, right_store));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn shared_sync_serving_cap_survives_reconnect_generations_and_closes_failed_writes() {
+        let dir = std::env::temp_dir().join(format!("bloch-sync-workers-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut store = crate::store::Store::open(&dir, &[7; 32]).unwrap();
+        store.append(&sync_test_block()).unwrap();
+        let peers: Vec<_> = (0..=MAX_SYNC_SERVING_WORKERS).map(|_| sync_test_peer()).collect();
+        let sockets: Vec<_> = peers.iter().map(|p| Arc::new(Mutex::new(p.connection.socket.try_clone().unwrap()))).collect();
+        let budget = Arc::new(Mutex::new(SyncBudget::new()));
+        let responders: Vec<_> = sockets.iter().map(|s| SyncResponder { socket: s.clone(), data_dir: dir.clone(), budget: budget.clone() }).collect();
+        let ip = "127.0.0.1".parse().unwrap();
+        // Keep the same guards the worker owns alive, modelling outstanding
+        // storage work deterministically across disconnected generations.
+        let guards: Vec<_> = peers.iter().zip(&responders).take(MAX_SYNC_SERVING_WORKERS).map(|(peer, responder)| {
+            responder.reserve(&peer.connection, ip, &mut GetBlocksLimiter::new()).unwrap()
+        }).collect();
+        assert_eq!(budget.lock().unwrap().serving, MAX_SYNC_SERVING_WORKERS);
+        for peer in peers.iter().take(MAX_SYNC_SERVING_WORKERS) { peer.connection.closed.store(true, Ordering::Release); }
+        let last = peers.last().unwrap();
+        let responder = responders.last().unwrap();
+        assert!(responder.reserve(&last.connection, ip, &mut GetBlocksLimiter::new()).is_none(), "fresh reconnect generations cannot bypass old serving work");
+        drop(guards);
+        assert_eq!(budget.lock().unwrap().serving, 0, "worker completion must return capacity");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        // A response failing after framing begins must close the connection,
+        // so the normal writer cannot append frames to a corrupted stream.
+        last.connection.socket.shutdown(Shutdown::Write).unwrap();
+        responder.answer(&last.connection, ip, get_blocks_frame(42), &mut GetBlocksLimiter::new());
+        while !last.connection.closed.load(Ordering::Acquire) || budget.lock().unwrap().serving != 0 {
+            assert!(Instant::now() < deadline, "failed response did not close/release its connection");
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn outbound_reader_failure_reconnects_and_reclaims_sync_permit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (events, _received) = mpsc::channel();
+        let mesh = start(
+            "127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
+            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(),
+        ).unwrap();
+        // More reconnects than the sync fanout: a leaked permit would leave
+        // the third connection without its initial history request.
+        for _ in 0..=SYNC_FANOUT {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "outbound reader exit did not reconnect");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            assert_eq!(
+                read_frame_until(&mut socket, Instant::now() + Duration::from_secs(2)).unwrap(),
+                get_blocks_frame(42),
+                "each new connection must be able to acquire a sync permit",
+            );
+            // End the reader with an invalid frame while the peer keeps its
+            // TCP read side open. The old writer could keep sending here
+            // indefinitely, even though this connection could receive nothing.
+            socket.write_all(&0u32.to_le_bytes()).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            assert_eq!(socket.read(&mut [0; 1]).unwrap(), 0,
+                "reader failure left the outbound writer half alive");
+            mesh.broadcast(get_blocks_frame(42)); // wake the idle writer promptly
+        }
+        drop(mesh);
+    }
 
     #[test]
     fn audit_inbound_reader_exit_reclaims_idle_writer_and_capacity() {
@@ -1546,14 +2257,14 @@ mod tests {
         let (socket, _) = listener.accept().unwrap();
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let inbound_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let connection = Arc::new(InboundConnection {
+        let connection = Arc::new(Connection {
             socket: socket.try_clone().unwrap(),
-            closed: AtomicBool::new(false),
-            _counts: (ConnCount::new(&live), ConnCount::new(&inbound_live)),
-            _ip_slot: None,
+            closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
+            _counts: (ConnCount::new(&live), Some(ConnCount::new(&inbound_live))),
+                    _ip_permit: None,
         });
-        let reader = InboundHalf(connection.clone());
-        let writer = InboundHalf(connection.clone());
+        let reader = ConnectionHalf(connection.clone());
+        let writer = ConnectionHalf(connection.clone());
         let (frames, rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
         let peer = InboundPeer { frames, connection: Arc::downgrade(&connection) };
         drop(connection);
@@ -1572,7 +2283,7 @@ mod tests {
         assert!(!peer.is_open());
         assert_eq!(live.load(Ordering::Acquire), 0);
         assert_eq!(inbound_live.load(Ordering::Acquire), 0);
-        assert!(matches!(peer.frames.try_send(vec![1]), Err(TrySendError::Disconnected(_))));
+        assert!(matches!(peer.frames.try_send(vec![1].into()), Err(TrySendError::Disconnected(_))));
     }
 
     #[test]
@@ -1582,14 +2293,14 @@ mod tests {
         let (mut socket, _) = listener.accept().unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let connection = Arc::new(InboundConnection {
+        let connection = Arc::new(Connection {
             socket: socket.try_clone().unwrap(),
-            closed: AtomicBool::new(false),
-            _counts: (ConnCount::new(&live), ConnCount::new(&live)),
-            _ip_slot: None,
+            closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
+            _counts: (ConnCount::new(&live), Some(ConnCount::new(&live))),
+            _ip_permit: None,
         });
-        let reader = InboundHalf(connection.clone());
-        let writer = InboundHalf(connection);
+        let reader = ConnectionHalf(connection.clone());
+        let writer = ConnectionHalf(connection);
         drop(writer);
         assert_eq!(live.load(Ordering::Acquire), 2, "reader still owns capacity");
         // Closing either half shuts down every clone of this socket.
@@ -1617,6 +2328,145 @@ mod tests {
         let error = result.unwrap_err();
         // Linux reports SO_RCVTIMEO as WouldBlock; other platforms use TimedOut.
         assert!(matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn write_frame_streams_prefix_then_large_payload_across_short_writes() {
+        #[derive(Default)]
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            offered: Vec<usize>,
+        }
+
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.offered.push(bytes.len());
+                // Split the four-byte prefix twice, then make the large
+                // payload cross many writes. `write_all` must preserve both
+                // phase order and every byte across those partial accepts.
+                let cap = if self.offered.len() <= 2 { 2 } else { 4_093 };
+                let accepted = bytes.len().min(cap);
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                Ok(accepted)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut payload = vec![0xA5; 1 << 20];
+        payload[0] = FRAME_BLOCK;
+        let mut writer = ShortWriter::default();
+        write_frame(&mut writer, &payload).unwrap();
+
+        assert_eq!(&writer.bytes[..4], &(payload.len() as u32).to_le_bytes());
+        assert_eq!(&writer.bytes[4..], payload.as_slice());
+        assert_eq!(writer.offered[..3], [4, 2, payload.len()],
+            "payload writing must begin only after the complete prefix");
+    }
+
+    #[test]
+    fn write_typed_frame_streams_length_tag_and_payload_across_short_writes() {
+        #[derive(Default)]
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            offered: Vec<usize>,
+        }
+
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.offered.push(bytes.len());
+                // Split the prefix, accept the one-byte tag, then split the
+                // large payload independently of both preceding phases.
+                let cap = if self.offered.len() <= 2 { 2 } else { 4_093 };
+                let accepted = bytes.len().min(cap);
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                Ok(accepted)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let payload = vec![0x5A; 1 << 20];
+        let mut writer = ShortWriter::default();
+        write_typed_frame(&mut writer, FRAME_TX, &payload).unwrap();
+
+        let frame_len = payload.len() + 1;
+        assert_eq!(&writer.bytes[..4], &(frame_len as u32).to_le_bytes());
+        assert_eq!(writer.bytes[4], FRAME_TX);
+        assert_eq!(&writer.bytes[5..], payload.as_slice());
+        assert_eq!(writer.offered[..4], [4, 2, 1, payload.len()],
+            "payload writing must begin only after the complete prefix and tag");
+    }
+
+    #[test]
+    fn transaction_typed_frame_matches_legacy_oracle_and_preserves_partial_errors() {
+        for payload in [Vec::new(), vec![1, 2, 3], vec![0xA5; 1 << 20]] {
+            let mut expected_frame = vec![FRAME_TX];
+            expected_frame.extend_from_slice(&payload);
+            let mut expected_wire = (expected_frame.len() as u32).to_le_bytes().to_vec();
+            expected_wire.extend_from_slice(&expected_frame);
+
+            let mut wire = Vec::new();
+            write_typed_frame(&mut wire, FRAME_TX, &payload).unwrap();
+            assert_eq!(wire, expected_wire);
+        }
+
+        struct PartialThenFail {
+            bytes: Vec<u8>,
+            remaining: usize,
+        }
+
+        impl Write for PartialThenFail {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "injected transaction write failure",
+                    ));
+                }
+                let accepted = bytes.len().min(self.remaining);
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                self.remaining = self.remaining.saturating_sub(accepted);
+                Ok(accepted)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+
+        let payload = vec![0x6C; 32];
+        let mut writer = PartialThenFail { bytes: Vec::new(), remaining: 12 };
+        assert_eq!(
+            write_typed_frame(&mut writer, FRAME_TX, &payload).unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe,
+        );
+        assert_eq!(&writer.bytes[..4], &33u32.to_le_bytes());
+        assert_eq!(writer.bytes[4], FRAME_TX);
+        assert_eq!(&writer.bytes[5..], &payload[..7]);
+    }
+
+    #[test]
+    fn send_transaction_writes_exact_wire_then_closes_without_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut wire = Vec::new();
+            socket.read_to_end(&mut wire).unwrap();
+            wire
+        });
+        let payload = vec![0xA7; 1 << 20];
+        send_transaction(&addr.to_string(), &payload).unwrap();
+        let wire = reader.join().unwrap();
+
+        let mut expected_frame = vec![FRAME_TX];
+        expected_frame.extend_from_slice(&payload);
+        let mut expected_wire = (expected_frame.len() as u32).to_le_bytes().to_vec();
+        expected_wire.extend_from_slice(&expected_frame);
+        assert_eq!(wire, expected_wire);
     }
 
     #[test]
@@ -1724,6 +2574,136 @@ mod tests {
         assert_eq!(budget.shed(), (0, 1, 0));
     }
 
+    #[test]
+    fn source_admission_lasts_through_processing_and_failed_delivery_releases_it() {
+        let (tx, rx) = mpsc::channel::<EngineEvent>();
+        let budget = QueueBudget::with_caps(1, 1 << 20);
+        let ip = "192.0.2.1".parse().unwrap();
+        let event = || NetEvent::Attestation(sample_attestation(), Origin::none());
+        assert!(send_from_ip(&tx, &budget, ip, event()));
+        let EngineEvent::Net(processing) = rx.recv().unwrap() else { panic!("network event") };
+        match &processing {
+            NetEvent::Block(_, origin)
+            | NetEvent::Attestation(_, origin)
+            | NetEvent::Transaction(_, origin) => assert!(
+                origin.verification_source().is_some(),
+                "the engine must receive the same normalized source carried by its guard",
+            ),
+        }
+        // Match the engine's early release of the legacy queue accounting.
+        // The source guard must remain held until processing actually ends.
+        budget.release(&processing);
+        assert!(send_from_ip(&tx, &budget, ip, event()));
+        assert!(rx.try_recv().is_err());
+        drop(processing);
+        assert!(send_from_ip(&tx, &budget, ip, event()));
+        let EngineEvent::Net(next) = rx.recv().unwrap() else { panic!("network event") };
+        budget.release(&next);
+        drop(next);
+        drop(rx);
+        assert!(!send_from_ip(&tx, &budget, ip, event()));
+        assert_eq!((budget.inflight(), budget.inflight_bytes()), (0, 0));
+        // A dead receiver drops both the queue reservation and Origin guard.
+        let (live_tx, live_rx) = mpsc::channel();
+        assert!(send_from_ip(&live_tx, &budget, ip, event()));
+        assert!(live_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn devnet_reserves_before_decode_and_releases_malformed_frames() {
+        let (tx, rx) = mpsc::channel::<EngineEvent>();
+        let budget = QueueBudget::with_caps(1, 1 << 20);
+        let ip = "192.0.2.44".parse().unwrap();
+        let malformed = vec![FRAME_ATT, 0xFF];
+
+        // Occupy the aggregate slot first. The malformed payload would fail
+        // decoding, but it must be shed on the tag/length reservation before
+        // a decoder gets the chance to inspect it.
+        assert!(budget.reserve_raw(EventClass::Attestation, 1));
+        assert!(decode_and_send_from_ip(&tx, &budget, ip, &malformed));
+        assert_eq!(budget.shed(), (0, 1, 0));
+        assert_eq!(budget.inflight(), 1);
+        assert!(rx.try_recv().is_err());
+        assert!(source_budget::Registry::reserve(
+            &budget.sources,
+            source_budget::Source::ip(ip),
+            EventClass::Attestation,
+            1,
+            1,
+            1 << 20,
+        ).is_some(), "pre-decode shedding must release the per-IP charge");
+        budget.release_raw(1);
+
+        // With capacity available the decoder rejects it, and both the global
+        // and per-IP reservations are returned on that path.
+        assert!(decode_and_send_from_ip(&tx, &budget, ip, &malformed));
+        assert_eq!(budget.inflight(), 0);
+        assert_eq!(budget.inflight_bytes(), 0);
+        assert!(source_budget::Registry::reserve(
+            &budget.sources,
+            source_budget::Source::ip(ip),
+            EventClass::Attestation,
+            1,
+            1,
+            1 << 20,
+        ).is_some(), "decode failure must release the per-IP charge");
+    }
+
+    #[test]
+    fn devnet_predecode_charge_matches_the_engine_release_charge() {
+        let (tx, rx) = mpsc::channel::<EngineEvent>();
+        let budget = QueueBudget::with_caps(4, 1 << 20);
+        let ip = "192.0.2.45".parse().unwrap();
+        let frame = block_frame(&sync_test_block());
+        assert!(decode_and_send_from_ip(&tx, &budget, ip, &frame));
+        assert_eq!(budget.inflight(), 1);
+        assert_eq!(budget.inflight_bytes(), frame.len() - 1);
+
+        let EngineEvent::Net(mut event) = rx.recv().unwrap() else { panic!("network event") };
+        assert_eq!(class_of(&event), EventClass::Block);
+        assert_eq!(queued_bytes(&event), frame.len() - 1);
+        assert_eq!(charged_bytes(&event), frame.len() - 1);
+        match &event {
+            NetEvent::Block(_, origin)
+            | NetEvent::Attestation(_, origin)
+            | NetEvent::Transaction(_, origin) => {
+                assert!(origin.verification_source().is_some())
+            }
+        }
+        // Queue consumers do not mutate events, but accounting must remain
+        // bound to the bytes that were actually reserved even on an
+        // unexpected internal mutation. Re-encoding at release would leak
+        // the difference here.
+        let NetEvent::Block(env, _) = &mut event else { unreachable!() };
+        env.proposer_sig.clear();
+        assert_ne!(queued_bytes(&event), frame.len() - 1);
+        assert_eq!(charged_bytes(&event), frame.len() - 1);
+        budget.release(&event);
+        drop(event);
+        assert_eq!(budget.inflight(), 0);
+        assert_eq!(budget.inflight_bytes(), 0);
+        assert!(source_budget::Registry::reserve(
+            &budget.sources,
+            source_budget::Source::ip(ip),
+            EventClass::Attestation,
+            1,
+            1,
+            1 << 20,
+        ).is_some(), "event drop must release the per-IP charge");
+    }
+
+    #[test]
+    fn source_free_queue_events_fall_back_to_canonical_size() {
+        let event = NetEvent::Attestation(sample_attestation(), Origin::none());
+        assert_eq!(charged_bytes(&event), queued_bytes(&event));
+        let budget = QueueBudget::with_caps(1, 1 << 20);
+        let expected = queued_bytes(&event);
+        assert!(budget.try_reserve(&event));
+        assert_eq!(budget.inflight_bytes(), expected);
+        budget.release(&event);
+        assert_eq!((budget.inflight(), budget.inflight_bytes()), (0, 0));
+    }
+
     /// O06 — the invariant `count <= cap` holds under contention. Eight
     /// threads race the reservation with nothing consuming; the old
     /// `load`-then-`fetch_add` could admit up to seven over the cap, the
@@ -1749,8 +2729,37 @@ mod tests {
         for h in handles {
             h.join().expect("racer");
         }
-        assert_eq!(admitted.load(Ordering::Relaxed), cap, "exactly cap reservations succeed");
+        let attestation_cap = class_count_cap(EventClass::Attestation, cap);
+        assert_eq!(admitted.load(Ordering::Relaxed), attestation_cap);
+        assert_eq!(budget.inflight(), attestation_cap);
+        for _ in attestation_cap..cap {
+            assert!(budget.reserve_raw(EventClass::Block, 1));
+        }
+        assert!(!budget.reserve_raw(EventClass::Block, 1));
         assert_eq!(budget.inflight(), cap);
+    }
+
+    #[test]
+    fn count_quotas_preserve_block_headroom_and_recover_after_release() {
+        let budget = QueueBudget::with_caps(8, 1 << 20);
+        for (class, target) in [
+            (EventClass::Transaction, 4), (EventClass::Attestation, 6), (EventClass::Block, 8),
+        ] {
+            while budget.inflight() < target {
+                assert!(budget.reserve_raw(class, 1));
+            }
+            assert!(!budget.reserve_raw(class, 1));
+            assert_eq!(budget.inflight_bytes(), target);
+        }
+        for _ in 0..8 { budget.release_raw(1); }
+        assert_eq!((budget.inflight(), budget.inflight_bytes()), (0, 0));
+        assert!(budget.reserve_raw(EventClass::Transaction, 1));
+        for class in [EventClass::Transaction, EventClass::Attestation, EventClass::Block] {
+            assert!(!QueueBudget::with_caps(0, 1024).reserve_raw(class, 1));
+            let tiny = QueueBudget::with_caps(1, 1024);
+            assert!(tiny.reserve_raw(class, 1));
+            assert!(!tiny.reserve_raw(class, 1));
+        }
     }
 
     /// O06 — the per-class byte quotas: transactions stop at half the
@@ -1857,23 +2866,56 @@ mod tests {
     /// `OUTBOUND_QUEUE_DEPTH` and every broadcast past that is dropped.
     #[test]
     fn devnet_broadcast_outbound_queue_is_bounded() {
-        let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) =
+        let (tx, rx): (SyncSender<SharedFrame>, Receiver<SharedFrame>) =
             mpsc::sync_channel(OUTBOUND_QUEUE_DEPTH);
         let mesh = DevnetMesh {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             peers: vec![tx],
+            sync: SyncScheduler::new(Arc::new(AtomicU64::new(0)), QueueBudget::new()),
             inbound: Arc::new(Mutex::new(Vec::new())),
             live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         // Never drain `rx` — the stalled-dialer scenario — and broadcast well
         // past the bound.
-        for i in 0..(OUTBOUND_QUEUE_DEPTH + 50) {
-            mesh.broadcast(vec![i as u8]);
+        for _ in 0..(OUTBOUND_QUEUE_DEPTH + 50) {
+            mesh.broadcast(vec![FRAME_BLOCK]);
         }
         let queued = std::iter::from_fn(|| rx.try_recv().ok()).count();
         assert_eq!(
             queued, OUTBOUND_QUEUE_DEPTH,
             "the outbound queue must cap at OUTBOUND_QUEUE_DEPTH, not grow with every broadcast"
         );
+    }
+
+    /// EN-08: fanout retains one immutable wire allocation, rather than one
+    /// payload allocation per writer queue. A full queue must still keep its
+    /// oldest frame and drop the incoming frame without changing ordering.
+    #[test]
+    fn devnet_broadcast_shares_wire_bytes_and_full_queues_do_not_displace() {
+        let (first_tx, first_rx) = mpsc::sync_channel::<SharedFrame>(1);
+        let (second_tx, second_rx) = mpsc::sync_channel::<SharedFrame>(1);
+        let mesh = DevnetMesh {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            peers: vec![first_tx, second_tx],
+            sync: SyncScheduler::new(Arc::new(AtomicU64::new(0)), QueueBudget::new()),
+            inbound: Arc::new(Mutex::new(Vec::new())),
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let mut retained = vec![0xA5; 1 << 20];
+        retained[0] = FRAME_BLOCK;
+        mesh.broadcast(retained.clone());
+
+        // Both queues are now full. This distinct incoming frame is refused;
+        // `try_send` does not evict or reorder the already retained frame.
+        mesh.broadcast(vec![FRAME_ATT, 0x5A]);
+
+        let first = first_rx.try_recv().unwrap();
+        let second = second_rx.try_recv().unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "both peers must retain the same allocation");
+        assert_eq!(first.as_ref(), retained.as_slice(), "wire bytes must remain exact");
+        assert_eq!(second.as_ref(), retained.as_slice(), "wire bytes must remain exact");
+        assert!(first_rx.try_recv().is_err(), "full queue must drop, not displace or append");
+        assert!(second_rx.try_recv().is_err(), "full queue must drop, not displace or append");
     }
 
     /// R3 M-4 / R1 A3-M2: the devnet listener accepts at most
@@ -1883,24 +2925,16 @@ mod tests {
     /// against a connection flood on a routable bind.
     #[test]
     fn inbound_connections_are_capped() {
-        // Probe a free loopback port, then hand that exact port to `start` —
-        // `net::start` takes a fixed port, not an ephemeral-port request it
-        // reports back, so this is the standard std::net test pattern. The
-        // TOCTOU window is a loopback address in this process's own test
-        // run; nothing else in this environment is racing for it.
-        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("probe a free port");
-        let port = probe.local_addr().expect("local_addr").port();
-        drop(probe);
-
         let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
         let inflight = QueueBudget::new();
         // Every connection here comes from loopback, so the per-address cap
-        // (audit NET-03) would bind at 4 long before the global cap; it is
-        // lifted for THIS test only, which is about the global one.
+        // (audit NET-03) would bind at `MAX_INBOUND_PER_IP` long before the
+        // global cap; it is lifted for THIS test only, which is about the
+        // global one.
         let mesh = start_with_tuning(
             "127.0.0.1",
-            port,
+            0,
             Vec::new(),
             events,
             std::env::temp_dir(),
@@ -1909,6 +2943,7 @@ mod tests {
             DevnetTuning { max_inbound_per_ip: usize::MAX, ..DevnetTuning::PRODUCTION },
         )
         .expect("bind the devnet transport");
+        let port = mesh.listen_addr().port();
 
         // Open more connections than the cap allows and HOLD them open — a
         // dropped `TcpStream` closes the socket, which would silently undo
@@ -1957,16 +2992,6 @@ mod tests {
 
     // ── deep audit 2026-09-16: NET-03, NET-05, NET-09, NET-17 ───────────────
 
-    /// A free loopback port for `start_with_tuning`, which takes a fixed
-    /// port (see `inbound_connections_are_capped` for why this is the
-    /// standard pattern here).
-    fn free_port() -> u16 {
-        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("probe a free port");
-        let port = probe.local_addr().expect("local_addr").port();
-        drop(probe);
-        port
-    }
-
     /// Poll `cond` for up to five seconds: fast on an idle box, still
     /// correct on a loaded one.
     fn wait_for(what: &str, cond: impl Fn() -> bool) {
@@ -2009,18 +3034,30 @@ mod tests {
         }
     }
 
-    /// The server is holding this socket open: a short read times out
-    /// rather than seeing EOF.
+    /// The server is holding this socket open: a short read sees nothing
+    /// but the server's own `get-blocks` asks (the sync scheduler issues
+    /// them on inbound connections too) and then times out, rather than
+    /// seeing EOF.
     fn expect_open(sock: &mut TcpStream, what: &str) {
-        sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-        let mut buf = [0u8; 1];
-        match sock.read(&mut buf) {
-            Ok(0) => panic!("the server closed a connection it should have kept ({what})"),
-            Ok(n) => panic!("{n} unexpected bytes ({what})"),
-            Err(e) => assert!(
-                matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
-                "unexpected read error ({what}): {e}"
-            ),
+        let deadline = Instant::now() + Duration::from_millis(300);
+        loop {
+            match read_frame_until(sock, deadline) {
+                Ok(frame) => assert_eq!(
+                    frame.first(),
+                    Some(&FRAME_GET_BLOCKS),
+                    "unexpected frame ({what}): {frame:?}"
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    panic!("the server closed a connection it should have kept ({what})")
+                }
+                Err(e) => {
+                    assert!(
+                        matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+                        "unexpected read error ({what}): {e}"
+                    );
+                    return;
+                }
+            }
         }
     }
 
@@ -2033,11 +3070,10 @@ mod tests {
     /// only admission decision was the per-process count.
     #[test]
     fn inbound_connections_are_capped_per_source_address() {
-        let port = free_port();
         let (events, _rx) = mpsc::channel::<EngineEvent>();
         let mesh = start_with_tuning(
             "127.0.0.1",
-            port,
+            0,
             Vec::new(),
             events,
             std::env::temp_dir(),
@@ -2046,6 +3082,7 @@ mod tests {
             DevnetTuning { max_inbound_per_ip: 2, ..DevnetTuning::PRODUCTION },
         )
         .expect("bind the devnet transport");
+        let port = mesh.listen_addr().port();
 
         let first = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         let mut second = TcpStream::connect(("127.0.0.1", port)).expect("connect");
@@ -2073,32 +3110,43 @@ mod tests {
     /// A peer that sends only such frames — 5 bytes per ~100 s was enough to
     /// hold a slot forever — is closed when a silent peer would be, while a
     /// peer sending decodable frames at the same cadence stays connected.
-    /// The `get-blocks` frame is the decodable one here: the empty
-    /// per-address table refuses it before the disk is touched, and it still
-    /// counts, because `serve_get_blocks` could have used it.
+    /// The `get-blocks` frame is the decodable one here: there is no block
+    /// log under the data dir, so the serving worker answers nothing, and it
+    /// still counts, because the responder could have used it.
     #[test]
     fn frames_that_decode_to_nothing_do_not_renew_the_inbound_deadline() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let idle = Duration::from_millis(400);
-        let by_ip = InboundByIp::new(MAX_INBOUND_PER_IP);
         let (events, _rx) = mpsc::channel::<EngineEvent>();
         let inflight = QueueBudget::new();
+        let sync_budget = Arc::new(Mutex::new(SyncBudget::new()));
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawn_reader = |server: TcpStream| {
             let rsock = server.try_clone().expect("clone");
-            let wsock = Arc::new(Mutex::new(server));
+            let connection = Arc::new(Connection {
+                socket: server.try_clone().expect("clone"),
+                closed: AtomicBool::new(false),
+                pending_sync: Mutex::new(None),
+                serving_sync: AtomicBool::new(false),
+                _counts: (ConnCount::new(&live), None),
+                _ip_permit: None,
+            });
+            let responder = SyncResponder {
+                socket: Arc::new(Mutex::new(server)),
+                data_dir: std::env::temp_dir(),
+                budget: sync_budget.clone(),
+            };
             let events = events.clone();
             let inflight = inflight.clone();
-            let by_ip = by_ip.clone();
             thread::spawn(move || {
                 let started = Instant::now();
                 run_inbound_reader(
                     rsock,
-                    wsock,
-                    std::env::temp_dir(),
+                    ConnectionHalf(connection),
                     events,
                     inflight,
-                    by_ip,
+                    responder,
                     addr.ip(),
                     idle,
                 );
@@ -2134,80 +3182,6 @@ mod tests {
         let _ = reader.join();
     }
 
-    /// audit NET-05 (2026-09-16): the `get-blocks` bucket is per source
-    /// address — every connection from one host draws on one burst — and
-    /// it outlives the connections, so closing and re-dialing does not hand
-    /// out a fresh burst. Refill is still the sustained rate, another
-    /// address is unaffected, and an address nobody admitted has no bucket.
-    /// Against the old per-connection limiter the two connections below
-    /// would have been admitted `2 × GET_BLOCKS_BURST` requests, and the
-    /// reconnect another `GET_BLOCKS_BURST`.
-    #[test]
-    fn get_blocks_budget_is_per_source_address_and_survives_reconnect() {
-        let table = InboundByIp::new(4);
-        let a: IpAddr = "10.0.0.1".parse().unwrap();
-        let b: IpAddr = "10.0.0.2".parse().unwrap();
-        let t0 = Instant::now();
-        assert!(!table.admit_get_blocks(a, t0), "an address never admitted has no budget");
-
-        let slot1 = table.try_admit(a, t0).expect("first slot");
-        let slot2 = table.try_admit(a, t0).expect("second slot");
-        let admitted = (0..(GET_BLOCKS_BURST as usize * 2))
-            .filter(|_| table.admit_get_blocks(a, t0))
-            .count();
-        assert_eq!(admitted, GET_BLOCKS_BURST as usize, "two connections, one burst");
-
-        let slot_b = table.try_admit(b, t0).expect("another address");
-        assert!(table.admit_get_blocks(b, t0), "another address has its own budget");
-
-        drop(slot1);
-        drop(slot2);
-        let slot3 = table.try_admit(a, t0).expect("re-admitted after closing");
-        assert!(!table.admit_get_blocks(a, t0), "a reconnect must not refill the bucket");
-
-        let t1 = t0 + Duration::from_secs(1);
-        let refilled = std::iter::from_fn(|| table.admit_get_blocks(a, t1).then_some(()))
-            .count();
-        assert_eq!(refilled as f64, GET_BLOCKS_ANSWERS_PER_SEC, "one second buys the sustained rate");
-
-        // With no connection and a full bucket, the entry is pruned on the
-        // next accept; `b`, still connected, is not.
-        drop(slot3);
-        let t2 = t1 + Duration::from_secs(60);
-        let _slot_b2 = table.try_admit(b, t2).expect("b again");
-        let by_ip = table.by_ip.lock().unwrap();
-        assert!(!by_ip.contains_key(&a), "a full bucket with no connection must not be retained");
-        assert!(by_ip.contains_key(&b));
-        drop(by_ip);
-        drop(slot_b);
-    }
-
-    /// audit NET-17 / NET-05 (2026-09-16): a `get-blocks` page is capped in
-    /// bytes as well as blocks, with the libp2p transport's arithmetic —
-    /// each block charged its length plus the 4-byte frame prefix, the page
-    /// ending at the first block that would take it past `MAX_SYNC_FRAME −
-    /// 1 KiB`. Against the old code every block `Store::blocks_after`
-    /// returned was written, up to 512 × 8 MiB.
-    #[test]
-    fn a_get_blocks_page_is_capped_in_bytes_as_well_as_blocks() {
-        assert_eq!(SYNC_PAGE_BYTES, crate::p2p::MAX_SYNC_FRAME as usize - 1024);
-        // Two of these are exactly the cap once each carries its prefix.
-        let half = vec![0u8; SYNC_PAGE_BYTES / 2 - 4];
-        let page: Vec<Vec<u8>> =
-            page_within_bytes(vec![half.clone(), half.clone(), vec![1], vec![2]]).collect();
-        assert_eq!(page.len(), 2, "the page stops at the byte cap, before the block cap");
-        assert_eq!(page[0].len(), half.len());
-        // Past the cap nothing more is served, however small.
-        let over = vec![vec![0u8; SYNC_PAGE_BYTES - 4], vec![0u8; 1]];
-        assert_eq!(page_within_bytes(over).count(), 1);
-        // A page of small blocks is bounded by the block count alone.
-        let small: Vec<Vec<u8>> = (0..SYNC_PAGE_BLOCKS).map(|i| vec![i as u8; 100]).collect();
-        assert_eq!(page_within_bytes(small).count(), SYNC_PAGE_BLOCKS);
-        // Log order is preserved.
-        let ordered: Vec<Vec<u8>> = page_within_bytes(vec![vec![1], vec![2], vec![3]]).collect();
-        assert_eq!(ordered, vec![vec![1], vec![2], vec![3]]);
-    }
-
     /// One dialer against a listener the test owns: the mesh dials
     /// `listener`, and whatever it writes is read back here.
     fn dial_from_mesh(tuning: DevnetTuning) -> (TcpListener, DevnetMesh, Receiver<EngineEvent>) {
@@ -2216,7 +3190,7 @@ mod tests {
         let (events, rx) = mpsc::channel::<EngineEvent>();
         let mesh = start_with_tuning(
             "127.0.0.1",
-            free_port(),
+            0,
             vec![peer],
             events,
             std::env::temp_dir(),
@@ -2229,7 +3203,7 @@ mod tests {
     }
 
     /// Read frames off `sock` until `wanted` arrives; everything before it
-    /// must be the dialer's own `get-blocks` (it holds the only sync slot).
+    /// must be the dialer's own `get-blocks` (the sync scheduler's asks).
     fn expect_frame_then(sock: &mut TcpStream, wanted: &[u8], what: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

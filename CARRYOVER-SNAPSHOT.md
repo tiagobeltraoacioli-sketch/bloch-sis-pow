@@ -1,7 +1,9 @@
 # The Genesis-3 terminal snapshot
 
-`carryover.tsv.gz` is the state Genesis-4 opened with: every unspent output of
-Genesis-3 at its terminal height, 39,918.
+`carryover.tsv.gz` is the state Genesis-4 opened with: every exported unspent
+output from the Genesis-3 snapshot published with terminal-height label
+39,918. Whether the applied selected tip on the snapshot nodes was actually
+39,917 or 39,918 remains the LG-01 provenance question below.
 
     rows            452,726
     uncompressed    54,780,151 bytes
@@ -69,3 +71,35 @@ Reproduce it:
 
     gzip -dc carryover.tsv.gz | sha256sum   # 84ddbbac…
     gzip -dc carryover.tsv.gz | wc -l       # 452726
+
+## LG-01 evidence boundary
+
+The exact arithmetic admits two materially different explanations. The
+snapshot nodes may have had an applied selected tip at 39,917 while 39,918
+was an announced, stored, or later-observed height that those snapshots never
+applied. Alternatively, block 39,918 may have been selected while the legacy
+non-atomic Extension path logged a failed UTXO mutation and still advanced
+`tip_hash`. The old exporter's silent-decode-skip path was another historical
+possibility; the current exporter and `iter_utxos_sorted` now fail closed, so
+a fresh successful derivation from each frozen archive can exclude that
+possibility for the archive being inspected.
+
+`scripts/verify-lg01-provenance.py` accepts reports from at least two distinct
+archival snapshot nodes and classifies only these two cases. It refuses
+artifact mismatches, incomplete block records, duplicate archive identities,
+or disagreement between nodes. It never changes the carryover file or a
+balance. Run its regression suite with:
+
+    python3 scripts/test-verify-lg01-provenance.py
+
+The verifier checks consistency, not authorship. Closing LG-01 requires the
+operators to publish the raw outputs and authenticated hashes behind every
+report field: frozen data-directory identity; snapshot-time
+`getdaginfo.tip_height`; `meta.tip_hash`; maximum stored height; a fixed-tool
+carryover verification giving the root, row count, total and file digests;
+and the height-39,918 block lookup giving hash, selected disposition,
+coinbase total and transaction count. The two node records need distinct
+archive identities and matching selected-tip facts. If the evidence proves a
+selected height-39,918 block whose effects are absent, accepting that
+historical loss or defining any remedy remains an explicit owner decision;
+this verifier does not invent a coinbase.

@@ -1,0 +1,28 @@
+Validation wave 23 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Base: e815b0e
+
+PASS
+
+python3 scripts/check-validator-lifecycle-mutations.py
+  control: passed
+  activation: killed
+  maturity: killed
+  one-shot: killed
+  indeterminate: killed
+  credential: killed
+  narrowing: killed
+  collision: killed
+  write-off-overflow: killed
+  All eight withdrawal guard mutations killed; shipping source unchanged.
+
+CI WIRING
+
+.github/workflows/tests.yml runs the same script in the blocking
+"cargo test — live crates" job before the complete live-crate suite.
+
+LIMIT
+
+This evidence is narrowly scoped to the eight withdrawal guard mutations. It
+does not prove the complete validator lifecycle, future activation safety,
+network interoperability or production deployment.

@@ -1,0 +1,27 @@
+Validation wave 26 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Implementation: d8437a4
+
+PASS
+
+cargo test --locked -p bloch-pos-committee --test spec_reconcile
+  11 passed, 0 failed.
+
+cargo test --locked -p bloch-pos-committee \
+  a_partitioned_minority_finalizes_because_the_leak_shrinks_the_denominator
+  1 passed, 0 failed; all other filtered test binaries completed normally.
+
+python3 scripts/check-comment-constants.py
+  430 files; 565 resolvable constants; 46 claims; 0 contradictions.
+
+bash scripts/ci-banned-words.sh
+  Passed.
+
+git diff --check
+  Passed before the implementation commit.
+
+LIMIT
+
+This wave corrects and pins repository prose. It does not activate the F6 seed
+look-ahead, prove that the scheduled slashing binary is deployed, or change
+any accepted block, state root, quorum calculation or supply balance.

@@ -118,7 +118,7 @@ fn all_values(args: &[String], name: &str) -> Vec<String> {
 }
 
 fn read_hex_file(path: &str) -> Result<Vec<u8>, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let text = zeroize::Zeroizing::new(fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?);
     unhex(text.trim()).map_err(|e| format!("{path}: {e}"))
 }
 
@@ -137,6 +137,9 @@ fn write_file(path: &str, bytes: &[u8], secret: bool) -> Result<(), String> {
                 .open(path)
                 .map_err(|e| format!("cannot create {path}: {e}"))?;
             f.write_all(bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
+            f.sync_all().map_err(|e| format!("cannot sync {path}: {e}"))?;
+            let parent = Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            crate::store::fsync_dir(parent).map_err(|e| format!("cannot sync signer directory: {e}"))?;
             return Ok(());
         }
     }
@@ -366,21 +369,10 @@ fn keygen(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Are all the arrangement's public keys distinct?
-///
-/// `ws::verify_envelope` enforces uniqueness of the signer *index*, not of the
-/// *key*: `DuplicateSigner` fires when one index is listed twice, and nothing
-/// anywhere compares two slots' `pubkey` bytes. So an arrangement that seats
-/// ONE key in TWO slots turns a 2-of-3 into a 1-of-3 that every client
-/// accepts — the holder signs once and the same signature is listed at both
-/// indices, which are distinct, so no rule is broken. Seating the duplicate
-/// once as `internal` and once as `external` defeats `min_external` in the
-/// same stroke, which is the rule §6.1 leans on to make two founder-adjacent
-/// keys not a quorum.
-///
-/// Rejecting this belongs where an arrangement is BORN, not in the acceptance
-/// rules: changing `verify_envelope` would change what a node accepts. The
-/// arrangement is public, so this is a check every reader can also run.
+/// Refuse duplicate keys before publishing an arrangement. The standalone
+/// verifier and boot decoder repeat this invariant at their own boundaries;
+/// ceremony diagnostics identify the offending slots before signatures are
+/// collected. Distinct keys alone do not establish independent operators.
 fn distinct_signer_keys(set: &SignerSet) -> Result<(), String> {
     for i in 0..set.signers.len() {
         // `i + 1` cannot overflow (i < len); saturating_add carries the proof.
@@ -390,7 +382,7 @@ fn distinct_signer_keys(set: &SignerSet) -> Result<(), String> {
                     "slots {i} and {j} hold the SAME public key.\n  \
                      One key in two slots is a forgeable quorum: its holder signs once, \
                      the signature is listed at both indices, and because the INDICES \
-                     differ, ws::verify_envelope's DuplicateSigner rule never fires — a \
+                     differ, index uniqueness alone cannot protect a \
                      {}-of-{} arrangement that one person alone can satisfy. If the two \
                      slots also differ in subset, the >={} external minimum falls with \
                      it.\n  Every slot must hold a key generated on a DIFFERENT holder's \
@@ -560,6 +552,105 @@ fn signer_set(args: &[String]) -> Result<(), String> {
 /// `wscheckpoint-<epoch>.bin`) and `<prefix>.json` (the human view quoting
 /// the ws digest). The digest printed at the end is the exact 32 bytes each
 /// signer signs.
+/// Reusing an output prefix is an idempotent publication, never a re-mint.
+/// An omitted timestamp means reuse the original issuance time. Every other
+/// field must still agree with the independently re-derived chain view.
+fn publication_bytes(
+    path: &str,
+    mut checkpoint: WeakSubjectivityCheckpoint,
+    explicit_issued_at: bool,
+) -> Result<(WeakSubjectivityCheckpoint, bool), String> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((checkpoint, false)),
+        Err(error) => return Err(format!("cannot read existing publication {path}: {error}")),
+    };
+    let mut bytes = Vec::new();
+    file.take(155).read_to_end(&mut bytes).map_err(|error| error.to_string())?;
+    let existing = decode_checkpoint(&bytes).map_err(|error| format!("existing publication {path}: {error}"))?;
+    if !explicit_issued_at { checkpoint.issued_at = existing.issued_at; }
+    if checkpoint != existing {
+        return Err(format!("refusing to replace existing checkpoint {path}: its signed fields differ; reuse the original artifact or investigate the discrepancy, never re-mint an already published epoch"));
+    }
+    Ok((existing, true))
+}
+
+/// An optional, operator-owned publication registry coordinates all output
+/// prefixes sharing this directory. Atomic hard-link installation exposes only
+/// fsynced complete artifacts and never replaces a competing epoch record.
+fn coordinate_publication(
+    directory: &Path,
+    checkpoint: WeakSubjectivityCheckpoint,
+    explicit_issued_at: bool,
+) -> Result<WeakSubjectivityCheckpoint, String> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)] {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("publication directory: {error}")),
+    }
+    let metadata = fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() { return Err("publication directory must be a real directory, not a symlink".into()); }
+    #[cfg(unix)] {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid only reads the process identity.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err("publication directory must be owned by this user and mode 0700".into());
+        }
+    }
+    // A concurrent caller may observe a newly created directory before its
+    // creator fsyncs the parent. Every successful publisher ensures durability.
+    let parent = directory.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    crate::store::fsync_dir(parent).map_err(|error| error.to_string())?;
+    let name = format!("{}-{}-{}.bin", checkpoint.network_id, hex32(&checkpoint.genesis_root), checkpoint.epoch);
+    let destination = directory.join(name);
+    let path = destination.to_str().ok_or("publication directory path must be UTF-8")?;
+    let (existing, found) = publication_bytes(path, checkpoint, explicit_issued_at)?;
+    if found {
+        crate::store::fsync_dir(directory).map_err(|error| error.to_string())?;
+        return Ok(existing);
+    }
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = directory.join(format!(".publication-{}-{serial}.tmp", std::process::id()));
+    let mut created = false;
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary).map_err(|error| format!("publication staging file: {error}"))?;
+        created = true;
+        file.write_all(&checkpoint.canonical_serialize()).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        match fs::hard_link(&temporary, &destination) {
+            Ok(()) => {
+                crate::store::fsync_dir(directory).map_err(|error| error.to_string())?;
+                Ok(checkpoint)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Another process won. Compare its complete canonical artifact,
+                // including issuance time when the caller explicitly fixed it.
+                let (winner, found) = publication_bytes(path, checkpoint, explicit_issued_at)?;
+                if !found { return Err("publication record disappeared during concurrent creation; investigate".into()); }
+                crate::store::fsync_dir(directory).map_err(|error| error.to_string())?;
+                Ok(winner)
+            }
+            Err(error) => Err(format!("atomic publication registration failed: {error}")),
+        }
+    })();
+    // A failed exclusive create may name somebody else's stale file. Unlink
+    // only after this invocation created it; never remove the durable record.
+    if created { let _ = fs::remove_file(&temporary); }
+    result
+}
+
 fn checkpoint(args: &[String]) -> Result<(), String> {
     let manifest_path = req(args, "--genesis")?;
     let rpcs: Vec<String> = req(args, "--rpc")?
@@ -597,10 +688,16 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
     // genesis anchor carries zeros for the same reason (`engine::run`, "no
     // validator-set SMT root exposed at this milestone"). The field stays in
     // the format so the day state download exists the artifact does not
-    // change shape; until then zeros are the honest value, and an override
-    // exists for that day.
+    // change shape; until then zero is an explicit unavailable-root sentinel.
+    // Do not permit an operator-supplied nonzero value to appear validated.
     let validator_set_root = match crate::arg_value(args, "--validator-set-root") {
-        Some(s) => parse_hex32(&s, "--validator-set-root")?,
+        Some(s) => {
+            let root = parse_hex32(&s, "--validator-set-root")?;
+            if root != [0; 32] {
+                return Err("nonzero --validator-set-root is unsupported: this tool cannot independently derive a validator registry commitment; use the historical zero sentinel".into());
+            }
+            root
+        },
         None => [0u8; 32],
     };
 
@@ -668,13 +765,29 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
         issued_at,
         signer_set_id,
     };
+    let bin_path = format!("{out}.bin");
+    let json_path = format!("{out}.json");
+    let explicit_time = crate::arg_value(args, "--issued-at").is_some();
+    let (cp, reused) = publication_bytes(&bin_path, cp, explicit_time)?;
+    let cp = match crate::arg_value(args, "--publication-dir") {
+        Some(directory) => coordinate_publication(Path::new(&directory), cp, explicit_time || reused)?,
+        None => {
+            println!("WARNING: no --publication-dir configured; other output prefixes are not coordinated against same-epoch re-minting");
+            cp
+        }
+    };
     let bytes = cp.canonical_serialize();
     decode_checkpoint(&bytes).map_err(|e| format!("self-check failed: {e}"))?;
     let digest = cp.ws_digest();
-
-    let bin_path = format!("{out}.bin");
-    let json_path = format!("{out}.json");
-    write_file(&bin_path, &bytes, false)?;
+    if !reused {
+        // Exclusive creation closes the check/create race between publishers.
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&bin_path)
+            .map_err(|error| format!("cannot create publication {bin_path}: {error}"))?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+    } else {
+        println!("reusing original checkpoint issuance time and digest from {bin_path}");
+    }
     // §2.3: the JSON is a *view*; the binary is the artifact. The view quotes
     // the digest so an announcement and the file can be compared by eye.
     let view = Json::obj(vec![
@@ -723,6 +836,13 @@ fn sign(args: &[String]) -> Result<(), String> {
     let cp = decode_checkpoint(&cp_bytes).map_err(|e| format!("{cp_path}: {e}"))?;
     let digest = cp.ws_digest();
 
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::metadata(&key_path).map_err(|e| format!("{key_path}: {e}"))?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+            return Err("signer secret must be a private regular file (0600 or stricter)".into());
+        }
+    }
     let sk = zeroize::Zeroizing::new(read_hex_file(&key_path)?);
     let enveloped = bloch_crypto::crypto::sign(&sk, &digest)
         .map_err(|e| format!("signing failed: {e:?}"))?;
@@ -1081,6 +1201,9 @@ fn explain_reject(r: &ws::EnvelopeReject, set: &SignerSet) -> String {
             "signer index {index} appears twice. One key must not count twice toward the \
              quorum — most likely the same signer's file was collected from two machines."
         ),
+        E::DuplicateSignerKey { first, second } => format!(
+            "arrangement slots {first} and {second} reuse one public key; each signer must have a distinct key."
+        ),
         E::QuorumNotReached { got, need } => format!(
             "{got} signature(s), but arrangement {} needs {need}. Collect {} more.",
             set.id,
@@ -1151,7 +1274,7 @@ fn probe_signatures(
 // ─── ws-verify ──────────────────────────────────────────────────────────────
 
 /// `ws-verify --envelope <file> --signer-set <file> --genesis <manifest>
-///  [--rpc <host:port>] [--now-epoch <n>]`
+///  [--rpc <host:port>] [--now-epoch <n>] [--require-fresh]`
 ///
 /// The exact check a booting node runs (`ws::verify_envelope` under the real
 /// hybrid verifier, against the chain identity the manifest fixes), minus the
@@ -1231,6 +1354,49 @@ fn show_partial(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckpointFreshness {
+    Fresh,
+    Stale,
+    Expired,
+}
+
+fn checkpoint_freshness(checkpoint_epoch: u64, now_epoch: u64) -> CheckpointFreshness {
+    let age = now_epoch.saturating_sub(checkpoint_epoch);
+    if age >= ws::WS_PERIOD_EPOCHS {
+        CheckpointFreshness::Expired
+    } else if age >= ws::WS_FRESH_EPOCHS {
+        CheckpointFreshness::Stale
+    } else {
+        CheckpointFreshness::Fresh
+    }
+}
+
+fn enforce_checkpoint_freshness(
+    checkpoint_epoch: u64,
+    freshness: Option<CheckpointFreshness>,
+    require_fresh: bool,
+) -> Result<(), String> {
+    if freshness == Some(CheckpointFreshness::Expired) {
+        return Err(format!(
+            "VERDICT: REFUSED FOR FRESH INSTALL — the envelope is cryptographically \
+             valid, but checkpoint epoch {checkpoint_epoch} is outside the {}-epoch \
+             weak-subjectivity window at the supplied current epoch. A booting fresh \
+             node refuses it; publish a newer signed checkpoint.",
+            ws::WS_PERIOD_EPOCHS,
+        ));
+    }
+    if require_fresh && freshness.is_none() {
+        return Err(
+            "VERDICT: FRESHNESS UNKNOWN — --require-fresh needs --now-epoch <n> or \
+             --rpc <host:port>; cryptographic validity alone is not fresh-install \
+             readiness."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn verify(args: &[String]) -> Result<(), String> {
     // Two read-only modes that need neither an arrangement nor a manifest,
     // because they answer questions asked at points in the ceremony where
@@ -1283,13 +1449,7 @@ fn verify(args: &[String]) -> Result<(), String> {
     println!("  hard stop         epoch {} (envelopes REFUSED after this — §6.3)", set.hard_stop());
     println!();
 
-    if let Err(e) = distinct_signer_keys(&set) {
-        println!("!!!! UNSOUND ARRANGEMENT — DO NOT TRUST THIS ENVELOPE");
-        println!("     {e}");
-        println!("     ws::verify_envelope will still ACCEPT it; the flaw is in the");
-        println!("     arrangement, not the signatures. Refuse the arrangement.");
-        println!();
-    }
+    distinct_signer_keys(&set)?;
 
     // The same shape gate a booting node runs (`ws_boot::boot`, NEW-2): the
     // §6 phases are policy, and an arrangement matching neither is refused
@@ -1302,6 +1462,9 @@ fn verify(args: &[String]) -> Result<(), String> {
             ws_boot::shape_policy_refusal(&set, &set_path),
         ));
     };
+
+    ws_boot::arrangement_window(&set, cp.epoch).map_err(|(adopted, stop)|
+        format!("VERDICT: REFUSED — checkpoint epoch {} is outside arrangement window {adopted}..={stop}", cp.epoch))?;
 
     println!("SIGNATURES  ({} listed)", env.signatures.len());
     let verdicts = probe_signatures(&env, &set, network_id, &genesis_root);
@@ -1335,16 +1498,20 @@ fn verify(args: &[String]) -> Result<(), String> {
             None => None,
         },
     };
+    let require_fresh = args.iter().any(|arg| arg == "--require-fresh");
     let window_days = ws::WS_PERIOD_EPOCHS / ws::EPOCHS_PER_DAY;
-    match now_epoch {
-        Some(now) => {
+    let freshness = now_epoch.map(|now| checkpoint_freshness(cp.epoch, now));
+    match (now_epoch, freshness) {
+        (Some(now), Some(freshness)) => {
             let age = now.saturating_sub(cp.epoch);
-            let state = if age >= ws::WS_PERIOD_EPOCHS {
-                "EXPIRED — a fresh node given this checkpoint would STILL refuse to sync"
-            } else if age >= ws::WS_FRESH_EPOCHS {
-                "STALE — inside the window but past the freshness threshold; publish a newer one"
-            } else {
-                "FRESH"
+            let state = match freshness {
+                CheckpointFreshness::Expired => {
+                    "EXPIRED — a fresh node given this checkpoint would STILL refuse to sync"
+                }
+                CheckpointFreshness::Stale => {
+                    "STALE — inside the window but past the freshness threshold; publish a newer one"
+                }
+                CheckpointFreshness::Fresh => "FRESH",
             };
             println!(
                 "FRESHNESS  epoch {} vs now {now}: age {age} of {} epochs (~{window_days} days) — {state}",
@@ -1352,11 +1519,12 @@ fn verify(args: &[String]) -> Result<(), String> {
                 ws::WS_PERIOD_EPOCHS
             );
         }
-        None => println!(
+        (None, None) => println!(
             "FRESHNESS  not evaluated (pass --rpc <host:port> or --now-epoch <n>). The window \
              is {} epochs, ~{window_days} days.",
             ws::WS_PERIOD_EPOCHS
         ),
+        _ => unreachable!("freshness exists exactly when a clock exists"),
     }
     println!();
 
@@ -1371,6 +1539,7 @@ fn verify(args: &[String]) -> Result<(), String> {
         p_min_external,
     ) {
         Ok(ok) => {
+            enforce_checkpoint_freshness(cp.epoch, freshness, require_fresh)?;
             if ok.arrangement_past_review {
                 println!(
                     "WARNING: the arrangement is past its 12-month review deadline (epoch {}, \
@@ -1411,6 +1580,124 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn audit_release_freshness_matches_the_boot_window_boundary() {
+        let checkpoint = 1_536;
+        assert_eq!(
+            checkpoint_freshness(checkpoint, checkpoint),
+            CheckpointFreshness::Fresh,
+        );
+        assert_eq!(
+            checkpoint_freshness(checkpoint, checkpoint + ws::WS_FRESH_EPOCHS),
+            CheckpointFreshness::Stale,
+        );
+        assert_eq!(
+            checkpoint_freshness(checkpoint, checkpoint + ws::WS_PERIOD_EPOCHS - 1),
+            CheckpointFreshness::Stale,
+        );
+        assert_eq!(
+            checkpoint_freshness(checkpoint, checkpoint + ws::WS_PERIOD_EPOCHS),
+            CheckpointFreshness::Expired,
+        );
+    }
+
+    #[test]
+    fn audit_future_checkpoint_does_not_underflow_its_freshness_age() {
+        assert_eq!(
+            checkpoint_freshness(100, 99),
+            CheckpointFreshness::Fresh,
+        );
+    }
+
+    #[test]
+    fn audit_release_gate_refuses_expired_or_unclocked_required_artifacts() {
+        let expired = enforce_checkpoint_freshness(
+            1_536,
+            Some(CheckpointFreshness::Expired),
+            false,
+        )
+        .unwrap_err();
+        assert!(expired.contains("REFUSED FOR FRESH INSTALL"), "{expired}");
+        let unknown = enforce_checkpoint_freshness(1_536, None, true).unwrap_err();
+        assert!(unknown.contains("FRESHNESS UNKNOWN"), "{unknown}");
+        assert!(
+            enforce_checkpoint_freshness(
+                1_536,
+                Some(CheckpointFreshness::Stale),
+                true,
+            )
+            .is_ok(),
+            "stale is a publication warning but remains inside the boot window",
+        );
+    }
+
+    #[test]
+    fn audit_publication_registry_coordinates_prefixes_and_concurrent_issuance() {
+        let base = tmp("registry");
+        let registry = Path::new(&base).join("publications");
+        let original = WeakSubjectivityCheckpoint {
+            version: WS_FORMAT_VERSION, network_id: 1, genesis_root: [1; 32], epoch: 64,
+            block_root: [2; 32], state_root: [3; 32], validator_set_root: [0; 32],
+            issued_at: 123, signer_set_id: 3,
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = [123, 456].into_iter().map(|issued_at| {
+            let registry = registry.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                coordinate_publication(&registry, WeakSubjectivityCheckpoint { issued_at, ..original }, false).unwrap()
+            })
+        }).collect();
+        let artifacts: Vec<_> = threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+        assert_eq!(artifacts[0], artifacts[1], "concurrent prefixes must share one issuance/digest");
+        let canonical = artifacts[0];
+        assert_eq!(coordinate_publication(&registry, original, false).unwrap(), canonical);
+        let changed = WeakSubjectivityCheckpoint { state_root: [7; 32], ..original };
+        assert!(coordinate_publication(&registry, changed, false).is_err());
+        let explicit = WeakSubjectivityCheckpoint { issued_at: 999, ..original };
+        assert!(coordinate_publication(&registry, explicit, true).is_err());
+        assert_eq!(fs::read_dir(&registry).unwrap().count(), 1, "staging files are cleaned");
+        let artifact = fs::read_dir(&registry).unwrap().next().unwrap().unwrap().path();
+        fs::write(&artifact, b"incomplete").unwrap();
+        assert!(coordinate_publication(&registry, original, false).is_err());
+        assert_eq!(fs::read(&artifact).unwrap(), b"incomplete");
+    }
+
+    #[test]
+    fn audit_checkpoint_creation_refuses_invented_validator_root_before_rpc() {
+        let args = ["--genesis", "unused", "--rpc", "unused:1", "--epoch", "64",
+            "--signer-set-id", "3", "--out", "unused", "--validator-set-root"];
+        let mut args: Vec<String> = args.into_iter().map(String::from).collect();
+        args.push(hex32(&[7; 32]));
+        let error = checkpoint(&args).unwrap_err();
+        assert!(error.contains("nonzero --validator-set-root is unsupported"));
+    }
+
+    #[test]
+    fn audit_checkpoint_publication_reuses_original_digest_and_refuses_changes() {
+        let dir = tmp("publication-reuse");
+        let path = format!("{dir}/epoch.bin");
+        let original = WeakSubjectivityCheckpoint {
+            version: WS_FORMAT_VERSION, network_id: 1, genesis_root: [1; 32], epoch: 64,
+            block_root: [2; 32], state_root: [3; 32], validator_set_root: [0; 32],
+            issued_at: 123, signer_set_id: 3,
+        };
+        assert!(!publication_bytes(&path, original, false).unwrap().1);
+        fs::write(&path, original.canonical_serialize()).unwrap();
+        let mut later = original;
+        later.issued_at = 456;
+        let (reused, existing) = publication_bytes(&path, later, false).unwrap();
+        assert!(existing);
+        assert_eq!(reused.ws_digest(), original.ws_digest());
+        assert!(publication_bytes(&path, later, true).is_err());
+        later.state_root = [9; 32];
+        assert!(publication_bytes(&path, later, false).is_err());
+        assert_eq!(decode_checkpoint(&fs::read(&path).unwrap()).unwrap(), original);
+        fs::write(&path, vec![0; 156]).unwrap();
+        assert!(publication_bytes(&path, original, false).is_err());
     }
 
     /// The whole ceremony, files and all, against real hybrid crypto and the
@@ -1705,15 +1992,14 @@ mod tests {
         let one_signature =
             decode_partial_file(&fs::read(format!("{dir}/sig0")).unwrap()).unwrap().signature;
 
-        // ONE signer, ONE signature, listed at two indices: ACCEPTED.
+        // One signer listed twice cannot satisfy the quorum.
         let forged = CheckpointEnvelope {
             checkpoint: cp,
             signatures: vec![(0, one_signature.clone()), (2, one_signature)],
         };
-        assert!(
-            ws::verify_envelope(&forged, &bad, FIX_NET, &FIX_GEN, &WsHybridVerifier).is_ok(),
-            "the quorum counts distinct INDICES, not distinct KEYS — if this now fails, \
-             verify_envelope was hardened and this test should be inverted"
+        assert_eq!(
+            ws::verify_envelope(&forged, &bad, FIX_NET, &FIX_GEN, &WsHybridVerifier),
+            Err(ws::EnvelopeReject::DuplicateSignerKey { first: 0, second: 2 }),
         );
 
         // ...and the tooling refuses to assemble against it anyway.

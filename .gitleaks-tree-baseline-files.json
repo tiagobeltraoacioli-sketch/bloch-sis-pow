@@ -1,0 +1,8 @@
+{
+  "docs/audit/reproducers/validator-joining-network-2026-09-13.json": "06e6fd08dfc90e95af6c0877a07ef547b76382d1fa325dac009543ce0b173847",
+  "docs/audit/reproducers/validator-joining-network-protected-2026-09-13.json": "d77aeb38ccdc537d96070014a4a10748588e58f6a0f061e137b971a7740d9c9d",
+  "docs/audit/reproducers/validator-migration-batches-2026-09-13.json": "d75fe82efc63b0943346742de91bb5e1806faa2381922357e092888dc9da1a41",
+  "docs/audit/reproducers/validator-migration-identities-2026-09-13.json": "bd79685da2ac630d223ee53866dd2b5e0de6e988c07ca42111b512edb6df7807",
+  "docs/audit/reproducers/validator-monday-local-qualification-2026-09-13.json": "eca11b7d76161a66493da9aa2b4e23aba9ccf6c2df5236f45ccfb76083f12584",
+  "crates/bloch-crypto/tests/vectors/acvp-mldsa65-keygen-tc26.json": "d062ba074dda6ddf44b545e3612f82c36c231fe1f95cc5e5fc8c29a28f63b4f4"
+}

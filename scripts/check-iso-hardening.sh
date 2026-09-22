@@ -37,8 +37,20 @@ for cfg in bloch-os postern-desktop; do
   assert_eq "$cfg" networking.firewall.enable                       'true'
 done
 
+# The disk/appliance compositions do not import the installer profile, but the
+# shared base configuration enables sshd.  Their dedicated profile must turn it
+# back off.  cloud.nix is deliberately not evaluated here because it is still
+# an unwired design profile; its restricted exception is checked structurally.
+for cfg in bloch-os-attested bloch-os-attested-aarch64; do
+  assert_eq "$cfg" services.openssh.enable                          'false'
+  assert_eq "$cfg" services.openssh.openFirewall                    'false'
+  assert_eq "$cfg" services.openssh.settings.PermitRootLogin        '"no"'
+  assert_eq "$cfg" services.openssh.settings.PasswordAuthentication 'false'
+  assert_eq "$cfg" services.openssh.settings.KbdInteractiveAuthentication 'false'
+done
+
 if [ "$fail" -ne 0 ]; then
   echo "check-iso-hardening: COMPOSED image still carries installer-profile sshd/empty-password defaults" >&2
   exit 1
 fi
-echo "check-iso-hardening: composed ISO configs are hardened (sshd off, passwords locked, mining off)"
+echo "check-iso-hardening: composed ISO/appliance configs are hardened (sshd off, passwords locked, mining off)"

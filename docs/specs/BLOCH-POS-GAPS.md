@@ -21,11 +21,9 @@ nor implemented**. A fourth section lists defects in implemented code —
 things that exist and are wrong or divergent, which is a different kind of
 missing.
 
-The one-line summary, so nobody mistakes the state of the project: **the
-pure consensus crate is substantially built and tested; the node is a
-134-line skeleton; every I/O-shaped spec has zero corresponding code; and
-the two validation stacks inside the pure crate do not agree with each
-other.**
+The one-line summary below was true at creation time and is retained as
+historical context. It is not current status: the node and production
+transition landed, and the uncalled second validation stack was deleted.
 
 ---
 
@@ -90,11 +88,17 @@ under the two-reviewer rule.
 nine ambiguities and this is not among them. The registration exists only
 in the module doc and in commit `e1657ed`'s message. Until it is in the
 interfaces doc, the two-reviewer process has nothing to review.
-**Consumed by:** `BLOCH-L1-EXECUTION-PLAN.md` milestone X1 — the ruling
-(each component in, or explicitly ruled node-local) merges into the single
-StateRoots re-freeze.
+**Historical disposition:** `BLOCH-L1-EXECUTION-PLAN.md` milestone X1 planned
+a single `StateRoots` re-freeze. That plan was superseded by the concrete,
+append-only component registry described under GAP-5.
 
-### GAP-2 — two block-validation stacks with divergent consensus-visible error orders
+### GAP-2 — two block-validation stacks with divergent accepted sets (resolved)
+
+**Resolved:** the uncalled `derive::validate_block` stack was deleted; the
+comparison below is retained as historical evidence for that deletion. Error
+precedence itself is diagnostic and DoS-sensitive, not consensus data. The
+consensus defect was that the two stacks enforced different checks and could
+therefore disagree on acceptance.
 
 `derive::validate_block` (`derive.rs:426-505`) and
 `transition::apply_block` (`transition.rs:840+`) are two independent
@@ -155,7 +159,15 @@ comment must say it pins a fix.
 
 ### GAP-5 — the frozen `StateRoots` and the concrete tree disagree
 
-Frozen: `interfaces.rs:749-768` — `StateRoots` with **7** fields, one
+**Resolved as interface classification, 2026-09-17.** `StateRoots` is now
+documented in code and specs as a frozen 14-field compatibility DTO with no
+production implementation, not the exhaustive live schema. The concrete SMT
+exports the machine-readable, append-only `STATE_COMPONENT_TAGS` registry (30
+components); uniqueness and spec reconciliation consume that registry. No
+root bytes or accepted block changed.
+
+**Original observation (historical line numbers):** frozen
+`interfaces.rs:749-768` had `StateRoots` with **7** fields, one
 `participation_root`. Concrete: `state_root.rs` — **8** component tags
 (`TAG_PARTICIPATION_CURRENT` and `_PREVIOUS` separate; insertion at
 `state_root.rs:433-470`), fields on `ConsensusState`
@@ -183,8 +195,8 @@ path". Nothing has started.
   implemented Solana rule.
 - `DS_PROPOSE` exists in `params.rs` but the §6.1 domain-tag table in the
   spec had no row for it (interfaces doc §4.1). **Resolved 2026-09-05:** §6.1
-  now carries the complete 14-tag registry plus the state-tree marker bytes
-  and all 22 component tags.
+  now carries the complete 15-tag registry plus the state-tree marker bytes
+  and all 30 component tags through `TAG_FUNDED_VALIDATOR = 0x1E`.
 - `params.rs:98-108`: orphan doc-comments (merge residue), and
   `SLOT_SUBCOMMITTEE_SIZE`/`COMMITTEE_SIZE` are dead constants under the
   partition model; `sample.rs` is the retained legacy mechanism with no
@@ -192,11 +204,10 @@ path". Nothing has started.
 - `lib.rs:107-139`: three name collisions (`Checkpoint`, `FinalityState`,
   `ValidatorRecord`) deliberately visible, awaiting the integration
   decision.
-- `tests/e2e.rs` still runs every scenario against its own
-  `harness::RefTransition` (`e2e.rs:54`, `:411`) although the real
-  `transition.rs`/`produce.rs` have landed; the SWAP POINT markers
-  (`e2e.rs:27-29`) were never exercised. The e2e suite currently proves
-  the harness, not the product.
+- `tests/e2e.rs` still runs its historical trait scenarios against
+  `harness::RefTransition`. It is now labelled a reference harness, not a
+  second production validator. It proves the fixture rather than the product;
+  engine/transition tests own production proposal and self-validation coverage.
 - `transition.rs:1447`: the inactivity leak is *not* wired into the
   transition ("eventually the inactivity leak") — the arithmetic exists in
   `finality.rs`, nothing calls it on protracted non-finality.

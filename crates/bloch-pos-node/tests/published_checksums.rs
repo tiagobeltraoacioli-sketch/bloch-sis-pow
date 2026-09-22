@@ -109,6 +109,62 @@ fn the_published_carryover_digests_describe_the_shipped_files() {
     }
 }
 
+#[test]
+fn the_terminal_carryover_facts_match_ledger_documentation() {
+    use bloch_pos_committee::tokenomics_v4::{
+        split_g3_sat, CARRYOVER_MEASURED_UTXOS, CARRYOVER_TOTAL_BLOCH, SAT_PER_BLOCH,
+    };
+
+    let gz = repo_root().join("carryover.tsv.gz");
+    let output = Command::new("gzip")
+        .arg("-dc")
+        .arg(&gz)
+        .output()
+        .expect("gzip runs");
+    assert!(output.status.success(), "gzip failed on {}", gz.display());
+    let text = std::str::from_utf8(&output.stdout).expect("snapshot is UTF-8 TSV");
+
+    let mut rows = 0u64;
+    let mut g3_total = 0u128;
+    let mut split_rows = 0u128;
+    let mut remainder_rows = 0u64;
+    let mut zero_rows = 0u64;
+    let mut largest: Option<(u64, &str, u32, &str)> = None;
+    for line in text.lines() {
+        let mut fields = line.split('\t');
+        let txid = fields.next().expect("txid");
+        let vout: u32 = fields.next().expect("vout").parse().expect("canonical vout");
+        let value: u64 = fields.next().expect("value").parse().expect("canonical value");
+        let address = fields.next().expect("address");
+        assert!(fields.next().is_none(), "snapshot row has more than four fields");
+
+        rows += 1;
+        g3_total += u128::from(value);
+        split_rows += split_g3_sat(u128::from(value));
+        remainder_rows += u64::from((u128::from(value) * 100) % 21 != 0);
+        zero_rows += u64::from(value == 0);
+        let candidate = (value, txid, vout, address);
+        if largest.is_none_or(|current| {
+            value > current.0 || (value == current.0 && (txid, vout) < (current.1, current.2))
+        }) {
+            largest = Some(candidate);
+        }
+    }
+
+    let exact = split_g3_sat(g3_total);
+    assert_eq!(rows, CARRYOVER_MEASURED_UTXOS);
+    assert_eq!(g3_total, 381_074_400_000_000_000);
+    assert_eq!(exact, CARRYOVER_TOTAL_BLOCH * SAT_PER_BLOCH);
+    assert_eq!(remainder_rows, 111);
+    assert_eq!(exact - split_rows, 57);
+    assert_eq!(zero_rows, 1, "the historical anchor is the only zero-value row");
+    assert_eq!(
+        largest.expect("snapshot is non-empty").3,
+        "cb339d2ef2e502d36864689192891567ba87f91c",
+        "the deterministic dust recipient is the owner of the largest output"
+    );
+}
+
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }

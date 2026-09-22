@@ -56,11 +56,13 @@
 //! UNAUDITED until the independent third-party review (S2 / Coherence P2).
 //! Ship the tool; do not market the claim as audited.
 //!
-//! # Index convention (matches the P4.1 `Wallet::address_at` deliverable)
+//! # Default index convention (P4.1 single-key `Wallet`)
 //!
 //! index 0  == the wallet's BASE keypair (`generate_keypair_from_seed(seed[..32])`,
 //!             i.e. today's `Wallet::from_seed` address) — back-compat.
 //! index N>0 == `crypto::diversified_keypair(master_seed, N)`.
+//! HD wallet v3 instead diversifies index zero too; use
+//! `DisclosureBundle::create_with_convention` with `HdWalletV3` for that family.
 
 use crate::address::{Address, Network};
 use crate::crypto;
@@ -87,6 +89,29 @@ pub const MAX_TEXT_LEN: usize = 4096;
 const MAX_PUBKEY_LEN: usize = 8 * 1024;
 /// Upper bound on a b64-decoded signature (hybrid enveloped sig is ~4.6 KB).
 const MAX_SIG_LEN: usize = 16 * 1024;
+/// Padded standard Base64 needs exactly four characters per three decoded
+/// bytes, rounded up. Preflight these encoded lengths before asking the
+/// decoder to allocate; the decoded-length checks remain authoritative.
+const MAX_PUBKEY_B64_LEN: usize = 4 * ((MAX_PUBKEY_LEN + 2) / 3);
+const MAX_SIG_B64_LEN: usize = 4 * ((MAX_SIG_LEN + 2) / 3);
+
+fn preflight_base64_len(
+    encoded: &str,
+    max_encoded_len: usize,
+    index: u32,
+    field: &str,
+) -> Result<(), DisclosureError> {
+    if encoded.len() > max_encoded_len {
+        return Err(DisclosureError::Invalid(format!(
+            "entry {}: {} base64 length {} exceeds pre-decode limit {}",
+            index,
+            field,
+            encoded.len(),
+            max_encoded_len,
+        )));
+    }
+    Ok(())
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -101,8 +126,8 @@ pub struct DisclosureEntry {
     pub address: String,
     /// The enveloped hybrid public key, base64.
     pub pubkey_b64: String,
-    /// Signature over the bundle's canonical digest, made with THIS index's
-    /// secret key. Base64.
+    /// Suite-enveloped hybrid signature over the bundle's canonical digest,
+    /// made with THIS index's secret key. Base64.
     pub sig_b64: String,
 }
 
@@ -154,10 +179,19 @@ pub enum DisclosureError {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Derivation helper (index convention shared with P4.1)
+// Derivation helper (historical P4.1 default plus explicit HD family)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Keypair at `index` under the shared wallet convention:
+/// Existing wallet families deliberately retain different index-zero keys.
+/// Select the family explicitly when disclosing HD v3 addresses; this does not
+/// change either wallet's derivation or the signed bundle format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisclosureKeyConvention {
+    SingleKeyWallet,
+    HdWalletV3,
+}
+
+/// Keypair at `index` under the historical single-key wallet convention:
 /// 0 = base keypair (`seed[..32]`, i.e. `Wallet::from_seed`); N>0 = diversified.
 ///
 /// `master_seed` is the 64-byte BIP39 seed (`SeedPhrase::to_seed_bytes()`);
@@ -165,7 +199,16 @@ pub enum DisclosureError {
 pub fn keypair_at(master_seed: &[u8], index: u32)
     -> Result<(Vec<u8>, Vec<u8>), crypto::CryptoError>
 {
-    if index == 0 {
+    keypair_at_with_convention(master_seed, index, DisclosureKeyConvention::SingleKeyWallet)
+}
+
+pub fn keypair_at_with_convention(master_seed: &[u8], index: u32, convention: DisclosureKeyConvention)
+    -> Result<(Vec<u8>, Vec<u8>), crypto::CryptoError>
+{
+    if master_seed.len() < 32 {
+        return Err(crypto::CryptoError::InvalidKey("master seed too short (need >= 32 bytes)".into()));
+    }
+    if index == 0 && convention == DisclosureKeyConvention::SingleKeyWallet {
         crypto::generate_keypair_from_seed(&master_seed[..32.min(master_seed.len())])
     } else {
         crypto::diversified_keypair(master_seed, index)
@@ -221,6 +264,17 @@ impl DisclosureBundle {
         purpose: &str,
         audience: &str,
     ) -> Result<Self, DisclosureError> {
+        Self::create_with_convention(master_seed, indices, network, purpose, audience,
+            DisclosureKeyConvention::SingleKeyWallet)
+    }
+
+    /// Explicit wallet-family selection. HD v3 uses diversified derivation even
+    /// at zero. Verification proves control of the included addresses, not the
+    /// derivation convention or common-seed origin; the wire format is unchanged.
+    pub fn create_with_convention(
+        master_seed: &[u8], indices: &[u32], network: Network, purpose: &str,
+        audience: &str, convention: DisclosureKeyConvention,
+    ) -> Result<Self, DisclosureError> {
         if master_seed.len() < 32 {
             return Err(DisclosureError::Crypto("master seed too short (need >= 32 bytes)".into()));
         }
@@ -242,7 +296,7 @@ impl DisclosureBundle {
         // path still wipes them).
         let mut keyed: Vec<(u32, Vec<u8>, Zeroizing<Vec<u8>>)> = Vec::with_capacity(sorted.len());
         for &index in &sorted {
-            let (pk, sk) = keypair_at(master_seed, index)
+            let (pk, sk) = keypair_at_with_convention(master_seed, index, convention)
                 .map_err(|e| DisclosureError::Crypto(e.to_string()))?;
             keyed.push((index, pk, Zeroizing::new(sk)));
         }
@@ -286,6 +340,23 @@ impl DisclosureBundle {
     /// See the module docs for what a successful verify does and does NOT
     /// prove (no completeness, no same-seed claim).
     pub fn verify(&self) -> Result<VerifiedDisclosure, DisclosureError> {
+        self.verify_with(crypto::verify)
+    }
+
+    /// Verify a bundle with strict suite envelopes and canonical primitives.
+    ///
+    /// Version 1 documents both entry keys and signatures as enveloped. This
+    /// opt-in policy enforces that contract and rejects Falcon's alternate
+    /// zero-padded representation. [`Self::verify`] remains compatibility
+    /// preserving for disclosure files already distributed to auditors.
+    pub fn verify_canonical(&self) -> Result<VerifiedDisclosure, DisclosureError> {
+        self.verify_with(crypto::verify_enveloped_canonical)
+    }
+
+    fn verify_with(
+        &self,
+        verify_signature: fn(&[u8], &[u8], &[u8]) -> bool,
+    ) -> Result<VerifiedDisclosure, DisclosureError> {
         if self.version != DISCLOSURE_VERSION {
             return Err(DisclosureError::UnsupportedVersion(self.version));
         }
@@ -321,6 +392,7 @@ impl DisclosureBundle {
             }
             last_index = Some(e.index);
 
+            preflight_base64_len(&e.pubkey_b64, MAX_PUBKEY_B64_LEN, e.index, "pubkey")?;
             let pk = B64.decode(&e.pubkey_b64)
                 .map_err(|err| DisclosureError::Invalid(format!("entry {}: bad pubkey b64: {}", e.index, err)))?;
             if pk.is_empty() || pk.len() > MAX_PUBKEY_LEN {
@@ -350,13 +422,14 @@ impl DisclosureBundle {
         let digest = bundle_digest(
             network, &self.purpose, &self.audience, &self.created_at, &digest_input);
         for (e, (_, pk)) in self.entries.iter().zip(&digest_input) {
+            preflight_base64_len(&e.sig_b64, MAX_SIG_B64_LEN, e.index, "signature")?;
             let sig = B64.decode(&e.sig_b64)
                 .map_err(|err| DisclosureError::Invalid(format!("entry {}: bad sig b64: {}", e.index, err)))?;
             if sig.is_empty() || sig.len() > MAX_SIG_LEN {
                 return Err(DisclosureError::Invalid(format!(
                     "entry {}: signature length {} out of bounds", e.index, sig.len())));
             }
-            if !crypto::verify(pk, &digest, &sig) {
+            if !verify_signature(pk, &digest, &sig) {
                 return Err(DisclosureError::SignatureInvalid { index: e.index });
             }
         }
@@ -478,6 +551,65 @@ mod tests {
     }
 
     #[test]
+    fn canonical_verify_rejects_raw_and_padded_signature_encodings() {
+        let mut bundle = DisclosureBundle::create(
+            &SEED,
+            &[7],
+            Network::Testnet,
+            "canonical encoding audit",
+            "Acme Auditors LLP",
+        )
+        .unwrap();
+        let pk = B64.decode(&bundle.entries[0].pubkey_b64).unwrap();
+        let digest = bundle_digest(
+            Network::Testnet,
+            &bundle.purpose,
+            &bundle.audience,
+            &bundle.created_at,
+            &[(7, pk)],
+        );
+        let (_, sk) = keypair_at(&SEED, 7).unwrap();
+        let padded_len = crypto::SUITE_HEADER_LEN
+            + crypto::MLDSA_SIG_LEN
+            + crypto::falcon::padded_signature_len();
+        let compact = (0..64)
+            .map(|_| crypto::sign(&sk, &digest).unwrap())
+            .find(|candidate| {
+                candidate.len() < padded_len
+                    && !candidate[crypto::SUITE_HEADER_LEN..].starts_with(&[0xb1, 0x0c])
+            })
+            .expect("fixture must permit both raw fallback and Falcon padding");
+        bundle.entries[0].sig_b64 = B64.encode(&compact);
+
+        assert!(bundle.verify().is_ok());
+        assert!(bundle.verify_canonical().is_ok());
+
+        let mut raw = bundle.clone();
+        raw.entries[0].sig_b64 = B64.encode(&compact[crypto::SUITE_HEADER_LEN..]);
+        assert!(
+            raw.verify().is_ok(),
+            "compatibility verifier retains mixed enveloped-key/raw-signature fallback"
+        );
+        assert!(matches!(
+            raw.verify_canonical(),
+            Err(DisclosureError::SignatureInvalid { index: 7 })
+        ));
+
+        let mut padded_signature = compact;
+        padded_signature.resize(padded_len, 0);
+        let mut padded = bundle;
+        padded.entries[0].sig_b64 = B64.encode(&padded_signature);
+        assert!(
+            padded.verify().is_ok(),
+            "compatibility verifier retains padded Falcon acceptance"
+        );
+        assert!(matches!(
+            padded.verify_canonical(),
+            Err(DisclosureError::SignatureInvalid { index: 7 })
+        ));
+    }
+
+    #[test]
     fn bundle_contains_no_secret_material() {
         let bundle = make_bundle();
         let json = serde_json::to_string(&bundle).unwrap();
@@ -551,6 +683,35 @@ mod tests {
         bundle.entries[0].sig_b64 = B64.encode(&sig);
         assert!(matches!(bundle.verify(),
             Err(DisclosureError::SignatureInvalid { index: 0 })));
+    }
+
+    #[test]
+    fn oversized_base64_fields_fail_before_decode_at_exact_encoded_boundaries() {
+        assert!(preflight_base64_len(
+            &"A".repeat(MAX_PUBKEY_B64_LEN),
+            MAX_PUBKEY_B64_LEN,
+            7,
+            "pubkey",
+        ).is_ok());
+        assert!(preflight_base64_len(
+            &"A".repeat(MAX_SIG_B64_LEN),
+            MAX_SIG_B64_LEN,
+            7,
+            "signature",
+        ).is_ok());
+
+        let base = make_bundle();
+        let mut oversized_pubkey = base.clone();
+        oversized_pubkey.entries[0].pubkey_b64 = "!".repeat(MAX_PUBKEY_B64_LEN + 1);
+        let pubkey_error = oversized_pubkey.verify().unwrap_err().to_string();
+        assert!(pubkey_error.contains("pubkey base64 length"));
+        assert!(!pubkey_error.contains("bad pubkey b64"));
+
+        let mut oversized_signature = base;
+        oversized_signature.entries[0].sig_b64 = "!".repeat(MAX_SIG_B64_LEN + 1);
+        let signature_error = oversized_signature.verify().unwrap_err().to_string();
+        assert!(signature_error.contains("signature base64 length"));
+        assert!(!signature_error.contains("bad sig b64"));
     }
 
     #[test]

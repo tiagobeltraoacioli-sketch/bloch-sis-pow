@@ -407,13 +407,17 @@ impl GatewayLedger {
             native_message,
             message,
         };
+        let verification_gas = gas_limit
+            .checked_sub(gas)
+            .ok_or(NativeError::ArithmeticOverflow)?;
+        let route_state = self.routes.get_mut(&deposit.route).ok_or(Error::UnknownRoute)?;
         let mut receipt = self.native.apply(tx, witnesses, height, &scoped, gas)?;
-        receipt.gas_used += gas_limit - gas;
+        debug_assert!(receipt.gas_used <= gas);
+        receipt.gas_used = receipt
+            .gas_used
+            .saturating_add(verification_gas);
         // Nothing below can reject: commit supply and replay accounting together.
-        self.routes
-            .get_mut(&deposit.route)
-            .expect("validated route")
-            .imported = imported;
+        route_state.imported = imported;
         self.events.insert(event);
         self.imports.insert(
             key,
@@ -478,12 +482,15 @@ impl GatewayLedger {
             native_message,
             message,
         };
+        let verification_gas = gas_limit
+            .checked_sub(gas)
+            .ok_or(NativeError::ArithmeticOverflow)?;
+        let state = self.routes.get_mut(&request.route).ok_or(Error::UnknownRoute)?;
         let mut receipt = self.native.apply(tx, witnesses, height, &scoped, gas)?;
-        receipt.gas_used += gas_limit - gas;
-        let state = self
-            .routes
-            .get_mut(&request.route)
-            .expect("validated route");
+        debug_assert!(receipt.gas_used <= gas);
+        receipt.gas_used = receipt
+            .gas_used
+            .saturating_add(verification_gas);
         state.burned = burned;
         state.next_release_nonce = next_nonce;
         self.releases
@@ -713,16 +720,19 @@ fn verify_quorum(
         return Err(Error::Unauthorized);
     }
     charge(gas, 200)?;
-    let mut accepted = 0;
+    let mut accepted = 0u16;
     for (key, sig) in config.committee.iter().zip(approvals) {
         if sig.is_empty() {
             continue;
         }
-        charge(gas, 1000u64.saturating_add(words(key.len() + sig.len())))?;
+        charge(
+            gas,
+            1000u64.saturating_add(words(key.len().saturating_add(sig.len()))),
+        )?;
         if !verifier.verify_pq(message, key, sig) {
             return Err(Error::Unauthorized);
         }
-        accepted += 1;
+        accepted = accepted.saturating_add(1);
     }
     if accepted < config.threshold {
         return Err(Error::Unauthorized);

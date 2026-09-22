@@ -12,7 +12,7 @@ services:
     # published image, pin it by digest (`your/repo:tag@sha256:<digest>`),
     # not by a mutable tag — a tag can be repointed after you have verified
     # its content once, a digest cannot.
-    image: bloch:local            # replace with your published image
+    image: REPLACE_WITH_DIGEST_PINNED_IMAGE  # operator image required; cannot be pulled
     command:
       # MED-10 fix: RPC bound to loopback INSIDE the container, not
       # 0.0.0.0. This is the "hardened" reference compose — a node whose RPC

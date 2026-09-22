@@ -1,0 +1,78 @@
+{
+  "recorded_utc": "2026-09-15T00:34:42.344751+00:00",
+  "source_base_commit": "43b7bbcd43cb542dfe98a1de778860273c01acce",
+  "tested_files_sha256": {
+    "crates/bloch-pos-node/src/validator_payout.rs": "0c3f286cc497da3afc356f5a5883eec706ea70e6fd8c12da5caf99238ce73e13",
+    "crates/bloch-pos-node/src/engine/validator_admission_tests.rs": "8c2718b5ba759e16eec0413d839117ecb0d20ea1cafb53bf57349c1654f8e115",
+    "crates/bloch-pos-node/tests/validator_payout_cli.rs": "2e4f0dcdc31048b5af9ab7226ec38230c96cb8c81af5379d8b88a54a502bd5da",
+    "scripts/rehearse-validator-admission.py": "2992e7e32d51406665b57f74debb74cba2c073c1f11f6e8db3c56faf6faf6b65"
+  },
+  "scope": "Disposable devnet lifecycle with two in-process engines and a separately built CLI process; not mainnet settlement or an independent-process partition test.",
+  "commands": [
+    "cargo +1.94.1 test --locked -p bloch-pos-node --test validator_payout_cli --test validator_deposit_cli",
+    "CARGO_PROFILE_TEST_OPT_LEVEL=2 python3 scripts/rehearse-validator-admission.py"
+  ],
+  "payout_cli_tests": {
+    "passed": 6,
+    "failed": 0
+  },
+  "deposit_cli_regressions": {
+    "passed": 1,
+    "failed": 0
+  },
+  "lifecycle_and_invalid_mempool_tests": {
+    "passed": 2,
+    "failed": 0
+  },
+  "randao_renewal": {
+    "passed": 1,
+    "failed": 0
+  },
+  "node_clippy_ratchet": {
+    "result": "passed",
+    "existing_panic_sites": 8,
+    "arithmetic": 0,
+    "other": 0
+  },
+  "node_relay_minimum_sat": 1000,
+  "minimum_boundary_test": "999 refused before key unlock; 1000 accepted",
+  "payout_workflow": [
+    "CLI prepare",
+    "CLI inspect",
+    "CLI sealed sign",
+    "CLI signed inspect",
+    "three signed mutations rejected at signature verification",
+    "node mempool admission",
+    "both engines apply spend",
+    "finality past spend epoch",
+    "replay state equality"
+  ],
+  "evidence": {
+    "deposit_txid": "9c481836b12a2342a5b0a48c0ed8b9923bb66d9c180bd40e4cf649f456b3f0bd",
+    "withdrawal_txid": "a460678462c8c4e5a313783fc9606919c2df00dd1026fb37c850420b6c01ba56",
+    "spend_txid": "07006e9342b64482dcf6b8b6f1aba9c7cd188d2448ccaf5f4d0968571aa3425d",
+    "spend_slot": 67010,
+    "spend_block": "f1987d9029c5b1f0397a6b2866e7948575c1448e668f2becda1b1e9eb7867677",
+    "head_block": "069eeacfad812ef91326b543db84bbc2e83cd25f10d2b8b1d0c8c4d6303994be",
+    "state_root": "d775fd33985d21123f01c3daf13a349f34b715e133b70491c4779bd2b2e3bda1",
+    "finalized_epoch": 2096,
+    "finalized_root": "f4d8ada7e763bfb36b53b493a7a5eeb309f1cdb4bfda8e6bbbea913f98c2b9b6"
+  },
+  "shipping_consensus_changed": false,
+  "production_keys_generated": false,
+  "mainnet_funds_sent": false,
+  "logs": {
+    "bloch-payout-full-rehearsal.log": {
+      "sha256": "e260d7ae7a2cc7dd242a87dfa1fcd746621a8c9569071b9e6a130d171dd120e3",
+      "bytes": 1534202
+    },
+    "bloch-payout-followup-tests.log": {
+      "sha256": "18d05ddf45a94824a1c9e3b949f9c93b3d8123fa4af2f6459711b80d46126321",
+      "bytes": 5663
+    },
+    "bloch-payout-followup-clippy.jsonl": {
+      "sha256": "1b43a95f77abe2643d39c0724220df33bf0db1b43578fb4059e2d9aa46b082c9",
+      "bytes": 900769
+    }
+  }
+}

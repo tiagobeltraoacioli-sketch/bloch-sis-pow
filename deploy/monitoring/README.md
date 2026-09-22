@@ -2,12 +2,9 @@
 
 # Monitoring — what the node exports, what it does not, and what to scrape
 
-This closes CRIT-2/HIGH-3 from the Round-2/3 audits: the node has had
-`/health` and `/metrics` since commit range `6b5c098..HEAD` (`metrics.rs`),
-but nothing scraped them, nothing alerted on them, and two counters an
-operator would actually need (finality-rewind refusals, equivocations) are
-not exported at all. This directory is the missing scrape/alert
-configuration; it does not touch the node binary.
+This directory supplies scrape and alert configuration for the exported node
+metrics. Deploying and wiring Alertmanager remain operator actions; checked-in
+rules alone do not establish monitoring coverage on any live host.
 
 ## Where the metric names come from
 
@@ -21,7 +18,7 @@ with the exporter is worse than none.
 
 | Series | Kind | Meaning |
 |---|---|---|
-| `bloch_pos_process_starts_total` | counter | Incremented once at boot; `resets()` over it is the restart/OOM-loop alarm |
+| `bloch_pos_process_starts_total` | counter | Incremented once at boot; use changes of `process_start_unix` to observe restarts (a constant counter reset to 1 cannot expose them reliably) |
 | `bloch_pos_store_append_failures_total` | counter | Block-log/index writes that failed (disk-full precursor) |
 | `bloch_pos_validator_not_started_total` | counter | Keystore present but validator could not arm |
 | `bloch_pos_finality_stalls_total` | counter | Edges into a finality stall (not currently alerted on directly — see `rules.yml`'s use of `last_finality_advance_unix` instead, which needs no rate window) |
@@ -35,8 +32,8 @@ with the exporter is worse than none.
 | `bloch_pos_peer_count` | gauge | Peers across live transports |
 | `bloch_pos_mempool_size` | gauge | Mempool entries |
 | `bloch_pos_is_syncing` | gauge | 1 while behind and requesting blocks |
-| `bloch_pos_validator_active` | gauge | 1 when this node performs validator duties |
-| `bloch_pos_last_finality_advance_unix` | gauge | Unix seconds finality last advanced (stamped to boot time at start, so never 0 on a live node) |
+| `bloch_pos_validator_active` | gauge | 1 when its registered key is epoch-eligible and startup/doppelganger gates are open; not proof of a signed duty |
+| `bloch_pos_last_finality_advance_unix` | gauge | Zero during startup; initialized after replay/WS checks, then updated when finality advances |
 | `bloch_pos_heartbeat_unix` | gauge | Unix seconds of the slot loop's latest turn; 0 during boot/replay — what `/health` checks |
 | `bloch_pos_data_dir_fs_free_bytes` | gauge | Free bytes on the data dir's filesystem (no matching `*_size_bytes`, so no percentage from this alone) |
 | `bloch_pos_process_start_unix` | gauge | Process start time, Prometheus convention |
@@ -47,22 +44,45 @@ with the exporter is worse than none.
 for the exact contract. Both endpoints are loopback-bound and off unless
 `--metrics-port` is explicitly passed; there is no default port (`main.rs`)
 — **the operator must set an actual port in `prometheus.yml` and confirm it
-matches the running unit file**, or the scrape config silently scrapes
-nothing.
+matches the running unit file**. A failed scrape triggers the availability
+alert; the remaining rules cannot observe an unreachable endpoint.
 
-## What this alert set needs but the node does not export
+The node refuses an enabled non-loopback `--metrics-bind` unless the command
+also carries `--allow-public-metrics`. That flag is an exposure acknowledgement,
+not authentication: a deliberately routable endpoint still needs a firewall
+and must not be treated as safe for the public internet.
 
-These are named in `rules.yml`, marked disabled, and listed here so a reader
-of either file sees the same gap:
+## Additional exported signals and alert coverage
 
-| Series (expected name) | Why it matters | Status |
-|---|---|---|
-| `bloch_pos_finality_rewinds_refused_total` | Round-3 audit M-1: the engine's downward finality ratchet (`engine.rs:2958`) refuses a rewind internally but never exports the count — the one signal that would reveal a silent, permanent, self-inflicted partition | **expected from patch node-b** |
-| `bloch_pos_equivocations_observed_total` | Round-3 audit NEW-1: no counter distinguishes an attacker filling the attestation `Hold` pool with unsigned frames, or a genuine equivocation, from ordinary traffic | **expected from patch node-b** |
-| `bloch_pos_keystore_sealed` | No runtime signal distinguishes a sealed (`BPOSKEY2`) from an opted-in-plaintext (`BPOSKEY1`) keystore; relevant ahead of the epoch-2700 flag day (`deploy/FLAG-DAY-EPOCH-2700.md`) | **expected from patch node-b** |
+The current exporter includes `bloch_pos_finality_rewinds_refused_total`,
+`bloch_pos_equivocations_observed_total` and `bloch_pos_keystore_sealed`.
+Their rules are active; previous claims that these metrics did not exist were
+stale. Rules also cover exposed write-failure counters, unavailable scrapes, missing
+or stale heartbeat, inactive expected validators and observed restart loops.
 
-Until these land, verify the conditions they would alert on manually — the
-flag-day and host-loss runbooks in this directory's parent describe how.
+Set the node scrape target's `role` label to `validator` or `archival`.
+Prometheus external labels are not part of local expression evaluation.
+Validator activity and sealed-key alerts must not fire for observer-only nodes.
+The inactive-validator rule grants 20 minutes of startup grace plus five minutes
+pending. These are starting thresholds to qualify against the fleet, not an SLA.
+`validator_active` now refreshes each engine turn: the loaded key must match
+an active registry record at the current wall epoch and boot/doppelganger gates
+must allow participation. A value of one does not establish that a duty was
+selected, signed, included, or allowed by durable signing watermarks. The
+finality-stall rule excludes the zero timestamp exported before replay ends.
+The sealed-key rule also waits for the first engine heartbeat, which is
+published only after the keystore gauge has been initialized.
+
+The store-append failure counter is **best-effort**: the node exits immediately
+after incrementing it, and a 15-second scrape may never observe that increment.
+Keep filesystem-capacity, scrape-unavailability and restart alerts, and preserve
+process logs; a zero or absent append-failure series does not prove successful
+persistence.
+
+Exact missed-duty accounting remains open: neither `validator_active` nor head
+lag proves whether a particular duty was scheduled and signed. Do not label
+those metrics as missed attestations. Validate rules with
+`promtool check rules rules.yml` and test paging delivery before relying on them.
 
 ## What to scrape alongside the node: `node_exporter`
 

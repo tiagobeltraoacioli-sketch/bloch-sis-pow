@@ -146,10 +146,10 @@ of both halves is deterministic/integer and therefore consensus-safe.
   key (longer seeds are truncated, not hashed — caller's responsibility).
 - Installs a **thread-local ChaCha20-seeded RNG** that overrides PQClean's
   `PQCRYPTO_RUST_randombytes` for the duration of the two `keypair()` calls, via
-  the **vendored fork** of `pqcrypto-internals` (`with_seeded_rng`,
+  the **vendored fork** of `pqcrypto-internals` (`with_seeded_rng_scope`,
   `crates/pqcrypto-internals/src/lib.rs`; wired through `[patch.crates-io]` in
   the root `Cargo.toml`).
-- An RAII guard restores the OS RNG on drop, so the override does not leak into
+- The scoped API owns cleanup and restores the OS RNG, so the override does not leak into
   later `generate_keypair()` calls (`crypto/mod.rs:78`, test at `254-262`).
 - Guarantee: same 32-byte seed ⇒ **byte-identical** `(pk, sk)` on any platform
   supported by `pqcrypto-mldsa 0.1`. ML-DSA keygen is deterministic-from-seed

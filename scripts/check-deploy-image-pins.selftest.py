@@ -9,6 +9,8 @@ configs happen to be pinned today:
   * a bare-tag `image:` (the MED-7 shape) goes red, BY NAME (file:line in the
     output);
   * a `@sha256:`-pinned image, and a recognised placeholder line, stay green;
+  * YAML anchors, aliases and merge keys fail closed rather than bypassing the
+    explicit image-scalar scan;
   * a `deploy/` directory that does not exist at all is refused, not skipped.
 
 Run: python3 scripts/check-deploy-image-pins.selftest.py
@@ -43,13 +45,14 @@ LOCAL_BUILD_COMPOSE = """\
 services:
   node1:
     build: { context: .., dockerfile: Dockerfile }
+    pull_policy: never
     image: bloch:latest  # local build only: docker build -t bloch . — never pulled from a registry
 """
 
 PLACEHOLDER_COMPOSE = """\
 services:
   node:
-    image: bloch:local            # replace with your published image
+    image: REPLACE_WITH_DIGEST_PINNED_IMAGE
 """
 
 MIXED_COMPOSE = """\
@@ -111,8 +114,8 @@ def case_pinned_passes() -> str | None:
 
 def case_placeholder_passes() -> str | None:
     with tempfile.TemporaryDirectory() as tmp:
-        write_deploy(tmp, "docker-compose.yml", PLACEHOLDER_COMPOSE)
-        write_deploy(tmp, "docker-compose.local.yml", LOCAL_BUILD_COMPOSE)
+        write_deploy(tmp, "template.yml", PLACEHOLDER_COMPOSE)
+        write_deploy(tmp, "docker-compose.yml", LOCAL_BUILD_COMPOSE)
         r = run_checker(tmp)
         if r.returncode != 0:
             return "recognised placeholder was rejected:\n%s%s" % (r.stdout, r.stderr)
@@ -159,12 +162,96 @@ def case_nested_yaml_is_scanned() -> str | None:
     return None
 
 
+def case_bypass_regressions() -> str | None:
+    cases = {
+        "comment digest": UNPINNED_COMPOSE.rstrip() + " # @sha256:" + DIGEST + "\n",
+        "TODO comment": UNPINNED_COMPOSE.rstrip() + " # TODO: pin later\n",
+        "user comment": UNPINNED_COMPOSE.rstrip() + " # YOUR_USER\n",
+        "local comment": UNPINNED_COMPOSE.rstrip() + " # local build only\n",
+        "trailing digest bytes": PINNED_COMPOSE.rstrip() + "suffix\n",
+        "missing never": LOCAL_BUILD_COMPOSE.replace("    pull_policy: never\n", ""),
+        "missing build": LOCAL_BUILD_COMPOSE.replace("    build: { context: .., dockerfile: Dockerfile }\n", ""),
+        "other service policy": LOCAL_BUILD_COMPOSE.replace("    pull_policy: never\n", "") + "  other:\n    pull_policy: never\n",
+        "single-quoted inline mapping": "services:\n  node: { 'image': bloch:latest }\n",
+        "quoted inline mapping": 'services:\n  node: { "image": bloch:latest }\n',
+        "inline mapping": "services:\n  node: { image: bloch:latest }\n",
+        "list image": "containers:\n  - image: bloch:latest\n",
+        "quoted key": 'services:\n  node:\n    "image": bloch:latest\n',
+    }
+    for name, content in cases.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            write_deploy(tmp, "docker-compose.yml", content)
+            r = run_checker(tmp)
+            if r.returncode == 0:
+                return "bypass accepted: %s\n%s" % (name, content)
+    with tempfile.TemporaryDirectory() as tmp:
+        write_deploy(tmp, "other.yml", LOCAL_BUILD_COMPOSE)
+        if run_checker(tmp).returncode == 0:
+            return "local-build exception escaped its single reviewed path"
+    with tempfile.TemporaryDirectory() as tmp:
+        write_deploy(tmp, "quoted.yml", PINNED_COMPOSE.replace("image: ", 'image: "').rstrip() + '"\n')
+        if run_checker(tmp).returncode != 0:
+            return "valid quoted digest refused"
+    return None
+
+
+def case_yaml_inheritance_fails_closed() -> str | None:
+    cases = {
+        "anchor": "x-base: &base\n  image: docker.io/blochv/bloch@sha256:%s\n" % DIGEST,
+        "punctuated anchor": "x-base: &base.v1/path\n  image: docker.io/blochv/bloch@sha256:%s\n" % DIGEST,
+        "alias": "services:\n  node: *base\n",
+        "merge key": "services:\n  node:\n    <<: *base\n",
+        "quoted merge key": 'services:\n  node:\n    "<<": *base\n',
+        "flow alias": "services: { node: *base }\n",
+        "quoted hash before anchor": 'x-base: { note: "x#y", holder: &base { image: bloch:latest } }\n',
+        "quoted hash before alias": 'services: { note: "x#y", node: *base }\n',
+        "plain hash before anchor": "x-base: { note: x#y, holder: &base { image: bloch:latest } }\n",
+        "plain hash before alias": "services: { note: x#y, node: *base }\n",
+        "flow literal merge": "services: { node: { <<: { image: bloch:latest } } }\n",
+    }
+    for name, content in cases.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            write_deploy(tmp, "inheritance.yml", content)
+            r = run_checker(tmp)
+            if r.returncode == 0:
+                return "YAML inheritance bypass accepted: %s\n%s" % (name, content)
+            if "unsupported YAML inheritance" not in r.stdout:
+                return "inheritance refusal did not name its reason: %s\n%s" % (name, r.stdout)
+
+    multiline_quote = 'x-base: { note: "first\n  second#third", holder: &base { image: bloch:latest } }\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        write_deploy(tmp, "multiline.yml", multiline_quote)
+        r = run_checker(tmp)
+        if r.returncode == 0 or "unsupported multiline quoted scalar" not in r.stdout:
+            return "multiline quoted scalar did not fail closed:\n%s%s" % (r.stdout, r.stderr)
+
+    accepted = {
+        "quoted alias text": PINNED_COMPOSE + 'x-note: "use *base here and x#y"\n',
+        "single quoted alias text": PINNED_COMPOSE + "x-note: 'use *base and x#y'\n",
+        "plain hash scalar": PINNED_COMPOSE + "x-note: x#y\n",
+        "block scalar alias text": PINNED_COMPOSE + "x-script: |\n  cp *base /tmp/output\n  echo x#y\n",
+        "folded scalar anchor text": PINNED_COMPOSE + "x-script: >-\n  echo &base is documentation\n",
+        "list block scalar alias text": PINNED_COMPOSE + "x-scripts:\n  - |\n    cp *base /tmp/output\n",
+    }
+    for name, content in accepted.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            write_deploy(tmp, "literal.yml", content)
+            r = run_checker(tmp)
+            if r.returncode != 0:
+                return "ordinary quoted/block text was refused: %s\n%s%s" % (
+                    name, r.stdout, r.stderr
+                )
+    return None
+
+
 def main() -> int:
     if not os.path.exists(CHECKER):
         print("selftest: FAIL — checker script not found at %s" % CHECKER)
         return 1
 
     cases = [
+        ("15 digest/exemption/syntax regressions", case_bypass_regressions),
+        ("YAML anchors, aliases and merge keys fail closed", case_yaml_inheritance_fails_closed),
         ("bare-tag image fails, names the file:line and the image", case_unpinned_fails),
         ("@sha256-pinned image passes", case_pinned_passes),
         ("recognised placeholder line passes", case_placeholder_passes),

@@ -15,7 +15,8 @@
 #   ./verify-bootnodes.sh --deep       # also ssh each bootnode to re-prove
 #                                      # keylessness, transport and one chain
 #
-# The plain run is the one a third party can do; --deep needs our fleet key.
+# The plain run is the one a third party can do; --deep needs a dedicated
+# read-only verification key. It deliberately refuses the fleet admin key.
 #
 # Exit 0 = every published entry passed. Non-zero = do not publish.
 set -uo pipefail
@@ -25,12 +26,20 @@ LIST=bootnodes.txt
 # A dedicated, read-only key — never the fleet admin/validator key. Per
 # deploy/SSH-ROLE-SEPARATION.md this key's authorized_keys entry is restricted
 # with a `command=`/`from=` ForceCommand to the read-only verify path only; it
-# cannot start, stop, or reconfigure anything. BLOCH_FLEET_KEY is accepted as a
-# deprecated fallback for one release so existing operators are not broken
-# silently, but every fleet should migrate to a key scoped this way.
-KEY=${BLOCH_VERIFY_RO_KEY:-${BLOCH_FLEET_KEY:-$HOME/.ssh/edgevana_verify_ro}}
+# cannot start, stop, or reconfigure anything. There is no BLOCH_FLEET_KEY
+# fallback: a read-only check must never require or accept the credential whose
+# fleet-wide blast radius this control exists to remove.
+KEY=${BLOCH_VERIFY_RO_KEY:-}
 DEEP=0
 [ "${1:-}" = "--deep" ] && DEEP=1
+
+if [ "$DEEP" -eq 1 ]; then
+  [ -n "$KEY" ] || {
+    echo "FAIL: --deep requires BLOCH_VERIFY_RO_KEY; the fleet/admin key is not accepted" >&2
+    exit 2
+  }
+  [ -f "$KEY" ] || { echo "FAIL: BLOCH_VERIFY_RO_KEY is not a regular file: $KEY" >&2; exit 2; }
+fi
 
 # bash 3.2 (the macOS default) has no `mapfile`, and this script has to run on
 # whatever an operator has. Plain word-splitting over a newline list is enough.
@@ -52,6 +61,7 @@ else
 fi
 
 echo "Checking $COUNT published entries from $LIST"
+echo "Public RPC refusal: ports 8080, 16310 and 16400 must be CLOSED on every entry"
 if [ $DEEP -eq 1 ]; then
   echo "NOTE: --deep facts (keyless/transport/chain state below) are SELF-REPORTED"
   echo "  by each host over its own ssh session. This script does not independently"
@@ -84,19 +94,35 @@ for e in $ENTRIES; do
     FAIL=1; continue
   fi
 
+  # INF-10 / NET-01: these observers are public P2P entry points, not public
+  # raw-RPC endpoints. The fleet incident exposed the full unauthenticated
+  # method set (including sendrawtransaction) through :8080 even though the
+  # unit claimed a loopback bind. Check from OUTSIDE the host: inspecting the
+  # unit over SSH proves configuration intent, not the firewall/NAT/proxy path
+  # an attacker reaches. 16310 is the compiled RPC default; 16400 is the
+  # historical/custom fleet RPC port used by the deep check below.
+  RPC_OPEN=""
+  for rpc_port in 8080 16310 16400; do
+    if probe "$HOST" "$rpc_port"; then
+      RPC_OPEN="$RPC_OPEN $rpc_port"
+    fi
+  done
+  if [ -n "$RPC_OPEN" ]; then
+    echo "   public RPC     : OPEN on$RPC_OPEN  <-- REMOVE EXPOSURE BEFORE PUBLISHING"
+    FAIL=1
+  else
+    echo "   public RPC     : closed (8080, 16310, 16400)"
+  fi
+
   [ $DEEP -eq 0 ] && continue
 
   # 2. Still keyless, still devnet, still following. A bootnode that has
   #    acquired a validator.key must come off the public list immediately: we
   #    would be publishing an unauthenticated push surface into consensus.
-  OUT=$(ssh -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY" ubuntu@"$HOST" '
-      if find /home/ubuntu/g4 -name validator.key 2>/dev/null | grep -q .; then
-        echo "KEY=present"; else echo "KEY=absent"; fi
-      systemctl cat bloch-archival.service 2>/dev/null | grep -oE -- "--transport [a-z0-9]+" | head -1
-      curl -s --max-time 8 -X POST http://127.0.0.1:16400 \
-        -H "content-type: application/json" \
-        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getchaininfo\",\"params\":[]}"
-    ' 2>/dev/null)
+  # `verify` is the only accepted SSH_ORIGINAL_COMMAND in the root-owned
+  # ForceCommand wrapper. No caller-supplied shell fragment crosses this
+  # boundary.
+  OUT=$(ssh -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY" ubuntu@"$HOST" verify 2>/dev/null)
 
   case "$OUT" in
     *KEY=absent*)  echo "   keyless        : yes" ;;
@@ -113,7 +139,7 @@ for e in $ENTRIES; do
   # 3. Following the chain, not merely answering. A forked node responds.
   #    The finalized height and root are appended for the cross-check below;
   #    a check that only prints them proves nothing on its own.
-  echo "$OUT" | grep -o '{"jsonrpc".*' | HOST="$HOST" ROOTS="$ROOTS" python3 -c '
+  echo "$OUT" | grep -o '{"jsonrpc".*' | HOST="$HOST" ROOTS="$ROOTS" python3 -I -c '
 import sys, json, os
 try:
     d = json.load(sys.stdin)["result"]

@@ -1,0 +1,33 @@
+Internal audit remediation wave 43 storage validation
+Date: 2026-09-18
+Branch: codex/audit-storage-reorg
+Base: 45ae11e
+Implementation: efa5455
+
+PASS
+cargo test -p bloch-pos-node --bin bloch-pos store::tests --no-fail-fast
+25 passed; 0 failed; 0 ignored; 487 filtered out.
+
+PASS
+cargo test -p bloch-pos-node --bin bloch-pos asynchronous_rewrite --no-fail-fast
+3 passed; 0 failed; 0 ignored; 509 filtered out.
+
+PASS (requires local loopback socket access outside the restricted runner)
+cargo test -p bloch-pos-node --bin bloch-pos reorg --no-fail-fast
+9 passed; 0 failed; 1 ignored; 501 filtered out.
+The first restricted invocation failed before test bodies because six fixtures
+could not bind an ephemeral loopback socket (`PermissionDenied`). The same
+compiled tests passed with loopback access.
+
+PASS WITH EXISTING WARNINGS
+cargo clippy -p bloch-pos-node --bin bloch-pos --tests --no-deps
+Completed successfully. Existing crate/test warnings remain; no warning was
+promoted or treated as a release gate by this command.
+
+PASS
+git diff --check
+
+KNOWN BASELINE FAILURE (not introduced by this wave)
+cargo fmt --all -- --check
+The repository reports formatting differences across existing files. A
+workspace-wide formatter rewrite is outside this storage-only wave.

@@ -2,7 +2,7 @@
 //! Colors: amber accent · green success · red error · muted gray
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ── ANSI colors ───────────────────────────────────────────────────────────────
 const AMBER:   &str = "\x1b[38;5;214m";   // #EF9F27 equivalent
@@ -13,6 +13,19 @@ const BOLD:    &str = "\x1b[1m";
 const DIM:     &str = "\x1b[2m";
 const RESET:   &str = "\x1b[0m";
 
+// The `disclose` command documents index zero as the base single-key wallet
+// address. Keep that product policy explicit instead of inheriting a public
+// compatibility wrapper's default convention.
+const CLI_DISCLOSURE_KEY_CONVENTION:
+    crate::wallet::disclosure::DisclosureKeyConvention =
+    crate::wallet::disclosure::DisclosureKeyConvention::SingleKeyWallet;
+
+// Verified bundles have bounded entry counts and bounded text/key/signature
+// fields; 64 MiB leaves ample headroom over the ordinary serialization of
+// those bounded typed fields. Keep the CLI file read itself bounded too,
+// before JSON allocates its fields.
+const CLI_DISCLOSURE_FILE_LIMIT: usize = crate::util::DEFAULT_WALLET_FILE_LIMIT;
+
 fn amber(s: &str)  -> String { format!("{}{}{}", AMBER, s, RESET) }
 fn green(s: &str)  -> String { format!("{}{}{}", GREEN, s, RESET) }
 fn red(s: &str)    -> String { format!("{}{}{}", RED, s, RESET) }
@@ -22,10 +35,11 @@ fn dim(s: &str)    -> String { format!("{}{}{}", DIM, s, RESET) }
 
 fn banner() {
     println!();
-    println!("  {}◆{}  {} E N T A N G L E M E N T {}  {}◆{}",
+    println!("  {}◆{}  {} B L O C H {}  {}◆{}",
         AMBER, RESET, BOLD, RESET, AMBER, RESET);
-    println!("  {}ML-DSA-65 · AES-256-GCM · Argon2id{}",
+    println!("  {}Hybrid signatures: ML-DSA-65 + Falcon-1024 · SHA3-256{}",
         MUTED, RESET);
+    println!("  {}Keystore encryption: AES-256-GCM · Argon2id{}", MUTED, RESET);
     println!();
 }
 
@@ -33,7 +47,7 @@ fn ok(msg: &str) {
     println!("  {} {}", green("✓"), msg);
 }
 
-fn err(msg: &str) {
+fn err(msg: &str) -> ! {
     println!("  {} {}", red("✗"), msg);
     std::process::exit(1);
 }
@@ -46,7 +60,7 @@ fn label(k: &str, v: &str) {
 
 #[derive(Parser)]
 #[command(name = "bloch-wallet")]
-#[command(about = "Bloch-SIS Protocol Wallet — ML-DSA-65 keypairs")]
+#[command(about = "Bloch Protocol Wallet — hybrid ML-DSA-65 + Falcon-1024 signatures")]
 #[command(version)]
 #[command(disable_help_flag = false)]
 struct Cli {
@@ -75,9 +89,9 @@ enum Cmd {
     Send {
         keystore: PathBuf,
         to:       String,
-        amount:   f64,
-        #[arg(long, default_value_t = 0.0001)]
-        fee:      f64,
+        amount:   String,
+        #[arg(long, default_value = "0.0001")]
+        fee:      String,
     },
     /// Sign a message (domain-separated digest — see `verify-message`)
     Sign { keystore: PathBuf, message: String },
@@ -89,6 +103,9 @@ enum Cmd {
         message: String,
         /// The signature, hex-encoded.
         signature: String,
+        /// Require suite envelopes and canonical signature encoding.
+        #[arg(long)]
+        canonical: bool,
     },
     /// P4.3 — Create a signed selective-disclosure bundle (view/audit key).
     /// Prompts for the BIP39 seed phrase; discloses ONLY the given receive
@@ -107,9 +124,19 @@ enum Cmd {
         output: PathBuf,
     },
     /// Verify a disclosure bundle OFFLINE (no node needed)
-    VerifyBundle { bundle: PathBuf },
+    VerifyBundle {
+        bundle: PathBuf,
+        /// Require suite envelopes and canonical Falcon encoding.
+        #[arg(long)]
+        canonical: bool,
+    },
     /// Watch-only audit: verify a bundle, then sum balances over its addresses
-    Watch { bundle: PathBuf },
+    Watch {
+        bundle: PathBuf,
+        /// Require suite envelopes and canonical Falcon encoding.
+        #[arg(long)]
+        canonical: bool,
+    },
 }
 
 pub fn main() {
@@ -119,8 +146,8 @@ pub fn main() {
     match cli.cmd {
 
         Cmd::New { output } => {
-            println!("  {}Generating ML-DSA-65 keypair...{}", MUTED, RESET);
-            println!("  {}(this takes a moment — 4000-byte key generation){}",
+            println!("  {}Generating hybrid ML-DSA-65 + Falcon-1024 keypair...{}", MUTED, RESET);
+            println!("  {}(post-quantum key generation may take a moment){}",
                 DIM, RESET);
             println!();
 
@@ -130,13 +157,15 @@ pub fn main() {
             println!();
             label("pubkey size",  &format!("{} bytes", kp.public_key.len()));
             label("privkey size", &format!("{} bytes (never share!)", kp.private_key.len()));
-            label("algorithm",    "ML-DSA-65 (NIST FIPS 204)");
+            label("algorithm",    "ML-DSA-65 + Falcon-1024 (hybrid)");
             label("network",      if cli.testnet { "testnet" } else { "mainnet" });
             println!();
 
             let pw = prompt_new_password();
             println!();
-            match kp.save_encrypted(&output, &pw) {
+            let saved = kp.save_encrypted(&output, &pw);
+            drop(pw);
+            match saved {
                 Ok(()) => {
                     ok(&format!("Keystore saved: {}", amber(&output.display().to_string())));
                     println!();
@@ -155,9 +184,8 @@ pub fn main() {
         Cmd::Pubkey { keystore } => {
             let kp = load_kp(&keystore);
             let hex = hex::encode(&kp.public_key);
-            println!("  {}", muted(&hex[..32]));
-            println!("  {}", muted(&hex[32..64]));
-            println!("  {}... ({} bytes total){}", DIM, kp.public_key.len(), RESET);
+            // Public-key export must include every byte for native script hashing.
+            println!("{hex}");
         }
 
         Cmd::Balance { address } => {
@@ -187,16 +215,19 @@ pub fn main() {
 
         Cmd::Send { keystore, to, amount, fee } => {
             let kp          = load_kp(&keystore);
-            let amount_sats = (amount * 1e8).round() as u64;
-            let fee_sats    = (fee * 1e8).round() as u64;
+            let amount_sats = checked_cli_satoshis(&amount, false).unwrap_or_else(|message| err(message));
+            let fee_sats = checked_cli_satoshis(&fee, true).unwrap_or_else(|message| err(message));
+            let total_needed = amount_sats.checked_add(fee_sats)
+                .unwrap_or_else(|| err("amount plus fee exceeds u64"));
+            let to_hex = checked_destination(&to, &kp.address).unwrap_or_else(|message| err(&message));
 
             println!("  {}transaction preview{}", BOLD, RESET);
             println!();
             label("from",   &kp.address);
             label("to",     &to);
-            label("amount", &format!("{:.8} BLOCH  {}({} sats){}",
+            label("amount", &format!("{} BLOCH  {}({} sats){}",
                 amount, MUTED, amount_sats, RESET));
-            label("fee",    &format!("{:.8} BLOCH", fee));
+            label("fee",    &format!("{} BLOCH", fee));
             println!();
 
             // 1. Fetch UTXOs via getutxos (returns full UTXO list for coin selection)
@@ -212,25 +243,15 @@ pub fn main() {
 
             let avail = crate::wallet::sat_u64(&resp["satoshis"]).unwrap_or(0);
             let utxo_count = resp["utxo_count"].as_u64().unwrap_or(0);
-            if avail < amount_sats + fee_sats {
+            if avail < total_needed {
                 err(&format!("Insufficient funds: have {:.8} BLOCH ({} UTXOs), need {:.8} BLOCH",
                     avail as f64 / 1e8, utxo_count,
-                    (amount_sats + fee_sats) as f64 / 1e8));
+                    total_needed as f64 / 1e8));
             }
 
             // 2. Parse UTXOs from getutxos response
-            let utxos_raw = resp["utxos"].as_array().cloned().unwrap_or_default();
-            let available_utxos: Vec<(Vec<u8>, u32, crate::core::TxOutput)> = utxos_raw
-                .iter()
-                .filter_map(|u| {
-                    let txid_hex = u["txid"].as_str()?;
-                    let txid = hex::decode(txid_hex).ok()?;
-                    let idx  = u["index"].as_u64()? as u32;
-                    let val  = crate::wallet::sat_u64(&u["value"])?;
-                    let spk  = hex::decode(u["script_pubkey"].as_str()?).ok()?;
-                    Some((txid, idx, crate::core::TxOutput { value: val, script_pubkey: spk }))
-                })
-                .collect();
+            let available_utxos = parse_send_utxos(&resp)
+                .unwrap_or_else(|message| err(message));
 
             if available_utxos.is_empty() {
                 err("No UTXOs returned by node — cannot build transaction");
@@ -239,24 +260,17 @@ pub fn main() {
             ok(&format!("{} UTXOs available ({:.8} BLOCH)",
                 available_utxos.len(), avail as f64 / 1e8));
 
-            // Sprint K: Parse and validate destination address (checksum-enforced)
-            let to_hex = match crate::address::Address::parse(&to) {
-                Ok(a) => hex::encode(a.hash()),
-                Err(e) => { err(&format!("Invalid destination address: {}\n  Hint: addresses must be 55 chars (bloch1q + 40 hex hash + 8 hex checksum)", e)); unreachable!() }
-            };
 
-            // 4. Build and sign transaction
-            print!("  {}building transaction...{}\r", MUTED, RESET);
             let tx = match crate::wallet::TxBuilder::build(&kp, &available_utxos, &to_hex, amount_sats, fee_sats) {
                 Ok(t)  => t,
-                Err(e) => { err(&format!("Build failed: {}", e)); unreachable!() }
+                Err(e) => { err(&format!("Build failed: {}", e)) }
             };
 
             let txid = tx.txid();
             ok(&format!("Transaction built — txid: {}", amber(&hex::encode(txid))));
             label("inputs",  &format!("{}", tx.inputs.len()));
             label("outputs", &format!("{}", tx.outputs.len()));
-            label("sig size",&format!("{} bytes (ML-DSA-65)", tx.inputs[0].script_sig.len()));
+            label("sig size",&format!("{} bytes", tx.inputs[0].script_sig.len()));
             println!();
 
             // 5. Serialize and broadcast via sendrawtransaction
@@ -285,7 +299,7 @@ pub fn main() {
                 .collect::<Result<Vec<_>, _>>()
             {
                 Ok(v) if !v.is_empty() => v,
-                _ => { err("indices must be a comma-separated list of numbers, e.g. 0,2,5"); unreachable!() }
+                _ => { err("indices must be a comma-separated list of numbers, e.g. 0,2,5") }
             };
 
             println!("  {}Selective disclosure — reveals ONLY the listed indices.{}", MUTED, RESET);
@@ -294,22 +308,30 @@ pub fn main() {
             println!();
 
             let phrase = prompt_password(&format!("  {}seed phrase:{} ", MUTED, RESET));
-            let seed = match crate::wallet::SeedPhrase::parse(&phrase) {
+            let parsed_seed = crate::wallet::SeedPhrase::parse(&phrase);
+            drop(phrase);
+            let seed = match parsed_seed {
                 Ok(s) => s,
-                Err(e) => { err(&format!("Invalid seed phrase: {}", e)); unreachable!() }
+                Err(e) => { err(&format!("Invalid seed phrase: {}", e)) }
             };
             let network = if cli.testnet { crate::address::Network::Testnet }
                           else { crate::address::Network::Mainnet };
 
             print!("  {}deriving {} keypair(s) + signing (slow: hybrid PQ keygen)...{}\r",
                 MUTED, idx.len(), RESET);
-            let seed_bytes = seed.to_seed_bytes();
-            let bundle = match crate::wallet::DisclosureBundle::create(
-                &seed_bytes, &idx, network, &purpose, &audience)
+            // Disclosure key generation can be slow and derive many children;
+            // keep its returned master-seed copy zeroizing for that lifetime.
+            let seed_bytes = zeroize::Zeroizing::new(seed.to_seed_bytes());
+            let bundle = match crate::wallet::DisclosureBundle::create_with_convention(
+                &seed_bytes[..], &idx, network, &purpose, &audience,
+                CLI_DISCLOSURE_KEY_CONVENTION)
             {
                 Ok(b) => b,
-                Err(e) => { err(&format!("Disclosure failed: {}", e)); unreachable!() }
+                Err(e) => { err(&format!("Disclosure failed: {}", e)) }
             };
+            if let Err(e) = bundle.verify_canonical() {
+                err(&format!("Disclosure canonical self-check failed: {}", e));
+            }
 
             let json = serde_json::to_string_pretty(&bundle).unwrap();
             match crate::util::atomic_write(&output, json.as_bytes()) {
@@ -328,8 +350,8 @@ pub fn main() {
             }
         }
 
-        Cmd::VerifyBundle { bundle } => {
-            let verified = load_and_verify_bundle(&bundle);
+        Cmd::VerifyBundle { bundle, canonical } => {
+            let verified = load_and_verify_bundle(&bundle, canonical);
             ok("bundle signatures + address bindings verified");
             println!();
             label("network",  &format!("{:?}", verified.network));
@@ -346,8 +368,8 @@ pub fn main() {
             println!("  {}Check the audience field names YOU before trusting the bundle.{}", DIM, RESET);
         }
 
-        Cmd::Watch { bundle } => {
-            let verified = load_and_verify_bundle(&bundle);
+        Cmd::Watch { bundle, canonical } => {
+            let verified = load_and_verify_bundle(&bundle, canonical);
             ok(&format!("bundle verified — {} address(es)", verified.addresses.len()));
             println!();
 
@@ -396,18 +418,18 @@ pub fn main() {
             }
         }
 
-        Cmd::VerifyMessage { pubkey, message, signature } => {
+        Cmd::VerifyMessage { pubkey, message, signature, canonical } => {
             let pk = match hex::decode(&pubkey) {
                 Ok(b) => b,
-                Err(e) => { err(&format!("Invalid pubkey hex: {}", e)); unreachable!() }
+                Err(e) => { err(&format!("Invalid pubkey hex: {}", e)) }
             };
             let sig = match hex::decode(&signature) {
                 Ok(b) => b,
-                Err(e) => { err(&format!("Invalid signature hex: {}", e)); unreachable!() }
+                Err(e) => { err(&format!("Invalid signature hex: {}", e)) }
             };
             // Same domain-separated digest `sign` uses — never hex-decode
             // `message` either; verification must mirror signing exactly.
-            if crate::wallet::Keypair::verify_message(&pk, message.as_bytes(), &sig) {
+            if verify_message_with_policy(&pk, message.as_bytes(), &sig, canonical) {
                 ok("signature verifies for this message and public key");
             } else {
                 err("signature does NOT verify for this message and public key");
@@ -420,38 +442,92 @@ pub fn main() {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-fn load_and_verify_bundle(path: &PathBuf) -> crate::wallet::VerifiedDisclosure {
-    let json = match std::fs::read_to_string(path) {
-        Ok(j) => j,
-        Err(e) => { err(&format!("Cannot read bundle: {}", e)); unreachable!() }
-    };
-    let bundle: crate::wallet::DisclosureBundle = match serde_json::from_str(&json) {
-        Ok(b) => b,
-        Err(e) => { err(&format!("Bundle parse failed: {}", e)); unreachable!() }
-    };
-    match bundle.verify() {
-        Ok(v) => v,
-        Err(e) => { err(&format!("Bundle verification FAILED: {}", e)); unreachable!() }
+fn verify_bundle_with_policy(
+    bundle: &crate::wallet::DisclosureBundle,
+    canonical: bool,
+) -> Result<crate::wallet::VerifiedDisclosure, crate::wallet::DisclosureError> {
+    if canonical {
+        bundle.verify_canonical()
+    } else {
+        bundle.verify()
     }
+}
+
+fn verify_message_with_policy(
+    public_key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+    canonical: bool,
+) -> bool {
+    if canonical {
+        crate::wallet::Keypair::verify_message_canonical(public_key, message, signature)
+    } else {
+        crate::wallet::Keypair::verify_message(public_key, message, signature)
+    }
+}
+
+fn load_and_verify_bundle(
+    path: &PathBuf,
+    canonical: bool,
+) -> crate::wallet::VerifiedDisclosure {
+    let bundle = match read_disclosure_bundle_with_limit(path, CLI_DISCLOSURE_FILE_LIMIT) {
+        Ok(b) => b,
+        Err(e) => { err(&e) }
+    };
+    match verify_bundle_with_policy(&bundle, canonical) {
+        Ok(v) => v,
+        Err(e) => { err(&format!("Bundle verification FAILED: {}", e)) }
+    }
+}
+
+fn read_disclosure_bundle_with_limit(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<crate::wallet::DisclosureBundle, String> {
+    let bytes = crate::util::read_wallet_file(path, max_bytes).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            format!("Disclosure bundle exceeds {}-byte input limit", max_bytes)
+        } else {
+            format!("Cannot read bundle: {}", error)
+        }
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("Bundle parse failed: {}", error))
 }
 
 fn load_kp(path: &PathBuf) -> crate::wallet::Keypair {
     let pw = prompt_password(&format!("  {}password:{} ", MUTED, RESET));
-    match crate::wallet::Keypair::load_encrypted(path, &pw) {
+    let loaded = crate::wallet::Keypair::load_encrypted(path, &pw);
+    drop(pw);
+    match loaded {
         Ok(kp) => { ok("keystore decrypted"); println!(); kp }
-        Err(e) => { err(&format!("Load failed: {}", e)); unreachable!() }
+        Err(e) => { err(&format!("Load failed: {}", e)) }
     }
 }
 
-fn prompt_password(prompt: &str) -> String {
-    rpassword::prompt_password(prompt).unwrap_or_default()
+fn own_prompt_secret(secret: String) -> zeroize::Zeroizing<String> {
+    zeroize::Zeroizing::new(secret)
 }
 
-fn prompt_new_password() -> String {
+fn prompt_password(prompt: &str) -> zeroize::Zeroizing<String> {
+    own_prompt_secret(rpassword::prompt_password(prompt).unwrap_or_default())
+}
+
+fn confirmed_prompt_secret(
+    password: zeroize::Zeroizing<String>,
+    confirmation: zeroize::Zeroizing<String>,
+) -> Option<zeroize::Zeroizing<String>> {
+    if password.as_str() == confirmation.as_str() {
+        Some(password)
+    } else {
+        None
+    }
+}
+
+fn prompt_new_password() -> zeroize::Zeroizing<String> {
     loop {
-        let pw  = rpassword::prompt_password(
+        let pw = own_prompt_secret(rpassword::prompt_password(
             &format!("  {}new password:{} ", MUTED, RESET)
-        ).unwrap_or_default();
+        ).unwrap_or_default());
         if let Err(e) = crate::wallet::validate_password(&pw) {
             println!("  {} {}", red("✗"), muted(&format!("weak password: {}", e)));
             continue;
@@ -463,40 +539,385 @@ fn prompt_new_password() -> String {
             println!("  {} {}", red("✗"), muted(&format!("weak password: {}", e)));
             continue;
         }
-        let pw2 = rpassword::prompt_password(
+        let pw2 = own_prompt_secret(rpassword::prompt_password(
             &format!("  {}confirm:     {} ", MUTED, RESET)
-        ).unwrap_or_default();
-        if pw == pw2 { return pw; }
+        ).unwrap_or_default());
+        if let Some(confirmed) = confirmed_prompt_secret(pw, pw2) {
+            return confirmed;
+        }
         println!("  {} {}", red("✗"), muted("passwords do not match"));
     }
 }
 
 fn rpc_call(endpoint: &str, method: &str, params: serde_json::Value) -> serde_json::Value {
-    let body = serde_json::to_string(&serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": method, "params": params
-    })).unwrap();
-    let url  = endpoint.trim_start_matches("http://");
-    let (host, _) = url.split_once('/').unwrap_or((url, ""));
-    match std::net::TcpStream::connect(host) {
-        Err(_) => serde_json::json!({ "error": "node not reachable" }),
-        Ok(mut s) => {
-            use std::io::{Write, Read};
-            let req = format!(
-                "POST / HTTP/1.0\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                host, body.len(), body
-            );
-            let _ = s.write_all(req.as_bytes());
-            let mut buf = String::new();
-            let _ = s.read_to_string(&mut buf);
-            if let Some(p) = buf.find("\r\n\r\n") {
-                serde_json::from_str(&buf[p+4..])
-                    .ok()
-                    .and_then(|v: serde_json::Value|
-                        v.get("result").cloned())
-                    .unwrap_or(serde_json::json!({}))
-            } else {
-                serde_json::json!({ "error": "invalid response" })
-            }
+    let authority = endpoint.strip_prefix("http://").unwrap_or(endpoint).trim_end_matches('/');
+    crate::wallet::http_rpc::call(authority, method, &params, None)
+        .unwrap_or_else(|error| serde_json::json!({"error":error}))
+}
+
+// Parse once from the original CLI token: no float may choose the spend amount.
+fn checked_cli_satoshis(value: &str, allow_zero: bool) -> Result<u64, &'static str> {
+    let satoshis = crate::wallet::parse_bloch_satoshis(value)?;
+    if !allow_zero && satoshis == 0 { return Err("payment must contain at least one satoshi"); }
+    Ok(satoshis)
+}
+
+fn checked_destination(destination: &str, source: &str) -> Result<String, String> {
+    let destination = crate::address::Address::parse(destination).map_err(|_| "invalid destination address".to_string())?;
+    let source = crate::address::Address::parse(source).map_err(|_| "invalid wallet address".to_string())?;
+    if destination.network() != source.network() { return Err("destination address network differs from wallet".into()); }
+    Ok(hex::encode(destination.hash()))
+}
+
+fn parse_send_utxos(response: &serde_json::Value) -> Result<Vec<(Vec<u8>, u32, crate::core::TxOutput)>, &'static str> {
+    let rows = response["utxos"].as_array().ok_or("RPC response missing UTXO array")?;
+    rows.iter().map(|row| {
+        let txid = hex::decode(row["txid"].as_str().ok_or("UTXO missing transaction ID")?)
+            .map_err(|_| "invalid UTXO transaction ID hex")?;
+        if txid.len() != 32 { return Err("UTXO transaction ID must contain 32 bytes"); }
+        let index = row["index"].as_u64().and_then(|value| u32::try_from(value).ok())
+            .ok_or("UTXO index must fit u32")?;
+        let value = crate::wallet::sat_u64(&row["value"]).ok_or("invalid UTXO value")?;
+        let script_pubkey = hex::decode(row["script_pubkey"].as_str().ok_or("UTXO missing script")?)
+            .map_err(|_| "invalid UTXO script hex")?;
+        Ok((txid, index, crate::core::TxOutput { value, script_pubkey }))
+    }).collect()
+}
+
+#[cfg(test)]
+mod audit_cli_input_tests {
+    use super::*;
+    use crate::address::{Address, Network};
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use sha3::{Digest, Sha3_256};
+    use zeroize::Zeroize;
+
+    #[test]
+    fn cli_prompt_secret_owner_preserves_content_and_zeroizes_while_live() {
+        let mut secret = own_prompt_secret(String::from("abandon abandon secret"));
+        assert!(std::mem::needs_drop::<zeroize::Zeroizing<String>>());
+        assert_eq!(secret.as_str(), "abandon abandon secret");
+        secret.zeroize();
+        assert!(secret.is_empty());
+    }
+
+    #[test]
+    fn new_password_confirmation_preserves_only_an_exact_zeroizing_owner() {
+        let password = own_prompt_secret(String::from("correct-horse-battery-9!"));
+        let confirmation = own_prompt_secret(String::from("correct-horse-battery-9!"));
+        let mut confirmed = confirmed_prompt_secret(password, confirmation).unwrap();
+        assert!(std::mem::needs_drop::<zeroize::Zeroizing<String>>());
+        assert_eq!(confirmed.as_str(), "correct-horse-battery-9!");
+
+        assert!(confirmed_prompt_secret(
+            own_prompt_secret(String::from("correct-horse-battery-9!")),
+            own_prompt_secret(String::from("wrong-confirmation")),
+        ).is_none());
+
+        confirmed.zeroize();
+        assert!(confirmed.is_empty());
+    }
+
+    #[test]
+    fn cli_disclosure_uses_explicit_single_key_convention() {
+        use crate::wallet::disclosure::{
+            keypair_at_with_convention, DisclosureKeyConvention,
+        };
+
+        assert_eq!(
+            CLI_DISCLOSURE_KEY_CONVENTION,
+            DisclosureKeyConvention::SingleKeyWallet,
+        );
+
+        let seed = [0x47; 64];
+        let (base_public, base_secret) =
+            crate::crypto::generate_keypair_from_seed(&seed[..32]).unwrap();
+        let _base_secret = zeroize::Zeroizing::new(base_secret);
+        let (cli_zero_public, cli_zero_secret) = keypair_at_with_convention(
+            &seed,
+            0,
+            CLI_DISCLOSURE_KEY_CONVENTION,
+        )
+        .unwrap();
+        let _cli_zero_secret = zeroize::Zeroizing::new(cli_zero_secret);
+        let (hd_zero_public, hd_zero_secret) = keypair_at_with_convention(
+            &seed,
+            0,
+            DisclosureKeyConvention::HdWalletV3,
+        )
+        .unwrap();
+        let _hd_zero_secret = zeroize::Zeroizing::new(hd_zero_secret);
+
+        assert_eq!(cli_zero_public, base_public);
+        assert_ne!(cli_zero_public, hd_zero_public);
+
+        let (cli_child_public, cli_child_secret) = keypair_at_with_convention(
+            &seed,
+            7,
+            CLI_DISCLOSURE_KEY_CONVENTION,
+        )
+        .unwrap();
+        let _cli_child_secret = zeroize::Zeroizing::new(cli_child_secret);
+        let (hd_child_public, hd_child_secret) = keypair_at_with_convention(
+            &seed,
+            7,
+            DisclosureKeyConvention::HdWalletV3,
+        )
+        .unwrap();
+        let _hd_child_secret = zeroize::Zeroizing::new(hd_child_secret);
+
+        assert_eq!(cli_child_public, hd_child_public);
+    }
+
+    #[test]
+    fn cli_disclosure_file_budget_accepts_exact_limit_and_rejects_one_more_byte() {
+        let bundle = crate::wallet::DisclosureBundle {
+            version: crate::wallet::disclosure::DISCLOSURE_VERSION,
+            network: "testnet".into(),
+            purpose: "budget fixture".into(),
+            audience: "auditor".into(),
+            created_at: "2026-09-19T00:00:00Z".into(),
+            entries: Vec::new(),
+        };
+        let mut bytes = serde_json::to_vec(&bundle).unwrap();
+        let exact_limit = bytes.len() + 32;
+        bytes.resize(exact_limit, b' ');
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        let parsed = read_disclosure_bundle_with_limit(file.path(), exact_limit).unwrap();
+        assert_eq!(parsed.purpose, bundle.purpose);
+
+        bytes.push(b' ');
+        std::fs::write(file.path(), &bytes).unwrap();
+        let error = read_disclosure_bundle_with_limit(file.path(), exact_limit).unwrap_err();
+        assert_eq!(
+            error,
+            format!("Disclosure bundle exceeds {}-byte input limit", exact_limit),
+        );
+        assert!(!error.contains("Bundle parse failed"));
+    }
+
+    #[test]
+    fn cli_amount_refuses_nonfinite_negative_saturating_and_zero_payment() {
+        for value in ["NaN", "inf", "-inf", "-1", "1e30"] {
+            assert!(checked_cli_satoshis(value, true).is_err());
         }
+        assert!(checked_cli_satoshis("0", false).is_err());
+        assert!(checked_cli_satoshis("0.000000001", false).is_err());
+        assert_eq!(checked_cli_satoshis("0", true), Ok(0));
+        assert_eq!(checked_cli_satoshis("1.25", false), Ok(125_000_000));
+        assert_eq!(checked_cli_satoshis("0.00000001", false), Ok(1));
+    }
+
+    #[test]
+    fn clap_preserves_exact_amount_and_fee_tokens() {
+        let cli = Cli::try_parse_from(["postern-wallet", "send", "wallet.json", "recipient",
+            "90071992.54740993", "--fee", "0.00000001"]).unwrap();
+        match cli.cmd {
+            Cmd::Send { amount, fee, .. } => {
+                assert_eq!(checked_cli_satoshis(&amount, false).unwrap(), 9_007_199_254_740_993);
+                assert_eq!(checked_cli_satoshis(&fee, true).unwrap(), 1);
+            }
+            _ => panic!("expected send command"),
+        }
+    }
+
+    #[test]
+    fn cli_destination_preserves_network_before_converting_to_hash() {
+        let main = Address::from_hash([1; 20], Network::Mainnet).to_string();
+        let test = Address::from_hash([1; 20], Network::Testnet).to_string();
+        assert!(checked_destination(&main, &test).is_err());
+        assert!(checked_destination(&test, &main).is_err());
+        assert_eq!(checked_destination(&main, &main).unwrap(), "01".repeat(20));
+        assert!(checked_destination("invalid", &main).is_err());
+    }
+
+    #[test]
+    fn cli_utxo_parser_refuses_invalid_rows_without_silent_filtering() {
+        let row = serde_json::json!({"txid": "ab".repeat(32), "index": u32::MAX,
+            "value": "9007199254740993", "script_pubkey": "cd".repeat(20)});
+        let parsed = parse_send_utxos(&serde_json::json!({"utxos": [row.clone()]})).unwrap();
+        assert_eq!(parsed[0].1, u32::MAX);
+        assert_eq!(parsed[0].2.value, 9_007_199_254_740_993);
+        for invalid in [serde_json::json!(4294967296u64), serde_json::json!(-1), serde_json::json!(1.5)] {
+            let mut bad = row.clone(); bad["index"] = invalid;
+            assert!(parse_send_utxos(&serde_json::json!({"utxos": [row.clone(), bad]})).is_err());
+        }
+        let mut bad = row; bad["txid"] = serde_json::json!("ab");
+        assert!(parse_send_utxos(&serde_json::json!({"utxos": [bad]})).is_err());
+        assert!(parse_send_utxos(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn canonical_bundle_flag_is_opt_in_and_rejects_raw_signature_fallback() {
+        let default_cli = Cli::try_parse_from([
+            "postern-wallet",
+            "verify-bundle",
+            "disclosure.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            default_cli.cmd,
+            Cmd::VerifyBundle {
+                canonical: false,
+                ..
+            }
+        ));
+        let strict_cli = Cli::try_parse_from([
+            "postern-wallet",
+            "verify-bundle",
+            "disclosure.json",
+            "--canonical",
+        ])
+        .unwrap();
+        assert!(matches!(
+            strict_cli.cmd,
+            Cmd::VerifyBundle {
+                canonical: true,
+                ..
+            }
+        ));
+        let default_watch = Cli::try_parse_from([
+            "postern-wallet",
+            "watch",
+            "disclosure.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            default_watch.cmd,
+            Cmd::Watch {
+                canonical: false,
+                ..
+            }
+        ));
+        let strict_watch = Cli::try_parse_from([
+            "postern-wallet",
+            "watch",
+            "disclosure.json",
+            "--canonical",
+        ])
+        .unwrap();
+        assert!(matches!(
+            strict_watch.cmd,
+            Cmd::Watch {
+                canonical: true,
+                ..
+            }
+        ));
+
+        let seed = [62u8; 64];
+        let mut bundle = (0..8)
+            .map(|_| {
+                crate::wallet::DisclosureBundle::create(
+                    &seed,
+                    &[0],
+                    Network::Testnet,
+                    "wave-62 product policy",
+                    "release auditor",
+                )
+                .unwrap()
+            })
+            .find(|candidate| {
+                let signature = B64.decode(&candidate.entries[0].sig_b64).unwrap();
+                !signature[crate::crypto::SUITE_HEADER_LEN..].starts_with(&[0xb1, 0x0c])
+            })
+            .expect("fixture signature body must not mimic the suite magic");
+
+        assert!(verify_bundle_with_policy(&bundle, false).is_ok());
+        assert!(verify_bundle_with_policy(&bundle, true).is_ok());
+        let signature = B64.decode(&bundle.entries[0].sig_b64).unwrap();
+        bundle.entries[0].sig_b64 = B64.encode(
+            &signature[crate::crypto::SUITE_HEADER_LEN..],
+        );
+
+        assert!(
+            verify_bundle_with_policy(&bundle, false).is_ok(),
+            "default CLI policy must preserve historical raw fallback"
+        );
+        assert!(matches!(
+            verify_bundle_with_policy(&bundle, true),
+            Err(crate::wallet::DisclosureError::SignatureInvalid { index: 0 })
+        ));
+    }
+
+    #[test]
+    fn canonical_message_flag_routes_genuine_magic_prefixed_fixture() {
+        let default_cli = Cli::try_parse_from([
+            "postern-wallet",
+            "verify-message",
+            "00",
+            "wave-66-message",
+            "00",
+        ])
+        .unwrap();
+        assert!(matches!(
+            default_cli.cmd,
+            Cmd::VerifyMessage {
+                canonical: false,
+                ..
+            }
+        ));
+        let strict_cli = Cli::try_parse_from([
+            "postern-wallet",
+            "verify-message",
+            "00",
+            "wave-66-message",
+            "00",
+            "--canonical",
+        ])
+        .unwrap();
+        assert!(matches!(
+            strict_cli.cmd,
+            Cmd::VerifyMessage {
+                canonical: true,
+                ..
+            }
+        ));
+
+        const SEARCH_COUNTER: u64 = 44_970;
+        const SIGNING_SEED_HEX: &str =
+            "350dedd0a2e98668324887e0a2ee89384f8f4d4e4fba79224f3eba885ac2bd74";
+        let (enveloped_pk, enveloped_sk) =
+            crate::crypto::generate_keypair_from_seed(&[0x66; 32]).unwrap();
+        let mut h = Sha3_256::new();
+        h.update(b"bloch/wallet-message/cr10/signing-rng/v1");
+        h.update(SEARCH_COUNTER.to_le_bytes());
+        let signing_seed: [u8; 32] = h.finalize().into();
+        assert_eq!(hex::encode(signing_seed), SIGNING_SEED_HEX);
+
+        let message = b"wave-66-message";
+        let digest = crate::crypto::signed_message_digest(message);
+        let enveloped_sig = pqcrypto_internals::with_seeded_rng_scope(&signing_seed, || {
+            crate::crypto::sign(&enveloped_sk, &digest).unwrap()
+        });
+        assert!(verify_message_with_policy(
+            &enveloped_pk,
+            message,
+            &enveloped_sig,
+            false,
+        ));
+        assert!(verify_message_with_policy(
+            &enveloped_pk,
+            message,
+            &enveloped_sig,
+            true,
+        ));
+
+        let raw_pk = &enveloped_pk[crate::crypto::SUITE_HEADER_LEN..];
+        let raw_sig = &enveloped_sig[crate::crypto::SUITE_HEADER_LEN..];
+        assert_eq!(&raw_sig[..2], &[0xb1, 0x0c], "fixture must hit CR-10");
+        assert!(
+            !crate::crypto::verify(raw_pk, &digest, raw_sig),
+            "generic autodetection must misclassify this genuine raw signature"
+        );
+        assert!(
+            verify_message_with_policy(raw_pk, message, raw_sig, false),
+            "compatible wallet policy must use the explicit raw format first"
+        );
+        assert!(
+            !verify_message_with_policy(raw_pk, message, raw_sig, true),
+            "canonical product policy must reject legacy raw records"
+        );
     }
 }

@@ -1,0 +1,34 @@
+Validation wave 25 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Implementation: 738bac8
+
+PASS
+
+cargo test --locked -p bloch-pos-committee \
+  seed_mix_refuses_an_epoch_that_cannot_be_a_slice_index
+  1 passed, 0 failed.
+
+cargo test --locked -p bloch-pos-committee \
+  the_partition_coverage_guard_survives_into_a_release_build
+  1 passed, 0 failed.
+
+cargo test --locked -p bloch-pos-node \
+  metrics::tests::counter_increment_changes_render
+  1 passed, 0 failed. The required-series check includes
+  bloch_pos_boundary_vote_drops_total.
+
+python3 scripts/check-comment-constants.py
+  430 files; 565 resolvable constants; 46 claims; 0 contradictions.
+
+bash scripts/ci-banned-words.sh
+  Passed.
+
+git diff --check
+  Passed before the implementation commit.
+
+LIMIT
+
+The committee helper has no production caller today. The Prometheus endpoint
+is disabled by default and its external monitoring configuration is outside
+source verification. This wave changes no accepted block, state root,
+activation schedule or fleet binary.

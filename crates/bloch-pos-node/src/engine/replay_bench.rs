@@ -8,22 +8,19 @@
 //! `tests/replay_hotpath_perf.rs` times individual functions —
 //! `state_root_with_eutxo_leaves`, `CommittedState::clone`, one hybrid verify.
 //! Those numbers say what a *function* costs. They cannot say what a *block*
-//! costs, because a replayed block is a whole engine step: an ingest, a
-//! fork-choice head computation (twice), a state clone, an epoch roll when the
-//! slot happens to sit on a boundary, the transition, and the root. Four
-//! people are optimising pieces of that; this file is how the sum is checked.
+//! costs, because a replayed block is a whole engine step: canonical-extension
+//! continuity, a state clone, an epoch roll when the slot happens to sit on a
+//! boundary, the transition, and the root. This file is how the sum is checked.
 //!
 //! So this drives the **real** node path:
 //!
 //! ```text
-//!   Engine::ingest                              <- the entry point boot replay uses
-//!     +- Engine::advance
-//!         +- Engine::forkchoice_head            (2x per block)
-//!         +- Engine::path_to_canonical
-//!         +- Engine::apply_canonical
-//!             +- Transition::apply_block
-//!                 +- compute_post_state         (clone, epoch roll, txs)
-//!                 +- compute_root               (the state root)
+//!   Engine::ingest_replay                       <- the entry point boot replay uses
+//!     +- exact current-head parent check
+//!     +- Engine::apply_canonical
+//!         +- Transition::apply_block
+//!             +- compute_post_state             (clone, epoch roll, txs)
+//!             +- compute_root                   (the state root)
 //! ```
 //!
 //! Symbols, not line numbers: this tree carried eight of them and every one had
@@ -31,18 +28,17 @@
 //! both `engine.rs` and `transition.rs`.
 //!
 //! It drives that tree through the same loop `run()` executes at boot
-//! (`for (i, env) in logged.into_iter().enumerate() { engine.ingest(env); .. }`)
+//! (`for env in logged { engine.ingest_replay(env); }`)
 //! with `live = false` — which is exactly what a restarting node runs.
 //!
 //! # Why this lives in `src/engine/` under `cfg(test)`
 //!
 //! `Engine` and every one of its fields are private to `engine`, and
 //! `bloch-pos-node` has no `[lib]` target — only a `[[bin]]`. An integration
-//! test in `tests/` therefore cannot reach `ingest` at all, and the only
+//! test in `tests/` therefore cannot reach `ingest_replay` at all, and the only
 //! alternative is to reimplement the replay loop against the public committee
-//! API. That would measure the reimplementation: no `forkchoice_head`, no
-//! `advance` retry loop, no `path_to_canonical` — three of the costs under
-//! investigation. A CHILD module of `engine` sees its parent's private items,
+//! API. That would measure the reimplementation, not the node's exact
+//! continuity checks and state bookkeeping. A CHILD module of `engine` sees its parent's private items,
 //! so this file drives the real thing and **nothing in production code had to
 //! be made more visible for it**. It costs one `#[cfg(test)] mod` line in
 //! `engine.rs` and nothing in the shipped binary.
@@ -118,7 +114,7 @@ use bloch_pos_committee::{committees, derive, epoch_of, fee_market, schedule};
 
 use sha3::{Digest, Sha3_256};
 
-use super::{now_ms, Engine, MempoolIndex, StateCell};
+use super::{now_ms, Engine, StateCell};
 use crate::genesis::{Manifest, ManifestValidator, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
 use crate::net;
@@ -260,24 +256,16 @@ struct Generator {
     sig_len: usize,
     /// Percentage of each slot's committee that actually attests.
     ///
-    /// The knob that decides which REGIME the chain replays in, and it is the
-    /// whole point of the depth experiment. Fork choice walks from the
-    /// **justified** checkpoint, so:
+    /// The knob that decides which finality regime the generated chain
+    /// records. It remains useful for comparing transition/finality work:
     ///
-    /// * at 100, justification advances and the walk is bounded by the
-    ///   unfinalized suffix — a couple of epochs, whatever the chain's total
-    ///   depth;
-    /// * below the 2/3 justification threshold, nothing ever justifies and
-    ///   the walk starts at genesis, so the walk spans the whole chain depth.
+    /// * at 100, justification advances through the generated history;
+    /// * below the 2/3 justification threshold, nothing ever justifies.
     ///
-    /// The second bullet used to say `forkchoice_head` becomes O(V.D^2) there.
-    /// That was true when this harness was written and is NOT true now:
-    /// perf/fork rebuilt LMD-GHOST as a bottom-up pass, O(V+N+D). The walk
-    /// still spans the whole depth when nothing justifies — that part stands —
-    /// but it costs a linear pass over it, not a quadratic one. MEASURED on
-    /// the integrated tree: across depths 1..192 the fork-choice column runs
-    /// 0.0-0.2 ms/block and grows 7.44x while depth grows 8x, which is linear
-    /// to within the noise of a 0.1 ms measurement.
+    /// Boot replay no longer runs fork choice per frame: `blocks.log` already
+    /// records the selected canonical chain, so replay requires exact parent
+    /// continuity and runs the transition directly. The fork-choice timing
+    /// column must therefore remain zero in both regimes.
     ///
     /// The live fleet has spent time in the second regime (params.rs, measured
     /// 2026-08-21: seven live validators holding 6.19% of unleaked stake), so
@@ -652,10 +640,11 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
             .expect("loopback devnet transport"),
     );
     Engine {
-        genesis_validator_count: manifest.validators.len() as u32,
+        genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
         state: StateCell::new(genesis_state),
         tr: Transition::new(verifier.clone()),
         tr_probe: Transition::new(ProbeVerifier),
+        gossip_verifier: super::verification::GossipVerifier::new(verifier.clone()),
         verifier,
         keys: None, // observer: replay proposes nothing and attests nothing
         blocks: BTreeMap::new(),
@@ -669,8 +658,10 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         recent_states: VecDeque::new(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
+        held_release_roots: VecDeque::new(),
         wall_slot: 0,
-        mempool: BTreeMap::new(),
+        mempool: super::admission::Mempool::default(),
+        future_blocks: BTreeMap::new(),
         // The replay harness never proposes, so nothing is ever skipped and
         // the TTL has nothing to expire; the fields exist for the type.
         mempool_admitted_at: BTreeMap::new(),
@@ -679,6 +670,8 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         // O cache de recusa (2026-08-30): o replay nao propoe, entao nunca
         // bane nada — o campo existe para o tipo, sempre vazio aqui.
         rejected: BTreeMap::new(),
+        rejected_bytes: 0,
+        rejected_expiry_hint: None,
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
         mempool_swept_epoch: u64::MAX,
@@ -688,12 +681,22 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
             .expect("open slashing protection"),
         net,
         head_slot,
+        block_count: Arc::new(std::sync::Mutex::new(crate::rpc::block_count_json(
+            0,
+            0,
+            Some(0),
+            0,
+            0,
+        ))),
         live: false,
         needs_sync: false,
         orphans: VecDeque::new(),
+        deferred_orphans: VecDeque::new(),
         orphans_evicted: 0,
         orphans_admitted: 0,
         blocks_pruned: 0,
+        proposal_admission_seen: BTreeMap::new(),
+        proposal_admission_counts: BTreeMap::new(),
         rejected_unsigned: 0,
         rejected_future: 0,
         last_applied_ms: now_ms(),
@@ -710,22 +713,26 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         tx_slot_index_order: VecDeque::new(),
         doppelganger_observe_until: None,
         doppelganger_halted: false,
-        mempool_index: MempoolIndex::new(),
         legacy_exits_applied: 0,
         manifest,
     }
 }
 
-/// Replay `chain` through `Engine::ingest`, timing every block.
+/// Replay `chain` through `Engine::ingest_replay`, timing every block.
 fn replay(manifest: Manifest, dir: &Path, chain: &[BlockEnvelope]) -> Vec<Sample> {
     let mut engine = boot_engine(manifest, dir);
     let mut out = Vec::with_capacity(chain.len());
     for env in chain {
         let _ = perf::take(); // zero the counters for this block
         let t = Instant::now();
-        engine.ingest(env.clone());
+        assert!(engine.ingest_replay(env.clone()), "generated canonical frame must replay");
         let total = t.elapsed();
         let counters = perf::take();
+        assert_eq!(
+            counters[perf::Phase::ForkChoice as usize].1,
+            0,
+            "boot replay must not invoke fork choice"
+        );
         let mut phases = [Duration::ZERO; perf::N_PHASES];
         for (i, (d, _)) in counters.iter().enumerate() {
             phases[i] = *d;
@@ -795,11 +802,9 @@ fn perf_replay_depth_curve() {
         blocks: env_u64("BLOCH_CURVE_BLOCKS", 512),
         runs: env_u64("BLOCH_CURVE_RUNS", 1) as usize,
         carryover: env_u64("BLOCH_CURVE_CARRYOVER", 8_192) as u32,
-        // Below the 2/3 justification threshold: nothing justifies, so fork
-        // choice walks from genesis over the whole chain depth. This is the
-        // regime the degraded live fleet has been in. Post-perf/fork that walk
-        // is linear in depth, not quadratic, so this configuration is still
-        // the interesting one but no longer the alarming one.
+        // Below the 2/3 justification threshold: nothing justifies. Replay is
+        // still direct canonical extension; this fixture now measures whether
+        // transition/finality work itself changes with chain depth.
         participation: env_u64("BLOCH_CURVE_PARTICIPATION", 60) as u32,
         depth: env_u64("BLOCH_BENCH_DEPTH", DEFAULT_DEPTH),
     };
@@ -807,11 +812,10 @@ fn perf_replay_depth_curve() {
 }
 
 /// Same measurement as [`perf_replay_depth_curve`], in the HEALTHY regime:
-/// full participation, so justification advances and the fork-choice walk is
-/// bounded by the unfinalized suffix instead of by the chain.
+/// full participation, so justification advances.
 ///
 /// The pair is the experiment. One number from one regime proves nothing;
-/// the ratio between them is what says whether depth matters.
+/// the ratio between them says whether transition/finality depth matters.
 #[test]
 #[ignore]
 fn perf_replay_depth_curve_justified() {
@@ -928,9 +932,7 @@ fn bench(cfg: BenchCfg) {
     println!("  eUTXO set at the tip                        : {utxos:>9}");
     println!("  justified epoch / finalized epoch           : {justified:>4} / {finalized}");
     if finalized == 0 {
-        println!("  NOTE: nothing finalized. Fork choice walks from the JUSTIFIED");
-        println!("        checkpoint, so an unjustified fixture makes that walk deeper than");
-        println!("        the live chain's and OVERSTATES the forkchoice share.");
+        println!("  NOTE: nothing finalized; boot replay still performs no fork-choice walk.");
     }
     assert!(!chain.is_empty(), "the fixture produced no blocks at all");
 
@@ -1052,8 +1054,8 @@ fn bench(cfg: BenchCfg) {
     // Every block in a replay is applied at a different chain depth: block i
     // is the (i+1)th. So one run already contains the whole curve — binning
     // the samples by position is the measurement, and it needs no extra runs.
-    // A single average over the run would hide exactly the superlinearity
-    // this is looking for.
+    // A single average over the run would hide depth-dependent transition or
+    // retained-state costs this is looking for.
     println!("\n── per-block cost BY CHAIN DEPTH, MEASURED (run 0) ──");
     println!(
         "{:>14}  {:>11}  {:>11}  {:>11}  {:>11}",
@@ -1094,7 +1096,9 @@ fn bench(cfg: BenchCfg) {
         );
     }
     if !perf::ENABLED {
-        println!("  (forkchoice/state_root columns are zero: built without perf-timing)");
+        println!("  (phase columns are zero: built without perf-timing)");
+    } else {
+        println!("  (forkchoice must stay zero: boot replay is direct canonical extension)");
     }
     println!(
         "  growth across the run: total {:.2}x, forkchoice {:.2}x",
@@ -1102,10 +1106,8 @@ fn bench(cfg: BenchCfg) {
         if first_fc > 0.0 { last_fc / first_fc } else { 0.0 }
     );
     println!(
-        "  (a flat total means depth does not matter at this chain length; a rising\n\
-         \x20  forkchoice column is the depth term becoming visible; since\n\
-         \x20  perf/fork that term is LINEAR in depth, so a column that grows\n\
-         \x20  in step with depth is expected and not a regression.)"
+        "  (a flat total means depth does not matter at this chain length; any\n\
+         \x20  non-zero forkchoice column is a replay-path regression.)"
     );
 
     // ── extrapolation, clearly labelled ─────────────────────────────────────
@@ -1123,10 +1125,10 @@ fn bench(cfg: BenchCfg) {
         t_genesis.as_secs_f64()
     );
     println!(
-        "  CAVEAT: LINEAR extrapolation from a {}-block chain. `forkchoice_head` is\n\
-         \x20 O(V+N+D) over the UNJUSTIFIED suffix -- linear, since perf/fork -- but\n\
-         \x20 `Engine::blocks` is still unpruned, so a real {depth}-block replay is a\n\
-         \x20 LOWER bound, not an estimate. The depth\n\
+        "  CAVEAT: LINEAR extrapolation from a {}-block chain. Boot replay does\n\
+         \x20 not invoke `forkchoice_head`, but decoded canonical envelopes and\n\
+         \x20 `Engine::blocks` are still retained, and transition cost can grow\n\
+         \x20 with state. This is not a production SLA. The depth\n\
          \x20 table above says how far from linear this particular run was.",
         chain.len()
     );
@@ -1168,4 +1170,76 @@ fn bench(cfg: BenchCfg) {
     }
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Restart-cache measurement on the same cryptographically valid fixture as
+/// full replay. No production SLA is inferred from this local benchmark.
+#[test]
+#[ignore]
+fn perf_local_cache_recovery() {
+    std::thread::Builder::new().stack_size(512 << 20).spawn(|| {
+        let leaves = env_u64("BLOCH_BENCH_CARRYOVER", 8192) as u32;
+        let blocks = env_u64("BLOCH_BENCH_BLOCKS", 96);
+        let tail = env_u64("BLOCH_CACHE_TAIL", 31) as usize;
+        let dir = std::env::temp_dir().join(format!("bloch-cache-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut generator = Generator::new(&dir.join("keys"), leaves, 100);
+        let mut chain = Vec::new();
+        for slot in 1..=blocks {
+            if let Some(block) = generator.block_at(slot) { chain.push(block); }
+        }
+        assert!(chain.len() > tail);
+        let count = chain.len() - tail;
+        let expected = generator.state.clone();
+        // Fresh OS threads isolate the consensus thread-local memos from
+        // fixture generation and from one another. OS filesystem caches are
+        // not flushed, so this is cold application state, not cold storage.
+        let full_manifest = clone_manifest(&generator.manifest);
+        let full_chain = chain.clone();
+        let full_dir = dir.join("full");
+        let full_expected = expected.clone();
+        let (genesis_ms, full_replay_with_cache_write_ms) = std::thread::Builder::new()
+            .stack_size(512 << 20).spawn(move || {
+                let t = Instant::now();
+                let mut full = boot_engine(full_manifest, &full_dir);
+                let genesis_ms = ms(t.elapsed());
+                let t = Instant::now();
+                for (i, block) in full_chain.iter().enumerate() {
+                    assert!(full.ingest_replay(block.clone()));
+                    if i + 1 == count {
+                        full.store.rewrite(&full_chain[..count]).unwrap();
+                        full.write_local_cache().unwrap();
+                    }
+                }
+                let replay_ms = ms(t.elapsed());
+                assert_eq!(*full.state, full_expected);
+                full.store.rewrite(&full_chain).unwrap();
+                (genesis_ms, replay_ms)
+            }).unwrap().join().unwrap();
+        let restore_manifest = clone_manifest(&generator.manifest);
+        let restore_dir = dir.join("full");
+        let (cached_boot_genesis_ms, log_read_ms, restore_ms, tail_ms, skipped) =
+            std::thread::Builder::new().stack_size(512 << 20).spawn(move || {
+                let t = Instant::now();
+                let mut restored = boot_engine(restore_manifest, &restore_dir);
+                let genesis_ms = ms(t.elapsed());
+                let t = Instant::now();
+                let mut logged = restored.store.read_all().unwrap();
+                let log_ms = ms(t.elapsed());
+                let t = Instant::now();
+                let skipped = restored.restore_local_cache(&mut logged).unwrap();
+                let restore_ms = ms(t.elapsed());
+                assert_eq!(skipped, count);
+                let t = Instant::now();
+                for block in logged { assert!(restored.ingest_replay(block)); }
+                let tail_ms = ms(t.elapsed());
+                assert_eq!(*restored.state, expected);
+                (genesis_ms, log_ms, restore_ms, tail_ms, skipped)
+            }).unwrap().join().unwrap();
+        println!("RECOVERY_BENCH application_cache=cold filesystem_cache=uncontrolled cpu={:?} leaves={} blocks={} skipped={} tail={} genesis_ms={:.3} full_replay_including_cache_write_ms={:.3} cached_boot_genesis_ms={:.3} log_read_ms={:.3} restore_ms={:.3} tail_ms={:.3} cached_total_ms={:.3}",
+            cpu(), leaves, chain.len(), skipped, tail, genesis_ms, full_replay_with_cache_write_ms,
+            cached_boot_genesis_ms, log_read_ms, restore_ms, tail_ms,
+            cached_boot_genesis_ms + log_read_ms + restore_ms + tail_ms);
+        std::fs::remove_dir_all(dir).unwrap();
+    }).unwrap().join().unwrap();
 }

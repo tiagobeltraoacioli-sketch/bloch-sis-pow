@@ -1,0 +1,28 @@
+# Restrict this build context independently of the legacy root Dockerfile.
+**
+!crates/
+!crates/coherence-core/
+!crates/coherence-core/Cargo.toml
+!crates/coherence-core/src/
+!crates/coherence-core/src/**
+!crates/coherence-prover/
+!crates/coherence-prover/program/
+!crates/coherence-prover/program/Cargo.toml
+!crates/coherence-prover/program/Cargo.lock
+!crates/coherence-prover/program/src/
+!crates/coherence-prover/program/src/**
+!crates/coherence-prover/service/
+!crates/coherence-prover/service/Cargo.toml
+!crates/coherence-prover/service/Cargo.lock
+!crates/coherence-prover/service/src/
+!crates/coherence-prover/service/src/**
+# Defense in depth if sensitive material is accidentally placed under src/.
+**/validator.key
+**/*.sk
+**/*.pem
+**/slashing-protection.bin
+**/passphrase*
+**/.env
+**/.env.*
+**/id_rsa*
+**/id_ed25519*

@@ -1,0 +1,40 @@
+[
+  {
+    "leaves": 8192.0,
+    "blocks": 96.0,
+    "skipped": 65.0,
+    "tail": 31.0,
+    "genesis_ms": 1147.449,
+    "full_replay_including_cache_write_ms": 1182.01,
+    "cached_boot_genesis_ms": 1189.54,
+    "log_read_ms": 3.481,
+    "restore_ms": 182.864,
+    "tail_ms": 330.336,
+    "cached_total_ms": 1706.221,
+    "cpu": "Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz",
+    "application_cache": "cold_thread_local_memos",
+    "filesystem_cache": "uncontrolled",
+    "host_contention": "uncontrolled",
+    "scope": "single_in_process_fixture_not_rpc_readiness",
+    "raw_result": "RECOVERY_BENCH application_cache=cold filesystem_cache=uncontrolled cpu=\"Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz\" leaves=8192 blocks=96 skipped=65 tail=31 genesis_ms=1147.449 full_replay_including_cache_write_ms=1182.010 cached_boot_genesis_ms=1189.540 log_read_ms=3.481 restore_ms=182.864 tail_ms=330.336 cached_total_ms=1706.221"
+  },
+  {
+    "leaves": 452726.0,
+    "blocks": 96.0,
+    "skipped": 65.0,
+    "tail": 31.0,
+    "genesis_ms": 58886.004,
+    "full_replay_including_cache_write_ms": 25603.407,
+    "cached_boot_genesis_ms": 77018.348,
+    "log_read_ms": 12.053,
+    "restore_ms": 2379.176,
+    "tail_ms": 8032.224,
+    "cached_total_ms": 87441.801,
+    "cpu": "Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz",
+    "application_cache": "cold_thread_local_memos",
+    "filesystem_cache": "uncontrolled",
+    "host_contention": "uncontrolled",
+    "scope": "single_in_process_fixture_not_rpc_readiness",
+    "raw_result": "RECOVERY_BENCH application_cache=cold filesystem_cache=uncontrolled cpu=\"Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz\" leaves=452726 blocks=96 skipped=65 tail=31 genesis_ms=58886.004 full_replay_including_cache_write_ms=25603.407 cached_boot_genesis_ms=77018.348 log_read_ms=12.053 restore_ms=2379.176 tail_ms=8032.224 cached_total_ms=87441.801"
+  }
+]

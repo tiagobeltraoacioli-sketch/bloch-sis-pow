@@ -1,0 +1,100 @@
+Fifth-wave validation — 2026-09-17
+Base fb65a38; branch fix/internal-audit-20260917; macOS x86_64, Rust1.94.1.
+Shared target; two build jobs and four test threads for integrated node run.
+Local logs under /private/tmp. Imported-module integration tests repeat some unit coverage.
+No Linux/hosted CI/live validator or Pages qualification. Ignored tests are not evidence of success.
+
+bloch-wave5-node-final.log
+Command: cargo test -p bloch-pos-node
+Scope: Integrated node tests. One trailing blank line in a test source was removed after compilation; no behavior changed.
+SHA256 0653c84a6a25b06f58f79ed43874502d9b58fe4fc36a85bc20208a1d2ba8d5b8
+test result: ok. 430 passed; 0 failed; 19 ignored; 0 measured; 0 filtered out; finished in 89.36s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 52.35s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.43s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 64 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.11s
+test result: ok. 0 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.79s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.13s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.98s
+
+bloch-wave5-hardened-corrected.log
+Command: bash scripts/hardened-clippy.sh
+Scope: Five crate ratchets after removing intermediate panic wrapper; arithmetic baseline lowered77to74, none increased.
+SHA256 4ded19f489ab1c5281e92faac1898f4e0f3cfca850cfefea40dc0b3ae91c154f
+hardened-clippy: toolchain 1.94.1 (pinned by rust-toolchain.toml)
+hardened-clippy: OK
+
+bloch-audit-wave5-proposal-final.log
+Command: cargo test -p bloch-pos-node --bin bloch-pos proposal_
+Scope: Five proposal tests after correcting a test-only stale gate assumption. Actual funded-admission gate is 2884; no gate changed. Active multi-funded dedicated qualification remains pending.
+SHA256 80665cdcd5452050a5f58ba0fc7803e38378e60950b1978bdac46f80cda832f1
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 444 filtered out; finished in 1.96s
+
+bloch-audit-wave5-transfer-compat.log
+Command: cargo test -p bloch-pos-node --bin bloch-pos transfer_v2_end_to_end
+Scope: Existing transfer compatibility tests.
+SHA256 ffbd508ed06b0ff0ccbeac291ebcccc3e4c87a1574326b25b3cd26e3cde50249
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 427 filtered out; finished in 2.04s
+
+bloch-wave5-keys-final.log
+Command: cargo test -p bloch-pos-node --bin bloch-pos keys::tests
+Scope: Keystore suite includes pre-allocation combined cost refusal; expensive legacy recovery parameter validation does not execute a 1 GiB/64-pass derivation.
+SHA256 9adb310f7a8224d17f82dc69ba1c197648d02b77f45e414011f616e878818abc
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 415 filtered out; finished in 2.80s
+
+bloch-wave5-ws-tool-final.log
+Command: cargo test -p bloch-pos-node --bin bloch-pos ws_tool::tests
+Scope: Registry race and final directory durability path.
+SHA256 951629bc3169cbbd8d2bb2c88a4025a7a41da75e444d87eb5cdbe6d1a26ea68c
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 431 filtered out; finished in 2.56s
+
+bloch-wave5-genesis.log
+Command: cargo test -p bloch-pos-node --bin bloch-pos audit_new_genesis_refuses_aliasing
+Scope: New-input invariant test preserves historical decode behavior.
+SHA256 f9712dc6a006404e3e4f4f14a48646ee2eb7ee37687446a4a35222d16eca174b
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 447 filtered out; finished in 0.00s
+
+bloch-wave5-operator-cli.log
+Command: cargo test -p bloch-pos-node --test genesis_creation_identity_cli --test keys_seal_cli --test keystore_at_rest
+Scope: Nine real-binary operator tests.
+SHA256 09d7c7a222d3f4c5ca83d27ebbaac29d5901f640bd76793723920e48aef305b0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.26s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
+
+audit-wallet-wave5-nonpanic.log
+Command: cargo test -p bloch-crypto --offline
+Scope: Final wallet suite after nonpanicking Result API correction and cross-network compatibility; ignored tests remain unqualified.
+SHA256 ff49127481406390fe677d0e14052fe805e621662d09db136fc177f72d1107b3
+test result: ok. 173 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 13.53s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+audit-api-wave5.log
+Command: cargo test --manifest-path services/pq-shield-api/Cargo.toml --offline
+Scope: Shield API tests including minimized responses and no malformed-input echoes.
+SHA256 bc531b9ee2db0e6cd2494e4c8d4c1c5293207287020b52b7485517b94df4bdd9
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+audit-legacy-cli-wave5-nonpanic.log
+Command: cargo check -p bloch --bin bloch-cli --offline
+Scope: Compile-check migrated legacy CLI import caller; final Result API; existing warnings.
+SHA256 35563c03a6f567ef0d7b2edb76175f58654e939c80d055a69057f47b2e46200d
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.26s
+
+bloch-wave5-indexer-final.log
+Command: npm --prefix tools/indexer test
+Scope: Selftest plus 36 node:test cases under Node24.21.0; local sockets required sandbox escalation. No live chain or canonical-height contract qualification.
+SHA256 3d266754be40d8f2224f019fc78db5a71511cab40bda63cf1126fe8b152aea0e
+ℹ tests 36
+ℹ pass 36
+ℹ fail 0

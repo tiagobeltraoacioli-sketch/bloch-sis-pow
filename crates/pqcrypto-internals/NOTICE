@@ -7,14 +7,15 @@ dual-licensed under the MIT license (LICENSE-MIT) and the Apache License,
 Version 2.0 (LICENSE-APACHE), at your option — the same terms as upstream
 (see Cargo.toml `license = "MIT OR Apache-2.0"`).
 
-Fork scope (audit finding G3 — recorded here so provenance is not only a
-claim in a doc comment): ONLY `src/lib.rs` has been modified from upstream
-0.2.11, to add a thread-local seeded-RNG override for deterministic ML-DSA/
-Falcon keygen (`with_seeded_rng`, see the module docs and README.md). The
-build system (`build.rs`) and the vendored C sources are claimed to be
-byte-for-byte identical to upstream 0.2.11's copies — see `VENDOR.toml` for a
-per-file SHA-256 hash pin of everything under `cfiles/` and `include/`, and
-`tests/vendor_pin.rs` for the test that recomputes and checks it.
+Fork scope (CR-09 correction): local modifications include src/lib.rs,
+Cargo.toml, build.rs, tests and provenance documentation. In particular the
+build script has WASI-specific handling for libc include paths. The fork is
+not a Rust-shim-only change. See README.md for scope and current limitations.
+
+VENDOR.toml and tests/vendor_pin.rs record and verify this repository's
+baseline for cfiles/ and include/. They neither pin the build script nor prove
+identity to an independently authenticated upstream 0.2.11 release. No such
+external provenance verification is claimed by this correction.
 
 Vendored third-party C sources
 -------------------------------
@@ -23,9 +24,8 @@ The files under `cfiles/` and `include/` are PQClean reference and optimized
 implementations (SHA3/SHAKE, Keccak, AES, NIST DRBG seed expander, random-byte
 generation, and the SP 800-185 constructions), carried into this crate by
 upstream `pqcrypto-internals` as its C support layer for the pqcrypto family
-of post-quantum algorithm crates. They are reproduced here unmodified from
-upstream 0.2.11 (see `VENDOR.toml`); no changes have been made to any file
-under `cfiles/` or `include/` by this fork.
+of post-quantum algorithm crates. Their contents are pinned by `VENDOR.toml`; this correction changes no file
+under `cfiles/` or `include/`. External upstream identity remains unverified.
 
 PQClean (https://github.com/PQClean/PQClean) states that its reference/
 optimized implementations are, per algorithm, released into the public
@@ -33,8 +33,7 @@ domain (CC0-1.0) or under a permissive license (MIT-style) by their original
 authors; upstream `pqcrypto-internals` redistributes them under its own
 overall MIT OR Apache-2.0 crate license. This NOTICE does not itself
 re-derive or re-verify each individual upstream author's license grant per
-file (this sandbox has no network access to the PQClean/rustpq upstream
-repositories to do so) — it records the provenance and licensing basis as
+file — it records the provenance and licensing basis as
 documented by the crate this fork is taken from, so that basis is visible
 in-tree rather than only implied by an unstated "same as upstream" comment.
 Anyone redistributing this crate should independently confirm the current

@@ -19,7 +19,7 @@
 //!
 //! This fork overrides `PQCRYPTO_RUST_randombytes` to check a thread-local
 //! seeded RNG before falling back to OS entropy. Callers use the
-//! `with_seeded_rng` helper (or set/clear manually) to scope determinism
+//! `with_seeded_rng_scope` helper to scope determinism
 //! around a specific keypair generation call.
 //!
 //! # Semantics
@@ -42,7 +42,7 @@
 //! - The override is a NO-OP for signing randomness if the caller doesn't
 //!   set the thread-local — signing remains hedged (randomized) by
 //!   default, which is the FIPS 204 recommended mode.
-//! - DO NOT use `with_seeded_rng` around `sign()` unless you explicitly
+//! - DO NOT use `with_seeded_rng_scope` around `sign()` unless you explicitly
 //!   want deterministic signatures. Deterministic signatures are more
 //!   vulnerable to fault attacks; the hedged variant is preferred.
 //!   Keygen is different — keygen is inherently deterministic-from-seed
@@ -79,26 +79,11 @@ thread_local! {
     static SEEDED_RNG_STACK: RefCell<Vec<SeededEntry>> = const { RefCell::new(Vec::new()) };
 }
 
-/// RAII guard that removes this call's seeded RNG from the thread-local stack.
-///
-/// Returned by [`with_seeded_rng`]. Hold this for the duration of any
-/// PQClean call that should consume deterministic bytes.
-///
-/// The guard is neither `Send` nor `Sync`: its destructor must run on the
-/// thread whose entropy source it changed. Moving the old zero-sized guard
-/// to another thread left the original thread deterministically seeded.
-///
-/// ```compile_fail
-/// let guard = pqcrypto_internals::with_seeded_rng(&[7; 32]);
-/// std::thread::spawn(move || drop(guard));
-/// ```
-///
-/// ```compile_fail
-/// fn require_sync<T: Sync>() {}
-/// require_sync::<pqcrypto_internals::SeededRngGuard>();
-/// ```
+/// Internal RAII guard for the scoped public API. Keeping this type and its
+/// constructor private prevents downstream callers from forgetting a guard
+/// and leaving deterministic entropy active for later operations.
 #[must_use = "guard must remain in scope — dropping it restores the previous RNG (or OS RNG)"]
-pub struct SeededRngGuard {
+struct SeededRngGuard {
     // Rc both binds the guard to its thread and identifies its exact entry.
     id: Rc<()>,
 }
@@ -108,7 +93,7 @@ impl Drop for SeededRngGuard {
         // Explicit drop can destroy an outer guard before an inner one.
         // Remove by identity: popping would remove the inner RNG instead,
         // then reactivate an outer seed whose owner had already been dropped.
-        SEEDED_RNG_STACK.with(|stack| {
+        let _ = SEEDED_RNG_STACK.try_with(|stack| {
             let mut stack = stack.borrow_mut();
             if let Some(index) = stack.iter().position(|entry| Rc::ptr_eq(&entry.id, &self.id)) {
                 stack.remove(index);
@@ -117,30 +102,12 @@ impl Drop for SeededRngGuard {
     }
 }
 
-/// Activate deterministic bytes for PQClean calls on this thread.
+/// Activate deterministic bytes for an internal PQClean test scope.
 ///
 /// Subsequent calls to `PQCRYPTO_RUST_randombytes` on this thread will
 /// return bytes from a ChaCha20 CSPRNG keyed with `seed`. When the
 /// returned guard is dropped, the override is cleared and OS RNG is
 /// restored.
-///
-/// # Example
-///
-/// ```ignore
-/// use pqcrypto_internals::with_seeded_rng;
-/// use pqcrypto_mldsa::mldsa65;
-///
-/// let seed = [0u8; 32]; // derive this from BIP39 / HKDF / etc.
-/// let (pk1, sk1) = {
-///     let _guard = with_seeded_rng(&seed);
-///     mldsa65::keypair()
-/// };
-/// let (pk2, sk2) = {
-///     let _guard = with_seeded_rng(&seed);
-///     mldsa65::keypair()
-/// };
-/// // Same seed → same keypair bytes.
-/// ```
 ///
 /// # Nesting (I-2)
 ///
@@ -159,7 +126,10 @@ impl Drop for SeededRngGuard {
 ///
 /// Still not recommended as a matter of style (a nested call SHOULD have a
 /// reason), but it can no longer corrupt an enclosing scope's determinism.
-pub fn with_seeded_rng(seed: &[u8; 32]) -> SeededRngGuard {
+///
+/// This primitive stays private. Downstream code must use
+/// [`with_seeded_rng_scope`], which owns cleanup across return and unwind.
+fn with_seeded_rng(seed: &[u8; 32]) -> SeededRngGuard {
     let rng = ChaCha20Rng::from_seed(*seed);
     let id = Rc::new(());
     SEEDED_RNG_STACK.with(|stack| {
@@ -168,9 +138,44 @@ pub fn with_seeded_rng(seed: &[u8; 32]) -> SeededRngGuard {
     SeededRngGuard { id }
 }
 
+/// Run a synchronous operation with a deterministic PQClean RNG override.
+///
+/// The caller never receives the cleanup guard. Normal return and unwinding
+/// remove this scope and all nested overrides, including forgotten legacy
+/// guards, while preserving the exact position of any outer stream. A guard
+/// returned from the closure is already inactive. This does not clean up
+/// overrides forgotten *before* this scope, or promise cleanup after abort.
+/// Do not return an async future expecting the override to cover its polling.
+/// The ChaCha byte stream and C ABI are unchanged; opaque RNG state erasure
+/// remains unsupported by the current dependency.
+///
+/// The old manual guard is deliberately not part of the public API:
+///
+/// ```compile_fail
+/// let _forgotten = pqcrypto_internals::with_seeded_rng(&[7; 32]);
+/// ```
+pub fn with_seeded_rng_scope<T>(seed: &[u8; 32], operation: impl FnOnce() -> T) -> T {
+    struct Scope(SeededRngGuard);
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            // Identity, not saved length: an outer legacy guard may have been
+            // explicitly dropped while this closure was running.
+            let _ = SEEDED_RNG_STACK.try_with(|stack| {
+                let mut stack = stack.borrow_mut();
+                if let Some(index) = stack.iter().position(|entry| Rc::ptr_eq(&entry.id, &self.0.id)) {
+                    stack.truncate(index);
+                }
+            });
+        }
+    }
+    let _scope = Scope(with_seeded_rng(seed));
+    operation()
+}
+
 /// Fill `buf` with random bytes — safe-Rust core of the FFI entry point.
 ///
-/// - If a seeded RNG is active on this thread (via [`with_seeded_rng`]):
+/// - If a seeded RNG is active on this thread (via
+///   [`with_seeded_rng_scope`]):
 ///   fills `buf` with deterministic bytes from that RNG (infallible).
 /// - Otherwise: fills `buf` with OS entropy via `getrandom::fill` —
 ///   identical to upstream pqcrypto-internals — and propagates any OS RNG
@@ -179,7 +184,7 @@ pub fn randombytes_fill(buf: &mut [u8]) -> Result<(), getrandom::Error> {
     // Fast path: no seeded RNG active (empty stack) → upstream behavior
     // exactly. Otherwise draw from the TOP of the stack (I-2) — the most
     // recently pushed, still-active guard.
-    let used_seeded = SEEDED_RNG_STACK.with(|stack| {
+    let used_seeded = SEEDED_RNG_STACK.try_with(|stack| {
         let mut s = stack.borrow_mut();
         match s.last_mut() {
             Some(entry) => {
@@ -190,7 +195,9 @@ pub fn randombytes_fill(buf: &mut [u8]) -> Result<(), getrandom::Error> {
         }
     });
 
-    if !used_seeded {
+    // Other TLS destructors may request entropy after this stack is destroyed.
+    // There is then no live override; use OS entropy rather than panic over FFI.
+    if !used_seeded.unwrap_or(false) {
         #[cfg(test)]
         if FORCE_RNG_FAILURE.load(core::sync::atomic::Ordering::Relaxed) {
             return Err(getrandom::Error::UNEXPECTED);
@@ -305,6 +312,75 @@ pub unsafe extern "C" fn PQCRYPTO_RUST_randombytes(buf: *mut u8, len: size_t) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_rng_cleans_forgotten_nested_guards_on_return_and_unwind() {
+        for unwind in [false, true] {
+            let result = std::panic::catch_unwind(|| {
+                with_seeded_rng_scope(&[1; 32], || {
+                    std::mem::forget(with_seeded_rng(&[2; 32]));
+                    with_seeded_rng_scope(&[3; 32], || {
+                        std::mem::forget(with_seeded_rng(&[4; 32]));
+                    });
+                    assert_eq!(SEEDED_RNG_STACK.with(|s| s.borrow().len()), 2);
+                    if unwind { panic!("intentional scope unwind"); }
+                });
+            });
+            assert_eq!(result.is_err(), unwind);
+            assert!(SEEDED_RNG_STACK.with(|s| s.borrow().is_empty()));
+        }
+    }
+
+    #[test]
+    fn scoped_rng_preserves_outer_stream_and_invalidates_returned_guard() {
+        let seed = [5; 32];
+        let mut expected = [0; 64];
+        ChaCha20Rng::from_seed(seed).fill_bytes(&mut expected);
+        let outer = with_seeded_rng(&seed);
+        let mut first = [0; 32];
+        randombytes_fill(&mut first).unwrap();
+        let returned = with_seeded_rng_scope(&[6; 32], || with_seeded_rng(&[7; 32]));
+        let mut second = [0; 32];
+        randombytes_fill(&mut second).unwrap();
+        assert_eq!(first, expected[..32]);
+        assert_eq!(second, expected[32..]);
+        drop(returned);
+        assert_eq!(SEEDED_RNG_STACK.with(|s| s.borrow().len()), 1);
+        drop(outer);
+        assert!(SEEDED_RNG_STACK.with(|s| s.borrow().is_empty()));
+    }
+
+    #[test]
+    fn scoped_rng_cleanup_survives_outer_guard_removed_inside_closure() {
+        let outer = with_seeded_rng(&[1; 32]);
+        with_seeded_rng_scope(&[2; 32], || {
+            drop(outer);
+            std::mem::forget(with_seeded_rng(&[3; 32]));
+        });
+        assert!(SEEDED_RNG_STACK.with(|s| s.borrow().is_empty()));
+    }
+
+    #[test]
+    fn legacy_guard_drop_and_entropy_are_safe_after_rng_tls_destruction() {
+        // Initialize HOLDER before STACK: TLS destructors run in reverse order.
+        // Its destructor therefore drops a legacy guard after STACK is gone.
+        struct Holder(Option<SeededRngGuard>);
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                assert!(SEEDED_RNG_STACK.try_with(|_| ()).is_err(), "exercise destroyed TLS, not ordinary drop");
+                drop(self.0.take());
+                randombytes_fill(&mut [0; 32]).unwrap();
+            }
+        }
+        thread_local! {
+            static HOLDER: RefCell<Holder> = const { RefCell::new(Holder(None)) };
+        }
+        std::thread::spawn(|| {
+            HOLDER.with(|holder| {
+                holder.borrow_mut().0 = Some(with_seeded_rng(&[9; 32]));
+            });
+        }).join().unwrap();
+    }
 
     /// Without a seeded RNG, two consecutive calls produce different bytes
     /// (OS RNG behavior — effectively never the same for 32-byte buffers).

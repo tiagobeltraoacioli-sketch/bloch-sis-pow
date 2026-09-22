@@ -107,6 +107,16 @@ pub const ACTIVATION_DELAY_EPOCHS: u64 = 8;
 /// `set_size / 4` epochs of publicly visible queue traffic to take a majority.
 pub const MAX_ACTIVATIONS_PER_EPOCH: usize = 4;
 
+/// Candidate lifetime ceiling for the permanent validator registry and its
+/// deposit history, consulted only behind
+/// `params::ACTIVATION_QUEUE_V2_ACTIVATION_EPOCH`.
+///
+/// Registry records are never deleted, so a pending-only cap would not bound
+/// state or the boundary scan. 4,096 permits 64 times the genesis cohort and
+/// represents at least 102.4 million BLOCH bonded at the 25,000-BLOCH floor.
+/// The value is a protocol candidate, not an activated capacity promise.
+pub const MAX_VALIDATOR_REGISTRY_ENTRIES: usize = 4_096;
+
 /// Voluntary exits admitted per epoch — the churn budget on the way OUT, and
 /// the exact mirror of [`MAX_ACTIVATIONS_PER_EPOCH`] on the way in.
 ///
@@ -142,9 +152,9 @@ pub const MAX_EXITS_PER_EPOCH: usize = 4;
 ///
 /// `voluntary_exits_this_epoch` counts the records whose `exit_epoch` equals
 /// `epoch + EXIT_DELAY_EPOCHS`, and it is allowed to do that *only* because a
-/// slashing ejection writes `exit_epoch = epoch` with no delay. Those two
-/// numbers are distinguishable exactly while [`EXIT_DELAY_EPOCHS`] is
-/// non-zero. Set it to zero and the two paths become indistinguishable in
+/// slashing ejection writes `exit_epoch = epoch + 1`. Those two numbers are
+/// distinguishable exactly while [`EXIT_DELAY_EPOCHS`] is greater than one.
+/// Set it to one and the two paths become indistinguishable in
 /// state: a wave of ejections would silently consume the voluntary budget and
 /// freeze honest exits, and an attacker could buy immunity from ejection by
 /// spending the epoch's exits first — a consensus rule quietly changing
@@ -155,9 +165,9 @@ pub const MAX_EXITS_PER_EPOCH: usize = 4;
 /// and it fails the build of whoever edits the delay rather than a node in
 /// production.
 const _: () = assert!(
-    EXIT_DELAY_EPOCHS > 0,
+    EXIT_DELAY_EPOCHS > 1,
     "MAX_EXITS_PER_EPOCH accounting distinguishes a voluntary exit from a slashing \
-     ejection by the delay alone; with EXIT_DELAY_EPOCHS = 0 they are the same number",
+     ejection by the delay alone; with EXIT_DELAY_EPOCHS = 1 they are the same number",
 );
 
 /// Epochs between a voluntary exit and the validator no longer being assigned
@@ -565,6 +575,7 @@ pub fn validate_wire_deposit(
 
 /// A validated deposit waiting for activation, as committed in state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct QueuedDeposit {
     /// SHA3-256 of the hybrid pubkey — 32 bytes of identity instead of 3,745.
     pub pubkey_hash: [u8; 32],
@@ -583,6 +594,25 @@ impl QueuedDeposit {
     fn queue_key(&self) -> (u64, [u8; 32]) {
         (self.deposit_epoch, self.pubkey_hash)
     }
+}
+
+/// Candidate same-epoch activation priority. The caller supplies the beacon
+/// seed for the epoch being opened, which is unavailable when an applicant
+/// chooses its key eight or more epochs earlier.
+pub(crate) fn activation_queue_priority(
+    queue_v2: bool,
+    seed: &[u8; 32],
+    pubkey_hash: &[u8; 32],
+) -> [u8; 32] {
+    if !queue_v2 {
+        return *pubkey_hash;
+    }
+    let mut h = Sha3_256::new();
+    h.update(crate::params::DS_SORTITION);
+    h.update(seed);
+    h.update(pubkey_hash);
+    h.update([crate::params::ROLE_ACTIVATION_QUEUE]);
+    h.finalize().into()
 }
 
 /// Resolve activation epochs for every queued deposit, up to and including
@@ -1125,6 +1155,33 @@ mod tests {
         // deposit, then the epoch-1 deposit — even though its hash is lowest.
         let ids: Vec<u8> = order1.iter().map(|(h, _)| h[0]).collect();
         assert_eq!(ids, vec![0x0a, 0x0b, 0x0c, 0x0e, 0x0f, 0x01]);
+    }
+
+    /// ST-13 candidate: priority is a deterministic permutation for one seed
+    /// and changes when the not-yet-known activation seed changes. Raw public
+    /// key order is therefore not the armed tiebreak.
+    #[test]
+    fn activation_priority_is_seeded_not_raw_pubkey_order() {
+        let keys: Vec<[u8; 32]> = (0..16u8).map(|i| [i; 32]).collect();
+        let order = |seed: [u8; 32]| {
+            let mut ranked = keys.clone();
+            ranked.sort_by_key(|key| activation_queue_priority(true, &seed, key));
+            ranked
+        };
+        let first = order([0x11; 32]);
+        let again = order([0x11; 32]);
+        let second = order([0x22; 32]);
+        assert_eq!(first, again, "one committed seed must define one deterministic order");
+        assert_ne!(first, keys, "candidate order must not be raw applicant-chosen key order");
+        assert_ne!(first, second, "changing the future seed must change activation priority");
+        let mut sorted = first;
+        sorted.sort_unstable();
+        assert_eq!(sorted, keys, "priority must permute, never add or drop, applicants");
+        assert_eq!(
+            activation_queue_priority(false, &[0xFF; 32], &keys[7]),
+            keys[7],
+            "below the gate the activation tiebreak must remain the raw public-key hash"
+        );
     }
 
     // -- exit and withdrawal ------------------------------------------------

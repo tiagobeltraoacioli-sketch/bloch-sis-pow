@@ -297,6 +297,7 @@ dependencies = [
  "bloch-euvm",
  "sha3",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
@@ -348,6 +349,7 @@ dependencies = [
  "hex",
  "hkdf",
  "sha2",
+ "zeroize",
 ]
 
 [[package]]

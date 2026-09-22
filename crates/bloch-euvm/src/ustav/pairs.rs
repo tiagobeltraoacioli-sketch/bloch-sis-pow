@@ -187,6 +187,9 @@ impl Ledger {
         gas = gas
             .checked_sub(second.gas_used)
             .ok_or(NativeError::OutOfGas)?;
+        let gas_used = gas_limit
+            .checked_sub(gas)
+            .ok_or(NativeError::ArithmeticOverflow)?;
 
         // No fallible transition remains after this point. Both legs have passed
         // the same native owner/module/KYC/expiry/conservation checks as apply().
@@ -201,7 +204,7 @@ impl Ledger {
             pair: pair.id(),
             authorization,
             legs: [first, second],
-            gas_used: gas_limit - gas,
+            gas_used,
         })
     }
 }

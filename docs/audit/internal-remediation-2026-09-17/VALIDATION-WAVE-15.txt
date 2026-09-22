@@ -1,0 +1,33 @@
+Validation wave 15 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Documentation reconciliation: a27f98b
+CI gate repair: 9e74fbb
+
+PASS
+
+cargo test -p bloch-pos-node --test slashing_backed_finality_claims
+  5 passed; decoder, schedule, observation hook, uniqueness and claim guard.
+
+cargo test -p bloch-pos-committee slashing_evidence_gate_matches_the_lifecycle_schedule
+cargo test -p bloch-pos-committee randao_recommit_gate_matches_the_lifecycle_schedule
+cargo test -p bloch-pos-committee withdrawal_gate_matches_the_lifecycle_schedule
+  1 passed in each focused run; all three production gates remain epoch 2884.
+
+python3 scripts/check-comment-constants.py
+  430 files scanned; 565 resolvable constants; 46 value claims checked;
+  3 historical/hypothetical claims skipped; 0 suppressions; 0 contradictions.
+
+bash scripts/ci-banned-words.sh
+  Passed; no trademark or attestation-bleed violations.
+
+bash scripts/ci-banned-words.selftest.sh
+  5 passed; 0 failed, covering bypass, genuine negation, affirmative claim,
+  negated trademark and clean text.
+
+git diff --check
+  Passed before both implementation commits and before this evidence checkpoint.
+
+LIMIT
+
+These are local executions. No hosted GitLab pipeline or fleet binary was
+changed or observed by this wave.

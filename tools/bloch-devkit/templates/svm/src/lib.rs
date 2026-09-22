@@ -1,5 +1,7 @@
-use solana_program::{account_info::{next_account_info, AccountInfo}, entrypoint,
-    entrypoint::ProgramResult, program_error::ProgramError, pubkey::Pubkey};
+use solana_account_info::{next_account_info, AccountInfo};
+use solana_program_entrypoint::{entrypoint, ProgramResult};
+use solana_program_error::ProgramError;
+use solana_pubkey::Pubkey;
 
 entrypoint!(process_instruction);
 

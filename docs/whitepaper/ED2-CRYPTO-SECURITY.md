@@ -143,8 +143,8 @@ cryptography that is more resistant to a future quantum adversary and
 correspondingly less battle-tested against classical cryptanalysis than the
 incumbent schemes, on the judgment that harvest-now-decrypt-later makes that
 trade worth making now rather than later. Choosing post-quantum early does
-not remove risk; it changes which risk is carried. Nothing in this chapter
-is a claim that Bloch's cryptography is proven secure against all future
+not remove risk; it changes which risk is carried. This chapter makes no
+claim of security against all future
 attacks — the hybrid AND construction exists as a hedge against exactly that
 uncertainty, not as a claim that the uncertainty has been resolved.
 

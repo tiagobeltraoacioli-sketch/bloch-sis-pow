@@ -10,6 +10,8 @@ impl CommittedState {
     /// inclusion delay. Stalls cannot backdate activation or bypass churn.
     pub(super) fn activate_finalized_deposits(&mut self, next_epoch: u64) {
         let finalized = self.finality_engine.finalized().epoch;
+        let queue_v2 = crate::params::activation_queue_v2_active(next_epoch);
+        let priority_seed = self.seed_for_epoch(next_epoch);
         let mut eligible: Vec<_> = self
             .deposit_history
             .iter()
@@ -18,16 +20,24 @@ impl CommittedState {
                 let rec = self.validators.get(&index)?;
                 (self.funded_validators.contains(&index)
                     && rec.activation_epoch == u64::MAX
+                    && rec.exit_epoch == u64::MAX
                     && !rec.slashed
                     && d.deposit_epoch < finalized
                     && d.deposit_epoch
                         .checked_add(staking::ACTIVATION_DELAY_EPOCHS)
                         .is_some_and(|e| e <= next_epoch))
-                .then_some((d.deposit_epoch, d.pubkey_hash, index))
+                .then(|| {
+                    let priority = staking::activation_queue_priority(
+                        queue_v2,
+                        &priority_seed,
+                        &d.pubkey_hash,
+                    );
+                    (d.deposit_epoch, priority, d.pubkey_hash, index)
+                })
             })
             .collect();
         eligible.sort_unstable();
-        for (_, _, index) in eligible
+        for (_, _, _, index) in eligible
             .into_iter()
             .take(staking::MAX_ACTIVATIONS_PER_EPOCH)
         {
@@ -188,8 +198,9 @@ impl CommittedState {
                 if !Self::slashing_evidence_active(self.epoch) {
                     return Err(TxReject::EvidenceNotActive);
                 }
+                let roster = self.consensus_roster_at(self.epoch);
                 self.clone()
-                    .apply_slashing_evidence(evidence, 0, total_active_sat, verifier)
+                    .apply_slashing_evidence(evidence, 0, &roster, verifier)
                     .map_err(|_| TxReject::StakingRule)
             }
             PosTransaction::ExitV2 { .. } | PosTransaction::RandaoRecommit { .. } => self

@@ -1,8 +1,8 @@
-//! # bloch-pq-vault — a non-custodial, native, opt-in post-quantum *defensive vault*
+//! # bloch-pq-vault — experimental Bitcoin vault and PQ anchor primitives
 //!
-//! FOUNDATION. Implements the **achievable, honest** scope of
+//! Experimental primitives associated with
 //! `docs/specs/PQ-SHIELD-NONCUSTODIAL-NATIVE.md`: a **commit-delay-reveal P2WSH vault**
-//! on stock Bitcoin, plus a **PQ-gated clawback**, anchored on Bloch by a PQ-signed
+//! on stock Bitcoin, plus a hashlocked classical clawback and a separate PQ-signed
 //! commitment. It composes the repo's building blocks:
 //!
 //! - [`bloch_btc_wallet`] — one seed → BTC (secp256k1) + companion PQ key
@@ -12,7 +12,7 @@
 //!   validators the anchor's guard program reuses.
 //! - the `bitcoin` crate — real P2WSH scripts, transactions, BIP-143 sighashes.
 //!
-//! Three modules:
+//! Modules:
 //! - [`preimage`] — `r = HKDF(pq_sk, "pq-shield/v1" ‖ vault_id)` and `H(r) = SHA256(r)`.
 //! - [`vault`]    — the P2WSH deposit/trigger scripts, addresses, and the unvault /
 //!   branch-A / clawback transactions with real sighash handling.
@@ -33,9 +33,10 @@
 //!    we do not zero them.
 //! 2. **The covenant caveat is structural.** Stock Bitcoin has no covenant opcode
 //!    (`OP_CTV`/`OP_VAULT` are unshippable soft-fork proposals). The commit-delay-reveal
-//!    shape is enforced by **pre-signed transactions + secure deletion of the deposit
-//!    bypass key** (Revault-style) — an *operational* trust assumption, not consensus.
-//!    This crate builds and signs those txs; it cannot make anyone delete a key.
+//!    shape is not enforced by these scripts. Historical parameters reuse the retained
+//!    hot key for the deposit and therefore retain a direct bypass. An experimental
+//!    separate-key construction allows a pre-sign/delete ceremony, but this crate
+//!    cannot verify deletion, and quantum signature forgery can still bypass it.
 //! 3. **Taproot is not quantum-safe at rest.** We use **P2WSH** for the deposit (the
 //!    whole script, hence every pubkey, is behind `SHA256`). A Taproot instantiation
 //!    would protect the spend window only. We do not repeat the false "unspent Taproot is
@@ -57,9 +58,25 @@
 //!    real fix is BIP-360 (P2QRH); this is a stopgap on unmodified Bitcoin. Designed ≠
 //!    built ≠ booted.
 
+//! ## Construction and recovery audit follow-up
+//!
+//! Historical `VaultParams` uses the same seed-derived hot key for deposit and
+//! branch A: deleting a copy while retaining that seed cannot remove the bypass.
+//! [`construction::SeparatedDepositV1`] is a separate, opt-in NEW construction
+//! with a distinct deposit public key; independence remains a caller assumption. Existing V1/V2/V3 key derivations,
+//! scripts and addresses remain unchanged. See `CONSTRUCTION-AUDIT.md` for its
+//! operational, quantum-race and validation limitations. For existing recovery
+//! preimages, [`preimage::restore_recovery_secret_v1`] checks the supplied backup
+//! context against the already committed hash without changing the derivation.
+//! New backups can persist [`preimage::RecoveryContextV1`] so restoration also
+//! selects the recorded V1/V2/V3 key family and network instead of guessing.
+//! [`preimage::SignedRecoveryContextV1`] can additionally authenticate those
+//! exact bytes against an independently trusted owner PQ public key before restore.
+
 #![forbid(unsafe_code)]
 
 pub mod anchor;
+pub mod construction;
 pub mod preimage;
 pub mod script_eval;
 pub mod vault;
@@ -68,6 +85,7 @@ use bitcoin::bip32::{DerivationPath, Xpriv};
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use bitcoin::{Address, NetworkKind, PublicKey};
 use std::str::FromStr;
+use zeroize::{Zeroize, Zeroizing};
 
 /// A4-M-5: which BIP-32 branch derives a vault's `hot`/`recovery` keys.
 ///
@@ -85,13 +103,18 @@ pub enum VaultKeyDerivation {
     /// receive chain. Kept so an EXISTING vault keeps deriving the keys it was
     /// built with; never used for a new vault going forward.
     V1SharedReceiveChain,
-    /// A4-M-5 fix: a dedicated hardened BRANCH no ordinary receive/change
+    /// Historical A4-M-5 branch isolation: a dedicated hardened BRANCH no ordinary receive/change
     /// address ever touches — `m/1998'/coin'/0'/0/{0,1}`. Purpose `1998'` is
     /// not assigned by any BIP (the `*_44/49/84/86` family are the only
     /// purpose values `bloch_btc_wallet` or any standard wallet UI derives
-    /// under), so this path can never collide with a receive/change address,
-    /// present or future, however many accounts the wallet creates.
+    /// under). The final role children are NOT hardened: a leaked hot private
+    /// key plus the branch xpub exposes recovery. Restore existing V2 vaults
+    /// with this scheme; use V3 for new vaults.
     V2DedicatedHardenedBranch,
+    /// New vaults: independent hardened role children at
+    /// `m/1999'/coin'/0'/{0',1'}`. A hot private key plus an ancestor
+    /// xpub cannot recover the parent or derive the recovery sibling.
+    V3HardenedRoles,
 }
 
 /// Purpose field for [`VaultKeyDerivation::V2DedicatedHardenedBranch`] —
@@ -102,23 +125,77 @@ const VAULT_PURPOSE_V2: &str = "1998'";
 /// The BTC `hot`/`recovery` keys guard the Bitcoin spend paths; the PQ key produces the
 /// preimage `r` and signs the Bloch anchor. Same seed → both, per the hybrid-identity
 /// model of [`bloch_btc_wallet`].
-#[derive(Clone)]
+/// Secret-bearing aggregate deliberately does not implement `Clone`: duplicating
+/// every private key defeats the owned-storage wipe performed on drop.
+///
+/// ```compile_fail
+/// use bloch_pq_vault::VaultKeys;
+/// fn duplicate(keys: VaultKeys) {
+///     let _second_owner = keys.clone();
+/// }
+/// ```
+///
+/// Secret fields are private. Callers must opt in to a borrowed view instead
+/// of obtaining or replacing secret-bearing fields directly:
+///
+/// ```compile_fail
+/// # let keys = bloch_pq_vault::derive_vault_keys(&[7u8; 32], false);
+/// let copied = keys.pq_secret.clone();
+/// ```
 pub struct VaultKeys {
     /// Hot spend key (deposit spend + trigger branch A).
-    pub hot_sk: SecretKey,
+    hot_sk: SecretKey,
     pub hot_pubkey: PublicKey,
     /// Recovery key (trigger branch B clawback).
-    pub recovery_sk: SecretKey,
+    recovery_sk: SecretKey,
     pub recovery_pubkey: PublicKey,
     /// Enveloped ML-DSA-65 ‖ Falcon-1024 public key (PQ identity / anchor key).
     pub pq_pubkey: Vec<u8>,
     /// Enveloped PQ secret key — produces `r` and signs the anchor. Keep secret.
-    pub pq_secret: Vec<u8>,
+    pq_secret: Vec<u8>,
     /// A4-M-5: which BIP-32 branch produced `hot_sk`/`recovery_sk`. Carried so
     /// a caller that persists vault key material also records how to
     /// re-derive it — a vault built under one version must always be
     /// re-derived under that SAME version.
     pub key_derivation: VaultKeyDerivation,
+}
+
+impl VaultKeys {
+    /// Borrow the hot Bitcoin secret key for an explicit signing operation.
+    ///
+    /// The reference avoids making field access itself copy the `SecretKey`.
+    /// The upstream type is still `Copy`, so a caller can deliberately copy it.
+    pub fn hot_secret_key(&self) -> &SecretKey {
+        &self.hot_sk
+    }
+
+    /// Borrow the recovery Bitcoin secret key for an explicit signing operation.
+    ///
+    /// The reference avoids making field access itself copy the `SecretKey`.
+    /// The upstream type is still `Copy`, so a caller can deliberately copy it.
+    pub fn recovery_secret_key(&self) -> &SecretKey {
+        &self.recovery_sk
+    }
+
+    /// Borrow the enveloped PQ secret key without exposing its owned vector.
+    pub fn pq_secret_key(&self) -> &[u8] {
+        &self.pq_secret
+    }
+}
+
+// Wipe this object's owned PQ allocation. VaultKeys is intentionally non-Clone
+// so the library does not offer a convenience path that duplicates every secret.
+// SecretKey is Copy: the library's erase is best effort and cannot wipe copies
+// already held by callers, registers or third-party key-generation internals.
+impl Zeroize for VaultKeys {
+    fn zeroize(&mut self) {
+        self.pq_secret.zeroize();
+        self.hot_sk.non_secure_erase();
+        self.recovery_sk.non_secure_erase();
+    }
+}
+impl Drop for VaultKeys {
+    fn drop(&mut self) { self.zeroize(); }
 }
 
 /// Derive [`VaultKeys`] from a seed under [`VaultKeyDerivation::V1SharedReceiveChain`]
@@ -130,30 +207,39 @@ pub struct VaultKeys {
 ///
 /// A4-M-5: kept EXACTLY as-is (including panicking on a malformed seed) for
 /// compatibility with existing callers and vaults built under it — see
-/// [`derive_vault_keys_v2`] for the fix (a dedicated, unexposed key branch).
+/// [`derive_vault_keys_v3`] for hardened role separation for new vaults.
 pub fn derive_vault_keys(seed: &[u8], mainnet: bool) -> VaultKeys {
+    derive_vault_keys_versioned(seed, mainnet, VaultKeyDerivation::V1SharedReceiveChain)
+        .expect("valid legacy vault seed")
+}
+
+/// Fallible restoration entry point. The stored derivation version is mandatory:
+/// never guess a different family when restoring an existing funded vault.
+/// V1/V2/V3 valid inputs retain their existing key bytes and derivation domains.
+pub fn derive_vault_keys_versioned(seed: &[u8], mainnet: bool, version: VaultKeyDerivation) -> Result<VaultKeys, String> {
+    match version {
+        VaultKeyDerivation::V2DedicatedHardenedBranch => return derive_vault_keys_v2(seed, mainnet),
+        VaultKeyDerivation::V3HardenedRoles => return derive_vault_keys_v3(seed, mainnet),
+        VaultKeyDerivation::V1SharedReceiveChain => {}
+    }
+    if seed.len() < 32 { return Err("legacy vault seed must contain at least 32 bytes".into()); }
     let secp = Secp256k1::new();
     let net = if mainnet { NetworkKind::Main } else { NetworkKind::Test };
     let coin = if mainnet { "0'" } else { "1'" };
-    let master = Xpriv::new_master(net, seed).expect("valid master seed");
-
-    let derive = |idx: u32| -> (SecretKey, PublicKey) {
-        let path = DerivationPath::from_str(&format!("m/84'/{coin}/0'/0/{idx}")).expect("path");
-        let xpriv = master.derive_priv(&secp, &path).expect("derive");
+    let master = Xpriv::new_master(net, seed).map_err(|e| format!("bip32 master: {e}"))?;
+    let derive = |idx: u32| -> Result<(SecretKey, PublicKey), String> {
+        let path = DerivationPath::from_str(&format!("m/84'/{coin}/0'/0/{idx}"))
+            .map_err(|e| format!("bip32 path: {e}"))?;
+        let xpriv = master.derive_priv(&secp, &path).map_err(|e| format!("bip32 derive: {e}"))?;
         let sk = xpriv.private_key;
-        let pk = PublicKey::new(sk.public_key(&secp));
-        (sk, pk)
+        Ok((sk, PublicKey::new(sk.public_key(&secp))))
     };
-    let (hot_sk, hot_pubkey) = derive(0);
-    let (recovery_sk, recovery_pubkey) = derive(1);
-
-    let (pq_pubkey, pq_secret) =
-        bloch_crypto::crypto::generate_keypair_from_seed(seed).expect("pq keygen from seed");
-
-    VaultKeys {
-        hot_sk, hot_pubkey, recovery_sk, recovery_pubkey, pq_pubkey, pq_secret,
-        key_derivation: VaultKeyDerivation::V1SharedReceiveChain,
-    }
+    let (hot_sk, hot_pubkey) = derive(0)?;
+    let (recovery_sk, recovery_pubkey) = derive(1)?;
+    let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(seed)
+        .map_err(|e| format!("pq keygen: {e}"))?;
+    Ok(VaultKeys { hot_sk, hot_pubkey, recovery_sk, recovery_pubkey, pq_pubkey, pq_secret,
+        key_derivation: VaultKeyDerivation::V1SharedReceiveChain })
 }
 
 /// A4-M-5 fix: derive [`VaultKeys`] on a DEDICATED hardened branch
@@ -199,15 +285,56 @@ pub fn derive_vault_keys_v2(seed: &[u8], mainnet: bool) -> Result<VaultKeys, Str
     // identity helper), and the vault needs the secret key too. Sharing
     // `pq_seed_for` (rather than re-hashing the domain tag here) keeps this
     // byte-for-byte identical to `derive_identity_versioned`'s PQ pubkey.
-    let pq_seed = bloch_btc_wallet::pq_seed_for(seed, bloch_btc_wallet::PqSeedKdf::V2DomainSeparated)
-        .ok_or_else(|| format!("seed too short: {} bytes (need at least {})", seed.len(), MIN_SEED_LEN))?;
-    let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed)
+    let pq_seed = Zeroizing::new(bloch_btc_wallet::pq_seed_for(seed, bloch_btc_wallet::PqSeedKdf::V2DomainSeparated)
+        .ok_or_else(|| format!("seed too short: {} bytes (need at least {})", seed.len(), MIN_SEED_LEN))?);
+    let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed[..])
         .map_err(|e| format!("pq keygen: {e}"))?;
 
     Ok(VaultKeys {
         hot_sk, hot_pubkey, recovery_sk, recovery_pubkey, pq_pubkey, pq_secret,
         key_derivation: VaultKeyDerivation::V2DedicatedHardenedBranch,
     })
+}
+
+fn derive_v3_pq_seed(seed: &[u8], mainnet: bool) -> Zeroizing<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+
+    let mut hash = Sha256::new();
+    hash.update(b"BLOCH-PQ-VAULT-V3-PQ-KEY");
+    hash.update([u8::from(mainnet)]);
+    hash.update(seed);
+    let mut pq_seed = Zeroizing::new([0u8; 32]);
+    hash.finalize_into((&mut *pq_seed).into());
+    pq_seed
+}
+
+/// Derive a new vault using hardened role separation (BV-04).
+///
+/// This is an explicit opt-in format: persist `V3HardenedRoles` with the vault
+/// backup. Never use it to restore a V1/V2 vault. Existing derivation functions
+/// and their outputs are unchanged. Compromise of the master seed still exposes
+/// both roles; hardened derivation protects against child-key plus xpub leakage.
+pub fn derive_vault_keys_v3(seed: &[u8], mainnet: bool) -> Result<VaultKeys, String> {
+    if !(32..=64).contains(&seed.len()) {
+        return Err("V3 seed must contain 32 to 64 bytes".into());
+    }
+    let secp = Secp256k1::new();
+    let net = if mainnet { NetworkKind::Main } else { NetworkKind::Test };
+    let coin = if mainnet { "0'" } else { "1'" };
+    let master = Xpriv::new_master(net, seed).map_err(|e| format!("bip32 master: {e}"))?;
+    let derive = |role: u32| -> Result<(SecretKey, PublicKey), String> {
+        let path = DerivationPath::from_str(&format!("m/1999'/{coin}/0'/{role}'"))
+            .map_err(|e| format!("bip32 path: {e}"))?;
+        let child = master.derive_priv(&secp, &path).map_err(|e| format!("bip32 derive: {e}"))?;
+        Ok((child.private_key, PublicKey::new(child.private_key.public_key(&secp))))
+    };
+    let (hot_sk, hot_pubkey) = derive(0)?;
+    let (recovery_sk, recovery_pubkey) = derive(1)?;
+    let pq_seed = derive_v3_pq_seed(seed, mainnet);
+    let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed[..])
+        .map_err(|e| format!("pq keygen: {e}"))?;
+    Ok(VaultKeys { hot_sk, hot_pubkey, recovery_sk, recovery_pubkey, pq_pubkey, pq_secret,
+        key_derivation: VaultKeyDerivation::V3HardenedRoles })
 }
 
 /// Produce a Bitcoin `<DER-sig ‖ SIGHASH_ALL>` witness push: sign `sighash` with `sk`.
@@ -374,6 +501,21 @@ mod e2e_tests {
         let after = EvalCtx { confirmations: DELTA as u32, ..reeval(&before) };
         assert_eq!(eval(&secp, &trig_script, witness(), &after), Ok(true));
 
+        // A signer can choose a sequence above the script minimum. BIP-68
+        // maturity follows that actual sequence, not merely the CSV operand.
+        let mut longer = a.clone();
+        longer.input[0].sequence = Sequence::from_height(288);
+        let longer_hash = p2wsh_sighash(&longer, 0, &trig_script, 99_500);
+        let longer_sig = ecdsa_witness_sig(&longer_hash, &keys.hot_sk);
+        let longer_ctx = EvalCtx { input_sequence: longer.input[0].sequence,
+            confirmations: 144, tx_version: longer.version.0, sighash: longer_hash };
+        for confirmations in [144, 287] {
+            let ctx = EvalCtx { confirmations, ..reeval(&longer_ctx) };
+            assert_eq!(eval(&secp, &trig_script, vec![longer_sig.clone(), vec![1]], &ctx), Err(EvalError::Immature));
+        }
+        let mature = EvalCtx { confirmations: 288, ..reeval(&longer_ctx) };
+        assert_eq!(eval(&secp, &trig_script, vec![longer_sig, vec![1]], &mature), Ok(true));
+
         // a branch-A spend whose nSequence does NOT encode the delay (RBF-final) fails CSV
         let mut a_bad = a.clone();
         a_bad.input[0].sequence = Sequence::ENABLE_RBF_NO_LOCKTIME;
@@ -481,7 +623,7 @@ mod e2e_tests {
         assert_eq!(
             eval(&secp, &trig_script, vec![sig_c, r.to_vec(), vec![]], &ctx_c),
             Ok(true),
-            "PQ-authorized clawback succeeds to the safe destination within Δ"
+            "hashlocked recovery succeeds to the safe destination within Δ"
         );
     }
 
@@ -586,6 +728,121 @@ mod e2e_tests {
             confirmations: c.confirmations,
             tx_version: c.tx_version,
             sighash: c.sighash,
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_hardened_roles {
+    use super::*;
+    use bitcoin::bip32::Xpub;
+
+    #[test]
+    fn v3_roles_cannot_be_derived_from_the_shared_public_parent() {
+        let seed = [42; 32];
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(NetworkKind::Test, &seed).unwrap();
+        let parent = master.derive_priv(&secp,
+            &DerivationPath::from_str("m/1999'/1'/0'").unwrap()).unwrap();
+        let public = Xpub::from_priv(&secp, &parent);
+        let keys = derive_vault_keys_v3(&seed, false).unwrap();
+        for (role, expected) in [(0, keys.hot_sk), (1, keys.recovery_sk)] {
+            let path = DerivationPath::from_str(&format!("m/{role}'")).unwrap();
+            assert!(public.derive_pub(&secp, &path).is_err());
+            assert_eq!(parent.derive_priv(&secp, &path).unwrap().private_key, expected);
+        }
+        let old = derive_vault_keys_v2(&seed, false).unwrap();
+        assert_ne!(keys.hot_sk, keys.recovery_sk);
+        assert_ne!(keys.hot_sk, old.hot_sk);
+        assert_ne!(keys.recovery_sk, old.recovery_sk);
+        assert_ne!(keys.pq_pubkey, old.pq_pubkey);
+        assert_eq!(keys.hot_sk, derive_vault_keys_v3(&seed, false).unwrap().hot_sk);
+        assert_ne!(keys.hot_sk, derive_vault_keys_v3(&seed, true).unwrap().hot_sk);
+    }
+
+    #[test]
+    fn v3_refuses_invalid_seed_lengths() {
+        for len in [0, 1, 31, 65, 4096] {
+            assert!(derive_vault_keys_v3(&vec![42; len], false).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_secret_ownership {
+    use super::*;
+
+    #[test]
+    fn v3_pq_seed_is_derived_directly_into_zeroizing_owner() {
+        let _: fn(&[u8], bool) -> Zeroizing<[u8; 32]> = derive_v3_pq_seed;
+        assert!(std::mem::needs_drop::<Zeroizing<[u8; 32]>>());
+
+        for (mainnet, expected) in [
+            (false, [
+                0x9a, 0xff, 0xa9, 0x5d, 0xd2, 0x1a, 0x4e, 0x5f,
+                0x50, 0x17, 0xd7, 0xfd, 0x97, 0x49, 0x31, 0xd2,
+                0x58, 0xfe, 0xde, 0x2e, 0x44, 0x41, 0x0b, 0xf8,
+                0xcb, 0x88, 0x9b, 0x9a, 0xb5, 0xcc, 0xc6, 0x0f,
+            ]),
+            (true, [
+                0xba, 0xd8, 0x17, 0x42, 0x36, 0x48, 0x75, 0x30,
+                0xe2, 0xac, 0xcb, 0xad, 0x44, 0x17, 0x11, 0xff,
+                0x12, 0x49, 0xfc, 0xb0, 0x5e, 0x0d, 0xf6, 0xd1,
+                0x1f, 0xa4, 0xd6, 0xa2, 0x31, 0x76, 0xbf, 0xb9,
+            ]),
+        ] {
+            let mut pq_seed = derive_v3_pq_seed(&[42; 32], mainnet);
+            assert_eq!(*pq_seed, expected);
+            pq_seed.zeroize();
+            assert!(pq_seed.iter().all(|byte| *byte == 0));
+        }
+    }
+
+    #[test]
+    fn secret_accessors_borrow_the_owned_storage() {
+        let keys = derive_vault_keys_v3(&[42; 32], false).unwrap();
+        assert!(std::ptr::eq(keys.hot_secret_key(), &keys.hot_sk));
+        assert!(std::ptr::eq(
+            keys.recovery_secret_key(),
+            &keys.recovery_sk,
+        ));
+        assert_eq!(keys.pq_secret_key().as_ptr(), keys.pq_secret.as_ptr());
+        assert_eq!(keys.pq_secret_key().len(), keys.pq_secret.len());
+    }
+
+    #[test]
+    fn explicit_wipe_clears_owned_pq_storage_without_changing_public_identity() {
+        let mut keys = derive_vault_keys_v3(&[42;32], false).unwrap();
+        let public = keys.pq_pubkey.clone();
+        assert!(!keys.pq_secret.is_empty());
+        keys.zeroize();
+        assert!(keys.pq_secret.is_empty());
+        assert_eq!(keys.pq_pubkey, public);
+        // This test deliberately does not read freed memory or claim to inspect
+        // compiler-created copies. The compile-fail example on `VaultKeys`
+        // separately prevents restoration of the whole-object Clone surface.
+    }
+}
+
+#[cfg(test)]
+mod audit_versioned_restore {
+    use super::*;
+    #[test]
+    fn explicit_restore_preserves_each_existing_derivation_and_refuses_short_seeds() {
+        let seed = [42;32];
+        for (version, original) in [
+            (VaultKeyDerivation::V1SharedReceiveChain, derive_vault_keys(&seed, false)),
+            (VaultKeyDerivation::V2DedicatedHardenedBranch, derive_vault_keys_v2(&seed, false).unwrap()),
+            (VaultKeyDerivation::V3HardenedRoles, derive_vault_keys_v3(&seed, false).unwrap()),
+        ] {
+            let restored = derive_vault_keys_versioned(&seed, false, version).unwrap();
+            assert_eq!(restored.hot_sk, original.hot_sk);
+            assert_eq!(restored.recovery_sk, original.recovery_sk);
+            assert_eq!(restored.pq_pubkey, original.pq_pubkey);
+            assert_eq!(restored.pq_secret, original.pq_secret);
+            for len in [0,1,31] {
+                assert!(derive_vault_keys_versioned(&vec![42;len], false, version).is_err());
+            }
         }
     }
 }

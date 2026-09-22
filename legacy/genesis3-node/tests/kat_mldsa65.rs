@@ -11,7 +11,7 @@
 // the official NIST ML-DSA-65 `.rsp` KAT files are NOT vendored in-tree. NIST
 // reproduces its keypair from an AES-256-CTR DRBG, while Bloch's
 // `generate_keypair_from_seed` drives keygen from a ChaCha20 stream via the
-// `pqcrypto-internals` fork's `with_seeded_rng`. A signed NIST `.rsp` vector
+// `pqcrypto-internals` fork's `with_seeded_rng_scope`. A signed NIST `.rsp` vector
 // therefore does NOT reproduce a Bloch seeded keypair, so this file does NOT
 // claim NIST-KAT equivalence. What it DOES pin, with no fabrication:
 //   (1) FIPS-204 ML-DSA-65 parameter sizes (pk 1952 / sk 4032 / sig 3309),
@@ -85,10 +85,7 @@ fn mldsa65_parameter_sizes_match_fips204() {
 fn mldsa65_seeded_keygen_is_byte_stable_and_matches_golden() {
     // Drive keygen from the fixed seed; take only the FIRST draw so this equals
     // the ML-DSA-65 half of the Bloch hybrid keypair (crypto/mod.rs:78-86).
-    let (pk1, sk1) = {
-        let _g = pqcrypto_internals::with_seeded_rng(&GOLDEN_SEED);
-        mldsa65::keypair()
-    };
+    let (pk1, sk1) = pqcrypto_internals::with_seeded_rng_scope(&GOLDEN_SEED, mldsa65::keypair);
     let pk1 = pk1.as_bytes();
     let sk1 = sk1.as_bytes();
 
@@ -108,10 +105,7 @@ fn mldsa65_seeded_keygen_is_byte_stable_and_matches_golden() {
     );
 
     // Determinism: a second seeded keygen reproduces identical bytes.
-    let (pk2, sk2) = {
-        let _g = pqcrypto_internals::with_seeded_rng(&GOLDEN_SEED);
-        mldsa65::keypair()
-    };
+    let (pk2, sk2) = pqcrypto_internals::with_seeded_rng_scope(&GOLDEN_SEED, mldsa65::keypair);
     assert_eq!(pk1, pk2.as_bytes(), "same seed must reproduce identical ML-DSA pk");
     assert_eq!(sk1, sk2.as_bytes(), "same seed must reproduce identical ML-DSA sk");
 }

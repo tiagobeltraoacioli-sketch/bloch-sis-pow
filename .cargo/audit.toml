@@ -46,23 +46,13 @@ ignore = [
     "RUSTSEC-2024-0381", # pqcrypto-kyber     superseded by pqcrypto-mlkem
                          # Lockfiles: root, fuzz.
     # ── Transitive, no first-party call path ──────────────────────────────────
-    "RUSTSEC-2025-0141", # bincode 1.3.3 unmaintained — wire format uses 2.x.
-                         # Lockfiles: root, pool, services/pq-shield-api, fuzz,
-                         # coherence-prover/{script,service}.
-    "RUSTSEC-2024-0436", # paste unmaintained — compile-time proc-macro helper.
-                         # Lockfiles: root, pool, services/pq-shield-api, fuzz,
-                         # spikes/prover-cost, coherence-prover/{script,service}
-                         # (not pool-proxy, euvm-tooling or the rv32* guests).
-    "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained — compile-time only.
-                         # Lockfile: root Cargo.lock ONLY, and only through the
-                         # 289 entries the root lock still carries from when
-                         # crates/coherence-prover was a workspace member (LD-02):
-                         # cargo-audit reads the raw lock, cargo-deny the resolved
-                         # graph, so this is NOT in deny.toml. Prune it with the
-                         # `cargo update --workspace` that drops those entries.
-    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained — transitive TLS PEM decode.
-                         # Lockfiles: coherence-prover/{script,service}; root only
-                         # through the stale lock entries above. Not in deny.toml.
+    "RUSTSEC-2025-0141", # bincode 1.3.3 unmaintained — node-local restart cache.
+                         # First-party use now exists; cache is checksummed,
+                         # build-bound and validated before restoring state.
+                         # This is accepted maintenance risk, not unreachable code.
+    "RUSTSEC-2024-0436", # paste unmaintained — compile-time proc-macro helper
+    "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained — compile-time only
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained — transitive TLS PEM decode
     # ── SP1 prover / zk host-side toolchain (not the node runtime path) ────────
     # Lockfiles: crates/coherence-prover/script and /service (the SP1 stack lives
     # there since coherence-prover left the root workspace); the root Cargo.lock

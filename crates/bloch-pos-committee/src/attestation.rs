@@ -8,7 +8,7 @@
 //! choice of verifier (the C FFI stack today, a pure-Rust one if the in-circuit
 //! path is ever taken — see `spikes/prover-cost/`) stays a caller decision.
 
-use crate::params::DS_ATTEST;
+use crate::params::{DS_ATTEST, DS_NETSIG2};
 use sha3::{Digest, Sha3_256};
 
 /// What a validator signs.
@@ -19,6 +19,7 @@ use sha3::{Digest, Sha3_256};
 /// signer had to be in, and whether the vote counts toward weight, finality,
 /// or both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct AttestationData {
     /// Slot this attestation is for.
     pub slot: u64,
@@ -48,6 +49,20 @@ impl AttestationData {
         h.update(self.source_root);
         h.update(self.target_epoch.to_le_bytes());
         h.update(self.target_root);
+        h.finalize().into()
+    }
+
+    /// Candidate genesis-bound attestation root.
+    ///
+    /// This API is intentionally not selected by production consensus while
+    /// `VALIDATOR_NETWORK_BINDING_ACTIVATION_EPOCH` is unarmed. It gives
+    /// activation rehearsals one canonical preimage without changing the
+    /// historical [`Self::signing_root`] used by replay and current evidence.
+    pub fn network_bound_signing_root(&self, network_domain: &[u8; 32]) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(DS_NETSIG2);
+        h.update(network_domain);
+        h.update(self.signing_root());
         h.finalize().into()
     }
 
@@ -272,6 +287,24 @@ mod tests {
             attestation_root: [0u8; 32],
             coherence_root: [0u8; 32],
         }
+    }
+
+    #[test]
+    fn candidate_root_binds_attestation_to_one_genesis_without_changing_legacy_root() {
+        let data = AttestationData {
+            slot: 64,
+            head: [1; 32],
+            source_epoch: 1,
+            source_root: [2; 32],
+            target_epoch: 2,
+            target_root: [3; 32],
+        };
+        let legacy = data.signing_root();
+        let a = data.network_bound_signing_root(&[0xA1; 32]);
+        let b = data.network_bound_signing_root(&[0xB2; 32]);
+        assert_ne!(a, b);
+        assert_ne!(a, legacy);
+        assert_eq!(data.signing_root(), legacy, "candidate must not mutate replay roots");
     }
 
     /// Distinct, deterministic fixture pubkey per index — length matches the

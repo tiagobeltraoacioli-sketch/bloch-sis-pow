@@ -33,38 +33,17 @@
 //!    [`crate::delegation::Registry::cap_sat`]. This module *calls* those and
 //!    never re-derives either denominator.
 //!
-//! ## Frozen error order (consensus-visible, per the `StateTransition` docs)
+//! ## Validation order (stable diagnostics, not consensus data)
 //!
-//! Cheapest first, so spam is rejected before any hybrid verify runs:
-//!
-//! 1. `NonMonotonicSlot` — slot must advance, and must not land in an epoch
-//!    the caller already processed past.
-//! 2. `WrongParent` — header `parent` vs the pre-state's head id.
-//! 3. `Proposal(WrongVersion)`.
-//! 4. `Proposal(NotScheduledProposer)` — the `schedule` draw (a hash, no sig).
-//! 5. `Proposal(BadRandaoReveal)` — preimage check + mix consistency (two
-//!    hashes).
-//! 6. `FinalityRegression` — header finality roots vs parent-committed
-//!    finality (a comparison).
-//! 7. `Proposal(BadSignature)` — the proposer's hybrid signature: one
-//!    expensive verify, placed before the N attestation verifies.
-//! 8. `Attestation(i)` — in body order; membership (cheap) is checked before
-//!    each signature inside [`crate::attestation::validate`].
-//! 9. `Transaction(i)` / `Transfer(i, reason)` — in body order. The staking
-//!    arms are cheap state lookups. A transfer runs its own frozen
-//!    cheapest-first order *within* the transaction (structure, size floor,
-//!    set membership, script hashes, conservation, then the hybrid
-//!    verifications last) — see [`CommittedState::apply_transfer`] — and
-//!    reports which rule it broke, because those rules decide who may move
-//!    coins and a bare index is not enough to debug a divergence over one.
-//! 10. `StateRootMismatch` — last, because the root only exists once the
-//!     whole transition has run.
-//!
-//! `EpochAdvanceTooLarge` was appended to this order, not inserted into it: it
-//! sits between the header-commitment checks and the epoch boundary walk it
-//! bounds, which is the first point at which the walk's cost is about to be
-//! paid. Every block that was a reject before the rule existed still returns
-//! the error it returned before.
+//! The production path keeps cheap structural and commitment checks ahead of
+//! hybrid verification, processes body items deterministically, and checks the
+//! computed state root only after building the child. That ordering is a DoS
+//! property and a useful API compatibility promise. It is not itself committed
+//! consensus state: [`TransitionError`] never appears in a block or state root.
+//! Nodes must agree whether a block is accepted and, when accepted, on its
+//! child root; two implementations choosing different diagnostics for the same
+//! multiply-invalid block do not fork. Tests pin important precedence where
+//! callers rely on it without mislabelling the diagnostic as consensus bytes.
 //!
 //! ## Double-apply is a reject, not a no-op — decided here
 //!
@@ -321,7 +300,7 @@ pub enum PosTransaction {
     ///
     /// It then read `Transfer { inputs: u32, tx_bytes, tip }` — three gas
     /// terms with **no sender, no recipient and no amount**. The committed
-    /// state carried the 452,133-output opening ledger and the state root
+    /// state carried the 452,726-output opening ledger and the state root
     /// committed to it, but no transaction could take a satoshi out of it: the
     /// chain had balances and no payments. This revision is what makes the
     /// ledger move, and it is where the authorisation rule lives — an output
@@ -461,8 +440,8 @@ pub enum PosTransaction {
     Exit { validator: u32 },
     /// ADR-041: permissionless, metered withdrawal to the registered script.
     Withdraw { validator: u32 },
-    /// Authenticated voluntary exit (§7.2) — consensus-INVALID until
-    /// [`crate::params::EXIT_AUTH_ACTIVATION_EPOCH`], which is `u64::MAX`.
+    /// Authenticated voluntary exit (§7.2) — consensus-INVALID before
+    /// [`crate::params::EXIT_AUTH_ACTIVATION_EPOCH`] (epoch 2884).
     ///
     /// What it adds over [`Self::Exit`], and both are necessary:
     ///
@@ -489,8 +468,7 @@ pub enum PosTransaction {
     },
     /// Install a fresh RANDAO chain head for an EXHAUSTED validator (§6.3
     /// step 4) — consensus-INVALID until
-    /// [`crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH`], which is
-    /// `u64::MAX`.
+    /// [`crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH`] (epoch 2884).
     ///
     /// # Why this variant exists
     ///
@@ -554,9 +532,9 @@ pub enum PosTransaction {
         delegator: u32,
         validator: u32,
         amount_sat: u128,
-        /// Resolved by the taint oracle at admission (§4.1): an ineligible
-        /// delegation is recorded but never contributes stake — the record
-        /// exists so the ineligibility is itself a committed, auditable fact.
+        /// Frozen legacy wire bit. The retired taint design allowed `false`,
+        /// but Genesis-4 has no eligibility oracle and consensus requires this
+        /// field to be `true`; it is never copied as caller-chosen state.
         eligible: bool,
     },
     /// A §7.3 evidence transaction: two conflicting signed messages proving
@@ -700,21 +678,13 @@ impl PosTransaction {
         h.finalize().into()
     }
 
-    /// This chain's own network-binding value (A2-3 / R7 M2): folded into
-    /// [`Self::checked_signing_root`] under `DS_SPEND2` once
-    /// [`crate::params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH`] arms — see
-    /// that constant's docs for the carryover-replay hole this closes.
+    /// Legacy source-tree label retained for API compatibility.
     ///
-    /// Fixed content, not `CommittedState`: this chain's genesis identity
-    /// does not evolve over its life, so it needs no Merkle commitment of
-    /// its own any more than `DS_SPEND` itself does — a node compiled
-    /// against a different value computes a different
-    /// `checked_signing_root` for every transfer from the instant the gate
-    /// arms and diverges at the very first activation-epoch block, exactly
-    /// as a bugged hardcoded domain tag would. The exact bytes are
-    /// arbitrary; only their being distinct from whatever OTHER network is
-    /// built from this same source is load-bearing, which is why they name
-    /// Genesis-4 by label rather than by anything computed.
+    /// This is not a network identity: two networks built from the same source
+    /// share it. Consensus uses [`Self::checked_signing_root_for_network`]
+    /// with the committed manifest digest. Existing external tools can keep
+    /// using [`Self::checked_signing_root`] while the gate is inert; after a
+    /// future activation they must migrate or their signatures fail closed.
     pub const fn network_binding() -> [u8; 32] {
         const LABEL: &[u8] = b"BLCH4:GENESIS-4:MAINNET";
         let mut out = [0u8; 32];
@@ -739,25 +709,21 @@ impl PosTransaction {
         h.finalize().into()
     }
 
-    /// The value a transfer's witnesses are actually checked against.
+    /// Compatibility root for callers that do not yet accept a network domain.
     ///
     /// Below [`CommittedState::sighash_network_binding_active`] this is
     /// exactly [`Self::spend_signing_root`] — unchanged, so every signing
     /// root this crate has ever computed replays identically. At and above
     /// it, the base root is folded again ([`Self::fold_network_binding`])
-    /// under `DS_SPEND2` with [`Self::network_binding`] — a NEW 16-byte tag
+    /// under `DS_SPEND2` with the legacy [`Self::network_binding`] label — a
+    /// NEW 16-byte tag
     /// that is neither a prefix of `DS_SPEND` nor prefixed by it (both are
     /// exactly 16 bytes with different content), so the result cannot
     /// collide with any digest `DS_SPEND` alone ever produced.
     ///
-    /// `spend_signing_root` itself is UNTOUCHED — its signature and its
-    /// value are exactly what they always were, on every call site
-    /// including `bloch-pos-node`'s wallets — so nothing outside this
-    /// crate's own signature CHECK need change before the gate arms.
-    /// Wallets adopt this fold only once the founder announces it, per
-    /// `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH`'s docs; until then, arming
-    /// with no wallet-side change simply makes every existing signature
-    /// invalid (fail-closed, not fail-open).
+    /// `spend_signing_root` itself is untouched. This helper is preserved so
+    /// source users do not break before an activation migration, but it is no
+    /// longer the consensus verification path.
     ///
     /// V1 and V2 share this fold because both already share
     /// `spend_signing_root`'s fold (one function, both callers), so the two
@@ -774,6 +740,25 @@ impl PosTransaction {
             return base;
         }
         Self::fold_network_binding(base, Self::network_binding())
+    }
+
+    /// Consensus candidate using the genesis-manifest domain committed in
+    /// state instead of [`Self::network_binding`]'s compatibility label.
+    ///
+    /// Before the inert gate this always returns the historical root, even
+    /// for an old replay state without a domain. Once rehearsed open it fails
+    /// closed when the state has no domain and otherwise binds the supplied
+    /// identity under `DS_SPEND2`.
+    pub fn checked_signing_root_for_network(
+        &self,
+        epoch: u64,
+        network_domain: Option<&[u8; 32]>,
+    ) -> Option<[u8; 32]> {
+        let base = self.spend_signing_root();
+        if !CommittedState::sighash_network_binding_active(epoch) {
+            return Some(base);
+        }
+        network_domain.map(|domain| Self::fold_network_binding(base, *domain))
     }
 
     /// The canonical wire encoding of a consensus transaction — the bytes the
@@ -990,6 +975,12 @@ impl PosTransaction {
     /// `tests::canonical_bytes_round_trips` pins it against the encoder rather
     /// than against a hand-written expectation.
     ///
+    /// Decoding answers only whether the bytes have the bounded wire shape.
+    /// Transaction rules belong to the admission/transition judge. In
+    /// particular, a syntactically decodable funded deposit can still fail
+    /// `FundedDeposit::validate_shape`; keeping that verdict out of this
+    /// function preserves the decode/judge separation used by the other tags.
+    ///
     /// # `SlashingEvidence` (tag `0x05`) decodes — corrected 2026-09-05
     ///
     /// This arm used to return [`TxDecodeError::EvidenceNotDecodable`]
@@ -1003,10 +994,11 @@ impl PosTransaction {
     /// Whether evidence is ACTIVE is not this function's question — the
     /// flag-day gate lives in the transition (`TxReject::EvidenceNotActive`),
     /// against the committed epoch, and
-    /// [`crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`] ships INERT
-    /// (`u64::MAX`): until the founder arms it, a block carrying this tag is
-    /// refused by every node, which is byte-for-byte the verdict a
-    /// pre-format binary reaches at its decoder.
+    /// [`crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`] is scheduled at
+    /// epoch 2884: below it a block carrying this tag is refused by every
+    /// current node, which is byte-for-byte the verdict a pre-format binary
+    /// reaches at its decoder; at and above it, the transition judges the
+    /// evidence.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, TxDecodeError> {
         let mut r = TxReader { b: bytes, i: 0 };
         let tag = r.u8()?;
@@ -1402,6 +1394,27 @@ pub fn reset_eutxo_entry_visits() {
 #[doc(hidden)]
 pub static BOUNDARY_VOTE_DROPS: AtomicU64 = AtomicU64::new(0);
 
+/// Observability only: rejected epoch feeds retain the historical no-op
+/// finality behavior. This process-wide counter is not committed state.
+#[doc(hidden)]
+pub static FINALITY_EPOCH_ORDER_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+fn report_finality_order_failure(error: finality::FinalityError) {
+    use std::io::Write;
+    let previous = FINALITY_EPOCH_ORDER_FAILURES.fetch_update(
+        Ordering::Relaxed, Ordering::Relaxed,
+        |current| Some(current.saturating_add(1)),
+    ).unwrap_or_else(|current| current);
+    let count = previous.saturating_add(1);
+    if count <= 8 || count.is_power_of_two() {
+        let finality::FinalityError::OutOfOrderEpoch { got, expected } = error;
+        // A broken stderr must not change block processing or trigger a panic.
+        let _ = writeln!(std::io::stderr().lock(),
+            "BLOCH-CONSENSUS-DIVERGENCE finality_epoch_order got={got} expected={expected} occurrences={count} action=preserve_existing_finality_noop");
+    }
+}
+
+
 /// Record and report one boundary-partition divergence. **Never panics, never
 /// touches consensus state, and never changes the returned post-state.**
 ///
@@ -1432,28 +1445,36 @@ pub static BOUNDARY_VOTE_DROPS: AtomicU64 = AtomicU64::new(0);
 /// hence non-fatal in release, fatal in a test build.
 ///
 /// So the requirement behind the guard — *production must be able to SEE this
-/// class of divergence if it ever recurs* — is met without the fatality: an
-/// unconditional, loud, structured, rate-limited line on stderr plus a
-/// counter. The `debug_assert_eq!` at the call site stays, because in a test
-/// build the condition IS a bug and should stop the run.
-///
-/// Rate-limited by power-of-two backoff rather than by a clock: this crate has
-/// no time source and must not acquire one (§5.5), and a replaying node can
-/// close thousands of epochs in seconds. The first eight are printed, then
-/// every doubling, so a live divergence is never silent and a backfill can
-/// never drown the log.
+/// class of divergence if it ever recurs* — is met without making consensus
+/// depend on a potentially blocking stderr write: the unconditional process
+/// counter is exported by the node's Prometheus endpoint. The
+/// `debug_assert_eq!` at the call site stays, because in a test build the
+/// condition IS a bug and should stop the run.
 #[cold]
-fn report_boundary_vote_drop(closing: u64, admitted: usize, tallied: usize) {
-    let n = BOUNDARY_VOTE_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 8 || n.is_power_of_two() {
-        eprintln!(
-            "BLOCH-CONSENSUS-DIVERGENCE boundary_partition_dropped_votes \
-             epoch={closing} admitted={admitted} tallied={tallied} dropped={} occurrences={n} \
-             note=the inclusion check at step 8 and the boundary tally partitioned different \
-             rosters; expected only after a mid-epoch slashing, a bug otherwise",
-            admitted.saturating_sub(tallied)
-        );
-    }
+fn report_boundary_vote_drop(_closing: u64, _admitted: usize, _tallied: usize) {
+    let _ = BOUNDARY_VOTE_DROPS.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |current| Some(current.saturating_add(1)),
+    );
+}
+
+/// Read-only summary of the committed fork-choice equivocator bar.
+///
+/// `total` is the monotone historical set committed in the state root.
+/// `active` and `active_stake_sat` are its intersection with the current
+/// leak-adjusted consensus roster. Keeping both views is important: an exited
+/// validator remains in the historical set forever, but no longer removes
+/// live fork-choice weight.
+///
+/// This is observability only. In particular, reading this value does not
+/// expire a bar, restore a latest message, alter a roster, or feed a consensus
+/// verdict back into the transition.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ForkChoiceEquivocatorSummary {
+    pub total: u64,
+    pub active: u64,
+    pub active_stake_sat: u64,
 }
 
 #[cfg(feature = "native-dex-rehearsal")]
@@ -1506,8 +1527,9 @@ impl ValidatedTransferV2<'_> {
 ///
 /// A plain value: `Clone` + `PartialEq`, no interior mutability, no handles.
 /// Everything a consensus rule may read arrives through this struct, and the
-/// struct is only ever produced by [`CommittedState::genesis`] or by the
-/// transition itself — there is no constructor that reads a database.
+/// struct is produced by genesis, transitions, or the feature-gated local
+/// restart-cache codec. That codec restores all fields and checks the root;
+/// it is not an untrusted state-sync or consensus wire decoder.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommittedState {
     // Immutable genesis-manifest context; deliberately outside historical state-root encoding.
@@ -1728,7 +1750,7 @@ pub struct CommittedState {
     /// anything — so the balance component of the state root was committed
     /// empty on every block since genesis. Genesis-4 had a `TAG_EUTXO` slot in
     /// its schema and no balances in it: a chain where nobody holds anything,
-    /// including the 452,133 outputs the Genesis-3 snapshot carries.
+    /// including the 452,726 outputs the Genesis-3 snapshot carries.
     ///
     /// The set lives in the state because the state root commits to it. What
     /// stays out of this crate is the general script format; what an output is
@@ -2415,7 +2437,11 @@ impl CommittedState {
         let gate_open = crate::params::rehearsal::gates_are_forced_open();
         #[cfg(not(test))]
         let gate_open = false;
-        let lookahead = if !gate_open && epoch < crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH {
+        let gate_active = crate::params::epoch_gate_active(
+            epoch,
+            crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH,
+        );
+        let lookahead = if !gate_open && !gate_active {
             0
         } else {
             #[cfg(test)]
@@ -2617,7 +2643,18 @@ impl CommittedState {
         if epoch < crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH {
             return roster;
         }
-        with_leak_applied(roster, |index| self.finality_engine.leaked_of(index))
+        let leaked = with_leak_applied(roster.clone(), |index| self.finality_engine.leaked_of(index));
+        // Candidate FC-01: a completely empty weighted schedule cannot carry
+        // the votes that restore leaked stake. This candidate restores the
+        // consensus roster without resetting committed leak accumulators.
+        // All roster consumers, including reward-v2, require qualification
+        // before activation; the gate remains unarmed.
+        if crate::params::duty_roster_recovery_active(epoch)
+            && !leaked.iter().any(|v| v.effective_stake > 0)
+        {
+            return roster;
+        }
+        leaked
     }
 
     /// The frozen finality view over the engine's state.
@@ -3058,14 +3095,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::bonding_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `DEPOSIT_ACTIVATION_EPOCH` is `u64::MAX` (an inert, permanently-closed
-        // gate — see the constant's docs), so this comparison is always false
-        // outside the `forced` rehearsal path; that is the intended, documented
-        // shape of the gate, not a bug for clippy to flag.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::DEPOSIT_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::DEPOSIT_ACTIVATION_EPOCH,
+            )
     }
 
     /// Is the **fee-to-stake decoupling** (finding C-R2-2) active in `epoch`?
@@ -3081,13 +3115,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::fee_stake_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
-        // founder's to arm) — the comparison is always false outside `forced`,
-        // by design, not a bug.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH,
+            )
     }
 
     /// Is the AUTHENTICATED exit rule active in `epoch`?
@@ -3104,8 +3136,8 @@ impl CommittedState {
         let forced = crate::params::rehearsal::exit_auth_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `EXIT_AUTH_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate, founder's
-        // to arm) — the comparison is always false outside `forced`, by design.
+        // The production gate is epoch 2884. `forced` lets deliberately old
+        // fixtures exercise the post-boundary rules without changing it.
         #[allow(clippy::absurd_extreme_comparisons)]
         {
             forced || crate::params::epoch_gate_active(epoch, crate::params::EXIT_AUTH_ACTIVATION_EPOCH)
@@ -3120,16 +3152,16 @@ impl CommittedState {
     /// walk — committed state, never a clock. Below the gate a block carrying
     /// evidence is refused (`TxReject::EvidenceNotActive`), which is the same
     /// verdict a pre-format binary reaches at its decoder, so a mixed fleet
-    /// agrees on every block until the founder arms
-    /// [`crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`].
+    /// agrees on every pre-boundary block. The scheduled boundary is
+    /// [`crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`] (epoch 2884).
     fn slashing_evidence_active(epoch: u64) -> bool {
         #[cfg(test)]
         let forced = crate::params::rehearsal::slashing_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
-        // founder's to arm) — the comparison is always false outside `forced`,
-        // by design.
+        // The production gate is epoch 2884. `forced` exists only so fixtures
+        // whose committed epoch is deliberately earlier can exercise the
+        // post-boundary rule without weakening that schedule.
         #[allow(clippy::absurd_extreme_comparisons)]
         {
             forced || crate::params::epoch_gate_active(epoch, crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH)
@@ -3147,12 +3179,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::dust_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `DUST_RULE_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate, founder's
-        // to arm) — the comparison is always false outside `forced`, by design.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::DUST_RULE_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::DUST_RULE_ACTIVATION_EPOCH,
+            )
     }
 
     /// Is the fork-choice equivocation retention horizon (external audit
@@ -3167,13 +3198,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::forkchoice_equivocation_horizon_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH` is `u64::MAX`
-        // today (inert gate, founder's to arm) — the comparison is always
-        // false outside `forced`, by design.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH,
+            )
     }
 
     /// H-R7-3, the consensus half: refuse outputs below
@@ -3212,9 +3241,8 @@ impl CommittedState {
         let forced = crate::params::rehearsal::randao_recommit_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `RANDAO_RECOMMIT_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
-        // founder's to arm) — the comparison is always false outside `forced`,
-        // by design.
+        // The production gate is epoch 2884. `forced` lets deliberately old
+        // fixtures exercise the post-boundary rules without changing it.
         #[allow(clippy::absurd_extreme_comparisons)]
         {
             forced || crate::params::epoch_gate_active(epoch, crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH)
@@ -3234,13 +3262,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::tx_bytes_bound_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `TX_BYTES_BOUND_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
-        // founder's to arm) — the comparison is always false outside `forced`,
-        // by design.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::TX_BYTES_BOUND_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::TX_BYTES_BOUND_ACTIVATION_EPOCH,
+            )
     }
 
     /// Is the **duplicate-attestation refusal** (R3 M-2) active in `epoch`?
@@ -3255,13 +3281,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::attestation_dedup_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `ATTESTATION_DEDUP_ACTIVATION_EPOCH` is `u64::MAX` today (inert
-        // gate, founder's to arm) — the comparison is always false outside
-        // `forced`, by design.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::ATTESTATION_DEDUP_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::ATTESTATION_DEDUP_ACTIVATION_EPOCH,
+            )
     }
 
     /// Is **rewards v2** (R1 M1 + M3 + M4, R7 M5) active in `epoch`? One
@@ -3277,39 +3301,29 @@ impl CommittedState {
         let forced = crate::params::rehearsal::rewards_v2_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `REWARDS_V2_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
-        // founder's to arm) — the comparison is always false outside
-        // `forced`, by design.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::REWARDS_V2_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::REWARDS_V2_ACTIVATION_EPOCH,
+            )
     }
 
-    /// Is **staking-transaction metering** (R7 M1) active in `epoch`? One
-    /// reader for the charge every staking variant reads.
-    /// [`crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH`]'s docs record
-    /// a second half of R7 M1 — a transaction-COUNT cap — that this pass
-    /// could NOT wire in (it needs a new `TransitionError` variant, and
-    /// `TransitionError` lives in the unowned `interfaces.rs`), so this
-    /// predicate gates only the metering charge, not a count check that does
-    /// not exist. `epoch` is the caller's `self.epoch`: committed state
-    /// rolled to the judged block's own `epoch_of(header.slot)`, never a
-    /// clock. Ships inert — `params::STAKING_TX_METERING_ACTIVATION_EPOCH`
-    /// is `u64::MAX` — and the rehearsal switch exists so the metering
-    /// rule's tests are not dead code until the founder arms it.
+    /// Is **staking-transaction metering** (R7 M1 / TX-10) active in `epoch`?
+    /// One reader for both the charge every staking variant reads and the
+    /// transaction-count ceiling. `epoch` is the judged block's committed
+    /// epoch, never a clock. Ships inert — the parameter is `u64::MAX` — and
+    /// the rehearsal switch keeps both candidate rules testable before a
+    /// coordinated protocol decision arms them.
     fn staking_tx_metering_active(epoch: u64) -> bool {
         #[cfg(test)]
         let forced = crate::params::rehearsal::staking_tx_metering_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `STAKING_TX_METERING_ACTIVATION_EPOCH` is `u64::MAX` today (inert
-        // gate, founder's to arm) — the comparison is always false outside
-        // `forced`, by design.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH,
+            )
     }
 
     /// R7 M1: the charge a staking-class transaction owes for its own bytes
@@ -3354,19 +3368,18 @@ impl CommittedState {
     /// Is the **withdrawal transaction** (R7 M4) active in `epoch`? One
     /// reader for one gate, mirroring [`Self::exit_auth_active`]. `epoch` is
     /// the caller's `self.epoch`: committed state rolled to the judged
-    /// block's own `epoch_of(header.slot)`, never a clock. Ships inert —
-    /// `params::WITHDRAWAL_ACTIVATION_EPOCH` is `u64::MAX` — and the
-    /// rehearsal switch exists so the withdrawal rules' tests are not dead
-    /// code until the founder arms it.
+    /// block's own `epoch_of(header.slot)`, never a clock. The production
+    /// boundary is `params::WITHDRAWAL_ACTIVATION_EPOCH` (epoch 2884); the
+    /// rehearsal switch lets deliberately earlier fixtures exercise the
+    /// post-boundary withdrawal rules.
     ///
     fn withdrawal_active(epoch: u64) -> bool {
         #[cfg(test)]
         let forced = crate::params::rehearsal::withdrawal_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `WITHDRAWAL_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
-        // founder's to arm) — the comparison is always false outside
-        // `forced`, by design.
+        // The production gate is epoch 2884. `forced` lets deliberately old
+        // fixtures exercise the post-boundary rules without changing it.
         #[allow(clippy::absurd_extreme_comparisons)]
         {
             forced || crate::params::epoch_gate_active(epoch, crate::params::WITHDRAWAL_ACTIVATION_EPOCH)
@@ -3386,13 +3399,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::sighash_network_binding_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH` is `u64::MAX` today
-        // (inert gate, founder's to arm) — the comparison is always false
-        // outside `forced`, by design.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH,
+            )
     }
 
     fn apply_transaction(
@@ -3446,6 +3457,11 @@ impl CommittedState {
                 // producer could lift for the whole network.
                 if !Self::unfunded_bonding_active(self.epoch) {
                     return Err(TxReject::StakingNotActive);
+                }
+                if crate::params::activation_queue_v2_active(self.epoch)
+                    && self.validators.len() >= staking::MAX_VALIDATOR_REGISTRY_ENTRIES
+                {
+                    return Err(TxReject::StakingRule);
                 }
                 let pubkey_hash: [u8; 32] = Sha3_256::digest(pubkey).into();
                 // A second deposit of a registered key is a top-up path
@@ -3539,8 +3555,9 @@ impl CommittedState {
                 // boundary walk, never node-local. At and above
                 // EXIT_AUTH_ACTIVATION_EPOCH the unauthenticated message is
                 // dead and `ExitV2` is the only voluntary exit; the constant
-                // is `u64::MAX`, so today this never fires and everything
-                // below is byte-for-byte the behaviour that shipped.
+                // is epoch 2884. Below that boundary this condition remains
+                // false and the historical legacy behavior is replayed; at
+                // and above it the legacy message is refused here.
                 if Self::exit_auth_active(self.epoch)
                     || crate::params::funded_validator_admission_active(self.epoch)
                 {
@@ -3582,11 +3599,10 @@ impl CommittedState {
             PosTransaction::RandaoRecommit { validator, new_commitment, epoch, signature } => {
                 // THE FLAG-DAY GATE, FIRST — same discipline as every other
                 // gated arm, read from `self.epoch` (committed state, never
-                // node-local). `RANDAO_RECOMMIT_ACTIVATION_EPOCH` is
-                // `u64::MAX`, so today this refuses at EVERY epoch and the
-                // fleet's behaviour is unchanged: chains stay terminal until
-                // the founder arms the flag day (deadline ~2027-02-11, the
-                // first exhaustion — see the constant's docs).
+                // node-local). `RANDAO_RECOMMIT_ACTIVATION_EPOCH` is 2884:
+                // earlier blocks refuse, while blocks at and above the
+                // lifecycle boundary judge the registered validator's signed
+                // re-commitment (see the constant's deployment caveat).
                 if !Self::randao_recommit_active(self.epoch) {
                     return Err(TxReject::StakingNotActive);
                 }
@@ -3617,6 +3633,14 @@ impl CommittedState {
                 if *amount_sat < delegation::MIN_DELEGATION_SAT {
                     return Err(TxReject::StakingRule);
                 }
+                // The bit remains in tag 0x04's frozen wire encoding, but the
+                // taint oracle that once gave it meaning was retired before
+                // Genesis-4. A sender may not manufacture consensus state by
+                // choosing it. `false` is noncanonical policy and is refused;
+                // the stored fact is derived from the one admissible value.
+                if !*eligible {
+                    return Err(TxReject::StakingRule);
+                }
                 self.delegations.push(Delegation {
                     delegator: *delegator,
                     validator: *validator,
@@ -3627,7 +3651,7 @@ impl CommittedState {
                     // change it (the same principle as ACTIVATION_DELAY).
                     requested_epoch: self.epoch + 1,
                     deactivate_epoch: None,
-                    eligible: *eligible,
+                    eligible: true,
                 });
                 // R7 M1: unauthenticated — no signature is verified here.
                 Ok(Self::staking_tx_charge(self.epoch, 0, tx.canonical_bytes().len()))
@@ -3739,11 +3763,28 @@ impl CommittedState {
         let Some(rec) = self.validators.get(&index) else {
             return Err(TxReject::StakingRule);
         };
-        // Same lifecycle rules as the legacy arm — active, not already
-        // exiting, not slashed. Slashing owns its own ejection path and must
-        // not share the voluntary one, or a slashed validator could reset its
-        // withdrawal clock.
-        if rec.slashed || rec.activation_epoch > self.epoch || rec.exit_epoch != u64::MAX {
+        // The normal path requires an active validator. The separately gated
+        // ST-16 candidate also admits a funded registration that is still in
+        // the activation queue after its ordinary delay. It deliberately
+        // reuses this message: the registered validator key, signed inclusion
+        // epoch, churn ceiling and replay rules remain identical.
+        let queued_funded_cancellation =
+            crate::params::funded_validator_cancellation_active(self.epoch)
+                && self.funded_validators.contains(&index)
+                && rec.activation_epoch == u64::MAX
+                && self.deposit_history.iter().any(|deposit| {
+                    deposit.pubkey_hash == *pubkey_hash
+                        && deposit
+                            .deposit_epoch
+                            .checked_add(staking::ACTIVATION_DELAY_EPOCHS)
+                            .is_some_and(|eligible| eligible <= self.epoch)
+                });
+        // Slashing owns its own ejection path and must not share the voluntary
+        // one, or a slashed validator could reset its withdrawal clock.
+        if rec.slashed
+            || (rec.activation_epoch > self.epoch && !queued_funded_cancellation)
+            || rec.exit_epoch != u64::MAX
+        {
             return Err(TxReject::StakingRule);
         }
         // THE CHURN BUDGET. Deliberately before the signature: it is the rule
@@ -4028,9 +4069,11 @@ impl CommittedState {
         // One signing root for the whole transfer, so N inputs cost N
         // verifications and not N roots. The root excludes the witnesses (see
         // `spend_signing_root`). Below `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH`
-        // (A2-3 / R7 M2) `checked_signing_root` returns exactly that root;
+        // (A2-3 / R7 M2) the network-aware helper returns exactly that root;
         // see its docs for what changes once the gate arms.
-        let signing_root = tx.checked_signing_root(self.epoch);
+        let signing_root = tx
+            .checked_signing_root_for_network(self.epoch, self.admission_network_domain.as_ref())
+            .ok_or(TransferReject::MissingNetworkBinding)?;
         for i in inputs {
             if !verifier.verify_with_key(&i.pubkey, &signing_root, &i.signature) {
                 return Err(TransferReject::BadSignature);
@@ -4332,13 +4375,18 @@ impl CommittedState {
         // The whole point of the format: the signing root covers every spend
         // point, so one signature per key authorises all of that key's
         // inputs. k verifications instead of n; each is the SAME check a V1
-        // input would get. Same `checked_signing_root` as V1 — one fold,
+        // input would get. Same network-aware root as V1 — one fold,
         // shared by both callers, so the two formats cannot drift into
         // different network-binding rules once the gate arms (A2-3 / R7 M2).
-        let signing_root = context.as_ref().map_or_else(
-            || tx.checked_signing_root(self.epoch),
-            |joint| joint.authorization,
-        );
+        let signing_root = match context.as_ref() {
+            Some(joint) => joint.authorization,
+            None => tx
+                .checked_signing_root_for_network(
+                    self.epoch,
+                    self.admission_network_domain.as_ref(),
+                )
+                .ok_or(TransferReject::MissingNetworkBinding)?,
+        };
         for k in keys {
             if !verifier.verify_with_key(&k.pubkey, &signing_root, &k.signature) {
                 return Err(TransferReject::BadSignature);
@@ -4375,7 +4423,7 @@ impl CommittedState {
         &mut self,
         evidence: &SlashingEvidence,
         including_proposer: u32,
-        total_active_sat: u128,
+        consensus_roster: &[Validator],
         verifier: &dyn SignatureVerifier,
     ) -> Result<(), ()> {
         let offender = match evidence {
@@ -4388,6 +4436,15 @@ impl CommittedState {
             return Err(());
         };
         let own_bond_sat = offender_rec.staked_sat;
+        let total_active_sat = consensus_roster
+            .iter()
+            .map(|v| v.effective_stake as u128)
+            .sum();
+        let offender_effective_sat = consensus_roster
+            .iter()
+            .find(|v| v.index == offender)
+            .map(|v| v.effective_stake as u128)
+            .unwrap_or(0);
         // Refuse unknown historical backing; repeated evidence must not erase
         // an indeterminate classification by manufacturing a newer floor.
         if self.is_write_off_indeterminate(offender) { return Err(()); }
@@ -4447,25 +4504,27 @@ impl CommittedState {
                 // slashing set fields, they do not delete), so evidence
                 // against an exited or already-slashed validator still
                 // resolves its key here.
-                self.slashing.process(
+                self.slashing.process_with_effective_exposure(
                     &pair,
                     self.epoch,
                     own_bond_sat,
                     &exposure,
                     total_active_sat,
+                    offender_effective_sat,
                     including_proposer,
                     verifier,
                     &self.validators,
                 )
             }
             SlashingEvidence::ProposerEquivocation { first, second } => {
-                self.slashing.process_proposer(
+                self.slashing.process_proposer_with_effective_exposure(
                     first,
                     second,
                     self.epoch,
                     own_bond_sat,
                     &exposure,
                     total_active_sat,
+                    offender_effective_sat,
                     including_proposer,
                     verifier,
                     &self.validators,
@@ -4503,11 +4562,10 @@ impl CommittedState {
             // already exiting earlier (or at exactly this epoch, via its own
             // voluntary exit) must not have its exit pushed LATER by a slash.
             //
-            // Replay-safety: this path is reachable only once
-            // `SLASHING_EVIDENCE_ACTIVATION_EPOCH` (still `u64::MAX`) is
-            // armed, so no historical block has ever executed this write —
-            // changing it needs no gate of its own (`params.rs`'s doc on that
-            // constant covers the argument).
+            // Replay-safety: this path is reachable only at and above
+            // `SLASHING_EVIDENCE_ACTIVATION_EPOCH` (2884), so pre-boundary
+            // historical blocks never executed this write. The lifecycle
+            // boundary itself is the gate (`params.rs` documents the rollout).
             let effective_exit = epoch.saturating_add(1);
             if effective_exit < rec.exit_epoch {
                 rec.exit_epoch = effective_exit;
@@ -4515,7 +4573,12 @@ impl CommittedState {
             // The residue stays reachable through the weak-subjectivity
             // margin, and a slash never *shortens* a scheduled lock
             // (`u64::MAX` means no lock was scheduled at all).
-            let lock = epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
+            let withdrawal_delay = if crate::params::slashing_economics_v2_active(epoch) {
+                staking::EXIT_DELAY_EPOCHS.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS)
+            } else {
+                staking::WITHDRAWAL_DELAY_EPOCHS
+            };
+            let lock = epoch.saturating_add(withdrawal_delay);
             rec.withdrawable_epoch = if rec.withdrawable_epoch == u64::MAX {
                 lock
             } else {
@@ -4625,6 +4688,28 @@ impl CommittedState {
     /// "3 of 3 active" are different networks and one number cannot say which.
     pub fn validator_count(&self) -> usize {
         self.validators.len()
+    }
+
+    /// Summarise the permanent committed fork-choice bar for operators.
+    ///
+    /// The active stake uses the same leak-adjusted roster that block
+    /// transition fork choice receives. The sum saturates defensively at
+    /// `u64::MAX`; the protocol supply is below that bound, but a read surface
+    /// must not wrap if it is ever called on a synthetic or corrupt state.
+    pub fn forkchoice_equivocator_summary(&self) -> ForkChoiceEquivocatorSummary {
+        let mut active = 0u64;
+        let mut active_stake_sat = 0u64;
+        for validator in self.consensus_roster_at(self.epoch) {
+            if self.fc_equivocators.contains(&validator.index) {
+                active = active.saturating_add(1);
+                active_stake_sat = active_stake_sat.saturating_add(validator.effective_stake);
+            }
+        }
+        ForkChoiceEquivocatorSummary {
+            total: self.fc_equivocators.len() as u64,
+            active,
+            active_stake_sat,
+        }
     }
 
     /// Every unspent output, in `(txid, vout)` order.
@@ -4983,8 +5068,8 @@ impl CommittedState {
             // epoch a slash lands in — freezing the epoch's roster at its
             // first slot without needing a flag day, since the write is
             // reachable only behind `SLASHING_EVIDENCE_ACTIVATION_EPOCH`
-            // (still `u64::MAX`) and therefore replays every historical block
-            // unchanged. This guard stays anyway, downgraded to
+            // (currently 2884), preserving pre-activation block semantics.
+            // This guard stays anyway, downgraded to
             // defense-in-depth for a class of bug this crate has already paid
             // for once, per `report_boundary_vote_drop`'s updated docs; the
             // mutation that proves it can still fail is
@@ -5002,10 +5087,12 @@ impl CommittedState {
                 "boundary partition dropped votes that the inclusion check at step 8 admitted - \
                  the two filters have diverged (or a mid-epoch slash moved the roster)"
             );
-            // Out-of-order is unreachable: this is the only call site and it
-            // feeds epochs densely by construction. A total no-op on Err
-            // beats a panic in a consensus path.
-            let _ = st.finality_engine.process_epoch(&epoch_votes);
+            // Preserve the existing no-op on a rejected epoch feed. Expose a
+            // desynchronized cursor without resetting it, rejecting a block,
+            // or introducing a panic into this consensus path.
+            if let Err(error) = st.finality_engine.process_epoch(&epoch_votes) {
+                report_finality_order_failure(error);
+            }
         }
 
         // 2. Rewards for the closed epoch (rewards.rs). Issuance follows the
@@ -5192,6 +5279,17 @@ impl CommittedState {
                     for (delegator, reward) in shares {
                         if reward > 0 {
                             *st.delegator_issuance_rewards.entry(delegator).or_insert(0) += reward;
+                            // This ledger credit is newly minted issuance in
+                            // exactly the same sense as the operator credit
+                            // above. Leaving it out of the counter makes the
+                            // unconditional supply-conservation check reject
+                            // the first rewards-v2 boundary that has an active
+                            // delegation. This branch remains behind the inert
+                            // rewards-v2 gate, so historical/pre-activation
+                            // state roots are unchanged.
+                            if !mutation_mints_from_nothing() {
+                                st.issued_sat += reward;
+                            }
                         }
                     }
                     // Truncation dust compounds into the operator's bond —
@@ -5524,6 +5622,20 @@ impl<V: SignatureVerifier> Transition<V> {
         attestations: &[Attestation],
         transactions: &[PosTransaction],
     ) -> Result<CommittedState, TransitionError> {
+        self.compute_post_state_observed(pre, envelope, attestations, transactions, |_, _, _| {})
+    }
+
+    /// Replay with a read-only receipt observer. Observations are provisional
+    /// until the caller verifies the final state root and this method succeeds.
+    /// The callback cannot mutate consensus state or change transaction charges.
+    pub fn compute_post_state_observed<F: FnMut(usize, &CommittedState, &fee_market::TxCharge)>(
+        &self,
+        pre: &CommittedState,
+        envelope: &ProposalEnvelope,
+        attestations: &[Attestation],
+        transactions: &[PosTransaction],
+        mut observer: F,
+    ) -> Result<CommittedState, TransitionError> {
         let header = &envelope.header;
 
         // 1. Slot must advance (double-apply of a block to its own
@@ -5548,6 +5660,17 @@ impl<V: SignatureVerifier> Transition<V> {
             return Err(TransitionError::Proposal(ProposalReject::WrongVersion));
         }
 
+        // TX-10 candidate: cap dispatch/state work by transaction COUNT as
+        // well as by gas and bytes. This intentionally runs before canonical
+        // serialization and body-root hashing, the first work proportional
+        // to transaction count. The gate is inert in production, preserving
+        // every historical verdict until a coordinated activation is chosen.
+        if CommittedState::staking_tx_metering_active(block_epoch)
+            && transactions.len() > crate::params::MAX_TRANSACTIONS_PER_BLOCK
+        {
+            return Err(TransitionError::TooManyTransactions);
+        }
+
         // 3b. THE HEADER MUST COMMIT TO WHAT IT CARRIES.
         //
         // These three checks were absent from this stack entirely. They existed
@@ -5567,8 +5690,8 @@ impl<V: SignatureVerifier> Transition<V> {
         //
         // They sit here — after the two integer comparisons, before the
         // sortition draw and long before the hybrid verify — because they are
-        // hashes over data already in hand, and the frozen error order is
-        // cheap-to-expensive. The functions are `derive`'s: one derivation
+        // hashes over data already in hand, preserving the cheap-to-expensive
+        // DoS posture. The functions are `derive`'s: one derivation
         // path means the producer stamps and the validator checks by calling
         // the same code, which is the whole anti-h28080 invariant `produce.rs`
         // is built on.
@@ -5825,6 +5948,17 @@ impl<V: SignatureVerifier> Transition<V> {
         //    build.
         let dedup_active = CommittedState::attestation_dedup_active(st.epoch);
         let mut seen: BTreeSet<(u32, [u8; 32])> = BTreeSet::new();
+        // Verdict-preserving replay suppression below the flag day. The live
+        // rule still ACCEPTS a repeated pair, so it cannot use the gated
+        // `DuplicateAttestation` refusal yet. It can, however, avoid paying
+        // twice for an *identical* attestation: after the first copy has
+        // verified, the same validator/root/signature bytes necessarily have
+        // the same result. Signature bytes are part of the key on purpose —
+        // two randomized encodings of one vote must each be checked, or an
+        // invalid second signature would change from reject to accept.
+        // Borrowed slices keep the bounded (MAX_ATTESTATIONS_PER_BLOCK) index
+        // small instead of cloning up to 4.6 KB per entry.
+        let mut validated_exact: BTreeSet<(u32, [u8; 32], &[u8])> = BTreeSet::new();
 
         for (i, att) in attestations.iter().enumerate() {
             let reject = TransitionError::Attestation(i as u32);
@@ -5832,8 +5966,12 @@ impl<V: SignatureVerifier> Transition<V> {
                 return Err(reject);
             }
             let signing_root = att.data.signing_root();
-            if dedup_active && !seen.insert((att.validator, signing_root)) {
+            let first_pair = seen.insert((att.validator, signing_root));
+            if dedup_active && !first_pair {
                 return Err(TransitionError::DuplicateAttestation(i as u32));
+            }
+            if !validated_exact.insert((att.validator, signing_root, att.signature.as_slice())) {
+                continue;
             }
             // Same slice `committee_for_slot` would have returned, from the
             // partition drawn once above. `unwrap_or` rather than an index:
@@ -5888,13 +6026,35 @@ impl<V: SignatureVerifier> Transition<V> {
         // Satoshis this block bonds without spending an output. See the
         // conservation check at step 11b.
         let mut unfunded_bonded: u128 = 0;
+        // Preflight the transfer budgets before executing any spend or
+        // rebuilding any output paths (TX-02). These are the same declared
+        // charges used below; other classes remain covered by the final caps.
+        let mut minimum_bytes = 0u64;
+        let mut minimum_gas = 0u64;
+        for tx in transactions {
+            let (bytes, witnesses) = match tx {
+                PosTransaction::Transfer { inputs, tx_bytes, .. } => (*tx_bytes, inputs.len()),
+                PosTransaction::TransferV2 { keys, tx_bytes, .. } => (*tx_bytes, keys.len()),
+                PosTransaction::FundedDeposit(tx) => (tx.tx_bytes, 2),
+                _ => continue,
+            };
+            minimum_bytes = minimum_bytes.saturating_add(bytes);
+            minimum_gas = minimum_gas.saturating_add(fee_market::intrinsic_gas(
+                fee_market::TxClass::Eutxo { inputs: witnesses as u32 }, bytes));
+        }
+        if minimum_gas > fee_market::BLOCK_GAS_LIMIT {
+            return Err(TransitionError::BlockGasLimitExceeded);
+        }
+        if minimum_bytes > fee_market::max_block_tx_bytes(block_epoch) {
+            return Err(TransitionError::BlockByteLimitExceeded);
+        }
         for (i, tx) in transactions.iter().enumerate() {
             let applied = match tx {
                 // The gate first: below SLASHING_EVIDENCE_ACTIVATION_EPOCH
-                // (u64::MAX today — INERT) a block carrying evidence is
-                // consensus-invalid on every node, byte-for-byte the verdict
-                // a pre-format binary reaches at its decoder. Judged off the
-                // block's own committed epoch, never a clock — the 2026-08-08
+                // (2884) a block carrying evidence is consensus-invalid on
+                // every current node, byte-for-byte the verdict a pre-format
+                // binary reaches at its decoder. Judged off the block's own
+                // committed epoch, never a clock — the 2026-08-08
                 // expected_bits fork is the standing reason.
                 PosTransaction::SlashingEvidence(_)
                     if !CommittedState::slashing_evidence_active(block_epoch) =>
@@ -5905,7 +6065,7 @@ impl<V: SignatureVerifier> Transition<V> {
                     .apply_slashing_evidence(
                         ev,
                         header.proposer_index,
-                        total_active,
+                        &roster,
                         &self.verifier,
                     )
                     // R7 M1: two hybrid verifications — `apply_slashing_evidence`
@@ -5919,6 +6079,13 @@ impl<V: SignatureVerifier> Transition<V> {
             };
             match applied {
                 Ok(charge) => {
+                    if block_gas.saturating_add(charge.gas) > fee_market::BLOCK_GAS_LIMIT {
+                        return Err(TransitionError::BlockGasLimitExceeded);
+                    }
+                    if block_bytes.saturating_add(charge.tx_bytes) > fee_market::max_block_tx_bytes(block_epoch) {
+                        return Err(TransitionError::BlockByteLimitExceeded);
+                    }
+                    observer(i, &st, &charge);
                     base_fees += charge.base_fee_sat;
                     priority_fees += charge.priority_fee_sat;
                     block_gas = block_gas.saturating_add(charge.gas);
@@ -6475,6 +6642,14 @@ mod tests {
         }
     }
 
+    struct CountingOkVerifier(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl SignatureVerifier for CountingOkVerifier {
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    }
+
     fn sat(bloch: u128) -> u128 {
         bloch * tokenomics_v4::SAT_PER_BLOCH
     }
@@ -6836,6 +7011,17 @@ mod tests {
                 "epoch {e}: the transition's boundary epoch and the committee crate's disagree"
             );
         }
+    }
+
+    #[test]
+    fn the_unarmed_ancestry_seed_gate_stays_closed_at_the_synthetic_boundary() {
+        let (_transition, mut state, _chains) = setup(4);
+        let legacy_mix = [0xA1; 32];
+        let gated_mix = [0xB2; 32];
+        state.boundary_mixes.insert(u64::MAX - 1, legacy_mix);
+        state.boundary_mixes.insert(u64::MAX - 2, gated_mix);
+
+        assert_eq!(state.seed_for_epoch(u64::MAX), legacy_mix);
     }
 
     /// **The retention claim, tested rather than argued.**
@@ -7469,6 +7655,50 @@ mod tests {
         );
     }
 
+    /// TX-15: below the flag day the second copy remains consensus-accepted,
+    /// but byte-identical replay must not buy a second hybrid verification.
+    /// The count is one proposer plus one attestation, not two attestations.
+    #[test]
+    fn an_exact_attestation_replay_reuses_its_successful_verification() {
+        let (_t, s, mut chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+        let one = attest(&s, member, att_slot, *s.head.as_bytes());
+        let two = vec![one.clone(), one];
+        let dup = build_header_over(&s, 63, &two, &mut chains);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t = Transition::new(CountingOkVerifier(calls.clone()));
+
+        assert_eq!(
+            t.apply_block(&s, &dup, &two, &[]),
+            Err(TransitionError::StateRootMismatch),
+            "the optimization must preserve the pre-gate accepted-body verdict"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "one proposer plus one unique attestation should be verified"
+        );
+    }
+
+    /// Same voter and signing root is not enough to reuse success: signature
+    /// bytes that differ retain the old verification and rejection behavior.
+    #[test]
+    fn a_signature_variant_of_the_same_vote_is_still_verified() {
+        let (_t, s, mut chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+        let one = attest(&s, member, att_slot, *s.head.as_bytes());
+        let mut invalid = one.clone();
+        invalid.signature[0] ^= 0xff;
+        let two = vec![one, invalid];
+        let dup = build_header_over(&s, 63, &two, &mut chains);
+
+        assert_eq!(
+            Transition::new(ToyVerifier).apply_block(&s, &dup, &two, &[]),
+            Err(TransitionError::Attestation(1)),
+            "a pair-only cache would wrongly accept the invalid signature variant"
+        );
+    }
+
     // -- ATTESTATION_DEDUP_ACTIVATION_EPOCH (audit R3 M-2) -------------------
 
     /// TRIPWIRE. `ATTESTATION_DEDUP_ACTIVATION_EPOCH` must stay `u64::MAX`
@@ -7491,12 +7721,32 @@ mod tests {
     /// and of nothing else.
     #[test]
     fn the_dedup_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1, u64::MAX] {
             assert!(!CommittedState::attestation_dedup_active(e), "epoch {e} must be below");
         }
-        assert!(CommittedState::attestation_dedup_active(
-            crate::params::ATTESTATION_DEDUP_ACTIVATION_EPOCH
-        ));
+    }
+
+    #[test]
+    fn every_legacy_unarmed_gate_stays_closed_at_the_synthetic_boundary() {
+        let epoch = u64::MAX;
+        let verdicts = [
+            ("deposit", CommittedState::unfunded_bonding_active(epoch)),
+            ("fee/stake", CommittedState::fee_stake_decouple_active(epoch)),
+            ("dust", CommittedState::dust_rule_active(epoch)),
+            (
+                "fork-choice equivocation horizon",
+                CommittedState::forkchoice_equivocation_horizon_active(epoch),
+            ),
+            ("transaction bytes", CommittedState::tx_bytes_bound_active(epoch)),
+            ("attestation dedup", CommittedState::attestation_dedup_active(epoch)),
+            ("rewards v2", CommittedState::rewards_v2_active(epoch)),
+            ("staking metering", CommittedState::staking_tx_metering_active(epoch)),
+            ("sighash network binding", CommittedState::sighash_network_binding_active(epoch)),
+        ];
+
+        for (name, active) in verdicts {
+            assert!(!active, "the {name} gate must treat MAX as an unarmed sentinel");
+        }
     }
 
     // -- REWARDS_V2_ACTIVATION_EPOCH (audit R1 M1 + M3 + M4, R7 M5) ----------
@@ -7518,10 +7768,9 @@ mod tests {
     /// Same shape as every other gate's function-of-the-epoch-alone test.
     #[test]
     fn the_rewards_v2_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1, u64::MAX] {
             assert!(!CommittedState::rewards_v2_active(e), "epoch {e} must be below");
         }
-        assert!(CommittedState::rewards_v2_active(crate::params::REWARDS_V2_ACTIVATION_EPOCH));
     }
 
     // -- FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH (external audit -----
@@ -7545,15 +7794,50 @@ mod tests {
     /// Same shape as every other gate's function-of-the-epoch-alone test.
     #[test]
     fn the_forkchoice_equivocation_horizon_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1, u64::MAX] {
             assert!(
                 !CommittedState::forkchoice_equivocation_horizon_active(e),
                 "epoch {e} must be below"
             );
         }
-        assert!(CommittedState::forkchoice_equivocation_horizon_active(
-            crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH
-        ));
+    }
+
+    /// FC-12 observability must describe today's permanent-bar semantics,
+    /// not accidentally introduce recovery semantics of its own. An exited
+    /// validator remains in the committed historical set across an epoch
+    /// boundary, while only currently active barred validators contribute to
+    /// the live weight gauge.
+    #[test]
+    fn forkchoice_equivocator_summary_separates_history_from_active_weight() {
+        let (_t, mut st, _chains) = setup(4);
+        assert_eq!(
+            st.forkchoice_equivocator_summary(),
+            ForkChoiceEquivocatorSummary::default(),
+        );
+
+        st.fc_equivocators.extend([1, 3]);
+        assert_eq!(
+            st.forkchoice_equivocator_summary(),
+            ForkChoiceEquivocatorSummary {
+                total: 2,
+                active: 2,
+                active_stake_sat: sat(400_000) as u64,
+            },
+        );
+
+        // Model validator 3 having left the active roster. FC-12's exact
+        // residual is that lifecycle progress does not clear its bar.
+        st.validators.get_mut(&3).unwrap().exit_epoch = st.epoch;
+        let rolled = st.close_epoch();
+        assert!(rolled.fc_equivocators.contains(&3));
+        assert_eq!(
+            rolled.forkchoice_equivocator_summary(),
+            ForkChoiceEquivocatorSummary {
+                total: 2,
+                active: 1,
+                active_stake_sat: sat(200_000) as u64,
+            },
+        );
     }
 
     /// The O01 model: one validator, A = (s, x), B = (s, y) conflicting at
@@ -7970,10 +8254,12 @@ mod tests {
         );
     }
 
-    /// R1 M4 regression: a delegator's pro-rata share of issuance must be
-    /// settled into the committed ledger, not silently discarded. Reverting
-    /// the fix (feeding `rewards::distribute` `delegated_stake: 0` again)
-    /// makes this go red.
+    /// R1 M4 / ST-06 regression: a delegator's pro-rata share of issuance
+    /// must be settled into the committed ledger and advance `issued_sat` by
+    /// the same amount. Reverting either half makes this go red: omitting the
+    /// ledger credit discards the delegator's reward, while omitting the
+    /// counter advance makes the supply-conservation guard refuse the first
+    /// rewards-v2 boundary with an active delegation.
     #[test]
     fn rewards_v2_settles_delegator_issuance_share() {
         let (_t, s, _chains) = epoch1_fixture();
@@ -8002,12 +8288,37 @@ mod tests {
             eligible: true,
         });
 
+        // Below the gate the new ledger and its issuance accounting remain
+        // completely inert. This is the historical-compatibility leg: the
+        // patch must not move any pre-activation committed quantity.
+        let legacy = st.clone().close_epoch();
+        assert_eq!(legacy.delegator_issuance_reward_sat(900), 0);
+
+        let issued_before = st.issued_sat();
+        let accounted_before = st.accounted_supply_sat();
         let _gate = crate::params::rehearsal::rewards_v2_gate_open_guard();
         let closed = st.close_epoch();
+        let delegator_reward = closed.delegator_issuance_reward_sat(900);
         assert!(
-            closed.delegator_issuance_reward_sat(900) > 0,
+            delegator_reward > 0,
             "R1 M4: a delegator behind an attesting, capped-eligible validator must earn a \
              pro-rata share of issuance"
+        );
+        let minted = closed.issued_sat() - issued_before;
+        let holdings_growth = closed.accounted_supply_sat() - accounted_before;
+        assert_eq!(
+            holdings_growth, minted,
+            "ST-06: every rewards-v2 ledger credit must advance issued_sat; otherwise the \
+             next boundary is refused as unconserved supply"
+        );
+        assert!(
+            minted >= delegator_reward,
+            "the committed issuance delta must include the delegator's newly minted share"
+        );
+        assert!(
+            CommittedState::supply_conserved(&st, &closed, 0),
+            "an honest rewards-v2 boundary with delegation must pass the production \
+             supply-conservation predicate"
         );
     }
 
@@ -8200,12 +8511,71 @@ mod tests {
     /// Same shape as every other gate's function-of-the-epoch-alone test.
     #[test]
     fn the_staking_tx_metering_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1, u64::MAX] {
             assert!(!CommittedState::staking_tx_metering_active(e), "epoch {e} must be below");
         }
-        assert!(CommittedState::staking_tx_metering_active(
-            crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH
-        ));
+    }
+
+    /// ST-12 regression: ADR-041 activated the withdrawal/lifecycle gate at
+    /// epoch 2,884 while the standalone metering gate remained inert. The
+    /// explicit `withdrawal_active` coupling in `staking_tx_charge` therefore
+    /// makes lifecycle transactions consume the existing gas and byte budgets
+    /// at the lifecycle boundary. Keep that release behavior visible: removing
+    /// the coupling would silently restore free lifecycle transactions, while
+    /// moving it earlier would break historical replay.
+    #[test]
+    fn lifecycle_gate_also_activates_staking_capacity_metering() {
+        let gate = crate::params::WITHDRAWAL_ACTIVATION_EPOCH;
+        assert_eq!(crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH, u64::MAX);
+
+        let before = CommittedState::staking_tx_charge(gate - 1, 1, 123);
+        assert_eq!(before.gas, 0);
+        assert_eq!(before.tx_bytes, 0);
+
+        let at = CommittedState::staking_tx_charge(gate, 1, 123);
+        assert!(at.gas > 0);
+        assert_eq!(at.tx_bytes, 123);
+        assert_eq!(at.base_fee_sat, 0);
+        assert_eq!(at.priority_fee_sat, 0);
+    }
+
+    /// TX-10: the count ceiling is a rehearsable consensus candidate, not a
+    /// silently-live tightening. Below the gate an oversized body reaches the
+    /// pre-existing body-root verdict; with the gate forced open it is refused
+    /// before body serialization. Exactly the ceiling is not over it.
+    #[test]
+    fn transaction_count_cap_is_inert_until_the_metering_gate_opens() {
+        let tx = PosTransaction::Delegate {
+            delegator: 900,
+            validator: 0,
+            amount_sat: delegation::MIN_DELEGATION_SAT,
+            eligible: true,
+        };
+
+        let (t, s, mut chains) = epoch1_fixture();
+        let over = vec![tx.clone(); crate::params::MAX_TRANSACTIONS_PER_BLOCK + 1];
+        let env = build_header_over(&s, 63, &[], &mut chains);
+        assert_eq!(
+            t.compute_post_state(&s, &env, &[], &over),
+            Err(TransitionError::BodyRootMismatch),
+            "production gate is inert: the new count candidate must not change today's verdict"
+        );
+
+        let _gate = crate::params::rehearsal::staking_tx_metering_gate_open_guard();
+        assert_eq!(
+            t.compute_post_state(&s, &env, &[], &over),
+            Err(TransitionError::TooManyTransactions),
+            "an armed node must refuse the whole body before judging its transactions"
+        );
+
+        let (t, s, mut chains) = epoch1_fixture();
+        let at = vec![tx; crate::params::MAX_TRANSACTIONS_PER_BLOCK];
+        let env = build_header_over(&s, 63, &[], &mut chains);
+        assert_eq!(
+            t.compute_post_state(&s, &env, &[], &at),
+            Err(TransitionError::BodyRootMismatch),
+            "a body exactly at MAX_TRANSACTIONS_PER_BLOCK is not over the candidate cap"
+        );
     }
 
     /// R7 M1 regression, the unauthenticated arms: below the gate a
@@ -9245,35 +9615,27 @@ mod tests {
 
     // -- WITHDRAWAL_ACTIVATION_EPOCH (audit R7 M4) ---------------------------
 
-    /// TRIPWIRE. `WITHDRAWAL_ACTIVATION_EPOCH` must stay `u64::MAX` until
-    /// the founder both rules on the withdrawal transaction's wire byte
-    /// (see [`CommittedState::withdrawal_active`]'s docs — this pass could
-    /// not add the `PosTransaction` variant itself, since ANY new variant
-    /// makes the unowned `tests/wire_tag_registry.rs`'s frozen, wildcard-
-    /// free match stop compiling) and arms this constant. Whoever arms it
-    /// deletes this test first, and reads the constant's docs while doing
-    /// so.
+    /// Pin the operator-scheduled ADR-041 release boundary. Moving it requires
+    /// another coordinated release; implementing a decoder alone is insufficient.
     #[test]
-    fn withdrawal_gate_is_inert() {
-        assert_eq!(
-            crate::params::WITHDRAWAL_ACTIVATION_EPOCH,
-            u64::MAX,
-            "arming withdrawal is a flag day gated on a wire-byte ruling; read the constant's docs",
-        );
+    fn withdrawal_gate_matches_the_lifecycle_schedule() {
+        assert_eq!(crate::params::WITHDRAWAL_ACTIVATION_EPOCH, 2_884);
+        assert_eq!(crate::params::WITHDRAWAL_ACTIVATION_EPOCH,
+            crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH);
     }
 
-    /// Same shape as every other gate's function-of-the-epoch-alone test —
-    /// pinned even with no call site yet, so the predicate and its
-    /// rehearsal switch cannot silently regress before the day they are
-    /// wired to an actual transaction arm.
+    /// The boundary follows committed block epochs, never an operator clock.
     #[test]
     fn the_withdrawal_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
-            assert!(!CommittedState::withdrawal_active(e), "epoch {e} must be below");
+        let gate = crate::params::WITHDRAWAL_ACTIVATION_EPOCH;
+        for epoch in [0, 1, 1_766, gate - 1] {
+            assert!(!CommittedState::withdrawal_active(epoch));
         }
-        assert!(!CommittedState::withdrawal_active(u64::MAX), "unarmed is closed even at the sentinel");
+        for epoch in [gate, gate + 1, u64::MAX] {
+            assert!(CommittedState::withdrawal_active(epoch));
+        }
         let _g = crate::params::rehearsal::withdrawal_gate_open_guard();
-        assert!(CommittedState::withdrawal_active(0), "the rehearsal switch must force it open too");
+        assert!(CommittedState::withdrawal_active(0));
     }
 
     // -- SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH (audit A2-3 / R7 M2) -------
@@ -9297,12 +9659,9 @@ mod tests {
     /// Same shape as every other gate's function-of-the-epoch-alone test.
     #[test]
     fn the_sighash_network_binding_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1, u64::MAX] {
             assert!(!CommittedState::sighash_network_binding_active(e), "epoch {e} must be below");
         }
-        assert!(CommittedState::sighash_network_binding_active(
-            crate::params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH
-        ));
     }
 
     /// KAT: below the gate, `checked_signing_root` is byte-identical to
@@ -9368,7 +9727,8 @@ mod tests {
         let alice = owner_key(0x91);
         let to = script_of(&owner_key(0x92));
         let coin = opening(0x9A, 0, 50_000_000, &alice);
-        let (_t, g, _c) = setup_funded(4, &[coin.clone()]);
+        let (_t, mut g, _c) = setup_funded(4, &[coin.clone()]);
+        g.admission_network_domain = Some([0xD4; 32]);
         let price = g.next_base_fee();
 
         let tx = transfer_spending(std::slice::from_ref(&coin), &alice, to, 512, 1, price);
@@ -9381,9 +9741,12 @@ mod tests {
             "a signature over the plain root must not satisfy the bound check",
         );
 
-        // Re-sign over the value `checked_signing_root` actually demands.
+        // Re-sign over the state-derived network root consensus actually demands.
         let mut bound_tx = tx.clone();
-        let bound_root = bound_tx.checked_signing_root(g.epoch);
+        let network = g.admission_network_domain.expect("bound genesis fixture");
+        let bound_root = bound_tx
+            .checked_signing_root_for_network(g.epoch, Some(&network))
+            .expect("bound state supplies a network domain");
         if let PosTransaction::Transfer { inputs, .. } = &mut bound_tx {
             for i in inputs.iter_mut() {
                 i.signature = toy_sign(&alice, &bound_root);
@@ -9392,6 +9755,42 @@ mod tests {
         assert!(
             g.clone().apply_transfer(&bound_tx, price, &ToyVerifier).is_ok(),
             "a signature over the bound root must satisfy the check once the gate is open",
+        );
+    }
+
+    #[test]
+    fn network_aware_candidate_preserves_replay_and_fails_closed_without_a_domain() {
+        let tx = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: [7u8; 32],
+                vout: 0,
+                pubkey: vec![1u8; 4],
+                signature: vec![2u8; 4],
+            }],
+            outputs: vec![TransferOutput { value: 100, script_hash: [9u8; 32] }],
+            tx_bytes: 64,
+            tip_millisat_per_gas: 0,
+        };
+
+        assert_eq!(
+            tx.checked_signing_root_for_network(0, None),
+            Some(tx.spend_signing_root()),
+            "historical states without a domain must replay byte-identically below the gate",
+        );
+
+        let _open = crate::params::rehearsal::sighash_network_binding_gate_open_guard();
+        assert_eq!(tx.checked_signing_root_for_network(0, None), None);
+        let a = tx.checked_signing_root_for_network(0, Some(&[0xAA; 32])).unwrap();
+        let b = tx.checked_signing_root_for_network(0, Some(&[0xBB; 32])).unwrap();
+        assert_ne!(a, b, "the same transfer must require different signatures on two geneses");
+    }
+
+    #[test]
+    fn validator_network_binding_candidate_stays_unarmed() {
+        assert_eq!(
+            crate::params::VALIDATOR_NETWORK_BINDING_ACTIVATION_EPOCH,
+            u64::MAX,
+            "validator binding needs coordinated signing, validation, gossip and slashing activation",
         );
     }
 
@@ -9888,6 +10287,54 @@ mod tests {
         );
     }
 
+    /// Tag 0x04 retains its historical eligibility byte, but there is no
+    /// Genesis-4 oracle that may set it false. The sender cannot write that
+    /// bit into committed delegation state: false is rejected and true is
+    /// re-derived as the only admissible value.
+    #[test]
+    fn delegate_wire_eligibility_cannot_choose_committed_state() {
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
+        let (_t, mut state, _chains) = setup(4);
+        let mut tx = PosTransaction::Delegate {
+            delegator: 900,
+            validator: 0,
+            amount_sat: delegation::MIN_DELEGATION_SAT,
+            eligible: false,
+        };
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&tx.canonical_bytes()),
+            Ok(tx.clone()),
+            "the frozen wire byte still decodes; the transition owns its meaning"
+        );
+        let before = state.state_root();
+        assert_eq!(
+            state.apply_transaction(
+                &tx,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &OkVerifier,
+            ),
+            Err(TxReject::StakingRule)
+        );
+        assert!(state.delegations.is_empty());
+        assert_eq!(state.state_root(), before, "rejection must be atomic");
+
+        let PosTransaction::Delegate { eligible, .. } = &mut tx else {
+            unreachable!()
+        };
+        *eligible = true;
+        state
+            .apply_transaction(
+                &tx,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &OkVerifier,
+            )
+            .expect("the canonical legacy bit is admitted when the gate is open");
+        assert_eq!(state.delegations.len(), 1);
+        assert!(state.delegations[0].eligible);
+    }
+
     /// The gate reads the epoch of the BLOCK, and the same body flips verdict
     /// on nothing but that number.
     ///
@@ -9900,14 +10347,9 @@ mod tests {
     #[test]
     fn the_gate_is_a_function_of_the_block_epoch_alone() {
         // Below the flag day: refused, at every epoch a chain can reach.
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1, u64::MAX] {
             assert!(!CommittedState::unfunded_bonding_active(e), "epoch {e} must be below");
         }
-        // At and above it: allowed. Reached only by moving the constant, which
-        // `deposit_gate_is_inert` forbids — the arm is covered, not open.
-        assert!(CommittedState::unfunded_bonding_active(
-            crate::params::DEPOSIT_ACTIVATION_EPOCH
-        ));
     }
 
     /// TRIPWIRE. `DEPOSIT_ACTIVATION_EPOCH` must stay `u64::MAX`.
@@ -9938,61 +10380,36 @@ mod tests {
 
     // -- EXIT_AUTH_ACTIVATION_EPOCH -----------------------------------------
 
-    /// TRIPWIRE. `EXIT_AUTH_ACTIVATION_EPOCH` must stay `u64::MAX`.
-    ///
-    /// Arming it retires the legacy `Exit` message on every node — and puts
-    /// nothing in its place, because `ExitV2`'s wire byte (`0x08`) is still
-    /// contested and this tree's decoder refuses it. Voluntary exit would stop
-    /// existing rather than become authenticated. Whoever arms it has to
-    /// delete this test first, and read this while doing so.
+    /// Pin the operator-scheduled ADR-041 release boundary. Moving it requires
+    /// another coordinated release; implementing a decoder alone is insufficient.
     #[test]
-    fn exit_auth_gate_is_inert() {
-        assert_eq!(
-            crate::params::EXIT_AUTH_ACTIVATION_EPOCH,
-            u64::MAX,
-            "arming this retires legacy Exit while ExitV2 is still undecodable; read the docs",
-        );
+    fn exit_auth_gate_matches_the_lifecycle_schedule() {
+        assert_eq!(crate::params::EXIT_AUTH_ACTIVATION_EPOCH, 2_884);
+        assert_eq!(crate::params::EXIT_AUTH_ACTIVATION_EPOCH,
+            crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH);
     }
 
     // -- SLASHING_EVIDENCE_ACTIVATION_EPOCH ---------------------------------
 
-    /// TRIPWIRE. `SLASHING_EVIDENCE_ACTIVATION_EPOCH` must stay `u64::MAX`
-    /// until the founder schedules the flag day.
-    ///
-    /// Arming it is not a code change, it is a NETWORK change with a hard
-    /// precondition: every node must already run a binary whose decoder
-    /// understands the tag-0x05 evidence wire format. Below the gate old and
-    /// new binaries agree on every block (both refuse one carrying evidence —
-    /// one at its decoder, one at the transition); the first post-gate block
-    /// that carries evidence is accepted only by nodes that can decode it, so
-    /// arming ahead of a complete rollout forks the fleet exactly the way the
-    /// 2026-08-08 `expected_bits` divergence did. Same discipline as
-    /// `LEAK_RECOVERY_ACTIVATION_EPOCH`: rollout first, flag day second.
-    /// Whoever arms it has to delete this test, and read this while doing so.
+    /// Pin the operator-scheduled ADR-041 release boundary. Moving it requires
+    /// another coordinated release; implementing a decoder alone is insufficient.
     #[test]
-    fn slashing_evidence_gate_is_inert() {
-        assert_eq!(
-            crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH,
-            u64::MAX,
-            "arming this activates §7.3 slashing network-wide and needs a full \
-             fleet rollout of the evidence decoder first; read the test docs",
-        );
+    fn slashing_evidence_gate_matches_the_lifecycle_schedule() {
+        assert_eq!(crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH, 2_884);
+        assert_eq!(crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH,
+            crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH);
     }
 
-    /// Same shape as the deposit gate's test: the verdict is a function of
-    /// the BLOCK's committed epoch and the constant, and of nothing else —
-    /// two nodes handed the same block cannot disagree about it.
+    /// Evidence becomes admissible at the committed lifecycle epoch only.
     #[test]
     fn the_evidence_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 2_700, 100_000, u64::MAX - 1] {
-            assert!(
-                !CommittedState::slashing_evidence_active(e),
-                "epoch {e} must be below the inert gate",
-            );
+        let gate = crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH;
+        for epoch in [0, 1, 1_766, 2_700, gate - 1] {
+            assert!(!CommittedState::slashing_evidence_active(epoch));
         }
-        // Reached only by moving the constant, which
-        // `slashing_evidence_gate_is_inert` forbids — covered, not open.
-        assert!(!CommittedState::slashing_evidence_active(u64::MAX));
+        for epoch in [gate, gate + 1, u64::MAX] {
+            assert!(CommittedState::slashing_evidence_active(epoch));
+        }
     }
 
     /// The unauthenticated message is STILL VALID today. This is the control
@@ -10032,25 +10449,13 @@ mod tests {
 
     // -- RANDAO_RECOMMIT_ACTIVATION_EPOCH (H-R7-1) --------------------------
 
-    /// TRIPWIRE. `RANDAO_RECOMMIT_ACTIVATION_EPOCH` must stay `u64::MAX`.
-    ///
-    /// Arming it activates the re-commit rules on every node — and today
-    /// nothing on the wire can reach them, because the transaction's byte
-    /// (`0x0A`) is still unassigned and this tree's decoder refuses it.
-    /// Arming is the founder's, it is TWO decisions (the byte and the flag
-    /// day), and unlike every other gate in this file it has a deadline:
-    /// both must land, fleet rebuilt, before the first RANDAO chain
-    /// exhausts (~2027-02-11), or proposal liveness decays validator by
-    /// validator. Whoever arms it has to delete this test first, and read
-    /// this while doing so.
+    /// Pin the operator-scheduled ADR-041 release boundary. Moving it requires
+    /// another coordinated release; implementing a decoder alone is insufficient.
     #[test]
-    fn randao_recommit_gate_is_inert() {
-        assert_eq!(
-            crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH,
-            u64::MAX,
-            "arming this activates re-commit rules whose wire byte is still \
-             unassigned; the ruling and the decoder arm must land together — read the docs",
-        );
+    fn randao_recommit_gate_matches_the_lifecycle_schedule() {
+        assert_eq!(crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH, 2_884);
+        assert_eq!(crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH,
+            crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH);
     }
 
     /// Build the signed re-commit a validator would actually send, under
@@ -10917,6 +11322,26 @@ mod tests {
         );
         let expected = rewards::split_fees_at(charge.base_fee_sat, charge.priority_fee_sat, 1);
         assert!(expected.burned > 0, "era 1 must burn half the base fee");
+
+        // TX-14 evidence: `issued_sat` is intentionally a gross, monotone
+        // issuance counter, not circulating supply. A burn therefore leaves
+        // it unchanged while reducing accounted holdings (and the signed
+        // supply gap) by the exact burned amount. Retrofitting burns into the
+        // counter would redefine a committed historical field and requires a
+        // migration/activation decision; this assertion pins the current
+        // compatibility contract instead of pretending the two quantities
+        // are interchangeable.
+        assert_eq!(s1.issued_sat(), g.issued_sat(), "a fee burn must not decrement gross issuance");
+        assert_eq!(
+            g.accounted_supply_sat() - s1.accounted_supply_sat(),
+            expected.burned,
+            "the ledger must lose exactly the base-fee share burned by omission"
+        );
+        assert_eq!(
+            g.supply_gap_sat() - s1.supply_gap_sat(),
+            i128::try_from(expected.burned).expect("fee burn is bounded by total supply"),
+            "the observable supply gap must record the exact burn while issued_sat stays monotone"
+        );
 
         // During the epoch the fee accrues but the bond — and with it every
         // committee — is untouched.
@@ -12027,6 +12452,17 @@ mod tests {
 
         let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
         let s1 = t.apply_block(&g, &b, &[], std::slice::from_ref(&tx)).unwrap();
+        // Receipt observation must preserve the ordinary consensus result.
+        let mut receipts = Vec::new();
+        let observed = t.compute_post_state_observed(&g, &b, &[], std::slice::from_ref(&tx),
+            |index, state, charge| receipts.push((index, state.utxo(&txid, 0).cloned(),
+                charge.base_fee_sat + charge.priority_fee_sat))).unwrap();
+        assert_eq!(observed.state_root(), s1.state_root());
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].0, 0);
+        assert_eq!(receipts[0].1.as_ref().unwrap().value, paid);
+        assert_eq!(receipts[0].2, u128::from(coin_a.value + coin_b.value - paid));
+        assert!(g.utxo(&coin_a.txid, coin_a.vout).is_some(), "receipt replay mutated pre-state");
 
         // The inputs are gone.
         assert!(
@@ -12785,6 +13221,64 @@ mod tests {
 
     // ── slashing through the transition (§7.3) ──────────────────────────────
 
+    #[test]
+    fn slashing_economics_v2_gate_ships_inert() {
+        assert_eq!(
+            crate::params::SLASHING_ECONOMICS_V2_ACTIVATION_EPOCH,
+            u64::MAX,
+            "ST-03/ST-04 changes need an explicit coordinated activation",
+        );
+        for epoch in [0, 2_884, 100_000, u64::MAX] {
+            assert!(!crate::params::slashing_economics_v2_active(epoch));
+        }
+    }
+
+    /// ST-04 candidate: self-slashing may still eject at E+1, because an
+    /// exit queue must not become immunity from proven equivocation, but it
+    /// must not release funds earlier than a voluntary exit requested in the
+    /// same epoch. The cap-free ejection remains an explicit residual.
+    #[test]
+    fn slashing_economics_candidate_removes_the_faster_withdrawal_incentive() {
+        let _candidate = crate::params::slashing_economics_v2_rehearsal::open();
+        let (_t, g, _c) = setup(4);
+        let offender = 0;
+        let mut st = g.clone();
+        let roster = st.consensus_roster_at(st.epoch);
+
+        st.apply_slashing_evidence(&double_vote_evidence(offender), 1, &roster, &OkVerifier)
+            .unwrap();
+
+        let rec = st.validator_record(offender).unwrap();
+        assert_eq!(rec.exit_epoch, st.epoch + 1, "candidate does not queue proven ejection");
+        assert_eq!(
+            rec.withdrawable_epoch,
+            st.epoch + staking::EXIT_DELAY_EPOCHS + staking::WITHDRAWAL_DELAY_EPOCHS,
+            "self-slashing must not unlock earlier than a same-epoch voluntary exit",
+        );
+        assert_eq!(
+            st.voluntary_exits_this_epoch(),
+            0,
+            "cap-free ejection remains residual rather than being silently reclassified",
+        );
+    }
+
+    #[test]
+    fn inert_slashing_economics_gate_preserves_the_historical_lock() {
+        let (_t, g, _c) = setup(4);
+        let offender = 0;
+        let mut st = g.clone();
+        let roster = st.consensus_roster_at(st.epoch);
+
+        st.apply_slashing_evidence(&double_vote_evidence(offender), 1, &roster, &OkVerifier)
+            .unwrap();
+
+        assert_eq!(
+            st.validator_record(offender).unwrap().withdrawable_epoch,
+            st.epoch + staking::WITHDRAWAL_DELAY_EPOCHS,
+            "closed candidate gate must preserve replay exactly",
+        );
+    }
+
     /// A double vote by `v`: two attestations, same target epoch, different
     /// heads. Signatures are the OkVerifier/MarkerVerifier-passing kind.
     fn double_vote_evidence(v: u32) -> SlashingEvidence {
@@ -12858,9 +13352,9 @@ mod tests {
         // refuses at every epoch. The switch says so out loud rather than the
         // constant being weakened to keep an old fixture green.
         let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
-        // The flag day, rehearsed: `SLASHING_EVIDENCE_ACTIVATION_EPOCH` ships
-        // inert (`u64::MAX`), so the post-gate rules this test exercises are
-        // reachable only through the guard.
+        // The fixture is at epoch zero, below the scheduled lifecycle boundary
+        // 2884, so it opens the test-only gate to exercise the post-boundary
+        // rules without changing the production constant.
         let _gate = crate::params::rehearsal::slashing_gate_open_guard();
         let (t, g, mut chains) = setup(4);
         let seed = g.seed_for_epoch(0);
@@ -13035,7 +13529,8 @@ mod tests {
         assert_eq!(activated, delegation::MIN_CHURN_SAT, "fixture premise: exactly half activates");
         assert!(activated < big, "fixture premise: the delegation is still partially queued");
 
-        st.apply_slashing_evidence(&double_vote_evidence(offender), 1, sat(1_000_000), &OkVerifier)
+        let roster = st.consensus_roster_at(st.epoch);
+        st.apply_slashing_evidence(&double_vote_evidence(offender), 1, &roster, &OkVerifier)
             .unwrap();
 
         let expected_loss = activated * slashing::SLASH_PROPOSER_EQUIV_BPS / 10_000;
@@ -13309,6 +13804,63 @@ mod tests {
         assert!(!st.pending_fee_rewards.is_empty());
         assert!(!st.boundary_mixes.is_empty());
         (t, st, atts)
+    }
+
+    #[test]
+    #[cfg(feature = "local-state-cache")]
+    fn local_cache_preserves_live_queues_fees_votes_and_ledger() {
+        let (_, mut state, _) = state_with_live_bookkeeping();
+        let header = BlockHeaderV4 {
+            version: BLOCK_VERSION_V4, parent: [0; 32], state_root: state.compute_root(),
+            body_root: [0; 32], slot: state.slot, proposer_index: 0,
+            randao_reveal: [0; 32], randao_mix: state.randao_mix,
+            justified_root: [0; 32], finalized_root: [0; 32],
+            attestation_root: [0; 32], coherence_root: [0; 32],
+        };
+        state.head = header.id();
+        let bytes = state.encode_local_cache().unwrap();
+        assert_eq!(bytes, state.encode_local_cache_owned_reference().unwrap(), "borrowed encoding must preserve the former cache bytes");
+        let prefix = b"existing cache header";
+        let mut prefixed = prefix.to_vec();
+        state.append_local_cache(&mut prefixed).unwrap();
+        assert_eq!(&prefixed[..prefix.len()], prefix);
+        assert_eq!(&prefixed[prefix.len()..], bytes.as_slice());
+        let restored = CommittedState::decode_local_cache(&bytes, &header).unwrap();
+        assert_eq!(state, restored);
+        let mut wrong = header.clone(); wrong.state_root[0] ^= 1;
+        assert!(CommittedState::decode_local_cache(&bytes, &wrong).is_err());
+        let mut trailing = bytes.clone(); trailing.push(0);
+        assert!(CommittedState::decode_local_cache(&trailing, &header).is_err());
+        assert!(CommittedState::decode_local_cache(&bytes[..bytes.len()/2], &header).is_err());
+    }
+
+    /// Run the compiled test binary directly under the platform RSS tool in
+    /// separate processes for each mode; compiler memory must not be included.
+    #[test]
+    #[ignore = "bounded local cache serializer memory measurement"]
+    #[cfg(feature = "local-state-cache")]
+    fn local_cache_serializer_memory_measurement() {
+        let mode = std::env::var("BLOCH_CACHE_SERIALIZER").unwrap_or_else(|_| "borrowed".into());
+        assert!(matches!(mode.as_str(), "borrowed" | "owned"));
+        let count = std::env::var("BLOCH_CACHE_BENCH_UTXOS")
+            .map(|value| value.parse::<u32>().unwrap()).unwrap_or(100_000);
+        assert!((1..=200_000).contains(&count), "keep this local fixture bounded");
+        let (_, mut state, _) = state_with_live_bookkeeping();
+        state.eutxos = (0..count).map(|index| {
+            let txid: [u8; 32] = Sha3_256::digest(index.to_le_bytes()).into();
+            crate::state_root::EutxoEntry {
+                txid, vout: 0, value: 1_000_000, script_hash: txid,
+            }
+        }).collect();
+        let started = std::time::Instant::now();
+        let bytes = if mode == "owned" {
+            state.encode_local_cache_owned_reference().unwrap()
+        } else {
+            state.encode_local_cache().unwrap()
+        };
+        println!("CACHE_SERIALIZER mode={mode} utxos={count} bytes={} elapsed_ms={} sha3={:x}",
+            bytes.len(), started.elapsed().as_millis(), Sha3_256::digest(&bytes));
+        std::hint::black_box((&state, &bytes));
     }
 
     /// Every consensus-relevant `CommittedState` field moves the root; every
@@ -13962,9 +14514,9 @@ mod tests {
     /// write-off that never fired.
     #[test]
     fn the_replay_compatibility_gates_are_inert_until_armed() {
-        // LEAK_RECOVERY_ACTIVATION_EPOCH left this list on 2026-09-06, when it
-        // was armed at 2700 — see `leak_recovery_armed_epoch_matches_the_runbook`
-        // below, which took over its tripwire duty in the armed form.
+        // LEAK_RECOVERY_ACTIVATION_EPOCH left this list when it was scheduled;
+        // after the epoch-2700 deadline was missed, the replacement tripwire
+        // below pinned it to epoch 2880.
         for (name, value) in [
             ("ANCESTRY_SEED_ACTIVATION_EPOCH", crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH),
         ] {
@@ -13981,23 +14533,11 @@ mod tests {
         }
     }
 
-    /// Armed on 2026-09-06 at epoch 2700 (founder decision; chain was at
-    /// ~epoch 2075, ≈6 days of lead for the coordinated fleet rollout).
-    ///
-    /// Until then this constant sat in
-    /// `the_replay_compatibility_gates_are_inert_until_armed` pinned at
-    /// `u64::MAX`. Arming flips the tripwire's job, not its nature — exactly as
-    /// `leaked_roster_armed_epoch_matches_the_runbook` above: it now guards
-    /// against a SECOND silent change of the epoch, which would be a new flag
-    /// day needing its own fleet rollout, announcement and runbook. The value
-    /// here must equal the one recorded in `docs/LEAK-RECOVERY-FLAG-DAY.md`.
+    /// The missed epoch-2700 deadline is replaced prospectively, preserving
+    /// the approved epoch-2713 history. See docs/LEAK-RECOVERY-FLAG-DAY.md.
     #[test]
     fn leak_recovery_armed_epoch_matches_the_runbook() {
-        assert_eq!(
-            crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH,
-            2_700,
-            "the armed epoch must match docs/LEAK-RECOVERY-FLAG-DAY.md; changing it again is a new flag day"
-        );
+        assert_eq!(crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH, 2_880);
     }
 
     /// Below its flag day, `seed_for_epoch` must be the ORIGINAL rule, mix of
@@ -14217,6 +14757,31 @@ mod tests {
     /// a committee. Without that half the assertions below would pass just as
     /// well against a roster that had lost the validator for some unrelated
     /// reason, which is the failure mode that makes a negative test worthless.
+    #[test]
+    fn audit_complete_inactivity_has_a_gated_recovery_schedule() {
+        let (_t, mut state, _c) = setup(4);
+        let roster = state.duty_roster_at(0);
+        let seed = state.seed_for_epoch(0);
+        for epoch in 1..=80 {
+            let mut accepted = Vec::new();
+            let votes = finality::votes_from_partition(epoch, &roster, &roster, &[], &seed, &mut accepted);
+            state.finality_engine.process_epoch(&votes).unwrap();
+        }
+        let epoch = crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH;
+        state.epoch = epoch;
+        let old = state.consensus_roster_at(epoch);
+        assert!(old.iter().all(|v| v.effective_stake == 0));
+        assert!(schedule::proposer(&seed, epoch * SLOTS_PER_EPOCH, &old).is_none());
+        let _gate = crate::params::audit_recovery_test::open();
+        let recovered = state.consensus_roster_at(epoch);
+        assert_eq!(recovered, state.duty_roster_at(epoch));
+        assert!(schedule::proposer(&seed, epoch * SLOTS_PER_EPOCH, &recovered).is_some());
+        assert_eq!(old.iter().map(|v| v.index).collect::<Vec<_>>(),
+                   recovered.iter().map(|v| v.index).collect::<Vec<_>>());
+        // No rewrite of committed leak accumulators or finality checkpoints.
+        assert!(roster.iter().all(|v| state.finality_engine.leaked_of(v.index) >= v.effective_stake));
+    }
+
     #[test]
     fn a_fully_leaked_validator_leaves_the_schedule() {
         // Holds a roster with a zero-stake member, so it must be excluded from
@@ -16185,5 +16750,36 @@ mod epoch_advance_bound {
         );
         // And it must still be a bound: anything near u64::MAX is not one.
         assert!(MAX_EPOCH_ADVANCE < 1 << 20, "a ceiling that large is not a ceiling");
+    }
+}
+
+#[cfg(feature = "local-state-cache")]
+mod local_cache;
+
+
+#[cfg(test)]
+mod finality_order_observability {
+    use super::*;
+
+    #[test]
+    fn desynchronized_epoch_is_observable_without_reset_or_transition_refusal() {
+        let (_, genesis, _) = super::tests::setup(8);
+        let mut state = genesis.close_epoch();
+        // Actual finality expects epoch1; simulate a corrupted synthetic cursor.
+        state.epoch = 3;
+        let finality_before = state.finality_engine.clone();
+        let count_before = FINALITY_EPOCH_ORDER_FAILURES.load(Ordering::Relaxed);
+        let after = state.close_epoch();
+        assert!(FINALITY_EPOCH_ORDER_FAILURES.load(Ordering::Relaxed) > count_before);
+        assert_eq!(after.finality_engine, finality_before);
+        assert_eq!(after.epoch, 4, "the surrounding transition retains its historical behavior");
+        assert!(after.issued_sat >= state.issued_sat);
+        // A second boundary still diagnoses the cursor gap rather than hiding
+        // it by silently resetting finality or pretending processing succeeded.
+        let count_again = FINALITY_EPOCH_ORDER_FAILURES.load(Ordering::Relaxed);
+        let next = after.close_epoch();
+        assert!(FINALITY_EPOCH_ORDER_FAILURES.load(Ordering::Relaxed) > count_again);
+        assert_eq!(next.finality_engine, finality_before);
+        assert_eq!(next.epoch, 5);
     }
 }

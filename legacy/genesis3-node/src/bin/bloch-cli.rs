@@ -6,14 +6,7 @@
 //!   bloch-cli send &lt;wallet.json&gt; &lt;to_address&gt; &lt;amount_bloch&gt; [--fee 0.001]
 //!   bloch-cli --help
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::process;
-
-// L-4: UTF-8-safe truncation of a node-response-derived string (see
-// `rpc_call` below) — reuses the same fix `network/mod.rs` already applies
-// on its own log paths, rather than repeating the byte-slice bug here.
-use bloch::network::truncate_utf8;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -26,6 +19,7 @@ fn main() {
     // Parse --rpc-url flag (default: 127.0.0.1:16210)
     let mut rpc_host = "127.0.0.1".to_string();
     let mut rpc_port = 16210u16;
+    let mut allow_large_hd_wallet = false;
     let mut cmd_args: Vec<&str> = Vec::new();
 
     let mut i = 1;
@@ -33,6 +27,7 @@ fn main() {
         match args[i].as_str() {
             "--rpc-host" => { i += 1; if i < args.len() { rpc_host = args[i].clone(); } }
             "--rpc-port" => { i += 1; if i < args.len() { rpc_port = args[i].parse().unwrap_or(16210); } }
+            "--allow-large-hd-wallet" => { allow_large_hd_wallet = true; }
             _ => { cmd_args.push(&args[i]); }
         }
         i += 1;
@@ -181,19 +176,19 @@ fn main() {
         "newaddress" => {
             require_params(params, 1, "newaddress <wallet-hd.json> [label]");
             let label = params.get(1).copied().unwrap_or("new");
-            do_newaddress(params[0], label);
+            do_newaddress(params[0], label, allow_large_hd_wallet);
             return;
         }
 
         "addresses" => {
             require_params(params, 1, "addresses <wallet-hd.json>");
-            do_list_addresses(params[0]);
+            do_list_addresses(params[0], allow_large_hd_wallet);
             return;
         }
 
         "importfounder" | "import-founder" => {
             require_params(params, 2, "importfounder <wallet-hd.json> <founder.json>");
-            do_import_founder(params[0], params[1]);
+            do_import_founder(params[0], params[1], allow_large_hd_wallet);
             return;
         }
 
@@ -279,125 +274,10 @@ fn main() {
 
 // ── RPC client ──────────────────────────────────────────────────────────────
 
-fn rpc_call(
-    host: &str,
-    port: u16,
-    method: &str,
-    params: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params,
-    });
-    let body_str = body.to_string();
-
-    let addr = format!("{}:{}", host, port);
-    let mut stream = TcpStream::connect(&addr)
-        .map_err(|e| format!("cannot connect to {} — is the node running? ({})", addr, e))?;
-
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))
-        .map_err(|e| e.to_string())?;
-
-    // Optional API key for auth-required writes (sendrawtransaction): set
-    // BLOCH_RPC_API_KEY. Sent as the x-api-key header the node expects.
-    //
-    // M-11 (audit): this request is built by hand (`format!`, not an HTTP
-    // client library), so nothing else stands between the environment
-    // variable's content and the raw request bytes. Before this fix, a
-    // `BLOCH_RPC_API_KEY` containing `\r\n` injected an arbitrary extra
-    // header — or, with a second `\r\n`, a whole pipelined second request —
-    // into the connection. INVARIANT (M-11): a value that cannot possibly be
-    // a well-formed single header value (contains a CR, LF, or any other
-    // ASCII control character) must abort the request with a clear error,
-    // never be interpolated as-is. The environment is operator-controlled
-    // here (this is a CLI, not a network-facing surface), so this is a
-    // robustness fix, not a privilege-boundary one — but it costs nothing
-    // and a hand-rolled HTTP client should never trust its own inputs less
-    // carefully than the node it is talking to trusts the network.
-    let api_key_hdr = match std::env::var("BLOCH_RPC_API_KEY") {
-        Ok(k) if k.chars().any(|c| c.is_ascii_control()) => {
-            return Err(
-                "BLOCH_RPC_API_KEY contains a control character (e.g. CR/LF) — \
-                 refusing to build a request with it (would allow HTTP header \
-                 injection)".to_string(),
-            );
-        }
-        Ok(k) => format!("x-api-key: {}\r\n", k),
-        Err(_) => String::new(),
-    };
-    let request = format!(
-        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-        addr, api_key_hdr, body_str.len(), body_str
-    );
-
-    stream.write_all(request.as_bytes()).map_err(|e| format!("write failed: {}", e))?;
-    stream.flush().map_err(|e| e.to_string())?;
-
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).map_err(|e| format!("read failed: {}", e))?;
-
-    let response_str = String::from_utf8_lossy(&response);
-
-    // Find JSON body (after \r\n\r\n)
-    let json_start = response_str.find("\r\n\r\n")
-        .map(|i| i + 4)
-        .unwrap_or(0);
-    let json_body = &response_str[json_start..];
-
-    // Handle chunked transfer encoding
-    let json_clean = if response_str.contains("Transfer-Encoding: chunked") {
-        parse_chunked(json_body)
-    } else {
-        json_body.trim().to_string()
-    };
-
-    // L-4: was `&json_clean[..200.min(json_clean.len())]` — a byte-index
-    // slice on a node-response-derived string. `String::from_utf8_lossy`
-    // upstream can still place a multi-byte UTF-8 character across byte 200,
-    // and 200 need not be (and, per `is_char_boundary`, was not guaranteed to
-    // be) a char boundary — that slice panics the CLI on such a response.
-    let resp: serde_json::Value = serde_json::from_str(&json_clean)
-        .map_err(|e| format!("invalid JSON response: {} — raw: {}", e, truncate_utf8(&json_clean, 200)))?;
-
-    if let Some(err) = resp.get("error").and_then(|e| e.as_str()) {
-        return Err(err.to_string());
-    }
-
-    Ok(resp.get("result").cloned().unwrap_or(resp))
-}
-
-/// Parse HTTP chunked transfer encoding
-fn parse_chunked(body: &str) -> String {
-    let mut result = String::new();
-    let mut remaining = body.trim();
-
-    loop {
-        // Read chunk size (hex)
-        let nl = match remaining.find("\r\n") {
-            Some(i) => i,
-            None => break,
-        };
-        let size_str = remaining[..nl].trim();
-        let size = match usize::from_str_radix(size_str, 16) {
-            Ok(0) => break, // terminal chunk
-            Ok(s) => s,
-            Err(_) => {
-                // Not chunked, return as-is
-                return body.trim().to_string();
-            }
-        };
-        remaining = &remaining[nl + 2..];
-        if remaining.len() < size { break; }
-        result.push_str(&remaining[..size]);
-        remaining = &remaining[size..];
-        if remaining.starts_with("\r\n") {
-            remaining = &remaining[2..];
-        }
-    }
-
-    if result.is_empty() { body.trim().to_string() } else { result }
+fn rpc_call(host: &str, port: u16, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let authority = if host.contains(':') && !host.starts_with('[') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
+    let api_key = std::env::var("BLOCH_RPC_API_KEY").ok();
+    bloch::wallet::http_rpc::call(&authority, method, params, api_key.as_deref())
 }
 
 // ── Send command ────────────────────────────────────────────────────────────
@@ -408,7 +288,7 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     let amount_str = params[2];
 
     // Parse fee (default 0.001 BLOCH)
-    let mut fee_bloch: f64 = 0.001;
+    let mut fee_bloch = "0.001";
     // Chain-id to sign for. The sighash folds in the chain-id, so signing for
     // the wrong one yields a SILENTLY-rejected tx ("invalid signature"). The
     // LIVE network is Genesis-2, so default to it (previously the wallet fell
@@ -418,7 +298,7 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     let mut i = 3;
     while i < params.len() {
         if params[i] == "--fee" && i + 1 < params.len() {
-            fee_bloch = params[i + 1].parse().unwrap_or_else(|_| die("invalid fee"));
+            fee_bloch = params[i + 1];
             i += 2;
         } else if params[i] == "--chain" && i + 1 < params.len() {
             chain = params[i + 1].to_lowercase();
@@ -450,7 +330,8 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     println!("Signing for chain: {}", chain);
 
     let amount_sats = bloch_to_sats(amount_str);
-    let fee_sats = (fee_bloch * 1e8) as u64;
+    let fee_sats = bloch::wallet::parse_bloch_satoshis(fee_bloch).unwrap_or_else(|message| die(message));
+    amount_sats.checked_add(fee_sats).unwrap_or_else(|| die("amount plus fee exceeds u64"));
 
     // Load wallet
     let password = read_password("Wallet password: ");
@@ -480,29 +361,12 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
         process::exit(1);
     }
 
-    // Convert to TxBuilder format
-    let mut available_utxos: Vec<(Vec<u8>, u32, bloch::core::TxOutput)> = Vec::new();
-    for u in &utxos_json {
-        let txid = hex::decode(u["txid"].as_str().unwrap_or("")).unwrap_or_default();
-        let idx = u["index"].as_u64().unwrap_or(0) as u32;
-        let value = sat_u64(&u["value"]).unwrap_or(0);
-        let spk = hex::decode(u["script_pubkey"].as_str().unwrap_or("")).unwrap_or_default();
-        available_utxos.push((txid, idx, bloch::core::TxOutput { value, script_pubkey: spk }));
-    }
-
-    let total_available: u64 = available_utxos.iter().map(|(_, _, o)| o.value).sum();
+    // Refuse malformed rows before they lose width or network information.
+    let available_utxos = parse_send_utxos(&utxos_json).unwrap_or_else(|message| die(message));
+    let total_available = available_utxos.iter().try_fold(0u64, |total, (_, _, output)| total.checked_add(output.value))
+        .unwrap_or_else(|| die("UTXO value total exceeds u64"));
     println!("Available: {} BLOCH ({} UTXOs)", total_available as f64 / 1e8, available_utxos.len());
-
-    // Sprint K: Parse and validate destination address (checksum-enforced)
-    let to_addr = match bloch::address::Address::parse(to_address) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("Invalid destination address: {}", e);
-            eprintln!("Hint: addresses must be 55 chars total (bloch1q + 40 hex hash + 8 hex checksum)");
-            process::exit(1);
-        }
-    };
-    let to_addr_hex = hex::encode(to_addr.hash());
+    let to_addr_hex = checked_destination(to_address, &keypair.address).unwrap_or_else(|message| die(message));
 
     // Build and sign TX
     let tx = match bloch::wallet::TxBuilder::build(
@@ -597,14 +461,44 @@ fn do_newseed(output_path: &str) {
     println!("Wallet file:   {}", output_path);
 }
 
-fn do_newaddress(wallet_path: &str, label: &str) {
+fn load_hd_wallet(
+    path: &std::path::Path,
+    mnemonic: &str,
+    passphrase: Option<&str>,
+    password: &str,
+    allow_large: bool,
+) -> Result<bloch::hd_wallet::HdWallet, String> {
+    if allow_large {
+        // Explicit recovery mode for a trusted historical backup. It retains
+        // the parser's absolute byte ceiling but intentionally relaxes the
+        // normal address and rederivation work budgets.
+        bloch::hd_wallet::HdWallet::load_with_file_limit(
+            path,
+            mnemonic,
+            passphrase,
+            password,
+            bloch::util::MAX_WALLET_FILE_LIMIT,
+        )
+    } else {
+        bloch::hd_wallet::HdWallet::load_bounded(path, mnemonic, passphrase, password)
+            .map_err(|error| {
+                if error.contains("exceeds configured limit") || error.contains("wallet file exceeds configured") {
+                    format!("{error}; for a trusted historical backup retry with --allow-large-hd-wallet")
+                } else {
+                    error
+                }
+            })
+    }
+}
+
+fn do_newaddress(wallet_path: &str, label: &str, allow_large_hd_wallet: bool) {
     let password = read_password("Wallet password: ");
     let passphrase_input = read_password("Passphrase (Enter to skip): ");
     let passphrase = if passphrase_input.is_empty() { None } else { Some(passphrase_input.as_str()) };
     let mnemonic = read_password("Mnemonic (24 words): ");
 
     let path = std::path::Path::new(wallet_path);
-    let mut wallet = match bloch::hd_wallet::HdWallet::load(path, &mnemonic, passphrase, &password) {
+    let mut wallet = match load_hd_wallet(path, &mnemonic, passphrase, &password, allow_large_hd_wallet) {
         Ok(w) => w,
         Err(e) => { eprintln!("Load failed: {}", e); process::exit(1); }
     };
@@ -624,13 +518,33 @@ fn do_newaddress(wallet_path: &str, label: &str) {
     println!("Label:       {}", label);
 }
 
-fn do_list_addresses(wallet_path: &str) {
-    // For listing we just show what's in the file (no decryption needed for public data)
-    let json = match std::fs::read_to_string(wallet_path) {
-        Ok(s) => s,
-        Err(e) => { eprintln!("Cannot read {}: {}", wallet_path, e); process::exit(1); }
-    };
-    let wallet: bloch::hd_wallet::HdWalletFile = match serde_json::from_str(&json) {
+fn read_public_hd_wallet(
+    wallet_path: &str,
+    allow_large_hd_wallet: bool,
+) -> Result<bloch::hd_wallet::HdWalletFile, String> {
+    let path = std::path::Path::new(wallet_path);
+    if allow_large_hd_wallet {
+        bloch::hd_wallet::HdWalletFile::read_public_with_limits(
+            path,
+            bloch::util::MAX_WALLET_FILE_LIMIT,
+            usize::MAX,
+        )
+    } else {
+        bloch::hd_wallet::HdWalletFile::read_public_bounded(path).map_err(|error| {
+            if error.contains("exceeds configured limit")
+                || error.contains("wallet file exceeds configured")
+            {
+                format!("{error}; for a trusted historical backup retry with --allow-large-hd-wallet")
+            } else {
+                error
+            }
+        })
+    }
+}
+
+fn do_list_addresses(wallet_path: &str, allow_large_hd_wallet: bool) {
+    // Public metadata needs no password, but remains attacker-controlled input.
+    let wallet = match read_public_hd_wallet(wallet_path, allow_large_hd_wallet) {
         Ok(w) => w,
         Err(e) => { eprintln!("Invalid wallet file: {}", e); process::exit(1); }
     };
@@ -647,7 +561,7 @@ fn do_list_addresses(wallet_path: &str) {
     println!("Total: {} address(es)", wallet.addresses.len());
 }
 
-fn do_import_founder(hd_wallet_path: &str, founder_path: &str) {
+fn do_import_founder(hd_wallet_path: &str, founder_path: &str, allow_large_hd_wallet: bool) {
     println!("Importing founder.json into HD wallet...");
     println!();
 
@@ -667,13 +581,16 @@ fn do_import_founder(hd_wallet_path: &str, founder_path: &str) {
     let mnemonic = read_password("HD wallet mnemonic (24 words): ");
 
     let hd_path = std::path::Path::new(hd_wallet_path);
-    let mut wallet = match bloch::hd_wallet::HdWallet::load(hd_path, &mnemonic, hd_passphrase, &hd_password) {
+    let mut wallet = match load_hd_wallet(hd_path, &mnemonic, hd_passphrase, &hd_password, allow_large_hd_wallet) {
         Ok(w) => w,
         Err(e) => { eprintln!("Failed to load HD wallet: {}", e); process::exit(1); }
     };
 
     let addr = founder_kp.address.clone();
-    wallet.import_keypair(founder_kp, "founder");
+    if let Err(e) = wallet.try_import_keypair(founder_kp, "founder") {
+        eprintln!("Import failed: {}", e);
+        process::exit(1);
+    }
 
     if let Err(e) = wallet.save(hd_path) {
         eprintln!("Save failed: {}", e);
@@ -746,8 +663,34 @@ fn sat_u64(v: &serde_json::Value) -> Option<u64> {
 }
 
 fn bloch_to_sats(s: &str) -> u64 {
-    let f: f64 = s.parse().unwrap_or_else(|_| die("invalid amount"));
-    (f * 1e8) as u64
+    checked_payment_sats(s).unwrap_or_else(|message| die(message))
+}
+
+fn checked_payment_sats(value: &str) -> Result<u64, &'static str> {
+    let satoshis = bloch::wallet::parse_bloch_satoshis(value)?;
+    if satoshis == 0 { return Err("payment must contain at least one satoshi"); }
+    Ok(satoshis)
+}
+
+fn checked_destination(destination: &str, source: &str) -> Result<String, &'static str> {
+    let destination = bloch::address::Address::parse(destination).map_err(|_| "invalid destination address")?;
+    let source = bloch::address::Address::parse(source).map_err(|_| "invalid wallet address")?;
+    if destination.network() != source.network() { return Err("destination address network differs from wallet"); }
+    Ok(hex::encode(destination.hash()))
+}
+
+fn parse_send_utxos(rows: &[serde_json::Value]) -> Result<Vec<(Vec<u8>, u32, bloch::core::TxOutput)>, &'static str> {
+    rows.iter().map(|row| {
+        let txid = hex::decode(row["txid"].as_str().ok_or("UTXO missing transaction ID")?)
+            .map_err(|_| "invalid UTXO transaction ID hex")?;
+        if txid.len() != 32 { return Err("UTXO transaction ID must contain 32 bytes"); }
+        let index = row["index"].as_u64().and_then(|value| u32::try_from(value).ok())
+            .ok_or("UTXO index must fit u32")?;
+        let value = sat_u64(&row["value"]).ok_or("invalid UTXO value")?;
+        let script_pubkey = hex::decode(row["script_pubkey"].as_str().ok_or("UTXO missing script")?)
+            .map_err(|_| "invalid UTXO script hex")?;
+        Ok((txid, index, bloch::core::TxOutput { value, script_pubkey }))
+    }).collect()
 }
 
 fn require_params(params: &[&str], min: usize, usage: &str) {
@@ -817,6 +760,89 @@ fn print_usage() {
   OPTIONS
     --rpc-host <host>                      RPC host (default: 127.0.0.1)
     --rpc-port <port>                      RPC port (default: 16210)
+    --allow-large-hd-wallet                Trusted-backup recovery (up to 512 MiB)
     --help                                 This message
 "#);
+}
+
+#[cfg(test)]
+mod audit_send_inputs {
+    use super::*;
+
+    fn public_wallet_fixture(addresses: usize) -> bloch::hd_wallet::HdWalletFile {
+        let crypto = bloch::wallet::KeystoreCrypto {
+            cipher: "fixture".into(),
+            ciphertext: String::new(),
+            nonce: String::new(),
+            kdf: "fixture".into(),
+            kdf_params: bloch::wallet::KdfParams {
+                memory_cost: 1,
+                time_cost: 1,
+                parallelism: 1,
+                salt: String::new(),
+                output_len: 32,
+            },
+        };
+        bloch::hd_wallet::HdWalletFile {
+            version: 3,
+            format: "hd-wallet-v1".into(),
+            network: "testnet".into(),
+            mnemonic_crypto: crypto.clone(),
+            addresses: (0..addresses).map(|index| bloch::hd_wallet::HdAddress {
+                index: index as u32,
+                address: format!("{}public-{index}", bloch::core::TESTNET_PREFIX),
+                label: String::new(),
+                keypair_crypto: crypto.clone(),
+                derived: false,
+            }).collect(),
+            created_at: String::new(),
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn amounts_are_exact_and_refuse_sub_satoshi_or_exponent_notation() {
+        for value in ["NaN", "inf", "-1", "1e30", "0.000000019", "0"] {
+            assert!(checked_payment_sats(value).is_err());
+        }
+        assert_eq!(bloch::wallet::parse_bloch_satoshis("0"), Ok(0));
+        assert_eq!(checked_payment_sats("1.25"), Ok(125_000_000));
+        assert_eq!(checked_payment_sats("90071992.54740993"), Ok(9_007_199_254_740_993));
+    }
+    #[test]
+    fn indices_and_networks_are_checked_before_information_is_discarded() {
+        use bloch::address::{Address, Network};
+        let main = Address::from_hash([1; 20], Network::Mainnet).to_string();
+        let test = Address::from_hash([1; 20], Network::Testnet).to_string();
+        assert!(checked_destination(&main, &test).is_err());
+        assert!(checked_destination(&test, &main).is_err());
+        assert_eq!(checked_destination(&main, &main).unwrap(), "01".repeat(20));
+        let mut row = serde_json::json!({"txid": "ab".repeat(32), "index": u32::MAX,
+            "value": "9007199254740993", "script_pubkey": "cd".repeat(20)});
+        let parsed = parse_send_utxos(&[row.clone()]).unwrap();
+        assert_eq!(parsed[0].1, u32::MAX);
+        assert_eq!(parsed[0].2.value, 9_007_199_254_740_993);
+        row["index"] = serde_json::json!(4294967296u64);
+        assert!(parse_send_utxos(&[row]).is_err());
+        assert!(parse_send_utxos(&[serde_json::json!({})]).is_err());
+    }
+
+    #[test]
+    fn address_listing_is_bounded_unless_trusted_backup_override_is_explicit() {
+        let path = std::env::temp_dir().join(format!(
+            "bloch-cli-public-wallet-limit-{}.json",
+            std::process::id()
+        ));
+        let fixture = public_wallet_fixture(
+            bloch::hd_wallet::DEFAULT_HD_WALLET_LOAD_LIMITS.max_addresses + 1,
+        );
+        std::fs::write(&path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+        let path_str = path.to_str().unwrap();
+
+        let rejected = read_public_hd_wallet(path_str, false).err().unwrap();
+        assert!(rejected.contains("address count 1025 exceeds configured limit 1024"));
+        assert!(rejected.contains("--allow-large-hd-wallet"));
+        assert_eq!(read_public_hd_wallet(path_str, true).unwrap().addresses.len(), 1025);
+        std::fs::remove_file(path).unwrap();
+    }
 }

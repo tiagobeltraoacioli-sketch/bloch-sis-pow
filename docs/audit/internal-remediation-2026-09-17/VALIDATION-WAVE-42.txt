@@ -1,0 +1,66 @@
+Validation wave 42 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Final local closeout; no deployment or consensus activation performed.
+
+PASS
+
+Finding-ledger parser
+  200 rows; 200 unique finding IDs.
+  66 IMPLEMENTED; 89 PARTIAL; 30 OPEN; 7 BASE CHANGED;
+  4 PROTOCOL DECISION; 1 UNARMED CANDIDATE;
+  1 REFUTED IN AUDIT; 2 VERIFIED POSITIVE.
+
+python3 scripts/check-live-node-retired-isolation.py --selftest
+  Clean, direct, transitive and missing-root cases passed.
+
+python3 scripts/check-live-node-retired-isolation.py
+  The live bloch-pos-node dependency graph reaches none of the retired
+  bloch, bloch-euvm or bloch-ffg crates.
+
+bash deploy/bootnodes/verify-bootnodes.selftest.sh
+  Closed RPC passes; exposed :8080 fails.
+
+python3 scripts/check-tests-blocking.selftest.py
+python3 scripts/check-tests-blocking.py
+  37 self-test cases passed; both pipelines explicitly gate all eight live
+  crates.
+
+python3 scripts/check-scanners-blocking.selftest.py
+python3 scripts/check-scanners-blocking.py
+  12 self-test cases passed; seven GitLab and seven GitHub scanner jobs are
+  blocking.
+
+python3 scripts/check-comment-constants.py
+  430 files and 46 value claims checked; zero contradictions.
+
+bash scripts/ci-banned-words.sh
+  Passed.
+
+python3 scripts/check-deploy-image-pins.py
+  All 15 deployment files passed.
+
+python3 scripts/check-no-source-archives.py
+  The one tracked archive contains no source; no compiled artifacts found.
+
+python3 scripts/check-ustav-pq-boundary.py
+  No listed classical signature library crosses the Ustav native boundary.
+
+ruby YAML.safe_load over .github/workflows/security.yml and .gitlab-ci.yml
+  Both parsed successfully with aliases enabled and no permitted classes.
+
+EXPECTED BLOCKER — NOT WAIVED
+
+python3 scripts/check-repro-inputs.py
+  Exit 1: flake.lock is absent. The guard requires scripts/flake-lock.sh to be
+  run on an aarch64 Nix host and explicitly forbids an agent from hand-writing
+  narHash values. The blocking flake-lock-drift job remains intact. This is
+  the already documented reproducibility boundary, not a regression introduced
+  by this closeout.
+
+FINAL INTEGRITY
+
+git diff --check
+  Passed before the closeout commit.
+
+No fleet host, external validator, deployed service, release artifact or
+consensus activation epoch was changed.

@@ -44,7 +44,7 @@ primary_region = "ord"
     path = "/health"
 
 # GPU machine. L40S balances price/VRAM for SP1; step up to a100-40gb/80gb for
-# larger circuits. CPU-only fallback: drop this block + build with CUDA_FEATURE="".
+# larger circuits. CPU-only fallback: drop this block + build with PROVER_BACKEND="cpu".
 [[vm]]
   gpu_kind = "l40s"
   gpus = 1

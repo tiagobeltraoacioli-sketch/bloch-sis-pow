@@ -1,0 +1,36 @@
+Validation wave 16 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Remote-access implementation: 42cb8e8
+
+PASS
+
+python3 scripts/check-attested-ssh.selftest.py
+  1 honest posture green; 6 hostile mutations red by name.
+
+python3 scripts/check-attested-ssh.py
+  Appliance sshd off; cloud exception key-only, non-root and wg0-only.
+
+python3 scripts/check-iso-hardening.selftest.py
+  1 honest composition green; 7 hostile mutations red by name.
+
+python3 scripts/check-iso-hardening.py
+  Both installer ISO compositions retain mkForce hardening and the composed
+  Nix-evaluation proof retains its required assertions.
+
+python3 -m py_compile scripts/check-attested-ssh.py scripts/check-attested-ssh.selftest.py
+  Passed with the repository runner's Python.
+
+bash -n scripts/check-iso-hardening.sh
+  Passed.
+
+bash scripts/ci-banned-words.sh
+  Passed; no trademark or attestation-bleed violations.
+
+git diff --check
+  Passed before the implementation commit and before this evidence checkpoint.
+
+LIMIT
+
+No Nix executable is installed on this host. The updated composed-value script
+was syntax-checked but not executed. No image was built or booted, and the
+/persist LUKS2/TPM2 path remains unqualified; INF-17 is PARTIAL.

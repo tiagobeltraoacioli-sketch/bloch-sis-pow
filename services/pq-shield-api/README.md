@@ -1,10 +1,10 @@
 # PQ-Shield API — a non-custodial developer endpoint for PQ-Shield Bitcoin vaults
 
 > ## ⚠️ SIGN LOCALLY — NON-CUSTODIAL
-> **This server never handles a private key and never signs.** Every route does
+> **This server does not sign and does not require private keys.** Every route does
 > **construction + verification only** and returns an *unsigned* artifact — a vault
 > address, a witnessScript, an unsigned transaction, a BIP-143 sighash, or the anchor
-> commitment bytes — for **you to sign locally**. All secret material stays 100%
+> commitment bytes — for **you to sign locally**. Keep all secret material
 > client-side:
 > - the BTC **hot / recovery secp256k1 private keys** (sign the sighashes),
 > - the **PQ secret key** — ML-DSA-65 ‖ Falcon-1024 (signs the anchor commitment),
@@ -18,12 +18,15 @@
 
 This service wraps the public, non-secret functions of the
 [`bloch-pq-vault`](../../crates/bloch-pq-vault) crate. It builds a **commit-delay-reveal
-P2WSH vault + a PQ-gated clawback on stock Bitcoin**, plus a **PQ-signed Bloch anchor**.
+P2WSH construction + hashlocked classical recovery on stock Bitcoin**, plus an
+off-chain **PQ-signed anchor commitment**.
 It is *not* the video/demo — this endpoint is how third-party builders integrate the
 feature into their own products.
 
-Read the crate's `HONEST LIMITS` and the security audit before shipping value: this is
-**transition-era defense-in-depth, NOT unconditional quantum immunity**.
+Read the crate's `HONEST LIMITS` and
+[`CONSTRUCTION-AUDIT.md`](../../crates/bloch-pq-vault/CONSTRUCTION-AUDIT.md) before
+testing it. Those are internal follow-up notes, not external product qualification.
+This is **transition-era defense-in-depth, NOT unconditional quantum immunity**.
 
 ---
 
@@ -32,8 +35,8 @@ Read the crate's `HONEST LIMITS` and the security audit before shipping value: t
 ```bash
 cd services/pq-shield-api
 cargo run                       # binds 127.0.0.1:8787
-PQ_SHIELD_BIND=0.0.0.0:8787 cargo run   # custom bind
-cargo test                      # 7 endpoint tests (round-trip vs. the crate)
+PQ_SHIELD_BIND=127.0.0.1:8787 cargo run   # loopback only
+cargo test                      # endpoint and audit regression tests
 ```
 
 The service is its **own cargo workspace** — building or running it does **not** touch
@@ -52,17 +55,18 @@ the Bloch chain node. Do **not** colocate it on a founder/chain node.
    │ OP_SHA256    │──────tx──────▶│ IF  Δ OP_CSV <hot> CHECKSIG│──branch A (delayed)──▶ destination
    │  <H(r)>      │  (reveals r)  │ ELSE SHA256 <H(r)> EQ-VER  │
    │ OP_EQUALVERIFY│              │      <recovery> CHECKSIG   │──branch B (immediate)─▶ safe_dest
-   │ <hot> CHECKSIG│              │ ENDIF                      │   = PQ-gated CLAWBACK
+   │ <hot> CHECKSIG│              │ ENDIF                      │   = hashlocked RECOVERY
    └──────────────┘              └───────────────────────────┘
 ```
 
 - **Branch A** carries the CSV relative-timelock Δ (normal, delayed spend, hot key).
-- **Branch B** is immediate but gated by revealing the PQ-derived preimage `r` +
-  a recovery-key signature — the *clawback* an owner/watchtower uses to beat an
-  attacker within Δ.
+- **Branch B** is immediate and requires the PQ-derived preimage `r` plus a
+  recovery-key signature. The unvault reveals `r`, so after that event the
+  recovery signature is the remaining authorization check.
 - The **Bloch anchor** is the PQ-signed record binding
-  `{vault address, H(r), pq pubkey, safe dest, Δ, policy}`; Bitcoin enforces the
-  hash+timelock half, Bloch enforces the PQ half.
+  `{vault address, H(r), pq pubkey, safe dest, Δ, policy}`. This repository can
+  construct and verify that record off chain, but does not post, order, revoke,
+  or enforce it on Bloch consensus. Bitcoin enforces only its own script.
 
 ---
 
@@ -134,7 +138,7 @@ Returns the unsigned tx + `sighashes[0]` (`sign_with: "hot_key"`); witness
 Δ blocks after the trigger confirms.
 
 ### `POST /vault/clawback-tx`
-The **immediate PQ-gated clawback** **TRIGGER → safe_destination** (branch B).
+The **immediate hashlocked recovery** **TRIGGER → safe_destination** (branch B).
 ```json
 {
   "network": "regtest",
@@ -149,6 +153,28 @@ Returns the unsigned tx + `sighashes[0]` (`sign_with: "recovery_key"`); witness
 `[ <recovery_sig>, <r>, <> ]` — you sign with the **recovery** key and **reveal `r`**
 locally (trailing empty item selects branch B). `safe_destination` must equal the
 anchored `designated_safe_dest` and be a **fresh, unexposed** address.
+
+### `POST /vault/clawback-ladder`
+Build two to 32 mutually replacing clawbacks for offline pre-signing before the
+vault is funded. The request replaces `fee_sat` above with a strictly increasing
+`fee_ladder_sat` array:
+```json
+{
+  "network": "regtest",
+  "vault": { "hot_pubkey": "...", "recovery_pubkey": "...", "recovery_hash": "...", "csv_delay": 144 },
+  "trigger_outpoint": { "txid": "<trigger txid>", "vout": 0 },
+  "trigger_amount_sat": 99500,
+  "safe_destination": "bcrt1q<fresh unexposed cold addr>",
+  "fee_ladder_sat": [500, 1000, 2000, 5000]
+}
+```
+Every returned replacement spends the same RBF-enabled input to the same safe
+destination and carries its own `SIGHASH_ALL`. Sign every step locally with the
+recovery key, assemble its branch-B witness, and give only those finite signed
+transactions to the watchtower. The server bounds every candidate by the same
+dust, money-range and ten-percent fee rules. Increasing absolute fees alone do
+not guarantee BIP-125 acceptance: validate the deltas against current relay
+policy and refresh the package before funding when necessary.
 
 ### `POST /anchor/commitment`
 The canonical bytes to **PQ-sign client-side** (ML-DSA-65 ‖ Falcon-1024). The server
@@ -178,15 +204,17 @@ fields + `signature`, or a full `signed_anchor_hex` blob — **plus a required
   "policy":"watchtower-01", "signature":"<hex PQ signature>",
   "trusted_pq_pubkey":"<hex of the PQ pubkey YOU already trust for this vault>" }
 ```
-Returns `{ "valid": true|false, "reason": "...", "verified_against_pq_pubkey": "...",
-"commitment_bytes_hex": "..." }`. Tampering with any committed field fails closed.
+Returns `{ "valid": true|false, "reason": "...", "non_custodial": "..." }`.
+Tampering with any committed field fails closed. Verification no longer echoes
+supplied trusted-key bytes or commitment bytes (BV-20). Obtain signing bytes
+from `/anchor/commitment`, where returning the public policy is necessary.
 
 > **`trusted_pq_pubkey` is not optional, and it is the whole point.** An anchor carries
 > its own `pq_recovery_pubkey`, so checking the signature against *that* is
 > self-certifying: an attacker generates a PQ keypair, writes their own
 > `designated_safe_dest` into an anchor, signs it with their own secret, and publishes a
-> blob that "verifies" perfectly. A watchtower trusting that answer would fee-bump a
-> clawback straight to the attacker. Authenticity here means *signed by **the** owner*,
+> blob that "verifies" perfectly. A watchtower trusting that answer could accept the
+> attacker's destination as authorized. Authenticity here means *signed by **the** owner*,
 > so you must pass the key you obtained out-of-band — from vault registration or from
 > the anchor guard hash, which commits to it. A mismatch returns
 > `reason: "UntrustedKey"`. Omitting the field is a `400`, never an implicit "valid".
@@ -241,8 +269,8 @@ curl -s -X POST $BASE/vault/clawback-tx -d "{
 
 ## Security notes
 
-- **Hardened recovery derivation (audit finding M1, Medium).** The security audit's
-  single Medium finding: the recovery key must **not** be a *non-hardened* BIP-32
+- **Hardened recovery derivation (historical finding M1).** The recovery key must
+  **not** be a *non-hardened* BIP-32
   sibling of the hot key, or a hot-key compromise plus a watch-only account xpub can
   derive the recovery key too — collapsing the hot-vs-recovery separation. **Derive the
   recovery key on a HARDENED path** (e.g. a separate hardened account
@@ -254,10 +282,13 @@ curl -s -X POST $BASE/vault/clawback-tx -d "{
   reused/Taproot address just moves the same exposure.
 - **`r` is single-use and public after reveal.** Use a unique `vault_id` per vault
   (client-side) so preimages are independent; never re-fund a spent deposit address.
-- **Honest ceiling.** Protection is a *spend-window delay + PQ-authorized recovery*, and
+- **A broadcaster is keyless only when it receives finite pre-signed replacements.**
+  Giving a service `recovery_sk` or a signing oracle makes it custodial and able to
+  redirect funds; the RBF sequence bit alone grants no replacement authority.
+- **Honest ceiling.** Protection is a *spend-window delay + hashlocked classical recovery*, and
   depends on the owner/watchtower being online during Δ and winning the fee race. It is
-  not unconditional quantum immunity. The Bloch-side PQ enforcement (`bloch-euvm`) is
-  itself FOUNDATION / not consensus-wired. The real fix is a PQ soft fork (BIP-360).
+  not unconditional quantum immunity. The separate PQ commitment is verified off chain;
+  no Bloch anchor registry is consensus-wired. The real fix is a PQ soft fork (BIP-360).
 
 ## Non-custodial audit of the routes (self-check)
 
@@ -267,6 +298,7 @@ curl -s -X POST $BASE/vault/clawback-tx -d "{
 | `POST /vault/unvault-tx` | no | the hot-key sighash; reveals `r` in witness |
 | `POST /vault/branch-a-tx` | no | the hot-key sighash |
 | `POST /vault/clawback-tx` | no | the recovery-key sighash; reveals `r` |
+| `POST /vault/clawback-ladder` | no | every replacement's recovery-key sighash; reveals `r` |
 | `POST /anchor/commitment` | no | PQ-signs the returned commitment bytes |
 | `POST /anchor/verify` | no | nothing (verification only) |
 | `GET /health`, `GET /` | no | — |
@@ -285,3 +317,53 @@ preimage derivation) are **never** called by the service.
   crypto are heavy for `wasm32`; the native binary is the recommended host.
 - **Do not** deploy it onto the founder/chain node — it is a separate, standalone
   service.
+
+
+## Internal audit hardening (2026-09-17)
+
+The binary now refuses non-loopback listeners. Expose it only through a local
+TLS proxy with authentication and per-client rate limits. POST routes require
+`Content-Type: application/json`, reject browser `Sec-Fetch-Site: cross-site`,
+and cap bodies at 128 KiB. The existing concurrency ceiling limits simultaneous
+requests; asynchronous timeouts do not preempt synchronous signature checks.
+
+Construction and verification accept only valid Bitcoin addresses sharing a
+network, and require a CSV delay of at least 144 blocks, including nested vault
+parameters and serialized anchor requests. Non-Bitcoin target-chain construction
+is unsupported. Transaction construction rejects outputs below the default
+Bitcoin dust threshold, amounts above MAX_MONEY, and fees over 10% of the input.
+This fee limit is API policy, not a dynamic fee estimator. The optional
+clawback ladder creates bounded pre-signable alternatives, but clients must
+still validate replacement deltas and the emergency fee strategy before
+funding a vault.
+
+The two anchor verification request forms are exclusive: either provide typed
+anchor fields and `signature`, or provide `signed_anchor_hex`. Unknown fields
+are rejected in both forms. The field-name guard catches common accidental
+secret submissions; it cannot recognize arbitrary secret bytes in allowed
+strings or undo disclosure after a request reaches the service. Public keys
+and unvault plans are sensitive to the vault threat model even though they are
+not private keys: prefer local construction and never treat a remote API as a
+privacy boundary. Address validation does not establish freshness, ownership,
+or correspondence to a particular on-chain vault script.
+
+For new client-side vault key generation, use the explicitly versioned
+`derive_vault_keys_v3` and persist `VaultKeyDerivation::V3HardenedRoles` in the
+backup. V3 uses `m/1999'/coin'/0'/{0',1'}` and a separate PQ domain. V1 and V2
+outputs remain unchanged for recovery of existing funds. This does not retrofit
+existing vaults: moving funds requires a separately reviewed migration. It also
+does not resolve deposit/branch-A key reuse, dynamic watchtower fee estimation,
+signed-package delivery, anchor revocation, or recovery preimage lifecycle
+design.
+
+### Response minimization (BV-20, 2026-09-17)
+
+Invalid JSON/schema, secret-shaped field names and unsupported network/chain
+errors do not repeat submitted keys or values. Verification returns its verdict
+without echoing the input key or policy-containing commitment. This changes
+response fields; clients should retain their own public inputs and use the
+commitment endpoint for signing bytes. No request-content secret detector is
+claimed: allowed policy text remains public, is committed exactly as supplied,
+and is necessarily included in the commitment endpoint's bytes. Never send
+secrets in policy text or other allowed fields. These changes cannot erase data
+already disclosed in a request, nor control proxy/access-log configuration.

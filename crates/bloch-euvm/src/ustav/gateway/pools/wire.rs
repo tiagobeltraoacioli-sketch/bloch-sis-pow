@@ -156,11 +156,15 @@ pub fn decode(bytes: &[u8]) -> Result<Envelope, Error> {
     for points in &mut funding {
         let count = r.count(MAX_INPUTS)?;
         // Check the entire bounded slice before allocating any outpoints.
-        let raw = r.take(count * 36)?;
+        let raw = r.take(count.checked_mul(36).ok_or(Error::InvalidShape)?)?;
         for point in raw.chunks_exact(36) {
+            let mut transaction = [0u8; 32];
+            transaction.copy_from_slice(&point[..32]);
+            let mut index = [0u8; 4];
+            index.copy_from_slice(&point[32..]);
             points.push(OutPoint {
-                transaction: point[..32].try_into().expect("fixed width"),
-                index: u32::from_le_bytes(point[32..].try_into().expect("fixed width")),
+                transaction,
+                index: u32::from_le_bytes(index),
             });
         }
     }
@@ -195,13 +199,14 @@ pub fn apply_encoded(
     if bytes.len() > MAX_ENCODED_BYTES {
         return Err(Error::TooLarge);
     }
-    let parse_gas = 100 + (bytes.len() as u64).div_ceil(32);
+    let parse_gas = 100u64.saturating_add((bytes.len() as u64).div_ceil(32));
     let remaining = gas_limit.checked_sub(parse_gas).ok_or(Error::OutOfGas)?;
     let e = decode(bytes)?;
     if e.domain != *ledger.gateway().native().domain() {
         return Err(Error::WrongDomain);
     }
     let mut receipt = ledger.execute(&e.action, &e.signature, height, verifier, remaining)?;
-    receipt.gas_used += parse_gas;
+    debug_assert!(receipt.gas_used <= remaining);
+    receipt.gas_used = receipt.gas_used.saturating_add(parse_gas);
     Ok(receipt)
 }

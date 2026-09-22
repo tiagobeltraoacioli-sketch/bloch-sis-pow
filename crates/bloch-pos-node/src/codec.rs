@@ -17,6 +17,7 @@
 
 use bloch_pos_committee::attestation::{Attestation, AttestationData};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, Body};
+use std::io::{self, Write};
 
 /// Hard cap on any decoded length field, so a corrupt frame cannot ask for a
 /// multi-gigabyte allocation. Generous for a devnet block (12 validators ×
@@ -131,14 +132,31 @@ pub fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
 // ── Attestations ────────────────────────────────────────────────────────────
 
 pub fn encode_attestation(out: &mut Vec<u8>, a: &Attestation) {
-    out.extend_from_slice(&a.data.slot.to_le_bytes());
-    out.extend_from_slice(&a.data.head);
-    out.extend_from_slice(&a.data.source_epoch.to_le_bytes());
-    out.extend_from_slice(&a.data.source_root);
-    out.extend_from_slice(&a.data.target_epoch.to_le_bytes());
-    out.extend_from_slice(&a.data.target_root);
-    out.extend_from_slice(&a.validator.to_le_bytes());
-    put_bytes(out, &a.signature);
+    write_attestation(out, a).expect("writing to Vec cannot fail");
+}
+
+/// Exact wire length of [`encode_attestation`] without allocating and copying
+/// its signature solely to measure the resulting buffer.
+pub(crate) fn encoded_attestation_len(a: &Attestation) -> usize {
+    // Fixed fields: slot (8), head (32), source epoch/root (8 + 32), target
+    // epoch/root (8 + 32), validator (4), and signature length prefix (4).
+    128usize.saturating_add(a.signature.len())
+}
+
+fn write_attestation<W: Write>(out: &mut W, a: &Attestation) -> io::Result<()> {
+    out.write_all(&a.data.slot.to_le_bytes())?;
+    out.write_all(&a.data.head)?;
+    out.write_all(&a.data.source_epoch.to_le_bytes())?;
+    out.write_all(&a.data.source_root)?;
+    out.write_all(&a.data.target_epoch.to_le_bytes())?;
+    out.write_all(&a.data.target_root)?;
+    out.write_all(&a.validator.to_le_bytes())?;
+    write_bytes(out, &a.signature)
+}
+
+fn write_bytes<W: Write>(out: &mut W, bytes: &[u8]) -> io::Result<()> {
+    out.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    out.write_all(bytes)
 }
 
 pub fn decode_attestation(r: &mut Reader<'_>) -> Result<Attestation, DecodeErr> {
@@ -157,6 +175,25 @@ pub fn decode_attestation(r: &mut Reader<'_>) -> Result<Attestation, DecodeErr> 
 
 // ── Block envelope ──────────────────────────────────────────────────────────
 
+/// Exact wire/disk length of [`encode_envelope`] without allocating a second
+/// attacker-sized buffer. Saturation is fail-closed for retention callers:
+/// an object whose component lengths cannot be represented is larger than
+/// every finite byte budget.
+pub fn encoded_envelope_len(env: &BlockEnvelope) -> usize {
+    let mut len = BlockHeaderV4::ENCODED_LEN
+        .saturating_add(4)
+        .saturating_add(env.proposer_sig.len())
+        .saturating_add(4);
+    for attestation in &env.body.attestations {
+        len = len.saturating_add(encoded_attestation_len(attestation));
+    }
+    len = len.saturating_add(4);
+    for transaction in &env.body.transactions {
+        len = len.saturating_add(4).saturating_add(transaction.len());
+    }
+    len
+}
+
 pub fn encode_envelope(env: &BlockEnvelope) -> Vec<u8> {
     // `with_capacity` is a size hint, not a correctness bound: saturating is
     // the intended semantics here (the alternative to saturation is "guess
@@ -164,17 +201,26 @@ pub fn encode_envelope(env: &BlockEnvelope) -> Vec<u8> {
     // `MAX_FIELD_LEN` (8 MiB) everywhere it is produced, far below
     // `usize::MAX - 512`, so saturation is not reachable in practice either.
     let mut out = Vec::with_capacity(512usize.saturating_add(env.proposer_sig.len()));
-    out.extend_from_slice(&env.header.canonical_serialize());
-    put_bytes(&mut out, &env.proposer_sig);
-    out.extend_from_slice(&(env.body.attestations.len() as u32).to_le_bytes());
-    for a in &env.body.attestations {
-        encode_attestation(&mut out, a);
-    }
-    out.extend_from_slice(&(env.body.transactions.len() as u32).to_le_bytes());
-    for tx in &env.body.transactions {
-        put_bytes(&mut out, tx);
-    }
+    write_envelope(&mut out, env).expect("writing to Vec cannot fail");
     out
+}
+
+/// Emit the canonical envelope bytes without first aggregating them in a
+/// second payload buffer. This is the shared authority for public encoding and
+/// persistence; callers that write to fallible storage must preflight their
+/// own frame cap before invoking it.
+pub(crate) fn write_envelope<W: Write>(out: &mut W, env: &BlockEnvelope) -> io::Result<()> {
+    out.write_all(&env.header.canonical_serialize())?;
+    write_bytes(out, &env.proposer_sig)?;
+    out.write_all(&(env.body.attestations.len() as u32).to_le_bytes())?;
+    for attestation in &env.body.attestations {
+        write_attestation(out, attestation)?;
+    }
+    out.write_all(&(env.body.transactions.len() as u32).to_le_bytes())?;
+    for transaction in &env.body.transactions {
+        write_bytes(out, transaction)?;
+    }
+    Ok(())
 }
 
 pub fn decode_envelope(buf: &[u8]) -> Result<BlockEnvelope, DecodeErr> {
@@ -184,8 +230,13 @@ pub fn decode_envelope(buf: &[u8]) -> Result<BlockEnvelope, DecodeErr> {
         BlockHeaderV4::canonical_deserialize(hb).map_err(|_| DecodeErr("bad header"))?;
     let proposer_sig = r.bytes()?;
     let natt = r.u32()? as usize;
-    if natt > 4096 {
+    if natt > bloch_pos_committee::params::MAX_ATTESTATIONS_PER_BLOCK {
         return Err(DecodeErr("too many attestations"));
+    }
+    // Every attestation has 128 fixed bytes including its signature length.
+    // Reserve only after the frame proves it can contain the declared count.
+    if natt > r.buf.len().saturating_sub(r.at) / 128 {
+        return Err(DecodeErr("truncated attestation collection"));
     }
     let mut attestations = Vec::with_capacity(natt);
     for _ in 0..natt {
@@ -194,6 +245,9 @@ pub fn decode_envelope(buf: &[u8]) -> Result<BlockEnvelope, DecodeErr> {
     let ntx = r.u32()? as usize;
     if ntx > 65_536 {
         return Err(DecodeErr("too many transactions"));
+    }
+    if ntx > r.buf.len().saturating_sub(r.at) / 4 {
+        return Err(DecodeErr("truncated transaction collection"));
     }
     let mut transactions = Vec::with_capacity(ntx);
     for _ in 0..ntx {
@@ -294,6 +348,89 @@ mod tests {
         assert_eq!(back.body.attestations[0].signature, env.body.attestations[0].signature);
         // Identity is preserved through the codec — same bytes, same id.
         assert_eq!(back.block_id(), env.block_id());
+    }
+
+    #[test]
+    fn encoded_envelope_len_tracks_empty_collections_fields_and_limits() {
+        let mut env = sample_envelope();
+        env.proposer_sig.clear();
+        env.body.attestations.clear();
+        env.body.transactions.clear();
+        assert_eq!(encoded_envelope_len(&env), encode_envelope(&env).len());
+
+        env.body.attestations.push(sample_envelope().body.attestations.remove(0));
+        assert_eq!(encoded_envelope_len(&env), encode_envelope(&env).len());
+
+        env.body.transactions.push(vec![0xA5; 4097]);
+        assert_eq!(encoded_envelope_len(&env), encode_envelope(&env).len());
+
+        env.proposer_sig.resize(MAX_FIELD_LEN, 0x5A);
+        assert_eq!(encoded_envelope_len(&env), encode_envelope(&env).len());
+    }
+
+    #[test]
+    fn encoded_attestation_len_matches_encoder_for_empty_realistic_and_large_signatures() {
+        let mut attestation = sample_envelope().body.attestations.remove(0);
+        for signature_len in [0, 4_589, 1 << 20] {
+            attestation.signature.resize(signature_len, 0xA5);
+            let mut encoded = Vec::new();
+            encode_attestation(&mut encoded, &attestation);
+
+            assert_eq!(encoded_attestation_len(&attestation), encoded.len());
+            assert_eq!(encoded.len(), 128usize.saturating_add(signature_len));
+        }
+    }
+
+    #[test]
+    fn canonical_envelope_emitter_matches_public_bytes_across_short_writes() {
+        #[derive(Default)]
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            writes: usize,
+        }
+
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes = self.writes.saturating_add(1);
+                let accepted = bytes.len().min(17);
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                Ok(accepted)
+            }
+
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+
+        let full = sample_envelope();
+        let mut empty = sample_envelope();
+        empty.proposer_sig.clear();
+        empty.body.attestations.clear();
+        empty.body.transactions.clear();
+        let mut large = sample_envelope();
+        large.body.transactions.push(vec![0xA5; 1 << 20]);
+
+        for envelope in [empty, full, large] {
+            let expected = encode_envelope(&envelope);
+            let mut writer = ShortWriter::default();
+            write_envelope(&mut writer, &envelope).expect("stream canonical envelope");
+            assert_eq!(writer.bytes, expected);
+            assert_eq!(writer.bytes.len(), encoded_envelope_len(&envelope));
+            assert!(writer.writes > 1, "fixture must exercise write_all retries");
+        }
+    }
+
+    #[test]
+    fn audit_collection_counts_must_fit_the_remaining_frame() {
+        let mut env = sample_envelope();
+        env.proposer_sig.clear();
+        env.body.attestations.clear();
+        env.body.transactions.clear();
+        let mut bytes = encode_envelope(&env);
+        let counts = BlockHeaderV4::ENCODED_LEN + 4;
+        bytes[counts..counts + 4].copy_from_slice(&4096u32.to_le_bytes());
+        assert_eq!(decode_envelope(&bytes).err().unwrap().0, "truncated attestation collection");
+        bytes[counts..counts + 4].copy_from_slice(&0u32.to_le_bytes());
+        bytes[counts + 4..counts + 8].copy_from_slice(&65536u32.to_le_bytes());
+        assert_eq!(decode_envelope(&bytes).err().unwrap().0, "truncated transaction collection");
     }
 
     #[test]

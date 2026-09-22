@@ -412,6 +412,8 @@ pub enum EnvelopeReject {
     /// The same signer listed twice — a duplicated key must not count twice
     /// toward the quorum.
     DuplicateSigner { index: u8 },
+    /// Distinct arrangement slots must not reuse the same public key.
+    DuplicateSignerKey { first: usize, second: usize },
     /// Fewer signatures than the threshold, before any verification runs.
     QuorumNotReached { got: usize, need: usize },
     /// Fewer external signatures than the minimum — a quorum consisting only
@@ -454,6 +456,23 @@ pub fn verify_envelope(
     expected_genesis_root: &[u8; 32],
     verifier: &dyn HybridKeyVerifier,
 ) -> Result<EnvelopeOk, EnvelopeReject> {
+    // These invariants belong to the public verifier, not just the node's
+    // file decoder. Direct library callers must not accept an empty quorum
+    // or count one key twice under different arrangement indices.
+    if set.threshold == 0 || set.signers.len() > 256
+        || set.threshold > set.signers.len()
+        || set.min_external > set.threshold
+        || set.signers.iter().filter(|s| s.external).count() < set.min_external
+    {
+        return Err(EnvelopeReject::SignerSetShapeMismatch {
+            threshold: set.threshold, signers: set.signers.len(), min_external: set.min_external,
+        });
+    }
+    for (second, signer) in set.signers.iter().enumerate() {
+        if let Some(first) = set.signers[..second].iter().position(|s| s.pubkey == signer.pubkey) {
+            return Err(EnvelopeReject::DuplicateSignerKey { first, second });
+        }
+    }
     let cp = &env.checkpoint;
     if cp.version != WS_FORMAT_VERSION {
         return Err(EnvelopeReject::WrongVersion { got: cp.version });
@@ -992,6 +1011,19 @@ mod tests {
 
     const NET: u32 = 0x0004_0001;
     const GEN: [u8; 32] = [0x61; 32];
+
+    #[test]
+    fn audit_standalone_verifier_rejects_empty_quorum_and_duplicate_keys() {
+        let mut set = phase_a_set();
+        set.threshold = 0;
+        set.min_external = 0;
+        assert!(matches!(verify_envelope(&envelope(&[]), &set, NET, &GEN, &accept_all()),
+            Err(EnvelopeReject::SignerSetShapeMismatch { .. })));
+        let mut set = phase_a_set();
+        set.signers[2].pubkey = set.signers[0].pubkey;
+        assert_eq!(verify_envelope(&envelope(&[0, 2]), &set, NET, &GEN, &accept_all()),
+            Err(EnvelopeReject::DuplicateSignerKey { first: 0, second: 2 }));
+    }
 
     #[test]
     fn valid_phase_a_envelope_verifies() {

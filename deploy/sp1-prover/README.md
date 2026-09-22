@@ -1,84 +1,63 @@
-# Coherence SP1 prover on Fly.io
+# Coherence SP1 prover candidate
 
-The GPU proving half of the shielded pool. A wallet POSTs `(public, witness)` to
-`/prove` and gets back a **raw FRI proof** (post-quantum) that the C1 spend
-statement (`check_spend`) held. The node verifies that FRI proof **locally** and
-trustlessly — it never calls this service to decide consensus. This box only
-does the expensive proving.
+This is an experimental off-chain proving service and Linux/amd64 build recipe.
+It has not been qualified in a Linux container or on a GPU in this audit session.
+The shared V1 spend statement does not prove recipient authorization: read
+[the activation blocker](../../crates/coherence-prover/AUTHORIZATION-BLOCKER.md).
+Do not accept funded shielded deposits or treat a successful proof as repairing
+that statement. Rebuilding changes the guest artifact and requires separately
+reviewed verifier identity and activation handling.
 
-```
-wallet ──(public, witness)──▶  /prove  ──▶ raw FRI proof ──▶ ShieldedTx.proof
-node   ── verifies the FRI proof locally (sp1-sdk verifier) ── no trust in this box
-```
+## Build inputs
 
-## Why this shape
+The recipe pins Rust, CUDA base images, SP1 CLI 4.2.1 and the compatible
+`succinct-1.85.0` guest toolchain. The downloaded guest toolchain is checked
+against a committed SHA256 before extraction. There are no downloaded shell
+installers. An explicit source/context allowlist excludes host-generated ELFs,
+keys and unrelated repository content. See [input provenance](BUILD-INPUTS.md).
 
-- **Proving is heavy** (seconds–minutes, GBs of RAM, ~GPU) → a dedicated,
-  scale-to-zero GPU machine. **Verifying is cheap** → stays in the node.
-- **Self-hosted, not a third party.** For a privacy chain, the prover runs on
-  infra you control (see the Succinct Network alternative below).
-- **Post-quantum coherence:** the service uses `.core()` (STARK/FRI) and never
-  `.groth16()/.plonk()` — an elliptic-curve wrap would be Shor-breakable.
+The guest is a standalone workspace with its own committed lockfile. Its build
+names the ELF path consumed by the service and verifies that the lockfile did
+not change. The service is another standalone workspace; its manifest and output
+directory are passed explicitly. The root workspace excludes it.
 
-## Best-practice setup (what this config does)
-
-- **GPU L40S, scale-to-zero.** Idle → 0 machines → \$0. A `/prove` request
-  cold-starts the GPU (seconds), proves, and the machine stops again after the
-  idle window. You pay GPU only while proving.
-- **Artifact cache on a volume** (`/data`, `SP1_HOME`). SP1 downloads circuit
-  artifacts / proving keys (GBs) on first use; the volume keeps them across cold
-  starts so wakes are fast.
-- **Bearer-token auth, FAIL-CLOSED** on `/prove` (`PROVER_AUTH_TOKEN` secret):
-  the service REFUSES TO START without a real token (placeholders like
-  `CHANGE_ME…` and tokens shorter than 32 chars are rejected). `/health` and
-  `/verify` are cheap and unauthenticated.
-- **TLS required**: `/prove` carries the FULL PRIVATE WITNESS, so requests
-  whose `x-forwarded-proto` isn't `https` are rejected (426). Fly's
-  `force_https` edge satisfies this; on Akash the SDL fronts the prover with a
-  Caddy TLS sidecar and never exposes plaintext 8080 globally.
-- **No mock proving**: the prover backend is chosen explicitly (`.cpu()` /
-  `.cuda()`); `SP1_PROVER=mock` in the environment aborts startup.
-- **Concurrency 1/machine** — one proving job per GPU; scale out with more
-  machines, not by overloading one.
-
-## Deploy
-
-```bash
-fly launch  --config deploy/sp1-prover/fly.toml --no-deploy
-fly volumes create sp1_artifacts --size 20 --region ord
-fly secrets set PROVER_AUTH_TOKEN=$(openssl rand -hex 32)
-fly deploy  --config deploy/sp1-prover/fly.toml --dockerfile deploy/sp1-prover/Dockerfile
+```sh
+# Run on an appropriately provisioned isolated build host; not validated here.
+docker build --platform linux/amd64 \
+  -f deploy/sp1-prover/Dockerfile \
+  --build-arg PROVER_BACKEND=cuda \
+  -t coherence-prover-candidate .
 ```
 
-Test:
-```bash
-curl https://bloch-sp1-prover.fly.dev/health          # -> ok
-curl -X POST https://bloch-sp1-prover.fly.dev/prove \
-  -H "authorization: Bearer $PROVER_AUTH_TOKEN" \
-  -H 'content-type: application/json' \
-  -d @spend.json                                       # -> {"proof_b64":"..."}
-```
+`PROVER_BACKEND=cpu` builds the CPU backend using the same pinned CUDA base
+images. It does not silently replace the compiler/base images or qualify CPU
+performance. Other backend values fail. The old `CUDA_FEATURE` argument is no
+longer used; build automation must select the explicit backend argument.
 
-## GPU vs CPU vs Succinct Network
+## Operational boundaries
 
-| Option | Speed | Cost | Trust | When |
-|---|---|---|---|---|
-| **GPU (this config)** | fast | GPU/hr, only while proving | self-hosted | default |
-| **CPU fallback** | slow (min) | cheap CPU machine | self-hosted | low volume / no GPU region |
-| **Succinct Prover Network** | fast | network credits | third party | burst scale, no infra |
+The service exposes `/health`, `/prove` and `/verify`. `/prove` receives the
+complete private witness, and a valid proof only establishes the statement
+implemented by the pinned guest. Proving infrastructure therefore sees witness
+secrets even though a verifier should receive only proof/public inputs.
 
-CPU fallback: remove the `[[vm]]` GPU block from `fly.toml`, build with
-`--build-arg CUDA_FEATURE=""`, and swap the CUDA base images in the Dockerfile
-for `rust:1-bookworm`. Everything else is identical (the service auto-uses the
-CPU prover without the `cuda` feature).
+Release builds require the configured bearer token and refuse debug auth/TLS
+bypasses. The `x-forwarded-proto` check is meaningful only behind a trusted TLS
+proxy with the origin inaccessible directly; it is not TLS inside the process.
+Both `/prove` and `/verify` check the existing bearer/TLS policy before parsing
+JSON; `/health` remains public. Native prove/verify jobs run behind worker slots retained until
+the work finishes, even when the HTTP request times out. A timeout does not kill
+native work and shutdown can wait for it. Proof encoding and decoding share the
+existing fixed-integer wire format and a 16 MiB serialized-proof budget; trailing
+bytes are refused. Body/proof byte limits do not bound total memory or CPU use.
 
-## Gaps to close (honest)
+The runtime uses UID/GID 10001 and `/data` as HOME, with `/data/.sp1` for tool
+artifacts. A mounted volume must be provisioned writable for that identity;
+mounting a root-owned volume hides the image's ownership settings. Existing
+Fly configuration is a candidate configuration, not a claim of deployed GPU
+availability, cost, cold-start time or end-to-end qualification.
 
-- **Untested until deployed.** No SP1 toolchain runs in the dev sandbox, so this
-  is a validated *recipe*, not a proven binary. Pin your SP1 version and confirm
-  the `prove().core().run()` / `verify()` surface for it.
-- **Node-side verifier not wired yet.** The node still stubs proof verification
-  to `false` (rejects shielded txs). Wiring `sp1-sdk`'s FRI verifier into the
-  node's `verify_proof` closure (replacing the stub) is the step that actually
-  turns shielded transactions on. That is a node change, tracked separately.
-- **No privacy claim** until the whole pipeline is audited (Coherence C4).
+Before deployment, independently qualify the container build, ELF/verifier
+identity, real proof/verification paths, resource behavior, private-origin TLS,
+authentication and volume ownership. The funded-statement blocker must be
+resolved through a reviewed versioned upgrade. This change publishes nothing.

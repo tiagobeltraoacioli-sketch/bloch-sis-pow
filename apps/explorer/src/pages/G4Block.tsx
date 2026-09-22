@@ -63,14 +63,9 @@ export function G4BlockPage({ slot }: { slot: number }) {
         {b.tx_count === 1 ? "transaction" : "transactions"} and {fmtInt(b.attestation_count)}{" "}
         {b.attestation_count === 1 ? "attestation" : "attestations"}.{" "}
         {b.finalized
-          ? // CORRECTED 2026-09-01. This line used to read "reversing it would
-            // require burning a third of the bonded stake". No stake on
-            // Genesis-4 can be slashed: evidence wire tag 0x05 is undecodable
-            // on every ingress path, nothing builds the transaction, and there
-            // is no activation constant. Finality here is economic by intent
-            // and cryptographic by nothing. See the retraction on `Finality`
-            // in crates/bloch-pos-node/src/rpc.rs.
-            "It is finalized \u2014 the strongest state this chain reports. That is not irreversible: finality is not backed by any slashing penalty (none can be applied today) and it has been observed moving backwards across legal reorgs."
+          ? // The lifecycle epoch 2884 is scheduled for 2026-09-14. A source
+            // schedule does not prove which rules the queried node has activated.
+            "Finalized on this node. Finality can differ across nodes; this status alone does not guarantee settlement."
           : `The chain calls it ${b.finality}; it is not finalized yet.`}
       </p>
 

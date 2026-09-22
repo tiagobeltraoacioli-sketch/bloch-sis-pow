@@ -27,8 +27,9 @@
 //!   leak-adjusted with no floor, so a node that can hear only a handful of
 //!   the fleet shrinks its own denominator until that handful is two thirds of
 //!   it, and finalizes alone. Three partitions did it at once, on one epoch,
-//!   under three roots. This is **live in every shipped binary today**, because
-//!   [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] is 2700 (armed 2026-09-06); below it the incident arithmetic still runs.
+//!   under three roots. [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] is
+//!   2880; below that scheduled boundary the incident arithmetic runs, while
+//!   at and above it the denominator floor and recovery rule apply.
 //! - **Scenarios 1 to 4 are the roster split**, described below. It is a real
 //!   defect, it was fixed on 2026-08-24, and it was **provably inert at the
 //!   time of the incident** — mainnet was at ~epoch 986 and the rule that
@@ -484,13 +485,12 @@ mod tests {
     /// the same epoch, on three different roots.
     ///
     /// Nothing in this test touches a mutation switch. **It runs the arithmetic
-    /// a shipped binary runs today**, because
-    /// [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] is 2700 (armed); below that epoch
-    /// `process_epoch` takes the unfloored `leak_adjusted` branch on every
-    /// epoch a real chain can reach. The floor and the leak recovery that
-    /// landed on 2026-08-25 are correct and are NOT in force. That is the
-    /// finding, and it is why this test is not decorated as a historical
-    /// curiosity: it is a description of the code the fleet is running.
+    /// the pre-boundary rule**, because
+    /// [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] is 2880. Below that
+    /// epoch `process_epoch` takes the unfloored `leak_adjusted` branch; at
+    /// and above it the denominator floor and leak recovery apply. The test is
+    /// retained as the counterexample that proves why the scheduled rule
+    /// exists, not as a claim about which epoch a deployed fleet has reached.
     ///
     /// The companion below shows the floor stops it, so this is not a test
     /// that merely cannot fail.
@@ -565,9 +565,10 @@ mod tests {
         println!(
             "INCIDENT (s0): 3 disjoint partitions of 4 of 64 validators (6.25% each) EACH \
              finalized checkpoint epoch {ce} at epoch {e0}, on 3 DIFFERENT roots \
-             ({:02x?}, {:02x?}, {:02x?}), after the leak destroyed {:.1}% of network stake. \
+             ({:02x?}, {:02x?}, {:02x?}), after the leak discounted {:.1}% of network \
+             quorum weight. \
              No mutation switch was touched: this is the arithmetic a shipped binary runs \
-             below epoch 2700 (LEAK_RECOVERY_ACTIVATION_EPOCH, armed 2026-09-06).",
+             below epoch 2880 (LEAK_RECOVERY_ACTIVATION_EPOCH).",
             &roots[0][..2],
             &roots[1][..2],
             &roots[2][..2],
@@ -605,47 +606,20 @@ mod tests {
         println!(
             "CURE (s0): with the floor at {}/{} of the unleaked total in force, all 3 \
              partitions of 4 of 64 failed to finalize in {INCIDENT_HORIZON} epochs. The \
-             floor binds in production at epoch 2700 (LEAK_RECOVERY_ACTIVATION_EPOCH, \
-             armed by founder decision on 2026-09-06).",
+             floor binds in source at epoch 2880 (LEAK_RECOVERY_ACTIVATION_EPOCH; fleet \
+             deployment remains separate evidence).",
             crate::params::MIN_QUORUM_DENOMINATOR_NUM,
             crate::params::MIN_QUORUM_DENOMINATOR_DEN
         );
     }
 
-    /// **The flag day is set: the floor and the leak recovery bind at 2700.**
-    ///
-    /// This test fired on 2026-09-06, exactly as designed, when the founder
-    /// armed the gate at epoch 2700. It now states the ARMED fact, so the day
-    /// somebody moves the epoch again (or disarms it), exactly one test tells
-    /// them that scenario 0 has changed meaning a second time.
-    ///
-    /// Meaning today: BELOW epoch 2700 the shipped arithmetic is unchanged —
-    /// `s0_three_partitions_finalize_three_different_roots_at_the_same_epoch`
-    /// still describes what a shipped binary does before the flag day. AT AND
-    /// AFTER 2700 the floored branch is live, and the cure test
-    /// (`s0_cure_the_denominator_floor_stops_all_three_partitions`) describes
-    /// the arithmetic instead. The settlement guarantee in
-    /// docs/post-mortems/2026-08-24-finality-divergence.md must be read with
-    /// the armed epoch in mind before telling an integrator anything about
-    /// finality.
+    /// Pin the coordinated replacement of the missed epoch-2700 deadline.
+    /// The one-half floor policy and its documented residual risk are unchanged.
     #[test]
-    fn the_quorum_floor_binds_at_epoch_2700() {
-        assert_eq!(
-            crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH,
-            2_700,
-            "LEAK_RECOVERY_ACTIVATION_EPOCH moved again. Whoever changed it: scenario 0's \
-             two tests change meaning at this boundary, and the fleet must run the new \
-             binary BEFORE the armed epoch or it splits. Re-read both scenario 0 tests and \
-             docs/post-mortems/2026-08-24-finality-divergence.md, and update this test to \
-             the new value only as part of a coordinated flag-day decision."
-        );
-        println!(
-            "RATCHET: LEAK_RECOVERY_ACTIVATION_EPOCH = 2700 (armed 2026-09-06). Below \
-             2700 the unfloored, leak-adjusted denominator of 2026-08-24 still runs; at \
-             and after 2700 the floor ({}/{}) and the leak recovery are in force.",
-            crate::params::MIN_QUORUM_DENOMINATOR_NUM,
-            crate::params::MIN_QUORUM_DENOMINATOR_DEN
-        );
+    fn the_quorum_floor_binds_at_epoch_2880() {
+        assert_eq!(crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH, 2_880);
+        assert_eq!(crate::params::MIN_QUORUM_DENOMINATOR_NUM, 1);
+        assert_eq!(crate::params::MIN_QUORUM_DENOMINATOR_DEN, 2);
     }
 
     // ═══════════════════ SCENARIO 1 — the disease reproduced ═════════════════
@@ -718,8 +692,8 @@ mod tests {
         // said so on the first run: `gap 2000000000 -> 0`. The leak has a
         // floor at zero, so once a stall is deep enough every absent validator
         // on both nodes is pinned at exactly zero and the two ledgers become
-        // IDENTICAL again. The ledgers reconverge — by destroying everything
-        // they disagreed about.
+        // IDENTICAL again. The ledgers reconverge — by discounting all quorum
+        // weight they disagreed about, not by burning bonded coins.
         //
         // What does not come back is the CHAIN. Each epoch of non-finality
         // takes more validators to zero, none ever returns (there is no decay
@@ -734,23 +708,24 @@ mod tests {
             r.zeros_start,
             r.zeros_end
         );
-        // How much of the fleet the stall has eaten. Reported rather than
+        // How much of the fleet's quorum weight the stall has discounted.
+        // Reported rather than
         // pinned to an exact count: a validator whose vote happens to survive
         // the mismatched partition is spared that epoch, so the exact terminal
         // count is a property of the shuffle, not of the finding.
         assert!(
             r.destroyed_end * 10 > (N as u128 * STAKE as u128) * 9,
-            "the stall destroyed only {} of {} satoshis; the fleet is not being consumed \
-             and the absorbing state is unproven",
+            "the stall discounted only {} of {} satoshis of quorum weight; the fleet is \
+             not being consumed and the absorbing state is unproven",
             r.destroyed_end,
             N as u128 * STAKE as u128
         );
         println!(
             "DISEASE: 2 nodes, zero-sets differing by {} validators, {} epochs of 100% honest \
              participation. Justified: L={} R={}, AGREED on {}. Boundary kept {:.1}% of \
-             admitted votes. Fully-leaked validators {} -> {} of {}; {} satoshis destroyed \
-             ({:.0}% of the fleet). The denominator is now ZERO: no quorum is reachable on \
-             any input, and nothing gives the stake back.",
+             admitted votes. Fully-leaked validators {} -> {} of {}; {} satoshis of quorum \
+             weight discounted ({:.0}% of the fleet). The denominator is now ZERO: no quorum \
+             is reachable on any input until recovery activates; bonded coins were not burned.",
             r.zero_set_symmetric_difference,
             r.epochs,
             r.left_justified,

@@ -28,10 +28,9 @@ base64 = "0.22"
 bincode = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# P-4/P-5/P-8 fix (audit finding): per-request timeout + a per-token concurrency
-# limiter, so one caller (or one hung request) cannot monopolise the GPU / wake
-# the scale-to-zero machine indefinitely.
-tower = { version = "0.4", features = ["limit"] }
+# HTTP wait deadlines and per-route admission limits. Native worker permits
+# remain held after an HTTP timeout; native jobs themselves are not cancellable.
+tower = { version = "0.4", features = ["limit", "util"] }
 tower-http = { version = "0.6", features = ["timeout"] }
 
 [features]

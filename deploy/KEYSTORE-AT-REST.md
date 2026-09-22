@@ -13,8 +13,9 @@ validator: the signing key *and* the RANDAO seed.
 
 ## READ THIS BEFORE DEPLOYING THE BINARY
 
-**Every keystore on the live fleet today is `BPOSKEY1` (plaintext), and the new
-binary refuses to load one unless told to.** The loader returns
+**A `BPOSKEY1` plaintext keystore requires an explicit plaintext opt-in.**
+Inspect each host before rollout; this historical note is not an inventory of
+currently deployed keystore formats. The loader returns
 `PermissionDenied` and the engine stops the boot. A fleet-wide restart onto
 this binary with no other change is a **fleet-wide halt**, not a degraded
 mode.
@@ -30,9 +31,10 @@ Pick one *before* the rollout, not during it:
   binary rollout from the key handling, not as the end state.
 
 - **Option B — re-seal (closes the finding).** Per host, with the node stopped:
-  back the keystore up offline, re-seal it, restart with the passphrase wired
-  into the unit. Sealing an existing key needs a re-seal tool this repo does
-  **not** ship — see "Not covered" below.
+  back the keystore up offline, run `bloch-pos keys seal --dir <data-dir>`
+  as the owning service account, and restart with the passphrase wired into
+  the unit. The command preserves the identity and refuses already-sealed
+  keys; it does not rotate an existing sealed passphrase.
 
 Never do both halves at once on more than one validator: a host that cannot
 open its key does not attest, and enough of them at once moves finality.
@@ -105,10 +107,14 @@ drives the real executable and needs no fleet and no clock.
 
 ## Not covered by this change
 
-- **No re-seal tool.** Sealing an existing plaintext keystore in place needs a
-  command this repo does not have (`keygen` only seals keys it just generated).
-  Until it exists, Option B has no supported procedure and Option A is the only
-  one an operator can actually execute.
+- **Explicit sealing is supported.** `bloch-pos keys inspect` and
+  `bloch-pos keys seal` inspect and seal an existing plaintext keystore.
+  Use the CLI help for the data-directory and passphrase-file arguments;
+  the node must be stopped so the command can acquire the directory lock.
+  Preserve a secure backup and verify the resulting public identity before
+  restarting. `keygen` refuses to replace an existing validator identity.
+  Newly sealed files require at least 12 passphrase characters; existing
+  sealed files remain readable under their original passphrase.
 - **No migration on load.** A loader that re-wrote the file it just read would
   be writing into a directory that may be shared, replicated, or mid-backup.
   Re-sealing is an operator action on an operator's schedule.
@@ -116,3 +122,79 @@ drives the real executable and needs no fleet and no clock.
   secret, the derived key and the passphrase are `Zeroizing` and the RANDAO
   seed is wiped in `Drop`, which bounds the window in core dumps and freed
   pages. It is not a defence against reading a running node's address space.
+
+
+## Single-use pipe credentials for an offline ceremony (KS-14)
+
+`keygen`, `keygen-public` and `run` also accept
+`BLOCH_KEYSTORE_PASSPHRASE_FD=<descriptor-number>` on Unix. The environment
+contains only this public descriptor number. The passphrase arrives as raw
+UTF-8 bytes through an inherited pipe, with EOF as the terminator; no trailing
+newline is removed. The consumer accepts at most 4096 bytes, requires completion
+within three seconds, and closes the descriptor on success or read failure.
+Standard input (descriptor 0) or a dedicated descriptor >= 3 is accepted;
+stdout/stderr, regular files and terminals are refused. Do not combine this
+source with `BLOCH_KEYSTORE_PASSPHRASE` or its `_FILE` alternative.
+
+`deploy/genesis4-key-ceremony.sh` uses a fresh anonymous pipe for each child.
+It clears inherited credential variables, disables shell tracing before reading
+the passphrase, keeps it in an unexported Bash variable, and uses the builtin
+`printf` so the secret never enters an external process argument list. The
+script unsets the variable after the public exports and on exit; Bash cannot
+promise that previous heap allocations, swap or crash dumps are zeroized.
+This reduces environment/argv exposure, not the need for an isolated trusted
+ceremony machine. Public-key export failure now stops the ceremony rather than
+producing a success report containing placeholder identities.
+
+This input path does not change `BPOSKEY1`/`BPOSKEY2`, KDF parameters, key
+identities or the existing file/environment compatibility paths. `keys seal`
+continues to use its explicit passphrase-file or terminal interface. No live
+ceremony or validator migration is implied by these source changes.
+
+
+### Default KDF resource limits (updated 2026-09-18)
+
+Opening a sealed file applies two default limits before invoking Argon2: at
+most 65,536 KiB (64 MiB) for one allocation, and at most 196,608 KiB-passes
+of combined `memory_KiB × passes` work. Production is exactly 65,536 KiB × 3
+passes. These are resource bounds, not a wall-clock recovery guarantee;
+the existing absolute memory, iteration and lane caps also remain in force.
+
+Ordinary opening accepts only that exact production tuple, so an
+unauthenticated header cannot select even a cheaper non-production cost. For
+an independently verified authentic historical file sealed with any different
+parameters, first run `bloch-pos keys inspect` without opening the file and
+independently confirm the artifact. Recovery then requires both
+`BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1` and the exact public header tuple in
+`BLOCH_KEYSTORE_EXPECT_KDF=<memory_kib,passes,lanes>`. Any missing, malformed
+or different tuple is refused before Argon2. A matching tuple restores the
+original finite decoding limits (1 GiB memory, 64 passes, 16 lanes); it does
+not authorize more expensive new seals, weaken AEAD authentication or change
+the file format. Remove both variables after recovery. An authenticated weak
+historical file remains recoverable under its exact reviewed tuple and emits
+the existing migration warning.
+
+### Interactive terminal interruptions
+
+The native `keys seal` prompt runs only in the synchronous CLI startup path,
+before any threads are created. While echo is disabled it temporarily blocks
+INT, TERM, HUP, QUIT and job-control stop signals on that thread, checks pending
+signals between readiness waits with a 100 ms timeout, and restores terminal
+attributes before restoring the caller's signal mask. It does not replace signal
+dispositions: ignored signals remain ignored, previously blocked signals remain
+blocked, and default termination still terminates with the original signal.
+A stop request restores the terminal before suspension; after continuation the
+partial entry is refused and the operator must rerun the command.
+
+This helper must not be moved into the multithreaded node runtime: another thread
+could receive a process-directed signal before terminal restoration. SIGKILL and
+SIGSTOP cannot be deferred and remain outside this guarantee. The private tty
+handle, bounded preallocated zeroizing buffers, and checked normal restoration
+remain in use. No interactive input is read through the shared stdin buffer.
+The regression `native_passphrase_tty` exercises the real CLI with disposable
+PTYs, deliberate confirmation mismatch, termination at both prompts, stop/resume,
+and inherited blocked/ignored signal behavior; it creates no keystore.
+
+Zeroizing buffers are wiped during normal Rust cleanup. Fatal asynchronous
+termination is not a guarantee that every secret allocation has been wiped;
+terminal restoration and process-memory zeroization are separate properties.

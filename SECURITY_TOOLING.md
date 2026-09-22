@@ -1,3 +1,13 @@
+> **Candidate schedule update — 2026-09-13.** The operator selected Monday,
+> 2026-09-14: leak recovery at epoch 2880 (21:31:19 UTC), followed by
+> lifecycle epoch 2884 (22:35:19 UTC). Earlier statements below about an
+> unarmed slashing gate or unreachable penalties describe the historical
+> pre-release configuration. Evidence is refused before epoch 2884; at and
+> after it, valid evidence can apply the configured penalties. This candidate
+> schedule does not establish fleet deployment, cross-node agreement or a
+> settlement guarantee. See `docs/VALIDATOR-OPENING.md` and the September 13
+> activation preflight for the release conditions and retained evidence.
+
 # Security Tooling — Bloch Protocol
 
 > **Genesis-3-era document — sealed 2026-08-12, scope table corrected
@@ -91,7 +101,14 @@ No Solidity is deployed yet (the L2 is a Rust revm scaffold). The Solidity toolc
 
 > **Scanner posture, corrected 2026-09-04 (finding I-H4).** Until this date the two scanners that back that claim on the GHSA side could not make it. `osv-scanner` and `secret-scan` were `allow_failure: true` in `.gitlab-ci.yml` / `continue-on-error: true` in `.github/workflows/security.yml`, **and** each opened with `if ! command -v <tool>; then echo skipping; exit 0; fi` — so on a runner without the tool the job went green having scanned nothing, and the log line that said so was informational prose, not a warning. osv-scanner is the only tool here that reads the OSV.dev DB, so the GHSA-only residuals below — yamux included — had no gate at all. Both jobs are now BLOCKING, install a pinned binary via `scripts/ci-install-scanner.sh` (which exits non-zero rather than skipping), and the residuals are explicit and expiring in `osv-scanner.toml`. `scripts/check-scanners-blocking.py` (with a selftest that proves it can still fail) holds both pipelines to that posture.
 
-1. **Unmaintained-notice** (no runtime vuln): the vendored `pqcrypto-*` PQ crates (PQClean archived — frozen under Cargo.lock by design), and SP1/zk host-side toolchain crates (backoff, ansi_term, instant, derivative, lru, …) that never touch the consensus/P2P runtime. Since 2026-09-16 (LD-02) the SP1 set is carried by `.cargo/audit.toml` only — it governs the `coherence-prover/{script,service}` lockfiles, where those crates resolve — and `deny.toml` names only advisories present in the root workspace's resolved graph (`cargo deny check advisories` must show zero `advisory-not-detected` warnings).
+Secret scanning now has separate blocking tracked-tree and full-depth reachable-
+history jobs on both CI providers. Exact redacted baselines contain individually
+reviewed noncredentials; a finding reintroduced in a new commit remains new.
+See [current scope and triage](docs/audit/internal-remediation-2026-09-17/HISTORY-SCAN.md).
+This does not certify unreachable history, credential rotation or hosted job execution.
+
+
+1. **Unmaintained-notice** (no runtime vuln): the vendored `pqcrypto-*` PQ crates (PQClean archived — frozen under Cargo.lock by design), and SP1/zk host-side toolchain crates (backoff, ansi_term, instant, derivative, lru, …) that never touch the consensus/P2P runtime. Since 2026-09-16 (LD-02) the SP1 set is carried by `.cargo/audit.toml` only, which governs the `coherence-prover/{script,service}` lockfiles where those crates resolve, and `deny.toml` names only advisories present in the root workspace's resolved graph (`cargo deny check advisories` must show zero `advisory-not-detected` warnings).
 
 2. **⚠️ OPEN real vulnerabilities — tracked, not dismissed:**
    - **RUSTSEC-2026-0118** — hickory-proto NSEC3 closest-encloser proof: **unbounded loop (DoS)**.

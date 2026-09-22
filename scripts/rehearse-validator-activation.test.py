@@ -32,10 +32,10 @@ class RewriteTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             activation.rewrite_params(SOURCE + "\npub const EXTRA_ACTIVATION_EPOCH: u64 = 3;\n", 4)
 
-    def test_armed_lifecycle_source_fails(self):
+    def test_unexpected_lifecycle_schedule_fails(self):
         with self.assertRaises(ValueError):
             activation.rewrite_params(SOURCE.replace(
-                "pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = u64::MAX;",
+                "pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = 2_884;",
                 "pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = 20;"), 4)
 
     def test_invalid_boundary_fails(self):

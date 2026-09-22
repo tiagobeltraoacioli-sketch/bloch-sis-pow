@@ -1,0 +1,84 @@
+Seventh-wave local validation — 2026-09-17
+Base776804e; Rust1.94.1/macOS x86_64; two Cargo build jobs, four test threads.
+No deployment, Linux/GPU build, real SP1 proof or production recovery SLA.
+Root lock adds only serde_json to bloch-indexer dependencies; package versions unchanged.
+Local socket tests require authorized sandbox escalation. The first indexer socket run was denied by the sandbox; rerun passed.
+The first mirror regression accidentally used its rename helper rather than same-inode overwrite; corrected fixture passed.
+The initial new source-baseline helper used Python3.11 file_digest; replaced with bounded streaming SHA256 for host Python3.9, then all actual-tool regressions passed.
+SP1 SDK build required network dependency downloads and a target directory literally named target; source/dependency code was not patched to bypass these requirements.
+
+cargo test --locked --offline -p bloch-pos-node; 466 unit +108 integration =574 passed;25 ignored; actual native terminal harness11 cases included
+/private/tmp/bloch-wave7-node-full-final.log
+SHA256 753e5bdc10bbc48e42477bb22f7b25696f5143bc157707c3e0f177c7a1483910
+
+bash scripts/hardened-clippy.sh; all five gates passed; no baseline increased
+/private/tmp/bloch-wave7-hardened-final.log
+SHA256 4f6c35e02c3319deec0db76de8987074d7e70d426a01a022b17b1957a19464cf
+
+cargo test --locked --offline -p bloch-indexer;18 index +2 socket +2 RPC tests passed;0 ignored
+/private/tmp/bloch-wave7-indexer-full-final.log
+SHA256 04921b787e143b416f3a4a58a3ade2c87e91936adb6233fab32bfa9142d5172d
+
+cargo test --locked --offline -p bloch-crypto --features node,wallet-cli;190 unit+1 integration passed;2 unit+3 doc ignored
+/private/tmp/bloch-wave7-crypto-full-final.log
+SHA256 add29e57dc85e0f80e3cf2bca9c03f2db2724dbbdb9a4d88dae287c51b42ccc2
+
+cargo test --locked --offline -p bloch-pq-vault;31 passed
+/private/tmp/audit-vault-sequence-wave7.log
+SHA256 6a49024e1d0f246191a24a10bc6f56a1ee522fe3c2ab0aa8b47d0a27ec21ef40
+
+cargo test --locked --offline --manifest-path crates/coherence-prover/service/Cargo.toml;11 passed against actual SDK; isolated /private/tmp/bloch-prover-service/target; no real ELF/proof execution
+/private/tmp/audit-prover-service-wave7-final.log
+SHA256 12d4aa6a9e089365bca0fcdc29f60363d32b7ff0f5f50c311a0139d28506dc5d
+
+legacy bloch-cli exact-decimal/input regressions;2 passed; standalone binary compiled
+/private/tmp/audit-legacy-exact-decimal-wave7.log
+SHA256 94e607a71e535522502b396b37c462f421c4b2f98337271f469d037a444493ad
+
+Actual CLI native passphrase PTY direct harness;11 cases passed
+/private/tmp/bloch-wave7-native-tty-final-direct.log
+SHA256 5a82b5619baf2c3b1bcd3043d40564c77b2226a61d7a52884426429ca803e320
+
+Committee real desynchronized-finality regression;1 passed
+/private/tmp/bloch-wave7-finality-order.log
+SHA256 ea1d7e169b0ba9d8978316f8894631001f6fe87eb7d0a980bff350ee94be2492
+
+Libp2p whole transport suite;28 passed
+/private/tmp/bloch-wave8-p2p-full-final.log
+SHA256 d8875981d5ede2220f514cdac3c69a0523f9a9615c255d8dd97259d4f7600226
+
+Real hybrid transfer/funded negative-cache regressions;2 passed including actual epoch2884
+/private/tmp/bloch-wave8-admission-negative-cache-final.log
+SHA256 6712b4c6ddefa1429bcceb1cbf63fce6c4ee5114b1adb0e7ae9961c3b4ebf111
+
+Root scanner-posture guard plus selftest;11 selftest cases;6 jobs blocking in each CI definition
+/private/tmp/bloch-wave7-scanner-guard-final.log
+SHA256 f9818eb98a53073a7b919e1bba57e932b9366ba4673b0259e64b9b2576c96952
+
+Root release-integrity selftest;14 checks passed
+/private/tmp/bloch-wave7-release-guard-final.log
+SHA256 4ccf5dd6dafa59710b39783b006fcf187c377bbad885d47e83fd1627eff77201
+
+Actual pinned Gitleaks wrapper regressions;7 groups passed including changed bytes at reviewed source location
+/private/tmp/bloch-wave7-secret-regressions-final.log
+SHA256 66909767380f8563decb3539b57320ab6b6646dfa5081f9788cdf8e020f7b251
+
+Actual pinned Gitleaks tracked-source scan with file-bound reviewed exceptions;passed
+/private/tmp/bloch-wave7-tree-final.log
+SHA256 d81f5c58bb2b315a833231e3d3d6c58899fa9e62a3c070de3d4b1b0cd8b9594a
+
+Actual pinned Gitleaks reachable-history scan;1109 commits, passed against149 reviewed public-identifier findings
+/private/tmp/bloch-wave7-history-final.log
+SHA256 13c9ff1b09d2a6fdd089d34532e48a8451944587f16e61607d582a78d2d4c4b8
+
+Failing-before-fix same-location source exception replacement; reproduced false negative
+/private/tmp/bloch-wave7-secret-baseline-replacement-repro.log
+SHA256 bb0ade87674eb9b9136803903bbd1d6e16d49c8e01b638f6dfbeb639a5935da1
+
+Failing-before-fix stale same-size slot-index crash residue; reproduced missing blocks
+/private/tmp/bloch-wave7-index-repro.log
+SHA256 ad5b3a7dfe0db9510ca0863710383f0c86fbd5d0fbd1838d798f0bc8446fa39d
+
+Failing-before-fix missing index append followed by successful later append; reproduced skipped block
+/private/tmp/bloch-wave7-index-gap-repro.log
+SHA256 d758b81b127b4bce0d1945b04a2842f3cdda842945c1be917353f3e1bdfcebce

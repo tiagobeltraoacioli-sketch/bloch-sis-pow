@@ -1,69 +1,64 @@
 # pqcrypto-internals — GroundState fork
 
-This is a **drop-in replacement** for the upstream
-[`pqcrypto-internals`](https://github.com/rustpq/pqcrypto) crate
-(version 0.2.11), with **one single change**: the
-`PQCRYPTO_RUST_randombytes` function checks a thread-local seeded RNG
-before falling back to OS entropy.
+Local fork based on `pqcrypto-internals` 0.2.11 (rustpq/pqcrypto), used through
+the workspace path patch. It preserves the C randombytes entry point while
+supporting deterministic wallet key generation from an existing ChaCha20 byte
+stream. This wrapper is not a claim of direct FIPS 204 seed-to-key equivalence:
+the supplied wallet seed first keys ChaCha, which supplies PQClean's entropy.
 
-This enables deterministic keypair generation from a 32-byte seed,
-which is required for BIP39-style wallet recovery in
-[GroundState](https://github.com/Groundstate100/groundstate) (see
-audit finding C-2).
+## Local modifications and provenance (CR-09)
 
-## Why
+The fork is **not** limited to `src/lib.rs`. This checkout contains:
 
-FIPS 204 Algorithm 6 (ML-DSA KeyGen_internal) is inherently
-deterministic from a 32-byte seed. The PQClean C implementation
-correctly implements this, but reads the seed from `randombytes()`
-without exposing a seeded entry point. Rather than forking PQClean's
-C code, we override the Rust shim that provides randomness to the
-C layer.
+- Rust randombytes overrides, scoped/legacy guards, failure handling and tests.
+- Cargo metadata/dependency changes for the RNG and vendored-file tests.
+- Build-script handling that excludes freestanding OpenBSD libc headers on
+  WASI, where the sysroot supplies libc. Native builds retain their own paths.
+- Local provenance documentation and a vendored-source hash manifest/test.
 
-## What changes
+`VENDOR.toml` pins only the files under `cfiles/` and `include/`. Its test checks
+file contents and the file set against this repository's recorded baseline.
+It does not prove equivalence to an authenticated upstream release, cover
+`build.rs` or `Cargo.toml`, or establish algorithm conformance. No external
+upstream comparison or new cryptographic known-answer certification is claimed
+by the CR-09 correction. See `NOTICE` for attribution and licensing basis.
 
-Only `src/lib.rs`. The C files (`cfiles/`), the build system
-(`build.rs`), and all other artifacts are **identical to upstream
-0.2.11**.
+## Scoped deterministic generation (CR-08)
 
-Two new dependencies:
-- `rand_chacha = "0.9"` (no-std) — for the ChaCha20-based CSPRNG
-- `rand_core = "0.9"` (no-std) — trait interface
-
-## How to use
-
-```rust
-use pqcrypto_internals::with_seeded_rng;
-use pqcrypto_mldsa::mldsa65;
-
-let seed: [u8; 32] = derive_from_bip39(&phrase);
-let (pk, sk) = {
-    let _guard = with_seeded_rng(&seed);
-    mldsa65::keypair()
-};
-// pk, sk are deterministic in `seed`.
+```rust,ignore
+let (pk, sk) = pqcrypto_internals::with_seeded_rng_scope(&seed, || {
+    pqcrypto_mldsa::mldsa65::keypair()
+});
 ```
 
-The guard is RAII — when it drops, the thread-local is cleared and
-all subsequent `randombytes()` calls revert to OS entropy. Upstream
-behavior is preserved byte-for-byte when no guard is active.
+The closure API owns its cleanup guard. Normal return and Rust unwinding remove
+its override and any nested legacy overrides, even if a nested guard is
+forgotten or returned. An outer stream resumes at its prior position. Scope
+cleanup identifies its entry rather than assuming stack length is unchanged.
+The scope is synchronous: it does not cover later polling of a returned future.
+Other threads are unaffected; no active override means OS entropy is used.
 
-## Consumed by
+The manual guard is now a private implementation detail. The scoped API is the
+only public deterministic-entropy entry point, so downstream callers cannot
+forget a guard and leave the thread seeded. This is an intentional breaking
+change for any external consumer of this internal fork; every workspace caller
+was inventoried and migrated. Do not put signing operations under deterministic
+key-generation scopes.
 
-Via `[patch.crates-io]` in
-[`Groundstate100/groundstate`](https://github.com/Groundstate100/groundstate):
+CR-08 remains **partial**: `rand_chacha` 0.9 exposes no guaranteed zeroization
+of its opaque RNG state. Removing an entry drops it but does not promise to
+wipe its internal key, buffered output or compiler copies. This patch does not
+use layout-dependent unsafe wiping or replace the derivation stream. Aborts
+and forced termination do not execute scope destructors.
 
-```toml
-[patch.crates-io]
-pqcrypto-internals = { git = "https://github.com/Groundstate100/pqcrypto-fork", branch = "main" }
-```
+## Validation
 
-## Upstream reconciliation
-
-An issue is open at rustpq/pqcrypto proposing a
-`keypair_from_seed()` API natively in `pqcrypto-mldsa`. If accepted,
-this fork is retired.
+Regressions cover scope return/unwinding, forgotten nested guards, returned
+guards, outer-stream resumption, out-of-order removal and TLS destruction.
+Existing first-party wallet derivation golden tests remain the compatibility
+check for the unchanged byte stream; the vendor pin test is a separate source
+integrity check.
 
 ## License
 
-MIT OR Apache-2.0 (same as upstream).
+MIT OR Apache-2.0, as declared in the crate manifest.

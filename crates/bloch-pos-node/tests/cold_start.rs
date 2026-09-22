@@ -31,10 +31,10 @@
 //!    nodes stop at a wall-clock slot and the last block can legitimately land
 //!    on one node and not another, so a final-root comparison would be a race,
 //!    not a proof.
-//! 3. The two block logs agree byte-for-byte over their common prefix. The
-//!    transition is deterministic (pinned by the pure crate), so identical
-//!    inputs in identical order are identical state — this is the same claim as
-//!    (2) made over the persisted artifact.
+//! 3. Both persisted block logs decode completely after shutdown. Combined
+//!    with (2), this proves the cold node persisted a valid independently
+//!    rebuilt chain without imposing byte identity on files produced through
+//!    different append/reorg histories.
 //!
 //! It is a wall-clock test with real sockets and real post-quantum signatures,
 //! so it takes roughly a minute and is deliberately tolerant about *how much*
@@ -82,9 +82,8 @@ fn tmp_root() -> PathBuf {
 }
 
 /// This test is about SYNC, and it is timing-sensitive: three debug-build
-/// nodes have to come up inside a six-second window or they join out of step,
-/// reorg, and trip the byte-identity assertion at the bottom of this file.
-/// (Measured on `main`, before any of this: 1 failure in 5 runs.)
+/// nodes have to come up inside a six-second window so the cold node still has
+/// enough pre-join history and post-join slots to demonstrate catch-up.
 ///
 /// So it runs on plaintext keystores, by the explicit opt-in the node now
 /// requires (audit I-H1) — sealing them would add Argon2id at 64 MiB to every
@@ -246,19 +245,20 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
         ));
     }
 
-    // The cold node joins late. Its data dir holds `validator.key` and nothing
-    // else — no block log, no meta marker, no state. That is the whole point:
+    // The cold node joins late. Key generation leaves its own validator.key
+    // and an advisory LOCK file — no block log, no meta marker, no state. That is the whole point:
     // it is not handed a database, it is handed a genesis manifest and a set of
     // peers, exactly like an exchange standing up a node today.
     std::thread::sleep(Duration::from_secs(COLD_START_DELAY_SECS));
     let cold_dir = root.join("d2");
-    let cold_files: Vec<String> = std::fs::read_dir(&cold_dir)
+    let mut cold_files: Vec<String> = std::fs::read_dir(&cold_dir)
         .expect("read cold dir")
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
         .collect();
+    cold_files.sort();
     assert_eq!(
         cold_files,
-        vec!["validator.key".to_string()],
+        vec!["LOCK".to_string(), "validator.key".to_string()],
         "the cold node's data dir must contain only its own keystore, not a donated database"
     );
     fleet.0.push(spawn_node(
@@ -341,65 +341,23 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
         );
     }
 
-    // 3. The persisted inputs agree over their common prefix. The transition is
-    //    deterministic, so this is the same claim as (2) about the artifact on
-    //    disk rather than about a log line.
-    let a = std::fs::read(root.join("d0/blocks.log")).expect("founder block log");
-    let b = std::fs::read(cold_dir.join("blocks.log")).expect("cold block log");
-    let n = a.len().min(b.len());
-    assert!(n > 0, "one of the block logs is empty");
-    //
-    // NOTE ON WHAT THIS DOES AND DOES NOT PROVE. This is a BYTE comparison of
-    // two files, which is strictly stronger than "the two nodes agree on the
-    // chain" — and the gap between the two is real, not hypothetical.
-    //
-    // MEASURED, 2026-08-23, 1 failure in 10 runs on this branch:
-    //     founder log 34145 B, cold log 34146 B, first diff at byte 29241
-    //     common slots [11, 36, 40]
-    //     all common slots agree on (block id, head root)? TRUE
-    //
-    // That is two nodes on the SAME chain, agreeing on every block they
-    // share, whose logs still differ by one byte. They can: the founder has
-    // produced since slot 0 and REWRITES its log whole on every reorg
-    // (`Store::rewrite`), while the cold node appends as it syncs. Same
-    // chain, different write history, so byte-identity is not implied. The
-    // comment above claiming determinism makes this "the same claim as (2)"
-    // is wrong — determinism gives the same STATE for the same blocks, not
-    // the same BYTES in a file two nodes wrote by different routes.
-    //
-    // Left as an assertion rather than weakened, because it does catch a real
-    // divergence too and this test cannot decode the log (bloch-pos-node is a
-    // binary crate, so `Store::read_all` is not reachable from `tests/`).
-    // What IS fixed here is the message: on failure it now prints whether the
-    // nodes actually disagreed, so the next person to see this knows in one
-    // line whether they are looking at a consensus bug or at log framing.
-    let byte_identical = a[..n] == b[..n];
-    if !byte_identical {
-        let off = (0..n).find(|i| a[*i] != b[*i]).unwrap_or(n);
-        let agree = common.iter().all(|s| cold[s] == founder[s]);
-        eprintln!(
-            "block logs differ: founder {} B, cold {} B, first differing byte {off}",
-            a.len(),
-            b.len()
-        );
-        eprintln!("  common slots: {common:?}");
-        eprintln!("  do the nodes agree on (block id, head root) at every common slot? {agree}");
-        eprintln!(
-            "  {}",
-            if agree {
-                "THEY AGREE — this is a log-framing difference, NOT a consensus divergence. \
-                 See the note above this assertion."
-            } else {
-                "THEY DISAGREE — this IS a consensus divergence. Investigate."
-            }
+    // 3. Both persisted artifacts must be complete, non-empty sequences of
+    // decodable block envelopes. Raw byte-prefix equality is not a consensus
+    // property: a founder may rewrite its canonical log during a reorg while
+    // the cold node appends the same eventual chain during sync. The semantic
+    // block-id/state-root equality above is the divergence check; this command
+    // checks the on-disk framing and codec without repairing either file.
+    for dir in [&root.join("d0"), &cold_dir] {
+        let inspection = run_to_completion(&[
+            "block-log-inspect",
+            "--data-dir",
+            dir.to_str().expect("UTF-8 test directory"),
+        ]);
+        assert!(
+            !inspection.contains("decoded_frames=0"),
+            "persisted block log is empty: {inspection}"
         );
     }
-    assert!(
-        byte_identical,
-        "the founder's and the cold node's block logs are not byte-identical over their \
-         common prefix; see the printed diagnostic above for whether the two nodes actually \
-         disagreed about the chain"
-    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

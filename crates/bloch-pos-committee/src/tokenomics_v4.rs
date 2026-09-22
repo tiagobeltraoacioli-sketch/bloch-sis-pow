@@ -123,11 +123,12 @@ pub const FOUNDATION_HELD_BLOCH: u128 =
 /// Of those four, what is spendable at slot 0: all of liquidity plus the 25%
 /// marketing tranche. VC and team are entirely cliffed.
 ///
-/// This equals **25.0% of circulating supply at genesis** — exactly the G2
-/// threshold, and unchanged by the split (a redenomination moves no ratio).
+/// This is **24.8484% of the policy-scheduled liquid supply at genesis**:
+/// 6,000,000,000 / (18,146,400,000 carryover + 6,000,000,000 Foundation).
+/// It used to be described as exactly 25% using a superseded carryover total.
 /// Worth keeping as a constant rather than a paragraph: two holders account
-/// for the whole genesis float, and neither can change that by behaving
-/// differently. Only emission and independent stake dilute them.
+/// for almost the whole scheduled genesis float. (The allocation schedules
+/// are policy, not spend locks; see the tokenomics spec §8.2.)
 pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
     LIQUIDITY_BLOCH + MARKETING_BLOCH * MARKETING_TGE_NUMERATOR / MARKETING_TGE_DENOMINATOR;
 
@@ -663,9 +664,10 @@ pub const fn validator_reward_halving_sat(slot: u64) -> u128 {
 /// both live constraints at once, and the split changes neither (both are
 /// ratios of the same supply):
 ///
-/// - **Inflation target.** Year 1 emits 4,367,467,018.77 BLCH = **4.36% of
-///   total supply** (`annual_inflation_bps(0)` = 436), against the founder's
-///   "under 7%" requirement. Year 5 is 2.86%, year 10 is 1.69%. Identical in
+/// - **Inflation target.** Year 1 emits 4,349,651,692.52191762 BLCH = **4.35%
+///   of total supply** (`annual_inflation_bps(0)` = 434 after integer
+///   truncation), against the founder's "under 7%" requirement. Year 5 is
+///   285 bps, year 10 is 168 bps. Identical in
 ///   basis points to the 21 B schedule this splits from — pinned by test.
 /// - **Decentralisation.** An 8%/year decline is too flat: validators stop
 ///   out-earning the insider unlock schedule and the 25%-of-stake gate is

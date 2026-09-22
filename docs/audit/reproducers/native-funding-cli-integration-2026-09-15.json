@@ -1,0 +1,10 @@
+{
+  "utc": "2026-09-15T03:46:52.893160+00:00",
+  "status": "passed",
+  "tests_executed": 1,
+  "binary_sha256": "acfdf3d4f601086468dfeedb237e593d1a23090e54aeef57728e3783ab54cf53",
+  "binary_source_commit": "0a9552f",
+  "test_source_sha256": "08d24a58639388c67c784441577670063c40a8a4afebc2306717f9003797e000",
+  "log_sha256": "ecc6909ba151c510724fa204bfe6a39d7ddeeb42e0b3391bbc442f7e550fe115",
+  "scope": "Separate CLI processes with disposable encrypted legacy wallet. No production funds, wallet or network used."
+}

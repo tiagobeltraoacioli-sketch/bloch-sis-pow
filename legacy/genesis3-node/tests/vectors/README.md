@@ -15,7 +15,7 @@ Unaudited software. The coin has no value. Nothing here is "secure", "audited",
 |---|---|---|
 | source of the "answer" | this repo's own implementation | an external authority (NIST FIPS-204 `.rsp`, Falcon-1024 NIST KATs) |
 | what a match proves | the bytes did not change vs the last blessing | the implementation agrees with the standard |
-| RNG for deterministic keygen | ChaCha20 via the `pqcrypto-internals` fork's `with_seeded_rng` | AES-256-CTR NIST DRBG |
+| RNG for deterministic keygen | ChaCha20 via the `pqcrypto-internals` fork's `with_seeded_rng_scope` | AES-256-CTR NIST DRBG |
 | status here | present | **absent** — the official `.rsp` files are not vendored, and a NIST DRBG is not wired (see `crates/bloch-crypto/src/crypto/mod.rs` §"KAT SOURCE / HONESTY") |
 
 Because Bloch's seeded keygen uses a ChaCha20 stream and NIST reproduces keypairs

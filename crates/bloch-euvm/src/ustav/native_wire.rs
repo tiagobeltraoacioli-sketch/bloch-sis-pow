@@ -146,7 +146,11 @@ impl<'a> Reader<'a> {
                 value: Some(bytes[32..40].to_vec()),
                 siblings: bytes[40..]
                     .chunks_exact(32)
-                    .map(|b| b.try_into().expect("fixed chunk width"))
+                    .map(|b| {
+                        let mut sibling = [0u8; 32];
+                        sibling.copy_from_slice(b);
+                        sibling
+                    })
                     .collect(),
             });
         }

@@ -1,0 +1,4 @@
+# The root workspace now builds Genesis-4. Legacy Genesis-3 is separate.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]

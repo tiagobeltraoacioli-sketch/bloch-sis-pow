@@ -117,7 +117,7 @@ available to you **today**.
 | Custody model | Non-custodial by construction: the node holds no spending key anywhere in its process, generates no address, and signs nothing on a user's behalf. All signing is client-side. | VERIFIED-IN-CODE | `crates/bloch-pos-node/src/main.rs:202-203` ("never holds a spending key"); `rpc.rs:1068-1069` (`getnewaddress` refusal doc) |
 | Transports | `devnet` (default), `libp2p`, `dual` — selected by `--transport`; default is `devnet` with a loopback P2P listen address | VERIFIED-IN-CODE | `main.rs:1119` (`None \| Some("devnet") => Transport::Devnet`), `main.rs:1044` (`DEFAULT_P2P_LISTEN = "/ip4/127.0.0.1/tcp/16400"`) |
 | RPC default bind/port | **`127.0.0.1:16310`** (`--rpc-bind` default `127.0.0.1`, `--rpc-port` default `16310` = `DEFAULT_RPC_PORT`). **Not `8080`** — see §10.1 and Appendix A. | VERIFIED-IN-CODE | `main.rs:81` (`DEFAULT_RPC_PORT: u16 = 16310`), `main.rs:1338-1339,1390` |
-| Metrics/health | `--metrics-bind 127.0.0.1` default, `--metrics-port` **off unless explicitly set** — no default listener | VERIFIED-IN-CODE | `main.rs:1355-1365,1395` |
+| Metrics/health | `--metrics-bind 127.0.0.1` default, `--metrics-port` **off unless explicitly set** — no default listener. An enabled non-loopback bind also requires `--allow-public-metrics`, which acknowledges exposure but adds no authentication. | VERIFIED-IN-CODE | `main.rs` (`metrics_bind_plan`, run configuration) |
 | L2 status | **No EVM-compatible L2 exists in this repository, and none runs code driven by it.** "Chain id 8400" is a reference to a separate, already-being-replaced external service the founder has framed as being retired, not extended; the successor "EVM at L1" plan is an explicit `Status: DRAFT` document with **no code for either track**. Do not present chain id 8400 as a current, operating feature. | VERIFIED-IN-CODE (absence) | `docs/FLEET-BRIEF-2026-08-11.md:51`; `docs/specs/BLOCH-L1-EXECUTION-PLAN.md:7` (`DRAFT — milestone plan for review; no code exists for either track`) |
 | Testnet | **No Genesis-4 testnet exists in this repository or is referenced by the PoS node/consensus crates at all** (zero occurrences of "testnet" in `bloch-pos-node`/`bloch-pos-committee`). The `bloch1t` "testnet" address prefix belongs only to the legacy Genesis-3 address module (`bloch-crypto::address`), which `bloch-pos-node` never imports. If you are told a Genesis-4 testnet exists, that is an infrastructure claim this repository does not support and cannot verify — treat as OPERATOR-ASSERTED and confirm independently. | VERIFIED-IN-CODE (absence) / OPERATOR-ASSERTED (any claimed live testnet) | `bloch-crypto/src/address.rs` (prefix table); `bloch-pos-node`/`bloch-pos-committee` grep, zero hits |
 | Weak-subjectivity status | **A fresh third-party node cannot join today** — see the boxed warning above and §2.6/§13.4. | VERIFIED-IN-CODE | `crates/bloch-pos-node/src/ws_boot.rs`, `crates/bloch-pos-committee/src/ws.rs` |
@@ -321,7 +321,8 @@ signed it could not all have withdrawn yet.
   recent checkpoint obtained OUT OF BAND is the only sound way in."* The
   message then names the recovery path: fetch a signed checkpoint envelope
   from a trusted channel, compare its digest across at least two independent
-  channels, and restart with `--ws-checkpoint <file> --ws-signer-set <file>`.
+  channels, obtain the signer-set fingerprint independently, and restart with
+  `--ws-checkpoint <file> --ws-signer-set <file> --ws-signer-set-sha3 <hex32>`.
 - **No such checkpoint exists in this repository.** `genesis/` contains only
   `mainnet.manifest` and `README.md` — no `ws_latest.bin`, no checkpoint
   envelope, no signer-set file. The signing ceremony that would produce one
@@ -531,10 +532,13 @@ because of it.
 ### 3.2 `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH` — the one gate that needs wallet coordination
 
 Currently `u64::MAX` (inert). Once armed, a signature is checked against
-`SHA3-256(DS_SPEND2 ‖ network_binding() ‖ spend_signing_root())` instead of
-`spend_signing_root()` alone (`network_binding()` a fixed 32-byte label,
-`b"BLCH4:GENESIS-4:MAINNET"`) — `spend_signing_root()` itself, and therefore
-every `txid`, is untouched. The code states the consequence for wallets
+`SHA3-256(DS_SPEND2 ‖ admission_network_domain ‖ spend_signing_root())` instead
+of `spend_signing_root()` alone. `admission_network_domain` is the canonical
+genesis-manifest digest committed in state; an activation-epoch state without
+it fails closed. The older `network_binding()` source label remains only as a
+compatibility API for pre-activation tooling and is not the consensus check.
+`spend_signing_root()` itself, and therefore every `txid`, is untouched. The
+code states the consequence for wallets
 explicitly: **"arming with no wallet-side change simply makes every existing
 signature invalid (fail-closed, not fail-open)"** — every outstanding
 signed-but-unconfirmed transaction becomes permanently `BadSignature` the
@@ -559,7 +563,7 @@ consensus path.
 | Enveloped hybrid sizes | Pubkey 4+1952+1793 = **3,749 B**; secret key 4+4032+2305 = **6,341 B**; signature (max) 4+3309+1462 = **4,775 B** | `transition.rs:207` (`WitnessKey` doc, "3,749 B key" / "4,775 B proofs") |
 | "Measured" gas-pricing signature size | **`HYBRID_SIG_BYTES = 4,589` bytes** — a *measured* figure (3,309 + a Falcon component priced at 1,280, not the 1,462 theoretical ceiling), used only to budget mempool declared-size slack, not a hard maximum. | `bloch-pos-committee/src/fee_market.rs:135-137` |
 | Hashing | SHA3-256 / SHAKE-256, domain-separated | throughout `bloch-crypto`, `bloch-pos-committee` |
-| Domain separation tags (16 bytes each, exact) | `DS_BLOCK = b"BLCH4:BLOCK\0\0\0\0\0"` (`params.rs:1820`); `DS_SPEND = b"BLCH4:SPEND\0\0\0\0\0"` (`:1838`); `DS_SPEND2 = b"BLCH4:SPEND2\0\0\0\0"` (`:1848`, inert, §3.2); `DS_TXID = b"BLCH4:TXID\0\0\0\0\0\0"` (`:1857`); `DS_PROPOSE = b"BLCH4:PROPOSE\0\0\0"` (`:1869`); `DS_EXIT = b"BLCH4:EXIT\0\0\0\0\0\0"` (`:1876`); `DS_WSCKPT = b"BLCH4:WSCKPT\0\0\0\0"` (`:1881`) | `bloch-pos-committee/src/params.rs`, per-tag line numbers given inline (file order: `DS_BLOCK`, `DS_SPEND`, `DS_SPEND2`, `DS_TXID`, `DS_PROPOSE`, `DS_EXIT`, `DS_WSCKPT`) |
+| Domain separation tags (16 bytes each, exact) | The complete registry is `params::DOMAIN_TAGS`. Relevant here: `DS_SPEND2 = b"BLCH4:SPEND2\0\0\0\0"` for the inert spend gate and `DS_NETSIG2 = b"BLCH4:NETSIG2\0\0\0"` for the unarmed validator-duty candidate. | `bloch-pos-committee/src/params.rs`; normative complete table in `BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §6.1 |
 | Constant-time / fail-closed properties | `crypto::verify` auto-detects enveloped vs. legacy-raw form by exact byte length and returns `false` (never panics) on a suite mismatch between pubkey and signature — a documented consensus rule, not merely a library nicety. OS-RNG failure fails **closed** (aborts) rather than silently falling back to a weaker source (a fixed Round-3 defect, K-H1). | `crypto/mod.rs:239-262` |
 
 <div class="note">
@@ -1282,7 +1286,7 @@ Every method in the frozen registry (`method_registry.rs`, `tests/rpc_method_reg
 | Method | Params (name, type; position) | Returns | Notes |
 |---|---|---|---|
 | `getchaininfo` | none | See §10.3 | |
-| `getbuildinfo` | none | `build_version, package_version, commit, commit_source (git\|asserted\|none), tree_state (clean\|modified\|unverified\|unknown), source_digest (sha3-256 hex), source_digest_alg, source_digest_scope, source_files, source_bytes, rustc, profile, target, digest_note` | Constant cost, no chain-state read. Compare `source_digest` across nodes you trust — identical digests mean identical *source*, not identical binary behaviour (see the warning below). |
+| `getbuildinfo` | none | `build_version, package_version, commit, commit_source (git\|asserted\|none), tree_state (clean\|asserted-clean\|modified\|unverified\|unknown), source_digest (sha3-256 hex), source_digest_alg, source_digest_scope, source_files, source_bytes, rustc, cargo, profile, target, build_environment_digest (sha3-256 hex), build_environment_digest_alg, build_environment_scope, build_environment_fields, build_tool_binaries_hashed, build_sysroot_components_hashed, build_configured_tool_binaries_hashed, build_default_linker_binaries_hashed, build_linker_binaries_hashed, digest_note` | Constant cost, no chain-state read. `asserted-clean` is an outer-recipe assertion; only `clean` is Git evidence gathered by the build script. Compare both digests across trusted builders: source equality alone does not establish equal compiler/code-generation inputs (see the warning below). |
 | `getblockcount` | none | `height, slot, epoch, finalized_height (u64\|null), justified_epoch, finalized_epoch` | |
 | `getblockbyslot` | `slot` (u64; pos 0) | Block object, §7.2 | `-32007 SLOT_EMPTY` if no canonical block at that slot (message names the current head) |
 | `getblockbyid` | `block_id` (64-hex; pos 0) | Block object, §7.2 | `-32000 BLOCK_NOT_FOUND` if unknown |
@@ -1654,9 +1658,19 @@ whether a field is a string vs. a number, where `null` can appear).
   "build_version": "0.4.0-genesis4", "package_version": "0.4.0",
   "commit": "72e5525...", "commit_source": "git", "tree_state": "clean",
   "source_digest": "3d67...b308", "source_digest_alg": "sha3-256",
-  "source_digest_scope": "workspace crates dir: rs, toml, c, h, S, s; plus workspace Cargo.toml and Cargo.lock; relative paths, sorted, length-prefixed",
+  "source_digest_scope": "workspace crates dir: rs, toml, c, h, S, s, macros; plus workspace Cargo.toml, Cargo.lock and rust-toolchain.toml; relative paths, sorted, length-prefixed",
   "source_files": "812", "source_bytes": "9134221",
-  "rustc": "1.94.1", "profile": "release", "target": "x86_64-unknown-linux-gnu",
+  "rustc": "rustc 1.94.1 (...)", "cargo": "cargo 1.94.1 (...)",
+  "profile": "release", "target": "x86_64-unknown-linux-gnu",
+  "build_environment_digest": "f27a...71c4",
+  "build_environment_digest_alg": "sha3-256",
+  "build_environment_scope": "rustc and cargo executable bytes plus version output; selected rustc driver and target libstd sysroot components; explicitly configured linker/compiler/archive/wrapper bytes, including an unambiguous compiler delegated by known wrappers and either the explicitly selected linker (including effective Rust flags) or the platform default linker observed from a target link probe; host; target; profile; selected Rust/C codegen variables, including absent exact host/target forms; sorted, length-prefixed; values hashed, not directly disclosed",
+  "build_environment_fields": "7",
+  "build_tool_binaries_hashed": "2",
+  "build_sysroot_components_hashed": "4",
+  "build_configured_tool_binaries_hashed": "1",
+  "build_default_linker_binaries_hashed": "1",
+  "build_linker_binaries_hashed": "1",
   "digest_note": "different digests prove different source trees; equal digests are evidence of the same source, not proof — whoever can edit the source can edit the build script that hashes it"
 }
 ```
@@ -1930,9 +1944,10 @@ fresh today** — read that section before planning around this section.
 | `--rpc-port <n>\|off` | **`16310`** | `off`/`0` disables RPC entirely. **Not 8080** — see §1 and Appendix A for where that number actually comes from. |
 | `--metrics-bind <ip>` | `127.0.0.1` | |
 | `--metrics-port <n>\|off` | **off — no default listener** | |
+| `--allow-public-metrics` | off | Required for enabled non-loopback metrics; acknowledgement only, not authentication. |
 | `--max-peers <n>` | 64 | libp2p/dual only |
 | `--behind-proxy` | off | libp2p/dual only — zeroes an IP-colocation peer-scoring penalty |
-| `--ws-checkpoint <file>` + `--ws-signer-set <file>` | none | Must be given together. See §2.6/§13.4. |
+| `--ws-checkpoint <file>` + `--ws-signer-set <file>` + `--ws-signer-set-sha3 <hex32>` | none | All three are required for an external envelope. See §2.6/§13.4. |
 | `--stop-at-slot <n>` | none | test/ops convenience |
 | `--allow-finality-rewind` (env: `BLOCH_ALLOW_FINALITY_REWIND=1`) | off | Not recommended for an observer node. |
 | `--no-doppelganger-check` (env: `BLOCH_NO_DOPPELGANGER=1`) | off | Meaningless for an observer (no keystore, no duties). |
@@ -1977,8 +1992,9 @@ from genesis and then **refuse to complete**, loudly, with the
 `ERR_WS_REQUIRE_CHECKPOINT` message quoted in full in §2.6 — this is the
 mechanism working as designed, not a bug to work around. If a checkpoint has
 since been published, obtain it from a channel you trust, verify its digest
-across at least two independent channels, and supply it via
-`--ws-checkpoint <file> --ws-signer-set <file>`.
+across at least two independent channels, obtain the arrangement fingerprint
+independently, and supply it via `--ws-checkpoint <file> --ws-signer-set <file>
+--ws-signer-set-sha3 <hex32>`.
 
 ### 13.5 RPC exposure
 
@@ -2044,15 +2060,22 @@ own alert rules from the table above instead.
 ```
 $ bloch-pos --version
 bloch-pos-node <pkg-version> (Genesis-4, block version 0xb10c0005)
-source-digest sha3-256:<hex> (<N> files, <M> bytes) commit-source:<git|asserted|none> tree:<clean|modified|unverified|unknown>
+source-digest sha3-256:<hex> (<N> files, <M> bytes) commit-source:<git|asserted|none> tree:<clean|asserted-clean|modified|unverified|unknown>
 ```
 
 `getbuildinfo` (RPC) and `bloch-pos buildinfo` (CLI) return the identical
 object: `build_version, package_version, commit, commit_source,
-tree_state, source_digest (SHA3-256 over every `crates/**/*.{rs,toml,c,h,S,s}`
-file plus the workspace `Cargo.toml`/`Cargo.lock`, computed at build time),
+tree_state, source_digest (SHA3-256 over every
+`crates/**/*.{rs,toml,c,h,S,s,macros}` file plus the workspace
+`Cargo.toml`/`Cargo.lock`/`rust-toolchain.toml`, computed at build time),
 source_digest_alg, source_digest_scope, source_files, source_bytes, rustc,
-profile, target, digest_note`.
+cargo, profile, target, build_environment_digest,
+build_environment_digest_alg, build_environment_scope,
+build_environment_fields, build_tool_binaries_hashed,
+build_sysroot_components_hashed, build_configured_tool_binaries_hashed,
+build_default_linker_binaries_hashed,
+build_linker_binaries_hashed,
+digest_note`.
 
 <div class="warn">
 
@@ -2236,7 +2259,7 @@ exposure, implausible-resource DoS, and third-party infrastructure.
 | 16 | (Not present in edition 1) L2 "EVM-compatible, chain id 8400" described as an optional current feature | No code implementing an EVM-compatible chain exists anywhere in this repository; the successor plan is an explicit `DRAFT` with no code for either track | VERIFIED-IN-CODE (absence), `docs/specs/BLOCH-L1-EXECUTION-PLAN.md:7` | Exchange: do not list chain id 8400 as a currently operating network. |
 | 17 | (New fact, not a correction) Weak-subjectivity bootstrap | A fresh node cannot join the network from scratch as of this edition — see the boxed warning at the top of this document and §2.6/§13.4 | VERIFIED-IN-CODE, `ws_boot.rs`, `ws.rs` | Exchange: confirm current ceremony status with the endpoint operator before planning a from-scratch node deployment; see the companion operator memo. |
 | 18 | Explorer footer lists `explorer.posternlabs.com / blochl1.com` as two current URLs | The project's own deploy configuration states `explorer.posternlabs.com` is a **retired** name and `blochl1.com` is the live domain | OPERATOR-ASSERTED (both sides — this repository's deploy config, not live DNS) | Exchange: use `blochl1.com` only; confirm with the operator before publishing the retired name. |
-| 19 | (Not present in edition 1 — an internal-codebase discrepancy noted here, not a correction to a prior claim) §13.8 states `carryover.tsv` has 452,726 opening outputs | **452,726** (at Genesis-3's terminal height 39,918) is the authoritative, final figure — it matches both `CARRYOVER-SNAPSHOT.md`'s own `rows 452,726` and `tokenomics_v4::CARRYOVER_MEASURED_UTXOS = 452_726`, and §1's network-parameters table now cites the same number. A **different** figure, **452,133** (an earlier, non-terminal snapshot at height 39,328), still appears throughout `genesis.rs`'s comments and a `#[cfg(test)]`/benchmark constant in `engine.rs` (`MAINNET_EUTXOS`) — that constant's own doc comment flags the 593-output gap explicitly and states "which of the two is stale is for the founder to settle." Neither figure is wrong as a measurement; they are two different snapshots of the same address set taken 590 blocks apart, and only 452,726/height 39,918 is the one this document, `CARRYOVER-SNAPSHOT.md`, and the live carryover artifact treat as authoritative. | VERIFIED-IN-CODE, `bloch-pos-node/src/engine.rs:8285-8294` (`MAINNET_EUTXOS`, the gap noted in-code); `bloch-pos-node/src/genesis.rs:277` (452,133, height 39,328); `bloch-pos-committee/src/tokenomics_v4.rs:236` (`CARRYOVER_MEASURED_UTXOS = 452_726`); `CARRYOVER-SNAPSHOT.md` | Exchange: use 452,726 (§1, §13.8) as the authoritative opening-output count; do not be alarmed by 452,133 appearing in code comments and a dev-only benchmark constant elsewhere in the tree — it is a known, named, non-consensus-affecting discrepancy, not a sign the carryover figure this document cites is wrong. |
+| 19 | (Not present in edition 1 — an internal-codebase discrepancy noted here, not a correction to a prior claim) §13.8 states `carryover.tsv` has 452,726 opening outputs | **452,726** (at Genesis-3's terminal height 39,918) is the authoritative, final figure. Source comments and the mainnet-sized benchmark were reconciled on 2026-09-17; 452,133 remains only where the earlier height-39,328 measurement is explicitly historical. | VERIFIED-IN-CODE, `bloch-pos-node/src/genesis.rs`, `bloch-pos-node/src/engine.rs` (`MAINNET_EUTXOS`), `bloch-pos-committee/src/tokenomics_v4.rs` (`CARRYOVER_MEASURED_UTXOS = 452_726`), `CARRYOVER-SNAPSHOT.md` | Exchange: use 452,726 (§1, §13.8) as the authoritative opening-output count. |
 
 ---
 

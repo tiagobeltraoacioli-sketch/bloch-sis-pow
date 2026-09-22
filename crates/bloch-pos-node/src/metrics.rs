@@ -51,8 +51,9 @@
 //! since finality advanced, and the incident counters.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -95,6 +96,42 @@ const MAX_HEAD_BYTES: usize = 8 * 1024;
 /// Connections served concurrently. A scraper plus a probe plus slack; past
 /// this the listener answers 503 and closes rather than spawning threads.
 const MAX_CONNECTIONS: usize = 16;
+
+/// One source may occupy only a quarter of the worker budget. Four concurrent
+/// scrapes from one monitoring address are already more than an honest
+/// Prometheus/health-probe pair needs, while leaving twelve slots for other
+/// operators behind distinct addresses.
+const MAX_CONNECTIONS_PER_IP: usize = 4;
+
+/// Holds both halves of metrics connection admission until its worker exits.
+/// A guard makes every early return and panic release the global and per-IP
+/// slots together instead of relying on matching decrements in every path.
+struct MetricsConnectionPermit {
+    _ip: crate::connection_limit::Permit,
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for MetricsConnectionPermit {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn reserve_connection(
+    ip: IpAddr,
+    live: &Arc<AtomicUsize>,
+    ip_limits: &Arc<crate::connection_limit::Limits>,
+) -> Option<MetricsConnectionPermit> {
+    let ip_permit = ip_limits.reserve(ip, MAX_CONNECTIONS_PER_IP)?;
+    if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+        live.fetch_sub(1, Ordering::SeqCst);
+        return None;
+    }
+    Some(MetricsConnectionPermit {
+        _ip: ip_permit,
+        live: Arc::clone(live),
+    })
+}
 
 /// The process-wide registry. Const-initialised, so incrementing from
 /// anywhere in the binary is one relaxed atomic op with no setup and no
@@ -149,6 +186,21 @@ pub struct NodeMetrics {
     /// `wall_slot - head_slot` (saturating). The "node is quietly behind"
     /// signal; on a healthy node this is 0 or 1.
     pub behind_by_slots: AtomicU64,
+    /// Epochs of wall-clock outage still available before one restart block
+    /// would exceed consensus `MAX_EPOCH_ADVANCE`. This is observability only:
+    /// it is never read by consensus or duty selection.
+    pub epoch_advance_headroom_epochs: AtomicU64,
+    /// Historical size of the committed `fc_equivocators` set. This is a
+    /// gauge, not the gossip event counter above: canonical reorgs can replace
+    /// the state being observed even though the set is monotone within one
+    /// branch.
+    pub forkchoice_equivocators: AtomicU64,
+    /// Members of the committed bar that remain in the current consensus
+    /// roster. Exited validators remain in `forkchoice_equivocators` but do
+    /// not contribute here.
+    pub forkchoice_equivocators_active: AtomicU64,
+    /// Leak-adjusted active stake excluded by the committed bar, in satoshis.
+    pub forkchoice_equivocator_active_stake_sat: AtomicU64,
     /// Committed finalized epoch.
     pub finalized_epoch: AtomicU64,
     /// Committed justified epoch.
@@ -169,10 +221,11 @@ pub struct NodeMetrics {
     /// 1 while the node considers itself syncing (behind and requesting
     /// blocks), else 0.
     pub is_syncing: AtomicU64,
-    /// 1 when a keystore is loaded AND its key matches the committed registry
-    /// (the node performs duties); 0 on an observer or a pending-activation
-    /// validator. `avg_over_time` of this against the roster is the
-    /// "validator-not-started" alarm.
+    /// 1 when the loaded key matches an active registry record at the current
+    /// wall epoch and boot-grace/doppelganger gates allow participation.
+    /// Refreshed each engine turn; 0 during startup or without an eligible key.
+    /// This does not prove a duty was selected, signed, included, or allowed
+    /// by its durable slashing watermark.
     pub validator_active: AtomicU64,
     /// Unix seconds of the last time the finalized epoch advanced (stamped at
     /// boot to the boot time, so the gauge is never 0 on a live node).
@@ -252,6 +305,12 @@ impl NodeMetrics {
             head_slot: AtomicU64::new(0),
             wall_slot: AtomicU64::new(0),
             behind_by_slots: AtomicU64::new(0),
+            epoch_advance_headroom_epochs: AtomicU64::new(
+                bloch_pos_committee::params::MAX_EPOCH_ADVANCE,
+            ),
+            forkchoice_equivocators: AtomicU64::new(0),
+            forkchoice_equivocators_active: AtomicU64::new(0),
+            forkchoice_equivocator_active_stake_sat: AtomicU64::new(0),
             finalized_epoch: AtomicU64::new(0),
             justified_epoch: AtomicU64::new(0),
             peer_count: AtomicU64::new(0),
@@ -348,6 +407,18 @@ impl NodeMetrics {
             self.get(&self.blocks_rejected_total),
         );
         series(
+            "bloch_pos_boundary_vote_drops_total",
+            "counter",
+            "Epoch-boundary votes admitted at inclusion but absent from the boundary partition; nonzero indicates consensus-roster divergence",
+            bloch_pos_committee::transition::BOUNDARY_VOTE_DROPS.load(Ordering::Relaxed),
+        );
+        series(
+            "bloch_pos_rejection_logs_suppressed_total",
+            "counter",
+            "Rejection diagnostics suppressed by bounded logging; validation and peer verdicts still execute",
+            crate::net::rejection_log::suppressed_total(),
+        );
+        series(
             "bloch_pos_equivocations_observed_total",
             "counter",
             "Equivocations captured by the gossip pool (two attestations, one validator, one slot)",
@@ -376,6 +447,30 @@ impl NodeMetrics {
             "gauge",
             "wall_slot minus head_slot; 0-1 on a healthy node",
             self.get(&self.behind_by_slots),
+        );
+        series(
+            "bloch_pos_epoch_advance_headroom_epochs",
+            "gauge",
+            "Wall-clock epochs remaining before one restart block exceeds consensus MAX_EPOCH_ADVANCE; alert before this reaches zero",
+            self.get(&self.epoch_advance_headroom_epochs),
+        );
+        series(
+            "bloch_pos_forkchoice_equivocators",
+            "gauge",
+            "Validators in the canonical state's permanent committed fork-choice bar",
+            self.get(&self.forkchoice_equivocators),
+        );
+        series(
+            "bloch_pos_forkchoice_equivocators_active",
+            "gauge",
+            "Committed fork-choice equivocators still present in the active consensus roster",
+            self.get(&self.forkchoice_equivocators_active),
+        );
+        series(
+            "bloch_pos_forkchoice_equivocator_active_stake_sat",
+            "gauge",
+            "Leak-adjusted active stake excluded by the committed fork-choice equivocator bar, in satoshis",
+            self.get(&self.forkchoice_equivocator_active_stake_sat),
         );
         series(
             "bloch_pos_finalized_epoch",
@@ -422,7 +517,7 @@ impl NodeMetrics {
         series(
             "bloch_pos_validator_active",
             "gauge",
-            "1 when this node performs validator duties, 0 on an observer or unarmed validator",
+            "1 when the registered key is epoch-eligible and startup/doppelganger gates are open; not a completed-duty count",
             self.get(&self.validator_active),
         );
         series(
@@ -633,19 +728,23 @@ pub fn fs_free_bytes(path: &std::path::Path) -> u64 {
 pub fn serve(bind_addr: &str, port: u16, metrics: &'static NodeMetrics) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind((bind_addr, port))?;
     let local = listener.local_addr()?;
-    let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let live = Arc::new(AtomicUsize::new(0));
+    let ip_limits = Arc::new(crate::connection_limit::Limits::default());
     thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(mut sock) = conn else { continue };
-            if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-                live.fetch_sub(1, Ordering::SeqCst);
+            let Ok(address) = sock.peer_addr() else { continue };
+            let Some(permit) = reserve_connection(address.ip(), &live, &ip_limits) else {
+                // Preserve the existing small 503 response, but never let an
+                // uncooperative saturated client block the accept thread
+                // before worker socket timeouts are configured.
+                let _ = sock.set_nonblocking(true);
                 let _ = respond(&mut sock, 503, "text/plain", "too many connections");
                 continue;
-            }
-            let live = live.clone();
+            };
             thread::spawn(move || {
+                let _permit = permit;
                 serve_connection(&mut sock, metrics);
-                live.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
@@ -660,7 +759,11 @@ fn serve_connection(sock: &mut TcpStream, metrics: &NodeMetrics) {
     // GET) is ignored: we answer and close.
     let mut buf: Vec<u8> = Vec::with_capacity(512);
     let mut chunk = [0u8; 1024];
+    let Some(deadline) = std::time::Instant::now().checked_add(IO_TIMEOUT) else { return };
     let head_end = loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() { return; }
+        if sock.set_read_timeout(Some(remaining)).is_err() { return; }
         if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             break p;
         }
@@ -728,6 +831,48 @@ fn respond(sock: &mut TcpStream, status: u16, ctype: &str, body: &str) -> std::i
 mod tests {
     use super::*;
 
+    #[test]
+    fn connection_admission_is_per_ip_global_and_released_by_guard() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let limits = Arc::new(crate::connection_limit::Limits::default());
+        let crowded: IpAddr = "192.0.2.1".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        let mut held = Vec::new();
+
+        for _ in 0..MAX_CONNECTIONS_PER_IP {
+            held.push(reserve_connection(crowded, &live, &limits).expect("source has room"));
+        }
+        assert!(
+            reserve_connection(mapped, &live, &limits).is_none(),
+            "IPv4-mapped IPv6 must share the source cap",
+        );
+        assert!(
+            reserve_connection("192.0.2.2".parse().unwrap(), &live, &limits).is_some(),
+            "one source must not consume every metrics worker",
+        );
+        drop(held.pop());
+        assert!(
+            reserve_connection(crowded, &live, &limits).is_some(),
+            "dropping a worker guard must restore that source's capacity",
+        );
+        drop(held);
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let limits = Arc::new(crate::connection_limit::Limits::default());
+        let mut all = Vec::new();
+        for octet in 1..=MAX_CONNECTIONS {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, octet as u8));
+            all.push(reserve_connection(ip, &live, &limits).expect("global budget has room"));
+        }
+        assert!(
+            reserve_connection("203.0.113.1".parse().unwrap(), &live, &limits).is_none(),
+            "distinct sources must still obey the global worker cap",
+        );
+        drop(all);
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert!(reserve_connection("203.0.113.1".parse().unwrap(), &live, &limits).is_some());
+    }
+
     /// Mutation-style: an increment must be VISIBLE in the rendered text. If
     /// any `inc` call or the render line for the series is deleted, this
     /// fails.
@@ -750,12 +895,17 @@ mod tests {
             "bloch_pos_finality_stalls_total",
             "bloch_pos_peer_count",
             "bloch_pos_behind_by_slots",
+            "bloch_pos_epoch_advance_headroom_epochs",
+            "bloch_pos_forkchoice_equivocators",
+            "bloch_pos_forkchoice_equivocators_active",
+            "bloch_pos_forkchoice_equivocator_active_stake_sat",
             "bloch_pos_is_syncing",
             // R3 metrics-gap follow-up: equivocations, the finality-latch
             // refusal counter, per-transport peer counts, the sealed-keystore
             // gauge and the parked-blocks gauge.
             "bloch_pos_equivocations_observed_total",
             "bloch_pos_finality_rewinds_refused_total",
+            "bloch_pos_boundary_vote_drops_total",
             "bloch_pos_peer_count_devnet",
             "bloch_pos_peer_count_p2p",
             "bloch_pos_keystore_sealed",
@@ -766,10 +916,18 @@ mod tests {
             "bloch_pos_net_shed_blocks_total",
             "bloch_pos_net_shed_attestations_total",
             "bloch_pos_net_shed_transactions_total",
+            "bloch_pos_rejection_logs_suppressed_total",
         ] {
             assert!(text.contains(name), "missing series {name}");
             assert!(text.contains(&format!("# TYPE {name}")), "missing TYPE for {name}");
         }
+        assert!(
+            text.contains(&format!(
+                "bloch_pos_epoch_advance_headroom_epochs {}",
+                bloch_pos_committee::params::MAX_EPOCH_ADVANCE,
+            )),
+            "the pre-slot-loop default must report full headroom, not a false zero alarm"
+        );
     }
 
     /// The health verdict is a pure function of heartbeat age and sync state.

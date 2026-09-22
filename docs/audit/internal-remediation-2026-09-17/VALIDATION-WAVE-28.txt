@@ -1,0 +1,30 @@
+Validation wave 28 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Implementation: e99f564
+
+PASS
+
+bash -n deploy/bootnodes/verify-bootnodes.sh \
+  deploy/bootnodes/verify-bootnodes.selftest.sh
+  Passed.
+
+bash deploy/bootnodes/verify-bootnodes.selftest.sh
+  Closed RPC with reachable P2P passed; exposed RPC on 8080 failed the verifier.
+
+python3 scripts/check-tests-blocking.selftest.py
+  37 cases behaved as documented.
+
+python3 scripts/check-tests-blocking.py
+  Both pipelines covered all 8 live crates in blocking test jobs.
+
+ruby -e 'require "yaml"; YAML.load_file(...)'
+  .github/workflows/tests.yml and .gitlab-ci.yml parsed successfully.
+
+git diff --check
+  Passed before the implementation commit and after the documentation update.
+
+LIMIT
+
+No live bootnode was probed, and no production firewall, proxy, service unit or
+binary was changed. This validates the repository guard only. INF-10 remains
+PARTIAL pending an authorized external fleet scan and remediation evidence.
