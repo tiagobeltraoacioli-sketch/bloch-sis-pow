@@ -12,12 +12,12 @@ const MAX_AGE_MINUTES = 1440;
 const CLOCK_SKEW_MS = 120 * 1000;
 
 function usage() {
-  return 'Usage: node evidence-assess.cjs --preflight DIR --checkpoint DIR --expect-domain 64-HEX --expect-genesis-sha256 64-HEX [--expect-binary-sha256 64-HEX] [--expect-signer-set-sha256 64-HEX] [--max-age-minutes 1..1440] [--json]\nReads only the two local evidence bundles and their SHA256SUMS. Maximum evidence age defaults to 30 minutes; clock skew allowance is 120 seconds. Expected values must come from independently authenticated release material. This comparison never qualifies a validator or opens staking.';
+  return 'Usage: node evidence-assess.cjs --preflight DIR --checkpoint DIR --expect-domain 64-HEX --expect-genesis-sha256 64-HEX [--expect-source-digest 64-HEX] [--expect-binary-sha256 64-HEX] [--expect-signer-set-sha256 64-HEX] [--max-age-minutes 1..1440] [--json]\nReads only the two local evidence bundles and their SHA256SUMS. Maximum evidence age defaults to 30 minutes; clock skew allowance is 120 seconds. Expected values must come from independently authenticated release material. This comparison never qualifies a validator or opens staking.';
 }
 
 function parseArgs(argv) {
   const opts = { json: false };
-  const names = { '--preflight': 'preflight', '--checkpoint': 'checkpoint', '--expect-domain': 'expectDomain', '--expect-genesis-sha256': 'expectGenesisSha256', '--expect-binary-sha256': 'expectBinarySha256', '--expect-signer-set-sha256': 'expectSignerSetSha256', '--max-age-minutes': 'maxAgeMinutes' };
+  const names = { '--preflight': 'preflight', '--checkpoint': 'checkpoint', '--expect-domain': 'expectDomain', '--expect-genesis-sha256': 'expectGenesisSha256', '--expect-source-digest': 'expectSourceDigest', '--expect-binary-sha256': 'expectBinarySha256', '--expect-signer-set-sha256': 'expectSignerSetSha256', '--max-age-minutes': 'maxAgeMinutes' };
   for (let i = 0; i < argv.length; i++) {
     if (['--help', '-h'].includes(argv[i])) { opts.help = true; continue; }
     if (argv[i] === '--json') { opts.json = true; continue; }
@@ -27,7 +27,7 @@ function parseArgs(argv) {
   }
   if (opts.help) return opts;
   for (const name of ['preflight', 'checkpoint', 'expectDomain', 'expectGenesisSha256']) if (!opts[name]) throw new Error(`${name} is required`);
-  for (const name of ['expectDomain', 'expectGenesisSha256', 'expectBinarySha256', 'expectSignerSetSha256']) if (opts[name] !== undefined && !HEX.test(opts[name])) throw new Error(`${name} must be 64 hexadecimal characters`);
+  for (const name of ['expectDomain', 'expectGenesisSha256', 'expectSourceDigest', 'expectBinarySha256', 'expectSignerSetSha256']) if (opts[name] !== undefined && !HEX.test(opts[name])) throw new Error(`${name} must be 64 hexadecimal characters`);
   if (opts.maxAgeMinutes === undefined) opts.maxAgeMinutes = DEFAULT_MAX_AGE_MINUTES;
   else if (!/^[0-9]+$/.test(opts.maxAgeMinutes) || !Number.isSafeInteger(Number(opts.maxAgeMinutes)) || Number(opts.maxAgeMinutes) < 1 || Number(opts.maxAgeMinutes) > MAX_AGE_MINUTES) throw new Error(`maxAgeMinutes must be an integer from 1 to ${MAX_AGE_MINUTES}`);
   else opts.maxAgeMinutes = Number(opts.maxAgeMinutes);
@@ -95,6 +95,16 @@ function assess(preflight, checkpoint, expected, nowMs = Date.now()) {
   add(c.status === 'CRYPTO_ACCEPTED_MANUAL_REQUIRED' && c.checks.length === requiredCheckpointChecks.length && requiredCheckpointChecks.every(id => c.checks.filter(item => item?.id === id && item.status === 'PASS').length === 1) && c.command?.name === 'ws-verify' && c.command.exitCode === 0 && c.command.signal === null && c.command.stopReason === null && c.freshness === 'FRESH' ? 'PASS' : 'FAIL', 'checkpoint-status', `Checkpoint: ${c.status}`);
   const domain = p.observations.primary.getvalidatoradmission?.network_domain;
   add(HEX.test(domain || '') && HEX.test(p.inputs.expectedNetworkDomain || '') && domain.toLowerCase() === expected.expectDomain.toLowerCase() && p.inputs.expectedNetworkDomain.toLowerCase() === expected.expectDomain.toLowerCase() ? 'PASS' : 'FAIL', 'network-domain', 'Preflight domain and its declared trusted input must match the operator-supplied domain.');
+  const sourcePin = p.inputs.expectedSourceDigest;
+  const sourceDigest = p.observations.primary.getbuildinfo?.source_digest;
+  const sourceCheck = p.report.checks?.filter(item => item?.title === 'Expected source digest' && item.level === 'PASS') || [];
+  if (sourcePin != null || expected.expectSourceDigest !== undefined) {
+    const internallyConsistent = HEX.test(sourcePin || '') && HEX.test(sourceDigest || '') &&
+      sourcePin.toLowerCase() === sourceDigest.toLowerCase() && sourceCheck.length === 1;
+    add(internallyConsistent && (expected.expectSourceDigest === undefined ||
+      (HEX.test(expected.expectSourceDigest) && sourcePin.toLowerCase() === expected.expectSourceDigest.toLowerCase())) ? 'PASS' : 'FAIL',
+    'source-digest-pin', 'Preflight expected source digest, node-reported source digest and the passing check must agree; an independently supplied digest must also match. This does not authenticate the binary.');
+  } else add('MANUAL', 'source-digest-pin', 'No independent source digest was supplied for this assessment; binary identity remains a manual gate.');
   const genesis = c.inputFingerprints.genesis?.sha256;
   add(HEX.test(genesis || '') && genesis.toLowerCase() === expected.expectGenesisSha256.toLowerCase() ? 'PASS' : 'FAIL', 'genesis-artifact', 'Checkpoint verifier genesis-manifest fingerprint must match the operator-supplied digest.');
   for (const [option, input, id, label] of [
@@ -143,7 +153,7 @@ function assess(preflight, checkpoint, expected, nowMs = Date.now()) {
   const status = checks.some(item => item.status === 'FAIL') ? 'FAIL' : 'REVIEW_MANUAL_REQUIRED';
   return {
     schema: 'bloch.genesis4.validator-evidence-assessment.v1', observedAt: new Date().toISOString(), status,
-    inputs: { preflightSha256: preflight.sha256, checkpointSha256: checkpoint.sha256, expectedDomain: expected.expectDomain.toLowerCase(), expectedGenesisSha256: expected.expectGenesisSha256.toLowerCase(), maxAgeMinutes, clockSkewSeconds: CLOCK_SKEW_MS / 1000, ...(expected.expectBinarySha256 === undefined ? {} : { expectedBinarySha256: expected.expectBinarySha256.toLowerCase() }), ...(expected.expectSignerSetSha256 === undefined ? {} : { expectedSignerSetSha256: expected.expectSignerSetSha256.toLowerCase() }) },
+    inputs: { preflightSha256: preflight.sha256, checkpointSha256: checkpoint.sha256, expectedDomain: expected.expectDomain.toLowerCase(), expectedGenesisSha256: expected.expectGenesisSha256.toLowerCase(), maxAgeMinutes, clockSkewSeconds: CLOCK_SKEW_MS / 1000, ...(expected.expectSourceDigest === undefined ? {} : { expectedSourceDigest: expected.expectSourceDigest.toLowerCase() }), ...(expected.expectBinarySha256 === undefined ? {} : { expectedBinarySha256: expected.expectBinarySha256.toLowerCase() }), ...(expected.expectSignerSetSha256 === undefined ? {} : { expectedSignerSetSha256: expected.expectSignerSetSha256.toLowerCase() }) },
     checks, manualGate: { status: 'NOT_VERIFIED', required: ['Authenticate release material, WS digest, signer arrangement and all supplied expected values independently.', 'Compare historical checkpoint root using an independent archival node when epochs differ.', 'Verify deployed binary identity, node independence, exit, withdrawal delay and spendable payout before any bond.'] },
     note: 'SHA256SUMS detects accidental or subsequent bundle changes; it does not authenticate the creator. This local assessment never qualifies staking or delegation.'
   };

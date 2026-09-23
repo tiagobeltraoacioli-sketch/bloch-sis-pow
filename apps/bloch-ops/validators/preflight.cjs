@@ -10,7 +10,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 function usage() {
-  return `Usage: node preflight.cjs --rpc URL [--reference-rpc URL] [--expect-domain 64-HEX] [--max-lag-slots N] [--timeout-ms N] [--evidence-dir NEW_DIRECTORY] [--json]\n\nQueries only ${METHODS.join(', ')}. Each method has a bounded timeout (default 20000 ms). An evidence directory must not already exist; it contains public RPC observations and an explicit pending manual gate. Supply a trusted network domain from independently authenticated release material. The optional reference endpoint is a comparison, not a trust anchor. Exit and withdrawal qualification is always a separate operator gate.`;
+  return `Usage: node preflight.cjs --rpc URL [--reference-rpc URL] [--expect-domain 64-HEX] [--expect-source-digest 64-HEX] [--max-lag-slots N] [--timeout-ms N] [--evidence-dir NEW_DIRECTORY] [--json]\n\nQueries only ${METHODS.join(', ')}. Each method has a bounded timeout (default 20000 ms). An evidence directory must not already exist; it contains public RPC observations and an explicit pending manual gate. Supply expected domain and source digest only from independently authenticated release material. A matching self-reported source digest does not authenticate the binary artifact. The optional reference endpoint is a comparison, not a trust anchor. Exit and withdrawal qualification is always a separate operator gate.`;
 }
 
 function parseArgs(argv) {
@@ -19,8 +19,9 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === '--help' || arg === '-h') { opts.help = true; continue; }
     if (arg === '--json') { opts.json = true; continue; }
-    const key = { '--rpc': 'rpc', '--reference-rpc': 'referenceRpc', '--expect-domain': 'expectDomain', '--max-lag-slots': 'maxLagSlots', '--timeout-ms': 'timeoutMs', '--evidence-dir': 'evidenceDir' }[arg];
+    const key = { '--rpc': 'rpc', '--reference-rpc': 'referenceRpc', '--expect-domain': 'expectDomain', '--expect-source-digest': 'expectSourceDigest', '--max-lag-slots': 'maxLagSlots', '--timeout-ms': 'timeoutMs', '--evidence-dir': 'evidenceDir' }[arg];
     if (!key || i + 1 >= argv.length) throw new Error(`Invalid or incomplete option: ${arg}`);
+    if (key === 'expectSourceDigest' && opts[key] !== undefined) throw new Error('--expect-source-digest may be supplied only once');
     opts[key] = argv[++i];
   }
   if (opts.help) return opts;
@@ -32,6 +33,7 @@ function parseArgs(argv) {
     if (url.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) throw new Error(`${name} must use HTTPS except on loopback`);
   }
   if (opts.expectDomain && !HEX32.test(opts.expectDomain)) throw new Error('--expect-domain must be 64 hexadecimal characters');
+  if (opts.expectSourceDigest !== undefined && !HEX32.test(opts.expectSourceDigest)) throw new Error('--expect-source-digest must be 64 hexadecimal characters');
   if (opts.evidenceDir !== undefined && (!opts.evidenceDir.trim() || opts.evidenceDir === '.' || opts.evidenceDir === '..')) throw new Error('--evidence-dir must name a new directory');
   opts.maxLagSlots = Number(opts.maxLagSlots);
   if (!Number.isSafeInteger(opts.maxLagSlots) || opts.maxLagSlots < 0) throw new Error('--max-lag-slots must be a nonnegative integer');
@@ -133,6 +135,10 @@ function evaluate(primary, reference, opts) {
   else add(admission.epoch === chain.epoch ? 'PASS' : 'WARN', 'Validator admission', `${admission.active ? 'active' : 'inactive'} at epoch ${admission.epoch}; chain epoch ${chain.epoch}. Admission is not exit, payout or delegation qualification.`);
   if (typeof build.source_digest === 'string' && HEX32.test(build.source_digest)) add('PASS', 'Build identity recorded', `version ${build.build_version ?? build.package_version ?? 'unreported'}; source digest ${build.source_digest}; tree ${build.tree_state ?? 'unknown'}. Verify artifact digest separately.`);
   else add('WARN', 'Build identity', 'No valid source digest reported; record the deployed release and binary artifact digest separately.');
+  if (opts.expectSourceDigest) {
+    if (!HEX32.test(String(build.source_digest ?? ''))) add('FAIL', 'Expected source digest', 'The node did not report a valid source digest; the independently supplied digest cannot be compared.');
+    else add(build.source_digest.toLowerCase() === opts.expectSourceDigest.toLowerCase() ? 'PASS' : 'FAIL', 'Expected source digest', `Node-reported ${build.source_digest}; operator-supplied ${opts.expectSourceDigest}. A match does not authenticate the running binary artifact.`);
+  }
   if (reference) {
     const other = reference.getchaininfo || {}, otherAdmission = reference.getvalidatoradmission || {}, otherBuild = reference.getbuildinfo || {};
     if (HEX32.test(String(domain ?? '')) && HEX32.test(String(otherAdmission.network_domain ?? ''))) add(domain.toLowerCase() === otherAdmission.network_domain.toLowerCase() ? 'PASS' : 'FAIL', 'Reference network domain', `primary ${domain}; reference ${otherAdmission.network_domain}.`);
@@ -170,7 +176,7 @@ function writeEvidenceBundle(directory, report, primary, reference, opts) {
     schema: 'bloch.genesis4.validator-preflight.evidence.v1',
     observedAt: report.observedAt,
     summary: report.summary,
-    inputs: { expectedNetworkDomain: opts.expectDomain || null, maxLagSlots: opts.maxLagSlots, referenceQueried: Boolean(reference) },
+    inputs: { expectedNetworkDomain: opts.expectDomain || null, expectedSourceDigest: opts.expectSourceDigest || null, maxLagSlots: opts.maxLagSlots, referenceQueried: Boolean(reference) },
     report,
     observations: { primary: publicObservation(primary), reference: reference ? publicObservation(reference) : null },
     manualGate: {

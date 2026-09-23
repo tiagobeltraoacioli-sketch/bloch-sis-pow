@@ -35,3 +35,14 @@
 .lookup-comparison strong{display:block;font-size:12px;letter-spacing:.07em;text-transform:uppercase}
 .lookup-comparison p{margin:9px 0;color:inherit;font-size:13px}
 .lookup-comparison small{font-size:11px;opacity:.75}
+.deposit-fields{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
+.deposit-fields input{width:100%;min-width:0;padding:12px 14px;border:1px solid #9dbb9c;background:#fff;color:#132c1c;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}
+.deposit-help{margin:8px 0 0;color:#607662;font-size:11px}
+.lookup-deposit{margin-top:16px;padding:17px 20px;border-left:4px solid #427d51;background:#e7f2e7;color:#17361e}
+.lookup-deposit[hidden]{display:none}
+.lookup-deposit.review{border-left-color:#a47729;background:#f7eacb;color:#3d3424}
+.lookup-deposit strong{display:block;font-size:12px;letter-spacing:.07em;text-transform:uppercase}
+.lookup-deposit p{margin:9px 0;font-size:13px}
+.lookup-deposit ul{margin:8px 0;padding-left:18px;overflow-wrap:anywhere;font:11px ui-monospace,SFMono-Regular,Menlo,monospace}
+.lookup-deposit small{font-size:11px;opacity:.75}
+@media(max-width:760px){.deposit-fields{grid-template-columns:1fr}}

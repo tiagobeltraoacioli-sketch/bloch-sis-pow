@@ -24,6 +24,22 @@ test('read-only pass still demands manual trust and lifecycle evidence', () => {
   assert.equal(report.checks.at(-1).level, 'MANUAL');
   assert.match(report.checks.at(-1).detail, /exit, withdrawal delay and spendable payout/);
 });
+test('independently supplied source digest is checked but does not clear the manual gate', () => {
+  const matching = evaluate(fixture(), null, { expectDomain: domain, expectSourceDigest: digest.toUpperCase(), maxLagSlots: 2 });
+  assert.equal(matching.summary, 'CHECKS_PASS_MANUAL_REQUIRED');
+  assert.equal(matching.checks.find(c => c.title === 'Expected source digest').level, 'PASS');
+  assert.equal(matching.checks.at(-1).level, 'MANUAL');
+
+  const mismatching = evaluate(fixture(), null, { expectDomain: domain, expectSourceDigest: 'f'.repeat(64), maxLagSlots: 2 });
+  assert.equal(mismatching.summary, 'FAIL');
+  assert.equal(mismatching.checks.find(c => c.title === 'Expected source digest').level, 'FAIL');
+
+  const missing = fixture();
+  delete missing.getbuildinfo.source_digest;
+  const absent = evaluate(missing, null, { expectDomain: domain, expectSourceDigest: digest, maxLagSlots: 2 });
+  assert.equal(absent.summary, 'FAIL');
+  assert.equal(absent.checks.find(c => c.title === 'Expected source digest').level, 'FAIL');
+});
 test('stale or unanchored nodes require review', () => {
   const sample = fixture(); sample.getchaininfo.behind_by_slots = 100; sample.getchaininfo.transport.peers.libp2p = 0;
   const report = evaluate(sample, null, { maxLagSlots: 64 });
@@ -44,6 +60,12 @@ test('different finalized epochs cannot be claimed corroborated', () => {
 test('reject remote cleartext and invalid expected domain', () => {
   assert.throws(() => parseArgs(['--rpc', 'http://example.com/rpc']), /HTTPS/);
   assert.throws(() => parseArgs(['--rpc', 'https://example.com/rpc', '--expect-domain', 'short']), /64 hexadecimal/);
+  for (const value of ['', 'short', 'g'.repeat(64), 'c'.repeat(63), 'c'.repeat(65)]) {
+    assert.throws(() => parseArgs(['--rpc', 'https://example.com/rpc', '--expect-source-digest', value]), /64 hexadecimal/);
+  }
+  assert.throws(() => parseArgs(['--rpc', 'https://example.com/rpc', '--expect-source-digest']), /Invalid or incomplete option/);
+  assert.throws(() => parseArgs(['--rpc', 'https://example.com/rpc', '--expect-source-digest', digest, '--expect-source-digest', digest]), /only once/);
+  assert.equal(parseArgs(['--rpc', 'https://example.com/rpc', '--expect-source-digest', digest.toUpperCase()]).expectSourceDigest, digest.toUpperCase());
   assert.throws(() => parseArgs(['--rpc', 'https://example.com/rpc', '--timeout-ms', '0']), /1000 to 60000/);
   assert.equal(parseArgs(['--rpc', 'https://example.com/rpc', '--timeout-ms', '5000']).timeoutMs, 5000);
 });
@@ -158,14 +180,15 @@ test('evidence bundle records selected RPC fields, integrity and pending manual 
     const sample = fixture();
     sample.getbuildinfo.private_key = 'never-persist-this';
     sample.getchaininfo.unknown_field = 'never-persist-this';
-    const report = evaluate(sample, null, { expectDomain: domain, maxLagSlots: 2 });
+    const report = evaluate(sample, null, { expectDomain: domain, expectSourceDigest: digest, maxLagSlots: 2 });
     const directory = path.join(parent, 'evidence');
-    const saved = writeEvidenceBundle(directory, report, sample, null, { expectDomain: domain, maxLagSlots: 2 });
+    const saved = writeEvidenceBundle(directory, report, sample, null, { expectDomain: domain, expectSourceDigest: digest, maxLagSlots: 2 });
     const body = fs.readFileSync(path.join(directory, 'evidence.json'), 'utf8');
     const bundle = JSON.parse(body);
     assert.equal(saved.checksum, crypto.createHash('sha256').update(body).digest('hex'));
     assert.equal(fs.readFileSync(path.join(directory, 'SHA256SUMS'), 'utf8'), `${saved.checksum}  evidence.json\n`);
     assert.equal(bundle.manualGate.status, 'NOT_VERIFIED');
+    assert.equal(bundle.inputs.expectedSourceDigest, digest);
     assert.equal(bundle.observations.primary.getbuildinfo.source_digest, digest);
     assert.equal(bundle.observations.primary.getchaininfo.finalized.root, root);
     assert.equal(bundle.summary, 'CHECKS_PASS_MANUAL_REQUIRED');
@@ -186,6 +209,7 @@ test('failed probes can be saved but never become passing evidence', () => {
     writeEvidenceBundle(directory, report, sample, null, { maxLagSlots: 2 });
     const bundle = JSON.parse(fs.readFileSync(path.join(directory, 'evidence.json'), 'utf8'));
     assert.equal(bundle.summary, 'FAIL');
+    assert.equal(bundle.inputs.expectedSourceDigest, null);
     assert.equal(bundle.observations.primary.getbuildinfo, null);
     assert.equal(bundle.manualGate.status, 'NOT_VERIFIED');
   } finally { fs.rmSync(parent, { recursive: true, force: true }); }

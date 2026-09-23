@@ -1,6 +1,7 @@
 import { validIncludedReceipt } from './receipt-validator.mjs';
 import { compareReceiptObservations } from './receipt-comparison.mjs?v=20260923-5';
 import { LookupResponseError, readBoundedJson } from './bounded-json.mjs?v=20260923-6';
+import { matchDepositOutputs } from './deposit-match.mjs?v=20260923-7';
 
 const NODE_STATUS = new Set(['pending', 'included', 'justified', 'finalized', 'unknown']);
 
@@ -17,6 +18,12 @@ const observationEvidence = document.getElementById('lookup-observation-evidence
 const comparison = document.getElementById('lookup-comparison');
 const comparisonStatus = document.getElementById('lookup-comparison-status');
 const comparisonDetail = document.getElementById('lookup-comparison-detail');
+const depositScript = document.getElementById('deposit-script-hash');
+const depositAmount = document.getElementById('deposit-amount-sat');
+const depositCard = document.getElementById('lookup-deposit');
+const depositStatus = document.getElementById('lookup-deposit-status');
+const depositDetail = document.getElementById('lookup-deposit-detail');
+const depositOutpoints = document.getElementById('lookup-deposit-outpoints');
 const tabHistory = new Map();
 
 function recordObservation(current) {
@@ -102,6 +109,20 @@ form.addEventListener('submit', async event => {
     result.hidden = true;
     observation.hidden = true;
     comparison.hidden = true;
+    depositCard.hidden = true;
+    return;
+  }
+  const expectedScript = depositScript.value.trim();
+  const expectedAmount = depositAmount.value.trim();
+  const matchRequested = expectedScript !== '' || expectedAmount !== '';
+  if (matchRequested && (!/^[0-9a-f]{64}$/i.test(expectedScript) ||
+      !/^[1-9][0-9]*$/.test(expectedAmount) || expectedAmount.length > 20 ||
+      BigInt(expectedAmount) > (1n << 64n) - 1n)) {
+    message.textContent = 'For deposit matching, enter both a 64-character public script hash and a positive integer satoshi amount.';
+    result.hidden = true;
+    observation.hidden = true;
+    comparison.hidden = true;
+    depositCard.hidden = true;
     return;
   }
   const url = `https://blochl1.com/api/v1/transactions/${txid}`;
@@ -112,6 +133,7 @@ form.addEventListener('submit', async event => {
   result.hidden = true;
   observation.hidden = true;
   comparison.hidden = true;
+  depositCard.hidden = true;
   message.textContent = 'Reading the archival receipt and chain-head observation…';
   try {
     const response = await fetch(url, { signal: controller.signal, credentials: 'omit', redirect: 'error' });
@@ -133,6 +155,20 @@ form.addEventListener('submit', async event => {
     const receipt = await readBoundedJson(response, 2 * 1024 * 1024);
     if (!validIncludedReceipt(receipt, txid)) {
       throw new LookupResponseError('The API returned an incomplete or inconsistent included receipt.');
+    }
+    if (matchRequested) {
+      const matched = matchDepositOutputs(receipt, expectedScript, expectedAmount);
+      depositStatus.textContent = matched.exactTotal ? 'Exact output total observed' : 'Deposit amount needs review';
+      depositDetail.textContent = `${matched.outputs.length} matching outpoint(s); ${matched.matchedAmountSat} sat observed against ${matched.expectedAmountSat} sat expected. Difference: ${matched.differenceSat} sat. This is not a credit or finality decision.`;
+      depositOutpoints.replaceChildren();
+      for (const output of matched.outputs) {
+        const item = document.createElement('li');
+        item.textContent = `${output.txid}:${output.vout} · ${output.valueSat} sat`;
+        depositOutpoints.append(item);
+      }
+      depositOutpoints.hidden = matched.outputs.length === 0;
+      depositCard.classList.toggle('review', !matched.exactTotal);
+      depositCard.hidden = false;
     }
     recordObservation({ kind: 'included', txid, receipt });
     summary.replaceChildren();

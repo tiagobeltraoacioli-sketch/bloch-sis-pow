@@ -22,10 +22,10 @@ submitting any other bytes.
 ## Install
 
 The versioned package is served at
-`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.11.tgz`.
+`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.12.tgz`.
 
 ```sh
-npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.11.tgz
+npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.12.tgz
 ```
 
 It can also be installed from a local checkout:
@@ -105,7 +105,7 @@ limits. It requests the node's maximum 1,000 UTXOs and returns
 `utxosTruncated: true` if the source owns more than the node can enumerate.
 The core can still select from the visible coins; if those cannot cover the
 amount, an exchange node or indexer with a complete UTXO view is required.
-SDK 0.1.11 also has an explicit `utxoMode: 'cursor'` for a node built with the
+SDK 0.1.12 also has an explicit `utxoMode: 'cursor'` for a node built with the
 source-only Genesis-4 cursor extension. **That extension is not deployed on
 current mainnet.** The default remains `legacy` and makes the same two-argument
 request as earlier versions. Do not enable cursor mode against an unverified
@@ -134,7 +134,7 @@ timeout until the original txid has been checked.
 
 `accepted: true` means mempool admission, not block inclusion or finality.
 Persist the exact signed bytes, txid, `signingRootHex` and `rawHash` for
-reconciliation and safe transport retries. SDK 0.1.11 requires all four fields
+reconciliation and safe transport retries. SDK 0.1.12 requires all four fields
 when broadcasting: before network I/O it recomputes the domain-separated txid
 from `signingRootHex` and SHA3-256 of `rawHex`; after admission it compares the
 node's byte count and `tx_hash` correlation handle. The latter is **not** the
@@ -167,6 +167,12 @@ signed bytes or submit a transaction:
 node examples/track-signed.mjs signed.json > first-observation.json
 node examples/track-signed.mjs signed.json first-observation.json > next-observation.json
 ```
+
+The CLI accepts only nonempty regular JSON files of at most 2 MiB. It checks
+the saved SDK identity fields and requires a previous tracking result for the
+same txid. Optional `BLOCH_RPC_URL` and `BLOCH_EXPLORER_URL` overrides must use
+HTTPS without embedded credentials, query or fragment. Its output excludes signed bytes and
+mnemonics; an input or network failure produces a fixed diagnostic on stderr.
 
 ## Transaction lookup
 

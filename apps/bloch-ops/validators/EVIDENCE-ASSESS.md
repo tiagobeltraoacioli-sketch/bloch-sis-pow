@@ -16,7 +16,7 @@ Supply both 64-character digests from independently authenticated release materi
 
 The assessor reads the UTC `observedAt` timestamps written by both bundle producers and requires the preflight bundle and its nested report to agree. It rejects malformed timestamps, evidence older than `--max-age-minutes`, evidence more than 120 seconds in the future, and a checkpoint timestamp more than 120 seconds before preflight or more than the age limit after it. The default limit is 30 minutes; the operator may set an integer from 1 to 1440. The 120-second allowance is for host clock skew, not an extension of the evidence age limit. Run both tools close together with synchronized clocks, then assess them promptly. The JSON result records the chosen limit, skew allowance and each temporal check. Timestamps come from the hosts that created the bundles; they are not independently authenticated, so review clock synchronization and evidence origin manually.
 
-If your authenticated release material publishes SHA-256 digests for the **exact node binary file** and **exact signer-set file** used in checkpoint verification, pin either or both as well:
+If authenticated release material supplies the expected source digest, pass `--expect-source-digest` to both preflight and this assessor. The assessor requires the saved preflight input, the node-reported `getbuildinfo.source_digest`, its passing check and your independently supplied value to agree. This checks internal consistency and a self-reported source identity; it does not authenticate the running binary. If the release also publishes SHA-256 digests for the **exact node binary file** and **exact signer-set file** used in checkpoint verification, pin either or both as well:
 
 ```sh
 node evidence-assess.cjs \
@@ -24,6 +24,7 @@ node evidence-assess.cjs \
   --checkpoint ./checkpoint-evidence-new \
   --expect-domain "$TRUSTED_NETWORK_DOMAIN" \
   --expect-genesis-sha256 "$TRUSTED_GENESIS_MANIFEST_SHA256" \
+  --expect-source-digest "$TRUSTED_SOURCE_DIGEST" \
   --expect-binary-sha256 "$TRUSTED_BINARY_SHA256" \
   --expect-signer-set-sha256 "$TRUSTED_SIGNER_SET_SHA256" \
   --json

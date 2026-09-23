@@ -8,7 +8,7 @@ const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const { parseArgs, readBundle, assess } = require('./evidence-assess.cjs');
 
-const domain = 'a'.repeat(64), genesis = 'b'.repeat(64), root = 'c'.repeat(64), digest = 'd'.repeat(64), binary = '1'.repeat(64), signerSet = '2'.repeat(64);
+const domain = 'a'.repeat(64), genesis = 'b'.repeat(64), root = 'c'.repeat(64), digest = 'd'.repeat(64), binary = '1'.repeat(64), signerSet = '2'.repeat(64), source = '3'.repeat(64);
 const observedAt = new Date().toISOString();
 const expected = { expectDomain: domain, expectGenesisSha256: genesis };
 const preflight = () => ({
@@ -105,6 +105,26 @@ test('both trusted values are mandatory', () => {
   assert.equal(parseArgs(['--preflight', 'one', '--checkpoint', 'two', '--expect-domain', domain, '--expect-genesis-sha256', genesis]).checkpoint, 'two');
 });
 
+test('optional source digest pin must agree across independent input, preflight input and node observation', () => {
+  const pinned = preflight();
+  pinned.inputs.expectedSourceDigest = source;
+  pinned.observations.primary.getbuildinfo = { source_digest: source };
+  pinned.report.checks.push({ title: 'Expected source digest', level: 'PASS' });
+  const result = assess(wrap(pinned), wrap(checkpoint()), { ...expected, expectSourceDigest: source.toUpperCase() });
+  assert.equal(result.status, 'REVIEW_MANUAL_REQUIRED');
+  assert.equal(result.checks.find(item => item.id === 'source-digest-pin').status, 'PASS');
+  assert.equal(result.inputs.expectedSourceDigest, source);
+  for (const mutate of [
+    p => { p.inputs.expectedSourceDigest = 'f'.repeat(64); },
+    p => { p.observations.primary.getbuildinfo.source_digest = 'f'.repeat(64); },
+    p => { p.report.checks.pop(); },
+  ]) {
+    const altered = structuredClone(pinned); mutate(altered);
+    assert.equal(assess(wrap(altered), wrap(checkpoint()), { ...expected, expectSourceDigest: source }).status, 'FAIL');
+  }
+  assert.equal(assess(wrap(preflight()), wrap(checkpoint()), { ...expected, expectSourceDigest: source }).status, 'FAIL');
+});
+
 test('optional authenticated binary and signer-set pins match recorded fingerprints and keep manual gate', () => {
   const pinned = { ...expected, expectBinarySha256: binary.toUpperCase(), expectSignerSetSha256: signerSet.toUpperCase() };
   const result = assess(wrap(preflight()), wrap(checkpoint()), pinned);
@@ -132,7 +152,7 @@ test('optional pins fail when recorded fingerprint is absent, malformed or diffe
 
 test('optional CLI pins reject malformed and repeated values', () => {
   const base = ['--preflight', 'one', '--checkpoint', 'two', '--expect-domain', domain, '--expect-genesis-sha256', genesis];
-  for (const option of ['--expect-binary-sha256', '--expect-signer-set-sha256']) {
+  for (const option of ['--expect-source-digest', '--expect-binary-sha256', '--expect-signer-set-sha256']) {
     assert.throws(() => parseArgs([...base, option, 'invalid']), /64 hexadecimal/);
     assert.throws(() => parseArgs([...base, option]), /incomplete option/);
     assert.throws(() => parseArgs([...base, option, binary, option, binary]), /repeated/);
