@@ -12,13 +12,13 @@ const domain = 'a'.repeat(64), genesis = 'b'.repeat(64), root = 'c'.repeat(64), 
 const observedAt = new Date().toISOString();
 const expected = { expectDomain: domain, expectGenesisSha256: genesis };
 const preflight = () => ({
-  schema: 'bloch.genesis4.validator-preflight.evidence.v1', observedAt, summary: 'CHECKS_PASS_MANUAL_REQUIRED', report: { observedAt, summary: 'CHECKS_PASS_MANUAL_REQUIRED', checks: [{ level: 'PASS' }, { level: 'MANUAL' }] },
-  inputs: { expectedNetworkDomain: domain, referenceQueried: false }, manualGate: { status: 'NOT_VERIFIED' },
-  observations: { primary: { getchaininfo: { epoch: 11, finalized: { epoch: 10, root } }, getvalidatoradmission: { network_domain: domain } }, reference: null }
+  schema: 'bloch.genesis4.validator-preflight.evidence.v1', observedAt, summary: 'CHECKS_PASS_MANUAL_REQUIRED', report: { observedAt, summary: 'CHECKS_PASS_MANUAL_REQUIRED', diagnostics: ['getchaininfo', 'getbuildinfo', 'getvalidatoradmission'].map(method => ({ endpoint: 'primary', method, status: 'OK' })), checks: [{ title: 'Head freshness', level: 'PASS' }, { title: 'Finality progress', level: 'PASS' }, { title: 'Validator admission', level: 'PASS' }, { title: 'Trust and lifecycle', level: 'MANUAL' }] },
+  inputs: { expectedNetworkDomain: domain, maxLagSlots: 16, referenceQueried: false }, manualGate: { status: 'NOT_VERIFIED' },
+  observations: { primary: { getchaininfo: { block_id: root, slot: 110, epoch: 11, behind_by_slots: 0, finalized: { epoch: 10, root } }, getvalidatoradmission: { active: true, epoch: 11, network_domain: domain } }, reference: null }
 });
 const checkpoint = () => ({
-  schema: 'bloch.genesis4.checkpoint-verification.v1', observedAt, status: 'CRYPTO_ACCEPTED_MANUAL_REQUIRED', checks: [{ status: 'PASS' }, { status: 'PASS' }, { status: 'PASS' }, { status: 'PASS' }],
-  command: { name: 'ws-verify', exitCode: 0, stopReason: null }, freshness: 'FRESH', wsDigest: digest, expectedDigest: digest, inputFingerprints: { genesis: { sha256: genesis }, binary: { sha256: binary }, signerSet: { sha256: signerSet } },
+  schema: 'bloch.genesis4.checkpoint-verification.v1', observedAt, status: 'CRYPTO_ACCEPTED_MANUAL_REQUIRED', checks: [{ id: 'command', status: 'PASS' }, { id: 'envelope', status: 'PASS' }, { id: 'independent-digest', status: 'PASS' }, { id: 'freshness', status: 'PASS' }],
+  command: { name: 'ws-verify', exitCode: 0, signal: null, stopReason: null }, freshness: 'FRESH', wsDigest: digest, expectedDigest: digest, inputFingerprints: { genesis: { sha256: genesis }, binary: { sha256: binary }, signerSet: { sha256: signerSet } },
   diagnostics: { stdout: `ENVELOPE  local\n  epoch             10\n  block root        ${root}\n  WS DIGEST         ${digest}\nFRESHNESS  epoch 10 vs now 11: age 1 of 2016 epochs — FRESH\nVERDICT: ACCEPTED by ws::verify_envelope.\n` },
   manualGate: { status: 'NOT_VERIFIED' }
 });
@@ -43,6 +43,38 @@ test('root, domain, genesis and digest contradictions fail closed', () => {
     const p = preflight(), c = checkpoint(); change(p, c);
     if (p.summary !== p.report.summary) assert.throws(() => assess(wrap(p), wrap(c), expected), /summary/);
     else assert.equal(assess(wrap(p), wrap(c), expected).status, 'FAIL');
+  }
+});
+
+test('passing source summary cannot hide contradictory head, lag or admission observations', () => {
+  for (const [mutate, checkId] of [
+    [p => { p.observations.primary.getchaininfo.finalized.epoch = 12; }, 'preflight-head'],
+    [p => { p.observations.primary.getchaininfo.behind_by_slots = 17; }, 'preflight-head'],
+    [p => { p.observations.primary.getvalidatoradmission.epoch = 10; }, 'admission-epoch'],
+    [p => { p.report.diagnostics.push({ status: 'ERROR', method: 'getchaininfo' }); }, 'preflight-status'],
+    [p => { p.report.diagnostics.pop(); }, 'preflight-status'],
+    [p => { p.inputs.referenceQueried = true; }, 'preflight-status'],
+    [p => { p.report.checks = []; }, 'preflight-status'],
+    [p => { p.report.checks.find(item => item.title === 'Finality progress').level = 'MANUAL'; }, 'preflight-status']
+  ]) {
+    const p = preflight(); mutate(p);
+    const result = assess(wrap(p), wrap(checkpoint()), expected);
+    assert.equal(result.status, 'FAIL');
+    assert.equal(result.checks.find(item => item.id === checkId).status, 'FAIL');
+    assert.equal(result.manualGate.status, 'NOT_VERIFIED');
+  }
+});
+
+test('checkpoint report and verifier epoch contradictions fail closed', () => {
+  for (const [mutate, checkId] of [
+    [c => { c.checks[0].id = 'freshness'; }, 'checkpoint-status'],
+    [c => { c.command.signal = 'SIGTERM'; }, 'checkpoint-status'],
+    [c => { c.diagnostics.stdout = c.diagnostics.stdout.replace('vs now 11', 'vs now 9'); }, 'checkpoint-epoch-order']
+  ]) {
+    const c = checkpoint(); mutate(c);
+    const result = assess(wrap(preflight()), wrap(c), expected);
+    assert.equal(result.status, 'FAIL');
+    assert.equal(result.checks.find(item => item.id === checkId).status, 'FAIL');
   }
 });
 

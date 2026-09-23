@@ -300,25 +300,29 @@ test('invalid included receipt is rejected without status fallback', async () =>
 
 function included(overrides = {}) {
   return { kind: 'included', txid, receipt: {
-    txid, blockId: 'cd'.repeat(32), height: 80, slot: 100, inputs: [{ value_sat: '120' }],
-    outputs: [{ value_sat: '100' }], feeSat: '20', stakeSat: '0', confirmations: 22,
-    observedHeadHeight: 101, finalized: true, ...overrides,
+    txid, blockId: 'cd'.repeat(32), height: 80, slot: 100,
+    transactionIndex: 0, kind: 'transfer_v2', sizeBytes: 8000,
+    inputs: [{ ...receiptFixture.inputs[0] }], outputs: [{ ...receiptFixture.outputs[0] }],
+    feeSat: '20', stakeSat: '0', confirmations: 22,
+    observedHeadHeight: 101, observedHeadSlot: 121, finalizedHeight: 90,
+    status: 'finalized', finalized: true, corroboration: 'final',
+    source: 'test canonical archive', verification: 'test replay', ...overrides,
   } };
 }
 
 test('observation comparison identifies stable progress and changed blocks', () => {
-  assert.equal(compareTransactionObservations(included(), included({ confirmations: 23, observedHeadHeight: 102 })).status, 'consistent');
-  assert.equal(compareTransactionObservations(included(), included({ inputs: [{ value_sat: '120', optional_indexer_note: 'new' }] })).status, 'consistent');
-  const moved = compareTransactionObservations(included(), included({ blockId: 'ef'.repeat(32), height: 81 }));
+  assert.equal(compareTransactionObservations(included(), included({ confirmations: 23, observedHeadHeight: 102, observedHeadSlot: 122 })).status, 'consistent');
+  assert.equal(compareTransactionObservations(included(), included({ inputs: [{ ...receiptFixture.inputs[0], optional_indexer_note: 'new' }] })).status, 'consistent');
+  const moved = compareTransactionObservations(included(), included({ blockId: 'ef'.repeat(32), height: 81, confirmations: 21 }));
   assert.equal(moved.status, 'block_changed');
   assert.equal(moved.requiresReview, true);
 });
 
 test('observation comparison flags missing receipts and regressions', () => {
   assert.equal(compareTransactionObservations(included(), { kind: 'unresolved', txid, nodeStatus: 'unknown' }).status, 'receipt_unavailable');
-  assert.equal(compareTransactionObservations(included(), included({ finalized: false })).status, 'finality_regressed');
+  assert.equal(compareTransactionObservations(included(), included({ finalized: false, status: 'confirmed' })).status, 'finality_regressed');
   assert.equal(compareTransactionObservations(included(), included({ confirmations: 20, observedHeadHeight: 99 })).status, 'head_regressed');
-  assert.equal(compareTransactionObservations(included(), included({ outputs: [{ value_sat: '99' }] })).status, 'receipt_changed');
+  assert.equal(compareTransactionObservations(included(), included({ outputs: [{ ...receiptFixture.outputs[0], value_sat: '99' }] })).status, 'receipt_changed');
   assert.equal(compareTransactionObservations(null, included()).status, 'first_inclusion');
 });
 
@@ -327,11 +331,30 @@ test('observation comparison refuses different or malformed records', () => {
   assert.throws(() => compareTransactionObservations(included(), { kind: 'included', txid }), /Valid transaction observations/);
 });
 
+test('observation comparison reviews changed metadata and finality or slot regressions', () => {
+  for (const change of [{ transactionIndex: 1 }, { kind: 'stake_v2' }, { sizeBytes: 8001 }]) {
+    assert.equal(compareTransactionObservations(included(), included(change)).status, 'receipt_changed');
+  }
+  assert.equal(compareTransactionObservations(included(), included({ finalizedHeight: 89 })).status, 'finality_regressed');
+  assert.equal(compareTransactionObservations(included(), included({ corroboration: 'corroborated' })).status, 'finality_regressed');
+  assert.equal(compareTransactionObservations(included(), included({ observedHeadSlot: 120 })).status, 'head_regressed');
+});
+
+test('observation comparison rejects structurally incomplete included receipts', () => {
+  const malformed = [
+    { transactionIndex: undefined }, { sizeBytes: 0 }, { finalizedHeight: 102 },
+    { observedHeadSlot: 99 }, { confirmations: 21 }, { feeSat: '-1' },
+    { outputs: [{ ...receiptFixture.outputs[0], value_sat: '18446744073709551616' }] },
+    { outputs: [receiptFixture.outputs[0], receiptFixture.outputs[0]] },
+  ];
+  for (const change of malformed) {
+    assert.throws(() => compareTransactionObservations(included(), included(change)), /Valid transaction observations/);
+  }
+});
+
 test('deposit output inspection sums exact integer satoshis by mainnet script hash', () => {
   const script_hash = G4.inspectAddress(address).scriptHash;
-  const receipt = {
-    txid, blockId: 'cd'.repeat(32), height: 80, slot: 100,
-    confirmations: 22, status: 'finalized', finalized: true,
+  const receipt = { ...included().receipt,
     outputs: [
       { txid, vout: 0, value_sat: '100000000', script_hash },
       { txid, vout: 1, value_sat: '25000000', script_hash },
@@ -348,13 +371,15 @@ test('deposit output inspection sums exact integer satoshis by mainnet script ha
 
 test('deposit output inspection rejects malformed or duplicate output records', () => {
   const script_hash = G4.inspectAddress(address).scriptHash;
-  const receipt = { txid, blockId: 'cd'.repeat(32), height: 80, slot: 100,
-    confirmations: 22, status: 'confirmed', finalized: false,
+  const receipt = { ...included().receipt, status: 'confirmed', finalized: false,
     outputs: [{ txid, vout: 0, value_sat: '100', script_hash }] };
   const inspect = transaction => inspectDepositOutputs({ transaction, addressTo: address, amount: '0.00000100' });
   assert.throws(() => inspect({ ...receipt, outputs: [...receipt.outputs, receipt.outputs[0]] }), /duplicate output/);
   assert.throws(() => inspect({ ...receipt, outputs: [{ ...receipt.outputs[0], value_sat: '1.25' }] }), /invalid or duplicate output/);
   assert.throws(() => inspect({ ...receipt, outputs: [{ ...receipt.outputs[0], txid: 'ef'.repeat(32) }] }), /invalid or duplicate output/);
+  assert.throws(() => inspect({ ...receipt, outputs: [{ ...receipt.outputs[0], value_sat: '18446744073709551616' }] }), /invalid or duplicate output/);
+  assert.throws(() => inspect({ ...receipt, observedHeadHeight: 79 }), /complete included/);
+  assert.throws(() => inspect({ ...receipt, finalizedHeight: 102 }), /complete included/);
   assert.throws(() => inspect({ ...receipt, status: 'pending' }), /complete included/);
   assert.throws(() => inspectDepositOutputs({ transaction: receipt, addressTo: address, amount: 0.1 }));
 });

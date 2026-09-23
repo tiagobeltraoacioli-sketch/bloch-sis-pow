@@ -22,10 +22,10 @@ submitting any other bytes.
 ## Install
 
 The versioned package is served at
-`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.10.tgz`.
+`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.11.tgz`.
 
 ```sh
-npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.10.tgz
+npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.11.tgz
 ```
 
 It can also be installed from a local checkout:
@@ -105,7 +105,7 @@ limits. It requests the node's maximum 1,000 UTXOs and returns
 `utxosTruncated: true` if the source owns more than the node can enumerate.
 The core can still select from the visible coins; if those cannot cover the
 amount, an exchange node or indexer with a complete UTXO view is required.
-SDK 0.1.10 also has an explicit `utxoMode: 'cursor'` for a node built with the
+SDK 0.1.11 also has an explicit `utxoMode: 'cursor'` for a node built with the
 source-only Genesis-4 cursor extension. **That extension is not deployed on
 current mainnet.** The default remains `legacy` and makes the same two-argument
 request as earlier versions. Do not enable cursor mode against an unverified
@@ -134,7 +134,7 @@ timeout until the original txid has been checked.
 
 `accepted: true` means mempool admission, not block inclusion or finality.
 Persist the exact signed bytes, txid, `signingRootHex` and `rawHash` for
-reconciliation and safe transport retries. SDK 0.1.10 requires all four fields
+reconciliation and safe transport retries. SDK 0.1.11 requires all four fields
 when broadcasting: before network I/O it recomputes the domain-separated txid
 from `signingRootHex` and SHA3-256 of `rawHex`; after admission it compares the
 node's byte count and `tx_hash` correlation handle. The latter is **not** the
@@ -244,7 +244,11 @@ bounded, and a public gateway is not an independent settlement authority.
 Persist each observation with the exchange's own transaction record. The pure
 `compareTransactionObservations(previous, current)` helper highlights a missing
 receipt, changed inclusion block, changed transaction contents, reported
-finality regression or lower observed head/confirmation count. It never
+finality height or corroboration regression, or lower observed head height,
+slot or confirmation count. Transaction contents include its input/output
+outpoints and amounts, fee, stake, index, kind and serialized size. The helper
+requires structurally complete included receipts before reporting consistency.
+It never
 authorizes a deposit credit or withdrawal payout. Differences demand review of
 the source records and independent node/checkpoint evidence.
 
@@ -276,7 +280,9 @@ of a complete included receipt to a checksummed Genesis-4 mainnet address. It
 converts the expected decimal BLOCH amount to integer satoshis, lists every
 matching `txid:vout`, sums those amounts with `BigInt`, and returns
 `matchedAmountSat`, `differenceSat` and `exactTotal`. It rejects duplicate or
-malformed outputs instead of silently ignoring them. The result is a
+malformed outputs, including values above the unsigned 64-bit limit, and
+requires the complete included receipt fields returned by `getTransaction`.
+The result is a
 measurement, not a credit decision; the exchange must apply its own ownership,
 finality, duplicate-credit and risk policy. In particular, multiple outputs to
 one address are listed separately so each outpoint can be accounted for once.

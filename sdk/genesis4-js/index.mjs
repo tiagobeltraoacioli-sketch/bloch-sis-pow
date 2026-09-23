@@ -39,6 +39,27 @@ function validReceiptEntries(entries, receiptTxid, outputs) {
   return true;
 }
 
+function validIncludedReceipt(receipt) {
+  return receipt && HASH.test(receipt.txid) && HASH.test(receipt.blockId) &&
+    validReceiptEntries(receipt.inputs, receipt.txid, false) &&
+    validReceiptEntries(receipt.outputs, receipt.txid, true) &&
+    [receipt.height, receipt.slot, receipt.transactionIndex, receipt.sizeBytes,
+      receipt.confirmations, receipt.finalizedHeight, receipt.observedHeadHeight,
+      receipt.observedHeadSlot].every(value => Number.isSafeInteger(value) && value >= 0) &&
+    receipt.sizeBytes > 0 && receipt.observedHeadHeight >= receipt.height &&
+    receipt.observedHeadSlot >= receipt.slot &&
+    receipt.finalizedHeight <= receipt.observedHeadHeight &&
+    receipt.confirmations === receipt.observedHeadHeight - receipt.height + 1 &&
+    uint64String(receipt.feeSat) && uint64String(receipt.stakeSat) &&
+    typeof receipt.kind === 'string' && receipt.kind.length > 0 &&
+    typeof receipt.source === 'string' && receipt.source.length > 0 &&
+    typeof receipt.verification === 'string' && receipt.verification.length > 0 &&
+    ['confirmed', 'finalized'].includes(receipt.status) &&
+    receipt.finalized === (receipt.status === 'finalized') &&
+    (!receipt.finalized || receipt.finalizedHeight >= receipt.height) &&
+    ['corroborated', 'final'].includes(receipt.corroboration);
+}
+
 function mainnetAddress(value, name) {
   const info = G4.inspectAddress(value);
   if (!info.verified || info.network !== 'mainnet') {
@@ -438,12 +459,9 @@ export async function trackSignedTransaction(signed, {
 /** Compare saved observations without deciding an exchange's credit or payout policy. */
 export function compareTransactionObservations(previous, current) {
   const valid = item => item && HASH.test(item.txid) &&
-    (item.kind === 'unresolved' || (item.kind === 'included' && item.receipt &&
-      HASH.test(item.receipt.blockId) && item.receipt.txid?.toLowerCase() === item.txid.toLowerCase() &&
-      [item.receipt.height, item.receipt.slot, item.receipt.confirmations,
-        item.receipt.observedHeadHeight].every(value => Number.isSafeInteger(value) && value >= 0) &&
-      Array.isArray(item.receipt.inputs) && Array.isArray(item.receipt.outputs) &&
-      typeof item.receipt.finalized === 'boolean'));
+    (item.kind === 'unresolved' || (item.kind === 'included' &&
+      validIncludedReceipt(item.receipt) &&
+      item.receipt.txid.toLowerCase() === item.txid.toLowerCase()));
   if (!valid(current) || (previous != null && !valid(previous))) {
     throw new Error('Valid transaction observations are required');
   }
@@ -472,11 +490,18 @@ export function compareTransactionObservations(previous, current) {
       JSON.stringify([transfers(after), after.feeSat, after.stakeSat])) {
     return result('receipt_changed', true, 'The indexed transaction contents changed for the same txid and block. Review the source records.');
   }
-  if (before.finalized && !after.finalized) {
-    return result('finality_regressed', true, 'The reported finality flag regressed. Compare independent nodes and checkpoints.');
+  if (before.transactionIndex !== after.transactionIndex || before.kind !== after.kind ||
+      before.sizeBytes !== after.sizeBytes) {
+    return result('receipt_changed', true, 'The indexed transaction metadata changed for the same txid and block. Review the source records.');
   }
-  if (after.confirmations < before.confirmations || after.observedHeadHeight < before.observedHeadHeight) {
-    return result('head_regressed', true, 'The reported head or confirmation count moved backward. Check for stale data or a chain reorganization.');
+  if ((before.finalized && !after.finalized) ||
+      after.finalizedHeight < before.finalizedHeight ||
+      (before.corroboration === 'final' && after.corroboration !== 'final')) {
+    return result('finality_regressed', true, 'The reported finality or corroboration regressed. Compare independent nodes and checkpoints.');
+  }
+  if (after.confirmations < before.confirmations || after.observedHeadHeight < before.observedHeadHeight ||
+      after.observedHeadSlot < before.observedHeadSlot) {
+    return result('head_regressed', true, 'The reported head, slot or confirmation count moved backward. Check for stale data or a chain reorganization.');
   }
   return result('consistent', false, 'The stored inclusion and reported progress are consistent across these two observations; this is not independent settlement proof.');
 }
@@ -485,13 +510,8 @@ export function compareTransactionObservations(previous, current) {
 export function inspectDepositOutputs({ transaction, addressTo, amount }) {
   const target = mainnetAddress(addressTo, 'addressTo');
   const expectedAmountSat = G4.sats.toWire(G4.sats.fromUserBLCH(amount));
-  if (!transaction || !HASH.test(transaction.txid) || !HASH.test(transaction.blockId) ||
-      !Array.isArray(transaction.outputs) ||
-      !Number.isSafeInteger(transaction.height) || transaction.height < 0 ||
-      !Number.isSafeInteger(transaction.slot) || transaction.slot < 0 ||
-      !Number.isSafeInteger(transaction.confirmations) || transaction.confirmations < 0 ||
-      !['confirmed', 'finalized'].includes(transaction.status) ||
-      transaction.finalized !== (transaction.status === 'finalized')) {
+  // Validate the receipt envelope first so malformed outputs retain a specific error.
+  if (!validIncludedReceipt(transaction && { ...transaction, outputs: [] })) {
     throw new Error('A complete included transaction receipt is required');
   }
   const seen = new Set();
@@ -500,7 +520,7 @@ export function inspectDepositOutputs({ transaction, addressTo, amount }) {
     if (!HASH.test(output?.txid) || output.txid.toLowerCase() !== transaction.txid.toLowerCase() ||
         !Number.isSafeInteger(output.vout) || output.vout < 0 ||
         !HASH.test(output.script_hash) ||
-        typeof output.value_sat !== 'string' || !/^(0|[1-9][0-9]*)$/.test(output.value_sat) ||
+        !uint64String(output.value_sat) ||
         seen.has(output.vout)) {
       throw new Error('Receipt contains an invalid or duplicate output');
     }

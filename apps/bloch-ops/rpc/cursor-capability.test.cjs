@@ -113,3 +113,33 @@ test('malformed or unavailable build information cannot certify the marker and d
   assert.equal(report.status, 'legacy_shape');
   assert.equal(report.request_count, 2);
 });
+test('reports RPC codes and controlled errors without server or transport messages', async () => {
+  const secret = 'private-upstream-token';
+  const rpcFailure = async (_url, options) => {
+    const { id } = JSON.parse(options.body);
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id,
+      error: { code: -32601, message: secret } }));
+  };
+  const failed = await checkCursorCapability({ rpc: endpoint, scriptHash, optIn: true, fetcher: rpcFailure });
+  assert.deepEqual(failed.rpc_error, { code: -32601 });
+  assert.deepEqual(failed.build_rpc_error, { code: -32601 });
+  assert.doesNotMatch(JSON.stringify(failed), /private-upstream-token/);
+
+  const transportFailure = async (_url, options) => {
+    if (JSON.parse(options.body).method === 'getbuildinfo') return respond({}, 'cursor-capability-build');
+    throw new Error(`RPC request failed: ${secret}`);
+  };
+  const transport = await checkCursorCapability({ rpc: endpoint, scriptHash, optIn: true, fetcher: transportFailure });
+  assert.equal(transport.status, 'invalid_response');
+  assert.equal(transport.error, 'RPC request failed or response could not be read');
+  assert.doesNotMatch(JSON.stringify(transport), /private-upstream-token/);
+
+  const malformed = async (_url, options) => {
+    const { method } = JSON.parse(options.body);
+    return method === 'getbuildinfo' ? respond({}, 'cursor-capability-build')
+      : new Response(`{"leak":"${secret}"`);
+  };
+  const invalid = await checkCursorCapability({ rpc: endpoint, scriptHash, optIn: true, fetcher: malformed });
+  assert.equal(invalid.error, 'Invalid JSON response');
+  assert.doesNotMatch(JSON.stringify(invalid), /private-upstream-token/);
+});

@@ -7,8 +7,8 @@
   <meta name="description" content="A verified Genesis-4 RPC catalog and read-only console for Bloch operators and integrators.">
   <title>Genesis-4 RPC — Bloch Ops</title>
   <link rel="icon" href="../assets/favicon.png" type="image/png">
-  <link rel="stylesheet" href="style.css?v=20260923d">
-  <script type="module" src="app.js?v=20260923e"></script>
+  <link rel="stylesheet" href="style.css?v=20260923e">
+  <script type="module" src="app.js?v=20260923f"></script>
 </head>
 <body>
   <a class="skip" href="#main">Skip to content</a>
@@ -46,8 +46,9 @@
       <div class="history-panel" aria-labelledby="history-title">
         <div class="history-heading"><div><p class="card-tag">THIS BROWSER TAB / GETCHAININFO</p><h3 id="history-title">Observation history</h3><p id="history-summary" role="status">Waiting for the first chain request.</p></div><div class="history-actions"><button id="download-history-json" type="button" disabled>Download JSON</button><button id="download-history-csv" type="button" disabled>Download CSV</button><button id="clear-history" type="button" disabled>Clear history</button></div></div>
         <div class="history-metrics"><div><span>RECORDED ATTEMPTS</span><strong id="history-count">0</strong></div><div><span>LAST VALID REPLY / LOCAL</span><strong id="history-last-valid">—</strong></div><div><span>HEAD CHANGE SINCE PREVIOUS VALID REPLY</span><strong id="history-head-change">—</strong></div><div><span>FINALITY DISTANCE CHANGE</span><strong id="history-distance-change">—</strong></div></div>
+        <div class="history-alert" id="history-alert" role="status" aria-live="polite"><strong id="history-alert-heading">Awaiting two valid replies</strong><p id="history-alert-context">Two valid getchaininfo replies in this browser tab are needed for a comparison.</p><ul id="history-alert-list" hidden></ul></div>
         <div class="history-table-wrap"><table><caption>Most recent observations, newest first</caption><thead><tr><th scope="col">Observed (local)</th><th scope="col">Result</th><th scope="col">Head</th><th scope="col">Finalized</th><th scope="col">Distance</th><th scope="col">Reported evidence</th><th scope="col">Round trip</th></tr></thead><tbody id="history-rows"><tr><td colspan="7">No samples in this tab yet.</td></tr></tbody></table></div>
-        <p class="history-note">Kept in memory only, capped at 120 requests and cleared when this tab reloads. Failed and invalid requests are recorded. Browser timestamps and round trips come from this device. These samples cannot establish gateway uptime, chain progress, consensus or a finality SLA; responses may be cached. Compare independent nodes before operational decisions.</p>
+        <p class="history-note">Kept in memory only, capped at 120 requests and cleared when this tab reloads. Failed and invalid requests are recorded. Alerts compare the last two valid gateway replies and may reflect caching or an inconsistent gateway view. Browser timestamps and round trips come from this device. These samples cannot establish gateway uptime, chain progress, consensus or a finality SLA. Compare independent nodes before operational decisions.</p>
       </div>
     </section>
     <section class="section console-section" id="console">

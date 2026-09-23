@@ -84,8 +84,15 @@ function assess(preflight, checkpoint, expected, nowMs = Date.now()) {
     add(age >= -CLOCK_SKEW_MS && age <= maxAgeMs ? 'PASS' : 'FAIL', `${label}-time`, `${label} observedAt ${new Date(at).toISOString()}; age ${Math.floor(age / 1000)} seconds; maximum ${maxAgeMinutes} minutes, future clock skew allowance 120 seconds.`);
   }
   add(checkpointAt >= preflightAt - CLOCK_SKEW_MS && checkpointAt - preflightAt <= maxAgeMs ? 'PASS' : 'FAIL', 'evidence-sequence', 'Checkpoint must follow preflight within the maximum age; up to 120 seconds of clock skew is allowed.');
-  add(p.summary === 'CHECKS_PASS_MANUAL_REQUIRED' && Array.isArray(p.report.checks) && p.report.checks.every(item => ['PASS', 'MANUAL'].includes(item.level)) ? 'PASS' : 'FAIL', 'preflight-status', `Preflight: ${p.summary}`);
-  add(c.status === 'CRYPTO_ACCEPTED_MANUAL_REQUIRED' && c.checks.length === 4 && c.checks.every(item => item.status === 'PASS') && c.command?.name === 'ws-verify' && c.command.exitCode === 0 && c.command.stopReason === null && c.freshness === 'FRESH' ? 'PASS' : 'FAIL', 'checkpoint-status', `Checkpoint: ${c.status}`);
+  const requiredPreflightChecks = [['Head freshness', 'PASS'], ['Finality progress', 'PASS'], ['Validator admission', 'PASS'], ['Trust and lifecycle', 'MANUAL']];
+  const reportChecks = p.report.checks;
+  const reportDiagnostics = p.report.diagnostics;
+  const methods = ['getchaininfo', 'getbuildinfo', 'getvalidatoradmission'];
+  const endpoints = p.inputs.referenceQueried === true ? ['primary', 'reference'] : ['primary'];
+  const completeDiagnostics = Array.isArray(reportDiagnostics) && reportDiagnostics.length === methods.length * endpoints.length && endpoints.every(endpoint => methods.every(method => reportDiagnostics.filter(item => item?.endpoint === endpoint && item.method === method && item.status === 'OK').length === 1));
+  add(p.summary === 'CHECKS_PASS_MANUAL_REQUIRED' && Array.isArray(reportChecks) && reportChecks.length > 0 && reportChecks.every(item => ['PASS', 'MANUAL'].includes(item?.level)) && requiredPreflightChecks.every(([title, level]) => { const matches = reportChecks.filter(item => item?.title === title); return matches.length === 1 && matches[0].level === level; }) && completeDiagnostics && typeof p.inputs.referenceQueried === 'boolean' && p.inputs.referenceQueried === Boolean(p.observations.reference) ? 'PASS' : 'FAIL', 'preflight-status', `Preflight: ${p.summary}; required checks and RPC diagnostics must agree.`);
+  const requiredCheckpointChecks = ['command', 'envelope', 'independent-digest', 'freshness'];
+  add(c.status === 'CRYPTO_ACCEPTED_MANUAL_REQUIRED' && c.checks.length === requiredCheckpointChecks.length && requiredCheckpointChecks.every(id => c.checks.filter(item => item?.id === id && item.status === 'PASS').length === 1) && c.command?.name === 'ws-verify' && c.command.exitCode === 0 && c.command.signal === null && c.command.stopReason === null && c.freshness === 'FRESH' ? 'PASS' : 'FAIL', 'checkpoint-status', `Checkpoint: ${c.status}`);
   const domain = p.observations.primary.getvalidatoradmission?.network_domain;
   add(HEX.test(domain || '') && HEX.test(p.inputs.expectedNetworkDomain || '') && domain.toLowerCase() === expected.expectDomain.toLowerCase() && p.inputs.expectedNetworkDomain.toLowerCase() === expected.expectDomain.toLowerCase() ? 'PASS' : 'FAIL', 'network-domain', 'Preflight domain and its declared trusted input must match the operator-supplied domain.');
   const genesis = c.inputFingerprints.genesis?.sha256;
@@ -113,7 +120,13 @@ function assess(preflight, checkpoint, expected, nowMs = Date.now()) {
   const chain = p.observations.primary.getchaininfo || {};
   const finalized = chain.finalized || {};
   const chainEpoch = chain.epoch;
+  const isUInt = value => Number.isSafeInteger(value) && value >= 0;
+  const maxLagSlots = p.inputs.maxLagSlots;
+  add(isUInt(chain.slot) && isUInt(chainEpoch) && isUInt(chain.behind_by_slots) && HEX.test(chain.block_id || '') && isUInt(maxLagSlots) && chain.behind_by_slots <= maxLagSlots && isUInt(finalized.epoch) && finalized.epoch <= chainEpoch && chainEpoch - finalized.epoch <= 4 ? 'PASS' : 'FAIL', 'preflight-head', 'Preflight head, lag and finality must satisfy the recorded passing thresholds.');
+  const admissionEpoch = p.observations.primary.getvalidatoradmission?.epoch;
+  add(isUInt(admissionEpoch) && admissionEpoch === chainEpoch && typeof p.observations.primary.getvalidatoradmission?.active === 'boolean' ? 'PASS' : 'FAIL', 'admission-epoch', 'Validator admission epoch must match the observed head epoch.');
   add(Number.isSafeInteger(chainEpoch) && Math.abs(chainEpoch - nowEpoch) <= 1 ? 'PASS' : 'FAIL', 'observation-epoch', `Preflight head epoch ${chainEpoch}; checkpoint verifier node clock epoch ${nowEpoch}. Maximum drift: one epoch.`);
+  add(cpEpoch <= nowEpoch ? 'PASS' : 'FAIL', 'checkpoint-epoch-order', 'The checkpoint epoch cannot exceed the verifier node clock epoch.');
   if (!Number.isSafeInteger(finalized.epoch) || !HEX.test(finalized.root || '')) add('FAIL', 'finalized-root', 'Preflight finalized checkpoint is absent or malformed.');
   else if (finalized.epoch === cpEpoch) add(finalized.root.toLowerCase() === root.toLowerCase() ? 'PASS' : 'FAIL', 'finalized-root', `Both reports describe epoch ${cpEpoch}; roots must agree.`);
   else if (finalized.epoch < cpEpoch) add('FAIL', 'finalized-root', `Preflight finalized epoch ${finalized.epoch} precedes checkpoint epoch ${cpEpoch}.`);

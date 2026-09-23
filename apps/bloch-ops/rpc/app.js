@@ -1,4 +1,5 @@
 import { readRpcResponse, RpcResponseError } from './response-guard.mjs';
+import { compareChainObservations } from './history-alerts.mjs';
 
 const gateway = 'https://posternlabs.com/g4rpc';
 const defaultTimeoutMs = 12000;
@@ -289,6 +290,24 @@ function renderHistory() {
   put('history-last-valid', current ? new Date(current.observed_at).toLocaleTimeString() : '—');
   put('history-summary', !last ? 'Waiting for the first chain request.' :
     `${valid.length} valid of ${history.length} recorded attempts · latest ${last.status} at ${new Date(last.observed_at).toLocaleTimeString()}. A valid reply is not a consensus determination.`);
+  const comparison = compareChainObservations(previous, current);
+  const alertPanel = document.getElementById('history-alert');
+  const alertList = document.getElementById('history-alert-list');
+  alertPanel.classList.toggle('review', comparison.status === 'review');
+  put('history-alert-heading', comparison.status === 'review' ? 'Review gateway observations' :
+    comparison.status === 'consistent' ? 'No regression in the last two valid replies' : 'Awaiting two valid replies');
+  put('history-alert-context', comparison.status === 'review' ?
+    `The last two valid replies differ in ways that need review${last !== current ? '; a later request failed or was invalid' : ''}. Cached or inconsistent gateway views are possible. Compare independent nodes before acting.` :
+    comparison.status === 'consistent' ?
+      `The last two valid replies show no checked regression${last !== current ? '; a later request failed or was invalid' : ''}. This is a browser-tab comparison, not independent consensus proof.` :
+      'Two valid getchaininfo replies in this browser tab are needed for a comparison.');
+  alertList.replaceChildren();
+  for (const alert of comparison.alerts) {
+    const item = document.createElement('li');
+    item.textContent = alert.message;
+    alertList.append(item);
+  }
+  alertList.hidden = comparison.alerts.length === 0;
   historyJSONButton.disabled = history.length === 0;
   historyCSVButton.disabled = history.length === 0;
   clearHistoryButton.disabled = history.length === 0;
