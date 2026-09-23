@@ -11,7 +11,7 @@ const txid = 'ab'.repeat(32);
 function response(data, status = 200) { return { ok: status === 200, status, async json() { return data; } }; }
 const fetchImpl = async (_url, options) => {
   const method = JSON.parse(options.body).method;
-  if (method === 'getutxos') return response({ result: { script_hash: '00'.repeat(32), utxos: [{ txid, vout: 0, value_sat: '1000000' }], total: 1, returned: 1, truncated: false } });
+  if (method === 'getutxos') return response({ result: { script_hash: '00'.repeat(32), utxos: [{ txid, vout: 0, value_sat: '1000000' }], total: 1001, returned: 1, truncated: true } });
   if (method === 'getchaininfo') return response({ result: { height: 100, slot: 120, epoch: 4, next_base_fee_millisat_per_gas: '10', behind_by_slots: 0 } });
   throw new Error(`Unexpected ${method}`);
 };
@@ -23,6 +23,7 @@ test('high-level SDK produces signed bytes ready for sendrawtransaction', async 
   assert.ok(signed.rawHex.length > 1000);
   assert.equal(signed.amountSat, '100000');
   assert.ok(BigInt(signed.feeSat) > 0n);
+  assert.equal(signed.utxosTruncated, true);
 });
 
 test('mismatched source address is refused before any RPC', async () => {

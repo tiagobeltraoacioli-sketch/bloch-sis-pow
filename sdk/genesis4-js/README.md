@@ -13,10 +13,10 @@ This is a source-distributed package; no npm publication is assumed.
 ## Install
 
 The versioned package is served at
-`https://blochl1.com/releases/genesis4-js/blochprotocol-genesis4-sdk-0.1.0.tgz`.
+`https://blochl1.com/releases/genesis4-js/blochprotocol-genesis4-sdk-0.1.1.tgz`.
 
 ```sh
-npm install https://blochl1.com/releases/genesis4-js/blochprotocol-genesis4-sdk-0.1.0.tgz
+npm install https://blochl1.com/releases/genesis4-js/blochprotocol-genesis4-sdk-0.1.1.tgz
 ```
 
 It can also be installed from a local checkout:
@@ -66,9 +66,11 @@ logs, and network requests; this SDK sends only script hashes and signed bytes.
 The SDK reads `getutxos` and `getchaininfo`, takes the **next** base fee and
 current epoch, invokes the core for UTXO selection and fee calculation, checks
 the preview against the signed transaction, and enforces block and RPC size
-limits. It refuses truncated UTXO enumerations. A source holding more outputs
-than the node can enumerate requires a node or indexer with a complete UTXO
-view. Transaction creation and broadcast are separate because a transfer's
+limits. It requests the node's maximum 1,000 UTXOs and returns
+`utxosTruncated: true` if the source owns more than the node can enumerate.
+The core can still select from the visible coins; if those cannot cover the
+amount, an exchange node or indexer with a complete UTXO view is required.
+Transaction creation and broadcast are separate because a transfer's
 fee can become stale at the next block; do not rebuild a transfer after a
 timeout until the original txid has been checked.
 

@@ -67,13 +67,10 @@ export async function createSignedTransaction({
       throw new Error('addressFrom does not match the mnemonic');
     }
     const [utxoResult, chainResult] = await Promise.all([
-      rpc('getutxos', [from.scriptHash, 250], rpcUrl, fetchImpl),
+      rpc('getutxos', [from.scriptHash, Number(G4.limits.UTXO_PAGE_MAX)], rpcUrl, fetchImpl),
       rpc('getchaininfo', [], rpcUrl, fetchImpl),
     ]);
     const utxos = G4.parseUtxos(utxoResult);
-    if (utxos.truncated) {
-      throw new Error('getutxos is truncated; this RPC cannot enumerate all source coins safely');
-    }
     const chain = G4.parseChainInfo(chainResult);
     if (!Number.isSafeInteger(chain.epoch) || chain.nextBaseFeeMillisatPerGas == null ||
         chain.slot == null || !Number.isSafeInteger(chainResult.behind_by_slots) || chainResult.behind_by_slots > 2) {
@@ -112,6 +109,7 @@ export async function createSignedTransaction({
       baseFeeMillisatPerGas: args.base_fee_millisat_per_gas,
       format: signed.format,
       selectedUtxos: signed.selected_utxos,
+      utxosTruncated: utxos.truncated,
     };
   } finally { core.dispose(); }
 }
