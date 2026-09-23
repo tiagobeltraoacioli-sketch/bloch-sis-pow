@@ -1,0 +1,90 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Bloch Genesis-4 archival transaction query",
+    "version": "1.0.0",
+    "description": "Read-only contract for included, canonical Genesis-4 mainnet transactions. This describes the public archival gateway response observed on 2026-09-23 and the fields required by the Genesis-4 JavaScript SDK. An HTTP 404 means no canonical archival receipt is available at lookup time; it does not establish that a submitted transaction failed. Recheck block identity and finality before applying an exchange credit policy."
+  },
+  "servers": [{ "url": "https://blochl1.com" }],
+  "paths": {
+    "/api/v1/transactions/{txid}": {
+      "get": {
+        "operationId": "getArchivalTransaction",
+        "summary": "Get a canonical included transaction receipt",
+        "parameters": [{
+          "name": "txid",
+          "in": "path",
+          "required": true,
+          "description": "Consensus transaction ID, 64 hexadecimal characters.",
+          "schema": { "$ref": "#/components/schemas/Hash32" }
+        }],
+        "responses": {
+          "200": {
+            "description": "Included transaction with a corroborated chain-head observation. Amounts are decimal satoshi strings.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IncludedTransaction" } } }
+          },
+          "404": {
+            "description": "No canonical archival receipt at lookup time. Pending status remains unknown.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LookupError" } } }
+          },
+          "default": {
+            "description": "Gateway or upstream failure; pause reconciliation until a valid receipt is available."
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Hash32": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$", "examples": ["2a70f41229d8587f060c308279238662c2aa331f4d9f32a660231716f418c672"] },
+      "Satoshis": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$", "description": "Unsigned decimal satoshis; parse with BigInt, never floating point. Values must fit in uint64." },
+      "Outpoint": {
+        "type": "object",
+        "required": ["txid", "vout", "value_sat", "script_hash"],
+        "properties": {
+          "txid": { "$ref": "#/components/schemas/Hash32" },
+          "vout": { "type": "integer", "minimum": 0 },
+          "value_sat": { "$ref": "#/components/schemas/Satoshis" },
+          "script_hash": { "$ref": "#/components/schemas/Hash32" }
+        }
+      },
+      "IncludedTransaction": {
+        "type": "object",
+        "required": ["txid", "block_id", "height", "slot", "index", "kind", "size_bytes", "fee_sat", "stake_sat", "inputs", "outputs", "confirmations", "status", "finalized", "finalized_height", "observed_head_height", "observed_head_slot", "corroboration", "source", "verification"],
+        "properties": {
+          "txid": { "$ref": "#/components/schemas/Hash32" },
+          "block_id": { "$ref": "#/components/schemas/Hash32" },
+          "height": { "type": "integer", "minimum": 0 },
+          "slot": { "type": "integer", "minimum": 0 },
+          "index": { "type": "integer", "minimum": 0, "description": "Transaction position within its block." },
+          "kind": { "type": "string", "minLength": 1 },
+          "size_bytes": { "type": "integer", "minimum": 1 },
+          "fee_sat": { "$ref": "#/components/schemas/Satoshis" },
+          "stake_sat": { "$ref": "#/components/schemas/Satoshis" },
+          "inputs": { "type": "array", "items": { "$ref": "#/components/schemas/Outpoint" } },
+          "outputs": { "type": "array", "items": { "$ref": "#/components/schemas/Outpoint" }, "description": "Each output txid equals the requested txid. Match script_hash and vout for deposit reconciliation." },
+          "confirmations": { "type": "integer", "minimum": 1, "description": "Inclusive: observed_head_height - height + 1." },
+          "status": { "type": "string", "enum": ["confirmed", "finalized"] },
+          "finalized": { "type": "boolean", "description": "True only when status is finalized and the corroborated finalized height reaches this transaction's height." },
+          "finalized_height": { "type": "integer", "minimum": 0 },
+          "observed_head_height": { "type": "integer", "minimum": 0 },
+          "observed_head_slot": { "type": "integer", "minimum": 0 },
+          "corroboration": { "type": "string", "enum": ["corroborated", "final"] },
+          "source": { "type": "string", "minLength": 1 },
+          "verification": { "type": "string", "minLength": 1 },
+          "as_of_height": { "type": "integer", "minimum": 0, "description": "Optional archival observation height." },
+          "as_of_slot": { "type": "integer", "minimum": 0, "description": "Optional archival observation slot." },
+          "chain_tip": { "$ref": "#/components/schemas/Hash32" }
+        }
+      },
+      "LookupError": {
+        "type": "object",
+        "required": ["error", "txid"],
+        "properties": {
+          "error": { "type": "string" },
+          "txid": { "$ref": "#/components/schemas/Hash32" }
+        }
+      }
+    }
+  }
+}
