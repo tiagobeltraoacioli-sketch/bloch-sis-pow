@@ -17,8 +17,6 @@ The site intentionally preserves the source material's qualification language:
 
 The roadmap uses four delivery gates: reliable base, data and integration, value workflows, then markets and networks. The global line begins with reconciliation software; the LatAm line begins with observation and authorized-partner pilots.
 
-The website and presentation use the transparent Bloch Inc wordmark supplied in `Postern_BLCH_P2B_Genesis4_Integration_Response_EN.pdf`. The dark and light logo variants are stored in `assets/`, with the matching B favicon.
-
 The complete 16-slide English presentation is `downloads/Bloch_Inc_Products_Services_EN_v4.pdf`. To rebuild it, install ReportLab and run:
 
 ```sh
