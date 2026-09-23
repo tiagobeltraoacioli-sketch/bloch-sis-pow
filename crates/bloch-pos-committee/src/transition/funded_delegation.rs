@@ -567,10 +567,12 @@ impl CommittedState {
             return Err(R::Signature);
         }
 
-        self.validators
+        let validator = self
+            .validators
             .get_mut(&tx.validator)
-            .expect("validator existence checked above")
-            .commission_bps = tx.commission_bps;
+            .ok_or(FundedDelegationReject::Validator)?;
+
+        validator.commission_bps = tx.commission_bps;
         Ok(Self::staking_tx_charge(
             self.epoch,
             1,
