@@ -1364,6 +1364,12 @@ on my own fork."**
 
 ### 10.4 `getutxos`/`listunspent` — the correct enumeration pattern (edition 1's is wrong)
 
+**Deployment note (2026-09-23):** The node source now contains an opt-in,
+head-bound third-parameter cursor extension. This section describes the
+previously deployed two-parameter behavior and remains the safe integration
+assumption until a binary carrying the extension is released and verified.
+See [the source-only cursor contract](GENESIS4-UTXO-CURSOR-SOURCE-ONLY.md).
+
 <div class="warn">
 
 **There is no pagination cursor and no `offset` parameter — the RPC signature

@@ -51,11 +51,41 @@ assert.equal(wrongEnrollment.valid, false, 'Wrong enrolled public key must rejec
 const serialized = await client.verifyAnchor({ signed_anchor_hex: fixture.signed_anchor_hex }, enrolledTestPubkey);
 assert.equal(serialized.valid, true, `Serialized signed anchor rejected: ${serialized.reason}`);
 
+// Exercise the actual HTTP boundary as well as the example client's local
+// guard. These placeholders contain no secrets or usable Bitcoin material.
+async function expectBadRequest(route, body, pattern) {
+  const response = await fetch(new URL(route, process.env.PQ_SHIELD_TEST_URL), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(10_000),
+  });
+  assert.equal(response.status, 400, `${route} should reject this request`);
+  const result = await response.json();
+  assert.match(result.error, pattern);
+  assert.equal(typeof result.non_custodial, 'string');
+}
+
+await expectBadRequest('/anchor/commitment',
+  { ...fixture.fields, mnemonic: 'placeholder' }, /secret material/i);
+await expectBadRequest('/vault/unvault-tx',
+  { vault: { pq_secret: 'placeholder' } }, /secret material/i);
+await expectBadRequest('/anchor/verify',
+  { signed_anchor_hex: fixture.signed_anchor_hex }, /trusted_pq_pubkey/i);
+await expectBadRequest('/anchor/verify',
+  { signed_anchor_hex: '00', trusted_pq_pubkey: enrolledTestPubkey }, /signed_anchor_hex.*malformed/i);
+await expectBadRequest('/anchor/commitment',
+  { ...fixture.fields, recovery_hash: '00' }, /recovery_hash/i);
+await expectBadRequest('/anchor/commitment',
+  { ...fixture.fields, csv_delay: 65536 }, /expected u16/i);
+
 console.log(JSON.stringify({
   status: 'PASS',
   scope: 'local disposable PQ signer and local reference verifier only',
   checks: ['matching commitment bytes', 'valid signature', 'tampered safe destination rejected',
     'tampered policy commitment rejected', 'wrong enrolled key rejected',
-    'serialized signed anchor accepted'],
+    'serialized signed anchor accepted', 'top-level and nested secret-shaped fields rejected over HTTP',
+    'missing trust root rejected over HTTP', 'malformed signed anchor rejected over HTTP',
+    'malformed recovery hash rejected over HTTP', 'oversized CSV delay rejected over HTTP'],
   bitcoin_signing: false, broadcast: false, bloch_consensus_anchor: false,
 }, null, 2));

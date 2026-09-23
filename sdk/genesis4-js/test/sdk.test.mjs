@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import G4 from '../g4.cjs';
 import { createCore } from '../core.mjs';
-import { createLocalWallet, deriveLocalAddress, createSignedTransaction, broadcastSignedTransaction, getTransaction, getTransactionObservation, compareTransactionObservations, inspectDepositOutputs } from '../index.mjs';
+import { createLocalWallet, deriveLocalAddress, createSignedTransaction, broadcastSignedTransaction, getTransaction, getTransactionObservation, trackSignedTransaction, compareTransactionObservations, inspectDepositOutputs } from '../index.mjs';
 
 const core = createCore();
 const mnemonic = core.call('new_mnemonic', { words: 24 }).mnemonic;
@@ -78,6 +78,37 @@ test('broadcast checks local identity and node byte correlation without using tx
   await assert.rejects(broadcastSignedTransaction(signed, { fetchImpl: async () => response({ result: {
     accepted: true, bytes: signed.rawHex.length / 2, tx_hash: '00'.repeat(32),
   } }) }), /mismatched byte count or correlation hash/);
+});
+
+test('stored signed transfer can be observed after a timeout without rebroadcast', async () => {
+  const signed = await createSignedTransaction({ addressFrom: address, mnemonic, addressTo: address, amount: '0.001', fetchImpl });
+  const calls = [];
+  const observation = await trackSignedTransaction(signed, { fetchImpl: async (_url, options) => {
+    calls.push(options?.body ? JSON.parse(options.body).method : 'GET');
+    return options?.body ? response({ result: { status: 'pending' } }) : response({ error: 'not indexed' }, 404);
+  } });
+  assert.deepEqual(calls, ['GET', 'gettxstatus']);
+  assert.equal(observation.txid, signed.txid);
+  assert.equal(observation.observation.kind, 'unresolved');
+  assert.equal(observation.comparison.status, 'unresolved');
+  assert.equal(observation.comparison.requiresReview, true);
+  const includedReceipt = {
+    ...receiptFixture, txid: signed.txid,
+    outputs: receiptFixture.outputs.map(output => ({ ...output, txid: signed.txid })),
+  };
+  const included = await trackSignedTransaction(signed, {
+    previousObservation: observation.observation,
+    fetchImpl: async (_url, options) => {
+      assert.equal(options?.body, undefined, 'included lookup must not ask node status');
+      return response(includedReceipt);
+    },
+  });
+  assert.equal(included.observation.kind, 'included');
+  assert.equal(included.comparison.status, 'first_inclusion');
+  assert.equal(included.comparison.requiresReview, true);
+  await assert.rejects(trackSignedTransaction({ ...signed, rawHex: `00${signed.rawHex.slice(2)}` }, {
+    fetchImpl: () => { throw new Error('Network called'); },
+  }), /nothing was submitted/);
 });
 
 test('mismatched source address is refused before any RPC', async () => {

@@ -9,12 +9,12 @@ const HEX = /^[a-fA-F0-9]{64}$/;
 const MAX_BYTES = 256 * 1024;
 
 function usage() {
-  return 'Usage: node evidence-assess.cjs --preflight DIR --checkpoint DIR --expect-domain 64-HEX --expect-genesis-sha256 64-HEX [--json]\nReads only the two local evidence bundles and their SHA256SUMS. Expected values must come from independently authenticated release material. This comparison never qualifies a validator or opens staking.';
+  return 'Usage: node evidence-assess.cjs --preflight DIR --checkpoint DIR --expect-domain 64-HEX --expect-genesis-sha256 64-HEX [--expect-binary-sha256 64-HEX] [--expect-signer-set-sha256 64-HEX] [--json]\nReads only the two local evidence bundles and their SHA256SUMS. Expected values must come from independently authenticated release material. Optional pins require matching recorded input fingerprints. This comparison never qualifies a validator or opens staking.';
 }
 
 function parseArgs(argv) {
   const opts = { json: false };
-  const names = { '--preflight': 'preflight', '--checkpoint': 'checkpoint', '--expect-domain': 'expectDomain', '--expect-genesis-sha256': 'expectGenesisSha256' };
+  const names = { '--preflight': 'preflight', '--checkpoint': 'checkpoint', '--expect-domain': 'expectDomain', '--expect-genesis-sha256': 'expectGenesisSha256', '--expect-binary-sha256': 'expectBinarySha256', '--expect-signer-set-sha256': 'expectSignerSetSha256' };
   for (let i = 0; i < argv.length; i++) {
     if (['--help', '-h'].includes(argv[i])) { opts.help = true; continue; }
     if (argv[i] === '--json') { opts.json = true; continue; }
@@ -23,8 +23,8 @@ function parseArgs(argv) {
     opts[name] = argv[++i];
   }
   if (opts.help) return opts;
-  for (const name of Object.values(names)) if (!opts[name]) throw new Error(`${name} is required`);
-  for (const name of ['expectDomain', 'expectGenesisSha256']) if (!HEX.test(opts[name])) throw new Error(`${name} must be 64 hexadecimal characters`);
+  for (const name of ['preflight', 'checkpoint', 'expectDomain', 'expectGenesisSha256']) if (!opts[name]) throw new Error(`${name} is required`);
+  for (const name of ['expectDomain', 'expectGenesisSha256', 'expectBinarySha256', 'expectSignerSetSha256']) if (opts[name] !== undefined && !HEX.test(opts[name])) throw new Error(`${name} must be 64 hexadecimal characters`);
   return opts;
 }
 
@@ -65,6 +65,15 @@ function assess(preflight, checkpoint, expected) {
   add(HEX.test(domain || '') && HEX.test(p.inputs.expectedNetworkDomain || '') && domain.toLowerCase() === expected.expectDomain.toLowerCase() && p.inputs.expectedNetworkDomain.toLowerCase() === expected.expectDomain.toLowerCase() ? 'PASS' : 'FAIL', 'network-domain', 'Preflight domain and its declared trusted input must match the operator-supplied domain.');
   const genesis = c.inputFingerprints.genesis?.sha256;
   add(HEX.test(genesis || '') && genesis.toLowerCase() === expected.expectGenesisSha256.toLowerCase() ? 'PASS' : 'FAIL', 'genesis-artifact', 'Checkpoint verifier genesis-manifest fingerprint must match the operator-supplied digest.');
+  for (const [option, input, id, label] of [
+    ['expectBinarySha256', 'binary', 'binary-artifact', 'node binary'],
+    ['expectSignerSetSha256', 'signerSet', 'signer-set-artifact', 'signer set']
+  ]) {
+    if (expected[option] === undefined) continue;
+    if (!HEX.test(expected[option])) throw new Error(`${option} must be 64 hexadecimal characters`);
+    const recorded = c.inputFingerprints[input]?.sha256;
+    add(HEX.test(recorded || '') && recorded.toLowerCase() === expected[option].toLowerCase() ? 'PASS' : 'FAIL', id, `Recorded ${label} fingerprint must match the independently supplied SHA-256.`);
+  }
   const stdout = c.diagnostics.stdout;
   if (typeof stdout !== 'string' || Buffer.byteLength(stdout) > 65536) throw new Error('Missing or oversized checkpoint stdout');
   const epochText = uniqueField(stdout, 'checkpoint epoch', /^  epoch\s+([0-9]+)\s*$/gm);
@@ -96,8 +105,8 @@ function assess(preflight, checkpoint, expected) {
   const status = checks.some(item => item.status === 'FAIL') ? 'FAIL' : 'REVIEW_MANUAL_REQUIRED';
   return {
     schema: 'bloch.genesis4.validator-evidence-assessment.v1', observedAt: new Date().toISOString(), status,
-    inputs: { preflightSha256: preflight.sha256, checkpointSha256: checkpoint.sha256, expectedDomain: expected.expectDomain.toLowerCase(), expectedGenesisSha256: expected.expectGenesisSha256.toLowerCase() },
-    checks, manualGate: { status: 'NOT_VERIFIED', required: ['Authenticate release material, WS digest, signer arrangement and both expected values independently.', 'Compare historical checkpoint root using an independent archival node when epochs differ.', 'Verify deployed binary identity, node independence, exit, withdrawal delay and spendable payout before any bond.'] },
+    inputs: { preflightSha256: preflight.sha256, checkpointSha256: checkpoint.sha256, expectedDomain: expected.expectDomain.toLowerCase(), expectedGenesisSha256: expected.expectGenesisSha256.toLowerCase(), ...(expected.expectBinarySha256 === undefined ? {} : { expectedBinarySha256: expected.expectBinarySha256.toLowerCase() }), ...(expected.expectSignerSetSha256 === undefined ? {} : { expectedSignerSetSha256: expected.expectSignerSetSha256.toLowerCase() }) },
+    checks, manualGate: { status: 'NOT_VERIFIED', required: ['Authenticate release material, WS digest, signer arrangement and all supplied expected values independently.', 'Compare historical checkpoint root using an independent archival node when epochs differ.', 'Verify deployed binary identity, node independence, exit, withdrawal delay and spendable payout before any bond.'] },
     note: 'SHA256SUMS detects accidental or subsequent bundle changes; it does not authenticate the creator. This local assessment never qualifies staking or delegation.'
   };
 }

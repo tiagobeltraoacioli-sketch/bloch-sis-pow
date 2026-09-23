@@ -4136,8 +4136,12 @@ impl Engine {
 
             RpcRequest::Balance(script_hash) => Ok(rpc::balance_json(&self.state, &script_hash)),
 
-            RpcRequest::Utxos { script_hash, limit } => {
-                Ok(rpc::utxos_json(&self.state, &script_hash, limit))
+            RpcRequest::Utxos { script_hash, limit, paginated, cursor } => {
+                if paginated {
+                    rpc::utxos_page_json(&self.state, &script_hash, limit, cursor.as_ref())
+                } else {
+                    Ok(rpc::utxos_json(&self.state, &script_hash, limit))
+                }
             }
 
             RpcRequest::TxOut { txid, vout } => Ok(rpc::txout_json(&self.state, &txid, vout)),

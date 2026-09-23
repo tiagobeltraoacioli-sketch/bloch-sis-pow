@@ -104,6 +104,47 @@ const ENGINE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default and maximum page size for [`RpcRequest::Utxos`].
 const UTXO_PAGE_DEFAULT: usize = 100;
 const UTXO_PAGE_MAX: usize = 1_000;
+const UTXO_CURSOR_BYTES: usize = 101;
+const UTXO_CURSOR_VERSION: u8 = 1;
+const UTXO_STALE_CURSOR: i64 = -32020;
+
+/// A page boundary bound to one committed block and one script hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UtxoCursor {
+    head: [u8; 32],
+    script_hash: [u8; 32],
+    txid: [u8; 32],
+    vout: u32,
+}
+
+impl UtxoCursor {
+    fn encode(&self) -> String {
+        let mut bytes = Vec::with_capacity(UTXO_CURSOR_BYTES);
+        bytes.push(UTXO_CURSOR_VERSION);
+        bytes.extend_from_slice(&self.head);
+        bytes.extend_from_slice(&self.script_hash);
+        bytes.extend_from_slice(&self.txid);
+        bytes.extend_from_slice(&self.vout.to_be_bytes());
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn decode(raw: &str) -> Option<Self> {
+        let hex_len = raw.strip_prefix("0x").unwrap_or(raw).len();
+        if hex_len != UTXO_CURSOR_BYTES * 2 {
+            return None;
+        }
+        let bytes = from_hex(raw)?;
+        if bytes.len() != UTXO_CURSOR_BYTES || bytes[0] != UTXO_CURSOR_VERSION {
+            return None;
+        }
+        Some(Self {
+            head: bytes[1..33].try_into().ok()?,
+            script_hash: bytes[33..65].try_into().ok()?,
+            txid: bytes[65..97].try_into().ok()?,
+            vout: u32::from_be_bytes(bytes[97..101].try_into().ok()?),
+        })
+    }
+}
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
 //
@@ -851,14 +892,13 @@ pub enum RpcRequest {
     ValidatorByKey([u8; 32]),
     ValidatorAdmission,
     Balance([u8; 32]),
-    Utxos { script_hash: [u8; 32], limit: usize },
+    Utxos { script_hash: [u8; 32], limit: usize, paginated: bool, cursor: Option<UtxoCursor> },
     /// `gettxout` — is this ONE output still unspent?
     ///
-    /// Exists because `listunspent` cannot answer it. That method takes a
-    /// script hash and a limit, has no cursor, and caps at `UTXO_PAGE_MAX`
-    /// (1,000). The founder's script hash holds 425,568 outputs on the live
-    /// chain, so 424,568 of them are unreachable through it: the same first
-    /// page comes back every time.
+    /// Exists because exact outpoint checks should not require enumerating a
+    /// holder's entire UTXO set. Legacy two-argument `listunspent` has no
+    /// cursor and caps at `UTXO_PAGE_MAX` (1,000); the optional third cursor
+    /// argument is a source-only extension until the next node release.
     ///
     /// That gap has a consequence beyond convenience. The vesting-lock flag day
     /// has a go/no-go precondition — the founder and team allocation outpoints
@@ -1006,8 +1046,12 @@ impl EngineBackend {
         };
         match req {
             RpcRequest::Balance(script_hash) => Some(Ok(balance_json(&state, script_hash))),
-            RpcRequest::Utxos { script_hash, limit } => {
-                Some(Ok(utxos_json(&state, script_hash, *limit)))
+            RpcRequest::Utxos { script_hash, limit, paginated, cursor } => {
+                Some(if *paginated {
+                    utxos_page_json(&state, script_hash, *limit, cursor.as_ref())
+                } else {
+                    Ok(utxos_json(&state, script_hash, *limit))
+                })
             }
             _ => None,
         }
@@ -1153,7 +1197,18 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
                     (n as usize).clamp(1, UTXO_PAGE_MAX)
                 }
             };
-            RpcRequest::Utxos { script_hash, limit }
+            let cursor_param = pick(params, 2, "cursor");
+            let cursor = match cursor_param {
+                None | Some(Json::Null) => None,
+                Some(Json::Str(raw)) => Some(UtxoCursor::decode(raw).ok_or_else(|| {
+                    RpcError::invalid_params("`cursor` must be a version-1, 101-byte hex token")
+                })?),
+                Some(_) => return Err(RpcError::invalid_params("`cursor` must be a hex string or null")),
+            };
+            if cursor.as_ref().is_some_and(|c| c.script_hash != script_hash) {
+                return Err(RpcError::invalid_params("`cursor` belongs to a different script hash"));
+            }
+            RpcRequest::Utxos { script_hash, limit, paginated: cursor_param.is_some(), cursor }
         }
         "sendrawtransaction" => {
             let raw = pick(params, 0, "hex")
@@ -2272,9 +2327,8 @@ pub fn balance_json(state: &CommittedState, script_hash: &[u8; 32]) -> Json {
 
 /// `getutxos` — the outputs themselves, paginated.
 ///
-/// `truncated` rather than a cursor: the honest thing for a devnet-stage
-/// surface is to say the page was cut, not to invent a pagination protocol the
-/// OpenAPI V4 freeze has not decided on.
+/// Legacy two-argument responses retain `truncated` and their original shape.
+/// Callers opting into the third cursor argument use [`utxos_page_json`].
 ///
 /// # Cost
 ///
@@ -2297,6 +2351,50 @@ pub fn utxos_json(state: &CommittedState, script_hash: &[u8; 32], limit: usize) 
         ("truncated", Json::Bool(total > page.len())),
         ("utxos", Json::Arr(page)),
     ])
+}
+
+/// Optional cursor extension. A stale head is rejected before any entries are read.
+/// The old two-parameter call remains byte-for-byte the original response shape.
+pub fn utxos_page_json(
+    state: &CommittedState,
+    script_hash: &[u8; 32],
+    limit: usize,
+    cursor: Option<&UtxoCursor>,
+) -> RpcResult {
+    let limit = limit.clamp(1, UTXO_PAGE_MAX);
+    let head = *state.head().as_bytes();
+    if cursor.is_some_and(|c| c.head != head) {
+        return Err(RpcError::new(UTXO_STALE_CURSOR, "UTXO cursor is stale: committed head changed"));
+    }
+    if cursor.is_some_and(|c| &c.script_hash != script_hash) {
+        return Err(RpcError::invalid_params("`cursor` belongs to a different script hash"));
+    }
+    let after = cursor.map(|c| (c.txid, c.vout));
+    let total = state.utxo_count_for_script(script_hash);
+    let entries: Vec<_> = state.utxos_for_script_after(script_hash, after).take(limit + 1).collect();
+    let has_more = entries.len() > limit;
+    let page: Vec<Json> = entries.iter().take(limit).map(|e| eutxo_json(e)).collect();
+    let next_cursor = if has_more {
+        let last = entries[limit - 1];
+        Json::s(UtxoCursor {
+            head,
+            script_hash: *script_hash,
+            txid: last.txid,
+            vout: last.vout,
+        }.encode())
+    } else {
+        Json::Null
+    };
+    Ok(Json::obj(vec![
+        ("script_hash", Json::hex(script_hash)),
+        ("total", Json::u(total as u64)),
+        ("returned", Json::u(page.len() as u64)),
+        ("truncated", Json::Bool(has_more)),
+        ("utxos", Json::Arr(page)),
+        ("at_head", Json::hex(&head)),
+        ("at_slot", Json::u(state.slot())),
+        ("next_cursor", next_cursor),
+    ]))
 }
 
 /// `gettxout` — one outpoint, answered as present-or-absent.

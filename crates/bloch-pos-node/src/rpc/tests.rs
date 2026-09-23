@@ -457,6 +457,53 @@ fn getutxos_lists_the_outputs_and_reports_truncation() {
     assert_eq!(page.get("truncated"), Some(&Json::Bool(true)));
 }
 
+#[test]
+fn cursor_pages_are_ordered_complete_and_head_bound() {
+    let st = state_with_balances();
+    let script = [0xAB; 32];
+    let old = utxos_json(&st, &script, 1);
+    assert!(old.get("next_cursor").is_none(), "legacy response shape must stay fixed");
+
+    let first = utxos_page_json(&st, &script, 1, None).unwrap();
+    let first_token = first.get("next_cursor").unwrap().as_str().unwrap();
+    let first_cursor = UtxoCursor::decode(first_token).unwrap();
+    assert_eq!(first.get("at_head").unwrap().as_str(), Some(crate::codec::hex32(st.head().as_bytes()).as_str()));
+    assert_eq!(first.get("truncated"), Some(&Json::Bool(true)));
+    let second = utxos_page_json(&st, &script, 1, Some(&first_cursor)).unwrap();
+    let second_cursor = UtxoCursor::decode(second.get("next_cursor").unwrap().as_str().unwrap()).unwrap();
+    let third = utxos_page_json(&st, &script, 1, Some(&second_cursor)).unwrap();
+    assert_eq!(third.get("truncated"), Some(&Json::Bool(false)));
+    assert_eq!(third.get("next_cursor"), Some(&Json::Null));
+    let mut seen = Vec::new();
+    for page in [&first, &second, &third] {
+        let item = page.get("utxos").unwrap().at(0).unwrap();
+        seen.push((item.get("txid").unwrap().as_str().unwrap().to_owned(), item.get("vout").unwrap().as_u64().unwrap()));
+    }
+    assert_eq!(seen, vec![("11".repeat(32), 0), ("11".repeat(32), 1), ("22".repeat(32), 0)]);
+
+    let mut stale = first_cursor.clone();
+    stale.head[0] ^= 1;
+    assert_eq!(utxos_page_json(&st, &script, 1, Some(&stale)).unwrap_err().code, UTXO_STALE_CURSOR);
+    assert_eq!(utxos_page_json(&st, &[0xCD; 32], 1, Some(&first_cursor)).unwrap_err().code, -32602);
+}
+
+#[test]
+fn cursor_range_lookup_does_not_walk_prior_pages() {
+    use bloch_pos_committee::transition::{eutxo_entry_visits, reset_eutxo_entry_visits};
+    let st = state_with_many_outputs(0, 2_001);
+    let script = [0xAB; 32];
+    let first = utxos_page_json(&st, &script, 1_000, None).unwrap();
+    let cursor = UtxoCursor::decode(first.get("next_cursor").unwrap().as_str().unwrap()).unwrap();
+    reset_eutxo_entry_visits();
+    let second = utxos_page_json(&st, &script, 1_000, Some(&cursor)).unwrap();
+    assert_eq!(second.get("returned").unwrap().as_u64(), Some(1_000));
+    assert!(eutxo_entry_visits() <= 1_001, "range lookup must not scan the first page");
+    let final_cursor = UtxoCursor::decode(second.get("next_cursor").unwrap().as_str().unwrap()).unwrap();
+    let third = utxos_page_json(&st, &script, 1_000, Some(&final_cursor)).unwrap();
+    assert_eq!(third.get("returned").unwrap().as_u64(), Some(1));
+    assert_eq!(third.get("next_cursor"), Some(&Json::Null));
+}
+
 // ─── H6: the ledger reads must not be O(the ledger) ─────────────────────────
 
 /// A committed state holding `others` outputs under one script hash and
@@ -618,7 +665,7 @@ fn ledger_reads_are_served_off_the_published_head() {
     assert_eq!(v.get("balance_sat").unwrap().as_str(), Some("18000000000000500"));
 
     let u = backend
-        .call(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: 2 })
+        .call(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: 2, paginated: false, cursor: None })
         .expect("getutxos must be answerable with no consensus thread listening");
     assert_eq!(u.get("total").unwrap().as_u64(), Some(3));
     assert_eq!(u.get("returned").unwrap().as_u64(), Some(2));
@@ -713,7 +760,7 @@ fn every_method_routes_to_its_request() {
     call(b, &request("getutxos", &format!("[\"{script}\"]")));
     assert_eq!(
         spy.last(),
-        Some(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: UTXO_PAGE_DEFAULT })
+        Some(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: UTXO_PAGE_DEFAULT, paginated: false, cursor: None })
     );
 
     call(b, &request("getmempoolinfo", "[]"));
@@ -772,7 +819,30 @@ fn listunspent_is_the_same_request_as_getutxos() {
     let a = spy.last();
     call(spy.as_ref(), &request("listunspent", &format!("[\"{script}\", 5]")));
     assert_eq!(a, spy.last());
-    assert_eq!(a, Some(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: 5 }));
+    assert_eq!(a, Some(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: 5, paginated: false, cursor: None }));
+}
+
+#[test]
+fn optional_cursor_routes_for_both_aliases_and_rejects_bad_tokens() {
+    let spy = Spy::new();
+    let script = "ab".repeat(32);
+    call(spy.as_ref(), &request("getutxos", &format!("[\"{script}\", 2, null]")));
+    let expected = Some(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: 2, paginated: true, cursor: None });
+    assert_eq!(spy.last(), expected);
+    call(spy.as_ref(), &request("listunspent", &format!("[\"{script}\", 2, null]")));
+    assert_eq!(spy.last(), expected);
+
+    let cursor = UtxoCursor { head: [7; 32], script_hash: [0xAB; 32], txid: [8; 32], vout: 9 };
+    call(spy.as_ref(), &request("getutxos", &format!("{{\"script_hash\":\"{script}\",\"limit\":2,\"cursor\":\"{}\"}}", cursor.encode())));
+    assert_eq!(spy.last(), Some(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: 2, paginated: true, cursor: Some(cursor.clone()) }));
+
+    for bad in ["", "00", "zz", &"ff".repeat(101)] {
+        let response = call(spy.as_ref(), &request("getutxos", &format!("[\"{script}\",2,\"{bad}\"]")));
+        assert_eq!(error_code(&response), Some(-32602));
+    }
+    let other_script = "cd".repeat(32);
+    let response = call(spy.as_ref(), &request("getutxos", &format!("[\"{other_script}\",2,\"{}\"]", cursor.encode())));
+    assert_eq!(error_code(&response), Some(-32602));
 }
 
 #[test]
@@ -792,7 +862,7 @@ fn getutxos_limit_is_clamped_rather_than_trusted() {
     call(spy.as_ref(), &request("getutxos", &format!("[\"{script}\", 99999999]")));
     assert_eq!(
         spy.last(),
-        Some(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: UTXO_PAGE_MAX }),
+        Some(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: UTXO_PAGE_MAX, paginated: false, cursor: None }),
         "an unbounded page size is a memory amplification on an unauthenticated port"
     );
 }

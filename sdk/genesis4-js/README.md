@@ -13,10 +13,10 @@ This is a source-distributed package; no npm publication is assumed.
 ## Install
 
 The versioned package is served at
-`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.7.tgz`.
+`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.8.tgz`.
 
 ```sh
-npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.7.tgz
+npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.8.tgz
 ```
 
 It can also be installed from a local checkout:
@@ -102,7 +102,7 @@ timeout until the original txid has been checked.
 
 `accepted: true` means mempool admission, not block inclusion or finality.
 Persist the exact signed bytes, txid, `signingRootHex` and `rawHash` for
-reconciliation and safe transport retries. SDK 0.1.7 requires all four fields
+reconciliation and safe transport retries. SDK 0.1.8 requires all four fields
 when broadcasting: before network I/O it recomputes the domain-separated txid
 from `signingRootHex` and SHA3-256 of `rawHex`; after admission it compares the
 node's byte count and `tx_hash` correlation handle. The latter is **not** the
@@ -110,6 +110,31 @@ consensus txid. A mismatch after submission is ambiguous because the node may
 already have accepted the bytes; check the original txid before retrying.
 If submission times out, retry the same bytes or look up the txid; do not infer failure from
 the timeout.
+
+`trackSignedTransaction(signed, {previousObservation})` checks the stored
+signed envelope before reading its txid from the archival API. If no included
+receipt exists, it returns an unresolved single-node observation. With a prior
+observation, it also reports a changed block, receipt, finality or head through
+`comparison`. It never broadcasts, rebuilds or approves a transaction:
+
+```js
+import { trackSignedTransaction } from '@blochprotocol/genesis4-sdk';
+
+const tracked = await trackSignedTransaction(signed, {
+  previousObservation: previous?.observation ?? null,
+});
+console.log(tracked.txid, tracked.observation.kind, tracked.comparison.status);
+// Save the observation for the next check; apply your own payout policy.
+```
+
+For a previously saved signed JSON object, the included read-only CLI prints
+only the txid, current observation and comparison; it does not print the
+signed bytes or submit a transaction:
+
+```sh
+node examples/track-signed.mjs signed.json > first-observation.json
+node examples/track-signed.mjs signed.json first-observation.json > next-observation.json
+```
 
 ## Transaction lookup
 

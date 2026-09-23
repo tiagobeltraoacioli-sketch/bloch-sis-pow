@@ -23,5 +23,16 @@ public key. The test key is provisionally treated as enrolled **only inside
 this local check**. A real verifier needs an independently authenticated
 enrollment source.
 
+The runner also sends direct HTTP requests to the local Rust service. It
+requires HTTP 400 and a structured error for top-level and nested
+secret-shaped field names (using inert placeholder values), a signed anchor
+without `trusted_pq_pubkey`, malformed serialized anchor bytes, a short
+recovery hash, and a `csv_delay` above the `u16` range. A signature checked
+against a different enrolled test key returns HTTP 200 with `valid: false`;
+that is a verification result, not a malformed-request response. These are
+bounded local checks, not proof that every invalid request is rejected.
+The runner does not assert a maximum request-body size because this service
+does not set an explicit body-size contract.
+
 This is a local reference test. It uses fake regtest addresses and no funded
 UTXO, Bitcoin signing, broadcast, or Bloch consensus anchor enforcement.

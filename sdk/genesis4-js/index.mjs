@@ -190,8 +190,8 @@ export async function createSignedTransaction({
   } finally { core.dispose(); }
 }
 
-/** Broadcast bytes created above. The returned tx_hash is not the consensus txid. */
-export async function broadcastSignedTransaction(signed, { rpcUrl = DEFAULT_RPC, fetchImpl = fetch } = {}) {
+/** Check the persisted SDK envelope before any transaction network request. */
+function verifySignedEnvelope(signed) {
   if (!HASH.test(signed?.txid) || !HASH.test(signed?.signingRootHex) || !HASH.test(signed?.rawHash) ||
       !/^[0-9a-f]+$/i.test(signed?.rawHex ?? '') || signed.rawHex.length % 2 ||
       signed.rawHex.length / 2 > G4.limits.RPC_MAX_RAW_TX_BYTES) {
@@ -201,6 +201,12 @@ export async function broadcastSignedTransaction(signed, { rpcUrl = DEFAULT_RPC,
       rawCorrelationHash(signed.rawHex) !== signed.rawHash.toLowerCase()) {
     throw new Error('Signed transaction identity or bytes changed; nothing was submitted');
   }
+  return signed.txid.toLowerCase();
+}
+
+/** Broadcast bytes created above. The returned tx_hash is not the consensus txid. */
+export async function broadcastSignedTransaction(signed, { rpcUrl = DEFAULT_RPC, fetchImpl = fetch } = {}) {
+  verifySignedEnvelope(signed);
   const admission = await rpc('sendrawtransaction', [signed.rawHex], rpcUrl, fetchImpl);
   if (admission?.accepted !== true) {
     throw new Error('sendrawtransaction did not confirm mempool admission; check the txid before building another transfer');
@@ -292,6 +298,17 @@ export async function getTransactionObservation(txid, {
       observationError: error.message,
     };
   }
+}
+
+/** Observe a stored signed transfer after submission or an ambiguous timeout. No rebroadcast occurs. */
+export async function trackSignedTransaction(signed, {
+  previousObservation = null, explorerUrl = DEFAULT_EXPLORER,
+  rpcUrl = DEFAULT_RPC, fetchImpl = fetch,
+} = {}) {
+  const txid = verifySignedEnvelope(signed);
+  const observation = await getTransactionObservation(txid, { explorerUrl, rpcUrl, fetchImpl });
+  const comparison = compareTransactionObservations(previousObservation, observation);
+  return { txid, observation, comparison };
 }
 
 /** Compare saved observations without deciding an exchange's credit or payout policy. */

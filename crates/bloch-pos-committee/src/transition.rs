@@ -2012,11 +2012,21 @@ impl EutxoSet {
         &self,
         script_hash: &[u8; 32],
     ) -> impl Iterator<Item = &crate::state_root::EutxoEntry> + '_ {
+        self.script_entries_after(script_hash, None)
+    }
+
+    /// Start strictly after an outpoint without walking preceding entries.
+    fn script_entries_after(
+        &self,
+        script_hash: &[u8; 32],
+        after: Option<([u8; 32], u32)>,
+    ) -> impl Iterator<Item = &crate::state_root::EutxoEntry> + '_ {
+        let lower = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
         self.entries
             .by_script
             .get(script_hash)
             .into_iter()
-            .flatten()
+            .flat_map(move |outpoints| outpoints.range((lower, std::ops::Bound::Unbounded)))
             .filter_map(move |op| {
                 note_entry_visit();
                 self.entries.by_outpoint.get(op)
@@ -4859,6 +4869,15 @@ impl CommittedState {
         script_hash: &[u8; 32],
     ) -> impl Iterator<Item = &crate::state_root::EutxoEntry> + '_ {
         self.eutxos.script_entries(script_hash)
+    }
+
+    /// The same index-backed ordered view, starting strictly after an outpoint.
+    pub fn utxos_for_script_after(
+        &self,
+        script_hash: &[u8; 32],
+        after: Option<([u8; 32], u32)>,
+    ) -> impl Iterator<Item = &crate::state_root::EutxoEntry> + '_ {
+        self.eutxos.script_entries_after(script_hash, after)
     }
 
     /// How many outputs `script_hash` holds, without visiting one of them.
