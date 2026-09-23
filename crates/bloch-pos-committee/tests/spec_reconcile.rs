@@ -195,8 +195,8 @@ fn f06_domain_and_state_tags_all_published() {
         );
     }
     assert!(
-        doc.contains("| `0x1E` | `TAG_FUNDED_VALIDATOR`"),
-        "{MIGRATION} component-tag table must number the live registry through 0x1E"
+        doc.contains("| `0x20` | `TAG_FUNDED_DELEGATION_LIFECYCLE`"),
+        "{MIGRATION} component-tag table must number the live registry through 0x20"
     );
 }
 
@@ -428,7 +428,7 @@ fn tx19_tokenomics_terminal_facts_match_code() {
 fn tx20_legacy_interfaces_are_classified_accurately() {
     assert_eq!(
         STATE_COMPONENT_TAGS.len(),
-        30,
+        32,
         "update the interface reconciliation when the append-only registry grows"
     );
 
@@ -436,7 +436,7 @@ fn tx20_legacy_interfaces_are_classified_accurately() {
     for claim in [
         "DTO with 14 top-level fields",
         "`STATE_COMPONENT_TAGS` registry",
-        "currently contains 30 components",
+        "currently contains 32 components",
         "winning error for a multiply-invalid block is not consensus data",
     ] {
         assert!(doc.contains(claim), "interface spec missing TX-20 claim {claim:?}");
