@@ -39,6 +39,12 @@ cargo test                      # 7 endpoint tests (round-trip vs. the crate)
 The service is its **own cargo workspace** — building or running it does **not** touch
 the Bloch chain node. Do **not** colocate it on a founder/chain node.
 
+Every POST route accepts at most **65,536 raw request-body bytes (64 KiB)**.
+Axum rejects larger bodies with **HTTP 413** before JSON parsing or PQ
+verification. This framework response is plain text; application-generated
+JSON errors include the non-custodial banner. Send only public inputs and
+keep requests comfortably below the limit.
+
 - `GET /` — HTML landing page + route table
 - `GET /health` — liveness JSON
 

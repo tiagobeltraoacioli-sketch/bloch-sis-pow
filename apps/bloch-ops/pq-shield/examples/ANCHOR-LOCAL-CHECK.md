@@ -31,8 +31,12 @@ recovery hash, and a `csv_delay` above the `u16` range. A signature checked
 against a different enrolled test key returns HTTP 200 with `valid: false`;
 that is a verification result, not a malformed-request response. These are
 bounded local checks, not proof that every invalid request is rejected.
-The runner does not assert a maximum request-body size because this service
-does not set an explicit body-size contract.
+The runner also sends a 65,537-byte JSON body to each of the six POST routes
+and requires HTTP 413. The Rust router test checks the boundary: a 65,536-byte
+body reaches JSON parsing, while one more byte is rejected before parsing.
+This 64 KiB limit applies to raw request-body bytes. The framework's HTTP 413
+response is plain text; application-generated JSON errors retain the
+`non_custodial` field.
 
 This is a local reference test. It uses fake regtest addresses and no funded
 UTXO, Bitcoin signing, broadcast, or Bloch consensus anchor enforcement.

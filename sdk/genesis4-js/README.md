@@ -13,10 +13,10 @@ This is a source-distributed package; no npm publication is assumed.
 ## Install
 
 The versioned package is served at
-`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.8.tgz`.
+`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.9.tgz`.
 
 ```sh
-npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.8.tgz
+npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.9.tgz
 ```
 
 It can also be installed from a local checkout:
@@ -96,13 +96,36 @@ limits. It requests the node's maximum 1,000 UTXOs and returns
 `utxosTruncated: true` if the source owns more than the node can enumerate.
 The core can still select from the visible coins; if those cannot cover the
 amount, an exchange node or indexer with a complete UTXO view is required.
+SDK 0.1.9 also has an explicit `utxoMode: 'cursor'` for a node built with the
+source-only Genesis-4 cursor extension. **That extension is not deployed on
+current mainnet.** The default remains `legacy` and makes the same two-argument
+request as earlier versions. Do not enable cursor mode against an unverified
+node: the SDK rejects a legacy reply before signing.
+
+```js
+const signed = await createSignedTransaction({
+  addressFrom, mnemonic, addressTo, amount: '1.25',
+  rpcUrl: process.env.BLOCH_RPC_URL,
+  utxoMode: 'cursor',
+  maxUtxoPages: 10,
+});
+console.log(signed.utxoPageCount, signed.utxoSourceHead);
+```
+
+Cursor mode checks the reported head, slot, total, output order and script hash
+across all pages, then requires a matching `getchaininfo` head before signing.
+It rejects stale or incomplete enumeration. `maxUtxoPages` is 1–20 (default
+10), so addresses exceeding the configured bound fail rather than signing from
+a partial list. This is an operator-supplied node observation, not independent
+proof of the eUTXO set or finality. Confirm node support and the exact release
+before use in a value-bearing workflow.
 Transaction creation and broadcast are separate because a transfer's
 fee can become stale at the next block; do not rebuild a transfer after a
 timeout until the original txid has been checked.
 
 `accepted: true` means mempool admission, not block inclusion or finality.
 Persist the exact signed bytes, txid, `signingRootHex` and `rawHash` for
-reconciliation and safe transport retries. SDK 0.1.8 requires all four fields
+reconciliation and safe transport retries. SDK 0.1.9 requires all four fields
 when broadcasting: before network I/O it recomputes the domain-separated txid
 from `signingRootHex` and SHA3-256 of `rawHex`; after admission it compares the
 node's byte count and `tx_hash` correlation handle. The latter is **not** the

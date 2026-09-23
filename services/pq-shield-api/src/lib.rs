@@ -28,6 +28,7 @@
 
 use axum::{
     body::Bytes,
+    extract::DefaultBodyLimit,
     extract::rejection::JsonRejection,
     http::StatusCode,
     response::{Html, IntoResponse, Response},
@@ -629,6 +630,10 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// this service (which itself speaks plain HTTP) is a deployment
 /// requirement, not optional hardening.
 const MAX_CONCURRENT_REQUESTS: usize = 64;
+/// Maximum JSON body accepted by the `Bytes` extractor on every POST route.
+/// The largest normal payload is a serialized PQ anchor, well below 64 KiB.
+/// Axum rejects a larger body with HTTP 413 before JSON parsing or crypto work.
+pub const MAX_JSON_BODY_BYTES: usize = 64 * 1024;
 
 /// Build the router. Exposed so integration tests can drive it in-process.
 ///
@@ -649,6 +654,7 @@ pub fn router() -> Router {
         .route("/vault/clawback-tx", post(clawback_tx))
         .route("/anchor/commitment", post(anchor_commitment))
         .route("/anchor/verify", post(anchor_verify))
+        .layer(DefaultBodyLimit::max(MAX_JSON_BODY_BYTES))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
@@ -969,6 +975,34 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.expect("router must still serve a request");
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn every_json_route_limits_request_bytes_before_parsing() {
+        use tower::util::ServiceExt as _;
+
+        for path in [
+            "/vault/address", "/vault/unvault-tx", "/vault/branch-a-tx",
+            "/vault/clawback-tx", "/anchor/commitment", "/anchor/verify",
+        ] {
+            for (size, expected) in [
+                (MAX_JSON_BODY_BYTES, StatusCode::BAD_REQUEST),
+                (MAX_JSON_BODY_BYTES + 1, StatusCode::PAYLOAD_TOO_LARGE),
+            ] {
+                // Whitespace is valid padding. At the limit the short `{}`
+                // reaches route parsing; one byte over is rejected by Axum.
+                let mut payload = b"{}".to_vec();
+                payload.resize(size, b' ');
+                let req = axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(payload))
+                    .unwrap();
+                let resp = router().oneshot(req).await.expect("router response");
+                assert_eq!(resp.status(), expected, "{path} with {size} body bytes");
+            }
+        }
     }
 }
 

@@ -79,6 +79,20 @@ await expectBadRequest('/anchor/commitment',
 await expectBadRequest('/anchor/commitment',
   { ...fixture.fields, csv_delay: 65536 }, /expected u16/i);
 
+const maxBodyBytes = 64 * 1024;
+for (const route of ['/vault/address', '/vault/unvault-tx', '/vault/branch-a-tx',
+  '/vault/clawback-tx', '/anchor/commitment', '/anchor/verify']) {
+  const oversized = `{}${' '.repeat(maxBodyBytes - 1)}`;
+  assert.equal(Buffer.byteLength(oversized), maxBodyBytes + 1);
+  const response = await fetch(new URL(route, process.env.PQ_SHIELD_TEST_URL), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: oversized,
+    signal: AbortSignal.timeout(10_000),
+  });
+  assert.equal(response.status, 413, `${route} must reject a body above 64 KiB`);
+}
+
 console.log(JSON.stringify({
   status: 'PASS',
   scope: 'local disposable PQ signer and local reference verifier only',
@@ -86,6 +100,7 @@ console.log(JSON.stringify({
     'tampered policy commitment rejected', 'wrong enrolled key rejected',
     'serialized signed anchor accepted', 'top-level and nested secret-shaped fields rejected over HTTP',
     'missing trust root rejected over HTTP', 'malformed signed anchor rejected over HTTP',
-    'malformed recovery hash rejected over HTTP', 'oversized CSV delay rejected over HTTP'],
+    'malformed recovery hash rejected over HTTP', 'oversized CSV delay rejected over HTTP',
+    'all six JSON routes reject request bodies above 64 KiB with HTTP 413'],
   bitcoin_signing: false, broadcast: false, bloch_consensus_anchor: false,
 }, null, 2));

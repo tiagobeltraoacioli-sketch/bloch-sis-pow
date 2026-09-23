@@ -504,6 +504,97 @@ fn cursor_range_lookup_does_not_walk_prior_pages() {
     assert_eq!(third.get("next_cursor"), Some(&Json::Null));
 }
 
+#[test]
+fn cursor_enumerates_more_than_one_thousand_without_gaps_or_duplicates() {
+    let st = state_with_many_outputs(17, 2_001);
+    let script = [0xAB; 32];
+    let mut after = None;
+    let mut seen = Vec::new();
+    let mut page_sizes = Vec::new();
+    loop {
+        let page = utxos_page_json(&st, &script, 1_500, after.as_ref()).unwrap();
+        let items = match page.get("utxos").unwrap() {
+            Json::Arr(items) => items,
+            other => panic!("utxos must be an array, got {other:?}"),
+        };
+        let returned = page.get("returned").unwrap().as_u64().unwrap() as usize;
+        assert_eq!(returned, items.len());
+        assert_eq!(page.get("total").unwrap().as_u64(), Some(2_001));
+        assert_eq!(page.get("script_hash").unwrap().as_str(), Some("ab".repeat(32).as_str()));
+        assert_eq!(page.get("at_head").unwrap().as_str(), Some(crate::codec::hex32(st.head().as_bytes()).as_str()));
+        assert_eq!(page.get("at_slot").unwrap().as_u64(), Some(st.slot()));
+        assert!(returned <= 1_000, "the page maximum must apply even to direct calls");
+        page_sizes.push(returned);
+        for item in items {
+            assert_eq!(item.get("script_hash").unwrap().as_str(), Some("ab".repeat(32).as_str()));
+            seen.push((item.get("txid").unwrap().as_str().unwrap().to_owned(), item.get("vout").unwrap().as_u64().unwrap()));
+        }
+        match page.get("next_cursor").unwrap() {
+            Json::Str(token) => {
+                assert_eq!(page.get("truncated"), Some(&Json::Bool(true)));
+                assert!(!items.is_empty());
+                let cursor = UtxoCursor::decode(token).unwrap();
+                let last = items.last().unwrap();
+                assert_eq!(cursor.txid.as_slice(), from_hex(last.get("txid").unwrap().as_str().unwrap()).unwrap());
+                assert_eq!(cursor.vout as u64, last.get("vout").unwrap().as_u64().unwrap());
+                after = Some(cursor);
+            }
+            Json::Null => {
+                assert_eq!(page.get("truncated"), Some(&Json::Bool(false)));
+                break;
+            }
+            other => panic!("invalid next_cursor: {other:?}"),
+        }
+    }
+    assert_eq!(page_sizes, vec![1_000, 1_000, 1]);
+    assert_eq!(seen.len(), 2_001);
+    assert!(seen.windows(2).all(|pair| pair[0] < pair[1]));
+    for (i, (txid, vout)) in seen.iter().enumerate() {
+        let mut expected = [0xFF; 32];
+        expected[..4].copy_from_slice(&(i as u32).to_be_bytes());
+        assert_eq!(txid, &crate::codec::hex32(&expected));
+        assert_eq!(*vout, 0);
+    }
+    // An empty owner still has an unambiguous complete first page.
+    let empty = utxos_page_json(&st, &[0x42; 32], 0, None).unwrap();
+    assert_eq!(empty.get("total").unwrap().as_u64(), Some(0));
+    assert_eq!(empty.get("returned").unwrap().as_u64(), Some(0));
+    assert_eq!(empty.get("truncated"), Some(&Json::Bool(false)));
+    assert_eq!(empty.get("next_cursor"), Some(&Json::Null));
+}
+
+#[test]
+fn cursor_from_previous_committed_head_rejects_new_snapshot() {
+    let before = state_with_many_outputs(0, 2);
+    let script = [0xAB; 32];
+    let first = utxos_page_json(&before, &script, 1, None).unwrap();
+    let cursor = UtxoCursor::decode(first.get("next_cursor").unwrap().as_str().unwrap()).unwrap();
+
+    // Build the same output set at a different committed block ID. The token
+    // must be rejected even if all UTXO entries happen to be unchanged.
+    let mut next_header = genesis_header();
+    next_header.slot = 1;
+    let mut txid_zero = [0xFF; 32];
+    txid_zero[..4].copy_from_slice(&0u32.to_be_bytes());
+    let mut txid_one = [0xFF; 32];
+    txid_one[..4].copy_from_slice(&1u32.to_be_bytes());
+    let after = CommittedState::genesis(
+        BlockId::of(&next_header), [9u8; 32],
+        &[GenesisValidator {
+            index: 0, pubkey: vec![0xAA; 64], staked_sat: 200_000 * 100_000_000,
+            randao_commitment: [1u8; 32], withdrawal_credentials: vec![], commission_bps: 500,
+        }],
+        &[0], [0u8; 32], [0u8; 32], [0u8; 32],
+        EvmCommitment { account_root: [0u8; 32], receipts_root: [0u8; 32], gas_used: 0, base_fee_per_gas: 0 },
+        &[
+            EutxoEntry { txid: txid_zero, vout: 0, value: 1_000, script_hash: script },
+            EutxoEntry { txid: txid_one, vout: 0, value: 1_000, script_hash: script },
+        ],
+    );
+    assert_ne!(before.head(), after.head());
+    assert_eq!(utxos_page_json(&after, &script, 1, Some(&cursor)).unwrap_err().code, UTXO_STALE_CURSOR);
+}
+
 // ─── H6: the ledger reads must not be O(the ledger) ─────────────────────────
 
 /// A committed state holding `others` outputs under one script hash and
@@ -836,13 +927,25 @@ fn optional_cursor_routes_for_both_aliases_and_rejects_bad_tokens() {
     call(spy.as_ref(), &request("getutxos", &format!("{{\"script_hash\":\"{script}\",\"limit\":2,\"cursor\":\"{}\"}}", cursor.encode())));
     assert_eq!(spy.last(), Some(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: 2, paginated: true, cursor: Some(cursor.clone()) }));
 
-    for bad in ["", "00", "zz", &"ff".repeat(101)] {
+    let before_bad = spy.last();
+    let mut wrong_version = cursor.encode();
+    wrong_version.replace_range(..2, "02");
+    let mut bad_digit = cursor.encode();
+    bad_digit.replace_range(50..51, "g");
+    for bad in ["", "00", "zz", &"ff".repeat(101), &wrong_version, &bad_digit] {
         let response = call(spy.as_ref(), &request("getutxos", &format!("[\"{script}\",2,\"{bad}\"]")));
         assert_eq!(error_code(&response), Some(-32602));
+        assert_eq!(spy.last(), before_bad, "bad token must not reach the backend");
     }
     let other_script = "cd".repeat(32);
     let response = call(spy.as_ref(), &request("getutxos", &format!("[\"{other_script}\",2,\"{}\"]", cursor.encode())));
     assert_eq!(error_code(&response), Some(-32602));
+    assert_eq!(spy.last(), before_bad);
+    for invalid_type in ["0", "false", "{}", "[]"] {
+        let response = call(spy.as_ref(), &request("listunspent", &format!("[\"{script}\",2,{invalid_type}]")));
+        assert_eq!(error_code(&response), Some(-32602));
+        assert_eq!(spy.last(), before_bad);
+    }
 }
 
 #[test]

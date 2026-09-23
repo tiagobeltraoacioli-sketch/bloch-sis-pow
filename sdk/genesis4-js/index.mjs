@@ -123,10 +123,72 @@ function assertFits(value) {
   }
 }
 
+async function completeCursorUtxos(scriptHash, rpcUrl, fetchImpl, maxUtxoPages) {
+  const all = [];
+  let cursor = null;
+  let head = null;
+  let slot = null;
+  let total = null;
+  let lastOutpoint = null;
+  const seenCursors = new Set();
+  for (let pageNumber = 1; pageNumber <= maxUtxoPages; pageNumber++) {
+    const page = await rpc('getutxos', [scriptHash, Number(G4.limits.UTXO_PAGE_MAX), cursor], rpcUrl, fetchImpl);
+    if (!HASH.test(page?.script_hash) || page.script_hash.toLowerCase() !== scriptHash.toLowerCase() ||
+        !HASH.test(page.at_head) || !Number.isSafeInteger(page.at_slot) || page.at_slot < 0 ||
+        !Number.isSafeInteger(page.total) || page.total < 0 ||
+        !Number.isSafeInteger(page.returned) || !Array.isArray(page.utxos) ||
+        page.returned !== page.utxos.length || page.utxos.length > Number(G4.limits.UTXO_PAGE_MAX) ||
+        typeof page.truncated !== 'boolean' ||
+        (page.truncated ? !/^[0-9a-f]{202}$/i.test(page.next_cursor ?? '') : page.next_cursor !== null)) {
+      throw new Error('Node did not return the complete Genesis-4 cursor protocol; no transaction was signed');
+    }
+    if (head === null) { head = page.at_head.toLowerCase(); slot = page.at_slot; total = page.total; }
+    else if (page.at_head.toLowerCase() !== head || page.at_slot !== slot || page.total !== total) {
+      throw new Error('UTXO cursor pages changed head, slot or total; no transaction was signed');
+    }
+    const parsed = G4.parseUtxos(page);
+    for (const entry of parsed.utxos) {
+      if (!HASH.test(entry.txid) || !HASH.test(entry.scriptHash) ||
+          entry.scriptHash.toLowerCase() !== scriptHash.toLowerCase()) {
+        throw new Error('UTXO cursor page contained an invalid or foreign output; no transaction was signed');
+      }
+      const current = { txid: entry.txid.toLowerCase(), vout: entry.vout };
+      if (lastOutpoint && (current.txid < lastOutpoint.txid ||
+          (current.txid === lastOutpoint.txid && current.vout <= lastOutpoint.vout))) {
+        throw new Error('UTXO cursor pages repeated or reordered an outpoint; no transaction was signed');
+      }
+      lastOutpoint = current;
+      all.push(entry);
+    }
+    if (all.length > total || (page.truncated && (page.utxos.length === 0 || all.length === total))) {
+      throw new Error('UTXO cursor page count contradicts the total; no transaction was signed');
+    }
+    if (!page.truncated) {
+      if (all.length !== total) throw new Error('UTXO cursor ended before the reported total; no transaction was signed');
+      return { utxos: all, truncated: false, head, slot, pageCount: pageNumber };
+    }
+    cursor = page.next_cursor.toLowerCase();
+    if (cursor.slice(0, 2) !== '01' || cursor.slice(2, 66) !== head ||
+        cursor.slice(66, 130) !== scriptHash.toLowerCase() ||
+        cursor.slice(130, 194) !== lastOutpoint.txid ||
+        Number.parseInt(cursor.slice(194), 16) !== lastOutpoint.vout) {
+      throw new Error('UTXO cursor does not bind the last output and chain head; no transaction was signed');
+    }
+    if (seenCursors.has(cursor)) throw new Error('UTXO cursor repeated; no transaction was signed');
+    seenCursors.add(cursor);
+  }
+  throw new Error(`UTXO cursor exceeded the ${maxUtxoPages}-page safety limit; no transaction was signed`);
+}
+
 /** Build a signed Genesis-4 transfer. amount is a decimal BLOCH string. No broadcast occurs. */
 export async function createSignedTransaction({
   addressFrom, mnemonic, addressTo, amount, rpcUrl = DEFAULT_RPC, fetchImpl = fetch,
+  utxoMode = 'legacy', maxUtxoPages = 10,
 }) {
+  if (!['legacy', 'cursor'].includes(utxoMode)) throw new Error('utxoMode must be legacy or cursor');
+  if (!Number.isSafeInteger(maxUtxoPages) || maxUtxoPages < 1 || maxUtxoPages > 20) {
+    throw new Error('maxUtxoPages must be an integer from 1 to 20');
+  }
   const from = mainnetAddress(addressFrom, 'addressFrom');
   mainnetAddress(addressTo, 'addressTo');
   const amountSat = G4.sats.toWire(G4.sats.fromUserBLCH(amount));
@@ -137,11 +199,22 @@ export async function createSignedTransaction({
     if (String(wallet.address).toLowerCase() !== addressFrom.trim().toLowerCase()) {
       throw new Error('addressFrom does not match the mnemonic');
     }
-    const [utxoResult, chainResult] = await Promise.all([
-      rpc('getutxos', [from.scriptHash, Number(G4.limits.UTXO_PAGE_MAX)], rpcUrl, fetchImpl),
-      rpc('getchaininfo', [], rpcUrl, fetchImpl),
-    ]);
-    const utxos = G4.parseUtxos(utxoResult);
+    let utxos, chainResult;
+    if (utxoMode === 'cursor') {
+      utxos = await completeCursorUtxos(from.scriptHash, rpcUrl, fetchImpl, maxUtxoPages);
+      chainResult = await rpc('getchaininfo', [], rpcUrl, fetchImpl);
+      if (!HASH.test(chainResult?.block_id) || chainResult.block_id.toLowerCase() !== utxos.head ||
+          chainResult.slot !== utxos.slot) {
+        throw new Error('Chain head changed after UTXO enumeration; no transaction was signed');
+      }
+    } else {
+      const [utxoResult, currentChain] = await Promise.all([
+        rpc('getutxos', [from.scriptHash, Number(G4.limits.UTXO_PAGE_MAX)], rpcUrl, fetchImpl),
+        rpc('getchaininfo', [], rpcUrl, fetchImpl),
+      ]);
+      utxos = G4.parseUtxos(utxoResult);
+      chainResult = currentChain;
+    }
     const chain = G4.parseChainInfo(chainResult);
     if (!Number.isSafeInteger(chain.epoch) || chain.nextBaseFeeMillisatPerGas == null ||
         chain.slot == null || !Number.isSafeInteger(chainResult.behind_by_slots) || chainResult.behind_by_slots > 2) {
@@ -186,6 +259,9 @@ export async function createSignedTransaction({
       format: signed.format,
       selectedUtxos: signed.selected_utxos,
       utxosTruncated: utxos.truncated,
+      utxoMode,
+      utxoPageCount: utxos.pageCount ?? 1,
+      utxoSourceHead: utxos.head ?? null,
     };
   } finally { core.dispose(); }
 }

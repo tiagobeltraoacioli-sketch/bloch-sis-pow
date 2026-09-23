@@ -47,7 +47,7 @@
   <p class="callout">Bitcoin script enforces its hashlock and branch delay. Without a Bitcoin covenant, the deposit-to-trigger policy also depends on pre-signed transaction handling and secure deletion of any bypass key.</p>
 </section>
 <section class="section light" id="routes">
-  <div class="intro"><p class="kicker">02 / HTTP CONTRACT</p><h2>Six precise routes.<br><em>No secret fields.</em></h2><p>Run the separate native service locally. JSON fields named like a mnemonic, seed, private key, WIF or preimage are rejected with HTTP 400. Bitcoin public keys must be 33-byte compressed secp256k1 keys.</p></div>
+  <div class="intro"><p class="kicker">02 / HTTP CONTRACT</p><h2>Six precise routes.<br><em>No secret fields.</em></h2><p>Run the separate native service locally. JSON fields named like a mnemonic, seed, private key, WIF or preimage are rejected with HTTP 400. Requests above 64 KiB receive HTTP 413 before parsing. Bitcoin public keys must be 33-byte compressed secp256k1 keys.</p></div>
   <div class="api-spec"><div><strong>Machine-readable OpenAPI 3.1</strong><p>Exact route paths, public request fields, unsigned response artifacts and error shape. The only server listed is your local process; importing this file does not connect to a hosted API.</p></div><a href="openapi.json" download="pq-shield-openapi.json">Download API contract ↓</a></div>
   <div class="terminal"><div class="terminal-top"><span>LOCAL SERVICE / DEFAULT BIND</span><span>127.0.0.1:8787</span></div><pre><code>cd services/pq-shield-api
 cargo run

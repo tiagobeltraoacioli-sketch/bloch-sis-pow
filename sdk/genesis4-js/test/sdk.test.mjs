@@ -58,6 +58,83 @@ test('high-level SDK produces signed bytes ready for sendrawtransaction', async 
   assert.match(signed.rawHash, /^[0-9a-f]{64}$/);
 });
 
+test('explicit cursor mode enumerates a stable complete UTXO view before signing', async () => {
+  const script_hash = G4.inspectAddress(address).scriptHash;
+  const head = 'cc'.repeat(32);
+  const token = `01${head}${script_hash}${'11'.repeat(32)}00000000`;
+  const calls = [];
+  const pagedFetch = async (_url, options) => {
+    const request = JSON.parse(options.body);
+    calls.push(request);
+    if (request.method === 'getchaininfo') return response({ result: {
+      block_id: head, height: 100, slot: 120, epoch: 4,
+      next_base_fee_millisat_per_gas: '10', behind_by_slots: 0,
+    } });
+    assert.equal(request.method, 'getutxos');
+    assert.equal(request.params[0], script_hash);
+    const first = request.params[2] === null;
+    assert.equal(request.params[2], first ? null : token);
+    return response({ result: {
+      script_hash, at_head: head, at_slot: 120, total: 2, returned: 1,
+      truncated: first, next_cursor: first ? token : null,
+      utxos: [{ txid: (first ? '11' : '22').repeat(32), vout: 0,
+        value_sat: '1000000', script_hash }],
+    } });
+  };
+  const signed = await createSignedTransaction({
+    addressFrom: address, mnemonic, addressTo: address, amount: '0.001',
+    utxoMode: 'cursor', fetchImpl: pagedFetch,
+  });
+  assert.equal(signed.utxosTruncated, false);
+  assert.equal(signed.utxoPageCount, 2);
+  assert.equal(signed.utxoSourceHead, head);
+  assert.deepEqual(calls.map(call => call.method), ['getutxos', 'getutxos', 'getchaininfo']);
+});
+
+test('cursor mode fails closed on legacy replies, page conflicts and safety limit', async () => {
+  const script_hash = G4.inspectAddress(address).scriptHash;
+  const head = 'cc'.repeat(32);
+  const token = `01${head}${script_hash}${'11'.repeat(32)}00000000`;
+  const page = (txid, truncated, override = {}) => ({
+    script_hash, at_head: head, at_slot: 120, total: 2, returned: 1,
+    truncated, next_cursor: truncated ? token : null,
+    utxos: [{ txid, vout: 0, value_sat: '1000000', script_hash }],
+    ...override,
+  });
+  const callWith = getPage => createSignedTransaction({
+    addressFrom: address, mnemonic, addressTo: address, amount: '0.001',
+    utxoMode: 'cursor', fetchImpl: async (_url, options) => {
+      const request = JSON.parse(options.body);
+      if (request.method !== 'getutxos') throw new Error('Signing reached chain read after bad pages');
+      return response({ result: getPage(request.params[2]) });
+    },
+  });
+  await assert.rejects(callWith(() => ({ script_hash, total: 1, returned: 1,
+    truncated: false, utxos: [{ txid, vout: 0, value_sat: '1000000', script_hash }] })), /cursor protocol/);
+  await assert.rejects(callWith(() => page('11'.repeat(32), true, {
+    next_cursor: '01'.padEnd(202, '0'),
+  })), /does not bind/);
+  await assert.rejects(callWith(cursor => cursor === null ? page('11'.repeat(32), true)
+    : page('11'.repeat(32), false)), /repeated or reordered/);
+  await assert.rejects(callWith(cursor => cursor === null ? page('11'.repeat(32), true)
+    : page('22'.repeat(32), false, { at_head: 'dd'.repeat(32) })), /changed head/);
+  await assert.rejects(createSignedTransaction({ addressFrom: address, mnemonic, addressTo: address,
+    amount: '0.001', utxoMode: 'cursor', maxUtxoPages: 1,
+    fetchImpl: async () => response({ result: page('11'.repeat(32), true) }),
+  }), /safety limit/);
+  await assert.rejects(createSignedTransaction({ addressFrom: address, mnemonic, addressTo: address,
+    amount: '0.001', utxoMode: 'cursor',
+    fetchImpl: async (_url, options) => {
+      const request = JSON.parse(options.body);
+      if (request.method === 'getchaininfo') return response({ result: {
+        block_id: 'dd'.repeat(32), height: 100, slot: 120, epoch: 4,
+        next_base_fee_millisat_per_gas: '10', behind_by_slots: 0,
+      } });
+      return response({ result: page(txid, false, { total: 1 }) });
+    },
+  }), /Chain head changed/);
+});
+
 test('broadcast checks local identity and node byte correlation without using tx_hash as txid', async () => {
   const signed = await createSignedTransaction({ addressFrom: address, mnemonic, addressTo: address, amount: '0.001', fetchImpl });
   let calls = 0;
