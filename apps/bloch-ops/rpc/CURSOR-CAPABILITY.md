@@ -2,14 +2,16 @@
 
 The current node source has an optional third `getutxos` parameter. Supplying `null` requests a first page with `at_head`, `at_slot`, and `next_cursor`; legacy two-parameter calls retain the old response. **This source contract does not mean the public Genesis-4 gateway or your node runs that release.** Measure your own endpoint before changing wallet behavior. The [RPC catalog v1](catalog.v1.json) describes the older deployed surface and does not claim cursor availability.
 
-`cursor-capability.cjs` is an opt-in, read-only observation. Use Node.js 20 or later and a public script hash controlled or approved by your operator. It sends one `getutxos(script_hash, 1, null)` request; only when the reply includes a `next_cursor` does it send one follow-up request. It never enumerates the UTXO set, signs, or broadcasts. It rejects non-HTTPS endpoints except loopback HTTP, credentials and query strings in URLs, and responses larger than 128 KiB. Each request has a 12-second default timeout (30-second maximum).
+`cursor-capability.cjs` is an opt-in, read-only observation. Use Node.js 20 or later and a public script hash controlled or approved by your operator. It sends one `getbuildinfo` request and one `getutxos(script_hash, 1, null)` request; only when the reply includes a `next_cursor` does it send a third request to follow one page. It never enumerates the UTXO set, signs, or broadcasts. It rejects non-HTTPS endpoints except loopback HTTP, credentials and query strings in URLs, and responses larger than 128 KiB per request. Each request has a 12-second default timeout (30-second maximum).
 
 ```sh
 node cursor-capability.cjs --rpc https://YOUR-RPC/rpc --script-hash "$SCRIPT_HASH" --probe-cursor --json
 node --test cursor-capability.test.cjs
 ```
 
-The script hash must be exactly 64 hexadecimal characters. `--probe-cursor` is required; omission sends zero requests. The JSON report contains the endpoint and script hash, so keep it private if those details are sensitive. Exit code `0` means a strictly validated cursor response was observed; `1` means a legacy shape, unavailable method, stale head, invalid response, timeout, or other inconclusive result; `2` means invalid arguments.
+The script hash must be exactly 64 hexadecimal characters. `--probe-cursor` is required; omission sends zero requests. The JSON report contains the endpoint and script hash, so keep it private if those details are sensitive. Exit code `0` means a strictly validated cursor response was observed; `1` means a legacy shape, unavailable method, stale head, invalid response, timeout, or other inconclusive result; `2` means invalid arguments. The exit code is based on the observed `getutxos` shape, never the self-reported build marker.
+
+`build_marker` reports whether `getbuildinfo.features` contains `utxo_cursor_v1`: `advertised`, `absent`, `unavailable`, `timeout`, or `invalid_response`. The feature list is validated and bounded; a missing field is `absent`. `marker_shape_relation` compares this marker with the first `getutxos` response: `advertised_and_observed`, `advertised_but_legacy`, `unadvertised_but_observed`, `unadvertised_and_legacy`, `marker_unknown`, or `shape_unknown`. Any mismatch deserves investigation. The marker is self-reported, so even `advertised_and_observed` does not attest to the binary or prove complete pagination.
 
 | Status | Meaning |
 | --- | --- |

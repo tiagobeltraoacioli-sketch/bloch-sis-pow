@@ -35,6 +35,7 @@ function withResponse(t, route, value, status = 200, contentType = 'application/
     assert.equal(url.origin, 'http://127.0.0.1:8787');
     assert.equal(url.pathname, route);
     assert.equal(options.method, route === '/health' ? 'GET' : 'POST');
+    assert.equal(options.redirect, 'manual');
     if (options.body) assert.doesNotThrow(() => JSON.parse(options.body));
     return new Response(contentType === 'application/json' ? JSON.stringify(value) : value,
       { status, headers: { 'content-type': contentType } });
@@ -116,6 +117,54 @@ test('malformed and oversized successful responses fail without echoing their bo
     const client = withResponse(sub, '/health', 'x'.repeat(64 * 1024 + 1), 200, 'text/plain');
     await assert.rejects(client.health(), /Unexpected \/health response; body exceeds 64 KiB/);
   });
+});
+
+test('redirects are rejected without forwarding the public payload', async (t) => {
+  const marker = 'public-request-marker';
+  const prior = globalThis.fetch;
+  let fetches = 0;
+  globalThis.fetch = async (_url, options) => {
+    fetches++;
+    assert.equal(options.redirect, 'manual');
+    assert.match(options.body, /public-request-marker/);
+    return new Response(null, { status: 307, headers: {
+      location: `https://unexpected.example/${marker}`,
+    } });
+  };
+  t.after(() => { globalThis.fetch = prior; });
+  await assert.rejects(createPqShieldClient().vaultAddress({ ...fields, marker }), (error) => {
+    assert.equal(error.message, '/vault/address returned a redirect or unexpected origin');
+    assert.equal(error.message.includes(marker), false);
+    return true;
+  });
+  assert.equal(fetches, 1);
+});
+
+test('unexpected response origins and followed redirects are rejected', async (t) => {
+  const prior = globalThis.fetch;
+  t.after(() => { globalThis.fetch = prior; });
+  for (const responseUrl of ['https://unexpected.example/health', 'http://127.0.0.1:9999/health']) {
+    globalThis.fetch = async () => ({ url: responseUrl, status: 200, ok: true, body: null });
+    await assert.rejects(createPqShieldClient().health(), /redirect or unexpected origin/);
+  }
+  globalThis.fetch = async () => ({ redirected: true, status: 200, ok: true, body: null });
+  await assert.rejects(createPqShieldClient().health(), /redirect or unexpected origin/);
+});
+
+test('network and timeout failures never echo transport details', async (t) => {
+  const marker = 'public-request-marker';
+  const prior = globalThis.fetch;
+  t.after(() => { globalThis.fetch = prior; });
+  for (const error of [new Error(`Failed to fetch ${marker}`),
+    new DOMException(`Timed out with ${marker}`, 'TimeoutError')]) {
+    globalThis.fetch = async () => { throw error; };
+    await assert.rejects(createPqShieldClient().vaultAddress({ ...fields, marker }), (caught) => {
+      assert.equal(caught.message, 'Unable to reach local /vault/address service');
+      assert.equal(caught.message.includes(marker), false);
+      assert.equal(caught.cause, undefined);
+      return true;
+    });
+  }
 });
 
 test('remote origins and secret-shaped nested request fields are rejected before fetch', async () => {

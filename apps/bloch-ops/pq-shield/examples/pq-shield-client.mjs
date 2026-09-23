@@ -81,12 +81,29 @@ export function createPqShieldClient(base = 'http://127.0.0.1:8787') {
 
   async function request(route, body) {
     if (body !== undefined) checkPublicInput(body);
-    const response = await fetch(new URL(route, origin), {
-      method: body === undefined ? 'GET' : 'POST',
-      headers: body === undefined ? undefined : { 'content-type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(10_000),
-    });
+    let response;
+    try {
+      response = await fetch(new URL(route, origin), {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        redirect: 'manual',
+        signal: AbortSignal.timeout(10_000),
+      });
+    } catch {
+      // Fetch errors may contain a URL, a reflected payload, or a proxy response.
+      throw new Error(`Unable to reach local ${route} service`);
+    }
+    let unexpectedOrigin = false;
+    try {
+      unexpectedOrigin = !!response.url && new URL(response.url).origin !== origin.origin;
+    } catch {
+      unexpectedOrigin = true;
+    }
+    if (response.redirected || unexpectedOrigin || response.status >= 300 && response.status < 400 || response.type === 'opaqueredirect') {
+      void response.body?.cancel().catch(() => {});
+      throw new Error(`${route} returned a redirect or unexpected origin`);
+    }
     if (!response.ok) {
       // Framework errors can be plain text, and JSON errors can reflect input.
       // Status is enough for callers; never include a server body in an error.

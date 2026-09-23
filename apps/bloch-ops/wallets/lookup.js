@@ -1,5 +1,5 @@
 import { validIncludedReceipt } from './receipt-validator.mjs';
-import { compareReceiptObservations } from './receipt-comparison.mjs';
+import { compareReceiptObservations } from './receipt-comparison.mjs?v=20260923-5';
 
 const form = document.getElementById('lookup-form');
 const input = document.getElementById('lookup-txid');

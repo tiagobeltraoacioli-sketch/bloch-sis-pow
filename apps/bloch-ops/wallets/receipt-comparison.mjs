@@ -12,8 +12,8 @@ function validObservation(item) {
 function transfers(receipt) {
   const entries = list => list.map(({ txid, vout, value_sat, script_hash }) =>
     [txid.toLowerCase(), vout, value_sat, script_hash.toLowerCase()]);
-  return JSON.stringify([entries(receipt.inputs), entries(receipt.outputs),
-    receipt.fee_sat, receipt.stake_sat]);
+  return JSON.stringify([receipt.kind, receipt.size_bytes,
+    entries(receipt.inputs), entries(receipt.outputs), receipt.fee_sat, receipt.stake_sat]);
 }
 
 export function compareReceiptObservations(previous, current) {
@@ -34,18 +34,21 @@ export function compareReceiptObservations(previous, current) {
   }
   const before = previous.receipt, after = current.receipt;
   if (before.block_id.toLowerCase() !== after.block_id.toLowerCase() ||
-      before.height !== after.height || before.slot !== after.slot) {
-    return result('block_changed', true, 'Inclusion block, height or slot changed. Review earlier reconciliation decisions.');
+      before.height !== after.height || before.slot !== after.slot || before.index !== after.index) {
+    return result('block_changed', true, 'Inclusion block, height, slot or transaction index changed. Review earlier reconciliation decisions.');
   }
   if (transfers(before) !== transfers(after)) {
-    return result('receipt_changed', true, 'Canonical inputs, outputs or amounts changed for the same inclusion. Review source records.');
+    return result('receipt_changed', true, 'Transaction kind, size, inputs, outputs or amounts changed for the same inclusion. Review source records.');
   }
-  if (before.finalized && !after.finalized) {
+  if ((before.finalized && !after.finalized) ||
+      after.finalized_height < before.finalized_height ||
+      (before.corroboration === 'final' && after.corroboration !== 'final')) {
     return result('finality_regressed', true, 'Reported finality regressed. Compare independent nodes and checkpoints.');
   }
   if (after.confirmations < before.confirmations ||
-      after.observed_head_height < before.observed_head_height) {
-    return result('head_regressed', true, 'Reported head or confirmations moved backward. Check for stale data or a reorganization.');
+      after.observed_head_height < before.observed_head_height ||
+      after.observed_head_slot < before.observed_head_slot) {
+    return result('head_regressed', true, 'Reported head, slot or confirmations moved backward. Check for stale data or a reorganization.');
   }
   return result('consistent', false, 'This tab saw the same included transaction and nondecreasing reported progress. This is not independent settlement proof.');
 }

@@ -15,6 +15,9 @@ function fixture() {
     getvalidatoradmission: { active: true, epoch: 200, network_domain: domain }
   };
 }
+function rpcResponse(method, result, options = {}) {
+  return new Response(JSON.stringify({ jsonrpc: '2.0', id: `preflight-${method}`, result, ...options }), { headers: { 'content-type': 'application/json' } });
+}
 test('read-only pass still demands manual trust and lifecycle evidence', () => {
   const report = evaluate(fixture(), fixture(), { expectDomain: domain, maxLagSlots: 64 });
   assert.equal(report.summary, 'CHECKS_PASS_MANUAL_REQUIRED');
@@ -50,7 +53,7 @@ test('RPC client requests only the three read-only methods', async () => {
   global.fetch = async (_url, options) => {
     const request = JSON.parse(options.body);
     calls.push(request.method);
-    return { ok: true, json: async () => ({ result: fixture()[request.method] }) };
+    return rpcResponse(request.method, fixture()[request.method]);
   };
   try {
     const result = await readEndpoint('https://example.com/rpc');
@@ -66,7 +69,7 @@ test('method failure is reported while other probes continue and result fails cl
     const method = JSON.parse(options.body).method;
     calls.push(method);
     if (method === 'getbuildinfo') throw new DOMException('request aborted', 'AbortError');
-    return { ok: true, json: async () => ({ result: fixture()[method] }) };
+    return rpcResponse(method, fixture()[method]);
   };
   try {
     const result = await readEndpoint('https://example.com/rpc', 5000);
@@ -77,6 +80,67 @@ test('method failure is reported while other probes continue and result fails cl
     assert.equal(report.summary, 'FAIL');
     assert.equal(report.checks.find(item => item.title === 'primary getbuildinfo').level, 'FAIL');
     assert.equal(report.checks.at(-1).level, 'MANUAL');
+  } finally { global.fetch = original; }
+});
+test('rejects malformed JSON-RPC envelopes while continuing remaining methods', async () => {
+  const original = global.fetch;
+  let caseIndex = 0;
+  const invalid = [
+    { id: 'wrong-id' },
+    { jsonrpc: '1.0' },
+    { result: [] },
+    { result: null },
+    { error: null },
+    { result: undefined, error: { code: -32603, message: 'secret server diagnostic' } },
+    { error: { code: -32603, message: 'secret server diagnostic' } },
+    { error: { code: 'not-a-code', message: 'secret server diagnostic' } }
+  ];
+  try {
+    for (caseIndex = 0; caseIndex < invalid.length; caseIndex++) {
+      const calls = [];
+      global.fetch = async (_url, options) => {
+        const method = JSON.parse(options.body).method;
+        calls.push(method);
+        return rpcResponse(method, fixture()[method], method === 'getchaininfo' ? invalid[caseIndex] : {});
+      };
+      const result = await readEndpoint('https://example.com/rpc');
+      assert.deepEqual(calls, ['getchaininfo', 'getbuildinfo', 'getvalidatoradmission']);
+      assert.equal(result.getchaininfo, undefined);
+      assert.equal(result.getvalidatoradmission.network_domain, domain);
+      assert.equal(result.diagnostics[0].status, 'ERROR');
+      if (caseIndex === 5) assert.equal(result.diagnostics[0].detail, 'RPC error -32603');
+      assert.doesNotMatch(result.diagnostics[0].detail, /secret/);
+      assert.equal(evaluate(result, null, { expectDomain: domain, maxLagSlots: 2 }).summary, 'FAIL');
+    }
+  } finally { global.fetch = original; }
+});
+test('bounds streamed RPC responses and omits untrusted bodies and transport errors', async () => {
+  const original = global.fetch;
+  const secret = 'secret server diagnostic';
+  const oversized = JSON.stringify({ jsonrpc: '2.0', id: 'preflight-getchaininfo', result: { data: 'x'.repeat(65536) } });
+  const failures = [
+    new Response(secret, { status: 503 }),
+    new Response(oversized),
+    new Response('{ invalid json'),
+    new Response('{}', { headers: { 'content-length': '65537' } }),
+    new Error(secret)
+  ];
+  try {
+    for (const failure of failures) {
+      global.fetch = async (_url, options) => {
+        const method = JSON.parse(options.body).method;
+        if (method === 'getchaininfo') {
+          if (failure instanceof Error) throw failure;
+          return failure;
+        }
+        return rpcResponse(method, fixture()[method]);
+      };
+      const result = await readEndpoint('https://example.com/rpc');
+      assert.equal(result.diagnostics[0].status, 'ERROR');
+      assert.doesNotMatch(JSON.stringify(result.diagnostics), /secret/);
+      assert.equal(result.diagnostics[1].status, 'OK');
+      assert.equal(result.diagnostics[2].status, 'OK');
+    }
   } finally { global.fetch = original; }
 });
 test('failed optional reference probe cannot produce a passing comparison', () => {

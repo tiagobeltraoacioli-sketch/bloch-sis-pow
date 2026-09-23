@@ -26,15 +26,20 @@ test('first inclusion and stable progress remain observations, not credit approv
 test('missing, moved, altered or regressed receipts require review', () => {
   assert.equal(compareReceiptObservations(included(receipt), { kind: 'unresolved', txid }).status, 'receipt_unavailable');
   assert.equal(compareReceiptObservations(included(receipt), included({ ...receipt, block_id: 'dd'.repeat(32) })).status, 'block_changed');
+  assert.equal(compareReceiptObservations(included(receipt), included({ ...receipt, index: 1 })).status, 'block_changed');
   assert.equal(compareReceiptObservations(included(receipt), included({
     ...receipt, outputs: [{ ...receipt.outputs[0], value_sat: '99' }],
   })).status, 'receipt_changed');
+  assert.equal(compareReceiptObservations(included(receipt), included({ ...receipt, size_bytes: 8001 })).status, 'receipt_changed');
   assert.equal(compareReceiptObservations(included(receipt), included({
     ...receipt, finalized: false, status: 'confirmed',
   })).status, 'finality_regressed');
+  assert.equal(compareReceiptObservations(included(receipt), included({ ...receipt, finalized_height: 89 })).status, 'finality_regressed');
+  assert.equal(compareReceiptObservations(included({ ...receipt, corroboration: 'final' }), included(receipt)).status, 'finality_regressed');
   assert.equal(compareReceiptObservations(included(receipt), included({
     ...receipt, confirmations: 21, observed_head_height: 100,
   })).status, 'head_regressed');
+  assert.equal(compareReceiptObservations(included(receipt), included({ ...receipt, observed_head_slot: 120 })).status, 'head_regressed');
 });
 
 test('invalid and cross-transaction observations are refused', () => {

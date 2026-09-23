@@ -4,6 +4,7 @@
 
 const METHODS = ['getchaininfo', 'getbuildinfo', 'getvalidatoradmission'];
 const HEX32 = /^[a-f0-9]{64}$/i;
+const MAX_RPC_RESPONSE_BYTES = 64 * 1024;
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -39,6 +40,32 @@ function parseArgs(argv) {
   return opts;
 }
 
+class ProbeError extends Error {}
+
+async function boundedJson(response) {
+  const statedLength = Number(response.headers?.get('content-length'));
+  if (Number.isFinite(statedLength) && statedLength > MAX_RPC_RESPONSE_BYTES) throw new ProbeError('RPC response exceeds 65536 bytes');
+  if (!response.body || typeof response.body.getReader !== 'function') throw new ProbeError('RPC response body unavailable');
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_RPC_RESPONSE_BYTES) throw new ProbeError('RPC response exceeds 65536 bytes');
+      chunks.push(value);
+    }
+  } finally {
+    if (size > MAX_RPC_RESPONSE_BYTES) await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  const bytes = Buffer.concat(chunks, size);
+  try { return JSON.parse(bytes.toString('utf8')); }
+  catch { throw new ProbeError('Invalid JSON-RPC response JSON'); }
+}
+
 async function query(endpoint, method, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -50,10 +77,14 @@ async function query(endpoint, method, timeoutMs) {
       signal: controller.signal,
       redirect: 'error'
     });
-    if (!response.ok) throw new Error(`${method}: HTTP ${response.status}`);
-    const envelope = await response.json();
-    if (envelope.error) throw new Error(`${method}: RPC ${envelope.error.code}: ${envelope.error.message}`);
-    if (!envelope.result || typeof envelope.result !== 'object') throw new Error(`${method}: missing result object`);
+    if (!response.ok) throw new ProbeError(`HTTP ${Number.isInteger(response.status) ? response.status : 'error'}`);
+    const envelope = await boundedJson(response);
+    if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope) || envelope.jsonrpc !== '2.0' || envelope.id !== `preflight-${method}`) throw new ProbeError('Invalid JSON-RPC envelope');
+    if (Object.hasOwn(envelope, 'error')) {
+      if (Object.hasOwn(envelope, 'result') || typeof envelope.error !== 'object' || Array.isArray(envelope.error) || !Number.isSafeInteger(envelope.error.code) || typeof envelope.error.message !== 'string') throw new ProbeError('Invalid JSON-RPC error');
+      throw new ProbeError(`RPC error ${envelope.error.code}`);
+    }
+    if (!envelope.result || typeof envelope.result !== 'object' || Array.isArray(envelope.result)) throw new ProbeError('Missing result object');
     return envelope.result;
   } finally { clearTimeout(timer); }
 }
@@ -67,7 +98,7 @@ async function readEndpoint(endpoint, timeoutMs = 20000, label = 'primary') {
       values[method] = await query(endpoint, method, timeoutMs);
       values.diagnostics.push({ endpoint: label, method, status: 'OK', elapsedMs: Date.now() - started });
     } catch (error) {
-      const detail = error.name === 'AbortError' ? `Timed out after ${timeoutMs} ms` : String(error.message || error).slice(0, 200);
+      const detail = error.name === 'AbortError' ? `Timed out after ${timeoutMs} ms` : error instanceof ProbeError ? error.message : 'RPC transport or response read failed';
       values.diagnostics.push({ endpoint: label, method, status: 'ERROR', elapsedMs: Date.now() - started, detail });
     }
   }

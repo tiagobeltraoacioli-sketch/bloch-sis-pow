@@ -10,11 +10,11 @@ const AMOUNT = /^(0|[1-9][0-9]*)$/;
 function validCount(value) { return Number.isSafeInteger(value) && value >= 0; }
 function validHex32(value) { return typeof value === 'string' && HEX32.test(value); }
 
-async function request(endpoint, params, id, timeoutMs, fetcher) {
+async function request(endpoint, method, params, id, timeoutMs, fetcher) {
   const response = await fetcher(endpoint, {
     method: 'POST', redirect: 'error',
     headers: { 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id, method: 'getutxos', params }),
+    body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -41,6 +41,23 @@ async function request(endpoint, params, id, timeoutMs, fetcher) {
     return { error: { code: payload.error.code, message: payload.error.message.slice(0, 200) } };
   }
   return { result: payload.result };
+}
+
+function buildMarker(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('Expected object build information');
+  if (!Object.hasOwn(result, 'features')) return 'absent';
+  if (!Array.isArray(result.features) || result.features.length > 64 ||
+    result.features.some(feature => typeof feature !== 'string' || feature.length > 128)) {
+    throw new Error('Invalid build feature list');
+  }
+  return result.features.includes('utxo_cursor_v1') ? 'advertised' : 'absent';
+}
+
+function markerShapeRelation(marker, shape) {
+  if (marker !== 'advertised' && marker !== 'absent') return 'marker_unknown';
+  if (shape !== 'cursor_shape' && shape !== 'legacy_shape') return 'shape_unknown';
+  if (marker === 'advertised') return shape === 'cursor_shape' ? 'advertised_and_observed' : 'advertised_but_legacy';
+  return shape === 'cursor_shape' ? 'unadvertised_but_observed' : 'unadvertised_and_legacy';
 }
 
 function pageShape(result, scriptHash) {
@@ -81,12 +98,26 @@ async function checkCursorCapability({ rpc, scriptHash, optIn = false, timeoutMs
   const script = scriptHash.toLowerCase();
   const report = { schema_version: '1.0.0', endpoint, observed_at_utc: new Date().toISOString(),
     method: 'getutxos', script_hash: script, limit: 1, request_count: 0, status: 'inconclusive',
+    build_marker: 'unknown', marker_shape_relation: 'shape_unknown',
     note: 'An endpoint observation only. Shape support does not prove complete enumeration, release identity, or mainnet availability.' };
+  // The marker is self-reported. Its absence or failure never suppresses the direct shape probe.
+  report.request_count++;
+  try {
+    const build = await request(endpoint, 'getbuildinfo', [], 'cursor-capability-build', timeoutMs, fetcher);
+    if (build.error) {
+      report.build_marker = 'unavailable';
+      report.build_rpc_error = build.error;
+    } else report.build_marker = buildMarker(build.result);
+  } catch (error) {
+    report.build_marker = error?.name === 'TimeoutError' ? 'timeout' : 'invalid_response';
+    report.build_error = String(error?.message || error);
+  }
   try {
     report.request_count++;
-    const first = await request(endpoint, [script, 1, null], 'cursor-capability-1', timeoutMs, fetcher);
+    const first = await request(endpoint, 'getutxos', [script, 1, null], 'cursor-capability-1', timeoutMs, fetcher);
     if (first.error) { report.status = 'unavailable'; report.rpc_error = first.error; return report; }
     const page = pageShape(first.result, script);
+    report.marker_shape_relation = markerShapeRelation(report.build_marker, page.kind);
     report.first_page = { total: page.total, returned: page.returned };
     if (page.kind === 'legacy_shape') { report.status = 'legacy_shape'; return report; }
     report.at_head = page.at_head;
@@ -98,7 +129,7 @@ async function checkCursorCapability({ rpc, scriptHash, optIn = false, timeoutMs
       return report;
     }
     report.request_count++;
-    const second = await request(endpoint, [script, 1, page.next_cursor], 'cursor-capability-2', timeoutMs, fetcher);
+    const second = await request(endpoint, 'getutxos', [script, 1, page.next_cursor], 'cursor-capability-2', timeoutMs, fetcher);
     if (second.error) {
       report.status = second.error.code === -32020 ? 'stale_head' : 'inconclusive';
       report.rpc_error = second.error;
@@ -142,7 +173,7 @@ async function main(argv) {
   const args = parseArgs(argv);
   if (args.help) {
     console.log('Usage: node cursor-capability.cjs --rpc HTTPS-OR-LOOPBACK-URL --script-hash 64-HEX --probe-cursor [--timeout-ms 12000] [--json]');
-    console.log('Sends one getutxos(script_hash, 1, null) request; a second request only if a next_cursor is returned.');
+    console.log('Sends one getbuildinfo and one getutxos(script_hash, 1, null) request; a third request only if a next_cursor is returned.');
     return 0;
   }
   const report = await checkCursorCapability(args);
@@ -153,4 +184,4 @@ if (require.main === module) main(process.argv.slice(2)).then(code => { process.
   console.error(`Cursor capability: ${error.message}`);
   process.exitCode = 2;
 });
-module.exports = { checkCursorCapability, pageShape, parseArgs, main };
+module.exports = { checkCursorCapability, pageShape, buildMarker, markerShapeRelation, parseArgs, main };
