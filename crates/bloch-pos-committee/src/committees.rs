@@ -354,8 +354,8 @@ fn epoch_committees_uncached(
     // shuffle, which is a bias in committee membership, not a rounding detail.
     let len = eligible.len();
     for i in (1..len).rev() {
-        let bound = (i + 1) as u128;
-        let limit = (u128::MAX / bound) * bound;
+        let bound = (i as u128).saturating_add(1);
+        let limit = (u128::MAX / bound).saturating_mul(bound);
         let j = loop {
             let mut buf = [0u8; 16];
             xof.read(&mut buf);

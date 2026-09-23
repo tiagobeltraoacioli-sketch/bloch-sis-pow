@@ -232,25 +232,36 @@ pub struct Registry {
 ///
 /// Free function of the values alone: deterministic, integer-only,
 /// committed-state-derived — nothing node-local (rule 1).
+fn div_or_zero(value: u128, divisor: u128) -> u128 {
+    match value.checked_div(divisor) {
+        Some(result) => result,
+        None => 0,
+    }
+}
+
 pub fn combined_cap_sat(stakes: &[u128]) -> u128 {
     let n = stakes.iter().filter(|s| **s > 0).count() as u128;
     if n == 0 {
         return 0;
     }
-    let total: u128 = stakes.iter().sum();
-    let mut cap = total * MAX_VALIDATOR_STAKE_BPS / 10_000;
-    let mut round = 0;
+    let total = stakes
+        .iter()
+        .fold(0u128, |acc, stake| acc.saturating_add(*stake));
+    let mut cap = div_or_zero(total.saturating_mul(MAX_VALIDATOR_STAKE_BPS), 10_000);
+    let mut round = 0u32;
     while round < CAP_FIXPOINT_ROUNDS {
-        let capped_total: u128 =
-            stakes.iter().map(|s| if *s > cap { cap } else { *s }).sum();
-        let next = capped_total * MAX_VALIDATOR_STAKE_BPS / 10_000;
+        let capped_total = stakes.iter().fold(0u128, |acc, stake| {
+            let capped = if *stake > cap { cap } else { *stake };
+            acc.saturating_add(capped)
+        });
+        let next = div_or_zero(capped_total.saturating_mul(MAX_VALIDATOR_STAKE_BPS), 10_000);
         if next == cap {
             break;
         }
         cap = next;
-        round += 1;
+        round = round.saturating_add(1);
     }
-    let floor = total / n;
+    let floor = div_or_zero(total, n);
     if cap < floor {
         floor
     } else {

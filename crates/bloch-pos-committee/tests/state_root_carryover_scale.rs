@@ -291,6 +291,8 @@ fn state<'a>(f: &'a Fixture, e: &'a [EutxoEntry]) -> ConsensusState<'a> {
         fc_recent_votes: &[],
         deposit_queue: &[],
         delegations: &[],
+        funded_delegation_owners: &[],
+        funded_delegation_lifecycle: &[],
         pending_fees: &[],
         taint_root: h32(101),
         coherence_accumulator_root: h32(102),

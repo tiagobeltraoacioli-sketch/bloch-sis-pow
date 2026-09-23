@@ -130,6 +130,8 @@ fn state<'a>(f: &'a Fixture, e: &'a [EutxoEntry]) -> ConsensusState<'a> {
         fc_recent_votes: &[],
         deposit_queue: &[],
         delegations: &[],
+        funded_delegation_owners: &[],
+        funded_delegation_lifecycle: &[],
         pending_fees: &[],
         // Round-4 REWARDS_V2 components (state_root.rs): empty until the gate arms,
         // exactly as on every historical block this benchmark replays.

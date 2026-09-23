@@ -198,6 +198,22 @@ const ONE_WAY_TX_TAGS: &[u8] = &[];
 const TX_TAGS: &[(u8, Status)] = &[
     // ADR-041: 0x07–0x09 are permanent tombstones; 0x0A/0x0C/0x0D released.
     (0x0B, Status::Released { name: "FundedDeposit", rivals: NO_RIVALS }),
+    (0x0E, Status::Released { name: "FundedDelegate", rivals: NO_RIVALS }),
+    (0x0F, Status::Released { name: "FundedUndelegate", rivals: NO_RIVALS }),
+    (
+        0x10,
+        Status::Released {
+            name: "FundedDelegationWithdraw",
+            rivals: NO_RIVALS,
+        },
+    ),
+    (
+        0x11,
+        Status::Released {
+            name: "ValidatorCommissionUpdate",
+            rivals: NO_RIVALS,
+        },
+    ),
     (0x01, Status::Released { name: "Transfer", rivals: NO_RIVALS }),
     (0x02, Status::Released { name: "Deposit", rivals: NO_RIVALS }),
     (0x03, Status::Released { name: "Exit", rivals: NO_RIVALS }),
@@ -520,6 +536,10 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         PosTransaction::Withdraw { .. } => 0x0D,
         PosTransaction::RandaoRecommit { .. } => 0x0A,
         PosTransaction::FundedDeposit(_) => 0x0B,
+        PosTransaction::FundedDelegate(_) => 0x0E,
+        PosTransaction::FundedUndelegate(_) => 0x0F,
+        PosTransaction::FundedDelegationWithdraw(_) => 0x10,
+        PosTransaction::ValidatorCommissionUpdate(_) => 0x11,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }

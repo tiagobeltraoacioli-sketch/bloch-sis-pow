@@ -2173,6 +2173,10 @@ impl PreparedSubmission {
             PosTransaction::TransferV2 { .. } => "transfer_v2",
             PosTransaction::Deposit { .. } => "deposit",
             PosTransaction::FundedDeposit(_) => "funded_deposit",
+            PosTransaction::FundedDelegate(_) => "funded_delegate",
+            PosTransaction::FundedUndelegate(_) => "funded_undelegate",
+            PosTransaction::FundedDelegationWithdraw(_) => "funded_delegation_withdraw",
+            PosTransaction::ValidatorCommissionUpdate(_) => "validator_commission_update",
             PosTransaction::Exit { .. } => "exit",
             // Distinct from "exit" on purpose: the two are different messages with
             // different rules (one authenticated, one not) and an operator reading

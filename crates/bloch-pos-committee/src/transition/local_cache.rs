@@ -34,6 +34,8 @@ struct CachedState {
     deposit_history: Vec<QueuedDeposit>,
     pubkey_index: BTreeMap<[u8; 32], u32>,
     delegations: Vec<Delegation>,
+    funded_delegation_owners: BTreeMap<u32, [u8; 32]>,
+    funded_delegation_lifecycle: BTreeMap<u32, (u64, bool)>,
     pending_fee_rewards: BTreeMap<u32, u128>,
     slashing: slashing::SlashingState,
     delegator_slash_losses: BTreeMap<u32, u128>,
@@ -79,6 +81,8 @@ struct CachedStateRef<'a> {
     deposit_history: &'a Vec<QueuedDeposit>,
     pubkey_index: &'a BTreeMap<[u8; 32], u32>,
     delegations: &'a Vec<Delegation>,
+    funded_delegation_owners: &'a BTreeMap<u32, [u8; 32]>,
+    funded_delegation_lifecycle: &'a BTreeMap<u32, (u64, bool)>,
     pending_fee_rewards: &'a BTreeMap<u32, u128>,
     slashing: &'a slashing::SlashingState,
     delegator_slash_losses: &'a BTreeMap<u32, u128>,
@@ -120,7 +124,7 @@ impl CommittedState {
     /// or allocating a second encoded payload. Restore the original destination
     /// length if serialization fails; existing prefix bytes remain untouched.
     pub fn append_local_cache(&self, bytes: &mut Vec<u8>) -> Result<(), String> {
-        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat } = self;
+        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat } = self;
         let value = CachedStateRef {
             admission_network_domain,
             slot,
@@ -147,6 +151,8 @@ impl CommittedState {
             deposit_history,
             pubkey_index,
             delegations,
+            funded_delegation_owners,
+            funded_delegation_lifecycle,
             pending_fee_rewards,
             slashing,
             delegator_slash_losses,
@@ -181,7 +187,7 @@ impl CommittedState {
     // oracle: equality catches changes to field order and eUTXO sequence framing.
     #[cfg(test)]
     pub(super) fn encode_local_cache_owned_reference(&self) -> Result<Vec<u8>, String> {
-        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat } = self;
+        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat } = self;
         let value = CachedState {
             admission_network_domain: admission_network_domain.clone(),
             slot: slot.clone(),
@@ -208,6 +214,8 @@ impl CommittedState {
             deposit_history: deposit_history.clone(),
             pubkey_index: pubkey_index.clone(),
             delegations: delegations.clone(),
+            funded_delegation_owners: funded_delegation_owners.clone(),
+            funded_delegation_lifecycle: funded_delegation_lifecycle.clone(),
             pending_fee_rewards: pending_fee_rewards.clone(),
             slashing: slashing.clone(),
             delegator_slash_losses: delegator_slash_losses.clone(),
@@ -265,6 +273,8 @@ impl CommittedState {
             deposit_history: value.deposit_history,
             pubkey_index: value.pubkey_index,
             delegations: value.delegations,
+            funded_delegation_owners: value.funded_delegation_owners,
+            funded_delegation_lifecycle: value.funded_delegation_lifecycle,
             pending_fee_rewards: value.pending_fee_rewards,
             slashing: value.slashing,
             delegator_slash_losses: value.delegator_slash_losses,

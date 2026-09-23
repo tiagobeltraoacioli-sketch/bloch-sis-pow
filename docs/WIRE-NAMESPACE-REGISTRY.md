@@ -125,9 +125,18 @@ has drifted to ~1008 in the deeper worktrees).
 | `0x07` | **UNASSIGNED — 5 claimants** | `FundedDeposit` 10 tips/13 heads · `DepositV2` 10/8 · `DepositFunded` 4/8 · `Withdraw` 2/2 · `SignedExit` 1/1. See C-4. | staking | `wire_tag_registry.rs` |
 | `0x08` | **UNASSIGNED — 3 claimants** | `SignedExit` 10 tips/13 heads · `Withdraw` 10/8 · `ExitV2` 4/8. Semantically incompatible, not a rename. See C-4. | withdraw | `wire_tag_registry.rs` |
 | `0x09` | **UNASSIGNED — 2 claimants** | `Withdraw` 14 tips/21 heads · `ExitV2` 4/2. **The "reserved on paper only" claim was false — see C-5.** | exit | `wire_tag_registry.rs` |
-| `0x0A`–`0xFF` | free | — | — | — |
+| `0x0A` | `RandaoRecommit` | **Merged** | staking | lifecycle tests |
+| `0x0B` | `FundedDeposit` | **Merged** | staking | funded-admission tests |
+| `0x0C` | `ExitV2` | **Merged** | staking | lifecycle tests |
+| `0x0D` | `Withdraw` | **Merged** | staking | lifecycle tests |
+| `0x0E` | `FundedDelegate` | **Assigned, unarmed candidate** | staking | funded-delegation tests |
+| `0x0F` | `FundedUndelegate` | **Assigned, unarmed candidate** | staking | funded-delegation tests |
+| `0x10` | `FundedDelegationWithdraw` | **Assigned, unarmed candidate** | staking | funded-delegation tests |
+| `0x11`–`0xFF` | free | — | — | — |
 
-**Next free transaction tag: `0x0A`.** (`0x09` is reserved, not free.)
+**Next free transaction tag: `0x11`.** (`0x07`–`0x09` remain reserved and
+contested; `0x0E`–`0x10` are assigned to the unarmed funded-delegation
+lifecycle.)
 
 ### CORRECTION, 2026-09-01 — `0x02`/`0x03`/`0x04` are not "rejected"
 
@@ -343,11 +352,19 @@ wrong message; it produces a wrong state root, on every node, permanently.
 | `0x14` | `TAG_ISSUED_SUPPLY` | Merged, `:193` | tokenomics |
 | `0x15` | `TAG_BASE_FEE` | Merged, `:209` | fee-market |
 | `0x16` | `TAG_DELEGATOR_FEE_REWARD` | Merged, `:219` | fee-market |
-| `0x17` | `TAG_COHERENCE_ANCHORS` | **UNMERGED — ruling applied**, `recon-coherence/…/state_root.rs:295` | coherence | *none — gap, see §8.3* |
-| `0x18` | `TAG_SHIELDED_POOL` | **UNMERGED — ruling applied**, `recon-coherence/…/state_root.rs:330` | coherence | *none — gap, see §8.3* |
-| `0x19`+ | free | — | — | — |
+| `0x17` | `TAG_VALIDATOR_FEE_REWARD` | Merged | fee-market |
+| `0x18` | `TAG_DELEGATOR_ISSUANCE_REWARD` | Merged | tokenomics |
+| `0x19` | `TAG_PROPOSED_CURRENT` | Merged | finality |
+| `0x1A` | `TAG_FC_RECENT_VOTE` | Merged | finality |
+| `0x1B` | `TAG_WRITTEN_OFF` | Merged | tokenomics |
+| `0x1C` | `TAG_STAKE_LOW_WATER` | Merged | staking |
+| `0x1D` | `TAG_RANDAO_GENERATION` | Merged | consensus |
+| `0x1E` | `TAG_FUNDED_VALIDATOR` | Merged | staking |
+| `0x1F` | `TAG_FUNDED_DELEGATION_OWNER` | **Assigned, unarmed candidate** | staking |
+| `0x20` | `TAG_FUNDED_DELEGATION_LIFECYCLE` | **Assigned, unarmed candidate** | staking |
+| `0x21`+ | free | — | — | — |
 
-**Next free state-root tag: `0x19`.**
+**Next free state-root tag: `0x21`.**
 
 **C-3 is resolved in code as of 2026-09-01** — see §6 C-3. The two stale
 claimants (`agent-a905f26b0f5a3faaf`, `agent-a14a11d370747fe90`) must not be

@@ -350,7 +350,10 @@ impl Index {
                     let id = tx.txid();
                     let n = match tx {
                         PosTransaction::Transfer { outputs, .. } | PosTransaction::TransferV2 { outputs, .. } => outputs.len(),
-                        PosTransaction::FundedDeposit(_) | PosTransaction::Withdraw { .. } => 1,
+                        PosTransaction::FundedDeposit(_)
+                        | PosTransaction::FundedDelegate(_)
+                        | PosTransaction::FundedDelegationWithdraw(_)
+                        | PosTransaction::Withdraw { .. } => 1,
                         _ => 0,
                     };
                     let outputs = (0..n).filter_map(|v| state.utxo(&id, v as u32)
@@ -409,7 +412,11 @@ impl Index {
                 inputs: Vec::new(),
                 input_values: Vec::new(),
                 size_bytes: raw.len() as u64,
-                stake_sat: match tx { PosTransaction::FundedDeposit(d) => d.amount_sat, _ => 0 },
+                stake_sat: match tx {
+                    PosTransaction::FundedDeposit(d) => d.amount_sat,
+                    PosTransaction::FundedDelegate(d) => d.amount_sat,
+                    _ => 0,
+                },
                 outputs: Vec::new(),
                 declared_bytes: 0,
                 tip_millisat_per_gas: 0,
@@ -714,6 +721,10 @@ fn kind_of(tx: &PosTransaction) -> TxKind {
         PosTransaction::Exit { .. } => TxKind::Exit,
         PosTransaction::Delegate { .. } => TxKind::Delegate,
         PosTransaction::FundedDeposit(_) => TxKind::FundedDeposit,
+        PosTransaction::FundedDelegate(_) => TxKind::FundedDelegate,
+        PosTransaction::FundedUndelegate(_) => TxKind::FundedUndelegate,
+        PosTransaction::FundedDelegationWithdraw(_) => TxKind::FundedDelegationWithdraw,
+        PosTransaction::ValidatorCommissionUpdate(_) => TxKind::ValidatorCommissionUpdate,
         PosTransaction::Withdraw { .. } => TxKind::Withdraw,
         PosTransaction::ExitV2 { .. } => TxKind::ExitV2,
         PosTransaction::RandaoRecommit { .. } => TxKind::RandaoRecommit,
@@ -743,6 +754,10 @@ fn transfer_parts(tx: &PosTransaction) -> (Vec<OutPoint>, Vec<(u64, ScriptHash)>
             *tip_millisat_per_gas,
         ),
         PosTransaction::FundedDeposit(d) => (
+            d.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
+            vec![(d.change.value, d.change.script_hash)], d.tx_bytes, d.tip_millisat_per_gas,
+        ),
+        PosTransaction::FundedDelegate(d) => (
             d.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
             vec![(d.change.value, d.change.script_hash)], d.tx_bytes, d.tip_millisat_per_gas,
         ),
