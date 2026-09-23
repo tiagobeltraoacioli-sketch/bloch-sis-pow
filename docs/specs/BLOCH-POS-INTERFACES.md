@@ -13,7 +13,7 @@
 >   39.918 e a Genesis-4 nasceu da snapshot assinada.
 > - **`StateRoots`** — preservado como DTO legado de 14 campos, sem
 >   implementacao de producao. Nao e a lista exaustiva do SMT vivo; essa
->   autoridade e `state_root::STATE_COMPONENT_TAGS` (30 componentes).
+>   autoridade e `state_root::STATE_COMPONENT_TAGS` (32 componentes).
 > - **ordem de erros** — precedencia de diagnostico e postura de DoS, nao dado
 >   de consenso. Consenso observa aceitacao/rejeicao e o estado filho; o erro
 >   local nao entra no bloco nem no state root.
@@ -177,7 +177,7 @@ selection (§5.4); A2 owns the property test. `StateRoots` is a frozen Phase-1
 DTO with 14 top-level fields, retained for compatibility but never implemented
 on the production path. It is not the live component schema. Production folds
 `state_root::ConsensusState`; the append-only `STATE_COMPONENT_TAGS` registry
-currently contains 30 components and is the count/name/tag authority.
+currently contains 32 components and is the count/name/tag authority.
 Attestations get their own tree, separate from transactions, so a finalized
 epoch's signatures can be pruned (§6.5.1) without disturbing the transaction
 commitment.
