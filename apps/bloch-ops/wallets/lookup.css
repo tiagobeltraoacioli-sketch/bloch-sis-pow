@@ -22,8 +22,11 @@
 .lookup-lists li strong,.lookup-lists li span{display:block;overflow-wrap:anywhere}
 .lookup-lists li strong{color:#18351e;font-size:12px}
 .lookup-result>a{color:#327844;font-size:13px;font-weight:800}
+.lookup-result>button{display:inline-block;margin:0 0 0 18px;padding:0;border:0;background:none;color:#327844;font:800 13px Arial,Helvetica,sans-serif;cursor:pointer}
+.lookup-result>button:hover{text-decoration:underline}
 @media(max-width:760px){.lookup{padding:20px}.lookup-controls{display:block}.lookup-controls input,.lookup-controls button{width:100%;min-height:46px}.lookup-controls button{margin-top:9px}.lookup-result dl{grid-template-columns:1fr 1fr}.lookup-lists{grid-template-columns:1fr}}
 @media(max-width:500px){.lookup-result dl{grid-template-columns:1fr}}
+@media(max-width:500px){.lookup-result>button{display:block;margin:14px 0 0}}
 .lookup-observation{margin-top:18px;padding:18px 20px;border-left:4px solid #a47729;background:#f7eacb;color:#3d3424}
 .lookup-observation[hidden]{display:none}
 .lookup-observation strong{display:block;font-size:12px;letter-spacing:.07em;text-transform:uppercase}

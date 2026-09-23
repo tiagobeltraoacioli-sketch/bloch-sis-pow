@@ -2,6 +2,7 @@ import { validIncludedReceipt } from './receipt-validator.mjs';
 import { compareReceiptObservations } from './receipt-comparison.mjs?v=20260923-5';
 import { LookupResponseError, readBoundedJson } from './bounded-json.mjs?v=20260923-6';
 import { matchDepositOutputs } from './deposit-match.mjs?v=20260923-7';
+import { buildReconciliationEvidence } from './reconciliation-evidence.mjs?v=20260923-8';
 
 const NODE_STATUS = new Set(['pending', 'included', 'justified', 'finalized', 'unknown']);
 
@@ -24,7 +25,22 @@ const depositCard = document.getElementById('lookup-deposit');
 const depositStatus = document.getElementById('lookup-deposit-status');
 const depositDetail = document.getElementById('lookup-deposit-detail');
 const depositOutpoints = document.getElementById('lookup-deposit-outpoints');
+const exportButton = document.getElementById('lookup-export');
 const tabHistory = new Map();
+let currentEvidence = null;
+
+exportButton.addEventListener('click', () => {
+  if (!currentEvidence || result.hidden) return;
+  const blob = new Blob([`${JSON.stringify(currentEvidence, null, 2)}\n`], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `bloch-tx-${currentEvidence.receipt.txid}-evidence.json`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
 
 function recordObservation(current) {
   const previous = tabHistory.get(current.txid);
@@ -104,6 +120,7 @@ function addTransfers(target, values) {
 form.addEventListener('submit', async event => {
   event.preventDefault();
   const txid = input.value.trim().toLowerCase();
+  currentEvidence = null;
   if (!/^[0-9a-f]{64}$/.test(txid)) {
     message.textContent = 'Enter a valid 64-character hexadecimal txid.';
     result.hidden = true;
@@ -170,6 +187,13 @@ form.addEventListener('submit', async event => {
       depositCard.classList.toggle('review', !matched.exactTotal);
       depositCard.hidden = false;
     }
+    const previous = tabHistory.get(txid);
+    currentEvidence = buildReconciliationEvidence(receipt, {
+      observedAt: new Date().toISOString(),
+      previousObservation: previous?.lastIncluded ?? previous?.latest ?? null,
+      expectedScriptHash: matchRequested ? expectedScript : null,
+      expectedAmountSat: matchRequested ? expectedAmount : null,
+    });
     recordObservation({ kind: 'included', txid, receipt });
     summary.replaceChildren();
     addField('Transaction ID', receipt.txid);
