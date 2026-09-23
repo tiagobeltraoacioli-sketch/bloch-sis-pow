@@ -10,6 +10,8 @@ from reportlab.platypus import Paragraph
 
 HERE = Path(__file__).resolve().parent
 OUTPUT = HERE / "downloads" / "Bloch_Inc_Products_Services_EN_v4.pdf"
+LOGO_DARK = HERE / "assets" / "bloch-inc-logo-dark.png"
+LOGO_LIGHT = HERE / "assets" / "bloch-inc-logo-light.png"
 W, H = 768, 432
 DARK = HexColor("#0C100D")
 PAPER = HexColor("#F7FAF5")
@@ -46,7 +48,8 @@ def frame(number, label, title, lead, light=False):
     c.setFillColor(bg)
     c.rect(0, 0, W, H, stroke=0, fill=1)
     t(46, 391, label.upper(), 10, accent, "Courier")
-    t(626, 389, "Bloch Inc", 16, fg, "Helvetica-Bold")
+    c.drawImage(str(LOGO_LIGHT if light else LOGO_DARK), 623, 380,
+                width=99, height=18.65, mask="auto")
     t(46, 340, title, 27, fg, "Helvetica-Bold")
     para(47, 314, 672, lead, 11.2, HexColor("#596659") if light else MUTED)
     c.setStrokeColor(HexColor("#B8C9B5") if light else LINE)
@@ -87,8 +90,7 @@ def two(number, label, title, lead, items, light=False):
 c.setFillColor(DARK)
 c.rect(0, 0, W, H, stroke=0, fill=1)
 t(46, 388, "STRATEGIC VISION / PRODUCTS + SERVICES", 10, GREEN, "Courier")
-t(45, 246, "Bloch", 94, WHITE, "Helvetica-Bold")
-t(386, 246, "Inc", 94, GREEN, "Helvetica-Bold")
+c.drawImage(str(LOGO_DARK), 45, 233, width=675, height=127.17, mask="auto")
 t(46, 188, "The next chapter of Bloch.", 31, WHITE, "Helvetica-Bold")
 para(47, 158, 680,
      "What exists today. What Bloch Inc proposes next for Latin America and global markets. A roadmap built around evidence, security and utility.",
