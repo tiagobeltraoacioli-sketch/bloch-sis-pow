@@ -8,7 +8,10 @@ const DEFAULT_EXPLORER = 'https://blochl1.com';
 const HASH = /^[0-9a-f]{64}$/i;
 const UINT = /^(0|[1-9][0-9]*)$/;
 const MAX_U64 = (1n << 64n) - 1n;
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const REQUEST_TIMEOUT_MS = 15_000;
 const TXID_DOMAIN = Buffer.from('BLCH4:TXID\0\0\0\0\0\0', 'ascii');
+class SafeTransportError extends Error {}
 
 function rawCorrelationHash(rawHex) {
   return createHash('sha3-256').update(Buffer.from(rawHex, 'hex')).digest('hex');
@@ -73,22 +76,55 @@ export function deriveLocalAddress({ mnemonic }) {
   } finally { core.dispose(); }
 }
 
-async function json(url, options, fetchImpl) {
-  const response = await fetchImpl(url, { ...options, redirect: 'error' });
-  let body;
-  try { body = await response.json(); }
-  catch (cause) {
-    if (response.ok) throw cause;
-    const error = new Error(`${url}: HTTP ${response.status}: non-JSON error response`);
-    error.status = response.status;
-    throw error;
+async function json(url, options, fetchImpl, endpoint) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetchImpl(url, { ...options, redirect: 'error', signal: controller.signal });
+    if (!Number.isInteger(response?.status) || typeof response?.ok !== 'boolean') {
+      throw new Error('invalid response');
+    }
+    // Error bodies are never parsed or reflected in an exception.
+    if (!response.ok) {
+      const error = new SafeTransportError(`${endpoint}: HTTP ${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
+    const claimedLength = Number(response.headers?.get('content-length'));
+    if (Number.isFinite(claimedLength) && claimedLength > MAX_RESPONSE_BYTES) {
+      void response.body?.cancel().catch(() => {});
+      throw new SafeTransportError(`${endpoint}: response exceeds ${MAX_RESPONSE_BYTES} bytes`);
+    }
+    if (!response.body || typeof response.body.getReader !== 'function') {
+      throw new SafeTransportError(`${endpoint}: response body is unavailable`);
+    }
+    const reader = response.body.getReader();
+    const chunks = [];
+    let size = 0;
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > MAX_RESPONSE_BYTES) throw new SafeTransportError(`${endpoint}: response exceeds ${MAX_RESPONSE_BYTES} bytes`);
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+      if (size > MAX_RESPONSE_BYTES) void response.body.cancel().catch(() => {});
+    }
+    let body;
+    try { body = JSON.parse(Buffer.concat(chunks, size).toString('utf8')); }
+    catch { throw new SafeTransportError(`${endpoint}: invalid JSON response`); }
+    return body;
+  } catch (error) {
+    if (error instanceof SafeTransportError) throw error;
+    if (controller.signal.aborted) throw new SafeTransportError(`${endpoint}: request timed out`);
+    throw new SafeTransportError(`${endpoint}: network request failed`);
+  } finally {
+    clearTimeout(timer);
   }
-  if (!response.ok) {
-    const error = new Error(`${url}: HTTP ${response.status}: ${JSON.stringify(body.error ?? body)}`);
-    error.status = response.status;
-    throw error;
-  }
-  return body;
 }
 
 async function rpc(method, params, rpcUrl, fetchImpl) {
@@ -98,10 +134,22 @@ async function rpc(method, params, rpcUrl, fetchImpl) {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-    }, fetchImpl);
-    if (body.result != null && !body.error) return body.result;
-    if (![-32051, -32004, -32053].includes(body.error?.code) || attempt === attempts - 1) {
-      throw new Error(`${method}: ${JSON.stringify(body.error ?? 'missing result')}`);
+    }, fetchImpl, `RPC ${method}`);
+    if (!body || typeof body !== 'object' || Array.isArray(body) ||
+        body.jsonrpc !== '2.0' || body.id !== 1 ||
+        Object.hasOwn(body, 'result') === Object.hasOwn(body, 'error')) {
+      throw new Error(`${method}: invalid JSON-RPC response envelope`);
+    }
+    if (Object.hasOwn(body, 'result')) {
+      if (body.result === null) throw new Error(`${method}: missing JSON-RPC result`);
+      return body.result;
+    }
+    if (!body.error || typeof body.error !== 'object' ||
+        !Number.isSafeInteger(body.error.code) || typeof body.error.message !== 'string') {
+      throw new Error(`${method}: invalid JSON-RPC error`);
+    }
+    if (![-32051, -32004, -32053].includes(body.error.code) || attempt === attempts - 1) {
+      throw new Error(`${method}: RPC error ${body.error.code}`);
     }
     await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
   }
@@ -298,7 +346,7 @@ export async function broadcastSignedTransaction(signed, { rpcUrl = DEFAULT_RPC,
 export async function getTransaction(txid, { explorerUrl = DEFAULT_EXPLORER, fetchImpl = fetch } = {}) {
   if (!HASH.test(txid)) throw new Error('txid must be 64 hexadecimal characters');
   const base = explorerUrl.replace(/\/$/, '');
-  const receipt = await json(`${base}/api/v1/transactions/${txid.toLowerCase()}`, { method: 'GET' }, fetchImpl);
+  const receipt = await json(`${base}/api/v1/transactions/${txid.toLowerCase()}`, { method: 'GET' }, fetchImpl, 'Archival transaction');
   if (!HASH.test(receipt.txid) || receipt.txid.toLowerCase() !== txid.toLowerCase() ||
       !HASH.test(receipt.block_id) ||
       !validReceiptEntries(receipt.inputs, receipt.txid, false) ||

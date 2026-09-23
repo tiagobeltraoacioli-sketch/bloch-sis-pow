@@ -1,5 +1,8 @@
 import { validIncludedReceipt } from './receipt-validator.mjs';
 import { compareReceiptObservations } from './receipt-comparison.mjs?v=20260923-5';
+import { LookupResponseError, readBoundedJson } from './bounded-json.mjs?v=20260923-6';
+
+const NODE_STATUS = new Set(['pending', 'included', 'justified', 'finalized', 'unknown']);
 
 const form = document.getElementById('lookup-form');
 const input = document.getElementById('lookup-txid');
@@ -42,13 +45,18 @@ async function nodeStatus(txid) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 'bloch-ops-wallets', method: 'gettxstatus', params: [txid] }),
       signal: controller.signal,
+      redirect: 'error',
     });
-    if (!response.ok) throw new Error(`Gateway returned HTTP ${response.status}.`);
-    const body = await response.json();
-    if (body.error || typeof body.result?.status !== 'string') throw new Error('No usable node status returned.');
+    if (!response.ok) throw new LookupResponseError('Gateway status unavailable.');
+    const body = await readBoundedJson(response, 64 * 1024);
+    if (body?.jsonrpc !== '2.0' || body.id !== 'bloch-ops-wallets' ||
+        Object.hasOwn(body, 'error') || !NODE_STATUS.has(body.result?.status)) {
+      throw new LookupResponseError('No usable node status returned.');
+    }
     return {
       status: body.result.status,
-      level: body.corroboration?.level ?? body.result.corroboration?.level ?? 'not reported',
+      level: ['corroborated', 'degraded', 'uncorroborated', 'final'].includes(body.corroboration?.level)
+        ? body.corroboration.level : 'not reported',
     };
   } finally {
     clearTimeout(timer);
@@ -106,7 +114,7 @@ form.addEventListener('submit', async event => {
   comparison.hidden = true;
   message.textContent = 'Reading the archival receipt and chain-head observation…';
   try {
-    const response = await fetch(url, { signal: controller.signal, credentials: 'omit' });
+    const response = await fetch(url, { signal: controller.signal, credentials: 'omit', redirect: 'error' });
     if (response.status === 404) {
       message.textContent = 'No included archival receipt found. Checking one node’s remembered status…';
       try {
@@ -121,10 +129,10 @@ form.addEventListener('submit', async event => {
       recordObservation({ kind: 'unresolved', txid });
       return;
     }
-    if (!response.ok) throw new Error(`The public API returned HTTP ${response.status}.`);
-    const receipt = await response.json();
+    if (!response.ok) throw new LookupResponseError(`The public API returned HTTP ${response.status}.`);
+    const receipt = await readBoundedJson(response, 2 * 1024 * 1024);
     if (!validIncludedReceipt(receipt, txid)) {
-      throw new Error('The API returned an incomplete or inconsistent included receipt.');
+      throw new LookupResponseError('The API returned an incomplete or inconsistent included receipt.');
     }
     recordObservation({ kind: 'included', txid, receipt });
     summary.replaceChildren();
@@ -145,7 +153,8 @@ form.addEventListener('submit', async event => {
     result.hidden = false;
     message.textContent = 'Included receipt loaded. Apply your own credit and finality policy.';
   } catch (error) {
-    message.textContent = error.name === 'AbortError' ? 'The lookup timed out. Retry or use the source API directly.' : String(error.message || 'Lookup unavailable.');
+    message.textContent = error.name === 'AbortError' ? 'The lookup timed out. Retry or use the source API directly.' :
+      error instanceof LookupResponseError ? error.message : 'Lookup unavailable. Retry or use the source API directly.';
   } finally {
     clearTimeout(timer);
     button.disabled = false;

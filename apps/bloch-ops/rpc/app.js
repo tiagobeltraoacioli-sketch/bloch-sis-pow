@@ -1,3 +1,5 @@
+import { readRpcResponse, RpcResponseError } from './response-guard.mjs';
+
 const gateway = 'https://posternlabs.com/g4rpc';
 const defaultTimeoutMs = 12000;
 const chainTimeoutMs = 20000;
@@ -87,15 +89,13 @@ async function rpc(request) {
     const response = await fetch(gateway, {
       method: 'POST',
       mode: 'cors',
+      redirect: 'error',
       credentials: 'omit',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify(request),
       signal: controller.signal
     });
-    const body = await response.text();
-    let parsed;
-    try { parsed = JSON.parse(body); }
-    catch { throw new Error(`Gateway returned HTTP ${response.status} without JSON.`); }
+    const parsed = await readRpcResponse(response, request.id);
     return { response, parsed };
   } catch (error) {
     if (controller.signal.aborted) {
@@ -103,7 +103,8 @@ async function rpc(request) {
       timeout.name = 'GatewayTimeoutError';
       throw timeout;
     }
-    throw error;
+    if (error instanceof RpcResponseError) throw error;
+    throw new Error('Gateway request failed.');
   } finally {
     clearTimeout(timer);
   }
@@ -128,12 +129,11 @@ form.addEventListener('submit', async event => {
     lastResponse = JSON.stringify(parsed, null, 2);
     responseField.textContent = lastResponse;
     copyResponseButton.disabled = false;
-    const level = parsed.corroboration?.level || parsed.result?.corroboration?.level;
-    setMessage(parsed.error ? `RPC error ${parsed.error.code ?? ''}: ${parsed.error.message || 'Unknown error'}` :
-      `HTTP ${response.status} · ${level ? `evidence: ${level}` : 'read-only response received'}`, Boolean(parsed.error) || !response.ok);
+    setMessage(parsed.error ? `RPC error ${parsed.error.code} · HTTP ${response.status}. Inspect the raw reply.` :
+      `HTTP ${response.status} · read-only response received. Inspect corroboration in the raw reply.`, Boolean(parsed.error) || !response.ok);
   } catch (error) {
     responseField.textContent = 'No usable response received.';
-    setMessage(error.name === 'GatewayTimeoutError' ? error.message : `Gateway request failed: ${error.message}`, true);
+    setMessage(error.name === 'GatewayTimeoutError' ? error.message : error.message, true);
   } finally { runButton.disabled = false; }
 });
 
@@ -187,7 +187,7 @@ async function evidenceCall(method) {
   try {
     const { response, parsed } = await rpc({ jsonrpc: '2.0', id: `bloch-ops-${method}`, method, params: [] });
     if (!response.ok || parsed?.error || !parsed?.result || typeof parsed.result !== 'object') {
-      throw new Error(parsed?.error?.message || `HTTP ${response.status}`);
+      throw new Error(`Gateway returned an unusable ${method} reply (HTTP ${response.status}).`);
     }
     return { parsed, elapsed_ms: Math.round(performance.now() - started) };
   } catch (error) {

@@ -18,7 +18,12 @@ const receiptFixture = {
   observed_head_height: 101, observed_head_slot: 121, corroboration: 'corroborated',
   source: 'test canonical archive', verification: 'test replay',
 };
-function response(data, status = 200) { return { ok: status === 200, status, async json() { return data; } }; }
+function response(data, status = 200) {
+  const body = data && typeof data === 'object' && !Array.isArray(data) &&
+    (Object.hasOwn(data, 'result') || Object.hasOwn(data, 'error')) && status === 200
+    ? { jsonrpc: '2.0', id: 1, ...data } : data;
+  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+}
 const fetchImpl = async (_url, options) => {
   const method = JSON.parse(options.body).method;
   if (method === 'getutxos') return response({ result: { script_hash: '00'.repeat(32), utxos: [{ txid, vout: 0, value_sat: '1000000' }], total: 1001, returned: 1, truncated: true } });
@@ -239,7 +244,49 @@ test('node failure after archival 404 remains unresolved', async () => {
   } });
   assert.equal(observed.kind, 'unresolved');
   assert.equal(observed.nodeStatus, null);
-  assert.match(observed.observationError, /node unavailable/);
+  assert.match(observed.observationError, /network request failed/);
+});
+
+test('transport rejects oversized and malformed successful responses without server text', async () => {
+  const oversized = new Response('x'.repeat(2 * 1024 * 1024 + 1));
+  await assert.rejects(getTransaction(txid, { fetchImpl: async () => oversized }), /response exceeds 2097152 bytes/);
+  await assert.rejects(getTransaction(txid, { fetchImpl: async () =>
+    new Response('{"secret":"server-payload"') }), error =>
+    /invalid JSON response/.test(error.message) && !error.message.includes('server-payload'));
+  await assert.rejects(getTransaction(txid, { fetchImpl: async () =>
+    new Response('server-payload', { status: 503 }) }), error =>
+    error.status === 503 && /HTTP 503/.test(error.message) && !error.message.includes('server-payload'));
+  await assert.rejects(getTransaction(txid, { fetchImpl: async () => {
+    const error = new Error('Archival transaction: secret transport detail');
+    error.status = 404;
+    throw error;
+  } }), error => error.status === undefined && error.message === 'Archival transaction: network request failed');
+});
+
+test('RPC validates id, version and exclusive result/error fields before use', async () => {
+  const malformed = [
+    { jsonrpc: '2.0', id: 2, result: { status: 'pending' } },
+    { jsonrpc: '1.0', id: 1, result: { status: 'pending' } },
+    { jsonrpc: '2.0', id: 1, result: { status: 'pending' }, error: null },
+    { jsonrpc: '2.0', id: 1 },
+  ];
+  for (const payload of malformed) {
+    const observed = await getTransactionObservation(txid, { fetchImpl: async (_url, options) =>
+      options?.body ? response(payload) : response({ error: 'not indexed' }, 404) });
+    assert.equal(observed.kind, 'unresolved');
+    assert.equal(observed.nodeStatus, null);
+    assert.match(observed.observationError, /invalid JSON-RPC response envelope/);
+  }
+});
+
+test('RPC errors expose stable codes but never a server supplied message', async () => {
+  const secret = 'private-upstream-message';
+  const observed = await getTransactionObservation(txid, { fetchImpl: async (_url, options) =>
+    options?.body ? response({ error: { code: -32603, message: secret } })
+      : response({ error: 'not indexed' }, 404) });
+  assert.equal(observed.nodeStatus, null);
+  assert.match(observed.observationError, /RPC error -32603/);
+  assert.ok(!observed.observationError.includes(secret));
 });
 
 test('invalid included receipt is rejected without status fallback', async () => {

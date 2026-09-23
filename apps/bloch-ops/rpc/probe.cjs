@@ -10,6 +10,46 @@ const SAFE_METHODS = Object.freeze([
   'getvalidatorcount', 'getvalidatoradmission', 'getmempoolinfo',
 ]);
 const MAX_BYTES = 1024 * 1024;
+const MAX_ERROR_CHARS = 256;
+
+class ProbeResponseError extends Error {}
+
+function printableText(value, maxLength) {
+  if (typeof value !== 'string') return null;
+  const clean = value.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').trim();
+  return clean ? clean.slice(0, maxLength) : null;
+}
+
+function observedInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function observedHex(value, length) {
+  return typeof value === 'string' && new RegExp(`^[0-9a-fA-F]{${length}}$`).test(value) ? value : null;
+}
+
+function observedResult(method, result) {
+  if (method === 'getchaininfo') {
+    const finalized = result.finalized;
+    return {
+      height: observedInteger(result.height), slot: observedInteger(result.slot),
+      finalized_height: observedInteger(result.finalized_height),
+      finalized: finalized && typeof finalized === 'object' && !Array.isArray(finalized)
+        ? { epoch: observedInteger(finalized.epoch),
+          root: typeof finalized.root === 'string' && /^(?:0x)?[0-9a-fA-F]{64}$/.test(finalized.root)
+            ? finalized.root : null } : null,
+    };
+  }
+  if (method === 'getvalidatoradmission') {
+    return { network_domain: observedHex(result.network_domain, 64),
+      active: typeof result.active === 'boolean' ? result.active : null };
+  }
+  if (method === 'getbuildinfo') {
+    return { source_digest: printableText(result.source_digest, 128),
+      commit: printableText(result.commit, 128) };
+  }
+  return undefined;
+}
 
 function endpointUrl(raw) {
   let url;
@@ -26,7 +66,7 @@ function endpointUrl(raw) {
 
 async function readBounded(response) {
   const reader = response.body?.getReader();
-  if (!reader) throw new Error('Empty HTTP response body');
+  if (!reader) throw new ProbeResponseError('Empty HTTP response body');
   let total = 0;
   const chunks = [];
   try {
@@ -34,7 +74,7 @@ async function readBounded(response) {
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
-      if (total > MAX_BYTES) throw new Error('Response exceeds 1 MiB limit');
+      if (total > MAX_BYTES) throw new ProbeResponseError('Response exceeds 1 MiB limit');
       chunks.push(value);
     }
   } finally { reader.releaseLock(); }
@@ -51,36 +91,45 @@ async function probeMethod(endpoint, spec, timeoutMs, fetcher = fetch) {
       body: JSON.stringify({ jsonrpc: '2.0', id: spec.name, method: spec.name, params: [] }),
       signal: AbortSignal.timeout(timeoutMs),
     });
-    diagnostic.http_status = response.status;
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const payload = JSON.parse(await readBounded(response));
-    if (payload?.jsonrpc !== '2.0' || payload?.id !== spec.name) throw new Error('Invalid JSON-RPC envelope or mismatched request id');
-    if (payload.error) {
+    diagnostic.http_status = Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
+      ? response.status : null;
+    if (!response.ok) throw new ProbeResponseError(diagnostic.http_status === null ? 'HTTP error' : `HTTP ${diagnostic.http_status}`);
+    let payload;
+    try { payload = JSON.parse(await readBounded(response)); }
+    catch (error) {
+      if (error instanceof ProbeResponseError) throw error;
+      throw new ProbeResponseError('Invalid JSON response');
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+        payload.jsonrpc !== '2.0' || payload.id !== spec.name) {
+      throw new ProbeResponseError('Invalid JSON-RPC envelope or mismatched request id');
+    }
+    const hasError = Object.hasOwn(payload, 'error');
+    const hasResult = Object.hasOwn(payload, 'result');
+    if (hasError === hasResult) throw new ProbeResponseError('JSON-RPC response must contain exactly one of result or error');
+    if (hasError) {
+      const rpcError = payload.error;
+      if (!rpcError || typeof rpcError !== 'object' || Array.isArray(rpcError) ||
+          !Number.isSafeInteger(rpcError.code) || typeof rpcError.message !== 'string' ||
+          !printableText(rpcError.message, MAX_ERROR_CHARS)) {
+        throw new ProbeResponseError('Invalid JSON-RPC error object');
+      }
       diagnostic.status = 'rpc_error';
-      diagnostic.error = { code: payload.error.code ?? null, message: String(payload.error.message ?? 'Unknown RPC error') };
+      diagnostic.error = { code: rpcError.code, message: printableText(rpcError.message, MAX_ERROR_CHARS) };
       return diagnostic;
     }
     const result = payload.result;
     if (spec.result_kind === 'object' && (!result || typeof result !== 'object' || Array.isArray(result))) {
-      throw new Error('Expected an object result');
+      throw new ProbeResponseError('Expected an object result');
     }
     diagnostic.missing_fields = spec.result_fields.filter(field => !Object.hasOwn(result, field));
     diagnostic.status = diagnostic.missing_fields.length ? 'schema_drift' : 'compatible_shape';
-    if (spec.name === 'getchaininfo') {
-      diagnostic.observed = {
-        height: result.height ?? null, slot: result.slot ?? null,
-        finalized_height: result.finalized_height ?? null,
-        finalized: result.finalized && typeof result.finalized === 'object' && !Array.isArray(result.finalized)
-          ? { epoch: result.finalized.epoch ?? null, root: result.finalized.root ?? null } : null,
-      };
-    } else if (spec.name === 'getvalidatoradmission') {
-      diagnostic.observed = { network_domain: result.network_domain ?? null, active: result.active ?? null };
-    } else if (spec.name === 'getbuildinfo') {
-      diagnostic.observed = { source_digest: result.source_digest ?? null, commit: result.commit ?? null };
-    }
+    const observed = observedResult(spec.name, result);
+    if (observed !== undefined) diagnostic.observed = observed;
   } catch (error) {
     diagnostic.status = error?.name === 'TimeoutError' ? 'timeout' : 'invalid_response';
-    diagnostic.error = String(error?.message || error);
+    diagnostic.error = error instanceof ProbeResponseError ? error.message
+      : diagnostic.status === 'timeout' ? 'RPC request timed out' : 'RPC request failed or response could not be read';
   } finally {
     diagnostic.round_trip_ms = Math.round(performance.now() - started);
   }

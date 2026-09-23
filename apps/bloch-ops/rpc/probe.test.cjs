@@ -50,6 +50,76 @@ test('reports RPC errors and missing catalog fields per method', async () => {
   assert.ok(rows.find(row => row.method === 'getblockcount').missing_fields.includes('slot'));
 });
 
+test('rejects contradictory and malformed JSON-RPC error envelopes', async () => {
+  const malformed = [
+    { result: {}, error: { code: -32601, message: 'conflict' } },
+    { error: { code: '-32601', message: 'wrong code type' } },
+    { error: { code: -32601, message: { secret: 'not a string' } } },
+    { error: null },
+    {},
+  ];
+  let index = 0;
+  const fetcher = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    if (index < malformed.length) {
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: payload.id, ...malformed[index++] }));
+    }
+    return reply(payload);
+  };
+  const rows = (await runProbe(endpoint, 1000, fetcher)).diagnostics;
+  assert.deepEqual(rows.slice(0, malformed.length).map(row => row.status), Array(malformed.length).fill('invalid_response'));
+  assert.equal(rows.at(-1).status, 'compatible_shape');
+});
+
+test('bounds and strips control characters from a valid RPC error message', async () => {
+  const fetcher = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: payload.id,
+      error: { code: -32601, message: `\u001b[31m${'x'.repeat(1000)}\nsecret` } }));
+  };
+  const rows = (await runProbe(endpoint, 1000, fetcher)).diagnostics;
+  assert.equal(rows[0].status, 'rpc_error');
+  assert.equal(rows[0].error.code, -32601);
+  assert.ok(rows[0].error.message.length <= 256);
+  assert.doesNotMatch(rows[0].error.message, /[\x00-\x1f\x7f-\x9f]|secret/);
+});
+
+test('limits observed values to scalar fields and refuses malformed checkpoint data', async () => {
+  const secret = { token: 'should never appear in output' };
+  const fetcher = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    if (payload.method === 'getchaininfo') return reply(payload, {
+      height: secret, slot: -1, finalized_height: 10.5,
+      finalized: { epoch: secret, root: `a${'b'.repeat(63)}\n` },
+    });
+    if (payload.method === 'getvalidatoradmission') return reply(payload, {
+      network_domain: secret, active: secret,
+    });
+    if (payload.method === 'getbuildinfo') return reply(payload, {
+      source_digest: secret, commit: `abc\u001b[31m${'x'.repeat(300)}`,
+    });
+    return reply(payload);
+  };
+  const report = await runProbe(endpoint, 1000, fetcher, { expectDomain: 'a'.repeat(64) });
+  assert.deepEqual(report.diagnostics[0].observed, {
+    height: null, slot: null, finalized_height: null,
+    finalized: { epoch: null, root: null },
+  });
+  assert.deepEqual(report.diagnostics[1].observed.source_digest, null);
+  assert.ok(report.diagnostics[1].observed.commit.length <= 128);
+  assert.deepEqual(report.diagnostics[4].observed, { network_domain: null, active: null });
+  assert.equal(report.cross_check.status, 'inconclusive');
+  assert.doesNotMatch(JSON.stringify(report), /should never appear in output|\u001b/);
+});
+
+test('does not expose transport error details in diagnostics', async () => {
+  const fetcher = async () => { throw new Error('Authorization token: secret-value'); };
+  const rows = (await runProbe(endpoint, 1000, fetcher)).diagnostics;
+  assert.equal(rows[0].status, 'invalid_response');
+  assert.equal(rows[0].error, 'RPC request failed or response could not be read');
+  assert.doesNotMatch(JSON.stringify(rows), /secret-value/);
+});
+
 test('rejects a mismatched JSON-RPC id and caps response size', async () => {
   const fetcher = async (_url, options) => {
     const payload = JSON.parse(options.body);

@@ -10,13 +10,22 @@ Genesis-4 Postern wallet. The WASM SHA-256 is pinned in `core.mjs`:
 `2f6548cd822d4840e4584b0200467fcb352aaf84a70ea2b3be0e3f099bfa5f49`.
 This is a source-distributed package; no npm publication is assumed.
 
+HTTP reads have a 15-second deadline and a 2 MiB response limit. Redirects
+are rejected. The SDK validates JSON-RPC version, request ID and result/error
+shape before using node data. HTTP and RPC errors expose status or numeric
+error code without copying server-supplied body text into logs or unresolved
+observations. An archival HTTP 404 still triggers the documented unresolved
+transaction lookup; other archival errors remain failures. Transport errors
+during `sendrawtransaction` are ambiguous: check the original txid before
+submitting any other bytes.
+
 ## Install
 
 The versioned package is served at
-`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.9.tgz`.
+`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.10.tgz`.
 
 ```sh
-npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.9.tgz
+npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.10.tgz
 ```
 
 It can also be installed from a local checkout:
@@ -96,7 +105,7 @@ limits. It requests the node's maximum 1,000 UTXOs and returns
 `utxosTruncated: true` if the source owns more than the node can enumerate.
 The core can still select from the visible coins; if those cannot cover the
 amount, an exchange node or indexer with a complete UTXO view is required.
-SDK 0.1.9 also has an explicit `utxoMode: 'cursor'` for a node built with the
+SDK 0.1.10 also has an explicit `utxoMode: 'cursor'` for a node built with the
 source-only Genesis-4 cursor extension. **That extension is not deployed on
 current mainnet.** The default remains `legacy` and makes the same two-argument
 request as earlier versions. Do not enable cursor mode against an unverified
@@ -125,7 +134,7 @@ timeout until the original txid has been checked.
 
 `accepted: true` means mempool admission, not block inclusion or finality.
 Persist the exact signed bytes, txid, `signingRootHex` and `rawHash` for
-reconciliation and safe transport retries. SDK 0.1.9 requires all four fields
+reconciliation and safe transport retries. SDK 0.1.10 requires all four fields
 when broadcasting: before network I/O it recomputes the domain-separated txid
 from `signingRootHex` and SHA3-256 of `rawHex`; after admission it compares the
 node's byte count and `tx_hash` correlation handle. The latter is **not** the
