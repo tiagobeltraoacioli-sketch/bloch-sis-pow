@@ -37,6 +37,10 @@ body reaches JSON parsing, while one more byte is rejected before parsing.
 This 64 KiB limit applies to raw request-body bytes. The framework's HTTP 413
 response is plain text; application-generated JSON errors retain the
 `non_custodial` field.
+The downloadable Node client reports the route and HTTP status for every
+non-success response, including this plain-text 413. It does not copy server
+error bodies into exceptions because those bodies may reflect caller input.
+Successful JSON responses are capped at 64 KiB before parsing.
 
 This is a local reference test. It uses fake regtest addresses and no funded
 UTXO, Bitcoin signing, broadcast, or Bloch consensus anchor enforcement.

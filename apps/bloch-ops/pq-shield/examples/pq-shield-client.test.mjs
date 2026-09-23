@@ -29,14 +29,15 @@ const responses = {
     verified_against_pq_pubkey: HEX, commitment_bytes_hex: HEX },
 };
 
-function withResponse(t, route, value, status = 200) {
+function withResponse(t, route, value, status = 200, contentType = 'application/json') {
   const original = globalThis.fetch;
   globalThis.fetch = async (url, options) => {
     assert.equal(url.origin, 'http://127.0.0.1:8787');
     assert.equal(url.pathname, route);
     assert.equal(options.method, route === '/health' ? 'GET' : 'POST');
     if (options.body) assert.doesNotThrow(() => JSON.parse(options.body));
-    return { ok: status >= 200 && status < 300, status, json: async () => value };
+    return new Response(contentType === 'application/json' ? JSON.stringify(value) : value,
+      { status, headers: { 'content-type': contentType } });
   };
   t.after(() => { globalThis.fetch = original; });
   return createPqShieldClient();
@@ -77,9 +78,44 @@ test('malformed or inconsistent responses fail closed', async (t) => {
   }
 });
 
-test('HTTP errors and null error bodies report the route without leaking inputs', async (t) => {
+test('HTTP errors report route and status without including any server body', async (t) => {
   const client = withResponse(t, '/vault/address', null, 400);
-  await assert.rejects(client.vaultAddress(fields), /\/vault\/address returned HTTP 400: unknown error/);
+  await assert.rejects(client.vaultAddress(fields), /\/vault\/address returned HTTP 400: server rejected request/);
+});
+
+test('plain-text 413 and malformed server errors never echo request or response data', async (t) => {
+  const marker = 'do-not-repeat-this-marker';
+  const cases = [
+    [413, `Payload Too Large: ${marker}`, 'text/plain', 'request body exceeds server limit'],
+    [500, `<html>${marker}</html>`, 'text/html', 'server rejected request'],
+    [400, { error: `Invalid input ${marker}` }, 'application/json', 'server rejected request'],
+  ];
+  for (const [status, body, contentType, reason] of cases) {
+    await t.test(`HTTP ${status}`, async (sub) => {
+      const client = withResponse(sub, '/vault/address', body, status, contentType);
+      await assert.rejects(client.vaultAddress({ ...fields, public_marker: marker }), (error) => {
+        assert.equal(error.message, `/vault/address returned HTTP ${status}: ${reason}`);
+        assert.equal(error.message.includes(marker), false);
+        return true;
+      });
+    });
+  }
+});
+
+test('malformed and oversized successful responses fail without echoing their bodies', async (t) => {
+  const marker = 'do-not-repeat-this-marker';
+  await t.test('invalid JSON', async (sub) => {
+    const client = withResponse(sub, '/health', `<html>${marker}</html>`, 200, 'text/html');
+    await assert.rejects(client.health(), (error) => {
+      assert.equal(error.message, 'Unexpected /health response; invalid JSON');
+      assert.equal(error.message.includes(marker), false);
+      return true;
+    });
+  });
+  await t.test('response above 64 KiB', async (sub) => {
+    const client = withResponse(sub, '/health', 'x'.repeat(64 * 1024 + 1), 200, 'text/plain');
+    await assert.rejects(client.health(), /Unexpected \/health response; body exceeds 64 KiB/);
+  });
 });
 
 test('remote origins and secret-shaped nested request fields are rejected before fetch', async () => {

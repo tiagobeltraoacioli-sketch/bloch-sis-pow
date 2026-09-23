@@ -7,14 +7,17 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const HEX = /^[a-fA-F0-9]{64}$/;
 const MAX_BYTES = 256 * 1024;
+const DEFAULT_MAX_AGE_MINUTES = 30;
+const MAX_AGE_MINUTES = 1440;
+const CLOCK_SKEW_MS = 120 * 1000;
 
 function usage() {
-  return 'Usage: node evidence-assess.cjs --preflight DIR --checkpoint DIR --expect-domain 64-HEX --expect-genesis-sha256 64-HEX [--expect-binary-sha256 64-HEX] [--expect-signer-set-sha256 64-HEX] [--json]\nReads only the two local evidence bundles and their SHA256SUMS. Expected values must come from independently authenticated release material. Optional pins require matching recorded input fingerprints. This comparison never qualifies a validator or opens staking.';
+  return 'Usage: node evidence-assess.cjs --preflight DIR --checkpoint DIR --expect-domain 64-HEX --expect-genesis-sha256 64-HEX [--expect-binary-sha256 64-HEX] [--expect-signer-set-sha256 64-HEX] [--max-age-minutes 1..1440] [--json]\nReads only the two local evidence bundles and their SHA256SUMS. Maximum evidence age defaults to 30 minutes; clock skew allowance is 120 seconds. Expected values must come from independently authenticated release material. This comparison never qualifies a validator or opens staking.';
 }
 
 function parseArgs(argv) {
   const opts = { json: false };
-  const names = { '--preflight': 'preflight', '--checkpoint': 'checkpoint', '--expect-domain': 'expectDomain', '--expect-genesis-sha256': 'expectGenesisSha256', '--expect-binary-sha256': 'expectBinarySha256', '--expect-signer-set-sha256': 'expectSignerSetSha256' };
+  const names = { '--preflight': 'preflight', '--checkpoint': 'checkpoint', '--expect-domain': 'expectDomain', '--expect-genesis-sha256': 'expectGenesisSha256', '--expect-binary-sha256': 'expectBinarySha256', '--expect-signer-set-sha256': 'expectSignerSetSha256', '--max-age-minutes': 'maxAgeMinutes' };
   for (let i = 0; i < argv.length; i++) {
     if (['--help', '-h'].includes(argv[i])) { opts.help = true; continue; }
     if (argv[i] === '--json') { opts.json = true; continue; }
@@ -25,7 +28,17 @@ function parseArgs(argv) {
   if (opts.help) return opts;
   for (const name of ['preflight', 'checkpoint', 'expectDomain', 'expectGenesisSha256']) if (!opts[name]) throw new Error(`${name} is required`);
   for (const name of ['expectDomain', 'expectGenesisSha256', 'expectBinarySha256', 'expectSignerSetSha256']) if (opts[name] !== undefined && !HEX.test(opts[name])) throw new Error(`${name} must be 64 hexadecimal characters`);
+  if (opts.maxAgeMinutes === undefined) opts.maxAgeMinutes = DEFAULT_MAX_AGE_MINUTES;
+  else if (!/^[0-9]+$/.test(opts.maxAgeMinutes) || !Number.isSafeInteger(Number(opts.maxAgeMinutes)) || Number(opts.maxAgeMinutes) < 1 || Number(opts.maxAgeMinutes) > MAX_AGE_MINUTES) throw new Error(`maxAgeMinutes must be an integer from 1 to ${MAX_AGE_MINUTES}`);
+  else opts.maxAgeMinutes = Number(opts.maxAgeMinutes);
   return opts;
+}
+
+function timestamp(value, label) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) throw new Error(`${label} must be a canonical UTC timestamp`);
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms) || new Date(ms).toISOString() !== value) throw new Error(`${label} must be a valid UTC timestamp`);
+  return ms;
 }
 
 function readBundle(directory, filename) {
@@ -52,13 +65,25 @@ function uniqueField(output, label, pattern) {
   return matches[0];
 }
 
-function assess(preflight, checkpoint, expected) {
+function assess(preflight, checkpoint, expected, nowMs = Date.now()) {
   const checks = [];
   const add = (status, id, detail) => checks.push({ status, id, detail });
   const p = preflight.value, c = checkpoint.value;
   if (p.schema !== 'bloch.genesis4.validator-preflight.evidence.v1' || c.schema !== 'bloch.genesis4.checkpoint-verification.v1') throw new Error('Unsupported evidence schema');
   if (!p.report || !p.observations?.primary || !p.inputs || !c.inputFingerprints || !c.diagnostics || !Array.isArray(c.checks)) throw new Error('Incomplete evidence structure');
   if (p.summary !== p.report.summary || p.manualGate?.status !== 'NOT_VERIFIED' || c.manualGate?.status !== 'NOT_VERIFIED') throw new Error('Inconsistent or missing manual gate / summary');
+  const maxAgeMinutes = expected.maxAgeMinutes === undefined ? DEFAULT_MAX_AGE_MINUTES : expected.maxAgeMinutes;
+  if (!Number.isSafeInteger(maxAgeMinutes) || maxAgeMinutes < 1 || maxAgeMinutes > MAX_AGE_MINUTES) throw new Error(`maxAgeMinutes must be an integer from 1 to ${MAX_AGE_MINUTES}`);
+  if (!Number.isSafeInteger(nowMs)) throw new Error('Assessment clock is invalid');
+  const preflightAt = timestamp(p.observedAt, 'Preflight observedAt');
+  if (timestamp(p.report.observedAt, 'Preflight report observedAt') !== preflightAt) throw new Error('Preflight report timestamp does not match bundle timestamp');
+  const checkpointAt = timestamp(c.observedAt, 'Checkpoint observedAt');
+  const maxAgeMs = maxAgeMinutes * 60000;
+  for (const [label, at] of [['preflight', preflightAt], ['checkpoint', checkpointAt]]) {
+    const age = nowMs - at;
+    add(age >= -CLOCK_SKEW_MS && age <= maxAgeMs ? 'PASS' : 'FAIL', `${label}-time`, `${label} observedAt ${new Date(at).toISOString()}; age ${Math.floor(age / 1000)} seconds; maximum ${maxAgeMinutes} minutes, future clock skew allowance 120 seconds.`);
+  }
+  add(checkpointAt >= preflightAt - CLOCK_SKEW_MS && checkpointAt - preflightAt <= maxAgeMs ? 'PASS' : 'FAIL', 'evidence-sequence', 'Checkpoint must follow preflight within the maximum age; up to 120 seconds of clock skew is allowed.');
   add(p.summary === 'CHECKS_PASS_MANUAL_REQUIRED' && Array.isArray(p.report.checks) && p.report.checks.every(item => ['PASS', 'MANUAL'].includes(item.level)) ? 'PASS' : 'FAIL', 'preflight-status', `Preflight: ${p.summary}`);
   add(c.status === 'CRYPTO_ACCEPTED_MANUAL_REQUIRED' && c.checks.length === 4 && c.checks.every(item => item.status === 'PASS') && c.command?.name === 'ws-verify' && c.command.exitCode === 0 && c.command.stopReason === null && c.freshness === 'FRESH' ? 'PASS' : 'FAIL', 'checkpoint-status', `Checkpoint: ${c.status}`);
   const domain = p.observations.primary.getvalidatoradmission?.network_domain;
@@ -105,7 +130,7 @@ function assess(preflight, checkpoint, expected) {
   const status = checks.some(item => item.status === 'FAIL') ? 'FAIL' : 'REVIEW_MANUAL_REQUIRED';
   return {
     schema: 'bloch.genesis4.validator-evidence-assessment.v1', observedAt: new Date().toISOString(), status,
-    inputs: { preflightSha256: preflight.sha256, checkpointSha256: checkpoint.sha256, expectedDomain: expected.expectDomain.toLowerCase(), expectedGenesisSha256: expected.expectGenesisSha256.toLowerCase(), ...(expected.expectBinarySha256 === undefined ? {} : { expectedBinarySha256: expected.expectBinarySha256.toLowerCase() }), ...(expected.expectSignerSetSha256 === undefined ? {} : { expectedSignerSetSha256: expected.expectSignerSetSha256.toLowerCase() }) },
+    inputs: { preflightSha256: preflight.sha256, checkpointSha256: checkpoint.sha256, expectedDomain: expected.expectDomain.toLowerCase(), expectedGenesisSha256: expected.expectGenesisSha256.toLowerCase(), maxAgeMinutes, clockSkewSeconds: CLOCK_SKEW_MS / 1000, ...(expected.expectBinarySha256 === undefined ? {} : { expectedBinarySha256: expected.expectBinarySha256.toLowerCase() }), ...(expected.expectSignerSetSha256 === undefined ? {} : { expectedSignerSetSha256: expected.expectSignerSetSha256.toLowerCase() }) },
     checks, manualGate: { status: 'NOT_VERIFIED', required: ['Authenticate release material, WS digest, signer arrangement and all supplied expected values independently.', 'Compare historical checkpoint root using an independent archival node when epochs differ.', 'Verify deployed binary identity, node independence, exit, withdrawal delay and spendable payout before any bond.'] },
     note: 'SHA256SUMS detects accidental or subsequent bundle changes; it does not authenticate the creator. This local assessment never qualifies staking or delegation.'
   };

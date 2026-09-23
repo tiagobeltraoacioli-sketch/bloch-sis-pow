@@ -9,14 +9,15 @@ const { spawnSync } = require('node:child_process');
 const { parseArgs, readBundle, assess } = require('./evidence-assess.cjs');
 
 const domain = 'a'.repeat(64), genesis = 'b'.repeat(64), root = 'c'.repeat(64), digest = 'd'.repeat(64), binary = '1'.repeat(64), signerSet = '2'.repeat(64);
+const observedAt = new Date().toISOString();
 const expected = { expectDomain: domain, expectGenesisSha256: genesis };
 const preflight = () => ({
-  schema: 'bloch.genesis4.validator-preflight.evidence.v1', summary: 'CHECKS_PASS_MANUAL_REQUIRED', report: { summary: 'CHECKS_PASS_MANUAL_REQUIRED', checks: [{ level: 'PASS' }, { level: 'MANUAL' }] },
+  schema: 'bloch.genesis4.validator-preflight.evidence.v1', observedAt, summary: 'CHECKS_PASS_MANUAL_REQUIRED', report: { observedAt, summary: 'CHECKS_PASS_MANUAL_REQUIRED', checks: [{ level: 'PASS' }, { level: 'MANUAL' }] },
   inputs: { expectedNetworkDomain: domain, referenceQueried: false }, manualGate: { status: 'NOT_VERIFIED' },
   observations: { primary: { getchaininfo: { epoch: 11, finalized: { epoch: 10, root } }, getvalidatoradmission: { network_domain: domain } }, reference: null }
 });
 const checkpoint = () => ({
-  schema: 'bloch.genesis4.checkpoint-verification.v1', status: 'CRYPTO_ACCEPTED_MANUAL_REQUIRED', checks: [{ status: 'PASS' }, { status: 'PASS' }, { status: 'PASS' }, { status: 'PASS' }],
+  schema: 'bloch.genesis4.checkpoint-verification.v1', observedAt, status: 'CRYPTO_ACCEPTED_MANUAL_REQUIRED', checks: [{ status: 'PASS' }, { status: 'PASS' }, { status: 'PASS' }, { status: 'PASS' }],
   command: { name: 'ws-verify', exitCode: 0, stopReason: null }, freshness: 'FRESH', wsDigest: digest, expectedDigest: digest, inputFingerprints: { genesis: { sha256: genesis }, binary: { sha256: binary }, signerSet: { sha256: signerSet } },
   diagnostics: { stdout: `ENVELOPE  local\n  epoch             10\n  block root        ${root}\n  WS DIGEST         ${digest}\nFRESHNESS  epoch 10 vs now 11: age 1 of 2016 epochs — FRESH\nVERDICT: ACCEPTED by ws::verify_envelope.\n` },
   manualGate: { status: 'NOT_VERIFIED' }
@@ -107,6 +108,59 @@ test('optional CLI pins reject malformed and repeated values', () => {
   const opts = parseArgs([...base, '--expect-binary-sha256', binary, '--expect-signer-set-sha256', signerSet]);
   assert.equal(opts.expectBinarySha256, binary);
   assert.equal(opts.expectSignerSetSha256, signerSet);
+});
+
+test('report timestamps are canonical, valid and identical within preflight bundle', () => {
+  for (const bad of [undefined, '', '2026-02-30T12:00:00.000Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.000+00:00']) {
+    const p = preflight(); p.observedAt = bad;
+    assert.throws(() => assess(wrap(p), wrap(checkpoint()), expected), /timestamp/);
+  }
+  const p = preflight(); p.report.observedAt = new Date(Date.parse(observedAt) - 1000).toISOString();
+  assert.throws(() => assess(wrap(p), wrap(checkpoint()), expected), /does not match/);
+  const c = checkpoint(); c.observedAt = 'not-a-time';
+  assert.throws(() => assess(wrap(preflight()), wrap(c), expected), /timestamp/);
+});
+
+test('age limit and future clock skew fail closed while retaining the manual gate', () => {
+  const now = Date.parse(observedAt);
+  const p = preflight(), c = checkpoint();
+  p.observedAt = p.report.observedAt = new Date(now - 31 * 60000).toISOString();
+  let result = assess(wrap(p), wrap(c), expected, now);
+  assert.equal(result.status, 'FAIL');
+  assert.equal(result.checks.find(item => item.id === 'preflight-time').status, 'FAIL');
+  assert.equal(result.manualGate.status, 'NOT_VERIFIED');
+  result = assess(wrap(p), wrap(c), { ...expected, maxAgeMinutes: 60 }, now);
+  assert.equal(result.status, 'REVIEW_MANUAL_REQUIRED');
+  c.observedAt = new Date(now + 121000).toISOString();
+  result = assess(wrap(preflight()), wrap(c), expected, now);
+  assert.equal(result.status, 'FAIL');
+  assert.equal(result.checks.find(item => item.id === 'checkpoint-time').status, 'FAIL');
+  c.observedAt = new Date(now + 120000).toISOString();
+  assert.equal(assess(wrap(preflight()), wrap(c), expected, now).checks.find(item => item.id === 'checkpoint-time').status, 'PASS');
+});
+
+test('checkpoint order and time separation are bounded', () => {
+  const now = Date.parse(observedAt);
+  const c = checkpoint(); c.observedAt = new Date(now - 121000).toISOString();
+  let result = assess(wrap(preflight()), wrap(c), expected, now);
+  assert.equal(result.checks.find(item => item.id === 'evidence-sequence').status, 'FAIL');
+  c.observedAt = new Date(now - 120000).toISOString();
+  result = assess(wrap(preflight()), wrap(c), expected, now);
+  assert.equal(result.checks.find(item => item.id === 'evidence-sequence').status, 'PASS');
+  const p = preflight(); p.observedAt = p.report.observedAt = new Date(now - 31 * 60000).toISOString();
+  result = assess(wrap(p), wrap(checkpoint()), expected, now);
+  assert.equal(result.checks.find(item => item.id === 'evidence-sequence').status, 'FAIL');
+});
+
+test('maximum age CLI is bounded and recorded', () => {
+  const base = ['--preflight', 'one', '--checkpoint', 'two', '--expect-domain', domain, '--expect-genesis-sha256', genesis];
+  for (const bad of ['0', '1441', '1.5', '-1', 'Infinity', 'NaN']) assert.throws(() => parseArgs([...base, '--max-age-minutes', bad]), /maxAgeMinutes/);
+  assert.throws(() => parseArgs([...base, '--max-age-minutes', '10', '--max-age-minutes', '20']), /repeated/);
+  assert.equal(parseArgs(base).maxAgeMinutes, 30);
+  assert.equal(parseArgs([...base, '--max-age-minutes', '1440']).maxAgeMinutes, 1440);
+  const result = assess(wrap(preflight()), wrap(checkpoint()), { ...expected, maxAgeMinutes: 45 }, Date.parse(observedAt));
+  assert.equal(result.inputs.maxAgeMinutes, 45);
+  assert.equal(result.inputs.clockSkewSeconds, 120);
 });
 
 test('CLI reads saved bundles and never reports an opening approval', t => {

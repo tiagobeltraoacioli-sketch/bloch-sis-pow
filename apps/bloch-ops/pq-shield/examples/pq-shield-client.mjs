@@ -4,6 +4,7 @@
 const HEX = /^(?:[0-9a-f]{2})+$/i;
 const HEX32 = /^[0-9a-f]{64}$/i;
 const SECRET_FIELD = /secret|seed|priv|mnemonic|wif|preimage|^(?:r|sk)$/i;
+const MAX_RESPONSE_BYTES = 64 * 1024;
 
 function checkPublicInput(value) {
   if (Array.isArray(value)) return value.forEach(checkPublicInput);
@@ -21,6 +22,41 @@ function requireShape(ok, route) {
 
 function safeAmount(value) {
   return Number.isSafeInteger(value) && value >= 0;
+}
+
+async function readJsonResponse(response, route) {
+  if (!response.body) throw new Error(`Unexpected ${route} response; empty body`);
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_RESPONSE_BYTES) {
+        await reader.cancel();
+        throw new Error(`Unexpected ${route} response; body exceeds 64 KiB`);
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    if (error?.message?.startsWith(`Unexpected ${route} response; body exceeds`)) throw error;
+    throw new Error(`Unable to read ${route} response`);
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  } catch {
+    throw new Error(`Unexpected ${route} response; invalid JSON`);
+  }
 }
 
 function unsignedShape(data, route, inputAmount, signer) {
@@ -51,9 +87,14 @@ export function createPqShieldClient(base = 'http://127.0.0.1:8787') {
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(10_000),
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(`${route} returned HTTP ${response.status}: ${typeof data?.error === 'string' ? data.error : 'unknown error'}`);
-    return data;
+    if (!response.ok) {
+      // Framework errors can be plain text, and JSON errors can reflect input.
+      // Status is enough for callers; never include a server body in an error.
+      void response.body?.cancel().catch(() => {});
+      const reason = response.status === 413 ? 'request body exceeds server limit' : 'server rejected request';
+      throw new Error(`${route} returned HTTP ${response.status}: ${reason}`);
+    }
+    return readJsonResponse(response, route);
   }
 
   return {

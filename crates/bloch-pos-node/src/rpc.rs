@@ -2536,6 +2536,10 @@ pub fn mempool_info_json(
 /// Constant. Every field is a `&'static str` baked in at compile time; the
 /// method reads no chain state, takes no lock and allocates one small object.
 /// It does not move with the height.
+///
+/// `features` is a self-reported list of optional wire shapes compiled into
+/// this source. It is not a release identifier or proof that a remote node is
+/// running this binary; clients must also probe the specific method they use.
 // NAMESPACE NOTE, 2026-09-02 — read before adding `RPC_SURFACE_VERSION` here.
 //
 // This method deliberately does NOT report a semantic surface version, and the
@@ -2577,6 +2581,9 @@ pub fn build_info_json() -> Json {
         ("tree_state", Json::s(env!("BLOCH_BUILD_TREE_STATE"))),
         ("source_digest", Json::s(env!("BLOCH_SOURCE_DIGEST"))),
         ("source_digest_alg", Json::s("sha3-256")),
+        // Only advertise source paths that are implemented and tested here.
+        // This does not assert that any deployed endpoint runs this build.
+        ("features", Json::Arr(vec![Json::s("utxo_cursor_v1")])),
         (
             "source_digest_scope",
             Json::s(

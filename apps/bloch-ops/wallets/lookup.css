@@ -29,3 +29,9 @@
 .lookup-observation strong{display:block;font-size:12px;letter-spacing:.07em;text-transform:uppercase}
 .lookup-observation p{margin:10px 0;color:#514735;font-size:13px}
 .lookup-observation small{color:#6c5b42;font-size:11px}
+.lookup-comparison{margin-top:16px;padding:17px 20px;border-left:4px solid #427d51;background:#e7f2e7;color:#17361e}
+.lookup-comparison[hidden]{display:none}
+.lookup-comparison.review{border-left-color:#a47729;background:#f7eacb;color:#3d3424}
+.lookup-comparison strong{display:block;font-size:12px;letter-spacing:.07em;text-transform:uppercase}
+.lookup-comparison p{margin:9px 0;color:inherit;font-size:13px}
+.lookup-comparison small{font-size:11px;opacity:.75}

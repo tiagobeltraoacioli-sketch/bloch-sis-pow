@@ -1,4 +1,5 @@
 import { validIncludedReceipt } from './receipt-validator.mjs';
+import { compareReceiptObservations } from './receipt-comparison.mjs';
 
 const form = document.getElementById('lookup-form');
 const input = document.getElementById('lookup-txid');
@@ -10,6 +11,26 @@ const lists = [document.getElementById('lookup-inputs'), document.getElementById
 const observation = document.getElementById('lookup-observation');
 const observationText = document.getElementById('lookup-observation-text');
 const observationEvidence = document.getElementById('lookup-observation-evidence');
+const comparison = document.getElementById('lookup-comparison');
+const comparisonStatus = document.getElementById('lookup-comparison-status');
+const comparisonDetail = document.getElementById('lookup-comparison-detail');
+const tabHistory = new Map();
+
+function recordObservation(current) {
+  const previous = tabHistory.get(current.txid);
+  const reference = previous?.lastIncluded ?? previous?.latest ?? null;
+  const finding = compareReceiptObservations(reference, current);
+  comparisonStatus.textContent = finding.status.replaceAll('_', ' ');
+  comparisonDetail.textContent = finding.detail;
+  comparison.classList.toggle('review', finding.requiresReview);
+  comparison.hidden = false;
+  tabHistory.delete(current.txid);
+  tabHistory.set(current.txid, {
+    latest: current,
+    lastIncluded: current.kind === 'included' ? current : previous?.lastIncluded ?? null,
+  });
+  if (tabHistory.size > 50) tabHistory.delete(tabHistory.keys().next().value);
+}
 
 async function nodeStatus(txid) {
   const controller = new AbortController();
@@ -71,6 +92,8 @@ form.addEventListener('submit', async event => {
   if (!/^[0-9a-f]{64}$/.test(txid)) {
     message.textContent = 'Enter a valid 64-character hexadecimal txid.';
     result.hidden = true;
+    observation.hidden = true;
+    comparison.hidden = true;
     return;
   }
   const url = `https://blochl1.com/api/v1/transactions/${txid}`;
@@ -80,6 +103,7 @@ form.addEventListener('submit', async event => {
   button.disabled = true;
   result.hidden = true;
   observation.hidden = true;
+  comparison.hidden = true;
   message.textContent = 'Reading the archival receipt and chain-head observation…';
   try {
     const response = await fetch(url, { signal: controller.signal, credentials: 'omit' });
@@ -94,6 +118,7 @@ form.addEventListener('submit', async event => {
       } catch {
         message.textContent = 'Archival receipt unavailable and node status could not be checked. Pending, delayed indexing or an unknown txid are all possible; do not infer failure.';
       }
+      recordObservation({ kind: 'unresolved', txid });
       return;
     }
     if (!response.ok) throw new Error(`The public API returned HTTP ${response.status}.`);
@@ -101,6 +126,7 @@ form.addEventListener('submit', async event => {
     if (!validIncludedReceipt(receipt, txid)) {
       throw new Error('The API returned an incomplete or inconsistent included receipt.');
     }
+    recordObservation({ kind: 'included', txid, receipt });
     summary.replaceChildren();
     addField('Transaction ID', receipt.txid);
     addField('Status', receipt.status);

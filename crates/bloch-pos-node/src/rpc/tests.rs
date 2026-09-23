@@ -463,6 +463,15 @@ fn cursor_pages_are_ordered_complete_and_head_bound() {
     let script = [0xAB; 32];
     let old = utxos_json(&st, &script, 1);
     assert!(old.get("next_cursor").is_none(), "legacy response shape must stay fixed");
+    let legacy_keys: Vec<_> = match &old {
+        Json::Obj(fields) => fields.iter().map(|(key, _)| key.as_str()).collect(),
+        other => panic!("legacy getutxos must return an object, got {other:?}"),
+    };
+    assert_eq!(
+        legacy_keys,
+        ["script_hash", "total", "returned", "truncated", "utxos"],
+        "the opt-in cursor and build marker must not alter legacy reads"
+    );
 
     let first = utxos_page_json(&st, &script, 1, None).unwrap();
     let first_token = first.get("next_cursor").unwrap().as_str().unwrap();
@@ -1709,6 +1718,11 @@ fn getbuildinfo_reports_the_fields_a_partner_compares() {
     }
 
     assert_eq!(v.get("source_digest_alg").unwrap().as_str(), Some("sha3-256"));
+    assert_eq!(
+        v.get("features"),
+        Some(&Json::Arr(vec![Json::s("utxo_cursor_v1")])),
+        "this source reports the opt-in cursor wire shape, not a deployment claim"
+    );
 
     // `commit_source` is the field that separates evidence from assertion.
     // Anything outside this set means the build script grew a case nobody
@@ -1843,6 +1857,7 @@ fn getbuildinfo_answers_over_the_json_rpc_envelope() {
     let out = call(&Ident, &request("getbuildinfo", "[]")).to_string();
     assert!(out.contains("\"source_digest\""), "not reachable over the envelope: {out}");
     assert!(out.contains("\"commit_source\""), "not reachable over the envelope: {out}");
+    assert!(out.contains("\"features\":[\"utxo_cursor_v1\"]"), "cursor marker missing over the envelope: {out}");
     assert!(!out.contains("\"error\""), "getbuildinfo errored: {out}");
     // The envelope must carry the id back, or a client cannot match it.
     assert!(out.contains("\"id\":1"), "envelope lost the id: {out}");

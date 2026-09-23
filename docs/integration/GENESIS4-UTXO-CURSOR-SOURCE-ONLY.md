@@ -2,6 +2,8 @@
 
 Status: implemented and tested in the local node source on 2026-09-23. This is **not a claim that the current mainnet RPC binary supports it**. Check the deployed node build before using a third parameter in production. The older two-parameter contract and response remain unchanged.
 
+Builds from this source include `"features":["utxo_cursor_v1"]` in the existing `getbuildinfo` response. This additive, self-reported marker helps distinguish a binary that includes the opt-in wire shape from older builds. It is not remote attestation and does not prove the endpoint executes that code path correctly. Check the exact endpoint with the opt-in request below before enabling pagination; an absent marker should be treated as unknown or older behavior.
+
 `getutxos` and its alias `listunspent` accept an optional third parameter, `cursor`. Start with an explicit `null`; omission selects the legacy response with no cursor:
 
 ```json
