@@ -230,4 +230,4 @@ if (require.main === module) main(process.argv.slice(2)).then(code => { process.
   process.exitCode = 2;
 });
 
-module.exports = { SAFE_METHODS, endpointUrl, probeMethod, runProbe, parseArgs, main, crossCheck };
+module.exports = { SAFE_METHODS, endpointUrl, probeMethod, runProbe, parseArgs, main, crossCheck, networkDomain, checkpoint };

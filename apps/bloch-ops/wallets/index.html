@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="../assets/style.css?v=20260923">
   <link rel="stylesheet" href="style.css?v=20260923">
   <link rel="stylesheet" href="lookup.css?v=20260923-2">
-  <script src="lookup.js?v=20260923-2" defer></script>
+  <script src="lookup.js?v=20260923-3" type="module"></script>
 </head>
 <body>
   <a class="skip" href="#main">Skip to content</a>
@@ -29,7 +29,7 @@ const recovered = deriveLocalAddress({ mnemonic });
 if (recovered.address !== expectedAddress) {
   throw new Error('Address mismatch');
 }</code></pre><p>Restoration returns an address without transmitting the phrase. For an interactive encrypted wallet, use Postern Wallet. Older identities may need their original derivation convention.</p></div></div><div class="wallet-callout"><strong>Local generation is not hosted custody.</strong><p>There is no mnemonic form or key store on Bloch Ops. Protect the calling process, backup ceremony and resulting wallet according to your own custody policy.</p></div></section>
-    <section class="wallet-section" id="transfer"><p class="kicker">02 / HIGH-LEVEL TRANSACTION INTERFACE</p><div class="wallet-section-head"><h2>Four inputs.<br>Signed bytes out.</h2><p><code>createSignedTransaction</code> handles UTXO selection, the current fee and epoch, construction, signing and serialization through the pinned Genesis-4 wallet core. Amounts are decimal strings.</p></div><div class="wallet-grid"><div><span class="step-tag">INSTALL / NODE.JS 20+</span><pre><code>npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.6.tgz</code></pre><p>The package is source-distributed and versioned. Check its code and pinned WASM hash before processing value.</p><a href="https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.6.tgz">Download SDK package ↗</a> <a href="downloads/blochprotocol-genesis4-sdk-0.1.6.tgz.sha256">Verify SHA-256 ↗</a></div><div><span class="step-tag">SIGN / LOCAL PROCESS</span><pre><code>import { createSignedTransaction } from '@blochprotocol/genesis4-sdk';
+    <section class="wallet-section" id="transfer"><p class="kicker">02 / HIGH-LEVEL TRANSACTION INTERFACE</p><div class="wallet-section-head"><h2>Four inputs.<br>Signed bytes out.</h2><p><code>createSignedTransaction</code> handles UTXO selection, the current fee and epoch, construction, signing and serialization through the pinned Genesis-4 wallet core. Amounts are decimal strings.</p></div><div class="wallet-grid"><div><span class="step-tag">INSTALL / NODE.JS 20+</span><pre><code>npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.7.tgz</code></pre><p>The package is source-distributed and versioned. Check its code and pinned WASM hash before processing value.</p><a href="https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.7.tgz">Download SDK package ↗</a> <a href="downloads/blochprotocol-genesis4-sdk-0.1.7.tgz.sha256">Verify SHA-256 ↗</a></div><div><span class="step-tag">SIGN / LOCAL PROCESS</span><pre><code>import { createSignedTransaction } from '@blochprotocol/genesis4-sdk';
 
 const signed = await createSignedTransaction({
   addressFrom: process.env.BLOCH_ADDRESS_FROM,

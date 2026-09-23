@@ -9,6 +9,15 @@ const mnemonic = core.call('new_mnemonic', { words: 24 }).mnemonic;
 const address = core.call('wallet_from_mnemonic', { mnemonic, testnet: false }).address;
 core.dispose();
 const txid = 'ab'.repeat(32);
+const receiptFixture = {
+  txid, block_id: 'cd'.repeat(32), height: 80, slot: 100, index: 0,
+  kind: 'transfer_v2', size_bytes: 8000, fee_sat: '20', stake_sat: '0',
+  inputs: [{ txid: 'ef'.repeat(32), vout: 0, value_sat: '120', script_hash: '01'.repeat(32) }],
+  outputs: [{ txid, vout: 0, value_sat: '100', script_hash: '02'.repeat(32) }],
+  confirmations: 22, status: 'finalized', finalized: true, finalized_height: 90,
+  observed_head_height: 101, observed_head_slot: 121, corroboration: 'corroborated',
+  source: 'test canonical archive', verification: 'test replay',
+};
 function response(data, status = 200) { return { ok: status === 200, status, async json() { return data; } }; }
 const fetchImpl = async (_url, options) => {
   const method = JSON.parse(options.body).method;
@@ -80,7 +89,7 @@ test('mismatched source address is refused before any RPC', async () => {
 });
 
 test('transaction lookup includes receipt, confirmations, and finality', async () => {
-  const lookupFetch = async () => response({ txid, block_id: 'cd'.repeat(32), height: 80, slot: 100, index: 0, kind: 'transfer_v2', inputs: [{ value_sat: '120' }], outputs: [{ value_sat: '100' }], fee_sat: '20', stake_sat: '0', size_bytes: 8000, confirmations: 22, status: 'finalized', finalized: true, finalized_height: 90, observed_head_height: 101, observed_head_slot: 121, corroboration: 'corroborated' });
+  const lookupFetch = async () => response(receiptFixture);
   const result = await getTransaction(txid, { fetchImpl: lookupFetch });
   assert.equal(result.confirmations, 22);
   assert.equal(result.status, 'finalized');
@@ -88,10 +97,19 @@ test('transaction lookup includes receipt, confirmations, and finality', async (
 });
 
 test('transaction observation preserves the complete included receipt', async () => {
-  const receipt = { txid, block_id: 'cd'.repeat(32), height: 80, slot: 100, index: 0, kind: 'transfer_v2', inputs: [], outputs: [], fee_sat: '20', stake_sat: '0', size_bytes: 8000, confirmations: 22, status: 'finalized', finalized: true, finalized_height: 90, observed_head_height: 101, observed_head_slot: 121, corroboration: 'corroborated' };
-  const observed = await getTransactionObservation(txid, { fetchImpl: async () => response(receipt) });
+  const observed = await getTransactionObservation(txid, { fetchImpl: async () => response(receiptFixture) });
   assert.equal(observed.kind, 'included');
   assert.equal(observed.receipt.status, 'finalized');
+});
+
+test('transaction lookup rejects malformed money, outpoints and inconsistent chain metadata', async () => {
+  const lookup = data => getTransaction(txid, { fetchImpl: async () => response(data) });
+  await assert.rejects(lookup({ ...receiptFixture, outputs: [{ ...receiptFixture.outputs[0], value_sat: '1.5' }] }), /incomplete or mismatched/);
+  await assert.rejects(lookup({ ...receiptFixture, outputs: [receiptFixture.outputs[0], receiptFixture.outputs[0]] }), /incomplete or mismatched/);
+  await assert.rejects(lookup({ ...receiptFixture, inputs: [{ ...receiptFixture.inputs[0], script_hash: 'bad' }] }), /incomplete or mismatched/);
+  await assert.rejects(lookup({ ...receiptFixture, outputs: [{ ...receiptFixture.outputs[0], txid: '00'.repeat(32) }] }), /incomplete or mismatched/);
+  await assert.rejects(lookup({ ...receiptFixture, confirmations: 21 }), /incomplete or mismatched/);
+  await assert.rejects(lookup({ ...receiptFixture, finalized_height: 79 }), /incomplete or mismatched/);
 });
 
 test('archival 404 yields a node-local unresolved status, never a receipt', async () => {

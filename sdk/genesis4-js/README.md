@@ -13,10 +13,10 @@ This is a source-distributed package; no npm publication is assumed.
 ## Install
 
 The versioned package is served at
-`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.6.tgz`.
+`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.7.tgz`.
 
 ```sh
-npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.6.tgz
+npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.7.tgz
 ```
 
 It can also be installed from a local checkout:
@@ -102,7 +102,7 @@ timeout until the original txid has been checked.
 
 `accepted: true` means mempool admission, not block inclusion or finality.
 Persist the exact signed bytes, txid, `signingRootHex` and `rawHash` for
-reconciliation and safe transport retries. SDK 0.1.6 requires all four fields
+reconciliation and safe transport retries. SDK 0.1.7 requires all four fields
 when broadcasting: before network I/O it recomputes the domain-separated txid
 from `signingRootHex` and SHA3-256 of `rawHex`; after admission it compares the
 node's byte count and `tx_hash` correlation handle. The latter is **not** the
@@ -147,6 +147,10 @@ Every input and output carries `value_sat` as a decimal string and a
 `observedHeadSlot`, `source`, and `verification`. Confirmations are inclusive:
 `observedHeadHeight - height + 1`. `finalized` is true only when the fresh,
 corroborated finalized height reaches the canonical receipt's height.
+The SDK rejects missing or duplicate outpoints, malformed integer amounts or
+script hashes, output txids that differ from the queried transaction, and
+contradictory height, confirmation or finality fields. These structural checks
+do not independently replay consensus or establish source authenticity.
 
 The archival index currently serves **included transactions**. A 404 does
 not prove that a recently submitted transaction failed: it may still be

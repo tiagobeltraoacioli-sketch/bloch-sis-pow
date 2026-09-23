@@ -16,3 +16,18 @@ Endpoints must use HTTPS, except for loopback HTTP. Credentials, query strings, 
 The cross-check compares `network_domain` with the trusted expected value when supplied, compares the two reported domains, and compares `finalized.epoch` and `finalized.root` when both endpoints report the **same finalized epoch**. Different epochs, missing fields, and unavailable reference requests are inconclusive. A same-epoch root conflict or domain mismatch fails the check. The JSON report includes the observed values and specific finding codes; it contains no keys or transaction data. Do not publish the report if your endpoint URL or operational metadata is sensitive.
 
 The result is a compatibility observation at one time. A matching `source_digest`, domain, or finalized root is self-reported; matching gateway replies do not prove chain consensus, operator independence, or an authenticated checkpoint. Before production use, compare a trusted network manifest, checkpoint, release artifact, and independent nodes. Shape compatibility does not verify field semantics, finality policy, uptime, or transaction submission.
+
+## Compare two saved observations
+
+Run the same probe at two distinct times and keep the original JSON files as evidence. `compare-reports.cjs` reads those files offline; it makes no RPC or network requests. Keep the comparator and `probe.cjs` in the same directory.
+
+```sh
+node probe.cjs --rpc https://node-a.example/rpc --expect-domain "$BLOCH_NETWORK_DOMAIN" --json > earlier.json
+# Run again later against the same endpoint and reference configuration.
+node probe.cjs --rpc https://node-a.example/rpc --expect-domain "$BLOCH_NETWORK_DOMAIN" --json > later.json
+node compare-reports.cjs --before earlier.json --after later.json --expect-domain "$BLOCH_NETWORK_DOMAIN" > comparison.json
+```
+
+The comparator requires the later report timestamp to be greater and the endpoint configuration to match. It checks the observed network domain against the trusted value, detects domain changes, decreasing finalized epochs or heights, and contradictory roots at the same finalized epoch. It also preserves a failed or inconclusive reference cross-check from either report. A higher epoch may have a different root. Missing data, changed endpoints, or unverified time order make the longitudinal check inconclusive. Findings are emitted as machine-readable JSON. Exit code `0` means match, `1` means fail or inconclusive, and `2` means invalid input. Each input is limited to 1 MiB. Keep the original reports private if endpoint URLs or operational metadata are sensitive; the comparison output omits endpoint URLs.
+
+These files and timestamps are supplied by the operator and are not authenticated. A match cannot establish continuous uptime, independent agreement, chain consensus, or settlement finality. Use an independent trusted checkpoint and your own transaction policy for operational decisions.

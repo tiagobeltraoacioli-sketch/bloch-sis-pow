@@ -6,6 +6,8 @@ fn main() {
     // Public fixture seed. The derived private key is intentionally NOT secure.
     let (pubkey, secret) = bloch_crypto::crypto::generate_keypair_from_seed(&[0x42; 32])
         .expect("test key generation");
+    let (other_pubkey, _) = bloch_crypto::crypto::generate_keypair_from_seed(&[0x43; 32])
+        .expect("second test key generation");
     let anchor = PqShieldAnchor {
         version: ANCHOR_VERSION,
         target_chain: TargetChain::Bitcoin,
@@ -29,6 +31,7 @@ fn main() {
         },
         "commitment_bytes_hex": hex::encode(anchor.commitment_bytes()),
         "signature": hex::encode(&signed.signature),
+        "other_test_pubkey": hex::encode(other_pubkey),
         "signed_anchor_hex": hex::encode(signed.serialize())
     }));
 }

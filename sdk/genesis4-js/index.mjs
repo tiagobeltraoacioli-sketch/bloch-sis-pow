@@ -6,6 +6,8 @@ import { createHash } from 'node:crypto';
 const DEFAULT_RPC = 'https://posternlabs.com/g4rpc';
 const DEFAULT_EXPLORER = 'https://blochl1.com';
 const HASH = /^[0-9a-f]{64}$/i;
+const UINT = /^(0|[1-9][0-9]*)$/;
+const MAX_U64 = (1n << 64n) - 1n;
 const TXID_DOMAIN = Buffer.from('BLCH4:TXID\0\0\0\0\0\0', 'ascii');
 
 function rawCorrelationHash(rawHex) {
@@ -14,6 +16,24 @@ function rawCorrelationHash(rawHex) {
 
 function txidFromSigningRoot(rootHex) {
   return createHash('sha3-256').update(TXID_DOMAIN).update(Buffer.from(rootHex, 'hex')).digest('hex');
+}
+
+function uint64String(value) {
+  return typeof value === 'string' && UINT.test(value) && BigInt(value) <= MAX_U64;
+}
+
+function validReceiptEntries(entries, receiptTxid, outputs) {
+  if (!Array.isArray(entries)) return false;
+  const seen = new Set();
+  for (const entry of entries) {
+    if (!HASH.test(entry?.txid) || !Number.isSafeInteger(entry.vout) || entry.vout < 0 ||
+        !HASH.test(entry.script_hash) || !uint64String(entry.value_sat) ||
+        (outputs && entry.txid.toLowerCase() !== receiptTxid.toLowerCase())) return false;
+    const outpoint = `${entry.txid.toLowerCase()}:${entry.vout}`;
+    if (seen.has(outpoint)) return false;
+    seen.add(outpoint);
+  }
+  return true;
 }
 
 function mainnetAddress(value, name) {
@@ -198,12 +218,23 @@ export async function getTransaction(txid, { explorerUrl = DEFAULT_EXPLORER, fet
   const base = explorerUrl.replace(/\/$/, '');
   const receipt = await json(`${base}/api/v1/transactions/${txid.toLowerCase()}`, { method: 'GET' }, fetchImpl);
   if (!HASH.test(receipt.txid) || receipt.txid.toLowerCase() !== txid.toLowerCase() ||
-      !Array.isArray(receipt.inputs) || !Array.isArray(receipt.outputs) ||
-      !Number.isSafeInteger(receipt.height) || !Number.isSafeInteger(receipt.slot) ||
-      !Number.isSafeInteger(receipt.confirmations) ||
-      !Number.isSafeInteger(receipt.finalized_height) ||
+      !HASH.test(receipt.block_id) ||
+      !validReceiptEntries(receipt.inputs, receipt.txid, false) ||
+      !validReceiptEntries(receipt.outputs, receipt.txid, true) ||
+      ![receipt.height, receipt.slot, receipt.index, receipt.size_bytes,
+        receipt.confirmations, receipt.finalized_height, receipt.observed_head_height,
+        receipt.observed_head_slot].every(value => Number.isSafeInteger(value) && value >= 0) ||
+      receipt.size_bytes === 0 || receipt.observed_head_height < receipt.height ||
+      receipt.observed_head_slot < receipt.slot ||
+      receipt.finalized_height > receipt.observed_head_height ||
+      receipt.confirmations !== receipt.observed_head_height - receipt.height + 1 ||
+      !uint64String(receipt.fee_sat) || !uint64String(receipt.stake_sat) ||
+      typeof receipt.kind !== 'string' || !receipt.kind ||
+      typeof receipt.source !== 'string' || !receipt.source ||
+      typeof receipt.verification !== 'string' || !receipt.verification ||
       !['confirmed', 'finalized'].includes(receipt.status) ||
       receipt.finalized !== (receipt.status === 'finalized') ||
+      (receipt.finalized && receipt.finalized_height < receipt.height) ||
       !['corroborated', 'final'].includes(receipt.corroboration)) {
     throw new Error('Indexer returned an incomplete or mismatched transaction receipt');
   }

@@ -1,3 +1,5 @@
+import { validIncludedReceipt } from './receipt-validator.mjs';
+
 const form = document.getElementById('lookup-form');
 const input = document.getElementById('lookup-txid');
 const message = document.getElementById('lookup-message');
@@ -96,8 +98,8 @@ form.addEventListener('submit', async event => {
     }
     if (!response.ok) throw new Error(`The public API returned HTTP ${response.status}.`);
     const receipt = await response.json();
-    if (!receipt || receipt.txid !== txid || !Array.isArray(receipt.inputs) || !Array.isArray(receipt.outputs)) {
-      throw new Error('The API response did not match the requested transaction.');
+    if (!validIncludedReceipt(receipt, txid)) {
+      throw new Error('The API returned an incomplete or inconsistent included receipt.');
     }
     summary.replaceChildren();
     addField('Transaction ID', receipt.txid);

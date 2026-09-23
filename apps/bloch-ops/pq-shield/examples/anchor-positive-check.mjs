@@ -1,4 +1,5 @@
-// Run against a locally running Rust pq-shield-api service on 127.0.0.1:8787.
+// Run through run-anchor-positive-local.mjs, or against a local service using
+// PQ_SHIELD_TEST_URL=http://127.0.0.1:<port>.
 // Requires local Rust/Cargo. Uses a public test seed, fake regtest addresses,
 // and no UTXO, funding, Bitcoin signing, chain publication, or broadcast.
 import assert from 'node:assert/strict';
@@ -13,7 +14,7 @@ const fixture = JSON.parse(execFileSync('cargo', ['run', '--quiet', '--manifest-
   encoding: 'utf8', timeout: 180_000, maxBuffer: 128 * 1024,
   env: { ...process.env, CARGO_TARGET_DIR: join(tmpdir(), 'pq-shield-anchor-fixture-build') },
 }));
-const client = createPqShieldClient();
+const client = createPqShieldClient(process.env.PQ_SHIELD_TEST_URL);
 await client.health();
 
 const commitment = await client.anchorCommitment(fixture.fields);
@@ -32,6 +33,20 @@ const tampered = await client.verifyAnchor({
   ...fixture.fields, designated_safe_dest: 'bcrt1qtestattackerdestination', signature: fixture.signature,
 }, enrolledTestPubkey);
 assert.equal(tampered.valid, false, 'Changed safe destination must invalidate signature');
+const changedPolicy = { ...fixture.fields, policy: 'altered-test-policy' };
+const changedCommitment = await client.anchorCommitment(changedPolicy);
+assert.notEqual(changedCommitment.commitment_bytes_hex, fixture.commitment_bytes_hex,
+  'Changed policy must alter commitment bytes');
+const tamperedCommitment = await client.verifyAnchor({
+  ...changedPolicy, signature: fixture.signature,
+}, enrolledTestPubkey);
+assert.equal(tamperedCommitment.valid, false, 'Changed commitment must invalidate signature');
+
+assert.notEqual(fixture.other_test_pubkey, enrolledTestPubkey);
+const wrongEnrollment = await client.verifyAnchor({
+  ...fixture.fields, signature: fixture.signature,
+}, fixture.other_test_pubkey);
+assert.equal(wrongEnrollment.valid, false, 'Wrong enrolled public key must reject signature');
 
 const serialized = await client.verifyAnchor({ signed_anchor_hex: fixture.signed_anchor_hex }, enrolledTestPubkey);
 assert.equal(serialized.valid, true, `Serialized signed anchor rejected: ${serialized.reason}`);
@@ -40,6 +55,7 @@ console.log(JSON.stringify({
   status: 'PASS',
   scope: 'local disposable PQ signer and local reference verifier only',
   checks: ['matching commitment bytes', 'valid signature', 'tampered safe destination rejected',
+    'tampered policy commitment rejected', 'wrong enrolled key rejected',
     'serialized signed anchor accepted'],
   bitcoin_signing: false, broadcast: false, bloch_consensus_anchor: false,
 }, null, 2));
