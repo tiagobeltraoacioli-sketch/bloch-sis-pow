@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#08100e">
+  <meta name="description" content="Bloch Data + Dev Cloud: a proposed data and developer service for traceable Bloch L1 records, versioned APIs, event delivery and reproducible testing. See what exists and what is planned.">
+  <meta property="og:title" content="Bloch Data + Dev Cloud — Data you can trace. Tools you can build on.">
+  <meta property="og:description" content="A transparent roadmap for canonical network data, developer APIs, webhooks and a sandbox.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://blochdata.xyz/">
+  <title>Bloch Data + Dev Cloud — Data you can trace</title>
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="header">
+    <a class="brand" href="#top" aria-label="Bloch Data home"><img src="assets/bloch-inc-logo-dark.png" alt="Bloch Inc" width="1380" height="260"><span>DATA</span></a>
+    <nav aria-label="Main navigation"><a href="#data">Data</a><a href="#cloud">Dev Cloud</a><a href="#trust">Trust model</a><a href="#roadmap">Roadmap</a></nav>
+    <a class="header-cta" href="https://blochinc.xyz/#services">Bloch Inc <span aria-hidden="true">↗</span></a>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top">
+      <div class="hero-mesh" aria-hidden="true"></div>
+      <div class="hero-content">
+        <div class="eyebrow"><span class="pulse"></span> PRODUCT ROADMAP / DATA + DEV CLOUD</div>
+        <h1>Data you can <em>trace.</em><br>Tools you can<br><em>build on.</em></h1>
+        <p class="hero-lead">Bloch Data + Dev Cloud is the proposed developer layer for canonical network records, reliable integrations and repeatable testing across the Bloch ecosystem.</p>
+        <div class="actions"><a class="button primary" href="#data">Explore the data layer <span aria-hidden="true">↓</span></a><a class="button secondary" href="#roadmap">See delivery stages <span aria-hidden="true">↗</span></a></div>
+        <p class="hero-note">The public explorer and historical index are available today. The managed data platform described here is in development and qualification.</p>
+      </div>
+      <div class="hero-visual" aria-label="Data pipeline from network records through an index to developer interfaces">
+        <div class="visual-caption"><span>01 / THE DATA PATH</span><span class="visual-live"><i></i> ROADMAP VIEW</span></div>
+        <div class="pipeline">
+          <div class="pipeline-node"><span>ORIGIN</span><strong>Bloch L1</strong><small>Blocks · transactions<br>validators · finality</small></div>
+          <div class="pipeline-line" aria-hidden="true"><i></i></div>
+          <div class="pipeline-node active"><span>CANONICAL VIEW</span><strong>Bloch Data</strong><small>Index · provenance<br>reorg-aware records</small></div>
+          <div class="pipeline-line" aria-hidden="true"><i></i></div>
+          <div class="pipeline-node"><span>DELIVERY</span><strong>Dev Cloud</strong><small>APIs · events<br>SDKs · sandbox</small></div>
+        </div>
+        <div class="visual-foot"><span>NETWORK EVIDENCE</span><span>VERSIONED CONTRACTS</span><span>REPRODUCIBLE WORKFLOWS</span></div>
+      </div>
+    </section>
+
+    <section class="stagebar" aria-label="Current stage"><strong>Where we are</strong><span><b>Available:</b> public explorer, historical records and published integration components</span><span><b>Next:</b> complete index, managed APIs, webhooks and sandbox</span></section>
+
+    <section class="section intro" id="data">
+      <div class="section-kicker">01 / BLOCH DATA</div>
+      <div class="section-head"><h2>Network data with a clear origin.</h2><p>One consistent view of the chain, built for teams that need to explain every balance change and transaction decision.</p></div>
+      <div class="data-grid">
+        <article><span class="item-number">01</span><div class="icon-box">↗</div><h3>Transactions &amp; UTXOs</h3><p>Inputs, outputs, amounts, fees, inclusion height, slot and confirmation state. Designed for deposit and withdrawal processing.</p><small>Historical explorer data exists; complete managed API is planned.</small></article>
+        <article><span class="item-number">02</span><div class="icon-box">▦</div><h3>Blocks &amp; finality</h3><p>Block ancestry, validator context and evidence that distinguishes observed inclusion from a qualified finality claim.</p><small>Finality reporting requires independent qualification.</small></article>
+        <article><span class="item-number">03</span><div class="icon-box">◎</div><h3>Addresses &amp; activity</h3><p>Address histories, balances and changes over time with a path back to the underlying network records.</p><small>Coverage and provenance targets for the complete index.</small></article>
+        <article><span class="item-number">04</span><div class="icon-box">⟲</div><h3>Canonical history</h3><p>Stable identifiers, explicit reorganization handling and recoverable indexing from a reviewed network anchor.</p><small>An EVM-side anchored indexer core exists; a durable Bloch Data service is planned.</small></article>
+      </div>
+    </section>
+
+    <section class="section interface" aria-labelledby="interface-title">
+      <div class="interface-copy"><div class="section-kicker">A CONTRACT WORTH BUILDING ON</div><h2 id="interface-title">From a txid to a complete record.</h2><p>The target transaction interface returns the fields an integrator needs to reconcile a transfer and follow its status.</p><ul><li>Canonical inputs and outputs with native amounts</li><li>Block height, slot and confirmation progress</li><li>Explicit inclusion, finality and reorganization status</li><li>Network identity and source provenance</li></ul><small>Illustrative field model. This is not a live API response or endpoint specification.</small></div>
+      <div class="schema" role="img" aria-label="Illustrative transaction record fields"><div class="schema-top"><span><i></i> TRANSACTION RECORD</span><span>PROPOSED SCHEMA</span></div><div class="schema-line"><b>txid</b><span>transaction identifier</span></div><div class="schema-line"><b>inputs[]</b><span>source outpoints + amounts</span></div><div class="schema-line"><b>outputs[]</b><span>destinations + amounts</span></div><div class="schema-line"><b>block.height / slot</b><span>inclusion position</span></div><div class="schema-line"><b>confirmations</b><span>chain depth</span></div><div class="schema-line"><b>finality.status</b><span>qualified evidence state</span></div><div class="schema-line"><b>canonical</b><span>reorg-aware state</span></div><div class="schema-bottom">Every field should have a documented meaning and source.</div></div>
+    </section>
+
+    <section class="section cloud" id="cloud"><div class="section-kicker">02 / DEV CLOUD</div><div class="section-head"><h2>Build once. Integrate with confidence.</h2><p>Developer tools that turn raw node access into predictable application workflows.</p></div><div class="cloud-grid"><article><div class="cloud-tag">API / PLANNED</div><h3>Versioned read APIs</h3><p>Documented transaction, block and address contracts with pagination, stable identifiers and compatibility rules.</p></article><article><div class="cloud-tag">EVENTS / PLANNED</div><h3>Reliable webhooks</h3><p>At-least-once delivery, idempotency keys, retries and replay for deposits, confirmations and finality changes.</p></article><article><div class="cloud-tag">TOOLS / INCREMENTAL</div><h3>SDKs &amp; examples</h3><p>Working client examples for exchange, wallet and application flows, with explicit network and version binding.</p></article><article><div class="cloud-tag">SANDBOX / PLANNED</div><h3>Reproducible sandbox</h3><p>Local node, fixtures and transaction simulation for testing integrations before mainnet submission.</p></article></div></section>
+
+    <section class="section trust" id="trust"><div class="section-kicker">03 / TRUST MODEL</div><div class="section-head"><h2>Useful data needs visible boundaries.</h2><p>A data service should show what the network observed, how the index derived it, and which claims still need independent proof.</p></div><div class="trust-list"><div><span>01</span><strong>Chain identity</strong><p>Bind every record to the expected network, chain and genesis.</p></div><div><span>02</span><strong>Canonicality</strong><p>Expose reorganization and replay behavior instead of silently replacing history.</p></div><div><span>03</span><strong>Finality evidence</strong><p>Separate confirmations from finality; never treat a single node claim as independent proof.</p></div><div><span>04</span><strong>Operational quality</strong><p>Measure index freshness, event integrity, availability and recovery time before service commitments.</p></div></div></section>
+
+    <section class="section roadmap" id="roadmap"><div class="section-kicker">04 / DELIVERY ROADMAP</div><div class="section-head"><h2>Ship the evidence before the promise.</h2><p>Milestones follow the Bloch Inc G0–G1 gates and the existing indexer implementation boundary.</p></div><div class="roadmap-grid"><article><span>NOW / FOUNDATION</span><h3>Public visibility</h3><p>Explorer, historical records and published integration components. An anchored EVM canonical indexer core exists in code.</p><small>Not a managed Dev Cloud service.</small></article><article><span>NEXT / INDEX</span><h3>Durable data</h3><p>Persist canonical and orphan transitions atomically, recover after restart and validate input adapters.</p><small>Prerequisite for dependable API reads.</small></article><article><span>THEN / INTERFACES</span><h3>Developer access</h3><p>Versioned APIs, documented schemas, SDK examples and idempotent event delivery.</p><small>Qualification before public service claims.</small></article><article><span>AFTER / SERVICE</span><h3>Managed Dev Cloud</h3><p>Sandbox, monitoring, support procedures and measured availability for pilot users.</p><small>Availability and terms depend on qualification.</small></article></div></section>
+
+    <section class="closing"><div class="closing-copy"><div class="section-kicker">BUILD ON WHAT YOU CAN VERIFY</div><h2>More than a data feed.<br><em>A dependable starting point.</em></h2><p>Bloch Data + Dev Cloud is being shaped for exchanges, wallets, builders and operators that need traceable records and repeatable integrations.</p><div class="actions"><a class="button primary" href="https://blochl1.com/">Explore public network data <span aria-hidden="true">↗</span></a><a class="button secondary" href="https://blochinc.xyz/#services">View the Bloch Inc roadmap <span aria-hidden="true">↗</span></a></div></div></section>
+  </main>
+  <footer class="footer"><div class="footer-main"><a class="brand" href="#top" aria-label="Bloch Data home"><img src="assets/bloch-inc-logo-dark.png" alt="Bloch Inc" width="1380" height="260"><span>DATA</span></a><p>Traceable data. Practical developer tools.<br>Built around network evidence.</p></div><div class="footer-links"><a href="https://blochinc.xyz/">Bloch Inc ↗</a><a href="https://blochl1.com/">Bloch Explorer ↗</a><a href="https://blochprotocol.dev/">Developer resources ↗</a></div><small>© 2026 Bloch Inc. Data + Dev Cloud is a proposed service line. Features and availability depend on qualification.</small></footer>
+</body>
+</html>
