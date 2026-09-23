@@ -115,6 +115,19 @@ already-withdrawn position, a fee above the signed ceiling, or an output
 collision. It creates exactly one eUTXO, marks the position withdrawn, masks
 it from future slash exposure, and clears its three account ledgers.
 
+### `ValidatorCommissionUpdate`
+
+Tag `0x11` changes the validator's commission on rewards from delegated stake.
+The registered validator hybrid key signs the network domain, exact inclusion
+epoch, validator index, and new basis-point rate. The principal is never
+charged; at 500 basis points the operator receives 5% of delegated rewards and
+the delegator receives 95%.
+
+Consensus permits a commission increase only when the validator has no live or
+pending delegation position. A decrease remains permitted while delegations
+exist. This prevents an operator from raising the rate after a delegator has
+committed stake.
+
 ## Activation and rollout
 
 The implementation initially ships with the funded-delegation activation

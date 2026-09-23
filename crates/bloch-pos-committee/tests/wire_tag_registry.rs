@@ -207,6 +207,13 @@ const TX_TAGS: &[(u8, Status)] = &[
             rivals: NO_RIVALS,
         },
     ),
+    (
+        0x11,
+        Status::Released {
+            name: "ValidatorCommissionUpdate",
+            rivals: NO_RIVALS,
+        },
+    ),
     (0x01, Status::Released { name: "Transfer", rivals: NO_RIVALS }),
     (0x02, Status::Released { name: "Deposit", rivals: NO_RIVALS }),
     (0x03, Status::Released { name: "Exit", rivals: NO_RIVALS }),
@@ -532,6 +539,7 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         PosTransaction::FundedDelegate(_) => 0x0E,
         PosTransaction::FundedUndelegate(_) => 0x0F,
         PosTransaction::FundedDelegationWithdraw(_) => 0x10,
+        PosTransaction::ValidatorCommissionUpdate(_) => 0x11,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }

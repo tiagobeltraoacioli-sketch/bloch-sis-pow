@@ -8,6 +8,7 @@ use crate::state_root::EutxoEntry;
 pub const FUNDED_DELEGATE_TAG: u8 = 0x0e;
 pub const FUNDED_UNDELEGATE_TAG: u8 = 0x0f;
 pub const FUNDED_DELEGATION_WITHDRAW_TAG: u8 = 0x10;
+pub const VALIDATOR_COMMISSION_UPDATE_TAG: u8 = 0x11;
 
 const KEY_BYTES: usize = funded::ADMISSION_PQ_KEY_BYTES;
 const SIGNATURE_MAX: usize = funded::ADMISSION_PQ_SIGNATURE_MAX;
@@ -15,6 +16,7 @@ const HYBRID_HEADER: [u8; 4] = [0xb1, 0x0c, 1, 0];
 const DELEGATE_DOMAIN: &[u8] = b"BLOCH:DELEGATION:FUND:V1";
 const UNDELEGATE_DOMAIN: &[u8] = b"BLOCH:DELEGATION:DEACTIVATE:V1";
 const WITHDRAW_DOMAIN: &[u8] = b"BLOCH:DELEGATION:WITHDRAW:V1";
+const COMMISSION_DOMAIN: &[u8] = b"BLOCH:VALIDATOR:COMMISSION:V1";
 const DELEGATE_CLASS: fee_market::TxClass = fee_market::TxClass::Eutxo { inputs: 2 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +56,18 @@ pub struct FundedDelegationWithdraw {
     pub signature: Vec<u8>,
 }
 
+/// Validator-key-authorized update of the reward commission advertised to
+/// future delegators. Increases are only valid while no live or pending
+/// delegation targets the validator; reductions remain possible at any time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatorCommissionUpdate {
+    pub network_domain: [u8; 32],
+    pub epoch: u64,
+    pub validator: u32,
+    pub commission_bps: u128,
+    pub signature: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FundedDelegationReject {
     NotActive,
@@ -74,6 +88,8 @@ pub enum FundedDelegationReject {
     NotInactive,
     WithdrawalDelay,
     AlreadyWithdrawn,
+    Commission,
+    CommissionIncreaseWithDelegations,
     Arithmetic,
 }
 
@@ -368,6 +384,45 @@ impl FundedDelegationWithdraw {
     }
 }
 
+impl ValidatorCommissionUpdate {
+    fn intent_bytes(&self) -> Vec<u8> {
+        let mut out = vec![VALIDATOR_COMMISSION_UPDATE_TAG];
+        out.extend_from_slice(&self.network_domain);
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.extend_from_slice(&self.validator.to_le_bytes());
+        out.extend_from_slice(&self.commission_bps.to_le_bytes());
+        out
+    }
+
+    pub fn signing_root(&self) -> [u8; 32] {
+        role_root(COMMISSION_DOMAIN, &self.intent_bytes())
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = self.intent_bytes();
+        put_bytes(&mut out, &self.signature);
+        out
+    }
+
+    pub(super) fn decode(r: &mut TxReader<'_>) -> Result<Self, TxDecodeError> {
+        Ok(Self {
+            network_domain: r.h32()?,
+            epoch: r.u64()?,
+            validator: r.u32()?,
+            commission_bps: r.u128()?,
+            signature: bounded(r, SIGNATURE_MAX, VALIDATOR_COMMISSION_UPDATE_TAG)?,
+        })
+    }
+
+    pub fn validate_shape(&self) -> Result<(), FundedDelegationReject> {
+        if self.commission_bps > rewards::MAX_COMMISSION_BPS || self.signature.len() > SIGNATURE_MAX
+        {
+            return Err(FundedDelegationReject::Shape);
+        }
+        Ok(())
+    }
+}
+
 impl CommittedState {
     fn funded_owner_matches(
         &self,
@@ -471,6 +526,56 @@ impl CommittedState {
         self.funded_delegation_owners.insert(delegator_id, owner);
         debug_assert_eq!(position as usize + 1, self.delegations.len());
         Ok(charge)
+    }
+
+    pub(super) fn apply_validator_commission_update(
+        &mut self,
+        tx: &ValidatorCommissionUpdate,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<fee_market::TxCharge, FundedDelegationReject> {
+        use FundedDelegationReject as R;
+        if !crate::params::funded_delegation_active(self.epoch) {
+            return Err(R::NotActive);
+        }
+        tx.validate_shape()?;
+        if self.admission_network_domain != Some(tx.network_domain) {
+            return Err(R::Network);
+        }
+        if tx.epoch != self.epoch {
+            return Err(R::Epoch);
+        }
+        let record = self.validators.get(&tx.validator).ok_or(R::Validator)?;
+        if record.slashed || record.exit_epoch != u64::MAX {
+            return Err(R::Validator);
+        }
+        if tx.commission_bps == record.commission_bps {
+            return Err(R::Commission);
+        }
+        if tx.commission_bps > record.commission_bps {
+            let registry = delegation::Registry::resolve(&self.delegations, self.epoch);
+            if self.delegations.iter().any(|delegation| {
+                delegation.validator == tx.validator
+                    && (registry.state_of(delegation) != delegation::StakeState::Inactive
+                        || registry.activated_sat(delegation) != 0)
+            }) {
+                return Err(R::CommissionIncreaseWithDelegations);
+            }
+        }
+        if !signature_has_shape(&tx.signature)
+            || !verifier.verify_with_key(&record.pubkey, &tx.signing_root(), &tx.signature)
+        {
+            return Err(R::Signature);
+        }
+
+        self.validators
+            .get_mut(&tx.validator)
+            .expect("validator existence checked above")
+            .commission_bps = tx.commission_bps;
+        Ok(Self::staking_tx_charge(
+            self.epoch,
+            1,
+            tx.canonical_bytes().len(),
+        ))
     }
 
     pub(super) fn apply_funded_undelegate(
@@ -679,6 +784,21 @@ mod tests {
             signature: Vec::new(),
         };
         assert_ne!(undelegate.signing_root(), withdraw.signing_root());
+
+        let commission = ValidatorCommissionUpdate {
+            network_domain: undelegate.network_domain,
+            epoch: undelegate.epoch,
+            validator: 0,
+            commission_bps: 500,
+            signature: Vec::new(),
+        };
+        assert_ne!(commission.signing_root(), undelegate.signing_root());
+        assert_ne!(commission.signing_root(), withdraw.signing_root());
+        let bytes = commission.canonical_bytes();
+        assert_eq!(bytes[0], VALIDATOR_COMMISSION_UPDATE_TAG);
+        let mut r = TxReader { b: &bytes, i: 1 };
+        assert_eq!(ValidatorCommissionUpdate::decode(&mut r), Ok(commission));
+        assert_eq!(r.i, bytes.len());
     }
 
     #[test]

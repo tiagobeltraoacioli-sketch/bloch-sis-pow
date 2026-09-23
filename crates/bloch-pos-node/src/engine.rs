@@ -7186,6 +7186,17 @@ fn admissible_with_network_verifier(
                 .validate_shape()
                 .map_err(|_| "invalid funded delegation withdrawal shape")
         }
+        PosTransaction::ValidatorCommissionUpdate(update) => {
+            if !bloch_pos_committee::params::epoch_gate_active(
+                wall_epoch,
+                bloch_pos_committee::params::FUNDED_DELEGATION_ACTIVATION_EPOCH,
+            ) {
+                return Err("validator commission update (tag 0x11) is not active");
+            }
+            update
+                .validate_shape()
+                .map_err(|_| "invalid validator commission update shape")
+        }
 
         // Staking messages are refused outright until bonding is funded from
         // the eUTXO set.

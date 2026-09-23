@@ -61,6 +61,19 @@ fn fixture() -> (CommittedState, FundedDelegate) {
     (state, tx)
 }
 
+fn commission_update(state: &CommittedState, commission_bps: u128) -> ValidatorCommissionUpdate {
+    let mut tx = ValidatorCommissionUpdate {
+        network_domain: state.admission_network_domain.unwrap(),
+        epoch: state.epoch,
+        validator: 0,
+        commission_bps,
+        signature: Vec::new(),
+    };
+    let key = &state.validators[&0].pubkey;
+    tx.signature = auth_sign(key, &tx.signing_root());
+    tx
+}
+
 #[test]
 fn lifecycle_is_inert_without_rehearsal() {
     let (mut state, tx) = fixture();
@@ -74,6 +87,70 @@ fn lifecycle_is_inert_without_rehearsal() {
         Err(FundedDelegationReject::NotActive)
     );
     assert_eq!(state, before);
+}
+
+#[test]
+fn commission_update_is_inert_and_atomic_without_rehearsal() {
+    let (mut state, _) = fixture();
+    let tx = commission_update(&state, 500);
+    let before = state.clone();
+    assert_eq!(
+        state.apply_validator_commission_update(&tx, &AuthVerifier),
+        Err(FundedDelegationReject::NotActive)
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn validator_can_set_five_percent_before_delegation() {
+    let _gate = funded_delegation_rehearsal::open();
+    let (mut state, _) = fixture();
+    state.validators.get_mut(&0).unwrap().commission_bps = 0;
+    let before_root = state.state_root();
+    let tx = commission_update(&state, 500);
+    state
+        .apply_validator_commission_update(&tx, &AuthVerifier)
+        .unwrap();
+    assert_eq!(state.validators[&0].commission_bps, 500);
+    assert_ne!(state.state_root(), before_root);
+
+    let mut forged = commission_update(&state, 400);
+    forged.signature[40] ^= 1;
+    let before = state.clone();
+    assert_eq!(
+        state.apply_validator_commission_update(&forged, &AuthVerifier),
+        Err(FundedDelegationReject::Signature)
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn commission_cannot_increase_after_delegation_but_can_decrease() {
+    let _gate = funded_delegation_rehearsal::open();
+    let (mut state, _) = fixture();
+    state.validators.get_mut(&0).unwrap().commission_bps = 500;
+    state.delegations.push(Delegation {
+        delegator: 88,
+        validator: 0,
+        amount_sat: delegation::MIN_DELEGATION_SAT,
+        requested_epoch: state.epoch,
+        deactivate_epoch: None,
+        eligible: true,
+    });
+
+    let increase = commission_update(&state, 600);
+    let before = state.clone();
+    assert_eq!(
+        state.apply_validator_commission_update(&increase, &AuthVerifier),
+        Err(FundedDelegationReject::CommissionIncreaseWithDelegations)
+    );
+    assert_eq!(state, before);
+
+    let decrease = commission_update(&state, 400);
+    state
+        .apply_validator_commission_update(&decrease, &AuthVerifier)
+        .unwrap();
+    assert_eq!(state.validators[&0].commission_bps, 400);
 }
 
 #[test]

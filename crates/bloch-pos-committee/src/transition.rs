@@ -131,6 +131,7 @@ mod lifecycle;
 pub use funded::{FundedDeposit, FundedDepositReject, FundingInput};
 pub use funded_delegation::{
     FundedDelegate, FundedDelegationReject, FundedDelegationWithdraw, FundedUndelegate,
+    ValidatorCommissionUpdate,
 };
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
@@ -300,6 +301,8 @@ pub enum PosTransaction {
     FundedUndelegate(FundedUndelegate),
     /// Owner-authorized payout of a fully inactive funded position (wire 0x10).
     FundedDelegationWithdraw(FundedDelegationWithdraw),
+    /// Validator-authorized commission update for future delegation (wire 0x11).
+    ValidatorCommissionUpdate(ValidatorCommissionUpdate),
     /// A value transfer against the committed eUTXO set, priced by the L1 fee
     /// market: **gas × price**, where the gas is derived (class + size,
     /// `fee_market::intrinsic_gas`) and the price is the base fee this block's
@@ -670,6 +673,7 @@ impl PosTransaction {
             PosTransaction::FundedDelegate(tx) => return tx.signing_root(),
             PosTransaction::FundedUndelegate(tx) => return tx.signing_root(),
             PosTransaction::FundedDelegationWithdraw(tx) => return tx.signing_root(),
+            PosTransaction::ValidatorCommissionUpdate(tx) => return tx.signing_root(),
             other => h.update(other.canonical_bytes()),
         }
         h.finalize().into()
@@ -837,6 +841,7 @@ impl PosTransaction {
             PosTransaction::FundedDelegate(tx) => return tx.canonical_bytes(),
             PosTransaction::FundedUndelegate(tx) => return tx.canonical_bytes(),
             PosTransaction::FundedDelegationWithdraw(tx) => return tx.canonical_bytes(),
+            PosTransaction::ValidatorCommissionUpdate(tx) => return tx.canonical_bytes(),
             PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
                 // Counts are length prefixes like every other variable-length
@@ -1031,6 +1036,8 @@ impl PosTransaction {
                 PosTransaction::FundedUndelegate(FundedUndelegate::decode(&mut r)?),
             funded_delegation::FUNDED_DELEGATION_WITHDRAW_TAG =>
                 PosTransaction::FundedDelegationWithdraw(FundedDelegationWithdraw::decode(&mut r)?),
+            funded_delegation::VALIDATOR_COMMISSION_UPDATE_TAG =>
+                PosTransaction::ValidatorCommissionUpdate(ValidatorCommissionUpdate::decode(&mut r)?),
             0x01 => {
                 // Counts are read from untrusted bytes, so nothing is
                 // preallocated from them: a 4-billion-input header on a 40-byte
@@ -3480,6 +3487,9 @@ impl CommittedState {
                 .map_err(TxReject::FundedDelegation),
             PosTransaction::FundedDelegationWithdraw(withdrawal) => self
                 .apply_funded_delegation_withdrawal(withdrawal, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::FundedDelegation),
+            PosTransaction::ValidatorCommissionUpdate(update) => self
+                .apply_validator_commission_update(update, verifier)
                 .map_err(TxReject::FundedDelegation),
             PosTransaction::Transfer { .. } => self
                 .apply_transfer(tx, base_fee_millisat_per_gas, verifier)
@@ -14500,7 +14510,8 @@ mod tests {
             // position and back; its lifecycle never edits the issuance cap.
             PosTransaction::FundedDelegate(_)
             | PosTransaction::FundedUndelegate(_)
-            | PosTransaction::FundedDelegationWithdraw(_) => {}
+            | PosTransaction::FundedDelegationWithdraw(_)
+            | PosTransaction::ValidatorCommissionUpdate(_) => {}
         }
 
         // Monotone under blocks and boundaries, and never above the cap.
