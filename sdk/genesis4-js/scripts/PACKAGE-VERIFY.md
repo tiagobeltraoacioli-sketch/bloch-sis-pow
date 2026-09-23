@@ -8,8 +8,8 @@ transfer using mocked RPC responses. It does not broadcast or contact a node.
 
 ```sh
 node scripts/verify-installed-package.mjs \
-  ../../apps/bloch-ops/wallets/downloads/blochprotocol-genesis4-sdk-0.1.12.tgz \
-  0.1.12
+  ../../apps/bloch-ops/wallets/downloads/blochprotocol-genesis4-sdk-0.1.13.tgz \
+  0.1.13
 ```
 
 Run it from `sdk/genesis4-js`. Pass the expected version explicitly; a version

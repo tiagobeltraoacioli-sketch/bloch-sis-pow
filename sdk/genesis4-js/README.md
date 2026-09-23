@@ -22,10 +22,10 @@ submitting any other bytes.
 ## Install
 
 The versioned package is served at
-`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.12.tgz`.
+`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.13.tgz`.
 
 ```sh
-npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.12.tgz
+npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.13.tgz
 ```
 
 It can also be installed from a local checkout:
@@ -105,7 +105,7 @@ limits. It requests the node's maximum 1,000 UTXOs and returns
 `utxosTruncated: true` if the source owns more than the node can enumerate.
 The core can still select from the visible coins; if those cannot cover the
 amount, an exchange node or indexer with a complete UTXO view is required.
-SDK 0.1.12 also has an explicit `utxoMode: 'cursor'` for a node built with the
+SDK 0.1.13 also has an explicit `utxoMode: 'cursor'` for a node built with the
 source-only Genesis-4 cursor extension. **That extension is not deployed on
 current mainnet.** The default remains `legacy` and makes the same two-argument
 request as earlier versions. Do not enable cursor mode against an unverified
@@ -134,7 +134,7 @@ timeout until the original txid has been checked.
 
 `accepted: true` means mempool admission, not block inclusion or finality.
 Persist the exact signed bytes, txid, `signingRootHex` and `rawHash` for
-reconciliation and safe transport retries. SDK 0.1.12 requires all four fields
+reconciliation and safe transport retries. SDK 0.1.13 requires all four fields
 when broadcasting: before network I/O it recomputes the domain-separated txid
 from `signingRootHex` and SHA3-256 of `rawHex`; after admission it compares the
 node's byte count and `tx_hash` correlation handle. The latter is **not** the
@@ -281,6 +281,41 @@ chain identity, source authenticity and your own finality policy separately.
 
 ## Inspect deposit outputs
 
+`getDepositTransaction({txid, addressTo, amount})` is the one-call exchange
+read path. It validates a checksummed Genesis-4 mainnet deposit address and a
+positive decimal BLOCH amount before making a network request, fetches the
+complete included receipt, and returns `{transaction, match}`. The `match`
+lists the exact output outpoints and integer satoshi total. An archival 404
+remains an unresolved lookup error; the function never turns node-local status
+into an included receipt.
+
+```js
+import { getDepositTransaction } from '@blochprotocol/genesis4-sdk';
+
+const { transaction, match } = await getDepositTransaction({
+  txid,
+  addressTo: expectedDepositAddress,
+  amount: '1.25000000',
+});
+console.log(transaction.blockId, transaction.height, transaction.finalized);
+console.log(match.matchingOutputs, match.matchedAmountSat, match.exactTotal);
+```
+
+Run `node examples/query-deposit.mjs <txid> <addressTo> <amount>` for a
+read-only mainnet query. This concrete included transaction and output were
+checked against Genesis-4 mainnet on 2026-09-23:
+
+```sh
+node examples/query-deposit.mjs \
+  2a70f41229d8587f060c308279238662c2aa331f4d9f32a660231716f418c672 \
+  bloch1q4df3127262d35b22ac2004c297ba60a03625ae9004807572 \
+  1992.76963149
+```
+
+The result matched output `:0` with `199276963149` satoshis and reported the
+transaction at height 84877, slot 113045. This result is an observation, not
+a credit decision.
+
 `inspectDepositOutputs({transaction, addressTo, amount})` matches the outputs
 of a complete included receipt to a checksummed Genesis-4 mainnet address. It
 converts the expected decimal BLOCH amount to integer satoshis, lists every
@@ -288,6 +323,8 @@ matching `txid:vout`, sums those amounts with `BigInt`, and returns
 `matchedAmountSat`, `differenceSat` and `exactTotal`. It rejects duplicate or
 malformed outputs, including values above the unsigned 64-bit limit, and
 requires the complete included receipt fields returned by `getTransaction`.
+Zero expected amounts are rejected, and `exactTotal` requires at least one
+matching output.
 The result is a
 measurement, not a credit decision; the exchange must apply its own ownership,
 finality, duplicate-credit and risk policy. In particular, multiple outputs to

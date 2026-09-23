@@ -37,7 +37,7 @@ try {
   const smoke = `
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { createLocalWallet, deriveLocalAddress, createSignedTransaction } from '${PACKAGE_NAME}';
+import { createLocalWallet, deriveLocalAddress, createSignedTransaction, getDepositTransaction } from '${PACKAGE_NAME}';
 
 const wallet = createLocalWallet();
 assert.equal(wallet.network, 'mainnet');
@@ -73,7 +73,23 @@ assert.match(signed.txid, /^[0-9a-f]{64}$/);
 assert.match(signed.rawHex, /^[0-9a-f]+$/);
 assert.ok(signed.rawHex.length > 1000);
 assert.equal(createHash('sha3-256').update(Buffer.from(signed.rawHex, 'hex')).digest('hex'), signed.rawHash);
-console.log('Installed package import, local wallet and mocked signing: OK');
+const depositTxid = 'cd'.repeat(32);
+const depositReceipt = {
+  txid: depositTxid, block_id: 'ef'.repeat(32), height: 80, slot: 100, index: 0,
+  kind: 'transfer_v2', size_bytes: 8000, fee_sat: '20', stake_sat: '0',
+  inputs: [{ txid: 'ab'.repeat(32), vout: 0, value_sat: '120', script_hash: '01'.repeat(32) }],
+  outputs: [{ txid: depositTxid, vout: 0, value_sat: '100',
+    script_hash: wallet.address.slice(7, 47) + '0'.repeat(24) }],
+  confirmations: 22, status: 'finalized', finalized: true, finalized_height: 90,
+  observed_head_height: 101, observed_head_slot: 121, corroboration: 'corroborated',
+  source: 'offline smoke', verification: 'fixture',
+};
+const deposit = await getDepositTransaction({ txid: depositTxid,
+  addressTo: wallet.address, amount: '0.00000100',
+  fetchImpl: async () => new Response(JSON.stringify(depositReceipt)) });
+assert.equal(deposit.match.exactTotal, true);
+assert.equal(deposit.match.matchingOutputs[0].vout, 0);
+console.log('Installed package import, local wallet, mocked signing and deposit query: OK');
 `;
   writeFileSync(join(temporary, 'smoke.mjs'), smoke);
   execFileSync(process.execPath, [join(temporary, 'smoke.mjs')], {

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import G4 from '../g4.cjs';
 import { createCore } from '../core.mjs';
-import { createLocalWallet, deriveLocalAddress, createSignedTransaction, broadcastSignedTransaction, getTransaction, getTransactionObservation, trackSignedTransaction, compareTransactionObservations, inspectDepositOutputs } from '../index.mjs';
+import { createLocalWallet, deriveLocalAddress, createSignedTransaction, broadcastSignedTransaction, getTransaction, getTransactionObservation, trackSignedTransaction, compareTransactionObservations, inspectDepositOutputs, getDepositTransaction } from '../index.mjs';
 
 const core = createCore();
 const mnemonic = core.call('new_mnemonic', { words: 24 }).mnemonic;
@@ -382,4 +382,30 @@ test('deposit output inspection rejects malformed or duplicate output records', 
   assert.throws(() => inspect({ ...receipt, finalizedHeight: 102 }), /complete included/);
   assert.throws(() => inspect({ ...receipt, status: 'pending' }), /complete included/);
   assert.throws(() => inspectDepositOutputs({ transaction: receipt, addressTo: address, amount: 0.1 }));
+  assert.throws(() => inspectDepositOutputs({ transaction: receipt, addressTo: address, amount: '0' }), /greater than zero/);
+});
+
+test('one-call deposit query validates target before reading and returns exact outpoints', async () => {
+  const script_hash = G4.inspectAddress(address).scriptHash;
+  let reads = 0;
+  const fetchImpl = async () => {
+    reads++;
+    return response({ ...receiptFixture, outputs: [
+      { txid, vout: 0, value_sat: '100', script_hash },
+      { txid, vout: 1, value_sat: '50', script_hash: '02'.repeat(32) },
+    ] });
+  };
+  await assert.rejects(getDepositTransaction({ txid, addressTo: address, amount: '0', fetchImpl }), /greater than zero/);
+  await assert.rejects(getDepositTransaction({ txid, addressTo: 'bloch1t' + address.slice(7),
+    amount: '0.00000100', fetchImpl }), /mainnet address/);
+  assert.equal(reads, 0);
+  const result = await getDepositTransaction({ txid, addressTo: address, amount: '0.00000100', fetchImpl });
+  assert.equal(reads, 1);
+  assert.equal(result.transaction.txid, txid);
+  assert.equal(result.match.exactTotal, true);
+  assert.deepEqual(result.match.matchingOutputs.map(item => item.vout), [0]);
+  const absent = inspectDepositOutputs({ transaction: result.transaction,
+    addressTo: 'bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073', amount: '0.00000100' });
+  assert.equal(absent.matchingOutputs.length, 0);
+  assert.equal(absent.exactTotal, false);
 });

@@ -510,6 +510,7 @@ export function compareTransactionObservations(previous, current) {
 export function inspectDepositOutputs({ transaction, addressTo, amount }) {
   const target = mainnetAddress(addressTo, 'addressTo');
   const expectedAmountSat = G4.sats.toWire(G4.sats.fromUserBLCH(amount));
+  if (BigInt(expectedAmountSat) === 0n) throw new Error('Deposit amount must be greater than zero');
   // Validate the receipt envelope first so malformed outputs retain a specific error.
   if (!validIncludedReceipt(transaction && { ...transaction, outputs: [] })) {
     throw new Error('A complete included transaction receipt is required');
@@ -538,8 +539,20 @@ export function inspectDepositOutputs({ transaction, addressTo, amount }) {
     address: addressTo, scriptHash: target.scriptHash,
     expectedAmountSat, matchedAmountSat: matchedAmountSat.toString(),
     differenceSat: (matchedAmountSat - expected).toString(),
-    exactTotal: matchedAmountSat === expected,
+    exactTotal: matchingOutputs.length > 0 && matchedAmountSat === expected,
     matchingOutputs,
     note: 'Output matching is a receipt inspection, not a deposit credit decision. Apply your own finality, ownership and duplicate-credit policy.',
   };
+}
+
+/** Query and inspect one included deposit without requiring exchange-side receipt plumbing. */
+export async function getDepositTransaction({
+  txid, addressTo, amount, explorerUrl = DEFAULT_EXPLORER, fetchImpl = fetch,
+}) {
+  mainnetAddress(addressTo, 'addressTo');
+  const expectedAmountSat = G4.sats.fromUserBLCH(amount);
+  if (expectedAmountSat === 0n) throw new Error('Deposit amount must be greater than zero');
+  const transaction = await getTransaction(txid, { explorerUrl, fetchImpl });
+  const match = inspectDepositOutputs({ transaction, addressTo, amount });
+  return { transaction, match };
 }
