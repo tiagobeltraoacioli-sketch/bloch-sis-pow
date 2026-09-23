@@ -3,6 +3,7 @@ import { compareReceiptObservations } from './receipt-comparison.mjs?v=20260923-
 import { LookupResponseError, readBoundedJson } from './bounded-json.mjs?v=20260923-6';
 import { matchDepositOutputs } from './deposit-match.mjs?v=20260923-7';
 import { buildReconciliationEvidence } from './reconciliation-evidence.mjs?v=20260923-9';
+import { resolveDepositTarget } from './address-target.mjs?v=20260923-10';
 
 const NODE_STATUS = new Set(['pending', 'included', 'justified', 'finalized', 'unknown']);
 
@@ -132,15 +133,22 @@ form.addEventListener('submit', async event => {
   const expectedScript = depositScript.value.trim();
   const expectedAmount = depositAmount.value.trim();
   const matchRequested = expectedScript !== '' || expectedAmount !== '';
-  if (matchRequested && (!/^[0-9a-f]{64}$/i.test(expectedScript) ||
-      !/^[1-9][0-9]*$/.test(expectedAmount) || expectedAmount.length > 20 ||
-      BigInt(expectedAmount) > (1n << 64n) - 1n)) {
-    message.textContent = 'For deposit matching, enter both a 64-character public script hash and a positive integer satoshi amount.';
-    result.hidden = true;
-    observation.hidden = true;
-    comparison.hidden = true;
-    depositCard.hidden = true;
-    return;
+  let depositTarget = null;
+  if (matchRequested) {
+    try {
+      depositTarget = resolveDepositTarget(expectedScript);
+      if (!/^[1-9][0-9]*$/.test(expectedAmount) || expectedAmount.length > 20 ||
+          BigInt(expectedAmount) > (1n << 64n) - 1n) {
+        throw new Error('Enter a positive integer satoshi amount with the deposit target.');
+      }
+    } catch (error) {
+      message.textContent = error.message;
+      result.hidden = true;
+      observation.hidden = true;
+      comparison.hidden = true;
+      depositCard.hidden = true;
+      return;
+    }
   }
   const url = `https://blochl1.com/api/v1/transactions/${txid}`;
   const button = form.querySelector('button');
@@ -174,9 +182,9 @@ form.addEventListener('submit', async event => {
       throw new LookupResponseError('The API returned an incomplete or inconsistent included receipt.');
     }
     if (matchRequested) {
-      const matched = matchDepositOutputs(receipt, expectedScript, expectedAmount);
+      const matched = matchDepositOutputs(receipt, depositTarget.scriptHash, expectedAmount);
       depositStatus.textContent = matched.exactTotal ? 'Exact output total observed' : 'Deposit amount needs review';
-      depositDetail.textContent = `${matched.outputs.length} matching outpoint(s); ${matched.matchedAmountSat} sat observed against ${matched.expectedAmountSat} sat expected. Difference: ${matched.differenceSat} sat. This is not a credit or finality decision.`;
+      depositDetail.textContent = `${matched.outputs.length} matching outpoint(s); ${matched.matchedAmountSat} sat observed against ${matched.expectedAmountSat} sat expected. Difference: ${matched.differenceSat} sat. Target script hash: ${depositTarget.scriptHash}. This is not a credit or finality decision.`;
       depositOutpoints.replaceChildren();
       for (const output of matched.outputs) {
         const item = document.createElement('li');
@@ -191,7 +199,7 @@ form.addEventListener('submit', async event => {
     currentEvidence = buildReconciliationEvidence(receipt, {
       observedAt: new Date().toISOString(),
       previousObservation: previous?.lastIncluded ?? previous?.latest ?? null,
-      expectedScriptHash: matchRequested ? expectedScript : null,
+      expectedScriptHash: matchRequested ? depositTarget.scriptHash : null,
       expectedAmountSat: matchRequested ? expectedAmount : null,
     });
     recordObservation({ kind: 'included', txid, receipt });
