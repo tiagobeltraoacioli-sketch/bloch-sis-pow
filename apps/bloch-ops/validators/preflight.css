@@ -1,0 +1,12 @@
+.preflight{background:#10271a;color:#edf5e9}
+.preflight .section-heading>p:last-child{color:#bbd0bd}
+.preflight-layout{max-width:1500px;margin:auto;display:grid;grid-template-columns:1fr 1fr;gap:24px;align-items:stretch}
+.preflight-layout>div,.preflight-layout pre{margin:0;padding:30px;border:1px solid #4f7457;background:#173721}
+.preflight-layout h3{margin:0 0 20px;font-size:clamp(25px,2.6vw,38px);line-height:1.12;letter-spacing:-.045em}
+.preflight-layout p,.preflight-note{color:#aec8b1;font-size:14px}
+.preflight-actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:25px}
+.preflight-actions a{padding:12px 16px;border:1px solid #8db792;color:#d3f5b0;font-size:12px;font-weight:800}
+.preflight-actions a:hover,.preflight-actions a:focus-visible{background:#d3f5b0;color:#10271a}
+.preflight-layout pre{display:flex;align-items:center;overflow-x:auto;color:#d3f5b0;font-size:clamp(11px,1vw,14px);line-height:1.8}
+.preflight-note{max-width:1500px;margin:20px auto 0}
+@media(max-width:800px){.preflight-layout{grid-template-columns:1fr}.preflight-layout>div,.preflight-layout pre{padding:20px}.preflight-layout pre{max-width:100%}}

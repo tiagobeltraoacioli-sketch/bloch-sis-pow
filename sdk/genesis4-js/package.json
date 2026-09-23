@@ -1,7 +1,7 @@
 {
   "name": "@blochprotocol/genesis4-sdk",
-  "version": "0.1.1",
-  "description": "Genesis-4 mainnet transaction signing and exchange receipt lookup",
+  "version": "0.1.6",
+  "description": "Genesis-4 mainnet local wallet creation, transaction signing and exchange receipt reconciliation",
   "type": "module",
   "exports": "./index.mjs",
   "files": ["index.mjs", "core.mjs", "g4.cjs", "bloch_wallet_wasm.wasm", "examples", "README.md", "LICENSE"],

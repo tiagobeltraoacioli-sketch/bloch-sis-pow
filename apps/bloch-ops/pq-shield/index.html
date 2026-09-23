@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#091710">
+  <meta name="description" content="PQ Shield non-custodial Bitcoin vault API reference, routes, security limits, and integration roadmap.">
+  <title>PQ Shield Reference API | Bloch Ops</title>
+  <link rel="icon" href="../assets/favicon.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="header">
+  <a class="brand" href="../"><img src="../assets/bloch-inc-logo-dark.png" width="1380" height="260" alt="Bloch Inc"><span>OPS</span></a>
+  <nav aria-label="Page navigation"><a href="../">Overview</a><a href="#routes">Routes</a><a href="#example">Example</a><a href="#security">Security</a><a href="#roadmap">Roadmap</a></nav>
+  <a class="header-link" href="../">All operations ↗</a>
+</header>
+<main id="content">
+<section class="hero">
+  <div class="hero-copy">
+    <p class="kicker"><i></i> DEVELOPER REFERENCE / BITCOIN</p>
+    <h1>PQ Shield<br><em>integration.</em></h1>
+    <p class="lead">Build a defensive Bitcoin vault from public inputs, prepare unsigned spends, and verify a post-quantum anchor against a key your application already trusts.</p>
+    <div class="actions"><a class="button bright" href="#routes">Explore the routes <span>↓</span></a><a class="button outline" href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/tree/main/services/pq-shield-api">Read source and README ↗</a></div>
+    <p class="small">Reference implementation in source. No hosted PQ Shield API or production readiness is claimed.</p>
+  </div>
+  <aside class="signal" aria-label="Service contract">
+    <div class="signal-head"><span>REFERENCE SERVICE</span><b>LOCAL / SELF-HOSTED</b></div>
+    <div class="signal-mark">{ }</div>
+    <p>Construction and verification only.<br><strong>Your signer stays yours.</strong></p>
+    <div class="signal-row"><span>PRIVATE KEYS RECEIVED</span><b>NEVER</b></div>
+    <div class="signal-row"><span>TRANSACTIONS SIGNED</span><b>NEVER</b></div>
+    <div class="signal-row"><span>BITCOIN BROADCAST</span><b>EXTERNAL</b></div>
+    <div class="signal-row"><span>BLOCH ANCHOR ENFORCEMENT</span><b>NOT CONSENSUS-WIRED</b></div>
+  </aside>
+</section>
+<div class="notice"><strong>Implementation status</strong><p>The Rust HTTP service exists and can be run locally. Its Bitcoin vault and Bloch anchor components are foundational and unaudited for production use. This page describes an API contract, not a live hosted endpoint.</p></div>
+<section class="section flow" id="model">
+  <div class="intro"><p class="kicker">01 / SYSTEM MODEL</p><h2>A recovery window,<br><em>under your control.</em></h2><p>PQ Shield builds a P2WSH deposit and delayed trigger output on unmodified Bitcoin. A client or watchtower can prepare a recovery spend while the normal branch waits for its relative timelock.</p></div>
+  <div class="cards four">
+    <article><span>01 / PREPARE</span><h3>Derive locally</h3><p>Generate hot and recovery keys, a unique preimage <code>r</code> and its hash <code>H(r)</code> in your signer. Send public keys and the hash only.</p></article>
+    <article><span>02 / CONSTRUCT</span><h3>Build artifacts</h3><p>The API returns P2WSH scripts, addresses, unsigned Bitcoin transactions and BIP-143 sighashes.</p></article>
+    <article><span>03 / SIGN</span><h3>Keep control</h3><p>Your signer assembles witnesses. Your PQ key signs the anchor commitment on your device.</p></article>
+    <article><span>04 / MONITOR</span><h3>Defend the window</h3><p>Your node or watchtower watches the trigger and submits a clawback to a fresh safe address when required.</p></article>
+  </div>
+  <p class="callout">Bitcoin script enforces its hashlock and branch delay. Without a Bitcoin covenant, the deposit-to-trigger policy also depends on pre-signed transaction handling and secure deletion of any bypass key.</p>
+</section>
+<section class="section light" id="routes">
+  <div class="intro"><p class="kicker">02 / HTTP CONTRACT</p><h2>Six precise routes.<br><em>No secret fields.</em></h2><p>Run the separate native service locally. JSON fields named like a mnemonic, seed, private key, WIF or preimage are rejected with HTTP 400. Bitcoin public keys must be 33-byte compressed secp256k1 keys.</p></div>
+  <div class="api-spec"><div><strong>Machine-readable OpenAPI 3.1</strong><p>Exact route paths, public request fields, unsigned response artifacts and error shape. The only server listed is your local process; importing this file does not connect to a hosted API.</p></div><a href="openapi.json" download="pq-shield-openapi.json">Download API contract ↓</a></div>
+  <div class="terminal"><div class="terminal-top"><span>LOCAL SERVICE / DEFAULT BIND</span><span>127.0.0.1:8787</span></div><pre><code>cd services/pq-shield-api
+cargo run
+curl http://127.0.0.1:8787/health</code></pre></div>
+  <div class="routes">
+    <article><b>POST</b><code>/vault/address</code><p>Build deposit and trigger P2WSH addresses and witness scripts from public keys, <code>H(r)</code> and a CSV delay.</p><small>PUBLIC INPUTS</small></article>
+    <article><b>POST</b><code>/vault/unvault-tx</code><p>Return an unsigned deposit → trigger transaction, hot-key sighash and trigger output details.</p><small>UNSIGNED TX</small></article>
+    <article><b>POST</b><code>/vault/branch-a-tx</code><p>Prepare the delayed trigger → destination spend and its hot-key sighash.</p><small>CSV-DELAYED</small></article>
+    <article><b>POST</b><code>/vault/clawback-tx</code><p>Prepare the immediate recovery-key spend to a fresh, anchored safe destination.</p><small>UNSIGNED TX</small></article>
+    <article><b>POST</b><code>/anchor/commitment</code><p>Return canonical anchor bytes for client-side PQ signing and Bloch guard hashes.</p><small>SIGN LOCALLY</small></article>
+    <article><b>POST</b><code>/anchor/verify</code><p>Verify a signature against a required <code>trusted_pq_pubkey</code> obtained outside the supplied anchor.</p><small>TRUST ROOT REQUIRED</small></article>
+  </div>
+  <div class="sample" id="example">
+    <div><p class="kicker">RUN LOCALLY / REGTEST</p><h3>Build a vault address</h3><p>This contains only public test inputs. The recovery hash is a demonstration value; derive a unique real <code>H(r)</code> in your own signer for each vault.</p><div class="example-links"><a href="examples/pq-shield-client.mjs" download>Download Node.js client ↓</a><a href="examples/pq-shield-client.test.mjs" download>Download offline tests ↓</a><a href="examples/client-workflow.mjs" download>Download client workflow ↓</a><a href="examples/client-routes-check.mjs" download>Download route check ↓</a><a href="examples/anchor-positive-check.mjs" download>Download positive anchor check ↓</a><a href="examples/anchor-positive-fixture/Cargo.toml" download>Download test signer manifest ↓</a><a href="examples/anchor-positive-fixture/src/main.rs" download>Download test signer source ↓</a><a href="examples/vault-address.mjs" download>Download address example ↓</a><a href="examples/local-contract-check.mjs" download>Download local contract check ↓</a><a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/blob/main/services/pq-shield-api/README.md">Full API reference ↗</a></div><p class="run-note">Save the client and offline test beside each other, then run <code>node --test pq-shield-client.test.mjs</code> without a service. For the live regtest examples, start the Rust API on loopback and run <code>node client-workflow.mjs</code> or <code>node client-routes-check.mjs</code>. To exercise a valid PQ anchor signature, keep the positive check and its Rust fixture directory beside the client, then run <code>node anchor-positive-check.mjs</code> from a repository checkout with Cargo. Its public seed creates disposable test keys; the check verifies a matching commitment, valid signature, tamper rejection, and serialized anchor. It does not prove owner enrollment, Bitcoin safety, or Bloch consensus enforcement. The client validates response shapes and rejects secret-shaped request fields; these checks do not independently verify Bitcoin transaction bytes. The scripts use dummy outpoints and never sign or broadcast Bitcoin transactions. The older single-route example and contract check remain available.</p></div>
+    <div class="terminal"><div class="terminal-top"><span>REGTEST / PUBLIC DATA ONLY</span><button class="copy-code" type="button" data-copy="vault-example" aria-label="Copy curl example">COPY</button></div><pre><code id="vault-example">curl -sS http://127.0.0.1:8787/vault/address \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "network": "regtest",
+    "hot_pubkey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "recovery_pubkey": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+    "recovery_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+    "csv_delay": 144
+  }'</code></pre></div>
+  </div>
+  <div class="contract">
+    <div class="contract-heading"><div><p class="kicker">PUBLIC-INPUT CONTRACT</p><h3>Map each request to its signer boundary.</h3></div><p>The API returns construction artifacts. A local signer must validate every address, amount, outpoint and sighash before signing. None of these routes broadcasts a transaction.</p></div>
+    <div class="contract-grid">
+      <article><span>01 / ADDRESS</span><h4><code>/vault/address</code></h4><p><code>network</code> is <code>bitcoin</code>, <code>testnet</code>, <code>signet</code> or <code>regtest</code>. Supply compressed <code>hot_pubkey</code> and <code>recovery_pubkey</code>, a 32-byte SHA-256 <code>recovery_hash</code>, and <code>csv_delay</code> as a 16-bit integer. Keep its preimage private.</p></article>
+      <article><span>02 / UNSIGNED SPENDS</span><h4><code>/vault/*-tx</code></h4><p>Repeat public vault parameters under <code>vault</code>. Provide the relevant <code>deposit_outpoint</code> or <code>trigger_outpoint</code> (<code>txid</code> and <code>vout</code>), input amount in satoshis, destination and <code>fee_sat</code>. The response includes <code>unsigned_tx_hex</code> and a signer-specific <code>sighash_hex</code>.</p></article>
+      <article><span>03 / ANCHOR</span><h4><code>/anchor/commitment</code></h4><p>Supply target chain, deposit address, recovery hash, PQ public key, designated safe destination, delay and policy. Sign only the returned <code>commitment_bytes_hex</code> in your own signer. A target-chain label is metadata; it does not deploy an adapter or change that chain's rules.</p></article>
+      <article><span>04 / VERIFY</span><h4><code>/anchor/verify</code></h4><p>Supply a signed anchor and <code>trusted_pq_pubkey</code> obtained independently through an authenticated registration. Compare the returned <code>valid</code> and <code>reason</code>; never treat the key carried inside the anchor as its own trust root.</p></article>
+    </div>
+    <p class="contract-foot">For machine-readable payloads and response fields, download the <a href="openapi.json">OpenAPI contract</a>; the <a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/blob/main/services/pq-shield-api/README.md">service README</a> explains the flow. The example deliberately stops before funding, signing or broadcasting.</p>
+  </div>
+</section>
+<section class="section" id="security">
+  <div class="intro"><p class="kicker">03 / SECURITY BOUNDARY</p><h2>Trust is explicit.</h2><p>A valid anchor signature matters only when your application already knows which PQ public key belongs to the owner. The anchor's own key cannot authenticate itself.</p></div>
+  <div class="cards four">
+    <article><span>01 / CLIENT</span><h3>Keys remain local</h3><p>Keep Bitcoin hot and recovery private keys, the PQ secret key and preimage <code>r</code> in your signer. Use a dedicated hardened derivation branch for new vault keys.</p></article>
+    <article><span>02 / VERIFIER</span><h3>Bring the trust root</h3><p><code>/anchor/verify</code> requires <code>trusted_pq_pubkey</code> from registration or another authenticated channel.</p></article>
+    <article><span>03 / WATCHTOWER</span><h3>Stay online during Δ</h3><p>Recovery relies on detection and a successful transaction race before the delayed branch matures.</p></article>
+    <article><span>04 / BITCOIN</span><h3>Know consensus limits</h3><p>Bitcoin still validates classical signatures. An external PQ anchor does not make native Bitcoin assets unconditionally quantum secure.</p></article>
+  </div>
+  <div class="warning"><strong>Not qualified for production custody.</strong><p>The crate and service have no independent production security qualification. Bloch-side PQ enforcement is not consensus-wired. Bitcoin covenant limits, exposed or reused keys, offline monitoring and preimage fee races remain material risks.</p></div>
+</section>
+<section class="section light" id="roadmap">
+  <div class="intro"><p class="kicker">04 / INTEGRATION PATH</p><h2>From reference<br>to partner pilots.</h2><p>Only the Bitcoin construction and anchor verification API described above are implemented here. Chain names accepted by the anchor format do not mean vaults or adapters exist on those chains.</p></div>
+  <div class="cards four">
+    <article><span>AVAILABLE IN SOURCE</span><h3>Bitcoin reference</h3><p>Local Rust service with public-input construction, unsigned transaction preparation and anchor verification.</p></article>
+    <article><span>BEFORE VALUE</span><h3>Security qualification</h3><p>Independent review, adversarial tests, watchtower operations, signer integration and a deployment contract.</p></article>
+    <article><span>PROPOSED</span><h3>Partner APIs</h3><p>Managed access, versioned policies, authenticated calls and operational reporting after qualification.</p></article>
+    <article><span>RESEARCH</span><h3>Other chains</h3><p>Separate threat models and chain-specific spend enforcement. No cross-chain vault deployment is represented here.</p></article>
+  </div>
+  <div class="closing"><div><p class="kicker">BUILD FROM THE IMPLEMENTATION</p><h2>Start with source.<br>Keep your keys.</h2></div><div><p>Review the route contract and honest limits, then run the reference service in an isolated environment.</p><a class="button bright" href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/tree/main/services/pq-shield-api">Open implementation <span>↗</span></a></div></div>
+</section>
+</main>
+<footer><a class="brand" href="../"><img src="../assets/bloch-inc-logo-dark.png" width="1380" height="260" alt="Bloch Inc"><span>OPS</span></a><p>PQ Shield developer reference. Hosted and other-chain services remain unqualified.</p><nav aria-label="Footer navigation"><a href="../">Bloch Ops ↗</a><a href="https://blochinc.xyz/">Bloch Inc ↗</a><a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/blob/main/docs/specs/PQ-SHIELD-NONCUSTODIAL-NATIVE.md">Technical design ↗</a></nav></footer>
+<script src="examples.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+.rpc-check{display:grid;grid-template-columns:1fr 1fr;align-items:center;gap:28px;max-width:1500px;margin:14px auto 0;padding:26px 30px;background:#d5e8cf;color:#20422a}
+.rpc-check strong{font-size:11px;letter-spacing:.1em;text-transform:uppercase}
+.rpc-check p{margin:9px 0 0;color:#45644a;font-size:13px}
+.rpc-check pre{overflow:auto;margin:0;padding:17px;background:#163421;color:#d9f7d1;font-size:12px}
+@media(max-width:760px){.rpc-check{grid-template-columns:1fr;padding:22px}}
+.readiness-head #admission-state.available,.readiness-row strong.available{color:var(--lime)}
+.readiness-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 25px 22px;color:#9ab39f;font-size:11px}
+.readiness-foot button{flex:none;border:1px solid #64836d;background:transparent;color:var(--lime);padding:9px 12px;cursor:pointer;font:inherit;font-weight:800}
+.readiness-foot button:hover,.readiness-foot button:focus-visible{border-color:var(--lime);background:#1b3926}
+.readiness-foot button:disabled{opacity:.5;cursor:wait}
+@media(max-width:430px){.readiness-foot{padding:0 16px 20px;flex-wrap:wrap}}

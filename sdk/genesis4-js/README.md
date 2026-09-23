@@ -1,6 +1,6 @@
 # Genesis-4 JavaScript SDK for exchange integration
 
-This package builds a complete signed Genesis-4 mainnet transfer using the
+This package creates or restores a Genesis-4 mainnet address locally and builds a complete signed Genesis-4 mainnet transfer using the
 same pinned WebAssembly signer shipped with the Postern wallet. The caller does
 not select UTXOs, calculate fees, encode a transaction, or sign it. The package
 has no runtime npm dependencies and requires Node.js 20 or newer.
@@ -13,10 +13,10 @@ This is a source-distributed package; no npm publication is assumed.
 ## Install
 
 The versioned package is served at
-`https://blochl1.com/releases/genesis4-js/blochprotocol-genesis4-sdk-0.1.1.tgz`.
+`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.6.tgz`.
 
 ```sh
-npm install https://blochl1.com/releases/genesis4-js/blochprotocol-genesis4-sdk-0.1.1.tgz
+npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.6.tgz
 ```
 
 It can also be installed from a local checkout:
@@ -24,6 +24,32 @@ It can also be installed from a local checkout:
 ```sh
 npm install /path/to/bloch-sis-pow/sdk/genesis4-js
 ```
+
+## Create or restore a local wallet
+
+`createLocalWallet()` uses the pinned wallet core to generate a fresh 24-word
+mnemonic and its checksummed Genesis-4 mainnet address. `deriveLocalAddress()`
+recovers the address from a phrase you already control. Both run inside the
+calling Node.js process and make **no RPC or HTTP request**.
+
+```js
+import { createLocalWallet, deriveLocalAddress } from '@blochprotocol/genesis4-sdk';
+
+const wallet = createLocalWallet();
+// Back up wallet.mnemonic through your own secure, offline key ceremony.
+// Do not print it in logs or send it to an API.
+console.log(wallet.address);
+
+const restored = deriveLocalAddress({ mnemonic: wallet.mnemonic });
+if (restored.address !== wallet.address) throw new Error('Address mismatch');
+```
+
+The SDK returns the mnemonic to the caller once and does not persist or encrypt
+it. The caller is responsible for controlled backup, process isolation and key
+custody. For an interactive encrypted wallet, use Postern Wallet instead of
+placing secrets in a website or a remote Ops endpoint. Importing an older
+wallet may require its original derivation convention; the function above uses
+the current core's default convention.
 
 ## Sign and submit
 
@@ -44,7 +70,7 @@ const signed = await createSignedTransaction({
   rpcUrl: process.env.BLOCH_RPC_URL ?? 'https://posternlabs.com/g4rpc',
 });
 
-// Store signed.txid and signed.rawHex before a network write. The RPC call is
+// Store the complete signed object before a network write. The RPC call is
 // equivalent to sendrawtransaction([signed.rawHex]).
 const submitted = await broadcastSignedTransaction(signed, {
   rpcUrl: process.env.BLOCH_RPC_URL ?? 'https://posternlabs.com/g4rpc',
@@ -75,8 +101,14 @@ fee can become stale at the next block; do not rebuild a transfer after a
 timeout until the original txid has been checked.
 
 `accepted: true` means mempool admission, not block inclusion or finality.
-Persist the exact signed bytes and txid for reconciliation. If submission
-times out, retry the same bytes or look up the txid; do not infer failure from
+Persist the exact signed bytes, txid, `signingRootHex` and `rawHash` for
+reconciliation and safe transport retries. SDK 0.1.6 requires all four fields
+when broadcasting: before network I/O it recomputes the domain-separated txid
+from `signingRootHex` and SHA3-256 of `rawHex`; after admission it compares the
+node's byte count and `tx_hash` correlation handle. The latter is **not** the
+consensus txid. A mismatch after submission is ambiguous because the node may
+already have accepted the bytes; check the original txid before retrying.
+If submission times out, retry the same bytes or look up the txid; do not infer failure from
 the timeout.
 
 ## Transaction lookup
@@ -121,6 +153,89 @@ not prove that a recently submitted transaction failed: it may still be
 pending or not yet indexed. No deposit should be credited from a mempool
 admission result. Pause crediting when the index or corroborated chain head is
 unavailable, and persist the block ID so reorgs can be detected on refresh.
+
+`getTransactionObservation(txid)` wraps that boundary for withdrawal tracking.
+It returns `{kind: 'included', receipt}` when the complete canonical receipt is
+available. Only after an archival 404, it asks one node for `gettxstatus` and
+returns `{kind: 'unresolved', nodeStatus}`. The node status can be `pending`,
+`included`, `justified`, `finalized` or `unknown`; none supplies the amounts,
+block identity and corroborated finality needed for deposit credit. A failed
+node query returns `nodeStatus: null` and remains unresolved. Malformed
+included receipts and other archival errors are raised rather than hidden.
+
+```js
+import { getTransactionObservation } from '@blochprotocol/genesis4-sdk';
+
+const observation = await getTransactionObservation(process.argv[2]);
+if (observation.kind === 'included') {
+  console.log(observation.receipt);
+} else {
+  console.log({ status: 'unresolved', nodeStatus: observation.nodeStatus });
+}
+```
+
+Run `node examples/observe.mjs <txid>` to try this flow. A node's `unknown`
+answer does not prove that a transaction never existed; its status index is
+bounded, and a public gateway is not an independent settlement authority.
+
+## Compare successive observations
+
+Persist each observation with the exchange's own transaction record. The pure
+`compareTransactionObservations(previous, current)` helper highlights a missing
+receipt, changed inclusion block, changed transaction contents, reported
+finality regression or lower observed head/confirmation count. It never
+authorizes a deposit credit or withdrawal payout. Differences demand review of
+the source records and independent node/checkpoint evidence.
+
+```js
+import { getTransactionObservation, compareTransactionObservations } from '@blochprotocol/genesis4-sdk';
+
+const current = await getTransactionObservation(txid);
+const comparison = compareTransactionObservations(previousObservation, current);
+console.log({ comparison, current });
+```
+
+The included `examples/compare-observations.mjs` reads a prior JSON snapshot
+when supplied and writes the new observation and comparison to stdout:
+
+```sh
+node examples/compare-observations.mjs <txid> > first.json
+node examples/compare-observations.mjs <txid> first.json > second.json
+```
+
+The comparison checks the canonical input/output outpoints, satoshi amounts,
+script hashes and inclusion metadata. It ignores extra indexer annotation
+fields. `consistent` means only that those two API observations agree; verify
+chain identity, source authenticity and your own finality policy separately.
+
+## Inspect deposit outputs
+
+`inspectDepositOutputs({transaction, addressTo, amount})` matches the outputs
+of a complete included receipt to a checksummed Genesis-4 mainnet address. It
+converts the expected decimal BLOCH amount to integer satoshis, lists every
+matching `txid:vout`, sums those amounts with `BigInt`, and returns
+`matchedAmountSat`, `differenceSat` and `exactTotal`. It rejects duplicate or
+malformed outputs instead of silently ignoring them. The result is a
+measurement, not a credit decision; the exchange must apply its own ownership,
+finality, duplicate-credit and risk policy. In particular, multiple outputs to
+one address are listed separately so each outpoint can be accounted for once.
+
+```js
+import { getTransaction, inspectDepositOutputs } from '@blochprotocol/genesis4-sdk';
+
+const transaction = await getTransaction(txid);
+const match = inspectDepositOutputs({
+  transaction,
+  addressTo: expectedDepositAddress,
+  amount: '1.25000000',
+});
+console.log(match.matchingOutputs, match.matchedAmountSat, match.finalized);
+```
+
+Run `node examples/inspect-deposit.mjs <txid> <addressTo> <amount>` for a
+read-only mainnet query. An archival 404, missing or changed receipt must stay
+unresolved; use `getTransactionObservation` and
+`compareTransactionObservations` to track that state.
 
 ## Verification
 

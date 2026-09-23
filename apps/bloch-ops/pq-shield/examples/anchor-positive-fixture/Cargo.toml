@@ -1,0 +1,16 @@
+[package]
+name = "pq-shield-anchor-positive-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+bloch-pq-vault = { path = "../../../../../crates/bloch-pq-vault" }
+bloch-crypto = { path = "../../../../../crates/bloch-crypto" }
+hex = "0.4"
+serde_json = "1"
+
+[patch.crates-io]
+pqcrypto-internals = { path = "../../../../../crates/pqcrypto-internals" }

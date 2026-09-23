@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#07130e">
+  <meta name="description" content="Genesis-4 wallet and exchange integration: local wallet creation, signed transfers and complete transaction receipts with the published JavaScript SDK.">
+  <title>Wallet integration — Bloch Ops</title>
+  <link rel="icon" href="../assets/favicon.png" type="image/png">
+  <link rel="stylesheet" href="../assets/style.css?v=20260923">
+  <link rel="stylesheet" href="style.css?v=20260923">
+  <link rel="stylesheet" href="lookup.css?v=20260923-2">
+  <script src="lookup.js?v=20260923-2" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="header"><a class="brand" href="/" aria-label="Bloch Ops home"><img src="../assets/bloch-inc-logo-dark.png" width="1380" height="260" alt="Bloch Inc"><span>OPS</span></a><nav aria-label="Primary navigation"><a href="/#access">RPC</a><a href="/validators/">Validators</a><a href="/wallets/" aria-current="page">Wallets</a><a href="/pq-shield/">PQ Shield</a></nav><a class="header-cta" href="https://blochinc.xyz/">Bloch Inc <span>↗</span></a></header>
+  <main id="main">
+    <section class="wallet-hero"><div class="wallet-hero-inner"><div><p class="eyebrow"><i></i> 03 / WALLET + EXCHANGE OPERATIONS</p><h1>Sign locally.<br><em>Reconcile precisely.</em></h1><p>The published Genesis-4 JavaScript SDK creates or restores a wallet locally, builds signed transfers and queries complete receipts. A node never receives a mnemonic or creates an address.</p><div class="actions"><a class="button primary" href="#create">Create locally <span>↓</span></a><a class="button outline" href="#transfer">Build a transfer <span>↓</span></a></div></div><div class="wallet-status"><span>IMPLEMENTATION STATUS</span><div><b>01</b><strong>Local wallet creation</strong><small>PUBLISHED / NODE.JS SDK</small></div><div><b>02</b><strong>JavaScript signing SDK</strong><small>PUBLISHED / SOURCE PACKAGE</small></div><div><b>03</b><strong>Canonical receipt API</strong><small>PUBLISHED / INCLUDED TRANSACTIONS</small></div><div><b>04</b><strong>Hosted key service</strong><small>NOT OFFERED</small></div></div></div></section>
+    <div class="wallet-boundary"><strong>Security boundary</strong><p>Generate and back up wallet keys in a trusted client or signer. This site has no mnemonic field, key store, transaction signer or broadcast button.</p></div>
+    <section class="wallet-section wallet-create" id="create"><p class="kicker">01 / LOCAL WALLET CREATION</p><div class="wallet-section-head"><h2>Generate the keys<br>where you control them.</h2><p>The Genesis-4 SDK now exposes <code>createLocalWallet()</code> and <code>deriveLocalAddress()</code>. They use the pinned wallet core inside your Node.js process and do not call an RPC or remote API.</p></div><div class="wallet-grid"><div><span class="step-tag">FRESH MAINNET IDENTITY</span><pre><code>import { createLocalWallet } from '@blochprotocol/genesis4-sdk';
+
+const wallet = createLocalWallet();
+// wallet.address is a checksummed mainnet address.
+// Back up wallet.mnemonic in your controlled key ceremony.
+console.log(wallet.address);</code></pre><p>The function returns a 24-word mnemonic once to the caller. The SDK does not persist or encrypt it; do not log it or send it to a website.</p></div><div><span class="step-tag">RESTORE / VERIFY ADDRESS</span><pre><code>import { deriveLocalAddress } from '@blochprotocol/genesis4-sdk';
+
+const recovered = deriveLocalAddress({ mnemonic });
+if (recovered.address !== expectedAddress) {
+  throw new Error('Address mismatch');
+}</code></pre><p>Restoration returns an address without transmitting the phrase. For an interactive encrypted wallet, use Postern Wallet. Older identities may need their original derivation convention.</p></div></div><div class="wallet-callout"><strong>Local generation is not hosted custody.</strong><p>There is no mnemonic form or key store on Bloch Ops. Protect the calling process, backup ceremony and resulting wallet according to your own custody policy.</p></div></section>
+    <section class="wallet-section" id="transfer"><p class="kicker">02 / HIGH-LEVEL TRANSACTION INTERFACE</p><div class="wallet-section-head"><h2>Four inputs.<br>Signed bytes out.</h2><p><code>createSignedTransaction</code> handles UTXO selection, the current fee and epoch, construction, signing and serialization through the pinned Genesis-4 wallet core. Amounts are decimal strings.</p></div><div class="wallet-grid"><div><span class="step-tag">INSTALL / NODE.JS 20+</span><pre><code>npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.6.tgz</code></pre><p>The package is source-distributed and versioned. Check its code and pinned WASM hash before processing value.</p><a href="https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.6.tgz">Download SDK package ↗</a> <a href="downloads/blochprotocol-genesis4-sdk-0.1.6.tgz.sha256">Verify SHA-256 ↗</a></div><div><span class="step-tag">SIGN / LOCAL PROCESS</span><pre><code>import { createSignedTransaction } from '@blochprotocol/genesis4-sdk';
+
+const signed = await createSignedTransaction({
+  addressFrom: process.env.BLOCH_ADDRESS_FROM,
+  mnemonic: process.env.BLOCH_MNEMONIC,
+  addressTo: process.env.BLOCH_ADDRESS_TO,
+  amount: '1.25000000',
+  rpcUrl: process.env.BLOCH_RPC_URL,
+});
+
+console.log(signed.txid, signed.rawHex);</code></pre><p><code>rawHex</code> is the complete signed serialized transaction for <code>sendrawtransaction([rawHex])</code>. Store the complete signed object, including <code>txid</code>, <code>rawHex</code>, <code>signingRootHex</code> and <code>rawHash</code>, before sending. The SDK checks these fields and the node’s byte hash on broadcast.</p></div></div><div class="wallet-callout"><strong>Broadcast is a separate decision.</strong><p>Use an exchange-controlled Genesis-4 node or an authenticated write endpoint. The public gateway may be read-only. A timeout does not prove that a transaction failed: check the original txid and retry the same bytes if appropriate.</p></div></section>
+    <section class="wallet-section wallet-light" id="receipt"><p class="kicker">03 / TRANSACTION RECEIPT</p><div class="wallet-section-head"><h2>A txid becomes an<br>operational record.</h2><p>The archival API joins an included transaction with a fresh chain-head observation. It returns inputs, outputs, satoshi amounts, height, slot, confirmations and finality fields.</p></div><div class="receipt-grid"><div><span class="step-tag">HTTP GET / PUBLIC</span><pre><code>GET https://blochl1.com/api/v1/transactions/{txid}</code></pre><p>Example included transaction:</p><a class="receipt-url" href="https://blochl1.com/api/v1/transactions/2a70f41229d8587f060c308279238662c2aa331f4d9f32a660231716f418c672">Open live JSON receipt ↗</a></div><div><span class="step-tag">SDK / NODE.JS</span><pre><code>import { getTransaction } from '@blochprotocol/genesis4-sdk';
+
+const tx = await getTransaction(txid);
+console.log({
+  inputs: tx.inputs,
+  outputs: tx.outputs,
+  height: tx.height,
+  slot: tx.slot,
+  confirmations: tx.confirmations,
+  finalized: tx.finalized,
+});</code></pre></div></div><div class="lookup"><div class="lookup-intro"><span class="step-tag">READ-ONLY RECEIPT INSPECTOR</span><h3>Check a transaction on mainnet</h3><p>Enter a 64-character txid. This page reads the public archival API and checks node status if no included receipt exists. It does not submit transactions.</p></div><form id="lookup-form"><label for="lookup-txid">Transaction ID</label><div class="lookup-controls"><input id="lookup-txid" name="txid" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="64" pattern="[0-9a-fA-F]{64}" placeholder="64 hexadecimal characters" required><button type="submit">Look up ↗</button></div></form><p id="lookup-message" class="lookup-message" role="status" aria-live="polite"></p><div id="lookup-observation" class="lookup-observation" hidden><strong>Node status only / no archival receipt</strong><p id="lookup-observation-text"></p><small id="lookup-observation-evidence"></small></div><div id="lookup-result" class="lookup-result" hidden><dl id="lookup-summary"></dl><div class="lookup-lists"><div><h4>Inputs</h4><ol id="lookup-inputs"></ol></div><div><h4>Outputs</h4><ol id="lookup-outputs"></ol></div></div><a id="lookup-source" href="https://blochl1.com/" target="_blank" rel="noopener noreferrer">Open source JSON ↗</a></div></div><div class="receipt-fields"><div><b>01 / MATCH</b><p>Use <code>inspectDepositOutputs()</code> to match the expected address script hash, list each outpoint and sum integer <code>value_sat</code> strings.</p></div><div><b>02 / INCLUDE</b><p>Record txid, block ID, height, slot and transaction index. Recheck the block ID if the chain reorganizes.</p></div><div><b>03 / FINALIZE</b><p>Credit only against your explicit confirmation and corroborated finality policy. Mempool acceptance is not a receipt.</p></div></div><p class="receipt-note">The SDK provides <code>inspectDepositOutputs()</code> for exact outpoint and satoshi matching, plus <code>getTransactionObservation()</code> and <code>compareTransactionObservations()</code> for unresolved or changed receipts. These are measurements, not credit decisions. Pause crediting if the index or corroborated chain head is unavailable.</p></section>
+    <section class="wallet-section"><p class="kicker">04 / HOSTED SERVICE BOUNDARY</p><div class="wallet-section-head"><h2>Keep secrets where<br>the owner controls them.</h2><p>Genesis-4 nodes explicitly reject <code>getnewaddress</code> because they hold no wallet. Local SDK creation is available; a hosted endpoint that accepts a mnemonic would change the custody and security model.</p></div><div class="wallet-principles"><article><span>01</span><h3>Client-side identity</h3><p>Create or restore locally with the SDK, Postern Wallet or an integrator-controlled signer. Never submit a seed phrase to a web form or RPC.</p></article><article><span>02</span><h3>Public-data APIs</h3><p>Read chain identity, UTXOs, fees and transaction status from a node. Bind signing to the verified Genesis-4 network.</p></article><article><span>03</span><h3>Future Ops interface</h3><p>Versioned address validation, unsigned preparation and signer adapters are roadmap work. They do not include server-held keys.</p></article></div><div class="wallet-links"><a href="https://posternlabs.com/apps/postern/">Open Postern Wallet ↗</a><a href="https://blochprotocol.dev/">Developer portal ↗</a><a href="/rpc/">RPC method catalog ↗</a></div></section>
+  </main>
+  <footer><div><a class="brand" href="/"><img src="../assets/bloch-inc-logo-dark.png" width="1380" height="260" alt="Bloch Inc"><span>OPS</span></a><p>Network operations, made legible.</p></div><nav aria-label="Ecosystem links"><a href="/">Ops home ↗</a><a href="/rpc/">RPC ↗</a><a href="/validators/">Validators ↗</a><a href="https://blochinc.xyz/">Bloch Inc ↗</a></nav><small>© 2026 Bloch Inc. Incorporation in Panama is in progress. Verify the active network release before moving value.</small></footer>
+</body>
+</html>

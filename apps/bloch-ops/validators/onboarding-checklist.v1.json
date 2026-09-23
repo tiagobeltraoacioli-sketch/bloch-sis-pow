@@ -1,0 +1,82 @@
+{
+  "schema": "bloch.genesis4.validator-onboarding.v1",
+  "purpose": "Operator evidence worksheet; no item is certified by downloading this file.",
+  "createdFor": "Genesis-4 external validator preparation",
+  "overallStatus": "NOT_QUALIFIED",
+  "statusLegend": {
+    "NOT_VERIFIED": "The operator must collect and authenticate evidence.",
+    "LIVE_QUERY_REQUIRED": "The value depends on the current deployed node and must be queried again.",
+    "RELEASE_EVIDENCE_PENDING": "The published opening checklist does not establish this mainnet lifecycle gate.",
+    "NOT_ACTIVE": "No production delegation transaction flow is offered."
+  },
+  "gates": [
+    {
+      "id": "trusted-chain-anchor",
+      "status": "NOT_VERIFIED",
+      "requiredEvidence": [
+        "Canonical Genesis-4 manifest and independently authenticated SHA3-256 network domain",
+        "Signed weak-subjectivity checkpoint envelope, signer set and digest authenticated through a separate channel",
+        "Local ws-verify result against the same manifest and comparison with the node's finalized checkpoint"
+      ],
+      "operatorEvidence": [],
+      "source": "docs/CHECKPOINT-RUNBOOK.md"
+    },
+    {
+      "id": "release-and-binary-identity",
+      "status": "NOT_VERIFIED",
+      "requiredEvidence": [
+        "Published activation notice and release artifact digest",
+        "Artifact digest, running binary digest, build identity and fleet inventory recorded for the exact installed release",
+        "Before/at/after activation-boundary rehearsal and same-block state-root agreement for the release candidate"
+      ],
+      "operatorEvidence": [],
+      "source": "docs/VALIDATOR-OPENING.md"
+    },
+    {
+      "id": "funded-admission",
+      "status": "LIVE_QUERY_REQUIRED",
+      "requiredEvidence": [
+        "Timestamped getchaininfo, getbuildinfo and getvalidatoradmission responses from the operator's synchronized node",
+        "Network domain compared with trusted manifest; admission active, activation epoch, stake bounds, queue limits and fee quote checked at current head",
+        "Native suite-1 funding UTXOs, offline dual-role authorization and withdrawal script ownership checked before any value-bearing submission",
+        "After inclusion, gettxstatus and getvalidatorbykey confirm registration, queue and activation separately"
+      ],
+      "operatorEvidence": [],
+      "source": "docs/specs/BLOCH-FUNDED-VALIDATOR-ADMISSION.md"
+    },
+    {
+      "id": "signer-and-recovery",
+      "status": "NOT_VERIFIED",
+      "requiredEvidence": [
+        "Validator keystore and RANDAO seed backed up under controlled custody",
+        "Funding and validator possession signers independently inspect the same network-bound draft",
+        "Withdrawal spending authority backed up separately; slashing journal and doppelganger observation preserved across restart"
+      ],
+      "operatorEvidence": [],
+      "source": "docs/specs/BLOCH-FUNDED-VALIDATOR-ADMISSION.md"
+    },
+    {
+      "id": "exit-to-spendable-payout",
+      "status": "RELEASE_EVIDENCE_PENDING",
+      "requiredEvidence": [
+        "Authenticated exit included and finalized on the exact deployed mainnet release",
+        "Production withdrawal delay observed without shortened parameters",
+        "Withdrawal included and finalized; payout UTXO controlled and spendable; txids, blocks and checkpoints retained",
+        "Current external-validator opening notice explicitly cites completed lifecycle qualification"
+      ],
+      "operatorEvidence": [],
+      "source": "docs/VALIDATOR-OPENING.md"
+    },
+    {
+      "id": "delegation",
+      "status": "NOT_ACTIVE",
+      "requiredEvidence": [
+        "Separate funded delegation transaction, signing, accounting, exit and withdrawal qualification",
+        "Explicit production activation notice"
+      ],
+      "operatorEvidence": [],
+      "source": "docs/specs/BLOCH-FUNDED-VALIDATOR-ADMISSION.md"
+    }
+  ],
+  "decisionRule": "Do not treat admission active, a passing read-only preflight or this worksheet as permission to bond or delegate. Require an authenticated opening notice and completed exact-release lifecycle evidence."
+}

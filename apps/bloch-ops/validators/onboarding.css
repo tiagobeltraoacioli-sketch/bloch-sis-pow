@@ -1,0 +1,14 @@
+.onboarding{background:#eff3ea}
+.onboarding .section-heading>p:last-child{max-width:760px}
+.onboarding-grid{max-width:1500px;margin:auto;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.onboarding-grid article{background:#fff;border:1px solid #c4d0be;padding:25px;min-width:0}
+.onboarding-grid span{display:block;color:#476f47;font-size:11px;font-weight:800;letter-spacing:.14em}
+.onboarding-grid h3{margin:14px 0 10px;font-size:clamp(20px,1.8vw,28px);letter-spacing:-.04em}
+.onboarding-grid p{margin:0;color:#4a5b4a;font-size:14px;line-height:1.6}
+.onboarding-actions{max-width:1500px;margin:24px auto 0;display:flex;gap:12px;flex-wrap:wrap}
+.onboarding-actions a{display:inline-block;padding:13px 17px;background:#173721;color:#e5f4db;font-size:12px;font-weight:800}
+.onboarding-actions a:hover,.onboarding-actions a:focus-visible{background:#2c6336}
+.onboarding-caution{max-width:1500px;margin:18px auto 0;color:#45574a;font-size:13px;line-height:1.6}
+@media(max-width:1100px){.topbar nav{display:none}}
+@media(max-width:900px){.onboarding-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:600px){.onboarding-grid{grid-template-columns:1fr}.onboarding-grid article{padding:20px}}

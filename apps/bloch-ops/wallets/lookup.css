@@ -1,0 +1,31 @@
+.lookup{margin-top:18px;padding:30px;border:1px solid #b7ceb8;background:#f9fcf6}
+.lookup-intro h3{margin:12px 0 8px;font-size:28px;line-height:1.1;letter-spacing:-.05em}
+.lookup-intro p{margin:0 0 25px;color:#5b705c;font-size:13px}
+.lookup form label{display:block;margin-bottom:8px;color:#496b4b;font-size:11px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}
+.lookup-controls{display:flex;gap:10px}
+.lookup-controls input{flex:1;min-width:0;padding:14px 16px;border:1px solid #9dbb9c;background:white;color:#132c1c;font:13px ui-monospace,SFMono-Regular,Menlo,monospace}
+.lookup-controls button{flex:none;padding:0 22px;border:0;background:#173f24;color:#e9f9dd;font:700 13px Arial,Helvetica,sans-serif;cursor:pointer}
+.lookup-controls button:hover{background:#2b6739}
+.lookup-controls button:disabled{opacity:.6;cursor:wait}
+.lookup-message{min-height:20px;margin:13px 0 0;color:#536d56;font-size:12px}
+.lookup-result{margin-top:20px;padding-top:22px;border-top:1px solid #c9dcc7}
+.lookup-result[hidden]{display:none}
+.lookup-result dl{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0}
+.lookup-result dl>div{min-width:0;padding:14px;background:#e5f0df}
+.lookup-result dt{color:#557c51;font-size:10px;font-weight:800;letter-spacing:.1em;text-transform:uppercase}
+.lookup-result dd{margin:8px 0 0;overflow-wrap:anywhere;color:#142d1a;font:13px ui-monospace,SFMono-Regular,Menlo,monospace}
+.lookup-lists{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:22px 0}
+.lookup-lists>div{min-width:0;padding:18px;border:1px solid #c1d6bd}
+.lookup-lists h4{margin:0 0 12px;font-size:15px}
+.lookup-lists ol{max-height:300px;overflow:auto;margin:0;padding-left:23px}
+.lookup-lists li{padding:9px 0;border-top:1px solid #e0ebe0;color:#59715b;font-size:11px}
+.lookup-lists li strong,.lookup-lists li span{display:block;overflow-wrap:anywhere}
+.lookup-lists li strong{color:#18351e;font-size:12px}
+.lookup-result>a{color:#327844;font-size:13px;font-weight:800}
+@media(max-width:760px){.lookup{padding:20px}.lookup-controls{display:block}.lookup-controls input,.lookup-controls button{width:100%;min-height:46px}.lookup-controls button{margin-top:9px}.lookup-result dl{grid-template-columns:1fr 1fr}.lookup-lists{grid-template-columns:1fr}}
+@media(max-width:500px){.lookup-result dl{grid-template-columns:1fr}}
+.lookup-observation{margin-top:18px;padding:18px 20px;border-left:4px solid #a47729;background:#f7eacb;color:#3d3424}
+.lookup-observation[hidden]{display:none}
+.lookup-observation strong{display:block;font-size:12px;letter-spacing:.07em;text-transform:uppercase}
+.lookup-observation p{margin:10px 0;color:#514735;font-size:13px}
+.lookup-observation small{color:#6c5b42;font-size:11px}

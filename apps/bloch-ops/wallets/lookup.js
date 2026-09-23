@@ -1,0 +1,125 @@
+const form = document.getElementById('lookup-form');
+const input = document.getElementById('lookup-txid');
+const message = document.getElementById('lookup-message');
+const result = document.getElementById('lookup-result');
+const summary = document.getElementById('lookup-summary');
+const source = document.getElementById('lookup-source');
+const lists = [document.getElementById('lookup-inputs'), document.getElementById('lookup-outputs')];
+const observation = document.getElementById('lookup-observation');
+const observationText = document.getElementById('lookup-observation-text');
+const observationEvidence = document.getElementById('lookup-observation-evidence');
+
+async function nodeStatus(txid) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch('https://posternlabs.com/g4rpc', {
+      method: 'POST',
+      credentials: 'omit',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'bloch-ops-wallets', method: 'gettxstatus', params: [txid] }),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`Gateway returned HTTP ${response.status}.`);
+    const body = await response.json();
+    if (body.error || typeof body.result?.status !== 'string') throw new Error('No usable node status returned.');
+    return {
+      status: body.result.status,
+      level: body.corroboration?.level ?? body.result.corroboration?.level ?? 'not reported',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function addField(label, value) {
+  const wrapper = document.createElement('div');
+  const term = document.createElement('dt');
+  const definition = document.createElement('dd');
+  term.textContent = label;
+  definition.textContent = value == null ? 'Unavailable' : String(value);
+  wrapper.append(term, definition);
+  summary.append(wrapper);
+}
+
+function addTransfers(target, values) {
+  target.replaceChildren();
+  if (!Array.isArray(values) || values.length === 0) {
+    const item = document.createElement('li');
+    item.textContent = 'No entries in this receipt.';
+    target.append(item);
+    return;
+  }
+  for (const value of values) {
+    const item = document.createElement('li');
+    const amount = document.createElement('strong');
+    const outpoint = document.createElement('span');
+    const script = document.createElement('span');
+    amount.textContent = `${String(value.value_sat ?? 'Unavailable')} sat`;
+    outpoint.textContent = `Outpoint: ${String(value.txid ?? 'Unavailable')}:${String(value.vout ?? 'Unavailable')}`;
+    script.textContent = `Script hash: ${String(value.script_hash ?? 'Unavailable')}`;
+    item.append(amount, outpoint, script);
+    target.append(item);
+  }
+}
+
+form.addEventListener('submit', async event => {
+  event.preventDefault();
+  const txid = input.value.trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(txid)) {
+    message.textContent = 'Enter a valid 64-character hexadecimal txid.';
+    result.hidden = true;
+    return;
+  }
+  const url = `https://blochl1.com/api/v1/transactions/${txid}`;
+  const button = form.querySelector('button');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+  button.disabled = true;
+  result.hidden = true;
+  observation.hidden = true;
+  message.textContent = 'Reading the archival receipt and chain-head observation…';
+  try {
+    const response = await fetch(url, { signal: controller.signal, credentials: 'omit' });
+    if (response.status === 404) {
+      message.textContent = 'No included archival receipt found. Checking one node’s remembered status…';
+      try {
+        const status = await nodeStatus(txid);
+        observationText.textContent = `The gateway node reports “${status.status}” for this txid. This is a node-local observation; it cannot replace an included receipt.`;
+        observationEvidence.textContent = `Evidence level: ${status.level}. “Unknown” does not prove absence. Do not credit a deposit without the required included receipt and finality evidence.`;
+        observation.hidden = false;
+        message.textContent = 'Archival receipt unavailable. Treat this transaction as unresolved for reconciliation.';
+      } catch {
+        message.textContent = 'Archival receipt unavailable and node status could not be checked. Pending, delayed indexing or an unknown txid are all possible; do not infer failure.';
+      }
+      return;
+    }
+    if (!response.ok) throw new Error(`The public API returned HTTP ${response.status}.`);
+    const receipt = await response.json();
+    if (!receipt || receipt.txid !== txid || !Array.isArray(receipt.inputs) || !Array.isArray(receipt.outputs)) {
+      throw new Error('The API response did not match the requested transaction.');
+    }
+    summary.replaceChildren();
+    addField('Transaction ID', receipt.txid);
+    addField('Status', receipt.status);
+    addField('Finalized', receipt.finalized === true ? 'Yes' : receipt.finalized === false ? 'No' : 'Unavailable');
+    addField('Confirmations', receipt.confirmations);
+    addField('Height / slot', `${String(receipt.height ?? 'Unavailable')} / ${String(receipt.slot ?? 'Unavailable')}`);
+    addField('Block ID', receipt.block_id);
+    addField('Fee', receipt.fee_sat == null ? null : `${receipt.fee_sat} sat`);
+    addField('Observed head', `${String(receipt.observed_head_height ?? 'Unavailable')} / slot ${String(receipt.observed_head_slot ?? 'Unavailable')}`);
+    addField('Finalized height', receipt.finalized_height);
+    addField('Corroboration', receipt.corroboration);
+    addField('Receipt verification', receipt.verification);
+    addTransfers(lists[0], receipt.inputs);
+    addTransfers(lists[1], receipt.outputs);
+    source.href = url;
+    result.hidden = false;
+    message.textContent = 'Included receipt loaded. Apply your own credit and finality policy.';
+  } catch (error) {
+    message.textContent = error.name === 'AbortError' ? 'The lookup timed out. Retry or use the source API directly.' : String(error.message || 'Lookup unavailable.');
+  } finally {
+    clearTimeout(timer);
+    button.disabled = false;
+  }
+});

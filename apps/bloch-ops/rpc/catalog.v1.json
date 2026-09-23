@@ -1,0 +1,50 @@
+{
+  "schema_version": "1.0.0",
+  "title": "Genesis-4 read-only RPC method catalog",
+  "generated_for": "Bloch Ops",
+  "source": {
+    "repository": "https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow",
+    "checkout_commit": "2da509438542c72d1f9bb2ca7437798e2a9b21ab",
+    "route_file": "crates/bloch-pos-node/src/rpc.rs",
+    "response_files": ["crates/bloch-pos-node/src/rpc.rs", "crates/bloch-pos-node/src/engine.rs"],
+    "note": "This catalog describes the checked-out source route and response constructors. The public gateway can run a different build and apply availability, cache, and corroboration rules."
+  },
+  "gateway": {
+    "url": "https://posternlabs.com/g4rpc",
+    "protocol": "JSON-RPC 2.0 over HTTP POST",
+    "content_type": "application/json",
+    "observed_at_utc": "2026-09-23",
+    "observed_method": "getbuildinfo",
+    "observed_source_digest": "55673e14cd2f98809a3e9c9b7bb3948bb9b1a5296254773240f0c272114e4c66",
+    "observation_scope": "A single successful getbuildinfo response; other methods are source-derived and were not certified by this probe."
+  },
+  "conventions": {
+    "params": "Positional JSON arrays or named JSON objects; no-argument methods accept [].",
+    "hex32": "A 32-byte value encoded as exactly 64 hexadecimal characters.",
+    "amounts": "Satoshi amounts and fee-rate amounts are decimal strings; slots, heights, indexes, and counts are JSON integers.",
+    "envelope": "Success uses result; failure uses error with code and message. The gateway may add corroboration metadata outside or inside result.",
+    "evidence": "Every response is an observation from the answering node or gateway. Check freshness and independent nodes before operational decisions."
+  },
+  "methods": [
+    {"name":"getchaininfo","params":[],"result_kind":"object","result_fields":["block_id","slot","height","finalized_height","epoch","state_root","justified","finalized","validators","total_active_stake_sat","base_fee_millisat_per_gas","next_base_fee_millisat_per_gas","wall_slot","behind_by_slots","transport"],"limits":"finalized_height can be null; transport peers can be null for a disabled stack.","source_symbol":"chain_info_json"},
+    {"name":"getbuildinfo","params":[],"result_kind":"object","result_fields":["build_version","package_version","commit","commit_source","tree_state","source_digest","source_digest_alg","profile","target"],"limits":"Self-reported build identity, not remote attestation.","source_symbol":"build_info_json"},
+    {"name":"getblockcount","params":[],"result_kind":"object","result_fields":["height","slot","epoch","finalized_height","justified_epoch","finalized_epoch"],"limits":"finalized_height can be null.","source_symbol":"block_count_json"},
+    {"name":"getblockbyslot","params":[{"name":"slot","type":"uint64","required":true}],"result_kind":"object","result_fields":["block_id","version","parent","slot","epoch","height","timestamp","state_root","body_root","finality","finalized","tx_count"],"limits":"A slot without a canonical block returns SLOT_EMPTY. Result contains block metadata and counts, not transaction bodies; height can be null.","source_symbol":"block_json"},
+    {"name":"getblockbyid","params":[{"name":"block_id","type":"hex32","required":true}],"result_kind":"object","result_fields":["block_id","version","parent","slot","epoch","height","timestamp","state_root","body_root","finality","finalized","tx_count"],"limits":"An unknown block returns BLOCK_NOT_FOUND. Result contains block metadata, not transaction bodies; height can be null.","source_symbol":"block_json"},
+    {"name":"getvalidator","params":[{"name":"index","type":"uint32","required":true}],"result_kind":"object","result_fields":["index","pubkey_hash","state","own_stake_sat","effective_stake_sat","commission_bps","activation_epoch","exit_epoch","withdrawable_epoch","withdrawal_credentials","funded","withdrawal_payout_sat"],"limits":"Unknown index returns VALIDATOR_NOT_FOUND. Several lifecycle and payout fields can be null; commission_bps is a decimal string in this response.","source_symbol":"validator_lifecycle_json"},
+    {"name":"getvalidatorbykey","params":[{"name":"pubkey_hash","type":"hex32","required":true}],"result_kind":"object","result_fields":["index","pubkey_hash","state","own_stake_sat","effective_stake_sat","commission_bps","activation_epoch","exit_epoch","withdrawable_epoch","withdrawal_credentials","funded","withdrawal_payout_sat"],"limits":"Looks up a registered validator by public-key hash, then returns the getvalidator shape.","source_symbol":"validator_lifecycle_json"},
+    {"name":"getvalidatorcount","params":[],"result_kind":"object","result_fields":["total","active","total_active_stake_sat"],"limits":"Aggregate view of the answering node.","source_symbol":"Engine::serve_rpc"},
+    {"name":"getvalidatoradmission","params":[],"result_kind":"object","result_fields":["active","activation_epoch","network_domain","epoch","minimum_stake_sat","maximum_stake_sat","activation_delay_epochs","exit_delay_epochs","withdrawal_delay_epochs","next_base_fee_millisat_per_gas"],"limits":"Activation epoch or network domain can be null; this is an admission report, not authorization to stake or withdraw.","source_symbol":"validator_admission_json"},
+    {"name":"getvalidators","params":[],"result_kind":"array","result_fields":["index","pubkey_hash","status","effective_stake_sat","commission_bps"],"limits":"No cursor or page cap in this build. effective_stake_sat can be null; commission_bps is a JSON integer here.","source_symbol":"validators_json"},
+    {"name":"getbalance","params":[{"name":"script_hash","type":"hex32","required":true}],"result_kind":"object","result_fields":["script_hash","balance_sat","utxo_count"],"limits":"Current committed eUTXO view at the answering head; balance_sat is a decimal string.","source_symbol":"balance_json"},
+    {"name":"getutxos","aliases":["listunspent"],"params":[{"name":"script_hash","type":"hex32","required":true},{"name":"limit","type":"uint64","required":false,"default":100,"effective_min":1,"effective_max":1000}],"result_kind":"object","result_fields":["script_hash","total","returned","truncated","utxos"],"limits":"No cursor. A truncated reply does not expose all outputs; each utxo has txid, vout, value_sat, script_hash.","source_symbol":"utxos_json"},
+    {"name":"gettxout","params":[{"name":"txid","type":"hex32","required":true},{"name":"vout","type":"uint32","required":false,"default":0}],"result_kind":"object","result_fields":["txid","vout","unspent","utxo","at_slot"],"limits":"unspent=false combines spent and never-existing outputs; utxo is null then. It does not return transaction history.","source_symbol":"txout_json"},
+    {"name":"gettxstatus","params":[{"name":"txid","type":"hex32","required":true}],"result_kind":"object","result_fields":["status"],"status_values":["pending","included","justified","finalized","unknown"],"limits":"No inputs, outputs, amount, fee, block height, or slot in this response. Status is this node's view.","source_symbol":"tx_status_json"},
+    {"name":"getmempoolinfo","params":[],"result_kind":"object","result_fields":["size","max","bytes","next_base_fee_millisat_per_gas","barred","barred_hits","expired","evicted_low_fee"],"limits":"One node's local mempool; not network-wide pending transaction count.","source_symbol":"mempool_info_json"}
+  ],
+  "excluded": [
+    {"name":"sendrawtransaction","reason":"Write operation; excluded from the read-only catalog and browser console."},
+    {"name":"gettransaction","reason":"The node returns a permanent NO_TRANSACTION_INDEX error in this build; no full transaction lookup is available by txid."},
+    {"name":"getnewaddress","reason":"The node returns NO_WALLET; it holds no wallet keys."}
+  ]
+}

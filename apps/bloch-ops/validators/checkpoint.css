@@ -1,0 +1,12 @@
+.checkpoint{background:#eaf1e4;color:#15281b}
+.checkpoint .section-heading>p:last-child{color:#49624b}
+.checkpoint-grid{max-width:1500px;margin:auto;display:grid;grid-template-columns:1fr 1fr;gap:24px;align-items:stretch}
+.checkpoint-grid>div,.checkpoint-grid pre{margin:0;padding:30px;border:1px solid #a9c1a4;background:#f5f8f1}
+.checkpoint-grid h3{margin:0 0 20px;font-size:clamp(25px,2.6vw,38px);line-height:1.12;letter-spacing:-.045em}
+.checkpoint-grid p,.checkpoint-note{color:#49624b;font-size:14px}
+.checkpoint-actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:25px}
+.checkpoint-actions a{padding:12px 16px;border:1px solid #4e7653;color:#1b4928;font-size:12px;font-weight:800}
+.checkpoint-actions a:hover,.checkpoint-actions a:focus-visible{background:#173721;color:#eff8e9}
+.checkpoint-grid pre{display:flex;align-items:center;overflow-x:auto;color:#1b4928;font-size:clamp(11px,1vw,14px);line-height:1.8}
+.checkpoint-note{max-width:1500px;margin:20px auto 0}
+@media(max-width:800px){.checkpoint-grid{grid-template-columns:1fr}.checkpoint-grid>div,.checkpoint-grid pre{padding:20px}.checkpoint-grid pre{max-width:100%}}

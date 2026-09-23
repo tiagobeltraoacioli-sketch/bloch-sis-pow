@@ -14,5 +14,8 @@ if (process.env.BLOCH_BROADCAST === '1') {
   const result = await broadcastSignedTransaction(signed, { rpcUrl });
   console.log(JSON.stringify({ txid: signed.txid, broadcast: result }));
 } else {
-  console.log(JSON.stringify({ txid: signed.txid, rawHex: signed.rawHex }));
+  console.log(JSON.stringify({
+    txid: signed.txid, rawHex: signed.rawHex,
+    signingRootHex: signed.signingRootHex, rawHash: signed.rawHash,
+  }));
 }
