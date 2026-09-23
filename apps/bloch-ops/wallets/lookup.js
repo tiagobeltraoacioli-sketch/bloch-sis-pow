@@ -2,7 +2,7 @@ import { validIncludedReceipt } from './receipt-validator.mjs';
 import { compareReceiptObservations } from './receipt-comparison.mjs?v=20260923-5';
 import { LookupResponseError, readBoundedJson } from './bounded-json.mjs?v=20260923-6';
 import { matchDepositOutputs } from './deposit-match.mjs?v=20260923-7';
-import { buildReconciliationEvidence } from './reconciliation-evidence.mjs?v=20260923-8';
+import { buildReconciliationEvidence } from './reconciliation-evidence.mjs?v=20260923-9';
 
 const NODE_STATUS = new Set(['pending', 'included', 'justified', 'finalized', 'unknown']);
 
