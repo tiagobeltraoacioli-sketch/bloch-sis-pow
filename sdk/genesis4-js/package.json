@@ -1,0 +1,11 @@
+{
+  "name": "@blochprotocol/genesis4-sdk",
+  "version": "0.1.0",
+  "description": "Genesis-4 mainnet transaction signing and exchange receipt lookup",
+  "type": "module",
+  "exports": "./index.mjs",
+  "files": ["index.mjs", "core.mjs", "g4.cjs", "bloch_wallet_wasm.wasm", "examples", "README.md", "LICENSE"],
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "license": "AGPL-3.0-or-later"
+}
