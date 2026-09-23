@@ -7150,6 +7150,42 @@ fn admissible_with_network_verifier(
             deposit.validate_shape()
                 .map_err(|_| "invalid funded deposit shape")
         }
+        PosTransaction::FundedDelegate(delegate) => {
+            if !bloch_pos_committee::params::epoch_gate_active(
+                wall_epoch,
+                bloch_pos_committee::params::FUNDED_DELEGATION_ACTIVATION_EPOCH,
+            ) {
+                return Err("funded delegation (tag 0x0E) is not active");
+            }
+            if wall_epoch > delegate.valid_until_epoch {
+                return Err("funded delegation has expired");
+            }
+            delegate
+                .validate_shape()
+                .map_err(|_| "invalid funded delegation shape")
+        }
+        PosTransaction::FundedUndelegate(undelegate) => {
+            if !bloch_pos_committee::params::epoch_gate_active(
+                wall_epoch,
+                bloch_pos_committee::params::FUNDED_DELEGATION_ACTIVATION_EPOCH,
+            ) {
+                return Err("funded undelegation (tag 0x0F) is not active");
+            }
+            undelegate
+                .validate_shape()
+                .map_err(|_| "invalid funded undelegation shape")
+        }
+        PosTransaction::FundedDelegationWithdraw(withdrawal) => {
+            if !bloch_pos_committee::params::epoch_gate_active(
+                wall_epoch,
+                bloch_pos_committee::params::FUNDED_DELEGATION_ACTIVATION_EPOCH,
+            ) {
+                return Err("funded delegation withdrawal (tag 0x10) is not active");
+            }
+            withdrawal
+                .validate_shape()
+                .map_err(|_| "invalid funded delegation withdrawal shape")
+        }
 
         // Staking messages are refused outright until bonding is funded from
         // the eUTXO set.

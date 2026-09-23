@@ -126,8 +126,12 @@ use crate::interfaces::{
 use crate::params::SLOTS_PER_EPOCH;
 
 pub mod funded;
+pub mod funded_delegation;
 mod lifecycle;
 pub use funded::{FundedDeposit, FundedDepositReject, FundingInput};
+pub use funded_delegation::{
+    FundedDelegate, FundedDelegationReject, FundedDelegationWithdraw, FundedUndelegate,
+};
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
 use crate::schedule;
@@ -136,7 +140,11 @@ use crate::slashing;
 use crate::staking::{self, QueuedDeposit};
 use crate::fee_market;
 use crate::state_root::{
-    AppliedEvidenceRecord, BaseFeeRecord, CheckpointRecord, ConsensusState, DelegatorFeeRecord, DelegatorLossRecord, SlashWindowRecord, DelegationRecord, DepositQueueRecord, EvmCommitment, FcEquivocatorRecord, FcMessageRecord, FcRecentVoteRecord, FinalityRecord, LeakRecord, ParticipationRecord, PendingFeeRecord, PendingVoteRecord, RandaoMix, ValidatorRecord as CommittedValidatorRecord,
+    AppliedEvidenceRecord, BaseFeeRecord, CheckpointRecord, ConsensusState, DelegatorFeeRecord,
+    DelegatorLossRecord, SlashWindowRecord, DelegationRecord, DepositQueueRecord, EvmCommitment,
+    FcEquivocatorRecord, FcMessageRecord, FcRecentVoteRecord, FinalityRecord,
+    FundedDelegationLifecycleRecord, FundedDelegationOwnerRecord, LeakRecord, ParticipationRecord,
+    PendingFeeRecord, PendingVoteRecord, RandaoMix, ValidatorRecord as CommittedValidatorRecord,
 };
 use crate::tokenomics_v4;
 use sha3::{Digest, Sha3_256};
@@ -285,6 +293,13 @@ pub struct TransferOutput {
 pub enum PosTransaction {
     /// PQ-authorized, UTXO-funded validator registration (wire 0x0B).
     FundedDeposit(FundedDeposit),
+    /// PQ-authorized, UTXO-funded delegation to an existing validator (wire
+    /// 0x0E). Consensus-invalid while the funded-delegation gate is inert.
+    FundedDelegate(FundedDelegate),
+    /// Owner-authorized start of a funded position's cool-down (wire 0x0F).
+    FundedUndelegate(FundedUndelegate),
+    /// Owner-authorized payout of a fully inactive funded position (wire 0x10).
+    FundedDelegationWithdraw(FundedDelegationWithdraw),
     /// A value transfer against the committed eUTXO set, priced by the L1 fee
     /// market: **gas × price**, where the gas is derived (class + size,
     /// `fee_market::intrinsic_gas`) and the price is the base fee this block's
@@ -652,6 +667,9 @@ impl PosTransaction {
                 );
             }
             PosTransaction::FundedDeposit(tx) => return tx.intent_root(),
+            PosTransaction::FundedDelegate(tx) => return tx.signing_root(),
+            PosTransaction::FundedUndelegate(tx) => return tx.signing_root(),
+            PosTransaction::FundedDelegationWithdraw(tx) => return tx.signing_root(),
             other => h.update(other.canonical_bytes()),
         }
         h.finalize().into()
@@ -816,6 +834,9 @@ impl PosTransaction {
         };
         match self {
             PosTransaction::FundedDeposit(tx) => return tx.canonical_bytes(),
+            PosTransaction::FundedDelegate(tx) => return tx.canonical_bytes(),
+            PosTransaction::FundedUndelegate(tx) => return tx.canonical_bytes(),
+            PosTransaction::FundedDelegationWithdraw(tx) => return tx.canonical_bytes(),
             PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
                 // Counts are length prefixes like every other variable-length
@@ -1004,6 +1025,12 @@ impl PosTransaction {
         let tag = r.u8()?;
         let tx = match tag {
             funded::FUNDED_DEPOSIT_TAG => PosTransaction::FundedDeposit(FundedDeposit::decode(&mut r)?),
+            funded_delegation::FUNDED_DELEGATE_TAG =>
+                PosTransaction::FundedDelegate(FundedDelegate::decode(&mut r)?),
+            funded_delegation::FUNDED_UNDELEGATE_TAG =>
+                PosTransaction::FundedUndelegate(FundedUndelegate::decode(&mut r)?),
+            funded_delegation::FUNDED_DELEGATION_WITHDRAW_TAG =>
+                PosTransaction::FundedDelegationWithdraw(FundedDelegationWithdraw::decode(&mut r)?),
             0x01 => {
                 // Counts are read from untrusted bytes, so nothing is
                 // preallocated from them: a 4-billion-input header on a 40-byte
@@ -1210,6 +1237,7 @@ impl core::fmt::Display for TxDecodeError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxReject {
     FundedDeposit(FundedDepositReject),
+    FundedDelegation(FundedDelegationReject),
     /// A value transfer broke one of the eUTXO rules.
     Transfer(TransferReject),
     /// A deposit, exit or delegation failed its state-dependent rule.
@@ -1626,6 +1654,11 @@ pub struct CommittedState {
     /// Every delegation ever included. Same replay argument as the deposit
     /// history: [`delegation::Registry::resolve`] is a fold over all of it.
     delegations: Vec<Delegation>,
+    /// Funding-key hash controlling each funded delegation account.
+    funded_delegation_owners: BTreeMap<u32, [u8; 32]>,
+    /// Position -> (first fully inactive epoch, withdrawn). `u64::MAX` means
+    /// the cool-down/churn drain has not completed yet.
+    funded_delegation_lifecycle: BTreeMap<u32, (u64, bool)>,
     /// Fee rewards accrued to proposers during the current epoch, compounded
     /// into their bond only at the epoch boundary — so effective stake, and
     /// with it every committee and schedule, is frozen for the epoch's whole
@@ -2271,6 +2304,8 @@ impl CommittedState {
             deposit_history: Vec::new(),
             pubkey_index,
             delegations: Vec::new(),
+            funded_delegation_owners: BTreeMap::new(),
+            funded_delegation_lifecycle: BTreeMap::new(),
             pending_fee_rewards: BTreeMap::new(),
             slashing: slashing::SlashingState::new(),
             delegator_slash_losses: BTreeMap::new(),
@@ -2808,6 +2843,23 @@ impl CommittedState {
                 eligible: d.eligible,
             })
             .collect();
+        let funded_delegation_owners: Vec<FundedDelegationOwnerRecord> = self
+            .funded_delegation_owners
+            .iter()
+            .map(|(delegator, owner_hash)| FundedDelegationOwnerRecord {
+                delegator: *delegator,
+                owner_hash: *owner_hash,
+            })
+            .collect();
+        let funded_delegation_lifecycle: Vec<FundedDelegationLifecycleRecord> = self
+            .funded_delegation_lifecycle
+            .iter()
+            .map(|(position, (inactive_since_epoch, withdrawn))| FundedDelegationLifecycleRecord {
+                position: *position,
+                inactive_since_epoch: *inactive_since_epoch,
+                withdrawn: *withdrawn,
+            })
+            .collect();
         let pending_fees: Vec<PendingFeeRecord> = self
             .pending_fee_rewards
             .iter()
@@ -2893,6 +2945,8 @@ impl CommittedState {
             fc_recent_votes: &fc_recent_votes,
             deposit_queue: &deposit_queue,
             delegations: &delegations,
+            funded_delegation_owners: &funded_delegation_owners,
+            funded_delegation_lifecycle: &funded_delegation_lifecycle,
             pending_fees: &pending_fees,
             applied_evidence: &applied_evidence,
             slash_window: &slash_window,
@@ -3418,6 +3472,15 @@ impl CommittedState {
             PosTransaction::FundedDeposit(deposit) => self
                 .apply_funded_deposit(deposit, total_active_sat, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::FundedDeposit),
+            PosTransaction::FundedDelegate(delegate) => self
+                .apply_funded_delegate(delegate, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::FundedDelegation),
+            PosTransaction::FundedUndelegate(undelegate) => self
+                .apply_funded_undelegate(undelegate, verifier)
+                .map_err(TxReject::FundedDelegation),
+            PosTransaction::FundedDelegationWithdraw(withdrawal) => self
+                .apply_funded_delegation_withdrawal(withdrawal, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::FundedDelegation),
             PosTransaction::Transfer { .. } => self
                 .apply_transfer(tx, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::Transfer),
@@ -4840,7 +4903,10 @@ impl CommittedState {
     pub fn accounted_supply_sat(&self) -> u128 {
         let held = self.eutxos.total_sat()
             + self.validators.values().map(|r| r.staked_sat).sum::<u128>()
-            + self.delegations.iter().map(|d| d.amount_sat).sum::<u128>()
+            + self.delegations.iter().enumerate()
+                .filter(|(position, _)| !self.funded_delegation_lifecycle
+                    .get(&(*position as u32)).is_some_and(|(_, withdrawn)| *withdrawn))
+                .map(|(_, d)| d.amount_sat).sum::<u128>()
             + self.pending_fee_rewards.values().sum::<u128>()
             + self.delegator_fee_rewards.values().sum::<u128>()
             + self.validator_fee_rewards.values().sum::<u128>()
@@ -5425,6 +5491,30 @@ impl CommittedState {
         // 5. Open E+1. The cohort cap for the new epoch is applied inside
         //    duty_roster_at (genesis_cohort.rs closed form — rule 3).
         st.epoch = next_epoch;
+        // A funded position becomes withdrawable only after both the fixed
+        // cool-down and the churn-budget drain have completed. A crowded exit
+        // queue can take longer than the nominal cool-down.
+        if crate::params::funded_delegation_active(next_epoch) {
+            let registry = delegation::Registry::resolve(&st.delegations, next_epoch);
+            let newly_inactive: Vec<(u32, u64)> = st.delegations.iter().enumerate()
+                .filter_map(|(position, d)| {
+                    let position = u32::try_from(position).ok()?;
+                    let (inactive_since, withdrawn) =
+                        st.funded_delegation_lifecycle.get(&position).copied()?;
+                    let deactivation = d.deactivate_epoch?;
+                    let cooldown_end = deactivation.checked_add(delegation::COOLDOWN_EPOCHS)?;
+                    (inactive_since == u64::MAX
+                        && !withdrawn
+                        && st.funded_delegation_owners.contains_key(&d.delegator)
+                        && next_epoch >= cooldown_end
+                        && registry.activated_sat(d) == 0)
+                        .then_some((position, next_epoch))
+                })
+                .collect();
+            for (position, inactive_since) in newly_inactive {
+                st.funded_delegation_lifecycle.insert(position, (inactive_since, false));
+            }
+        }
         st.pending_votes.clear();
         let roster_next = st.consensus_roster_at(next_epoch);
         st.previous_participation = std::mem::take(&mut st.current_participation);
@@ -6604,6 +6694,10 @@ mod tests {
     mod funded_admission {
         use super::*;
         include!("transition/funded/tests.rs");
+    }
+    mod funded_delegation_lifecycle {
+        use super::*;
+        include!("transition/funded_delegation/tests.rs");
     }
     use crate::header::BlockHeaderV4;
 
@@ -13810,6 +13904,8 @@ mod tests {
     #[cfg(feature = "local-state-cache")]
     fn local_cache_preserves_live_queues_fees_votes_and_ledger() {
         let (_, mut state, _) = state_with_live_bookkeeping();
+        state.funded_delegation_owners.insert(42, [0xA5; 32]);
+        state.funded_delegation_lifecycle.insert(17, (state.epoch.saturating_sub(1), true));
         let header = BlockHeaderV4 {
             version: BLOCK_VERSION_V4, parent: [0; 32], state_root: state.compute_root(),
             body_root: [0; 32], slot: state.slot, proposer_index: 0,
@@ -14400,6 +14496,11 @@ mod tests {
             PosTransaction::RandaoRecommit { .. } => {}
             // Funded admission transfers UTXO value into bonded stake and fees.
             PosTransaction::FundedDeposit(_) => {}
+            // Funded delegation moves existing UTXO value through a bonded
+            // position and back; its lifecycle never edits the issuance cap.
+            PosTransaction::FundedDelegate(_)
+            | PosTransaction::FundedUndelegate(_)
+            | PosTransaction::FundedDelegationWithdraw(_) => {}
         }
 
         // Monotone under blocks and boundaries, and never above the cap.

@@ -431,6 +431,8 @@ mod harness {
             fc_recent_votes: &[],
             deposit_queue: &[],
             delegations: &[],
+            funded_delegation_owners: &[],
+            funded_delegation_lifecycle: &[],
             pending_fees: &[],
             taint_root: TAINT_ROOT,
             coherence_accumulator_root: COHERENCE_ACC_ROOT,
