@@ -53,6 +53,64 @@ identifies the exact downloaded report bytes. Creation time is the untrusted
 local browser clock. Reports are unsigned. A CSV export indexes outcomes and
 source row references; formula-leading identifiers are neutralized.
 
+## Portable case files (v4)
+
+**Prepare complete case** recomputes the current evidence from the original CSVs
+and prepares a single `bloch-data-case.bloch.json` file. The preview identifies
+all six components before download. Keep the separately downloaded case SHA-256
+in an independently controlled location if you need a retained reference.
+
+The versioned `bloch.data.case-file.v1` container embeds these exact UTF-8 texts:
+
+| Component | Contents |
+| --- | --- |
+| `evidence.json` | Original evidence JSON bytes, unchanged |
+| `source-a.csv` | Original source A bytes, including BOM and line endings |
+| `source-b.csv` | Original source B bytes, in the original A/B order |
+| `review.json` | Complete journal bound to this evidence, including an empty journal when unreviewed |
+| `configuration.json` | Configuration from the evidence report |
+| `verification.json` | Fresh local recomputation receipt for the evidence and journal |
+
+Each component declares its fixed name, media type, byte count and SHA-256.
+The manifest binds the evidence/journal digests and states the assurance limits.
+JSON string escaping is a transport representation, not encryption; decoded
+component texts preserve the source bytes. There is no compression, archive
+extraction, script execution, network fetch or filesystem path interpretation.
+The six component names and their order are fixed. Unknown, missing, duplicate,
+reordered or oversized components fail verification. The whole case is limited
+to 64 MiB; existing report, journal and CSV limits still apply. Configuration
+and embedded verification receipt are each limited to 16 KiB.
+
+**Verify case locally** checks the manifest and each component, recomputes the
+comparison from both embedded CSVs, validates journal binding, compares the
+configuration with the evidence and checks the retained verification receipt
+against the recomputed evidence and journal. It never trusts the packaged
+receipt's success claim as a substitute for recomputation. The receipt timestamp
+is a format-checked local declaration, not trusted time. The internal manifest
+digest is not treated as an independently retained reference.
+
+After successful verification, download any individual component, export a new
+case-verification receipt or open the exact report and journal for further
+review. Opening replaces the current comparison session and preserves the
+original evidence bytes. Source components download under fixed safe names;
+the report retains its original source-name declarations. Existing v1 evidence
+and journal exports remain supported by the separate-file verifier.
+
+Preparing captures a complete snapshot, regardless of queue filters. Changes to
+the active report or journal discard a prepared snapshot; prepare again before
+downloading the updated case. A verified imported case remains a separate,
+unchanged snapshot when the working review changes. Its Clear button discards
+that import session. Clearing or changing an input during asynchronous work
+prevents obsolete results from being shown.
+
+The case includes private original CSVs and review notes in plaintext and is
+unsigned. Use approved institutional storage and access controls. The case
+digest can bind a retained snapshot, but it does not authenticate people or
+sources, certify completeness, enforce retention, prevent replay/rollback or
+prove an on-chain claim. Without an independently retained digest, a coherent
+replacement can pass internal consistency checks. No encryption, signature,
+institutional approval or regulatory certification is inferred from packaging.
+
 ## Investigation desk and queue (v3)
 
 The overview adds two interactive charts using the entire current report:
@@ -94,7 +152,7 @@ Filters are kept only in page memory. Reset restores all keys and original key
 order; changing the report, clearing or reopening evidence resets filters. New
 annotations immediately update the search index, counts and filtered queue.
 Full evidence JSON and the existing all-results CSV continue to include every
-result regardless of the queue filters. CSV search is bounded at 160 characters.
+result regardless of the queue filters. Search input is bounded at 160 characters.
 
 ## Exception review and verification (v2)
 
@@ -133,7 +191,7 @@ the final newline. Reformatting, duplicate keys and ambiguous JSON are rejected.
 Limits: 24 MiB evidence JSON, 8 MiB review JSON, 2 MiB per CSV, 120 characters for
 reviewer labels and 2,000 for notes. All inputs must be valid UTF-8. Malformed or
 changed files invalidate prior verification results. The original v1 evidence
-schema and comparison rules remain supported; the browser interface is v3.
+schema and comparison rules remain supported; the browser interface is v4.
 
 Without a separately retained report digest, verification establishes internal
 consistency only. A coherent replacement of the evidence and both sources can
@@ -143,7 +201,8 @@ on-chain inclusion. The verification receipt records these limits explicitly.
 
 Review changes are held only in memory. Clearing, applying configuration,
 loading other files or rerunning discards the current journal. The verification
-panel has a separate Clear button. Closing or refreshing clears both sessions.
+and case-verification panels have separate Clear buttons. Closing or refreshing
+clears all sessions and prepared case files from page state.
 
 No application upload, API fetch, analytics, third-party fonts, localStorage,
 IndexedDB or cookies are used. `connect-src 'none'` is set in both HTTP headers
@@ -165,7 +224,7 @@ prototype, and their guarantees are not attributed to it.
 
 ## Run locally / offline
 
-Unzip `downloads/bloch-data-local-workbench-v3.zip` into an approved directory.
+Unzip `downloads/bloch-data-local-workbench-v4.zip` into an approved directory.
 Start a localhost-only server from that directory:
 
 ```sh
@@ -184,7 +243,7 @@ configuration by the two example download controls.
 ## Build, test and deploy (repository)
 
 ```sh
-node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs
+node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs scripts/test-bloch-data-case.mjs
 python3 scripts/build-bloch-data.py
 node scripts/verify-bloch-data.mjs
 wrangler pages deploy apps/bloch-data --project-name bloch-data --branch main
@@ -200,12 +259,14 @@ outside the public static directory. Serve the provided `_headers` on production
 
 `assets/modules.v1.mjs` defines schemas, keys, field types, institution defaults,
 and regional profiles. `reconcile.v1.mjs` provides strict parsing and comparison;
-`samples.v1.mjs` supplies labelled fixtures; `workbench.v3.mjs` renders local state.
+`samples.v1.mjs` supplies labelled fixtures; `workbench.v4.mjs` renders local state.
 `audit.v1.mjs` validates/recomputes evidence and journals; `verification.v1.mjs`
 handles the separate verifier session. `queue.v1.mjs` provides the local search
 index, selection/sort rules, chart summaries and filtered CSV export. These are
 presentation and workflow functions, separate from comparison rules and evidence
-serialization. Versioned static asset URLs keep existing
+serialization. `case-file.v1.mjs` creates and verifies the bounded six-component
+case format; `case-workbench.v1.mjs` manages preparation and import sessions.
+Versioned static asset URLs keep existing
 immutable caches isolated from the updated interface.
 Add a reviewed schema and key definition to the module registry, add independent
 fixtures and tests, then version the rules and assets. Preserve exact source

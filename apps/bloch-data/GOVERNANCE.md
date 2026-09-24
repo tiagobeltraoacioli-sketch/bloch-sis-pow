@@ -16,6 +16,7 @@ The register is non-exhaustive; applicable requirements must be added and review
 | Traceability | Original file digests, rule/configuration version, normalized records, exact report digest and local recomputation verifier | Sign reviews, independently retain evidence, protect time and prevent rollback |
 | Exception review | Separate unsigned journal bound to exact report bytes; ordered annotations; original outcomes preserved | Authenticate reviewers, authorize decisions, enforce separation of duties and retain protected history |
 | Investigation workflow | Local record/latest-note search, combined filters, full-report charts, explicit queue order and filtered CSV bound to evidence/journal digests | Approve operating priorities, control private exports and independently assess financial exposure; counts are not risk scores |
+| Case retention | Single plaintext case with original CSVs, evidence, complete journal, configuration and local receipt; bounded manifest/component verification and recomputation on reopening | Approve storage, encryption, recipients and access; retain independent digests or signed checkpoints; enforce retention and protect against rollback |
 | Access | No hosted private account store or multi-tenant service | SSO/MFA, role separation, authorized exports, tenant isolation and reviewer signatures |
 | Retention | No application persistence; manual Clear | Encryption, key custody, legal holds, retention schedules, rights handling and verifiable disposal |
 | Cross-border data | No application transfer of source files | Validate residence, recipients, transfer mechanisms and lawful hosting |
@@ -45,6 +46,14 @@ filtered exports identify their scope and include private reviewer notes.
 Search ignores accents/case only for retrieval, never for record matching. A
 filtered CSV is a convenience artifact; retain the complete evidence and review
 JSONs and protect them using institutional storage and access controls.
+
+The v4 case file includes private source data in plaintext. Preparing a case is
+not anonymization or on-chain publication. Component checksums establish local
+integrity relationships; without a trusted retained reference an attacker can
+replace a coherent case. Verification recomputes the comparison and checks the
+embedded receipt, but does not attest identity, source truth, protected time or
+the latest history. Institution-controlled encryption, signatures, approvals,
+retention and access remain external integration responsibilities.
 
 ## Brazil
 
