@@ -280,6 +280,12 @@ const TAG_WRITTEN_OFF: u8 = 0x1B;
 const TAG_STAKE_LOW_WATER: u8 = 0x1C;
 const TAG_RANDAO_GENERATION: u8 = 0x1D;
 const TAG_FUNDED_VALIDATOR: u8 = 0x1E;
+/// Funding-key hash controlling one funded delegator identifier. Empty below
+/// the funded-delegation activation gate, preserving historical roots.
+const TAG_FUNDED_DELEGATION_OWNER: u8 = 0x1F;
+/// Withdrawal lifecycle keyed by delegation-history position. Absence means
+/// the funded position has not yet begun deactivation.
+const TAG_FUNDED_DELEGATION_LIFECYCLE: u8 = 0x20;
 
 /// Append-only registry of every component namespace in the live state SMT.
 ///
@@ -288,7 +294,7 @@ const TAG_FUNDED_VALIDATOR: u8 = 0x1E;
 /// compatibility DTO, not an exhaustive model of the live tree. New
 /// components must be appended here as well as in the tree fold; the
 /// uniqueness and spec-reconciliation tests consume this registry directly.
-pub const STATE_COMPONENT_TAGS: [(&str, u8); 30] = [
+pub const STATE_COMPONENT_TAGS: [(&str, u8); 32] = [
     ("TAG_EUTXO", TAG_EUTXO),
     ("TAG_VALIDATOR", TAG_VALIDATOR),
     ("TAG_PARTICIPATION_CURRENT", TAG_PARTICIPATION_CURRENT),
@@ -319,6 +325,8 @@ pub const STATE_COMPONENT_TAGS: [(&str, u8); 30] = [
     ("TAG_STAKE_LOW_WATER", TAG_STAKE_LOW_WATER),
     ("TAG_RANDAO_GENERATION", TAG_RANDAO_GENERATION),
     ("TAG_FUNDED_VALIDATOR", TAG_FUNDED_VALIDATOR),
+    ("TAG_FUNDED_DELEGATION_OWNER", TAG_FUNDED_DELEGATION_OWNER),
+    ("TAG_FUNDED_DELEGATION_LIFECYCLE", TAG_FUNDED_DELEGATION_LIFECYCLE),
 ];
 
 
@@ -1563,6 +1571,49 @@ impl DelegationRecord {
     }
 }
 
+/// Funding authority for one funded delegation account. The hash is
+/// SHA3-256 of the hybrid public key carried by its creation transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FundedDelegationOwnerRecord {
+    pub delegator: u32,
+    pub owner_hash: [u8; 32],
+}
+
+impl FundedDelegationOwnerRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.delegator.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(36);
+        out.extend_from_slice(&self.delegator.to_le_bytes());
+        out.extend_from_slice(&self.owner_hash);
+        out
+    }
+}
+
+/// Post-deactivation lifecycle for one funded delegation-history position.
+/// The inactive epoch stays `u64::MAX` while the cool-down/churn drain is in
+/// progress; the record is retained after withdrawal for replay protection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FundedDelegationLifecycleRecord {
+    pub position: u32,
+    pub inactive_since_epoch: u64,
+    pub withdrawn: bool,
+}
+
+impl FundedDelegationLifecycleRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.position.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(13);
+        out.extend_from_slice(&self.position.to_le_bytes());
+        out.extend_from_slice(&self.inactive_since_epoch.to_le_bytes());
+        out.push(u8::from(self.withdrawn));
+        out
+    }
+}
+
 /// Fee rewards accrued to one proposer during the open epoch, waiting to
 /// compound at the boundary; committed per entry under [`TAG_PENDING_FEE`].
 /// Uncommitted, a boundary would pay validators amounts no root ever agreed
@@ -1829,6 +1880,10 @@ pub struct ConsensusState<'a> {
     pub deposit_queue: &'a [DepositQueueRecord],
     /// The permanent delegation history, positionally keyed.
     pub delegations: &'a [DelegationRecord],
+    /// Funding-key ownership of funded delegator identifiers.
+    pub funded_delegation_owners: &'a [FundedDelegationOwnerRecord],
+    /// Inactivity epoch and withdrawal marker per funded position.
+    pub funded_delegation_lifecycle: &'a [FundedDelegationLifecycleRecord],
     /// Fee rewards pending the epoch boundary.
     pub pending_fees: &'a [PendingFeeRecord],
     /// Root of the taint set (§4.1), maintained by its own module.
@@ -2036,6 +2091,18 @@ fn build_state_tree_inner(state: &ConsensusState<'_>, eutxo_tree: &Smt) -> Smt {
     }
     for d in state.delegations {
         smt.insert(derive_key(TAG_DELEGATION, &d.entry_key()), hash_value(&d.serialize()));
+    }
+    for owner in state.funded_delegation_owners {
+        smt.insert(
+            derive_key(TAG_FUNDED_DELEGATION_OWNER, &owner.entry_key()),
+            hash_value(&owner.serialize()),
+        );
+    }
+    for lifecycle in state.funded_delegation_lifecycle {
+        smt.insert(
+            derive_key(TAG_FUNDED_DELEGATION_LIFECYCLE, &lifecycle.entry_key()),
+            hash_value(&lifecycle.serialize()),
+        );
     }
     for f in state.pending_fees {
         smt.insert(derive_key(TAG_PENDING_FEE, &f.entry_key()), hash_value(&f.serialize()));
@@ -3453,6 +3520,8 @@ mod tests {
             fc_recent_votes: &f.fc_recent_votes,
             deposit_queue: &f.deposit_queue,
             delegations: &f.delegations,
+            funded_delegation_owners: &[],
+            funded_delegation_lifecycle: &[],
             pending_fees: &f.pending_fees,
             taint_root: val(101),
             coherence_accumulator_root: val(102),
@@ -3527,6 +3596,30 @@ mod tests {
                 assert!(roots.insert(state_root(&changed)), "generation key/value omitted or truncated");
             }
         }
+    }
+
+    #[test]
+    fn funded_delegation_owner_and_lifecycle_are_load_bearing() {
+        let f = fixture();
+        let base = state(&f);
+        let baseline = state_root(&base);
+
+        let owners = [FundedDelegationOwnerRecord { delegator: 7, owner_hash: val(211) }];
+        let mut with_owner = base.clone();
+        with_owner.funded_delegation_owners = &owners;
+        assert_ne!(state_root(&with_owner), baseline, "owner record omitted");
+
+        let lifecycle = [FundedDelegationLifecycleRecord {
+            position: 9, inactive_since_epoch: 123, withdrawn: false,
+        }];
+        let mut with_lifecycle = base.clone();
+        with_lifecycle.funded_delegation_lifecycle = &lifecycle;
+        let active_root = state_root(&with_lifecycle);
+        assert_ne!(active_root, baseline, "lifecycle record omitted");
+
+        let withdrawn = [FundedDelegationLifecycleRecord { withdrawn: true, ..lifecycle[0] }];
+        with_lifecycle.funded_delegation_lifecycle = &withdrawn;
+        assert_ne!(state_root(&with_lifecycle), active_root, "withdrawal marker omitted");
     }
 
     #[test]

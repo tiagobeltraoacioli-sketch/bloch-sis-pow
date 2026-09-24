@@ -535,6 +535,14 @@ pub struct DirLock {
 /// this process, which takes another actor doing so on purpose.
 const LOCK_ACQUIRE_ATTEMPTS: u32 = 8;
 
+/// A process spawned concurrently with a clean in-process restart briefly
+/// inherits the old open file description between `fork` and `exec`.  The
+/// descriptor is `CLOEXEC`, but Linux `flock` remains held during that narrow
+/// window.  Retry only when the lock file names this process; another process
+/// is still refused on the first attempt.
+#[cfg(unix)]
+const SELF_LOCK_RELEASE_ATTEMPTS: u32 = 64;
+
 /// What one round of open → `flock` → verify established.
 enum Locked {
     /// The descriptor holds the lock on the inode the path names.
@@ -548,6 +556,7 @@ impl DirLock {
     /// Take the lock, or fail with the message an operator needs.
     pub fn acquire(dir: &Path) -> io::Result<DirLock> {
         let path = dir.join("LOCK");
+        let mut self_lock_attempts = 0;
         for _attempt in 0..LOCK_ACQUIRE_ATTEMPTS {
             let (file, fresh) = match open_lock_file(&path)? {
                 Some(opened) => opened,
@@ -555,7 +564,21 @@ impl DirLock {
                 // unlinked it in that window. Start over against the path.
                 None => continue,
             };
-            match lock_and_verify(file, &path, fresh)? {
+            let locked = loop {
+                match lock_and_verify(file.try_clone()?, &path, fresh) {
+                    #[cfg(unix)]
+                    Err(error)
+                        if error.kind() == io::ErrorKind::AddrInUse
+                            && lock_names_current_process(&path)
+                            && self_lock_attempts < SELF_LOCK_RELEASE_ATTEMPTS =>
+                    {
+                        self_lock_attempts = self_lock_attempts.saturating_add(1);
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    result => break result?,
+                }
+            };
+            match locked {
                 Locked::Held(mut file) => {
                     file.set_len(0)?;
                     file.write_all(format!("{}\n", std::process::id()).as_bytes())?;
@@ -580,6 +603,13 @@ impl DirLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+#[cfg(unix)]
+fn lock_names_current_process(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .is_some_and(|holder| holder.trim() == std::process::id().to_string())
 }
 
 /// Open `path` for locking. `Ok(Some((file, fresh)))` where `fresh` says
@@ -2636,6 +2666,31 @@ mod tests {
         let store = Store::open(&dir, &[4u8; 32]).expect("a stale lock must be reclaimed");
         drop(store);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `Command` can fork while a store is being dropped.  Until the child
+    /// execs, its inherited `CLOEXEC` descriptor keeps the parent's flock
+    /// alive even though the parent has closed its copy.  A bounded retry for
+    /// a lock naming our own PID closes that scheduler-dependent restart gap.
+    #[cfg(unix)]
+    #[test]
+    fn a_transient_self_owned_lock_is_reacquired_after_its_last_copy_closes() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-pos-self-lock-retry-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let inherited = DirLock::acquire(&dir).expect("take the original lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            drop(inherited);
+        });
+
+        let reacquired = DirLock::acquire(&dir).expect("retry the transient self-owned lock");
+        release.join().expect("release thread");
+        drop(reacquired);
         let _ = fs::remove_dir_all(&dir);
     }
 

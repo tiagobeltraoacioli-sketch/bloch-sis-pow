@@ -2159,6 +2159,37 @@ pub(crate) const ROLE_ACTIVATION_QUEUE: u8 = 0x04;
 /// unfunded legacy Deposit/Delegate formats. No runtime override exists.
 pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = 2_884;
 
+/// Candidate activation epoch for UTXO-funded delegation to an existing
+/// validator (wire 0x0E-0x10). `u64::MAX` means INERT.
+///
+/// This gate covers the complete position lifecycle: funded creation,
+/// authenticated deactivation and withdrawal. The three messages must never
+/// be activated independently because doing so could accept principal without
+/// a consensus path for its owner to recover it. Activation requires a state
+/// migration, historical replay, mixed-fleet qualification and an explicit
+/// coordinated epoch; there is no runtime override.
+pub const FUNDED_DELEGATION_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn funded_delegation_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if funded_delegation_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, FUNDED_DELEGATION_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod funded_delegation_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Candidate ST-16 cancellation path for funded validators that remain in the
 /// activation queue. `u64::MAX` means INERT.
 ///
@@ -2260,7 +2291,7 @@ const fn gate_is_inert_or_not_before(gate: u64, prerequisite: u64) -> bool {
 
 #[cfg(test)]
 mod epoch_gate_tests {
-    use super::epoch_gate_active;
+    use super::{epoch_gate_active, funded_delegation_active};
 
     #[test]
     fn max_is_an_unarmed_sentinel_even_at_the_synthetic_boundary() {
@@ -2274,6 +2305,13 @@ mod epoch_gate_tests {
         assert!(!epoch_gate_active(41, 42));
         assert!(epoch_gate_active(42, 42));
         assert!(epoch_gate_active(u64::MAX, 42));
+    }
+
+    #[test]
+    fn funded_delegation_ships_inert() {
+        for epoch in [0, 2_884, u64::MAX - 1, u64::MAX] {
+            assert!(!funded_delegation_active(epoch));
+        }
     }
 }
 

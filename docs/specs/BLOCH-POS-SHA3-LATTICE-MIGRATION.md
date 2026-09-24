@@ -573,7 +573,7 @@ state component, mixed into key derivation so entries from different
 components can never occupy the same leaf even when their natural keys
 coincide. The registry is **append-only** (reusing or renumbering a tag
 silently re-keys every leaf of the component it named) and is, as shipped,
-exactly these 30:
+exactly these 32:
 
 | Tag | Component |
 |---:|---|
@@ -607,6 +607,8 @@ exactly these 30:
 | `0x1C` | `TAG_STAKE_LOW_WATER` — ADR-041 validator stake low-water marks |
 | `0x1D` | `TAG_RANDAO_GENERATION` — ADR-041 validator RANDAO generations |
 | `0x1E` | `TAG_FUNDED_VALIDATOR` — ADR-041 funded-validator membership |
+| `0x1F` | `TAG_FUNDED_DELEGATION_OWNER` — funded-delegation owner and principal record |
+| `0x20` | `TAG_FUNDED_DELEGATION_LIFECYCLE` — funded-delegation exit and withdrawal lifecycle |
 
 The ADR-041 encodings above document the existing implementation; they do not
 change activation gates. `0x1B` uses an empty entry key and a little-endian
@@ -615,6 +617,8 @@ index as its entry key and a little-endian `u128` floor value; a recorded zero
 floor is present and differs from absence. `0x1D` uses the same validator-key
 encoding and a little-endian `u32` generation, omitted when zero. `0x1E` uses
 the validator-key encoding and the one-byte value `0x01` for each member.
+`0x1F` and `0x20` use the funded-delegation identifier as their entry key and
+commit the canonical owner/principal and lifecycle encodings respectively.
 These are state component tags, a separate namespace from transaction kinds.
 Entries with distinct keys are iteration-order independent; conflicting duplicate
 keys are not an alternative canonical representation of the same state.
