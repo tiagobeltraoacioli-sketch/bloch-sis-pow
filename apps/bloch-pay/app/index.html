@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0b1510"><meta name="description" content="Prepare BLCH invoices, reconcile manual payment records and explore your outstanding balances in a private, local Bloch Pay workspace.">
+  <title>Bloch Pay — Workspace</title><link rel="icon" href="../assets/favicon.png"><link rel="manifest" href="manifest.webmanifest"><link rel="stylesheet" href="workspace.css?v=1"><script type="module" src="workspace.mjs?v=1"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to workspace</a>
+  <aside class="sidebar">
+    <a class="brand" href="../"><img src="../assets/bloch-inc-logo-dark.png" width="1380" height="260" alt="Bloch Inc"><span>PAY</span></a>
+    <p class="sidebar-label">YOUR WORKSPACE</p>
+    <nav aria-label="Workspace"><a href="#overview">Overview <span>01</span></a><a href="#invoices">Invoices <span>02</span></a><a href="#analytics">Analytics <span>03</span></a><a href="#records">Payment records <span>04</span></a><a href="#data">Data &amp; backups <span>05</span></a><a href="integrations">Integration studio ↗</a></nav>
+    <div class="sidebar-bottom"><span class="network-dot"></span> BLCH / Genesis-4<p>Local workspace · public preview</p><a href="https://posternlabs.com/apps/wallet/" target="_blank" rel="noopener noreferrer">Open Postern Wallet ↗</a><a href="https://blochl1.com/" target="_blank" rel="noopener noreferrer">Open Bloch Explorer ↗</a><a href="../#roadmap">Product roadmap ↗</a></div>
+  </aside>
+  <main id="main">
+    <header class="topbar"><span>OPERATIONS / BLOCH PAY</span><div><span id="connection">Online</span><button id="install" hidden>Install app ↓</button><button id="new-invoice" class="primary">+ New invoice</button></div></header>
+    <div class="notice" id="storage-notice" role="alert" hidden></div>
+    <div class="notice" id="update-notice" hidden>New app version available. <button id="update-app">Update app</button></div>
+    <section id="overview" class="section">
+      <div class="page-heading"><div><p class="eyebrow">YOUR NEXT MOVE, IN VIEW</p><h1>Every invoice.<br><em>A clearer picture.</em></h1></div><div class="workspace-status"><span>LOCAL RECORDS</span><strong id="invoice-count">0 invoices</strong><p>Stored in this browser.<br>Export a backup to keep a copy.</p></div></div>
+      <p class="boundary">Prepare and reconcile BLCH records here. Payment records are entered manually; matching an invoice does not verify a transfer or finality. Signing happens in your wallet.</p>
+      <div class="metrics" id="metrics" aria-label="Workspace totals"></div>
+      <div class="overview-bottom"><p id="summary-line"></p><span id="as-of"></span></div>
+    </section>
+    <section id="invoices" class="section">
+      <div class="section-heading"><div><p class="eyebrow">01 / RECEIVABLES + PAYABLES</p><h2>The invoice ledger</h2></div><span class="tag">BLCH · 8 DECIMALS</span></div>
+      <form class="filters" id="filters" role="search"><label>Search<input id="search" type="search" placeholder="Reference or counterparty" maxlength="120"></label><label>Direction<select id="direction"><option value="all">All directions</option><option value="receivable">Receivables</option><option value="payable">Payables</option></select></label><label>Record status<select id="status"><option value="all">All statuses</option><option value="open">Open</option><option value="partial">Partial</option><option value="matched">Matched</option><option value="over-recorded">Over-recorded</option><option value="overdue">Overdue</option><option value="void">Void</option></select></label><button type="reset">Reset filters</button></form>
+      <div id="ledger"></div><p class="small" id="filter-summary" aria-live="polite"></p>
+    </section>
+    <section id="analytics" class="section">
+      <div class="section-heading"><div><p class="eyebrow">02 / PLAN WITH YOUR RECORDS</p><h2>Outstanding, at a glance</h2></div><span class="tag">ALL ACTIVE INVOICES</span></div>
+      <div class="chart-grid"><article class="panel"><div class="panel-heading"><h3>Due schedule</h3><span>Today + 27 days</span></div><p>Outstanding amounts by due date; this is a schedule, not a prediction.</p><div class="legend"><span class="in">Receivable</span><span class="out">Payable</span></div><div id="schedule"></div></article><article class="panel"><div class="panel-heading"><h3>Aging</h3><span>Remaining BLCH</span></div><p>Receivables and payables grouped by days overdue.</p><div id="aging"></div></article></div>
+      <article class="panel counterparties"><div class="panel-heading"><h3>Counterparty exposure</h3><span>Top 8 by outstanding amount</span></div><div id="counterparties"></div></article>
+    </section>
+    <section id="records" class="section">
+      <div class="section-heading"><div><p class="eyebrow">03 / RECONCILIATION</p><h2>Payment records</h2></div><button id="new-receipt">+ Record payment</button></div>
+      <p class="section-description">Attach amounts and optional Explorer references to invoices. Partial matches and excess amounts remain visible. Transaction references are not independently verified.</p><div id="receipts"></div>
+    </section>
+    <section id="data" class="section">
+      <div class="section-heading"><div><p class="eyebrow">04 / YOUR DATA, PORTABLE</p><h2>Backups &amp; exports</h2></div><span class="tag" id="storage-status">BROWSER STORAGE</span></div>
+      <div class="data-grid"><article class="panel"><h3>Keep a complete copy</h3><p>JSON backups preserve invoices and payment records. Browser data is not encrypted by Bloch Pay and may be cleared by your browser. Use this on a trusted device.</p><div class="button-row"><button id="export-backup" class="primary">Export backup ↓</button><button id="import-backup">Import backup</button></div><input type="file" id="backup-file" accept=".json,application/json" hidden></article><article class="panel"><h3>Take records to your books</h3><p>Export amounts as exact decimal BLCH values. All totals and charts use your saved records; no wallet balance is inferred.</p><div class="button-row"><button id="export-invoices">Invoices CSV ↓</button><button id="export-receipts">Payment records CSV ↓</button></div></article></div>
+    </section>
+    <footer>Bloch Pay Workspace · local preview <span><a href="https://blochinc.xyz/">Bloch Inc ↗</a><a href="../">About Bloch Pay ↗</a></span></footer>
+  </main>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <dialog id="invoice-dialog"><form id="invoice-form"><div class="dialog-heading"><div><p class="eyebrow">PREPARE A BUSINESS RECORD</p><h2>New invoice</h2></div><button type="button" class="icon-button" data-close aria-label="Close invoice form">×</button></div><div class="form-grid"><label>Direction<select name="direction"><option value="receivable">Receivable · someone owes you</option><option value="payable">Payable · you owe someone</option></select></label><label>Invoice reference<input name="reference" required maxlength="60" placeholder="INV-2026-001"></label><label class="wide">Counterparty<input name="counterparty" required maxlength="120" placeholder="Organization or contact"></label><label>Amount in BLCH<input name="amount" required inputmode="decimal" placeholder="1250.00000001" maxlength="22"><small>Up to 8 decimal places. Use a decimal point.</small></label><label>Issue date<input name="issued" type="date" required min="2000-01-01" max="2099-12-31"></label><label>Due date<input name="due" type="date" required min="2000-01-01" max="2099-12-31"></label><label>Recipient reference · optional<input name="recipient" maxlength="160" placeholder="Address or internal account reference"><small>Saved as text; address format is not validated.</small></label><label class="wide">Note · optional<textarea name="note" maxlength="500" rows="2"></textarea></label></div><p class="form-error" role="alert"></p><div class="dialog-actions"><button type="button" data-close>Cancel</button><button class="primary" type="submit">Save invoice</button></div></form></dialog>
+  <dialog id="receipt-dialog"><form id="receipt-form"><div class="dialog-heading"><div><p class="eyebrow">MANUAL RECONCILIATION</p><h2>Record a payment</h2></div><button type="button" class="icon-button" data-close aria-label="Close payment form">×</button></div><p class="form-note">This records your observation. It does not query the chain, confirm a payment or verify finality.</p><div class="form-grid"><label class="wide">Invoice<select name="invoiceId" required></select></label><label>Record reference<input name="reference" required maxlength="80" placeholder="REC-2026-001"></label><label>Amount in BLCH<input name="amount" required inputmode="decimal" maxlength="22" placeholder="250"></label><label>Date received / paid<input name="date" type="date" required min="2000-01-01" max="2099-12-31"></label><label>Output index · optional<input name="output" type="number" min="0" max="4294967295" step="1" placeholder="0"></label><label class="wide">Consensus transaction ID · optional<input name="txid" maxlength="64" pattern="[a-fA-F0-9]{64}" placeholder="64 hexadecimal characters"></label><label class="wide">Block ID · required with a transaction ID<input name="blockId" maxlength="64" pattern="[a-fA-F0-9]{64}" placeholder="64 hexadecimal characters"><small>Provide all three fields to link a specific transaction output.</small></label><label class="wide">Note · optional<textarea name="note" maxlength="500" rows="2"></textarea></label></div><p class="form-error" role="alert"></p><div class="dialog-actions"><button type="button" data-close>Cancel</button><button class="primary" type="submit">Save payment record</button></div></form></dialog>
+  <dialog id="detail-dialog"><div class="dialog-heading"><h2>Invoice details</h2><button class="icon-button" data-close aria-label="Close details">×</button></div><div id="invoice-detail"></div><div class="dialog-actions"><button data-close>Close</button></div></dialog>
+  <dialog id="confirm-dialog"><div class="dialog-heading"><h2 id="confirm-title">Confirm change</h2><button class="icon-button" data-close aria-label="Cancel change">×</button></div><p id="confirm-copy"></p><p class="form-error" role="alert"></p><div class="dialog-actions"><button data-close>Cancel</button><button id="confirm-action" class="primary">Confirm</button></div></dialog>
+</body>
+</html>

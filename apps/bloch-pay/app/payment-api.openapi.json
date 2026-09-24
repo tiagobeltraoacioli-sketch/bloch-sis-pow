@@ -1,0 +1,420 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Bloch Pay Partner Integration API \u2014 Design",
+    "version": "0.1.0-design",
+    "description": "PROPOSED CONTRACT ONLY. No API endpoint or partner rail is deployed. Bloch Pay coordinates instructions and reconciliation; the responsible partner supplies settlement and beneficiary-credit evidence. The local integration-draft export is a planning artifact, not a PaymentIntent request. Adapters must enforce authorization, signatures, replay windows and supported currency/rail mappings before execution."
+  },
+  "servers": [],
+  "paths": {
+    "/v1/payment-intents": {
+      "post": {
+        "summary": "Proposed: create a partner-scoped payment intent",
+        "operationId": "createPaymentIntent",
+        "security": [
+          {
+            "PartnerToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 16,
+              "maxLength": 128
+            },
+            "description": "Scoped to the authenticated partner. Reusing a key with another payload returns 409."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PaymentIntentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Intent created; no settlement is implied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentIntent"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request or inconsistent currency, scale or rail."
+          },
+          "401": {
+            "description": "Missing or invalid authentication."
+          },
+          "403": {
+            "description": "Partner or corridor not authorized."
+          },
+          "409": {
+            "description": "Idempotency key conflicts with an earlier payload."
+          },
+          "422": {
+            "description": "Missing funding, quote, participant eligibility or required information."
+          }
+        }
+      }
+    },
+    "/v1/payment-intents/{id}": {
+      "get": {
+        "summary": "Proposed: read intent and independent settlement legs",
+        "operationId": "getPaymentIntent",
+        "security": [
+          {
+            "PartnerToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authorized intent state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentIntent"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required."
+          },
+          "404": {
+            "description": "No accessible intent."
+          }
+        }
+      }
+    },
+    "/v1/partner-events": {
+      "post": {
+        "summary": "Proposed: ingest a signed, replay-protected partner event",
+        "operationId": "recordPartnerEvent",
+        "description": "Authenticate the partner, verify the signature over the raw request body and timestamp, enforce the replay window and intent ownership, and reject conflicting event IDs before state changes. Webhook authentication and adapters are not implemented in this preview. Settlement and credit events do not prevent later returns.",
+        "security": [
+          {
+            "PartnerToken": [],
+            "EventSignature": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "X-Event-Timestamp",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PartnerEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Event validated and queued; financial completion is not implied."
+          },
+          "401": {
+            "description": "Invalid authentication, signature or timestamp."
+          },
+          "403": {
+            "description": "Partner cannot update this intent."
+          },
+          "409": {
+            "description": "Event identifier conflict or invalid state transition."
+          },
+          "422": {
+            "description": "Event evidence is incomplete or inconsistent."
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "PartnerToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Proposed server-issued, partner-scoped token; never collected by the browser planner."
+      },
+      "EventSignature": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Event-Signature",
+        "description": "Algorithm, key identifiers, raw-body signing and replay policy to be agreed in the adapter contract."
+      }
+    },
+    "schemas": {
+      "Leg": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "partner_reference",
+          "partner_role",
+          "rail",
+          "currency",
+          "decimals",
+          "amount_minor"
+        ],
+        "properties": {
+          "partner_reference": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 80
+          },
+          "partner_role": {
+            "type": "string",
+            "enum": [
+              "bank",
+              "psp",
+              "vasp",
+              "psav",
+              "custodian",
+              "fx",
+              "liquidity",
+              "infrastructure"
+            ]
+          },
+          "rail": {
+            "type": "string",
+            "enum": [
+              "pix",
+              "sepa",
+              "sepa_instant",
+              "ach",
+              "blch",
+              "other"
+            ]
+          },
+          "currency": {
+            "type": "string",
+            "enum": [
+              "BRL",
+              "EUR",
+              "USD",
+              "GBP",
+              "CHF",
+              "CAD",
+              "AUD",
+              "MXN",
+              "JPY",
+              "BLCH"
+            ]
+          },
+          "decimals": {
+            "type": "integer",
+            "enum": [
+              0,
+              2,
+              8
+            ]
+          },
+          "amount_minor": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]{0,19}$",
+            "description": "Exact positive integer in the explicitly declared currency minor units."
+          },
+          "settlement_partner_reference": {
+            "type": "string"
+          }
+        },
+        "description": "The server must validate rail/currency compatibility, currency scale, participant permissions, funding and supported corridor. Non-bank participants access fiat rails through qualified institutions."
+      },
+      "PaymentIntentRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "payment_reference",
+          "source",
+          "destination"
+        ],
+        "properties": {
+          "payment_reference": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 80
+          },
+          "source": {
+            "$ref": "#/components/schemas/Leg"
+          },
+          "destination": {
+            "$ref": "#/components/schemas/Leg"
+          },
+          "partner_quote_reference": {
+            "type": "string"
+          }
+        },
+        "description": "Different currencies require a current partner quote. Amounts and fees are explicitly agreed; no conversion rate is inferred."
+      },
+      "PaymentIntent": {
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "source_status",
+          "destination_status",
+          "beneficiary_credit",
+          "return_status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "created",
+              "awaiting_review",
+              "ready",
+              "processing",
+              "completed",
+              "failed",
+              "returned"
+            ]
+          },
+          "source_status": {
+            "$ref": "#/components/schemas/LegStatus"
+          },
+          "destination_status": {
+            "$ref": "#/components/schemas/LegStatus"
+          },
+          "beneficiary_credit": {
+            "type": "string",
+            "enum": [
+              "not_observed",
+              "partner_reported_credited"
+            ]
+          },
+          "return_status": {
+            "type": "string",
+            "enum": [
+              "not_observed",
+              "pending",
+              "returned"
+            ]
+          }
+        }
+      },
+      "LegStatus": {
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "not_observed",
+              "accepted",
+              "submitted",
+              "partner_reported_settled",
+              "failed",
+              "returned"
+            ]
+          },
+          "partner_event_id": {
+            "type": "string"
+          },
+          "rail_reference": {
+            "type": "string"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "PartnerEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "event_id",
+          "intent_id",
+          "leg",
+          "type",
+          "occurred_at",
+          "partner_reference",
+          "evidence_reference"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 80
+          },
+          "intent_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "leg": {
+            "type": "string",
+            "enum": [
+              "source",
+              "destination"
+            ]
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "accepted",
+              "submitted",
+              "settled",
+              "credited",
+              "failed",
+              "returned"
+            ]
+          },
+          "occurred_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "partner_reference": {
+            "type": "string"
+          },
+          "evidence_reference": {
+            "type": "string"
+          },
+          "amount_minor": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]{0,19}$",
+            "description": "Exact positive integer in the explicitly declared currency minor units."
+          },
+          "currency": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
