@@ -19,7 +19,7 @@ The register is non-exhaustive; applicable requirements must be added and review
 | Case retention | Single plaintext case with original CSVs, evidence, complete journal, configuration and local receipt; bounded manifest/component verification and recomputation on reopening | Approve storage, encryption, recipients and access; retain independent digests or signed checkpoints; enforce retention and protect against rollback |
 | Snapshot comparison | Verify two compatible cases; compare exact normalized record multisets and per-key review histories; retain both case digests and originals | Align source roles, cutoffs and dataset scope; establish chronology and authority; approve corrections and review continuity separately |
 | Access | No hosted private account store or multi-tenant service | SSO/MFA, role separation, authorized exports, tenant isolation and reviewer signatures |
-| Retention | No application persistence; manual Clear | Encryption, key custody, legal holds, retention schedules, rights handling and verifiable disposal |
+| Retention | No application persistence; manual Clear; optional password-encrypted copy of a complete audit bundle | Institutional key custody, recipient access, legal holds, retention schedules, recovery, rights handling and verifiable disposal |
 | Cross-border data | No application transfer of source files | Validate residence, recipients, transfer mechanisms and lawful hosting |
 | Incident/continuity | No operational claim | Monitoring, incident register/reporting, response, backup, recovery and testing |
 | On-chain | Publication and signing absent; imported receipts compared as observations | Reviewed hiding commitment, approval, signer, payload support, inclusion/canonicality/finality verification |
@@ -180,3 +180,37 @@ Opening resumes the exact case and review journal; subsequent edits in the
 workbench do not rewrite the retained bundle. Updated work requires a newly
 exported case and bundle. The synthetic example and UI state identify data mode;
 that mode remains a declaration, not evidence of institutional provenance.
+
+## Password-encrypted copy boundary (v9)
+
+The optional encrypted envelope protects a retained complete audit bundle using
+native Web Crypto AES-256-GCM. Creation first verifies the plaintext bundle;
+unlocking authenticates decryption and then verifies all inner components and
+relationships again. The exact original bundle/case/evidence/review bytes remain
+unchanged. Unencrypted exports remain explicitly labelled and available.
+
+PBKDF2-HMAC-SHA256 derives the nonextractable AES key with 600,000 iterations and
+a fresh 32-byte random salt. Each export also has a fresh 12-byte random IV and
+128-bit tag. Header fields are authenticated; private names, module, source data,
+review notes and plaintext hashes are encrypted. Format and ciphertext length
+remain observable. See the [README](README.md#encrypted-format-and-independent-implementation)
+for the complete wire format and official technical references. Algorithm choices
+are not a claim of FIPS validation or certified institutional security.
+
+The user controls the password and its custody; there is no reset, escrow or
+server-side recovery. A retained file permits offline guessing, so password
+strength matters. Possession of the password allows decryption and replacement;
+authenticated encryption does not identify an institution or reviewer, attest
+source truth/completeness, prevent rollback or prove authorized data exclusion.
+Optional independently retained ciphertext/plaintext digests identify exact
+copies, not their authority or chronology. Institutional identity, recipient
+access, revocation, signatures, managed keys and recovery remain external controls.
+
+Passwords and keys are not persisted by application code. Password fields clear
+on attempts, and input changes/clear/lock invalidate stale asynchronous results.
+Unlocking exposes plaintext in local browser memory. Lock clears only its own
+workspace; cases opened elsewhere and downloads persist independently. Buffer
+zeroing is best effort, not a secure-erasure guarantee for browser memory. The
+feature does not protect against a compromised browser/device or eliminate
+original/plaintext copies, legal retention duties or approved storage controls.
+No chain publication or regulatory certification is added.

@@ -3,6 +3,7 @@ import {readFile,stat} from 'node:fs/promises';
 import {resolve,extname} from 'node:path';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
+import {verifyEncryption} from './verify-bloch-data-encryption.mjs';
 import {fileURLToPath} from 'node:url';
 import {defaultConfig} from '../apps/bloch-data/assets/modules.v1.mjs';
 import {samplesFor} from '../apps/bloch-data/assets/samples.v1.mjs';
@@ -330,20 +331,22 @@ try {
   await page.setInputFiles('#ab-input',{name:'restored.bundle.json',mimeType:'application/json',buffer:Buffer.from(abText)});
   await page.evaluate(()=>{window.abOriginalRead=File.prototype.arrayBuffer;window.abReleases=[];File.prototype.arrayBuffer=function(){return new Promise(resolve=>{window.abReleases.push(()=>resolve(window.abOriginalRead.call(this)));});};});await page.click('#ab-verify');await page.waitForFunction(()=>window.abReleases.length===1);await page.click('#ab-clear');await page.evaluate(()=>{File.prototype.arrayBuffer=window.abOriginalRead;for(const release of window.abReleases)release();});assert.equal(await page.locator('#ab-results').isVisible(),false);assert.equal(await page.inputValue('#ab-input'),'');assert.equal(await page.locator('#ab-graph').innerText(),'');assert.equal(await page.locator('#ab-detail').innerText(),'');assert.equal(await page.locator('#ab-component-rows').innerText(),'');
   assert.equal(requests.length,baseline,'Audit bundle processing triggered network requests');
+  await verifyEncryption({page,context,text:abText,digest:abDigest,evidenceDigest:pvEvidence.digest});
+  assert.equal(requests.length,baseline,'Encrypted bundle processing triggered network requests');
 
 
 
   await context.setOffline(false);
-  for(const path of [process.env.VERIFY_DIR?'README.md':'downloads/bloch-data-local-workbench-v8.zip','GOVERNANCE.md','regulatory-register.v1.json','samples/venue.csv'])assert.equal((await context.request.get(new URL(path,target).href)).status(),200,path);
+  for(const path of [process.env.VERIFY_DIR?'README.md':'downloads/bloch-data-local-workbench-v9.zip','GOVERNANCE.md','regulatory-register.v1.json','samples/venue.csv'])assert.equal((await context.request.get(new URL(path,target).href)).status(),200,path);
   if(!process.env.VERIFY_DIR){
-    const packagePath='downloads/bloch-data-local-workbench-v8.zip';
+    const packagePath='downloads/bloch-data-local-workbench-v9.zip';
     const packageResponse=await context.request.get(new URL(packagePath,target).href),packageBytes=await packageResponse.body();
     assert.equal(packageBytes.subarray(0,4).toString('hex'),'504b0304','Offline download must be a ZIP, not an HTML fallback');
     const hashResponse=await context.request.get(new URL(packagePath+'.sha256',target).href);
     assert.equal(hashResponse.status(),200);const advertised=(await hashResponse.text()).trim().split(/\s+/);
     assert.equal(advertised[0],createHash('sha256').update(packageBytes).digest('hex'),'Offline ZIP must match its published SHA-256');
-    assert.equal(advertised[1],'bloch-data-local-workbench-v8.zip');
+    assert.equal(advertised[1],'bloch-data-local-workbench-v9.zip');
   }
   assert.deepEqual(errors,[]);
-  console.log(JSON.stringify({url:target,modules:4,regionalProfiles:7,layout,localUploads:'no network requests',exports:'digest verified',auditBundles:'exact retained case and originals, full linkage, review resume, immutable snapshot, extraction, pins, tampering, XSS and cancellation',preparationVerification:'exact originals, reproduced CSVs, lineage graph, evidence binding, retained digests, exports, offline, XSS and cancellation',sourcePreparation:'independent formats, exclusions, lineage, exact digests, machine CSV, prepared evidence, malformed UTF-8 and cancellation',caseComparison:'offline example, transition filters, full exports, retained digests, case resume, tampering and cancellation',caseFiles:'six exact components, offline round-trip, retained digest, mutation and cancellation checked',queue:'search, chart filters, full 125-key export, page reset, journal binding',reviews:'bound journal, unchanged outcomes, resume verified report',verification:'offline recomputation, pin and tampering checked',malformedFiles:'fail closed',offline:'passed',xss:'text only',errors}));
+  console.log(JSON.stringify({url:target,modules:4,regionalProfiles:7,layout,localUploads:'no network requests',exports:'digest verified',encryptedBundles:'independent cipher interoperability, generated passwords, exact retained review, private metadata, pins, tampering, cancellation, plaintext opt-in, lock scope and no persistence',auditBundles:'exact retained case and originals, full linkage, review resume, immutable snapshot, extraction, pins, tampering, XSS and cancellation',preparationVerification:'exact originals, reproduced CSVs, lineage graph, evidence binding, retained digests, exports, offline, XSS and cancellation',sourcePreparation:'independent formats, exclusions, lineage, exact digests, machine CSV, prepared evidence, malformed UTF-8 and cancellation',caseComparison:'offline example, transition filters, full exports, retained digests, case resume, tampering and cancellation',caseFiles:'six exact components, offline round-trip, retained digest, mutation and cancellation checked',queue:'search, chart filters, full 125-key export, page reset, journal binding',reviews:'bound journal, unchanged outcomes, resume verified report',verification:'offline recomputation, pin and tampering checked',malformedFiles:'fail closed',offline:'passed',xss:'text only',errors}));
 }finally{await browser.close();server.close();}

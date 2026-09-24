@@ -120,6 +120,89 @@ data mode remain declarations. Source identity/completeness, authorization,
 rollback protection, audit signatures, regulatory certification and on-chain
 inclusion remain outside this verifier's guarantees.
 
+## Password-protected audit bundles (v9)
+
+The `#encrypted-bundle` workspace protects an optional copy of a complete audit
+bundle. Copy the snapshot prepared above or select a retained plaintext bundle,
+optionally supply its independent SHA-256, and choose and confirm a unique
+password. The entire bundle must verify before encryption. Download the encrypted
+JSON and, optionally, its SHA-256 sidecar. Keep the password separately in an
+approved password manager. **There is no password reset or recovery.** Originals,
+previous exports and other workspaces are not erased or encrypted by this action.
+
+Use 16–256 Unicode code points, with no control characters or whitespace-only
+password. Input is exact UTF-8: no trimming, case folding or normalization. A
+length requirement does not establish password strength. The optional generator
+uses 24 random bytes (192 bits), represented by 32 base64url characters. Save the
+password before submitting; password fields are immediately cleared and remasked
+on each attempt. The app does not persist passwords or keys. Browser/password
+manager behavior and device compromise remain outside these guarantees.
+
+To reopen, select the encrypted JSON and enter its password. Optional independent
+references can pin the encrypted file and/or the exact plaintext bundle. The
+app authenticates decryption and then runs full bundle verification, including
+all original/prepared bindings, the retained case, outcomes and review history.
+A valid authentication tag alone is not enough to open a case. No file is
+extracted automatically. Explicit actions download the exact **plaintext** bundle
+or resume its case, preserving the original report bytes and review journal.
+
+Lock discards this unlock workspace and invalidates pending operations. A case
+already opened in the main workbench, other verifier panels and downloaded files
+remain separate. Clear those panels separately. Byte buffers are zeroed where
+practical and derived keys are nonextractable, but JavaScript strings, browser
+copies and memory cannot be guaranteed securely wiped. Unlocking necessarily
+makes plaintext available in the local browser. Use an approved, controlled device.
+
+### Encrypted format and independent implementation
+
+`bloch.data.encrypted-audit-bundle.v1` is strict UTF-8 JSON, serialized with
+`JSON.stringify(value, null, 2) + "\n"`. Its fixed ordered fields are:
+
+1. `schema`: `bloch.data.encrypted-audit-bundle.v1`.
+2. `content_type`: `bloch.data.audit-bundle.v1`.
+3. `encoding`: `base64`.
+4. `kdf`: ordered `name: PBKDF2`, `hash: SHA-256`, `iterations: 600000`, `salt`.
+5. `cipher`: ordered `name: AES-GCM`, `key_bits: 256`, `iv`, `tag_bits: 128`.
+6. `ciphertext`: encrypted payload followed by the 16-byte authentication tag.
+
+Salt (32 bytes), IV (12 bytes) and ciphertext use canonical standard base64 with
+padding. Generate a fresh random salt and IV on every encryption. Derive a
+32-byte AES key using PBKDF2-HMAC-SHA256 over the exact UTF-8 password and salt.
+The AES-GCM additional authenticated data is the exact serialization of the
+first five fields, **excluding ciphertext**, with two-space indentation and a
+trailing newline. Encrypt the original bundle UTF-8 bytes unchanged; no compressed
+or independently reconstructed representation is accepted. The inner plaintext
+bundle's existing `assurance.encryption: none` correctly describes that unchanged
+inner format; the new wrapper supplies encryption for the retained outer file.
+
+The header includes no source names, module, mode, local timestamp, review notes
+or plaintext hashes. Format/algorithm parameters and encrypted length remain
+visible. Inputs are capped at 96 MiB plaintext and 129 MiB encrypted JSON; the
+ciphertext byte limit is 96 MiB plus the 16-byte tag. Unknown fields, parameter
+changes, wrong field order, malformed/noncanonical encodings and oversized inputs
+fail closed. This version does not negotiate weaker or arbitrarily expensive
+cryptographic parameters. Its SHA-256 sidecar identifies the encrypted file,
+not its plaintext; encryption is intentionally nondeterministic.
+
+The implementation uses native [Web Crypto](https://www.w3.org/TR/webcrypto/).
+PBKDF2 was selected for native browser support without third-party code; its
+600,000-round SHA-256 work factor follows the
+[OWASP PBKDF2 guidance](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#pbkdf2).
+OWASP generally prefers Argon2id for password storage; this release does not ship
+an Argon2 implementation. AES-GCM uses the recommended 96-bit IV and an explicit
+128-bit tag; see [AES-GCM parameters](https://developer.mozilla.org/en-US/docs/Web/API/AesGcmParams).
+These choices do not establish FIPS validation, an independent security audit
+or regulatory certification. Tests include independent Node cipher API
+interoperability in both directions, tampering and complete inner verification.
+
+An attacker with a copy can attempt offline password guessing. Anyone with the
+password can decrypt or encrypt a replacement, and an older valid file can be
+replayed. Independent retained hashes can identify a specific copy but do not
+authenticate its source or prove it is current. This feature is not institutional
+key custody, recipient access control, revocation, SSO, signatures, legal hold,
+retention enforcement, recovery or on-chain verification. Integrate and qualify
+those controls separately; do not publish private files or their raw hashes.
+
 ## Complete audit bundles (v8)
 
 `#audit-bundle` retains the complete source-preparation path and reviewed case in
@@ -143,7 +226,8 @@ CSVs are retained inside the case rather than duplicated as outer components.
 The package is JSON with embedded UTF-8 text, not a ZIP. Nothing is executed or
 automatically extracted. It includes private original columns excluded from
 prepared output, records and review notes in **plaintext**. It is not encrypted
-or signed; institutional storage/access/retention controls remain necessary.
+or signed; the v9 encrypted envelope below protects an optional retained copy.
+Institutional storage/access/retention controls remain necessary.
 The complete serialized bundle is capped at 96 MiB, including JSON escaping.
 Individual input maxima do not guarantee that their combination fits this bound.
 
@@ -400,7 +484,7 @@ the final newline. Reformatting, duplicate keys and ambiguous JSON are rejected.
 Limits: 24 MiB evidence JSON, 8 MiB review JSON, 2 MiB per CSV, 120 characters for
 reviewer labels and 2,000 for notes. All inputs must be valid UTF-8. Malformed or
 changed files invalidate prior verification results. The original v1 evidence
-schema and comparison rules remain supported; the browser interface is v8.
+schema and comparison rules remain supported; the browser interface is v9.
 
 Without a separately retained report digest, verification establishes internal
 consistency only. A coherent replacement of the evidence and both sources can
@@ -433,7 +517,7 @@ prototype, and their guarantees are not attributed to it.
 
 ## Run locally / offline
 
-Unzip `downloads/bloch-data-local-workbench-v8.zip` into an approved directory.
+Unzip `downloads/bloch-data-local-workbench-v9.zip` into an approved directory.
 Start a localhost-only server from that directory:
 
 ```sh
@@ -452,7 +536,7 @@ configuration by the two example download controls.
 ## Build, test and deploy (repository)
 
 ```sh
-node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs scripts/test-bloch-data-case.mjs scripts/test-bloch-data-diff.mjs scripts/test-bloch-data-preparation.mjs scripts/test-bloch-data-preparation-verification.mjs scripts/test-bloch-data-audit-bundle.mjs
+node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs scripts/test-bloch-data-case.mjs scripts/test-bloch-data-diff.mjs scripts/test-bloch-data-preparation.mjs scripts/test-bloch-data-preparation-verification.mjs scripts/test-bloch-data-audit-bundle.mjs scripts/test-bloch-data-encryption.mjs
 python3 scripts/build-bloch-data.py
 node scripts/verify-bloch-data.mjs
 wrangler pages deploy apps/bloch-data --project-name bloch-data --branch main
@@ -468,7 +552,7 @@ outside the public static directory. Serve the provided `_headers` on production
 
 `assets/modules.v1.mjs` defines schemas, keys, field types, institution defaults,
 and regional profiles. `reconcile.v1.mjs` provides strict parsing and comparison;
-`samples.v1.mjs` supplies labelled fixtures; `workbench.v8.mjs` renders local state.
+`samples.v1.mjs` supplies labelled fixtures; `workbench.v9.mjs` renders local state.
 `audit.v1.mjs` validates/recomputes evidence and journals; `verification.v1.mjs`
 handles the separate verifier session. `queue.v1.mjs` provides the local search
 index, selection/sort rules, chart summaries and filtered CSV export. These are
@@ -486,8 +570,11 @@ evidence linkage; `preparation-verifier-workbench.v1.mjs` renders its independen
 session and path graph. `preparation-samples.v1.mjs` generates synthetic originals,
 preparation and evidence for the verifier example.
 `audit-bundle.v1.mjs` packages and verifies the complete retained path;
-`audit-bundle-workbench.v1.mjs` manages separate builder/verifier sessions and
+`audit-bundle-workbench.v2.mjs` manages separate builder/verifier sessions and
 `audit-bundle-samples.v1.mjs` supplies the labelled example.
+`encrypted-bundle.v1.mjs` validates the fixed authenticated-encryption format and
+verifies the plaintext bundle; `encrypted-bundle-workbench.v1.mjs` handles separate
+encryption/unlock state and explicit downloads. No cryptographic library is shipped.
 Versioned static asset URLs keep existing
 immutable caches isolated from the updated interface.
 Add a reviewed schema and key definition to the module registry, add independent
@@ -495,6 +582,7 @@ fixtures and tests, then version the rules and assets. Preserve exact source
 bytes, duplicate detection, no hidden tolerances and explicit assurance limits.
 
 Future institution adapters cover authenticated extract contracts, calendars,
-cutoff alignment, identity and review workflows, encryption/retention, regulatory
+cutoff alignment, identity and review workflows, institutional key custody and
+retention enforcement, regulatory
 filings and approved Bloch publication. No live exchange, bank, B3, Pix, STR,
 Open Finance, SPEI or regulator connection is claimed.
