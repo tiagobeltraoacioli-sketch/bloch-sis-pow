@@ -22,8 +22,7 @@ No currency conversion, netting, fuzzy matching or partial fills are inferred.
 A duplicate key always requires review. The screen paginates 50 keys at a time;
 exports retain every result and source row/value. Blank-line source row numbers
 are preserved. Per-key source previews show at most 20 rows per side; the JSON
-retains every duplicate source record. Physical source row numbers
-are preserved. Maximum per source: 2 MiB and 5,000 records.
+retains every duplicate source record. Maximum per source: 2 MiB and 5,000 records.
 
 ## Global and LatAm configuration
 
@@ -60,6 +59,8 @@ and HTML. User records are held in browser memory; Clear discards page state,
 but does not securely erase memory or delete downloads. Use an institution-
 controlled browser/device and approved encrypted storage for exported records.
 The web host receives ordinary page/asset requests, not imported file contents.
+The deployed `Cache-Control: no-transform` directive prevents Cloudflare's
+automatic Web Analytics beacon injection. Browser QA checks for external assets.
 The hosted page is not a substitute for an approved institutional deployment.
 
 The Bloch receipt module is read-only and offline. No signer, key collection,

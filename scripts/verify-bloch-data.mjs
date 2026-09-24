@@ -24,7 +24,7 @@ try {
   assert.equal(await page.locator('#metric-review').innerText(),'5');
   assert.equal(await page.locator('#module-select option').count(),4);
   assert.equal(await page.locator('#region-select option').count(),7);
-  assert.ok(requests.every(url=>url.startsWith(new URL(target).origin+'/')),'Unexpected external asset request');
+  assert.ok(requests.every(url=>url.startsWith(new URL(target).origin+'/')),'Unexpected external asset request: '+requests.filter(url=>!url.startsWith(new URL(target).origin+'/')).join(', '));
   assert.equal(await page.evaluate(()=>localStorage.length),0);
   const ids=await page.locator('[id]').evaluateAll(els=>els.map(el=>el.id));assert.equal(new Set(ids).size,ids.length);
   assert.deepEqual(await page.locator('a[href^="#"]').evaluateAll(els=>els.map(el=>el.getAttribute('href').slice(1)).filter(id=>id&&!document.getElementById(id))),[]);
