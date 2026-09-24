@@ -1,3 +1,4 @@
+import {setupPwa} from './pwa.mjs';
 import {emptyWorkspace,readBackup,validateWorkspace,parseAmount,formatAmount,localDate,invoiceSummary,analytics,chartPercent,invoicesCSV,receiptsCSV,storeWorkspace,STORAGE_KEY} from './model.mjs';
 const $=selector=>document.querySelector(selector);
 const escape=value=>String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -70,8 +71,5 @@ $('#backup-file').addEventListener('change',async event=>{const file=event.targe
 window.addEventListener('storage',event=>{if(event.key===STORAGE_KEY||event.key===null){$('#storage-notice').hidden=false;$('#storage-notice').textContent='This workspace changed in another tab. Reload this page before making changes.';}});
 function connection(){ $('#connection').textContent=navigator.onLine?'Online':'Offline · local mode'; }
 window.addEventListener('online',connection);window.addEventListener('offline',connection);connection();render();
-let deferredInstall;
-window.addEventListener('beforeinstallprompt',event=>{event.preventDefault();deferredInstall=event;$('#install').hidden=false;});
-$('#install').addEventListener('click',async()=>{if(!deferredInstall)return;await deferredInstall.prompt();deferredInstall=null;$('#install').hidden=true;});
-if('serviceWorker' in navigator){navigator.serviceWorker.register('./sw.js',{scope:'./',updateViaCache:'none'}).then(reg=>{const show=()=>{if(reg.waiting&&navigator.serviceWorker.controller){$('#update-notice').hidden=false;$('#update-app').onclick=()=>{if(document.querySelector('dialog[open]'))return notify('Close the open form before updating.');reg.waiting.postMessage({type:'ACTIVATE'});};}};show();reg.addEventListener('updatefound',()=>reg.installing?.addEventListener('statechange',show));}).catch(()=>notify('Offline installation is unavailable in this browser.'));let reloading=false;navigator.serviceWorker.addEventListener('controllerchange',()=>{if(!reloading){reloading=true;location.reload();}});}
+setupPwa({notify});
 setInterval(()=>{if($('#as-of').textContent.split(' · ')[0]!==`As of ${localDate()}`)render();},60000);

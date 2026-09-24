@@ -1,0 +1,34 @@
+// Verify real service-worker upgrades on one origin, using an earlier staged release.
+import assert from 'node:assert/strict';
+import {createServer} from 'node:http';
+import {readFile,writeFile,mkdir} from 'node:fs/promises';
+import {resolve,dirname,extname} from 'node:path';
+import {fileURLToPath} from 'node:url';
+const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
+const previous=process.env.PAY_PREVIOUS_RELEASE;if(!previous)throw new Error('Set PAY_PREVIOUS_RELEASE to the staged v1 release directory.');
+const current=resolve(dirname(fileURLToPath(import.meta.url)),'..');
+let release=previous,testUpdate=false;
+const server=createServer(async(req,res)=>{try{let path=new URL(req.url,'http://localhost').pathname;if(path.endsWith('/'))path+='index.html';else if(!extname(path))path+='.html';const file=resolve(release,'.'+path);assert(file.startsWith(release+'/'));let data=await readFile(file);if(testUpdate&&path==='/app/sw.js')data=Buffer.from(data.toString().replace("const CACHE='bloch-pay-shell-v2'","const CACHE='bloch-pay-shell-v2-update-test'"));res.setHeader('Content-Type',({'.html':'text/html','.mjs':'application/javascript','.js':'application/javascript','.css':'text/css','.webmanifest':'application/manifest+json','.json':'application/json','.png':'image/png','.svg':'image/svg+xml'})[extname(file)]||'application/octet-stream');res.end(data);}catch(error){console.error('Request failed:',req.url,error.message);res.writeHead(404);res.end();}});
+await new Promise(done=>server.listen(0,'127.0.0.1',done));const base=`http://127.0.0.1:${server.address().port}`;
+const browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
+const context=await browser.newContext();const page=await context.newPage();
+page.setDefaultTimeout(30000);
+page.on('pageerror',error=>console.error('Browser error:',error.message));
+context.on('serviceworker',worker=>console.log('Worker started:',worker.url()));
+context.on('console',message=>{if(message.type()==='error')console.error('Console error:',message.text());});
+async function waitWorker(target,field){for(let attempt=0;attempt<300;attempt++){const state=await target.evaluate(async key=>(await navigator.serviceWorker.getRegistration())?.[key]?.state,field);if(attempt%50===0)console.log('Waiting for',field,'current state:',state);if(state===(field==='active'?'activated':'installed'))return;await new Promise(done=>setTimeout(done,100));}throw new Error('Service worker did not reach '+field);}
+try{
+  console.log('Loading previous release and creating preservation record.');
+  await page.goto(base+'/app/',{waitUntil:'networkidle'});await page.locator('#new-invoice').click();const form=page.locator('#invoice-form');for(const[key,value]of Object.entries({reference:'PRESERVE-001',counterparty:'Upgrade record',amount:'27000000000.00000001'}))await form.locator(`[name=${key}]`).fill(value);await form.getByRole('button',{name:'Save invoice',exact:true}).click();await page.locator('#invoice-dialog').waitFor({state:'hidden'});
+  await waitWorker(page,'active');await page.goto(base+'/app/',{waitUntil:'networkidle'});assert(await page.evaluate(()=>Boolean(navigator.serviceWorker.controller)));const saved=await page.evaluate(()=>localStorage.getItem('bloch-pay-workspace-v1'));
+  console.log('Installing current release over v1.');
+  release=current;await page.evaluate(async()=>{const reg=await navigator.serviceWorker.getRegistration();await reg.update();});await waitWorker(page,'waiting');await page.locator('#update-app').click();await page.waitForFunction(()=>document.querySelector('script[src="workspace.mjs?v=2"]'));assert.equal(await page.evaluate(()=>localStorage.getItem('bloch-pay-workspace-v1')),saved);assert.equal(await page.locator('.metric strong').first().innerText(),'27,000,000,000.00000001');
+  const cachesAfter=await page.evaluate(()=>caches.keys());assert(cachesAfter.includes('bloch-pay-shell-v2'));assert(!cachesAfter.includes('bloch-pay-shell-v1'));
+  console.log('Checking cross-tab update with an unsaved form.');
+  await page.goto(base+'/app/integrations',{waitUntil:'networkidle'});assert.equal(await page.locator('#partner-form').count(),1);await page.locator('#route-form [name=reference]').fill('unsaved-draft-001');
+  const other=await context.newPage();await other.goto(base+'/app/',{waitUntil:'networkidle'});testUpdate=true;await other.evaluate(async()=>{const reg=await navigator.serviceWorker.getRegistration();await reg.update();});await waitWorker(other,'waiting');await other.locator('#update-app').click();await page.waitForFunction(()=>document.querySelector('#update-app').textContent==='Reload app');assert.equal(await page.locator('#route-form [name=reference]').inputValue(),'unsaved-draft-001');
+  await page.locator('#update-app').click();assert.equal(await page.locator('#route-form [name=reference]').inputValue(),'unsaved-draft-001');assert((await page.locator('#route-toast').innerText()).includes('Finish or close'));
+  await page.locator('#route-form button[type=reset]').click();await page.waitForFunction(()=>document.querySelector('#route-form [name=reference]').value==='');await page.locator('#update-app').click();await page.waitForFunction(()=>document.querySelector('#update-notice').hidden);assert.equal(await page.evaluate(()=>localStorage.getItem('bloch-pay-workspace-v1')),saved);
+  await context.setOffline(true);await page.reload({waitUntil:'networkidle'});assert.equal(await page.locator('#partner-form').count(),1);await page.goto(base+'/app/',{waitUntil:'networkidle'});assert.equal(await page.locator('.metric strong').first().innerText(),'27,000,000,000.00000001');
+  const report={result:'PASS',checks:['v1 → v2 upgrade preserves exact invoice storage','Old shell removed only after complete update','New directory available after upgrade','Cross-tab activation preserves unsaved route form','Explicit reload waits for user to finish changes','Upgraded app and invoices work offline']};const out=process.env.PAY_ARTIFACTS||'/private/tmp/bloch-pay-upgrade';await mkdir(out,{recursive:true});await writeFile(out+'/upgrade-verification.json',JSON.stringify(report,null,2));console.log(JSON.stringify(report));
+}finally{await browser.close();server.closeAllConnections();await new Promise(done=>server.close(done));}

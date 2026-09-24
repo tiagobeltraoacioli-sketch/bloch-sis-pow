@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#0b1510"><meta name="description" content="Prepare BLCH invoices, reconcile manual payment records and explore your outstanding balances in a private, local Bloch Pay workspace.">
-  <title>Bloch Pay — Workspace</title><link rel="icon" href="../assets/favicon.png"><link rel="manifest" href="manifest.webmanifest"><link rel="stylesheet" href="workspace.css?v=1"><script type="module" src="workspace.mjs?v=1"></script>
+  <title>Bloch Pay — Workspace</title><link rel="icon" href="../assets/favicon.png"><link rel="manifest" href="manifest.webmanifest"><link rel="stylesheet" href="workspace.css?v=1"><script type="module" src="workspace.mjs?v=2"></script>
 </head>
 <body>
   <a class="skip" href="#main">Skip to workspace</a>
@@ -16,7 +16,7 @@
   <main id="main">
     <header class="topbar"><span>OPERATIONS / BLOCH PAY</span><div><span id="connection">Online</span><button id="install" hidden>Install app ↓</button><button id="new-invoice" class="primary">+ New invoice</button></div></header>
     <div class="notice" id="storage-notice" role="alert" hidden></div>
-    <div class="notice" id="update-notice" hidden>New app version available. <button id="update-app">Update app</button></div>
+    <div class="notice" id="update-notice" hidden><span id="update-copy">New app version available.</span> <button id="update-app">Update app</button></div>
     <section id="overview" class="section">
       <div class="page-heading"><div><p class="eyebrow">YOUR NEXT MOVE, IN VIEW</p><h1>Every invoice.<br><em>A clearer picture.</em></h1></div><div class="workspace-status"><span>LOCAL RECORDS</span><strong id="invoice-count">0 invoices</strong><p>Stored in this browser.<br>Export a backup to keep a copy.</p></div></div>
       <p class="boundary">Prepare and reconcile BLCH records here. Payment records are entered manually; matching an invoice does not verify a transfer or finality. Signing happens in your wallet.</p>
