@@ -53,6 +53,55 @@ identifies the exact downloaded report bytes. Creation time is the untrusted
 local browser clock. Reports are unsigned. A CSV export indexes outcomes and
 source row references; formula-leading identifiers are neutralized.
 
+## Exception review and verification (v2)
+
+Select **Review exception** on a differing, missing or duplicate key. Add a
+reviewer label, state and explanation. States are investigating, explained,
+follow-up required and reopened. Each entry preserves the original comparison
+outcome, composite key, sequence and untrusted local timestamp. The workbench
+appends history; it never turns an explained discrepancy into a matched record.
+The dashboard counts the latest state per key. The editor displays the last 20
+entries for a selected key; the JSON retains up to 1,000 entries per report.
+
+Download the review JSON and its separate SHA-256 alongside the exact evidence
+JSON and original source CSVs. A journal binds to the evidence file's SHA-256,
+including its creation timestamp. Rerunning creates a new report; a journal for
+an earlier report cannot be attached to the new report. Import in the active
+session only accepts a continuation of existing history, never a replacement.
+The journal is unsigned: labels are not authenticated identities, explanations
+are not authorized approvals, and local timestamps have no trusted attestation.
+An external editor can rewrite the journal or remove entries. Independent
+retention, signatures and anti-rollback controls remain institutional work.
+
+To verify or resume retained evidence:
+
+1. In **Verify**, select the original evidence JSON, source A and source B.
+2. Optionally supply a report SHA-256 retained independently before verification
+   and a review journal. Keep A/B order; renamed files are accepted if bytes agree.
+3. Run verification. It recomputes source byte digests, normalized records,
+   comparison outcomes and rules using the versioned comparison implementation.
+   Unknown report fields and unsupported assurance claims fail verification.
+4. Download the unsigned verification receipt, or open the verified report for
+   review. Opening preserves the original report bytes and can resume a journal.
+   Download any current work first; opening replaces the comparison session.
+
+JSON inputs must use the workbench export's exact pretty-printed format, including
+the final newline. Reformatting, duplicate keys and ambiguous JSON are rejected.
+Limits: 24 MiB evidence JSON, 8 MiB review JSON, 2 MiB per CSV, 120 characters for
+reviewer labels and 2,000 for notes. All inputs must be valid UTF-8. Malformed or
+changed files invalidate prior verification results. The original v1 evidence
+schema and comparison rules remain supported; the browser interface is v2.
+
+Without a separately retained report digest, verification establishes internal
+consistency only. A coherent replacement of the evidence and both sources can
+pass. Even a matching digest does not establish source truth or completeness,
+identity, trustworthy time, the latest journal version, authorized approval or
+on-chain inclusion. The verification receipt records these limits explicitly.
+
+Review changes are held only in memory. Clearing, applying configuration,
+loading other files or rerunning discards the current journal. The verification
+panel has a separate Clear button. Closing or refreshing clears both sessions.
+
 No application upload, API fetch, analytics, third-party fonts, localStorage,
 IndexedDB or cookies are used. `connect-src 'none'` is set in both HTTP headers
 and HTML. User records are held in browser memory; Clear discards page state,
@@ -73,7 +122,7 @@ prototype, and their guarantees are not attributed to it.
 
 ## Run locally / offline
 
-Unzip `downloads/bloch-data-local-workbench-v1.zip` into an approved directory.
+Unzip `downloads/bloch-data-local-workbench-v2.zip` into an approved directory.
 Start a localhost-only server from that directory:
 
 ```sh
@@ -92,7 +141,7 @@ configuration by the two example download controls.
 ## Build, test and deploy (repository)
 
 ```sh
-node --test scripts/test-bloch-data.mjs
+node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs
 python3 scripts/build-bloch-data.py
 node scripts/verify-bloch-data.mjs
 wrangler pages deploy apps/bloch-data --project-name bloch-data --branch main
@@ -108,7 +157,10 @@ outside the public static directory. Serve the provided `_headers` on production
 
 `assets/modules.v1.mjs` defines schemas, keys, field types, institution defaults,
 and regional profiles. `reconcile.v1.mjs` provides strict parsing and comparison;
-`samples.v1.mjs` supplies labelled fixtures; `workbench.v1.mjs` renders local state.
+`samples.v1.mjs` supplies labelled fixtures; `workbench.v2.mjs` renders local state.
+`audit.v1.mjs` validates/recomputes evidence and journals; `verification.v1.mjs`
+handles the separate verifier session. Versioned static asset URLs keep existing
+immutable caches isolated from the updated interface.
 Add a reviewed schema and key definition to the module registry, add independent
 fixtures and tests, then version the rules and assets. Preserve exact source
 bytes, duplicate detection, no hidden tolerances and explicit assurance limits.

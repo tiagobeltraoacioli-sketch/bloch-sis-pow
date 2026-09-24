@@ -13,7 +13,8 @@ The register is non-exhaustive; applicable requirements must be added and review
 | Data movement | Files stay in browser memory; connection requests blocked by CSP; no upload endpoint | Approved workstation/browser, host distribution and change control |
 | Data minimization | Fixed module schema; unknown fields rejected; source values displayed locally | Select permitted datasets, tokenize identifiers, classify fields and approve purpose |
 | Correctness | Exact decimal/integer comparison, bounded parsing, duplicates always review | Authenticate sources, align cutoffs, determine completeness and operational truth |
-| Traceability | Original file digests, rule/configuration version, normalized records and exact report digest | Sign reviews, independently retain evidence, protect time and prevent rollback |
+| Traceability | Original file digests, rule/configuration version, normalized records, exact report digest and local recomputation verifier | Sign reviews, independently retain evidence, protect time and prevent rollback |
+| Exception review | Separate unsigned journal bound to exact report bytes; ordered annotations; original outcomes preserved | Authenticate reviewers, authorize decisions, enforce separation of duties and retain protected history |
 | Access | No hosted private account store or multi-tenant service | SSO/MFA, role separation, authorized exports, tenant isolation and reviewer signatures |
 | Retention | No application persistence; manual Clear | Encryption, key custody, legal holds, retention schedules, rights handling and verifiable disposal |
 | Cross-border data | No application transfer of source files | Validate residence, recipients, transfer mechanisms and lawful hosting |
@@ -26,6 +27,15 @@ explicit local user action, not an anonymization step. A file hash is not a
 privacy-preserving public artifact. Do not publish reports, account references,
 source digests, retention/legal metadata or commitment openings to a public chain.
 A chain txid alone does not bind the report or prove correctness/finality.
+
+The v2 verifier checks local consistency against both original CSV files and
+optionally an independently retained report digest. It uses the same versioned
+comparison implementation, not a separately certified audit engine. Without a
+trusted external reference a coherent replacement of all files can pass. Review
+labels and timestamps are self-declared; an unsigned journal can be rewritten or
+rolled back outside the app. Its digest must be retained independently if used
+for subsequent integrity checks. An explained exception remains a discrepancy.
+No signature, regulated approval, immutable log or legal compliance is inferred.
 
 ## Brazil
 
