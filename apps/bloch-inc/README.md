@@ -59,3 +59,14 @@ network operations portal, with direct links to its RPC catalog, validator guide
 wallet integration guide and PQ Shield reference work. Ops is also linked from the
 closing ecosystem list. Delegation setup, managed wallet APIs and cross-chain PQ
 Shield services retain their staged status.
+
+## Red & Blue portal — 24 September 2026
+
+The desktop/mobile navigation, BI-PoRB service card, closing ecosystem list and
+footer link directly to `https://rednblue.space/portal/`. The portal provides
+invitation-only organization access to Bitcoin, Ethereum and Bloch observations,
+graphs, saved analyses, machine learning and scoped APIs. Red describes
+sample-relative structural deviation; Blue describes observed-record completeness.
+Neither is presented as a validated AML, credit or ownership assessment. The
+separate `aml-blochinc.pages.dev` dashboard remains linked as a synthetic risk
+preview.
