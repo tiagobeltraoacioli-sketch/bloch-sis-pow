@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#050706">
+  <meta name="description" content="Bloch Markets is a proposed market infrastructure service for eligible digital assets, built around Ustav programmable tokens, lifecycle APIs and a future qualified Bloch DEX liquidity connection.">
+  <meta property="og:title" content="Bloch Markets — Digital asset infrastructure as a service">
+  <meta property="og:description" content="Programmable token infrastructure, developer APIs and auditable workflows. A proposed Bloch Inc service, with clear delivery gates.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://blochinc.xyz/markets/">
+  <title>Bloch Markets — Infrastructure as a service | Bloch Inc</title>
+  <link rel="icon" href="../assets/favicon.png" type="image/png">
+  <link rel="stylesheet" href="../assets/site.css">
+  <link rel="stylesheet" href="../assets/roadmap.css?v=20260923-markets">
+  <link rel="stylesheet" href="../assets/markets.css?v=20260923">
+  <script src="../assets/site.js" defer></script>
+</head>
+<body>
+  <div class="scroll-progress" aria-hidden="true"><span></span></div>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header" data-header>
+    <a class="brand" href="../" aria-label="Bloch Inc home"><img class="brand-logo" src="../assets/bloch-inc-logo-dark.png" alt="Bloch Inc" width="1380" height="260"></a>
+    <nav class="desktop-nav" aria-label="Primary navigation"><a href="../#portfolio">Products</a><a href="../#services">Services</a><a href="#platform">Platform</a><a href="#status">Status</a><a href="#roadmap">Roadmap</a></nav>
+    <a class="header-link" href="../">Bloch Inc <span aria-hidden="true">↗</span></a>
+    <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="mobile-nav"><span>Menu</span><i aria-hidden="true"></i></button>
+    <nav class="mobile-nav" id="mobile-nav" aria-label="Mobile navigation" hidden><a href="../#portfolio">Products</a><a href="../#services">Services</a><a href="#platform">Platform</a><a href="#status">Status</a><a href="#roadmap">Roadmap</a><a href="../">Bloch Inc home</a></nav>
+  </header>
+
+  <main id="main">
+    <section class="markets-hero" aria-labelledby="markets-title">
+      <div class="markets-grid" aria-hidden="true"></div>
+      <div class="markets-hero-inner">
+        <p class="eyebrow"><span></span> Bloch Inc / proposed service</p>
+        <p class="markets-index">01 / programmable assets &nbsp; 02 / data &nbsp; 03 / liquidity interfaces</p>
+        <h1 id="markets-title">Market infrastructure<br><em>as a service.</em></h1>
+        <p class="markets-lead">Bloch Markets is a proposed software platform for builders and operators of eligible digital assets. It brings the Ustav programmable token into a coherent path for creation, policy, data and, once qualified, liquidity integration.</p>
+        <div class="hero-actions"><a class="button button-primary" href="#platform">Explore the platform <span aria-hidden="true">↓</span></a><a class="button button-secondary" href="#status">See the delivery status <span aria-hidden="true">↗</span></a></div>
+        <div class="markets-status"><span class="markets-status-dot" aria-hidden="true"></span><strong>Proposal / reference code available</strong><span>Native service and AMM connection are not live.</span></div>
+      </div>
+      <div class="markets-wordmark" aria-hidden="true">M<span>.</span></div>
+    </section>
+
+    <section class="markets-intro section-pad" aria-labelledby="intro-title">
+      <div class="section-label"><span>01</span><p>Product thesis</p></div>
+      <div><p class="eyebrow"><span></span> Software infrastructure</p><h2 id="intro-title">Give digital assets<br><em>usable rails.</em></h2></div>
+      <p>Offer reusable software components rather than operating a marketplace: programmable tokens, lifecycle APIs, event records and reconciliation tools. Teams remain responsible for their own assets, policies and operations.</p>
+    </section>
+
+    <section class="markets-platform section-pad" id="platform" aria-labelledby="platform-title">
+      <div class="section-head"><div><p class="eyebrow"><span></span> Product + service modules</p><h2 id="platform-title">One foundation.<br>Four service layers.</h2></div><p>Each layer can be evaluated independently. Production availability depends on its own engineering and security gate.</p></div>
+      <div class="markets-modules">
+        <article><span>01 / token engine</span><h3>Ustav programmable token</h3><p>Define an eligible native asset and apply programmable controls for registration, supply, transfers, burns and policy changes. The current implementation is a local reference kernel.</p><small>Existing: locally executable code / future: live node integration</small></article>
+        <article><span>02 / developer platform</span><h3>Lifecycle APIs + sandbox</h3><p>Proposed APIs, SDK examples and a repeatable sandbox for asset configuration, policy tests and application integration.</p><small>Proposed service / requires stable API and node activation</small></article>
+        <article><span>03 / operations</span><h3>Events, data + reconciliation</h3><p>Proposed event streams, indexed asset histories, operator views and exportable records that help teams reconcile their own workflows.</p><small>Proposed service / requires complete indexing and observability</small></article>
+        <article><span>04 / liquidity interface</span><h3>Bloch DEX adapter</h3><p>A future native path from eligible Ustav assets to Bloch DEX AMM pools, subject to live native execution, audited pool logic, asset eligibility and operational controls.</p><small>Research and local prototype / no live native AMM</small></article>
+      </div>
+    </section>
+
+    <section class="markets-flow section-pad" aria-labelledby="flow-title">
+      <div class="section-head"><div><p class="eyebrow"><span></span> Service architecture</p><h2 id="flow-title">From asset logic<br>to usable services.</h2></div><p>The API and DEX connections below are a target architecture, not an enabled production route.</p></div>
+      <div class="markets-flow-map" aria-label="Proposed architecture: builder application to lifecycle API to Ustav token engine, with data services and a future Bloch DEX adapter">
+        <div><span>Builder / operator</span><strong>Application</strong><small>Owns asset rules and customer relationships</small></div>
+        <b aria-hidden="true">→</b>
+        <div><span>Bloch Markets</span><strong>Lifecycle API</strong><small>Configuration, policies and records</small></div>
+        <b aria-hidden="true">→</b>
+        <div class="flow-core"><span>Bloch Protocol</span><strong>Ustav</strong><small>Programmable native token kernel</small></div>
+      </div>
+      <div class="markets-flow-secondary"><div><span>Data layer</span><strong>Events + reconciliation</strong><small>Proposed, after complete indexing</small></div><div><span>Future adapter</span><strong>Bloch DEX AMM</strong><small>Requires qualified live native pools</small></div></div>
+    </section>
+
+    <section class="markets-status-section section-pad" id="status" aria-labelledby="status-title">
+      <div class="section-head"><div><p class="eyebrow"><span></span> Current status / September 2026</p><h2 id="status-title">The evidence<br>behind the proposal.</h2></div><p>Local prototypes demonstrate technical directions. A hosted service needs live network integration and independent qualification.</p></div>
+      <div class="markets-status-grid">
+        <article><span>Available locally</span><h3>Ustav token lifecycle</h3><p>Registration, minting, transfers, burns and policy updates run in the repository's local reference kernel.</p></article>
+        <article><span>Available locally</span><h3>Native pair + pool prototypes</h3><p>Atomic native pairs and supply-only token pool custody run in separate local implementations. The pool rejects base BLCH.</p></article>
+        <article><span>Not activated</span><h3>Genesis-4 integration</h3><p>Ustav is not a dependency of the live Genesis-4 node. Production signing, execution, indexing and service operations need integration.</p></article>
+        <article><span>Not activated</span><h3>Native Bloch DEX AMM</h3><p>No live native pool or Bloch Markets trading path is offered. Qualification requires security review, asset rules and operational readiness.</p></article>
+      </div>
+      <p class="markets-scope">Service scope: software infrastructure for eligible digital assets. Bloch Markets does not offer securities issuance, brokerage, custody, fiat payment rails or operation of a regulated exchange.</p>
+    </section>
+
+    <section class="markets-roadmap section-pad" id="roadmap" aria-labelledby="roadmap-title">
+      <div class="section-head"><div><p class="eyebrow"><span></span> Delivery sequence</p><h2 id="roadmap-title">Qualify each step<br>before the next.</h2></div><p>The sequence is directional. It does not promise launch dates or production access.</p></div>
+      <ol class="markets-steps"><li><span>01</span><div><h3>Ustav sandbox</h3><p>Package local token and policy examples with repeatable tests and documented asset eligibility.</p></div></li><li><span>02</span><div><h3>Live token infrastructure</h3><p>Integrate native execution into the node, prove authorization and finality, then expose versioned lifecycle APIs and index data.</p></div></li><li><span>03</span><div><h3>Operator services</h3><p>Qualify event delivery, reconciliation, monitoring, recovery and support procedures for a limited service pilot.</p></div></li><li><span>04</span><div><h3>DEX liquidity adapter</h3><p>Only after native pool audit and live network qualification, connect eligible assets to Bloch DEX liquidity interfaces.</p></div></li></ol>
+      <div class="markets-domain"><span>Standalone product site</span><strong><a href="https://blochmarkets.xyz/">blochmarkets.xyz ↗</a></strong><p>Explore the dedicated Bloch Markets service site.</p></div>
+    </section>
+  </main>
+
+  <footer class="site-footer"><a class="brand" href="../" aria-label="Bloch Inc home"><img class="brand-logo" src="../assets/bloch-inc-logo-dark.png" alt="Bloch Inc" width="1380" height="260"></a><p>Products. Infrastructure. Long-term research.</p><div><a href="../">Bloch Inc ↗</a><a href="../#services">Products + services ↗</a><a href="https://blochdex.com/">Bloch DEX ↗</a><a href="https://blochl1.com/">Bloch Explorer ↗</a></div><small>© 2026 Bloch Inc. Incorporation in Panama is in progress. Bloch Markets is a proposed service; availability depends on qualification.</small></footer>
+</body>
+</html>

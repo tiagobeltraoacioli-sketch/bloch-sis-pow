@@ -5,6 +5,7 @@ Static institutional website for `blochinc.xyz`. The product and services roadma
 The site intentionally preserves the source material's qualification language:
 
 - Bloch Inc incorporation in Panama is in progress.
+- Bloch Ops links to published network entry points and operator guidance. Its delegation setup and managed wallet/PQ Shield interfaces are staged work. The custom domain `ops-blochinc.xyz` is active on the Cloudflare Pages deployment.
 - The wallet is described as public beta.
 - DEX software is described as a development preview.
 - Cross-chain aggregator deployment is unverified.
@@ -12,7 +13,8 @@ The site intentionally preserves the source material's qualification language:
 - ECDSA is described only as the Bloch L2/EVM authorization model; native Bloch L1 authorization remains ML-DSA-65 + Falcon-1024.
 - Bridge qualification is in progress and public asset transfers are not enabled.
 - Bloch Verify has an offline comparison MVP; authenticated operator evidence and a production service remain proposed.
-- Bloch Data + Dev Cloud, Treasury + Pay, Bloch Markets and Bloch LatAm are roadmap lines, not activated services.
+- Bloch Data + Dev Cloud, Treasury + Pay, Bloch Markets and Bloch LatAm are roadmap lines, not activated services. The `/markets/` page presents Bloch Markets as software infrastructure for eligible digital assets. Ustav's programmable token lifecycle and separate native pair/pool prototypes run locally, but Ustav is not integrated into the live Genesis-4 node and no native Bloch DEX AMM is live.
+- Bloch Markets does not offer securities issuance, brokerage, custody, fiat payment rails or operation of a regulated exchange. Its standalone service site is deployed at `blochmarkets.pages.dev`; `blochmarkets.xyz` is the custom domain for that Pages project.
 - Pix, Open Finance, Drex, DvP and PvP are partner-dependent concepts. The site makes no claim of production rail connectivity or regulated authorization.
 
 The roadmap uses four delivery gates: reliable base, data and integration, value workflows, then markets and networks. The global line begins with reconciliation software; the LatAm line begins with observation and authorized-partner pilots.
