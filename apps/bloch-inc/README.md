@@ -35,3 +35,21 @@ python3 -m http.server 4173 --directory apps/bloch-inc
 ## Cloudflare Pages
 
 The site is dependency-free. Deploy `apps/bloch-inc` as the static asset directory.
+
+## Chain-data platforms — 24 September 2026
+
+The homepage introduces three distinct destinations, linked from the hero, navigation,
+current-status ledger, ecosystem links and footer:
+
+- **Bloch Explorer — blochl1.com:** Bloch Genesis-4 / BLCH only; graph atlas, receipts,
+  validators, finality, indexed balances and evaluated telemetry models.
+- **Bloch Space — bloch.space:** the institutional entry points emphasize Bitcoin/BTC
+  and Ethereum, with direct network links. Space also retains its other network views.
+- **Bloch Graphus — bloch-graphus.xyz:** bounded public-chain graph and balance analytics
+  for BTC, ETH, Ethereum ERC-20 USDT/USDC and BLCH, with Constellation, Oculum and Analytics
+  Lab. The old synthetic-only description and legacy Pages URLs have been replaced.
+  Synthetic illustrations remain distinct from real source records; production AML
+  scoring and ZK proofs are not claimed.
+
+The three platform illustrations are decorative diagrams, not live network snapshots.
+Existing downloadable presentations retain their version dates.
