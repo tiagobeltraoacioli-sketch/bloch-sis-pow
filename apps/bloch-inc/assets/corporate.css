@@ -1,0 +1,33 @@
+/* Corporate ownership and entity status, September 2026. */
+#structure{scroll-margin-top:82px}
+.corporate-jump{margin-top:24px}
+.ownership-chain{display:grid;grid-template-columns:minmax(0,1fr) 180px minmax(0,1fr);align-items:stretch}
+.ownership-entity{display:flex;flex-direction:column;align-items:flex-start;min-width:0;padding:32px;border:1px solid var(--line-bright);background:linear-gradient(145deg,#152014,#0b110d)}
+.ownership-subsidiary{border-color:#657f3e}
+.ownership-meta{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px;width:100%;color:var(--lime);font:600 .63rem/1.5 var(--mono);text-transform:uppercase;letter-spacing:.08em}
+.ownership-meta span:last-child{color:var(--muted)}
+.ownership-entity h3{margin:36px 0 16px;font-size:clamp(1.7rem,3vw,2.6rem);line-height:1.1;letter-spacing:-.045em}
+.ownership-entity p{margin:0 0 22px;max-width:340px;color:#bbc6b9;font-size:.92rem;line-height:1.7}
+.ownership-entity strong{color:var(--paper);font-weight:500}
+.ownership-status{display:flex;align-items:center;gap:9px;margin-top:auto;padding-top:12px;color:#e6c382;font:500 .63rem/1.6 var(--mono);text-transform:uppercase;letter-spacing:.04em}
+.ownership-status i{flex:none;width:6px;height:6px;border-radius:50%;background:currentColor}
+.ownership-entity .text-link{margin-top:28px}
+.ownership-link{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;text-align:center}
+.ownership-link strong{color:var(--lime);font:500 2.8rem/1 var(--mono);letter-spacing:-.06em}
+.ownership-link>span:not(.ownership-arrow){color:var(--muted);font:.67rem/1.6 var(--mono)}
+.ownership-arrow{position:relative;display:block;width:100%;height:1px;margin-top:12px;background:#657f3e}
+.ownership-arrow:after{content:"";position:absolute;right:1px;top:-4px;width:8px;height:8px;border-top:1px solid var(--lime);border-right:1px solid var(--lime);transform:rotate(45deg)}
+.operating-roles-heading{margin:64px 0 24px;padding-top:28px;border-top:1px solid var(--line)}
+.operating-roles-heading h3{margin:0 0 8px;font-size:1.2rem;font-weight:500}
+.operating-roles-heading p{margin:0;color:var(--muted);font-size:.85rem}
+.operating-roles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.operating-roles article{padding:28px;border:1px solid var(--line);background:var(--panel)}
+.operating-roles article>span{color:var(--lime);font:600 .65rem/1.5 var(--mono);text-transform:uppercase;letter-spacing:.1em}
+.operating-roles h3{margin:18px 0 28px;font-size:1.45rem;letter-spacing:-.03em}
+.operating-roles ul{list-style:none;margin:0;padding:0}
+.operating-roles li{padding:10px 0;border-top:1px solid var(--line);color:#aeb8af;font-size:.86rem}
+.site-footer>.corporate-footer{grid-column:1/-1;justify-self:start;margin:0;max-width:1000px;color:#aeb8af;font-size:.8rem;line-height:1.8}
+.corporate-footer a{display:inline-block;margin-left:8px;color:var(--lime);text-decoration:underline;text-underline-offset:4px}
+.ownership-entity a:focus-visible,.corporate-footer a:focus-visible,.corporate-jump:focus-visible{outline:2px solid var(--lime);outline-offset:5px}
+@media(max-width:1050px){.ownership-chain{grid-template-columns:minmax(0,1fr) 130px minmax(0,1fr)}.ownership-entity{padding:24px}}
+@media(max-width:760px){.ownership-chain,.operating-roles{grid-template-columns:1fr}.ownership-entity{padding:28px}.ownership-link{padding:28px 0 0;gap:10px}.ownership-arrow{width:1px;height:40px;margin-top:2px}.ownership-arrow:after{top:auto;bottom:1px;right:-4px;transform:rotate(135deg)}.ownership-entity h3{margin-top:28px;font-size:2rem}.operating-roles-heading{margin-top:44px}.corporate-footer a{margin-left:0}.site-footer>.corporate-footer{grid-column:auto}}

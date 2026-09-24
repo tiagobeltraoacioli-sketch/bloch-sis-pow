@@ -5,6 +5,7 @@ Static institutional website for `blochinc.xyz`. The product and services roadma
 The site intentionally preserves the source material's qualification language:
 
 - Bloch Inc incorporation in Panama is in progress.
+- Postern Labs Ltda (Brazil) holds 100% of Bloch Inc's share capital. Postern Labs Ltda is in the process of transforming into Postern Labs S.A. These company-provided details were added on 24 September 2026; neither process is presented as completed.
 - Bloch Ops links to published network entry points and operator guidance. Its delegation setup and managed wallet/PQ Shield interfaces are staged work. The custom domain `ops-blochinc.xyz` is active on the Cloudflare Pages deployment.
 - The wallet is described as public beta.
 - DEX software is described as a development preview.
