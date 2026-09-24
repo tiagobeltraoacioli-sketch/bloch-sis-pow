@@ -6,6 +6,7 @@ The site intentionally preserves the source material's qualification language:
 
 - Bloch Inc incorporation in Panama is in progress.
 - Postern Labs Ltda (Brazil) holds 100% of Bloch Inc's share capital. Postern Labs Ltda is in the process of transforming into Postern Labs S.A. These company-provided details were added on 24 September 2026; neither process is presented as completed.
+- Postern Labs Ltda reports holdings of 27 billion Bloch Protocol Tokens (BLCH), or 27,000,000,000 tokens, and is described as a major BLCH holder. This company-provided disclosure was added on 24 September 2026, separately from the 100% equity ownership of Bloch Inc. It is not an independently verified on-chain balance, supply percentage or holder ranking.
 - Bloch Ops links to published network entry points and operator guidance. Its delegation setup and managed wallet/PQ Shield interfaces are staged work. The custom domain `ops-blochinc.xyz` is active on the Cloudflare Pages deployment.
 - The wallet is described as public beta.
 - DEX software is described as a development preview.
