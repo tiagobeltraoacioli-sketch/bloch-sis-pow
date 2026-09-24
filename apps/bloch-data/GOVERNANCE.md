@@ -121,8 +121,33 @@ formats, mappings, exclusions and output configuration. Retain the original
 extracts, prepared outputs and receipt together under the institution's controls.
 Later evidence/case files bind to prepared CSVs, and do not embed this receipt or
 original extracts. The UI states that provenance boundary before loading. This
-release does not verify imported preparation receipts. The receipt has no source
+release supports receipt verification as described below. The receipt has no source
 cell values but can still contain sensitive filenames, headers and policy
 metadata. Prepared CSVs contain private records and preserve formula-like text.
 No retention enforcement, encryption, identity authentication, data-subject
 workflow, regulatory certification or Bloch publication is added by preparation.
+
+## Preparation verification boundary (v7)
+
+The local verifier independently recomputes a retained preparation receipt from
+its original extracts, requires exact prepared CSV bytes, and validates every
+mapping, declared exclusion, normalization count and row reference. Optional
+reconciliation evidence must match the full applied configuration, data mode and
+prepared source bytes; its outcomes are independently recomputed. Review history
+is neither supplied nor verified in this workflow. Existing evidence/case
+verification remains the path for retained review journals.
+
+Optional, independently retained preparation and evidence digests bind the check
+to specific retained file identities. Without those references, a coherent
+replacement can pass. A reproduced mapping does not establish authorized data
+exclusion, source completeness, institutional identity or chronology. The graph
+represents checked local file relationships, not on-chain transactions or a
+signed chain of custody. No publication, retention enforcement, cryptographic
+signature, regulatory certification or rollback protection is added.
+
+The new verification receipt records file digests, counts and scoped check
+results without raw source records. The original extracts and preparation
+receipt remain separate from six-component case files. Loading verified prepared
+files creates a new reconciliation input session and does not resume supplied
+evidence or review history. Clear/input changes invalidate pending results;
+processing remains in browser memory with no data upload or persistence.

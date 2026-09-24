@@ -56,7 +56,7 @@ source and output hashes, byte and row counts, input headers, explicit mappings,
 exclusions, applied rules and row lineage. It contains filenames/configuration
 metadata, but no source cell values. Retain it with both originals and outputs.
 A hash establishes a byte reference, not source identity or completeness. The
-receipt is generated locally; this release has no receipt-import verifier.
+receipt is generated locally; verify retained file sets in Preparation verification.
 
 Loading prepared files explicitly replaces the active reconciliation session;
 it does not run the comparison. Subsequent evidence and six-component cases bind
@@ -66,6 +66,58 @@ requires retaining the separate receipt and originals. This feature does not
 change any existing evidence, review or case schema. Synthetic examples retain
 their synthetic mode when loaded directly into reconciliation. Session data
 stays in memory; clearing preparation does not clear the separate workbench.
+
+## Preparation verification and evidence linkage (v7)
+
+`#preparation-verify` reopens a v1 preparation receipt with both original extracts
+and both prepared CSVs. An optional evidence JSON extends verification through
+the reconciliation report. Optional independently retained preparation/evidence
+SHA-256 references detect replacement against those specific byte identities.
+The verifier is independent from the preparation and reconciliation sessions.
+
+The receipt must be an original, formatted workbench JSON export, at most 8 MiB.
+Original and prepared files are bounded to 2 MiB each; optional evidence is
+bounded to 24 MiB. All files must be valid UTF-8. Filenames can change during
+retention; source A/B ordering and exact content must agree. Original BOM,
+line endings and excluded cells remain part of the input digest. Regenerated
+prepared files must agree byte-for-byte; equivalent CSV reformatting is rejected.
+
+Verification reruns the unchanged preparation rules and checks all mappings,
+exclusion declarations, headers, byte and row counts, every changed-cell count,
+every row reference, rules and assurance metadata. It does not authenticate the
+person who selected those mappings or exclusions. If evidence is supplied, its
+source digests, complete applied configuration and data mode must agree with the
+prepared sources, and all reconciliation outcomes are independently recomputed.
+No evidence means verification stops at the prepared files. A retained evidence
+digest is rejected if the corresponding evidence JSON is absent.
+
+The interactive path shows original → transformation → prepared CSV for each
+side, plus the optional link into reconciliation evidence. Node selection is
+keyboard accessible. Details show declared filenames, exact digests, mappings,
+normalization counts and the first 20 row references per side; all references
+are checked, including those outside the preview. A labelled synthetic example
+runs entirely locally using the active module's configuration.
+
+Download `bloch.data.source-preparation-verification.v1` JSON and its SHA-256,
+or download the exact retained preparation receipt again. The verification
+receipt records original/prepared file identities, row counts, changed-cell
+counts, receipt/evidence identities and the status of optional independent pins.
+It contains no source record values or review notes. Retain the full file set
+separately; neither receipt is embedded in the existing six-component cases.
+
+Loading verified prepared CSVs is an explicit action that replaces the active
+workbench files, configuration, report and review session. It does not resume
+supplied evidence or review history, and does not run a comparison automatically.
+Use the evidence/case verifier to resume retained reports and journals. Clearing
+or changing verifier input invalidates the entire result, including pending
+reads; it does not clear other workspaces. There is no network upload or local
+browser persistence.
+
+These checks establish local consistency. Without independent digest references,
+a coherent replacement can pass. Timestamps, policy references, filenames and
+data mode remain declarations. Source identity/completeness, authorization,
+rollback protection, audit signatures, regulatory certification and on-chain
+inclusion remain outside this verifier's guarantees.
 
 ## Global and LatAm configuration
 
@@ -291,7 +343,7 @@ the final newline. Reformatting, duplicate keys and ambiguous JSON are rejected.
 Limits: 24 MiB evidence JSON, 8 MiB review JSON, 2 MiB per CSV, 120 characters for
 reviewer labels and 2,000 for notes. All inputs must be valid UTF-8. Malformed or
 changed files invalidate prior verification results. The original v1 evidence
-schema and comparison rules remain supported; the browser interface is v6.
+schema and comparison rules remain supported; the browser interface is v7.
 
 Without a separately retained report digest, verification establishes internal
 consistency only. A coherent replacement of the evidence and both sources can
@@ -324,7 +376,7 @@ prototype, and their guarantees are not attributed to it.
 
 ## Run locally / offline
 
-Unzip `downloads/bloch-data-local-workbench-v6.zip` into an approved directory.
+Unzip `downloads/bloch-data-local-workbench-v7.zip` into an approved directory.
 Start a localhost-only server from that directory:
 
 ```sh
@@ -343,7 +395,7 @@ configuration by the two example download controls.
 ## Build, test and deploy (repository)
 
 ```sh
-node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs scripts/test-bloch-data-case.mjs scripts/test-bloch-data-diff.mjs scripts/test-bloch-data-preparation.mjs
+node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs scripts/test-bloch-data-case.mjs scripts/test-bloch-data-diff.mjs scripts/test-bloch-data-preparation.mjs scripts/test-bloch-data-preparation-verification.mjs
 python3 scripts/build-bloch-data.py
 node scripts/verify-bloch-data.mjs
 wrangler pages deploy apps/bloch-data --project-name bloch-data --branch main
@@ -359,7 +411,7 @@ outside the public static directory. Serve the provided `_headers` on production
 
 `assets/modules.v1.mjs` defines schemas, keys, field types, institution defaults,
 and regional profiles. `reconcile.v1.mjs` provides strict parsing and comparison;
-`samples.v1.mjs` supplies labelled fixtures; `workbench.v6.mjs` renders local state.
+`samples.v1.mjs` supplies labelled fixtures; `workbench.v7.mjs` renders local state.
 `audit.v1.mjs` validates/recomputes evidence and journals; `verification.v1.mjs`
 handles the separate verifier session. `queue.v1.mjs` provides the local search
 index, selection/sort rules, chart summaries and filtered CSV export. These are
@@ -372,6 +424,10 @@ labelled example pair using the existing reconciliation and case exporters.
 `preparation.v1.mjs` parses bounded extract tables and validates explicit mappings
 through the unchanged module rules; `preparation-workbench.v1.mjs` renders the
 separate preparation session, lineage charts and downloads.
+`preparation-verification.v1.mjs` reproduces retained transformations and optional
+evidence linkage; `preparation-verifier-workbench.v1.mjs` renders its independent
+session and path graph. `preparation-samples.v1.mjs` generates synthetic originals,
+preparation and evidence for the verifier example.
 Versioned static asset URLs keep existing
 immutable caches isolated from the updated interface.
 Add a reviewed schema and key definition to the module registry, add independent

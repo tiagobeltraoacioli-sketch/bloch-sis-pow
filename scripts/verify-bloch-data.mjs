@@ -6,6 +6,9 @@ import {createHash} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import {defaultConfig} from '../apps/bloch-data/assets/modules.v1.mjs';
 import {samplesFor} from '../apps/bloch-data/assets/samples.v1.mjs';
+import {createReport} from '../apps/bloch-data/assets/reconcile.v1.mjs';
+import {prepareSources} from '../apps/bloch-data/assets/preparation.v1.mjs';
+import {preparationExample} from '../apps/bloch-data/assets/preparation-samples.v1.mjs';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 const root=process.env.VERIFY_DIR?resolve(process.env.VERIFY_DIR):resolve(fileURLToPath(new URL('../apps/bloch-data',import.meta.url)));
 const server=http.createServer(async(req,res)=>{
@@ -254,17 +257,57 @@ try {
   assert.equal(await page.inputValue('#prep-a-file'),'');assert.equal(await page.locator('#prep-a-mapping').innerText(),'');assert.equal(await page.locator('#prep-output').innerText(),'');assert.equal(await page.locator('#prep-digest').innerText(),'');assert.equal(await page.locator('#prep-results').isVisible(),false);assert.equal(await page.locator('#prep-a-name').innerText(),'No source loaded');
   assert.equal(requests.length,baseline,'Source preparation triggered network requests');
 
+  // Retained preparation verification, including optional evidence linkage and independent pins.
+  const beforeVerificationDigest=await page.locator('#report-digest').innerText();
+  await page.click('#pv-example');await page.waitForSelector('#pv-results:visible');assert.equal(await page.locator('#pv-graph button').count(),6);assert.equal(await page.locator('#report-digest').innerText(),beforeVerificationDigest);
+  assert.ok((await page.locator('#pv-summary').innerText()).startsWith('SYNTHETIC EXAMPLE'));assert.ok((await page.locator('#pv-evidence-summary').innerText()).startsWith('Evidence linked and recomputed'));
+  await page.locator('#pv-graph button[data-side="0"][data-stage="input"]').focus();await page.keyboard.press('Enter');assert.ok((await page.locator('#pv-detail').innerText()).includes('Exact original bytes match'));
+  await page.locator('#pv-graph button[data-side="1"][data-stage="transform"]').click();assert.equal(await page.locator('#pv-detail tbody tr').count(),7);assert.ok((await page.locator('#pv-detail').innerText()).includes('extract_note'));
+  const pvExamplePromise=page.waitForEvent('download');await page.click('#pv-download');const pvExampleOutput=JSON.parse(await readFile(await (await pvExamplePromise).path(),'utf8'));assert.equal(pvExampleOutput.mode,'synthetic_example');assert.equal(pvExampleOutput.assurance.mapping_authorization,'not_authenticated');
+  await page.locator('#pv-graph').evaluate(element=>element.scrollIntoView({block:'start'}));await page.screenshot({path:'/private/tmp/blochdata-preparation-verifier-1440.png'});
+  await page.setViewportSize({width:390,height:844});await page.locator('#pv-graph').evaluate(element=>element.scrollIntoView({block:'start'}));await page.screenshot({path:'/private/tmp/blochdata-preparation-verifier-390.png'});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);await page.setViewportSize({width:1440,height:1100});
+  await page.click('#pv-clear');
+  const pvFixture=await preparationExample(defaultConfig('cash','br','bank')),pvDeclared=JSON.parse(pvFixture.receiptText);
+  const pvOriginals=pvFixture.originals.map((file,index)=>({...file,name:`original-${index} <img src=x onerror=alert(1)>.csv`,text:file.text.replaceAll('ACCOUNT-DEMO','<img src=x onerror=alert(1)>'),profile:pvDeclared.sources[index].profile}));
+  const pvPrepared=await prepareSources(pvOriginals,pvDeclared.configuration,'local_files');const pvEvidence=await createReport(pvPrepared.sources[0],pvPrepared.sources[1],'local_files',pvPrepared.configuration);
+  const pvFiles=[['pv-receipt',pvPrepared.bytes,'receipt.json'],['pv-original-a',pvOriginals[0].text,'renamed-original-a.csv'],['pv-original-b',pvOriginals[1].text,'renamed-original-b.csv'],['pv-prepared-a',pvPrepared.sources[0].text,'renamed-prepared-a.csv'],['pv-prepared-b',pvPrepared.sources[1].text,'renamed-prepared-b.csv'],['pv-evidence',pvEvidence.bytes,'evidence.json']];
+  for(const [id,text,name] of pvFiles)await page.setInputFiles('#'+id,{name,mimeType:name.endsWith('.json')?'application/json':'text/csv',buffer:Buffer.from(text)});
+  await page.fill('#pv-pin',pvPrepared.digest);await page.fill('#pv-evidence-pin',pvEvidence.digest);await page.click('#pv-run');await page.waitForSelector('#pv-results:visible');
+  assert.equal(await page.locator('#pv-receipt-digest').innerText(),pvPrepared.digest);assert.ok((await page.locator('#pv-pins').innerText()).includes('independently retained digest matched'));assert.ok((await page.locator('#pv-evidence-summary').innerText()).includes('retained evidence digest matched'));
+  assert.equal(await page.locator('#pv-graph img, #pv-graph script, #pv-detail img').count(),0);assert.ok((await page.locator('#pv-graph').innerText()).includes('<img'));
+  const pvExportPromise=page.waitForEvent('download');await page.click('#pv-download');const pvExportText=await readFile(await (await pvExportPromise).path(),'utf8'),pvExport=JSON.parse(pvExportText);assert.equal(pvExport.preparation_sha256,pvPrepared.digest);assert.equal(pvExport.evidence.sha256,pvEvidence.digest);assert.equal(pvExport.assurance.review_journal,'not_supplied_or_verified');assert.equal(pvExport.sources[0].lineage_rows,8);assert.equal(createHash('sha256').update(pvExportText).digest('hex'),await page.locator('#pv-export-digest').innerText());
+  const pvHashPromise=page.waitForEvent('download');await page.click('#pv-hash');assert.ok((await readFile(await (await pvHashPromise).path(),'utf8')).startsWith(createHash('sha256').update(pvExportText).digest('hex')));
+  const pvRetainedPromise=page.waitForEvent('download');await page.click('#pv-retained');assert.equal(await readFile(await (await pvRetainedPromise).path(),'utf8'),pvPrepared.bytes);
+  await page.click('#pv-open');assert.equal(await page.locator('#results').isVisible(),false);assert.equal(await page.locator('#mode-label').innerText(),'YOUR FILES / LOCAL ONLY');await page.click('#run');await page.waitForSelector('#results:visible');assert.equal(await page.locator('#metric-matched').innerText(),'3');assert.equal(await page.locator('#review-entry-count').innerText(),'0');assert.equal(await page.locator('#pv-results').isVisible(),true);
+  await page.fill('#pv-pin','0'.repeat(64));assert.equal(await page.locator('#pv-results').isVisible(),false);await page.click('#pv-run');await page.waitForFunction(()=>document.getElementById('pv-status').textContent.includes('does not match'));
+  await page.fill('#pv-pin',pvPrepared.digest);await page.fill('#pv-evidence-pin','0'.repeat(64));await page.click('#pv-run');await page.waitForFunction(()=>document.getElementById('pv-status').textContent.includes('report does not match'));await page.fill('#pv-evidence-pin',pvEvidence.digest);
+  await page.setInputFiles('#pv-original-a',{name:'changed-excluded.csv',mimeType:'text/csv',buffer:Buffer.from(pvOriginals[0].text.replace('Synthetic extraction note','changed excluded value'))});await page.click('#pv-run');await page.waitForFunction(()=>document.getElementById('pv-status').textContent.includes('Original source A'));assert.equal(await page.locator('#pv-results').isVisible(),false);
+  await page.setInputFiles('#pv-original-a',{name:'restored.csv',mimeType:'text/csv',buffer:Buffer.from(pvOriginals[0].text)});await page.setInputFiles('#pv-prepared-b',{name:'reformatted.csv',mimeType:'text/csv',buffer:Buffer.from(pvPrepared.sources[1].text.replaceAll('\r\n','\n'))});await page.click('#pv-run');await page.waitForFunction(()=>document.getElementById('pv-status').textContent.includes('Prepared source B'));
+  await page.setInputFiles('#pv-prepared-b',{name:'restored.csv',mimeType:'text/csv',buffer:Buffer.from(pvPrepared.sources[1].text)});
+  const alteredPreparation=JSON.parse(pvPrepared.bytes);alteredPreparation.sources[0].lineage[0].source_row++;await page.setInputFiles('#pv-receipt',{name:'altered-receipt.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(alteredPreparation,null,2)+'\n')});await page.fill('#pv-pin','');await page.click('#pv-run');await page.waitForFunction(()=>document.getElementById('pv-status').textContent.includes('lineage'));
+  await page.setInputFiles('#pv-receipt',{name:'restored.json',mimeType:'application/json',buffer:Buffer.from(pvPrepared.bytes)});
+  const alteredPVEvidence=JSON.parse(pvEvidence.bytes);alteredPVEvidence.result.counts.matched++;await page.setInputFiles('#pv-evidence',{name:'altered-evidence.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(alteredPVEvidence,null,2)+'\n')});await page.fill('#pv-evidence-pin','');await page.click('#pv-run');await page.waitForFunction(()=>document.getElementById('pv-status').textContent.includes('Recomputed outcomes'));
+  await page.setInputFiles('#pv-evidence',[]);await page.fill('#pv-evidence-pin',pvEvidence.digest);await page.click('#pv-run');await page.waitForFunction(()=>document.getElementById('pv-status').textContent.includes('requires the corresponding evidence'));await page.fill('#pv-evidence-pin','');await page.click('#pv-run');await page.waitForSelector('#pv-results:visible');assert.ok((await page.locator('#pv-evidence-summary').innerText()).startsWith('No evidence supplied'));
+  const pvNoEvidencePromise=page.waitForEvent('download');await page.click('#pv-download');assert.equal(JSON.parse(await readFile(await (await pvNoEvidencePromise).path(),'utf8')).evidence,null);
+  await page.setInputFiles('#pv-original-a',{name:'invalid.csv',mimeType:'text/csv',buffer:Buffer.from([0xc3,0x28])});await page.click('#pv-run');await page.waitForFunction(()=>document.getElementById('pv-status').textContent.includes('valid UTF-8'));
+  await page.setInputFiles('#pv-original-a',{name:'restored.csv',mimeType:'text/csv',buffer:Buffer.from(pvOriginals[0].text)});
+  await page.evaluate(()=>{window.pvOriginalRead=File.prototype.arrayBuffer;window.pvReleases=[];File.prototype.arrayBuffer=function(){return new Promise(resolve=>{window.pvReleases.push(()=>resolve(window.pvOriginalRead.call(this)));});};});
+  await page.click('#pv-run');await page.waitForFunction(()=>window.pvReleases.length===5);await page.click('#pv-clear');await page.evaluate(()=>{File.prototype.arrayBuffer=window.pvOriginalRead;for(const release of window.pvReleases)release();});
+  assert.equal(await page.locator('#pv-results').isVisible(),false);assert.equal(await page.inputValue('#pv-receipt'),'');assert.equal(await page.inputValue('#pv-original-a'),'');assert.equal(await page.locator('#pv-graph').innerText(),'');assert.equal(await page.locator('#pv-detail').innerText(),'');assert.equal(await page.locator('#pv-receipt-digest').innerText(),'');
+  assert.equal(requests.length,baseline,'Preparation verification triggered network requests');
+
+
   await context.setOffline(false);
-  for(const path of [process.env.VERIFY_DIR?'README.md':'downloads/bloch-data-local-workbench-v6.zip','GOVERNANCE.md','regulatory-register.v1.json','samples/venue.csv'])assert.equal((await context.request.get(new URL(path,target).href)).status(),200,path);
+  for(const path of [process.env.VERIFY_DIR?'README.md':'downloads/bloch-data-local-workbench-v7.zip','GOVERNANCE.md','regulatory-register.v1.json','samples/venue.csv'])assert.equal((await context.request.get(new URL(path,target).href)).status(),200,path);
   if(!process.env.VERIFY_DIR){
-    const packagePath='downloads/bloch-data-local-workbench-v6.zip';
+    const packagePath='downloads/bloch-data-local-workbench-v7.zip';
     const packageResponse=await context.request.get(new URL(packagePath,target).href),packageBytes=await packageResponse.body();
     assert.equal(packageBytes.subarray(0,4).toString('hex'),'504b0304','Offline download must be a ZIP, not an HTML fallback');
     const hashResponse=await context.request.get(new URL(packagePath+'.sha256',target).href);
     assert.equal(hashResponse.status(),200);const advertised=(await hashResponse.text()).trim().split(/\s+/);
     assert.equal(advertised[0],createHash('sha256').update(packageBytes).digest('hex'),'Offline ZIP must match its published SHA-256');
-    assert.equal(advertised[1],'bloch-data-local-workbench-v6.zip');
+    assert.equal(advertised[1],'bloch-data-local-workbench-v7.zip');
   }
   assert.deepEqual(errors,[]);
-  console.log(JSON.stringify({url:target,modules:4,regionalProfiles:7,layout,localUploads:'no network requests',exports:'digest verified',sourcePreparation:'independent formats, exclusions, lineage, exact digests, machine CSV, prepared evidence, malformed UTF-8 and cancellation',caseComparison:'offline example, transition filters, full exports, retained digests, case resume, tampering and cancellation',caseFiles:'six exact components, offline round-trip, retained digest, mutation and cancellation checked',queue:'search, chart filters, full 125-key export, page reset, journal binding',reviews:'bound journal, unchanged outcomes, resume verified report',verification:'offline recomputation, pin and tampering checked',malformedFiles:'fail closed',offline:'passed',xss:'text only',errors}));
+  console.log(JSON.stringify({url:target,modules:4,regionalProfiles:7,layout,localUploads:'no network requests',exports:'digest verified',preparationVerification:'exact originals, reproduced CSVs, lineage graph, evidence binding, retained digests, exports, offline, XSS and cancellation',sourcePreparation:'independent formats, exclusions, lineage, exact digests, machine CSV, prepared evidence, malformed UTF-8 and cancellation',caseComparison:'offline example, transition filters, full exports, retained digests, case resume, tampering and cancellation',caseFiles:'six exact components, offline round-trip, retained digest, mutation and cancellation checked',queue:'search, chart filters, full 125-key export, page reset, journal binding',reviews:'bound journal, unchanged outcomes, resume verified report',verification:'offline recomputation, pin and tampering checked',malformedFiles:'fail closed',offline:'passed',xss:'text only',errors}));
 }finally{await browser.close();server.close();}
