@@ -53,6 +53,49 @@ identifies the exact downloaded report bytes. Creation time is the untrusted
 local browser clock. Reports are unsigned. A CSV export indexes outcomes and
 source row references; formula-leading identifiers are neutralized.
 
+## Investigation desk and queue (v3)
+
+The overview adds two interactive charts using the entire current report:
+
+- Differing fields: keys with the `different` outcome, counted once per differing
+  field. A key may appear in multiple bars. Missing records and duplicates are
+  excluded from this field count and retain their own original outcomes.
+- Review progress: one latest annotation per exception, including not reviewed,
+  investigating, explained, follow-up required and reopened. Matched keys are
+  outside this review distribution. Counts are not exposure or risk estimates.
+
+Selecting a chart bar replaces the queue filters with that field or review
+state. Charts keep showing full-report counts; the queue states its filtered
+count and the report total separately. Keyboard users can activate bar buttons.
+
+The queue combines comparison outcome, review state, differing field and local
+text search. Every whitespace-separated search term must appear somewhere in a
+composite key, normalized source value or the latest reviewer label/note. Search
+uses literal substrings, ignores case and accents and includes all source rows,
+including duplicates beyond the 20-row preview. Earlier review notes remain in
+the journal but are not included in queue search. Search normalization never
+changes identifiers, comparison rules, original results or evidence bytes.
+
+Sort by record key, number of differing fields, latest journal sequence, or
+follow-up order: follow-up required, reopened, not reviewed, investigating,
+explained, then matched. Equal values preserve original key order. Latest-entry
+ordering uses the journal sequence, not an authenticated clock. These orders
+organize operator work and do not infer monetary exposure or approve exceptions.
+
+**Download filtered queue CSV** exports every selected key across all pages,
+including applied filters, sort, original outcome, row references and the latest
+review annotation. Each row identifies the exact evidence and review JSON
+digests. Notes can contain private data. Formula-leading fields are neutralized
+and multiline quoted notes remain quoted CSV cells. This convenience export is
+not an evidence or journal replacement and is not accepted by the JSON verifier;
+retain the full JSON files alongside it. An empty selection disables export.
+
+Filters are kept only in page memory. Reset restores all keys and original key
+order; changing the report, clearing or reopening evidence resets filters. New
+annotations immediately update the search index, counts and filtered queue.
+Full evidence JSON and the existing all-results CSV continue to include every
+result regardless of the queue filters. CSV search is bounded at 160 characters.
+
 ## Exception review and verification (v2)
 
 Select **Review exception** on a differing, missing or duplicate key. Add a
@@ -90,7 +133,7 @@ the final newline. Reformatting, duplicate keys and ambiguous JSON are rejected.
 Limits: 24 MiB evidence JSON, 8 MiB review JSON, 2 MiB per CSV, 120 characters for
 reviewer labels and 2,000 for notes. All inputs must be valid UTF-8. Malformed or
 changed files invalidate prior verification results. The original v1 evidence
-schema and comparison rules remain supported; the browser interface is v2.
+schema and comparison rules remain supported; the browser interface is v3.
 
 Without a separately retained report digest, verification establishes internal
 consistency only. A coherent replacement of the evidence and both sources can
@@ -122,7 +165,7 @@ prototype, and their guarantees are not attributed to it.
 
 ## Run locally / offline
 
-Unzip `downloads/bloch-data-local-workbench-v2.zip` into an approved directory.
+Unzip `downloads/bloch-data-local-workbench-v3.zip` into an approved directory.
 Start a localhost-only server from that directory:
 
 ```sh
@@ -141,7 +184,7 @@ configuration by the two example download controls.
 ## Build, test and deploy (repository)
 
 ```sh
-node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs
+node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs
 python3 scripts/build-bloch-data.py
 node scripts/verify-bloch-data.mjs
 wrangler pages deploy apps/bloch-data --project-name bloch-data --branch main
@@ -157,9 +200,12 @@ outside the public static directory. Serve the provided `_headers` on production
 
 `assets/modules.v1.mjs` defines schemas, keys, field types, institution defaults,
 and regional profiles. `reconcile.v1.mjs` provides strict parsing and comparison;
-`samples.v1.mjs` supplies labelled fixtures; `workbench.v2.mjs` renders local state.
+`samples.v1.mjs` supplies labelled fixtures; `workbench.v3.mjs` renders local state.
 `audit.v1.mjs` validates/recomputes evidence and journals; `verification.v1.mjs`
-handles the separate verifier session. Versioned static asset URLs keep existing
+handles the separate verifier session. `queue.v1.mjs` provides the local search
+index, selection/sort rules, chart summaries and filtered CSV export. These are
+presentation and workflow functions, separate from comparison rules and evidence
+serialization. Versioned static asset URLs keep existing
 immutable caches isolated from the updated interface.
 Add a reviewed schema and key definition to the module registry, add independent
 fixtures and tests, then version the rules and assets. Preserve exact source

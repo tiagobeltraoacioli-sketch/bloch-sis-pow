@@ -15,6 +15,7 @@ The register is non-exhaustive; applicable requirements must be added and review
 | Correctness | Exact decimal/integer comparison, bounded parsing, duplicates always review | Authenticate sources, align cutoffs, determine completeness and operational truth |
 | Traceability | Original file digests, rule/configuration version, normalized records, exact report digest and local recomputation verifier | Sign reviews, independently retain evidence, protect time and prevent rollback |
 | Exception review | Separate unsigned journal bound to exact report bytes; ordered annotations; original outcomes preserved | Authenticate reviewers, authorize decisions, enforce separation of duties and retain protected history |
+| Investigation workflow | Local record/latest-note search, combined filters, full-report charts, explicit queue order and filtered CSV bound to evidence/journal digests | Approve operating priorities, control private exports and independently assess financial exposure; counts are not risk scores |
 | Access | No hosted private account store or multi-tenant service | SSO/MFA, role separation, authorized exports, tenant isolation and reviewer signatures |
 | Retention | No application persistence; manual Clear | Encryption, key custody, legal holds, retention schedules, rights handling and verifiable disposal |
 | Cross-border data | No application transfer of source files | Validate residence, recipients, transfer mechanisms and lawful hosting |
@@ -36,6 +37,14 @@ labels and timestamps are self-declared; an unsigned journal can be rewritten or
 rolled back outside the app. Its digest must be retained independently if used
 for subsequent integrity checks. An explained exception remains a discrepancy.
 No signature, regulated approval, immutable log or legal compliance is inferred.
+
+The v3 investigation queue is a view over the existing comparison and latest
+review annotations. Filtering and explaining exceptions do not remove them from
+the evidence or mark them as matched. Charts always summarize the full report;
+filtered exports identify their scope and include private reviewer notes.
+Search ignores accents/case only for retrieval, never for record matching. A
+filtered CSV is a convenience artifact; retain the complete evidence and review
+JSONs and protect them using institutional storage and access controls.
 
 ## Brazil
 
