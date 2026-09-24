@@ -151,3 +151,32 @@ receipt remain separate from six-component case files. Loading verified prepared
 files creates a new reconciliation input session and does not resume supplied
 evidence or review history. Clear/input changes invalidate pending results;
 processing remains in browser memory with no data upload or persistence.
+
+## Complete audit bundle boundary (v8)
+
+An audit bundle embeds the unchanged case, unchanged preparation receipt and both
+original extracts, plus a freshly recomputed preparation verification receipt.
+All component hashes, original/prepared relationships, case rules/outcomes,
+configuration and review bindings are checked at creation and on reopening. This
+adds a retained artifact for the full lineage without changing existing evidence,
+review, preparation or six-component case schemas.
+
+Original columns excluded during preparation are present in the bundle's raw
+extracts. The bundle also includes private prepared records and review notes.
+It is plaintext, unsigned and unencrypted; its storage, access, retention and
+transfer must remain inside the institution's approved controls. Nothing is
+published to a network or automatically extracted to the filesystem. The whole
+serialized file is limited to 96 MiB, with separately bounded components.
+
+Optional independent case/preparation references gate creation; those checks do
+not become assertions of independent references inside the package. Only a
+separately retained whole-bundle digest binds a reopening operation to that
+external identity. Internal component hashes establish local consistency, not
+source identity, completeness, authorized exclusion, approved decisions,
+chronology, authenticated custody or on-chain inclusion. The bundle provides no
+signature, encryption, rollback prevention or regulatory certification.
+
+Opening resumes the exact case and review journal; subsequent edits in the
+workbench do not rewrite the retained bundle. Updated work requires a newly
+exported case and bundle. The synthetic example and UI state identify data mode;
+that mode remains a declaration, not evidence of institutional provenance.

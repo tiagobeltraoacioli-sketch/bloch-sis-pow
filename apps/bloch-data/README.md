@@ -103,7 +103,8 @@ or download the exact retained preparation receipt again. The verification
 receipt records original/prepared file identities, row counts, changed-cell
 counts, receipt/evidence identities and the status of optional independent pins.
 It contains no source record values or review notes. Retain the full file set
-separately; neither receipt is embedded in the existing six-component cases.
+separately, or retain the preparation and case together in an audit bundle.
+Neither receipt changes the existing six-component case format.
 
 Loading verified prepared CSVs is an explicit action that replaces the active
 workbench files, configuration, report and review session. It does not resume
@@ -118,6 +119,62 @@ a coherent replacement can pass. Timestamps, policy references, filenames and
 data mode remain declarations. Source identity/completeness, authorization,
 rollback protection, audit signatures, regulatory certification and on-chain
 inclusion remain outside this verifier's guarantees.
+
+## Complete audit bundles (v8)
+
+`#audit-bundle` retains the complete source-preparation path and reviewed case in
+one `bloch.data.audit-bundle.v1` JSON file. Supply an existing case, its preparation
+receipt and both exact original extracts. Preparation is reproduced against the
+prepared CSVs already embedded in the case. Case components, configuration, data
+mode, evidence outcomes and review binding must all verify before packaging.
+Optional independently retained case/preparation digests gate creation.
+
+The bundle has exactly five ordered, fixed-name components:
+
+1. `case.bloch.json`: the unchanged six-component case.
+2. `preparation.json`: the unchanged source-preparation receipt.
+3. `original-a.csv`: exact original A bytes, including BOM and line endings.
+4. `original-b.csv`: exact original B bytes.
+5. `preparation-verification.json`: a freshly recomputed, unsigned consistency
+   receipt linking originals, preparation, prepared CSVs and case evidence.
+
+The original case/evidence/review schemas and bytes are not rewritten. Prepared
+CSVs are retained inside the case rather than duplicated as outer components.
+The package is JSON with embedded UTF-8 text, not a ZIP. Nothing is executed or
+automatically extracted. It includes private original columns excluded from
+prepared output, records and review notes in **plaintext**. It is not encrypted
+or signed; institutional storage/access/retention controls remain necessary.
+The complete serialized bundle is capped at 96 MiB, including JSON escaping.
+Individual input maxima do not guarantee that their combination fits this bound.
+
+Bundle reopening checks exact manifest fields, component names/order, byte sizes
+and hashes, independently verifies the embedded six-component case, reruns
+preparation and compares its outputs to the case sources byte-for-byte. Every
+review entry remains bound to the exact retained evidence. The packaged
+preparation verification receipt is itself compared with recomputation, retaining
+only its declared local timestamp. Embedded digests are internal consistency
+bindings, never represented as independent references. Supply a separately
+retained SHA-256 of the whole bundle to bind reopening to that exact artifact.
+
+An interactive graph exposes originals, transformation, case and review journal.
+The review preview shows the last 10 entries; verification checks all entries.
+Download verified components individually, the exact retained bundle, or a
+`bloch.data.audit-bundle-verification.v1` receipt and its SHA-256. The new receipt
+records file identities, counts and scoped checks without raw records or notes.
+A labelled synthetic example uses the active module and one illustrative review.
+
+Opening the verified case explicitly replaces the current workbench session while
+preserving the exact evidence bytes and retained review history. New annotations
+do not modify the bundle snapshot. Export an updated case and prepare a new
+bundle to retain subsequent work. Builder and verifier are separate sessions;
+input changes and clear actions cancel their respective pending results. All
+processing remains local in memory, including in the offline distribution.
+
+The diagram represents verified data bindings, not chronology, authenticated
+custody or on-chain transactions. Without an independent bundle digest, a
+coherent replacement can pass consistency checks. Source authenticity and
+completeness, mapping authorization, reviewer identity, approval authority,
+protected time, rollback prevention and regulatory certification are not supplied.
 
 ## Global and LatAm configuration
 
@@ -343,7 +400,7 @@ the final newline. Reformatting, duplicate keys and ambiguous JSON are rejected.
 Limits: 24 MiB evidence JSON, 8 MiB review JSON, 2 MiB per CSV, 120 characters for
 reviewer labels and 2,000 for notes. All inputs must be valid UTF-8. Malformed or
 changed files invalidate prior verification results. The original v1 evidence
-schema and comparison rules remain supported; the browser interface is v7.
+schema and comparison rules remain supported; the browser interface is v8.
 
 Without a separately retained report digest, verification establishes internal
 consistency only. A coherent replacement of the evidence and both sources can
@@ -376,7 +433,7 @@ prototype, and their guarantees are not attributed to it.
 
 ## Run locally / offline
 
-Unzip `downloads/bloch-data-local-workbench-v7.zip` into an approved directory.
+Unzip `downloads/bloch-data-local-workbench-v8.zip` into an approved directory.
 Start a localhost-only server from that directory:
 
 ```sh
@@ -395,7 +452,7 @@ configuration by the two example download controls.
 ## Build, test and deploy (repository)
 
 ```sh
-node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs scripts/test-bloch-data-case.mjs scripts/test-bloch-data-diff.mjs scripts/test-bloch-data-preparation.mjs scripts/test-bloch-data-preparation-verification.mjs
+node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs scripts/test-bloch-data-case.mjs scripts/test-bloch-data-diff.mjs scripts/test-bloch-data-preparation.mjs scripts/test-bloch-data-preparation-verification.mjs scripts/test-bloch-data-audit-bundle.mjs
 python3 scripts/build-bloch-data.py
 node scripts/verify-bloch-data.mjs
 wrangler pages deploy apps/bloch-data --project-name bloch-data --branch main
@@ -411,7 +468,7 @@ outside the public static directory. Serve the provided `_headers` on production
 
 `assets/modules.v1.mjs` defines schemas, keys, field types, institution defaults,
 and regional profiles. `reconcile.v1.mjs` provides strict parsing and comparison;
-`samples.v1.mjs` supplies labelled fixtures; `workbench.v7.mjs` renders local state.
+`samples.v1.mjs` supplies labelled fixtures; `workbench.v8.mjs` renders local state.
 `audit.v1.mjs` validates/recomputes evidence and journals; `verification.v1.mjs`
 handles the separate verifier session. `queue.v1.mjs` provides the local search
 index, selection/sort rules, chart summaries and filtered CSV export. These are
@@ -428,6 +485,9 @@ separate preparation session, lineage charts and downloads.
 evidence linkage; `preparation-verifier-workbench.v1.mjs` renders its independent
 session and path graph. `preparation-samples.v1.mjs` generates synthetic originals,
 preparation and evidence for the verifier example.
+`audit-bundle.v1.mjs` packages and verifies the complete retained path;
+`audit-bundle-workbench.v1.mjs` manages separate builder/verifier sessions and
+`audit-bundle-samples.v1.mjs` supplies the labelled example.
 Versioned static asset URLs keep existing
 immutable caches isolated from the updated interface.
 Add a reviewed schema and key definition to the module registry, add independent

@@ -22,15 +22,15 @@ for name, content in fixtures.items():
 (site/'samples/venue.csv').write_text(fixtures['trades-global-a.csv'])
 (site/'samples/clearing.csv').write_text(fixtures['trades-global-b.csv'])
 (site/'downloads').mkdir(exist_ok=True)
-package = site/'downloads/bloch-data-local-workbench-v7.zip'
+package = site/'downloads/bloch-data-local-workbench-v8.zip'
 files = [site/'index.html', site/'README.md', site/'GOVERNANCE.md', site/'regulatory-register.v1.json']
-files += [site/'assets'/name for name in ['exchange.v7.css','modules.v1.mjs','reconcile.v1.mjs','samples.v1.mjs','workbench.v7.mjs','audit.v1.mjs','verification.v1.mjs','queue.v1.mjs','case-file.v1.mjs','case-workbench.v1.mjs','case-diff.v1.mjs','diff-samples.v1.mjs','diff-workbench.v1.mjs','preparation.v1.mjs','preparation-workbench.v1.mjs','preparation-verification.v1.mjs','preparation-verifier-workbench.v1.mjs','preparation-samples.v1.mjs','bloch-inc-logo-dark.png','favicon.png']]
+files += [site/'assets'/name for name in ['exchange.v8.css','modules.v1.mjs','reconcile.v1.mjs','samples.v1.mjs','workbench.v8.mjs','audit.v1.mjs','verification.v1.mjs','queue.v1.mjs','case-file.v1.mjs','case-workbench.v1.mjs','case-diff.v1.mjs','diff-samples.v1.mjs','diff-workbench.v1.mjs','preparation.v1.mjs','preparation-workbench.v1.mjs','preparation-verification.v1.mjs','preparation-verifier-workbench.v1.mjs','preparation-samples.v1.mjs','audit-bundle.v1.mjs','audit-bundle-workbench.v1.mjs','audit-bundle-samples.v1.mjs','bloch-inc-logo-dark.png','favicon.png']]
 files += sorted((site/'samples').glob('*.csv'))
 with zipfile.ZipFile(package, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
     for file in files:
         data = file.read_bytes()
         if file.name == 'index.html':
-            data = data.replace(b'href="downloads/bloch-data-local-workbench-v7.zip" download', b'href="README.md"')
+            data = data.replace(b'href="downloads/bloch-data-local-workbench-v8.zip" download', b'href="README.md"')
             data = data.replace(b'Download the offline workbench', b'Offline instructions')
             data = data.replace(b'Download for your environment', b'Offline instructions')
         entry = zipfile.ZipInfo(str(file.relative_to(site)), date_time=(2026,9,24,0,0,0))
