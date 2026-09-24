@@ -16,6 +16,10 @@ changed. If you cloned one of these, you are in the right place.
 
 ## Read this first if you want to run a node on the live chain
 
+**Current signed Linux x86-64 validator upgrade:** [September 24, 2026 — `4d4c5075`](releases/bloch-pos-2026-09-24/README.md).
+The package includes the binary, signed checksum and upgrade instructions.
+[Download from the site](https://blochl1.com/releases/2026-09-24/bloch-pos).
+
 The live chain is **Genesis-4**, proof of stake. It started at
 **2026-08-13 21:31:19 UTC** and has been producing a block every 30 s and
 finalising every epoch since. The trunk of this repository builds it:
