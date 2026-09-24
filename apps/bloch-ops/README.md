@@ -31,3 +31,7 @@ node --test apps/bloch-ops/monitor/*.test.mjs apps/bloch-ops/rpc/response-guard.
 ```
 
 The monitor links the existing source consoles, Bloch Space GraphLab, and the separate Bloch Markets local receipt Studio.
+
+## Historical analytics
+
+The monitor now includes selectable observation windows, an interactive source/outcome map, source-sample inspection, adjacent head-progress rates, concurrent RPC-failure episodes, six-signal Pearson correlations and distribution tables. Missing values, constant signals and sampling gaps remain explicit. Analysis JSON includes its selected evidence and can be reopened as unverified replay, with derived results recomputed. See [methods and limits](monitor/ANALYTICS.md). These calculations add no requests or automatic persistence.

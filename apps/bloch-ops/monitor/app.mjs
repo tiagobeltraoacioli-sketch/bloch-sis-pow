@@ -1,9 +1,11 @@
+import {mountAnalytics} from './analytics-view.mjs';
 import {SOURCES,MAX_ROUNDS,DEFAULTS,settings,validateBundle,freshness,stake,metrics,evaluate,transitionAlerts,statistics,csv} from './model.mjs';
 import {readRound} from './source.mjs';
 const $=id=>document.getElementById(id),esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num=v=>v==null?'—':Number(v).toLocaleString('en-US'),short=v=>typeof v==='string'&&v.length>24?v.slice(0,14)+'…'+v.slice(-8):v??'—';
 const utc=v=>new Date(v).toLocaleTimeString('en-GB',{timeZone:'UTC'})+' UTC';
 const svg=(tag,attrs={})=>{const n=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [key,value]of Object.entries(attrs))n.setAttribute(key,value);return n;};
+const analytics=mountAnalytics(document.getElementById('analytics'),save);
 let config={...DEFAULTS},rounds=[],alerts=new Map(),events=[],busy=false,automatic=true,replay=false,replayIndex=0,controller=null,generation=0,nextDue=Date.now(),selected='chain';
 function windowRounds(){return replay?rounds.slice(0,replayIndex+1):rounds;}
 function current(){return windowRounds().at(-1);}
@@ -66,7 +68,7 @@ function renderEvidence(){
   $('source-facts').innerHTML=facts.map(([k,v])=>`<div><span>${k}</span><strong>${esc(v)}</strong></div>`).join('');$('source-json').textContent=o?JSON.stringify(o,null,2):'No source observation.';
   const stats=statistics(windowRounds());$('source-statistics').innerHTML=Object.entries(stats).map(([key,s])=>`<tr><td>${SOURCES[key].name}</td><td>${s.valid} / ${s.attempts}</td><td>${s.successRatio==null?'—':(s.successRatio*100).toFixed(1)+'%'}</td><td>${num(s.median)} ms</td><td>${num(s.p95)} ms</td></tr>`).join('');
 }
-function render(full=true){mode();renderSources();updateAlerts();renderAlerts();renderMap();renderEvidence();if(full)renderCharts();}
+function render(full=true){mode();renderSources();updateAlerts();renderAlerts();renderMap();renderEvidence();if(full){renderCharts();analytics.update(windowRounds(),config);}}
 function fillSettings(){for(const key of Object.keys(DEFAULTS))if(key==='interval')$('interval').value=String(config.interval);else $('setting-'+key).value=config[key];}
 async function refresh(){
   if(busy||replay)return;busy=true;const id=++generation;controller=new AbortController();mode();let done=0;message('Reading 0 / 6 public sources…');
@@ -85,7 +87,7 @@ $('copy-curl').onclick=async()=>{const s=SOURCES[selected],command=s.method?`cur
 $('clear-history').onclick=()=>{clear();message('Tab observations cleared. The next scheduled read starts a new window.');};
 $('export-json').onclick=()=>save(JSON.stringify({schema:'bloch-ops-monitor/1',exported_at:new Date().toISOString(),verification:'source-reported observations; not an attestation',scope:'Selected public response fields from this browser. No private data or signing capability.',settings:config,rounds:windowRounds()},null,2),'application/json','json');
 $('export-csv').onclick=()=>save(csv(windowRounds()),'text/csv','csv');
-$('session-import').onchange=async e=>{const file=e.target.files[0];if(!file)return;try{if(file.size>8*1024*1024)throw new Error('Session files must be 8 MiB or smaller.');const parsed=validateBundle(JSON.parse(await file.text()));if(!parsed.rounds.length)throw new Error('The session has no recorded rounds.');clear();config=parsed.settings;rounds=parsed.rounds;automatic=false;replay=true;replayIndex=rounds.length-1;$('replay-round').max=String(replayIndex);$('replay-round').value=String(replayIndex);fillSettings();render();message('Unverified evidence opened locally. No live queries will run until you start a new live session.');}catch(error){message(`Import rejected: ${error.message}`,true);}finally{e.target.value='';}};
+$('session-import').onchange=async e=>{const file=e.target.files[0];if(!file)return;try{if(file.size>8*1024*1024)throw new Error('Session files must be 8 MiB or smaller.');const raw=JSON.parse(await file.text());const parsed=validateBundle(raw?.schema==='bloch-ops-analysis/1'?raw.evidence:raw);if(!parsed.rounds.length)throw new Error('The session has no recorded rounds.');clear();config=parsed.settings;rounds=parsed.rounds;automatic=false;replay=true;replayIndex=rounds.length-1;$('replay-round').max=String(replayIndex);$('replay-round').value=String(replayIndex);fillSettings();render();message('Unverified evidence opened locally. No live queries will run until you start a new live session.');}catch(error){message(`Import rejected: ${error.message}`,true);}finally{e.target.value='';}};
 $('replay-round').oninput=()=>{replayIndex=Number($('replay-round').value);render();};
 $('resume-live').onclick=()=>{replay=false;automatic=true;config={...DEFAULTS};clear();fillSettings();refresh();};
 document.addEventListener('visibilitychange',()=>{mode();if(!document.hidden&&automatic&&!replay&&!busy&&Date.now()>=nextDue)refresh();});
