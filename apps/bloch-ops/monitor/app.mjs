@@ -1,0 +1,93 @@
+import {SOURCES,MAX_ROUNDS,DEFAULTS,settings,validateBundle,freshness,stake,metrics,evaluate,transitionAlerts,statistics,csv} from './model.mjs';
+import {readRound} from './source.mjs';
+const $=id=>document.getElementById(id),esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num=v=>v==null?'—':Number(v).toLocaleString('en-US'),short=v=>typeof v==='string'&&v.length>24?v.slice(0,14)+'…'+v.slice(-8):v??'—';
+const utc=v=>new Date(v).toLocaleTimeString('en-GB',{timeZone:'UTC'})+' UTC';
+const svg=(tag,attrs={})=>{const n=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [key,value]of Object.entries(attrs))n.setAttribute(key,value);return n;};
+let config={...DEFAULTS},rounds=[],alerts=new Map(),events=[],busy=false,automatic=true,replay=false,replayIndex=0,controller=null,generation=0,nextDue=Date.now(),selected='chain';
+function windowRounds(){return replay?rounds.slice(0,replayIndex+1):rounds;}
+function current(){return windowRounds().at(-1);}
+function basisTime(){return replay&&current()?Date.parse(current().finished_at):Date.now();}
+function state(source){return freshness(current()?.observations[source],basisTime(),config);}
+function liveData(source){return state(source)==='valid'?current().observations[source].data:null;}
+function message(text,error=false){$('monitor-status').textContent=text;$('monitor-status').dataset.error=String(error);}
+function mode(){const key=replay?'replay':!automatic?'paused':document.hidden?'paused':'live';$('mode-label').dataset.mode=key;$('mode-label').textContent=replay?'UNVERIFIED LOCAL REPLAY':!automatic?'SCHEDULED READS PAUSED':document.hidden?'HIDDEN TAB / SCHEDULE PAUSED':'LIVE SOURCE READS';$('pause').textContent=automatic?'Pause':'Resume';$('pause').hidden=replay;$('refresh').disabled=busy||replay;$('resume-live').hidden=!replay;$('interval').disabled=replay;$('replay-controls').hidden=!replay;$('clear-history').disabled=busy;$('session-import').disabled=busy;}
+function updateAlerts(){const view=windowRounds();if(replay){alerts=new Map();events=[];for(const r of view){const prefix=view.slice(0,view.indexOf(r)+1),result=transitionAlerts(alerts,evaluate(prefix,config,Date.parse(r.finished_at)),r.finished_at);alerts=result.alerts;events.push(...result.events);}}else{const result=transitionAlerts(alerts,evaluate(view,config,Date.now()),new Date().toISOString());alerts=result.alerts;events.push(...result.events);}events=events.slice(-500);}
+function summary(source,data){if(!data)return ['—','No current valid observation.'];switch(source){
+  case 'chain':return [`#${num(data.height)}`,`Slot ${num(data.slot)} · finalized #${num(data.finalized_height)}`];
+  case 'validators':return [`${num(data.active)} / ${num(data.total)}`,`${stake(data.total_active_stake_sat)} BLCH active stake`];
+  case 'admission':return [data.active?'Reported active':'Reported inactive',`Minimum ${stake(data.minimum_stake_sat)} BLCH · epoch ${num(data.epoch)}`];
+  case 'mempool':return [`${num(data.size)} transactions`,`${num(data.bytes)} bytes · ${num(data.max)} configured maximum`];
+  case 'build':return [data.package_version,`Source ${short(data.source_digest)} · ${data.corroboration.source_node??'observer unspecified'}`];
+  case 'indexer':return [`#${num(data.indexed_to_height)}`,`${num(data.transactions)} indexed transactions · ${num(data.lag_slots)} lag slots`];
+}}
+function renderSources(){
+  const c=liveData('chain'),v=liveData('validators'),m=liveData('mempool');
+  const cards=[['Observed head',c?num(c.height):'—',c?`Slot ${num(c.slot)}`:'Waiting for a current chain read'],['Finality distance',c?.finalized_height==null?'—':num(c.height-c.finalized_height),'Blocks from the reported checkpoint'],['Active validators',v?`${num(v.active)} / ${num(v.total)}`:'—','Separate registry source observation'],['Node queue',m?num(m.size):'—','Transactions at the answering observer']];
+  $('headline-metrics').innerHTML=cards.map(([label,value,detail])=>`<article class="headline-metric"><span>${label}</span><strong>${value}</strong><small>${detail}</small></article>`).join('');
+  $('source-cards').innerHTML=Object.entries(SOURCES).map(([key,s])=>{const o=current()?.observations[key],status=state(key),[value,detail]=summary(key,liveData(key));return `<article class="source-card"><div class="source-top"><h3>${s.name}</h3><span class="source-state" data-state="${status}">${replay&&status==='valid'?'RECORDED VALID':status==='valid'?'VALID REPLY':status.toUpperCase()}</span></div><div class="source-value">${esc(value)}</div><p>${esc(o?.status==='failed'?o.error:detail)}</p><div class="source-bottom"><span>${o?`${utc(o.at)} · ${num(o.round_trip_ms)} ms`:'No source observation'}</span><button type="button" data-inspect="${key}">Inspect ↗</button></div></article>`;}).join('');
+  const valid=Object.keys(SOURCES).filter(k=>state(k)==='valid').length;$('freshness-note').textContent=`${valid} / 6 ${replay?'recorded':'current'} valid readouts · separate source snapshots`;$('round-count').textContent=`${windowRounds().length} / ${MAX_ROUNDS} rounds`;
+  const view=windowRounds();$('window-label').textContent=view.length?`${utc(view[0].started_at)} → ${utc(view.at(-1).finished_at)} · ${view.length} rounds`:'Waiting for source samples.';
+  $('replay-label').textContent=replay?`${replayIndex+1} / ${rounds.length} · ${current()?utc(current().finished_at):'Empty'}`:'';
+  $('export-json').disabled=!rounds.length;$('export-csv').disabled=!rounds.length;
+}
+function renderMap(){
+  const graphic=$('source-map');graphic.replaceChildren();
+  const line=(d,dashed=false)=>graphic.append(svg('path',{d,class:'topology-line',...(dashed?{'stroke-dasharray':'4 5'}:{})}));
+  line('M130 136 H175 V77 H224');line('M175 136 V236 H224');
+  for(let i=0;i<5;i++)line(`M360 77 H409 V${30+i*48} H449`);
+  const box=(x,y,w,text,source=null)=>{const group=svg('g',{class:'topology-node',...(source?{'data-source':source,'data-state':state(source),tabindex:'0',role:'button','aria-label':`Inspect ${text}`}:{})});group.append(svg('rect',{x,y:y-17,width:w,height:34,rx:5}));const label=svg('text',{x:x+w/2,y:y+4,'text-anchor':'middle'});label.textContent=text;group.append(label);if(source){group.addEventListener('click',()=>inspect(source,true));group.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();inspect(source,true);}});}graphic.append(group);};
+  box(8,136,122,'Your browser');box(224,77,136,'Public RPC');box(224,236,136,'Indexer relay','indexer');['chain','validators','admission','mempool','build'].forEach((s,i)=>box(449,30+i*48,155,SOURCES[s].name,s));
+  line('M604 30 H640 V58 H666',true);line('M640 30 V105 H666',true);box(666,58,100,'Witness');box(666,105,100,'Plane');
+  const note=svg('text',{x:625,y:148,class:'topology-note'});note.textContent='Reported flags';graphic.append(note);const second=svg('text',{x:226,y:282,class:'topology-note'});second.textContent='Separate source reads; no consensus attestation.';graphic.append(second);
+}
+function chart(title,description,keys,labels){
+  const view=windowRounds(),panel=document.createElement('article');panel.className='trend-chart';panel.innerHTML=`<h3>${title}</h3><p>${description}</p>`;
+  const rows=view.map((r,i)=>{const data=metrics(r);return {time:Date.parse(r.finished_at),data,index:i};}),values=rows.flatMap(r=>keys.map(k=>r.data[k])).filter(v=>v!=null);
+  if(!values.length){panel.insertAdjacentHTML('beforeend','<p class="empty-state">No valid observations for this metric.</p>');return panel;}
+  const graphic=svg('svg',{viewBox:'0 0 620 205',role:'img','aria-label':`${title}. ${rows.length} sampled rounds; missing values are gaps.`}),low=Math.min(...values),high=Math.max(...values),spread=high-low||1,start=rows[0].time,end=rows.at(-1).time;
+  const x=r=>end===start?316:45+(r.time-start)/(end-start)*555,y=v=>high===low?91:160-(v-low)/spread*137;
+  for(let i=0;i<4;i++){const py=23+i*137/3;graphic.append(svg('line',{x1:45,x2:600,y1:py,y2:py,class:'chart-grid'}));const label=svg('text',{x:4,y:(high===low?91:py)+4,class:'chart-label'});label.textContent=Number(high-spread*i/3).toLocaleString('en-US',{maximumFractionDigits:1});if(high!==low||i===0)graphic.append(label);}
+  for(const [series,key]of keys.entries()){let segment=[],previous=null;const flush=()=>{if(segment.length>1)graphic.append(svg('path',{d:segment.map((p,i)=>`${i?'L':'M'}${p[0].toFixed(2)} ${p[1].toFixed(2)}`).join(' '),class:series?'chart-line chart-secondary':'chart-line'}));segment=[];};for(const row of rows){const value=row.data[key];if(value==null||previous!=null&&row.time-previous>config.interval*2500)flush();if(value!=null){segment.push([x(row),y(value)]);const dot=svg('circle',{cx:x(row),cy:y(value),r:rows.length>70?1.7:3,class:series?'chart-dot secondary':'chart-dot'}),tip=svg('title');tip.textContent=`${labels[series]} · ${num(value)} · ${utc(row.time)}`;dot.append(tip);graphic.append(dot);}previous=row.time;}flush();}
+  for(const [at,text,anchor]of [[45,utc(start),'start'],[600,utc(end),'end']]){const label=svg('text',{x:at,y:192,'text-anchor':anchor,class:'chart-label'});label.textContent=text;graphic.append(label);}panel.append(graphic);
+  const rail=document.createElement('div');rail.className='chart-rail';rail.innerHTML=`<span>${labels.join(' / ')}</span><span>${num(low)} → ${num(high)} observed range</span>`;panel.append(rail);return panel;
+}
+function renderCharts(){const definitions=[['Head & finalized height','Independent observations of the answering gateway.',['height','finalized'],['Head','Finalized']],['Finality distance','Reported head minus reported finalized height, in blocks.',['finality_gap'],['Blocks']],['Observer synchronization','Source-reported distance from its wall slot.',['sync_lag'],['Slots']],['Historical indexing','Lag reported by the indexer against its own comparison head.',['indexer_lag'],['Slots']],['Node mempool','Queue occupancy from a routed node-local read.',['mempool'],['Transactions']],['Validator participation set','Active registry count from a separate source read.',['active'],['Active validators']],['Transport connections','Reported devnet connections; not unique peers across the network.',['connections'],['Connections']],['Browser round trip','getchaininfo latency includes network and gateway processing.',['latency'],['Milliseconds']],['Head / indexer difference','Signed height difference between separate moving snapshots.',['indexer_delta'],['Blocks']]];$('trend-charts').replaceChildren(...definitions.map(args=>chart(...args)));}
+function renderAlerts(){
+  const open=[...alerts.values()].filter(a=>a.state!=='resolved');$('alert-count').textContent=current()?`${open.filter(a=>a.state==='active').length} active / ${open.filter(a=>a.state==='unknown').length} awaiting observation`:'Waiting for the first round.';
+  $('active-alerts').innerHTML=open.length?open.map(a=>`<article class="alert-card" data-state="${a.state}"><div class="alert-meta">${a.state==='unknown'?'AWAITING FRESH OBSERVATION':a.acknowledged?'ACKNOWLEDGED IN THIS TAB':'REVIEW'} · ${utc(a.opened_at)}</div><h3>${esc(a.title)}</h3><p>${esc(a.detail)}</p><button type="button" data-ack="${esc(a.id)}" ${replay||a.acknowledged?'disabled':''}>${a.acknowledged?'Acknowledged':'Acknowledge locally'}</button></article>`).join(''):`<div class="empty-state">${current()?'No active condition under the selected local thresholds. This is not a network safety or availability guarantee.':'Conditions will be evaluated after the first bounded source round.'}</div>`;
+  $('alert-history').innerHTML=events.slice().reverse().map(e=>`<tr><td>${utc(e.at)}</td><td>${esc(e.action.replaceAll('_',' '))}</td><td>${esc(e.title)}</td></tr>`).join('')||'<tr><td colspan="3">No condition transitions recorded.</td></tr>';
+}
+function inspect(source,scroll=false){selected=source;$('inspect-source').value=source;renderEvidence();if(scroll)$('evidence').scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth'});}
+function renderEvidence(){
+  const o=current()?.observations[selected],meta=SOURCES[selected];$('source-scope').textContent=meta.scope;$('source-guide').href=meta.route;
+  const facts=[['Public source',meta.url],['Browser read route',meta.relay??'Direct public gateway'],['Method',meta.method||'GET /indexer/health'],['Observation',o?utc(o.at):'Unavailable'],['State',replay?`Recorded ${o?.status??'unknown'} / unverified file`:state(selected)],['Round trip',o?`${num(o.round_trip_ms)} ms`:'—'],['Field coverage','Selected validated fields; unknown API properties omitted']];
+  const data=o?.data;if(data?.network_domain)facts.push(['Reported network domain',data.network_domain]);if(data?.source_digest)facts.push(['Reported source digest',data.source_digest]);if(data?.block_id)facts.push(['Reported block ID',data.block_id]);if(data?.chain_tip)facts.push(['Indexed chain tip',data.chain_tip]);
+  $('source-facts').innerHTML=facts.map(([k,v])=>`<div><span>${k}</span><strong>${esc(v)}</strong></div>`).join('');$('source-json').textContent=o?JSON.stringify(o,null,2):'No source observation.';
+  const stats=statistics(windowRounds());$('source-statistics').innerHTML=Object.entries(stats).map(([key,s])=>`<tr><td>${SOURCES[key].name}</td><td>${s.valid} / ${s.attempts}</td><td>${s.successRatio==null?'—':(s.successRatio*100).toFixed(1)+'%'}</td><td>${num(s.median)} ms</td><td>${num(s.p95)} ms</td></tr>`).join('');
+}
+function render(full=true){mode();renderSources();updateAlerts();renderAlerts();renderMap();renderEvidence();if(full)renderCharts();}
+function fillSettings(){for(const key of Object.keys(DEFAULTS))if(key==='interval')$('interval').value=String(config.interval);else $('setting-'+key).value=config[key];}
+async function refresh(){
+  if(busy||replay)return;busy=true;const id=++generation;controller=new AbortController();mode();let done=0;message('Reading 0 / 6 public sources…');
+  try{const round=await readRound({signal:controller.signal,onProgress:()=>{done++;if(id===generation)message(`Reading ${done} / 6 public sources…`);}});if(id!==generation)return;rounds.push(round);if(rounds.length>MAX_ROUNDS)rounds.shift();const valid=Object.values(round.observations).filter(o=>o.status==='valid').length;render();message(`${valid} / 6 valid source readouts · ${utc(round.finished_at)}${automatic?'':' · scheduled reads paused'}`,valid<6);}
+  catch{if(id===generation)message('Observation round cancelled. Earlier evidence is preserved.',true);}
+  finally{if(id===generation){busy=false;controller=null;nextDue=Date.now()+config.interval*1000;mode();}}
+}
+function clear(){generation++;controller?.abort();controller=null;busy=false;rounds=[];alerts=new Map();events=[];replayIndex=0;render();}
+function save(data,type,name){const url=URL.createObjectURL(new Blob([data],{type})),a=document.createElement('a');a.href=url;a.download=`bloch-ops-${new Date().toISOString().replaceAll(':','-')}.${name}`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+$('refresh').onclick=refresh;$('pause').onclick=()=>{automatic=!automatic;if(!automatic){generation++;controller?.abort();controller=null;busy=false;message('Scheduled reads paused. Source freshness continues to age.');}else refresh();render(false);};
+$('interval').onchange=()=>{config=settings({...config,interval:Number($('interval').value)});nextDue=Date.now()+config.interval*1000;render(false);};
+$('settings-form').onsubmit=e=>{e.preventDefault();try{const input={interval:Number($('interval').value)};for(const key of Object.keys(DEFAULTS).filter(k=>k!=='interval'))input[key]=key.startsWith('expected')?$('setting-'+key).value.trim():Number($('setting-'+key).value);config=settings(input);render();message('Local review thresholds applied.');}catch(error){message(error.message,true);}};
+$('inspect-source').innerHTML=Object.entries(SOURCES).map(([key,s])=>`<option value="${key}">${s.name}</option>`).join('');$('inspect-source').onchange=()=>inspect($('inspect-source').value);
+document.addEventListener('click',e=>{const inspectButton=e.target.closest('[data-inspect]');if(inspectButton)inspect(inspectButton.dataset.inspect,true);const ack=e.target.closest('[data-ack]');if(ack&&!replay){const a=alerts.get(ack.dataset.ack);if(a){a.acknowledged=true;events.push({at:new Date().toISOString(),id:a.id,action:'acknowledged_locally',title:a.title});renderAlerts();}}});
+$('copy-curl').onclick=async()=>{const s=SOURCES[selected],command=s.method?`curl -sS '${s.url}' -H 'Content-Type: application/json' --data '${JSON.stringify({jsonrpc:'2.0',id:'ops-observe',method:s.method,params:[]})}'`:`curl -sS '${s.url}'`;try{await navigator.clipboard.writeText(command);message('Read-only command copied.');}catch{message('Clipboard unavailable. Use the method and source shown in the inspector.',true);}};
+$('clear-history').onclick=()=>{clear();message('Tab observations cleared. The next scheduled read starts a new window.');};
+$('export-json').onclick=()=>save(JSON.stringify({schema:'bloch-ops-monitor/1',exported_at:new Date().toISOString(),verification:'source-reported observations; not an attestation',scope:'Selected public response fields from this browser. No private data or signing capability.',settings:config,rounds:windowRounds()},null,2),'application/json','json');
+$('export-csv').onclick=()=>save(csv(windowRounds()),'text/csv','csv');
+$('session-import').onchange=async e=>{const file=e.target.files[0];if(!file)return;try{if(file.size>8*1024*1024)throw new Error('Session files must be 8 MiB or smaller.');const parsed=validateBundle(JSON.parse(await file.text()));if(!parsed.rounds.length)throw new Error('The session has no recorded rounds.');clear();config=parsed.settings;rounds=parsed.rounds;automatic=false;replay=true;replayIndex=rounds.length-1;$('replay-round').max=String(replayIndex);$('replay-round').value=String(replayIndex);fillSettings();render();message('Unverified evidence opened locally. No live queries will run until you start a new live session.');}catch(error){message(`Import rejected: ${error.message}`,true);}finally{e.target.value='';}};
+$('replay-round').oninput=()=>{replayIndex=Number($('replay-round').value);render();};
+$('resume-live').onclick=()=>{replay=false;automatic=true;config={...DEFAULTS};clear();fillSettings();refresh();};
+document.addEventListener('visibilitychange',()=>{mode();if(!document.hidden&&automatic&&!replay&&!busy&&Date.now()>=nextDue)refresh();});
+setInterval(()=>{if(!replay)render(false);if(automatic&&!replay&&!busy&&!document.hidden&&Date.now()>=nextDue)refresh();},5000);
+fillSettings();render();refresh();
