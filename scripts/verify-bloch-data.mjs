@@ -210,17 +210,61 @@ try {
   assert.equal(await page.locator('#diff-results').isVisible(),false);assert.equal(await page.inputValue('#diff-baseline'),'');assert.equal(await page.inputValue('#diff-candidate'),'');assert.equal(await page.locator('#diff-rows').textContent(),'');assert.equal(await page.locator('#diff-identities').textContent(),'');
   await page.click('#diff-example');await page.waitForSelector('#diff-results:visible');await page.click('#diff-clear');
   assert.equal(requests.length,baseline,'Case comparison triggered network requests');
+
+  // Source preparation: independent conventions, explicit exclusions, lineage and prepared-source binding.
+  await page.click('#prep-example');
+  assert.ok((await page.locator('#prep-status').innerText()).startsWith('SYNTHETIC EXTRACTS'));
+  assert.equal(await page.inputValue('#prep-a-date'),'dmy');assert.equal(await page.inputValue('#prep-b-date'),'iso');
+  await page.locator('#source-preparation').evaluate(element=>element.scrollIntoView({block:'start'}));await page.screenshot({path:'/private/tmp/blochdata-preparation-input-1440.png'});
+  await page.setViewportSize({width:390,height:844});await page.locator('#source-preparation').evaluate(element=>element.scrollIntoView({block:'start'}));await page.screenshot({path:'/private/tmp/blochdata-preparation-input-390.png'});await page.setViewportSize({width:1440,height:1100});
+  await page.click('#prep-run');await page.waitForFunction(()=>document.getElementById('prep-status').textContent.includes('acknowledge'));
+  assert.equal(await page.locator('#prep-results').isVisible(),false);
+  await page.check('#prep-a-consent');await page.check('#prep-b-consent');await page.click('#prep-run');await page.waitForSelector('#prep-results:visible');
+  const prepReceiptPromise=page.waitForEvent('download');await page.click('#prep-receipt');const prepText=await readFile(await (await prepReceiptPromise).path(),'utf8'),prep=JSON.parse(prepText);
+  assert.equal(prep.mode,'synthetic_example');assert.equal(prep.sources[0].lineage[0].source_row,3);assert.equal(prep.sources[0].lineage[0].prepared_row,2);
+  assert.deepEqual(prep.sources.map(source=>source.output.rows),[8,7]);assert.equal(prep.assurance.evidence_source_binding,'prepared_csv_only');
+  assert.equal(createHash('sha256').update(prepText).digest('hex'),await page.locator('#prep-digest').innerText());
+  const prepHashPromise=page.waitForEvent('download');await page.click('#prep-hash');assert.ok((await readFile(await (await prepHashPromise).path(),'utf8')).startsWith(await page.locator('#prep-digest').innerText()));
+  const preparedTexts=[];for(const side of ['a','b']){const promise=page.waitForEvent('download');await page.click('#prep-download-'+side);preparedTexts.push(await readFile(await (await promise).path(),'utf8'));}
+  for(let index=0;index<2;index++)assert.equal(createHash('sha256').update(preparedTexts[index]).digest('hex'),prep.sources[index].output.sha256);
+  const prepConfigPromise=page.waitForEvent('download');await page.click('#prep-configuration');assert.deepEqual(JSON.parse(await readFile(await (await prepConfigPromise).path(),'utf8')),prep.configuration);
+  await page.locator('#prep-output button[data-field="booking_date"]').first().focus();await page.keyboard.press('Enter');
+  assert.equal(await page.locator('#prep-output button[data-field="booking_date"]').first().getAttribute('aria-pressed'),'true');
+  assert.ok((await page.locator('#prep-output').innerText()).includes('8 rows with booking_date normalized'));
+  await page.locator('#prep-output').evaluate(element=>element.scrollIntoView({block:'start'}));await page.screenshot({path:'/private/tmp/blochdata-preparation-1440.png'});
+  await page.setViewportSize({width:390,height:844});await page.locator('#prep-output').evaluate(element=>element.scrollIntoView({block:'start'}));await page.screenshot({path:'/private/tmp/blochdata-preparation-390.png'});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  await page.setViewportSize({width:1440,height:1100});
+  await page.click('#prep-open');assert.equal(await page.locator('#results').isVisible(),false);assert.equal(await page.locator('#mode-label').innerText(),'SYNTHETIC EXAMPLE');await page.click('#run');await page.waitForSelector('#results:visible');assert.equal(await page.locator('#metric-matched').innerText(),'3');
+  const preparedEvidencePromise=page.waitForEvent('download');await page.click('#export-json');const preparedEvidence=JSON.parse(await readFile(await (await preparedEvidencePromise).path(),'utf8'));
+  assert.equal(preparedEvidence.sources[0].sha256,prep.sources[0].output.sha256);assert.notEqual(preparedEvidence.sources[0].sha256,prep.sources[0].input.sha256);assert.deepEqual(preparedEvidence.configuration,prep.configuration);
+  // Mapping or format changes invalidate the receipt and require fresh exclusion acknowledgement.
+  await page.selectOption('#prep-a-map-account','book_entity');assert.equal(await page.locator('#prep-results').isVisible(),false);assert.equal(await page.isChecked('#prep-a-consent'),false);await page.check('#prep-a-consent');await page.click('#prep-run');await page.waitForFunction(()=>document.getElementById('prep-status').textContent.includes('different existing input column'));
+  await page.click('#prep-example');await page.check('#prep-a-consent');await page.check('#prep-b-consent');await page.selectOption('#prep-a-decimal','dot');assert.equal(await page.isChecked('#prep-a-consent'),false);await page.check('#prep-a-consent');await page.click('#prep-run');await page.waitForFunction(()=>document.getElementById('prep-status').textContent.includes('invalid amount'));
+  // File-based use preserves literal cells, no synthetic mixing, and does not need exclusions for exact schemas.
+  await page.click('#prep-clear');await page.click('#prep-capture');
+  await page.setInputFiles('#prep-a-file',{name:'literal-a.csv',mimeType:'text/csv',buffer:Buffer.from(preparedTexts[0].replaceAll('ACCOUNT-DEMO','<img src=x onerror=alert(1)>'))});
+  await page.setInputFiles('#prep-b-file',{name:'literal-b.csv',mimeType:'text/csv',buffer:Buffer.from(preparedTexts[1].replaceAll('ACCOUNT-DEMO','<img src=x onerror=alert(1)>'))});
+  await page.waitForFunction(()=>document.getElementById('prep-b-name').textContent.includes('rows'));assert.equal(await page.locator('#prep-a-consent').isDisabled(),true);await page.click('#prep-run');await page.waitForSelector('#prep-results:visible');
+  assert.ok((await page.locator('#prep-status').innerText()).startsWith('LOCAL EXTRACTS'));await page.locator('#prep-output details summary').first().click();assert.equal(await page.locator('#prep-output img, #prep-output script').count(),0);assert.ok((await page.locator('#prep-output .prep-preview').first().innerText()).includes('<img'));
+  await page.click('#prep-open');await page.click('#run');await page.waitForSelector('#results:visible');assert.equal(await page.locator('#mode-label').innerText(),'YOUR FILES / LOCAL ONLY');assert.equal(await page.locator('#result-rows img').count(),0);
+  await page.setInputFiles('#prep-a-file',{name:'invalid.csv',mimeType:'text/csv',buffer:Buffer.from([0xc3,0x28])});await page.waitForFunction(()=>document.getElementById('prep-status').classList.contains('error'));assert.equal(await page.locator('#prep-results').isVisible(),false);await page.click('#prep-run');await page.waitForFunction(()=>document.getElementById('prep-status').textContent.includes('Load and inspect'));
+  // Clearing a pending read must not resurrect a source or an earlier result.
+  await page.evaluate(()=>{window.prepOriginalRead=File.prototype.arrayBuffer;File.prototype.arrayBuffer=function(){return new Promise(resolve=>{window.releasePrepRead=()=>resolve(window.prepOriginalRead.call(this));});};});
+  await page.setInputFiles('#prep-a-file',{name:'delayed.csv',mimeType:'text/csv',buffer:Buffer.from(preparedTexts[0])});await page.waitForFunction(()=>typeof window.releasePrepRead==='function');await page.click('#prep-clear');await page.evaluate(()=>{File.prototype.arrayBuffer=window.prepOriginalRead;window.releasePrepRead();});
+  assert.equal(await page.inputValue('#prep-a-file'),'');assert.equal(await page.locator('#prep-a-mapping').innerText(),'');assert.equal(await page.locator('#prep-output').innerText(),'');assert.equal(await page.locator('#prep-digest').innerText(),'');assert.equal(await page.locator('#prep-results').isVisible(),false);assert.equal(await page.locator('#prep-a-name').innerText(),'No source loaded');
+  assert.equal(requests.length,baseline,'Source preparation triggered network requests');
+
   await context.setOffline(false);
-  for(const path of [process.env.VERIFY_DIR?'README.md':'downloads/bloch-data-local-workbench-v5.zip','GOVERNANCE.md','regulatory-register.v1.json','samples/venue.csv'])assert.equal((await context.request.get(new URL(path,target).href)).status(),200,path);
+  for(const path of [process.env.VERIFY_DIR?'README.md':'downloads/bloch-data-local-workbench-v6.zip','GOVERNANCE.md','regulatory-register.v1.json','samples/venue.csv'])assert.equal((await context.request.get(new URL(path,target).href)).status(),200,path);
   if(!process.env.VERIFY_DIR){
-    const packagePath='downloads/bloch-data-local-workbench-v5.zip';
+    const packagePath='downloads/bloch-data-local-workbench-v6.zip';
     const packageResponse=await context.request.get(new URL(packagePath,target).href),packageBytes=await packageResponse.body();
     assert.equal(packageBytes.subarray(0,4).toString('hex'),'504b0304','Offline download must be a ZIP, not an HTML fallback');
     const hashResponse=await context.request.get(new URL(packagePath+'.sha256',target).href);
     assert.equal(hashResponse.status(),200);const advertised=(await hashResponse.text()).trim().split(/\s+/);
     assert.equal(advertised[0],createHash('sha256').update(packageBytes).digest('hex'),'Offline ZIP must match its published SHA-256');
-    assert.equal(advertised[1],'bloch-data-local-workbench-v5.zip');
+    assert.equal(advertised[1],'bloch-data-local-workbench-v6.zip');
   }
   assert.deepEqual(errors,[]);
-  console.log(JSON.stringify({url:target,modules:4,regionalProfiles:7,layout,localUploads:'no network requests',exports:'digest verified',caseComparison:'offline example, transition filters, full exports, retained digests, case resume, tampering and cancellation',caseFiles:'six exact components, offline round-trip, retained digest, mutation and cancellation checked',queue:'search, chart filters, full 125-key export, page reset, journal binding',reviews:'bound journal, unchanged outcomes, resume verified report',verification:'offline recomputation, pin and tampering checked',malformedFiles:'fail closed',offline:'passed',xss:'text only',errors}));
+  console.log(JSON.stringify({url:target,modules:4,regionalProfiles:7,layout,localUploads:'no network requests',exports:'digest verified',sourcePreparation:'independent formats, exclusions, lineage, exact digests, machine CSV, prepared evidence, malformed UTF-8 and cancellation',caseComparison:'offline example, transition filters, full exports, retained digests, case resume, tampering and cancellation',caseFiles:'six exact components, offline round-trip, retained digest, mutation and cancellation checked',queue:'search, chart filters, full 125-key export, page reset, journal binding',reviews:'bound journal, unchanged outcomes, resume verified report',verification:'offline recomputation, pin and tampering checked',malformedFiles:'fail closed',offline:'passed',xss:'text only',errors}));
 }finally{await browser.close();server.close();}

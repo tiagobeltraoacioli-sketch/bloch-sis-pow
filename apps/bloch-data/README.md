@@ -24,13 +24,56 @@ exports retain every result and source row/value. Blank-line source row numbers
 are preserved. Per-key source previews show at most 20 rows per side; the JSON
 retains every duplicate source record. Maximum per source: 2 MiB and 5,000 records.
 
+## Source preparation (v6)
+
+The independent `#source-preparation` workspace captures the active module and
+policy configuration. Import two CSVs and select each source's delimiter,
+date format and decimal mark separately. Exact or configured headers are
+preselected; all other field mappings require an explicit selection. Every
+required field must map to a different input column. There is no value inference,
+localized-enum translation, thousands-separator guessing or approximate matching.
+
+Inputs permit up to 64 columns, 5,000 nonblank data records and 2 MiB of valid
+UTF-8 per side. Duplicate/empty headers and ragged rows fail closed. Excluding
+additional columns requires per-source acknowledgement, reset whenever a source,
+format or mapping changes. Excluded cell contents are not carried into exports.
+Mapped records pass through the existing module's exact validation rules.
+Canonical outputs retain row order, duplicate multiplicity, identifiers and
+numeric precision; use ISO dates, decimal dot, comma CSV and canonical headers.
+The output and projected CSV must also fit the 2 MiB reconciliation limit.
+
+Interactive charts count mapped cells whose text changed through the declared
+normalization rules. Select a field to inspect its row lineage. The screen shows
+10 lineage entries and 5 prepared records per side; the receipt contains every
+original/prepared row reference and changed-field list. Original BOM, line
+endings and excluded columns remain part of the original input's SHA-256.
+Machine CSVs preserve formula-like identifiers; import all columns as text if
+opening them in spreadsheet software. They are not spreadsheet-safe reports.
+
+Download both prepared files, their configuration and the preparation receipt
+with its SHA-256. The unsigned `bloch.data.source-preparation.v1` receipt records
+source and output hashes, byte and row counts, input headers, explicit mappings,
+exclusions, applied rules and row lineage. It contains filenames/configuration
+metadata, but no source cell values. Retain it with both originals and outputs.
+A hash establishes a byte reference, not source identity or completeness. The
+receipt is generated locally; this release has no receipt-import verifier.
+
+Loading prepared files explicitly replaces the active reconciliation session;
+it does not run the comparison. Subsequent evidence and six-component cases bind
+**only to the prepared CSVs**. Neither the original extracts nor the preparation
+receipt are embedded in those formats. The original-to-prepared relationship
+requires retaining the separate receipt and originals. This feature does not
+change any existing evidence, review or case schema. Synthetic examples retain
+their synthetic mode when loaded directly into reconciliation. Session data
+stays in memory; clearing preparation does not clear the separate workbench.
+
 ## Global and LatAm configuration
 
 Profiles: Global/custom, Brazil, Mexico, Colombia, Chile, Argentina and other
 LatAm jurisdictions. Brazil defaults to DD/MM/YYYY, decimal comma and semicolon
 CSV. No thousands separators are accepted. Every profile can override date,
 decimal, delimiter and source-column mapping. Both sources use the same applied
-configuration; normalize unlike exports before comparison. Applying a new
+configuration; use Source preparation to map unlike exports before comparison. Applying a new
 configuration clears loaded files. Example data reloads with the new module.
 
 Canonical names are shown in the workbench. A source mapping uses canonical keys
@@ -248,7 +291,7 @@ the final newline. Reformatting, duplicate keys and ambiguous JSON are rejected.
 Limits: 24 MiB evidence JSON, 8 MiB review JSON, 2 MiB per CSV, 120 characters for
 reviewer labels and 2,000 for notes. All inputs must be valid UTF-8. Malformed or
 changed files invalidate prior verification results. The original v1 evidence
-schema and comparison rules remain supported; the browser interface is v5.
+schema and comparison rules remain supported; the browser interface is v6.
 
 Without a separately retained report digest, verification establishes internal
 consistency only. A coherent replacement of the evidence and both sources can
@@ -281,7 +324,7 @@ prototype, and their guarantees are not attributed to it.
 
 ## Run locally / offline
 
-Unzip `downloads/bloch-data-local-workbench-v5.zip` into an approved directory.
+Unzip `downloads/bloch-data-local-workbench-v6.zip` into an approved directory.
 Start a localhost-only server from that directory:
 
 ```sh
@@ -300,7 +343,7 @@ configuration by the two example download controls.
 ## Build, test and deploy (repository)
 
 ```sh
-node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs scripts/test-bloch-data-case.mjs scripts/test-bloch-data-diff.mjs
+node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs scripts/test-bloch-data-case.mjs scripts/test-bloch-data-diff.mjs scripts/test-bloch-data-preparation.mjs
 python3 scripts/build-bloch-data.py
 node scripts/verify-bloch-data.mjs
 wrangler pages deploy apps/bloch-data --project-name bloch-data --branch main
@@ -316,7 +359,7 @@ outside the public static directory. Serve the provided `_headers` on production
 
 `assets/modules.v1.mjs` defines schemas, keys, field types, institution defaults,
 and regional profiles. `reconcile.v1.mjs` provides strict parsing and comparison;
-`samples.v1.mjs` supplies labelled fixtures; `workbench.v5.mjs` renders local state.
+`samples.v1.mjs` supplies labelled fixtures; `workbench.v6.mjs` renders local state.
 `audit.v1.mjs` validates/recomputes evidence and journals; `verification.v1.mjs`
 handles the separate verifier session. `queue.v1.mjs` provides the local search
 index, selection/sort rules, chart summaries and filtered CSV export. These are
@@ -326,6 +369,9 @@ case format; `case-workbench.v1.mjs` manages preparation and import sessions.
 `case-diff.v1.mjs` verifies and compares two case snapshots; `diff-workbench.v1.mjs`
 renders the independent comparison session; `diff-samples.v1.mjs` builds the
 labelled example pair using the existing reconciliation and case exporters.
+`preparation.v1.mjs` parses bounded extract tables and validates explicit mappings
+through the unchanged module rules; `preparation-workbench.v1.mjs` renders the
+separate preparation session, lineage charts and downloads.
 Versioned static asset URLs keep existing
 immutable caches isolated from the updated interface.
 Add a reviewed schema and key definition to the module registry, add independent

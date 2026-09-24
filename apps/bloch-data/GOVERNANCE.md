@@ -105,3 +105,24 @@ For every additional regulation record: official source, version/effective date,
 activity and data scope, applicability owner, required control, implementation,
 evidence reference, remaining gap and next review. Review transitions rather than
 assuming a newly published rule already applies.
+
+## Source preparation boundary (v6)
+
+Preparation applies explicit, independently configured source-column mappings
+and existing module validation to local extracts. Extra-column exclusion needs
+fresh acknowledgement after source/mapping/format changes. It preserves row
+order and duplicate multiplicity, rejects missing mapped fields, and records
+normalization counts plus complete original/prepared row references. There is
+no inferred identity, automatic correction or institution-specific source
+adapter. File and record limits are bounded in both source and canonical output.
+
+The separate unsigned receipt binds exact original and prepared file hashes,
+formats, mappings, exclusions and output configuration. Retain the original
+extracts, prepared outputs and receipt together under the institution's controls.
+Later evidence/case files bind to prepared CSVs, and do not embed this receipt or
+original extracts. The UI states that provenance boundary before loading. This
+release does not verify imported preparation receipts. The receipt has no source
+cell values but can still contain sensitive filenames, headers and policy
+metadata. Prepared CSVs contain private records and preserve formula-like text.
+No retention enforcement, encryption, identity authentication, data-subject
+workflow, regulatory certification or Bloch publication is added by preparation.
