@@ -53,3 +53,9 @@ current-status ledger, ecosystem links and footer:
 
 The three platform illustrations are decorative diagrams, not live network snapshots.
 Existing downloadable presentations retain their version dates.
+
+The same homepage section also highlights **Bloch Ops — ops-blochinc.xyz** as the
+network operations portal, with direct links to its RPC catalog, validator guide,
+wallet integration guide and PQ Shield reference work. Ops is also linked from the
+closing ecosystem list. Delegation setup, managed wallet APIs and cross-chain PQ
+Shield services retain their staged status.
