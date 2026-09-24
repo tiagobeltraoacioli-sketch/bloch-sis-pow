@@ -177,6 +177,15 @@ try {
   await page.fill('#queue-search','BULK-124');assert.equal(await page.locator('#result-rows tr').count(),1);assert.equal(await page.locator('#previous-page').isDisabled(),true);assert.ok((await page.locator('#table-count').innerText()).startsWith('1–1'));
   assert.equal(requests.length,baseline,'Queue interactions triggered network requests');
   for(const path of [process.env.VERIFY_DIR?'README.md':'downloads/bloch-data-local-workbench-v4.zip','GOVERNANCE.md','regulatory-register.v1.json','samples/venue.csv'])assert.equal((await context.request.get(new URL(path,target).href)).status(),200,path);
+  if(!process.env.VERIFY_DIR){
+    const packagePath='downloads/bloch-data-local-workbench-v4.zip';
+    const packageResponse=await context.request.get(new URL(packagePath,target).href),packageBytes=await packageResponse.body();
+    assert.equal(packageBytes.subarray(0,4).toString('hex'),'504b0304','Offline download must be a ZIP, not an HTML fallback');
+    const hashResponse=await context.request.get(new URL(packagePath+'.sha256',target).href);
+    assert.equal(hashResponse.status(),200);const advertised=(await hashResponse.text()).trim().split(/\s+/);
+    assert.equal(advertised[0],createHash('sha256').update(packageBytes).digest('hex'),'Offline ZIP must match its published SHA-256');
+    assert.equal(advertised[1],'bloch-data-local-workbench-v4.zip');
+  }
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({url:target,modules:4,regionalProfiles:7,layout,localUploads:'no network requests',exports:'digest verified',caseFiles:'six exact components, offline round-trip, retained digest, mutation and cancellation checked',queue:'search, chart filters, full 125-key export, page reset, journal binding',reviews:'bound journal, unchanged outcomes, resume verified report',verification:'offline recomputation, pin and tampering checked',malformedFiles:'fail closed',offline:'passed',xss:'text only',errors}));
 }finally{await browser.close();server.close();}
