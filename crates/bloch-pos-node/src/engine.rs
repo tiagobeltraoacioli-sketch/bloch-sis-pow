@@ -1026,6 +1026,21 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
     }
 }
 
+/// The byte size this transaction DECLARES to consensus — `tx_bytes` for the
+/// three shapes that carry one, zero for every other message. What the
+/// transition's block byte cap (step 10b) sums, so the packer and the mempool
+/// door (audit EN-01, 2026-09-16) budget by the same number: never less than
+/// the wire length, since consensus refuses under-declaration
+/// (`UnderdeclaredSize`) and a non-transfer charges nothing.
+fn declared_tx_bytes(tx: &PosTransaction) -> u64 {
+    match tx {
+        PosTransaction::Transfer { tx_bytes, .. }
+        | PosTransaction::TransferV2 { tx_bytes, .. } => *tx_bytes,
+        PosTransaction::FundedDeposit(tx) => tx.tx_bytes,
+        _ => 0,
+    }
+}
+
 /// The spend-authority hash of this transaction's FIRST input — its "source"
 /// for [`MEMPOOL_MAX_PER_SOURCE`] (R7 M6). Lifecycle messages use their
 /// validator identity, domain-separated from spend keys. `None` remains only
@@ -1573,6 +1588,12 @@ struct Engine {
     /// a mempool under fee pressure and a mempool simply not receiving
     /// transactions both look like "it got smaller" without this.
     mempool_evicted_low_fee: u64,
+    /// Legacy `Exit` (tag 0x03) transactions this node has APPLIED inside a
+    /// canonical block since boot (audit TX-01 / FC-03, 2026-09-16). The
+    /// message is unauthenticated and consensus-valid today, so one scheduled
+    /// proposer can retire the whole roster with it; this node cannot refuse
+    /// the block (that is a flag day), but it must not apply one silently.
+    legacy_exits_applied: u64,
     /// Transactions the proposer's drop loop refused, keyed exactly like
     /// [`Self::mempool`] and mapping to `(slot the bar lifts at, times it has
     /// barred a re-offer)`.
@@ -2434,6 +2455,15 @@ impl Engine {
     /// An accepted, authenticated duty under this key proves a duplicate only
     /// if it was signed during live observation. Check the observation deadline
     /// against our wall clock, and exclude duties predating its start.
+    ///
+    /// Audit EN-03 (2026-09-16): without the floor on the duty's own signed
+    /// slot, a peer replaying this node's pre-restart attestation (still
+    /// inside `on_attestation`'s epoch window, unknown to the fresh pool,
+    /// verified by its own key) halted the validator on every mid-epoch
+    /// restart. The signed slot is inside the signature, so it cannot be
+    /// forged; a duty signed for a slot at or after the observation start
+    /// cannot be this process's own (it signs nothing while observing).
+    /// Called on the direct-Accept path and on `release_held`.
     fn note_possible_doppelganger(&mut self, index: u32, duty_slot: u64) {
         let Some(my_index) = self.duty_index(&self.state) else { return };
         if index != my_index || self.doppelganger_halted {
@@ -2450,13 +2480,15 @@ impl Engine {
         }
         self.doppelganger_halted = true;
         eprintln!(
-            "DOPPELGANGER DETECTED: validator {index} produced a duty at wall slot {} while \
-             this process was still inside its {DOPPELGANGER_OBSERVE_SLOTS}-slot observation \
+            "DOPPELGANGER DETECTED: validator {index} produced a duty signed for slot \
+             {duty_slot} (seen at wall slot {}, observation started at slot {}) while this \
+             process was still inside its {DOPPELGANGER_OBSERVE_SLOTS}-slot observation \
              window and had not yet started its own duties — another instance of this key is \
              signing on the network right now. REFUSING to start duties. This requires an \
              operator to confirm only one instance of this key is running before restarting; \
              bypass with --no-doppelganger-check or BLOCH_NO_DOPPELGANGER=1 (NOT recommended).",
             self.wall_slot,
+            until.saturating_sub(DOPPELGANGER_OBSERVE_SLOTS),
         );
     }
 
@@ -4216,21 +4248,15 @@ impl Engine {
         // The signature IS caught here — `admissible`'s Transfer arm verifies
         // every input's spend signature, under a comment in capitals saying
         // why, and refusing at the mempool door is what stops a garbage
-        // signature propagating. What this does NOT catch is a transfer whose
-        // inputs do not exist, or which fails conservation. Those still reach
-        // the mempool and are dropped by the proposer, which is why the
-        // proposer's guard is the one that carries liveness and this one only
-        // reduces waste. Two checks, neither trusting the other.
-        //
-        // The epoch handed down is the WALL-CLOCK epoch, read here through
-        // the `wall_slot()` METHOD (the clock against the manifest's genesis)
-        // and never the `wall_slot` FIELD: the field is refreshed by the slot
-        // loop, and on the RPC path — which converges here through
-        // `serve_rpc`'s SendRawTransaction arm — nothing guarantees the loop
-        // has run this tick. Why wall and not the head's epoch is argued at
-        // the TransferV2 arm of `admissible` itself, next to the gate it
-        // feeds. Gossip (`NetEvent::Transaction`) and RPC both land in this
-        // one call, so one call site carries the whole decision.
+        // signature propagating. What this does NOT catch — an input that
+        // does not exist or is not owned by the key, conservation at the
+        // current base fee — `admission::check_transfer` above refuses
+        // before any signature is paid for; the proposer's probe loop still
+        // drops whatever slips past both, which is why the proposer's guard
+        // is the one that carries liveness and these only reduce waste.
+        // Checks that do not trust each other. Gossip
+        // (`NetEvent::Transaction`) and RPC both land in this one call, so
+        // one call site carries the whole decision.
         if let PosTransaction::FundedDeposit(deposit) = &tx {
             if self.state.admission_network_domain() != Some(deposit.network_domain) {
                 return Err(Refusal::Invalid("funded deposit belongs to a different genesis manifest"));
@@ -4378,14 +4404,18 @@ impl Engine {
             // and a non-transfer charges zero declared bytes, so the floor
             // only ever over-budgets, and an over-budgeted block is merely
             // smaller, never invalid.
-            let declared = match tx {
-                PosTransaction::Transfer { tx_bytes, .. }
-                | PosTransaction::TransferV2 { tx_bytes, .. } => *tx_bytes,
-                PosTransaction::FundedDeposit(tx) => tx.tx_bytes,
-                _ => 0,
-            };
-            let n = (encoded.len() as u64).max(declared);
+            let n = (encoded.len() as u64).max(declared_tx_bytes(tx));
             if bytes.saturating_add(n) > cap {
+                // SKIP, never stop (audit EN-01, 2026-09-16). This was a
+                // `break`, and over a tip-descending order a break meant one
+                // entry that did not fit ended selection for everything
+                // behind it: a single over-cap transfer claiming the highest
+                // tip — admissible, never selected, so never refused by the
+                // transition and never barred, re-sent every TTL — kept
+                // every proposer on the network producing EMPTY blocks. The
+                // door now refuses such an entry too, but the packer must
+                // not depend on every peer's door having been right (the
+                // slot-69 lesson): a smaller entry behind it may still fit.
                 continue;
             }
             let points = Self::spent_outpoints(tx).unwrap_or_default();
@@ -4452,6 +4482,32 @@ impl Engine {
                 // same bytes they were keyed under.
                 for encoded in &env.body.transactions {
                     self.mempool.remove(encoded);
+                }
+                // Audit TX-01 / FC-03, 2026-09-16: the legacy `Exit` (tag
+                // 0x03) is UNAUTHENTICATED and consensus-valid today — its
+                // transition arm checks registry state and never touches a
+                // verifier (the mempool refuses it, but a proposer writes
+                // the body directly). One scheduled proposer can retire the
+                // other 63 validators with it in a single ~5-byte-per-exit
+                // block. Refusing the block is a flag day
+                // (`EXIT_AUTH_ACTIVATION_EPOCH`), not this node's call; what
+                // this node CAN do is refuse to apply one silently. Counted
+                // and shouted, on replay too — a refusal flag day has to
+                // audit 0x03 history first, and this is where it shows.
+                for tx in &txs {
+                    if let PosTransaction::Exit { validator } = tx {
+                        self.legacy_exits_applied = self.legacy_exits_applied.saturating_add(1);
+                        eprintln!(
+                            "LEGACY EXIT APPLIED (unauthenticated tag 0x03): block {} at slot {} \
+                             by proposer v{} retires validator {validator} — nobody signed this \
+                             on validator {validator}'s behalf. If this validator did not ask \
+                             to exit, the proposer is hostile; {} applied since boot.",
+                            crate::codec::hex8(id.as_bytes()),
+                            env.header.slot,
+                            env.header.proposer_index,
+                            self.legacy_exits_applied,
+                        );
+                    }
                 }
                 // R4 F-11: record where each transaction landed, for
                 // `gettxstatus`. After the mempool drop (a transaction is
@@ -5438,8 +5494,9 @@ impl Engine {
                     Err(Refusal::AtCapacity) => Err(RpcError::new(
                         rpc::MEMPOOL_FULL,
                         format!(
-                            "mempool is at capacity ({MEMPOOL_MAX} entries); retry later — \
-                         the transaction was not judged invalid"
+                            "mempool is at capacity ({MEMPOOL_MAX} entries or {} bytes); retry \
+                             later — the transaction was not judged invalid",
+                            admission::MAX_MEMPOOL_BYTES,
                         ),
                     )),
                     //
@@ -6174,6 +6231,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         tx_slot_index_order: VecDeque::new(),
         doppelganger_observe_until: None,
         doppelganger_halted: false,
+        legacy_exits_applied: 0,
         genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
         manifest,
     };
@@ -8915,7 +8973,7 @@ mod transfer_v2_end_to_end {
     /// `epochs_past` places `genesis_time_ms` so the node's real wall epoch is
     /// at least that
     /// (+2 slots of margin so the epoch cannot regress mid-test).
-    fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
+    pub(super) fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
         let slot_ms = 500u64;
         let back_ms = epochs_past
             .saturating_mul(SLOTS_PER_EPOCH)
@@ -9025,6 +9083,7 @@ mod transfer_v2_end_to_end {
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
             doppelganger_halted: false,
+            legacy_exits_applied: 0,
         }
     }
 
@@ -9033,14 +9092,17 @@ mod transfer_v2_end_to_end {
     /// of them through a ONE-entry witness table with one real hybrid
     /// signature — the whole economy of the format. Returns the entries so
     /// the engine's genesis can hold the very outputs being swept.
-    fn sweep_fixture(n: u32) -> (Vec<EutxoEntry>, PosTransaction) {
+    pub(super) fn sweep_fixture(n: u32) -> (Vec<EutxoEntry>, PosTransaction) {
         sweep_fixture_declaring(n, 9_000 + u64::from(n) * 40)
     }
 
     /// [`sweep_fixture`] with the declared `tx_bytes` as a knob — the
     /// declared size sits inside the signing root, so it has to be fixed
     /// BEFORE the hybrid signature is produced, exactly as a wallet does it.
-    fn sweep_fixture_declaring(n: u32, declared: u64) -> (Vec<EutxoEntry>, PosTransaction) {
+    pub(super) fn sweep_fixture_declaring(
+        n: u32,
+        declared: u64,
+    ) -> (Vec<EutxoEntry>, PosTransaction) {
         let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[42u8; 32])
             .expect("hybrid keypair from a fixed seed");
         let script_hash: [u8; 32] = Sha3_256::digest(&pk).into();
@@ -10294,6 +10356,7 @@ mod perf_support {
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
             doppelganger_halted: false,
+            legacy_exits_applied: 0,
         };
         (engine, TestDir(dir))
     }
@@ -10603,9 +10666,15 @@ mod doppelganger_tests {
     }
 
     fn sample_attestation_for(validator: u32) -> Attestation {
+        sample_attestation_at(validator, 1)
+    }
+
+    /// Like [`sample_attestation_for`], signed for `slot` (audit EN-03: the
+    /// signed slot is what the hook now floors on).
+    fn sample_attestation_at(validator: u32, slot: u64) -> Attestation {
         Attestation {
             data: AttestationData {
-                slot: 1,
+                slot,
                 head: [0u8; 32],
                 source_epoch: 0,
                 source_root: [0u8; 32],
@@ -10615,6 +10684,77 @@ mod doppelganger_tests {
             validator,
             signature: Vec::new(),
         }
+    }
+
+    /// **Audit EN-03, the related gap.** An attestation that outran its
+    /// block is HELD, not accepted, and the hook used to run only on the
+    /// direct-Accept path — a duplicate whose vote arrived before its block
+    /// was never detected. Two engines on one key: `other` proposes at the
+    /// slot before its epoch-1 attestation duty and attests at the duty;
+    /// `me` — observing since the duty slot — sees the attestation first
+    /// (held: its head is unknown), then the block. The block is signed for
+    /// the slot before observation started and must NOT count (it is what a
+    /// pre-restart instance could have produced); the attestation replayed
+    /// by `release_held_turn`, signed for the observation start itself, must.
+    #[test]
+    fn a_held_then_released_attestation_signed_during_observation_halts() {
+        let (mut other, dir) = perf_support::proposing_engine();
+        // Committees partition the roster over an epoch's slots, so a lone
+        // validator has exactly one attestation slot per epoch — find it in
+        // epoch 1, the first epoch a duty can be signed for.
+        let duty = {
+            let rolled = other.rolled_to(1);
+            let roster = rolled.active_validators();
+            let seed = Engine::seed_for(&rolled, 1);
+            (SLOTS_PER_EPOCH..2 * SLOTS_PER_EPOCH)
+                .find(|s| committees::committee_for_slot(&seed, *s, &roster).contains(&0))
+                .expect("fixture: the lone validator sits on one epoch-1 committee")
+        };
+        let boot = duty - 1;
+        let _clock = validator_lifecycle::clock_at(duty);
+        other.wall_slot = duty;
+        other.propose(boot);
+        let head = other.head_id();
+        assert_ne!(head, other.manifest.genesis_id(), "fixture: the other instance must propose");
+        other.attest(duty);
+        let att = other
+            .pool
+            .values()
+            .find(|a| a.data.slot == duty)
+            .cloned()
+            .expect("fixture: the other instance must attest at the duty slot");
+        let block = other.blocks[head.as_bytes()].clone();
+
+        let (mut me, _dir2) = perf_support::proposing_engine();
+        me.keys = Some(
+            Keystore::load_with(&dir.0, &crate::keys::Unlock::PlaintextOptIn)
+                .expect("fixture: reload the SAME key"),
+        );
+        me.manifest = Manifest::decode(&other.manifest.encode()).expect("fixture: same manifest");
+        me.state = StateCell::new(me.manifest.genesis_state());
+        me.chain = vec![(0, me.manifest.genesis_id())];
+        me.canonical = BTreeSet::from([*me.manifest.genesis_id().as_bytes()]);
+        me.start_doppelganger_observation(duty);
+
+        me.on_attestation(att, Origin::none(), epoch_of(duty));
+        assert_eq!(me.att_pool.pending_len(), 1, "fixture: the attestation must be HELD");
+        assert!(!me.doppelganger_halted, "fixture: nothing accepted yet, nothing to halt on");
+
+        me.ingest(block);
+        assert_eq!(me.head_id(), head, "fixture: the block must be adopted");
+        assert!(
+            !me.doppelganger_halted,
+            "the block alone (signed for slot {boot}, before observation) must not halt"
+        );
+        // The landed block only queues its waiters; the slot loop replays
+        // them in bounded turns. Drain the queue the way the loop does.
+        while me.release_held_turn() {}
+        assert_eq!(me.att_pool.pending_len(), 0, "fixture: the held attestation was replayed");
+        assert!(
+            me.doppelganger_halted,
+            "the released attestation, signed for slot {duty} at the observation start, is a \
+             live duplicate and must halt"
+        );
     }
 
     /// **The finding's own scenario.** A synthetic gossip attestation
@@ -10724,6 +10864,278 @@ mod doppelganger_tests {
         assert!(
             !engine.doppelganger_blocks_duties(DOPPELGANGER_OBSERVE_SLOTS),
             "at the deadline slot itself, the window has closed"
+        );
+    }
+}
+
+/// The mempool door and the packer after the 2026-09-16 audit, pinned
+/// against the maintainer's remediation: EN-01 (`pack_transactions` skips
+/// an entry that does not fit instead of stopping; the door refuses an
+/// over-cap transfer through `admission::check_transfer`), EN-02 / EN-06 /
+/// NET-02 (a duplicated, unknown or unowned input is refused before any
+/// signature is verified), EN-04 (the per-source cap is answered by the
+/// pool's own counters and holds against a fully backed population).
+#[cfg(test)]
+mod mempool_door_tests {
+    use super::transfer_v2_end_to_end::{
+        engine_at_wall_epoch, sweep_fixture, sweep_fixture_declaring,
+    };
+    use super::*;
+    use bloch_pos_committee::params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH as V2_FLAG_DAY;
+    use bloch_pos_committee::state_root::EutxoEntry;
+    use bloch_pos_committee::transition::{TransferInput, TransferOutput};
+
+    /// A V1 transfer nothing on the door will ever verify, distinct per `n`,
+    /// under one key of `pubkey`'s choosing and at `tip`. Handed straight to
+    /// the packer by the test that needs a population, never admitted.
+    fn filler(n: u32, pubkey: u8, tip: u128) -> PosTransaction {
+        PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: n.to_le_bytes().repeat(8).try_into().expect("32 bytes"),
+                vout: 0,
+                pubkey: vec![pubkey; 8],
+                signature: vec![1],
+            }],
+            outputs: vec![TransferOutput { value: 1_000, script_hash: [n as u8; 32] }],
+            tx_bytes: 0,
+            tip_millisat_per_gas: tip,
+        }
+    }
+
+    /// **EN-01, the packer.** The highest-tip entry does not fit the cap;
+    /// ten honest entries behind it do. Before: `break`, empty selection,
+    /// every proposer on the network producing empty blocks for as long as
+    /// one frame per TTL kept the entry alive. Mutation: restore the `break`
+    /// and the selection is empty. Exercised on `pack_transactions` itself:
+    /// `select_transactions` first drops what the head state does not back,
+    /// which is a different guard and would hide this one.
+    #[test]
+    fn an_over_cap_entry_at_the_top_of_the_order_no_longer_empties_the_selection() {
+        let epoch = V2_FLAG_DAY + 1;
+        let cap = fee_market::max_block_tx_bytes(epoch);
+        let mut attacker = filler(0xFFFF, 0xAA, 1_000_000);
+        if let PosTransaction::Transfer { tx_bytes, .. } = &mut attacker {
+            *tx_bytes = cap + 1; // never fits, sorts first
+        }
+        let mut population: Vec<(Vec<u8>, PosTransaction)> =
+            vec![(attacker.canonical_bytes(), attacker.clone())];
+        for i in 0..10u32 {
+            let honest = filler(i, 0xBB, 0);
+            population.push((honest.canonical_bytes(), honest));
+        }
+        let candidates: Vec<(&Vec<u8>, &PosTransaction)> =
+            population.iter().map(|(key, tx)| (key, tx)).collect();
+        assert_eq!(candidates.len(), 11, "fixture: eleven distinct entries");
+
+        let selected = Engine::pack_transactions(epoch, candidates);
+        assert_eq!(selected.len(), 10, "the ten honest entries behind the over-cap one are selected");
+        assert!(!selected.contains(&attacker), "the entry that does not fit is skipped, not packed");
+    }
+
+    /// **EN-01, the door.** A transfer whose consensus-counted size — wire
+    /// bytes, or its declared `tx_bytes`, whichever is larger — exceeds the
+    /// block byte cap is refused before it can take a slot, sort first, or
+    /// be relayed. Both halves of the `max`, and a control inside the cap.
+    #[test]
+    fn a_transfer_larger_than_the_block_byte_cap_is_refused_at_the_door() {
+        let epoch = V2_FLAG_DAY + 1;
+        let cap = fee_market::max_block_tx_bytes(epoch);
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+
+        // Wire bytes over the cap: 140 inputs of 4 KB junk keys ≈ 560 KB.
+        let big = PosTransaction::Transfer {
+            inputs: (0..140u8)
+                .map(|i| TransferInput {
+                    txid: [i; 32],
+                    vout: 0,
+                    pubkey: vec![0x55; 4_000],
+                    signature: vec![1],
+                })
+                .collect(),
+            outputs: vec![TransferOutput { value: 1_000, script_hash: [0x77; 32] }],
+            tx_bytes: 0,
+            tip_millisat_per_gas: u128::MAX / 2,
+        };
+        assert!(big.canonical_bytes().len() as u64 > cap, "fixture: must be over the cap on the wire");
+        let err = node.on_transaction(big).expect_err("an over-cap transfer must be refused");
+        assert!(err.reason().contains("block byte budget"), "refused for its size: {}", err.reason());
+
+        // Declared over the cap, small on the wire: the number consensus
+        // counts is the declaration, so this can never be carried either.
+        let (entries, declared) = sweep_fixture_declaring(4, cap + 1);
+        let mut node = engine_at_wall_epoch(epoch, &entries);
+        let err = node.on_transaction(declared).expect_err("an over-declared transfer must be refused");
+        assert!(err.reason().contains("block byte budget"), "refused for its size: {}", err.reason());
+        assert!(node.mempool.is_empty(), "nothing over the cap takes a slot");
+
+        // Control: the same shape inside the cap is admitted.
+        let (entries, ok) = sweep_fixture(4);
+        let mut node = engine_at_wall_epoch(epoch, &entries);
+        assert_eq!(node.on_transaction(ok), Ok(Admitted::New));
+    }
+
+    /// **EN-02 / NET-02: `DuplicateInput`.** The same outpoint twice is
+    /// refused by consensus before any signature; now by the door too. The
+    /// declared size leaves room for the extra input, so the refusal is for
+    /// the repeat and not for under-declaration.
+    #[test]
+    fn a_transfer_spending_the_same_output_twice_is_refused_at_the_door() {
+        let (entries, mut tx) = sweep_fixture_declaring(4, 12_000);
+        if let PosTransaction::TransferV2 { inputs, .. } = &mut tx {
+            let again = inputs[0].clone();
+            inputs.push(again);
+        }
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let err = node.on_transaction(tx).expect_err("a duplicate outpoint must be refused");
+        assert!(err.reason().contains("repeats an input"), "{}", err.reason());
+        assert!(node.mempool.is_empty());
+    }
+
+    /// **EN-02 / NET-02: `UnknownInput`.** An outpoint the head state does
+    /// not hold cannot apply: refused, and — unlike a bad signature — as a
+    /// state-dependent verdict, since the parent may still land.
+    #[test]
+    fn a_transfer_spending_an_output_the_chain_does_not_have_is_refused_at_the_door() {
+        let (entries, mut tx) = sweep_fixture(4);
+        if let PosTransaction::TransferV2 { inputs, .. } = &mut tx {
+            inputs[2].txid = [0x44; 32];
+        }
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let err = node.on_transaction(tx).expect_err("an unknown outpoint must be refused");
+        assert!(err.reason().contains("absent from committed state"), "{}", err.reason());
+        assert!(matches!(err, Refusal::StateDependent(_)), "a missing parent is not a bad transaction");
+        assert!(node.mempool.is_empty());
+    }
+
+    /// **EN-02 / EN-06 / NET-02: `ScriptMismatch`.** The attack that made
+    /// EN-01's censorship free: naming ANYONE's outputs under the attacker's
+    /// own key. V2 and V1 both, and the V1 control proves the door refuses
+    /// only what consensus refuses: with the output actually owned by the
+    /// carried key, the same transfer gets past the ownership check and is
+    /// refused later, for a different reason.
+    #[test]
+    fn a_transfer_whose_key_does_not_own_the_output_is_refused_at_the_door() {
+        let (mut entries, tx) = sweep_fixture(4);
+        entries[1].script_hash = [0x99; 32]; // someone else's coin
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let err = node.on_transaction(tx).expect_err("an unowned outpoint must be refused");
+        assert!(err.reason().contains("does not own its input"), "{}", err.reason());
+        assert!(node.mempool.is_empty());
+
+        // Declared above its (tiny) encoding so the size rules stay quiet
+        // and the ownership rule is the first one that can speak.
+        let v1 = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: [0x11; 32],
+                vout: 0,
+                pubkey: vec![7; 16],
+                signature: vec![1],
+            }],
+            outputs: vec![TransferOutput { value: 1_000, script_hash: [0x22; 32] }],
+            tx_bytes: 512,
+            tip_millisat_per_gas: 0,
+        };
+        let coin = |script_hash: [u8; 32]| EutxoEntry { txid: [0x11; 32], vout: 0, value: 5_000, script_hash };
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &[coin([0x99; 32])]);
+        let err = node.on_transaction(v1.clone()).expect_err("V1: an unowned outpoint must be refused");
+        assert!(err.reason().contains("does not own its input"), "{}", err.reason());
+
+        let owned: [u8; 32] = Sha3_256::digest([7u8; 16]).into();
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &[coin(owned)]);
+        let err = node.on_transaction(v1).expect_err("control: still unpayable and unsigned");
+        assert!(
+            !err.reason().contains("own its input"),
+            "owned outpoint: past the ownership check, refused for another reason: {}",
+            err.reason()
+        );
+        assert!(node.mempool.is_empty());
+    }
+
+    /// The per-source cap (R7 M6) holds against a population capacity
+    /// planning cannot reclaim: 64 pending transfers under the fixture's
+    /// key, every one backed by the head state, then a 65th — refused as
+    /// `TooManyFromSource`, with nothing evicted to make room for it.
+    #[test]
+    fn the_per_source_cap_is_still_enforced_against_a_backed_population() {
+        let (entries, tx) = sweep_fixture(4);
+        let source = tx_source_hash(&tx).expect("a transfer has a source");
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        for i in 1..=MEMPOOL_MAX_PER_SOURCE as u64 {
+            // Distinct bytes (the declared size is inside the signing root),
+            // same source, same backing outputs.
+            let (_, pending) = sweep_fixture_declaring(4, 12_000 + i);
+            node.mempool.insert(pending.canonical_bytes(), pending);
+        }
+        assert_eq!(node.mempool.source_count(&source), MEMPOOL_MAX_PER_SOURCE);
+
+        assert_eq!(node.on_transaction(tx), Err(Refusal::TooManyFromSource));
+        assert_eq!(
+            node.mempool.len(),
+            MEMPOOL_MAX_PER_SOURCE,
+            "nothing reclaimed: every pending entry is backed"
+        );
+        assert_eq!(node.mempool.source_count(&source), MEMPOOL_MAX_PER_SOURCE);
+    }
+}
+
+/// Audit TX-01 / FC-03, 2026-09-16: an applied legacy `Exit` (tag 0x03) is
+/// counted and shouted. Acceptance is deliberately unchanged — refusing the
+/// block is `EXIT_AUTH_ACTIVATION_EPOCH`'s flag day, not this node's call.
+#[cfg(test)]
+mod legacy_exit_alert_tests {
+    use super::*;
+
+    /// A block from ANOTHER proposer carrying a legacy exit. This node's own
+    /// packer never proposes one (`pack_transactions`, TX-01), so the body
+    /// is written the way a hostile proposer would write it: a real proposal
+    /// from a second engine on the same key, its body replaced, its roots
+    /// recomputed over the genesis state and its header re-signed.
+    #[test]
+    fn an_applied_legacy_exit_is_counted_and_alerted() {
+        let exit = PosTransaction::Exit { validator: 0 };
+        assert!(
+            admissible(&exit, 0).is_err(),
+            "control: the door refuses it — a proposer writes the body directly"
+        );
+
+        let (mut other, _dir) = perf_support::proposing_engine();
+        let _clock = validator_lifecycle::clock_at(1);
+        other.wall_slot = 1;
+        other.propose(1);
+        let mut block = other.blocks[other.head_id().as_bytes()].clone();
+        assert_eq!(block.header.slot, 1, "fixture: the other instance must propose");
+
+        let (mut me, _dir2) = perf_support::proposing_engine();
+        me.manifest = Manifest::decode(&other.manifest.encode()).expect("fixture: same manifest");
+        me.state = StateCell::new(me.manifest.genesis_state());
+        me.chain = vec![(0, me.manifest.genesis_id())];
+        me.canonical = BTreeSet::from([*me.manifest.genesis_id().as_bytes()]);
+        me.wall_slot = 1;
+        assert_eq!(me.legacy_exits_applied, 0);
+
+        let txs = vec![exit.clone()];
+        block.body.transactions = vec![exit.canonical_bytes()];
+        block.header.body_root = derive::body_root(&block.body.transactions);
+        let probe = ProposalEnvelope { header: block.header.clone(), proposer_sig: Vec::new() };
+        let post = me
+            .tr_probe
+            .compute_post_state(&me.state, &probe, &block.body.attestations, &txs)
+            .expect("fixture: the transition applies a legacy exit before its flag day");
+        block.header.state_root = post.state_root();
+        block.proposer_sig = other
+            .keys
+            .as_ref()
+            .expect("the proposing fixture holds a keystore")
+            .sign(&block.header.proposal_signing_root());
+        let id = block.block_id();
+
+        me.ingest(block);
+        assert_eq!(me.head_id(), id, "fixture: the block must be adopted");
+        assert_eq!(me.legacy_exits_applied, 1, "the applied exit is counted");
+        assert_ne!(
+            me.state.validator_record(0).expect("validator 0").exit_epoch,
+            u64::MAX,
+            "acceptance unchanged: the transition applied it — that is the finding, not the fix"
         );
     }
 }
@@ -12342,6 +12754,7 @@ mod duty_view_anchor {
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
             doppelganger_halted: false,
+            legacy_exits_applied: 0,
         };
         (engine, dir)
     }
@@ -12600,6 +13013,7 @@ mod slot_horizon {
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
             doppelganger_halted: false,
+            legacy_exits_applied: 0,
             orphans: VecDeque::new(),
             deferred_orphans: VecDeque::new(),
             orphans_evicted: 0,
