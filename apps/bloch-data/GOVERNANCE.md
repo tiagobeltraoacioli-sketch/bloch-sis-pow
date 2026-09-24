@@ -17,6 +17,7 @@ The register is non-exhaustive; applicable requirements must be added and review
 | Exception review | Separate unsigned journal bound to exact report bytes; ordered annotations; original outcomes preserved | Authenticate reviewers, authorize decisions, enforce separation of duties and retain protected history |
 | Investigation workflow | Local record/latest-note search, combined filters, full-report charts, explicit queue order and filtered CSV bound to evidence/journal digests | Approve operating priorities, control private exports and independently assess financial exposure; counts are not risk scores |
 | Case retention | Single plaintext case with original CSVs, evidence, complete journal, configuration and local receipt; bounded manifest/component verification and recomputation on reopening | Approve storage, encryption, recipients and access; retain independent digests or signed checkpoints; enforce retention and protect against rollback |
+| Snapshot comparison | Verify two compatible cases; compare exact normalized record multisets and per-key review histories; retain both case digests and originals | Align source roles, cutoffs and dataset scope; establish chronology and authority; approve corrections and review continuity separately |
 | Access | No hosted private account store or multi-tenant service | SSO/MFA, role separation, authorized exports, tenant isolation and reviewer signatures |
 | Retention | No application persistence; manual Clear | Encryption, key custody, legal holds, retention schedules, rights handling and verifiable disposal |
 | Cross-border data | No application transfer of source files | Validate residence, recipients, transfer mechanisms and lawful hosting |
@@ -54,6 +55,14 @@ replace a coherent case. Verification recomputes the comparison and checks the
 embedded receipt, but does not attest identity, source truth, protected time or
 the latest history. Institution-controlled encryption, signatures, approvals,
 retention and access remain external integration responsibilities.
+
+The v5 comparator labels baseline and candidate according to user selection,
+not trusted chronology. Exact-key additions/removals do not establish economic
+continuity or explain missing scope. A transition to Matched is a comparison
+outcome, not approval, independent source validation or settlement. Original
+records and journals are preserved; review decisions are never copied to another
+case automatically. Full comparison JSON contains private data from both cases
+and requires the same institutional retention and access controls as its inputs.
 
 ## Brazil
 

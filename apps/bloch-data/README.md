@@ -53,6 +53,63 @@ identifies the exact downloaded report bytes. Creation time is the untrusted
 local browser clock. Reports are unsigned. A CSV export indexes outcomes and
 source row references; formula-leading identifiers are neutralized.
 
+## Case snapshot comparison (v5)
+
+**Verify and compare cases** accepts an operator-selected baseline and candidate,
+with optional independently retained case digests. Each file is verified and its
+reconciliation recomputed before comparison. Both must have the same module,
+complete applied configuration, matching keys, compared fields and rules.
+Synthetic examples and local-file cases cannot be mixed. There is no inferred
+chronology, source authority, cutoff alignment or automatic transfer of reviews.
+
+Composite keys match exactly. The full key union has one category per key:
+
+| Category | Meaning |
+| --- | --- |
+| Added | Key appears only in the candidate |
+| Removed | Key appears only in the baseline |
+| Changed records | A shared key has different normalized records on either source side or a different comparison outcome |
+| Review changes only | Source records and outcome agree, but that key's ordered annotation history differs |
+| Unchanged | Normalized records, outcome and per-key annotation history agree |
+
+Within a key, source A compares with A and B with B. Records use an exact multiset
+of all normalized fields: order is ignored, but duplicates and multiplicity are
+retained. Individual field value multisets identify changed fields. A duplicate
+key can have changed field combinations even when each individual field multiset
+agrees; that still counts as changed records. No duplicate pairing, fuzzy matching,
+netting, currency conversion or amount tolerance is introduced.
+
+Row-reference moves are flagged separately on a source side whose normalized
+record multiset agrees. They do not change the key's category by themselves.
+Original file bytes, evidence bytes and journal bytes may differ even when every
+key is unchanged. Changing a date or identifier in the composite key creates a
+removal and addition; the tool does not infer continuity between those keys.
+
+Review comparison includes the entire ordered history for each key: state,
+reviewer label, note, declared timestamp and original outcome. Global sequence
+numbers are ignored for that comparison because inserting an event for another
+key can renumber an unchanged per-key history. Full original event sequences
+remain in the exported JSON. Dropped or edited annotations are visible, but the
+app does not establish which history is newer or enforce rollback protection.
+
+Clickable category counts and the full-report outcome matrix filter a paginated
+table. Absent is a matrix boundary for additions/removals. Search applies literal,
+case/accent-insensitive terms only to composite keys and is limited to 160
+characters. The screen previews at most 10 records per source side and 10 review
+events per key/snapshot; the JSON retains all records and annotations.
+
+Exports always include the full union regardless of filters: a versioned JSON,
+its exact SHA-256, and a CSV summary with both case digests and safe formula-like
+identifiers. JSON contains private records and review notes from both snapshots.
+These are unsigned comparison artifacts, not importable cases or audit opinions.
+The original case schema is unchanged. Either verified case can be explicitly
+opened for continued review, replacing the working reconciliation session; the
+comparison remains a separate snapshot. Clear discards its own inputs/results.
+
+**Run synthetic example** builds two labelled cases entirely locally: one added
+key, one removed key, three record changes, one review-only change and three
+unchanged keys. It makes no network request and uses no market observations.
+
 ## Portable case files (v4)
 
 **Prepare complete case** recomputes the current evidence from the original CSVs
@@ -191,7 +248,7 @@ the final newline. Reformatting, duplicate keys and ambiguous JSON are rejected.
 Limits: 24 MiB evidence JSON, 8 MiB review JSON, 2 MiB per CSV, 120 characters for
 reviewer labels and 2,000 for notes. All inputs must be valid UTF-8. Malformed or
 changed files invalidate prior verification results. The original v1 evidence
-schema and comparison rules remain supported; the browser interface is v4.
+schema and comparison rules remain supported; the browser interface is v5.
 
 Without a separately retained report digest, verification establishes internal
 consistency only. A coherent replacement of the evidence and both sources can
@@ -201,7 +258,7 @@ on-chain inclusion. The verification receipt records these limits explicitly.
 
 Review changes are held only in memory. Clearing, applying configuration,
 loading other files or rerunning discards the current journal. The verification
-and case-verification panels have separate Clear buttons. Closing or refreshing
+and case-verification/comparison panels have separate Clear buttons. Closing or refreshing
 clears all sessions and prepared case files from page state.
 
 No application upload, API fetch, analytics, third-party fonts, localStorage,
@@ -224,7 +281,7 @@ prototype, and their guarantees are not attributed to it.
 
 ## Run locally / offline
 
-Unzip `downloads/bloch-data-local-workbench-v4.zip` into an approved directory.
+Unzip `downloads/bloch-data-local-workbench-v5.zip` into an approved directory.
 Start a localhost-only server from that directory:
 
 ```sh
@@ -243,7 +300,7 @@ configuration by the two example download controls.
 ## Build, test and deploy (repository)
 
 ```sh
-node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs scripts/test-bloch-data-case.mjs
+node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs scripts/test-bloch-data-case.mjs scripts/test-bloch-data-diff.mjs
 python3 scripts/build-bloch-data.py
 node scripts/verify-bloch-data.mjs
 wrangler pages deploy apps/bloch-data --project-name bloch-data --branch main
@@ -259,13 +316,16 @@ outside the public static directory. Serve the provided `_headers` on production
 
 `assets/modules.v1.mjs` defines schemas, keys, field types, institution defaults,
 and regional profiles. `reconcile.v1.mjs` provides strict parsing and comparison;
-`samples.v1.mjs` supplies labelled fixtures; `workbench.v4.mjs` renders local state.
+`samples.v1.mjs` supplies labelled fixtures; `workbench.v5.mjs` renders local state.
 `audit.v1.mjs` validates/recomputes evidence and journals; `verification.v1.mjs`
 handles the separate verifier session. `queue.v1.mjs` provides the local search
 index, selection/sort rules, chart summaries and filtered CSV export. These are
 presentation and workflow functions, separate from comparison rules and evidence
 serialization. `case-file.v1.mjs` creates and verifies the bounded six-component
 case format; `case-workbench.v1.mjs` manages preparation and import sessions.
+`case-diff.v1.mjs` verifies and compares two case snapshots; `diff-workbench.v1.mjs`
+renders the independent comparison session; `diff-samples.v1.mjs` builds the
+labelled example pair using the existing reconciliation and case exporters.
 Versioned static asset URLs keep existing
 immutable caches isolated from the updated interface.
 Add a reviewed schema and key definition to the module registry, add independent
