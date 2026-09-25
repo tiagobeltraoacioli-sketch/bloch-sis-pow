@@ -1,4 +1,5 @@
 import {RAILS,ROLES,buildRoute,applySampleEvent} from './integrations.mjs';
+import {validateModules} from './participant-modules.mjs';
 export const STUDIO_KEY='bloch-pay-integration-workspace-v1';
 export const STAGES=Object.freeze({exploring:'Exploring',discovery:'Discovery',technical_review:'Technical review',sandbox:'Sandbox planning',paused:'Paused'});
 export const CHECKS=Object.freeze({entity:'Entity and corridor scope',access:'Rail access and settlement partner',security:'Adapter authentication and events',funding:'Funding, liquidity and conversion',operations:'Reconciliation, returns and recovery'});
@@ -8,14 +9,14 @@ const text=(value,label,max,optional=false)=>{if(typeof value!=='string'||value.
 const reference=(value,label)=>{if(typeof value!=='string'||!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{2,79}$/.test(value))fail(`Invalid ${label}. Use 3–80 letters, digits, dots, underscores or hyphens.`);return value;};
 const time=value=>{if(typeof value!=='string'||!/^20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)||!Number.isFinite(Date.parse(value))||new Date(value).toISOString()!==value)fail('Invalid saved timestamp.');return value;};
 const choice=(value,options,label)=>{if(typeof value!=='string'||!Object.hasOwn(options,value))fail(`Invalid ${label}.`);return value;};
-export function emptyStudio(){return {schema:'bloch-pay-integration-workspace',version:1,environment:'design',execution_enabled:false,revision:0,partners:[],routes:[]};}
+export function emptyStudio(){return {schema:'bloch-pay-integration-workspace',version:2,environment:'design',execution_enabled:false,revision:0,partners:[],routes:[]};}
 export function emptyReview(){return Object.fromEntries(Object.keys(CHECKS).map(key=>[key,{state:'not_started',reference:''}]));}
 export function validatePartner(input){
   if(!input||!Array.isArray(input.rails)||!input.rails.length||input.rails.length>Object.keys(RAILS).length||new Set(input.rails).size!==input.rails.length)fail('Select at least one distinct rail for this partner.');
   const review={};
   for(const key of Object.keys(CHECKS)){const item=input.review?.[key];if(!item)fail('Partner review is incomplete.');const state=choice(item.state,REVIEW_STATES,'review state'),ref=text(item.reference,'evidence reference',180,true);if(state==='documented'&&!ref)fail(`Add an evidence reference for “${CHECKS[key]}”.`);review[key]={state,reference:ref};}
   const result={id:reference(input.id,'partner reference').toLowerCase(),name:text(input.name,'partner name',120),role:choice(input.role,ROLES,'participant role'),jurisdiction:text(input.jurisdiction,'jurisdiction',80),owner:text(input.owner,'owner/team',120,true),stage:choice(input.stage,STAGES,'stage'),rails:input.rails.map(rail=>choice(rail,RAILS,'rail')).sort(),review,note:text(input.note,'partner note',500,true),created_at:time(input.created_at),updated_at:time(input.updated_at)};
-  if(result.updated_at<result.created_at)fail('Partner update predates its creation.');return result;
+  if(result.updated_at<result.created_at)fail('Partner update predates its creation.');result.modules=validateModules(input.modules);return result;
 }
 export function decimalFromMinor(value,decimals){
   if(typeof value!=='string'||!/^[1-9]\d{0,19}$/.test(value)||![0,2,8].includes(decimals))fail('Invalid saved amount or currency scale.');
@@ -30,10 +31,10 @@ export function validateDraft(input){
 }
 export function replayRoute(route){let sample=route.draft;for(const event of route.events)sample=applySampleEvent(sample,event);return sample;}
 export function validateStudio(input){
-  if(!input||input.schema!=='bloch-pay-integration-workspace'||input.version!==1||input.environment!=='design'||input.execution_enabled!==false)fail('This is not a supported integration workspace backup.');
+  if(!input||input.schema!=='bloch-pay-integration-workspace'||![1,2].includes(input.version)||input.environment!=='design'||input.execution_enabled!==false)fail('This is not a supported integration workspace backup.');
   if(!Number.isSafeInteger(input.revision)||input.revision<0||input.revision>Number.MAX_SAFE_INTEGER-10)fail('Invalid studio revision.');
   if(!Array.isArray(input.partners)||input.partners.length>200||!Array.isArray(input.routes)||input.routes.length>500)fail('The studio limit is 200 partners and 500 saved routes.');
-  const partners=input.partners.map(validatePartner),ids=new Set();for(const p of partners){if(ids.has(p.id))fail('Duplicate partner reference.');ids.add(p.id);}
+  const partners=input.partners.map(p=>validatePartner({...p,modules:input.version===1?undefined:p.modules})),ids=new Set();for(const p of partners){if(ids.has(p.id))fail('Duplicate partner reference.');ids.add(p.id);}
   const routeIds=new Set();
   const routes=input.routes.map(r=>{
     if(!r||typeof r.archived!=='boolean'||!Array.isArray(r.events)||r.events.length>20)fail('Invalid saved route.');

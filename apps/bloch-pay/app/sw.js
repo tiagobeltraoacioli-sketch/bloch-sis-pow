@@ -1,10 +1,11 @@
-const CACHE='bloch-pay-shell-v2';
+const CACHE='bloch-pay-shell-v3';
 const SHELL=[
   ['/app/','text/html'],['/app/integrations','text/html'],
   ['/app/workspace.css','text/css'],['/app/integrations.css','text/css'],
   ['/app/workspace.mjs','javascript'],['/app/model.mjs','javascript'],
   ['/app/integration-ui.mjs','javascript'],['/app/integrations.mjs','javascript'],
   ['/app/studio-model.mjs','javascript'],['/app/studio-ui.mjs','javascript'],['/app/pwa.mjs','javascript'],
+  ['/app/participant-modules.mjs','javascript'],['/app/modules-ui.mjs','javascript'],['/app/operations.mjs','javascript'],['/app/operations-ui.mjs','javascript'],
   ['/app/manifest.webmanifest','json'],['/app/payment-api.openapi.json','json'],
   ['/app/icon.svg','image/svg+xml'],['/assets/favicon.png','image/png'],['/assets/bloch-inc-logo-dark.png','image/png']
 ];

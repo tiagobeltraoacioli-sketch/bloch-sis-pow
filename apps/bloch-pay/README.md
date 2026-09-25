@@ -35,15 +35,56 @@ FX and liquidity providers, platforms and payment infrastructure operators.
   mismatches, paused participants, incomplete documentation and missing quotes.
   Opening a saved draft leaves actual settlement observations unchanged.
 - A directed connection graph and a complete connection table summarize active
-  saved routes. The graph displays up to 12 participants; the table includes all
-  connections. Planned source amounts stay separate by currency. Draft variants
+  saved routes. All references are included, up to 1,000 across 500 routes. Search,
+  direct-neighbor focus, incoming/outgoing filtering, keyboard selection and zoom
+  support inspection. Labels are omitted above 24 visible nodes; the selector and
+  table retain exact references. Planned source amounts stay separate by currency. Draft variants
   are included independently, so these totals do not represent payment volume.
+- Planning review filters active drafts by participant, rail pair and recorded
+  review state. Shared action items deduplicate requirements across both legs and
+  drafts, retain owners and prioritize blocked planning items. This is not a risk
+  score. Compare up to three drafts and export the filtered routes as exact CSV.
 - Separate integration workspace JSON backups include participants, route drafts
   and scenarios. Imports require confirmation and never replace invoice records.
 - `app/payment-api.openapi.json`: an OpenAPI 3.1 **design contract**, describing
   partner-scoped intents, idempotency, signed event ingestion, individual leg
   statuses and returns. No managed API endpoints or webhook receiver are deployed.
   The planner export is a design artifact, not an executable API request.
+
+## Participant modules
+
+Each participant can configure Graphus, Constellation, AML / BI-PoRB and System
+Map, with a purpose, selected assets (BTC, ETH, Ethereum USDT/USDC, BLCH), and an
+optional private-access plan. Nothing is selected for migrated participants.
+Product links include the selected asset only; they never include participant
+names, organization references, private scores or credentials.
+
+The **Check public capabilities** action reads
+`https://bloch-graphus.xyz/api/system/map` directly through its public CORS contract.
+It omits credentials, refuses redirects, caps responses at 1 MB and times out after
+15 seconds. Validated metadata stays in memory, outside the service-worker cache.
+There is no background polling. A failed refresh labels the previous successful
+registry with its retrieval time. Implementation availability does not establish
+continuous source health, an executed analysis or private access. Navigation uses
+fixed product URLs, not URLs supplied by the registry.
+
+The public AML launcher opens evidence preparation in System Map. Private actions
+open the existing BI-PoRB portal, where membership, roles, scopes and authorization
+are enforced. Red and Blue are descriptive observation indices, not AML decisions.
+No sanctions matcher, customer data transfer or private API call runs in Bloch Pay.
+
+**Export integration manifest** produces a design contract containing participant
+module configuration, asset launchers, requested scopes and existing BI-PoRB API
+paths. Read access requests `analyses:read` and `scores:read`; collection additionally
+requests `data:read` and `analyses:write`. The authenticated principal supplies the
+actual organization scope. Local organization references confer no permission.
+Credentials belong in the participant server's secret store. Bloch Pay does not
+provision accounts, keys, a server adapter or a shared sign-on session.
+
+The public registry and the existing private portal contract were checked on
+24 September 2026. Module descriptions may change; use the explicit refresh action
+to inspect the current registry. Public product links open the independently
+deployed tools and their own source-query controls.
 
 ## Financial and integration boundaries
 
@@ -95,14 +136,22 @@ marked as recorded requires a reference, but the app does not fetch or verify it
 Imports discard the open route draft after confirmation; export a backup first
 if that work needs to be retained.
 
+Integration backup schema v2 adds participant modules while retaining the existing
+storage key. Reading/importing a v1 backup preserves routes and scenarios and
+defaults every module to unselected. The next successful save writes v2. Older app
+versions reject v2 backups rather than silently discarding module configuration.
+Invoice storage is unchanged. Module configuration is a local planning record,
+not an authorization database.
+
 ## Checks
 
 From the repository root:
 
 ```sh
-node --test apps/bloch-pay/tests/model.test.mjs apps/bloch-pay/tests/studio.test.mjs
+node --test apps/bloch-pay/tests/*.test.mjs
 node apps/bloch-pay/tests/browser.mjs
-PAY_PREVIOUS_RELEASE=/absolute/staged/v1 node apps/bloch-pay/tests/upgrade.mjs
+node apps/bloch-pay/tests/modules-browser.mjs
+PAY_PREVIOUS_RELEASE=/absolute/staged/v2 node apps/bloch-pay/tests/upgrade.mjs
 ```
 
 Browser checks need Playwright and Chrome/Chromium. Set `PLAYWRIGHT_MODULE` to a
@@ -117,7 +166,11 @@ duplicate outputs, CSV injection, stale storage, partner/currency validation, ev
 ordering, participant documentation, route persistence, archive/restore, separate
 backups, currency-separated graph totals, export, three screen sizes, HTML escaping
 and offline reloads. The upgrade check requires the previous staged release and
-verifies invoice preservation from v1 to v2 and cross-tab unsaved-form protection.
+verifies invoice and studio preservation from v2 to v3 and cross-tab unsaved-form
+protection. Module browser checks use explicit synthetic participants and intercepted
+registry fixtures, including failed refresh, scoped exports, all 25 sample references,
+comparison limits, filters and offline persistence. Unit checks include the maximum
+1,000-reference graph. Production public-registry reads are verified separately.
 
 ## Publication
 
@@ -130,4 +183,6 @@ Increment the service-worker cache version when changing app shell assets after
 this release. Updates wait for the user's update action before reloading the app.
 The shared update handler preserves open forms and unsaved integration drafts when
 another tab activates an update, offering an explicit reload after changes are
-saved or reset. Offline shell v2 keeps the original invoice storage format.
+saved or reset. Offline shell v3 keeps the original invoice storage format and
+includes the four module and planning scripts. Only the public Graphus origin is
+added to the site's connection policies; private API keys are never accepted by the UI.
