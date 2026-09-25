@@ -1,6 +1,8 @@
-const CACHE='bloch-pay-shell-v3';
+const CACHE='bloch-pay-shell-v4';
 const SHELL=[
-  ['/app/','text/html'],['/app/integrations','text/html'],
+  ['/app/','text/html'],['/app/integrations','text/html'],['/app/evidence','text/html'],
+  ['/app/evidence.css','text/css'],['/app/evidence-ui.mjs','javascript'],['/app/evidence-model.mjs','javascript'],['/app/evidence-store.mjs','javascript'],
+  ['/app/evidence-vendor/graphus-analytics.mjs','javascript'],['/app/evidence-vendor/graphus-evidence.mjs','javascript'],
   ['/app/workspace.css','text/css'],['/app/integrations.css','text/css'],
   ['/app/workspace.mjs','javascript'],['/app/model.mjs','javascript'],
   ['/app/integration-ui.mjs','javascript'],['/app/integrations.mjs','javascript'],

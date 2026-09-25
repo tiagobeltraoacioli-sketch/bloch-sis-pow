@@ -86,6 +86,44 @@ The public registry and the existing private portal contract were checked on
 to inspect the current registry. Public product links open the independently
 deployed tools and their own source-query controls.
 
+## Participant evidence workspace
+
+`/app/evidence` captures one bounded public source page for a configured participant
+and asset (BLCH, BTC, ETH, Ethereum USDT/USDC), or imports a Graphus collection.
+The optional saved-route link is a local annotation. Only the asset is sent to
+`https://bloch-graphus.xyz/api/chain/network`; credentials are omitted, redirects
+are refused, and the request can be canceled or times out after 45 seconds. There
+is no automatic request, pagination or fallback dataset. Failed refreshes retain
+the previous sample, and canceled responses cannot replace a changed context.
+
+The workspace validates source schemas, dataset SHA-256, anchors and diagnostics
+using the shared Graphus evidence contract. It shows source retrieval times,
+coverage, missing timestamps, exact records, record-type and block charts, and
+filters by reference, type and integer base-unit bounds. UTXO record types stay
+separate; summing input and output observations would double-count activity.
+A digest identifies the dataset bytes; it does not independently verify chain
+inclusion, source truth, participant ownership or payment settlement.
+
+Review owners, stages, notes, archive state and local revision history stay
+separate from source facts. Captures and imported packets have distinct labels.
+A Graphus packet export excludes participant, route and reviewer metadata and can
+be imported manually in Constellation or Graphus Analytics. Links open the tools;
+no background upload or cross-origin session transfer occurs. Private BI-PoRB
+access continues through the existing authenticated portal.
+
+Evidence is stored in the separate IndexedDB database `bloch-pay-evidence-v1`:
+50 reviews, 20 MB per vault, 6 MB per packet and 50 revisions per review. Writes
+check a generation and capacity inside one transaction. A stale tab, invalid
+backup or failed transaction cannot replace a newer saved record. Evidence backup
+imports validate all packets before confirmation and replacement. They do not
+change invoices or the integration directory. Save an open sample before leaving;
+export a vault backup before clearing browser data. These are local, unencrypted
+records, not an authenticated approval log or a shared review service.
+
+The two pure Graphus modules are vendored from the existing Bloch repository.
+`evidence-vendor-provenance.json` records source revision, hashes and the single
+relative-import adaptation; no synthetic fixture is selected by the application.
+
 ## Financial and integration boundaries
 
 Payment records and transaction-output references are entered manually, not
@@ -151,7 +189,8 @@ From the repository root:
 node --test apps/bloch-pay/tests/*.test.mjs
 node apps/bloch-pay/tests/browser.mjs
 node apps/bloch-pay/tests/modules-browser.mjs
-PAY_PREVIOUS_RELEASE=/absolute/staged/v2 node apps/bloch-pay/tests/upgrade.mjs
+node apps/bloch-pay/tests/evidence-browser.mjs
+PAY_PREVIOUS_RELEASE=/absolute/staged/v3 node apps/bloch-pay/tests/upgrade.mjs
 ```
 
 Browser checks need Playwright and Chrome/Chromium. Set `PLAYWRIGHT_MODULE` to a
@@ -159,18 +198,23 @@ module path if it is not installed in the repository and `CHROME_PATH` to an exi
 browser executable. `PAY_ARTIFACTS` selects the screenshot/report directory. Without
 a URL the script starts a local static server with Pages-style clean URLs. Passing
 the preview/production origin runs the same checks in an isolated browser profile;
-all mutations remain in that profile's local storage.
+all mutations remain in that profile's browser storage.
 
 Coverage includes exact amounts, partial/excess reconciliation, invalid backups,
 duplicate outputs, CSV injection, stale storage, partner/currency validation, event
 ordering, participant documentation, route persistence, archive/restore, separate
 backups, currency-separated graph totals, export, three screen sizes, HTML escaping
 and offline reloads. The upgrade check requires the previous staged release and
-verifies invoice and studio preservation from v2 to v3 and cross-tab unsaved-form
+verifies invoice and studio preservation from v3 to v4 and cross-tab unsaved-form
 protection. Module browser checks use explicit synthetic participants and intercepted
 registry fixtures, including failed refresh, scoped exports, all 25 sample references,
 comparison limits, filters and offline persistence. Unit checks include the maximum
-1,000-reference graph. Production public-registry reads are verified separately.
+1,000-reference graph. Production public-registry reads are verified separately. Evidence checks cover
+source contracts, digest tampering, exact filters, metadata separation, review
+validation, archive/restore, offline IndexedDB persistence, stale-tab rejection,
+transaction rollback, backup isolation, canceled requests, failed-refresh retention
+and imported-packet labeling. Evidence browser fixtures are explicitly synthetic;
+real source responses are checked separately with `evidence-live.mjs ORIGIN`.
 
 ## Publication
 
@@ -178,11 +222,12 @@ Run `node apps/bloch-pay/stage.mjs /absolute/output/directory` to stage only the
 public files. Do not publish tests or build tools. The Pages project is `bloch-pay`
 with production branch `main`. The service worker is scoped to `/app/` and caches
 only an explicit shell inventory; it never caches an API or partner response.
-Cloudflare Pages canonicalizes `/app/integrations.html` to `/app/integrations`.
+Cloudflare Pages canonicalizes the integration and evidence HTML pages to
+`/app/integrations` and `/app/evidence`.
 Increment the service-worker cache version when changing app shell assets after
 this release. Updates wait for the user's update action before reloading the app.
 The shared update handler preserves open forms and unsaved integration drafts when
 another tab activates an update, offering an explicit reload after changes are
-saved or reset. Offline shell v3 keeps the original invoice storage format and
-includes the four module and planning scripts. Only the public Graphus origin is
+saved or reset. Offline shell v4 keeps the original invoice and integration
+storage formats and includes the evidence workspace (27 shell files). Only the public Graphus origin is
 added to the site's connection policies; private API keys are never accepted by the UI.

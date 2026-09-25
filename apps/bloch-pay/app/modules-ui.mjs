@@ -10,7 +10,7 @@ export function mountParticipantModules(){
     $('module-asset').innerHTML=plan.assets.map(asset=>`<option>${asset}</option>`).join('');if(plan.assets.includes(prior))$('module-asset').value=prior;
     $('export-module-plan').disabled=!partner;$('configure-participant-modules').disabled=!partner;
     $('configure-participant-modules').dataset.editPartner=partner?.id||'';
-    $('module-plan-summary').innerHTML=partner?`<p class="module-purpose"><strong>${e(partner.name)}</strong> · ${plan.enabled.length} tools configured<br>${e(plan.purpose||'No module purpose recorded yet.')}<br><small>${e(PRIVATE_PROFILES[plan.private_profile])} · authorization not verified by Bloch Pay</small></p>`:'<div class="empty"><h3>Add a participant to configure modules</h3><p>The public capability registry can be checked without participant data.</p></div>';
+    $('module-plan-summary').innerHTML=partner?`<p class="module-purpose"><strong>${e(partner.name)}</strong> · ${plan.enabled.length} tools configured<br>${e(plan.purpose||'No module purpose recorded yet.')}<br><a class="inline-link" href="evidence?participant=${partner.id}&amp;asset=${$('module-asset').value}">Open evidence workspace ↗</a><br><small>${e(PRIVATE_PROFILES[plan.private_profile])} · authorization not verified by Bloch Pay</small></p>`:'<div class="empty"><h3>Add a participant to configure modules</h3><p>The public capability registry can be checked without participant data.</p></div>';
     const asset=$('module-asset').value;
     $('participant-module-cards').innerHTML=Object.entries(MODULES).map(([key,m])=>{
       const enabled=plan.enabled.includes(key),nodes=registry?.modules.filter(n=>(!m.ids.length||m.ids.includes(n.id))&&n.assets.includes(asset))||[];

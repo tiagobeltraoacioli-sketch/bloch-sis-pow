@@ -1,0 +1,19 @@
+{
+  "source_repository": "bloch-inc-porb",
+  "copied_at": "2026-09-24",
+  "files": [
+    {
+      "source": "graphus/assets/analytics_engine.js",
+      "source_sha256": "232f0b35cf43a9d0c03bb9be54aa53ebdbf317a2b21ec47d8295343e6daf165d",
+      "local": "graphus-analytics.mjs",
+      "change": "Unchanged source"
+    },
+    {
+      "source": "graphus/assets/system_evidence.js",
+      "source_sha256": "d592c72258b8272951412da7b5bd77aa2ed3f33f068564bf42292603a1d249f0",
+      "local": "graphus-evidence.mjs",
+      "change": "ES module import path only"
+    }
+  ],
+  "source_revision": "82b43dc86eba3c685aff02ee57d2751f75f0f81f"
+}
