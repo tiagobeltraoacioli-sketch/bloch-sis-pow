@@ -24,6 +24,66 @@ exports retain every result and source row/value. Blank-line source row numbers
 are preserved. Per-key source previews show at most 20 rows per side; the JSON
 retains every duplicate source record. Maximum per source: 2 MiB and 5,000 records.
 
+## Multi-case audit overview (v10)
+
+The `#case-overview` dashboard accepts 1–12 retained six-component `.bloch.json`
+cases, with a 64 MiB individual limit and 96 MiB total. Each selected file has an
+optional independent SHA-256 reference. All cases are verified and reconciled
+again before any result is displayed; a failure invalidates the entire selection.
+Use the existing audit-bundle verifier or password unlock workspace to open and
+export a case from a complete bundle. The overview accepts plaintext cases and
+does not establish upstream preparation linkage beyond their comparison CSVs.
+
+Each chart bar shows a case's matched, different, missing-side and duplicate-key
+outcomes. Bars represent proportions within that case; exact counts and exception
+counts are shown alongside them. The review matrix uses the latest retained
+annotation for each exception: not reviewed, investigating, explained, follow-up
+required or reopened. Journal-entry counts include every annotation and can
+exceed the number of reviewed exceptions. Explained does not remove a discrepancy.
+Select a bar or a matrix row with pointer or keyboard to inspect case, evidence,
+review and configuration digests, module/region/institution and reference status.
+
+Module, regional-profile and review-work filters combine. Active follow-up means
+investigating, follow-up required or reopened; not-reviewed has its own filter.
+Metrics and charts follow the visible selection. JSON and CSV exports always
+retain **all** selected cases, as stated in their scope. Clearing or changing
+inputs/references discards results and prevents pending work from reappearing.
+The five-case synthetic example covers all four modules without fetching data.
+
+Whole-case duplicates and different review snapshots of the exact same evidence
+are rejected. Select the intended review version explicitly; no latest version
+is inferred. Cases with different evidence hashes can still describe overlapping
+economic records, repeated periods or different source scopes. Totals therefore
+count case observations, **not distinct financial records**, and never aggregate
+amounts, currencies, prices, valuations or financial exposure. Cases may have
+different modules, configurations and regions. Synthetic and local-file cases
+must use separate overviews; mode is a retained declaration, not source identity.
+File selection order does not establish chronology or common cutoffs.
+
+Opening a selected case replaces the current workbench with its exact evidence
+and journal. A plaintext download retains that case byte-for-byte. Workbench
+annotations do not rewrite the overview snapshot. To reflect updated work,
+export the new case and verify a new selection. Other workspaces and downloads
+are unaffected by clearing this dashboard.
+
+`bloch.data.case-overview.v1` exports a local, unsigned JSON summary, not an
+importable case or verification certificate. It records selected filenames,
+input byte counts, module/institution/region identifiers, exact case/evidence/
+review/configuration hashes, per-case reference checks, outcomes, latest review
+counts and overall observation totals. No raw source records, review notes or
+reviewer labels are included. Metadata can still be private; protect these
+unencrypted files inside the approved environment. CSV neutralizes formula-like
+filenames and identifies its full-selection scope. Retain original cases;
+summary exports do not replace them or verify their origin independently.
+
+The case-set digest hashes the canonical JSON array of lexicographically sorted
+whole-case SHA-256 strings, serialized with two spaces and a final newline. It
+identifies the same exact case set regardless of selection order or filenames.
+The separate summary digest binds the exact exported JSON, including its local
+untrusted timestamp, labels and reference declarations. Neither digest proves
+source completeness, equal data scope, reviewer authority, custody, freshness,
+regulatory compliance or on-chain inclusion.
+
 ## Source preparation (v6)
 
 The independent `#source-preparation` workspace captures the active module and
@@ -484,7 +544,7 @@ the final newline. Reformatting, duplicate keys and ambiguous JSON are rejected.
 Limits: 24 MiB evidence JSON, 8 MiB review JSON, 2 MiB per CSV, 120 characters for
 reviewer labels and 2,000 for notes. All inputs must be valid UTF-8. Malformed or
 changed files invalidate prior verification results. The original v1 evidence
-schema and comparison rules remain supported; the browser interface is v9.
+schema and comparison rules remain supported; the browser interface is v10.
 
 Without a separately retained report digest, verification establishes internal
 consistency only. A coherent replacement of the evidence and both sources can
@@ -517,7 +577,7 @@ prototype, and their guarantees are not attributed to it.
 
 ## Run locally / offline
 
-Unzip `downloads/bloch-data-local-workbench-v9.zip` into an approved directory.
+Unzip `downloads/bloch-data-local-workbench-v10.zip` into an approved directory.
 Start a localhost-only server from that directory:
 
 ```sh
@@ -536,7 +596,7 @@ configuration by the two example download controls.
 ## Build, test and deploy (repository)
 
 ```sh
-node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs scripts/test-bloch-data-case.mjs scripts/test-bloch-data-diff.mjs scripts/test-bloch-data-preparation.mjs scripts/test-bloch-data-preparation-verification.mjs scripts/test-bloch-data-audit-bundle.mjs scripts/test-bloch-data-encryption.mjs
+node --test scripts/test-bloch-data.mjs scripts/test-bloch-data-audit.mjs scripts/test-bloch-data-queue.mjs scripts/test-bloch-data-case.mjs scripts/test-bloch-data-diff.mjs scripts/test-bloch-data-preparation.mjs scripts/test-bloch-data-preparation-verification.mjs scripts/test-bloch-data-audit-bundle.mjs scripts/test-bloch-data-encryption.mjs scripts/test-bloch-data-overview.mjs
 python3 scripts/build-bloch-data.py
 node scripts/verify-bloch-data.mjs
 wrangler pages deploy apps/bloch-data --project-name bloch-data --branch main
@@ -552,7 +612,7 @@ outside the public static directory. Serve the provided `_headers` on production
 
 `assets/modules.v1.mjs` defines schemas, keys, field types, institution defaults,
 and regional profiles. `reconcile.v1.mjs` provides strict parsing and comparison;
-`samples.v1.mjs` supplies labelled fixtures; `workbench.v9.mjs` renders local state.
+`samples.v1.mjs` supplies labelled fixtures; `workbench.v10.mjs` renders local state.
 `audit.v1.mjs` validates/recomputes evidence and journals; `verification.v1.mjs`
 handles the separate verifier session. `queue.v1.mjs` provides the local search
 index, selection/sort rules, chart summaries and filtered CSV export. These are
@@ -575,6 +635,9 @@ preparation and evidence for the verifier example.
 `encrypted-bundle.v1.mjs` validates the fixed authenticated-encryption format and
 verifies the plaintext bundle; `encrypted-bundle-workbench.v1.mjs` handles separate
 encryption/unlock state and explicit downloads. No cryptographic library is shipped.
+`case-overview.v1.mjs` verifies bounded case selections and summarizes outcomes
+and latest review states; `overview-workbench.v1.mjs` renders charts, filters and
+case selection; `overview-samples.v1.mjs` builds the five-case synthetic example.
 Versioned static asset URLs keep existing
 immutable caches isolated from the updated interface.
 Add a reviewed schema and key definition to the module registry, add independent

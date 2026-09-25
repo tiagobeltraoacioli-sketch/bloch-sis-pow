@@ -18,6 +18,7 @@ The register is non-exhaustive; applicable requirements must be added and review
 | Investigation workflow | Local record/latest-note search, combined filters, full-report charts, explicit queue order and filtered CSV bound to evidence/journal digests | Approve operating priorities, control private exports and independently assess financial exposure; counts are not risk scores |
 | Case retention | Single plaintext case with original CSVs, evidence, complete journal, configuration and local receipt; bounded manifest/component verification and recomputation on reopening | Approve storage, encryption, recipients and access; retain independent digests or signed checkpoints; enforce retention and protect against rollback |
 | Snapshot comparison | Verify two compatible cases; compare exact normalized record multisets and per-key review histories; retain both case digests and originals | Align source roles, cutoffs and dataset scope; establish chronology and authority; approve corrections and review continuity separately |
+| Multi-case oversight | Bounded, fully verified case selection; per-case outcome chart, latest-review matrix and full-set summary exports | Establish common cutoffs/scope, choose intended snapshots, assess exposure independently and protect metadata |
 | Access | No hosted private account store or multi-tenant service | SSO/MFA, role separation, authorized exports, tenant isolation and reviewer signatures |
 | Retention | No application persistence; manual Clear; optional password-encrypted copy of a complete audit bundle | Institutional key custody, recipient access, legal holds, retention schedules, recovery, rights handling and verifiable disposal |
 | Cross-border data | No application transfer of source files | Validate residence, recipients, transfer mechanisms and lawful hosting |
@@ -214,3 +215,34 @@ zeroing is best effort, not a secure-erasure guarantee for browser memory. The
 feature does not protect against a compromised browser/device or eliminate
 original/plaintext copies, legal retention duties or approved storage controls.
 No chain publication or regulatory certification is added.
+
+## Multi-case overview boundary (v10)
+
+The dashboard verifies all six components of every selected case, recomputes its
+comparison and validates its retained review journal before showing any results.
+Independent case digests are optional and reported per case. A bad case or digest
+fails the entire selection. Limits are 12 cases, 64 MiB per file and 96 MiB total;
+all data remains in browser memory. No private files are uploaded or persisted.
+
+Counts sum observations within each retained case. Different evidence files can
+refer to overlapping financial records or periods, so totals are not unique
+transactions, account balances, exposure or audit materiality. Modules, regions
+and configurations may differ. No amounts, valuations or currencies are added.
+Exact duplicate cases and alternate review snapshots of the same evidence are
+rejected; the user must choose the intended snapshot. File order and local times
+do not establish chronology, protected custody, freshness or equal cutoffs.
+
+The review matrix counts the last retained state per exception, while a separate
+journal-entry count retains all annotations. Explained does not mean matched,
+settled or approved. Reviewers remain self-declared. Opening a case preserves its
+exact retained evidence and journal; later workbench annotations do not update
+the overview. The dashboard does not certify original extract preparation; use
+complete audit bundles to verify that separate upstream relationship.
+
+Filters change charts and visible metrics. JSON/CSV exports explicitly include
+all selected cases. These unsigned, unencrypted summaries contain counts,
+filenames, profile identifiers and digests but no raw records or review notes.
+Metadata remains subject to institutional handling. Summary and case-set digests
+identify bytes/sets, not provenance or authority; retain the original cases.
+No source authentication, approval workflow, regulatory certification, financial
+risk score, institutional access control or on-chain verification is added.
