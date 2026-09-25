@@ -278,3 +278,14 @@ another tab activates an update, offering an explicit reload after changes are
 saved or reset. Offline shell v5 keeps the original invoice and integration
 storage formats and includes the evidence and reconciliation workspaces (31 shell files). Only the public Graphus origin is
 added to the site's connection policies; private API keys are never accepted by the UI.
+
+### Batch reconciliation release verification
+
+Commit `3f627e8082d1ec3ac95b486ecb7d1740baf9712b` was staged from an isolated Git
+archive and published as `50ef0c4f.bloch-pay.pages.dev`. On 25 September 2026,
+all 35 public files on `blochpay.xyz` matched the staged release (HTML comparison
+excludes only the Cloudflare-injected analytics script). The dedicated browser
+flow also passed on the custom domain in an isolated profile, including offline
+reload, exact ledger changes, exceptions, duplicate skipping, responsive layouts,
+quota failure and stale-tab rejection. Fixtures remained in that profile's local
+storage, and the flow made no data-upload requests.
