@@ -1,5 +1,6 @@
-const CACHE='bloch-pay-shell-v4';
+const CACHE='bloch-pay-shell-v5';
 const SHELL=[
+  ['/app/reconcile','text/html'],['/app/reconcile.css','text/css'],['/app/reconcile-ui.mjs','javascript'],['/app/reconciliation.mjs','javascript'],
   ['/app/','text/html'],['/app/integrations','text/html'],['/app/evidence','text/html'],
   ['/app/evidence.css','text/css'],['/app/evidence-ui.mjs','javascript'],['/app/evidence-model.mjs','javascript'],['/app/evidence-store.mjs','javascript'],
   ['/app/evidence-vendor/graphus-analytics.mjs','javascript'],['/app/evidence-vendor/graphus-evidence.mjs','javascript'],

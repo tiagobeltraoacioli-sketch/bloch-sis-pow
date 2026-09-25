@@ -51,6 +51,44 @@ FX and liquidity providers, platforms and payment infrastructure operators.
   statuses and returns. No managed API endpoints or webhook receiver are deployed.
   The planner export is a design artifact, not an executable API request.
 
+## Batch reconciliation
+
+`/app/reconcile` previews a UTF-8, comma-separated payment-record CSV against
+the current BLCH invoice workspace. Download the header template, add records
+with existing invoice references and review the entire batch before confirming.
+Invoice references match case-insensitively; there is no fuzzy allocation.
+Quoted commas, escaped quotes, multiline notes and UTF-8 BOM are supported.
+Semicolon delimiters, locale decimal separators and spreadsheet files are not
+guessed. The input limit is 3,000 records / 2 MB; the existing combined ledger
+limits remain 3,000 receipts / 2 MB.
+
+The preview shows new, identical and blocked records, searchable exception rows,
+classification charts and exact aggregate invoice impact. Multiple rows for the
+same invoice are evaluated together. Receivable and payable additions stay
+separate. Partial matches, matched recorded amounts and increasing excess remain
+distinct. Mobile invoice cards expose all proposed balances without horizontal
+scrolling. Reports include every CSV record, regardless of the active filter.
+
+An identical reference with identical normalized invoice, amount, date, transaction
+fields and note is skipped, including repeats within one file. Conflicting
+references, missing/void invoices, invalid amounts/dates, direction mismatches
+and reused transaction-output references block the entire batch. Optional imported
+evidence labels do not establish independent verification. Monetary calculations
+use integer base units throughout. Report CSV cells escape spreadsheet formulas.
+
+Saving requires acknowledging the impact and confirming the appended record
+count. The complete preview is bound to its invoice snapshot, and storage is
+checked again at commit. Stale tabs, changed invoices and quota failures cannot
+partially save a batch. New records append to the existing ledger and use its
+normal JSON backups; integration and IndexedDB evidence storage are untouched.
+An exported review is a pre-import snapshot, not proof of payment or an immutable
+audit trail. After import the page labels that snapshot explicitly.
+
+Files and previews remain local and unencrypted. No upload, chain query, payment
+execution or automatic verification occurs. Preview state is intentionally not
+persisted. Unsaved files and previews defer service-worker reloads until cleared
+or imported. The invoice, participant and evidence storage formats are unchanged.
+
 ## Participant modules
 
 Each participant can configure Graphus, Constellation, AML / BI-PoRB and System
@@ -190,7 +228,8 @@ node --test apps/bloch-pay/tests/*.test.mjs
 node apps/bloch-pay/tests/browser.mjs
 node apps/bloch-pay/tests/modules-browser.mjs
 node apps/bloch-pay/tests/evidence-browser.mjs
-PAY_PREVIOUS_RELEASE=/absolute/staged/v3 node apps/bloch-pay/tests/upgrade.mjs
+node apps/bloch-pay/tests/reconciliation-browser.mjs
+PAY_PREVIOUS_RELEASE=/absolute/staged/v4 node apps/bloch-pay/tests/upgrade.mjs
 ```
 
 Browser checks need Playwright and Chrome/Chromium. Set `PLAYWRIGHT_MODULE` to a
@@ -205,7 +244,7 @@ duplicate outputs, CSV injection, stale storage, partner/currency validation, ev
 ordering, participant documentation, route persistence, archive/restore, separate
 backups, currency-separated graph totals, export, three screen sizes, HTML escaping
 and offline reloads. The upgrade check requires the previous staged release and
-verifies invoice and studio preservation from v3 to v4 and cross-tab unsaved-form
+verifies invoice and studio preservation from v4 to v5 and cross-tab unsaved-form
 protection. Module browser checks use explicit synthetic participants and intercepted
 registry fixtures, including failed refresh, scoped exports, all 25 sample references,
 comparison limits, filters and offline persistence. Unit checks include the maximum
@@ -215,6 +254,14 @@ validation, archive/restore, offline IndexedDB persistence, stale-tab rejection,
 transaction rollback, backup isolation, canceled requests, failed-refresh retention
 and imported-packet labeling. Evidence browser fixtures are explicitly synthetic;
 real source responses are checked separately with `evidence-live.mjs ORIGIN`.
+
+The batch reconciliation release passed 55 unit checks, the invoice/integration
+browser regression, its dedicated browser flow and the v4-to-v5 upgrade test.
+Dedicated checks cover no-write previews, whole-batch rejection, duplicate
+skipping, exact invoice impact, CSV exports, 1440/390/320 px layouts, confirmation
+and cancellation, quota failure, repeated imports, separate integration storage,
+offline review, row pagination and stale-tab confirmation. A real service-worker
+update from another tab preserves a pending reconciliation preview until cleared.
 
 ## Publication
 
@@ -228,6 +275,6 @@ Increment the service-worker cache version when changing app shell assets after
 this release. Updates wait for the user's update action before reloading the app.
 The shared update handler preserves open forms and unsaved integration drafts when
 another tab activates an update, offering an explicit reload after changes are
-saved or reset. Offline shell v4 keeps the original invoice and integration
-storage formats and includes the evidence workspace (27 shell files). Only the public Graphus origin is
+saved or reset. Offline shell v5 keeps the original invoice and integration
+storage formats and includes the evidence and reconciliation workspaces (31 shell files). Only the public Graphus origin is
 added to the site's connection policies; private API keys are never accepted by the UI.
