@@ -2,6 +2,27 @@
 
 # Weak-subjectivity checkpoints — the published artifacts
 
+## Current publication — epoch 3328, September 26, 2026
+
+The [epoch-3328 package](epoch-3328/README.md) contains the signed envelope,
+public signer set, canonical checkpoint, checksums and verification record.
+The current release verifies its three signatures; two live archivals agree on
+its finalized block and state. It was **FRESH** at epoch 3959 and is refused for
+initial synchronization from epoch **5344**, **2026-10-12 06:35:19 UTC**.
+
+**Custody limitation:** all three keys were used on one operator-controlled
+machine. Independent custody and an external auditor's attestation are
+unverified. This is an operator-controlled publication, not certification of
+the independent Phase-A ceremony described below. Read the package's trust
+statement and authenticate its signer-set fingerprint before use. Operators
+requiring independent custodians must wait for that requirement to be met.
+
+See the [public observer guide](../docs/PUBLIC-OBSERVER-2026-09-26.md) for
+download, verification and launch commands. The epoch-1536 files below are
+historical, expired artifacts and must not be used for a fresh installation.
+
+## Formats and independent ceremony
+
 This directory is the publication home of the artifacts that
 `bloch-pos run --ws-checkpoint <file> --ws-signer-set <file>` consumes
 (`crates/bloch-pos-node/src/ws_boot.rs`). The mechanism has been in the node
@@ -138,7 +159,10 @@ out-of-band property the whole mechanism needs.
   wired"), a checkpoint anchors and cross-checks a from-genesis sync; it is
   not yet a sync starting point.
 
-## Current artifact — epoch 1536 (mainnet, minted 2026-08-31, UNSIGNED)
+## Historical artifact — epoch 1536 (mainnet, minted 2026-08-31, UNSIGNED)
+
+The remainder of this section records the original August 31 artifact and
+then-current ceremony status. It is not the current bootstrap publication.
 
 Derived from the live chain (RPC 139.84.201.52:16400; the chain's finalized
 epoch was 1588 at derivation, so epoch 1536 — the latest finalized publication

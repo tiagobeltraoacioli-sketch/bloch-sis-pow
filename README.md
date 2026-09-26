@@ -20,6 +20,14 @@ changed. If you cloned one of these, you are in the right place.
 The package includes the binary, signed checksum and upgrade instructions.
 [Download from the site](https://blochl1.com/releases/2026-09-24/bloch-pos).
 
+**Fresh observer installation:** use the [September 26 public observer guide](docs/PUBLIC-OBSERVER-2026-09-26.md)
+and [epoch-3328 checkpoint package](checkpoints/epoch-3328/README.md). The envelope
+has three valid signatures and is within the weak-subjectivity window until
+epoch 5344, **October 12, 2026 at 06:35:19 UTC**. It is an operator-controlled
+trust anchor: independent signer custody and an external auditor's attestation
+remain unverified. Review that limitation and authenticate the signer-set pin
+before bootstrap. The older epoch-1536 publication is expired.
+
 The live chain is **Genesis-4**, proof of stake. It started at
 **2026-08-13 21:31:19 UTC** and has been producing a block every 30 s and
 finalising every epoch since. The trunk of this repository builds it:
@@ -163,7 +171,7 @@ change any rule, so "impossible to change" would be false.
 | PoS consensus core (`crates/bloch-pos-committee`) | yes | yes — 366 tests green, measured 2026-08-13 | **yes — live** |
 | PoS node (`crates/bloch-pos-node`) | yes | yes | **yes — mainnet since 2026-08-13 21:31:19 UTC**, 64 validators, justifying and finalising (current host distribution: [`deploy/FLEET-INVENTORY.md`](deploy/FLEET-INVENTORY.md) — not restated here as a round number this table cannot keep current) |
 | Tokenomics V4 | yes | constants + const-asserts in the crate | yes — it is the live emission |
-| Weak-subjectivity checkpoints | yes | no | no |
+| Weak-subjectivity checkpoints | yes | yes — verifier and [signed epoch-3328 package](checkpoints/epoch-3328/README.md) | Current release accepts the envelope; independent custody and a full fresh replay of this package remain unverified |
 | EVM at L1 | proposal; direction accepted (`docs/adr/ADR-040-evm-and-ustav-at-l1.md`) | **no code exists** — the authorization model is an open founder decision | no |
 | Ustav (PSTRN-1) charter at L1 | proposal | no — nothing wired | no |
 | Third-party audit | scoped | pre-audit dossier written | **not performed** |
@@ -277,10 +285,12 @@ chain (most of it is still the latter; `deploy/FLAG-DAY-EPOCH-2700.md` and
 
 ## Prebuilt binaries
 
-**These are Genesis-3 binaries, and Genesis-3 has stopped.** They are kept
+For Genesis-4 use the [signed September 24 release](releases/bloch-pos-2026-09-24/README.md)
+and the [current observer bootstrap guide](docs/PUBLIC-OBSERVER-2026-09-26.md).
+
+**The binaries listed below are Genesis-3 binaries, and Genesis-3 has stopped.** They are kept
 published because they are the artifacts an auditor replays the closed chain
-with, not because there is a network for them to join. There is no prebuilt
-Genesis-4 node yet; build `bloch-pos` from source.
+with, not because there is a network for them to join.
 
 Building from source is the recommended path — you run the bytes you
 compiled, and the build is reproducible by design (see [REPRO.md](./REPRO.md)).

@@ -1,0 +1,92 @@
+{
+  "checked_on_utc": "2026-09-26",
+  "checkpoint": {
+    "format": "bloch-ws-checkpoint",
+    "version": 1,
+    "network_id": 1228832244,
+    "genesis_root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415",
+    "epoch": 3328,
+    "boundary_slot": 106493,
+    "block_root": "386df5c04e116b755014e8e6b5aca0120be633401266b348ff1daf3f181896f9",
+    "state_root": "09c0bfbe8cbe63127a27b9e80dd75a03792e2db6995abbfb1929dfb5202ba52c",
+    "validator_set_root": "0000000000000000000000000000000000000000000000000000000000000000",
+    "issued_at": 1789930007,
+    "signer_set_id": 1,
+    "ws_digest": "f4f067929ee881f671df54a5849edec4106c712f28b2286ab1a7fc58e587fbc0"
+  },
+  "verification_binary_source": "4d4c5075872c622fdd26aa418a9d249ec95fbcea",
+  "verification_binary_sha256": "fb8a65cbd9721d794bd4c2151b50d82d85a7df2299d59d7bad44a7635c30b46a",
+  "verifier_exit_code": 0,
+  "signatures_valid": 3,
+  "distinct_public_keys": 3,
+  "quorum": 2,
+  "signer_count": 3,
+  "declared_external_signers": 3,
+  "minimum_external_signers": 1,
+  "signer_set_adopted_epoch": 0,
+  "signer_set_fingerprint_sha3_256": "bccb7c5ee127f806ac7da69a6dfab0a0b1c3d2750d6224bbfb652baa3322d627",
+  "checked_at_epoch": 3959,
+  "age_at_check_epochs": 631,
+  "window_epochs": 2016,
+  "freshness_at_check": "FRESH",
+  "soft_stale_at_epoch": 4336,
+  "refused_at_epoch": 5344,
+  "refused_at_utc": "2026-10-12T06:35:19Z",
+  "canonical_boundary": {
+    "block_id": "386df5c04e116b755014e8e6b5aca0120be633401266b348ff1daf3f181896f9",
+    "slot": 106493,
+    "height": 80156,
+    "state_root": "09c0bfbe8cbe63127a27b9e80dd75a03792e2db6995abbfb1929dfb5202ba52c",
+    "finalized": true
+  },
+  "corroboration": {
+    "node_count": 2,
+    "public_rpc_endpoints": [
+      "139.180.166.5:8080",
+      "139.180.173.231:8080"
+    ],
+    "method": "Direct read-only checks of each archival node, over authenticated SSH, using its local RPC.",
+    "independent_operators": false,
+    "observed_finalized_epoch": 3957,
+    "observed_finalized_root": "ee96263627ea844df67290d05f6ce91121e629fc82aa0faf74d8232bbc257ebd"
+  },
+  "custody": {
+    "independent_custody_verified": false,
+    "independent_auditor_attestation_available": false,
+    "ceremony_record": "The three signing keys were used on the same operator-controlled machine for this artifact.",
+    "external_labels": "Declarations in the signer-set file; they do not prove external ownership or independent custody.",
+    "publication_scope": "Existing operator-held artifact, with the custody limitation disclosed; not an independently signed Phase-A ceremony."
+  },
+  "full_fresh_node_replay_tested_for_this_package": false,
+  "limitations": [
+    "Consumers must explicitly trust this operator-controlled anchor and authenticate the signer-set fingerprint through another trusted channel.",
+    "This record does not certify compliance with the independent-custodian requirements of the Phase-A specification.",
+    "Both archival references are controlled by the same organization.",
+    "The all-zero validator_set_root is the placeholder supported by this release. The checkpoint anchors from-genesis replay, not snapshot download.",
+    "The signed envelope authenticates the canonical checkpoint. This JSON and the guide are supplementary metadata.",
+    "No new signatures were generated for this publication."
+  ],
+  "artifact_sha256": {
+    "wscheckpoint-3328.bin": "ed34a420656f2e985a3daf950d5695a7f77509cf4f9fe25e33ee83d5931219a8",
+    "wscheckpoint-3328.json": "86cdfcd13cf3a627bfbc0c49ee8dfefa227249772af43c8f0163de6bef22c5d9",
+    "wscheckpoint-3328.envelope.bin": "66c7f832e5d644388e439c965014810e283347624404dca9b343bb5ae4c1d18d",
+    "signer-set-1.bin": "b2ea7f0ca9356a3d82bcd2a3f6a1e1a1b997a809b3bc91a063c90d7852566643"
+  },
+  "public_signer_keys": [
+    {
+      "index": 0,
+      "declared_external": true,
+      "raw_hybrid_public_key_sha256": "5efc54eb57f3226be416a04f7d64fb4a49a0dc21cca445added49b293699957a"
+    },
+    {
+      "index": 1,
+      "declared_external": true,
+      "raw_hybrid_public_key_sha256": "afa529461b5fbb89a4d33e34538980cb32dc001277c46be1fd7d38efc7b7b9dc"
+    },
+    {
+      "index": 2,
+      "declared_external": true,
+      "raw_hybrid_public_key_sha256": "ad59580111aceedba4c12958132cc5cdf30f209c73abdb765d4d3eb0de89e3ac"
+    }
+  ]
+}

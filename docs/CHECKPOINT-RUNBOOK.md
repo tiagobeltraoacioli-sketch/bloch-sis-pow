@@ -2,6 +2,13 @@
 
 # Weak-subjectivity checkpoint runbook
 
+**Current publication, September 26, 2026:** [epoch 3328](../checkpoints/epoch-3328/README.md)
+is available as an operator-controlled anchor with independent custody
+unverified. See the [observer guide](PUBLIC-OBSERVER-2026-09-26.md) for current
+bootstrap commands. The historical epoch recommendations in section 10 below
+are September 2 measurements. This publication does not certify completion of
+the independent ceremony specified by this runbook.
+
 How to mint, sign, assemble, publish and verify a Genesis-4 weak-subjectivity
 checkpoint. Written to be followed by an operator who did not write the tool.
 

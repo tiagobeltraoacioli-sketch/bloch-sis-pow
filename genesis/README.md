@@ -17,6 +17,11 @@ are needed; neither is useful alone.
 
 ## Running a node against it
 
+For a fresh installation, follow the [September 26 observer guide](../docs/PUBLIC-OBSERVER-2026-09-26.md).
+The historical command below omits the signed checkpoint, signer set and
+independently authenticated fingerprint now required after the genesis-only
+window expired. It is not a complete current launch command.
+
     bloch-pos run \
       --data-dir  ./data \
       --genesis    ./genesis/mainnet.manifest \
