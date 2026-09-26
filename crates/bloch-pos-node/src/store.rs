@@ -1154,6 +1154,12 @@ impl Store {
                 out.extend_from_slice(META_MAGIC);
                 out.extend_from_slice(&bloch_pos_committee::header::VERSION_G4.to_le_bytes());
                 out.extend_from_slice(genesis_digest);
+                // audit KS-10, 2026-09-16: staged, fsync'd, renamed, and the
+                // directory fsync'd. This was a bare `fs::write`, so a crash
+                // on first boot could leave an empty `meta.bin` that the next
+                // open refused as "a different network or schema": fail-closed,
+                // but a misleading message for a first-boot crash, and an
+                // operator-only recovery.
                 atomic_private_write(&meta_path, &out)?;
             }
             Err(e) => return Err(e),
@@ -3077,5 +3083,32 @@ mod tests {
             proposer_sig: vec![0xAA; 32],
             body: Body { transactions: Vec::new(), attestations: Vec::new() },
         }
+    }
+
+    /// audit KS-10 (2026-09-16): `meta.bin` is installed atomically on first
+    /// open — the 44-byte record is there, the temp file is not, and a
+    /// second open of the same dir for the same genesis accepts it.
+    #[test]
+    fn meta_bin_is_written_atomically_on_first_open() {
+        let dir = std::env::temp_dir().join(format!("bloch-pos-store-meta-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let genesis = [5u8; 32];
+        {
+            let _store = Store::open(&dir, &genesis).expect("first open writes meta.bin");
+            let meta = fs::read(dir.join("meta.bin")).expect("meta.bin exists after open");
+            assert_eq!(meta.len(), 44);
+            assert_eq!(&meta[..8], META_MAGIC);
+            assert_eq!(&meta[12..], &genesis);
+            // The staging file carries a per-process unique name, so look
+            // for the suffix rather than one fixed path.
+            let leftover: Vec<String> = fs::read_dir(&dir)
+                .expect("read dir")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".tmp"))
+                .collect();
+            assert!(leftover.is_empty(), "temp file left behind: {leftover:?}");
+        }
+        let _again = Store::open(&dir, &genesis).expect("the installed meta.bin is accepted");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

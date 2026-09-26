@@ -255,6 +255,131 @@ fn the_plaintext_opt_in_is_the_only_route_to_a_plaintext_file() {
     }
 }
 
+// ----- deep audit 2026-09-16: KS-01, KS-02, KS-03 through the binary -----
+
+fn write_pass_file(dir: &PathBuf, contents: &str, mode: u32) -> PathBuf {
+    let p = dir.join("pass");
+    std::fs::write(&p, format!("{contents}\n")).expect("write pass file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+    let _ = mode;
+    p
+}
+
+/// Temp files left in `dir`. The keystore is installed through a staging
+/// file with a per-process unique name, so look for the suffix rather than
+/// one fixed path.
+fn leftover_temp_files(dir: &PathBuf) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .expect("read dir")
+        .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect()
+}
+
+/// audit KS-01 (2026-09-16). `keygen` pointed at a directory that already
+/// holds a `validator.key` is a refusal, not a replacement: the bytes on
+/// disk are untouched under every policy, the message says why, and the
+/// exit code is the binary's failure code (1), not a usage error.
+#[test]
+fn keygen_refuses_to_overwrite_an_existing_keystore() {
+    let dir = tmp_dir("overwrite");
+    let out = keygen(&dir, &[("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE)]);
+    assert!(out.status.success(), "first keygen failed: {}", stderr(&out));
+    let before = std::fs::read(dir.join("validator.key")).expect("read");
+
+    for env in [
+        vec![("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE)],
+        vec![("BLOCH_KEYSTORE_PASSPHRASE", "a different throwaway passphrase")],
+        vec![("BLOCH_KEYSTORE_ALLOW_PLAINTEXT", "1")],
+    ] {
+        let again = keygen(&dir, &env);
+        assert_eq!(again.status.code(), Some(1), "keygen over a live key ({env:?}): {}", stderr(&again));
+        let e = stderr(&again);
+        assert!(e.contains("refusing to replace"), "the refusal does not say why: {e}");
+        assert!(again.stdout.is_empty(), "a refused keygen printed a success line");
+    }
+    assert_eq!(std::fs::read(dir.join("validator.key")).expect("read"), before, "the key was touched");
+    let leftover = leftover_temp_files(&dir);
+    assert!(leftover.is_empty(), "temp file left behind: {leftover:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// audit KS-02 (2026-09-16). The node's `BLOCH_KEYSTORE_PASSPHRASE_FILE`
+/// path, the one `run` and every keystore-reading verb take, refuses a
+/// group- or world-readable passphrase file, the way `keys seal
+/// --passphrase-file` always did, and opens the keystore once the file is
+/// 0600. Driven through `keygen-public`, which reads the keystore through
+/// exactly the loader `run` uses.
+#[cfg(unix)]
+#[test]
+fn the_node_passphrase_file_path_refuses_a_world_readable_file() {
+    let dir = tmp_dir("passfile-mode");
+    let pass = write_pass_file(&dir, PASSPHRASE, 0o600);
+    let out = keygen(&dir, &[("BLOCH_KEYSTORE_PASSPHRASE_FILE", pass.to_str().unwrap())]);
+    assert!(out.status.success(), "keygen from a 0600 passphrase file failed: {}", stderr(&out));
+
+    for mode in [0o644u32, 0o640, 0o604] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pass, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        let refused = run(
+            &["keygen-public", "--dir", dir.to_str().unwrap()],
+            &[("BLOCH_KEYSTORE_PASSPHRASE_FILE", pass.to_str().unwrap())],
+        );
+        assert!(!refused.status.success(), "a {mode:04o} passphrase file opened the keystore");
+        assert!(refused.stdout.is_empty(), "a refused open still printed a cohort row");
+        let e = stderr(&refused);
+        assert!(
+            e.contains("readable by group or others") && e.contains("passphrase file"),
+            "the refusal does not name the cause: {e}"
+        );
+    }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pass, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    let ok = run(
+        &["keygen-public", "--dir", dir.to_str().unwrap()],
+        &[("BLOCH_KEYSTORE_PASSPHRASE_FILE", pass.to_str().unwrap())],
+    );
+    assert!(ok.status.success(), "a 0600 passphrase file must open the keystore: {}", stderr(&ok));
+    assert!(String::from_utf8_lossy(&ok.stdout).starts_with("0\t"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// audit KS-03 (2026-09-16). `keygen` under a passphrase shorter than the
+/// floor `keys seal` already enforces, from the environment variable and
+/// from a passphrase file alike, is refused, names the floor, and writes
+/// nothing. The floor applies when SEALING only: resolving the unlock policy
+/// never enforces it (unit-tested in `keys.rs`), so a keystore sealed under
+/// a short passphrase by an earlier binary keeps opening.
+#[test]
+fn keygen_refuses_a_short_passphrase_and_writes_nothing() {
+    let dir = tmp_dir("short-pass");
+    let short = "elevenchars";
+    let pass = write_pass_file(&dir, short, 0o600);
+    for env in [
+        vec![("BLOCH_KEYSTORE_PASSPHRASE", short)],
+        vec![("BLOCH_KEYSTORE_PASSPHRASE_FILE", pass.to_str().unwrap())],
+    ] {
+        let out = keygen(&dir, &env);
+        assert_eq!(out.status.code(), Some(1), "keygen under a short passphrase ({env:?})");
+        let e = stderr(&out);
+        assert!(e.contains("at least 12 characters"), "the refusal does not name the floor: {e}");
+        assert!(!dir.join("validator.key").exists(), "a refused keygen wrote a keystore");
+        let leftover = leftover_temp_files(&dir);
+        assert!(leftover.is_empty(), "a refused keygen left a temp file: {leftover:?}");
+    }
+    // Twelve characters is the floor, and the floor seals.
+    let out = keygen(&dir, &[("BLOCH_KEYSTORE_PASSPHRASE", "twelve chars")]);
+    assert!(out.status.success(), "a passphrase at the floor must seal: {}", stderr(&out));
+    assert_eq!(&std::fs::read(dir.join("validator.key")).unwrap()[..8], SEALED_MAGIC);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(unix)]
 #[test]
 fn inherited_pipe_credentials_seal_and_reopen_without_secret_environment() {

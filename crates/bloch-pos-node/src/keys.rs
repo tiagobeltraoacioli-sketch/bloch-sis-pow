@@ -119,9 +119,18 @@ const KDF_DEFAULT_MAX_M_COST_KIB: u32 = 65_536; // 64 MiB
 /// legacy settings require the explicit finite recovery override.
 const KDF_DEFAULT_MAX_WORK_KIB: u64 = 196_608; // 192 MiB-pass
 
-/// Shortest passphrase `keys seal` will seal under. Argon2id makes guessing
+/// Shortest passphrase this module will SEAL under: `keys seal` and, since
+/// audit KS-03 (2026-09-16), `keygen` / every [`Keystore::save_with`] through
+/// the env/file passphrase too (the mainnet ceremony sealed 64 keystores
+/// through that path with only a non-empty check). Argon2id makes guessing
 /// expensive per attempt, not impossible; a validator identity behind eight
 /// characters is still a dictionary away.
+///
+/// Enforced on every sealing write (`seal_payload`, which every writer
+/// reaches) and never on unlock: a keystore already sealed under a shorter
+/// passphrase by an older binary must keep opening, or the fix would lock
+/// its operator out of a live validator. Re-sealing such a file under a
+/// longer passphrase is a separate operator action.
 pub const MIN_SEAL_PASSPHRASE_CHARS: usize = 12;
 
 /// Argon2id cost parameters, written into every sealed keystore.
@@ -387,6 +396,12 @@ impl Unlock {
         plaintext_opt_in: bool,
     ) -> io::Result<Unlock> {
         if let Some(path) = pass_file {
+            // audit KS-02, 2026-09-16: the same reader, so the same 0600
+            // check, that `keys seal --passphrase-file` always used. This
+            // was a bare `fs::read`, so a world-readable passphrase file
+            // beside a 0600 keystore was refused by the sealing tool and
+            // accepted by the node. Every failure is re-kinded to
+            // PermissionDenied (never NotFound): see the doc comment.
             let pass = read_passphrase_file(Path::new(&path)).map_err(|e| {
                 io::Error::new(io::ErrorKind::PermissionDenied, format!("cannot read protected keystore passphrase file: {e}"))
             })?;
@@ -547,6 +562,34 @@ impl Keystore {
 
     /// Write `dir/validator.key`, sealed unless the caller explicitly asked
     /// for plaintext.
+    ///
+    /// ## Never over an existing file (audit KS-01, 2026-09-16)
+    ///
+    /// This is the `keygen` path, and it used to open the final path with
+    /// `truncate(true)`: `bloch-pos keygen --dir <live datadir>` replaced a
+    /// validator's hybrid secret key and RANDAO seed with a throwaway pair in
+    /// one line, with nothing but the shell scripts around it checking first.
+    /// [`Keystore::generate_with`] now refuses an existing `validator.key`
+    /// with `AlreadyExists`, under the data-dir lock, before a key is even
+    /// generated; removing the file is the operator's own, separate action.
+    /// The only in-place rewrite this module performs is
+    /// [`Keystore::seal_in_place`], which has its own temp file, round-trip
+    /// verification and data-dir lock.
+    ///
+    /// ## Atomic (audit KS-10, 2026-09-16)
+    ///
+    /// `store::atomic_private_write`: the bytes go to a uniquely named
+    /// sibling staging file created 0600 with `create_new` (never
+    /// created-then-chmodded: the umask window was the finding I-H1 closed),
+    /// are fsync'd, are renamed over the final path, and the directory is
+    /// fsync'd. At no instant does the path name a partial or empty
+    /// keystore, and a staging file that was never published is unlinked.
+    ///
+    /// ## Passphrase floor (audit KS-03, 2026-09-16)
+    ///
+    /// The `seal` path refuses a passphrase under
+    /// [`MIN_SEAL_PASSPHRASE_CHARS`] before a byte is written, so `keygen`
+    /// through the env/file passphrase gets the floor `keys seal` always had.
     pub fn save_with(&self, dir: &Path, unlock: &Unlock) -> io::Result<()> {
         fs::create_dir_all(dir)?;
         ensure_mutation_ownership(dir)?;
@@ -1145,7 +1188,9 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     acc == 0
 }
 
-/// A passphrase from a file, for `keys seal --passphrase-file`.
+/// A passphrase from a file, for `keys seal --passphrase-file` and — since
+/// audit KS-02 (2026-09-16) — for the node's own `BLOCH_KEYSTORE_PASSPHRASE_FILE`
+/// path through [`Unlock::from_sources`].
 ///
 /// The file must be mode 0600 (unix): a world-readable passphrase file is the
 /// same leak as a world-readable key. One trailing newline is stripped, the
@@ -2143,6 +2188,135 @@ mod tests {
         fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(Unlock::from_sources(Some(p.clone().into_os_string()), None, false).is_ok());
         assert_eq!(read_passphrase_file(&p).unwrap().as_str(), "a long enough passphrase");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ----- audit KS-01 / KS-02 / KS-03 / KS-10 (deep audit 2026-09-16) -----
+
+    /// Directory entries left behind by a write: the staging file
+    /// `atomic_private_write` uses carries a per-process unique name, so
+    /// look for the `.tmp` suffix rather than one fixed path.
+    fn leftover_temp_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect()
+    }
+
+    /// audit KS-01 + KS-10 (2026-09-16). `keygen` over a live keystore used
+    /// to replace it in one line. Now an existing `validator.key` is a
+    /// refusal that leaves every byte of it as found, with no temp file
+    /// behind, under either policy and under a different passphrase, and
+    /// the file still opens under its own passphrase.
+    #[test]
+    fn keygen_refuses_to_overwrite_and_leaves_no_temp_file_behind() {
+        let dir = tmp_dir("no-overwrite");
+        let unlock = Unlock::passphrase_with("the first passphrase", TEST_KDF);
+        let first = Keystore::generate_with(&dir, 8, &unlock).expect("first keygen");
+        let path = dir.join("validator.key");
+        let before = fs::read(&path).expect("read");
+        assert!(leftover_temp_files(&dir).is_empty(), "temp file left after a keygen");
+
+        for policy in [
+            Unlock::passphrase_with("a different passphrase", TEST_KDF),
+            Unlock::PlaintextOptIn,
+        ] {
+            let e = expect_err_kind(
+                Keystore::generate_with(&dir, 9, &policy),
+                io::ErrorKind::AlreadyExists,
+                "keygen over an existing keystore",
+            );
+            assert!(e.to_string().contains("refusing to replace"), "{e}");
+        }
+        assert_eq!(fs::read(&path).expect("read"), before, "the keystore was touched");
+        assert!(leftover_temp_files(&dir).is_empty(), "a refused keygen left a temp file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let again = Keystore::load_with(&dir, &unlock).expect("still opens under its passphrase");
+        assert_eq!(again.pubkey, first.pubkey);
+        assert_eq!(again.index, 8);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// audit KS-02 (2026-09-16). The node's own passphrase-file path,
+    /// `BLOCH_KEYSTORE_PASSPHRASE_FILE` resolved by `from_sources`, applies
+    /// the mode check `keys seal --passphrase-file` always applied. It used
+    /// to be a bare `fs::read`. The refusal names the cause, keeps the kind
+    /// `PermissionDenied` (never `NotFound`), and a 0600 file resolves to a
+    /// passphrase policy at the production cost with the newline gone.
+    #[cfg(unix)]
+    #[test]
+    fn the_node_passphrase_file_path_refuses_a_world_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("node-passfile");
+        let p = dir.join("pass");
+        fs::write(&p, b"a long enough passphrase\n").unwrap();
+        for mode in [0o644, 0o640, 0o604] {
+            fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+            let e = expect_err_kind(
+                Unlock::from_sources(Some(p.clone().into_os_string()), None, false),
+                io::ErrorKind::PermissionDenied,
+                "loose passphrase file on the node path",
+            );
+            assert!(e.to_string().contains("readable by group or others"), "{e}");
+        }
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        match Unlock::from_sources(Some(p.clone().into_os_string()), None, false) {
+            Ok(Unlock::Passphrase { pass, kdf, expected_existing_kdf }) => {
+                assert_eq!(pass.as_str(), "a long enough passphrase");
+                assert_eq!(kdf, KdfParams::PRODUCTION);
+                assert_eq!(expected_existing_kdf, None, "the file path never widens the KDF");
+            }
+            _ => panic!("a 0600 passphrase file must resolve to a passphrase policy"),
+        }
+        // Empty is a refusal too, re-kinded like every other failure of this
+        // path to PermissionDenied: never NotFound, which would select
+        // observer mode.
+        fs::write(&p, b"\n").unwrap();
+        expect_err_kind(
+            Unlock::from_sources(Some(p.into_os_string()), None, false),
+            io::ErrorKind::PermissionDenied,
+            "empty passphrase file",
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// audit KS-03 (2026-09-16). Every sealing write, `keygen` through the
+    /// env/file passphrase included, refuses a passphrase under
+    /// `MIN_SEAL_PASSPHRASE_CHARS` and writes nothing; exactly the floor
+    /// seals. The floor is NOT applied when the unlock policy is resolved:
+    /// a keystore sealed under a short passphrase by the unchecked path (the
+    /// mainnet ceremony sealed 64 through it) must keep opening, or the fix
+    /// bricks its operator. (No such file can be produced through this
+    /// module any more, since `seal_payload` itself enforces the floor, so
+    /// the unlock half is checked at the policy level.)
+    #[test]
+    fn sealing_refuses_a_short_passphrase_but_unlocking_never_does() {
+        let dir = tmp_dir("short-pass");
+        let short = "elevenchars";
+        assert!(short.chars().count() < MIN_SEAL_PASSPHRASE_CHARS);
+        let e = expect_err_kind(
+            Keystore::generate_with(&dir, 3, &Unlock::passphrase_with(short, TEST_KDF)),
+            io::ErrorKind::InvalidInput,
+            "keygen under a short passphrase",
+        );
+        assert!(e.to_string().contains(&MIN_SEAL_PASSPHRASE_CHARS.to_string()), "{e}");
+        assert!(!dir.join("validator.key").exists(), "a refused keygen wrote a keystore");
+        assert!(leftover_temp_files(&dir).is_empty(), "a refused keygen left a temp file");
+
+        let floor = "x".repeat(MIN_SEAL_PASSPHRASE_CHARS);
+        Keystore::generate_with(&dir, 3, &Unlock::passphrase_with(floor.as_str(), TEST_KDF))
+            .expect("a passphrase at the floor seals");
+
+        // The env path resolves a short passphrase; only sealing refuses it.
+        assert!(matches!(
+            Unlock::from_sources(None, Some(short.to_string()), false),
+            Ok(Unlock::Passphrase { .. })
+        ), "the env path resolves a short passphrase; only sealing refuses it");
         let _ = fs::remove_dir_all(&dir);
     }
 

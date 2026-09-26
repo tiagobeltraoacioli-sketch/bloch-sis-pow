@@ -86,7 +86,7 @@
 //! by the peer's inbound handler on the same socket.
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
@@ -672,7 +672,45 @@ const OUTBOUND_QUEUE_DEPTH: usize = 256;
 /// peer count for inbound connections from peers that dialed first; past it a
 /// new connection is closed immediately, before either thread is spawned.
 const MAX_INBOUND_CONNECTIONS: usize = 128;
+
+/// Inbound TCP connections this transport will hold from ONE source address
+/// at once (audit NET-03, 2026-09-16).
+///
+/// [`MAX_INBOUND_CONNECTIONS`] is a per-process count. Counted that way, one
+/// host that opens 128 sockets to a public bootnode and sends a 5-byte frame
+/// on each every ~100 s holds every slot for as long as it likes, and every
+/// third party following the quickstart is refused at accept — the only
+/// public onboarding path, denied for the price of 128 idle sockets. This
+/// accommodates several validators, or an injector (`send_transaction` opens
+/// and closes its own connection) next to a validator, on one host, and
+/// still means a single source can take at most a quarter of the global
+/// allowance. Checked at accept, alongside the global cap, through
+/// [`crate::connection_limit::Limits`]; the permit is released when the
+/// connection ends.
 const MAX_INBOUND_PER_IP: usize = 32;
+
+/// The devnet transport's tunables, as one value, so [`start`] has exactly
+/// one production setting and the tests that need a small number have a
+/// named way to ask for it (audit NET-03 / NET-09, 2026-09-16). Production
+/// goes through `start` and always gets [`DevnetTuning::PRODUCTION`].
+#[derive(Clone, Copy)]
+struct DevnetTuning {
+    /// [`MAX_INBOUND_PER_IP`].
+    max_inbound_per_ip: usize,
+    /// [`DEVNET_IO_TIMEOUT`], as the inbound reader's deadline: how long an
+    /// accepted connection may go without a decodable frame.
+    inbound_idle: Duration,
+    /// [`DIAL_STALE_AFTER`].
+    dial_stale_after: Duration,
+}
+
+impl DevnetTuning {
+    const PRODUCTION: DevnetTuning = DevnetTuning {
+        max_inbound_per_ip: MAX_INBOUND_PER_IP,
+        inbound_idle: DEVNET_IO_TIMEOUT,
+        dial_stale_after: DIAL_STALE_AFTER,
+    };
+}
 
 /// Socket read/write timeout for the devnet mesh (R3 M-4 / R1 A3-M2). This
 /// transport had none: a peer that stopped reading its socket could stall
@@ -681,20 +719,54 @@ const MAX_INBOUND_PER_IP: usize = 32;
 /// held its reader thread — and its slot under [`MAX_INBOUND_CONNECTIONS`] —
 /// open forever.
 ///
-/// An honest peer's connection is never idle anywhere near this long: the
-/// dialer side below re-asks for history at least every 5 seconds while it
-/// holds a sync slot, and on a live chain a block or attestation broadcast
-/// arrives far more often than that. This is a generous multiple of that
-/// cadence, not a tight bound tuned to it.
+/// An honest connection that holds a sync slot re-asks for history every
+/// 5 seconds and is never idle anywhere near this long. The other
+/// connections are NOT that busy (audit NET-09, 2026-09-16): this transport
+/// does not relay, so one direction of a socket carries only what that
+/// endpoint itself originates — its own attestation once per epoch (~16 min)
+/// and its proposals — and between those the accepting side closes it here.
+/// That is fine, and it is now handled rather than hidden: the dialer below
+/// notices the close through its reader thread and re-dials before it writes
+/// the next frame, so the idle close costs a reconnect and never a frame.
+///
+/// On the inbound side the deadline is anchored at the last DECODABLE frame
+/// (audit NET-03): a frame of an unknown type renews nothing, so a peer
+/// sending only keepalive junk is closed at exactly the moment a silent peer
+/// would be.
 const DEVNET_IO_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Sustained `get-blocks` answers this transport will build per connection,
-/// per second, and the burst above it before the sustained rate binds — same
-/// values and the same reasoning as [`crate::p2p::SYNC_ANSWERS_PER_SEC`] /
-/// [`crate::p2p::SYNC_ANSWER_BURST`] on the production transport, which this
-/// mirrors (R3 M-4 / R1 A3-M2): the devnet serving path had NO rate limit at
-/// all, so a connected peer could issue `get-blocks` back to back forever,
-/// each one paying a `Store::blocks_after` disk read.
+/// How long a dialed socket may go without this node WRITING to it before
+/// the next queued frame goes out on a fresh socket instead (audit NET-09,
+/// 2026-09-16).
+///
+/// The accepting side closes an inbound connection [`DEVNET_IO_TIMEOUT`]
+/// after the last decodable frame it read — that is, after this dialer's
+/// last write. The dialer's reader thread notices that close once the FIN
+/// arrives and closes the connection, so the writer re-dials (see
+/// `run_connection_writer`); this closes the window before the FIN has
+/// arrived, and the race between the peer's close and this node's next
+/// write, deterministically: a socket this node has not written to for this
+/// long is one the peer is about to close, and a frame due for it is written
+/// on a new socket. Fifteen seconds under the peer's deadline covers
+/// scheduling skew between two hosts; a connection that holds a sync lease
+/// writes every 5 s and never comes near it.
+const DIAL_STALE_AFTER: Duration = Duration::from_secs(105);
+
+/// Sustained `get-blocks` answers this transport will build per source
+/// address, per second, and the burst above it before the sustained rate
+/// binds — same values and the same reasoning as
+/// [`crate::p2p::SYNC_ANSWERS_PER_SEC`] / [`crate::p2p::SYNC_ANSWER_BURST`]
+/// on the production transport, which this mirrors (R3 M-4 / R1 A3-M2): the
+/// devnet serving path had NO rate limit at all, so a connected peer could
+/// issue `get-blocks` back to back forever, each one paying a
+/// `Store::blocks_after` disk read.
+///
+/// Per source ADDRESS as well as per connection (audit NET-05, 2026-09-16):
+/// a per-connection bucket alone multiplies by however many connections one
+/// host may hold, and the budget it bought was 128 × 8 × 512 blocks/s from
+/// one host. Every connection from one address also draws on ONE shared
+/// bucket that outlives the connection (see [`SyncBudget`]), so closing and
+/// re-dialing does not refill it.
 const GET_BLOCKS_ANSWERS_PER_SEC: f64 = 8.0;
 const GET_BLOCKS_BURST: f64 = 32.0;
 
@@ -823,18 +895,85 @@ fn run_inbound_writer(
     socket: Arc<Mutex<TcpStream>>,
     half: ConnectionHalf,
 ) {
-    run_connection_writer(&rx, socket, half);
+    // The accepting side is the one that closes an idle connection, so it
+    // has no stale deadline to stay under and no reconnect to carry a frame
+    // to.
+    run_connection_writer(&rx, socket, half, None, &mut None);
 }
 
-fn run_connection_writer(rx: &Receiver<SharedFrame>, socket: Arc<Mutex<TcpStream>>, half: ConnectionHalf) {
+/// Drain `rx` into `socket` until the connection closes.
+///
+/// `stale_after` and `pending` are the dialer's (audit NET-09, 2026-09-16);
+/// the inbound writer passes neither. The accepting side closes a connection
+/// [`DEVNET_IO_TIMEOUT`] after the last decodable frame it read, that is,
+/// after this writer's last write, which on a connection that holds no sync
+/// lease is the honest cadence (one attestation per ~16 min). The reader half
+/// notices that close once the FIN arrives and drops its [`ConnectionHalf`],
+/// which is what `closed` reports here. Before this, nothing told the writer,
+/// and by TCP semantics its FIRST write into the dead socket succeeded locally
+/// (the peer answers RST) and only the SECOND failed, so the first frame after
+/// an idle period, most likely this node's own attestation or proposal, was
+/// lost every time. Two things close that window:
+///
+/// - A socket this node has not written to for `stale_after` is not written
+///   to again, whether or not the peer's FIN has arrived yet: its idle close
+///   is due, and racing it loses the frame. See [`DIAL_STALE_AFTER`].
+/// - A frame taken off the queue and not delivered, because the socket was
+///   closed or stale or the write failed, is handed back in `pending` and
+///   written first on the next socket. A `get-blocks` frame is never carried:
+///   its authorization belongs to the connection it was issued for
+///   (`take_sync_request`), and the scheduler re-issues it.
+///
+/// Chosen over a keepalive frame: a keepalive is a new type byte on a wire
+/// this change must not alter, and it would have to count as decodable on the
+/// inbound side (see `run_inbound_reader`) or it would not renew anything.
+/// Returning here reuses the dial/re-dial path that already exists for a
+/// failed write, costs one TCP handshake per idle close, and keeps the wire
+/// exactly as it was.
+fn run_connection_writer(
+    rx: &Receiver<SharedFrame>,
+    socket: Arc<Mutex<TcpStream>>,
+    half: ConnectionHalf,
+    stale_after: Option<Duration>,
+    pending: &mut Option<SharedFrame>,
+) {
+    let mut last_write = Instant::now();
+    if let Some(frame) = pending.take() {
+        let Ok(mut writer) = socket.lock() else {
+            *pending = Some(frame);
+            return;
+        };
+        if half.0.closed.load(Ordering::Acquire)
+            || write_frame(&mut *writer, frame.as_ref()).is_err()
+        {
+            *pending = Some(frame);
+            return;
+        }
+        last_write = Instant::now();
+    }
     while !half.0.closed.load(Ordering::Acquire) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(frame) => {
                 let Ok(mut writer) = socket.lock() else { return };
-                if half.0.closed.load(Ordering::Acquire) { return; }
-                if frame.first() == Some(&FRAME_GET_BLOCKS)
-                    && !half.0.take_sync_request(frame.as_ref(), Instant::now()) { continue; }
-                if write_frame(&mut *writer, frame.as_ref()).is_err() { return; }
+                let carry = frame.first() != Some(&FRAME_GET_BLOCKS);
+                if half.0.closed.load(Ordering::Acquire)
+                    || stale_after.is_some_and(|stale| last_write.elapsed() >= stale)
+                {
+                    if carry {
+                        *pending = Some(frame);
+                    }
+                    return;
+                }
+                if !carry && !half.0.take_sync_request(frame.as_ref(), Instant::now()) {
+                    continue;
+                }
+                if write_frame(&mut *writer, frame.as_ref()).is_err() {
+                    if carry {
+                        *pending = Some(frame);
+                    }
+                    return;
+                }
+                last_write = Instant::now();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -1098,14 +1237,43 @@ fn framed_event_shape(frame: &[u8]) -> Option<(EventClass, usize)> {
     Some((class, frame.len().saturating_sub(1)))
 }
 
-/// Admit a legacy devnet frame before decoding it.
+/// What became of one data frame handed to [`admit_frame_from_ip`]. The
+/// inbound reader anchors its idle deadline on this (audit NET-03 / NET-05,
+/// 2026-09-16); `decode_and_send_from_ip` folds it to "is the engine still
+/// there".
+enum FrameOutcome {
+    /// Decoded and queued for the engine.
+    Delivered,
+    /// Refused by a budget (the source's or the engine queue's) and dropped.
+    /// The refusal may come before decoding, so this says nothing about the
+    /// payload beyond its type byte and size.
+    Shed,
+    /// Nothing this node could use: an unknown type byte, a payload that
+    /// does not decode, or one whose canonical size disagrees with the wire.
+    Undecodable,
+    /// The engine is gone; the caller stops its thread.
+    EngineGone,
+}
+
+/// Admit a legacy devnet frame before decoding it. False when the engine is
+/// gone, so callers can stop their thread.
 fn decode_and_send_from_ip(
     events: &Sender<EngineEvent>,
     budget: &QueueBudget,
-    ip: std::net::IpAddr,
+    ip: IpAddr,
     frame: &[u8],
 ) -> bool {
-    let Some((class, size)) = framed_event_shape(frame) else { return true };
+    !matches!(admit_frame_from_ip(events, budget, ip, frame), FrameOutcome::EngineGone)
+}
+
+/// [`decode_and_send_from_ip`], reporting what happened to the frame.
+fn admit_frame_from_ip(
+    events: &Sender<EngineEvent>,
+    budget: &QueueBudget,
+    ip: IpAddr,
+    frame: &[u8],
+) -> FrameOutcome {
+    let Some((class, size)) = framed_event_shape(frame) else { return FrameOutcome::Undecodable };
     let Some(source_guard) = source_budget::Registry::reserve(
         &budget.sources,
         source_budget::Source::ip(ip),
@@ -1115,22 +1283,22 @@ fn decode_and_send_from_ip(
         budget.bytes_cap,
     ) else {
         budget.shed_counter(class).fetch_add(1, Ordering::Relaxed);
-        return true;
+        return FrameOutcome::Shed;
     };
     if !budget.reserve_raw(class, size) {
         budget.shed_counter(class).fetch_add(1, Ordering::Relaxed);
-        return true;
+        return FrameOutcome::Shed;
     }
 
     let Some(mut event) = decode_event(frame) else {
         budget.release_raw(size);
-        return true;
+        return FrameOutcome::Undecodable;
     };
     // All three decoders are canonical. A future permissive decoder must not
     // release a different byte charge from the one reserved before it ran.
     if class_of(&event) != class || queued_bytes(&event) != size {
         budget.release_raw(size);
-        return true;
+        return FrameOutcome::Undecodable;
     }
     match &mut event {
         NetEvent::Block(_, origin)
@@ -1139,9 +1307,9 @@ fn decode_and_send_from_ip(
     }
     if events.send(EngineEvent::Net(event)).is_err() {
         budget.release_raw(size);
-        return false;
+        return FrameOutcome::EngineGone;
     }
-    true
+    FrameOutcome::Delivered
 }
 
 fn send_to_engine(events: &Sender<EngineEvent>, budget: &QueueBudget, ev: NetEvent) -> bool {
@@ -1404,6 +1572,56 @@ fn serve_get_blocks(
     }
 }
 
+/// The inbound reader loop: data frames go to the engine, get-blocks is
+/// handed to the bounded serving worker. Returns when the connection is
+/// done; the [`ConnectionHalf`] it holds then shuts the socket down.
+///
+/// The deadline is anchored at the last DECODABLE frame (audit NET-03 /
+/// NET-05, 2026-09-16), not at the last frame. `read_frame` renewed a full
+/// [`DEVNET_IO_TIMEOUT`] on every frame, and a 5-byte frame of an unknown
+/// type decodes to nothing and cost nothing, so one such frame per ~100 s
+/// held a slot forever. Now a frame that neither the engine nor the sync
+/// responder can use leaves the deadline where it was, and a peer that sends
+/// only those is closed at the moment a silent peer would be. A frame the
+/// budget refused before decoding DOES renew it: its bytes were charged to
+/// the source, and an honest peer whose frames are shed while the engine
+/// replays must not be closed for that. `idle` is [`DEVNET_IO_TIMEOUT`] in
+/// production and a parameter here so the test does not wait two minutes.
+fn run_inbound_reader(
+    mut socket: TcpStream,
+    half: ConnectionHalf,
+    events: Sender<EngineEvent>,
+    budget: Arc<QueueBudget>,
+    responder: SyncResponder,
+    ip: IpAddr,
+    idle: Duration,
+) {
+    // Per-connection (R3 M-4 / R1 A3-M2): see [`GetBlocksLimiter`].
+    let mut limiter = GetBlocksLimiter::new();
+    let mut last_decodable = Instant::now();
+    loop {
+        let Some(deadline) = last_decodable.checked_add(idle) else { return };
+        let Ok(frame) = read_frame_until(&mut socket, deadline) else { return };
+        let decodable = if frame.first() == Some(&FRAME_GET_BLOCKS) {
+            // Well-formed or not is decided here; whether it is ANSWERED is
+            // the responder's budget, and a refusal there is still a frame
+            // this node could have used.
+            let well_formed = frame.len() == 9;
+            responder.answer(&half.0, ip, frame, &mut limiter);
+            well_formed
+        } else {
+            match admit_frame_from_ip(&events, &budget, ip, &frame) {
+                FrameOutcome::Delivered | FrameOutcome::Shed => true,
+                FrameOutcome::Undecodable => false,
+                FrameOutcome::EngineGone => return,
+            }
+        };
+        if decodable {
+            last_decodable = Instant::now();
+        }
+    }
+}
+
 /// Start the mesh: listen on `bind_addr:listen_port`, dial every peer, feed
 /// decoded events into `events`. `head_slot` is read when (re)dialing to ask
 /// peers for everything after our head.
@@ -1423,6 +1641,29 @@ pub fn start(
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
     inflight: Arc<QueueBudget>,
+) -> std::io::Result<DevnetMesh> {
+    start_with_tuning(
+        bind_addr, listen_port, peer_addrs, events, data_dir, head_slot, inflight,
+        DevnetTuning::PRODUCTION,
+    )
+}
+
+/// [`start`] with the tunables as a parameter (audit NET-03 / NET-09,
+/// 2026-09-16). Production goes through `start` and always gets
+/// [`DevnetTuning::PRODUCTION`]; this exists so the global-cap test, which
+/// fills all `MAX_INBOUND_CONNECTIONS` from loopback, can lift the
+/// per-address bound it would otherwise hit first, and so the idle and
+/// stale deadlines can be tested in milliseconds rather than minutes.
+#[allow(clippy::too_many_arguments)]
+fn start_with_tuning(
+    bind_addr: &str,
+    listen_port: u16,
+    peer_addrs: Vec<String>,
+    events: Sender<EngineEvent>,
+    data_dir: PathBuf,
+    head_slot: Arc<AtomicU64>,
+    inflight: Arc<QueueBudget>,
+    tuning: DevnetTuning,
 ) -> std::io::Result<DevnetMesh> {
     // Inbound: accept, then per-connection: read frames; data frames go to
     // the engine; get-blocks is answered by a globally bounded serving worker.
@@ -1467,9 +1708,14 @@ pub fn start(
                     continue;
                 }
                 let Ok(address) = sock.peer_addr() else { continue };
-                // Accommodate multiple validators per host, but one address
-                // cannot consume the global 128-connection allowance.
-                let Some(ip_permit) = ip_limits.reserve(address.ip(), MAX_INBOUND_PER_IP) else { continue };
+                // Audit NET-03 (2026-09-16): and past THIS address's share of
+                // the cap, the same immediate close, so one host cannot
+                // consume the global allowance. A socket whose peer address
+                // cannot be read is one this node cannot account for, and is
+                // closed the same way. The permit is a guard that travels
+                // with the connection below, so every early `continue`
+                // between here and the spawn hands it straight back.
+                let Some(ip_permit) = ip_limits.reserve(address.ip(), tuning.max_inbound_per_ip) else { continue };
                 // R3 M-4 / R1 A3-M2: bounded so a peer that stops reading or
                 // never writes cannot hold a thread and a queue open forever.
                 if sock.set_read_timeout(Some(DEVNET_IO_TIMEOUT)).is_err()
@@ -1508,33 +1754,16 @@ pub fn start(
                 let events = events.clone();
                 let data_dir = data_dir.clone();
                 let inflight = inflight.clone();
-                let mut rsock = rsock;
-                // Counted from here to wherever this thread leaves. The guards
-                // are moved into the closure, so every `return` below and any
-                // unwind releases both.
+                // Counted from here to wherever this thread leaves. The guard
+                // is moved into the reader, so every `return` inside it and
+                // any unwind releases it.
                 let half = ConnectionHalf(connection);
                 let responder = SyncResponder { socket: wsock, data_dir: data_dir.clone(), budget: sync_budget.clone() };
                 thread::spawn(move || {
-                    let _half = half;
-                    // Per-connection (R3 M-4 / R1 A3-M2): see [`GetBlocksLimiter`].
-                    let mut get_blocks_limiter = GetBlocksLimiter::new();
-                    loop {
-                        match read_frame(&mut rsock) {
-                            Ok(frame) => {
-                                if frame.first() == Some(&FRAME_GET_BLOCKS) {
-                                    responder.answer(&_half.0, address.ip(), frame, &mut get_blocks_limiter);
-                                } else if !decode_and_send_from_ip(
-                                    &events,
-                                    &inflight,
-                                    address.ip(),
-                                    &frame,
-                                ) {
-                                    return;
-                                }
-                            }
-                            Err(_) => return,
-                        }
-                    }
+                    run_inbound_reader(
+                        rsock, half, events, inflight, responder, address.ip(),
+                        tuning.inbound_idle,
+                    );
                 });
             }
         });
@@ -1554,45 +1783,65 @@ pub fn start(
         let events = events.clone();
         let inflight = inflight.clone();
         let live = live.clone();
-        thread::spawn(move || loop {
-            let Ok(sock) = TcpStream::connect(&addr) else {
-                thread::sleep(Duration::from_millis(300));
-                continue;
-            };
-            // Both halves own one connected lifetime. A read timeout must
-            // close the writer too: otherwise it can keep sending forever
-            // while no worker consumes the peer's blocks or sync replies.
-            let Ok(rsock) = sock.try_clone() else { continue };
-            let Ok(shutdown_socket) = sock.try_clone() else { continue };
-            let connection = Arc::new(Connection {
-                socket: shutdown_socket,
-                closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
-                _counts: (ConnCount::new(&live), None),
+        thread::spawn(move || {
+            // Audit NET-09 (2026-09-16): a frame taken off the queue and not
+            // delivered, because the socket turned out to be dead or stale
+            // or the write failed, is carried across the reconnect and
+            // written first on the new socket, so no broadcast is lost to an
+            // idle close. `None` between reconnects; `Some` survives failed
+            // dials. See `run_connection_writer`.
+            let mut pending: Option<SharedFrame> = None;
+            loop {
+                let Ok(sock) = TcpStream::connect(&addr) else {
+                    thread::sleep(Duration::from_millis(300));
+                    continue;
+                };
+                // Both halves own one connected lifetime. A read timeout must
+                // close the writer too: otherwise it can keep sending forever
+                // while no worker consumes the peer's blocks or sync replies.
+                let Ok(rsock) = sock.try_clone() else { continue };
+                let Ok(shutdown_socket) = sock.try_clone() else { continue };
+                let connection = Arc::new(Connection {
+                    socket: shutdown_socket,
+                    closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
+                    _counts: (ConnCount::new(&live), None),
                     _ip_permit: None,
-            });
-            if let Some(scheduler) = scheduler.upgrade() {
-                scheduler.register(InboundPeer { frames: tx.clone(), connection: Arc::downgrade(&connection) }, Instant::now());
-            }
-            let writer_half = ConnectionHalf(connection.clone());
-            let reader_half = ConnectionHalf(connection);
-            let wsock = sock;
-            // R3 M-4 / R1 A3-M2: same bound as the inbound side — see
-            // [`DEVNET_IO_TIMEOUT`]. Best-effort; a platform that refuses the
-            // option gets an unbounded-latency socket, not a broken one.
-            let _ = wsock.set_read_timeout(Some(DEVNET_IO_TIMEOUT));
-            let _ = wsock.set_write_timeout(Some(DEVNET_IO_TIMEOUT));
-            let wsock = Arc::new(Mutex::new(wsock));
-            // Reader half also answers reverse-direction requests, so an
-            // inbound-only connection can participate in recovery.
-            {
-                let events = events.clone();
-                let inflight = inflight.clone();
-                let responder = SyncResponder { socket: wsock.clone(), data_dir: data_dir.clone(), budget: sync_budget.clone() };
-                thread::spawn(move || {
-                    run_outbound_reader(rsock, events, inflight, reader_half, responder);
                 });
+                if let Some(scheduler) = scheduler.upgrade() {
+                    scheduler.register(InboundPeer { frames: tx.clone(), connection: Arc::downgrade(&connection) }, Instant::now());
+                }
+                let writer_half = ConnectionHalf(connection.clone());
+                let reader_half = ConnectionHalf(connection);
+                let wsock = sock;
+                // R3 M-4 / R1 A3-M2: same bound as the inbound side — see
+                // [`DEVNET_IO_TIMEOUT`]. Best-effort; a platform that refuses the
+                // option gets an unbounded-latency socket, not a broken one.
+                let _ = wsock.set_read_timeout(Some(DEVNET_IO_TIMEOUT));
+                let _ = wsock.set_write_timeout(Some(DEVNET_IO_TIMEOUT));
+                let wsock = Arc::new(Mutex::new(wsock));
+                // Reader half also answers reverse-direction requests, so an
+                // inbound-only connection can participate in recovery.
+                {
+                    let events = events.clone();
+                    let inflight = inflight.clone();
+                    let responder = SyncResponder { socket: wsock.clone(), data_dir: data_dir.clone(), budget: sync_budget.clone() };
+                    thread::spawn(move || {
+                        run_outbound_reader(rsock, events, inflight, reader_half, responder);
+                    });
+                }
+                // Audit NET-09 (2026-09-16): the reader half is what notices
+                // the peer closing this socket; dropping its `ConnectionHalf`
+                // is what `run_connection_writer` sees as `closed`, and the
+                // stale deadline covers the close that is due but not yet
+                // seen. Either way the loop re-dials.
+                run_connection_writer(
+                    &rx,
+                    wsock,
+                    writer_half,
+                    Some(tuning.dial_stale_after),
+                    &mut pending,
+                );
             }
-            run_connection_writer(&rx, wsock, writer_half);
         });
     }
 
@@ -2679,7 +2928,11 @@ mod tests {
         let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
         let inflight = QueueBudget::new();
-        let mesh = start(
+        // Every connection here comes from loopback, so the per-address cap
+        // (audit NET-03) would bind at `MAX_INBOUND_PER_IP` long before the
+        // global cap; it is lifted for THIS test only, which is about the
+        // global one.
+        let mesh = start_with_tuning(
             "127.0.0.1",
             0,
             Vec::new(),
@@ -2687,6 +2940,7 @@ mod tests {
             std::env::temp_dir(),
             head_slot,
             inflight,
+            DevnetTuning { max_inbound_per_ip: usize::MAX, ..DevnetTuning::PRODUCTION },
         )
         .expect("bind the devnet transport");
         let port = mesh.listen_addr().port();
@@ -2704,7 +2958,7 @@ mod tests {
         // fixed amount, so this is fast on an idle box and still correct on
         // a loaded one.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while mesh.peer_count() < MAX_INBOUND_PER_IP && Instant::now() < deadline {
+        while mesh.peer_count() < MAX_INBOUND_CONNECTIONS && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
         // One quiet moment so the count has settled — proving it never rises
@@ -2713,7 +2967,7 @@ mod tests {
 
         assert_eq!(
             mesh.peer_count(),
-            MAX_INBOUND_PER_IP,
+            MAX_INBOUND_CONNECTIONS,
             "the transport must accept no more than MAX_INBOUND_CONNECTIONS inbound connections"
         );
 
@@ -2734,5 +2988,298 @@ mod tests {
         // them at end of scope, which is a normal client-side close and
         // proves nothing was already closed from the server's side.
         drop(conns);
+    }
+
+    // ── deep audit 2026-09-16: NET-03, NET-05, NET-09, NET-17 ───────────────
+
+    /// Poll `cond` for up to five seconds: fast on an idle box, still
+    /// correct on a loaded one.
+    fn wait_for(what: &str, cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Accept one connection or fail, rather than block a test forever on a
+    /// dialer that never comes.
+    fn accept_within(listener: &TcpListener, what: &str) -> TcpStream {
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((sock, _)) => {
+                    listener.set_nonblocking(false).expect("blocking accept");
+                    sock.set_nonblocking(false).expect("blocking socket");
+                    return sock;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "no connection arrived: {what}");
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("accept failed ({what}): {e}"),
+            }
+        }
+    }
+
+    /// The server closed this socket: a read sees EOF, not a timeout.
+    fn expect_closed_by_server(sock: &mut TcpStream, what: &str) {
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 1];
+        match sock.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => panic!("{n} unexpected bytes on a connection the server should have closed ({what})"),
+            Err(e) => panic!("the server did not close the connection ({what}): {e}"),
+        }
+    }
+
+    /// The server is holding this socket open: a short read sees nothing
+    /// but the server's own `get-blocks` asks (the sync scheduler issues
+    /// them on inbound connections too) and then times out, rather than
+    /// seeing EOF.
+    fn expect_open(sock: &mut TcpStream, what: &str) {
+        let deadline = Instant::now() + Duration::from_millis(300);
+        loop {
+            match read_frame_until(sock, deadline) {
+                Ok(frame) => assert_eq!(
+                    frame.first(),
+                    Some(&FRAME_GET_BLOCKS),
+                    "unexpected frame ({what}): {frame:?}"
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    panic!("the server closed a connection it should have kept ({what})")
+                }
+                Err(e) => {
+                    assert!(
+                        matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+                        "unexpected read error ({what}): {e}"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// audit NET-03 (2026-09-16): one source address holds at most
+    /// `max_inbound_per_ip` inbound connections at once. The next one from
+    /// that address is closed at accept, exactly like a connection past the
+    /// global cap, and the slot comes back the moment one of its
+    /// connections ends — so this bounds a host, not a peer for good.
+    /// Against the old code every connection below is accepted, since the
+    /// only admission decision was the per-process count.
+    #[test]
+    fn inbound_connections_are_capped_per_source_address() {
+        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        let mesh = start_with_tuning(
+            "127.0.0.1",
+            0,
+            Vec::new(),
+            events,
+            std::env::temp_dir(),
+            Arc::new(AtomicU64::new(0)),
+            QueueBudget::new(),
+            DevnetTuning { max_inbound_per_ip: 2, ..DevnetTuning::PRODUCTION },
+        )
+        .expect("bind the devnet transport");
+        let port = mesh.listen_addr().port();
+
+        let first = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let mut second = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        wait_for("two connections from loopback", || mesh.peer_count() >= 2);
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(mesh.peer_count(), 2);
+
+        // The third from the same address: closed at accept, never counted.
+        let mut third = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        expect_closed_by_server(&mut third, "a third connection from one address");
+        assert_eq!(mesh.peer_count(), 2, "a refused connection must not be counted");
+        expect_open(&mut second, "a connection within the per-address cap");
+
+        // Ending one connection hands the slot back.
+        drop(first);
+        wait_for("the closed connection's slot to be released", || mesh.peer_count() < 2);
+        let mut fourth = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        wait_for("the fourth connection to be accepted", || mesh.peer_count() >= 2);
+        expect_open(&mut fourth, "a connection after a slot was released");
+        drop(second);
+        drop(fourth);
+    }
+
+    /// audit NET-03 (2026-09-16): a frame of an unknown type renews nothing.
+    /// A peer that sends only such frames — 5 bytes per ~100 s was enough to
+    /// hold a slot forever — is closed when a silent peer would be, while a
+    /// peer sending decodable frames at the same cadence stays connected.
+    /// The `get-blocks` frame is the decodable one here: there is no block
+    /// log under the data dir, so the serving worker answers nothing, and it
+    /// still counts, because the responder could have used it.
+    #[test]
+    fn frames_that_decode_to_nothing_do_not_renew_the_inbound_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let idle = Duration::from_millis(400);
+        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        let inflight = QueueBudget::new();
+        let sync_budget = Arc::new(Mutex::new(SyncBudget::new()));
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawn_reader = |server: TcpStream| {
+            let rsock = server.try_clone().expect("clone");
+            let connection = Arc::new(Connection {
+                socket: server.try_clone().expect("clone"),
+                closed: AtomicBool::new(false),
+                pending_sync: Mutex::new(None),
+                serving_sync: AtomicBool::new(false),
+                _counts: (ConnCount::new(&live), None),
+                _ip_permit: None,
+            });
+            let responder = SyncResponder {
+                socket: Arc::new(Mutex::new(server)),
+                data_dir: std::env::temp_dir(),
+                budget: sync_budget.clone(),
+            };
+            let events = events.clone();
+            let inflight = inflight.clone();
+            thread::spawn(move || {
+                let started = Instant::now();
+                run_inbound_reader(
+                    rsock,
+                    ConnectionHalf(connection),
+                    events,
+                    inflight,
+                    responder,
+                    addr.ip(),
+                    idle,
+                );
+                started.elapsed()
+            })
+        };
+
+        // Junk every 100 ms, well inside the deadline, for up to 2 s.
+        let mut junk = TcpStream::connect(addr).expect("connect");
+        let reader = spawn_reader(listener.accept().expect("accept").0);
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(2) && write_frame(&mut junk, &[0xFF]).is_ok() {
+            thread::sleep(Duration::from_millis(100));
+        }
+        let alive = reader.join().expect("reader thread");
+        assert!(alive >= idle, "closed before the deadline: {alive:?}");
+        assert!(
+            alive < Duration::from_millis(1500),
+            "undecodable frames kept the connection alive for {alive:?}; the deadline must \
+             be anchored at the last DECODABLE frame"
+        );
+
+        // Control: decodable frames at the same cadence keep it open past
+        // three deadlines.
+        let mut good = TcpStream::connect(addr).expect("connect");
+        let reader = spawn_reader(listener.accept().expect("accept").0);
+        for _ in 0..13 {
+            write_frame(&mut good, &get_blocks_frame(0)).expect("write a decodable frame");
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!reader.is_finished(), "decodable frames must renew the deadline");
+        drop(good);
+        let _ = reader.join();
+    }
+
+    /// One dialer against a listener the test owns: the mesh dials
+    /// `listener`, and whatever it writes is read back here.
+    fn dial_from_mesh(tuning: DevnetTuning) -> (TcpListener, DevnetMesh, Receiver<EngineEvent>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind the peer");
+        let peer = listener.local_addr().expect("local_addr").to_string();
+        let (events, rx) = mpsc::channel::<EngineEvent>();
+        let mesh = start_with_tuning(
+            "127.0.0.1",
+            0,
+            vec![peer],
+            events,
+            std::env::temp_dir(),
+            Arc::new(AtomicU64::new(0)),
+            QueueBudget::new(),
+            tuning,
+        )
+        .expect("start the dialer");
+        (listener, mesh, rx)
+    }
+
+    /// Read frames off `sock` until `wanted` arrives; everything before it
+    /// must be the dialer's own `get-blocks` (the sync scheduler's asks).
+    fn expect_frame_then(sock: &mut TcpStream, wanted: &[u8], what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let frame = read_frame_until(sock, deadline)
+                .unwrap_or_else(|e| panic!("the frame never arrived ({what}): {e}"));
+            if frame == wanted {
+                return;
+            }
+            assert_eq!(frame.first(), Some(&FRAME_GET_BLOCKS), "unexpected frame ({what}): {frame:?}");
+        }
+    }
+
+    /// audit NET-09 (2026-09-16): when the peer closes a dialed socket — as
+    /// the accepting side does after `DEVNET_IO_TIMEOUT` idle — the dialer
+    /// notices through its reader thread, re-dials, and the first broadcast
+    /// after the close arrives on the new socket. Against the old code that
+    /// broadcast was written into the dead socket (the first write after a
+    /// peer's close succeeds locally) and lost; the reconnect came one frame
+    /// too late.
+    #[test]
+    fn a_dialer_whose_peer_closed_the_socket_reconnects_and_loses_no_frame() {
+        let (listener, mesh, _rx) = dial_from_mesh(DevnetTuning::PRODUCTION);
+        let mut first = accept_within(&listener, "the initial dial");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(read_frame_until(&mut first, deadline).expect("sync ask"), get_blocks_frame(0));
+
+        // The peer closes it. Give the dialer's reader a moment to see the
+        // FIN — on loopback that is microseconds; this is generous.
+        drop(first);
+        thread::sleep(Duration::from_millis(500));
+
+        // ONE broadcast, and it must come out of the new socket.
+        let frame = att_frame(&sample_attestation());
+        mesh.broadcast(frame.clone());
+        let mut second = accept_within(&listener, "the re-dial after the peer's close");
+        expect_frame_then(&mut second, &frame, "the broadcast after an idle close");
+    }
+
+    /// audit NET-09 (2026-09-16): a socket this node has not written to for
+    /// `dial_stale_after` is not written to again — the peer's idle close is
+    /// due, and racing it loses the frame — so the next broadcast goes out
+    /// on a fresh socket, and the stale socket sees nothing further. With
+    /// the production value this takes 105 s; the deadline is a tunable so
+    /// it takes 300 ms here.
+    #[test]
+    fn a_dialer_does_not_write_into_a_socket_the_peer_is_about_to_close() {
+        let (listener, mesh, _rx) = dial_from_mesh(DevnetTuning {
+            dial_stale_after: Duration::from_millis(300),
+            ..DevnetTuning::PRODUCTION
+        });
+        let mut first = accept_within(&listener, "the initial dial");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(read_frame_until(&mut first, deadline).expect("sync ask"), get_blocks_frame(0));
+
+        // The peer keeps the socket open and silent; this node writes
+        // nothing for longer than the stale deadline (the next sync ask is
+        // 5 s away).
+        thread::sleep(Duration::from_millis(600));
+        let frame = att_frame(&sample_attestation());
+        mesh.broadcast(frame.clone());
+
+        let mut second = accept_within(&listener, "the re-dial for a stale socket");
+        expect_frame_then(&mut second, &frame, "the broadcast on the fresh socket");
+        // Nothing but EOF on the socket the dialer abandoned: the frame was
+        // not written there first.
+        match read_frame_until(&mut first, Instant::now() + Duration::from_millis(300)) {
+            Ok(f) => panic!("a frame was written into the stale socket: {f:?}"),
+            Err(_) => {}
+        }
+    }
+
+    /// The stale deadline must sit under the peer's idle deadline, or it
+    /// guards nothing.
+    #[test]
+    fn the_dial_stale_deadline_is_under_the_inbound_idle_deadline() {
+        assert!(DIAL_STALE_AFTER < DEVNET_IO_TIMEOUT);
+        assert!(DEVNET_IO_TIMEOUT - DIAL_STALE_AFTER >= Duration::from_secs(10));
     }
 }
