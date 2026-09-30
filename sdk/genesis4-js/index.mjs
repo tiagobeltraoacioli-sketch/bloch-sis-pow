@@ -8,6 +8,7 @@ const DEFAULT_EXPLORER = 'https://blochl1.com';
 const HASH = /^[0-9a-f]{64}$/i;
 const UINT = /^(0|[1-9][0-9]*)$/;
 const MAX_U64 = (1n << 64n) - 1n;
+const MAX_U32 = 0xffffffff;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 15_000;
 const TXID_DOMAIN = Buffer.from('BLCH4:TXID\0\0\0\0\0\0', 'ascii');
@@ -21,6 +22,53 @@ function txidFromSigningRoot(rootHex) {
   return createHash('sha3-256').update(TXID_DOMAIN).update(Buffer.from(rootHex, 'hex')).digest('hex');
 }
 
+// Decode the two transfer wire formats and fold the actual spend fields.
+// Mirrors PosTransaction::{from_canonical_bytes,spend_signing_root} in
+// crates/bloch-pos-committee/src/transition.rs. This binds identity to bytes;
+// it does not verify signatures, UTXO ownership, fees or consensus acceptance.
+function signingRootFromTransferBytes(rawHex) {
+  const bytes = Buffer.from(rawHex, 'hex');
+  let offset = 0;
+  const take = length => {
+    if (length > bytes.length - offset) throw new Error('Truncated transfer');
+    const field = bytes.subarray(offset, offset + length);
+    offset += length;
+    return field;
+  };
+  const u32 = () => take(4).readUInt32LE();
+  const witness = () => { take(u32()); take(u32()); };
+  const count = minimumBytes => {
+    const field = take(4);
+    const value = field.readUInt32LE();
+    if (value > Math.floor((bytes.length - offset) / minimumBytes)) {
+      throw new Error('Transfer count exceeds available bytes');
+    }
+    return { field, value };
+  };
+  const tag = take(1)[0];
+  if (tag !== 0x01 && tag !== 0x06) throw new Error('Unsupported transfer format');
+  let keyCount = 0;
+  if (tag === 0x06) {
+    const keys = count(8);
+    keyCount = keys.value;
+    for (let i = 0; i < keys.value; i++) witness();
+  }
+  const hash = createHash('sha3-256').update(Buffer.from('BLCH4:SPEND\0\0\0\0\0', 'ascii'));
+  const inputs = count(tag === 0x01 ? 44 : 40);
+  hash.update(inputs.field);
+  for (let i = 0; i < inputs.value; i++) {
+    hash.update(take(36)); // txid and u32 output index
+    if (tag === 0x01) witness();
+    else if (u32() >= keyCount) throw new Error('Invalid witness-table index');
+  }
+  const outputs = count(40);
+  hash.update(outputs.field);
+  for (let i = 0; i < outputs.value; i++) hash.update(take(40));
+  hash.update(take(24)); // u64 declared bytes and u128 tip, little-endian
+  if (offset !== bytes.length) throw new Error('Trailing transfer bytes');
+  return hash.digest('hex');
+}
+
 function uint64String(value) {
   return typeof value === 'string' && UINT.test(value) && BigInt(value) <= MAX_U64;
 }
@@ -29,7 +77,7 @@ function validReceiptEntries(entries, receiptTxid, outputs) {
   if (!Array.isArray(entries)) return false;
   const seen = new Set();
   for (const entry of entries) {
-    if (!HASH.test(entry?.txid) || !Number.isSafeInteger(entry.vout) || entry.vout < 0 ||
+    if (!HASH.test(entry?.txid) || !Number.isSafeInteger(entry.vout) || entry.vout < 0 || entry.vout > MAX_U32 ||
         !HASH.test(entry.script_hash) || !uint64String(entry.value_sat) ||
         (outputs && entry.txid.toLowerCase() !== receiptTxid.toLowerCase())) return false;
     const outpoint = `${entry.txid.toLowerCase()}:${entry.vout}`;
@@ -314,7 +362,7 @@ export async function createSignedTransaction({
     if (txidFromSigningRoot(signed.signing_root_hex) !== signed.txid_hex) {
       throw new Error('Signed transaction ID differs from its domain-separated signing root');
     }
-    return {
+    const envelope = {
       txid: signed.txid_hex,
       rawHex: signed.raw_hex,
       signingRootHex: signed.signing_root_hex,
@@ -332,35 +380,52 @@ export async function createSignedTransaction({
       utxoPageCount: utxos.pageCount ?? 1,
       utxoSourceHead: utxos.head ?? null,
     };
+    verifySignedEnvelope(envelope);
+    return envelope;
   } finally { core.dispose(); }
 }
 
 /** Check the persisted SDK envelope before any transaction network request. */
-function verifySignedEnvelope(signed) {
+function verifySignedEnvelope(input) {
+  // Capture each field once: callers may mutate their object while a request
+  // is pending. All checks, submission and returned identity use this snapshot.
+  const signed = { txid: input?.txid, signingRootHex: input?.signingRootHex,
+    rawHash: input?.rawHash, rawHex: input?.rawHex };
+  if (Object.values(signed).some(value => typeof value !== 'string')) {
+    throw new Error('SDK signed transaction identity fields must be strings');
+  }
   if (!HASH.test(signed?.txid) || !HASH.test(signed?.signingRootHex) || !HASH.test(signed?.rawHash) ||
-      !/^[0-9a-f]+$/i.test(signed?.rawHex ?? '') || signed.rawHex.length % 2 ||
-      signed.rawHex.length / 2 > G4.limits.RPC_MAX_RAW_TX_BYTES) {
+      signed.rawHex.length / 2 > G4.limits.RPC_MAX_RAW_TX_BYTES ||
+      signed.rawHex.length % 2 || !/^[0-9a-f]+$/i.test(signed.rawHex)) {
     throw new Error('A complete SDK signed transaction with txid, signingRootHex, rawHash and rawHex is required');
   }
   if (txidFromSigningRoot(signed.signingRootHex) !== signed.txid.toLowerCase() ||
       rawCorrelationHash(signed.rawHex) !== signed.rawHash.toLowerCase()) {
     throw new Error('Signed transaction identity or bytes changed; nothing was submitted');
   }
-  return signed.txid.toLowerCase();
+  try {
+    if (signingRootFromTransferBytes(signed.rawHex) !== signed.signingRootHex.toLowerCase()) {
+      throw new Error('Spend root mismatch');
+    }
+  } catch {
+    throw new Error('Signed transaction bytes do not encode the declared transfer identity; nothing was submitted');
+  }
+  return Object.freeze({ ...signed, txid: signed.txid.toLowerCase(),
+    signingRootHex: signed.signingRootHex.toLowerCase(), rawHash: signed.rawHash.toLowerCase() });
 }
 
 /** Broadcast bytes created above. The returned tx_hash is not the consensus txid. */
 export async function broadcastSignedTransaction(signed, { rpcUrl = DEFAULT_RPC, fetchImpl = fetch } = {}) {
-  verifySignedEnvelope(signed);
-  const admission = await rpc('sendrawtransaction', [signed.rawHex], rpcUrl, fetchImpl);
+  const envelope = verifySignedEnvelope(signed);
+  const admission = await rpc('sendrawtransaction', [envelope.rawHex], rpcUrl, fetchImpl);
   if (admission?.accepted !== true) {
     throw new Error('sendrawtransaction did not confirm mempool admission; check the txid before building another transfer');
   }
-  if (admission.tx_hash?.toLowerCase() !== signed.rawHash.toLowerCase() ||
-      admission.bytes !== signed.rawHex.length / 2) {
+  if (admission.tx_hash?.toLowerCase() !== envelope.rawHash ||
+      admission.bytes !== envelope.rawHex.length / 2) {
     throw new Error('Node reported admission with mismatched byte count or correlation hash; check the original txid before any retry');
   }
-  return { txid: signed.txid, admission };
+  return { txid: envelope.txid, admission };
 }
 
 /** Return an indexed canonical receipt with confirmation and finality status. */
@@ -450,7 +515,7 @@ export async function trackSignedTransaction(signed, {
   previousObservation = null, explorerUrl = DEFAULT_EXPLORER,
   rpcUrl = DEFAULT_RPC, fetchImpl = fetch,
 } = {}) {
-  const txid = verifySignedEnvelope(signed);
+  const { txid } = verifySignedEnvelope(signed);
   const observation = await getTransactionObservation(txid, { explorerUrl, rpcUrl, fetchImpl });
   const comparison = compareTransactionObservations(previousObservation, observation);
   return { txid, observation, comparison };
@@ -519,7 +584,7 @@ export function inspectDepositOutputs({ transaction, addressTo, amount }) {
   const matchingOutputs = [];
   for (const output of transaction.outputs) {
     if (!HASH.test(output?.txid) || output.txid.toLowerCase() !== transaction.txid.toLowerCase() ||
-        !Number.isSafeInteger(output.vout) || output.vout < 0 ||
+        !Number.isSafeInteger(output.vout) || output.vout < 0 || output.vout > MAX_U32 ||
         !HASH.test(output.script_hash) ||
         !uint64String(output.value_sat) ||
         seen.has(output.vout)) {

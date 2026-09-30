@@ -37,7 +37,8 @@ try {
   const smoke = `
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { createLocalWallet, deriveLocalAddress, createSignedTransaction, getDepositTransaction } from '${PACKAGE_NAME}';
+import { createLocalWallet, deriveLocalAddress, createSignedTransaction,
+  broadcastSignedTransaction, trackSignedTransaction, getDepositTransaction } from '${PACKAGE_NAME}';
 
 const wallet = createLocalWallet();
 assert.equal(wallet.network, 'mainnet');
@@ -73,6 +74,23 @@ assert.match(signed.txid, /^[0-9a-f]{64}$/);
 assert.match(signed.rawHex, /^[0-9a-f]+$/);
 assert.ok(signed.rawHex.length > 1000);
 assert.equal(createHash('sha3-256').update(Buffer.from(signed.rawHex, 'hex')).digest('hex'), signed.rawHash);
+const other = await createSignedTransaction({ addressFrom: wallet.address,
+  mnemonic: wallet.mnemonic, addressTo: wallet.address, amount: '0.002', fetchImpl });
+const mixed = { ...signed, rawHex: other.rawHex, rawHash: other.rawHash };
+let submissions = 0;
+const submit = async (_url, options) => {
+  submissions++;
+  const request = JSON.parse(options.body);
+  assert.equal(request.method, 'sendrawtransaction');
+  assert.deepEqual(request.params, [signed.rawHex]);
+  return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id,
+    result: { accepted: true, bytes: signed.rawHex.length / 2, tx_hash: signed.rawHash } }));
+};
+await assert.rejects(broadcastSignedTransaction(mixed, { fetchImpl: submit }), /nothing was submitted/);
+await assert.rejects(trackSignedTransaction(mixed, { fetchImpl: submit }), /nothing was submitted/);
+assert.equal(submissions, 0);
+assert.equal((await broadcastSignedTransaction(signed, { fetchImpl: submit })).txid, signed.txid);
+assert.equal(submissions, 1);
 const depositTxid = 'cd'.repeat(32);
 const depositReceipt = {
   txid: depositTxid, block_id: 'ef'.repeat(32), height: 80, slot: 100, index: 0,
@@ -89,7 +107,11 @@ const deposit = await getDepositTransaction({ txid: depositTxid,
   fetchImpl: async () => new Response(JSON.stringify(depositReceipt)) });
 assert.equal(deposit.match.exactTotal, true);
 assert.equal(deposit.match.matchingOutputs[0].vout, 0);
-console.log('Installed package import, local wallet, mocked signing and deposit query: OK');
+depositReceipt.outputs[0].vout = 4294967296;
+await assert.rejects(getDepositTransaction({ txid: depositTxid,
+  addressTo: wallet.address, amount: '0.00000100',
+  fetchImpl: async () => new Response(JSON.stringify(depositReceipt)) }), /incomplete or mismatched/);
+console.log('Installed package import, local wallet, mocked signing, identity binding and deposit bounds: OK');
 `;
   writeFileSync(join(temporary, 'smoke.mjs'), smoke);
   execFileSync(process.execPath, [join(temporary, 'smoke.mjs')], {

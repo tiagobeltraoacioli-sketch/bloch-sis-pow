@@ -10,6 +10,11 @@ Genesis-4 Postern wallet. The WASM SHA-256 is pinned in `core.mjs`:
 `2f6548cd822d4840e4584b0200467fcb352aaf84a70ea2b3be0e3f099bfa5f49`.
 This is a source-distributed package; no npm publication is assumed.
 
+This checkout is the **unpublished 0.1.14 release candidate**. It fixes receipt
+output-index bounds and persisted-envelope identity. The 0.1.13 artifact is
+preserved and does not contain these fixes. Local verification does not prove
+P2B adoption, qualification or deployment.
+
 HTTP reads have a 15-second deadline and a 2 MiB response limit. Redirects
 are rejected. The SDK validates JSON-RPC version, request ID and result/error
 shape before using node data. HTTP and RPC errors expose status or numeric
@@ -21,11 +26,11 @@ submitting any other bytes.
 
 ## Install
 
-The versioned package is served at
-`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.13.tgz`.
+Install the candidate from its reviewed local tarball after comparing its
+SHA-256 with the accompanying release record:
 
 ```sh
-npm install https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.13.tgz
+npm install --offline --ignore-scripts /path/to/blochprotocol-genesis4-sdk-0.1.14.tgz
 ```
 
 It can also be installed from a local checkout:
@@ -33,6 +38,11 @@ It can also be installed from a local checkout:
 ```sh
 npm install /path/to/bloch-sis-pow/sdk/genesis4-js
 ```
+
+The previous distribution URL is
+`https://ops-blochinc.xyz/wallets/downloads/blochprotocol-genesis4-sdk-0.1.13.tgz`.
+Do not assume that changing this URL to `0.1.14` identifies a published release.
+Publication and the integrator's installed version require separate evidence.
 
 ## Create or restore a local wallet
 
@@ -140,6 +150,21 @@ from `signingRootHex` and SHA3-256 of `rawHex`; after admission it compares the
 node's byte count and `tx_hash` correlation handle. The latter is **not** the
 consensus txid. A mismatch after submission is ambiguous because the node may
 already have accepted the bytes; check the original txid before retrying.
+The 0.1.14 candidate additionally decodes transfer tags `0x01` and `0x06`
+and recomputes the spend root from their actual input outpoints, outputs,
+declared byte count and tip before broadcast or tracking. Truncated fields,
+impossible counts, invalid witness indexes, unsupported tags and trailing bytes
+are refused. Each identity field is captured once before validation, so caller
+mutation during network I/O cannot change the submitted bytes or returned txid.
+This is a bounded structural and identity check, not verification of hybrid
+signatures, witness-table ordering, UTXO ownership, fees, activation or consensus
+acceptance. Witness bytes are outside the spend root by protocol design; their
+correlation hash binds the stored bytes without authenticating their signer.
+The raw transaction limit is 524,254 bytes; its encoded JSON-RPC request fits
+the node's 1 MiB body cap. Oversized envelopes are refused before byte decoding
+or a network callback. Broadcast sends one request and has no automatic retry.
+The SDK does not persist signed envelopes or implement an outbox. Callers must
+save the exact bytes durably and reconcile an ambiguous result before retrying.
 If submission times out, retry the same bytes or look up the txid; do not infer failure from
 the timeout.
 
@@ -280,6 +305,9 @@ fields. `consistent` means only that those two API observations agree; verify
 chain identity, source authenticity and your own finality policy separately.
 
 ## Inspect deposit outputs
+
+The 0.1.14 candidate enforces native `u32` output indexes (`0` through
+`4294967295`) on receipt inputs and outputs, including offline inspection.
 
 `getDepositTransaction({txid, addressTo, amount})` is the one-call exchange
 read path. It validates a checksummed Genesis-4 mainnet deposit address and a

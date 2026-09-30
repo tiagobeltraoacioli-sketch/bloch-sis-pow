@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { syntheticTransfer } from './synthetic-transfer.mjs';
 import { mkdtempSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,13 +11,10 @@ import { spawnSync } from 'node:child_process';
 const cli = fileURLToPath(new URL('../examples/track-signed.mjs', import.meta.url));
 const root = mkdtempSync(join(tmpdir(), 'bloch-track-cli-'));
 after(() => rmSync(root, { recursive: true, force: true }));
-const rawHex = 'ab'.repeat(128);
-const signingRootHex = 'cd'.repeat(32);
-const domain = Buffer.from('BLCH4:TXID\0\0\0\0\0\0', 'ascii');
-const txid = createHash('sha3-256').update(domain).update(Buffer.from(signingRootHex, 'hex')).digest('hex');
-const rawHash = createHash('sha3-256').update(Buffer.from(rawHex, 'hex')).digest('hex');
+const transfer = await syntheticTransfer();
+const { rawHex, txid } = transfer;
 const mnemonic = 'private mnemonic should never print';
-const signed = { txid, rawHex, signingRootHex, rawHash, mnemonic };
+const signed = { ...transfer, mnemonic };
 const signedPath = join(root, 'signed.json');
 writeFileSync(signedPath, JSON.stringify(signed));
 const preloader = join(root, 'fetch.mjs');
