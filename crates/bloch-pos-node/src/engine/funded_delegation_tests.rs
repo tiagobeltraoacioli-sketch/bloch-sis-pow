@@ -193,7 +193,7 @@ fn real_hybrid_commission_requires_the_validator_and_binds_rate() {
 }
 
 #[test]
-fn shipping_node_refuses_all_four_signed_intents_without_state_or_pool_changes() {
+fn preactivation_node_refuses_all_four_signed_intents_without_state_or_pool_changes() {
     let (mut node, _dir, owner, tx) = fixture();
     let wires = [
         PosTransaction::ValidatorCommissionUpdate(commission(&node, 0)),
@@ -204,7 +204,7 @@ fn shipping_node_refuses_all_four_signed_intents_without_state_or_pool_changes()
     let root = node.state.state_root();
     let _clock = validator_lifecycle::clock_at(1);
     for wire in wires {
-        for epoch in [0, 4329, u64::MAX - 1, u64::MAX] {
+        for epoch in [0, 4329, 4527] {
             assert!(admissible(&wire, epoch).unwrap_err().contains("not active"));
         }
         assert!(node.on_transaction(wire).is_err());

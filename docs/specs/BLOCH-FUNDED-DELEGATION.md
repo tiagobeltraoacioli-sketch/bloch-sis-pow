@@ -330,3 +330,74 @@ null. The response is a head-state observation, not proof of finality: use
 `gettxstatus` and finalized block identity before accounting for settlement.
 Inactive positions still owe the full withdrawal delay; the RPC reports those
 states separately. This interface does not change consensus or activation.
+
+### Mainnet history and finite activation qualification (2026-10-01)
+
+The deployed `4d4c5075` binary, the `7c4710bb` candidate and the new offline
+CLI/RPC candidate `8f0e429d` each replayed the same 108,474-block finalized
+mainnet prefix from genesis without a state cache. Each exited successfully at
+slot 138,751 with state root
+`aa599c8f7c30d1633a5c9412b499db2e0d8edc8559ec1c3b4df7a4c7d790b088`.
+The anchor is block
+`fa66d4d2ee5435b0e3e7c576df8e543162d54e2323011443028d2d5cf24ebaee`.
+This qualifies that frozen history, not fresh network bootstrap or exchange
+settlement. The shipping delegation gate remains unarmed.
+
+A separate lab build compressed the existing finite current-regime gates to
+epochs one and two, then armed funded delegation at epoch eight. The baseline
+control used identical compressed historical gates and left delegation unarmed.
+At 500 ms slots, three candidate validators and an old observer agreed before
+activation. The candidates finalized commission, funded delegation and exit
+transactions submitted through the public CLI/RPC; the old observer refused the
+first activated transaction block and stopped following that branch. Forged
+operator signatures, forged delegation signatures, a commission increase after
+funding and premature withdrawal were refused at RPC admission. Replaying the
+416-block activated finalized prefix reproduced its exact root on the armed
+build; the unarmed control rejected it. This test did not wait for mature payout.
+
+Two faster fixture limitations are retained in the evidence rather than counted
+as passes. Three proposers at 25 ms developed excessive finality lag and short
+reorganizations. A single proposer at 25 ms exhausted all 8,192 RANDAO reveals:
+without another proposer, no block could include its renewal. That fixture kept
+attesting but stopped advancing its head. The full network lifecycle runner
+therefore requires three proposers; it also checks progress against the wall
+slot, not only the gap between head and finality. These are distinct from the
+already passed in-process real-delay lifecycle rehearsal.
+
+`python3 scripts/rehearse-funded-delegation.py --admission-only` reproduces the
+short real-hybrid admission and input-reservation checks in a gate-zero source
+copy. `scripts/rehearse-funded-delegation-rpc.py` runs the external finite-gate
+CLI/RPC scenario with fresh keys in a new directory. Its `--activation-only`
+mode deliberately stops before maturity; a full result is only a pass after
+exact payout accounting and a second withdrawal refusal. No production service,
+key or balance is modified by these qualification workflows.
+
+
+## October 1 scheduled candidate and unattended qualification
+
+The operator requested an automatic upgrade of the 95 inventoried validators
+and funded-delegation activation approximately two days later. The candidate
+now schedules epoch **4528**, slot **144896**, at **2026-10-03 04:59:19.962 UTC**
+(**01:59:19.962 America/Sao_Paulo**). This is an epoch/slot boundary, not a
+predicted produced-block height. The Genesis-4 manifest SHA3-256 remains
+`f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966`.
+Only the funded-delegation gate changes; historical gates, the 32-epoch
+cooldown, 2048-epoch withdrawal delay and 500,000,000 BLCH principal ceiling
+remain unchanged. The requested 500-basis-point operator commissions still
+require finalized commission transactions after activation.
+
+This schedule in source is **not evidence of deployment or a release**.
+The October 1 preflight matched all 95 expected services and public identities
+on nine hosts to the deployed `4d4c5075` binary. Mainnet reported 139 active
+validators; the other 44 are outside this service inventory. Their upgrade
+readiness is unresolved and must not be inferred from the approximately 92.1%
+of effective stake represented by the inventoried fleet.
+
+Full CLI/RPC attempt `rpc-network-04` stopped after a three-second read RPC
+timeout, before maturity. It remains a failed attempt. The runner now records
+and retries read-only transport failures at most three times, while retaining
+all consensus, payout and finality assertions. It never automatically retries
+an ambiguous transaction submission. Attempt `rpc-network-05` uses three
+proposers, 100 ms slots, real protocol delays and a persistent systemd service
+with a three-hour bound. Its eventual report, exact scheduled-artifact replay,
+independent build comparison and network readiness are release gates.
