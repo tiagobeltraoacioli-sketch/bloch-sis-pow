@@ -79,8 +79,15 @@ Its SP1 proof is genuine; the surrounding native validator signatures remain
 deterministic test signatures. Cross-repository qualification separately compares
 the exact public statement, predecessor commitment and full-wrapper-key policy.
 
+The optional `BLOCH_NATIVE_RECOVERY_EXPORT` test output retains the exact accepted
+header, native transaction and state root without exporting signing keys. L2's
+native-only recovery now exercises those bytes with the real Groth16 verifier,
+disposable ML-DSA/Falcon checkpoint quorums and persisted Reth replay. Its V5
+records preserve the native envelope and reject normalization/downgrades. Those
+WS signatures do not replace the native fixture's test proposer signatures or
+establish an operational FFG quorum.
+
 Deployment still requires reviewed native network/activation configuration,
-validator replay and fault qualification, inclusion handling for the native `0x0E`
-wire envelope in the L2 recovery adapters, authenticated checkpoints, durable
+validator replay and fault qualification, production checkpoint authority, durable
 publication and Reth finality qualification. Decoding or verifying a proof alone
 does not satisfy those requirements. No production readiness flag changes here.

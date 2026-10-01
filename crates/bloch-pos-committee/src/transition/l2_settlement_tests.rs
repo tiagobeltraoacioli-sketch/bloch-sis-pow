@@ -255,6 +255,26 @@ mod l2_tests {
         assert_eq!(child.l2_settlement().unwrap().height(), 2);
         assert_eq!(child.accounted_supply_sat(), pre.accounted_supply_sat());
         assert_ne!(child.state_root(), pre.state_root());
+        // Public fixture export for cross-repository recovery/PQ qualification.
+        // These are actual accepted header/body bytes; no signing keys are saved.
+        if let Some(path) = std::env::var_os("BLOCH_NATIVE_RECOVERY_EXPORT") {
+            let path = std::path::PathBuf::from(path);
+            std::fs::create_dir(&path).unwrap();
+            for (name, bytes) in [
+                ("header.bin", block.header.canonical_serialize().to_vec()),
+                ("transaction.bin", tx.canonical_bytes()),
+                ("state-root.bin", child.state_root().to_vec()),
+            ] {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path.join(name))
+                    .unwrap()
+                    .write_all(&bytes)
+                    .unwrap();
+            }
+        }
         // The complete encoded proof is covered by the block body. Corrupting it
         // fails block validation; a correctly rebound body still fails pairing.
         let mut corrupted = settlement.clone();
