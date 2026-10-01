@@ -401,3 +401,34 @@ an ambiguous transaction submission. Attempt `rpc-network-05` uses three
 proposers, 100 ms slots, real protocol delays and a persistent systemd service
 with a three-hour bound. Its eventual report, exact scheduled-artifact replay,
 independent build comparison and network readiness are release gates.
+
+
+### Unattended qualification handoff
+
+Scheduled candidate source: `c43dbd667295fb8314c22a156c6e696b9f5c88c0`.
+The 37 focused committee tests and four real-hybrid node tests passed; two
+lab-only node tests remain deliberately ignored in the shipping test run.
+Authenticated builders `host652474` and `host652475` independently ran the
+pinned canonical-container recipe and produced byte-identical Linux x86-64
+executables. The canonical output comparator passed. Binary SHA-256:
+`bd58e25faab8ed3fb1ba67096f64e48ec65e8a66e248b3fda8c5d7a814c95a06`.
+
+Full CLI/RPC attempt `rpc-network-05` failed after 2892.748 seconds when the
+head reached epoch 899 while finality remained at 883. The retained logs show
+continued proposals and later justification; they do not establish a finalized
+root conflict. This failure is not converted into a pass. A new complete
+three-proposer attempt, `rpc-network-06`, uses 500 ms slots, unmodified protocol
+delays, the same assertions, and a persistent 12-hour systemd unit. Nominal
+withdrawal maturity takes approximately nine hours. The exact scheduled
+release also has a separate persistent mainnet replay job against the pinned
+108,474-block prefix.
+
+The local unattended controller compares independent builds, verifies the
+exact-artifact replay and mature payout evidence, and only then creates a
+locally signed candidate package. It stops on qualification failure. It has
+**no production restart or deployment path** while readiness of the other 44
+active validators remains unresolved. The 95-service migration plan is a
+non-executing draft with one canary, at most one restarting identity per host,
+and at most one eighth of measured effective stake offline per wave. Its
+preflight must be refreshed before any future rollout. No production service,
+commission, funded position, or P2B approval changed in this handoff.
