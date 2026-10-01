@@ -2164,8 +2164,8 @@ pub(crate) const ROLE_ACTIVATION_QUEUE: u8 = 0x04;
 pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = 2_884;
 
 /// Scheduled activation epoch for UTXO-funded delegation to an existing
-/// validator (wire 0x0E-0x10): epoch 4528, slot 144896, corresponding to
-/// 2026-10-03 04:59:19.962 UTC on the pinned Genesis-4 manifest.
+/// validator (wire 0x0E-0x10): epoch 4669, slot 149408, corresponding to
+/// 2026-10-04 18:35:19.962 UTC on the pinned Genesis-4 manifest.
 ///
 /// This gate covers the complete position lifecycle: funded creation,
 /// authenticated deactivation and withdrawal. The three messages must never
@@ -2176,7 +2176,7 @@ pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = 2_884;
 /// The same gate enforces the fixed 500-million-BLCH delegated-principal
 /// ceiling and settles funded delegators' issuance after operator commission.
 /// It does not arm the separate rewards-v2 or fee/stake-decoupling gates.
-pub const FUNDED_DELEGATION_ACTIVATION_EPOCH: u64 = 4_528;
+pub const FUNDED_DELEGATION_ACTIVATION_EPOCH: u64 = 4_669;
 
 pub(crate) fn funded_delegation_active(epoch: u64) -> bool {
     #[cfg(test)]
@@ -2317,11 +2317,11 @@ mod epoch_gate_tests {
 
     #[test]
     fn funded_delegation_opens_only_at_the_scheduled_epoch() {
-        for epoch in [0, 2_884, 4_527] {
+        for epoch in [0, 2_884, 4_527, 4_528, 4_529, 4_668] {
             assert!(!funded_delegation_active(epoch));
         }
-        assert!(funded_delegation_active(4_528));
-        assert!(funded_delegation_active(4_529));
+        assert!(funded_delegation_active(4_669));
+        assert!(funded_delegation_active(4_670));
     }
 }
 

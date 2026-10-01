@@ -2,7 +2,13 @@
 
 # Funded delegation lifecycle
 
-Status: implementation candidate, consensus gate unarmed
+Status: scheduled candidate at epoch 4669; qualification blocked, not deployed
+
+The current candidate proposes **2026-10-04 18:35:19.962 UTC**
+(**15:35:19.962 America/Sao_Paulo**), epoch **4669**, slot **149408**.
+It supersedes the epoch-4528 preview. The full CLI/RPC lifecycle failed its
+finality-lag assertion; postponing the gate does not repair that failure or
+authorize deployment. See the final rescheduling record below.
 
 This document specifies the funded replacement for legacy transaction tag
 `0x04` (`Delegate`). The legacy message names an amount without consuming an
@@ -373,11 +379,11 @@ exact payout accounting and a second withdrawal refusal. No production service,
 key or balance is modified by these qualification workflows.
 
 
-## October 1 scheduled candidate and unattended qualification
+## October 1 initial scheduled candidate and unattended qualification (superseded)
 
-The operator requested an automatic upgrade of the 95 inventoried validators
-and funded-delegation activation approximately two days later. The candidate
-now schedules epoch **4528**, slot **144896**, at **2026-10-03 04:59:19.962 UTC**
+The operator initially requested an automatic upgrade of the 95 inventoried
+validators and funded-delegation activation approximately two days later. That
+superseded candidate scheduled epoch **4528**, slot **144896**, at **2026-10-03 04:59:19.962 UTC**
 (**01:59:19.962 America/Sao_Paulo**). This is an epoch/slot boundary, not a
 predicted produced-block height. The Genesis-4 manifest SHA3-256 remains
 `f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966`.
@@ -474,3 +480,33 @@ RANDAO renewal. Withdrawal maturity remains epoch 2095, so this is progress
 evidence, not a full lifecycle pass. The local controller now records both
 public links and retains the conditional, separately tagged qualified
 prerelease path. Production migration remains unconfigured.
+
+### Rescheduled three-day candidate
+
+At the operator's October 1 request, the boundary moved from epoch **4528** to
+**4669**, slot **149408**, at **2026-10-04 18:35:19.962 UTC**
+(**15:35:19.962 America/Sao_Paulo**). The request was recorded at
+2026-10-01 18:31:30.865140 UTC. The new boundary is the first epoch start at or
+after 72 hours from that instant; it is not a predicted produced-block height.
+The pinned manifest encodes genesis time `1786656679962` ms and slot duration
+`30000` ms, with 32 slots per epoch. The manifest digest is unchanged.
+
+The earlier complete `rpc-network-06` lifecycle failed after **14965.375
+seconds** with `finality lag exceeds rehearsal budget`, before mature payout.
+The unattended controller stopped and marked the earlier GitHub preview's
+qualification as stopped. That failure remains open. Moving the mainnet date
+does not change the finite-gate laboratory or count it as a pass.
+
+Only the funded-delegation boundary changes in this reschedule. Historical
+consensus gates, cooldown/withdrawal delays, signatures, the 500-million-BLCH
+principal ceiling and commission behavior remain unchanged. Regression checks
+also require delegation to remain disabled at the obsolete epoch 4528 and
+through 4668. The published epoch-4528 executable cannot be rescheduled by
+configuration; it is superseded and must not be used for the new schedule.
+A separately built, signed and versioned candidate is required. Its exact
+artifact needs independent build comparison and historical replay again.
+
+No production validator was migrated by this workflow. A qualified release
+and rollout remain blocked on a successful complete CLI/RPC lifecycle and
+coordinated readiness outside the 95-validator inventory. The operator's
+requested 5% commissions still require separate finalized transactions.
