@@ -510,3 +510,33 @@ No production validator was migrated by this workflow. A qualified release
 and rollout remain blocked on a successful complete CLI/RPC lifecycle and
 coordinated readiness outside the 95-validator inventory. The operator's
 requested 5% commissions still require separate finalized transactions.
+
+
+### Full rehearsal failure: growing synchronous restart-cache work
+
+Analysis of `rpc-network-06` retains its failure: the head reached epoch 934
+while finality remained at 921. The three nodes each wrote roughly 1,000
+restart caches. Median cache-write time grew from about 103 ms below slot
+10,000 to about 560 ms after slot 28,000, exceeding the 500 ms laboratory slot.
+The logs also record about 100 short reorganizations per node. These are
+observations from the failed run, not a completed lifecycle qualification.
+
+`write_local_cache` previously re-read and SHA3-hashed the complete block log
+on the consensus thread every 32 blocks and after a reorganization. The repair
+maintains the exact framed-log fingerprint through durable writes. Reorganization
+writers compute the replacement fingerprint while streaming their staging file
+and publish it only after the log is durable. Partial writes and uncertain
+publication invalidate the fingerprint; a preflight refusal preserves it.
+Startup seeds it from the repaired authoritative log. Cache recovery still
+independently hashes the on-disk prefix, verifies the cache checksum, source
+identity, canonical frame boundary and restored state root.
+
+Regressions compare the incremental digest with an independent full-file hash
+across appends, same-size replacements, asynchronous replacement plus append,
+torn-tail recovery and restart. They cover short writes, rejected frames and
+out-of-band same-length corruption. A cache-specific work counter requires zero
+historical bytes scanned while writing caches and a full independent disk scan
+when restoring one. The CLI/RPC runner now retains its final liveness sample,
+all three node observations, exact build identities and cache/reorg metrics.
+Its finality limits, real cooldown, withdrawal delay and payout assertions remain
+unchanged. A corrected full network rehearsal is still required before approval.

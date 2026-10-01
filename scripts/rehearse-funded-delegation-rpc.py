@@ -12,9 +12,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import socket
+import statistics
 import subprocess
 import time
 import urllib.request
@@ -50,7 +52,9 @@ def main():
               'slot_ms':args.slot_ms, 'validator_count':args.validators,
               'mode':'activation-only' if args.activation_only else 'full-lifecycle', 'cooldown_epochs':32, 'withdrawal_delay_epochs':2048,
               'transport':'devnet', 'normal_doppelganger_window':True,
-              'binary_sha256':{b.name:hashlib.sha256(b.read_bytes()).hexdigest() for b in (candidate,baseline)}}
+              'binary_sha256':{b.name:hashlib.sha256(b.read_bytes()).hexdigest() for b in (candidate,baseline)},
+              'runner_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              'max_finality_lag_epochs':0, 'max_behind_by_slots':0}
     def save():
         for name, value in [('report',report),('events',events)]:
             temporary=work/(name+'.json.tmp')
@@ -127,13 +131,16 @@ def main():
                 except TimeoutError:pass
         raise AssertionError('epoch-bound intent did not land: '+kind)
     def finalized_equal():
-        states=[info(i) for i in range(3)];checkpoint=min(states,key=lambda s:s['finalized']['epoch'])['finalized']['root']
+        states=[info(i) for i in range(3)]
+        report['last_chain_observation']=[{k:s[k] for k in ('slot','epoch','height','finalized','behind_by_slots')} for s in states]
+        checkpoint=min(states,key=lambda s:s['finalized']['epoch'])['finalized']['root']
         blocks=[rpc(i,'getblockbyid',[checkpoint]) for i in range(3)]
         assert all(b['finalized'] for b in blocks)
         assert len({(b['block_id'],b['state_root'],b['height']) for b in blocks})==1
         return blocks[0]
     started=time.monotonic()
     try:
+        report['buildinfo']={b.name:json.loads(subprocess.check_output([b,'buildinfo'],env=env,timeout=30)) for b in (candidate,baseline)}
         for off in [0,1,2,3,100,101,102,103]:
             with socket.socket() as s:s.bind(('127.0.0.1',args.port_base+off))
         for i in range(3):cli('keygen','--dir',work/f'key{i}','--index',i)
@@ -209,6 +216,11 @@ def main():
         while not pos()['mature']:
             assert time.monotonic()<deadline,'maturity timeout'
             checkpoint=finalized_equal();state=info()
+            lag=state['epoch']-state['finalized']['epoch']
+            report['max_finality_lag_epochs']=max(report['max_finality_lag_epochs'],lag)
+            report['max_behind_by_slots']=max(report['max_behind_by_slots'],state['behind_by_slots'])
+            report['last_liveness_check']={'head_epoch':state['epoch'],'finalized_epoch':state['finalized']['epoch'],
+                  'finality_lag_epochs':lag,'behind_by_slots':state['behind_by_slots'],'elapsed_s':round(time.monotonic()-started,3)}
             assert state['finalized']['epoch']>=previous_final
             previous_final=state['finalized']['epoch']
             assert state['epoch']-state['finalized']['epoch']<12,'finality lag exceeds rehearsal budget'
@@ -244,6 +256,15 @@ def main():
             try:p.wait(timeout=15)
             except subprocess.TimeoutExpired:p.kill();p.wait()
         for h in handles:h.close()
+        report['node_log_metrics']={}
+        for i in range(4):
+            path=work/f'node{i}.log'
+            if not path.exists():continue
+            text=path.read_text(errors='replace')
+            timings=[int(x) for x in re.findall(r'state-cache: persisted [^\n]*elapsed_ms=(\d+)',text)]
+            report['node_log_metrics'][str(i)]={'reorgs':text.count('REORG:'),'cache_writes':len(timings),
+                  'cache_write_max_ms':max(timings,default=0),
+                  'cache_write_median_ms':statistics.median(timings) if timings else None}
         report['elapsed_seconds']=round(time.monotonic()-started,3);save()
         print(json.dumps(report,indent=2),flush=True)
 
