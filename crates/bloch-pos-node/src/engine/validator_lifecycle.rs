@@ -25,6 +25,10 @@ fn is_lifecycle(tx: &PosTransaction) -> bool {
     matches!(
         tx,
         PosTransaction::FundedDeposit(_)
+            | PosTransaction::FundedDelegate(_)
+            | PosTransaction::FundedUndelegate(_)
+            | PosTransaction::FundedDelegationWithdraw(_)
+            | PosTransaction::ValidatorCommissionUpdate(_)
             | PosTransaction::Withdraw { .. }
             | PosTransaction::ExitV2 { .. }
             | PosTransaction::RandaoRecommit { .. }
@@ -128,6 +132,10 @@ impl Engine {
         match tx {
             PosTransaction::FundedDeposit(deposit) =>
                 Some(lifecycle_source_hash(b"funding-key", &deposit.funding_pubkey)),
+            PosTransaction::FundedDelegate(t) => Some(lifecycle_source_hash(b"funding-key", &t.funding_pubkey)),
+            PosTransaction::FundedUndelegate(t) => Some(lifecycle_source_hash(b"funding-key", &t.funding_pubkey)),
+            PosTransaction::FundedDelegationWithdraw(t) => Some(lifecycle_source_hash(b"funding-key", &t.funding_pubkey)),
+            PosTransaction::ValidatorCommissionUpdate(t) => Some(validator_lifecycle_source(t.validator)),
             PosTransaction::ExitV2 { pubkey_hash, .. } => self.state
                 .validator_index_by_hash(pubkey_hash).map(validator_lifecycle_source),
             PosTransaction::RandaoRecommit { validator, .. } =>
@@ -151,8 +159,8 @@ impl Engine {
         let incoming = Self::spent_outpoints(tx).unwrap_or_default();
         self.mempool.iter().any(|(key, other)| {
             if evicted.contains(key) { return false; }
-            let funded = matches!(tx, PosTransaction::FundedDeposit(_))
-                || matches!(other, PosTransaction::FundedDeposit(_));
+            let funded = matches!(tx, PosTransaction::FundedDeposit(_) | PosTransaction::FundedDelegate(_))
+                || matches!(other, PosTransaction::FundedDeposit(_) | PosTransaction::FundedDelegate(_));
             if !funded {
                 return false;
             }

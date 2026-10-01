@@ -888,6 +888,7 @@ pub enum RpcRequest {
     ValidatorCount,
     ValidatorByKey([u8; 32]),
     ValidatorAdmission,
+    FundedDelegation(u32),
     Balance([u8; 32]),
     Utxos { script_hash: [u8; 32], limit: usize },
     /// `gettxout` — is this ONE output still unspent?
@@ -1113,6 +1114,7 @@ impl EngineBackend {
             | RpcRequest::ValidatorCount
             | RpcRequest::ValidatorByKey(_)
             | RpcRequest::ValidatorAdmission
+            | RpcRequest::FundedDelegation(_)
             | RpcRequest::Validators => {}
             _ => return None,
         }
@@ -1132,6 +1134,7 @@ impl EngineBackend {
             RpcRequest::ValidatorCount => Some(Ok(validator_count_json(&state))),
             RpcRequest::ValidatorByKey(hash) => Some(validator_by_key_json(&state, hash)),
             RpcRequest::ValidatorAdmission => Some(Ok(validator_admission_json(&state))),
+            RpcRequest::FundedDelegation(position) => Some(Ok(funded_delegation_json(&state, *position))),
             RpcRequest::Validators => Some(Ok(validator_registry_json(&state))),
             RpcRequest::TxOut { txid, vout } => Some(Ok(txout_json(&state, txid, *vout))),
             RpcRequest::Balance(script_hash) => Some(Ok(balance_json(&state, script_hash))),
@@ -1276,6 +1279,7 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
         "getvalidatorcount" => RpcRequest::ValidatorCount,
         "getvalidatorbykey" => RpcRequest::ValidatorByKey(want_hex32(params, 0, "pubkey_hash")?),
         "getvalidatoradmission" => RpcRequest::ValidatorAdmission,
+        "getfundeddelegation" => RpcRequest::FundedDelegation(want_u32(params, 0, "position")?),
         "getbalance" => RpcRequest::Balance(want_hex32(params, 0, "script_hash")?),
         // Refused on purpose, and permanently for this build. See the doc
         // comments on the two constructors for the full reasoning.
@@ -2781,5 +2785,33 @@ pub fn validator_admission_json(state: &bloch_pos_committee::transition::Committ
         ("maximum_activations_per_epoch", Json::u(staking::MAX_ACTIVATIONS_PER_EPOCH as u64)),
         ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
         ("legacy_unfunded_deposit_enabled", Json::Bool(false)),
+    ])
+}
+
+/// One funded position and its owner ledger at the committed head; null if absent.
+/// Clients must confirm the containing transaction's finality with gettxstatus.
+pub fn funded_delegation_json(state: &CommittedState, position: u32) -> Json {
+    let Some(view) = state.funded_delegation_view(position) else { return Json::Null; };
+    let d = view.delegation;
+    let epoch = epoch_of(state.slot());
+    Json::obj(vec![
+        ("position", Json::u(position.into())),
+        ("delegator", Json::u(d.delegator.into())),
+        ("validator", Json::u(d.validator.into())),
+        ("owner_pubkey_hash", Json::hex(&view.owner)),
+        ("as_of_slot", Json::u(state.slot())),
+        ("principal_sat", Json::sat(d.amount_sat)),
+        ("activated_sat", Json::sat(view.activated_sat)),
+        ("requested_epoch", Json::u(d.requested_epoch)),
+        ("deactivate_epoch", d.deactivate_epoch.map_or(Json::Null, Json::u)),
+        ("inactive_since", view.inactive_since.map_or(Json::Null, Json::u)),
+        ("withdrawable_epoch", view.withdrawable_epoch.map_or(Json::Null, Json::u)),
+        ("withdrawn", Json::Bool(view.withdrawn)),
+        ("mature", Json::Bool(!view.withdrawn && view.activated_sat == 0
+            && view.withdrawable_epoch.is_some_and(|e| epoch >= e))),
+        ("fee_rewards_sat", Json::sat(state.delegator_fee_reward_sat(d.delegator))),
+        ("issuance_rewards_sat", Json::sat(state.delegator_issuance_reward_sat(d.delegator))),
+        ("slash_losses_sat", Json::sat(state.delegator_slash_loss_sat(d.delegator))),
+        ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
     ])
 }

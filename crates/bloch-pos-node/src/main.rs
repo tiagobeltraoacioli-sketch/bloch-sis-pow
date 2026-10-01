@@ -49,6 +49,7 @@ mod connection_limit;
 mod devnet_tools;
 mod engine;
 mod genesis;
+mod funded_delegation_cli;
 mod keys;
 mod metrics;
 mod net;
@@ -218,6 +219,12 @@ fn main() {
         Some("genesis") => genesis_cmd(&args[1..]),
         Some("genesis-mainnet") => genesis_mainnet(&args[1..]),
         Some("submit-tx") => submit_tx(&args[1..]),
+        Some("funded-delegation") => {
+            if let Err(error) = funded_delegation_cli::run(&args[1..]) {
+                eprintln!("funded-delegation: {error}");
+                exit(2);
+            }
+        }
         Some("validator-deposit") => {
             if let Err(error) = validator_deposit::run(&args[1..]) {
                 eprintln!("validator-deposit: {error}");
@@ -314,6 +321,7 @@ fn print_help() {
                Print the PUBLIC header of validator.key: format, index,\n\
                pubkey sha3, KDF cost, file mode. Opens nothing, prints no\n\
                secret. Also reports whether the data dir lock is free.\n\
+           bloch-pos funded-delegation --help
            bloch-pos validator-deposit --help
            bloch-pos validator-lifecycle --help
            bloch-pos validator-payout --help

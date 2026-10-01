@@ -3842,6 +3842,7 @@ impl Engine {
                 Some(inputs.iter().map(|i| (i.txid, i.vout)).collect())
             }
             PosTransaction::FundedDeposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::FundedDelegate(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             _ => None,
         }
     }
@@ -5401,6 +5402,7 @@ impl Engine {
 
             RpcRequest::ValidatorByKey(hash) => rpc::validator_by_key_json(&self.state, &hash),
             RpcRequest::ValidatorAdmission => Ok(rpc::validator_admission_json(&self.state)),
+            RpcRequest::FundedDelegation(position) => Ok(rpc::funded_delegation_json(&self.state, position)),
             RpcRequest::Validator(index) => rpc::validator_record_json(&self.state, index),
 
             RpcRequest::ValidatorCount => Ok(rpc::validator_count_json(&self.state)),

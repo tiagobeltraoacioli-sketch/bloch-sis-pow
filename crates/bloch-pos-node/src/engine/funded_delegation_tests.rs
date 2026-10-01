@@ -346,3 +346,31 @@ fn real_hybrid_funded_delegation_full_lifecycle() {
     println!("full lifecycle passed: commission=500bps, withdrawal_delay={} epochs, final_epoch={maturity}, blocks={}",
         bloch_pos_committee::staking::WITHDRAWAL_DELAY_EPOCHS, node.head_height());
 }
+
+/// Fast state-aware RPC/gossip admission checks in the same isolated gate-zero fixture.
+#[test]
+#[ignore = "requires a disposable funded-delegation gate-zero build"]
+fn funded_delegation_admission_refuses_forgery_and_reserves_inputs() {
+    assert_eq!(bloch_pos_committee::params::FUNDED_DELEGATION_ACTIVATION_EPOCH, 0);
+    let (mut node, _dir, owner, tx) = fixture();
+    let _clock = validator_lifecycle::clock_at(1);
+    assert_eq!(rpc::funded_delegation_json(&node.state, 0).to_string(), "null");
+    let root = node.state.state_root();
+    let mut forged = tx.clone();
+    forged.funding_signature[14] ^= 1;
+    assert!(node.on_transaction(PosTransaction::FundedDelegate(forged)).is_err());
+    let mut commission_tx = commission(&node, 0);
+    commission_tx.signature = owner.sign(&commission_tx.signing_root());
+    assert!(node.on_transaction(PosTransaction::ValidatorCommissionUpdate(commission_tx)).is_err());
+    assert!(node.on_transaction(PosTransaction::FundedUndelegate(undelegate(&owner, tx.network_domain, 0))).is_err());
+    assert!(node.on_transaction(PosTransaction::FundedDelegationWithdraw(withdrawal(&owner, tx.network_domain, 0))).is_err());
+    assert!(node.mempool.is_empty());
+    assert_eq!(root, node.state.state_root());
+    node.on_transaction(PosTransaction::FundedDelegate(tx.clone())).unwrap();
+    let mut conflicting = tx.clone();
+    conflicting.change.script_hash[0] ^= 1;
+    conflicting.funding_signature = owner.sign(&conflicting.signing_root());
+    assert!(node.on_transaction(PosTransaction::FundedDelegate(conflicting)).is_err());
+    assert_eq!(node.mempool.len(), 1);
+    assert_eq!(root, node.state.state_root());
+}

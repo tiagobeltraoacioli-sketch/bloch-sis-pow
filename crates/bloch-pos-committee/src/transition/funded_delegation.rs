@@ -431,7 +431,33 @@ impl ValidatorCommissionUpdate {
     }
 }
 
+/// Read-only, committed position data. Inactivity alone does not permit withdrawal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FundedDelegationView {
+    pub delegation: Delegation,
+    pub owner: [u8; 32],
+    pub activated_sat: u128,
+    pub inactive_since: Option<u64>,
+    pub withdrawable_epoch: Option<u64>,
+    pub withdrawn: bool,
+}
+
 impl CommittedState {
+    pub fn funded_delegation_view(&self, position: u32) -> Option<FundedDelegationView> {
+        let delegation = *self.delegations.get(position as usize)?;
+        let owner = *self.funded_delegation_owners.get(&delegation.delegator)?;
+        let (inactive, withdrawn) = self.funded_delegation_lifecycle
+            .get(&position).copied().unwrap_or((u64::MAX, false));
+        let inactive_since = (inactive != u64::MAX).then_some(inactive);
+        Some(FundedDelegationView {
+            delegation, owner,
+            activated_sat: delegation::Registry::resolve(&self.delegations, self.epoch)
+                .activated_sat(&delegation),
+            inactive_since,
+            withdrawable_epoch: inactive_since.and_then(|e| e.checked_add(staking::WITHDRAWAL_DELAY_EPOCHS)),
+            withdrawn,
+        })
+    }
     fn funded_owner_matches(
         &self,
         delegator_id: u32,

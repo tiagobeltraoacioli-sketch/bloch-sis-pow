@@ -203,7 +203,11 @@ impl CommittedState {
                     .apply_slashing_evidence(evidence, 0, &roster, verifier)
                     .map_err(|_| TxReject::StakingRule)
             }
-            PosTransaction::ExitV2 { .. } | PosTransaction::RandaoRecommit { .. } => self
+            PosTransaction::FundedDelegate(_)
+            | PosTransaction::FundedUndelegate(_)
+            | PosTransaction::FundedDelegationWithdraw(_)
+            | PosTransaction::ValidatorCommissionUpdate(_)
+            | PosTransaction::ExitV2 { .. } | PosTransaction::RandaoRecommit { .. } => self
                 .clone()
                 .apply_transaction(tx, total_active_sat, base_fee, verifier)
                 .map(|_| ()),

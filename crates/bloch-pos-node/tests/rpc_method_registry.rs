@@ -100,6 +100,8 @@ const ROUTED: &[(&str, &str)] = &[
     ("getvalidatorcount", "ValidatorCount"),
     ("getvalidatorbykey", "ValidatorByKey"),
     ("getvalidatoradmission", "ValidatorAdmission"),
+    // A funded position and its owner ledger are not exposed by validator queries.
+    ("getfundeddelegation", "FundedDelegation"),
     ("getbalance", "Balance"),
     ("gettxout", "TxOut"),
     ("getutxos", "Utxos"),

@@ -305,3 +305,28 @@ external CLI/RPC and network transport, nor does the mixed shipping-binary
 test exercise a scheduled activation boundary. Those rehearsals, historical
 mainnet replay, coordinated deployment, a signed activation release, and a
 small-value mainnet lifecycle remain prerequisites to production activation.
+
+### Offline operator workflow and committed position query
+
+`bloch-pos funded-delegation --help` describes the offline preparation,
+inspection and signing commands for all four funded intents. Signing requires
+both a trusted genesis manifest and the exact independently reviewed signing
+root. Files are created exclusively with owner-only permissions. These commands
+never submit transactions or enable the activation gate. Commission inspections
+require the validator public key when a signature is present; independently
+check the validator index against the registry before signing.
+
+Submit reviewed, signed canonical hex through the existing `sendrawtransaction`
+RPC. The consensus transaction ID printed by the CLI is the identifier for
+`gettxstatus`; the submission's local hash is not that ID. All four intents now
+receive committed-state and signature validation before RPC/gossip admission,
+with the existing per-source verification budget. Funded input conflicts are
+reserved across pending deposits, delegations and transfers.
+
+`getfundeddelegation(position)` returns a single committed funded position,
+owner hash, principal, activated stake, deactivation/inactivity/maturity epochs,
+withdrawn status and reward/loss ledgers. An absent or legacy position returns
+null. The response is a head-state observation, not proof of finality: use
+`gettxstatus` and finalized block identity before accounting for settlement.
+Inactive positions still owe the full withdrawal delay; the RPC reports those
+states separately. This interface does not change consensus or activation.
