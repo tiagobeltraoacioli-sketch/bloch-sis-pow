@@ -2,7 +2,7 @@
 
 # Funded delegation lifecycle
 
-Status: design candidate, consensus gate unarmed
+Status: implementation candidate, consensus gate unarmed
 
 This document specifies the funded replacement for legacy transaction tag
 `0x04` (`Delegate`). The legacy message names an amount without consuming an
@@ -18,8 +18,11 @@ entire validating fleet.
    validator operator cannot deactivate, redirect, or withdraw it.
 3. Activation uses the existing delegation warm-up budget. Inclusion never
    gives immediate consensus weight.
-4. Delegated stake remains subject to the existing per-validator effective
-   stake cap and pro-rata slashing rules.
+4. A validator may accept at most 500,000,000 BLCH of delegated principal.
+   Pending, active, cooling-down, and withdrawable positions reserve capacity
+   until withdrawal. This fixed limit replaces the legacy percentage cap for
+   the delegated component after activation; own stake is outside this limit.
+   Cohort caps, inactivity leaks, and pro-rata slashing still apply.
 5. Deactivation uses the existing cool-down budget. Withdrawal additionally
    waits the validator weak-subjectivity delay after the position has become
    fully inactive.
@@ -73,6 +76,10 @@ missing, slashed, or exiting validator, validates the minimum amount, resolves
 every input from committed state, checks ownership and exact conservation,
 verifies the signature, spends the inputs, creates change, allocates the
 position and owner record, and queues the delegation for the next epoch.
+It rejects an amount that would put the sum of all unwithdrawn positions
+behind that validator above 500,000,000 BLCH. The aggregate check happens
+before any input is spent, so splitting a deposit across owners or pending
+transactions cannot bypass the limit.
 
 ### `FundedUndelegate`
 
@@ -150,9 +157,16 @@ are created, because even an unactivated pending position prevents a later
 increase. Batch construction, signing, and broadcasting remain separate
 operational steps. No transaction or activation follows from this document.
 
+The subsequent clarification sets **500,000,000 BLCH as the delegation
+limit**, not a contribution to each validator. The requested contribution
+remains 10,000,000 BLCH for each of the 30 expansion validators. The cap is
+a uniform funded-delegation consensus rule; the list of 95 commission
+updates is an operator-specific transaction plan, not a registry whitelist
+in consensus.
+
 ### Qualification result, 2026-10-01 UTC
 
-Activation remains blocked. The production delegation resolver has a cap
+Activation remains unarmed. The released delegation resolver has a cap
 discontinuity: its fixed-point calculation can round to zero, and
 `Registry::validators` treats zero as an uncapped amount. An offline probe
 using the unchanged resolver from release `4d4c5075` produces:
@@ -176,26 +190,44 @@ cargo run -p bloch-pos-committee --example funded_delegation_readiness --locked 
 cargo test -p bloch-pos-committee --lib funded_delegation --locked --offline
 ```
 
-The 17 focused tests pass, including the requested 95 commission updates,
+The candidate uses `validators_with_absolute_cap` behind the funded lifecycle
+gate. The four rows above then retain the full activated 10,000,000 BLCH of
+delegated weight each. No existing principal is rewritten. Before the gate,
+the old weight calculation is preserved for historical replay.
+
+The 22 focused tests pass, including the requested 95 commission updates,
 preservation of registry index 65, unchanged principal and supply, signed
 intent domain/epoch/key binding, rejection of a commission increase after a
-pending funded position, and conservation for 30 positions of 10 million.
+pending funded position, conservation for 30 positions of 10 million, both
+30- and 95-position stress cases at the 500-million ceiling, aggregate-limit
+rejection, capacity release after owner withdrawal, and issuance accounting.
+The complete committee suite passes 681 tests, with six measurement tests
+ignored by their existing annotations.
 These tests use synthetic keys and the test verifier. They do not establish
 real hybrid-signature interoperability, mixed-version agreement, historical
 replay, or mainnet readiness.
 
-There is also an issuance dependency: `REWARDS_V2_ACTIVATION_EPOCH` remains
-unarmed. With only funded delegation enabled, `close_epoch` still supplies
+The released implementation also has an issuance dependency:
+`REWARDS_V2_ACTIVATION_EPOCH` remains unarmed. With only its original funded
+delegation implementation enabled, `close_epoch` supplies
 zero delegated stake and zero commission to the issuance calculation, so
 delegators receive no issuance-ledger credit. Producer-fee sharing is a
 different path. The existing
 `rewards_v2_settles_delegator_issuance_share` regression confirms the before/
 after gate behavior. Rewards-v2 also changes attestation-credit validity,
 leak-adjusted reward weights, and proposer credits; it cannot be silently
-enabled as though it were only a commission setting.
+enabled as though it were only a commission setting. The candidate therefore
+settles funded delegators' issuance under the complete funded-delegation gate
+while retaining the existing participation-credit rules. It partitions the
+roster's already-computed effective weight between own and delegated origins
+before applying commission, rather than adding delegation a second time.
+Tests establish 5% of delegated issuance goes to the operator, principal is
+unchanged, total minting stays within the epoch budget, and enabling the gate
+in a state without delegations leaves the epoch root unchanged.
 
-The intended denominator and treatment of own stake must be resolved before
-changing the cap. The separate `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH` also
-remains unarmed; enabling it changes additional reward behavior and is not a
-substitute for a scoped delegation correction. Neither gate nor a live
-validator's commission was changed during this qualification.
+Both `REWARDS_V2_ACTIVATION_EPOCH` and
+`FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH` remain unarmed. The funded-delegation
+gate is also unarmed. Full historical replay, real hybrid-signature lifecycle
+qualification, multi-node mixed-version rehearsal, coordinated release, and
+the small mainnet lifecycle remain outstanding. No production binary,
+commission, principal, or activation epoch changed during this qualification.

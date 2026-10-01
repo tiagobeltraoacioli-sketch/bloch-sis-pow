@@ -1689,6 +1689,10 @@ pub const ATTESTATION_DEDUP_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// give for their own pairing — every rule that changes issuance is one
 /// mixed-fleet fork waiting for one flag day, not several.
 ///
+/// Funded delegation has a separately gated issuance split for its complete
+/// owner lifecycle. That path partitions existing effective weight between
+/// stake origins without enabling the other three rewards-v2 credit rules.
+/// Below both gates the original issuance behavior remains unchanged.
 /// `rewards_v2_gate_is_inert` pins the value.
 pub const REWARDS_V2_ACTIVATION_EPOCH: u64 = u64::MAX;
 
@@ -2168,6 +2172,9 @@ pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = 2_884;
 /// a consensus path for its owner to recover it. Activation requires a state
 /// migration, historical replay, mixed-fleet qualification and an explicit
 /// coordinated epoch; there is no runtime override.
+/// The same gate enforces the fixed 500-million-BLCH delegated-principal
+/// ceiling and settles funded delegators' issuance after operator commission.
+/// It does not arm the separate rewards-v2 or fee/stake-decoupling gates.
 pub const FUNDED_DELEGATION_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 pub(crate) fn funded_delegation_active(epoch: u64) -> bool {

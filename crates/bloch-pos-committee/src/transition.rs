@@ -1719,13 +1719,14 @@ pub struct CommittedState {
     /// [`Self::delegator_fee_rewards`], for exactly the same ledger reason:
     /// crediting a delegation record's `amount_sat` directly would
     /// retroactively reshuffle every later warm-up admission under the
-    /// shared churn budget. Below
-    /// [`crate::params::REWARDS_V2_ACTIVATION_EPOCH`] the issuance loop
+    /// shared churn budget. Below both
+    /// [`crate::params::REWARDS_V2_ACTIVATION_EPOCH`] and
+    /// [`crate::params::FUNDED_DELEGATION_ACTIVATION_EPOCH`] the issuance loop
     /// calls `rewards::distribute` with `delegated_stake: 0`, so
     /// `Payout::delegators` is always zero and this map is never written —
     /// it contributes ZERO leaves under `TAG_DELEGATOR_ISSUANCE_REWARD`
     /// while empty, so every pre-gate root is unchanged by its mere
-    /// existence. At and above the gate, `close_epoch` settles each
+    /// existence. Once either gate is active, `close_epoch` settles each
     /// validator's `payout.delegators` here, split pro-rata by activated
     /// stake (mirroring the fee path's `split_delegator_fees`). Read by the
     /// wallet surface ([`Self::delegator_issuance_reward_sat`]).
@@ -2595,11 +2596,19 @@ impl CommittedState {
     /// one is still reachable through the real evidence-processing path — see
     /// the updated docs on both.
     fn duty_roster_at(&self, epoch: u64) -> Vec<Validator> {
-        // Delegated stake resolved by the delegation module's own fold; its
-        // per-validator cap uses the fixed-point form (rule 3 — the cap is
-        // measured against the capped total, not the total it reduces).
+        // Delegated stake resolved by the delegation module's warm-up fold.
         let reg = delegation::Registry::resolve(&self.delegations, epoch);
-        let delegated = reg.validators(); // sorted by index
+        // Funded delegation uses the fixed principal ceiling. Reusing the
+        // legacy percentage fixed point here can round the cap to zero and
+        // bypass it, or collapse an adjacent cardinality to a few satoshis.
+        // The historical branch remains byte-identical below activation.
+        let delegated = if crate::params::funded_delegation_active(epoch) {
+            reg.validators_with_absolute_cap(
+                funded_delegation::MAX_FUNDED_DELEGATION_PER_VALIDATOR_SAT,
+            )
+        } else {
+            reg.validators()
+        }; // sorted by index
 
         let mut roster: Vec<Validator> = Vec::new();
         for (idx, rec) in &self.validators {
@@ -4704,8 +4713,7 @@ impl CommittedState {
 
     /// Total issuance reward settled to one delegator account, in satoshis
     /// (audit R1 M4) — the issuance mirror of [`Self::delegator_fee_reward_sat`].
-    /// Zero everywhere until [`crate::params::REWARDS_V2_ACTIVATION_EPOCH`]
-    /// binds.
+    /// Zero until rewards-v2 or the complete funded-delegation lifecycle binds.
     pub fn delegator_issuance_reward_sat(&self, delegator: u32) -> u128 {
         self.delegator_issuance_rewards.get(&delegator).copied().unwrap_or(0)
     }
@@ -5196,9 +5204,13 @@ impl CommittedState {
 
         // R1 M1 + M3 + M4, R7 M5 — behind ONE gate; see
         // `REWARDS_V2_ACTIVATION_EPOCH`'s docs for why all four are bound
-        // together. Below it every branch below takes the ORIGINAL arm,
-        // byte for byte the chain as it stands.
+        // together. Historical behavior is preserved below both this gate
+        // and the complete funded-delegation lifecycle gate.
         let rewards_v2 = Self::rewards_v2_active(closing);
+        // Funded positions must receive their issuance share as part of the
+        // complete lifecycle. This does not opt into rewards-v2's separate
+        // changes to vote validity, leak pricing, or proposer credits.
+        let funded_rewards = crate::params::funded_delegation_active(closing);
 
         // R1 M1: participation credit, scoped to what can actually justify.
         // A vote counts only if it is the validator's ONE vote this epoch —
@@ -5250,13 +5262,11 @@ impl CommittedState {
 
         // R1 M4: the delegation registry, resolved once, used both to price
         // each validator's delegated stake/commission and to split the
-        // delegators' share pro-rata by ACTIVATED stake. Only computed
-        // behind the gate — `Registry::resolve` is provably a no-op below it
-        // anyway (nothing reads its result), but there is no reason to pay
-        // even the short-circuited cost of R1 M5 on a live chain that will
-        // not use it.
-        let issuance_registry =
-            if rewards_v2 { Some(delegation::Registry::resolve(&st.delegations, closing)) } else { None };
+        // delegators' share pro-rata by ACTIVATED stake. Funded delegation
+        // also needs this ledger, independently of rewards-v2's credit rules.
+        let issuance_registry = if rewards_v2 || funded_rewards {
+            Some(delegation::Registry::resolve(&st.delegations, closing))
+        } else { None };
 
         // R7 M5: which validators were SCHEDULED to propose at least one
         // slot of the closing epoch, off the same seed and the same
@@ -5279,32 +5289,46 @@ impl CommittedState {
                 // Stake basis is the CAPPED effective stake: stake above the
                 // per-validator or cohort cap carries no weight and earns
                 // nothing — the caps would be decorative otherwise.
-                // `issuance_registry` is `Some` exactly when `rewards_v2`
-                // (resolved above under that very flag), so binding it here
-                // IS the gate test — with no panic site for the impossible
-                // `rewards_v2 && None` case (hardened ratchet, O07).
+                // The registry is present when either issuance splitting
+                // gate is active. Credit rules still follow rewards-v2 alone.
                 let (attested, delegated_stake, commission_bps, extra_credit, extra_max) =
                     if let Some(registry) = issuance_registry.as_ref() {
-                        let attested = valid_credit.get(&v.index).copied().unwrap_or(false);
+                        let attested = if rewards_v2 {
+                            valid_credit.get(&v.index).copied().unwrap_or(false)
+                        } else {
+                            st.current_participation.get(&v.index).copied().unwrap_or(false)
+                        };
                         let delegated_stake = registry.stake_of(v.index);
                         let commission_bps =
                             st.validators.get(&v.index).map_or(0, |r| r.commission_bps);
-                        let scheduled = scheduled_to_propose.contains(&v.index);
-                        let produced = *st.current_proposed.get(&v.index).unwrap_or(&false);
+                        let scheduled = rewards_v2 && scheduled_to_propose.contains(&v.index);
+                        let produced = rewards_v2 && *st.current_proposed.get(&v.index).unwrap_or(&false);
                         (attested, delegated_stake, commission_bps, u64::from(scheduled && produced), u64::from(scheduled))
                     } else {
                         let attested = *st.current_participation.get(&v.index).unwrap_or(&false);
                         (attested, 0u128, 0u128, 0u64, 0u64)
                     };
-                // The operator/delegator split below the gate happens where
-                // per-delegator accounts exist (DEV-3's wallet surface);
-                // consensus commits only the total, into the bond. At and
-                // above the gate the split is real (R1 M4) and the credit
-                // denominator can include a forfeitable proposer slice
-                // (R7 M5).
+                // The roster's effective stake already includes delegation.
+                // Split that fixed weight between origins; adding delegated
+                // stake to it again would mint a second reward for the same
+                // stake. Scale both origins through the cohort/leak caps.
+                let (self_stake, delegated_stake) = if funded_rewards {
+                    let effective = u128::from(v.effective_stake);
+                    let own = st.validators.get(&v.index).map_or(0, |r| r.staked_sat);
+                    let delegated = delegated_stake.min(
+                        funded_delegation::MAX_FUNDED_DELEGATION_PER_VALIDATOR_SAT,
+                    );
+                    let total = own + delegated;
+                    let delegated_weight = if total == 0 { 0 } else {
+                        effective * delegated / total
+                    };
+                    (effective - delegated_weight, delegated_weight)
+                } else {
+                    (u128::from(v.effective_stake), delegated_stake)
+                };
                 let payout = rewards::distribute(
                     &StakeAccount {
-                        self_stake: v.effective_stake as u128,
+                        self_stake,
                         delegated_stake,
                         commission_bps,
                         credits: u64::from(attested) + extra_credit,
@@ -5333,7 +5357,7 @@ impl CommittedState {
                 // issuance ledger, pro-rata by ACTIVATED stake — mirroring
                 // the fee path's `split_delegator_fees` below (reused as-is:
                 // the arithmetic is a generic pro-rata split, not specific to
-                // fees). Below the gate `delegated_stake` is always 0 above,
+                // fees). Below both gates `delegated_stake` is always 0 above,
                 // so `payout.delegators` is always 0 and this never runs.
                 // `payout.delegators > 0` implies `delegated_stake > 0`, which
                 // is only ever non-zero when the registry above is `Some`; the
@@ -5361,7 +5385,7 @@ impl CommittedState {
                             // unconditional supply-conservation check reject
                             // the first rewards-v2 boundary that has an active
                             // delegation. This branch remains behind the inert
-                            // rewards-v2 gate, so historical/pre-activation
+                            // issuance-splitting gates, so pre-activation
                             // state roots are unchanged.
                             if !mutation_mints_from_nothing() {
                                 st.issued_sat += reward;
