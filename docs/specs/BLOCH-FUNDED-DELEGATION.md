@@ -432,3 +432,15 @@ non-executing draft with one canary, at most one restarting identity per host,
 and at most one eighth of measured effective stake offline per wave. Its
 preflight must be refreshed before any future rollout. No production service,
 commission, funded position, or P2B approval changed in this handoff.
+
+
+The exact scheduled-artifact replay subsequently passed with the same
+108,474-block anchor root as the baseline. The unattended publication path
+was configured to publish a **prerelease**, only after the full CLI/RPC test
+also passes and while at least 24 hours remain before activation. It first
+uploads a draft, downloads and compares all seven signed-package assets, and
+only then publishes. It targets the exact candidate commit on a separate
+release branch, preserving `main` and the stable/latest release. Repository
+write access was checked with a successful non-mutating push dry run. Public
+release creation and production rollout had not occurred at this handoff;
+network readiness remains a separate deployment blocker.
