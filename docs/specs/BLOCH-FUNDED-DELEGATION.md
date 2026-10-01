@@ -444,3 +444,33 @@ release branch, preserving `main` and the stable/latest release. Repository
 write access was checked with a successful non-mutating push dry run. Public
 release creation and production rollout had not occurred at this handoff;
 network readiness remains a separate deployment blocker.
+
+### Signed preview publication
+
+At the operator's subsequent request, the same pinned executable was published
+as an explicitly unqualified, signed preview on October 1. The
+[GitHub preview release](https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/tag/funded-delegation-epoch-4528-preview)
+and the [L1 validator guide](https://blochl1.com/validators/guide#delegation-preview)
+provide the binary, build information, publication-snapshot metadata, release
+notes, trusted-key reference, checksum manifest and detached Minisign signature.
+All seven assets downloaded anonymously from each destination matched the
+signed local package byte for byte. Native Minisign independently verified the
+manifest against the existing trusted release key. This preview is not marked
+as the latest stable release and does not approve a production rollout.
+
+The site deployment uses source commit
+`07f85c9dacf20420e8df24056a222094fac092f9`, preserving the existing stable
+downloads and P2B receipt-validation changes. Its 213 tests passed, seven
+optional tests skipped, and the production build succeeded. The entry and guide
+bundles served by `blochl1.com` matched that build. The signed preview metadata
+remains an immutable publication snapshot; subsequent qualification results
+will be recorded in the GitHub release notes.
+
+An independent observation at **2026-10-01 13:45:09 UTC** found the unchanged
+`rpc-network-06` service running. All three candidate nodes were at epoch 589,
+finalized epoch 587, one slot behind the wall slot, and agreed on the common
+finalized block and state root. The third validator had completed its first
+RANDAO renewal. Withdrawal maturity remains epoch 2095, so this is progress
+evidence, not a full lifecycle pass. The local controller now records both
+public links and retains the conditional, separately tagged qualified
+prerelease path. Production migration remains unconfigured.
