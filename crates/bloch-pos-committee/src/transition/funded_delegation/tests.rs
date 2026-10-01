@@ -154,6 +154,195 @@ fn commission_cannot_increase_after_delegation_but_can_decrease() {
 }
 
 #[test]
+fn all_ninety_five_commissions_change_without_changing_principal_or_supply() {
+    let _gate = funded_delegation_rehearsal::open();
+    let (_, mut state, _) = setup_with(96, AuthVerifier, &[]);
+    state.admission_network_domain = Some([0x91; 32]);
+    for record in state.validators.values_mut() {
+        record.commission_bps = 0;
+    }
+    // The controlled fleet excludes registry index 65, which belongs to
+    // another operator. Local expansion labels are not registry indices.
+    state.validators.get_mut(&65).unwrap().commission_bps = 177;
+    let principal: Vec<_> = state.validators.values().map(|r| r.staked_sat).collect();
+    let supply = state.accounted_supply_sat();
+    let opening_root = state.state_root();
+    for validator in (0..65).chain(66..96) {
+        let mut tx = ValidatorCommissionUpdate {
+            network_domain: state.admission_network_domain.unwrap(),
+            epoch: state.epoch,
+            validator,
+            commission_bps: 500,
+            signature: Vec::new(),
+        };
+        tx.signature = auth_sign(&state.validators[&validator].pubkey, &tx.signing_root());
+        let wire = PosTransaction::ValidatorCommissionUpdate(tx.clone()).canonical_bytes();
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&wire).unwrap(),
+            PosTransaction::ValidatorCommissionUpdate(tx.clone())
+        );
+        state
+            .apply_validator_commission_update(&tx, &AuthVerifier)
+            .unwrap();
+        assert_eq!(state.accounted_supply_sat(), supply);
+    }
+    assert!(state
+        .validators
+        .values()
+        .filter(|r| r.index != 65)
+        .all(|r| r.commission_bps == 500));
+    assert_eq!(state.validators[&65].commission_bps, 177);
+    assert_eq!(
+        state
+            .validators
+            .values()
+            .map(|r| r.staked_sat)
+            .collect::<Vec<_>>(),
+        principal
+    );
+    assert_ne!(state.state_root(), opening_root);
+}
+
+#[test]
+fn commission_rejects_wrong_network_epoch_key_rate_and_replay_atomically() {
+    let _gate = funded_delegation_rehearsal::open();
+    let (mut state, _) = fixture();
+    for record in state.validators.values_mut() {
+        record.commission_bps = 0;
+    }
+    let original = commission_update(&state, 500);
+    for (case, expected) in [
+        (0, FundedDelegationReject::Network),
+        (1, FundedDelegationReject::Epoch),
+        (2, FundedDelegationReject::Signature),
+        (3, FundedDelegationReject::Shape),
+        (4, FundedDelegationReject::Validator),
+    ] {
+        let mut tx = original.clone();
+        match case {
+            0 => tx.network_domain[0] ^= 1,
+            1 => tx.epoch += 1,
+            2 => tx.validator = 1,
+            3 => tx.commission_bps = 10_001,
+            4 => tx.validator = u32::MAX,
+            _ => unreachable!(),
+        }
+        let before = state.clone();
+        assert_eq!(
+            state.apply_validator_commission_update(&tx, &AuthVerifier),
+            Err(expected)
+        );
+        assert_eq!(state, before);
+    }
+    state
+        .apply_validator_commission_update(&original, &AuthVerifier)
+        .unwrap();
+    let before = state.clone();
+    assert_eq!(
+        state.apply_validator_commission_update(&original, &AuthVerifier),
+        Err(FundedDelegationReject::Commission)
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn funded_pending_position_blocks_commission_increase_before_any_weight_activates() {
+    let _gate = funded_delegation_rehearsal::open();
+    let (mut state, delegate) = fixture();
+    state.validators.get_mut(&0).unwrap().commission_bps = 0;
+    state
+        .apply_funded_delegate(
+            &delegate,
+            fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+            &AuthVerifier,
+        )
+        .unwrap();
+    assert_eq!(
+        delegation::Registry::resolve(&state.delegations, state.epoch).total_active(),
+        0
+    );
+    let update = commission_update(&state, 500);
+    let before = state.clone();
+    assert_eq!(
+        state.apply_validator_commission_update(&update, &AuthVerifier),
+        Err(FundedDelegationReject::CommissionIncreaseWithDelegations)
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn commission_before_funded_delegation_preserves_principal_and_rate() {
+    let _gate = funded_delegation_rehearsal::open();
+    let (mut state, delegate) = fixture();
+    state.validators.get_mut(&0).unwrap().commission_bps = 0;
+    let update = commission_update(&state, 500);
+    state
+        .apply_validator_commission_update(&update, &AuthVerifier)
+        .unwrap();
+    state
+        .apply_funded_delegate(
+            &delegate,
+            fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+            &AuthVerifier,
+        )
+        .unwrap();
+    assert_eq!(state.validators[&0].commission_bps, 500);
+    assert_eq!(state.delegations[0].amount_sat, delegate.amount_sat);
+}
+
+#[test]
+fn thirty_ten_million_positions_conserve_funding_and_keep_distinct_owners() {
+    let _gate = funded_delegation_rehearsal::open();
+    let (_, mut state, _) = setup_with(96, AuthVerifier, &[]);
+    state.admission_network_domain = Some([0x91; 32]);
+    let base_fee = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+    let mut spent_fees = 0;
+    let mut opening_supply = state.accounted_supply_sat();
+    for validator in 66..96u32 {
+        let input = FundingInput {
+            txid: [validator as u8; 32],
+            vout: 0,
+        };
+        let mut tx = funded_delegate(input.clone());
+        tx.funding_pubkey = pq_key(validator as u8);
+        tx.validator_pubkey_hash = Sha3_256::digest(&state.validators[&validator].pubkey).into();
+        tx.amount_sat = 10_000_000 * 100_000_000;
+        tx.funding_signature = auth_sign(&tx.funding_pubkey, &tx.signing_root());
+        let funding = tx.required_funding_sat().unwrap();
+        state.eutxos.insert(crate::state_root::EutxoEntry {
+            txid: input.txid,
+            vout: input.vout,
+            value: funding.try_into().unwrap(),
+            script_hash: Sha3_256::digest(&tx.funding_pubkey).into(),
+        });
+        opening_supply += funding;
+        let charge = state
+            .apply_funded_delegate(&tx, base_fee, &AuthVerifier)
+            .unwrap();
+        spent_fees += charge.base_fee_sat;
+        assert_eq!(state.accounted_supply_sat(), opening_supply - spent_fees);
+    }
+    assert_eq!(state.delegations.len(), 30);
+    assert_eq!(state.funded_delegation_owners.len(), 30);
+    assert_eq!(
+        state.delegations.iter().map(|d| d.amount_sat).sum::<u128>(),
+        300_000_000 * 100_000_000
+    );
+    assert_eq!(
+        delegation::Registry::resolve(&state.delegations, state.epoch).total_active(),
+        0
+    );
+    for (position, d) in state.delegations.iter().enumerate() {
+        assert_eq!(d.delegator, position as u32);
+        assert_eq!(d.validator, 66 + position as u32);
+        assert_eq!(
+            state.funded_delegation_owners[&d.delegator],
+            Sha3_256::digest(pq_key(d.validator as u8)).as_slice()
+        );
+    }
+}
+
+#[test]
 fn creation_rejections_are_atomic_and_owner_bound() {
     let _gate = funded_delegation_rehearsal::open();
     let base_fee = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;

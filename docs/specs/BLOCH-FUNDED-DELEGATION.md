@@ -141,6 +141,61 @@ epoch set to `u64::MAX`. Arming it requires:
 4. publication of the activation epoch and signed release artifact;
 5. one small-value mainnet lifecycle before any operational bulk delegation.
 
-The planned operational batch is thirty positions of 350,000 BLCH each,
-10,500,000 BLCH total. Batch construction, signing, and broadcasting are
-separate operational steps and are not authorized by merging this protocol.
+The operational request of 2026-09-30 supersedes the previous 350,000 BLCH
+batch: thirty positions of 10,000,000 BLCH each, 300,000,000 BLCH total, and
+500 basis points of commission for the 95 controlled validators. Those
+validators occupy registry indices 0–64 and 66–95; index 65 is outside the
+controlled fleet. Commission updates must finalize before funded positions
+are created, because even an unactivated pending position prevents a later
+increase. Batch construction, signing, and broadcasting remain separate
+operational steps. No transaction or activation follows from this document.
+
+### Qualification result, 2026-10-01 UTC
+
+Activation remains blocked. The production delegation resolver has a cap
+discontinuity: its fixed-point calculation can round to zero, and
+`Registry::validators` treats zero as an uncapped amount. An offline probe
+using the unchanged resolver from release `4d4c5075` produces:
+
+| Equal funded positions | BLCH per position | Computed cap, sat | Delegated weight per validator, sat |
+| --- | ---: | ---: | ---: |
+| 30 | 10,000,000 | 0 | 1,000,000,000,000,000 |
+| 35 | 10,000,000 | 0 | 1,000,000,000,000,000 |
+| 36 | 10,000,000 | 2 | 2 |
+| 95 | 10,000,000 | 184,025,910,235,569 | 184,025,910,235,569 |
+
+These are delegated components, before own stake, cohort caps, and inactivity
+leaks. They are not final proposer probabilities. The same synthetic
+30-position batch takes 563 epoch budgets to warm up fully, assuming no
+other positions or exits. That is a model result, not a live-chain forecast.
+
+Reproduce without keys or network access:
+
+```sh
+cargo run -p bloch-pos-committee --example funded_delegation_readiness --locked --offline
+cargo test -p bloch-pos-committee --lib funded_delegation --locked --offline
+```
+
+The 17 focused tests pass, including the requested 95 commission updates,
+preservation of registry index 65, unchanged principal and supply, signed
+intent domain/epoch/key binding, rejection of a commission increase after a
+pending funded position, and conservation for 30 positions of 10 million.
+These tests use synthetic keys and the test verifier. They do not establish
+real hybrid-signature interoperability, mixed-version agreement, historical
+replay, or mainnet readiness.
+
+There is also an issuance dependency: `REWARDS_V2_ACTIVATION_EPOCH` remains
+unarmed. With only funded delegation enabled, `close_epoch` still supplies
+zero delegated stake and zero commission to the issuance calculation, so
+delegators receive no issuance-ledger credit. Producer-fee sharing is a
+different path. The existing
+`rewards_v2_settles_delegator_issuance_share` regression confirms the before/
+after gate behavior. Rewards-v2 also changes attestation-credit validity,
+leak-adjusted reward weights, and proposer credits; it cannot be silently
+enabled as though it were only a commission setting.
+
+The intended denominator and treatment of own stake must be resolved before
+changing the cap. The separate `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH` also
+remains unarmed; enabling it changes additional reward behavior and is not a
+substitute for a scoped delegation correction. Neither gate nor a live
+validator's commission was changed during this qualification.
