@@ -647,7 +647,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         gossip_verifier: super::verification::GossipVerifier::new(verifier.clone()),
         verifier,
         keys: None, // observer: replay proposes nothing and attests nothing
-        blocks: BTreeMap::new(),
+        blocks: super::BlockInventory::default(),
         observed_proposals: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),

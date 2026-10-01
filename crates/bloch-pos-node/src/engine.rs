@@ -74,13 +74,15 @@
 //! carries the slashing-cost retraction an integrator needs: the latch stops
 //! THIS node rewinding itself; it is not an economic guarantee across nodes.
 //!
-//! The store is **rebuilt from scratch on every head computation** rather than
-//! carried as mutable node state. That is the §5.5 posture applied where it is
-//! cheapest to get wrong: a cached fork-choice store is exactly the kind of
-//! node-local mutable state that made two honest nodes disagree in the
-//! `expected_bits` incident. Rebuilding is O(blocks x attestations) per call
-//! and, on a devnet, free; when it stops being free the fix is an incremental
-//! store with a test proving it equals the rebuild, not a cache with a comment.
+//! Latest messages and current stakes are rebuilt on every head computation.
+//! `BlockInventory` maintains parent/child and historical-vote indexes in the
+//! same container as the envelopes; all mutations update those indexes. The
+//! weight walk needs only descendants of the justified checkpoint, but the
+//! vote fold retains the full rebuild's exact block-ID/body/pool ordering:
+//! legacy equivocation detection is order-sensitive, so an arrival-order
+//! latest-message cache would change heads. Differential tests compare both
+//! tie-break regimes against the unchanged full rebuild through insertion,
+//! replacement, removal, stake changes, missing parents and synthetic cycles.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -108,6 +110,9 @@ use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition
 use bloch_pos_committee::interfaces::TransitionError;
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 use sha3::{Digest, Sha3_256};
+
+mod block_inventory;
+use block_inventory::BlockInventory;
 
 mod validator_lifecycle;
 mod admission;
@@ -1467,7 +1472,7 @@ struct Engine {
     /// from them — so this still grows with the chain. That is the chain's
     /// own size, not an attacker's budget, and it is the honest remaining
     /// limitation.
-    blocks: BTreeMap<[u8; 32], BlockEnvelope>,
+    blocks: BlockInventory,
     observed_proposals: BTreeMap<(u64, u32), ProposalEnvelope>,
     /// Canonical chain, ascending slot, genesis first.
     chain: Vec<(u64, BlockId)>,
@@ -3644,14 +3649,7 @@ impl Engine {
     /// The LMD-GHOST head over every block this node has seen, canonical or
     /// not.
     ///
-    /// Rebuilt from scratch each call (see the module docs on why there is no
-    /// cached store). Deterministic despite the map iteration: `Store::observe`
-    /// keeps the highest-slot message per validator and bars any validator that
-    /// signed two different heads in one slot, so the resulting store is a
-    /// function of the message *set*, never of arrival order — the property
-    /// that was found violated in `forkchoice.rs` on 2026-08-11 and fixed
-    /// there. Sibling lists are sorted so the tie-break is stable too.
-    /// Everything [`lmd_ghost_head`] reads, in a form cheap enough to compare
+    /// Everything fork choice reads, in a form cheap enough to compare
     /// on every turn of `advance`'s loop.
     ///
     /// The two state inputs are compared by value. The two collection inputs
@@ -3688,12 +3686,11 @@ impl Engine {
     fn forkchoice_head(&self) -> [u8; 32] {
         // Instrumentation only; compiled out without `perf-timing`.
         let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::ForkChoice);
-        lmd_ghost_head_at_epoch(
-            &self.blocks,
+        self.blocks.head(
             self.pool.values(),
             &self.state.active_validators(),
             self.state.finality().justified.root,
-            epoch_of(self.state.slot()),
+            bloch_pos_committee::params::forkchoice_slot_tiebreak_active(epoch_of(self.state.slot())),
         )
     }
 
@@ -6126,7 +6123,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
         verifier,
         keys,
-        blocks: BTreeMap::new(),
+        blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -7647,7 +7644,7 @@ mod forkchoice_tests {
     use super::*;
     use bloch_pos_committee::sample::Validator;
 
-    fn header(parent: [u8; 32], slot: u64, marker: u8) -> BlockHeaderV4 {
+    pub(super) fn header(parent: [u8; 32], slot: u64, marker: u8) -> BlockHeaderV4 {
         BlockHeaderV4 {
             version: VERSION_G4,
             parent,
@@ -7664,7 +7661,7 @@ mod forkchoice_tests {
         }
     }
 
-    fn attest(validator: u32, slot: u64, head: [u8; 32]) -> Attestation {
+    pub(super) fn attest(validator: u32, slot: u64, head: [u8; 32]) -> Attestation {
         Attestation {
             validator,
             data: AttestationData {
@@ -7705,7 +7702,7 @@ mod forkchoice_tests {
         (blocks, ids)
     }
 
-    fn vals(n: u32) -> Vec<Validator> {
+    pub(super) fn vals(n: u32) -> Vec<Validator> {
         (0..n)
             .map(|index| Validator {
                 index,
@@ -8977,7 +8974,7 @@ mod transfer_v2_end_to_end {
             gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: None,
-            blocks: BTreeMap::new(),
+            blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -10240,7 +10237,7 @@ mod perf_support {
             gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: Some(ks),
-            blocks: BTreeMap::new(),
+            blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -12294,7 +12291,7 @@ mod duty_view_anchor {
             gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: Some(ks0),
-            blocks: BTreeMap::new(),
+            blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -12562,7 +12559,7 @@ mod slot_horizon {
             gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: None,
-            blocks: BTreeMap::new(),
+            blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),

@@ -540,3 +540,40 @@ when restoring one. The CLI/RPC runner now retains its final liveness sample,
 all three node observations, exact build identities and cache/reorg metrics.
 Its finality limits, real cooldown, withdrawal delay and payout assertions remain
 unchanged. A corrected full network rehearsal is still required before approval.
+
+### Follow-up rehearsal failure and indexed fork-choice inputs
+
+The cache correction alone did not complete the lifecycle. `rpc-network-07`
+(50 ms slots) failed with a 23-epoch finality lag; `rpc-network-08` (100 ms)
+failed after 3,104 seconds with a 12-epoch lag on node 0. The latter first
+reorganized around slots 16,834–17,924 and reached about epoch 965. Median
+cache writes remained 1 ms on all three nodes. Neither run reached the mature
+payout, and both failures remain qualification blockers.
+
+The next correction removes full-history parent/child map reconstruction and
+weight propagation from each head computation. `BlockInventory` owns the
+envelopes and derived child/vote indexes, with no mutable map access that could
+bypass index maintenance. The queried weight graph contains only descendants
+of the current justified checkpoint. Historical votes are still folded in the
+exact previous block-ID, body and loose-pool order: the legacy latest-message
+store is order-sensitive in the presence of equivocation, so replacing it with
+an arrival-order cache would change consensus behavior. Current canonical
+stakes and both existing tie-break regimes are unchanged. Synthetic cycles use
+the unchanged full rebuild to preserve its original global step bound.
+
+Differential regressions cover random insertions, same-ID replacements,
+removals, missing parents, cycles, changing stakes and loose votes, as well as
+the legacy equivocation ordering and historical carriers outside the live
+subtree. The retained canonical envelopes, child index and historical vote
+summaries still grow with chain history; this is not bounded-history storage.
+The new candidate requires its own complete lifecycle, independent artifact
+comparison, exact-artifact mainnet replay and strict cache restart before any
+qualification claim. The real protocol delays and liveness assertions remain
+unchanged, and production rollout remains blocked.
+
+The local optimized benchmark uses a 64-block live suffix, three historical
+votes every 32 blocks and twelve head computations per case. At 4,096, 32,768
+and 65,536 retained blocks, full rebuilds averaged 2.098, 28.142 and 65.574 ms;
+indexed computations averaged 0.060, 0.155 and 0.313 ms respectively, with
+identical selected heads. These are local synthetic measurements of fork
+choice, not whole-node throughput or a completed network qualification.
