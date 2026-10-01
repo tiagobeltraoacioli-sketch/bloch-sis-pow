@@ -231,3 +231,77 @@ gate is also unarmed. Full historical replay, real hybrid-signature lifecycle
 qualification, multi-node mixed-version rehearsal, coordinated release, and
 the small mainnet lifecycle remain outstanding. No production binary,
 commission, principal, or activation epoch changed during this qualification.
+
+### Shipping-binary compatibility and hybrid authorization, 2026-10-01 UTC
+
+The Linux candidate from commit `7c4710bb54b4430ac5814a7e26280bce9e07cccc`
+(SHA-256 `98d066dc41e156f1bb4fea5f3a6a3db79108645e10dec0e6188134cede679768`)
+was exercised alongside deployed baseline commit
+`4d4c5075872c622fdd26aa418a9d249ec95fbcea`
+(SHA-256 `fb8a65cbd9721d794bd4c2151b50d82d85a7df2299d59d7bad44a7635c30b46a`).
+The reproducible harness is `scripts/qualify-mixed-l1-candidate.py`.
+
+Three independent validator processes ran old/new/old binaries on loopback
+libp2p, using fresh hybrid keys and a synthetic bound genesis. A fourth,
+candidate observer started with an empty data directory after head slot 101.
+The normal 64-slot doppelganger window remained enabled. The test used
+500-millisecond slots and stopped at slot 256.
+
+- All four processes agreed on 96 finalized blocks, including full block IDs
+  and state roots. All three validator indices proposed finalized blocks.
+- The late observer independently acquired and validated history predating
+  its startup. Finality reached checkpoint epoch 5 on all four nodes.
+- Baseline and candidate each replayed the same stopped, synthetic block log
+  from genesis in both devnet and libp2p modes. All four results were slot 255,
+  192 blocks, and state root
+  `f7df5c8455bc404661a70dc8109c29ccbc3b6b05e87975dba76b2652c427264c`.
+- No production datadir or signing identity was used. The 15 existing
+  validator services on the test host remained running.
+
+This establishes mixed shipping-version agreement over this synthetic
+pre-activation history. It does **not** establish agreement across an armed
+fork boundary, historical mainnet replay, or mainnet bootstrap readiness.
+
+Four additional node tests use actual ML-DSA-65 and Falcon-1024 signatures
+through `HybridVerifier`, rather than the committee's synthetic verifier:
+
+```sh
+cargo test -p bloch-pos-node --bin bloch-pos funded_delegation_tests --locked --offline
+```
+
+They verify canonical round-trips; rejection when either signature component
+is corrupted; binding to network, epoch, inputs, validator, amount, change,
+withdrawal destination, position, and commission rate; separation of owner
+and validator authority; and refusal of all four signed transaction types by
+the shipping node without committed-state or mempool mutation. The shipping
+gate is also checked at epochs 0, 4329, `u64::MAX - 1`, and `u64::MAX`.
+
+The separate `scripts/rehearse-funded-delegation.py` runner copies source to
+a disposable directory and arms only the funded-delegation gate there. It
+runs the ignored real-hybrid lifecycle test; the shipping gate and the real
+cool-down and withdrawal delays remain unchanged. This test is separate from
+the four ordinary shipping tests and must report its own successful result
+before its lifecycle evidence can be counted.
+
+The isolated lifecycle run passed on 2026-10-01 UTC. It used two in-process
+node engines, a fresh validator key and owner key, the real hybrid verifier,
+and a synthetic genesis allocation. Commission was set to 500 basis points
+before funding a 10-BLCH position. Real signed blocks carried the funding,
+deactivation, and withdrawal. The owner received issuance; an early payout
+was excluded; the unchanged 32-epoch cool-down and 2,048-epoch withdrawal
+delay elapsed; and the payout equaled principal plus credited fees and
+issuance, less slash losses and the withdrawal fee. A second owner-signed
+withdrawal to another destination was excluded without a second payout.
+
+Both engines agreed after every applied block. Their independent full
+replays from synthetic genesis matched the resulting states at slot 66722,
+epoch 2085, after 2,275 blocks. The selected lifecycle test passed in 813.73
+seconds. The four shipping authorization tests also passed; the positive
+lifecycle test remains ignored in the ordinary suite because it requires
+the separate isolated compilation. No shipping consensus constant changed.
+
+This in-process result does not exercise a funded lifecycle through the
+external CLI/RPC and network transport, nor does the mixed shipping-binary
+test exercise a scheduled activation boundary. Those rehearsals, historical
+mainnet replay, coordinated deployment, a signed activation release, and a
+small-value mainnet lifecycle remain prerequisites to production activation.

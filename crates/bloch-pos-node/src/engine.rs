@@ -15475,6 +15475,10 @@ mod finality_latch_tests {
 mod validator_admission_tests;
 
 #[cfg(test)]
+#[path = "engine/funded_delegation_tests.rs"]
+mod funded_delegation_tests;
+
+#[cfg(test)]
 mod branch_gap_repair_tests {
     use super::*;
 
