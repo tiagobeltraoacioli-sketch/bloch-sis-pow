@@ -866,3 +866,11 @@ silently.** Claim the abbreviation from the PMO, not just the concept.
 `crates/coherence-core` uses a separate `bloch:coherence:*:v1` domain family
 (noted at `params.rs:705-709`) which is deliberately outside the BLCH4 sweep.
 Distinct namespace; not tracked here.
+
+## Experimental native L2 settlement (2026-10-01)
+
+The isolated native-settlement development assigns transaction `0x0E` to the
+fixed 979-byte settlement envelope and state component `0x1F` to its policy and
+cursor. Both are new per-namespace assignments; tombstones are unchanged.
+Existing manifests leave the policy absent and the public mempool refuses the
+transaction. See [the protocol and qualification boundary](specs/BLOCH-NATIVE-L2-SETTLEMENT.md).

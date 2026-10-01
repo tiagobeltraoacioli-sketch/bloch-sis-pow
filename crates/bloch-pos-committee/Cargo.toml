@@ -22,6 +22,7 @@ perf-timing = []
 sha3 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
+bloch-l2-proof = { path = "../bloch-l2-proof" }
 hex = "0.4"
 
 # SHA3/Keccak dev-profile overrides live in the root Cargo.toml, the only

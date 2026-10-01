@@ -1,0 +1,9 @@
+{
+  "source_artifact_sha256": "d22c6673ae6d21aa57dda874138d205236c52064c5a6fd3a6c7d71ac20cb0bd6",
+  "canonical_proof_sha256": "273a8eb24fd235839e81cb01f865edffbcbfaabd4969986fe1971383e494b5e0",
+  "public_values_sha256": "e8535f1453dbec4ddc5f532b3154e76f05f9e808e3c246d702701fad3d2c2c10",
+  "guest_elf_sha256": "8e24512ffa42d7c7e87db8c10df8c2a1d09c3977170e6615d559f9b5f9da8c4b",
+  "classification": "real-groth16-proof-of-synthetic-source-contract",
+  "native_source_authenticated": false,
+  "program_bn254": "00f47fd903d685e85cec17ba027d9bdbab3f51c2ee5f92c078b5e03ca6c3a41a"
+}

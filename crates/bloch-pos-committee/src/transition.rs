@@ -304,6 +304,8 @@ pub struct TransferOutput {
 /// not receive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PosTransaction {
+    /// Experimental native settlement (0x0E); rejected without a genesis policy.
+    L2Settlement(Box<crate::l2_settlement::Transaction>),
     /// PQ-authorized, UTXO-funded validator registration (wire 0x0B).
     FundedDeposit(FundedDeposit),
     /// A value transfer against the committed eUTXO set, priced by the L1 fee
@@ -830,6 +832,7 @@ impl PosTransaction {
             b.extend_from_slice(bytes);
         };
         match self {
+            PosTransaction::L2Settlement(tx) => return tx.encode(),
             PosTransaction::FundedDeposit(tx) => return tx.canonical_bytes(),
             PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
@@ -1008,6 +1011,10 @@ impl PosTransaction {
     /// refused by every node, which is byte-for-byte the verdict a
     /// pre-format binary reaches at its decoder.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, TxDecodeError> {
+        if bytes.first() == Some(&crate::l2_settlement::WIRE_TAG) {
+            return crate::l2_settlement::Transaction::decode(bytes)
+                .map(|tx| Self::L2Settlement(Box::new(tx))).ok_or(TxDecodeError::Truncated);
+        }
         let mut r = TxReader { b: bytes, i: 0 };
         let tag = r.u8()?;
         let tx = match tag {
@@ -1217,6 +1224,7 @@ impl core::fmt::Display for TxDecodeError {
 /// refuses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxReject {
+    L2Settlement(crate::l2_settlement::Reject),
     FundedDeposit(FundedDepositReject),
     /// A value transfer broke one of the eUTXO rules.
     Transfer(TransferReject),
@@ -1654,6 +1662,7 @@ pub struct CommittedState {
     /// The node's execution layer computes it; this transition only commits
     /// it, exactly like the Coherence roots above.
     evm: EvmCommitment,
+    l2_settlement: Option<crate::l2_settlement::State>,
     /// Cumulative issued supply in satoshis — the hard-cap invariant's
     /// counter (2026-08-12), committed under `TAG_ISSUED_SUPPLY`.
     ///
@@ -2221,6 +2230,7 @@ impl CommittedState {
             coherence_accumulator_root,
             coherence_nullifier_root,
             evm,
+            l2_settlement: None,
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
             eutxos: opening_balances.iter().cloned().collect(),
         };
@@ -2312,6 +2322,19 @@ impl CommittedState {
             &self.coherence_nullifier_root,
         )
     }
+
+    /// New-network setup only; existing manifests never call this constructor.
+    pub fn configure_l2_genesis(mut self, policy: crate::l2_settlement::Policy)
+        -> Result<Self, crate::l2_settlement::Reject> {
+        if self.slot != 0 || self.epoch != 0 || self.l2_settlement.is_some()
+            || self.admission_network_domain != Some(policy.identities[0])
+            || self.head.as_bytes() != &policy.identities[1] {
+            return Err(crate::l2_settlement::Reject::Policy);
+        }
+        self.l2_settlement = Some(crate::l2_settlement::State::genesis(policy)?);
+        Ok(self)
+    }
+    pub fn l2_settlement(&self) -> Option<&crate::l2_settlement::State> { self.l2_settlement.as_ref() }
 
     pub fn head(&self) -> BlockId {
         self.head
@@ -2793,7 +2816,7 @@ impl CommittedState {
         // (It genuinely WAS `&[]` once, under a comment saying the node
         // supplied it, and nothing did: every block from genesis committed an
         // empty balance component. Hence the emphasis.)
-        crate::state_root::state_root_with_eutxo_tree(&ConsensusState {
+        let mut tree = crate::state_root::build_state_tree_with_eutxo_tree(&ConsensusState {
             written_off_sat: self.written_off_sat,
             funded_validators: &self.funded_validators.iter().copied().collect::<Vec<_>>(),
             stake_low_water: &self.stake_low_water.iter().map(|(k,v)| (*k,*v)).collect::<Vec<_>>(),
@@ -2828,7 +2851,11 @@ impl CommittedState {
             coherence_nullifier_root: self.coherence_nullifier_root,
             evm: self.evm,
             issued_sat: self.issued_sat,
-        }, self.eutxos.tree())
+        }, self.eutxos.tree());
+        if let Some(state) = &self.l2_settlement {
+            crate::state_root::insert_l2_settlement(&mut tree, &state.committed_bytes());
+        }
+        tree.root()
     }
 
     // ── Fork-choice accumulation ────────────────────────────────────────────
@@ -3357,6 +3384,16 @@ impl CommittedState {
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, TxReject> {
         match tx {
+            PosTransaction::L2Settlement(tx) => {
+                let state = self.l2_settlement.as_mut()
+                    .ok_or(TxReject::L2Settlement(crate::l2_settlement::Reject::NotActive))?;
+                state.apply(tx, *self.head.as_bytes(), self.slot, verifier).map_err(TxReject::L2Settlement)?;
+                // Protocol-only empty-inbox transaction: no synthetic fee credit.
+                // One verification reserves the complete block gas budget.
+                Ok(fee_market::TxCharge { gas: fee_market::BLOCK_GAS_LIMIT,
+                    tx_bytes: crate::l2_settlement::TRANSACTION_BYTES as u64,
+                    base_fee_sat: 0, priority_fee_sat: 0 })
+            }
             PosTransaction::Withdraw { validator } => self.apply_withdrawal(*validator, tx),
             PosTransaction::FundedDeposit(deposit) => self
                 .apply_funded_deposit(deposit, total_active_sat, base_fee_millisat_per_gas, verifier)
@@ -5821,6 +5858,10 @@ impl<V: SignatureVerifier> Transition<V> {
         let mut block_bytes: u64 = 0;
         // Satoshis this block bonds without spending an output. See the
         // conservation check at step 11b.
+        // Bound proof invocations before any transaction proof is executed.
+        if transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2Settlement(_))).count() > 1 {
+            return Err(TransitionError::BlockGasLimitExceeded);
+        }
         let mut unfunded_bonded: u128 = 0;
         for (i, tx) in transactions.iter().enumerate() {
             let applied = match tx {
@@ -5983,6 +6024,9 @@ impl<V: SignatureVerifier> Transition<V> {
             return Err(TransitionError::SupplyNotConserved);
         }
 
+        if let Some(state) = st.l2_settlement.as_mut() {
+            state.advance_height().map_err(|_| TransitionError::StateRootMismatch)?;
+        }
         st.slot = header.slot;
         st.head = BlockId::of(header);
         Ok(st)
@@ -6363,6 +6407,7 @@ mod tx_codec_tests {
 
 #[cfg(test)]
 mod tests {
+    include!("transition/l2_settlement_tests.rs");
     use super::*;
     mod validator_lifecycle {
         use super::*;
@@ -13749,6 +13794,7 @@ mod tests {
             PosTransaction::RandaoRecommit { .. } => {}
             // Funded admission transfers UTXO value into bonded stake and fees.
             PosTransaction::FundedDeposit(_) => {}
+            PosTransaction::L2Settlement(_) => {} // Cursor only; no balances.
         }
 
         // Monotone under blocks and boundaries, and never above the cap.
@@ -15968,4 +16014,5 @@ mod epoch_advance_bound {
         // And it must still be a bound: anything near u64::MAX is not one.
         assert!(MAX_EPOCH_ADVANCE < 1 << 20, "a ceiling that large is not a ceiling");
     }
+
 }

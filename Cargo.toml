@@ -13,6 +13,7 @@ resolver = "2"
 members = [
     "tools/bloch-indexer",
     # ── Genesis-4, proof of stake. THE LIVE CHAIN. ──
+    "crates/bloch-l2-proof",        # deterministic succinct verifier, no prover
     "crates/bloch-pos-committee",  # frozen consensus math (pure, sha3-only)
     "crates/bloch-pos-node",       # the `bloch-pos` binary the fleet runs
     "tools/genesis4-ceremony",     # assembled the live genesis block

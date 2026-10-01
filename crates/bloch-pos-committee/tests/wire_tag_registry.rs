@@ -327,6 +327,8 @@ const TX_TAGS: &[(u8, Status)] = &[
     (0x0A, Status::Released { name: "RandaoRecommit", rivals: NO_RIVALS }),
     (0x0C, Status::Released { name: "ExitV2", rivals: NO_RIVALS }),
     (0x0D, Status::Released { name: "Withdraw", rivals: NO_RIVALS }),
+    // New experimental format; no shipping genesis enables this rule.
+    (0x0E, Status::Released { name: "L2Settlement", rivals: NO_RIVALS }),
 ];
 
 /// Three lineages that all intend the SAME flag day disagree on all three
@@ -518,6 +520,7 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         PosTransaction::Withdraw { .. } => 0x0D,
         PosTransaction::RandaoRecommit { .. } => 0x0A,
         PosTransaction::FundedDeposit(_) => 0x0B,
+        PosTransaction::L2Settlement(_) => 0x0E,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }

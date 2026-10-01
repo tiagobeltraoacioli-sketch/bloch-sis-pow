@@ -5562,6 +5562,7 @@ fn declared_size_bound(tx: &PosTransaction, declared: u64) -> Result<(), &'stati
 
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     match tx {
+        PosTransaction::L2Settlement(_) => Err("native L2 settlement is not enabled by a shipping genesis manifest"),
         PosTransaction::FundedDeposit(deposit) => {
             if !bloch_pos_committee::params::funded_validator_admission_active(wall_epoch) {
                 return Err("funded validator admission is not active: FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH is unarmed or not reached");

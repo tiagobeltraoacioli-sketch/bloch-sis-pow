@@ -1,0 +1,11 @@
+[package]
+name = "bloch-l2-proof"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94.1"
+license = "AGPL-3.0-or-later"
+publish = false
+[dependencies]
+sp1-verifier = { version = "=6.8.0", default-features = false }
+sha2 = { version = "=0.10.9", default-features = false }
+sha3 = { version = "=0.10.9", default-features = false }

@@ -1965,6 +1965,7 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
         // match is exhaustive on purpose, and an operator reading the field
         // post-activation needs the honest name.
         PosTransaction::RandaoRecommit { .. } => "randao_recommit",
+        PosTransaction::L2Settlement(_) => "l2_settlement",
     };
     Json::obj(vec![
         ("accepted", Json::Bool(true)),

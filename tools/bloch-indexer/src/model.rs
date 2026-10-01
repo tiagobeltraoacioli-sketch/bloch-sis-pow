@@ -135,6 +135,7 @@ pub struct HistoryEntry {
 /// the bytes are one seek away in the log when a caller does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxKind {
+    L2Settlement,
     Transfer,
     TransferV2,
     FundedDeposit,
@@ -157,6 +158,7 @@ pub enum TxKind {
 impl TxKind {
     pub fn name(&self) -> String {
         match self {
+            TxKind::L2Settlement => "l2_settlement".into(),
             TxKind::Transfer => "transfer".into(),
             TxKind::TransferV2 => "transfer_v2".into(),
             TxKind::FundedDeposit => "funded_deposit".into(),

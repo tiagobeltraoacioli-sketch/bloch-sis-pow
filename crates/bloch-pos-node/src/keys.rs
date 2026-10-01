@@ -1128,6 +1128,10 @@ impl Default for HybridVerifier {
 }
 
 impl bloch_pos_committee::attestation::SignatureVerifier for HybridVerifier {
+    fn verify_l2_settlement(&self, policy: &[u8; 32], program: &[u8; 32], values: &[u8], proof: &[u8]) -> bool {
+        bloch_l2_proof::verify(policy, program, values, proof)
+    }
+
     /// The suite check itself. Robust to arbitrary key bytes by contract:
     /// `bloch_crypto::crypto::verify` documents "any body parse failure ⇒
     /// false, never a panic (consensus rule)" and guards every length before
@@ -1150,6 +1154,10 @@ impl bloch_pos_committee::attestation::SignatureVerifier for HybridVerifier {
 pub struct ProbeVerifier;
 
 impl bloch_pos_committee::attestation::SignatureVerifier for ProbeVerifier {
+    fn verify_l2_settlement(&self, policy: &[u8; 32], program: &[u8; 32], values: &[u8], proof: &[u8]) -> bool {
+        bloch_l2_proof::verify(policy, program, values, proof)
+    }
+
     fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
         true
     }
@@ -1164,6 +1172,20 @@ fn os_random(buf: &mut [u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn both_proposal_and_validation_verify_real_l2_proofs() {
+        use bloch_pos_committee::attestation::SignatureVerifier;
+        let values=include_bytes!("../../bloch-l2-proof/tests/fixtures/source-contract.values");
+        let proof=include_bytes!("../../bloch-l2-proof/tests/fixtures/source-contract.proof");
+        let key: [u8;32]=values[22+6*32..22+7*32].try_into().unwrap();
+        let policy=bloch_l2_proof::policy_commitment();
+        for verifier in [&super::HybridVerifier as &dyn SignatureVerifier,&super::ProbeVerifier] {
+            assert!(verifier.verify_l2_settlement(&policy,&key,values,proof));
+            let mut bad=*proof;bad[12]^=1;
+            assert!(!verifier.verify_l2_settlement(&policy,&key,values,&bad));
+        }
+    }
     use super::*;
     use bloch_pos_committee::attestation::SignatureVerifier;
 

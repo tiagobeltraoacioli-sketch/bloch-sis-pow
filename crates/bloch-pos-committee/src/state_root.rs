@@ -277,6 +277,12 @@ const TAG_WRITTEN_OFF: u8 = 0x1B;
 const TAG_STAKE_LOW_WATER: u8 = 0x1C;
 const TAG_RANDAO_GENERATION: u8 = 0x1D;
 const TAG_FUNDED_VALIDATOR: u8 = 0x1E;
+/// Experimental policy/cursor component; absent on existing native networks.
+const TAG_L2_SETTLEMENT: u8 = 0x1F;
+
+pub(crate) fn insert_l2_settlement(tree: &mut Smt, bytes: &[u8]) {
+    tree.insert(derive_key(TAG_L2_SETTLEMENT, &[]), hash_value(bytes));
+}
 
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
@@ -3525,6 +3531,7 @@ mod tests {
             TAG_PROPOSED_CURRENT,
             TAG_FC_RECENT_VOTE,
             TAG_WRITTEN_OFF, TAG_STAKE_LOW_WATER, TAG_RANDAO_GENERATION, TAG_FUNDED_VALIDATOR,
+            TAG_L2_SETTLEMENT,
         ];
         let distinct: std::collections::BTreeSet<u8> = tags.iter().copied().collect();
         assert_eq!(distinct.len(), tags.len(), "two state-root components share a tag byte");
