@@ -894,6 +894,10 @@ fn keygen(args: &[String]) {
 /// about which balance set this chain opens with, and the file itself is
 /// checked later, at node start, against exactly these four fields.
 fn genesis_mainnet(args: &[String]) {
+    if arg_value(args, "--l2-settlement-config").is_some() {
+        eprintln!("L2 settlement is restricted to a fresh unfunded development genesis");
+        exit(2);
+    }
     use bloch_pos_committee::tokenomics_v4 as t;
 
     let Some(cohort_path) = arg_value(args, "--cohort") else {
@@ -1079,6 +1083,14 @@ fn genesis_mainnet(args: &[String]) {
 }
 
 fn genesis_cmd(args: &[String]) {
+    let format = if let Some(path) = arg_value(args, "--l2-settlement-config") {
+        if !args.iter().any(|a| a == "--bind-genesis") {
+            eprintln!("L2 settlement requires --bind-genesis"); exit(2);
+        }
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| { eprintln!("L2 config: {e}"); exit(2) });
+        let config = genesis::L2Config::decode(&bytes).unwrap_or_else(|e| { eprintln!("L2 config: {e}"); exit(2) });
+        genesis::ManifestFormat::V3L2Async(config)
+    } else { manifest_format(args) };
     let Some(keys_csv) = arg_value(args, "--keys") else {
         eprintln!("genesis: --keys <dir1,dir2,...> is required");
         exit(2);
@@ -1139,7 +1151,7 @@ fn genesis_cmd(args: &[String]) {
         carryover: None,
         allocations: Vec::new(),
         carryover_entries: Vec::new(),
-        format: manifest_format(args),
+        format,
         pre_state_root: std::sync::OnceLock::new(),
     };
     if let Err(e) = manifest.check_supply() {
@@ -1147,7 +1159,9 @@ fn genesis_cmd(args: &[String]) {
         exit(1);
     }
     let bytes = manifest.encode();
-    if let Err(e) = std::fs::write(&out, &bytes) {
+    use std::io::Write;
+    if let Err(e) = std::fs::OpenOptions::new().write(true).create_new(true).open(&out)
+        .and_then(|mut f| f.write_all(&bytes)) {
         eprintln!("genesis: cannot write {out}: {e}");
         exit(1);
     }

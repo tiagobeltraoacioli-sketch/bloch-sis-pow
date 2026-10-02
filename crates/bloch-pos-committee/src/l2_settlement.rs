@@ -4,6 +4,8 @@
 use sha3::{Digest, Sha3_256};
 
 pub const WIRE_TAG: u8 = 0x0e;
+/// Asynchronous settlement, enabled only by a new manifest-bound genesis.
+pub const ASYNC_WIRE_TAG: u8 = 0x0f;
 pub const STATEMENT_TAG: &[u8] = b"BLOCH:EVM:SETTLEMENT:2";
 pub const STATEMENT_BYTES: usize = 590;
 pub const PROOF_BYTES: usize = 356;
@@ -19,8 +21,14 @@ pub struct Transaction {
 }
 impl Transaction {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
+        Self::decode_tag(bytes, WIRE_TAG)
+    }
+    pub fn decode_async(bytes: &[u8]) -> Option<Self> {
+        Self::decode_tag(bytes, ASYNC_WIRE_TAG)
+    }
+    fn decode_tag(bytes: &[u8], tag: u8) -> Option<Self> {
         if bytes.len() != TRANSACTION_BYTES
-            || bytes[0] != WIRE_TAG
+            || bytes[0] != tag
             || !bytes[33..].starts_with(STATEMENT_TAG)
         {
             return None;
@@ -32,8 +40,14 @@ impl Transaction {
         })
     }
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_tag(WIRE_TAG)
+    }
+    pub fn encode_async(&self) -> Vec<u8> {
+        self.encode_tag(ASYNC_WIRE_TAG)
+    }
+    fn encode_tag(&self, tag: u8) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(TRANSACTION_BYTES);
-        bytes.push(WIRE_TAG);
+        bytes.push(tag);
         bytes.extend_from_slice(&self.proof_policy);
         bytes.extend_from_slice(&self.statement);
         bytes.extend_from_slice(&self.proof);
@@ -110,6 +124,8 @@ pub struct State {
     policy: Policy,
     native_height: u64,
     head: Option<([u8; 32], [u8; STATEMENT_BYTES])>,
+    asynchronous: bool,
+    source_anchor: Option<([u8; 32], u64, u64)>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -130,7 +146,24 @@ impl State {
             policy,
             native_height: 0,
             head: None,
+            asynchronous: false,
+            source_anchor: None,
         })
+    }
+    pub(crate) fn genesis_async(policy: Policy) -> Result<Self, Reject> {
+        let mut state = Self::genesis(policy)?;
+        state.asynchronous = true;
+        Ok(state)
+    }
+    pub fn asynchronous(&self) -> bool { self.asynchronous }
+    /// A source is pinned by a committed transition, never by a proof caller.
+    pub fn frozen_source(&self) -> Option<Source> {
+        self.source_anchor.map(|(block, slot, height)| self.source_at(block, slot, height))
+    }
+    pub(crate) fn prepare_source(&mut self, parent: [u8; 32], parent_slot: u64) {
+        if self.asynchronous && self.source_anchor.is_none() && self.native_height > 0 {
+            self.source_anchor = Some((parent, parent_slot, self.native_height));
+        }
     }
     pub fn policy(&self) -> &Policy {
         &self.policy
@@ -142,6 +175,9 @@ impl State {
         self.head
     }
     pub fn source(&self, block: [u8; 32], slot: u64) -> Source {
+        self.frozen_source().unwrap_or_else(|| self.source_at(block, slot, self.native_height))
+    }
+    fn source_at(&self, block: [u8; 32], slot: u64, height: u64) -> Source {
         let previous = self.head.map(|(_, s)| h(&s, S + 448)).unwrap_or([0; 32]);
         let inbox_root = hash(&[b"BLOCH:NATIVE:L2:EMPTY-INBOX:1"]);
         let commitment = hash(&[
@@ -152,13 +188,13 @@ impl State {
             &previous,
             &block,
             &slot.to_le_bytes(),
-            &self.native_height.to_le_bytes(),
+            &height.to_le_bytes(),
             &inbox_root,
         ]);
         Source {
             block,
             slot,
-            height: self.native_height,
+            height,
             commitment,
             inbox_root,
         }
@@ -168,9 +204,24 @@ impl State {
         Ok(())
     }
     pub fn committed_bytes(&self) -> Vec<u8> {
-        let mut out = b"BLOCH:NATIVE:L2:STATE:1".to_vec();
+        let mut out = if self.asynchronous {
+            b"BLOCH:NATIVE:L2:STATE:2".to_vec()
+        } else {
+            b"BLOCH:NATIVE:L2:STATE:1".to_vec()
+        };
         self.policy.encode(&mut out);
         out.extend_from_slice(&self.native_height.to_le_bytes());
+        if self.asynchronous {
+            match self.source_anchor {
+                None => out.push(0),
+                Some((block, slot, height)) => {
+                    out.push(1);
+                    out.extend_from_slice(&block);
+                    out.extend_from_slice(&slot.to_le_bytes());
+                    out.extend_from_slice(&height.to_le_bytes());
+                }
+            }
+        }
         match self.head {
             None => out.push(0),
             Some((digest, statement)) => {
@@ -188,8 +239,12 @@ impl State {
         tx: &Transaction,
         parent: [u8; 32],
         slot: u64,
+        asynchronous: bool,
         verifier: &dyn crate::attestation::SignatureVerifier,
     ) -> Result<(), Reject> {
+        if asynchronous != self.asynchronous || (asynchronous && self.source_anchor.is_none()) {
+            return Err(Reject::NotActive);
+        }
         let s = &tx.statement;
         if !s.starts_with(STATEMENT_TAG)
             || tx.proof_policy != self.policy.proof_policy
@@ -247,6 +302,12 @@ impl State {
             return Err(Reject::Proof);
         }
         self.head = Some((tx.commitment(), *s));
+        self.source_anchor = None;
         Ok(())
+    }
+
+    /// Mempool preflight shares the transition checks and never mutates state.
+    pub fn validate_async(&self, tx: &Transaction, verifier: &dyn crate::attestation::SignatureVerifier) -> Result<(), Reject> {
+        self.clone().apply(tx, [0; 32], 0, true, verifier)
     }
 }

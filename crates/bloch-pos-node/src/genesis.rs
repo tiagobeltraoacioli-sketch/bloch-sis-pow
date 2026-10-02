@@ -38,6 +38,10 @@ const MANIFEST_MAGIC_V1: &[u8; 8] = b"BPOSMAN1";
 /// Byte-identical layout to v1 — only the magic differs, and only the derived
 /// header changes. See [`ManifestFormat`].
 const MANIFEST_MAGIC_V2: &[u8; 8] = b"BPOSMAN2";
+const MANIFEST_MAGIC_V3: &[u8; 8] = b"BPOSMAN3";
+#[path = "genesis_l2.rs"]
+mod l2;
+pub use l2::L2Config;
 
 /// Which genesis-binding rule a manifest's header derivation follows.
 ///
@@ -82,6 +86,8 @@ pub enum ManifestFormat {
     V1Unbound,
     /// `BPOSMAN2` — genesis header bound to the manifest's ledger.
     V2Bound,
+    /// New, unfunded development network with asynchronous L2 settlement.
+    V3L2Async(L2Config),
 }
 
 /// The beacon mix that seeds epoch 0 — fixed before any validator could have
@@ -841,6 +847,7 @@ impl Manifest {
         out.extend_from_slice(match self.format {
             ManifestFormat::V1Unbound => MANIFEST_MAGIC_V1,
             ManifestFormat::V2Bound => MANIFEST_MAGIC_V2,
+            ManifestFormat::V3L2Async(_) => MANIFEST_MAGIC_V3,
         });
         out.extend_from_slice(&self.genesis_time_ms.to_le_bytes());
         out.extend_from_slice(&self.slot_ms.to_le_bytes());
@@ -874,15 +881,19 @@ impl Manifest {
             out.extend_from_slice(&a.amount_sat.to_le_bytes());
             out.extend_from_slice(&a.unlock_epoch.to_le_bytes());
         }
+        if let ManifestFormat::V3L2Async(config) = self.format {
+            out.extend_from_slice(&config.encode());
+        }
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Manifest, crate::codec::DecodeErr> {
         use crate::codec::{DecodeErr, Reader};
         let mut r = Reader::new(bytes);
-        let format = match r.take(8)? {
+        let magic = r.take(8)?;
+        let mut format = match magic {
             m if m == MANIFEST_MAGIC_V1 => ManifestFormat::V1Unbound,
-            m if m == MANIFEST_MAGIC_V2 => ManifestFormat::V2Bound,
+            m if m == MANIFEST_MAGIC_V2 || m == MANIFEST_MAGIC_V3 => ManifestFormat::V2Bound,
             _ => return Err(DecodeErr("not a genesis manifest")),
         };
         let genesis_time_ms = r.u64()?;
@@ -998,6 +1009,12 @@ impl Manifest {
                 amount_sat,
                 unlock_epoch: r.u64()?,
             });
+        }
+        if magic == MANIFEST_MAGIC_V3 {
+            if carryover.is_some() || !allocations.is_empty() || !cohort.is_empty() {
+                return Err(DecodeErr("L2 development manifest cannot carry balances or a cohort"));
+            }
+            format = ManifestFormat::V3L2Async(L2Config::decode(r.take(L2Config::BYTES)?)?);
         }
         r.finish()?;
         Ok(Manifest {
@@ -1247,7 +1264,7 @@ impl Manifest {
     /// rule is still reachable and what it costs.
     pub fn genesis_header(&self) -> BlockHeaderV4 {
         let mut h = self.anchor_header();
-        if self.format == ManifestFormat::V2Bound {
+        if self.format != ManifestFormat::V1Unbound {
             h.state_root = self.genesis_pre_state_root();
         }
         h
@@ -1289,7 +1306,7 @@ impl Manifest {
     pub fn genesis_mix(&self) -> [u8; 32] {
         match self.format {
             ManifestFormat::V1Unbound => GENESIS_MIX,
-            ManifestFormat::V2Bound => {
+            ManifestFormat::V2Bound | ManifestFormat::V3L2Async(_) => {
                 let digest = self.carryover.as_ref().map(|c| c.digest).unwrap_or([0u8; 32]);
                 let mut h = Sha3_256::new();
                 h.update(bloch_pos_committee::params::DS_RANDAO);
@@ -1420,8 +1437,9 @@ impl Manifest {
                 commission_bps: v.commission_bps,
             })
             .collect();
-        CommittedState::genesis_with_network_domain(
-            Sha3_256::digest(self.encode()).into(),
+        let network: [u8; 32] = Sha3_256::digest(self.encode()).into();
+        let state = CommittedState::genesis_with_network_domain(
+            network,
             anchor,
             self.genesis_mix(),
             &vals,
@@ -1440,7 +1458,13 @@ impl Manifest {
                 base_fee_per_gas: 0,
             },
             &self.opening_balances(),
-        )
+        );
+        match self.format {
+            ManifestFormat::V3L2Async(config) => state
+                .configure_l2_genesis_async(config.policy(network, *anchor.as_bytes()))
+                .expect("decoded nonzero L2 genesis policy"),
+            _ => state,
+        }
     }
 
     /// Ingest the Genesis-3 balance snapshot this manifest commits to.
@@ -1708,6 +1732,40 @@ mod tests {
             format: ManifestFormat::V1Unbound,
             pre_state_root: std::sync::OnceLock::new(),
         }
+    }
+
+
+    #[test]
+    fn l2_manifest_binds_policy_and_keeps_legacy_formats_unchanged() {
+        let config = L2Config { identities: [[3;32];5],
+            proof_policy: bloch_l2_proof::policy_commitment(), chain_id: 700771,
+            initial_l2_parent: [4;32], initial_l2_state: [5;32] };
+        let mut manifest = sample(); manifest.cohort.clear();
+        manifest.format = ManifestFormat::V3L2Async(config);
+        let bytes = manifest.encode();
+        let decoded = Manifest::decode(&bytes).unwrap();
+        assert_eq!(decoded.encode(), bytes);
+        let genesis = decoded.genesis_state();
+        assert!(genesis.l2_settlement().unwrap().asynchronous());
+        assert_eq!(genesis.l2_settlement().unwrap().policy().identities[1], *decoded.genesis_id().as_bytes());
+        assert!(genesis.l2_settlement().unwrap().frozen_source().is_none());
+        let mut other = config; other.initial_l2_parent[0] ^= 1;
+        manifest.format = ManifestFormat::V3L2Async(other);
+        manifest.pre_state_root = std::sync::OnceLock::new();
+        assert_ne!(decoded.genesis_id(), manifest.genesis_id());
+        assert!(Manifest::decode(&bytes[..bytes.len()-1]).is_err());
+        assert!(Manifest::decode(&[bytes.clone(), vec![0]].concat()).is_err());
+        manifest.cohort.push(0);
+        assert!(Manifest::decode(&manifest.encode()).is_err());
+        for format in [ManifestFormat::V1Unbound, ManifestFormat::V2Bound] {
+            let mut legacy = sample(); legacy.format = format;
+            let bytes = legacy.encode();
+            let decoded = Manifest::decode(&bytes).unwrap();
+            assert_eq!(decoded.encode(), bytes);
+            assert!(decoded.genesis_state().l2_settlement().is_none());
+        }
+        let mut bad = config.encode(); bad[160] ^= 1;
+        assert!(L2Config::decode(&bad).is_err());
     }
 
     // ── Carryover fixtures ──────────────────────────────────────────────

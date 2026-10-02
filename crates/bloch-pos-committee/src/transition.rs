@@ -306,6 +306,8 @@ pub struct TransferOutput {
 pub enum PosTransaction {
     /// Experimental native settlement (0x0E); rejected without a genesis policy.
     L2Settlement(Box<crate::l2_settlement::Transaction>),
+    /// Manifest-bound asynchronous settlement (0x0F).
+    L2SettlementAsync(Box<crate::l2_settlement::Transaction>),
     /// PQ-authorized, UTXO-funded validator registration (wire 0x0B).
     FundedDeposit(FundedDeposit),
     /// A value transfer against the committed eUTXO set, priced by the L1 fee
@@ -833,6 +835,7 @@ impl PosTransaction {
         };
         match self {
             PosTransaction::L2Settlement(tx) => return tx.encode(),
+            PosTransaction::L2SettlementAsync(tx) => return tx.encode_async(),
             PosTransaction::FundedDeposit(tx) => return tx.canonical_bytes(),
             PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
@@ -1014,6 +1017,10 @@ impl PosTransaction {
         if bytes.first() == Some(&crate::l2_settlement::WIRE_TAG) {
             return crate::l2_settlement::Transaction::decode(bytes)
                 .map(|tx| Self::L2Settlement(Box::new(tx))).ok_or(TxDecodeError::Truncated);
+        }
+        if bytes.first() == Some(&crate::l2_settlement::ASYNC_WIRE_TAG) {
+            return crate::l2_settlement::Transaction::decode_async(bytes)
+                .map(|tx| Self::L2SettlementAsync(Box::new(tx))).ok_or(TxDecodeError::Truncated);
         }
         let mut r = TxReader { b: bytes, i: 0 };
         let tag = r.u8()?;
@@ -2334,6 +2341,13 @@ impl CommittedState {
         self.l2_settlement = Some(crate::l2_settlement::State::genesis(policy)?);
         Ok(self)
     }
+    /// A separate committed mode: existing genesis constructors keep 0x0E semantics.
+    pub fn configure_l2_genesis_async(self, policy: crate::l2_settlement::Policy)
+        -> Result<Self, crate::l2_settlement::Reject> {
+        let mut state = self.configure_l2_genesis(policy.clone())?;
+        state.l2_settlement = Some(crate::l2_settlement::State::genesis_async(policy)?);
+        Ok(state)
+    }
     pub fn l2_settlement(&self) -> Option<&crate::l2_settlement::State> { self.l2_settlement.as_ref() }
 
     pub fn head(&self) -> BlockId {
@@ -3384,10 +3398,11 @@ impl CommittedState {
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, TxReject> {
         match tx {
-            PosTransaction::L2Settlement(tx) => {
+            PosTransaction::L2Settlement(settlement) | PosTransaction::L2SettlementAsync(settlement) => {
+                let asynchronous = matches!(tx, PosTransaction::L2SettlementAsync(_));
                 let state = self.l2_settlement.as_mut()
                     .ok_or(TxReject::L2Settlement(crate::l2_settlement::Reject::NotActive))?;
-                state.apply(tx, *self.head.as_bytes(), self.slot, verifier).map_err(TxReject::L2Settlement)?;
+                state.apply(settlement, *self.head.as_bytes(), self.slot, asynchronous, verifier).map_err(TxReject::L2Settlement)?;
                 // Protocol-only empty-inbox transaction: no synthetic fee credit.
                 // One verification reserves the complete block gas budget.
                 Ok(fee_market::TxCharge { gas: fee_market::BLOCK_GAS_LIMIT,
@@ -5858,8 +5873,13 @@ impl<V: SignatureVerifier> Transition<V> {
         let mut block_bytes: u64 = 0;
         // Satoshis this block bonds without spending an output. See the
         // conservation check at step 11b.
+        // The parent is already committed. Pin it before transactions, and keep
+        // it across all subsequent blocks until a valid proof consumes it.
+        if let Some(l2) = st.l2_settlement.as_mut() {
+            l2.prepare_source(*pre.head.as_bytes(), pre.slot);
+        }
         // Bound proof invocations before any transaction proof is executed.
-        if transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2Settlement(_))).count() > 1 {
+        if transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_))).count() > 1 {
             return Err(TransitionError::BlockGasLimitExceeded);
         }
         let mut unfunded_bonded: u128 = 0;
@@ -13794,7 +13814,7 @@ mod tests {
             PosTransaction::RandaoRecommit { .. } => {}
             // Funded admission transfers UTXO value into bonded stake and fees.
             PosTransaction::FundedDeposit(_) => {}
-            PosTransaction::L2Settlement(_) => {} // Cursor only; no balances.
+            PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => {} // Cursor only; no balances.
         }
 
         // Monotone under blocks and boundaries, and never above the cap.

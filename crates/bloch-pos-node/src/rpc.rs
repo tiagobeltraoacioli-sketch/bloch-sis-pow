@@ -842,6 +842,10 @@ pub enum RpcRequest {
     ChainInfo,
     /// `getbuildinfo` — which binary is answering. Reads no chain state.
     BuildInfo,
+    /// Committed asynchronous settlement source and cursor.
+    L2Settlement,
+    /// Exact public envelope for independent consensus replay.
+    BlockRaw([u8; 32]),
     /// `getblockcount` — the polling method, carrying finality with it.
     BlockCount,
     BlockBySlot(u64),
@@ -1115,6 +1119,8 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
     Ok(match method {
         "getchaininfo" => RpcRequest::ChainInfo,
         "getbuildinfo" => RpcRequest::BuildInfo,
+        "getl2settlement" => RpcRequest::L2Settlement,
+        "getblockraw" => RpcRequest::BlockRaw(want_hex32(params, 0, "block id")?),
         "getblockcount" => RpcRequest::BlockCount,
         "getblockbyslot" => RpcRequest::BlockBySlot(want_u64(params, 0, "slot")?),
         "getblockbyid" => RpcRequest::BlockById(want_hex32(params, 0, "block_id")?),
@@ -1966,6 +1972,7 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
         // post-activation needs the honest name.
         PosTransaction::RandaoRecommit { .. } => "randao_recommit",
         PosTransaction::L2Settlement(_) => "l2_settlement",
+        PosTransaction::L2SettlementAsync(_) => "l2_settlement_async",
     };
     Json::obj(vec![
         ("accepted", Json::Bool(true)),
@@ -2431,5 +2438,28 @@ pub fn validator_admission_json(state: &bloch_pos_committee::transition::Committ
         ("maximum_activations_per_epoch", Json::u(staking::MAX_ACTIVATIONS_PER_EPOCH as u64)),
         ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
         ("legacy_unfunded_deposit_enabled", Json::Bool(false)),
+    ])
+}
+
+/// Public, committed source for the bounded asynchronous proof worker.
+pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedState) -> Json {
+    let Some(l2) = state.l2_settlement() else { return Json::Null; };
+    let policy = l2.policy();
+    let source = l2.frozen_source().map_or(Json::Null, |source| Json::obj(vec![
+        ("block", Json::hex(&source.block)), ("slot", Json::u(source.slot)),
+        ("height", Json::u(source.height)), ("commitment", Json::hex(&source.commitment)),
+        ("inbox_root", Json::hex(&source.inbox_root)),
+        ("request", Json::s(format!("{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            crate::codec::hex32(&policy.identities[0]), crate::codec::hex32(&policy.identities[1]),
+            crate::codec::hex32(&source.block), source.slot, source.height,
+            crate::codec::hex32(&source.commitment), crate::codec::hex32(&source.inbox_root)))),
+    ]));
+    Json::obj(vec![
+        ("asynchronous", Json::Bool(l2.asynchronous())), ("native_height", Json::u(l2.height())),
+        ("network", Json::hex(&policy.identities[0])), ("genesis", Json::hex(&policy.identities[1])),
+        ("chain_id", Json::u(policy.chain_id)), ("source", source),
+        ("accepted", l2.head().map_or(Json::Null, |(commitment, statement)| Json::obj(vec![
+            ("commitment", Json::hex(&commitment)), ("statement", Json::s(crate::codec::hex(&statement))),
+        ]))),
     ])
 }

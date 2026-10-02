@@ -41,6 +41,10 @@ publish = false
 name = "bloch-pos"
 path = "src/main.rs"
 
+[lib]
+test = false
+doctest = false
+
 [features]
 # Phase timers for the end-to-end replay benchmark (src/replay_bench.rs).
 # OFF by default; with it off every span in engine.rs and in the committee

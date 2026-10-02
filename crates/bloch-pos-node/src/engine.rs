@@ -3136,7 +3136,16 @@ impl Engine {
                 return Err(Refusal::Invalid("funded deposit belongs to a different genesis manifest"));
             }
         }
-        admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
+        if let PosTransaction::L2SettlementAsync(settlement) = &tx {
+            let state = self.state.l2_settlement().ok_or(Refusal::Invalid("L2 settlement is not configured"))?;
+            if self.mempool.values().any(|pending| matches!(pending, PosTransaction::L2SettlementAsync(_))) {
+                return Err(Refusal::Invalid("one L2 proof is already pending"));
+            }
+            state.validate_async(settlement, &HybridVerifier::new())
+                .map_err(|_| Refusal::Invalid("L2 settlement policy, source, successor or proof failed"))?;
+        } else {
+            admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
+        }
         if self.funded_mempool_conflict(&tx) {
             return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
         }
@@ -3182,6 +3191,10 @@ impl Engine {
     /// it builds a block every other node rejects — so the epoch comes from
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
+        // A proof reserves the whole gas budget. Never pack it with transfers.
+        if let Some(tx) = self.mempool.values().find(|tx| matches!(tx, PosTransaction::L2SettlementAsync(_))) {
+            return vec![tx.clone()];
+        }
         let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
         let mut out = Vec::new();
         let mut bytes = 0u64;
@@ -4224,6 +4237,11 @@ impl Engine {
 
             // Identity of the binary, not of the chain: no state read, no
             // lock taken, constant cost at any height.
+            RpcRequest::L2Settlement => Ok(rpc::l2_settlement_json(&self.state)),
+            RpcRequest::BlockRaw(id) => {
+                let env = self.envelope_by_id(&id).ok_or_else(|| RpcError::new(rpc::BLOCK_NOT_FOUND, "unknown block"))?;
+                Ok(rpc::Json::s(crate::codec::hex(&crate::codec::encode_envelope(&env))))
+            }
             RpcRequest::BuildInfo => Ok(rpc::build_info_json()),
             RpcRequest::MempoolInfo => Ok(rpc::mempool_info_json(
                 self.mempool.len(),
@@ -5562,7 +5580,7 @@ fn declared_size_bound(tx: &PosTransaction, declared: u64) -> Result<(), &'stati
 
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     match tx {
-        PosTransaction::L2Settlement(_) => Err("native L2 settlement is not enabled by a shipping genesis manifest"),
+        PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => Err("native L2 settlement is not enabled by a shipping genesis manifest"),
         PosTransaction::FundedDeposit(deposit) => {
             if !bloch_pos_committee::params::funded_validator_admission_active(wall_epoch) {
                 return Err("funded validator admission is not active: FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH is unarmed or not reached");

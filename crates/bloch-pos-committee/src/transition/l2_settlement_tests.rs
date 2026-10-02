@@ -32,7 +32,8 @@ mod l2_tests {
             bloch_l2_proof::verify(policy, key, values, proof)
         }
     }
-    fn fixture() -> (CommittedState, Vec<RandaoChain>) {
+    fn fixture() -> (CommittedState, Vec<RandaoChain>) { fixture_mode(false) }
+    fn fixture_mode(asynchronous: bool) -> (CommittedState, Vec<RandaoChain>) {
         let (_, mut genesis, mut chains) = setup(4);
         let identities = std::array::from_fn(|i| hash_at(TEMPLATE, S + i * 32));
         let mut policy = Policy {
@@ -45,7 +46,7 @@ mod l2_tests {
         policy.identities[0] = [0x91; 32];
         policy.identities[1] = *genesis.head.as_bytes();
         genesis.admission_network_domain = Some(policy.identities[0]);
-        genesis = genesis.configure_l2_genesis(policy).unwrap();
+        genesis = if asynchronous { genesis.configure_l2_genesis_async(policy) } else { genesis.configure_l2_genesis(policy) }.unwrap();
         let t = Transition::new(ToyVerifier);
         let first = build_block(&t, &genesis, 1, &[], &[], &mut chains);
         let pre = t.apply_block(&genesis, &first, &[], &[]).unwrap();
@@ -372,5 +373,58 @@ mod l2_tests {
             .advance_height()
             .unwrap();
         assert_ne!(changed.state_root(), base);
+    }
+
+    #[test]
+    fn async_source_survives_skipped_slots_and_rotates_only_after_acceptance() {
+        let (mut pre, mut chains) = fixture_mode(true);
+        assert!(pre.l2_settlement().unwrap().frozen_source().is_none());
+        let anchor = *pre.head().as_bytes();
+        let t = Transition::new(ProofDouble);
+        for slot in [2, 7, 12] {
+            let block = build_block(&t, &pre, slot, &[], &[], &mut chains);
+            pre = t.apply_block(&pre, &block, &[], &[]).unwrap();
+            let source = pre.l2_settlement().unwrap().frozen_source().unwrap();
+            assert_eq!((source.block, source.slot, source.height), (anchor, 1, 1));
+        }
+        let old_source = pre.l2_settlement().unwrap().frozen_source().unwrap();
+        let tx = PosTransaction::L2SettlementAsync(Box::new(transaction(&pre)));
+        assert_eq!(tx.canonical_bytes()[0], 0x0f);
+        assert_eq!(PosTransaction::from_canonical_bytes(&tx.canonical_bytes()).unwrap(), tx);
+        let before = pre.state_root();
+        let block = build_block(&t, &pre, 15, &[], std::slice::from_ref(&tx), &mut chains);
+        let post = t.apply_block(&pre, &block, &[], std::slice::from_ref(&tx)).unwrap();
+        assert_eq!(pre.state_root(), before);
+        assert!(post.l2_settlement().unwrap().frozen_source().is_none());
+        assert!(post.clone().apply_transaction(&tx, 0, 1, &ProofDouble).is_err());
+        let next = build_block(&t, &post, 16, &[], &[], &mut chains);
+        let next_state = t.apply_block(&post, &next, &[], &[]).unwrap();
+        let source = next_state.l2_settlement().unwrap().frozen_source().unwrap();
+        assert_eq!(source.block, *post.head().as_bytes());
+        assert_eq!(source.height, post.l2_settlement().unwrap().height());
+        assert_ne!(source.commitment, old_source.commitment);
+        assert_eq!(post.accounted_supply_sat(), pre.accounted_supply_sat());
+        assert_eq!(t.apply_block(&pre, &block, &[], &[tx]).unwrap(), post);
+    }
+    #[test]
+    fn async_mode_source_and_proof_fail_closed_without_state_mutation() {
+        let (pre, _) = fixture();
+        let tx = transaction(&pre);
+        assert!(pre.clone().apply_transaction(&PosTransaction::L2SettlementAsync(Box::new(tx)), 0, 1, &ProofDouble).is_err());
+        let (pre, mut chains) = fixture_mode(true);
+        let t = Transition::new(ProofDouble);
+        let block = build_block(&t, &pre, 2, &[], &[], &mut chains);
+        let pre = t.apply_block(&pre, &block, &[], &[]).unwrap();
+        let original = transaction(&pre);
+        assert!(pre.clone().apply_transaction(&PosTransaction::L2Settlement(Box::new(original.clone())), 0, 1, &ProofDouble).is_err());
+        for offset in [S, S+32, S+224, S+264, S+400, S+432, S+440, S+448, S+512] {
+            let mut changed = original.clone(); changed.statement[offset] ^= 1;
+            let mut state = pre.clone();
+            assert!(state.apply_transaction(&PosTransaction::L2SettlementAsync(Box::new(changed)), 0, 1, &ProofDouble).is_err());
+            assert_eq!(state, pre);
+        }
+        let mut state = pre.clone();
+        assert!(state.apply_transaction(&PosTransaction::L2SettlementAsync(Box::new(original)), 0, 1, &RealProof).is_err());
+        assert_eq!(state, pre);
     }
 }

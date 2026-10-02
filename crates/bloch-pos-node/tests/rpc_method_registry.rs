@@ -93,6 +93,8 @@ use std::path::PathBuf;
 const ROUTED: &[(&str, &str)] = &[
     ("getchaininfo", "ChainInfo"),
     ("getbuildinfo", "BuildInfo"),
+    ("getl2settlement", "L2Settlement"),
+    ("getblockraw", "BlockRaw"),
     ("getblockcount", "BlockCount"),
     ("getblockbyslot", "BlockBySlot"),
     ("getblockbyid", "BlockById"),
