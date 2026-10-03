@@ -8,6 +8,25 @@ use bloch_pos_committee::transition::{
     ValidatorCommissionUpdate,
 };
 
+#[test]
+fn delegation_wallet_rpc_is_owner_scoped_and_reports_real_gate_and_delays() {
+    let (mut node, _dir, owner, _) = fixture();
+    let hash: [u8;32] = Sha3_256::digest(&owner.pubkey).into();
+    let response = node.serve_rpc(rpc::RpcRequest::DelegationWallet {owner:hash,cursor:0}).unwrap();
+    assert_eq!(response.get("schema").and_then(rpc::Json::as_str),Some("bloch.delegation-wallet.v1"));
+    assert_eq!(response.get("owner_pubkey_hash"),Some(&rpc::Json::hex(&hash)));
+    assert_eq!(response.get("active"),Some(&rpc::Json::Bool(false)));
+    assert_eq!(response.get("withdrawal_delay_epochs"),Some(&rpc::Json::u(2048)));
+    assert_eq!(response.get("cooldown_epochs"),Some(&rpc::Json::u(32)));
+    assert_eq!(response.get("next_cursor"),Some(&rpc::Json::Null));
+    let rpc::Json::Arr(utxos)=response.get("utxos").unwrap() else {panic!()};
+    assert_eq!(utxos.len(),1);
+    let other=node.serve_rpc(rpc::RpcRequest::DelegationWallet {owner:[0xab;32],cursor:0}).unwrap();
+    assert_eq!(other.get("utxos"),Some(&rpc::Json::Arr(vec![])));
+    assert!(rpc::route("getdelegationwallet",Some(&rpc::Json::Arr(vec![rpc::Json::hex(&hash),rpc::Json::u(u64::MAX)]))).is_err());
+    assert!(rpc::route("getdelegationwallet",Some(&rpc::Json::Arr(vec![rpc::Json::s("bad"),rpc::Json::u(0)]))).is_err());
+}
+
 fn fixture() -> (Engine, perf_support::TestDir, Keystore, FundedDelegate) {
     let (mut node, dir) = perf_support::proposing_engine();
     let owner =

@@ -89,6 +89,7 @@ fn frozen_method_space(req: &RpcRequest) -> &'static str {
         RpcRequest::ValidatorByKey(_) => "getvalidatorbykey",
         RpcRequest::ValidatorAdmission => "getvalidatoradmission",
         RpcRequest::FundedDelegation(_) => "getfundeddelegation",
+        RpcRequest::DelegationWallet { .. } => "getdelegationwallet",
         RpcRequest::Balance(_) => "getbalance",
         RpcRequest::Utxos { .. } => "getutxos",
         RpcRequest::TxOut { .. } => "gettxout",
@@ -151,6 +152,7 @@ fn every_frozen_variant_routes_under_its_registered_name() {
     let hex32 = "ab".repeat(32);
     let cases: &[(&str, &str)] = &[
         ("getfundeddelegation", "[0]"),
+        ("getdelegationwallet", "[\"0000000000000000000000000000000000000000000000000000000000000000\",0]"),
         ("getchaininfo", "[]"),
         ("getbuildinfo", "[]"),
         ("getblockcount", "[]"),

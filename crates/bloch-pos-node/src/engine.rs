@@ -5400,6 +5400,7 @@ impl Engine {
             RpcRequest::ValidatorByKey(hash) => rpc::validator_by_key_json(&self.state, &hash),
             RpcRequest::ValidatorAdmission => Ok(rpc::validator_admission_json(&self.state)),
             RpcRequest::FundedDelegation(position) => Ok(rpc::funded_delegation_json(&self.state, position)),
+            RpcRequest::DelegationWallet { owner, cursor } => Ok(rpc::delegation_wallet_json(&self.state, &owner, cursor)),
             RpcRequest::Validator(index) => rpc::validator_record_json(&self.state, index),
 
             RpcRequest::ValidatorCount => Ok(rpc::validator_count_json(&self.state)),

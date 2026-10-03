@@ -877,6 +877,7 @@ fn hex32_from(s: &str) -> Option<[u8; 32]> {
 /// has already been decided.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RpcRequest {
+    DelegationWallet { owner: [u8; 32], cursor: u32 },
     ChainInfo,
     /// `getbuildinfo` — which binary is answering. Reads no chain state.
     BuildInfo,
@@ -1115,6 +1116,7 @@ impl EngineBackend {
             | RpcRequest::ValidatorByKey(_)
             | RpcRequest::ValidatorAdmission
             | RpcRequest::FundedDelegation(_)
+            | RpcRequest::DelegationWallet { .. }
             | RpcRequest::Validators => {}
             _ => return None,
         }
@@ -1135,6 +1137,7 @@ impl EngineBackend {
             RpcRequest::ValidatorByKey(hash) => Some(validator_by_key_json(&state, hash)),
             RpcRequest::ValidatorAdmission => Some(Ok(validator_admission_json(&state))),
             RpcRequest::FundedDelegation(position) => Some(Ok(funded_delegation_json(&state, *position))),
+            RpcRequest::DelegationWallet { owner, cursor } => Some(Ok(delegation_wallet_json(&state, owner, *cursor))),
             RpcRequest::Validators => Some(Ok(validator_registry_json(&state))),
             RpcRequest::TxOut { txid, vout } => Some(Ok(txout_json(&state, txid, *vout))),
             RpcRequest::Balance(script_hash) => Some(Ok(balance_json(&state, script_hash))),
@@ -1280,6 +1283,7 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
         "getvalidatorbykey" => RpcRequest::ValidatorByKey(want_hex32(params, 0, "pubkey_hash")?),
         "getvalidatoradmission" => RpcRequest::ValidatorAdmission,
         "getfundeddelegation" => RpcRequest::FundedDelegation(want_u32(params, 0, "position")?),
+        "getdelegationwallet" => RpcRequest::DelegationWallet { owner: want_hex32(params, 0, "owner")?, cursor: want_u32(params, 1, "cursor")? },
         "getbalance" => RpcRequest::Balance(want_hex32(params, 0, "script_hash")?),
         // Refused on purpose, and permanently for this build. See the doc
         // comments on the two constructors for the full reasoning.
@@ -2792,6 +2796,10 @@ pub fn validator_admission_json(state: &bloch_pos_committee::transition::Committ
 /// Clients must confirm the containing transaction's finality with gettxstatus.
 pub fn funded_delegation_json(state: &CommittedState, position: u32) -> Json {
     let Some(view) = state.funded_delegation_view(position) else { return Json::Null; };
+    funded_position_json(state, position, view)
+}
+
+fn funded_position_json(state: &CommittedState, position: u32, view: bloch_pos_committee::transition::funded_delegation::FundedDelegationView) -> Json {
     let d = view.delegation;
     let epoch = epoch_of(state.slot());
     Json::obj(vec![
@@ -2813,5 +2821,43 @@ pub fn funded_delegation_json(state: &CommittedState, position: u32) -> Json {
         ("issuance_rewards_sat", Json::sat(state.delegator_issuance_reward_sat(d.delegator))),
         ("slash_losses_sat", Json::sat(state.delegator_slash_loss_sat(d.delegator))),
         ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
+    ])
+}
+
+/// One committed snapshot, bounded discovery and protocol parameters. It is
+/// an observer's head view, never a proof that an operation has settled.
+pub fn delegation_wallet_json(state: &CommittedState, owner: &[u8; 32], cursor: u32) -> Json {
+    use bloch_pos_committee::{params, delegation, staking, transition::funded_delegation::MAX_FUNDED_DELEGATION_PER_VALIDATOR_SAT};
+    let epoch = epoch_of(state.slot());
+    let (positions, next) = state.funded_delegation_page(owner, cursor);
+    let reserved = state.funded_delegation_reserved();
+    let validators = (0..state.validator_count().min(512) as u32).filter_map(|index| {
+        let rec = state.validator_record(index)?;
+        let mut row = validator_json(&rec, None, epoch);
+        if let Json::Obj(fields) = &mut row { fields.push(("reserved_delegation_sat".into(), Json::sat(*reserved.get(&index).unwrap_or(&0)))); }
+        Some(row)
+    }).collect();
+    Json::obj(vec![
+        ("schema", Json::s("bloch.delegation-wallet.v1")),
+        ("network_domain", state.admission_network_domain().map_or(Json::Null, |d| Json::hex(&d))),
+        ("owner_pubkey_hash", Json::hex(owner)),
+        ("as_of_slot", Json::u(state.slot())), ("epoch", Json::u(epoch)),
+        ("finalized_epoch", Json::u(state.finality().finalized.epoch)),
+        ("finalized_root", Json::hex(&state.finality().finalized.root)),
+        ("active", Json::Bool(params::epoch_gate_active(epoch, params::FUNDED_DELEGATION_ACTIVATION_EPOCH))),
+        ("activation_epoch", Json::u(params::FUNDED_DELEGATION_ACTIVATION_EPOCH)),
+        ("cooldown_epochs", Json::u(delegation::COOLDOWN_EPOCHS)),
+        ("withdrawal_delay_epochs", Json::u(staking::WITHDRAWAL_DELAY_EPOCHS)),
+        ("slots_per_epoch", Json::u(SLOTS_PER_EPOCH)),
+        ("slot_duration_ms", Json::u(params::SLOT_DURATION_SECS * 1000)),
+        ("minimum_delegation_sat", Json::sat(delegation::MIN_DELEGATION_SAT)),
+        ("maximum_validator_delegation_sat", Json::sat(MAX_FUNDED_DELEGATION_PER_VALIDATOR_SAT)),
+        ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
+        ("positions", Json::Arr(positions.into_iter().map(|(p, v)| funded_position_json(state, p, v)).collect())),
+        ("next_cursor", next.map_or(Json::Null, |c| Json::u(c.into()))),
+        ("validators", Json::Arr(validators)),
+        ("validators_truncated", Json::Bool(state.validator_count() > 512)),
+        ("utxos", Json::Arr(state.utxos_for_script(owner).take(128).map(eutxo_json).collect())),
+        ("utxos_truncated", Json::Bool(state.utxo_count_for_script(owner) > 128)),
     ])
 }

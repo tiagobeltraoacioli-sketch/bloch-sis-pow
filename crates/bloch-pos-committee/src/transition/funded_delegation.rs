@@ -443,6 +443,41 @@ pub struct FundedDelegationView {
 }
 
 impl CommittedState {
+    /// Bounded discovery for wallets. The cursor visits at most 512 registry
+    /// entries, including other owners; activation is resolved once per page.
+    /// This is a read projection and does not add consensus state or indexes.
+    pub fn funded_delegation_page(&self, owner: &[u8; 32], cursor: u32) -> (Vec<(u32, FundedDelegationView)>, Option<u32>) {
+        let start = (cursor as usize).min(self.delegations.len());
+        let end = start.saturating_add(512).min(self.delegations.len());
+        let registry = delegation::Registry::resolve(&self.delegations, self.epoch);
+        let mut rows = Vec::new();
+        let mut next = end;
+        for position in start..end {
+            let d = self.delegations[position];
+            if self.funded_delegation_owners.get(&d.delegator) != Some(owner) { continue; }
+            let (inactive, withdrawn) = self.funded_delegation_lifecycle.get(&(position as u32)).copied().unwrap_or((u64::MAX, false));
+            let inactive_since = (inactive != u64::MAX).then_some(inactive);
+            rows.push((position as u32, FundedDelegationView {
+                delegation: d, owner: *owner, activated_sat: registry.activated_sat(&d),
+                inactive_since, withdrawable_epoch: inactive_since.and_then(|e| e.checked_add(staking::WITHDRAWAL_DELAY_EPOCHS)), withdrawn,
+            }));
+            if rows.len() == 128 { next = position + 1; break; }
+        }
+        (rows, (next < self.delegations.len()).then_some(next as u32))
+    }
+
+    /// Capacity includes every unwithdrawn position, as admission does.
+    pub fn funded_delegation_reserved(&self) -> std::collections::BTreeMap<u32, u128> {
+        let mut totals = std::collections::BTreeMap::<u32, u128>::new();
+        for (position, d) in self.delegations.iter().enumerate() {
+            if !self.funded_delegation_lifecycle.get(&(position as u32)).is_some_and(|(_, withdrawn)| *withdrawn) {
+                let total = totals.entry(d.validator).or_default();
+                *total = total.saturating_add(d.amount_sat);
+            }
+        }
+        totals
+    }
+
     pub fn funded_delegation_view(&self, position: u32) -> Option<FundedDelegationView> {
         let delegation = *self.delegations.get(position as usize)?;
         let owner = *self.funded_delegation_owners.get(&delegation.delegator)?;
@@ -771,6 +806,24 @@ impl CommittedState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wallet_discovery_is_owner_bound_paginated_and_preserves_withdrawn_history() {
+        let (_, mut state, _) = crate::transition::tests::setup(4);
+        state.delegations.clear();
+        for index in 0..700u32 {
+            state.delegations.push(Delegation {delegator:index,validator:0,amount_sat:delegation::MIN_DELEGATION_SAT,requested_epoch:1,deactivate_epoch:None,eligible:false});
+            state.funded_delegation_owners.insert(index, if index < 600 {[1;32]} else {[2;32]});
+        }
+        state.funded_delegation_lifecycle.insert(0,(0,true));
+        let (first,next)=state.funded_delegation_page(&[1;32],0);
+        assert_eq!(first.len(),128);assert_eq!(next,Some(128));assert!(first[0].1.withdrawn);
+        assert_eq!(state.funded_delegation_reserved()[&0],699*delegation::MIN_DELEGATION_SAT);
+        let (empty,next)=state.funded_delegation_page(&[2;32],0);assert!(empty.is_empty());assert_eq!(next,Some(512));
+        let (second,next)=state.funded_delegation_page(&[2;32],512);assert_eq!(second.len(),100);assert_eq!(second[0].0,600);assert_eq!(next,None);
+        assert!(second.iter().all(|(_,v)|v.owner==[2;32]));
+        assert_eq!(state.funded_delegation_page(&[1;32],u32::MAX).1,None);
+    }
 
     fn key(tag: u8) -> Vec<u8> {
         let mut key = vec![tag; KEY_BYTES];

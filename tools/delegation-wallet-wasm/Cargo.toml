@@ -1,0 +1,17 @@
+[package]
+name = "bloch-delegation-wallet-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+bloch-pos-committee = { path = "../../crates/bloch-pos-committee" }
+bloch-crypto = { path = "../../crates/bloch-crypto", default-features = false }
+sha3 = "0.10"
+zeroize = "1"
+hex = "0.4"
+serde_json = "1"

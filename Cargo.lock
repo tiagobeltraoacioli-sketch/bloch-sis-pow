@@ -1534,6 +1534,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloch-delegation-wallet-wasm"
+version = "0.1.0"
+dependencies = [
+ "bloch-crypto",
+ "bloch-pos-committee",
+ "hex",
+ "serde_json",
+ "sha3 0.10.9",
+ "zeroize",
+]
+
+[[package]]
 name = "bloch-euvm"
 version = "0.0.1"
 dependencies = [
