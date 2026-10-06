@@ -1155,8 +1155,8 @@ fn genesis_cmd(args: &[String]) {
         if flag != "--dev-allocation" {
             continue;
         }
-        if !matches!(format, genesis::ManifestFormat::V3L2Async(_)) {
-            eprintln!("genesis: --dev-allocation is only valid for BPOSMAN3 development manifests");
+        if !matches!(format, genesis::ManifestFormat::V3L2Async(_)) || !cfg!(feature = "devnet-l2-deposits") {
+            eprintln!("genesis: --dev-allocation needs a BPOSMAN3 manifest and a devnet-l2-deposits build");
             exit(2);
         }
         let value = flags.next().unwrap_or_else(|| { eprintln!("genesis: --dev-allocation needs SCRIPT_HASH:SATS"); exit(2) });

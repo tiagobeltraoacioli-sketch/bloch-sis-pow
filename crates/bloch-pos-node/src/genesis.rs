@@ -1011,7 +1011,12 @@ impl Manifest {
             });
         }
         if magic == MANIFEST_MAGIC_V3 {
-            if carryover.is_some() || !allocations.is_empty() || !cohort.is_empty() {
+            // Development deposit builds may fund test accounts at genesis;
+            // carryover and cohort stay refused for every L2 development manifest.
+            if carryover.is_some()
+                || !cohort.is_empty()
+                || (!allocations.is_empty() && !cfg!(feature = "devnet-l2-deposits"))
+            {
                 return Err(DecodeErr("L2 development manifest cannot carry balances or a cohort"));
             }
             format = ManifestFormat::V3L2Async(L2Config::decode(r.take(L2Config::BYTES)?)?);
