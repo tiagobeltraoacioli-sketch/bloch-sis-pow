@@ -21,6 +21,9 @@ perf-timing = []
 # lifecycle gates unchanged). A node built with it refuses non-BPOSMAN3
 # manifests. Never enable it for Genesis-4 or any funded network.
 devnet-randao-recommit = []
+# DEVELOPMENT NETWORKS ONLY. Native L2 deposits: escrowed BLCH appended to the
+# L2 inbox, and settlements must mint exactly the consumed inbox records.
+devnet-l2-deposits = []
 
 [dependencies]
 sha3 = { version = "0.10", default-features = false }

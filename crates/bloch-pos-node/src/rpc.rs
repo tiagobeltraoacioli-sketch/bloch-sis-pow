@@ -1973,6 +1973,7 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
         PosTransaction::RandaoRecommit { .. } => "randao_recommit",
         PosTransaction::L2Settlement(_) => "l2_settlement",
         PosTransaction::L2SettlementAsync(_) => "l2_settlement_async",
+        PosTransaction::L2Deposit(_) => "l2_deposit",
     };
     Json::obj(vec![
         ("accepted", Json::Bool(true)),
@@ -2449,6 +2450,15 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
         ("block", Json::hex(&source.block)), ("slot", Json::u(source.slot)),
         ("height", Json::u(source.height)), ("commitment", Json::hex(&source.commitment)),
         ("inbox_root", Json::hex(&source.inbox_root)),
+        ("inbox_count", Json::u(source.inbox_count)),
+        ("consumed_start", Json::u(l2.consumed())),
+        ("consumed_end", Json::u(l2.consumed() + l2.pending_for(&source).len() as u64)),
+        // The exact records the next settlement must mint, in order.
+        ("pending", Json::Arr(l2.pending_for(&source).iter().map(|r| Json::obj(vec![
+            ("height", Json::u(r.height)), ("tx_index", Json::u(u64::from(r.tx_index))),
+            ("txid", Json::hex(&r.txid)), ("vout", Json::u(u64::from(r.vout))),
+            ("sats", Json::u(r.sats)), ("recipient", Json::s(crate::codec::hex(&r.recipient))),
+        ])).collect())),
         ("request", Json::s(format!("{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             crate::codec::hex32(&policy.identities[0]), crate::codec::hex32(&policy.identities[1]),
             crate::codec::hex32(&source.block), source.slot, source.height,
@@ -2458,6 +2468,10 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
         ("asynchronous", Json::Bool(l2.asynchronous())), ("native_height", Json::u(l2.height())),
         ("network", Json::hex(&policy.identities[0])), ("genesis", Json::hex(&policy.identities[1])),
         ("chain_id", Json::u(policy.chain_id)), ("source", source),
+        ("inbox", Json::obj(vec![
+            ("count", Json::u(l2.inbox().len() as u64)), ("consumed", Json::u(l2.consumed())),
+            ("escrow_sat", Json::s(l2.escrow_sat().to_string())),
+        ])),
         ("accepted", l2.head().map_or(Json::Null, |(commitment, statement)| Json::obj(vec![
             ("commitment", Json::hex(&commitment)), ("statement", Json::s(crate::codec::hex(&statement))),
         ]))),

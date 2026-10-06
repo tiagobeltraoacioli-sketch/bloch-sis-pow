@@ -330,6 +330,8 @@ const TX_TAGS: &[(u8, Status)] = &[
     // New experimental format; no shipping genesis enables this rule.
     (0x0E, Status::Released { name: "L2Settlement", rivals: NO_RIVALS }),
     (0x0F, Status::Released { name: "L2SettlementAsync", rivals: NO_RIVALS }),
+    // Development networks only (`devnet-l2-deposits`); inert otherwise.
+    (0x10, Status::Released { name: "L2Deposit", rivals: NO_RIVALS }),
 ];
 
 /// Three lineages that all intend the SAME flag day disagree on all three
@@ -523,6 +525,7 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         PosTransaction::FundedDeposit(_) => 0x0B,
         PosTransaction::L2Settlement(_) => 0x0E,
         PosTransaction::L2SettlementAsync(_) => 0x0F,
+        PosTransaction::L2Deposit(_) => 0x10,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }

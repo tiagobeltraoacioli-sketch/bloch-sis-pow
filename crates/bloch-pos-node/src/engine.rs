@@ -498,6 +498,7 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
         PosTransaction::Transfer { tip_millisat_per_gas, .. }
         | PosTransaction::TransferV2 { tip_millisat_per_gas, .. } => *tip_millisat_per_gas,
         PosTransaction::FundedDeposit(tx) => tx.tip_millisat_per_gas,
+        PosTransaction::L2Deposit(tx) => tx.tip_millisat_per_gas,
         _ => 0,
     }
 }
@@ -525,6 +526,7 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
             Some(Sha3_256::digest(pk).into())
         }
         PosTransaction::FundedDeposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::L2Deposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         _ => None,
     }
 }
@@ -2798,6 +2800,7 @@ impl Engine {
                 Some(inputs.iter().map(|i| (i.txid, i.vout)).collect())
             }
             PosTransaction::FundedDeposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::L2Deposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             _ => None,
         }
     }
@@ -3234,6 +3237,7 @@ impl Engine {
                 PosTransaction::Transfer { tx_bytes, .. }
                 | PosTransaction::TransferV2 { tx_bytes, .. } => *tx_bytes,
                 PosTransaction::FundedDeposit(tx) => tx.tx_bytes,
+                PosTransaction::L2Deposit(tx) => tx.tx_bytes,
                 _ => 0,
             };
             let n = (encoded.len() as u64).max(declared);
@@ -5439,6 +5443,17 @@ fn declared_size_bound(tx: &PosTransaction, declared: u64) -> Result<(), &'stati
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     match tx {
         PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => Err("native L2 settlement is not enabled by a shipping genesis manifest"),
+        PosTransaction::L2Deposit(deposit) => {
+            if !cfg!(feature = "devnet-l2-deposits") {
+                return Err("native L2 deposits are not enabled in this build");
+            }
+            // State checks (inputs, ownership, conservation) run in consensus.
+            if HybridVerifier::new().verify_with_key(&deposit.funding_pubkey, &deposit.intent_root(), &deposit.signature) {
+                Ok(())
+            } else {
+                Err("invalid L2 deposit hybrid PQ authorization")
+            }
+        }
         PosTransaction::FundedDeposit(deposit) => {
             if !bloch_pos_committee::params::funded_validator_admission_active(wall_epoch) {
                 return Err("funded validator admission is not active: FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH is unarmed or not reached");

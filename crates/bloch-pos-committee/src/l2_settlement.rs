@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Native, parent-state-owned settlement validation for an empty L2 inbox.
-//! No native locks, bridge mint/release, withdrawals or production activation.
-use sha3::{Digest, Sha3_256};
+//! Native, parent-state-owned settlement validation for the L2 inbox.
+//! With `devnet-l2-deposits`, native L2 deposits (escrowed BLCH) append to an
+//! ordered inbox and each settlement must mint exactly the next inbox records.
+//! No bridge release, withdrawals or production activation.
+use sha3::{Digest, Keccak256, Sha3_256};
 
 pub const WIRE_TAG: u8 = 0x0e;
 /// Asynchronous settlement, enabled only by a new manifest-bound genesis.
@@ -11,6 +13,93 @@ pub const STATEMENT_BYTES: usize = 590;
 pub const PROOF_BYTES: usize = 356;
 pub const TRANSACTION_BYTES: usize = 1 + 32 + STATEMENT_BYTES + PROOF_BYTES;
 const S: usize = STATEMENT_TAG.len();
+/// Records one settlement must consume, when pending: min(pending, this).
+pub const MAX_INBOX_PER_SETTLEMENT: u64 = 64;
+/// Exact L2 body framing tag (`bloch_l2_evm::node_primitives::NodeBodyV2`).
+const L2_BODY_TAG: &[u8] = b"BLOCH:EVM:BODY:2";
+
+/// One escrowed native deposit, in inbox order. Its fields are exactly the
+/// L2 `DepositProvenance::BridgedBlch` plus the EVM recipient.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InboxRecord {
+    /// Native height of the block containing the deposit transaction.
+    pub height: u64,
+    /// Position of the deposit among deposits in that block.
+    pub tx_index: u32,
+    pub txid: [u8; 32],
+    /// Output index of the escrow (after any change outputs).
+    pub vout: u32,
+    pub sats: u64,
+    pub recipient: [u8; 20],
+}
+impl InboxRecord {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(76);
+        out.extend_from_slice(&self.height.to_le_bytes());
+        out.extend_from_slice(&self.tx_index.to_le_bytes());
+        out.extend_from_slice(&self.txid);
+        out.extend_from_slice(&self.vout.to_le_bytes());
+        out.extend_from_slice(&self.sats.to_le_bytes());
+        out.extend_from_slice(&self.recipient);
+        out
+    }
+}
+
+fn empty_inbox_root() -> [u8; 32] {
+    hash(&[b"BLOCH:NATIVE:L2:EMPTY-INBOX:1"])
+}
+
+// Minimal RLP, sufficient for the fixed L2 body shape.
+fn rlp_length(out: &mut Vec<u8>, offset: u8, len: usize) {
+    if len < 56 {
+        out.push(offset + len as u8);
+    } else {
+        let be = (len as u64).to_be_bytes();
+        let skip = be.iter().take_while(|b| **b == 0).count();
+        out.push(offset + 55 + (8 - skip) as u8);
+        out.extend_from_slice(&be[skip..]);
+    }
+}
+fn rlp_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.len() == 1 && bytes[0] < 0x80 {
+        out.push(bytes[0]);
+    } else {
+        rlp_length(out, 0x80, bytes.len());
+        out.extend_from_slice(bytes);
+    }
+}
+fn rlp_uint(out: &mut Vec<u8>, value: u64) {
+    let be = value.to_be_bytes();
+    let skip = be.iter().take_while(|b| **b == 0).count();
+    rlp_bytes(out, &be[skip..]);
+}
+fn rlp_list(out: &mut Vec<u8>, payload: &[u8]) {
+    rlp_length(out, 0xc0, payload.len());
+    out.extend_from_slice(payload);
+}
+
+/// `keccak256(rlp(NodeBodyV2 { deposits: records, transactions: [] }))`:
+/// the only body a settlement may prove while it consumes these records.
+pub fn expected_body_commitment(records: &[InboxRecord]) -> [u8; 32] {
+    let mut deposits = Vec::new();
+    for r in records {
+        let mut fields = Vec::new();
+        rlp_bytes(&mut fields, &r.recipient);
+        rlp_uint(&mut fields, r.height);
+        rlp_uint(&mut fields, u64::from(r.tx_index));
+        rlp_bytes(&mut fields, &r.txid);
+        rlp_uint(&mut fields, u64::from(r.vout));
+        rlp_uint(&mut fields, r.sats);
+        rlp_list(&mut deposits, &fields);
+    }
+    let mut payload = Vec::new();
+    rlp_bytes(&mut payload, L2_BODY_TAG);
+    rlp_list(&mut payload, &deposits);
+    rlp_list(&mut payload, &[]);
+    let mut body = Vec::new();
+    rlp_list(&mut body, &payload);
+    Keccak256::digest(&body).into()
+}
 
 /// One canonical native transaction. Length is fixed before allocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +207,8 @@ pub struct Source {
     pub height: u64,
     pub commitment: [u8; 32],
     pub inbox_root: [u8; 32],
+    /// Inbox records known at the source (the root commits to all of them).
+    pub inbox_count: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
@@ -125,7 +216,12 @@ pub struct State {
     native_height: u64,
     head: Option<([u8; 32], [u8; STATEMENT_BYTES])>,
     asynchronous: bool,
-    source_anchor: Option<([u8; 32], u64, u64)>,
+    /// (block, slot, height, inbox count, inbox root) frozen at the anchor.
+    source_anchor: Option<([u8; 32], u64, u64, u64, [u8; 32])>,
+    inbox: Vec<InboxRecord>,
+    inbox_root: [u8; 32],
+    consumed: u64,
+    escrow_sat: u128,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -136,6 +232,8 @@ pub enum Reject {
     Height,
     NotActive,
     Limit,
+    /// The proven L2 body does not mint exactly the consumed inbox records.
+    Deposits,
 }
 impl State {
     pub fn genesis(policy: Policy) -> Result<Self, Reject> {
@@ -148,6 +246,10 @@ impl State {
             head: None,
             asynchronous: false,
             source_anchor: None,
+            inbox: Vec::new(),
+            inbox_root: empty_inbox_root(),
+            consumed: 0,
+            escrow_sat: 0,
         })
     }
     pub(crate) fn genesis_async(policy: Policy) -> Result<Self, Reject> {
@@ -158,12 +260,42 @@ impl State {
     pub fn asynchronous(&self) -> bool { self.asynchronous }
     /// A source is pinned by a committed transition, never by a proof caller.
     pub fn frozen_source(&self) -> Option<Source> {
-        self.source_anchor.map(|(block, slot, height)| self.source_at(block, slot, height))
+        self.source_anchor
+            .map(|(block, slot, height, count, root)| self.source_at(block, slot, height, count, root))
     }
     pub(crate) fn prepare_source(&mut self, parent: [u8; 32], parent_slot: u64) {
         if self.asynchronous && self.source_anchor.is_none() && self.native_height > 0 {
-            self.source_anchor = Some((parent, parent_slot, self.native_height));
+            self.source_anchor = Some((parent, parent_slot, self.native_height, self.inbox.len() as u64, self.inbox_root));
         }
+    }
+    /// Escrow a native deposit into the next inbox position. The caller has
+    /// already removed exactly `record.sats` from the spendable supply.
+    pub(crate) fn append_deposit(&mut self, record: InboxRecord) -> Result<(), Reject> {
+        if !self.asynchronous || self.inbox.len() >= u32::MAX as usize {
+            return Err(Reject::NotActive);
+        }
+        self.escrow_sat = self.escrow_sat.checked_add(u128::from(record.sats)).ok_or(Reject::Limit)?;
+        self.inbox_root = hash(&[b"BLOCH:NATIVE:L2:INBOX:1", &self.inbox_root, &record.encode()]);
+        self.inbox.push(record);
+        Ok(())
+    }
+    /// Deposits already appended at `height` (gives the next tx_index there).
+    pub fn deposits_at_height(&self, height: u64) -> u32 {
+        self.inbox.iter().rev().take_while(|r| r.height == height).count() as u32
+    }
+    pub fn inbox(&self) -> &[InboxRecord] {
+        &self.inbox
+    }
+    pub fn consumed(&self) -> u64 {
+        self.consumed
+    }
+    pub fn escrow_sat(&self) -> u128 {
+        self.escrow_sat
+    }
+    /// The records the next settlement must consume from `source`.
+    pub fn pending_for(&self, source: &Source) -> &[InboxRecord] {
+        let end = source.inbox_count.min(self.consumed.saturating_add(MAX_INBOX_PER_SETTLEMENT));
+        &self.inbox[self.consumed as usize..end as usize]
     }
     pub fn policy(&self) -> &Policy {
         &self.policy
@@ -175,11 +307,12 @@ impl State {
         self.head
     }
     pub fn source(&self, block: [u8; 32], slot: u64) -> Source {
-        self.frozen_source().unwrap_or_else(|| self.source_at(block, slot, self.native_height))
+        self.frozen_source().unwrap_or_else(|| {
+            self.source_at(block, slot, self.native_height, self.inbox.len() as u64, self.inbox_root)
+        })
     }
-    fn source_at(&self, block: [u8; 32], slot: u64, height: u64) -> Source {
+    fn source_at(&self, block: [u8; 32], slot: u64, height: u64, inbox_count: u64, inbox_root: [u8; 32]) -> Source {
         let previous = self.head.map(|(_, s)| h(&s, S + 448)).unwrap_or([0; 32]);
-        let inbox_root = hash(&[b"BLOCH:NATIVE:L2:EMPTY-INBOX:1"]);
         let commitment = hash(&[
             b"BLOCH:NATIVE:L2:EMPTY-SOURCE:1",
             &self.policy.identities[0],
@@ -197,6 +330,7 @@ impl State {
             height,
             commitment,
             inbox_root,
+            inbox_count,
         }
     }
     pub(crate) fn advance_height(&mut self) -> Result<(), Reject> {
@@ -214,7 +348,7 @@ impl State {
         if self.asynchronous {
             match self.source_anchor {
                 None => out.push(0),
-                Some((block, slot, height)) => {
+                Some((block, slot, height, _, _)) => {
                     out.push(1);
                     out.extend_from_slice(&block);
                     out.extend_from_slice(&slot.to_le_bytes());
@@ -228,6 +362,18 @@ impl State {
                 out.push(1);
                 out.extend_from_slice(&digest);
                 out.extend_from_slice(&statement);
+            }
+        }
+        // Absent until the first deposit, so empty-inbox states keep their bytes.
+        if !self.inbox.is_empty() {
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:INBOX-STATE:1");
+            out.extend_from_slice(&(self.inbox.len() as u64).to_le_bytes());
+            out.extend_from_slice(&self.inbox_root);
+            out.extend_from_slice(&self.consumed.to_le_bytes());
+            out.extend_from_slice(&self.escrow_sat.to_le_bytes());
+            if let Some((_, _, _, count, root)) = self.source_anchor {
+                out.extend_from_slice(&count.to_le_bytes());
+                out.extend_from_slice(&root);
             }
         }
         out
@@ -263,10 +409,12 @@ impl State {
             || n(s, S + 440) != source.height
             || h(s, S + 448) != source.commitment
             || h(s, S + 480) != source.inbox_root
-            || n(s, S + 512) != 0
-            || n(s, S + 520) != 0
-            || n(s, S + 528) != 0
         {
+            return Err(Reject::Source);
+        }
+        // Deterministic consumption: everything pending at the anchor, capped.
+        let end = source.inbox_count.min(self.consumed.saturating_add(MAX_INBOX_PER_SETTLEMENT));
+        if n(s, S + 512) != source.inbox_count || n(s, S + 520) != self.consumed || n(s, S + 528) != end {
             return Err(Reject::Source);
         }
         let (previous, number, parent, root) = match self.head {
@@ -293,6 +441,12 @@ impl State {
         {
             return Err(Reject::Successor);
         }
+        // The proof binds the body; consensus binds the body to the inbox.
+        if cfg!(feature = "devnet-l2-deposits")
+            && h(s, S + 536) != expected_body_commitment(&self.inbox[self.consumed as usize..end as usize])
+        {
+            return Err(Reject::Deposits);
+        }
         if !verifier.verify_l2_settlement(
             &self.policy.proof_policy,
             &self.policy.identities[6],
@@ -303,11 +457,35 @@ impl State {
         }
         self.head = Some((tx.commitment(), *s));
         self.source_anchor = None;
+        self.consumed = end;
         Ok(())
     }
 
     /// Mempool preflight shares the transition checks and never mutates state.
     pub fn validate_async(&self, tx: &Transaction, verifier: &dyn crate::attestation::SignatureVerifier) -> Result<(), Reject> {
         self.clone().apply(tx, [0; 32], 0, true, verifier)
+    }
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::*;
+
+    #[test]
+    fn empty_body_commitment_matches_the_proven_l2_body() {
+        // body_commitment of every real devnet settlement proof (empty body).
+        let proven = "631fadc856db46e03e0a80f48f053f496c57548c0b1a2fba6701432a2299d420";
+        let ours: String = expected_body_commitment(&[]).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(ours, proven);
+    }
+
+    #[test]
+    fn empty_inbox_root_is_unchanged_and_appends_chain() {
+        assert_eq!(empty_inbox_root(), hash(&[b"BLOCH:NATIVE:L2:EMPTY-INBOX:1"]));
+        let record = InboxRecord { height: 7, tx_index: 0, txid: [1; 32], vout: 1, sats: 5_000, recipient: [2; 20] };
+        assert_ne!(expected_body_commitment(&[record]), expected_body_commitment(&[]));
+        let mut other = record;
+        other.sats += 1;
+        assert_ne!(expected_body_commitment(&[record]), expected_body_commitment(&[other]));
     }
 }

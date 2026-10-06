@@ -45,6 +45,7 @@
 //! rule once integration review starts).
 
 mod codec;
+mod l2_deposit_cli;
 mod engine;
 mod genesis;
 mod keys;
@@ -140,6 +141,12 @@ fn main() {
         Some("genesis") => genesis_cmd(&args[1..]),
         Some("genesis-mainnet") => genesis_mainnet(&args[1..]),
         Some("submit-tx") => submit_tx(&args[1..]),
+        Some("l2-deposit") => {
+            if let Err(error) = l2_deposit_cli::run(&args[1..]) {
+                eprintln!("l2-deposit: {error}");
+                exit(2);
+            }
+        }
         Some("validator-deposit") => {
             if let Err(error) = validator_deposit::run(&args[1..]) {
                 eprintln!("validator-deposit: {error}");
@@ -1139,17 +1146,42 @@ fn genesis_cmd(args: &[String]) {
             commission_bps: 0,
         });
     }
+    // Development L2 networks may fund test accounts at genesis (liquid at
+    // epoch 0) so native deposits can be exercised. Refused for any other
+    // manifest format: a funded network never takes balances from a flag.
+    let mut allocations = Vec::new();
+    let mut flags = args.iter();
+    while let Some(flag) = flags.next() {
+        if flag != "--dev-allocation" {
+            continue;
+        }
+        if !matches!(format, genesis::ManifestFormat::V3L2Async(_)) {
+            eprintln!("genesis: --dev-allocation is only valid for BPOSMAN3 development manifests");
+            exit(2);
+        }
+        let value = flags.next().unwrap_or_else(|| { eprintln!("genesis: --dev-allocation needs SCRIPT_HASH:SATS"); exit(2) });
+        let (hash, sats) = value.split_once(':').unwrap_or_else(|| { eprintln!("genesis: --dev-allocation needs SCRIPT_HASH:SATS"); exit(2) });
+        let script_hash: [u8; 32] = codec::unhex(hash).ok().and_then(|b| b.try_into().ok())
+            .unwrap_or_else(|| { eprintln!("genesis: --dev-allocation script hash must be 32 bytes of hex"); exit(2) });
+        let amount_sat: u64 = sats.parse().unwrap_or_else(|_| { eprintln!("genesis: --dev-allocation amount must be integer sats"); exit(2) });
+        allocations.push(genesis::GenesisAllocation {
+            purpose: genesis::alloc_purpose::LIQUIDITY,
+            script_hash,
+            amount_sat: u128::from(amount_sat),
+            unlock_epoch: 0,
+        });
+    }
     let manifest = genesis::Manifest {
         genesis_time_ms: genesis_time_from_now(start_in),
         slot_ms,
         validators,
         cohort: Vec::new(),
-        // `genesis` builds devnet manifests: no carried balances, no vested
-        // allocations. The mainnet manifest is assembled by a separate path
-        // that takes the signed Genesis-3 snapshot as input, because its
-        // inputs come from a ceremony and not from a command line.
+        // `genesis` builds devnet manifests: no carried balances. Vested
+        // allocations exist only as explicit `--dev-allocation`s above. The
+        // mainnet manifest is assembled by a separate path that takes the
+        // signed Genesis-3 snapshot as input.
         carryover: None,
-        allocations: Vec::new(),
+        allocations,
         carryover_entries: Vec::new(),
         format,
         pre_state_root: std::sync::OnceLock::new(),

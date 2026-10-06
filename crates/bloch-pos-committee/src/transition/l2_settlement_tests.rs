@@ -427,4 +427,174 @@ mod l2_tests {
         assert!(state.apply_transaction(&PosTransaction::L2SettlementAsync(Box::new(original)), 0, 1, &RealProof).is_err());
         assert_eq!(state, pre);
     }
+
+    // ── Native L2 deposits (devnet-l2-deposits) ─────────────────────────────
+
+    fn depositor() -> Vec<u8> {
+        // Hybrid key geometry; ToyVerifier only needs it to be one fixed key.
+        vec![0x5a; crate::transition::funded::ADMISSION_PQ_KEY_BYTES]
+    }
+    const FUNDED: u64 = 50_000_000_000;
+
+    fn funded_async_fixture() -> (CommittedState, Vec<RandaoChain>) {
+        let key = depositor();
+        let coin = crate::state_root::EutxoEntry { txid: [0x33; 32], vout: 0, value: FUNDED, script_hash: script_of(&key) };
+        let (_, mut genesis, mut chains) = setup_with(4, ToyVerifier, &[coin]);
+        let identities = std::array::from_fn(|i| hash_at(TEMPLATE, S + i * 32));
+        let mut policy = Policy {
+            identities,
+            proof_policy: bloch_l2_proof::policy_commitment(),
+            chain_id: 700771,
+            initial_l2_parent: hash_at(TEMPLATE, S + 272),
+            initial_l2_state: hash_at(TEMPLATE, S + 304),
+        };
+        policy.identities[0] = [0x91; 32];
+        policy.identities[1] = *genesis.head.as_bytes();
+        genesis.admission_network_domain = Some(policy.identities[0]);
+        genesis = genesis.configure_l2_genesis_async(policy).unwrap();
+        let t = Transition::new(ToyVerifier);
+        let first = build_block(&t, &genesis, 1, &[], &[], &mut chains);
+        (t.apply_block(&genesis, &first, &[], &[]).unwrap(), chains)
+    }
+
+    fn deposit_tx(pre: &CommittedState, amount: u64) -> crate::transition::L2Deposit {
+        let key = depositor();
+        let mut tx = crate::transition::L2Deposit {
+            network_domain: [0x91; 32],
+            funding_pubkey: key.clone(),
+            inputs: vec![crate::transition::FundingInput { txid: [0x33; 32], vout: 0 }],
+            amount_sat: amount,
+            recipient: [0x42; 20],
+            change: TransferOutput { value: 0, script_hash: script_of(&key) },
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+            signature: vec![0; 32],
+        };
+        tx.tx_bytes = tx.canonical_bytes().len() as u64;
+        let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, tx.tx_bytes, pre.next_base_fee(), 0);
+        tx.change.value = (u128::from(FUNDED) - u128::from(amount) - charge.base_fee_sat - charge.priority_fee_sat) as u64;
+        tx.signature = toy_sign(&key, &tx.intent_root());
+        tx
+    }
+
+    /// An async settlement for the frozen source, chaining from the current head.
+    fn settlement(pre: &CommittedState, body: [u8; 32]) -> Transaction {
+        let state = pre.l2_settlement().unwrap();
+        let mut tx = transaction(pre);
+        let source = state.source(*pre.head.as_bytes(), pre.slot);
+        let s = &mut tx.statement;
+        let end = source.inbox_count.min(state.consumed() + crate::l2_settlement::MAX_INBOX_PER_SETTLEMENT);
+        s[S + 512..S + 520].copy_from_slice(&source.inbox_count.to_be_bytes());
+        s[S + 520..S + 528].copy_from_slice(&state.consumed().to_be_bytes());
+        s[S + 528..S + 536].copy_from_slice(&end.to_be_bytes());
+        s[S + 536..S + 568].copy_from_slice(&body);
+        if let Some((digest, old)) = state.head() {
+            s[S + 224..S + 256].copy_from_slice(&digest);
+            let number = u64::from_be_bytes(old[S + 264..S + 272].try_into().unwrap()) + 1;
+            s[S + 264..S + 272].copy_from_slice(&number.to_be_bytes());
+            s[S + 272..S + 304].copy_from_slice(&old[S + 336..S + 368]);
+            s[S + 304..S + 336].copy_from_slice(&old[S + 368..S + 400]);
+            s[S + 336] ^= number as u8; // a distinct successor header
+        }
+        tx
+    }
+
+    fn apply(pre: &CommittedState, slot: u64, txs: &[PosTransaction], chains: &mut [RandaoChain]) -> Result<CommittedState, TransitionError> {
+        let t = Transition::new(ProofDouble);
+        let block = build_block(&t, pre, slot, &[], txs, chains);
+        t.apply_block(pre, &block, &[], txs)
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-deposits")]
+    fn l2_deposit_escrows_and_the_next_settlement_must_mint_it_exactly() {
+        let (pre, mut chains) = funded_async_fixture();
+        let amount = 7_000_000_000;
+        let tx = deposit_tx(&pre, amount);
+        let wire = PosTransaction::L2Deposit(tx.clone());
+        assert_eq!(PosTransaction::from_canonical_bytes(&wire.canonical_bytes()).unwrap(), wire);
+        let supply = pre.accounted_supply_sat();
+        let s2 = apply(&pre, 2, std::slice::from_ref(&wire), &mut chains).expect("deposit applies");
+        let l2 = s2.l2_settlement().unwrap();
+        assert_eq!(l2.inbox().len(), 1);
+        let record = l2.inbox()[0];
+        assert_eq!((record.sats, record.recipient, record.vout, record.tx_index), (amount, [0x42; 20], 1, 0));
+        assert_eq!(record.txid, wire.txid());
+        assert_eq!(record.height, pre.l2_settlement().unwrap().height() + 1);
+        assert_eq!(l2.escrow_sat(), u128::from(amount));
+        assert!(s2.eutxos.get(&([0x33; 32], 0)).is_none(), "input spent");
+        assert_eq!(s2.eutxos.get(&(wire.txid(), 0)).unwrap().value, tx.change.value);
+        assert!(s2.accounted_supply_sat() < supply - u128::from(amount) + 1, "escrow leaves spendable supply");
+        // Replaying the same deposit fails (input already spent).
+        let mut replay = s2.clone();
+        assert!(replay.apply_transaction(&wire, 0, s2.next_base_fee(), &ToyVerifier).is_err());
+        assert_eq!(replay, s2);
+
+        // Block 3: the anchor predates the deposit, so it consumes nothing.
+        let empty = crate::l2_settlement::expected_body_commitment(&[]);
+        let first = PosTransaction::L2SettlementAsync(Box::new(settlement(&s2, empty)));
+        let s3 = apply(&s2, 3, std::slice::from_ref(&first), &mut chains).expect("empty settlement");
+        assert_eq!(s3.l2_settlement().unwrap().consumed(), 0);
+
+        // Block 4: anchored after the deposit; it must mint exactly that record.
+        let s3b = apply(&s3, 4, &[], &mut chains).unwrap();
+        for wrong in [empty, crate::l2_settlement::expected_body_commitment(&[crate::l2_settlement::InboxRecord { sats: amount + 1, ..record }])] {
+            let bad = settlement(&s3b, wrong);
+            let mut l2 = s3b.l2_settlement().unwrap().clone();
+            let r = l2.apply(&bad, *s3b.head.as_bytes(), s3b.slot, true, &ProofDouble);
+            assert_eq!(r, Err(Reject::Deposits), "wrong body must be refused");
+        }
+        let exact = crate::l2_settlement::expected_body_commitment(&[record]);
+        let good = PosTransaction::L2SettlementAsync(Box::new(settlement(&s3b, exact)));
+        let s5 = apply(&s3b, 5, std::slice::from_ref(&good), &mut chains).expect("exact body settles the deposit");
+        assert_eq!(s5.l2_settlement().unwrap().consumed(), 1);
+        assert_ne!(s5.state_root(), s3b.state_root());
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-deposits")]
+    fn invalid_l2_deposits_are_refused_without_mutation() {
+        let (pre, _) = funded_async_fixture();
+        let base = deposit_tx(&pre, 7_000_000_000);
+        let fee = pre.next_base_fee();
+        let mut cases = Vec::new();
+        let mut t = base.clone();
+        t.network_domain = [0x92; 32];
+        t.signature = toy_sign(&t.funding_pubkey, &t.intent_root());
+        cases.push(("network", t));
+        let mut t = base.clone();
+        t.signature[0] ^= 1;
+        cases.push(("signature", t));
+        let mut t = base.clone();
+        t.change.value += 1;
+        t.signature = toy_sign(&t.funding_pubkey, &t.intent_root());
+        cases.push(("conservation", t));
+        let mut t = base.clone();
+        t.amount_sat = crate::transition::l2_deposit::MIN_L2_DEPOSIT_SAT - 1;
+        t.signature = toy_sign(&t.funding_pubkey, &t.intent_root());
+        cases.push(("minimum", t));
+        let mut t = base.clone();
+        t.funding_pubkey[0] ^= 1; // not the coin's owner
+        t.signature = toy_sign(&t.funding_pubkey, &t.intent_root());
+        cases.push(("ownership", t));
+        let mut t = base.clone();
+        t.recipient = [0; 20];
+        t.signature = toy_sign(&t.funding_pubkey, &t.intent_root());
+        cases.push(("recipient", t));
+        for (name, tx) in cases {
+            let mut state = pre.clone();
+            assert!(state.apply_transaction(&PosTransaction::L2Deposit(tx), 0, fee, &ToyVerifier).is_err(), "{name}");
+            assert_eq!(state, pre, "{name} mutated state");
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "devnet-l2-deposits"))]
+    fn l2_deposits_are_inert_without_the_development_feature() {
+        let (pre, _) = funded_async_fixture();
+        let mut state = pre.clone();
+        let tx = PosTransaction::L2Deposit(deposit_tx(&pre, 7_000_000_000));
+        assert!(state.apply_transaction(&tx, 0, pre.next_base_fee(), &ToyVerifier).is_err());
+        assert_eq!(state, pre);
+    }
 }

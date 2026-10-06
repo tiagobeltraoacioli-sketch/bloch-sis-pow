@@ -149,6 +149,8 @@ use crate::params::SLOTS_PER_EPOCH;
 pub mod funded;
 mod lifecycle;
 pub use funded::{FundedDeposit, FundedDepositReject, FundingInput};
+pub mod l2_deposit;
+pub use l2_deposit::{L2Deposit, L2DepositReject};
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
 use crate::schedule;
@@ -310,6 +312,8 @@ pub enum PosTransaction {
     L2SettlementAsync(Box<crate::l2_settlement::Transaction>),
     /// PQ-authorized, UTXO-funded validator registration (wire 0x0B).
     FundedDeposit(FundedDeposit),
+    /// Escrow BLCH into the asynchronous L2 inbox (development networks).
+    L2Deposit(L2Deposit),
     /// A value transfer against the committed eUTXO set, priced by the L1 fee
     /// market: **gas × price**, where the gas is derived (class + size,
     /// `fee_market::intrinsic_gas`) and the price is the base fee this block's
@@ -678,6 +682,7 @@ impl PosTransaction {
                 );
             }
             PosTransaction::FundedDeposit(tx) => return tx.intent_root(),
+            PosTransaction::L2Deposit(tx) => return tx.intent_root(),
             other => h.update(other.canonical_bytes()),
         }
         h.finalize().into()
@@ -837,6 +842,7 @@ impl PosTransaction {
             PosTransaction::L2Settlement(tx) => return tx.encode(),
             PosTransaction::L2SettlementAsync(tx) => return tx.encode_async(),
             PosTransaction::FundedDeposit(tx) => return tx.canonical_bytes(),
+            PosTransaction::L2Deposit(tx) => return tx.canonical_bytes(),
             PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
                 // Counts are length prefixes like every other variable-length
@@ -1026,6 +1032,7 @@ impl PosTransaction {
         let tag = r.u8()?;
         let tx = match tag {
             funded::FUNDED_DEPOSIT_TAG => PosTransaction::FundedDeposit(FundedDeposit::decode(&mut r)?),
+            l2_deposit::L2_DEPOSIT_TAG => PosTransaction::L2Deposit(L2Deposit::decode(&mut r)?),
             0x01 => {
                 // Counts are read from untrusted bytes, so nothing is
                 // preallocated from them: a 4-billion-input header on a 40-byte
@@ -1233,6 +1240,7 @@ impl core::fmt::Display for TxDecodeError {
 pub enum TxReject {
     L2Settlement(crate::l2_settlement::Reject),
     FundedDeposit(FundedDepositReject),
+    L2Deposit(L2DepositReject),
     /// A value transfer broke one of the eUTXO rules.
     Transfer(TransferReject),
     /// A deposit, exit or delegation failed its state-dependent rule.
@@ -3413,6 +3421,9 @@ impl CommittedState {
             PosTransaction::FundedDeposit(deposit) => self
                 .apply_funded_deposit(deposit, total_active_sat, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::FundedDeposit),
+            PosTransaction::L2Deposit(deposit) => self
+                .apply_l2_deposit(deposit, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::L2Deposit),
             PosTransaction::Transfer { .. } => self
                 .apply_transfer(tx, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::Transfer),
@@ -13826,6 +13837,8 @@ mod tests {
             PosTransaction::RandaoRecommit { .. } => {}
             // Funded admission transfers UTXO value into bonded stake and fees.
             PosTransaction::FundedDeposit(_) => {}
+            // Escrow removes spendable value; nothing is issued.
+            PosTransaction::L2Deposit(_) => {}
             PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => {} // Cursor only; no balances.
         }
 
