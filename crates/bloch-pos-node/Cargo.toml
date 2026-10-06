@@ -52,6 +52,8 @@ doctest = false
 # The benchmark runs the SAME code either way — the feature only decides
 # whether the breakdown is available. Never enable it on a producing node.
 perf-timing = ["bloch-pos-committee/perf-timing"]
+# DEVELOPMENT NETWORKS ONLY; see bloch-pos-committee. Refuses non-BPOSMAN3 manifests.
+devnet-randao-recommit = ["bloch-pos-committee/devnet-randao-recommit"]
 
 [dependencies]
 bloch-l2-proof = { path = "../bloch-l2-proof" }

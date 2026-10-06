@@ -204,7 +204,13 @@ fn main() {
         }
     };
 
-    println!("cargo:rustc-env=BLOCH_BUILD_VERSION={pkg} ({commit}{dirty})");
+    // Consensus-relevant development features are part of the build identity.
+    let devnet = if std::env::var_os("CARGO_FEATURE_DEVNET_RANDAO_RECOMMIT").is_some() {
+        "+devnet-randao-recommit"
+    } else {
+        ""
+    };
+    println!("cargo:rustc-env=BLOCH_BUILD_VERSION={pkg} ({commit}{dirty}){devnet}");
 
     // ── The machine-readable half, for `getbuildinfo` ──────────────────────
     //

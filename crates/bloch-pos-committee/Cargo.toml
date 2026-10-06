@@ -17,6 +17,10 @@ publish = false
 # zero-sized with no Drop and every call site disappears. Never enable it on a
 # node that is producing.
 perf-timing = []
+# DEVELOPMENT NETWORKS ONLY. Arms RANDAO re-commits from genesis (all other
+# lifecycle gates unchanged). A node built with it refuses non-BPOSMAN3
+# manifests. Never enable it for Genesis-4 or any funded network.
+devnet-randao-recommit = []
 
 [dependencies]
 sha3 = { version = "0.10", default-features = false }

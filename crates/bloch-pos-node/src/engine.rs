@@ -4393,6 +4393,18 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
+    // A build with consensus rules armed for development networks must never
+    // join a funded network: refuse anything but a BPOSMAN3 development manifest.
+    #[cfg(feature = "devnet-randao-recommit")]
+    {
+        if !matches!(manifest.format, crate::genesis::ManifestFormat::V3L2Async(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "this build has devnet-randao-recommit (RANDAO re-commits from genesis) and runs only BPOSMAN3 development manifests",
+            ));
+        }
+        println!("DEVELOPMENT BUILD: devnet-randao-recommit — RANDAO re-commits active from genesis");
+    }
 
     // The opening ledger, before anything else touches the manifest. A
     // manifest that commits to a carryover is not usable until the snapshot

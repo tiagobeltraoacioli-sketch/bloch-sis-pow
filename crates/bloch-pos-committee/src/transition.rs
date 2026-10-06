@@ -10002,10 +10002,21 @@ mod tests {
     /// Pin the operator-scheduled ADR-041 release boundary. Moving it requires
     /// another coordinated release; implementing a decoder alone is insufficient.
     #[test]
+    #[cfg(not(feature = "devnet-randao-recommit"))]
     fn randao_recommit_gate_matches_the_lifecycle_schedule() {
         assert_eq!(crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH, 2_884);
         assert_eq!(crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH,
             crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH);
+    }
+
+    /// The development build arms only the re-commit gate, from genesis.
+    #[test]
+    #[cfg(feature = "devnet-randao-recommit")]
+    fn devnet_build_arms_only_the_recommit_gate() {
+        assert_eq!(crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH, 0);
+        assert!(CommittedState::randao_recommit_active(0));
+        assert_eq!(crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH, 2_884);
+        assert_eq!(crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH, 2_884);
     }
 
     /// Build the signed re-commit a validator would actually send, under
@@ -10025,6 +10036,7 @@ mod tests {
     /// re-commit for a genuinely exhausted validator is consensus-invalid,
     /// so today's fleet behaviour — chains are terminal — is unchanged.
     #[test]
+    #[cfg(not(feature = "devnet-randao-recommit"))]
     fn below_the_gate_a_perfectly_signed_recommit_is_consensus_invalid() {
         let (_t, g, _chains) = setup(4);
         let mut probe = g.clone();
