@@ -205,11 +205,13 @@ fn main() {
     };
 
     // Consensus-relevant development features are part of the build identity.
-    let devnet = if std::env::var_os("CARGO_FEATURE_DEVNET_RANDAO_RECOMMIT").is_some() {
-        "+devnet-randao-recommit"
-    } else {
-        ""
-    };
+    let mut devnet = String::new();
+    if std::env::var_os("CARGO_FEATURE_DEVNET_RANDAO_RECOMMIT").is_some() {
+        devnet.push_str("+devnet-randao-recommit");
+    }
+    if std::env::var_os("CARGO_FEATURE_DEVNET_L2_DEPOSITS").is_some() {
+        devnet.push_str("+devnet-l2-deposits");
+    }
     println!("cargo:rustc-env=BLOCH_BUILD_VERSION={pkg} ({commit}{dirty}){devnet}");
 
     // ── The machine-readable half, for `getbuildinfo` ──────────────────────

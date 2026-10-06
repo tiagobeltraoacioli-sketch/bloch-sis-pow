@@ -4399,15 +4399,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
     // A build with consensus rules armed for development networks must never
     // join a funded network: refuse anything but a BPOSMAN3 development manifest.
-    #[cfg(feature = "devnet-randao-recommit")]
+    #[cfg(any(feature = "devnet-randao-recommit", feature = "devnet-l2-deposits"))]
     {
         if !matches!(manifest.format, crate::genesis::ManifestFormat::V3L2Async(_)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "this build has devnet-randao-recommit (RANDAO re-commits from genesis) and runs only BPOSMAN3 development manifests",
+                "this build has development consensus features (devnet-randao-recommit / devnet-l2-deposits) and runs only BPOSMAN3 development manifests",
             ));
         }
-        println!("DEVELOPMENT BUILD: devnet-randao-recommit — RANDAO re-commits active from genesis");
+        println!("DEVELOPMENT BUILD: {}", env!("BLOCH_BUILD_VERSION"));
     }
 
     // The opening ledger, before anything else touches the manifest. A
