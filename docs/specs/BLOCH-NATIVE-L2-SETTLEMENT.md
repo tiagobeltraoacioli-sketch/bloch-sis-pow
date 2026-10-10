@@ -106,3 +106,45 @@ deposit-only V3 settlements (`user_tx_count = 0`) are accepted on every build.
 `l2_settlement::USER_TRANSACTIONS_ENABLED` exposes the build's choice.
 The 1155-byte frame is pinned by the shared vector in
 `crates/bloch-pos-committee/tests/l2_settlement_v3_frame.rs`.
+
+## L1 data availability for V3 user transactions (2026-10-10, M3)
+
+Transaction `0x15` (`L2DataAvailability`, `transition/l2_da.rs`) publishes the
+user-transaction batch of one unsettled L2 block in a native block. It is an
+ordinary fee-paying eUTXO transaction: a hybrid PQ funding key signs the
+witness-free intent (network domain, inputs, L2 chain id, L2 block number,
+payload, change, declared size, tip) under `BLOCH:L2:DA:V1`, and pays
+`fee_market::intrinsic_gas` (16 gas per declared byte plus one hybrid
+verification per input) at the block base fee. Bounds:
+
+| Bound | Value | Why |
+|---|---|---|
+| Payload | ≤ 114,688 bytes (`da::MAX_PAYLOAD_BYTES`) | with the largest envelope (≤ 16 inputs, key, signature) one DA transaction stays below the pre-V2 block byte target (128 KiB) |
+| DA transactions per block | ≤ 4 (`da::MAX_PER_BLOCK`, consensus) | inclusion is a fee auction (like blobs); bounds the stored records |
+| Retention | 1,024 native blocks | a record serves settlements in the next 1,024 blocks, then expires |
+| Window | next 64 unsettled L2 blocks | stale or far-future batches are refused |
+| Stored records | ≤ 4,100 × 48 bytes | `MAX_PER_BLOCK × (RETENTION + 1)` |
+
+Payload: `count (u32 BE, ≥ 1)` then `count × (len (u32 BE, ≥ 1) || envelope)`,
+the exact signed EIP-2718 envelopes of the L2 body in order, no trailing bytes.
+Commitment: `keccak256("BLOCH:L2:DA:1" || chain_id u64 BE || l2_block_number u64 BE || payload)`.
+The state stores only `(l2_number, commitment, inclusion height)`; the batch
+bytes stay in the native block. Rejections: another L2 chain (`Chain`), settled
+or beyond the window (`Number`), the same batch twice for a block
+(`Duplicate`), malformed or oversize payload (`Payload`; oversize does not
+decode), plus the usual eUTXO rules (inputs, ownership, conservation,
+signature, declared size).
+
+Settlement rule (V3): when `user_tx_count > 0`, `da_commitment` must equal a
+retained record for the same L2 block number whose inclusion height is
+strictly lower than the block applying the settlement (`Reject::DataUnavailable`
+otherwise). A settlement reserves the whole block gas budget, so the "earlier
+block" rule never depends on in-block ordering. When `user_tx_count == 0`,
+`da_commitment` must be zero (`Reject::Reserved`). Accepting a settlement drops
+every record for that and earlier L2 blocks. The M2.6 guard is unchanged: user
+transactions (and therefore DA transactions) remain refused unless the build
+enables `devnet-l2-user-txs`. `getl2settlement` lists the retained records under
+`data_availability`. The offline `bloch-pos l2-da prepare|sign|inspect` tool
+builds and signs the transaction. The shared vector
+`crates/bloch-pos-committee/tests/fixtures/l2-da-v1` pins payload and
+commitment against the L2 codec.

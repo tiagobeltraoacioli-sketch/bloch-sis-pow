@@ -151,6 +151,8 @@ mod lifecycle;
 pub use funded::{FundedDeposit, FundedDepositReject, FundingInput};
 pub mod l2_deposit;
 pub use l2_deposit::{L2Deposit, L2DepositReject};
+pub mod l2_da;
+pub use l2_da::{L2DataAvailability, L2DataAvailabilityReject};
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
 use crate::schedule;
@@ -314,6 +316,9 @@ pub enum PosTransaction {
     FundedDeposit(FundedDeposit),
     /// Escrow BLCH into the asynchronous L2 inbox (development networks).
     L2Deposit(L2Deposit),
+    /// Publish one L2 block's user-transaction batch on L1 (0x15,
+    /// development networks with `devnet-l2-user-txs`).
+    L2DataAvailability(L2DataAvailability),
     /// A value transfer against the committed eUTXO set, priced by the L1 fee
     /// market: **gas × price**, where the gas is derived (class + size,
     /// `fee_market::intrinsic_gas`) and the price is the base fee this block's
@@ -683,6 +688,7 @@ impl PosTransaction {
             }
             PosTransaction::FundedDeposit(tx) => return tx.intent_root(),
             PosTransaction::L2Deposit(tx) => return tx.intent_root(),
+            PosTransaction::L2DataAvailability(tx) => return tx.intent_root(),
             other => h.update(other.canonical_bytes()),
         }
         h.finalize().into()
@@ -843,6 +849,7 @@ impl PosTransaction {
             PosTransaction::L2SettlementAsync(tx) => return tx.encode_async(),
             PosTransaction::FundedDeposit(tx) => return tx.canonical_bytes(),
             PosTransaction::L2Deposit(tx) => return tx.canonical_bytes(),
+            PosTransaction::L2DataAvailability(tx) => return tx.canonical_bytes(),
             PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
                 // Counts are length prefixes like every other variable-length
@@ -1033,6 +1040,7 @@ impl PosTransaction {
         let tx = match tag {
             funded::FUNDED_DEPOSIT_TAG => PosTransaction::FundedDeposit(FundedDeposit::decode(&mut r)?),
             l2_deposit::L2_DEPOSIT_TAG => PosTransaction::L2Deposit(L2Deposit::decode(&mut r)?),
+            l2_da::L2_DATA_AVAILABILITY_TAG => PosTransaction::L2DataAvailability(L2DataAvailability::decode(&mut r)?),
             0x01 => {
                 // Counts are read from untrusted bytes, so nothing is
                 // preallocated from them: a 4-billion-input header on a 40-byte
@@ -1241,6 +1249,7 @@ pub enum TxReject {
     L2Settlement(crate::l2_settlement::Reject),
     FundedDeposit(FundedDepositReject),
     L2Deposit(L2DepositReject),
+    L2DataAvailability(L2DataAvailabilityReject),
     /// A value transfer broke one of the eUTXO rules.
     Transfer(TransferReject),
     /// A deposit, exit or delegation failed its state-dependent rule.
@@ -3424,6 +3433,9 @@ impl CommittedState {
             PosTransaction::L2Deposit(deposit) => self
                 .apply_l2_deposit(deposit, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::L2Deposit),
+            PosTransaction::L2DataAvailability(batch) => self
+                .apply_l2_data_availability(batch, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::L2DataAvailability),
             PosTransaction::Transfer { .. } => self
                 .apply_transfer(tx, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::Transfer),
@@ -5891,6 +5903,13 @@ impl<V: SignatureVerifier> Transition<V> {
         }
         // Bound proof invocations before any transaction proof is executed.
         if transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_))).count() > 1 {
+            return Err(TransitionError::BlockGasLimitExceeded);
+        }
+        // DA batches per block are capped like blobs: it bounds the retained
+        // DA records (`l2_settlement::da::MAX_RECORDS`) independently of fees.
+        if transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2DataAvailability(_))).count()
+            > crate::l2_settlement::da::MAX_PER_BLOCK
+        {
             return Err(TransitionError::BlockGasLimitExceeded);
         }
         let mut unfunded_bonded: u128 = 0;
@@ -13839,6 +13858,8 @@ mod tests {
             PosTransaction::FundedDeposit(_) => {}
             // Escrow removes spendable value; nothing is issued.
             PosTransaction::L2Deposit(_) => {}
+            // A DA batch only pays fees from its inputs; nothing is issued.
+            PosTransaction::L2DataAvailability(_) => {}
             PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => {} // Cursor only; no balances.
         }
 

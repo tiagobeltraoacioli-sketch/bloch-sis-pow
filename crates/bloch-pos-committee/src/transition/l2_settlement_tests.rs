@@ -614,10 +614,33 @@ mod l2_tests {
         s[S + v3::TRANSACTIONS_ROOT..S + v3::TRANSACTIONS_ROOT + 32].copy_from_slice(&[0x7a; 32]);
         s[S + v3::RECEIPTS_ROOT..S + v3::RECEIPTS_ROOT + 32].copy_from_slice(&[0x7b; 32]);
         s[S + v3::USER_TX_COUNT..S + v3::USER_TX_COUNT + 8].copy_from_slice(&user_txs.to_be_bytes());
+        // M3: user transactions name their L1 batch; none means zero.
+        if user_txs != 0 {
+            s[S + v3::DA_COMMITMENT..S + v3::DA_COMMITMENT + 32].copy_from_slice(&TEST_DA);
+        }
         // A body with user transactions has a body commitment the native
         // chain cannot recompute; V3 must not try.
         s[S + 536..S + 568].copy_from_slice(&[0x5c; 32]);
         tx
+    }
+    const TEST_DA: [u8; 32] = [0xd7; 32];
+    /// `state` plus an L1 DA record for `tx`'s block and commitment, included
+    /// at the state's current native height (an earlier block than the one
+    /// that will apply `tx`). Unchanged when `tx` has no user transactions.
+    fn ready(state: &CommittedState, tx: &Transaction) -> CommittedState {
+        let s = &tx.statement;
+        let users = u64::from_be_bytes(s[S + v3::USER_TX_COUNT..S + v3::USER_TX_COUNT + 8].try_into().unwrap());
+        let mut out = state.clone();
+        if users != 0 {
+            let l2 = out.l2_settlement.as_mut().unwrap();
+            let height = l2.height();
+            l2.insert_da_record(crate::l2_settlement::da::Record {
+                l2_number: u64::from_be_bytes(s[S + 264..S + 272].try_into().unwrap()),
+                commitment: s[S + v3::DA_COMMITMENT..S + v3::DA_COMMITMENT + 32].try_into().unwrap(),
+                height,
+            });
+        }
+        out
     }
     fn no_deposits() -> [u8; 32] {
         crate::l2_settlement::deposits_hash(&[])
@@ -632,6 +655,7 @@ mod l2_tests {
     fn v3_settlement_with_user_transactions_is_accepted_and_replays() {
         let (pre, mut chains) = fixture();
         let settlement = to_v3(transaction(&pre), no_deposits(), user_txs(3));
+        let pre = ready(&pre, &settlement);
         let tx = PosTransaction::L2Settlement(Box::new(settlement.clone()));
         let bytes = tx.canonical_bytes();
         assert_eq!(bytes.len(), TRANSACTION_V3_BYTES);
@@ -668,14 +692,16 @@ mod l2_tests {
         let (pre, _) = fixture();
         assert_eq!(crate::l2_settlement::USER_TRANSACTIONS_ENABLED, cfg!(feature = "devnet-l2-user-txs"));
         for count in [1u64, 2, u64::MAX] {
-            let tx = PosTransaction::L2Settlement(Box::new(to_v3(transaction(&pre), no_deposits(), count)));
-            let mut state = pre.clone();
+            let settlement = to_v3(transaction(&pre), no_deposits(), count);
+            let mut state = ready(&pre, &settlement);
+            let before = state.clone();
+            let tx = PosTransaction::L2Settlement(Box::new(settlement));
             let result = state.apply_transaction(&tx, 0, 1, &ProofDouble);
             if cfg!(feature = "devnet-l2-user-txs") {
                 assert!(result.is_ok(), "count {count}: {result:?}");
             } else {
                 assert_eq!(result, Err(TxReject::L2Settlement(Reject::UserTransactions)), "count {count}");
-                assert_eq!(state, pre, "count {count} mutated state");
+                assert_eq!(state, before, "count {count} mutated state");
             }
         }
         // A deposit-only V3 settlement (user_tx_count = 0) is accepted on every build.
@@ -691,6 +717,7 @@ mod l2_tests {
     fn v3_rejects_wrong_length_tag_deposits_and_reserved_fields() {
         let (pre, _) = fixture();
         let good = to_v3(transaction(&pre), no_deposits(), user_txs(1));
+        let pre = ready(&pre, &good);
         let encoded = good.encode();
         // Wrong length: every truncation, and a suffix.
         for len in 0..TRANSACTION_V3_BYTES {
@@ -720,7 +747,13 @@ mod l2_tests {
             ("deposits_hash", S + v3::DEPOSITS_HASH, Reject::Deposits),
             ("withdrawal_root", S + v3::WITHDRAWAL_ROOT, Reject::Reserved),
             ("withdrawal_count", S + v3::WITHDRAWAL_COUNT + 7, Reject::Reserved),
-            ("da_commitment", S + v3::DA_COMMITMENT, Reject::Reserved),
+            // Zero is the only value without user transactions; with them,
+            // any other commitment has no L1 record.
+            (
+                "da_commitment",
+                S + v3::DA_COMMITMENT,
+                if crate::l2_settlement::USER_TRANSACTIONS_ENABLED { Reject::DataUnavailable } else { Reject::Reserved },
+            ),
         ];
         for (name, offset, reject) in cases {
             let mut bad = good.clone();
@@ -759,7 +792,9 @@ mod l2_tests {
     fn v3_out_of_order_settlement_is_refused() {
         let (pre, mut chains) = fixture();
         let t = Transition::new(ProofDouble);
-        let first = PosTransaction::L2Settlement(Box::new(to_v3(transaction(&pre), no_deposits(), user_txs(1))));
+        let first = to_v3(transaction(&pre), no_deposits(), user_txs(1));
+        let pre = ready(&pre, &first);
+        let first = PosTransaction::L2Settlement(Box::new(first));
         let block = build_block(&t, &pre, 2, &[], std::slice::from_ref(&first), &mut chains);
         let s2 = t.apply_block(&pre, &block, &[], std::slice::from_ref(&first)).unwrap();
         // Skips a number / does not chain from the accepted head.
@@ -782,6 +817,7 @@ mod l2_tests {
         }
         // The correctly chained successor is accepted (state built in a block).
         next.statement[S + 264..S + 272].copy_from_slice(&2u64.to_be_bytes());
+        let s2 = ready(&s2, &next);
         let tx = PosTransaction::L2Settlement(Box::new(next));
         let block = build_block(&t, &s2, 3, &[], std::slice::from_ref(&tx), &mut chains);
         let s3 = t.apply_block(&s2, &block, &[], std::slice::from_ref(&tx)).unwrap();
@@ -798,7 +834,9 @@ mod l2_tests {
         let record = s2.l2_settlement().unwrap().inbox()[0];
         // Anchor predates the deposit: consumes nothing, user txs only.
         let empty = crate::l2_settlement::expected_body_commitment(&[]);
-        let first = PosTransaction::L2SettlementAsync(Box::new(to_v3(settlement(&s2, empty), no_deposits(), user_txs(4))));
+        let first = to_v3(settlement(&s2, empty), no_deposits(), user_txs(4));
+        let s2 = ready(&s2, &first);
+        let first = PosTransaction::L2SettlementAsync(Box::new(first));
         let s3 = apply(&s2, 3, std::slice::from_ref(&first), &mut chains).expect("V3 with user txs, no deposits");
         assert_eq!(s3.l2_settlement().unwrap().consumed(), 0);
         let s3b = apply(&s3, 4, &[], &mut chains).unwrap();
@@ -821,7 +859,9 @@ mod l2_tests {
         assert_eq!(l2.apply(&range, *s3b.head.as_bytes(), s3b.slot, true, &ProofDouble), Err(Reject::Source));
         // The V3 body commitment is NOT recomputed: any body (here with two
         // user txs) settles as long as deposits_hash matches the inbox.
-        let good = PosTransaction::L2SettlementAsync(Box::new(to_v3(settlement(&s3b, empty), exact, user_txs(2))));
+        let good = to_v3(settlement(&s3b, empty), exact, user_txs(2));
+        let s3b = ready(&s3b, &good);
+        let good = PosTransaction::L2SettlementAsync(Box::new(good));
         let s5 = apply(&s3b, 5, std::slice::from_ref(&good), &mut chains).expect("V3 mints the deposit");
         assert_eq!(s5.l2_settlement().unwrap().consumed(), 1);
         assert_eq!(s5.l2_settlement().unwrap().escrow_sat(), u128::from(amount));
@@ -844,5 +884,334 @@ mod l2_tests {
         let empty = crate::l2_settlement::expected_body_commitment(&[]);
         let ok = PosTransaction::L2SettlementAsync(Box::new(settlement(&s2, empty)));
         assert!(apply(&s2, 3, std::slice::from_ref(&ok), &mut chains).is_ok());
+    }
+
+    // ── M3: L1 data availability (0x15, devnet-l2-user-txs) ─────────────────
+
+    use crate::l2_settlement::da;
+    use crate::transition::l2_da::{L2DataAvailability, L2DataAvailabilityReject as DaReject};
+
+    /// Canonical batch of `txs` (see `l2_settlement::da`).
+    fn batch(txs: &[&[u8]]) -> Vec<u8> {
+        let mut out = (txs.len() as u32).to_be_bytes().to_vec();
+        for tx in txs {
+            out.extend_from_slice(&(tx.len() as u32).to_be_bytes());
+            out.extend_from_slice(tx);
+        }
+        out
+    }
+
+    /// A signed DA transaction spending `coin` (value, at `outpoint`) with
+    /// all remaining value back as change.
+    fn da_tx(pre: &CommittedState, outpoint: ([u8; 32], u32), value: u64, number: u64, payload: Vec<u8>) -> L2DataAvailability {
+        let key = depositor();
+        let mut tx = L2DataAvailability {
+            network_domain: [0x91; 32],
+            funding_pubkey: key.clone(),
+            inputs: vec![crate::transition::FundingInput { txid: outpoint.0, vout: outpoint.1 }],
+            l2_chain_id: 700771,
+            l2_block_number: number,
+            payload,
+            change: TransferOutput { value: 0, script_hash: script_of(&key) },
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+            signature: vec![0; 32],
+        };
+        tx.tx_bytes = tx.canonical_bytes().len() as u64;
+        let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, tx.tx_bytes, pre.next_base_fee(), 0);
+        tx.change.value = (u128::from(value) - charge.base_fee_sat - charge.priority_fee_sat) as u64;
+        tx.signature = toy_sign(&key, &tx.intent_root());
+        tx
+    }
+    fn resign(mut tx: L2DataAvailability) -> L2DataAvailability {
+        tx.signature = toy_sign(&tx.funding_pubkey, &tx.intent_root());
+        tx
+    }
+
+    /// V3 user-transaction settlement of the next L2 block naming `commitment`.
+    fn v3_with_da(pre: &CommittedState, commitment: [u8; 32]) -> Transaction {
+        let empty = crate::l2_settlement::expected_body_commitment(&[]);
+        let mut tx = to_v3(settlement(pre, empty), no_deposits(), 2);
+        tx.statement[S + v3::DA_COMMITMENT..S + v3::DA_COMMITMENT + 32].copy_from_slice(&commitment);
+        tx
+    }
+
+    /// Shared with bloch-l2-evm `da_batch_cross_repository_vector`: the same
+    /// payload bytes must produce the same commitment in both codecs.
+    #[test]
+    fn da_batch_matches_the_shared_vector() {
+        let text = include_str!("../../tests/fixtures/l2-da-v1/batch.hex");
+        let payload = hex::decode(text.trim()).unwrap();
+        let tx2: Vec<u8> = (0u8..100).collect();
+        assert_eq!(payload, batch(&[&[0x02, 0xc0], &tx2]));
+        assert_eq!(da::batch_count(&payload), Some(2));
+        let digest = hex::encode(da::commitment(700771, 7, &payload));
+        assert_eq!(digest, include_str!("../../tests/fixtures/l2-da-v1/commitment-700771-7.hex").trim());
+        // Chain and block number are bound.
+        assert_ne!(da::commitment(700772, 7, &payload), da::commitment(700771, 7, &payload));
+        assert_ne!(da::commitment(700771, 8, &payload), da::commitment(700771, 7, &payload));
+    }
+
+    /// The exact 0x15 wire frame carrying the shared batch, pinned for the
+    /// settler's independent parser (bloch-l2-evm `deployment/devnet`).
+    #[test]
+    fn l2_da_wire_frame_matches_the_shared_vector() {
+        let payload = hex::decode(include_str!("../../tests/fixtures/l2-da-v1/batch.hex").trim()).unwrap();
+        let tx = L2DataAvailability {
+            network_domain: [0x91; 32],
+            funding_pubkey: vec![0x5a; crate::transition::funded::ADMISSION_PQ_KEY_BYTES],
+            inputs: vec![crate::transition::FundingInput { txid: [0x33; 32], vout: 0 }],
+            l2_chain_id: 700771,
+            l2_block_number: 7,
+            payload,
+            change: TransferOutput { value: 12_345, script_hash: [0x44; 32] },
+            tx_bytes: 9_000,
+            tip_millisat_per_gas: 0,
+            signature: vec![0x66; 64],
+        };
+        let wire = PosTransaction::L2DataAvailability(tx.clone());
+        let bytes = wire.canonical_bytes();
+        assert_eq!(hex::encode(&bytes), include_str!("../../tests/fixtures/l2-da-v1/tx-0x15.hex").trim());
+        assert_eq!(PosTransaction::from_canonical_bytes(&bytes).unwrap(), wire);
+        assert_eq!(
+            hex::encode(tx.commitment()),
+            include_str!("../../tests/fixtures/l2-da-v1/commitment-700771-7.hex").trim()
+        );
+    }
+
+    #[test]
+    fn da_batch_codec_is_exact_and_size_capped() {
+        assert_eq!(da::batch_count(&batch(&[b"a"])), Some(1));
+        for bad in [
+            vec![],
+            vec![0, 0, 0],
+            batch(&[]),                                  // zero transactions
+            batch(&[b""]),                               // empty envelope
+            [batch(&[b"a"]), vec![0]].concat(),          // trailing byte
+            batch(&[b"ab"])[..batch(&[b"ab"]).len() - 1].to_vec(), // truncated
+            vec![0, 0, 0, 2, 0, 0, 0, 1, 7],             // count too high
+            vec![0xff, 0xff, 0xff, 0xff],                // huge count, no data
+        ] {
+            assert_eq!(da::batch_count(&bad), None, "{bad:?}");
+        }
+        // Exactly at the cap is accepted, one byte more is refused.
+        let fill = da::MAX_PAYLOAD_BYTES - 8;
+        let at_cap = batch(&[&vec![1u8; fill]]);
+        assert_eq!(at_cap.len(), da::MAX_PAYLOAD_BYTES);
+        assert_eq!(da::batch_count(&at_cap), Some(1));
+        assert_eq!(da::batch_count(&batch(&[&vec![1u8; fill + 1]])), None);
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn l2_da_publishes_a_batch_and_unlocks_exactly_that_settlement() {
+        let (genesis, mut chains) = funded_async_fixture();
+        // One empty block anchors the asynchronous source.
+        let pre = apply(&genesis, 2, &[], &mut chains).unwrap();
+        let payload = batch(&[&[0x02, 0xc0], b"second"]);
+        let tx = da_tx(&pre, ([0x33; 32], 0), FUNDED, 1, payload.clone());
+        let commitment = da::commitment(700771, 1, &payload);
+        assert_eq!(tx.commitment(), commitment);
+        let wire = PosTransaction::L2DataAvailability(tx.clone());
+        let bytes = wire.canonical_bytes();
+        assert_eq!(bytes[0], 0x15);
+        assert_eq!(PosTransaction::from_canonical_bytes(&bytes).unwrap(), wire);
+        assert!(bytes.len() <= crate::transition::l2_da::MAX_L2_DATA_AVAILABILITY_BYTES);
+
+        // Missing DA: the user-transaction settlement is refused.
+        let settle = v3_with_da(&pre, commitment);
+        let mut l2 = pre.l2_settlement().unwrap().clone();
+        assert_eq!(l2.apply(&settle, *pre.head.as_bytes(), pre.slot, true, &ProofDouble), Err(Reject::DataUnavailable));
+
+        // Same block: DA then settlement. The record is not yet from an
+        // earlier native block, so the settlement is still refused.
+        let mut same = pre.clone();
+        same.apply_transaction(&wire, 0, pre.next_base_fee(), &ToyVerifier).expect("DA applies");
+        assert_eq!(
+            same.apply_transaction(&PosTransaction::L2SettlementAsync(Box::new(settle.clone())), 0, 1, &ProofDouble),
+            Err(TxReject::L2Settlement(Reject::DataUnavailable))
+        );
+
+        // Block 2 includes the DA; only the commitment is stored.
+        let s2 = apply(&pre, 3, std::slice::from_ref(&wire), &mut chains).expect("DA block");
+        let records = s2.l2_settlement().unwrap().data_availability().to_vec();
+        assert_eq!(records, vec![da::Record { l2_number: 1, commitment, height: 3 }]);
+        assert!(s2.eutxos.get(&([0x33; 32], 0)).is_none(), "fee input spent");
+        assert_eq!(s2.eutxos.get(&(wire.txid(), 0)).unwrap().value, tx.change.value);
+        assert_ne!(s2.state_root(), pre.state_root());
+        // Replay of the same DA transaction: its input is gone.
+        let mut replay = s2.clone();
+        assert_eq!(
+            replay.apply_transaction(&wire, 0, s2.next_base_fee(), &ToyVerifier),
+            Err(TxReject::L2DataAvailability(DaReject::MissingInput))
+        );
+        assert_eq!(replay, s2);
+
+        // Wrong commitment: refused. The matching one settles in block 3.
+        let mut l2 = s2.l2_settlement().unwrap().clone();
+        let wrong = v3_with_da(&s2, da::commitment(700771, 1, &batch(&[b"other"])));
+        assert_eq!(l2.apply(&wrong, *s2.head.as_bytes(), s2.slot, true, &ProofDouble), Err(Reject::DataUnavailable));
+        // A user-transaction settlement with a zero commitment never matches.
+        let zero = v3_with_da(&s2, [0; 32]);
+        assert_eq!(l2.apply(&zero, *s2.head.as_bytes(), s2.slot, true, &ProofDouble), Err(Reject::DataUnavailable));
+        let good = PosTransaction::L2SettlementAsync(Box::new(v3_with_da(&s2, commitment)));
+        let s3 = apply(&s2, 4, std::slice::from_ref(&good), &mut chains).expect("settles with DA");
+        assert_eq!(s3.l2_settlement().unwrap().settled_number(), 1);
+        // The record is consumed with its block; a DA for block 1 is now stale.
+        assert!(s3.l2_settlement().unwrap().data_availability().is_empty());
+        let late = da_tx(&s3, (wire.txid(), 0), tx.change.value, 1, payload.clone());
+        let mut st = s3.clone();
+        assert_eq!(
+            st.apply_transaction(&PosTransaction::L2DataAvailability(late), 0, s3.next_base_fee(), &ToyVerifier),
+            Err(TxReject::L2DataAvailability(DaReject::Number))
+        );
+        assert_eq!(st, s3);
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn invalid_l2_da_transactions_are_refused_without_mutation() {
+        let (pre, _) = funded_async_fixture();
+        let payload = batch(&[b"tx"]);
+        let base = da_tx(&pre, ([0x33; 32], 0), FUNDED, 1, payload.clone());
+        let fee = pre.next_base_fee();
+        let mut cases: Vec<(&str, L2DataAvailability, DaReject)> = Vec::new();
+        cases.push(("chain", resign(L2DataAvailability { l2_chain_id: 700772, ..base.clone() }), DaReject::Chain));
+        cases.push(("settled number", resign(L2DataAvailability { l2_block_number: 0, ..base.clone() }), DaReject::Number));
+        cases.push((
+            "beyond window",
+            resign(L2DataAvailability { l2_block_number: da::WINDOW + 1, ..base.clone() }),
+            DaReject::Number,
+        ));
+        cases.push(("network", resign(L2DataAvailability { network_domain: [0x92; 32], ..base.clone() }), DaReject::Network));
+        let mut t = base.clone();
+        t.signature[0] ^= 1;
+        cases.push(("signature", t, DaReject::Signature));
+        let mut t = base.clone();
+        t.change.value += 1;
+        cases.push(("conservation", resign(t), DaReject::Conservation));
+        let mut t = base.clone();
+        t.funding_pubkey[0] ^= 1;
+        cases.push(("ownership", resign(t), DaReject::Ownership));
+        for payload in [batch(&[]), [payload.clone(), vec![0]].concat(), batch(&[&vec![1u8; da::MAX_PAYLOAD_BYTES]])] {
+            let mut t = base.clone();
+            t.payload = payload;
+            t.tx_bytes = t.canonical_bytes().len() as u64 + 64;
+            cases.push(("payload", resign(t), DaReject::Payload));
+        }
+        let mut t = base.clone();
+        t.tx_bytes -= 1;
+        cases.push(("underdeclared", resign(t), DaReject::UnderdeclaredSize));
+        for (name, tx, reject) in cases {
+            let mut state = pre.clone();
+            assert_eq!(
+                state.apply_transaction(&PosTransaction::L2DataAvailability(tx), 0, fee, &ToyVerifier),
+                Err(TxReject::L2DataAvailability(reject)),
+                "{name}"
+            );
+            assert_eq!(state, pre, "{name} mutated state");
+        }
+        // The same batch twice for one block is refused (a different batch is not).
+        let mut state = pre.clone();
+        let first = PosTransaction::L2DataAvailability(base.clone());
+        state.apply_transaction(&first, 0, fee, &ToyVerifier).unwrap();
+        let coin = (first.txid(), 0);
+        let change = base.change.value;
+        let again = da_tx(&state, coin, change, 1, payload.clone());
+        let before = state.clone();
+        assert_eq!(
+            state.apply_transaction(&PosTransaction::L2DataAvailability(again), 0, fee, &ToyVerifier),
+            Err(TxReject::L2DataAvailability(DaReject::Duplicate))
+        );
+        assert_eq!(state, before);
+        let other = da_tx(&state, coin, change, 1, batch(&[b"competing"]));
+        assert!(state.apply_transaction(&PosTransaction::L2DataAvailability(other), 0, fee, &ToyVerifier).is_ok());
+        assert_eq!(state.l2_settlement().unwrap().data_availability().len(), 2);
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn oversize_da_does_not_decode() {
+        let (pre, _) = funded_async_fixture();
+        let mut tx = da_tx(&pre, ([0x33; 32], 0), FUNDED, 1, batch(&[b"x"]));
+        tx.payload = vec![0; da::MAX_PAYLOAD_BYTES + 1];
+        let bytes = PosTransaction::L2DataAvailability(tx).canonical_bytes();
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&bytes),
+            Err(TxDecodeError::NotCanonical(crate::transition::l2_da::L2_DATA_AVAILABILITY_TAG))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn more_than_four_da_batches_in_one_block_are_refused() {
+        let (pre, mut chains) = funded_async_fixture();
+        let mut state = pre.clone();
+        let mut coin = (([0x33; 32], 0), FUNDED);
+        let mut txs = Vec::new();
+        for i in 0..=da::MAX_PER_BLOCK {
+            let tx = da_tx(&state, coin.0, coin.1, 1, batch(&[&[i as u8 + 1]]));
+            let wire = PosTransaction::L2DataAvailability(tx.clone());
+            state.apply_transaction(&wire, 0, pre.next_base_fee(), &ToyVerifier).unwrap();
+            coin = ((wire.txid(), 0), tx.change.value);
+            txs.push(wire);
+        }
+        let t = Transition::new(ToyVerifier);
+        let mut block = build_block(&t, &pre, 2, &[], &[], &mut chains);
+        block.header.body_root =
+            crate::derive::body_root(&txs.iter().map(PosTransaction::canonical_bytes).collect::<Vec<_>>());
+        let pk = crate::attestation::KeyLookup::pubkey(&pre, block.header.proposer_index).unwrap();
+        block.proposer_sig = toy_sign(pk, &block.header.proposal_signing_root());
+        assert_eq!(t.compute_post_state(&pre, &block, &[], &txs), Err(TransitionError::BlockGasLimitExceeded));
+        assert!(apply(&pre, 3, &txs[..da::MAX_PER_BLOCK], &mut chains).is_ok());
+    }
+
+    #[test]
+    #[cfg(not(feature = "devnet-l2-user-txs"))]
+    fn l2_da_is_inert_without_the_user_transaction_feature() {
+        let (pre, _) = funded_async_fixture();
+        let mut state = pre.clone();
+        let tx = PosTransaction::L2DataAvailability(da_tx(&pre, ([0x33; 32], 0), FUNDED, 1, batch(&[b"tx"])));
+        assert_eq!(
+            state.apply_transaction(&tx, 0, pre.next_base_fee(), &ToyVerifier),
+            Err(TxReject::L2DataAvailability(DaReject::NotActive))
+        );
+        assert_eq!(state, pre);
+    }
+
+    /// Records expire after `RETENTION_BLOCKS`; the retained set never
+    /// exceeds `MAX_RECORDS` even with every block full of DA batches.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn da_records_expire_and_stay_bounded() {
+        let (pre, _) = funded_async_fixture();
+        let mut l2 = pre.l2_settlement().unwrap().clone();
+        l2.record_data_availability(700771, 1, [1; 32]).unwrap();
+        l2.advance_height().unwrap();
+        assert!(l2.data_availability().iter().any(|r| r.commitment == [1; 32]));
+        for _ in 1..da::RETENTION_BLOCKS {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(l2.data_availability().len(), 1, "usable for RETENTION_BLOCKS blocks");
+        l2.advance_height().unwrap();
+        assert!(l2.data_availability().is_empty(), "expired");
+
+        // Worst case: MAX_PER_BLOCK new records in every block, forever.
+        let mut l2 = pre.l2_settlement().unwrap().clone();
+        let mut peak = 0;
+        for block in 0..(da::RETENTION_BLOCKS + 64) {
+            for k in 0..da::MAX_PER_BLOCK {
+                let number = 1 + (block % da::WINDOW);
+                let mut c = [0u8; 32];
+                c[..8].copy_from_slice(&block.to_be_bytes());
+                c[8] = k as u8;
+                l2.record_data_availability(700771, number, c).unwrap();
+            }
+            peak = peak.max(l2.data_availability().len());
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(peak, da::MAX_RECORDS);
+        assert!(l2.data_availability().len() < da::MAX_RECORDS);
+        assert!(l2.committed_bytes().len() <= pre.l2_settlement().unwrap().committed_bytes().len() + 26 + 8 + 48 * da::MAX_RECORDS);
     }
 }

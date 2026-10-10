@@ -38,7 +38,8 @@ pub mod v3 {
     pub const WITHDRAWAL_ROOT: usize = 672;
     /// Reserved for M4; must be zero.
     pub const WITHDRAWAL_COUNT: usize = 704;
-    /// Reserved for M3 (data availability); must be zero.
+    /// Data-availability commitment (M3, [`super::da::commitment`]): zero
+    /// when `user_tx_count == 0`, otherwise the commitment of an L1 DA record.
     pub const DA_COMMITMENT: usize = 712;
     pub const END: usize = 744;
 }
@@ -61,6 +62,106 @@ impl StatementVersion {
         }
     }
 }
+/// L1 data availability for settlement V3 user transactions (milestone M3).
+///
+/// A V3 settlement that executed user transactions names, in `da_commitment`,
+/// the batch it executed. The native chain never stores the batch: an
+/// `L2DataAvailability` transaction (wire 0x15) carries it in an L1 block, and
+/// the committed state keeps only `(l2 block number, commitment, inclusion
+/// height)`. The settlement is accepted only when such a record was included
+/// in a strictly earlier native block, so every settled user transaction can
+/// be re-read from L1 blocks alone (`bloch-l2-produce-dev reconstruct`).
+///
+/// Shared format (pinned by `tests/fixtures/l2-da-v1` in both repositories):
+///
+/// * payload: `count (u32 BE, >= 1)` then `count` times `len (u32 BE, >= 1)
+///   || len bytes`, the exact signed EIP-2718 envelopes of the L2 body in body
+///   order, no trailing bytes, at most [`MAX_PAYLOAD_BYTES`];
+/// * commitment: `keccak256("BLOCH:L2:DA:1" || chain_id (u64 BE) ||
+///   l2_block_number (u64 BE) || payload)`.
+pub mod da {
+    use sha3::{Digest, Keccak256};
+
+    pub const COMMITMENT_DOMAIN: &[u8] = b"BLOCH:L2:DA:1";
+    /// 112 KiB. With the largest authorized envelope (hybrid key, signature
+    /// and [`MAX_INPUTS`] inputs, < 9 KiB) one DA transaction stays below the
+    /// pre-V2 byte target (`fee_market::BLOCK_TX_BYTES_TARGET`, 128 KiB), so a
+    /// single batch never fills more than half of the smallest block and never
+    /// by itself pushes the base fee up. It is far above what the prover
+    /// settles per block today (single-digit user transactions).
+    pub const MAX_PAYLOAD_BYTES: usize = 114_688;
+    /// Funding inputs of one DA transaction (each costs one hybrid verification).
+    pub const MAX_INPUTS: usize = 16;
+    /// DA transactions per native block, like blobs per block: inclusion is
+    /// a fee auction, and the stored records stay bounded (see [`MAX_RECORDS`]).
+    pub const MAX_PER_BLOCK: usize = 4;
+    /// A record serves settlements in the next `RETENTION_BLOCKS` native
+    /// blocks after its inclusion, then expires (re-post the batch if the
+    /// settlement has not landed by then).
+    pub const RETENTION_BLOCKS: u64 = 1_024;
+    /// Records are accepted only for the next `WINDOW` unsettled L2 blocks.
+    pub const WINDOW: u64 = 64;
+    /// Upper bound on stored records: the per-block cap times the retained
+    /// blocks plus the block being applied. Each record commits 48 bytes, so
+    /// the DA section of the committed L2 state stays below 193 KiB.
+    pub const MAX_RECORDS: usize = MAX_PER_BLOCK * (RETENTION_BLOCKS as usize + 1);
+    const _: () = assert!(MAX_RECORDS == 4_100);
+
+    /// Number of transactions in a canonical batch payload, or `None` if the
+    /// payload is not exactly one canonical batch within the size cap.
+    pub fn batch_count(payload: &[u8]) -> Option<u32> {
+        if payload.len() > MAX_PAYLOAD_BYTES || payload.len() < 4 {
+            return None;
+        }
+        let count = u32::from_be_bytes(payload[..4].try_into().ok()?);
+        let mut at = 4usize;
+        for _ in 0..count {
+            let len = u32::from_be_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
+            if len == 0 {
+                return None;
+            }
+            at = at.checked_add(4)?.checked_add(len)?;
+            if at > payload.len() {
+                return None;
+            }
+        }
+        (count > 0 && at == payload.len()).then_some(count)
+    }
+
+    pub fn commitment(chain_id: u64, l2_block_number: u64, payload: &[u8]) -> [u8; 32] {
+        let mut h = Keccak256::new();
+        h.update(COMMITMENT_DOMAIN);
+        h.update(chain_id.to_be_bytes());
+        h.update(l2_block_number.to_be_bytes());
+        h.update(payload);
+        h.finalize().into()
+    }
+
+    /// One stored DA record.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Record {
+        pub l2_number: u64,
+        pub commitment: [u8; 32],
+        /// Native height of the block that included the DA transaction.
+        pub height: u64,
+    }
+
+    /// Why the L2 state refused to record a DA batch.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Refusal {
+        /// No L2 policy, or a build without `devnet-l2-user-txs`.
+        NotActive,
+        /// The batch names another L2 chain.
+        Chain,
+        /// Already settled, or beyond [`WINDOW`] unsettled blocks.
+        Number,
+        /// The same (number, commitment) is already recorded.
+        Duplicate,
+        /// [`MAX_RECORDS`] reached (unreachable with the per-block cap).
+        Full,
+    }
+}
+
 /// Records one settlement must consume, when pending: min(pending, this).
 pub const MAX_INBOX_PER_SETTLEMENT: u64 = 64;
 /// Exact L2 body framing tag (`bloch_l2_evm::node_primitives::NodeBodyV2`).
@@ -296,6 +397,8 @@ pub struct State {
     inbox_root: [u8; 32],
     consumed: u64,
     escrow_sat: u128,
+    /// L1 data-availability records (M3), in inclusion order.
+    da: Vec<da::Record>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -317,6 +420,10 @@ pub enum Reject {
     /// chain stores only hashes, so a settled user transaction could not be
     /// reconstructed from L1.
     UserTransactions,
+    /// A V3 statement with user transactions whose `da_commitment` matches no
+    /// L1 data-availability record (same L2 block number) included in a
+    /// strictly earlier native block and still retained.
+    DataUnavailable,
 }
 
 /// Whether this build admits V3 settlements that executed user transactions.
@@ -337,6 +444,7 @@ impl State {
             inbox_root: empty_inbox_root(),
             consumed: 0,
             escrow_sat: 0,
+            da: Vec::new(),
         })
     }
     pub(crate) fn genesis_async(policy: Policy) -> Result<Self, Reject> {
@@ -384,6 +492,48 @@ impl State {
         let end = source.inbox_count.min(self.consumed.saturating_add(MAX_INBOX_PER_SETTLEMENT));
         &self.inbox[self.consumed as usize..end as usize]
     }
+    /// Retained L1 data-availability records, oldest first.
+    pub fn data_availability(&self) -> &[da::Record] {
+        &self.da
+    }
+    /// Number of the last settled L2 block (0 before the first settlement).
+    pub fn settled_number(&self) -> u64 {
+        self.head.as_ref().map_or(0, |(_, s)| n(s, S + 264))
+    }
+    /// Record an L1-published batch for an unsettled L2 block of this chain.
+    /// The caller has already charged and authorized the DA transaction.
+    pub(crate) fn record_data_availability(
+        &mut self,
+        chain_id: u64,
+        l2_number: u64,
+        commitment: [u8; 32],
+    ) -> Result<(), da::Refusal> {
+        use da::Refusal as R;
+        if !USER_TRANSACTIONS_ENABLED {
+            return Err(R::NotActive);
+        }
+        if chain_id != self.policy.chain_id {
+            return Err(R::Chain);
+        }
+        let settled = self.settled_number();
+        if l2_number <= settled || l2_number > settled.saturating_add(da::WINDOW) {
+            return Err(R::Number);
+        }
+        if self.da.iter().any(|r| r.l2_number == l2_number && r.commitment == commitment) {
+            return Err(R::Duplicate);
+        }
+        if self.da.len() >= da::MAX_RECORDS {
+            return Err(R::Full);
+        }
+        let height = self.native_height.checked_add(1).ok_or(R::Full)?;
+        self.da.push(da::Record { l2_number, commitment, height });
+        Ok(())
+    }
+    /// Test hook: install a DA record without a funded DA transaction.
+    #[cfg(test)]
+    pub(crate) fn insert_da_record(&mut self, record: da::Record) {
+        self.da.push(record);
+    }
     pub fn policy(&self) -> &Policy {
         &self.policy
     }
@@ -422,6 +572,10 @@ impl State {
     }
     pub(crate) fn advance_height(&mut self) -> Result<(), Reject> {
         self.native_height = self.native_height.checked_add(1).ok_or(Reject::Height)?;
+        // Expire DA records: one included at height x serves settlements in
+        // native blocks x+1 ..= x+RETENTION_BLOCKS.
+        let height = self.native_height;
+        self.da.retain(|r| r.height.saturating_add(da::RETENTION_BLOCKS) > height);
         Ok(())
     }
     pub fn committed_bytes(&self) -> Vec<u8> {
@@ -462,6 +616,16 @@ impl State {
             if let Some((_, _, _, count, root)) = self.source_anchor {
                 out.extend_from_slice(&count.to_le_bytes());
                 out.extend_from_slice(&root);
+            }
+        }
+        // Absent while empty, so states without DA keep their bytes.
+        if !self.da.is_empty() {
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:DA-STATE:1");
+            out.extend_from_slice(&(self.da.len() as u64).to_le_bytes());
+            for r in &self.da {
+                out.extend_from_slice(&r.l2_number.to_le_bytes());
+                out.extend_from_slice(&r.commitment);
+                out.extend_from_slice(&r.height.to_le_bytes());
             }
         }
         out
@@ -547,19 +711,32 @@ impl State {
             // V3: user transactions allowed; the minted deposits must be
             // exactly the consumed inbox records, in order.
             StatementVersion::V3 => {
-                if n(s, S + v3::USER_TX_COUNT) != 0 && !USER_TRANSACTIONS_ENABLED {
+                let users = n(s, S + v3::USER_TX_COUNT);
+                if users != 0 && !USER_TRANSACTIONS_ENABLED {
                     return Err(Reject::UserTransactions);
                 }
                 if h(s, S + v3::DEPOSITS_HASH) != deposits_hash(consumed) {
                     return Err(Reject::Deposits);
                 }
+                let da_commitment = h(s, S + v3::DA_COMMITMENT);
                 if h(s, S + v3::TRANSACTIONS_ROOT) == [0; 32]
                     || h(s, S + v3::RECEIPTS_ROOT) == [0; 32]
                     || h(s, S + v3::WITHDRAWAL_ROOT) != [0; 32]
                     || n(s, S + v3::WITHDRAWAL_COUNT) != 0
-                    || h(s, S + v3::DA_COMMITMENT) != [0; 32]
+                    || (users == 0 && da_commitment != [0; 32])
                 {
                     return Err(Reject::Reserved);
+                }
+                // User transactions settle only after their batch is on L1:
+                // a retained record for this exact block, from an earlier
+                // native block (a settlement reserves its whole block's gas,
+                // so the rule never depends on in-block ordering).
+                if users != 0
+                    && !self.da.iter().any(|r| {
+                        r.l2_number == number && r.commitment == da_commitment && r.height <= self.native_height
+                    })
+                {
+                    return Err(Reject::DataUnavailable);
                 }
             }
         }
@@ -574,6 +751,8 @@ impl State {
         self.head = Some((tx.commitment(), s.to_vec()));
         self.source_anchor = None;
         self.consumed = end;
+        // Records for settled blocks can never be used again.
+        self.da.retain(|r| r.l2_number > number);
         Ok(())
     }
 

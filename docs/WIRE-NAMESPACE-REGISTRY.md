@@ -878,5 +878,10 @@ assigns transactions `0x0E`-`0x11` to funded delegation). OPEN: state component
 state tags up to `0x20`); it must move (e.g. to `0x21`) in the mainnet port. It
 is not moved here because it changes every genesis state root and invalidates
 the real Groth16 fixtures pinned to the current genesis identity. Both are new per-namespace assignments; tombstones are unchanged.
+M3 (2026-10-10) assigns transaction `0x15` to `L2DataAvailability` (development
+networks, `devnet-l2-user-txs`). `0x15` was checked free on every local branch
+and remote ref (no `*_TAG: u8 = 0x15`..`0x1F` in any transition tree) and on the
+mainnet tree (`MAINNET_TX_TAGS`, highest `0x11`). Its records live inside the
+existing L2 state component; no new state tag is introduced.
 Existing manifests leave the policy absent and the public mempool refuses the
 transaction. See [the protocol and qualification boundary](specs/BLOCH-NATIVE-L2-SETTLEMENT.md).
