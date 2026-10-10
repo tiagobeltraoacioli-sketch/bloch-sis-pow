@@ -45,6 +45,7 @@
 //! rule once integration review starts).
 
 mod codec;
+mod l2_da_cli;
 mod l2_deposit_cli;
 mod engine;
 mod genesis;
@@ -144,6 +145,12 @@ fn main() {
         Some("l2-deposit") => {
             if let Err(error) = l2_deposit_cli::run(&args[1..]) {
                 eprintln!("l2-deposit: {error}");
+                exit(2);
+            }
+        }
+        Some("l2-da") => {
+            if let Err(error) = l2_da_cli::run(&args[1..]) {
+                eprintln!("l2-da: {error}");
                 exit(2);
             }
         }

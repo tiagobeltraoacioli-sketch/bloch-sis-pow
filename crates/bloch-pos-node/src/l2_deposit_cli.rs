@@ -23,7 +23,7 @@ Change returns to the funding key. Consensus requires exact conservation at the
 including block's base fee (query getchaininfo next_base_fee_millisat_per_gas).
 Development networks only: a build without devnet-l2-deposits refuses the deposit.";
 
-fn read_text(path: &str) -> Result<String, String> {
+pub(crate) fn read_text(path: &str) -> Result<String, String> {
     let mut text = String::new();
     std::fs::File::open(path).map_err(|e| e.to_string())?.take(100_001).read_to_string(&mut text).map_err(|e| e.to_string())?;
     if text.len() > 100_000 {
@@ -52,7 +52,7 @@ fn write_tx(path: &str, tx: &L2Deposit) -> Result<(), String> {
     file.sync_all().map_err(|e| e.to_string())
 }
 
-fn options(args: &[String], allowed: &[&str]) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn options(args: &[String], allowed: &[&str]) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
@@ -68,11 +68,11 @@ fn options(args: &[String], allowed: &[&str]) -> Result<Vec<(String, String)>, S
     Ok(out)
 }
 
-fn get<'a>(opts: &'a [(String, String)], flag: &str) -> Result<&'a str, String> {
+pub(crate) fn get<'a>(opts: &'a [(String, String)], flag: &str) -> Result<&'a str, String> {
     opts.iter().find(|(f, _)| f == flag).map(|(_, v)| v.as_str()).ok_or_else(|| format!("missing {flag}"))
 }
 
-fn domain(genesis: &str) -> Result<[u8; 32], String> {
+pub(crate) fn domain(genesis: &str) -> Result<[u8; 32], String> {
     let (manifest, _) = Manifest::load(Path::new(genesis)).map_err(|e| e.to_string())?;
     Ok(Sha3_256::digest(manifest.encode()).into())
 }

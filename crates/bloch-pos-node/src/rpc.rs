@@ -1974,6 +1974,7 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
         PosTransaction::L2Settlement(_) => "l2_settlement",
         PosTransaction::L2SettlementAsync(_) => "l2_settlement_async",
         PosTransaction::L2Deposit(_) => "l2_deposit",
+        PosTransaction::L2DataAvailability(_) => "l2_data_availability",
     };
     Json::obj(vec![
         ("accepted", Json::Bool(true)),
@@ -2472,6 +2473,11 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
             ("count", Json::u(l2.inbox().len() as u64)), ("consumed", Json::u(l2.consumed())),
             ("escrow_sat", Json::s(l2.escrow_sat().to_string())),
         ])),
+        // Retained L1 data-availability records (M3), oldest first.
+        ("data_availability", Json::Arr(l2.data_availability().iter().map(|r| Json::obj(vec![
+            ("l2_number", Json::u(r.l2_number)), ("commitment", Json::hex(&r.commitment)),
+            ("height", Json::u(r.height)),
+        ])).collect())),
         ("accepted", l2.head().map_or(Json::Null, |(commitment, statement)| Json::obj(vec![
             ("commitment", Json::hex(&commitment)), ("statement", Json::s(crate::codec::hex(&statement))),
         ]))),

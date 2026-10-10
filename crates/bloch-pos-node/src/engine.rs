@@ -499,6 +499,7 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
         | PosTransaction::TransferV2 { tip_millisat_per_gas, .. } => *tip_millisat_per_gas,
         PosTransaction::FundedDeposit(tx) => tx.tip_millisat_per_gas,
         PosTransaction::L2Deposit(tx) => tx.tip_millisat_per_gas,
+        PosTransaction::L2DataAvailability(tx) => tx.tip_millisat_per_gas,
         _ => 0,
     }
 }
@@ -527,6 +528,7 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
         }
         PosTransaction::FundedDeposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::L2Deposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::L2DataAvailability(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         _ => None,
     }
 }
@@ -2801,6 +2803,7 @@ impl Engine {
             }
             PosTransaction::FundedDeposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::L2Deposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::L2DataAvailability(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             _ => None,
         }
     }
@@ -3213,6 +3216,8 @@ impl Engine {
         // without it costing security: candidates tied on fee are
         // interchangeable by construction.
         let mut ordered: Vec<(&Vec<u8>, &PosTransaction)> = self.mempool.iter().collect();
+        // Consensus caps DA batches per block; the highest tips win the slots.
+        let mut da_batches = 0usize;
         ordered.sort_by(|(ka, ta), (kb, tb)| {
             tx_tip_rate(tb).cmp(&tx_tip_rate(ta)).then_with(|| ka.cmp(kb))
         });
@@ -3238,11 +3243,18 @@ impl Engine {
                 | PosTransaction::TransferV2 { tx_bytes, .. } => *tx_bytes,
                 PosTransaction::FundedDeposit(tx) => tx.tx_bytes,
                 PosTransaction::L2Deposit(tx) => tx.tx_bytes,
+                PosTransaction::L2DataAvailability(tx) => tx.tx_bytes,
                 _ => 0,
             };
             let n = (encoded.len() as u64).max(declared);
             if bytes.saturating_add(n) > cap {
                 break;
+            }
+            if matches!(tx, PosTransaction::L2DataAvailability(_)) {
+                if da_batches >= bloch_pos_committee::l2_settlement::da::MAX_PER_BLOCK {
+                    continue;
+                }
+                da_batches += 1;
             }
             bytes = bytes.saturating_add(n); // checked against `cap` just above
             out.push(tx.clone());
@@ -5443,6 +5455,21 @@ fn declared_size_bound(tx: &PosTransaction, declared: u64) -> Result<(), &'stati
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     match tx {
         PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => Err("native L2 settlement is not enabled by a shipping genesis manifest"),
+        PosTransaction::L2DataAvailability(batch) => {
+            if !bloch_pos_committee::l2_settlement::USER_TRANSACTIONS_ENABLED {
+                return Err("L2 data availability is not enabled in this build");
+            }
+            // Shape and payload are rechecked in consensus; refuse the
+            // obviously unusable batch before the signature.
+            if bloch_pos_committee::l2_settlement::da::batch_count(&batch.payload).is_none() {
+                return Err("L2 data availability payload is not one canonical batch");
+            }
+            if HybridVerifier::new().verify_with_key(&batch.funding_pubkey, &batch.intent_root(), &batch.signature) {
+                Ok(())
+            } else {
+                Err("invalid L2 data availability hybrid PQ authorization")
+            }
+        }
         PosTransaction::L2Deposit(deposit) => {
             if !cfg!(feature = "devnet-l2-deposits") {
                 return Err("native L2 deposits are not enabled in this build");
