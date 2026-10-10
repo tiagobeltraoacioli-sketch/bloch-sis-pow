@@ -5,9 +5,13 @@
 //! No bridge release, withdrawals or production activation.
 use sha3::{Digest, Keccak256, Sha3_256};
 
-pub const WIRE_TAG: u8 = 0x0e;
+/// Native wire tags. Moved on 2026-10-10 from 0x0E/0x0F to the first bytes
+/// after the mainnet transaction space (mainnet assigns 0x0E-0x11 to funded
+/// delegation; see `tests/wire_tag_registry.rs`). Development networks that
+/// settled under the old bytes (devnet3) cannot be replayed by this build.
+pub const WIRE_TAG: u8 = 0x12;
 /// Asynchronous settlement, enabled only by a new manifest-bound genesis.
-pub const ASYNC_WIRE_TAG: u8 = 0x0f;
+pub const ASYNC_WIRE_TAG: u8 = 0x13;
 pub const STATEMENT_TAG: &[u8] = b"BLOCH:EVM:SETTLEMENT:2";
 pub const STATEMENT_BYTES: usize = 590;
 pub const PROOF_BYTES: usize = 356;

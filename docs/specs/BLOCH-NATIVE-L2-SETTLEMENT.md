@@ -7,7 +7,8 @@ No live network, funded bridge, checkpoint ceremony or RPC finality is activated
 
 ## Committed rules
 
-The experimental native transaction discriminator is `0x0E`, a new assignment
+The experimental native transaction discriminator is `0x12` (originally `0x0E`;
+moved 2026-10-10 because mainnet assigns `0x0E` to `FundedDelegate`), a new assignment
 outside the historical `0x07..0x09` tombstones. Its encoding is exactly 979 bytes:
 `tag || proof_policy[32] || settlement_public_values[590] || groth16_proof[356]`.
 The public-value layout is the existing `BLOCH:EVM:SETTLEMENT:2` big-endian codec.

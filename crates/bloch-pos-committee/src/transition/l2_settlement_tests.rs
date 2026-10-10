@@ -389,7 +389,8 @@ mod l2_tests {
         }
         let old_source = pre.l2_settlement().unwrap().frozen_source().unwrap();
         let tx = PosTransaction::L2SettlementAsync(Box::new(transaction(&pre)));
-        assert_eq!(tx.canonical_bytes()[0], 0x0f);
+        assert_eq!(tx.canonical_bytes()[0], crate::l2_settlement::ASYNC_WIRE_TAG);
+        assert_eq!(crate::l2_settlement::ASYNC_WIRE_TAG, 0x13);
         assert_eq!(PosTransaction::from_canonical_bytes(&tx.canonical_bytes()).unwrap(), tx);
         let before = pre.state_root();
         let block = build_block(&t, &pre, 15, &[], std::slice::from_ref(&tx), &mut chains);

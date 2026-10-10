@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Native L2 deposit (development networks, `devnet-l2-deposits`). Wire tag 0x10.
+//! Native L2 deposit (development networks, `devnet-l2-deposits`). Wire tag 0x14
+//! (moved from 0x10, which mainnet assigns to `FundedDelegationWithdraw`).
 //!
 //! One hybrid PQ funding key spends UTXOs it owns and escrows `amount_sat` for
 //! an EVM recipient on the asynchronous L2. The escrowed value leaves the
@@ -15,7 +16,7 @@ use crate::{
     transition::funded::{FundingInput, ADMISSION_PQ_KEY_BYTES, ADMISSION_PQ_SIGNATURE_MAX},
 };
 
-pub const L2_DEPOSIT_TAG: u8 = 0x10;
+pub const L2_DEPOSIT_TAG: u8 = 0x14;
 pub const MAX_DEPOSIT_INPUTS: usize = 128;
 /// Smallest deposit: 0.01 BLCH. Dust-sized escrow records only bloat the inbox.
 pub const MIN_L2_DEPOSIT_SAT: u64 = 1_000_000;

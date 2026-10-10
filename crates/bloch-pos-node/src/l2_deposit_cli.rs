@@ -35,7 +35,7 @@ fn read_text(path: &str) -> Result<String, String> {
 fn read_tx(path: &str) -> Result<L2Deposit, String> {
     match PosTransaction::from_canonical_bytes(&codec::unhex(read_text(path)?.trim())?).map_err(|e| e.to_string())? {
         PosTransaction::L2Deposit(tx) => Ok(tx),
-        _ => Err("expected an L2 deposit (wire 0x10)".into()),
+        _ => Err("expected an L2 deposit (wire 0x14)".into()),
     }
 }
 
@@ -119,7 +119,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
 }
 
 fn inspect(tx: &L2Deposit) {
-    println!("L2 deposit (wire 0x10)");
+    println!("L2 deposit (wire 0x14)");
     println!("  network domain : {}", codec::hex32(&tx.network_domain));
     println!("  funding key    : sha3 {}", codec::hex32(&Sha3_256::digest(&tx.funding_pubkey).into()));
     for input in &tx.inputs {

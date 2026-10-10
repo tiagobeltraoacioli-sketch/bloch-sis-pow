@@ -328,10 +328,13 @@ const TX_TAGS: &[(u8, Status)] = &[
     (0x0C, Status::Released { name: "ExitV2", rivals: NO_RIVALS }),
     (0x0D, Status::Released { name: "Withdraw", rivals: NO_RIVALS }),
     // New experimental format; no shipping genesis enables this rule.
-    (0x0E, Status::Released { name: "L2Settlement", rivals: NO_RIVALS }),
-    (0x0F, Status::Released { name: "L2SettlementAsync", rivals: NO_RIVALS }),
+    // Moved 2026-10-10 from 0x0E/0x0F/0x10, which mainnet assigns to funded
+    // delegation (see MAINNET_TX_TAGS below). Development history settled under
+    // the old bytes (devnet3) is not replayable by this tree.
+    (0x12, Status::Released { name: "L2Settlement", rivals: NO_RIVALS }),
+    (0x13, Status::Released { name: "L2SettlementAsync", rivals: NO_RIVALS }),
     // Development networks only (`devnet-l2-deposits`); inert otherwise.
-    (0x10, Status::Released { name: "L2Deposit", rivals: NO_RIVALS }),
+    (0x14, Status::Released { name: "L2Deposit", rivals: NO_RIVALS }),
 ];
 
 /// Three lineages that all intend the SAME flag day disagree on all three
@@ -523,9 +526,9 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         PosTransaction::Withdraw { .. } => 0x0D,
         PosTransaction::RandaoRecommit { .. } => 0x0A,
         PosTransaction::FundedDeposit(_) => 0x0B,
-        PosTransaction::L2Settlement(_) => 0x0E,
-        PosTransaction::L2SettlementAsync(_) => 0x0F,
-        PosTransaction::L2Deposit(_) => 0x10,
+        PosTransaction::L2Settlement(_) => 0x12,
+        PosTransaction::L2SettlementAsync(_) => 0x13,
+        PosTransaction::L2Deposit(_) => 0x14,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }
@@ -1084,5 +1087,59 @@ fn domain_separators_match_the_frozen_registry() {
                 found[i].0, found[j].0, found[i].1
             );
         }
+    }
+}
+
+// ===========================================================================
+//          L2 TAGS MUST NOT COLLIDE WITH THE MAINNET TRANSACTION SPACE
+// ===========================================================================
+
+/// Transaction tags assigned on the mainnet protocol tree, copied from
+/// `crates/bloch-pos-committee/tests/wire_tag_registry.rs` (`TX_TAGS`) and
+/// `transition/funded_delegation.rs` on branch/worktree
+/// `wallet-delegation-protocol-20261003` (commit 46e2f4d2), 2026-10-10:
+/// 0x01-0x06 released, 0x07-0x09 tombstoned, 0x0A RandaoRecommit,
+/// 0x0B FundedDeposit, 0x0C ExitV2, 0x0D Withdraw, 0x0E FundedDelegate,
+/// 0x0F FundedUndelegate, 0x10 FundedDelegationWithdraw,
+/// 0x11 ValidatorCommissionUpdate. Highest mainnet tag: 0x11.
+/// Update this list whenever mainnet assigns a new tag.
+const MAINNET_TX_TAGS: &[u8] = &[
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11,
+];
+
+/// The development-only L2 transactions must be portable to mainnet without
+/// re-pointing any byte the mainnet decoder already gives a meaning.
+#[test]
+fn l2_transaction_tags_do_not_overlap_the_mainnet_tag_set() {
+    let l2: Vec<(u8, &str)> = TX_TAGS
+        .iter()
+        .filter_map(|(tag, status)| match status {
+            Status::Released { name, .. } if name.starts_with("L2") => Some((*tag, *name)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        l2,
+        vec![(0x12, "L2Settlement"), (0x13, "L2SettlementAsync"), (0x14, "L2Deposit")],
+        "the L2 rows of the registry changed"
+    );
+    for (tag, name) in &l2 {
+        assert!(
+            !MAINNET_TX_TAGS.contains(tag),
+            "{name} uses {tag:#04x}, which the mainnet tree already assigns"
+        );
+        assert!(*tag > *MAINNET_TX_TAGS.iter().max().unwrap(), "{name} is inside the mainnet range");
+    }
+    // The encoders agree with the registry.
+    assert_eq!(bloch_pos_committee::l2_settlement::WIRE_TAG, 0x12);
+    assert_eq!(bloch_pos_committee::l2_settlement::ASYNC_WIRE_TAG, 0x13);
+    assert_eq!(bloch_pos_committee::transition::l2_deposit::L2_DEPOSIT_TAG, 0x14);
+    // The old bytes no longer decode as L2 transactions in this tree.
+    for old in [0x0E, 0x0F, 0x10] {
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&[old]),
+            Err(TxDecodeError::UnknownTag(old)),
+            "{old:#04x} must be free here (mainnet owns it)"
+        );
     }
 }

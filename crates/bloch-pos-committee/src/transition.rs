@@ -306,9 +306,9 @@ pub struct TransferOutput {
 /// not receive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PosTransaction {
-    /// Experimental native settlement (0x0E); rejected without a genesis policy.
+    /// Experimental native settlement (0x12); rejected without a genesis policy.
     L2Settlement(Box<crate::l2_settlement::Transaction>),
-    /// Manifest-bound asynchronous settlement (0x0F).
+    /// Manifest-bound asynchronous settlement (0x13).
     L2SettlementAsync(Box<crate::l2_settlement::Transaction>),
     /// PQ-authorized, UTXO-funded validator registration (wire 0x0B).
     FundedDeposit(FundedDeposit),

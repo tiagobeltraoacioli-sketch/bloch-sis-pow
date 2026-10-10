@@ -10,8 +10,9 @@ The manifest digest derives the native network identity. The bound genesis
 construction derives the native genesis identity without a hash cycle. The
 decoder rejects carryover balances, allocations and cohorts in this format.
 
-Transaction `0x0F` carries the existing 590-byte V2 statement and 356-byte
-Groth16 proof, with a 32-byte proof-policy identifier. `0x0E` retains its exact
+Transaction `0x13` (originally `0x0F`; renumbered 2026-10-10 to avoid the
+mainnet funded-delegation tags) carries the existing 590-byte V2 statement and 356-byte
+Groth16 proof, with a 32-byte proof-policy identifier. `0x12` retains its exact
 immediate-parent semantics and encoding. Neither mode accepts the other tag.
 
 Before processing transactions, the first transition with a non-genesis parent

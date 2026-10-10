@@ -869,8 +869,14 @@ Distinct namespace; not tracked here.
 
 ## Experimental native L2 settlement (2026-10-01)
 
-The isolated native-settlement development assigns transaction `0x0E` to the
+The isolated native-settlement development assigns transaction `0x12` to the
 fixed 979-byte settlement envelope and state component `0x1F` to its policy and
-cursor. Both are new per-namespace assignments; tombstones are unchanged.
+cursor (2026-10-10: transaction tags moved from `0x0E`, and async settlement and
+L2 deposit from `0x0F`/`0x10`, to `0x12`/`0x13`/`0x14`, because the mainnet tree
+assigns transactions `0x0E`-`0x11` to funded delegation). OPEN: state component
+`0x1F` also collides with mainnet `TAG_FUNDED_DELEGATION_OWNER` (mainnet uses
+state tags up to `0x20`); it must move (e.g. to `0x21`) in the mainnet port. It
+is not moved here because it changes every genesis state root and invalidates
+the real Groth16 fixtures pinned to the current genesis identity. Both are new per-namespace assignments; tombstones are unchanged.
 Existing manifests leave the policy absent and the public mempool refuses the
 transaction. See [the protocol and qualification boundary](specs/BLOCH-NATIVE-L2-SETTLEMENT.md).
