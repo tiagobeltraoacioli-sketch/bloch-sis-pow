@@ -95,6 +95,17 @@ mod v3_tests {
         assert_ne!(policy_commitment(), policy_commitment_v3());
     }
 
+    /// Operator helper for genesis preparation (bloch-l2-evm
+    /// docs/DEVNET4-RECIPE.md, step 4): prints the V2 and V3 policy
+    /// commitments of THIS build (pinned SP1 circuit and full wrapper key).
+    /// `cargo test -p bloch-l2-proof print_policy_commitment_v3 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "operator helper; prints the pinned policies"]
+    fn print_policy_commitment_v3() {
+        println!("policy_commitment_v2 {}", hex(policy_commitment()));
+        println!("policy_commitment_v3 {}", hex(policy_commitment_v3()));
+    }
+
     #[test]
     fn a_policy_never_admits_the_other_statement_version() {
         let program = [7; 32];
