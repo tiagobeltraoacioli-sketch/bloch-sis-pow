@@ -148,3 +148,38 @@ enables `devnet-l2-user-txs`. `getl2settlement` lists the retained records under
 builds and signs the transaction. The shared vector
 `crates/bloch-pos-committee/tests/fixtures/l2-da-v1` pins payload and
 commitment against the L2 codec.
+
+## L2 withdrawal root in settlement V3 (2026-10-10, M4)
+
+The L2 outbox predeploy (`L2ToL1MessagePasser` at `0x4200…0102`,
+`bloch_l2_evm::withdrawal`) burns each withdrawal's value out of the L2 supply
+and appends one leaf to an append-only, depth-32 keccak tree:
+
+* leaf: `keccak256("BLOCH:L2:WITHDRAW:1" || chain_id u64 BE || nonce u64 BE ||
+  l1_recipient (32) || sats u64 BE)`, where `nonce` is the leaf index and
+  `l1_recipient` the native owner script hash (SHA3-256 of the owner's hybrid
+  public key, as in `TransferOutput::script_hash`);
+* node: `keccak256(left || right)`; empty leaf: 32 zero bytes; empty tree root
+  `27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757`
+  (`l2_settlement::withdrawal::empty_root`).
+
+A V3 statement now carries, at offsets 672 and 704 after the tag, the tree's
+root and leaf count after its L2 block (no longer reserved zero). Settlement
+rule (V3): relative to the accepted head (the empty tree before any V3 head or
+after a V2 head) the count must not decrease and the root must change exactly
+when the count does (`Reject::Withdrawals`, checked before the proof, state
+untouched). A settlement that adds leaves stores
+`(l2_number, root, count, native height)` (`withdrawal::Record`,
+`State::withdrawal_roots`). Retention: every record younger than
+`withdrawal::RETENTION_BLOCKS` (1,024) native blocks plus the newest older
+one, so once withdrawals exist a root at least that old is always available;
+at most one settlement per native block, so ≤ 1,026 records × 56 bytes.
+Committed bytes gain the section `BLOCH:NATIVE:L2:WITHDRAWAL-STATE:1` only when
+records exist (states without withdrawals keep their bytes).
+`getl2settlement.withdrawals` shows `{root, count}` of the head and the
+retained `roots`. `withdrawal::root_from_proof` folds a leaf and its 32
+bottom-up siblings into the root it proves, for the L1 claim (M5, not
+implemented: no escrow is released here). The shared vectors
+`crates/bloch-pos-committee/tests/fixtures/l2-withdrawal-v1` (identical copy
+in bloch-l2-evm) pin the leaf, the empty root, trees of 1, 2, 3 and 1,000
+leaves and proofs.

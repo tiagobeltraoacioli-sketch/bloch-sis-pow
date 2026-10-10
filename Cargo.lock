@@ -1572,6 +1572,7 @@ version = "0.1.0"
 dependencies = [
  "bloch-l2-proof",
  "hex",
+ "serde_json",
  "sha3 0.10.9",
 ]
 

@@ -605,7 +605,7 @@ mod l2_tests {
 
     /// Promote a V2 statement to V3: V3 tag, V2 fields unchanged, then the
     /// V3 commitments for a body with `user_txs` transactions minting
-    /// `deposits` (reserved fields zero).
+    /// `deposits` and no withdrawals (the empty withdrawal tree).
     fn to_v3(mut tx: Transaction, deposits: [u8; 32], user_txs: u64) -> Transaction {
         let s = &mut tx.statement;
         s[..S].copy_from_slice(STATEMENT_V3_TAG);
@@ -614,6 +614,8 @@ mod l2_tests {
         s[S + v3::TRANSACTIONS_ROOT..S + v3::TRANSACTIONS_ROOT + 32].copy_from_slice(&[0x7a; 32]);
         s[S + v3::RECEIPTS_ROOT..S + v3::RECEIPTS_ROOT + 32].copy_from_slice(&[0x7b; 32]);
         s[S + v3::USER_TX_COUNT..S + v3::USER_TX_COUNT + 8].copy_from_slice(&user_txs.to_be_bytes());
+        s[S + v3::WITHDRAWAL_ROOT..S + v3::WITHDRAWAL_ROOT + 32]
+            .copy_from_slice(&crate::l2_settlement::withdrawal::empty_root());
         // M3: user transactions name their L1 batch; none means zero.
         if user_txs != 0 {
             s[S + v3::DA_COMMITMENT..S + v3::DA_COMMITMENT + 32].copy_from_slice(&TEST_DA);
@@ -745,8 +747,10 @@ mod l2_tests {
         // Field-level rejections leave state untouched.
         let cases: Vec<(&str, usize, Reject)> = vec![
             ("deposits_hash", S + v3::DEPOSITS_HASH, Reject::Deposits),
-            ("withdrawal_root", S + v3::WITHDRAWAL_ROOT, Reject::Reserved),
-            ("withdrawal_count", S + v3::WITHDRAWAL_COUNT + 7, Reject::Reserved),
+            // M4: without new withdrawals the root must stay the empty tree,
+            // and a new leaf must move the root.
+            ("withdrawal_root", S + v3::WITHDRAWAL_ROOT, Reject::Withdrawals),
+            ("withdrawal_count", S + v3::WITHDRAWAL_COUNT + 7, Reject::Withdrawals),
             // Zero is the only value without user transactions; with them,
             // any other commitment has no L1 record.
             (
@@ -1213,5 +1217,151 @@ mod l2_tests {
         assert_eq!(peak, da::MAX_RECORDS);
         assert!(l2.data_availability().len() < da::MAX_RECORDS);
         assert!(l2.committed_bytes().len() <= pre.l2_settlement().unwrap().committed_bytes().len() + 26 + 8 + 48 * da::MAX_RECORDS);
+    }
+
+    // ── M4: withdrawal root and count ──
+
+    /// A V3 successor of the accepted head of `l2` (or the first settlement),
+    /// for a body without deposits or user transactions, publishing the
+    /// withdrawal tree `(root, count)`.
+    fn next_v3(
+        l2: &crate::l2_settlement::State,
+        parent: [u8; 32],
+        slot: u64,
+        withdrawals: ([u8; 32], u64),
+    ) -> Transaction {
+        let source = l2.source(parent, slot);
+        let mut tx = to_v3(
+            Transaction { proof_policy: l2.policy().proof_policy, statement: TEMPLATE.to_vec(), proof: [1; 356] },
+            no_deposits(),
+            0,
+        );
+        let s = &mut tx.statement;
+        for (i, id) in l2.policy().identities.iter().enumerate() {
+            s[S + i * 32..S + (i + 1) * 32].copy_from_slice(id);
+        }
+        let mut put = |offset: usize, value: &[u8]| s[S + offset..S + offset + value.len()].copy_from_slice(value);
+        put(400, &source.block);
+        put(432, &source.slot.to_be_bytes());
+        put(440, &source.height.to_be_bytes());
+        put(448, &source.commitment);
+        put(480, &source.inbox_root);
+        if let Some((digest, head)) = l2.head() {
+            let number = u64::from_be_bytes(head[S + 264..S + 272].try_into().unwrap()) + 1;
+            put(224, &digest);
+            put(264, &number.to_be_bytes());
+            put(272, &hash_at(&head, S + 336));
+            put(304, &hash_at(&head, S + 368));
+            put(336, &[number as u8 + 0x30; 32]);
+            put(368, &[number as u8 + 0x50; 32]);
+        }
+        put(v3::WITHDRAWAL_ROOT, &withdrawals.0);
+        put(v3::WITHDRAWAL_COUNT, &withdrawals.1.to_be_bytes());
+        tx
+    }
+
+    #[test]
+    fn v3_withdrawal_tree_must_grow_and_its_roots_are_retained() {
+        use crate::l2_settlement::withdrawal::{self, Record};
+        let (pre, _) = fixture();
+        let (parent, slot) = (*pre.head.as_bytes(), pre.slot);
+        let mut l2 = pre.l2_settlement().unwrap().clone();
+        let empty = withdrawal::empty_root();
+        assert_eq!(l2.withdrawal_head(), (empty, 0));
+        let bytes_before = l2.committed_bytes();
+        // Settle, then close the native block.
+        let settle = |l2: &mut crate::l2_settlement::State, w: ([u8; 32], u64)| -> Result<(), Reject> {
+            // One native block per settlement: the slot never trails the height.
+            let slot = slot.max(l2.height());
+            let tx = next_v3(l2, parent, slot, w);
+            let before = l2.clone();
+            let result = l2.apply(&tx, parent, slot, false, &ProofDouble);
+            if result.is_err() {
+                assert_eq!(*l2, before, "a refused settlement mutated state");
+            } else {
+                l2.advance_height().unwrap();
+            }
+            result
+        };
+        // Block 1: no withdrawal. Nothing is recorded; committed bytes keep
+        // the pre-M4 layout apart from the head.
+        settle(&mut l2, (empty, 0)).unwrap();
+        assert!(l2.withdrawal_roots().is_empty());
+        assert!(!l2.committed_bytes().windows(9).any(|w| w == b"WITHDRAWA"));
+        assert_ne!(l2.committed_bytes(), bytes_before);
+        // Block 2: two withdrawals.
+        let r2 = [0x21; 32];
+        settle(&mut l2, (r2, 2)).unwrap();
+        assert_eq!(l2.withdrawal_head(), (r2, 2));
+        let height = l2.height();
+        assert_eq!(l2.withdrawal_roots(), &[Record { l2_number: 2, root: r2, count: 2, height }]);
+        assert!(l2.committed_bytes().windows(34).any(|w| w == b"BLOCH:NATIVE:L2:WITHDRAWAL-STATE:1"));
+        // Refused: fewer leaves, a moved root without leaves, new leaves
+        // without a new root, a zero root.
+        assert_eq!(settle(&mut l2, ([0x22; 32], 1)), Err(Reject::Withdrawals));
+        assert_eq!(settle(&mut l2, ([0x22; 32], 2)), Err(Reject::Withdrawals));
+        assert_eq!(settle(&mut l2, (r2, 3)), Err(Reject::Withdrawals));
+        assert_eq!(settle(&mut l2, (empty, 0)), Err(Reject::Withdrawals));
+        // Block 3: unchanged tree, no new record. Block 4: one more leaf.
+        settle(&mut l2, (r2, 2)).unwrap();
+        assert_eq!(l2.withdrawal_roots().len(), 1);
+        settle(&mut l2, ([0x23; 32], 3)).unwrap();
+        assert_eq!(l2.withdrawal_roots().len(), 2);
+        assert_eq!(l2.withdrawal_roots()[1].l2_number, 4);
+        // A V2 head counts as the empty tree for the next V3 statement.
+        let v2_head = crate::l2_settlement::State::genesis(l2.policy().clone()).unwrap();
+        assert_eq!(v2_head.withdrawal_head(), (empty, 0));
+
+        // Retention: every record younger than RETENTION_BLOCKS and the
+        // newest older one (so a mature root always remains).
+        for _ in 0..withdrawal::RETENTION_BLOCKS {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(l2.withdrawal_roots().len(), 1);
+        assert_eq!(l2.withdrawal_roots()[0].root, [0x23; 32]);
+        settle(&mut l2, ([0x24; 32], 4)).unwrap();
+        for _ in 0..3 * withdrawal::RETENTION_BLOCKS {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(l2.withdrawal_roots().len(), 1);
+        assert_eq!(l2.withdrawal_roots()[0].root, [0x24; 32]);
+    }
+
+    /// Shared vectors with bloch-l2-evm (`tests/fixtures/l2-withdrawal-v1`,
+    /// identical copy), rebuilt from THIS crate's leaf and tree code.
+    #[test]
+    fn withdrawal_leaf_and_tree_match_the_shared_l2_vectors() {
+        use crate::l2_settlement::withdrawal;
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/l2-withdrawal-v1/vectors.json")).unwrap();
+        let hex32 = |v: &serde_json::Value| -> [u8; 32] {
+            hex::decode(v.as_str().unwrap().trim_start_matches("0x")).unwrap().try_into().unwrap()
+        };
+        let int = |v: &serde_json::Value| v.as_u64().unwrap();
+        assert_eq!(hex32(&fixture["empty_root"]), withdrawal::empty_root());
+        let leaves = fixture["leaves"].as_array().unwrap();
+        assert_eq!(leaves.len(), 3);
+        for leaf in leaves {
+            let computed =
+                withdrawal::leaf(int(&leaf["chain_id"]), int(&leaf["nonce"]), &hex32(&leaf["l1_recipient"]), int(&leaf["sats"]));
+            assert_eq!(computed, hex32(&leaf["leaf"]));
+        }
+        let chain = int(&fixture["chain_id"]);
+        let vector_leaf = |i: u64| withdrawal::leaf(chain, i, &[(i % 255) as u8 + 1; 32], 1_000_000 + i);
+        let trees = fixture["trees"].as_array().unwrap();
+        assert_eq!(trees.iter().map(|t| int(&t["count"])).collect::<Vec<_>>(), vec![1, 2, 3, 1000]);
+        for tree in trees {
+            let leaves: Vec<[u8; 32]> = (0..int(&tree["count"])).map(vector_leaf).collect();
+            let root = hex32(&tree["root"]);
+            assert_eq!(withdrawal::root(&leaves), root, "{} leaves", leaves.len());
+            for proof in tree["proofs"].as_array().unwrap() {
+                let index = int(&proof["index"]);
+                let siblings: Vec<[u8; 32]> = proof["siblings"].as_array().unwrap().iter().map(hex32).collect();
+                let siblings: [[u8; 32]; 32] = siblings.try_into().unwrap();
+                assert_eq!(withdrawal::root_from_proof(&vector_leaf(index), index, &siblings), Some(root));
+                assert_ne!(withdrawal::root_from_proof(&vector_leaf(index), index ^ 1, &siblings), Some(root));
+            }
+        }
+        assert_eq!(withdrawal::root_from_proof(&[0; 32], 1 << 32, &[[0; 32]; 32]), None);
     }
 }

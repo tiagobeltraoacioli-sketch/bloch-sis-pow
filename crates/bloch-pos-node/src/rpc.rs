@@ -2478,6 +2478,18 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
             ("l2_number", Json::u(r.l2_number)), ("commitment", Json::hex(&r.commitment)),
             ("height", Json::u(r.height)),
         ])).collect())),
+        // Withdrawal tree after the accepted head and the retained roots of
+        // settlements that added withdrawals (M4), oldest first.
+        ("withdrawals", {
+            let (root, count) = l2.withdrawal_head();
+            Json::obj(vec![
+                ("root", Json::hex(&root)), ("count", Json::u(count)),
+                ("roots", Json::Arr(l2.withdrawal_roots().iter().map(|r| Json::obj(vec![
+                    ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
+                    ("count", Json::u(r.count)), ("height", Json::u(r.height)),
+                ])).collect())),
+            ])
+        }),
         ("accepted", l2.head().map_or(Json::Null, |(commitment, statement)| Json::obj(vec![
             ("commitment", Json::hex(&commitment)), ("statement", Json::s(crate::codec::hex(&statement))),
         ]))),

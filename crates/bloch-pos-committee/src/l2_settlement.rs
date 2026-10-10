@@ -2,7 +2,9 @@
 //! Native, parent-state-owned settlement validation for the L2 inbox.
 //! With `devnet-l2-deposits`, native L2 deposits (escrowed BLCH) append to an
 //! ordered inbox and each settlement must mint exactly the next inbox records.
-//! No bridge release, withdrawals or production activation.
+//! Settlement V3 publishes the L2 withdrawal tree (M4); this module checks it
+//! and keeps recent roots for the L1 claim (M5). No bridge release or
+//! production activation.
 use sha3::{Digest, Keccak256, Sha3_256};
 
 /// Native wire tags. Moved on 2026-10-10 from 0x0E/0x0F to the first bytes
@@ -19,7 +21,8 @@ pub const PROOF_BYTES: usize = 356;
 pub const TRANSACTION_BYTES: usize = 1 + 32 + STATEMENT_BYTES + PROOF_BYTES;
 /// Settlement V3 (`bloch_l2_evm::proof_statement::SettlementStatementV3`):
 /// the V2 fields at their V2 offsets, then deposits hash, transactions root,
-/// receipts root, user transaction count, and three M1-reserved fields.
+/// receipts root, user transaction count, withdrawal root and count (M4), and
+/// the data-availability commitment (M3).
 /// V3 admits L2 blocks with user transactions; deposits are bound through
 /// `deposits_hash` instead of recomputing an empty body.
 pub const STATEMENT_V3_TAG: &[u8] = b"BLOCH:EVM:SETTLEMENT:3";
@@ -159,6 +162,108 @@ pub mod da {
         Duplicate,
         /// [`MAX_RECORDS`] reached (unreachable with the per-block cap).
         Full,
+    }
+}
+
+/// L2 → L1 withdrawals (milestone M4): the commitment settlement V3 publishes.
+///
+/// The L2 outbox (`L2ToL1MessagePasser`, `bloch_l2_evm::withdrawal`) appends
+/// one leaf per withdrawal to an append-only, depth-32 keccak tree:
+///
+/// * leaf: `keccak256("BLOCH:L2:WITHDRAW:1" || chain_id (u64 BE) || nonce
+///   (u64 BE, the leaf index) || l1_recipient (32, the owner script hash) ||
+///   sats (u64 BE))`;
+/// * node: `keccak256(left || right)`; empty leaf: 32 zero bytes; the empty
+///   tree's root is [`empty_root`].
+///
+/// A V3 statement carries the root and the leaf count after its L2 block. The
+/// native chain accepts it only if the count does not decrease and the root
+/// changes exactly when the count does (relative to the accepted head; a V2
+/// head counts as the empty tree), and keeps `(l2 number, root, count, native
+/// height)` of each settlement that added withdrawals ([`Record`]) for the L1
+/// claim (M5), which proves a leaf against a retained root with
+/// [`root_from_proof`]. Shared vectors: `tests/fixtures/l2-withdrawal-v1`
+/// (identical copy in bloch-l2-evm).
+pub mod withdrawal {
+    use sha3::{Digest, Keccak256};
+
+    pub const LEAF_DOMAIN: &[u8] = b"BLOCH:L2:WITHDRAW:1";
+    pub const TREE_DEPTH: usize = 32;
+    /// Records younger than this many native blocks are always kept; of the
+    /// older ones only the newest survives, so a root at least this old stays
+    /// available to claims once withdrawals exist.
+    pub const RETENTION_BLOCKS: u64 = 1_024;
+    /// Upper bound on stored records: at most one settlement per native block
+    /// adds a record, plus the retained older one and the block being applied.
+    /// Each record commits 56 bytes, so this section stays below 58 KiB.
+    pub const MAX_RECORDS: usize = RETENTION_BLOCKS as usize + 2;
+
+    pub fn leaf(chain_id: u64, nonce: u64, l1_recipient: &[u8; 32], sats: u64) -> [u8; 32] {
+        let mut h = Keccak256::new();
+        h.update(LEAF_DOMAIN);
+        h.update(chain_id.to_be_bytes());
+        h.update(nonce.to_be_bytes());
+        h.update(l1_recipient);
+        h.update(sats.to_be_bytes());
+        h.finalize().into()
+    }
+
+    fn node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+        let mut h = Keccak256::new();
+        h.update(left);
+        h.update(right);
+        h.finalize().into()
+    }
+
+    /// `zero[0]` is the empty leaf, `zero[h + 1] = node(zero[h], zero[h])`.
+    pub fn zero_hashes() -> [[u8; 32]; TREE_DEPTH + 1] {
+        let mut zero = [[0u8; 32]; TREE_DEPTH + 1];
+        for h in 0..TREE_DEPTH {
+            zero[h + 1] = node(&zero[h], &zero[h]);
+        }
+        zero
+    }
+
+    pub fn empty_root() -> [u8; 32] {
+        zero_hashes()[TREE_DEPTH]
+    }
+
+    /// Root of the tree over `leaves` in index order (tests and tooling; the
+    /// chain never sees the leaves).
+    pub fn root(leaves: &[[u8; 32]]) -> [u8; 32] {
+        let zero = zero_hashes();
+        let mut level = leaves.to_vec();
+        for z in zero.iter().take(TREE_DEPTH) {
+            if level.is_empty() {
+                return zero[TREE_DEPTH];
+            }
+            level = level.chunks(2).map(|pair| node(&pair[0], pair.get(1).unwrap_or(z))).collect();
+        }
+        level[0]
+    }
+
+    /// The root that `siblings` (bottom-up) prove for `leaf` at `index`, or
+    /// `None` for an index outside the tree. The claim must also check
+    /// `index < count` of the root it cites.
+    pub fn root_from_proof(leaf: &[u8; 32], index: u64, siblings: &[[u8; 32]; TREE_DEPTH]) -> Option<[u8; 32]> {
+        if index >> TREE_DEPTH != 0 {
+            return None;
+        }
+        let mut acc = *leaf;
+        for (h, sibling) in siblings.iter().enumerate() {
+            acc = if (index >> h) & 1 == 1 { node(sibling, &acc) } else { node(&acc, sibling) };
+        }
+        Some(acc)
+    }
+
+    /// One accepted settlement that added withdrawals.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Record {
+        pub l2_number: u64,
+        pub root: [u8; 32],
+        pub count: u64,
+        /// Native height of the block that accepted the settlement.
+        pub height: u64,
     }
 }
 
@@ -399,6 +504,9 @@ pub struct State {
     escrow_sat: u128,
     /// L1 data-availability records (M3), in inclusion order.
     da: Vec<da::Record>,
+    /// Withdrawal roots of settlements that added withdrawals (M4), oldest
+    /// first, pruned by [`withdrawal::RETENTION_BLOCKS`].
+    withdrawals: Vec<withdrawal::Record>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -411,9 +519,12 @@ pub enum Reject {
     Limit,
     /// The proven L2 body does not mint exactly the consumed inbox records.
     Deposits,
-    /// A V3 field reserved for a later milestone is not zero, or a V3 body
-    /// commitment is zero.
+    /// A V3 body commitment is zero, or a V3 `da_commitment` is set without
+    /// user transactions.
     Reserved,
+    /// The V3 withdrawal count decreased, or the withdrawal root changed
+    /// without new withdrawals (or did not change with new ones).
+    Withdrawals,
     /// A V3 statement with `user_tx_count > 0` on a build without the
     /// `devnet-l2-user-txs` feature. User transactions stay disabled outside
     /// development networks until data availability (M3) exists: the native
@@ -445,6 +556,7 @@ impl State {
             consumed: 0,
             escrow_sat: 0,
             da: Vec::new(),
+            withdrawals: Vec::new(),
         })
     }
     pub(crate) fn genesis_async(policy: Policy) -> Result<Self, Reject> {
@@ -495,6 +607,21 @@ impl State {
     /// Retained L1 data-availability records, oldest first.
     pub fn data_availability(&self) -> &[da::Record] {
         &self.da
+    }
+    /// Retained withdrawal roots (M4), oldest first: the roots an L1 claim
+    /// can prove against.
+    pub fn withdrawal_roots(&self) -> &[withdrawal::Record] {
+        &self.withdrawals
+    }
+    /// `(root, count)` of the withdrawal tree after the accepted head: the
+    /// empty tree before any V3 settlement (and after a V2 head).
+    pub fn withdrawal_head(&self) -> ([u8; 32], u64) {
+        match &self.head {
+            Some((_, s)) if StatementVersion::of(s) == Some(StatementVersion::V3) => {
+                (h(s, S + v3::WITHDRAWAL_ROOT), n(s, S + v3::WITHDRAWAL_COUNT))
+            }
+            _ => (withdrawal::empty_root(), 0),
+        }
     }
     /// Number of the last settled L2 block (0 before the first settlement).
     pub fn settled_number(&self) -> u64 {
@@ -576,6 +703,12 @@ impl State {
         // native blocks x+1 ..= x+RETENTION_BLOCKS.
         let height = self.native_height;
         self.da.retain(|r| r.height.saturating_add(da::RETENTION_BLOCKS) > height);
+        // Withdrawal roots: keep every record younger than the retention
+        // window and the newest older one (records are in height order).
+        let old = self.withdrawals.iter().take_while(|r| r.height.saturating_add(withdrawal::RETENTION_BLOCKS) <= height).count();
+        if old > 1 {
+            self.withdrawals.drain(..old - 1);
+        }
         Ok(())
     }
     pub fn committed_bytes(&self) -> Vec<u8> {
@@ -616,6 +749,17 @@ impl State {
             if let Some((_, _, _, count, root)) = self.source_anchor {
                 out.extend_from_slice(&count.to_le_bytes());
                 out.extend_from_slice(&root);
+            }
+        }
+        // Absent while empty, so states without withdrawals keep their bytes.
+        if !self.withdrawals.is_empty() {
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:WITHDRAWAL-STATE:1");
+            out.extend_from_slice(&(self.withdrawals.len() as u64).to_le_bytes());
+            for r in &self.withdrawals {
+                out.extend_from_slice(&r.l2_number.to_le_bytes());
+                out.extend_from_slice(&r.root);
+                out.extend_from_slice(&r.count.to_le_bytes());
+                out.extend_from_slice(&r.height.to_le_bytes());
             }
         }
         // Absent while empty, so states without DA keep their bytes.
@@ -701,6 +845,7 @@ impl State {
         }
         // The proof binds the body; consensus binds the body to the inbox.
         let consumed = &self.inbox[self.consumed as usize..end as usize];
+        let mut new_withdrawals = None;
         match version {
             // V2 history: the body must be exactly the deposits, no user txs.
             StatementVersion::V2 => {
@@ -721,11 +866,24 @@ impl State {
                 let da_commitment = h(s, S + v3::DA_COMMITMENT);
                 if h(s, S + v3::TRANSACTIONS_ROOT) == [0; 32]
                     || h(s, S + v3::RECEIPTS_ROOT) == [0; 32]
-                    || h(s, S + v3::WITHDRAWAL_ROOT) != [0; 32]
-                    || n(s, S + v3::WITHDRAWAL_COUNT) != 0
                     || (users == 0 && da_commitment != [0; 32])
                 {
                     return Err(Reject::Reserved);
+                }
+                // The withdrawal tree only grows, and its root moves exactly
+                // when leaves are added.
+                let (root, count) = (h(s, S + v3::WITHDRAWAL_ROOT), n(s, S + v3::WITHDRAWAL_COUNT));
+                let (head_root, head_count) = self.withdrawal_head();
+                if count < head_count || (count == head_count) != (root == head_root) {
+                    return Err(Reject::Withdrawals);
+                }
+                if count > head_count {
+                    new_withdrawals = Some(withdrawal::Record {
+                        l2_number: number,
+                        root,
+                        count,
+                        height: self.native_height.checked_add(1).ok_or(Reject::Height)?,
+                    });
                 }
                 // User transactions settle only after their batch is on L1:
                 // a retained record for this exact block, from an earlier
@@ -747,6 +905,12 @@ impl State {
             &tx.proof,
         ) {
             return Err(Reject::Proof);
+        }
+        if let Some(record) = new_withdrawals {
+            if self.withdrawals.len() >= withdrawal::MAX_RECORDS {
+                return Err(Reject::Limit);
+            }
+            self.withdrawals.push(record);
         }
         self.head = Some((tx.commitment(), s.to_vec()));
         self.source_anchor = None;
