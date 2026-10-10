@@ -56,6 +56,8 @@ perf-timing = ["bloch-pos-committee/perf-timing"]
 devnet-randao-recommit = ["bloch-pos-committee/devnet-randao-recommit"]
 # DEVELOPMENT NETWORKS ONLY; see bloch-pos-committee.
 devnet-l2-deposits = ["bloch-pos-committee/devnet-l2-deposits"]
+# DEVELOPMENT NETWORKS ONLY; see bloch-pos-committee (user transactions before DA).
+devnet-l2-user-txs = ["devnet-l2-deposits", "bloch-pos-committee/devnet-l2-user-txs"]
 
 [dependencies]
 bloch-l2-proof = { path = "../bloch-l2-proof" }

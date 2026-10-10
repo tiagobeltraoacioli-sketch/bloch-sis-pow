@@ -622,11 +622,16 @@ mod l2_tests {
     fn no_deposits() -> [u8; 32] {
         crate::l2_settlement::deposits_hash(&[])
     }
+    /// User transaction count for tests that must pass on every build: real
+    /// user transactions only where the devnet feature admits them (M2.6).
+    fn user_txs(n: u64) -> u64 {
+        if crate::l2_settlement::USER_TRANSACTIONS_ENABLED { n } else { 0 }
+    }
 
     #[test]
     fn v3_settlement_with_user_transactions_is_accepted_and_replays() {
         let (pre, mut chains) = fixture();
-        let settlement = to_v3(transaction(&pre), no_deposits(), 3);
+        let settlement = to_v3(transaction(&pre), no_deposits(), user_txs(3));
         let tx = PosTransaction::L2Settlement(Box::new(settlement.clone()));
         let bytes = tx.canonical_bytes();
         assert_eq!(bytes.len(), TRANSACTION_V3_BYTES);
@@ -655,10 +660,37 @@ mod l2_tests {
         );
     }
 
+    /// M2.6 production guard: until L1 data availability (M3) exists, only a
+    /// `devnet-l2-user-txs` build admits a V3 settlement with user transactions.
+    /// The check runs before deposits and the proof, and never mutates state.
+    #[test]
+    fn v3_user_transactions_require_the_devnet_feature() {
+        let (pre, _) = fixture();
+        assert_eq!(crate::l2_settlement::USER_TRANSACTIONS_ENABLED, cfg!(feature = "devnet-l2-user-txs"));
+        for count in [1u64, 2, u64::MAX] {
+            let tx = PosTransaction::L2Settlement(Box::new(to_v3(transaction(&pre), no_deposits(), count)));
+            let mut state = pre.clone();
+            let result = state.apply_transaction(&tx, 0, 1, &ProofDouble);
+            if cfg!(feature = "devnet-l2-user-txs") {
+                assert!(result.is_ok(), "count {count}: {result:?}");
+            } else {
+                assert_eq!(result, Err(TxReject::L2Settlement(Reject::UserTransactions)), "count {count}");
+                assert_eq!(state, pre, "count {count} mutated state");
+            }
+        }
+        // A deposit-only V3 settlement (user_tx_count = 0) is accepted on every build.
+        let tx = PosTransaction::L2Settlement(Box::new(to_v3(transaction(&pre), no_deposits(), 0)));
+        let mut state = pre.clone();
+        assert!(state.apply_transaction(&tx, 0, 1, &ProofDouble).is_ok());
+        // The guard does not apply to V2 statements, which cannot carry user
+        // transactions at all (their body is recomputed as deposit-only).
+        assert!(pre.clone().apply_transaction(&PosTransaction::L2Settlement(Box::new(transaction(&pre))), 0, 1, &ProofDouble).is_ok());
+    }
+
     #[test]
     fn v3_rejects_wrong_length_tag_deposits_and_reserved_fields() {
         let (pre, _) = fixture();
-        let good = to_v3(transaction(&pre), no_deposits(), 1);
+        let good = to_v3(transaction(&pre), no_deposits(), user_txs(1));
         let encoded = good.encode();
         // Wrong length: every truncation, and a suffix.
         for len in 0..TRANSACTION_V3_BYTES {
@@ -727,13 +759,13 @@ mod l2_tests {
     fn v3_out_of_order_settlement_is_refused() {
         let (pre, mut chains) = fixture();
         let t = Transition::new(ProofDouble);
-        let first = PosTransaction::L2Settlement(Box::new(to_v3(transaction(&pre), no_deposits(), 1)));
+        let first = PosTransaction::L2Settlement(Box::new(to_v3(transaction(&pre), no_deposits(), user_txs(1))));
         let block = build_block(&t, &pre, 2, &[], std::slice::from_ref(&first), &mut chains);
         let s2 = t.apply_block(&pre, &block, &[], std::slice::from_ref(&first)).unwrap();
         // Skips a number / does not chain from the accepted head.
         let state = s2.l2_settlement().unwrap();
         let (digest, old) = state.head().unwrap();
-        let mut next = to_v3(transaction(&s2), no_deposits(), 2);
+        let mut next = to_v3(transaction(&s2), no_deposits(), user_txs(2));
         next.statement[S + 224..S + 256].copy_from_slice(&digest);
         next.statement[S + 272..S + 304].copy_from_slice(&old[S + 336..S + 368]);
         next.statement[S + 304..S + 336].copy_from_slice(&old[S + 368..S + 400]);
@@ -766,7 +798,7 @@ mod l2_tests {
         let record = s2.l2_settlement().unwrap().inbox()[0];
         // Anchor predates the deposit: consumes nothing, user txs only.
         let empty = crate::l2_settlement::expected_body_commitment(&[]);
-        let first = PosTransaction::L2SettlementAsync(Box::new(to_v3(settlement(&s2, empty), no_deposits(), 4)));
+        let first = PosTransaction::L2SettlementAsync(Box::new(to_v3(settlement(&s2, empty), no_deposits(), user_txs(4))));
         let s3 = apply(&s2, 3, std::slice::from_ref(&first), &mut chains).expect("V3 with user txs, no deposits");
         assert_eq!(s3.l2_settlement().unwrap().consumed(), 0);
         let s3b = apply(&s3, 4, &[], &mut chains).unwrap();
@@ -778,18 +810,18 @@ mod l2_tests {
             crate::l2_settlement::deposits_hash(&[crate::l2_settlement::InboxRecord { recipient: [0x43; 20], ..record }]),
             crate::l2_settlement::deposits_hash(&[record, record]),
         ] {
-            let bad = to_v3(settlement(&s3b, empty), wrong, 2);
+            let bad = to_v3(settlement(&s3b, empty), wrong, user_txs(2));
             let mut l2 = s3b.l2_settlement().unwrap().clone();
             assert_eq!(l2.apply(&bad, *s3b.head.as_bytes(), s3b.slot, true, &ProofDouble), Err(Reject::Deposits));
         }
         // A wrong consumed range is refused before deposits are compared.
-        let mut range = to_v3(settlement(&s3b, empty), exact, 2);
+        let mut range = to_v3(settlement(&s3b, empty), exact, user_txs(2));
         range.statement[S + 528..S + 536].copy_from_slice(&0u64.to_be_bytes());
         let mut l2 = s3b.l2_settlement().unwrap().clone();
         assert_eq!(l2.apply(&range, *s3b.head.as_bytes(), s3b.slot, true, &ProofDouble), Err(Reject::Source));
         // The V3 body commitment is NOT recomputed: any body (here with two
         // user txs) settles as long as deposits_hash matches the inbox.
-        let good = PosTransaction::L2SettlementAsync(Box::new(to_v3(settlement(&s3b, empty), exact, 2)));
+        let good = PosTransaction::L2SettlementAsync(Box::new(to_v3(settlement(&s3b, empty), exact, user_txs(2))));
         let s5 = apply(&s3b, 5, std::slice::from_ref(&good), &mut chains).expect("V3 mints the deposit");
         assert_eq!(s5.l2_settlement().unwrap().consumed(), 1);
         assert_eq!(s5.l2_settlement().unwrap().escrow_sat(), u128::from(amount));

@@ -92,3 +92,17 @@ Deployment still requires reviewed native network/activation configuration,
 validator replay and fault qualification, production checkpoint authority, durable
 publication and Reth finality qualification. Decoding or verifying a proof alone
 does not satisfy those requirements. No production readiness flag changes here.
+
+## Settlement V3 and the user-transaction guard (2026-10-10, M2)
+
+A V3 statement (`BLOCH:EVM:SETTLEMENT:3`, 766 bytes, 1155-byte transaction under
+tags 0x12/0x13) may report `user_tx_count > 0`. Until L1 data availability (M3)
+exists the native chain stores only hashes, so a settled user transaction could
+not be rebuilt from L1. The verifier therefore refuses any V3 statement with
+`user_tx_count > 0` with `Reject::UserTransactions` unless the build enables the
+development feature `devnet-l2-user-txs` (which implies `devnet-l2-deposits`).
+The check runs before the deposit and proof checks and never mutates state;
+deposit-only V3 settlements (`user_tx_count = 0`) are accepted on every build.
+`l2_settlement::USER_TRANSACTIONS_ENABLED` exposes the build's choice.
+The 1155-byte frame is pinned by the shared vector in
+`crates/bloch-pos-committee/tests/l2_settlement_v3_frame.rs`.

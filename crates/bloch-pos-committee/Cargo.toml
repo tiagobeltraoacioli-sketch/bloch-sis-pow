@@ -24,6 +24,10 @@ devnet-randao-recommit = []
 # DEVELOPMENT NETWORKS ONLY. Native L2 deposits: escrowed BLCH appended to the
 # L2 inbox, and settlements must mint exactly the consumed inbox records.
 devnet-l2-deposits = []
+# DEVELOPMENT NETWORKS ONLY. Admits settlement V3 statements with
+# user_tx_count > 0. Without it the native verifier refuses them
+# (Reject::UserTransactions) until L1 data availability (M3) exists.
+devnet-l2-user-txs = ["devnet-l2-deposits"]
 
 [dependencies]
 sha3 = { version = "0.10", default-features = false }

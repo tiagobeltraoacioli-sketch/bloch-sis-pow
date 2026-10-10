@@ -311,7 +311,17 @@ pub enum Reject {
     /// A V3 field reserved for a later milestone is not zero, or a V3 body
     /// commitment is zero.
     Reserved,
+    /// A V3 statement with `user_tx_count > 0` on a build without the
+    /// `devnet-l2-user-txs` feature. User transactions stay disabled outside
+    /// development networks until data availability (M3) exists: the native
+    /// chain stores only hashes, so a settled user transaction could not be
+    /// reconstructed from L1.
+    UserTransactions,
 }
+
+/// Whether this build admits V3 settlements that executed user transactions.
+/// Only development networks enable it (feature `devnet-l2-user-txs`).
+pub const USER_TRANSACTIONS_ENABLED: bool = cfg!(feature = "devnet-l2-user-txs");
 impl State {
     pub fn genesis(policy: Policy) -> Result<Self, Reject> {
         if !policy.valid() {
@@ -537,6 +547,9 @@ impl State {
             // V3: user transactions allowed; the minted deposits must be
             // exactly the consumed inbox records, in order.
             StatementVersion::V3 => {
+                if n(s, S + v3::USER_TX_COUNT) != 0 && !USER_TRANSACTIONS_ENABLED {
+                    return Err(Reject::UserTransactions);
+                }
                 if h(s, S + v3::DEPOSITS_HASH) != deposits_hash(consumed) {
                     return Err(Reject::Deposits);
                 }
