@@ -33,7 +33,10 @@ impl L2Config {
         };
         r.finish()?;
         if !value.policy([1;32], [2;32]).valid()
-            || value.proof_policy != bloch_l2_proof::policy_commitment() {
+            // V2 (existing networks) or V3 (user transactions); exactly one is
+            // pinned per genesis and the verifier admits only its own version.
+            || (value.proof_policy != bloch_l2_proof::policy_commitment()
+                && value.proof_policy != bloch_l2_proof::policy_commitment_v3()) {
             return Err(DecodeErr("invalid or unsupported L2 policy"));
         }
         Ok(value)

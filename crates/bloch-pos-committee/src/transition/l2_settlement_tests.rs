@@ -56,7 +56,7 @@ mod l2_tests {
     fn transaction(pre: &CommittedState) -> Transaction {
         let state = pre.l2_settlement().unwrap();
         let source = state.source(*pre.head.as_bytes(), pre.slot);
-        let mut statement = *TEMPLATE;
+        let mut statement = TEMPLATE.to_vec();
         for (i, id) in state.policy().identities.iter().enumerate() {
             statement[S + i * 32..S + (i + 1) * 32].copy_from_slice(id);
         }
@@ -201,7 +201,7 @@ mod l2_tests {
         let mut state = pre.clone();
         let tx = Transaction {
             proof_policy: bloch_l2_proof::policy_commitment(),
-            statement: *values,
+            statement: values.to_vec(),
             proof: *proof,
         };
         assert_eq!(
@@ -219,11 +219,11 @@ mod l2_tests {
     fn native_l2_real_groth16_applies_in_the_actual_transition_and_replays() {
         let (pre, mut chains) = fixture();
         let statement =
-            *include_bytes!("../../../bloch-l2-proof/tests/fixtures/native-empty.values");
+            include_bytes!("../../../bloch-l2-proof/tests/fixtures/native-empty.values").to_vec();
         let proof = *include_bytes!("../../../bloch-l2-proof/tests/fixtures/native-empty.proof");
         let settlement = Transaction {
             proof_policy: pre.l2_settlement().unwrap().policy().proof_policy,
-            statement,
+            statement: statement.clone(),
             proof,
         };
         let tx = PosTransaction::L2Settlement(Box::new(settlement.clone()));
@@ -597,5 +597,220 @@ mod l2_tests {
         let tx = PosTransaction::L2Deposit(deposit_tx(&pre, 7_000_000_000));
         assert!(state.apply_transaction(&tx, 0, pre.next_base_fee(), &ToyVerifier).is_err());
         assert_eq!(state, pre);
+    }
+
+    // ── Settlement V3: user transactions, deposits bound by deposits_hash ──
+
+    use crate::l2_settlement::{v3, STATEMENT_V3_BYTES, STATEMENT_V3_TAG, TRANSACTION_V3_BYTES};
+
+    /// Promote a V2 statement to V3: V3 tag, V2 fields unchanged, then the
+    /// V3 commitments for a body with `user_txs` transactions minting
+    /// `deposits` (reserved fields zero).
+    fn to_v3(mut tx: Transaction, deposits: [u8; 32], user_txs: u64) -> Transaction {
+        let s = &mut tx.statement;
+        s[..S].copy_from_slice(STATEMENT_V3_TAG);
+        s.resize(STATEMENT_V3_BYTES, 0);
+        s[S + v3::DEPOSITS_HASH..S + v3::DEPOSITS_HASH + 32].copy_from_slice(&deposits);
+        s[S + v3::TRANSACTIONS_ROOT..S + v3::TRANSACTIONS_ROOT + 32].copy_from_slice(&[0x7a; 32]);
+        s[S + v3::RECEIPTS_ROOT..S + v3::RECEIPTS_ROOT + 32].copy_from_slice(&[0x7b; 32]);
+        s[S + v3::USER_TX_COUNT..S + v3::USER_TX_COUNT + 8].copy_from_slice(&user_txs.to_be_bytes());
+        // A body with user transactions has a body commitment the native
+        // chain cannot recompute; V3 must not try.
+        s[S + 536..S + 568].copy_from_slice(&[0x5c; 32]);
+        tx
+    }
+    fn no_deposits() -> [u8; 32] {
+        crate::l2_settlement::deposits_hash(&[])
+    }
+
+    #[test]
+    fn v3_settlement_with_user_transactions_is_accepted_and_replays() {
+        let (pre, mut chains) = fixture();
+        let settlement = to_v3(transaction(&pre), no_deposits(), 3);
+        let tx = PosTransaction::L2Settlement(Box::new(settlement.clone()));
+        let bytes = tx.canonical_bytes();
+        assert_eq!(bytes.len(), TRANSACTION_V3_BYTES);
+        assert_eq!(bytes[0], crate::l2_settlement::WIRE_TAG);
+        assert_eq!(PosTransaction::from_canonical_bytes(&bytes).unwrap(), tx);
+        let t = Transition::new(ProofDouble);
+        let block = build_block(&t, &pre, 2, &[], std::slice::from_ref(&tx), &mut chains);
+        let post = t.apply_block(&pre, &block, &[], std::slice::from_ref(&tx)).unwrap();
+        assert_eq!(post, t.apply_block(&pre, &block, &[], std::slice::from_ref(&tx)).unwrap());
+        let (commitment, head) = post.l2_settlement().unwrap().head().unwrap();
+        assert_eq!((commitment, head.len()), (settlement.commitment(), STATEMENT_V3_BYTES));
+        assert_ne!(post.state_root(), pre.state_root());
+        assert_eq!(post.accounted_supply_sat(), pre.accounted_supply_sat());
+        // Replay: the same settlement cannot be applied on top of itself.
+        let mut again = post.clone();
+        assert_eq!(
+            again.apply_transaction(&tx, 0, 1, &ProofDouble),
+            Err(TxReject::L2Settlement(Reject::Source))
+        );
+        assert_eq!(again, post);
+        // The real verifier still decides: ToyVerifier refuses the proof.
+        let mut refused = pre.clone();
+        assert_eq!(
+            refused.apply_transaction(&tx, 0, 1, &ToyVerifier),
+            Err(TxReject::L2Settlement(Reject::Proof))
+        );
+    }
+
+    #[test]
+    fn v3_rejects_wrong_length_tag_deposits_and_reserved_fields() {
+        let (pre, _) = fixture();
+        let good = to_v3(transaction(&pre), no_deposits(), 1);
+        let encoded = good.encode();
+        // Wrong length: every truncation, and a suffix.
+        for len in 0..TRANSACTION_V3_BYTES {
+            assert!(PosTransaction::from_canonical_bytes(&encoded[..len]).is_err(), "len {len}");
+        }
+        assert!(PosTransaction::from_canonical_bytes(&[encoded.clone(), vec![0]].concat()).is_err());
+        // Wrong tag: a V2 tag on V3 length, a V3 tag on V2 length, a mangled tag.
+        let mut v2_tag = encoded.clone();
+        v2_tag[33..33 + S].copy_from_slice(STATEMENT_TAG);
+        assert!(PosTransaction::from_canonical_bytes(&v2_tag).is_err());
+        let mut v3_on_v2 = transaction(&pre).encode();
+        v3_on_v2[33..33 + S].copy_from_slice(STATEMENT_V3_TAG);
+        assert!(PosTransaction::from_canonical_bytes(&v3_on_v2).is_err());
+        let mut mangled = encoded.clone();
+        mangled[33 + S - 1] ^= 1;
+        assert!(PosTransaction::from_canonical_bytes(&mangled).is_err());
+        // An in-memory statement of neither shape is refused by apply.
+        let mut odd = good.clone();
+        odd.statement.push(0);
+        let mut state = pre.clone();
+        assert_eq!(
+            state.apply_transaction(&PosTransaction::L2Settlement(Box::new(odd)), 0, 1, &ProofDouble),
+            Err(TxReject::L2Settlement(Reject::Policy))
+        );
+        // Field-level rejections leave state untouched.
+        let cases: Vec<(&str, usize, Reject)> = vec![
+            ("deposits_hash", S + v3::DEPOSITS_HASH, Reject::Deposits),
+            ("withdrawal_root", S + v3::WITHDRAWAL_ROOT, Reject::Reserved),
+            ("withdrawal_count", S + v3::WITHDRAWAL_COUNT + 7, Reject::Reserved),
+            ("da_commitment", S + v3::DA_COMMITMENT, Reject::Reserved),
+        ];
+        for (name, offset, reject) in cases {
+            let mut bad = good.clone();
+            bad.statement[offset] ^= 1;
+            let mut state = pre.clone();
+            assert_eq!(
+                state.apply_transaction(&PosTransaction::L2Settlement(Box::new(bad)), 0, 1, &ProofDouble),
+                Err(TxReject::L2Settlement(reject)),
+                "{name}"
+            );
+            assert_eq!(state, pre, "{name} mutated state");
+        }
+        for zeroed in [v3::TRANSACTIONS_ROOT, v3::RECEIPTS_ROOT] {
+            let mut bad = good.clone();
+            bad.statement[S + zeroed..S + zeroed + 32].fill(0);
+            let mut state = pre.clone();
+            assert_eq!(
+                state.apply_transaction(&PosTransaction::L2Settlement(Box::new(bad)), 0, 1, &ProofDouble),
+                Err(TxReject::L2Settlement(Reject::Reserved))
+            );
+        }
+        // Every V2-prefix field still binds policy, source and successor.
+        for offset in [S, S + 224, S + 256, S + 264, S + 272, S + 304, S + 400, S + 432, S + 448, S + 480, S + 512, S + 528] {
+            let mut bad = good.clone();
+            bad.statement[offset] ^= 1;
+            let mut state = pre.clone();
+            assert!(
+                state.apply_transaction(&PosTransaction::L2Settlement(Box::new(bad)), 0, 1, &ProofDouble).is_err(),
+                "offset {offset}"
+            );
+            assert_eq!(state, pre);
+        }
+    }
+
+    #[test]
+    fn v3_out_of_order_settlement_is_refused() {
+        let (pre, mut chains) = fixture();
+        let t = Transition::new(ProofDouble);
+        let first = PosTransaction::L2Settlement(Box::new(to_v3(transaction(&pre), no_deposits(), 1)));
+        let block = build_block(&t, &pre, 2, &[], std::slice::from_ref(&first), &mut chains);
+        let s2 = t.apply_block(&pre, &block, &[], std::slice::from_ref(&first)).unwrap();
+        // Skips a number / does not chain from the accepted head.
+        let state = s2.l2_settlement().unwrap();
+        let (digest, old) = state.head().unwrap();
+        let mut next = to_v3(transaction(&s2), no_deposits(), 2);
+        next.statement[S + 224..S + 256].copy_from_slice(&digest);
+        next.statement[S + 272..S + 304].copy_from_slice(&old[S + 336..S + 368]);
+        next.statement[S + 304..S + 336].copy_from_slice(&old[S + 368..S + 400]);
+        for (name, number, previous) in [("skipped", 3u64, digest), ("unchained", 2, [0xee; 32])] {
+            let mut bad = next.clone();
+            bad.statement[S + 264..S + 272].copy_from_slice(&number.to_be_bytes());
+            bad.statement[S + 224..S + 256].copy_from_slice(&previous);
+            let mut st = s2.clone();
+            assert_eq!(
+                st.apply_transaction(&PosTransaction::L2Settlement(Box::new(bad)), 0, 1, &ProofDouble),
+                Err(TxReject::L2Settlement(Reject::Successor)),
+                "{name}"
+            );
+        }
+        // The correctly chained successor is accepted (state built in a block).
+        next.statement[S + 264..S + 272].copy_from_slice(&2u64.to_be_bytes());
+        let tx = PosTransaction::L2Settlement(Box::new(next));
+        let block = build_block(&t, &s2, 3, &[], std::slice::from_ref(&tx), &mut chains);
+        let s3 = t.apply_block(&s2, &block, &[], std::slice::from_ref(&tx)).unwrap();
+        assert_eq!(s3.l2_settlement().unwrap().head().unwrap().1[S + 271], 2);
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-deposits")]
+    fn v3_deposits_must_match_the_inbox_while_user_transactions_settle() {
+        let (pre, mut chains) = funded_async_fixture();
+        let amount = 7_000_000_000;
+        let wire = PosTransaction::L2Deposit(deposit_tx(&pre, amount));
+        let s2 = apply(&pre, 2, std::slice::from_ref(&wire), &mut chains).unwrap();
+        let record = s2.l2_settlement().unwrap().inbox()[0];
+        // Anchor predates the deposit: consumes nothing, user txs only.
+        let empty = crate::l2_settlement::expected_body_commitment(&[]);
+        let first = PosTransaction::L2SettlementAsync(Box::new(to_v3(settlement(&s2, empty), no_deposits(), 4)));
+        let s3 = apply(&s2, 3, std::slice::from_ref(&first), &mut chains).expect("V3 with user txs, no deposits");
+        assert_eq!(s3.l2_settlement().unwrap().consumed(), 0);
+        let s3b = apply(&s3, 4, &[], &mut chains).unwrap();
+        // Now the deposit must be minted: deposits_hash binds it exactly.
+        let exact = crate::l2_settlement::deposits_hash(&[record]);
+        for wrong in [
+            no_deposits(),
+            crate::l2_settlement::deposits_hash(&[crate::l2_settlement::InboxRecord { sats: amount + 1, ..record }]),
+            crate::l2_settlement::deposits_hash(&[crate::l2_settlement::InboxRecord { recipient: [0x43; 20], ..record }]),
+            crate::l2_settlement::deposits_hash(&[record, record]),
+        ] {
+            let bad = to_v3(settlement(&s3b, empty), wrong, 2);
+            let mut l2 = s3b.l2_settlement().unwrap().clone();
+            assert_eq!(l2.apply(&bad, *s3b.head.as_bytes(), s3b.slot, true, &ProofDouble), Err(Reject::Deposits));
+        }
+        // A wrong consumed range is refused before deposits are compared.
+        let mut range = to_v3(settlement(&s3b, empty), exact, 2);
+        range.statement[S + 528..S + 536].copy_from_slice(&0u64.to_be_bytes());
+        let mut l2 = s3b.l2_settlement().unwrap().clone();
+        assert_eq!(l2.apply(&range, *s3b.head.as_bytes(), s3b.slot, true, &ProofDouble), Err(Reject::Source));
+        // The V3 body commitment is NOT recomputed: any body (here with two
+        // user txs) settles as long as deposits_hash matches the inbox.
+        let good = PosTransaction::L2SettlementAsync(Box::new(to_v3(settlement(&s3b, empty), exact, 2)));
+        let s5 = apply(&s3b, 5, std::slice::from_ref(&good), &mut chains).expect("V3 mints the deposit");
+        assert_eq!(s5.l2_settlement().unwrap().consumed(), 1);
+        assert_eq!(s5.l2_settlement().unwrap().escrow_sat(), u128::from(amount));
+        // Replaying the accepted settlement fails.
+        let mut replay = s5.clone();
+        assert!(replay.apply_transaction(&good, 0, 1, &ProofDouble).is_err());
+        assert_eq!(replay, s5);
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-deposits")]
+    fn v2_history_still_requires_the_empty_transaction_body() {
+        // V2 keeps its exact rule: a V2 statement whose body commitment is not
+        // the deposit-only body is refused even when deposits are empty.
+        let (pre, mut chains) = funded_async_fixture();
+        let s2 = apply(&pre, 2, &[], &mut chains).unwrap();
+        let with_user_txs = settlement(&s2, [0x5c; 32]);
+        let mut l2 = s2.l2_settlement().unwrap().clone();
+        assert_eq!(l2.apply(&with_user_txs, *s2.head.as_bytes(), s2.slot, true, &ProofDouble), Err(Reject::Deposits));
+        let empty = crate::l2_settlement::expected_body_commitment(&[]);
+        let ok = PosTransaction::L2SettlementAsync(Box::new(settlement(&s2, empty)));
+        assert!(apply(&s2, 3, std::slice::from_ref(&ok), &mut chains).is_ok());
     }
 }

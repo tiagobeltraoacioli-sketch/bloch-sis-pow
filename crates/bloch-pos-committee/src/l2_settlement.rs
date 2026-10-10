@@ -15,8 +15,52 @@ pub const ASYNC_WIRE_TAG: u8 = 0x13;
 pub const STATEMENT_TAG: &[u8] = b"BLOCH:EVM:SETTLEMENT:2";
 pub const STATEMENT_BYTES: usize = 590;
 pub const PROOF_BYTES: usize = 356;
+/// Exact V2 transaction length (kept for existing history).
 pub const TRANSACTION_BYTES: usize = 1 + 32 + STATEMENT_BYTES + PROOF_BYTES;
+/// Settlement V3 (`bloch_l2_evm::proof_statement::SettlementStatementV3`):
+/// the V2 fields at their V2 offsets, then deposits hash, transactions root,
+/// receipts root, user transaction count, and three M1-reserved fields.
+/// V3 admits L2 blocks with user transactions; deposits are bound through
+/// `deposits_hash` instead of recomputing an empty body.
+pub const STATEMENT_V3_TAG: &[u8] = b"BLOCH:EVM:SETTLEMENT:3";
+pub const STATEMENT_V3_BYTES: usize = 766;
+pub const TRANSACTION_V3_BYTES: usize = 1 + 32 + STATEMENT_V3_BYTES + PROOF_BYTES;
 const S: usize = STATEMENT_TAG.len();
+const _: () = assert!(STATEMENT_V3_TAG.len() == S);
+/// V3 field offsets after the tag. Independent of the L2 codec; conformance
+/// tests pin both sides (`settlement_v3_layout` in bloch-l2-evm).
+pub mod v3 {
+    pub const DEPOSITS_HASH: usize = 568;
+    pub const TRANSACTIONS_ROOT: usize = 600;
+    pub const RECEIPTS_ROOT: usize = 632;
+    pub const USER_TX_COUNT: usize = 664;
+    /// Reserved for M4 (outbox); must be zero.
+    pub const WITHDRAWAL_ROOT: usize = 672;
+    /// Reserved for M4; must be zero.
+    pub const WITHDRAWAL_COUNT: usize = 704;
+    /// Reserved for M3 (data availability); must be zero.
+    pub const DA_COMMITMENT: usize = 712;
+    pub const END: usize = 744;
+}
+const _: () = assert!(S + v3::END == STATEMENT_V3_BYTES);
+
+/// Statement version, selected only by the statement tag (and exact length).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatementVersion {
+    V2,
+    V3,
+}
+impl StatementVersion {
+    fn of(statement: &[u8]) -> Option<Self> {
+        if statement.len() == STATEMENT_BYTES && statement.starts_with(STATEMENT_TAG) {
+            Some(Self::V2)
+        } else if statement.len() == STATEMENT_V3_BYTES && statement.starts_with(STATEMENT_V3_TAG) {
+            Some(Self::V3)
+        } else {
+            None
+        }
+    }
+}
 /// Records one settlement must consume, when pending: min(pending, this).
 pub const MAX_INBOX_PER_SETTLEMENT: u64 = 64;
 /// Exact L2 body framing tag (`bloch_l2_evm::node_primitives::NodeBodyV2`).
@@ -105,11 +149,28 @@ pub fn expected_body_commitment(records: &[InboxRecord]) -> [u8; 32] {
     Keccak256::digest(&body).into()
 }
 
-/// One canonical native transaction. Length is fixed before allocation.
+/// `keccak256(recipient || height BE8 || tx_index BE4 || txid || vout BE4 ||
+/// sats BE8)` over the records in order; `keccak256("")` when empty. This is
+/// `bloch_l2_evm::executor::deposits_hash` of the deposits these records mint.
+pub fn deposits_hash(records: &[InboxRecord]) -> [u8; 32] {
+    let mut h = Keccak256::new();
+    for r in records {
+        h.update(r.recipient);
+        h.update(r.height.to_be_bytes());
+        h.update(r.tx_index.to_be_bytes());
+        h.update(r.txid);
+        h.update(r.vout.to_be_bytes());
+        h.update(r.sats.to_be_bytes());
+    }
+    h.finalize().into()
+}
+
+/// One canonical native transaction. The statement is exactly a V2 (590-byte)
+/// or V3 (766-byte) statement; decoding fixes the length before allocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transaction {
     pub proof_policy: [u8; 32],
-    pub statement: [u8; STATEMENT_BYTES],
+    pub statement: Vec<u8>,
     pub proof: [u8; PROOF_BYTES],
 }
 impl Transaction {
@@ -120,17 +181,25 @@ impl Transaction {
         Self::decode_tag(bytes, ASYNC_WIRE_TAG)
     }
     fn decode_tag(bytes: &[u8], tag: u8) -> Option<Self> {
-        if bytes.len() != TRANSACTION_BYTES
-            || bytes[0] != tag
-            || !bytes[33..].starts_with(STATEMENT_TAG)
-        {
+        let statement_bytes = match bytes.len() {
+            TRANSACTION_BYTES => STATEMENT_BYTES,
+            TRANSACTION_V3_BYTES => STATEMENT_V3_BYTES,
+            _ => return None,
+        };
+        if bytes[0] != tag {
             return None;
         }
+        let statement = &bytes[33..33 + statement_bytes];
+        StatementVersion::of(statement)?;
         Some(Self {
             proof_policy: bytes[1..33].try_into().ok()?,
-            statement: bytes[33..33 + STATEMENT_BYTES].try_into().ok()?,
-            proof: bytes[33 + STATEMENT_BYTES..].try_into().ok()?,
+            statement: statement.to_vec(),
+            proof: bytes[33 + statement_bytes..].try_into().ok()?,
         })
+    }
+    /// The statement version, or `None` for a malformed in-memory value.
+    pub fn version(&self) -> Option<StatementVersion> {
+        StatementVersion::of(&self.statement)
     }
     pub fn encode(&self) -> Vec<u8> {
         self.encode_tag(WIRE_TAG)
@@ -139,7 +208,7 @@ impl Transaction {
         self.encode_tag(ASYNC_WIRE_TAG)
     }
     fn encode_tag(&self, tag: u8) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(TRANSACTION_BYTES);
+        let mut bytes = Vec::with_capacity(1 + 32 + self.statement.len() + PROOF_BYTES);
         bytes.push(tag);
         bytes.extend_from_slice(&self.proof_policy);
         bytes.extend_from_slice(&self.statement);
@@ -153,7 +222,7 @@ impl Transaction {
             b"BLOCH:EXPERIMENTAL:NATIVE-SETTLEMENT-COMMITMENT:1",
             b"BLOCH:EXPERIMENTAL:NATIVE-SETTLEMENT-TX:1",
             &self.proof_policy,
-            &self.statement,
+            self.statement.as_slice(),
             &self.proof,
         ])
     }
@@ -218,7 +287,8 @@ pub struct Source {
 pub struct State {
     policy: Policy,
     native_height: u64,
-    head: Option<([u8; 32], [u8; STATEMENT_BYTES])>,
+    /// Commitment and exact statement (V2 or V3) of the accepted head.
+    head: Option<([u8; 32], Vec<u8>)>,
     asynchronous: bool,
     /// (block, slot, height, inbox count, inbox root) frozen at the anchor.
     source_anchor: Option<([u8; 32], u64, u64, u64, [u8; 32])>,
@@ -238,6 +308,9 @@ pub enum Reject {
     Limit,
     /// The proven L2 body does not mint exactly the consumed inbox records.
     Deposits,
+    /// A V3 field reserved for a later milestone is not zero, or a V3 body
+    /// commitment is zero.
+    Reserved,
 }
 impl State {
     pub fn genesis(policy: Policy) -> Result<Self, Reject> {
@@ -307,8 +380,8 @@ impl State {
     pub fn height(&self) -> u64 {
         self.native_height
     }
-    pub fn head(&self) -> Option<([u8; 32], [u8; STATEMENT_BYTES])> {
-        self.head
+    pub fn head(&self) -> Option<([u8; 32], Vec<u8>)> {
+        self.head.clone()
     }
     pub fn source(&self, block: [u8; 32], slot: u64) -> Source {
         self.frozen_source().unwrap_or_else(|| {
@@ -316,7 +389,7 @@ impl State {
         })
     }
     fn source_at(&self, block: [u8; 32], slot: u64, height: u64, inbox_count: u64, inbox_root: [u8; 32]) -> Source {
-        let previous = self.head.map(|(_, s)| h(&s, S + 448)).unwrap_or([0; 32]);
+        let previous = self.head.as_ref().map(|(_, s)| h(s, S + 448)).unwrap_or([0; 32]);
         let commitment = hash(&[
             b"BLOCH:NATIVE:L2:EMPTY-SOURCE:1",
             &self.policy.identities[0],
@@ -360,12 +433,13 @@ impl State {
                 }
             }
         }
-        match self.head {
+        match &self.head {
             None => out.push(0),
             Some((digest, statement)) => {
+                // The statement's own tag fixes its length (590 or 766).
                 out.push(1);
-                out.extend_from_slice(&digest);
-                out.extend_from_slice(&statement);
+                out.extend_from_slice(digest);
+                out.extend_from_slice(statement);
             }
         }
         // Absent until the first deposit, so empty-inbox states keep their bytes.
@@ -395,9 +469,14 @@ impl State {
         if asynchronous != self.asynchronous || (asynchronous && self.source_anchor.is_none()) {
             return Err(Reject::NotActive);
         }
-        let s = &tx.statement;
-        if !s.starts_with(STATEMENT_TAG)
-            || tx.proof_policy != self.policy.proof_policy
+        let s = tx.statement.as_slice();
+        // The version is the statement tag. Which version a network accepts is
+        // pinned by its proof policy: the policy-bound verifier admits only
+        // public values of its own version (`bloch_l2_proof::verify`).
+        let Some(version) = StatementVersion::of(s) else {
+            return Err(Reject::Policy);
+        };
+        if tx.proof_policy != self.policy.proof_policy
             || (0..7).any(|i| h(s, S + i * 32) != self.policy.identities[i])
             || n(s, S + 256) != self.policy.chain_id
         {
@@ -421,18 +500,19 @@ impl State {
         if n(s, S + 512) != source.inbox_count || n(s, S + 520) != self.consumed || n(s, S + 528) != end {
             return Err(Reject::Source);
         }
-        let (previous, number, parent, root) = match self.head {
+        let (previous, number, parent, root) = match &self.head {
             None => (
                 [0; 32],
                 1,
                 self.policy.initial_l2_parent,
                 self.policy.initial_l2_state,
             ),
+            // Shared V2/V3 prefix offsets: a V3 head may follow a V2 head.
             Some((digest, old)) => (
-                digest,
-                n(&old, S + 264).checked_add(1).ok_or(Reject::Successor)?,
-                h(&old, S + 336),
-                h(&old, S + 368),
+                *digest,
+                n(old, S + 264).checked_add(1).ok_or(Reject::Successor)?,
+                h(old, S + 336),
+                h(old, S + 368),
             ),
         };
         if h(s, S + 224) != previous
@@ -446,10 +526,29 @@ impl State {
             return Err(Reject::Successor);
         }
         // The proof binds the body; consensus binds the body to the inbox.
-        if cfg!(feature = "devnet-l2-deposits")
-            && h(s, S + 536) != expected_body_commitment(&self.inbox[self.consumed as usize..end as usize])
-        {
-            return Err(Reject::Deposits);
+        let consumed = &self.inbox[self.consumed as usize..end as usize];
+        match version {
+            // V2 history: the body must be exactly the deposits, no user txs.
+            StatementVersion::V2 => {
+                if cfg!(feature = "devnet-l2-deposits") && h(s, S + 536) != expected_body_commitment(consumed) {
+                    return Err(Reject::Deposits);
+                }
+            }
+            // V3: user transactions allowed; the minted deposits must be
+            // exactly the consumed inbox records, in order.
+            StatementVersion::V3 => {
+                if h(s, S + v3::DEPOSITS_HASH) != deposits_hash(consumed) {
+                    return Err(Reject::Deposits);
+                }
+                if h(s, S + v3::TRANSACTIONS_ROOT) == [0; 32]
+                    || h(s, S + v3::RECEIPTS_ROOT) == [0; 32]
+                    || h(s, S + v3::WITHDRAWAL_ROOT) != [0; 32]
+                    || n(s, S + v3::WITHDRAWAL_COUNT) != 0
+                    || h(s, S + v3::DA_COMMITMENT) != [0; 32]
+                {
+                    return Err(Reject::Reserved);
+                }
+            }
         }
         if !verifier.verify_l2_settlement(
             &self.policy.proof_policy,
@@ -459,7 +558,7 @@ impl State {
         ) {
             return Err(Reject::Proof);
         }
-        self.head = Some((tx.commitment(), *s));
+        self.head = Some((tx.commitment(), s.to_vec()));
         self.source_anchor = None;
         self.consumed = end;
         Ok(())
@@ -491,5 +590,45 @@ mod inbox_tests {
         let mut other = record;
         other.sats += 1;
         assert_ne!(expected_body_commitment(&[record]), expected_body_commitment(&[other]));
+    }
+
+    /// Shared with bloch-l2-evm `deposits_hash_cross_repository_golden_vector`.
+    #[test]
+    fn deposits_hash_matches_the_l2_golden_vector() {
+        let record = InboxRecord { height: 7, tx_index: 3, txid: [0x11; 32], vout: 1, sats: 5_000, recipient: [0x42; 20] };
+        let ours: String = deposits_hash(&[record]).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(ours, "0cbc6acc037c5bd96bf847b916a584239e9fa7c22afbf1a37703f4b13afbcfd3");
+        let empty: [u8; 32] = Keccak256::digest([]).into();
+        assert_eq!(deposits_hash(&[]), empty);
+    }
+
+    /// Rebuilds bloch-l2-evm's `settlement_v3_golden_vector` bytes from THIS
+    /// crate's offsets: a layout drift on either side breaks the digest.
+    #[test]
+    fn v3_offsets_match_the_l2_golden_vector() {
+        let mut s = vec![0u8; STATEMENT_V3_BYTES];
+        s[..S].copy_from_slice(STATEMENT_V3_TAG);
+        let mut put_hash = |offset: usize, byte: u8| s[S + offset..S + offset + 32].fill(byte);
+        for (i, offset) in [0, 32, 64, 96, 128, 160, 192, 224].into_iter().enumerate() {
+            put_hash(offset, i as u8 + 1);
+        }
+        for (offset, byte) in [(272, 0x09), (304, 0x0a), (336, 0x0b), (368, 0x0c), (400, 0x0d), (448, 0x0e),
+            (480, 0x0f), (536, 0x10), (v3::DEPOSITS_HASH, 0x11), (v3::TRANSACTIONS_ROOT, 0x12),
+            (v3::RECEIPTS_ROOT, 0x13), (v3::WITHDRAWAL_ROOT, 0x14), (v3::DA_COMMITMENT, 0x15)] {
+            put_hash(offset, byte);
+        }
+        let mut put_u64 = |offset: usize, hi: u8| {
+            for k in 0..8 {
+                s[S + offset + k] = hi + 1 + k as u8;
+            }
+        };
+        for (offset, hi) in [(256, 0x00), (264, 0x10), (432, 0x20), (440, 0x30), (512, 0x40), (520, 0x50),
+            (528, 0x60), (v3::USER_TX_COUNT, 0x70), (v3::WITHDRAWAL_COUNT, 0x80)] {
+            put_u64(offset, hi);
+        }
+        let digest: String = Keccak256::digest(&s).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(digest, "66469230128b9e871eb65c938c300ce51b4e42136468145f7e54c211ade696d4");
+        assert_eq!(StatementVersion::of(&s), Some(StatementVersion::V3));
+        assert_eq!(StatementVersion::of(&s[..STATEMENT_BYTES]), None);
     }
 }

@@ -3414,7 +3414,7 @@ impl CommittedState {
                 // Protocol-only empty-inbox transaction: no synthetic fee credit.
                 // One verification reserves the complete block gas budget.
                 Ok(fee_market::TxCharge { gas: fee_market::BLOCK_GAS_LIMIT,
-                    tx_bytes: crate::l2_settlement::TRANSACTION_BYTES as u64,
+                    tx_bytes: (1 + 32 + settlement.statement.len() + crate::l2_settlement::PROOF_BYTES) as u64,
                     base_fee_sat: 0, priority_fee_sat: 0 })
             }
             PosTransaction::Withdraw { validator } => self.apply_withdrawal(*validator, tx),
