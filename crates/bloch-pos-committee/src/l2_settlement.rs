@@ -256,6 +256,34 @@ pub mod withdrawal {
         Some(acc)
     }
 
+    /// `(root, count)` published by an accepted statement: the empty tree for
+    /// none or a V2 statement (which has no withdrawals).
+    pub fn tree_after(statement: Option<&[u8]>) -> ([u8; 32], u64) {
+        use super::{h, n, StatementVersion, S};
+        match statement {
+            Some(s) if StatementVersion::of(s) == Some(StatementVersion::V3) => {
+                (h(s, S + super::v3::WITHDRAWAL_ROOT), n(s, S + super::v3::WITHDRAWAL_COUNT))
+            }
+            _ => (empty_root(), 0),
+        }
+    }
+
+    /// The withdrawal part of the V3 acceptance rule, against the accepted
+    /// head statement (`None` before the first settlement): the count never
+    /// decreases and the root changes exactly when the count does. Returns
+    /// the new `(root, count)` when the statement adds withdrawals.
+    pub fn check_successor(head: Option<&[u8]>, statement: &[u8]) -> Result<Option<([u8; 32], u64)>, super::Reject> {
+        if super::StatementVersion::of(statement) != Some(super::StatementVersion::V3) {
+            return Err(super::Reject::Policy);
+        }
+        let (root, count) = tree_after(Some(statement));
+        let (head_root, head_count) = tree_after(head);
+        if count < head_count || (count == head_count) != (root == head_root) {
+            return Err(super::Reject::Withdrawals);
+        }
+        Ok((count > head_count).then_some((root, count)))
+    }
+
     /// One accepted settlement that added withdrawals.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Record {
@@ -616,12 +644,7 @@ impl State {
     /// `(root, count)` of the withdrawal tree after the accepted head: the
     /// empty tree before any V3 settlement (and after a V2 head).
     pub fn withdrawal_head(&self) -> ([u8; 32], u64) {
-        match &self.head {
-            Some((_, s)) if StatementVersion::of(s) == Some(StatementVersion::V3) => {
-                (h(s, S + v3::WITHDRAWAL_ROOT), n(s, S + v3::WITHDRAWAL_COUNT))
-            }
-            _ => (withdrawal::empty_root(), 0),
-        }
+        withdrawal::tree_after(self.head.as_ref().map(|(_, s)| s.as_slice()))
     }
     /// Number of the last settled L2 block (0 before the first settlement).
     pub fn settled_number(&self) -> u64 {
@@ -872,12 +895,8 @@ impl State {
                 }
                 // The withdrawal tree only grows, and its root moves exactly
                 // when leaves are added.
-                let (root, count) = (h(s, S + v3::WITHDRAWAL_ROOT), n(s, S + v3::WITHDRAWAL_COUNT));
-                let (head_root, head_count) = self.withdrawal_head();
-                if count < head_count || (count == head_count) != (root == head_root) {
-                    return Err(Reject::Withdrawals);
-                }
-                if count > head_count {
+                let head = self.head.as_ref().map(|(_, old)| old.as_slice());
+                if let Some((root, count)) = withdrawal::check_successor(head, s)? {
                     new_withdrawals = Some(withdrawal::Record {
                         l2_number: number,
                         root,
