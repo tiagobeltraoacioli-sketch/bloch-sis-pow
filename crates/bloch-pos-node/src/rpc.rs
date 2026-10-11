@@ -1975,6 +1975,7 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
         PosTransaction::L2SettlementAsync(_) => "l2_settlement_async",
         PosTransaction::L2Deposit(_) => "l2_deposit",
         PosTransaction::L2DataAvailability(_) => "l2_data_availability",
+        PosTransaction::L2WithdrawClaim(_) => "l2_withdraw_claim",
     };
     Json::obj(vec![
         ("accepted", Json::Bool(true)),
@@ -2488,6 +2489,23 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
                     ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
                     ("count", Json::u(r.count)), ("height", Json::u(r.height)),
                 ])).collect())),
+                // M5 claims: the newest root a claim in the next block may
+                // prove against, and the nullifier set as its frontier
+                // (words below `floor` fully claimed; `words` maps a 256-leaf
+                // word index to its bitmap, bit i of byte j = leaf 256w+8j+i).
+                ("delay_blocks", Json::u(bloch_pos_committee::l2_settlement::withdrawal::WITHDRAW_DELAY_BLOCKS)),
+                ("matured", l2.matured_withdrawals().map_or(Json::Null, |r| Json::obj(vec![
+                    ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
+                    ("count", Json::u(r.count)), ("height", Json::u(r.height)),
+                ]))),
+                ("claimed", Json::obj(vec![
+                    ("count", Json::u(l2.claimed().claims())), ("floor", Json::u(l2.claimed().floor())),
+                    ("words", Json::Arr(l2.claimed().words().map(|(w, bits)| Json::obj(vec![
+                        ("word", Json::u(w)), ("bits", Json::hex(bits)),
+                    ])).collect())),
+                ])),
+                ("released_sat", Json::sat(l2.released_sat())),
+                ("escrow_conserved", Json::Bool(l2.escrow_conserved())),
             ])
         }),
         ("accepted", l2.head().map_or(Json::Null, |(commitment, statement)| Json::obj(vec![

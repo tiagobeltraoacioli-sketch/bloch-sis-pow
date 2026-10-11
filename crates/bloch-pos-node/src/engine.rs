@@ -500,6 +500,7 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
         PosTransaction::FundedDeposit(tx) => tx.tip_millisat_per_gas,
         PosTransaction::L2Deposit(tx) => tx.tip_millisat_per_gas,
         PosTransaction::L2DataAvailability(tx) => tx.tip_millisat_per_gas,
+        PosTransaction::L2WithdrawClaim(tx) => tx.tip_millisat_per_gas,
         _ => 0,
     }
 }
@@ -529,6 +530,7 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
         PosTransaction::FundedDeposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::L2Deposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::L2DataAvailability(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::L2WithdrawClaim(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         _ => None,
     }
 }
@@ -2804,6 +2806,7 @@ impl Engine {
             PosTransaction::FundedDeposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::L2Deposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::L2DataAvailability(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::L2WithdrawClaim(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             _ => None,
         }
     }
@@ -3244,6 +3247,7 @@ impl Engine {
                 PosTransaction::FundedDeposit(tx) => tx.tx_bytes,
                 PosTransaction::L2Deposit(tx) => tx.tx_bytes,
                 PosTransaction::L2DataAvailability(tx) => tx.tx_bytes,
+                PosTransaction::L2WithdrawClaim(tx) => tx.tx_bytes,
                 _ => 0,
             };
             let n = (encoded.len() as u64).max(declared);
@@ -5468,6 +5472,21 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
                 Ok(())
             } else {
                 Err("invalid L2 data availability hybrid PQ authorization")
+            }
+        }
+        PosTransaction::L2WithdrawClaim(claim) => {
+            if !bloch_pos_committee::l2_settlement::USER_TRANSACTIONS_ENABLED {
+                return Err("L2 withdrawal claims are not enabled in this build");
+            }
+            // The proof, maturity, nullifier and escrow are state checks and
+            // run in consensus; refuse a malformed claim before the signature.
+            if claim.validate_shape().is_err() {
+                return Err("L2 withdrawal claim has an invalid shape or release output");
+            }
+            if HybridVerifier::new().verify_with_key(&claim.funding_pubkey, &claim.intent_root(), &claim.signature) {
+                Ok(())
+            } else {
+                Err("invalid L2 withdrawal claim hybrid PQ authorization")
             }
         }
         PosTransaction::L2Deposit(deposit) => {
