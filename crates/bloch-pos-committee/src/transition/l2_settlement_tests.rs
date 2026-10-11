@@ -525,7 +525,11 @@ mod l2_tests {
         assert_eq!(l2.escrow_sat(), u128::from(amount));
         assert!(s2.eutxos.get(&([0x33; 32], 0)).is_none(), "input spent");
         assert_eq!(s2.eutxos.get(&(wire.txid(), 0)).unwrap().value, tx.change.value);
-        assert!(s2.accounted_supply_sat() < supply - u128::from(amount) + 1, "escrow leaves spendable supply");
+        // Escrow leaves the spendable set but stays in the accounted supply
+        // (M5: claims move it back out); only the fee leaves.
+        assert!(s2.eutxos.total_sat() + u128::from(amount) < pre.eutxos.total_sat() + 1);
+        assert!(s2.accounted_supply_sat() <= supply && supply - s2.accounted_supply_sat() < u128::from(amount));
+        assert!(s2.l2_settlement().unwrap().escrow_conserved());
         // Replaying the same deposit fails (input already spent).
         let mut replay = s2.clone();
         assert!(replay.apply_transaction(&wire, 0, s2.next_base_fee(), &ToyVerifier).is_err());
@@ -1363,5 +1367,496 @@ mod l2_tests {
             }
         }
         assert_eq!(withdrawal::root_from_proof(&[0; 32], 1 << 32, &[[0; 32]; 32]), None);
+    }
+
+    // ── M5: L2WithdrawClaim (0x16) ──
+
+    use crate::l2_settlement::withdrawal::{self as wd, WITHDRAW_DELAY_BLOCKS};
+    use crate::transition::l2_claim::{L2WithdrawClaim, L2WithdrawClaimReject as ClaimReject, CHANGE_VOUT, RELEASE_VOUT};
+
+    /// Leaf `i` of the shared l2-withdrawal-v1 vector trees.
+    fn wleaf(i: u64) -> ([u8; 32], u64) {
+        ([(i % 255) as u8 + 1; 32], 1_000_000 + i)
+    }
+    fn wleaves(n: u64) -> Vec<[u8; 32]> {
+        (0..n).map(|i| { let (r, sats) = wleaf(i); wd::leaf(700771, i, &r, sats) }).collect()
+    }
+
+    /// A signed claim of leaf `index` of the `n`-leaf vector tree, funded by
+    /// the depositor key's coin `outpoint` worth `value`, all of it but the
+    /// fee back as change.
+    fn claim_tx(pre: &CommittedState, outpoint: ([u8; 32], u32), value: u64, n: u64, index: u64) -> L2WithdrawClaim {
+        let key = depositor();
+        let (l1_recipient, sats) = wleaf(index);
+        let mut tx = L2WithdrawClaim {
+            network_domain: [0x91; 32],
+            funding_pubkey: key.clone(),
+            inputs: vec![crate::transition::FundingInput { txid: outpoint.0, vout: outpoint.1 }],
+            l2_chain_id: 700771,
+            index,
+            l1_recipient,
+            sats,
+            siblings: wd::proof(&wleaves(n), index).unwrap(),
+            release: TransferOutput { value: sats, script_hash: l1_recipient },
+            change: TransferOutput { value: 0, script_hash: script_of(&key) },
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+            signature: vec![0; 32],
+        };
+        tx.tx_bytes = tx.canonical_bytes().len() as u64;
+        let charge = fee_market::charge(tx.class(), tx.tx_bytes, pre.next_base_fee(), 0);
+        tx.change.value = (u128::from(value) - charge.base_fee_sat - charge.priority_fee_sat) as u64;
+        tx.signature = toy_sign(&key, &tx.intent_root());
+        tx
+    }
+    fn resign_claim(mut tx: L2WithdrawClaim) -> L2WithdrawClaim {
+        tx.signature = toy_sign(&tx.funding_pubkey, &tx.intent_root());
+        tx
+    }
+    fn claim(tx: &L2WithdrawClaim) -> PosTransaction {
+        PosTransaction::L2WithdrawClaim(tx.clone())
+    }
+
+    /// The block at `slot` carrying `txs` instead of `valid.1` is invalid
+    /// because of transaction `index`, and `valid` is then applied. One block
+    /// per slot: building a block spends its proposer's RANDAO reveal, so the
+    /// invalid body is grafted onto the valid block and re-signed.
+    fn refuse_then_apply(
+        pre: &CommittedState,
+        slot: u64,
+        txs: &[PosTransaction],
+        index: u32,
+        valid: &[PosTransaction],
+        chains: &mut [RandaoChain],
+    ) -> CommittedState {
+        let t = Transition::new(ProofDouble);
+        let block = build_block(&t, pre, slot, &[], valid, chains);
+        let mut graft = block.clone();
+        graft.header.body_root = crate::derive::body_root(&txs.iter().map(PosTransaction::canonical_bytes).collect::<Vec<_>>());
+        let pk = crate::attestation::KeyLookup::pubkey(pre, graft.header.proposer_index).unwrap();
+        graft.proposer_sig = toy_sign(pk, &graft.header.proposal_signing_root());
+        assert_eq!(t.compute_post_state(pre, &graft, &[], txs), Err(TransitionError::Transaction(index)));
+        t.apply_block(pre, &block, &[], valid).expect("valid block")
+    }
+
+    /// Async fixture with `escrow` sats escrowed (one deposit record) and a
+    /// matured withdrawal record for the `n`-leaf vector tree; the funding
+    /// coin is untouched.
+    fn matured_claim_fixture(n: u64, escrow: u64) -> CommittedState {
+        let (mut pre, _) = funded_async_fixture();
+        let l2 = pre.l2_settlement.as_mut().unwrap();
+        l2.append_deposit(crate::l2_settlement::InboxRecord {
+            height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: escrow, recipient: [0x42; 20],
+        })
+        .unwrap();
+        let height = l2.height();
+        l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&wleaves(n)), count: n, height: 1 });
+        for _ in height..1 + WITHDRAW_DELAY_BLOCKS {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(l2.matured_count(), n);
+        pre
+    }
+
+    /// Shared with bloch-l2-evm (`tests/fixtures/l2-claim-v1`, identical
+    /// copy): the exact 0x16 frame, its intent root, txid and nullifier.
+    #[test]
+    fn l2_claim_wire_frame_matches_the_shared_vector() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/l2-claim-v1/vectors.json")).unwrap();
+        let hex32 = |v: &serde_json::Value| -> [u8; 32] { hex::decode(v.as_str().unwrap()).unwrap().try_into().unwrap() };
+        let leaves = wleaves(3);
+        let (l1_recipient, sats) = wleaf(1);
+        let tx = L2WithdrawClaim {
+            network_domain: [0x91; 32],
+            funding_pubkey: vec![0x5a; crate::transition::funded::ADMISSION_PQ_KEY_BYTES],
+            inputs: vec![crate::transition::FundingInput { txid: [0x33; 32], vout: 0 }],
+            l2_chain_id: 700771,
+            index: 1,
+            l1_recipient,
+            sats,
+            siblings: wd::proof(&leaves, 1).unwrap(),
+            release: TransferOutput { value: sats, script_hash: l1_recipient },
+            change: TransferOutput { value: 12_345, script_hash: [0x44; 32] },
+            tx_bytes: 4_000,
+            tip_millisat_per_gas: 7,
+            signature: vec![0x66; 64],
+        };
+        let wire = claim(&tx);
+        let bytes = wire.canonical_bytes();
+        assert_eq!(hex::encode(&bytes), fixture["tx_hex"].as_str().unwrap());
+        assert_eq!(PosTransaction::from_canonical_bytes(&bytes).unwrap(), wire);
+        assert_eq!(tx.intent_root(), hex32(&fixture["intent_root"]));
+        assert_eq!(wire.txid(), hex32(&fixture["txid"]));
+        assert_eq!(tx.nullifier(), hex32(&fixture["nullifier"]));
+        assert_eq!(wd::nullifier(700771, 1), hex32(&fixture["nullifier"]));
+        assert_eq!(tx.leaf(), hex32(&fixture["leaf"]));
+        assert_eq!(wd::root(&leaves), hex32(&fixture["root"]));
+        assert_eq!(fixture["count"].as_u64(), Some(3));
+        // The root is the l2-withdrawal-v1 3-leaf tree root.
+        let shared: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/l2-withdrawal-v1/vectors.json")).unwrap();
+        let three = shared["trees"].as_array().unwrap().iter().find(|t| t["count"] == 3).unwrap();
+        assert_eq!(three["root"].as_str().unwrap().trim_start_matches("0x"), fixture["root"].as_str().unwrap());
+        // Versions other than 1 do not decode (M6 adds version 2).
+        for version in [0u8, 2, 0xff] {
+            let mut other = bytes.clone();
+            other[1] = version;
+            assert_eq!(
+                PosTransaction::from_canonical_bytes(&other),
+                Err(TxDecodeError::NotCanonical(crate::transition::l2_claim::L2_WITHDRAW_CLAIM_TAG))
+            );
+        }
+        // Truncation never decodes.
+        assert!(PosTransaction::from_canonical_bytes(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn withdrawal_proofs_and_nullifier_bitmap() {
+        let leaves = wleaves(5);
+        let root = wd::root(&leaves);
+        for i in 0..5 {
+            assert_eq!(wd::root_from_proof(&leaves[i as usize], i, &wd::proof(&leaves, i).unwrap()), Some(root));
+        }
+        assert_eq!(wd::proof(&leaves, 5), None);
+        assert_ne!(wd::nullifier(700771, 1), wd::nullifier(700772, 1));
+        assert_ne!(wd::nullifier(700771, 1), wd::nullifier(700771, 2));
+        // Bitmap: set/contains, floor compaction after a full word.
+        let mut b = wd::ClaimBitmap::default();
+        assert!(!b.contains(3));
+        assert!(b.insert(3));
+        assert!(!b.insert(3));
+        assert!(b.contains(3) && !b.contains(2) && !b.contains(259));
+        for i in 0..256 {
+            b.insert(i);
+        }
+        assert_eq!((b.floor(), b.stored_words(), b.claims()), (1, 0, 256));
+        assert!(b.contains(0) && b.contains(255) && !b.contains(256));
+        b.insert(600);
+        assert_eq!((b.floor(), b.stored_words()), (1, 1));
+        for i in 256..512 {
+            b.insert(i);
+        }
+        assert_eq!((b.floor(), b.stored_words(), b.claims()), (2, 1, 513));
+        for i in 512..768 {
+            b.insert(i);
+        }
+        assert_eq!((b.floor(), b.stored_words(), b.claims()), (3, 0, 768));
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn invalid_l2_claims_are_refused_without_mutation() {
+        let pre = matured_claim_fixture(3, 50_000_000);
+        let fee = pre.next_base_fee();
+        let base = claim_tx(&pre, ([0x33; 32], 0), FUNDED, 3, 1);
+        let mut cases: Vec<(&str, L2WithdrawClaim, ClaimReject)> = Vec::new();
+        let mut t = base.clone();
+        t.siblings[0][0] ^= 1;
+        cases.push(("bad proof", resign_claim(t), ClaimReject::Proof));
+        let mut t = base.clone();
+        t.siblings[5] = [0x99; 32];
+        cases.push(("bad upper sibling", resign_claim(t), ClaimReject::Proof));
+        cases.push(("proof for another index", resign_claim(L2WithdrawClaim { index: 0, ..base.clone() }), ClaimReject::Proof));
+        cases.push(("chain", resign_claim(L2WithdrawClaim { l2_chain_id: 700772, ..base.clone() }), ClaimReject::Chain));
+        // Wrong amount or recipient: the release output must match, and a
+        // consistent but different (recipient, sats) is not the settled leaf.
+        let mut t = base.clone();
+        t.release.value += 1;
+        cases.push(("release amount", resign_claim(t), ClaimReject::ReleaseOutput));
+        let mut t = base.clone();
+        t.release.script_hash = [0x55; 32];
+        cases.push(("release recipient", resign_claim(t), ClaimReject::ReleaseOutput));
+        let mut t = base.clone();
+        t.sats += 1;
+        t.release.value += 1;
+        cases.push(("amount", resign_claim(t), ClaimReject::Proof));
+        let mut t = base.clone();
+        t.l1_recipient = [0x55; 32];
+        t.release.script_hash = [0x55; 32];
+        cases.push(("recipient", resign_claim(t), ClaimReject::Proof));
+        let mut t = base.clone();
+        t.sats = crate::transition::l2_deposit::MIN_L2_DEPOSIT_SAT - 1;
+        t.release.value = t.sats;
+        cases.push(("dust", resign_claim(t), ClaimReject::Amount));
+        cases.push(("network", resign_claim(L2WithdrawClaim { network_domain: [0x92; 32], ..base.clone() }), ClaimReject::Network));
+        let mut t = base.clone();
+        t.signature[0] ^= 1;
+        cases.push(("signature", t, ClaimReject::Signature));
+        let mut t = base.clone();
+        t.change.value += 1;
+        cases.push(("conservation", resign_claim(t), ClaimReject::Conservation));
+        let mut t = base.clone();
+        t.funding_pubkey[0] ^= 1;
+        cases.push(("ownership", resign_claim(t), ClaimReject::Ownership));
+        let mut t = base.clone();
+        t.inputs[0].vout = 9;
+        cases.push(("missing input", resign_claim(t), ClaimReject::MissingInput));
+        let mut t = base.clone();
+        t.tx_bytes -= 1;
+        cases.push(("underdeclared", resign_claim(t), ClaimReject::UnderdeclaredSize));
+        let mut t = base.clone();
+        t.index = 1 << 32;
+        cases.push(("index outside the tree", resign_claim(t), ClaimReject::Shape));
+        for (name, tx, reject) in cases {
+            let mut state = pre.clone();
+            assert_eq!(state.apply_transaction(&claim(&tx), 0, fee, &ToyVerifier), Err(TxReject::L2WithdrawClaim(reject)), "{name}");
+            assert_eq!(state, pre, "{name} mutated state");
+        }
+
+        // Index at or above the count of the root it proves against: a record
+        // whose count stops before a leaf the tree holds.
+        let mut short = pre.clone();
+        let l2 = short.l2_settlement.as_mut().unwrap();
+        l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: wd::root(&wleaves(4)), count: 3, height: 1 });
+        let t = claim_tx(&short, ([0x33; 32], 0), FUNDED, 4, 3);
+        let before = short.clone();
+        assert_eq!(short.apply_transaction(&claim(&t), 0, fee, &ToyVerifier), Err(TxReject::L2WithdrawClaim(ClaimReject::Index)));
+        assert_eq!(short, before);
+
+        // Not yet matured: the same tree accepted one block too recently.
+        let (mut young, _) = funded_async_fixture();
+        let l2 = young.l2_settlement.as_mut().unwrap();
+        l2.append_deposit(crate::l2_settlement::InboxRecord {
+            height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 50_000_000, recipient: [0x42; 20],
+        })
+        .unwrap();
+        let accepted = l2.height() + 1;
+        l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&wleaves(3)), count: 3, height: accepted });
+        l2.advance_height().unwrap();
+        for _ in 1..WITHDRAW_DELAY_BLOCKS {
+            assert_eq!(young.l2_settlement().unwrap().matured_count(), 0);
+            let t = claim_tx(&young, ([0x33; 32], 0), FUNDED, 3, 1);
+            let before = young.clone();
+            assert_eq!(
+                young.apply_transaction(&claim(&t), 0, fee, &ToyVerifier),
+                Err(TxReject::L2WithdrawClaim(ClaimReject::NotMatured))
+            );
+            assert_eq!(young, before);
+            young.l2_settlement.as_mut().unwrap().advance_height().unwrap();
+        }
+        // Exactly WITHDRAW_DELAY_BLOCKS after acceptance it is claimable.
+        assert_eq!(young.l2_settlement().unwrap().height() + 1, accepted + WITHDRAW_DELAY_BLOCKS);
+        assert_eq!(young.l2_settlement().unwrap().matured_count(), 3);
+        let t = claim_tx(&young, ([0x33; 32], 0), FUNDED, 3, 1);
+        young.apply_transaction(&claim(&t), 0, fee, &ToyVerifier).expect("matured claim");
+
+        // Escrow insufficient (unreachable with proven settlements).
+        let poor = matured_claim_fixture(3, 1_000_000);
+        let mut state = poor.clone();
+        let t = claim_tx(&poor, ([0x33; 32], 0), FUNDED, 3, 1);
+        assert_eq!(state.apply_transaction(&claim(&t), 0, fee, &ToyVerifier), Err(TxReject::L2WithdrawClaim(ClaimReject::Escrow)));
+        assert_eq!(state, poor);
+        // ... while the 1_000_000-sat leaf 0 exactly empties it.
+        let t = claim_tx(&poor, ([0x33; 32], 0), FUNDED, 3, 0);
+        state.apply_transaction(&claim(&t), 0, fee, &ToyVerifier).unwrap();
+        let l2 = state.l2_settlement().unwrap();
+        assert_eq!((l2.escrow_sat(), l2.released_sat()), (0, 1_000_000));
+        assert!(l2.escrow_conserved());
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn a_leaf_is_claimed_once_in_a_block_across_blocks_and_never_again() {
+        let (genesis, mut chains) = funded_async_fixture();
+        let mut pre = genesis.clone();
+        {
+            let l2 = pre.l2_settlement.as_mut().unwrap();
+            l2.append_deposit(crate::l2_settlement::InboxRecord {
+                height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 50_000_000, recipient: [0x42; 20],
+            })
+            .unwrap();
+            l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&wleaves(3)), count: 3, height: 1 });
+        }
+        let mut slot = 2;
+        while pre.l2_settlement().unwrap().matured_count() == 0 {
+            pre = apply(&pre, slot, &[], &mut chains).unwrap();
+            slot += 1;
+        }
+        let fee = pre.next_base_fee();
+        let first = claim_tx(&pre, ([0x33; 32], 0), FUNDED, 3, 1);
+        let mut state = pre.clone();
+        state.apply_transaction(&claim(&first), 0, fee, &ToyVerifier).unwrap();
+        // A second claim of the same leaf funded by the first claim's change.
+        let again = claim_tx(&state, (claim(&first).txid(), CHANGE_VOUT), first.change.value, 3, 1);
+        let before = state.clone();
+        assert_eq!(
+            state.apply_transaction(&claim(&again), 0, fee, &ToyVerifier),
+            Err(TxReject::L2WithdrawClaim(ClaimReject::AlreadyClaimed))
+        );
+        assert_eq!(state, before);
+        // In one block: the block is invalid.
+        let both = [claim(&first), claim(&again)];
+        // Across blocks: the first lands, the second is refused next block.
+        let s1 = refuse_then_apply(&pre, slot, &both, 1, std::slice::from_ref(&both[0]), &mut chains);
+        assert!(s1.l2_settlement().unwrap().claimed().contains(1));
+        // Another leaf still claims in the block that refuses the replay.
+        let other = claim_tx(&s1, (claim(&first).txid(), CHANGE_VOUT), first.change.value, 3, 2);
+        let s2 = refuse_then_apply(&s1, slot + 1, std::slice::from_ref(&both[1]), 0, &[claim(&other)], &mut chains);
+        let l2 = s2.l2_settlement().unwrap();
+        assert_eq!(l2.claimed().claims(), 2);
+        assert_eq!(l2.released_sat(), u128::from(wleaf(1).1 + wleaf(2).1));
+        assert!(l2.escrow_conserved());
+        assert!(s2.l2_settlement().unwrap().committed_bytes().windows(29).any(|w| w == b"BLOCH:NATIVE:L2:CLAIM-STATE:1"));
+    }
+
+    #[test]
+    #[cfg(not(feature = "devnet-l2-user-txs"))]
+    fn l2_claims_are_inert_without_the_user_transaction_feature() {
+        let pre = matured_claim_fixture(3, 50_000_000);
+        let mut state = pre.clone();
+        let tx = claim_tx(&pre, ([0x33; 32], 0), FUNDED, 3, 1);
+        assert_eq!(
+            state.apply_transaction(&claim(&tx), 0, pre.next_base_fee(), &ToyVerifier),
+            Err(TxReject::L2WithdrawClaim(ClaimReject::NotActive))
+        );
+        assert_eq!(state, pre);
+        assert_eq!(
+            pre.l2_settlement().unwrap().check_claim(700771, 1, &wleaf(1).0, wleaf(1).1, &tx.siblings),
+            Err(wd::ClaimRefusal::NotActive)
+        );
+    }
+
+    /// Conservation over random deposit / settle / claim sequences at the L2
+    /// state: escrow always equals deposits minus claims, never underflows,
+    /// a leaf releases at most once, and only matured, in-tree leaves pay.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn escrow_is_conserved_over_random_deposit_settle_claim_sequences() {
+        let (pre, _) = funded_async_fixture();
+        for seed in 1..=24u64 {
+            let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut next = move |m: u64| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng % m
+            };
+            let mut l2 = pre.l2_settlement().unwrap().clone();
+            // The L2 side: withdrawals appended to the outbox (leaf, recipient, sats).
+            let mut outbox: Vec<([u8; 32], [u8; 32], u64)> = Vec::new();
+            let mut settled = 0usize; // leaves covered by the newest record
+            let mut paid = std::collections::BTreeSet::new();
+            let (mut deposited, mut released) = (0u128, 0u128);
+            for step in 0..400u64 {
+                match next(6) {
+                    0 => {
+                        let sats = 1_000_000 + next(5_000_000);
+                        l2.append_deposit(crate::l2_settlement::InboxRecord {
+                            height: l2.height() + 1, tx_index: 0, txid: [step as u8; 32], vout: 1, sats, recipient: [1; 20],
+                        })
+                        .unwrap();
+                        deposited += u128::from(sats);
+                    }
+                    1 => {
+                        // L2 withdraws (possibly more than escrowed: the
+                        // escrow check must hold the line).
+                        let i = outbox.len() as u64;
+                        let recipient = [(next(250) + 1) as u8; 32];
+                        let sats = 1_000_000 + next(3_000_000);
+                        outbox.push((wd::leaf(700771, i, &recipient, sats), recipient, sats));
+                    }
+                    2 if outbox.len() > settled => {
+                        let leaves: Vec<[u8; 32]> = outbox.iter().map(|o| o.0).collect();
+                        let height = l2.height() + 1;
+                        l2.insert_withdrawal_record(wd::Record {
+                            l2_number: step, root: wd::root(&leaves), count: leaves.len() as u64, height,
+                        });
+                        settled = leaves.len();
+                        l2.advance_height().unwrap();
+                    }
+                    3 => {
+                        for _ in 0..next(WITHDRAW_DELAY_BLOCKS + 8) {
+                            l2.advance_height().unwrap();
+                        }
+                    }
+                    _ if !outbox.is_empty() => {
+                        let index = next(outbox.len() as u64 + 1); // sometimes out of range
+                        let (leaf, recipient, sats) = outbox.get(index as usize).copied().unwrap_or(([9; 32], [9; 32], 1_000_000));
+                        let leaves: Vec<[u8; 32]> = outbox.iter().map(|o| o.0).collect();
+                        // Prove against the tree as of a random retained record.
+                        let records = l2.withdrawal_roots().to_vec();
+                        let Some(record) = records.get(next(records.len() as u64 + 1) as usize) else { continue };
+                        let siblings = wd::proof(&leaves[..record.count as usize], index).unwrap_or([[7; 32]; 32]);
+                        let before = l2.clone();
+                        let result = l2.release_withdrawal(700771, index, &recipient, sats, &siblings);
+                        let matured = record.height + WITHDRAW_DELAY_BLOCKS <= l2.height() + 1;
+                        let in_tree = index < record.count && leaf == leaves[index as usize];
+                        let expected_ok = matured && in_tree && !paid.contains(&index) && l2.escrow_sat() >= u128::from(sats);
+                        assert_eq!(result.is_ok(), expected_ok, "seed {seed} step {step}: {result:?}");
+                        if result.is_ok() {
+                            paid.insert(index);
+                            released += u128::from(sats);
+                        } else {
+                            assert_eq!(l2, before);
+                        }
+                    }
+                    _ => {}
+                }
+                assert!(l2.escrow_conserved(), "seed {seed} step {step}");
+                assert_eq!(l2.escrow_sat(), deposited - released);
+                assert_eq!(l2.released_sat(), released);
+                assert_eq!(l2.claimed().claims(), paid.len() as u64);
+            }
+        }
+    }
+
+    /// Full transition, block by block: deposit (0x14) → V3 settlement
+    /// publishing the withdrawal tree → the delay → claim (0x16). The escrow
+    /// shrinks by exactly the claim, the recipient's output holds exactly the
+    /// leaf amount, the relayer pays the fee, and supply is conserved (the
+    /// transition's own check runs on every block).
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn deposit_settle_wait_claim_end_to_end() {
+        let (pre, mut chains) = funded_async_fixture();
+        let amount = 7_000_000_000;
+        let deposit = deposit_tx(&pre, amount);
+        let deposit_wire = PosTransaction::L2Deposit(deposit.clone());
+        let s2 = apply(&pre, 2, std::slice::from_ref(&deposit_wire), &mut chains).unwrap();
+        let empty = crate::l2_settlement::expected_body_commitment(&[]);
+        let first = to_v3(settlement(&s2, empty), no_deposits(), 0);
+        let s3 = apply(&s2, 3, &[PosTransaction::L2SettlementAsync(Box::new(first))], &mut chains).unwrap();
+        let s4 = apply(&s3, 4, &[], &mut chains).unwrap();
+        // L2 block 2 mints the deposit and withdraws three leaves.
+        let record = s4.l2_settlement().unwrap().inbox()[0];
+        let mut second = to_v3(settlement(&s4, empty), crate::l2_settlement::deposits_hash(&[record]), 0);
+        let leaves = wleaves(3);
+        second.statement[S + v3::WITHDRAWAL_ROOT..S + v3::WITHDRAWAL_ROOT + 32].copy_from_slice(&wd::root(&leaves));
+        second.statement[S + v3::WITHDRAWAL_COUNT..S + v3::WITHDRAWAL_COUNT + 8].copy_from_slice(&3u64.to_be_bytes());
+        let mut state = apply(&s4, 5, &[PosTransaction::L2SettlementAsync(Box::new(second))], &mut chains).unwrap();
+        let accepted = state.l2_settlement().unwrap().withdrawal_roots()[0];
+        assert_eq!((accepted.count, accepted.height), (3, state.l2_settlement().unwrap().height()));
+        let funding = (deposit_wire.txid(), 0);
+        let mut slot = 6;
+        // Every block before maturity refuses the claim; empty blocks pass.
+        while state.l2_settlement().unwrap().height() + 1 < accepted.height + WITHDRAW_DELAY_BLOCKS {
+            let early = claim_tx(&state, funding, deposit.change.value, 3, 2);
+            state = refuse_then_apply(&state, slot, &[claim(&early)], 0, &[], &mut chains);
+            slot += 1;
+        }
+        assert_eq!(state.l2_settlement().unwrap().matured_count(), 3);
+        let tx = claim_tx(&state, funding, deposit.change.value, 3, 2);
+        let (recipient, sats) = wleaf(2);
+        let supply = state.accounted_supply_sat();
+        let balance = state.balance_sat(&recipient);
+        let post = apply(&state, slot, &[claim(&tx)], &mut chains).expect("matured claim applies");
+        let l2 = post.l2_settlement().unwrap();
+        assert_eq!(l2.escrow_sat(), u128::from(amount - sats));
+        assert_eq!(l2.released_sat(), u128::from(sats));
+        assert!(l2.escrow_conserved());
+        assert!(l2.claimed().contains(2) && !l2.claimed().contains(1));
+        assert_eq!(post.balance_sat(&recipient), balance + u128::from(sats));
+        let txid = claim(&tx).txid();
+        let out = post.eutxos.get(&(txid, RELEASE_VOUT)).unwrap();
+        assert_eq!((out.value, out.script_hash), (sats, recipient));
+        assert_eq!(post.eutxos.get(&(txid, CHANGE_VOUT)).unwrap().value, tx.change.value);
+        assert!(post.eutxos.get(&funding).is_none(), "relayer input spent");
+        // Only the relayer's fee left the accounted supply.
+        let fee = deposit.change.value - tx.change.value;
+        assert!(supply - post.accounted_supply_sat() <= u128::from(fee));
+        assert_ne!(post.state_root(), state.state_root());
+        // Replay in the next block: refused.
+        refuse_then_apply(&post, slot + 1, &[claim(&tx)], 0, &[], &mut chains);
     }
 }

@@ -153,6 +153,8 @@ pub mod l2_deposit;
 pub use l2_deposit::{L2Deposit, L2DepositReject};
 pub mod l2_da;
 pub use l2_da::{L2DataAvailability, L2DataAvailabilityReject};
+pub mod l2_claim;
+pub use l2_claim::{L2WithdrawClaim, L2WithdrawClaimReject};
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
 use crate::schedule;
@@ -319,6 +321,9 @@ pub enum PosTransaction {
     /// Publish one L2 block's user-transaction batch on L1 (0x15,
     /// development networks with `devnet-l2-user-txs`).
     L2DataAvailability(L2DataAvailability),
+    /// Release one settled, matured L2 withdrawal from escrow to its L1
+    /// recipient (0x16, development networks with `devnet-l2-user-txs`).
+    L2WithdrawClaim(L2WithdrawClaim),
     /// A value transfer against the committed eUTXO set, priced by the L1 fee
     /// market: **gas × price**, where the gas is derived (class + size,
     /// `fee_market::intrinsic_gas`) and the price is the base fee this block's
@@ -689,6 +694,7 @@ impl PosTransaction {
             PosTransaction::FundedDeposit(tx) => return tx.intent_root(),
             PosTransaction::L2Deposit(tx) => return tx.intent_root(),
             PosTransaction::L2DataAvailability(tx) => return tx.intent_root(),
+            PosTransaction::L2WithdrawClaim(tx) => return tx.intent_root(),
             other => h.update(other.canonical_bytes()),
         }
         h.finalize().into()
@@ -850,6 +856,7 @@ impl PosTransaction {
             PosTransaction::FundedDeposit(tx) => return tx.canonical_bytes(),
             PosTransaction::L2Deposit(tx) => return tx.canonical_bytes(),
             PosTransaction::L2DataAvailability(tx) => return tx.canonical_bytes(),
+            PosTransaction::L2WithdrawClaim(tx) => return tx.canonical_bytes(),
             PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
                 // Counts are length prefixes like every other variable-length
@@ -1041,6 +1048,7 @@ impl PosTransaction {
             funded::FUNDED_DEPOSIT_TAG => PosTransaction::FundedDeposit(FundedDeposit::decode(&mut r)?),
             l2_deposit::L2_DEPOSIT_TAG => PosTransaction::L2Deposit(L2Deposit::decode(&mut r)?),
             l2_da::L2_DATA_AVAILABILITY_TAG => PosTransaction::L2DataAvailability(L2DataAvailability::decode(&mut r)?),
+            l2_claim::L2_WITHDRAW_CLAIM_TAG => PosTransaction::L2WithdrawClaim(L2WithdrawClaim::decode(&mut r)?),
             0x01 => {
                 // Counts are read from untrusted bytes, so nothing is
                 // preallocated from them: a 4-billion-input header on a 40-byte
@@ -1250,6 +1258,7 @@ pub enum TxReject {
     FundedDeposit(FundedDepositReject),
     L2Deposit(L2DepositReject),
     L2DataAvailability(L2DataAvailabilityReject),
+    L2WithdrawClaim(L2WithdrawClaimReject),
     /// A value transfer broke one of the eUTXO rules.
     Transfer(TransferReject),
     /// A deposit, exit or delegation failed its state-dependent rule.
@@ -3436,6 +3445,9 @@ impl CommittedState {
             PosTransaction::L2DataAvailability(batch) => self
                 .apply_l2_data_availability(batch, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::L2DataAvailability),
+            PosTransaction::L2WithdrawClaim(claim) => self
+                .apply_l2_withdraw_claim(claim, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::L2WithdrawClaim),
             PosTransaction::Transfer { .. } => self
                 .apply_transfer(tx, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::Transfer),
@@ -4754,7 +4766,10 @@ impl CommittedState {
             + self.pending_fee_rewards.values().sum::<u128>()
             + self.delegator_fee_rewards.values().sum::<u128>()
             + self.validator_fee_rewards.values().sum::<u128>()
-            + self.delegator_issuance_rewards.values().sum::<u128>();
+            + self.delegator_issuance_rewards.values().sum::<u128>()
+            // L2 escrow is held BLCH (deposits move value in, claims move it
+            // back out); zero on every network without an L2 policy.
+            + self.l2_settlement.as_ref().map_or(0, |l2| l2.escrow_sat());
         let burned = self.delegator_slash_losses.values().sum::<u128>();
         held.saturating_sub(burned)
     }
@@ -13860,6 +13875,9 @@ mod tests {
             PosTransaction::L2Deposit(_) => {}
             // A DA batch only pays fees from its inputs; nothing is issued.
             PosTransaction::L2DataAvailability(_) => {}
+            // A claim moves escrowed value (counted in the accounted
+            // supply) to an output; its fee comes from the relayer's inputs.
+            PosTransaction::L2WithdrawClaim(_) => {}
             PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => {} // Cursor only; no balances.
         }
 

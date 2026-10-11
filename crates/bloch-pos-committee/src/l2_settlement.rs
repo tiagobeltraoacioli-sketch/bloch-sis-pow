@@ -3,8 +3,9 @@
 //! With `devnet-l2-deposits`, native L2 deposits (escrowed BLCH) append to an
 //! ordered inbox and each settlement must mint exactly the next inbox records.
 //! Settlement V3 publishes the L2 withdrawal tree (M4); this module checks it
-//! and keeps recent roots for the L1 claim (M5). No bridge release or
-//! production activation.
+//! and keeps recent roots for the L1 claim (M5), which releases escrow to
+//! the L1 recipient once the root is [`withdrawal::WITHDRAW_DELAY_BLOCKS`]
+//! old, at most once per leaf. No production activation.
 use sha3::{Digest, Keccak256, Sha3_256};
 
 /// Native wire tags. Moved on 2026-10-10 from 0x0E/0x0F to the first bytes
@@ -242,6 +243,24 @@ pub mod withdrawal {
         level[0]
     }
 
+    /// Bottom-up siblings of leaf `index` in the tree over `leaves` (tests
+    /// and tooling), or `None` when `index` is not a leaf of it.
+    pub fn proof(leaves: &[[u8; 32]], index: u64) -> Option<[[u8; 32]; TREE_DEPTH]> {
+        if index >= leaves.len() as u64 {
+            return None;
+        }
+        let zero = zero_hashes();
+        let mut siblings = [[0u8; 32]; TREE_DEPTH];
+        let mut level = leaves.to_vec();
+        let mut at = index as usize;
+        for (h, z) in zero.iter().take(TREE_DEPTH).enumerate() {
+            siblings[h] = *level.get(at ^ 1).unwrap_or(z);
+            level = level.chunks(2).map(|pair| node(&pair[0], pair.get(1).unwrap_or(z))).collect();
+            at /= 2;
+        }
+        Some(siblings)
+    }
+
     /// The root that `siblings` (bottom-up) prove for `leaf` at `index`, or
     /// `None` for an index outside the tree. The claim must also check
     /// `index < count` of the root it cites.
@@ -292,6 +311,154 @@ pub mod withdrawal {
         pub count: u64,
         /// Native height of the block that accepted the settlement.
         pub height: u64,
+    }
+
+    // ── M5: the L1 claim (`L2WithdrawClaim`, wire 0x16) ──
+
+    /// Native blocks between the block that accepted a settlement and the
+    /// first block in which a claim may prove against its root: a record
+    /// accepted at height `h` serves claims in blocks `h + WITHDRAW_DELAY_BLOCKS`
+    /// and later. Development value: one epoch (32 slots of 30 s). It is a
+    /// consensus constant, so changing it is a new network, not a flag.
+    ///
+    /// Mainnet suggestion (M8): at least one day (2,880 blocks) and, in
+    /// addition, the accepting block finalized (FFG); [`RETENTION_BLOCKS`]
+    /// must then be raised to at least the delay (the assertion below).
+    pub const WITHDRAW_DELAY_BLOCKS: u64 = 32;
+    /// The newest record at least `WITHDRAW_DELAY_BLOCKS` old is always
+    /// retained (every record younger than `RETENTION_BLOCKS` is kept, and of
+    /// the older ones the newest), so the matured tree is always derivable.
+    /// A zero delay would let a claim prove against a settlement of the
+    /// same block.
+    const _: () = assert!(WITHDRAW_DELAY_BLOCKS >= 1 && WITHDRAW_DELAY_BLOCKS <= RETENTION_BLOCKS);
+
+    pub const NULLIFIER_DOMAIN: &[u8] = b"BLOCH:L2:CLAIM:1";
+
+    /// `keccak256("BLOCH:L2:CLAIM:1" || chain_id (u64 BE) || leaf_index (u64
+    /// BE))`: the public identity of one claim (mempool and RPC key). The
+    /// committed state stores the same fact as one bit per leaf index of the
+    /// policy's chain ([`ClaimBitmap`]).
+    pub fn nullifier(chain_id: u64, index: u64) -> [u8; 32] {
+        let mut h = Keccak256::new();
+        h.update(NULLIFIER_DOMAIN);
+        h.update(chain_id.to_be_bytes());
+        h.update(index.to_be_bytes());
+        h.finalize().into()
+    }
+
+    /// Why a withdrawal claim is refused by the L2 state.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ClaimRefusal {
+        /// No L2 policy, or a build without `devnet-l2-user-txs`.
+        NotActive,
+        /// The claim names another L2 chain.
+        Chain,
+        /// The proof folds to no retained withdrawal root.
+        Proof,
+        /// The proof folds to a retained root that is not yet
+        /// [`WITHDRAW_DELAY_BLOCKS`] old.
+        NotMatured,
+        /// The leaf index is not below the count of the root it proves against.
+        Index,
+        /// The leaf was already claimed.
+        Claimed,
+        /// The escrow holds less than the claim (unreachable while every
+        /// settlement is proven; checked anyway).
+        Escrow,
+    }
+
+    /// The retained record the claim proves against, if the proof is valid,
+    /// matured for a claim in native block `at_height`, and the index lies in
+    /// that tree. Pure: shared by the transition, the mempool and tooling.
+    pub fn matured_proof<'a>(
+        records: &'a [Record],
+        at_height: u64,
+        chain_id: u64,
+        index: u64,
+        l1_recipient: &[u8; 32],
+        sats: u64,
+        siblings: &[[u8; 32]; TREE_DEPTH],
+    ) -> Result<&'a Record, ClaimRefusal> {
+        let leaf = leaf(chain_id, index, l1_recipient, sats);
+        let root = root_from_proof(&leaf, index, siblings).ok_or(ClaimRefusal::Proof)?;
+        // Roots are unique among records (each adds leaves to an
+        // append-only tree); take the newest match regardless.
+        let record = records.iter().rev().find(|r| r.root == root).ok_or(ClaimRefusal::Proof)?;
+        if record.height.saturating_add(WITHDRAW_DELAY_BLOCKS) > at_height {
+            return Err(ClaimRefusal::NotMatured);
+        }
+        if index >= record.count {
+            return Err(ClaimRefusal::Index);
+        }
+        Ok(record)
+    }
+
+    /// The newest record matured for a claim in native block `at_height`.
+    pub fn matured(records: &[Record], at_height: u64) -> Option<&Record> {
+        records.iter().rev().find(|r| r.height.saturating_add(WITHDRAW_DELAY_BLOCKS) <= at_height)
+    }
+
+    /// Claimed leaf indices of the policy's chain, one bit per index in
+    /// 256-bit words. Words below `floor` are entirely claimed and dropped,
+    /// so the stored set is the "frontier" between fully claimed history and
+    /// the newest withdrawals: with claims roughly in leaf order it stays a
+    /// few words, and in the worst case (every 256th leaf left unclaimed) it
+    /// is 40 bytes per 256 leaves. Indices are below 2^32 (tree depth).
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct ClaimBitmap {
+        floor: u64,
+        words: std::collections::BTreeMap<u64, [u8; 32]>,
+        claims: u64,
+    }
+    impl ClaimBitmap {
+        pub fn contains(&self, index: u64) -> bool {
+            let word = index / 256;
+            if word < self.floor {
+                return true;
+            }
+            let bit = (index % 256) as usize;
+            self.words.get(&word).is_some_and(|w| w[bit / 8] & (1 << (bit % 8)) != 0)
+        }
+        /// Set `index`; false if it was already set.
+        pub(crate) fn insert(&mut self, index: u64) -> bool {
+            if self.contains(index) {
+                return false;
+            }
+            let word = index / 256;
+            let bit = (index % 256) as usize;
+            self.words.entry(word).or_insert([0; 32])[bit / 8] |= 1 << (bit % 8);
+            self.claims += 1;
+            while self.words.get(&self.floor).is_some_and(|w| *w == [0xff; 32]) {
+                self.words.remove(&self.floor);
+                self.floor += 1;
+            }
+            true
+        }
+        /// Number of claimed leaves.
+        pub fn claims(&self) -> u64 {
+            self.claims
+        }
+        /// Words below this index are fully claimed (and not stored).
+        pub fn floor(&self) -> u64 {
+            self.floor
+        }
+        /// Stored (partially claimed) words.
+        pub fn stored_words(&self) -> usize {
+            self.words.len()
+        }
+        /// Stored (partially claimed) words, ascending: `(word index, bits)`.
+        pub fn words(&self) -> impl Iterator<Item = (u64, &[u8; 32])> {
+            self.words.iter().map(|(w, bits)| (*w, bits))
+        }
+        pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+            out.extend_from_slice(&self.claims.to_le_bytes());
+            out.extend_from_slice(&self.floor.to_le_bytes());
+            out.extend_from_slice(&(self.words.len() as u64).to_le_bytes());
+            for (index, word) in &self.words {
+                out.extend_from_slice(&index.to_le_bytes());
+                out.extend_from_slice(word);
+            }
+        }
     }
 }
 
@@ -535,6 +702,11 @@ pub struct State {
     /// Withdrawal roots of settlements that added withdrawals (M4), oldest
     /// first, pruned by [`withdrawal::RETENTION_BLOCKS`].
     withdrawals: Vec<withdrawal::Record>,
+    /// Claimed withdrawal leaves (M5, the nullifier set).
+    claimed: withdrawal::ClaimBitmap,
+    /// Satoshis released from escrow by claims. Invariant:
+    /// `escrow_sat == sum(inbox sats) - released_sat`.
+    released_sat: u128,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -585,6 +757,8 @@ impl State {
             escrow_sat: 0,
             da: Vec::new(),
             withdrawals: Vec::new(),
+            claimed: withdrawal::ClaimBitmap::default(),
+            released_sat: 0,
         })
     }
     pub(crate) fn genesis_async(policy: Policy) -> Result<Self, Reject> {
@@ -641,6 +815,78 @@ impl State {
     pub fn withdrawal_roots(&self) -> &[withdrawal::Record] {
         &self.withdrawals
     }
+    /// The newest retained withdrawal record a claim in the next native
+    /// block may prove against (M5), `None` before any is old enough.
+    pub fn matured_withdrawals(&self) -> Option<withdrawal::Record> {
+        withdrawal::matured(&self.withdrawals, self.native_height.saturating_add(1)).copied()
+    }
+    /// Leaves `0..matured_count` are claimable in the next native block.
+    pub fn matured_count(&self) -> u64 {
+        self.matured_withdrawals().map_or(0, |r| r.count)
+    }
+    /// Claimed leaves (the nullifier set).
+    pub fn claimed(&self) -> &withdrawal::ClaimBitmap {
+        &self.claimed
+    }
+    /// Satoshis released from escrow by claims.
+    pub fn released_sat(&self) -> u128 {
+        self.released_sat
+    }
+    /// Satoshis ever escrowed by deposits (the inbox is never pruned).
+    pub fn deposited_sat(&self) -> u128 {
+        self.inbox.iter().map(|r| u128::from(r.sats)).sum()
+    }
+    /// The bridge conservation invariant: escrow equals deposits minus claims.
+    pub fn escrow_conserved(&self) -> bool {
+        self.deposited_sat().checked_sub(self.released_sat) == Some(self.escrow_sat)
+    }
+    /// Check a claim of withdrawal `index` for the next native block without
+    /// mutating state (mempool preflight, RPC, tooling).
+    pub fn check_claim(
+        &self,
+        chain_id: u64,
+        index: u64,
+        l1_recipient: &[u8; 32],
+        sats: u64,
+        siblings: &[[u8; 32]; withdrawal::TREE_DEPTH],
+    ) -> Result<withdrawal::Record, withdrawal::ClaimRefusal> {
+        use withdrawal::ClaimRefusal as R;
+        if !USER_TRANSACTIONS_ENABLED || !self.asynchronous {
+            return Err(R::NotActive);
+        }
+        if chain_id != self.policy.chain_id {
+            return Err(R::Chain);
+        }
+        let at = self.native_height.checked_add(1).ok_or(R::NotActive)?;
+        let record = *withdrawal::matured_proof(&self.withdrawals, at, chain_id, index, l1_recipient, sats, siblings)?;
+        if self.claimed.contains(index) {
+            return Err(R::Claimed);
+        }
+        if self.escrow_sat < u128::from(sats) {
+            return Err(R::Escrow);
+        }
+        Ok(record)
+    }
+    /// Release `sats` of escrow for withdrawal `index` (M5). The caller
+    /// creates exactly that output for `l1_recipient` after this succeeds;
+    /// on error nothing changed.
+    pub(crate) fn release_withdrawal(
+        &mut self,
+        chain_id: u64,
+        index: u64,
+        l1_recipient: &[u8; 32],
+        sats: u64,
+        siblings: &[[u8; 32]; withdrawal::TREE_DEPTH],
+    ) -> Result<(), withdrawal::ClaimRefusal> {
+        self.check_claim(chain_id, index, l1_recipient, sats, siblings)?;
+        let released = self.released_sat.checked_add(u128::from(sats)).ok_or(withdrawal::ClaimRefusal::Escrow)?;
+        // No fallible step below: nullifier, escrow and total move together.
+        let fresh = self.claimed.insert(index);
+        debug_assert!(fresh);
+        self.escrow_sat -= u128::from(sats);
+        self.released_sat = released;
+        Ok(())
+    }
     /// `(root, count)` of the withdrawal tree after the accepted head: the
     /// empty tree before any V3 settlement (and after a V2 head).
     pub fn withdrawal_head(&self) -> ([u8; 32], u64) {
@@ -678,6 +924,11 @@ impl State {
         let height = self.native_height.checked_add(1).ok_or(R::Full)?;
         self.da.push(da::Record { l2_number, commitment, height });
         Ok(())
+    }
+    /// Test hook: install a withdrawal record without a settlement.
+    #[cfg(test)]
+    pub(crate) fn insert_withdrawal_record(&mut self, record: withdrawal::Record) {
+        self.withdrawals.push(record);
     }
     /// Test hook: install a DA record without a funded DA transaction.
     #[cfg(test)]
@@ -784,6 +1035,12 @@ impl State {
                 out.extend_from_slice(&r.count.to_le_bytes());
                 out.extend_from_slice(&r.height.to_le_bytes());
             }
+        }
+        // Absent until the first claim, so states without claims keep their bytes.
+        if self.claimed.claims() != 0 {
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:CLAIM-STATE:1");
+            out.extend_from_slice(&self.released_sat.to_le_bytes());
+            self.claimed.encode(&mut out);
         }
         // Absent while empty, so states without DA keep their bytes.
         if !self.da.is_empty() {

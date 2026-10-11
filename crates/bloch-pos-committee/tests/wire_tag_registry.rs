@@ -338,6 +338,9 @@ const TX_TAGS: &[(u8, Status)] = &[
     // M3 data availability (`devnet-l2-user-txs`); 0x15 checked free on every
     // local ref and on the mainnet tree (MAINNET_TX_TAGS) on 2026-10-10.
     (0x15, Status::Released { name: "L2DataAvailability", rivals: NO_RIVALS }),
+    // M5 withdrawal claim (`devnet-l2-user-txs`); 0x16 checked free on every
+    // local ref (327 refs) and on the mainnet tree (MAINNET_TX_TAGS) on 2026-10-10.
+    (0x16, Status::Released { name: "L2WithdrawClaim", rivals: NO_RIVALS }),
 ];
 
 /// Three lineages that all intend the SAME flag day disagree on all three
@@ -533,6 +536,7 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         PosTransaction::L2SettlementAsync(_) => 0x13,
         PosTransaction::L2Deposit(_) => 0x14,
         PosTransaction::L2DataAvailability(_) => 0x15,
+        PosTransaction::L2WithdrawClaim(_) => 0x16,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }
@@ -1124,7 +1128,13 @@ fn l2_transaction_tags_do_not_overlap_the_mainnet_tag_set() {
         .collect();
     assert_eq!(
         l2,
-        vec![(0x12, "L2Settlement"), (0x13, "L2SettlementAsync"), (0x14, "L2Deposit"), (0x15, "L2DataAvailability")],
+        vec![
+            (0x12, "L2Settlement"),
+            (0x13, "L2SettlementAsync"),
+            (0x14, "L2Deposit"),
+            (0x15, "L2DataAvailability"),
+            (0x16, "L2WithdrawClaim"),
+        ],
         "the L2 rows of the registry changed"
     );
     for (tag, name) in &l2 {
@@ -1139,6 +1149,7 @@ fn l2_transaction_tags_do_not_overlap_the_mainnet_tag_set() {
     assert_eq!(bloch_pos_committee::l2_settlement::ASYNC_WIRE_TAG, 0x13);
     assert_eq!(bloch_pos_committee::transition::l2_deposit::L2_DEPOSIT_TAG, 0x14);
     assert_eq!(bloch_pos_committee::transition::l2_da::L2_DATA_AVAILABILITY_TAG, 0x15);
+    assert_eq!(bloch_pos_committee::transition::l2_claim::L2_WITHDRAW_CLAIM_TAG, 0x16);
     // The old bytes no longer decode as L2 transactions in this tree.
     for old in [0x0E, 0x0F, 0x10] {
         assert_eq!(
