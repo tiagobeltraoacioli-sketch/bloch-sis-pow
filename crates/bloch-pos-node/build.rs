@@ -212,6 +212,9 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_DEVNET_L2_DEPOSITS").is_some() {
         devnet.push_str("+devnet-l2-deposits");
     }
+    if std::env::var_os("CARGO_FEATURE_DEVNET_L2_USER_TXS").is_some() {
+        devnet.push_str("+devnet-l2-user-txs");
+    }
     println!("cargo:rustc-env=BLOCH_BUILD_VERSION={pkg} ({commit}{dirty}){devnet}");
 
     // ── The machine-readable half, for `getbuildinfo` ──────────────────────
