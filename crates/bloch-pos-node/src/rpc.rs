@@ -2504,6 +2504,25 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
                         ("word", Json::u(w)), ("bits", Json::hex(bits)),
                     ])).collect())),
                 ])),
+                // M6: claims of at least large_claim_sat wait
+                // large_delay_blocks (matured_large is their newest root),
+                // and each window releases at most its cap (the window's
+                // first claim always passes).
+                ("large_claim_sat", Json::sat(u128::from(bloch_pos_committee::l2_settlement::withdrawal::LARGE_CLAIM_SAT))),
+                ("large_delay_blocks", Json::u(bloch_pos_committee::l2_settlement::withdrawal::LARGE_WITHDRAW_DELAY_BLOCKS)),
+                ("matured_large", l2.matured_large_withdrawals().map_or(Json::Null, |r| Json::obj(vec![
+                    ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
+                    ("count", Json::u(r.count)), ("height", Json::u(r.height)),
+                ]))),
+                ("release_window", {
+                    let w = l2.release_window();
+                    Json::obj(vec![
+                        ("window", Json::u(w.window)),
+                        ("blocks", Json::u(bloch_pos_committee::l2_settlement::withdrawal::RELEASE_WINDOW_BLOCKS)),
+                        ("released_sat", Json::sat(w.released)), ("cap_sat", Json::sat(w.cap)),
+                        ("remaining_sat", Json::sat(w.remaining())),
+                    ])
+                }),
                 ("released_sat", Json::sat(l2.released_sat())),
                 ("escrow_conserved", Json::Bool(l2.escrow_conserved())),
             ])

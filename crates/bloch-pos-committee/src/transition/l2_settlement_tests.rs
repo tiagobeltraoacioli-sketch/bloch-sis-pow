@@ -1724,6 +1724,8 @@ mod l2_tests {
     #[cfg(feature = "devnet-l2-user-txs")]
     fn escrow_is_conserved_over_random_deposit_settle_claim_sequences() {
         let (pre, _) = funded_async_fixture();
+        // Refusals by the M6 rules alone, summed over seeds: both must bind.
+        let (mut limited, mut large_waits) = (0u32, 0u32);
         for seed in 1..=24u64 {
             let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
             let mut next = move |m: u64| {
@@ -1738,10 +1740,15 @@ mod l2_tests {
             let mut settled = 0usize; // leaves covered by the newest record
             let mut paid = std::collections::BTreeSet::new();
             let (mut deposited, mut released) = (0u128, 0u128);
+            // Odd seeds use BLCH-scale amounts, so the large-claim delay and
+            // the release window bind; even seeds stay below both.
+            let scale = if seed % 2 == 1 { 10_000 } else { 1 };
+            // Independent model of the release window: (window, released, cap).
+            let mut window = (u64::MAX, 0u128, 0u128);
             for step in 0..400u64 {
                 match next(6) {
                     0 => {
-                        let sats = 1_000_000 + next(5_000_000);
+                        let sats = (1_000_000 + next(5_000_000)) * scale;
                         l2.append_deposit(crate::l2_settlement::InboxRecord {
                             height: l2.height() + 1, tx_index: 0, txid: [step as u8; 32], vout: 1, sats, recipient: [1; 20],
                         })
@@ -1753,7 +1760,7 @@ mod l2_tests {
                         // escrow check must hold the line).
                         let i = outbox.len() as u64;
                         let recipient = [(next(250) + 1) as u8; 32];
-                        let sats = 1_000_000 + next(3_000_000);
+                        let sats = (1_000_000 + next(3_000_000)) * scale;
                         outbox.push((wd::leaf(700771, i, &recipient, sats), recipient, sats));
                     }
                     2 if outbox.len() > settled => {
@@ -1766,7 +1773,7 @@ mod l2_tests {
                         l2.advance_height().unwrap();
                     }
                     3 => {
-                        for _ in 0..next(WITHDRAW_DELAY_BLOCKS + 8) {
+                        for _ in 0..next(wd::LARGE_WITHDRAW_DELAY_BLOCKS / 2 + 8) {
                             l2.advance_height().unwrap();
                         }
                     }
@@ -1778,17 +1785,32 @@ mod l2_tests {
                         let records = l2.withdrawal_roots().to_vec();
                         let Some(record) = records.get(next(records.len() as u64 + 1) as usize) else { continue };
                         let siblings = wd::proof(&leaves[..record.count as usize], index).unwrap_or([[7; 32]; 32]);
+                        let at = l2.height() + 1;
+                        let delay = if sats >= wd::LARGE_CLAIM_SAT { wd::LARGE_WITHDRAW_DELAY_BLOCKS } else { WITHDRAW_DELAY_BLOCKS };
+                        let matured = record.height + delay <= at;
+                        let in_tree = index < record.count && leaf == leaves[index as usize];
+                        let w = at / wd::RELEASE_WINDOW_BLOCKS;
+                        let current = if window.0 == w && window.1 != 0 {
+                            window
+                        } else {
+                            (w, 0, (l2.escrow_sat() / 10).max(1_000_000_000))
+                        };
+                        let fits = current.1 == 0 || current.1 + u128::from(sats) <= current.2;
+                        let expected_ok =
+                            matured && in_tree && !paid.contains(&index) && l2.escrow_sat() >= u128::from(sats) && fits;
                         let before = l2.clone();
                         let result = l2.release_withdrawal(700771, index, &recipient, sats, &siblings);
-                        let matured = record.height + WITHDRAW_DELAY_BLOCKS <= l2.height() + 1;
-                        let in_tree = index < record.count && leaf == leaves[index as usize];
-                        let expected_ok = matured && in_tree && !paid.contains(&index) && l2.escrow_sat() >= u128::from(sats);
                         assert_eq!(result.is_ok(), expected_ok, "seed {seed} step {step}: {result:?}");
                         if result.is_ok() {
                             paid.insert(index);
                             released += u128::from(sats);
+                            window = (current.0, current.1 + u128::from(sats), current.2);
                         } else {
                             assert_eq!(l2, before);
+                            limited += u32::from(matured && in_tree && !paid.contains(&index) && l2.escrow_sat() >= u128::from(sats) && !fits);
+                            large_waits += u32::from(
+                                in_tree && sats >= wd::LARGE_CLAIM_SAT && record.height + WITHDRAW_DELAY_BLOCKS <= at && !matured,
+                            );
                         }
                     }
                     _ => {}
@@ -1799,6 +1821,97 @@ mod l2_tests {
                 assert_eq!(l2.claimed().claims(), paid.len() as u64);
             }
         }
+        assert!(limited > 0 && large_waits > 0, "M6 rules never bound: limited {limited}, large waits {large_waits}");
+    }
+
+    // ── M6: large-claim delay and release window ──
+
+    const BLCH: u64 = 100_000_000;
+
+    /// Async L2 state with `escrow` sats escrowed and one withdrawal record
+    /// (accepted at native height 1) over `leaves` = (recipient, sats).
+    fn window_fixture(escrow: u64, leaves: &[([u8; 32], u64)]) -> (crate::l2_settlement::State, Vec<[u8; 32]>) {
+        let (pre, _) = funded_async_fixture();
+        let mut l2 = pre.l2_settlement().unwrap().clone();
+        l2.append_deposit(crate::l2_settlement::InboxRecord {
+            height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: escrow, recipient: [0x42; 20],
+        })
+        .unwrap();
+        let tree: Vec<[u8; 32]> =
+            leaves.iter().enumerate().map(|(i, (r, sats))| wd::leaf(700771, i as u64, r, *sats)).collect();
+        l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&tree), count: tree.len() as u64, height: 1 });
+        (l2, tree)
+    }
+
+    fn release(l2: &mut crate::l2_settlement::State, tree: &[[u8; 32]], leaves: &[([u8; 32], u64)], i: u64) -> Result<(), wd::ClaimRefusal> {
+        let (r, sats) = leaves[i as usize];
+        l2.release_withdrawal(700771, i, &r, sats, &wd::proof(tree, i).unwrap())
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn a_large_claim_waits_the_longer_delay() {
+        let leaves = [([1; 32], wd::LARGE_CLAIM_SAT - 1), ([2; 32], wd::LARGE_CLAIM_SAT)];
+        let (mut l2, tree) = window_fixture(1_000 * BLCH, &leaves);
+        while l2.height() + 1 < 1 + WITHDRAW_DELAY_BLOCKS {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(l2.matured_withdrawals().map(|r| r.count), Some(2));
+        assert_eq!(l2.matured_large_withdrawals(), None);
+        assert_eq!(release(&mut l2, &tree, &leaves, 1), Err(wd::ClaimRefusal::NotMatured));
+        release(&mut l2, &tree, &leaves, 0).expect("just below the threshold: standard delay");
+        while l2.height() + 1 < 1 + wd::LARGE_WITHDRAW_DELAY_BLOCKS {
+            assert_eq!(release(&mut l2, &tree, &leaves, 1), Err(wd::ClaimRefusal::NotMatured));
+            l2.advance_height().unwrap();
+        }
+        assert!(l2.matured_large_withdrawals().is_some());
+        // Next window: the first claim of a window is always admitted.
+        release(&mut l2, &tree, &leaves, 1).expect("large claim after the long delay");
+        assert!(l2.escrow_conserved());
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn claims_beyond_the_window_cap_wait_for_the_next_window() {
+        // Escrow 1 000 BLCH: cap 100 BLCH per window.
+        let leaves = [([1; 32], 60 * BLCH), ([2; 32], 50 * BLCH), ([3; 32], 40 * BLCH), ([4; 32], 99 * BLCH)];
+        let (mut l2, tree) = window_fixture(1_000 * BLCH, &leaves);
+        while (l2.height() + 1) % wd::RELEASE_WINDOW_BLOCKS != 0 || l2.height() + 1 < 1 + WITHDRAW_DELAY_BLOCKS {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(l2.release_window().cap, 100 * BLCH as u128);
+        release(&mut l2, &tree, &leaves, 0).unwrap();
+        let state = l2.clone();
+        assert_eq!(release(&mut l2, &tree, &leaves, 1), Err(wd::ClaimRefusal::RateLimited));
+        assert_eq!(l2, state, "a refused claim changes nothing");
+        release(&mut l2, &tree, &leaves, 2).expect("60 + 40 fits the cap exactly");
+        assert_eq!(l2.release_window().remaining(), 0);
+        assert_eq!(release(&mut l2, &tree, &leaves, 3), Err(wd::ClaimRefusal::RateLimited));
+        // The cap stays fixed for the window although the escrow shrank.
+        assert_eq!(l2.release_window().cap, 100 * BLCH as u128);
+        for _ in 0..wd::RELEASE_WINDOW_BLOCKS {
+            l2.advance_height().unwrap();
+        }
+        // New window: cap from the escrow now (900 BLCH → 90 BLCH), and the
+        // window's first claim is admitted even above it.
+        assert_eq!(l2.release_window().cap, 90 * BLCH as u128);
+        release(&mut l2, &tree, &leaves, 3).expect("first claim of the window");
+        assert_eq!(release(&mut l2, &tree, &leaves, 1), Err(wd::ClaimRefusal::RateLimited));
+        assert!(l2.escrow_conserved());
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn a_small_escrow_releases_up_to_the_floor_per_window() {
+        let leaves = [([1; 32], 6 * BLCH), ([2; 32], 4 * BLCH), ([3; 32], BLCH)];
+        let (mut l2, tree) = window_fixture(20 * BLCH, &leaves);
+        while (l2.height() + 1) % wd::RELEASE_WINDOW_BLOCKS != 0 || l2.height() + 1 < 1 + WITHDRAW_DELAY_BLOCKS {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(l2.release_window().cap, wd::RELEASE_FLOOR_SAT);
+        release(&mut l2, &tree, &leaves, 0).unwrap();
+        release(&mut l2, &tree, &leaves, 1).unwrap();
+        assert_eq!(release(&mut l2, &tree, &leaves, 2), Err(wd::ClaimRefusal::RateLimited));
     }
 
     /// Full transition, block by block: deposit (0x14) → V3 settlement

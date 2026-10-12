@@ -5,7 +5,8 @@
 //! Settlement V3 publishes the L2 withdrawal tree (M4); this module checks it
 //! and keeps recent roots for the L1 claim (M5), which releases escrow to
 //! the L1 recipient once the root is [`withdrawal::WITHDRAW_DELAY_BLOCKS`]
-//! old, at most once per leaf. No production activation.
+//! old (longer for large claims), at most once per leaf and within a
+//! per-window release cap (M6). No production activation.
 use sha3::{Digest, Keccak256, Sha3_256};
 
 /// Native wire tags. Moved on 2026-10-10 from 0x0E/0x0F to the first bytes
@@ -332,6 +333,74 @@ pub mod withdrawal {
     /// same block.
     const _: () = assert!(WITHDRAW_DELAY_BLOCKS >= 1 && WITHDRAW_DELAY_BLOCKS <= RETENTION_BLOCKS);
 
+    // ── M6: limits that bound the damage of a forged settlement ──
+    //
+    // The settlement proof (Groth16 over BN254) is not post-quantum, and a
+    // forged settlement can publish any withdrawal tree. These rules do not
+    // prevent that; they slow the drain so that operators can react (halt
+    // the network or replace the L2 policy) before the escrow empties.
+
+    /// Claims of at least this many satoshis (100 BLCH) wait
+    /// [`LARGE_WITHDRAW_DELAY_BLOCKS`] instead of [`WITHDRAW_DELAY_BLOCKS`].
+    pub const LARGE_CLAIM_SAT: u64 = 10_000_000_000;
+    /// Development value: four epochs. Mainnet suggestion (M8): one week.
+    pub const LARGE_WITHDRAW_DELAY_BLOCKS: u64 = 128;
+    const _: () = assert!(
+        LARGE_WITHDRAW_DELAY_BLOCKS >= WITHDRAW_DELAY_BLOCKS && LARGE_WITHDRAW_DELAY_BLOCKS <= RETENTION_BLOCKS
+    );
+    /// The delay a claim of `sats` must wait after the record it proves against.
+    pub fn delay_for(sats: u64) -> u64 {
+        if sats >= LARGE_CLAIM_SAT {
+            LARGE_WITHDRAW_DELAY_BLOCKS
+        } else {
+            WITHDRAW_DELAY_BLOCKS
+        }
+    }
+    /// Release windows: native block `h` belongs to window
+    /// `h / RELEASE_WINDOW_BLOCKS`.
+    pub const RELEASE_WINDOW_BLOCKS: u64 = 32;
+    /// Per window, claims release at most `max(RELEASE_FLOOR_SAT, escrow at
+    /// the window's first claim × RELEASE_WINDOW_BPS / 10 000)`, except that
+    /// the window's first claim is always admitted (a single withdrawal above
+    /// the cap waits for an empty window instead of never paying). A forged
+    /// tree therefore drains at most ~10% of the escrow per window, plus one
+    /// claim.
+    pub const RELEASE_WINDOW_BPS: u128 = 1_000;
+    /// 10 BLCH: keeps a small escrow usable.
+    pub const RELEASE_FLOOR_SAT: u128 = 1_000_000_000;
+
+    /// Release accounting of the current window.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ReleaseWindow {
+        /// Window index (`native height / RELEASE_WINDOW_BLOCKS`).
+        pub window: u64,
+        /// Satoshis released in this window.
+        pub released: u128,
+        /// The cap of this window, fixed at its first claim.
+        pub cap: u128,
+    }
+    impl ReleaseWindow {
+        /// The window state a claim of `sats` in native block `at_height`
+        /// sees, given the current escrow: rolled to a fresh window when the
+        /// stored one is older.
+        pub fn at(self, at_height: u64, escrow_sat: u128) -> Self {
+            let window = at_height / RELEASE_WINDOW_BLOCKS;
+            if window == self.window && self.released != 0 {
+                return self;
+            }
+            let share = escrow_sat.saturating_mul(RELEASE_WINDOW_BPS) / 10_000;
+            Self { window, released: 0, cap: share.max(RELEASE_FLOOR_SAT) }
+        }
+        /// Whether `sats` more fits (the first claim of a window always does).
+        pub fn admits(&self, sats: u64) -> bool {
+            self.released == 0 || self.released.saturating_add(u128::from(sats)) <= self.cap
+        }
+        /// Room left in the window (the first claim may exceed it).
+        pub fn remaining(&self) -> u128 {
+            self.cap.saturating_sub(self.released)
+        }
+    }
+
     pub const NULLIFIER_DOMAIN: &[u8] = b"BLOCH:L2:CLAIM:1";
 
     /// `keccak256("BLOCH:L2:CLAIM:1" || chain_id (u64 BE) || leaf_index (u64
@@ -365,6 +434,8 @@ pub mod withdrawal {
         /// The escrow holds less than the claim (unreachable while every
         /// settlement is proven; checked anyway).
         Escrow,
+        /// The release window's cap is used up; the claim fits a later window.
+        RateLimited,
     }
 
     /// The retained record the claim proves against, if the proof is valid,
@@ -384,7 +455,7 @@ pub mod withdrawal {
         // Roots are unique among records (each adds leaves to an
         // append-only tree); take the newest match regardless.
         let record = records.iter().rev().find(|r| r.root == root).ok_or(ClaimRefusal::Proof)?;
-        if record.height.saturating_add(WITHDRAW_DELAY_BLOCKS) > at_height {
+        if record.height.saturating_add(delay_for(sats)) > at_height {
             return Err(ClaimRefusal::NotMatured);
         }
         if index >= record.count {
@@ -393,9 +464,10 @@ pub mod withdrawal {
         Ok(record)
     }
 
-    /// The newest record matured for a claim in native block `at_height`.
-    pub fn matured(records: &[Record], at_height: u64) -> Option<&Record> {
-        records.iter().rev().find(|r| r.height.saturating_add(WITHDRAW_DELAY_BLOCKS) <= at_height)
+    /// The newest record matured for a claim of `sats` in native block
+    /// `at_height`.
+    pub fn matured(records: &[Record], at_height: u64, sats: u64) -> Option<&Record> {
+        records.iter().rev().find(|r| r.height.saturating_add(delay_for(sats)) <= at_height)
     }
 
     /// Claimed leaf indices of the policy's chain, one bit per index in
@@ -707,6 +779,8 @@ pub struct State {
     /// Satoshis released from escrow by claims. Invariant:
     /// `escrow_sat == sum(inbox sats) - released_sat`.
     released_sat: u128,
+    /// Release accounting of the newest window with a claim (M6).
+    release_window: withdrawal::ReleaseWindow,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -759,6 +833,7 @@ impl State {
             withdrawals: Vec::new(),
             claimed: withdrawal::ClaimBitmap::default(),
             released_sat: 0,
+            release_window: withdrawal::ReleaseWindow::default(),
         })
     }
     pub(crate) fn genesis_async(policy: Policy) -> Result<Self, Reject> {
@@ -818,7 +893,16 @@ impl State {
     /// The newest retained withdrawal record a claim in the next native
     /// block may prove against (M5), `None` before any is old enough.
     pub fn matured_withdrawals(&self) -> Option<withdrawal::Record> {
-        withdrawal::matured(&self.withdrawals, self.native_height.saturating_add(1)).copied()
+        withdrawal::matured(&self.withdrawals, self.native_height.saturating_add(1), 0).copied()
+    }
+    /// The same for a claim of at least [`withdrawal::LARGE_CLAIM_SAT`].
+    pub fn matured_large_withdrawals(&self) -> Option<withdrawal::Record> {
+        withdrawal::matured(&self.withdrawals, self.native_height.saturating_add(1), withdrawal::LARGE_CLAIM_SAT)
+            .copied()
+    }
+    /// The release window a claim in the next native block sees.
+    pub fn release_window(&self) -> withdrawal::ReleaseWindow {
+        self.release_window.at(self.native_height.saturating_add(1), self.escrow_sat)
     }
     /// Leaves `0..matured_count` are claimable in the next native block.
     pub fn matured_count(&self) -> u64 {
@@ -865,6 +949,9 @@ impl State {
         if self.escrow_sat < u128::from(sats) {
             return Err(R::Escrow);
         }
+        if !self.release_window().admits(sats) {
+            return Err(R::RateLimited);
+        }
         Ok(record)
     }
     /// Release `sats` of escrow for withdrawal `index` (M5). The caller
@@ -880,11 +967,14 @@ impl State {
     ) -> Result<(), withdrawal::ClaimRefusal> {
         self.check_claim(chain_id, index, l1_recipient, sats, siblings)?;
         let released = self.released_sat.checked_add(u128::from(sats)).ok_or(withdrawal::ClaimRefusal::Escrow)?;
-        // No fallible step below: nullifier, escrow and total move together.
+        let mut window = self.release_window();
+        window.released = window.released.saturating_add(u128::from(sats));
+        // No fallible step below: nullifier, escrow, total and window move together.
         let fresh = self.claimed.insert(index);
         debug_assert!(fresh);
         self.escrow_sat -= u128::from(sats);
         self.released_sat = released;
+        self.release_window = window;
         Ok(())
     }
     /// `(root, count)` of the withdrawal tree after the accepted head: the
@@ -1041,6 +1131,9 @@ impl State {
             out.extend_from_slice(b"BLOCH:NATIVE:L2:CLAIM-STATE:1");
             out.extend_from_slice(&self.released_sat.to_le_bytes());
             self.claimed.encode(&mut out);
+            out.extend_from_slice(&self.release_window.window.to_le_bytes());
+            out.extend_from_slice(&self.release_window.released.to_le_bytes());
+            out.extend_from_slice(&self.release_window.cap.to_le_bytes());
         }
         // Absent while empty, so states without DA keep their bytes.
         if !self.da.is_empty() {

@@ -34,6 +34,10 @@ sign --genesis TRUSTED_FILE --tx FILE --dir KEYSTORE_DIR --out NEW_FILE
 a withdrawal root the L1 retains (getl2settlement withdrawals.roots) and at
 least withdrawals.delay_blocks native blocks old when the claim is included;
 proving against the newest matured root (withdrawals.matured) always works.
+Claims of at least withdrawals.large_claim_sat wait withdrawals.large_delay_blocks
+(use withdrawals.matured_large). Each release window frees at most
+withdrawals.release_window.cap_sat; a claim that does not fit is refused and
+fits a later window (the first claim of a window is always admitted).
 The funding inputs pay the fee and the rest returns as change to the funding
 key; the recipient output is exactly the withdrawn sats. Consensus requires
 exact conservation at the including block's base fee (getchaininfo

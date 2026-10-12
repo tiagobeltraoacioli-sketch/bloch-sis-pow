@@ -101,6 +101,8 @@ pub enum L2WithdrawClaimReject {
     AlreadyClaimed,
     /// The escrow holds less than the claim.
     Escrow,
+    /// The release window's cap is used up; retry in a later window.
+    RateLimited,
     Arithmetic,
 }
 
@@ -114,6 +116,7 @@ impl From<ClaimRefusal> for L2WithdrawClaimReject {
             ClaimRefusal::Index => Self::Index,
             ClaimRefusal::Claimed => Self::AlreadyClaimed,
             ClaimRefusal::Escrow => Self::Escrow,
+            ClaimRefusal::RateLimited => Self::RateLimited,
         }
     }
 }
