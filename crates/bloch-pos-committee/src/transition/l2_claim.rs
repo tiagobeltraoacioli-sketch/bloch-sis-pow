@@ -26,8 +26,13 @@
 //! when zero).
 //!
 //! **Versioned body.** The byte after the tag is the claim version. Version 1
-//! is defined here; M6 can add an owner (PQ) signature for large withdrawals
-//! as version 2 without a new wire tag. Any other version does not decode.
+//! carries no attestation. Version 2 (M6) appends the attestor set (threshold,
+//! all n enveloped hybrid keys) and at least k of their signatures over
+//! `withdrawal::attestation_digest(network_domain, l2_chain_id, root)`, the
+//! root being the one the Merkle proof folds to; the set must hash to the
+//! policy's `attestor_set`. With attestors configured, claims of at least
+//! `withdrawal::ATTESTED_CLAIM_SAT` must be version 2. Any other version does
+//! not decode.
 
 use super::*;
 use crate::{
@@ -37,14 +42,101 @@ use crate::{
 };
 
 pub const L2_WITHDRAW_CLAIM_TAG: u8 = 0x16;
-/// The only claim body version this build decodes.
+/// Claim body without attestation.
 pub const CLAIM_VERSION: u8 = 1;
+/// Claim body with the attestors' co-signature (M6).
+pub const CLAIM_VERSION_ATTESTED: u8 = 2;
 /// Funding inputs of one claim (each costs one hybrid verification).
 pub const MAX_CLAIM_INPUTS: usize = 16;
 /// Release output index; change, when present, is output 1.
 pub const RELEASE_VOUT: u32 = 0;
 pub const CHANGE_VOUT: u32 = 1;
 const INTENT_DOMAIN: &[u8] = b"BLOCH:L2:CLAIM:V1";
+
+/// k-of-n hybrid PQ co-signature of a withdrawal root (claim version 2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attestation {
+    /// k: signatures required.
+    pub threshold: u8,
+    /// All n attestor keys, in set order (each `ADMISSION_PQ_KEY_BYTES`).
+    pub keys: Vec<Vec<u8>>,
+    /// `(signer index, signature)`, indices strictly increasing, at least k.
+    pub signatures: Vec<(u8, Vec<u8>)>,
+}
+
+impl Attestation {
+    pub fn set_hash(&self) -> [u8; 32] {
+        withdrawal::attestor_set_hash(self.threshold, &self.keys)
+    }
+
+    fn encode(&self, b: &mut Vec<u8>) {
+        b.push(self.threshold);
+        b.push(self.keys.len() as u8);
+        for key in &self.keys {
+            b.extend_from_slice(key);
+        }
+        b.push(self.signatures.len() as u8);
+        for (index, signature) in &self.signatures {
+            b.push(*index);
+            b.extend_from_slice(&(signature.len() as u32).to_le_bytes());
+            b.extend_from_slice(signature);
+        }
+    }
+
+    fn decode(r: &mut TxReader<'_>, bad: TxDecodeError) -> Result<Self, TxDecodeError> {
+        let threshold = r.u8()?;
+        let n = r.u8()? as usize;
+        if n == 0 || n > withdrawal::MAX_ATTESTORS {
+            return Err(bad);
+        }
+        let mut keys = Vec::with_capacity(n);
+        for _ in 0..n {
+            keys.push(r.take(ADMISSION_PQ_KEY_BYTES)?.to_vec());
+        }
+        let m = r.u8()? as usize;
+        if m > n {
+            return Err(bad);
+        }
+        let mut signatures = Vec::with_capacity(m);
+        for _ in 0..m {
+            let index = r.u8()?;
+            let len = r.u32()? as usize;
+            if len > ADMISSION_PQ_SIGNATURE_MAX {
+                return Err(bad);
+            }
+            signatures.push((index, r.take(len)?.to_vec()));
+        }
+        Ok(Self { threshold, keys, signatures })
+    }
+
+    /// State-free checks: 1 ≤ k ≤ n ≤ MAX, distinct keys, k ≤ signatures,
+    /// increasing in-range indices, non-empty bounded signatures.
+    pub fn validate_shape(&self) -> bool {
+        let n = self.keys.len();
+        let k = usize::from(self.threshold);
+        k >= 1
+            && k <= n
+            && n <= withdrawal::MAX_ATTESTORS
+            && self.keys.iter().all(|key| key.len() == ADMISSION_PQ_KEY_BYTES)
+            && self.keys.iter().enumerate().all(|(i, a)| self.keys[..i].iter().all(|b| a != b))
+            && self.signatures.len() >= k
+            && self.signatures.len() <= n
+            && self.signatures.windows(2).all(|w| w[0].0 < w[1].0)
+            && self.signatures.iter().all(|(i, sig)| {
+                usize::from(*i) < n && !sig.is_empty() && sig.len() <= ADMISSION_PQ_SIGNATURE_MAX
+            })
+    }
+
+    /// Every listed signature verifies over the attestation of `root`.
+    pub fn verify(&self, network_domain: &[u8; 32], chain_id: u64, root: &[u8; 32], verifier: &dyn SignatureVerifier) -> bool {
+        let digest = withdrawal::attestation_digest(network_domain, chain_id, root);
+        self.validate_shape()
+            && self
+                .signatures
+                .iter()
+                .all(|(i, sig)| verifier.verify_with_key(&self.keys[usize::from(*i)], &digest, sig))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct L2WithdrawClaim {
@@ -69,6 +161,8 @@ pub struct L2WithdrawClaim {
     pub change: TransferOutput,
     pub tx_bytes: u64,
     pub tip_millisat_per_gas: u128,
+    /// Version 2 when present (M6).
+    pub attestation: Option<Attestation>,
     pub signature: Vec<u8>,
 }
 
@@ -103,6 +197,10 @@ pub enum L2WithdrawClaimReject {
     Escrow,
     /// The release window's cap is used up; retry in a later window.
     RateLimited,
+    /// The claim needs the attestors' co-signature (version 2) and has none.
+    AttestationRequired,
+    /// The attestation names another set, or a signature does not verify.
+    Attestation,
     Arithmetic,
 }
 
@@ -125,7 +223,7 @@ impl L2WithdrawClaim {
     fn intent_bytes(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(ADMISSION_PQ_KEY_BYTES + 1_400 + self.inputs.len() * 36);
         b.push(L2_WITHDRAW_CLAIM_TAG);
-        b.push(CLAIM_VERSION);
+        b.push(self.version());
         b.extend_from_slice(&self.network_domain);
         b.extend_from_slice(&(self.funding_pubkey.len() as u32).to_le_bytes());
         b.extend_from_slice(&self.funding_pubkey);
@@ -147,7 +245,18 @@ impl L2WithdrawClaim {
         b.extend_from_slice(&self.change.script_hash);
         b.extend_from_slice(&self.tx_bytes.to_le_bytes());
         b.extend_from_slice(&self.tip_millisat_per_gas.to_le_bytes());
+        if let Some(attestation) = &self.attestation {
+            attestation.encode(&mut b);
+        }
         b
+    }
+
+    pub fn version(&self) -> u8 {
+        if self.attestation.is_some() {
+            CLAIM_VERSION_ATTESTED
+        } else {
+            CLAIM_VERSION
+        }
     }
 
     /// Witness-free root the funding key signs; also the txid preimage.
@@ -177,7 +286,8 @@ impl L2WithdrawClaim {
 
     pub(super) fn decode(r: &mut TxReader<'_>) -> Result<Self, TxDecodeError> {
         let bad = TxDecodeError::NotCanonical(L2_WITHDRAW_CLAIM_TAG);
-        if r.u8()? != CLAIM_VERSION {
+        let version = r.u8()?;
+        if version != CLAIM_VERSION && version != CLAIM_VERSION_ATTESTED {
             return Err(bad);
         }
         let network_domain = r.h32()?;
@@ -206,6 +316,11 @@ impl L2WithdrawClaim {
         let change = TransferOutput { value: r.u64()?, script_hash: r.h32()? };
         let tx_bytes = r.u64()?;
         let tip_millisat_per_gas = r.u128()?;
+        let attestation = if version == CLAIM_VERSION_ATTESTED {
+            Some(Attestation::decode(r, bad.clone())?)
+        } else {
+            None
+        };
         let n = r.u32()? as usize;
         if n > ADMISSION_PQ_SIGNATURE_MAX {
             return Err(bad);
@@ -224,6 +339,7 @@ impl L2WithdrawClaim {
             change,
             tx_bytes,
             tip_millisat_per_gas,
+            attestation,
             signature,
         })
     }
@@ -238,6 +354,7 @@ impl L2WithdrawClaim {
             || self.inputs.len() > MAX_CLAIM_INPUTS
             || !self.inputs.windows(2).all(|w| w[0] < w[1])
             || self.index >> TREE_DEPTH != 0
+            || self.attestation.as_ref().is_some_and(|a| !a.validate_shape())
         {
             return Err(R::Shape);
         }
@@ -251,6 +368,21 @@ impl L2WithdrawClaim {
             return Err(R::UnderdeclaredSize);
         }
         Ok(())
+    }
+
+    /// The withdrawal root the Merkle proof folds to (`None` off the tree).
+    pub fn proven_root(&self) -> Option<[u8; 32]> {
+        withdrawal::root_from_proof(&self.leaf(), self.index, &self.siblings)
+    }
+
+    /// The attestation's signatures over the proven root (state-free; the
+    /// mempool runs it). True for a version-1 claim.
+    pub fn verify_attestation(&self, verifier: &dyn SignatureVerifier) -> bool {
+        match (&self.attestation, self.proven_root()) {
+            (None, _) => true,
+            (Some(a), Some(root)) => a.verify(&self.network_domain, self.l2_chain_id, &root, verifier),
+            (Some(_), None) => false,
+        }
     }
 
     pub fn class(&self) -> fee_market::TxClass {
@@ -280,10 +412,16 @@ impl CommittedState {
             return Err(R::GasCeiling);
         }
         // The claim itself, before any input lookup (cheap, keccak only).
-        self.l2_settlement
-            .as_ref()
-            .ok_or(R::NotActive)?
-            .check_claim(tx.l2_chain_id, tx.index, &tx.l1_recipient, tx.sats, &tx.siblings)?;
+        let l2 = self.l2_settlement.as_ref().ok_or(R::NotActive)?;
+        l2.check_claim(tx.l2_chain_id, tx.index, &tx.l1_recipient, tx.sats, &tx.siblings)?;
+        match &tx.attestation {
+            None if l2.attestation_required(tx.sats) => return Err(R::AttestationRequired),
+            // An attestation must name the policy's set (none configured: refused).
+            Some(a) if l2.policy().attestor_set == [0; 32] || a.set_hash() != l2.policy().attestor_set => {
+                return Err(R::Attestation)
+            }
+            _ => {}
+        }
         let owner: [u8; 32] = Sha3_256::digest(&tx.funding_pubkey).into();
         let mut spent = 0u128;
         for input in &tx.inputs {
@@ -308,6 +446,10 @@ impl CommittedState {
         // Expensive check last.
         if !verifier.verify_with_key(&tx.funding_pubkey, &tx.intent_root(), &tx.signature) {
             return Err(R::Signature);
+        }
+        // Up to MAX_ATTESTORS hybrid verifications, after the funding key.
+        if !tx.verify_attestation(verifier) {
+            return Err(R::Attestation);
         }
         let l2 = self.l2_settlement.as_mut().ok_or(R::NotActive)?;
         // The release is the last fallible step; spendable-set edits follow it.

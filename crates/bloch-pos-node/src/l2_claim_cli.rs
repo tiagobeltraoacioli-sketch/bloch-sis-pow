@@ -7,16 +7,17 @@
 
 use crate::{
     codec,
-    keys::Keystore,
+    keys::{HybridVerifier, Keystore},
     l2_deposit_cli::{domain, get, options, read_text},
     rpc::{parse_json, Json},
 };
+use bloch_pos_committee::attestation::SignatureVerifier;
 use bloch_pos_committee::{
     fee_market,
     l2_settlement::withdrawal::{self, TREE_DEPTH},
     transition::{
-        funded::ADMISSION_PQ_SIGNATURE_MAX,
-        l2_claim::MAX_CLAIM_INPUTS,
+        funded::{ADMISSION_PQ_KEY_BYTES, ADMISSION_PQ_SIGNATURE_MAX},
+        l2_claim::{Attestation, MAX_CLAIM_INPUTS},
         FundingInput, L2WithdrawClaim, PosTransaction, TransferOutput,
     },
 };
@@ -26,9 +27,23 @@ use std::{fs::OpenOptions, io::Write, path::Path};
 const HELP: &str = "Native L2 withdrawal claim: release one settled L2 withdrawal to its L1 recipient (offline; does not broadcast)
 
 prepare --genesis FILE --funding-pubkey HEX_FILE --input TXID:VOUT:SAT [--input ...]
-        --proof JSON_FILE --base-fee MILLISAT_PER_GAS --tip MILLISAT_PER_GAS --out FILE
+        --proof JSON_FILE --base-fee MILLISAT_PER_GAS --tip MILLISAT_PER_GAS
+        [--attestors SET_FILE --attestation PARTIAL [--attestation ...]] --out FILE
 inspect --tx FILE
 sign --genesis TRUSTED_FILE --tx FILE --dir KEYSTORE_DIR --out NEW_FILE
+
+Attestors (M6; large claims on networks whose L2 policy names an attestor set):
+attestor-set --threshold K --pubkey PK_FILE [--pubkey ...] --out SET_FILE
+        assemble the k-of-n set from the attestors' public keys (ws-keygen .pk),
+        in order; prints the set hash
+set-attestors --config L2_CONFIG --attestors SET_FILE --out NEW_L2_CONFIG
+        append the set hash to a 264-byte L2 settlement config (genesis input)
+attest --genesis FILE --proof JSON_FILE --attestors SET_FILE --signer-index I
+        --key SK_FILE --out PARTIAL
+        sign the root the proof folds to with one attestor's secret key
+        (ws-keygen .sk). Sign only a root you rebuilt yourself from the L1
+        data-availability batches (bloch-l2-produce-dev reconstruct): that
+        independent check is what the attestation adds.
 
 --proof is the output of bloch-l2-produce-dev withdrawal-proof. Its root must be
 a withdrawal root the L1 retains (getl2settlement withdrawals.roots) and at
@@ -83,6 +98,7 @@ pub(crate) struct Proof {
     pub sats: u64,
     pub siblings: [[u8; 32]; TREE_DEPTH],
     pub root: [u8; 32],
+    pub count: u64,
 }
 
 pub(crate) fn parse_proof(text: &str) -> Result<Proof, String> {
@@ -111,14 +127,123 @@ pub(crate) fn parse_proof(text: &str) -> Result<Proof, String> {
     if withdrawal::root_from_proof(&leaf, index, &siblings) != Some(root) {
         return Err("the siblings do not prove the leaf against withdrawal_root".into());
     }
-    if index >= u(doc.get("withdrawal_count"), "withdrawal_count")? {
+    let count = u(doc.get("withdrawal_count"), "withdrawal_count")?;
+    if index >= count {
         return Err("index is not below withdrawal_count".into());
     }
-    Ok(Proof { chain_id, index, l1_recipient, sats, siblings, root })
+    Ok(Proof { chain_id, index, l1_recipient, sats, siblings, root, count })
+}
+
+/// Attestor set file: the threshold on the first line, then one enveloped
+/// public key (hex) per line, in set order.
+fn read_set(path: &str) -> Result<(u8, Vec<Vec<u8>>), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let threshold: u8 = lines.next().ok_or("empty attestor set file")?.parse().map_err(|_| "bad threshold line")?;
+    let keys = lines.map(codec::unhex).collect::<Result<Vec<_>, _>>()?;
+    let probe = Attestation { threshold, keys: keys.clone(), signatures: Vec::new() };
+    check_set(&probe)?;
+    Ok((threshold, keys))
+}
+
+fn check_set(a: &Attestation) -> Result<(), String> {
+    let n = a.keys.len();
+    if a.threshold == 0 || usize::from(a.threshold) > n || n > withdrawal::MAX_ATTESTORS {
+        return Err(format!("need 1 <= k <= n <= {}", withdrawal::MAX_ATTESTORS));
+    }
+    if a.keys.iter().any(|k| k.len() != ADMISSION_PQ_KEY_BYTES) {
+        return Err(format!("each attestor key must be {ADMISSION_PQ_KEY_BYTES} enveloped bytes"));
+    }
+    for (i, key) in a.keys.iter().enumerate() {
+        if a.keys[..i].contains(key) {
+            return Err(format!("attestor {i} repeats an earlier key: one holder would count twice"));
+        }
+    }
+    Ok(())
+}
+
+fn attestor_set(args: &[String]) -> Result<(), String> {
+    let o = options(args, &["--threshold", "--pubkey", "--out"])?;
+    let threshold: u8 = get(&o, "--threshold")?.parse().map_err(|_| "bad --threshold")?;
+    let keys = o
+        .iter()
+        .filter(|(f, _)| f == "--pubkey")
+        .map(|(_, path)| codec::unhex(read_text(path)?.trim()))
+        .collect::<Result<Vec<_>, _>>()?;
+    check_set(&Attestation { threshold, keys: keys.clone(), signatures: Vec::new() })?;
+    let mut text = format!("{threshold}\n");
+    for key in &keys {
+        text.push_str(&codec::hex(key));
+        text.push('\n');
+    }
+    let mut file = OpenOptions::new().write(true).create_new(true).open(get(&o, "--out")?).map_err(|e| e.to_string())?;
+    file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+    println!("attestor set {threshold}-of-{}", keys.len());
+    for (i, key) in keys.iter().enumerate() {
+        println!("  {i}: sha3 {}", codec::hex32(&Sha3_256::digest(key).into()));
+    }
+    println!("set hash {}", codec::hex32(&withdrawal::attestor_set_hash(threshold, &keys)));
+    Ok(())
+}
+
+fn set_attestors(args: &[String]) -> Result<(), String> {
+    let o = options(args, &["--config", "--attestors", "--out"])?;
+    let config = std::fs::read(get(&o, "--config")?).map_err(|e| e.to_string())?;
+    if config.len() != crate::genesis::L2Config::BYTES {
+        return Err(format!("--config must be a {}-byte L2 config without attestors", crate::genesis::L2Config::BYTES));
+    }
+    let (threshold, keys) = read_set(get(&o, "--attestors")?)?;
+    let hash = withdrawal::attestor_set_hash(threshold, &keys);
+    let out = [config, hash.to_vec()].concat();
+    crate::genesis::L2Config::decode(&out).map_err(|e| format!("resulting config: {e}"))?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(get(&o, "--out")?).map_err(|e| e.to_string())?;
+    file.write_all(&out).map_err(|e| e.to_string())?;
+    println!("L2 config with attestor set {threshold}-of-{} ({})", keys.len(), codec::hex32(&hash));
+    Ok(())
+}
+
+/// Partial file: signer index, the digest signed, the signature (hex lines).
+fn read_partial(path: &str) -> Result<(u8, [u8; 32], Vec<u8>), String> {
+    let text = read_text(path)?;
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let [index, digest, signature] = lines[..] else { return Err(format!("{path}: expected 3 lines")) };
+    Ok((
+        index.parse().map_err(|_| format!("{path}: bad signer index"))?,
+        codec::unhex(digest)?.try_into().map_err(|_| format!("{path}: digest needs 32 bytes"))?,
+        codec::unhex(signature)?,
+    ))
+}
+
+fn attest(args: &[String]) -> Result<(), String> {
+    let o = options(args, &["--genesis", "--proof", "--attestors", "--signer-index", "--key", "--out"])?;
+    let proof = parse_proof(&read_text(get(&o, "--proof")?)?)?;
+    let (threshold, keys) = read_set(get(&o, "--attestors")?)?;
+    let index: u8 = get(&o, "--signer-index")?.parse().map_err(|_| "bad --signer-index")?;
+    let pubkey = keys.get(usize::from(index)).ok_or("--signer-index is outside the set")?;
+    let digest = withdrawal::attestation_digest(&domain(get(&o, "--genesis")?)?, proof.chain_id, &proof.root);
+    let sk = zeroize::Zeroizing::new(codec::unhex(read_text(get(&o, "--key")?)?.trim())?);
+    let signature = bloch_crypto::crypto::sign(&sk, &digest).map_err(|e| format!("signing failed: {e:?}"))?;
+    if !HybridVerifier::new().verify_with_key(pubkey, &digest, &signature) {
+        return Err("signature does not verify under the set's key at --signer-index; wrong key or index".into());
+    }
+    let text = format!("{index}\n{}\n{}\n", codec::hex32(&digest), codec::hex(&signature));
+    let mut file = OpenOptions::new().write(true).create_new(true).open(get(&o, "--out")?).map_err(|e| e.to_string())?;
+    file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+    println!(
+        "attestor {index} of {threshold}-of-{} signed chain {} withdrawal root {} (count {})",
+        keys.len(),
+        proof.chain_id,
+        codec::hex32(&proof.root),
+        proof.count
+    );
+    Ok(())
 }
 
 fn prepare(args: &[String]) -> Result<(), String> {
-    let o = options(args, &["--genesis", "--funding-pubkey", "--input", "--proof", "--base-fee", "--tip", "--out"])?;
+    let o = options(
+        args,
+        &["--genesis", "--funding-pubkey", "--input", "--proof", "--base-fee", "--tip", "--attestors", "--attestation", "--out"],
+    )?;
     let funding_pubkey = codec::unhex(read_text(get(&o, "--funding-pubkey")?)?.trim())?;
     let mut inputs = Vec::new();
     let mut total: u128 = 0;
@@ -137,8 +262,31 @@ fn prepare(args: &[String]) -> Result<(), String> {
     let base_fee: u128 = get(&o, "--base-fee")?.parse().map_err(|_| "bad --base-fee")?;
     let tip: u128 = get(&o, "--tip")?.parse().map_err(|_| "bad --tip")?;
     let owner: [u8; 32] = Sha3_256::digest(&funding_pubkey).into();
+    let network_domain = domain(get(&o, "--genesis")?)?;
+    let attestation = match get(&o, "--attestors") {
+        Err(_) if o.iter().any(|(f, _)| f == "--attestation") => return Err("--attestation needs --attestors".into()),
+        Err(_) => None,
+        Ok(path) => {
+            let (threshold, keys) = read_set(path)?;
+            let digest = withdrawal::attestation_digest(&network_domain, proof.chain_id, &proof.root);
+            let mut signatures = Vec::new();
+            for (_, partial) in o.iter().filter(|(f, _)| f == "--attestation") {
+                let (index, signed, signature) = read_partial(partial)?;
+                if signed != digest {
+                    return Err(format!("{partial}: signed another root or network"));
+                }
+                signatures.push((index, signature));
+            }
+            signatures.sort_by_key(|(i, _)| *i);
+            let a = Attestation { threshold, keys, signatures };
+            if !a.verify(&network_domain, proof.chain_id, &proof.root, &HybridVerifier::new()) {
+                return Err("attestation does not verify (fewer than k signatures, a repeated index, or a bad signature)".into());
+            }
+            Some(a)
+        }
+    };
     let mut tx = L2WithdrawClaim {
-        network_domain: domain(get(&o, "--genesis")?)?,
+        network_domain,
         funding_pubkey,
         inputs,
         l2_chain_id: proof.chain_id,
@@ -150,6 +298,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
         change: TransferOutput { value: 0, script_hash: owner },
         tx_bytes: 0,
         tip_millisat_per_gas: tip,
+        attestation,
         signature: Vec::new(),
     };
     // Reserve the worst-case signature so the declared size never under-runs.
@@ -179,6 +328,16 @@ fn inspect(tx: &L2WithdrawClaim) {
     println!("  change         : {} sat", tx.change.value);
     println!("  tx_bytes       : {}  tip: {} millisat/gas", tx.tx_bytes, tx.tip_millisat_per_gas);
     println!("  txid           : {}", codec::hex32(&PosTransaction::L2WithdrawClaim(tx.clone()).txid()));
+    match &tx.attestation {
+        None => println!("  attestation    : none (version 1)"),
+        Some(a) => println!(
+            "  attestation    : {}-of-{} set {}, signers {:?}",
+            a.threshold,
+            a.keys.len(),
+            codec::hex32(&a.set_hash()),
+            a.signatures.iter().map(|(i, _)| *i).collect::<Vec<_>>()
+        ),
+    }
     println!("  shape          : {}", tx.validate_shape().map_or_else(|e| format!("{e:?}"), |_| "ok".into()));
     println!("  signed         : {}", !tx.signature.is_empty());
 }
@@ -213,13 +372,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "prepare" => prepare(rest),
+        "attestor-set" => attestor_set(rest),
+        "set-attestors" => set_attestors(rest),
+        "attest" => attest(rest),
         "sign" => sign(rest),
         "inspect" => {
             let o = options(rest, &["--tx"])?;
             inspect(&read_tx(get(&o, "--tx")?)?);
             Ok(())
         }
-        _ => Err("expected prepare, inspect, sign or --help".into()),
+        _ => Err("expected prepare, inspect, sign, attestor-set, set-attestors, attest or --help".into()),
     }
 }
 
@@ -246,6 +408,30 @@ mod tests {
             codec::hex32(&leaf),
             siblings.iter().map(|s| format!("\"{}\"", codec::hex32(s))).collect::<Vec<_>>().join(",")
         )
+    }
+
+    /// Real hybrid keys (ML-DSA-65 + Falcon-1024): the attestation the CLI
+    /// assembles verifies under the node's verifier, and only as k-of-n.
+    #[test]
+    fn a_real_hybrid_attestation_verifies_k_of_n() {
+        let p = parse_proof(&doc(false)).unwrap();
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..3).map(|_| bloch_crypto::crypto::generate_keypair()).collect();
+        let keys: Vec<Vec<u8>> = pairs.iter().map(|(pk, _)| pk.clone()).collect();
+        assert!(keys.iter().all(|k| k.len() == ADMISSION_PQ_KEY_BYTES), "ws-keygen keys fit the claim");
+        let domain = [0x91; 32];
+        let digest = withdrawal::attestation_digest(&domain, p.chain_id, &p.root);
+        let sign = |i: usize| (i as u8, bloch_crypto::crypto::sign(&pairs[i].1, &digest).unwrap());
+        let mut a = Attestation { threshold: 2, keys: keys.clone(), signatures: vec![sign(0), sign(2)] };
+        check_set(&a).unwrap();
+        assert!(a.verify(&domain, p.chain_id, &p.root, &HybridVerifier::new()));
+        assert!(!a.verify(&[0x92; 32], p.chain_id, &p.root, &HybridVerifier::new()), "another network");
+        assert!(!a.verify(&domain, p.chain_id, &[0; 32], &HybridVerifier::new()), "another root");
+        a.signatures.truncate(1);
+        assert!(!a.verify(&domain, p.chain_id, &p.root, &HybridVerifier::new()), "below k");
+        a.signatures = vec![(0, sign(1).1), sign(2)];
+        assert!(!a.verify(&domain, p.chain_id, &p.root, &HybridVerifier::new()), "signature in the wrong slot");
+        let doubled = Attestation { threshold: 2, keys: vec![keys[0].clone(), keys[0].clone()], signatures: Vec::new() };
+        assert!(check_set(&doubled).is_err(), "one holder in two slots");
     }
 
     #[test]

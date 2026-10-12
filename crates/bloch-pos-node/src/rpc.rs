@@ -2523,6 +2523,11 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
                         ("remaining_sat", Json::sat(w.remaining())),
                     ])
                 }),
+                // M6: with attestor_set non-null, claims of at least
+                // attested_claim_sat need the attestors' k-of-n signature
+                // (claim version 2).
+                ("attestor_set", if policy.attestor_set == [0; 32] { Json::Null } else { Json::hex(&policy.attestor_set) }),
+                ("attested_claim_sat", Json::sat(u128::from(bloch_pos_committee::l2_settlement::withdrawal::ATTESTED_CLAIM_SAT))),
                 ("released_sat", Json::sat(l2.released_sat())),
                 ("escrow_conserved", Json::Bool(l2.escrow_conserved())),
             ])

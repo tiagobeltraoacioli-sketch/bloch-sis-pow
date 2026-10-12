@@ -369,6 +369,50 @@ pub mod withdrawal {
     /// 10 BLCH: keeps a small escrow usable.
     pub const RELEASE_FLOOR_SAT: u128 = 1_000_000_000;
 
+    // ── M6: post-quantum co-signature of large claims ──
+    //
+    // With an attestor set in the policy, a claim of at least
+    // `ATTESTED_CLAIM_SAT` must carry k-of-n hybrid (ML-DSA-65 + Falcon-1024)
+    // signatures over the withdrawal root it proves against. Attestors sign a
+    // root only after rebuilding the L2 from its L1 data-availability batches
+    // (M3) and finding the same root, so a forged settlement proof alone no
+    // longer releases large amounts. Small claims stay bounded by the release
+    // window.
+
+    /// Claims at or above this need the attestation (equal to the large-claim
+    /// threshold: one notion of "large").
+    pub const ATTESTED_CLAIM_SAT: u64 = LARGE_CLAIM_SAT;
+    /// Upper bound on attestors (each signature is one hybrid verification).
+    pub const MAX_ATTESTORS: usize = 7;
+    pub const ATTESTOR_SET_DOMAIN: &[u8] = b"BLOCH:L2:ATTESTOR-SET:1";
+    pub const ATTESTATION_DOMAIN: &[u8] = b"BLOCH:L2:WITHDRAW-ATTEST:1";
+
+    /// `SHA3-256(ATTESTOR_SET_DOMAIN || k || n || key_0 || … || key_{n-1})`,
+    /// keys enveloped hybrid public keys in set order.
+    pub fn attestor_set_hash(threshold: u8, keys: &[Vec<u8>]) -> [u8; 32] {
+        use sha3::Sha3_256;
+        let mut h = Sha3_256::new();
+        h.update(ATTESTOR_SET_DOMAIN);
+        h.update([threshold, keys.len() as u8]);
+        for key in keys {
+            h.update(key);
+        }
+        h.finalize().into()
+    }
+
+    /// What each attestor signs: `SHA3-256(ATTESTATION_DOMAIN ||
+    /// network_domain || chain_id (u64 BE) || withdrawal root)`. The root of
+    /// an append-only tree already fixes its leaf count.
+    pub fn attestation_digest(network_domain: &[u8; 32], chain_id: u64, root: &[u8; 32]) -> [u8; 32] {
+        use sha3::Sha3_256;
+        let mut h = Sha3_256::new();
+        h.update(ATTESTATION_DOMAIN);
+        h.update(network_domain);
+        h.update(chain_id.to_be_bytes());
+        h.update(root);
+        h.finalize().into()
+    }
+
     /// Release accounting of the current window.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct ReleaseWindow {
@@ -724,6 +768,9 @@ pub struct Policy {
     pub chain_id: u64,
     pub initial_l2_parent: [u8; 32],
     pub initial_l2_state: [u8; 32],
+    /// M6: [`withdrawal::attestor_set_hash`] of the hybrid PQ co-signers whose
+    /// k-of-n attestation large claims need; all zero = no attestors.
+    pub attestor_set: [u8; 32],
 }
 impl Policy {
     pub fn valid(&self) -> bool {
@@ -741,6 +788,11 @@ impl Policy {
         out.extend_from_slice(&self.chain_id.to_le_bytes());
         out.extend_from_slice(&self.initial_l2_parent);
         out.extend_from_slice(&self.initial_l2_state);
+        // Absent without attestors, so existing policies keep their bytes.
+        if self.attestor_set != [0; 32] {
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:ATTESTORS:1");
+            out.extend_from_slice(&self.attestor_set);
+        }
     }
 }
 
@@ -900,6 +952,10 @@ impl State {
         withdrawal::matured(&self.withdrawals, self.native_height.saturating_add(1), withdrawal::LARGE_CLAIM_SAT)
             .copied()
     }
+    /// Whether a claim of `sats` must carry the attestors' co-signature.
+    pub fn attestation_required(&self, sats: u64) -> bool {
+        self.policy.attestor_set != [0; 32] && sats >= withdrawal::ATTESTED_CLAIM_SAT
+    }
     /// The release window a claim in the next native block sees.
     pub fn release_window(&self) -> withdrawal::ReleaseWindow {
         self.release_window.at(self.native_height.saturating_add(1), self.escrow_sat)
@@ -1014,6 +1070,11 @@ impl State {
         let height = self.native_height.checked_add(1).ok_or(R::Full)?;
         self.da.push(da::Record { l2_number, commitment, height });
         Ok(())
+    }
+    /// Test hook: configure the attestor set after genesis.
+    #[cfg(test)]
+    pub(crate) fn set_attestor_set(&mut self, set: [u8; 32]) {
+        self.policy.attestor_set = set;
     }
     /// Test hook: install a withdrawal record without a settlement.
     #[cfg(test)]

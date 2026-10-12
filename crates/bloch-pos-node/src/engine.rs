@@ -5483,11 +5483,16 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             if claim.validate_shape().is_err() {
                 return Err("L2 withdrawal claim has an invalid shape or release output");
             }
-            if HybridVerifier::new().verify_with_key(&claim.funding_pubkey, &claim.intent_root(), &claim.signature) {
-                Ok(())
-            } else {
-                Err("invalid L2 withdrawal claim hybrid PQ authorization")
+            if !HybridVerifier::new().verify_with_key(&claim.funding_pubkey, &claim.intent_root(), &claim.signature) {
+                return Err("invalid L2 withdrawal claim hybrid PQ authorization");
             }
+            // The attestors sign the root the proof folds to, so their
+            // signatures check here without state; only "is this the
+            // policy's set" waits for consensus.
+            if !claim.verify_attestation(&HybridVerifier::new()) {
+                return Err("invalid L2 withdrawal claim attestation");
+            }
+            Ok(())
         }
         PosTransaction::L2Deposit(deposit) => {
             if !cfg!(feature = "devnet-l2-deposits") {

@@ -52,6 +52,9 @@ fn write_tx(path: &str, tx: &L2Deposit) -> Result<(), String> {
     file.sync_all().map_err(|e| e.to_string())
 }
 
+/// Flags that may be given more than once (in order).
+const REPEATABLE: &[&str] = &["--input", "--attestation", "--pubkey"];
+
 pub(crate) fn options(args: &[String], allowed: &[&str]) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     let mut iter = args.iter();
@@ -60,7 +63,7 @@ pub(crate) fn options(args: &[String], allowed: &[&str]) -> Result<Vec<(String, 
             return Err(format!("unknown option {flag}"));
         }
         let value = iter.next().ok_or_else(|| format!("missing value for {flag}"))?;
-        if flag != "--input" && out.iter().any(|(f, _)| f == flag) {
+        if !REPEATABLE.contains(&flag.as_str()) && out.iter().any(|(f, _)| f == flag) {
             return Err(format!("duplicate option {flag}"));
         }
         out.push((flag.clone(), value.clone()));

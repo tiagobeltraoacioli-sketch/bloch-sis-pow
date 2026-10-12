@@ -42,6 +42,7 @@ mod l2_tests {
             chain_id: 700771,
             initial_l2_parent: hash_at(TEMPLATE, S + 272),
             initial_l2_state: hash_at(TEMPLATE, S + 304),
+            attestor_set: [0; 32],
         };
         policy.identities[0] = [0x91; 32];
         policy.identities[1] = *genesis.head.as_bytes();
@@ -448,6 +449,7 @@ mod l2_tests {
             chain_id: 700771,
             initial_l2_parent: hash_at(TEMPLATE, S + 272),
             initial_l2_state: hash_at(TEMPLATE, S + 304),
+            attestor_set: [0; 32],
         };
         policy.identities[0] = [0x91; 32];
         policy.identities[1] = *genesis.head.as_bytes();
@@ -1401,6 +1403,7 @@ mod l2_tests {
             change: TransferOutput { value: 0, script_hash: script_of(&key) },
             tx_bytes: 0,
             tip_millisat_per_gas: 0,
+            attestation: None,
             signature: vec![0; 32],
         };
         tx.tx_bytes = tx.canonical_bytes().len() as u64;
@@ -1480,6 +1483,7 @@ mod l2_tests {
             change: TransferOutput { value: 12_345, script_hash: [0x44; 32] },
             tx_bytes: 4_000,
             tip_millisat_per_gas: 7,
+            attestation: None,
             signature: vec![0x66; 64],
         };
         let wire = claim(&tx);
@@ -1822,6 +1826,146 @@ mod l2_tests {
             }
         }
         assert!(limited > 0 && large_waits > 0, "M6 rules never bound: limited {limited}, large waits {large_waits}");
+    }
+
+    // ── M6: post-quantum co-signature of large claims (claim version 2) ──
+
+    use crate::transition::l2_claim::Attestation;
+
+    fn attestor(i: u8) -> Vec<u8> {
+        vec![0xa0 + i; crate::transition::funded::ADMISSION_PQ_KEY_BYTES]
+    }
+    fn attestors() -> Vec<Vec<u8>> {
+        (0..3).map(attestor).collect()
+    }
+
+    /// Committed state with attestors 2-of-3 (unless `configured` is false),
+    /// 1 000 BLCH escrowed and one record over `leaves`, matured for large
+    /// claims; the relayer's funding coin is untouched.
+    fn attested_fixture(leaves: &[([u8; 32], u64)], configured: bool) -> CommittedState {
+        let (mut pre, _) = funded_async_fixture();
+        let l2 = pre.l2_settlement.as_mut().unwrap();
+        l2.append_deposit(crate::l2_settlement::InboxRecord {
+            height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 1_000 * BLCH, recipient: [0x42; 20],
+        })
+        .unwrap();
+        if configured {
+            l2.set_attestor_set(wd::attestor_set_hash(2, &attestors()));
+        }
+        let tree: Vec<[u8; 32]> =
+            leaves.iter().enumerate().map(|(i, (r, sats))| wd::leaf(700771, i as u64, r, *sats)).collect();
+        l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&tree), count: tree.len() as u64, height: 1 });
+        while l2.height() + 1 < 1 + wd::LARGE_WITHDRAW_DELAY_BLOCKS {
+            l2.advance_height().unwrap();
+        }
+        pre
+    }
+
+    /// A signed claim of `leaves[index]`, attested by `signers` when given.
+    fn claim_of(pre: &CommittedState, leaves: &[([u8; 32], u64)], index: u64, attestation: Option<Attestation>) -> L2WithdrawClaim {
+        let key = depositor();
+        let (l1_recipient, sats) = leaves[index as usize];
+        let tree: Vec<[u8; 32]> =
+            leaves.iter().enumerate().map(|(i, (r, s))| wd::leaf(700771, i as u64, r, *s)).collect();
+        let mut tx = L2WithdrawClaim {
+            network_domain: [0x91; 32],
+            funding_pubkey: key.clone(),
+            inputs: vec![crate::transition::FundingInput { txid: [0x33; 32], vout: 0 }],
+            l2_chain_id: 700771,
+            index,
+            l1_recipient,
+            sats,
+            siblings: wd::proof(&tree, index).unwrap(),
+            release: TransferOutput { value: sats, script_hash: l1_recipient },
+            change: TransferOutput { value: 0, script_hash: script_of(&key) },
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+            attestation,
+            signature: vec![0; 32],
+        };
+        tx.tx_bytes = tx.canonical_bytes().len() as u64;
+        let charge = fee_market::charge(tx.class(), tx.tx_bytes, pre.next_base_fee(), 0);
+        tx.change.value = (u128::from(FUNDED) - charge.base_fee_sat - charge.priority_fee_sat) as u64;
+        tx.signature = toy_sign(&key, &tx.intent_root());
+        tx
+    }
+
+    /// Signatures of `signers` over the root `leaves` folds to.
+    fn attest(leaves: &[([u8; 32], u64)], signers: &[u8]) -> Attestation {
+        let tree: Vec<[u8; 32]> =
+            leaves.iter().enumerate().map(|(i, (r, s))| wd::leaf(700771, i as u64, r, *s)).collect();
+        let digest = wd::attestation_digest(&[0x91; 32], 700771, &wd::root(&tree));
+        Attestation {
+            threshold: 2,
+            keys: attestors(),
+            signatures: signers.iter().map(|&i| (i, toy_sign(&attestor(i), &digest))).collect(),
+        }
+    }
+
+    fn try_claim(pre: &CommittedState, tx: &L2WithdrawClaim) -> Result<CommittedState, TxReject> {
+        let mut state = pre.clone();
+        state.apply_transaction(&claim(tx), 0, pre.next_base_fee(), &ToyVerifier).map(|_| state)
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn a_large_claim_needs_the_attestors_k_of_n_signature() {
+        let leaves = [([1; 32], 150 * BLCH), ([2; 32], 5 * BLCH)];
+        let pre = attested_fixture(&leaves, true);
+        let refuse = |tx: &L2WithdrawClaim, why| assert_eq!(try_claim(&pre, tx).map(|_| ()), Err(TxReject::L2WithdrawClaim(why)));
+        // Version 1 above the threshold: refused.
+        refuse(&claim_of(&pre, &leaves, 0, None), ClaimReject::AttestationRequired);
+        // 2-of-3 over the proven root: applies, and round-trips on the wire.
+        let good = claim_of(&pre, &leaves, 0, Some(attest(&leaves, &[0, 2])));
+        let wire = claim(&good);
+        assert_eq!(wire.canonical_bytes()[1], 2, "version 2");
+        assert_eq!(PosTransaction::from_canonical_bytes(&wire.canonical_bytes()).unwrap(), wire);
+        let post = try_claim(&pre, &good).expect("attested large claim");
+        assert!(post.l2_settlement().unwrap().claimed().contains(0));
+        assert_eq!(post.balance_sat(&[1; 32]), pre.balance_sat(&[1; 32]) + u128::from(150 * BLCH));
+        // All three also pass.
+        try_claim(&pre, &claim_of(&pre, &leaves, 0, Some(attest(&leaves, &[0, 1, 2])))).unwrap();
+        // One signature is below k: a shape error.
+        refuse(&claim_of(&pre, &leaves, 0, Some(attest(&leaves, &[1]))), ClaimReject::Shape);
+        // A signature over another root.
+        let mut other = attest(&[([9; 32], 150 * BLCH)], &[0, 1]);
+        other.threshold = 2;
+        refuse(&claim_of(&pre, &leaves, 0, Some(other)), ClaimReject::Attestation);
+        // One forged signature among enough.
+        let mut forged = attest(&leaves, &[0, 1]);
+        forged.signatures[1].1[0] ^= 1;
+        refuse(&claim_of(&pre, &leaves, 0, Some(forged)), ClaimReject::Attestation);
+        // Another set (a key replaced), signed by its own keys.
+        let mut foreign = attest(&leaves, &[0, 1]);
+        foreign.keys[2] = attestor(9);
+        refuse(&claim_of(&pre, &leaves, 0, Some(foreign)), ClaimReject::Attestation);
+        // Same key twice to turn 2-of-3 into 1 holder: shape.
+        let mut doubled = attest(&leaves, &[0, 1]);
+        doubled.keys[1] = attestor(0);
+        doubled.signatures[1].1 = doubled.signatures[0].1.clone();
+        refuse(&claim_of(&pre, &leaves, 0, Some(doubled)), ClaimReject::Shape);
+        // Re-signing the funding key cannot detach the attestation: a claim
+        // whose attestation was swapped has another txid.
+        let swapped = claim_of(&pre, &leaves, 0, Some(attest(&leaves, &[0, 1])));
+        assert_ne!(claim(&swapped).txid(), wire.txid());
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn small_claims_and_networks_without_attestors_keep_version_1() {
+        let leaves = [([1; 32], 150 * BLCH), ([2; 32], wd::ATTESTED_CLAIM_SAT - 1)];
+        let pre = attested_fixture(&leaves, true);
+        // Below the threshold, version 1 suffices; version 2 is also accepted.
+        try_claim(&pre, &claim_of(&pre, &leaves, 1, None)).expect("small claim, no attestation");
+        try_claim(&pre, &claim_of(&pre, &leaves, 1, Some(attest(&leaves, &[1, 2])))).expect("optional attestation");
+        // No attestors configured: large claims stay version 1, and a version 2
+        // claim names a set the network does not have.
+        let bare = attested_fixture(&leaves, false);
+        try_claim(&bare, &claim_of(&bare, &leaves, 0, None)).expect("no attestors: version 1");
+        assert_eq!(
+            try_claim(&bare, &claim_of(&bare, &leaves, 0, Some(attest(&leaves, &[0, 1])))).map(|_| ()),
+            Err(TxReject::L2WithdrawClaim(ClaimReject::Attestation))
+        );
     }
 
     // ── M6: large-claim delay and release window ──

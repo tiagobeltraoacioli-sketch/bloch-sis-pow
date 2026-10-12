@@ -1019,7 +1019,10 @@ impl Manifest {
             {
                 return Err(DecodeErr("L2 development manifest cannot carry balances or a cohort"));
             }
-            format = ManifestFormat::V3L2Async(L2Config::decode(r.take(L2Config::BYTES)?)?);
+            // The L2 config is the manifest's tail: 264 bytes, or 296 with
+            // an attestor set (M6).
+            let len = if r.remaining() == L2Config::BYTES_ATTESTED { L2Config::BYTES_ATTESTED } else { L2Config::BYTES };
+            format = ManifestFormat::V3L2Async(L2Config::decode(r.take(len)?)?);
         }
         r.finish()?;
         Ok(Manifest {
@@ -1744,7 +1747,7 @@ mod tests {
     fn l2_manifest_binds_policy_and_keeps_legacy_formats_unchanged() {
         let config = L2Config { identities: [[3;32];5],
             proof_policy: bloch_l2_proof::policy_commitment(), chain_id: 700771,
-            initial_l2_parent: [4;32], initial_l2_state: [5;32] };
+            initial_l2_parent: [4;32], initial_l2_state: [5;32], attestor_set: [0;32] };
         let mut manifest = sample(); manifest.cohort.clear();
         manifest.format = ManifestFormat::V3L2Async(config);
         let bytes = manifest.encode();
@@ -1771,6 +1774,30 @@ mod tests {
         }
         let mut bad = config.encode(); bad[160] ^= 1;
         assert!(L2Config::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn l2_manifest_carries_an_optional_attestor_set() {
+        let config = L2Config { identities: [[3;32];5],
+            proof_policy: bloch_l2_proof::policy_commitment(), chain_id: 700771,
+            initial_l2_parent: [4;32], initial_l2_state: [5;32], attestor_set: [6;32] };
+        assert_eq!(config.encode().len(), L2Config::BYTES_ATTESTED);
+        let mut manifest = sample(); manifest.cohort.clear();
+        manifest.format = ManifestFormat::V3L2Async(config);
+        let bytes = manifest.encode();
+        if !bloch_pos_committee::l2_settlement::USER_TRANSACTIONS_ENABLED {
+            assert!(Manifest::decode(&bytes).is_err(), "attestors need devnet-l2-user-txs");
+            return;
+        }
+        let decoded = Manifest::decode(&bytes).unwrap();
+        assert_eq!(decoded.encode(), bytes);
+        assert_eq!(decoded.genesis_state().l2_settlement().unwrap().policy().attestor_set, [6;32]);
+        // The set is bound into the genesis.
+        let mut bare = sample(); bare.cohort.clear(); bare.format = ManifestFormat::V3L2Async(L2Config { attestor_set: [0;32], ..config });
+        assert_ne!(Manifest::decode(&bare.encode()).unwrap().genesis_id(), decoded.genesis_id());
+        // An explicit all-zero set is not canonical.
+        let mut zero = config.encode(); zero[264..].fill(0);
+        assert!(L2Config::decode(&zero).is_err());
     }
 
     // ── Carryover fixtures ──────────────────────────────────────────────

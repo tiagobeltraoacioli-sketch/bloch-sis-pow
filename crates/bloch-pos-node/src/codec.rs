@@ -115,6 +115,11 @@ impl<'a> Reader<'a> {
         Ok(self.take(n)?.to_vec())
     }
 
+    /// Bytes not yet read.
+    pub fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.at)
+    }
+
     pub fn finish(self) -> Result<(), DecodeErr> {
         if self.at != self.buf.len() {
             return Err(DecodeErr("trailing bytes"));
