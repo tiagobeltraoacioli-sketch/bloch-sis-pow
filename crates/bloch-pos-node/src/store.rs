@@ -1153,6 +1153,98 @@ fn rewrite_files(
     Ok(fingerprint)
 }
 
+/// Durable reorg publication that keeps the log's first `keep_frames` frames
+/// byte-for-byte and appends `tail` after them.
+///
+/// The prefix is copied from the current log file through a fixed-size
+/// buffer instead of being re-encoded from in-memory envelopes, so a reorg no
+/// longer has to clone the whole canonical chain into the writer's heap. The
+/// publication sequence (staging file, fsync, index invalidation, rename,
+/// index rebuild) is the one [`rewrite_files`] uses.
+///
+/// `expected_last` is the block id the last kept frame must carry. The log
+/// and the canonical chain are equal outside a pending rewrite (`Store::append`
+/// joins the writer first, and boot refuses a log whose replay does not reach
+/// every logged block), so a mismatch means that invariant broke; the rewrite
+/// fails closed rather than publishing a log of a different chain.
+fn rewrite_tail_files(
+    dir: &Path,
+    generation: &std::sync::Arc<std::sync::RwLock<()>>,
+    keep_frames: u64,
+    expected_last: Option<[u8; 32]>,
+    tail: &[BlockEnvelope],
+) -> io::Result<LogFingerprint> {
+    let destination = dir.join("blocks.log");
+    let mut source = File::open(&destination)?;
+    let source_len = source.metadata()?.len();
+    let corrupt = |what: &str| io::Error::new(io::ErrorKind::InvalidData, format!("reorg prefix copy: {what}"));
+    // Walk the length prefixes only; bodies are not read except the last kept one.
+    let mut at = 0u64;
+    let mut last: Option<(u64, usize)> = None;
+    for _ in 0..keep_frames {
+        source.seek(SeekFrom::Start(at))?;
+        let mut prefix = [0u8; 4];
+        source.read_exact(&mut prefix)?;
+        let len = u32::from_le_bytes(prefix) as usize;
+        if len > crate::codec::MAX_FIELD_LEN {
+            return Err(corrupt("frame over cap"));
+        }
+        let end = at
+            .checked_add(4)
+            .and_then(|body| body.checked_add(len as u64))
+            .ok_or_else(|| corrupt("frame length overflow"))?;
+        if end > source_len {
+            return Err(corrupt("log shorter than the retained prefix"));
+        }
+        last = Some((at, len));
+        at = end;
+    }
+    match (last, expected_last) {
+        (None, None) => {}
+        (Some((offset, len)), Some(expected)) => {
+            source.seek(SeekFrom::Start(offset.saturating_add(4)))?;
+            let mut payload = Vec::new();
+            read_frame_payload(&mut source, &mut payload, len)?;
+            let env = crate::codec::decode_envelope(&payload)
+                .map_err(|e| corrupt(&e.to_string()))?;
+            if *env.block_id().as_bytes() != expected {
+                return Err(corrupt("last retained frame is not the reorg ancestor"));
+            }
+        }
+        _ => return Err(corrupt("retained frame count disagrees with the ancestor")),
+    }
+
+    let mut staging = PrivateStagingFile::create_for(&destination)?;
+    let mut fingerprint = LogFingerprint::new();
+    source.seek(SeekFrom::Start(0))?;
+    let copied = io::copy(
+        &mut Read::by_ref(&mut source).take(at),
+        &mut FingerprintWriter { writer: staging.file_mut(), fingerprint: &mut fingerprint },
+    )?;
+    if copied != at {
+        return Err(corrupt("short prefix copy"));
+    }
+    drop(source);
+    for env in tail {
+        write_log_envelope(&mut FingerprintWriter {
+            writer: staging.file_mut(), fingerprint: &mut fingerprint,
+        }, env)?;
+    }
+    staging.file_mut().sync_all()?;
+
+    let mut idx = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join("blocks.idx"))?;
+    let len = publish_staged_rewrite(dir, generation, staging, &mut idx)?;
+    if fingerprint.bytes != len {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "rewritten log fingerprint length differs"));
+    }
+    Ok(fingerprint)
+}
+
 /// The short publication transaction shared by synchronous tests/tools and
 /// the asynchronous live writer. Keeping this ordering in one function makes
 /// the existing forced-index-failure regression cover both entry points.
@@ -1378,6 +1470,31 @@ impl Store {
             .name("block-log-reorg-writer".into())
             .spawn(move || {
                 let result = rewrite_files(&dir, &generation, &envs);
+                let _ = tx.send(result);
+            })?;
+        self.pending_rewrite = Some(rx);
+        self.log_fingerprint = None;
+        Ok(())
+    }
+
+    /// [`Store::rewrite_async`] for a reorg: keep the log's first
+    /// `keep_frames` frames as they are on disk and replace everything after
+    /// them with `tail`. Only the tail is held in memory; see
+    /// [`rewrite_tail_files`] for the prefix check.
+    pub fn rewrite_tail_async(
+        &mut self,
+        keep_frames: u64,
+        expected_last: Option<[u8; 32]>,
+        tail: Vec<BlockEnvelope>,
+    ) -> io::Result<()> {
+        self.finish_pending_rewrite()?;
+        let dir = self.dir.clone();
+        let generation = std::sync::Arc::clone(&self.generation);
+        let (tx, rx) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("block-log-reorg-writer".into())
+            .spawn(move || {
+                let result = rewrite_tail_files(&dir, &generation, keep_frames, expected_last, &tail);
                 let _ = tx.send(result);
             })?;
         self.pending_rewrite = Some(rx);
@@ -2174,6 +2291,73 @@ mod tests {
             .map(|bytes| crate::codec::decode_envelope(&bytes).unwrap().header.slot)
             .collect();
         assert_eq!(served, slots, "rebuilt index and authoritative log agree");
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tail_rewrite_keeps_the_prefix_bytes_and_replaces_only_the_suffix() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-tail-rewrite-{}", std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x74; 32]).unwrap();
+        for slot in 1..=5 {
+            store.append(&sample_envelope(slot)).unwrap();
+        }
+        let before = fs::read(dir.join("blocks.log")).unwrap();
+        let ancestor = *sample_envelope(3).block_id().as_bytes();
+
+        store.rewrite_tail_async(3, Some(ancestor), vec![sample_envelope(40), sample_envelope(50)]).unwrap();
+        store.append(&sample_envelope(60)).unwrap();
+        assert!(store.poll_rewrite().unwrap());
+
+        let slots: Vec<_> = store.read_all().unwrap().into_iter()
+            .map(|env| env.header.slot).collect();
+        assert_eq!(slots, vec![1, 2, 3, 40, 50, 60]);
+        let after = fs::read(dir.join("blocks.log")).unwrap();
+        let prefix_len = before.len() - 2 * (before.len() / 5);
+        assert_eq!(&after[..prefix_len], &before[..prefix_len], "kept frames are byte-identical");
+        let served: Vec<_> = Store::blocks_after(&dir, 0, 10).unwrap().into_iter()
+            .map(|bytes| crate::codec::decode_envelope(&bytes).unwrap().header.slot)
+            .collect();
+        assert_eq!(served, slots, "rebuilt index and authoritative log agree");
+
+        // The fingerprint covers the copied prefix too: it must match a
+        // fresh read of the published file, as after a whole-log rewrite.
+        let (len, digest) = store.durable_log_fingerprint().unwrap();
+        let fresh = LogFingerprint::read(&dir.join("blocks.log"), len).unwrap();
+        assert_eq!(digest, fresh.digest());
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tail_rewrite_from_genesis_and_refusal_on_a_foreign_prefix() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-tail-rewrite-refuse-{}", std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x75; 32]).unwrap();
+        for slot in 1..=3 {
+            store.append(&sample_envelope(slot)).unwrap();
+        }
+        // An ancestor that is not the last retained frame: nothing published.
+        let wrong = *sample_envelope(1).block_id().as_bytes();
+        store.rewrite_tail_async(2, Some(wrong), vec![sample_envelope(9)]).unwrap();
+        assert!(store.flush_rewrite().is_err(), "foreign prefix fails closed");
+        let slots: Vec<_> = store.read_all().unwrap().into_iter()
+            .map(|env| env.header.slot).collect();
+        assert_eq!(slots, vec![1, 2, 3], "the old log is untouched");
+        drop(store);
+
+        // Reorg down to genesis keeps no frame at all.
+        let mut store = Store::open(&dir, &[0x75; 32]).unwrap();
+        store.rewrite_tail_async(0, None, vec![sample_envelope(7)]).unwrap();
+        assert!(store.flush_rewrite().unwrap());
+        let slots: Vec<_> = store.read_all().unwrap().into_iter()
+            .map(|env| env.header.slot).collect();
+        assert_eq!(slots, vec![7]);
         drop(store);
         let _ = fs::remove_dir_all(dir);
     }

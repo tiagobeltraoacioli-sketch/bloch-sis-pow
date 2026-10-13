@@ -20,6 +20,11 @@ pub(super) struct BlockInventory {
     blocks: BTreeMap<Root, BlockEnvelope>,
     children: Children,
     votes: BTreeMap<Root, Vec<(u32, LatestMessage)>>,
+    /// Finalized canonical blocks whose body and proposer signature were
+    /// released from memory (see [`BlockInventory::hollow`]). Their header,
+    /// parent edge and vote index stay, so fork choice is unchanged; the full
+    /// envelope is read back from the block log when something needs it.
+    hollow: HashSet<Root>,
 }
 
 impl Deref for BlockInventory {
@@ -68,8 +73,36 @@ impl BlockInventory {
         previous
     }
 
+    /// Release a stored block's body and proposer signature, keeping its
+    /// header, parent edge and vote index.
+    ///
+    /// Only for canonical blocks strictly below the finality latch: those can
+    /// never be re-applied or cut by a reorg without the operator override
+    /// (which rehydrates them first), and the block log on disk holds their
+    /// exact bytes. Every PQ hybrid signature is ~4.6 KB, so the bodies are
+    /// nearly all of a stored block; keeping them for the whole chain made a
+    /// node's heap grow with the chain. The vote index was built from the full
+    /// body at insertion and is untouched, so [`BlockInventory::head`] folds
+    /// exactly the same votes in exactly the same order.
+    pub(super) fn hollow(&mut self, id: &Root) -> bool {
+        let Some(block) = self.blocks.get_mut(id) else { return false };
+        if !self.hollow.insert(*id) {
+            return false;
+        }
+        block.proposer_sig = Vec::new();
+        block.body.transactions = Vec::new();
+        block.body.attestations = Vec::new();
+        true
+    }
+
+    /// Whether `id` is stored with its body released.
+    pub(super) fn is_hollow(&self, id: &Root) -> bool {
+        self.hollow.contains(id)
+    }
+
     pub(super) fn remove(&mut self, id: &Root) -> Option<BlockEnvelope> {
         let block = self.blocks.remove(id)?;
+        self.hollow.remove(id);
         let parent = block.header.parent;
         if let Some(children) = self.children.get_mut(&parent) {
             if let Ok(at) = children.binary_search(id) {
@@ -90,6 +123,7 @@ impl BlockInventory {
         self.blocks.clear();
         self.children.clear();
         self.votes.clear();
+        self.hollow.clear();
     }
 
     /// Only descendants of the walk's starting checkpoint can affect the
@@ -216,6 +250,38 @@ mod tests {
                 "indexed head differs at justified={justified:?}, slot_tiebreak={slot_tiebreak}"
             );
         }
+    }
+
+    #[test]
+    fn released_bodies_keep_the_fork_choice_head() {
+        let mut inventory = BlockInventory::default();
+        let g = root(0);
+        let outside = root(99);
+        inventory.insert(root(1), block(g, 1, Vec::new()));
+        inventory.insert(root(2), block(g, 1, Vec::new()));
+        inventory.insert(root(30), block(outside, 8, vec![attest(0, 2, root(1))]));
+        inventory.insert(root(20), block(outside, 7, vec![attest(0, 1, root(2))]));
+        inventory.insert(root(10), block(outside, 6, vec![attest(1, 1, root(1))]));
+        let validators = vals(2);
+        let before: Vec<_> = [false, true]
+            .map(|tiebreak| inventory.head([].iter(), &validators, g, tiebreak))
+            .to_vec();
+
+        for id in [root(10), root(20), root(30)] {
+            assert!(inventory.hollow(&id));
+            assert!(!inventory.hollow(&id), "releasing twice is a no-op");
+            assert!(inventory.blocks[&id].body.attestations.is_empty());
+        }
+        let after: Vec<_> = [false, true]
+            .map(|tiebreak| inventory.head([].iter(), &validators, g, tiebreak))
+            .to_vec();
+        assert_eq!(after, before, "the vote index, not the body, feeds fork choice");
+
+        let restored = block(outside, 8, vec![attest(0, 2, root(1))]);
+        inventory.insert(root(30), restored);
+        assert!(!inventory.is_hollow(&root(30)), "re-inserting a full block clears the mark");
+        inventory.remove(&root(20));
+        assert!(!inventory.is_hollow(&root(20)));
     }
 
     #[test]

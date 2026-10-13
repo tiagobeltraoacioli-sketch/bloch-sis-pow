@@ -814,6 +814,24 @@ const _: () = assert!(
 /// correct slow path underneath it, never a limit on what can be reorganised.
 const REORG_STATE_WINDOW: usize = 2;
 
+/// Released finalized bodies after which [`return_freed_heap_to_os`] runs.
+const RELEASE_TRIM_THRESHOLD: usize = 1_024;
+
+/// Ask glibc to return free heap pages to the kernel.
+///
+/// Released block bodies are thousands of small allocations spread through
+/// the heap; glibc only shrinks the heap from its top, so without this the
+/// node's resident size would stay at its boot high-water mark (the whole
+/// block log, decoded) after the bodies are gone. No-op off glibc.
+fn return_freed_heap_to_os() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim` takes no pointers; it only walks glibc's own free
+    // lists under the allocator's locks and is safe to call from any thread.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// Ceiling on blocks parked waiting for a parent this node has never seen.
 ///
 /// **The bound is the whole point.** Before this existed, `ingest` stored
@@ -4601,25 +4619,39 @@ impl Engine {
             .position(|(_, cid)| cid.as_bytes() == &id)
             .expect("replay target is canonical");
         let mut st = self.manifest.genesis_state();
-        // Borrow each stored envelope in canonical order. The transition only
-        // reads the block, so cloning the whole prefix (including every body,
-        // transaction, attestation and signature) into a temporary Vec added
-        // work proportional to retained history without changing the fold.
-        for (_, cid) in &self.chain[1..=cut] {
-            let env = self
-                .blocks
-                .get(cid.as_bytes())
-                .expect("canonical block stored");
+        let apply = |st: &CommittedState, env: &BlockEnvelope| {
             let envelope = ProposalEnvelope {
                 header: env.header.clone(),
                 proposer_sig: env.proposer_sig.clone(),
             };
             let txs = body_transactions(env)
                 .expect("a canonical block's body decoded when it was applied");
-            st = self
-                .tr
-                .apply_block(&st, &envelope, &env.body.attestations, &txs)
-                .expect("canonical prefix replay cannot fail (it applied before)");
+            self.tr
+                .apply_block(st, &envelope, &env.body.attestations, &txs)
+                .expect("canonical prefix replay cannot fail (it applied before)")
+        };
+        // Borrow each stored envelope in canonical order. The transition only
+        // reads the block, so cloning the whole prefix (including every body,
+        // transaction, attestation and signature) into a temporary Vec added
+        // work proportional to retained history without changing the fold.
+        // Released (finalized) bodies are streamed back from the block log a
+        // page at a time instead.
+        let mut i = 1;
+        while i <= cut {
+            let id = *self.chain[i].1.as_bytes();
+            if self.blocks.is_hollow(&id) {
+                let mut end = i + 1;
+                while end <= cut && self.blocks.is_hollow(self.chain[end].1.as_bytes()) {
+                    end += 1;
+                }
+                self.read_logged_canonical(i, end, |env| st = apply(&st, &env))
+                    .expect("released canonical bodies are readable from the block log");
+                i = end;
+            } else {
+                let env = self.blocks.get(&id).expect("canonical block stored");
+                st = apply(&st, env);
+                i += 1;
+            }
         }
         st
     }
@@ -4646,6 +4678,82 @@ impl Engine {
             Some((floor, _)) if floor >= h => {}
             _ => self.finalized_latch = Some((h, fin.root)),
         }
+        self.hollow_finalized_bodies();
+    }
+
+    /// Release the bodies of canonical blocks strictly below the finality
+    /// latch (see [`block_inventory::BlockInventory::hollow`]).
+    ///
+    /// Newest first, stopping at the first block already released, so after
+    /// the first call this is O(newly finalized blocks). Skipped while a reorg
+    /// rewrite of the block log is pending: a block adopted by that reorg is
+    /// not yet in the published log, and a released body must always be
+    /// readable back from it.
+    fn hollow_finalized_bodies(&mut self) {
+        let Some((latch, _)) = self.finalized_latch else { return };
+        if self.store.rewrite_pending() {
+            return;
+        }
+        let top = usize::try_from(latch).unwrap_or(usize::MAX).min(self.chain.len());
+        let mut released = 0usize;
+        for i in (1..top).rev() {
+            let id = *self.chain[i].1.as_bytes();
+            if self.blocks.is_hollow(&id) {
+                break;
+            }
+            if self.blocks.hollow(&id) {
+                released = released.saturating_add(1);
+            }
+        }
+        // A finality step releases about an epoch of blocks, which the next
+        // blocks reuse. A large batch (boot replay, the first run after an
+        // upgrade) frees most of the chain at once, and glibc keeps freed
+        // pages in the middle of the heap resident unless asked.
+        if released >= RELEASE_TRIM_THRESHOLD {
+            return_freed_heap_to_os();
+        }
+    }
+
+    /// Canonical envelopes `chain[from..to]`, read back from the block log in
+    /// order. Used for blocks whose body was released from memory.
+    ///
+    /// The log equals the canonical chain at every height below the finality
+    /// latch, which is the only place a released body can be; each frame's id
+    /// is still checked against the chain, and a disagreement is an error,
+    /// never a silently different block.
+    fn read_logged_canonical(
+        &self,
+        from: usize,
+        to: usize,
+        mut each: impl FnMut(BlockEnvelope),
+    ) -> io::Result<()> {
+        const PAGE_BLOCKS: usize = 256;
+        if from == 0 || from > to || to > self.chain.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "canonical range out of bounds"));
+        }
+        let dir = self.store.directory();
+        let mut at = from;
+        let mut after_slot = self.chain[from - 1].0;
+        while at < to {
+            let page = crate::store::Store::blocks_after(dir, after_slot, (to - at).min(PAGE_BLOCKS))?;
+            if page.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "block log ends before a canonical block"));
+            }
+            for bytes in page {
+                if at >= to {
+                    break;
+                }
+                let env = crate::codec::decode_envelope(&bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                if env.block_id().as_bytes() != self.chain[at].1.as_bytes() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "block log disagrees with the canonical chain"));
+                }
+                after_slot = env.header.slot;
+                each(env);
+                at += 1;
+            }
+        }
+        Ok(())
     }
 
     /// Would truncating the canonical chain at `ancestor` cut below the
@@ -4805,6 +4913,23 @@ impl Engine {
             return false;
         }
 
+        // Only under the operator's rewind override can the cut fall below
+        // released bodies; those blocks are about to leave the canonical
+        // chain and may be re-adopted later, so restore them in full first.
+        let released_above_cut: Vec<usize> = (after_cut..self.chain.len())
+            .filter(|&i| self.blocks.is_hollow(self.chain[i].1.as_bytes()))
+            .collect();
+        if let (Some(&first), Some(&last)) = (released_above_cut.first(), released_above_cut.last()) {
+            let mut restored = Vec::with_capacity(last + 1 - first);
+            if let Err(e) = self.read_logged_canonical(first, last + 1, |env| restored.push(env)) {
+                eprintln!("reorg refused: could not restore released bodies above the cut: {e}");
+                return false;
+            }
+            for env in restored {
+                self.blocks.insert(*env.block_id().as_bytes(), env);
+            }
+        }
+
         let base = self.state_at_canonical(ancestor);
         // Post-states of the branch, so the ring is refilled for the branch
         // that just won without recomputing anything.
@@ -4902,11 +5027,14 @@ impl Engine {
         self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
         self.revalidate_lifecycle_mempool();
         if self.live {
-            let canonical_envs: Vec<BlockEnvelope> = self.chain[1..]
-                .iter()
-                .map(|(_, id)| self.blocks.get(id.as_bytes()).expect("stored").clone())
-                .collect();
-            if let Err(e) = self.store.rewrite_async(canonical_envs) {
+            // The log equals the pre-reorg canonical chain, so its first
+            // `cut` frames are exactly `chain[1..=cut]` and stay as they are
+            // on disk. Only the adopted branch is handed to the writer: the
+            // old code cloned every canonical envelope here, a transient copy
+            // of the whole chain that every node on a host paid at the same
+            // moment of a network-wide reorg.
+            let expected_last = (cut > 0).then_some(ancestor);
+            if let Err(e) = self.store.rewrite_tail_async(cut as u64, expected_last, branch.clone()) {
                 eprintln!("FATAL: could not start block log rewrite: {e}");
                 std::process::exit(1);
             }
@@ -5315,6 +5443,14 @@ impl Engine {
     fn envelope_by_id<'a>(&'a self, id: &[u8; 32]) -> Option<Cow<'a, BlockEnvelope>> {
         if self.chain[0].1.as_bytes() == id {
             return Some(Cow::Owned(self.genesis_envelope()));
+        }
+        if self.blocks.is_hollow(id) {
+            let height = usize::try_from(self.height_of(id)?).ok()?;
+            let mut found = None;
+            if let Err(e) = self.read_logged_canonical(height, height + 1, |env| found = Some(env)) {
+                eprintln!("rpc: could not read released block {} from the log: {e}", crate::codec::hex8(id));
+            }
+            return found.map(Cow::Owned);
         }
         self.blocks.get(id).map(Cow::Borrowed)
     }
@@ -11912,6 +12048,74 @@ mod reorg_state_tests {
             committed,
             "borrowed replay diverged from the state root committed by the canonical block"
         );
+    }
+
+    fn encoded(env: &BlockEnvelope) -> Vec<u8> {
+        let mut out = Vec::new();
+        crate::codec::write_envelope(&mut out, env).expect("encode");
+        out
+    }
+
+    /// Released bodies leave fork-choice inputs and replay untouched, and the
+    /// full block is served back from the log byte for byte.
+    #[test]
+    fn released_bodies_replay_and_serve_from_the_block_log() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        for slot in 1..=6 {
+            engine.propose(slot);
+        }
+        let ids: Vec<[u8; 32]> = engine.chain[1..].iter().map(|(_, id)| *id.as_bytes()).collect();
+        let full: Vec<Vec<u8>> = ids.iter().map(|id| encoded(&engine.blocks[id])).collect();
+        let target = ids[4];
+        let expected = engine.replay_to(target);
+        let votes_before: Vec<_> = engine.blocks.iter().map(|(id, _)| *id).collect();
+
+        // As if the latch had reached height 5: heights 1..=4 are released.
+        engine.finalized_latch = Some((5, target));
+        engine.hollow_finalized_bodies();
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(engine.blocks.is_hollow(id), i < 4, "height {}", i + 1);
+        }
+        let released = &engine.blocks[&ids[0]];
+        assert!(released.proposer_sig.is_empty() && released.body.attestations.is_empty());
+        assert_eq!(
+            engine.blocks.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            votes_before,
+            "released blocks stay in the inventory"
+        );
+
+        assert_eq!(engine.replay_to(target), expected, "replay streams released bodies from the log");
+        for (id, bytes) in ids.iter().zip(&full) {
+            let served = engine.envelope_by_id(id).expect("every canonical block is served");
+            assert_eq!(&encoded(served.as_ref()), bytes, "served block is the original");
+        }
+
+        // Idempotent, and a later latch releases only the new blocks.
+        engine.hollow_finalized_bodies();
+        engine.finalized_latch = Some((6, ids[5]));
+        engine.hollow_finalized_bodies();
+        assert!(engine.blocks.is_hollow(&ids[4]) && !engine.blocks.is_hollow(&ids[5]));
+    }
+
+    /// Under the operator rewind override a reorg may cut below released
+    /// bodies; they are restored in full first, so the old branch can be
+    /// re-adopted later.
+    #[test]
+    fn an_override_reorg_below_released_bodies_restores_them() {
+        let (mut engine, _dir, fork_point, rival) = forked(3);
+        let above: Vec<[u8; 32]> = engine.chain[2..].iter().map(|(_, id)| *id.as_bytes()).collect();
+        let full: Vec<Vec<u8>> = above.iter().map(|id| encoded(&engine.blocks[id])).collect();
+        let top = engine.chain.len() as u64 - 1;
+        engine.finalized_latch = Some((top, *engine.chain[top as usize].1.as_bytes()));
+        engine.hollow_finalized_bodies();
+        assert!(above[..above.len() - 1].iter().all(|id| engine.blocks.is_hollow(id)));
+
+        engine.finality_rewind_override = true;
+        assert!(engine.do_reorg(fork_point, vec![rival]), "override reorg succeeds");
+        for (id, bytes) in above.iter().zip(&full) {
+            assert!(!engine.blocks.is_hollow(id), "restored before leaving the chain");
+            assert_eq!(&encoded(&engine.blocks[id]), bytes);
+        }
     }
 }
 
