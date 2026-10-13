@@ -2485,10 +2485,17 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
             let (root, count) = l2.withdrawal_head();
             Json::obj(vec![
                 ("root", Json::hex(&root)), ("count", Json::u(count)),
+                // `finalized`: the accepting block is in the FFG-finalized
+                // prefix, which a claim in the next block requires (from
+                // finalized_claims_from_height on).
                 ("roots", Json::Arr(l2.withdrawal_roots().iter().map(|r| Json::obj(vec![
                     ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
                     ("count", Json::u(r.count)), ("height", Json::u(r.height)),
+                    ("finalized", Json::Bool(bloch_pos_committee::l2_settlement::withdrawal::record_finalized(
+                        r.height, l2.height(), state.slot(), state.finality().finalized.epoch,
+                    ))),
                 ])).collect())),
+                ("finalized_claims_from_height", Json::u(bloch_pos_committee::l2_settlement::withdrawal::FINALIZED_CLAIMS_FROM_HEIGHT)),
                 // M5 claims: the newest root a claim in the next block may
                 // prove against, and the nullifier set as its frontier
                 // (words below `floor` fully claimed; `words` maps a 256-leaf

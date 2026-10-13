@@ -197,6 +197,9 @@ pub enum L2WithdrawClaimReject {
     Escrow,
     /// The release window's cap is used up; retry in a later window.
     RateLimited,
+    /// The settlement it proves against is not yet in the FFG-finalized
+    /// prefix ([`withdrawal::record_finalized`]); retry after finality.
+    NotFinalized,
     /// The claim needs the attestors' co-signature (version 2) and has none.
     AttestationRequired,
     /// The attestation names another set, or a signature does not verify.
@@ -432,7 +435,15 @@ impl CommittedState {
             }
             _ => {}
         }
-        l2.check_claim(tx.l2_chain_id, tx.index, &tx.l1_recipient, tx.sats, &tx.siblings, tx.attestation.is_some())?;
+        let record = l2.check_claim(tx.l2_chain_id, tx.index, &tx.l1_recipient, tx.sats, &tx.siblings, tx.attestation.is_some())?;
+        // During a block's transactions `self` still has the parent's slot
+        // and the L2 state the parent's native height; the claim's block is
+        // the next one.
+        if l2.height().saturating_add(1) >= withdrawal::FINALIZED_CLAIMS_FROM_HEIGHT
+            && !withdrawal::record_finalized(record.height, l2.height(), self.slot, self.finality_view().finalized.epoch)
+        {
+            return Err(R::NotFinalized);
+        }
         let owner: [u8; 32] = Sha3_256::digest(&tx.funding_pubkey).into();
         let mut spent = 0u128;
         for input in &tx.inputs {

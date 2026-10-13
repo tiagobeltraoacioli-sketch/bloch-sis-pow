@@ -1458,7 +1458,18 @@ mod l2_tests {
             l2.advance_height().unwrap();
         }
         assert_eq!(l2.matured_count(), n);
+        finalize_all(&mut pre);
         pre
+    }
+
+    /// Mark the chain up to `state`'s head FFG-finalized: claims prove only
+    /// against finalized settlements (`wd::record_finalized`), and these
+    /// fixtures carry no attestations.
+    fn finalize_all(state: &mut CommittedState) {
+        state.finality_engine = crate::finality::FinalityState::relaunch(crate::finality::Checkpoint {
+            epoch: crate::epoch_of(state.slot) + 1,
+            root: *state.head.as_bytes(),
+        });
     }
 
     /// Shared with bloch-l2-evm (`tests/fixtures/l2-claim-v1`, identical
@@ -1643,6 +1654,9 @@ mod l2_tests {
         assert_eq!(young.l2_settlement().unwrap().height() + 1, accepted + WITHDRAW_DELAY_BLOCKS);
         assert_eq!(young.l2_settlement().unwrap().matured_count(), 3);
         let t = claim_tx(&young, ([0x33; 32], 0), FUNDED, 3, 1);
+        // Matured but not finalized: refused until the settlement is final.
+        assert_eq!(young.l2_withdraw_claim_refusal(&t), Some(ClaimReject::NotFinalized));
+        finalize_all(&mut young);
         young.apply_transaction(&claim(&t), 0, fee, &ToyVerifier).expect("matured claim");
 
         // Escrow insufficient (unreachable with proven settlements).
@@ -1677,6 +1691,7 @@ mod l2_tests {
             pre = apply(&pre, slot, &[], &mut chains).unwrap();
             slot += 1;
         }
+        finalize_all(&mut pre);
         let fee = pre.next_base_fee();
         let first = claim_tx(&pre, ([0x33; 32], 0), FUNDED, 3, 1);
         let mut state = pre.clone();
@@ -1858,6 +1873,7 @@ mod l2_tests {
         while l2.height() + 1 < 1 + wd::LARGE_WITHDRAW_DELAY_BLOCKS {
             l2.advance_height().unwrap();
         }
+        finalize_all(&mut pre);
         pre
     }
 
@@ -2047,6 +2063,22 @@ mod l2_tests {
     }
 
     #[test]
+    fn a_record_is_finalized_once_its_slot_bound_precedes_the_checkpoint() {
+        let e = crate::params::SLOTS_PER_EPOCH;
+        // Tip at height 100, slot 3e+10: the record at height 90 has slot
+        // at most 3e. Finalized epoch 3 covers slots < 3e: not yet.
+        assert!(!wd::record_finalized(90, 100, 3 * e + 10, 3));
+        assert!(wd::record_finalized(89, 100, 3 * e + 10, 3));
+        assert!(wd::record_finalized(90, 100, 3 * e + 10, 4));
+        // Nothing is finalized at epoch 0; a record above the tip never is.
+        assert!(!wd::record_finalized(0, 100, 50, 0));
+        assert!(!wd::record_finalized(101, 100, 1_000, 99));
+        // Missed slots after the record only delay it (the bound is conservative).
+        assert!(!wd::record_finalized(90, 91, 3 * e + 40, 3));
+        assert_eq!(wd::FINALIZED_CLAIMS_FROM_HEIGHT, 0, "tests build without the devnet activation override");
+    }
+
+    #[test]
     #[cfg(feature = "devnet-l2-user-txs")]
     fn only_an_attested_first_claim_may_exceed_the_window_cap() {
         // Escrow 300 BLCH: cap 30 BLCH. 99 BLCH is below the attestation
@@ -2131,6 +2163,12 @@ mod l2_tests {
         }
         assert_eq!(state.l2_settlement().unwrap().matured_count(), 3);
         let tx = claim_tx(&state, funding, deposit.change.value, 3, 2);
+        // Matured, but the accepting block is not FFG-finalized yet: the
+        // block refuses the claim (an Ethereum rollup waits for L1 finality).
+        assert_eq!(state.l2_withdraw_claim_refusal(&tx), Some(ClaimReject::NotFinalized));
+        state = refuse_then_apply(&state, slot, &[claim(&tx)], 0, &[], &mut chains);
+        slot += 1;
+        finalize_all(&mut state);
         let (recipient, sats) = wleaf(2);
         let supply = state.accounted_supply_sat();
         let balance = state.balance_sat(&recipient);

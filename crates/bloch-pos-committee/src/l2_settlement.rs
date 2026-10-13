@@ -356,6 +356,54 @@ pub mod withdrawal {
             WITHDRAW_DELAY_BLOCKS
         }
     }
+    // ── Ethereum-rollup withdrawals: claims only against finalized settlements ──
+    //
+    // A claim may prove only against a withdrawal record whose accepting
+    // block lies in the FFG-finalized prefix, so no reorganization can undo
+    // the settlement a payout relied on (the plan's "settlement accepted with
+    // age ≥ N finalized epochs"; on Ethereum, withdrawals wait for the L1 to
+    // finalize the output root).
+    //
+    // Without a new state field: slots strictly increase along the chain, so
+    // a block at native height `h` has slot ≤ `slot(H) − (H − h)` for any
+    // later block `H`. When that bound is below the finalized checkpoint's
+    // epoch boundary, the accepting block is at or before the checkpoint (the
+    // last block strictly before the boundary), hence finalized. Missed slots
+    // after `h` only make the bound conservative (a claim waits longer, never
+    // less).
+
+    /// Native height from which the rule applies (claims in blocks at or
+    /// above it). Zero: from genesis. A development build may set
+    /// `BLOCH_DEVNET_FINALIZED_CLAIMS_FROM_HEIGHT` at compile time to activate
+    /// it on a running devnet whose history holds earlier claims (devnet4).
+    pub const FINALIZED_CLAIMS_FROM_HEIGHT: u64 = match option_env!("BLOCH_DEVNET_FINALIZED_CLAIMS_FROM_HEIGHT") {
+        Some(text) => parse_u64(text),
+        None => 0,
+    };
+    const fn parse_u64(text: &str) -> u64 {
+        let bytes = text.as_bytes();
+        assert!(!bytes.is_empty(), "BLOCH_DEVNET_FINALIZED_CLAIMS_FROM_HEIGHT is empty");
+        let mut value: u64 = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            assert!(bytes[i].is_ascii_digit(), "BLOCH_DEVNET_FINALIZED_CLAIMS_FROM_HEIGHT must be decimal");
+            value = value * 10 + (bytes[i] - b'0') as u64;
+            i += 1;
+        }
+        value
+    }
+
+    /// Whether the record accepted at native height `record_height` is in
+    /// the finalized prefix, seen from the block at (`tip_height`,
+    /// `tip_slot`) whose finalized checkpoint epoch is `finalized_epoch`.
+    pub fn record_finalized(record_height: u64, tip_height: u64, tip_slot: u64, finalized_epoch: u64) -> bool {
+        if record_height > tip_height {
+            return false;
+        }
+        let slot_bound = tip_slot.saturating_sub(tip_height - record_height);
+        slot_bound < finalized_epoch.saturating_mul(crate::params::SLOTS_PER_EPOCH)
+    }
+
     /// Release windows: native block `h` belongs to window
     /// `h / RELEASE_WINDOW_BLOCKS`.
     pub const RELEASE_WINDOW_BLOCKS: u64 = 32;
