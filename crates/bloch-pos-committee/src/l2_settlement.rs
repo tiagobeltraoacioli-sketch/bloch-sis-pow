@@ -360,11 +360,15 @@ pub mod withdrawal {
     /// `h / RELEASE_WINDOW_BLOCKS`.
     pub const RELEASE_WINDOW_BLOCKS: u64 = 32;
     /// Per window, claims release at most `max(RELEASE_FLOOR_SAT, escrow at
-    /// the window's first claim × RELEASE_WINDOW_BPS / 10 000)`, except that
-    /// the window's first claim is always admitted (a single withdrawal above
-    /// the cap waits for an empty window instead of never paying). A forged
-    /// tree therefore drains at most ~10% of the escrow per window, plus one
-    /// claim.
+    /// the window's first claim × RELEASE_WINDOW_BPS / 10 000)`. One claim
+    /// may exceed the cap, as the window's first and only claim, and only if
+    /// it is EXEMPT: attested by the policy's attestor set, or on a policy
+    /// without attestors (there nobody could lift the cap, and a withdrawal
+    /// above it would otherwise never pay). A forged settlement proof alone
+    /// therefore drains at most ~10% of the escrow per window when the policy
+    /// has attestors. The devnet4 rehearsal (2026-10-12) showed why the
+    /// exemption needs the attestors: before, any first claim passed, so an
+    /// unattested 99 BLCH claim could take a third of a 300 BLCH escrow.
     pub const RELEASE_WINDOW_BPS: u128 = 1_000;
     /// 10 BLCH: keeps a small escrow usable.
     pub const RELEASE_FLOOR_SAT: u128 = 1_000_000_000;
@@ -435,11 +439,12 @@ pub mod withdrawal {
             let share = escrow_sat.saturating_mul(RELEASE_WINDOW_BPS) / 10_000;
             Self { window, released: 0, cap: share.max(RELEASE_FLOOR_SAT) }
         }
-        /// Whether `sats` more fits (the first claim of a window always does).
-        pub fn admits(&self, sats: u64) -> bool {
-            self.released == 0 || self.released.saturating_add(u128::from(sats)) <= self.cap
+        /// Whether `sats` more fits. An `exempt` claim (see
+        /// [`RELEASE_WINDOW_BPS`]) may exceed the cap as the window's first.
+        pub fn admits(&self, sats: u64, exempt: bool) -> bool {
+            self.released.saturating_add(u128::from(sats)) <= self.cap || (exempt && self.released == 0)
         }
-        /// Room left in the window (the first claim may exceed it).
+        /// Room left in the window (an exempt first claim may exceed it).
         pub fn remaining(&self) -> u128 {
             self.cap.saturating_sub(self.released)
         }
@@ -980,6 +985,12 @@ impl State {
     pub fn escrow_conserved(&self) -> bool {
         self.deposited_sat().checked_sub(self.released_sat) == Some(self.escrow_sat)
     }
+    /// Whether a claim may exceed the release window's cap as the window's
+    /// first: `attested` (it carries an attestation of the policy's set; the
+    /// caller verifies the signatures) or the policy has no attestors.
+    pub fn window_exempt(&self, attested: bool) -> bool {
+        attested || self.policy.attestor_set == [0; 32]
+    }
     /// Check a claim of withdrawal `index` for the next native block without
     /// mutating state (mempool preflight, RPC, tooling).
     pub fn check_claim(
@@ -989,6 +1000,7 @@ impl State {
         l1_recipient: &[u8; 32],
         sats: u64,
         siblings: &[[u8; 32]; withdrawal::TREE_DEPTH],
+        attested: bool,
     ) -> Result<withdrawal::Record, withdrawal::ClaimRefusal> {
         use withdrawal::ClaimRefusal as R;
         if !USER_TRANSACTIONS_ENABLED || !self.asynchronous {
@@ -1005,7 +1017,7 @@ impl State {
         if self.escrow_sat < u128::from(sats) {
             return Err(R::Escrow);
         }
-        if !self.release_window().admits(sats) {
+        if !self.release_window().admits(sats, self.window_exempt(attested)) {
             return Err(R::RateLimited);
         }
         Ok(record)
@@ -1020,8 +1032,9 @@ impl State {
         l1_recipient: &[u8; 32],
         sats: u64,
         siblings: &[[u8; 32]; withdrawal::TREE_DEPTH],
+        attested: bool,
     ) -> Result<(), withdrawal::ClaimRefusal> {
-        self.check_claim(chain_id, index, l1_recipient, sats, siblings)?;
+        self.check_claim(chain_id, index, l1_recipient, sats, siblings, attested)?;
         let released = self.released_sat.checked_add(u128::from(sats)).ok_or(withdrawal::ClaimRefusal::Escrow)?;
         let mut window = self.release_window();
         window.released = window.released.saturating_add(u128::from(sats));

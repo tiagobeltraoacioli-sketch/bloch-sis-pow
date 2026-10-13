@@ -391,11 +391,20 @@ impl L2WithdrawClaim {
 }
 
 impl CommittedState {
-    pub(super) fn apply_l2_withdraw_claim(
-        &mut self,
+    /// Why this state would refuse `tx` in the next block, checking
+    /// everything except the signatures (the mempool verified those). For
+    /// logs and tooling: the block transition reports a refused claim only as
+    /// the frozen `TransitionError::Transaction(i)`, which names no reason.
+    pub fn l2_withdraw_claim_refusal(&self, tx: &L2WithdrawClaim) -> Option<L2WithdrawClaimReject> {
+        self.check_l2_withdraw_claim(tx, self.next_base_fee()).err()
+    }
+
+    /// The state checks of [`Self::apply_l2_withdraw_claim`], in its order,
+    /// up to (not including) the signatures.
+    fn check_l2_withdraw_claim(
+        &self,
         tx: &L2WithdrawClaim,
         base_fee: u128,
-        verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, L2WithdrawClaimReject> {
         use L2WithdrawClaimReject as R;
         if !crate::l2_settlement::USER_TRANSACTIONS_ENABLED || self.l2_settlement.is_none() {
@@ -413,7 +422,8 @@ impl CommittedState {
         }
         // The claim itself, before any input lookup (cheap, keccak only).
         let l2 = self.l2_settlement.as_ref().ok_or(R::NotActive)?;
-        l2.check_claim(tx.l2_chain_id, tx.index, &tx.l1_recipient, tx.sats, &tx.siblings)?;
+        // Attestation first: a missing one is the more useful refusal than
+        // the release window it would also exceed.
         match &tx.attestation {
             None if l2.attestation_required(tx.sats) => return Err(R::AttestationRequired),
             // An attestation must name the policy's set (none configured: refused).
@@ -422,6 +432,7 @@ impl CommittedState {
             }
             _ => {}
         }
+        l2.check_claim(tx.l2_chain_id, tx.index, &tx.l1_recipient, tx.sats, &tx.siblings, tx.attestation.is_some())?;
         let owner: [u8; 32] = Sha3_256::digest(&tx.funding_pubkey).into();
         let mut spent = 0u128;
         for input in &tx.inputs {
@@ -443,6 +454,18 @@ impl CommittedState {
         if self.eutxos.contains_key(&(txid, RELEASE_VOUT)) || self.eutxos.contains_key(&(txid, CHANGE_VOUT)) {
             return Err(R::OutputCollision);
         }
+        Ok(charge)
+    }
+
+    pub(super) fn apply_l2_withdraw_claim(
+        &mut self,
+        tx: &L2WithdrawClaim,
+        base_fee: u128,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<fee_market::TxCharge, L2WithdrawClaimReject> {
+        use L2WithdrawClaimReject as R;
+        let charge = self.check_l2_withdraw_claim(tx, base_fee)?;
+        let txid = PosTransaction::L2WithdrawClaim(tx.clone()).txid();
         // Expensive check last.
         if !verifier.verify_with_key(&tx.funding_pubkey, &tx.intent_root(), &tx.signature) {
             return Err(R::Signature);
@@ -453,7 +476,8 @@ impl CommittedState {
         }
         let l2 = self.l2_settlement.as_mut().ok_or(R::NotActive)?;
         // The release is the last fallible step; spendable-set edits follow it.
-        l2.release_withdrawal(tx.l2_chain_id, tx.index, &tx.l1_recipient, tx.sats, &tx.siblings)?;
+        // An attestation reaching here names the policy's set and verified.
+        l2.release_withdrawal(tx.l2_chain_id, tx.index, &tx.l1_recipient, tx.sats, &tx.siblings, tx.attestation.is_some())?;
         for input in &tx.inputs {
             self.eutxos.remove(&(input.txid, input.vout));
         }

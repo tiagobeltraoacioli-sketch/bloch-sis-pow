@@ -1994,8 +1994,20 @@ impl Engine {
                             }
                         },
                     };
+                    // `Transaction(i)` is frozen and carries no reason; for
+                    // an L2 withdrawal claim, ask the state why (the check
+                    // runs against the pre-state, which is what the
+                    // operator needs: RateLimited, AttestationRequired, ...).
+                    let why = match &bad {
+                        PosTransaction::L2WithdrawClaim(claim) => self
+                            .state
+                            .l2_withdraw_claim_refusal(claim)
+                            .map(|r| format!(": L2 withdrawal claim index {} refused, {r:?}", claim.index))
+                            .unwrap_or_default(),
+                        _ => String::new(),
+                    };
                     eprintln!(
-                        "[slot {slot}] dropping a transaction the transition refuses ({err:?}); \
+                        "[slot {slot}] dropping a transaction the transition refuses ({err:?}{why}); \
                          proposing without it"
                     );
                     // Out of the mempool too, or the next proposer inherits the

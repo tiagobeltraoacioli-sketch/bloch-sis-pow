@@ -2506,8 +2506,9 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
                 ])),
                 // M6: claims of at least large_claim_sat wait
                 // large_delay_blocks (matured_large is their newest root),
-                // and each window releases at most its cap (the window's
-                // first claim always passes).
+                // and each window releases at most its cap (only an attested
+                // first claim of a window, or any first claim on a policy
+                // without attestors, may exceed it).
                 ("large_claim_sat", Json::sat(u128::from(bloch_pos_committee::l2_settlement::withdrawal::LARGE_CLAIM_SAT))),
                 ("large_delay_blocks", Json::u(bloch_pos_committee::l2_settlement::withdrawal::LARGE_WITHDRAW_DELAY_BLOCKS)),
                 ("matured_large", l2.matured_large_withdrawals().map_or(Json::Null, |r| Json::obj(vec![
