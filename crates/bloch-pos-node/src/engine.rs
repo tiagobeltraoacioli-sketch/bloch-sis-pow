@@ -4748,6 +4748,14 @@ impl Engine {
                 if env.block_id().as_bytes() != self.chain[at].1.as_bytes() {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "block log disagrees with the canonical chain"));
                 }
+                // The id hashes the header only. The header commits to the
+                // body through these two roots, so recomputing them makes a
+                // body damaged on disk an error instead of a served block.
+                if env.header.attestation_root != derive::attestation_root(&env.body.attestations)
+                    || env.header.body_root != derive::body_root(&env.body.transactions)
+                {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "logged block body does not match its header"));
+                }
                 after_slot = env.header.slot;
                 each(env);
                 at += 1;
@@ -12088,6 +12096,24 @@ mod reorg_state_tests {
         for (id, bytes) in ids.iter().zip(&full) {
             let served = engine.envelope_by_id(id).expect("every canonical block is served");
             assert_eq!(&encoded(served.as_ref()), bytes, "served block is the original");
+        }
+
+        // A body damaged on disk under an intact header (same block id) is
+        // refused, not served or replayed.
+        {
+            let mut logged: Vec<BlockEnvelope> = full.iter()
+                .map(|bytes| crate::codec::decode_envelope(bytes).expect("decode"))
+                .collect();
+            logged[1].body.transactions.push(vec![0x42]);
+            assert_eq!(logged[1].block_id().as_bytes(), &ids[1], "the id does not cover the body");
+            engine.store.rewrite(&logged).expect("tamper the log");
+            assert!(engine.read_logged_canonical(1, 2, |_| ()).is_ok(), "an intact frame still reads");
+            let err = engine.read_logged_canonical(2, 3, |_| ()).expect_err("tampered body refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(engine.envelope_by_id(&ids[1]).is_none(), "RPC does not serve it");
+            logged[1].body.transactions.pop();
+            engine.store.rewrite(&logged).expect("restore the log");
+            assert!(engine.envelope_by_id(&ids[1]).is_some());
         }
 
         // Idempotent, and a later latch releases only the new blocks.
