@@ -73,6 +73,67 @@ New tests (`transition/l2_settlement_tests.rs`, all build-independent):
 | `a_synchronous_activation_settles_but_refuses_deposits_and_claims` | sync mode |
 | node `l2_admission_follows_the_installed_profile_not_the_build` | mempool door |
 
+## Mainnet policy (encoded 2026-10-14) — set-once parts unset, inert
+
+`l2_settlement::mainnet` records the policy approved on 2026-10-14:
+
+| Item | Code | Value |
+| --- | --- | --- |
+| mode | `ASYNCHRONOUS` | `true` |
+| attestors | `ATTESTOR_THRESHOLD`, `ATTESTOR_COUNT` | 3-of-5 hybrid (ML-DSA-65 + Falcon-1024) |
+| limits | `LIMITS` | small delay 64; large ≥ 100 BLCH (= attestation threshold), delay 2 880; retention 2 880; window 2 880 blocks, 1 000 bps, floor 10 BLCH |
+| attestor keys | `ATTESTOR_SET: Option<&str>` | **`None` (unset)** — the `l2-claim attestor-set` file, via `include_str!` |
+| program + L2 genesis | `PROGRAM: Option<Program>` | **`None` (unset)** — 7 identities, proof policy, L2 genesis parent/state |
+
+- `mainnet::activation()` builds the `Activation` (chain id 700770, attestor
+  set hash of the five keys at k = 3, async, `LIMITS`) and refuses with
+  `Incomplete::{AttestorKeysUnset, AttestorSet, ProgramUnset}` while a part is
+  missing or the set is not exactly 5 distinct enveloped hybrid keys at threshold 3.
+- `activation_policy()` = `mainnet::activation().ok()` → `None` today.
+- Consensus guard: `Activation::valid()` now also requires, for an activation
+  on chain id 700770, async + a non-zero attestor set + exactly
+  `mainnet::LIMITS`. So even an armed gate never installs a mainnet L2 without
+  attestors (the boundary installs nothing).
+- Pre-activation consensus is unchanged: `activation_policy()` is only read in
+  `close_epoch` past the gate (`u64::MAX`), and the policy is `None` anyway.
+
+Tests (`transition/l2_settlement_tests.rs`, build-independent):
+`mainnet_policy_records_the_approved_values`,
+`mainnet_activation_is_refused_while_attestor_keys_are_unset`,
+`mainnet_large_threshold_is_exactly_100_blch`,
+`mainnet_release_window_is_10_percent_with_a_10_blch_floor`,
+`mainnet_policy_end_to_end_3_of_5_delays_and_window` (real claims on an
+activated L2 with the mainnet limits: 63 blocks refused / 64 pay for a claim
+just under 100 BLCH; exactly 100 BLCH needs the attestation and 2 880 blocks;
+window cap 100 BLCH on 1 000 BLCH escrow; 2 signatures refused, the same
+signer twice refused, a non-member set or a non-member signing in a member's
+slot refused, the set at another threshold refused, any 3 of 5 and all 5
+accepted).
+
+## Attestor keys — script prepared, NOT run
+
+Scheme: `bloch-pos ws-keygen` (hybrid ML-DSA-65 + Falcon-1024, enveloped
+3 749-byte public key; the `.sk` is created 0600 and never printed). Script:
+`scripts/l2-activation/generate-mainnet-attestor-keys.sh`, output
+`~/Desktop/L2-MAINNET-ATESTADORES/` (dir 0700, umask 077, refuses to
+overwrite, never reads or prints a `.sk`; optional `--age-recipient` encrypts
+each `.sk` and deletes the plaintext).
+
+```
+cargo build --release -p bloch-pos-node
+# preferred: each operator, on their own (air-gapped) machine
+scripts/l2-activation/generate-mainnet-attestor-keys.sh --index I   # I = 0..4
+# or, weaker ceremony, all five here (then move each .sk to its operator)
+scripts/l2-activation/generate-mainnet-attestor-keys.sh --all
+# with attestor-0..4.pk collected: attestors.set + set hash
+scripts/l2-activation/generate-mainnet-attestor-keys.sh --assemble
+```
+
+Then commit `attestors.set` into the tree and set
+`mainnet::ATTESTOR_SET = Some(include_str!(…))` (one reviewed commit; set
+once). Operators sign with `bloch-pos l2-claim attest … --key attestor-I.sk`
+only roots they rebuilt from the L1 DA batches.
+
 ## Historical replay — procedure ready, needs data from the user
 
 Script: `scripts/l2-activation/replay-mainnet-history.sh`.
@@ -183,23 +244,39 @@ through old-release relays (the bootnodes/archivals are leaves dialled by
 validators): **upgrade bootnodes and archivals first, and verify direct
 peering among upgraded validators before the epoch.**
 
+### Re-run after the rebase and the policy commit (2026-10-14)
+
+Tree `6529e085` (rebased on `b75fce63`, mainnet policy encoded):
+`bloch-pos-committee` 731 / 0 failed (default), 735 / 0 (`local-state-cache`),
+751 / 0 (`devnet-l2-user-txs,local-state-cache`) — each +5, the new mainnet
+policy tests; `bloch-pos-node` 705 / 0 (one run hit a timing flake in
+`build_source_digest_tests::hidden_macro_input_is_hashed`, unrelated, 3/3 and
+the full suite rerun green); `cargo build --release -p bloch-pos-node` OK.
+
+Mixed fleet, loopback only, PASS (`--activation-epoch 6 --epochs-after 6`):
+baseline = release `b75fce63` (built from `git archive`), rehearsal and inert
+from `6529e085`. Pre-gate all 5 nodes finalized the same checkpoints and 128
+canonical blocks are identical; rehearsal nodes finalized e9; baseline and inert
+observer stayed at e4 (nothing at or after e6), each logging the
+`StateRootMismatch` at the first block of the activation epoch.
+
 ## What remains before arming
 
-1. **Rebase onto the release the fleet will run.** `release/mem-fix-eth-leak-20261014`
-   (b75fce63) adds bounded block memory and an Ethereum-paced inactivity leak
-   flag day at epoch 5700 on top of `da136d41`; this branch is based on
-   `da136d41`. The L2 build must carry every consensus rule the fleet runs.
-2. **The policy** (`activation_policy()`):
-   - L2 genesis `initial_l2_parent/state` (from the L2 node's genesis for the chosen chain id);
-   - chain id: **decided 2026-10-14: 700770** (`l2_settlement::MAINNET_CHAIN_ID`;
-     `armed_l2_gate_has_a_policy` requires the pinned policy to use it; devnets keep 700771);
-   - SP1 program identity: guest ELF, KoalaBear and BN254 keys, proof policy
-     (V3, user transactions). The real-Groth16 fixture
+1. ~~**Rebase onto the release the fleet will run.**~~ — done: rebased onto
+   `release/mem-fix-eth-leak-20261014` (b75fce63: bounded block memory,
+   Ethereum-paced inactivity leak from epoch 5700).
+2. **The policy** — decisions approved and encoded 2026-10-14
+   (`l2_settlement::mainnet`: async, 3-of-5 attestors, limits, chain id
+   700770). Still **unset** (activation refuses until filled):
+   - `mainnet::ATTESTOR_SET`: run the key ceremony ("Attestor keys" above),
+     assemble `attestors.set`, commit it;
+   - `mainnet::PROGRAM`: SP1 program identity (guest ELF, KoalaBear and BN254
+     keys, proof policy V3 with user transactions), L2 genesis
+     `initial_l2_parent/state` for chain 700770, and identities[0..1] = the
+     Genesis-4 admission domain and native genesis. The real-Groth16 fixture
      (`native_l2_real_groth16_applies_in_the_actual_transition_and_replays`,
      ignored) must be regenerated with the SP1 prover for this tree and the
-     mainnet program;
-   - sync vs async; attestor set (threshold + hybrid keys);
-   - limits.
+     mainnet program.
 3. **Historical replay** (above) — PASS required.
 4. **Mixed fleet** (above) — PASS required, on the rebased build.
 5. **Operational gaps found while doing this:**
@@ -217,20 +294,25 @@ peering among upgraded validators before the epoch.**
    tags served by an own node; receipts carrying `from`; `BLOCKHASH` for the
    last 256 blocks; block gas limit ≥ ~4M (router); block timestamps in
    wall-clock seconds (devnet4 does so since block 228).
-7. **Coordinated epoch.** Set the constant, pin the activation and update
-   `l2_settlement_gate_is_inert` in the same commit; leave time for every
+7. **Coordinated epoch** — only after 2–4 pass and ≥ 2 weeks public notice.
+   Set the constant and update `l2_settlement_gate_is_inert` in the same commit
+   (`armed_l2_gate_has_a_policy` then requires `mainnet::activation()` to be
+   complete); leave time for every
    validator and archival to upgrade (nodes that do not, diverge at the first
    block of that epoch).
 
-## Decisions for the user (with recommendation)
+## Decisions — approved by the user 2026-10-14
 
-| Decision | Recommendation |
+The recommendations were approved as the mainnet L2 policy and are encoded in
+`l2_settlement::mainnet` (see "Mainnet policy (encoded)" above).
+
+| Decision | Approved |
 | --- | --- |
-| Sync or async | **Async.** Deposits and claims exist only in async; the node only admits async proofs. |
-| Chain id | **Decided: 700770** (devnet stays 700771). |
-| Attestor set | **Yes**, 2-of-3 or 3-of-5 hybrid PQ keys on separate hosts/operators, fixed in the policy (no rotation: a new set = new policy). Without attestors any first claim of a window may exceed the cap, and the Groth16 proof is not post-quantum. |
-| Small-claim delay | 64 blocks (~32 min, two epochs). Finality is already required; this only adds a margin. |
-| Large threshold / delay | 100 BLCH / 2 880 blocks (~1 day), attested. |
-| Retention | 2 880 blocks (≥ large delay; keeps the committed state small). |
-| Release window | 2 880 blocks (1 day) × 10 % of escrow, floor 10 BLCH. Bounds a forged-proof drain to ~10 %/day while operators react. |
-| Activation epoch | Only after 1–4 above pass; at least ~2 weeks after the release that carries it is on every node. |
+| Sync or async | **Async** (`mainnet::ASYNCHRONOUS`). Deposits and claims exist only in async; the node only admits async proofs. |
+| Chain id | **700770** (`MAINNET_CHAIN_ID`; devnets stay 700771). |
+| Attestor set | **3-of-5**, hybrid ML-DSA-65 + Falcon-1024 (the scheme the chain uses for admission keys, weak-subjectivity signers and L2 attestations), five operators on separate hosts, fixed at activation (set-once: no rotation, no periodic signing, no admin; a new set = a new policy). |
+| Small-claim delay | **64 blocks** (two epochs), on top of FFG finality. |
+| Large threshold / delay | **≥ 100 BLCH**: attestation required and **2 880 blocks**. |
+| Retention | 2 880 blocks (= large delay; keeps the committed state small). |
+| Release window | **2 880 blocks**, at most **10 % of escrow, floor 10 BLCH**; only an attested first claim of a window may exceed it. |
+| Activation epoch | **Not set.** Chosen only after: rebase (done), policy encoded (done, this commit), archival replay of mainnet history PASS, mixed-fleet qualification PASS on the final build, and ≥ 2 weeks public notice with the release on every node. The gate stays `u64::MAX`. |
