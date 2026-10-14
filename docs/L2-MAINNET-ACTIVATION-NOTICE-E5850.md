@@ -9,9 +9,9 @@
 | Published | 2026-10-14 (T−3 days) |
 | Activation epoch **E** | **5850** — first slot 187200, expected around **2026-10-17 21:31 UTC** (30 s slots, 32 slots per epoch; the epoch number, not the clock time, is binding) |
 | Release | `bloch-pos` 0.1.0-mainnet, commit `78b7343a347d2c53944a7058b7cb1c2ca4efe842` |
-| Binary SHA-256 (Linux x86-64) | `{{SHA256}}` |
-| Release signing key | `{{bloch-release-YYYYMMDD.pub}}` (minisign), fingerprint `{{KEY ID}}` |
-| Download | `{{RELEASE URL}}` and `releases/bloch-pos-{{YYYY-MM-DD}}/` in the repository |
+| Binary SHA-256 (Linux x86-64) | `fa9996eda48a8d3a5beff249c1c7d9f666d9e8207c4f0a1825ba3dba3889fc18` |
+| Release signing key | `bloch-release-20260922.pub` (minisign), key id `1A5D96A5C4955EF7` |
+| Download | `{{RELEASE URL}}` and `releases/bloch-pos-2026-10-14-l2-e5850/` in the repository |
 | Who must act | **every** validator, archival / RPC node, bootnode, explorer, indexer and exchange node |
 
 ## 1. Summary
@@ -76,7 +76,7 @@ and cannot be changed without a new announced activation.
 2. **Verify the binary** before installing it:
 
    ```bash
-   minisign -Vm SHA256SUMS -p {{bloch-release-YYYYMMDD.pub}}
+   minisign -Vm SHA256SUMS -p bloch-release-20260922.pub
    sha256sum --check SHA256SUMS          # must print: bloch-pos: OK
    ./bloch-pos --version                 # must name commit 78b7343a
    ./bloch-pos buildinfo                 # build_version must carry no "+devnet" / "rehearsal" marker
