@@ -915,8 +915,16 @@ pub struct Activation {
 impl Activation {
     /// An armed epoch must come with an activation that passes this
     /// (`armed_l2_gate_has_a_policy`).
+    ///
+    /// An activation for the mainnet chain id must also be the approved
+    /// mainnet policy: asynchronous, an attestor set present (never
+    /// installed while the keys are unset) and exactly [`mainnet::LIMITS`].
     pub fn valid(&self) -> bool {
-        self.policy.valid() && self.limits.valid()
+        let mainnet_shape = self.policy.chain_id != MAINNET_CHAIN_ID
+            || (self.asynchronous == mainnet::ASYNCHRONOUS
+                && self.policy.attestor_set != [0; 32]
+                && self.limits == mainnet::LIMITS);
+        self.policy.valid() && self.limits.valid() && mainnet_shape
     }
 }
 
@@ -926,16 +934,144 @@ impl Activation {
 /// arms nothing.
 pub const MAINNET_CHAIN_ID: u64 = 700_770;
 
-/// The activation pinned for the running network. `None` until the mainnet
-/// policy is decided: the proof program keys, the L2 genesis, the chain id,
-/// the attestor set, sync or async, and the limits. An armed epoch without
-/// one is refused by `armed_l2_gate_has_a_policy`.
+/// The mainnet L2 policy approved 2026-10-14 (docs/L2-MAINNET-ACTIVATION.md):
+/// asynchronous settlement, a 3-of-5 hybrid PQ attestor set fixed at
+/// activation, and the withdrawal limits below. Recording it arms nothing:
+/// the gate stays the sentinel and [`activation`](mainnet::activation)
+/// refuses while any part is still unset (the attestor keys, the L2 program
+/// and genesis), so [`activation_policy`] stays `None`.
+///
+/// Set-once: the attestor set is committed in the policy at installation
+/// (`BLOCH:NATIVE:L2:ATTESTORS:1` in the 0x21 leaf). There is no rotation,
+/// no periodic signing and no admin key; a new set is a new policy (a new
+/// flag day).
+pub mod mainnet {
+    use super::{withdrawal, Activation, Policy, MAINNET_CHAIN_ID};
+    use crate::transition::funded::ADMISSION_PQ_KEY_BYTES;
+
+    /// Settlement V3 over the asynchronous wire (deposits and claims need it).
+    pub const ASYNCHRONOUS: bool = true;
+    /// k of the attestor set: signatures a large claim needs.
+    pub const ATTESTOR_THRESHOLD: u8 = 3;
+    /// n of the attestor set: hybrid (ML-DSA-65 + Falcon-1024) keys, each held
+    /// by a different operator on a different host.
+    pub const ATTESTOR_COUNT: usize = 5;
+    const _: () = assert!(
+        ATTESTOR_THRESHOLD >= 1
+            && ATTESTOR_THRESHOLD as usize <= ATTESTOR_COUNT
+            && ATTESTOR_COUNT <= withdrawal::MAX_ATTESTORS
+    );
+
+    /// One BLCH in satoshis.
+    pub const BLCH: u64 = 100_000_000;
+    /// The approved withdrawal limits.
+    pub const LIMITS: withdrawal::Limits = withdrawal::Limits {
+        // Small claims: 64 blocks (two epochs) after the record, on top of
+        // the FFG-finality requirement.
+        delay_blocks: 64,
+        // Claims of at least 100 BLCH are large: attested and 2 880 blocks.
+        large_claim_sat: 100 * BLCH,
+        large_delay_blocks: 2_880,
+        // Retention must cover the large delay.
+        retention_blocks: 2_880,
+        // Per 2 880-block window: at most 10% of the escrow, floor 10 BLCH.
+        release_window_blocks: 2_880,
+        release_window_bps: 1_000,
+        release_floor_sat: 10 * BLCH,
+    };
+    const _: () = assert!(LIMITS.valid());
+
+    /// The attestor set, SET ONCE before the flag day: the text that
+    /// `bloch-pos l2-claim attestor-set --threshold 3 --pubkey … --out` writes
+    /// (threshold line, then the five enveloped public keys in hex, in set
+    /// order), e.g. `Some(include_str!("../l2-mainnet/attestors.set"))`.
+    /// `None` = UNSET: [`activation`] refuses.
+    pub const ATTESTOR_SET: Option<&str> = None;
+
+    /// The L2 program and genesis the activation pins: the seven V2
+    /// identities (Genesis-4 admission domain, native genesis, L2 domain,
+    /// L2 configuration, guest ELF, KoalaBear key, BN254 key), the proof
+    /// policy and the L2 genesis parent/state for chain [`MAINNET_CHAIN_ID`].
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Program {
+        pub identities: [[u8; 32]; 7],
+        pub proof_policy: [u8; 32],
+        pub initial_l2_parent: [u8; 32],
+        pub initial_l2_state: [u8; 32],
+    }
+    /// `None` = UNSET until the mainnet SP1 program and L2 genesis exist.
+    pub const PROGRAM: Option<Program> = None;
+
+    /// Why the mainnet activation cannot be built yet.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Incomplete {
+        /// [`ATTESTOR_SET`] is unset.
+        AttestorKeysUnset,
+        /// The attestor set is not 3-of-5 distinct enveloped hybrid keys.
+        AttestorSet,
+        /// [`PROGRAM`] is unset.
+        ProgramUnset,
+    }
+
+    fn unhex(text: &str) -> Option<Vec<u8>> {
+        let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+        let bytes = text.as_bytes();
+        if bytes.len() % 2 != 0 {
+            return None;
+        }
+        bytes.chunks(2).map(|p| Some(digit(p[0])? << 4 | digit(p[1])?)).collect()
+    }
+
+    /// The public keys of an attestor set file, checked against the approved
+    /// shape: threshold 3, exactly 5 distinct keys of the enveloped hybrid size.
+    pub fn attestor_keys(text: &str) -> Result<Vec<Vec<u8>>, Incomplete> {
+        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+        if lines.next().and_then(|l| l.parse::<u8>().ok()) != Some(ATTESTOR_THRESHOLD) {
+            return Err(Incomplete::AttestorSet);
+        }
+        let keys = lines.map(unhex).collect::<Option<Vec<_>>>().ok_or(Incomplete::AttestorSet)?;
+        let distinct = keys.iter().enumerate().all(|(i, k)| !keys[..i].contains(k));
+        if keys.len() != ATTESTOR_COUNT || !distinct || keys.iter().any(|k| k.len() != ADMISSION_PQ_KEY_BYTES) {
+            return Err(Incomplete::AttestorSet);
+        }
+        Ok(keys)
+    }
+
+    /// The mainnet activation from its set-once parts, or why it is incomplete.
+    pub fn activation_from(program: Option<&Program>, attestor_set: Option<&str>) -> Result<Activation, Incomplete> {
+        let keys = attestor_keys(attestor_set.ok_or(Incomplete::AttestorKeysUnset)?)?;
+        let program = program.ok_or(Incomplete::ProgramUnset)?;
+        Ok(Activation {
+            policy: Policy {
+                identities: program.identities,
+                proof_policy: program.proof_policy,
+                chain_id: MAINNET_CHAIN_ID,
+                initial_l2_parent: program.initial_l2_parent,
+                initial_l2_state: program.initial_l2_state,
+                attestor_set: withdrawal::attestor_set_hash(ATTESTOR_THRESHOLD, &keys),
+            },
+            asynchronous: ASYNCHRONOUS,
+            limits: LIMITS,
+        })
+    }
+
+    /// The mainnet activation as recorded in this build.
+    pub fn activation() -> Result<Activation, Incomplete> {
+        activation_from(PROGRAM.as_ref(), ATTESTOR_SET)
+    }
+}
+
+/// The activation pinned for the running network: [`mainnet::activation`]
+/// once every set-once part is filled. `None` today: the approved policy
+/// (async, 3-of-5 attestors, limits) is recorded but the attestor keys and
+/// the L2 program/genesis are unset. An armed epoch without one is refused by
+/// `armed_l2_gate_has_a_policy`.
 pub fn activation_policy() -> Option<Activation> {
     #[cfg(test)]
     if let Some(p) = activation_rehearsal::policy() {
         return Some(p);
     }
-    None
+    mainnet::activation().ok()
 }
 
 /// The activation a network bound to `network` (its admission domain)

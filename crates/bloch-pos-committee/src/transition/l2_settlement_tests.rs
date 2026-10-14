@@ -2252,6 +2252,9 @@ mod l2_tests {
                 .expect("an armed L2 gate needs a pinned activation policy");
             assert!(pinned.valid(), "pinned policy and limits must be valid");
             assert_eq!(pinned.policy.chain_id, crate::l2_settlement::MAINNET_CHAIN_ID);
+            // The approved mainnet policy, with every set-once part filled.
+            assert_eq!(Ok(pinned.clone()), crate::l2_settlement::mainnet::activation());
+            assert_ne!(pinned.policy.attestor_set, [0; 32], "attestor keys must be set");
             let l2 = crate::l2_settlement::State::activated(pinned).expect("the pinned activation installs");
             assert!(l2.profile().is_activated() && l2.user_transactions());
         }
@@ -2623,6 +2626,263 @@ mod l2_tests {
         assert!(post.l2_settlement().unwrap().escrow_conserved());
         // The next claim of the same window is over the cap.
         refuse(&post, &claim_of(&post, &leaves, 3, None), ClaimReject::RateLimited);
+    }
+
+    // ── Mainnet L2 policy approved 2026-10-14 ─────────────────────────────
+
+    use crate::l2_settlement::mainnet;
+
+    fn mainnet_attestors() -> Vec<Vec<u8>> {
+        (0..5).map(attestor).collect()
+    }
+
+    /// The text `l2-claim attestor-set` writes for `keys` at `threshold`.
+    fn set_file(threshold: u8, keys: &[Vec<u8>]) -> String {
+        let hex = |k: &Vec<u8>| k.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let mut text = format!("{threshold}\n");
+        for key in keys {
+            text.push_str(&hex(key));
+            text.push('\n');
+        }
+        text
+    }
+
+    fn mainnet_program() -> mainnet::Program {
+        let (_, policy) = running_without_l2();
+        mainnet::Program {
+            identities: policy.identities,
+            proof_policy: policy.proof_policy,
+            initial_l2_parent: policy.initial_l2_parent,
+            initial_l2_state: policy.initial_l2_state,
+        }
+    }
+
+    #[test]
+    fn mainnet_policy_records_the_approved_values() {
+        assert!(mainnet::ASYNCHRONOUS);
+        assert_eq!((mainnet::ATTESTOR_THRESHOLD, mainnet::ATTESTOR_COUNT), (3, 5));
+        assert_eq!(mainnet::BLCH, BLCH);
+        assert_eq!(
+            mainnet::LIMITS,
+            wd::Limits {
+                delay_blocks: 64,
+                large_claim_sat: 100 * BLCH,
+                large_delay_blocks: 2_880,
+                retention_blocks: 2_880,
+                release_window_blocks: 2_880,
+                release_window_bps: 1_000,
+                release_floor_sat: 10 * BLCH,
+            }
+        );
+        assert!(mainnet::LIMITS.valid());
+        // The epoch is not chosen and the set-once parts are unset.
+        assert_eq!(crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH, u64::MAX);
+        assert_eq!(mainnet::ATTESTOR_SET, None);
+        assert_eq!(mainnet::PROGRAM, None);
+        assert_eq!(mainnet::activation(), Err(mainnet::Incomplete::AttestorKeysUnset));
+        assert!(crate::l2_settlement::activation_policy().is_none());
+        // Once filled, the activation is exactly the approved policy.
+        let set = set_file(3, &mainnet_attestors());
+        let a = mainnet::activation_from(Some(&mainnet_program()), Some(&set)).unwrap();
+        assert!(a.valid());
+        assert!(a.asynchronous);
+        assert_eq!(a.limits, mainnet::LIMITS);
+        assert_eq!(a.policy.chain_id, crate::l2_settlement::MAINNET_CHAIN_ID);
+        assert_eq!(a.policy.attestor_set, wd::attestor_set_hash(3, &mainnet_attestors()));
+        let l2 = crate::l2_settlement::State::activated(a).unwrap();
+        assert!(l2.profile().is_activated() && l2.deposits_enabled() && l2.user_transactions());
+    }
+
+    #[test]
+    fn mainnet_activation_is_refused_while_attestor_keys_are_unset() {
+        use mainnet::Incomplete as I;
+        let program = mainnet_program();
+        let keys = mainnet_attestors();
+        // The build refuses to produce an activation.
+        assert_eq!(mainnet::activation_from(Some(&program), None), Err(I::AttestorKeysUnset));
+        assert_eq!(mainnet::activation_from(None, None), Err(I::AttestorKeysUnset));
+        assert_eq!(mainnet::activation_from(None, Some(&set_file(3, &keys))), Err(I::ProgramUnset));
+        // Only 3-of-5 distinct enveloped hybrid keys are a mainnet set.
+        let mut dup = keys.clone();
+        dup[4] = dup[0].clone();
+        let mut short = keys.clone();
+        short[2].pop();
+        for bad in [
+            set_file(2, &keys),
+            set_file(5, &keys),
+            set_file(3, &keys[..4]),
+            set_file(3, &[keys.clone(), vec![attestor(5)]].concat()),
+            set_file(3, &dup),
+            set_file(3, &short),
+            String::new(),
+            "3\nzz\n".to_string(),
+        ] {
+            assert_eq!(mainnet::activation_from(Some(&program), Some(&bad)), Err(I::AttestorSet));
+        }
+        // Consensus never installs a mainnet-chain activation without
+        // attestors, synchronous, or with other limits, even when armed.
+        let (genesis, mut policy) = running_without_l2();
+        policy.chain_id = crate::l2_settlement::MAINNET_CHAIN_ID;
+        let _gate = crate::params::l2_settlement_rehearsal::open();
+        let unset = Activation { policy: policy.clone(), asynchronous: true, limits: mainnet::LIMITS };
+        let mut set_policy = policy.clone();
+        set_policy.attestor_set = wd::attestor_set_hash(3, &keys);
+        let broken = [
+            unset,
+            Activation { policy: set_policy.clone(), asynchronous: false, limits: mainnet::LIMITS },
+            Activation { policy: set_policy.clone(), asynchronous: true, limits: PINNED },
+        ];
+        for pinned in broken {
+            assert!(!pinned.valid());
+            assert_eq!(crate::l2_settlement::State::activated(pinned.clone()), Err(Reject::Policy));
+            let _policy = crate::l2_settlement::activation_rehearsal::set(pinned);
+            assert!(genesis.close_epoch().l2_settlement().is_none());
+        }
+        // With the keys set, the same boundary installs it.
+        let good = Activation { policy: set_policy, asynchronous: true, limits: mainnet::LIMITS };
+        assert!(good.valid());
+        let _policy = crate::l2_settlement::activation_rehearsal::set(good);
+        let opened = genesis.close_epoch();
+        let l2 = opened.l2_settlement().expect("installed with the keys set");
+        assert_eq!(l2.limits(), &mainnet::LIMITS);
+    }
+
+    #[test]
+    fn mainnet_large_threshold_is_exactly_100_blch() {
+        let limits = mainnet::LIMITS;
+        assert_eq!(limits.delay_for(100 * BLCH - 1), 64);
+        assert_eq!(limits.delay_for(100 * BLCH), 2_880);
+        assert_eq!(limits.delay_for(100 * BLCH + 1), 2_880);
+        assert_eq!(limits.delay_for(1), 64);
+        let (_, mut policy) = running_without_l2();
+        policy.attestor_set = wd::attestor_set_hash(3, &mainnet_attestors());
+        let l2 = crate::l2_settlement::State::activated(Activation { policy, asynchronous: true, limits }).unwrap();
+        assert!(!l2.attestation_required(100 * BLCH - 1));
+        assert!(l2.attestation_required(100 * BLCH));
+        assert!(l2.attestation_required(u64::MAX));
+    }
+
+    #[test]
+    fn mainnet_release_window_is_10_percent_with_a_10_blch_floor() {
+        let limits = mainnet::LIMITS;
+        let cap = |escrow: u64| wd::ReleaseWindow::default().at(&limits, 2_880, u128::from(escrow)).cap;
+        let sat = |blch: u64| u128::from(blch * BLCH);
+        // The floor governs below 100 BLCH of escrow.
+        assert_eq!(cap(0), sat(10));
+        assert_eq!(cap(50 * BLCH), sat(10));
+        assert_eq!(cap(100 * BLCH), sat(10));
+        // 10% above it.
+        assert_eq!(cap(101 * BLCH), sat(10) + u128::from(BLCH / 10));
+        assert_eq!(cap(1_000 * BLCH), sat(100));
+        assert_eq!(cap(25_000 * BLCH), sat(2_500));
+        // Windows are 2 880 native blocks.
+        let used = wd::ReleaseWindow { window: 0, released: sat(100), cap: sat(100) };
+        assert_eq!(used.at(&limits, 2_879, sat(900)), used);
+        let next = used.at(&limits, 2_880, sat(900));
+        assert_eq!((next.window, next.released, next.cap), (1, 0, sat(90)));
+        // The cap is inclusive; only an exempt (attested) first claim exceeds it.
+        let fresh = wd::ReleaseWindow::default().at(&limits, 0, sat(1_000));
+        assert!(fresh.admits(100 * BLCH, false));
+        assert!(!fresh.admits(100 * BLCH + 1, false));
+        assert!(fresh.admits(100 * BLCH + 1, true));
+        let after = wd::ReleaseWindow { released: 1, ..fresh };
+        assert!(!after.admits(100 * BLCH, true));
+    }
+
+    /// Signatures of `signers` (indices into `keys`, signed with `signing`
+    /// keys) over the root `leaves` folds to, as a 3-of-n attestation.
+    fn attest_with(leaves: &[([u8; 32], u64)], keys: Vec<Vec<u8>>, signers: &[(u8, Vec<u8>)]) -> Attestation {
+        let tree: Vec<[u8; 32]> =
+            leaves.iter().enumerate().map(|(i, (r, s))| wd::leaf(700771, i as u64, r, *s)).collect();
+        let digest = wd::attestation_digest(&[0x91; 32], 700771, &wd::root(&tree));
+        Attestation {
+            threshold: mainnet::ATTESTOR_THRESHOLD,
+            keys,
+            signatures: signers.iter().map(|(i, key)| (*i, toy_sign(key, &digest))).collect(),
+        }
+    }
+    fn attest5(leaves: &[([u8; 32], u64)], signers: &[u8]) -> Attestation {
+        let signers: Vec<(u8, Vec<u8>)> = signers.iter().map(|&i| (i, attestor(i))).collect();
+        attest_with(leaves, mainnet_attestors(), &signers)
+    }
+
+    #[test]
+    fn mainnet_policy_end_to_end_3_of_5_delays_and_window() {
+        // The approved limits and a 3-of-5 set, installed at the boundary of
+        // the funded test network (chain 700771, so the mainnet-chain shape
+        // rule is not what is under test here).
+        let (base, mut policy, mut chains) = funded_running_without_l2();
+        policy.attestor_set = wd::attestor_set_hash(3, &mainnet_attestors());
+        let mut pre = {
+            let _gate = crate::params::l2_settlement_rehearsal::open();
+            let _policy = crate::l2_settlement::activation_rehearsal::set(Activation {
+                policy,
+                asynchronous: mainnet::ASYNCHRONOUS,
+                limits: mainnet::LIMITS,
+            });
+            apply(&base, crate::params::SLOTS_PER_EPOCH, &[], &mut chains).unwrap()
+        };
+        assert_eq!(pre.l2_settlement().unwrap().limits(), &mainnet::LIMITS);
+        // 1 000 BLCH escrowed (window cap 100 BLCH); one record at height 1.
+        let leaves = [([1; 32], 100 * BLCH), ([2; 32], 100 * BLCH - 1), ([3; 32], 50 * BLCH), ([4; 32], BLCH)];
+        let tree: Vec<[u8; 32]> =
+            leaves.iter().enumerate().map(|(i, (r, sats))| wd::leaf(700771, i as u64, r, *sats)).collect();
+        let l2 = pre.l2_settlement.as_mut().unwrap();
+        l2.append_deposit(crate::l2_settlement::InboxRecord {
+            height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 1_000 * BLCH, recipient: [0x42; 20],
+        })
+        .unwrap();
+        l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&tree), count: tree.len() as u64, height: 1 });
+        while l2.height() + 1 < 64 {
+            l2.advance_height().unwrap();
+        }
+        finalize_all(&mut pre);
+        let refuse = |pre: &CommittedState, tx: &L2WithdrawClaim, why| {
+            assert_eq!(try_claim(pre, tx).map(|_| ()), Err(TxReject::L2WithdrawClaim(why)))
+        };
+        // Small (just under 100 BLCH): 63 blocks are not enough, 64 are.
+        refuse(&pre, &claim_of(&pre, &leaves, 1, None), ClaimReject::NotMatured);
+        pre.l2_settlement.as_mut().unwrap().advance_height().unwrap();
+        let small = try_claim(&pre, &claim_of(&pre, &leaves, 1, None)).expect("small claim after 64 blocks");
+        assert_eq!(small.l2_settlement().unwrap().release_window().cap, 100 * u128::from(BLCH));
+        // Window: 99.99999999 + 50 BLCH exceeds the 100 BLCH cap.
+        refuse(&small, &claim_of(&small, &leaves, 2, None), ClaimReject::RateLimited);
+        // Exactly 100 BLCH is large: attestation required, then the large delay.
+        refuse(&pre, &claim_of(&pre, &leaves, 0, None), ClaimReject::AttestationRequired);
+        refuse(&pre, &claim_of(&pre, &leaves, 0, Some(attest5(&leaves, &[0, 1, 2]))), ClaimReject::NotMatured);
+
+        let l2 = pre.l2_settlement.as_mut().unwrap();
+        while l2.height() + 1 < 1 + 2_880 {
+            l2.advance_height().unwrap();
+        }
+        refuse(&pre, &claim_of(&pre, &leaves, 0, None), ClaimReject::AttestationRequired);
+        // Two signatures: refused.
+        refuse(&pre, &claim_of(&pre, &leaves, 0, Some(attest5(&leaves, &[0, 3]))), ClaimReject::Shape);
+        // The same signer twice to make up three: refused.
+        refuse(&pre, &claim_of(&pre, &leaves, 0, Some(attest5(&leaves, &[0, 0, 3]))), ClaimReject::Shape);
+        let mut doubled = attest5(&leaves, &[0, 1, 3]);
+        doubled.keys[1] = attestor(0);
+        doubled.signatures[1].1 = doubled.signatures[0].1.clone();
+        refuse(&pre, &claim_of(&pre, &leaves, 0, Some(doubled)), ClaimReject::Shape);
+        // A non-member: a set with an outside key, signed by it...
+        let mut foreign_keys = mainnet_attestors();
+        foreign_keys[4] = attestor(9);
+        let foreign = attest_with(&leaves, foreign_keys, &[(0, attestor(0)), (1, attestor(1)), (4, attestor(9))]);
+        refuse(&pre, &claim_of(&pre, &leaves, 0, Some(foreign)), ClaimReject::Attestation);
+        // ...or signing in a member's slot.
+        let impostor = attest_with(&leaves, mainnet_attestors(), &[(0, attestor(0)), (1, attestor(1)), (4, attestor(9))]);
+        refuse(&pre, &claim_of(&pre, &leaves, 0, Some(impostor)), ClaimReject::Attestation);
+        // The right set at another threshold is another set.
+        let mut two_of_five = attest5(&leaves, &[0, 1, 2]);
+        two_of_five.threshold = 2;
+        refuse(&pre, &claim_of(&pre, &leaves, 0, Some(two_of_five)), ClaimReject::Attestation);
+        // Three distinct members: accepted (any three, and all five).
+        for signers in [&[0u8, 1, 2][..], &[0, 2, 4], &[1, 3, 4], &[0, 1, 2, 3, 4]] {
+            let post = try_claim(&pre, &claim_of(&pre, &leaves, 0, Some(attest5(&leaves, signers)))).expect("3-of-5");
+            let l2 = post.l2_settlement().unwrap();
+            assert!(l2.claimed().contains(0) && l2.escrow_conserved());
+            assert_eq!(post.balance_sat(&[1; 32]), pre.balance_sat(&[1; 32]) + u128::from(100 * BLCH));
+        }
     }
 
     #[test]
