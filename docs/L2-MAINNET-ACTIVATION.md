@@ -342,3 +342,18 @@ The recommendations were approved as the mainnet L2 policy and are encoded in
 | Retention | 2 880 blocks (= large delay; keeps the committed state small). |
 | Release window | **2 880 blocks**, at most **10 % of escrow, floor 10 BLCH**; only an attested first claim of a window may exceed it. |
 | Activation epoch | **Not set.** Chosen only after: rebase (done), policy encoded (done, this commit), archival replay of mainnet history PASS, mixed-fleet qualification PASS on the final build, and ≥ 2 weeks public notice with the release on every node. The gate stays `u64::MAX`. |
+
+## Archival replay (2026-10-14): PASS
+
+Full Bloch mainnet L1 history replayed offline (loopback, no peers, RPC off) on 45.77 from a read-only
+copy of archival 139.180.166.5 (`/home/ubuntu/g4/archival-next`, `blocks.log` 2,353,001,376 B, sha256
+`7ad02731…279eb4`, snapshot 18:08:31Z):
+
+| | Build | Result |
+| --- | --- | --- |
+| baseline | exact fleet binary `funded-delegation-3a68f10b` (sha256 `22478fc5…60f7ba`, commit 3a68f10b) | 144,112 blocks, head slot 178154 `ebc1e1d9…f1f95a`, state root `09ad308e…708126` |
+| candidate | e6b9b92c release, no features (L2 inert) | identical head, state root, justified e5566, finalized e5565 |
+
+`replay-mainnet-history.sh` verdict PASS; the final `state.cache` of both runs is byte-identical except the
+embedded source digest and checksum; the root matches both archivals' RPC. Note: at copy time the
+archivals' finalized height (144051, e5565) lagged the head (e5570) by ~1 h.
