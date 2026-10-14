@@ -161,6 +161,81 @@ pub const INACTIVITY_LEAK_THRESHOLD_EPOCHS: u64 = 4;
 /// §5.1 value this is a Phase-1 proposal needing a KAT and a devnet sweep.
 pub const INACTIVITY_LEAK_QUOTIENT: u128 = 64;
 
+/// Divisor of the inactivity bite from [`ETH_PACED_LEAK_ACTIVATION_EPOCH`]
+/// onward: the leak runs at Ethereum's wall-clock pace instead of
+/// [`INACTIVITY_LEAK_QUOTIENT`]'s hours.
+///
+/// # Why 64 had to go
+///
+/// At 64 an absent validator kept about a third of its weight after 11 leak
+/// epochs (~3 h) and was at zero after 64 (~17 h). The 2026-10-13 stall showed
+/// the cost: hosts starved of memory stopped voting for a few hours, the leak
+/// discounted them before they recovered, each side of the resulting
+/// partition leaked the other away, and fork choice (which weighs from the
+/// node's own leaked state) made the split self-reinforcing. A leak that fast
+/// punishes an operator incident as if it were abandoned stake.
+///
+/// # The derivation
+///
+/// Ethereum (Bellatrix onward): inactivity score `+4` per missed epoch while
+/// leaking, per-epoch penalty `balance · score / (4 · 2^24)`, so after `n`
+/// epochs the bite is `n / 2^24` and the cumulative loss `≈ n² / 2^25`.
+/// An Ethereum epoch is 6.4 min and a Bloch epoch 16 min (32 × 30 s), so `n =
+/// 2.5 · T` for `T` Bloch epochs. Bloch's cumulative loss is `≈ T² / (2 · Q)`.
+/// Equal at every `T` when `Q = 2^25 / (2 · 2.5²) = 2^25 / 12.5 ≈ 2_684_355`.
+///
+/// What it buys: an absent validator keeps ~50% of its weight after ~21 days
+/// of unbroken non-finality (Ethereum's figure: ~50% after ~3 weeks), 99%
+/// after ~1 day. The price is the same as Ethereum's: if more than a third of
+/// the stake is gone for good, finality takes weeks, not hours, to return.
+///
+/// Unlike Ethereum, Bloch's leak is a WEIGHT discount, not a burn: it is
+/// returned by [`INACTIVITY_LEAK_RECOVERY_QUOTIENT`] once the validator votes.
+pub const INACTIVITY_LEAK_QUOTIENT_ETH_PACED: u128 = 2_684_355;
+
+/// Flag day for [`INACTIVITY_LEAK_QUOTIENT_ETH_PACED`].
+///
+/// The leak accumulator is committed into the state root (`state_root.rs`,
+/// `leaked: Vec<LeakRecord>`), so a node on the old quotient computes a
+/// different root at the first leak epoch after this one. Every node —
+/// validators AND archivals — must run this release BEFORE the epoch.
+/// Epoch 5700 starts at 2026-10-16 05:31:19 UTC (epoch 2880 = 2026-09-14
+/// 21:31:19 UTC, 960 s per epoch). If the fleet cannot be upgraded in time,
+/// move it forward in a new release before the boundary; a partially upgraded
+/// fleet must not cross it.
+pub const ETH_PACED_LEAK_ACTIVATION_EPOCH: u64 = 5_700;
+
+/// The inactivity-bite divisor in force at `epoch`.
+pub fn inactivity_leak_quotient(epoch: u64) -> u128 {
+    #[cfg(test)]
+    if eth_paced_leak_rehearsal::enabled() {
+        return INACTIVITY_LEAK_QUOTIENT_ETH_PACED;
+    }
+    if epoch_gate_active(epoch, ETH_PACED_LEAK_ACTIVATION_EPOCH) {
+        INACTIVITY_LEAK_QUOTIENT_ETH_PACED
+    } else {
+        INACTIVITY_LEAK_QUOTIENT
+    }
+}
+
+/// Opens [`ETH_PACED_LEAK_ACTIVATION_EPOCH`] on this test thread only, so a
+/// test can drive the new pace at small epoch numbers. Not in
+/// `rehearsal::gates_are_forced_open`: the leak-era tests that force every gate
+/// open measure recovery in tens of epochs and are about the OLD pace.
+#[cfg(test)]
+pub(crate) mod eth_paced_leak_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) { ENABLED.with(|c| c.set(self.0)); }
+        }
+        Restore(ENABLED.with(|c| c.replace(true)))
+    }
+}
+
 /// Divisor of the per-epoch **recovery** of the inactivity leak, once finality
 /// is healthy again: `leaked -= max(leaked / QUOTIENT, 1)` on every epoch that
 /// is *not* leaking. This is the whole answer to "the relaunch inherits a

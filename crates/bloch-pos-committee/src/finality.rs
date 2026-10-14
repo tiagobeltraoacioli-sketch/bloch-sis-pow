@@ -84,7 +84,7 @@
 
 use crate::attestation::AttestationData;
 use crate::params::{
-    INACTIVITY_LEAK_QUOTIENT, INACTIVITY_LEAK_RECOVERY_QUOTIENT,
+    INACTIVITY_LEAK_RECOVERY_QUOTIENT,
     INACTIVITY_LEAK_THRESHOLD_EPOCHS, MIN_QUORUM_DENOMINATOR_DEN, MIN_QUORUM_DENOMINATOR_NUM,
 };
 use crate::sample::Validator;
@@ -527,7 +527,9 @@ impl FinalityState {
                 // Cannot overflow: `remaining` and `t` are both u64 values, so
                 // their u128 product is < 2^128.
                 #[allow(clippy::arithmetic_side_effects)]
-                let bite = ((remaining as u128 * t) / INACTIVITY_LEAK_QUOTIENT).max(1) as u64;
+                let bite = ((remaining as u128 * t)
+                    / crate::params::inactivity_leak_quotient(votes.epoch))
+                .max(1) as u64;
                 let bite = bite.min(remaining);
                 // Cannot overflow: `remaining = effective_stake - leaked` (the
                 // `stake` map, saturating; a zero skipped above), and
@@ -902,6 +904,47 @@ mod tests {
         assert!(st.leaked_of(1) > 0);
         assert!(st.leaked_of(2) > 0);
         assert_eq!(st.leaked_of(0), 0, "a validly voting member never leaks");
+    }
+
+    #[test]
+    fn the_eth_paced_quotient_arms_exactly_at_its_flag_day() {
+        use crate::params::{
+            inactivity_leak_quotient, ETH_PACED_LEAK_ACTIVATION_EPOCH, INACTIVITY_LEAK_QUOTIENT,
+            INACTIVITY_LEAK_QUOTIENT_ETH_PACED,
+        };
+        assert_eq!(inactivity_leak_quotient(ETH_PACED_LEAK_ACTIVATION_EPOCH - 1), INACTIVITY_LEAK_QUOTIENT);
+        assert_eq!(inactivity_leak_quotient(ETH_PACED_LEAK_ACTIVATION_EPOCH), INACTIVITY_LEAK_QUOTIENT_ETH_PACED);
+    }
+
+    /// Ethereum's figures, measured through `process_epoch`: an absent
+    /// validator keeps >99.8% of its weight after a day of non-finality and
+    /// about half after three weeks. 40% present / 60% absent so the stall
+    /// cannot end before the 50% mark (it ends near a 2/3 loss).
+    #[test]
+    fn the_eth_paced_leak_halves_an_absent_validator_in_about_three_weeks() {
+        let _open = crate::params::eth_paced_leak_rehearsal::open();
+        let committee = [validator(0, 40_000_000), validator(1, 60_000_000)];
+        let mut st = FinalityState::new(genesis());
+        let epochs_per_day = 24 * 3600 / (32 * crate::params::SLOT_DURATION_SECS);
+        let mut kept_after_a_day = None;
+        for e in 1..=(21 * epochs_per_day + INACTIVITY_LEAK_THRESHOLD_EPOCHS) {
+            let atts = [vote(0, e, [(e % 251) as u8 + 1; 32], genesis())];
+            let out = st
+                .process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &atts })
+                .unwrap();
+            assert!(out.finalized.is_none(), "the 40/60 stall must not end before the 50% mark");
+            if e == epochs_per_day + INACTIVITY_LEAK_THRESHOLD_EPOCHS {
+                kept_after_a_day = Some(60_000_000 - st.leaked_of(1));
+            }
+        }
+        let day = kept_after_a_day.unwrap();
+        assert!(day * 1000 >= 60_000_000 * 998, "after one day kept {day} of 60M");
+        let weeks = 60_000_000 - st.leaked_of(1);
+        assert!(
+            (25_000_000..=35_000_000).contains(&weeks),
+            "after 21 days kept {weeks} of 60M; Ethereum's pace is about half"
+        );
+        assert_eq!(st.leaked_of(0), 0);
     }
 
     #[test]
