@@ -81,6 +81,8 @@ fn frozen_method_space(req: &RpcRequest) -> &'static str {
     match req {
         RpcRequest::ChainInfo => "getchaininfo",
         RpcRequest::BuildInfo => "getbuildinfo",
+        RpcRequest::L2Settlement => "getl2settlement",
+        RpcRequest::BlockRaw(_) => "getblockraw",
         RpcRequest::BlockCount => "getblockcount",
         RpcRequest::BlockBySlot(_) => "getblockbyslot",
         RpcRequest::BlockById(_) => "getblockbyid",

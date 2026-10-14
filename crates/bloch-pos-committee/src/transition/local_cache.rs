@@ -124,7 +124,12 @@ impl CommittedState {
     /// or allocating a second encoded payload. Restore the original destination
     /// length if serialization fails; existing prefix bytes remain untouched.
     pub fn append_local_cache(&self, bytes: &mut Vec<u8>) -> Result<(), String> {
-        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat } = self;
+        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat, l2_settlement } = self;
+        // The L2 settlement component has no local-cache codec yet: such a
+        // node replays instead (the restore root check would refuse anyway).
+        if l2_settlement.is_some() {
+            return Err("L2 settlement state is not locally cacheable".into());
+        }
         let value = CachedStateRef {
             admission_network_domain,
             slot,
@@ -187,7 +192,7 @@ impl CommittedState {
     // oracle: equality catches changes to field order and eUTXO sequence framing.
     #[cfg(test)]
     pub(super) fn encode_local_cache_owned_reference(&self) -> Result<Vec<u8>, String> {
-        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat } = self;
+        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat, l2_settlement: _ } = self;
         let value = CachedState {
             admission_network_domain: admission_network_domain.clone(),
             slot: slot.clone(),
@@ -290,6 +295,7 @@ impl CommittedState {
             coherence_nullifier_root: value.coherence_nullifier_root,
             evm: value.evm,
             issued_sat: value.issued_sat,
+            l2_settlement: None,
         };
         if state.slot != header.slot || state.epoch != header.slot / crate::params::SLOTS_PER_EPOCH || state.compute_root() != header.state_root {
             return Err("cached state does not match its block header".into());

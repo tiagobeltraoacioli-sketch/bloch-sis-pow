@@ -135,6 +135,13 @@ pub struct HistoryEntry {
 /// the bytes are one seek away in the log when a caller does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxKind {
+    L2Settlement,
+    L2SettlementAsync,
+    /// Native L2 bridge (0x14-0x16). Recorded by kind only: the index does
+    /// not yet follow their escrow inputs/outputs (needed before activation).
+    L2Deposit,
+    L2DataAvailability,
+    L2WithdrawClaim,
     Transfer,
     TransferV2,
     FundedDeposit,
@@ -161,6 +168,11 @@ pub enum TxKind {
 impl TxKind {
     pub fn name(&self) -> String {
         match self {
+            TxKind::L2Settlement => "l2_settlement".into(),
+            TxKind::L2SettlementAsync => "l2_settlement_async".into(),
+            TxKind::L2Deposit => "l2_deposit".into(),
+            TxKind::L2DataAvailability => "l2_data_availability".into(),
+            TxKind::L2WithdrawClaim => "l2_withdraw_claim".into(),
             TxKind::Transfer => "transfer".into(),
             TxKind::TransferV2 => "transfer_v2".into(),
             TxKind::FundedDeposit => "funded_deposit".into(),

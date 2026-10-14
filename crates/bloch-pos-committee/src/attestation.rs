@@ -139,6 +139,11 @@ pub trait SignatureVerifier {
     /// that checked one half for spending and two for attesting would make
     /// spending cheaper to forge than attesting.
     fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool;
+
+    /// Deterministic native L2 proof check, using only parent-committed policy.
+    /// Older verifier implementations cannot silently admit the new transaction.
+    fn verify_l2_settlement(&self, _policy: &[u8; 32], _program: &[u8; 32],
+        _values: &[u8], _proof: &[u8]) -> bool { false }
 }
 
 /// Resolves a validator index to its registered public key.

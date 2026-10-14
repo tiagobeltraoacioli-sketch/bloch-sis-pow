@@ -47,6 +47,9 @@
 mod codec;
 mod connection_limit;
 mod devnet_tools;
+mod l2_da_cli;
+mod l2_claim_cli;
+mod l2_deposit_cli;
 mod engine;
 mod genesis;
 mod funded_delegation_cli;
@@ -222,6 +225,24 @@ fn main() {
         Some("funded-delegation") => {
             if let Err(error) = funded_delegation_cli::run(&args[1..]) {
                 eprintln!("funded-delegation: {error}");
+                exit(2);
+            }
+        }
+        Some("l2-deposit") => {
+            if let Err(error) = l2_deposit_cli::run(&args[1..]) {
+                eprintln!("l2-deposit: {error}");
+                exit(2);
+            }
+        }
+        Some("l2-da") => {
+            if let Err(error) = l2_da_cli::run(&args[1..]) {
+                eprintln!("l2-da: {error}");
+                exit(2);
+            }
+        }
+        Some("l2-claim") => {
+            if let Err(error) = l2_claim_cli::run(&args[1..]) {
+                eprintln!("l2-claim: {error}");
                 exit(2);
             }
         }
@@ -1072,6 +1093,10 @@ fn keygen(args: &[String]) {
 /// about which balance set this chain opens with, and the file itself is
 /// checked later, at node start, against exactly these four fields.
 fn genesis_mainnet(args: &[String]) {
+    if arg_value(args, "--l2-settlement-config").is_some() {
+        eprintln!("L2 settlement is restricted to a fresh unfunded development genesis");
+        exit(2);
+    }
     use bloch_pos_committee::tokenomics_v4 as t;
 
     let Some(cohort_path) = arg_value(args, "--cohort") else {
@@ -1261,6 +1286,14 @@ fn genesis_mainnet(args: &[String]) {
 }
 
 fn genesis_cmd(args: &[String]) {
+    let format = if let Some(path) = arg_value(args, "--l2-settlement-config") {
+        if !args.iter().any(|a| a == "--bind-genesis") {
+            eprintln!("L2 settlement requires --bind-genesis"); exit(2);
+        }
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| { eprintln!("L2 config: {e}"); exit(2) });
+        let config = genesis::L2Config::decode(&bytes).unwrap_or_else(|e| { eprintln!("L2 config: {e}"); exit(2) });
+        genesis::ManifestFormat::V3L2Async(config)
+    } else { manifest_format(args) };
     let Some(keys_csv) = arg_value(args, "--keys") else {
         eprintln!("genesis: --keys <dir1,dir2,...> is required");
         exit(2);
@@ -1312,27 +1345,52 @@ fn genesis_cmd(args: &[String]) {
     // `--alloc` opening balances (devnet_tools): liquid LIQUIDITY-purpose
     // allocations, the one funding path a fresh devnet has. Refused past the
     // manifest's decode cap or with an amount that does not fit a u64 UTXO.
-    let allocations = match devnet_tools::parse_allocs(args) {
+    let mut allocations = match devnet_tools::parse_allocs(args) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("genesis: {e}");
             exit(2);
         }
     };
+    // Development L2 networks may fund test accounts at genesis (liquid at
+    // epoch 0) so native deposits can be exercised. Refused for any other
+    // manifest format: a funded network never takes balances from a flag.
+    let mut flags = args.iter();
+    while let Some(flag) = flags.next() {
+        if flag != "--dev-allocation" {
+            continue;
+        }
+        if !matches!(format, genesis::ManifestFormat::V3L2Async(_)) || !cfg!(feature = "devnet-l2-deposits") {
+            eprintln!("genesis: --dev-allocation needs a BPOSMAN3 manifest and a devnet-l2-deposits build");
+            exit(2);
+        }
+        let value = flags.next().unwrap_or_else(|| { eprintln!("genesis: --dev-allocation needs SCRIPT_HASH:SATS"); exit(2) });
+        let (hash, sats) = value.split_once(':').unwrap_or_else(|| { eprintln!("genesis: --dev-allocation needs SCRIPT_HASH:SATS"); exit(2) });
+        let script_hash: [u8; 32] = codec::unhex(hash).ok().and_then(|b| b.try_into().ok())
+            .unwrap_or_else(|| { eprintln!("genesis: --dev-allocation script hash must be 32 bytes of hex"); exit(2) });
+        let amount_sat: u64 = sats.parse().unwrap_or_else(|_| { eprintln!("genesis: --dev-allocation amount must be integer sats"); exit(2) });
+        allocations.push(genesis::GenesisAllocation {
+            purpose: genesis::alloc_purpose::LIQUIDITY,
+            script_hash,
+            amount_sat: u128::from(amount_sat),
+            unlock_epoch: 0,
+        });
+    }
     let manifest = genesis::Manifest {
         genesis_time_ms: genesis_time_from_now(start_in),
         slot_ms,
         validators,
         cohort: Vec::new(),
         // `genesis` builds devnet manifests: no carried balances, and only
-        // the `--alloc` balances given on the command line (empty by
+        // the `--alloc` balances (and, on BPOSMAN3 L2 devnets, the
+        // `--dev-allocation`s) given on the command line (empty by
         // default). The mainnet manifest is assembled by a separate path
         // that takes the signed Genesis-3 snapshot as input, because its
         // inputs come from a ceremony and not from a command line.
         carryover: None,
         allocations,
         carryover_entries: Vec::new(),
-        format: manifest_format(args),
+        format,
         pre_state_root: std::sync::OnceLock::new(),
     };
     if let Err(e) = manifest.validate_new_validator_set() {
@@ -1344,7 +1402,9 @@ fn genesis_cmd(args: &[String]) {
         exit(1);
     }
     let bytes = manifest.encode();
-    if let Err(e) = std::fs::write(&out, &bytes) {
+    use std::io::Write;
+    if let Err(e) = std::fs::OpenOptions::new().write(true).create_new(true).open(&out)
+        .and_then(|mut f| f.write_all(&bytes)) {
         eprintln!("genesis: cannot write {out}: {e}");
         exit(1);
     }

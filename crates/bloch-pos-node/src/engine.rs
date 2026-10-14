@@ -1045,6 +1045,9 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
         PosTransaction::Transfer { tip_millisat_per_gas, .. }
         | PosTransaction::TransferV2 { tip_millisat_per_gas, .. } => *tip_millisat_per_gas,
         PosTransaction::FundedDeposit(tx) => tx.tip_millisat_per_gas,
+        PosTransaction::L2Deposit(tx) => tx.tip_millisat_per_gas,
+        PosTransaction::L2DataAvailability(tx) => tx.tip_millisat_per_gas,
+        PosTransaction::L2WithdrawClaim(tx) => tx.tip_millisat_per_gas,
         _ => 0,
     }
 }
@@ -1082,6 +1085,9 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
             };
             Some(validator_lifecycle_source(validator))
         }
+        PosTransaction::L2Deposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::L2DataAvailability(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::L2WithdrawClaim(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         _ => None,
     }
 }
@@ -3593,10 +3599,22 @@ impl Engine {
         slot: u64,
     ) -> bool {
         if let Some(index) = culprit_index(err, txs.len()) {
-            let bad = txs.remove(index).canonical_bytes();
+            let tx = txs.remove(index);
+            // `Transaction(i)` is frozen and carries no reason; for an L2
+            // withdrawal claim, ask the pre-state why (RateLimited,
+            // AttestationRequired, NotFinalized, ...).
+            let why = match &tx {
+                PosTransaction::L2WithdrawClaim(claim) => self
+                    .state
+                    .l2_withdraw_claim_refusal(claim)
+                    .map(|r| format!(" (L2 withdrawal claim index {} refused, {r:?})", claim.index))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            let bad = tx.canonical_bytes();
             self.mempool.remove(&bad);
             self.reject_transaction(bad, slot);
-            eprintln!("[slot {slot}] removing indexed transaction refused by transition: {err:?}");
+            eprintln!("[slot {slot}] removing indexed transaction refused by transition: {err:?}{why}");
             true
         } else if txs.pop().is_some() {
             eprintln!("[slot {slot}] narrowing proposal after unattributed refusal: {err:?}");
@@ -3858,6 +3876,9 @@ impl Engine {
             }
             PosTransaction::FundedDeposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::FundedDelegate(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::L2Deposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::L2DataAvailability(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::L2WithdrawClaim(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             _ => None,
         }
     }
@@ -4252,26 +4273,35 @@ impl Engine {
                 return Err(Refusal::Invalid("funded deposit belongs to a different genesis manifest"));
             }
         }
-        let verifier = self.gossip_verifier.budgeted_for_source(
-            self.wall_slot(),
-            GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
-            verification_source,
-            GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
-        );
-        let admission = admissible_with_network_verifier(
-            &tx,
-            epoch_of(self.wall_slot()),
-            self.state.admission_network_domain().as_ref(),
-            &verifier,
-        );
-        let limited = verifier.limited();
-        drop(verifier);
-        if limited {
-            return Err(Refusal::GossipVerificationLimited {
-                until_slot: self.wall_slot().saturating_add(1),
-            });
+        if let PosTransaction::L2SettlementAsync(settlement) = &tx {
+            let state = self.state.l2_settlement().ok_or(Refusal::Invalid("L2 settlement is not configured"))?;
+            if self.mempool.values().any(|pending| matches!(pending, PosTransaction::L2SettlementAsync(_))) {
+                return Err(Refusal::Invalid("one L2 proof is already pending"));
+            }
+            state.validate_async(settlement, &HybridVerifier::new())
+                .map_err(|_| Refusal::Invalid("L2 settlement policy, source, successor or proof failed"))?;
+        } else {
+            let verifier = self.gossip_verifier.budgeted_for_source(
+                self.wall_slot(),
+                GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+                verification_source,
+                GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+            );
+            let admission = admissible_with_network_verifier(
+                &tx,
+                epoch_of(self.wall_slot()),
+                self.state.admission_network_domain().as_ref(),
+                &verifier,
+            );
+            let limited = verifier.limited();
+            drop(verifier);
+            if limited {
+                return Err(Refusal::GossipVerificationLimited {
+                    until_slot: self.wall_slot().saturating_add(1),
+                });
+            }
+            admission.map_err(Refusal::Invalid)?;
         }
-        admission.map_err(Refusal::Invalid)?;
         if self.funded_mempool_conflict(&tx, &capacity.stale) {
             return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
         }
@@ -4326,6 +4356,10 @@ impl Engine {
     /// it builds a block every other node rejects — so the epoch comes from
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
+        // A proof reserves the whole gas budget. Never pack it with transfers.
+        if let Some(tx) = self.mempool.values().find(|tx| matches!(tx, PosTransaction::L2SettlementAsync(_))) {
+            return vec![tx.clone()];
+        }
         // Admission is a historical observation, not a reservation of inputs or
         // fees. Recheck against this proposal's parent and fee epoch before a
         // stale high-tip transaction can consume candidate capacity (EN-06).
@@ -4371,6 +4405,8 @@ impl Engine {
         // without it costing security: candidates tied on fee are
         // interchangeable by construction.
         let mut reserved = BTreeSet::new();
+        // Consensus caps DA batches per block; the highest tips win the slots.
+        let mut da_batches = 0usize;
         ordered.sort_by(|(ka, ta), (kb, tb)| {
             tx_tip_rate(tb).cmp(&tx_tip_rate(ta)).then_with(|| ka.cmp(kb))
         });
@@ -4398,6 +4434,9 @@ impl Engine {
                 PosTransaction::Transfer { tx_bytes, .. }
                 | PosTransaction::TransferV2 { tx_bytes, .. } => *tx_bytes,
                 PosTransaction::FundedDeposit(tx) => tx.tx_bytes,
+                PosTransaction::L2Deposit(tx) => tx.tx_bytes,
+                PosTransaction::L2DataAvailability(tx) => tx.tx_bytes,
+                PosTransaction::L2WithdrawClaim(tx) => tx.tx_bytes,
                 _ => 0,
             };
             let n = (encoded.len() as u64).max(declared);
@@ -4407,6 +4446,12 @@ impl Engine {
             let points = Self::spent_outpoints(tx).unwrap_or_default();
             if points.iter().any(|point| reserved.contains(point)) {
                 continue;
+            }
+            if matches!(tx, PosTransaction::L2DataAvailability(_)) {
+                if da_batches >= bloch_pos_committee::l2_settlement::da::MAX_PER_BLOCK {
+                    continue;
+                }
+                da_batches += 1;
             }
             reserved.extend(points);
             bytes = bytes.saturating_add(n); // checked against `cap` just above
@@ -5654,6 +5699,11 @@ impl Engine {
 
             // Identity of the binary, not of the chain: no state read, no
             // lock taken, constant cost at any height.
+            RpcRequest::L2Settlement => Ok(rpc::l2_settlement_json(&self.state)),
+            RpcRequest::BlockRaw(id) => {
+                let env = self.envelope_by_id(&id).ok_or_else(|| RpcError::new(rpc::BLOCK_NOT_FOUND, "unknown block"))?;
+                Ok(rpc::Json::s(crate::codec::hex(&crate::codec::encode_envelope(&env))))
+            }
             RpcRequest::BuildInfo => Ok(rpc::build_info_json()),
             RpcRequest::MempoolInfo => Ok(rpc::mempool_info_json(
                 self.mempool.len(),
@@ -5681,163 +5731,9 @@ impl Engine {
 /// that the log of a multi-hour replay stays readable.
 const REPLAY_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Verdict of the boot-time keystore identity gate ("gate 3").
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum KeystoreIdentity {
-    /// The keystore is the manifest's validator at that index, and its local
-    /// RANDAO chain opens the committed head.
-    Ok,
-    /// No manifest validator carries this (index, pubkey) pair.
-    NotInGenesisSet,
-    /// The validator is in the manifest, but the local RANDAO seed does not
-    /// regenerate the committed commitment.
-    RandaoMismatch,
-}
-
-/// The boot-time identity gate, extracted from `run` so it can be tested.
-///
-/// # This gate is the third thing blocking an open network, and it is
-/// # independent of the verifier
-///
-/// A validator added by an on-chain deposit is, by construction, NOT in the
-/// genesis manifest. So even once the verifier reads the registry and the
-/// network can *count* a newcomer's votes, the newcomer's own node still
-/// refuses to boot with `keystore does not match the genesis manifest's
-/// validator set`. Fixing the verifier alone gets you a validator everyone
-/// else can verify and that cannot start.
-///
-/// The root cause is the same one the verifier had: **identity is being read
-/// from the genesis manifest instead of from the committed registry.** A
-/// validator's index, key and RANDAO commitment are all committed state
-/// (`ValidatorRecord`), and a deposit writes all three. The manifest is only
-/// the registry's value at height 0.
-///
-/// **That fix is now made, in [`check_registry_identity`] below, and this
-/// function is no longer authoritative.** It survives as a *fast pre-pass*
-/// only: the registry is not reachable here (the store is not open, the log
-/// and neither replay nor the local restart cache has reconstructed the
-/// committed registry), so the authoritative check waits for state recovery. Keeping a cheap
-/// manifest look first means a genesis operator who mistyped a seed still
-/// learns it in a second instead of after a replay.
-///
-/// What changed is which verdicts are fatal. `NotInGenesisSet` is no longer
-/// an error at all — it is the *normal and expected* state of every validator
-/// the network will ever add by deposit, and refusing to boot on it is
-/// precisely the wall that kept a deposit-added validator off the network.
-/// It is now advisory, and [`check_registry_identity`] decides.
-///
-/// # One latent defect fixed in the extraction
-///
-/// The original read the RANDAO commitment as
-/// `manifest.validators[keys.index as usize]` — indexing by POSITION after
-/// having found the record by its `index` FIELD. Those coincide only while
-/// the manifest is dense and sorted; otherwise it compares against another
-/// validator's commitment, or panics out of bounds. This version uses the
-/// record it already found. On the live fleet's dense manifest the two are
-/// identical; everywhere else this one is correct and the old one was not.
-/// (`Manifest::pubkeys()` carries the same position-vs-index assumption and
-/// silently yields an EMPTY key for an out-of-range index — see
-/// `genesis::tests::the_manifest_table_silently_empties_sparse_indices`.)
-pub(crate) fn check_keystore_identity(
-    manifest: &crate::genesis::Manifest,
-    index: u32,
-    pubkey: &[u8],
-    randao_seed: [u8; 32],
-) -> KeystoreIdentity {
-    let Some(v) = manifest.validators.iter().find(|v| v.index == index) else {
-        return KeystoreIdentity::NotInGenesisSet;
-    };
-    if v.pubkey != pubkey {
-        return KeystoreIdentity::NotInGenesisSet;
-    }
-    if RandaoChain::generate(randao_seed).commitment() != v.randao_commitment {
-        return KeystoreIdentity::RandaoMismatch;
-    }
-    KeystoreIdentity::Ok
-}
-
-/// Verdict of the authoritative, registry-backed identity gate.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum RegistryIdentity {
-    /// The committed registry holds this index, it carries exactly this
-    /// keystore's key, and the local RANDAO chain opens its committed
-    /// commitment. Duties are armed.
-    Active,
-    /// Registered identity, but its exit has taken effect. Keep following
-    /// the chain so automatic withdrawal can run when the lock matures.
-    Inactive,
-    /// The registry has no such index *yet*. Not an error: it is what a
-    /// deposit-added validator looks like before its deposit is applied.
-    /// Boot, follow the chain, sign nothing, re-check every slot.
-    PendingActivation,
-    /// The registry holds this index and it belongs to a DIFFERENT key.
-    /// Fatal — see the double-signing note on [`check_registry_identity`].
-    WrongValidator,
-    /// The right key at the right index, but the local RANDAO seed does not
-    /// regenerate the committed commitment. Fatal: this node cannot produce a
-    /// reveal the network will accept, so every block it proposes is refused.
-    RandaoMismatch,
-}
-
-/// The identity gate that actually decides, read from the **committed
-/// registry** rather than from the genesis manifest.
-///
-/// # Why this had to move past replay
-///
-/// The committed registry is reconstructed by full replay or a compatible
-/// local cache plus verified tail replay. At the point `run` loads the
-/// keystore neither recovery path has run, so there is no registry to
-/// consult — no `Store`, no log, no `Engine`. The only registry that exists
-/// before replay is the manifest's, i.e. the height-0 one, which by
-/// construction cannot contain anyone added since height 0. Any gate placed
-/// there can only ever ask "were you in the genesis set?", which is the wrong
-/// question. This one runs after replay, where `engine.state` is the registry
-/// as of the node's own head. The weak-subjectivity gate already sets that
-/// precedent for the same reason.
-///
-/// # Why absence must not be fatal, and why a mismatch must be
-///
-/// The two cases were one branch before, and collapsing them is what closed
-/// the network:
-///
-/// - **Absent** means "your deposit has not been applied on this node's head
-///   yet" — a newcomer that has just deposited, or one still replaying. It is
-///   a temporary, self-healing condition, and the honest response is to
-///   follow the chain and keep checking.
-/// - **Present but a different key** means another validator already owns
-///   this index. Signing there is signing *as them*: two conflicting messages
-///   under one index is exactly the equivocation `slashing.rs` exists to
-///   punish. This must refuse to boot, and it is the real safety value the
-///   old gate was providing — preserved here, and now aimed at the case that
-///   actually warrants it.
-///
-/// # The re-check is a safety requirement, not a convenience
-///
-/// It is tempting to conclude that pending-activation needs no machinery,
-/// because `attest` and `propose` already return early when the index is not
-/// in the roster they derive from committed state. That is true and it is not
-/// sufficient. Indices are allocated `keys().next_back() + 1`, so an operator
-/// whose keystore was minted for index 64 *before* depositing can be beaten
-/// to index 64 by somebody else's deposit. The roster check would then pass —
-/// the index is active — and this node would sign under a key that is not
-/// its own. So the duty path re-checks the *key*, not just the index, every
-/// time it is about to sign: see `Engine::duty_index`.
-pub(crate) fn check_registry_identity(
-    state: &CommittedState, index: u32, pubkey: &[u8], randao_seed: [u8; 32],
-) -> RegistryIdentity {
-    let Some(rec) = state.validator_record(index) else { return RegistryIdentity::PendingActivation };
-    if rec.pubkey != pubkey { return RegistryIdentity::WrongValidator; }
-    let mut chain = RandaoChain::generate(randao_seed);
-    let mut commitment = chain.commitment();
-    for _ in 0..state.validator_reveals_used(index).unwrap_or(0) {
-        let Some(reveal) = chain.next_reveal() else { return RegistryIdentity::RandaoMismatch };
-        commitment = reveal;
-    }
-    if commitment != rec.randao_commitment { return RegistryIdentity::RandaoMismatch; }
-    if rec.activation_epoch > epoch_of(state.slot()) { return RegistryIdentity::PendingActivation; }
-    if epoch_of(state.slot()) >= rec.exit_epoch { return RegistryIdentity::Inactive; }
-    RegistryIdentity::Active
-}
+#[path = "engine_identity.rs"]
+mod identity;
+pub(crate) use identity::{check_keystore_identity, check_registry_identity, KeystoreIdentity, RegistryIdentity};
 
 fn start_devnet(
     cfg: &Config,
@@ -5976,6 +5872,18 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
+    // A build with consensus rules armed for development networks must never
+    // join a funded network: refuse anything but a BPOSMAN3 development manifest.
+    #[cfg(any(feature = "devnet-randao-recommit", feature = "devnet-l2-deposits"))]
+    {
+        if !matches!(manifest.format, crate::genesis::ManifestFormat::V3L2Async(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "this build has development consensus features (devnet-randao-recommit / devnet-l2-deposits) and runs only BPOSMAN3 development manifests",
+            ));
+        }
+        println!("DEVELOPMENT BUILD: {}", env!("BLOCH_BUILD_VERSION"));
+    }
 
     // The opening ledger, before anything else touches the manifest. A
     // manifest that commits to a carryover is not usable until the snapshot
@@ -7281,6 +7189,53 @@ fn admissible_with_network_verifier(
     verifier: &dyn SignatureVerifier,
 ) -> Result<(), &'static str> {
     match tx {
+        PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => Err("native L2 settlement is not enabled by a shipping genesis manifest"),
+        PosTransaction::L2DataAvailability(batch) => {
+            if !bloch_pos_committee::l2_settlement::USER_TRANSACTIONS_ENABLED {
+                return Err("L2 data availability is not enabled in this build");
+            }
+            // Shape and payload are rechecked in consensus; refuse the
+            // obviously unusable batch before the signature.
+            if bloch_pos_committee::l2_settlement::da::batch_count(&batch.payload).is_none() {
+                return Err("L2 data availability payload is not one canonical batch");
+            }
+            if HybridVerifier::new().verify_with_key(&batch.funding_pubkey, &batch.intent_root(), &batch.signature) {
+                Ok(())
+            } else {
+                Err("invalid L2 data availability hybrid PQ authorization")
+            }
+        }
+        PosTransaction::L2WithdrawClaim(claim) => {
+            if !bloch_pos_committee::l2_settlement::USER_TRANSACTIONS_ENABLED {
+                return Err("L2 withdrawal claims are not enabled in this build");
+            }
+            // The proof, maturity, nullifier and escrow are state checks and
+            // run in consensus; refuse a malformed claim before the signature.
+            if claim.validate_shape().is_err() {
+                return Err("L2 withdrawal claim has an invalid shape or release output");
+            }
+            if !HybridVerifier::new().verify_with_key(&claim.funding_pubkey, &claim.intent_root(), &claim.signature) {
+                return Err("invalid L2 withdrawal claim hybrid PQ authorization");
+            }
+            // The attestors sign the root the proof folds to, so their
+            // signatures check here without state; only "is this the
+            // policy's set" waits for consensus.
+            if !claim.verify_attestation(&HybridVerifier::new()) {
+                return Err("invalid L2 withdrawal claim attestation");
+            }
+            Ok(())
+        }
+        PosTransaction::L2Deposit(deposit) => {
+            if !cfg!(feature = "devnet-l2-deposits") {
+                return Err("native L2 deposits are not enabled in this build");
+            }
+            // State checks (inputs, ownership, conservation) run in consensus.
+            if HybridVerifier::new().verify_with_key(&deposit.funding_pubkey, &deposit.intent_root(), &deposit.signature) {
+                Ok(())
+            } else {
+                Err("invalid L2 deposit hybrid PQ authorization")
+            }
+        }
         PosTransaction::FundedDeposit(deposit) => {
             if !bloch_pos_committee::params::funded_validator_admission_active(wall_epoch) {
                 return Err("funded validator admission is not active: FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH is unarmed or not reached");

@@ -715,6 +715,11 @@ fn push_history(
 
 fn kind_of(tx: &PosTransaction) -> TxKind {
     match tx {
+        PosTransaction::L2Settlement(_) => TxKind::L2Settlement,
+        PosTransaction::L2SettlementAsync(_) => TxKind::L2SettlementAsync,
+        PosTransaction::L2Deposit(_) => TxKind::L2Deposit,
+        PosTransaction::L2DataAvailability(_) => TxKind::L2DataAvailability,
+        PosTransaction::L2WithdrawClaim(_) => TxKind::L2WithdrawClaim,
         PosTransaction::Transfer { .. } => TxKind::Transfer,
         PosTransaction::TransferV2 { .. } => TxKind::TransferV2,
         PosTransaction::Deposit { .. } => TxKind::Deposit,

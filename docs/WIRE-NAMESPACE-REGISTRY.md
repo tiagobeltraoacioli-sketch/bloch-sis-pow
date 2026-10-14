@@ -132,11 +132,18 @@ has drifted to ~1008 in the deeper worktrees).
 | `0x0E` | `FundedDelegate` | **Assigned, unarmed candidate** | staking | funded-delegation tests |
 | `0x0F` | `FundedUndelegate` | **Assigned, unarmed candidate** | staking | funded-delegation tests |
 | `0x10` | `FundedDelegationWithdraw` | **Assigned, unarmed candidate** | staking | funded-delegation tests |
-| `0x11`–`0xFF` | free | — | — | — |
+| `0x11` | `ValidatorCommissionUpdate` | **Assigned** (funded-delegation lifecycle) | staking | funded-delegation tests |
+| `0x12` | `L2Settlement` | **Assigned, native L2 (M8 port)** — refused outside an L2 policy | l2 | `wire_tag_registry.rs` |
+| `0x13` | `L2SettlementAsync` | **Assigned, native L2** — refused outside an L2 policy | l2 | `wire_tag_registry.rs` |
+| `0x14` | `L2Deposit` | **Assigned, native L2** — `devnet-l2-deposits` builds only until activation | l2 | `wire_tag_registry.rs` |
+| `0x15` | `L2DataAvailability` | **Assigned, native L2** — `devnet-l2-user-txs` builds only until activation | l2 | `wire_tag_registry.rs` |
+| `0x16` | `L2WithdrawClaim` | **Assigned, native L2** — `devnet-l2-user-txs` builds only until activation | l2 | `wire_tag_registry.rs` |
+| `0x17`–`0xFF` | free | — | — | — |
 
-**Next free transaction tag: `0x11`.** (`0x07`–`0x09` remain reserved and
-contested; `0x0E`–`0x10` are assigned to the unarmed funded-delegation
-lifecycle.)
+**Next free transaction tag: `0x17`.** (`0x07`–`0x09` remain reserved and
+contested; `0x0E`–`0x11` are assigned to the funded-delegation lifecycle;
+`0x12`–`0x16` to the native L2 bridge, renumbered past `0x0E`–`0x11` on
+2026-10-10 because the L2 branch first used them.)
 
 ### CORRECTION, 2026-09-01 — `0x02`/`0x03`/`0x04` are not "rejected"
 
@@ -362,9 +369,11 @@ wrong message; it produces a wrong state root, on every node, permanently.
 | `0x1E` | `TAG_FUNDED_VALIDATOR` | Merged | staking |
 | `0x1F` | `TAG_FUNDED_DELEGATION_OWNER` | **Assigned, unarmed candidate** | staking |
 | `0x20` | `TAG_FUNDED_DELEGATION_LIFECYCLE` | **Assigned, unarmed candidate** | staking |
-| `0x21`+ | free | — | — | — |
+| `0x21` | `TAG_L2_SETTLEMENT` | **Assigned, native L2 (M8 port)** — no leaf without an L2 policy | l2 |
+| `0x22`+ | free | — | — | — |
 
-**Next free state-root tag: `0x21`.**
+**Next free state-root tag: `0x22`.** (The L2 branch first used `0x1F`, which
+collides with `TAG_FUNDED_DELEGATION_OWNER`; the M8 port moved it to `0x21`.)
 
 **C-3 is resolved in code as of 2026-09-01** — see §6 C-3. The two stale
 claimants (`agent-a905f26b0f5a3faaf`, `agent-a14a11d370747fe90`) must not be
@@ -884,3 +893,22 @@ silently.** Claim the abbreviation from the PMO, not just the concept.
 `crates/coherence-core` uses a separate `bloch:coherence:*:v1` domain family
 (noted at `params.rs:705-709`) which is deliberately outside the BLCH4 sweep.
 Distinct namespace; not tracked here.
+
+## Experimental native L2 settlement (2026-10-01)
+
+The isolated native-settlement development assigns transaction `0x12` to the
+fixed 979-byte settlement envelope and state component `0x1F` to its policy and
+cursor (2026-10-10: transaction tags moved from `0x0E`, and async settlement and
+L2 deposit from `0x0F`/`0x10`, to `0x12`/`0x13`/`0x14`, because the mainnet tree
+assigns transactions `0x0E`-`0x11` to funded delegation). OPEN: state component
+`0x1F` also collides with mainnet `TAG_FUNDED_DELEGATION_OWNER` (mainnet uses
+state tags up to `0x20`); it must move (e.g. to `0x21`) in the mainnet port. It
+is not moved here because it changes every genesis state root and invalidates
+the real Groth16 fixtures pinned to the current genesis identity. Both are new per-namespace assignments; tombstones are unchanged.
+M3 (2026-10-10) assigns transaction `0x15` to `L2DataAvailability` (development
+networks, `devnet-l2-user-txs`). `0x15` was checked free on every local branch
+and remote ref (no `*_TAG: u8 = 0x15`..`0x1F` in any transition tree) and on the
+mainnet tree (`MAINNET_TX_TAGS`, highest `0x11`). Its records live inside the
+existing L2 state component; no new state tag is introduced.
+Existing manifests leave the policy absent and the public mempool refuses the
+transaction. See [the protocol and qualification boundary](specs/BLOCH-NATIVE-L2-SETTLEMENT.md).

@@ -287,6 +287,15 @@ const TAG_FUNDED_DELEGATION_OWNER: u8 = 0x1F;
 /// the funded position has not yet begun deactivation.
 const TAG_FUNDED_DELEGATION_LIFECYCLE: u8 = 0x20;
 
+/// Native L2 settlement policy/cursor/inbox/withdrawal component. Absent
+/// (no leaf) on every network without an L2 policy, preserving historical
+/// roots. 0x1F/0x20 belong to funded delegation on Genesis-4.
+const TAG_L2_SETTLEMENT: u8 = 0x21;
+
+pub(crate) fn insert_l2_settlement(tree: &mut Smt, bytes: &[u8]) {
+    tree.insert(derive_key(TAG_L2_SETTLEMENT, &[]), hash_value(bytes));
+}
+
 /// Append-only registry of every component namespace in the live state SMT.
 ///
 /// This is the machine-readable authority for component count, names and tag
@@ -294,7 +303,7 @@ const TAG_FUNDED_DELEGATION_LIFECYCLE: u8 = 0x20;
 /// compatibility DTO, not an exhaustive model of the live tree. New
 /// components must be appended here as well as in the tree fold; the
 /// uniqueness and spec-reconciliation tests consume this registry directly.
-pub const STATE_COMPONENT_TAGS: [(&str, u8); 32] = [
+pub const STATE_COMPONENT_TAGS: [(&str, u8); 33] = [
     ("TAG_EUTXO", TAG_EUTXO),
     ("TAG_VALIDATOR", TAG_VALIDATOR),
     ("TAG_PARTICIPATION_CURRENT", TAG_PARTICIPATION_CURRENT),
@@ -327,6 +336,7 @@ pub const STATE_COMPONENT_TAGS: [(&str, u8); 32] = [
     ("TAG_FUNDED_VALIDATOR", TAG_FUNDED_VALIDATOR),
     ("TAG_FUNDED_DELEGATION_OWNER", TAG_FUNDED_DELEGATION_OWNER),
     ("TAG_FUNDED_DELEGATION_LIFECYCLE", TAG_FUNDED_DELEGATION_LIFECYCLE),
+    ("TAG_L2_SETTLEMENT", TAG_L2_SETTLEMENT),
 ];
 
 

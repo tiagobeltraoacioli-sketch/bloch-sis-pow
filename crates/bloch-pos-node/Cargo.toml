@@ -41,6 +41,10 @@ publish = false
 name = "bloch-pos"
 path = "src/main.rs"
 
+[lib]
+test = false
+doctest = false
+
 [features]
 # Phase timers for the end-to-end replay benchmark (src/replay_bench.rs).
 # OFF by default; with it off every span in engine.rs and in the committee
@@ -48,8 +52,15 @@ path = "src/main.rs"
 # The benchmark runs the SAME code either way — the feature only decides
 # whether the breakdown is available. Never enable it on a producing node.
 perf-timing = ["bloch-pos-committee/perf-timing"]
+# DEVELOPMENT NETWORKS ONLY; see bloch-pos-committee. Refuses non-BPOSMAN3 manifests.
+devnet-randao-recommit = ["bloch-pos-committee/devnet-randao-recommit"]
+# DEVELOPMENT NETWORKS ONLY; see bloch-pos-committee.
+devnet-l2-deposits = ["bloch-pos-committee/devnet-l2-deposits"]
+# DEVELOPMENT NETWORKS ONLY; see bloch-pos-committee (user transactions before DA).
+devnet-l2-user-txs = ["devnet-l2-deposits", "bloch-pos-committee/devnet-l2-user-txs"]
 
 [dependencies]
+bloch-l2-proof = { path = "../bloch-l2-proof" }
 # The frozen consensus math (pure, sha3-only).
 bloch-pos-committee = { path = "../bloch-pos-committee", features = ["local-state-cache"] }
 # The hybrid ML-DSA-65 ‖ Falcon-1024 suite (M2: keys/ + KeyVerifier). Path

@@ -880,6 +880,10 @@ pub enum RpcRequest {
     ChainInfo,
     /// `getbuildinfo` — which binary is answering. Reads no chain state.
     BuildInfo,
+    /// Committed asynchronous settlement source and cursor.
+    L2Settlement,
+    /// Exact public envelope for independent consensus replay.
+    BlockRaw([u8; 32]),
     /// `getblockcount` — the polling method, carrying finality with it.
     BlockCount,
     BlockBySlot(u64),
@@ -1272,6 +1276,8 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
     Ok(match method {
         "getchaininfo" => RpcRequest::ChainInfo,
         "getbuildinfo" => RpcRequest::BuildInfo,
+        "getl2settlement" => RpcRequest::L2Settlement,
+        "getblockraw" => RpcRequest::BlockRaw(want_hex32(params, 0, "block id")?),
         "getblockcount" => RpcRequest::BlockCount,
         "getblockbyslot" => RpcRequest::BlockBySlot(want_u64(params, 0, "slot")?),
         "getblockbyid" => RpcRequest::BlockById(want_hex32(params, 0, "block_id")?),
@@ -2194,6 +2200,11 @@ impl PreparedSubmission {
             // match is exhaustive on purpose, and an operator reading the field
             // post-activation needs the honest name.
             PosTransaction::RandaoRecommit { .. } => "randao_recommit",
+            PosTransaction::L2Settlement(_) => "l2_settlement",
+            PosTransaction::L2SettlementAsync(_) => "l2_settlement_async",
+            PosTransaction::L2Deposit(_) => "l2_deposit",
+            PosTransaction::L2DataAvailability(_) => "l2_data_availability",
+            PosTransaction::L2WithdrawClaim(_) => "l2_withdraw_claim",
         };
         Self {
             kind,
@@ -2813,5 +2824,107 @@ pub fn funded_delegation_json(state: &CommittedState, position: u32) -> Json {
         ("issuance_rewards_sat", Json::sat(state.delegator_issuance_reward_sat(d.delegator))),
         ("slash_losses_sat", Json::sat(state.delegator_slash_loss_sat(d.delegator))),
         ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
+    ])
+}
+
+/// Public, committed source for the bounded asynchronous proof worker.
+pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedState) -> Json {
+    let Some(l2) = state.l2_settlement() else { return Json::Null; };
+    let policy = l2.policy();
+    let source = l2.frozen_source().map_or(Json::Null, |source| Json::obj(vec![
+        ("block", Json::hex(&source.block)), ("slot", Json::u(source.slot)),
+        ("height", Json::u(source.height)), ("commitment", Json::hex(&source.commitment)),
+        ("inbox_root", Json::hex(&source.inbox_root)),
+        ("inbox_count", Json::u(source.inbox_count)),
+        ("consumed_start", Json::u(l2.consumed())),
+        ("consumed_end", Json::u(l2.consumed() + l2.pending_for(&source).len() as u64)),
+        // The exact records the next settlement must mint, in order.
+        ("pending", Json::Arr(l2.pending_for(&source).iter().map(|r| Json::obj(vec![
+            ("height", Json::u(r.height)), ("tx_index", Json::u(u64::from(r.tx_index))),
+            ("txid", Json::hex(&r.txid)), ("vout", Json::u(u64::from(r.vout))),
+            ("sats", Json::u(r.sats)), ("recipient", Json::s(crate::codec::hex(&r.recipient))),
+        ])).collect())),
+        ("request", Json::s(format!("{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            crate::codec::hex32(&policy.identities[0]), crate::codec::hex32(&policy.identities[1]),
+            crate::codec::hex32(&source.block), source.slot, source.height,
+            crate::codec::hex32(&source.commitment), crate::codec::hex32(&source.inbox_root)))),
+    ]));
+    Json::obj(vec![
+        ("asynchronous", Json::Bool(l2.asynchronous())), ("native_height", Json::u(l2.height())),
+        ("network", Json::hex(&policy.identities[0])), ("genesis", Json::hex(&policy.identities[1])),
+        ("chain_id", Json::u(policy.chain_id)), ("source", source),
+        ("inbox", Json::obj(vec![
+            ("count", Json::u(l2.inbox().len() as u64)), ("consumed", Json::u(l2.consumed())),
+            ("escrow_sat", Json::s(l2.escrow_sat().to_string())),
+        ])),
+        // Retained L1 data-availability records (M3), oldest first.
+        ("data_availability", Json::Arr(l2.data_availability().iter().map(|r| Json::obj(vec![
+            ("l2_number", Json::u(r.l2_number)), ("commitment", Json::hex(&r.commitment)),
+            ("height", Json::u(r.height)),
+        ])).collect())),
+        // Withdrawal tree after the accepted head and the retained roots of
+        // settlements that added withdrawals (M4), oldest first.
+        ("withdrawals", {
+            let (root, count) = l2.withdrawal_head();
+            Json::obj(vec![
+                ("root", Json::hex(&root)), ("count", Json::u(count)),
+                // `finalized`: the accepting block is in the FFG-finalized
+                // prefix, which a claim in the next block requires (from
+                // finalized_claims_from_height on).
+                ("roots", Json::Arr(l2.withdrawal_roots().iter().map(|r| Json::obj(vec![
+                    ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
+                    ("count", Json::u(r.count)), ("height", Json::u(r.height)),
+                    ("finalized", Json::Bool(bloch_pos_committee::l2_settlement::withdrawal::record_finalized(
+                        r.height, l2.height(), state.slot(), state.finality().finalized.epoch,
+                    ))),
+                ])).collect())),
+                ("finalized_claims_from_height", Json::u(bloch_pos_committee::l2_settlement::withdrawal::FINALIZED_CLAIMS_FROM_HEIGHT)),
+                // M5 claims: the newest root a claim in the next block may
+                // prove against, and the nullifier set as its frontier
+                // (words below `floor` fully claimed; `words` maps a 256-leaf
+                // word index to its bitmap, bit i of byte j = leaf 256w+8j+i).
+                ("delay_blocks", Json::u(bloch_pos_committee::l2_settlement::withdrawal::WITHDRAW_DELAY_BLOCKS)),
+                ("matured", l2.matured_withdrawals().map_or(Json::Null, |r| Json::obj(vec![
+                    ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
+                    ("count", Json::u(r.count)), ("height", Json::u(r.height)),
+                ]))),
+                ("claimed", Json::obj(vec![
+                    ("count", Json::u(l2.claimed().claims())), ("floor", Json::u(l2.claimed().floor())),
+                    ("words", Json::Arr(l2.claimed().words().map(|(w, bits)| Json::obj(vec![
+                        ("word", Json::u(w)), ("bits", Json::hex(bits)),
+                    ])).collect())),
+                ])),
+                // M6: claims of at least large_claim_sat wait
+                // large_delay_blocks (matured_large is their newest root),
+                // and each window releases at most its cap (only an attested
+                // first claim of a window, or any first claim on a policy
+                // without attestors, may exceed it).
+                ("large_claim_sat", Json::sat(u128::from(bloch_pos_committee::l2_settlement::withdrawal::LARGE_CLAIM_SAT))),
+                ("large_delay_blocks", Json::u(bloch_pos_committee::l2_settlement::withdrawal::LARGE_WITHDRAW_DELAY_BLOCKS)),
+                ("matured_large", l2.matured_large_withdrawals().map_or(Json::Null, |r| Json::obj(vec![
+                    ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
+                    ("count", Json::u(r.count)), ("height", Json::u(r.height)),
+                ]))),
+                ("release_window", {
+                    let w = l2.release_window();
+                    Json::obj(vec![
+                        ("window", Json::u(w.window)),
+                        ("blocks", Json::u(bloch_pos_committee::l2_settlement::withdrawal::RELEASE_WINDOW_BLOCKS)),
+                        ("released_sat", Json::sat(w.released)), ("cap_sat", Json::sat(w.cap)),
+                        ("remaining_sat", Json::sat(w.remaining())),
+                    ])
+                }),
+                // M6: with attestor_set non-null, claims of at least
+                // attested_claim_sat need the attestors' k-of-n signature
+                // (claim version 2).
+                ("attestor_set", if policy.attestor_set == [0; 32] { Json::Null } else { Json::hex(&policy.attestor_set) }),
+                ("attested_claim_sat", Json::sat(u128::from(bloch_pos_committee::l2_settlement::withdrawal::ATTESTED_CLAIM_SAT))),
+                ("released_sat", Json::sat(l2.released_sat())),
+                ("escrow_conserved", Json::Bool(l2.escrow_conserved())),
+            ])
+        }),
+        ("accepted", l2.head().map_or(Json::Null, |(commitment, statement)| Json::obj(vec![
+            ("commitment", Json::hex(&commitment)), ("statement", Json::s(crate::codec::hex(&statement))),
+        ]))),
     ])
 }

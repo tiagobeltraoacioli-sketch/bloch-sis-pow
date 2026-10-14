@@ -133,6 +133,12 @@ pub use funded_delegation::{
     FundedDelegate, FundedDelegationReject, FundedDelegationWithdraw, FundedUndelegate,
     ValidatorCommissionUpdate,
 };
+pub mod l2_deposit;
+pub use l2_deposit::{L2Deposit, L2DepositReject};
+pub mod l2_da;
+pub use l2_da::{L2DataAvailability, L2DataAvailabilityReject};
+pub mod l2_claim;
+pub use l2_claim::{L2WithdrawClaim, L2WithdrawClaimReject};
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
 use crate::schedule;
@@ -292,6 +298,10 @@ pub struct TransferOutput {
 /// not receive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PosTransaction {
+    /// Experimental native settlement (0x12); rejected without a genesis policy.
+    L2Settlement(Box<crate::l2_settlement::Transaction>),
+    /// Manifest-bound asynchronous settlement (0x13).
+    L2SettlementAsync(Box<crate::l2_settlement::Transaction>),
     /// PQ-authorized, UTXO-funded validator registration (wire 0x0B).
     FundedDeposit(FundedDeposit),
     /// PQ-authorized, UTXO-funded delegation to an existing validator (wire
@@ -303,6 +313,14 @@ pub enum PosTransaction {
     FundedDelegationWithdraw(FundedDelegationWithdraw),
     /// Validator-authorized commission update for future delegation (wire 0x11).
     ValidatorCommissionUpdate(ValidatorCommissionUpdate),
+    /// Escrow BLCH into the asynchronous L2 inbox (development networks).
+    L2Deposit(L2Deposit),
+    /// Publish one L2 block's user-transaction batch on L1 (0x15,
+    /// development networks with `devnet-l2-user-txs`).
+    L2DataAvailability(L2DataAvailability),
+    /// Release one settled, matured L2 withdrawal from escrow to its L1
+    /// recipient (0x16, development networks with `devnet-l2-user-txs`).
+    L2WithdrawClaim(L2WithdrawClaim),
     /// A value transfer against the committed eUTXO set, priced by the L1 fee
     /// market: **gas × price**, where the gas is derived (class + size,
     /// `fee_market::intrinsic_gas`) and the price is the base fee this block's
@@ -674,6 +692,9 @@ impl PosTransaction {
             PosTransaction::FundedUndelegate(tx) => return tx.signing_root(),
             PosTransaction::FundedDelegationWithdraw(tx) => return tx.signing_root(),
             PosTransaction::ValidatorCommissionUpdate(tx) => return tx.signing_root(),
+            PosTransaction::L2Deposit(tx) => return tx.intent_root(),
+            PosTransaction::L2DataAvailability(tx) => return tx.intent_root(),
+            PosTransaction::L2WithdrawClaim(tx) => return tx.intent_root(),
             other => h.update(other.canonical_bytes()),
         }
         h.finalize().into()
@@ -837,11 +858,16 @@ impl PosTransaction {
             b.extend_from_slice(bytes);
         };
         match self {
+            PosTransaction::L2Settlement(tx) => return tx.encode(),
+            PosTransaction::L2SettlementAsync(tx) => return tx.encode_async(),
             PosTransaction::FundedDeposit(tx) => return tx.canonical_bytes(),
             PosTransaction::FundedDelegate(tx) => return tx.canonical_bytes(),
             PosTransaction::FundedUndelegate(tx) => return tx.canonical_bytes(),
             PosTransaction::FundedDelegationWithdraw(tx) => return tx.canonical_bytes(),
             PosTransaction::ValidatorCommissionUpdate(tx) => return tx.canonical_bytes(),
+            PosTransaction::L2Deposit(tx) => return tx.canonical_bytes(),
+            PosTransaction::L2DataAvailability(tx) => return tx.canonical_bytes(),
+            PosTransaction::L2WithdrawClaim(tx) => return tx.canonical_bytes(),
             PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
                 // Counts are length prefixes like every other variable-length
@@ -1026,6 +1052,14 @@ impl PosTransaction {
     /// reaches at its decoder; at and above it, the transition judges the
     /// evidence.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, TxDecodeError> {
+        if bytes.first() == Some(&crate::l2_settlement::WIRE_TAG) {
+            return crate::l2_settlement::Transaction::decode(bytes)
+                .map(|tx| Self::L2Settlement(Box::new(tx))).ok_or(TxDecodeError::Truncated);
+        }
+        if bytes.first() == Some(&crate::l2_settlement::ASYNC_WIRE_TAG) {
+            return crate::l2_settlement::Transaction::decode_async(bytes)
+                .map(|tx| Self::L2SettlementAsync(Box::new(tx))).ok_or(TxDecodeError::Truncated);
+        }
         let mut r = TxReader { b: bytes, i: 0 };
         let tag = r.u8()?;
         let tx = match tag {
@@ -1038,6 +1072,9 @@ impl PosTransaction {
                 PosTransaction::FundedDelegationWithdraw(FundedDelegationWithdraw::decode(&mut r)?),
             funded_delegation::VALIDATOR_COMMISSION_UPDATE_TAG =>
                 PosTransaction::ValidatorCommissionUpdate(ValidatorCommissionUpdate::decode(&mut r)?),
+            l2_deposit::L2_DEPOSIT_TAG => PosTransaction::L2Deposit(L2Deposit::decode(&mut r)?),
+            l2_da::L2_DATA_AVAILABILITY_TAG => PosTransaction::L2DataAvailability(L2DataAvailability::decode(&mut r)?),
+            l2_claim::L2_WITHDRAW_CLAIM_TAG => PosTransaction::L2WithdrawClaim(L2WithdrawClaim::decode(&mut r)?),
             0x01 => {
                 // Counts are read from untrusted bytes, so nothing is
                 // preallocated from them: a 4-billion-input header on a 40-byte
@@ -1243,8 +1280,12 @@ impl core::fmt::Display for TxDecodeError {
 /// refuses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxReject {
+    L2Settlement(crate::l2_settlement::Reject),
     FundedDeposit(FundedDepositReject),
     FundedDelegation(FundedDelegationReject),
+    L2Deposit(L2DepositReject),
+    L2DataAvailability(L2DataAvailabilityReject),
+    L2WithdrawClaim(L2WithdrawClaimReject),
     /// A value transfer broke one of the eUTXO rules.
     Transfer(TransferReject),
     /// A deposit, exit or delegation failed its state-dependent rule.
@@ -1763,6 +1804,7 @@ pub struct CommittedState {
     /// The node's execution layer computes it; this transition only commits
     /// it, exactly like the Coherence roots above.
     evm: EvmCommitment,
+    l2_settlement: Option<crate::l2_settlement::State>,
     /// Cumulative issued supply in satoshis — the hard-cap invariant's
     /// counter (2026-08-12), committed under `TAG_ISSUED_SUPPLY`.
     ///
@@ -2332,6 +2374,7 @@ impl CommittedState {
             coherence_accumulator_root,
             coherence_nullifier_root,
             evm,
+            l2_settlement: None,
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
             eutxos: opening_balances.iter().cloned().collect(),
         };
@@ -2423,6 +2466,26 @@ impl CommittedState {
             &self.coherence_nullifier_root,
         )
     }
+
+    /// New-network setup only; existing manifests never call this constructor.
+    pub fn configure_l2_genesis(mut self, policy: crate::l2_settlement::Policy)
+        -> Result<Self, crate::l2_settlement::Reject> {
+        if self.slot != 0 || self.epoch != 0 || self.l2_settlement.is_some()
+            || self.admission_network_domain != Some(policy.identities[0])
+            || self.head.as_bytes() != &policy.identities[1] {
+            return Err(crate::l2_settlement::Reject::Policy);
+        }
+        self.l2_settlement = Some(crate::l2_settlement::State::genesis(policy)?);
+        Ok(self)
+    }
+    /// A separate committed mode: existing genesis constructors keep 0x0E semantics.
+    pub fn configure_l2_genesis_async(self, policy: crate::l2_settlement::Policy)
+        -> Result<Self, crate::l2_settlement::Reject> {
+        let mut state = self.configure_l2_genesis(policy.clone())?;
+        state.l2_settlement = Some(crate::l2_settlement::State::genesis_async(policy)?);
+        Ok(state)
+    }
+    pub fn l2_settlement(&self) -> Option<&crate::l2_settlement::State> { self.l2_settlement.as_ref() }
 
     pub fn head(&self) -> BlockId {
         self.head
@@ -2944,7 +3007,7 @@ impl CommittedState {
         // (It genuinely WAS `&[]` once, under a comment saying the node
         // supplied it, and nothing did: every block from genesis committed an
         // empty balance component. Hence the emphasis.)
-        crate::state_root::state_root_with_eutxo_tree(&ConsensusState {
+        let mut tree = crate::state_root::build_state_tree_with_eutxo_tree(&ConsensusState {
             written_off_sat: self.written_off_sat,
             funded_validators: &self.funded_validators.iter().copied().collect::<Vec<_>>(),
             stake_low_water: &self.stake_low_water.iter().map(|(k,v)| (*k,*v)).collect::<Vec<_>>(),
@@ -2981,7 +3044,11 @@ impl CommittedState {
             coherence_nullifier_root: self.coherence_nullifier_root,
             evm: self.evm,
             issued_sat: self.issued_sat,
-        }, self.eutxos.tree())
+        }, self.eutxos.tree());
+        if let Some(state) = &self.l2_settlement {
+            crate::state_root::insert_l2_settlement(&mut tree, &state.committed_bytes());
+        }
+        tree.root()
     }
 
     // ── Fork-choice accumulation ────────────────────────────────────────────
@@ -3484,6 +3551,17 @@ impl CommittedState {
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, TxReject> {
         match tx {
+            PosTransaction::L2Settlement(settlement) | PosTransaction::L2SettlementAsync(settlement) => {
+                let asynchronous = matches!(tx, PosTransaction::L2SettlementAsync(_));
+                let state = self.l2_settlement.as_mut()
+                    .ok_or(TxReject::L2Settlement(crate::l2_settlement::Reject::NotActive))?;
+                state.apply(settlement, *self.head.as_bytes(), self.slot, asynchronous, verifier).map_err(TxReject::L2Settlement)?;
+                // Protocol-only empty-inbox transaction: no synthetic fee credit.
+                // One verification reserves the complete block gas budget.
+                Ok(fee_market::TxCharge { gas: fee_market::BLOCK_GAS_LIMIT,
+                    tx_bytes: (1 + 32 + settlement.statement.len() + crate::l2_settlement::PROOF_BYTES) as u64,
+                    base_fee_sat: 0, priority_fee_sat: 0 })
+            }
             PosTransaction::Withdraw { validator } => self.apply_withdrawal(*validator, tx),
             PosTransaction::FundedDeposit(deposit) => self
                 .apply_funded_deposit(deposit, total_active_sat, base_fee_millisat_per_gas, verifier)
@@ -3500,6 +3578,15 @@ impl CommittedState {
             PosTransaction::ValidatorCommissionUpdate(update) => self
                 .apply_validator_commission_update(update, verifier)
                 .map_err(TxReject::FundedDelegation),
+            PosTransaction::L2Deposit(deposit) => self
+                .apply_l2_deposit(deposit, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::L2Deposit),
+            PosTransaction::L2DataAvailability(batch) => self
+                .apply_l2_data_availability(batch, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::L2DataAvailability),
+            PosTransaction::L2WithdrawClaim(claim) => self
+                .apply_l2_withdraw_claim(claim, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::L2WithdrawClaim),
             PosTransaction::Transfer { .. } => self
                 .apply_transfer(tx, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::Transfer),
@@ -4928,7 +5015,10 @@ impl CommittedState {
             + self.pending_fee_rewards.values().sum::<u128>()
             + self.delegator_fee_rewards.values().sum::<u128>()
             + self.validator_fee_rewards.values().sum::<u128>()
-            + self.delegator_issuance_rewards.values().sum::<u128>();
+            + self.delegator_issuance_rewards.values().sum::<u128>()
+            // L2 escrow is held BLCH (deposits move value in, claims move it
+            // back out); zero on every network without an L2 policy.
+            + self.l2_settlement.as_ref().map_or(0, |l2| l2.escrow_sat());
         let burned = self.delegator_slash_losses.values().sum::<u128>();
         held.saturating_sub(burned)
     }
@@ -6149,6 +6239,22 @@ impl<V: SignatureVerifier> Transition<V> {
         let mut block_bytes: u64 = 0;
         // Satoshis this block bonds without spending an output. See the
         // conservation check at step 11b.
+        // The parent is already committed. Pin it before transactions, and keep
+        // it across all subsequent blocks until a valid proof consumes it.
+        if let Some(l2) = st.l2_settlement.as_mut() {
+            l2.prepare_source(*pre.head.as_bytes(), pre.slot);
+        }
+        // Bound proof invocations before any transaction proof is executed.
+        if transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_))).count() > 1 {
+            return Err(TransitionError::BlockGasLimitExceeded);
+        }
+        // DA batches per block are capped like blobs: it bounds the retained
+        // DA records (`l2_settlement::da::MAX_RECORDS`) independently of fees.
+        if transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2DataAvailability(_))).count()
+            > crate::l2_settlement::da::MAX_PER_BLOCK
+        {
+            return Err(TransitionError::BlockGasLimitExceeded);
+        }
         let mut unfunded_bonded: u128 = 0;
         // Preflight the transfer budgets before executing any spend or
         // rebuilding any output paths (TX-02). These are the same declared
@@ -6339,6 +6445,9 @@ impl<V: SignatureVerifier> Transition<V> {
             return Err(TransitionError::SupplyNotConserved);
         }
 
+        if let Some(state) = st.l2_settlement.as_mut() {
+            state.advance_height().map_err(|_| TransitionError::StateRootMismatch)?;
+        }
         st.slot = header.slot;
         st.head = BlockId::of(header);
         Ok(st)
@@ -6719,6 +6828,7 @@ mod tx_codec_tests {
 
 #[cfg(test)]
 mod tests {
+    include!("transition/l2_settlement_tests.rs");
     use super::*;
     mod validator_lifecycle {
         use super::*;
@@ -10580,10 +10690,21 @@ mod tests {
     /// Pin the operator-scheduled ADR-041 release boundary. Moving it requires
     /// another coordinated release; implementing a decoder alone is insufficient.
     #[test]
+    #[cfg(not(feature = "devnet-randao-recommit"))]
     fn randao_recommit_gate_matches_the_lifecycle_schedule() {
         assert_eq!(crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH, 2_884);
         assert_eq!(crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH,
             crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH);
+    }
+
+    /// The development build arms only the re-commit gate, from genesis.
+    #[test]
+    #[cfg(feature = "devnet-randao-recommit")]
+    fn devnet_build_arms_only_the_recommit_gate() {
+        assert_eq!(crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH, 0);
+        assert!(CommittedState::randao_recommit_active(0));
+        assert_eq!(crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH, 2_884);
+        assert_eq!(crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH, 2_884);
     }
 
     /// Build the signed re-commit a validator would actually send, under
@@ -10603,6 +10724,7 @@ mod tests {
     /// re-commit for a genuinely exhausted validator is consensus-invalid,
     /// so today's fleet behaviour — chains are terminal — is unchanged.
     #[test]
+    #[cfg(not(feature = "devnet-randao-recommit"))]
     fn below_the_gate_a_perfectly_signed_recommit_is_consensus_invalid() {
         let (_t, g, _chains) = setup(4);
         let mut probe = g.clone();
@@ -14536,6 +14658,14 @@ mod tests {
             | PosTransaction::FundedUndelegate(_)
             | PosTransaction::FundedDelegationWithdraw(_)
             | PosTransaction::ValidatorCommissionUpdate(_) => {}
+            // Escrow removes spendable value; nothing is issued.
+            PosTransaction::L2Deposit(_) => {}
+            // A DA batch only pays fees from its inputs; nothing is issued.
+            PosTransaction::L2DataAvailability(_) => {}
+            // A claim moves escrowed value (counted in the accounted
+            // supply) to an output; its fee comes from the relayer's inputs.
+            PosTransaction::L2WithdrawClaim(_) => {}
+            PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => {} // Cursor only; no balances.
         }
 
         // Monotone under blocks and boundaries, and never above the cap.
@@ -16887,6 +17017,7 @@ mod epoch_advance_bound {
         // And it must still be a bound: anything near u64::MAX is not one.
         assert!(MAX_EPOCH_ADVANCE < 1 << 20, "a ceiling that large is not a ceiling");
     }
+
 }
 
 #[cfg(feature = "local-state-cache")]

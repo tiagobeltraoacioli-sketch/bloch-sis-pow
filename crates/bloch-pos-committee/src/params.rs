@@ -1611,7 +1611,16 @@ pub const MAX_TRANSFER_OUTPUTS: usize = 256;
 /// epoch. Every validator must upgrade before the boundary and before its
 /// existing RANDAO chain exhausts. The node automatically submits a valid
 /// recommit after exhaustion; this does not reset the old reveal history.
+#[cfg(not(feature = "devnet-randao-recommit"))]
 pub const RANDAO_RECOMMIT_ACTIVATION_EPOCH: u64 = 2_884;
+/// Development networks only (`devnet-randao-recommit`): re-commits apply from
+/// genesis so a short-slot, small validator set renews exhausted chains instead
+/// of halting once every chain is spent (observed 2026-10-03 at height
+/// 3 x 8,192 on the BPOSMAN3 development network). Every other lifecycle gate
+/// keeps its scheduled epoch. The node refuses non-BPOSMAN3 manifests in this
+/// build, and `getbuildinfo` reports the feature.
+#[cfg(feature = "devnet-randao-recommit")]
+pub const RANDAO_RECOMMIT_ACTIVATION_EPOCH: u64 = 0;
 
 /// Flag day for the **declared-size ceiling** on transfers (audit H-R7-2,
 /// 2026-09-05): at and above this epoch, a `Transfer`/`TransferV2` whose
@@ -2405,6 +2414,7 @@ const _: () = {
     assert!(FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH == EXIT_AUTH_ACTIVATION_EPOCH);
     assert!(EXIT_AUTH_ACTIVATION_EPOCH == WITHDRAWAL_ACTIVATION_EPOCH);
     assert!(WITHDRAWAL_ACTIVATION_EPOCH == SLASHING_EVIDENCE_ACTIVATION_EPOCH);
+    #[cfg(not(feature = "devnet-randao-recommit"))]
     assert!(SLASHING_EVIDENCE_ACTIVATION_EPOCH == RANDAO_RECOMMIT_ACTIVATION_EPOCH);
     assert!(DEPOSIT_ACTIVATION_EPOCH == u64::MAX);
     assert!(gate_is_inert_or_not_before(

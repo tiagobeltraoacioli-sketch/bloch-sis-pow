@@ -197,6 +197,10 @@ fn spawn_node(
 }
 
 #[test]
+#[cfg_attr(
+    any(feature = "devnet-randao-recommit", feature = "devnet-l2-deposits"),
+    ignore = "uses a BPOSMAN1 genesis, which development-feature builds refuse by design"
+)]
 fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
     let root = tmp_root();
     let genesis = root.join("genesis.bin");
