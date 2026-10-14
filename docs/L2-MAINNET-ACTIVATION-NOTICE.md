@@ -7,8 +7,7 @@
 > are committed (`mainnet::PROGRAM`), the archival replay of mainnet history
 > is PASS, and `scripts/l2-activation/final-qualification.sh` is PASS on the
 > final commit. The notice must go out **at least 14 days before epoch E**.
-> A Portuguese version is in `L2-MAINNET-ACTIVATION-NOTICE.pt-BR.md`; keep
-> both in sync.
+> Public communication is in English only.
 
 | | |
 | --- | --- |

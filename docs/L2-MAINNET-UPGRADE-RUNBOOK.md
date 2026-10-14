@@ -1,7 +1,6 @@
 # Operator runbook — upgrade for the native L2 activation (epoch E)
 
-Companion to the public notice (`docs/L2-MAINNET-ACTIVATION-NOTICE.md`,
-Portuguese `…NOTICE.pt-BR.md`). Placeholders `{{…}}` are filled when the
+Companion to the public notice (`docs/L2-MAINNET-ACTIVATION-NOTICE.md`). Placeholders `{{…}}` are filled when the
 notice is published. Applies to **validators, archivals / RPC nodes and
 bootnodes**; exchange nodes follow the archival path.
 
