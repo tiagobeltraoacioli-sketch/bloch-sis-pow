@@ -58,6 +58,8 @@ devnet-randao-recommit = ["bloch-pos-committee/devnet-randao-recommit"]
 devnet-l2-deposits = ["bloch-pos-committee/devnet-l2-deposits"]
 # DEVELOPMENT NETWORKS ONLY; see bloch-pos-committee (user transactions before DA).
 devnet-l2-user-txs = ["devnet-l2-deposits", "bloch-pos-committee/devnet-l2-user-txs"]
+# QUALIFICATION BUILDS ONLY; see bloch-pos-committee. Refuses funded manifests.
+l2-activation-rehearsal = ["bloch-pos-committee/l2-activation-rehearsal"]
 
 [dependencies]
 bloch-l2-proof = { path = "../bloch-l2-proof" }

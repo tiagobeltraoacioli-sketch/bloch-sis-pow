@@ -6,7 +6,15 @@
 //! and keeps recent roots for the L1 claim (M5), which releases escrow to
 //! the L1 recipient once the root is [`withdrawal::WITHDRAW_DELAY_BLOCKS`]
 //! old (longer for large claims), at most once per leaf and within a
-//! per-window release cap (M6). No production activation.
+//! per-window release cap (M6).
+//!
+//! What an installed L2 admits is its [`Profile`], fixed when it is installed:
+//! an L2 from a development genesis manifest follows the build's devnet
+//! features (`devnet-l2-deposits`, `devnet-l2-user-txs`) and the development
+//! limits ([`withdrawal::Limits::DEVELOPMENT`]); an L2 installed by the
+//! running-network flag day ([`activation_policy`], M9) admits deposits, data
+//! availability, user transactions and claims on every build, with the
+//! limits pinned in the activation. No production activation is armed.
 use sha3::{Digest, Keccak256, Sha3_256};
 
 /// Native wire tags. Moved on 2026-10-10 from 0x0E/0x0F to the first bytes
@@ -154,7 +162,7 @@ pub mod da {
     /// Why the L2 state refused to record a DA batch.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Refusal {
-        /// No L2 policy, or a build without `devnet-l2-user-txs`.
+        /// No L2, or an L2 whose profile does not admit user transactions.
         NotActive,
         /// The batch names another L2 chain.
         Chain,
@@ -199,6 +207,81 @@ pub mod withdrawal {
     /// adds a record, plus the retained older one and the block being applied.
     /// Each record commits 56 bytes, so this section stays below 58 KiB.
     pub const MAX_RECORDS: usize = RETENTION_BLOCKS as usize + 2;
+
+    /// The withdrawal limits of one installed L2 (M5/M6), fixed when it is
+    /// installed and never changed. [`Limits::DEVELOPMENT`] are the constants
+    /// below, used by every L2 from a development genesis manifest (devnet4
+    /// replays unchanged); a running-network activation pins its own.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Limits {
+        /// See [`WITHDRAW_DELAY_BLOCKS`].
+        pub delay_blocks: u64,
+        /// See [`LARGE_CLAIM_SAT`]; also the attestation threshold
+        /// ([`ATTESTED_CLAIM_SAT`]): one notion of "large".
+        pub large_claim_sat: u64,
+        /// See [`LARGE_WITHDRAW_DELAY_BLOCKS`].
+        pub large_delay_blocks: u64,
+        /// See [`RETENTION_BLOCKS`]; at least `large_delay_blocks`.
+        pub retention_blocks: u64,
+        /// See [`RELEASE_WINDOW_BLOCKS`].
+        pub release_window_blocks: u64,
+        /// See [`RELEASE_WINDOW_BPS`] (1..=10 000).
+        pub release_window_bps: u64,
+        /// See [`RELEASE_FLOOR_SAT`].
+        pub release_floor_sat: u64,
+    }
+    /// Upper bound on a pinned retention: one week of 30 s slots. It bounds
+    /// the committed withdrawal section (56 bytes per record, < 1.1 MiB).
+    pub const MAX_RETENTION_BLOCKS: u64 = 20_160;
+    impl Limits {
+        pub const DEVELOPMENT: Limits = Limits {
+            delay_blocks: WITHDRAW_DELAY_BLOCKS,
+            large_claim_sat: LARGE_CLAIM_SAT,
+            large_delay_blocks: LARGE_WITHDRAW_DELAY_BLOCKS,
+            retention_blocks: RETENTION_BLOCKS,
+            release_window_blocks: RELEASE_WINDOW_BLOCKS,
+            release_window_bps: RELEASE_WINDOW_BPS as u64,
+            release_floor_sat: RELEASE_FLOOR_SAT as u64,
+        };
+        /// The same invariants the development constants assert at compile
+        /// time, plus bounds that keep the committed state small.
+        pub const fn valid(&self) -> bool {
+            self.delay_blocks >= 1
+                && self.delay_blocks <= self.large_delay_blocks
+                && self.large_delay_blocks <= self.retention_blocks
+                && self.retention_blocks <= MAX_RETENTION_BLOCKS
+                && self.large_claim_sat > 0
+                && self.release_window_blocks >= 1
+                && self.release_window_bps >= 1
+                && self.release_window_bps <= 10_000
+                && self.release_floor_sat > 0
+        }
+        /// The delay a claim of `sats` must wait after the record it proves against.
+        pub const fn delay_for(&self, sats: u64) -> u64 {
+            if sats >= self.large_claim_sat {
+                self.large_delay_blocks
+            } else {
+                self.delay_blocks
+            }
+        }
+        /// Upper bound on stored records (see [`MAX_RECORDS`]).
+        pub const fn max_records(&self) -> usize {
+            self.retention_blocks as usize + 2
+        }
+        pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+            for v in [
+                self.delay_blocks,
+                self.large_claim_sat,
+                self.large_delay_blocks,
+                self.retention_blocks,
+                self.release_window_blocks,
+                self.release_window_bps,
+                self.release_floor_sat,
+            ] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
 
     pub fn leaf(chain_id: u64, nonce: u64, l1_recipient: &[u8; 32], sats: u64) -> [u8; 32] {
         let mut h = Keccak256::new();
@@ -349,13 +432,11 @@ pub mod withdrawal {
         LARGE_WITHDRAW_DELAY_BLOCKS >= WITHDRAW_DELAY_BLOCKS && LARGE_WITHDRAW_DELAY_BLOCKS <= RETENTION_BLOCKS
     );
     /// The delay a claim of `sats` must wait after the record it proves against.
+    /// [`Limits::delay_for`] of the development limits.
     pub fn delay_for(sats: u64) -> u64 {
-        if sats >= LARGE_CLAIM_SAT {
-            LARGE_WITHDRAW_DELAY_BLOCKS
-        } else {
-            WITHDRAW_DELAY_BLOCKS
-        }
+        Limits::DEVELOPMENT.delay_for(sats)
     }
+    const _: () = assert!(Limits::DEVELOPMENT.valid());
     // ── Ethereum-rollup withdrawals: claims only against finalized settlements ──
     //
     // A claim may prove only against a withdrawal record whose accepting
@@ -479,13 +560,13 @@ pub mod withdrawal {
         /// The window state a claim of `sats` in native block `at_height`
         /// sees, given the current escrow: rolled to a fresh window when the
         /// stored one is older.
-        pub fn at(self, at_height: u64, escrow_sat: u128) -> Self {
-            let window = at_height / RELEASE_WINDOW_BLOCKS;
+        pub fn at(self, limits: &Limits, at_height: u64, escrow_sat: u128) -> Self {
+            let window = at_height / limits.release_window_blocks;
             if window == self.window && self.released != 0 {
                 return self;
             }
-            let share = escrow_sat.saturating_mul(RELEASE_WINDOW_BPS) / 10_000;
-            Self { window, released: 0, cap: share.max(RELEASE_FLOOR_SAT) }
+            let share = escrow_sat.saturating_mul(u128::from(limits.release_window_bps)) / 10_000;
+            Self { window, released: 0, cap: share.max(u128::from(limits.release_floor_sat)) }
         }
         /// Whether `sats` more fits. An `exempt` claim (see
         /// [`RELEASE_WINDOW_BPS`]) may exceed the cap as the window's first.
@@ -515,7 +596,7 @@ pub mod withdrawal {
     /// Why a withdrawal claim is refused by the L2 state.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum ClaimRefusal {
-        /// No L2 policy, or a build without `devnet-l2-user-txs`.
+        /// No L2, or an L2 whose profile does not admit user transactions.
         NotActive,
         /// The claim names another L2 chain.
         Chain,
@@ -539,6 +620,7 @@ pub mod withdrawal {
     /// matured for a claim in native block `at_height`, and the index lies in
     /// that tree. Pure: shared by the transition, the mempool and tooling.
     pub fn matured_proof<'a>(
+        limits: &Limits,
         records: &'a [Record],
         at_height: u64,
         chain_id: u64,
@@ -552,7 +634,7 @@ pub mod withdrawal {
         // Roots are unique among records (each adds leaves to an
         // append-only tree); take the newest match regardless.
         let record = records.iter().rev().find(|r| r.root == root).ok_or(ClaimRefusal::Proof)?;
-        if record.height.saturating_add(delay_for(sats)) > at_height {
+        if record.height.saturating_add(limits.delay_for(sats)) > at_height {
             return Err(ClaimRefusal::NotMatured);
         }
         if index >= record.count {
@@ -563,8 +645,8 @@ pub mod withdrawal {
 
     /// The newest record matured for a claim of `sats` in native block
     /// `at_height`.
-    pub fn matured(records: &[Record], at_height: u64, sats: u64) -> Option<&Record> {
-        records.iter().rev().find(|r| r.height.saturating_add(delay_for(sats)) <= at_height)
+    pub fn matured<'a>(limits: &Limits, records: &'a [Record], at_height: u64, sats: u64) -> Option<&'a Record> {
+        records.iter().rev().find(|r| r.height.saturating_add(limits.delay_for(sats)) <= at_height)
     }
 
     /// Claimed leaf indices of the policy's chain, one bit per index in
@@ -811,13 +893,38 @@ fn n(bytes: &[u8], offset: usize) -> u64 {
     u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
-/// The L2 policy a running network installs when
-/// [`crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH`] binds, and whether its
-/// settlement is asynchronous (wire tag [`ASYNC_WIRE_TAG`]). `None` until the
-/// mainnet policy is decided: the proof program keys, the L2 genesis, the
-/// chain id and the attestor set. An armed epoch without a policy is refused
-/// by `armed_l2_gate_has_a_policy`.
-pub fn activation_policy() -> Option<(Policy, bool)> {
+/// What a running network installs at the L2 flag day
+/// ([`crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH`]): the policy, whether
+/// settlement is asynchronous (wire tag [`ASYNC_WIRE_TAG`]; deposits and
+/// claims need it) and the withdrawal limits. The installed L2 has the
+/// [`Profile::activated`] profile on every build: deposits, data
+/// availability, user transactions and claims do not depend on cargo
+/// features.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Activation {
+    pub policy: Policy,
+    pub asynchronous: bool,
+    pub limits: withdrawal::Limits,
+}
+impl Activation {
+    /// An armed epoch must come with an activation that passes this
+    /// (`armed_l2_gate_has_a_policy`).
+    pub fn valid(&self) -> bool {
+        self.policy.valid() && self.limits.valid()
+    }
+}
+
+/// EVM chain id of the MAINNET L2, decided 2026-10-14 (free on
+/// chainid.network; development networks keep 700771). The pinned
+/// activation must use it (`armed_l2_gate_has_a_policy`). Recording the value
+/// arms nothing.
+pub const MAINNET_CHAIN_ID: u64 = 700_770;
+
+/// The activation pinned for the running network. `None` until the mainnet
+/// policy is decided: the proof program keys, the L2 genesis, the chain id,
+/// the attestor set, sync or async, and the limits. An armed epoch without
+/// one is refused by `armed_l2_gate_has_a_policy`.
+pub fn activation_policy() -> Option<Activation> {
     #[cfg(test)]
     if let Some(p) = activation_rehearsal::policy() {
         return Some(p);
@@ -825,16 +932,108 @@ pub fn activation_policy() -> Option<(Policy, bool)> {
     None
 }
 
+/// The activation a network bound to `network` (its admission domain)
+/// installs at the flag day: the pinned [`activation_policy`] when it names
+/// that network. A qualification build (`l2-activation-rehearsal`) instead
+/// installs [`rehearsal_activation`] on whatever development network it runs.
+pub fn activation_for(network: Option<[u8; 32]>) -> Option<Activation> {
+    let network = network?;
+    #[cfg(feature = "l2-activation-rehearsal")]
+    {
+        Some(rehearsal_activation(network))
+    }
+    #[cfg(not(feature = "l2-activation-rehearsal"))]
+    {
+        activation_policy().filter(|a| a.policy.identities[0] == network)
+    }
+}
+
+/// Mixed-fleet rehearsal policy: bound to the running development network,
+/// asynchronous, development limits, placeholder program identity (no proof
+/// is ever produced for it; the rehearsal qualifies the boundary, not the L2).
+#[cfg(feature = "l2-activation-rehearsal")]
+pub fn rehearsal_activation(network: [u8; 32]) -> Activation {
+    let id = |label: &[u8]| hash(&[b"BLOCH:L2:REHEARSAL:1", label, &network]);
+    Activation {
+        policy: Policy {
+            identities: [network, id(b"genesis"), id(b"domain"), id(b"config"), id(b"elf"), id(b"koalabear"), id(b"bn254")],
+            proof_policy: id(b"proof-policy"),
+            chain_id: 700_999,
+            initial_l2_parent: id(b"parent"),
+            initial_l2_state: id(b"state"),
+            attestor_set: [0; 32],
+        },
+        asynchronous: true,
+        limits: withdrawal::Limits::DEVELOPMENT,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod activation_rehearsal {
-    use super::Policy;
+    use super::Activation;
     use std::cell::RefCell;
-    thread_local! { static POLICY: RefCell<Option<(Policy, bool)>> = const { RefCell::new(None) }; }
-    pub fn policy() -> Option<(Policy, bool)> { POLICY.with(|p| p.borrow().clone()) }
-    pub fn set(policy: Policy, asynchronous: bool) -> impl Drop {
-        struct Restore(Option<(Policy, bool)>);
+    thread_local! { static POLICY: RefCell<Option<Activation>> = const { RefCell::new(None) }; }
+    pub fn policy() -> Option<Activation> { POLICY.with(|p| p.borrow().clone()) }
+    pub fn set(activation: Activation) -> impl Drop {
+        struct Restore(Option<Activation>);
         impl Drop for Restore { fn drop(&mut self) { POLICY.with(|p| *p.borrow_mut() = self.0.take()); } }
-        Restore(POLICY.with(|p| p.borrow_mut().replace((policy, asynchronous))))
+        Restore(POLICY.with(|p| p.borrow_mut().replace(activation)))
+    }
+}
+
+/// What an installed L2 admits beyond empty settlements. Fixed when the L2
+/// is installed; consensus reads it from the state, never from the build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Profile {
+    /// Native deposits into the inbox (0x14), and V2 bodies bound to the
+    /// consumed inbox records.
+    pub deposits: bool,
+    /// V3 settlements with user transactions, L1 data availability (0x15)
+    /// and withdrawal claims (0x16).
+    pub user_transactions: bool,
+    /// Claims in native L2 blocks at or above this height must prove
+    /// against a finalized settlement (see
+    /// [`withdrawal::FINALIZED_CLAIMS_FROM_HEIGHT`]).
+    pub finalized_claims_from_height: u64,
+    pub limits: withdrawal::Limits,
+    /// Installed by the running-network flag day. Its profile is committed
+    /// in the state; a development profile is not (its bytes are unchanged).
+    activated: bool,
+}
+impl Profile {
+    /// The profile of an L2 from a development genesis manifest: the build's
+    /// devnet features, the development limits.
+    pub const fn development() -> Self {
+        Self {
+            deposits: cfg!(feature = "devnet-l2-deposits"),
+            user_transactions: USER_TRANSACTIONS_ENABLED,
+            finalized_claims_from_height: withdrawal::FINALIZED_CLAIMS_FROM_HEIGHT,
+            limits: withdrawal::Limits::DEVELOPMENT,
+            activated: false,
+        }
+    }
+    /// The profile of an L2 installed by the running-network flag day:
+    /// everything admitted, claims against finalized settlements from the
+    /// first block, the pinned limits.
+    pub const fn activated(limits: withdrawal::Limits) -> Self {
+        Self {
+            deposits: true,
+            user_transactions: true,
+            finalized_claims_from_height: 0,
+            limits,
+            activated: true,
+        }
+    }
+    pub fn is_activated(&self) -> bool {
+        self.activated
+    }
+    fn encode(&self, out: &mut Vec<u8>) {
+        if self.activated {
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:ACTIVATED-PROFILE:1");
+            out.push(u8::from(self.deposits) | u8::from(self.user_transactions) << 1);
+            out.extend_from_slice(&self.finalized_claims_from_height.to_le_bytes());
+            self.limits.encode(out);
+        }
     }
 }
 
@@ -913,6 +1112,8 @@ pub struct State {
     released_sat: u128,
     /// Release accounting of the newest window with a claim (M6).
     release_window: withdrawal::ReleaseWindow,
+    /// What this L2 admits and its limits, fixed at installation.
+    profile: Profile,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -931,11 +1132,9 @@ pub enum Reject {
     /// The V3 withdrawal count decreased, or the withdrawal root changed
     /// without new withdrawals (or did not change with new ones).
     Withdrawals,
-    /// A V3 statement with `user_tx_count > 0` on a build without the
-    /// `devnet-l2-user-txs` feature. User transactions stay disabled outside
-    /// development networks until data availability (M3) exists: the native
-    /// chain stores only hashes, so a settled user transaction could not be
-    /// reconstructed from L1.
+    /// A V3 statement with `user_tx_count > 0` on an L2 whose [`Profile`]
+    /// does not admit user transactions (a development genesis on a build
+    /// without `devnet-l2-user-txs`).
     UserTransactions,
     /// A V3 statement with user transactions whose `da_commitment` matches no
     /// L1 data-availability record (same L2 block number) included in a
@@ -943,8 +1142,10 @@ pub enum Reject {
     DataUnavailable,
 }
 
-/// Whether this build admits V3 settlements that executed user transactions.
-/// Only development networks enable it (feature `devnet-l2-user-txs`).
+/// Whether an L2 from a development genesis manifest admits user
+/// transactions, data availability and claims on this build (feature
+/// `devnet-l2-user-txs`; see [`Profile::development`]). An L2 installed by
+/// the running-network flag day admits them regardless ([`Profile::activated`]).
 pub const USER_TRANSACTIONS_ENABLED: bool = cfg!(feature = "devnet-l2-user-txs");
 impl State {
     pub fn genesis(policy: Policy) -> Result<Self, Reject> {
@@ -966,6 +1167,7 @@ impl State {
             claimed: withdrawal::ClaimBitmap::default(),
             released_sat: 0,
             release_window: withdrawal::ReleaseWindow::default(),
+            profile: Profile::development(),
         })
     }
     pub(crate) fn genesis_async(policy: Policy) -> Result<Self, Reject> {
@@ -973,7 +1175,24 @@ impl State {
         state.asynchronous = true;
         Ok(state)
     }
+    /// The L2 a running network installs at the flag day (M8 part 2 / M9).
+    pub fn activated(activation: Activation) -> Result<Self, Reject> {
+        if !activation.valid() {
+            return Err(Reject::Policy);
+        }
+        let mut state = Self::genesis(activation.policy)?;
+        state.asynchronous = activation.asynchronous;
+        state.profile = Profile::activated(activation.limits);
+        Ok(state)
+    }
     pub fn asynchronous(&self) -> bool { self.asynchronous }
+    pub fn profile(&self) -> &Profile { &self.profile }
+    pub fn limits(&self) -> &withdrawal::Limits { &self.profile.limits }
+    /// Native deposits (0x14) are admitted: the profile allows them and the
+    /// settlement is asynchronous (the inbox is frozen at the anchor).
+    pub fn deposits_enabled(&self) -> bool { self.profile.deposits && self.asynchronous }
+    /// User-transaction settlements, data availability and claims.
+    pub fn user_transactions(&self) -> bool { self.profile.user_transactions }
     /// A source is pinned by a committed transition, never by a proof caller.
     pub fn frozen_source(&self) -> Option<Source> {
         self.source_anchor
@@ -1025,20 +1244,21 @@ impl State {
     /// The newest retained withdrawal record a claim in the next native
     /// block may prove against (M5), `None` before any is old enough.
     pub fn matured_withdrawals(&self) -> Option<withdrawal::Record> {
-        withdrawal::matured(&self.withdrawals, self.native_height.saturating_add(1), 0).copied()
+        withdrawal::matured(&self.profile.limits, &self.withdrawals, self.native_height.saturating_add(1), 0).copied()
     }
-    /// The same for a claim of at least [`withdrawal::LARGE_CLAIM_SAT`].
+    /// The same for a large claim (at least the profile's `large_claim_sat`).
     pub fn matured_large_withdrawals(&self) -> Option<withdrawal::Record> {
-        withdrawal::matured(&self.withdrawals, self.native_height.saturating_add(1), withdrawal::LARGE_CLAIM_SAT)
+        let limits = &self.profile.limits;
+        withdrawal::matured(limits, &self.withdrawals, self.native_height.saturating_add(1), limits.large_claim_sat)
             .copied()
     }
     /// Whether a claim of `sats` must carry the attestors' co-signature.
     pub fn attestation_required(&self, sats: u64) -> bool {
-        self.policy.attestor_set != [0; 32] && sats >= withdrawal::ATTESTED_CLAIM_SAT
+        self.policy.attestor_set != [0; 32] && sats >= self.profile.limits.large_claim_sat
     }
     /// The release window a claim in the next native block sees.
     pub fn release_window(&self) -> withdrawal::ReleaseWindow {
-        self.release_window.at(self.native_height.saturating_add(1), self.escrow_sat)
+        self.release_window.at(&self.profile.limits, self.native_height.saturating_add(1), self.escrow_sat)
     }
     /// Leaves `0..matured_count` are claimable in the next native block.
     pub fn matured_count(&self) -> u64 {
@@ -1078,14 +1298,14 @@ impl State {
         attested: bool,
     ) -> Result<withdrawal::Record, withdrawal::ClaimRefusal> {
         use withdrawal::ClaimRefusal as R;
-        if !USER_TRANSACTIONS_ENABLED || !self.asynchronous {
+        if !self.profile.user_transactions || !self.asynchronous {
             return Err(R::NotActive);
         }
         if chain_id != self.policy.chain_id {
             return Err(R::Chain);
         }
         let at = self.native_height.checked_add(1).ok_or(R::NotActive)?;
-        let record = *withdrawal::matured_proof(&self.withdrawals, at, chain_id, index, l1_recipient, sats, siblings)?;
+        let record = *withdrawal::matured_proof(&self.profile.limits, &self.withdrawals, at, chain_id, index, l1_recipient, sats, siblings)?;
         if self.claimed.contains(index) {
             return Err(R::Claimed);
         }
@@ -1139,7 +1359,7 @@ impl State {
         commitment: [u8; 32],
     ) -> Result<(), da::Refusal> {
         use da::Refusal as R;
-        if !USER_TRANSACTIONS_ENABLED {
+        if !self.profile.user_transactions {
             return Err(R::NotActive);
         }
         if chain_id != self.policy.chain_id {
@@ -1218,7 +1438,8 @@ impl State {
         self.da.retain(|r| r.height.saturating_add(da::RETENTION_BLOCKS) > height);
         // Withdrawal roots: keep every record younger than the retention
         // window and the newest older one (records are in height order).
-        let old = self.withdrawals.iter().take_while(|r| r.height.saturating_add(withdrawal::RETENTION_BLOCKS) <= height).count();
+        let retention = self.profile.limits.retention_blocks;
+        let old = self.withdrawals.iter().take_while(|r| r.height.saturating_add(retention) <= height).count();
         if old > 1 {
             self.withdrawals.drain(..old - 1);
         }
@@ -1231,6 +1452,8 @@ impl State {
             b"BLOCH:NATIVE:L2:STATE:1".to_vec()
         };
         self.policy.encode(&mut out);
+        // Absent for development profiles, so their states keep their bytes.
+        self.profile.encode(&mut out);
         out.extend_from_slice(&self.native_height.to_le_bytes());
         if self.asynchronous {
             match self.source_anchor {
@@ -1371,7 +1594,7 @@ impl State {
         match version {
             // V2 history: the body must be exactly the deposits, no user txs.
             StatementVersion::V2 => {
-                if cfg!(feature = "devnet-l2-deposits") && h(s, S + 536) != expected_body_commitment(consumed) {
+                if self.profile.deposits && h(s, S + 536) != expected_body_commitment(consumed) {
                     return Err(Reject::Deposits);
                 }
             }
@@ -1379,7 +1602,7 @@ impl State {
             // exactly the consumed inbox records, in order.
             StatementVersion::V3 => {
                 let users = n(s, S + v3::USER_TX_COUNT);
-                if users != 0 && !USER_TRANSACTIONS_ENABLED {
+                if users != 0 && !self.profile.user_transactions {
                     return Err(Reject::UserTransactions);
                 }
                 if h(s, S + v3::DEPOSITS_HASH) != deposits_hash(consumed) {
@@ -1425,7 +1648,7 @@ impl State {
             return Err(Reject::Proof);
         }
         if let Some(record) = new_withdrawals {
-            if self.withdrawals.len() >= withdrawal::MAX_RECORDS {
+            if self.withdrawals.len() >= self.profile.limits.max_records() {
                 return Err(Reject::Limit);
             }
             self.withdrawals.push(record);

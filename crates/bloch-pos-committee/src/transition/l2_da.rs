@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! L2 data availability (development networks, `devnet-l2-user-txs`). Wire tag
+//! L2 data availability (M3; admitted when the installed L2's profile admits
+//! user transactions: development genesis with `devnet-l2-user-txs`, or the
+//! running-network activation). Wire tag
 //! 0x15, the first byte after the L2 settlement/deposit tags; no mainnet tree
 //! assigns it (see `tests/wire_tag_registry.rs`).
 //!
@@ -217,7 +219,7 @@ impl CommittedState {
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, L2DataAvailabilityReject> {
         use L2DataAvailabilityReject as R;
-        if !crate::l2_settlement::USER_TRANSACTIONS_ENABLED || self.l2_settlement.is_none() {
+        if !self.l2_settlement.as_ref().is_some_and(|l2| l2.user_transactions()) {
             return Err(R::NotActive);
         }
         tx.validate_shape()?;

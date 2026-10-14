@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Native L2 deposit (development networks, `devnet-l2-deposits`). Wire tag 0x14
+//! Native L2 deposit (admitted when the installed L2's profile admits
+//! deposits: development genesis with `devnet-l2-deposits`, or the
+//! running-network activation). Wire tag 0x14
 //! (moved from 0x10, which mainnet assigns to `FundedDelegationWithdraw`).
 //!
 //! One hybrid PQ funding key spends UTXOs it owns and escrows `amount_sat` for
@@ -160,10 +162,6 @@ impl L2Deposit {
     }
 }
 
-pub(crate) fn l2_deposits_active() -> bool {
-    cfg!(feature = "devnet-l2-deposits")
-}
-
 impl CommittedState {
     pub(super) fn apply_l2_deposit(
         &mut self,
@@ -172,7 +170,9 @@ impl CommittedState {
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, L2DepositReject> {
         use L2DepositReject as R;
-        if !l2_deposits_active() || !self.l2_settlement.as_ref().is_some_and(|s| s.asynchronous()) {
+        // The installed L2's profile decides (development genesis: the
+        // build's devnet feature; running-network activation: always).
+        if !self.l2_settlement.as_ref().is_some_and(|s| s.deposits_enabled()) {
             return Err(R::NotActive);
         }
         tx.validate_shape()?;

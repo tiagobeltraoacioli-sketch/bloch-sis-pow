@@ -35,8 +35,8 @@ sign --genesis TRUSTED_FILE --tx FILE --dir KEYSTORE_DIR --out NEW_FILE
 The payload is the canonical batch (bloch-l2-produce-dev da). The whole input
 value minus the fee returns as change to the funding key. Consensus requires
 exact conservation at the including block's base fee (getchaininfo
-next_base_fee_millisat_per_gas). Development networks only: a build without
-devnet-l2-user-txs refuses the transaction.";
+next_base_fee_millisat_per_gas). The network's L2 must admit it (getl2settlement profile): a development
+genesis on a devnet-l2-user-txs build, or a network past its L2 flag day.";
 
 fn read_payload(path: &str) -> Result<Vec<u8>, String> {
     let limit = 2 * da::MAX_PAYLOAD_BYTES + 16;

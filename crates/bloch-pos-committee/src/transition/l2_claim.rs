@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! L2 → L1 withdrawal claim (milestone M5; development networks with
-//! `devnet-l2-user-txs`). Wire tag 0x16, the first byte after the L2 data
+//! L2 → L1 withdrawal claim (milestone M5). Admitted when the installed L2's
+//! profile admits user transactions: a development genesis on a
+//! `devnet-l2-user-txs` build, or the running-network activation (M9). Wire tag 0x16, the first byte after the L2 data
 //! availability tag; no mainnet tree and no local ref assigns it (see
 //! `tests/wire_tag_registry.rs`).
 //!
@@ -410,7 +411,7 @@ impl CommittedState {
         base_fee: u128,
     ) -> Result<fee_market::TxCharge, L2WithdrawClaimReject> {
         use L2WithdrawClaimReject as R;
-        if !crate::l2_settlement::USER_TRANSACTIONS_ENABLED || self.l2_settlement.is_none() {
+        if !self.l2_settlement.as_ref().is_some_and(|l2| l2.user_transactions()) {
             return Err(R::NotActive);
         }
         tx.validate_shape()?;
@@ -439,7 +440,7 @@ impl CommittedState {
         // During a block's transactions `self` still has the parent's slot
         // and the L2 state the parent's native height; the claim's block is
         // the next one.
-        if l2.height().saturating_add(1) >= withdrawal::FINALIZED_CLAIMS_FROM_HEIGHT
+        if l2.height().saturating_add(1) >= l2.profile().finalized_claims_from_height
             && !withdrawal::record_finalized(record.height, l2.height(), self.slot, self.finality_view().finalized.epoch)
         {
             return Err(R::NotFinalized);

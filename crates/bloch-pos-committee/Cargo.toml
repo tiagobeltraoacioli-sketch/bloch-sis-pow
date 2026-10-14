@@ -32,6 +32,12 @@ devnet-l2-deposits = []
 # user_tx_count > 0. Without it the native verifier refuses them
 # (Reject::UserTransactions) until L1 data availability (M3) exists.
 devnet-l2-user-txs = ["devnet-l2-deposits"]
+# QUALIFICATION BUILDS ONLY (mixed-fleet rehearsal of the L2 flag day, M9).
+# Arms params::L2_SETTLEMENT_ACTIVATION_EPOCH at the compile-time value of
+# BLOCH_L2_REHEARSAL_ACTIVATION_EPOCH with a rehearsal policy bound to the
+# running network. The node refuses the Genesis-4 mainnet manifest and any
+# manifest with a carryover. Never ship it.
+l2-activation-rehearsal = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }

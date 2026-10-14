@@ -2199,6 +2199,8 @@ mod l2_tests {
 
     // ── M8 part 2: activation of the L2 on a running network ──────────────
 
+    use crate::l2_settlement::{Activation, Profile};
+
     /// A network that has run without L2: no policy at genesis, bound domain.
     fn running_without_l2() -> (CommittedState, Policy) {
         let (_, mut genesis, _) = setup(4);
@@ -2218,6 +2220,24 @@ mod l2_tests {
         (genesis, policy)
     }
 
+    /// Limits of a rehearsal activation, deliberately unlike the development
+    /// constants so that a test passing with them proves the pinned limits
+    /// (not `withdrawal::Limits::DEVELOPMENT`) govern the activated L2.
+    const PINNED: wd::Limits = wd::Limits {
+        delay_blocks: 40,
+        large_claim_sat: 50 * BLCH,
+        large_delay_blocks: 90,
+        retention_blocks: 120,
+        release_window_blocks: 48,
+        release_window_bps: 500,
+        release_floor_sat: 5 * BLCH,
+    };
+    const _: () = assert!(PINNED.valid() && PINNED.delay_blocks > WITHDRAW_DELAY_BLOCKS);
+
+    fn activation(policy: Policy, asynchronous: bool) -> Activation {
+        Activation { policy, asynchronous, limits: PINNED }
+    }
+
     #[test]
     fn l2_settlement_gate_is_inert() {
         assert_eq!(crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH, u64::MAX);
@@ -2228,10 +2248,12 @@ mod l2_tests {
     #[test]
     fn armed_l2_gate_has_a_policy() {
         if crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH != u64::MAX {
-            let (policy, _) = crate::l2_settlement::activation_policy()
+            let pinned = crate::l2_settlement::activation_policy()
                 .expect("an armed L2 gate needs a pinned activation policy");
-            assert!(policy.valid());
-            assert!(crate::l2_settlement::State::genesis(policy).is_ok());
+            assert!(pinned.valid(), "pinned policy and limits must be valid");
+            assert_eq!(pinned.policy.chain_id, crate::l2_settlement::MAINNET_CHAIN_ID);
+            let l2 = crate::l2_settlement::State::activated(pinned).expect("the pinned activation installs");
+            assert!(l2.profile().is_activated() && l2.user_transactions());
         }
     }
 
@@ -2240,7 +2262,7 @@ mod l2_tests {
         let (genesis, policy) = running_without_l2();
         let plain = genesis.close_epoch();
         // A pinned policy alone does nothing while the gate is the sentinel.
-        let _policy = crate::l2_settlement::activation_rehearsal::set(policy, false);
+        let _policy = crate::l2_settlement::activation_rehearsal::set(activation(policy, true));
         let with_policy = genesis.close_epoch();
         assert!(with_policy.l2_settlement().is_none());
         assert_eq!(with_policy.state_root(), plain.state_root());
@@ -2253,13 +2275,15 @@ mod l2_tests {
             let (genesis, policy) = running_without_l2();
             let inert = genesis.close_epoch();
             let _gate = crate::params::l2_settlement_rehearsal::open();
-            let _policy = crate::l2_settlement::activation_rehearsal::set(policy.clone(), asynchronous);
+            let _policy = crate::l2_settlement::activation_rehearsal::set(activation(policy.clone(), asynchronous));
             // Mid-epoch blocks are untouched: activation happens at the boundary.
             assert!(genesis.l2_settlement().is_none());
             let opened = genesis.close_epoch();
             let l2 = opened.l2_settlement().expect("installed at the boundary");
             assert_eq!(l2.policy(), &policy);
             assert_eq!(l2.height(), 0);
+            assert_eq!(l2.asynchronous(), asynchronous);
+            assert_eq!(l2.profile(), &Profile::activated(PINNED));
             assert_eq!(opened.epoch, genesis.epoch + 1);
             // The L2 component enters the state root only now.
             assert_ne!(opened.state_root(), inert.state_root());
@@ -2277,12 +2301,36 @@ mod l2_tests {
         let (genesis, mut policy) = running_without_l2();
         policy.identities[0] = [0x92; 32];
         let _gate = crate::params::l2_settlement_rehearsal::open();
-        let _policy = crate::l2_settlement::activation_rehearsal::set(policy, false);
+        let _policy = crate::l2_settlement::activation_rehearsal::set(activation(policy, true));
         let opened = genesis.close_epoch();
         assert!(opened.l2_settlement().is_none());
         let mut unbound = genesis.clone();
         unbound.admission_network_domain = None;
         assert!(unbound.close_epoch().l2_settlement().is_none());
+    }
+
+    #[test]
+    fn activation_with_invalid_limits_installs_nothing() {
+        let (genesis, policy) = running_without_l2();
+        let _gate = crate::params::l2_settlement_rehearsal::open();
+        let broken = [
+            wd::Limits { delay_blocks: 0, ..PINNED },
+            wd::Limits { large_delay_blocks: PINNED.delay_blocks - 1, ..PINNED },
+            wd::Limits { retention_blocks: PINNED.large_delay_blocks - 1, ..PINNED },
+            wd::Limits { retention_blocks: wd::MAX_RETENTION_BLOCKS + 1, large_delay_blocks: wd::MAX_RETENTION_BLOCKS + 1, ..PINNED },
+            wd::Limits { release_window_blocks: 0, ..PINNED },
+            wd::Limits { release_window_bps: 0, ..PINNED },
+            wd::Limits { release_window_bps: 10_001, ..PINNED },
+            wd::Limits { release_floor_sat: 0, ..PINNED },
+            wd::Limits { large_claim_sat: 0, ..PINNED },
+        ];
+        for limits in broken {
+            let pinned = Activation { policy: policy.clone(), asynchronous: true, limits };
+            assert!(!pinned.valid(), "{limits:?}");
+            assert_eq!(crate::l2_settlement::State::activated(pinned.clone()), Err(Reject::Policy));
+            let _policy = crate::l2_settlement::activation_rehearsal::set(pinned);
+            assert!(genesis.close_epoch().l2_settlement().is_none(), "{limits:?}");
+        }
     }
 
     #[test]
@@ -2292,10 +2340,12 @@ mod l2_tests {
         other.chain_id = 1;
         other.identities[0] = pre.admission_network_domain.unwrap();
         let _gate = crate::params::l2_settlement_rehearsal::open();
-        let _policy = crate::l2_settlement::activation_rehearsal::set(other, false);
+        let _policy = crate::l2_settlement::activation_rehearsal::set(activation(other, true));
         let next = pre.close_epoch();
         assert_eq!(next.l2_settlement().unwrap().policy(), pre.l2_settlement().unwrap().policy());
         assert_eq!(next.l2_settlement().unwrap().policy().chain_id, 700771);
+        // A development genesis keeps its development profile.
+        assert_eq!(next.l2_settlement().unwrap().profile(), &Profile::development());
     }
 
     #[test]
@@ -2322,7 +2372,7 @@ mod l2_tests {
         // The first block of epoch 1 crosses the boundary: the flag day
         // installs the policy, and the block itself is the L2's native height 1.
         let _gate = crate::params::l2_settlement_rehearsal::open();
-        let _policy = crate::l2_settlement::activation_rehearsal::set(policy.clone(), false);
+        let _policy = crate::l2_settlement::activation_rehearsal::set(activation(policy.clone(), false));
         let boundary = build_block(&t, &before, crate::params::SLOTS_PER_EPOCH, &[], &[], &mut chains);
         let opened = t.apply_block(&before, &boundary, &[], &[]).unwrap();
         let l2 = opened.l2_settlement().expect("installed at the boundary");
@@ -2336,5 +2386,268 @@ mod l2_tests {
             .expect("a settlement against the activated L2 is admitted");
         assert_ne!(admitted.state_root(), opened.state_root());
     }
-}
 
+    // ── M9: the activated L2 is fully capable on every build ──────────────
+
+    /// The funded running network (the depositor's coin at `[0x33; 32]:0`)
+    /// before the flag day, at slot 1, and its policy.
+    fn funded_running_without_l2() -> (CommittedState, Policy, Vec<RandaoChain>) {
+        let key = depositor();
+        let coin = crate::state_root::EutxoEntry { txid: [0x33; 32], vout: 0, value: FUNDED, script_hash: script_of(&key) };
+        let (_, mut genesis, mut chains) = setup_with(4, ToyVerifier, &[coin]);
+        genesis.admission_network_domain = Some([0x91; 32]);
+        let (_, mut policy) = running_without_l2();
+        policy.identities[1] = *genesis.head.as_bytes();
+        let pre = apply(&genesis, 1, &[], &mut chains).unwrap();
+        assert!(pre.l2_settlement().is_none());
+        (pre, policy, chains)
+    }
+
+    /// The funded network after its flag day: the first block of epoch 1
+    /// installed the activation (native L2 height 1).
+    fn activated_fixture(asynchronous: bool, attestor_set: [u8; 32]) -> (CommittedState, Vec<RandaoChain>) {
+        let (pre, mut policy, mut chains) = funded_running_without_l2();
+        policy.attestor_set = attestor_set;
+        let _gate = crate::params::l2_settlement_rehearsal::open();
+        let _policy = crate::l2_settlement::activation_rehearsal::set(activation(policy, asynchronous));
+        let opened = apply(&pre, crate::params::SLOTS_PER_EPOCH, &[], &mut chains).unwrap();
+        let l2 = opened.l2_settlement().expect("installed at the boundary");
+        assert_eq!((l2.height(), l2.asynchronous()), (1, asynchronous));
+        (opened, chains)
+    }
+
+    #[test]
+    fn the_activated_profile_does_not_depend_on_build_features() {
+        let (_, policy) = running_without_l2();
+        let dev = crate::l2_settlement::State::genesis(policy.clone()).unwrap();
+        // A development genesis follows the build (devnet replays unchanged).
+        assert_eq!(dev.profile(), &Profile::development());
+        assert_eq!(dev.profile().deposits, cfg!(feature = "devnet-l2-deposits"));
+        assert_eq!(dev.user_transactions(), cfg!(feature = "devnet-l2-user-txs"));
+        assert_eq!(dev.limits(), &wd::Limits::DEVELOPMENT);
+        assert!(!dev.profile().is_activated());
+        // The activated L2 admits everything on this build, whatever it is.
+        let on = crate::l2_settlement::State::activated(activation(policy.clone(), true)).unwrap();
+        assert!(on.profile().is_activated() && on.deposits_enabled() && on.user_transactions());
+        assert_eq!(on.profile().finalized_claims_from_height, 0);
+        assert_eq!(on.limits(), &PINNED);
+        // Synchronous settlement has no inbox: no deposits (and no claims).
+        let sync = crate::l2_settlement::State::activated(activation(policy, false)).unwrap();
+        assert!(!sync.deposits_enabled() && sync.user_transactions());
+        // The development state bytes carry no profile (devnet roots are
+        // unchanged); the activated state commits its profile and limits.
+        let tag: &[u8] = b"BLOCH:NATIVE:L2:ACTIVATED-PROFILE:1";
+        assert!(!dev.committed_bytes().windows(tag.len()).any(|w| w == tag));
+        let bytes = on.committed_bytes();
+        assert!(bytes.windows(tag.len()).any(|w| w == tag));
+        let other = crate::l2_settlement::State::activated(Activation {
+            limits: wd::Limits { release_window_bps: 400, ..PINNED },
+            ..activation(on.policy().clone(), true)
+        })
+        .unwrap();
+        assert_ne!(other.committed_bytes(), bytes, "the limits are committed");
+    }
+
+    #[test]
+    fn l2_transactions_are_refused_and_roots_unchanged_while_inert() {
+        let (pre, policy, mut chains) = funded_running_without_l2();
+        // Blocks across the first boundary, built and applied without any pinned policy.
+        let mut plain = vec![pre.clone()];
+        let mut blocks = Vec::new();
+        let t = Transition::new(ProofDouble);
+        for slot in [2, crate::params::SLOTS_PER_EPOCH - 1, crate::params::SLOTS_PER_EPOCH, crate::params::SLOTS_PER_EPOCH + 1] {
+            let block = build_block(&t, plain.last().unwrap(), slot, &[], &[], &mut chains);
+            plain.push(t.apply_block(plain.last().unwrap(), &block, &[], &[]).unwrap());
+            blocks.push(block);
+        }
+        // The same blocks with an activation pinned but the gate the
+        // sentinel: every post-state, and so every state root, is identical.
+        let _policy = crate::l2_settlement::activation_rehearsal::set(activation(policy, true));
+        let mut state = pre.clone();
+        for (block, expected) in blocks.iter().zip(&plain[1..]) {
+            state = t.apply_block(&state, block, &[], &[]).unwrap();
+            assert_eq!(&state, expected);
+            assert_eq!(state.state_root(), expected.state_root());
+            assert!(state.l2_settlement().is_none());
+        }
+        // Every L2 transaction is refused without mutation, as by a build
+        // without L2: deposit, DA, claim, settlement (sync and async).
+        let leaves = [([1; 32], BLCH)];
+        let refusals = [
+            PosTransaction::L2Deposit(deposit_tx(&state, 7 * BLCH)),
+            PosTransaction::L2DataAvailability(da_tx(&state, ([0x33; 32], 0), FUNDED, 1, batch(&[b"tx"]))),
+            claim(&claim_of(&state, &leaves, 0, None)),
+        ];
+        for tx in refusals.iter() {
+            let mut st = state.clone();
+            assert!(st.apply_transaction(tx, 0, state.next_base_fee(), &ToyVerifier).is_err(), "{tx:?}");
+            assert_eq!(st, state);
+        }
+        assert_eq!(state.l2_withdraw_claim_refusal(&claim_of(&state, &leaves, 0, None)), Some(ClaimReject::NotActive));
+        let (with_l2, _) = fixture();
+        for wire in [
+            PosTransaction::L2Settlement(Box::new(transaction(&with_l2))),
+            PosTransaction::L2SettlementAsync(Box::new(transaction(&with_l2))),
+        ] {
+            let mut st = state.clone();
+            assert_eq!(st.apply_transaction(&wire, 0, 1, &ProofDouble), Err(TxReject::L2Settlement(Reject::NotActive)));
+            assert_eq!(st, state);
+        }
+        // A block carrying one of them is invalid.
+        let t = Transition::new(ProofDouble);
+        let mut graft = build_block(&t, &state, crate::params::SLOTS_PER_EPOCH + 2, &[], &[], &mut chains);
+        graft.header.body_root = crate::derive::body_root(&[refusals[0].canonical_bytes()]);
+        let pk = crate::attestation::KeyLookup::pubkey(&state, graft.header.proposer_index).unwrap();
+        graft.proposer_sig = toy_sign(pk, &graft.header.proposal_signing_root());
+        assert_eq!(t.compute_post_state(&state, &graft, &[], &refusals[..1]), Err(TransitionError::Transaction(0)));
+    }
+
+    #[test]
+    fn activated_l2_deposits_settles_user_transactions_and_pays_claims() {
+        let (opened, mut chains) = activated_fixture(true, [0; 32]);
+        let mut slot = crate::params::SLOTS_PER_EPOCH + 1;
+        let mut next = |pre: &CommittedState, txs: &[PosTransaction], chains: &mut Vec<RandaoChain>| {
+            let post = apply(pre, slot, txs, chains);
+            slot += 1;
+            post
+        };
+        // Deposit: escrowed into the inbox (no cargo feature needed).
+        let amount = 70 * BLCH;
+        let deposit = deposit_tx(&opened, amount);
+        let deposit_wire = PosTransaction::L2Deposit(deposit.clone());
+        let s2 = next(&opened, std::slice::from_ref(&deposit_wire), &mut chains).expect("deposit applies");
+        assert_eq!(s2.l2_settlement().unwrap().escrow_sat(), u128::from(amount));
+        let record = s2.l2_settlement().unwrap().inbox()[0];
+
+        // DA for L2 block 1, then the user-transaction settlement that needs it.
+        let payload = batch(&[&[0x02, 0xc0], b"second"]);
+        let da = da_tx(&s2, (deposit_wire.txid(), 0), deposit.change.value, 1, payload.clone());
+        let da_wire = PosTransaction::L2DataAvailability(da.clone());
+        let commitment = da::commitment(700771, 1, &payload);
+        // Without the batch on L1 the settlement is refused.
+        let early = v3_with_da(&s2, commitment);
+        assert_eq!(
+            s2.l2_settlement().unwrap().clone().apply(&early, *s2.head.as_bytes(), s2.slot, true, &ProofDouble),
+            Err(Reject::DataUnavailable)
+        );
+        let s3 = next(&s2, std::slice::from_ref(&da_wire), &mut chains).expect("DA applies");
+        assert_eq!(s3.l2_settlement().unwrap().data_availability().len(), 1);
+        let first = PosTransaction::L2SettlementAsync(Box::new(v3_with_da(&s3, commitment)));
+        let s4 = next(&s3, std::slice::from_ref(&first), &mut chains).expect("user transactions settle with DA");
+        assert_eq!(s4.l2_settlement().unwrap().settled_number(), 1);
+        let s5 = next(&s4, &[], &mut chains).unwrap();
+
+        // L2 block 2 mints the deposit and withdraws three leaves.
+        let empty = crate::l2_settlement::expected_body_commitment(&[]);
+        let mut second = to_v3(settlement(&s5, empty), crate::l2_settlement::deposits_hash(&[record]), 0);
+        let leaves = wleaves(3);
+        second.statement[S + v3::WITHDRAWAL_ROOT..S + v3::WITHDRAWAL_ROOT + 32].copy_from_slice(&wd::root(&leaves));
+        second.statement[S + v3::WITHDRAWAL_COUNT..S + v3::WITHDRAWAL_COUNT + 8].copy_from_slice(&3u64.to_be_bytes());
+        let mut state = next(&s5, &[PosTransaction::L2SettlementAsync(Box::new(second))], &mut chains).unwrap();
+        let accepted = state.l2_settlement().unwrap().withdrawal_roots()[0];
+        assert_eq!(state.l2_settlement().unwrap().consumed(), 1);
+
+        // The pinned delay governs, not the development one.
+        let funding = (da_wire.txid(), 0);
+        while state.l2_settlement().unwrap().height() + 1 < accepted.height + PINNED.delay_blocks {
+            let early = claim_tx(&state, funding, da.change.value, 3, 2);
+            assert_eq!(state.l2_withdraw_claim_refusal(&early), Some(ClaimReject::NotMatured));
+            state = next(&state, &[], &mut chains).unwrap();
+        }
+        assert!(state.l2_settlement().unwrap().height() + 1 > accepted.height + WITHDRAW_DELAY_BLOCKS);
+        let tx = claim_tx(&state, funding, da.change.value, 3, 2);
+        // Ethereum-rollup finality from the first activated block.
+        assert_eq!(state.l2_withdraw_claim_refusal(&tx), Some(ClaimReject::NotFinalized));
+        finalize_all(&mut state);
+        assert_eq!(state.l2_withdraw_claim_refusal(&tx), None);
+        let (recipient, sats) = wleaf(2);
+        let balance = state.balance_sat(&recipient);
+        let post = next(&state, &[claim(&tx)], &mut chains).expect("matured, finalized claim pays");
+        let l2 = post.l2_settlement().unwrap();
+        assert_eq!(l2.escrow_sat(), u128::from(amount - sats));
+        assert!(l2.escrow_conserved() && l2.claimed().contains(2));
+        assert_eq!(post.balance_sat(&recipient), balance + u128::from(sats));
+        // Replay: refused.
+        assert!(post.l2_withdraw_claim_refusal(&tx).is_some());
+    }
+
+    #[test]
+    fn activated_l2_enforces_attestors_and_the_pinned_release_window() {
+        let set = wd::attestor_set_hash(2, &attestors());
+        let (mut pre, _) = activated_fixture(true, set);
+        // 1 000 BLCH escrowed; one finalized record over `leaves`, old
+        // enough for large claims under the pinned limits.
+        let leaves = [([1; 32], 60 * BLCH), ([2; 32], 30 * BLCH), ([3; 32], 25 * BLCH), ([4; 32], 4 * BLCH)];
+        let tree: Vec<[u8; 32]> =
+            leaves.iter().enumerate().map(|(i, (r, sats))| wd::leaf(700771, i as u64, r, *sats)).collect();
+        let l2 = pre.l2_settlement.as_mut().unwrap();
+        l2.append_deposit(crate::l2_settlement::InboxRecord {
+            height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 1_000 * BLCH, recipient: [0x42; 20],
+        })
+        .unwrap();
+        l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&tree), count: tree.len() as u64, height: 1 });
+        // Matured for small claims but not yet for large ones (pinned delays).
+        while l2.height() + 1 < 1 + PINNED.delay_blocks {
+            l2.advance_height().unwrap();
+        }
+        finalize_all(&mut pre);
+        let refuse = |pre: &CommittedState, tx: &L2WithdrawClaim, why| {
+            assert_eq!(try_claim(pre, tx).map(|_| ()), Err(TxReject::L2WithdrawClaim(why)))
+        };
+        // 60 BLCH >= the pinned large threshold (50): it needs the attestors...
+        refuse(&pre, &claim_of(&pre, &leaves, 0, None), ClaimReject::AttestationRequired);
+        // ...and the pinned large delay (90), attested or not.
+        refuse(&pre, &claim_of(&pre, &leaves, 0, Some(attest(&leaves, &[0, 1]))), ClaimReject::NotMatured);
+        // 30 BLCH is small here (it would be small in development too) and pays.
+        let small = try_claim(&pre, &claim_of(&pre, &leaves, 1, None)).expect("small claim");
+        // Pinned window: 5% of 1 000 BLCH = 50 BLCH; 30 + 25 exceeds it.
+        assert_eq!(small.l2_settlement().unwrap().release_window().cap, 50 * u128::from(BLCH));
+        refuse(&small, &claim_of(&small, &leaves, 2, None), ClaimReject::RateLimited);
+
+        let l2 = pre.l2_settlement.as_mut().unwrap();
+        while l2.height() + 1 < 1 + PINNED.large_delay_blocks {
+            l2.advance_height().unwrap();
+        }
+        refuse(&pre, &claim_of(&pre, &leaves, 0, None), ClaimReject::AttestationRequired);
+        refuse(&pre, &claim_of(&pre, &leaves, 0, Some(attest(&leaves, &[2]))), ClaimReject::Shape);
+        // k-of-n: the attested first claim of a window may exceed its cap.
+        let post = try_claim(&pre, &claim_of(&pre, &leaves, 0, Some(attest(&leaves, &[0, 2])))).expect("attested large claim");
+        assert!(post.l2_settlement().unwrap().claimed().contains(0));
+        assert!(post.l2_settlement().unwrap().escrow_conserved());
+        // The next claim of the same window is over the cap.
+        refuse(&post, &claim_of(&post, &leaves, 3, None), ClaimReject::RateLimited);
+    }
+
+    #[test]
+    fn a_synchronous_activation_settles_but_refuses_deposits_and_claims() {
+        let (opened, _) = activated_fixture(false, [0; 32]);
+        let fee = opened.next_base_fee();
+        let mut st = opened.clone();
+        assert!(st.apply_transaction(&PosTransaction::L2Deposit(deposit_tx(&opened, 7 * BLCH)), 0, fee, &ToyVerifier).is_err());
+        assert_eq!(st, opened);
+        let leaves = [([1; 32], BLCH)];
+        assert_eq!(
+            try_claim(&opened, &claim_of(&opened, &leaves, 0, None)).map(|_| ()),
+            Err(TxReject::L2WithdrawClaim(ClaimReject::NotActive))
+        );
+        // V3 settlements with user transactions are admitted (with DA).
+        let settlement = to_v3(transaction(&opened), no_deposits(), 2);
+        let ready_state = ready(&opened, &settlement);
+        let mut admitted = ready_state.clone();
+        admitted
+            .apply_transaction(&PosTransaction::L2Settlement(Box::new(settlement)), 0, 1, &ProofDouble)
+            .expect("user transactions settle on the activated L2 on every build");
+    }
+
+    /// Qualification builds only: the gate is the compiled epoch, and the
+    /// rehearsal policy binds whatever development network runs it.
+    #[test]
+    #[cfg(feature = "l2-activation-rehearsal")]
+    fn rehearsal_build_arms_the_compiled_epoch_for_any_network() {
+        let e = crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH;
+        assert!(e != u64::MAX && crate::params::l2_settlement_active(e) && !crate::params::l2_settlement_active(e - 1));
+        let a = crate::l2_settlement::activation_for(Some([0x93; 32])).unwrap();
+        assert!(a.valid() && a.asynchronous && a.policy.identities[0] == [0x93; 32]);
+        assert!(crate::l2_settlement::activation_for(None).is_none());
+    }
+}

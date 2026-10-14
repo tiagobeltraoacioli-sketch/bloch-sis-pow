@@ -2853,6 +2853,14 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
         ("asynchronous", Json::Bool(l2.asynchronous())), ("native_height", Json::u(l2.height())),
         ("network", Json::hex(&policy.identities[0])), ("genesis", Json::hex(&policy.identities[1])),
         ("chain_id", Json::u(policy.chain_id)), ("source", source),
+        // What this L2 admits, fixed at installation: a development genesis
+        // follows the node's devnet features; the running-network flag day
+        // ("activated") admits everything on every build.
+        ("profile", Json::obj(vec![
+            ("activated", Json::Bool(l2.profile().is_activated())),
+            ("deposits", Json::Bool(l2.deposits_enabled())),
+            ("user_transactions", Json::Bool(l2.user_transactions())),
+        ])),
         ("inbox", Json::obj(vec![
             ("count", Json::u(l2.inbox().len() as u64)), ("consumed", Json::u(l2.consumed())),
             ("escrow_sat", Json::s(l2.escrow_sat().to_string())),
@@ -2878,12 +2886,12 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
                         r.height, l2.height(), state.slot(), state.finality().finalized.epoch,
                     ))),
                 ])).collect())),
-                ("finalized_claims_from_height", Json::u(bloch_pos_committee::l2_settlement::withdrawal::FINALIZED_CLAIMS_FROM_HEIGHT)),
+                ("finalized_claims_from_height", Json::u(l2.profile().finalized_claims_from_height)),
                 // M5 claims: the newest root a claim in the next block may
                 // prove against, and the nullifier set as its frontier
                 // (words below `floor` fully claimed; `words` maps a 256-leaf
                 // word index to its bitmap, bit i of byte j = leaf 256w+8j+i).
-                ("delay_blocks", Json::u(bloch_pos_committee::l2_settlement::withdrawal::WITHDRAW_DELAY_BLOCKS)),
+                ("delay_blocks", Json::u(l2.limits().delay_blocks)),
                 ("matured", l2.matured_withdrawals().map_or(Json::Null, |r| Json::obj(vec![
                     ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
                     ("count", Json::u(r.count)), ("height", Json::u(r.height)),
@@ -2899,8 +2907,9 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
                 // and each window releases at most its cap (only an attested
                 // first claim of a window, or any first claim on a policy
                 // without attestors, may exceed it).
-                ("large_claim_sat", Json::sat(u128::from(bloch_pos_committee::l2_settlement::withdrawal::LARGE_CLAIM_SAT))),
-                ("large_delay_blocks", Json::u(bloch_pos_committee::l2_settlement::withdrawal::LARGE_WITHDRAW_DELAY_BLOCKS)),
+                ("large_claim_sat", Json::sat(u128::from(l2.limits().large_claim_sat))),
+                ("large_delay_blocks", Json::u(l2.limits().large_delay_blocks)),
+                ("retention_blocks", Json::u(l2.limits().retention_blocks)),
                 ("matured_large", l2.matured_large_withdrawals().map_or(Json::Null, |r| Json::obj(vec![
                     ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
                     ("count", Json::u(r.count)), ("height", Json::u(r.height)),
@@ -2909,7 +2918,9 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
                     let w = l2.release_window();
                     Json::obj(vec![
                         ("window", Json::u(w.window)),
-                        ("blocks", Json::u(bloch_pos_committee::l2_settlement::withdrawal::RELEASE_WINDOW_BLOCKS)),
+                        ("blocks", Json::u(l2.limits().release_window_blocks)),
+                        ("bps", Json::u(l2.limits().release_window_bps)),
+                        ("floor_sat", Json::sat(u128::from(l2.limits().release_floor_sat))),
                         ("released_sat", Json::sat(w.released)), ("cap_sat", Json::sat(w.cap)),
                         ("remaining_sat", Json::sat(w.remaining())),
                     ])
@@ -2918,7 +2929,7 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
                 // attested_claim_sat need the attestors' k-of-n signature
                 // (claim version 2).
                 ("attestor_set", if policy.attestor_set == [0; 32] { Json::Null } else { Json::hex(&policy.attestor_set) }),
-                ("attested_claim_sat", Json::sat(u128::from(bloch_pos_committee::l2_settlement::withdrawal::ATTESTED_CLAIM_SAT))),
+                ("attested_claim_sat", Json::sat(u128::from(l2.limits().large_claim_sat))),
                 ("released_sat", Json::sat(l2.released_sat())),
                 ("escrow_conserved", Json::Bool(l2.escrow_conserved())),
             ])

@@ -2298,7 +2298,27 @@ pub(crate) mod funded_delegation_rehearsal {
 /// historical replay of the network with this build, mixed-fleet
 /// qualification and an explicit coordinated epoch; there is no runtime
 /// override. `l2_settlement_gate_is_inert` pins the value.
+#[cfg(not(feature = "l2-activation-rehearsal"))]
 pub const L2_SETTLEMENT_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// Qualification builds (`l2-activation-rehearsal`) only: the compile-time
+/// epoch of the mixed-fleet rehearsal. Such a build refuses funded manifests.
+#[cfg(feature = "l2-activation-rehearsal")]
+pub const L2_SETTLEMENT_ACTIVATION_EPOCH: u64 =
+    parse_rehearsal_epoch(env!("BLOCH_L2_REHEARSAL_ACTIVATION_EPOCH"));
+#[cfg(feature = "l2-activation-rehearsal")]
+const fn parse_rehearsal_epoch(text: &str) -> u64 {
+    let bytes = text.as_bytes();
+    assert!(!bytes.is_empty(), "BLOCH_L2_REHEARSAL_ACTIVATION_EPOCH is empty");
+    let mut value: u64 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        assert!(bytes[i].is_ascii_digit(), "BLOCH_L2_REHEARSAL_ACTIVATION_EPOCH must be decimal");
+        value = value * 10 + (bytes[i] - b'0') as u64;
+        i += 1;
+    }
+    assert!(value >= 1 && value < u64::MAX, "rehearsal epoch out of range");
+    value
+}
 
 pub(crate) fn l2_settlement_active(epoch: u64) -> bool {
     #[cfg(test)]

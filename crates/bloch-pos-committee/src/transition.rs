@@ -5619,18 +5619,14 @@ impl CommittedState {
         // activation policy at the flag day, only if the policy names this
         // network. Inert while `L2_SETTLEMENT_ACTIVATION_EPOCH` is the sentinel.
         if st.l2_settlement.is_none() && crate::params::l2_settlement_active(next_epoch) {
-            if let Some((policy, asynchronous)) = crate::l2_settlement::activation_policy() {
-                if st.admission_network_domain == Some(policy.identities[0]) {
-                    let installed = if asynchronous {
-                        crate::l2_settlement::State::genesis_async(policy)
-                    } else {
-                        crate::l2_settlement::State::genesis(policy)
-                    };
-                    // An invalid pinned policy is refused by
-                    // `armed_l2_gate_has_a_policy`; it never reaches consensus.
-                    if let Ok(state) = installed {
-                        st.l2_settlement = Some(state);
-                    }
+            if let Some(activation) = crate::l2_settlement::activation_for(st.admission_network_domain) {
+                // The activated profile admits deposits, DA, user
+                // transactions and claims on every build (no cargo
+                // feature), with the pinned limits. An invalid pinned
+                // activation is refused by `armed_l2_gate_has_a_policy`;
+                // it never reaches consensus.
+                if let Ok(state) = crate::l2_settlement::State::activated(activation) {
+                    st.l2_settlement = Some(state);
                 }
             }
         }

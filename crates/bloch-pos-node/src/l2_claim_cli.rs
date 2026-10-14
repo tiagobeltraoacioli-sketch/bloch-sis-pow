@@ -56,8 +56,8 @@ fits a later window (the first claim of a window is always admitted).
 The funding inputs pay the fee and the rest returns as change to the funding
 key; the recipient output is exactly the withdrawn sats. Consensus requires
 exact conservation at the including block's base fee (getchaininfo
-next_base_fee_millisat_per_gas). Development networks only: a build without
-devnet-l2-user-txs refuses the transaction.";
+next_base_fee_millisat_per_gas). The network's L2 must admit it (getl2settlement profile): a development
+genesis on a devnet-l2-user-txs build, or a network past its L2 flag day.";
 
 fn read_tx(path: &str) -> Result<L2WithdrawClaim, String> {
     match PosTransaction::from_canonical_bytes(&codec::unhex(read_text(path)?.trim())?).map_err(|e| e.to_string())? {

@@ -4273,6 +4273,9 @@ impl Engine {
                 return Err(Refusal::Invalid("funded deposit belongs to a different genesis manifest"));
             }
         }
+        if let Some(why) = l2_admission_refusal(&tx, self.state.l2_settlement()) {
+            return Err(Refusal::Invalid(why));
+        }
         if let PosTransaction::L2SettlementAsync(settlement) = &tx {
             let state = self.state.l2_settlement().ok_or(Refusal::Invalid("L2 settlement is not configured"))?;
             if self.mempool.values().any(|pending| matches!(pending, PosTransaction::L2SettlementAsync(_))) {
@@ -5884,6 +5887,18 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
         println!("DEVELOPMENT BUILD: {}", env!("BLOCH_BUILD_VERSION"));
     }
+    // A mixed-fleet rehearsal build arms the L2 flag day at a compile-time
+    // epoch: it must never run a funded network.
+    #[cfg(feature = "l2-activation-rehearsal")]
+    {
+        if crate::codec::hex32(&digest) == GENESIS4_MAINNET_NETWORK_DIGEST || manifest.carryover.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "this is an L2 activation rehearsal build; it refuses the Genesis-4 mainnet manifest and any funded (carryover) manifest",
+            ));
+        }
+        println!("L2 ACTIVATION REHEARSAL BUILD: {}", env!("BLOCH_BUILD_VERSION"));
+    }
 
     // The opening ledger, before anything else touches the manifest. A
     // manifest that commits to a carryover is not usable until the snapshot
@@ -7174,6 +7189,32 @@ fn declared_size_bound(tx: &PosTransaction, declared: u64) -> Result<(), &'stati
     Ok(())
 }
 
+/// The stateful L2 door of `on_transaction`: DA, claims and deposits enter
+/// the mempool only when the head's installed L2 admits them. Its profile
+/// decides (development genesis: the build's devnet features; running-network
+/// activation: always), so a mainnet build refuses them before the flag day
+/// and admits them after it without a cargo feature. Consensus re-checks.
+/// SHA3-256 of `genesis/mainnet.manifest` (the Genesis-4 network digest).
+#[cfg(feature = "l2-activation-rehearsal")]
+const GENESIS4_MAINNET_NETWORK_DIGEST: &str = "f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966";
+
+pub(crate) fn l2_admission_refusal(
+    tx: &PosTransaction,
+    l2: Option<&bloch_pos_committee::l2_settlement::State>,
+) -> Option<&'static str> {
+    let user_transactions = l2.is_some_and(|l2| l2.user_transactions());
+    match tx {
+        PosTransaction::L2DataAvailability(_) if !user_transactions => {
+            Some("L2 data availability is not active on this network")
+        }
+        PosTransaction::L2WithdrawClaim(_) if !user_transactions => Some("L2 withdrawal claims are not active on this network"),
+        PosTransaction::L2Deposit(_) if !l2.is_some_and(|l2| l2.deposits_enabled()) => {
+            Some("native L2 deposits are not active on this network")
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     admissible_with_verifier(tx, wall_epoch, &HybridVerifier::new())
 }
@@ -7190,10 +7231,10 @@ fn admissible_with_network_verifier(
 ) -> Result<(), &'static str> {
     match tx {
         PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => Err("native L2 settlement is not enabled by a shipping genesis manifest"),
+        // Whether the network's L2 admits DA, claims and deposits is a state
+        // question (the installed L2's profile), answered at the stateful door
+        // by `l2_admission_refusal`; here only shape and signatures.
         PosTransaction::L2DataAvailability(batch) => {
-            if !bloch_pos_committee::l2_settlement::USER_TRANSACTIONS_ENABLED {
-                return Err("L2 data availability is not enabled in this build");
-            }
             // Shape and payload are rechecked in consensus; refuse the
             // obviously unusable batch before the signature.
             if bloch_pos_committee::l2_settlement::da::batch_count(&batch.payload).is_none() {
@@ -7206,9 +7247,6 @@ fn admissible_with_network_verifier(
             }
         }
         PosTransaction::L2WithdrawClaim(claim) => {
-            if !bloch_pos_committee::l2_settlement::USER_TRANSACTIONS_ENABLED {
-                return Err("L2 withdrawal claims are not enabled in this build");
-            }
             // The proof, maturity, nullifier and escrow are state checks and
             // run in consensus; refuse a malformed claim before the signature.
             if claim.validate_shape().is_err() {
@@ -7226,9 +7264,6 @@ fn admissible_with_network_verifier(
             Ok(())
         }
         PosTransaction::L2Deposit(deposit) => {
-            if !cfg!(feature = "devnet-l2-deposits") {
-                return Err("native L2 deposits are not enabled in this build");
-            }
             // State checks (inputs, ownership, conservation) run in consensus.
             if HybridVerifier::new().verify_with_key(&deposit.funding_pubkey, &deposit.intent_root(), &deposit.signature) {
                 Ok(())
@@ -15840,5 +15875,62 @@ mod stale_head_duty_gate_tests {
     #[test]
     fn clock_regression_cannot_fabricate_elapsed_staleness() {
         assert!(!node_is_behind(1, 100, 10, 20, 1));
+    }
+}
+
+#[cfg(test)]
+mod l2_admission_tests {
+    use super::*;
+    use bloch_pos_committee::l2_settlement::{withdrawal, Activation, Policy, State};
+    use bloch_pos_committee::transition::{FundingInput, L2DataAvailability, L2Deposit, TransferOutput};
+
+    fn policy() -> Policy {
+        Policy {
+            identities: std::array::from_fn(|i| [i as u8 + 1; 32]),
+            proof_policy: [0x0b; 32],
+            chain_id: 700771,
+            initial_l2_parent: [0x0c; 32],
+            initial_l2_state: [0x0d; 32],
+            attestor_set: [0; 32],
+        }
+    }
+    fn txs() -> Vec<PosTransaction> {
+        let change = TransferOutput { value: 1, script_hash: [3; 32] };
+        let input = FundingInput { txid: [4; 32], vout: 0 };
+        vec![
+            PosTransaction::L2Deposit(L2Deposit {
+                network_domain: [1; 32], funding_pubkey: vec![5; 8], inputs: vec![input.clone()],
+                amount_sat: 1, recipient: [6; 20], change: change.clone(), tx_bytes: 0,
+                tip_millisat_per_gas: 0, signature: Vec::new(),
+            }),
+            PosTransaction::L2DataAvailability(L2DataAvailability {
+                network_domain: [1; 32], funding_pubkey: vec![5; 8], inputs: vec![input],
+                l2_chain_id: 700771, l2_block_number: 1, payload: vec![0, 0, 0, 1, 0, 0, 0, 1, 7],
+                change, tx_bytes: 0, tip_millisat_per_gas: 0, signature: Vec::new(),
+            }),
+        ]
+    }
+
+    /// The mempool's L2 door reads the installed L2's profile, not the build:
+    /// no L2 (a running network before its flag day) refuses on every
+    /// build; an activated L2 admits on every build, a mainnet build included.
+    #[test]
+    fn l2_admission_follows_the_installed_profile_not_the_build() {
+        for tx in txs() {
+            assert!(l2_admission_refusal(&tx, None).is_some(), "{tx:?}");
+        }
+        let limits = withdrawal::Limits::DEVELOPMENT;
+        let on = State::activated(Activation { policy: policy(), asynchronous: true, limits }).unwrap();
+        for tx in txs() {
+            assert_eq!(l2_admission_refusal(&tx, Some(&on)), None, "{tx:?}");
+        }
+        // Synchronous activation: no inbox, so no deposits; DA still enters.
+        let sync = State::activated(Activation { policy: policy(), asynchronous: false, limits }).unwrap();
+        let [deposit, da] = <[PosTransaction; 2]>::try_from(txs()).unwrap();
+        assert!(l2_admission_refusal(&deposit, Some(&sync)).is_some());
+        assert_eq!(l2_admission_refusal(&da, Some(&sync)), None);
+        // A development genesis follows the build's devnet features.
+        let dev = State::genesis(policy()).unwrap();
+        assert_eq!(l2_admission_refusal(&da, Some(&dev)).is_none(), cfg!(feature = "devnet-l2-user-txs"));
     }
 }

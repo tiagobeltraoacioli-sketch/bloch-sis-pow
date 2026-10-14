@@ -21,7 +21,8 @@ sign --genesis TRUSTED_FILE --tx FILE --dir KEYSTORE_DIR --out NEW_FILE
 
 Change returns to the funding key. Consensus requires exact conservation at the
 including block's base fee (query getchaininfo next_base_fee_millisat_per_gas).
-Development networks only: a build without devnet-l2-deposits refuses the deposit.";
+The network's L2 must admit deposits (getl2settlement profile): an asynchronous
+development genesis on a devnet-l2-deposits build, or a network past its L2 flag day.";
 
 pub(crate) fn read_text(path: &str) -> Result<String, String> {
     let mut text = String::new();

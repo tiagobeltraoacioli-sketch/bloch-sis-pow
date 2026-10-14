@@ -560,6 +560,11 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_DEVNET_L2_USER_TXS").is_some() {
         devnet.push_str("+devnet-l2-user-txs");
     }
+    if std::env::var_os("CARGO_FEATURE_L2_ACTIVATION_REHEARSAL").is_some() {
+        let epoch = std::env::var("BLOCH_L2_REHEARSAL_ACTIVATION_EPOCH").unwrap_or_default();
+        devnet.push_str(&format!("+l2-activation-rehearsal-e{epoch}"));
+    }
+    println!("cargo:rerun-if-env-changed=BLOCH_L2_REHEARSAL_ACTIVATION_EPOCH");
     println!("cargo:rustc-env=BLOCH_BUILD_VERSION={pkg} ({commit}{dirty}){devnet}");
 
     // ── The machine-readable half, for `getbuildinfo` ──────────────────────
