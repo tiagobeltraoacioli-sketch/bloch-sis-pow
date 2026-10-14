@@ -60,6 +60,8 @@ devnet-l2-deposits = ["bloch-pos-committee/devnet-l2-deposits"]
 devnet-l2-user-txs = ["devnet-l2-deposits", "bloch-pos-committee/devnet-l2-user-txs"]
 # QUALIFICATION BUILDS ONLY; see bloch-pos-committee. Refuses funded manifests.
 l2-activation-rehearsal = ["bloch-pos-committee/l2-activation-rehearsal"]
+# QUALIFICATION BUILDS ONLY; the rehearsal with the mainnet policy values.
+l2-activation-rehearsal-mainnet-policy = ["l2-activation-rehearsal", "bloch-pos-committee/l2-activation-rehearsal-mainnet-policy"]
 
 [dependencies]
 bloch-l2-proof = { path = "../bloch-l2-proof" }

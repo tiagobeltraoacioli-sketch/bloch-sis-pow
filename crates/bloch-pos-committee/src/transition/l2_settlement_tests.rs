@@ -3008,4 +3008,20 @@ mod l2_tests {
         assert!(a.valid() && a.asynchronous && a.policy.identities[0] == [0x93; 32]);
         assert!(crate::l2_settlement::activation_for(None).is_none());
     }
+
+    /// Final-qualification rehearsal builds install the approved mainnet
+    /// values (and pass the mainnet-shape consensus guard), still bound to the
+    /// running development network.
+    #[test]
+    #[cfg(feature = "l2-activation-rehearsal-mainnet-policy")]
+    fn mainnet_policy_rehearsal_installs_the_approved_values() {
+        use crate::l2_settlement::{mainnet, MAINNET_CHAIN_ID};
+        let a = crate::l2_settlement::activation_for(Some([0x93; 32])).unwrap();
+        assert!(a.valid());
+        assert_eq!(a.policy.identities[0], [0x93; 32]);
+        assert_eq!(a.policy.chain_id, MAINNET_CHAIN_ID);
+        assert_eq!(a.asynchronous, mainnet::ASYNCHRONOUS);
+        assert_eq!(a.limits, mainnet::LIMITS);
+        assert_ne!(a.policy.attestor_set, [0; 32]);
+    }
 }

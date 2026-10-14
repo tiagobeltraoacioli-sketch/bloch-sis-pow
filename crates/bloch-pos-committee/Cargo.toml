@@ -38,6 +38,10 @@ devnet-l2-user-txs = ["devnet-l2-deposits"]
 # running network. The node refuses the Genesis-4 mainnet manifest and any
 # manifest with a carryover. Never ship it.
 l2-activation-rehearsal = []
+# QUALIFICATION BUILDS ONLY: the rehearsal above, installing the approved
+# mainnet policy values (chain id 700770, async, mainnet limits, attestor set)
+# instead of the development ones. Final qualification only. Never ship it.
+l2-activation-rehearsal-mainnet-policy = ["l2-activation-rehearsal"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }

@@ -1093,10 +1093,19 @@ pub fn activation_for(network: Option<[u8; 32]>) -> Option<Activation> {
 /// Mixed-fleet rehearsal policy: bound to the running development network,
 /// asynchronous, development limits, placeholder program identity (no proof
 /// is ever produced for it; the rehearsal qualifies the boundary, not the L2).
+///
+/// With `l2-activation-rehearsal-mainnet-policy` (final qualification) the
+/// rehearsal installs the approved MAINNET policy values instead: chain id
+/// [`MAINNET_CHAIN_ID`], [`mainnet::ASYNCHRONOUS`], [`mainnet::LIMITS`], the
+/// committed [`mainnet::ATTESTOR_SET`] hash (a non-zero placeholder while it
+/// is unset) and, once [`mainnet::PROGRAM`] is set, its program identities,
+/// proof policy and L2 genesis. Only the network binding (identities 0..1)
+/// stays the running devnet's, so it still never runs on a funded network.
 #[cfg(feature = "l2-activation-rehearsal")]
 pub fn rehearsal_activation(network: [u8; 32]) -> Activation {
     let id = |label: &[u8]| hash(&[b"BLOCH:L2:REHEARSAL:1", label, &network]);
-    Activation {
+    #[allow(unused_mut)]
+    let mut activation = Activation {
         policy: Policy {
             identities: [network, id(b"genesis"), id(b"domain"), id(b"config"), id(b"elf"), id(b"koalabear"), id(b"bn254")],
             proof_policy: id(b"proof-policy"),
@@ -1107,7 +1116,24 @@ pub fn rehearsal_activation(network: [u8; 32]) -> Activation {
         },
         asynchronous: true,
         limits: withdrawal::Limits::DEVELOPMENT,
+    };
+    #[cfg(feature = "l2-activation-rehearsal-mainnet-policy")]
+    {
+        let policy = &mut activation.policy;
+        policy.chain_id = MAINNET_CHAIN_ID;
+        policy.attestor_set = mainnet::ATTESTOR_SET
+            .and_then(|text| mainnet::attestor_keys(text).ok())
+            .map_or(id(b"attestor-set"), |keys| withdrawal::attestor_set_hash(mainnet::ATTESTOR_THRESHOLD, &keys));
+        if let Some(program) = mainnet::PROGRAM.as_ref() {
+            policy.identities[2..].copy_from_slice(&program.identities[2..]);
+            policy.proof_policy = program.proof_policy;
+            policy.initial_l2_parent = program.initial_l2_parent;
+            policy.initial_l2_state = program.initial_l2_state;
+        }
+        activation.asynchronous = mainnet::ASYNCHRONOUS;
+        activation.limits = mainnet::LIMITS;
     }
+    activation
 }
 
 #[cfg(test)]
