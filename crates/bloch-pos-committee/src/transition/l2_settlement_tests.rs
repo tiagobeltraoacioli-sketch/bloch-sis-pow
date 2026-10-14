@@ -2242,7 +2242,10 @@ mod l2_tests {
     fn l2_settlement_gate_is_inert() {
         assert_eq!(crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH, u64::MAX);
         assert!(!crate::params::l2_settlement_active(u64::MAX - 1));
-        assert!(crate::l2_settlement::activation_policy().is_none());
+        // The pinned policy may be complete (every set-once part filled):
+        // the sentinel epoch alone keeps it inert (`close_epoch` never reads
+        // it before the gate).
+        assert_eq!(crate::l2_settlement::activation_policy(), crate::l2_settlement::mainnet::activation().ok());
     }
 
     #[test]
@@ -2675,13 +2678,14 @@ mod l2_tests {
             }
         );
         assert!(mainnet::LIMITS.valid());
-        // The epoch is not chosen; the attestor set is committed but the
-        // program is unset, so the build still refuses to activate.
+        // The epoch is not chosen; the attestor set and the program are
+        // pinned, so the activation is complete and only the sentinel epoch
+        // keeps it inert.
         assert_eq!(crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH, u64::MAX);
         assert!(mainnet::ATTESTOR_SET.is_some());
-        assert_eq!(mainnet::PROGRAM, None);
-        assert_eq!(mainnet::activation(), Err(mainnet::Incomplete::ProgramUnset));
-        assert!(crate::l2_settlement::activation_policy().is_none());
+        assert!(mainnet::PROGRAM.is_some());
+        let pinned = mainnet::activation().expect("every set-once part is pinned");
+        assert_eq!(crate::l2_settlement::activation_policy(), Some(pinned));
         // Once filled, the activation is exactly the approved policy.
         let set = set_file(3, &mainnet_attestors());
         let a = mainnet::activation_from(Some(&mainnet_program()), Some(&set)).unwrap();
@@ -2709,17 +2713,24 @@ mod l2_tests {
         assert_eq!(hash.iter().map(|b| format!("{b:02x}")).collect::<String>(), expected);
     }
 
-    /// With the attestor set committed, the build refuses on the program.
+    /// With the attestor set and the program committed the build's mainnet
+    /// activation is complete (and inert behind the sentinel epoch); without
+    /// the program it would be refused.
     #[test]
-    fn mainnet_activation_is_refused_while_program_is_unset() {
-        assert_eq!(mainnet::activation(), Err(mainnet::Incomplete::ProgramUnset));
+    fn mainnet_activation_is_complete_with_the_committed_parts() {
         assert_eq!(mainnet::activation_from(None, mainnet::ATTESTOR_SET), Err(mainnet::Incomplete::ProgramUnset));
-        assert!(crate::l2_settlement::activation_policy().is_none());
-        // Filling the program is all that is left.
-        let a = mainnet::activation_from(Some(&mainnet_program()), mainnet::ATTESTOR_SET).unwrap();
-        assert!(a.valid());
+        let a = mainnet::activation().expect("attestor set and program are pinned");
+        assert!(a.valid() && a.asynchronous && a.limits == mainnet::LIMITS);
+        assert_eq!(a.policy.chain_id, crate::l2_settlement::MAINNET_CHAIN_ID);
+        let p = mainnet::PROGRAM.unwrap();
+        assert_eq!(
+            (a.policy.identities, a.policy.proof_policy, a.policy.initial_l2_parent, a.policy.initial_l2_state),
+            (p.identities, p.proof_policy, p.initial_l2_parent, p.initial_l2_state)
+        );
         let keys = mainnet::attestor_keys(mainnet::ATTESTOR_SET.unwrap()).unwrap();
         assert_eq!(a.policy.attestor_set, wd::attestor_set_hash(3, &keys));
+        assert_eq!(crate::l2_settlement::activation_policy(), Some(a));
+        assert_eq!(crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH, u64::MAX);
     }
 
     #[test]
@@ -3053,5 +3064,162 @@ mod l2_tests {
         assert_eq!(a.asynchronous, mainnet::ASYNCHRONOUS);
         assert_eq!(a.limits, mainnet::LIMITS);
         assert_ne!(a.policy.attestor_set, [0; 32]);
+    }
+
+    /// The pinned program (set 2026-10-14) is the mainnet one: Genesis-4
+    /// binding, the L2 domain derived from it, the V3 proof policy of this
+    /// build, distinct non-zero identities, and a valid mainnet activation
+    /// with any 3-of-5 set.
+    #[test]
+    fn mainnet_program_is_pinned_to_genesis4_and_the_v3_policy() {
+        use sha3::{Digest, Keccak256};
+        let p = mainnet::PROGRAM.expect("pinned");
+        let hexs = |b: &[u8; 32]| hex::encode(b);
+        assert_eq!(hexs(&p.identities[0]), "f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966");
+        assert_eq!(hexs(&p.identities[1]), "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415");
+        let mut h = Keccak256::new();
+        h.update(b"BLOCH:L2:MAINNET-DOMAIN:1");
+        h.update(crate::l2_settlement::MAINNET_CHAIN_ID.to_be_bytes());
+        h.update(p.identities[0]);
+        assert_eq!(<[u8; 32]>::from(h.finalize()), p.identities[2], "L2 domain derivation");
+        assert_eq!(p.proof_policy, bloch_l2_proof::policy_commitment_v3());
+        assert!(p.identities.iter().enumerate().all(|(i, id)| *id != [0; 32] && !p.identities[..i].contains(id)));
+        assert!(p.initial_l2_parent != [0; 32] && p.initial_l2_state != [0; 32]);
+        let a = mainnet::activation_from(Some(&p), Some(&set_file(3, &mainnet_attestors()))).unwrap();
+        assert!(a.valid() && a.asynchronous && a.limits == mainnet::LIMITS);
+        assert_eq!(a.policy.chain_id, 700_770);
+    }
+
+    // ── Mainnet program (settlement_v3_mainnet): a real Groth16 proof ─────
+
+    /// Placeholder program with the real network-side identities (Genesis-4
+    /// domain, Genesis-4 genesis, L2 mainnet domain): the async source
+    /// commitment binds only those three, so the request it prints is the one
+    /// the real program is proven against.
+    fn mainnet_request_program() -> mainnet::Program {
+        let hex32 = |s: &str| -> [u8; 32] { hex::decode(s).unwrap().try_into().unwrap() };
+        mainnet::PROGRAM.unwrap_or(mainnet::Program {
+            identities: [
+                hex32("f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966"),
+                hex32("9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"),
+                hex32("1c3f8772d0bdfc22f33efce250a4f471343587859f815f083cfee69d3b6f0733"),
+                [0x13; 32], [0x14; 32], [0x15; 32], [0x16; 32],
+            ],
+            proof_policy: bloch_l2_proof::policy_commitment_v3(),
+            initial_l2_parent: [0x17; 32],
+            initial_l2_state: [0x18; 32],
+        })
+    }
+
+    /// The test chain bound to the program's admission domain (Genesis-4),
+    /// crossing the flag day with `program` and five test attestors at k = 3
+    /// (the real `mainnet::activation_from`), then one empty block: the async
+    /// source of L2 block 1 is frozen at the boundary block.
+    fn mainnet_program_chain(program: &mainnet::Program) -> (CommittedState, Vec<RandaoChain>) {
+        let (_, mut genesis, mut chains) = setup(4);
+        genesis.admission_network_domain = Some(program.identities[0]);
+        let pre = apply(&genesis, 1, &[], &mut chains).unwrap();
+        let activation = mainnet::activation_from(Some(program), Some(&set_file(3, &mainnet_attestors()))).unwrap();
+        assert!(activation.valid());
+        let opened = {
+            let _gate = crate::params::l2_settlement_rehearsal::open();
+            let _policy = crate::l2_settlement::activation_rehearsal::set(activation.clone());
+            apply(&pre, crate::params::SLOTS_PER_EPOCH, &[], &mut chains).unwrap()
+        };
+        let l2 = opened.l2_settlement().expect("installed at the boundary");
+        assert_eq!(l2.policy(), &activation.policy);
+        assert!(l2.profile().is_activated() && l2.asynchronous());
+        let next = apply(&opened, crate::params::SLOTS_PER_EPOCH + 1, &[], &mut chains).unwrap();
+        let source = next.l2_settlement().unwrap().frozen_source().expect("async source frozen");
+        assert_eq!((source.block, source.slot), (*opened.head.as_bytes(), opened.slot));
+        (next, chains)
+    }
+
+    /// Operator helper (bloch-l2-evm `deployment/mainnet`): the native request
+    /// file (`BLOCH_NATIVE_L2_REQUEST`, 11 lines) for L2 block 1 of
+    /// [`mainnet_program_chain`].
+    /// `cargo test -p bloch-pos-committee --lib print_mainnet_program_fixture_request -- --ignored --nocapture`
+    #[test]
+    #[ignore = "operator helper; prints the native request of the mainnet fixture"]
+    fn print_mainnet_program_fixture_request() {
+        let program = mainnet_request_program();
+        let (state, _) = mainnet_program_chain(&program);
+        let l2 = state.l2_settlement().unwrap();
+        let source = l2.frozen_source().unwrap();
+        let h = |b: &[u8; 32]| hex::encode(b);
+        println!("BEGIN-REQUEST");
+        print!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            h(&program.identities[0]), h(&program.identities[1]), h(&source.block), source.slot, source.height,
+            h(&source.commitment), h(&source.inbox_root), h(&[0; 32]), source.inbox_count, l2.consumed(),
+            source.inbox_count
+        );
+        println!("END-REQUEST");
+    }
+
+    /// The pinned mainnet program end to end: a real SP1 Groth16 proof of the
+    /// `settlement_v3_mainnet` guest (L2 block 1 of chain 700770 on the pinned
+    /// L2 genesis, anchored to the frozen native source) settles in the actual
+    /// transition with the real verifier, replays, and is bound to every
+    /// public byte, the proof and the source. Regenerate the fixture with
+    /// bloch-l2-evm `deployment/mainnet/prove-native-fixture.sh` whenever the
+    /// test chain or the program changes.
+    #[test]
+    fn mainnet_program_real_groth16_settles_on_the_activated_l2() {
+        let program = mainnet::PROGRAM.expect("the mainnet program is pinned");
+        let values: &[u8] = include_bytes!("../../../bloch-l2-proof/tests/fixtures/mainnet-empty.values");
+        let proof: [u8; 356] = *include_bytes!("../../../bloch-l2-proof/tests/fixtures/mainnet-empty.proof");
+        let request = include_str!("../../../bloch-l2-proof/tests/fixtures/mainnet-empty.request");
+        // The statement names exactly the pinned program, policy and L2 genesis.
+        assert_eq!(values.len(), STATEMENT_V3_BYTES);
+        assert!(values.starts_with(STATEMENT_V3_TAG));
+        for (i, id) in program.identities.iter().enumerate() {
+            assert_eq!(hash_at(values, S + i * 32), *id, "identity {i}");
+        }
+        assert_eq!(u64::from_be_bytes(values[S + 264..S + 272].try_into().unwrap()), 1);
+        assert_eq!(hash_at(values, S + 272), program.initial_l2_parent);
+        assert_eq!(hash_at(values, S + 304), program.initial_l2_state);
+        assert!(bloch_l2_proof::verify(&program.proof_policy, &program.identities[6], values, &proof));
+        assert!(!bloch_l2_proof::verify(&bloch_l2_proof::policy_commitment(), &program.identities[6], values, &proof));
+
+        let (pre, mut chains) = mainnet_program_chain(&program);
+        let source = pre.l2_settlement().unwrap().frozen_source().unwrap();
+        let lines: Vec<&str> = request.lines().collect();
+        assert_eq!(lines[2], hex::encode(source.block), "fixture made for another test chain: regenerate");
+        assert_eq!(hash_at(values, S + 400), source.block);
+        assert_eq!(hash_at(values, S + 448), source.commitment);
+
+        let settlement = Transaction { proof_policy: program.proof_policy, statement: values.to_vec(), proof };
+        let tx = PosTransaction::L2SettlementAsync(Box::new(settlement.clone()));
+        assert_eq!(PosTransaction::from_canonical_bytes(&tx.canonical_bytes()).unwrap(), tx);
+        let transition = Transition::new(RealProof);
+        let slot = pre.slot + 1;
+        let block = build_block(&transition, &pre, slot, &[], std::slice::from_ref(&tx), &mut chains);
+        let child = transition.apply_block(&pre, &block, &[], std::slice::from_ref(&tx)).unwrap();
+        assert_eq!(child, transition.apply_block(&pre, &block, &[], std::slice::from_ref(&tx)).unwrap());
+        let l2 = child.l2_settlement().unwrap();
+        assert_eq!(l2.settled_number(), 1);
+        assert_eq!(l2.head(), Some((settlement.commitment(), values.to_vec())));
+        assert_eq!(child.accounted_supply_sat(), pre.accounted_supply_sat());
+        assert_ne!(child.state_root(), pre.state_root());
+        // Replay of the same settlement is refused.
+        let mut again = child.clone();
+        assert!(again.apply_transaction(&tx, 0, 1, &RealProof).is_err());
+        assert_eq!(again, child);
+        // The pairing decides: a test verifier and a flipped proof byte refuse.
+        let mut refused = pre.clone();
+        assert_eq!(refused.apply_transaction(&tx, 0, 1, &ToyVerifier), Err(TxReject::L2Settlement(Reject::Proof)));
+        let mut corrupted = settlement.clone();
+        corrupted.proof[12] ^= 1;
+        let mut unchanged = pre.clone();
+        assert_eq!(
+            unchanged.apply_transaction(&PosTransaction::L2SettlementAsync(Box::new(corrupted)), 0, 1, &RealProof),
+            Err(TxReject::L2Settlement(Reject::Proof))
+        );
+        // Another source never verifies.
+        let mut wrong_source = settlement;
+        wrong_source.statement[S + 448] ^= 1;
+        assert!(unchanged.apply_transaction(&PosTransaction::L2SettlementAsync(Box::new(wrong_source)), 0, 1, &RealProof).is_err());
+        assert_eq!(unchanged, pre);
     }
 }

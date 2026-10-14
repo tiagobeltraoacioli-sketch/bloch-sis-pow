@@ -1002,8 +1002,63 @@ pub mod mainnet {
         pub initial_l2_parent: [u8; 32],
         pub initial_l2_state: [u8; 32],
     }
-    /// `None` = UNSET until the mainnet SP1 program and L2 genesis exist.
-    pub const PROGRAM: Option<Program> = None;
+    /// 64 hex characters as 32 bytes, at compile time (a typo fails the build).
+    const fn h32(text: &str) -> [u8; 32] {
+        let b = text.as_bytes();
+        assert!(b.len() == 64, "32-byte hex");
+        let mut out = [0u8; 32];
+        let mut i = 0;
+        while i < 32 {
+            out[i] = (nibble(b[2 * i]) << 4) | nibble(b[2 * i + 1]);
+            i += 1;
+        }
+        out
+    }
+    const fn nibble(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("lowercase hex"),
+        }
+    }
+
+    /// SET 2026-10-14: the `settlement_v3_mainnet` SP1 program of chain
+    /// [`MAINNET_CHAIN_ID`] and its L2 genesis (bloch-l2-evm
+    /// `feat/l2-mainnet-rpc-20261014` f0d53fe; reproduce with
+    /// `deployment/mainnet/make_native_program.py`, see
+    /// `docs/MAINNET-PROGRAM.md` there):
+    ///
+    /// - guest ELF SHA-256 `203114bf34df280d7964fd3ea047907f4bca230ad0e7a0e4bea85b305ad7c473`
+    ///   (3 070 744 bytes; `build-reproducible.sh`, SP1 CLI 6.8.0,
+    ///   succinct-1.96.0-64bit-v2, macOS x86_64, two-checkout reproducible);
+    /// - SP1 circuit v6.1.0, Groth16 wrapper VK SHA-256 `4388a21c…e696`
+    ///   (bound inside the V3 proof policy);
+    /// - L2 genesis: `ChainSpec::mainnet` (no allocation besides the kernel
+    ///   system accounts), domain `MAINNET_DOMAIN`, timestamp 1786656679
+    ///   (Genesis-4 slot 0).
+    pub const PROGRAM: Option<Program> = Some(Program {
+        identities: [
+            // Genesis-4 admission network domain: SHA3-256 of the manifest encoding.
+            h32("f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966"),
+            // Genesis-4 native genesis block id.
+            h32("9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"),
+            // L2 V2 domain: keccak256("BLOCH:L2:MAINNET-DOMAIN:1" || 700770 BE8 || identities[0]).
+            h32("1c3f8772d0bdfc22f33efce250a4f471343587859f815f083cfee69d3b6f0733"),
+            // Execution configuration commitment (ChainSpec::mainnet, CONFIG:2:CANCUN).
+            h32("8ec1c804e67190434fdf72b723103d26938797e90e1b652d366a1b053e3d8f2b"),
+            // settlement_v3_mainnet ELF Keccak-256.
+            h32("6e4c844007cbea4c5a3686f44cfb3b91362c146f3e87199a5229d619fae5c073"),
+            // SP1 KoalaBear verifying-key hash.
+            h32("389cfbde2516711668008cf00222398c6b2a3852266ca79c4ec42c5a6b39ac0e"),
+            // SP1 BN254 verifying-key hash (the Groth16 program key).
+            h32("007139f7bc9459c45b40046780222398cd65470a499b29e72762162d6b39ac0e"),
+        ],
+        // `bloch_l2_proof::policy_commitment_v3()` (settlement V3, user transactions).
+        proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
+        // L2 genesis header hash and state root (chain 700770).
+        initial_l2_parent: h32("632e45ae778da371a88dc1ae430193aa77eabb67a11de18e84fea7d20d11f468"),
+        initial_l2_state: h32("2ad7e807ac2ea14e2f423572fcb9e0f168de4cb26b5bbbd2711caf34cb05c05d"),
+    });
 
     /// Why the mainnet activation cannot be built yet.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

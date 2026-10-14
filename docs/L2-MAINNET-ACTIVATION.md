@@ -83,7 +83,7 @@ New tests (`transition/l2_settlement_tests.rs`, all build-independent):
 | attestors | `ATTESTOR_THRESHOLD`, `ATTESTOR_COUNT` | 3-of-5 hybrid (ML-DSA-65 + Falcon-1024) |
 | limits | `LIMITS` | small delay 64; large ≥ 100 BLCH (= attestation threshold), delay 2 880; retention 2 880; window 2 880 blocks, 1 000 bps, floor 10 BLCH |
 | attestor keys | `ATTESTOR_SET: Option<&str>` | **SET 2026-10-14** — `include_str!("../l2-mainnet/attestors.set")` (`crates/bloch-pos-committee/l2-mainnet/attestors.set`), set hash `1c06adbb7fef042f58d7efd11587689e324c036c3b467081a63b1cf79caccc4b`; generated with `--all` on one machine (move each `.sk` to its operator) |
-| program + L2 genesis | `PROGRAM: Option<Program>` | **`None` (unset)** — 7 identities, proof policy, L2 genesis parent/state |
+| program + L2 genesis | `PROGRAM: Option<Program>` | **set 2026-10-14** — `settlement_v3_mainnet` (ELF `203114bf…`, BN254 vkey `007139f7…`), V3 policy `15486996…`, L2 genesis `632e45ae…` / state `2ad7e807…` (see below) |
 
 - `mainnet::activation()` builds the `Activation` (chain id 700770, attestor
   set hash of the five keys at k = 3, async, `LIMITS`) and refuses with
@@ -268,16 +268,41 @@ observer stayed at e4 (nothing at or after e6), each logging the
    Ethereum-paced inactivity leak from epoch 5700).
 2. **The policy** — decisions approved and encoded 2026-10-14
    (`l2_settlement::mainnet`: async, 3-of-5 attestors, limits, chain id
-   700770). Still **unset** (activation refuses until filled):
+   700770). Both set-once parts are now filled: `mainnet::activation()` is
+   complete and `activation_policy()` returns it; the sentinel epoch keeps it
+   inert until the arming commit:
    - ~~`mainnet::ATTESTOR_SET`~~: DONE 2026-10-14 (set hash `1c06adbb…cc4b`);
      still to do: move each `attestor-I.sk` to its operator and delete it here;
-   - `mainnet::PROGRAM`: SP1 program identity (guest ELF, KoalaBear and BN254
-     keys, proof policy V3 with user transactions), L2 genesis
-     `initial_l2_parent/state` for chain 700770, and identities[0..1] = the
-     Genesis-4 admission domain and native genesis. The real-Groth16 fixture
-     (`native_l2_real_groth16_applies_in_the_actual_transition_and_replays`,
-     ignored) must be regenerated with the SP1 prover for this tree and the
-     mainnet program.
+   - ~~`mainnet::PROGRAM`~~ — **set 2026-10-14** (bloch-l2-evm
+     `feat/l2-mainnet-rpc-20261014`, `docs/MAINNET-PROGRAM.md` there):
+
+     | identity | value |
+     | --- | --- |
+     | 0 Genesis-4 admission domain | `f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966` |
+     | 1 Genesis-4 genesis block | `9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415` |
+     | 2 L2 domain = keccak256(`BLOCH:L2:MAINNET-DOMAIN:1` ‖ 700770 BE8 ‖ id 0) | `1c3f8772d0bdfc22f33efce250a4f471343587859f815f083cfee69d3b6f0733` |
+     | 3 configuration (`ChainSpec::mainnet`) | `8ec1c804e67190434fdf72b723103d26938797e90e1b652d366a1b053e3d8f2b` |
+     | 4 ELF Keccak (`settlement_v3_mainnet`, SHA-256 `203114bf…c473`) | `6e4c844007cbea4c5a3686f44cfb3b91362c146f3e87199a5229d619fae5c073` |
+     | 5 SP1 KoalaBear vkey | `389cfbde2516711668008cf00222398c6b2a3852266ca79c4ec42c5a6b39ac0e` |
+     | 6 SP1 BN254 vkey | `007139f7bc9459c45b40046780222398cd65470a499b29e72762162d6b39ac0e` |
+     | proof policy V3 | `154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d` |
+     | L2 genesis hash / state root | `632e45ae778da371a88dc1ae430193aa77eabb67a11de18e84fea7d20d11f468` / `2ad7e807ac2ea14e2f423572fcb9e0f168de4cb26b5bbbd2711caf34cb05c05d` |
+
+     L2 genesis: no premine (only the EIP-4788 predeploy and the `BLOCK_INFO`
+     head record, zero balances), timestamp 1786656679 (Genesis-4 slot 0),
+     30 M gas, 1 gwei initial base fee. Real Groth16 fixture
+     `mainnet-empty.*` (`bloch-l2-proof/tests/fixtures`): a proof of the
+     mainnet program for L2 block 1 that
+     `mainnet_program_real_groth16_settles_on_the_activated_l2` applies in the
+     actual transition with the real verifier. It binds the test chain's
+     boundary block, whose state root commits the whole policy: regenerate it
+     (`print_mainnet_program_fixture_request`, then bloch-l2-evm
+     `deployment/mainnet/prove-native-fixture.sh`) if the PROGRAM or the test
+     chain changes. The old V2 fixture test
+     (`native_l2_real_groth16_applies_in_the_actual_transition_and_replays`)
+     stays ignored: it pins the retired devnet V2 guest. With both
+     `ATTESTOR_SET` and `PROGRAM` set, `activation_policy()` is `Some`; the
+     sentinel epoch alone keeps it inert (`l2_settlement_gate_is_inert`).
 3. **Historical replay** (above) — PASS required.
 4. **Mixed fleet** (above) — PASS required, on the rebased build.
 5. **Operational gaps found while doing this:**
