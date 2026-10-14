@@ -7,6 +7,8 @@ use bincode::Options;
 use crate::header::BlockHeaderV4;
 
 const LIMIT: u64 = 512 * 1024 * 1024;
+/// Marks the optional trailing L2 settlement section of a cached state.
+const L2_SECTION: &[u8; 16] = b"BPOSST01:L2:v1\0\0";
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedState {
     admission_network_domain: Option<[u8; 32]>,
@@ -125,11 +127,6 @@ impl CommittedState {
     /// length if serialization fails; existing prefix bytes remain untouched.
     pub fn append_local_cache(&self, bytes: &mut Vec<u8>) -> Result<(), String> {
         let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat, l2_settlement } = self;
-        // The L2 settlement component has no local-cache codec yet: such a
-        // node replays instead (the restore root check would refuse anyway).
-        if l2_settlement.is_some() {
-            return Err("L2 settlement state is not locally cacheable".into());
-        }
         let value = CachedStateRef {
             admission_network_domain,
             slot,
@@ -184,6 +181,21 @@ impl CommittedState {
             .serialize_into(&mut *bytes, &value) {
             bytes.truncate(original_len);
             return Err(error.to_string());
+        }
+        // The L2 settlement component is an optional trailing section, so a
+        // state without L2 (every network before the activation epoch) keeps
+        // exactly the bytes it had before L2 existed.
+        if let Some(l2) = l2_settlement {
+            bytes.extend_from_slice(L2_SECTION);
+            if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
+                .serialize_into(&mut *bytes, l2) {
+                bytes.truncate(original_len);
+                return Err(error.to_string());
+            }
+            if bytes.len() - original_len > LIMIT as usize {
+                bytes.truncate(original_len);
+                return Err("local cache payload exceeds its limit".into());
+            }
         }
         Ok(())
     }
@@ -245,8 +257,20 @@ impl CommittedState {
     /// provenance. Rebuild all derived ledger indexes and its Merkle subtree;
     /// neither cached tree nodes nor a raw BlockId deserializer are trusted.
     pub fn decode_local_cache(bytes: &[u8], header: &BlockHeaderV4) -> Result<Self, String> {
+        // The reader advances past the base payload; what remains is either
+        // nothing or exactly one L2 section (see `append_local_cache`).
+        let mut rest = bytes;
         let value: CachedState = bincode::DefaultOptions::new().with_limit(LIMIT)
-            .reject_trailing_bytes().deserialize(bytes).map_err(|e| e.to_string())?;
+            .deserialize_from(&mut rest).map_err(|e| e.to_string())?;
+        let l2_settlement = if rest.is_empty() {
+            None
+        } else {
+            let section = rest.strip_prefix(L2_SECTION.as_slice())
+                .ok_or("unexpected bytes after the cached state")?;
+            let l2: crate::l2_settlement::State = bincode::DefaultOptions::new().with_limit(LIMIT)
+                .reject_trailing_bytes().deserialize(section).map_err(|e| e.to_string())?;
+            Some(l2.from_local_cache()?)
+        };
         let count = value.eutxos.len();
         let eutxos: EutxoSet = value.eutxos.into_iter().collect();
         if eutxos.entries.by_outpoint.len() != count { return Err("duplicate cached outpoint".into()); }
@@ -295,7 +319,7 @@ impl CommittedState {
             coherence_nullifier_root: value.coherence_nullifier_root,
             evm: value.evm,
             issued_sat: value.issued_sat,
-            l2_settlement: None,
+            l2_settlement,
         };
         if state.slot != header.slot || state.epoch != header.slot / crate::params::SLOTS_PER_EPOCH || state.compute_root() != header.state_root {
             return Err("cached state does not match its block header".into());

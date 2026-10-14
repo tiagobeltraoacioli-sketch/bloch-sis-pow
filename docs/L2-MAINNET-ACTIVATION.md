@@ -203,9 +203,13 @@ peering among upgraded validators before the epoch.**
 3. **Historical replay** (above) — PASS required.
 4. **Mixed fleet** (above) — PASS required, on the rebased build.
 5. **Operational gaps found while doing this:**
-   - the local state cache does not store L2 state (a node holding L2 replays
-     from genesis on restart). After activation that applies to every mainnet
-     node; extend the cache codec before arming, or accept full replays;
+   - ~~the local state cache does not store L2 state~~ — done: the L2
+     component is an optional trailing section of the cache payload
+     (`BPOSST01:L2:v1`); states without L2 keep their exact bytes, restore
+     rechecks the inbox root, escrow conservation and claim count, takes a
+     development profile from the build, and the header root check binds the
+     rest (`local_cache_carries_l2_state_and_keeps_pre_activation_bytes`,
+     `local_cache_restore_rechecks_uncommitted_invariants`);
    - the mempool refuses synchronous settlements (0x12) outright; only the
      async path (0x13) is wired in the node.
 6. **L2 node / RPC items raised by the DEX work** (L2 repo, not this tree):

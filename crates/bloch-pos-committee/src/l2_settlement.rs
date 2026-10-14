@@ -151,6 +151,7 @@ pub mod da {
     }
 
     /// One stored DA record.
+    #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Record {
         pub l2_number: u64,
@@ -212,6 +213,7 @@ pub mod withdrawal {
     /// installed and never changed. [`Limits::DEVELOPMENT`] are the constants
     /// below, used by every L2 from a development genesis manifest (devnet4
     /// replays unchanged); a running-network activation pins its own.
+    #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Limits {
         /// See [`WITHDRAW_DELAY_BLOCKS`].
@@ -388,6 +390,7 @@ pub mod withdrawal {
     }
 
     /// One accepted settlement that added withdrawals.
+    #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Record {
         pub l2_number: u64,
@@ -547,6 +550,7 @@ pub mod withdrawal {
     }
 
     /// Release accounting of the current window.
+    #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct ReleaseWindow {
         /// Window index (`native height / RELEASE_WINDOW_BLOCKS`).
@@ -655,6 +659,7 @@ pub mod withdrawal {
     /// the newest withdrawals: with claims roughly in leaf order it stays a
     /// few words, and in the worst case (every 256th leaf left unclaimed) it
     /// is 40 bytes per 256 leaves. Indices are below 2^32 (tree depth).
+    #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
     pub struct ClaimBitmap {
         floor: u64,
@@ -720,6 +725,7 @@ const L2_BODY_TAG: &[u8] = b"BLOCH:EVM:BODY:2";
 
 /// One escrowed native deposit, in inbox order. Its fields are exactly the
 /// L2 `DepositProvenance::BridgedBlch` plus the EVM recipient.
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InboxRecord {
     /// Native height of the block containing the deposit transaction.
@@ -983,6 +989,7 @@ pub(crate) mod activation_rehearsal {
 
 /// What an installed L2 admits beyond empty settlements. Fixed when the L2
 /// is installed; consensus reads it from the state, never from the build.
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Profile {
     /// Native deposits into the inbox (0x14), and V2 bodies bound to the
@@ -1040,6 +1047,7 @@ impl Profile {
 /// Immutable network configuration, installed only by a new genesis constructor.
 /// The first seven hashes follow the V2 statement: native network/genesis,
 /// L2 domain/configuration, guest ELF, KoalaBear key and BN254 key.
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
     pub identities: [[u8; 32]; 7],
@@ -1087,6 +1095,7 @@ pub struct Source {
     /// Inbox records known at the source (the root commits to all of them).
     pub inbox_count: u64,
 }
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     policy: Policy,
@@ -1667,6 +1676,47 @@ impl State {
     }
 }
 
+/// Local restart cache support (`transition::local_cache`). Not a consensus
+/// or state-sync format: the node binds the cache to its own build, manifest
+/// and block log, and the restore recomputes the state root.
+#[cfg(feature = "local-state-cache")]
+impl State {
+    /// Recheck what the committed bytes summarise but do not contain, and
+    /// take a development profile from this build exactly as a replay would
+    /// (cargo features are not part of the cache's build binding).
+    pub(crate) fn from_local_cache(mut self) -> Result<Self, String> {
+        if !self.profile.activated {
+            self.profile = Profile::development();
+        }
+        let mut root = empty_inbox_root();
+        let mut deposited = 0u128;
+        for record in &self.inbox {
+            root = hash(&[b"BLOCH:NATIVE:L2:INBOX:1", &root, &record.encode()]);
+            deposited = deposited.checked_add(u128::from(record.sats))
+                .ok_or("cached L2 inbox overflows")?;
+        }
+        if root != self.inbox_root {
+            return Err("cached L2 inbox does not match its root".into());
+        }
+        if self.consumed > self.inbox.len() as u64 {
+            return Err("cached L2 inbox cursor is past the inbox".into());
+        }
+        if deposited.checked_sub(self.released_sat) != Some(self.escrow_sat) {
+            return Err("cached L2 escrow does not match deposits and releases".into());
+        }
+        let stored: u64 = self.claimed.words().map(|(_, bits)| {
+            bits.iter().map(|b| u64::from(b.count_ones())).sum::<u64>()
+        }).sum();
+        let full = self.claimed.floor().checked_mul(256).ok_or("cached L2 claim floor overflows")?;
+        if self.claimed.words().any(|(word, _)| word < self.claimed.floor())
+            || full.checked_add(stored) != Some(self.claimed.claims())
+        {
+            return Err("cached L2 claim set is inconsistent".into());
+        }
+        Ok(self)
+    }
+}
+
 #[cfg(test)]
 mod inbox_tests {
     use super::*;
@@ -1727,5 +1777,55 @@ mod inbox_tests {
         assert_eq!(digest, "66469230128b9e871eb65c938c300ce51b4e42136468145f7e54c211ade696d4");
         assert_eq!(StatementVersion::of(&s), Some(StatementVersion::V3));
         assert_eq!(StatementVersion::of(&s[..STATEMENT_BYTES]), None);
+    }
+
+    /// The local restart cache rechecks what the state root summarises (the
+    /// inbox records behind its root, escrow conservation, the claim count)
+    /// and takes a development profile from the running build.
+    #[test]
+    #[cfg(feature = "local-state-cache")]
+    fn local_cache_restore_rechecks_uncommitted_invariants() {
+        let policy = Policy {
+            identities: [[7; 32]; 7],
+            proof_policy: [8; 32],
+            chain_id: 700771,
+            initial_l2_parent: [9; 32],
+            initial_l2_state: [10; 32],
+            attestor_set: [0; 32],
+        };
+        let mut good = State::genesis_async(policy).unwrap();
+        good.native_height = 3;
+        good.append_deposit(InboxRecord { height: 2, tx_index: 0, txid: [1; 32], vout: 0, sats: 9_000, recipient: [2; 20] }).unwrap();
+        good.append_deposit(InboxRecord { height: 3, tx_index: 0, txid: [3; 32], vout: 1, sats: 1_000, recipient: [4; 20] }).unwrap();
+        assert!(good.claimed.insert(0) && good.claimed.insert(5));
+        good.escrow_sat -= 600;
+        good.released_sat = 600;
+        assert_eq!(good.clone().from_local_cache(), Ok(good.clone()));
+
+        // A development profile is the build's, whatever the cache carried.
+        let mut foreign = good.clone();
+        foreign.profile.deposits = !foreign.profile.deposits;
+        foreign.profile.limits.delay_blocks += 1;
+        assert_eq!(foreign.from_local_cache().unwrap().profile, Profile::development());
+        // An activated profile is committed and kept as cached.
+        let mut activated = good.clone();
+        activated.profile = Profile::activated(withdrawal::Limits::DEVELOPMENT);
+        assert_eq!(activated.clone().from_local_cache(), Ok(activated));
+
+        let mut record = good.clone();
+        record.inbox[1].sats += 1;
+        record.escrow_sat += 1;
+        assert!(record.from_local_cache().is_err(), "inbox records must match the root");
+        let mut escrow = good.clone();
+        escrow.escrow_sat += 1;
+        assert!(escrow.from_local_cache().is_err(), "escrow must be conserved");
+        let mut cursor = good.clone();
+        cursor.consumed = 3;
+        assert!(cursor.from_local_cache().is_err(), "the cursor stays within the inbox");
+        let mut claims = good.clone();
+        let mut bitmap = serde_json::to_value(&claims.claimed).unwrap();
+        bitmap["claims"] = serde_json::json!(3);
+        claims.claimed = serde_json::from_value(bitmap).unwrap();
+        assert!(claims.from_local_cache().is_err(), "the claim count matches the bitmap");
     }
 }

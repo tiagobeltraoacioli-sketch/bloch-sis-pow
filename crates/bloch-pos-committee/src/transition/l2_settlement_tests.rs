@@ -2569,6 +2569,13 @@ mod l2_tests {
         assert_eq!(post.balance_sat(&recipient), balance + u128::from(sats));
         // Replay: refused.
         assert!(post.l2_withdraw_claim_refusal(&tx).is_some());
+        // The restart cache restores all of it (inbox, DA, withdrawals,
+        // claim bitmap, release window, activated profile).
+        #[cfg(feature = "local-state-cache")]
+        {
+            assert!(l2.claimed().claims() == 1 && !l2.withdrawal_roots().is_empty());
+            local_cache_round_trip(&post);
+        }
     }
 
     #[test]
@@ -2637,6 +2644,97 @@ mod l2_tests {
         admitted
             .apply_transaction(&PosTransaction::L2Settlement(Box::new(settlement)), 0, 1, &ProofDouble)
             .expect("user transactions settle on the activated L2 on every build");
+    }
+
+    /// Bind `state` to a header carrying its root, cache it and restore it.
+    #[cfg(feature = "local-state-cache")]
+    fn local_cache_round_trip(state: &CommittedState) -> (CommittedState, Vec<u8>, crate::header::BlockHeaderV4) {
+        let mut state = state.clone();
+        let header = crate::header::BlockHeaderV4 {
+            version: BLOCK_VERSION_V4, parent: [0; 32], state_root: state.compute_root(),
+            body_root: [0; 32], slot: state.slot, proposer_index: 0,
+            randao_reveal: [0; 32], randao_mix: state.randao_mix,
+            justified_root: [0; 32], finalized_root: [0; 32],
+            attestation_root: [0; 32], coherence_root: [0; 32],
+        };
+        state.head = header.id();
+        let bytes = state.encode_local_cache().unwrap();
+        let restored = CommittedState::decode_local_cache(&bytes, &header).expect("cached state restores");
+        assert_eq!(restored, state);
+        assert_eq!(restored.state_root(), state.state_root());
+        (state, bytes, header)
+    }
+
+    /// The restart cache carries the L2 settlement component as an optional
+    /// trailing section: states without L2 (every network before the
+    /// activation epoch) keep their exact bytes, and a node holding L2 (after
+    /// activation, or on a devnet) restores it instead of replaying.
+    #[test]
+    #[cfg(feature = "local-state-cache")]
+    fn local_cache_carries_l2_state_and_keeps_pre_activation_bytes() {
+        // Before activation: the pre-L2 encoding, byte for byte.
+        let (pre, _, _) = funded_running_without_l2();
+        let (pre, bytes, header) = local_cache_round_trip(&pre);
+        assert_eq!(bytes, pre.encode_local_cache_owned_reference().unwrap(), "pre-activation cache bytes are unchanged");
+        let marker: &[u8] = b"BPOSST01:L2:v1";
+        assert!(!bytes.windows(marker.len()).any(|w| w == marker));
+        let mut trailing = bytes.clone(); trailing.push(0);
+        assert!(CommittedState::decode_local_cache(&trailing, &header).is_err());
+
+        // The flag-day state, then a state with an inbox, DA, a settled head,
+        // retained withdrawals, a claim and a release window.
+        let (opened, mut chains) = activated_fixture(true, [0; 32]);
+        let (opened, opened_bytes, opened_header) = local_cache_round_trip(&opened);
+        assert_eq!(&opened_bytes[..], {
+            let mut base = opened.clone();
+            base.l2_settlement = None;
+            let mut expected = base.encode_local_cache().unwrap();
+            assert_eq!(expected, base.encode_local_cache_owned_reference().unwrap());
+            expected.extend_from_slice(&opened_bytes[expected.len()..]);
+            expected
+        }.as_slice(), "the L2 section only appends");
+        assert!(opened_bytes.windows(marker.len()).any(|w| w == marker));
+        let restored = CommittedState::decode_local_cache(&opened_bytes, &opened_header).unwrap();
+        assert!(restored.l2_settlement().unwrap().profile().is_activated());
+        // A cache without its L2 section, or with garbage after it, is refused.
+        let mut without = opened.clone();
+        without.l2_settlement = None;
+        assert!(CommittedState::decode_local_cache(&without.encode_local_cache().unwrap(), &opened_header).is_err());
+        let mut garbage = opened_bytes.clone(); garbage.push(0);
+        assert!(CommittedState::decode_local_cache(&garbage, &opened_header).is_err());
+        let mut bad_marker = opened_bytes.clone();
+        let at = bad_marker.windows(marker.len()).position(|w| w == marker).unwrap();
+        bad_marker[at] ^= 1;
+        assert!(CommittedState::decode_local_cache(&bad_marker, &opened_header).is_err());
+        assert!(CommittedState::decode_local_cache(&opened_bytes[..opened_bytes.len() - 1], &opened_header).is_err());
+
+        let deposit = deposit_tx(&opened, 70 * BLCH);
+        let deposit_wire = PosTransaction::L2Deposit(deposit.clone());
+        let mut slot = opened.slot + 1;
+        let s2 = apply(&opened, slot, std::slice::from_ref(&deposit_wire), &mut chains).unwrap();
+        slot += 1;
+        let payload = batch(&[&[0x02, 0xc0], b"second"]);
+        let da = da_tx(&s2, (deposit_wire.txid(), 0), deposit.change.value, 1, payload.clone());
+        let s3 = apply(&s2, slot, &[PosTransaction::L2DataAvailability(da)], &mut chains).unwrap();
+        slot += 1;
+        let first = PosTransaction::L2SettlementAsync(Box::new(v3_with_da(&s3, da::commitment(700771, 1, &payload))));
+        let s4 = apply(&s3, slot, &[first], &mut chains).unwrap();
+        assert!(!s3.l2_settlement().unwrap().data_availability().is_empty());
+        let l2 = s4.l2_settlement().unwrap();
+        assert!(!l2.inbox().is_empty() && l2.settled_number() == 1);
+        let (_, s4_bytes, s4_header) = local_cache_round_trip(&s4);
+        // A cache of another L2 state under this header fails the root check.
+        let (_, s3_bytes, _) = local_cache_round_trip(&s3);
+        assert!(CommittedState::decode_local_cache(&s3_bytes, &s4_header).is_err());
+        assert_ne!(s3_bytes, s4_bytes);
+
+        // Withdrawals, a paid claim and a release window: see the end of
+        // `activated_l2_deposits_settles_user_transactions_and_pays_claims`.
+
+        // A development (manifest genesis) L2 restores with this build's profile.
+        let (devnet, _) = fixture_mode(true);
+        let (devnet, _, _) = local_cache_round_trip(&devnet);
+        assert_eq!(devnet.l2_settlement().unwrap().profile(), &Profile::development());
     }
 
     /// Qualification builds only: the gate is the compiled epoch, and the
