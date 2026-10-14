@@ -82,14 +82,15 @@ New tests (`transition/l2_settlement_tests.rs`, all build-independent):
 | mode | `ASYNCHRONOUS` | `true` |
 | attestors | `ATTESTOR_THRESHOLD`, `ATTESTOR_COUNT` | 3-of-5 hybrid (ML-DSA-65 + Falcon-1024) |
 | limits | `LIMITS` | small delay 64; large ≥ 100 BLCH (= attestation threshold), delay 2 880; retention 2 880; window 2 880 blocks, 1 000 bps, floor 10 BLCH |
-| attestor keys | `ATTESTOR_SET: Option<&str>` | **`None` (unset)** — the `l2-claim attestor-set` file, via `include_str!` |
+| attestor keys | `ATTESTOR_SET: Option<&str>` | **SET 2026-10-14** — `include_str!("../l2-mainnet/attestors.set")` (`crates/bloch-pos-committee/l2-mainnet/attestors.set`), set hash `1c06adbb7fef042f58d7efd11587689e324c036c3b467081a63b1cf79caccc4b`; generated with `--all` on one machine (move each `.sk` to its operator) |
 | program + L2 genesis | `PROGRAM: Option<Program>` | **`None` (unset)** — 7 identities, proof policy, L2 genesis parent/state |
 
 - `mainnet::activation()` builds the `Activation` (chain id 700770, attestor
   set hash of the five keys at k = 3, async, `LIMITS`) and refuses with
   `Incomplete::{AttestorKeysUnset, AttestorSet, ProgramUnset}` while a part is
   missing or the set is not exactly 5 distinct enveloped hybrid keys at threshold 3.
-- `activation_policy()` = `mainnet::activation().ok()` → `None` today.
+- `activation_policy()` = `mainnet::activation().ok()` → `None` today
+  (`Incomplete::ProgramUnset`: the attestor set is committed, the program is not).
 - Consensus guard: `Activation::valid()` now also requires, for an activation
   on chain id 700770, async + a non-zero attestor set + exactly
   `mainnet::LIMITS`. So even an armed gate never installs a mainnet L2 without
@@ -268,8 +269,8 @@ observer stayed at e4 (nothing at or after e6), each logging the
 2. **The policy** — decisions approved and encoded 2026-10-14
    (`l2_settlement::mainnet`: async, 3-of-5 attestors, limits, chain id
    700770). Still **unset** (activation refuses until filled):
-   - `mainnet::ATTESTOR_SET`: run the key ceremony ("Attestor keys" above),
-     assemble `attestors.set`, commit it;
+   - ~~`mainnet::ATTESTOR_SET`~~: DONE 2026-10-14 (set hash `1c06adbb…cc4b`);
+     still to do: move each `attestor-I.sk` to its operator and delete it here;
    - `mainnet::PROGRAM`: SP1 program identity (guest ELF, KoalaBear and BN254
      keys, proof policy V3 with user transactions), L2 genesis
      `initial_l2_parent/state` for chain 700770, and identities[0..1] = the

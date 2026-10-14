@@ -984,9 +984,12 @@ pub mod mainnet {
     /// The attestor set, SET ONCE before the flag day: the text that
     /// `bloch-pos l2-claim attestor-set --threshold 3 --pubkey … --out` writes
     /// (threshold line, then the five enveloped public keys in hex, in set
-    /// order), e.g. `Some(include_str!("../l2-mainnet/attestors.set"))`.
-    /// `None` = UNSET: [`activation`] refuses.
-    pub const ATTESTOR_SET: Option<&str> = None;
+    /// order). `None` = UNSET: [`activation`] refuses.
+    ///
+    /// SET 2026-10-14 (`generate-mainnet-attestor-keys.sh --all`, then
+    /// `--assemble`): set hash
+    /// `1c06adbb7fef042f58d7efd11587689e324c036c3b467081a63b1cf79caccc4b`.
+    pub const ATTESTOR_SET: Option<&str> = Some(include_str!("../l2-mainnet/attestors.set"));
 
     /// The L2 program and genesis the activation pins: the seven V2
     /// identities (Genesis-4 admission domain, native genesis, L2 domain,
@@ -1063,8 +1066,8 @@ pub mod mainnet {
 
 /// The activation pinned for the running network: [`mainnet::activation`]
 /// once every set-once part is filled. `None` today: the approved policy
-/// (async, 3-of-5 attestors, limits) is recorded but the attestor keys and
-/// the L2 program/genesis are unset. An armed epoch without one is refused by
+/// (async, 3-of-5 attestors, limits) and the attestor keys are recorded but
+/// the L2 program/genesis is unset. An armed epoch without one is refused by
 /// `armed_l2_gate_has_a_policy`.
 pub fn activation_policy() -> Option<Activation> {
     #[cfg(test)]

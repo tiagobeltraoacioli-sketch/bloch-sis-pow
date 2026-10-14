@@ -2675,11 +2675,12 @@ mod l2_tests {
             }
         );
         assert!(mainnet::LIMITS.valid());
-        // The epoch is not chosen and the set-once parts are unset.
+        // The epoch is not chosen; the attestor set is committed but the
+        // program is unset, so the build still refuses to activate.
         assert_eq!(crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH, u64::MAX);
-        assert_eq!(mainnet::ATTESTOR_SET, None);
+        assert!(mainnet::ATTESTOR_SET.is_some());
         assert_eq!(mainnet::PROGRAM, None);
-        assert_eq!(mainnet::activation(), Err(mainnet::Incomplete::AttestorKeysUnset));
+        assert_eq!(mainnet::activation(), Err(mainnet::Incomplete::ProgramUnset));
         assert!(crate::l2_settlement::activation_policy().is_none());
         // Once filled, the activation is exactly the approved policy.
         let set = set_file(3, &mainnet_attestors());
@@ -2693,12 +2694,41 @@ mod l2_tests {
         assert!(l2.profile().is_activated() && l2.deposits_enabled() && l2.user_transactions());
     }
 
+    /// The committed mainnet attestor set (generated 2026-10-14): 3-of-5
+    /// distinct enveloped hybrid keys with the set hash `--assemble` printed.
+    #[test]
+    fn committed_mainnet_attestor_set_parses() {
+        let text = mainnet::ATTESTOR_SET.expect("mainnet attestor set committed");
+        let keys = mainnet::attestor_keys(text).expect("3-of-5 enveloped hybrid keys");
+        assert_eq!(keys.len(), 5);
+        assert!(keys.iter().enumerate().all(|(i, k)| !keys[..i].contains(k)));
+        assert!(keys.iter().all(|k| k.len() == crate::transition::funded::ADMISSION_PQ_KEY_BYTES));
+        assert_eq!(text.lines().next().map(str::trim), Some("3"));
+        let expected = "1c06adbb7fef042f58d7efd11587689e324c036c3b467081a63b1cf79caccc4b";
+        let hash = wd::attestor_set_hash(mainnet::ATTESTOR_THRESHOLD, &keys);
+        assert_eq!(hash.iter().map(|b| format!("{b:02x}")).collect::<String>(), expected);
+    }
+
+    /// With the attestor set committed, the build refuses on the program.
+    #[test]
+    fn mainnet_activation_is_refused_while_program_is_unset() {
+        assert_eq!(mainnet::activation(), Err(mainnet::Incomplete::ProgramUnset));
+        assert_eq!(mainnet::activation_from(None, mainnet::ATTESTOR_SET), Err(mainnet::Incomplete::ProgramUnset));
+        assert!(crate::l2_settlement::activation_policy().is_none());
+        // Filling the program is all that is left.
+        let a = mainnet::activation_from(Some(&mainnet_program()), mainnet::ATTESTOR_SET).unwrap();
+        assert!(a.valid());
+        let keys = mainnet::attestor_keys(mainnet::ATTESTOR_SET.unwrap()).unwrap();
+        assert_eq!(a.policy.attestor_set, wd::attestor_set_hash(3, &keys));
+    }
+
     #[test]
     fn mainnet_activation_is_refused_while_attestor_keys_are_unset() {
         use mainnet::Incomplete as I;
         let program = mainnet_program();
         let keys = mainnet_attestors();
-        // The build refuses to produce an activation.
+        // A policy without the attestor set is refused (constructed directly:
+        // the build's own set is committed).
         assert_eq!(mainnet::activation_from(Some(&program), None), Err(I::AttestorKeysUnset));
         assert_eq!(mainnet::activation_from(None, None), Err(I::AttestorKeysUnset));
         assert_eq!(mainnet::activation_from(None, Some(&set_file(3, &keys))), Err(I::ProgramUnset));
