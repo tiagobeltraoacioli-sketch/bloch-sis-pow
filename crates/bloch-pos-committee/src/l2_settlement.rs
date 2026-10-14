@@ -811,6 +811,33 @@ fn n(bytes: &[u8], offset: usize) -> u64 {
     u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
+/// The L2 policy a running network installs when
+/// [`crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH`] binds, and whether its
+/// settlement is asynchronous (wire tag [`ASYNC_WIRE_TAG`]). `None` until the
+/// mainnet policy is decided: the proof program keys, the L2 genesis, the
+/// chain id and the attestor set. An armed epoch without a policy is refused
+/// by `armed_l2_gate_has_a_policy`.
+pub fn activation_policy() -> Option<(Policy, bool)> {
+    #[cfg(test)]
+    if let Some(p) = activation_rehearsal::policy() {
+        return Some(p);
+    }
+    None
+}
+
+#[cfg(test)]
+pub(crate) mod activation_rehearsal {
+    use super::Policy;
+    use std::cell::RefCell;
+    thread_local! { static POLICY: RefCell<Option<(Policy, bool)>> = const { RefCell::new(None) }; }
+    pub fn policy() -> Option<(Policy, bool)> { POLICY.with(|p| p.borrow().clone()) }
+    pub fn set(policy: Policy, asynchronous: bool) -> impl Drop {
+        struct Restore(Option<(Policy, bool)>);
+        impl Drop for Restore { fn drop(&mut self) { POLICY.with(|p| *p.borrow_mut() = self.0.take()); } }
+        Restore(POLICY.with(|p| p.borrow_mut().replace((policy, asynchronous))))
+    }
+}
+
 /// Immutable network configuration, installed only by a new genesis constructor.
 /// The first seven hashes follow the V2 statement: native network/genesis,
 /// L2 domain/configuration, guest ELF, KoalaBear key and BN254 key.

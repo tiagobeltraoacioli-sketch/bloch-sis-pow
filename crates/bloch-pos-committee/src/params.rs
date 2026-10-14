@@ -2282,6 +2282,44 @@ pub(crate) mod funded_delegation_rehearsal {
     }
 }
 
+/// Flag day for the native L2 settlement on a network that is already running
+/// (M8 part 2). `u64::MAX` means INERT.
+///
+/// Before the gate, a network without an L2 policy keeps no L2 state, the
+/// L2 state component is absent from the state root (historical roots are
+/// unchanged) and every L2 transaction is refused as on builds without L2.
+/// At the first epoch boundary whose new epoch is `>=` this value, a network
+/// that still has no L2 state installs [`crate::l2_settlement::activation_policy`]
+/// if, and only if, that policy names this network's admission domain. Other
+/// networks are unaffected.
+///
+/// Arming requires the policy (proof program keys, L2 genesis, chain id,
+/// attestor set) to be pinned in `l2_settlement::activation_policy`, a
+/// historical replay of the network with this build, mixed-fleet
+/// qualification and an explicit coordinated epoch; there is no runtime
+/// override. `l2_settlement_gate_is_inert` pins the value.
+pub const L2_SETTLEMENT_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn l2_settlement_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_settlement_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_SETTLEMENT_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_settlement_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Candidate ST-16 cancellation path for funded validators that remain in the
 /// activation queue. `u64::MAX` means INERT.
 ///

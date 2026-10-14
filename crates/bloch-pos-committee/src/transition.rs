@@ -5615,6 +5615,25 @@ impl CommittedState {
         // 5. Open E+1. The cohort cap for the new epoch is applied inside
         //    duty_roster_at (genesis_cohort.rs closed form — rule 3).
         st.epoch = next_epoch;
+        // M8 part 2: a running network without L2 state installs the pinned
+        // activation policy at the flag day, only if the policy names this
+        // network. Inert while `L2_SETTLEMENT_ACTIVATION_EPOCH` is the sentinel.
+        if st.l2_settlement.is_none() && crate::params::l2_settlement_active(next_epoch) {
+            if let Some((policy, asynchronous)) = crate::l2_settlement::activation_policy() {
+                if st.admission_network_domain == Some(policy.identities[0]) {
+                    let installed = if asynchronous {
+                        crate::l2_settlement::State::genesis_async(policy)
+                    } else {
+                        crate::l2_settlement::State::genesis(policy)
+                    };
+                    // An invalid pinned policy is refused by
+                    // `armed_l2_gate_has_a_policy`; it never reaches consensus.
+                    if let Ok(state) = installed {
+                        st.l2_settlement = Some(state);
+                    }
+                }
+            }
+        }
         // A funded position becomes withdrawable only after both the fixed
         // cool-down and the churn-budget drain have completed. A crowded exit
         // queue can take longer than the nominal cool-down.

@@ -2196,4 +2196,145 @@ mod l2_tests {
         // Replay in the next block: refused.
         refuse_then_apply(&post, slot + 1, &[claim(&tx)], 0, &[], &mut chains);
     }
+
+    // ── M8 part 2: activation of the L2 on a running network ──────────────
+
+    /// A network that has run without L2: no policy at genesis, bound domain.
+    fn running_without_l2() -> (CommittedState, Policy) {
+        let (_, mut genesis, _) = setup(4);
+        genesis.admission_network_domain = Some([0x91; 32]);
+        let identities = std::array::from_fn(|i| hash_at(TEMPLATE, S + i * 32));
+        let mut policy = Policy {
+            identities,
+            proof_policy: bloch_l2_proof::policy_commitment(),
+            chain_id: 700771,
+            initial_l2_parent: hash_at(TEMPLATE, S + 272),
+            initial_l2_state: hash_at(TEMPLATE, S + 304),
+            attestor_set: [0; 32],
+        };
+        policy.identities[0] = [0x91; 32];
+        policy.identities[1] = *genesis.head.as_bytes();
+        assert!(genesis.l2_settlement().is_none());
+        (genesis, policy)
+    }
+
+    #[test]
+    fn l2_settlement_gate_is_inert() {
+        assert_eq!(crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH, u64::MAX);
+        assert!(!crate::params::l2_settlement_active(u64::MAX - 1));
+        assert!(crate::l2_settlement::activation_policy().is_none());
+    }
+
+    #[test]
+    fn armed_l2_gate_has_a_policy() {
+        if crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH != u64::MAX {
+            let (policy, _) = crate::l2_settlement::activation_policy()
+                .expect("an armed L2 gate needs a pinned activation policy");
+            assert!(policy.valid());
+            assert!(crate::l2_settlement::State::genesis(policy).is_ok());
+        }
+    }
+
+    #[test]
+    fn inert_boundary_keeps_the_state_root() {
+        let (genesis, policy) = running_without_l2();
+        let plain = genesis.close_epoch();
+        // A pinned policy alone does nothing while the gate is the sentinel.
+        let _policy = crate::l2_settlement::activation_rehearsal::set(policy, false);
+        let with_policy = genesis.close_epoch();
+        assert!(with_policy.l2_settlement().is_none());
+        assert_eq!(with_policy.state_root(), plain.state_root());
+        assert_eq!(with_policy, plain);
+    }
+
+    #[test]
+    fn activation_installs_the_policy_at_the_boundary() {
+        for asynchronous in [false, true] {
+            let (genesis, policy) = running_without_l2();
+            let inert = genesis.close_epoch();
+            let _gate = crate::params::l2_settlement_rehearsal::open();
+            let _policy = crate::l2_settlement::activation_rehearsal::set(policy.clone(), asynchronous);
+            // Mid-epoch blocks are untouched: activation happens at the boundary.
+            assert!(genesis.l2_settlement().is_none());
+            let opened = genesis.close_epoch();
+            let l2 = opened.l2_settlement().expect("installed at the boundary");
+            assert_eq!(l2.policy(), &policy);
+            assert_eq!(l2.height(), 0);
+            assert_eq!(opened.epoch, genesis.epoch + 1);
+            // The L2 component enters the state root only now.
+            assert_ne!(opened.state_root(), inert.state_root());
+            let mut without = opened.clone();
+            without.l2_settlement = None;
+            assert_eq!(without.state_root(), inert.state_root());
+            // Installed once: the next boundary does not reset it.
+            let next = opened.close_epoch();
+            assert_eq!(next.l2_settlement().map(|s| s.policy()), Some(&policy));
+        }
+    }
+
+    #[test]
+    fn activation_ignores_other_networks() {
+        let (genesis, mut policy) = running_without_l2();
+        policy.identities[0] = [0x92; 32];
+        let _gate = crate::params::l2_settlement_rehearsal::open();
+        let _policy = crate::l2_settlement::activation_rehearsal::set(policy, false);
+        let opened = genesis.close_epoch();
+        assert!(opened.l2_settlement().is_none());
+        let mut unbound = genesis.clone();
+        unbound.admission_network_domain = None;
+        assert!(unbound.close_epoch().l2_settlement().is_none());
+    }
+
+    #[test]
+    fn activation_never_replaces_existing_l2_state() {
+        let (pre, _) = fixture();
+        let mut other = pre.l2_settlement().unwrap().policy().clone();
+        other.chain_id = 1;
+        other.identities[0] = pre.admission_network_domain.unwrap();
+        let _gate = crate::params::l2_settlement_rehearsal::open();
+        let _policy = crate::l2_settlement::activation_rehearsal::set(other, false);
+        let next = pre.close_epoch();
+        assert_eq!(next.l2_settlement().unwrap().policy(), pre.l2_settlement().unwrap().policy());
+        assert_eq!(next.l2_settlement().unwrap().policy().chain_id, 700771);
+    }
+
+    #[test]
+    fn settlements_are_refused_before_and_admitted_after_activation() {
+        let (_, mut genesis, mut chains) = setup(4);
+        let (_, policy) = running_without_l2();
+        genesis.admission_network_domain = Some(policy.identities[0]);
+        let mut policy = policy;
+        policy.identities[1] = *genesis.head.as_bytes();
+        let t = Transition::new(ToyVerifier);
+
+        // Epoch 0, before the flag day: a block applies, no L2 state, the
+        // settlement wire is refused exactly as by a build without L2.
+        let first = build_block(&t, &genesis, 1, &[], &[], &mut chains);
+        let before = t.apply_block(&genesis, &first, &[], &[]).unwrap();
+        assert!(before.l2_settlement().is_none());
+        let (with_l2, _) = fixture();
+        let foreign = transaction(&with_l2);
+        assert_eq!(
+            before.clone().apply_transaction(&PosTransaction::L2Settlement(Box::new(foreign)), 0, 1, &ProofDouble),
+            Err(TxReject::L2Settlement(Reject::NotActive))
+        );
+
+        // The first block of epoch 1 crosses the boundary: the flag day
+        // installs the policy, and the block itself is the L2's native height 1.
+        let _gate = crate::params::l2_settlement_rehearsal::open();
+        let _policy = crate::l2_settlement::activation_rehearsal::set(policy.clone(), false);
+        let boundary = build_block(&t, &before, crate::params::SLOTS_PER_EPOCH, &[], &[], &mut chains);
+        let opened = t.apply_block(&before, &boundary, &[], &[]).unwrap();
+        let l2 = opened.l2_settlement().expect("installed at the boundary");
+        assert_eq!(l2.policy(), &policy);
+        assert_eq!(l2.height(), 1);
+
+        // A settlement built against the activated L2 is admitted in the next block.
+        let tx = PosTransaction::L2Settlement(Box::new(transaction(&opened)));
+        let mut admitted = opened.clone();
+        admitted.apply_transaction(&tx, 0, 1, &ProofDouble)
+            .expect("a settlement against the activated L2 is admitted");
+        assert_ne!(admitted.state_root(), opened.state_root());
+    }
 }
+
