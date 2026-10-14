@@ -2297,9 +2297,13 @@ pub(crate) mod funded_delegation_rehearsal {
 /// attestor set) to be pinned in `l2_settlement::activation_policy`, a
 /// historical replay of the network with this build, mixed-fleet
 /// qualification and an explicit coordinated epoch; there is no runtime
-/// override. `l2_settlement_gate_is_inert` pins the value.
+/// override. `l2_settlement_gate_is_armed_at_the_mainnet_epoch` pins the value.
+///
+/// Mainnet: epoch 5850 (first slot 187200, 2026-10-17 21:31:19 UTC), chosen
+/// 2026-10-14 after the archival replay of the full L1 history and the final
+/// qualification passed on this build.
 #[cfg(not(feature = "l2-activation-rehearsal"))]
-pub const L2_SETTLEMENT_ACTIVATION_EPOCH: u64 = u64::MAX;
+pub const L2_SETTLEMENT_ACTIVATION_EPOCH: u64 = 5_850;
 /// Qualification builds (`l2-activation-rehearsal`) only: the compile-time
 /// epoch of the mixed-fleet rehearsal. Such a build refuses funded manifests.
 #[cfg(feature = "l2-activation-rehearsal")]

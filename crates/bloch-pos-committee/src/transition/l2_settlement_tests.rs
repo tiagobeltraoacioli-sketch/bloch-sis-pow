@@ -2239,13 +2239,15 @@ mod l2_tests {
     }
 
     #[test]
-    fn l2_settlement_gate_is_inert() {
-        assert_eq!(crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH, u64::MAX);
-        assert!(!crate::params::l2_settlement_active(u64::MAX - 1));
-        // The pinned policy may be complete (every set-once part filled):
-        // the sentinel epoch alone keeps it inert (`close_epoch` never reads
-        // it before the gate).
-        assert_eq!(crate::l2_settlement::activation_policy(), crate::l2_settlement::mainnet::activation().ok());
+    #[cfg(not(feature = "l2-activation-rehearsal"))]
+    fn l2_settlement_gate_is_armed_at_the_mainnet_epoch() {
+        assert_eq!(crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH, 5_850);
+        assert!(!crate::params::l2_settlement_active(5_849));
+        assert!(crate::params::l2_settlement_active(5_850));
+        // `close_epoch` reads the policy only from the gate on; it is the
+        // complete approved mainnet activation.
+        let pinned = crate::l2_settlement::mainnet::activation().expect("every set-once part is pinned");
+        assert_eq!(crate::l2_settlement::activation_policy(), Some(pinned));
     }
 
     #[test]
@@ -2678,10 +2680,10 @@ mod l2_tests {
             }
         );
         assert!(mainnet::LIMITS.valid());
-        // The epoch is not chosen; the attestor set and the program are
-        // pinned, so the activation is complete and only the sentinel epoch
-        // keeps it inert.
-        assert_eq!(crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH, u64::MAX);
+        // The attestor set and the program are pinned, so the activation is
+        // complete; it is installed at the mainnet epoch.
+        #[cfg(not(feature = "l2-activation-rehearsal"))]
+        assert_eq!(crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH, 5_850);
         assert!(mainnet::ATTESTOR_SET.is_some());
         assert!(mainnet::PROGRAM.is_some());
         let pinned = mainnet::activation().expect("every set-once part is pinned");
@@ -2730,7 +2732,8 @@ mod l2_tests {
         let keys = mainnet::attestor_keys(mainnet::ATTESTOR_SET.unwrap()).unwrap();
         assert_eq!(a.policy.attestor_set, wd::attestor_set_hash(3, &keys));
         assert_eq!(crate::l2_settlement::activation_policy(), Some(a));
-        assert_eq!(crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH, u64::MAX);
+        #[cfg(not(feature = "l2-activation-rehearsal"))]
+        assert_eq!(crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH, 5_850);
     }
 
     #[test]
