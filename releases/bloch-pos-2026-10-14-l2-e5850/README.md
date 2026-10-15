@@ -28,8 +28,10 @@ source-digest sha3-256:820f775507cd41651adf4ed9a1aeb0ace434917ac86d5dd051593fb91
 **Consensus change.** This release arms the native L2 settlement at epoch
 **5850** (first slot 187200, 2026-10-17 21:31:19 UTC). Every node must run
 this binary before that epoch; a node on an older binary forks off the network
-at epoch 5850. Before epoch 5850, rolling back to the previous release
-(`bloch-pos-2026-09-22`) is safe. After the first block of epoch 5850 is
+at epoch 5850. It also carries the Ethereum-paced inactivity leak from epoch
+**5700** (2026-10-16 05:31:19 UTC), so nodes still on the previous release
+(node `3a68f10b`, 2026-10-09) should upgrade before epoch 5700. Rolling back to
+`3a68f10b` is safe only before epoch 5700. After the first block of epoch 5850 is
 finalized there is no rollback; the remedy for a defect is a new forward
 release. If the activation is postponed, the replacement release
 `bloch-pos-2026-10-14-l2-postpone` (same build, gate disarmed) must be
