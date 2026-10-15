@@ -161,3 +161,14 @@ becomes necessary, the epoch is postponed (§7) rather than compressed.
 
 Only messages on the channels above, signed with the release key, are
 authoritative. We will never ask for keys, passphrases or seed material.
+
+## 9. Go / no-go record (2026-10-15)
+
+- Measured at 2026-10-15 ~17:00 UTC from `getvalidators` (effective stake of
+  active validators): **89.2 %** of active stake runs `78b7343a` (all
+  operator-run validators, 62 of 106 active), plus both archivals. External
+  validators (10.8 %) had not reported a version.
+- This is below the 90 % threshold of §7. **Decision: GO.** The activation at
+  epoch 5850 proceeds. The upgraded stake is well above the 2/3 needed to
+  finalize, so the chain keeps finalizing after epoch 5850; external
+  validators that have not upgraded by then fork off and must upgrade (§5).
