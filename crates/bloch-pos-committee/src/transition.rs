@@ -5632,6 +5632,19 @@ impl CommittedState {
                 }
             }
         }
+        // Claim finality on this chain (NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH):
+        // record this chain's checkpoint of the epoch being opened. `head` is
+        // still the parent here — the last block strictly before the new
+        // epoch's first slot, the root `Engine::checkpoint_root` has
+        // attesters vote — also across empty epochs rolled in one block.
+        // Inert below the gate: nothing recorded, L2 bytes unchanged.
+        if crate::params::native_claim_finality_active(next_epoch) {
+            let finalized_epoch = st.finality_engine.finalized().epoch;
+            let root = *st.head.as_bytes();
+            if let Some(l2) = st.l2_settlement.as_mut() {
+                l2.record_checkpoint_root(next_epoch, root, finalized_epoch);
+            }
+        }
         // A funded position becomes withdrawable only after both the fixed
         // cool-down and the churn-budget drain have completed. A crowded exit
         // queue can take longer than the nominal cool-down.

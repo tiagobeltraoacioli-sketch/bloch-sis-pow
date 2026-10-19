@@ -9,6 +9,10 @@ use crate::header::BlockHeaderV4;
 const LIMIT: u64 = 512 * 1024 * 1024;
 /// Marks the optional trailing L2 settlement section of a cached state.
 const L2_SECTION: &[u8; 16] = b"BPOSST01:L2:v1\0\0";
+/// Marks the optional section after the L2 one holding the L2 state's own
+/// checkpoint roots (`params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH`).
+/// Written only when non-empty, so every earlier cache keeps its bytes.
+const L2_CHECKPOINT_SECTION: &[u8; 16] = b"BPOSST01:L2CP:v1";
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedState {
     admission_network_domain: Option<[u8; 32]>,
@@ -192,6 +196,14 @@ impl CommittedState {
                 bytes.truncate(original_len);
                 return Err(error.to_string());
             }
+            if !l2.checkpoint_roots().is_empty() {
+                bytes.extend_from_slice(L2_CHECKPOINT_SECTION);
+                if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
+                    .serialize_into(&mut *bytes, l2.checkpoint_roots()) {
+                    bytes.truncate(original_len);
+                    return Err(error.to_string());
+                }
+            }
             if bytes.len() - original_len > LIMIT as usize {
                 bytes.truncate(original_len);
                 return Err("local cache payload exceeds its limit".into());
@@ -265,10 +277,20 @@ impl CommittedState {
         let l2_settlement = if rest.is_empty() {
             None
         } else {
-            let section = rest.strip_prefix(L2_SECTION.as_slice())
+            let mut section = rest.strip_prefix(L2_SECTION.as_slice())
                 .ok_or("unexpected bytes after the cached state")?;
-            let l2: crate::l2_settlement::State = bincode::DefaultOptions::new().with_limit(LIMIT)
-                .reject_trailing_bytes().deserialize(section).map_err(|e| e.to_string())?;
+            let mut l2: crate::l2_settlement::State = bincode::DefaultOptions::new().with_limit(LIMIT)
+                .deserialize_from(&mut section).map_err(|e| e.to_string())?;
+            if !section.is_empty() {
+                let roots_section = section.strip_prefix(L2_CHECKPOINT_SECTION.as_slice())
+                    .ok_or("unexpected bytes after the cached L2 state")?;
+                let roots: BTreeMap<u64, [u8; 32]> = bincode::DefaultOptions::new().with_limit(LIMIT)
+                    .reject_trailing_bytes().deserialize(roots_section).map_err(|e| e.to_string())?;
+                if roots.is_empty() {
+                    return Err("empty cached L2 checkpoint-root section".into());
+                }
+                l2.restore_checkpoint_roots(roots);
+            }
             Some(l2.from_local_cache()?)
         };
         let count = value.eutxos.len();

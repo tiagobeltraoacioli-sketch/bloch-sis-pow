@@ -3360,9 +3360,11 @@ mod l2_tests {
         }
     }
 
-    /// REPRODUCTION (rules as they stand): branch B finalizes A's epoch-1
-    /// checkpoint and the claim releases on B — and on A. One withdrawal,
-    /// two payouts, one per side of the split.
+    /// REPRODUCTION (rules as they stand, i.e. below
+    /// `NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH`, which history replays
+    /// under): branch B finalizes A's epoch-E checkpoint and the claim
+    /// releases on B, and on A. One withdrawal, two payouts, one per side of
+    /// the split.
     #[test]
     fn split_claim_releases_on_a_branch_that_finalized_the_other_branchs_checkpoint() {
         let split_claims::Split { a, b, mut ca, mut cb, a_cp, b_cp } = split_claims::split();
@@ -3376,5 +3378,94 @@ mod l2_tests {
                 .unwrap_or_else(|e| panic!("claim block on {name}: {e:?}"));
             assert_eq!(post.balance_sat(&recipient), before + u128::from(sats), "paid on {name}");
         }
+    }
+
+    /// AFTER `NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH`: the same split, the
+    /// same votes, the same finality on both branches — and the claim pays
+    /// only on A, the branch whose own checkpoint was finalized. On B it is
+    /// refused `NotFinalized`, in the mempool check and in a block.
+    const CP_TAG: &[u8] = b"BLOCH:NATIVE:L2:CHECKPOINT-ROOTS:1";
+
+    #[test]
+    fn split_claim_is_refused_where_the_finalized_checkpoint_is_not_the_chains_own() {
+        let _rule = crate::params::native_claim_finality_test::open();
+        let split_claims::Split { a, b, mut ca, mut cb, a_cp, b_cp } = split_claims::split();
+        let e = split_claims::E;
+        // Each branch recorded ITS OWN checkpoint of the finalized epoch.
+        assert_eq!(a.l2_settlement().unwrap().checkpoint_root(e), Some(a_cp));
+        assert_eq!(b.l2_settlement().unwrap().checkpoint_root(e), Some(b_cp));
+        for st in [&a, &b] {
+            assert!(st.l2_settlement().unwrap().checkpoint_roots().len() <= 4);
+            assert!(st.l2_settlement().unwrap().committed_bytes()
+                .windows(CP_TAG.len()).any(|w| w == CP_TAG));
+        }
+
+        // B: refused, and a block carrying it is invalid.
+        let tx = split_claims::claim_on(&b);
+        assert_eq!(b.l2_withdraw_claim_refusal(&tx), Some(ClaimReject::NotFinalized));
+        let (recipient, sats) = wleaf(2);
+        let before_b = b.balance_sat(&recipient);
+        let b_post = refuse_then_apply(&b, split_claims::CLAIM_SLOT, &[claim(&tx)], 0, &[], &mut cb);
+        assert_eq!(b_post.balance_sat(&recipient), before_b);
+
+        // A: unchanged, it pays.
+        let tx = split_claims::claim_on(&a);
+        assert_eq!(a.l2_withdraw_claim_refusal(&tx), None);
+        let before_a = a.balance_sat(&recipient);
+        let a_post = split_claims::block_with(&a, split_claims::CLAIM_SLOT, &[], &[claim(&tx)], &mut ca)
+            .expect("the claim pays on the branch whose checkpoint is final");
+        assert_eq!(a_post.balance_sat(&recipient), before_a + u128::from(sats));
+
+        // The roots survive the restart cache (their own trailing section).
+        #[cfg(feature = "local-state-cache")]
+        {
+            let (_, bytes, _) = local_cache_round_trip(&a_post);
+            assert!(bytes.windows(16).any(|w| w == b"BPOSST01:L2CP:v1"));
+        }
+    }
+
+    /// Below the gate (the default, `u64::MAX`) nothing is recorded: the L2
+    /// committed bytes, hence every state root and every cache, are those of
+    /// the release, and the split still pays on both sides (the reproduction
+    /// above runs below the gate).
+    #[test]
+    fn below_the_claim_finality_gate_nothing_is_recorded() {
+        assert_eq!(crate::params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH, u64::MAX);
+        let split_claims::Split { a, b, .. } = split_claims::split();
+        for st in [&a, &b] {
+            let l2 = st.l2_settlement().unwrap();
+            assert!(l2.checkpoint_roots().is_empty());
+            assert!(!l2.committed_bytes().windows(CP_TAG.len()).any(|w| w == CP_TAG));
+        }
+        #[cfg(feature = "local-state-cache")]
+        {
+            let (_, bytes, _) = local_cache_round_trip(&a);
+            assert!(!bytes.windows(16).any(|w| w == b"BPOSST01:L2CP:v1"));
+        }
+    }
+
+    #[test]
+    fn native_claim_finality_gate_is_inert() {
+        assert_eq!(crate::params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH, u64::MAX);
+        for epoch in [0, 5_850, 10_000, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::native_claim_finality_active(epoch));
+        }
+    }
+
+    /// A stalled finality keeps the finalized epoch's root and the three
+    /// newest: FFG at the close of epoch c can only finalize c - 1.
+    #[test]
+    fn checkpoint_roots_stay_bounded_through_a_finality_stall() {
+        let (pre, _) = split_claims::parent();
+        let mut l2 = pre.l2_settlement().unwrap().clone();
+        for epoch in 3..200u64 {
+            l2.record_checkpoint_root(epoch, [epoch as u8; 32], 3);
+            assert!(l2.checkpoint_roots().len() <= 4);
+        }
+        assert_eq!(l2.checkpoint_roots().keys().copied().collect::<Vec<_>>(), vec![3, 197, 198, 199]);
+        // Finality resumes at 198 (closing 199): its root is there.
+        l2.record_checkpoint_root(200, [200; 32], 198);
+        assert_eq!(l2.checkpoint_roots().keys().copied().collect::<Vec<_>>(), vec![198, 199, 200]);
+        assert_eq!(l2.checkpoint_root(198), Some([198; 32]));
     }
 }

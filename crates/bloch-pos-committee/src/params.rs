@@ -2391,6 +2391,60 @@ pub(crate) mod l2_settlement_rehearsal {
     }
 }
 
+/// L2 withdrawal claims (0x16) release only against a finalized checkpoint
+/// that lies on the claim's OWN chain. `u64::MAX` means INERT.
+///
+/// The rule as it stands (`withdrawal::record_finalized`) compares epochs
+/// only, and the FFG tally (`finality::FinalityState::process_epoch`) counts
+/// votes by `target_root` without asking whether that root is an ancestor of
+/// the block carrying them. In a split, a branch that includes the other
+/// side's votes finalizes the other side's checkpoint and, under the old rule,
+/// releases claims on itself: one withdrawal, a payout on each side
+/// (security review 2026-10-19; reproduced by
+/// `split_claim_releases_on_a_branch_that_finalized_the_other_branchs_checkpoint`).
+///
+/// Once armed, from the first block of this epoch:
+/// - every epoch boundary records the chain's own checkpoint root for the new
+///   epoch (the parent block: the last block strictly before the epoch's
+///   first slot, the convention attesters vote) in the L2 state
+///   (`l2_settlement::State::checkpoint_roots`, committed, at most four
+///   entries);
+/// - a claim is admitted only if, in addition to the old rule, the finalized
+///   checkpoint's root equals this chain's own root at that epoch. Otherwise
+///   it is refused `NotFinalized`, the refusal it already had.
+///
+/// Below the gate nothing is recorded (the L2 committed bytes, hence every
+/// state root, are byte-identical) and claims follow the old rule exactly,
+/// so history replays unchanged. Claims pause from activation until the
+/// first checkpoint recorded under the rule finalizes (~2 epochs on a
+/// healthy chain).
+///
+/// ARMING THIS IS A FOUNDER DECISION: it changes block validity (a claim
+/// that applies today is refused after it), so the whole fleet must run the
+/// new release before the epoch. `native_claim_finality_gate_is_inert` pins
+/// the inert value.
+pub const NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn native_claim_finality_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if native_claim_finality_test::forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod native_claim_finality_test {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Candidate ST-16 cancellation path for funded validators that remain in the
 /// activation queue. `u64::MAX` means INERT.
 ///

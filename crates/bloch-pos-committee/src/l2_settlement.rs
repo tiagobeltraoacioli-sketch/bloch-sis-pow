@@ -480,6 +480,12 @@ pub mod withdrawal {
     /// Whether the record accepted at native height `record_height` is in
     /// the finalized prefix, seen from the block at (`tip_height`,
     /// `tip_slot`) whose finalized checkpoint epoch is `finalized_epoch`.
+    ///
+    /// EPOCHS ONLY: it trusts that the finalized checkpoint is on the tip's
+    /// own chain, which FFG does not guarantee (a branch can finalize the
+    /// checkpoint of another branch whose votes it carries). Consensus reads
+    /// it through `CommittedState::l2_record_finalized_for_claim`, which adds
+    /// that check from `params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH`.
     pub fn record_finalized(record_height: u64, tip_height: u64, tip_slot: u64, finalized_epoch: u64) -> bool {
         if record_height > tip_height {
             return false;
@@ -1343,6 +1349,15 @@ pub struct State {
     release_window: withdrawal::ReleaseWindow,
     /// What this L2 admits and its limits, fixed at installation.
     profile: Profile,
+    /// This chain's own checkpoint roots (epoch -> root), recorded at each
+    /// epoch boundary from `params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH`
+    /// and empty before it: a claim is final only if the finalized
+    /// checkpoint is one of them. At most four entries (see
+    /// [`State::record_checkpoint_root`]). Committed (last, absent while
+    /// empty); the local cache carries it in its own trailing section so the
+    /// cached bytes of this struct do not change.
+    #[cfg_attr(feature = "local-state-cache", serde(skip))]
+    checkpoint_roots: std::collections::BTreeMap<u64, [u8; 32]>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -1397,6 +1412,7 @@ impl State {
             released_sat: 0,
             release_window: withdrawal::ReleaseWindow::default(),
             profile: Profile::development(),
+            checkpoint_roots: std::collections::BTreeMap::new(),
         })
     }
     pub(crate) fn genesis_async(policy: Policy) -> Result<Self, Reject> {
@@ -1488,6 +1504,31 @@ impl State {
     /// The release window a claim in the next native block sees.
     pub fn release_window(&self) -> withdrawal::ReleaseWindow {
         self.release_window.at(&self.profile.limits, self.native_height.saturating_add(1), self.escrow_sat)
+    }
+    /// Record `root` as this chain's checkpoint of `epoch` (the epoch the
+    /// boundary opens), with `finalized_epoch` the finalized checkpoint after
+    /// the boundary's tally. FFG finalizes only the epoch before the one it
+    /// closes, so besides the finalized epoch's root (claims read it while
+    /// finality stalls) only the three newest entries can ever be read: at
+    /// most four are kept, whatever the stall.
+    pub(crate) fn record_checkpoint_root(&mut self, epoch: u64, root: [u8; 32], finalized_epoch: u64) {
+        self.checkpoint_roots.insert(epoch, root);
+        self.checkpoint_roots.retain(|e, _| *e == finalized_epoch || e.saturating_add(2) >= epoch);
+    }
+    /// This chain's own checkpoint root of `epoch`, if recorded (see
+    /// `params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH`).
+    pub fn checkpoint_root(&self, epoch: u64) -> Option<[u8; 32]> {
+        self.checkpoint_roots.get(&epoch).copied()
+    }
+    /// The recorded own-chain checkpoint roots, oldest first.
+    pub fn checkpoint_roots(&self) -> &std::collections::BTreeMap<u64, [u8; 32]> {
+        &self.checkpoint_roots
+    }
+    /// Local-cache restore only; the state root check that follows the
+    /// restore authenticates what is put back.
+    #[cfg(feature = "local-state-cache")]
+    pub(crate) fn restore_checkpoint_roots(&mut self, roots: std::collections::BTreeMap<u64, [u8; 32]>) {
+        self.checkpoint_roots = roots;
     }
     /// Leaves `0..matured_count` are claimable in the next native block.
     pub fn matured_count(&self) -> u64 {
@@ -1744,6 +1785,17 @@ impl State {
                 out.extend_from_slice(&r.l2_number.to_le_bytes());
                 out.extend_from_slice(&r.commitment);
                 out.extend_from_slice(&r.height.to_le_bytes());
+            }
+        }
+        // Absent while empty: nothing is recorded below
+        // NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH, so earlier states keep
+        // their bytes.
+        if !self.checkpoint_roots.is_empty() {
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:CHECKPOINT-ROOTS:1");
+            out.extend_from_slice(&(self.checkpoint_roots.len() as u64).to_le_bytes());
+            for (epoch, root) in &self.checkpoint_roots {
+                out.extend_from_slice(&epoch.to_le_bytes());
+                out.extend_from_slice(root);
             }
         }
         out
