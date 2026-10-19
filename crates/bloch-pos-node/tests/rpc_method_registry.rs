@@ -94,6 +94,7 @@ const ROUTED: &[(&str, &str)] = &[
     ("getchaininfo", "ChainInfo"),
     ("getbuildinfo", "BuildInfo"),
     ("getl2settlement", "L2Settlement"),
+    ("getkes", "Kes"),
     ("getblockraw", "BlockRaw"),
     ("getblockcount", "BlockCount"),
     ("getblockbyslot", "BlockBySlot"),

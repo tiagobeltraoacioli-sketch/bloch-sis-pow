@@ -91,7 +91,7 @@ const KEYSTORE_MAGIC_V2: &[u8; 8] = b"BPOSKEY2";
 
 /// The only KDF this format knows. A byte rather than an implied constant so
 /// a future KDF is a *refusal* on old binaries instead of a misparse.
-const KDF_ARGON2ID: u8 = 1;
+pub(crate) const KDF_ARGON2ID: u8 = 1;
 
 /// Upper bound on the Argon2 memory cost this node will honour when opening a
 /// file. The parameters live in the keystore, and a keystore is a file an
@@ -202,7 +202,7 @@ impl KdfParams {
     }
 
     /// Argon2id(passphrase, salt) → 32-byte AEAD key, zeroized on drop.
-    fn derive(self, passphrase: &str, salt: &[u8; 32]) -> io::Result<Zeroizing<[u8; 32]>> {
+    pub(crate) fn derive(self, passphrase: &str, salt: &[u8; 32]) -> io::Result<Zeroizing<[u8; 32]>> {
         self.derive_with_legacy_work(passphrase, salt, false)
     }
 
@@ -871,7 +871,7 @@ impl Keystore {
 /// normal. `NotFound` is passed through unchanged: it is the observer signal
 /// `load_optional` depends on, and `fs::metadata` reports it with the same
 /// kind `fs::read` did.
-fn read_keystore_file(path: &Path) -> io::Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn read_keystore_file(path: &Path) -> io::Result<Zeroizing<Vec<u8>>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1342,10 +1342,17 @@ impl bloch_pos_committee::attestation::SignatureVerifier for ProbeVerifier {
     fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
         true
     }
+
+    /// The probe's proposer signature is empty; from KES enforcement on it
+    /// must pass here exactly as it does through `verify_with_key` before
+    /// (devnet4 halted at its KES activation without this, 2026-10-14).
+    fn verify_kes(&self, _public: &bloch_pos_committee::kes::KesPublic, _period: u64, _message: &[u8; 32], _sig: &[u8]) -> bool {
+        true
+    }
 }
 
 /// Fill `buf` from the OS entropy pool (`/dev/urandom`). Devnet-grade.
-fn os_random(buf: &mut [u8]) -> io::Result<()> {
+pub(crate) fn os_random(buf: &mut [u8]) -> io::Result<()> {
     use std::io::Read;
     let mut f = fs::File::open("/dev/urandom")?;
     f.read_exact(buf)

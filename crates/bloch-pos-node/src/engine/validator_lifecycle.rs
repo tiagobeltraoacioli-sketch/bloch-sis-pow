@@ -33,7 +33,44 @@ fn is_lifecycle(tx: &PosTransaction) -> bool {
             | PosTransaction::ExitV2 { .. }
             | PosTransaction::RandaoRecommit { .. }
             | PosTransaction::SlashingEvidence(_)
+            | PosTransaction::KesRegister { .. }
     )
+}
+
+/// Mempool hygiene for KES registration (0x17), which consensus accepts once
+/// per validator (`check_kes_register` refuses a validator that already has a
+/// key). Relay policy only: consensus repeats its own check on the block's
+/// pre-state and nothing here changes block validity (devnet line 7606f74f).
+///
+/// Two refusals, each with its own reason so an operator can tell them apart:
+/// a key already in COMMITTED state, and a registration for the same validator
+/// already PENDING here (two pending registrations for one validator can never
+/// both apply; first come, first kept — the rule the funded deposit uses for a
+/// joining key). Once the first is included, `revalidate_lifecycle_mempool`
+/// evicts anything left behind against committed state. Both checks are
+/// cheap and run before any signature verification.
+pub(super) fn kes_register_conflict(
+    state: &CommittedState,
+    mempool: &BTreeMap<Vec<u8>, PosTransaction>,
+    tx: &PosTransaction,
+) -> Result<(), Refusal> {
+    let PosTransaction::KesRegister { validator, .. } = tx else {
+        return Ok(());
+    };
+    if state.kes_public(*validator).is_some() {
+        return Err(Refusal::Invalid(
+            "KES key already registered for this validator: registration (tag 0x17) \
+             is once-only and consensus refuses a re-registration",
+        ));
+    }
+    if mempool.values().any(|pending| {
+        matches!(pending, PosTransaction::KesRegister { validator: other, .. } if other == validator)
+    }) {
+        return Err(Refusal::Invalid(
+            "a KES registration for this validator is already pending; only one can apply",
+        ));
+    }
+    Ok(())
 }
 
 /// Delegates only cryptographic calls that survive consensus' cheap-first
@@ -109,6 +146,7 @@ impl Engine {
         if !is_lifecycle(tx) {
             return Ok(());
         }
+        kes_register_conflict(&self.state, &self.mempool, tx)?;
         let total = self.state.active_validators().iter()
             .map(|v| u128::from(v.effective_stake)).sum();
         let fee = self.state.next_base_fee();
@@ -138,7 +176,8 @@ impl Engine {
             PosTransaction::ValidatorCommissionUpdate(t) => Some(validator_lifecycle_source(t.validator)),
             PosTransaction::ExitV2 { pubkey_hash, .. } => self.state
                 .validator_index_by_hash(pubkey_hash).map(validator_lifecycle_source),
-            PosTransaction::RandaoRecommit { validator, .. } =>
+            PosTransaction::RandaoRecommit { validator, .. }
+            | PosTransaction::KesRegister { validator, .. } =>
                 Some(validator_lifecycle_source(*validator)),
             PosTransaction::SlashingEvidence(evidence) => {
                 let validator = match evidence {

@@ -882,6 +882,8 @@ pub enum RpcRequest {
     BuildInfo,
     /// Committed asynchronous settlement source and cursor.
     L2Settlement,
+    /// `getkes`: the KES schedule and every registered forward-secure key.
+    Kes,
     /// Exact public envelope for independent consensus replay.
     BlockRaw([u8; 32]),
     /// `getblockcount` — the polling method, carrying finality with it.
@@ -1277,6 +1279,7 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
         "getchaininfo" => RpcRequest::ChainInfo,
         "getbuildinfo" => RpcRequest::BuildInfo,
         "getl2settlement" => RpcRequest::L2Settlement,
+        "getkes" => RpcRequest::Kes,
         "getblockraw" => RpcRequest::BlockRaw(want_hex32(params, 0, "block id")?),
         "getblockcount" => RpcRequest::BlockCount,
         "getblockbyslot" => RpcRequest::BlockBySlot(want_u64(params, 0, "slot")?),
@@ -2200,6 +2203,7 @@ impl PreparedSubmission {
             // match is exhaustive on purpose, and an operator reading the field
             // post-activation needs the honest name.
             PosTransaction::RandaoRecommit { .. } => "randao_recommit",
+            PosTransaction::KesRegister { .. } => "kes_register",
             PosTransaction::L2Settlement(_) => "l2_settlement",
             PosTransaction::L2SettlementAsync(_) => "l2_settlement_async",
             PosTransaction::L2Deposit(_) => "l2_deposit",
@@ -2828,6 +2832,28 @@ pub fn funded_delegation_json(state: &CommittedState, position: u32) -> Json {
 }
 
 /// Public, committed source for the bounded asynchronous proof worker.
+/// `getkes`: the compiled schedule (`null` epochs when unarmed), the head's
+/// epoch and KES period, and the registered keys by validator.
+pub fn kes_json(state: &bloch_pos_committee::transition::CommittedState) -> Json {
+    use bloch_pos_committee::params::{kes_period, kes_registration_open, KES_ACTIVATION_EPOCH, KES_PERIOD_EPOCHS, KES_REGISTRATION_EPOCH};
+    let epoch = bloch_pos_committee::epoch_of(state.slot());
+    let armed = |e: u64| if e == u64::MAX { Json::Null } else { Json::u(e) };
+    Json::obj(vec![
+        ("registration_epoch", armed(KES_REGISTRATION_EPOCH)),
+        ("activation_epoch", armed(KES_ACTIVATION_EPOCH)),
+        ("period_epochs", Json::u(KES_PERIOD_EPOCHS)),
+        ("epoch", Json::u(epoch)),
+        ("registration_open", Json::Bool(kes_registration_open(epoch))),
+        ("period", kes_period(epoch).map_or(Json::Null, Json::u)),
+        ("registered", Json::Arr(state.kes_roots().iter().map(|(validator, public)| Json::obj(vec![
+            ("validator", Json::u(u64::from(*validator))),
+            ("depth", Json::u(u64::from(public.depth))),
+            ("periods", Json::u(public.periods())),
+            ("root", Json::hex(&public.root)),
+        ])).collect())),
+    ])
+}
+
 pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedState) -> Json {
     let Some(l2) = state.l2_settlement() else { return Json::Null; };
     let policy = l2.policy();

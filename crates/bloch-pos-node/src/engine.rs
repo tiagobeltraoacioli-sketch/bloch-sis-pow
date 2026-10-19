@@ -1076,7 +1076,8 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
         PosTransaction::ExitV2 { pubkey_hash, .. } =>
             Some(lifecycle_source_hash(b"exit", pubkey_hash)),
         PosTransaction::Withdraw { validator }
-        | PosTransaction::RandaoRecommit { validator, .. } =>
+        | PosTransaction::RandaoRecommit { validator, .. }
+        | PosTransaction::KesRegister { validator, .. } =>
             Some(validator_lifecycle_source(*validator)),
         PosTransaction::SlashingEvidence(evidence) => {
             let validator = match evidence {
@@ -1470,6 +1471,10 @@ struct Engine {
     /// keystore, is how you equivocate and get slashed. There is no safe
     /// version of that, so there is this.
     keys: Option<Keystore>,
+    /// Forward-secure signing key (`crate::kes_key`), loaded when
+    /// `validator.kes` exists. From `KES_ACTIVATION_EPOCH` on, proposals and
+    /// votes are signed with it and `keys` signs transactions only.
+    kes: Option<KesSigner>,
     /// Every block this node has *authenticated and connected*, canonical or
     /// not, by id.
     ///
@@ -1949,7 +1954,9 @@ enum AttestationAdmission {
 }
 
 /// Local, non-forgeable evidence that this exact signed header already passed
-/// gossip authentication under one registry key. Construction is private and
+/// gossip authentication under one registry authority
+/// (`bloch_pos_committee::kes::authority_fingerprint`: `SHA3(static key)`
+/// before KES enforcement, static key ‖ KES key ‖ domain ‖ period after). Construction is private and
 /// the type is move-only. Promotion consumes it; a block that is parked again
 /// receives a fresh binding only after this proof matches the current key or
 /// a fresh verification succeeds.
@@ -1961,22 +1968,21 @@ struct AuthenticatedBlockAdmission {
 }
 
 impl AuthenticatedBlockAdmission {
-    fn new(env: &BlockEnvelope, pubkey: &[u8]) -> Self {
+    fn new(env: &BlockEnvelope, authority: &[u8; 32]) -> Self {
         Self {
             block_id: *env.block_id().as_bytes(),
             signing_root: env.header.proposal_signing_root(),
             signature_sha3: Sha3_256::digest(&env.proposer_sig).into(),
-            pubkey_sha3: Sha3_256::digest(pubkey).into(),
+            pubkey_sha3: *authority,
         }
     }
 
-    fn matches(&self, env: &BlockEnvelope, pubkey: &[u8]) -> bool {
+    fn matches(&self, env: &BlockEnvelope, authority: &[u8; 32]) -> bool {
         let signature_sha3: [u8; 32] = Sha3_256::digest(&env.proposer_sig).into();
-        let pubkey_sha3: [u8; 32] = Sha3_256::digest(pubkey).into();
         self.block_id == *env.block_id().as_bytes()
             && self.signing_root == env.header.proposal_signing_root()
             && self.signature_sha3 == signature_sha3
-            && self.pubkey_sha3 == pubkey_sha3
+            && self.pubkey_sha3 == *authority
     }
 }
 
@@ -2418,6 +2424,35 @@ impl Engine {
         (rec.pubkey == keys.pubkey).then_some(keys.index)
     }
 
+    /// Make the KES key ready to sign a duty of `epoch`: `Ok(None)` before
+    /// KES enforcement (the static key signs, exactly as before),
+    /// `Ok(Some(period))` once evolved — on disk first — to the epoch's
+    /// period, `Err` when this node must not sign (no KES key, an erased or
+    /// expired period, or a failed write). Called only once a duty is
+    /// settled, so an idle validator does not evolve or log.
+    fn prepare_kes(&mut self, epoch: u64) -> Result<Option<u64>, String> {
+        let Some(period) = bloch_pos_committee::params::kes_period(epoch) else {
+            return Ok(None);
+        };
+        let Some(kes) = self.kes.as_mut() else {
+            return Err(format!(
+                "KES is enforced from epoch {} and no {} is loaded",
+                bloch_pos_committee::params::KES_ACTIVATION_EPOCH,
+                crate::kes_key::FILE_NAME
+            ));
+        };
+        if period < kes.key.period() {
+            return Err(format!("KES period {period} is erased (key at period {})", kes.key.period()));
+        }
+        if period > kes.key.period() {
+            kes.key
+                .evolve_to(&kes.dir, &kes.unlock, period)
+                .map_err(|e| format!("KES evolve to period {period}: {e}"))?;
+            println!("KES key evolved to period {period}; earlier seeds erased on disk");
+        }
+        Ok(Some(period))
+    }
+
     /// Publish participation eligibility, not a scheduled or completed duty.
     /// Read the current registry on every turn so activation, exit and reorg
     /// key mappings cannot leave a boot-time value behind. These are the same
@@ -2495,10 +2530,11 @@ impl Engine {
         //
         // Borrow shape: `keys` is read inside the signing closure while
         // `slashprot` is borrowed mutably, so the key is resolved to a local
-        // rather than through `self`.
-        let Some(keys) = self.keys.as_ref() else {
+        // rather than through `self` — after `prepare_kes`, which may rewrite
+        // the KES key on disk.
+        if self.keys.is_none() {
             return;
-        };
+        }
         if self.doppelganger_blocks_duties(slot) {
             return;
         }
@@ -2537,12 +2573,24 @@ impl Engine {
         // already signed", including after an NTP step backwards or a restart
         // inside the same slot.
         //
+        // KES: the vote's period is its target epoch's, which is this slot's.
+        let kes_period = match self.prepare_kes(e) {
+            Ok(period) => period,
+            Err(why) => {
+                eprintln!("[slot {slot}] not attesting: {why}");
+                return;
+            }
+        };
+        let Some(keys) = self.keys.as_ref() else {
+            return;
+        };
+        let kes = self.kes.as_ref();
         let root = data.signing_root();
         let signature = match self.slashprot.guard_attestation(
             slot,
             data.source_epoch,
             data.target_epoch,
-            || keys.sign(&root),
+            || sign_duty(keys, kes, kes_period, KeyLookup::kes_network_domain(&*rolled), index, &root),
         ) {
             Ok(sig) => sig,
             Err(refusal) => {
@@ -2729,14 +2777,29 @@ impl Engine {
         // proposer offence, and everything above this line — the post-state,
         // the transaction selection — is discardable work; the signature is
         // not.
+        // KES: the proposal's period is its slot's epoch's. Prepared only
+        // now that this node is certain to sign.
+        let kes_period = match self.prepare_kes(e) {
+            Ok(period) => period,
+            Err(why) => {
+                eprintln!("[slot {slot}] not proposing: {why}");
+                return;
+            }
+        };
         // `keys.is_none()` returned at the top of this function and nothing
         // in between writes `keys`; the arm is unreachable and returning
         // without a block is the observer's behaviour.
         let Some(keys) = self.keys.as_ref() else {
             return;
         };
+        let kes = self.kes.as_ref();
         let root = header.proposal_signing_root();
-        let proposer_sig = match self.slashprot.guard_proposal(slot, || keys.sign(&root)) {
+        let proposer_sig = match self
+            .slashprot
+            .guard_proposal(slot, || {
+                sign_duty(keys, kes, kes_period, KeyLookup::kes_network_domain(&*rolled), index, &root)
+            })
+        {
             Ok(sig) => sig,
             Err(refusal) => {
                 eprintln!("[slot {slot}] {refusal}");
@@ -3236,11 +3299,23 @@ impl Engine {
         // accumulate: such blocks enter `blocks`, all but one lose the
         // fork-choice tie, and `advance` — which only ever removes the block
         // it tried to apply — never touches the rest.
-        let authenticated = match KeyLookup::pubkey(&*self.state, env.header.proposer_index) {
-            Some(pk) if src.bounded_by_wall_clock() => {
+        //
+        // From KES enforcement on, the proposer signs with the leaf of its
+        // slot's period (`bloch_pos_committee::kes::verify_validator`, the
+        // transition's own step 7), and the authority a cached proof is bound
+        // to also commits to the KES key (`kes::authority_fingerprint`);
+        // before it, both are exactly the static-key forms.
+        let proposer_epoch = epoch_of(env.header.slot);
+        let authority = bloch_pos_committee::kes::authority_fingerprint(
+            &*self.state,
+            env.header.proposer_index,
+            proposer_epoch,
+        );
+        let authenticated = match authority {
+            Some(authority) if src.bounded_by_wall_clock() => {
                 let proof_matches = prior_authentication
                     .as_ref()
-                    .is_some_and(|proof| proof.matches(&env, pk));
+                    .is_some_and(|proof| proof.matches(&env, &authority));
                 if proof_matches {
                     true
                 } else {
@@ -3250,11 +3325,14 @@ impl Engine {
                         src.verification_source(),
                         GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
                     );
-                    let verified = verifier.verify_with_key(
-                        pk,
+                    let verified = bloch_pos_committee::kes::verify_validator(
+                        &*self.state,
+                        &verifier,
+                        env.header.proposer_index,
+                        proposer_epoch,
                         &env.header.proposal_signing_root(),
                         &env.proposer_sig,
-                    );
+                    ) == Some(true);
                     if verifier.limited() {
                         // Local overload is not proof of a forgery. Ignore so an
                         // honest relay is not scored; sync retries from the
@@ -3264,14 +3342,17 @@ impl Engine {
                     verified
                 }
             }
-            Some(pk) => prior_authentication
+            Some(authority) => prior_authentication
                 .as_ref()
-                .is_some_and(|proof| proof.matches(&env, pk))
-                || self.gossip_verifier.verify_with_key(
-                    pk,
+                .is_some_and(|proof| proof.matches(&env, &authority))
+                || bloch_pos_committee::kes::verify_validator(
+                    &*self.state,
+                    &self.gossip_verifier,
+                    env.header.proposer_index,
+                    proposer_epoch,
                     &env.header.proposal_signing_root(),
                     &env.proposer_sig,
-                ),
+                ) == Some(true),
             None => {
                 // Unknown identity: hold it, ask for the gap, decide nothing.
                 self.park_orphan(id, env, src);
@@ -3294,11 +3375,10 @@ impl Engine {
             ));
             return (Verdict::Reject, None);
         }
-        let Some(authenticated_pubkey) = KeyLookup::pubkey(&*self.state, env.header.proposer_index)
-        else {
+        let Some(authenticated_authority) = authority else {
             return (Verdict::Ignore, None);
         };
-        let authenticated = AuthenticatedBlockAdmission::new(&env, authenticated_pubkey);
+        let authenticated = AuthenticatedBlockAdmission::new(&env, &authenticated_authority);
 
         if !self.admit_proposal_variant(
             id,
@@ -5709,6 +5789,7 @@ impl Engine {
             // Identity of the binary, not of the chain: no state read, no
             // lock taken, constant cost at any height.
             RpcRequest::L2Settlement => Ok(rpc::l2_settlement_json(&self.state)),
+            RpcRequest::Kes => Ok(rpc::kes_json(&self.state)),
             RpcRequest::BlockRaw(id) => {
                 let env = self.envelope_by_id(&id).ok_or_else(|| RpcError::new(rpc::BLOCK_NOT_FOUND, "unknown block"))?;
                 Ok(rpc::Json::s(crate::codec::hex(&crate::codec::encode_envelope(&env))))
@@ -6189,6 +6270,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         std::env::var_os("BLOCH_NO_DOPPELGANGER"),
     )?;
 
+    let kes = load_kes_signer(&cfg.data_dir, keys.is_some())?;
     let mut engine = Engine {
         state: StateCell::new(genesis_state),
         tr: Transition::new(verifier.clone()),
@@ -6196,6 +6278,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
         verifier,
         keys,
+        kes,
         blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
@@ -7221,6 +7304,66 @@ pub(crate) fn l2_admission_refusal(
     }
 }
 
+/// The loaded KES key with what it needs to rewrite itself on evolution.
+pub(crate) struct KesSigner {
+    key: crate::kes_key::KesKey,
+    dir: PathBuf,
+    unlock: crate::keys::Unlock,
+}
+
+/// Load `validator.kes` for a validator node, under the keystore's passphrase
+/// policy. Absent file: `None` (a node without one keeps signing statically
+/// until KES enforcement, then stops signing loudly instead of signing with a
+/// key consensus refuses).
+fn load_kes_signer(dir: &std::path::Path, validator: bool) -> io::Result<Option<KesSigner>> {
+    if !validator || !crate::kes_key::KesKey::path(dir).exists() {
+        return Ok(None);
+    }
+    let unlock = crate::keys::Unlock::from_env()?;
+    let Some(key) = crate::kes_key::KesKey::load_optional(dir, &unlock)? else {
+        return Ok(None);
+    };
+    println!(
+        "KES key loaded: depth {}, period {}, root {}",
+        key.public().depth,
+        key.period(),
+        crate::codec::hex8(&key.public().root)
+    );
+    Ok(Some(KesSigner { key, dir: dir.to_path_buf(), unlock }))
+}
+
+/// One consensus signature for a duty, made inside the slashing-protection
+/// guard: the static key before KES enforcement (`kes_period` `None`), the
+/// KES leaf of the prepared period after it.
+///
+/// The leaf signs `kes::leaf_message` — the root bound to the duty state's
+/// network domain, the duty's validator index, the key's tree and the period — the
+/// same function every verifier runs. A duty the bound message cannot be
+/// formed for (no KES key, no domain) returns an empty signature, which
+/// consensus refuses, rather than a signature over the wrong bytes;
+/// `prepare_kes` has already refused the no-key case before the guard.
+fn sign_duty(
+    keys: &Keystore,
+    kes: Option<&KesSigner>,
+    kes_period: Option<u64>,
+    network_domain: Option<[u8; 32]>,
+    validator: u32,
+    root: &[u8; 32],
+) -> Vec<u8> {
+    let Some(period) = kes_period else {
+        return keys.sign(root);
+    };
+    let Some(kes) = kes else {
+        return Vec::new();
+    };
+    let public = kes.key.public();
+    let domain = network_domain;
+    let Some(message) = bloch_pos_committee::kes::leaf_message(domain, validator, &public, period, root) else {
+        return Vec::new();
+    };
+    kes.key.sign(&message).unwrap_or_default()
+}
+
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     admissible_with_verifier(tx, wall_epoch, &HybridVerifier::new())
 }
@@ -7731,6 +7874,26 @@ fn admissible_with_network_verifier(
         // unconditional; post-activation the signature half still belongs to
         // consensus alone (this function is stateless — no registry to
         // resolve the validator's committed key against).
+        // KES registration (0x17): refused before `KES_REGISTRATION_EPOCH`
+        // exactly like every other flag-day format. After it, the structural
+        // bounds here; the signature, the once-only rule and the registry
+        // checks belong to `validate_lifecycle_transaction` (committed state)
+        // and to consensus.
+        PosTransaction::KesRegister { depth, signature, .. } => {
+            if !bloch_pos_committee::params::kes_registration_open(wall_epoch) {
+                return Err(
+                    "KES registration (tag 0x17) is not active: the format ships behind a \
+                     flag day (KES_REGISTRATION_EPOCH) that this chain has not reached",
+                );
+            }
+            if !(bloch_pos_committee::kes::MIN_DEPTH..=bloch_pos_committee::kes::MAX_DEPTH).contains(depth)
+                || signature.is_empty()
+                || signature.len() > bloch_pos_committee::transition::funded::ADMISSION_PQ_SIGNATURE_MAX
+            {
+                return Err("KES registration has an out-of-range depth or signature length");
+            }
+            Ok(())
+        }
         PosTransaction::RandaoRecommit { .. } => {
             if !bloch_pos_committee::params::epoch_gate_active(wall_epoch, bloch_pos_committee::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH) {
                 return Err(
@@ -9161,6 +9324,7 @@ mod transfer_v2_end_to_end {
             gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: None,
+            kes: None,
             blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
@@ -10424,6 +10588,7 @@ mod perf_support {
             gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: Some(ks),
+            kes: None,
             blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
@@ -12564,6 +12729,7 @@ mod duty_view_anchor {
             gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: Some(ks0),
+            kes: None,
             blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
@@ -12832,6 +12998,7 @@ mod slot_horizon {
             gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: None,
+            kes: None,
             blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
@@ -15987,3 +16154,7 @@ mod l2_admission_tests {
         assert_eq!(l2_admission_refusal(&da, Some(&dev)).is_none(), cfg!(feature = "devnet-l2-user-txs"));
     }
 }
+
+#[cfg(test)]
+#[path = "engine/kes_tests.rs"]
+mod kes_tests;
