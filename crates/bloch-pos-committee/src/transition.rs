@@ -144,10 +144,6 @@ pub use l2_claim::{L2WithdrawClaim, L2WithdrawClaimReject};
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
 use crate::schedule;
-// Consensus code resolves keys through `crate::kes::verify_validator`; the
-// tests still call `KeyLookup::pubkey` on bare registries.
-#[cfg(test)]
-use crate::attestation::KeyLookup as _;
 use crate::slashing;
 use crate::staking::{self, QueuedDeposit};
 use crate::fee_market;
