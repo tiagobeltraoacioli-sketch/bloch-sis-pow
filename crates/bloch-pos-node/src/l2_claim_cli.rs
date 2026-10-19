@@ -47,10 +47,11 @@ attest --genesis FILE --proof JSON_FILE --attestors SET_FILE --signer-index I
 
 --proof is the output of bloch-l2-produce-dev withdrawal-proof. Its root must be
 a withdrawal root the L1 retains (getl2settlement withdrawals.roots) and at
-least withdrawals.delay_blocks native blocks old when the claim is included;
-proving against the newest matured root (withdrawals.matured) always works.
-Claims of at least withdrawals.large_claim_sat wait withdrawals.large_delay_blocks
-(use withdrawals.matured_large). Each release window frees at most
+least withdrawals.delay_blocks native blocks old when the claim is included,
+and FINALIZED (its \"finalized\" flag). Prove against withdrawals.claimable, the
+newest root that is both; withdrawals.matured is the delay alone and may not be
+final yet. Claims of at least withdrawals.large_claim_sat wait
+withdrawals.large_delay_blocks (use withdrawals.claimable_large). Each release window frees at most
 withdrawals.release_window.cap_sat; a claim that does not fit is refused and
 fits a later window (the first claim of a window is always admitted).
 The funding inputs pay the fee and the rest returns as change to the funding
