@@ -211,6 +211,36 @@ pub struct SlashingProtection {
     binding: Option<Binding>,
     /// Some means V3 must be retained, including after importing older backups.
     recommit: Option<RecommitProtection>,
+    /// Host-level copy of the record outside the data dir
+    /// ([`crate::signer_anchor`]). Written after the data-dir record and
+    /// before the signature is released, so a restored data dir cannot be
+    /// older than this copy without the boot noticing.
+    mirror: Option<PathBuf>,
+    /// Holds the host-level key lock for as long as this record can sign.
+    anchor: Option<crate::signer_anchor::SignerAnchor>,
+}
+
+/// What [`SlashingProtection::attach_anchor`] found when it compared the
+/// data-dir record with the host-level anchor copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorCheck {
+    /// No anchor existed yet; it now holds a copy of the data-dir record.
+    Adopted,
+    /// Both copies already agreed.
+    InSync,
+    /// The anchor lagged (crash between the two writes, or an imported
+    /// record); it was raised to the data-dir record.
+    AnchorRaised,
+    /// The data dir was BEHIND the anchor and the operator accepted it; the
+    /// data-dir record was raised to the anchor before any signature.
+    DataDirRolledForward,
+}
+
+/// Which kind of signature of this key was seen on the network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Published {
+    Proposal { slot: u64 },
+    Attestation { slot: u64, source_epoch: u64, target_epoch: u64 },
 }
 
 /// Export a bound record while the validator is stopped. No secret key is read.
@@ -363,7 +393,7 @@ impl SlashingProtection {
             }
             (None, None) => None,
         };
-        Ok(SlashingProtection { path, wm, binding, recommit })
+        Ok(SlashingProtection { path, wm, binding, recommit, mirror: None, anchor: None })
     }
 
     /// The identity the file is bound to (or will be bound to on the next
@@ -480,8 +510,148 @@ impl SlashingProtection {
         } else {
             encode(&next, self.binding.as_ref())
         };
-        crate::store::atomic_private_write(&self.path, &bytes)
+        crate::store::atomic_private_write(&self.path, &bytes)?;
+        if let Some(mirror) = &self.mirror {
+            crate::store::atomic_private_write(mirror, &bytes)?;
+        }
+        Ok(())
     }
+
+    /// The bytes this record would have on disk now.
+    fn encoded(&self) -> io::Result<Vec<u8>> {
+        Ok(match self.recommit {
+            Some(protection) => {
+                let binding = self.binding.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "V3 recommit protection requires identity binding"))?;
+                encode_v3(&self.wm, binding, &protection)
+            }
+            None => encode(&self.wm, self.binding.as_ref()),
+        })
+    }
+
+    /// Compare this data-dir record with the host-level anchor copy at
+    /// `anchor`, then mirror every later write there.
+    ///
+    /// The anchor lives outside the data dir, so restoring an old data-dir
+    /// backup (or starting a fresh data dir for a key this host already ran)
+    /// leaves the anchor AHEAD of the record. That is refused unless
+    /// `accept_rollback`, in which case the record is raised to the anchor
+    /// (monotone, never lowered) before anything can sign. An anchor that
+    /// lags is simply raised: that is the crash window between the two
+    /// writes, and the data-dir record is the one written first.
+    pub fn attach_anchor(&mut self, anchor: crate::signer_anchor::SignerAnchor, accept_rollback: bool) -> io::Result<AnchorCheck> {
+        let check = self.attach_anchor_path(&anchor.record_path(), accept_rollback)?;
+        self.anchor = Some(anchor);
+        Ok(check)
+    }
+
+    fn attach_anchor_path(&mut self, anchor: &Path, accept_rollback: bool) -> io::Result<AnchorCheck> {
+        let binding = self.binding.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "a signer anchor requires a bound record"))?;
+        let bytes = match fs::read(anchor) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let Some(bytes) = bytes else {
+            crate::store::atomic_private_write(anchor, &self.encoded()?)?;
+            self.mirror = Some(anchor.to_path_buf());
+            return Ok(AnchorCheck::Adopted);
+        };
+        let (anchor_wm, anchor_binding, anchor_recommit) = decode_record(&bytes).ok_or_else(|| io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("signer anchor {} is corrupt; refusing to sign. Restore it or remove it deliberately.", anchor.display()),
+        ))?;
+        if anchor_binding != Some(binding) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "signer anchor {} is bound to another validator key or network", anchor.display())));
+        }
+        let merged = max_marks(self.wm, anchor_wm);
+        let recommit = merge_recommit(self.recommit, anchor_recommit)?;
+        let data_behind = merged != self.wm || recommit != self.recommit;
+        let anchor_behind = merged != anchor_wm || recommit != anchor_recommit;
+        if data_behind && !accept_rollback {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "SIGNING ROLLBACK REFUSED: {} is OLDER than this host's signer anchor {} \
+                 (data dir {:?}, anchor {:?}). The data dir was restored from a backup, \
+                 replaced, or never received this key's record. Signing from it could \
+                 repeat a duty this key already signed. Stop every other instance of this \
+                 key, then restart with --accept-signing-rollback (raises the record to the \
+                 anchor; never lowers it).",
+                self.path.display(), anchor.display(), self.wm, anchor_wm)));
+        }
+        if data_behind {
+            self.write_record(merged, recommit)?;
+            self.wm = merged;
+            self.recommit = recommit;
+        }
+        self.mirror = Some(anchor.to_path_buf());
+        if anchor_behind {
+            self.write_record(self.wm, self.recommit)?;
+        }
+        Ok(if data_behind {
+            AnchorCheck::DataDirRolledForward
+        } else if anchor_behind {
+            AnchorCheck::AnchorRaised
+        } else {
+            AnchorCheck::InSync
+        })
+    }
+
+    /// True when `seen` is a signature of this key that the record does not
+    /// cover: the record is stale (restored backup) or another instance of
+    /// the key is signing. Pure; see [`SlashingProtection::raise_to_published`].
+    pub fn is_uncovered(&self, seen: Published) -> bool {
+        let above = |value: u64, mark: Option<u64>| mark.is_none_or(|m| value > m);
+        match seen {
+            Published::Proposal { slot } => above(slot, self.wm.proposal_slot),
+            Published::Attestation { slot, target_epoch, .. } => {
+                above(slot, self.wm.attestation_slot) || above(target_epoch, self.wm.target_epoch)
+            }
+        }
+    }
+
+    /// Raise the record durably so it covers `seen`. Never lowers anything.
+    pub fn raise_to_published(&mut self, seen: Published) -> io::Result<Watermarks> {
+        let incoming = match seen {
+            Published::Proposal { slot } => Watermarks { proposal_slot: Some(slot), ..Watermarks::default() },
+            Published::Attestation { slot, source_epoch, target_epoch } => Watermarks {
+                attestation_slot: Some(slot),
+                source_epoch: Some(source_epoch),
+                target_epoch: Some(target_epoch),
+                ..Watermarks::default()
+            },
+        };
+        let next = max_marks(self.wm, incoming);
+        if next != self.wm {
+            self.write_record(next, self.recommit)?;
+            self.wm = next;
+        }
+        Ok(next)
+    }
+}
+
+fn max_marks(a: Watermarks, b: Watermarks) -> Watermarks {
+    Watermarks {
+        proposal_slot: a.proposal_slot.max(b.proposal_slot),
+        attestation_slot: a.attestation_slot.max(b.attestation_slot),
+        source_epoch: a.source_epoch.max(b.source_epoch),
+        target_epoch: a.target_epoch.max(b.target_epoch),
+    }
+}
+
+/// Monotone max of two bound records for the same identity (export merges
+/// the data-dir record with the host anchor this way).
+pub fn merge_records(binding: Binding, left: &[u8], right: &[u8]) -> io::Result<Vec<u8>> {
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "invalid or foreign slashing protection record");
+    let (lw, lb, lr) = decode_record(left).ok_or_else(bad)?;
+    let (rw, rb, rr) = decode_record(right).ok_or_else(bad)?;
+    if lb != Some(binding) || rb != Some(binding) {
+        return Err(bad());
+    }
+    let wm = max_marks(lw, rw);
+    Ok(match merge_recommit(lr, rr)? {
+        Some(protection) => encode_v3(&wm, &binding, &protection),
+        None => encode(&wm, Some(&binding)),
+    })
 }
 
 fn encode(wm: &Watermarks, binding: Option<&Binding>) -> Vec<u8> {
@@ -1113,5 +1283,153 @@ mod tests {
         assert!(SlashingProtection::open_bound(&d.0, other_network).is_err());
         let reopened = SlashingProtection::open_bound(&d.0, binding).unwrap();
         assert_eq!(reopened.watermarks().target_epoch, Some(11));
+    }
+
+    // ── P3a: host signer anchor, rollback guard, key lock (fault injection) ──
+
+    fn anchored(data: &Path, root: &Path, accept: bool) -> io::Result<(SlashingProtection, AnchorCheck)> {
+        let mut sp = SlashingProtection::open_bound(data, KEY_A)?;
+        let anchor = crate::signer_anchor::SignerAnchor::acquire(root, &KEY_A)?;
+        let check = sp.attach_anchor(anchor, accept)?;
+        Ok((sp, check))
+    }
+
+    /// Fault: the operator restores an old data-dir backup. Its record is
+    /// internally consistent and LOWER than what the key signed; the anchor
+    /// outside the data dir refuses it, and the explicit flag raises it.
+    #[test]
+    fn restored_old_data_dir_is_refused_unless_accepted_and_then_raised() {
+        let data = dir("rb-data");
+        let root = dir("rb-root");
+        let backup;
+        {
+            let (mut sp, check) = anchored(&data.0, &root.0, false).unwrap();
+            assert_eq!(check, AnchorCheck::Adopted);
+            sp.guard_attestation(64, 0, 1, || ()).unwrap();
+            backup = fs::read(data.0.join(FILE_NAME)).unwrap();
+            sp.guard_attestation(128, 1, 2, || ()).unwrap();
+            sp.guard_proposal(130, || ()).unwrap();
+        } // process exits, locks released
+        crate::store::atomic_private_write(&data.0.join(FILE_NAME), &backup).unwrap();
+        let err = anchored(&data.0, &root.0, false).expect_err("rollback must be refused");
+        assert!(err.to_string().contains("SIGNING ROLLBACK REFUSED"), "{err}");
+        // A fresh, empty data dir for a key this host already ran is the same thing.
+        let empty = dir("rb-empty");
+        assert!(anchored(&empty.0, &root.0, false).is_err());
+
+        let (mut sp, check) = anchored(&data.0, &root.0, true).unwrap();
+        assert_eq!(check, AnchorCheck::DataDirRolledForward);
+        assert_eq!(sp.watermarks().attestation_slot, Some(128));
+        assert!(sp.guard_attestation(129, 1, 2, || panic!("double vote")).is_err());
+        assert!(sp.guard_proposal(130, || panic!("second block")).is_err());
+        assert_eq!(read_fresh(&data.0.join(FILE_NAME)).proposal_slot, Some(130), "raised durably");
+    }
+
+    /// Fault: crash after the data-dir record is durable but before the anchor
+    /// copy is written. The signature was never released (both writes precede
+    /// it), and the next boot raises the lagging anchor instead of refusing.
+    #[test]
+    fn crash_between_record_and_anchor_write_recovers_without_refusal() {
+        let data = dir("crash-data");
+        let root = dir("crash-root");
+        {
+            let (mut sp, _) = anchored(&data.0, &root.0, false).unwrap();
+            sp.guard_attestation(10, 0, 1, || ()).unwrap();
+        }
+        let anchor_path = crate::signer_anchor::key_dir(&root.0, &KEY_A).join(crate::signer_anchor::RECORD_FILE);
+        let lagging = fs::read(&anchor_path).unwrap();
+        {
+            let (mut sp, _) = anchored(&data.0, &root.0, false).unwrap();
+            sp.guard_attestation(20, 1, 2, || ()).unwrap();
+        }
+        // Simulate the crash window: data dir has slot 20, anchor still has 10.
+        crate::store::atomic_private_write(&anchor_path, &lagging).unwrap();
+        let (sp, check) = anchored(&data.0, &root.0, false).unwrap();
+        assert_eq!(check, AnchorCheck::AnchorRaised);
+        assert_eq!(read_fresh(&anchor_path).attestation_slot, Some(20));
+        assert_eq!(sp.watermarks().attestation_slot, Some(20));
+    }
+
+    /// Fault: the anchor write fails (crash/IO error before release). The
+    /// signing closure must never run, and memory must not advance.
+    #[test]
+    fn anchor_write_failure_never_releases_a_signature() {
+        let data = dir("fail-data");
+        let root = dir("fail-root");
+        let (mut sp, _) = anchored(&data.0, &root.0, false).unwrap();
+        let key = crate::signer_anchor::key_dir(&root.0, &KEY_A);
+        let record = key.join(crate::signer_anchor::RECORD_FILE);
+        fs::remove_file(&record).unwrap();
+        fs::create_dir(&record).unwrap(); // a directory cannot be replaced by rename
+        let r = sp.guard_attestation(5, 0, 1, || panic!("signature released before the anchor was durable"));
+        assert!(matches!(r, Err(Refusal::Io(_))));
+        assert_eq!(sp.watermarks().attestation_slot, None);
+    }
+
+    /// Fault: a second instance of the same key on this host, from another
+    /// data dir. The per-key flock refuses it; it is free again after exit.
+    #[test]
+    fn second_instance_of_a_key_on_one_host_is_refused() {
+        let first_dir = dir("two-a");
+        let second_dir = dir("two-b");
+        let root = dir("two-root");
+        let (first, _) = anchored(&first_dir.0, &root.0, false).unwrap();
+        let err = anchored(&second_dir.0, &root.0, false).expect_err("second signer must be refused");
+        assert!(err.to_string().contains("SECOND SIGNER REFUSED"), "{err}");
+        // A different key on the same host is unaffected.
+        assert!(crate::signer_anchor::SignerAnchor::acquire(&root.0, &KEY_B).is_ok());
+        drop(first);
+        // The second data dir has no record but the anchor has one only if
+        // something was signed; nothing was, so it may now start.
+        assert!(anchored(&second_dir.0, &root.0, false).is_ok());
+    }
+
+    #[test]
+    fn retired_key_refuses_to_boot_on_this_host() {
+        let data = dir("ret-data");
+        let root = dir("ret-root");
+        drop(anchored(&data.0, &root.0, false).unwrap());
+        let key = crate::signer_anchor::key_dir(&root.0, &KEY_A);
+        crate::signer_anchor::write_retired(&key, "migrated to host-b").unwrap();
+        let err = anchored(&data.0, &root.0, false).expect_err("retired");
+        assert!(err.to_string().contains("RETIRED"), "{err}");
+        crate::signer_anchor::write_retired(&data.0, "migrated").unwrap();
+        assert!(crate::signer_anchor::check_not_retired(&[&data.0]).is_err());
+        // Tools may still take the lock to export.
+        assert!(crate::signer_anchor::SignerAnchor::acquire_for_tool(&root.0, &KEY_A).is_ok());
+    }
+
+    /// Runtime rollback guard: a published signature of this key beyond the
+    /// record is detected and the record is raised so no later duty conflicts.
+    #[test]
+    fn published_signature_beyond_the_record_is_detected_and_covered() {
+        let d = dir("pub");
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        sp.guard_attestation(40, 3, 4, || ()).unwrap();
+        let echo = Published::Attestation { slot: 40, source_epoch: 3, target_epoch: 4 };
+        assert!(!sp.is_uncovered(echo), "our own echo is covered");
+        assert!(sp.is_uncovered(Published::Proposal { slot: 1 }), "no proposal recorded yet");
+        let foreign = Published::Attestation { slot: 50, source_epoch: 4, target_epoch: 5 };
+        assert!(sp.is_uncovered(foreign));
+        sp.raise_to_published(foreign).unwrap();
+        assert!(!sp.is_uncovered(foreign));
+        assert!(sp.guard_attestation(51, 4, 5, || panic!("double vote with the foreign one")).is_err());
+        assert_eq!(read_fresh(&d.0.join(FILE_NAME)).target_epoch, Some(5));
+    }
+
+    /// Migration export merges data dir and anchor monotonically.
+    #[test]
+    fn merge_records_takes_the_maximum_and_rejects_foreign() {
+        let a = dir("merge-a");
+        let b = dir("merge-b");
+        let mut sa = SlashingProtection::open_bound(&a.0, KEY_A).unwrap();
+        sa.guard_proposal(90, || ()).unwrap();
+        let mut sb = SlashingProtection::open_bound(&b.0, KEY_A).unwrap();
+        sb.guard_attestation(70, 1, 2, || ()).unwrap();
+        let merged = merge_records(KEY_A, &fs::read(a.0.join(FILE_NAME)).unwrap(), &fs::read(b.0.join(FILE_NAME)).unwrap()).unwrap();
+        let (wm, binding) = decode(&merged).unwrap();
+        assert_eq!(binding, Some(KEY_A));
+        assert_eq!((wm.proposal_slot, wm.attestation_slot, wm.target_epoch), (Some(90), Some(70), Some(2)));
+        assert!(merge_records(KEY_B, &merged, &merged).is_err());
     }
 }

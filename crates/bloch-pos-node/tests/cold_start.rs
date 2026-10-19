@@ -152,6 +152,8 @@ fn spawn_node(
     let err = out.try_clone().expect("dup log");
     Command::new(BIN)
         .env(KEYSTORE_POLICY.0, KEYSTORE_POLICY.1)
+        // Keep the host signer anchor inside this throwaway test root.
+        .env("BLOCH_SIGNER_ANCHOR_DIR", dir.with_extension("signer-anchor"))
         .args([
             "run",
             "--data-dir",

@@ -2489,6 +2489,43 @@ impl Engine {
         );
     }
 
+    /// Rollback guard, runtime half (node-local). An authenticated signature
+    /// of THIS key that the signing record does not cover means the record is
+    /// stale (restored data dir) or another instance of the key is signing.
+    /// Either way the record is raised durably to cover it, so no later duty
+    /// can conflict with it; and when the sighting is live network evidence,
+    /// duties stop until an operator restarts the node.
+    fn note_own_signature(&mut self, index: u32, seen: crate::slashprot::Published, live_evidence: bool) {
+        let Some(my_index) = self.duty_index(&self.state) else { return };
+        if index != my_index || !self.slashprot.is_uncovered(seen) {
+            return;
+        }
+        let before = self.slashprot.watermarks();
+        match self.slashprot.raise_to_published(seen) {
+            Ok(after) if live_evidence => {
+                self.doppelganger_halted = true;
+                eprintln!(
+                    "SIGNING RECORD STALE: validator {index} signed {seen:?} on the network, which \
+                     this node's record {before:?} does not cover. Either the data dir was \
+                     restored from a backup or ANOTHER INSTANCE of this key is signing. Record \
+                     raised to {after:?}; duties STOPPED until restart. Confirm only one \
+                     instance of this key runs before restarting."
+                );
+            }
+            Ok(after) => eprintln!(
+                "SIGNING RECORD STALE: replayed chain shows validator {index} signed {seen:?} \
+                 beyond the record {before:?}; record raised to {after:?} before any duty."
+            ),
+            Err(e) => {
+                self.doppelganger_halted = true;
+                eprintln!(
+                    "SIGNING RECORD STALE: validator {index} signed {seen:?} beyond the record \
+                     and the record could not be raised ({e}); duties STOPPED."
+                );
+            }
+        }
+    }
+
     fn attest(&mut self, slot: u64) {
         // An observer holds no key and therefore has no duty. Bound here, once,
         // and used to sign below — nothing between reads `keys` mutably.
@@ -3386,6 +3423,11 @@ impl Engine {
         let proposer_slot = env.header.slot;
         self.observe_proposer_equivocation(&env);
         self.blocks.insert(id, env);
+        self.note_own_signature(
+            proposer_index,
+            crate::slashprot::Published::Proposal { slot: proposer_slot },
+            src.bounded_by_wall_clock(),
+        );
         if src.bounded_by_wall_clock() {
             self.note_possible_doppelganger(proposer_index, proposer_slot);
         }
@@ -5315,6 +5357,7 @@ impl Engine {
                 // R6 HIGH-8: an accepted attestation is a real, signature-
                 // checked duty by `att.validator` — exactly the class of
                 // sighting doppelgänger protection exists to catch.
+                self.note_own_signature(att.validator, published_attestation(&att), true);
                 self.note_possible_doppelganger(att.validator, att.data.slot);
                 self.pool
                     .insert((att.validator, att.data.signing_root()), att);
@@ -5371,6 +5414,7 @@ impl Engine {
                 if let Some(evidence) = slashing_candidate {
                     self.report_equivocation((*evidence).into());
                 }
+                self.note_own_signature(att.validator, published_attestation(&att), true);
                 self.note_possible_doppelganger(att.validator, att.data.slot);
                 let frame = net::att_frame(&att);
                 self.pool
@@ -5854,6 +5898,60 @@ mod boot_switch_tests {
     }
 }
 
+fn published_attestation(att: &Attestation) -> crate::slashprot::Published {
+    crate::slashprot::Published::Attestation {
+        slot: att.data.slot,
+        source_epoch: att.data.source_epoch,
+        target_epoch: att.data.target_epoch,
+    }
+}
+
+/// Host-level signer anchor (node-local): one flock per validator key across
+/// every data dir on this host, plus a record copy outside the data dir that
+/// refuses a rolled-back data dir. See [`crate::signer_anchor`].
+fn attach_signer_anchor(
+    data_dir: &std::path::Path,
+    binding: crate::slashprot::Binding,
+    protection: &mut SlashingProtection,
+) -> io::Result<()> {
+    use crate::signer_anchor as anchor;
+    anchor::check_not_retired(&[data_dir])?;
+    if parse_boot_switch(anchor::ENV_DISABLE, std::env::var_os(anchor::ENV_DISABLE))? {
+        println!(
+            "SIGNER ANCHOR: DISABLED ({} is set). Nothing on this host stops a second \
+             instance of this key in another data dir, or a restored data dir, from signing.",
+            anchor::ENV_DISABLE
+        );
+        return Ok(());
+    }
+    let accept_rollback = parse_boot_switch(
+        anchor::ENV_ACCEPT_ROLLBACK,
+        std::env::var_os(anchor::ENV_ACCEPT_ROLLBACK),
+    )?;
+    let root = anchor::default_root().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no signer anchor directory: set --signer-anchor-dir / {} (or HOME), or \
+                 disable it explicitly with --no-signer-anchor",
+                anchor::ENV_DIR
+            ),
+        )
+    })?;
+    let held = anchor::SignerAnchor::acquire(&root, &binding)?;
+    let dir = held.dir().to_path_buf();
+    let check = protection.attach_anchor(held, accept_rollback)?;
+    println!("SIGNER ANCHOR: {} ({check:?}); signer lock held", dir.display());
+    if check == crate::slashprot::AnchorCheck::DataDirRolledForward {
+        eprintln!(
+            "SIGNER ANCHOR: the data-dir record was OLDER than the anchor and was raised \
+             to it under --accept-signing-rollback. Watermarks now {:?}.",
+            protection.watermarks()
+        );
+    }
+    Ok(())
+}
+
 pub fn run(cfg: Config) -> io::Result<()> {
     // Metrics FIRST, before the manifest is even read (audit C-R6-2): the
     // replay window is the one stretch where the node is alive, mute, and
@@ -6029,10 +6127,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let slashprot = match keys.as_ref() {
         Some(k) => {
             let pkh: [u8; 32] = <sha3::Sha3_256 as sha3::Digest>::digest(&k.pubkey).into();
-            SlashingProtection::open_bound(
-                &cfg.data_dir,
-                crate::slashprot::Binding { validator_pubkey_sha3: pkh, genesis_digest: digest },
-            )?
+            let binding =
+                crate::slashprot::Binding { validator_pubkey_sha3: pkh, genesis_digest: digest };
+            let mut protection = SlashingProtection::open_bound(&cfg.data_dir, binding)?;
+            attach_signer_anchor(&cfg.data_dir, binding, &mut protection)?;
+            protection
         }
         None => SlashingProtection::open(&cfg.data_dir)?,
     };
@@ -10779,6 +10878,9 @@ mod doppelganger_tests {
         engine.start_doppelganger_observation(100);
         let mut old = sample_attestation_for(index);
         old.data.slot = 99;
+        // This node's own historical work: persist-before-sign means its
+        // record covers it (an uncovered one is the stale-record case below).
+        engine.slashprot.raise_to_published(published_attestation(&old)).unwrap();
         engine.apply_decision(old, GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
         assert!(!engine.doppelganger_halted);
         let mut current = sample_attestation_for(index);
@@ -10786,6 +10888,30 @@ mod doppelganger_tests {
         engine.apply_decision(current, GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
         assert!(engine.doppelganger_halted);
         assert!(engine.doppelganger_blocks_duties(10_000));
+    }
+
+    /// Rollback guard, runtime half: after the window, a gossip duty of this
+    /// key that the signing record does NOT cover (restored data dir, or a
+    /// second instance elsewhere) stops duties and raises the record durably.
+    #[test]
+    fn uncovered_own_duty_after_the_window_halts_and_raises_the_record() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
+        engine.doppelganger_observe_until = Some(10);
+        engine.wall_slot = 500;
+        let mut foreign = sample_attestation_for(my_index);
+        foreign.data.slot = 480;
+        foreign.data.source_epoch = 3;
+        foreign.data.target_epoch = 4;
+        engine.apply_decision(foreign, GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
+        assert!(engine.doppelganger_halted, "an uncovered own signature must stop duties");
+        let wm = engine.slashprot.watermarks();
+        assert_eq!((wm.attestation_slot, wm.target_epoch), (Some(480), Some(4)));
+        // Another validator's duty never trips it.
+        let (mut other, _d2) = perf_support::proposing_engine();
+        let idx = other.keys.as_ref().unwrap().index;
+        other.apply_decision(sample_attestation_for(idx + 1), GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
+        assert!(!other.doppelganger_halted);
     }
 
     fn sample_attestation_for(validator: u32) -> Attestation {
@@ -10854,6 +10980,11 @@ mod doppelganger_tests {
         let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
         engine.doppelganger_observe_until = Some(10);
         engine.wall_slot = 50; // past the window
+        // Its own duty: the record covers it, because it was persisted first.
+        engine
+            .slashprot
+            .raise_to_published(published_attestation(&sample_attestation_for(my_index)))
+            .unwrap();
 
         engine.apply_decision(
             sample_attestation_for(my_index),
