@@ -76,7 +76,9 @@
 //
 // POST-FIX tests (`#[ignore]`, `post_fix_*`): the intended behaviour after
 // p2a (count only own-chain target votes) and p1a (frozen finality set, no
-// leak in the denominator). Un-ignore after both merge:
+// leak in the denominator). The p1a ones arm
+// `params::NATIVE_FINALITY_SET_ACTIVATION_EPOCH` and run; the p2a one stays
+// ignored until p2a merges:
 //   - no branch ever justifies or finalizes a checkpoint that is not its own;
 //   - in any split, at most one side finalizes a post-fork checkpoint;
 //   - one withdrawal pays on at most one side.
@@ -479,8 +481,9 @@ fn today_equal_split_with_leak_finalizes_both_sides() {
 }
 
 #[test]
-#[ignore = "post-fix (p1a frozen finality set, no leak in the denominator): un-ignore after merge"]
 fn post_fix_equal_split_finalizes_at_most_one_side() {
+    // p1a: frozen finality set armed from genesis of the fixture.
+    let _frozen = crate::params::native_finality_set_test::open();
     let _rules = mainnet_rules();
     let _claims = crate::params::native_claim_finality_test::open();
     let mut br = s2();
@@ -557,8 +560,9 @@ fn today_three_way_split_finalizes_all_three_branches() {
 }
 
 #[test]
-#[ignore = "post-fix (p1a frozen finality set, no leak in the denominator): un-ignore after merge"]
 fn post_fix_three_way_split_finalizes_at_most_one_branch() {
+    // p1a: frozen finality set armed from genesis of the fixture.
+    let _frozen = crate::params::native_finality_set_test::open();
     let _rules = mainnet_rules();
     let br = s3();
     assert!(br.iter().filter(|b| b.first_final.is_some()).count() <= 1, "{}", summary(&br));
@@ -669,13 +673,17 @@ fn today_late_joining_branch_finalizes_a_checkpoint_conflicting_with_the_finaliz
 }
 
 #[test]
-#[ignore = "post-fix (p1a frozen finality set, no leak in the denominator): un-ignore after merge"]
 fn post_fix_late_joining_half_never_finalizes_against_the_finalized_checkpoint() {
+    // p1a: frozen finality set armed from genesis of the fixture.
+    let _frozen = crate::params::native_finality_set_test::open();
     let _rules = mainnet_rules();
     let _claims = crate::params::native_claim_finality_test::open();
     let mut br = s5();
     assert_eq!(br[1].first_final, None, "{}", summary(&br));
-    assert!(claim_pays(&mut br[0]));
+    // A keeps (never reverts) its pre-split finality. A holds only half of
+    // the frozen set after the split, so it halts too: whether its claim
+    // matures is irrelevant to safety; B's must not pay.
+    assert_eq!(br[0].finalized(), Cp { epoch: 2, root: br[0].cps[&2] }, "{}", summary(&br));
     assert!(!claim_pays(&mut br[1]));
 }
 
