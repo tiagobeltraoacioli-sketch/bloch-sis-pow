@@ -1521,7 +1521,7 @@ pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = 2_884;
 /// slashed validator, and an included evidence either slashes (sets
 /// `slashed`) or invalidates its block, so the canonical chain carries none.
 /// See docs/SLASHING-PRE-ACTIVATION-EXPOSURE.md for the arming decision.
-pub const PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH: u64 = u64::MAX;
+pub const PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH: u64 = SLASHING_EVIDENCE_ACTIVATION_EPOCH;
 
 /// Is the pre-activation offence refusal binding at `epoch`?
 pub fn pre_activation_offence_refusal_active(epoch: u64) -> bool {
