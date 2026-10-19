@@ -3468,4 +3468,10 @@ mod l2_tests {
         assert_eq!(l2.checkpoint_roots().keys().copied().collect::<Vec<_>>(), vec![198, 199, 200]);
         assert_eq!(l2.checkpoint_root(198), Some([198; 32]));
     }
+
+    // Adversarial multi-branch FFG suite (p2b, 2026-10-19).
+    mod ffg_branch_tests {
+        use super::*;
+        include!("ffg_branch_tests.rs");
+    }
 }
