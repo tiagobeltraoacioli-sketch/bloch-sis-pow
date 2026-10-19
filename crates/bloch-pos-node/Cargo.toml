@@ -71,6 +71,9 @@ bloch-pos-committee = { path = "../bloch-pos-committee", features = ["local-stat
 # dependency, one-way; pulls the PQClean FFI tree, which is why this crate's
 # build stopped being instant at M2 — planned in the integration doc §6.
 bloch-crypto = { path = "../bloch-crypto" }
+# Finality certificates (getfinalitycertificate): wire format + registry proofs.
+# Library/RPC only; no consensus path reads it.
+bloch-finality-cert = { path = "../bloch-finality-cert" }
 sha3 = "0.10"
 
 # Keystore encryption at rest (src/keys.rs, audit I-H1): Argon2id derives the

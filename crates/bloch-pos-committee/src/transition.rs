@@ -2794,7 +2794,28 @@ impl CommittedState {
         ROOT_COMPUTATION_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
         // Instrumentation only; compiled out without `perf-timing`.
         let _perf = crate::perf::span(crate::perf::Phase::StateRoot);
-        let validators: Vec<CommittedValidatorRecord> = self
+        self.compute_tree().root()
+    }
+
+    /// The full committed state tree whose root is [`Self::compute_root`].
+    ///
+    /// Library-only accessor for proof producers (finality certificates):
+    /// the SAME construction the root uses, split out so a proof cannot be
+    /// built against a different tree than the one the header commits. Pure,
+    /// read-only; it changes no root and no consensus input.
+    pub fn state_tree(&self) -> crate::state_root::Smt {
+        self.compute_tree()
+    }
+
+    /// Canonical committed bytes of every validator registry record, by
+    /// index ascending — the exact leaves [`Self::state_tree`] holds under
+    /// `TAG_VALIDATOR`.
+    pub fn committed_validator_records(&self) -> Vec<CommittedValidatorRecord> {
+        self.committed_validators()
+    }
+
+    fn committed_validators(&self) -> Vec<CommittedValidatorRecord> {
+        self
             .validators
             .values()
             .map(|r| CommittedValidatorRecord {
@@ -2817,7 +2838,11 @@ impl CommittedState {
                 withdrawal_credentials: r.withdrawal_credentials.clone(),
                 commission_bps: r.commission_bps,
             })
-            .collect();
+            .collect()
+    }
+
+    fn compute_tree(&self) -> crate::state_root::Smt {
+        let validators: Vec<CommittedValidatorRecord> = self.committed_validators();
         let current: Vec<ParticipationRecord> = self
             .current_participation
             .iter()
@@ -3050,7 +3075,7 @@ impl CommittedState {
         if let Some(state) = &self.l2_settlement {
             crate::state_root::insert_l2_settlement(&mut tree, &state.committed_bytes());
         }
-        tree.root()
+        tree
     }
 
     // ── Fork-choice accumulation ────────────────────────────────────────────

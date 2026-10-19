@@ -1446,6 +1446,9 @@ mod ws_lifecycle_tests;
 
 mod local_cache;
 mod verification;
+mod finality_cert;
+#[cfg(test)]
+mod finality_cert_tests;
 
 struct Engine {
     manifest: Manifest,
@@ -1512,6 +1515,9 @@ struct Engine {
     /// the wrong branch". A block that leaves the canonical chain and later
     /// returns has the same post-state both times.
     recent_states: VecDeque<([u8; 32], Arc<CommittedState>)>,
+    /// Retained checkpoint registry proofs + built certificates for
+    /// `getfinalitycertificate`. RPC-only; see `engine/finality_cert.rs`.
+    finality_certs: finality_cert::FinalityCertStore,
     /// Attestations available to fork choice and to the next proposal, keyed
     /// by content so duplicates collapse. This is the *aggregation* store.
     pool: BTreeMap<(u32, [u8; 32]), Attestation>,
@@ -4538,6 +4544,9 @@ impl Engine {
                 self.remember_state(*id.as_bytes(), snapshot);
                 self.canonical.insert(*id.as_bytes());
                 self.chain.push((env.header.slot, id));
+                // RPC-only: retain the registry proof of a checkpoint block
+                // when this block opened a new epoch (once per epoch).
+                self.note_checkpoint_registry();
                 self.head_slot.store(env.header.slot, Ordering::Relaxed);
                 self.last_applied_ms = now_ms();
                 // Finality latch (F-03): arm/raise the floor the moment the
@@ -5119,6 +5128,9 @@ impl Engine {
             self.chain.push((env.header.slot, id));
         }
         self.canonical = canonical;
+        // RPC-only: the reorg ring holds the new head and its parent, so
+        // the head's boundary (if it opened an epoch) can be retained.
+        self.note_checkpoint_registry();
         self.head_slot
             .store(self.head_slot_now(), Ordering::Relaxed);
         self.last_applied_ms = now_ms();
@@ -5773,6 +5785,10 @@ impl Engine {
             RpcRequest::Validators => Ok(rpc::validator_registry_json(&self.state)),
 
             RpcRequest::TxStatus(txid) => Ok(rpc::tx_status_json(self.tx_status(&txid))),
+
+            RpcRequest::FinalityCertificate { epoch, block, set_source_epoch } => {
+                self.finality_certificate(epoch, block, set_source_epoch)
+            }
         }
     }
 }
@@ -6300,6 +6316,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
         recent_states: VecDeque::new(),
+        finality_certs: Default::default(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
         held_release_roots: VecDeque::new(),
@@ -9265,6 +9282,7 @@ mod transfer_v2_end_to_end {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+            finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
@@ -10475,6 +10493,17 @@ mod perf_support {
     pub(super) fn proposing_engine_funded(
         opening: &[bloch_pos_committee::state_root::EutxoEntry],
     ) -> (Engine, TestDir) {
+        let (engine, dir, _) = proposing_engine_n(opening, 1);
+        (engine, dir)
+    }
+
+    /// `n` genesis validators with real hybrid keystores (each in its own
+    /// subdirectory). The engine signs as validator 0; the other keystores are
+    /// returned so a test can swap them in to attest/propose as the whole set.
+    pub(super) fn proposing_engine_n(
+        opening: &[bloch_pos_committee::state_root::EutxoEntry],
+        n: u32,
+    ) -> (Engine, TestDir, Vec<Keystore>) {
         static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "bloch-pos-perf-{}-{}",
@@ -10489,17 +10518,29 @@ mod perf_support {
         // in an unoptimized test binary would dominate the suite.
         let ks = Keystore::generate_with(&dir, 0, &crate::keys::Unlock::PlaintextOptIn)
             .expect("generate a devnet keystore");
+        let others: Vec<Keystore> = (1..n)
+            .map(|i| {
+                let sub = dir.join(format!("v{i}"));
+                std::fs::create_dir_all(&sub).expect("create a validator subdir");
+                Keystore::generate_with(&sub, i, &crate::keys::Unlock::PlaintextOptIn)
+                    .expect("generate a devnet keystore")
+            })
+            .collect();
         let manifest = Manifest {
             genesis_time_ms: now_ms(),
             slot_ms: 1_000,
-            validators: vec![ManifestValidator {
-                index: 0,
-                stake_sat: 200_000 * SAT_PER_BLOCH,
-                randao_commitment: RandaoChain::generate(ks.randao_seed).commitment(),
-                pubkey: ks.pubkey.clone(),
-                withdrawal_credentials: Vec::new(),
-                commission_bps: 0,
-            }],
+            validators: std::iter::once(&ks)
+                .chain(others.iter())
+                .enumerate()
+                .map(|(i, k)| ManifestValidator {
+                    index: i as u32,
+                    stake_sat: 200_000 * SAT_PER_BLOCH,
+                    randao_commitment: RandaoChain::generate(k.randao_seed).commitment(),
+                    pubkey: k.pubkey.clone(),
+                    withdrawal_credentials: Vec::new(),
+                    commission_bps: 0,
+                })
+                .collect(),
             cohort: Vec::new(),
             carryover: None,
             allocations: Vec::new(),
@@ -10528,6 +10569,7 @@ mod perf_support {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+            finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
@@ -10580,7 +10622,7 @@ mod perf_support {
             doppelganger_observe_until: None,
             doppelganger_halted: false,
         };
-        (engine, TestDir(dir))
+        (engine, TestDir(dir), others)
     }
 }
 
@@ -12700,6 +12742,7 @@ mod duty_view_anchor {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+            finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
@@ -12968,6 +13011,7 @@ mod slot_horizon {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+            finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),

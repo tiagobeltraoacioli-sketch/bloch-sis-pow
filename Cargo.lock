@@ -1550,6 +1550,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloch-finality-cert"
+version = "0.1.0"
+dependencies = [
+ "bloch-crypto",
+ "bloch-pos-committee",
+ "sha3 0.10.9",
+]
+
+[[package]]
 name = "bloch-indexer"
 version = "0.1.0"
 dependencies = [
@@ -1589,6 +1598,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "bloch-crypto",
+ "bloch-finality-cert",
  "bloch-l2-proof",
  "bloch-pos-committee",
  "cc",

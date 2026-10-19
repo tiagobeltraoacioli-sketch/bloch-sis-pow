@@ -105,6 +105,9 @@ fn frozen_method_space(req: &RpcRequest) -> &'static str {
         // table, per this file's own two-layer discipline.
         RpcRequest::Validators => "getvalidators",
         RpcRequest::TxStatus(_) => "gettxstatus",
+        // Finality certificates (2026-10-19): a new question — "prove this
+        // checkpoint is final to someone who runs no node" — not an alias.
+        RpcRequest::FinalityCertificate { .. } => "getfinalitycertificate",
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }
@@ -163,6 +166,7 @@ fn every_frozen_variant_routes_under_its_registered_name() {
         ("getvalidatoradmission", "[]"),
         ("getmempoolinfo", "[]"),
         ("getvalidators", "[]"),
+        ("getfinalitycertificate", "[\"latest\"]"),
     ];
     for (name, params) in cases {
         let p = parse_json(params).expect("test params parse");

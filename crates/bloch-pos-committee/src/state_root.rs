@@ -1103,6 +1103,94 @@ pub fn verify_inclusion(
     h == *root
 }
 
+/// Proof that `key` is NOT committed under a root: the 256 siblings of the
+/// key's path, folded from the empty leaf slot instead of a leaf.
+///
+/// Library-only (finality certificates, light clients). It reads the same
+/// tree [`Smt::prove`] reads and changes nothing the state root commits.
+impl Smt {
+    /// Absence proof for `key`, or `None` if the key IS committed.
+    pub fn prove_absence(&self, key: &[u8; 32]) -> Option<InclusionProof> {
+        let mut siblings = Vec::with_capacity(TREE_DEPTH);
+        let mut node = &self.root;
+        let mut d = 0;
+        while d < TREE_DEPTH {
+            match node {
+                None => {
+                    for dd in d..TREE_DEPTH {
+                        siblings.push(self.empty[dd + 1]);
+                    }
+                    return Some(InclusionProof { siblings });
+                }
+                Some(Node::Leaf(l)) => {
+                    if l.key == *key {
+                        return None;
+                    }
+                    // The lone leaf sits in this subtree; walk until our key's
+                    // path leaves it, then the rest of our path is empty.
+                    let mut dd = d;
+                    while dd < TREE_DEPTH && bit(key, dd) == bit(&l.key, dd) {
+                        siblings.push(self.empty[dd + 1]);
+                        dd += 1;
+                    }
+                    if dd == TREE_DEPTH {
+                        return None;
+                    }
+                    siblings.push(singleton_subtree_root(&l.key, &l.value_hash, dd + 1, &self.empty));
+                    for e in (dd + 1)..TREE_DEPTH {
+                        siblings.push(self.empty[e + 1]);
+                    }
+                    return Some(InclusionProof { siblings });
+                }
+                Some(Node::Split(s)) => {
+                    let (on_path, off_path) =
+                        if bit(key, d) == 0 { (&s.left, &s.right) } else { (&s.right, &s.left) };
+                    siblings.push(hash_of(off_path, d + 1, &self.empty));
+                    node = on_path;
+                }
+            }
+            d += 1;
+        }
+        match node {
+            Some(Node::Leaf(l)) if l.key == *key => None,
+            None => Some(InclusionProof { siblings }),
+            _ => None,
+        }
+    }
+}
+
+/// Verify that nothing is committed at `key` under `root` (see
+/// [`Smt::prove_absence`]). Free function, no tree needed.
+pub fn verify_absence(root: &[u8; 32], key: &[u8; 32], proof: &InclusionProof) -> bool {
+    if proof.siblings.len() != TREE_DEPTH {
+        return false;
+    }
+    let mut h = sha3(&[&[MARK_EMPTY]]);
+    for d in (0..TREE_DEPTH).rev() {
+        let sib = &proof.siblings[d];
+        h = if bit(key, d) == 0 { node_hash(&h, sib) } else { node_hash(sib, &h) };
+    }
+    h == *root
+}
+
+/// The empty-subtree constants (`[d]` = root of an empty subtree at depth
+/// `d`; `[TREE_DEPTH]` = the empty leaf slot). Public so a proof can be
+/// shipped compressed (empty siblings elided) and re-expanded by a verifier.
+pub fn empty_subtree_hashes() -> Vec<[u8; 32]> {
+    empty_hashes()
+}
+
+/// Tree key of the validator registry record at `index` (component
+/// `TAG_VALIDATOR`). The single definition the state root itself uses.
+pub fn validator_leaf_key(index: u32) -> [u8; 32] {
+    derive_key(TAG_VALIDATOR, &index.to_le_bytes())
+}
+
+/// Leaf value hash of a canonical serialization (`SHA3(DS_STATE ‖ 0x04 ‖ bytes)`).
+pub fn leaf_value_hash(serialized: &[u8]) -> [u8; 32] {
+    hash_value(serialized)
+}
+
 // -- Committed state components ---------------------------------------------
 //
 // Serialization here is canonical by construction: fixed field order, fixed
@@ -1222,6 +1310,50 @@ pub struct ValidatorRecord {
 }
 
 impl ValidatorRecord {
+    /// The exact bytes the state root hashes for this record (library-only
+    /// accessor; the format is the committed one, unchanged).
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        self.serialize()
+    }
+
+    /// Strict inverse of [`Self::canonical_bytes`]: every byte consumed,
+    /// lengths bounded, `slashed` exactly 0/1. `None` on anything else.
+    pub fn from_canonical_bytes(b: &[u8]) -> Option<Self> {
+        struct R<'a>(&'a [u8]);
+        impl<'a> R<'a> {
+            fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+                if self.0.len() < n { return None; }
+                let (h, t) = self.0.split_at(n);
+                self.0 = t;
+                Some(h)
+            }
+            fn u32(&mut self) -> Option<u32> { Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?)) }
+            fn u64(&mut self) -> Option<u64> { Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?)) }
+            fn a32(&mut self) -> Option<[u8; 32]> { self.take(32)?.try_into().ok() }
+        }
+        let mut r = R(b);
+        let index = r.u32()?;
+        let pk_len = r.u32()? as usize;
+        if pk_len > 65_536 { return None; }
+        let pubkey = r.take(pk_len)?.to_vec();
+        let stake = r.u64()?;
+        let activation_epoch = r.u64()?;
+        let exit_epoch = r.u64()?;
+        let slashed = match r.take(1)?[0] { 0 => false, 1 => true, _ => return None };
+        let randao_commitment = r.a32()?;
+        let reveals_used = r.u32()?;
+        let withdrawable_epoch = r.u64()?;
+        let wc_len = r.u32()? as usize;
+        if wc_len > 65_536 { return None; }
+        let withdrawal_credentials = r.take(wc_len)?.to_vec();
+        let commission_bps = u128::from_le_bytes(r.take(16)?.try_into().ok()?);
+        if !r.0.is_empty() { return None; }
+        Some(ValidatorRecord {
+            index, pubkey, stake, activation_epoch, exit_epoch, slashed, randao_commitment,
+            reveals_used, withdrawable_epoch, withdrawal_credentials, commission_bps,
+        })
+    }
+
     fn entry_key(&self) -> Vec<u8> {
         self.index.to_le_bytes().to_vec()
     }
