@@ -223,6 +223,32 @@ impl SlashingEvidence {
     }
 }
 
+/// The epoch an offence was COMMITTED in — not the epoch it is reported in.
+///
+/// Attestation pairs: the larger of the two target epochs, i.e. the epoch of
+/// the later conflicting vote, which is when the pair first became an
+/// offence. Header pairs: the epoch of the doubly-signed slot. Taking the
+/// LATER message is deliberate: a pair whose second message was signed after
+/// slashing activated is a post-activation act and stays slashable even if
+/// its first message is old.
+pub fn evidence_offence_epoch(evidence: &crate::interfaces::SlashingEvidence) -> u64 {
+    match evidence {
+        crate::interfaces::SlashingEvidence::AttestationOffence { first, second } => {
+            first.data.target_epoch.max(second.data.target_epoch)
+        }
+        crate::interfaces::SlashingEvidence::ProposerEquivocation { first, second } => {
+            first.header.slot.max(second.header.slot) / crate::params::SLOTS_PER_EPOCH
+        }
+    }
+}
+
+/// Was this offence committed before slashing existed
+/// ([`crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`])? Pure function of
+/// the evidence bytes, so a stateless mempool can apply it.
+pub fn offence_predates_activation(evidence: &crate::interfaces::SlashingEvidence) -> bool {
+    evidence_offence_epoch(evidence) < crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH
+}
+
 /// Everything one applied slash produced. Balances live outside this crate,
 /// so the outcome reports amounts and leaves crediting/debiting to the caller.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -678,6 +704,36 @@ impl SlashingState {
 mod tests {
     use super::*;
     use crate::attestation::AttestationData;
+
+    #[test]
+    fn offence_epoch_is_the_later_message_and_gates_on_activation() {
+        let gate = crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH;
+        let att = |source: u64, target: u64| Attestation {
+            data: AttestationData {
+                slot: target * crate::params::SLOTS_PER_EPOCH,
+                head: [target as u8; 32],
+                source_epoch: source,
+                source_root: [0; 32],
+                target_epoch: target,
+                target_root: [0; 32],
+            },
+            validator: 7,
+            signature: vec![],
+        };
+        let pair = |a, b| crate::interfaces::SlashingEvidence::AttestationOffence { first: a, second: b };
+        // The incident's shape: both votes years before slashing existed.
+        let old = pair(att(651, 664), att(600, 1486));
+        assert_eq!(evidence_offence_epoch(&old), 1486);
+        assert!(offence_predates_activation(&old));
+        // Order-independent.
+        assert_eq!(evidence_offence_epoch(&pair(att(600, 1486), att(651, 664))), 1486);
+        // Straddling: the later vote is post-activation, so it is slashable.
+        let straddle = pair(att(10, gate + 5), att(20, 30));
+        assert!(!offence_predates_activation(&straddle));
+        // Boundary: exactly the activation epoch is post-activation.
+        assert!(offence_predates_activation(&pair(att(1, gate - 1), att(2, gate - 1))));
+        assert!(!offence_predates_activation(&pair(att(1, gate), att(2, gate))));
+    }
 
     /// A signature is "valid" iff it equals the signing root — enough to make
     /// forgery (any other bytes) detectable per-message in tests.

@@ -763,6 +763,27 @@ pub mod rehearsal {
         static SLASHING_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
     }
 
+    thread_local! {
+        static PRE_ACTIVATION_REFUSAL_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH`] as bound.
+    pub fn pre_activation_refusal_forced() -> bool {
+        PRE_ACTIVATION_REFUSAL_TL.with(|c| c.get())
+    }
+
+    /// Binds the pre-activation offence refusal for this thread until drop.
+    pub fn pre_activation_refusal_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                PRE_ACTIVATION_REFUSAL_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = PRE_ACTIVATION_REFUSAL_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
     /// Test-only: treat [`super::SLASHING_EVIDENCE_ACTIVATION_EPOCH`] as
     /// already bound.
     ///
@@ -1481,6 +1502,35 @@ pub const FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///
 /// The release tests pin this gate to the same epoch as funded admission.
 pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = 2_884;
+
+/// Pre-activation offence refusal (incident 2026-10-19). `u64::MAX` = INERT.
+///
+/// [`SLASHING_EVIDENCE_ACTIVATION_EPOCH`] gates the epoch of the INCLUDING
+/// block only; the offence's own epoch was never checked, so every pair of
+/// conflicting messages ever signed — including the thousands of surround and
+/// double votes our own validators left in canonical blocks at target epochs
+/// 664..1486, years of protocol time before slashing existed — became
+/// slashable at epoch 2884. Once this gate binds (judged off the including
+/// block's committed epoch, like every gate), a block carrying evidence whose
+/// offence epoch ([`crate::slashing::evidence_offence_epoch`]) is below
+/// [`SLASHING_EVIDENCE_ACTIVATION_EPOCH`] is invalid.
+///
+/// Soft fork: it only removes blocks from the valid set. Replay-safe at ANY
+/// arming value ≥ 2884 as long as no canonical block in `[2884, arming)`
+/// carries pre-activation evidence; on mainnet at e6026 the registry has no
+/// slashed validator, and an included evidence either slashes (sets
+/// `slashed`) or invalidates its block, so the canonical chain carries none.
+/// See docs/SLASHING-PRE-ACTIVATION-EXPOSURE.md for the arming decision.
+pub const PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH: u64 = u64::MAX;
+
+/// Is the pre-activation offence refusal binding at `epoch`?
+pub fn pre_activation_offence_refusal_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    let forced = rehearsal::pre_activation_refusal_forced();
+    #[cfg(not(test))]
+    let forced = false;
+    forced || epoch_gate_active(epoch, PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH)
+}
 
 /// Candidate ST-03/ST-04 slashing-economics rules. `u64::MAX` means INERT.
 ///

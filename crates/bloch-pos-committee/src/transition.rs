@@ -128,6 +128,8 @@ use crate::params::SLOTS_PER_EPOCH;
 pub mod funded;
 pub mod funded_delegation;
 mod lifecycle;
+mod slashing_rehearsal;
+pub use slashing_rehearsal::EvidenceRehearsal;
 pub use funded::{FundedDeposit, FundedDepositReject, FundingInput};
 pub use funded_delegation::{
     FundedDelegate, FundedDelegationReject, FundedDelegationWithdraw, FundedUndelegate,
@@ -6303,6 +6305,16 @@ impl<V: SignatureVerifier> Transition<V> {
                 // expected_bits fork is the standing reason.
                 PosTransaction::SlashingEvidence(_)
                     if !CommittedState::slashing_evidence_active(block_epoch) =>
+                {
+                    Err(TxReject::EvidenceNotActive)
+                }
+                // Incident 2026-10-19: the gate above judges only the
+                // including block. Once PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH
+                // binds, an offence committed before slashing existed is not
+                // slashable, whatever block carries it.
+                PosTransaction::SlashingEvidence(ev)
+                    if crate::params::pre_activation_offence_refusal_active(block_epoch)
+                        && slashing::offence_predates_activation(ev) =>
                 {
                     Err(TxReject::EvidenceNotActive)
                 }
@@ -13874,6 +13886,75 @@ mod tests {
             t.compute_post_state(&g, &env, &[], std::slice::from_ref(&innocent)).unwrap_err(),
             TransitionError::Transaction(0),
         );
+    }
+
+    /// Incident 2026-10-19: once `PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH`
+    /// binds, evidence for an offence committed before slashing existed
+    /// (target epoch 1 here, < 2884) invalidates the block that carries it;
+    /// with the refusal unbound the very same evidence slashes (control).
+    #[test]
+    fn pre_activation_offence_rejects_the_block_once_the_refusal_binds() {
+        let _gate = crate::params::rehearsal::slashing_gate_open_guard();
+        let (t, g, mut chains) = setup(4);
+        let p1 = schedule::proposer(&g.seed_for_epoch(0), 1, &g.duty_roster()).unwrap();
+        let offender = (p1 + 1) % 4;
+        let ev = PosTransaction::SlashingEvidence(double_vote_evidence(offender));
+        let PosTransaction::SlashingEvidence(inner) = &ev else { unreachable!() };
+        assert!(slashing::offence_predates_activation(inner));
+        {
+            let _refuse = crate::params::rehearsal::pre_activation_refusal_guard();
+            let env = probe_env(&g, 1, std::slice::from_ref(&ev), &mut chains);
+            assert_eq!(
+                t.compute_post_state(&g, &env, &[], std::slice::from_ref(&ev)).unwrap_err(),
+                TransitionError::Transaction(0),
+            );
+            // Relay validation mirrors consensus.
+            assert_eq!(
+                g.validate_lifecycle_transaction(&ev, 0, 0, &OkVerifier),
+                Err(TxReject::EvidenceNotActive)
+            );
+        }
+        let (_, _, mut fresh) = setup(4);
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&ev), &mut fresh);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&ev)).unwrap();
+        assert!(s1.validator_record(offender).unwrap().slashed, "control: unbound refusal slashes");
+    }
+
+    /// The refusal is about WHEN the offence happened, not when it is
+    /// reported: a pair whose later vote targets an epoch at or after
+    /// activation stays slashable with the refusal bound.
+    #[test]
+    fn post_activation_offence_still_slashes_under_the_refusal() {
+        let _gate = crate::params::rehearsal::slashing_gate_open_guard();
+        let _refuse = crate::params::rehearsal::pre_activation_refusal_guard();
+        let (t, g, mut chains) = setup(4);
+        let p1 = schedule::proposer(&g.seed_for_epoch(0), 1, &g.duty_roster()).unwrap();
+        let offender = (p1 + 1) % 4;
+        let te = crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH;
+        let data = |head: u8| AttestationData {
+            slot: te * crate::params::SLOTS_PER_EPOCH,
+            head: [head; 32],
+            source_epoch: te - 1,
+            source_root: [1; 32],
+            target_epoch: te,
+            target_root: [head; 32],
+        };
+        let ev = PosTransaction::SlashingEvidence(SlashingEvidence::AttestationOffence {
+            first: Attestation { data: data(0xAA), validator: offender, signature: vec![0u8; 8] },
+            second: Attestation { data: data(0xBB), validator: offender, signature: vec![0u8; 8] },
+        });
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&ev), &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&ev)).unwrap();
+        assert!(s1.validator_record(offender).unwrap().slashed);
+    }
+
+    /// Draft value: unarmed until the operator picks the epoch
+    /// (docs/SLASHING-PRE-ACTIVATION-EXPOSURE.md). Goes red when armed so the
+    /// arming commit has to revisit this pin and the replay argument.
+    #[test]
+    fn pre_activation_refusal_is_unarmed_in_this_draft() {
+        assert_eq!(crate::params::PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH, u64::MAX);
+        assert!(!crate::params::pre_activation_offence_refusal_active(u64::MAX - 1));
     }
 
     #[test]

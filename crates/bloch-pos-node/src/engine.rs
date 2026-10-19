@@ -4380,6 +4380,12 @@ impl Engine {
     fn candidate_is_backed(&self, tx: &PosTransaction, encoded: usize, epoch: u64,
         funded_context: &mut Option<(Arc<CommittedState>, u128)>) -> bool {
         if admission::check_transfer(&self.state, tx, encoded, epoch).is_err() { return false; }
+        // Proposer policy (incident 2026-10-19): never include evidence for an
+        // offence that predates slashing, even if it reached the mempool by a
+        // path that skipped `admissible`.
+        if let PosTransaction::SlashingEvidence(ev) = tx {
+            if bloch_pos_committee::slashing::offence_predates_activation(ev) { return false; }
+        }
         if matches!(tx, PosTransaction::FundedDeposit(_)) {
             if !bloch_pos_committee::params::funded_validator_admission_active(epoch) { return false; }
             let (rolled, total) = funded_context.get_or_insert_with(|| {
@@ -7697,12 +7703,23 @@ fn admissible_with_network_verifier(
             }
             Ok(())
         }
-        PosTransaction::SlashingEvidence(_) => {
+        PosTransaction::SlashingEvidence(ev) => {
             if !bloch_pos_committee::params::epoch_gate_active(wall_epoch, bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH) {
                 return Err(
                     "slashing evidence (tag 0x05) is not active: the transaction ships \
                      behind a flag day (SLASHING_EVIDENCE_ACTIVATION_EPOCH) that this \
                      chain has not reached, so no block could carry it",
+                );
+            }
+            // Node policy, unconditional (incident 2026-10-19): an offence
+            // committed before slashing existed is never relayed. Consensus
+            // still accepts such evidence until
+            // PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH binds; this only stops
+            // THIS node from carrying it to a proposer.
+            if bloch_pos_committee::slashing::offence_predates_activation(ev) {
+                return Err(
+                    "slashing evidence for an offence committed before \
+                     SLASHING_EVIDENCE_ACTIVATION_EPOCH is refused by node policy",
                 );
             }
             Ok(())
@@ -7936,6 +7953,42 @@ mod forkchoice_tests {
                 err.contains("SLASHING_EVIDENCE_ACTIVATION_EPOCH"),
                 "the refusal must name the gate: {err}"
             );
+        }
+    }
+
+    /// Incident 2026-10-19 node policy: past the flag day, evidence for an
+    /// offence committed BEFORE it is refused at the door; a post-activation
+    /// offence is still admitted.
+    #[test]
+    fn pre_activation_offence_is_refused_at_the_door_after_the_flag_day() {
+        let gate = bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH;
+        let ev = |target: u64| {
+            let attest = |head: u8| bloch_pos_committee::Attestation {
+                data: bloch_pos_committee::AttestationData {
+                    slot: target * bloch_pos_committee::SLOTS_PER_EPOCH,
+                    head: [head; 32],
+                    source_epoch: target - 1,
+                    source_root: [1; 32],
+                    target_epoch: target,
+                    target_root: [head; 32],
+                },
+                validator: 2,
+                signature: vec![0u8; 8],
+            };
+            PosTransaction::SlashingEvidence(
+                bloch_pos_committee::interfaces::SlashingEvidence::AttestationOffence {
+                    first: attest(0xAA),
+                    second: attest(0xBB),
+                },
+            )
+        };
+        for wall_epoch in [gate, 6_026, 50_000] {
+            for target in [1u64, 664, 1_486, gate - 1] {
+                let err = admissible(&ev(target), wall_epoch).expect_err("pre-activation offence admitted");
+                assert!(err.contains("before"), "{err}");
+            }
+            assert!(admissible(&ev(gate), wall_epoch).is_ok());
+            assert!(admissible(&ev(wall_epoch), wall_epoch).is_ok());
         }
     }
 

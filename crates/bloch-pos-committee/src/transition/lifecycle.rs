@@ -198,6 +198,11 @@ impl CommittedState {
                 if !Self::slashing_evidence_active(self.epoch) {
                     return Err(TxReject::EvidenceNotActive);
                 }
+                if crate::params::pre_activation_offence_refusal_active(self.epoch)
+                    && crate::slashing::offence_predates_activation(evidence)
+                {
+                    return Err(TxReject::EvidenceNotActive);
+                }
                 let roster = self.consensus_roster_at(self.epoch);
                 self.clone()
                     .apply_slashing_evidence(evidence, 0, &roster, verifier)
