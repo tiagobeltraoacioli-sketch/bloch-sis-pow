@@ -495,6 +495,41 @@ fn node_is_behind(
         && now_ms.saturating_sub(last_applied_ms) > stale_after_ms
 }
 
+/// Whether this slot-loop turn may sign the attestation for wall slot `slot`.
+///
+/// Below `ANCESTRY_SEED_ACTIVATION_EPOCH` the committee seed of epoch `e` is
+/// the RANDAO mix of the last block before `first_slot_of_epoch(e)`, and the
+/// target is that same block. An attester that signs at the very start of an
+/// epoch's slot while its head is still in `e - 1` AND the boundary slot
+/// `first_slot_of_epoch(e) - 1` is empty in its view is betting that no block
+/// for that slot is still in flight. When one is, the vote is drawn from the
+/// wrong seed and names the wrong target, so it is never included; worse,
+/// once the late block lands the validator's real committee slot comes up
+/// later in the same epoch and slashing protection correctly refuses it as a
+/// double vote. One late block costs the whole epoch's vote.
+///
+/// So in exactly that case the signature waits until half the slot has
+/// elapsed, giving the late boundary block time to arrive. Every other case —
+/// head already in `e`, or head on the boundary slot itself — signs at once,
+/// unchanged, so same-slot inclusion (the only inclusion an epoch's last
+/// slot ever gets) is not touched.
+fn attestation_due(
+    head_slot: u64,
+    slot: u64,
+    now_ms: u64,
+    slot_start_ms: u64,
+    slot_ms: u64,
+) -> bool {
+    let e = epoch_of(slot);
+    if epoch_of(head_slot) >= e {
+        return true;
+    }
+    let boundary_seen = first_slot_of_epoch(e)
+        .and_then(|first| first.checked_sub(1))
+        .is_none_or(|last_of_prev| head_slot >= last_of_prev);
+    boundary_seen || now_ms.saturating_sub(slot_start_ms) >= slot_ms / 2
+}
+
 /// Remaining wall-clock epochs before a single block extending `head_slot`
 /// would exceed the consensus epoch-walk ceiling.
 ///
@@ -6858,7 +6893,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // this function's stack — a restart forgets them entirely. They stop
         // duplicate work within one run; `slashprot` is what stops a second
         // signature across runs and across processes.
-        if !duties_blocked && slot > last_attested {
+        if !duties_blocked
+            && slot > last_attested
+            && attestation_due(engine.state.slot(), slot, now, slot_start, slot_ms)
+        {
             engine.maintain_validator_lifecycle(wall_epoch);
             engine.attest(slot);
             last_attested = slot;
@@ -16046,6 +16084,55 @@ mod stale_head_duty_gate_tests {
     fn a_normal_one_slot_head_gap_does_not_block_duties() {
         assert!(!node_is_behind(99, 100, 50_000, 0, 20_000));
         assert!(!validator_duties_blocked(false, false, false, false, false));
+    }
+
+    /// Epoch-start slot 191296 with the head on 191294 while the boundary
+    /// block 191295 is still in flight: signing at slot start would vote the
+    /// wrong target, so the vote waits half a slot for the boundary block.
+    #[test]
+    fn an_epoch_start_vote_waits_while_the_boundary_slot_is_empty_in_view() {
+        let slot_ms = 30_000;
+        let (slot, start) = (191_296u64, 1_000_000u64);
+        assert_eq!(slot % SLOTS_PER_EPOCH, 0);
+        assert!(!attestation_due(191_294, slot, start, start, slot_ms));
+        assert!(!attestation_due(191_294, slot, start + slot_ms / 2 - 1, start, slot_ms));
+        assert!(attestation_due(191_294, slot, start + slot_ms / 2, start, slot_ms));
+        // The late block landed: the seed and target are now pinned.
+        assert!(attestation_due(191_295, slot, start, start, slot_ms));
+    }
+
+    #[test]
+    fn later_slots_of_an_epoch_with_no_block_yet_still_wait_on_a_missing_boundary() {
+        let slot_ms = 30_000;
+        // Slots 191296..191298 empty in view, head still on 191294.
+        assert!(!attestation_due(191_294, 191_298, 0, 0, slot_ms));
+        assert!(attestation_due(191_294, 191_298, slot_ms / 2, 0, slot_ms));
+    }
+
+    #[test]
+    fn ordinary_and_epoch_end_votes_are_signed_at_slot_start() {
+        let slot_ms = 30_000;
+        // Head on the boundary slot: the usual epoch start, unchanged.
+        assert!(attestation_due(191_295, 191_296, 0, 0, slot_ms));
+        // Head already inside the epoch, even across empty slots.
+        assert!(attestation_due(191_296, 191_310, 0, 0, slot_ms));
+        // An epoch's last slot depends on same-slot inclusion; never delayed.
+        assert!(attestation_due(191_320, 191_327, 0, 0, slot_ms));
+        assert_eq!(191_327 % SLOTS_PER_EPOCH, SLOTS_PER_EPOCH - 1);
+        // Epoch 0 has no previous boundary.
+        assert!(attestation_due(0, 5, 0, 0, slot_ms));
+    }
+
+    #[test]
+    fn the_slot_loop_gates_attest_on_attestation_due() {
+        let source = include_str!("engine.rs");
+        let call = source
+            .find("            engine.attest(slot);\n            last_attested = slot;")
+            .expect("slot-loop attest call");
+        let gate = source[..call]
+            .rfind("&& attestation_due(engine.state.slot(), slot, now, slot_start, slot_ms)")
+            .expect("attestation_due gate");
+        assert!(call - gate < 200, "the gate must guard the slot-loop attest call");
     }
 
     #[test]
