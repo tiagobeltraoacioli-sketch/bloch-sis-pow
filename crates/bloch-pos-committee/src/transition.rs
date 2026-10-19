@@ -13948,13 +13948,15 @@ mod tests {
         assert!(s1.validator_record(offender).unwrap().slashed);
     }
 
-    /// Draft value: unarmed until the operator picks the epoch
-    /// (docs/SLASHING-PRE-ACTIVATION-EXPOSURE.md). Goes red when armed so the
-    /// arming commit has to revisit this pin and the replay argument.
+    /// Armed at slashing activation (owner decision 2026-10-19): replay-safe
+    /// because no canonical block in [2884, now) carries slashing evidence and
+    /// no validator is slashed (docs/SLASHING-PRE-ACTIVATION-EXPOSURE.md).
     #[test]
-    fn pre_activation_refusal_is_unarmed_in_this_draft() {
-        assert_eq!(crate::params::PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH, u64::MAX);
-        assert!(!crate::params::pre_activation_offence_refusal_active(u64::MAX - 1));
+    fn pre_activation_refusal_is_armed_at_slashing_activation() {
+        let gate = crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH;
+        assert_eq!(crate::params::PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH, gate);
+        assert!(!crate::params::pre_activation_offence_refusal_active(gate - 1));
+        assert!(crate::params::pre_activation_offence_refusal_active(gate));
     }
 
     #[test]
