@@ -208,6 +208,14 @@ impl CommittedState {
                     .apply_slashing_evidence(evidence, 0, &roster, verifier)
                     .map_err(|_| TxReject::StakingRule)
             }
+            // Same gate and rules as the consensus arm, without cloning the
+            // state: `check_kes_register` mutates nothing.
+            PosTransaction::KesRegister { validator, depth, root, signature } => {
+                if !crate::params::kes_registration_open(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
+                self.check_kes_register(*validator, *depth, root, signature, verifier).map(|_| ())
+            }
             PosTransaction::FundedDelegate(_)
             | PosTransaction::FundedUndelegate(_)
             | PosTransaction::FundedDelegationWithdraw(_)

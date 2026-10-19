@@ -144,6 +144,9 @@ pub use l2_claim::{L2WithdrawClaim, L2WithdrawClaimReject};
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
 use crate::schedule;
+// Consensus code resolves keys through `crate::kes::verify_validator`; the
+// tests still call `KeyLookup::pubkey` on bare registries.
+#[cfg(test)]
 use crate::attestation::KeyLookup as _;
 use crate::slashing;
 use crate::staking::{self, QueuedDeposit};
@@ -565,6 +568,19 @@ pub enum PosTransaction {
         /// [`crate::beacon::recommit_signing_root`].
         signature: Vec<u8>,
     },
+    /// Register a forward-secure (KES) key for a validator, once (wire
+    /// 0x17). Refused before [`crate::params::KES_REGISTRATION_EPOCH`].
+    /// Authorised by the validator's registered static key over
+    /// [`crate::kes::register_signing_root`] (network domain, index, depth,
+    /// root). From [`crate::params::KES_ACTIVATION_EPOCH`] on, the
+    /// validator's proposals and votes verify only under this root.
+    KesRegister {
+        validator: u32,
+        depth: u8,
+        root: [u8; 32],
+        /// Hybrid signature by the registered static key.
+        signature: Vec<u8>,
+    },
     /// Bond delegated stake behind an operator.
     Delegate {
         delegator: u32,
@@ -962,6 +978,14 @@ impl PosTransaction {
                 b.extend_from_slice(&epoch.to_le_bytes());
                 put(&mut b, signature);
             }
+            PosTransaction::KesRegister { validator, depth, root, signature } => {
+                // Fixed-width fields, then a length-prefixed signature.
+                b.push(crate::kes::REGISTER_TAG);
+                b.extend_from_slice(&validator.to_le_bytes());
+                b.push(*depth);
+                b.extend_from_slice(root);
+                put(&mut b, signature);
+            }
             PosTransaction::RandaoRecommit { validator, new_commitment, epoch, signature } => {
                 // ADR-041: fixed-width fields, then a length-prefixed signature.
                 b.push(0x0A);
@@ -1134,6 +1158,9 @@ impl PosTransaction {
                 pubkey_hash: r.h32()?, epoch: r.u64()?, signature: r.bytes()?,
             },
             0x0D => PosTransaction::Withdraw { validator: r.u32()? },
+            crate::kes::REGISTER_TAG => PosTransaction::KesRegister {
+                validator: r.u32()?, depth: r.u8()?, root: r.h32()?, signature: r.bytes()?,
+            },
             0x0A => PosTransaction::RandaoRecommit {
                 validator: r.u32()?, new_commitment: r.h32()?,
                 epoch: r.u64()?, signature: r.bytes()?,
@@ -1807,6 +1834,11 @@ pub struct CommittedState {
     /// it, exactly like the Coherence roots above.
     evm: EvmCommitment,
     l2_settlement: Option<crate::l2_settlement::State>,
+    /// Forward-secure validator keys (`crate::kes`), registered once by wire
+    /// 0x17 and never replaced here. Committed under its own state-root
+    /// component (tag 0x22) only once non-empty, so history without a
+    /// registration keeps every state root it had.
+    kes: BTreeMap<u32, crate::kes::KesPublic>,
     /// Cumulative issued supply in satoshis — the hard-cap invariant's
     /// counter (2026-08-12), committed under `TAG_ISSUED_SUPPLY`.
     ///
@@ -1905,6 +1937,37 @@ impl crate::attestation::KeyLookup for BTreeMap<u32, ValidatorRecord> {
 impl crate::attestation::KeyLookup for CommittedState {
     fn pubkey(&self, validator: u32) -> Option<&[u8]> {
         self.validators.pubkey(validator)
+    }
+    fn kes_public(&self, validator: u32) -> Option<crate::kes::KesPublic> {
+        self.kes.get(&validator).copied()
+    }
+    fn kes_network_domain(&self) -> Option<[u8; 32]> {
+        Some(self.admission_network_domain.unwrap_or([0; 32]))
+    }
+}
+
+/// The registry, its KES keys and the network domain, borrowed field by field
+/// so a transition step can hold it while mutating other parts of the same
+/// state (the reason the map impl above exists). Every consensus signature
+/// check inside the transition resolves through this view, so the static key
+/// before KES enforcement and the KES leaf after it come from one pre-state.
+pub(crate) struct RegistryView<'a> {
+    pub(crate) validators: &'a BTreeMap<u32, ValidatorRecord>,
+    pub(crate) kes: &'a BTreeMap<u32, crate::kes::KesPublic>,
+    /// `CommittedState::admission_network_domain`, which KES leaf signatures
+    /// commit to (`crate::kes::leaf_message`).
+    pub(crate) network_domain: Option<[u8; 32]>,
+}
+
+impl crate::attestation::KeyLookup for RegistryView<'_> {
+    fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+        self.validators.pubkey(validator)
+    }
+    fn kes_public(&self, validator: u32) -> Option<crate::kes::KesPublic> {
+        self.kes.get(&validator).copied()
+    }
+    fn kes_network_domain(&self) -> Option<[u8; 32]> {
+        Some(self.network_domain.unwrap_or([0; 32]))
     }
 }
 
@@ -2377,6 +2440,7 @@ impl CommittedState {
             coherence_nullifier_root,
             evm,
             l2_settlement: None,
+            kes: BTreeMap::new(),
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
             eutxos: opening_balances.iter().cloned().collect(),
         };
@@ -3049,6 +3113,9 @@ impl CommittedState {
         }, self.eutxos.tree());
         if let Some(state) = &self.l2_settlement {
             crate::state_root::insert_l2_settlement(&mut tree, &state.committed_bytes());
+        }
+        if !self.kes.is_empty() {
+            crate::state_root::insert_kes_roots(&mut tree, &self.kes);
         }
         tree.root()
     }
@@ -3767,6 +3834,19 @@ impl CommittedState {
                     Self::staking_tx_charge(epoch_for_charge, 1, tx.canonical_bytes().len())
                 })
             }
+            PosTransaction::KesRegister { validator, depth, root, signature } => {
+                // THE FLAG-DAY GATE, FIRST, from committed state: before
+                // `KES_REGISTRATION_EPOCH` a block carrying 0x17 is refused
+                // exactly as the previous release refused the undecodable tag.
+                if !crate::params::kes_registration_open(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
+                // One hybrid verification, like the other validator-signed arms.
+                let epoch_for_charge = self.epoch;
+                self.apply_kes_register(*validator, *depth, root, signature, verifier).map(|()| {
+                    Self::staking_tx_charge(epoch_for_charge, 1, tx.canonical_bytes().len())
+                })
+            }
             PosTransaction::RandaoRecommit { validator, new_commitment, epoch, signature } => {
                 // THE FLAG-DAY GATE, FIRST — same discipline as every other
                 // gated arm, read from `self.epoch` (committed state, never
@@ -4002,6 +4082,63 @@ impl CommittedState {
     /// the exhaustion precondition, and only then the one hybrid
     /// verification (~145 µs). Every check runs before any mutation, so a
     /// refused re-commit leaves the state untouched.
+    /// Wire 0x17: record `validator`'s KES key, once ([`Self::check_kes_register`]
+    /// first; the insertion is the only mutation).
+    fn apply_kes_register(
+        &mut self,
+        validator: u32,
+        depth: u8,
+        root: &[u8; 32],
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<(), TxReject> {
+        let public = self.check_kes_register(validator, depth, root, signature, verifier)?;
+        self.kes.insert(validator, public);
+        Ok(())
+    }
+
+    /// Every rule of a KES registration except the flag-day gate, against
+    /// this state and without mutating it (consensus and mempool share it):
+    /// refused for an unknown, slashed or exited validator, an out-of-range
+    /// depth, a validator that already has a key, or a signature that is not
+    /// the registered static key's over [`crate::kes::register_signing_root`].
+    /// The one hybrid verification runs last.
+    pub(crate) fn check_kes_register(
+        &self,
+        validator: u32,
+        depth: u8,
+        root: &[u8; 32],
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<crate::kes::KesPublic, TxReject> {
+        if !(crate::kes::MIN_DEPTH..=crate::kes::MAX_DEPTH).contains(&depth) || self.kes.contains_key(&validator) {
+            return Err(TxReject::StakingRule);
+        }
+        let Some(rec) = self.validators.get(&validator) else {
+            return Err(TxReject::StakingRule);
+        };
+        if rec.slashed || rec.exit_epoch <= self.epoch {
+            return Err(TxReject::StakingRule);
+        }
+        let public = crate::kes::KesPublic { depth, root: *root };
+        let domain = self.admission_network_domain.unwrap_or([0; 32]);
+        let message = crate::kes::register_signing_root(&domain, validator, &public);
+        if !verifier.verify_with_key(&rec.pubkey, &message, signature) {
+            return Err(TxReject::StakingRule);
+        }
+        Ok(public)
+    }
+
+    /// The registered KES key of `validator`, if any.
+    pub fn kes_public(&self, validator: u32) -> Option<crate::kes::KesPublic> {
+        self.kes.get(&validator).copied()
+    }
+
+    /// Every registered KES key, by validator index.
+    pub fn kes_roots(&self) -> &BTreeMap<u32, crate::kes::KesPublic> {
+        &self.kes
+    }
+
     fn apply_randao_recommit(
         &mut self,
         validator: u32,
@@ -4684,7 +4821,7 @@ impl CommittedState {
                     offender_effective_sat,
                     including_proposer,
                     verifier,
-                    &self.validators,
+                    &RegistryView { validators: &self.validators, kes: &self.kes, network_domain: self.admission_network_domain },
                 )
             }
             SlashingEvidence::ProposerEquivocation { first, second } => {
@@ -4698,7 +4835,7 @@ impl CommittedState {
                     offender_effective_sat,
                     including_proposer,
                     verifier,
-                    &self.validators,
+                    &RegistryView { validators: &self.validators, kes: &self.kes, network_domain: self.admission_network_domain },
                 )
             }
         }
@@ -6065,15 +6202,20 @@ impl<V: SignatureVerifier> Transition<V> {
         //    signature is bound to its index and cannot be replayed under
         //    another. (Attestation signing roots are NOT so bound; see the
         //    note in step 8.)
-        let Some(proposer_key) = st.validators.pubkey(header.proposer_index) else {
-            return Err(TransitionError::Proposal(ProposalReject::UnknownProposer));
-        };
-        if !self.verifier.verify_with_key(
-            proposer_key,
+        //    From KES enforcement on, the proposer signs with the leaf of its
+        //    slot's period under its registered KES key (`crate::kes`);
+        //    before it this is exactly the static-key check.
+        match crate::kes::verify_validator(
+            &RegistryView { validators: &st.validators, kes: &st.kes, network_domain: st.admission_network_domain },
+            &self.verifier,
+            header.proposer_index,
+            crate::epoch_of(header.slot),
             &header.proposal_signing_root(),
             &envelope.proposer_sig,
         ) {
-            return Err(TransitionError::Proposal(ProposalReject::BadSignature));
+            None => return Err(TransitionError::Proposal(ProposalReject::UnknownProposer)),
+            Some(false) => return Err(TransitionError::Proposal(ProposalReject::BadSignature)),
+            Some(true) => {}
         }
 
         // R7 M5 (behind REWARDS_V2_ACTIVATION_EPOCH): the proposer named
@@ -6212,8 +6354,14 @@ impl<V: SignatureVerifier> Transition<V> {
             // chunks — a fact this line declines to assume.
             let idx = (att.data.slot % crate::params::SLOTS_PER_EPOCH) as usize;
             let committee = partition.get(idx).unwrap_or(&empty_committee);
-            if attestation::validate(att, committee, header.slot, &self.verifier, &st.validators)
-                .is_err()
+            if attestation::validate(
+                att,
+                committee,
+                header.slot,
+                &self.verifier,
+                &RegistryView { validators: &st.validators, kes: &st.kes, network_domain: st.admission_network_domain },
+            )
+            .is_err()
             {
                 return Err(reject);
             }
@@ -6856,6 +7004,7 @@ mod tx_codec_tests {
 #[cfg(test)]
 mod tests {
     include!("transition/l2_settlement_tests.rs");
+    include!("transition/kes_tests.rs");
     use super::*;
     mod validator_lifecycle {
         use super::*;
@@ -7661,6 +7810,19 @@ mod tests {
         // Signed twice because the signing root covers `state_root`: the probe
         // header (root still zero) and the final header are different messages.
         let sign_for = |h: &BlockHeaderV4| -> Vec<u8> {
+            // From KES enforcement on (only ever under a test-armed schedule),
+            // the proposer signs with its toy KES leaf for the slot's period.
+            if let Some(period) = crate::params::kes_period(crate::epoch_of(h.slot)) {
+                let message = crate::kes::leaf_message(
+                    crate::attestation::KeyLookup::kes_network_domain(pre),
+                    p,
+                    &kes_rules::toy_kes_public(p),
+                    period,
+                    &h.proposal_signing_root(),
+                )
+                .unwrap_or([0; 32]);
+                return kes_rules::toy_kes_sign(p, period, &message);
+            }
             match crate::attestation::KeyLookup::pubkey(pre, p) {
                 Some(pk) => toy_sign(pk, &h.proposal_signing_root()),
                 // A fixture whose registry has no such index: leave the stub
@@ -14748,6 +14910,9 @@ mod tests {
             // no satoshi in either direction. Beacon state, not value state;
             // it cannot touch the cap.
             PosTransaction::RandaoRecommit { .. } => {}
+            // A KES registration records one (depth, root) pair per validator
+            // and moves no satoshi: registry metadata, not value.
+            PosTransaction::KesRegister { .. } => {}
             // Funded admission transfers UTXO value into bonded stake and fees.
             PosTransaction::FundedDeposit(_) => {}
             // Funded delegation moves existing UTXO value through a bonded

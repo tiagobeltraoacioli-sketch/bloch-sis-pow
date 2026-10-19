@@ -296,6 +296,19 @@ pub(crate) fn insert_l2_settlement(tree: &mut Smt, bytes: &[u8]) {
     tree.insert(derive_key(TAG_L2_SETTLEMENT, &[]), hash_value(bytes));
 }
 
+/// Registered forward-secure (KES) keys (`crate::kes`), one leaf per
+/// validator: key `u32` index, value `KesPublic::committed_bytes()`
+/// (`depth ‖ root`). Inserted only for registered validators, so every state
+/// root before the first registration is unchanged. 0x22: the byte devnet4
+/// used, free on this line after the L2's 0x21.
+const TAG_KES_ROOT: u8 = 0x22;
+
+pub(crate) fn insert_kes_roots(tree: &mut Smt, roots: &BTreeMap<u32, crate::kes::KesPublic>) {
+    for (validator, public) in roots {
+        tree.insert(derive_key(TAG_KES_ROOT, &validator.to_le_bytes()), hash_value(&public.committed_bytes()));
+    }
+}
+
 /// Append-only registry of every component namespace in the live state SMT.
 ///
 /// This is the machine-readable authority for component count, names and tag
@@ -303,7 +316,7 @@ pub(crate) fn insert_l2_settlement(tree: &mut Smt, bytes: &[u8]) {
 /// compatibility DTO, not an exhaustive model of the live tree. New
 /// components must be appended here as well as in the tree fold; the
 /// uniqueness and spec-reconciliation tests consume this registry directly.
-pub const STATE_COMPONENT_TAGS: [(&str, u8); 33] = [
+pub const STATE_COMPONENT_TAGS: [(&str, u8); 34] = [
     ("TAG_EUTXO", TAG_EUTXO),
     ("TAG_VALIDATOR", TAG_VALIDATOR),
     ("TAG_PARTICIPATION_CURRENT", TAG_PARTICIPATION_CURRENT),
@@ -337,6 +350,7 @@ pub const STATE_COMPONENT_TAGS: [(&str, u8); 33] = [
     ("TAG_FUNDED_DELEGATION_OWNER", TAG_FUNDED_DELEGATION_OWNER),
     ("TAG_FUNDED_DELEGATION_LIFECYCLE", TAG_FUNDED_DELEGATION_LIFECYCLE),
     ("TAG_L2_SETTLEMENT", TAG_L2_SETTLEMENT),
+    ("TAG_KES_ROOT", TAG_KES_ROOT),
 ];
 
 

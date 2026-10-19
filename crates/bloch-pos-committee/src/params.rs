@@ -2558,3 +2558,128 @@ pub(crate) mod audit_recovery_test {
         Restore(ENABLED.with(|v| v.replace(true)))
     }
 }
+
+// ── Forward-secure validator keys (KES, `crate::kes`) ───────────────────────
+//
+// Two mainnet flag days, both unarmed (`u64::MAX`) until chosen, no cargo
+// feature anywhere (docs/KES-MAINNET-READINESS.md §7):
+//
+// 1. `KES_REGISTRATION_EPOCH` opens wire 0x17 (`PosTransaction::KesRegister`):
+//    each validator commits, once, the Merkle root of its key tree. Signing
+//    stays static; nothing else changes.
+// 2. `KES_ACTIVATION_EPOCH` (enforcement): from it on, every proposal and
+//    every vote verifies only under the leaf of its epoch's KES period, over
+//    `kes::leaf_message` (network domain ‖ validator ‖ depth ‖ root ‖ period ‖
+//    consensus root — the audit p8a binding, in force from the first KES
+//    signature, so there is no unbound KES history to replay).
+//
+// Before the first of them every rule is byte-for-byte the static one: 0x17
+// is refused exactly as an undecodable tag was, and the 0x22 state-root
+// component is absent while no root is registered.
+
+/// Opens KES registration (wire 0x17). Unarmed.
+pub const KES_REGISTRATION_EPOCH: u64 = u64::MAX;
+/// KES enforcement: proposals and votes must carry a KES leaf signature
+/// from this epoch on. Unarmed.
+pub const KES_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// Epochs per KES period. 32 slots of 30 s is a 16-minute epoch, so 90
+/// epochs is exactly 24 h (readiness doc §4, option A).
+pub const KES_PERIOD_EPOCHS: u64 = 90;
+/// The tree depth `bloch-pos kes keygen` produces by default: 2^12 daily
+/// periods, about 11.2 years (option A). Consensus accepts any depth in
+/// `kes::MIN_DEPTH..=kes::MAX_DEPTH`; this is the operator default only.
+pub const KES_DEFAULT_DEPTH: u8 = 12;
+
+const _: () = {
+    assert!(KES_PERIOD_EPOCHS > 0, "KES_PERIOD_EPOCHS must be positive");
+    assert!(KES_PERIOD_EPOCHS * SLOTS_PER_EPOCH * SLOT_DURATION_SECS == 86_400, "a KES period is one day");
+    // Enforcement without a registration window would silence every
+    // validator at once: refuse to compile it. Registration must open
+    // strictly before enforcement.
+    assert!(
+        KES_ACTIVATION_EPOCH == u64::MAX
+            || (KES_REGISTRATION_EPOCH != u64::MAX && KES_REGISTRATION_EPOCH < KES_ACTIVATION_EPOCH),
+        "KES enforcement needs an earlier registration window"
+    );
+};
+
+/// The KES schedule a build runs under: (registration, activation, period
+/// epochs). The compiled constants, or a test-only thread-local override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KesSchedule {
+    pub registration_epoch: u64,
+    pub activation_epoch: u64,
+    pub period_epochs: u64,
+}
+
+/// The schedule consensus reads. A pure function of the build.
+pub fn kes_schedule() -> KesSchedule {
+    #[cfg(test)]
+    if let Some(schedule) = kes_rehearsal::get() {
+        return schedule;
+    }
+    KesSchedule {
+        registration_epoch: KES_REGISTRATION_EPOCH,
+        activation_epoch: KES_ACTIVATION_EPOCH,
+        period_epochs: KES_PERIOD_EPOCHS,
+    }
+}
+
+/// May a block of `epoch` carry a `KesRegister` (wire 0x17)? Stays open after
+/// enforcement so a validator that joins later can register.
+pub fn kes_registration_open(epoch: u64) -> bool {
+    epoch_gate_active(epoch, kes_schedule().registration_epoch)
+}
+
+/// The global KES period `epoch` signs in, or `None` before enforcement
+/// (static keys sign). A pure function of the epoch and the schedule.
+pub fn kes_period(epoch: u64) -> Option<u64> {
+    let s = kes_schedule();
+    epoch_gate_active(epoch, s.activation_epoch).then(|| (epoch - s.activation_epoch) / s.period_epochs)
+}
+
+/// Test-only, thread-local KES schedule override. `cfg(test)`: it cannot
+/// exist in a shipped binary.
+#[cfg(test)]
+pub mod kes_rehearsal {
+    use super::KesSchedule;
+    use std::cell::Cell;
+    thread_local! {
+        static SCHEDULE: Cell<Option<KesSchedule>> = const { Cell::new(None) };
+    }
+    pub fn set(schedule: Option<KesSchedule>) {
+        SCHEDULE.with(|c| c.set(schedule));
+    }
+    pub(crate) fn get() -> Option<KesSchedule> {
+        SCHEDULE.with(|c| c.get())
+    }
+}
+
+#[cfg(test)]
+mod kes_schedule_tests {
+    use super::*;
+
+    #[test]
+    fn the_mainnet_schedule_is_unarmed() {
+        assert_eq!(KES_REGISTRATION_EPOCH, u64::MAX);
+        assert_eq!(KES_ACTIVATION_EPOCH, u64::MAX);
+        for epoch in [0, 4_669, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert!(!kes_registration_open(epoch));
+            assert_eq!(kes_period(epoch), None);
+        }
+    }
+
+    #[test]
+    fn periods_count_from_enforcement_in_days() {
+        kes_rehearsal::set(Some(KesSchedule { registration_epoch: 10, activation_epoch: 100, period_epochs: 90 }));
+        assert!(!kes_registration_open(9));
+        assert!(kes_registration_open(10));
+        assert!(kes_registration_open(100_000), "registration stays open after enforcement");
+        assert_eq!(kes_period(99), None);
+        assert_eq!(kes_period(100), Some(0));
+        assert_eq!(kes_period(189), Some(0));
+        assert_eq!(kes_period(190), Some(1));
+        kes_rehearsal::set(None);
+        assert_eq!(kes_period(190), None);
+    }
+}

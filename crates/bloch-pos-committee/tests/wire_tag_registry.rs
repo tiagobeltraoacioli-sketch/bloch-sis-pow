@@ -357,6 +357,10 @@ const TX_TAGS: &[(u8, Status)] = &[
     // M5 withdrawal claim (`devnet-l2-user-txs`); 0x16 checked free on every
     // local ref (327 refs) and on the mainnet tree (MAINNET_TX_TAGS) on 2026-10-10.
     (0x16, Status::Released { name: "L2WithdrawClaim", rivals: NO_RIVALS }),
+    // Forward-secure validator keys (KES registration). Same byte devnet4 used
+    // (devnet line 4847d708); free on this tree above the L2 range. Refused by
+    // consensus before params::KES_REGISTRATION_EPOCH (u64::MAX).
+    (0x17, Status::Released { name: "KesRegister", rivals: NO_RIVALS }),
 ];
 
 /// Three lineages that all intend the SAME flag day disagree on all three
@@ -559,6 +563,7 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         PosTransaction::L2Deposit(_) => 0x14,
         PosTransaction::L2DataAvailability(_) => 0x15,
         PosTransaction::L2WithdrawClaim(_) => 0x16,
+        PosTransaction::KesRegister { .. } => 0x17,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }
@@ -1177,6 +1182,8 @@ fn l2_transaction_tags_do_not_overlap_the_mainnet_tag_set() {
     assert_eq!(bloch_pos_committee::transition::l2_deposit::L2_DEPOSIT_TAG, 0x14);
     assert_eq!(bloch_pos_committee::transition::l2_da::L2_DATA_AVAILABILITY_TAG, 0x15);
     assert_eq!(bloch_pos_committee::transition::l2_claim::L2_WITHDRAW_CLAIM_TAG, 0x16);
+    assert_eq!(bloch_pos_committee::kes::REGISTER_TAG, 0x17);
+    assert!(!MAINNET_TX_TAGS.contains(&0x17), "KesRegister must stay outside the deployed mainnet range");
     // The pre-renumbering L2 bytes now belong to funded delegation: they
     // dispatch to its decoders (a bare tag is truncated, not unknown).
     for old in [0x0E, 0x0F, 0x10, 0x11] {

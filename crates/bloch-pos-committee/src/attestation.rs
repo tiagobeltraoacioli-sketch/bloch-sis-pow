@@ -140,6 +140,20 @@ pub trait SignatureVerifier {
     /// spending cheaper to forge than attesting.
     fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool;
 
+    /// Verify a KES signature (`crate::kes`): `signature` over `message` (the
+    /// already bound `kes::leaf_message`) by `public`'s leaf of global period
+    /// `period`. The default is the full check — decode, leaf index, Merkle
+    /// path, then [`Self::verify_with_key`] on the leaf key, so wrappers that
+    /// cache or budget `verify_with_key` cover KES leaves too. It is a trait
+    /// method, not a free function every caller runs, so a verifier that
+    /// accepts every signature accepts these too: the producer's post-state
+    /// probe carries an EMPTY proposer signature, which the structural checks
+    /// would refuse before any key is consulted (devnet4 halted on exactly
+    /// that at its KES activation, 2026-10-14; fixed there by 694a5960).
+    fn verify_kes(&self, public: &crate::kes::KesPublic, period: u64, message: &[u8; 32], signature: &[u8]) -> bool {
+        crate::kes::verify(self, public, period, message, signature)
+    }
+
     /// Deterministic native L2 proof check, using only parent-committed policy.
     /// Older verifier implementations cannot silently admit the new transaction.
     fn verify_l2_settlement(&self, _policy: &[u8; 32], _program: &[u8; 32],
@@ -199,6 +213,21 @@ pub trait KeyLookup {
     /// such index. `None` must be treated as a verification failure by the
     /// caller — never as "skip the check".
     fn pubkey(&self, validator: u32) -> Option<&[u8]>;
+
+    /// The validator's registered forward-secure key (`crate::kes`), if any.
+    /// Only committed state carries KES registrations; other lookups have none.
+    fn kes_public(&self, _validator: u32) -> Option<crate::kes::KesPublic> {
+        None
+    }
+
+    /// The network domain KES leaf signatures are bound to
+    /// (`crate::kes::leaf_message`): the committed admission domain, zero when
+    /// the manifest set none (the same value `KesRegister` is signed over).
+    /// `None` — every lookup that is not committed state — makes every KES
+    /// signature fail closed.
+    fn kes_network_domain(&self) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 /// Why an attestation was rejected. Distinct variants because "invalid" alone
@@ -261,10 +290,20 @@ pub fn validate(
     // The registry read, last, beside the verify it feeds. A committee member
     // with no registry key cannot be dismissed as a bad signature: it means
     // this registry does not know the validator, which is a different fact.
-    let Some(pubkey) = keys.pubkey(att.validator) else {
+    // From KES enforcement on, the vote must carry the leaf of its target
+    // epoch's period (`crate::kes::verify_validator`); before it, this is
+    // exactly the static-key check it always was.
+    let Some(valid) = crate::kes::verify_validator(
+        keys,
+        verifier,
+        att.validator,
+        att.data.target_epoch,
+        &att.data.signing_root(),
+        &att.signature,
+    ) else {
         return Err(RejectReason::UnknownValidator);
     };
-    if !verifier.verify_with_key(pubkey, &att.data.signing_root(), &att.signature) {
+    if !valid {
         return Err(RejectReason::BadSignature);
     }
     Ok(())

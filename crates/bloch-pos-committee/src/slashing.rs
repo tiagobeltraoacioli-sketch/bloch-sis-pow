@@ -482,12 +482,21 @@ impl SlashingState {
         //    against it. `offense()` has already established that both
         //    attestations name the same validator, so resolving per-message
         //    would be resolving the same index twice.
-        let Some(pubkey) = keys.pubkey(validator) else {
-            return Err(EvidenceError::UnknownValidator);
-        };
+        //    Each vote is checked with the key it had to be signed with: the
+        //    static key before KES enforcement, the leaf of its target epoch's
+        //    period after (`crate::kes::verify_validator`).
         for att in [&evidence.first, &evidence.second] {
-            if !verifier.verify_with_key(pubkey, &att.data.signing_root(), &att.signature) {
-                return Err(EvidenceError::BadSignature);
+            match crate::kes::verify_validator(
+                keys,
+                verifier,
+                validator,
+                att.data.target_epoch,
+                &att.data.signing_root(),
+                &att.signature,
+            ) {
+                None => return Err(EvidenceError::UnknownValidator),
+                Some(false) => return Err(EvidenceError::BadSignature),
+                Some(true) => {}
             }
         }
 
@@ -598,16 +607,20 @@ impl SlashingState {
         // 4. Signatures, last — the proposer really signed both headers.
         //    One key, resolved from the offender's index in the caller's
         //    registry; step 1 has already established both headers name it.
-        let Some(pubkey) = keys.pubkey(validator) else {
-            return Err(EvidenceError::UnknownValidator);
-        };
+        //    Static key before KES enforcement, the leaf of the slot's period
+        //    after (`crate::kes::verify_validator`).
         for env in [first, second] {
-            if !verifier.verify_with_key(
-                pubkey,
+            match crate::kes::verify_validator(
+                keys,
+                verifier,
+                validator,
+                crate::epoch_of(env.header.slot),
                 &env.header.proposal_signing_root(),
                 &env.proposer_sig,
             ) {
-                return Err(EvidenceError::BadSignature);
+                None => return Err(EvidenceError::UnknownValidator),
+                Some(false) => return Err(EvidenceError::BadSignature),
+                Some(true) => {}
             }
         }
 

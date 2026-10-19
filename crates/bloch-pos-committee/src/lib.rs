@@ -118,6 +118,7 @@ pub mod forkchoice;
 pub mod gossip;
 pub mod header;
 pub mod interfaces;
+pub mod kes;
 pub mod params;
 // Instrumentation only, and compiled out unless `perf-timing` is on — see
 // the module docs. No consensus rule reads it.
