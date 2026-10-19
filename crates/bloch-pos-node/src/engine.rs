@@ -1883,6 +1883,13 @@ enum Refusal {
     /// The per-identity or aggregate lifecycle hybrid-verification allowance
     /// is exhausted for the wall slot. The caller may retry next slot.
     LifecycleVerificationLimited { until_slot: u64 },
+    /// P5a (`NATIVE_SLASHING_ACTIVATION_EPOCH`): slashing evidence whose bytes
+    /// alone prove it wrong on every honest node — two signers, no conflict,
+    /// or a forged signature under a finalized key binding. Unlike
+    /// [`Refusal::Invalid`] this is attributable: the gossip path penalises
+    /// the delivering peer (`Verdict::Reject`), as ObenBlock's PoCI ingress
+    /// does, so forged evidence is never free to relay.
+    EvidenceFault(&'static str),
     /// Per-source or aggregate block/attestation/transaction admission
     /// verification is exhausted for this wall slot. This is local load,
     /// never invalid bytes.
@@ -1895,7 +1902,7 @@ impl Refusal {
     fn reason(&self) -> &'static str {
         match self {
             Refusal::AtCapacity => "mempool is at capacity",
-            Refusal::Invalid(why) | Refusal::StateDependent(why) => why,
+            Refusal::Invalid(why) | Refusal::StateDependent(why) | Refusal::EvidenceFault(why) => why,
             Refusal::PreviouslyRefused { .. } => {
                 "this node's proposer already had the transition refuse this transaction"
             }
@@ -4308,6 +4315,11 @@ impl Engine {
         if self.funded_mempool_conflict(&tx, &capacity.stale) {
             return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
         }
+        if let PosTransaction::SlashingEvidence(evidence) = &tx {
+            if validator_lifecycle::native_slashing_admission_active(epoch_of(self.wall_slot())) {
+                self.precheck_slashing_evidence(evidence, verification_source)?;
+            }
+        }
         self.validate_lifecycle_admission(&tx)?;
         // Commit only after every incoming admission check succeeds. Removing
         // state-dependent failures under pressure is retention, never a bar.
@@ -5673,7 +5685,7 @@ impl Engine {
                     Err(Refusal::StateDependent(why)) => Err(RpcError::tx_refused_retryable(
                         self.wall_slot().saturating_add(1), why,
                     )),
-                    Err(Refusal::Invalid(why)) => Err(RpcError::new(
+                    Err(Refusal::Invalid(why) | Refusal::EvidenceFault(why)) => Err(RpcError::new(
                         rpc::TX_REFUSED,
                         format!("{why} — this transaction cannot be admitted; retrying \
                              the same bytes will not help"),
@@ -6956,6 +6968,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
                                 origin.verification_source(),
                             ) {
                                 Ok(_) => Verdict::Accept,
+                                // P5a: a context-free evidence fault is the
+                                // deliverer's own, on every branch.
+                                Err(Refusal::EvidenceFault(_)) => Verdict::Reject,
                                 // A peer may have a different head, fee, epoch
                                 // or pending input. Refuse relay without scoring
                                 // that local-state difference as misconduct.

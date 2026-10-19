@@ -1545,6 +1545,29 @@ pub fn pre_activation_offence_refusal_active(epoch: u64) -> bool {
 /// coordinated release; this source does not make that decision.
 pub const SLASHING_ECONOMICS_V2_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// P5a (ObenBlock PoCI port): evidence-fault admission. `u64::MAX` = INERT.
+///
+/// Node-local relay policy only, read against the WALL epoch by the node's
+/// mempool. It changes no state transition, no block validity and no state
+/// root: blocks carrying evidence are judged by `apply_slashing_evidence`
+/// exactly as before, so replay is identical on either side of the gate.
+///
+/// Once armed, a node judges `SlashingEvidence` (tag 0x05) before cloning
+/// state: context-free faults (two signers, no conflict, a forged signature
+/// under a key binding already finalized) are refused as faults of the
+/// DELIVERING peer, and the two hybrid verifications are charged to the
+/// deliverer's verification allowance rather than to the accused
+/// validator's lifecycle allowance — which today lets anyone forge cheap
+/// evidence against `v` to exhaust `v`'s allowance and delay genuine
+/// evidence against `v` (and `v`'s own exit/commission/RANDAO messages).
+/// See `CommittedState::precheck_slashing_evidence`.
+pub const NATIVE_SLASHING_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Is the P5a evidence-admission policy armed at `wall_epoch`?
+pub const fn native_slashing_active(wall_epoch: u64) -> bool {
+    epoch_gate_active(wall_epoch, NATIVE_SLASHING_ACTIVATION_EPOCH)
+}
+
 pub(crate) fn slashing_economics_v2_active(epoch: u64) -> bool {
     slashing_economics_v2_start(epoch).is_some()
 }

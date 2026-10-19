@@ -249,6 +249,26 @@ pub fn offence_predates_activation(evidence: &crate::interfaces::SlashingEvidenc
     evidence_offence_epoch(evidence) < crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH
 }
 
+/// Anti-replay identity of a header-pair evidence: sorted proposal signing
+/// roots under `DS_SLASH`, signatures excluded — the construction
+/// [`SlashingState::process_proposer`] has always used, factored out so
+/// pre-admission computes the very same bytes.
+pub fn proposer_evidence_id(
+    validator: u32,
+    first: &crate::header::BlockHeaderV4,
+    second: &crate::header::BlockHeaderV4,
+) -> [u8; 32] {
+    let r1 = first.proposal_signing_root();
+    let r2 = second.proposal_signing_root();
+    let (lo, hi) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
+    let mut h = Sha3_256::new();
+    h.update(DS_SLASH);
+    h.update(validator.to_le_bytes());
+    h.update(lo);
+    h.update(hi);
+    h.finalize().into()
+}
+
 /// Everything one applied slash produced. Balances live outside this crate,
 /// so the outcome reports amounts and leaves crediting/debiting to the caller.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -366,6 +386,12 @@ impl SlashingState {
         if let Some((epoch, sat)) = window {
             *self.window.entry(epoch).or_insert(0) += sat;
         }
+    }
+
+    /// Has this evidence identity already been applied? Read-only mirror of
+    /// the anti-replay check, for clone-free pre-admission (P5a).
+    pub fn is_applied(&self, id: &[u8; 32]) -> bool {
+        self.applied.contains(id)
     }
 
     /// Has this validator already been slashed and ejected?
@@ -576,16 +602,8 @@ impl SlashingState {
         //    under DS_PROPOSE while attestation roots are under DS_ATTEST, so
         //    a header-pair id can never collide with an attestation-pair id
         //    even though both live in one `applied` set.
-        let r1 = first.header.proposal_signing_root();
-        let r2 = second.header.proposal_signing_root();
-        let (lo, hi) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
         let validator = first.header.proposer_index;
-        let mut h = Sha3_256::new();
-        h.update(DS_SLASH);
-        h.update(validator.to_le_bytes());
-        h.update(lo);
-        h.update(hi);
-        let id: [u8; 32] = h.finalize().into();
+        let id = proposer_evidence_id(validator, &first.header, &second.header);
         if self.applied.contains(&id) {
             return Err(EvidenceError::AlreadyApplied);
         }

@@ -130,6 +130,8 @@ pub mod funded_delegation;
 mod lifecycle;
 mod slashing_rehearsal;
 pub use slashing_rehearsal::EvidenceRehearsal;
+pub mod evidence_admission;
+pub use evidence_admission::{EvidencePrecheck, EvidencePrecheckError};
 pub use funded::{FundedDeposit, FundedDepositReject, FundingInput};
 pub use funded_delegation::{
     FundedDelegate, FundedDelegationReject, FundedDelegationWithdraw, FundedUndelegate,
@@ -14006,6 +14008,111 @@ mod tests {
             t.compute_post_state(&s1, &env3, &[], std::slice::from_ref(&swapped)).unwrap_err(),
             TransitionError::Transaction(0),
         );
+    }
+
+    /// P5a audit pin — evidence across two branches. A validator that votes
+    /// for target epoch 1 on two sibling branches has double-voted; the pair
+    /// is prosecutable on EITHER branch (the signing root binds no branch
+    /// state), applies exactly once per branch, a slash on one branch is
+    /// invisible on the other until that branch includes the evidence, and
+    /// replay (either order) is refused on both.
+    #[test]
+    fn evidence_across_two_branches_slashes_once_per_branch() {
+        let _gate = crate::params::rehearsal::slashing_gate_open_guard();
+        let (t, g, mut chains_a) = setup(4);
+        let (_, _, mut chains_b) = setup(4);
+        let a1 = build_block(&t, &g, 1, &[], &[], &mut chains_a);
+        let sa1 = t.apply_block(&g, &a1, &[], &[]).unwrap();
+        let b1 = build_block(&t, &g, 2, &[], &[], &mut chains_b);
+        let sb1 = t.apply_block(&g, &b1, &[], &[]).unwrap();
+        assert_ne!(sa1.head, sb1.head, "two real sibling branches");
+        let vote = |root: [u8; 32]| Attestation {
+            data: AttestationData {
+                slot: 33,
+                head: root,
+                source_epoch: 0,
+                source_root: [1; 32],
+                target_epoch: 1,
+                target_root: root,
+            },
+            validator: 0,
+            signature: vec![0u8; 8],
+        };
+        let p3 = schedule::proposer(&sa1.seed_for_epoch(0), 3, &sa1.duty_roster()).unwrap();
+        let p4 = schedule::proposer(&sb1.seed_for_epoch(0), 4, &sb1.duty_roster()).unwrap();
+        let offender = (0..4).find(|v| *v != p3 && *v != p4).unwrap();
+        let mut a = vote(*sa1.head.as_bytes());
+        let mut b = vote(*sb1.head.as_bytes());
+        a.validator = offender;
+        b.validator = offender;
+        let ev = PosTransaction::SlashingEvidence(SlashingEvidence::AttestationOffence {
+            first: a.clone(),
+            second: b.clone(),
+        });
+        let swapped = PosTransaction::SlashingEvidence(SlashingEvidence::AttestationOffence {
+            first: b,
+            second: a,
+        });
+        let a2 = build_block(&t, &sa1, 3, &[], std::slice::from_ref(&ev), &mut chains_a);
+        let sa2 = t.apply_block(&sa1, &a2, &[], std::slice::from_ref(&ev)).unwrap();
+        assert!(sa2.validator_record(offender).unwrap().slashed);
+        assert!(!sb1.validator_record(offender).unwrap().slashed, "branch B unaffected");
+        // Branch B includes the swapped order — one offence, fresh on B.
+        let b2 = build_block(&t, &sb1, 4, &[], std::slice::from_ref(&swapped), &mut chains_b);
+        let sb2 = t.apply_block(&sb1, &b2, &[], std::slice::from_ref(&swapped)).unwrap();
+        assert!(sb2.validator_record(offender).unwrap().slashed);
+        assert_eq!(
+            sa2.validator_record(offender).unwrap().staked_sat,
+            sb2.validator_record(offender).unwrap().staked_sat,
+            "the same offence prices identically on both branches",
+        );
+        // Replay on each branch, both orders: dead on arrival.
+        for (pre, slot) in [(&sa2, 5u64), (&sb2, 6u64)] {
+            for tx in [&ev, &swapped] {
+                let (_, _, mut c) = setup(4);
+                let env = probe_env(pre, slot, std::slice::from_ref(tx), &mut c);
+                assert_eq!(
+                    t.compute_post_state(pre, &env, &[], std::slice::from_ref(tx)).unwrap_err(),
+                    TransitionError::Transaction(0),
+                );
+            }
+        }
+    }
+
+    /// P5a audit pin — malformed evidence in a block costs the PROPOSER the
+    /// whole block (consensus never charges or records it), and its id is
+    /// not burned: the genuine evidence still applies afterwards.
+    #[test]
+    fn malformed_evidence_forfeits_the_block_and_burns_no_id() {
+        let _gate = crate::params::rehearsal::slashing_gate_open_guard();
+        let (t, g, mut chains) = setup(4);
+        let p1 = schedule::proposer(&g.seed_for_epoch(0), 1, &g.duty_roster()).unwrap();
+        let offender = (p1 + 1) % 4;
+        let SlashingEvidence::AttestationOffence { first, second } = double_vote_evidence(offender)
+        else {
+            unreachable!()
+        };
+        let mut other = second.clone();
+        other.validator = (offender + 1) % 4;
+        for bad in [
+            SlashingEvidence::AttestationOffence { first: first.clone(), second: other },
+            SlashingEvidence::AttestationOffence { first: first.clone(), second: first.clone() },
+        ] {
+            let tx = PosTransaction::SlashingEvidence(bad);
+            let (_, _, mut c) = setup(4);
+            let env = probe_env(&g, 1, std::slice::from_ref(&tx), &mut c);
+            assert_eq!(
+                t.compute_post_state(&g, &env, &[], std::slice::from_ref(&tx)).unwrap_err(),
+                TransitionError::Transaction(0),
+            );
+        }
+        // Truncated wire bytes never decode.
+        let good = PosTransaction::SlashingEvidence(double_vote_evidence(offender));
+        let bytes = good.canonical_bytes();
+        assert!(PosTransaction::from_canonical_bytes(&bytes[..bytes.len() - 1]).is_err());
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&good), &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&good)).unwrap();
+        assert!(s1.validator_record(offender).unwrap().slashed);
     }
 
     /// THE GATE, CLOSED — the configuration every node runs today, asserted
