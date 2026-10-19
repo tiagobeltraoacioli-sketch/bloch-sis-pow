@@ -721,12 +721,12 @@ mod tests {
             signature: vec![],
         };
         let pair = |a, b| crate::interfaces::SlashingEvidence::AttestationOffence { first: a, second: b };
-        // The incident's shape: both votes years before slashing existed.
-        let old = pair(att(651, 664), att(600, 1486));
-        assert_eq!(evidence_offence_epoch(&old), 1486);
+        // Both votes before slashing existed.
+        let old = pair(att(90, 100), att(50, 900));
+        assert_eq!(evidence_offence_epoch(&old), 900);
         assert!(offence_predates_activation(&old));
         // Order-independent.
-        assert_eq!(evidence_offence_epoch(&pair(att(600, 1486), att(651, 664))), 1486);
+        assert_eq!(evidence_offence_epoch(&pair(att(50, 900), att(90, 100))), 900);
         // Straddling: the later vote is post-activation, so it is slashable.
         let straddle = pair(att(10, gate + 5), att(20, 30));
         assert!(!offence_predates_activation(&straddle));

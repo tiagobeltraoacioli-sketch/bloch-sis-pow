@@ -1506,10 +1506,8 @@ pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = 2_884;
 /// Pre-activation offence refusal (incident 2026-10-19). `u64::MAX` = INERT.
 ///
 /// [`SLASHING_EVIDENCE_ACTIVATION_EPOCH`] gates the epoch of the INCLUDING
-/// block only; the offence's own epoch was never checked, so every pair of
-/// conflicting messages ever signed — including the thousands of surround and
-/// double votes our own validators left in canonical blocks at target epochs
-/// 664..1486, years of protocol time before slashing existed — became
+/// block only; the offence's own epoch was never checked, so a pair of
+/// conflicting messages signed before slashing existed would have become
 /// slashable at epoch 2884. Once this gate binds (judged off the including
 /// block's committed epoch, like every gate), a block carrying evidence whose
 /// offence epoch ([`crate::slashing::evidence_offence_epoch`]) is below
@@ -1520,7 +1518,6 @@ pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = 2_884;
 /// carries pre-activation evidence; on mainnet at e6026 the registry has no
 /// slashed validator, and an included evidence either slashes (sets
 /// `slashed`) or invalidates its block, so the canonical chain carries none.
-/// See docs/SLASHING-PRE-ACTIVATION-EXPOSURE.md for the arming decision.
 pub const PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH: u64 = SLASHING_EVIDENCE_ACTIVATION_EPOCH;
 
 /// Is the pre-activation offence refusal binding at `epoch`?

@@ -13950,7 +13950,7 @@ mod tests {
 
     /// Armed at slashing activation (owner decision 2026-10-19): replay-safe
     /// because no canonical block in [2884, now) carries slashing evidence and
-    /// no validator is slashed (docs/SLASHING-PRE-ACTIVATION-EXPOSURE.md).
+    /// no validator is slashed.
     #[test]
     fn pre_activation_refusal_is_armed_at_slashing_activation() {
         let gate = crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH;

@@ -60,7 +60,6 @@ mod p2p;
 mod rpc;
 mod slashprot;
 mod slashing_cli;
-mod slash_rehearsal;
 mod store;
 mod ws_boot;
 mod validator_deposit;
@@ -272,12 +271,6 @@ fn main() {
             if let Err(error) = devnet_tools::transfer_v2(&args[1..]) {
                 eprintln!("transfer-v2: {error}");
                 exit(2);
-            }
-        }
-        Some("slash-rehearsal") => {
-            if let Err(e) = slash_rehearsal::run(&args[1..]) {
-                eprintln!("slash-rehearsal: {e}");
-                std::process::exit(1);
             }
         }
         Some("devnet-equivocate") => {

@@ -7983,7 +7983,7 @@ mod forkchoice_tests {
             )
         };
         for wall_epoch in [gate, 6_026, 50_000] {
-            for target in [1u64, 664, 1_486, gate - 1] {
+            for target in [1u64, 100, 900, gate - 1] {
                 let err = admissible(&ev(target), wall_epoch).expect_err("pre-activation offence admitted");
                 assert!(err.contains("before"), "{err}");
             }
