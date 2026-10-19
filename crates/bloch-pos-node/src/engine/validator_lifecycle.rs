@@ -464,11 +464,14 @@ mod p5a_evidence_admission_tests {
 
     fn att(engine: &Engine, v: u32, head: u8, sign: bool) -> Attestation {
         let data = AttestationData {
-            slot: 33,
+            // A post-activation offence: the 609070ee node policy refuses any
+            // offence committed before SLASHING_EVIDENCE_ACTIVATION_EPOCH in
+            // `admissible`, before P5a pre-admission is ever reached.
+            slot: GATE_SLOT,
             head: [head; 32],
             source_epoch: 0,
             source_root: [1; 32],
-            target_epoch: 1,
+            target_epoch: params::SLASHING_EVIDENCE_ACTIVATION_EPOCH,
             target_root: [head; 32],
         };
         let signature = if sign {
