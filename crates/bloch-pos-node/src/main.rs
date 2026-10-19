@@ -51,6 +51,7 @@ mod l2_da_cli;
 mod l2_claim_cli;
 mod l2_deposit_cli;
 mod engine;
+mod equivocation_watch;
 mod genesis;
 mod funded_delegation_cli;
 mod keys;
@@ -218,6 +219,12 @@ fn main() {
         Some("slashing-protection") => {
             if let Err(error) = slashing_cli::run(&args[1..]) {
                 eprintln!("slashing-protection: {error}");
+                exit(2);
+            }
+        }
+        Some("watch-equivocation") => {
+            if let Err(error) = equivocation_watch::run(&args[1..]) {
+                eprintln!("watch-equivocation: {error}\n{}", equivocation_watch::USAGE);
                 exit(2);
             }
         }
@@ -396,6 +403,8 @@ fn print_help() {
                Signer anchor (default $HOME/.bloch-signer): one lock per\n\
                validator key on this host, and a refusal to sign from a data\n\
                dir older than the key's last signature.\n\
+           bloch-pos watch-equivocation --rpc HOST:PORT [--rpc ...] --state FILE --out EVIDENCE.jsonl\n\
+               [--from-slot N] [--to-slot N] [--window-epochs 256]   (read-only double/surround vote detector)\n\
            bloch-pos ws-keygen --out <prefix>\n\
            bloch-pos ws-signer-set --id <n> --threshold <m>\n\
                                    --min-external <k> --adopted-epoch <e>\n\
