@@ -496,6 +496,226 @@ pub fn split_envelope(bytes: &[u8]) -> Option<(u16, &[u8])> {
     parse_envelope(bytes)
 }
 
+// ── Canonical encodings and suite-bound signing context (audit e9b52781) ─────
+//
+// The compatibility verifier [`verify`] admits several byte forms of ONE
+// hybrid signature:
+//
+//   (a1) with or without the 4-byte suite header (legacy raw fallback);
+//   (a2) Falcon half compact, or zero-padded to PQClean's 1,280-byte form;
+//   (a3) the ML-DSA half of one signing run combined with the Falcon half of
+//        another — both halves sign the bare message, so any pairing verifies;
+//   (b)  no suite id in the signed context: suites 0x0001 and 0x0002 both sign
+//        ML-DSA with an EMPTY context, so the ML-DSA half of a 0x0001
+//        signature, relabelled 0x0002, verifies under a 0x0002 key that reuses
+//        the same ML-DSA key.
+//
+// [`verify`] is consensus history and is NOT changed. Two stricter policies
+// are added; callers choose one through [`SignaturePolicy`]:
+//
+// * [`SignaturePolicy::CanonicalUnbound`] — today's (context-free) signing
+//   math, but exactly one byte form: the suite header is mandatory, every
+//   body has its exact length, and the Falcon half is the compact encoding
+//   `falcon::sign` emits. Closes (a1) and (a2). Node relay/mempool policy
+//   before the consensus flag day; never a consensus rule by itself.
+// * [`SignaturePolicy::Bound`] — the same canonical encoding PLUS a
+//   per-suite signing context ("v2"): ML-DSA signs with the FIPS 204 context
+//   string `SIG_V2_MLDSA_CONTEXT_PREFIX ‖ suite_id LE`, and the Falcon half
+//   signs `SIG_V2_FALCON_DOMAIN ‖ suite_id LE ‖ SHA3-256(mldsa_sig) ‖ msg`, so
+//   it commits to the exact ML-DSA half it travels with. Closes (a3) and (b).
+//   Becomes the consensus rule at the committee's
+//   `SIG_CANONICAL_ACTIVATION_EPOCH` (inert, `u64::MAX`).
+//
+// Public keys: an enveloped key must have the exact body length of its suite.
+// The raw legacy hybrid key (exact length, carry-over addresses) stays
+// admissible under both strict policies: its bytes are fixed by the address
+// commitment / registry entry, so it is not a malleable *signature* form. A
+// legacy-key holder signs by enveloping its raw secret key under 0x0001.
+
+/// FIPS 204 context prefix for v2 (suite-bound) ML-DSA halves. The suite id
+/// (`u16` LE) is appended, giving a 14-byte context (FIPS 204 allows ≤ 255).
+pub const SIG_V2_MLDSA_CONTEXT_PREFIX: &[u8] = b"BLOCH-SIG-v2";
+/// Domain tag prefixed to the message signed by the v2 Falcon half.
+pub const SIG_V2_FALCON_DOMAIN: &[u8] = b"BLOCH-SIG-v2/FALCON1024";
+
+/// Which signature forms and which signing context a verifier admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SignaturePolicy {
+    /// Historical consensus rule: exactly [`verify`].
+    Compatible,
+    /// v1 (context-free) math, canonical bytes only. Relay policy.
+    CanonicalUnbound,
+    /// v2 suite-bound context, canonical bytes only.
+    Bound,
+}
+
+fn sig_v2_mldsa_context(suite: u16) -> [u8; 14] {
+    let mut ctx = [0u8; 14];
+    ctx[..12].copy_from_slice(SIG_V2_MLDSA_CONTEXT_PREFIX);
+    ctx[12..].copy_from_slice(&suite.to_le_bytes());
+    ctx
+}
+
+fn sig_v2_falcon_message(suite: u16, mldsa_sig: &[u8], message: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        SIG_V2_FALCON_DOMAIN.len().saturating_add(2 + 32).saturating_add(message.len()),
+    );
+    out.extend_from_slice(SIG_V2_FALCON_DOMAIN);
+    out.extend_from_slice(&suite.to_le_bytes());
+    out.extend_from_slice(&Sha3_256::digest(mldsa_sig));
+    out.extend_from_slice(message);
+    out
+}
+
+/// Sign under the v2 suite-bound context ([`SignaturePolicy::Bound`]).
+/// Output is always the canonical encoding (header ‖ exact ML-DSA ‖ compact
+/// Falcon). Not accepted by [`verify`]; valid in consensus only once the
+/// committee's `SIG_CANONICAL_ACTIVATION_EPOCH` has been reached.
+pub fn sign_bound(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let (suite, sk_body) = parse_envelope(secret_key_bytes)
+        .ok_or_else(|| CryptoError::InvalidKey("secret-key envelope: too short or bad magic".into()))?;
+    let ctx = sig_v2_mldsa_context(suite);
+    match suite {
+        SUITE_MLDSA65_FALCON1024 => {
+            if sk_body.len() <= MLDSA_SECRET_LEN {
+                return Err(CryptoError::InvalidKey("hybrid secret key too short".into()));
+            }
+            let (msk, fsk) = sk_body.split_at(MLDSA_SECRET_LEN);
+            let sk = mldsa65::SecretKey::from_bytes(msk)
+                .map_err(|_| CryptoError::InvalidKey("bad ML-DSA secret key".into()))?;
+            let msig = mldsa65::detached_sign_ctx(message, &ctx, &sk).as_bytes().to_vec();
+            let fsig = falcon::sign(fsk, &sig_v2_falcon_message(suite, &msig, message))?;
+            let mut out = msig;
+            out.extend_from_slice(&fsig);
+            Ok(wrap_envelope(suite, &out))
+        }
+        SUITE_MLDSA65_ONLY => {
+            if sk_body.len() != MLDSA_SECRET_LEN {
+                return Err(CryptoError::InvalidKey("ML-DSA-only secret key wrong length".into()));
+            }
+            let sk = mldsa65::SecretKey::from_bytes(sk_body)
+                .map_err(|_| CryptoError::InvalidKey("bad ML-DSA secret key".into()))?;
+            let out = mldsa65::detached_sign_ctx(message, &ctx, &sk).as_bytes().to_vec();
+            Ok(wrap_envelope(suite, &out))
+        }
+        _ => Err(CryptoError::InvalidKey(format!("unknown/reserved suite {:#06x}", suite))),
+    }
+}
+
+/// Sign so the result verifies under `policy`. `Compatible` and
+/// `CanonicalUnbound` both produce today's v1 signature ([`sign`] is already
+/// canonical); `Bound` produces a v2 signature ([`sign_bound`]).
+pub fn sign_with_policy(
+    policy: SignaturePolicy,
+    secret_key_bytes: &[u8],
+    message: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    match policy {
+        SignaturePolicy::Compatible | SignaturePolicy::CanonicalUnbound => {
+            sign(secret_key_bytes, message)
+        }
+        SignaturePolicy::Bound => sign_bound(secret_key_bytes, message),
+    }
+}
+
+/// Verify under `policy`. Malformed input ⇒ `false`, never a panic.
+pub fn verify_with_policy(
+    policy: SignaturePolicy,
+    public_key_bytes: &[u8],
+    message: &[u8],
+    signature_bytes: &[u8],
+) -> bool {
+    match policy {
+        SignaturePolicy::Compatible => verify(public_key_bytes, message, signature_bytes),
+        SignaturePolicy::CanonicalUnbound => {
+            verify_canonical_unbound(public_key_bytes, message, signature_bytes)
+        }
+        SignaturePolicy::Bound => verify_bound(public_key_bytes, message, signature_bytes),
+    }
+}
+
+/// The one canonical (suite, pk body, sig body) view, or `None` if any part
+/// is in a non-canonical form. Signature header mandatory; enveloped or exact
+/// legacy public key; exact body lengths; suites must match; compact Falcon.
+fn parse_canonical<'a>(
+    public_key_bytes: &'a [u8],
+    signature_bytes: &'a [u8],
+) -> Option<(u16, &'a [u8], &'a [u8])> {
+    let (sig_suite, sig_body) = parse_envelope(signature_bytes)?;
+    let (pk_suite, pk_body) = if public_key_bytes.len() == legacy_hybrid_pubkey_len() {
+        (SUITE_MLDSA65_FALCON1024, public_key_bytes)
+    } else {
+        parse_envelope(public_key_bytes)?
+    };
+    if pk_suite != sig_suite {
+        return None;
+    }
+    match sig_suite {
+        SUITE_MLDSA65_FALCON1024 => {
+            if pk_body.len() != legacy_hybrid_pubkey_len() || sig_body.len() <= MLDSA_SIG_LEN {
+                return None;
+            }
+            if !falcon::is_canonical_signature(&sig_body[MLDSA_SIG_LEN..]) {
+                return None;
+            }
+        }
+        SUITE_MLDSA65_ONLY => {
+            if pk_body.len() != MLDSA_PUBKEY_LEN || sig_body.len() != MLDSA_SIG_LEN {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some((sig_suite, pk_body, sig_body))
+}
+
+/// Whether `signature_bytes` is in its one canonical byte form for
+/// `public_key_bytes` (header present, exact lengths, compact Falcon, suite
+/// match). Encoding only — performs no signature math.
+pub fn is_canonical_signature_encoding(public_key_bytes: &[u8], signature_bytes: &[u8]) -> bool {
+    parse_canonical(public_key_bytes, signature_bytes).is_some()
+}
+
+/// [`SignaturePolicy::CanonicalUnbound`]: v1 math, canonical bytes only.
+pub fn verify_canonical_unbound(
+    public_key_bytes: &[u8],
+    message: &[u8],
+    signature_bytes: &[u8],
+) -> bool {
+    let Some((suite, pk_body, sig_body)) = parse_canonical(public_key_bytes, signature_bytes) else {
+        return false;
+    };
+    match suite {
+        SUITE_MLDSA65_FALCON1024 => {
+            verify_hybrid_mldsa_falcon_with(pk_body, message, sig_body, falcon::verify_canonical)
+        }
+        SUITE_MLDSA65_ONLY => verify_mldsa65_only(pk_body, message, sig_body),
+        _ => false,
+    }
+}
+
+/// [`SignaturePolicy::Bound`]: v2 suite-bound context, canonical bytes only.
+pub fn verify_bound(public_key_bytes: &[u8], message: &[u8], signature_bytes: &[u8]) -> bool {
+    let Some((suite, pk_body, sig_body)) = parse_canonical(public_key_bytes, signature_bytes) else {
+        return false;
+    };
+    let ctx = sig_v2_mldsa_context(suite);
+    let (mpk, fpk) = pk_body.split_at(MLDSA_PUBKEY_LEN);
+    let (msig, fsig) = sig_body.split_at(MLDSA_SIG_LEN);
+    let Ok(pk) = mldsa65::PublicKey::from_bytes(mpk) else { return false };
+    let Ok(sig) = mldsa65::DetachedSignature::from_bytes(msig) else { return false };
+    if mldsa65::verify_detached_signature_ctx(&sig, message, &ctx, &pk).is_err() {
+        return false;
+    }
+    match suite {
+        SUITE_MLDSA65_FALCON1024 => {
+            falcon::verify_canonical(fpk, &sig_v2_falcon_message(suite, msig, message), fsig)
+        }
+        SUITE_MLDSA65_ONLY => fpk.is_empty() && fsig.is_empty(),
+        _ => false,
+    }
+}
+
 pub fn address_from_pubkey(public_key: &[u8], testnet: bool) -> String {
     let hash = Sha3_256::digest(public_key);
     let mut payload = [0u8; 20];
@@ -773,6 +993,13 @@ pub mod falcon {
     ) -> bool {
         is_compact_signature_encoding(signature_bytes)
             && verify(public_key_bytes, message, signature_bytes)
+    }
+
+    /// Whether `signature` is a Falcon-1024 signature in the one compact
+    /// encoding [`sign`] emits (header byte, nonce, exactly-consumed
+    /// compressed body, zero unused bits). Encoding only; no signature math.
+    pub fn is_canonical_signature(signature: &[u8]) -> bool {
+        is_compact_signature_encoding(signature)
     }
 
     const FALCON1024_HEADER: u8 = 0x30 + 10;
@@ -1651,5 +1878,256 @@ mod kat {
         // reproduce (pk, sk, sig) for each seed, and assert byte-equality through
         // the pqcrypto primitives. This gives standards-traceable KATs on top of
         // the crate-oracle equivalence already proven here.
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Audit e9b52781: every accepted byte form, under every SignaturePolicy.
+// ═════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod sig_policy_tests {
+    use super::*;
+    use SignaturePolicy::{Bound, CanonicalUnbound, Compatible};
+
+    const MSG: &[u8] = b"bloch-sig-canonical-20261019";
+
+    fn verdicts(pk: &[u8], msg: &[u8], sig: &[u8]) -> [bool; 3] {
+        [
+            verify_with_policy(Compatible, pk, msg, sig),
+            verify_with_policy(CanonicalUnbound, pk, msg, sig),
+            verify_with_policy(Bound, pk, msg, sig),
+        ]
+    }
+
+    fn padded_len() -> usize {
+        SUITE_HEADER_LEN + MLDSA_SIG_LEN + falcon::padded_signature_len()
+    }
+
+    /// Seeded signature whose compact Falcon half leaves room for padding.
+    fn seeded_sig(
+        policy: SignaturePolicy,
+        sk: &[u8],
+    ) -> Vec<u8> {
+        for i in 0u8..=255 {
+            let sig = pqcrypto_internals::with_seeded_rng_scope(&[i; 32], || {
+                sign_with_policy(policy, sk, MSG).unwrap()
+            });
+            if sig.len() < padded_len() {
+                return sig;
+            }
+        }
+        panic!("no compact fixture with padding room in 256 seeds");
+    }
+
+    fn padded(sig: &[u8]) -> Vec<u8> {
+        let mut p = sig.to_vec();
+        p.resize(padded_len(), 0);
+        p
+    }
+
+    #[test]
+    fn v1_and_v2_signatures_are_domain_separated() {
+        let (pk, sk) = generate_keypair();
+        let v1 = sign(&sk, MSG).unwrap();
+        assert_eq!(verdicts(&pk, MSG, &v1), [true, true, false]);
+        let v2 = sign_bound(&sk, MSG).unwrap();
+        assert_eq!(verdicts(&pk, MSG, &v2), [false, false, true]);
+        assert!(v2.len() <= max_signature_len());
+        assert!(is_canonical_signature_encoding(&pk, &v1));
+        assert!(is_canonical_signature_encoding(&pk, &v2));
+        assert!(!verify_bound(&pk, b"other", &v2));
+        assert!(verify(&pk, MSG, &sign_with_policy(Compatible, &sk, MSG).unwrap()));
+    }
+
+    /// (a1) The 4-byte header may be stripped and `verify` still accepts it.
+    #[test]
+    fn headerless_signature_is_refused_by_both_strict_policies() {
+        let (pk, sk) = generate_keypair_from_seed(&[0x31; 32]).unwrap();
+        let raw_pk = &pk[SUITE_HEADER_LEN..];
+        for policy in [CanonicalUnbound, Bound] {
+            let sig = seeded_sig(policy, &sk);
+            let raw_sig = &sig[SUITE_HEADER_LEN..];
+            if raw_sig[..2] == SUITE_MAGIC {
+                continue; // 2^-16 fixture coincidence; not the form under test
+            }
+            assert!(verify_with_policy(policy, &pk, MSG, &sig));
+            assert!(verify_with_policy(policy, raw_pk, MSG, &sig), "legacy pk + header ok");
+            for (k, s) in [(&pk[..], raw_sig), (raw_pk, raw_sig)] {
+                assert!(!verify_with_policy(CanonicalUnbound, k, MSG, s));
+                assert!(!verify_with_policy(Bound, k, MSG, s));
+                assert!(!is_canonical_signature_encoding(k, s));
+                if policy == CanonicalUnbound {
+                    assert!(verify(k, MSG, s), "compat verifier accepts headerless form");
+                }
+            }
+        }
+    }
+
+    /// (a2) PQClean's zero-padded Falcon encoding of the same signature.
+    #[test]
+    fn padded_falcon_half_is_refused_by_both_strict_policies() {
+        let (pk, sk) = generate_keypair_from_seed(&[0x32; 32]).unwrap();
+        let v1 = seeded_sig(CanonicalUnbound, &sk);
+        let v1p = padded(&v1);
+        assert_eq!(verdicts(&pk, MSG, &v1p), [true, false, false]);
+        assert!(!is_canonical_signature_encoding(&pk, &v1p));
+
+        let v2 = seeded_sig(Bound, &sk);
+        assert!(verify_bound(&pk, MSG, &v2));
+        let v2p = padded(&v2);
+        assert_eq!(verdicts(&pk, MSG, &v2p), [false, false, false]);
+
+        // Any trailing byte after the compact body, and truncation, also fail.
+        for sig in [&v1, &v2] {
+            let mut long = sig.clone();
+            long.push(0);
+            assert!(!verify_canonical_unbound(&pk, MSG, &long));
+            assert!(!verify_bound(&pk, MSG, &long));
+            let short = &sig[..sig.len() - 1];
+            assert!(!verify_canonical_unbound(&pk, MSG, short));
+            assert!(!verify_bound(&pk, MSG, short));
+        }
+    }
+
+    /// (a3) Halves from two signing runs recombine under v1; not under v2.
+    #[test]
+    fn recombined_halves_verify_only_without_the_bound_context() {
+        let (pk, sk) = generate_keypair();
+        let split = SUITE_HEADER_LEN + MLDSA_SIG_LEN;
+        let mix = |a: &[u8], b: &[u8]| {
+            let mut m = a[..split].to_vec();
+            m.extend_from_slice(&b[split..]);
+            m
+        };
+
+        let (a, b) = (sign(&sk, MSG).unwrap(), sign(&sk, MSG).unwrap());
+        assert_ne!(a[..split], b[..split], "hedged signing must differ per run");
+        let ab = mix(&a, &b);
+        assert_ne!(ab, a);
+        assert_ne!(ab, b);
+        // The audit finding, pinned: v1 cannot tell a recombination apart.
+        assert_eq!(verdicts(&pk, MSG, &ab), [true, true, false]);
+
+        let (a2, b2) = (sign_bound(&sk, MSG).unwrap(), sign_bound(&sk, MSG).unwrap());
+        assert!(verify_bound(&pk, MSG, &a2) && verify_bound(&pk, MSG, &b2));
+        assert_eq!(verdicts(&pk, MSG, &mix(&a2, &b2)), [false, false, false]);
+        assert_eq!(verdicts(&pk, MSG, &mix(&b2, &a2)), [false, false, false]);
+        // Nor does a v1 half combine with a v2 half in either order.
+        assert_eq!(verdicts(&pk, MSG, &mix(&a, &a2)), [false, false, false]);
+        assert_eq!(verdicts(&pk, MSG, &mix(&a2, &a)), [false, false, false]);
+    }
+
+    /// (b) Strip the Falcon half of a 0x0001 signature and relabel it 0x0002.
+    #[test]
+    fn suite_relabel_verifies_only_without_the_bound_context() {
+        let (mpk, msk) = mldsa65::keypair();
+        let (fpk, fsk) = falcon::keypair();
+        let mut hpk = mpk.as_bytes().to_vec();
+        hpk.extend_from_slice(&fpk);
+        let mut hsk = msk.as_bytes().to_vec();
+        hsk.extend_from_slice(&fsk);
+        let hybrid_pk = wrap_envelope(SUITE_MLDSA65_FALCON1024, &hpk);
+        let hybrid_sk = wrap_envelope(SUITE_MLDSA65_FALCON1024, &hsk);
+        let only_pk = wrap_envelope(SUITE_MLDSA65_ONLY, mpk.as_bytes());
+        let only_sk = wrap_envelope(SUITE_MLDSA65_ONLY, msk.as_bytes());
+        let relabel = |sig: &[u8]| {
+            let (suite, body) = parse_envelope(sig).unwrap();
+            assert_eq!(suite, SUITE_MLDSA65_FALCON1024);
+            wrap_envelope(SUITE_MLDSA65_ONLY, &body[..MLDSA_SIG_LEN])
+        };
+
+        let v1 = sign(&hybrid_sk, MSG).unwrap();
+        assert_eq!(verdicts(&hybrid_pk, MSG, &v1), [true, true, false]);
+        // The audit finding, pinned: the stripped half verifies as 0x0002.
+        assert_eq!(verdicts(&only_pk, MSG, &relabel(&v1)), [true, true, false]);
+
+        let v2 = sign_bound(&hybrid_sk, MSG).unwrap();
+        assert_eq!(verdicts(&hybrid_pk, MSG, &v2), [false, false, true]);
+        assert_eq!(verdicts(&only_pk, MSG, &relabel(&v2)), [false, false, false]);
+
+        // Genuine 0x0002 signatures under each policy, and the reverse
+        // direction: a 0x0002 v2 half cannot be grafted into a 0x0001 sig.
+        let o1 = sign(&only_sk, MSG).unwrap();
+        assert_eq!(verdicts(&only_pk, MSG, &o1), [true, true, false]);
+        let o2 = sign_bound(&only_sk, MSG).unwrap();
+        assert_eq!(verdicts(&only_pk, MSG, &o2), [false, false, true]);
+        let (_, o2_body) = parse_envelope(&o2).unwrap();
+        let (_, v2_body) = parse_envelope(&v2).unwrap();
+        let mut graft = o2_body.to_vec();
+        graft.extend_from_slice(&v2_body[MLDSA_SIG_LEN..]);
+        let graft = wrap_envelope(SUITE_MLDSA65_FALCON1024, &graft);
+        assert_eq!(verdicts(&hybrid_pk, MSG, &graft), [false, false, false]);
+    }
+
+    /// Carry-over keys: raw legacy pk with an enveloped (canonical) signature.
+    #[test]
+    fn legacy_raw_public_key_signs_canonically_under_an_envelope() {
+        let (pk, sk) = generate_keypair_from_seed(&[0x33; 32]).unwrap();
+        let raw_pk = pk[SUITE_HEADER_LEN..].to_vec();
+        let raw_sk = sk[SUITE_HEADER_LEN..].to_vec();
+        let wrapped_sk = wrap_envelope(SUITE_MLDSA65_FALCON1024, &raw_sk);
+        let v1 = sign(&wrapped_sk, MSG).unwrap();
+        assert_eq!(verdicts(&raw_pk, MSG, &v1), [true, true, false]);
+        let v2 = sign_bound(&wrapped_sk, MSG).unwrap();
+        assert_eq!(verdicts(&raw_pk, MSG, &v2), [false, false, true]);
+    }
+
+    /// Non-canonical public-key and suite framings.
+    #[test]
+    fn strict_policies_refuse_malformed_keys_and_suite_mismatch() {
+        let (pk, sk) = generate_keypair_from_seed(&[0x34; 32]).unwrap();
+        let v1 = sign(&sk, MSG).unwrap();
+        let v2 = sign_bound(&sk, MSG).unwrap();
+        let mut long_pk = pk.clone();
+        long_pk.push(0);
+        let mut bad_suite_pk = pk.clone();
+        bad_suite_pk[2] = 0x02;
+        let mut bad_suite_sig = v2.clone();
+        bad_suite_sig[2] = 0x02;
+        let mut reserved = v2.clone();
+        reserved[2] = 0xFF;
+        reserved[3] = 0xFF;
+        for (k, s) in [
+            (&long_pk[..], &v2[..]),
+            (&bad_suite_pk[..], &v2[..]),
+            (&pk[..], &bad_suite_sig[..]),
+            (&pk[..], &reserved[..]),
+            (&pk[..], &[][..]),
+            (&[][..], &v2[..]),
+        ] {
+            assert!(!verify_bound(k, MSG, s));
+            assert!(!verify_canonical_unbound(k, MSG, s));
+            assert!(!is_canonical_signature_encoding(k, s));
+        }
+        assert!(!verify_canonical_unbound(&long_pk, MSG, &v1));
+        assert!(sign_bound(&[0u8; 3], MSG).is_err());
+        assert!(sign_bound(&wrap_envelope(0x0000, &[0u8; 8]), MSG).is_err());
+    }
+
+    #[test]
+    fn strict_policies_never_panic_on_garbage() {
+        let (pk, sk) = generate_keypair();
+        let sig = sign_bound(&sk, MSG).unwrap();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..300 {
+            let mut s = sig.clone();
+            let n = (next() % 8) as usize;
+            for _ in 0..n {
+                let i = (next() as usize) % s.len();
+                s[i] ^= (next() & 0xFF) as u8 | 1;
+            }
+            let cut = (next() as usize) % (s.len() + 1);
+            for t in [&s[..], &s[..cut]] {
+                let _ = verify_bound(&pk, MSG, t);
+                let _ = verify_canonical_unbound(&pk, MSG, t);
+                let _ = verify_bound(&pk[..cut.min(pk.len())], MSG, t);
+            }
+        }
     }
 }
