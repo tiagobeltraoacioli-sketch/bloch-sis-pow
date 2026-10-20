@@ -106,6 +106,12 @@ done
 die() { echo "qualify: FAIL - $*" >&2; exit 1; }
 COMMIT="$(git -C "$REPO" rev-parse --verify --quiet "$COMMIT_ARG^{commit}")" || die "unknown commit $COMMIT_ARG"
 BASE_COMMIT="$(git -C "$REPO" rev-parse --verify --quiet "$BASE_COMMIT^{commit}")" || die "unknown base commit"
+# Release integrity (HF1 review H-3): the candidate must descend from the
+# fleet release, or it silently drops what that release fixed (for example
+# the pre-activation offence refusal). Never qualify a source branch that
+# forks before it.
+git -C "$REPO" merge-base --is-ancestor "$BASE_COMMIT" "$COMMIT" \
+  || die "$COMMIT does not descend from the fleet release $BASE_COMMIT"
 C12="${COMMIT:0:12}"
 OUT="${OUT:-$HOME/hf-qualify-$C12-$(date -u +%Y%m%dT%H%M%SZ)}"
 [ ! -e "$OUT" ] || die "$OUT exists; give a new directory"
