@@ -58,7 +58,10 @@ fi
 # not rebuilt on the next pass.
 GUARD_VER="$(cat "$HERE/check.sh" "$HERE/overlay.sh" "$GUARD_TREE/crates/bloch-pos-node/src/engine/hf_replay_guard.rs" | shasum -a 256 | cut -c1-10)"
 
-export CARGO_TARGET_DIR="$CACHE/target"
+# One target dir PER TREE. Cargo leaves the source path out of a path
+# package's artifact hash, so two worktrees sharing a target dir silently
+# reuse each other's compiled bloch-pos-committee / bloch-crypto — observed
+# here: a branch "replayed" with a sibling's library. Never share it.
 # Same opt-level and overflow-checks as the release profile (overflow
 # behaviour is consensus-relevant and stays identical); only fat LTO and the
 # single codegen unit are relaxed, which change build time, not semantics.
@@ -77,7 +80,7 @@ prepare_tree() { # $1=label $2=sha
     git --git-dir="$REPO" worktree add --detach -f "$d" "$2" >/dev/null 2>&1 || return 1
   fi
   git -C "$d" checkout --detach -f "$2" >/dev/null 2>&1 || return 1
-  git -C "$d" clean -fdq -e target >/dev/null 2>&1
+  git -C "$d" clean -fdq -e /target >/dev/null 2>&1
   "$HERE/overlay.sh" "$GUARD_TREE" "$d" || return 1
   echo "$d"
 }
@@ -85,12 +88,12 @@ prepare_tree() { # $1=label $2=sha
 # Run one ignored guard test in tree $1; extra env in "$@".
 run_guard() { # $1=tree $2=test-name $3=logfile, rest env
   local t="$1" name="$2" lf="$3"; shift 3
-  ( cd "$t" && env "$@" $NICE cargo test --release -p bloch-pos-node --bin bloch-pos \
+  ( cd "$t" && env CARGO_TARGET_DIR="$t/target" "$@" $NICE cargo test --release -p bloch-pos-node --bin bloch-pos \
       "engine::hf_replay_guard::$name" -- --ignored --exact --nocapture --test-threads=1 ) >"$lf" 2>&1
 }
 
 build_guard() { # $1=tree $2=logfile
-  ( cd "$1" && $NICE cargo test --release -p bloch-pos-node --bin bloch-pos --no-run ) >"$2" 2>&1
+  ( cd "$1" && CARGO_TARGET_DIR="$1/target" $NICE cargo test --release -p bloch-pos-node --bin bloch-pos --no-run ) >"$2" 2>&1
 }
 
 # First differing line of two dumps -> "slot <n> (<context>)".
@@ -148,7 +151,7 @@ ensure_reference() {
   local rg="$CACHE/dumps/ref-${REF:0:12}.golden"
   if [ "${HF_GUARD_SKIP_GOLDEN:-0}" != 1 ] && [ ! -f "$rg" ]; then
     log "reference golden tests"
-    ( cd "$REFTREE" && $NICE cargo test --release -p bloch-pos-committee --test '*' --no-fail-fast ) >"$CACHE/logs/ref-golden.log" 2>&1
+    ( cd "$REFTREE" && CARGO_TARGET_DIR="$REFTREE/target" $NICE cargo test --release -p bloch-pos-committee --test '*' --no-fail-fast ) >"$CACHE/logs/ref-golden.log" 2>&1
     grep -qE '^error\[|^error: could not compile' "$CACHE/logs/ref-golden.log" && { log "reference golden tests do not build"; exit 2; }
     grep -E '^test .* \.\.\. FAILED$' "$CACHE/logs/ref-golden.log" | awk '{print $2}' | sort > "$rg"
   fi
@@ -167,6 +170,12 @@ check_target() { # $1=branch-or-commit
   label="t-$(printf '%s' "$tgt" | tr -c 'A-Za-z0-9._-' '_')"
   local base="$CACHE/dumps/$label-${sha:0:12}-g$GUARD_VER"
   if [ -s "$base.verdict" ]; then cat "$base.verdict"; head -1 "$base.verdict" | grep -q '  PASS  '; return; fi
+  # Short-cut by identity: the guard compiles only these paths. A target that
+  # changes none of them compiles to the reference's code by construction.
+  if git --git-dir="$REPO" diff --quiet "$REF" "$sha" -- crates Cargo.toml Cargo.lock rust-toolchain.toml; then
+    echo "$tgt ${sha:0:10}  PASS  identical consensus sources (no change under crates/, Cargo.*, rust-toolchain.toml)" | tee "$base.verdict"
+    return 0
+  fi
   tree="$(prepare_tree "$label" "$sha")" || { echo "$tgt ${sha:0:10}  FAIL  overlay could not be applied (engine.rs / replay_bench.rs anchors moved)"; return 1; }
   log "$tgt ${sha:0:10}: build"
   if ! build_guard "$tree" "$base.build.log"; then
@@ -192,7 +201,7 @@ check_target() { # $1=branch-or-commit
     # nothing either way; it is dropped and named, and the rest still run.
     local dropped="" try
     for try in 1 2 3 4; do
-      ( cd "$tree" && $NICE cargo test --release -p bloch-pos-committee --test '*' --no-fail-fast ) >"$base.golden.log" 2>&1
+      ( cd "$tree" && CARGO_TARGET_DIR="$tree/target" $NICE cargo test --release -p bloch-pos-committee --test '*' --no-fail-fast ) >"$base.golden.log" 2>&1
       local bad; bad="$(grep -oE '^error: could not compile `bloch-pos-committee` \(test "[A-Za-z0-9_]+"\)' "$base.golden.log" \
         | sed -E 's/.*\(test "([^"]+)"\)/\1/' | sort -u)"
       [ -n "$bad" ] || break
