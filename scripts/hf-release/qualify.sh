@@ -39,6 +39,9 @@
 #     --window W            epochs replayed after the forced activation (default 16)
 #     --jobs N              concurrent replays (default 3)
 #     --expect-slot N --expect-root HEX   head reported by the archivals for --source
+#     --tests-allow-fail PKG  package whose test failures are reported, not fatal
+#                           (repeatable; default: bloch = legacy/genesis3-node, the
+#                           closed Genesis-3 PoW node outside the CI blocking set)
 #     --skip-tests | --skip-forced | --allow-unsandboxed
 #   env: CONTAINER_ENGINE (default docker; e.g. a `sudo -n docker` wrapper)
 #
@@ -53,11 +56,12 @@ PREFIX_PY="$KIT/log-prefix.py"
 ENGINE="${CONTAINER_ENGINE:-docker}"
 SLOTS_PER_EPOCH=32
 
+case "${1:-}" in -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;; esac
 COMMIT_ARG="${1:-}"; [ $# -gt 0 ] && shift
 SOURCE="" BASELINE_BIN="" OUT="" BASE_COMMIT=b4a21fb657d0beb17f64c62889b605c9a7a2d031
 FORCE_EPOCH="" WINDOW=16 JOBS=3 EXPECT_SLOT="" EXPECT_ROOT=""
 SKIP_TESTS=0 SKIP_FORCED=0 UNSANDBOXED=0
-GATE_ARGS=()
+GATE_ARGS=() ALLOW_FAIL=() ALLOW_FAIL_SET=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --source) SOURCE="$2"; shift 2 ;;
@@ -70,19 +74,21 @@ while [ $# -gt 0 ]; do
     --jobs) JOBS="$2"; shift 2 ;;
     --expect-slot) EXPECT_SLOT="$2"; shift 2 ;;
     --expect-root) EXPECT_ROOT="$2"; shift 2 ;;
+    --tests-allow-fail) ALLOW_FAIL+=("$2"); ALLOW_FAIL_SET=1; shift 2 ;;
     --skip-tests) SKIP_TESTS=1; shift ;;
     --skip-forced) SKIP_FORCED=1; shift ;;
     --allow-unsandboxed) UNSANDBOXED=1; shift ;;
-    -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-usage() { sed -n '31,44p' "$0" >&2; exit 2; }
+usage() { sed -n '/^# usage:/,/^#   env:/p' "$0" >&2; exit 2; }
 [ -n "$COMMIT_ARG" ] && [ -n "$SOURCE" ] && [ -n "$BASELINE_BIN" ] || usage
 for n in "$WINDOW" "$JOBS" ${FORCE_EPOCH:+"$FORCE_EPOCH"}; do
   case "$n" in ''|*[!0-9]*) echo "numeric option expected, got '$n'" >&2; exit 2 ;; esac
 done
 [ "$JOBS" -ge 1 ] || JOBS=1
+[ "$ALLOW_FAIL_SET" = 1 ] || ALLOW_FAIL=(bloch)
 
 die() { echo "qualify: FAIL - $*" >&2; exit 1; }
 COMMIT="$(git -C "$REPO" rev-parse --verify --quiet "$COMMIT_ARG^{commit}")" || die "unknown commit $COMMIT_ARG"
@@ -153,11 +159,21 @@ run_tests() {
   set -e
   passed=$(grep -E '^test result:' "$OUT/tests.log" | awk '{s+=$4} END{print s+0}')
   failed=$(grep -E '^test result:' "$OUT/tests.log" | awk '{s+=$6} END{print s+0}')
+  # Packages with a failing test target, from cargo's "-p <pkg> --<target>" hints.
+  local failing blocking="" p a ok
+  failing="$(grep -oE '`-p [A-Za-z0-9_-]+' "$OUT/tests.log" | awk '{print $2}' | sort -u | tr '\n' ' ')"
+  for p in $failing; do
+    ok=0; for a in "${ALLOW_FAIL[@]}"; do [ "$p" = "$a" ] && ok=1; done
+    [ "$ok" = 1 ] || blocking="$blocking $p"
+  done
   if [ "$trc" = 0 ]; then
     record tests PASS "$passed passed, $failed failed"
+  elif [ -n "$failing" ] && [ -z "$blocking" ]; then
+    grep -E '^test .* FAILED$' "$OUT/tests.log" | sort -u | head -20 || true
+    record tests WARN "$passed passed, $failed failed, only in allowed package(s): $failing(tests.log)"
   else
-    grep -E '^test .* FAILED$|^error(\[|:)' "$OUT/tests.log" | head -40 || true
-    record tests FAIL "rc=$trc, $passed passed, $failed failed (tests.log)"
+    grep -E '^test .* FAILED$|^error(\[|:)' "$OUT/tests.log" | sort -u | head -40 || true
+    record tests FAIL "rc=$trc, $passed passed, $failed failed; blocking package(s):${blocking:- none identified (build error?)} (tests.log)"
   fi
 }
 TESTS_PID=""
