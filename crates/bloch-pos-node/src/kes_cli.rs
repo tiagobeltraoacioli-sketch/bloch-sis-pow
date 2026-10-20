@@ -13,18 +13,25 @@ const HELP: &str = "Forward-secure (KES) validator keys
 
 keygen   --dir DATA_DIR [--depth N]        new validator.kes (2^N periods, default 12: about 11 years
                                            of one-day periods), sealed like validator.key
+keygen-next --dir DATA_DIR [--depth N]     validator.kes.next: an early successor the node rotates to
+                                           (KesRotate, signed by its current leaf) after a restart;
+                                           incident response only, the node renews on its own
 inspect  --dir DATA_DIR                    depth, root and the current period
 register --dir DATA_DIR --genesis FILE --out FILE [--validator INDEX]
                                            the once-only registration tx (wire 0x17), signed by
                                            validator.key; send its hex with sendrawtransaction.
-                                           Consensus refuses it before KES_REGISTRATION_EPOCH
+                                           Consensus refuses it before HF3_KES_EPOCH
 
 The key evolves inside the node: before signing in a new period it rewrites
-validator.kes with only that period's seed. Never keep copies of older files.";
+validator.kes with only that period's seed. Never keep copies of older files.
+Renewal is automatic (HF3): about a year before the key expires the node
+generates validator.kes.next, rotates to it with a KesRotate signed by the
+current leaf, and swaps the files once the chain makes it the key in force.";
 
 pub fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
-        Some("keygen") => keygen(&args[1..]),
+        Some("keygen") => keygen(&args[1..], false),
+        Some("keygen-next") => keygen(&args[1..], true),
         Some("inspect") => inspect(&args[1..]),
         Some("register") => register(&args[1..]),
         _ => {
@@ -34,15 +41,26 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn keygen(args: &[String]) -> Result<(), String> {
+fn keygen(args: &[String], next: bool) -> Result<(), String> {
     let o = options(args, &["--dir", "--depth"])?;
     let dir = Path::new(get(&o, "--dir")?);
     let depth: u8 = match get(&o, "--depth") {
         Ok(text) => text.parse().map_err(|_| "--depth must be a small integer")?,
         Err(_) => bloch_pos_committee::params::KES_DEFAULT_DEPTH,
     };
-    if KesKey::path(dir).exists() {
-        return Err(format!("{} already exists; a KES key is registered once", KesKey::path(dir).display()));
+    if depth < bloch_pos_committee::params::KES_MIN_REGISTERED_DEPTH || depth > kes::MAX_DEPTH {
+        return Err(format!(
+            "--depth must be {}..={} (consensus refuses shallower trees)",
+            bloch_pos_committee::params::KES_MIN_REGISTERED_DEPTH,
+            kes::MAX_DEPTH
+        ));
+    }
+    let target = if next { KesKey::next_path(dir) } else { KesKey::path(dir) };
+    if target.exists() {
+        return Err(format!("{} already exists; never overwrite KES key material", target.display()));
+    }
+    if next && !KesKey::path(dir).exists() {
+        return Err("--next needs the current validator.kes beside it".into());
     }
     let unlock = Unlock::from_env().map_err(|e| e.to_string())?;
     let index = Keystore::load_with(dir, &unlock).map_err(|e| format!("validator.key: {e}"))?.index;
@@ -54,7 +72,11 @@ fn keygen(args: &[String]) -> Result<(), String> {
         }
     })
     .map_err(|e| e.to_string())?;
-    key.save(dir, &unlock).map_err(|e| e.to_string())?;
+    if next {
+        key.save_next(dir, &unlock).map_err(|e| e.to_string())?;
+    } else {
+        key.save(dir, &unlock).map_err(|e| e.to_string())?;
+    }
     println!("{}", inspect_json(&key));
     Ok(())
 }

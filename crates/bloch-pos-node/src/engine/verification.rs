@@ -72,6 +72,16 @@ impl<V> GossipVerifier<V> {
         hash.finalize().into()
     }
 
+    /// The failure-cache root of a KES LEAF check: distinct from the plain
+    /// root, because a leaf is verified in the bound (v2) form and a triple
+    /// that failed one form says nothing about the other.
+    pub(super) fn kes_leaf_cache_root(root: &[u8; 32]) -> [u8; 32] {
+        let mut hash = Sha3_256::new();
+        hash.update(b"bloch-node-kes-leaf-failure-v1");
+        hash.update(root);
+        hash.finalize().into()
+    }
+
     pub(super) fn is_known_failure(
         &self,
         pubkey: &[u8],
@@ -145,6 +155,19 @@ impl<V> BudgetedVerifier<'_, V> {
 }
 
 impl<V: SignatureVerifier> SignatureVerifier for BudgetedVerifier<'_, V> {
+    /// KES leaves: same cache-before-budget order, forwarded to the owner's
+    /// leaf hook (bound form), never to `verify_with_key`.
+    fn verify_kes_leaf(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        if self.owner.is_known_failure(pubkey, &GossipVerifier::<V>::kes_leaf_cache_root(root), signature) {
+            return false;
+        }
+        if !self.owner.reserve_verification(self.slot, self.cap, self.source, self.source_cap) {
+            self.limited.set(true);
+            return false;
+        }
+        self.owner.verify_kes_leaf(pubkey, root, signature)
+    }
+
     fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
         // Exact known failures remain cheap and deterministic, and consuming
         // no allowance for them preserves the cache-before-budget ordering.
@@ -164,19 +187,21 @@ impl<V: SignatureVerifier> SignatureVerifier for BudgetedVerifier<'_, V> {
     }
 }
 
-impl<V: SignatureVerifier> SignatureVerifier for GossipVerifier<V> {
-    fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+impl<V: SignatureVerifier> GossipVerifier<V> {
+    /// The failure cache around one cryptographic check, keyed by
+    /// `(pubkey, cache_root, signature)`.
+    fn cached(&self, pubkey: &[u8], cache_root: &[u8; 32], signature: &[u8], check: impl FnOnce() -> bool) -> bool {
         #[cfg(test)]
         assert!(
             !self.panic_on_verification.get(),
             "deferred authenticated block must not repeat gossip verification"
         );
-        let key = Self::failure_key(pubkey, root, signature);
+        let key = Self::failure_key(pubkey, cache_root, signature);
         if self.failures.borrow().known.contains(&key) {
             return false;
         }
         // Release the cache borrow before calling cryptographic code.
-        if self.verifier.verify_with_key(pubkey, root, signature) {
+        if check() {
             return true;
         }
         let mut failures = self.failures.borrow_mut();
@@ -191,6 +216,20 @@ impl<V: SignatureVerifier> SignatureVerifier for GossipVerifier<V> {
     }
 }
 
+impl<V: SignatureVerifier> SignatureVerifier for GossipVerifier<V> {
+    fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        self.cached(pubkey, root, signature, || self.verifier.verify_with_key(pubkey, root, signature))
+    }
+
+    /// KES leaves: cached under their own root domain and forwarded to the
+    /// inner verifier's leaf hook (bound form).
+    fn verify_kes_leaf(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        self.cached(pubkey, &Self::kes_leaf_cache_root(root), signature, || {
+            self.verifier.verify_kes_leaf(pubkey, root, signature)
+        })
+    }
+}
+
 #[cfg(test)]
 pub(super) struct CountedHybrid(std::rc::Rc<std::cell::Cell<usize>>);
 
@@ -199,6 +238,10 @@ impl SignatureVerifier for CountedHybrid {
     fn verify_with_key(&self, key: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
         self.0.set(self.0.get().saturating_add(1));
         crate::keys::HybridVerifier::new().verify_with_key(key, root, signature)
+    }
+    fn verify_kes_leaf(&self, key: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        self.0.set(self.0.get().saturating_add(1));
+        crate::keys::HybridVerifier::new().verify_kes_leaf(key, root, signature)
     }
 }
 

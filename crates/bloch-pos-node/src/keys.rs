@@ -1325,6 +1325,13 @@ impl bloch_pos_committee::attestation::SignatureVerifier for HybridVerifier {
     fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool {
         bloch_crypto::crypto::verify(pubkey, signing_root, signature)
     }
+
+    /// KES leaves are canonical and suite-bound (v2) from the first KES
+    /// signature (review F-1): `bloch_crypto::crypto::verify_bound`, never
+    /// the v1 form, so the `SIG_CANONICAL` flag day does not touch them.
+    fn verify_kes_leaf(&self, leaf_pk: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        bloch_crypto::crypto::verify_bound(leaf_pk, message, signature)
+    }
 }
 
 /// Accept-everything verifier for the producer's own `compute_post_state`

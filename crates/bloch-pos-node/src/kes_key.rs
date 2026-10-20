@@ -4,13 +4,20 @@
 //! passphrase policy ([`Unlock`]).
 //!
 //! The file holds the public tree (depth, root, every leaf hash) in the clear
-//! and, sealed, only the CURRENT period and its seed. [`KesKey::evolve_to`]
+//! and, sealed, only the CURRENT leaf index and its seed. The leaf index is
+//! local to the tree: on chain, leaf `i` signs global period
+//! `start_period + i` (`bloch_pos_committee::kes::KesPublic::leaf_index`), and
+//! the node maps one to the other from committed state. [`KesKey::evolve_to`]
 //! writes the evolved state to disk (temp file, fsync, rename) **before** the
-//! caller signs anything in the new period, then replaces it in memory. Once
+//! caller signs anything with the new leaf, then replaces it in memory. Once
 //! that rename lands, no earlier seed exists anywhere this node wrote it, so
 //! nothing it holds can sign an earlier period — the long-range property.
 //! Operators must not keep older copies of this file: a backup of an earlier
 //! state is an earlier seed.
+//!
+//! Rotation (HF3): the successor tree is generated in the background and
+//! sealed as `validator.kes.next` ([`NEXT_FILE_NAME`]); once the chain makes
+//! it the key in force, [`promote_next`] swaps it in and shreds the old file.
 //!
 //! ```text
 //! BPOSKES2 (sealed):    magic ‖ kdf id ‖ m t p ‖ salt ‖ nonce ‖ index ‖ depth ‖ root ‖ leaves  [AAD]
@@ -32,13 +39,38 @@ use crate::keys::{os_random, read_keystore_file, KdfParams, Unlock, KDF_ARGON2ID
 const MAGIC_PLAIN: &[u8; 8] = b"BPOSKES1";
 const MAGIC_SEALED: &[u8; 8] = b"BPOSKES2";
 pub const FILE_NAME: &str = "validator.kes";
+/// The rotated-in successor, written before its `KesRotate` is submitted.
+pub const NEXT_FILE_NAME: &str = "validator.kes.next";
+/// The replaced key during a swap; shredded right after (and at startup if
+/// a crash interrupted the swap).
+pub const RETIRED_FILE_NAME: &str = "validator.kes.retired";
 
 pub struct KesKey {
     index: u32,
     public: KesPublic,
     leaves: Vec<[u8; 32]>,
+    /// The leaf index (local to this tree) the key can sign with now.
     period: u64,
     seed: Zeroizing<[u8; 32]>,
+    /// The sealing key derived once (Argon2id) with its salt and cost, reused
+    /// by every later evolution of this file (review F-7: re-deriving 64 MiB
+    /// Argon2id on every validator of a host at the same period boundary is
+    /// a synchronized memory spike). The node already holds the passphrase
+    /// for the process lifetime, so caching its derivative adds no exposure.
+    /// Each save still uses a fresh random 24-byte XChaCha nonce.
+    seal: std::cell::RefCell<Option<SealCache>>,
+}
+
+struct SealCache {
+    kdf: KdfParams,
+    salt: [u8; 32],
+    key: Zeroizing<[u8; 32]>,
+}
+
+impl Clone for SealCache {
+    fn clone(&self) -> Self {
+        SealCache { kdf: self.kdf, salt: self.salt, key: Zeroizing::new(*self.key) }
+    }
 }
 
 fn bad(message: &'static str) -> io::Error {
@@ -70,19 +102,22 @@ impl KesKey {
             *s = kes::step(&s);
             progress(i + 1);
         }
-        let public = KesPublic { depth, root: kes::merkle_root(&leaves) };
-        Ok(KesKey { index, public, leaves, period: 0, seed: seed0 })
+        let public = KesPublic::new(depth, kes::merkle_root(&leaves), 0);
+        Ok(KesKey { index, public, leaves, period: 0, seed: seed0, seal: Default::default() })
     }
 
     pub fn index(&self) -> u32 {
         self.index
     }
 
+    /// The tree (depth and root). Its `start_period` is 0: where the tree
+    /// starts is the chain's record, not the file's
+    /// (`CommittedState::kes_public_at`).
     pub fn public(&self) -> KesPublic {
         self.public
     }
 
-    /// The period whose leaf this key can sign with now.
+    /// The leaf index (local to the tree) this key can sign with now.
     pub fn period(&self) -> u64 {
         self.period
     }
@@ -91,8 +126,12 @@ impl KesKey {
         dir.join(FILE_NAME)
     }
 
-    /// Move to `period`, erasing every earlier seed — on disk first, then in
-    /// memory. Refuses to go back and refuses past the last leaf.
+    pub fn next_path(dir: &Path) -> PathBuf {
+        dir.join(NEXT_FILE_NAME)
+    }
+
+    /// Move to leaf `period`, erasing every earlier seed — on disk first,
+    /// then in memory. Refuses to go back and refuses past the last leaf.
     pub fn evolve_to(&mut self, dir: &Path, unlock: &Unlock, period: u64) -> io::Result<()> {
         if period < self.period {
             return Err(io::Error::new(
@@ -110,8 +149,15 @@ impl KesKey {
         for _ in self.period..period {
             *seed = kes::step(&seed);
         }
-        let next = KesKey { index: self.index, public: self.public, leaves: self.leaves.clone(), period, seed };
-        next.save(dir, unlock)?;
+        let next = KesKey {
+            index: self.index,
+            public: self.public,
+            leaves: self.leaves.clone(),
+            period,
+            seed,
+            seal: std::cell::RefCell::new(self.seal.borrow().clone()),
+        };
+        next.save_named(dir, unlock, FILE_NAME)?;
         *self = next;
         Ok(())
     }
@@ -121,7 +167,9 @@ impl KesKey {
     /// The caller evolves first.
     pub fn sign(&self, message: &[u8; 32]) -> io::Result<Vec<u8>> {
         let (leaf_pk, sk) = leaf_keypair(&self.seed)?;
-        let sig = bloch_crypto::crypto::sign(&sk, message)
+        // Canonical, suite-bound v2 form (review F-1), matching
+        // `HybridVerifier::verify_kes_leaf`.
+        let sig = bloch_crypto::crypto::sign_bound(&sk, message)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("KES leaf signing: {e:?}")))?;
         let index = u32::try_from(self.period).map_err(|_| bad("KES period exceeds u32"))?;
         Ok(KesSignature { index, leaf_pk, sig, path: kes::auth_path(&self.leaves, self.period as usize) }.encode())
@@ -139,11 +187,31 @@ impl KesKey {
     /// Write `dir/validator.kes` atomically (0600 temp file, fsync, rename,
     /// fsync of the directory), sealed unless plaintext was explicitly allowed.
     pub fn save(&self, dir: &Path, unlock: &Unlock) -> io::Result<()> {
+        self.save_named(dir, unlock, FILE_NAME)
+    }
+
+    /// Write `dir/validator.kes.next` (the rotation successor) the same way.
+    pub fn save_next(&self, dir: &Path, unlock: &Unlock) -> io::Result<()> {
+        self.save_named(dir, unlock, NEXT_FILE_NAME)
+    }
+
+    fn save_named(&self, dir: &Path, unlock: &Unlock, name: &str) -> io::Result<()> {
         let mut out = Zeroizing::new(Vec::new());
         match unlock {
             Unlock::Passphrase { pass, kdf, .. } => {
-                let mut salt = [0u8; 32];
-                os_random(&mut salt)?;
+                let cached = self.seal.borrow().as_ref().filter(|c| c.kdf == *kdf).cloned();
+                let cache = match cached {
+                    Some(cache) => cache,
+                    None => {
+                        let mut salt = [0u8; 32];
+                        os_random(&mut salt)?;
+                        let key = kdf.derive(pass, &salt)?;
+                        let cache = SealCache { kdf: *kdf, salt, key };
+                        *self.seal.borrow_mut() = Some(cache.clone());
+                        cache
+                    }
+                };
+                let salt = cache.salt;
                 let mut nonce = [0u8; 24];
                 os_random(&mut nonce)?;
                 let mut header = Vec::new();
@@ -158,8 +226,7 @@ impl KesKey {
                 let mut plain = Zeroizing::new(Vec::with_capacity(40));
                 plain.extend_from_slice(&self.period.to_le_bytes());
                 plain.extend_from_slice(&self.seed[..]);
-                let key = kdf.derive(pass, &salt)?;
-                let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
+                let cipher = XChaCha20Poly1305::new_from_slice(cache.key.as_ref())
                     .map_err(|_| io::Error::new(io::ErrorKind::Other, "AEAD key length"))?;
                 let sealed = cipher
                     .encrypt(XNonce::from_slice(&nonce), Payload { msg: &plain, aad: &header })
@@ -175,8 +242,8 @@ impl KesKey {
             }
         }
         fs::create_dir_all(dir)?;
-        let path = Self::path(dir);
-        let tmp = dir.join(format!("{FILE_NAME}.tmp"));
+        let path = dir.join(name);
+        let tmp = dir.join(format!("{name}.tmp"));
         {
             use std::io::Write;
             #[cfg(unix)]
@@ -196,7 +263,16 @@ impl KesKey {
 
     /// `Ok(None)` iff `dir/validator.kes` does not exist.
     pub fn load_optional(dir: &Path, unlock: &Unlock) -> io::Result<Option<KesKey>> {
-        let bytes = match read_keystore_file(&Self::path(dir)) {
+        Self::load_path(&Self::path(dir), unlock)
+    }
+
+    /// `Ok(None)` iff `dir/validator.kes.next` does not exist.
+    pub fn load_next(dir: &Path, unlock: &Unlock) -> io::Result<Option<KesKey>> {
+        Self::load_path(&Self::next_path(dir), unlock)
+    }
+
+    fn load_path(path: &Path, unlock: &Unlock) -> io::Result<Option<KesKey>> {
+        let bytes = match read_keystore_file(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
@@ -245,7 +321,8 @@ impl KesKey {
         if kes::merkle_root(&leaves) != root {
             return Err(bad("KES leaves do not match the root"));
         }
-        let public = KesPublic { depth, root };
+        let public = KesPublic::new(depth, root, 0);
+        let mut seal_cache = None;
         let (period, seed) = match kdf_salt_nonce {
             None => {
                 let period = r.u64().map_err(|_| bad("truncated KES key"))?;
@@ -272,6 +349,7 @@ impl KesKey {
                 let key = kdf.derive(pass, &salt)?;
                 let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
                     .map_err(|_| io::Error::new(io::ErrorKind::Other, "AEAD key length"))?;
+                seal_cache = Some(SealCache { kdf, salt, key: Zeroizing::new(*key) });
                 let plain = Zeroizing::new(
                     cipher
                         .decrypt(XNonce::from_slice(&nonce), Payload { msg: &sealed, aad: &bytes[..header_len] })
@@ -289,8 +367,66 @@ impl KesKey {
         if period >= public.periods() {
             return Err(bad("KES period is beyond the tree"));
         }
-        Ok(KesKey { index, public, leaves, period, seed })
+        Ok(KesKey { index, public, leaves, period, seed, seal: std::cell::RefCell::new(seal_cache) })
     }
+}
+
+/// Overwrite `path` with zeros, fsync, and remove it. Best effort against
+/// recovery from the file system; a copy-on-write or journaled medium may
+/// still hold old blocks, which is why operators keep KES data dirs out of
+/// snapshots (docs/KES-MAINNET-READINESS.md §6).
+pub fn shred(path: &Path) -> io::Result<()> {
+    use std::io::Write;
+    let len = match fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    {
+        let mut f = fs::OpenOptions::new().write(true).open(path)?;
+        f.write_all(&vec![0u8; len as usize])?;
+        f.sync_all()?;
+    }
+    fs::remove_file(path)?;
+    if let Some(dir) = path.parent() {
+        fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Make the rotation successor the key: `validator.kes` →
+/// `validator.kes.retired`, `validator.kes.next` → `validator.kes`, then
+/// shred the retired file. Each rename is atomic, so a crash leaves either
+/// the old key in place with the successor beside it, or the successor in
+/// place with a retired file that [`finish_interrupted_rotation`] shreds.
+pub fn promote_next(dir: &Path) -> io::Result<()> {
+    let current = dir.join(FILE_NAME);
+    let next = dir.join(NEXT_FILE_NAME);
+    let retired = dir.join(RETIRED_FILE_NAME);
+    if !next.exists() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "no validator.kes.next to promote"));
+    }
+    if current.exists() {
+        fs::rename(&current, &retired)?;
+    }
+    fs::rename(&next, &current)?;
+    fs::File::open(dir)?.sync_all()?;
+    shred(&retired)
+}
+
+/// Startup: a swap interrupted after its renames leaves
+/// `validator.kes.retired`; shred it. A swap interrupted between the renames
+/// leaves `validator.kes.next` and `validator.kes.retired` but no
+/// `validator.kes`: finish it.
+pub fn finish_interrupted_rotation(dir: &Path) -> io::Result<()> {
+    let current = dir.join(FILE_NAME);
+    let next = dir.join(NEXT_FILE_NAME);
+    let retired = dir.join(RETIRED_FILE_NAME);
+    if !current.exists() && next.exists() && retired.exists() {
+        fs::rename(&next, &current)?;
+        fs::File::open(dir)?.sync_all()?;
+    }
+    shred(&retired)
 }
 
 #[cfg(test)]
@@ -338,6 +474,37 @@ mod tests {
         assert!(!kes::verify(&verifier, &public, 0, &root, &again));
         assert!(fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_successor_is_promoted_atomically_and_the_old_key_shredded() {
+        let dir = tmp("promote");
+        let unlock = quick();
+        let old = KesKey::generate(4, 1, |_| {}).unwrap();
+        old.save(&dir, &unlock).unwrap();
+        let next = KesKey::generate(4, 2, |_| {}).unwrap();
+        next.save_next(&dir, &unlock).unwrap();
+        assert_eq!(KesKey::load_next(&dir, &unlock).unwrap().unwrap().public(), next.public());
+        promote_next(&dir).unwrap();
+        assert_eq!(KesKey::load_optional(&dir, &unlock).unwrap().unwrap().public(), next.public());
+        assert!(KesKey::load_next(&dir, &unlock).unwrap().is_none());
+        assert!(!dir.join(RETIRED_FILE_NAME).exists(), "the old key is gone");
+        assert!(promote_next(&dir).is_err(), "nothing left to promote");
+
+        // A crash between the two renames: no validator.kes, a retired one
+        // and the successor. Startup finishes the swap.
+        let crashed = tmp("promote-crash");
+        let a = KesKey::generate(4, 1, |_| {}).unwrap();
+        let b = KesKey::generate(4, 1, |_| {}).unwrap();
+        a.save(&crashed, &unlock).unwrap();
+        fs::rename(crashed.join(FILE_NAME), crashed.join(RETIRED_FILE_NAME)).unwrap();
+        b.save_next(&crashed, &unlock).unwrap();
+        finish_interrupted_rotation(&crashed).unwrap();
+        assert_eq!(KesKey::load_optional(&crashed, &unlock).unwrap().unwrap().public(), b.public());
+        assert!(!crashed.join(RETIRED_FILE_NAME).exists());
+        assert!(!crashed.join(NEXT_FILE_NAME).exists());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&crashed);
     }
 
     #[test]

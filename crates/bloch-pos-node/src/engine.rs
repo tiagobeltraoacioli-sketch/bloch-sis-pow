@@ -1077,7 +1077,8 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
             Some(lifecycle_source_hash(b"exit", pubkey_hash)),
         PosTransaction::Withdraw { validator }
         | PosTransaction::RandaoRecommit { validator, .. }
-        | PosTransaction::KesRegister { validator, .. } =>
+        | PosTransaction::KesRegister { validator, .. }
+        | PosTransaction::KesRotate { validator, .. } =>
             Some(validator_lifecycle_source(*validator)),
         PosTransaction::SlashingEvidence(evidence) => {
             let validator = match evidence {
@@ -2424,16 +2425,26 @@ impl Engine {
         (rec.pubkey == keys.pubkey).then_some(keys.index)
     }
 
-    /// Make the KES key ready to sign a duty of `epoch`: `Ok(None)` before
-    /// KES enforcement (the static key signs, exactly as before),
-    /// `Ok(Some(period))` once evolved — on disk first — to the epoch's
-    /// period, `Err` when this node must not sign (no KES key, an erased or
-    /// expired period, or a failed write). Called only once a duty is
-    /// settled, so an idle validator does not evolve or log.
-    fn prepare_kes(&mut self, epoch: u64) -> Result<Option<u64>, String> {
-        let Some(period) = bloch_pos_committee::params::kes_period(epoch) else {
-            return Ok(None);
+    /// Make the KES key ready to sign for `validator` in `epoch`: `Ok(None)`
+    /// before KES enforcement (the static key signs, exactly as before),
+    /// `Ok(Some((period, key in force)))` once evolved — on disk first — to
+    /// the leaf the chain assigns that period (`KesPublic::leaf_index`: the
+    /// period minus the key's on-chain start period), `Err` when this node
+    /// must not sign (no KES key here or on chain, a file that is not the key
+    /// in force, an erased or expired leaf, or a failed write). Promotes a
+    /// rotated-in successor the chain has made the key in force. Called only
+    /// once a duty is settled, so an idle validator does not evolve or log.
+    fn prepare_kes(&mut self, epoch: u64, validator: u32) -> Result<Option<(u64, bloch_pos_committee::kes::KesPublic)>, String> {
+        use bloch_pos_committee::kes::SigningMode;
+        // The same rule every verifier runs (`kes::signing_mode`): static
+        // before KES binds on chain, and for a never-registered validator
+        // after (fallback); the KES leaf for a registered one.
+        let period = match bloch_pos_committee::kes::signing_mode(&*self.state, validator, epoch) {
+            SigningMode::Static => return Ok(None),
+            SigningMode::FailClosed => return Err("KES enforcement state unknown".into()),
+            SigningMode::Kes(period) => period,
         };
+        let head_period = bloch_pos_committee::params::kes_period(epoch_of(self.state.slot()));
         let Some(kes) = self.kes.as_mut() else {
             return Err(format!(
                 "KES is enforced from epoch {} and no {} is loaded",
@@ -2441,16 +2452,160 @@ impl Engine {
                 crate::kes_key::FILE_NAME
             ));
         };
-        if period < kes.key.period() {
-            return Err(format!("KES period {period} is erased (key at period {})", kes.key.period()));
+        let Some(public) = self.state.kes_public_at(validator, period) else {
+            return Err(format!("no KES key is registered on chain for v{validator}"));
+        };
+        kes.adopt_successor(&public)?;
+        if kes.key.index() != validator && kes.key.index() != crate::keys::AUTO_VALIDATOR_INDEX {
+            return Err(format!(
+                "{} belongs to v{}, not v{validator}",
+                crate::kes_key::FILE_NAME,
+                kes.key.index()
+            ));
         }
-        if period > kes.key.period() {
+        if !kes.key.public().same_tree(&public) {
+            return Err(format!(
+                "{} (root {}) is not v{validator}'s KES key in force for period {period} (root {})",
+                crate::kes_key::FILE_NAME,
+                crate::codec::hex8(&kes.key.public().root),
+                crate::codec::hex8(&public.root)
+            ));
+        }
+        let Some(leaf) = public.leaf_index(period) else {
+            return Err(format!(
+                "v{validator}'s KES key does not cover period {period} (start {}, end {}): expired or not yet started",
+                public.start_period,
+                public.end_period()
+            ));
+        };
+        if leaf < kes.key.period() {
+            return Err(format!("KES leaf {leaf} (period {period}) is erased (key at leaf {})", kes.key.period()));
+        }
+        if leaf > kes.key.period() {
+            // Review F-5: erasure cannot be undone, so a clock that jumped
+            // forward must not erase periods the chain has not reached. The
+            // key moves at most one period past where it is, or past the
+            // head's period, unless the operator confirms the target period
+            // (`BLOCH_KES_ALLOW_PERIOD_JUMP=<period>`).
+            let key_period = public.start_period.saturating_add(kes.key.period());
+            if !kes_evolution_allowed(key_period, head_period, period, kes_period_jump_confirmed()) {
+                return Err(format!(
+                    "refusing to erase KES periods {key_period}..{period}: the chain head is at period {:?}; \
+                     a clock jump? set BLOCH_KES_ALLOW_PERIOD_JUMP={period} to confirm",
+                    head_period
+                ));
+            }
+            if leaf > kes.key.period() + 1 {
+                eprintln!("KES WARNING: evolving across {} periods at once (to period {period})", leaf - kes.key.period());
+            }
             kes.key
-                .evolve_to(&kes.dir, &kes.unlock, period)
-                .map_err(|e| format!("KES evolve to period {period}: {e}"))?;
-            println!("KES key evolved to period {period}; earlier seeds erased on disk");
+                .evolve_to(&kes.dir, &kes.unlock, leaf)
+                .map_err(|e| format!("KES evolve to leaf {leaf} (period {period}): {e}"))?;
+            println!("KES key evolved to leaf {leaf} (period {period}); earlier seeds erased on disk");
         }
-        Ok(Some(period))
+        Ok(Some((period, public)))
+    }
+
+    /// HF3 automatic KES rotation, once per slot turn for a validator node
+    /// (docs/KES-MAINNET-READINESS.md §3 item 3). No operator action: when the
+    /// key in force has at most `KES_ROTATE_REMAINING_PERIODS` (+ a per-index
+    /// stagger) periods left, generate the successor tree in the background,
+    /// seal it as `validator.kes.next`, submit a `KesRotate` signed by the
+    /// current leaf (again each period until included), and swap the files
+    /// once the chain makes the successor the key in force. Inert before KES
+    /// enforcement, while behind the clock, and for observers.
+    pub(super) fn maintain_kes(&mut self, wall_epoch: u64) {
+        if self.kes.is_none()
+            || self.doppelganger_blocks_duties(self.wall_slot)
+            || epoch_of(self.state.slot()) != wall_epoch
+        {
+            return;
+        }
+        let Some(period) = bloch_pos_committee::params::kes_period(wall_epoch) else {
+            return;
+        };
+        let Some(index) = self.duty_index(&self.state) else {
+            return;
+        };
+        let Some(entry) = self.state.kes_roots().get(&index).copied() else {
+            return;
+        };
+        let Some(kes) = self.kes.as_mut() else {
+            return;
+        };
+        kes.poll_keygen();
+        if let Err(why) = kes.adopt_successor(&entry.in_force(period)) {
+            eprintln!("KES rotation for v{index}: {why}");
+            return;
+        }
+        let step = kes_rotation_step(
+            &entry,
+            period,
+            index,
+            &kes.key.public(),
+            kes.next.as_ref().map(|next| next.public()),
+            kes.keygen.is_some(),
+            kes.rotation_submitted == Some(period),
+        );
+        match step {
+            KesRotationStep::Idle | KesRotationStep::AwaitHandover => {}
+            KesRotationStep::Foreign => eprintln!(
+                "KES rotation for v{index}: the chain holds a pending successor that is not {}; \
+                 this node will not be able to sign once it takes over",
+                crate::kes_key::NEXT_FILE_NAME
+            ),
+            KesRotationStep::Generate { depth } => kes.spawn_keygen(index, depth),
+            KesRotationStep::Submit => self.submit_kes_rotation(wall_epoch, period, index),
+        }
+    }
+
+    fn submit_kes_rotation(&mut self, wall_epoch: u64, period: u64, index: u32) {
+        let in_force = match self.prepare_kes(wall_epoch, index) {
+            Ok(Some((p, public))) if p == period => public,
+            Ok(_) => return,
+            Err(why) => {
+                eprintln!("KES rotation for v{index} deferred: {why}");
+                return;
+            }
+        };
+        let Some(kes) = self.kes.as_ref() else {
+            return;
+        };
+        let Some(next) = kes.next.as_ref().map(|next| next.public()) else {
+            return;
+        };
+        let domain = KeyLookup::kes_network_domain(&*self.state);
+        let rotate_root = bloch_pos_committee::kes::rotate_signing_root(
+            &domain.unwrap_or([0; 32]),
+            index,
+            period,
+            next.depth,
+            &next.root,
+        );
+        let Some(message) = bloch_pos_committee::kes::leaf_message(domain, index, &in_force, period, &rotate_root) else {
+            return;
+        };
+        let signature = match kes.key.sign(&message) {
+            Ok(signature) => signature,
+            Err(e) => {
+                eprintln!("KES rotation for v{index}: leaf signing failed: {e}");
+                return;
+            }
+        };
+        let tx = PosTransaction::KesRotate { validator: index, period, depth: next.depth, root: next.root, signature };
+        match self.on_transaction(tx) {
+            Ok(_) => {
+                println!(
+                    "KES rotation for v{index} submitted in period {period}: successor root {} from period {}",
+                    crate::codec::hex8(&next.root),
+                    period + 1
+                );
+                if let Some(kes) = self.kes.as_mut() {
+                    kes.rotation_submitted = Some(period);
+                }
+            }
+            Err(reason) => eprintln!("KES rotation for v{index} deferred: {reason:?}"),
+        }
     }
 
     /// Publish participation eligibility, not a scheduled or completed duty.
@@ -2574,7 +2729,7 @@ impl Engine {
         // inside the same slot.
         //
         // KES: the vote's period is its target epoch's, which is this slot's.
-        let kes_period = match self.prepare_kes(e) {
+        let kes_period = match self.prepare_kes(e, index) {
             Ok(period) => period,
             Err(why) => {
                 eprintln!("[slot {slot}] not attesting: {why}");
@@ -2779,7 +2934,7 @@ impl Engine {
         // not.
         // KES: the proposal's period is its slot's epoch's. Prepared only
         // now that this node is certain to sign.
-        let kes_period = match self.prepare_kes(e) {
+        let kes_period = match self.prepare_kes(e, index) {
             Ok(period) => period,
             Err(why) => {
                 eprintln!("[slot {slot}] not proposing: {why}");
@@ -6827,6 +6982,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // signature across runs and across processes.
         if !duties_blocked && slot > last_attested {
             engine.maintain_validator_lifecycle(wall_epoch);
+            engine.maintain_kes(wall_epoch);
             engine.attest(slot);
             last_attested = slot;
         }
@@ -7304,11 +7460,157 @@ pub(crate) fn l2_admission_refusal(
     }
 }
 
-/// The loaded KES key with what it needs to rewrite itself on evolution.
+/// The loaded KES key with what it needs to rewrite itself on evolution,
+/// and the HF3 rotation state: the sealed successor (`validator.kes.next`),
+/// a background keygen in flight, and the period a rotation was last
+/// submitted in.
 pub(crate) struct KesSigner {
     key: crate::kes_key::KesKey,
     dir: PathBuf,
     unlock: crate::keys::Unlock,
+    next: Option<crate::kes_key::KesKey>,
+    keygen: Option<std::sync::mpsc::Receiver<io::Result<crate::kes_key::KesKey>>>,
+    rotation_submitted: Option<u64>,
+}
+
+impl KesSigner {
+    pub(crate) fn new(key: crate::kes_key::KesKey, dir: PathBuf, unlock: crate::keys::Unlock) -> Self {
+        KesSigner { key, dir, unlock, next: None, keygen: None, rotation_submitted: None }
+    }
+
+    /// If the chain's key in force is the sealed successor, swap the files
+    /// (`kes_key::promote_next`) and sign with it from now on.
+    fn adopt_successor(&mut self, in_force: &bloch_pos_committee::kes::KesPublic) -> Result<(), String> {
+        let promote = !self.key.public().same_tree(in_force)
+            && self.next.as_ref().is_some_and(|next| next.public().same_tree(in_force));
+        if !promote {
+            return Ok(());
+        }
+        crate::kes_key::promote_next(&self.dir).map_err(|e| format!("KES successor swap failed: {e}"))?;
+        if let Some(next) = self.next.take() {
+            self.key = next;
+        }
+        self.rotation_submitted = None;
+        println!(
+            "KES successor in force from period {}: {} replaced, old key shredded",
+            in_force.start_period,
+            crate::kes_key::FILE_NAME
+        );
+        Ok(())
+    }
+
+    /// Collect a finished background keygen: seal it as `validator.kes.next`.
+    fn poll_keygen(&mut self) {
+        let Some(rx) = self.keygen.as_ref() else {
+            return;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(io::Error::new(io::ErrorKind::Other, "KES keygen thread exited"))
+            }
+        };
+        self.keygen = None;
+        match outcome.and_then(|key| key.save_next(&self.dir, &self.unlock).map(|()| key)) {
+            Ok(key) => {
+                println!(
+                    "KES successor generated and sealed as {}: depth {}, root {}",
+                    crate::kes_key::NEXT_FILE_NAME,
+                    key.public().depth,
+                    crate::codec::hex8(&key.public().root)
+                );
+                self.next = Some(key);
+            }
+            Err(e) => eprintln!("KES successor keygen failed (retried next turn): {e}"),
+        }
+    }
+
+    /// Generate the successor tree on a background thread (depth 12 is a few
+    /// CPU-minutes; duties keep running on the current key meanwhile).
+    fn spawn_keygen(&mut self, index: u32, depth: u8) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("kes-keygen".into()).spawn(move || {
+            let _ = tx.send(crate::kes_key::KesKey::generate(index, depth, |_| {}));
+        });
+        match spawned {
+            Ok(_) => {
+                println!("KES successor keygen started for v{index} (depth {depth})");
+                self.keygen = Some(rx);
+            }
+            Err(e) => eprintln!("KES successor keygen could not start: {e}"),
+        }
+    }
+}
+
+/// Review F-5: may the KES key erase its way from global period `key_period`
+/// to `target`? At most one period past the key's own period or the head's,
+/// or exactly the period an operator confirmed.
+pub(crate) fn kes_evolution_allowed(key_period: u64, head_period: Option<u64>, target: u64, confirmed: Option<u64>) -> bool {
+    target <= key_period.max(head_period.unwrap_or(0)).saturating_add(1) || confirmed == Some(target)
+}
+
+/// The operator's confirmation of a multi-period KES jump (review F-5).
+fn kes_period_jump_confirmed() -> Option<u64> {
+    std::env::var("BLOCH_KES_ALLOW_PERIOD_JUMP").ok()?.trim().parse().ok()
+}
+
+/// What the node's KES rotation does this turn (`Engine::maintain_kes`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KesRotationStep {
+    /// Nothing to do: far from expiry, or a keygen is running.
+    Idle,
+    /// Start generating a successor of this depth.
+    Generate { depth: u8 },
+    /// Submit (or resubmit, once per period) a `KesRotate` to the successor.
+    Submit,
+    /// The successor is committed on chain and takes over next period.
+    AwaitHandover,
+    /// The chain's pending successor is not the one this node holds.
+    Foreign,
+}
+
+/// The node's rotation policy, pure: from the committed entry, the global
+/// period, the validator index, the tree in `validator.kes`, the tree in
+/// `validator.kes.next` (if any), whether a keygen is running and whether a
+/// rotation was already submitted this period. Keygen starts once
+/// `remaining ≤ KES_ROTATE_REMAINING_PERIODS + index % KES_ROTATION_STAGGER_PERIODS`;
+/// a sealed successor is submitted whenever one exists.
+pub(crate) fn kes_rotation_step(
+    entry: &bloch_pos_committee::kes::KesEntry,
+    period: u64,
+    index: u32,
+    key: &bloch_pos_committee::kes::KesPublic,
+    next: Option<bloch_pos_committee::kes::KesPublic>,
+    generating: bool,
+    submitted_this_period: bool,
+) -> KesRotationStep {
+    use bloch_pos_committee::params::{KES_ROTATE_REMAINING_PERIODS, KES_ROTATION_STAGGER_PERIODS};
+    let in_force = entry.in_force(period);
+    if let Some(pending) = entry.pending_at(period) {
+        return if next.is_some_and(|next| next.same_tree(&pending)) {
+            KesRotationStep::AwaitHandover
+        } else {
+            KesRotationStep::Foreign
+        };
+    }
+    if !key.same_tree(&in_force) || in_force.leaf_index(period).is_none() {
+        // Not this node's key in force, or already expired: a leaf-signed
+        // rotation is impossible (the static key cannot rotate).
+        return KesRotationStep::Idle;
+    }
+    // A sealed successor is rotated in whenever it exists: the scheduled one
+    // below, or one an operator generated early for incident response
+    // (`bloch-pos kes keygen --next`, then a restart).
+    let usable_next = next.filter(|next| !next.same_tree(&in_force));
+    if usable_next.is_some() {
+        return if submitted_this_period { KesRotationStep::Idle } else { KesRotationStep::Submit };
+    }
+    let horizon = KES_ROTATE_REMAINING_PERIODS + u64::from(index) % KES_ROTATION_STAGGER_PERIODS;
+    if generating || in_force.remaining_periods(period) > horizon {
+        return KesRotationStep::Idle;
+    }
+    KesRotationStep::Generate { depth: in_force.depth }
 }
 
 /// Load `validator.kes` for a validator node, under the keystore's passphrase
@@ -7316,7 +7618,11 @@ pub(crate) struct KesSigner {
 /// until KES enforcement, then stops signing loudly instead of signing with a
 /// key consensus refuses).
 fn load_kes_signer(dir: &std::path::Path, validator: bool) -> io::Result<Option<KesSigner>> {
-    if !validator || !crate::kes_key::KesKey::path(dir).exists() {
+    if !validator {
+        return Ok(None);
+    }
+    crate::kes_key::finish_interrupted_rotation(dir)?;
+    if !crate::kes_key::KesKey::path(dir).exists() {
         return Ok(None);
     }
     let unlock = crate::keys::Unlock::from_env()?;
@@ -7329,12 +7635,23 @@ fn load_kes_signer(dir: &std::path::Path, validator: bool) -> io::Result<Option<
         key.period(),
         crate::codec::hex8(&key.public().root)
     );
-    Ok(Some(KesSigner { key, dir: dir.to_path_buf(), unlock }))
+    let next = crate::kes_key::KesKey::load_next(dir, &unlock)?;
+    if let Some(next) = &next {
+        println!(
+            "KES successor loaded: depth {}, root {}",
+            next.public().depth,
+            crate::codec::hex8(&next.public().root)
+        );
+    }
+    let mut signer = KesSigner::new(key, dir.to_path_buf(), unlock);
+    signer.next = next;
+    Ok(Some(signer))
 }
 
 /// One consensus signature for a duty, made inside the slashing-protection
-/// guard: the static key before KES enforcement (`kes_period` `None`), the
-/// KES leaf of the prepared period after it.
+/// guard: the static key before KES enforcement (`kes_duty` `None`), the
+/// KES leaf of the prepared period after it, bound to the on-chain key in
+/// force (`prepare_kes`).
 ///
 /// The leaf signs `kes::leaf_message` — the root bound to the duty state's
 /// network domain, the duty's validator index, the key's tree and the period — the
@@ -7345,18 +7662,17 @@ fn load_kes_signer(dir: &std::path::Path, validator: bool) -> io::Result<Option<
 fn sign_duty(
     keys: &Keystore,
     kes: Option<&KesSigner>,
-    kes_period: Option<u64>,
+    kes_duty: Option<(u64, bloch_pos_committee::kes::KesPublic)>,
     network_domain: Option<[u8; 32]>,
     validator: u32,
     root: &[u8; 32],
 ) -> Vec<u8> {
-    let Some(period) = kes_period else {
+    let Some((period, public)) = kes_duty else {
         return keys.sign(root);
     };
     let Some(kes) = kes else {
         return Vec::new();
     };
-    let public = kes.key.public();
     let domain = network_domain;
     let Some(message) = bloch_pos_committee::kes::leaf_message(domain, validator, &public, period, root) else {
         return Vec::new();
@@ -7891,6 +8207,25 @@ fn admissible_with_network_verifier(
                 || signature.len() > bloch_pos_committee::transition::funded::ADMISSION_PQ_SIGNATURE_MAX
             {
                 return Err("KES registration has an out-of-range depth or signature length");
+            }
+            Ok(())
+        }
+        // HF3 KES rotation: refused before `HF3_KES_EPOCH` exactly like every
+        // other flag-day format. After it, the structural bounds here; the
+        // period, the leaf signature, the one-per-period rule and the
+        // registry checks belong to `validate_lifecycle_transaction`
+        // (committed state) and to consensus.
+        PosTransaction::KesRotate { depth, signature, .. } => {
+            if !bloch_pos_committee::params::kes_registration_open(wall_epoch) {
+                return Err(
+                    "KES rotation is not active: the format ships behind a flag day \
+                     (HF3_KES_EPOCH) that this chain has not reached",
+                );
+            }
+            if !(bloch_pos_committee::kes::MIN_DEPTH..=bloch_pos_committee::kes::MAX_DEPTH).contains(depth)
+                || bloch_pos_committee::kes::KesSignature::decode(signature).is_none()
+            {
+                return Err("KES rotation has an out-of-range depth or a malformed KES signature");
             }
             Ok(())
         }

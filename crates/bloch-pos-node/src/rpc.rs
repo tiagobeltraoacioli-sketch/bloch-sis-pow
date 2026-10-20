@@ -2204,6 +2204,7 @@ impl PreparedSubmission {
             // post-activation needs the honest name.
             PosTransaction::RandaoRecommit { .. } => "randao_recommit",
             PosTransaction::KesRegister { .. } => "kes_register",
+            PosTransaction::KesRotate { .. } => "kes_rotate",
             PosTransaction::L2Settlement(_) => "l2_settlement",
             PosTransaction::L2SettlementAsync(_) => "l2_settlement_async",
             PosTransaction::L2Deposit(_) => "l2_deposit",
@@ -2845,12 +2846,32 @@ pub fn kes_json(state: &bloch_pos_committee::transition::CommittedState) -> Json
         ("epoch", Json::u(epoch)),
         ("registration_open", Json::Bool(kes_registration_open(epoch))),
         ("period", kes_period(epoch).map_or(Json::Null, Json::u)),
-        ("registered", Json::Arr(state.kes_roots().iter().map(|(validator, public)| Json::obj(vec![
-            ("validator", Json::u(u64::from(*validator))),
-            ("depth", Json::u(u64::from(public.depth))),
-            ("periods", Json::u(public.periods())),
-            ("root", Json::hex(&public.root)),
-        ])).collect())),
+        ("enforced_from", state.kes_enforced_from().map_or(Json::Null, Json::u)),
+        ("registered_stake_bps", Json::u(state.kes_registered_stake_bps(epoch))),
+        ("min_registered_stake_bps", Json::u(bloch_pos_committee::params::KES_MIN_REGISTERED_STAKE_BPS)),
+        ("registered", Json::Arr(state.kes_roots().iter().map(|(validator, entry)| {
+            // The key in force at the head's period (period 0 before
+            // enforcement), and a rotated-in successor waiting for its start.
+            let at = kes_period(epoch).unwrap_or(0);
+            let key = |public: &bloch_pos_committee::kes::KesPublic| Json::obj(vec![
+                ("depth", Json::u(u64::from(public.depth))),
+                ("periods", Json::u(public.periods())),
+                ("root", Json::hex(&public.root)),
+                ("start_period", Json::u(public.start_period)),
+                ("end_period", Json::u(public.end_period())),
+            ]);
+            let in_force = entry.in_force(at);
+            Json::obj(vec![
+                ("validator", Json::u(u64::from(*validator))),
+                ("depth", Json::u(u64::from(in_force.depth))),
+                ("periods", Json::u(in_force.periods())),
+                ("root", Json::hex(&in_force.root)),
+                ("start_period", Json::u(in_force.start_period)),
+                ("end_period", Json::u(in_force.end_period())),
+                ("periods_remaining", Json::u(in_force.remaining_periods(at))),
+                ("pending_rotation", entry.pending_at(at).as_ref().map_or(Json::Null, key)),
+            ])
+        }).collect())),
     ])
 }
 
