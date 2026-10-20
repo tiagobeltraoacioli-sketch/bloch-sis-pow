@@ -72,7 +72,7 @@ def first_epoch_of_period(p: int) -> int:
 
 
 class KesRehearsal(Rehearsal):
-    U, LATE, CRASH, JUMP, WRONG, RESCUE, SECOND = 0, (2, 5), 4, 6, 7, 3, 9
+    U, LATE, CRASH, JUMP, WRONG, RESCUE, SECOND, EQUIV = 0, (2, 5), 4, 6, 7, 3, 9, 10
 
     def __init__(self, a):
         super().__init__(a)
@@ -216,6 +216,11 @@ class KesRehearsal(Rehearsal):
                            s1c)
             self.boundaries.append(("KES bind", int(bind) if bind is not None else ENFORCE_EPOCH))
 
+            # S10 (part 1): v10 equivocates in a KES period p after bind; the
+            # evidence is HELD (not sent) until v10 has rotated twice.
+            self.wait_epoch(self.clock.wall_epoch(), 16)
+            self.sres["S10"] = self.kes_equivocate_hold(self.EQUIV)
+
             # S7 (part 1): take v3 offline before its rotation horizon so its key expires.
             self.wait_epoch(18)
             self.stop_node(self.RESCUE)
@@ -237,6 +242,9 @@ class KesRehearsal(Rehearsal):
             # S5: clock jump on v6.
             self.wait_epoch(31)
             self.sres["S5"] = self.clock_jump(self.JUMP)
+
+            # S10 (part 2): after two rotations, submit the held evidence.
+            self.kes_equivocate_submit(self.EQUIV, deadline_epoch=a.stop_epoch - 4)
 
             self.wait_epoch(a.stop_epoch)
             report["final_live"] = {i: self.latest(i) for i in range(self.total_nodes)}
@@ -281,6 +289,69 @@ class KesRehearsal(Rehearsal):
                   f"{len(fails)} fail, {sum(c['status']=='SKIP' for c in self.checks.rows)} not exercised)  "
                   f"report: {self.work/'report.json'}")
         return 1 if report["status"] != "PASS" else 0
+
+    # ── S10 ──────────────────────────────────────────────────────────────
+    def kes_equivocate_hold(self, v) -> dict:
+        """Forge with v's CURRENT leaf during period p; keep the evidence file."""
+        res: dict = {"validator": v, "attempts": []}
+        ev = self.work / "evidence-kes-period.hex"
+        deadline = self.clock.wall_epoch() + 4
+        while self.clock.wall_epoch() < deadline and "evidence_txid" not in res:
+            epoch = self.clock.wall_epoch()
+            p = period_of(epoch)
+            hit = self.find_block_by({v}, first_epoch_of_period(p), epoch, node=0) if p is not None else None
+            if hit:
+                slot = hit[0]
+                try:
+                    out = self.cand.run(["devnet-equivocate", "--genesis", str(self.genesis), "--dir",
+                                         str(self.work / f"node{v}"), "--data-dir", str(self.work / f"node{v}"),
+                                         "--slot", str(slot), "--kes-period", str(p),
+                                         "--evidence-out", str(ev)], timeout=300).stdout
+                    txid = re.search(r"evidence transaction id: ([0-9a-f]{64})", out)
+                    res.update(period=p, slot=slot, evidence_txid=txid and txid.group(1),
+                               in_force_root_at_p=(self.entry(self.getkes(), v) or {}).get("root"))
+                    break
+                except SoakError as e:
+                    res["attempts"].append(str(e)[-240:])
+                    if ev.exists():
+                        ev.unlink()
+            time.sleep(3)
+        self.event("s10_equivocation_held", **{k: v2 for k, v2 in res.items() if k != "attempts"})
+        self.checks.ok("S10 equivocation signed with the current KES leaf in period p (evidence held)",
+                       bool(res.get("evidence_txid")), res)
+        return res
+
+    def kes_equivocate_submit(self, v, deadline_epoch) -> None:
+        res = self.sres.get("S10", {})
+        if not res.get("evidence_txid"):
+            return
+        roots = [res.get("in_force_root_at_p")]
+        while self.clock.wall_epoch() < deadline_epoch:
+            e = self.entry(self.kes_sampler_tick(), v)
+            if e and e["root"] != roots[-1]:
+                roots.append(e["root"])
+            if len(roots) >= 3:
+                break
+            time.sleep(5)
+        res["roots_seen"] = roots
+        res["rotations_before_submit"] = len(roots) - 1
+        self.disturb(v, self.clock.wall_slot())
+        ok, msg = self.submit(0, (self.work / "evidence-kes-period.hex").read_text().strip())
+        res["submitted"] = {"accepted": ok, "reply": msg[:240], "epoch": self.clock.wall_epoch()}
+        self.event("s10_evidence_submitted", accepted=ok, rotations=res["rotations_before_submit"])
+        self.wait_epoch(self.clock.wall_epoch() + 3)
+        view = {}
+        for i in range(self.n):
+            if not self.nodes[i].alive():
+                continue
+            try:
+                view[i] = self.rpc(i, "getvalidator", [v]).get("slashed")
+            except SoakError as err:
+                view[i] = str(err)[:80]
+        res["slashed_view"] = view
+        self.checks.ok("S10 evidence from period p still slashes after two rotations",
+                       res["rotations_before_submit"] >= 2 and ok and bool(view) and all(x is True for x in view.values()),
+                       {k: res[k] for k in ("period", "rotations_before_submit", "submitted", "slashed_view")})
 
     # ── S4 ───────────────────────────────────────────────────────────────
     def crash_mid_swap(self, v, deadline_epoch) -> dict:
