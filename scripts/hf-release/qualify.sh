@@ -193,8 +193,8 @@ run_tests() {
     "$tag" cargo test --workspace --locked --no-fail-fast > "$OUT/tests.log" 2>&1
   trc=$?
   set -e
-  passed=$(grep -E '^test result:' "$OUT/tests.log" | awk '{s+=$4} END{print s+0}')
-  failed=$(grep -E '^test result:' "$OUT/tests.log" | awk '{s+=$6} END{print s+0}')
+  passed=$(awk '/^test result:/{s+=$4} END{print s+0}' "$OUT/tests.log")
+  failed=$(awk '/^test result:/{s+=$6} END{print s+0}' "$OUT/tests.log")
   # Every failing test with the crate of the test binary it ran in:
   # "<crate> <test path>" (crate from cargo's "Running ... (target/debug/deps/<crate>-<hash>)").
   awk '
@@ -291,8 +291,8 @@ fi
 cuts=""
 for item in ${forced[@]+"${forced[@]}"}; do
   read -r label spec <<<"$item"
-  lo=$(echo "$spec" | tr ',' '\n' | cut -d= -f2 | sort -n | head -1)
-  hi=$(echo "$spec" | tr ',' '\n' | cut -d= -f2 | sort -n | tail -1)
+  lo=$(echo "$spec" | tr ',' '\n' | awk -F= 'NR==1||$2<m{m=$2} END{print m}')
+  hi=$(echo "$spec" | tr ',' '\n' | awk -F= 'NR==1||$2>m{m=$2} END{print m}')
   [ $(( (hi + WINDOW) * SLOTS_PER_EPOCH )) -le "$IDX_LAST_SLOT" ] || die "$label: forced e$hi + window $WINDOW is beyond the source head e$IDX_HEAD_EPOCH"
   say "forced set $label: $spec (pre: slots < e$lo, post: slots < e$((hi + WINDOW)))"
   cuts="$cuts $lo $((hi + WINDOW))"
@@ -311,8 +311,8 @@ for c in $cuts; do replay "ref-cut-e$c" "$BIN" "$OUT/data/cut-e$c"; done
 # ── 4. forced builds (serially, in the container) and their replays ───────
 for item in ${forced[@]+"${forced[@]}"}; do
   read -r label spec <<<"$item"
-  lo=$(echo "$spec" | tr ',' '\n' | cut -d= -f2 | sort -n | head -1)
-  hi=$(echo "$spec" | tr ',' '\n' | cut -d= -f2 | sort -n | tail -1)
+  lo=$(echo "$spec" | tr ',' '\n' | awk -F= 'NR==1||$2<m{m=$2} END{print m}')
+  hi=$(echo "$spec" | tr ',' '\n' | awk -F= 'NR==1||$2>m{m=$2} END{print m}')
   d="$OUT/forced/$label"; mkdir -p "$d/tree"
   echo "$lo $((hi + WINDOW)) $spec" > "$d/set"
   git -C "$REPO" archive --format=tar "$COMMIT" | tar -xf - -C "$d/tree"
@@ -410,7 +410,7 @@ else
           echo "FAIL	replayed but head [$post_head] != configured [$ref_post]" > "$d/verdict"
         fi
       elif grep -q 'did not re-apply to its header state root' "$OUT/replay/forced-$label-post.out"; then
-        h="$(grep -h 'apply refused' "$OUT/replay/forced-$label-post/candidate.log" 2>/dev/null | head -1 | cut -c1-160)"
+        h="$(grep -h 'apply refused' "$OUT/replay/forced-$label-post/candidate.log" 2>/dev/null | head -1 | cut -c1-160 || true)"
         last="$(grep -h '^replay ' "$OUT/replay/forced-$label-post/candidate.log" 2>/dev/null | tail -1 | grep -oE 'head slot [0-9]+' || true)"
         echo "PASS	identical before e$lo; after activation a clean consensus rejection (diverged-after-activation; last progress ${last:-n/a}): ${h:-no reason logged}" > "$d/verdict"
       else
