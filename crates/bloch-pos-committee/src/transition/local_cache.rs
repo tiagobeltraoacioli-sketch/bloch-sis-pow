@@ -9,6 +9,11 @@ use crate::header::BlockHeaderV4;
 const LIMIT: u64 = 512 * 1024 * 1024;
 /// Marks the optional trailing L2 settlement section of a cached state.
 const L2_SECTION: &[u8; 16] = b"BPOSST01:L2:v1\0\0";
+/// Marks the optional section after the L2 one (or after the base payload
+/// when there is no L2 state) holding the finality engine's own checkpoint
+/// roots (`params::HF1_OWN_TARGET_VOTES_EPOCH`). Written only when non-empty,
+/// so every earlier cache keeps its bytes.
+const OWN_CHECKPOINT_SECTION: &[u8; 16] = b"BPOSST01:FFGO:v1";
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedState {
     admission_network_domain: Option<[u8; 32]>,
@@ -197,6 +202,20 @@ impl CommittedState {
                 return Err("local cache payload exceeds its limit".into());
             }
         }
+        let own: BTreeMap<u64, [u8; 32]> =
+            finality_engine.own_checkpoints().map(|c| (c.epoch, c.root)).collect();
+        if !own.is_empty() {
+            bytes.extend_from_slice(OWN_CHECKPOINT_SECTION);
+            if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
+                .serialize_into(&mut *bytes, &own) {
+                bytes.truncate(original_len);
+                return Err(error.to_string());
+            }
+            if bytes.len() - original_len > LIMIT as usize {
+                bytes.truncate(original_len);
+                return Err("local cache payload exceeds its limit".into());
+            }
+        }
         Ok(())
     }
 
@@ -258,19 +277,34 @@ impl CommittedState {
     /// neither cached tree nodes nor a raw BlockId deserializer are trusted.
     pub fn decode_local_cache(bytes: &[u8], header: &BlockHeaderV4) -> Result<Self, String> {
         // The reader advances past the base payload; what remains is either
-        // nothing or exactly one L2 section (see `append_local_cache`).
+        // nothing or the optional sections below (see `append_local_cache`).
         let mut rest = bytes;
         let value: CachedState = bincode::DefaultOptions::new().with_limit(LIMIT)
             .deserialize_from(&mut rest).map_err(|e| e.to_string())?;
-        let l2_settlement = if rest.is_empty() {
-            None
-        } else {
-            let section = rest.strip_prefix(L2_SECTION.as_slice())
-                .ok_or("unexpected bytes after the cached state")?;
+        // Optional sections, in this order: L2, then the finality engine's
+        // own checkpoints. Anything else is refused.
+        let l2_settlement = if let Some(mut section) = rest.strip_prefix(L2_SECTION.as_slice()) {
             let l2: crate::l2_settlement::State = bincode::DefaultOptions::new().with_limit(LIMIT)
-                .reject_trailing_bytes().deserialize(section).map_err(|e| e.to_string())?;
+                .deserialize_from(&mut section).map_err(|e| e.to_string())?;
+            rest = section;
             Some(l2.from_local_cache()?)
+        } else {
+            None
         };
+        let own_checkpoints = if let Some(mut section) = rest.strip_prefix(OWN_CHECKPOINT_SECTION.as_slice()) {
+            let roots: BTreeMap<u64, [u8; 32]> = bincode::DefaultOptions::new().with_limit(LIMIT)
+                .deserialize_from(&mut section).map_err(|e| e.to_string())?;
+            if roots.is_empty() {
+                return Err("empty cached own-checkpoint section".into());
+            }
+            rest = section;
+            Some(roots)
+        } else {
+            None
+        };
+        if !rest.is_empty() {
+            return Err("unexpected bytes after the cached state".into());
+        }
         let count = value.eutxos.len();
         let eutxos: EutxoSet = value.eutxos.into_iter().collect();
         if eutxos.entries.by_outpoint.len() != count { return Err("duplicate cached outpoint".into()); }
@@ -291,7 +325,13 @@ impl CommittedState {
             funded_validators: value.funded_validators,
             stake_low_water: value.stake_low_water,
             randao_generations: value.randao_generations,
-            finality_engine: value.finality_engine,
+            finality_engine: {
+                let mut engine = value.finality_engine;
+                if let Some(roots) = own_checkpoints {
+                    engine.restore_own_checkpoints(roots);
+                }
+                engine
+            },
             previous_justified: value.previous_justified,
             pending_votes: value.pending_votes,
             latest_messages: value.latest_messages,

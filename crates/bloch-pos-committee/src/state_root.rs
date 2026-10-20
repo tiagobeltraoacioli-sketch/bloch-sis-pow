@@ -1364,6 +1364,11 @@ pub struct FinalityRecord {
     pub leaked: Vec<LeakRecord>,
     /// Next epoch the engine will accept — the "dense, in-order" clock.
     pub next_epoch: u64,
+    /// The chain's own checkpoint roots the FFG tally reads, any order —
+    /// serialization sorts by epoch. Empty below
+    /// `params::HF1_OWN_TARGET_VOTES_EPOCH`, and then not written at
+    /// all, so every earlier leaf keeps its bytes. At most two entries.
+    pub own_checkpoints: Vec<CheckpointRecord>,
 }
 
 impl FinalityRecord {
@@ -1391,9 +1396,24 @@ impl FinalityRecord {
             s.extend_from_slice(&l.leaked_sat.to_le_bytes());
         }
         s.extend_from_slice(&self.next_epoch.to_le_bytes());
+        // Trailing, tagged, absent while empty: below the gate the leaf is
+        // byte-identical to the one every historical header commits.
+        if !self.own_checkpoints.is_empty() {
+            let mut own = self.own_checkpoints.clone();
+            own.sort_by_key(|c| c.epoch);
+            s.extend_from_slice(OWN_CHECKPOINTS_TAG);
+            s.extend_from_slice(&(own.len() as u64).to_le_bytes());
+            for c in &own {
+                c.write_into(&mut s);
+            }
+        }
         s
     }
 }
+
+/// Marks the optional own-checkpoint section of the finality leaf
+/// (`params::HF1_OWN_TARGET_VOTES_EPOCH`).
+pub const OWN_CHECKPOINTS_TAG: &[u8] = b"BLOCH:FINALITY:OWN-CHECKPOINTS:1";
 
 /// One epoch-boundary vote awaiting the finality tally, committed per entry
 /// under [`TAG_PENDING_VOTE`]. Keyed by `(validator, signing_root)` — exactly
@@ -3245,6 +3265,7 @@ mod tests {
             finalized: CheckpointRecord { epoch: 40, root: val(0x50) },
             leaked: vec![LeakRecord { validator: 3, leaked_sat: 77 }],
             next_epoch: 43,
+            own_checkpoints: Vec::new(),
         };
         let pending_votes: Vec<PendingVoteRecord> = (0..3u32)
             .map(|i| PendingVoteRecord {

@@ -2391,6 +2391,65 @@ pub(crate) mod l2_settlement_rehearsal {
     }
 }
 
+/// FFG counts only votes whose source AND target are checkpoints of the
+/// block's OWN chain (the Ethereum rule). `u64::MAX` means INERT.
+///
+/// Today `finality::FinalityState::process_epoch` tallies by `target_root`
+/// without ancestry: a branch whose blocks carry the other side's votes
+/// justifies and finalizes the other side's checkpoint — a root that is not
+/// on the branch at all. The L2 claim-finality rule (the other half of
+/// hard fork 1) only stops claims from paying against such a finality; this
+/// gate stops the finality itself.
+///
+/// Once armed, for every epoch `e >= ` this value:
+/// - the boundary that opens `e` records the chain's own checkpoint root of
+///   `e` (the parent block: the last block strictly before `e`'s first slot,
+///   the convention `Engine::checkpoint_root` has attesters vote) in the
+///   finality state, keeping only that entry and the current justified
+///   checkpoint's epoch (at most two entries, 80 committed bytes; see
+///   `finality::FinalityState::record_own_checkpoint`);
+/// - the tally of `e` counts a vote only if its `target_root` is the own root
+///   of `e` and its source is the own root of the source epoch. A justified
+///   checkpoint is therefore always the chain's own; a source justified before
+///   the gate has no recorded own root, so its votes still justify but the
+///   link does not finalize it (finality resumes one epoch later, at `e`);
+/// - a vote naming a foreign checkpoint is ABSENT: no quorum weight, it
+///   leaks during a stall and does not recover, and it earns no participation
+///   credit at the boundary (Ethereum: a wrong target forfeits the target
+///   reward and raises the inactivity score). Its inclusion stays valid —
+///   it is still slashing evidence — and the committed participation bit
+///   still records inclusion.
+///
+/// Below the gate nothing is recorded (the finality leaf, hence every state
+/// root, and the local cache are byte-identical) and the tally is the
+/// historical one, so history replays unchanged.
+///
+/// ARMING THIS IS A FOUNDER DECISION: it changes which checkpoints justify,
+/// which is committed state, so the whole fleet must run the new release
+/// before the epoch. `hf1_own_target_votes_gate_is_inert` pins the inert
+/// value.
+pub const HF1_OWN_TARGET_VOTES_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn own_target_votes_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if own_target_votes_test::forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, HF1_OWN_TARGET_VOTES_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod own_target_votes_test {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Candidate ST-16 cancellation path for funded validators that remain in the
 /// activation queue. `u64::MAX` means INERT.
 ///

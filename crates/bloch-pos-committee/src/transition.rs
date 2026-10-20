@@ -2488,6 +2488,26 @@ impl CommittedState {
         Ok(state)
     }
     pub fn l2_settlement(&self) -> Option<&crate::l2_settlement::State> { self.l2_settlement.as_ref() }
+    /// This chain's own checkpoint root of `epoch` as recorded for the FFG
+    /// tally (`params::HF1_OWN_TARGET_VOTES_EPOCH`): `None` below the
+    /// gate and for epochs no longer retained. The node's attester votes this
+    /// root when present, so its vote is exactly what the tally of its own
+    /// head's chain counts.
+    pub fn own_checkpoint_root(&self, epoch: u64) -> Option<[u8; 32]> {
+        self.finality_engine.own_checkpoint_root(epoch)
+    }
+    /// Whether `data` names this chain's own checkpoints: its target is the
+    /// recorded own root of its target epoch, and its source the recorded own
+    /// root of its source epoch when one is recorded (a pre-gate source has
+    /// none; see `finality::FinalityState::process_epoch`). Meaningful only
+    /// from `params::HF1_OWN_TARGET_VOTES_EPOCH`.
+    pub(crate) fn names_own_checkpoints(&self, data: &AttestationData) -> bool {
+        self.finality_engine.own_checkpoint_root(data.target_epoch) == Some(data.target_root)
+            && self
+                .finality_engine
+                .own_checkpoint_root(data.source_epoch)
+                .is_none_or(|root| root == data.source_root)
+    }
 
     pub fn head(&self) -> BlockId {
         self.head
@@ -2854,6 +2874,7 @@ impl CommittedState {
                 .map(|(validator, leaked_sat)| LeakRecord { validator, leaked_sat })
                 .collect(),
             next_epoch: self.finality_engine.next_epoch(),
+            own_checkpoints: self.finality_engine.own_checkpoints().map(cp).collect(),
         };
         // The signing root travels from the accumulation key into the leaf
         // key untouched — computed once, in attestation.rs, never re-derived.
@@ -5317,6 +5338,33 @@ impl CommittedState {
         // naming any other source could not have been cast against this
         // chain's own history).
         let mut valid_credit: BTreeMap<u32, bool> = BTreeMap::new();
+
+        // Own-chain credit (`params::HF1_OWN_TARGET_VOTES_EPOCH`): a
+        // validator whose vote for this epoch names a checkpoint that is not
+        // this chain's own was ABSENT for the tally above (no quorum weight,
+        // leak, no recovery), so it is absent for issuance too — the same
+        // rule, read off the same recorded roots. Credited only if it has a
+        // vote for `closing` and every such vote names own checkpoints (one
+        // foreign vote beside an own one is a double vote: no credit either).
+        // `None` below the gate: credit is exactly what it was.
+        let own_chain_credit: Option<BTreeSet<u32>> =
+            if crate::params::own_target_votes_active(closing) {
+                let mut own: BTreeSet<u32> = BTreeSet::new();
+                let mut foreign: BTreeSet<u32> = BTreeSet::new();
+                for ((validator, _), data) in &st.pending_votes {
+                    if data.target_epoch != closing {
+                        continue;
+                    }
+                    if st.names_own_checkpoints(data) {
+                        own.insert(*validator);
+                    } else {
+                        foreign.insert(*validator);
+                    }
+                }
+                Some(own.difference(&foreign).copied().collect())
+            } else {
+                None
+            };
         if rewards_v2 {
             let mut seen_root: BTreeMap<u32, [u8; 32]> = BTreeMap::new();
             let mut equivocated: BTreeSet<u32> = BTreeSet::new();
@@ -5385,11 +5433,11 @@ impl CommittedState {
                 // gate is active. Credit rules still follow rewards-v2 alone.
                 let (attested, delegated_stake, commission_bps, extra_credit, extra_max) =
                     if let Some(registry) = issuance_registry.as_ref() {
-                        let attested = if rewards_v2 {
+                        let attested = (if rewards_v2 {
                             valid_credit.get(&v.index).copied().unwrap_or(false)
                         } else {
                             st.current_participation.get(&v.index).copied().unwrap_or(false)
-                        };
+                        }) && own_chain_credit.as_ref().is_none_or(|own| own.contains(&v.index));
                         let delegated_stake = registry.stake_of(v.index);
                         let commission_bps =
                             st.validators.get(&v.index).map_or(0, |r| r.commission_bps);
@@ -5397,7 +5445,8 @@ impl CommittedState {
                         let produced = rewards_v2 && *st.current_proposed.get(&v.index).unwrap_or(&false);
                         (attested, delegated_stake, commission_bps, u64::from(scheduled && produced), u64::from(scheduled))
                     } else {
-                        let attested = *st.current_participation.get(&v.index).unwrap_or(&false);
+                        let attested = *st.current_participation.get(&v.index).unwrap_or(&false)
+                            && own_chain_credit.as_ref().is_none_or(|own| own.contains(&v.index));
                         (attested, 0u128, 0u128, 0u64, 0u64)
                     };
                 // The roster's effective stake already includes delegation.
@@ -5631,6 +5680,19 @@ impl CommittedState {
                     st.l2_settlement = Some(state);
                 }
             }
+        }
+        // FFG on this chain only (HF1_OWN_TARGET_VOTES_EPOCH): record this
+        // chain's checkpoint of the epoch being opened in the finality state,
+        // where the tally of that epoch reads it. `head` is still the parent
+        // here — the last block strictly before the new epoch's first slot,
+        // the root `Engine::checkpoint_root` has attesters vote — also across
+        // empty epochs rolled in one block. Independent of L2: finality
+        // exists on every network. After the
+        // closing epoch's tally on purpose — retention keeps the justified
+        // checkpoint that tally produced. Inert below the gate.
+        if crate::params::own_target_votes_active(next_epoch) {
+            let root = *st.head.as_bytes();
+            st.finality_engine.record_own_checkpoint(next_epoch, root);
         }
         // A funded position becomes withdrawable only after both the fixed
         // cool-down and the churn-budget drain have completed. A crowded exit
