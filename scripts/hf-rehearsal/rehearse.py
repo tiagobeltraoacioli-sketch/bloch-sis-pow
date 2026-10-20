@@ -459,20 +459,21 @@ class Rehearsal:
             off_share = sum(live[v] for v in offline) / remaining
             stop_e, start_e = a.hf3 + 3, a.hf3 + 9
             self.wait_epoch(stop_e)
-            before = {v: self.rpc(majority[0], "getvalidator", [v]) for v in offline}
+            ref_v = majority[0]
+            before = {v: self.rpc(majority[0], "getvalidator", [v]) for v in [*offline, ref_v]}
             for v in offline:
                 self.nodes[v].stopped_on_purpose = True
                 self.nodes[v].stop()
             self.event("inactivity_start", offline=offline, offline_share=off_share)
             self.wait_epoch(start_e)
-            after = {v: self.rpc(majority[0], "getvalidator", [v]) for v in offline}
+            after = {v: self.rpc(majority[0], "getvalidator", [v]) for v in [*offline, ref_v]}
             for v in offline:
                 self.nodes[v].start()
                 self.nodes[v].stopped_on_purpose = False
             self.event("inactivity_end")
-            report["inactivity"] = {"offline": offline, "share": off_share,
-                                    "stake_before": {v: (before[v]["own_stake_sat"], before[v]["effective_stake_sat"]) for v in offline},
-                                    "stake_after": {v: (after[v]["own_stake_sat"], after[v]["effective_stake_sat"]) for v in offline}}
+            report["inactivity"] = {"offline": offline, "share": off_share, "online_reference": ref_v,
+                                    "stake_before": {v: (before[v]["own_stake_sat"], before[v]["effective_stake_sat"]) for v in before},
+                                    "stake_after": {v: (after[v]["own_stake_sat"], after[v]["effective_stake_sat"]) for v in after}}
 
             self.wait_epoch(a.stop_epoch)
             report["final_live"] = {i: self.latest(i) for i in range(self.total_nodes)}
@@ -575,9 +576,16 @@ class Rehearsal:
         self.checks.ok("inactivity: finality stalled while > 1/3 stake offline",
                        bool(fins) and fins[-1] - fins[0] <= 1, {"online_fin_values": fins, "offline": offline})
         inact = report.get("inactivity", {})
-        bites = {v: int(inact["stake_before"][v][0]) - int(inact["stake_after"][v][0]) for v in offline}
-        self.checks.ok("inactivity: leak reduced the offline validators' stake", all(x > 0 for x in bites.values()),
-                       {"own_stake_loss_sat": bites})
+        # The leak is a ledger subtracted from the bond: effective = own - leaked.
+        # own_stake keeps compounding issuance, so the bite is the growth of
+        # (own - effective), and an online validator's gap must not grow.
+        def gap(snap, v):
+            return int(snap[v][0]) - int(snap[v][1])
+        bites = {v: gap(inact["stake_after"], v) - gap(inact["stake_before"], v) for v in inact["stake_after"]}
+        ref = inact["online_reference"]
+        self.checks.ok("inactivity: leak bit the offline validators (and not the online reference)",
+                       all(bites[v] > 0 for v in offline) and bites[ref] == 0,
+                       {"leaked_sat_during_window": bites, "online_reference": ref})
         end = {}
         for s in self.window(set(upgraded), start_e + 3, a.stop_epoch + 1):
             end[s["node"]] = s["fin"]

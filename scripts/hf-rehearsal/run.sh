@@ -19,6 +19,8 @@
 #   --past-gate E         where the already-crossed 2884-era flag days land (default 6)
 #   --jobs N              CARGO_BUILD_JOBS (default 4); builds run under nice -n 10
 #   --candidate-bin F --baseline-bin F --arming F   skip the builds
+#   --baseline-bin F alone   reuse a baseline binary, build only the candidate
+#   --build-only          stop after the builds (prints the binaries)
 #
 # Gate override: if the candidate's crates/bloch-pos-node/Cargo.toml declares a
 # feature `hf-rehearsal`, it is built with that feature and
@@ -37,7 +39,7 @@ HERE="$REPO/scripts/hf-rehearsal"
 BASELINE=b4a21fb657d0beb17f64c62889b605c9a7a2d031
 CANDIDATE=""; CANDIDATE_TREE=""; WORK=""; TARGET="$REPO/target/hf-rehearsal"
 HF1=10; HF2=14; HF3=18; PAST=6; JOBS=4
-CBIN=""; BBIN=""; ARMING=""
+CBIN=""; BBIN=""; ARMING=""; BUILD_ONLY=0
 PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -54,6 +56,7 @@ while [ $# -gt 0 ]; do
     --candidate-bin) CBIN="$2"; shift 2;;
     --baseline-bin) BBIN="$2"; shift 2;;
     --arming) ARMING="$2"; shift 2;;
+    --build-only) BUILD_ONLY=1; shift;;
     --) shift; PASS=("$@"); break;;
     -h|--help) sed -n '3,33p' "$0"; exit 0;;
     *) echo "unknown option $1" >&2; exit 2;;
@@ -86,9 +89,11 @@ build() { # $1 src $2 out-binary $3 features
 }
 
 if [ -z "$CBIN" ]; then
-  echo "== baseline $BASELINE"
-  export_ref "$BASELINE" "$BUILD/src-baseline"
-  python3 -I "$HERE/arm.py" "$BUILD/src-baseline" --no-hf --past-gate "$PAST" --report "$BUILD/arming-baseline.json"
+  if [ -z "$BBIN" ]; then
+    echo "== baseline $BASELINE"
+    export_ref "$BASELINE" "$BUILD/src-baseline"
+    python3 -I "$HERE/arm.py" "$BUILD/src-baseline" --no-hf --past-gate "$PAST" --report "$BUILD/arming-baseline.json"
+  fi
   echo "== candidate ${CANDIDATE_TREE:-$CANDIDATE}"
   if [ -n "$CANDIDATE_TREE" ]; then export_tree "$CANDIDATE_TREE" "$BUILD/src-candidate"
   else export_ref "$CANDIDATE" "$BUILD/src-candidate"; fi
@@ -112,10 +117,16 @@ PY
     python3 -I "$HERE/arm.py" "$BUILD/src-candidate" --hf1 "$HF1" --hf2 "$HF2" --hf3 "$HF3" --past-gate "$PAST" \
       --report "$BUILD/arming-candidate.json"
   fi
-  BBIN="$BUILD/bloch-pos-baseline"; CBIN="$BUILD/bloch-pos-candidate"; ARMING="$BUILD/arming-candidate.json"
-  echo "== building baseline (nice, jobs=$JOBS)"; build "$BUILD/src-baseline" "$BBIN" ""
+  CBIN="$BUILD/bloch-pos-candidate"; ARMING="$BUILD/arming-candidate.json"
+  if [ ! -d "$BUILD/src-baseline" ]; then
+    echo "== reusing baseline binary $BBIN (must be built with the same --past-gate)"
+  else
+    BBIN="$BUILD/bloch-pos-baseline"
+    echo "== building baseline (nice, jobs=$JOBS)"; build "$BUILD/src-baseline" "$BBIN" ""
+  fi
   echo "== building candidate (nice, jobs=$JOBS${FEATURES:+, features=$FEATURES})"; build "$BUILD/src-candidate" "$CBIN" "$FEATURES"
 fi
 
+if [ "$BUILD_ONLY" = 1 ]; then echo "built: --baseline-bin $BBIN --candidate-bin $CBIN --arming $ARMING"; exit 0; fi
 exec python3 -I "$HERE/rehearse.py" --candidate-bin "$CBIN" --baseline-bin "$BBIN" ${ARMING:+--arming "$ARMING"} \
   --work "$WORK" --hf1 "$HF1" --hf2 "$HF2" --hf3 "$HF3" "${PASS[@]+"${PASS[@]}"}"
