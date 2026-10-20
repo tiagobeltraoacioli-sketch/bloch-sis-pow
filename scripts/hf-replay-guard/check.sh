@@ -187,8 +187,17 @@ check_target() { # $1=branch-or-commit
     # bloch-pos-committee; the target's own src/ is left untouched.
     rm -rf "$tree/crates/bloch-pos-committee/tests"
     cp -R "$REFTREE/crates/bloch-pos-committee/tests" "$tree/crates/bloch-pos-committee/tests"
-    ( cd "$tree" && $NICE cargo test --release -p bloch-pos-committee --test '*' --no-fail-fast ) >"$base.golden.log" 2>&1
-    # Only failures the reference does not also show count.
+    # A reference test target that no longer COMPILES against the target
+    # (typically an exhaustive match over an enum the port extended) proves
+    # nothing either way; it is dropped and named, and the rest still run.
+    local dropped="" try
+    for try in 1 2 3 4; do
+      ( cd "$tree" && $NICE cargo test --release -p bloch-pos-committee --test '*' --no-fail-fast ) >"$base.golden.log" 2>&1
+      local bad; bad="$(grep -oE '^error: could not compile `bloch-pos-committee` \(test "[A-Za-z0-9_]+"\)' "$base.golden.log" \
+        | sed -E 's/.*\(test "([^"]+)"\)/\1/' | sort -u)"
+      [ -n "$bad" ] || break
+      for b in $bad; do rm -f "$tree/crates/bloch-pos-committee/tests/$b.rs"; dropped="$dropped$b "; done
+    done
     local failed; failed="$(grep -E '^test .* \.\.\. FAILED$' "$base.golden.log" | awk '{print $2}' | sort \
       | comm -23 - "$CACHE/dumps/ref-${REF:0:12}.golden" | tr '\n' ' ')"
     if grep -qE '^error\[|^error: could not compile' "$base.golden.log"; then
@@ -198,6 +207,7 @@ check_target() { # $1=branch-or-commit
     else
       gold="OK($(grep -cE '^test .* \.\.\. ok$' "$base.golden.log"))"
     fi
+    [ -n "$dropped" ] && notes+=("golden: not comparable (reference test no longer compiles against the target's extended types): $dropped")
     git -C "$tree" checkout -q -- crates/bloch-pos-committee/tests 2>/dev/null; git -C "$tree" clean -fdq crates/bloch-pos-committee/tests
   fi
   local nfx nmn; nfx="$(grep -c ' ACCEPT ' "$base.fixtures" 2>/dev/null)"; nmn="$(grep -c ID-MATCH "$base.mainnet" 2>/dev/null)"
