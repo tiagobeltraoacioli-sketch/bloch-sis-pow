@@ -786,9 +786,13 @@ class Rehearsal:
         # (own - effective), and an online validator's gap must not grow.
         def gap(snap, v):
             return int(snap[v][0]) - int(snap[v][1])
-        bites = {v: gap(inact["stake_after"], v) - gap(inact["stake_before"], v) for v in inact["stake_after"]}
-        self.checks.ok("inactivity: leak bit every offline validator", all(bites[v] > 0 for v in offline),
-                       {v: bites[v] for v in offline})
+        # A slashed validator reports null stakes; it has no leak to measure.
+        def numeric(snap, v):
+            return v in snap and all(x is not None for x in snap[v])
+        bites = {v: gap(inact["stake_after"], v) - gap(inact["stake_before"], v) for v in inact["stake_after"]
+                 if v != inact.get("slashed") and numeric(inact["stake_after"], v) and numeric(inact["stake_before"], v)}
+        self.checks.ok("inactivity: leak bit every offline validator", all(bites.get(v, 0) > 0 for v in offline),
+                       {v: bites.get(v) for v in offline})
         # Online reference: only a validator whose OWN node logged an attestation
         # for every epoch in which the leak could charge it ([stop_e-1, start_e])
         # must come out at zero. A node log line is "signed and broadcast", not
@@ -796,7 +800,7 @@ class Rehearsal:
         # make without decoding block bodies. Partial attesters are reported
         # with the epochs they missed, never failed.
         need = set(range(stop_e - 1, start_e + 1))
-        online = [v for v in upgraded if v not in offline and v != inact.get("slashed")]
+        online = [v for v in upgraded if v not in offline and v in bites]
         attested = {v: {int(e) for e in re.findall(r"\] attested \(epoch (\d+)", self.nodes[v].log_text())} & need
                     for v in online}
         full = [v for v in online if attested[v] == need]
