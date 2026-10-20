@@ -365,6 +365,15 @@ class Rehearsal:
                 self.checks.ok("evidence refused while slashing is not yet active",
                                not pre["submitted_before_gate"]["accepted"], pre["submitted_before_gate"])
 
+            # L2 installed at --l2-epoch (< HF1): claim finality must record
+            # nothing before HF1 and the chain's own checkpoint roots after it.
+            l2_snaps = {}
+            if a.l2_epoch is not None:
+                self.wait_epoch(a.hf1 - 1, 16)
+                l2_snaps["pre_hf1"] = self.l2_snapshot()
+                self.wait_epoch(a.hf1, 24)
+                l2_snaps["post_hf1"] = self.l2_snapshot()
+
             # e10 HF1, e11-e13 partition.
             cut, heal = a.hf1 + 1, a.hf1 + 3
             self.wait_epoch(cut)
@@ -375,6 +384,11 @@ class Rehearsal:
             self.wait_epoch(heal)
             self.mesh.heal_between(minority_set, other)
             self.event("partition_heal")
+
+            if a.l2_epoch is not None:
+                self.wait_epoch(a.hf2, 8)
+                l2_snaps["hf2"] = self.l2_snapshot()
+                self.check_l2_claim_finality(l2_snaps, report)
 
             # e15: slashing.
             self.wait_epoch(a.hf2 + 1, 4)
@@ -463,19 +477,21 @@ class Rehearsal:
             off_share = sum(live[v] for v in offline) / remaining
             stop_e, start_e = a.hf3 + 3, a.hf3 + 9
             self.wait_epoch(stop_e)
-            ref_v = majority[0]
-            before = {v: self.rpc(majority[0], "getvalidator", [v]) for v in [*offline, ref_v]}
+            # Snapshot EVERY validator: which online ones count as the reference
+            # is decided afterwards, from what each one actually attested.
+            before = {v: self.rpc(majority[0], "getvalidator", [v]) for v in range(self.n)}
             for v in offline:
                 self.nodes[v].stopped_on_purpose = True
                 self.nodes[v].stop()
             self.event("inactivity_start", offline=offline, offline_share=off_share)
             self.wait_epoch(start_e)
-            after = {v: self.rpc(majority[0], "getvalidator", [v]) for v in [*offline, ref_v]}
+            after = {v: self.rpc(majority[0], "getvalidator", [v]) for v in range(self.n)}
             for v in offline:
                 self.nodes[v].start()
                 self.nodes[v].stopped_on_purpose = False
             self.event("inactivity_end")
-            report["inactivity"] = {"offline": offline, "share": off_share, "online_reference": ref_v,
+            report["inactivity"] = {"offline": offline, "share": off_share, "window": [stop_e, start_e],
+                                    "slashed": slashed_v,
                                     "stake_before": {v: (before[v]["own_stake_sat"], before[v]["effective_stake_sat"]) for v in before},
                                     "stake_after": {v: (after[v]["own_stake_sat"], after[v]["effective_stake_sat"]) for v in after}}
 
@@ -522,6 +538,61 @@ class Rehearsal:
             print(f"VERDICT: {report['status']}  ({sum(c['status']=='PASS' for c in self.checks.rows)} pass, "
                   f"{len(fails)} fail, {sum(c['status']=='SKIP' for c in self.checks.rows)} skip)  report: {self.work/'report.json'}")
         return 1 if report["status"] != "PASS" else 0
+
+    def l2_snapshot(self) -> dict:
+        snap = {"wall_slot": self.clock.wall_slot(), "nodes": {}}
+        for i in range(self.total_nodes):
+            try:
+                r = self.rpc(i, "getl2settlement", timeout=5.0)
+            except SoakError as e:
+                snap["nodes"][i] = {"error": str(e)[:200]}
+                continue
+            snap["nodes"][i] = None if r is None else {
+                "activated": (r.get("profile") or {}).get("activated"),
+                "roots": {int(x["epoch"]): x["root"] for x in r.get("rehearsal_checkpoint_roots", [])}
+                if "rehearsal_checkpoint_roots" in r else None}
+        return snap
+
+    def own_checkpoint_root(self, epoch: int) -> str | None:
+        """The chain's own checkpoint root for `epoch`: the last block strictly
+        before the epoch's first slot (the convention attesters vote)."""
+        for slot in range(epoch * SPE - 1, max(epoch * SPE - 4 * SPE, 0), -1):
+            try:
+                b = self.rpc(0, "getblockbyslot", [slot])
+            except RpcError:
+                continue
+            if b and b.get("slot") == slot:
+                return b["block_id"]
+        return None
+
+    def check_l2_claim_finality(self, snaps: dict, report: dict) -> None:
+        a = self.a
+        up = list(range(self.n))
+        report["l2_claim_finality"] = snaps
+        pre, post, late = snaps["pre_hf1"]["nodes"], snaps["post_hf1"]["nodes"], snaps["hf2"]["nodes"]
+        installed = {i: bool(v and v.get("activated")) for i, v in pre.items()}
+        self.checks.ok(f"L2 installed at e{a.l2_epoch} on every node, the non-upgraded one included",
+                       all(installed.values()), installed)
+        exposed = all(post.get(i) and post[i].get("roots") is not None for i in up)
+        if not exposed:
+            self.checks.add("HF1 claim finality records checkpoint roots", "SKIP",
+                            {"reason": "candidate getl2settlement has no rehearsal_checkpoint_roots "
+                                       "(tree without State::checkpoint_roots, or !expose-l2-checkpoint-roots off)"})
+            return
+        self.checks.ok("HF1 claim finality: no checkpoint root recorded before HF1",
+                       all(pre[i] and pre[i]["roots"] == {} for i in up), {i: pre[i] for i in up})
+        roots = {i: dict(post[i]["roots"], **late[i]["roots"]) for i in up if late.get(i) and late[i].get("roots") is not None}
+        self.checks.ok("HF1 claim finality: roots recorded from HF1 on, at most four kept",
+                       all(post[i]["roots"] and min(post[i]["roots"]) >= a.hf1 for i in up)
+                       and all(len(late[i]["roots"]) <= 4 for i in up if late.get(i) and late[i].get("roots") is not None),
+                       {"post_hf1": {i: post[i]["roots"] for i in up}, "at_hf2": {i: (late.get(i) or {}).get("roots") for i in up}})
+        agree = {}
+        for e in sorted({e for r in roots.values() for e in r}):
+            vals = {r[e] for r in roots.values() if e in r}
+            own = self.own_checkpoint_root(e)
+            agree[e] = {"distinct_across_nodes": len(vals), "own_root": own, "matches_own": vals == {own}}
+        self.checks.ok("HF1 claim finality: every recorded root is the chain's own checkpoint, identical on all nodes",
+                       bool(agree) and all(v["matches_own"] for v in agree.values()), agree)
 
     def kes_rotation(self, report) -> None:
         if not re.search(r"\bkes\b", self.cand_help, re.I):
@@ -586,10 +657,29 @@ class Rehearsal:
         def gap(snap, v):
             return int(snap[v][0]) - int(snap[v][1])
         bites = {v: gap(inact["stake_after"], v) - gap(inact["stake_before"], v) for v in inact["stake_after"]}
-        ref = inact["online_reference"]
-        self.checks.ok("inactivity: leak bit the offline validators (and not the online reference)",
-                       all(bites[v] > 0 for v in offline) and bites[ref] == 0,
-                       {"leaked_sat_during_window": bites, "online_reference": ref})
+        self.checks.ok("inactivity: leak bit every offline validator", all(bites[v] > 0 for v in offline),
+                       {v: bites[v] for v in offline})
+        # Online reference: only a validator whose OWN node logged an attestation
+        # for every epoch in which the leak could charge it ([stop_e-1, start_e])
+        # must come out at zero. A node log line is "signed and broadcast", not
+        # "included and counted"; that is the strongest claim the harness can
+        # make without decoding block bodies. Partial attesters are reported
+        # with the epochs they missed, never failed.
+        need = set(range(stop_e - 1, start_e + 1))
+        online = [v for v in upgraded if v not in offline and v != inact.get("slashed")]
+        attested = {v: {int(e) for e in re.findall(r"\] attested \(epoch (\d+)", self.nodes[v].log_text())} & need
+                    for v in online}
+        full = [v for v in online if attested[v] == need]
+        partial = {v: {"missed_epochs": sorted(need - attested[v]), "leaked_sat": bites[v]}
+                   for v in online if v not in full}
+        ev = {"window_epochs": sorted(need), "fully_attesting": {v: bites[v] for v in full},
+              "partially_attesting": partial}
+        if full:
+            self.checks.ok("inactivity: online validators that attested in every leaking epoch were not charged",
+                           all(bites[v] == 0 for v in full), ev)
+        else:
+            self.checks.add("inactivity: online validators that attested in every leaking epoch were not charged",
+                            "SKIP", dict(ev, reason="no online validator logged an attestation in every window epoch"))
         end = {}
         for s in self.window(set(upgraded), start_e + 3, a.stop_epoch + 1):
             end[s["node"]] = s["fin"]
@@ -719,11 +809,14 @@ def main() -> int:
     ap.add_argument("--stop-epoch", type=int, default=31)
     ap.add_argument("--port-base", type=int, default=27400)
     ap.add_argument("--bind-genesis", action="store_true", help="BPOSMAN2 manifest (default: the format mainnet launched with)")
+    ap.add_argument("--l2-epoch", type=int, help="the L2 install epoch both binaries were built with (run.sh --l2-epoch)")
     a = ap.parse_args()
     if not 8 <= a.validators <= 15:
         sys.exit("--validators must be 8..15 (one relay port block of 16 incl. the observer)")
     if not (4 < a.hf1 < a.hf2 < a.hf3 and a.hf3 + 13 <= a.stop_epoch):
         sys.exit("need 4 < hf1 < hf2 < hf3 and stop-epoch >= hf3 + 13")
+    if a.l2_epoch is not None and not 0 < a.l2_epoch < a.hf1 - 1:
+        sys.exit("--l2-epoch must be before HF1 - 1 (the pre-HF1 snapshot is taken in epoch HF1 - 1)")
     if a.hf2 - a.hf1 < 4 or a.hf3 - a.hf2 < 4:
         sys.exit("leave >= 4 epochs between HF gates (partition / slashing phases live there)")
     return Rehearsal(a).run()

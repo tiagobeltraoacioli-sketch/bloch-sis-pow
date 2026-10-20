@@ -120,6 +120,9 @@ def main() -> int:
         drops: list[str] = []
         for conf_file in (args.conf or [GATES_CONF]):
           for raw in conf_file.read_text().splitlines():
+            if raw.strip() == "!expose-l2-checkpoint-roots":
+                report["expose_l2_checkpoint_roots"] = True
+                continue
             if raw.strip() == "!clock-offset-env":
                 report["clock_offset_env"] = True
                 continue
@@ -208,6 +211,21 @@ def main() -> int:
                                 "            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0))\n}")
         engine.write_text(text.replace(old_fn, new_fn))
         report.setdefault("source_patches", []).append("engine.rs now_ms(): + BLOCH_REHEARSAL_CLOCK_OFFSET_MS")
+
+    if not args.no_hf and report.get("expose_l2_checkpoint_roots"):
+        # Rehearsal copy only: getl2settlement also reports the claim-finality
+        # checkpoint roots (l2_settlement::State::checkpoint_roots), so the
+        # harness can check what HF1 records. Skipped on a tree without them.
+        rpc = root / "crates/bloch-pos-node/src/rpc.rs"
+        anchor = '        ("asynchronous", Json::Bool(l2.asynchronous())), ("native_height", Json::u(l2.height())),\n'
+        text = rpc.read_text()
+        if text.count(anchor) == 1 and "fn checkpoint_roots(&self)" in (root / "crates/bloch-pos-committee/src/l2_settlement.rs").read_text():
+            insert = ('        ("rehearsal_checkpoint_roots", Json::Arr(l2.checkpoint_roots().iter().map(|(e, r)| '
+                      'Json::obj(vec![("epoch", Json::u(*e)), ("root", Json::hex(r))])).collect())),\n')
+            rpc.write_text(text.replace(anchor, insert + anchor))
+            report.setdefault("source_patches", []).append("rpc.rs getl2settlement: + rehearsal_checkpoint_roots")
+        else:
+            print("  note: !expose-l2-checkpoint-roots skipped (no checkpoint_roots accessor or anchor in this tree)")
 
     if not args.no_hf and drops:
         path = root / PARAMS

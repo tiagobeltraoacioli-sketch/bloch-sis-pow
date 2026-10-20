@@ -21,6 +21,9 @@
 #   --candidate-bin F --baseline-bin F --arming F   skip the builds
 #   --baseline-bin F alone   reuse a baseline binary, build only the candidate
 #   --build-only          stop after the builds (prints the binaries)
+#   --l2-epoch E          build BOTH binaries with l2-activation-rehearsal: an L2 state is
+#                         installed at epoch E (choose E < --hf1 so HF1 claim finality has
+#                         an L2 state to record checkpoint roots in)
 #   --driver rehearse|kes  scenario driver (kes: HF3 KES rehearsal, needs --conf kes.conf builds)
 #   --conf FILE           arm.py gate conf (repeatable; default gates.conf), e.g.
 #                         --conf scripts/hf-rehearsal/gates.conf --conf scripts/hf-rehearsal/kes.conf
@@ -42,7 +45,7 @@ HERE="$REPO/scripts/hf-rehearsal"
 BASELINE=b4a21fb657d0beb17f64c62889b605c9a7a2d031
 CANDIDATE=""; CANDIDATE_TREE=""; WORK=""; TARGET="$REPO/target/hf-rehearsal"
 HF1=10; HF2=14; HF3=18; PAST=6; JOBS=4
-CBIN=""; BBIN=""; ARMING=""; BUILD_ONLY=0; CONFS=(); DRIVER=rehearse
+CBIN=""; BBIN=""; ARMING=""; BUILD_ONLY=0; CONFS=(); DRIVER=rehearse; L2EPOCH=""
 PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -62,6 +65,7 @@ while [ $# -gt 0 ]; do
     --build-only) BUILD_ONLY=1; shift;;
     --conf) CONFS+=(--conf "$2"); shift 2;;
     --driver) DRIVER="$2"; shift 2;;
+    --l2-epoch) L2EPOCH="$2"; shift 2;;
     --) shift; PASS=("$@"); break;;
     -h|--help) sed -n '3,33p' "$0"; exit 0;;
     *) echo "unknown option $1" >&2; exit 2;;
@@ -86,7 +90,7 @@ build() { # $1 src $2 out-binary $3 features
   local feat=()
   [ -n "$3" ] && feat=(--features "$3")
   ( cd "$1" && CARGO_TARGET_DIR="$TARGET" CARGO_BUILD_JOBS="$JOBS" \
-      BLOCH_HF1_REHEARSAL_EPOCH="$HF1" BLOCH_HF2_REHEARSAL_EPOCH="$HF2" BLOCH_HF3_REHEARSAL_EPOCH="$HF3" \
+      BLOCH_L2_REHEARSAL_ACTIVATION_EPOCH="${L2EPOCH:-1}" BLOCH_HF1_REHEARSAL_EPOCH="$HF1" BLOCH_HF2_REHEARSAL_EPOCH="$HF2" BLOCH_HF3_REHEARSAL_EPOCH="$HF3" \
       nice -n 10 cargo build --locked --release -p bloch-pos-node --bin bloch-pos ${feat[@]+"${feat[@]}"} ) \
       > "$BUILD/$(basename "$2").build.log" 2>&1 \
     || { echo "build failed: $BUILD/$(basename "$2").build.log" >&2; tail -30 "$BUILD/$(basename "$2").build.log" >&2; exit 1; }
@@ -124,18 +128,20 @@ PY
   fi
   CBIN="$BUILD/bloch-pos-candidate"; ARMING="$BUILD/arming-candidate.json"
   if [ ! -d "$BUILD/src-baseline" ]; then
+    [ -z "$L2EPOCH" ] || { echo "REFUSED: --l2-epoch needs the baseline rebuilt with L2 (drop --baseline-bin)" >&2; exit 2; }
     echo "== reusing baseline binary $BBIN (must be built with the same --past-gate)"
   else
     BBIN="$BUILD/bloch-pos-baseline"
-    echo "== building baseline (nice, jobs=$JOBS)"; build "$BUILD/src-baseline" "$BBIN" ""
+    echo "== building baseline (nice, jobs=$JOBS${L2EPOCH:+, L2 at e$L2EPOCH})"; build "$BUILD/src-baseline" "$BBIN" "${L2EPOCH:+l2-activation-rehearsal}"
   fi
+  if [ -n "$L2EPOCH" ]; then FEATURES="${FEATURES:+$FEATURES,}l2-activation-rehearsal"; fi
   echo "== building candidate (nice, jobs=$JOBS${FEATURES:+, features=$FEATURES})"; build "$BUILD/src-candidate" "$CBIN" "$FEATURES"
 fi
 
 if [ "$BUILD_ONLY" = 1 ]; then echo "built: --baseline-bin $BBIN --candidate-bin $CBIN --arming $ARMING"; exit 0; fi
 case "$DRIVER" in
   rehearse) exec python3 -I "$HERE/rehearse.py" --candidate-bin "$CBIN" --baseline-bin "$BBIN" ${ARMING:+--arming "$ARMING"} \
-              --work "$WORK" --hf1 "$HF1" --hf2 "$HF2" --hf3 "$HF3" "${PASS[@]+"${PASS[@]}"}";;
+              --work "$WORK" --hf1 "$HF1" --hf2 "$HF2" --hf3 "$HF3" ${L2EPOCH:+--l2-epoch "$L2EPOCH"} "${PASS[@]+"${PASS[@]}"}";;
   kes) exec python3 -I "$HERE/kes.py" --candidate-bin "$CBIN" --baseline-bin "$BBIN" ${ARMING:+--arming "$ARMING"} \
               --work "$WORK" "${PASS[@]+"${PASS[@]}"}";;
   *) echo "unknown --driver $DRIVER" >&2; exit 2;;
