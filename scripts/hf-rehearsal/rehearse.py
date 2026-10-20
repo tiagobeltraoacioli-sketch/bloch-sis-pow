@@ -403,9 +403,14 @@ class Rehearsal:
             if hit:
                 slot, q, bid = hit
                 ev = self.work / "evidence-post-activation.hex"
-                post = self.equivocate(q, slot, to=f"127.0.0.1:{self.mesh_port(majority[-1])}", evidence_out=ev)
-                post.update(validator=q, slot=slot, offence_epoch=slot // SPE)
-                self.event("post_activation_offence", **post)
+                try:
+                    post = self.equivocate(q, slot, to=f"127.0.0.1:{self.mesh_port(majority[-1])}", evidence_out=ev)
+                    post.update(validator=q, slot=slot, offence_epoch=slot // SPE)
+                    self.event("post_activation_offence", **post)
+                except SoakError as e:
+                    # Record and continue: the later phases do not depend on it.
+                    post = {"error": str(e)[-600:], "slot": slot, "intended_validator": q}
+                    self.event("post_activation_offence_failed", **post)
             self.checks.ok("post-activation offence injected", bool(post.get("ids")), post)
 
             # e16: 0x0003 spend before HF3 must be refused.
