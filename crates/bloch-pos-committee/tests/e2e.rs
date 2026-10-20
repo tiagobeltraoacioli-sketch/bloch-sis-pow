@@ -373,6 +373,7 @@ mod harness {
                 .map(|(validator, leaked_sat)| LeakRecord { validator, leaked_sat })
                 .collect(),
             next_epoch: s.finality.next_epoch(),
+            finality_set: None,
         };
         let pending_votes: Vec<PendingVoteRecord> = s
             .pending_votes

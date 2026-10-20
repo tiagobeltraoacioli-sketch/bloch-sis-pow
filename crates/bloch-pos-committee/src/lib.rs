@@ -186,7 +186,7 @@ pub use staking::{
 pub use state_root::{
     build_state_tree, state_root, verify_inclusion, BaseFeeRecord, CheckpointRecord,
     ConsensusState, DelegationRecord, DelegatorFeeRecord, DepositQueueRecord, EutxoEntry,
-    FcEquivocatorRecord, FcMessageRecord, FcRecentVoteRecord, FinalityRecord, InclusionProof, LeakRecord,
+    FcEquivocatorRecord, FcMessageRecord, FcRecentVoteRecord, FinalityRecord, FinalitySetRecord, InclusionProof, LeakRecord,
     ParticipationRecord, PendingFeeRecord, PendingVoteRecord, RandaoMix, Smt, STATE_COMPONENT_TAGS,
 };
 pub use header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, DecodeError, VERSION_G4};

@@ -2391,6 +2391,255 @@ pub(crate) mod l2_settlement_rehearsal {
     }
 }
 
+// ── HF1: claim finality + frozen finality set ─────────────────────────────
+//
+// HF1 is made of two consensus rules, each behind its own activation constant:
+//
+// - [`HF1_CLAIM_FINALITY_EPOCH`] (claim finality, "CF"): an L2 withdrawal
+//   claim is final only under a finalized checkpoint that is this chain's own.
+//   It stops the payout consequence of a branch finalizing another branch's
+//   checkpoint. It changes no vote weight and does not affect finality
+//   liveness.
+// - [`HF1_FROZEN_FINALITY_SET_EPOCH`] (frozen finality set, "p1a"): the FFG
+//   quorum is measured against a frozen, unleaked set, so the inactivity leak
+//   can no longer let a minority side of a split finalize on its own.
+//
+// The modelled split shapes reach zero conflicting finalizations and zero
+// double payouts only with both rules active. The dependency is one-way:
+//
+// - The frozen set alone still lets a branch that carries foreign votes
+//   release a claim against a checkpoint that is not on it, so it MUST NOT be
+//   armed without CF: if `HF1_FROZEN_FINALITY_SET_EPOCH` is finite, then
+//   `HF1_CLAIM_FINALITY_EPOCH` is finite and no later
+//   (`HF1_CLAIM_FINALITY_EPOCH <= HF1_FROZEN_FINALITY_SET_EPOCH`; equal is
+//   allowed).
+// - CF alone only removes payouts and is safe to arm on its own (the
+//   leak-driven double finality of long splits remains until the frozen set
+//   is armed, as it does today).
+//
+// `hf1_gates_coherent` encodes this rule; a `const` assertion below makes a
+// build that arms the frozen set without (or before) CF fail to compile, and
+// `hf1_tests` pins the rule itself.
+
+/// Whether a pair of HF1 activation epochs is a valid arming: the frozen set
+/// may be armed only if claim finality is armed at the same epoch or earlier.
+/// Claim finality alone, and both inert, are valid.
+pub const fn hf1_gates_coherent(claim_finality: u64, frozen_set: u64) -> bool {
+    frozen_set == u64::MAX || (claim_finality != u64::MAX && claim_finality <= frozen_set)
+}
+
+// The frozen finality set must never run without claim finality: a build that
+// arms it alone, or before claim finality, does not compile.
+const _: () = assert!(hf1_gates_coherent(HF1_CLAIM_FINALITY_EPOCH, HF1_FROZEN_FINALITY_SET_EPOCH));
+
+/// L2 withdrawal claims (0x16) release only against a finalized checkpoint
+/// that lies on the claim's OWN chain. `u64::MAX` means INERT. HF1: may be
+/// armed alone; must be armed no later than [`HF1_FROZEN_FINALITY_SET_EPOCH`]
+/// (see the HF1 section above).
+///
+/// The rule as it stands (`withdrawal::record_finalized`) compares epochs
+/// only, and the FFG tally (`finality::FinalityState::process_epoch`) counts
+/// votes by `target_root` without asking whether that root is an ancestor of
+/// the block carrying them. In a split, a branch that includes the other
+/// side's votes finalizes the other side's checkpoint and, under the old rule,
+/// releases claims on itself: one withdrawal, a payout on each side
+/// (security review 2026-10-19; reproduced by
+/// `split_claim_releases_on_a_branch_that_finalized_the_other_branchs_checkpoint`).
+///
+/// Once armed, from the first block of this epoch:
+/// - every epoch boundary records the chain's own checkpoint root for the new
+///   epoch (the parent block: the last block strictly before the epoch's
+///   first slot, the convention attesters vote) in the L2 state
+///   (`l2_settlement::State::checkpoint_roots`, committed, at most four
+///   entries);
+/// - a claim is admitted only if, in addition to the old rule, the finalized
+///   checkpoint's root equals this chain's own root at that epoch. Otherwise
+///   it is refused `NotFinalized`, the refusal it already had.
+///
+/// Below the gate nothing is recorded (the L2 committed bytes, hence every
+/// state root, are byte-identical) and claims follow the old rule exactly,
+/// so history replays unchanged. Claims pause from activation until the
+/// first checkpoint recorded under the rule finalizes (~2 epochs on a
+/// healthy chain).
+///
+/// ARMING THIS IS A FOUNDER DECISION: it changes block validity (a claim
+/// that applies today is refused after it), so the whole fleet must run the
+/// new release before the epoch. `native_claim_finality_gate_is_inert` pins
+/// the inert value.
+pub const HF1_CLAIM_FINALITY_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn native_claim_finality_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if native_claim_finality_test::forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, HF1_CLAIM_FINALITY_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod native_claim_finality_test {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+/// Frozen finality set (PoCI port): the FFG quorum is measured against a
+/// validator-set snapshot that the inactivity leak cannot shrink. `u64::MAX`
+/// means INERT. HF1: may be armed only together with, or after,
+/// [`HF1_CLAIM_FINALITY_EPOCH`] (see the HF1 section above).
+///
+/// # The defect
+///
+/// Below this gate `finality::FinalityState::process_epoch` measures two
+/// thirds against the LEAK-ADJUSTED total, floored at one half of the unleaked
+/// total. The leak ledger is a function of the votes each branch included, so
+/// in a split each side discounts the other and is measured against its own
+/// smaller total: any side holding at least one third of the stake finalizes
+/// alone after a long enough stall (2026-10-13 mainnet split, 2026-10-17
+/// devnet4 three-way split; pinned by
+/// `finality::tests::disjoint_one_third_partitions_finalize_conflicting_checkpoints_without_equivocation`).
+///
+/// # The rule, once armed
+///
+/// - The quorum is `3 x weight >= 2 x total(C)` where `C` is the FINALITY SET:
+///   a frozen `(validator, stake)` map. Votes count with their `C` weight,
+///   unleaked; a voter outside `C` counts zero; the leak never touches `C`.
+///   Two disjoint sides would each need two thirds of one fixed total, so at
+///   most one side of any split can justify (hence finalize).
+/// - `C` changes only through a FINALIZED HANDOFF: when the checkpoint of
+///   epoch `f` finalizes under `C`, the candidate snapshotted at `f` (the
+///   duty roster of `f`, minus members absent for
+///   [`NATIVE_FINALITY_SET_PRUNE_AFTER_EPOCHS`]) becomes `C`. Absence pruning
+///   is therefore authorized by two thirds of the old set, never by a local
+///   timeout; a pruned validator rejoins automatically once one of its votes
+///   is included again (next finalized handoff).
+/// - The inactivity leak keeps accruing and keeps reducing proposer weight
+///   and rewards; it no longer buys finality back. If more than one third of
+///   `C` vanishes at once finality HALTS until that stake returns or a
+///   coordinated release names a recovery epoch in
+///   [`NATIVE_FINALITY_SET_RECOVERY_EPOCHS`].
+///
+/// Below the gate nothing changes: the extra state is absent, the committed
+/// finality leaf is byte-identical, and history replays unchanged.
+///
+/// ARMING THIS IS A FOUNDER DECISION. It trades the leak's liveness rescue
+/// for partition safety, and the activation epoch must be reached by a
+/// finalizing chain (the first set is the duty roster at that epoch).
+pub const HF1_FROZEN_FINALITY_SET_EPOCH: u64 = u64::MAX;
+
+/// Absence pruning horizon of the finality set: a member with no included
+/// epoch vote for this many epochs is left out of the next handoff. 90
+/// epochs x 32 slots x 30 s = 24 h, the PoCI `PRUNE_AFTER` duration.
+pub const NATIVE_FINALITY_SET_PRUNE_AFTER_EPOCHS: u64 = 90;
+
+/// Manual recovery from a finality halt (more than one third of the finality
+/// set gone for good). At each listed epoch the finality set is re-formed
+/// from that epoch's duty roster minus members absent for
+/// [`NATIVE_FINALITY_SET_PRUNE_AFTER_EPOCHS`], WITHOUT a finalized handoff.
+///
+/// This is the only path that bypasses the old set's authorization, so it is
+/// a coordinated release, never automatic: the release names the epoch, and
+/// operators also pin the surviving branch with a weak-subjectivity
+/// checkpoint so every node re-forms the set on the same history. Empty
+/// means no recovery has ever been used.
+pub const NATIVE_FINALITY_SET_RECOVERY_EPOCHS: &[u64] = &[];
+
+pub(crate) fn native_finality_set_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if let Some(armed) = native_finality_set_test::armed_at() {
+        return epoch >= armed;
+    }
+    epoch_gate_active(epoch, HF1_FROZEN_FINALITY_SET_EPOCH)
+}
+
+pub(crate) fn native_finality_set_recovery_at(epoch: u64) -> bool {
+    #[cfg(test)]
+    if native_finality_set_test::recovery_at(epoch) {
+        return true;
+    }
+    NATIVE_FINALITY_SET_RECOVERY_EPOCHS.contains(&epoch)
+}
+
+#[cfg(test)]
+pub(crate) mod native_finality_set_test {
+    use std::cell::{Cell, RefCell};
+    thread_local! {
+        static ARMED: Cell<Option<u64>> = const { Cell::new(None) };
+        static RECOVERY: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+    pub fn armed_at() -> Option<u64> { ARMED.with(Cell::get) }
+    pub fn recovery_at(epoch: u64) -> bool { RECOVERY.with(|r| r.borrow().contains(&epoch)) }
+    /// Arm the gate at `epoch` for this thread until the guard drops.
+    pub fn arm_at(epoch: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore { fn drop(&mut self) { ARMED.with(|v| v.set(self.0)); } }
+        Restore(ARMED.with(|v| v.replace(Some(epoch))))
+    }
+    /// Arm from genesis.
+    pub fn open() -> impl Drop { arm_at(0) }
+    /// Schedule test-only recovery epochs until the guard drops.
+    pub fn recovery(epochs: &[u64]) -> impl Drop {
+        struct Restore(Vec<u64>);
+        impl Drop for Restore {
+            fn drop(&mut self) { RECOVERY.with(|r| *r.borrow_mut() = std::mem::take(&mut self.0)); }
+        }
+        Restore(RECOVERY.with(|r| r.replace(epochs.to_vec())))
+    }
+}
+
+#[cfg(test)]
+mod hf1_tests {
+    use super::*;
+
+    #[test]
+    fn hf1_ships_inert_as_a_whole() {
+        assert_eq!(HF1_CLAIM_FINALITY_EPOCH, u64::MAX);
+        assert_eq!(HF1_FROZEN_FINALITY_SET_EPOCH, u64::MAX);
+        assert!(hf1_gates_coherent(HF1_CLAIM_FINALITY_EPOCH, HF1_FROZEN_FINALITY_SET_EPOCH));
+        for epoch in [0, 5_850, 8_610, 8_616, u64::MAX - 1, u64::MAX] {
+            assert!(!native_claim_finality_active(epoch));
+            assert!(!native_finality_set_active(epoch));
+        }
+    }
+
+    #[test]
+    fn hf1_frozen_set_requires_claim_finality_no_later() {
+        let m = u64::MAX;
+        // Both inert; claim finality alone; both armed, claim finality first
+        // or at the same epoch.
+        assert!(hf1_gates_coherent(m, m));
+        assert!(hf1_gates_coherent(8_610, m));
+        assert!(hf1_gates_coherent(0, m));
+        assert!(hf1_gates_coherent(8_610, 8_610));
+        assert!(hf1_gates_coherent(8_610, 8_616));
+        assert!(hf1_gates_coherent(0, m - 1));
+        // Frozen set alone.
+        assert!(!hf1_gates_coherent(m, 8_616));
+        assert!(!hf1_gates_coherent(m, 0));
+        assert!(!hf1_gates_coherent(m, m - 1));
+        // Frozen set before claim finality.
+        assert!(!hf1_gates_coherent(8_616, 8_610));
+        assert!(!hf1_gates_coherent(1, 0));
+    }
+
+    /// Once both are armed at a coherent pair, no epoch has the frozen set
+    /// active without claim finality.
+    #[test]
+    fn hf1_frozen_set_never_runs_without_claim_finality() {
+        for (cf, fs) in [(8_610u64, 8_616u64), (8_610, 8_610), (8_610, u64::MAX), (8_610, 20_000)] {
+            assert!(hf1_gates_coherent(cf, fs));
+            for epoch in cf.saturating_sub(4)..cf + 64 {
+                assert!(!epoch_gate_active(epoch, fs) || epoch_gate_active(epoch, cf), "epoch {epoch}");
+            }
+        }
+    }
+}
+
 /// Candidate ST-16 cancellation path for funded validators that remain in the
 /// activation queue. `u64::MAX` means INERT.
 ///

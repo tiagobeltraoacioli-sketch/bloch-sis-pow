@@ -2899,28 +2899,54 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
         // settlements that added withdrawals (M4), oldest first.
         ("withdrawals", {
             let (root, count) = l2.withdrawal_head();
+            // `finalized` everywhere below is the consensus predicate a claim
+            // in the next block must pass (from finalized_claims_from_height
+            // on): the accepting block is in the FFG-finalized prefix and,
+            // once the native-claim-finality rule is armed, the finalized
+            // checkpoint is this chain's own. "matured" alone is only the
+            // delay; a matured record that is not finalized is refused.
+            let finalized = |height: u64| state.l2_record_finalized_for_claim(height);
+            let next = l2.height().saturating_add(1);
+            let gate = |r: &bloch_pos_committee::l2_settlement::withdrawal::Record, sats: u64| {
+                r.height.saturating_add(l2.limits().delay_for(sats)) <= next
+            };
+            let record = |r: &bloch_pos_committee::l2_settlement::withdrawal::Record| Json::obj(vec![
+                ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
+                ("count", Json::u(r.count)), ("height", Json::u(r.height)),
+                ("finalized", Json::Bool(finalized(r.height))),
+            ]);
+            // The newest record a claim of that size can prove against in
+            // the next block: matured AND finalized.
+            let claimable = |sats: u64| l2.withdrawal_roots().iter().rev()
+                .find(|r| gate(r, sats) && finalized(r.height))
+                .map_or(Json::Null, record);
+            let fin = state.finality().finalized;
             Json::obj(vec![
                 ("root", Json::hex(&root)), ("count", Json::u(count)),
-                // `finalized`: the accepting block is in the FFG-finalized
-                // prefix, which a claim in the next block requires (from
-                // finalized_claims_from_height on).
-                ("roots", Json::Arr(l2.withdrawal_roots().iter().map(|r| Json::obj(vec![
-                    ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
-                    ("count", Json::u(r.count)), ("height", Json::u(r.height)),
-                    ("finalized", Json::Bool(bloch_pos_committee::l2_settlement::withdrawal::record_finalized(
-                        r.height, l2.height(), state.slot(), state.finality().finalized.epoch,
-                    ))),
-                ])).collect())),
+                ("roots", Json::Arr(l2.withdrawal_roots().iter().map(record).collect())),
                 ("finalized_claims_from_height", Json::u(l2.profile().finalized_claims_from_height)),
+                // The finalized checkpoint claims rely on, and this chain's
+                // own root at its epoch (null before the rule records one).
+                // `own_root` != `root` means this node's chain carries a
+                // finality that is not its own: treat claims as unsafe.
+                ("finalized_checkpoint", Json::obj(vec![
+                    ("epoch", Json::u(fin.epoch)), ("root", Json::hex(&fin.root)),
+                    ("own_root", l2.checkpoint_root(fin.epoch).map_or(Json::Null, |r| Json::hex(&r))),
+                    ("own_chain_rule_active", Json::Bool(bloch_pos_committee::params::epoch_gate_active(
+                        bloch_pos_committee::epoch_of(state.slot()),
+                        bloch_pos_committee::params::HF1_CLAIM_FINALITY_EPOCH,
+                    ))),
+                ])),
+                ("claimable", claimable(0)),
+                ("claimable_large", claimable(l2.limits().large_claim_sat)),
                 // M5 claims: the newest root a claim in the next block may
                 // prove against, and the nullifier set as its frontier
                 // (words below `floor` fully claimed; `words` maps a 256-leaf
                 // word index to its bitmap, bit i of byte j = leaf 256w+8j+i).
                 ("delay_blocks", Json::u(l2.limits().delay_blocks)),
-                ("matured", l2.matured_withdrawals().map_or(Json::Null, |r| Json::obj(vec![
-                    ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
-                    ("count", Json::u(r.count)), ("height", Json::u(r.height)),
-                ]))),
+                // Delay only. Use `claimable`: a matured root whose
+                // `finalized` is false is refused NotFinalized.
+                ("matured", l2.matured_withdrawals().map_or(Json::Null, |r| record(&r))),
                 ("claimed", Json::obj(vec![
                     ("count", Json::u(l2.claimed().claims())), ("floor", Json::u(l2.claimed().floor())),
                     ("words", Json::Arr(l2.claimed().words().map(|(w, bits)| Json::obj(vec![
@@ -2935,10 +2961,7 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
                 ("large_claim_sat", Json::sat(u128::from(l2.limits().large_claim_sat))),
                 ("large_delay_blocks", Json::u(l2.limits().large_delay_blocks)),
                 ("retention_blocks", Json::u(l2.limits().retention_blocks)),
-                ("matured_large", l2.matured_large_withdrawals().map_or(Json::Null, |r| Json::obj(vec![
-                    ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
-                    ("count", Json::u(r.count)), ("height", Json::u(r.height)),
-                ]))),
+                ("matured_large", l2.matured_large_withdrawals().map_or(Json::Null, |r| record(&r))),
                 ("release_window", {
                     let w = l2.release_window();
                     Json::obj(vec![

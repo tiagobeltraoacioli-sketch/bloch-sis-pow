@@ -9,6 +9,14 @@ use crate::header::BlockHeaderV4;
 const LIMIT: u64 = 512 * 1024 * 1024;
 /// Marks the optional trailing L2 settlement section of a cached state.
 const L2_SECTION: &[u8; 16] = b"BPOSST01:L2:v1\0\0";
+/// Marks the optional section after the L2 one holding the L2 state's own
+/// checkpoint roots (`params::HF1_CLAIM_FINALITY_EPOCH`).
+/// Written only when non-empty, so every earlier cache keeps its bytes.
+const L2_CHECKPOINT_SECTION: &[u8; 16] = b"BPOSST01:L2CP:v1";
+/// Marks the optional LAST section: the frozen finality set
+/// (`params::HF1_FROZEN_FINALITY_SET_EPOCH`). Written only once the
+/// gate has created it, so every earlier cache keeps its bytes.
+const FINALITY_SET_SECTION: &[u8; 16] = b"BPOSST01:FSET:v1";
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedState {
     admission_network_domain: Option<[u8; 32]>,
@@ -192,6 +200,26 @@ impl CommittedState {
                 bytes.truncate(original_len);
                 return Err(error.to_string());
             }
+            if !l2.checkpoint_roots().is_empty() {
+                bytes.extend_from_slice(L2_CHECKPOINT_SECTION);
+                if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
+                    .serialize_into(&mut *bytes, l2.checkpoint_roots()) {
+                    bytes.truncate(original_len);
+                    return Err(error.to_string());
+                }
+            }
+            if bytes.len() - original_len > LIMIT as usize {
+                bytes.truncate(original_len);
+                return Err("local cache payload exceeds its limit".into());
+            }
+        }
+        if let Some(fs) = finality_engine.finality_set() {
+            bytes.extend_from_slice(FINALITY_SET_SECTION);
+            if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
+                .serialize_into(&mut *bytes, fs) {
+                bytes.truncate(original_len);
+                return Err(error.to_string());
+            }
             if bytes.len() - original_len > LIMIT as usize {
                 bytes.truncate(original_len);
                 return Err("local cache payload exceeds its limit".into());
@@ -262,15 +290,35 @@ impl CommittedState {
         let mut rest = bytes;
         let value: CachedState = bincode::DefaultOptions::new().with_limit(LIMIT)
             .deserialize_from(&mut rest).map_err(|e| e.to_string())?;
-        let l2_settlement = if rest.is_empty() {
-            None
-        } else {
-            let section = rest.strip_prefix(L2_SECTION.as_slice())
+        // Optional sections, in their only legal order: L2 [L2CP], then FSET.
+        let mut l2_settlement = None;
+        if !rest.is_empty() && !rest.starts_with(FINALITY_SET_SECTION) {
+            let mut section = rest.strip_prefix(L2_SECTION.as_slice())
                 .ok_or("unexpected bytes after the cached state")?;
-            let l2: crate::l2_settlement::State = bincode::DefaultOptions::new().with_limit(LIMIT)
-                .reject_trailing_bytes().deserialize(section).map_err(|e| e.to_string())?;
-            Some(l2.from_local_cache()?)
-        };
+            let mut l2: crate::l2_settlement::State = bincode::DefaultOptions::new().with_limit(LIMIT)
+                .deserialize_from(&mut section).map_err(|e| e.to_string())?;
+            if !section.is_empty() && !section.starts_with(FINALITY_SET_SECTION) {
+                let mut roots_section = section.strip_prefix(L2_CHECKPOINT_SECTION.as_slice())
+                    .ok_or("unexpected bytes after the cached L2 state")?;
+                let roots: BTreeMap<u64, [u8; 32]> = bincode::DefaultOptions::new().with_limit(LIMIT)
+                    .deserialize_from(&mut roots_section).map_err(|e| e.to_string())?;
+                if roots.is_empty() {
+                    return Err("empty cached L2 checkpoint-root section".into());
+                }
+                l2.restore_checkpoint_roots(roots);
+                section = roots_section;
+            }
+            l2_settlement = Some(l2.from_local_cache()?);
+            rest = section;
+        }
+        let mut finality_engine = value.finality_engine;
+        if !rest.is_empty() {
+            let fs_section = rest.strip_prefix(FINALITY_SET_SECTION.as_slice())
+                .ok_or("unexpected bytes after the cached L2 state")?;
+            let fs: finality::FinalitySetState = bincode::DefaultOptions::new().with_limit(LIMIT)
+                .reject_trailing_bytes().deserialize(fs_section).map_err(|e| e.to_string())?;
+            finality_engine.restore_finality_set(Some(fs));
+        }
         let count = value.eutxos.len();
         let eutxos: EutxoSet = value.eutxos.into_iter().collect();
         if eutxos.entries.by_outpoint.len() != count { return Err("duplicate cached outpoint".into()); }
@@ -291,7 +339,7 @@ impl CommittedState {
             funded_validators: value.funded_validators,
             stake_low_water: value.stake_low_water,
             randao_generations: value.randao_generations,
-            finality_engine: value.finality_engine,
+            finality_engine,
             previous_justified: value.previous_justified,
             pending_votes: value.pending_votes,
             latest_messages: value.latest_messages,

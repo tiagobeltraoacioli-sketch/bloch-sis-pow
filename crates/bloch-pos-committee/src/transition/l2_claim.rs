@@ -395,6 +395,24 @@ impl L2WithdrawClaim {
 }
 
 impl CommittedState {
+    /// Whether the withdrawal record accepted at native height
+    /// `record_height` is final for a claim, as consensus judges it: in the
+    /// FFG-finalized prefix by [`withdrawal::record_finalized`] and, from
+    /// [`crate::params::HF1_CLAIM_FINALITY_EPOCH`], under a
+    /// finalized checkpoint that is this chain's OWN checkpoint at its epoch
+    /// (a branch can finalize a checkpoint of another branch whose votes it
+    /// carries; that finality says nothing about this branch).
+    ///
+    /// Read during a block's transactions (`self` is the parent rolled to the
+    /// block's epoch) and by tooling on the head state.
+    pub fn l2_record_finalized_for_claim(&self, record_height: u64) -> bool {
+        let Some(l2) = self.l2_settlement.as_ref() else { return false };
+        let finalized = self.finality_view().finalized;
+        withdrawal::record_finalized(record_height, l2.height(), self.slot, finalized.epoch)
+            && (!crate::params::native_claim_finality_active(self.epoch)
+                || l2.checkpoint_root(finalized.epoch) == Some(finalized.root))
+    }
+
     /// Why this state would refuse `tx` in the next block, checking
     /// everything except the signatures (the mempool verified those). For
     /// logs and tooling: the block transition reports a refused claim only as
@@ -441,7 +459,7 @@ impl CommittedState {
         // and the L2 state the parent's native height; the claim's block is
         // the next one.
         if l2.height().saturating_add(1) >= l2.profile().finalized_claims_from_height
-            && !withdrawal::record_finalized(record.height, l2.height(), self.slot, self.finality_view().finalized.epoch)
+            && !self.l2_record_finalized_for_claim(record.height)
         {
             return Err(R::NotFinalized);
         }

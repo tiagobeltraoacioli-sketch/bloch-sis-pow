@@ -3225,4 +3225,293 @@ mod l2_tests {
         assert!(unchanged.apply_transaction(&PosTransaction::L2SettlementAsync(Box::new(wrong_source)), 0, 1, &RealProof).is_err());
         assert_eq!(unchanged, pre);
     }
+
+
+    // ── Claim finality must lie on the claim's own chain (2026-10-19) ──
+    //
+    // `wd::record_finalized` compares EPOCHS only, and the FFG tally counts
+    // votes by `target_root` without asking whether that root is on the
+    // branch that carries them. A minority branch that includes the
+    // majority's votes therefore finalizes the MAJORITY's checkpoint and,
+    // under the rule as it stands, releases claims on itself: the same
+    // withdrawal pays out on both sides of a split.
+    mod split_claims {
+        use super::*;
+        type Vote = crate::attestation::Attestation;
+
+        /// The fixture's RANDAO chains, regenerated at the same positions, so
+        /// a second branch can be proposed from the same parent.
+        pub(super) fn fork_chains(chains: &[RandaoChain]) -> Vec<RandaoChain> {
+            chains
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let mut seed = [0u8; 32];
+                    seed[0] = i as u8;
+                    seed[1] = 0x5A;
+                    let mut f = RandaoChain::generate(seed);
+                    for _ in 0..crate::params::RANDAO_CHAIN_LENGTH - c.remaining() {
+                        f.next_reveal().unwrap();
+                    }
+                    assert_eq!(f.remaining(), c.remaining());
+                    f
+                })
+                .collect()
+        }
+
+        pub(super) fn block_with(
+            pre: &CommittedState,
+            slot: u64,
+            atts: &[Vote],
+            txs: &[PosTransaction],
+            chains: &mut [RandaoChain],
+        ) -> Result<CommittedState, TransitionError> {
+            let t = Transition::new(ProofDouble);
+            let b = build_block(&t, pre, slot, atts, txs, chains);
+            t.apply_block(pre, &b, atts, txs)
+        }
+
+        /// One parent: the funded network just after its L2 flag day (the
+        /// activated profile admits claims on every build; first block of
+        /// epoch 1), holding a withdrawal record at native height 1 of a
+        /// 3-leaf tree, matured, with escrow behind it. The native height is
+        /// advanced far past the record (as `matured_claim_fixture` does), so
+        /// the slot bound of `wd::record_finalized` passes as soon as the
+        /// record's epoch is final: the test isolates WHICH checkpoint is.
+        pub(super) fn parent() -> (CommittedState, Vec<RandaoChain>) {
+            let (mut pre, chains) = activated_fixture(true, [0; 32]);
+            let l2 = pre.l2_settlement.as_mut().unwrap();
+            l2.append_deposit(crate::l2_settlement::InboxRecord {
+                height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 300 * BLCH, recipient: [0x42; 20],
+            })
+            .unwrap();
+            l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&wleaves(3)), count: 3, height: 1 });
+            let until = 1 + 4 * l2.limits().large_delay_blocks;
+            for _ in l2.height()..until {
+                l2.advance_height().unwrap();
+            }
+            assert_eq!(l2.matured_count(), 3);
+            assert_eq!(pre.epoch, 1);
+            (pre, chains)
+        }
+
+        pub(super) struct Split {
+            pub a: CommittedState,
+            pub b: CommittedState,
+            pub ca: Vec<RandaoChain>,
+            pub cb: Vec<RandaoChain>,
+            pub a_cp: [u8; 32],
+            pub b_cp: [u8; 32],
+        }
+
+        /// The epoch whose checkpoint the split finalizes.
+        pub(super) const E: u64 = 2;
+        const fn first(epoch: u64) -> u64 {
+            epoch * crate::params::SLOTS_PER_EPOCH
+        }
+
+        /// Branch A takes the slot before epoch E, branch B the one before
+        /// that, both children of the parent: their epoch-E checkpoints (the
+        /// last block before E's first slot, the convention
+        /// `Engine::checkpoint_root` votes) differ. Every vote of epochs E
+        /// and E+1 targets A's checkpoints, and B's blocks carry those votes
+        /// too: the 2026-10-13 shape, a branch that hears the other side's
+        /// attestations. After the first block of E+2 BOTH branches have
+        /// finalized (E, A's checkpoint).
+        pub(super) fn split() -> Split {
+            let (p, mut ca) = parent();
+            let mut cb = fork_chains(&ca);
+            let a = block_with(&p, first(E) - 1, &[], &[], &mut ca).unwrap();
+            let b = block_with(&p, first(E) - 2, &[], &[], &mut cb).unwrap();
+            let (a_cp, b_cp) = (*a.head.as_bytes(), *b.head.as_bytes());
+            assert_ne!(a_cp, b_cp);
+
+            // Epoch E: votes for A's checkpoint, on both branches.
+            let a = block_with(&a, first(E), &[], &[], &mut ca).unwrap();
+            let b = block_with(&b, first(E) + 1, &[], &[], &mut cb).unwrap();
+            let va = full_epoch_attestations(&a, a_cp);
+            let vb = full_epoch_attestations(&b, a_cp);
+            let a = block_with(&a, first(E + 1) - 1, &va, &[], &mut ca).unwrap();
+            let b = block_with(&b, first(E + 1) - 1, &vb, &[], &mut cb).unwrap();
+            let a_next = *a.head.as_bytes();
+
+            // Epoch E+1: votes for A's next checkpoint, sourcing (E, A's).
+            let a = block_with(&a, first(E + 1), &[], &[], &mut ca).unwrap();
+            let b = block_with(&b, first(E + 1), &[], &[], &mut cb).unwrap();
+            assert_eq!(b.finality().justified, Checkpoint { epoch: E, root: a_cp });
+            let va = full_epoch_attestations(&a, a_next);
+            let vb = full_epoch_attestations(&b, a_next);
+            let a = block_with(&a, first(E + 2) - 1, &va, &[], &mut ca).unwrap();
+            let b = block_with(&b, first(E + 2) - 1, &vb, &[], &mut cb).unwrap();
+            let a = block_with(&a, first(E + 2), &[], &[], &mut ca).unwrap();
+            let b = block_with(&b, first(E + 2), &[], &[], &mut cb).unwrap();
+
+            let fin = Checkpoint { epoch: E, root: a_cp };
+            assert_eq!(a.finality().finalized, fin);
+            assert_eq!(b.finality().finalized, fin, "B finalized A's checkpoint, which is not on B");
+            Split { a, b, ca, cb, a_cp, b_cp }
+        }
+
+        /// The slot of the claim block on either branch.
+        pub(super) const CLAIM_SLOT: u64 = first(E + 2) + 1;
+
+        pub(super) fn claim_on(state: &CommittedState) -> L2WithdrawClaim {
+            claim_tx(state, ([0x33; 32], 0), FUNDED, 3, 2)
+        }
+    }
+
+    /// REPRODUCTION (rules as they stand, i.e. below
+    /// `HF1_CLAIM_FINALITY_EPOCH`, which history replays
+    /// under): branch B finalizes A's epoch-E checkpoint and the claim
+    /// releases on B, and on A. One withdrawal, two payouts, one per side of
+    /// the split.
+    #[test]
+    fn split_claim_releases_on_a_branch_that_finalized_the_other_branchs_checkpoint() {
+        let split_claims::Split { a, b, mut ca, mut cb, a_cp, b_cp } = split_claims::split();
+        assert_ne!(a_cp, b_cp);
+        let (recipient, sats) = wleaf(2);
+        for (state, chains, name) in [(&a, &mut ca, "A"), (&b, &mut cb, "B")] {
+            let tx = split_claims::claim_on(state);
+            assert_eq!(state.l2_withdraw_claim_refusal(&tx), None, "claim admissible on {name}");
+            let before = state.balance_sat(&recipient);
+            let post = split_claims::block_with(state, split_claims::CLAIM_SLOT, &[], &[claim(&tx)], chains)
+                .unwrap_or_else(|e| panic!("claim block on {name}: {e:?}"));
+            assert_eq!(post.balance_sat(&recipient), before + u128::from(sats), "paid on {name}");
+        }
+    }
+
+    /// AFTER `HF1_CLAIM_FINALITY_EPOCH`: the same split, the
+    /// same votes, the same finality on both branches — and the claim pays
+    /// only on A, the branch whose own checkpoint was finalized. On B it is
+    /// refused `NotFinalized`, in the mempool check and in a block.
+    const CP_TAG: &[u8] = b"BLOCH:NATIVE:L2:CHECKPOINT-ROOTS:1";
+
+    #[test]
+    fn split_claim_is_refused_where_the_finalized_checkpoint_is_not_the_chains_own() {
+        let _rule = crate::params::native_claim_finality_test::open();
+        let split_claims::Split { a, b, mut ca, mut cb, a_cp, b_cp } = split_claims::split();
+        let e = split_claims::E;
+        // Each branch recorded ITS OWN checkpoint of the finalized epoch.
+        assert_eq!(a.l2_settlement().unwrap().checkpoint_root(e), Some(a_cp));
+        assert_eq!(b.l2_settlement().unwrap().checkpoint_root(e), Some(b_cp));
+        for st in [&a, &b] {
+            assert!(st.l2_settlement().unwrap().checkpoint_roots().len() <= 4);
+            assert!(st.l2_settlement().unwrap().committed_bytes()
+                .windows(CP_TAG.len()).any(|w| w == CP_TAG));
+        }
+
+        // B: refused, and a block carrying it is invalid.
+        let tx = split_claims::claim_on(&b);
+        assert_eq!(b.l2_withdraw_claim_refusal(&tx), Some(ClaimReject::NotFinalized));
+        let (recipient, sats) = wleaf(2);
+        let before_b = b.balance_sat(&recipient);
+        let b_post = refuse_then_apply(&b, split_claims::CLAIM_SLOT, &[claim(&tx)], 0, &[], &mut cb);
+        assert_eq!(b_post.balance_sat(&recipient), before_b);
+
+        // A: unchanged, it pays.
+        let tx = split_claims::claim_on(&a);
+        assert_eq!(a.l2_withdraw_claim_refusal(&tx), None);
+        let before_a = a.balance_sat(&recipient);
+        let a_post = split_claims::block_with(&a, split_claims::CLAIM_SLOT, &[], &[claim(&tx)], &mut ca)
+            .expect("the claim pays on the branch whose checkpoint is final");
+        assert_eq!(a_post.balance_sat(&recipient), before_a + u128::from(sats));
+
+        // The roots survive the restart cache (their own trailing section).
+        #[cfg(feature = "local-state-cache")]
+        {
+            let (_, bytes, _) = local_cache_round_trip(&a_post);
+            assert!(bytes.windows(16).any(|w| w == b"BPOSST01:L2CP:v1"));
+        }
+    }
+
+    /// Below the gate (the default, `u64::MAX`) nothing is recorded: the L2
+    /// committed bytes, hence every state root and every cache, are those of
+    /// the release, and the split still pays on both sides (the reproduction
+    /// above runs below the gate).
+    #[test]
+    fn below_the_claim_finality_gate_nothing_is_recorded() {
+        assert_eq!(crate::params::HF1_CLAIM_FINALITY_EPOCH, u64::MAX);
+        let split_claims::Split { a, b, .. } = split_claims::split();
+        for st in [&a, &b] {
+            let l2 = st.l2_settlement().unwrap();
+            assert!(l2.checkpoint_roots().is_empty());
+            assert!(!l2.committed_bytes().windows(CP_TAG.len()).any(|w| w == CP_TAG));
+        }
+        #[cfg(feature = "local-state-cache")]
+        {
+            let (_, bytes, _) = local_cache_round_trip(&a);
+            assert!(!bytes.windows(16).any(|w| w == b"BPOSST01:L2CP:v1"));
+        }
+    }
+
+    #[test]
+    fn native_claim_finality_gate_is_inert() {
+        assert_eq!(crate::params::HF1_CLAIM_FINALITY_EPOCH, u64::MAX);
+        for epoch in [0, 5_850, 10_000, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::native_claim_finality_active(epoch));
+        }
+    }
+
+    /// HF1 needs both halves. The frozen finality set alone does not stop a
+    /// branch that carries the other branch's votes from finalizing that
+    /// branch's checkpoint (the carried votes come from members of the set),
+    /// so the claim still pays on both sides; with claim finality armed as
+    /// well, it pays only on the branch whose own checkpoint is final.
+    #[test]
+    fn hf1_split_claim_needs_claim_finality_on_top_of_the_frozen_set() {
+        let (recipient, sats) = wleaf(2);
+        // Frozen set only.
+        {
+            let _frozen = crate::params::native_finality_set_test::open();
+            let split_claims::Split { a, b, mut ca, mut cb, a_cp, .. } = split_claims::split();
+            for (state, chains, name) in [(&a, &mut ca, "A"), (&b, &mut cb, "B")] {
+                assert!(state.finality_engine.finality_set().is_some(), "frozen set in force on {name}");
+                assert_eq!(state.finality().finalized.root, a_cp);
+                let tx = split_claims::claim_on(state);
+                assert_eq!(state.l2_withdraw_claim_refusal(&tx), None, "frozen set alone: admissible on {name}");
+                let before = state.balance_sat(&recipient);
+                let post = split_claims::block_with(state, split_claims::CLAIM_SLOT, &[], &[claim(&tx)], chains)
+                    .unwrap_or_else(|e| panic!("claim block on {name}: {e:?}"));
+                assert_eq!(post.balance_sat(&recipient), before + u128::from(sats));
+            }
+        }
+        // Both HF1 halves.
+        let _frozen = crate::params::native_finality_set_test::open();
+        let _claims = crate::params::native_claim_finality_test::open();
+        let split_claims::Split { a, b, mut ca, mut cb, .. } = split_claims::split();
+        assert!(a.finality_engine.finality_set().is_some() && b.finality_engine.finality_set().is_some());
+        let tx = split_claims::claim_on(&b);
+        assert_eq!(b.l2_withdraw_claim_refusal(&tx), Some(ClaimReject::NotFinalized));
+        let before_b = b.balance_sat(&recipient);
+        let b_post = refuse_then_apply(&b, split_claims::CLAIM_SLOT, &[claim(&tx)], 0, &[], &mut cb);
+        assert_eq!(b_post.balance_sat(&recipient), before_b);
+        let tx = split_claims::claim_on(&a);
+        let before_a = a.balance_sat(&recipient);
+        let a_post = split_claims::block_with(&a, split_claims::CLAIM_SLOT, &[], &[claim(&tx)], &mut ca)
+            .expect("the claim pays on the branch whose checkpoint is final");
+        assert_eq!(a_post.balance_sat(&recipient), before_a + u128::from(sats));
+    }
+
+    /// A stalled finality keeps the finalized epoch's root and the three
+    /// newest: FFG at the close of epoch c can only finalize c - 1.
+    #[test]
+    fn checkpoint_roots_stay_bounded_through_a_finality_stall() {
+        let (pre, _) = split_claims::parent();
+        let mut l2 = pre.l2_settlement().unwrap().clone();
+        for epoch in 3..200u64 {
+            l2.record_checkpoint_root(epoch, [epoch as u8; 32], 3);
+            assert!(l2.checkpoint_roots().len() <= 4);
+        }
+        assert_eq!(l2.checkpoint_roots().keys().copied().collect::<Vec<_>>(), vec![3, 197, 198, 199]);
+        // Finality resumes at 198 (closing 199): its root is there.
+        l2.record_checkpoint_root(200, [200; 32], 198);
+        assert_eq!(l2.checkpoint_roots().keys().copied().collect::<Vec<_>>(), vec![198, 199, 200]);
+        assert_eq!(l2.checkpoint_root(198), Some([198; 32]));
+    }
+
+    // Adversarial multi-branch FFG suite (p2b, 2026-10-19).
+    mod ffg_branch_tests {
+        use super::*;
+        include!("ffg_branch_tests.rs");
+    }
 }

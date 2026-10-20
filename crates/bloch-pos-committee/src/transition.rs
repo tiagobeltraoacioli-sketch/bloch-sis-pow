@@ -2879,6 +2879,15 @@ impl CommittedState {
                 .map(|(validator, leaked_sat)| LeakRecord { validator, leaked_sat })
                 .collect(),
             next_epoch: self.finality_engine.next_epoch(),
+            finality_set: self.finality_engine.finality_set().map(|fs| {
+                let pairs = |m: &BTreeMap<u32, u64>| m.iter().map(|(v, x)| (*v, *x)).collect();
+                crate::state_root::FinalitySetRecord {
+                    current_epoch: fs.current.epoch,
+                    current: pairs(&fs.current.members),
+                    pending: fs.pending.as_ref().map(|p| (p.epoch, pairs(&p.members))),
+                    last_seen: pairs(&fs.last_seen),
+                }
+            }),
         };
         // The signing root travels from the accumulation key into the leaf
         // key untouched — computed once, in attestation.rs, never re-derived.
@@ -5655,6 +5664,19 @@ impl CommittedState {
                 if let Ok(state) = crate::l2_settlement::State::activated(activation) {
                     st.l2_settlement = Some(state);
                 }
+            }
+        }
+        // Claim finality on this chain (HF1_CLAIM_FINALITY_EPOCH):
+        // record this chain's checkpoint of the epoch being opened. `head` is
+        // still the parent here — the last block strictly before the new
+        // epoch's first slot, the root `Engine::checkpoint_root` has
+        // attesters vote — also across empty epochs rolled in one block.
+        // Inert below the gate: nothing recorded, L2 bytes unchanged.
+        if crate::params::native_claim_finality_active(next_epoch) {
+            let finalized_epoch = st.finality_engine.finalized().epoch;
+            let root = *st.head.as_bytes();
+            if let Some(l2) = st.l2_settlement.as_mut() {
+                l2.record_checkpoint_root(next_epoch, root, finalized_epoch);
             }
         }
         // A funded position becomes withdrawable only after both the fixed
@@ -9268,6 +9290,69 @@ mod tests {
         assert_eq!(fin.justified, Checkpoint { epoch: 2, root: *cp2.as_bytes() });
         assert_eq!(fin.finalized, Checkpoint { epoch: 1, root: *cp1.as_bytes() });
         assert_eq!(fin.previous_justified, Checkpoint { epoch: 1, root: *cp1.as_bytes() });
+    }
+
+    /// Frozen finality set, end to end through real blocks: the same
+    /// justification/finality as `justification_and_finality_advance_across_epochs`,
+    /// the set is committed into the state root (so roots differ from the
+    /// inert build only once the gate binds), and it survives the local cache.
+    #[test]
+    fn frozen_finality_set_keeps_normal_finality_and_is_committed() {
+        let run = |armed: bool| {
+            let _g = armed.then(crate::params::native_finality_set_test::open);
+            let (t, g, mut chains) = setup(8);
+            let b1 = build_block(&t, &g, 32, &[], &[], &mut chains);
+            let s1 = t.apply_block(&g, &b1, &[], &[]).unwrap();
+            let cp1 = s1.head();
+            let atts1 = full_epoch_attestations(&s1, *cp1.as_bytes());
+            let b2 = build_block(&t, &s1, 63, &atts1, &[], &mut chains);
+            let s2 = t.apply_block(&s1, &b2, &atts1, &[]).unwrap();
+            let b3 = build_block(&t, &s2, 64, &[], &[], &mut chains);
+            let s3 = t.apply_block(&s2, &b3, &[], &[]).unwrap();
+            let cp2 = s3.head();
+            let atts2 = full_epoch_attestations(&s3, *cp2.as_bytes());
+            let b4 = build_block(&t, &s3, 95, &atts2, &[], &mut chains);
+            let s4 = t.apply_block(&s3, &b4, &atts2, &[]).unwrap();
+            let b5 = build_block(&t, &s4, 96, &[], &[], &mut chains);
+            let s5 = t.apply_block(&s4, &b5, &[], &[]).unwrap();
+            (s1, s5)
+        };
+        let (legacy1, legacy) = run(false);
+        let (armed1, armed) = run(true);
+        // Same epochs justified/finalized. Roots from epoch 2 on differ only
+        // because the committed leaf (hence every later block id) does.
+        assert_eq!(legacy.finality().finalized, armed.finality().finalized);
+        assert_eq!(legacy.finality().justified.epoch, armed.finality().justified.epoch);
+        assert_eq!(armed.finality().finalized.epoch, 1);
+        assert!(legacy.finality_engine.finality_set().is_none());
+        let fs = armed.finality_engine.finality_set().expect("gate created the set");
+        assert_eq!(fs.current.members.len(), 8);
+        assert_eq!(fs.current.total(), legacy1.duty_roster_at(1).iter().map(|v| v.effective_stake as u128).sum::<u128>());
+        // Epoch 0 closes nothing, so the first block's root is the same; from
+        // the first gated boundary on, the committed leaf carries the set.
+        assert_eq!(legacy1.state_root(), armed1.state_root());
+        assert_ne!(legacy.state_root(), armed.state_root());
+        #[cfg(feature = "local-state-cache")]
+        {
+            let mut st = armed.clone();
+            let header = BlockHeaderV4 {
+                version: BLOCK_VERSION_V4, parent: [0; 32], state_root: st.compute_root(),
+                body_root: [0; 32], slot: st.slot, proposer_index: 0,
+                randao_reveal: [0; 32], randao_mix: st.randao_mix,
+                justified_root: [0; 32], finalized_root: [0; 32],
+                attestation_root: [0; 32], coherence_root: [0; 32],
+            };
+            st.head = header.id();
+            let bytes = st.encode_local_cache().unwrap();
+            let restored = CommittedState::decode_local_cache(&bytes, &header).unwrap();
+            assert_eq!(restored, st);
+            let mut cut = st.clone();
+            cut.finality_engine.restore_finality_set(None);
+            let short = cut.encode_local_cache().unwrap();
+            assert!(CommittedState::decode_local_cache(&short, &header).is_err(), "losing the set must fail the root check");
+            let mut trailing = bytes.clone(); trailing.push(0);
+            assert!(CommittedState::decode_local_cache(&trailing, &header).is_err());
+        }
     }
 
     // ── B6: the supply-conservation invariant, shown refusing ────────────

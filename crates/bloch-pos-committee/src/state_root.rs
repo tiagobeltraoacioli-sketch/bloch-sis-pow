@@ -1496,6 +1496,51 @@ pub struct FinalityRecord {
     pub leaked: Vec<LeakRecord>,
     /// Next epoch the engine will accept — the "dense, in-order" clock.
     pub next_epoch: u64,
+    /// Frozen finality set (`params::HF1_FROZEN_FINALITY_SET_EPOCH`).
+    /// `None` below the gate, and then NOTHING is appended to the leaf, so
+    /// every historical root is byte-identical.
+    pub finality_set: Option<FinalitySetRecord>,
+}
+
+/// The frozen finality set, its pending handoff candidate and the presence
+/// ledger that prunes it. Lists in any order; serialization sorts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalitySetRecord {
+    pub current_epoch: u64,
+    pub current: Vec<(u32, u64)>,
+    pub pending: Option<(u64, Vec<(u32, u64)>)>,
+    pub last_seen: Vec<(u32, u64)>,
+}
+
+/// Domain tag opening the optional finality-set extension of the finality
+/// leaf. Its presence is what distinguishes a gated leaf from a legacy one.
+const FINALITY_SET_EXTENSION_TAG: &[u8; 16] = b"BLOCH-FFG-FSETv1";
+
+impl FinalitySetRecord {
+    fn write_pairs(s: &mut Vec<u8>, pairs: &[(u32, u64)]) {
+        let mut sorted = pairs.to_vec();
+        sorted.sort_unstable();
+        s.extend_from_slice(&(sorted.len() as u64).to_le_bytes());
+        for (v, x) in &sorted {
+            s.extend_from_slice(&v.to_le_bytes());
+            s.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+
+    fn write_into(&self, s: &mut Vec<u8>) {
+        s.extend_from_slice(FINALITY_SET_EXTENSION_TAG);
+        s.extend_from_slice(&self.current_epoch.to_le_bytes());
+        Self::write_pairs(s, &self.current);
+        match &self.pending {
+            None => s.push(0),
+            Some((epoch, members)) => {
+                s.push(1);
+                s.extend_from_slice(&epoch.to_le_bytes());
+                Self::write_pairs(s, members);
+            }
+        }
+        Self::write_pairs(s, &self.last_seen);
+    }
 }
 
 impl FinalityRecord {
@@ -1523,6 +1568,9 @@ impl FinalityRecord {
             s.extend_from_slice(&l.leaked_sat.to_le_bytes());
         }
         s.extend_from_slice(&self.next_epoch.to_le_bytes());
+        if let Some(fs) = &self.finality_set {
+            fs.write_into(&mut s);
+        }
         s
     }
 }
@@ -3377,6 +3425,7 @@ mod tests {
             finalized: CheckpointRecord { epoch: 40, root: val(0x50) },
             leaked: vec![LeakRecord { validator: 3, leaked_sat: 77 }],
             next_epoch: 43,
+            finality_set: None,
         };
         let pending_votes: Vec<PendingVoteRecord> = (0..3u32)
             .map(|i| PendingVoteRecord {
@@ -4152,5 +4201,43 @@ mod tests {
             })
             .collect();
         assert_eq!(total_effective_stake(&validators), 3u128 * u64::MAX as u128);
+    }
+
+    /// Frozen finality set: `None` appends nothing (every pre-gate leaf is
+    /// the legacy bytes); `Some` extends the leaf and is order-insensitive.
+    #[test]
+    fn finality_set_extension_is_absent_below_the_gate() {
+        let base = FinalityRecord {
+            justified: vec![CheckpointRecord { epoch: 3, root: [3; 32] }],
+            current_justified: CheckpointRecord { epoch: 3, root: [3; 32] },
+            previous_justified: CheckpointRecord { epoch: 2, root: [2; 32] },
+            finalized: CheckpointRecord { epoch: 2, root: [2; 32] },
+            leaked: vec![LeakRecord { validator: 1, leaked_sat: 5 }],
+            next_epoch: 4,
+            finality_set: None,
+        };
+        let legacy = base.serialize();
+        assert_eq!(legacy.len(), 8 + 40 + 40 * 3 + 8 + 12 + 8);
+        let mut gated = base.clone();
+        gated.finality_set = Some(FinalitySetRecord {
+            current_epoch: 2,
+            current: vec![(1, 100), (0, 100)],
+            pending: Some((3, vec![(0, 100)])),
+            last_seen: vec![(1, 3), (0, 3)],
+        });
+        let bytes = gated.serialize();
+        assert_eq!(&bytes[..legacy.len()], &legacy[..]);
+        assert!(bytes.len() > legacy.len());
+        let mut shuffled = gated.clone();
+        if let Some(fs) = shuffled.finality_set.as_mut() {
+            fs.current.reverse();
+            fs.last_seen.reverse();
+        }
+        assert_eq!(shuffled.serialize(), bytes);
+        let mut other = gated.clone();
+        if let Some(fs) = other.finality_set.as_mut() {
+            fs.pending = None;
+        }
+        assert_ne!(other.serialize(), bytes);
     }
 }
