@@ -2773,7 +2773,102 @@ impl Engine {
         }
     }
 
+    /// Late retry of this epoch's attestation duty that the slot loop could
+    /// not perform on time (node-local liveness; no consensus change).
+    ///
+    /// # Why
+    ///
+    /// Each active validator has exactly one attestation duty slot per epoch.
+    /// The slot loop only calls [`Self::attest`] for the CURRENT wall slot, and
+    /// only while the stale-head gate (`node_is_behind` + [`DutySyncGate`]) and
+    /// the other duty blockers are open. A run of two or more empty slots
+    /// (missing proposers) closes that gate for an online, fully synced node;
+    /// if the validator's single duty slot falls inside the run, the old loop
+    /// never came back to it, the validator cast no vote for the epoch, and
+    /// it was charged as offline (inactivity leak) although it was online.
+    ///
+    /// Once the gate reopens at wall slot `w` of the SAME epoch `e`, this
+    /// signs the vote for the missed duty slot `d < w`: `data.slot = d` (so
+    /// the committee check, which keys on `data.slot`, still passes),
+    /// `target = (e, checkpoint_root(e))`, source = current justified view,
+    /// head = current head. Consensus accepts an attestation of the current
+    /// epoch whose slot is not in the future (`attestation::validate`,
+    /// step 8, gossip window of 2 epochs), so the vote is includable by any
+    /// block of epoch `e` at slot `>= d`.
+    ///
+    /// # Slashing safety (slashing protection stays the single authority)
+    ///
+    /// - Signing goes through the same `guard_attestation` as the on-time
+    ///   path: the watermark (slot, source, target) is fsync-ed BEFORE the
+    ///   signature exists, across restarts and processes.
+    /// - Double vote: the guard refuses any `target_epoch <= watermark`. The
+    ///   on-time vote and a retry both target `e`, so whichever is signed
+    ///   first makes every other vote for `e` impossible. This function also
+    ///   pre-checks the watermark and stays silent once `e` is covered; the
+    ///   pre-check is an optimisation, never the protection.
+    /// - Surround vote: source is the current justified epoch, refused by
+    ///   the guard if below the source watermark; with target strictly above
+    ///   the target watermark, the new vote cannot surround or be surrounded
+    ///   by any vote this key signed.
+    /// - Same-slot (fork-choice) equivocation: the guard requires
+    ///   `data.slot > attestation_slot watermark`. All earlier votes are from
+    ///   earlier epochs (slots `< first_slot(e) <= d`), and no later vote for
+    ///   slot `d` can follow, so no two votes of this key share a slot.
+    /// - Bounded to the epoch: only `epoch_of(d) == epoch_of(w)` is ever
+    ///   retried; a duty from an epoch that has ended is dropped, never
+    ///   signed late.
+    /// - Restart mid-epoch: nothing here is in memory; the decision is the
+    ///   durable watermark. A node restarted after signing for `e` does not
+    ///   sign again; one restarted after missing `d` votes once.
+    fn retry_missed_attestation(&mut self, wall_slot: u64) {
+        if self.keys.is_none() || self.doppelganger_blocks_duties(wall_slot) {
+            return;
+        }
+        let e = epoch_of(wall_slot);
+        if e == 0 {
+            return;
+        }
+        // Cheap pre-check (see above): already voted for this target epoch.
+        if self.slashprot.watermarks().target_epoch.is_some_and(|t| t >= e) {
+            return;
+        }
+        let Some(duty_slot) = self.attestation_duty_slot(e) else {
+            return;
+        };
+        if duty_slot >= wall_slot || epoch_of(duty_slot) != e {
+            // Not yet due (the on-time path handles it), or not this epoch.
+            return;
+        }
+        println!("[slot {wall_slot}] retrying the missed attestation duty of slot {duty_slot} (epoch {e})");
+        self.attest_for(duty_slot, wall_slot);
+    }
+
+    /// This validator's attestation duty slot in epoch `e`, from the same
+    /// snapshot, seed and roster [`Self::attest`] uses (one epoch partition).
+    fn attestation_duty_slot(&mut self, e: u64) -> Option<u64> {
+        let rolled = self.rolled_to(e);
+        let index = self.duty_index(&rolled)?;
+        let roster = rolled.active_validators();
+        let seed = Self::seed_for(&rolled, e);
+        let partition = committees::epoch_committees(&seed, e, &roster);
+        let first = first_slot_of_epoch(e)?;
+        partition
+            .iter()
+            .position(|c| c.binary_search(&index).is_ok())
+            .and_then(|i| first.checked_add(i as u64))
+    }
+
     fn attest(&mut self, slot: u64) {
+        self.attest_for(slot, slot);
+    }
+
+    /// Sign the duty of `slot` (the attestation's `data.slot`) at wall slot
+    /// `wall_slot >= slot`, same epoch. On time, the two are equal.
+    fn attest_for(&mut self, slot: u64, wall_slot: u64) {
+        // Never a future duty, never a duty of another (ended) epoch.
+        if slot > wall_slot || epoch_of(slot) != epoch_of(wall_slot) {
+            return;
+        }
         // An observer holds no key and therefore has no duty. Bound here, once,
         // and used to sign below — nothing between reads `keys` mutably.
         //
@@ -2784,7 +2879,7 @@ impl Engine {
         if self.keys.is_none() {
             return;
         }
-        if self.doppelganger_blocks_duties(slot) {
+        if self.doppelganger_blocks_duties(wall_slot) {
             return;
         }
         let e = epoch_of(slot);
@@ -2840,11 +2935,12 @@ impl Engine {
         };
         // SLASHING PROTECTION. The duty is settled; the signature is not made
         // until the watermark for it is on disk and fsync-ed. `slot` here is
-        // the wall-clock slot — the slot loop derives it from `wall_slot()`
-        // and hands it in — so "refuse unless the slot exceeds the watermark"
-        // is exactly "refuse unless the wall clock has moved past what we
-        // already signed", including after an NTP step backwards or a restart
-        // inside the same slot.
+        // the wall-clock slot on time, or an earlier duty slot of the SAME
+        // epoch for a late retry (`retry_missed_attestation`, whose doc holds
+        // the full slashing-safety argument). Either way the guard refuses
+        // unless the slot exceeds the slot watermark AND the target epoch
+        // exceeds the target watermark, so one key signs at most one vote per
+        // target epoch, including after an NTP step backwards or a restart.
         //
         // KES: the vote's period is its target epoch's, which is this slot's.
         let kes_period = match self.prepare_kes(e, index) {
@@ -2885,9 +2981,10 @@ impl Engine {
             .insert((att.validator, att.data.signing_root()), att);
         self.net.broadcast(frame);
         println!(
-            "[slot {slot}] attested (epoch {e}, head {}, target {})",
+            "[slot {slot}] attested (epoch {e}, head {}, target {}){}",
             crate::codec::hex8(&data.head),
-            crate::codec::hex8(&data.target_root)
+            crate::codec::hex8(&data.target_root),
+            if slot < wall_slot { format!(" late, at wall slot {wall_slot}") } else { String::new() }
         );
     }
 
@@ -7264,6 +7361,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
             engine.maintain_kes(wall_epoch);
             engine.attest(slot);
             last_attested = slot;
+            // A duty slot of this epoch skipped while duties were blocked
+            // (empty-slot run, sync, boot grace) is voted now, at most once
+            // per epoch; see `retry_missed_attestation` for the safety case.
+            // Inside the `attestation_due` gate, like the on-time duty.
+            engine.retry_missed_attestation(slot);
         }
         let propose_at = slot_start.saturating_add(slot_ms / 3); // a deadline
         if !duties_blocked && now >= propose_at && slot > last_built {
@@ -11746,6 +11848,152 @@ mod local_attestation_ownership {
             frame < insert && insert < broadcast,
             "frame preparation, pool ownership and publication order changed"
         );
+    }
+}
+
+/// Missed-duty retry: a validator whose single attestation slot of an epoch
+/// fell while duties were blocked (an empty-slot run closing the stale-head
+/// gate) still votes once in that epoch, never twice, never after it ends.
+#[cfg(test)]
+mod missed_duty_retry_tests {
+    use super::*;
+    use bloch_pos_committee::SLOTS_PER_EPOCH;
+
+    /// First epoch >= 1 whose duty slot is not the epoch's last slot, so a
+    /// later wall slot of the same epoch exists. Returns (epoch, duty slot).
+    fn epoch_with_room(engine: &mut Engine) -> (u64, u64) {
+        for e in 1..64 {
+            let d = engine.attestation_duty_slot(e).expect("the only validator has a duty");
+            assert_eq!(epoch_of(d), e);
+            if d + 1 < (e + 1) * SLOTS_PER_EPOCH {
+                return (e, d);
+            }
+        }
+        panic!("no epoch with a duty before its last slot");
+    }
+
+    fn own_votes(engine: &Engine, target: u64) -> Vec<Attestation> {
+        engine.pool.values().filter(|a| a.data.target_epoch == target).cloned().collect()
+    }
+
+    #[test]
+    fn a_duty_skipped_in_an_empty_slot_gap_is_voted_later_in_the_same_epoch() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let (e, d) = epoch_with_room(&mut engine);
+        let last = (e + 1) * SLOTS_PER_EPOCH - 1;
+        let w = (d + 2).min(last);
+        // The slot loop was blocked for d..w-1; at w the gate reopens.
+        engine.attest(w);
+        assert!(own_votes(&engine, e).is_empty(), "w is not the duty slot");
+        engine.retry_missed_attestation(w);
+        let votes = own_votes(&engine, e);
+        assert_eq!(votes.len(), 1, "exactly one late vote for epoch {e}");
+        let v = &votes[0];
+        assert_eq!(v.data.slot, d, "the vote is for the duty slot, not the wall slot");
+        assert_eq!(v.data.target_root, engine.checkpoint_root(e));
+        let keys = engine.keys.as_ref().unwrap();
+        assert!(engine.verifier.verify_with_key(&keys.pubkey, &v.data.signing_root(), &v.signature));
+        // Consensus-side acceptance of the late vote: same committee check,
+        // slot not in the future relative to any later block of the epoch.
+        let rolled = engine.rolled_to(e);
+        let committee =
+            committees::committee_for_slot(&Engine::seed_for(&rolled, e), v.data.slot, &rolled.active_validators());
+        assert!(committee.binary_search(&v.validator).is_ok());
+        let wm = engine.slashprot.watermarks();
+        assert_eq!((wm.attestation_slot, wm.target_epoch), (Some(d), Some(e)));
+    }
+
+    #[test]
+    fn never_a_second_vote_for_the_same_epoch() {
+        // Late vote first, then every later turn of the epoch: no new vote.
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let (e, d) = epoch_with_room(&mut engine);
+        let last = (e + 1) * SLOTS_PER_EPOCH - 1;
+        engine.retry_missed_attestation(d + 1);
+        assert_eq!(engine.pool.len(), 1);
+        for w in d + 1..=last {
+            engine.attest(w);
+            engine.retry_missed_attestation(w);
+        }
+        assert_eq!(engine.pool.len(), 1, "the retry must never sign twice");
+
+        // On-time vote first: the retry stays silent for the rest of the epoch.
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let (e, d) = epoch_with_room(&mut engine);
+        engine.attest(d);
+        engine.retry_missed_attestation(d);
+        assert_eq!(own_votes(&engine, e).len(), 1);
+        for w in d + 1..(e + 1) * SLOTS_PER_EPOCH {
+            engine.retry_missed_attestation(w);
+        }
+        assert_eq!(own_votes(&engine, e).len(), 1, "on-time vote covers the epoch");
+
+        // Even a direct second signature for another slot of the epoch is
+        // refused by slashing protection, the single authority.
+        if d + 1 < (e + 1) * SLOTS_PER_EPOCH {
+            engine.attest_for(d, d + 1);
+            assert_eq!(own_votes(&engine, e).len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_duty_of_an_ended_epoch_is_never_signed() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let (e, d) = epoch_with_room(&mut engine);
+        let _ = d;
+        // Blocked through the whole rest of epoch e; the gate reopens in e+1.
+        let next_first = (e + 1) * SLOTS_PER_EPOCH;
+        let next_duty = engine.attestation_duty_slot(e + 1).unwrap();
+        for w in next_first..=next_duty.max(next_first) {
+            engine.attest(w);
+            engine.retry_missed_attestation(w);
+        }
+        assert!(own_votes(&engine, e).is_empty(), "epoch {e}'s duty must not be signed in e+1");
+        assert!(engine.pool.values().all(|a| epoch_of(a.data.slot) == a.data.target_epoch));
+        // A forged call shape for the past epoch is refused too.
+        engine.attest_for(d, next_first);
+        assert!(own_votes(&engine, e).is_empty());
+    }
+
+    #[test]
+    fn restart_mid_epoch_reads_the_durable_watermark() {
+        // Signed (late) before the restart: the restarted node does not sign again.
+        let (mut engine, dir) = perf_support::proposing_engine();
+        let (e, d) = epoch_with_room(&mut engine);
+        engine.retry_missed_attestation(d + 1);
+        assert_eq!(own_votes(&engine, e).len(), 1);
+        engine.pool.clear();
+        engine.slashprot = SlashingProtection::open(&dir.0).expect("reopen as the next boot");
+        for w in d + 1..(e + 1) * SLOTS_PER_EPOCH {
+            engine.attest(w);
+            engine.retry_missed_attestation(w);
+        }
+        assert!(own_votes(&engine, e).is_empty(), "a restart must not produce a second vote");
+
+        // Restarted after missing the duty (nothing signed): votes once.
+        let (mut engine, dir) = perf_support::proposing_engine();
+        let (e, d) = epoch_with_room(&mut engine);
+        engine.slashprot = SlashingProtection::open(&dir.0).expect("fresh boot");
+        engine.retry_missed_attestation(d + 1);
+        engine.retry_missed_attestation(d + 1);
+        assert_eq!(own_votes(&engine, e).len(), 1);
+    }
+
+    #[test]
+    fn the_slot_loop_retries_after_the_on_time_attest() {
+        let source = include_str!("engine.rs");
+        let call = source
+            .find("            engine.attest(slot);\n")
+            .expect("slot-loop attest call");
+        let retry = source[call..]
+            .find("engine.retry_missed_attestation(slot);")
+            .expect("slot loop must retry a missed duty");
+        // Integration with hf-node-only: its gate test pins `attest` directly
+        // followed by the `last_attested` latch, so the retry follows the
+        // latch; it must still sit inside the same gated branch, i.e. before
+        // the proposer step that follows that branch.
+        let end = source[call..].find("let propose_at").expect("end of the attest branch");
+        assert!(retry < end && retry < 600, "the retry must sit inside the unblocked attest branch");
     }
 }
 
