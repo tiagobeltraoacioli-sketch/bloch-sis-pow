@@ -21,6 +21,8 @@
 #   --candidate-bin F --baseline-bin F --arming F   skip the builds
 #   --baseline-bin F alone   reuse a baseline binary, build only the candidate
 #   --build-only          stop after the builds (prints the binaries)
+#   --conf FILE           arm.py gate conf (repeatable; default gates.conf), e.g.
+#                         --conf scripts/hf-rehearsal/gates.conf --conf scripts/hf-rehearsal/kes.conf
 #
 # Gate override: if the candidate's crates/bloch-pos-node/Cargo.toml declares a
 # feature `hf-rehearsal`, it is built with that feature and
@@ -39,7 +41,7 @@ HERE="$REPO/scripts/hf-rehearsal"
 BASELINE=b4a21fb657d0beb17f64c62889b605c9a7a2d031
 CANDIDATE=""; CANDIDATE_TREE=""; WORK=""; TARGET="$REPO/target/hf-rehearsal"
 HF1=10; HF2=14; HF3=18; PAST=6; JOBS=4
-CBIN=""; BBIN=""; ARMING=""; BUILD_ONLY=0
+CBIN=""; BBIN=""; ARMING=""; BUILD_ONLY=0; CONFS=()
 PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -57,6 +59,7 @@ while [ $# -gt 0 ]; do
     --baseline-bin) BBIN="$2"; shift 2;;
     --arming) ARMING="$2"; shift 2;;
     --build-only) BUILD_ONLY=1; shift;;
+    --conf) CONFS+=(--conf "$2"); shift 2;;
     --) shift; PASS=("$@"); break;;
     -h|--help) sed -n '3,33p' "$0"; exit 0;;
     *) echo "unknown option $1" >&2; exit 2;;
@@ -115,7 +118,7 @@ json.dump(r,open(p,"w"),indent=2)
 PY
   else
     python3 -I "$HERE/arm.py" "$BUILD/src-candidate" --hf1 "$HF1" --hf2 "$HF2" --hf3 "$HF3" --past-gate "$PAST" \
-      --report "$BUILD/arming-candidate.json"
+      --report "$BUILD/arming-candidate.json" ${CONFS[@]+"${CONFS[@]}"}
   fi
   CBIN="$BUILD/bloch-pos-candidate"; ARMING="$BUILD/arming-candidate.json"
   if [ ! -d "$BUILD/src-baseline" ]; then

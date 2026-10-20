@@ -51,7 +51,7 @@ GATES_CONF = Path(__file__).resolve().parent / "gates.conf"
 SLASHING_ERA = 2_884
 UNTOUCHED = {"L2_SETTLEMENT_ACTIVATION_EPOCH"}
 
-DECL = re.compile(r"^(?P<indent>\s*)pub(?:\([a-z]+\))? const (?P<name>[A-Z0-9_]+): u64 = (?P<value>u64::MAX|\d[\d_]*);$",
+DECL = re.compile(r"^(?P<indent>\s*)pub(?:\([a-z]+\))? const (?P<name>[A-Z0-9_]+): (?:u64|u8) = (?P<value>u64::MAX|\d[\d_]*);$",
                   re.M)
 
 
@@ -82,6 +82,8 @@ def main() -> int:
     ap.add_argument("--past-gate", type=int, default=6)
     ap.add_argument("--mainnet-epoch", type=int, default=7_000)
     ap.add_argument("--report", type=Path, required=True)
+    ap.add_argument("--conf", type=Path, action="append",
+                    help="gate conf file(s); default gates.conf. Repeatable (e.g. gates.conf + kes.conf)")
     args = ap.parse_args()
 
     root = args.root.resolve()
@@ -111,8 +113,13 @@ def main() -> int:
         epochs = {"HF1": args.hf1, "HF2": args.hf2, "HF3": args.hf3}
         conf: dict[str, int] = {}
         literal: dict[str, int] = {}
-        for line in GATES_CONF.read_text().splitlines():
-            line = line.split("#", 1)[0].split()
+        drops: list[str] = []
+        for conf_file in (args.conf or [GATES_CONF]):
+          for raw in conf_file.read_text().splitlines():
+            if raw.startswith("!drop-line "):
+                drops.append(raw[len("!drop-line "):].strip())
+                continue
+            line = raw.split("#", 1)[0].split()
             if len(line) == 2 and line[1].startswith("="):
                 literal[line[0]] = int(line[1][1:])
                 continue
@@ -146,6 +153,43 @@ def main() -> int:
                 if changes:
                     file.write_text(text)
                     report["hf_constants"] += [dict(c, file=str(rel)) for c in changes]
+
+    if not args.no_hf:
+        # Literal overrides whose initializer is an expression (e.g. `14 * 90`)
+        # are not matched by DECL: rewrite them by exact name, exactly once.
+        done = {c["name"] for c in report["hf_constants"]}
+        for name, value in literal.items():
+            if name in done:
+                continue
+            pat = re.compile(rf"^(\s*pub(?:\([a-z]+\))? const {name}: (?:u64|u8) = )([^;]+);$", re.M)
+            hits = []
+            for base in HF_ROOTS:
+                for file in sorted((root / base).rglob("*.rs")):
+                    text = file.read_text()
+                    found = pat.findall(text)
+                    if found:
+                        hits.append((file, found[0][1]))
+            if not hits:
+                report.setdefault("missing_literals", []).append(name)
+                print(f"  note: literal {name} is not declared in this tree (skipped)")
+                continue
+            if len(hits) != 1:
+                sys.exit(f"literal {name}: expected exactly one declaration, found {len(hits)}")
+            file, old_value = hits[0]
+            file.write_text(pat.sub(rf"\g<1>{value};", file.read_text(), count=1))
+            report["hf_constants"].append({"name": name, "from": old_value, "to": str(value),
+                                           "file": str(file.relative_to(root))})
+
+    if not args.no_hf and drops:
+        path = root / PARAMS
+        lines = path.read_text().splitlines(keepends=True)
+        for needle in drops:
+            hits = [i for i, l in enumerate(lines) if needle in l]
+            if len(hits) != 1:
+                sys.exit(f"!drop-line {needle!r}: expected exactly one line in {PARAMS}, found {len(hits)}")
+            report.setdefault("dropped_lines", []).append(lines[hits[0]].strip())
+            del lines[hits[0]]
+        path.write_text("".join(lines))
 
     args.report.write_text(json.dumps(report, indent=2) + "\n")
     print(f"armed {len(report['past'])} past gates -> {{0, {args.past_gate}}}; "
