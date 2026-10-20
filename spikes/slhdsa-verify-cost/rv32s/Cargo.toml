@@ -1,0 +1,11 @@
+[package]
+name = "rv32-slhdsa128s-verify"
+version = "0.1.0"
+edition = "2021"
+[workspace]
+[dependencies]
+fips205 = { version = "=0.4.1", default-features = false, features = ["slh_dsa_shake_128s"] }
+[profile.release]
+opt-level = 3
+panic = "abort"
+lto = true
