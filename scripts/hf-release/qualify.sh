@@ -13,16 +13,21 @@
 #              changed gate must be scheduled after the replayed head (or be
 #              inert), so this run is the "nothing changes before activation"
 #              proof;
-#   4. forced  for each gate, a QUALIFICATION-ONLY build with only that gate
-#              moved to an early epoch E inside the copied history:
-#                pre   slots < E*32: must end on exactly the configured head
-#                      (moving the constant changes nothing before activation);
+#   4. forced  for each forced gate, a QUALIFICATION-ONLY build with only that
+#              gate moved to an early epoch E inside the copied history:
+#                pre   slots < E*32: must end on exactly the head the candidate
+#                      reaches on the same prefix (moving the constant changes
+#                      nothing before activation);
 #                post  slots < (E+W)*32: must cross activation without a panic
 #                      or crash. Either every historical block still applies
 #                      ("inert-on-history") or replay stops cleanly with a
 #                      consensus rejection ("diverged-after-activation"), which
 #                      is the expected shape of a consensus change.
 #              Forced binaries carry a synthetic commit and are never staged.
+#
+# Steps 2-4 run concurrently (tests in the container, replays on the host,
+# forced builds serially in the container); wall time is about one canonical
+# build + max(tests, forced builds + ~45 min of replays).
 #
 # Runs on a Linux x86-64 build host with a container engine (docker buildx).
 # Never contacts a fleet host; every replay is network-isolated and works on
@@ -34,18 +39,22 @@
 #     --baseline-bin FILE   the binary the fleet runs today (b4a21fb6 release)
 #     --out DIR             new output directory (default ~/hf-qualify-<commit12>-<utc>)
 #     --base-commit C       fleet release commit for gate discovery (default b4a21fb6...)
-#     --gate NAME[=EPOCH]   gate to force (repeatable; default: every changed gate)
-#     --force-epoch N       early test epoch (default: replayed head epoch - window - 8)
+#     --gate NAME[=EPOCH]   gate to force (repeatable; added to the discovered gates)
+#     --gates-only          force only the --gate list (the schedule check still
+#                           covers every discovered gate)
+#     --force-epoch N       early test epoch (default: head epoch of --source - window - 8)
 #     --window W            epochs replayed after the forced activation (default 16)
-#     --jobs N              concurrent replays (default 3)
+#     --jobs N              concurrent replays (default 8)
 #     --expect-slot N --expect-root HEX   head reported by the archivals for --source
-#     --tests-allow-fail PKG  package whose test failures are reported, not fatal
+#     --tests-allow-fail PKG  crate whose test failures are reported, not fatal
 #                           (repeatable; default: bloch = legacy/genesis3-node, the
 #                           closed Genesis-3 PoW node outside the CI blocking set)
+#     --tests-allow-test NAME test (full path or final segment) whose failure is
+#                           expected, e.g. an "inert gate" tripwire in an armed build
 #     --skip-tests | --skip-forced | --allow-unsandboxed
 #   env: CONTAINER_ENGINE (default docker; e.g. a `sudo -n docker` wrapper)
 #
-# Exit 0 and "VERDICT: PASS" only if every step passed.
+# Exit 0 and "VERDICT: PASS" only if no step FAILed (WARN is reported, not fatal).
 set -euo pipefail
 
 KIT="$(cd "$(dirname "$0")" && pwd)"
@@ -59,9 +68,9 @@ SLOTS_PER_EPOCH=32
 case "${1:-}" in -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;; esac
 COMMIT_ARG="${1:-}"; [ $# -gt 0 ] && shift
 SOURCE="" BASELINE_BIN="" OUT="" BASE_COMMIT=b4a21fb657d0beb17f64c62889b605c9a7a2d031
-FORCE_EPOCH="" WINDOW=16 JOBS=3 EXPECT_SLOT="" EXPECT_ROOT=""
-SKIP_TESTS=0 SKIP_FORCED=0 UNSANDBOXED=0
-GATE_ARGS=() ALLOW_FAIL=() ALLOW_FAIL_SET=0
+FORCE_EPOCH="" WINDOW=16 JOBS=8 EXPECT_SLOT="" EXPECT_ROOT=""
+SKIP_TESTS=0 SKIP_FORCED=0 UNSANDBOXED=0 GATES_ONLY=0
+GATE_ARGS=() ALLOW_FAIL=() ALLOW_FAIL_SET=0 ALLOW_TEST=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --source) SOURCE="$2"; shift 2 ;;
@@ -69,12 +78,14 @@ while [ $# -gt 0 ]; do
     --out) OUT="$2"; shift 2 ;;
     --base-commit) BASE_COMMIT="$2"; shift 2 ;;
     --gate) GATE_ARGS+=("$2"); shift 2 ;;
+    --gates-only) GATES_ONLY=1; shift ;;
     --force-epoch) FORCE_EPOCH="$2"; shift 2 ;;
     --window) WINDOW="$2"; shift 2 ;;
     --jobs) JOBS="$2"; shift 2 ;;
     --expect-slot) EXPECT_SLOT="$2"; shift 2 ;;
     --expect-root) EXPECT_ROOT="$2"; shift 2 ;;
     --tests-allow-fail) ALLOW_FAIL+=("$2"); ALLOW_FAIL_SET=1; shift 2 ;;
+    --tests-allow-test) ALLOW_TEST+=("$2"); shift 2 ;;
     --skip-tests) SKIP_TESTS=1; shift ;;
     --skip-forced) SKIP_FORCED=1; shift ;;
     --allow-unsandboxed) UNSANDBOXED=1; shift ;;
@@ -89,6 +100,7 @@ for n in "$WINDOW" "$JOBS" ${FORCE_EPOCH:+"$FORCE_EPOCH"}; do
 done
 [ "$JOBS" -ge 1 ] || JOBS=1
 [ "$ALLOW_FAIL_SET" = 1 ] || ALLOW_FAIL=(bloch)
+[ "$GATES_ONLY" = 0 ] || [ ${#GATE_ARGS[@]} -gt 0 ] || { echo "--gates-only needs --gate" >&2; exit 2; }
 
 die() { echo "qualify: FAIL - $*" >&2; exit 1; }
 COMMIT="$(git -C "$REPO" rev-parse --verify --quiet "$COMMIT_ARG^{commit}")" || die "unknown commit $COMMIT_ARG"
@@ -138,9 +150,9 @@ else
 fi
 cleanup; WT=""
 
-# ── 2. workspace tests (in the background, alongside the replays) ─────────
+# ── 2. workspace tests (in the background) ────────────────────────────────
 run_tests() {
-  local ctx="$OUT/test-ctx" tag="bloch-hf-qualify:$C12" trc passed failed
+  local ctx="$OUT/test-ctx" tag="bloch-hf-qualify:$C12" trc passed failed blocking allowed
   mkdir -p "$ctx"
   git -C "$REPO" archive --format=tar "$COMMIT" | tar -xf - -C "$ctx"
   say "tests: image $tag (pinned toolchain, Dockerfile target build)"
@@ -159,21 +171,31 @@ run_tests() {
   set -e
   passed=$(grep -E '^test result:' "$OUT/tests.log" | awk '{s+=$4} END{print s+0}')
   failed=$(grep -E '^test result:' "$OUT/tests.log" | awk '{s+=$6} END{print s+0}')
-  # Packages with a failing test target, from cargo's "-p <pkg> --<target>" hints.
-  local failing blocking="" p a ok
-  failing="$(grep -oE '`-p [A-Za-z0-9_-]+' "$OUT/tests.log" | awk '{print $2}' | sort -u | tr '\n' ' ')"
-  for p in $failing; do
-    ok=0; for a in "${ALLOW_FAIL[@]}"; do [ "$p" = "$a" ] && ok=1; done
-    [ "$ok" = 1 ] || blocking="$blocking $p"
-  done
+  # Every failing test with the crate of the test binary it ran in:
+  # "<crate> <test path>" (crate from cargo's "Running ... (target/debug/deps/<crate>-<hash>)").
+  awk '
+    /^ *Running / && match($0, /deps\/[A-Za-z0-9_]+-[0-9a-f]+\)/) {
+      s = substr($0, RSTART + 5, RLENGTH - 6); sub(/-[0-9a-f]+$/, "", s); crate = s }
+    /^ *Doc-tests / { crate = $2 }
+    /^test .* \.\.\. FAILED$/ { print crate, $2 }
+  ' "$OUT/tests.log" | sort -u > "$OUT/tests-failed.txt"
+  blocking="" allowed=""
+  while read -r crate name; do
+    [ -n "$name" ] || continue
+    local ok=0 a
+    for a in "${ALLOW_FAIL[@]}"; do [ "$crate" = "${a//-/_}" ] && ok=1; done
+    for a in ${ALLOW_TEST[@]+"${ALLOW_TEST[@]}"}; do
+      case "$name" in "$a"|*"::$a") ok=1 ;; esac
+    done
+    if [ "$ok" = 1 ]; then allowed="$allowed $crate:$name"; else blocking="$blocking $crate:$name"; fi
+  done < "$OUT/tests-failed.txt"
   if [ "$trc" = 0 ]; then
     record tests PASS "$passed passed, $failed failed"
-  elif [ -n "$failing" ] && [ -z "$blocking" ]; then
-    grep -E '^test .* FAILED$' "$OUT/tests.log" | sort -u | head -20 || true
-    record tests WARN "$passed passed, $failed failed, only in allowed package(s): $failing(tests.log)"
+  elif [ -s "$OUT/tests-failed.txt" ] && [ -z "$blocking" ]; then
+    record tests WARN "$passed passed, $failed failed, all allowed:$allowed (tests.log)"
   else
-    grep -E '^test .* FAILED$|^error(\[|:)' "$OUT/tests.log" | sort -u | head -40 || true
-    record tests FAIL "rc=$trc, $passed passed, $failed failed; blocking package(s):${blocking:- none identified (build error?)} (tests.log)"
+    grep -E '^error(\[|:)' "$OUT/tests.log" | sort -u | head -20 || true
+    record tests FAIL "rc=$trc, $passed passed, $failed failed; blocking:${blocking:- none attributed (build error?)} (tests.log)"
   fi
 }
 TESTS_PID=""
@@ -186,45 +208,116 @@ fi
 # ── replay helpers ────────────────────────────────────────────────────────
 PORT_NEXT=28800
 REPLAY_FLAGS=(); [ "$UNSANDBOXED" = 0 ] || REPLAY_FLAGS+=(--allow-unsandboxed)
-# replay <label> <binary> <source dir> <port> [replay args...]; output in replay/<label>.out
+REPLAY_PIDS=()
+# replay <label> <binary> <source dir> [replay args...]: runs in the background,
+# at most JOBS at once; output in replay/<label>.out, exit code in replay/<label>.rc.
 replay() {
-  local label="$1" bin="$2" src="$3" port="$4"; shift 4
-  set +e
-  "$REPLAY" --candidate "$bin" --source "$src" --work "$OUT/replay/$label" --port-base "$port" \
-    ${REPLAY_FLAGS[@]+"${REPLAY_FLAGS[@]}"} "$@" > "$OUT/replay/$label.out" 2>&1
-  local rc=$?
-  set -e
-  echo "$rc" > "$OUT/replay/$label.rc"
-  return 0
+  local label="$1" bin="$2" src="$3" alive p; shift 3
+  while :; do
+    alive=0
+    for p in ${REPLAY_PIDS[@]+"${REPLAY_PIDS[@]}"}; do kill -0 "$p" 2>/dev/null && alive=$((alive + 1)); done
+    [ "$alive" -ge "$JOBS" ] || break
+    sleep 15
+  done
+  PORT_NEXT=$((PORT_NEXT + 10))
+  (
+    set +e
+    "$REPLAY" --candidate "$bin" --source "$src" --work "$OUT/replay/$label" --port-base "$PORT_NEXT" \
+      ${REPLAY_FLAGS[@]+"${REPLAY_FLAGS[@]}"} "$@" > "$OUT/replay/$label.out" 2>&1
+    echo "$?" > "$OUT/replay/$label.rc"
+  ) &
+  REPLAY_PIDS+=($!)
+  say "  replay $label started"
 }
-head_of() { awk '$1=="candidate" && NF==4 {print $2, $3, $4}' "$OUT/replay/$1.out" | tail -1; }
-rc_of() { cat "$OUT/replay/$1.rc"; }
-# Each replay gets its own loopback port range (relevant when not in a netns).
-alloc() { PORT_NEXT=$((PORT_NEXT + 10)); P=$PORT_NEXT; }
+head_of() { awk '$1=="candidate" && NF==4 {print $2, $3, $4}' "$OUT/replay/$1.out" 2>/dev/null | tail -1; }
+rc_of() { cat "$OUT/replay/$1.rc" 2>/dev/null || echo none; }
 
-# ── 3. configured-epoch replay of the whole copy ──────────────────────────
-say "full replay: candidate and fleet baseline, from genesis, in parallel (~30 min each)"
-expect=(); [ -z "$EXPECT_ROOT" ] || expect=(--expect-root "$EXPECT_ROOT" --expect-slot "$EXPECT_SLOT")
-alloc; replay full-candidate "$BIN" "$SOURCE" "$P" ${expect[@]+"${expect[@]}"} & pids=($!)
-alloc; replay full-baseline "$BASELINE_BIN" "$SOURCE" "$P" ${expect[@]+"${expect[@]}"} & pids+=($!)
-wait "${pids[@]}"
-ref_full="$(head_of full-candidate)"; base_full="$(head_of full-baseline)"
-if [ "$(rc_of full-candidate)" = 0 ] && [ "$(rc_of full-baseline)" = 0 ] && [ -n "$ref_full" ] && [ "$ref_full" = "$base_full" ]; then
-  record replay-configured PASS "head (slot blocks root) $ref_full, identical to baseline"
-else
-  tail -5 "$OUT/replay/full-candidate.out" "$OUT/replay/full-baseline.out"
-  record replay-configured FAIL "candidate [$ref_full] rc=$(rc_of full-candidate) / baseline [$base_full] rc=$(rc_of full-baseline)"
-  [ -z "$TESTS_PID" ] || wait "$TESTS_PID" || true
-  die "configured-epoch replay did not pass; forced smoke tests are meaningless without it"
-fi
-read -r HEAD_SLOT _ _ <<<"$ref_full"
-HEAD_EPOCH=$((HEAD_SLOT / SLOTS_PER_EPOCH))
-
-# ── gates ─────────────────────────────────────────────────────────────────
+# ── gates and forced epochs (from the index, before any replay) ───────────
+IDX_LAST_SLOT="$(python3 -I -c '
+import struct, sys
+b = open(sys.argv[1], "rb").read()
+assert b[:8] == b"BPOSIDX1" and len(b) >= 28, "bad blocks.idx"
+n = (len(b) - 8) // 20
+print(struct.unpack_from("<Q", b, 8 + (n - 1) * 20)[0])' "$SOURCE/blocks.idx")"
+IDX_HEAD_EPOCH=$((IDX_LAST_SLOT / SLOTS_PER_EPOCH))
 gate_names=(); for g in ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}; do gate_names+=(--gate "${g%%=*}"); done
 python3 -I "$GATES_PY" discover --repo "$REPO" --base "$BASE_COMMIT" --candidate "$COMMIT" \
   ${gate_names[@]+"${gate_names[@]}"} > "$OUT/gates.tsv"
-say "gates (name, fleet value, candidate value, status):"; sed 's/^/    /' "$OUT/gates.tsv"
+say "gates (name, fleet value, candidate value, status); source head e$IDX_HEAD_EPOCH (index):"
+sed 's/^/    /' "$OUT/gates.tsv"
+
+forced=()   # "name epoch"
+if [ "$SKIP_FORCED" = 0 ]; then
+  default_e="${FORCE_EPOCH:-$((IDX_HEAD_EPOCH - WINDOW - 8))}"
+  while IFS=$'\t' read -r name _ _ _; do
+    if [ "$GATES_ONLY" = 1 ]; then
+      listed=0; for g in "${GATE_ARGS[@]}"; do [ "${g%%=*}" = "$name" ] && listed=1; done
+      [ "$listed" = 1 ] || continue
+    fi
+    e="$default_e"
+    for g in ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}; do case "$g" in "$name="*) e="${g#*=}" ;; esac; done
+    case "$e" in ''|*[!0-9]*) die "bad forced epoch for $name: $e" ;; esac
+    [ $(( (e + WINDOW) * SLOTS_PER_EPOCH )) -le "$IDX_LAST_SLOT" ] || die "$name: forced epoch $e + window $WINDOW is beyond the source head e$IDX_HEAD_EPOCH"
+    forced+=("$name $e")
+  done < "$OUT/gates.tsv"
+fi
+epochs=""
+[ ${#forced[@]} -eq 0 ] || epochs=$(printf '%s\n' "${forced[@]}" | awk '{print $2}' | sort -un)
+for e in $epochs; do
+  python3 -I "$PREFIX_PY" --source "$SOURCE" --dest "$OUT/data/pre-e$e" --before-slot $((e * SLOTS_PER_EPOCH)) | sed 's/^/  pre-e'"$e"': /'
+  python3 -I "$PREFIX_PY" --source "$SOURCE" --dest "$OUT/data/post-e$e" --before-slot $(((e + WINDOW) * SLOTS_PER_EPOCH)) | sed 's/^/  post-e'"$e"': /'
+done
+
+# ── 3. configured replays + candidate references on each prefix ───────────
+expect=(); [ -z "$EXPECT_ROOT" ] || expect=(--expect-root "$EXPECT_ROOT" --expect-slot "$EXPECT_SLOT")
+replay full-candidate "$BIN" "$SOURCE" ${expect[@]+"${expect[@]}"}
+replay full-baseline "$BASELINE_BIN" "$SOURCE" ${expect[@]+"${expect[@]}"}
+for e in $epochs; do
+  replay "ref-pre-e$e" "$BIN" "$OUT/data/pre-e$e"
+  replay "ref-post-e$e" "$BIN" "$OUT/data/post-e$e"
+done
+
+# ── 4. forced builds (serially, in the container) and their replays ───────
+for item in ${forced[@]+"${forced[@]}"}; do
+  read -r g e <<<"$item"
+  d="$OUT/forced/$g-e$e"; mkdir -p "$d/tree"
+  git -C "$REPO" archive --format=tar "$COMMIT" | tar -xf - -C "$d/tree"
+  if ! python3 -I "$GATES_PY" force --tree "$d/tree" --gate "$g" --epoch "$e" > "$d/patch.txt"; then
+    echo "FAIL	could not patch $g" > "$d/verdict"; continue
+  fi
+  (cd "$d/tree" && git init -q && git add -A \
+    && GIT_AUTHOR_DATE="@$SDE" GIT_COMMITTER_DATE="@$SDE" git -c user.name=hf-qualify -c user.email=hf-qualify@invalid \
+       commit -q -m "QUALIFICATION ONLY - NEVER RELEASE: $g forced to epoch $e on top of $COMMIT")
+  say "forced build $g=e$e ($(tr '\n' ' ' < "$d/patch.txt"))"
+  if (cd "$d/tree" && CONTAINER_ENGINE="$ENGINE" scripts/build-pos-release-container.sh "$d/build") > "$d/build.log" 2>&1; then
+    fb="$d/bloch-pos-FORCED-$g-e$e"
+    mv "$d/build/bloch-pos" "$fb"
+    rm -f "$d/build/SHA256SUMS"
+    echo "QUALIFICATION ONLY: $g forced to epoch $e. Never sign, stage or run on a network." > "$d/build/NEVER-RELEASE"
+    rm -rf "$d/tree"
+    replay "forced-$g-pre" "$fb" "$OUT/data/pre-e$e"
+    replay "forced-$g-post" "$fb" "$OUT/data/post-e$e"
+  else
+    tail -20 "$d/build.log"
+    echo "FAIL	forced build failed (forced/$g-e$e/build.log)" > "$d/verdict"
+  fi
+done
+
+say "waiting for $(( ${#REPLAY_PIDS[@]} )) replay(s)"
+[ ${#REPLAY_PIDS[@]} -eq 0 ] || wait "${REPLAY_PIDS[@]}" || true
+
+# ── verdicts ──────────────────────────────────────────────────────────────
+ref_full="$(head_of full-candidate)"; base_full="$(head_of full-baseline)"
+if [ "$(rc_of full-candidate)" = 0 ] && [ "$(rc_of full-baseline)" = 0 ] && [ -n "$ref_full" ] && [ "$ref_full" = "$base_full" ]; then
+  record replay-configured PASS "head (slot blocks root) $ref_full, identical to baseline"
+  read -r HEAD_SLOT _ _ <<<"$ref_full"
+else
+  tail -5 "$OUT/replay/full-candidate.out" "$OUT/replay/full-baseline.out" || true
+  record replay-configured FAIL "candidate [$ref_full] rc=$(rc_of full-candidate) / baseline [$base_full] rc=$(rc_of full-baseline)"
+  HEAD_SLOT="$IDX_LAST_SLOT"
+fi
+HEAD_EPOCH=$((HEAD_SLOT / SLOTS_PER_EPOCH))
+
 sched_bad=""
 while IFS=$'\t' read -r name _ _ st; do
   case "$st" in
@@ -232,8 +325,10 @@ while IFS=$'\t' read -r name _ _ st; do
       if [ "$e" -le "$HEAD_EPOCH" ]; then
         explicit=0; for g in ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}; do [ "${g%%=*}" = "$name" ] && explicit=1; done
         [ "$explicit" = 1 ] || sched_bad="$sched_bad $name(e$e<=head e$HEAD_EPOCH)"
+      else
+        say "  $name armed at e$e: $(( e - HEAD_EPOCH )) epochs (~$(( (e - HEAD_EPOCH) * 16 / 60 )) h) after the replayed head"
       fi ;;
-    inert) say "  NOTE $name is inert (u64::MAX): not scheduled in this build" ;;
+    inert) : ;;
     missing) sched_bad="$sched_bad $name(missing)" ;;
     *) say "  NOTE $name: $st (check by hand)" ;;
   esac
@@ -241,112 +336,42 @@ done < "$OUT/gates.tsv"
 if [ -n "$sched_bad" ]; then
   record gate-schedule FAIL "changed gate at or before the replayed head:$sched_bad"
 else
-  record gate-schedule PASS "$(wc -l < "$OUT/gates.tsv" | tr -d ' ') gate(s); replayed head e$HEAD_EPOCH"
+  record gate-schedule PASS "$(grep -c scheduled: "$OUT/gates.tsv" || true) armed, $(grep -c inert "$OUT/gates.tsv" || true) inert; replayed head e$HEAD_EPOCH"
 fi
 
-# ── 4. forced early activation, one gate at a time ────────────────────────
 if [ "$SKIP_FORCED" = 1 ]; then
   record forced SKIPPED "--skip-forced"
-elif [ ! -s "$OUT/gates.tsv" ]; then
-  record forced SKIPPED "no changed gate and no --gate given"
+elif [ ${#forced[@]} -eq 0 ]; then
+  record forced SKIPPED "no gate to force"
 else
-  default_e="${FORCE_EPOCH:-$((HEAD_EPOCH - WINDOW - 8))}"
-  forced=()   # "name epoch"
-  while IFS=$'\t' read -r name _ _ _; do
-    e="$default_e"
-    for g in ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}; do
-      case "$g" in "$name="*) e="${g#*=}" ;; esac
-    done
-    case "$e" in ''|*[!0-9]*) die "bad forced epoch for $name: $e" ;; esac
-    [ $(( (e + WINDOW) * SLOTS_PER_EPOCH )) -le "$HEAD_SLOT" ] || die "$name: forced epoch $e + window $WINDOW is beyond the replayed head e$HEAD_EPOCH"
-    forced+=("$name $e")
-  done < "$OUT/gates.tsv"
-
-  # Slot-bounded prefixes and the configured candidate's head on each.
-  epochs=$(printf '%s\n' "${forced[@]}" | awk '{print $2}' | sort -un)
-  for e in $epochs; do
-    python3 -I "$PREFIX_PY" --source "$SOURCE" --dest "$OUT/data/pre-e$e" --before-slot $((e * SLOTS_PER_EPOCH)) | sed 's/^/  pre-e'"$e"': /'
-    python3 -I "$PREFIX_PY" --source "$SOURCE" --dest "$OUT/data/post-e$e" --before-slot $(((e + WINDOW) * SLOTS_PER_EPOCH)) | sed 's/^/  post-e'"$e"': /'
-  done
-  say "reference replays of the configured candidate on each prefix"
-  pids=()
-  for e in $epochs; do
-    alloc; replay "ref-pre-e$e" "$BIN" "$OUT/data/pre-e$e" "$P" & pids+=($!)
-    alloc; replay "ref-post-e$e" "$BIN" "$OUT/data/post-e$e" "$P" & pids+=($!)
-  done
-  wait "${pids[@]}"
-  for e in $epochs; do
-    for k in pre post; do
-      [ "$(rc_of "ref-$k-e$e")" = 0 ] || { tail -5 "$OUT/replay/ref-$k-e$e.out"; die "configured candidate failed on the $k-e$e prefix"; }
-    done
-  done
-
-  # Forced builds, serially (each is a full container build).
   for item in "${forced[@]}"; do
     read -r g e <<<"$item"
-    d="$OUT/forced/$g-e$e"; mkdir -p "$d/tree"
-    git -C "$REPO" archive --format=tar "$COMMIT" | tar -xf - -C "$d/tree"
-    python3 -I "$GATES_PY" force --tree "$d/tree" --gate "$g" --epoch "$e" > "$d/patch.txt" \
-      || { record "forced:$g" FAIL "could not patch"; continue; }
-    (cd "$d/tree" && git init -q && git add -A \
-      && GIT_AUTHOR_DATE="@$SDE" GIT_COMMITTER_DATE="@$SDE" git -c user.name=hf-qualify -c user.email=hf-qualify@invalid \
-         commit -q -m "QUALIFICATION ONLY - NEVER RELEASE: $g forced to epoch $e on top of $COMMIT")
-    say "forced build $g=e$e"
-    if (cd "$d/tree" && CONTAINER_ENGINE="$ENGINE" scripts/build-pos-release-container.sh "$d/build") > "$d/build.log" 2>&1; then
-      mv "$d/build/bloch-pos" "$d/bloch-pos-FORCED-$g-e$e"
-      rm -f "$d/build/SHA256SUMS"
-      echo "QUALIFICATION ONLY: $g forced to epoch $e. Never sign, stage or run on a network." > "$d/build/NEVER-RELEASE"
-      rm -rf "$d/tree"
-    else
-      tail -20 "$d/build.log"; record "forced:$g" FAIL "forced build failed (forced/$g-e$e/build.log)"
-    fi
-  done
-
-  # Forced replays: pre (must equal the configured head) then post (must cross cleanly).
-  run_forced() {
-    local g="$1" e="$2" d="$OUT/forced/$1-e$2" fb ref_pre ref_post h post_head
-    fb="$d/bloch-pos-FORCED-$g-e$e"
-    ref_pre="$(head_of "ref-pre-e$e")"; ref_post="$(head_of "ref-post-e$e")"
-    read -r hs _ hr <<<"$ref_pre"
-    replay "forced-$g-pre" "$fb" "$OUT/data/pre-e$e" "$3" --expect-slot "$hs" --expect-root "$hr"
-    if [ "$(rc_of "forced-$g-pre")" != 0 ]; then
-      echo "FAIL	pre-activation replay differs from the configured build (replay/forced-$g-pre.out)" > "$d/verdict"; return 0
-    fi
-    replay "forced-$g-post" "$fb" "$OUT/data/post-e$e" "$4"
-    post_head="$(head_of "forced-$g-post")"
-    if [ "$(rc_of "forced-$g-post")" = 0 ]; then
-      if [ "$post_head" = "$ref_post" ]; then
-        echo "PASS	inert-on-history: crossed e$e and replayed to e$((e + WINDOW)) unchanged" > "$d/verdict"
+    d="$OUT/forced/$g-e$e"
+    if [ ! -f "$d/verdict" ]; then
+      ref_pre="$(head_of "ref-pre-e$e")"; ref_post="$(head_of "ref-post-e$e")"
+      pre_head="$(head_of "forced-$g-pre")"; post_head="$(head_of "forced-$g-post")"
+      if [ "$(rc_of "ref-pre-e$e")" != 0 ] || [ "$(rc_of "ref-post-e$e")" != 0 ]; then
+        echo "FAIL	the configured candidate itself failed on the e$e prefixes (replay/ref-*-e$e.out)" > "$d/verdict"
+      elif [ "$(rc_of "forced-$g-pre")" != 0 ] || [ "$pre_head" != "$ref_pre" ]; then
+        echo "FAIL	before activation the forced build differs: [$pre_head] vs configured [$ref_pre] (replay/forced-$g-pre.out)" > "$d/verdict"
+      elif [ "$(rc_of "forced-$g-post")" = 0 ]; then
+        if [ "$post_head" = "$ref_post" ]; then
+          echo "PASS	identical before e$e; crossed it and replayed to e$((e + WINDOW)) with history still valid (inert-on-history)" > "$d/verdict"
+        else
+          echo "FAIL	replayed but head [$post_head] != configured [$ref_post]" > "$d/verdict"
+        fi
+      elif grep -q 'did not re-apply to its header state root' "$OUT/replay/forced-$g-post.out"; then
+        h="$(grep -h 'apply refused' "$OUT/replay/forced-$g-post/candidate.log" 2>/dev/null | head -1 | cut -c1-160)"
+        echo "PASS	identical before e$e; after it a clean consensus rejection (diverged-after-activation): ${h:-no reason logged}" > "$d/verdict"
       else
-        echo "FAIL	replayed but head [$post_head] != configured [$ref_post]" > "$d/verdict"
+        echo "FAIL	post-activation replay crashed or stopped without a consensus verdict (replay/forced-$g-post.out)" > "$d/verdict"
       fi
-    elif grep -q 'did not re-apply to its header state root' "$OUT/replay/forced-$g-post.out"; then
-      h="$(grep -h 'apply refused' "$OUT/replay/forced-$g-post/candidate.log" 2>/dev/null | head -1 | cut -c1-160)"
-      echo "PASS	diverged-after-activation (clean consensus rejection at or after slot $((e * SLOTS_PER_EPOCH))): ${h:-no reason logged}" > "$d/verdict"
-    else
-      echo "FAIL	post-activation replay crashed or stopped without a consensus verdict (replay/forced-$g-post.out)" > "$d/verdict"
     fi
-  }
-  pids=()
-  for item in "${forced[@]}"; do
-    read -r g e <<<"$item"
-    [ -x "$OUT/forced/$g-e$e/bloch-pos-FORCED-$g-e$e" ] || continue
-    alloc; p_pre=$P; alloc
-    run_forced "$g" "$e" "$p_pre" "$P" & pids+=($!)
-    # Throttle: keep at most JOBS forced pipelines alive.
-    while [ "$(jobs -rp | grep -vx "${TESTS_PID:-none}" | wc -l)" -ge "$JOBS" ]; do sleep 20; done
-  done
-  [ ${#pids[@]} -eq 0 ] || wait "${pids[@]}"
-  for item in "${forced[@]}"; do
-    read -r g e <<<"$item"
-    v="$OUT/forced/$g-e$e/verdict"
-    [ -f "$v" ] || continue
-    IFS=$'\t' read -r st detail < "$v"
+    IFS=$'\t' read -r st detail < "$d/verdict"
     record "forced:$g@e$e" "$st" "$detail"
   done
 fi
 
-# ── verdict ───────────────────────────────────────────────────────────────
 if [ -n "$TESTS_PID" ]; then say "waiting for the workspace tests"; wait "$TESTS_PID" || true; fi
 echo "finished=$(date -u +%FT%TZ)" >> "$OUT/qualify.env"
 echo
