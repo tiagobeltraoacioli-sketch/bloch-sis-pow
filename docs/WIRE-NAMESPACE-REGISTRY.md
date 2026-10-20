@@ -138,7 +138,7 @@ has drifted to ~1008 in the deeper worktrees).
 | `0x14` | `L2Deposit` | **Assigned, native L2** — `devnet-l2-deposits` builds only until activation | l2 | `wire_tag_registry.rs` |
 | `0x15` | `L2DataAvailability` | **Assigned, native L2** — `devnet-l2-user-txs` builds only until activation | l2 | `wire_tag_registry.rs` |
 | `0x16` | `L2WithdrawClaim` | **Assigned, native L2** — `devnet-l2-user-txs` builds only until activation | l2 | `wire_tag_registry.rs` |
-| `0x17` | `KesRegister` | **HF3, implemented on this line, unarmed** — refused before `HF3_KES_EPOCH` (= `KES_REGISTRATION_EPOCH`, u64::MAX); same byte devnet4 runs | consensus | `wire_alloc.rs`, `wire_tag_registry.rs` |
+| `0x17` | `KesRegister` | **HF3, implemented on this line, unarmed** — refused before `HF3_KES_EPOCH` (= `KES_REGISTRATION_EPOCH`, u64::MAX); same byte devnet4 runs. `HF3_KES_EPOCH` is itself a flag day: the first block carrying 0x17 (or 0x1B) forks every node without this code (rehearsal kes-1) | consensus | `wire_alloc.rs`, `wire_tag_registry.rs` |
 | `0x18` | `WithdrawalCredentialRotation` | **HF3, reserved** — PQ migration, gate `HF3_PQ_MIGRATION_EPOCH` | pq-migration | `wire_alloc.rs` |
 | `0x19` | `RescueCommit` | **HF3, reserved** — PQ migration, gate `HF3_PQ_MIGRATION_EPOCH` | pq-migration | `wire_alloc.rs` |
 | `0x1A` | `RescueReveal` | **HF3, reserved** — PQ migration, gate `HF3_PQ_MIGRATION_EPOCH` | pq-migration | `wire_alloc.rs` |
