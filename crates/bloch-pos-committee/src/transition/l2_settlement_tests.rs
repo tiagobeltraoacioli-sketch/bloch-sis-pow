@@ -3615,4 +3615,10 @@ mod l2_tests {
         swapped.extend_from_slice(&bytes[l2..own]);
         assert!(CommittedState::decode_local_cache(&swapped, &header).is_err());
     }
+
+    // Adversarial multi-branch FFG suite (p2b).
+    mod ffg_branch_tests {
+        use super::*;
+        include!("ffg_branch_tests.rs");
+    }
 }

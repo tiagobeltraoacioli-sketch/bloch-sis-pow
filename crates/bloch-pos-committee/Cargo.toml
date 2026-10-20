@@ -21,6 +21,12 @@ native-dex-rehearsal = ["dep:bloch-euvm"]
 # node that is producing.
 perf-timing = []
 local-state-cache = ["dep:serde", "dep:bincode"]
+# TEST-ONLY, TEMPORARY. Compiles the FFG branch tests
+# (src/transition/ffg_branch_tests.rs) that arm the L2 claim-finality rule of
+# hard fork 1, which is ported on a separate branch; without that branch they
+# do not compile. The hard-fork-1 integration deletes this feature and its
+# `cfg`s. No effect on any non-test build.
+hf1-claim-finality-tests = []
 # DEVELOPMENT NETWORKS ONLY. Arms RANDAO re-commits from genesis (all other
 # lifecycle gates unchanged). A node built with it refuses non-BPOSMAN3
 # manifests. Never enable it for Genesis-4 or any funded network.
