@@ -1,0 +1,18 @@
+[package]
+name = "bloch-mldsa-clean"
+version = "0.1.0"
+edition = "2021"
+authors = ["Bloch-SIS Protocol"]
+description = "Bloch consensus ML-DSA-65: safe wrappers pinning verify/sign to PQClean's portable `clean` implementation on every platform"
+license = "AGPL-3.0-or-later"
+repository = "https://gitlab.com/bloch-protocol/bloch"
+
+[dependencies]
+# Same exact pin as bloch-crypto (I-4). `default-features = false`: this crate
+# never needs the AVX2/AArch64 backends; it calls `PQCLEAN_MLDSA65_CLEAN_*`
+# directly, so the result is the same even if some other crate's features
+# unify the SIMD backends back into the build.
+pqcrypto-mldsa = { version = "=0.1.2", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+pqcrypto-traits = "0.3"
