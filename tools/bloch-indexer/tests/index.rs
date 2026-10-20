@@ -713,3 +713,46 @@ fn a_block_this_build_cannot_apply_halts_at_the_previous_height_and_says_why() {
     assert_eq!(ix.height(), 1);
     std::fs::remove_dir_all(d).unwrap();
 }
+
+
+// ── Post-quantum migration (HF3) ────────────────────────────────────────────
+
+/// The rescue reveal spends every output of the revealed key. Without replay
+/// (this fixture) the swept output's value is unknown (inputs minus a fee
+/// only consensus computes), so only the spends are checked here; the serving
+/// path takes the output from the replay receipt (`created_output_bound`).
+/// Rotation and commit move no eUTXO. All three carry the node's kind names.
+#[test]
+fn pq_migration_transactions_have_their_ledger_effects_and_names() {
+    use bloch_pos_committee::transition::{FundingInput, RescueCommit, RescueReveal, WithdrawalCredentialRotation};
+    let genesis = h32(1);
+    let lattice = h32(0x1A);
+    let other = h32(0x0B);
+    let a = OutPoint { txid: h32(10), vout: 0 };
+    let b = OutPoint { txid: h32(11), vout: 3 };
+    let c = OutPoint { txid: h32(12), vout: 0 };
+    let mut ix = Index::new(genesis, vec![
+        (a, Utxo { value_sat: 600, script_hash: lattice, created_height: 0 }),
+        (b, Utxo { value_sat: 400, script_hash: lattice, created_height: 0 }),
+        (c, Utxo { value_sat: 50, script_hash: other, created_height: 0 }),
+    ], 64);
+    let rotation = PosTransaction::WithdrawalCredentialRotation(WithdrawalCredentialRotation {
+        network_domain: [0u8; 32], epoch: 0, validator: 7,
+        authorizing_pubkey: vec![1; 4], new_pubkey: vec![2; 4],
+        authorizing_signature: vec![3; 4], new_key_signature: vec![4; 4],
+    });
+    let commit = PosTransaction::RescueCommit(RescueCommit { network_domain: [0u8; 32], commitment: h32(0xCC) });
+    let reveal = PosTransaction::RescueReveal(RescueReveal {
+        network_domain: [0u8; 32], pubkey: vec![5; 4],
+        inputs: vec![FundingInput { txid: a.txid, vout: a.vout }, FundingInput { txid: b.txid, vout: b.vout }],
+        destination_script_hash: h32(0xDE), tip_millisat_per_gas: 0, tx_bytes: 0, signature: vec![6; 4],
+    });
+    ix.apply(&envelope(header(1, genesis, 0, 1), vec![rotation, commit, reveal], vec![]), 0);
+    assert_eq!(ix.balance_of(&lattice), 0, "the reveal spent both lattice outputs");
+    assert!(!ix.utxo.contains_key(&a) && !ix.utxo.contains_key(&b));
+    assert_eq!(ix.balance_of(&other), 50, "unrelated outputs untouched");
+    let kinds: Vec<String> = ix.txs.iter().map(|t| t.kind.name()).collect();
+    assert_eq!(kinds, ["withdrawal_credential_rotation", "pq_rescue_commit", "pq_rescue_reveal"]);
+    assert_eq!(ix.txs[2].inputs, vec![a, b]);
+    assert!(ix.txs[0].inputs.is_empty() && ix.txs[1].inputs.is_empty());
+}

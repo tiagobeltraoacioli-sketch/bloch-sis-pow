@@ -159,6 +159,14 @@ pub enum TxKind {
     /// messages in through the roots they were signed over, so nothing
     /// recovers an envelope from it. Recorded as present rather than dropped.
     SlashingEvidence,
+    /// Post-quantum migration (0x18): a validator's withdrawal credential
+    /// moves to a hash-based-suite key. No eUTXO effect.
+    WithdrawalCredentialRotation,
+    /// Lattice-break rescue commitment (0x19). No eUTXO effect, fee-free.
+    PqRescueCommit,
+    /// Lattice-break rescue reveal (0x1A): sweeps every output of one key
+    /// into one output at vout 0.
+    PqRescueReveal,
     /// A tag this build does not know. Recorded, never fatal: an index that
     /// aborts on an unknown tag stops being available exactly when a new
     /// transaction type ships.
@@ -187,6 +195,9 @@ impl TxKind {
             TxKind::Exit => "exit".into(),
             TxKind::Delegate => "delegate".into(),
             TxKind::SlashingEvidence => "slashing_evidence".into(),
+            TxKind::WithdrawalCredentialRotation => "withdrawal_credential_rotation".into(),
+            TxKind::PqRescueCommit => "pq_rescue_commit".into(),
+            TxKind::PqRescueReveal => "pq_rescue_reveal".into(),
             TxKind::Unknown(t) => format!("unknown_{t:#04x}"),
         }
     }

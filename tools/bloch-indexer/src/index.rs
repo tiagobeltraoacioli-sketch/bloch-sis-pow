@@ -829,11 +829,10 @@ fn kind_of(tx: &PosTransaction) -> TxKind {
         PosTransaction::ExitV2 { .. } => TxKind::ExitV2,
         PosTransaction::RandaoRecommit { .. } => TxKind::RandaoRecommit,
         PosTransaction::SlashingEvidence(_) => TxKind::SlashingEvidence,
-        // Post-quantum migration (0x18-0x1A), gated inert. Recorded by tag
-        // only; the index must learn the reveal's sweep before activation.
-        PosTransaction::WithdrawalCredentialRotation(_) => TxKind::Unknown(0x18),
-        PosTransaction::RescueCommit(_) => TxKind::Unknown(0x19),
-        PosTransaction::RescueReveal(_) => TxKind::Unknown(0x1A),
+        // Post-quantum migration (0x18-0x1A). Names match the node's RPC.
+        PosTransaction::WithdrawalCredentialRotation(_) => TxKind::WithdrawalCredentialRotation,
+        PosTransaction::RescueCommit(_) => TxKind::PqRescueCommit,
+        PosTransaction::RescueReveal(_) => TxKind::PqRescueReveal,
     }
 }
 
@@ -887,6 +886,15 @@ fn transfer_parts(tx: &PosTransaction) -> (Vec<OutPoint>, Vec<(u64, ScriptHash)>
                 outs, c.tx_bytes, c.tip_millisat_per_gas,
             )
         }
+        // Post-quantum rescue reveal (0x1A): spends every output of the
+        // revealed key (both script forms) and creates ONE output at vout 0
+        // for `destination_script_hash` worth inputs minus fee. The value is
+        // known only after the fee, so the output comes from the replay
+        // receipt (`created_output_bound` = 1), never from a declaration.
+        PosTransaction::RescueReveal(r) => (
+            r.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
+            Vec::new(), r.tx_bytes, r.tip_millisat_per_gas,
+        ),
         // No eUTXO inputs. Withdraw-style payouts (FundedDelegationWithdraw,
         // Withdraw) create an output that only consensus can value; it comes
         // from the replay receipt (`created_output_bound`).
@@ -905,7 +913,12 @@ fn transfer_parts(tx: &PosTransaction) -> (Vec<OutPoint>, Vec<(u64, ScriptHash)>
         | PosTransaction::Withdraw { .. }
         | PosTransaction::ExitV2 { .. }
         | PosTransaction::RandaoRecommit { .. }
-        | PosTransaction::SlashingEvidence(_) => (Vec::new(), Vec::new(), 0, 0),
+        | PosTransaction::SlashingEvidence(_)
+        // Credential rotation (0x18) rewrites where a later `Withdraw` pays;
+        // that payout already comes from the receipt. Rescue commit (0x19)
+        // is fee-free state only.
+        | PosTransaction::WithdrawalCredentialRotation(_)
+        | PosTransaction::RescueCommit(_) => (Vec::new(), Vec::new(), 0, 0),
     }
 }
 
@@ -924,6 +937,8 @@ fn created_output_bound(tx: &PosTransaction) -> usize {
         // and change at vout 1 (claim).
         PosTransaction::L2Deposit(_) | PosTransaction::L2DataAvailability(_) => 1,
         PosTransaction::L2WithdrawClaim(_) => 2,
+        PosTransaction::RescueReveal(_) => 1,
+        PosTransaction::WithdrawalCredentialRotation(_) | PosTransaction::RescueCommit(_) => 0,
         PosTransaction::L2Settlement(_)
         | PosTransaction::L2SettlementAsync(_)
         | PosTransaction::FundedUndelegate(_)
