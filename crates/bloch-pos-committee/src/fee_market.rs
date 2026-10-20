@@ -186,6 +186,174 @@ pub const SECP256K1_VERIFY_GAS: u64 = 3_000;
 /// harness). The spec forbids activation with this number unmeasured.
 pub const SHIELDED_VERIFY_GAS_PROVISIONAL: u64 = 25 * HYBRID_VERIFY_GAS;
 
+// ── Per-suite verification gas (HF3; inert until HF3_SLH_SUITE_EPOCH) ───────
+//
+// `HYBRID_VERIFY_GAS` is suite-blind: every eUTXO witness is charged one
+// ML-DSA-65 ‖ Falcon-1024 verification whatever its envelope says. That is
+// exact today (live spends are suite 0x0001 only) and would UNDER-price the
+// optional hash-based suite 0x0003 by an order of magnitude, so from
+// `params::HF3_SLH_SUITE_EPOCH` the verify term is read per witness from the
+// public key's envelope header — the same header the verifier dispatches on,
+// so the gas charged is the work actually run.
+//
+// Derivation rule: a suite's verify gas is the MAX of two measured costs,
+// each scaled so that suite 0x0001 lands exactly on `HYBRID_VERIFY_GAS`:
+//   (a) RV32IM instructions / `INSTRUCTIONS_PER_GAS` — the existing,
+//       hardware-independent calibration (same interpreter, same ratio);
+//   (b) native single-core verify time on the fleet's Xeon (Cascade Lake,
+//       136.244.93.186, the 209.250.236.240 class) in units of the hybrid's.
+// (a) alone would under-price the shipped verifier: PQClean's ML-DSA/Falcon
+// are vectorised while `fips205`'s Keccak is portable Rust, so the native
+// ratio (≈14.7×) exceeds the instruction ratio (≈10.6×). Taking the max means
+// neither the prover nor a validator's CPU is ever sold below cost. Raw
+// numbers: `spikes/slhdsa-verify-cost/RESULTS.md`.
+
+/// Envelope magic shared by every enveloped key and signature
+/// (`bloch-crypto::crypto::parse_envelope`): `B1 0C ‖ suite_id u16 LE`.
+pub const SUITE_ENVELOPE_MAGIC: [u8; 2] = [0xB1, 0x0C];
+
+// Suite id and key shape live in `params` (the one HF3 home). Only a key of
+// exactly the enveloped 0x0003 shape is priced as an SLH witness: any other
+// 0x0003-labelled bytes are refused by the verifier on length alone, before
+// any hashing, and a legacy raw hybrid key (3,745 B) that happens to start
+// with the 0x0003 header bytes is still a hybrid to the verifier — and so to
+// the fee.
+pub use crate::params::{SLHDSA_FALCON_ENVELOPED_PUBKEY_LEN, SUITE_SLHDSA128S_FALCON1024};
+
+/// Measured RV32IM instructions per half, same harness as
+/// [`HYBRID_VERIFY_INSTRUCTIONS`] (`spikes/prover-cost/RESULTS.md`).
+pub const MLDSA65_VERIFY_INSTRUCTIONS: u64 = 5_909_451;
+pub const FALCON1024_VERIFY_INSTRUCTIONS: u64 = 1_312_901;
+/// SLH-DSA-SHAKE-128s verify (`fips205` 0.4.1, suite context string):
+/// 76,056,212 instructions, 4,378 Keccak-f1600 permutations (94.3%).
+pub const SLHDSA128S_VERIFY_INSTRUCTIONS: u64 = 76_056_212;
+
+/// Measured native single-core verify time, nanoseconds (median of 5
+/// batches, Cascade Lake Xeon). Only RATIOS against the hybrid enter gas.
+pub const MLDSA65_VERIFY_NATIVE_NS: u64 = 53_600;
+pub const FALCON1024_VERIFY_NATIVE_NS: u64 = 102_000;
+pub const SLHDSA128S_VERIFY_NATIVE_NS: u64 = 2_181_500;
+/// Suite 0x0001 natively: the calibration point of rule (b).
+pub const HYBRID_VERIFY_NATIVE_NS: u64 = MLDSA65_VERIFY_NATIVE_NS + FALCON1024_VERIFY_NATIVE_NS;
+
+/// Verify gas for a pair from its two measured costs (rules (a), (b) above).
+pub const fn pair_verify_gas(instructions: u64, native_ns: u64) -> u64 {
+    let by_instructions = instructions / INSTRUCTIONS_PER_GAS;
+    let by_time = ((HYBRID_VERIFY_GAS as u128 * native_ns as u128)
+        .div_ceil(HYBRID_VERIFY_NATIVE_NS as u128)) as u64;
+    if by_instructions > by_time { by_instructions } else { by_time }
+}
+
+/// Gas for one SLH-DSA-128s ‖ Falcon-1024 verification: 1,067,610.
+pub const SLHDSA_FALCON_VERIFY_GAS: u64 = pair_verify_gas(
+    SLHDSA128S_VERIFY_INSTRUCTIONS + FALCON1024_VERIFY_INSTRUCTIONS,
+    SLHDSA128S_VERIFY_NATIVE_NS + FALCON1024_VERIFY_NATIVE_NS,
+);
+
+/// Whether per-suite verify gas binds at `epoch`. `u64::MAX` is "never",
+/// even at epoch `u64::MAX` — the same sentinel rule as
+/// `bloch_crypto::crypto::hf3_slh_suite_active`, so the fee arm and the
+/// verifier arm cannot disagree at the boundary.
+pub fn per_suite_verify_gas_active(epoch: u64) -> bool {
+    crate::params::hf3_slh_suite_active(epoch)
+}
+
+#[cfg(test)]
+pub(crate) const fn per_suite_verify_gas_active_under(epoch: u64, activation: u64) -> bool {
+    crate::params::epoch_gate_active(epoch, activation)
+}
+
+/// The verification family a witness public key selects, read from its
+/// envelope header and exact length only (no parsing of the body, no
+/// allocation). Anything that is not a well-formed suite-0x0003 key — suite
+/// 0x0001, 0x0002, legacy raw keys, malformed or unknown-suite bytes — is
+/// priced as today's hybrid: those either run the hybrid verifier (or less)
+/// or are rejected by it before any hashing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifySuite {
+    Hybrid,
+    SlhDsaFalcon,
+}
+
+pub const fn verify_suite_of(pubkey: &[u8]) -> VerifySuite {
+    if pubkey.len() != SLHDSA_FALCON_ENVELOPED_PUBKEY_LEN
+        || pubkey[0] != SUITE_ENVELOPE_MAGIC[0]
+        || pubkey[1] != SUITE_ENVELOPE_MAGIC[1]
+    {
+        return VerifySuite::Hybrid;
+    }
+    match u16::from_le_bytes([pubkey[2], pubkey[3]]) {
+        SUITE_SLHDSA128S_FALCON1024 => VerifySuite::SlhDsaFalcon,
+        _ => VerifySuite::Hybrid,
+    }
+}
+
+/// Verify gas of one witness of `suite`.
+pub const fn suite_verify_gas(suite: VerifySuite) -> u64 {
+    match suite {
+        VerifySuite::Hybrid => HYBRID_VERIFY_GAS,
+        VerifySuite::SlhDsaFalcon => SLHDSA_FALCON_VERIFY_GAS,
+    }
+}
+
+/// Node-local relay weight of one verification of `pubkey`'s suite, in
+/// hybrid-verification units (`ceil(suite gas / HYBRID_VERIFY_GAS)`): 1 for
+/// suite 0x0001, 15 for suite 0x0003. Gossip verification budgets count
+/// these units (from the HF3 epoch — see bloch-pos-node
+/// `engine::verification`) so an SLH-heavy flood buys the same CPU per slot
+/// as a hybrid one. Not consensus.
+pub const fn verify_cost_units(pubkey: &[u8]) -> u64 {
+    suite_verify_gas(verify_suite_of(pubkey)).div_ceil(HYBRID_VERIFY_GAS)
+}
+
+/// [`verify_cost_units`] at `epoch`: exactly 1 below the HF3 gate (today's
+/// one-call-one-unit budget, byte-identical), suite-weighted from it.
+pub fn verify_cost_units_at(pubkey: &[u8], epoch: u64) -> u64 {
+    if per_suite_verify_gas_active(epoch) { verify_cost_units(pubkey) } else { 1 }
+}
+
+/// The eUTXO class for a transfer whose witnesses carry `keys`, at `epoch`.
+///
+/// Below the flag day this is exactly `Eutxo { inputs: keys.len() }` —
+/// byte-for-byte today's charge whatever the envelopes say (an SLH key is
+/// refused by the verifier there anyway). From the flag day each witness is
+/// priced by its own suite. Callers pass the keys the node will ACTUALLY
+/// verify: one per V1 input, one per V2 table entry.
+pub fn eutxo_class_for_keys<'a, I>(epoch: u64, keys: I) -> TxClass
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    eutxo_class_for_keys_with(per_suite_verify_gas_active(epoch), keys)
+}
+
+#[cfg(test)]
+pub(crate) fn eutxo_class_for_keys_under<'a, I>(epoch: u64, activation: u64, keys: I) -> TxClass
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    eutxo_class_for_keys_with(per_suite_verify_gas_active_under(epoch, activation), keys)
+}
+
+fn eutxo_class_for_keys_with<'a, I>(armed: bool, keys: I) -> TxClass
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut hybrid = 0u32;
+    let mut slh_falcon = 0u32;
+    for key in keys {
+        match verify_suite_of(key) {
+            VerifySuite::Hybrid => hybrid = hybrid.saturating_add(1),
+            VerifySuite::SlhDsaFalcon => slh_falcon = slh_falcon.saturating_add(1),
+        }
+    }
+    if !armed || slh_falcon == 0 {
+        // Below the gate: today's suite-blind count. From it, an all-hybrid
+        // transfer keeps the same value AND variant as before the flag day.
+        return TxClass::Eutxo { inputs: hybrid.saturating_add(slh_falcon) };
+    }
+    TxClass::EutxoSuites { hybrid, slh_falcon }
+}
+
 /// The transaction classes a block can carry, for intrinsic-gas purposes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxClass {
@@ -198,6 +366,11 @@ pub enum TxClass {
     /// over the shared signing root authorises all of that owner's inputs.
     /// Both callers derive the count from their lists; nothing asserts it.
     Eutxo { inputs: u32 },
+    /// eUTXO transfer with at least one suite-0x0003 (SLH-DSA ‖ Falcon)
+    /// witness, priced per suite. Only [`eutxo_class_for_keys`] builds it,
+    /// and only once [`per_suite_verify_gas_active`]; counts are
+    /// verifications, as above.
+    EutxoSuites { hybrid: u32, slh_falcon: u32 },
     /// EVM transaction from a PQ (hybrid) account: one envelope verification.
     EvmPq,
     /// EVM transaction from a secp256k1 account — **gated** on the founder's
@@ -212,6 +385,9 @@ pub enum TxClass {
 pub const fn verify_gas(class: TxClass) -> u64 {
     match class {
         TxClass::Eutxo { inputs } => HYBRID_VERIFY_GAS.saturating_mul(inputs as u64),
+        TxClass::EutxoSuites { hybrid, slh_falcon } => HYBRID_VERIFY_GAS
+            .saturating_mul(hybrid as u64)
+            .saturating_add(SLHDSA_FALCON_VERIFY_GAS.saturating_mul(slh_falcon as u64)),
         TxClass::EvmPq => HYBRID_VERIFY_GAS,
         TxClass::EvmSecp256k1 => SECP256K1_VERIFY_GAS,
         TxClass::Shielded => SHIELDED_VERIFY_GAS_PROVISIONAL,
@@ -564,6 +740,19 @@ const _: () = assert!(MIN_BASE_FEE_MILLISAT_PER_GAS >= BASE_FEE_CHANGE_DENOMINAT
 
 // The derived verify price is the number the spec quotes.
 const _: () = assert!(HYBRID_VERIFY_GAS == 72_748);
+
+// Per-suite verify gas (P9f). The calibration point holds: the hybrid's own
+// halves, run through the same rule, land exactly on HYBRID_VERIFY_GAS.
+const _: () = assert!(
+    pair_verify_gas(MLDSA65_VERIFY_INSTRUCTIONS + FALCON1024_VERIFY_INSTRUCTIONS, HYBRID_VERIFY_NATIVE_NS)
+        == HYBRID_VERIFY_GAS
+);
+const _: () = assert!(SLHDSA_FALCON_VERIFY_GAS == 1_067_610);
+// The pair may not be cheaper than the instruction rule alone says.
+const _: () = assert!(SLHDSA_FALCON_VERIFY_GAS >= (SLHDSA128S_VERIFY_INSTRUCTIONS + FALCON1024_VERIFY_INSTRUCTIONS) / INSTRUCTIONS_PER_GAS);
+// A block can still carry dozens of SLH witnesses by gas: ~1.07 M gas each
+// against the 60 M cap leaves the byte cap, not gas, as the co-binding limit.
+const _: () = assert!(BLOCK_GAS_LIMIT / SLHDSA_FALCON_VERIFY_GAS >= 50);
 
 // One satoshi is still the settlement quantum; the msat price never mints
 // sub-satoshi value (ceil_div output is whole satoshis by construction, this
@@ -978,5 +1167,88 @@ mod tests {
         };
         let p = distribute_producer_fees(&acct, 12_345);
         assert_eq!((p.operator, p.delegators, p.forfeited), (12_345, 0, 0));
+    }
+
+    // ── Per-suite verify gas (HF3 suite 0x0003) ─────────────────────────
+
+    fn enveloped(suite: u16, body_len: usize) -> Vec<u8> {
+        let mut k = vec![0xB1, 0x0C];
+        k.extend_from_slice(&suite.to_le_bytes());
+        k.resize(4 + body_len, 0x5A);
+        k
+    }
+
+    fn slh_key() -> Vec<u8> { enveloped(SUITE_SLHDSA128S_FALCON1024, 1825) }
+
+    #[test]
+    fn hf3_fee_gate_ships_inert_and_is_bit_identical_below_it() {
+        assert_eq!(crate::params::HF3_SLH_SUITE_EPOCH, u64::MAX);
+        let slh_f = slh_key();
+        let hyb = enveloped(0x0001, 3745);
+        let unknown = enveloped(0x0004, 1984);
+        let keys: [&[u8]; 3] = [&slh_f, &unknown, &hyb];
+        for epoch in [0, 1, 6_017, u64::MAX - 1, u64::MAX] {
+            assert!(!per_suite_verify_gas_active(epoch));
+            assert_eq!(eutxo_class_for_keys(epoch, keys), TxClass::Eutxo { inputs: 3 });
+            for k in keys {
+                assert_eq!(verify_cost_units_at(k, epoch), 1, "gossip budget unchanged below HF3");
+            }
+        }
+        // u64::MAX is "never" even when the epoch is u64::MAX itself.
+        assert!(!per_suite_verify_gas_active_under(u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn hf3_fee_gate_prices_each_witness_by_its_envelope_once_armed() {
+        const ACT: u64 = 7_000;
+        let slh_f = slh_key();
+        let hyb = enveloped(0x0001, 3745);
+        let legacy_raw = vec![0u8; 3745];
+        let mldsa_only = enveloped(0x0002, 1952);
+        let unknown = enveloped(0x0004, 1984);
+        let keys: [&[u8]; 6] = [&slh_f, &slh_f, &hyb, &legacy_raw, &mldsa_only, &unknown];
+        assert_eq!(eutxo_class_for_keys_under(ACT - 1, ACT, keys), TxClass::Eutxo { inputs: 6 });
+        let armed = eutxo_class_for_keys_under(ACT, ACT, keys);
+        assert_eq!(armed, TxClass::EutxoSuites { hybrid: 4, slh_falcon: 2 });
+        assert_eq!(verify_gas(armed), 4 * HYBRID_VERIFY_GAS + 2 * SLHDSA_FALCON_VERIFY_GAS);
+        // An all-hybrid transfer keeps the old variant and value after the flag day.
+        let hybrids: [&[u8]; 2] = [&hyb, &legacy_raw];
+        assert_eq!(eutxo_class_for_keys_under(ACT + 1, ACT, hybrids), TxClass::Eutxo { inputs: 2 });
+        // Malformed / truncated / wrong-length / unknown headers are priced as
+        // hybrid, never as free, and never panic.
+        let mut legacy_collision = vec![0x77u8; 3745];
+        legacy_collision[..4].copy_from_slice(&[0xB1, 0x0C, 0x03, 0x00]);
+        for k in [&[][..], &[0xB1][..], &[0xB1, 0x0C, 0x03][..], &[0xB1, 0x0C, 0x03, 0x00][..],
+                  &[0xB1, 0x0D, 0x03, 0x00][..], &[0xB1, 0x0C, 0xFF, 0xFF][..],
+                  &enveloped(SUITE_SLHDSA128S_FALCON1024, 1824)[..],
+                  &enveloped(SUITE_SLHDSA128S_FALCON1024, 1826)[..], &legacy_collision[..]] {
+            assert_eq!(verify_suite_of(k), VerifySuite::Hybrid, "{} bytes", k.len());
+        }
+        assert_eq!(verify_suite_of(&slh_f), VerifySuite::SlhDsaFalcon);
+    }
+
+    #[test]
+    fn slh_verify_units_bound_relay_cpu_like_hybrid() {
+        assert_eq!(verify_cost_units(&enveloped(0x0001, 3745)), 1);
+        assert_eq!(verify_cost_units(&slh_key()), 15);
+        // Units x the hybrid's native time covers the pair's native time.
+        let ns = SLHDSA128S_VERIFY_NATIVE_NS + FALCON1024_VERIFY_NATIVE_NS;
+        assert!(SLHDSA_FALCON_VERIFY_GAS.div_ceil(HYBRID_VERIFY_GAS) * HYBRID_VERIFY_NATIVE_NS >= ns);
+    }
+
+    /// The DoS bound in one place: per block, the gas cap alone limits how
+    /// many SLH verifications a block can make the network run, and that
+    /// worst case stays a small fraction of a slot on one core.
+    #[test]
+    fn worst_case_slh_verifications_per_block_are_bounded_by_gas() {
+        let max_verifies = BLOCK_GAS_LIMIT / SLHDSA_FALCON_VERIFY_GAS;
+        assert_eq!(max_verifies, 56);
+        let worst_ns = max_verifies * (SLHDSA128S_VERIFY_NATIVE_NS + FALCON1024_VERIFY_NATIVE_NS);
+        assert!(worst_ns < 150_000_000, "{worst_ns} ns of verification per block");
+        // A hybrid-priced block of the same gas would have bought ~14.7x the
+        // SLH CPU had the suite stayed suite-blind: the reason the fee arm and
+        // the verifier arm share one gate.
+        let blind = (BLOCK_GAS_LIMIT / HYBRID_VERIFY_GAS) * (SLHDSA128S_VERIFY_NATIVE_NS + FALCON1024_VERIFY_NATIVE_NS);
+        assert!(blind > 10 * worst_ns);
     }
 }

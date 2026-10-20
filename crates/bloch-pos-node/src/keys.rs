@@ -1325,7 +1325,37 @@ impl bloch_pos_committee::attestation::SignatureVerifier for HybridVerifier {
     fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool {
         bloch_crypto::crypto::verify(pubkey, signing_root, signature)
     }
+
+    /// HF3 spend witnesses: `bloch_crypto::crypto::verify_spend` with the
+    /// gate decided by the ONE HF3 constant
+    /// (`bloch_pos_committee::params::hf3_slh_suite_active`). Closed, it is
+    /// exactly `verify`; open, it also accepts suite 0x0003
+    /// (SLH-DSA-SHAKE-128s ‖ Falcon-1024, both halves, Falcon first).
+    fn verify_spend_at_epoch(
+        &self,
+        pubkey: &[u8],
+        signing_root: &[u8; 32],
+        signature: &[u8],
+        epoch: u64,
+    ) -> bool {
+        bloch_crypto::crypto::verify_spend(
+            pubkey,
+            signing_root,
+            signature,
+            bloch_pos_committee::params::hf3_slh_suite_active(epoch),
+        )
+    }
 }
+
+// HF3: the activation epoch exists ONLY in bloch-pos-committee (params);
+// bloch-crypto takes the gate verdict as an argument. The wire constants that
+// both crates must agree on are pinned here, the one crate linking both (the
+// lengths are runtime functions in bloch-crypto, so they are pinned by the
+// test `hf3_suite_shape_constants_match_bloch_crypto`).
+const _: () = assert!(
+    bloch_pos_committee::params::SUITE_SLHDSA128S_FALCON1024
+        == bloch_crypto::crypto::SUITE_SLHDSA128S_FALCON1024
+);
 
 /// Accept-everything verifier for the producer's own `compute_post_state`
 /// probe: the state a block commits does not depend on the verifier, and the
@@ -1353,6 +1383,18 @@ fn os_random(buf: &mut [u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hf3_suite_shape_constants_match_bloch_crypto() {
+        use bloch_pos_committee::params as p;
+        assert_eq!(
+            p::SLHDSA_FALCON_ENVELOPED_PUBKEY_LEN,
+            bloch_crypto::crypto::SUITE_HEADER_LEN
+                + bloch_crypto::crypto::slhdsa_suite::slhdsa_suite_pubkey_body_len()
+        );
+        assert_eq!(p::SLHDSA_FALCON_MAX_ENVELOPED_SIG_LEN, bloch_crypto::crypto::max_slhdsa_suite_signature_len());
+        assert_eq!(p::HF3_SLH_SUITE_EPOCH, u64::MAX, "HF3 ships inert");
+    }
 
     #[test]
     fn both_proposal_and_validation_verify_real_l2_proofs() {
