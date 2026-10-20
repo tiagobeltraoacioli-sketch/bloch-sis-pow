@@ -2571,3 +2571,8 @@ mod frozen_set_tests {
         }
     }
 }
+
+/// HF1 security review (2026-10-20); see docs/HARD-FORKS-1-2-3-INTEGRATION.md.
+#[cfg(test)]
+#[path = "finality_hf1_review_tests.rs"]
+mod hf1_review_tests;
