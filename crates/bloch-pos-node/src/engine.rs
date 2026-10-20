@@ -2537,6 +2537,12 @@ impl Engine {
             return Err(format!("KES leaf {leaf} (period {period}) is erased (key at leaf {})", kes.key.period()));
         }
         if leaf > kes.key.period() {
+            // Evolution timing (review F-7, jitter): a key evolves at its
+            // validator's FIRST duty of the new period, i.e. its attestation
+            // slot, which the committee shuffle spreads over the 32 slots of
+            // the period's first epoch; and re-sealing reuses the cached
+            // Argon2id-derived key (`KesKey` seal cache), so co-hosted
+            // validators neither evolve in one slot nor run a 64 MiB KDF.
             // Review F-5: erasure cannot be undone, so a clock that jumped
             // forward must not erase periods the chain has not reached. The
             // key moves at most one period past where it is, or past the
@@ -2582,7 +2588,7 @@ impl Engine {
         let Some(index) = self.duty_index(&self.state) else {
             return;
         };
-        let Some(entry) = self.state.kes_roots().get(&index).copied() else {
+        let Some(entry) = self.state.kes_roots().get(&index).cloned() else {
             return;
         };
         let Some(kes) = self.kes.as_mut() else {
@@ -2965,6 +2971,12 @@ impl Engine {
             data.target_epoch,
             || sign_duty(keys, kes, kes_period, KeyLookup::kes_network_domain(&*rolled), index, epoch_of(data.slot), &root),
         ) {
+            // An empty signature means signing failed (review F-7 residual):
+            // the watermark is spent, but nothing is sent.
+            Ok(sig) if sig.is_empty() => {
+                eprintln!("[slot {slot}] not attesting: the duty signature could not be produced");
+                return;
+            }
             Ok(sig) => sig,
             Err(refusal) => {
                 eprintln!("[slot {slot}] {refusal}");
@@ -3174,6 +3186,12 @@ impl Engine {
                 sign_duty(keys, kes, kes_period, KeyLookup::kes_network_domain(&*rolled), index, epoch_of(header.slot), &root)
             })
         {
+            // An empty signature means signing failed (review F-7 residual):
+            // the watermark is spent, but no block is broadcast.
+            Ok(sig) if sig.is_empty() => {
+                eprintln!("[slot {slot}] not proposing: the proposer signature could not be produced");
+                return;
+            }
             Ok(sig) => sig,
             Err(refusal) => {
                 eprintln!("[slot {slot}] {refusal}");
@@ -8078,7 +8096,14 @@ fn sign_duty(
     let Some(message) = bloch_pos_committee::kes::leaf_message(domain, validator, &public, period, root) else {
         return Vec::new();
     };
-    kes.key.sign(&message).unwrap_or_default()
+    match kes.key.sign(&message) {
+        Ok(signature) => signature,
+        Err(e) => {
+            // Callers refuse to send an empty signature.
+            eprintln!("KES leaf signing failed: {e}");
+            Vec::new()
+        }
+    }
 }
 
 /// NODE-ONLY RELAY POLICY (HF2 sigdet), live and ungated: in addition to the

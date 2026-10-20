@@ -221,7 +221,7 @@ fn rotation_is_refused_at_the_door_while_hf3_is_unarmed() {
 }
 
 fn entry(current: KesPublic, next: Option<KesPublic>) -> kes::KesEntry {
-    kes::KesEntry { current, next }
+    kes::KesEntry { current, next, retired: Vec::new() }
 }
 
 /// The node's rotation policy, period by period: idle far from expiry,
