@@ -128,3 +128,8 @@ sha3 = "0.10"
 [dev-dependencies]
 # Deterministic adversarial signature fixtures in offline-tool tests only.
 pqcrypto-internals = { path = "../pqcrypto-internals" }
+# HF2 sigdet relay-policy tests: exercise every compiled ML-DSA-65 backend
+# (clean + avx2/neon) so the honest-signature check is per-backend.
+pqcrypto-mldsa = { version = "=0.1.2", features = ["avx2", "neon", "std"] }
+pqcrypto-traits = "0.3"
+bloch-mldsa-clean = { path = "../bloch-mldsa-clean" }
