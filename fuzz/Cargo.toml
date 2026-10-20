@@ -55,6 +55,8 @@ bincode = { version = "2", features = ["serde"] }
 [patch.crates-io]
 pqcrypto-internals = { path = "../crates/pqcrypto-internals" }
 libp2p-yamux = { path = "../crates/libp2p-yamux" }
+# HF3 suite 0x0003: the vendored, hash-pinned fips205 0.4.1, same as the root.
+fips205 = { path = "../crates/fips205" }
 
 [[bin]]
 name = "block_parse"

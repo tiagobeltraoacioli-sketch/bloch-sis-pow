@@ -606,6 +606,7 @@ dependencies = [
  "bloch-sis-pow",
  "chrono",
  "coherence-core",
+ "fips205",
  "hex",
  "hmac",
  "log",
@@ -616,6 +617,7 @@ dependencies = [
  "pqcrypto-traits",
  "primitive-types",
  "rand 0.9.5",
+ "rand_core 0.6.4",
  "reqwest",
  "serde",
  "serde_json",
@@ -1386,6 +1388,16 @@ name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
+
+[[package]]
+name = "fips205"
+version = "0.4.1"
+dependencies = [
+ "rand_core 0.6.4",
+ "sha2 0.10.9",
+ "sha3",
+ "zeroize",
+]
 
 [[package]]
 name = "fixed-hash"
