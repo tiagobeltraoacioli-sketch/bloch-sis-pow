@@ -116,6 +116,9 @@ def main() -> int:
         drops: list[str] = []
         for conf_file in (args.conf or [GATES_CONF]):
           for raw in conf_file.read_text().splitlines():
+            if raw.strip() == "!clock-offset-env":
+                report["clock_offset_env"] = True
+                continue
             if raw.startswith("!drop-line "):
                 drops.append(raw[len("!drop-line "):].strip())
                 continue
@@ -179,6 +182,26 @@ def main() -> int:
             file.write_text(pat.sub(rf"\g<1>{value};", file.read_text(), count=1))
             report["hf_constants"].append({"name": name, "from": old_value, "to": str(value),
                                            "file": str(file.relative_to(root))})
+
+    if not args.no_hf and report.get("clock_offset_env"):
+        # Rehearsal copy only: BLOCH_REHEARSAL_CLOCK_OFFSET_MS shifts ONE node's
+        # wall clock forward (clock-jump scenario) without touching the host clock.
+        engine = root / "crates/bloch-pos-node/src/engine.rs"
+        text = engine.read_text()
+        old_fn = ("fn now_ms() -> u64 {\n"
+                  "    // A host clock before the Unix epoch is a misconfigured machine, not a\n"
+                  "    // time. It reads as 0 ms — before any genesis, so every duty and the\n"
+                  "    // slot loop simply wait for the clock — where it used to abort the node.\n"
+                  "    SystemTime::now()\n"
+                  "        .duration_since(UNIX_EPOCH)\n"
+                  "        .map_or(0, |d| d.as_millis() as u64)\n"
+                  "}")
+        if text.count(old_fn) != 1:
+            sys.exit("!clock-offset-env: engine.rs now_ms() is not the expected text; refusing to patch")
+        new_fn = old_fn[:-1] + ("        .saturating_add(std::env::var(\"BLOCH_REHEARSAL_CLOCK_OFFSET_MS\").ok()\n"
+                                "            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0))\n}")
+        engine.write_text(text.replace(old_fn, new_fn))
+        report.setdefault("source_patches", []).append("engine.rs now_ms(): + BLOCH_REHEARSAL_CLOCK_OFFSET_MS")
 
     if not args.no_hf and drops:
         path = root / PARAMS
