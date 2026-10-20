@@ -170,6 +170,13 @@ check_target() { # $1=branch-or-commit
   label="t-$(printf '%s' "$tgt" | tr -c 'A-Za-z0-9._-' '_')"
   local base="$CACHE/dumps/$label-${sha:0:12}-g$GUARD_VER"
   if [ -s "$base.verdict" ]; then cat "$base.verdict"; head -1 "$base.verdict" | grep -q '  PASS  '; return; fi
+  # A port must sit on the reference. A target that does not contain it is a
+  # different chain line; comparing it would only report the missing commits.
+  if ! git --git-dir="$REPO" merge-base --is-ancestor "$REF" "$sha"; then
+    local mb; mb="$(git --git-dir="$REPO" merge-base "$REF" "$sha")"
+    echo "$tgt ${sha:0:10}  FAIL  NOT-BASED-ON-REFERENCE (merge-base ${mb:0:10}; $(git --git-dir="$REPO" rev-list --count "$mb..$REF") reference commits missing)" | tee "$base.verdict"
+    return 1
+  fi
   # Short-cut by identity: the guard compiles only these paths. A target that
   # changes none of them compiles to the reference's code by construction.
   if git --git-dir="$REPO" diff --quiet "$REF" "$sha" -- crates Cargo.toml Cargo.lock rust-toolchain.toml; then
