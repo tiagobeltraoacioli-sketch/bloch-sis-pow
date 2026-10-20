@@ -83,6 +83,12 @@ gates!(
     FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH,
     ACTIVATION_QUEUE_V2_ACTIVATION_EPOCH,
     DUTY_ROSTER_RECOVERY_ACTIVATION_EPOCH,
+    // Hard forks 1-3 (crates/bloch-pos-committee/src/hard_forks.rs).
+    HF1_CLAIM_FINALITY_EPOCH,
+    HF1_FROZEN_FINALITY_SET_EPOCH,
+    HF2_SLASHING_V2_EPOCH,
+    NATIVE_SLASHING_ACTIVATION_EPOCH,
+    HF2_GROWTH_CAP_EPOCH,
 );
 
 /// Source commit of this build, when the builder exported

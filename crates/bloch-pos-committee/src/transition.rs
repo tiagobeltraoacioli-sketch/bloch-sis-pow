@@ -12896,6 +12896,64 @@ mod tests {
         );
     }
 
+    /// **Hard forks 1-3 leave transfers alone** (owner scope 2026-10-20:
+    /// "do everything without touching withdrawals and deposits").
+    ///
+    /// The same V1 `Transfer` and V2 `TransferV2`, built and signed the way
+    /// today's wallet builds them, are applied with every HF gate that has a
+    /// test override forced open at genesis and with every gate shut. The
+    /// verdict, the fee charged, the unspent set and the state root must be
+    /// identical. A hard-fork gate that starts touching user transfers fails
+    /// here; when a new HF gate with a test override lands, add it to
+    /// `all_hf_gates_open`.
+    #[test]
+    fn hf_gates_leave_transfers_byte_identical() {
+        fn all_hf_gates_open() -> Vec<Box<dyn Drop>> {
+            vec![
+                Box::new(crate::params::native_claim_finality_test::open()),
+                Box::new(crate::params::native_finality_set_test::open()),
+                Box::new(crate::params::hf2_growth_cap_rehearsal::open()),
+            ]
+        }
+        fn run() -> ([u8; 32], Vec<(([u8; 32], u32), u64)>, u128, Result<u128, TransferReject>, Vec<(([u8; 32], u32), u64)>) {
+            let alice = owner_key(0x5A);
+            let bob_script = script_of(&owner_key(0x5B));
+            let coin_a = opening(0x8A, 0, 60_000_000, &alice);
+            let coin_b = opening(0x8A, 1, 40_000_000, &alice);
+            let (t, g, mut chains) = setup_funded(4, &[coin_a.clone(), coin_b.clone()]);
+            let price = g.next_base_fee();
+
+            // V1 through a whole block.
+            let tx = transfer_spending(&[coin_a.clone(), coin_b.clone()], &alice, bob_script, 512, 2, price);
+            let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
+            let s1 = t.apply_block(&g, &b, &[], std::slice::from_ref(&tx)).unwrap();
+            let before: u128 = u128::from(coin_a.value) + u128::from(coin_b.value);
+            let after: u128 = s1.eutxos.values().map(|e| u128::from(e.value)).sum();
+            let set1 = s1.eutxos.values().map(|e| ((e.txid, e.vout), e.value)).collect();
+
+            // V2 applied directly.
+            let v2 = transfer_v2_raw(&[coin_a, coin_b], &[&alice], &[0, 0], bob_script, 0, 2, price);
+            let mut g2 = g.clone();
+            let v2_fee = g2
+                .apply_transfer_v2(&v2, price, &ToyVerifier)
+                .map(|c| c.base_fee_sat + c.priority_fee_sat);
+            let set2 = g2.eutxos.values().map(|e| ((e.txid, e.vout), e.value)).collect();
+            (s1.state_root(), set1, before - after, v2_fee, set2)
+        }
+
+        let shut = run();
+        let open = {
+            let _gates = all_hf_gates_open();
+            run()
+        };
+        assert!(shut.3.is_ok(), "control: the V2 transfer must apply: {:?}", shut.3);
+        assert_eq!(open.1, shut.1, "V1 transfer: unspent set differs with HF gates open");
+        assert_eq!(open.2, shut.2, "V1 transfer: fee differs with HF gates open");
+        assert_eq!(open.3, shut.3, "V2 transfer: verdict or fee differs with HF gates open");
+        assert_eq!(open.4, shut.4, "V2 transfer: unspent set differs with HF gates open");
+        assert_eq!(open.0, shut.0, "V1 transfer block: state root differs with HF gates open");
+    }
+
     /// **Conservation.** A transfer whose outputs plus fee do not equal its
     /// inputs is refused, and refused with a reason of its own.
     ///
