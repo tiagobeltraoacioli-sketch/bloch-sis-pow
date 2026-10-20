@@ -14,6 +14,11 @@
 > os normativos.
 
 
+> **Update 2026-10-20 (p9e audit finding 2).** Verify-before-release, a
+> power-on Falcon KAT + pairwise self-test, an architecture check, core-dump /
+> ptrace suppression, an opt-in constant-latency floor and a dudect-style
+> timing test now exist node-side; see `docs/CRYPTO-AUDIT-STATUS-20261020.md`.
+
 **Answers:** `BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §14.3 (open question) and the
 DEV-2 caveat in §6.2.
 **Author:** A6 (applied cryptography) · **Date:** 2026-08-11 · **Status:** finding, for A4/DEV-2 review
