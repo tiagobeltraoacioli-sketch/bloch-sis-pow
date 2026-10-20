@@ -3369,6 +3369,26 @@ pub const KES_PERIOD_EPOCHS: u64 = 90;
 /// `kes::MIN_DEPTH..=kes::MAX_DEPTH`; this is the operator default only.
 pub const KES_DEFAULT_DEPTH: u8 = 12;
 
+
+/// Enforcement is inert, or registration is armed strictly before it.
+/// (A function rather than an inline comparison so the hardened lint does not
+/// read the shipped `u64::MAX` values as an always-true comparison.)
+const fn kes_registration_precedes_enforcement(registration: u64, enforcement: u64) -> bool {
+    enforcement == u64::MAX || (registration != u64::MAX && registration < enforcement)
+}
+
+/// Enforcement is inert, or it comes at least
+/// `KES_MIN_REGISTRATION_WINDOW_EPOCHS` after registration opens.
+const fn kes_registration_window_is_long_enough(registration: u64, enforcement: u64) -> bool {
+    if enforcement == u64::MAX {
+        return true;
+    }
+    match enforcement.checked_sub(registration) {
+        Some(window) => window >= KES_MIN_REGISTRATION_WINDOW_EPOCHS,
+        None => false,
+    }
+}
+
 const _: () = {
     assert!(KES_PERIOD_EPOCHS > 0, "KES_PERIOD_EPOCHS must be positive");
     assert!(KES_PERIOD_EPOCHS * SLOTS_PER_EPOCH * SLOT_DURATION_SECS == 86_400, "a KES period is one day");
@@ -3376,13 +3396,11 @@ const _: () = {
     // validator at once: refuse to compile it. Registration must open
     // strictly before enforcement.
     assert!(
-        KES_ACTIVATION_EPOCH == u64::MAX
-            || (KES_REGISTRATION_EPOCH != u64::MAX && KES_REGISTRATION_EPOCH < KES_ACTIVATION_EPOCH),
+        kes_registration_precedes_enforcement(KES_REGISTRATION_EPOCH, KES_ACTIVATION_EPOCH),
         "KES enforcement needs an earlier registration window"
     );
     assert!(
-        HF3_KES_ENFORCE_EPOCH == u64::MAX
-            || HF3_KES_ENFORCE_EPOCH - HF3_KES_EPOCH >= KES_MIN_REGISTRATION_WINDOW_EPOCHS,
+        kes_registration_window_is_long_enough(HF3_KES_EPOCH, HF3_KES_ENFORCE_EPOCH),
         "the HF3 registration window must last at least KES_MIN_REGISTRATION_WINDOW_EPOCHS"
     );
     // The rotation horizon must leave a default-depth tree most of its life.

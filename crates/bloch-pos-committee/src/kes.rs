@@ -291,14 +291,16 @@ impl KesSignature {
             at = end;
             Some(out)
         };
-        let u32_at = |b: &[u8]| u32::from_le_bytes(b.try_into().unwrap());
-        let index = u32_at(take(4)?);
-        let pk_len = u32_at(take(4)?) as usize;
+        // `take(4)` yields exactly four bytes, so the conversion cannot fail;
+        // it is still a `None`, not a panic, on a decoder path.
+        let u32_at = |b: &[u8]| -> Option<u32> { Some(u32::from_le_bytes(b.try_into().ok()?)) };
+        let index = u32_at(take(4)?)?;
+        let pk_len = u32_at(take(4)?)? as usize;
         if pk_len > MAX_LEAF_PK_LEN {
             return None;
         }
         let leaf_pk = take(pk_len)?.to_vec();
-        let sig_len = u32_at(take(4)?) as usize;
+        let sig_len = u32_at(take(4)?)? as usize;
         if sig_len > MAX_LEAF_SIG_LEN {
             return None;
         }
@@ -309,7 +311,7 @@ impl KesSignature {
         }
         let mut path = Vec::with_capacity(depth as usize);
         for _ in 0..depth {
-            path.push(take(32)?.try_into().unwrap());
+            path.push(take(32)?.try_into().ok()?);
         }
         (at == bytes.len()).then_some(KesSignature { index, leaf_pk, sig, path })
     }
