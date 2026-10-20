@@ -186,6 +186,8 @@ if [ "$SCENARIOS" != "none" ]; then
     grep -q "could not build" "$OUT/harness-$s.log" && log "  WARNING $s: a producer built a block the real transition refused"
   done
   log "HARNESS TOTAL conflicting_finality=$harness_conflicts double_pay=$harness_double"
+  log "(conflicting_finality = finalization events conflicting with an earlier one; double_pay = epochs in"
+  log " which two conflicting heads both admit the split-time withdrawal under the build's claim rule)"
   [ "$fail" = 0 ] || log "WARNING: at least one harness scenario failed"
 fi
 

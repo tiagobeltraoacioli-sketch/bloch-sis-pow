@@ -120,8 +120,9 @@ pub struct NetConfig {
 /// The harness does not execute L2 claims, it evaluates their predicate, so
 /// it cannot read the branch's constant directly without failing to compile
 /// on branches that do not define it. `scripts/hf-verify/run-all.sh` sets
-/// the variable from the compiled branch's
-/// `params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH` (after any override);
+/// the variable from the compiled branch's claim-finality constant
+/// (`HF1_CLAIM_FINALITY_EPOCH` or `NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH`,
+/// after any override);
 /// unset or unparsable means inert (`u64::MAX`), the release behaviour.
 pub fn claim_gate_epoch() -> u64 {
     std::env::var("HF_CLAIM_GATE_EPOCH").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(u64::MAX)
@@ -847,14 +848,20 @@ impl Report {
         };
         let groups = self.phases.get(1).map_or(0, |p| p.groups.len());
         let fins: Vec<String> = (0..groups).map(first_fin).collect();
+        // Entries start with "e<epoch>:"; report the first one's epoch.
+        let first = |v: &Vec<String>| -> String {
+            v.first().and_then(|m| m.strip_prefix('e')).and_then(|m| m.split(':').next()).unwrap_or("-").to_string()
+        };
         format!(
-            "HFV scenario={:?} start={} claim_gate={} conflicting_finality={} foreign_finality={} double_pay={} double_pay_own_chain_rule={} stalls={} latch_refusals={} final_heads={} split_first_finalized=[{}] blocks={}",
+            "HFV scenario={:?} start={} claim_gate={} conflicting_finality={} first_conflict_e={} foreign_finality={} double_pay={} first_double_pay_e={} double_pay_own_chain_rule={} stalls={} latch_refusals={} final_heads={} split_first_finalized=[{}] blocks={}",
             self.scenario,
             self.start_epoch,
             match claim_gate_epoch() { u64::MAX => "inert".to_string(), e => e.to_string() },
             self.conflicting_finality.len(),
+            first(&self.conflicting_finality),
             self.foreign_finality.len(),
             self.double_payout.len(),
+            first(&self.double_payout),
             self.double_payout_own_chain_rule.len(),
             self.stalls.len(),
             self.latch_refusals,
