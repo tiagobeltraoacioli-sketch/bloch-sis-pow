@@ -138,11 +138,11 @@ has drifted to ~1008 in the deeper worktrees).
 | `0x14` | `L2Deposit` | **Assigned, native L2** — `devnet-l2-deposits` builds only until activation | l2 | `wire_tag_registry.rs` |
 | `0x15` | `L2DataAvailability` | **Assigned, native L2** — `devnet-l2-user-txs` builds only until activation | l2 | `wire_tag_registry.rs` |
 | `0x16` | `L2WithdrawClaim` | **Assigned, native L2** — `devnet-l2-user-txs` builds only until activation | l2 | `wire_tag_registry.rs` |
-| `0x17` | `KesRegister` | **HF3, reserved** — KES port (`codex/hf3-kes-20261020`), same byte devnet4 runs; gate `KES_REGISTRATION_EPOCH` | consensus | `wire_alloc.rs` |
+| `0x17` | `KesRegister` | **HF3, implemented on this line, unarmed** — refused before `HF3_KES_EPOCH` (= `KES_REGISTRATION_EPOCH`, u64::MAX); same byte devnet4 runs | consensus | `wire_alloc.rs`, `wire_tag_registry.rs` |
 | `0x18` | `WithdrawalCredentialRotation` | **HF3, assigned, unarmed** — PQ migration, gate `HF3_PQ_MIGRATION_EPOCH` | pq-migration | `wire_alloc.rs` |
 | `0x19` | `RescueCommit` | **HF3, assigned, unarmed** — PQ rescue, gate `LATTICE_EMERGENCY_ACTIVATION_EPOCH` (≥ `HF3_PQ_MIGRATION_EPOCH`) | pq-migration | `wire_alloc.rs` |
 | `0x1A` | `RescueReveal` | **HF3, assigned, unarmed** — PQ rescue, gate `LATTICE_EMERGENCY_ACTIVATION_EPOCH` (≥ `HF3_PQ_MIGRATION_EPOCH`) | pq-migration | `wire_alloc.rs` |
-| `0x1B` | `KesRotate` | **HF3, reserved** — KES leaf-authorised rotation (p8b proposal, moved from `0x18`) | consensus | `wire_alloc.rs` |
+| `0x1B` | `KesRotate` | **HF3, implemented on this line, unarmed** — KES leaf-authorised rotation (p8b proposal, moved from `0x18`); refused before `HF3_KES_EPOCH` | consensus | `wire_alloc.rs`, `wire_tag_registry.rs` |
 | `0x1C`–`0xFF` | free | — | — | — |
 
 **Next free transaction tag: `0x1C`.** (`0x17`–`0x1B` are the HF3
@@ -376,7 +376,7 @@ wrong message; it produces a wrong state root, on every node, permanently.
 | `0x1F` | `TAG_FUNDED_DELEGATION_OWNER` | **Assigned, unarmed candidate** | staking |
 | `0x20` | `TAG_FUNDED_DELEGATION_LIFECYCLE` | **Assigned, unarmed candidate** | staking |
 | `0x21` | `TAG_L2_SETTLEMENT` | **Assigned, native L2 (M8 port)** — no leaf without an L2 policy | l2 |
-| `0x22` | `TAG_KES_ROOT` | **HF3, reserved** — KES port; devnet4 byte | consensus |
+| `0x22` | `TAG_KES_ROOT` | **HF3, implemented on this line, unarmed** — per validator `KesEntry` (key in force `depth ‖ root ‖ start_period`, then any pending successor); one `enforced` leaf once KES binds; no leaf until the first registration | consensus |
 | `0x23` | `TAG_LC_ROSTER` | **Reserved** — light client (`codex/bloch-lc-20261014`), live on devnet4 | lc |
 | `0x24` | `TAG_PQ_RESCUE_COMMIT` | **HF3, assigned, unarmed** — PQ rescue commitments, no leaf while empty | pq-migration |
 | `0x25`+ | free | — | — | — |

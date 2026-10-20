@@ -105,8 +105,9 @@ pub mod local_cache {
     pub const L2: &[u8; 16] = b"BPOSST01:L2:v1\0\0";
     /// Pending: `codex/native-claim-finality-20261019` (L2 checkpoint roots).
     pub const L2_CHECKPOINTS: &[u8; 16] = b"BPOSST01:L2CP:v1";
-    /// HF3 KES.
-    pub const KES: &[u8; 16] = b"BPOSST01:KES:v1\0";
+    /// HF3 KES (`v2`: entries with start periods and the enforcement bind
+    /// epoch; the devnet lineage's `v1` section is not accepted).
+    pub const KES: &[u8; 16] = b"BPOSST01:KES:v2\0";
     /// HF3 PQ rescue commitments.
     pub const PQ: &[u8; 16] = b"BPOSST01:PQ:v1\0\0";
     /// HF1 frozen finality set (p1a).
@@ -174,7 +175,7 @@ pub const TX_TABLE: &[Row] = &[
     Row {
         tag: tx::KES_REGISTER,
         name: "KesRegister",
-        status: Status::Pending { gate: "KES_REGISTRATION_EPOCH", branch: "codex/hf3-kes-20261020" },
+        status: Status::Pending { gate: "HF3_KES_EPOCH", branch: "codex/hf3-kes-20261020" },
     },
     Row {
         tag: tx::WITHDRAWAL_CREDENTIAL_ROTATION,
@@ -200,7 +201,7 @@ pub const TX_TABLE: &[Row] = &[
     Row {
         tag: tx::KES_ROTATE,
         name: "KesRotate",
-        status: Status::Pending { gate: "KES_ACTIVATION_EPOCH", branch: "codex/hf3-kes-20261020" },
+        status: Status::Pending { gate: "HF3_KES_EPOCH", branch: "codex/hf3-kes-20261020" },
     },
 ];
 
@@ -245,6 +246,13 @@ mod tests {
     }
 
     /// The mainnet rows agree with the constants the decoder dispatches on.
+    #[test]
+    fn hf3_kes_rows_match_the_decoder_constants() {
+        assert_eq!(crate::kes::REGISTER_TAG, tx::KES_REGISTER);
+        assert_eq!(crate::kes::ROTATE_TAG, tx::KES_ROTATE);
+        assert!(crate::state_root::STATE_COMPONENT_TAGS.contains(&("TAG_KES_ROOT", state::KES_ROOT)));
+    }
+
     #[test]
     fn mainnet_rows_match_the_decoder_constants() {
         use crate::transition::{funded, funded_delegation, l2_claim, l2_da, l2_deposit};

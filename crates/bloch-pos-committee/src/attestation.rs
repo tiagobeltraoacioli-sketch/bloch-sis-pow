@@ -186,6 +186,34 @@ pub trait SignatureVerifier {
         self.verify_with_key(pubkey, signing_root, signature)
     }
 
+    /// Verify a KES signature (`crate::kes`): `signature` over `message` (the
+    /// already bound `kes::leaf_message`) by `public`'s leaf of global period
+    /// `period`. The default is the full check — decode, leaf index, Merkle
+    /// path, then [`Self::verify_with_key`] on the leaf key, so wrappers that
+    /// cache or budget `verify_with_key` cover KES leaves too. It is a trait
+    /// method, not a free function every caller runs, so a verifier that
+    /// accepts every signature accepts these too: the producer's post-state
+    /// probe carries an EMPTY proposer signature, which the structural checks
+    /// would refuse before any key is consulted (devnet4 halted on exactly
+    /// that at its KES activation, 2026-10-14; fixed there by 694a5960).
+    fn verify_kes(&self, public: &crate::kes::KesPublic, period: u64, message: &[u8; 32], signature: &[u8]) -> bool {
+        crate::kes::verify(self, public, period, message, signature)
+    }
+
+    /// Verify one KES LEAF signature (`crate::kes::verify` calls this after
+    /// the Merkle path checks out). KES leaves are signed in the canonical,
+    /// suite-bound v2 form (`bloch_crypto::crypto::sign_bound`) from the
+    /// first KES signature, independent of any signature-policy flag day
+    /// (review F-1: the v1 form would die at `SIG_CANONICAL`). The real
+    /// verifier (`bloch-pos-node` `HybridVerifier`) overrides this with
+    /// `verify_bound`; every wrapper (caching, budgeting, policy-pinning)
+    /// MUST forward it to its inner verifier unchanged. The default — the
+    /// plain `verify_with_key` — exists for test doubles that model no
+    /// encoding.
+    fn verify_kes_leaf(&self, leaf_pk: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        self.verify_with_key(leaf_pk, message, signature)
+    }
+
     /// Deterministic native L2 proof check, using only parent-committed policy.
     /// Older verifier implementations cannot silently admit the new transaction.
     fn verify_l2_settlement(&self, _policy: &[u8; 32], _program: &[u8; 32],
@@ -327,6 +355,20 @@ impl SignatureVerifier for PolicyVerifier<'_> {
             .verify_with_key_under(self.policy.strictest(policy), pubkey, signing_root, signature)
     }
 
+    /// The whole KES check (decode, path, leaf) is delegated to the inner
+    /// verifier unchanged, so a verifier that accepts every signature (the
+    /// producer's post-state probe) still does so through this wrapper.
+    fn verify_kes(&self, public: &crate::kes::KesPublic, period: u64, message: &[u8; 32], signature: &[u8]) -> bool {
+        self.inner.verify_kes(public, period, message, signature)
+    }
+
+    /// KES leaves are consensus messages signed in the v2 bound form from the
+    /// first KES signature, independent of any policy flag day: forwarded to
+    /// the inner verifier unchanged (never tightened or loosened here).
+    fn verify_kes_leaf(&self, leaf_pk: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        self.inner.verify_kes_leaf(leaf_pk, message, signature)
+    }
+
     /// HF3 spends through the transaction policy wrapper. A suite-0x0003
     /// witness has no ML-DSA half, and the ML-DSA backend is the only thing a
     /// transaction policy selects, so it is judged by the inner verifier's
@@ -405,6 +447,31 @@ pub trait KeyLookup {
     /// such index. `None` must be treated as a verification failure by the
     /// caller — never as "skip the check".
     fn pubkey(&self, validator: u32) -> Option<&[u8]>;
+
+    /// The validator's forward-secure key (`crate::kes`) in force for global
+    /// KES period `period` (`crate::kes::KesEntry::in_force`), if any. Only
+    /// committed state carries KES keys; other lookups have none.
+    fn kes_public(&self, _validator: u32, _period: u64) -> Option<crate::kes::KesPublic> {
+        None
+    }
+
+    /// The network domain KES leaf signatures are bound to
+    /// (`crate::kes::leaf_message`): the committed admission domain, zero when
+    /// the manifest set none (the same value `KesRegister` is signed over).
+    /// `None` — every lookup that is not committed state — makes every KES
+    /// signature fail closed.
+    fn kes_network_domain(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    /// Whether KES binds and since when (`CommittedState::kes_enforced_from`):
+    /// `Some(None)` not yet bound (static keys sign), `Some(Some(e))` bound
+    /// from epoch `e`. `None` — every lookup that is not committed state —
+    /// means "cannot tell": past the compiled enforcement gate every
+    /// signature check through it fails closed.
+    fn kes_enforced_from(&self) -> Option<Option<u64>> {
+        None
+    }
 }
 
 /// Why an attestation was rejected. Distinct variants because "invalid" alone
@@ -467,10 +534,20 @@ pub fn validate(
     // The registry read, last, beside the verify it feeds. A committee member
     // with no registry key cannot be dismissed as a bad signature: it means
     // this registry does not know the validator, which is a different fact.
-    let Some(pubkey) = keys.pubkey(att.validator) else {
+    // From KES enforcement on, the vote must carry the leaf of its target
+    // epoch's period (`crate::kes::verify_validator`); before it, this is
+    // exactly the static-key check it always was.
+    let Some(valid) = crate::kes::verify_validator(
+        keys,
+        verifier,
+        att.validator,
+        att.data.target_epoch,
+        &att.data.signing_root(),
+        &att.signature,
+    ) else {
         return Err(RejectReason::UnknownValidator);
     };
-    if !verifier.verify_with_key(pubkey, &att.data.signing_root(), &att.signature) {
+    if !valid {
         return Err(RejectReason::BadSignature);
     }
     Ok(())

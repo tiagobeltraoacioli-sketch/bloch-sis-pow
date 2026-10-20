@@ -150,7 +150,6 @@ pub use pq_migration::{
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
 use crate::schedule;
-use crate::attestation::KeyLookup as _;
 use crate::slashing;
 use crate::staking::{self, QueuedDeposit};
 use crate::fee_market;
@@ -580,6 +579,36 @@ pub enum PosTransaction {
         /// [`crate::beacon::recommit_signing_root`].
         signature: Vec<u8>,
     },
+    /// Register a forward-secure (KES) key for a validator, once (wire
+    /// 0x17). Refused before [`crate::params::KES_REGISTRATION_EPOCH`].
+    /// Authorised by the validator's registered static key over
+    /// [`crate::kes::register_signing_root`] (network domain, index, depth,
+    /// root). From [`crate::params::KES_ACTIVATION_EPOCH`] on, the
+    /// validator's proposals and votes verify only under this root.
+    KesRegister {
+        validator: u32,
+        depth: u8,
+        root: [u8; 32],
+        /// Hybrid signature by the registered static key.
+        signature: Vec<u8>,
+    },
+    /// Replace a validator's KES key from the next period on (HF3, wire
+    /// [`crate::kes::ROTATE_TAG`]). Refused before
+    /// [`crate::params::HF3_KES_EPOCH`] and before KES enforcement (there is
+    /// no period to sign in). Authorised ONLY by the leaf of period `period`
+    /// of the key in force, over [`crate::kes::rotate_signing_root`] bound
+    /// through [`crate::kes::leaf_message`]; valid only in a block of that
+    /// period; at most one per validator per period. The new tree signs from
+    /// `period + 1` (its start period).
+    KesRotate {
+        validator: u32,
+        /// Global KES period the rotation is signed in (the block's).
+        period: u64,
+        depth: u8,
+        root: [u8; 32],
+        /// Encoded `crate::kes::KesSignature` by the current leaf.
+        signature: Vec<u8>,
+    },
     /// Bond delegated stake behind an operator.
     Delegate {
         delegator: u32,
@@ -983,6 +1012,23 @@ impl PosTransaction {
                 b.extend_from_slice(&epoch.to_le_bytes());
                 put(&mut b, signature);
             }
+            PosTransaction::KesRegister { validator, depth, root, signature } => {
+                // Fixed-width fields, then a length-prefixed signature.
+                b.push(crate::kes::REGISTER_TAG);
+                b.extend_from_slice(&validator.to_le_bytes());
+                b.push(*depth);
+                b.extend_from_slice(root);
+                put(&mut b, signature);
+            }
+            PosTransaction::KesRotate { validator, period, depth, root, signature } => {
+                // Fixed-width fields, then a length-prefixed KES signature.
+                b.push(crate::kes::ROTATE_TAG);
+                b.extend_from_slice(&validator.to_le_bytes());
+                b.extend_from_slice(&period.to_le_bytes());
+                b.push(*depth);
+                b.extend_from_slice(root);
+                put(&mut b, signature);
+            }
             PosTransaction::RandaoRecommit { validator, new_commitment, epoch, signature } => {
                 // ADR-041: fixed-width fields, then a length-prefixed signature.
                 b.push(0x0A);
@@ -1160,6 +1206,12 @@ impl PosTransaction {
                 pubkey_hash: r.h32()?, epoch: r.u64()?, signature: r.bytes()?,
             },
             0x0D => PosTransaction::Withdraw { validator: r.u32()? },
+            crate::kes::REGISTER_TAG => PosTransaction::KesRegister {
+                validator: r.u32()?, depth: r.u8()?, root: r.h32()?, signature: r.bytes()?,
+            },
+            crate::kes::ROTATE_TAG => PosTransaction::KesRotate {
+                validator: r.u32()?, period: r.u64()?, depth: r.u8()?, root: r.h32()?, signature: r.bytes()?,
+            },
             0x0A => PosTransaction::RandaoRecommit {
                 validator: r.u32()?, new_commitment: r.h32()?,
                 epoch: r.u64()?, signature: r.bytes()?,
@@ -1842,6 +1894,18 @@ pub struct CommittedState {
     /// behind that gate), and an empty map adds no state-root leaf and no
     /// local-cache section, so every historical root and cache is unchanged.
     pq_rescue_commits: BTreeMap<[u8; 32], u64>,
+    /// Forward-secure validator keys (`crate::kes`): registered once by wire
+    /// 0x17, replaced only by a leaf-signed `KesRotate`. Each entry is the key
+    /// in force and at most one successor (`crate::kes::KesEntry`). Committed
+    /// under its own state-root component (tag 0x22) only once non-empty, so
+    /// history without a registration keeps every state root it had.
+    kes: BTreeMap<u32, crate::kes::KesEntry>,
+    /// The epoch KES enforcement bound on chain (`None` until it does): the
+    /// first epoch boundary at or after `HF3_KES_ENFORCE_EPOCH` where
+    /// registered, unexpired KES keys cover
+    /// `KES_MIN_REGISTERED_STAKE_BPS` of the consensus roster's stake. Never
+    /// cleared. Committed under component 0x22 only once set.
+    kes_enforced_from: Option<u64>,
     /// Cumulative issued supply in satoshis — the hard-cap invariant's
     /// counter (2026-08-12), committed under `TAG_ISSUED_SUPPLY`.
     ///
@@ -1940,6 +2004,45 @@ impl crate::attestation::KeyLookup for BTreeMap<u32, ValidatorRecord> {
 impl crate::attestation::KeyLookup for CommittedState {
     fn pubkey(&self, validator: u32) -> Option<&[u8]> {
         self.validators.pubkey(validator)
+    }
+    fn kes_public(&self, validator: u32, period: u64) -> Option<crate::kes::KesPublic> {
+        self.kes.get(&validator).map(|entry| entry.in_force(period))
+    }
+    fn kes_network_domain(&self) -> Option<[u8; 32]> {
+        Some(self.admission_network_domain.unwrap_or([0; 32]))
+    }
+    fn kes_enforced_from(&self) -> Option<Option<u64>> {
+        Some(self.kes_enforced_from)
+    }
+}
+
+/// The registry, its KES keys and the network domain, borrowed field by field
+/// so a transition step can hold it while mutating other parts of the same
+/// state (the reason the map impl above exists). Every consensus signature
+/// check inside the transition resolves through this view, so the static key
+/// before KES enforcement and the KES leaf after it come from one pre-state.
+pub(crate) struct RegistryView<'a> {
+    pub(crate) validators: &'a BTreeMap<u32, ValidatorRecord>,
+    pub(crate) kes: &'a BTreeMap<u32, crate::kes::KesEntry>,
+    /// `CommittedState::admission_network_domain`, which KES leaf signatures
+    /// commit to (`crate::kes::leaf_message`).
+    pub(crate) network_domain: Option<[u8; 32]>,
+    /// `CommittedState::kes_enforced_from`.
+    pub(crate) enforced_from: Option<u64>,
+}
+
+impl crate::attestation::KeyLookup for RegistryView<'_> {
+    fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+        self.validators.pubkey(validator)
+    }
+    fn kes_public(&self, validator: u32, period: u64) -> Option<crate::kes::KesPublic> {
+        self.kes.get(&validator).map(|entry| entry.in_force(period))
+    }
+    fn kes_network_domain(&self) -> Option<[u8; 32]> {
+        Some(self.network_domain.unwrap_or([0; 32]))
+    }
+    fn kes_enforced_from(&self) -> Option<Option<u64>> {
+        Some(self.enforced_from)
     }
 }
 
@@ -2413,6 +2516,8 @@ impl CommittedState {
             evm,
             l2_settlement: None,
             pq_rescue_commits: BTreeMap::new(),
+            kes: BTreeMap::new(),
+            kes_enforced_from: None,
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
             eutxos: opening_balances.iter().cloned().collect(),
         };
@@ -3140,6 +3245,9 @@ impl CommittedState {
         }, self.eutxos.tree());
         if let Some(state) = &self.l2_settlement {
             crate::state_root::insert_l2_settlement(&mut tree, &state.committed_bytes());
+        }
+        if !self.kes.is_empty() || self.kes_enforced_from.is_some() {
+            crate::state_root::insert_kes_roots(&mut tree, &self.kes, self.kes_enforced_from);
         }
         crate::state_root::insert_pq_rescue_commits(&mut tree, &self.pq_rescue_commits);
         tree
@@ -3883,6 +3991,32 @@ impl CommittedState {
                     Self::staking_tx_charge(epoch_for_charge, 1, tx.canonical_bytes().len())
                 })
             }
+            PosTransaction::KesRegister { validator, depth, root, signature } => {
+                // THE FLAG-DAY GATE, FIRST, from committed state: before
+                // `KES_REGISTRATION_EPOCH` a block carrying 0x17 is refused
+                // exactly as the previous release refused the undecodable tag.
+                if !crate::params::kes_registration_open(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
+                // One hybrid verification, like the other validator-signed arms.
+                let epoch_for_charge = self.epoch;
+                self.apply_kes_register(*validator, *depth, root, signature, verifier).map(|()| {
+                    Self::staking_tx_charge(epoch_for_charge, 1, tx.canonical_bytes().len())
+                })
+            }
+            PosTransaction::KesRotate { validator, period, depth, root, signature } => {
+                // THE HF3 GATE, FIRST, from committed state: before
+                // `HF3_KES_EPOCH` the tag is refused exactly as the previous
+                // release refused the undecodable byte.
+                if !crate::params::kes_registration_open(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
+                // One leaf (hybrid) verification plus a Merkle path.
+                let epoch_for_charge = self.epoch;
+                self.apply_kes_rotate(*validator, *period, *depth, root, signature, verifier).map(|()| {
+                    Self::staking_tx_charge(epoch_for_charge, 1, tx.canonical_bytes().len())
+                })
+            }
             PosTransaction::RandaoRecommit { validator, new_commitment, epoch, signature } => {
                 // THE FLAG-DAY GATE, FIRST — same discipline as every other
                 // gated arm, read from `self.epoch` (committed state, never
@@ -4118,6 +4252,195 @@ impl CommittedState {
     /// the exhaustion precondition, and only then the one hybrid
     /// verification (~145 µs). Every check runs before any mutation, so a
     /// refused re-commit leaves the state untouched.
+    /// Wire 0x17: record `validator`'s KES key, once ([`Self::check_kes_register`]
+    /// first; the insertion is the only mutation).
+    fn apply_kes_register(
+        &mut self,
+        validator: u32,
+        depth: u8,
+        root: &[u8; 32],
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<(), TxReject> {
+        let public = self.check_kes_register(validator, depth, root, signature, verifier)?;
+        self.kes.insert(validator, public.into());
+        Ok(())
+    }
+
+    /// Every rule of a KES registration except the flag-day gate, against
+    /// this state and without mutating it (consensus and mempool share it):
+    /// refused for an unknown, slashed or exited validator, an out-of-range
+    /// depth, a validator that already has a key, or a signature that is not
+    /// the registered static key's over [`crate::kes::register_signing_root`].
+    /// The one hybrid verification runs last.
+    pub(crate) fn check_kes_register(
+        &self,
+        validator: u32,
+        depth: u8,
+        root: &[u8; 32],
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<crate::kes::KesPublic, TxReject> {
+        if !(crate::params::kes_schedule().min_depth.max(crate::kes::MIN_DEPTH)..=crate::kes::MAX_DEPTH).contains(&depth) {
+            return Err(TxReject::StakingRule);
+        }
+        let Some(rec) = self.validators.get(&validator) else {
+            return Err(TxReject::StakingRule);
+        };
+        if rec.slashed || rec.exit_epoch <= self.epoch {
+            return Err(TxReject::StakingRule);
+        }
+        let period = crate::params::kes_period(self.epoch);
+        let bound = self.kes_enforced_from.is_some_and(|from| self.epoch >= from);
+        // Per-key start (readiness blocker B1): period 0 while KES does not
+        // bind yet, else the period after the one it is included in.
+        let mut start_period = match (bound, period) {
+            (true, Some(p)) => p.saturating_add(1),
+            _ => 0,
+        };
+        if let Some(entry) = self.kes.get(&validator) {
+            // Registration is once-only, except as a RESCUE (readiness B3):
+            // after KES binds, once the key in force has EXPIRED with no
+            // successor pending, the static key may register a fresh tree,
+            // which starts `KES_RESCUE_DELAY_PERIODS` later. An unexpired key
+            // is never replaced by the static key: a static key stolen or
+            // sold later must not take over forward-secure signing
+            // (long-range). Renewal of a live key is `KesRotate`; a lost but
+            // unexpired `validator.kes` is recovered by exit and re-join.
+            let p = period.unwrap_or(0);
+            let in_force = entry.in_force(p);
+            let expired = bound && p >= in_force.end_period() && entry.pending_at(p).is_none();
+            if !expired {
+                return Err(TxReject::StakingRule);
+            }
+            start_period = p.saturating_add(crate::params::KES_RESCUE_DELAY_PERIODS);
+            if entry.in_force(period.unwrap_or(0)).root == *root
+                || entry.next.is_some_and(|next| next.root == *root)
+            {
+                return Err(TxReject::StakingRule);
+            }
+        }
+        let public = crate::kes::KesPublic::new(depth, *root, start_period);
+        let domain = self.admission_network_domain.unwrap_or([0; 32]);
+        let message = crate::kes::register_signing_root(&domain, validator, &public);
+        if !verifier.verify_with_key(&rec.pubkey, &message, signature) {
+            return Err(TxReject::StakingRule);
+        }
+        Ok(public)
+    }
+
+    /// Wire `ROTATE_TAG`: settle a successor already in force, then record
+    /// the new key from `period + 1` ([`Self::check_kes_rotate`] first).
+    fn apply_kes_rotate(
+        &mut self,
+        validator: u32,
+        period: u64,
+        depth: u8,
+        root: &[u8; 32],
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<(), TxReject> {
+        let entry = self.check_kes_rotate(validator, period, depth, root, signature, verifier)?;
+        self.kes.insert(validator, entry);
+        Ok(())
+    }
+
+    /// Every rule of a KES rotation except the HF3 gate, against this state
+    /// and without mutating it (consensus and mempool share it). Returns the
+    /// entry the rotation leaves. Refused when: KES is not enforced at this
+    /// epoch, or `period` is not this epoch's period (a rotation is valid
+    /// only in a block of the period it was signed in); the validator is
+    /// unknown, slashed, exited or has no KES key; a rotation is already
+    /// pending (one per validator per period); the depth is out of range or
+    /// the new tree repeats the key in force; or the signature is not the
+    /// in-force key's leaf of `period` over
+    /// [`crate::kes::rotate_signing_root`]. The static key has no say here.
+    pub(crate) fn check_kes_rotate(
+        &self,
+        validator: u32,
+        period: u64,
+        depth: u8,
+        root: &[u8; 32],
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<crate::kes::KesEntry, TxReject> {
+        if crate::params::kes_period(self.epoch) != Some(period)
+            || !(crate::params::kes_schedule().min_depth.max(crate::kes::MIN_DEPTH)..=crate::kes::MAX_DEPTH).contains(&depth)
+        {
+            return Err(TxReject::StakingRule);
+        }
+        let Some(entry) = self.kes.get(&validator) else {
+            return Err(TxReject::StakingRule);
+        };
+        let Some(rec) = self.validators.get(&validator) else {
+            return Err(TxReject::StakingRule);
+        };
+        if rec.slashed || rec.exit_epoch <= self.epoch {
+            return Err(TxReject::StakingRule);
+        }
+        let settled = entry.settled(period);
+        if settled.pending_at(period).is_some() {
+            return Err(TxReject::StakingRule);
+        }
+        let current = settled.in_force(period);
+        let next = crate::kes::KesPublic::new(depth, *root, period.saturating_add(1));
+        if next.same_tree(&current) {
+            return Err(TxReject::StakingRule);
+        }
+        let domain = self.admission_network_domain.unwrap_or([0; 32]);
+        let message = crate::kes::rotate_signing_root(&domain, validator, period, depth, root);
+        let view = RegistryView { validators: &self.validators, kes: &self.kes, network_domain: self.admission_network_domain, enforced_from: self.kes_enforced_from };
+        if crate::kes::verify_validator_in(&view, verifier, validator, Some(period), &message, signature) != Some(true) {
+            return Err(TxReject::StakingRule);
+        }
+        Ok(crate::kes::KesEntry { current: settled.current, next: Some(next) })
+    }
+
+    /// Share (basis points) of the consensus roster's effective stake at
+    /// `epoch` held by validators whose KES key in force at `epoch`'s period
+    /// (period 0 before the gate) is registered and unexpired. The binding
+    /// precondition of KES enforcement.
+    pub fn kes_registered_stake_bps(&self, epoch: u64) -> u64 {
+        let period = crate::params::kes_period(epoch).unwrap_or(0);
+        let roster = self.consensus_roster_at(epoch);
+        let total: u128 = roster.iter().map(|v| u128::from(v.effective_stake)).sum();
+        if total == 0 {
+            return 0;
+        }
+        let covered: u128 = roster
+            .iter()
+            .filter(|v| {
+                self.kes
+                    .get(&v.index)
+                    .is_some_and(|entry| entry.in_force(period).leaf_index(period).is_some())
+            })
+            .map(|v| u128::from(v.effective_stake))
+            .sum();
+        (covered * 10_000 / total) as u64
+    }
+
+    /// The epoch KES enforcement bound on chain, if it has.
+    pub fn kes_enforced_from(&self) -> Option<u64> {
+        self.kes_enforced_from
+    }
+
+    /// The KES key of `validator` in force at global period `period`, if any.
+    pub fn kes_public_at(&self, validator: u32, period: u64) -> Option<crate::kes::KesPublic> {
+        self.kes.get(&validator).map(|entry| entry.in_force(period))
+    }
+
+    /// The KES key of `validator` in force at this state's epoch (its first
+    /// key before enforcement), if any.
+    pub fn kes_public(&self, validator: u32) -> Option<crate::kes::KesPublic> {
+        let period = crate::params::kes_period(self.epoch).unwrap_or(0);
+        self.kes_public_at(validator, period)
+    }
+
+    /// Every validator's KES entry (key in force and pending successor).
+    pub fn kes_roots(&self) -> &BTreeMap<u32, crate::kes::KesEntry> {
+        &self.kes
+    }
+
     fn apply_randao_recommit(
         &mut self,
         validator: u32,
@@ -4831,7 +5154,7 @@ impl CommittedState {
                     offender_effective_sat,
                     including_proposer,
                     verifier,
-                    &self.validators,
+                    &RegistryView { validators: &self.validators, kes: &self.kes, network_domain: self.admission_network_domain, enforced_from: self.kes_enforced_from },
                 )
             }
             SlashingEvidence::ProposerEquivocation { first, second } => {
@@ -4845,7 +5168,7 @@ impl CommittedState {
                     offender_effective_sat,
                     including_proposer,
                     verifier,
-                    &self.validators,
+                    &RegistryView { validators: &self.validators, kes: &self.kes, network_domain: self.admission_network_domain, enforced_from: self.kes_enforced_from },
                 )
             }
         }
@@ -5794,6 +6117,15 @@ impl CommittedState {
         st.epoch = next_epoch;
         // Rescue commitments past their TTL (no-op on the empty pre-gate map).
         st.prune_pq_rescue_commits(next_epoch);
+        // HF3 KES: enforcement binds at the first boundary past the compiled
+        // gate where registered keys cover the stake threshold (review F-2).
+        // Inert while `HF3_KES_ENFORCE_EPOCH` is the sentinel.
+        if st.kes_enforced_from.is_none()
+            && crate::params::kes_period(next_epoch).is_some()
+            && st.kes_registered_stake_bps(next_epoch) >= crate::params::KES_MIN_REGISTERED_STAKE_BPS
+        {
+            st.kes_enforced_from = Some(next_epoch);
+        }
         // M8 part 2: a running network without L2 state installs the pinned
         // activation policy at the flag day, only if the policy names this
         // network. Inert while `L2_SETTLEMENT_ACTIVATION_EPOCH` is the sentinel.
@@ -6275,15 +6607,20 @@ impl<V: SignatureVerifier> Transition<V> {
         //    signature is bound to its index and cannot be replayed under
         //    another. (Attestation signing roots are NOT so bound; see the
         //    note in step 8.)
-        let Some(proposer_key) = st.validators.pubkey(header.proposer_index) else {
-            return Err(TransitionError::Proposal(ProposalReject::UnknownProposer));
-        };
-        if !block_verifier.verify_with_key(
-            proposer_key,
+        //    From KES enforcement on, the proposer signs with the leaf of its
+        //    slot's period under its registered KES key (`crate::kes`);
+        //    before it this is exactly the static-key check.
+        match crate::kes::verify_validator(
+            &RegistryView { validators: &st.validators, kes: &st.kes, network_domain: st.admission_network_domain, enforced_from: st.kes_enforced_from },
+            &block_verifier,
+            header.proposer_index,
+            crate::epoch_of(header.slot),
             &header.proposal_signing_root(),
             &envelope.proposer_sig,
         ) {
-            return Err(TransitionError::Proposal(ProposalReject::BadSignature));
+            None => return Err(TransitionError::Proposal(ProposalReject::UnknownProposer)),
+            Some(false) => return Err(TransitionError::Proposal(ProposalReject::BadSignature)),
+            Some(true) => {}
         }
 
         // R7 M5 (behind REWARDS_V2_ACTIVATION_EPOCH): the proposer named
@@ -6429,8 +6766,14 @@ impl<V: SignatureVerifier> Transition<V> {
                 &self.verifier,
                 crate::epoch_of(att.data.slot),
             );
-            if attestation::validate(att, committee, header.slot, &att_verifier, &st.validators)
-                .is_err()
+            if attestation::validate(
+                att,
+                committee,
+                header.slot,
+                &att_verifier,
+                &RegistryView { validators: &st.validators, kes: &st.kes, network_domain: st.admission_network_domain, enforced_from: st.kes_enforced_from },
+            )
+            .is_err()
             {
                 return Err(reject);
             }
@@ -7081,6 +7424,7 @@ mod tx_codec_tests {
 #[cfg(test)]
 mod tests {
     include!("transition/l2_settlement_tests.rs");
+    include!("transition/kes_tests.rs");
     use super::*;
     mod validator_lifecycle {
         use super::*;
@@ -7890,6 +8234,19 @@ mod tests {
         // Signed twice because the signing root covers `state_root`: the probe
         // header (root still zero) and the final header are different messages.
         let sign_for = |h: &BlockHeaderV4| -> Vec<u8> {
+            // From KES enforcement on (only ever under a test-armed schedule),
+            // the proposer signs with its toy KES leaf for the slot's period.
+            if let crate::kes::SigningMode::Kes(period) = crate::kes::signing_mode(pre, p, crate::epoch_of(h.slot)) {
+                let message = crate::kes::leaf_message(
+                    crate::attestation::KeyLookup::kes_network_domain(pre),
+                    p,
+                    &kes_rules::toy_kes_public(p),
+                    period,
+                    &h.proposal_signing_root(),
+                )
+                .unwrap_or([0; 32]);
+                return kes_rules::toy_kes_sign(p, period, &message);
+            }
             match crate::attestation::KeyLookup::pubkey(pre, p) {
                 Some(pk) => toy_sign(pk, &h.proposal_signing_root()),
                 // A fixture whose registry has no such index: leave the stub
@@ -13628,7 +13985,17 @@ mod tests {
         let shut = run();
         let open = {
             let _gates = all_hf_gates_open();
-            run()
+            // HF3 KES registration and enforcement from genesis (no validator
+            // registers here, so every signer stays on its static key).
+            crate::params::kes_rehearsal::set(Some(crate::params::KesSchedule {
+                registration_epoch: 0,
+                activation_epoch: 0,
+                period_epochs: crate::params::KES_PERIOD_EPOCHS,
+                min_depth: crate::params::KES_MIN_REGISTERED_DEPTH,
+            }));
+            let r = run();
+            crate::params::kes_rehearsal::set(None);
+            r
         };
         assert!(shut.3.is_ok(), "control: the V2 transfer must apply: {:?}", shut.3);
         assert_eq!(open.1, shut.1, "V1 transfer: unspent set differs with HF gates open");
@@ -15725,6 +16092,12 @@ mod tests {
             // no satoshi in either direction. Beacon state, not value state;
             // it cannot touch the cap.
             PosTransaction::RandaoRecommit { .. } => {}
+            // A KES registration records one (depth, root) pair per validator
+            // and moves no satoshi: registry metadata, not value.
+            PosTransaction::KesRegister { .. } => {}
+            // A KES rotation replaces that pair from the next period on and
+            // moves no satoshi either.
+            PosTransaction::KesRotate { .. } => {}
             // Funded admission transfers UTXO value into bonded stake and fees.
             PosTransaction::FundedDeposit(_) => {}
             // Funded delegation moves existing UTXO value through a bonded

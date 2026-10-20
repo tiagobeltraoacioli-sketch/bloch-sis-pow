@@ -43,6 +43,7 @@
 use crate::attestation::{Attestation, KeyLookup, RejectReason, SignatureVerifier};
 use crate::params::SLOTS_PER_EPOCH;
 use crate::slashing::SlashingEvidence;
+#[cfg(test)]
 use sha3::{Digest, Sha3_256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -542,7 +543,12 @@ impl AttestationPool {
         //    projection lags and answers `UnknownValidator` loses propagation,
         //    never consensus. Reject-vs-Ignore matters for exactly that
         //    reason — see below.
-        let Some(pubkey) = keys.pubkey(att.validator) else {
+        //    The fingerprint is `SHA3(static key)` before KES enforcement and
+        //    also commits to the KES key, domain and period after it
+        //    (`crate::kes::authority_fingerprint`).
+        let Some(current_pubkey_sha3) =
+            crate::kes::authority_fingerprint(keys, att.validator, att.data.target_epoch)
+        else {
             // IGNORE, not Reject. A committee member this node cannot resolve
             // is a node that is BEHIND — its registry projection has not yet
             // caught up to the deposit that added the validator — and the
@@ -588,14 +594,22 @@ impl AttestationPool {
         //    same key fingerprint; a defensive key mismatch takes the normal
         //    verification path. Only verified attestations are recorded or
         //    parked, so a forger cannot frame a validator.
-        let current_pubkey_sha3: [u8; 32] = Sha3_256::digest(pubkey).into();
+        //    From KES enforcement on, the leaf of the target epoch's period
+        //    signs (`crate::kes::verify_validator`); before it, the static key.
         let already_authenticated = authenticated_pubkey_sha3 == Some(current_pubkey_sha3);
         if !already_authenticated
-            && !crate::attestation::PolicyVerifier::consensus(
-                verifier,
+            && crate::kes::verify_validator(
+                keys,
+                // Each vote under the consensus signature rule of its OWN
+                // epoch (HF2), and from KES enforcement on by the leaf of that
+                // epoch's period (HF3). The epoch is the vote SLOT's, the one
+                // its signer signed under.
+                &crate::attestation::PolicyVerifier::consensus(verifier, crate::epoch_of(att.data.slot)),
+                att.validator,
                 crate::epoch_of(att.data.slot),
-            )
-            .verify_with_key(pubkey, &data_hash, &att.signature)
+                &data_hash,
+                &att.signature,
+            ) != Some(true)
         {
             return GossipDecision::Reject(RejectReason::BadSignature);
         }

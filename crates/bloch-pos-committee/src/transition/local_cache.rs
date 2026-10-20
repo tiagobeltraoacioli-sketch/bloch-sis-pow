@@ -24,6 +24,14 @@ const FINALITY_SET_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::FINALITY
 /// roots (`params::HF1_OWN_TARGET_VOTES_EPOCH`). Written only when non-empty,
 /// so every earlier cache keeps its bytes.
 const OWN_CHECKPOINT_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::OWN_CHECKPOINTS;
+/// Marks the optional section holding KES entries (`CommittedState::kes`:
+/// key in force and pending successor, each with its start period). Written
+/// only when non-empty, so every cache without a registration keeps its
+/// bytes. `v2`: the devnet lineage's `v1` section (no start period) is not
+/// accepted and makes the cache rebuild from blocks.
+const KES_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::KES;
+/// One cached KES key: depth, root, start period.
+type CachedKes = (u8, [u8; 32], u64);
 // Every optional section is written and parsed in `wire_alloc::local_cache::ORDER`.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedState {
@@ -142,7 +150,7 @@ impl CommittedState {
     /// or allocating a second encoded payload. Restore the original destination
     /// length if serialization fails; existing prefix bytes remain untouched.
     pub fn append_local_cache(&self, bytes: &mut Vec<u8>) -> Result<(), String> {
-        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat, l2_settlement, pq_rescue_commits } = self;
+        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat, l2_settlement, pq_rescue_commits, kes, kes_enforced_from } = self;
         let value = CachedStateRef {
             admission_network_domain,
             slot,
@@ -221,6 +229,27 @@ impl CommittedState {
                 return Err("local cache payload exceeds its limit".into());
             }
         }
+        // Registered KES keys: an optional section after L2 [L2CP], absent while none is
+        // registered (every network before `KES_REGISTRATION_EPOCH`).
+        if !kes.is_empty() || kes_enforced_from.is_some() {
+            let flat: BTreeMap<u32, (CachedKes, Option<CachedKes>)> = kes
+                .iter()
+                .map(|(v, e)| {
+                    let flat = |k: &crate::kes::KesPublic| (k.depth, k.root, k.start_period);
+                    (*v, (flat(&e.current), e.next.as_ref().map(flat)))
+                })
+                .collect();
+            bytes.extend_from_slice(KES_SECTION);
+            if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
+                .serialize_into(&mut *bytes, &(flat, *kes_enforced_from)) {
+                bytes.truncate(original_len);
+                return Err(error.to_string());
+            }
+            if bytes.len() - original_len > LIMIT as usize {
+                bytes.truncate(original_len);
+                return Err("local cache payload exceeds its limit".into());
+            }
+        }
         if !pq_rescue_commits.is_empty() {
             bytes.extend_from_slice(PQ_SECTION);
             if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
@@ -262,7 +291,7 @@ impl CommittedState {
     // oracle: equality catches changes to field order and eUTXO sequence framing.
     #[cfg(test)]
     pub(super) fn encode_local_cache_owned_reference(&self) -> Result<Vec<u8>, String> {
-        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat, l2_settlement: _, pq_rescue_commits: _ } = self;
+        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat, l2_settlement: _, pq_rescue_commits: _, kes: _, kes_enforced_from: _ } = self;
         let value = CachedState {
             admission_network_domain: admission_network_domain.clone(),
             slot: slot.clone(),
@@ -321,7 +350,7 @@ impl CommittedState {
         let value: CachedState = bincode::DefaultOptions::new().with_limit(LIMIT)
             .deserialize_from(&mut rest).map_err(|e| e.to_string())?;
         // Optional sections, in their only legal order
-        // (`wire_alloc::local_cache::ORDER`): L2 [L2CP], PQ, FSET, FFGO.
+        // (`wire_alloc::local_cache::ORDER`): L2 [L2CP], KES, PQ, FSET, FFGO.
         let mut l2_settlement = None;
         if let Some(mut section) = rest.strip_prefix(L2_SECTION.as_slice()) {
             let mut l2: crate::l2_settlement::State = bincode::DefaultOptions::new().with_limit(LIMIT)
@@ -336,6 +365,23 @@ impl CommittedState {
                 section = roots_section;
             }
             l2_settlement = Some(l2.from_local_cache()?);
+            rest = section;
+        }
+        let mut kes = BTreeMap::new();
+        let mut kes_enforced_from = None;
+        if let Some(mut section) = rest.strip_prefix(KES_SECTION.as_slice()) {
+            let (flat, enforced): (BTreeMap<u32, (CachedKes, Option<CachedKes>)>, Option<u64>) =
+                bincode::DefaultOptions::new().with_limit(LIMIT)
+                    .deserialize_from(&mut section).map_err(|e| e.to_string())?;
+            if flat.is_empty() && enforced.is_none() {
+                return Err("empty cached KES section".into());
+            }
+            kes_enforced_from = enforced;
+            let key = |(depth, root, start): CachedKes| crate::kes::KesPublic::new(depth, root, start);
+            kes = flat
+                .into_iter()
+                .map(|(v, (current, next))| (v, crate::kes::KesEntry { current: key(current), next: next.map(key) }))
+                .collect();
             rest = section;
         }
         let pq_rescue_commits: BTreeMap<[u8; 32], u64> = match rest.strip_prefix(PQ_SECTION.as_slice()) {
@@ -419,6 +465,8 @@ impl CommittedState {
             issued_sat: value.issued_sat,
             l2_settlement,
             pq_rescue_commits,
+            kes,
+            kes_enforced_from,
         };
         if state.slot != header.slot || state.epoch != header.slot / crate::params::SLOTS_PER_EPOCH || state.compute_root() != header.state_root {
             return Err("cached state does not match its block header".into());

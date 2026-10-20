@@ -177,7 +177,7 @@ selection (§5.4); A2 owns the property test. `StateRoots` is a frozen Phase-1
 DTO with 14 top-level fields, retained for compatibility but never implemented
 on the production path. It is not the live component schema. Production folds
 `state_root::ConsensusState`; the append-only `STATE_COMPONENT_TAGS` registry
-currently contains 34 components and is the count/name/tag authority.
+currently contains 35 components and is the count/name/tag authority.
 Attestations get their own tree, separate from transactions, so a finalized
 epoch's signatures can be pruned (§6.5.1) without disturbing the transaction
 commitment.

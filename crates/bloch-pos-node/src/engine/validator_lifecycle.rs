@@ -69,7 +69,48 @@ fn is_lifecycle(tx: &PosTransaction) -> bool {
             | PosTransaction::ExitV2 { .. }
             | PosTransaction::RandaoRecommit { .. }
             | PosTransaction::SlashingEvidence(_)
+            | PosTransaction::KesRegister { .. }
+            | PosTransaction::KesRotate { .. }
     )
+}
+
+/// Mempool hygiene for KES registration (0x17), which consensus accepts once
+/// per validator (`check_kes_register` refuses a validator that already has a
+/// key). Relay policy only: consensus repeats its own check on the block's
+/// pre-state and nothing here changes block validity (devnet line 7606f74f).
+///
+/// Two refusals, each with its own reason so an operator can tell them apart:
+/// a key already in COMMITTED state, and a registration for the same validator
+/// already PENDING here (two pending registrations for one validator can never
+/// both apply; first come, first kept — the rule the funded deposit uses for a
+/// joining key). Once the first is included, `revalidate_lifecycle_mempool`
+/// evicts anything left behind against committed state. Both checks are
+/// cheap and run before any signature verification.
+pub(super) fn kes_register_conflict(
+    state: &CommittedState,
+    mempool: &BTreeMap<Vec<u8>, PosTransaction>,
+    tx: &PosTransaction,
+) -> Result<(), Refusal> {
+    if let PosTransaction::KesRotate { validator, .. } = tx {
+        return kes_rotate_conflict(state, mempool, *validator);
+    }
+    let PosTransaction::KesRegister { validator, .. } = tx else {
+        return Ok(());
+    };
+    if state.kes_public(*validator).is_some() {
+        return Err(Refusal::Invalid(
+            "KES key already registered for this validator: registration (tag 0x17) \
+             is once-only and consensus refuses a re-registration",
+        ));
+    }
+    if mempool.values().any(|pending| {
+        matches!(pending, PosTransaction::KesRegister { validator: other, .. } if other == validator)
+    }) {
+        return Err(Refusal::Invalid(
+            "a KES registration for this validator is already pending; only one can apply",
+        ));
+    }
+    Ok(())
 }
 
 /// Delegates only cryptographic calls that survive consensus' cheap-first
@@ -137,6 +178,26 @@ impl<V: SignatureVerifier> SignatureVerifier for LifecycleAdmissionVerifier<'_, 
         }
         self.inner.verify_spend_at_epoch(public_key, message, signature, epoch)
     }
+
+    /// KES leaves (a `KesRotate`): the same per-source allowance, forwarded
+    /// to the inner leaf hook (bound form).
+    fn verify_kes_leaf(&self, public_key: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        if self.inner.is_known_failure(
+            bloch_pos_committee::SignaturePolicy::Compatible,
+            public_key,
+            &verification::GossipVerifier::<V>::kes_leaf_cache_root(message),
+            signature,
+        ) {
+            return false;
+        }
+        if let Some(source) = self.source {
+            if !self.mempool.borrow_mut().reserve_lifecycle_verification(source, self.wall_slot) {
+                self.limited.set(true);
+                return false;
+            }
+        }
+        self.inner.verify_kes_leaf(public_key, message, signature)
+    }
 }
 
 #[cfg(test)]
@@ -179,11 +240,42 @@ mod verification_budget_tests {
     }
 }
 
+/// Mempool hygiene for HF3 KES rotation, which consensus accepts at most once
+/// per validator per period (`check_kes_rotate`). Relay policy only, applied
+/// from day one (readiness doc §3 item 2): one pending rotation per validator
+/// (first come, first kept), and none while the committed state already
+/// holds a successor waiting for its period. Stale rotations (signed for a
+/// period the head has left) fail `validate_lifecycle_transaction` and are
+/// evicted by `revalidate_lifecycle_mempool`.
+fn kes_rotate_conflict(
+    state: &CommittedState,
+    mempool: &BTreeMap<Vec<u8>, PosTransaction>,
+    validator: u32,
+) -> Result<(), Refusal> {
+    let period = params::kes_period(epoch_of(state.slot()));
+    if let (Some(entry), Some(period)) = (state.kes_roots().get(&validator), period) {
+        if entry.pending_at(period).is_some() {
+            return Err(Refusal::Invalid(
+                "a KES rotation for this validator is already committed and waits for its period",
+            ));
+        }
+    }
+    if mempool.values().any(|pending| {
+        matches!(pending, PosTransaction::KesRotate { validator: other, .. } if *other == validator)
+    }) {
+        return Err(Refusal::Invalid(
+            "a KES rotation for this validator is already pending; only one can apply per period",
+        ));
+    }
+    Ok(())
+}
+
 impl Engine {
     pub(super) fn validate_lifecycle_admission(&mut self, tx: &PosTransaction) -> Result<(), Refusal> {
         if !is_lifecycle(tx) {
             return Ok(());
         }
+        kes_register_conflict(&self.state, &self.mempool, tx)?;
         let total = self.state.active_validators().iter()
             .map(|v| u128::from(v.effective_stake)).sum();
         let fee = self.state.next_base_fee();
@@ -220,7 +312,9 @@ impl Engine {
             PosTransaction::RescueCommit(t) => Some(lifecycle_source_hash(b"rescue-commit", &t.commitment)),
             PosTransaction::ExitV2 { pubkey_hash, .. } => self.state
                 .validator_index_by_hash(pubkey_hash).map(validator_lifecycle_source),
-            PosTransaction::RandaoRecommit { validator, .. } =>
+            PosTransaction::RandaoRecommit { validator, .. }
+            | PosTransaction::KesRegister { validator, .. }
+            | PosTransaction::KesRotate { validator, .. } =>
                 Some(validator_lifecycle_source(*validator)),
             // P5a: once armed, `precheck_slashing_evidence` has already
             // charged both verifications to the DELIVERER; charging the

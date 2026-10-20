@@ -832,6 +832,8 @@ fn kind_of(tx: &PosTransaction) -> TxKind {
         // Post-quantum migration (0x18-0x1A). Names match the node's RPC.
         PosTransaction::WithdrawalCredentialRotation(_) => TxKind::WithdrawalCredentialRotation,
         PosTransaction::RescueCommit(_) => TxKind::PqRescueCommit,
+        PosTransaction::KesRegister { .. } => TxKind::KesRegister,
+        PosTransaction::KesRotate { .. } => TxKind::KesRotate,
         PosTransaction::RescueReveal(_) => TxKind::PqRescueReveal,
     }
 }
@@ -918,7 +920,9 @@ fn transfer_parts(tx: &PosTransaction) -> (Vec<OutPoint>, Vec<(u64, ScriptHash)>
         // that payout already comes from the receipt. Rescue commit (0x19)
         // is fee-free state only.
         | PosTransaction::WithdrawalCredentialRotation(_)
-        | PosTransaction::RescueCommit(_) => (Vec::new(), Vec::new(), 0, 0),
+        | PosTransaction::RescueCommit(_)
+        | PosTransaction::KesRegister { .. }
+        | PosTransaction::KesRotate { .. } => (Vec::new(), Vec::new(), 0, 0),
     }
 }
 
@@ -938,7 +942,10 @@ fn created_output_bound(tx: &PosTransaction) -> usize {
         PosTransaction::L2Deposit(_) | PosTransaction::L2DataAvailability(_) => 1,
         PosTransaction::L2WithdrawClaim(_) => 2,
         PosTransaction::RescueReveal(_) => 1,
-        PosTransaction::WithdrawalCredentialRotation(_) | PosTransaction::RescueCommit(_) => 0,
+        PosTransaction::WithdrawalCredentialRotation(_)
+        | PosTransaction::RescueCommit(_)
+        | PosTransaction::KesRegister { .. }
+        | PosTransaction::KesRotate { .. } => 0,
         PosTransaction::L2Settlement(_)
         | PosTransaction::L2SettlementAsync(_)
         | PosTransaction::FundedUndelegate(_)

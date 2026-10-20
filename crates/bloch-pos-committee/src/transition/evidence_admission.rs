@@ -125,7 +125,12 @@ impl CommittedState {
         if self.is_write_off_indeterminate(offender) {
             return Err(Context(EvidenceError::AlreadySlashed));
         }
-        let key_binding_final = rec.activation_epoch == 0;
+        // A KES registration (and every rotation) is a post-genesis,
+        // branch-dependent transaction: a KES-era signature failure proves a
+        // fault only against an entry both peers share, so a registered
+        // validator's key binding is never treated as final here (relay
+        // verdict "ignore", not a peer fault).
+        let key_binding_final = rec.activation_epoch == 0 && !self.kes_roots().contains_key(&offender);
         Ok(EvidencePrecheck { offender, id, signed, key_binding_final })
     }
 
@@ -141,7 +146,11 @@ impl CommittedState {
     ) -> Option<bool> {
         for (epoch, root, sig) in pre.signed.iter() {
             if !slashing::verify_offender_signature(
-                &self.validators,
+                // The whole state as the key lookup: it resolves KES keys and
+                // the enforcement bind epoch, exactly as consensus does (the
+                // bare validator map would judge KES-era evidence under the
+                // static key; review F-3).
+                self,
                 verifier,
                 pre.offender,
                 *epoch,

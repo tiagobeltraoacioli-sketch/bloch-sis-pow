@@ -229,6 +229,23 @@ impl CommittedState {
                     .apply_slashing_evidence(evidence, 0, &roster, verifier)
                     .map_err(|_| TxReject::StakingRule)
             }
+            // Same gate and rules as the consensus arm, without cloning the
+            // state: `check_kes_register` mutates nothing.
+            PosTransaction::KesRegister { validator, depth, root, signature } => {
+                if !crate::params::kes_registration_open(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
+                self.check_kes_register(*validator, *depth, root, signature, verifier).map(|_| ())
+            }
+            // Same gate and rules as the consensus arm: `check_kes_rotate`
+            // mutates nothing. Judged at this state's epoch, so a rotation
+            // signed for a period the head has left is refused (and evicted).
+            PosTransaction::KesRotate { validator, period, depth, root, signature } => {
+                if !crate::params::kes_registration_open(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
+                self.check_kes_rotate(*validator, *period, *depth, root, signature, verifier).map(|_| ())
+            }
             PosTransaction::FundedDelegate(_)
             | PosTransaction::FundedUndelegate(_)
             | PosTransaction::FundedDelegationWithdraw(_)

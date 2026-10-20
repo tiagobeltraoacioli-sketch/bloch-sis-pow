@@ -524,7 +524,8 @@ fn local_cache_round_trips_rescue_commitments() {
 
 /// The PQ bytes come from the HF3 allocation table and nowhere else: 0x17
 /// (KesRegister) and 0x1B (KesRotate) sit on either side, 0x24 is the
-/// rescue-commitment state tag, and this tree decodes neither KES byte.
+/// rescue-commitment state tag, and on the integrated tree both KES bytes
+/// dispatch to the KES decoders (never to a PQ one).
 #[test]
 fn pq_wire_bytes_follow_the_hf3_allocation() {
     use crate::wire_alloc::{state, tx};
@@ -534,7 +535,11 @@ fn pq_wire_bytes_follow_the_hf3_allocation() {
     );
     assert_eq!(state::PQ_RESCUE_COMMIT, 0x24);
     for kes in [tx::KES_REGISTER, tx::KES_ROTATE] {
-        assert_eq!(PosTransaction::from_canonical_bytes(&[kes]), Err(TxDecodeError::UnknownTag(kes)));
+        assert_ne!(PosTransaction::from_canonical_bytes(&[kes]), Err(TxDecodeError::UnknownTag(kes)));
+        assert!(!matches!(
+            PosTransaction::from_canonical_bytes(&[kes]),
+            Ok(PosTransaction::WithdrawalCredentialRotation(_) | PosTransaction::RescueCommit(_) | PosTransaction::RescueReveal(_))
+        ));
     }
     // Every PQ tag decodes to its own variant on this tree (round trip).
     let tx = PosTransaction::RescueCommit(RescueCommit {

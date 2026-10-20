@@ -81,6 +81,16 @@ impl<V> GossipVerifier<V> {
         hash.finalize().into()
     }
 
+    /// The failure-cache root of a KES LEAF check: distinct from the plain
+    /// root, because a leaf is verified in the bound (v2) form and a triple
+    /// that failed one form says nothing about the other.
+    pub(super) fn kes_leaf_cache_root(root: &[u8; 32]) -> [u8; 32] {
+        let mut hash = Sha3_256::new();
+        hash.update(b"bloch-node-kes-leaf-failure-v1");
+        hash.update(root);
+        hash.finalize().into()
+    }
+
     pub(super) fn is_known_failure(
         &self,
         policy: SignaturePolicy,
@@ -193,6 +203,20 @@ impl<V> BudgetedVerifier<'_, V> {
 }
 
 impl<V: SignatureVerifier> SignatureVerifier for BudgetedVerifier<'_, V> {
+    /// KES leaves: same cache-before-budget order, forwarded to the owner's
+    /// leaf hook (bound form), never to `verify_with_key`. One unit.
+    fn verify_kes_leaf(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        let cache_root = GossipVerifier::<V>::kes_leaf_cache_root(root);
+        if self.owner.is_known_failure(SignaturePolicy::Compatible, pubkey, &cache_root, signature) {
+            return false;
+        }
+        if !self.owner.reserve_verification(self.slot, self.cap, self.source, self.source_cap, 1) {
+            self.limited.set(true);
+            return false;
+        }
+        self.owner.verify_kes_leaf(pubkey, root, signature)
+    }
+
     fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
         self.verify_with_key_under(SignaturePolicy::Compatible, pubkey, root, signature)
     }
@@ -285,6 +309,25 @@ impl<V: SignatureVerifier> SignatureVerifier for GossipVerifier<V> {
         false
     }
 
+    /// KES leaves: cached under their own root domain and forwarded to the
+    /// inner verifier's leaf hook (bound form).
+    fn verify_kes_leaf(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        #[cfg(test)]
+        assert!(
+            !self.panic_on_verification.get(),
+            "deferred authenticated block must not repeat gossip verification"
+        );
+        let key = Self::failure_key(SignaturePolicy::Compatible, pubkey, &Self::kes_leaf_cache_root(root), signature);
+        if self.failures.borrow().known.contains(&key) {
+            return false;
+        }
+        if self.verifier.verify_kes_leaf(pubkey, root, signature) {
+            return true;
+        }
+        self.remember_failure(key);
+        false
+    }
+
     /// HF3 spend path: below the gate exactly [`Self::verify_with_key`]; from
     /// it the inner verifier's epoch-aware method, memoizing failures under
     /// the gate-specific key ([`Self::spend_failure_key`]).
@@ -335,6 +378,11 @@ impl SignatureVerifier for CountedHybrid {
     ) -> bool {
         self.0.set(self.0.get().saturating_add(1));
         crate::keys::HybridVerifier::new().verify_with_key_under(policy, key, root, signature)
+    }
+
+    fn verify_kes_leaf(&self, key: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        self.0.set(self.0.get().saturating_add(1));
+        crate::keys::HybridVerifier::new().verify_kes_leaf(key, root, signature)
     }
 }
 

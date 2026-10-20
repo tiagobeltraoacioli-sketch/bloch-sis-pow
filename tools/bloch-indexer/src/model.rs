@@ -167,6 +167,11 @@ pub enum TxKind {
     /// Lattice-break rescue reveal (0x1A): sweeps every output of one key
     /// into one output at vout 0.
     PqRescueReveal,
+    /// HF3 KES registration (0x17): a validator commits its forward-secure
+    /// key tree. No eUTXO effect.
+    KesRegister,
+    /// HF3 KES rotation (0x1B), leaf-authorised. No eUTXO effect.
+    KesRotate,
     /// A tag this build does not know. Recorded, never fatal: an index that
     /// aborts on an unknown tag stops being available exactly when a new
     /// transaction type ships.
@@ -198,6 +203,8 @@ impl TxKind {
             TxKind::WithdrawalCredentialRotation => "withdrawal_credential_rotation".into(),
             TxKind::PqRescueCommit => "pq_rescue_commit".into(),
             TxKind::PqRescueReveal => "pq_rescue_reveal".into(),
+            TxKind::KesRegister => "kes_register".into(),
+            TxKind::KesRotate => "kes_rotate".into(),
             TxKind::Unknown(t) => format!("unknown_{t:#04x}"),
         }
     }

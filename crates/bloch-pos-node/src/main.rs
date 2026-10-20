@@ -55,6 +55,8 @@ mod equivocation_watch;
 mod genesis;
 mod funded_delegation_cli;
 mod keys;
+mod kes_key;
+mod kes_cli;
 mod metrics;
 mod net;
 mod p2p;
@@ -246,6 +248,12 @@ fn main() {
         Some("l2-da") => {
             if let Err(error) = l2_da_cli::run(&args[1..]) {
                 eprintln!("l2-da: {error}");
+                exit(2);
+            }
+        }
+        Some("kes") => {
+            if let Err(error) = kes_cli::run(&args[1..]) {
+                eprintln!("kes: {error}");
                 exit(2);
             }
         }
