@@ -671,8 +671,10 @@ class Rehearsal:
             if self.obs in infos:
                 ref = chains[up[0]]
                 mine = chains[self.obs]
-                common = sorted(set(ref) | set(mine))
-                fork = next((s for s in common if ref.get(s) != mine.get(s) and s <= max(mine, default=0)), None)
+                # First slot where the upgraded chain has a block the observer
+                # does not share — including blocks past the observer's head,
+                # which is what a node that stopped at a rejected block shows.
+                fork = next((s for s in sorted(ref) if mine.get(s) != ref.get(s)), None)
                 obs_fin = infos[self.obs]["finalized"]["epoch"]
                 ev = {"fork_slot": fork, "fork_epoch": None if fork is None else fork // SPE,
                       "observer_head_slot": infos[self.obs]["slot"], "observer_finalized_epoch": obs_fin,
