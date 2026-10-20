@@ -138,10 +138,12 @@ has drifted to ~1008 in the deeper worktrees).
 | `0x14` | `L2Deposit` | **Assigned, native L2** — `devnet-l2-deposits` builds only until activation | l2 | `wire_tag_registry.rs` |
 | `0x15` | `L2DataAvailability` | **Assigned, native L2** — `devnet-l2-user-txs` builds only until activation | l2 | `wire_tag_registry.rs` |
 | `0x16` | `L2WithdrawClaim` | **Assigned, native L2** — `devnet-l2-user-txs` builds only until activation | l2 | `wire_tag_registry.rs` |
-| `0x17` | `KesRegister` | **Assigned, unarmed** — refused before `KES_REGISTRATION_EPOCH` (u64::MAX); same byte devnet4 used | consensus | `wire_tag_registry.rs` |
-| `0x18`–`0xFF` | free | — | — | — |
+| `0x17` | `KesRegister` | **Assigned, unarmed** — refused before `HF3_KES_EPOCH` (= `KES_REGISTRATION_EPOCH`, u64::MAX); same byte devnet4 used | consensus | `wire_tag_registry.rs` |
+| `0x18`–`0x1A` | PQ migration (`WithdrawalCredentialRotation`, `RescueCommit`, `RescueReveal`) | **Reserved** by the HF3 allocation (`codex/hf3-tags-20261020` e0bfbfff); absent from this tree | pq-migration | `wire_alloc.rs` (HF3 tags line) |
+| `0x1B` | `KesRotate` | **Assigned, unarmed** — HF3 leaf-authorised KES rotation; refused before `HF3_KES_EPOCH` (u64::MAX) | consensus | `wire_tag_registry.rs` |
+| `0x1C`–`0xFF` | free | — | — | — |
 
-**Next free transaction tag: `0x18`.** (`0x07`–`0x09` remain reserved and
+**Next free transaction tag: `0x1C`.** (`0x07`–`0x09` remain reserved and
 contested; `0x0E`–`0x11` are assigned to the funded-delegation lifecycle;
 `0x12`–`0x16` to the native L2 bridge, renumbered past `0x0E`–`0x11` on
 2026-10-10 because the L2 branch first used them.)
@@ -371,7 +373,7 @@ wrong message; it produces a wrong state root, on every node, permanently.
 | `0x1F` | `TAG_FUNDED_DELEGATION_OWNER` | **Assigned, unarmed candidate** | staking |
 | `0x20` | `TAG_FUNDED_DELEGATION_LIFECYCLE` | **Assigned, unarmed candidate** | staking |
 | `0x21` | `TAG_L2_SETTLEMENT` | **Assigned, native L2 (M8 port)** — no leaf without an L2 policy | l2 |
-| `0x22` | `TAG_KES_ROOT` | **Assigned, unarmed** — no leaf until a validator registers a KES root | consensus |
+| `0x22` | `TAG_KES_ROOT` | **Assigned, unarmed** — per validator `KesEntry` (key in force `depth ‖ root ‖ start_period`, then any pending successor); one `enforced` leaf once KES binds; no leaf until the first registration | consensus |
 | `0x23`+ | free | — | — | — |
 
 **Next free state-root tag: `0x23`.** (The L2 branch first used `0x1F`, which
