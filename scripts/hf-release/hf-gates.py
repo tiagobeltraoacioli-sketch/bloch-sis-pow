@@ -9,6 +9,12 @@
       between the fleet release and the candidate, plus any --gate given.
       status: scheduled:<epoch> | inert (u64::MAX) | alias:<expr> | missing
 
+  hf-gates.py tripwires --repo <git dir> --commit <commit> --gate NAME [--gate NAME ...]
+      Prints the test functions that pin one of the given gates to u64::MAX
+      (`assert_eq!(<..>NAME, u64::MAX)` or `NAME == u64::MAX` in their body).
+      Such a test must fail once the gate is armed; qualify.sh accepts exactly
+      these failures for the gates it finds armed.
+
   hf-gates.py force --tree <exported source dir> --gate NAME --epoch N
       Rewrites every single-line definition of NAME under <tree>/crates to N.
       QUALIFICATION ONLY: the result must never be released. Fails if the
@@ -107,6 +113,27 @@ def force(args):
         print(h)
 
 
+def tripwires(args):
+    names = set()
+    for gate in args.gate:
+        pat = r"(^|[^A-Z0-9_])" + gate + r"[[:space:]]*(,|==)[[:space:]]*u64::MAX"
+        out = subprocess.run(["git", "-C", args.repo, "grep", "-nE", pat, args.commit, "--", "crates/*.rs"],
+                             check=False, capture_output=True, text=True)
+        for line in out.stdout.splitlines():
+            _, path, lineno, _ = line.split(":", 3)
+            src = subprocess.run(["git", "-C", args.repo, "show", f"{args.commit}:{path}"],
+                                 check=True, capture_output=True, text=True).stdout.split("\n")
+            for i in range(int(lineno) - 1, -1, -1):
+                m = re.match(r"\s*(?:pub\s+)?fn\s+([a-z0-9_]+)\s*\(", src[i])
+                if m:
+                    # Only a #[test] function counts as a tripwire.
+                    if any("#[test]" in src[j] for j in range(max(0, i - 4), i)):
+                        names.add(m.group(1))
+                    break
+    for n in sorted(names):
+        print(n)
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -115,12 +142,16 @@ def main():
     d.add_argument("--base", required=True)
     d.add_argument("--candidate", required=True)
     d.add_argument("--gate", action="append")
+    t = sub.add_parser("tripwires")
+    t.add_argument("--repo", required=True)
+    t.add_argument("--commit", required=True)
+    t.add_argument("--gate", action="append", required=True)
     f = sub.add_parser("force")
     f.add_argument("--tree", required=True)
     f.add_argument("--gate", required=True)
     f.add_argument("--epoch", required=True, type=int)
     args = p.parse_args()
-    discover(args) if args.cmd == "discover" else force(args)
+    {"discover": discover, "tripwires": tripwires, "force": force}[args.cmd](args)
 
 
 if __name__ == "__main__":

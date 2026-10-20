@@ -13,7 +13,7 @@
 #              changed gate must be scheduled after the replayed head (or be
 #              inert), so this run is the "nothing changes before activation"
 #              proof;
-#   4. forced  for each forced gate, a QUALIFICATION-ONLY build with only that
+#   4. forced  for each gate the candidate arms (plus any --gate), a QUALIFICATION-ONLY build with only that
 #              gate moved to an early epoch E inside the copied history:
 #                pre   slots < E*32: must end on exactly the head the candidate
 #                      reaches on the same prefix (moving the constant changes
@@ -39,7 +39,7 @@
 #     --baseline-bin FILE   the binary the fleet runs today (b4a21fb6 release)
 #     --out DIR             new output directory (default ~/hf-qualify-<commit12>-<utc>)
 #     --base-commit C       fleet release commit for gate discovery (default b4a21fb6...)
-#     --gate NAME[=EPOCH]   gate to force (repeatable; added to the discovered gates)
+#     --gate NAME[=EPOCH]   extra gate to force (repeatable; default: every gate armed in <commit>)
 #     --gates-only          force only the --gate list (the schedule check still
 #                           covers every discovered gate)
 #     --force-epoch N       early test epoch (default: head epoch of --source - window - 8)
@@ -50,7 +50,8 @@
 #                           (repeatable; default: bloch = legacy/genesis3-node, the
 #                           closed Genesis-3 PoW node outside the CI blocking set)
 #     --tests-allow-test NAME test (full path or final segment) whose failure is
-#                           expected, e.g. an "inert gate" tripwire in an armed build
+#                           expected (tests that pin an ARMED gate to u64::MAX are
+#                           found and accepted automatically; see hf-gates.py tripwires)
 #     --skip-tests | --skip-forced | --allow-unsandboxed
 #   env: CONTAINER_ENGINE (default docker; e.g. a `sudo -n docker` wrapper)
 #
@@ -150,6 +151,29 @@ else
 fi
 cleanup; WT=""
 
+# ── gates (git only), before the tests so armed-gate tripwires are known ──
+IDX_LAST_SLOT="$(python3 -I -c '
+import struct, sys
+b = open(sys.argv[1], "rb").read()
+assert b[:8] == b"BPOSIDX1" and len(b) >= 28, "bad blocks.idx"
+n = (len(b) - 8) // 20
+print(struct.unpack_from("<Q", b, 8 + (n - 1) * 20)[0])' "$SOURCE/blocks.idx")"
+IDX_HEAD_EPOCH=$((IDX_LAST_SLOT / SLOTS_PER_EPOCH))
+gate_names=(); for g in ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}; do gate_names+=(--gate "${g%%=*}"); done
+python3 -I "$GATES_PY" discover --repo "$REPO" --base "$BASE_COMMIT" --candidate "$COMMIT" \
+  ${gate_names[@]+"${gate_names[@]}"} > "$OUT/gates.tsv"
+say "gates (name, fleet value, candidate value, status); source head e$IDX_HEAD_EPOCH (index):"
+sed 's/^/    /' "$OUT/gates.tsv"
+
+armed=(); while IFS=$'\t' read -r name _ _ st; do case "$st" in scheduled:*) armed+=(--gate "$name") ;; esac; done < "$OUT/gates.tsv"
+if [ ${#armed[@]} -gt 0 ]; then
+  python3 -I "$GATES_PY" tripwires --repo "$REPO" --commit "$COMMIT" "${armed[@]}" > "$OUT/tripwires.txt"
+  if [ -s "$OUT/tripwires.txt" ]; then
+    say "tests pinning an armed gate to u64::MAX (expected to fail, accepted): $(tr '\n' ' ' < "$OUT/tripwires.txt")"
+    while read -r t; do ALLOW_TEST+=("$t"); done < "$OUT/tripwires.txt"
+  fi
+fi
+
 # ── 2. workspace tests (in the background) ────────────────────────────────
 run_tests() {
   local ctx="$OUT/test-ctx" tag="bloch-hf-qualify:$C12" trc passed failed blocking allowed
@@ -232,74 +256,86 @@ replay() {
 head_of() { awk '$1=="candidate" && NF==4 {print $2, $3, $4}' "$OUT/replay/$1.out" 2>/dev/null | tail -1; }
 rc_of() { cat "$OUT/replay/$1.rc" 2>/dev/null || echo none; }
 
-# ── gates and forced epochs (from the index, before any replay) ───────────
-IDX_LAST_SLOT="$(python3 -I -c '
-import struct, sys
-b = open(sys.argv[1], "rb").read()
-assert b[:8] == b"BPOSIDX1" and len(b) >= 28, "bad blocks.idx"
-n = (len(b) - 8) // 20
-print(struct.unpack_from("<Q", b, 8 + (n - 1) * 20)[0])' "$SOURCE/blocks.idx")"
-IDX_HEAD_EPOCH=$((IDX_LAST_SLOT / SLOTS_PER_EPOCH))
-gate_names=(); for g in ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}; do gate_names+=(--gate "${g%%=*}"); done
-python3 -I "$GATES_PY" discover --repo "$REPO" --base "$BASE_COMMIT" --candidate "$COMMIT" \
-  ${gate_names[@]+"${gate_names[@]}"} > "$OUT/gates.tsv"
-say "gates (name, fleet value, candidate value, status); source head e$IDX_HEAD_EPOCH (index):"
-sed 's/^/    /' "$OUT/gates.tsv"
-
-forced=()   # "name epoch"
+# ── forced sets (from the index, before any replay) ───────────────────────
+# A forced set is "label spec" with spec "NAME=E[,NAME=E...]", built as ONE
+# qualification binary. Default: one set "armed" holding every gate this build
+# arms, all shifted by the same delta so the latest lands at head - window - 8
+# (keeps every ordering/spacing rule the release itself satisfies, e.g. CF <=
+# frozen set, KES enforcement >= registration + 14 days). Each --gate NAME[=E]
+# adds its own single-gate set; --gates-only keeps only those.
+forced=()
 if [ "$SKIP_FORCED" = 0 ]; then
-  default_e="${FORCE_EPOCH:-$((IDX_HEAD_EPOCH - WINDOW - 8))}"
-  while IFS=$'\t' read -r name _ _ _; do
-    if [ "$GATES_ONLY" = 1 ]; then
-      listed=0; for g in "${GATE_ARGS[@]}"; do [ "${g%%=*}" = "$name" ] && listed=1; done
-      [ "$listed" = 1 ] || continue
+  target_e="${FORCE_EPOCH:-$((IDX_HEAD_EPOCH - WINDOW - 8))}"
+  if [ "$GATES_ONLY" = 0 ]; then
+    spec="" max_armed=0
+    while IFS=$'\t' read -r name _ _ st; do
+      case "$st" in scheduled:*) v="${st#scheduled:}"; [ "$v" -gt "$max_armed" ] && max_armed="$v"
+        spec="$spec,$name=$v" ;; esac
+    done < "$OUT/gates.tsv"
+    if [ -n "$spec" ]; then
+      shifted=""
+      for kv in ${spec//,/ }; do
+        v="${kv#*=}"; nv=$((v - max_armed + target_e))
+        [ "$nv" -ge 1 ] || die "cannot shift ${kv%%=*} (e$v) into the copied history; give a longer --source or --force-epoch"
+        shifted="$shifted,${kv%%=*}=$nv"
+      done
+      forced+=("armed ${shifted#,}")
     fi
-    e="$default_e"
-    for g in ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}; do case "$g" in "$name="*) e="${g#*=}" ;; esac; done
-    case "$e" in ''|*[!0-9]*) die "bad forced epoch for $name: $e" ;; esac
-    [ $(( (e + WINDOW) * SLOTS_PER_EPOCH )) -le "$IDX_LAST_SLOT" ] || die "$name: forced epoch $e + window $WINDOW is beyond the source head e$IDX_HEAD_EPOCH"
-    forced+=("$name $e")
-  done < "$OUT/gates.tsv"
+  fi
+  for g in ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}; do
+    case "$g" in *=*) e="${g#*=}" ;; *) e="$target_e" ;; esac
+    case "$e" in ''|*[!0-9]*) die "bad forced epoch in --gate $g" ;; esac
+    forced+=("${g%%=*} ${g%%=*}=$e")
+  done
 fi
-epochs=""
-[ ${#forced[@]} -eq 0 ] || epochs=$(printf '%s\n' "${forced[@]}" | awk '{print $2}' | sort -un)
-for e in $epochs; do
-  python3 -I "$PREFIX_PY" --source "$SOURCE" --dest "$OUT/data/pre-e$e" --before-slot $((e * SLOTS_PER_EPOCH)) | sed 's/^/  pre-e'"$e"': /'
-  python3 -I "$PREFIX_PY" --source "$SOURCE" --dest "$OUT/data/post-e$e" --before-slot $(((e + WINDOW) * SLOTS_PER_EPOCH)) | sed 's/^/  post-e'"$e"': /'
+cuts=""
+for item in ${forced[@]+"${forced[@]}"}; do
+  read -r label spec <<<"$item"
+  lo=$(echo "$spec" | tr ',' '\n' | cut -d= -f2 | sort -n | head -1)
+  hi=$(echo "$spec" | tr ',' '\n' | cut -d= -f2 | sort -n | tail -1)
+  [ $(( (hi + WINDOW) * SLOTS_PER_EPOCH )) -le "$IDX_LAST_SLOT" ] || die "$label: forced e$hi + window $WINDOW is beyond the source head e$IDX_HEAD_EPOCH"
+  say "forced set $label: $spec (pre: slots < e$lo, post: slots < e$((hi + WINDOW)))"
+  cuts="$cuts $lo $((hi + WINDOW))"
+done
+cuts=$(printf '%s\n' $cuts | sort -un)
+for c in $cuts; do
+  python3 -I "$PREFIX_PY" --source "$SOURCE" --dest "$OUT/data/cut-e$c" --before-slot $((c * SLOTS_PER_EPOCH)) | sed 's/^/  cut-e'"$c"': /'
 done
 
 # ── 3. configured replays + candidate references on each prefix ───────────
 expect=(); [ -z "$EXPECT_ROOT" ] || expect=(--expect-root "$EXPECT_ROOT" --expect-slot "$EXPECT_SLOT")
 replay full-candidate "$BIN" "$SOURCE" ${expect[@]+"${expect[@]}"}
 replay full-baseline "$BASELINE_BIN" "$SOURCE" ${expect[@]+"${expect[@]}"}
-for e in $epochs; do
-  replay "ref-pre-e$e" "$BIN" "$OUT/data/pre-e$e"
-  replay "ref-post-e$e" "$BIN" "$OUT/data/post-e$e"
-done
+for c in $cuts; do replay "ref-cut-e$c" "$BIN" "$OUT/data/cut-e$c"; done
 
 # ── 4. forced builds (serially, in the container) and their replays ───────
 for item in ${forced[@]+"${forced[@]}"}; do
-  read -r g e <<<"$item"
-  d="$OUT/forced/$g-e$e"; mkdir -p "$d/tree"
+  read -r label spec <<<"$item"
+  lo=$(echo "$spec" | tr ',' '\n' | cut -d= -f2 | sort -n | head -1)
+  hi=$(echo "$spec" | tr ',' '\n' | cut -d= -f2 | sort -n | tail -1)
+  d="$OUT/forced/$label"; mkdir -p "$d/tree"
+  echo "$lo $((hi + WINDOW)) $spec" > "$d/set"
   git -C "$REPO" archive --format=tar "$COMMIT" | tar -xf - -C "$d/tree"
-  if ! python3 -I "$GATES_PY" force --tree "$d/tree" --gate "$g" --epoch "$e" > "$d/patch.txt"; then
-    echo "FAIL	could not patch $g" > "$d/verdict"; continue
-  fi
+  ok=1
+  for kv in ${spec//,/ }; do
+    python3 -I "$GATES_PY" force --tree "$d/tree" --gate "${kv%%=*}" --epoch "${kv#*=}" >> "$d/patch.txt" || ok=0
+  done
+  if [ "$ok" = 0 ]; then echo "FAIL	could not patch $spec" > "$d/verdict"; continue; fi
   (cd "$d/tree" && git init -q && git add -A \
     && GIT_AUTHOR_DATE="@$SDE" GIT_COMMITTER_DATE="@$SDE" git -c user.name=hf-qualify -c user.email=hf-qualify@invalid \
-       commit -q -m "QUALIFICATION ONLY - NEVER RELEASE: $g forced to epoch $e on top of $COMMIT")
-  say "forced build $g=e$e ($(tr '\n' ' ' < "$d/patch.txt"))"
+       commit -q -m "QUALIFICATION ONLY - NEVER RELEASE: $spec on top of $COMMIT")
+  say "forced build $label ($(tr '\n' ' ' < "$d/patch.txt"))"
   if (cd "$d/tree" && CONTAINER_ENGINE="$ENGINE" scripts/build-pos-release-container.sh "$d/build") > "$d/build.log" 2>&1; then
-    fb="$d/bloch-pos-FORCED-$g-e$e"
+    fb="$d/bloch-pos-FORCED-$label"
     mv "$d/build/bloch-pos" "$fb"
     rm -f "$d/build/SHA256SUMS"
-    echo "QUALIFICATION ONLY: $g forced to epoch $e. Never sign, stage or run on a network." > "$d/build/NEVER-RELEASE"
+    echo "QUALIFICATION ONLY: $spec. Never sign, stage or run on a network." > "$d/build/NEVER-RELEASE"
     rm -rf "$d/tree"
-    replay "forced-$g-pre" "$fb" "$OUT/data/pre-e$e"
-    replay "forced-$g-post" "$fb" "$OUT/data/post-e$e"
+    replay "forced-$label-pre" "$fb" "$OUT/data/cut-e$lo"
+    replay "forced-$label-post" "$fb" "$OUT/data/cut-e$((hi + WINDOW))"
   else
-    tail -20 "$d/build.log"
-    echo "FAIL	forced build failed (forced/$g-e$e/build.log)" > "$d/verdict"
+    grep -E '^#[0-9]+ .*error' "$d/build.log" | head -5 || true
+    echo "FAIL	forced build failed (forced/$label/build.log)" > "$d/verdict"
   fi
 done
 
@@ -333,6 +369,18 @@ while IFS=$'\t' read -r name _ _ st; do
     *) say "  NOTE $name: $st (check by hand)" ;;
   esac
 done < "$OUT/gates.tsv"
+# KES: enforcement needs a registration window of at least 14 days (1,260
+# epochs) after registration opens, so every validator can register its root.
+kes_reg="$(awk -F'\t' '$1=="HF3_KES_EPOCH"{print $4}' "$OUT/gates.tsv")"
+kes_enf="$(awk -F'\t' '$1=="HF3_KES_ENFORCE_EPOCH"{print $4}' "$OUT/gates.tsv")"
+case "$kes_enf" in scheduled:*)
+  case "$kes_reg" in
+    scheduled:*) w=$(( ${kes_enf#scheduled:} - ${kes_reg#scheduled:} ))
+      if [ "$w" -lt 1260 ]; then sched_bad="$sched_bad KES-window($w<1260 epochs)"
+      else say "  KES registration window: $w epochs (~$((w / 90)) days)"; fi ;;
+    *) sched_bad="$sched_bad HF3_KES_ENFORCE_EPOCH-armed-without-HF3_KES_EPOCH" ;;
+  esac ;;
+esac
 if [ -n "$sched_bad" ]; then
   record gate-schedule FAIL "changed gate at or before the replayed head:$sched_bad"
 else
@@ -345,30 +393,32 @@ elif [ ${#forced[@]} -eq 0 ]; then
   record forced SKIPPED "no gate to force"
 else
   for item in "${forced[@]}"; do
-    read -r g e <<<"$item"
-    d="$OUT/forced/$g-e$e"
+    read -r label spec <<<"$item"
+    d="$OUT/forced/$label"
     if [ ! -f "$d/verdict" ]; then
-      ref_pre="$(head_of "ref-pre-e$e")"; ref_post="$(head_of "ref-post-e$e")"
-      pre_head="$(head_of "forced-$g-pre")"; post_head="$(head_of "forced-$g-post")"
-      if [ "$(rc_of "ref-pre-e$e")" != 0 ] || [ "$(rc_of "ref-post-e$e")" != 0 ]; then
-        echo "FAIL	the configured candidate itself failed on the e$e prefixes (replay/ref-*-e$e.out)" > "$d/verdict"
-      elif [ "$(rc_of "forced-$g-pre")" != 0 ] || [ "$pre_head" != "$ref_pre" ]; then
-        echo "FAIL	before activation the forced build differs: [$pre_head] vs configured [$ref_pre] (replay/forced-$g-pre.out)" > "$d/verdict"
-      elif [ "$(rc_of "forced-$g-post")" = 0 ]; then
+      read -r lo post_cut _ < "$d/set"
+      ref_pre="$(head_of "ref-cut-e$lo")"; ref_post="$(head_of "ref-cut-e$post_cut")"
+      pre_head="$(head_of "forced-$label-pre")"; post_head="$(head_of "forced-$label-post")"
+      if [ "$(rc_of "ref-cut-e$lo")" != 0 ] || [ "$(rc_of "ref-cut-e$post_cut")" != 0 ]; then
+        echo "FAIL	the configured candidate itself failed on a prefix (replay/ref-cut-*.out)" > "$d/verdict"
+      elif [ "$(rc_of "forced-$label-pre")" != 0 ] || [ "$pre_head" != "$ref_pre" ]; then
+        echo "FAIL	before e$lo the forced build differs: [$pre_head] vs configured [$ref_pre] (replay/forced-$label-pre.out)" > "$d/verdict"
+      elif [ "$(rc_of "forced-$label-post")" = 0 ]; then
         if [ "$post_head" = "$ref_post" ]; then
-          echo "PASS	identical before e$e; crossed it and replayed to e$((e + WINDOW)) with history still valid (inert-on-history)" > "$d/verdict"
+          echo "PASS	identical before e$lo; crossed $spec and replayed to e$post_cut with history still valid (inert-on-history)" > "$d/verdict"
         else
           echo "FAIL	replayed but head [$post_head] != configured [$ref_post]" > "$d/verdict"
         fi
-      elif grep -q 'did not re-apply to its header state root' "$OUT/replay/forced-$g-post.out"; then
-        h="$(grep -h 'apply refused' "$OUT/replay/forced-$g-post/candidate.log" 2>/dev/null | head -1 | cut -c1-160)"
-        echo "PASS	identical before e$e; after it a clean consensus rejection (diverged-after-activation): ${h:-no reason logged}" > "$d/verdict"
+      elif grep -q 'did not re-apply to its header state root' "$OUT/replay/forced-$label-post.out"; then
+        h="$(grep -h 'apply refused' "$OUT/replay/forced-$label-post/candidate.log" 2>/dev/null | head -1 | cut -c1-160)"
+        last="$(grep -h '^replay ' "$OUT/replay/forced-$label-post/candidate.log" 2>/dev/null | tail -1 | grep -oE 'head slot [0-9]+' || true)"
+        echo "PASS	identical before e$lo; after activation a clean consensus rejection (diverged-after-activation; last progress ${last:-n/a}): ${h:-no reason logged}" > "$d/verdict"
       else
-        echo "FAIL	post-activation replay crashed or stopped without a consensus verdict (replay/forced-$g-post.out)" > "$d/verdict"
+        echo "FAIL	post-activation replay crashed or stopped without a consensus verdict (replay/forced-$label-post.out)" > "$d/verdict"
       fi
     fi
     IFS=$'\t' read -r st detail < "$d/verdict"
-    record "forced:$g@e$e" "$st" "$detail"
+    record "forced:$label" "$st" "$spec: $detail"
   done
 fi
 
