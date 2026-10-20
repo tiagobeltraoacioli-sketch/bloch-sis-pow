@@ -581,7 +581,7 @@ class Rehearsal:
             return
         self.checks.ok("HF1 claim finality: no checkpoint root recorded before HF1",
                        all(pre[i] and pre[i]["roots"] == {} for i in up), {i: pre[i] for i in up})
-        roots = {i: dict(post[i]["roots"], **late[i]["roots"]) for i in up if late.get(i) and late[i].get("roots") is not None}
+        roots = {i: {**post[i]["roots"], **late[i]["roots"]} for i in up if late.get(i) and late[i].get("roots") is not None}
         self.checks.ok("HF1 claim finality: roots recorded from HF1 on, at most four kept",
                        all(post[i]["roots"] and min(post[i]["roots"]) >= a.hf1 for i in up)
                        and all(len(late[i]["roots"]) <= 4 for i in up if late.get(i) and late[i].get("roots") is not None),
