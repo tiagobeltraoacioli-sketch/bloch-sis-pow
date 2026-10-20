@@ -596,7 +596,13 @@ pub fn check_signed_by(env: &BlockEnvelope, keys: &Keystore) -> Result<(), Strin
 pub fn forge_conflicting(env: &BlockEnvelope, keys: &Keystore) -> BlockEnvelope {
     let mut conflicting = env.clone();
     conflicting.header.state_root[0] ^= 1;
-    conflicting.proposer_sig = keys.sign(&conflicting.header.proposal_signing_root());
+    // The proposer signature is a CONSENSUS message: sign under the rule of
+    // the block's own epoch (v1 before SIG_CANONICAL_ACTIVATION_EPOCH, v2
+    // from it) so the forged block stays a valid equivocation after the gate.
+    conflicting.proposer_sig = keys.sign_for_epoch(
+        bloch_pos_committee::epoch_of(conflicting.header.slot),
+        &conflicting.header.proposal_signing_root(),
+    );
     conflicting
 }
 

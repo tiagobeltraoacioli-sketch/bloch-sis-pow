@@ -9338,6 +9338,32 @@ mod admission_authorisation {
         );
     }
 
+    /// OWNER SCOPE (HF2): every offline CLI that signs a TRANSACTION
+    /// (transfer-v2, validator-deposit, funded-delegation, validator-payout,
+    /// and any future tx CLI) emits a v1 signature via `keys.sign` /
+    /// `crypto::sign`. Consensus judges transactions under
+    /// `SignaturePolicy::transaction`, which is never a canonical policy — so
+    /// that v1 signature verifies at EVERY epoch, whatever the ML-DSA-pin and
+    /// canonical gates say (this exercises all four gate states).
+    #[test]
+    fn offline_cli_v1_signatures_verify_under_the_transaction_policy_at_every_epoch() {
+        use bloch_pos_committee::SignaturePolicy::{self, Compatible, CompatiblePinned};
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[0x3Cu8; 32]).unwrap();
+        let v = HybridVerifier::new();
+        for root in [[0u8; 32], [0x5A; 32], [0xFF; 32]] {
+            // Exactly what the offline CLIs produce for a transaction root.
+            let sig = bloch_crypto::crypto::sign(&sk, &root).unwrap();
+            for (pin, canon) in [(false, false), (true, false), (true, true), (false, true)] {
+                let policy = SignaturePolicy::transaction_for(pin, canon);
+                assert!(matches!(policy, Compatible | CompatiblePinned), "{policy:?}");
+                assert!(
+                    v.verify_with_key_under(policy, &pk, &root, &sig),
+                    "v1 transaction signature rejected under {policy:?} (pin={pin}, canon={canon})"
+                );
+            }
+        }
+    }
+
     /// **H1, at the mempool door.** A transfer whose tip or declared gas is
     /// outside the fee market's consensus bounds must not be admitted, must
     /// not be gossiped, and must never reach a proposer that would price it.
