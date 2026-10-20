@@ -6,13 +6,11 @@
 > test in a release commit, replay the full L1 history with that build, run
 > the mixed-fleet qualification, sign the release, then fill every `{{…}}`.
 >
-> **HF1 bundle.** This rule ships as the first half of hard fork HF1
-> (branch `codex/hf1-core-20261020`), together with the frozen finality set
-> (`params::HF1_FROZEN_FINALITY_SET_EPOCH`). The two constants must be armed
-> in the same release, claim finality first and the frozen set at most
-> `params::HF1_MAX_GATE_SPACING_EPOCHS` epochs later; a build that arms only
-> one of them does not compile. The combined operator notice is the FD-1
-> notice of the security flag-day plan.
+> **HF1.** This rule is the claim-finality half of HF1 (branch
+> `codex/hf1-core-20261020`). It may be armed on its own. The other half,
+> the frozen finality set (`params::HF1_FROZEN_FINALITY_SET_EPOCH`), may
+> only be armed at the same epoch as this rule or later; a build that arms
+> the frozen set without this rule does not compile.
 
 | | |
 | --- | --- |

@@ -2391,63 +2391,51 @@ pub(crate) mod l2_settlement_rehearsal {
     }
 }
 
-// ── HF1: claim finality + frozen finality set (one hard fork) ─────────────
+// ── HF1: claim finality + frozen finality set ─────────────────────────────
 //
-// HF1 is ONE hard fork made of two consensus rules, each behind its own
-// activation constant:
+// HF1 is made of two consensus rules, each behind its own activation constant:
 //
 // - [`HF1_CLAIM_FINALITY_EPOCH`] (claim finality, "CF"): an L2 withdrawal
 //   claim is final only under a finalized checkpoint that is this chain's own.
 //   It stops the payout consequence of a branch finalizing another branch's
-//   checkpoint.
+//   checkpoint. It changes no vote weight and does not affect finality
+//   liveness.
 // - [`HF1_FROZEN_FINALITY_SET_EPOCH`] (frozen finality set, "p1a"): the FFG
 //   quorum is measured against a frozen, unleaked set, so the inactivity leak
 //   can no longer let a minority side of a split finalize on its own.
 //
-// Neither rule is sufficient alone. CF alone still lets both sides of a long
-// split finalize (and pay the claims each side's own history admits); the
-// frozen set alone still lets a branch carrying foreign votes release a claim
-// against a checkpoint that is not on it. Only the two together keep
-// conflicting finalizations and double payouts at zero across the modelled
-// split shapes. They therefore MUST BE ARMED TOGETHER, in one release:
+// The modelled split shapes reach zero conflicting finalizations and zero
+// double payouts only with both rules active. The dependency is one-way:
 //
-// - both `u64::MAX` (inert), or both finite;
-// - CF first: `HF1_CLAIM_FINALITY_EPOCH <= HF1_FROZEN_FINALITY_SET_EPOCH`
-//   (CF only adds state and changes no vote weight, so a divergence at the
-//   first gate is attributable to CF before the quorum rule changes);
-// - at most [`HF1_MAX_GATE_SPACING_EPOCHS`] apart, so the window in which only
-//   one half is active stays short.
+// - The frozen set alone still lets a branch that carries foreign votes
+//   release a claim against a checkpoint that is not on it, so it MUST NOT be
+//   armed without CF: if `HF1_FROZEN_FINALITY_SET_EPOCH` is finite, then
+//   `HF1_CLAIM_FINALITY_EPOCH` is finite and no later
+//   (`HF1_CLAIM_FINALITY_EPOCH <= HF1_FROZEN_FINALITY_SET_EPOCH`; equal is
+//   allowed).
+// - CF alone only removes payouts and is safe to arm on its own (the
+//   leak-driven double finality of long splits remains until the frozen set
+//   is armed, as it does today).
 //
-// `hf1_gates_coherent` encodes these rules; a `const` assertion below makes a
-// partially or incoherently armed build fail to compile, and
+// `hf1_gates_coherent` encodes this rule; a `const` assertion below makes a
+// build that arms the frozen set without (or before) CF fail to compile, and
 // `hf1_tests` pins the rule itself.
 
-/// Largest allowed distance between the two HF1 activation epochs (16 epochs,
-/// about 4 h 16 min at 30 s slots). The intended schedule is CF, then the
-/// frozen finality set six epochs later.
-pub const HF1_MAX_GATE_SPACING_EPOCHS: u64 = 16;
-
-/// Whether a pair of HF1 activation epochs is a valid arming: both inert, or
-/// both armed with claim finality first and the frozen set at most
-/// [`HF1_MAX_GATE_SPACING_EPOCHS`] later.
+/// Whether a pair of HF1 activation epochs is a valid arming: the frozen set
+/// may be armed only if claim finality is armed at the same epoch or earlier.
+/// Claim finality alone, and both inert, are valid.
 pub const fn hf1_gates_coherent(claim_finality: u64, frozen_set: u64) -> bool {
-    match (claim_finality == u64::MAX, frozen_set == u64::MAX) {
-        (true, true) => true,
-        (false, false) => {
-            claim_finality <= frozen_set && frozen_set - claim_finality <= HF1_MAX_GATE_SPACING_EPOCHS
-        }
-        _ => false,
-    }
+    frozen_set == u64::MAX || (claim_finality != u64::MAX && claim_finality <= frozen_set)
 }
 
-// HF1 must be armed as a whole: a build with only one half armed, the halves
-// in the wrong order, or too far apart does not compile.
+// The frozen finality set must never run without claim finality: a build that
+// arms it alone, or before claim finality, does not compile.
 const _: () = assert!(hf1_gates_coherent(HF1_CLAIM_FINALITY_EPOCH, HF1_FROZEN_FINALITY_SET_EPOCH));
 
 /// L2 withdrawal claims (0x16) release only against a finalized checkpoint
-/// that lies on the claim's OWN chain. `u64::MAX` means INERT. First half of
-/// HF1: arm together with [`HF1_FROZEN_FINALITY_SET_EPOCH`] (see the HF1
-/// section above).
+/// that lies on the claim's OWN chain. `u64::MAX` means INERT. HF1: may be
+/// armed alone; must be armed no later than [`HF1_FROZEN_FINALITY_SET_EPOCH`]
+/// (see the HF1 section above).
 ///
 /// The rule as it stands (`withdrawal::record_finalized`) compares epochs
 /// only, and the FFG tally (`finality::FinalityState::process_epoch`) counts
@@ -2502,7 +2490,7 @@ pub(crate) mod native_claim_finality_test {
 
 /// Frozen finality set (PoCI port): the FFG quorum is measured against a
 /// validator-set snapshot that the inactivity leak cannot shrink. `u64::MAX`
-/// means INERT. Second half of HF1: arm together with, and no earlier than,
+/// means INERT. HF1: may be armed only together with, or after,
 /// [`HF1_CLAIM_FINALITY_EPOCH`] (see the HF1 section above).
 ///
 /// # The defect
@@ -2620,33 +2608,32 @@ mod hf1_tests {
     }
 
     #[test]
-    fn hf1_gates_must_be_armed_together_in_order_and_close() {
+    fn hf1_frozen_set_requires_claim_finality_no_later() {
         let m = u64::MAX;
-        // Both inert, or both armed with claim finality first.
+        // Both inert; claim finality alone; both armed, claim finality first
+        // or at the same epoch.
         assert!(hf1_gates_coherent(m, m));
-        assert!(hf1_gates_coherent(8_610, 8_616));
+        assert!(hf1_gates_coherent(8_610, m));
+        assert!(hf1_gates_coherent(0, m));
         assert!(hf1_gates_coherent(8_610, 8_610));
-        assert!(hf1_gates_coherent(8_610, 8_610 + HF1_MAX_GATE_SPACING_EPOCHS));
-        assert!(hf1_gates_coherent(0, 0));
-        // Only one half armed.
-        assert!(!hf1_gates_coherent(8_610, m));
+        assert!(hf1_gates_coherent(8_610, 8_616));
+        assert!(hf1_gates_coherent(0, m - 1));
+        // Frozen set alone.
         assert!(!hf1_gates_coherent(m, 8_616));
-        assert!(!hf1_gates_coherent(m - 1, m));
+        assert!(!hf1_gates_coherent(m, 0));
+        assert!(!hf1_gates_coherent(m, m - 1));
         // Frozen set before claim finality.
         assert!(!hf1_gates_coherent(8_616, 8_610));
         assert!(!hf1_gates_coherent(1, 0));
-        // Too far apart.
-        assert!(!hf1_gates_coherent(8_610, 8_610 + HF1_MAX_GATE_SPACING_EPOCHS + 1));
-        assert!(!hf1_gates_coherent(0, m - 1));
     }
 
     /// Once both are armed at a coherent pair, no epoch has the frozen set
     /// active without claim finality.
     #[test]
     fn hf1_frozen_set_never_runs_without_claim_finality() {
-        for (cf, fs) in [(8_610u64, 8_616u64), (8_610, 8_610), (8_610, 8_610 + HF1_MAX_GATE_SPACING_EPOCHS)] {
+        for (cf, fs) in [(8_610u64, 8_616u64), (8_610, 8_610), (8_610, u64::MAX), (8_610, 20_000)] {
             assert!(hf1_gates_coherent(cf, fs));
-            for epoch in cf.saturating_sub(4)..fs + 4 {
+            for epoch in cf.saturating_sub(4)..cf + 64 {
                 assert!(!epoch_gate_active(epoch, fs) || epoch_gate_active(epoch, cf), "epoch {epoch}");
             }
         }
