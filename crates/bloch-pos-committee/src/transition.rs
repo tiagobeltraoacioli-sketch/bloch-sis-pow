@@ -6845,6 +6845,15 @@ impl<V: SignatureVerifier> Transition<V> {
         {
             return Err(TransitionError::BlockGasLimitExceeded);
         }
+        // F-9: free rescue commitments may take at most a quarter of the
+        // block (params::RESCUE_COMMITS_MAX_PER_BLOCK). Only once the
+        // emergency gate binds: below it each one is refused on its own.
+        if crate::params::lattice_emergency_active(block_epoch)
+            && transactions.iter().filter(|tx| matches!(tx, PosTransaction::RescueCommit(_))).count() as u64
+                > crate::params::RESCUE_COMMITS_MAX_PER_BLOCK
+        {
+            return Err(TransitionError::BlockGasLimitExceeded);
+        }
         let mut unfunded_bonded: u128 = 0;
         // Preflight the transfer budgets before executing any spend or
         // rebuilding any output paths (TX-02). These are the same declared
@@ -12961,6 +12970,88 @@ mod tests {
             new_era_price,
             "the boundary block must be priced against the epoch it lives in"
         );
+    }
+
+    /// F-9 fixture: a funded state with a pinned network domain and `n`
+    /// distinct, free rescue commitments for it.
+    fn rescue_flood_fixture(
+        n: u8,
+    ) -> (Transition<ToyVerifier>, CommittedState, Vec<RandaoChain>, Vec<PosTransaction>, crate::state_root::EutxoEntry, Vec<u8>) {
+        // A hash-based (suite 0x0003-shaped) owner: once the emergency binds,
+        // lattice keys may not spend directly, and the paying user in these
+        // tests must be one who still can.
+        let mut owner = vec![0x37u8; crate::transition::pq_migration::SLH_SUITE_PUBKEY_BYTES];
+        owner[..4].copy_from_slice(&[0xb1, 0x0c, 0x03, 0x00]);
+        let coin = opening(0x91, 0, 21_000_000_000_000_000, &owner);
+        let (t, mut g, chains) = setup_funded(4, std::slice::from_ref(&coin));
+        let net = [0x5Du8; 32];
+        g.admission_network_domain = Some(net);
+        let commits = (0..n)
+            .map(|k| {
+                PosTransaction::RescueCommit(RescueCommit { network_domain: net, commitment: [k.wrapping_add(1); 32] })
+            })
+            .collect();
+        (t, g, chains, commits, coin, owner)
+    }
+
+    /// F-9: with the emergency armed, a block may carry at most
+    /// `RESCUE_COMMITS_MAX_PER_BLOCK` free commitments; one more makes the
+    /// whole block invalid, so a proposer cannot be paid (or fooled) into
+    /// filling a block with them.
+    #[test]
+    fn rescue_commitments_are_capped_per_block_once_armed() {
+        let _gate = crate::params::pq_migration_rehearsal::open_emergency();
+        let max = crate::params::RESCUE_COMMITS_MAX_PER_BLOCK as u8;
+        let (t, g, mut chains, commits, _, _) = rescue_flood_fixture(max + 1);
+        let env = probe_env(&g, 1, &commits, &mut chains);
+        assert_eq!(
+            t.compute_post_state(&g, &env, &[], &commits).unwrap_err(),
+            TransitionError::BlockGasLimitExceeded,
+        );
+        let at_cap = &commits[..max as usize];
+        let (t, g, mut chains, _, _, _) = rescue_flood_fixture(0);
+        let env = probe_env(&g, 1, at_cap, &mut chains);
+        let post = t.compute_post_state(&g, &env, &[], at_cap).unwrap();
+        let per_commit = fee_market::BLOCK_GAS_LIMIT / crate::params::RESCUE_COMMITS_PER_BLOCK;
+        assert_eq!(post.block_gas_used, per_commit * max as u64);
+        assert!(post.block_gas_used <= fee_market::BLOCK_GAS_LIMIT / 4, "the flood holds at most a quarter of the gas");
+    }
+
+    /// F-9: a maximal flood of commitments cannot exclude a paying
+    /// transaction. The same block carries every commitment consensus allows
+    /// AND a transfer charged more than half the block's gas.
+    #[test]
+    fn a_rescue_flood_cannot_exclude_a_paying_transfer() {
+        let _gate = crate::params::pq_migration_rehearsal::open_emergency();
+        let max = crate::params::RESCUE_COMMITS_MAX_PER_BLOCK as u8;
+        let (t, g, mut chains, commits, coin, owner) = rescue_flood_fixture(max);
+        let to = script_of(&owner_key(0x38));
+        // A transfer declaring every byte the commitments leave in the block:
+        // the largest block a paying user could have built alone. An uncapped
+        // flood (16 commitments = the whole gas) left room for nothing.
+        let commit_bytes: u64 = commits.iter().map(|c| c.canonical_bytes().len() as u64).sum();
+        let room = fee_market::max_block_tx_bytes(1) - commit_bytes;
+        let heavy = transfer_spending(std::slice::from_ref(&coin), &owner, to, room, 0, g.next_base_fee());
+        let heavy_gas = fee_market::intrinsic_gas(fee_market::TxClass::Eutxo { inputs: 1 }, room);
+        let mut body = commits.clone();
+        body.push(heavy);
+        let env = probe_env(&g, 1, &body, &mut chains);
+        let post = t.compute_post_state(&g, &env, &[], &body).unwrap();
+        let flood_gas = fee_market::BLOCK_GAS_LIMIT / crate::params::RESCUE_COMMITS_PER_BLOCK * max as u64;
+        assert_eq!(post.block_gas_used, flood_gas + heavy_gas);
+        assert!(fee_market::BLOCK_GAS_LIMIT - flood_gas >= 3 * (fee_market::BLOCK_GAS_LIMIT / 4));
+        assert_eq!(post.pq_rescue_commits.len(), max as usize);
+    }
+
+    /// Below the emergency gate the cap is not consulted: an over-cap block
+    /// of commitments keeps its pre-F-9 verdict (the first commitment is
+    /// refused as a transaction), byte-identical to the inert release.
+    #[test]
+    fn rescue_commit_cap_is_inert_below_the_gate() {
+        let max = crate::params::RESCUE_COMMITS_MAX_PER_BLOCK as u8;
+        let (t, g, mut chains, commits, _, _) = rescue_flood_fixture(max + 1);
+        let env = probe_env(&g, 1, &commits, &mut chains);
+        assert_eq!(t.compute_post_state(&g, &env, &[], &commits).unwrap_err(), TransitionError::Transaction(0));
     }
 
     #[test]
