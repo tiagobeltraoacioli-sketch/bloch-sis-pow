@@ -3290,7 +3290,13 @@ pub(crate) mod audit_recovery_test {
 // ── Forward-secure validator keys (KES, `crate::kes`) ───────────────────────
 //
 // Hard fork 3 (HF3). Two mainnet flag days, both unarmed (`u64::MAX`) until
-// chosen, no cargo feature anywhere (docs/KES-MAINNET-READINESS.md §7):
+// chosen, no cargo feature anywhere (docs/KES-MAINNET-READINESS.md §7).
+//
+// `HF3_KES_EPOCH` IS ITSELF A HARD FORK, not a soft opening: a binary without
+// this line refuses tags 0x17/0x1B as unknown, so the first block carrying a
+// `KesRegister` (or `KesRotate`) forks every non-upgraded node off the chain
+// (rehearsal kes-1). Every node must run this code before `HF3_KES_EPOCH`,
+// exactly as before enforcement.
 //
 // 1. `HF3_KES_EPOCH` (alias `KES_REGISTRATION_EPOCH`) opens wire 0x17
 //    (`PosTransaction::KesRegister`) and `kes::ROTATE_TAG`
@@ -3337,6 +3343,13 @@ pub const KES_ROTATION_STAGGER_PERIODS: u64 = 64;
 /// bind epoch is committed state (`CommittedState::kes_enforced_from`).
 /// Until then every validator signs with its static key.
 pub const KES_MIN_REGISTERED_STAKE_BPS: u64 = 9_000;
+/// Epochs between the boundary that decides the KES bind and the first epoch
+/// it governs (rehearsal kes-1: finality lagged 3-5 epochs right after a
+/// same-boundary bind, because nodes whose head had not crossed the boundary
+/// judged the first KES-signed votes and blocks under the static rule). With
+/// a delay, every head at most `KES_BIND_DELAY_EPOCHS - 1` epochs behind
+/// already knows the bind epoch.
+pub const KES_BIND_DELAY_EPOCHS: u64 = 2;
 /// Static-key fallback (review F-2): after enforcement binds, a validator
 /// with NO KES registration still signs with its static key, so validators
 /// that never registered (or join later) do not go silent and cannot halt

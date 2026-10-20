@@ -59,6 +59,10 @@ pub struct KesKey {
     /// for the process lifetime, so caching its derivative adds no exposure.
     /// Each save still uses a fresh random 24-byte XChaCha nonce.
     seal: std::cell::RefCell<Option<SealCache>>,
+    /// The current leaf's keypair, derived once per leaf rather than on every
+    /// signature (a Falcon-1024 keygen per duty was measurable on the duty
+    /// path; rehearsal kes-1). Dropped (zeroized) when the key evolves.
+    leaf: std::cell::RefCell<Option<(u64, Vec<u8>, Zeroizing<Vec<u8>>)>>,
 }
 
 struct SealCache {
@@ -103,7 +107,7 @@ impl KesKey {
             progress(i + 1);
         }
         let public = KesPublic::new(depth, kes::merkle_root(&leaves), 0);
-        Ok(KesKey { index, public, leaves, period: 0, seed: seed0, seal: Default::default() })
+        Ok(KesKey { index, public, leaves, period: 0, seed: seed0, seal: Default::default(), leaf: Default::default() })
     }
 
     pub fn index(&self) -> u32 {
@@ -156,6 +160,7 @@ impl KesKey {
             period,
             seed,
             seal: std::cell::RefCell::new(self.seal.borrow().clone()),
+            leaf: Default::default(),
         };
         next.save_named(dir, unlock, FILE_NAME)?;
         *self = next;
@@ -166,7 +171,15 @@ impl KesKey {
     /// root — with the current period's leaf (encoded `kes::KesSignature`).
     /// The caller evolves first.
     pub fn sign(&self, message: &[u8; 32]) -> io::Result<Vec<u8>> {
-        let (leaf_pk, sk) = leaf_keypair(&self.seed)?;
+        let cached = self.leaf.borrow().as_ref().filter(|(leaf, _, _)| *leaf == self.period).map(|(_, pk, sk)| (pk.clone(), Zeroizing::new(sk.to_vec())));
+        let (leaf_pk, sk) = match cached {
+            Some(pair) => pair,
+            None => {
+                let (pk, sk) = leaf_keypair(&self.seed)?;
+                *self.leaf.borrow_mut() = Some((self.period, pk.clone(), Zeroizing::new(sk.to_vec())));
+                (pk, sk)
+            }
+        };
         // Canonical, suite-bound v2 form (review F-1), matching
         // `HybridVerifier::verify_kes_leaf`.
         let sig = bloch_crypto::crypto::sign_bound(&sk, message)
@@ -367,7 +380,7 @@ impl KesKey {
         if period >= public.periods() {
             return Err(bad("KES period is beyond the tree"));
         }
-        Ok(KesKey { index, public, leaves, period, seed, seal: std::cell::RefCell::new(seal_cache) })
+        Ok(KesKey { index, public, leaves, period, seed, seal: std::cell::RefCell::new(seal_cache), leaf: Default::default() })
     }
 }
 

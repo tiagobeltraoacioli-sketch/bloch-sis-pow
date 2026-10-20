@@ -357,3 +357,45 @@ fn kes_evolution_refuses_multi_period_jumps_without_confirmation() {
     assert!(kes_evolution_allowed(10, Some(10), 40, Some(40)), "confirmed");
     assert!(!kes_evolution_allowed(10, Some(10), 40, Some(39)), "confirmation names the exact period");
 }
+
+/// Rehearsal kes-1 (2): the hybrid signature bound is the true maximum
+/// envelope (compact Falcon up to 1,462 bytes), so a long-Falcon static
+/// registration signature is not refused at the door; the decoder bound for
+/// KES leaves is the same number.
+#[test]
+fn the_kes_signature_bounds_are_the_true_hybrid_maximum() {
+    assert_eq!(kes::HYBRID_SIGNATURE_MAX, bloch_crypto::crypto::max_signature_len());
+    assert_eq!(kes::MAX_LEAF_SIG_LEN, bloch_crypto::crypto::max_signature_len());
+    assert!(bloch_pos_committee::transition::funded::ADMISSION_PQ_SIGNATURE_MAX < kes::HYBRID_SIGNATURE_MAX);
+    let with_sig = |len: usize| PosTransaction::KesRegister { validator: 0, depth: 12, root: [1; 32], signature: vec![7; len] };
+    // Structural door only (the flag-day gate is checked first, so call the
+    // bound through a window that is open: compare the two refusals).
+    let gate = admissible(&with_sig(16), 0).unwrap_err();
+    for len in [4_593, 4_596, kes::HYBRID_SIGNATURE_MAX] {
+        assert_eq!(admissible(&with_sig(len), 0).unwrap_err(), gate, "{len} bytes fail only on the gate");
+    }
+    assert!(admissible_kes_register_shape(12, &vec![7; kes::HYBRID_SIGNATURE_MAX]));
+    assert!(admissible_kes_register_shape(12, &vec![7; 4_596]));
+    assert!(!admissible_kes_register_shape(12, &vec![7; kes::HYBRID_SIGNATURE_MAX + 1]));
+    assert!(!admissible_kes_register_shape(12, &[]));
+}
+
+/// Rehearsal kes-1 (1): the mempool's registration dedupe reads the same
+/// rescue rule consensus applies (`CommittedState::kes_rescue_open`), so an
+/// expired key's static-key rescue is not refused at the door. Under the
+/// compiled schedule no rescue can be open; the armed cases are in the
+/// committee (`an_expired_key_can_be_rescued_by_the_static_key_and_a_live_one_cannot`).
+#[test]
+fn the_registration_dedupe_defers_to_the_consensus_rescue_rule() {
+    let (engine, _dir) = perf_support::proposing_engine();
+    for v in 0..4 {
+        assert!(!engine.state.kes_rescue_open(v));
+    }
+    let pending: BTreeMap<Vec<u8>, PosTransaction> = BTreeMap::new();
+    assert_eq!(validator_lifecycle::kes_register_conflict(&engine.state, &pending, &registration(&engine, 0, 0x11)), Ok(()));
+    let source = include_str!("validator_lifecycle.rs");
+    assert!(
+        source.contains("state.kes_public(*validator).is_some() && !state.kes_rescue_open(*validator)"),
+        "the already-registered refusal must exempt an open rescue"
+    );
+}

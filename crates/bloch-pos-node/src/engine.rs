@@ -7825,6 +7825,16 @@ impl KesSigner {
     }
 }
 
+/// Structural bounds of a `KesRegister` at the mempool door: depth in the
+/// codec range and a non-empty signature of at most the TRUE hybrid maximum
+/// (`kes::HYBRID_SIGNATURE_MAX`, compact Falcon up to 1,462 bytes), not the
+/// padded-Falcon admission bound (rehearsal kes-1: 4,596-byte signatures).
+pub(crate) fn admissible_kes_register_shape(depth: u8, signature: &[u8]) -> bool {
+    (bloch_pos_committee::kes::MIN_DEPTH..=bloch_pos_committee::kes::MAX_DEPTH).contains(&depth)
+        && !signature.is_empty()
+        && signature.len() <= bloch_pos_committee::kes::HYBRID_SIGNATURE_MAX
+}
+
 /// Review F-5: may the KES key erase its way from global period `key_period`
 /// to `target`? At most one period past the key's own period or the head's,
 /// or exactly the period an operator confirmed.
@@ -8645,10 +8655,7 @@ fn admissible_with_network_verifier(
                      flag day (KES_REGISTRATION_EPOCH) that this chain has not reached",
                 );
             }
-            if !(bloch_pos_committee::kes::MIN_DEPTH..=bloch_pos_committee::kes::MAX_DEPTH).contains(depth)
-                || signature.is_empty()
-                || signature.len() > bloch_pos_committee::transition::funded::ADMISSION_PQ_SIGNATURE_MAX
-            {
+            if !admissible_kes_register_shape(*depth, signature) {
                 return Err("KES registration has an out-of-range depth or signature length");
             }
             Ok(())

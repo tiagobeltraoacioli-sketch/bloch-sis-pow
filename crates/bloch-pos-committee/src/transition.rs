@@ -4307,13 +4307,10 @@ impl CommittedState {
             // sold later must not take over forward-secure signing
             // (long-range). Renewal of a live key is `KesRotate`; a lost but
             // unexpired `validator.kes` is recovered by exit and re-join.
-            let p = period.unwrap_or(0);
-            let in_force = entry.in_force(p);
-            let expired = bound && p >= in_force.end_period() && entry.pending_at(p).is_none();
-            if !expired {
+            if !self.kes_rescue_open(validator) {
                 return Err(TxReject::StakingRule);
             }
-            start_period = p.saturating_add(crate::params::KES_RESCUE_DELAY_PERIODS);
+            start_period = period.unwrap_or(0).saturating_add(crate::params::KES_RESCUE_DELAY_PERIODS);
             if entry.in_force(period.unwrap_or(0)).root == *root
                 || entry.next.is_some_and(|next| next.root == *root)
             {
@@ -4417,6 +4414,19 @@ impl CommittedState {
             .map(|v| u128::from(v.effective_stake))
             .sum();
         (covered * 10_000 / total) as u64
+    }
+
+    /// May `validator` re-register with its static key now (readiness B3
+    /// rescue)? Only once KES binds, its key in force has expired at this
+    /// state's period, and no rotation is pending. The one rule
+    /// `check_kes_register` and the node's mempool dedupe share.
+    pub fn kes_rescue_open(&self, validator: u32) -> bool {
+        let Some(entry) = self.kes.get(&validator) else {
+            return false;
+        };
+        let bound = self.kes_enforced_from.is_some_and(|from| self.epoch >= from);
+        let p = crate::params::kes_period(self.epoch).unwrap_or(0);
+        bound && p >= entry.in_force(p).end_period() && entry.pending_at(p).is_none()
     }
 
     /// The epoch KES enforcement bound on chain, if it has.
@@ -6117,14 +6127,17 @@ impl CommittedState {
         st.epoch = next_epoch;
         // Rescue commitments past their TTL (no-op on the empty pre-gate map).
         st.prune_pq_rescue_commits(next_epoch);
-        // HF3 KES: enforcement binds at the first boundary past the compiled
-        // gate where registered keys cover the stake threshold (review F-2).
+        // HF3 KES: enforcement is decided at the first boundary past the
+        // compiled gate where registered keys cover the stake threshold
+        // (review F-2), and takes effect `KES_BIND_DELAY_EPOCHS` later, so a
+        // node whose head has not crossed this boundary yet still judges the
+        // first KES-signed votes and blocks under the right rule.
         // Inert while `HF3_KES_ENFORCE_EPOCH` is the sentinel.
         if st.kes_enforced_from.is_none()
             && crate::params::kes_period(next_epoch).is_some()
             && st.kes_registered_stake_bps(next_epoch) >= crate::params::KES_MIN_REGISTERED_STAKE_BPS
         {
-            st.kes_enforced_from = Some(next_epoch);
+            st.kes_enforced_from = Some(next_epoch.saturating_add(crate::params::KES_BIND_DELAY_EPOCHS));
         }
         // M8 part 2: a running network without L2 state installs the pinned
         // activation policy at the flag day, only if the policy names this
