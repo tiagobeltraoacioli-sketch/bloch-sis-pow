@@ -361,6 +361,12 @@ const TX_TAGS: &[(u8, Status)] = &[
     // (devnet line 4847d708); free on this tree above the L2 range. Refused by
     // consensus before params::KES_REGISTRATION_EPOCH (u64::MAX).
     (0x17, Status::Released { name: "KesRegister", rivals: NO_RIVALS }),
+    // HF3 KES rotation, leaf-authorised. PROVISIONAL byte: the 2026-10-19
+    // allocation (codex/bloch-tag-alloc-20261019) gives 0x18-0x1A to the PQ
+    // migration (p9d) and names 0x1B next free; the HF3 tag resolution
+    // (codex/hf3-tags-20261020) must confirm or move it. Refused by consensus
+    // before params::HF3_KES_EPOCH (u64::MAX).
+    (0x1B, Status::Released { name: "KesRotate", rivals: NO_RIVALS }),
 ];
 
 /// Three lineages that all intend the SAME flag day disagree on all three
@@ -564,6 +570,7 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         PosTransaction::L2DataAvailability(_) => 0x15,
         PosTransaction::L2WithdrawClaim(_) => 0x16,
         PosTransaction::KesRegister { .. } => 0x17,
+        PosTransaction::KesRotate { .. } => 0x1B,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }
@@ -1184,6 +1191,11 @@ fn l2_transaction_tags_do_not_overlap_the_mainnet_tag_set() {
     assert_eq!(bloch_pos_committee::transition::l2_claim::L2_WITHDRAW_CLAIM_TAG, 0x16);
     assert_eq!(bloch_pos_committee::kes::REGISTER_TAG, 0x17);
     assert!(!MAINNET_TX_TAGS.contains(&0x17), "KesRegister must stay outside the deployed mainnet range");
+    assert_eq!(bloch_pos_committee::kes::ROTATE_TAG, 0x1B);
+    assert!(!MAINNET_TX_TAGS.contains(&0x1B), "KesRotate must stay outside the deployed mainnet range");
+    for reserved in [0x18, 0x19, 0x1A] {
+        assert_ne!(bloch_pos_committee::kes::ROTATE_TAG, reserved, "0x18-0x1A belong to the PQ migration (2026-10-19 allocation)");
+    }
     // The pre-renumbering L2 bytes now belong to funded delegation: they
     // dispatch to its decoders (a bare tag is truncated, not unknown).
     for old in [0x0E, 0x0F, 0x10, 0x11] {

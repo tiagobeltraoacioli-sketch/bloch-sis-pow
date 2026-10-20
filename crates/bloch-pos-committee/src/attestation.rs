@@ -154,6 +154,20 @@ pub trait SignatureVerifier {
         crate::kes::verify(self, public, period, message, signature)
     }
 
+    /// Verify one KES LEAF signature (`crate::kes::verify` calls this after
+    /// the Merkle path checks out). KES leaves are signed in the canonical,
+    /// suite-bound v2 form (`bloch_crypto::crypto::sign_bound`) from the
+    /// first KES signature, independent of any signature-policy flag day
+    /// (review F-1: the v1 form would die at `SIG_CANONICAL`). The real
+    /// verifier (`bloch-pos-node` `HybridVerifier`) overrides this with
+    /// `verify_bound`; every wrapper (caching, budgeting, policy-pinning)
+    /// MUST forward it to its inner verifier unchanged. The default — the
+    /// plain `verify_with_key` — exists for test doubles that model no
+    /// encoding.
+    fn verify_kes_leaf(&self, leaf_pk: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        self.verify_with_key(leaf_pk, message, signature)
+    }
+
     /// Deterministic native L2 proof check, using only parent-committed policy.
     /// Older verifier implementations cannot silently admit the new transaction.
     fn verify_l2_settlement(&self, _policy: &[u8; 32], _program: &[u8; 32],
@@ -214,9 +228,10 @@ pub trait KeyLookup {
     /// caller — never as "skip the check".
     fn pubkey(&self, validator: u32) -> Option<&[u8]>;
 
-    /// The validator's registered forward-secure key (`crate::kes`), if any.
-    /// Only committed state carries KES registrations; other lookups have none.
-    fn kes_public(&self, _validator: u32) -> Option<crate::kes::KesPublic> {
+    /// The validator's forward-secure key (`crate::kes`) in force for global
+    /// KES period `period` (`crate::kes::KesEntry::in_force`), if any. Only
+    /// committed state carries KES keys; other lookups have none.
+    fn kes_public(&self, _validator: u32, _period: u64) -> Option<crate::kes::KesPublic> {
         None
     }
 
@@ -226,6 +241,15 @@ pub trait KeyLookup {
     /// `None` — every lookup that is not committed state — makes every KES
     /// signature fail closed.
     fn kes_network_domain(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    /// Whether KES binds and since when (`CommittedState::kes_enforced_from`):
+    /// `Some(None)` not yet bound (static keys sign), `Some(Some(e))` bound
+    /// from epoch `e`. `None` — every lookup that is not committed state —
+    /// means "cannot tell": past the compiled enforcement gate every
+    /// signature check through it fails closed.
+    fn kes_enforced_from(&self) -> Option<Option<u64>> {
         None
     }
 }

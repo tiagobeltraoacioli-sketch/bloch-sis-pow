@@ -297,15 +297,21 @@ pub(crate) fn insert_l2_settlement(tree: &mut Smt, bytes: &[u8]) {
 }
 
 /// Registered forward-secure (KES) keys (`crate::kes`), one leaf per
-/// validator: key `u32` index, value `KesPublic::committed_bytes()`
-/// (`depth ‖ root`). Inserted only for registered validators, so every state
+/// validator: key `u32` index, value `KesEntry::committed_bytes()` (the key
+/// in force `depth ‖ root ‖ start_period`, then the pending successor's, if
+/// any). Inserted only for registered validators, so every state
 /// root before the first registration is unchanged. 0x22: the byte devnet4
 /// used, free on this line after the L2's 0x21.
 const TAG_KES_ROOT: u8 = 0x22;
 
-pub(crate) fn insert_kes_roots(tree: &mut Smt, roots: &BTreeMap<u32, crate::kes::KesPublic>) {
+pub(crate) fn insert_kes_roots(tree: &mut Smt, roots: &BTreeMap<u32, crate::kes::KesEntry>, enforced_from: Option<u64>) {
     for (validator, public) in roots {
         tree.insert(derive_key(TAG_KES_ROOT, &validator.to_le_bytes()), hash_value(&public.committed_bytes()));
+    }
+    // The enforcement bind epoch: an 8-byte key, so it never shares a key
+    // with a 4-byte validator index.
+    if let Some(epoch) = enforced_from {
+        tree.insert(derive_key(TAG_KES_ROOT, b"enforced"), hash_value(&epoch.to_le_bytes()));
     }
 }
 

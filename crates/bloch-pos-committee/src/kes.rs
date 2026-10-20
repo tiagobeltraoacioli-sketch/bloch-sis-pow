@@ -27,16 +27,26 @@
 //! the Merkle path alone proves only that the key is SOME leaf of SOME tree.
 //! On the mainnet line the binding is in force from the first KES signature.
 //!
-//! # Seams for key rotation (kept narrow on purpose)
+//! # Per-key start period and rotation (HF3, docs/KES-MAINNET-READINESS.md §3)
 //!
-//! * [`KesPublic::leaf_index`] maps a global period to a leaf of the tree.
-//!   Here it is the identity below `2^depth`; a per-key start period changes
-//!   only this function and [`KesPublic::committed_bytes`].
-//! * [`verify_validator_in`] takes the period explicitly; [`verify_validator`]
-//!   feeds it [`crate::params::kes_period`].
-//! * The state holds one [`KesPublic`] per validator
-//!   (`CommittedState::kes_public`, `kes_roots`), written only by
-//!   `CommittedState::apply_kes_register`.
+//! The devnet lineage indexed leaves by the network-wide period since
+//! activation, so every tree of one depth expired in the same epoch and a key
+//! could never be renewed (readiness blockers B1/B2). On this line:
+//!
+//! * Each key carries its own `start_period` ([`KesPublic::start_period`]):
+//!   leaf `i` signs global period `start_period + i`
+//!   ([`KesPublic::leaf_index`]). A registration before enforcement starts at
+//!   period 0; one included in period `p` after it starts at `p + 1`.
+//! * `KesRotate` ([`ROTATE_TAG`]) replaces a key without a human in the loop:
+//!   it is signed by the leaf of the CURRENT period `p` of the key in force
+//!   over [`rotate_signing_root`] (bound through [`leaf_message`]), is valid
+//!   only in a block of period `p`, and makes the new tree the key from
+//!   `p + 1` (start period `p + 1`). The static key cannot rotate: a static
+//!   key stolen later could otherwise rotate on a long-range fork.
+//! * The state keeps, per validator, a [`KesEntry`]: the key in force and at
+//!   most one pending successor. [`KesEntry::in_force`] resolves the key for
+//!   a period lazily, so no epoch-boundary hook mutates state; the successor
+//!   is promoted (and the old key dropped) when the next rotation is applied.
 //!
 //! This crate only hashes and checks paths; the leaf signature goes through
 //! the caller's [`SignatureVerifier`] like every other consensus signature.
@@ -52,10 +62,16 @@ const DS_NODE: &[u8] = b"BLOCH-KES-v1/node";
 const DS_REGISTER: &[u8] = b"BLOCH-KES-v1/register";
 const DS_SIGN: &[u8] = b"BLOCH-KES-v2/sign";
 const DS_AUTHORITY: &[u8] = b"BLOCH-KES-v1/authority";
+const DS_ROTATE: &[u8] = b"BLOCH-KES-v1/rotate";
 
 /// Transaction tag of `PosTransaction::KesRegister`. Free on the mainnet line
 /// (highest 0x16, the L2 range 0x12-0x16) and the same byte devnet4 used.
 pub const REGISTER_TAG: u8 = 0x17;
+
+/// Transaction tag of `PosTransaction::KesRotate`: 0x1B, as ruled by the HF3
+/// tag allocation (`codex/hf3-tags-20261020` e0bfbfff, `wire_alloc::tx::
+/// KES_ROTATE`; 0x18-0x1A belong to the PQ migration).
+pub const ROTATE_TAG: u8 = 0x1B;
 
 /// Wire prefix of a KES signature; a legacy hybrid signature starts with the
 /// suite envelope `B1 0C 01 00`, so the two never parse as each other.
@@ -120,32 +136,112 @@ pub fn auth_path(leaves: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
     path
 }
 
-/// A validator's registered forward-secure key: tree depth and Merkle root.
+/// A validator's registered forward-secure key: tree depth, Merkle root and
+/// the global period its leaf 0 signs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KesPublic {
     pub depth: u8,
     pub root: [u8; 32],
+    /// The global KES period of leaf 0 (per key, fixed when the key is
+    /// committed; readiness blocker B1).
+    pub start_period: u64,
 }
 
 impl KesPublic {
+    /// A tree whose leaf 0 signs global period `start_period`.
+    pub fn new(depth: u8, root: [u8; 32], start_period: u64) -> Self {
+        KesPublic { depth, root, start_period }
+    }
+
     /// Number of leaves (periods) in the tree.
     pub fn periods(&self) -> u64 {
-        1u64 << self.depth
+        1u64 << self.depth.min(MAX_DEPTH)
     }
 
-    /// The leaf that signs global KES period `period`, or `None` when the
-    /// tree has none for it (expired). The rotation seam: a per-key start
-    /// period subtracts here and nowhere else.
+    /// The leaf that signs global KES period `period`: `period −
+    /// start_period`, or `None` before the key starts or once the tree is
+    /// exhausted (expired).
     pub fn leaf_index(&self, period: u64) -> Option<u64> {
-        (MIN_DEPTH..=MAX_DEPTH).contains(&self.depth).then_some(period).filter(|&leaf| leaf < self.periods())
+        if !(MIN_DEPTH..=MAX_DEPTH).contains(&self.depth) {
+            return None;
+        }
+        period.checked_sub(self.start_period).filter(|&leaf| leaf < self.periods())
     }
 
-    /// The bytes the state commits for this key (component 0x22 value):
-    /// `depth ‖ root`.
+    /// The first global period this key can no longer sign.
+    pub fn end_period(&self) -> u64 {
+        self.start_period.saturating_add(self.periods())
+    }
+
+    /// Periods left to sign at global period `period`, counting `period`
+    /// itself (0 once expired; the full lifetime before the start).
+    pub fn remaining_periods(&self, period: u64) -> u64 {
+        self.end_period().saturating_sub(period.max(self.start_period))
+    }
+
+    /// Same tree (depth and root), whatever the start period.
+    pub fn same_tree(&self, other: &KesPublic) -> bool {
+        self.depth == other.depth && self.root == other.root
+    }
+
+    /// The bytes the state commits for this key:
+    /// `depth ‖ root ‖ u64 LE start_period`.
     pub fn committed_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(33);
+        let mut out = Vec::with_capacity(41);
         out.push(self.depth);
         out.extend_from_slice(&self.root);
+        out.extend_from_slice(&self.start_period.to_le_bytes());
+        out
+    }
+}
+
+/// A validator's KES state: the key in force and at most one rotated-in
+/// successor, which takes over at its own `start_period`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KesEntry {
+    pub current: KesPublic,
+    pub next: Option<KesPublic>,
+}
+
+impl From<KesPublic> for KesEntry {
+    fn from(current: KesPublic) -> Self {
+        KesEntry { current, next: None }
+    }
+}
+
+impl KesEntry {
+    /// The key that signs global period `period`: the successor from its
+    /// start period on, the current key before. Leaf bounds are the key's
+    /// own ([`KesPublic::leaf_index`]).
+    pub fn in_force(&self, period: u64) -> KesPublic {
+        match self.next {
+            Some(next) if period >= next.start_period => next,
+            _ => self.current,
+        }
+    }
+
+    /// The same entry with a successor that is already in force at `period`
+    /// promoted (the replaced key is dropped). Pure; the transition applies it
+    /// before a rotation, so the state never holds more than two keys.
+    pub fn settled(&self, period: u64) -> KesEntry {
+        match self.next {
+            Some(next) if period >= next.start_period => KesEntry { current: next, next: None },
+            _ => *self,
+        }
+    }
+
+    /// The rotation waiting for a later period than `period`, if any.
+    pub fn pending_at(&self, period: u64) -> Option<KesPublic> {
+        self.next.filter(|next| next.start_period > period)
+    }
+
+    /// The state-root value (component 0x22): the current key's
+    /// [`KesPublic::committed_bytes`], then the successor's if there is one.
+    pub fn committed_bytes(&self) -> Vec<u8> {
+        let mut out = self.current.committed_bytes();
+        if let Some(next) = self.next {
+            out.extend_from_slice(&next.committed_bytes());
+        }
         out
     }
 }
@@ -234,7 +330,7 @@ pub fn verify<V: SignatureVerifier + ?Sized>(
         node = if i & 1 == 0 { node_hash(&node, sib) } else { node_hash(sib, &node) };
         i >>= 1;
     }
-    node == public.root && verifier.verify_with_key(&s.leaf_pk, message, &s.sig)
+    node == public.root && verifier.verify_kes_leaf(&s.leaf_pk, message, &s.sig)
 }
 
 /// The signing root a validator's static key signs to register `public`.
@@ -242,6 +338,14 @@ pub fn verify<V: SignatureVerifier + ?Sized>(
 /// registration cannot be replayed onto another network or validator.
 pub fn register_signing_root(network_domain: &[u8; 32], validator: u32, public: &KesPublic) -> [u8; 32] {
     h(&[DS_REGISTER, network_domain, &validator.to_le_bytes(), &[public.depth], &public.root])
+}
+
+/// The root the CURRENT leaf of `validator`'s key in force signs (through
+/// [`leaf_message`]) to rotate to `new_depth ‖ new_root` in global period
+/// `period`. Bound to the network, validator, period and new tree; a
+/// distinct domain from every consensus root and from registration.
+pub fn rotate_signing_root(network_domain: &[u8; 32], validator: u32, period: u64, new_depth: u8, new_root: &[u8; 32]) -> [u8; 32] {
+    h(&[DS_ROTATE, network_domain, &validator.to_le_bytes(), &period.to_le_bytes(), &[new_depth], new_root])
 }
 
 /// What a KES leaf signs: the consensus signing root under the network
@@ -276,12 +380,64 @@ pub fn leaf_message(
     network_domain.map(|domain| bound_signing_root(&domain, validator, public, period, signing_root))
 }
 
+/// Which key authenticates `validator`'s consensus signature for `epoch`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigningMode {
+    /// The registered static key: before the compiled gate, before KES binds
+    /// on chain (`kes_enforced_from`), or — after it binds — for a validator
+    /// that never registered a KES key (static-key fallback, review F-2).
+    Static,
+    /// The KES leaf of this global period under the key in force.
+    Kes(u64),
+    /// Past the gate, through a lookup that cannot say whether KES binds:
+    /// nothing verifies.
+    FailClosed,
+}
+
+/// Has KES enforcement bound (compiled gate reached and committed bind
+/// epoch passed) at `epoch` according to `keys`?
+pub fn is_bound(keys: &dyn KeyLookup, epoch: u64) -> bool {
+    crate::params::kes_period(epoch).is_some() && matches!(keys.kes_enforced_from(), Some(Some(bound)) if epoch >= bound)
+}
+
+/// The signing mode for `validator` in `epoch` (see [`SigningMode`]).
+pub fn signing_mode(keys: &dyn KeyLookup, validator: u32, epoch: u64) -> SigningMode {
+    let Some(period) = crate::params::kes_period(epoch) else {
+        return SigningMode::Static;
+    };
+    match keys.kes_enforced_from() {
+        None => return SigningMode::FailClosed,
+        Some(None) => return SigningMode::Static,
+        Some(Some(bound)) if epoch < bound => return SigningMode::Static,
+        Some(Some(_)) => {}
+    }
+    match keys.kes_public(validator, period) {
+        Some(_) => SigningMode::Kes(period),
+        None => SigningMode::Static,
+    }
+}
+
 /// Verify a validator's consensus signature (a proposal or a vote) for
-/// `epoch` against `keys`: before KES enforcement, the registered static
-/// hybrid key, exactly as before; from it on, the registered KES root with
-/// the leaf of `epoch`'s period, over [`leaf_message`]. `None` when `keys`
-/// does not know the validator at all. A validator without a KES root signs
-/// nothing valid after enforcement.
+/// `epoch` against `keys`, under [`signing_mode`]. Its signature is exactly
+/// that of `slashing::verify_offender_signature` on the HF2 slashing line
+/// (`keys, verifier, validator, message_epoch, signing_root, signature ->
+/// Option<bool>`): the integration routes that function here so consensus
+/// and the node's evidence pre-check resolve the same per-epoch key.
+///
+/// Fault attribution: a KES root (and every rotation) is registered by a
+/// transaction after genesis, so the key in force is BRANCH-DEPENDENT. A
+/// KES signature that fails here proves misbehaviour only against a KES
+/// entry both peers share; a relay must treat such a failure as "ignore",
+/// not as a peer fault, unless the validator's entry
+/// (`CommittedState::kes_roots`) is identical in this node's finalized
+/// state. Static-key failures keep their existing attribution.
+///
+/// Rules: the static hybrid key,
+/// exactly as before, until KES binds (and for never-registered validators
+/// after); the leaf of `epoch`'s period under the key in force, over
+/// [`leaf_message`], for a registered validator once it binds. `None` when
+/// `keys` does not know the validator at all. A registered key that has
+/// expired signs nothing (rescue: re-register, `check_kes_register`).
 pub fn verify_validator(
     keys: &dyn KeyLookup,
     verifier: &dyn SignatureVerifier,
@@ -290,7 +446,15 @@ pub fn verify_validator(
     signing_root: &[u8; 32],
     signature: &[u8],
 ) -> Option<bool> {
-    verify_validator_in(keys, verifier, validator, crate::params::kes_period(epoch), signing_root, signature)
+    let period = match signing_mode(keys, validator, epoch) {
+        SigningMode::Static => None,
+        SigningMode::Kes(period) => Some(period),
+        SigningMode::FailClosed => {
+            keys.pubkey(validator)?;
+            return Some(false);
+        }
+    };
+    verify_validator_in(keys, verifier, validator, period, signing_root, signature)
 }
 
 /// [`verify_validator`] with the period given: `None` is the static key,
@@ -308,7 +472,7 @@ pub fn verify_validator_in(
     let Some(period) = period else {
         return Some(verifier.verify_with_key(static_key, signing_root, signature));
     };
-    let Some(public) = keys.kes_public(validator) else {
+    let Some(public) = keys.kes_public(validator, period) else {
         return Some(false);
     };
     let Some(message) = leaf_message(keys.kes_network_domain(), validator, &public, period, signing_root) else {
@@ -328,10 +492,16 @@ pub fn verify_validator_in(
 pub fn authority_fingerprint(keys: &dyn KeyLookup, validator: u32, epoch: u64) -> Option<[u8; 32]> {
     let static_key = keys.pubkey(validator)?;
     let static_hash = h(&[static_key]);
-    let Some(period) = crate::params::kes_period(epoch) else {
-        return Some(static_hash);
+    let period = match signing_mode(keys, validator, epoch) {
+        // After KES binds, a never-registered validator's static key is a
+        // fallback authority: tagged, so no verdict cached under the plain
+        // pre-enforcement form is reused across the bind.
+        SigningMode::Static if is_bound(keys, epoch) => return Some(h(&[DS_AUTHORITY, &static_hash, b"static-fallback"])),
+        SigningMode::Static => return Some(static_hash),
+        SigningMode::FailClosed => return Some(h(&[DS_AUTHORITY, &static_hash, b"fail-closed"])),
+        SigningMode::Kes(period) => period,
     };
-    let kes = keys.kes_public(validator).map(|k| k.committed_bytes()).unwrap_or_default();
+    let kes = keys.kes_public(validator, period).map(|k| k.committed_bytes()).unwrap_or_default();
     let domain = keys.kes_network_domain();
     Some(h(&[
         DS_AUTHORITY,
@@ -380,7 +550,7 @@ mod tests {
     #[test]
     fn every_period_verifies_only_for_itself() {
         let (pks, leaves) = toy_tree(3, [7; 32]);
-        let public = KesPublic { depth: 3, root: merkle_root(&leaves) };
+        let public = KesPublic::new(3, merkle_root(&leaves), 0);
         let root = [9u8; 32];
         for p in 0..8usize {
             let sig = toy_sign(&pks, &leaves, p, &root);
@@ -394,7 +564,7 @@ mod tests {
     #[test]
     fn tampering_and_foreign_keys_fail() {
         let (pks, leaves) = toy_tree(3, [7; 32]);
-        let public = KesPublic { depth: 3, root: merkle_root(&leaves) };
+        let public = KesPublic::new(3, merkle_root(&leaves), 0);
         let root = [9u8; 32];
         let good = KesSignature::decode(&toy_sign(&pks, &leaves, 2, &root)).unwrap();
         let mut bad = good.clone();
@@ -406,7 +576,7 @@ mod tests {
         let (other_pks, other_leaves) = toy_tree(3, [8; 32]);
         let foreign = toy_sign(&other_pks, &other_leaves, 2, &root);
         assert!(!verify(&ToyVerifier, &public, 2, &root, &foreign), "another tree");
-        assert!(!verify(&ToyVerifier, &KesPublic { depth: 2, root: public.root }, 2, &root, &good.encode()));
+        assert!(!verify(&ToyVerifier, &KesPublic::new(2, public.root, 0), 2, &root, &good.encode()));
     }
 
     #[test]
@@ -432,12 +602,12 @@ mod tests {
 
     #[test]
     fn the_bound_root_commits_to_every_field() {
-        let k = KesPublic { depth: 10, root: [5; 32] };
+        let k = KesPublic::new(10, [5; 32], 0);
         let base = bound_signing_root(&[1; 32], 3, &k, 7, &[9; 32]);
         assert_ne!(base, bound_signing_root(&[2; 32], 3, &k, 7, &[9; 32]), "network");
         assert_ne!(base, bound_signing_root(&[1; 32], 4, &k, 7, &[9; 32]), "validator");
-        assert_ne!(base, bound_signing_root(&[1; 32], 3, &KesPublic { depth: 11, root: [5; 32] }, 7, &[9; 32]), "depth");
-        assert_ne!(base, bound_signing_root(&[1; 32], 3, &KesPublic { depth: 10, root: [6; 32] }, 7, &[9; 32]), "root");
+        assert_ne!(base, bound_signing_root(&[1; 32], 3, &KesPublic::new(11, [5; 32], 0), 7, &[9; 32]), "depth");
+        assert_ne!(base, bound_signing_root(&[1; 32], 3, &KesPublic::new(10, [6; 32], 0), 7, &[9; 32]), "root");
         assert_ne!(base, bound_signing_root(&[1; 32], 3, &k, 8, &[9; 32]), "period");
         assert_ne!(base, bound_signing_root(&[1; 32], 3, &k, 7, &[8; 32]), "message");
         assert_ne!(base, register_signing_root(&[1; 32], 3, &k), "never a registration message");
@@ -445,17 +615,65 @@ mod tests {
 
     #[test]
     fn leaf_index_is_the_period_inside_the_tree_and_nothing_outside() {
-        let k = KesPublic { depth: 2, root: [0; 32] };
+        let k = KesPublic::new(2, [0; 32], 0);
         assert_eq!((0..4).map(|p| k.leaf_index(p)).collect::<Vec<_>>(), vec![Some(0), Some(1), Some(2), Some(3)]);
         assert_eq!(k.leaf_index(4), None, "an exhausted tree signs nothing");
-        assert_eq!(KesPublic { depth: 0, root: [0; 32] }.leaf_index(0), None);
-        assert_eq!(KesPublic { depth: MAX_DEPTH + 1, root: [0; 32] }.leaf_index(0), None);
-        assert_eq!(k.committed_bytes(), [&[2u8][..], &[0u8; 32][..]].concat());
+        assert_eq!(KesPublic::new(0, [0; 32], 0).leaf_index(0), None);
+        assert_eq!(KesPublic::new(MAX_DEPTH + 1, [0; 32], 0).leaf_index(0), None);
+        assert_eq!(k.committed_bytes(), [&[2u8][..], &[0u8; 32][..], &0u64.to_le_bytes()[..]].concat());
+    }
+
+    #[test]
+    fn a_per_key_start_period_shifts_the_leaves_and_the_expiry() {
+        // Blocker B1: two keys of the same depth expire at different periods
+        // when they start at different periods.
+        let a = KesPublic::new(2, [1; 32], 0);
+        let b = KesPublic::new(2, [1; 32], 10);
+        assert_eq!(b.leaf_index(9), None, "before its start a key signs nothing");
+        assert_eq!((10..14).map(|p| b.leaf_index(p)).collect::<Vec<_>>(), vec![Some(0), Some(1), Some(2), Some(3)]);
+        assert_eq!(b.leaf_index(14), None);
+        assert_eq!((a.end_period(), b.end_period()), (4, 14));
+        assert_eq!((b.remaining_periods(0), b.remaining_periods(10), b.remaining_periods(13), b.remaining_periods(14)), (4, 4, 1, 0));
+        assert!(a.same_tree(&b));
+        assert_ne!(a.committed_bytes(), b.committed_bytes(), "the start period is committed");
+        assert_eq!(KesPublic::new(16, [0; 32], u64::MAX - 3).leaf_index(u64::MAX), Some(3), "no overflow at the top");
+        assert_eq!(KesPublic::new(16, [0; 32], u64::MAX - 3).end_period(), u64::MAX);
+    }
+
+    #[test]
+    fn a_kes_entry_hands_over_at_the_successors_start_and_settles_lazily() {
+        let current = KesPublic::new(3, [1; 32], 0);
+        let next = KesPublic::new(3, [2; 32], 6);
+        let entry = KesEntry { current, next: Some(next) };
+        assert_eq!(entry.in_force(5), current);
+        assert_eq!(entry.in_force(6), next);
+        assert_eq!(entry.pending_at(5), Some(next));
+        assert_eq!(entry.pending_at(6), None);
+        assert_eq!(entry.settled(5), entry, "nothing to promote yet");
+        assert_eq!(entry.settled(6), KesEntry::from(next), "promoted, old key dropped");
+        assert_eq!(
+            entry.committed_bytes(),
+            [current.committed_bytes(), next.committed_bytes()].concat()
+        );
+        assert_eq!(KesEntry::from(current).committed_bytes(), current.committed_bytes());
+    }
+
+    #[test]
+    fn the_rotation_root_binds_every_field_and_is_its_own_domain() {
+        let base = rotate_signing_root(&[1; 32], 3, 7, 12, &[5; 32]);
+        assert_ne!(base, rotate_signing_root(&[2; 32], 3, 7, 12, &[5; 32]), "network");
+        assert_ne!(base, rotate_signing_root(&[1; 32], 4, 7, 12, &[5; 32]), "validator");
+        assert_ne!(base, rotate_signing_root(&[1; 32], 3, 8, 12, &[5; 32]), "period");
+        assert_ne!(base, rotate_signing_root(&[1; 32], 3, 7, 11, &[5; 32]), "depth");
+        assert_ne!(base, rotate_signing_root(&[1; 32], 3, 7, 12, &[6; 32]), "root");
+        let k = KesPublic::new(12, [5; 32], 0);
+        assert_ne!(base, register_signing_root(&[1; 32], 3, &k), "never a registration message");
+        assert_ne!(base, bound_signing_root(&[1; 32], 3, &k, 7, &[5; 32]), "never a leaf message");
     }
 
     #[test]
     fn without_a_network_domain_there_is_no_message_to_sign() {
-        let k = KesPublic { depth: 3, root: [4; 32] };
+        let k = KesPublic::new(3, [4; 32], 0);
         assert_eq!(leaf_message(None, 1, &k, 0, &[9; 32]), None);
         assert_eq!(leaf_message(Some([1; 32]), 1, &k, 0, &[9; 32]), Some(bound_signing_root(&[1; 32], 1, &k, 0, &[9; 32])));
         assert_ne!(leaf_message(Some([1; 32]), 1, &k, 0, &[9; 32]), Some([9; 32]), "never the bare root");
@@ -463,10 +681,10 @@ mod tests {
 
     #[test]
     fn registration_root_binds_network_validator_and_key() {
-        let k = KesPublic { depth: 10, root: [5; 32] };
+        let k = KesPublic::new(10, [5; 32], 0);
         let base = register_signing_root(&[1; 32], 3, &k);
         assert_ne!(base, register_signing_root(&[2; 32], 3, &k));
         assert_ne!(base, register_signing_root(&[1; 32], 4, &k));
-        assert_ne!(base, register_signing_root(&[1; 32], 3, &KesPublic { depth: 11, root: [5; 32] }));
+        assert_ne!(base, register_signing_root(&[1; 32], 3, &KesPublic::new(11, [5; 32], 0)));
     }
 }

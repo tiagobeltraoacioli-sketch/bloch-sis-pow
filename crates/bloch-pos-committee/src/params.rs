@@ -2561,13 +2561,15 @@ pub(crate) mod audit_recovery_test {
 
 // ── Forward-secure validator keys (KES, `crate::kes`) ───────────────────────
 //
-// Two mainnet flag days, both unarmed (`u64::MAX`) until chosen, no cargo
-// feature anywhere (docs/KES-MAINNET-READINESS.md §7):
+// Hard fork 3 (HF3). Two mainnet flag days, both unarmed (`u64::MAX`) until
+// chosen, no cargo feature anywhere (docs/KES-MAINNET-READINESS.md §7):
 //
-// 1. `KES_REGISTRATION_EPOCH` opens wire 0x17 (`PosTransaction::KesRegister`):
-//    each validator commits, once, the Merkle root of its key tree. Signing
-//    stays static; nothing else changes.
-// 2. `KES_ACTIVATION_EPOCH` (enforcement): from it on, every proposal and
+// 1. `HF3_KES_EPOCH` (alias `KES_REGISTRATION_EPOCH`) opens wire 0x17
+//    (`PosTransaction::KesRegister`) and `kes::ROTATE_TAG`
+//    (`PosTransaction::KesRotate`): each validator commits, once, the Merkle
+//    root of its key tree. Signing stays static; nothing else changes.
+//    Rotation needs a period to be signed in, so it only applies after (2).
+// 2. `HF3_KES_ENFORCE_EPOCH` (alias `KES_ACTIVATION_EPOCH`): from it on, every proposal and
 //    every vote verifies only under the leaf of its epoch's KES period, over
 //    `kes::leaf_message` (network domain ‖ validator ‖ depth ‖ root ‖ period ‖
 //    consensus root — the audit p8a binding, in force from the first KES
@@ -2577,11 +2579,47 @@ pub(crate) mod audit_recovery_test {
 // is refused exactly as an undecodable tag was, and the 0x22 state-root
 // component is absent while no root is registered.
 
-/// Opens KES registration (wire 0x17). Unarmed.
-pub const KES_REGISTRATION_EPOCH: u64 = u64::MAX;
-/// KES enforcement: proposals and votes must carry a KES leaf signature
-/// from this epoch on. Unarmed.
-pub const KES_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// HF3: opens KES registration (wire 0x17) and rotation (`kes::ROTATE_TAG`).
+/// Unarmed.
+pub const HF3_KES_EPOCH: u64 = u64::MAX;
+/// HF3 KES enforcement: proposals and votes must carry a KES leaf signature
+/// from this epoch on. Unarmed; must come at least
+/// `KES_MIN_REGISTRATION_WINDOW_EPOCHS` after `HF3_KES_EPOCH`.
+pub const HF3_KES_ENFORCE_EPOCH: u64 = u64::MAX;
+/// Opens KES registration (wire 0x17): `HF3_KES_EPOCH`.
+pub const KES_REGISTRATION_EPOCH: u64 = HF3_KES_EPOCH;
+/// KES enforcement: `HF3_KES_ENFORCE_EPOCH`.
+pub const KES_ACTIVATION_EPOCH: u64 = HF3_KES_ENFORCE_EPOCH;
+/// Shortest registration window the build accepts: 14 days of 90 epochs
+/// (readiness doc §7 step 5: the flag day at least two weeks after the
+/// window opens, once registered roots cover the stake).
+pub const KES_MIN_REGISTRATION_WINDOW_EPOCHS: u64 = 14 * 90;
+/// Node policy, not consensus: a validator node starts generating and
+/// rotating to a fresh tree once its key in force has at most this many
+/// periods left (one year at one-day periods; readiness doc §4, `R`). Each
+/// node adds `validator index % KES_ROTATION_STAGGER_PERIODS` so co-hosted
+/// validators do not generate in the same period.
+pub const KES_ROTATE_REMAINING_PERIODS: u64 = 365;
+/// Spread of the node's rotation trigger across validator indices.
+pub const KES_ROTATION_STAGGER_PERIODS: u64 = 64;
+/// On-chain enforcement precondition (review F-2): from
+/// `HF3_KES_ENFORCE_EPOCH` on, KES binds only at the first epoch boundary
+/// where validators holding a registered, unexpired KES key carry at least
+/// this share (basis points) of the consensus roster's effective stake. The
+/// bind epoch is committed state (`CommittedState::kes_enforced_from`).
+/// Until then every validator signs with its static key.
+pub const KES_MIN_REGISTERED_STAKE_BPS: u64 = 9_000;
+/// Static-key fallback (review F-2): after enforcement binds, a validator
+/// with NO KES registration still signs with its static key, so validators
+/// that never registered (or join later) do not go silent and cannot halt
+/// finality. Registered validators sign only with KES. A static-key
+/// re-registration (rescue, readiness B3) is accepted only while a key has
+/// expired, and its key starts this many periods after inclusion.
+pub const KES_RESCUE_DELAY_PERIODS: u64 = 2;
+/// Shallowest tree the transition accepts from HF3 on. `kes::MIN_DEPTH` (1)
+/// remains the codec bound; a depth-1 tree lives two days, a depth-8 tree
+/// 256 days (review F-2: "an operator can brick itself in 2 days").
+pub const KES_MIN_REGISTERED_DEPTH: u8 = 8;
 /// Epochs per KES period. 32 slots of 30 s is a 16-minute epoch, so 90
 /// epochs is exactly 24 h (readiness doc §4, option A).
 pub const KES_PERIOD_EPOCHS: u64 = 90;
@@ -2601,6 +2639,15 @@ const _: () = {
             || (KES_REGISTRATION_EPOCH != u64::MAX && KES_REGISTRATION_EPOCH < KES_ACTIVATION_EPOCH),
         "KES enforcement needs an earlier registration window"
     );
+    assert!(
+        HF3_KES_ENFORCE_EPOCH == u64::MAX
+            || HF3_KES_ENFORCE_EPOCH - HF3_KES_EPOCH >= KES_MIN_REGISTRATION_WINDOW_EPOCHS,
+        "the HF3 registration window must last at least KES_MIN_REGISTRATION_WINDOW_EPOCHS"
+    );
+    // The rotation horizon must leave a default-depth tree most of its life.
+    assert!(KES_ROTATE_REMAINING_PERIODS + KES_ROTATION_STAGGER_PERIODS < (1u64 << KES_DEFAULT_DEPTH) / 2);
+    assert!(KES_MIN_REGISTERED_STAKE_BPS > 6_667 && KES_MIN_REGISTERED_STAKE_BPS <= 10_000);
+    assert!(KES_MIN_REGISTERED_DEPTH <= KES_DEFAULT_DEPTH);
 };
 
 /// The KES schedule a build runs under: (registration, activation, period
@@ -2610,6 +2657,9 @@ pub struct KesSchedule {
     pub registration_epoch: u64,
     pub activation_epoch: u64,
     pub period_epochs: u64,
+    /// Shallowest tree registration and rotation accept
+    /// (`KES_MIN_REGISTERED_DEPTH`).
+    pub min_depth: u8,
 }
 
 /// The schedule consensus reads. A pure function of the build.
@@ -2622,6 +2672,7 @@ pub fn kes_schedule() -> KesSchedule {
         registration_epoch: KES_REGISTRATION_EPOCH,
         activation_epoch: KES_ACTIVATION_EPOCH,
         period_epochs: KES_PERIOD_EPOCHS,
+        min_depth: KES_MIN_REGISTERED_DEPTH,
     }
 }
 
@@ -2661,6 +2712,8 @@ mod kes_schedule_tests {
 
     #[test]
     fn the_mainnet_schedule_is_unarmed() {
+        assert_eq!(HF3_KES_EPOCH, u64::MAX);
+        assert_eq!(HF3_KES_ENFORCE_EPOCH, u64::MAX);
         assert_eq!(KES_REGISTRATION_EPOCH, u64::MAX);
         assert_eq!(KES_ACTIVATION_EPOCH, u64::MAX);
         for epoch in [0, 4_669, 1 << 40, u64::MAX - 1, u64::MAX] {
@@ -2671,7 +2724,7 @@ mod kes_schedule_tests {
 
     #[test]
     fn periods_count_from_enforcement_in_days() {
-        kes_rehearsal::set(Some(KesSchedule { registration_epoch: 10, activation_epoch: 100, period_epochs: 90 }));
+        kes_rehearsal::set(Some(KesSchedule { registration_epoch: 10, activation_epoch: 100, period_epochs: 90, min_depth: 1 }));
         assert!(!kes_registration_open(9));
         assert!(kes_registration_open(10));
         assert!(kes_registration_open(100_000), "registration stays open after enforcement");
