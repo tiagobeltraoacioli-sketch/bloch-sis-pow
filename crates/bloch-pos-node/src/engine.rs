@@ -14198,10 +14198,15 @@ mod duty_view_anchor {
         let keys: Vec<Keystore> = (0..n)
             .map(|i| {
                 // Disposable devnet keys, plaintext by explicit opt-in — see
-                // the note in the single-validator harness above.
-                Keystore::generate_with(
+                // the note in the single-validator harness above. Seeded, so
+                // the proposer draws (and therefore which slots this node
+                // proposes in) are the same on every run.
+                let mut seed = [0x5Du8; 32];
+                seed[..4].copy_from_slice(&i.to_le_bytes());
+                Keystore::generate_seeded_for_test(
                     &dir.0.join(format!("v{i}")),
                     i,
+                    seed,
                     &crate::keys::Unlock::PlaintextOptIn,
                 )
                 .expect("generate a devnet keystore")

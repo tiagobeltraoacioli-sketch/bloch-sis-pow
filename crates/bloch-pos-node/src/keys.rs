@@ -545,6 +545,21 @@ impl Keystore {
         Ok(ks)
     }
 
+    /// TEST ONLY: [`Keystore::generate_with`] with the hybrid keypair and the
+    /// RANDAO seed derived from `seed`, so a multi-validator fixture is the
+    /// same chain on every run (proposer draws depend on both).
+    #[cfg(test)]
+    pub(crate) fn generate_seeded_for_test(dir: &Path, index: u32, seed: [u8; 32], unlock: &Unlock) -> io::Result<Keystore> {
+        use sha3::{Digest, Sha3_256};
+        fs::create_dir_all(dir)?;
+        let (pubkey, secret) = bloch_crypto::crypto::generate_keypair_from_seed(&seed)
+            .map_err(|e| io::Error::other(format!("seeded keygen: {e:?}")))?;
+        let randao_seed: [u8; 32] = Sha3_256::new_with_prefix(b"bloch-test-randao-seed").chain_update(seed).finalize().into();
+        let ks = Keystore { index, pubkey, secret: Zeroizing::new(secret), randao_seed };
+        ks.save_with(dir, unlock)?;
+        Ok(ks)
+    }
+
     /// Write `dir/validator.key`, sealed unless the caller explicitly asked
     /// for plaintext.
     pub fn save_with(&self, dir: &Path, unlock: &Unlock) -> io::Result<()> {
