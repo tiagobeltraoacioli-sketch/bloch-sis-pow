@@ -25,7 +25,8 @@
 #     [--carryover <carryover.tsv.gz | carryover.tsv>]   (default: repo copy) \
 #     [--manifest <genesis/mainnet.manifest>]             (default: repo copy) \
 #     [--expect-root <hex64> --expect-slot <n>]          (head reported by two archivals) \
-#     [--allow-unsandboxed]                               (no unshare / sandbox-exec available)
+#     [--allow-unsandboxed]                               (no unshare / sandbox-exec available) \
+#     [--port-base <n>]                                   (default 28790; distinct per concurrent run)
 #
 # Verdict: exit 0 and "VERDICT: PASS" only if every run replayed the whole log,
 # the candidate is a mainnet build, the gate is inert in it, and all runs (and
@@ -37,7 +38,7 @@ MANIFEST="$REPO/genesis/mainnet.manifest"
 MANIFEST_SHA256="7eef82a70ef9b0e1dd86f86d33cba11fc10cdfc7395c2e5f6669613fa1beb2dd"
 CARRYOVER="$REPO/carryover.tsv.gz"
 CARRYOVER_TSV_SHA256="84ddbbac2afdd5c78618096a7d4f66cf5b04a3e5757a03fe90550e50096183f6"
-CANDIDATE="" BASELINE="" SOURCE="" WORK="" EXPECT_ROOT="" EXPECT_SLOT="" UNSANDBOXED=0
+CANDIDATE="" BASELINE="" SOURCE="" WORK="" EXPECT_ROOT="" EXPECT_SLOT="" UNSANDBOXED=0 PORT=28790
 while [ $# -gt 0 ]; do
   case "$1" in
     --candidate) CANDIDATE="$2"; shift 2 ;;
@@ -49,10 +50,11 @@ while [ $# -gt 0 ]; do
     --expect-root) EXPECT_ROOT="$2"; shift 2 ;;
     --expect-slot) EXPECT_SLOT="$2"; shift 2 ;;
     --allow-unsandboxed) UNSANDBOXED=1; shift ;;
+    --port-base) PORT="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-[ -n "$CANDIDATE" ] && [ -n "$SOURCE" ] && [ -n "$WORK" ] || { sed -n '18,31p' "$0" >&2; exit 2; }
+[ -n "$CANDIDATE" ] && [ -n "$SOURCE" ] && [ -n "$WORK" ] || { sed -n '18,32p' "$0" >&2; exit 2; }
 sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 die() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -81,10 +83,15 @@ grep -q '"build_version":"[^"]*devnet' "$WORK/candidate.buildinfo.json" \
 # Isolation: no route off the host. Linux: a fresh network namespace (only an
 # unconfigured loopback). macOS: a sandbox profile that denies every network
 # operation except loopback. Either way no --peers / --p2p-peer is passed and
-# RPC is off, so the node has nobody to talk to even on loopback.
+# RPC is off, so the node has nobody to talk to even on loopback. Hosts that
+# forbid unprivileged user namespaces (Ubuntu 24.04 AppArmor default) take the
+# second arm: a root-created network namespace, loopback up, and the node
+# dropped back to the calling user with setpriv before it starts.
 isolate() {
   if [ "$(uname)" = Linux ] && unshare --net --map-root-user true 2>/dev/null; then
     unshare --net --map-root-user "$@"
+  elif [ "$(uname)" = Linux ] && command -v setpriv >/dev/null && sudo -n unshare --net true 2>/dev/null; then
+    sudo -n unshare --net sh -c 'ip link set lo up; u=$0; g=$1; shift; exec setpriv --reuid="$u" --regid="$g" --init-groups "$@"' "$(id -u)" "$(id -g)" "$@"
   elif [ "$(uname)" = Darwin ] && command -v sandbox-exec >/dev/null; then
     sandbox-exec -p '(version 1)(allow default)(deny network*)(allow network* (local ip "localhost:*"))(allow network* (remote ip "localhost:*"))' "$@"
   elif [ "$UNSANDBOXED" = 1 ]; then
@@ -95,7 +102,7 @@ isolate() {
   fi
 }
 
-PORT=28790
+case "$PORT" in ''|*[!0-9]*) die "--port-base must be a number" ;; esac
 run_one() { # label binary
   local label="$1" bin="$2" d="$WORK/$1"
   mkdir -m 700 "$d"
