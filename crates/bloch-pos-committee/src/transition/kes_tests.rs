@@ -1094,11 +1094,20 @@ mod kes_rules {
         assert_eq!(st.kes_roots()[&3].current.start_period, 0, "not bound yet: starts at period 0");
         let root_before = st.state_root();
         st = st.close_epoch();
-        assert_eq!(st.kes_enforced_from(), Some(5));
+        // Decided at the boundary into epoch 5, in force from 5 + the bind
+        // delay, so every node whose head is in epoch 5 or 6 already knows
+        // which key signs epoch 7 (rehearsal finding: finality lag at bind).
+        let bind = 5 + crate::params::KES_BIND_DELAY_EPOCHS;
+        assert_eq!(st.kes_enforced_from(), Some(bind));
         assert_ne!(st.state_root(), root_before);
-        let slot = 5 * 32 + 1;
+        for epoch in 5..bind {
+            let slot = epoch * 32 + 1;
+            let still_static = vote(&st, 1, slot, 0xB3, |r| toy_sign(&[1u8; 8], r));
+            assert_eq!(crate::attestation::validate(&still_static, &[1], slot, &ToyVerifier, &view(&st)), Ok(()), "epoch {epoch}");
+        }
+        let slot = bind * 32 + 1;
         let static_vote = vote(&st, 1, slot, 0xB2, |r| toy_sign(&[1u8; 8], r));
-        let kes_vote = vote(&st, 1, slot, 0xB2, |r| honest_own(&st, 1, 3, r));
+        let kes_vote = vote(&st, 1, slot, 0xB2, |r| honest_own(&st, 1, bind - 2, r));
         assert_eq!(
             crate::attestation::validate(&static_vote, &[1], slot, &ToyVerifier, &view(&st)),
             Err(crate::attestation::RejectReason::BadSignature)
@@ -1107,7 +1116,7 @@ mod kes_rules {
         // Never cleared, even if coverage later drops.
         st.kes.clear();
         st = st.close_epoch();
-        assert_eq!(st.kes_enforced_from(), Some(5));
+        assert_eq!(st.kes_enforced_from(), Some(bind));
     }
 
     #[test]
@@ -1154,8 +1163,14 @@ mod kes_rules {
         let tx = register(&st, 1, fresh);
         assert_eq!(relay_check(&st, &tx), Err(TxReject::StakingRule));
         assert_eq!(apply(&mut st, &tx), Err(TxReject::StakingRule), "live key");
+        assert!(!st.kes_rescue_open(1), "the node mempool reads this rule: closed while live");
         // Period 16: the depth-4 key has expired. Rescue starts 2 periods on.
         st.epoch = 2 + 16;
+        assert!(st.kes_rescue_open(1), "open once expired (the mempool admits the rescue, rehearsal S7)");
+        assert!(!st.kes_rescue_open(2), "never for an unregistered validator");
+        let mut unbound = st.clone();
+        unbound.kes_enforced_from = None;
+        assert!(!unbound.kes_rescue_open(1), "never before KES binds");
         let tx = register(&st, 1, fresh);
         assert_eq!(relay_check(&st, &tx), Ok(()));
         apply(&mut st, &tx).unwrap();
@@ -1163,6 +1178,7 @@ mod kes_rules {
         assert_eq!(rescued.start_period, 16 + crate::params::KES_RESCUE_DELAY_PERIODS);
         assert!(!vote_verifies(&st, 1, 2 + 17, &rescued, &tree_from(0xA1, DEPTH), 17), "not before its start");
         assert!(vote_verifies(&st, 1, 2 + 18, &rescued, &tree_from(0xA1, DEPTH), 18));
+        assert!(!st.kes_rescue_open(1), "rescued: closed again");
         // Once rescued the key is live again: no second rescue.
         st.epoch = 2 + 18;
         let again = register(&st, 1, public_of(&tree_from(0xA2, DEPTH)));

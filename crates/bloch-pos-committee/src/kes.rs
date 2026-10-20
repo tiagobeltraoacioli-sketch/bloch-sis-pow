@@ -80,9 +80,17 @@ pub const SIGNATURE_MAGIC: [u8; 4] = *b"KES1";
 pub const MIN_DEPTH: u8 = 1;
 pub const MAX_DEPTH: u8 = 16;
 /// Leaf key and signature bounds: the hybrid suite's envelope sizes
-/// (3,749-byte key; at most 4,593-byte signature, `transition::funded`).
+/// (3,749-byte key; at most `HYBRID_SIGNATURE_MAX` signature bytes).
 pub const MAX_LEAF_PK_LEN: usize = 3_749;
-pub const MAX_LEAF_SIG_LEN: usize = 4_593;
+pub const MAX_LEAF_SIG_LEN: usize = HYBRID_SIGNATURE_MAX;
+/// Longest hybrid ML-DSA-65 ‖ Falcon-1024 signature envelope: 4-byte suite
+/// header, 3,309-byte ML-DSA-65 signature and a Falcon-1024 detached
+/// signature of up to 1,462 bytes (PQClean `CRYPTO_BYTES`; the compact
+/// encoding's length varies per signature). The 4,593 used elsewhere is the
+/// 1,280-byte PADDED Falcon size, which a compact signature can exceed
+/// (rehearsal kes-1: a 4,596-byte registration signature). Pinned against
+/// `bloch_crypto::crypto::max_signature_len()` in the node tests.
+pub const HYBRID_SIGNATURE_MAX: usize = 4 + 3_309 + 1_462;
 /// Largest encoded KES signature: magic, period, two length prefixes, key,
 /// signature, depth byte and a full path.
 pub const MAX_SIGNATURE_LEN: usize = 4 + 4 + 4 + MAX_LEAF_PK_LEN + 4 + MAX_LEAF_SIG_LEN + 1 + 32 * MAX_DEPTH as usize;
@@ -577,6 +585,18 @@ mod tests {
         let foreign = toy_sign(&other_pks, &other_leaves, 2, &root);
         assert!(!verify(&ToyVerifier, &public, 2, &root, &foreign), "another tree");
         assert!(!verify(&ToyVerifier, &KesPublic::new(2, public.root, 0), 2, &root, &good.encode()));
+    }
+
+    #[test]
+    fn a_maximum_length_falcon_leaf_signature_decodes() {
+        assert_eq!(HYBRID_SIGNATURE_MAX, 4_775);
+        let at_max = KesSignature { index: 0, leaf_pk: vec![1; MAX_LEAF_PK_LEN], sig: vec![2; HYBRID_SIGNATURE_MAX], path: vec![[3; 32]; 12] };
+        assert_eq!(KesSignature::decode(&at_max.encode()), Some(at_max.clone()));
+        // The padded-Falcon size used by admission limits is not the maximum.
+        let over_padded = KesSignature { sig: vec![2; 4_596], ..at_max.clone() };
+        assert!(KesSignature::decode(&over_padded.encode()).is_some(), "a 4,596-byte leaf signature (rehearsal kes-1)");
+        let too_long = KesSignature { sig: vec![2; HYBRID_SIGNATURE_MAX + 1], ..at_max };
+        assert!(KesSignature::decode(&too_long.encode()).is_none());
     }
 
     #[test]
