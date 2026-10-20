@@ -314,6 +314,38 @@ These are public commitments; the RPC is where they become checkable.
   hybrid signatures are not returned (they are prunable after finality,
   migration spec §6.5.1).
 
+### 4.5a `getfinalitycertificate [epoch | "latest", block?, set_source_epoch?]` (2026-10-19)
+
+Returns a self-contained proof that checkpoint `(epoch, root)` is finalized,
+for clients that run no node (exchanges, the L2 follower). Implemented in
+`crates/bloch-pos-node/src/engine/finality_cert.rs`; format and verifier in
+`crates/bloch-finality-cert` (CLI `bloch-finality-verify`). RPC/library only:
+no consensus rule, state-root component or wire message changed.
+
+- `certificate` (hex, format `BLOCHFC1`) carries: the checkpoint header (hash =
+  `root`); the justifying link `S → E` and finalizing link `E → E+1`, every
+  vote listed with `slot`, `head` and its full hybrid ML-DSA-65 ‖ Falcon-1024
+  signature over the unchanged `AttestationData::signing_root`; the entire
+  validator registry of a *set-source* checkpoint block, each record with a
+  compressed SMT inclusion proof against that block's `state_root`, plus
+  absence proofs for every index gap and `max_index + 1` (no member can be
+  omitted); optional parent-linked headers from the checkpoint down to `block`.
+- Trust: the verifier holds one or more trusted block ids (a weak-subjectivity
+  anchor). The set-source block must be one of them; each verified checkpoint
+  becomes trusted for the next certificate (chain of certificates).
+  `set_source_epoch` (default: the justifying link's source) lets a client hop
+  from its last trusted epoch; the verifier bounds the hop (default 256 epochs).
+- Weight rule: committed own bond (`ValidatorRecord.stake`) of records active at
+  the link's target epoch; `3·signed >= 2·total` on both links. Ignores the
+  inactivity leak and delegated stake, so it is never weaker than the chain's
+  rule; an epoch finalized only under a leak-shrunk denominator is refused.
+- Node: registry proofs are retained for the last `BLOCH_FINALITY_CERT_EPOCHS`
+  checkpoints (default 16, `0` disables; built once per epoch boundary, not
+  persisted across restarts). Older set sources answer `-32004`.
+- Size (measured, 106 validators, full participation): see
+  `crates/bloch-finality-cert/tests/vectors/README` (1.42 MB full, 1.10 MB with a
+  minimal 2/3 vote subset; registry 0.44 MB, each vote 4,637 B).
+
 ### 4.6 Open — vesting-lock visibility (`getvestingstatus`)
 
 With taint dissolved, the only coin-class question left is **vesting**:

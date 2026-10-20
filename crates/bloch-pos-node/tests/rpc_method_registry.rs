@@ -117,6 +117,8 @@ const ROUTED: &[(&str, &str)] = &[
     // own two-layer discipline.
     ("getvalidators", "Validators"),
     ("gettxstatus", "TxStatus"),
+    // Freeze bump (2026-10-19): finality certificates, a new variant.
+    ("getfinalitycertificate", "FinalityCertificate"),
 ];
 
 /// Names that are routed and answer with a REFUSAL rather than a variant.

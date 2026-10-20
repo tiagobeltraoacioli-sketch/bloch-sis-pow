@@ -1,0 +1,25 @@
+[package]
+name = "bloch-finality-cert"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+description = "Self-contained Bloch Genesis-4 finality certificates: wire format, builder helpers and a standalone verifier (bloch-finality-verify). RPC/library only: it reads committed state and signed votes, it changes no consensus rule. UNAUDITED."
+
+[features]
+default = ["hybrid"]
+# The production hybrid ML-DSA-65 || Falcon-1024 check (bloch_crypto::crypto::verify,
+# the same entry point the node's consensus verifier calls). Without it the
+# library still parses and verifies everything except signatures, which the
+# caller then supplies through `SigCheck`.
+hybrid = ["dep:bloch-crypto"]
+
+[dependencies]
+bloch-pos-committee = { path = "../bloch-pos-committee" }
+bloch-crypto = { path = "../bloch-crypto", optional = true }
+sha3 = "0.10"
+
+[[bin]]
+name = "bloch-finality-verify"
+path = "src/bin/bloch-finality-verify.rs"
+required-features = ["hybrid"]

@@ -495,6 +495,41 @@ fn node_is_behind(
         && now_ms.saturating_sub(last_applied_ms) > stale_after_ms
 }
 
+/// Whether this slot-loop turn may sign the attestation for wall slot `slot`.
+///
+/// Below `ANCESTRY_SEED_ACTIVATION_EPOCH` the committee seed of epoch `e` is
+/// the RANDAO mix of the last block before `first_slot_of_epoch(e)`, and the
+/// target is that same block. An attester that signs at the very start of an
+/// epoch's slot while its head is still in `e - 1` AND the boundary slot
+/// `first_slot_of_epoch(e) - 1` is empty in its view is betting that no block
+/// for that slot is still in flight. When one is, the vote is drawn from the
+/// wrong seed and names the wrong target, so it is never included; worse,
+/// once the late block lands the validator's real committee slot comes up
+/// later in the same epoch and slashing protection correctly refuses it as a
+/// double vote. One late block costs the whole epoch's vote.
+///
+/// So in exactly that case the signature waits until half the slot has
+/// elapsed, giving the late boundary block time to arrive. Every other case —
+/// head already in `e`, or head on the boundary slot itself — signs at once,
+/// unchanged, so same-slot inclusion (the only inclusion an epoch's last
+/// slot ever gets) is not touched.
+fn attestation_due(
+    head_slot: u64,
+    slot: u64,
+    now_ms: u64,
+    slot_start_ms: u64,
+    slot_ms: u64,
+) -> bool {
+    let e = epoch_of(slot);
+    if epoch_of(head_slot) >= e {
+        return true;
+    }
+    let boundary_seen = first_slot_of_epoch(e)
+        .and_then(|first| first.checked_sub(1))
+        .is_none_or(|last_of_prev| head_slot >= last_of_prev);
+    boundary_seen || now_ms.saturating_sub(slot_start_ms) >= slot_ms / 2
+}
+
 /// Remaining wall-clock epochs before a single block extending `head_slot`
 /// would exceed the consensus epoch-walk ceiling.
 ///
@@ -1446,6 +1481,9 @@ mod ws_lifecycle_tests;
 
 mod local_cache;
 mod verification;
+mod finality_cert;
+#[cfg(test)]
+mod finality_cert_tests;
 
 struct Engine {
     manifest: Manifest,
@@ -1512,6 +1550,9 @@ struct Engine {
     /// the wrong branch". A block that leaves the canonical chain and later
     /// returns has the same post-state both times.
     recent_states: VecDeque<([u8; 32], Arc<CommittedState>)>,
+    /// Retained checkpoint registry proofs + built certificates for
+    /// `getfinalitycertificate`. RPC-only; see `engine/finality_cert.rs`.
+    finality_certs: finality_cert::FinalityCertStore,
     /// Attestations available to fork choice and to the next proposal, keyed
     /// by content so duplicates collapse. This is the *aggregation* store.
     pool: BTreeMap<(u32, [u8; 32]), Attestation>,
@@ -2489,6 +2530,49 @@ impl Engine {
         );
     }
 
+    /// Rollback guard, runtime half (node-local). An authenticated signature
+    /// of THIS key that the signing record does not cover means the record is
+    /// stale (restored data dir) or another instance of the key is signing.
+    /// Either way the record is raised durably to cover it, so no later duty
+    /// can conflict with it; and when the sighting is live network evidence,
+    /// duties stop until an operator restarts the node.
+    fn note_own_signature(&mut self, index: u32, seen: crate::slashprot::Published, live_evidence: bool) {
+        // Cheap pre-filter: skip the registry probe for every other validator.
+        match self.keys.as_ref() {
+            None => return,
+            Some(k) if k.index != crate::keys::AUTO_VALIDATOR_INDEX && k.index != index => return,
+            Some(_) => {}
+        }
+        let Some(my_index) = self.duty_index(&self.state) else { return };
+        if index != my_index || !self.slashprot.is_uncovered(seen) {
+            return;
+        }
+        let before = self.slashprot.watermarks();
+        match self.slashprot.raise_to_published(seen) {
+            Ok(after) if live_evidence => {
+                self.doppelganger_halted = true;
+                eprintln!(
+                    "SIGNING RECORD STALE: validator {index} signed {seen:?} on the network, which \
+                     this node's record {before:?} does not cover. Either the data dir was \
+                     restored from a backup or ANOTHER INSTANCE of this key is signing. Record \
+                     raised to {after:?}; duties STOPPED until restart. Confirm only one \
+                     instance of this key runs before restarting."
+                );
+            }
+            Ok(after) => eprintln!(
+                "SIGNING RECORD STALE: replayed chain shows validator {index} signed {seen:?} \
+                 beyond the record {before:?}; record raised to {after:?} before any duty."
+            ),
+            Err(e) => {
+                self.doppelganger_halted = true;
+                eprintln!(
+                    "SIGNING RECORD STALE: validator {index} signed {seen:?} beyond the record \
+                     and the record could not be raised ({e}); duties STOPPED."
+                );
+            }
+        }
+    }
+
     fn attest(&mut self, slot: u64) {
         // An observer holds no key and therefore has no duty. Bound here, once,
         // and used to sign below — nothing between reads `keys` mutably.
@@ -3386,6 +3470,11 @@ impl Engine {
         let proposer_slot = env.header.slot;
         self.observe_proposer_equivocation(&env);
         self.blocks.insert(id, env);
+        self.note_own_signature(
+            proposer_index,
+            crate::slashprot::Published::Proposal { slot: proposer_slot },
+            src.bounded_by_wall_clock(),
+        );
         if src.bounded_by_wall_clock() {
             self.note_possible_doppelganger(proposer_index, proposer_slot);
         }
@@ -4496,6 +4585,9 @@ impl Engine {
                 self.remember_state(*id.as_bytes(), snapshot);
                 self.canonical.insert(*id.as_bytes());
                 self.chain.push((env.header.slot, id));
+                // RPC-only: retain the registry proof of a checkpoint block
+                // when this block opened a new epoch (once per epoch).
+                self.note_checkpoint_registry();
                 self.head_slot.store(env.header.slot, Ordering::Relaxed);
                 self.last_applied_ms = now_ms();
                 // Finality latch (F-03): arm/raise the floor the moment the
@@ -5077,6 +5169,9 @@ impl Engine {
             self.chain.push((env.header.slot, id));
         }
         self.canonical = canonical;
+        // RPC-only: the reorg ring holds the new head and its parent, so
+        // the head's boundary (if it opened an epoch) can be retained.
+        self.note_checkpoint_registry();
         self.head_slot
             .store(self.head_slot_now(), Ordering::Relaxed);
         self.last_applied_ms = now_ms();
@@ -5315,6 +5410,7 @@ impl Engine {
                 // R6 HIGH-8: an accepted attestation is a real, signature-
                 // checked duty by `att.validator` — exactly the class of
                 // sighting doppelgänger protection exists to catch.
+                self.note_own_signature(att.validator, published_attestation(&att), true);
                 self.note_possible_doppelganger(att.validator, att.data.slot);
                 self.pool
                     .insert((att.validator, att.data.signing_root()), att);
@@ -5371,6 +5467,7 @@ impl Engine {
                 if let Some(evidence) = slashing_candidate {
                     self.report_equivocation((*evidence).into());
                 }
+                self.note_own_signature(att.validator, published_attestation(&att), true);
                 self.note_possible_doppelganger(att.validator, att.data.slot);
                 let frame = net::att_frame(&att);
                 self.pool
@@ -5729,6 +5826,10 @@ impl Engine {
             RpcRequest::Validators => Ok(rpc::validator_registry_json(&self.state)),
 
             RpcRequest::TxStatus(txid) => Ok(rpc::tx_status_json(self.tx_status(&txid))),
+
+            RpcRequest::FinalityCertificate { epoch, block, set_source_epoch } => {
+                self.finality_certificate(epoch, block, set_source_epoch)
+            }
         }
     }
 }
@@ -5852,6 +5953,85 @@ mod boot_switch_tests {
             assert!(error.to_string().contains("TEST_SWITCH"));
         }
     }
+}
+
+fn published_attestation(att: &Attestation) -> crate::slashprot::Published {
+    crate::slashprot::Published::Attestation {
+        slot: att.data.slot,
+        source_epoch: att.data.source_epoch,
+        target_epoch: att.data.target_epoch,
+    }
+}
+
+/// Host-level signer anchor (node-local): one flock per validator key across
+/// every data dir on this host, plus a record copy outside the data dir that
+/// refuses a rolled-back data dir. See [`crate::signer_anchor`].
+fn attach_signer_anchor(
+    data_dir: &std::path::Path,
+    binding: crate::slashprot::Binding,
+    protection: &mut SlashingProtection,
+) -> io::Result<()> {
+    use crate::signer_anchor as anchor;
+    anchor::check_not_retired(&[data_dir])?;
+    if parse_boot_switch(anchor::ENV_DISABLE, std::env::var_os(anchor::ENV_DISABLE))? {
+        println!(
+            "SIGNER ANCHOR: DISABLED ({} is set). Nothing on this host stops a second \
+             instance of this key in another data dir, or a restored data dir, from signing.",
+            anchor::ENV_DISABLE
+        );
+        return Ok(());
+    }
+    let accept_rollback = parse_boot_switch(
+        anchor::ENV_ACCEPT_ROLLBACK,
+        std::env::var_os(anchor::ENV_ACCEPT_ROLLBACK),
+    )?;
+    let unavailable = |why: String| {
+        eprintln!(
+            "SIGNER ANCHOR: UNAVAILABLE ({why}). Booting WITHOUT the host signer anchor \
+             (data-dir record and data-dir lock only, as before the anchor existed). To \
+             enable it, pass --signer-anchor-dir <dir> (or {}) naming a directory this \
+             service can write, e.g. one listed in the unit's ReadWritePaths=.",
+            anchor::ENV_DIR
+        );
+    };
+    let held = match anchor::resolve_root() {
+        Some(anchor::RootSource::Explicit(root)) => {
+            anchor::SignerAnchor::acquire(&root, &binding).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("signer anchor dir {} (--signer-anchor-dir / {}): {e}", root.display(), anchor::ENV_DIR),
+                )
+            })?
+        }
+        Some(anchor::RootSource::Default(root)) => {
+            match anchor::SignerAnchor::acquire_default(&root, &binding)? {
+                Some(held) => held,
+                None => {
+                    unavailable(format!(
+                        "default {} is not writable from this process: sandboxed home \
+                         (ProtectHome=/ProtectSystem=strict) or missing home",
+                        root.display()
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+        None => {
+            unavailable("HOME is unset and no --signer-anchor-dir was given".into());
+            return Ok(());
+        }
+    };
+    let dir = held.dir().to_path_buf();
+    let check = protection.attach_anchor(held, accept_rollback)?;
+    println!("SIGNER ANCHOR: {} ({check:?}); signer lock held", dir.display());
+    if check == crate::slashprot::AnchorCheck::DataDirRolledForward {
+        eprintln!(
+            "SIGNER ANCHOR: the data-dir record was OLDER than the anchor and was raised \
+             to it under --accept-signing-rollback. Watermarks now {:?}.",
+            protection.watermarks()
+        );
+    }
+    Ok(())
 }
 
 pub fn run(cfg: Config) -> io::Result<()> {
@@ -6029,10 +6209,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let slashprot = match keys.as_ref() {
         Some(k) => {
             let pkh: [u8; 32] = <sha3::Sha3_256 as sha3::Digest>::digest(&k.pubkey).into();
-            SlashingProtection::open_bound(
-                &cfg.data_dir,
-                crate::slashprot::Binding { validator_pubkey_sha3: pkh, genesis_digest: digest },
-            )?
+            let binding =
+                crate::slashprot::Binding { validator_pubkey_sha3: pkh, genesis_digest: digest };
+            let mut protection = SlashingProtection::open_bound(&cfg.data_dir, binding)?;
+            attach_signer_anchor(&cfg.data_dir, binding, &mut protection)?;
+            protection
         }
         None => SlashingProtection::open(&cfg.data_dir)?,
     };
@@ -6201,6 +6382,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
         recent_states: VecDeque::new(),
+        finality_certs: Default::default(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
         held_release_roots: VecDeque::new(),
@@ -6742,7 +6924,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // this function's stack — a restart forgets them entirely. They stop
         // duplicate work within one run; `slashprot` is what stops a second
         // signature across runs and across processes.
-        if !duties_blocked && slot > last_attested {
+        if !duties_blocked
+            && slot > last_attested
+            && attestation_due(engine.state.slot(), slot, now, slot_start, slot_ms)
+        {
             engine.maintain_validator_lifecycle(wall_epoch);
             engine.attest(slot);
             last_attested = slot;
@@ -9166,6 +9351,7 @@ mod transfer_v2_end_to_end {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+            finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
@@ -10376,6 +10562,17 @@ mod perf_support {
     pub(super) fn proposing_engine_funded(
         opening: &[bloch_pos_committee::state_root::EutxoEntry],
     ) -> (Engine, TestDir) {
+        let (engine, dir, _) = proposing_engine_n(opening, 1);
+        (engine, dir)
+    }
+
+    /// `n` genesis validators with real hybrid keystores (each in its own
+    /// subdirectory). The engine signs as validator 0; the other keystores are
+    /// returned so a test can swap them in to attest/propose as the whole set.
+    pub(super) fn proposing_engine_n(
+        opening: &[bloch_pos_committee::state_root::EutxoEntry],
+        n: u32,
+    ) -> (Engine, TestDir, Vec<Keystore>) {
         static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "bloch-pos-perf-{}-{}",
@@ -10390,17 +10587,29 @@ mod perf_support {
         // in an unoptimized test binary would dominate the suite.
         let ks = Keystore::generate_with(&dir, 0, &crate::keys::Unlock::PlaintextOptIn)
             .expect("generate a devnet keystore");
+        let others: Vec<Keystore> = (1..n)
+            .map(|i| {
+                let sub = dir.join(format!("v{i}"));
+                std::fs::create_dir_all(&sub).expect("create a validator subdir");
+                Keystore::generate_with(&sub, i, &crate::keys::Unlock::PlaintextOptIn)
+                    .expect("generate a devnet keystore")
+            })
+            .collect();
         let manifest = Manifest {
             genesis_time_ms: now_ms(),
             slot_ms: 1_000,
-            validators: vec![ManifestValidator {
-                index: 0,
-                stake_sat: 200_000 * SAT_PER_BLOCH,
-                randao_commitment: RandaoChain::generate(ks.randao_seed).commitment(),
-                pubkey: ks.pubkey.clone(),
-                withdrawal_credentials: Vec::new(),
-                commission_bps: 0,
-            }],
+            validators: std::iter::once(&ks)
+                .chain(others.iter())
+                .enumerate()
+                .map(|(i, k)| ManifestValidator {
+                    index: i as u32,
+                    stake_sat: 200_000 * SAT_PER_BLOCH,
+                    randao_commitment: RandaoChain::generate(k.randao_seed).commitment(),
+                    pubkey: k.pubkey.clone(),
+                    withdrawal_credentials: Vec::new(),
+                    commission_bps: 0,
+                })
+                .collect(),
             cohort: Vec::new(),
             carryover: None,
             allocations: Vec::new(),
@@ -10429,6 +10638,7 @@ mod perf_support {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+            finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
@@ -10481,7 +10691,7 @@ mod perf_support {
             doppelganger_observe_until: None,
             doppelganger_halted: false,
         };
-        (engine, TestDir(dir))
+        (engine, TestDir(dir), others)
     }
 }
 
@@ -10779,6 +10989,9 @@ mod doppelganger_tests {
         engine.start_doppelganger_observation(100);
         let mut old = sample_attestation_for(index);
         old.data.slot = 99;
+        // This node's own historical work: persist-before-sign means its
+        // record covers it (an uncovered one is the stale-record case below).
+        engine.slashprot.raise_to_published(published_attestation(&old)).unwrap();
         engine.apply_decision(old, GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
         assert!(!engine.doppelganger_halted);
         let mut current = sample_attestation_for(index);
@@ -10786,6 +10999,30 @@ mod doppelganger_tests {
         engine.apply_decision(current, GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
         assert!(engine.doppelganger_halted);
         assert!(engine.doppelganger_blocks_duties(10_000));
+    }
+
+    /// Rollback guard, runtime half: after the window, a gossip duty of this
+    /// key that the signing record does NOT cover (restored data dir, or a
+    /// second instance elsewhere) stops duties and raises the record durably.
+    #[test]
+    fn uncovered_own_duty_after_the_window_halts_and_raises_the_record() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
+        engine.doppelganger_observe_until = Some(10);
+        engine.wall_slot = 500;
+        let mut foreign = sample_attestation_for(my_index);
+        foreign.data.slot = 480;
+        foreign.data.source_epoch = 3;
+        foreign.data.target_epoch = 4;
+        engine.apply_decision(foreign, GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
+        assert!(engine.doppelganger_halted, "an uncovered own signature must stop duties");
+        let wm = engine.slashprot.watermarks();
+        assert_eq!((wm.attestation_slot, wm.target_epoch), (Some(480), Some(4)));
+        // Another validator's duty never trips it.
+        let (mut other, _d2) = perf_support::proposing_engine();
+        let idx = other.keys.as_ref().unwrap().index;
+        other.apply_decision(sample_attestation_for(idx + 1), GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
+        assert!(!other.doppelganger_halted);
     }
 
     fn sample_attestation_for(validator: u32) -> Attestation {
@@ -10854,6 +11091,11 @@ mod doppelganger_tests {
         let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
         engine.doppelganger_observe_until = Some(10);
         engine.wall_slot = 50; // past the window
+        // Its own duty: the record covers it, because it was persisted first.
+        engine
+            .slashprot
+            .raise_to_published(published_attestation(&sample_attestation_for(my_index)))
+            .unwrap();
 
         engine.apply_decision(
             sample_attestation_for(my_index),
@@ -12569,6 +12811,7 @@ mod duty_view_anchor {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+            finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
@@ -12837,6 +13080,7 @@ mod slot_horizon {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+            finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
@@ -15871,6 +16115,55 @@ mod stale_head_duty_gate_tests {
     fn a_normal_one_slot_head_gap_does_not_block_duties() {
         assert!(!node_is_behind(99, 100, 50_000, 0, 20_000));
         assert!(!validator_duties_blocked(false, false, false, false, false));
+    }
+
+    /// Epoch-start slot 191296 with the head on 191294 while the boundary
+    /// block 191295 is still in flight: signing at slot start would vote the
+    /// wrong target, so the vote waits half a slot for the boundary block.
+    #[test]
+    fn an_epoch_start_vote_waits_while_the_boundary_slot_is_empty_in_view() {
+        let slot_ms = 30_000;
+        let (slot, start) = (191_296u64, 1_000_000u64);
+        assert_eq!(slot % SLOTS_PER_EPOCH, 0);
+        assert!(!attestation_due(191_294, slot, start, start, slot_ms));
+        assert!(!attestation_due(191_294, slot, start + slot_ms / 2 - 1, start, slot_ms));
+        assert!(attestation_due(191_294, slot, start + slot_ms / 2, start, slot_ms));
+        // The late block landed: the seed and target are now pinned.
+        assert!(attestation_due(191_295, slot, start, start, slot_ms));
+    }
+
+    #[test]
+    fn later_slots_of_an_epoch_with_no_block_yet_still_wait_on_a_missing_boundary() {
+        let slot_ms = 30_000;
+        // Slots 191296..191298 empty in view, head still on 191294.
+        assert!(!attestation_due(191_294, 191_298, 0, 0, slot_ms));
+        assert!(attestation_due(191_294, 191_298, slot_ms / 2, 0, slot_ms));
+    }
+
+    #[test]
+    fn ordinary_and_epoch_end_votes_are_signed_at_slot_start() {
+        let slot_ms = 30_000;
+        // Head on the boundary slot: the usual epoch start, unchanged.
+        assert!(attestation_due(191_295, 191_296, 0, 0, slot_ms));
+        // Head already inside the epoch, even across empty slots.
+        assert!(attestation_due(191_296, 191_310, 0, 0, slot_ms));
+        // An epoch's last slot depends on same-slot inclusion; never delayed.
+        assert!(attestation_due(191_320, 191_327, 0, 0, slot_ms));
+        assert_eq!(191_327 % SLOTS_PER_EPOCH, SLOTS_PER_EPOCH - 1);
+        // Epoch 0 has no previous boundary.
+        assert!(attestation_due(0, 5, 0, 0, slot_ms));
+    }
+
+    #[test]
+    fn the_slot_loop_gates_attest_on_attestation_due() {
+        let source = include_str!("engine.rs");
+        let call = source
+            .find("            engine.attest(slot);\n            last_attested = slot;")
+            .expect("slot-loop attest call");
+        let gate = source[..call]
+            .rfind("&& attestation_due(engine.state.slot(), slot, now, slot_start, slot_ms)")
+            .expect("attestation_due gate");
+        assert!(call - gate < 200, "the gate must guard the slot-loop attest call");
     }
 
     #[test]

@@ -51,6 +51,7 @@ mod l2_da_cli;
 mod l2_claim_cli;
 mod l2_deposit_cli;
 mod engine;
+mod equivocation_watch;
 mod genesis;
 mod funded_delegation_cli;
 mod keys;
@@ -59,6 +60,7 @@ mod net;
 mod p2p;
 mod rpc;
 mod slashprot;
+mod signer_anchor;
 mod slashing_cli;
 mod store;
 mod ws_boot;
@@ -103,6 +105,7 @@ fn plaintext_opt_in_flag(args: &[String]) -> bool {
         return false;
     }
     let switches = ["--allow-finality-rewind", "--no-doppelganger-check", "--replay-from-genesis",
+        "--no-signer-anchor", "--accept-signing-rollback",
         "--require-state-cache", "--behind-proxy", "--bind-genesis"];
     let mut rest = args.iter().skip(1);
     while let Some(arg) = rest.next() {
@@ -216,6 +219,12 @@ fn main() {
         Some("slashing-protection") => {
             if let Err(error) = slashing_cli::run(&args[1..]) {
                 eprintln!("slashing-protection: {error}");
+                exit(2);
+            }
+        }
+        Some("watch-equivocation") => {
+            if let Err(error) = equivocation_watch::run(&args[1..]) {
+                eprintln!("watch-equivocation: {error}\n{}", equivocation_watch::USAGE);
                 exit(2);
             }
         }
@@ -381,11 +390,23 @@ fn print_help() {
                epoch from running nodes (all --rpc endpoints must agree),\n\
                writing <prefix>.bin (154 canonical bytes) + <prefix>.json\n\
                and printing the ws digest the signers sign.\n\
-           bloch-pos slashing-protection <export|import|set-floor>\n\
+           bloch-pos slashing-protection <export|import|set-floor|retire>\n\
                --data-dir <dir> --validator-pubkey-sha3 <hex32>\n\
-               --genesis-digest <hex32> [--out <file>|--in <file>|--min-slot <n>]\n\
+               --genesis-digest <hex32> [--signer-anchor-dir <dir>]\n\
+               [--out <file>|--in <file>|--min-slot <n>|--note <text>]\n\
                Offline only: stop this node and fence any previous signer.\n\
                Import merges monotone watermarks; it never lowers protection.\n\
+               Export merges the host signer anchor; retire blocks this key\n\
+               from booting on this host again (after a migration export).\n\
+           bloch-pos run ... [--signer-anchor-dir <dir>] [--no-signer-anchor]\n\
+                             [--accept-signing-rollback]\n\
+               Signer anchor (default $HOME/.bloch-signer): one lock per\n\
+               validator key on this host, and a refusal to sign from a data\n\
+               dir older than the key's last signature. An unwritable\n\
+               default (systemd ProtectHome=, missing HOME) only warns;\n\
+               an explicit --signer-anchor-dir must be usable.\n\
+           bloch-pos watch-equivocation --rpc HOST:PORT [--rpc ...] --state FILE --out EVIDENCE.jsonl\n\
+               [--from-slot N] [--to-slot N] [--window-epochs 256]   (read-only double/surround vote detector)\n\
            bloch-pos ws-keygen --out <prefix>\n\
            bloch-pos ws-signer-set --id <n> --threshold <m>\n\
                                    --min-external <k> --adopted-epoch <e>\n\
@@ -788,6 +809,8 @@ fn run_switch(args: &[String], name: &str) -> bool {
         "--behind-proxy",
         "--bind-genesis",
         "--no-doppelganger-check",
+        "--no-signer-anchor",
+        "--accept-signing-rollback",
         "--replay-from-genesis",
         "--require-state-cache",
     ];
@@ -1683,6 +1706,16 @@ fn run_cmd(args: &[String]) {
     // on `BLOCH_NO_DOPPELGANGER`.
     if args.iter().any(|a| a == "--no-doppelganger-check") {
         unsafe { std::env::set_var("BLOCH_NO_DOPPELGANGER", "1") };
+    }
+    // Host-level signer anchor (key lock + rollback guard): see signer_anchor.rs.
+    if run_switch(args, "--no-signer-anchor") {
+        unsafe { std::env::set_var(signer_anchor::ENV_DISABLE, "1") };
+    }
+    if run_switch(args, "--accept-signing-rollback") {
+        unsafe { std::env::set_var(signer_anchor::ENV_ACCEPT_ROLLBACK, "1") };
+    }
+    if let Some(value) = arg_value(args, "--signer-anchor-dir") {
+        unsafe { std::env::set_var(signer_anchor::ENV_DIR, value) };
     }
     if let Some(value) = arg_value(args, "--max-replay-blocks") {
         if value.parse::<usize>().is_err() {

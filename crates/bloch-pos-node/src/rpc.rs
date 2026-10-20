@@ -936,6 +936,13 @@ pub enum RpcRequest {
     /// and `Engine::tx_slot_index` (`included`/`justified`/`finalized`); see
     /// `Engine::serve_rpc`'s arm for the exact precedence.
     TxStatus([u8; 32]),
+    /// `getfinalitycertificate(epoch|"latest", block?, set_source_epoch?)`:
+    /// a self-contained finality certificate (see `bloch-finality-cert`).
+    FinalityCertificate {
+        epoch: Option<u64>,
+        block: Option<[u8; 32]>,
+        set_source_epoch: Option<u64>,
+    },
 }
 
 /// Whatever can answer an [`RpcRequest`]. In production this is the channel to
@@ -1347,6 +1354,24 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
         // R4 F-11.
         "getvalidators" => RpcRequest::Validators,
         "gettxstatus" => RpcRequest::TxStatus(want_hex32(params, 0, "txid")?),
+        "getfinalitycertificate" => {
+            let epoch = match pick(params, 0, "epoch") {
+                None | Some(Json::Null) => None,
+                Some(v) if v.as_str() == Some("latest") => None,
+                Some(v) => Some(v.as_u64().ok_or_else(|| {
+                    RpcError::invalid_params("`epoch` must be a non-negative integer or \"latest\"")
+                })?),
+            };
+            let block = match pick(params, 1, "block") {
+                None | Some(Json::Null) => None,
+                Some(_) => Some(want_hex32(params, 1, "block")?),
+            };
+            let set_source_epoch = match pick(params, 2, "set_source_epoch") {
+                None | Some(Json::Null) => None,
+                Some(_) => Some(want_u64(params, 2, "set_source_epoch")?),
+            };
+            RpcRequest::FinalityCertificate { epoch, block, set_source_epoch }
+        }
         other => return Err(RpcError::method_not_found(other)),
     })
 }

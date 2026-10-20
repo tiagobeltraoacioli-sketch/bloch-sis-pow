@@ -152,6 +152,83 @@ down:
 4. Start the replacement only after the preceding conditions hold. Retain
    doppelganger protection and confirm new duties exceed the merged history.
 
+## Signer anchor and planned host migration
+
+Node-local, no consensus change. Since the P3a signer hardening every
+validator node also keeps a **signer anchor** outside its data dir:
+`$BLOCH_SIGNER_ANCHOR_DIR` (`--signer-anchor-dir`), default
+`$HOME/.bloch-signer/<pubkey-sha3>-<network-digest>/`, holding:
+
+- `LOCK` — an exclusive `flock` per validator key. A second `bloch-pos run`
+  with the same key on the same host refuses to boot (`SECOND SIGNER
+  REFUSED`) whatever data dir it uses. It is per host: it cannot see another
+  host, which is why fencing below is still mandatory. All instances on a
+  host must resolve the same anchor root (same user/`HOME` or the same
+  `--signer-anchor-dir`; containers need it on a shared host volume).
+- `signing_record.bin` — a copy of `slashing_protection.bin`, written after
+  the data-dir record and before every signature is released. At boot, a
+  data-dir record older than the anchor (restored backup, fresh data dir for
+  a key this host already ran) is refused (`SIGNING ROLLBACK REFUSED`).
+  After stopping every other instance, `--accept-signing-rollback` raises the
+  record to the anchor (never lowers it). A lagging anchor (crash between the
+  two writes) is raised silently.
+- `SIGNER-RETIRED` — written by `slashing-protection retire`; the key then
+  refuses to boot on this host again.
+
+At runtime, an authenticated block or gossip attestation of this key that
+the record does not cover raises the record durably to cover it and, when
+seen live, stops duties until restart (`SIGNING RECORD STALE`) — the
+restored-backup or second-host case after the doppelganger window closed.
+
+`--no-signer-anchor` / `BLOCH_NO_SIGNER_ANCHOR=1` disables the anchor (logged
+loudly). The existing 64-slot doppelganger wait is unchanged.
+
+#### Anchor root under hardened systemd units
+
+The default root `$HOME/.bloch-signer` is best effort. Units with
+`ProtectHome=yes|read-only`, `ProtectSystem=strict` whose `ReadWritePaths=`
+cover only the data dir, or no `HOME` at all, cannot write it. The node then
+logs `SIGNER ANCHOR: UNAVAILABLE (...)` and boots exactly as releases without
+the anchor did (data-dir record and data-dir lock only); it never refuses to
+boot because of the default root. A held key lock, a `SIGNER-RETIRED` marker,
+a corrupt or foreign anchor record and a rolled-back data dir stay fatal.
+(`ProtectHome=tmpfs` gives each unit a private, ephemeral home: the anchor
+then works per boot only and cannot see other units.)
+
+To enable the anchor on such units, use one shared directory per host and
+name it explicitly; an explicit root that cannot be created or locked is a
+boot refusal, not a warning:
+
+```ini
+# /etc/systemd/system/bloch-nNN.service.d/zz-signer-anchor.conf
+[Service]
+Environment=BLOCH_SIGNER_ANCHOR_DIR=/var/lib/bloch-signer
+ReadWritePaths=/var/lib/bloch-signer
+```
+
+Create it once (`install -d -m 0700 -o <service user> /var/lib/bloch-signer`)
+and give every unit of that host the same value, so the per-key lock spans
+all of them. Pass the same `--signer-anchor-dir` to the offline
+`slashing-protection` commands.
+
+### Planned migration, old host A → new host B (toolkit order)
+
+1. On A: stop the node and confirm the process exited.
+2. On A: `bloch-pos slashing-protection export --data-dir A_DIR
+   --validator-pubkey-sha3 PKH --genesis-digest DIGEST --out rec.bin`
+   (merges A's anchor; taking the anchor lock also proves nothing on A runs).
+3. On A: `bloch-pos slashing-protection retire --data-dir A_DIR
+   --validator-pubkey-sha3 PKH --genesis-digest DIGEST --note "moved to B <date>"`.
+   Disable A's unit so it is not restarted.
+4. Copy `rec.bin` (no key material) and the sealed key to B.
+5. On B (stopped): `bloch-pos slashing-protection import --data-dir B_DIR ... --in rec.bin`.
+6. Start B. Its anchor is adopted from the imported record; doppelganger
+   observation still runs before duties.
+
+Never copy a whole data dir between hosts and start both. Never remove
+`SIGNER-RETIRED` or pass `--accept-signing-rollback` without first proving
+every other instance of the key is stopped.
+
 ### Step 3 — Exit and replace, do not un-fence
 
 A fenced host does not get unfenced. If it turns out to have been a false
@@ -178,4 +255,5 @@ claim.
 - [ ] The copy's passphrase is stored separately from the copy itself.
 - [ ] Host-loss response starts with fencing (verified process/host/key fencing + independent chain observations), never with restore.
 - [ ] A fenced host is never re-admitted under its old key.
+- [ ] Migrations follow export → retire → import; the signer anchor is never disabled on a validator.
 - [ ] Any key replacement goes through the ordinary deposit/exit gate, not an out-of-band shortcut.

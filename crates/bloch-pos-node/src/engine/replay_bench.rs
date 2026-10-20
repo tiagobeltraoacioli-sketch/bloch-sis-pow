@@ -656,6 +656,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         // empty ring means the first reorg it meets takes the `replay_to`
         // fallback — which is what a real cold boot does too.
         recent_states: VecDeque::new(),
+        finality_certs: Default::default(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
         held_release_roots: VecDeque::new(),
