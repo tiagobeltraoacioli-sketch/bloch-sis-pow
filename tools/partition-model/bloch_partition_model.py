@@ -748,7 +748,7 @@ def summary(path: Path) -> str:
     finality halt if the partition never heals."""
     data = json.loads(path.read_text())
     rows = data["rows"]
-    cols = [3, 7, 14, 21, 30, 60, None]
+    cols = [d for d in (3, 7, 14, 21, 30, 60) if d in data["days"]] + [None]
     head = " | ".join("never" if d is None else f"{d}d" for d in cols)
     out = [f"| class | variant | conflicting finality, heal after: {head} | double pay, never | "
            "epochs to conflict min/med | halt heavy side, never: med/max epochs |",
