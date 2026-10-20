@@ -41,7 +41,9 @@
 //   `FinalityState` at mainnet epochs to give the mainnet numbers.
 // - Horizon: at most `HORIZON` epochs per run.
 // - Claim rule: `HF1_CLAIM_FINALITY_EPOCH` forced open where a
-//   test says "armed" (the fix already on this branch), inert otherwise.
+//   test says "armed", inert otherwise.
+// - Own-target rule: `params::HF1_OWN_TARGET_VOTES_EPOCH` forced open in
+//   the `post_fix_*` tests, together with the frozen finality set.
 //
 // SCENARIOS and what TODAY's rules do (pinned by the `today_*` tests):
 // 1. Minority branch carrying majority votes (same-slot opening; epoch 2:
@@ -78,7 +80,7 @@
 // p2a (count only own-chain target votes) and p1a (frozen finality set, no
 // leak in the denominator). The p1a ones arm
 // `params::HF1_FROZEN_FINALITY_SET_EPOCH` and run; the p2a one stays
-// ignored until p2a merges:
+// run too:
 //   - no branch ever justifies or finalizes a checkpoint that is not its own;
 //   - in any split, at most one side finalizes a post-fork checkpoint;
 //   - one withdrawal pays on at most one side.
@@ -429,10 +431,13 @@ fn today_ordinary_partition_cannot_carry_honest_foreign_votes_into_finality() {
     assert!(!foreign(&br, 1, &br[1].justified().root), "{s}");
 }
 
+/// Post-fix p2a (`params::HF1_OWN_TARGET_VOTES_EPOCH`, armed for this
+/// test): scenario 1 again; B carries the same messages, but they name A's
+/// checkpoints and count for nothing on B.
 #[test]
-#[ignore = "post-fix (p2a own-chain target votes): un-ignore after merge"]
 fn post_fix_minority_branch_never_justifies_or_finalizes_a_foreign_checkpoint() {
     let _rules = mainnet_rules();
+    let _own = crate::params::own_target_votes_test::open();
     let mut br = s1();
     let s = summary(&br);
     for i in 0..2 {
@@ -485,6 +490,7 @@ fn post_fix_equal_split_finalizes_at_most_one_side() {
     // p1a: frozen finality set armed from genesis of the fixture.
     let _frozen = crate::params::native_finality_set_test::open();
     let _rules = mainnet_rules();
+    let _own = crate::params::own_target_votes_test::open();
     let _claims = crate::params::native_claim_finality_test::open();
     let mut br = s2();
     let finals = br.iter().filter(|b| b.first_final.is_some()).count();
@@ -564,6 +570,7 @@ fn post_fix_three_way_split_finalizes_at_most_one_branch() {
     // p1a: frozen finality set armed from genesis of the fixture.
     let _frozen = crate::params::native_finality_set_test::open();
     let _rules = mainnet_rules();
+    let _own = crate::params::own_target_votes_test::open();
     let br = s3();
     assert!(br.iter().filter(|b| b.first_final.is_some()).count() <= 1, "{}", summary(&br));
 }
@@ -677,6 +684,7 @@ fn post_fix_late_joining_half_never_finalizes_against_the_finalized_checkpoint()
     // p1a: frozen finality set armed from genesis of the fixture.
     let _frozen = crate::params::native_finality_set_test::open();
     let _rules = mainnet_rules();
+    let _own = crate::params::own_target_votes_test::open();
     let _claims = crate::params::native_claim_finality_test::open();
     let mut br = s5();
     assert_eq!(br[1].first_final, None, "{}", summary(&br));

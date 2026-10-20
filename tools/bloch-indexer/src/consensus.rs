@@ -86,6 +86,7 @@ gates!(
     // Hard forks 1-3 (crates/bloch-pos-committee/src/hard_forks.rs).
     HF1_CLAIM_FINALITY_EPOCH,
     HF1_FROZEN_FINALITY_SET_EPOCH,
+    HF1_OWN_TARGET_VOTES_EPOCH,
     HF2_SLASHING_V2_EPOCH,
     NATIVE_SLASHING_ACTIVATION_EPOCH,
     HF2_GROWTH_CAP_EPOCH,

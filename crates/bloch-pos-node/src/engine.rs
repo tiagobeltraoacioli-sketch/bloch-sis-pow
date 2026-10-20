@@ -2612,13 +2612,37 @@ impl Engine {
             return;
         }
         let fin = rolled.finality();
+        // From `params::HF1_OWN_TARGET_VOTES_EPOCH` the tally of the
+        // head's chain counts a vote only if its target is the root that
+        // chain RECORDED for `e` (and its source that chain's justified
+        // checkpoint, which is then always its own). `rolled` is the head's
+        // state rolled into `e`, so its record is that root; vote it, so the
+        // vote is by construction one the head's own chain counts. It is the
+        // same convention as `checkpoint_root` (last block strictly before
+        // `e`'s first slot); a disagreement means the canonical index and the
+        // head state have diverged, and the state is the one consensus reads.
+        let canonical_target = self.checkpoint_root(e);
+        let target_root = match rolled.own_checkpoint_root(e) {
+            Some(own) => {
+                if own != canonical_target {
+                    eprintln!(
+                        "[slot {slot}] checkpoint of epoch {e}: head state records {} but the \
+                         canonical index gives {}; voting the head state's own root",
+                        crate::codec::hex8(&own),
+                        crate::codec::hex8(&canonical_target),
+                    );
+                }
+                own
+            }
+            None => canonical_target,
+        };
         let data = AttestationData {
             slot,
             head: *self.head_id().as_bytes(),
             source_epoch: fin.justified.epoch,
             source_root: fin.justified.root,
             target_epoch: e,
-            target_root: self.checkpoint_root(e),
+            target_root,
         };
         // SLASHING PROTECTION. The duty is settled; the signature is not made
         // until the watermark for it is on disk and fsync-ed. `slot` here is

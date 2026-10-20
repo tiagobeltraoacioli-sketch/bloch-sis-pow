@@ -17,6 +17,11 @@ const L2_CHECKPOINT_SECTION: &[u8; 16] = b"BPOSST01:L2CP:v1";
 /// (`params::HF1_FROZEN_FINALITY_SET_EPOCH`). Written only once the
 /// gate has created it, so every earlier cache keeps its bytes.
 const FINALITY_SET_SECTION: &[u8; 16] = b"BPOSST01:FSET:v1";
+/// Marks the optional section after the L2 one (or after the base payload
+/// when there is no L2 state) holding the finality engine's own checkpoint
+/// roots (`params::HF1_OWN_TARGET_VOTES_EPOCH`). Written only when non-empty,
+/// so every earlier cache keeps its bytes.
+const OWN_CHECKPOINT_SECTION: &[u8; 16] = b"BPOSST01:FFGO:v1";
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedState {
     admission_network_domain: Option<[u8; 32]>,
@@ -213,6 +218,20 @@ impl CommittedState {
                 return Err("local cache payload exceeds its limit".into());
             }
         }
+        let own: BTreeMap<u64, [u8; 32]> =
+            finality_engine.own_checkpoints().map(|c| (c.epoch, c.root)).collect();
+        if !own.is_empty() {
+            bytes.extend_from_slice(OWN_CHECKPOINT_SECTION);
+            if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
+                .serialize_into(&mut *bytes, &own) {
+                bytes.truncate(original_len);
+                return Err(error.to_string());
+            }
+            if bytes.len() - original_len > LIMIT as usize {
+                bytes.truncate(original_len);
+                return Err("local cache payload exceeds its limit".into());
+            }
+        }
         if let Some(fs) = finality_engine.finality_set() {
             bytes.extend_from_slice(FINALITY_SET_SECTION);
             if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
@@ -286,20 +305,16 @@ impl CommittedState {
     /// neither cached tree nodes nor a raw BlockId deserializer are trusted.
     pub fn decode_local_cache(bytes: &[u8], header: &BlockHeaderV4) -> Result<Self, String> {
         // The reader advances past the base payload; what remains is either
-        // nothing or exactly one L2 section (see `append_local_cache`).
+        // nothing or the optional sections below (see `append_local_cache`).
         let mut rest = bytes;
         let value: CachedState = bincode::DefaultOptions::new().with_limit(LIMIT)
             .deserialize_from(&mut rest).map_err(|e| e.to_string())?;
-        // Optional sections, in their only legal order: L2 [L2CP], then FSET.
+        // Optional sections, in their only legal order: L2 [L2CP], FFGO, FSET.
         let mut l2_settlement = None;
-        if !rest.is_empty() && !rest.starts_with(FINALITY_SET_SECTION) {
-            let mut section = rest.strip_prefix(L2_SECTION.as_slice())
-                .ok_or("unexpected bytes after the cached state")?;
+        if let Some(mut section) = rest.strip_prefix(L2_SECTION.as_slice()) {
             let mut l2: crate::l2_settlement::State = bincode::DefaultOptions::new().with_limit(LIMIT)
                 .deserialize_from(&mut section).map_err(|e| e.to_string())?;
-            if !section.is_empty() && !section.starts_with(FINALITY_SET_SECTION) {
-                let mut roots_section = section.strip_prefix(L2_CHECKPOINT_SECTION.as_slice())
-                    .ok_or("unexpected bytes after the cached L2 state")?;
+            if let Some(mut roots_section) = section.strip_prefix(L2_CHECKPOINT_SECTION.as_slice()) {
                 let roots: BTreeMap<u64, [u8; 32]> = bincode::DefaultOptions::new().with_limit(LIMIT)
                     .deserialize_from(&mut roots_section).map_err(|e| e.to_string())?;
                 if roots.is_empty() {
@@ -312,9 +327,18 @@ impl CommittedState {
             rest = section;
         }
         let mut finality_engine = value.finality_engine;
+        if let Some(mut section) = rest.strip_prefix(OWN_CHECKPOINT_SECTION.as_slice()) {
+            let roots: BTreeMap<u64, [u8; 32]> = bincode::DefaultOptions::new().with_limit(LIMIT)
+                .deserialize_from(&mut section).map_err(|e| e.to_string())?;
+            if roots.is_empty() {
+                return Err("empty cached own-checkpoint section".into());
+            }
+            finality_engine.restore_own_checkpoints(roots);
+            rest = section;
+        }
         if !rest.is_empty() {
             let fs_section = rest.strip_prefix(FINALITY_SET_SECTION.as_slice())
-                .ok_or("unexpected bytes after the cached L2 state")?;
+                .ok_or("unexpected bytes after the cached state")?;
             let fs: finality::FinalitySetState = bincode::DefaultOptions::new().with_limit(LIMIT)
                 .reject_trailing_bytes().deserialize(fs_section).map_err(|e| e.to_string())?;
             finality_engine.restore_finality_set(Some(fs));

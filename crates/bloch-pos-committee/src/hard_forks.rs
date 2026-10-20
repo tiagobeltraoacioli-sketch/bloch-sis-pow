@@ -16,7 +16,10 @@
 //!
 //! - **HF1.** The frozen finality set requires claim finality, armed no
 //!   later (`params::hf1_gates_coherent`). Claim finality may be armed alone
-//!   (HF1 security review, M-5).
+//!   (HF1 security review, M-5). Own-target votes require the frozen set,
+//!   armed no later (schedule O2: without a frozen denominator, filtering
+//!   foreign votes lowers counted participation on both sides of a split
+//!   and speeds up minority finality under the leak).
 //! - **HF2 after HF1.** An armed HF2 gate requires claim finality armed and
 //!   at least [`HF2_MIN_EPOCHS_AFTER_HF1`] epochs (24 h) after it, so a
 //!   replacement release can still move HF2 once HF1 is live (schedule O4).
@@ -69,6 +72,7 @@ pub const HARD_FORK_GATES: &[HardForkGate] = &[
     // HF1: L2 claim finality and the frozen finality set.
     gate!(Hf1, params::HF1_CLAIM_FINALITY_EPOCH, false),
     gate!(Hf1, params::HF1_FROZEN_FINALITY_SET_EPOCH, false),
+    gate!(Hf1, params::HF1_OWN_TARGET_VOTES_EPOCH, false),
     // HF2: slashing v2 (P5a evidence admission, node policy) and the
     // funded-activation growth cap.
     gate!(Hf2, params::HF2_SLASHING_V2_EPOCH, true),
@@ -94,13 +98,20 @@ pub const fn hf2_after_hf1(claim_finality: u64, hf2: u64) -> bool {
 }
 
 /// The ordering rules between all HF1/HF2/HF3 gates (see the module docs).
+/// `later` is inert, or `earlier` is armed at the same epoch or before it.
+pub const fn requires_no_later(earlier: u64, later: u64) -> bool {
+    !armed(later) || (armed(earlier) && earlier <= later)
+}
+
 pub const fn hard_fork_schedule_coherent(
     claim_finality: u64,
     frozen_set: u64,
+    own_target: u64,
     hf2_slashing: u64,
     hf2_growth_cap: u64,
 ) -> bool {
     params::hf1_gates_coherent(claim_finality, frozen_set)
+        && requires_no_later(frozen_set, own_target)
         && hf2_after_hf1(claim_finality, hf2_slashing)
         && hf2_after_hf1(claim_finality, hf2_growth_cap)
 }
@@ -108,6 +119,7 @@ pub const fn hard_fork_schedule_coherent(
 const _: () = assert!(hard_fork_schedule_coherent(
     params::HF1_CLAIM_FINALITY_EPOCH,
     params::HF1_FROZEN_FINALITY_SET_EPOCH,
+    params::HF1_OWN_TARGET_VOTES_EPOCH,
     params::HF2_SLASHING_V2_EPOCH,
     params::HF2_GROWTH_CAP_EPOCH,
 ));
@@ -125,6 +137,7 @@ mod tests {
         assert!(hard_fork_schedule_coherent(
             params::HF1_CLAIM_FINALITY_EPOCH,
             params::HF1_FROZEN_FINALITY_SET_EPOCH,
+            params::HF1_OWN_TARGET_VOTES_EPOCH,
             params::HF2_SLASHING_V2_EPOCH,
             params::HF2_GROWTH_CAP_EPOCH,
         ));
@@ -173,30 +186,39 @@ mod tests {
 
     #[test]
     fn claim_finality_may_ship_alone() {
-        assert!(hard_fork_schedule_coherent(6_460, M, M, M));
-        assert!(hard_fork_schedule_coherent(0, M, M, M));
+        assert!(hard_fork_schedule_coherent(6_460, M, M, M, M));
+        assert!(hard_fork_schedule_coherent(0, M, M, M, M));
     }
 
     #[test]
     fn frozen_set_needs_claim_finality_no_later() {
-        assert!(hard_fork_schedule_coherent(6_460, 6_460, M, M));
-        assert!(hard_fork_schedule_coherent(6_460, 6_466, M, M));
-        assert!(!hard_fork_schedule_coherent(M, 6_460, M, M));
-        assert!(!hard_fork_schedule_coherent(6_466, 6_460, M, M));
+        assert!(hard_fork_schedule_coherent(6_460, 6_460, M, M, M));
+        assert!(hard_fork_schedule_coherent(6_460, 6_466, M, M, M));
+        assert!(!hard_fork_schedule_coherent(M, 6_460, M, M, M));
+        assert!(!hard_fork_schedule_coherent(6_466, 6_460, M, M, M));
+    }
+
+    #[test]
+    fn own_target_needs_the_frozen_set_no_later() {
+        assert!(hard_fork_schedule_coherent(6_460, 6_460, 6_466, M, M));
+        assert!(hard_fork_schedule_coherent(6_460, 6_460, 6_460, M, M));
+        assert!(!hard_fork_schedule_coherent(6_460, M, 6_466, M, M));
+        assert!(!hard_fork_schedule_coherent(6_460, 6_470, 6_466, M, M));
+        assert!(!hard_fork_schedule_coherent(M, M, 6_466, M, M));
     }
 
     #[test]
     fn hf2_needs_hf1_a_day_earlier() {
-        assert!(hard_fork_schedule_coherent(6_460, M, 6_550, 6_550));
-        assert!(hard_fork_schedule_coherent(6_460, M, 6_550, M));
-        assert!(hard_fork_schedule_coherent(6_460, M, M, 6_550));
+        assert!(hard_fork_schedule_coherent(6_460, M, M, 6_550, 6_550));
+        assert!(hard_fork_schedule_coherent(6_460, M, M, 6_550, M));
+        assert!(hard_fork_schedule_coherent(6_460, M, M, M, 6_550));
         // HF2 without HF1.
-        assert!(!hard_fork_schedule_coherent(M, M, 6_550, M));
-        assert!(!hard_fork_schedule_coherent(M, M, M, 6_550));
+        assert!(!hard_fork_schedule_coherent(M, M, M, 6_550, M));
+        assert!(!hard_fork_schedule_coherent(M, M, M, M, 6_550));
         // Less than one day after HF1.
-        assert!(!hard_fork_schedule_coherent(6_460, M, 6_549, M));
-        assert!(!hard_fork_schedule_coherent(6_460, M, M, 6_460));
+        assert!(!hard_fork_schedule_coherent(6_460, M, M, 6_549, M));
+        assert!(!hard_fork_schedule_coherent(6_460, M, M, M, 6_460));
         // Saturation: claim finality near the top never wraps.
-        assert!(!hard_fork_schedule_coherent(M - 1, M, M - 2, M));
+        assert!(!hard_fork_schedule_coherent(M - 1, M, M, M - 2, M));
     }
 }

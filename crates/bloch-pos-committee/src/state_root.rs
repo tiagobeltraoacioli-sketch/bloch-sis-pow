@@ -1500,6 +1500,11 @@ pub struct FinalityRecord {
     /// `None` below the gate, and then NOTHING is appended to the leaf, so
     /// every historical root is byte-identical.
     pub finality_set: Option<FinalitySetRecord>,
+    /// The chain's own checkpoint roots the FFG tally reads, any order —
+    /// serialization sorts by epoch. Empty below
+    /// `params::HF1_OWN_TARGET_VOTES_EPOCH`, and then not written at
+    /// all, so every earlier leaf keeps its bytes. At most two entries.
+    pub own_checkpoints: Vec<CheckpointRecord>,
 }
 
 /// The frozen finality set, its pending handoff candidate and the presence
@@ -1571,9 +1576,24 @@ impl FinalityRecord {
         if let Some(fs) = &self.finality_set {
             fs.write_into(&mut s);
         }
+        // Trailing, tagged, absent while empty: below the gate the leaf is
+        // byte-identical to the one every historical header commits.
+        if !self.own_checkpoints.is_empty() {
+            let mut own = self.own_checkpoints.clone();
+            own.sort_by_key(|c| c.epoch);
+            s.extend_from_slice(OWN_CHECKPOINTS_TAG);
+            s.extend_from_slice(&(own.len() as u64).to_le_bytes());
+            for c in &own {
+                c.write_into(&mut s);
+            }
+        }
         s
     }
 }
+
+/// Marks the optional own-checkpoint section of the finality leaf
+/// (`params::HF1_OWN_TARGET_VOTES_EPOCH`).
+pub const OWN_CHECKPOINTS_TAG: &[u8] = b"BLOCH:FINALITY:OWN-CHECKPOINTS:1";
 
 /// One epoch-boundary vote awaiting the finality tally, committed per entry
 /// under [`TAG_PENDING_VOTE`]. Keyed by `(validator, signing_root)` — exactly
@@ -3426,6 +3446,7 @@ mod tests {
             leaked: vec![LeakRecord { validator: 3, leaked_sat: 77 }],
             next_epoch: 43,
             finality_set: None,
+            own_checkpoints: Vec::new(),
         };
         let pending_votes: Vec<PendingVoteRecord> = (0..3u32)
             .map(|i| PendingVoteRecord {
@@ -4203,6 +4224,42 @@ mod tests {
         assert_eq!(total_effective_stake(&validators), 3u128 * u64::MAX as u128);
     }
 
+    /// HF1 integration (review L-3): the frozen-set and own-checkpoint
+    /// extensions of the finality leaf have one fixed order (FSET, then
+    /// OWN-CHECKPOINTS, as `wire_alloc::finality_leaf` records), and either
+    /// one alone keeps exactly the bytes it has on its own.
+    #[test]
+    fn finality_leaf_extensions_have_one_order_and_compose() {
+        let base = FinalityRecord {
+            justified: vec![CheckpointRecord { epoch: 3, root: [3; 32] }],
+            current_justified: CheckpointRecord { epoch: 3, root: [3; 32] },
+            previous_justified: CheckpointRecord { epoch: 2, root: [2; 32] },
+            finalized: CheckpointRecord { epoch: 2, root: [2; 32] },
+            leaked: Vec::new(),
+            next_epoch: 4,
+            finality_set: None,
+            own_checkpoints: Vec::new(),
+        };
+        let legacy = base.serialize();
+        let fs = FinalitySetRecord { current_epoch: 2, current: vec![(0, 100), (1, 100)], pending: None, last_seen: vec![] };
+        let own = vec![CheckpointRecord { epoch: 3, root: [3; 32] }, CheckpointRecord { epoch: 4, root: [4; 32] }];
+        let mut only_fs = base.clone();
+        only_fs.finality_set = Some(fs.clone());
+        let mut only_own = base.clone();
+        only_own.own_checkpoints = own.clone();
+        let mut both = base.clone();
+        both.finality_set = Some(fs);
+        both.own_checkpoints = own;
+        let (a, b, c) = (only_fs.serialize(), only_own.serialize(), both.serialize());
+        assert!(a.starts_with(&legacy) && b.starts_with(&legacy) && c.starts_with(&legacy));
+        let fs_ext = &a[legacy.len()..];
+        let own_ext = &b[legacy.len()..];
+        assert!(fs_ext.starts_with(crate::wire_alloc::finality_leaf::FINALITY_SET));
+        assert!(own_ext.starts_with(crate::wire_alloc::finality_leaf::OWN_CHECKPOINTS));
+        // Both: exactly FSET's bytes, then OWN's bytes.
+        assert_eq!(c, [legacy.as_slice(), fs_ext, own_ext].concat());
+    }
+
     /// Frozen finality set: `None` appends nothing (every pre-gate leaf is
     /// the legacy bytes); `Some` extends the leaf and is order-insensitive.
     #[test]
@@ -4215,6 +4272,7 @@ mod tests {
             leaked: vec![LeakRecord { validator: 1, leaked_sat: 5 }],
             next_epoch: 4,
             finality_set: None,
+            own_checkpoints: Vec::new(),
         };
         let legacy = base.serialize();
         assert_eq!(legacy.len(), 8 + 40 + 40 * 3 + 8 + 12 + 8);

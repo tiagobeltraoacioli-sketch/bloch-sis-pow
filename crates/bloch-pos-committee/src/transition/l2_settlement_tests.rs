@@ -3315,40 +3315,66 @@ mod l2_tests {
         /// last block before E's first slot, the convention
         /// `Engine::checkpoint_root` votes) differ. Every vote of epochs E
         /// and E+1 targets A's checkpoints, and B's blocks carry those votes
-        /// too: the 2026-10-13 shape, a branch that hears the other side's
+        /// too: a branch that hears the other side's
         /// attestations. After the first block of E+2 BOTH branches have
         /// finalized (E, A's checkpoint).
         pub(super) fn split() -> Split {
+            let split = split_mixed(usize::MAX);
+            let (a, b, a_cp) = (&split.a, &split.b, split.a_cp);
+            let fin = Checkpoint { epoch: E, root: a_cp };
+            assert_eq!(a.finality().finalized, fin);
+            assert_eq!(b.finality().finalized, fin, "B finalized A's checkpoint, which is not on B");
+            split
+        }
+
+        /// The split, with the `foreign_on_b` lowest-index voters of every
+        /// epoch on B voting A's checkpoints (the votes B hears from the other side)
+        /// and the rest voting B's own. `usize::MAX`: every vote on B is A's,
+        /// the shape [`split`] reproduces. No assertion on the
+        /// outcome: callers assert under the rules they run.
+        pub(super) fn split_mixed(foreign_on_b: usize) -> Split {
             let (p, mut ca) = parent();
             let mut cb = fork_chains(&ca);
             let a = block_with(&p, first(E) - 1, &[], &[], &mut ca).unwrap();
             let b = block_with(&p, first(E) - 2, &[], &[], &mut cb).unwrap();
             let (a_cp, b_cp) = (*a.head.as_bytes(), *b.head.as_bytes());
             assert_ne!(a_cp, b_cp);
+            // By validator index, so the same validators are the foreign
+            // voters in every epoch.
+            let mixed = |b: &CommittedState, foreign: [u8; 32], own: [u8; 32]| -> Vec<Vote> {
+                let mut f = full_epoch_attestations(b, foreign);
+                let mut o = full_epoch_attestations(b, own);
+                f.sort_by_key(|v| v.validator);
+                o.sort_by_key(|v| v.validator);
+                f.into_iter()
+                    .zip(o)
+                    .enumerate()
+                    .map(|(i, (f, o))| if i < foreign_on_b { f } else { o })
+                    .collect()
+            };
 
-            // Epoch E: votes for A's checkpoint, on both branches.
+            // Epoch E: votes for A's checkpoint on A; on B, A's checkpoint
+            // from the first `foreign_on_b` voters.
             let a = block_with(&a, first(E), &[], &[], &mut ca).unwrap();
             let b = block_with(&b, first(E) + 1, &[], &[], &mut cb).unwrap();
             let va = full_epoch_attestations(&a, a_cp);
-            let vb = full_epoch_attestations(&b, a_cp);
+            let vb = mixed(&b, a_cp, b_cp);
             let a = block_with(&a, first(E + 1) - 1, &va, &[], &mut ca).unwrap();
             let b = block_with(&b, first(E + 1) - 1, &vb, &[], &mut cb).unwrap();
-            let a_next = *a.head.as_bytes();
+            let (a_next, b_next) = (*a.head.as_bytes(), *b.head.as_bytes());
 
             // Epoch E+1: votes for A's next checkpoint, sourcing (E, A's).
             let a = block_with(&a, first(E + 1), &[], &[], &mut ca).unwrap();
             let b = block_with(&b, first(E + 1), &[], &[], &mut cb).unwrap();
-            assert_eq!(b.finality().justified, Checkpoint { epoch: E, root: a_cp });
+            if foreign_on_b == usize::MAX && !crate::params::own_target_votes_test::forced() {
+                assert_eq!(b.finality().justified, Checkpoint { epoch: E, root: a_cp });
+            }
             let va = full_epoch_attestations(&a, a_next);
-            let vb = full_epoch_attestations(&b, a_next);
+            let vb = mixed(&b, a_next, b_next);
             let a = block_with(&a, first(E + 2) - 1, &va, &[], &mut ca).unwrap();
             let b = block_with(&b, first(E + 2) - 1, &vb, &[], &mut cb).unwrap();
             let a = block_with(&a, first(E + 2), &[], &[], &mut ca).unwrap();
             let b = block_with(&b, first(E + 2), &[], &[], &mut cb).unwrap();
-
-            let fin = Checkpoint { epoch: E, root: a_cp };
-            assert_eq!(a.finality().finalized, fin);
-            assert_eq!(b.finality().finalized, fin, "B finalized A's checkpoint, which is not on B");
             Split { a, b, ca, cb, a_cp, b_cp }
         }
 
@@ -3444,6 +3470,141 @@ mod l2_tests {
         }
     }
 
+    // ── FFG counts only votes naming the chain's own checkpoints ──
+    // (`params::HF1_OWN_TARGET_VOTES_EPOCH`, hard fork 1)
+
+    /// Per-validator bond, the ledger pre-decouple issuance compounds into.
+    fn stakes(st: &CommittedState) -> BTreeMap<u32, u128> {
+        st.validators.iter().map(|(i, r)| (*i, r.staked_sat)).collect()
+    }
+
+    /// Validators whose bond grew from `from` to `to`: those credited with
+    /// issuance at a boundary in between (no fees in these fixtures).
+    fn credited(from: &CommittedState, to: &CommittedState) -> BTreeSet<u32> {
+        let (f, t) = (stakes(from), stakes(to));
+        t.iter().filter(|(i, s)| f.get(i).is_some_and(|b| *s > b)).map(|(i, _)| *i).collect()
+    }
+
+    fn justified_epochs(st: &CommittedState) -> Vec<u64> {
+        st.finality_engine.justified_checkpoints().map(|c| c.epoch).collect()
+    }
+
+    /// The reproduction, under the own-target rule: the minority branch B
+    /// carries every one of A's votes and finalizes NOTHING of A's — no A
+    /// root is justified on B, B's finality does not move, and B's voters
+    /// (all naming A's checkpoints) are absent for issuance. A, the branch
+    /// whose checkpoints the votes name, finalizes (E, A's) exactly as
+    /// before. Every justified root on either branch is that branch's own.
+    #[test]
+    fn own_target_rule_stops_the_minority_branch_finalizing_the_majority_root() {
+        let e = split_claims::E;
+        let (parent, _) = split_claims::parent();
+        let before = split_claims::split_mixed(usize::MAX);
+        let _rule = crate::params::own_target_votes_test::open();
+        let (gated_parent, _) = split_claims::parent();
+        let after = split_claims::split_mixed(usize::MAX);
+        // The committed own roots change every block id above the gate, so
+        // each run is compared with its own checkpoints, epochs with epochs.
+        let (a_cp, b_cp) = (after.a_cp, after.b_cp);
+
+        // Below the gate (the reproduction): B finalized A's root.
+        assert_eq!(before.b.finality().finalized, Checkpoint { epoch: e, root: before.a_cp });
+
+        // A: unchanged finality, issuance and leak.
+        assert_eq!(after.a.finality().finalized, Checkpoint { epoch: e, root: a_cp });
+        assert_eq!(justified_epochs(&after.a), justified_epochs(&before.a));
+        assert_eq!(after.a.issued_sat, before.a.issued_sat);
+        assert_eq!(after.a.finality_engine.leaked_total(), before.a.finality_engine.leaked_total());
+
+        // B: nothing of A's justifies, finality stays where the split began.
+        assert!(!after.b.finality_engine.is_justified(&crate::finality::Checkpoint { epoch: e, root: a_cp }));
+        assert_eq!(justified_epochs(&after.b), justified_epochs(&gated_parent));
+        assert!(after.b.finality().finalized.epoch < e);
+        assert_eq!(after.b.finality().finalized, gated_parent.finality().finalized);
+        assert_eq!(after.b.finality().justified, gated_parent.finality().justified);
+        // Each branch recorded ITS OWN checkpoint of E and the justified one
+        // it still needs: at most two entries.
+        assert!(after.a.own_checkpoint_root(e + 2).is_some());
+        for st in [&after.a, &after.b] {
+            assert!(st.finality_engine.own_checkpoints().count() <= 2);
+            let fin = st.finality();
+            if fin.justified.epoch >= 1 {
+                assert_eq!(st.own_checkpoint_root(fin.justified.epoch), Some(fin.justified.root));
+            }
+        }
+        assert_ne!(after.b.own_checkpoint_root(e + 2), after.a.own_checkpoint_root(e + 2));
+        assert_ne!(a_cp, b_cp);
+
+        // Issuance: every voter on A is credited at E and E+1; on B, below
+        // the gate, too — above it, none (their votes named A's checkpoints).
+        assert_eq!(credited(&parent, &before.b).len(), 4);
+        assert_eq!(credited(&gated_parent, &after.a).len(), 4);
+        assert!(credited(&gated_parent, &after.b).is_empty(), "foreign votes earn no credit");
+        assert!(after.b.issued_sat < before.b.issued_sat);
+        // Inclusion is still recorded: the votes are valid in B's blocks.
+        assert_eq!(after.b.previous_participation.values().filter(|v| **v).count(), 4);
+    }
+
+    /// Mixed: B hears three of A's four voters plus one own voter. Below the
+    /// gate the three foreign votes (3/4 >= 2/3) justify and finalize A's
+    /// root on B; above it only the own vote counts (1/4), nothing
+    /// justifies, and only the own voter is credited.
+    #[test]
+    fn own_target_rule_with_a_foreign_majority_on_the_branch() {
+        let e = split_claims::E;
+        let before = split_claims::split_mixed(3);
+        assert_eq!(before.b.finality().finalized, Checkpoint { epoch: e, root: before.a_cp });
+        let _rule = crate::params::own_target_votes_test::open();
+        let (gated_parent, _) = split_claims::parent();
+        let after = split_claims::split_mixed(3);
+        assert!(after.b.finality().finalized.epoch < e);
+        assert!(!after.b.finality_engine.is_justified(&crate::finality::Checkpoint { epoch: e, root: after.a_cp }));
+        assert!(!after.b.finality_engine.is_justified(&crate::finality::Checkpoint { epoch: e, root: after.b_cp }));
+        assert_eq!(credited(&gated_parent, &after.b).len(), 1, "only the own voter is credited");
+        // A is untouched by what B carries.
+        assert_eq!(after.a.finality().finalized, Checkpoint { epoch: e, root: after.a_cp });
+    }
+
+    /// Mixed: B hears one of A's voters and three own. Its own checkpoint
+    /// justifies and finalizes under both rules; the one foreign voter is
+    /// credited below the gate and not above it.
+    #[test]
+    fn own_target_rule_with_an_own_majority_on_the_branch() {
+        let e = split_claims::E;
+        let (parent, _) = split_claims::parent();
+        let before = split_claims::split_mixed(1);
+        let fin_b = Checkpoint { epoch: e, root: before.b_cp };
+        assert_eq!(before.b.finality().finalized, fin_b);
+        assert_eq!(credited(&parent, &before.b).len(), 4);
+        let _rule = crate::params::own_target_votes_test::open();
+        let (gated_parent, _) = split_claims::parent();
+        let after = split_claims::split_mixed(1);
+        assert_eq!(after.b.finality().finalized, Checkpoint { epoch: e, root: after.b_cp });
+        assert_eq!(after.b.finality().finalized.epoch, fin_b.epoch);
+        assert_eq!(justified_epochs(&after.b), justified_epochs(&before.b));
+        // Every justified checkpoint on B is B's own: E's is b_cp.
+        assert!(after.b.finality_engine.is_justified(&crate::finality::Checkpoint { epoch: e, root: after.b_cp }));
+        assert_eq!(credited(&gated_parent, &after.b).len(), 3, "the foreign voter is absent");
+        assert!(after.b.issued_sat < before.b.issued_sat);
+    }
+
+    /// Below the gate (the default, `u64::MAX`) nothing is recorded: the
+    /// finality leaf, hence every state root, and the cache keep their bytes.
+    #[test]
+    fn below_the_own_target_gate_nothing_is_recorded() {
+        assert_eq!(crate::params::HF1_OWN_TARGET_VOTES_EPOCH, u64::MAX);
+        let split_claims::Split { a, b, .. } = split_claims::split();
+        for st in [&a, &b] {
+            assert_eq!(st.finality_engine.own_checkpoints().count(), 0);
+            assert_eq!(st.own_checkpoint_root(st.epoch), None);
+        }
+        #[cfg(feature = "local-state-cache")]
+        {
+            let (_, bytes, _) = local_cache_round_trip(&a);
+            assert!(!bytes.windows(16).any(|w| w == b"BPOSST01:FFGO:v1"));
+        }
+    }
+
     #[test]
     fn native_claim_finality_gate_is_inert() {
         assert_eq!(crate::params::HF1_CLAIM_FINALITY_EPOCH, u64::MAX);
@@ -3509,7 +3670,84 @@ mod l2_tests {
         assert_eq!(l2.checkpoint_root(198), Some([198; 32]));
     }
 
-    // Adversarial multi-branch FFG suite (p2b, 2026-10-19).
+    #[test]
+    fn hf1_own_target_votes_gate_is_inert() {
+        assert_eq!(crate::params::HF1_OWN_TARGET_VOTES_EPOCH, u64::MAX);
+        for epoch in [0, 5_850, 10_000, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::own_target_votes_active(epoch));
+        }
+    }
+
+    /// The own checkpoints change the state root (they are committed) and
+    /// survive the restart cache in their own trailing section, after the L2
+    /// ones.
+    #[test]
+    fn own_checkpoints_are_committed_and_cached() {
+        let _rule = crate::params::own_target_votes_test::open();
+        let split_claims::Split { a, .. } = split_claims::split_mixed(usize::MAX);
+        assert!(a.finality_engine.own_checkpoints().count() >= 1);
+        let mut stripped = a.clone();
+        stripped.finality_engine.set_own_checkpoints_for_test(BTreeMap::new());
+        assert_ne!(stripped.state_root(), a.state_root());
+        #[cfg(feature = "local-state-cache")]
+        {
+            let (_, bytes, _) = local_cache_round_trip(&a);
+            assert!(bytes.windows(16).any(|w| w == b"BPOSST01:FFGO:v1"));
+        }
+    }
+
+    /// The own-checkpoint cache section without an L2 section before it (a
+    /// network without L2): restored after the base payload; an empty
+    /// section, trailing bytes, or the sections out of order are refused.
+    #[test]
+    #[cfg(feature = "local-state-cache")]
+    fn own_checkpoints_are_cached_without_l2() {
+        use bincode::Options;
+        let (mut st, _, _) = funded_running_without_l2();
+        assert!(st.l2_settlement().is_none());
+        let plain = local_cache_round_trip(&st).1;
+        st.finality_engine.set_own_checkpoints_for_test(BTreeMap::from([(7, [7; 32]), (9, [9; 32])]));
+        let (st, bytes, header) = local_cache_round_trip(&st);
+        let marker: &[u8] = b"BPOSST01:FFGO:v1";
+        let at = bytes.windows(16).position(|w| w == marker).expect("own-checkpoint section");
+        assert_eq!(at, plain.len(), "right after the base payload");
+        assert!(!bytes.windows(14).any(|w| w == b"BPOSST01:L2:v1"));
+        let restored = CommittedState::decode_local_cache(&bytes, &header).unwrap();
+        assert_eq!(restored.own_checkpoint_root(9), Some([9; 32]));
+        assert_eq!(restored.state_root(), st.state_root());
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(CommittedState::decode_local_cache(&trailing, &header).is_err());
+        let mut empty = bytes[..at + 16].to_vec();
+        bincode::DefaultOptions::new()
+            .serialize_into(&mut empty, &BTreeMap::<u64, [u8; 32]>::new())
+            .unwrap();
+        assert!(CommittedState::decode_local_cache(&empty, &header).is_err());
+        let mut twice = bytes.clone();
+        twice.extend_from_slice(&bytes[at..]);
+        assert!(CommittedState::decode_local_cache(&twice, &header).is_err());
+    }
+
+    /// With L2 present the own-checkpoint section follows the L2 one, and an
+    /// L2 section after it is refused.
+    #[test]
+    #[cfg(feature = "local-state-cache")]
+    fn own_checkpoints_section_follows_the_l2_section() {
+        let (mut st, _) = split_claims::parent();
+        assert!(st.l2_settlement().is_some());
+        st.finality_engine.set_own_checkpoints_for_test(BTreeMap::from([(2, [2; 32])]));
+        let (_, bytes, header) = local_cache_round_trip(&st);
+        let l2 = bytes.windows(14).position(|w| w == b"BPOSST01:L2:v1").unwrap();
+        let own = bytes.windows(16).position(|w| w == b"BPOSST01:FFGO:v1").unwrap();
+        assert!(l2 < own);
+        let mut swapped = bytes[..l2].to_vec();
+        swapped.extend_from_slice(&bytes[own..]);
+        swapped.extend_from_slice(&bytes[l2..own]);
+        assert!(CommittedState::decode_local_cache(&swapped, &header).is_err());
+    }
+
+    // Adversarial multi-branch FFG suite (p2b).
     mod ffg_branch_tests {
         use super::*;
         include!("ffg_branch_tests.rs");

@@ -207,6 +207,17 @@ pub struct FinalityState {
     /// keep decoding.
     #[cfg_attr(feature = "local-state-cache", serde(skip))]
     finality_set: Option<Box<FinalitySetState>>,
+    /// The chain's OWN checkpoint roots (epoch -> root), recorded by the
+    /// transition at each epoch boundary from
+    /// `params::HF1_OWN_TARGET_VOTES_EPOCH` and empty before it. From
+    /// that gate a vote counts only if its target is the own root of the
+    /// epoch being tallied and its source the own root of the source epoch.
+    /// At most two entries (see [`FinalityState::record_own_checkpoint`]).
+    /// Committed in the finality leaf (last, absent while empty); the local
+    /// cache carries it in its own trailing section, so the cached bytes of
+    /// this struct do not change.
+    #[cfg_attr(feature = "local-state-cache", serde(skip))]
+    own_checkpoints: BTreeMap<u64, [u8; 32]>,
 }
 
 /// A frozen `(validator -> stake)` map: the denominator and the vote weights
@@ -256,6 +267,7 @@ impl FinalityState {
             leaked: BTreeMap::new(),
             next_epoch: genesis.epoch + 1,
             finality_set: None,
+            own_checkpoints: BTreeMap::new(),
         }
     }
 
@@ -520,6 +532,33 @@ impl FinalityState {
             })
             .collect();
 
+        // Own chain only (`params::HF1_OWN_TARGET_VOTES_EPOCH`).
+        // Without ancestry the tally above would let a branch carrying the
+        // other side's votes justify — and finalize — the other side's
+        // checkpoint. From the gate a vote counts only if it names this
+        // chain's own checkpoints: target = the own root recorded at the
+        // boundary that opened this epoch, source = the own root of the
+        // source epoch when one is recorded. A source justified before the
+        // gate has no recorded root; its votes may still justify an own
+        // target (or the chain could never justify again), but the link is
+        // not trusted to finalize it (`source_is_own` below). After the
+        // gate every justified checkpoint passed this filter, so the source
+        // check is the induction's base case plus defence in depth.
+        //
+        // A filtered vote is ABSENT for everything below: no quorum weight,
+        // leak during a stall, no recovery — the same as not voting.
+        let own_rule = crate::params::own_target_votes_active(votes.epoch);
+        let own_target = self.own_checkpoints.get(&votes.epoch).copied();
+        let own_source = self.own_checkpoints.get(&source.epoch).copied();
+        let mut valid = valid;
+        if own_rule {
+            valid.retain(|_, d| {
+                Some(d.target_root) == own_target
+                    && own_source.is_none_or(|root| root == d.source_root)
+            });
+        }
+        let source_is_own = !own_rule || own_source == Some(source.root);
+
         // ── 2. Justify / finalize ──────────────────────────────────────────
         let mut tally: BTreeMap<[u8; 32], u128> = BTreeMap::new();
         // Cannot overflow: `valid` is keyed by u32 validator index, so a tally
@@ -572,6 +611,7 @@ impl FinalityState {
             // unequal instead of panicking.
             if source.epoch.checked_add(1) == Some(cp.epoch)
                 && source.epoch > self.finalized.epoch
+                && source_is_own
             {
                 self.finalized = source;
                 finalized_now = Some(source);
@@ -827,6 +867,48 @@ impl FinalityState {
         }
         fs.pending = Some(Self::snapshot(votes, &fs.last_seen));
     }
+
+    /// Record `root` as this chain's own checkpoint of `epoch`, the epoch the
+    /// boundary opens (`params::HF1_OWN_TARGET_VOTES_EPOCH`; the
+    /// transition is the only caller, after the closing epoch's tally).
+    ///
+    /// Retention: the tally of an epoch reads exactly two roots — its own
+    /// (recorded when it opened, i.e. the newest entry) and the source's,
+    /// which is always `current_justified` (the uniform-link rule). The
+    /// justified checkpoint only moves inside `process_epoch`, which runs
+    /// before the next record, so keeping {`epoch`, `current_justified.epoch`}
+    /// keeps every root a later tally can read: at most two entries
+    /// (2 × 40 committed bytes), whatever the length of a stall. Older roots
+    /// are not needed — a vote naming an older source is already discarded by
+    /// the uniform-link rule.
+    pub fn record_own_checkpoint(&mut self, epoch: u64, root: [u8; 32]) {
+        self.own_checkpoints.insert(epoch, root);
+        let justified = self.current_justified.epoch;
+        self.own_checkpoints.retain(|e, _| *e == epoch || *e == justified);
+    }
+
+    /// This chain's own checkpoint root of `epoch`, if recorded.
+    pub fn own_checkpoint_root(&self, epoch: u64) -> Option<[u8; 32]> {
+        self.own_checkpoints.get(&epoch).copied()
+    }
+
+    /// The recorded own checkpoints, in epoch order — read by the state
+    /// commitment and the local cache only.
+    pub fn own_checkpoints(&self) -> impl Iterator<Item = Checkpoint> + '_ {
+        self.own_checkpoints.iter().map(|(epoch, root)| Checkpoint { epoch: *epoch, root: *root })
+    }
+
+    /// Local-cache restore only; the state-root check that follows a restore
+    /// authenticates what is put back.
+    #[cfg(feature = "local-state-cache")]
+    pub fn restore_own_checkpoints(&mut self, roots: BTreeMap<u64, [u8; 32]>) {
+        self.own_checkpoints = roots;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_own_checkpoints_for_test(&mut self, roots: BTreeMap<u64, [u8; 32]>) {
+        self.own_checkpoints = roots;
+    }
 }
 
 #[cfg(test)]
@@ -860,6 +942,176 @@ mod tests {
                 target_root: target,
             },
         )
+    }
+
+    // ── Own-chain checkpoints (params::HF1_OWN_TARGET_VOTES_EPOCH) ──
+
+    /// One epoch with the own-target rule on and `own` recorded as this
+    /// chain's checkpoint of `epoch` (what the transition does at the
+    /// boundary that opens it).
+    fn own_epoch(
+        st: &mut FinalityState,
+        epoch: u64,
+        own: [u8; 32],
+        committee: &[Validator],
+        atts: &[(u32, AttestationData)],
+    ) -> EpochOutcome {
+        st.record_own_checkpoint(epoch, own);
+        st.process_epoch(&EpochVotes { epoch, active_set: committee, attestations: atts }).unwrap()
+    }
+
+    /// The tally without ancestry, below the gate: a supermajority naming a
+    /// root this chain does not have justifies it, and the next epoch
+    /// finalizes it. Above the gate the same votes are absent.
+    #[test]
+    fn own_target_rule_refuses_a_foreign_supermajority() {
+        let committee = [validator(0, 100), validator(1, 100), validator(2, 100)];
+        let foreign = root(0xF1);
+        let atts1 = [vote(0, 1, foreign, genesis()), vote(1, 1, foreign, genesis()), vote(2, 1, foreign, genesis())];
+        let fcp = Checkpoint { epoch: 1, root: foreign };
+        let atts2 = [vote(0, 2, root(0xF2), fcp), vote(1, 2, root(0xF2), fcp), vote(2, 2, root(0xF2), fcp)];
+
+        let mut legacy = FinalityState::new(genesis());
+        legacy.process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts1 }).unwrap();
+        legacy.process_epoch(&EpochVotes { epoch: 2, active_set: &committee, attestations: &atts2 }).unwrap();
+        assert_eq!(legacy.finalized(), fcp, "below the gate the foreign root finalizes");
+
+        let _rule = crate::params::own_target_votes_test::open();
+        let mut st = FinalityState::new(genesis());
+        assert_eq!(own_epoch(&mut st, 1, root(1), &committee, &atts1).justified, None);
+        assert_eq!(own_epoch(&mut st, 2, root(2), &committee, &atts2).justified, None);
+        assert_eq!(st.current_justified(), genesis());
+        assert_eq!(st.finalized(), genesis());
+    }
+
+    /// Normal finality is unchanged: own votes justify and finalize exactly
+    /// as below the gate, and the justified checkpoints are the own ones.
+    #[test]
+    fn own_target_rule_keeps_normal_finality() {
+        let committee = [validator(0, 100), validator(1, 100), validator(2, 100)];
+        let epoch_votes = |e: u64| -> Vec<(u32, AttestationData)> {
+            let source = if e == 1 { genesis() } else { Checkpoint { epoch: e - 1, root: root((e - 1) as u8) } };
+            (0..3).map(|v| vote(v, e, root(e as u8), source)).collect()
+        };
+        let mut legacy = FinalityState::new(genesis());
+        let legacy_out: Vec<EpochOutcome> = (1..=6u64)
+            .map(|e| legacy.process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &epoch_votes(e) }).unwrap())
+            .collect();
+        let _rule = crate::params::own_target_votes_test::open();
+        let mut st = FinalityState::new(genesis());
+        for e in 1..=6u64 {
+            let out = own_epoch(&mut st, e, root(e as u8), &committee, &epoch_votes(e));
+            assert_eq!(out, legacy_out[(e - 1) as usize], "epoch {e}");
+            assert!(st.own_checkpoints().count() <= 2);
+        }
+        assert_eq!(st.finalized(), Checkpoint { epoch: 5, root: root(5) });
+        assert_eq!(st.finalized(), legacy.finalized());
+        assert_eq!(st.justified_checkpoints().collect::<Vec<_>>(), legacy.justified_checkpoints().collect::<Vec<_>>());
+    }
+
+    /// Mixed epoch: 2/3 own + 1/3 foreign justifies the own root; 1/3 own +
+    /// 2/3 foreign justifies nothing (below the gate it would justify the
+    /// foreign root). A double voter (own and foreign) counts for neither.
+    #[test]
+    fn own_target_rule_mixed_votes() {
+        let committee = [validator(0, 100), validator(1, 100), validator(2, 100)];
+        let _rule = crate::params::own_target_votes_test::open();
+        let own = root(1);
+        let foreign = root(0xF1);
+
+        let mut st = FinalityState::new(genesis());
+        let atts = [vote(0, 1, own, genesis()), vote(1, 1, own, genesis()), vote(2, 1, foreign, genesis())];
+        assert_eq!(own_epoch(&mut st, 1, own, &committee, &atts).justified, Some(Checkpoint { epoch: 1, root: own }));
+
+        let mut st = FinalityState::new(genesis());
+        let atts = [vote(0, 1, own, genesis()), vote(1, 1, foreign, genesis()), vote(2, 1, foreign, genesis())];
+        assert_eq!(own_epoch(&mut st, 1, own, &committee, &atts).justified, None);
+
+        let mut st = FinalityState::new(genesis());
+        let atts = [
+            vote(0, 1, own, genesis()), vote(1, 1, own, genesis()),
+            vote(1, 1, foreign, genesis()), vote(2, 1, own, genesis()),
+        ];
+        let out = own_epoch(&mut st, 1, own, &committee, &atts);
+        assert_eq!(out.equivocators, vec![1]);
+        assert_eq!(out.justified, Some(Checkpoint { epoch: 1, root: own }));
+    }
+
+    /// The activation boundary: the justified checkpoint inherited from
+    /// before the gate has no recorded own root. Votes sourcing it still
+    /// justify an own target (otherwise the chain could never justify
+    /// again), but that link does not finalize the unverified source; the
+    /// next own link finalizes the first own checkpoint, one epoch later.
+    #[test]
+    fn own_target_rule_does_not_finalize_an_unrecorded_source() {
+        let committee = [validator(0, 100), validator(1, 100), validator(2, 100)];
+        let mut st = FinalityState::new(genesis());
+        let atts: Vec<_> = (0..3).map(|v| vote(v, 1, root(1), genesis())).collect();
+        st.process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts }).unwrap();
+        let pre_gate = Checkpoint { epoch: 1, root: root(1) };
+        assert_eq!(st.current_justified(), pre_gate);
+
+        let _rule = crate::params::own_target_votes_test::open();
+        let atts: Vec<_> = (0..3).map(|v| vote(v, 2, root(2), pre_gate)).collect();
+        let out = own_epoch(&mut st, 2, root(2), &committee, &atts);
+        assert_eq!(out.justified, Some(Checkpoint { epoch: 2, root: root(2) }));
+        assert_eq!(out.finalized, None, "an unrecorded source is not finalized");
+        let atts: Vec<_> = (0..3).map(|v| vote(v, 3, root(3), Checkpoint { epoch: 2, root: root(2) })).collect();
+        let out = own_epoch(&mut st, 3, root(3), &committee, &atts);
+        assert_eq!(out.finalized, Some(Checkpoint { epoch: 2, root: root(2) }));
+    }
+
+    /// Fail closed: with the rule on and no own root recorded for the epoch,
+    /// no vote counts.
+    #[test]
+    fn own_target_rule_without_a_record_counts_nothing() {
+        let committee = [validator(0, 100), validator(1, 100), validator(2, 100)];
+        let _rule = crate::params::own_target_votes_test::open();
+        let mut st = FinalityState::new(genesis());
+        let atts: Vec<_> = (0..3).map(|v| vote(v, 1, root(1), genesis())).collect();
+        let out = st.process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts }).unwrap();
+        assert_eq!(out.justified, None);
+    }
+
+    /// Leak accounting: during a stall a validator voting a foreign
+    /// checkpoint is charged exactly as one that did not vote, and does not
+    /// recover; an own voter is spared.
+    #[test]
+    fn foreign_voters_leak_like_absentees() {
+        let committee = [validator(0, 50_000_000), validator(1, 25_000_000), validator(2, 25_000_000)];
+        let _rule = crate::params::own_target_votes_test::open();
+        let mut st = FinalityState::new(genesis());
+        for e in 1..=(INACTIVITY_LEAK_THRESHOLD_EPOCHS + 6) {
+            // 0 votes own (50%: no quorum), 1 votes the other side, 2 is silent.
+            let atts = [vote(0, e, root(e as u8), genesis()), vote(1, e, root(0xF0), genesis())];
+            own_epoch(&mut st, e, root(e as u8), &committee, &atts);
+        }
+        assert_eq!(st.finalized(), genesis());
+        assert_eq!(st.leaked_of(0), 0, "the own voter is spared");
+        assert!(st.leaked_of(1) > 0);
+        assert_eq!(st.leaked_of(1), st.leaked_of(2), "a foreign vote is an absence");
+    }
+
+    /// Storage bound: whatever the stall, at most two own roots are kept —
+    /// the newest (the epoch being tallied next) and the justified one (the
+    /// only admissible source).
+    #[test]
+    fn own_checkpoints_stay_at_two_through_a_stall() {
+        let mut st = FinalityState::new(genesis());
+        let committee = [validator(0, 100), validator(1, 100), validator(2, 100)];
+        let _rule = crate::params::own_target_votes_test::open();
+        let atts: Vec<_> = (0..3).map(|v| vote(v, 1, root(1), genesis())).collect();
+        own_epoch(&mut st, 1, root(1), &committee, &atts);
+        for e in 2..200u64 {
+            own_epoch(&mut st, e, root(e as u8), &committee, &[]);
+            assert!(st.own_checkpoints().count() <= 2);
+        }
+        st.record_own_checkpoint(200, root(200));
+        assert_eq!(
+            st.own_checkpoints().map(|c| c.epoch).collect::<Vec<_>>(),
+            vec![1, 200],
+            "the justified source survives the stall"
+        );
     }
 
     #[test]
