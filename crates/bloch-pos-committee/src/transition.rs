@@ -12604,6 +12604,47 @@ mod tests {
             );
         }
 
+        /// Owner decision: HF3 is strictly opt-in. A suite-0x0001 transfer
+        /// (V1 and V2, hybrid-shaped keys) has the SAME validity, the SAME
+        /// charge and the SAME post-state with the gate closed and open, and a
+        /// bad 0x0001 signature is refused the same way on both sides.
+        #[test]
+        fn hybrid_transfer_validity_and_fee_are_identical_across_hf3() {
+            let owner = owner_key(0x66);
+            let coin = opening(0xA6, 0, 1_000_000_000_000_000, &owner);
+            let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+            let price = g.next_base_fee();
+            let to = script_of(&owner_key(0x67));
+            let v1 = transfer_spending(std::slice::from_ref(&coin), &owner, to, 20_000, 0, price);
+            let mut bad = v1.clone();
+            if let PosTransaction::Transfer { inputs, .. } = &mut bad {
+                inputs[0].signature[0] ^= 1;
+            }
+            let v2 = transfer_v2_raw(std::slice::from_ref(&coin), &[&owner], &[0], to, 20_000, 0, price);
+            let run = |armed: bool| {
+                let _gate = crate::params::hf3_slh_rehearsal::arm(if armed { g.epoch } else { u64::MAX });
+                assert_eq!(crate::params::hf3_slh_suite_active(g.epoch), armed);
+                let v = SuiteToyVerifier::default();
+                let mut s1 = g.clone();
+                let c1 = s1.apply_transfer(&v1, price, &v).expect("0x0001 V1 transfer applies");
+                let mut s2 = g.clone();
+                let c2 = s2.apply_transfer_v2(&v2, price, &v).expect("0x0001 V2 transfer applies");
+                let rb = g.clone().apply_transfer(&bad, price, &v);
+                let class = fee_market::eutxo_class_for_keys(g.epoch, [owner.as_slice()]);
+                (c1, c2, rb, class, s1.eutxos.clone(), s2.eutxos.clone())
+            };
+            let closed = run(false);
+            let open = run(true);
+            assert_eq!(closed.0, open.0, "V1 charge moved across HF3");
+            assert_eq!(closed.1, open.1, "V2 charge moved across HF3");
+            assert_eq!(closed.2, Err(TransferReject::BadSignature));
+            assert_eq!(open.2, Err(TransferReject::BadSignature));
+            assert_eq!(closed.3, fee_market::TxClass::Eutxo { inputs: 1 });
+            assert_eq!(closed.3, open.3);
+            assert_eq!(closed.4, open.4, "V1 post-state moved across HF3");
+            assert_eq!(closed.5, open.5, "V2 post-state moved across HF3");
+        }
+
         /// The V2 table path is wired the same way: one epoch-aware call per
         /// table entry, at the committed epoch.
         #[test]

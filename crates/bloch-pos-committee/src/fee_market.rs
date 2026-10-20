@@ -1227,6 +1227,28 @@ mod tests {
         assert_eq!(verify_suite_of(&slh_f), VerifySuite::SlhDsaFalcon);
     }
 
+    /// Owner decision: fees of every non-0x0003 transfer are identical
+    /// across HF3, for any mix of 0x0001 / legacy raw / 0x0002 / malformed keys.
+    #[test]
+    fn non_slh_transfer_fees_are_identical_across_hf3() {
+        const ACT: u64 = 9;
+        let hyb = enveloped(0x0001, 3745);
+        let legacy_raw = vec![7u8; 3745];
+        let mldsa_only = enveloped(0x0002, 1952);
+        let junk = enveloped(SUITE_SLHDSA128S_FALCON1024, 10);
+        let l: &[u8] = &legacy_raw;
+        let sets: [Vec<&[u8]>; 4] = [vec![&hyb], vec![&hyb, l], vec![&mldsa_only, &hyb, &junk], vec![l; 7]];
+        for keys in &sets {
+            let before = eutxo_class_for_keys_under(ACT - 1, ACT, keys.iter().copied());
+            let after = eutxo_class_for_keys_under(ACT, ACT, keys.iter().copied());
+            assert_eq!(before, after);
+            assert_eq!(before, TxClass::Eutxo { inputs: keys.len() as u32 });
+            for bytes in [3_000u64, 8_503, 100_000] {
+                assert_eq!(charge(before, bytes, 10, 3), charge(after, bytes, 10, 3));
+            }
+        }
+    }
+
     #[test]
     fn slh_verify_units_bound_relay_cpu_like_hybrid() {
         assert_eq!(verify_cost_units(&enveloped(0x0001, 3745)), 1);

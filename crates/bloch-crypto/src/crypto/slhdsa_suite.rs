@@ -379,6 +379,44 @@ mod tests {
         assert!(verify(&hpk, MSG, &hsig) && verify(&mpk, MSG, &msig));
     }
 
+    /// Owner decision (HF3 is strictly opt-in): every verdict on an object
+    /// whose PUBLIC KEY is not suite 0x0003 — 0x0001, 0x0002, legacy raw,
+    /// malformed — is identical with the gate open and closed, including
+    /// 0x0001 keys paired with 0x0003-labelled signatures.
+    #[test]
+    fn non_0x0003_key_verdicts_are_identical_across_the_gate() {
+        let (spk, ssk) = kp();
+        let ssig = sign(&ssk, MSG).unwrap();
+        let (hpk, hsk) = hybrid_from_seed(&SEED).unwrap();
+        let hsig = sign(&hsk, MSG).unwrap();
+        let (mpk, msk) = {
+            use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
+            let (p, s) = pqcrypto_mldsa::mldsa65::keypair();
+            (crate::crypto::wrap_envelope(SUITE_MLDSA65_ONLY, p.as_bytes()),
+             crate::crypto::wrap_envelope(SUITE_MLDSA65_ONLY, s.as_bytes()))
+        };
+        let msig = sign(&msk, MSG).unwrap();
+        let mut bad = hsig.clone();
+        bad[100] ^= 1;
+        let mut legacy_sig_with_0x0003_magic = hsig[4..].to_vec();
+        legacy_sig_with_0x0003_magic[..4].copy_from_slice(&[0xB1, 0x0C, 0x03, 0x00]);
+        let pks: [&[u8]; 5] = [&hpk, &hpk[4..], &mpk, &relabel(&spk, 0xFFFF), b"junk"];
+        let sigs: [&[u8]; 9] = [&ssig, &hsig, &hsig[4..], &msig, &bad,
+            &relabel(&ssig, 0x0001), &relabel(&hsig, SUITE_SLHDSA128S_FALCON1024),
+            &legacy_sig_with_0x0003_magic, b""];
+        for p in pks {
+            for s in sigs {
+                assert_eq!(verify_spend(p, MSG, s, true), verify(p, MSG, s));
+                assert_eq!(verify_spend(p, MSG, s, false), verify(p, MSG, s));
+            }
+            assert_eq!(is_spend_public_key_admissible(p, true), is_hybrid_public_key(p));
+        }
+        assert!(verify_spend(&hpk, MSG, &hsig, true) && verify_spend(&hpk[4..], MSG, &hsig[4..], true));
+        assert!(verify_spend(&mpk, MSG, &msig, true));
+        // Address format is untouched: same pk, same address, either way.
+        assert_eq!(address_from_pubkey(&hpk, false), address_from_pubkey(&hpk, false));
+    }
+
     #[test]
     fn rehearsal_activation_accepts_only_at_or_after_epoch() {
         let (pk, sk) = kp();
