@@ -4263,7 +4263,13 @@ impl CommittedState {
         verifier: &dyn SignatureVerifier,
     ) -> Result<(), TxReject> {
         let public = self.check_kes_register(validator, depth, root, signature, verifier)?;
-        self.kes.insert(validator, public.into());
+        // A rescue keeps the expired key in the history (review R-1), so
+        // evidence it signed stays provable.
+        let entry = match self.kes.get(&validator) {
+            Some(old) => old.replaced_by(public, crate::params::kes_period(self.epoch).unwrap_or(0)),
+            None => public.into(),
+        };
+        self.kes.insert(validator, entry);
         Ok(())
     }
 
@@ -4313,6 +4319,7 @@ impl CommittedState {
             start_period = period.unwrap_or(0).saturating_add(crate::params::KES_RESCUE_DELAY_PERIODS);
             if entry.in_force(period.unwrap_or(0)).root == *root
                 || entry.next.is_some_and(|next| next.root == *root)
+                || entry.retired.iter().any(|r| r.public.root == *root)
             {
                 return Err(TxReject::StakingRule);
             }
@@ -4381,7 +4388,9 @@ impl CommittedState {
         }
         let current = settled.in_force(period);
         let next = crate::kes::KesPublic::new(depth, *root, period.saturating_add(1));
-        if next.same_tree(&current) {
+        // Never back to the tree in force or to one in the history: a reused
+        // tree's old leaves may already be compromised.
+        if next.same_tree(&current) || settled.retired.iter().any(|r| r.public.same_tree(&next)) {
             return Err(TxReject::StakingRule);
         }
         let domain = self.admission_network_domain.unwrap_or([0; 32]);
@@ -4390,7 +4399,7 @@ impl CommittedState {
         if crate::kes::verify_validator_in(&view, verifier, validator, Some(period), &message, signature) != Some(true) {
             return Err(TxReject::StakingRule);
         }
-        Ok(crate::kes::KesEntry { current: settled.current, next: Some(next) })
+        Ok(crate::kes::KesEntry { next: Some(next), ..settled })
     }
 
     /// Share (basis points) of the consensus roster's effective stake at

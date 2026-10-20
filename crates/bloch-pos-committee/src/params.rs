@@ -3357,6 +3357,14 @@ pub const KES_BIND_DELAY_EPOCHS: u64 = 2;
 /// re-registration (rescue, readiness B3) is accepted only while a key has
 /// expired, and its key starts this many periods after inclusion.
 pub const KES_RESCUE_DELAY_PERIODS: u64 = 2;
+/// How long a replaced KES key stays in the state after its last covered
+/// period, so equivocation evidence signed under it stays provable (review
+/// R-1). One year of one-day periods: well past the slashing correlation
+/// window (`slashing::CORRELATION_WINDOW_EPOCHS`, about 46 periods) and the
+/// withdrawal delay (`staking::WITHDRAWAL_DELAY_EPOCHS`, about 23 periods),
+/// after which the offender's stake has left. Bounded growth: at most one
+/// rotation per validator per period, 49 bytes of history each.
+pub const KES_KEY_HISTORY_PERIODS: u64 = 365;
 /// Shallowest tree the transition accepts from HF3 on. `kes::MIN_DEPTH` (1)
 /// remains the codec bound; a depth-1 tree lives two days, a depth-8 tree
 /// 256 days (review F-2: "an operator can brick itself in 2 days").
@@ -3407,6 +3415,7 @@ const _: () = {
     assert!(KES_ROTATE_REMAINING_PERIODS + KES_ROTATION_STAGGER_PERIODS < (1u64 << KES_DEFAULT_DEPTH) / 2);
     assert!(KES_MIN_REGISTERED_STAKE_BPS > 6_667 && KES_MIN_REGISTERED_STAKE_BPS <= 10_000);
     assert!(KES_MIN_REGISTERED_DEPTH <= KES_DEFAULT_DEPTH);
+    assert!(KES_KEY_HISTORY_PERIODS * KES_PERIOD_EPOCHS >= crate::slashing::CORRELATION_WINDOW_EPOCHS + crate::staking::WITHDRAWAL_DELAY_EPOCHS);
 };
 
 /// The KES schedule a build runs under: (registration, activation, period

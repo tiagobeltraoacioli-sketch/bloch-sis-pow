@@ -953,7 +953,7 @@ on any ref, so it moves to `0x1B`; no implemented byte is re-pointed.
 | state | `0x25`+ | free | — | — |
 | local cache | `BPOSST01:L2:v1\0\0` | L2 | — | mainnet |
 | local cache | `BPOSST01:L2CP:v1` | L2 checkpoint roots | — | `codex/native-claim-finality-20261019` |
-| local cache | `BPOSST01:KES:v1\0` | KES | — | KES line |
+| local cache | `BPOSST01:KES:v3\0` | KES (v3: entries, start periods, bind epoch, retired-key history) | — | KES line |
 | local cache | `BPOSST01:PQ:v1\0\0` | PQ rescue commitments | — | this branch |
 | local cache | `BPOSST01:FSET:v1` | frozen finality set | — | HF1 (p1a) |
 | local cache | `BPOSST01:FFGO:v1` | own-target checkpoints | — | HF1 (p2a) |

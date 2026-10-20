@@ -287,6 +287,7 @@ mod kes_rules {
         st.kes.insert(0, kes::KesEntry {
             current: KesPublic::new(DEPTH, toy_kes_public(0).root, 3),
             next: Some(KesPublic::new(DEPTH + 1, [0x5C; 32], 17)),
+            retired: vec![kes::RetiredKes { public: KesPublic::new(DEPTH, [0x5B; 32], 0), end_period: 3 }],
         });
         let header = header_for(&st);
         st.head = header.id();
@@ -777,11 +778,13 @@ mod kes_rules {
         trees.insert(toy_kes_public(1).root, tree(1).0);
         let mut rotations = 0u8;
         let mut roots_seen = std::collections::BTreeSet::new();
+        let mut signed_by: Vec<KesPublic> = Vec::new();
         for period in 0..200u64 {
             st.epoch = 10 + period;
-            let entry = st.kes_roots()[&1];
+            let entry = st.kes_roots()[&1].clone();
             let public = entry.in_force(period);
             roots_seen.insert(public.root);
+            signed_by.push(public);
             let pks = trees[&public.root].clone();
             assert!(vote_verifies(&st, 1, st.epoch, &public, &pks, period), "rotating validator, period {period}");
             assert_eq!(
@@ -806,8 +809,17 @@ mod kes_rules {
         }
         assert!(rotations >= 14, "{rotations} rotations over 200 periods");
         assert_eq!(roots_seen.len(), rotations as usize + 1);
-        // The state never holds more than the key in force and one successor.
-        assert!(st.kes_roots()[&1].committed_bytes().len() <= 82);
+        // Review R-1: every past period still resolves to the key that signed
+        // it (history inside KES_KEY_HISTORY_PERIODS), so its votes stay
+        // verifiable as evidence; nothing past the horizon is kept.
+        let entry = st.kes_roots()[&1].clone();
+        for (period, public) in signed_by.iter().enumerate() {
+            assert_eq!(entry.in_force(period as u64), *public, "period {period}");
+            assert!(vote_verifies(&st, 1, 10 + period as u64, public, &trees[&public.root], period as u64), "evidence-grade vote, period {period}");
+        }
+        assert_eq!(entry.retired.len(), rotations as usize - 1, "every replaced key, none pruned within the horizon");
+        let far = entry.settled(200 + crate::params::KES_KEY_HISTORY_PERIODS + 1);
+        assert!(far.retired.is_empty(), "history is bounded by KES_KEY_HISTORY_PERIODS");
     }
 
     #[test]
@@ -972,7 +984,7 @@ mod kes_rules {
         let new = st.kes_roots()[&1].in_force(6);
         let onward = rotate(&st, 1, 6, &new, &new_pks, &tree_from(0x83, DEPTH));
         apply(&mut st, &onward).unwrap();
-        let entry = st.kes_roots()[&1];
+        let entry = st.kes_roots()[&1].clone();
         assert_eq!(entry.current, new, "settled: the first successor is now current");
         assert_eq!(entry.next.unwrap().start_period, 7);
     }
@@ -1010,7 +1022,7 @@ mod kes_rules {
         b.kes.insert(1, KesPublic::new(DEPTH, [1; 32], 1).into());
         assert_ne!(a.state_root(), b.state_root(), "start period");
         let mut c = a.clone();
-        c.kes.insert(1, kes::KesEntry { current: KesPublic::new(DEPTH, [1; 32], 0), next: Some(KesPublic::new(DEPTH, [2; 32], 9)) });
+        c.kes.insert(1, kes::KesEntry { current: KesPublic::new(DEPTH, [1; 32], 0), next: Some(KesPublic::new(DEPTH, [2; 32], 9)), retired: Vec::new() });
         assert_ne!(a.state_root(), c.state_root(), "pending successor");
     }
 

@@ -43,8 +43,9 @@
 //!   only in a block of period `p`, and makes the new tree the key from
 //!   `p + 1` (start period `p + 1`). The static key cannot rotate: a static
 //!   key stolen later could otherwise rotate on a long-range fork.
-//! * The state keeps, per validator, a [`KesEntry`]: the key in force and at
-//!   most one pending successor. [`KesEntry::in_force`] resolves the key for
+//! * The state keeps, per validator, a [`KesEntry`]: the key in force, at
+//!   most one pending successor, and the bounded history of replaced keys
+//!   (so evidence signed under them stays provable, review R-1). [`KesEntry::in_force`] resolves the key for
 //!   a period lazily, so no epoch-boundary hook mutates state; the successor
 //!   is promoted (and the old key dropped) when the next rotation is applied.
 //!
@@ -203,39 +204,108 @@ impl KesPublic {
     }
 }
 
-/// A validator's KES state: the key in force and at most one rotated-in
-/// successor, which takes over at its own `start_period`.
+/// A key a validator no longer signs with, kept so signatures it made while
+/// in force stay verifiable (review R-1: slashing evidence from period `p`
+/// must not become unprovable because the offender rotated). It covers
+/// global periods `public.start_period .. end_period` (exclusive end): the
+/// periods before its replacement took over, or before it expired.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RetiredKes {
+    pub public: KesPublic,
+    pub end_period: u64,
+}
+
+impl RetiredKes {
+    fn covers(&self, period: u64) -> bool {
+        period >= self.public.start_period && period < self.end_period
+    }
+}
+
+/// A validator's KES state: the key in force, at most one rotated-in
+/// successor (which takes over at its own `start_period`), and the history
+/// of replaced keys still inside [`crate::params::KES_KEY_HISTORY_PERIODS`].
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KesEntry {
     pub current: KesPublic,
     pub next: Option<KesPublic>,
+    /// Replaced keys, oldest first, with disjoint ascending period ranges.
+    pub retired: Vec<RetiredKes>,
 }
 
 impl From<KesPublic> for KesEntry {
     fn from(current: KesPublic) -> Self {
-        KesEntry { current, next: None }
+        KesEntry { current, next: None, retired: Vec::new() }
     }
 }
 
+/// Tag that starts the retired-key section of [`KesEntry::committed_bytes`].
+/// A key's first byte is its depth (at most [`MAX_DEPTH`]), so the section
+/// can never be confused with a successor key.
+const RETIRED_SECTION_TAG: u8 = 0xFF;
+
 impl KesEntry {
-    /// The key that signs global period `period`: the successor from its
-    /// start period on, the current key before. Leaf bounds are the key's
-    /// own ([`KesPublic::leaf_index`]).
+    /// The key that signed (or signs) global period `period`: the successor
+    /// from its start period on; the current key from its start; before
+    /// that, the retired key whose range covers `period` (review R-1). With
+    /// none, the current key, whose leaf bounds then refuse the period.
     pub fn in_force(&self, period: u64) -> KesPublic {
         match self.next {
-            Some(next) if period >= next.start_period => next,
-            _ => self.current,
+            Some(next) if period >= next.start_period => return next,
+            _ => {}
         }
+        if period >= self.current.start_period {
+            return self.current;
+        }
+        self.retired
+            .iter()
+            .rev()
+            .find(|r| r.covers(period))
+            .map(|r| r.public)
+            .unwrap_or(self.current)
     }
 
     /// The same entry with a successor that is already in force at `period`
-    /// promoted (the replaced key is dropped). Pure; the transition applies it
-    /// before a rotation, so the state never holds more than two keys.
+    /// promoted; the replaced key moves to the history (covering up to the
+    /// successor's start) and history older than
+    /// `KES_KEY_HISTORY_PERIODS` before `period` is pruned. Pure; the
+    /// transition applies it before a rotation.
     pub fn settled(&self, period: u64) -> KesEntry {
-        match self.next {
-            Some(next) if period >= next.start_period => KesEntry { current: next, next: None },
-            _ => *self,
+        let mut out = match self.next {
+            Some(next) if period >= next.start_period => {
+                let mut retired = self.retired.clone();
+                retired.push(RetiredKes { public: self.current, end_period: next.start_period });
+                KesEntry { current: next, next: None, retired }
+            }
+            _ => self.clone(),
+        };
+        out.prune(period);
+        out
+    }
+
+    /// Replace the key in force by `fresh` (a rescue re-registration), keeping
+    /// the replaced key in the history up to `fresh.start_period` (it has
+    /// expired, so its own end comes first).
+    pub fn replaced_by(&self, fresh: KesPublic, period: u64) -> KesEntry {
+        let mut retired = self.retired.clone();
+        if let Some(next) = self.next {
+            retired.push(RetiredKes { public: self.current, end_period: next.start_period });
+            retired.push(RetiredKes { public: next, end_period: next.end_period().min(fresh.start_period) });
+        } else {
+            retired.push(RetiredKes {
+                public: self.current,
+                end_period: self.current.end_period().min(fresh.start_period),
+            });
         }
+        let mut out = KesEntry { current: fresh, next: None, retired };
+        out.prune(period);
+        out
+    }
+
+    /// Drop history whose last covered period is more than
+    /// `KES_KEY_HISTORY_PERIODS` before `period`.
+    fn prune(&mut self, period: u64) {
+        let keep_from = period.saturating_sub(crate::params::KES_KEY_HISTORY_PERIODS);
+        self.retired.retain(|r| r.end_period > keep_from);
     }
 
     /// The rotation waiting for a later period than `period`, if any.
@@ -244,11 +314,21 @@ impl KesEntry {
     }
 
     /// The state-root value (component 0x22): the current key's
-    /// [`KesPublic::committed_bytes`], then the successor's if there is one.
+    /// [`KesPublic::committed_bytes`], then the successor's if there is one,
+    /// then — only when there is history — `0xFF ‖ u32 LE count ‖ count ×
+    /// (key ‖ u64 LE end_period)`.
     pub fn committed_bytes(&self) -> Vec<u8> {
         let mut out = self.current.committed_bytes();
         if let Some(next) = self.next {
             out.extend_from_slice(&next.committed_bytes());
+        }
+        if !self.retired.is_empty() {
+            out.push(RETIRED_SECTION_TAG);
+            out.extend_from_slice(&(self.retired.len() as u32).to_le_bytes());
+            for r in &self.retired {
+                out.extend_from_slice(&r.public.committed_bytes());
+                out.extend_from_slice(&r.end_period.to_le_bytes());
+            }
         }
         out
     }
@@ -666,13 +746,17 @@ mod tests {
     fn a_kes_entry_hands_over_at_the_successors_start_and_settles_lazily() {
         let current = KesPublic::new(3, [1; 32], 0);
         let next = KesPublic::new(3, [2; 32], 6);
-        let entry = KesEntry { current, next: Some(next) };
+        let entry = KesEntry { current, next: Some(next), retired: Vec::new() };
         assert_eq!(entry.in_force(5), current);
         assert_eq!(entry.in_force(6), next);
         assert_eq!(entry.pending_at(5), Some(next));
         assert_eq!(entry.pending_at(6), None);
         assert_eq!(entry.settled(5), entry, "nothing to promote yet");
-        assert_eq!(entry.settled(6), KesEntry::from(next), "promoted, old key dropped");
+        let promoted = entry.settled(6);
+        assert_eq!((promoted.current, promoted.next), (next, None), "promoted");
+        assert_eq!(promoted.retired, vec![RetiredKes { public: current, end_period: 6 }], "the old key is history, not dropped");
+        assert_eq!(promoted.in_force(5), current, "period 5 still resolves to the key that signed it");
+        assert_eq!(promoted.in_force(6), next);
         assert_eq!(
             entry.committed_bytes(),
             [current.committed_bytes(), next.committed_bytes()].concat()
@@ -708,5 +792,44 @@ mod tests {
         assert_ne!(base, register_signing_root(&[2; 32], 3, &k));
         assert_ne!(base, register_signing_root(&[1; 32], 4, &k));
         assert_ne!(base, register_signing_root(&[1; 32], 3, &KesPublic::new(11, [5; 32], 0)));
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn history_resolves_each_period_to_the_key_that_signed_it_and_is_pruned() {
+        let k0 = KesPublic::new(4, [0; 32], 0);
+        let k1 = KesPublic::new(4, [1; 32], 2);
+        let k2 = KesPublic::new(4, [2; 32], 3);
+        let e = KesEntry { current: k0, next: Some(k1), retired: Vec::new() }.settled(2);
+        let e = KesEntry { next: Some(k2), ..e }.settled(3);
+        assert_eq!(e.current, k2);
+        assert_eq!(e.retired, vec![RetiredKes { public: k0, end_period: 2 }, RetiredKes { public: k1, end_period: 3 }]);
+        assert_eq!((e.in_force(0), e.in_force(1), e.in_force(2), e.in_force(3), e.in_force(9)), (k0, k0, k1, k2, k2));
+        // The old keys' leaves past their range are never selected.
+        assert_eq!(e.in_force(5), k2, "k0's leaf 5 exists, but k0 does not cover period 5");
+        let horizon = crate::params::KES_KEY_HISTORY_PERIODS;
+        assert_eq!(e.settled(2 + horizon).retired.len(), 1, "k0 (ends at 2) pruned past the horizon");
+        assert!(e.settled(3 + horizon).retired.is_empty());
+        // Committed bytes carry the history after a tag no key starts with.
+        let bytes = e.committed_bytes();
+        assert_eq!(bytes[41], RETIRED_SECTION_TAG);
+        assert_eq!(bytes.len(), 41 + 1 + 4 + 2 * 49);
+        assert_ne!(e.committed_bytes(), KesEntry::from(k2).committed_bytes());
+    }
+
+    #[test]
+    fn a_rescue_keeps_the_expired_key_in_history() {
+        let old = KesPublic::new(2, [7; 32], 0); // periods 0..4
+        let fresh = KesPublic::new(2, [8; 32], 6);
+        let e = KesEntry::from(old).replaced_by(fresh, 4);
+        assert_eq!(e.current, fresh);
+        assert_eq!(e.retired, vec![RetiredKes { public: old, end_period: 4 }]);
+        assert_eq!(e.in_force(3), old);
+        assert_eq!(e.in_force(4), fresh, "nothing covers 4..6: the fresh key, whose leaves refuse it");
+        assert_eq!(fresh.leaf_index(4), None);
     }
 }

@@ -32,6 +32,8 @@ const OWN_CHECKPOINT_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::OWN_CH
 const KES_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::KES;
 /// One cached KES key: depth, root, start period.
 type CachedKes = (u8, [u8; 32], u64);
+/// One cached KES entry: key in force, successor, history (key, end period).
+type CachedKesEntry = (CachedKes, Option<CachedKes>, Vec<(CachedKes, u64)>);
 // Every optional section is written and parsed in `wire_alloc::local_cache::ORDER`.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedState {
@@ -232,11 +234,12 @@ impl CommittedState {
         // Registered KES keys: an optional section after L2 [L2CP], absent while none is
         // registered (every network before `KES_REGISTRATION_EPOCH`).
         if !kes.is_empty() || kes_enforced_from.is_some() {
-            let flat: BTreeMap<u32, (CachedKes, Option<CachedKes>)> = kes
+            let flat: BTreeMap<u32, CachedKesEntry> = kes
                 .iter()
                 .map(|(v, e)| {
                     let flat = |k: &crate::kes::KesPublic| (k.depth, k.root, k.start_period);
-                    (*v, (flat(&e.current), e.next.as_ref().map(flat)))
+                    let history = e.retired.iter().map(|r| (flat(&r.public), r.end_period)).collect();
+                    (*v, (flat(&e.current), e.next.as_ref().map(flat), history))
                 })
                 .collect();
             bytes.extend_from_slice(KES_SECTION);
@@ -370,7 +373,7 @@ impl CommittedState {
         let mut kes = BTreeMap::new();
         let mut kes_enforced_from = None;
         if let Some(mut section) = rest.strip_prefix(KES_SECTION.as_slice()) {
-            let (flat, enforced): (BTreeMap<u32, (CachedKes, Option<CachedKes>)>, Option<u64>) =
+            let (flat, enforced): (BTreeMap<u32, CachedKesEntry>, Option<u64>) =
                 bincode::DefaultOptions::new().with_limit(LIMIT)
                     .deserialize_from(&mut section).map_err(|e| e.to_string())?;
             if flat.is_empty() && enforced.is_none() {
@@ -380,7 +383,13 @@ impl CommittedState {
             let key = |(depth, root, start): CachedKes| crate::kes::KesPublic::new(depth, root, start);
             kes = flat
                 .into_iter()
-                .map(|(v, (current, next))| (v, crate::kes::KesEntry { current: key(current), next: next.map(key) }))
+                .map(|(v, (current, next, history))| {
+                    let retired = history
+                        .into_iter()
+                        .map(|(k, end_period)| crate::kes::RetiredKes { public: key(k), end_period })
+                        .collect();
+                    (v, crate::kes::KesEntry { current: key(current), next: next.map(key), retired })
+                })
                 .collect();
             rest = section;
         }

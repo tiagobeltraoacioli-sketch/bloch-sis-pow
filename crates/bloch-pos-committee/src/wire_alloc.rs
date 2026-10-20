@@ -107,7 +107,9 @@ pub mod local_cache {
     pub const L2_CHECKPOINTS: &[u8; 16] = b"BPOSST01:L2CP:v1";
     /// HF3 KES (`v2`: entries with start periods and the enforcement bind
     /// epoch; the devnet lineage's `v1` section is not accepted).
-    pub const KES: &[u8; 16] = b"BPOSST01:KES:v2\0";
+    /// `v3` adds the retired-key history (review R-1); `v1`/`v2` sections
+    /// are refused and the cache is rebuilt from blocks.
+    pub const KES: &[u8; 16] = b"BPOSST01:KES:v3\0";
     /// HF3 PQ rescue commitments.
     pub const PQ: &[u8; 16] = b"BPOSST01:PQ:v1\0\0";
     /// HF1 frozen finality set (p1a).
