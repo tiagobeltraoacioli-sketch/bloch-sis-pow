@@ -5,7 +5,7 @@
 //! public key, signing root, and signature determine each entry. Registry,
 //! committee, clock, missing-parent, and admission failures never enter it.
 //! Consensus execution continues to use its independent, uncached verifier.
-use bloch_pos_committee::attestation::SignatureVerifier;
+use bloch_pos_committee::attestation::{SignaturePolicy, SignatureVerifier};
 use sha3::{Digest, Sha3_256};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -61,9 +61,18 @@ impl<V> GossipVerifier<V> {
         }
     }
 
-    fn failure_key(pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> [u8; 32] {
+    /// The policy is part of the key: a signature refused under the strict
+    /// relay policy (e.g. a padded Falcon half) may still be valid under the
+    /// consensus rule, and must not be remembered as invalid there.
+    fn failure_key(
+        policy: SignaturePolicy,
+        pubkey: &[u8],
+        root: &[u8; 32],
+        signature: &[u8],
+    ) -> [u8; 32] {
         let mut hash = Sha3_256::new();
-        hash.update(b"bloch-node-gossip-invalid-signature-v1");
+        hash.update(b"bloch-node-gossip-invalid-signature-v2");
+        hash.update([policy.tag()]);
         hash.update((pubkey.len() as u64).to_le_bytes());
         hash.update(pubkey);
         hash.update(root);
@@ -74,11 +83,12 @@ impl<V> GossipVerifier<V> {
 
     pub(super) fn is_known_failure(
         &self,
+        policy: SignaturePolicy,
         pubkey: &[u8],
         root: &[u8; 32],
         signature: &[u8],
     ) -> bool {
-        let key = Self::failure_key(pubkey, root, signature);
+        let key = Self::failure_key(policy, pubkey, root, signature);
         self.failures.borrow().known.contains(&key)
     }
 
@@ -146,9 +156,19 @@ impl<V> BudgetedVerifier<'_, V> {
 
 impl<V: SignatureVerifier> SignatureVerifier for BudgetedVerifier<'_, V> {
     fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        self.verify_with_key_under(SignaturePolicy::Compatible, pubkey, root, signature)
+    }
+
+    fn verify_with_key_under(
+        &self,
+        policy: SignaturePolicy,
+        pubkey: &[u8],
+        root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
         // Exact known failures remain cheap and deterministic, and consuming
         // no allowance for them preserves the cache-before-budget ordering.
-        if self.owner.is_known_failure(pubkey, root, signature) {
+        if self.owner.is_known_failure(policy, pubkey, root, signature) {
             return false;
         }
         if !self.owner.reserve_verification(
@@ -160,23 +180,33 @@ impl<V: SignatureVerifier> SignatureVerifier for BudgetedVerifier<'_, V> {
             self.limited.set(true);
             return false;
         }
-        self.owner.verify_with_key(pubkey, root, signature)
+        self.owner.verify_with_key_under(policy, pubkey, root, signature)
     }
 }
 
 impl<V: SignatureVerifier> SignatureVerifier for GossipVerifier<V> {
     fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        self.verify_with_key_under(SignaturePolicy::Compatible, pubkey, root, signature)
+    }
+
+    fn verify_with_key_under(
+        &self,
+        policy: SignaturePolicy,
+        pubkey: &[u8],
+        root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
         #[cfg(test)]
         assert!(
             !self.panic_on_verification.get(),
             "deferred authenticated block must not repeat gossip verification"
         );
-        let key = Self::failure_key(pubkey, root, signature);
+        let key = Self::failure_key(policy, pubkey, root, signature);
         if self.failures.borrow().known.contains(&key) {
             return false;
         }
         // Release the cache borrow before calling cryptographic code.
-        if self.verifier.verify_with_key(pubkey, root, signature) {
+        if self.verifier.verify_with_key_under(policy, pubkey, root, signature) {
             return true;
         }
         let mut failures = self.failures.borrow_mut();
@@ -200,6 +230,17 @@ impl SignatureVerifier for CountedHybrid {
         self.0.set(self.0.get().saturating_add(1));
         crate::keys::HybridVerifier::new().verify_with_key(key, root, signature)
     }
+
+    fn verify_with_key_under(
+        &self,
+        policy: SignaturePolicy,
+        key: &[u8],
+        root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        self.0.set(self.0.get().saturating_add(1));
+        crate::keys::HybridVerifier::new().verify_with_key_under(policy, key, root, signature)
+    }
 }
 
 #[cfg(test)]
@@ -212,6 +253,30 @@ pub(super) fn counted_hybrid() -> (GossipVerifier<CountedHybrid>, std::rc::Rc<st
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    /// A failure remembered under the strict relay policy must not become a
+    /// failure under the consensus rule: the padded form is refused for relay
+    /// yet stays consensus-valid until the flag day.
+    #[test]
+    fn failure_cache_is_keyed_by_signature_policy() {
+        use bloch_crypto::crypto::{falcon, MLDSA_SIG_LEN, SUITE_HEADER_LEN};
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        let root = [0x6Cu8; 32];
+        let padded_len = SUITE_HEADER_LEN + MLDSA_SIG_LEN + falcon::padded_signature_len();
+        let mut sig = (0..64)
+            .map(|_| bloch_crypto::crypto::sign(&sk, &root).unwrap())
+            .find(|s| s.len() < padded_len)
+            .unwrap();
+        sig.resize(padded_len, 0);
+        let (verifier, calls) = counted_hybrid();
+        let budget = verifier.budgeted(5, 16);
+        assert!(!budget.verify_with_key_under(SignaturePolicy::CanonicalUnbound, &pk, &root, &sig));
+        assert!(verifier.is_known_failure(SignaturePolicy::CanonicalUnbound, &pk, &root, &sig));
+        assert!(!verifier.is_known_failure(SignaturePolicy::Compatible, &pk, &root, &sig));
+        assert!(budget.verify_with_key(&pk, &root, &sig), "compatible verdict is independent");
+        assert!(!budget.verify_with_key_under(SignaturePolicy::CanonicalUnbound, &pk, &root, &sig));
+        assert_eq!(calls.get(), 2, "the strict failure is served from the cache");
+    }
 
     struct CountingVerifier { calls: Cell<usize> }
 

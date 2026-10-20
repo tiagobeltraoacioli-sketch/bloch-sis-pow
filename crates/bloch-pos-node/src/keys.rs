@@ -858,8 +858,28 @@ impl Keystore {
     // in `engine.rs`, for a case this module's own construction paths
     // already rule out. Left COUNTED by the hardened ratchet on purpose.
     pub fn sign(&self, signing_root: &[u8; 32]) -> Vec<u8> {
-        bloch_crypto::crypto::sign(&self.secret, signing_root)
+        // `Compatible` is exactly `bloch_crypto::crypto::sign`.
+        self.sign_under(bloch_pos_committee::SignaturePolicy::Compatible, signing_root)
+    }
+
+    /// Sign so the signature verifies under `policy` — the consensus rule of
+    /// the epoch the signed object is judged in (audit e9b52781). Identical
+    /// to [`Self::sign`] until `SIG_CANONICAL_ACTIVATION_EPOCH` arms.
+    pub fn sign_under(
+        &self,
+        policy: bloch_pos_committee::SignaturePolicy,
+        signing_root: &[u8; 32],
+    ) -> Vec<u8> {
+        bloch_crypto::crypto::sign_with_policy(crypto_policy(policy), &self.secret, signing_root)
             .expect("hybrid signing over a well-formed keystore key cannot fail")
+    }
+
+    /// [`Self::sign_under`] with the consensus policy of `epoch` — for
+    /// CONSENSUS MESSAGES ONLY (attestations, proposals; `epoch` is the
+    /// signed message's own epoch). Transactions, including validator
+    /// lifecycle ones, always sign v1 with [`Self::sign`] (HF2 scope).
+    pub fn sign_for_epoch(&self, epoch: u64, signing_root: &[u8; 32]) -> Vec<u8> {
+        self.sign_under(bloch_pos_committee::SignaturePolicy::consensus(epoch), signing_root)
     }
 }
 
@@ -1325,6 +1345,32 @@ impl bloch_pos_committee::attestation::SignatureVerifier for HybridVerifier {
     fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool {
         bloch_crypto::crypto::verify(pubkey, signing_root, signature)
     }
+
+    /// Audit e9b52781: the same suite check under an explicit encoding /
+    /// signing-context policy. `Compatible` is exactly `verify_with_key`.
+    fn verify_with_key_under(
+        &self,
+        policy: bloch_pos_committee::SignaturePolicy,
+        pubkey: &[u8],
+        signing_root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        bloch_crypto::crypto::verify_with_policy(crypto_policy(policy), pubkey, signing_root, signature)
+    }
+}
+
+/// The committee's signature policy, in `bloch_crypto`'s vocabulary.
+pub fn crypto_policy(
+    policy: bloch_pos_committee::SignaturePolicy,
+) -> bloch_crypto::crypto::SignaturePolicy {
+    use bloch_crypto::crypto::SignaturePolicy as C;
+    use bloch_pos_committee::SignaturePolicy as P;
+    match policy {
+        P::Compatible => C::Compatible,
+        P::CompatiblePinned => C::CompatiblePinned,
+        P::CanonicalUnbound => C::CanonicalUnbound,
+        P::Bound => C::Bound,
+    }
 }
 
 /// Accept-everything verifier for the producer's own `compute_post_state`
@@ -1553,6 +1599,40 @@ mod tests {
         let root = [0x5Au8; 32];
         let sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign");
         assert!(HybridVerifier::new().verify_with_key(&pk, &root, &sig));
+    }
+
+    /// Audit e9b52781: the PQ verifier honours every committee policy, and
+    /// the keystore signs for the epoch's consensus policy (v1 while inert).
+    #[test]
+    fn hybrid_verifier_applies_each_signature_policy() {
+        use bloch_crypto::crypto::{falcon, MLDSA_SIG_LEN, SUITE_HEADER_LEN};
+        use bloch_pos_committee::SignaturePolicy::{Bound, CanonicalUnbound, Compatible, CompatiblePinned};
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        let root = [0x5Bu8; 32];
+        let v = HybridVerifier::new();
+        let verdicts = |sig: &[u8]| {
+            [Compatible, CompatiblePinned, CanonicalUnbound, Bound].map(|p| v.verify_with_key_under(p, &pk, &root, sig))
+        };
+        let padded_len = SUITE_HEADER_LEN + MLDSA_SIG_LEN + falcon::padded_signature_len();
+        let v1 = (0..64)
+            .map(|_| bloch_crypto::crypto::sign(&sk, &root).unwrap())
+            .find(|s| s.len() < padded_len)
+            .unwrap();
+        assert_eq!(verdicts(&v1), [true, true, true, false]);
+        let mut padded = v1.clone();
+        padded.resize(padded_len, 0);
+        assert_eq!(verdicts(&padded), [true, true, false, false]);
+        let v2 = bloch_crypto::crypto::sign_bound(&sk, &root).unwrap();
+        assert_eq!(verdicts(&v2), [false, false, false, true]);
+
+        let dir = tmp_dir("sigpolicy");
+        let ks = Keystore::generate_with(&dir, 0, &Unlock::PlaintextOptIn).expect("gen plaintext");
+        let sig = ks.sign_for_epoch(0, &root);
+        assert!(HybridVerifier::new().verify_with_key(&ks.pubkey, &root, &sig));
+        assert!(v.verify_with_key_under(CanonicalUnbound, &ks.pubkey, &root, &sig));
+        let bound = ks.sign_under(Bound, &root);
+        assert!(v.verify_with_key_under(Bound, &ks.pubkey, &root, &bound));
+        assert!(!v.verify_with_key(&ks.pubkey, &root, &bound));
     }
 
     #[test]

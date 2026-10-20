@@ -591,7 +591,11 @@ impl AttestationPool {
         let current_pubkey_sha3: [u8; 32] = Sha3_256::digest(pubkey).into();
         let already_authenticated = authenticated_pubkey_sha3 == Some(current_pubkey_sha3);
         if !already_authenticated
-            && !verifier.verify_with_key(pubkey, &data_hash, &att.signature)
+            && !crate::attestation::PolicyVerifier::consensus(
+                verifier,
+                crate::epoch_of(att.data.slot),
+            )
+            .verify_with_key(pubkey, &data_hash, &att.signature)
         {
             return GossipDecision::Reject(RejectReason::BadSignature);
         }

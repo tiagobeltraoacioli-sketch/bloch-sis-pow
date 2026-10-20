@@ -485,8 +485,13 @@ impl SlashingState {
         let Some(pubkey) = keys.pubkey(validator) else {
             return Err(EvidenceError::UnknownValidator);
         };
+        // Each vote is judged under the consensus signature rule of ITS OWN
+        // epoch (HF2 review): the validator signed it under that rule, and a
+        // later including block must neither invalidate a pre-flag-day vote
+        // (slashing escape) nor admit a v1 vote signed after the flag day.
         for att in [&evidence.first, &evidence.second] {
-            if !verifier.verify_with_key(pubkey, &att.data.signing_root(), &att.signature) {
+            let policy = crate::attestation::SignaturePolicy::consensus(crate::epoch_of(att.data.slot));
+            if !verifier.verify_with_key_under(policy, pubkey, &att.data.signing_root(), &att.signature) {
                 return Err(EvidenceError::BadSignature);
             }
         }
@@ -602,7 +607,10 @@ impl SlashingState {
             return Err(EvidenceError::UnknownValidator);
         };
         for env in [first, second] {
-            if !verifier.verify_with_key(
+            // The header's own epoch rule, as for votes above (HF2 review).
+            let policy = crate::attestation::SignaturePolicy::consensus(crate::epoch_of(env.header.slot));
+            if !verifier.verify_with_key_under(
+                policy,
                 pubkey,
                 &env.header.proposal_signing_root(),
                 &env.proposer_sig,

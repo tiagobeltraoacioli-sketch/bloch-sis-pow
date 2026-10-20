@@ -140,10 +140,169 @@ pub trait SignatureVerifier {
     /// spending cheaper to forge than attesting.
     fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool;
 
+    /// [`Self::verify_with_key`] under an explicit [`SignaturePolicy`]
+    /// (audit e9b52781: canonical encodings and suite-bound context).
+    ///
+    /// The default forwards to `verify_with_key` and is correct ONLY for
+    /// verifiers with no notion of byte encodings (test doubles, the
+    /// accept-all producer probe). The real PQ verifier and every wrapper
+    /// around one MUST override it — a wrapper left on the default would
+    /// silently apply the compatibility rule after the flag day.
+    fn verify_with_key_under(
+        &self,
+        policy: SignaturePolicy,
+        pubkey: &[u8],
+        signing_root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        let _ = policy;
+        self.verify_with_key(pubkey, signing_root, signature)
+    }
+
     /// Deterministic native L2 proof check, using only parent-committed policy.
     /// Older verifier implementations cannot silently admit the new transaction.
     fn verify_l2_settlement(&self, _policy: &[u8; 32], _program: &[u8; 32],
         _values: &[u8], _proof: &[u8]) -> bool { false }
+}
+
+/// Which hybrid-signature byte forms and signing context are admitted.
+/// Mirrors `bloch_crypto::crypto::SignaturePolicy` (this crate stays free of
+/// the PQ stack; the node maps one onto the other).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SignaturePolicy {
+    /// Historical consensus rule: every byte form `crypto::verify` accepts
+    /// (headerless, zero-padded Falcon, recombined halves, unbound suite),
+    /// ML-DSA half judged by the CPU-dispatching backend.
+    Compatible,
+    /// The historical byte forms, ML-DSA half judged by the pinned,
+    /// platform-independent FIPS 204 verifier (`crypto::verify_pinned`).
+    /// Consensus from [`crate::params::MLDSA_PIN_ACTIVATION_EPOCH`].
+    CompatiblePinned,
+    /// Today's context-free signing math in its one canonical byte form.
+    /// Opt-in verification policy (bloch-crypto); no consensus or mempool
+    /// path selects it.
+    CanonicalUnbound,
+    /// Canonical byte form AND the v2 per-suite signing context (Falcon half
+    /// bound to its ML-DSA half). Consensus from
+    /// [`crate::params::SIG_CANONICAL_ACTIVATION_EPOCH`].
+    Bound,
+}
+
+impl SignaturePolicy {
+    /// The consensus rule for signatures judged in `epoch` (the judged
+    /// block's committed epoch, never a clock).
+    pub fn consensus(epoch: u64) -> Self {
+        if crate::params::sig_canonical_active(epoch) {
+            SignaturePolicy::Bound
+        } else if crate::params::mldsa_pin_active(epoch) {
+            SignaturePolicy::CompatiblePinned
+        } else {
+            SignaturePolicy::Compatible
+        }
+    }
+
+    /// The rule for TRANSACTION witnesses (every L1 transaction users,
+    /// exchanges and validators sign: transfers, deposits, withdrawals,
+    /// delegation/lifecycle transactions, L2 bridge deposits and withdrawal
+    /// claims) judged in `epoch`.
+    ///
+    /// OWNER DECISION (HF2 scope): the canonical/suite-bound rule
+    /// ([`crate::params::SIG_CANONICAL_ACTIVATION_EPOCH`]) applies to
+    /// consensus messages only (votes, proposer signatures, slashing
+    /// evidence, KES leaves). Transactions keep accepting exactly today's v1
+    /// encodings (headerless, padded Falcon, recombined halves) before and
+    /// after it, so no wallet, exchange or pre-signed transaction is affected.
+    /// The only thing that ever changes here is the ML-DSA BACKEND
+    /// ([`Self::CompatiblePinned`] from `MLDSA_PIN_ACTIVATION_EPOCH`): the
+    /// FIPS 204 reference behaviour, which every shipped signer satisfies.
+    pub fn transaction(epoch: u64) -> Self {
+        Self::transaction_for(
+            crate::params::mldsa_pin_active(epoch),
+            crate::params::sig_canonical_active(epoch),
+        )
+    }
+
+    /// [`Self::transaction`] as a pure function of the two gates. Never a
+    /// canonical policy, whatever the gates say.
+    pub fn transaction_for(mldsa_pin_active: bool, sig_canonical_active: bool) -> Self {
+        if mldsa_pin_active || sig_canonical_active {
+            SignaturePolicy::CompatiblePinned
+        } else {
+            SignaturePolicy::Compatible
+        }
+    }
+
+    /// The stricter of two policies. `Bound` dominates (its signing context
+    /// is what consensus will demand), then `CanonicalUnbound`, then
+    /// `CompatiblePinned`, then `Compatible` (each admits a subset of the
+    /// next one's signatures; both canonical policies use the pinned ML-DSA
+    /// verifier). Lets an outer policy wrapper sit around the transition's own
+    /// wrapper without the inner one loosening it.
+    pub fn strictest(self, other: Self) -> Self {
+        use SignaturePolicy::*;
+        match (self, other) {
+            (Bound, _) | (_, Bound) => Bound,
+            (CanonicalUnbound, _) | (_, CanonicalUnbound) => CanonicalUnbound,
+            (CompatiblePinned, _) | (_, CompatiblePinned) => CompatiblePinned,
+            (Compatible, Compatible) => Compatible,
+        }
+    }
+
+    /// One stable byte per policy, for callers that key caches on a verdict.
+    pub fn tag(self) -> u8 {
+        match self {
+            SignaturePolicy::Compatible => 0,
+            SignaturePolicy::CanonicalUnbound => 1,
+            SignaturePolicy::Bound => 2,
+            SignaturePolicy::CompatiblePinned => 3,
+        }
+    }
+}
+
+/// Pins a [`SignaturePolicy`] onto a verifier: its `verify_with_key` is the
+/// inner verifier's `verify_with_key_under(policy, ..)`, and an explicit
+/// policy passed through it is combined with [`SignaturePolicy::strictest`]. Wrapping is how the
+/// state transition applies the epoch's rule to every call site below it
+/// without threading the epoch through each one.
+pub struct PolicyVerifier<'a> {
+    inner: &'a dyn SignatureVerifier,
+    policy: SignaturePolicy,
+}
+
+impl<'a> PolicyVerifier<'a> {
+    pub fn new(inner: &'a dyn SignatureVerifier, policy: SignaturePolicy) -> Self {
+        PolicyVerifier { inner, policy }
+    }
+
+    /// The consensus rule for `epoch`.
+    pub fn consensus(inner: &'a dyn SignatureVerifier, epoch: u64) -> Self {
+        Self::new(inner, SignaturePolicy::consensus(epoch))
+    }
+
+    pub fn policy(&self) -> SignaturePolicy {
+        self.policy
+    }
+}
+
+impl SignatureVerifier for PolicyVerifier<'_> {
+    fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool {
+        self.inner.verify_with_key_under(self.policy, pubkey, signing_root, signature)
+    }
+
+    fn verify_with_key_under(
+        &self,
+        policy: SignaturePolicy,
+        pubkey: &[u8],
+        signing_root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        self.inner
+            .verify_with_key_under(self.policy.strictest(policy), pubkey, signing_root, signature)
+    }
+
+    fn verify_l2_settlement(&self, policy: &[u8; 32], program: &[u8; 32], values: &[u8], proof: &[u8]) -> bool {
+        self.inner.verify_l2_settlement(policy, program, values, proof)
+    }
 }
 
 /// Resolves a validator index to its registered public key.
