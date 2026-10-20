@@ -62,6 +62,9 @@ fn is_lifecycle(tx: &PosTransaction) -> bool {
             | PosTransaction::FundedUndelegate(_)
             | PosTransaction::FundedDelegationWithdraw(_)
             | PosTransaction::ValidatorCommissionUpdate(_)
+            | PosTransaction::WithdrawalCredentialRotation(_)
+            | PosTransaction::RescueCommit(_)
+            | PosTransaction::RescueReveal(_)
             | PosTransaction::Withdraw { .. }
             | PosTransaction::ExitV2 { .. }
             | PosTransaction::RandaoRecommit { .. }
@@ -109,6 +112,30 @@ impl<V: SignatureVerifier> SignatureVerifier for LifecycleAdmissionVerifier<'_, 
             }
         }
         self.inner.verify_with_key_under(policy, public_key, message, signature)
+    }
+
+    /// HF3: the credential rotation (0x18) checks both of its keys through
+    /// the spend verifier, which is the only path that accepts suite 0x0003.
+    /// Forwarded under the same allowance; without this override the trait
+    /// default would route it to `verify_with_key` and the lifecycle door
+    /// would refuse every rotation into an SLH key.
+    fn verify_spend_at_epoch(
+        &self,
+        public_key: &[u8],
+        message: &[u8; 32],
+        signature: &[u8],
+        epoch: u64,
+    ) -> bool {
+        if self.inner.is_known_failure(bloch_pos_committee::SignaturePolicy::Compatible, public_key, message, signature) {
+            return false;
+        }
+        if let Some(source) = self.source {
+            if !self.mempool.borrow_mut().reserve_lifecycle_verification(source, self.wall_slot) {
+                self.limited.set(true);
+                return false;
+            }
+        }
+        self.inner.verify_spend_at_epoch(public_key, message, signature, epoch)
     }
 }
 
@@ -188,6 +215,9 @@ impl Engine {
             PosTransaction::FundedUndelegate(t) => Some(lifecycle_source_hash(b"funding-key", &t.funding_pubkey)),
             PosTransaction::FundedDelegationWithdraw(t) => Some(lifecycle_source_hash(b"funding-key", &t.funding_pubkey)),
             PosTransaction::ValidatorCommissionUpdate(t) => Some(validator_lifecycle_source(t.validator)),
+            PosTransaction::WithdrawalCredentialRotation(t) => Some(validator_lifecycle_source(t.validator)),
+            PosTransaction::RescueReveal(t) => Some(lifecycle_source_hash(b"rescue-key", &t.pubkey)),
+            PosTransaction::RescueCommit(t) => Some(lifecycle_source_hash(b"rescue-commit", &t.commitment)),
             PosTransaction::ExitV2 { pubkey_hash, .. } => self.state
                 .validator_index_by_hash(pubkey_hash).map(validator_lifecycle_source),
             PosTransaction::RandaoRecommit { validator, .. } =>

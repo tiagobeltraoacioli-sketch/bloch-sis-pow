@@ -184,12 +184,18 @@ pub const TX_TABLE: &[Row] = &[
     Row {
         tag: tx::RESCUE_COMMIT,
         name: "RescueCommit",
-        status: Status::Pending { gate: "HF3_PQ_MIGRATION_EPOCH", branch: "codex/hf3-tags-20261020" },
+        status: Status::Pending {
+            gate: "LATTICE_EMERGENCY_ACTIVATION_EPOCH (>= HF3_PQ_MIGRATION_EPOCH)",
+            branch: "codex/hf3-tags-20261020",
+        },
     },
     Row {
         tag: tx::RESCUE_REVEAL,
         name: "RescueReveal",
-        status: Status::Pending { gate: "HF3_PQ_MIGRATION_EPOCH", branch: "codex/hf3-tags-20261020" },
+        status: Status::Pending {
+            gate: "LATTICE_EMERGENCY_ACTIVATION_EPOCH (>= HF3_PQ_MIGRATION_EPOCH)",
+            branch: "codex/hf3-tags-20261020",
+        },
     },
     Row {
         tag: tx::KES_ROTATE,

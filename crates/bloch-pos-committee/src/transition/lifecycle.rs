@@ -233,6 +233,9 @@ impl CommittedState {
             | PosTransaction::FundedUndelegate(_)
             | PosTransaction::FundedDelegationWithdraw(_)
             | PosTransaction::ValidatorCommissionUpdate(_)
+            | PosTransaction::WithdrawalCredentialRotation(_)
+            | PosTransaction::RescueCommit(_)
+            | PosTransaction::RescueReveal(_)
             | PosTransaction::ExitV2 { .. } | PosTransaction::RandaoRecommit { .. } => self
                 .clone()
                 .apply_transaction(tx, total_active_sat, base_fee, verifier)

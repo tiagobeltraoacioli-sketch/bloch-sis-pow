@@ -610,6 +610,9 @@ exactly these 32:
 | `0x1F` | `TAG_FUNDED_DELEGATION_OWNER` — funded-delegation owner and principal record |
 | `0x20` | `TAG_FUNDED_DELEGATION_LIFECYCLE` — funded-delegation exit and withdrawal lifecycle |
 | `0x21` | `TAG_L2_SETTLEMENT` — native L2 policy, settlement cursor, inbox, DA and withdrawal records (absent without an L2 policy) |
+| `0x22` | *reserved* — `TAG_KES_ROOT` (KES mainnet port, `codex/bloch-kes-port-20261019`; not in this tree's registry) |
+| `0x23` | *reserved* — `TAG_LC_ROSTER` (light-client roster, `codex/bloch-lc-20261014`; not in this tree's registry) |
+| `0x24` | `TAG_PQ_RESCUE_COMMIT` — post-quantum rescue commitment → inclusion epoch (no leaf while empty; written only behind `LATTICE_EMERGENCY_ACTIVATION_EPOCH`, see `docs/PQ-SUITE-MIGRATION.md`) |
 
 The ADR-041 encodings above document the existing implementation; they do not
 change activation gates. `0x1B` uses an empty entry key and a little-endian

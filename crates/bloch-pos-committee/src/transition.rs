@@ -143,6 +143,10 @@ pub mod l2_da;
 pub use l2_da::{L2DataAvailability, L2DataAvailabilityReject};
 pub mod l2_claim;
 pub use l2_claim::{L2WithdrawClaim, L2WithdrawClaimReject};
+pub mod pq_migration;
+pub use pq_migration::{
+    PqMigrationReject, RescueCommit, RescueReveal, WithdrawalCredentialRotation,
+};
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
 use crate::schedule;
@@ -325,6 +329,15 @@ pub enum PosTransaction {
     /// Release one settled, matured L2 withdrawal from escrow to its L1
     /// recipient (0x16, development networks with `devnet-l2-user-txs`).
     L2WithdrawClaim(L2WithdrawClaim),
+    /// Rotate a validator's withdrawal credential to a hash-based-suite key
+    /// (0x18). INERT until `params::HF3_PQ_MIGRATION_EPOCH`.
+    WithdrawalCredentialRotation(WithdrawalCredentialRotation),
+    /// Publish a lattice-break rescue commitment (0x19). INERT until
+    /// `params::LATTICE_EMERGENCY_ACTIVATION_EPOCH`.
+    RescueCommit(RescueCommit),
+    /// Sweep a lattice key's outputs against a matured commitment (0x1A).
+    /// INERT until `params::LATTICE_EMERGENCY_ACTIVATION_EPOCH`.
+    RescueReveal(RescueReveal),
     /// A value transfer against the committed eUTXO set, priced by the L1 fee
     /// market: **gas × price**, where the gas is derived (class + size,
     /// `fee_market::intrinsic_gas`) and the price is the base fee this block's
@@ -699,6 +712,9 @@ impl PosTransaction {
             PosTransaction::L2Deposit(tx) => return tx.intent_root(),
             PosTransaction::L2DataAvailability(tx) => return tx.intent_root(),
             PosTransaction::L2WithdrawClaim(tx) => return tx.intent_root(),
+            PosTransaction::WithdrawalCredentialRotation(tx) => return tx.signing_root(),
+            PosTransaction::RescueCommit(tx) => return tx.signing_root(),
+            PosTransaction::RescueReveal(tx) => return tx.signing_root(),
             other => h.update(other.canonical_bytes()),
         }
         h.finalize().into()
@@ -872,6 +888,9 @@ impl PosTransaction {
             PosTransaction::L2Deposit(tx) => return tx.canonical_bytes(),
             PosTransaction::L2DataAvailability(tx) => return tx.canonical_bytes(),
             PosTransaction::L2WithdrawClaim(tx) => return tx.canonical_bytes(),
+            PosTransaction::WithdrawalCredentialRotation(tx) => return tx.canonical_bytes(),
+            PosTransaction::RescueCommit(tx) => return tx.canonical_bytes(),
+            PosTransaction::RescueReveal(tx) => return tx.canonical_bytes(),
             PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
                 // Counts are length prefixes like every other variable-length
@@ -1079,6 +1098,11 @@ impl PosTransaction {
             l2_deposit::L2_DEPOSIT_TAG => PosTransaction::L2Deposit(L2Deposit::decode(&mut r)?),
             l2_da::L2_DATA_AVAILABILITY_TAG => PosTransaction::L2DataAvailability(L2DataAvailability::decode(&mut r)?),
             l2_claim::L2_WITHDRAW_CLAIM_TAG => PosTransaction::L2WithdrawClaim(L2WithdrawClaim::decode(&mut r)?),
+            pq_migration::WITHDRAWAL_CREDENTIAL_ROTATION_TAG => PosTransaction::WithdrawalCredentialRotation(
+                WithdrawalCredentialRotation::decode(&mut r)?,
+            ),
+            pq_migration::RESCUE_COMMIT_TAG => PosTransaction::RescueCommit(RescueCommit::decode(&mut r)?),
+            pq_migration::RESCUE_REVEAL_TAG => PosTransaction::RescueReveal(RescueReveal::decode(&mut r)?),
             0x01 => {
                 // Counts are read from untrusted bytes, so nothing is
                 // preallocated from them: a 4-billion-input header on a 40-byte
@@ -1290,6 +1314,9 @@ pub enum TxReject {
     L2Deposit(L2DepositReject),
     L2DataAvailability(L2DataAvailabilityReject),
     L2WithdrawClaim(L2WithdrawClaimReject),
+    /// A post-quantum migration rule (credential rotation, lattice-spend
+    /// freeze, rescue commit/reveal) refused the transaction.
+    PqMigration(PqMigrationReject),
     /// A value transfer broke one of the eUTXO rules.
     Transfer(TransferReject),
     /// A deposit, exit or delegation failed its state-dependent rule.
@@ -1809,6 +1836,12 @@ pub struct CommittedState {
     /// it, exactly like the Coherence roots above.
     evm: EvmCommitment,
     l2_settlement: Option<crate::l2_settlement::State>,
+    /// Lattice-break rescue commitments (commitment → inclusion epoch),
+    /// `transition::pq_migration`. EMPTY until
+    /// `params::LATTICE_EMERGENCY_ACTIVATION_EPOCH` binds (its only writer is
+    /// behind that gate), and an empty map adds no state-root leaf and no
+    /// local-cache section, so every historical root and cache is unchanged.
+    pq_rescue_commits: BTreeMap<[u8; 32], u64>,
     /// Cumulative issued supply in satoshis — the hard-cap invariant's
     /// counter (2026-08-12), committed under `TAG_ISSUED_SUPPLY`.
     ///
@@ -2379,6 +2412,7 @@ impl CommittedState {
             coherence_nullifier_root,
             evm,
             l2_settlement: None,
+            pq_rescue_commits: BTreeMap::new(),
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
             eutxos: opening_balances.iter().cloned().collect(),
         };
@@ -3107,6 +3141,7 @@ impl CommittedState {
         if let Some(state) = &self.l2_settlement {
             crate::state_root::insert_l2_settlement(&mut tree, &state.committed_bytes());
         }
+        crate::state_root::insert_pq_rescue_commits(&mut tree, &self.pq_rescue_commits);
         tree
     }
 
@@ -3656,9 +3691,22 @@ impl CommittedState {
             PosTransaction::L2WithdrawClaim(claim) => self
                 .apply_l2_withdraw_claim(claim, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::L2WithdrawClaim),
-            PosTransaction::Transfer { .. } => self
-                .apply_transfer(tx, base_fee_millisat_per_gas, verifier)
-                .map_err(TxReject::Transfer),
+            PosTransaction::WithdrawalCredentialRotation(rotation) => self
+                .apply_withdrawal_credential_rotation(rotation, verifier)
+                .map_err(TxReject::PqMigration),
+            PosTransaction::RescueCommit(commit) => self
+                .apply_rescue_commit(commit)
+                .map_err(TxReject::PqMigration),
+            PosTransaction::RescueReveal(reveal) => self
+                .apply_rescue_reveal(reveal, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::PqMigration),
+            PosTransaction::Transfer { .. } => {
+                // Emergency freeze (INERT: never evaluated below
+                // `LATTICE_EMERGENCY_ACTIVATION_EPOCH`).
+                self.check_lattice_spend_freeze(tx)?;
+                self.apply_transfer(tx, base_fee_millisat_per_gas, verifier)
+                    .map_err(TxReject::Transfer)
+            }
             PosTransaction::TransferV2 { .. } => {
                 // THE FLAG-DAY GATE, FIRST — before any other look at the
                 // transaction. Read from `self.epoch`, which is COMMITTED
@@ -3672,6 +3720,7 @@ impl CommittedState {
                 if self.epoch < crate::params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH {
                     return Err(TxReject::Transfer(TransferReject::FormatNotActive));
                 }
+                self.check_lattice_spend_freeze(tx)?;
                 self.apply_transfer_v2(tx, base_fee_millisat_per_gas, verifier)
                     .map_err(TxReject::Transfer)
             }
@@ -5712,6 +5761,8 @@ impl CommittedState {
         // 5. Open E+1. The cohort cap for the new epoch is applied inside
         //    duty_roster_at (genesis_cohort.rs closed form — rule 3).
         st.epoch = next_epoch;
+        // Rescue commitments past their TTL (no-op on the empty pre-gate map).
+        st.prune_pq_rescue_commits(next_epoch);
         // M8 part 2: a running network without L2 state installs the pinned
         // activation policy at the flag day, only if the policy names this
         // network. Inert while `L2_SETTLEMENT_ACTIVATION_EPOCH` is the sentinel.
@@ -7011,6 +7062,10 @@ mod tests {
     mod funded_delegation_lifecycle {
         use super::*;
         include!("transition/funded_delegation/tests.rs");
+    }
+    mod pq_migration {
+        use super::*;
+        include!("transition/pq_migration/tests.rs");
     }
     use crate::header::BlockHeaderV4;
 
@@ -13255,6 +13310,11 @@ mod tests {
                 Box::new(crate::params::own_target_votes_test::open()),
                 Box::new(crate::params::sig_canonical_gate_open_guard()),
                 Box::new(crate::params::mldsa_pin_gate_open_guard()),
+                // HF3 suite migration (rotation into suite 0x0003). The
+                // lattice EMERGENCY is deliberately not opened: it freezes
+                // lattice-key spends by design and is never part of a
+                // scheduled release (`hard_forks::NEVER_IN_A_SCHEDULED_RELEASE`).
+                Box::new(crate::params::pq_migration_rehearsal::open_slh()),
             ]
         }
         fn run() -> ([u8; 32], Vec<(([u8; 32], u32), u64)>, u128, Result<u128, TransferReject>, Vec<(([u8; 32], u32), u64)>) {
@@ -15399,6 +15459,13 @@ mod tests {
             // supply) to an output; its fee comes from the relayer's inputs.
             PosTransaction::L2WithdrawClaim(_) => {}
             PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => {} // Cursor only; no balances.
+            // Rewrites one registry column (the credential); no satoshi moves.
+            PosTransaction::WithdrawalCredentialRotation(_) => {}
+            // Inserts a 32-byte commitment; no satoshi moves.
+            PosTransaction::RescueCommit(_) => {}
+            // Sweeps existing outputs into one output minus the market fee
+            // (strict conservation); nothing is issued.
+            PosTransaction::RescueReveal(_) => {}
         }
 
         // Monotone under blocks and boundaries, and never above the cap.

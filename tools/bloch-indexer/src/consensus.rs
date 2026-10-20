@@ -92,6 +92,8 @@ gates!(
     HF2_GROWTH_CAP_EPOCH,
     SIG_CANONICAL_ACTIVATION_EPOCH,
     MLDSA_PIN_ACTIVATION_EPOCH,
+    HF3_PQ_MIGRATION_EPOCH,
+    LATTICE_EMERGENCY_ACTIVATION_EPOCH,
 );
 
 /// Source commit of this build, when the builder exported

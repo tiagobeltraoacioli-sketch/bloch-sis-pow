@@ -139,9 +139,9 @@ has drifted to ~1008 in the deeper worktrees).
 | `0x15` | `L2DataAvailability` | **Assigned, native L2** — `devnet-l2-user-txs` builds only until activation | l2 | `wire_tag_registry.rs` |
 | `0x16` | `L2WithdrawClaim` | **Assigned, native L2** — `devnet-l2-user-txs` builds only until activation | l2 | `wire_tag_registry.rs` |
 | `0x17` | `KesRegister` | **HF3, reserved** — KES port (`codex/hf3-kes-20261020`), same byte devnet4 runs; gate `KES_REGISTRATION_EPOCH` | consensus | `wire_alloc.rs` |
-| `0x18` | `WithdrawalCredentialRotation` | **HF3, reserved** — PQ migration, gate `HF3_PQ_MIGRATION_EPOCH` | pq-migration | `wire_alloc.rs` |
-| `0x19` | `RescueCommit` | **HF3, reserved** — PQ migration, gate `HF3_PQ_MIGRATION_EPOCH` | pq-migration | `wire_alloc.rs` |
-| `0x1A` | `RescueReveal` | **HF3, reserved** — PQ migration, gate `HF3_PQ_MIGRATION_EPOCH` | pq-migration | `wire_alloc.rs` |
+| `0x18` | `WithdrawalCredentialRotation` | **HF3, assigned, unarmed** — PQ migration, gate `HF3_PQ_MIGRATION_EPOCH` | pq-migration | `wire_alloc.rs` |
+| `0x19` | `RescueCommit` | **HF3, assigned, unarmed** — PQ rescue, gate `LATTICE_EMERGENCY_ACTIVATION_EPOCH` (≥ `HF3_PQ_MIGRATION_EPOCH`) | pq-migration | `wire_alloc.rs` |
+| `0x1A` | `RescueReveal` | **HF3, assigned, unarmed** — PQ rescue, gate `LATTICE_EMERGENCY_ACTIVATION_EPOCH` (≥ `HF3_PQ_MIGRATION_EPOCH`) | pq-migration | `wire_alloc.rs` |
 | `0x1B` | `KesRotate` | **HF3, reserved** — KES leaf-authorised rotation (p8b proposal, moved from `0x18`) | consensus | `wire_alloc.rs` |
 | `0x1C`–`0xFF` | free | — | — | — |
 
@@ -378,7 +378,7 @@ wrong message; it produces a wrong state root, on every node, permanently.
 | `0x21` | `TAG_L2_SETTLEMENT` | **Assigned, native L2 (M8 port)** — no leaf without an L2 policy | l2 |
 | `0x22` | `TAG_KES_ROOT` | **HF3, reserved** — KES port; devnet4 byte | consensus |
 | `0x23` | `TAG_LC_ROSTER` | **Reserved** — light client (`codex/bloch-lc-20261014`), live on devnet4 | lc |
-| `0x24` | `TAG_PQ_RESCUE_COMMIT` | **HF3, reserved** — PQ rescue commitments, no leaf while empty | pq-migration |
+| `0x24` | `TAG_PQ_RESCUE_COMMIT` | **HF3, assigned, unarmed** — PQ rescue commitments, no leaf while empty | pq-migration |
 | `0x25`+ | free | — | — | — |
 
 **Next free state-root tag: `0x25`.** (The L2 branch first used `0x1F`, which
@@ -942,8 +942,8 @@ on any ref, so it moves to `0x1B`; no implemented byte is re-pointed.
 | tx | `0x07`–`0x09` | tombstones (ADR-041) | — | never assign |
 | tx | `0x17` | `KesRegister` | `KES_REGISTRATION_EPOCH` | `codex/hf3-kes-20261020` |
 | tx | `0x18` | `WithdrawalCredentialRotation` | `HF3_PQ_MIGRATION_EPOCH` | `codex/hf3-tags-20261020` |
-| tx | `0x19` | `RescueCommit` | `HF3_PQ_MIGRATION_EPOCH` | `codex/hf3-tags-20261020` |
-| tx | `0x1A` | `RescueReveal` | `HF3_PQ_MIGRATION_EPOCH` | `codex/hf3-tags-20261020` |
+| tx | `0x19` | `RescueCommit` | `LATTICE_EMERGENCY_ACTIVATION_EPOCH` (≥ `HF3_PQ_MIGRATION_EPOCH`) | `codex/hf3-tags-20261020` |
+| tx | `0x1A` | `RescueReveal` | `LATTICE_EMERGENCY_ACTIVATION_EPOCH` (≥ `HF3_PQ_MIGRATION_EPOCH`) | `codex/hf3-tags-20261020` |
 | tx | `0x1B` | `KesRotate` | KES gate | `codex/hf3-kes-20261020` (design: p8b) |
 | tx | `0x1C`+ | free | — | — |
 | state | `0x01`–`0x21` | released set (`STATE_COMPONENT_TAGS`) | — | mainnet |

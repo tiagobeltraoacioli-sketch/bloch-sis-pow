@@ -82,7 +82,17 @@ pub const HARD_FORK_GATES: &[HardForkGate] = &[
     // consensus messages only, and the platform-independent ML-DSA rule.
     gate!(Hf2, params::SIG_CANONICAL_ACTIVATION_EPOCH, false),
     gate!(Hf2, params::MLDSA_PIN_ACTIVATION_EPOCH, false),
+    // HF3: post-quantum suite migration (credential rotation 0x18) and the
+    // lattice-break emergency (0x19/0x1A rescue, lattice spends frozen).
+    gate!(Hf3, params::HF3_PQ_MIGRATION_EPOCH, false),
+    gate!(Hf3, params::LATTICE_EMERGENCY_ACTIVATION_EPOCH, false),
 ];
+
+/// Gates that no scheduled release may arm (owner scope 2026-10-20: nothing
+/// that changes how users deposit, transfer or withdraw). The lattice
+/// emergency freezes lattice-key spends by design; it exists only for a
+/// public break of both lattice families and needs its own decision.
+pub const NEVER_IN_A_SCHEDULED_RELEASE: &[&str] = &["params::LATTICE_EMERGENCY_ACTIVATION_EPOCH"];
 
 /// Gates the next release may arm (owner decision 2026-10-20: claim
 /// finality only). Everything else must stay `u64::MAX`.
@@ -115,6 +125,8 @@ pub const fn hard_fork_schedule_coherent(
     hf2_growth_cap: u64,
     sig_canonical: u64,
     mldsa_pin: u64,
+    pq_migration: u64,
+    lattice_emergency: u64,
 ) -> bool {
     params::hf1_gates_coherent(claim_finality, frozen_set)
         && requires_no_later(frozen_set, own_target)
@@ -122,6 +134,8 @@ pub const fn hard_fork_schedule_coherent(
         && hf2_after_hf1(claim_finality, hf2_growth_cap)
         && hf2_after_hf1(claim_finality, sig_canonical)
         && hf2_after_hf1(claim_finality, mldsa_pin)
+        && hf2_after_hf1(claim_finality, pq_migration)
+        && requires_no_later(pq_migration, lattice_emergency)
 }
 
 // The ML-DSA pin's QUALIFICATION-ONLY build arms it at 0 on purpose (full
@@ -135,6 +149,8 @@ const _: () = assert!(hard_fork_schedule_coherent(
     params::HF2_GROWTH_CAP_EPOCH,
     params::SIG_CANONICAL_ACTIVATION_EPOCH,
     params::MLDSA_PIN_ACTIVATION_EPOCH,
+    params::HF3_PQ_MIGRATION_EPOCH,
+    params::LATTICE_EMERGENCY_ACTIVATION_EPOCH,
 ));
 // The P5a alias must follow the HF2 release switch.
 const _: () = assert!(params::NATIVE_SLASHING_ACTIVATION_EPOCH == params::HF2_SLASHING_V2_EPOCH);
@@ -155,6 +171,8 @@ mod tests {
             params::HF2_GROWTH_CAP_EPOCH,
             params::SIG_CANONICAL_ACTIVATION_EPOCH,
             params::MLDSA_PIN_ACTIVATION_EPOCH,
+            params::HF3_PQ_MIGRATION_EPOCH,
+            params::LATTICE_EMERGENCY_ACTIVATION_EPOCH,
         ));
     }
 
@@ -164,6 +182,15 @@ mod tests {
             if !RELEASE_ARMABLE.contains(&g.name) {
                 assert!(!g.armed(), "{} is armed but outside this release's scope", g.name);
             }
+        }
+    }
+
+    #[test]
+    fn emergency_gates_are_never_release_armable() {
+        for name in NEVER_IN_A_SCHEDULED_RELEASE {
+            assert!(!RELEASE_ARMABLE.contains(name));
+            let g = HARD_FORK_GATES.iter().find(|g| g.name == *name).expect("listed");
+            assert!(!g.armed(), "{name} must stay u64::MAX");
         }
     }
 
@@ -201,44 +228,49 @@ mod tests {
 
     #[test]
     fn claim_finality_may_ship_alone() {
-        assert!(hard_fork_schedule_coherent(6_460, M, M, M, M, M, M));
-        assert!(hard_fork_schedule_coherent(0, M, M, M, M, M, M));
+        assert!(hard_fork_schedule_coherent(6_460, M, M, M, M, M, M, M, M));
+        assert!(hard_fork_schedule_coherent(0, M, M, M, M, M, M, M, M));
     }
 
     #[test]
     fn frozen_set_needs_claim_finality_no_later() {
-        assert!(hard_fork_schedule_coherent(6_460, 6_460, M, M, M, M, M));
-        assert!(hard_fork_schedule_coherent(6_460, 6_466, M, M, M, M, M));
-        assert!(!hard_fork_schedule_coherent(M, 6_460, M, M, M, M, M));
-        assert!(!hard_fork_schedule_coherent(6_466, 6_460, M, M, M, M, M));
+        assert!(hard_fork_schedule_coherent(6_460, 6_460, M, M, M, M, M, M, M));
+        assert!(hard_fork_schedule_coherent(6_460, 6_466, M, M, M, M, M, M, M));
+        assert!(!hard_fork_schedule_coherent(M, 6_460, M, M, M, M, M, M, M));
+        assert!(!hard_fork_schedule_coherent(6_466, 6_460, M, M, M, M, M, M, M));
     }
 
     #[test]
     fn own_target_needs_the_frozen_set_no_later() {
-        assert!(hard_fork_schedule_coherent(6_460, 6_460, 6_466, M, M, M, M));
-        assert!(hard_fork_schedule_coherent(6_460, 6_460, 6_460, M, M, M, M));
-        assert!(!hard_fork_schedule_coherent(6_460, M, 6_466, M, M, M, M));
-        assert!(!hard_fork_schedule_coherent(6_460, 6_470, 6_466, M, M, M, M));
-        assert!(!hard_fork_schedule_coherent(M, M, 6_466, M, M, M, M));
+        assert!(hard_fork_schedule_coherent(6_460, 6_460, 6_466, M, M, M, M, M, M));
+        assert!(hard_fork_schedule_coherent(6_460, 6_460, 6_460, M, M, M, M, M, M));
+        assert!(!hard_fork_schedule_coherent(6_460, M, 6_466, M, M, M, M, M, M));
+        assert!(!hard_fork_schedule_coherent(6_460, 6_470, 6_466, M, M, M, M, M, M));
+        assert!(!hard_fork_schedule_coherent(M, M, 6_466, M, M, M, M, M, M));
     }
 
     #[test]
     fn hf2_needs_hf1_a_day_earlier() {
-        assert!(hard_fork_schedule_coherent(6_460, M, M, 6_550, 6_550, M, M));
-        assert!(hard_fork_schedule_coherent(6_460, M, M, 6_550, M, M, M));
-        assert!(hard_fork_schedule_coherent(6_460, M, M, M, 6_550, M, M));
+        assert!(hard_fork_schedule_coherent(6_460, M, M, 6_550, 6_550, M, M, M, M));
+        assert!(hard_fork_schedule_coherent(6_460, M, M, 6_550, M, M, M, M, M));
+        assert!(hard_fork_schedule_coherent(6_460, M, M, M, 6_550, M, M, M, M));
         // HF2 without HF1.
-        assert!(!hard_fork_schedule_coherent(M, M, M, 6_550, M, M, M));
-        assert!(!hard_fork_schedule_coherent(M, M, M, M, 6_550, M, M));
+        assert!(!hard_fork_schedule_coherent(M, M, M, 6_550, M, M, M, M, M));
+        assert!(!hard_fork_schedule_coherent(M, M, M, M, 6_550, M, M, M, M));
         // Less than one day after HF1.
-        assert!(!hard_fork_schedule_coherent(6_460, M, M, 6_549, M, M, M));
-        assert!(!hard_fork_schedule_coherent(6_460, M, M, M, 6_460, M, M));
+        assert!(!hard_fork_schedule_coherent(6_460, M, M, 6_549, M, M, M, M, M));
+        assert!(!hard_fork_schedule_coherent(6_460, M, M, M, 6_460, M, M, M, M));
         // Signature gates follow the same rule.
-        assert!(hard_fork_schedule_coherent(6_460, M, M, M, M, 6_550, 6_550));
-        assert!(!hard_fork_schedule_coherent(M, M, M, M, M, 6_550, M));
-        assert!(!hard_fork_schedule_coherent(M, M, M, M, M, M, 6_550));
-        assert!(!hard_fork_schedule_coherent(6_460, M, M, M, M, 6_500, M));
+        assert!(hard_fork_schedule_coherent(6_460, M, M, M, M, 6_550, 6_550, M, M));
+        assert!(!hard_fork_schedule_coherent(M, M, M, M, M, 6_550, M, M, M));
+        assert!(!hard_fork_schedule_coherent(M, M, M, M, M, M, 6_550, M, M));
+        assert!(!hard_fork_schedule_coherent(6_460, M, M, M, M, 6_500, M, M, M));
+        // HF3 PQ migration after HF1; the emergency only after the migration.
+        assert!(hard_fork_schedule_coherent(6_460, M, M, M, M, M, M, 6_562, M));
+        assert!(!hard_fork_schedule_coherent(M, M, M, M, M, M, M, 6_562, M));
+        assert!(!hard_fork_schedule_coherent(6_460, M, M, M, M, M, M, M, 6_600));
+        assert!(!hard_fork_schedule_coherent(6_460, M, M, M, M, M, M, 6_600, 6_562));
         // Saturation: claim finality near the top never wraps.
-        assert!(!hard_fork_schedule_coherent(M - 1, M, M, M - 2, M, M, M));
+        assert!(!hard_fork_schedule_coherent(M - 1, M, M, M - 2, M, M, M, M, M));
     }
 }
