@@ -13,6 +13,10 @@ use pqcrypto_traits::sign::{PublicKey, SecretKey, DetachedSignature};
 use sha3::{Sha3_256, Digest};
 use log::debug;
 
+/// Signer-side hardening (p9e finding 2): self-tests and verify-before-release.
+/// Non-consensus: verification rules are untouched.
+pub mod hardening;
+
 // Hybrid signature layout (Sprint B6b-1): ML-DSA-65 ‖ Falcon-1024.
 // Public key = mldsa_pk(1952) ‖ falcon_pk. Secret = mldsa_sk(4032) ‖ falcon_sk.
 // Signature  = mldsa_sig(3309) ‖ falcon_sig(variable). Splits use the fixed
