@@ -1205,4 +1205,34 @@ mod kes_rules {
         assert!(kes::verify(&LeafOnly, &public, 3, &message, &sig));
         assert!(!kes::verify(&LeafOnly, &public, 4, &message, &sig));
     }
+
+    // ── HF2/HF3 security review (2026-10-20): cross-fork findings ─────────
+    // Ported from the review branch (codex/hf23-review-20261020, fa65a3ac)
+    // to the integrated API. Both pass on the integration tree.
+
+    /// HF23-R1 (HF2 P5a x HF3 KES, review F-3). Consensus slashes a genuine
+    /// KES-era equivocation; the node's P5a pre-admission must judge the
+    /// signatures exactly as consensus does (`verify_precheck_signatures`
+    /// runs `slashing::verify_offender_signature`, which resolves the KES
+    /// leaf), and a KES-registered validator's binding is never "final", so
+    /// a failure would be ignored rather than scored as a peer fault.
+    #[test]
+    fn hf23_p5a_precheck_must_accept_genuine_kes_evidence_that_consensus_slashes() {
+        let _armed = Armed::enforcing(2, 2);
+        let (_t, g, _chains) = setup_with(4, ToyVerifier, &[]);
+        let mut st = bound(g.clone());
+        st.kes.insert(3, toy_kes_public(3).into());
+        let slot = 4 * 32 + 1; // epoch 4: period 1
+        let first = vote(&st, 3, slot, 0xAA, |r| honest_own(&st, 3, 1, r));
+        let second = vote(&st, 3, slot, 0xBB, |r| honest_own(&st, 3, 1, r));
+        let dels: [crate::delegation::Delegation; 0] = [];
+        let pair = crate::slashing::SlashingEvidence { first: first.clone(), second: second.clone() };
+        assert!(crate::slashing::SlashingState::new()
+            .process(&pair, 4, 0, &dels, 1_000_000, 0, &ToyVerifier, &view(&st))
+            .is_ok(), "consensus slashes this evidence");
+        let ev = SlashingEvidence::AttestationOffence { first, second };
+        let pre = st.precheck_slashing_evidence(&ev).expect("structure and context pass");
+        assert!(!pre.key_binding_final, "a KES registration is branch-dependent: never a final binding");
+        assert_eq!(st.verify_precheck_signatures(&pre, &ToyVerifier), Some(true));
+    }
 }
