@@ -249,6 +249,50 @@ pub fn offence_predates_activation(evidence: &crate::interfaces::SlashingEvidenc
     evidence_offence_epoch(evidence) < crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH
 }
 
+/// Anti-replay identity of a header-pair evidence: sorted proposal signing
+/// roots under `DS_SLASH`, signatures excluded — the construction
+/// [`SlashingState::process_proposer`] has always used, factored out so
+/// pre-admission computes the very same bytes.
+pub fn proposer_evidence_id(
+    validator: u32,
+    first: &crate::header::BlockHeaderV4,
+    second: &crate::header::BlockHeaderV4,
+) -> [u8; 32] {
+    let r1 = first.proposal_signing_root();
+    let r2 = second.proposal_signing_root();
+    let (lo, hi) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
+    let mut h = Sha3_256::new();
+    h.update(DS_SLASH);
+    h.update(validator.to_le_bytes());
+    h.update(lo);
+    h.update(hi);
+    h.finalize().into()
+}
+
+/// The one rule consensus uses to judge an evidence signature: resolve the
+/// offender's verification key for the message's own epoch (vote target
+/// epoch, header slot epoch) and verify. `None` = no key resolves for this
+/// index here (consensus: `UnknownValidator`); `Some(false)` = bad signature.
+///
+/// Both [`SlashingState::process`] / [`SlashingState::process_proposer`] and
+/// the node's pre-admission (`CommittedState::verify_precheck_signatures`)
+/// call THIS function, so any change to key resolution (for example a
+/// per-epoch KES leaf) changes both together and the relay can never refuse
+/// evidence that consensus would slash. Today the key is the static
+/// registered key and `message_epoch` does not affect the result.
+pub fn verify_offender_signature(
+    keys: &dyn KeyLookup,
+    verifier: &dyn SignatureVerifier,
+    validator: u32,
+    message_epoch: u64,
+    signing_root: &[u8; 32],
+    signature: &[u8],
+) -> Option<bool> {
+    let _ = message_epoch;
+    let pubkey = keys.pubkey(validator)?;
+    Some(verifier.verify_with_key(pubkey, signing_root, signature))
+}
+
 /// Everything one applied slash produced. Balances live outside this crate,
 /// so the outcome reports amounts and leaves crediting/debiting to the caller.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -368,6 +412,12 @@ impl SlashingState {
         }
     }
 
+    /// Has this evidence identity already been applied? Read-only mirror of
+    /// the anti-replay check, for clone-free pre-admission (P5a).
+    pub fn is_applied(&self, id: &[u8; 32]) -> bool {
+        self.applied.contains(id)
+    }
+
     /// Has this validator already been slashed and ejected?
     pub fn is_ejected(&self, validator: u32) -> bool {
         self.ejected.contains(&validator)
@@ -482,12 +532,21 @@ impl SlashingState {
         //    against it. `offense()` has already established that both
         //    attestations name the same validator, so resolving per-message
         //    would be resolving the same index twice.
-        let Some(pubkey) = keys.pubkey(validator) else {
-            return Err(EvidenceError::UnknownValidator);
-        };
+        //    Key resolution lives in `verify_offender_signature`, shared with
+        //    the node's pre-admission. An unknown index resolves no key on the
+        //    first message, so it still fails before any verification.
         for att in [&evidence.first, &evidence.second] {
-            if !verifier.verify_with_key(pubkey, &att.data.signing_root(), &att.signature) {
-                return Err(EvidenceError::BadSignature);
+            match verify_offender_signature(
+                keys,
+                verifier,
+                validator,
+                att.data.target_epoch,
+                &att.data.signing_root(),
+                &att.signature,
+            ) {
+                None => return Err(EvidenceError::UnknownValidator),
+                Some(false) => return Err(EvidenceError::BadSignature),
+                Some(true) => {}
             }
         }
 
@@ -576,16 +635,8 @@ impl SlashingState {
         //    under DS_PROPOSE while attestation roots are under DS_ATTEST, so
         //    a header-pair id can never collide with an attestation-pair id
         //    even though both live in one `applied` set.
-        let r1 = first.header.proposal_signing_root();
-        let r2 = second.header.proposal_signing_root();
-        let (lo, hi) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
         let validator = first.header.proposer_index;
-        let mut h = Sha3_256::new();
-        h.update(DS_SLASH);
-        h.update(validator.to_le_bytes());
-        h.update(lo);
-        h.update(hi);
-        let id: [u8; 32] = h.finalize().into();
+        let id = proposer_evidence_id(validator, &first.header, &second.header);
         if self.applied.contains(&id) {
             return Err(EvidenceError::AlreadyApplied);
         }
@@ -598,16 +649,18 @@ impl SlashingState {
         // 4. Signatures, last — the proposer really signed both headers.
         //    One key, resolved from the offender's index in the caller's
         //    registry; step 1 has already established both headers name it.
-        let Some(pubkey) = keys.pubkey(validator) else {
-            return Err(EvidenceError::UnknownValidator);
-        };
         for env in [first, second] {
-            if !verifier.verify_with_key(
-                pubkey,
+            match verify_offender_signature(
+                keys,
+                verifier,
+                validator,
+                crate::epoch_of(env.header.slot),
                 &env.header.proposal_signing_root(),
                 &env.proposer_sig,
             ) {
-                return Err(EvidenceError::BadSignature);
+                None => return Err(EvidenceError::UnknownValidator),
+                Some(false) => return Err(EvidenceError::BadSignature),
+                Some(true) => {}
             }
         }
 
