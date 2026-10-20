@@ -20,6 +20,8 @@
 #   * the `default` feature set is `slh_dsa_shake_128s` only (no getrandom
 #     0.2 OS-RNG stack, no other parameter sets); bloch-crypto additionally
 #     names it explicitly with default-features = false;
+#   * upstream doc examples are not run as doctests (they need features this
+#     copy does not build);
 #   * a vendor-pin test (sha2/toml/serde dev-deps, same versions as
 #     crates/pqcrypto-internals) is added; rand_chacha 0.3 stays as the one
 #     upstream dev-dependency, for upstream's in-crate unit tests.
@@ -46,6 +48,9 @@ autoexamples = false
 [lib]
 name = "fips205"
 path = "src/lib.rs"
+# Upstream's doc examples assume its default features (all twelve parameter
+# sets + the getrandom OS RNG), which this copy deliberately does not build.
+doctest = false
 
 [[test]]
 name = "vendor_pin"
