@@ -107,6 +107,41 @@ pub const ACTIVATION_DELAY_EPOCHS: u64 = 8;
 /// `set_size / 4` epochs of publicly visible queue traffic to take a majority.
 pub const MAX_ACTIVATIONS_PER_EPOCH: usize = 4;
 
+/// Growth-cap window, consulted only behind
+/// `params::NATIVE_GROWTH_CAP_ACTIVATION_EPOCH`: 24 epochs is 6.4 hours,
+/// about one ObenBlock epoch, so the ObenBlock bound carries over unchanged.
+pub const GROWTH_WINDOW_EPOCHS: u64 = 24;
+
+/// At most `W / GROWTH_DIV` of new own stake activates per window.
+pub const GROWTH_DIV: u128 = 64;
+
+/// Activation budget per [`GROWTH_WINDOW_EPOCHS`] window for active weight
+/// `w`: `max(w / GROWTH_DIV, MIN_DEPOSIT_SAT)`. The floor lets a small set
+/// still add one minimum validator per window.
+pub const fn growth_budget_sat(w: u128) -> u128 {
+    let g = w / GROWTH_DIV;
+    if g > MIN_DEPOSIT_SAT { g } else { MIN_DEPOSIT_SAT }
+}
+
+/// How many of `stakes` (already in queue order, already limited to
+/// [`MAX_ACTIVATIONS_PER_EPOCH`]) may activate, given `used` sat activated
+/// earlier in the window. FIFO: the first that does not fit stops the epoch,
+/// so a later small bond cannot jump a larger one. An empty window always
+/// admits its head, so a bond larger than the budget (the set shrank after it
+/// was deposited) still activates and the queue cannot deadlock.
+pub fn growth_admissions(used: u128, budget: u128, stakes: &[u128]) -> usize {
+    let mut used = used;
+    let mut n = 0;
+    for stake in stakes {
+        if used != 0 && used.saturating_add(*stake) > budget {
+            break;
+        }
+        used = used.saturating_add(*stake);
+        n += 1;
+    }
+    n
+}
+
 /// Candidate lifetime ceiling for the permanent validator registry and its
 /// deposit history, consulted only behind
 /// `params::ACTIVATION_QUEUE_V2_ACTIVATION_EPOCH`.

@@ -694,3 +694,76 @@ fn finality_recovery_activates_without_backdating_or_bypassing_churn() {
         assert!(state.finality().finalized.epoch >= 20);
     });
 }
+
+#[test]
+fn native_growth_cap_gate_is_inert() {
+    assert_eq!(crate::params::NATIVE_GROWTH_CAP_ACTIVATION_EPOCH, u64::MAX);
+    for epoch in [0, 2_884, 6_016, u64::MAX - 1, u64::MAX] {
+        assert!(!crate::params::native_growth_cap_active(epoch));
+    }
+}
+
+#[test]
+fn growth_budget_is_w_over_64_with_a_minimum_deposit_floor() {
+    assert_eq!(staking::growth_budget_sat(0), staking::MIN_DEPOSIT_SAT);
+    assert_eq!(staking::growth_budget_sat(sat(200_000_000)), sat(3_125_000));
+    // FIFO, head always enters an empty window, nothing jumps the queue.
+    assert_eq!(staking::growth_admissions(0, 25, &[30, 10]), 1);
+    assert_eq!(staking::growth_admissions(0, 25, &[10, 10, 10]), 2);
+    assert_eq!(staking::growth_admissions(20, 25, &[10, 5]), 0);
+    assert_eq!(staking::growth_admissions(20, 25, &[5, 1]), 1);
+    assert_eq!(staking::growth_admissions(u128::MAX, u128::MAX - 1, &[1]), 0);
+}
+
+/// Same scenario as `finality_recovery_activates_without_backdating_or_bypassing_churn`
+/// (which pins 4 + 1 activations with the cap inert): with the cap armed the
+/// 1.6M-BLCH set admits 25k BLCH per 24-epoch window, so one bond at 22 and
+/// the next batch only when that activation leaves the window, at 46, sized
+/// to the budget of the (grown) weight then.
+#[test]
+fn growth_cap_bounds_activated_weight_per_window_when_rehearsed() {
+    let _g = crate::params::native_growth_cap_rehearsal::open();
+    run(|| {
+        let deposits: Vec<_> = (50..55).map(deposit).collect();
+        let (t, mut state, mut chains) = fixture(&deposits);
+        for tx in &deposits { apply(&mut state, tx).unwrap(); }
+        for _ in 0..20 { state = t.process_epoch(&state).unwrap(); }
+        for tag in 50..55 { chains.push(RandaoChain::generate([tag; 32])); }
+        let mut target = [0; 32];
+        let mut w46 = 0u128;
+        let activated = |s: &CommittedState| -> Vec<u64> {
+            let mut e: Vec<_> = s.validators.values().filter(|v| v.index >= 8)
+                .map(|v| v.activation_epoch).filter(|e| *e != u64::MAX).collect();
+            e.sort_unstable();
+            e
+        };
+        for slot in (20 * SLOTS_PER_EPOCH)..=(47 * SLOTS_PER_EPOCH) {
+            let atts = if slot % SLOTS_PER_EPOCH == SLOTS_PER_EPOCH - 1 {
+                full_epoch_attestations(&state, target)
+            } else { Vec::new() };
+            let b = build_block(&t, &state, slot, &atts, &[], &mut chains);
+            state = t.apply_block(&state, &b, &atts, &[]).unwrap();
+            if slot % SLOTS_PER_EPOCH == 0 { target = *state.head.as_bytes(); }
+            if slot == 45 * SLOTS_PER_EPOCH {
+                assert_eq!(activated(&state), vec![22], "one bond per window");
+            }
+            if slot == 46 * SLOTS_PER_EPOCH {
+                // W as the 45 -> 46 boundary measured it. Issuance compounds
+                // into the test bonds, so W, and the budget, grew since 22.
+                w46 = state
+                    .duty_roster_at(45)
+                    .iter()
+                    .map(|v| u128::from(v.effective_stake))
+                    .sum();
+            }
+        }
+        let epochs = activated(&state);
+        assert_eq!(epochs[0], 22);
+        assert!(epochs[1..].iter().all(|e| *e == 46), "nothing between the windows: {epochs:?}");
+        let n = epochs.len() as u128 - 1;
+        let budget = staking::growth_budget_sat(w46);
+        assert!(n >= 1 && n * staking::MIN_DEPOSIT_SAT <= budget);
+        assert!(n == 4 || (n + 1) * staking::MIN_DEPOSIT_SAT > budget, "FIFO fills the budget");
+        assert!(state.finality().finalized.epoch >= 44);
+    });
+}

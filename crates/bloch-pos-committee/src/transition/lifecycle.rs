@@ -37,10 +37,31 @@ impl CommittedState {
             })
             .collect();
         eligible.sort_unstable();
-        for (_, _, _, index) in eligible
-            .into_iter()
-            .take(staking::MAX_ACTIVATIONS_PER_EPOCH)
-        {
+        eligible.truncate(staking::MAX_ACTIVATIONS_PER_EPOCH);
+        if crate::params::native_growth_cap_active(next_epoch) && !eligible.is_empty() {
+            // Weight of the closing epoch, as finality counts it (after the
+            // per-validator and cohort caps, before the leak).
+            let w: u128 = self
+                .duty_roster_at(next_epoch.saturating_sub(1))
+                .iter()
+                .map(|v| u128::from(v.effective_stake))
+                .sum();
+            let window_start = next_epoch.saturating_sub(staking::GROWTH_WINDOW_EPOCHS - 1);
+            let used: u128 = self
+                .funded_validators
+                .iter()
+                .filter_map(|i| self.validators.get(i))
+                .filter(|r| r.activation_epoch >= window_start && r.activation_epoch < next_epoch)
+                .map(|r| r.staked_sat)
+                .fold(0u128, u128::saturating_add);
+            let stakes: Vec<u128> = eligible
+                .iter()
+                .map(|(_, _, _, i)| self.validators.get(i).map_or(0, |r| r.staked_sat))
+                .collect();
+            let n = staking::growth_admissions(used, staking::growth_budget_sat(w), &stakes);
+            eligible.truncate(n);
+        }
+        for (_, _, _, index) in eligible {
             if let Some(rec) = self.validators.get_mut(&index) {
                 rec.activation_epoch = next_epoch;
             }

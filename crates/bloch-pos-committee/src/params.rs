@@ -2462,6 +2462,44 @@ pub(crate) mod activation_queue_v2_rehearsal {
     }
 }
 
+/// Candidate growth cap on funded-validator activation weight (ObenBlock O10
+/// §6.3 ported to stake). `u64::MAX` means INERT.
+///
+/// Today an outsider with the coins can add `4 x 1%` of active weight per
+/// 16-minute epoch (four activations, each bond capped at 1% of active stake
+/// when deposited), so a queue filled in one epoch reaches 2/3 of the weight
+/// in hours. Once armed, the own stake activated over any
+/// [`crate::staking::GROWTH_WINDOW_EPOCHS`] window is bounded by
+/// [`crate::staking::growth_budget_sat`] (`max(W/64, MIN_DEPOSIT)`), FIFO,
+/// with the head always admitted into an empty window so the queue drains.
+/// Capturing 2/3 from honest weight `W` then needs at least
+/// `71 x 24` epochs (about 19 days), the ObenBlock bound.
+///
+/// This changes which epoch a queued validator activates, a committed field,
+/// so it needs historical replay and a coordinated epoch.
+/// `native_growth_cap_gate_is_inert` pins the inert value.
+pub const NATIVE_GROWTH_CAP_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn native_growth_cap_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if native_growth_cap_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, NATIVE_GROWTH_CAP_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod native_growth_cap_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 pub fn funded_validator_admission_active(epoch: u64) -> bool {
     #[cfg(test)]
     if funded_admission_rehearsal::enabled() { return true; }
