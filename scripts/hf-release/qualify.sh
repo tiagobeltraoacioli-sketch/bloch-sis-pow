@@ -46,7 +46,7 @@
 #     --window W            epochs replayed after the forced activation (default 16)
 #     --jobs N              concurrent replays (default 8)
 #     --expect-slot N --expect-root HEX   head reported by the archivals for --source
-#     --tests-allow-fail PKG  crate whose test failures are reported, not fatal
+#     --tests-allow-fail PKG  package whose test failures are reported, not fatal
 #                           (repeatable; default: bloch = legacy/genesis3-node, the
 #                           closed Genesis-3 PoW node outside the CI blocking set)
 #     --tests-allow-test NAME test (full path or final segment) whose failure is
@@ -195,19 +195,22 @@ run_tests() {
   set -e
   passed=$(awk '/^test result:/{s+=$4} END{print s+0}' "$OUT/tests.log")
   failed=$(awk '/^test result:/{s+=$6} END{print s+0}' "$OUT/tests.log")
-  # Every failing test with the crate of the test binary it ran in:
-  # "<crate> <test path>" (crate from cargo's "Running ... (target/debug/deps/<crate>-<hash>)").
+  # Every failing test with its PACKAGE: "<package> <test path>". With
+  # --no-fail-fast cargo prints, right after each failing test binary,
+  # "error: test failed, to rerun pass `-p <package> ...`"; the FAILED lines
+  # since the previous binary belong to that package ("?" if none follows).
   awk '
-    /^ *Running / && match($0, /deps\/[A-Za-z0-9_]+-[0-9a-f]+\)/) {
-      s = substr($0, RSTART + 5, RLENGTH - 6); sub(/-[0-9a-f]+$/, "", s); crate = s }
-    /^ *Doc-tests / { crate = $2 }
-    /^test .* \.\.\. FAILED$/ { print crate, $2 }
+    /^ *(Running|Doc-tests) / { for (i in pend) print "?", pend[i]; delete pend; n = 0 }
+    /^test .* \.\.\. FAILED$/ { pend[++n] = $2 }
+    /to rerun pass `-p / { match($0, /`-p [A-Za-z0-9_-]+/); pkg = substr($0, RSTART + 4, RLENGTH - 4)
+                           for (i in pend) print pkg, pend[i]; delete pend; n = 0 }
+    END { for (i in pend) print "?", pend[i] }
   ' "$OUT/tests.log" | sort -u > "$OUT/tests-failed.txt"
   blocking="" allowed=""
   while read -r crate name; do
     [ -n "$name" ] || continue
     local ok=0 a
-    for a in "${ALLOW_FAIL[@]}"; do [ "$crate" = "${a//-/_}" ] && ok=1; done
+    for a in "${ALLOW_FAIL[@]}"; do [ "$crate" = "$a" ] && ok=1; done
     for a in ${ALLOW_TEST[@]+"${ALLOW_TEST[@]}"}; do
       case "$name" in "$a"|*"::$a") ok=1 ;; esac
     done
