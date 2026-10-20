@@ -72,6 +72,84 @@ def rewrite(text: str, decide) -> tuple[str, list[dict]]:
     return DECL.sub(sub, text), changes
 
 
+# REHEARSAL-COPY TOOLING PATCH (devnet tooling only; consensus untouched).
+# (1) check_signed_by judges the original block under its epoch's consensus
+#     signature policy (the tip verifies with the legacy v1 rule only, so the
+#     tool refuses every block after SIG_CANONICAL: rehearsal t87-hf).
+# (2) --kes-period P: sign the conflicting header with the validator's CURRENT
+#     KES leaf for period P (first tree, start period 0), the way the node signs
+#     a KES-bound proposal. Used during period P, never with retained keys.
+EQ_CHECK_OLD = """    if bloch_crypto::crypto::verify(
+        &keys.pubkey,
+        &env.header.proposal_signing_root(),
+        &env.proposer_sig,
+    ) {"""
+EQ_CHECK_NEW = """    // REHEARSAL-COPY FIX: the original's epoch consensus signature policy.
+    if bloch_crypto::crypto::verify_with_policy(
+        crate::keys::crypto_policy(bloch_pos_committee::SignaturePolicy::consensus(
+            bloch_pos_committee::epoch_of(env.header.slot),
+        )),
+        &keys.pubkey,
+        &env.header.proposal_signing_root(),
+        &env.proposer_sig,
+    ) {"""
+EQ_FLAGS_OLD = """        &["--genesis", "--dir", "--data-dir", "--slot", "--to", "--evidence-out"],"""
+EQ_FLAGS_NEW = """        &["--genesis", "--dir", "--data-dir", "--slot", "--to", "--evidence-out", "--kes-period"],"""
+EQ_FORGE_OLD = """    let original = read_block_at_slot(data_dir, slot)?;
+    check_signed_by(&original, &keys)?;
+    let conflicting = forge_conflicting(&original, &keys);"""
+EQ_FORGE_NEW = """    let original = read_block_at_slot(data_dir, slot)?;
+    let kes_period: Option<u64> = match a.0.get("--kes-period").and_then(|v| v.first()) {
+        Some(text) => Some(text.parse().map_err(|_| "--kes-period must be an integer")?),
+        None => None,
+    };
+    let conflicting = if let Some(period) = kes_period {
+        // REHEARSAL-COPY: KES-bound proposal. Sign with the current leaf only.
+        let unlock = crate::keys::Unlock::from_env().map_err(error)?;
+        let kes = crate::kes_key::KesKey::load_optional(Path::new(a.get("--dir")?), &unlock)
+            .map_err(error)?
+            .ok_or("--kes-period needs validator.kes in --dir")?;
+        if kes.index() != original.header.proposer_index {
+            return Err(format!("validator.kes is v{}, the block is v{}", kes.index(), original.header.proposer_index));
+        }
+        if kes.public().start_period != 0 || kes.period() != period {
+            return Err(format!(
+                "validator.kes is at leaf {} of a tree starting at {}; --kes-period {period} must be its current leaf",
+                kes.period(), kes.public().start_period
+            ));
+        }
+        let domain = crate::l2_deposit_cli::domain(a.get("--genesis")?)?;
+        let mut forged = original.clone();
+        forged.header.state_root[0] ^= 1;
+        let message = bloch_pos_committee::kes::leaf_message(
+            Some(domain), forged.header.proposer_index, &kes.public(), period,
+            &forged.header.proposal_signing_root(),
+        ).ok_or("no KES leaf message")?;
+        forged.proposer_sig = kes.sign(&message).map_err(error)?;
+        forged
+    } else {
+        check_signed_by(&original, &keys)?;
+        forge_conflicting(&original, &keys)
+    };"""
+
+
+def patch_devnet_equivocate(root: Path, report: dict) -> None:
+    path = root / "crates/bloch-pos-node/src/devnet_tools.rs"
+    text = path.read_text()
+    for old, new, what in ((EQ_CHECK_OLD, EQ_CHECK_NEW, "check_signed_by epoch policy"),
+                           (EQ_FLAGS_OLD, EQ_FLAGS_NEW, "--kes-period flag"),
+                           (EQ_FORGE_OLD, EQ_FORGE_NEW, "KES-leaf forging")):
+        if text.count(old) != 1:
+            sys.exit(f"!devnet-equivocate-tooling: anchor for {what} not found exactly once; refusing")
+        text = text.replace(old, new)
+    kes_ok = (root / "crates/bloch-pos-node/src/kes_key.rs").exists()
+    if not kes_ok:
+        sys.exit("!devnet-equivocate-tooling needs a tree with KES (kes_key.rs)")
+    path.write_text(text)
+    report.setdefault("source_patches", []).append(
+        "devnet_tools.rs: check_signed_by under the epoch policy; devnet-equivocate --kes-period (current leaf)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("root", type=Path)
@@ -123,6 +201,9 @@ def main() -> int:
           for raw in conf_file.read_text().splitlines():
             if raw.startswith("!inert "):
                 inert.add(raw[len("!inert "):].strip())
+                continue
+            if raw.strip() == "!devnet-equivocate-tooling":
+                report["devnet_equivocate_tooling"] = True
                 continue
             if raw.strip() == "!expose-l2-checkpoint-roots":
                 report["expose_l2_checkpoint_roots"] = True
@@ -234,6 +315,9 @@ def main() -> int:
             report.setdefault("source_patches", []).append("rpc.rs getl2settlement: + rehearsal_checkpoint_roots")
         else:
             print("  note: !expose-l2-checkpoint-roots skipped (no checkpoint_roots accessor or anchor in this tree)")
+
+    if not args.no_hf and report.get("devnet_equivocate_tooling"):
+        patch_devnet_equivocate(root, report)
 
     if not args.no_hf and drops:
         path = root / PARAMS
