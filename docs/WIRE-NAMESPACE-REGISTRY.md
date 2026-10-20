@@ -51,12 +51,12 @@ writing the constant.**
 
 | # | Namespace | Dispatch | Diagnostic on duplicate | Next free |
 | --- | --- | --- | --- | --- |
-| §1 | Transaction tags | `match` on `u8` literal | warning, same-`match` only — **and never across branches** | **`0x0A`** (`0x07`–`0x09` contested, not free) |
+| §1 | Transaction tags | `match` on `u8` literal | warning, same-`match` only — **and never across branches** | **`0x1C`** (`0x07`–`0x09` tombstoned; `0x17`–`0x1B` HF3) |
 | §1a | Slashing-evidence kinds (nested in `0x05`) | `match`, has catch-all | warning, same-`match` only | **`0x03`** |
 | §2 | Frame bytes | `match` by *reference* + runtime `==` | **NONE** | **`0x09`** |
 | §3a | Sync **request** tags | `match` | none in practice | **`0x04`** |
 | §3b | Sync **response** tags | `match` | none in practice | **`0x04`** |
-| §4 | State-root tags | key prefix, never matched | **NONE — consensus-fatal** | **`0x19`** |
+| §4 | State-root tags | key prefix, never matched | **NONE — consensus-fatal** | **`0x25`** (`0x22`–`0x24` HF3/LC) |
 | §5 | RPC method names | `match` on `&str` | warning | *(names, not numbers)* |
 | §9.1 | Role tags (**two files**) | hashed into sortition seed | **NONE — consensus-fatal** | **`0x04`** |
 | §9.2 | Merkle `MARK_*` / `KIND_*` | hashed | none | **`0x03`** each |
@@ -138,12 +138,15 @@ has drifted to ~1008 in the deeper worktrees).
 | `0x14` | `L2Deposit` | **Assigned, native L2** — `devnet-l2-deposits` builds only until activation | l2 | `wire_tag_registry.rs` |
 | `0x15` | `L2DataAvailability` | **Assigned, native L2** — `devnet-l2-user-txs` builds only until activation | l2 | `wire_tag_registry.rs` |
 | `0x16` | `L2WithdrawClaim` | **Assigned, native L2** — `devnet-l2-user-txs` builds only until activation | l2 | `wire_tag_registry.rs` |
-| `0x17` | `KesRegister` | **Assigned, unarmed** — refused before `HF3_KES_EPOCH` (= `KES_REGISTRATION_EPOCH`, u64::MAX); same byte devnet4 used | consensus | `wire_tag_registry.rs` |
-| `0x18`–`0x1A` | PQ migration (`WithdrawalCredentialRotation`, `RescueCommit`, `RescueReveal`) | **Reserved** by the HF3 allocation (`codex/hf3-tags-20261020` e0bfbfff); absent from this tree | pq-migration | `wire_alloc.rs` (HF3 tags line) |
-| `0x1B` | `KesRotate` | **Assigned, unarmed** — HF3 leaf-authorised KES rotation; refused before `HF3_KES_EPOCH` (u64::MAX) | consensus | `wire_tag_registry.rs` |
+| `0x17` | `KesRegister` | **HF3, implemented on this line, unarmed** — refused before `HF3_KES_EPOCH` (= `KES_REGISTRATION_EPOCH`, u64::MAX); same byte devnet4 runs | consensus | `wire_alloc.rs`, `wire_tag_registry.rs` |
+| `0x18` | `WithdrawalCredentialRotation` | **HF3, reserved** — PQ migration, gate `HF3_PQ_MIGRATION_EPOCH` | pq-migration | `wire_alloc.rs` |
+| `0x19` | `RescueCommit` | **HF3, reserved** — PQ migration, gate `HF3_PQ_MIGRATION_EPOCH` | pq-migration | `wire_alloc.rs` |
+| `0x1A` | `RescueReveal` | **HF3, reserved** — PQ migration, gate `HF3_PQ_MIGRATION_EPOCH` | pq-migration | `wire_alloc.rs` |
+| `0x1B` | `KesRotate` | **HF3, implemented on this line, unarmed** — KES leaf-authorised rotation (p8b proposal, moved from `0x18`); refused before `HF3_KES_EPOCH` | consensus | `wire_alloc.rs`, `wire_tag_registry.rs` |
 | `0x1C`–`0xFF` | free | — | — | — |
 
-**Next free transaction tag: `0x1C`.** (`0x07`–`0x09` remain reserved and
+**Next free transaction tag: `0x1C`.** (`0x17`–`0x1B` are the HF3
+allocation of 2026-10-20, see the last section.) (`0x07`–`0x09` remain reserved and
 contested; `0x0E`–`0x11` are assigned to the funded-delegation lifecycle;
 `0x12`–`0x16` to the native L2 bridge, renumbered past `0x0E`–`0x11` on
 2026-10-10 because the L2 branch first used them.)
@@ -373,10 +376,12 @@ wrong message; it produces a wrong state root, on every node, permanently.
 | `0x1F` | `TAG_FUNDED_DELEGATION_OWNER` | **Assigned, unarmed candidate** | staking |
 | `0x20` | `TAG_FUNDED_DELEGATION_LIFECYCLE` | **Assigned, unarmed candidate** | staking |
 | `0x21` | `TAG_L2_SETTLEMENT` | **Assigned, native L2 (M8 port)** — no leaf without an L2 policy | l2 |
-| `0x22` | `TAG_KES_ROOT` | **Assigned, unarmed** — per validator `KesEntry` (key in force `depth ‖ root ‖ start_period`, then any pending successor); one `enforced` leaf once KES binds; no leaf until the first registration | consensus |
-| `0x23`+ | free | — | — | — |
+| `0x22` | `TAG_KES_ROOT` | **HF3, implemented on this line, unarmed** — per validator `KesEntry` (key in force `depth ‖ root ‖ start_period`, then any pending successor); one `enforced` leaf once KES binds; no leaf until the first registration | consensus |
+| `0x23` | `TAG_LC_ROSTER` | **Reserved** — light client (`codex/bloch-lc-20261014`), live on devnet4 | lc |
+| `0x24` | `TAG_PQ_RESCUE_COMMIT` | **HF3, reserved** — PQ rescue commitments, no leaf while empty | pq-migration |
+| `0x25`+ | free | — | — | — |
 
-**Next free state-root tag: `0x23`.** (The L2 branch first used `0x1F`, which
+**Next free state-root tag: `0x25`.** (The L2 branch first used `0x1F`, which
 collides with `TAG_FUNDED_DELEGATION_OWNER`; the M8 port moved it to `0x21`.)
 
 **C-3 is resolved in code as of 2026-09-01** — see §6 C-3. The two stale
@@ -916,3 +921,52 @@ mainnet tree (`MAINNET_TX_TAGS`, highest `0x11`). Its records live inside the
 existing L2 state component; no new state tag is introduced.
 Existing manifests leave the policy absent and the public mempool refuses the
 transaction. See [the protocol and qualification boundary](specs/BLOCH-NATIVE-L2-SETTLEMENT.md).
+
+## HF3 allocation 2026-10-20 — KES, PQ migration, light client (supersedes 2026-10-19)
+
+Machine-readable twin: `crates/bloch-pos-committee/src/wire_alloc.rs`
+(`codex/hf3-tags-20261020`). **Stable: bytes are appended, never
+re-pointed.** Every gate below is `u64::MAX` on the mainnet line.
+
+The clash: KES registration holds `0x17` (live on devnet4); the PQ migration
+(`codex/bloch-p9d-migration-20261019`, `104d8a94`) was drafted at
+`0x17`–`0x19` and moved to `0x18`–`0x1A` by `codex/bloch-tag-alloc-20261019`
+(`61ac024d`), a move `codex/hf-wallet-20261020` has already merged; and
+`docs/KES-MAINNET-READINESS.md` (`codex/bloch-p8b-kesmainnet-20261019`)
+proposed `KesRotate` at `0x18`. `KesRotate` is the only claimant with no code
+on any ref, so it moves to `0x1B`; no implemented byte is re-pointed.
+
+| Namespace | Byte / marker | Owner | Gate | Branch |
+|---|---|---|---|---|
+| tx | `0x01`–`0x06`, `0x0A`–`0x16` | released set | — | mainnet `b4a21fb6` |
+| tx | `0x07`–`0x09` | tombstones (ADR-041) | — | never assign |
+| tx | `0x17` | `KesRegister` | `KES_REGISTRATION_EPOCH` | `codex/hf3-kes-20261020` |
+| tx | `0x18` | `WithdrawalCredentialRotation` | `HF3_PQ_MIGRATION_EPOCH` | `codex/hf3-tags-20261020` |
+| tx | `0x19` | `RescueCommit` | `HF3_PQ_MIGRATION_EPOCH` | `codex/hf3-tags-20261020` |
+| tx | `0x1A` | `RescueReveal` | `HF3_PQ_MIGRATION_EPOCH` | `codex/hf3-tags-20261020` |
+| tx | `0x1B` | `KesRotate` | KES gate | `codex/hf3-kes-20261020` (design: p8b) |
+| tx | `0x1C`+ | free | — | — |
+| state | `0x01`–`0x21` | released set (`STATE_COMPONENT_TAGS`) | — | mainnet |
+| state | `0x22` | `TAG_KES_ROOT` | KES gate | `codex/hf3-kes-20261020` |
+| state | `0x23` | `TAG_LC_ROSTER` | LC | `codex/bloch-lc-20261014` (devnet4) |
+| state | `0x24` | `TAG_PQ_RESCUE_COMMIT` | `HF3_PQ_MIGRATION_EPOCH` | `codex/hf3-tags-20261020` |
+| state | `0x25`+ | free | — | — |
+| local cache | `BPOSST01:L2:v1\0\0` | L2 | — | mainnet |
+| local cache | `BPOSST01:L2CP:v1` | L2 checkpoint roots | — | `codex/native-claim-finality-20261019` |
+| local cache | `BPOSST01:KES:v1\0` | KES | — | KES line |
+| local cache | `BPOSST01:PQ:v1\0\0` | PQ rescue commitments | — | this branch |
+| local cache | `BPOSST01:FSET:v1` | frozen finality set | — | HF1 (p1a) |
+| local cache | `BPOSST01:FFGO:v1` | own-target checkpoints | — | HF1 (p2a) |
+| finality leaf ext. | `BLOCH-FFG-FSETv1`, then `BLOCH:FINALITY:OWN-CHECKPOINTS:1` | HF1 | — | p1a / p2a |
+
+Local-cache sections are parsed by sequential prefix stripping; the merge
+order is the table order (L2, L2CP, KES, PQ, FSET, FFGO).
+
+Sweep (2026-10-20): all 371 `refs/heads` + `refs/remotes` tips; every
+`*_TAG: u8` / `TAG_*: u8` constant under `crates/` and every arm of the
+`PosTransaction` decoder. Beyond the released set the only claimants are the
+rows above. Stale pre-mainnet rivals inside the released ranges remain as
+recorded in §1/§4/§6 (e.g. `NATIVE_TRANSFER_TAG = 0x0E` on
+`feat/native-usdt-custody`; `TAG_SHIELDED_POOL` `0x17`/`0x18`,
+`TAG_UNBACKED_PRINCIPAL` `0x17`, `TAG_EPOCH_FROZEN_BOND` `0x17`,
+`TAG_NATIVE_STATE` `0x1F` on old lines); none may be merged.
