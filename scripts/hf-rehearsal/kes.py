@@ -203,7 +203,8 @@ class KesRehearsal(Rehearsal):
             k = self.kes_sampler_tick()
             s1b = {"enforced_from": k and k["enforced_from"], "bps": k and k["registered_stake_bps"]}
             ok2, msg2 = self.register(self.LATE[1], self.work / f"node{self.LATE[1]}", self.LATE[1], "late")
-            self.wait_epoch(ENFORCE_EPOCH + 5)
+            # KES_BIND_DELAY_EPOCHS (2 on the integration line) after the deciding boundary.
+            self.wait_epoch(ENFORCE_EPOCH + 6)
             k = self.kes_sampler_tick()
             bind = k and k["enforced_from"]
             s1c = {"enforced_from": bind, "bps": k and k["registered_stake_bps"], "late2": msg2[:160]}

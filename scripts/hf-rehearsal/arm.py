@@ -118,8 +118,12 @@ def main() -> int:
         conf: dict[str, int] = {}
         literal: dict[str, int] = {}
         drops: list[str] = []
+        inert: set[str] = set()
         for conf_file in (args.conf or [GATES_CONF]):
           for raw in conf_file.read_text().splitlines():
+            if raw.startswith("!inert "):
+                inert.add(raw[len("!inert "):].strip())
+                continue
             if raw.strip() == "!expose-l2-checkpoint-roots":
                 report["expose_l2_checkpoint_roots"] = True
                 continue
@@ -142,7 +146,11 @@ def main() -> int:
 
         report["literal_overrides"] = literal
 
+        report["kept_inert"] = sorted(inert)
+
         def hf(name: str, value: str):
+            if name in inert:
+                return None
             if name in literal:
                 return literal[name]
             if value != "u64::MAX":

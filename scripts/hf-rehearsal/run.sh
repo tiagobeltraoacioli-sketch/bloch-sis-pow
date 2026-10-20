@@ -24,6 +24,8 @@
 #   --l2-epoch E          build BOTH binaries with l2-activation-rehearsal: an L2 state is
 #                         installed at epoch E (choose E < --hf1 so HF1 claim finality has
 #                         an L2 state to record checkpoint roots in)
+#   --only-listed         arm only constants named in the conf files (no HF<n>_ prefix rule;
+#                         the KES run uses it: --conf kes.conf --only-listed)
 #   --driver rehearse|kes  scenario driver (kes: HF3 KES rehearsal, needs --conf kes.conf builds)
 #   --conf FILE           arm.py gate conf (repeatable; default gates.conf), e.g.
 #                         --conf scripts/hf-rehearsal/gates.conf --conf scripts/hf-rehearsal/kes.conf
@@ -45,7 +47,7 @@ HERE="$REPO/scripts/hf-rehearsal"
 BASELINE=b4a21fb657d0beb17f64c62889b605c9a7a2d031
 CANDIDATE=""; CANDIDATE_TREE=""; WORK=""; TARGET="$REPO/target/hf-rehearsal"
 HF1=10; HF2=14; HF3=18; PAST=6; JOBS=4
-CBIN=""; BBIN=""; ARMING=""; BUILD_ONLY=0; CONFS=(); DRIVER=rehearse; L2EPOCH=""
+CBIN=""; BBIN=""; ARMING=""; BUILD_ONLY=0; CONFS=(); DRIVER=rehearse; L2EPOCH=""; ONLY_LISTED=()
 PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -66,6 +68,7 @@ while [ $# -gt 0 ]; do
     --conf) CONFS+=(--conf "$2"); shift 2;;
     --driver) DRIVER="$2"; shift 2;;
     --l2-epoch) L2EPOCH="$2"; shift 2;;
+    --only-listed) ONLY_LISTED=(--only-listed); shift;;
     --) shift; PASS=("$@"); break;;
     -h|--help) sed -n '3,33p' "$0"; exit 0;;
     *) echo "unknown option $1" >&2; exit 2;;
@@ -124,7 +127,7 @@ json.dump(r,open(p,"w"),indent=2)
 PY
   else
     python3 -I "$HERE/arm.py" "$BUILD/src-candidate" --hf1 "$HF1" --hf2 "$HF2" --hf3 "$HF3" --past-gate "$PAST" \
-      --report "$BUILD/arming-candidate.json" ${CONFS[@]+"${CONFS[@]}"}
+      --report "$BUILD/arming-candidate.json" ${CONFS[@]+"${CONFS[@]}"} ${ONLY_LISTED[@]+"${ONLY_LISTED[@]}"}
   fi
   CBIN="$BUILD/bloch-pos-candidate"; ARMING="$BUILD/arming-candidate.json"
   if [ ! -d "$BUILD/src-baseline" ]; then
