@@ -43,6 +43,7 @@ pub mod codec;
 pub mod genesis;
 
 pub mod api;
+pub mod consensus;
 pub mod explorer;
 pub mod rpcprobe;
 mod io_deadline;

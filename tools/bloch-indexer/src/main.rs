@@ -7,7 +7,12 @@
 //! bloch-indexer serve   --log L --manifest M --carryover C [--bind 127.0.0.1:8090] [--poll-ms 5000]
 //! bloch-indexer verify-reorg --log L --manifest M --carryover C [--depth 13]
 //! bloch-indexer compare --log L --manifest M --carryover C [--archival 139.180.166.5:8080] [--sample 64]
+//! bloch-indexer gates
 //! ```
+//!
+//! `gates` prints the consensus activation schedule compiled into this binary
+//! (see `consensus.rs`). Run it before every flag day: the epoch being armed
+//! must appear with its armed value, or this binary will halt at it.
 //!
 //! Every subcommand reads a **local copy** of an archival observer's
 //! `blocks.log`. Nothing here polls the fleet; `compare` is the sole exception
@@ -34,6 +39,7 @@ struct Args {
     sample: usize,
     depth: usize,
     undo_depth: usize,
+    ledger_check: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -48,6 +54,7 @@ fn parse_args() -> Result<Args, String> {
         sample: 64,
         depth: 13,
         undo_depth: DEFAULT_UNDO_DEPTH,
+        ledger_check: true,
     };
     let mut it = std::env::args().skip(1);
     a.cmd = it.next().ok_or_else(usage)?;
@@ -63,6 +70,7 @@ fn parse_args() -> Result<Args, String> {
             "--sample" => a.sample = val()?.parse().map_err(|_| "bad --sample")?,
             "--depth" => a.depth = val()?.parse().map_err(|_| "bad --depth")?,
             "--undo-depth" => a.undo_depth = val()?.parse().map_err(|_| "bad --undo-depth")?,
+            "--no-ledger-check" => a.ledger_check = false,
             other => return Err(format!("unknown flag {other}\n{}", usage())),
         }
     }
@@ -71,7 +79,8 @@ fn parse_args() -> Result<Args, String> {
 
 fn usage() -> String {
     "usage: bloch-indexer <build|serve|verify-reorg|compare> --log L --manifest M --carryover C \
-     [--bind ADDR] [--archival HOST:PORT] [--poll-ms N] [--sample N] [--depth N] [--undo-depth N]"
+     [--bind ADDR] [--archival HOST:PORT] [--poll-ms N] [--sample N] [--depth N] [--undo-depth N] \
+     [--no-ledger-check]\n       bloch-indexer gates"
         .to_string()
 }
 
@@ -88,6 +97,13 @@ fn run() -> Result<(), String> {
         "build" => {
             let (ix, t) = build(&a)?;
             report(&ix, t);
+            match &ix.halted {
+                Some(h) => Err(h.describe()),
+                None => Ok(()),
+            }
+        }
+        "gates" => {
+            print!("{}", bloch_indexer::consensus::table());
             Ok(())
         }
         "serve" => serve(&a),
@@ -119,11 +135,36 @@ fn build(a: &Args) -> Result<(Index, BuildTiming), String> {
 
     let t2 = Instant::now();
     let mut ix = Index::new(genesis_id, outputs, a.undo_depth);
-    ix.replay = Some(manifest.genesis_state());
+    let genesis_state = manifest.genesis_state();
+    // The per-block ledger cross-check compares live-output counts, so it is
+    // only meaningful if both sides open with the same count.
+    let consensus_open = genesis_state.utxos().size_hint();
+    ix.ledger_check = a.ledger_check;
+    if ix.ledger_check && consensus_open != (ix.utxo.len(), Some(ix.utxo.len())) {
+        eprintln!(
+            "warning: opening ledger has {} outputs, consensus genesis state {:?}; per-block \
+             ledger cross-check disabled",
+            ix.utxo.len(),
+            consensus_open
+        );
+        ix.ledger_check = false;
+    }
+    ix.replay = Some(genesis_state);
     let t_seed = t2.elapsed();
 
     let t3 = Instant::now();
-    let (applied, _) = ix.sync(&mut reader).map_err(|e| format!("applying log: {e}"))?;
+    let applied = match ix.sync(&mut reader) {
+        Ok((applied, _)) => applied,
+        // A block this build cannot apply: keep the applied prefix and report
+        // why (`Index::halted`); `serve` exposes it on /status instead of
+        // exiting into a restart loop.
+        Err(e) if ix.halted.is_some() => {
+            eprintln!("bloch-indexer: {e}");
+            ix.sync_error = Some(e.to_string());
+            ix.stats.blocks_applied
+        }
+        Err(e) => return Err(format!("applying log: {e}")),
+    };
     ix.verify_undo_roundtrip(&mut reader, 13).map_err(|e| format!("undo qualification: {e}"))?;
     ix.checked_at = Instant::now();
     let t_apply = t3.elapsed();
@@ -219,10 +260,27 @@ fn serve(a: &Args) -> Result<(), String> {
                     needs_sync = false;
                 }
                 ix.checked_at = Instant::now();
-                ix.sync_error = None;
+                // A halted index stays visibly halted until a sync applies
+                // the whole log (which clears `halted`).
+                ix.sync_error = ix.halted.as_ref().map(|h| h.describe());
                 Ok(())
             })();
             if let Err(e) = result {
+                let halted = writer.read().unwrap().halted.is_some();
+                if halted {
+                    // Deterministic: this build cannot apply the next block.
+                    // Rebuilding from genesis would reach the same block and
+                    // the same refusal. Keep the applied prefix, report it on
+                    // /status, and retry only when the log changes (a reorg
+                    // may drop the block; a new binary needs a restart).
+                    needs_sync = false;
+                    let mut ix = writer.write().unwrap();
+                    if ix.sync_error.as_deref() != Some(&e.to_string()) {
+                        eprintln!("sync halted: {e}");
+                    }
+                    ix.sync_error = Some(e.to_string());
+                    continue;
+                }
                 needs_sync = true;
                 writer.write().unwrap().sync_error = Some(e.to_string());
                 eprintln!("sync failed; API unavailable while rebuilding: {e}");
@@ -366,6 +424,7 @@ fn clone_args(a: &Args) -> Args {
         sample: a.sample,
         depth: a.depth,
         undo_depth: a.undo_depth,
+        ledger_check: a.ledger_check,
     }
 }
 
