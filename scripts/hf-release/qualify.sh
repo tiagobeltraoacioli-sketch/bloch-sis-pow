@@ -132,20 +132,19 @@ else
 fi
 cleanup; WT=""
 
-# ── 2. workspace tests ────────────────────────────────────────────────────
-if [ "$SKIP_TESTS" = 1 ]; then
-  record tests SKIPPED "--skip-tests"
-else
-  ctx="$OUT/test-ctx"; mkdir -p "$ctx"
+# ── 2. workspace tests (in the background, alongside the replays) ─────────
+run_tests() {
+  local ctx="$OUT/test-ctx" tag="bloch-hf-qualify:$C12" trc passed failed
+  mkdir -p "$ctx"
   git -C "$REPO" archive --format=tar "$COMMIT" | tar -xf - -C "$ctx"
-  tag="bloch-hf-qualify:$C12"
-  say "test image $tag (pinned toolchain, Dockerfile target build)"
-  "$ENGINE" buildx build --progress=plain --target build --load -t "$tag" \
+  say "tests: image $tag (pinned toolchain, Dockerfile target build)"
+  if ! "$ENGINE" buildx build --progress=plain --target build --load -t "$tag" \
     --build-arg "BLOCH_BUILD_COMMIT=$COMMIT" --build-arg "SOURCE_DATE_EPOCH=$SDE" \
-    --file "$ctx/deploy/pos-release/Dockerfile" "$ctx" > "$OUT/tests-image.log" 2>&1 \
-    || { record tests FAIL "test image build failed (tests-image.log)"; die "test image build failed"; }
+    --file "$ctx/deploy/pos-release/Dockerfile" "$ctx" > "$OUT/tests-image.log" 2>&1; then
+    record tests FAIL "test image build failed (tests-image.log)"; return 0
+  fi
   rm -rf "$ctx"
-  say "cargo test --workspace --locked --no-fail-fast (log: $OUT/tests.log)"
+  say "tests: cargo test --workspace --locked --no-fail-fast (log: $OUT/tests.log)"
   set +e
   "$ENGINE" run --rm --name "bloch-hf-qualify-tests-$C12-$$" \
     -e "BLOCH_BUILD_COMMIT=$COMMIT" -e BLOCH_BUILD_TREE_ASSERTION=clean -e CARGO_TERM_COLOR=never \
@@ -160,6 +159,12 @@ else
     grep -E '^test .* FAILED$|^error(\[|:)' "$OUT/tests.log" | head -40 || true
     record tests FAIL "rc=$trc, $passed passed, $failed failed (tests.log)"
   fi
+}
+TESTS_PID=""
+if [ "$SKIP_TESTS" = 1 ]; then
+  record tests SKIPPED "--skip-tests"
+else
+  run_tests & TESTS_PID=$!
 fi
 
 # ── replay helpers ────────────────────────────────────────────────────────
@@ -178,21 +183,22 @@ replay() {
 }
 head_of() { awk '$1=="candidate" && NF==4 {print $2, $3, $4}' "$OUT/replay/$1.out" | tail -1; }
 rc_of() { cat "$OUT/replay/$1.rc"; }
-port() { PORT_NEXT=$((PORT_NEXT + 10)); echo "$PORT_NEXT"; }
+# Each replay gets its own loopback port range (relevant when not in a netns).
+alloc() { PORT_NEXT=$((PORT_NEXT + 10)); P=$PORT_NEXT; }
 
 # ── 3. configured-epoch replay of the whole copy ──────────────────────────
 say "full replay: candidate and fleet baseline, from genesis, in parallel (~30 min each)"
-p1=$(port); p2=$(port)
 expect=(); [ -z "$EXPECT_ROOT" ] || expect=(--expect-root "$EXPECT_ROOT" --expect-slot "$EXPECT_SLOT")
-replay full-candidate "$BIN" "$SOURCE" "$p1" ${expect[@]+"${expect[@]}"} &
-replay full-baseline "$BASELINE_BIN" "$SOURCE" "$p2" ${expect[@]+"${expect[@]}"} &
-wait
+alloc; replay full-candidate "$BIN" "$SOURCE" "$P" ${expect[@]+"${expect[@]}"} & pids=($!)
+alloc; replay full-baseline "$BASELINE_BIN" "$SOURCE" "$P" ${expect[@]+"${expect[@]}"} & pids+=($!)
+wait "${pids[@]}"
 ref_full="$(head_of full-candidate)"; base_full="$(head_of full-baseline)"
 if [ "$(rc_of full-candidate)" = 0 ] && [ "$(rc_of full-baseline)" = 0 ] && [ -n "$ref_full" ] && [ "$ref_full" = "$base_full" ]; then
   record replay-configured PASS "head (slot blocks root) $ref_full, identical to baseline"
 else
   tail -5 "$OUT/replay/full-candidate.out" "$OUT/replay/full-baseline.out"
   record replay-configured FAIL "candidate [$ref_full] rc=$(rc_of full-candidate) / baseline [$base_full] rc=$(rc_of full-baseline)"
+  [ -z "$TESTS_PID" ] || wait "$TESTS_PID" || true
   die "configured-epoch replay did not pass; forced smoke tests are meaningless without it"
 fi
 read -r HEAD_SLOT _ _ <<<"$ref_full"
@@ -247,11 +253,12 @@ else
     python3 -I "$PREFIX_PY" --source "$SOURCE" --dest "$OUT/data/post-e$e" --before-slot $(((e + WINDOW) * SLOTS_PER_EPOCH)) | sed 's/^/  post-e'"$e"': /'
   done
   say "reference replays of the configured candidate on each prefix"
+  pids=()
   for e in $epochs; do
-    replay "ref-pre-e$e" "$BIN" "$OUT/data/pre-e$e" "$(port)" &
-    replay "ref-post-e$e" "$BIN" "$OUT/data/post-e$e" "$(port)" &
+    alloc; replay "ref-pre-e$e" "$BIN" "$OUT/data/pre-e$e" "$P" & pids+=($!)
+    alloc; replay "ref-post-e$e" "$BIN" "$OUT/data/post-e$e" "$P" & pids+=($!)
   done
-  wait
+  wait "${pids[@]}"
   for e in $epochs; do
     for k in pre post; do
       [ "$(rc_of "ref-$k-e$e")" = 0 ] || { tail -5 "$OUT/replay/ref-$k-e$e.out"; die "configured candidate failed on the $k-e$e prefix"; }
@@ -304,15 +311,16 @@ else
       echo "FAIL	post-activation replay crashed or stopped without a consensus verdict (replay/forced-$g-post.out)" > "$d/verdict"
     fi
   }
-  running=0
+  pids=()
   for item in "${forced[@]}"; do
     read -r g e <<<"$item"
     [ -x "$OUT/forced/$g-e$e/bloch-pos-FORCED-$g-e$e" ] || continue
-    run_forced "$g" "$e" "$(port)" "$(port)" &
-    running=$((running + 1))
-    if [ "$running" -ge "$JOBS" ]; then wait -n || true; running=$((running - 1)); fi
+    alloc; p_pre=$P; alloc
+    run_forced "$g" "$e" "$p_pre" "$P" & pids+=($!)
+    # Throttle: keep at most JOBS forced pipelines alive.
+    while [ "$(jobs -rp | grep -vx "${TESTS_PID:-none}" | wc -l)" -ge "$JOBS" ]; do sleep 20; done
   done
-  wait
+  [ ${#pids[@]} -eq 0 ] || wait "${pids[@]}"
   for item in "${forced[@]}"; do
     read -r g e <<<"$item"
     v="$OUT/forced/$g-e$e/verdict"
@@ -323,6 +331,7 @@ else
 fi
 
 # ── verdict ───────────────────────────────────────────────────────────────
+if [ -n "$TESTS_PID" ]; then say "waiting for the workspace tests"; wait "$TESTS_PID" || true; fi
 echo "finished=$(date -u +%FT%TZ)" >> "$OUT/qualify.env"
 echo
 echo "── results ($RESULTS) ──"
