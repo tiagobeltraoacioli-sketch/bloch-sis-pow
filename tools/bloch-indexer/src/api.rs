@@ -233,6 +233,17 @@ pub fn route(path: &str, query: &str, index: &Shared) -> (u16, Json) {
 
         ["status"] => (200, status_json(&ix)),
 
+        ["holders"] => {
+            if ix.sync_error.is_some() || ix.checked_at.elapsed().as_secs() > 30 {
+                return (503, err("index synchronization unavailable; retry later"));
+            }
+            let limit = qnum(query, "limit").unwrap_or(64);
+            if !(1..=256).contains(&limit) {
+                return (400, err("limit must be between 1 and 256"));
+            }
+            (200, holders_json(&ix, limit as usize))
+        }
+
         // ── Blocks ──────────────────────────────────────────────────────────
         ["block", "height", h] => match h.parse::<u64>().ok().and_then(|h| ix.block_at_height(h)) {
             Some(r) => (200, block_json(&ix, r)),
@@ -569,6 +580,34 @@ fn shape_of(sh: &ScriptHash) -> &'static str {
     } else {
         "native (SHA3-256 of a hybrid public key)"
     }
+}
+
+/// Largest positive script balances in the indexed canonical state. A script
+/// reference is not a person or a proven wallet owner. Exact amounts remain
+/// decimal strings; this bounded list is not a census of every holder.
+pub fn holders_json(ix: &Index, limit: usize) -> Json {
+    let mut balances: Vec<_> = ix.balance.iter().filter(|(_, amount)| **amount > 0).collect();
+    balances.sort_unstable_by(|(a_hash, a_amount), (b_hash, b_amount)|
+        b_amount.cmp(a_amount).then(a_hash.cmp(b_hash)));
+    let shown = limit.min(256).min(balances.len());
+    let rows = balances.iter().take(shown).enumerate().map(|(rank, (script_hash, balance))| {
+        Json::Obj(vec![
+            ("rank", Json::u(rank as u64 + 1)),
+            ("script_hash", Json::hex32(script_hash)),
+            ("balance_sat", Json::sat(**balance)),
+            ("utxo_count", Json::u(ix.by_script.get(*script_hash).map(|s| s.len()).unwrap_or(0) as u64)),
+        ])
+    }).collect();
+    let tip = ix.tip();
+    Json::Obj(vec![
+        ("holders", Json::Arr(rows)),
+        ("returned", Json::u(shown as u64)),
+        ("total_script_hashes_with_balance", Json::u(balances.len() as u64)),
+        ("indexed_total_sat", Json::sat(tip.eutxo_total_sat)),
+        ("as_of_height", Json::u(ix.height())),
+        ("as_of_slot", Json::u(tip.slot)),
+        ("chain_tip", Json::hex32(&tip.block_id)),
+    ])
 }
 
 fn status_json(ix: &Index) -> Json {

@@ -611,3 +611,36 @@ fn transaction_lookup_and_block_contents_obey_snapshot_and_selector() {
     assert_eq!(old.0, 200);
     assert!(old.1.to_string().contains("archival structure only; consensus replay disabled"));
 }
+
+#[test]
+fn holder_page_ranks_exact_positive_script_balances_without_inventing_owners() {
+    let genesis = h32(1);
+    let entries = vec![
+        (OutPoint { txid: h32(10), vout: 0 }, Utxo { value_sat: 9_007_199_254_740_993, script_hash: h32(2), created_height: 0 }),
+        (OutPoint { txid: h32(11), vout: 0 }, Utxo { value_sat: 7, script_hash: h32(3), created_height: 0 }),
+    ];
+    let ix = Index::new(genesis, entries, 64);
+    let page = bloch_indexer::api::holders_json(&ix, 1).to_string();
+    assert!(page.contains("\"total_script_hashes_with_balance\":2"));
+    assert!(page.contains("\"balance_sat\":\"9007199254740993\""));
+    assert!(page.contains("\"utxo_count\":1"));
+    assert!(!page.contains(&bloch_indexer::hex32(&h32(3))));
+    assert!(!page.contains("owner"));
+}
+
+#[test]
+fn holder_route_rejects_stale_or_failed_index_snapshots() {
+    use std::sync::{Arc, RwLock};
+    use std::time::{Duration, Instant};
+
+    let index = Arc::new(RwLock::new(Index::new(h32(1), vec![], 64)));
+    assert_eq!(bloch_indexer::api::route("/holders", "limit=64", &index).0, 200);
+    index.write().unwrap().sync_error = Some("log unavailable".into());
+    assert_eq!(bloch_indexer::api::route("/holders", "limit=64", &index).0, 503);
+    {
+        let mut snapshot = index.write().unwrap();
+        snapshot.sync_error = None;
+        snapshot.checked_at = Instant::now() - Duration::from_secs(31);
+    }
+    assert_eq!(bloch_indexer::api::route("/holders", "limit=64", &index).0, 503);
+}

@@ -72,6 +72,13 @@ snapshot slot, height, block ID, source and verification method.
 - `GET /utxos/<script_hash>?limit=&cursor=`: complete pageable unspent set.
 - `GET /history/<script_hash>?limit=&cursor=`: creation/spend history, newest first.
 - `GET /outpoint/<txid>/<vout>`: historical value and creation/spend positions.
+- `GET /script/<script_hash>/balance`: exact indexed eUTXO balance, UTXO count,
+  height and chain tip for one reference.
+- `GET /holders?limit=64`: largest positive script balances, sorted by exact
+  satoshis and bounded to 256 rows. The response includes the number of funded
+  script references and total indexed eUTXO satoshis. It is a ranking of script
+  references, not people or proven wallet owners. Staked and delegated amounts
+  are outside the eUTXO balance and are not included.
 
 Cursors bind an offset to a specific canonical block ID and height. Appended
 blocks do not change the snapshot. If the anchor is reorganized, pagination
