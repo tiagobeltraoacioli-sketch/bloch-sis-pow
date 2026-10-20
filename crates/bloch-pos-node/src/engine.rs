@@ -1438,6 +1438,10 @@ pub use state_cell::SharedHead;
 #[cfg(test)]
 mod replay_bench;
 
+/// Hard-fork port guard: "gates off is byte-identical". `cfg(test)`, instrumentation only.
+#[cfg(test)]
+mod hf_replay_guard;
+
 #[cfg(test)]
 mod proposal_revalidation_tests;
 
