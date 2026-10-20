@@ -3148,15 +3148,31 @@ pub const RESCUE_COMMIT_MIN_DELAY_EPOCHS: u64 = 90;
 
 /// Epochs after which an unrevealed rescue commitment is pruned (~30 days).
 /// Bounds the commitment set: at most
-/// `RESCUE_COMMITS_PER_BLOCK × SLOTS_PER_EPOCH × RESCUE_COMMIT_TTL_EPOCHS`
+/// `RESCUE_COMMITS_MAX_PER_BLOCK × SLOTS_PER_EPOCH × RESCUE_COMMIT_TTL_EPOCHS`
 /// 32-byte entries.
 pub const RESCUE_COMMIT_TTL_EPOCHS: u64 = 2_700;
 
-/// Fee-free rescue commitments that fit in one block. Each commitment is
-/// charged `BLOCK_GAS_LIMIT / RESCUE_COMMITS_PER_BLOCK` gas and no money, so
-/// the block gas cap is the rate limit (a lattice-only holder has no
-/// spendable coin to pay a fee with once the emergency gate binds).
+/// Gas divisor for a rescue commitment: each is charged
+/// `BLOCK_GAS_LIMIT / RESCUE_COMMITS_PER_BLOCK` gas and no money (a
+/// lattice-only holder has no spendable coin to pay a fee with once the
+/// emergency gate binds). Pricing only; the per-block COUNT is bounded by
+/// [`RESCUE_COMMITS_MAX_PER_BLOCK`].
 pub const RESCUE_COMMITS_PER_BLOCK: u64 = 16;
+
+/// Consensus cap on rescue commitments per block (F-9, 2026-10-20).
+///
+/// A commitment is free and unauthenticated by design (it must not reveal
+/// the key it protects, and its owner cannot pay), so the gas price alone
+/// let 16 of them fill a whole block: a flood excluded every other
+/// transaction at zero cost. With this cap, commitments can occupy at most
+/// `RESCUE_COMMITS_MAX_PER_BLOCK / RESCUE_COMMITS_PER_BLOCK` = 1/4 of the
+/// block gas; the other 3/4 (and all but 4 × ~70 bytes of the byte cap) stay
+/// available to paying transactions whatever the flood. Enforced only from
+/// `LATTICE_EMERGENCY_ACTIVATION_EPOCH`; below it every commitment is
+/// refused anyway, with its pre-cap error.
+pub const RESCUE_COMMITS_MAX_PER_BLOCK: u64 = 4;
+
+const _: () = assert!(RESCUE_COMMITS_MAX_PER_BLOCK * 4 <= RESCUE_COMMITS_PER_BLOCK);
 
 const _: () = assert!(gate_is_inert_or_not_before(
     LATTICE_EMERGENCY_ACTIVATION_EPOCH,

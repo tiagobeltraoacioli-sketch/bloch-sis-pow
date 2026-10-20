@@ -114,8 +114,19 @@ to the fastest forger.
 reveals nothing about the key.
 - It is unauthenticated and fee-free, because a lattice-only holder has
   nothing it can sign or pay with.
-- It is rate-limited by gas: each commit costs
-  `BLOCK_GAS_LIMIT / RESCUE_COMMITS_PER_BLOCK` (16 per block).
+- It is priced in gas, each commit costing
+  `BLOCK_GAS_LIMIT / RESCUE_COMMITS_PER_BLOCK` (1/16 of a block), and
+  **capped per block** by consensus at `RESCUE_COMMITS_MAX_PER_BLOCK = 4`
+  (F-9, 2026-10-20). Commits can therefore hold at most a quarter of a
+  block's gas; without the cap 16 free commits filled a block and a flood
+  excluded every paying transaction. An over-cap block is
+  `BlockGasLimitExceeded` from the emergency gate on.
+- Node policy (not consensus): all commits share one mempool source, so a
+  flood holds at most 64 mempool entries and never evicts a paying
+  transaction; the proposer ranks commits after every tipped and zero-tip
+  transaction and orders them among themselves by
+  `SHA3(domain ‖ parent block id ‖ commitment)`, which cannot be ground
+  before the parent exists.
 - The first writer keeps its epoch (`CommitmentExists`).
 - Commits are pruned after `RESCUE_COMMIT_TTL_EPOCHS = 2,700` (about 30 days).
 - The commits are committed under state tag `0x24`.
@@ -151,9 +162,13 @@ finality stops a reorg from re-ordering the two commitments.
    value must leave **before** the break (Path A), or through Option C below.
 2. **Censorship for the full delay** (≥ 90 epochs) lets a forger's later
    commitment mature. Raising the delay trades rescue latency for safety.
-3. **Commit spam.** Fee-free commits can crowd the 16-per-block budget.
-   Mitigations are proposer policy, a larger budget, or "sponsored" commits
-   paid from any SLH coin, since a commit is only 32 bytes anyone can post.
+3. **Commit spam.** Since F-9 a flood can no longer exclude other
+   transactions (at most 4 commits, 1/4 of the gas, per block). It can still
+   compete with honest rescuers for those 4 slots: a sustained flood delays
+   rescues roughly in proportion to its share of the commit pool, and the
+   per-block draw from the parent id only stops it from winning every slot
+   by grinding. The remaining fix is "sponsored" commits paid from any SLH
+   coin (a commit is only 32 bytes anyone can post); not built.
 4. **Consensus itself.** Validator consensus keys are lattice. A lattice break
    lets an attacker forge votes and blocks, and the rescue's finality check
    assumes honest finality. Consensus keys need their own SLH/hash-based path

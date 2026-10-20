@@ -1128,8 +1128,31 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
         PosTransaction::L2WithdrawClaim(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::RescueReveal(tx) => Some(Sha3_256::digest(&tx.pubkey).into()),
         PosTransaction::WithdrawalCredentialRotation(tx) => Some(validator_lifecycle_source(tx.validator)),
+        // F-9: a rescue commitment is free and names no key, so every one
+        // shares ONE source. The flood can then hold at most
+        // MEMPOOL_MAX_PER_SOURCE (64) of the MEMPOOL_MAX entries, i.e. 16
+        // blocks' worth at RESCUE_COMMITS_MAX_PER_BLOCK, and never displaces
+        // a paying transaction.
+        PosTransaction::RescueCommit(_) => Some(rescue_commit_pool_source()),
         _ => None,
     }
+}
+
+fn rescue_commit_pool_source() -> [u8; 32] {
+    lifecycle_source_hash(b"rescue-commit-pool", &[])
+}
+
+/// Proposer order among rescue commitments (F-9): they carry no tip, so the
+/// fee order ties them all and the canonical-bytes tie-break would hand
+/// every slot to whoever grinds the lowest commitment bytes. Instead rank by
+/// `SHA3(domain ‖ parent block id ‖ commitment)`: unknown until the parent
+/// exists, so it cannot be ground in advance, and re-drawn every block.
+fn rescue_commit_rank(seed: &[u8; 32], commitment: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(b"bloch/proposer/rescue-commit-order/v1");
+    h.update(seed);
+    h.update(commitment);
+    h.finalize().into()
 }
 
 fn lifecycle_source_hash(domain: &[u8], identity: &[u8]) -> [u8; 32] {
@@ -4858,7 +4881,7 @@ impl Engine {
         let candidates = self.mempool.iter().filter(|(encoded, tx)| {
             self.candidate_is_backed(tx, encoded.len(), epoch, &mut funded_context)
         }).collect();
-        Self::pack_transactions(epoch, candidates)
+        Self::pack_transactions(epoch, *self.state.head().as_bytes(), candidates)
     }
 
     /// Node relay policy (HF2 sigdet): the proposer never selects a spend
@@ -4925,7 +4948,11 @@ impl Engine {
         true
     }
 
-    fn pack_transactions(epoch: u64, mut ordered: Vec<(&Vec<u8>, &PosTransaction)>) -> Vec<PosTransaction> {
+    fn pack_transactions(
+        epoch: u64,
+        seed: [u8; 32],
+        mut ordered: Vec<(&Vec<u8>, &PosTransaction)>,
+    ) -> Vec<PosTransaction> {
         let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
         let mut out = Vec::new();
         let mut bytes = 0u64;
@@ -4943,8 +4970,19 @@ impl Engine {
         let mut reserved = BTreeSet::new();
         // Consensus caps DA batches per block; the highest tips win the slots.
         let mut da_batches = 0usize;
+        // F-9: consensus admits at most RESCUE_COMMITS_MAX_PER_BLOCK
+        // commitments; they rank after every tipped transaction and among
+        // themselves by `rescue_commit_rank`.
+        let mut rescue_commits = 0u64;
+        let rescue_key = |tx: &PosTransaction| match tx {
+            PosTransaction::RescueCommit(c) => Some(rescue_commit_rank(&seed, &c.commitment)),
+            _ => None,
+        };
         ordered.sort_by(|(ka, ta), (kb, tb)| {
-            tx_tip_rate(tb).cmp(&tx_tip_rate(ta)).then_with(|| ka.cmp(kb))
+            tx_tip_rate(tb).cmp(&tx_tip_rate(ta))
+                .then_with(|| rescue_key(ta).is_some().cmp(&rescue_key(tb).is_some()))
+                .then_with(|| rescue_key(ta).cmp(&rescue_key(tb)))
+                .then_with(|| ka.cmp(kb))
         });
         for (encoded, tx) in ordered {
             // Legacy unauthenticated exits are never proposed, even if a
@@ -4989,6 +5027,12 @@ impl Engine {
                     continue;
                 }
                 da_batches += 1;
+            }
+            if matches!(tx, PosTransaction::RescueCommit(_)) {
+                if rescue_commits >= bloch_pos_committee::params::RESCUE_COMMITS_MAX_PER_BLOCK {
+                    continue;
+                }
+                rescue_commits = rescue_commits.saturating_add(1);
             }
             reserved.extend(points);
             bytes = bytes.saturating_add(n); // checked against `cap` just above
@@ -10807,6 +10851,100 @@ mod transfer_v2_end_to_end {
         );
     }
 
+    fn rescue_commit(k: u16) -> PosTransaction {
+        let mut commitment = [0u8; 32];
+        commitment[..2].copy_from_slice(&k.to_le_bytes());
+        PosTransaction::RescueCommit(bloch_pos_committee::transition::RescueCommit {
+            network_domain: [0x5D; 32],
+            commitment,
+        })
+    }
+
+    fn zero_tip_transfer(i: u8) -> PosTransaction {
+        PosTransaction::Transfer {
+            inputs: vec![bloch_pos_committee::transition::TransferInput {
+                txid: [i; 32],
+                vout: 0,
+                pubkey: vec![7, i],
+                signature: vec![8],
+            }],
+            outputs: vec![TransferOutput { value: 1, script_hash: [i; 32] }],
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        }
+    }
+
+    /// F-9, proposer side: a mempool holding a flood of free rescue
+    /// commitments and some zero-tip transfers yields a block with EVERY
+    /// transfer and at most `RESCUE_COMMITS_MAX_PER_BLOCK` commitments, the
+    /// commitments ranked after even zero-tip transfers.
+    #[test]
+    fn a_rescue_commit_flood_cannot_crowd_out_transfers_in_selection() {
+        let epoch = V2_FLAG_DAY + 1;
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+        for k in 0..200u16 {
+            let tx = rescue_commit(k);
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        for i in 0..10u8 {
+            let tx = zero_tip_transfer(i);
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        let selected = Engine::pack_transactions(epoch, [0x11; 32], node.mempool.iter().collect());
+        let commits = selected.iter().filter(|tx| matches!(tx, PosTransaction::RescueCommit(_))).count();
+        let transfers = selected.iter().filter(|tx| matches!(tx, PosTransaction::Transfer { .. })).count();
+        assert_eq!(transfers, 10, "every transfer is selected despite the flood");
+        assert_eq!(commits as u64, bloch_pos_committee::params::RESCUE_COMMITS_MAX_PER_BLOCK);
+        let first_commit = selected.iter().position(|tx| matches!(tx, PosTransaction::RescueCommit(_))).unwrap();
+        assert!(selected[..first_commit].iter().all(|tx| matches!(tx, PosTransaction::Transfer { .. })));
+        assert_eq!(first_commit, 10, "commitments rank after zero-tip transfers");
+    }
+
+    /// F-9: which commitments win the scarce slots is re-drawn from the
+    /// parent block id, so grinding commitment bytes low (the canonical-bytes
+    /// tie-break) does not buy every slot, and the draw changes per block.
+    #[test]
+    fn rescue_commit_slots_are_drawn_from_the_parent_not_from_byte_order() {
+        let epoch = V2_FLAG_DAY + 1;
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+        for k in 0..64u16 {
+            let tx = rescue_commit(k);
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        let pick = |seed: [u8; 32]| -> Vec<PosTransaction> {
+            Engine::pack_transactions(epoch, seed, node.mempool.iter().collect())
+        };
+        let a = pick([0x01; 32]);
+        let b = pick([0x02; 32]);
+        assert_eq!(a, pick([0x01; 32]), "deterministic for one parent");
+        assert_ne!(a, b, "a different parent re-draws the slots");
+        let lowest: Vec<PosTransaction> = (0..64u16).map(rescue_commit)
+            .map(|tx| (tx.canonical_bytes(), tx)).collect::<BTreeMap<_, _>>()
+            .into_values().take(a.len()).collect();
+        assert!(a != lowest || b != lowest, "byte order does not decide the winners");
+    }
+
+    /// F-9, mempool side: every commitment shares one source, so a flood
+    /// holds at most `MEMPOOL_MAX_PER_SOURCE` entries and a paying transfer
+    /// is still admitted while the commitment pool is full.
+    #[test]
+    fn rescue_commits_share_one_mempool_source() {
+        let epoch = V2_FLAG_DAY + 1;
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+        for k in 0..MEMPOOL_MAX_PER_SOURCE as u16 {
+            let tx = rescue_commit(k);
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        assert_eq!(node.mempool.source_count(&rescue_commit_pool_source()), MEMPOOL_MAX_PER_SOURCE);
+        let one_more = rescue_commit(9_999);
+        assert!(matches!(
+            node.plan_mempool_capacity(&one_more, one_more.canonical_bytes().len(), epoch),
+            Err(Refusal::TooManyFromSource)
+        ));
+        let transfer = zero_tip_transfer(1);
+        assert!(node.plan_mempool_capacity(&transfer, transfer.canonical_bytes().len(), epoch).is_ok());
+    }
+
     /// **H-R7-2, the proposer**: `select_transactions` must budget by the
     /// size CONSENSUS will count — each transfer's declared `tx_bytes` — not
     /// by wire length. Packing by wire length selected one tiny transfer
@@ -10863,7 +11001,7 @@ mod transfer_v2_end_to_end {
 
         // Exercise the byte packer independently of eligibility; these
         // synthetic transactions intentionally have no committed inputs.
-        let selected = Engine::pack_transactions(epoch, node.mempool.iter().collect());
+        let selected = Engine::pack_transactions(epoch, [0u8; 32], node.mempool.iter().collect());
         assert!(!selected.is_empty(), "an empty selection would prove nothing");
         // The property the transition enforces at step 10b: the sum of the
         // sizes consensus counts must fit the cap. `max` mirrors the packer:
