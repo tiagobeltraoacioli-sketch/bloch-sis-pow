@@ -21,11 +21,12 @@ Two groups of `pub const NAME: u64 = VALUE;` declarations are rewritten:
         that tie them together still hold. L2_SETTLEMENT_ACTIVATION_EPOCH is
         left untouched: its activation policy names the mainnet admission
         domain and is inert on a fresh devnet either way.
-  HF    every `HF1_*`, `HF2_*`, `HF3_*` constant (u64::MAX or a number) in
-        bloch-pos-committee/src and bloch-pos-node/src becomes --hf1/--hf2/
-        --hf3. That is the naming convention of the codex/hf*-20261020
-        branches (e.g. HF1_CLAIM_FINALITY_EPOCH, HF2_SLASHING_V2_EPOCH).
-        Aliases (`= HF2_SLASHING_V2_EPOCH`) follow automatically.
+  HF    every INERT (u64::MAX) gate named in gates.conf, plus any other
+        inert `HF1_*`/`HF2_*`/`HF3_*` constant, in bloch-pos-committee,
+        bloch-pos-node and bloch-crypto sources, becomes --hf1/--hf2/--hf3
+        (plus the offset gates.conf gives, e.g. own-target votes at HF1+2).
+        Numeric HF constants (HF1_MAX_GATE_SPACING_EPOCHS = 16) are never
+        touched. Aliases (`= HF2_SLASHING_V2_EPOCH`) follow automatically.
 
 If the tree declares a cargo feature `hf-rehearsal` (the mechanism the
 codex/hf-verify-harness-20261020 branch may add) run.sh builds with it
@@ -45,7 +46,8 @@ import sys
 from pathlib import Path
 
 PARAMS = Path("crates/bloch-pos-committee/src/params.rs")
-HF_ROOTS = [Path("crates/bloch-pos-committee/src"), Path("crates/bloch-pos-node/src")]
+HF_ROOTS = [Path("crates/bloch-pos-committee/src"), Path("crates/bloch-pos-node/src"), Path("crates/bloch-crypto/src")]
+GATES_CONF = Path(__file__).resolve().parent / "gates.conf"
 SLASHING_ERA = 2_884
 UNTOUCHED = {"L2_SETTLEMENT_ACTIVATION_EPOCH"}
 
@@ -106,10 +108,25 @@ def main() -> int:
     report["past"] = [dict(c, file=str(PARAMS)) for c in changes]
 
     if not args.no_hf:
-        epochs = {"1": args.hf1, "2": args.hf2, "3": args.hf3}
+        epochs = {"HF1": args.hf1, "HF2": args.hf2, "HF3": args.hf3}
+        conf: dict[str, int] = {}
+        for line in GATES_CONF.read_text().splitlines():
+            line = line.split("#", 1)[0].split()
+            if len(line) == 2:
+                m = re.fullmatch(r"(HF[123])(?:\+(\d+))?", line[1])
+                if not m:
+                    sys.exit(f"gates.conf: bad entry {line}")
+                conf[line[0]] = epochs[m.group(1)] + int(m.group(2) or 0)
+        report["gates_conf"] = conf
 
         def hf(name: str, value: str):
-            m = re.match(r"HF([123])_", name)
+            if value != "u64::MAX":
+                if name in conf:
+                    report.setdefault("already_armed", []).append({"name": name, "value": value})
+                return None
+            if name in conf:
+                return conf[name]
+            m = re.match(r"(HF[123])_", name)
             return epochs[m.group(1)] if m else None
 
         for base in HF_ROOTS:

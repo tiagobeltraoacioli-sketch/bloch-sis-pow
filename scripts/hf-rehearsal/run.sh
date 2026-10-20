@@ -79,7 +79,7 @@ build() { # $1 src $2 out-binary $3 features
   [ -n "$3" ] && feat=(--features "$3")
   ( cd "$1" && CARGO_TARGET_DIR="$TARGET" CARGO_BUILD_JOBS="$JOBS" \
       BLOCH_HF1_REHEARSAL_EPOCH="$HF1" BLOCH_HF2_REHEARSAL_EPOCH="$HF2" BLOCH_HF3_REHEARSAL_EPOCH="$HF3" \
-      nice -n 10 cargo build --locked --release -p bloch-pos-node --bin bloch-pos "${feat[@]}" ) \
+      nice -n 10 cargo build --locked --release -p bloch-pos-node --bin bloch-pos ${feat[@]+"${feat[@]}"} ) \
       > "$BUILD/$(basename "$2").build.log" 2>&1 \
     || { echo "build failed: $BUILD/$(basename "$2").build.log" >&2; tail -30 "$BUILD/$(basename "$2").build.log" >&2; exit 1; }
   cp "$TARGET/release/bloch-pos" "$2"
