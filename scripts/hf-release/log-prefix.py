@@ -7,9 +7,11 @@ usage: log-prefix.py --source <dir> --dest <new dir> --before-slot <n>
 Reads <source>/blocks.idx (BPOSIDX1: slot u64 LE | offset u64 LE | len u32 LE
 per frame, see crates/bloch-pos-node/src/store.rs) to find the first frame whose
 slot is >= <n>, and copies every byte of <source>/blocks.log before that frame
-into <dest>/blocks.log. meta.bin and ws_latest.bin are copied by name. No
-blocks.idx is written: the node rebuilds a missing index on open. The source is
-opened read-only and never modified.
+into <dest>/blocks.log. meta.bin is copied by name. ws_latest.bin is NOT: a
+weak-subjectivity checkpoint newer than the cut must not judge a truncated log,
+and a replay from genesis does not need it. No blocks.idx is written: the node
+rebuilds a missing index on open. The source is opened read-only and never
+modified.
 
 Prints one line: "prefix frames=<k> last_slot=<s> bytes=<b> before_slot=<n>".
 """
@@ -91,10 +93,7 @@ def main():
             remaining -= len(chunk)
         dst.flush()
         os.fsync(dst.fileno())
-    for name in ("meta.bin", "ws_latest.bin"):
-        path = os.path.join(args.source, name)
-        if os.path.isfile(path):
-            shutil.copyfile(path, os.path.join(args.dest, name))
+    shutil.copyfile(os.path.join(args.source, "meta.bin"), os.path.join(args.dest, "meta.bin"))
     print(f"prefix frames={frames} last_slot={last_slot} bytes={cut} before_slot={args.before_slot}")
 
 
