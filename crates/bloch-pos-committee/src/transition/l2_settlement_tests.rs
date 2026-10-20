@@ -3361,7 +3361,7 @@ mod l2_tests {
     }
 
     /// REPRODUCTION (rules as they stand, i.e. below
-    /// `NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH`, which history replays
+    /// `HF1_CLAIM_FINALITY_EPOCH`, which history replays
     /// under): branch B finalizes A's epoch-E checkpoint and the claim
     /// releases on B, and on A. One withdrawal, two payouts, one per side of
     /// the split.
@@ -3380,7 +3380,7 @@ mod l2_tests {
         }
     }
 
-    /// AFTER `NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH`: the same split, the
+    /// AFTER `HF1_CLAIM_FINALITY_EPOCH`: the same split, the
     /// same votes, the same finality on both branches — and the claim pays
     /// only on A, the branch whose own checkpoint was finalized. On B it is
     /// refused `NotFinalized`, in the mempool check and in a block.
@@ -3430,7 +3430,7 @@ mod l2_tests {
     /// above runs below the gate).
     #[test]
     fn below_the_claim_finality_gate_nothing_is_recorded() {
-        assert_eq!(crate::params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH, u64::MAX);
+        assert_eq!(crate::params::HF1_CLAIM_FINALITY_EPOCH, u64::MAX);
         let split_claims::Split { a, b, .. } = split_claims::split();
         for st in [&a, &b] {
             let l2 = st.l2_settlement().unwrap();
@@ -3446,10 +3446,50 @@ mod l2_tests {
 
     #[test]
     fn native_claim_finality_gate_is_inert() {
-        assert_eq!(crate::params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH, u64::MAX);
+        assert_eq!(crate::params::HF1_CLAIM_FINALITY_EPOCH, u64::MAX);
         for epoch in [0, 5_850, 10_000, u64::MAX - 1, u64::MAX] {
             assert!(!crate::params::native_claim_finality_active(epoch));
         }
+    }
+
+    /// HF1 needs both halves. The frozen finality set alone does not stop a
+    /// branch that carries the other branch's votes from finalizing that
+    /// branch's checkpoint (the carried votes come from members of the set),
+    /// so the claim still pays on both sides; with claim finality armed as
+    /// well, it pays only on the branch whose own checkpoint is final.
+    #[test]
+    fn hf1_split_claim_needs_claim_finality_on_top_of_the_frozen_set() {
+        let (recipient, sats) = wleaf(2);
+        // Frozen set only.
+        {
+            let _frozen = crate::params::native_finality_set_test::open();
+            let split_claims::Split { a, b, mut ca, mut cb, a_cp, .. } = split_claims::split();
+            for (state, chains, name) in [(&a, &mut ca, "A"), (&b, &mut cb, "B")] {
+                assert!(state.finality_engine.finality_set().is_some(), "frozen set in force on {name}");
+                assert_eq!(state.finality().finalized.root, a_cp);
+                let tx = split_claims::claim_on(state);
+                assert_eq!(state.l2_withdraw_claim_refusal(&tx), None, "frozen set alone: admissible on {name}");
+                let before = state.balance_sat(&recipient);
+                let post = split_claims::block_with(state, split_claims::CLAIM_SLOT, &[], &[claim(&tx)], chains)
+                    .unwrap_or_else(|e| panic!("claim block on {name}: {e:?}"));
+                assert_eq!(post.balance_sat(&recipient), before + u128::from(sats));
+            }
+        }
+        // Both HF1 halves.
+        let _frozen = crate::params::native_finality_set_test::open();
+        let _claims = crate::params::native_claim_finality_test::open();
+        let split_claims::Split { a, b, mut ca, mut cb, .. } = split_claims::split();
+        assert!(a.finality_engine.finality_set().is_some() && b.finality_engine.finality_set().is_some());
+        let tx = split_claims::claim_on(&b);
+        assert_eq!(b.l2_withdraw_claim_refusal(&tx), Some(ClaimReject::NotFinalized));
+        let before_b = b.balance_sat(&recipient);
+        let b_post = refuse_then_apply(&b, split_claims::CLAIM_SLOT, &[claim(&tx)], 0, &[], &mut cb);
+        assert_eq!(b_post.balance_sat(&recipient), before_b);
+        let tx = split_claims::claim_on(&a);
+        let before_a = a.balance_sat(&recipient);
+        let a_post = split_claims::block_with(&a, split_claims::CLAIM_SLOT, &[], &[claim(&tx)], &mut ca)
+            .expect("the claim pays on the branch whose checkpoint is final");
+        assert_eq!(a_post.balance_sat(&recipient), before_a + u128::from(sats));
     }
 
     /// A stalled finality keeps the finalized epoch's root and the three

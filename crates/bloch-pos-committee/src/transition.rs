@@ -5641,7 +5641,7 @@ impl CommittedState {
                 }
             }
         }
-        // Claim finality on this chain (NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH):
+        // Claim finality on this chain (HF1_CLAIM_FINALITY_EPOCH):
         // record this chain's checkpoint of the epoch being opened. `head` is
         // still the parent here — the last block strictly before the new
         // epoch's first slot, the root `Engine::checkpoint_root` has

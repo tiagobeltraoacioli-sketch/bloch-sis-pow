@@ -40,7 +40,7 @@
 //   outcome: `projection_*` below folds the same split through
 //   `FinalityState` at mainnet epochs to give the mainnet numbers.
 // - Horizon: at most `HORIZON` epochs per run.
-// - Claim rule: `NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH` forced open where a
+// - Claim rule: `HF1_CLAIM_FINALITY_EPOCH` forced open where a
 //   test says "armed" (the fix already on this branch), inert otherwise.
 //
 // SCENARIOS and what TODAY's rules do (pinned by the `today_*` tests):
@@ -77,7 +77,7 @@
 // POST-FIX tests (`#[ignore]`, `post_fix_*`): the intended behaviour after
 // p2a (count only own-chain target votes) and p1a (frozen finality set, no
 // leak in the denominator). The p1a ones arm
-// `params::NATIVE_FINALITY_SET_ACTIVATION_EPOCH` and run; the p2a one stays
+// `params::HF1_FROZEN_FINALITY_SET_EPOCH` and run; the p2a one stays
 // ignored until p2a merges:
 //   - no branch ever justifies or finalizes a checkpoint that is not its own;
 //   - in any split, at most one side finalizes a post-fork checkpoint;

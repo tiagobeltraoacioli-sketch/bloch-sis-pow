@@ -485,7 +485,7 @@ pub mod withdrawal {
     /// own chain, which FFG does not guarantee (a branch can finalize the
     /// checkpoint of another branch whose votes it carries). Consensus reads
     /// it through `CommittedState::l2_record_finalized_for_claim`, which adds
-    /// that check from `params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH`.
+    /// that check from `params::HF1_CLAIM_FINALITY_EPOCH`.
     pub fn record_finalized(record_height: u64, tip_height: u64, tip_slot: u64, finalized_epoch: u64) -> bool {
         if record_height > tip_height {
             return false;
@@ -1350,7 +1350,7 @@ pub struct State {
     /// What this L2 admits and its limits, fixed at installation.
     profile: Profile,
     /// This chain's own checkpoint roots (epoch -> root), recorded at each
-    /// epoch boundary from `params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH`
+    /// epoch boundary from `params::HF1_CLAIM_FINALITY_EPOCH`
     /// and empty before it: a claim is final only if the finalized
     /// checkpoint is one of them. At most four entries (see
     /// [`State::record_checkpoint_root`]). Committed (last, absent while
@@ -1516,7 +1516,7 @@ impl State {
         self.checkpoint_roots.retain(|e, _| *e == finalized_epoch || e.saturating_add(2) >= epoch);
     }
     /// This chain's own checkpoint root of `epoch`, if recorded (see
-    /// `params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH`).
+    /// `params::HF1_CLAIM_FINALITY_EPOCH`).
     pub fn checkpoint_root(&self, epoch: u64) -> Option<[u8; 32]> {
         self.checkpoint_roots.get(&epoch).copied()
     }
@@ -1788,7 +1788,7 @@ impl State {
             }
         }
         // Absent while empty: nothing is recorded below
-        // NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH, so earlier states keep
+        // HF1_CLAIM_FINALITY_EPOCH, so earlier states keep
         // their bytes.
         if !self.checkpoint_roots.is_empty() {
             out.extend_from_slice(b"BLOCH:NATIVE:L2:CHECKPOINT-ROOTS:1");

@@ -398,7 +398,7 @@ impl CommittedState {
     /// Whether the withdrawal record accepted at native height
     /// `record_height` is final for a claim, as consensus judges it: in the
     /// FFG-finalized prefix by [`withdrawal::record_finalized`] and, from
-    /// [`crate::params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH`], under a
+    /// [`crate::params::HF1_CLAIM_FINALITY_EPOCH`], under a
     /// finalized checkpoint that is this chain's OWN checkpoint at its epoch
     /// (a branch can finalize a checkpoint of another branch whose votes it
     /// carries; that finality says nothing about this branch).

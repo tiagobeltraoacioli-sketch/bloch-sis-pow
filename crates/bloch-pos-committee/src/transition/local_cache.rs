@@ -10,11 +10,11 @@ const LIMIT: u64 = 512 * 1024 * 1024;
 /// Marks the optional trailing L2 settlement section of a cached state.
 const L2_SECTION: &[u8; 16] = b"BPOSST01:L2:v1\0\0";
 /// Marks the optional section after the L2 one holding the L2 state's own
-/// checkpoint roots (`params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH`).
+/// checkpoint roots (`params::HF1_CLAIM_FINALITY_EPOCH`).
 /// Written only when non-empty, so every earlier cache keeps its bytes.
 const L2_CHECKPOINT_SECTION: &[u8; 16] = b"BPOSST01:L2CP:v1";
 /// Marks the optional LAST section: the frozen finality set
-/// (`params::NATIVE_FINALITY_SET_ACTIVATION_EPOCH`). Written only once the
+/// (`params::HF1_FROZEN_FINALITY_SET_EPOCH`). Written only once the
 /// gate has created it, so every earlier cache keeps its bytes.
 const FINALITY_SET_SECTION: &[u8; 16] = b"BPOSST01:FSET:v1";
 #[derive(serde::Serialize, serde::Deserialize)]

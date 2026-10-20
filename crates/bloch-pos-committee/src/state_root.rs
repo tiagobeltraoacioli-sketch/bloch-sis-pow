@@ -1364,7 +1364,7 @@ pub struct FinalityRecord {
     pub leaked: Vec<LeakRecord>,
     /// Next epoch the engine will accept — the "dense, in-order" clock.
     pub next_epoch: u64,
-    /// Frozen finality set (`params::NATIVE_FINALITY_SET_ACTIVATION_EPOCH`).
+    /// Frozen finality set (`params::HF1_FROZEN_FINALITY_SET_EPOCH`).
     /// `None` below the gate, and then NOTHING is appended to the leaf, so
     /// every historical root is byte-identical.
     pub finality_set: Option<FinalitySetRecord>,

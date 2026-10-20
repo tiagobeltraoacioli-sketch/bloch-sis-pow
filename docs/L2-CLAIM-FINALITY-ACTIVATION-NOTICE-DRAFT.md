@@ -1,16 +1,24 @@
 # NOTICE (DRAFT): L2 withdrawal claims require own-chain finality (mandatory node upgrade)
 
 > **Draft, not published, not activated.** In the source the gate
-> `params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH` is still `u64::MAX`
+> `params::HF1_CLAIM_FINALITY_EPOCH` is still `u64::MAX`
 > (inert). Before publishing: choose **E**, arm the constant and its pinning
 > test in a release commit, replay the full L1 history with that build, run
 > the mixed-fleet qualification, sign the release, then fill every `{{…}}`.
+>
+> **HF1 bundle.** This rule ships as the first half of hard fork HF1
+> (branch `codex/hf1-core-20261020`), together with the frozen finality set
+> (`params::HF1_FROZEN_FINALITY_SET_EPOCH`). The two constants must be armed
+> in the same release, claim finality first and the frozen set at most
+> `params::HF1_MAX_GATE_SPACING_EPOCHS` epochs later; a build that arms only
+> one of them does not compile. The combined operator notice is the FD-1
+> notice of the security flag-day plan.
 
 | | |
 | --- | --- |
 | Published | `{{DATE}}` (T−`{{N}}` days; recommended N ≥ 7) |
 | Activation epoch **E** | `{{E}}`, first slot `{{E × 32}}`, expected around `{{UTC}}` (30 s slots, 32 slots per epoch; the epoch number is binding, not the clock time) |
-| Release | `bloch-pos` `{{VERSION}}`, commit `{{COMMIT}}` (branch `codex/native-claim-finality-20261019`) |
+| Release | `bloch-pos` `{{VERSION}}`, commit `{{COMMIT}}` (branch `codex/hf1-core-20261020`) |
 | Binary SHA-256 (Linux x86-64) | `{{SHA256}}` |
 | Release signing key | `bloch-release-20260922.pub` (minisign), key id `1A5D96A5C4955EF7` |
 | Who must act | **every** validator, archival / RPC node, bootnode, explorer, indexer, bridge operator and exchange node |

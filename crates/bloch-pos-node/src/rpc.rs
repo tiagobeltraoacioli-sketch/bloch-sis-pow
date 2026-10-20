@@ -2909,7 +2909,7 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
                     ("own_root", l2.checkpoint_root(fin.epoch).map_or(Json::Null, |r| Json::hex(&r))),
                     ("own_chain_rule_active", Json::Bool(bloch_pos_committee::params::epoch_gate_active(
                         bloch_pos_committee::epoch_of(state.slot()),
-                        bloch_pos_committee::params::NATIVE_CLAIM_FINALITY_ACTIVATION_EPOCH,
+                        bloch_pos_committee::params::HF1_CLAIM_FINALITY_EPOCH,
                     ))),
                 ])),
                 ("claimable", claimable(0)),

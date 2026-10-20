@@ -84,7 +84,7 @@
 //!
 //! ## The frozen finality set (gated, inert)
 //!
-//! `params::NATIVE_FINALITY_SET_ACTIVATION_EPOCH` restores the "one 3/3
+//! `params::HF1_FROZEN_FINALITY_SET_EPOCH` restores the "one 3/3
 //! total" premise across the network (ObenBlock PoCI, ported). From the gate
 //! the quorum is `3·w ≥ 2·total(C)` over a frozen set `C` whose stakes are
 //! unleaked and whose membership changes only when the checkpoint it was
@@ -199,7 +199,7 @@ pub struct FinalityState {
     leaked: BTreeMap<u32, u64>,
     /// Next epoch this state will accept — makes "dense, in-order" checkable.
     next_epoch: u64,
-    /// Frozen finality set (`params::NATIVE_FINALITY_SET_ACTIVATION_EPOCH`).
+    /// Frozen finality set (`params::HF1_FROZEN_FINALITY_SET_EPOCH`).
     /// `None` on every epoch below the gate, which is what keeps the committed
     /// finality leaf and the local cache bytes identical for history. Skipped
     /// by serde: the local cache carries it as its own trailing section
@@ -451,7 +451,7 @@ impl FinalityState {
         // FROZEN FINALITY SET (PoCI port), gated. From the gate on the
         // denominator is the total of a frozen set the leak cannot touch, and
         // votes weigh what the set says, unleaked. See
-        // `params::NATIVE_FINALITY_SET_ACTIVATION_EPOCH`.
+        // `params::HF1_FROZEN_FINALITY_SET_EPOCH`.
         let frozen = crate::params::native_finality_set_active(votes.epoch);
         if frozen {
             self.open_finality_set(votes);
@@ -747,7 +747,7 @@ impl FinalityState {
     }
 
     /// The frozen-finality-set state; `None` below
-    /// `params::NATIVE_FINALITY_SET_ACTIVATION_EPOCH`.
+    /// `params::HF1_FROZEN_FINALITY_SET_EPOCH`.
     pub fn finality_set(&self) -> Option<&FinalitySetState> {
         self.finality_set.as_deref()
     }
@@ -2254,7 +2254,7 @@ mod local_cache_tests {
     }
 }
 
-/// Frozen finality set (`params::NATIVE_FINALITY_SET_ACTIVATION_EPOCH`): the
+/// Frozen finality set (`params::HF1_FROZEN_FINALITY_SET_EPOCH`): the
 /// partition, normal-operation, pruning, recovery and replay properties.
 #[cfg(test)]
 mod frozen_set_tests {
@@ -2564,7 +2564,7 @@ mod frozen_set_tests {
 
     #[test]
     fn the_gate_ships_inert() {
-        assert_eq!(crate::params::NATIVE_FINALITY_SET_ACTIVATION_EPOCH, u64::MAX);
+        assert_eq!(crate::params::HF1_FROZEN_FINALITY_SET_EPOCH, u64::MAX);
         assert!(crate::params::NATIVE_FINALITY_SET_RECOVERY_EPOCHS.is_empty());
         for epoch in [0, 5_850, 1 << 40, u64::MAX - 1, u64::MAX] {
             assert!(!crate::params::native_finality_set_active(epoch));
