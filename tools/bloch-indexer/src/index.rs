@@ -978,4 +978,18 @@ impl bloch_pos_committee::attestation::SignatureVerifier for ArchiveVerifier {
         };
         bloch_crypto::crypto::verify_with_policy(policy, key, root, signature)
     }
+
+    /// HF3 spend witnesses, exactly as the node's production verifier
+    /// (`keys.rs`) judges them. The trait default is fail-closed for suite
+    /// 0x0003, so without this override the first 0x0003 spend after
+    /// `HF3_SLH_SUITE_EPOCH` would fail replay and halt the index at a block
+    /// the network accepted.
+    fn verify_spend_at_epoch(&self, key: &[u8], root: &[u8; 32], signature: &[u8], epoch: u64) -> bool {
+        bloch_crypto::crypto::verify_spend(
+            key,
+            root,
+            signature,
+            bloch_pos_committee::params::hf3_slh_suite_active(epoch),
+        )
+    }
 }
