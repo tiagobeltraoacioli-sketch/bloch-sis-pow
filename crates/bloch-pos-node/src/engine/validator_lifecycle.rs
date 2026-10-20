@@ -192,13 +192,19 @@ impl Engine {
     /// 2. Chain context (unknown index, applied, already slashed) → state
     ///    dependent; never a peer fault, an honest peer may be on a branch
     ///    where it still applies.
-    /// 3. One pending evidence per offender: a re-signed (malleated) copy of
-    ///    pending evidence is a different txid but the same offence.
-    /// 4. Both signatures, charged to the DELIVERING source's gossip
-    ///    allowance, never to the accused's lifecycle allowance. Local
-    ///    observations (`None`) are this node's own verified gossip and run
-    ///    unbudgeted, so `report_equivocation` cannot be starved. A bad
-    ///    signature is a fault only when the index→key binding is finalized.
+    /// 3. Both signatures, under EXACTLY the consensus key resolution
+    ///    (`CommittedState::verify_precheck_signatures`), charged to the
+    ///    DELIVERING source's gossip allowance, never to the accused's
+    ///    lifecycle allowance. Local observations (`None`) are this node's
+    ///    own verified gossip and run unbudgeted, so `report_equivocation`
+    ///    cannot be starved. A bad signature is a fault only when the
+    ///    index→key binding is identical on every branch (genesis keys); a
+    ///    key that does not resolve here is never a fault.
+    /// 4. One pending evidence per offender: a re-signed (malleated) copy of
+    ///    pending evidence is a different txid but the same offence. This
+    ///    O(mempool) scan runs only after the budgeted verification, so
+    ///    forged evidence is bounded by the allowance before it can cost a
+    ///    scan.
     pub(super) fn precheck_slashing_evidence(
         &self,
         evidence: &SlashingEvidence,
@@ -220,19 +226,8 @@ impl Engine {
                 ))
             }
         };
-        let offender = pre.offender;
-        if self.mempool.values().any(|tx| {
-            matches!(tx, PosTransaction::SlashingEvidence(e) if evidence_offender(e) == offender)
-        }) {
-            return Err(Refusal::StateDependent(
-                "slashing evidence against this validator is already pending",
-            ));
-        }
         let signed = match source {
-            None => pre
-                .signed
-                .iter()
-                .all(|(root, sig)| self.gossip_verifier.verify_with_key(pre.pubkey, root, sig)),
+            None => self.state.verify_precheck_signatures(&pre, &self.gossip_verifier),
             Some(_) => {
                 let wall_slot = self.wall_slot();
                 let verifier = self.gossip_verifier.budgeted_for_source(
@@ -241,27 +236,41 @@ impl Engine {
                     source,
                     GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
                 );
-                let ok = pre
-                    .signed
-                    .iter()
-                    .all(|(root, sig)| verifier.verify_with_key(pre.pubkey, root, sig));
+                let signed = self.state.verify_precheck_signatures(&pre, &verifier);
                 if verifier.limited() {
                     return Err(Refusal::GossipVerificationLimited {
                         until_slot: wall_slot.saturating_add(1),
                     });
                 }
-                ok
+                signed
             }
         };
-        if !signed {
-            return Err(if pre.key_binding_final {
-                Refusal::EvidenceFault("slashing evidence carries a forged signature")
-            } else {
-                Refusal::StateDependent(
-                    "slashing evidence signature does not verify under this node's \
-                     unfinalized key binding",
-                )
-            });
+        match signed {
+            Some(true) => {}
+            None => {
+                return Err(Refusal::StateDependent(
+                    "slashing evidence names a validator whose key does not resolve \
+                     in this node's committed state",
+                ))
+            }
+            Some(false) => {
+                return Err(if pre.key_binding_final {
+                    Refusal::EvidenceFault("slashing evidence carries a forged signature")
+                } else {
+                    Refusal::StateDependent(
+                        "slashing evidence signature does not verify under this node's \
+                         branch-dependent key binding",
+                    )
+                })
+            }
+        }
+        let offender = pre.offender;
+        if self.mempool.values().any(|tx| {
+            matches!(tx, PosTransaction::SlashingEvidence(e) if evidence_offender(e) == offender)
+        }) {
+            return Err(Refusal::StateDependent(
+                "slashing evidence against this validator is already pending",
+            ));
         }
         Ok(())
     }
@@ -557,7 +566,7 @@ mod p5a_evidence_admission_tests {
             Err(Refusal::StateDependent(_))
         ));
         // One pending evidence per offender: a second pair (or a re-signed
-        // copy) is refused before any verification.
+        // copy) is refused once its signatures are judged.
         let tx = PosTransaction::SlashingEvidence(genuine);
         engine.mempool.insert(tx.canonical_bytes(), tx);
         let other = ev(att(&engine, 0, 0xCC, true), att(&engine, 0, 0xDD, true));
@@ -565,5 +574,29 @@ mod p5a_evidence_admission_tests {
             engine.precheck_slashing_evidence(&other, src(2)),
             Err(Refusal::StateDependent(_))
         ));
+    }
+
+    /// HF2 review F-10: the O(mempool) pending-offender scan runs only after
+    /// the budgeted verification, so forged evidence against an offender with
+    /// pending evidence is still charged to (and judged against) the
+    /// deliverer's allowance, and is refused as the fault it is.
+    #[test]
+    fn verification_budget_runs_before_the_pending_scan() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let _gate = native_slashing_open();
+        let _clock = clock_at(GATE_SLOT);
+        let genuine = ev(att(&engine, 0, 0xAA, true), att(&engine, 0, 0xBB, true));
+        let tx = PosTransaction::SlashingEvidence(genuine);
+        engine.mempool.insert(tx.canonical_bytes(), tx);
+        let before = engine.gossip_verifier.budget_used_at(GATE_SLOT);
+        let forged = ev(att(&engine, 0, 0xCC, false), att(&engine, 0, 0xDD, false));
+        assert!(matches!(
+            engine.precheck_slashing_evidence(&forged, src(3)),
+            Err(Refusal::EvidenceFault(_))
+        ));
+        assert!(
+            engine.gossip_verifier.budget_used_at(GATE_SLOT) > before,
+            "the deliverer's allowance is charged before any mempool scan"
+        );
     }
 }

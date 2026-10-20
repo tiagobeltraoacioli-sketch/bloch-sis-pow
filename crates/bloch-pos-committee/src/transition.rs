@@ -131,7 +131,7 @@ mod lifecycle;
 mod slashing_rehearsal;
 pub use slashing_rehearsal::EvidenceRehearsal;
 pub mod evidence_admission;
-pub use evidence_admission::{EvidencePrecheck, EvidencePrecheckError};
+pub use evidence_admission::{EvidencePrecheck, EvidencePrecheckError, SignedMessage};
 pub use funded::{FundedDeposit, FundedDepositReject, FundingInput};
 pub use funded_delegation::{
     FundedDelegate, FundedDelegationReject, FundedDelegationWithdraw, FundedUndelegate,
