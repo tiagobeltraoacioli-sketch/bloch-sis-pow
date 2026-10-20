@@ -21,6 +21,7 @@
 #   --candidate-bin F --baseline-bin F --arming F   skip the builds
 #   --baseline-bin F alone   reuse a baseline binary, build only the candidate
 #   --build-only          stop after the builds (prints the binaries)
+#   --driver rehearse|kes  scenario driver (kes: HF3 KES rehearsal, needs --conf kes.conf builds)
 #   --conf FILE           arm.py gate conf (repeatable; default gates.conf), e.g.
 #                         --conf scripts/hf-rehearsal/gates.conf --conf scripts/hf-rehearsal/kes.conf
 #
@@ -41,7 +42,7 @@ HERE="$REPO/scripts/hf-rehearsal"
 BASELINE=b4a21fb657d0beb17f64c62889b605c9a7a2d031
 CANDIDATE=""; CANDIDATE_TREE=""; WORK=""; TARGET="$REPO/target/hf-rehearsal"
 HF1=10; HF2=14; HF3=18; PAST=6; JOBS=4
-CBIN=""; BBIN=""; ARMING=""; BUILD_ONLY=0; CONFS=()
+CBIN=""; BBIN=""; ARMING=""; BUILD_ONLY=0; CONFS=(); DRIVER=rehearse
 PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -60,6 +61,7 @@ while [ $# -gt 0 ]; do
     --arming) ARMING="$2"; shift 2;;
     --build-only) BUILD_ONLY=1; shift;;
     --conf) CONFS+=(--conf "$2"); shift 2;;
+    --driver) DRIVER="$2"; shift 2;;
     --) shift; PASS=("$@"); break;;
     -h|--help) sed -n '3,33p' "$0"; exit 0;;
     *) echo "unknown option $1" >&2; exit 2;;
@@ -131,5 +133,10 @@ PY
 fi
 
 if [ "$BUILD_ONLY" = 1 ]; then echo "built: --baseline-bin $BBIN --candidate-bin $CBIN --arming $ARMING"; exit 0; fi
-exec python3 -I "$HERE/rehearse.py" --candidate-bin "$CBIN" --baseline-bin "$BBIN" ${ARMING:+--arming "$ARMING"} \
-  --work "$WORK" --hf1 "$HF1" --hf2 "$HF2" --hf3 "$HF3" "${PASS[@]+"${PASS[@]}"}"
+case "$DRIVER" in
+  rehearse) exec python3 -I "$HERE/rehearse.py" --candidate-bin "$CBIN" --baseline-bin "$BBIN" ${ARMING:+--arming "$ARMING"} \
+              --work "$WORK" --hf1 "$HF1" --hf2 "$HF2" --hf3 "$HF3" "${PASS[@]+"${PASS[@]}"}";;
+  kes) exec python3 -I "$HERE/kes.py" --candidate-bin "$CBIN" --baseline-bin "$BBIN" ${ARMING:+--arming "$ARMING"} \
+              --work "$WORK" "${PASS[@]+"${PASS[@]}"}";;
+  *) echo "unknown --driver $DRIVER" >&2; exit 2;;
+esac

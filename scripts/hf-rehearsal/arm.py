@@ -80,6 +80,10 @@ def main() -> int:
     ap.add_argument("--hf3", type=int, default=18)
     ap.add_argument("--no-hf", action="store_true", help="arm only the PAST group (non-upgraded build)")
     ap.add_argument("--past-gate", type=int, default=6)
+    ap.add_argument("--only-listed", action="store_true",
+                    help="arm only constants named in the conf files (no HF<n>_ prefix rule)")
+    ap.add_argument("--no-past", action="store_true",
+                    help="leave every past flag day untouched (a network with real history, e.g. devnet4)")
     ap.add_argument("--mainnet-epoch", type=int, default=7_000)
     ap.add_argument("--report", type=Path, required=True)
     ap.add_argument("--conf", type=Path, action="append",
@@ -105,7 +109,7 @@ def main() -> int:
         return 0 if n < SLASHING_ERA else args.past_gate
 
     path = root / PARAMS
-    text, changes = rewrite(path.read_text(), past)
+    text, changes = rewrite(path.read_text(), (lambda name, value: None) if args.no_past else past)
     path.write_text(text)
     report["past"] = [dict(c, file=str(PARAMS)) for c in changes]
 
@@ -144,6 +148,8 @@ def main() -> int:
                 return None
             if name in conf:
                 return conf[name]
+            if args.only_listed:
+                return None
             m = re.match(r"(HF[123])_", name)
             return epochs[m.group(1)] if m else None
 

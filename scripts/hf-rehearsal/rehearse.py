@@ -103,6 +103,10 @@ class Rehearsal:
         self.arming = json.loads(args.arming.read_text()) if args.arming and args.arming.exists() else {}
         self.hf_armed = bool(self.arming.get("hf_constants")) or bool(self.arming.get("feature_mode"))
         self.stakes: dict[int, int] = {}
+        # (label, epoch) whose first block must be finalized and shared; the
+        # KES driver replaces these with its own schedule.
+        self.boundaries = [("HF1", args.hf1), ("HF2", args.hf2), ("HF3", args.hf3)]
+        self.proposers: dict[int, int] = {}
         self.allocs: dict[str, dict] = {}
 
     # ── ports ────────────────────────────────────────────────────────────
@@ -650,13 +654,15 @@ class Rehearsal:
                         continue
                     if b and b.get("slot") == slot:
                         chains[i][slot] = (b["block_id"], b["state_root"])
+                        if i == 0:
+                            self.proposers[slot] = b.get("proposer_index")
             up = [i for i in infos if i != self.obs]
             fin_slot = min(infos[i]["finalized"]["epoch"] for i in up) * SPE
             diverge = [s for s in range(1, fin_slot + 1) if len({chains[i].get(s) for i in up}) != 1]
             self.checks.ok("upgraded nodes: identical canonical chain up to the common finalized checkpoint",
                            not diverge, {"finalized_slot": fin_slot, "first_divergent_slots": diverge[:5],
                                          "finalized_epochs": {i: infos[i]["finalized"]["epoch"] for i in infos}})
-            for name, b in (("HF1", self.a.hf1), ("HF2", self.a.hf2), ("HF3", self.a.hf3)):
+            for name, b in self.boundaries:
                 first_slot = next((s for s in range(b * SPE, top + 1) if s in chains[up[0]]), None)
                 ok = first_slot is not None and first_slot <= fin_slot
                 self.checks.ok(f"{name} boundary block (first slot >= {b * SPE}) is finalized and shared", ok,
@@ -674,7 +680,7 @@ class Rehearsal:
                       "observer_rejections": len(re.findall(r"StateRootMismatch|reject ", self.nodes[self.obs].log_text()))}
                 report["observer"] = ev
                 if self.hf_armed:
-                    first_hf = min(self.a.hf1, self.a.hf2, self.a.hf3) * SPE
+                    first_hf = min(e for _, e in self.boundaries) * SPE
                     self.checks.ok("non-upgraded node follows the shared chain until the first HF boundary",
                                    fork is None or fork >= first_hf, ev)
                     self.checks.ok("non-upgraded node forked off (did not follow upgraded blocks to the end)",
