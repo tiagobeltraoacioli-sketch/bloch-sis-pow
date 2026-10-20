@@ -1,0 +1,70 @@
+[package]
+name = "bloch-crypto-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
+# P9e verify-side fuzz harness for bloch-crypto (ML-DSA-65 || Falcon-1024
+# hybrid, envelope parsing, cross-backend ML-DSA, Falcon compact decoding, and
+# SLH-DSA candidate verifiers). Lightweight on purpose: unlike ../../../fuzz it
+# does not pull the legacy Genesis-3 node.
+# Run: cargo +nightly fuzz run <target>   (from this directory)
+
+[package.metadata]
+cargo-fuzz = true
+
+# Own workspace root (not a member of the node workspace, no Cargo.lock churn).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bloch-crypto = { path = ".." }
+pqcrypto-mldsa = "=0.1.2"
+pqcrypto-falcon = { version = "=0.4.1", default-features = false, features = ["std"] }
+pqcrypto-traits = "0.3"
+pqcrypto-internals = "0.2"
+fips204 = { version = "=0.4.6", default-features = false, features = ["ml-dsa-65"] }
+fips205 = { version = "=0.4.1", default-features = false, features = ["slh_dsa_shake_128s"] }
+slh-dsa = "=0.2.0-rc.5"
+rand_core_06 = { package = "rand_core", version = "0.6" }
+
+[patch.crates-io]
+pqcrypto-internals = { path = "../../pqcrypto-internals" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "hybrid_forgery_oracle"
+path = "fuzz_targets/hybrid_forgery_oracle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_malformed"
+path = "fuzz_targets/verify_malformed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mldsa_backend_diff"
+path = "fuzz_targets/mldsa_backend_diff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "falcon_decode_diff"
+path = "fuzz_targets/falcon_decode_diff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slhdsa_verify_diff"
+path = "fuzz_targets/slhdsa_verify_diff.rs"
+test = false
+doc = false
+bench = false

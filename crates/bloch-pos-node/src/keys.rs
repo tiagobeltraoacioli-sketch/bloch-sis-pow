@@ -857,10 +857,173 @@ impl Keystore {
     // never-actually-fails error through every proposer/attester call site
     // in `engine.rs`, for a case this module's own construction paths
     // already rule out. Left COUNTED by the hardened ratchet on purpose.
+    //
+    // p9e finding 2 (Falcon signing on hot hosts): every signature is now
+    // verified under this keystore's own public key before it is returned —
+    // the standard countermeasure against fault attacks on lattice signers,
+    // where a faulted signature that gets published can leak key material.
+    // The returned bytes are exactly what `bloch_crypto::crypto::sign`
+    // produced; nothing about the wire format or any verifier changes. A
+    // signature that does not verify is withheld and signing is retried with
+    // fresh randomness; if that keeps failing the signer is broken (hardware
+    // fault, or public and secret halves that disagree) and the process
+    // aborts rather than keep exercising the key. A restart runs the
+    // power-on self-test (`prepare_signing_host`) before signing again.
     pub fn sign(&self, signing_root: &[u8; 32]) -> Vec<u8> {
-        bloch_crypto::crypto::sign(&self.secret, signing_root)
-            .expect("hybrid signing over a well-formed keystore key cannot fail")
+        self.sign_released(signing_root, bloch_crypto::crypto::sign, bloch_crypto::crypto::verify)
     }
+
+    /// The release path shared by every signing entry point: sign with
+    /// `sign_fn`, return the signature only if `verify_fn` accepts it under
+    /// this keystore's public key, retry with fresh randomness, abort when the
+    /// signer keeps failing. A policy-specific signer must be paired with the
+    /// verifier of the same policy.
+    fn sign_released(
+        &self,
+        signing_root: &[u8; 32],
+        sign_fn: impl Fn(&[u8], &[u8]) -> Result<Vec<u8>, bloch_crypto::crypto::CryptoError>,
+        verify_fn: impl Fn(&[u8], &[u8], &[u8]) -> bool,
+    ) -> Vec<u8> {
+        let started = std::time::Instant::now();
+        for _attempt in 0..SIGN_VERIFY_ATTEMPTS {
+            match bloch_crypto::crypto::hardening::sign_verified_with(
+                &sign_fn,
+                &verify_fn,
+                &self.secret,
+                &self.pubkey,
+                signing_root,
+            ) {
+                Ok(signature) => {
+                    pad_signing_latency(started, signing_latency_floor());
+                    return signature;
+                }
+                Err(e) => eprintln!("SIGNER FAULT (validator {}): {e}", self.index),
+            }
+        }
+        eprintln!(
+            "SIGNER FAULT (validator {}): {SIGN_VERIFY_ATTEMPTS} consecutive signatures failed \
+             verification under the keystore's own public key. Aborting so that no faulty \
+             signature is ever released; on restart the signer self-test runs before any \
+             signing. Check the host for hardware faults and the keystore for a pubkey/secret \
+             mismatch (p9e finding 2, docs/CRYPTO-AUDIT-STATUS-20261020.md).",
+            self.index
+        );
+        std::process::abort()
+    }
+
+    /// Power-on checks for a host about to sign with this keystore
+    /// (p9e finding 2). Run once at node start, before the first duty:
+    ///
+    /// 1. the build targets an architecture on which the integer-only Falcon
+    ///    signer has been vetted (x86_64, aarch64) — overridable only with
+    ///    `BLOCH_ALLOW_UNVETTED_SIGNING_PLATFORM=1`;
+    /// 2. the Falcon-1024 known-answer self-test passes;
+    /// 3. this keystore's secret and public halves are pairwise consistent.
+    ///
+    /// Failure is an error: the node must not start signing on a host whose
+    /// signer is not the one that was reviewed.
+    pub fn signer_self_test(&self) -> io::Result<()> {
+        let allow_unvetted = std::env::var_os(ALLOW_UNVETTED_PLATFORM_ENV).is_some_and(|v| v == "1");
+        signer_self_test_with(&self.secret, &self.pubkey, allow_unvetted)
+    }
+}
+
+/// Signing attempts before [`Keystore::sign`] gives up and aborts.
+pub const SIGN_VERIFY_ATTEMPTS: u32 = 3;
+
+/// Opt-in for signing on an architecture outside
+/// `bloch_crypto::crypto::hardening::VETTED_SIGNING_ARCHES`.
+pub const ALLOW_UNVETTED_PLATFORM_ENV: &str = "BLOCH_ALLOW_UNVETTED_SIGNING_PLATFORM";
+
+/// Optional constant-latency floor for [`Keystore::sign`], in milliseconds.
+///
+/// A validator signs on a public schedule, and the time at which its message
+/// appears on the network includes the signing latency. With a floor set,
+/// `sign` does not return before `floor` has elapsed since it started, so the
+/// observable latency is the floor rather than the (integer-only, designed
+/// constant-time) signer's own running time whenever signing is faster than
+/// the floor. Off by default (0); recommended 100 for mainnet validators.
+/// Capped at [`SIGN_LATENCY_FLOOR_MAX_MS`].
+pub const SIGN_LATENCY_FLOOR_ENV: &str = "BLOCH_SIGN_LATENCY_FLOOR_MS";
+
+/// Upper bound on [`SIGN_LATENCY_FLOOR_ENV`]; a slot is 30 s.
+pub const SIGN_LATENCY_FLOOR_MAX_MS: u64 = 2_000;
+
+/// Opt-out of [`harden_signing_process`]'s core-dump suppression, for
+/// deliberate debugging on a non-production host.
+pub const ALLOW_CORE_DUMPS_ENV: &str = "BLOCH_ALLOW_CORE_DUMPS";
+
+fn parse_latency_floor(raw: Option<&str>) -> std::time::Duration {
+    let ms = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(SIGN_LATENCY_FLOOR_MAX_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+fn signing_latency_floor() -> std::time::Duration {
+    static FLOOR: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| parse_latency_floor(std::env::var(SIGN_LATENCY_FLOOR_ENV).ok().as_deref()))
+}
+
+fn pad_signing_latency(started: std::time::Instant, floor: std::time::Duration) {
+    if let Some(remaining) = floor.checked_sub(started.elapsed()) {
+        std::thread::sleep(remaining);
+    }
+}
+
+fn signer_self_test_with(secret: &[u8], pubkey: &[u8], allow_unvetted_platform: bool) -> io::Result<()> {
+    use bloch_crypto::crypto::hardening;
+    let fail = |what: String| io::Error::other(format!("signer self-test: {what}"));
+    if let Err(e) = hardening::signing_platform_check() {
+        if allow_unvetted_platform {
+            eprintln!("WARNING: {e}. Continuing because {ALLOW_UNVETTED_PLATFORM_ENV}=1.");
+        } else {
+            return Err(fail(format!("{e}. Set {ALLOW_UNVETTED_PLATFORM_ENV}=1 only after reviewing this platform")));
+        }
+    }
+    hardening::falcon_signing_self_test().map_err(fail)?;
+    hardening::pairwise_consistency_test(secret, pubkey).map_err(fail)?;
+    Ok(())
+}
+
+/// Process-level hardening for a node that holds a signing key in memory
+/// (p9e finding 2). Disables core dumps (`RLIMIT_CORE = 0`) so a crash cannot
+/// write the hybrid secret key to `/var/crash` or systemd-coredump, and on
+/// Linux marks the process non-dumpable (`PR_SET_DUMPABLE = 0`), which also
+/// stops other processes running as the same user from ptrace-attaching to
+/// it or reading its memory through `/proc/<pid>/mem`.
+///
+/// Side effects an operator should know: `/proc/<pid>/{fd,environ,maps,smaps,
+/// mem}` become root-only (world-readable `stat`, `statm`, `status` — what
+/// `ps`/`top` use — are unaffected), and same-user debuggers cannot attach.
+/// `BLOCH_ALLOW_CORE_DUMPS=1` skips all of this. Returns what was applied.
+pub fn harden_signing_process() -> io::Result<&'static str> {
+    if std::env::var_os(ALLOW_CORE_DUMPS_ENV).is_some_and(|v| v == "1") {
+        return Ok("skipped (BLOCH_ALLOW_CORE_DUMPS=1)");
+    }
+    #[cfg(unix)]
+    {
+        let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: plain syscall on a stack value; no memory is retained.
+        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: PR_SET_DUMPABLE takes integer arguments only.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(if cfg!(target_os = "linux") {
+        "core dumps disabled, process non-dumpable"
+    } else if cfg!(unix) {
+        "core dumps disabled"
+    } else {
+        "not applicable on this platform"
+    })
 }
 
 /// Read `validator.key`, refusing a file that anyone but its owner can read.
@@ -2208,5 +2371,90 @@ mod tests {
         assert_ne!(next, other.randao_seed_for(&network, 1));
         let _ = fs::remove_dir_all(dir);
         let _ = fs::remove_dir_all(dir2);
+    }
+}
+
+#[cfg(test)]
+mod signer_hardening_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-signer-hardening-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn sign_releases_only_signatures_that_verify_under_the_keystore_pubkey() {
+        let dir = tmp("sign");
+        let ks = Keystore::generate_with(&dir, 3, &Unlock::PlaintextOptIn).expect("generate");
+        for byte in [0u8, 0x5A, 0xFF] {
+            let root = [byte; 32];
+            let sig = ks.sign(&root);
+            assert!(bloch_crypto::crypto::verify(&ks.pubkey, &root, &sig));
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn signer_self_test_passes_for_a_consistent_keystore() {
+        let dir = tmp("selftest-ok");
+        let ks = Keystore::generate_with(&dir, 4, &Unlock::PlaintextOptIn).expect("generate");
+        ks.signer_self_test().expect("self-test on a fresh keystore");
+        signer_self_test_with(&ks.secret, &ks.pubkey, false).expect("explicit, no override");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn signer_self_test_refuses_a_keystore_whose_halves_disagree() {
+        let (_, secret) = bloch_crypto::crypto::generate_keypair();
+        let (pubkey, _) = bloch_crypto::crypto::generate_keypair();
+        let ks = Keystore { index: 9, pubkey, secret: Zeroizing::new(secret), randao_seed: [0; 32] };
+        let err = ks.signer_self_test().expect_err("mismatched halves must fail the self-test");
+        assert!(err.to_string().contains("pairwise consistency"), "{err}");
+    }
+
+    #[test]
+    fn latency_floor_is_off_by_default_parsed_and_capped() {
+        use std::time::Duration;
+        assert_eq!(parse_latency_floor(None), Duration::ZERO);
+        assert_eq!(parse_latency_floor(Some("")), Duration::ZERO);
+        assert_eq!(parse_latency_floor(Some("abc")), Duration::ZERO);
+        assert_eq!(parse_latency_floor(Some("-5")), Duration::ZERO);
+        assert_eq!(parse_latency_floor(Some(" 100 ")), Duration::from_millis(100));
+        assert_eq!(
+            parse_latency_floor(Some("999999999")),
+            Duration::from_millis(SIGN_LATENCY_FLOOR_MAX_MS)
+        );
+    }
+
+    #[test]
+    fn latency_padding_waits_out_the_floor_and_never_shortens() {
+        use std::time::{Duration, Instant};
+        let started = Instant::now();
+        pad_signing_latency(started, Duration::from_millis(30));
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        let started = Instant::now();
+        pad_signing_latency(started, Duration::ZERO);
+        assert!(started.elapsed() < Duration::from_millis(30));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_signing_process_disables_core_dumps() {
+        if std::env::var_os(ALLOW_CORE_DUMPS_ENV).is_some() {
+            return;
+        }
+        let applied = harden_signing_process().expect("hardening");
+        assert!(applied.starts_with("core dumps disabled"), "{applied}");
+        let mut limit = libc::rlimit { rlim_cur: 1, rlim_max: 1 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) }, 0);
+        assert_eq!((limit.rlim_cur, limit.rlim_max), (0, 0));
+        #[cfg(target_os = "linux")]
+        assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
     }
 }

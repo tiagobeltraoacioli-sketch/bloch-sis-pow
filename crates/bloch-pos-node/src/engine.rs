@@ -6137,7 +6137,16 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // silent observer, printing the reassuring line below and attesting
     // nothing. There is no error kind left here to misread.
     let keys = match Keystore::load_optional(&cfg.data_dir)? {
-        Some(k) => Some(k),
+        Some(k) => {
+            // p9e finding 2 (Falcon signing on hot hosts): before the first
+            // duty, keep the key out of core dumps and same-user ptrace, and
+            // refuse to sign unless the signer passes its power-on self-test.
+            let hardening = crate::keys::harden_signing_process()?;
+            k.signer_self_test()?;
+            println!("signer self-test: ok (platform {}, Falcon-1024 KAT, pairwise); {hardening}",
+                bloch_crypto::crypto::hardening::target_arch());
+            Some(k)
+        }
         None => {
             println!(
                 "observer mode: no keystore in {}. This node follows the chain, applies \
