@@ -2814,6 +2814,62 @@ mod frozen_set_tests {
         assert!(max_leak > 0, "the pre-gate window exercised the leak");
     }
 
+    /// The frozen set changes the quorum, not who is charged by the leak.
+    /// Rehearsal shape: stakes 20/40/60 x 4, the four validators 8..=11
+    /// (about 41% of the stake) go offline, so finality stalls and the leak
+    /// starts; every other validator keeps voting except v0, which misses
+    /// one epoch's duty. Under both rules, epoch by epoch, the leak ledger is
+    /// identical: the offline validators leak, an online validator that voted
+    /// every epoch leaks nothing, and v0 leaks only for the epoch it missed.
+    /// (Missing a duty during a leak is what charges an online validator,
+    /// with or without the frozen set.)
+    #[test]
+    fn the_frozen_set_does_not_change_who_the_leak_charges() {
+        let _floor = crate::params::rehearsal::gates_open_guard();
+        for eth_paced in [false, true] {
+            let _q = eth_paced.then(crate::params::eth_paced_leak_rehearsal::open);
+            let unit = 1_000_000_000_000u64;
+            let stakes: Vec<u64> = (0..12u64).map(|i| (i % 3 + 1) * 20 * unit).collect();
+            let set = roster(&stakes);
+            let all: Vec<u32> = (0..12).collect();
+            let offline = [8u32, 9, 10, 11];
+            let missed_by_v0 = 12u64;
+            let mut legacy = FinalityState::new(G);
+            let mut frozen = FinalityState::new(G);
+            for e in 1..=6 {
+                step(&mut legacy, &set, &all, e, 0x01);
+                let _g = gate::open();
+                step(&mut frozen, &set, &all, e, 0x01);
+            }
+            assert_eq!(legacy.finalized().epoch, 5);
+            let mut v0_leaked_at = None;
+            for e in 7..=14u64 {
+                let voters: Vec<u32> = all
+                    .iter()
+                    .copied()
+                    .filter(|v| !offline.contains(v) && !(*v == 0 && e == missed_by_v0))
+                    .collect();
+                let a = step(&mut legacy, &set, &voters, e, 0x01);
+                let b = {
+                    let _g = gate::open();
+                    step(&mut frozen, &set, &voters, e, 0x01)
+                };
+                assert_eq!((a.justified, b.justified), (None, None), "epoch {e}: the stall holds under both");
+                let l: Vec<(u32, u64)> = legacy.leaked_stakes().collect();
+                let f: Vec<(u32, u64)> = frozen.leaked_stakes().collect();
+                assert_eq!(l, f, "epoch {e}: same leak ledger under both rules");
+                for (v, _) in &f {
+                    assert!(offline.contains(v) || *v == 0, "epoch {e}: online v{v} leaked");
+                }
+                if v0_leaked_at.is_none() && f.iter().any(|(v, _)| *v == 0) {
+                    v0_leaked_at = Some(e);
+                }
+            }
+            assert!(legacy.leaked_total() > 0, "the window exercised the leak");
+            assert_eq!(v0_leaked_at, Some(missed_by_v0), "v0 is charged for its missed epoch only");
+        }
+    }
+
     #[test]
     fn the_gate_ships_inert() {
         assert_eq!(crate::params::HF1_FROZEN_FINALITY_SET_EPOCH, u64::MAX);
