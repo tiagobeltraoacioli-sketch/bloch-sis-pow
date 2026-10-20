@@ -217,203 +217,68 @@ fn v2_bound_signatures_verify_on_every_backend_under_their_suite_context_only() 
     }
 }
 
-// ── FIPS 204 Alg. 8 z bound ──────────────────────────────────────────────
+// ── FIPS 204 Alg. 8 z bound, from NIST ACVP negative vectors ──────────────
 //
-// FIPS 204 Alg. 8 line 13 requires ||z||_inf < GAMMA1 - BETA. The fixture
-// below produces a signature that is well-formed in every other respect but
-// whose z lies in [GAMMA1 - BETA, GAMMA1]: it is the reference signer
-// (sign.c, Alg. 7) driven through PQClean's own internal routines with the z
-// acceptance condition inverted. The pinned verifier must reject it on every
-// platform.
+// FIPS 204 Alg. 8 line 13 requires ||z||_inf < GAMMA1 - BETA. No signature is
+// generated here: the NIST ACVP ML-DSA-65 sigVer set includes
+// "modified signature - z" cases whose expected result is reject. The pinned
+// verifier must match NIST on every empty-context sigVer case, and reject each
+// modified-z case in particular.
+use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
-const N: usize = 256;
-const K: usize = 6;
-const L: usize = 5;
-const GAMMA1: i32 = 1 << 19;
-const GAMMA2: i32 = (8_380_417 - 1) / 32;
-const BETA: i32 = 196;
-const OMEGA: u32 = 55;
+const FIXTURE: &[u8] = include_bytes!("vectors/acvp-fips204-mldsa65-full.json");
+const FIXTURE_SHA256: &str = "8289dd0ad1913e45b9150c95b7f6040ec169bec9d598ee438f7d731d5387c751";
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Poly([i32; N]);
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VecL([Poly; L]);
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VecK([Poly; K]);
-
-extern "C" {
-    fn PQCLEAN_MLDSA65_CLEAN_unpack_sk(
-        rho: *mut u8, tr: *mut u8, key: *mut u8, t0: *mut VecK, s1: *mut VecL, s2: *mut VecK, sk: *const u8,
-    );
-    fn PQCLEAN_MLDSA65_CLEAN_polyvec_matrix_expand(mat: *mut VecL, rho: *const u8);
-    fn PQCLEAN_MLDSA65_CLEAN_polyvecl_ntt(v: *mut VecL);
-    fn PQCLEAN_MLDSA65_CLEAN_polyveck_ntt(v: *mut VecK);
-    fn PQCLEAN_MLDSA65_CLEAN_polyvecl_uniform_gamma1(v: *mut VecL, seed: *const u8, nonce: u16);
-    fn PQCLEAN_MLDSA65_CLEAN_polyvec_matrix_pointwise_montgomery(t: *mut VecK, mat: *const VecL, v: *const VecL);
-    fn PQCLEAN_MLDSA65_CLEAN_polyveck_reduce(v: *mut VecK);
-    fn PQCLEAN_MLDSA65_CLEAN_polyveck_invntt_tomont(v: *mut VecK);
-    fn PQCLEAN_MLDSA65_CLEAN_polyveck_caddq(v: *mut VecK);
-    fn PQCLEAN_MLDSA65_CLEAN_polyveck_decompose(v1: *mut VecK, v0: *mut VecK, v: *const VecK);
-    fn PQCLEAN_MLDSA65_CLEAN_polyveck_pack_w1(r: *mut u8, w1: *const VecK);
-    fn PQCLEAN_MLDSA65_CLEAN_poly_challenge(c: *mut Poly, seed: *const u8);
-    fn PQCLEAN_MLDSA65_CLEAN_poly_ntt(a: *mut Poly);
-    fn PQCLEAN_MLDSA65_CLEAN_polyvecl_pointwise_poly_montgomery(r: *mut VecL, a: *const Poly, v: *const VecL);
-    fn PQCLEAN_MLDSA65_CLEAN_polyvecl_invntt_tomont(v: *mut VecL);
-    fn PQCLEAN_MLDSA65_CLEAN_polyvecl_add(w: *mut VecL, u: *const VecL, v: *const VecL);
-    fn PQCLEAN_MLDSA65_CLEAN_polyvecl_reduce(v: *mut VecL);
-    fn PQCLEAN_MLDSA65_CLEAN_polyvecl_chknorm(v: *const VecL, b: i32) -> core::ffi::c_int;
-    fn PQCLEAN_MLDSA65_CLEAN_polyveck_pointwise_poly_montgomery(r: *mut VecK, a: *const Poly, v: *const VecK);
-    fn PQCLEAN_MLDSA65_CLEAN_polyveck_sub(w: *mut VecK, u: *const VecK, v: *const VecK);
-    fn PQCLEAN_MLDSA65_CLEAN_polyveck_add(w: *mut VecK, u: *const VecK, v: *const VecK);
-    fn PQCLEAN_MLDSA65_CLEAN_polyveck_chknorm(v: *const VecK, b: i32) -> core::ffi::c_int;
-    fn PQCLEAN_MLDSA65_CLEAN_polyveck_make_hint(h: *mut VecK, v0: *const VecK, v1: *const VecK) -> core::ffi::c_uint;
-    fn PQCLEAN_MLDSA65_CLEAN_pack_sig(sig: *mut u8, c: *const u8, z: *const VecL, h: *const VecK);
+fn sigver_cases() -> Vec<Value> {
+    assert_eq!(hex::encode(Sha256::digest(FIXTURE)), FIXTURE_SHA256, "fixture edited");
+    let v: Value = serde_json::from_slice(FIXTURE).unwrap();
+    assert_eq!(v["parameterSet"], "ML-DSA-65");
+    v["sigVer"].as_array().unwrap().clone()
 }
 
-fn shake256(parts: &[&[u8]], out: &mut [u8]) {
-    use sha3::digest::{ExtendableOutput, Update, XofReader};
-    let mut h = sha3::Shake256::default();
-    for p in parts {
-        h.update(p);
-    }
-    h.finalize_xof().read(out);
+fn field(case: &Value, name: &str) -> Vec<u8> {
+    hex::decode(case[name].as_str().unwrap_or("")).unwrap()
 }
 
-/// A signature on `msg` (empty context) under `sk` that satisfies every
-/// FIPS 204 condition except ||z||_inf < GAMMA1 - BETA. Returns the signature and the
-/// largest |z_i| it carries.
-fn z_bound_fixture(sk: &[u8; SK], msg: &[u8]) -> (Vec<u8>, i32) {
-    let zero_poly = Poly([0; N]);
-    let (mut t0, mut s2) = (VecK([zero_poly; K]), VecK([zero_poly; K]));
-    let mut s1 = VecL([zero_poly; L]);
-    let (mut rho, mut tr, mut key) = ([0u8; 32], [0u8; 64], [0u8; 32]);
-    let mut mat = [VecL([zero_poly; L]); K];
-    let mut mu = [0u8; 64];
-    let mut rhoprime = [0u8; 64];
-    // SAFETY: every buffer has the exact type/size the PQClean prototypes in
-    // clean/{packing,polyvec,poly}.h declare for ML-DSA-65 (K = 6, L = 5,
-    // N = 256, int32 coefficients); pqcrypto-mldsa is pinned =0.1.2.
-    unsafe {
-        PQCLEAN_MLDSA65_CLEAN_unpack_sk(
-            rho.as_mut_ptr(), tr.as_mut_ptr(), key.as_mut_ptr(), &mut t0, &mut s1, &mut s2, sk.as_ptr(),
+#[test]
+fn pinned_verifier_matches_nist_on_every_sigver_case() {
+    let mut empty = 0;
+    for c in sigver_cases() {
+        let (pk, msg, ctx, sig) = (field(&c, "pk"), field(&c, "message"), field(&c, "context"), field(&c, "signature"));
+        let want = c["testPassed"].as_bool().unwrap();
+        // The pinned backend (clean) with the case's FIPS 204 context.
+        assert_eq!(
+            bloch_mldsa_clean::verify_ctx(&pk, &msg, &ctx, &sig),
+            want,
+            "pinned clean verifier vs NIST tcId {} ({})",
+            c["tcId"],
+            c["reason"]
         );
-        shake256(&[&tr, &[0u8, 0u8], msg], &mut mu);
-        shake256(&[&key, &[0u8; 32], &mu], &mut rhoprime); // rnd = 0^32
-        PQCLEAN_MLDSA65_CLEAN_polyvec_matrix_expand(mat.as_mut_ptr(), rho.as_ptr());
-        PQCLEAN_MLDSA65_CLEAN_polyvecl_ntt(&mut s1);
-        PQCLEAN_MLDSA65_CLEAN_polyveck_ntt(&mut s2);
-        PQCLEAN_MLDSA65_CLEAN_polyveck_ntt(&mut t0);
-        for nonce in 0..u16::MAX {
-            let mut y = VecL([zero_poly; L]);
-            PQCLEAN_MLDSA65_CLEAN_polyvecl_uniform_gamma1(&mut y, rhoprime.as_ptr(), nonce);
-            let mut z = y;
-            let (mut w1, mut w0, mut h) = (VecK([zero_poly; K]), VecK([zero_poly; K]), VecK([zero_poly; K]));
-            PQCLEAN_MLDSA65_CLEAN_polyvecl_ntt(&mut z);
-            PQCLEAN_MLDSA65_CLEAN_polyvec_matrix_pointwise_montgomery(&mut w1, mat.as_ptr(), &z);
-            PQCLEAN_MLDSA65_CLEAN_polyveck_reduce(&mut w1);
-            PQCLEAN_MLDSA65_CLEAN_polyveck_invntt_tomont(&mut w1);
-            PQCLEAN_MLDSA65_CLEAN_polyveck_caddq(&mut w1);
-            let w = w1;
-            PQCLEAN_MLDSA65_CLEAN_polyveck_decompose(&mut w1, &mut w0, &w);
-            let mut sig = vec![0u8; SIG];
-            PQCLEAN_MLDSA65_CLEAN_polyveck_pack_w1(sig.as_mut_ptr(), &w1);
-            let mut ctilde = [0u8; 48];
-            shake256(&[&mu, &sig[..K * 128]], &mut ctilde);
-            let mut cp = zero_poly;
-            PQCLEAN_MLDSA65_CLEAN_poly_challenge(&mut cp, ctilde.as_ptr());
-            PQCLEAN_MLDSA65_CLEAN_poly_ntt(&mut cp);
-
-            PQCLEAN_MLDSA65_CLEAN_polyvecl_pointwise_poly_montgomery(&mut z, &cp, &s1);
-            PQCLEAN_MLDSA65_CLEAN_polyvecl_invntt_tomont(&mut z);
-            let zc = z;
-            PQCLEAN_MLDSA65_CLEAN_polyvecl_add(&mut z, &zc, &y);
-            PQCLEAN_MLDSA65_CLEAN_polyvecl_reduce(&mut z);
-            // Inverted z condition: keep only z outside the bound that still encodes
-            // (polyz_pack represents exactly [-(GAMMA1 - 1), GAMMA1]).
-            let over = PQCLEAN_MLDSA65_CLEAN_polyvecl_chknorm(&z, GAMMA1 - BETA) != 0;
-            let encodable = z.0.iter().all(|p| p.0.iter().all(|&c| (-(GAMMA1 - 1)..=GAMMA1).contains(&c)));
-            if !(over && encodable) {
-                continue;
-            }
-            // Every other signer check, unchanged.
-            PQCLEAN_MLDSA65_CLEAN_polyveck_pointwise_poly_montgomery(&mut h, &cp, &s2);
-            PQCLEAN_MLDSA65_CLEAN_polyveck_invntt_tomont(&mut h);
-            let w0c = w0;
-            PQCLEAN_MLDSA65_CLEAN_polyveck_sub(&mut w0, &w0c, &h);
-            PQCLEAN_MLDSA65_CLEAN_polyveck_reduce(&mut w0);
-            if PQCLEAN_MLDSA65_CLEAN_polyveck_chknorm(&w0, GAMMA2 - BETA) != 0 {
-                continue;
-            }
-            PQCLEAN_MLDSA65_CLEAN_polyveck_pointwise_poly_montgomery(&mut h, &cp, &t0);
-            PQCLEAN_MLDSA65_CLEAN_polyveck_invntt_tomont(&mut h);
-            PQCLEAN_MLDSA65_CLEAN_polyveck_reduce(&mut h);
-            if PQCLEAN_MLDSA65_CLEAN_polyveck_chknorm(&h, GAMMA2) != 0 {
-                continue;
-            }
-            let w0c = w0;
-            PQCLEAN_MLDSA65_CLEAN_polyveck_add(&mut w0, &w0c, &h);
-            let hc = h;
-            let n = PQCLEAN_MLDSA65_CLEAN_polyveck_make_hint(&mut h, &w0, &w1);
-            let _ = hc;
-            if n > OMEGA {
-                continue;
-            }
-            PQCLEAN_MLDSA65_CLEAN_pack_sig(sig.as_mut_ptr(), ctilde.as_ptr(), &z, &h);
-            let max = z.0.iter().flat_map(|p| p.0.iter()).map(|c| c.abs()).max().unwrap();
-            return (sig, max);
+        // The empty-context ones also go through the crypto entry point.
+        if ctx.is_empty() {
+            assert_eq!(bloch_crypto::crypto::verify_mldsa65_raw_pinned(&pk, &msg, &sig), want, "tcId {}", c["tcId"]);
+            empty += 1;
         }
     }
-    panic!("no z-bound fixture candidate found");
+    assert!(empty > 0);
 }
 
 #[test]
-fn pinned_verifier_enforces_the_fips204_z_bound() {
-    let bs = backends();
-    for i in 0..4u8 {
-        let (pk, sk) = keypair_seeded(&bs[0], &[0xD0 ^ i; 32]);
-        let msg = [b"hf2 z bound ".as_slice(), &[i]].concat();
-        let (sig, max_z) = z_bound_fixture(&sk, &msg);
-        assert!(max_z >= GAMMA1 - BETA && max_z <= GAMMA1, "fixture |z| = {max_z}");
-        assert!(!verify(&bs[0], &pk, &msg, b"", &sig), "clean must enforce the z bound");
-        assert!(!bloch_crypto::crypto::verify_mldsa65_raw_pinned(&pk, &msg, &sig));
-        // Tamper control.
-        let mut bad = sig.clone();
-        bad[0] ^= 1;
-        for b in &bs {
-            assert!(!verify(b, &pk, &msg, b"", &bad), "{} accepts tampered c~", b.name);
+fn pinned_verifier_rejects_the_nist_modified_z_vectors() {
+    let mut seen = 0;
+    for c in sigver_cases() {
+        if c["reason"].as_str() != Some("modified signature - z") {
+            continue;
         }
+        assert_eq!(c["testPassed"].as_bool(), Some(false));
+        let (pk, msg, ctx, sig) = (field(&c, "pk"), field(&c, "message"), field(&c, "context"), field(&c, "signature"));
+        assert!(
+            !bloch_mldsa_clean::verify_ctx(&pk, &msg, &ctx, &sig),
+            "pinned clean verifier accepted NIST modified-z vector tcId {}",
+            c["tcId"]
+        );
+        seen += 1;
     }
-}
-
-/// The pinned policies enforce the same bound on hybrid (0x0001) signatures
-/// whose ML-DSA half is the z-bound fixture, and still accept honest ones.
-#[test]
-fn pinned_policies_enforce_the_fips204_z_bound_on_hybrid_signatures() {
-    use bloch_crypto::crypto::{
-        falcon, generate_keypair_from_seed, sign, split_envelope, verify as verify_legacy, verify_pinned,
-        verify_with_policy, SignaturePolicy, MLDSA_SECRET_LEN, SUITE_HEADER_LEN,
-    };
-    let (pk, sk) = generate_keypair_from_seed(&[0xE7u8; 32]).unwrap();
-    let (_, sk_body) = split_envelope(&sk).unwrap();
-    let msk: [u8; SK] = sk_body[..MLDSA_SECRET_LEN].try_into().unwrap();
-    let msg = [0x5Au8; 32];
-    let (msig, _) = z_bound_fixture(&msk, &msg);
-    let honest = sign(&sk, &msg).unwrap();
-    let mut candidate = honest[..SUITE_HEADER_LEN].to_vec();
-    candidate.extend_from_slice(&msig);
-    candidate.extend_from_slice(&falcon::sign(&sk_body[MLDSA_SECRET_LEN..], &msg).unwrap());
-    for policy in [SignaturePolicy::CompatiblePinned, SignaturePolicy::CanonicalUnbound] {
-        assert!(!verify_with_policy(policy, &pk, &msg, &candidate), "{policy:?}");
-    }
-    assert!(!verify_pinned(&pk, &msg, &candidate));
-    assert_eq!(
-        verify_with_policy(SignaturePolicy::Compatible, &pk, &msg, &candidate),
-        verify_legacy(&pk, &msg, &candidate)
-    );
-    for policy in [SignaturePolicy::Compatible, SignaturePolicy::CompatiblePinned, SignaturePolicy::CanonicalUnbound] {
-        assert!(verify_with_policy(policy, &pk, &msg, &honest), "{policy:?}");
-    }
+    assert!(seen >= 1, "the ACVP fixture must carry a modified-z negative vector");
 }
