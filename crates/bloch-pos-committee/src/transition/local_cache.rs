@@ -14,7 +14,7 @@ const L2_SECTION: &[u8; 16] = b"BPOSST01:L2:v1\0\0";
 /// only when non-empty, so every cache without a registration keeps its
 /// bytes. `v2`: the devnet lineage's `v1` section (no start period) is not
 /// accepted and makes the cache rebuild from blocks.
-const KES_SECTION: &[u8; 16] = b"BPOSST01:KES:v2\0";
+const KES_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::KES;
 /// One cached KES key: depth, root, start period.
 type CachedKes = (u8, [u8; 32], u64);
 #[derive(serde::Serialize, serde::Deserialize)]

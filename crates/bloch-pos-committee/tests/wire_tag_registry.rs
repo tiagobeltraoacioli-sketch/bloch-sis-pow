@@ -361,11 +361,10 @@ const TX_TAGS: &[(u8, Status)] = &[
     // (devnet line 4847d708); free on this tree above the L2 range. Refused by
     // consensus before params::KES_REGISTRATION_EPOCH (u64::MAX).
     (0x17, Status::Released { name: "KesRegister", rivals: NO_RIVALS }),
-    // HF3 KES rotation, leaf-authorised. PROVISIONAL byte: the 2026-10-19
-    // allocation (codex/bloch-tag-alloc-20261019) gives 0x18-0x1A to the PQ
-    // migration (p9d) and names 0x1B next free; the HF3 tag resolution
-    // (codex/hf3-tags-20261020) must confirm or move it. Refused by consensus
-    // before params::HF3_KES_EPOCH (u64::MAX).
+    // HF3 KES rotation, leaf-authorised: 0x1B per the HF3 tag table
+    // (codex/hf3-tags-20261020 e0bfbfff, wire_alloc::tx::KES_ROTATE; 0x18-0x1A
+    // are the PQ migration's). Refused by consensus before
+    // params::HF3_KES_EPOCH (u64::MAX).
     (0x1B, Status::Released { name: "KesRotate", rivals: NO_RIVALS }),
 ];
 
@@ -1212,17 +1211,29 @@ fn l2_transaction_tags_do_not_overlap_the_mainnet_tag_set() {
 /// The HF3 table reserves `0x17`–`0x1B` (KesRegister, the PQ trio,
 /// KesRotate). None is in this file's frozen table, and none may decode on a
 /// tree that has not merged its owning line. Each line's merge moves its
-/// bytes from this list into `TX_TAGS`.
-const HF3_RESERVED_NOT_IN_TREE: &[u8] = &[0x17, 0x18, 0x19, 0x1A, 0x1B];
+/// bytes from this list into `TX_TAGS`. The KES line (this tree) has moved
+/// `0x17` KesRegister and `0x1B` KesRotate.
+const HF3_RESERVED_NOT_IN_TREE: &[u8] = &[0x18, 0x19, 0x1A];
+/// HF3 bytes this tree implements: in `TX_TAGS` and decodable.
+const HF3_LANDED_IN_TREE: &[u8] = &[0x17, 0x1B];
 
 #[test]
 fn hf3_reserved_tx_tags_are_unknown_until_their_line_lands() {
     use bloch_pos_committee::wire_alloc::{tx, TX_TABLE};
     assert_eq!(
-        HF3_RESERVED_NOT_IN_TREE.iter().chain([&tx::NEXT_FREE]).count(),
+        HF3_RESERVED_NOT_IN_TREE.iter().chain(HF3_LANDED_IN_TREE).chain([&tx::NEXT_FREE]).count(),
         6,
         "update this list when an HF3 line lands"
     );
+    for tag in HF3_LANDED_IN_TREE {
+        assert!(TX_TAGS.iter().any(|(t, _)| t == tag), "{tag:#04x} landed but is not in the frozen table");
+        assert!(TX_TABLE.iter().any(|r| r.tag == *tag), "{tag:#04x} is not allocated in wire_alloc");
+        assert_ne!(
+            PosTransaction::from_canonical_bytes(&[*tag]),
+            Err(TxDecodeError::UnknownTag(*tag)),
+            "{tag:#04x} dispatches to its decoder on this tree (a bare tag is truncated, not unknown)"
+        );
+    }
     for tag in HF3_RESERVED_NOT_IN_TREE {
         assert!(TX_TAGS.iter().all(|(t, _)| t != tag), "{tag:#04x} is in the frozen table");
         assert!(TX_TABLE.iter().any(|r| r.tag == *tag), "{tag:#04x} is not allocated in wire_alloc");
