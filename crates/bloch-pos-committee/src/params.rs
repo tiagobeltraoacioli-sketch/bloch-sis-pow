@@ -2021,6 +2021,72 @@ pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 /// `staking_tx_metering_gate_is_inert` pins the value.
 pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// HF3 flag day for the optional signature suite 0x0003
+/// (SLH-DSA-SHAKE-128s ‖ Falcon-1024; suite 0x0001 stays the default). In
+/// THIS crate it switches two rules, both from this epoch and both decided off
+/// the block's own committed epoch:
+///
+/// 1. eUTXO spend witnesses are verified through
+///    `SignatureVerifier::verify_spend_at_epoch`, whose production
+///    implementation (`bloch_crypto::crypto::verify_at_epoch`) accepts a
+///    suite-0x0003 witness — below the gate it is exactly `verify_with_key`;
+/// 2. each witness's verify term is priced by its own envelope suite
+///    (`fee_market::eutxo_class_for_keys`) instead of the suite-blind
+///    `HYBRID_VERIFY_GAS`. Below it every charge is bit-identical.
+///
+/// MUST equal `bloch_crypto::crypto::HF3_SLH_SUITE_EPOCH` (this crate does
+/// not depend on bloch-crypto; bloch-pos-node asserts the equality at compile
+/// time): a verifier that accepts the suite while fees still price it as a
+/// hybrid sells ~1.07 M gas of CPU for 72,748. `u64::MAX` = never, even at
+/// `u64::MAX`. Ships INERT; `hf3_slh_suite_gate_is_inert` pins the value.
+pub const HF3_SLH_SUITE_EPOCH: u64 = u64::MAX;
+
+/// HF3 suite id: SLH-DSA-SHAKE-128s ‖ Falcon-1024. The canonical consensus
+/// copy; bloch-pos-node pins it to `bloch_crypto::crypto::SUITE_SLHDSA128S_FALCON1024`.
+pub const SUITE_SLHDSA128S_FALCON1024: u16 = 0x0003;
+
+/// Exact length of a well-formed enveloped suite-0x0003 public key:
+/// header(4) ‖ SLH-DSA-SHAKE-128s pk(32) ‖ Falcon-1024 pk(1793) = 1,829 B.
+/// Pinned to bloch-crypto's in bloch-pos-node.
+pub const SLHDSA_FALCON_ENVELOPED_PUBKEY_LEN: usize = 4 + 32 + 1793;
+
+/// Largest enveloped suite-0x0003 signature the verifier accepts:
+/// header(4) ‖ SLH-DSA-SHAKE-128s sig(7856) ‖ compact Falcon-1024 sig
+/// (PQClean `CRYPTO_BYTES` = 1462, NOT the 1280 B padded size) = 9,322 B.
+/// Any size bound on a 0x0003 witness elsewhere in consensus MUST use this
+/// constant: a smaller bound would refuse signatures the verifier accepts.
+/// Pinned to `bloch_crypto::crypto::max_slhdsa_suite_signature_len()` in
+/// bloch-pos-node.
+pub const SLHDSA_FALCON_MAX_ENVELOPED_SIG_LEN: usize = 4 + 7856 + 1462;
+
+/// Whether HF3 (suite 0x0003 spends + per-suite verify gas) binds at `epoch`.
+/// `u64::MAX` = never. Test builds may arm a rehearsal activation on the
+/// current thread ([`hf3_slh_rehearsal::arm`]); shipped binaries cannot.
+pub fn hf3_slh_suite_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if let Some(activation) = hf3_slh_rehearsal::activation() {
+        return epoch_gate_active(epoch, activation);
+    }
+    epoch_gate_active(epoch, HF3_SLH_SUITE_EPOCH)
+}
+
+/// Thread-local rehearsal activation for [`HF3_SLH_SUITE_EPOCH`], so tests can
+/// drive the armed rules at small epochs. `cfg(test)` only.
+#[cfg(test)]
+pub(crate) mod hf3_slh_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ACTIVATION: Cell<Option<u64>> = const { Cell::new(None) }; }
+    pub fn activation() -> Option<u64> { ACTIVATION.with(Cell::get) }
+    /// Arm `activation` on this thread until the guard drops (also on unwind).
+    pub fn arm(activation: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore {
+            fn drop(&mut self) { ACTIVATION.with(|c| c.set(self.0)); }
+        }
+        Restore(ACTIVATION.with(|c| c.replace(Some(activation))))
+    }
+}
+
 /// Candidate consensus ceiling on transaction count, consulted only when
 /// [`STAKING_TX_METERING_ACTIVATION_EPOCH`] is armed.
 ///
@@ -3096,6 +3162,10 @@ const _: () = assert!(gate_is_inert_or_not_before(
     LATTICE_EMERGENCY_ACTIVATION_EPOCH,
     HF3_PQ_MIGRATION_EPOCH
 ));
+
+// A rotation into suite 0x0003 is useful only once suite 0x0003 verifies:
+// the PQ migration is armed at or after the SLH-DSA suite.
+const _: () = assert!(gate_is_inert_or_not_before(HF3_PQ_MIGRATION_EPOCH, HF3_SLH_SUITE_EPOCH));
 
 pub(crate) fn hf3_pq_migration_active(epoch: u64) -> bool {
     #[cfg(test)]

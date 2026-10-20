@@ -31,23 +31,19 @@ pub const RESCUE_REVEAL_TAG: u8 = crate::wire_alloc::tx::RESCUE_REVEAL;
 /// `codex/bloch-p9a-slhdsa-20261019`; a mismatch is a consensus split.
 pub const SUITE_MLDSA65_FALCON1024: u16 = 0x0001;
 pub const SUITE_MLDSA65_ONLY: u16 = 0x0002;
-pub const SUITE_SLHDSA128S_FALCON1024: u16 = 0x0003;
+pub const SUITE_SLHDSA128S_FALCON1024: u16 = crate::params::SUITE_SLHDSA128S_FALCON1024;
 
 const SUITE_MAGIC: [u8; 2] = [0xb1, 0x0c];
 /// Raw (pre-envelope) hybrid key length: ML-DSA-65 pk ‖ Falcon-1024 pk.
 const LEGACY_HYBRID_PK_BYTES: usize = staking::HYBRID_PK_BYTES;
 /// Envelope ‖ SLH-DSA-128s pk (32) ‖ Falcon-1024 pk (1793).
 pub const SLH_SUITE_PUBKEY_BYTES: usize = 4 + 32 + 1_793;
-/// Envelope ‖ SLH-DSA-128s sig (7856) ‖ Falcon-1024 compact sig (≤ 1462,
-/// PQClean `CRYPTO_BYTES`, not the 1280 B padded size). Equals
-/// `params::SLHDSA_FALCON_MAX_ENVELOPED_SIG_LEN` on codex/hf3-slhdsa-20261020;
-/// the 1280 draft bound refused valid long Falcon signatures.
-pub const SLH_SUITE_SIGNATURE_MAX: usize = 4 + 7_856 + 1_462;
+/// Envelope ‖ SLH-DSA-128s sig (7856) ‖ Falcon-1024 compact sig (≤ 1462).
+/// The suite line's single bound.
+pub const SLH_SUITE_SIGNATURE_MAX: usize = crate::params::SLHDSA_FALCON_MAX_ENVELOPED_SIG_LEN;
 /// Verify gas of one suite-0x0003 signature (SLH-DSA-SHAKE-128s ‖
-/// Falcon-1024). MUST equal `fee_market::SLHDSA_FALCON_VERIFY_GAS` on the
-/// SLH-DSA suite line (codex/hf3-slhdsa-20261020, `41c2f765`); when the two
-/// lines merge, replace this literal with that constant.
-pub const SLH_SUITE_VERIFY_GAS: u64 = 1_067_610;
+/// Falcon-1024): the suite line's per-suite verify gas.
+pub const SLH_SUITE_VERIFY_GAS: u64 = crate::fee_market::SLHDSA_FALCON_VERIFY_GAS;
 /// Largest key/signature any accepted suite produces.
 const PUBKEY_MAX: usize = funded::ADMISSION_PQ_KEY_BYTES;
 const SIGNATURE_MAX: usize = SLH_SUITE_SIGNATURE_MAX;

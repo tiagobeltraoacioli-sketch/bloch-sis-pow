@@ -7474,6 +7474,23 @@ fn admissible_with_verifier(tx: &PosTransaction, wall_epoch: u64, verifier: &dyn
     admissible_with_network_verifier(tx, wall_epoch, None, verifier)
 }
 
+/// The mempool mirror of `CommittedState::spend_witness_verifies`, on the
+/// wall epoch (node-local policy; see the V2 arm for why wall, not head):
+/// below HF3 exactly `verify_with_key`, from it `verify_spend_at_epoch`.
+fn admission_spend_witness_verifies(
+    verifier: &dyn SignatureVerifier,
+    wall_epoch: u64,
+    pubkey: &[u8],
+    signing_root: &[u8; 32],
+    signature: &[u8],
+) -> bool {
+    if bloch_pos_committee::params::hf3_slh_suite_active(wall_epoch) {
+        verifier.verify_spend_at_epoch(pubkey, signing_root, signature, wall_epoch)
+    } else {
+        verifier.verify_with_key(pubkey, signing_root, signature)
+    }
+}
+
 fn admissible_with_network_verifier(
     tx: &PosTransaction,
     wall_epoch: u64,
@@ -7672,9 +7689,15 @@ fn admissible_with_network_verifier(
             // output cannot safely be declared nonexistent without a state
             // inventory and a flag day. The shared classifier also preserves
             // exact-length legacy raw hybrid keys, including magic collisions.
+            // HF3: from params::HF3_SLH_SUITE_EPOCH (wall epoch, as for V2
+            // below) a well-formed suite-0x0003 key is also admissible; below
+            // it this is exactly `is_hybrid_public_key`.
             if inputs
                 .iter()
-                .any(|i| !bloch_crypto::crypto::is_hybrid_public_key(&i.pubkey))
+                .any(|i| !bloch_crypto::crypto::is_spend_public_key_admissible(
+                    &i.pubkey,
+                    bloch_pos_committee::params::hf3_slh_suite_active(wall_epoch),
+                ))
             {
                 return Err(
                     "transfer uses a non-hybrid public-key suite — live spends require \
@@ -7707,9 +7730,7 @@ fn admissible_with_network_verifier(
                 );
             }
             price_bounds(
-                fee_market::TxClass::Eutxo {
-                    inputs: inputs.len() as u32,
-                },
+                fee_market::eutxo_class_for_keys(wall_epoch, inputs.iter().map(|i| i.pubkey.as_slice())),
                 *tx_bytes,
                 *tip_millisat_per_gas,
             )?;
@@ -7733,7 +7754,7 @@ fn admissible_with_network_verifier(
                 .checked_signing_root_for_network(wall_epoch, network_domain)
                 .ok_or("network-bound spend gate requires a committed genesis domain")?;
             for i in inputs {
-                if !verifier.verify_with_key(&i.pubkey, &signing_root, &i.signature) {
+                if !admission_spend_witness_verifies(verifier, wall_epoch, &i.pubkey, &signing_root, &i.signature) {
                     return Err("transfer carries a signature that does not verify");
                 }
             }
@@ -7836,7 +7857,10 @@ fn admissible_with_network_verifier(
             // expensive signature verification.
             if keys
                 .iter()
-                .any(|k| !bloch_crypto::crypto::is_hybrid_public_key(&k.pubkey))
+                .any(|k| !bloch_crypto::crypto::is_spend_public_key_admissible(
+                    &k.pubkey,
+                    bloch_pos_committee::params::hf3_slh_suite_active(wall_epoch),
+                ))
             {
                 return Err(
                     "transfer uses a non-hybrid public-key suite — live spends require \
@@ -7846,9 +7870,7 @@ fn admissible_with_network_verifier(
             // The two price bounds, on the V2 class term (one verification
             // per TABLE entry) — mirroring `apply_transfer_v2`.
             price_bounds(
-                fee_market::TxClass::Eutxo {
-                    inputs: keys.len() as u32,
-                },
+                fee_market::eutxo_class_for_keys(wall_epoch, keys.iter().map(|k| k.pubkey.as_slice())),
                 *tx_bytes,
                 *tip_millisat_per_gas,
             )?;
@@ -7894,7 +7916,7 @@ fn admissible_with_network_verifier(
                 .checked_signing_root_for_network(wall_epoch, network_domain)
                 .ok_or("network-bound spend gate requires a committed genesis domain")?;
             for k in keys {
-                if !verifier.verify_with_key(&k.pubkey, &signing_root, &k.signature) {
+                if !admission_spend_witness_verifies(verifier, wall_epoch, &k.pubkey, &signing_root, &k.signature) {
                     return Err("transfer carries a signature that does not verify");
                 }
             }
@@ -9187,6 +9209,65 @@ mod admission_authorisation {
         // verifier successfully in both encodings.
         assert!(admissible(&signed_transfer().0, 0).is_ok());
         assert!(admissible(&signed_transfer_v2(2), V2_FLAG_DAY).is_ok());
+    }
+
+    /// HF3 ships inert: a transfer authorised by a REAL suite-0x0003
+    /// (SLH-DSA-SHAKE-128s ‖ Falcon-1024) key and signature is refused at
+    /// admission in both encodings, by the unchanged suite policy and before
+    /// any verification, at every epoch; and the production verifier refuses
+    /// its witness on both entry points, while the hybrid controls pass.
+    #[test]
+    fn hf3_suite_0x0003_spends_are_refused_while_the_gate_is_inert() {
+        use bloch_pos_committee::attestation::SignatureVerifier;
+        struct MustNotVerify;
+        impl SignatureVerifier for MustNotVerify {
+            fn verify_with_key(&self, _: &[u8], _: &[u8; 32], _: &[u8]) -> bool {
+                panic!("suite policy must run before signature verification")
+            }
+        }
+        assert_eq!(bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH, u64::MAX);
+        let (pk, sk) = bloch_crypto::crypto::slhdsa_suite::generate_keypair_from_seed(&[0x33u8; 32])
+            .expect("suite-0x0003 keypair");
+        let mut v1 = signed_transfer().0;
+        let root = v1.spend_signing_root();
+        let sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign with the 0x0003 key");
+        if let PosTransaction::Transfer { inputs, .. } = &mut v1 {
+            inputs[0].pubkey = pk.clone();
+            inputs[0].signature = sig.clone();
+        }
+        let root = v1.spend_signing_root();
+        let sig = bloch_crypto::crypto::sign(&sk, &root).expect("re-sign over the final root");
+        if let PosTransaction::Transfer { inputs, .. } = &mut v1 {
+            inputs[0].signature = sig.clone();
+        }
+        let mut v2 = signed_transfer_v2(2);
+        if let PosTransaction::TransferV2 { keys, .. } = &mut v2 {
+            keys[0].pubkey = pk.clone();
+        }
+        let root2 = v2.spend_signing_root();
+        if let PosTransaction::TransferV2 { keys, .. } = &mut v2 {
+            keys[0].signature = bloch_crypto::crypto::sign(&sk, &root2).expect("sign V2 root");
+        }
+        for epoch in [0, V2_FLAG_DAY, 6_017, u64::MAX] {
+            let err = admissible_with_verifier(&v1, epoch, &MustNotVerify)
+                .expect_err("suite 0x0003 must not enter the V1 mempool before HF3");
+            assert!(err.contains("non-hybrid"), "wrong refusal: {err}");
+            if epoch >= V2_FLAG_DAY {
+                let err = admissible_with_verifier(&v2, epoch, &MustNotVerify)
+                    .expect_err("suite 0x0003 must not enter the V2 mempool before HF3");
+                assert!(err.contains("non-hybrid"), "wrong refusal: {err}");
+            }
+            assert!(!HybridVerifier::new().verify_spend_at_epoch(&pk, &root, &sig, epoch));
+        }
+        assert!(!HybridVerifier::new().verify_with_key(&pk, &root, &sig));
+        // Controls: the hybrid fixtures traverse the real verifier on both
+        // entry points.
+        let (h, hsig) = signed_transfer();
+        let PosTransaction::Transfer { inputs, .. } = &h else { unreachable!() };
+        let hroot = h.spend_signing_root();
+        assert!(HybridVerifier::new().verify_with_key(&inputs[0].pubkey, &hroot, &hsig));
+        assert!(HybridVerifier::new().verify_spend_at_epoch(&inputs[0].pubkey, &hroot, &hsig, 0));
+        assert!(admissible(&h, 0).is_ok());
     }
 
     /// The flag day itself, with the unit pinned: both epochs are DERIVED

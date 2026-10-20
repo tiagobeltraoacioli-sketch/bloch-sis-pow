@@ -1,0 +1,79 @@
+# VENDOR.toml — hash pin for the vendored fips205 0.4.1 sources.
+#
+# Every file listed here is byte-identical to the crates.io package
+# fips205 0.4.1 (.crate sha256 2f5626bf5534df4ebdbd2536465d7eaa8a9dc2cdeb7e036e0ecf291dcc80ffb6,
+# upstream git a9b02e92cdf9169db537027f23dbe570ec35f6a4) as extracted by cargo
+# after its registry checksum check on 2026-10-20. Only Cargo.toml (see its
+# header) and the tests/ directory are local.
+#
+# `tests/vendor_pin.rs` recomputes these hashes on every `cargo test` and also
+# fails if a file appears under src/ without a pin, so the algorithm code
+# cannot change without an explicit re-pin in the same commit. Changing a pin
+# is a crypto-review event: re-run the FIPS 205 ACVP vectors
+# (bloch-crypto tests/acvp_slhdsa.rs) and say why in the commit message.
+
+[meta]
+upstream_crate = "fips205"
+upstream_version = "0.4.1"
+upstream_crate_sha256 = "2f5626bf5534df4ebdbd2536465d7eaa8a9dc2cdeb7e036e0ecf291dcc80ffb6"
+upstream_git = "a9b02e92cdf9169db537027f23dbe570ec35f6a4"
+
+[[file]]
+path = "CHANGELOG.md"
+sha256 = "595463f760b736d85eafe5f9b2522aeeb55d8453360cde8fb18d17a7ba68b155"
+
+[[file]]
+path = "LICENSE-APACHE"
+sha256 = "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
+
+[[file]]
+path = "LICENSE-MIT"
+sha256 = "d27687b51f2874822c1530976b7e837eac4f308d94bf3dd42047011b7d437b47"
+
+[[file]]
+path = "README.md"
+sha256 = "512a5b8c91ced950c4ecf6502295edff2f200c6112d6fa6d5de062a784bd4cf0"
+
+[[file]]
+path = "SECURITY.md"
+sha256 = "da7fa483f573cf1d1ce2afc533fd3317c3688639cacce0f74ceba8fba9dc74d6"
+
+[[file]]
+path = "src/fors.rs"
+sha256 = "88f726e0a9eaad9e92e39638cd8c894068e27b983e016ea20e8e74a9ff529eab"
+
+[[file]]
+path = "src/hashers.rs"
+sha256 = "1b7ea4ee0dfbaadbe4250c175a0b64fdf83fc9aa98af4882c634f5c49e6dbfa2"
+
+[[file]]
+path = "src/helpers.rs"
+sha256 = "f21b4f2510c1fa0534dd55d12434cacfcfd634ea05cad0dea0404d6c369ce2b9"
+
+[[file]]
+path = "src/hypertree.rs"
+sha256 = "2d5fc30230a55ff482dff35fa717bc785716d3e778b0eb4902dde078d46d4d80"
+
+[[file]]
+path = "src/lib.rs"
+sha256 = "c5f462cf6735782205a0fad4fc6a97069bdd01237929d8940b03da3cffc3cd70"
+
+[[file]]
+path = "src/slh.rs"
+sha256 = "00c97b8c06772712ae167687871daf39342ca72a30e5d0cacdfa66f0cb1a6c21"
+
+[[file]]
+path = "src/traits.rs"
+sha256 = "493a026db224786e404a0caac8c1bf95d75bd5446de365af80275e71413393e9"
+
+[[file]]
+path = "src/types.rs"
+sha256 = "ccdcfcceb765f3f914f962fc821e02412cb23f4112a754b6e4afd44ff71dba25"
+
+[[file]]
+path = "src/wots.rs"
+sha256 = "d61f00104b022ade5fde2341e59885466c67272a0562f300648c626e2ff97b69"
+
+[[file]]
+path = "src/xmss.rs"
+sha256 = "68901a702c1b324c7fce02887ab91ac1020a585e193ed906515aa76b8dc69153"

@@ -340,7 +340,7 @@ impl SignatureVerifier for PolicyVerifier<'_> {
         signature: &[u8],
         epoch: u64,
     ) -> bool {
-        if crate::transition::pq_migration::key_suite(pubkey) == Some(crate::transition::pq_migration::SUITE_SLHDSA128S_FALCON1024) {
+        if crate::transition::pq_migration::key_suite(pubkey) == Some(crate::params::SUITE_SLHDSA128S_FALCON1024) {
             self.inner.verify_spend_at_epoch(pubkey, signing_root, signature, epoch)
         } else {
             self.verify_with_key(pubkey, signing_root, signature)

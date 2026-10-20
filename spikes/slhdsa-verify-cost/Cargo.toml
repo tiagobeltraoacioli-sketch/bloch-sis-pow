@@ -1,0 +1,26 @@
+[package]
+name = "slhdsa-verify-cost-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone spike (P9f fee policy) — NOT a member of the node workspace.
+# Measures native verify time of the candidate SLH-DSA suite halves against
+# the production PQClean verifiers, and writes the KAT the RV32IM guest in
+# ./rv32s verifies under ../prover-cost/emu/rv32.py.
+
+[workspace]
+
+[dependencies]
+# Production stack, pinned exactly as crates/bloch-crypto pins it.
+pqcrypto-mldsa  = "=0.1.2"
+pqcrypto-falcon = { version = "=0.4.1", default-features = false, features = ["std"] }
+pqcrypto-traits = "0.3"
+# Candidate (as pinned by agent p9a in crates/bloch-crypto).
+fips205 = { version = "=0.4.1", default-features = false, features = ["slh_dsa_shake_128s", "slh_dsa_shake_128f"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

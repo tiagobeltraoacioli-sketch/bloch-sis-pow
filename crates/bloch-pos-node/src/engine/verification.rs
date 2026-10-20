@@ -92,6 +92,36 @@ impl<V> GossipVerifier<V> {
         self.failures.borrow().known.contains(&key)
     }
 
+    /// Failure key for the HF3 spend path once the suite gate is open. A
+    /// distinct domain, so a suite-0x0003 witness memoized as invalid by the
+    /// context-free path (or before the gate) is never served as a cached
+    /// failure after it: the verdict sets differ, so the caches must too.
+    fn spend_failure_key(pubkey: &[u8], root: &[u8; 32], signature: &[u8], armed: bool) -> [u8; 32] {
+        if !armed {
+            return Self::failure_key(SignaturePolicy::Compatible, pubkey, root, signature);
+        }
+        let mut hash = Sha3_256::new();
+        hash.update(b"bloch-node-gossip-invalid-spend-signature-hf3-v1");
+        hash.update(Self::failure_key(SignaturePolicy::Compatible, pubkey, root, signature));
+        hash.finalize().into()
+    }
+
+    fn is_known_spend_failure(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8], armed: bool) -> bool {
+        let key = Self::spend_failure_key(pubkey, root, signature, armed);
+        self.failures.borrow().known.contains(&key)
+    }
+
+    fn remember_failure(&self, key: [u8; 32]) {
+        let mut failures = self.failures.borrow_mut();
+        if failures.order.len() >= MAX_FAILURES {
+            if let Some(oldest) = failures.order.pop_front() {
+                failures.known.remove(&oldest);
+            }
+        }
+        failures.known.insert(key);
+        failures.order.push_back(key);
+    }
+
     pub(super) fn budgeted(&self, slot: u64, cap: usize) -> BudgetedVerifier<'_, V> {
         BudgetedVerifier {
             owner: self,
@@ -113,12 +143,17 @@ impl<V> GossipVerifier<V> {
         BudgetedVerifier { owner: self, slot, cap, source, source_cap, limited: Cell::new(false) }
     }
 
+    /// Reserve `units` of this slot's allowance. A unit is one suite-0x0001
+    /// hybrid verification; an SLH-DSA-suite verification costs
+    /// `fee_market::verify_cost_units` (15) because it burns ~15x the CPU,
+    /// so the per-slot ceiling bounds CPU rather than call count.
     fn reserve_verification(
         &self,
         slot: u64,
         cap: usize,
         source: Option<[u8; 32]>,
         source_cap: usize,
+        units: usize,
     ) -> bool {
         let mut budget = self.budget.borrow_mut();
         if budget.slot != Some(slot) {
@@ -126,14 +161,17 @@ impl<V> GossipVerifier<V> {
             budget.used = 0;
             budget.by_source.clear();
         }
-        if source.is_some_and(|key| budget.by_source.get(&key).copied().unwrap_or(0) >= source_cap) {
+        let units = units.max(1);
+        if source.is_some_and(|key| {
+            budget.by_source.get(&key).copied().unwrap_or(0).saturating_add(units) > source_cap
+        }) {
             return false;
         }
-        if budget.used >= cap { return false; }
-        budget.used = budget.used.saturating_add(1);
+        if budget.used.saturating_add(units) > cap { return false; }
+        budget.used = budget.used.saturating_add(units);
         if let Some(key) = source {
             let used = budget.by_source.entry(key).or_default();
-            *used = used.saturating_add(1);
+            *used = used.saturating_add(units);
         }
         true
     }
@@ -171,16 +209,43 @@ impl<V: SignatureVerifier> SignatureVerifier for BudgetedVerifier<'_, V> {
         if self.owner.is_known_failure(policy, pubkey, root, signature) {
             return false;
         }
-        if !self.owner.reserve_verification(
-            self.slot,
-            self.cap,
-            self.source,
-            self.source_cap,
-        ) {
+        // The context-free path never runs an SLH-DSA verification (suite
+        // 0x0003 is refused by its suite arm), so it costs one unit as before.
+        if !self.owner.reserve_verification(self.slot, self.cap, self.source, self.source_cap, 1) {
             self.limited.set(true);
             return false;
         }
         self.owner.verify_with_key_under(policy, pubkey, root, signature)
+    }
+
+    /// Spend witnesses at `epoch`. Below HF3 this is exactly
+    /// [`Self::verify_with_key`] (one unit). From HF3 a suite-0x0003 witness
+    /// reserves `fee_market::verify_cost_units` (15) units, so the per-slot
+    /// and per-source ceilings bound CPU rather than call count.
+    fn verify_spend_at_epoch(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8], epoch: u64) -> bool {
+        let armed = bloch_pos_committee::params::hf3_slh_suite_active(epoch);
+        self.verify_spend_gated(pubkey, root, signature, epoch, armed)
+    }
+}
+
+impl<V: SignatureVerifier> BudgetedVerifier<'_, V> {
+    /// [`SignatureVerifier::verify_spend_at_epoch`] with the HF3 gate decided
+    /// by the caller (so tests can drive the armed branch; the shipped gate is
+    /// `u64::MAX`).
+    fn verify_spend_gated(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8], epoch: u64, armed: bool) -> bool {
+        if !armed {
+            return self.verify_with_key(pubkey, root, signature);
+        }
+        if self.owner.is_known_spend_failure(pubkey, root, signature, true) {
+            return false;
+        }
+        let units = usize::try_from(bloch_pos_committee::fee_market::verify_cost_units(pubkey))
+            .unwrap_or(usize::MAX);
+        if !self.owner.reserve_verification(self.slot, self.cap, self.source, self.source_cap, units) {
+            self.limited.set(true);
+            return false;
+        }
+        self.owner.verify_spend_gated(pubkey, root, signature, epoch, true)
     }
 }
 
@@ -217,6 +282,36 @@ impl<V: SignatureVerifier> SignatureVerifier for GossipVerifier<V> {
         }
         failures.known.insert(key);
         failures.order.push_back(key);
+        false
+    }
+
+    /// HF3 spend path: below the gate exactly [`Self::verify_with_key`]; from
+    /// it the inner verifier's epoch-aware method, memoizing failures under
+    /// the gate-specific key ([`Self::spend_failure_key`]).
+    fn verify_spend_at_epoch(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8], epoch: u64) -> bool {
+        let armed = bloch_pos_committee::params::hf3_slh_suite_active(epoch);
+        self.verify_spend_gated(pubkey, root, signature, epoch, armed)
+    }
+}
+
+impl<V: SignatureVerifier> GossipVerifier<V> {
+    fn verify_spend_gated(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8], epoch: u64, armed: bool) -> bool {
+        if !armed {
+            return self.verify_with_key(pubkey, root, signature);
+        }
+        #[cfg(test)]
+        assert!(
+            !self.panic_on_verification.get(),
+            "deferred authenticated block must not repeat gossip verification"
+        );
+        let key = Self::spend_failure_key(pubkey, root, signature, true);
+        if self.failures.borrow().known.contains(&key) {
+            return false;
+        }
+        if self.verifier.verify_spend_at_epoch(pubkey, root, signature, epoch) {
+            return true;
+        }
+        self.remember_failure(key);
         false
     }
 }
@@ -390,6 +485,87 @@ mod tests {
         assert!(!honest_admitted.verify_with_key(b"registered key", &[4; 32], &signature));
         assert!(!honest_admitted.limited(), "another source retains aggregate headroom");
         assert_eq!(verifier.verifier.calls.get(), 3);
+    }
+
+    /// A suite-0x0003-SHAPED key (envelope header, exact length).
+    fn slh_key() -> Vec<u8> {
+        let mut k = vec![0xB1, 0x0C, 0x03, 0x00];
+        k.resize(bloch_pos_committee::fee_market::SLHDSA_FALCON_ENVELOPED_PUBKEY_LEN, 0x42);
+        k
+    }
+
+    /// The fleet's configuration: HF3 is off, so the spend entry point is the
+    /// context-free one — one unit per call, same cache — whatever the key.
+    #[test]
+    fn spend_path_below_hf3_is_the_context_free_path() {
+        assert_eq!(bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH, u64::MAX);
+        let verifier = fixture();
+        for n in 0u8..3 {
+            let bounded = verifier.budgeted_for_source(90, 3, Some([1; 32]), 3);
+            assert!(!bounded.verify_spend_at_epoch(&slh_key(), &[n; 32], &[0xCC; 8], u64::MAX));
+            assert!(!bounded.limited());
+        }
+        assert_eq!(verifier.budget_used_at(90), 3, "one unit per SLH-shaped call below HF3");
+        assert_eq!(verifier.verifier.calls.get(), 3);
+        let shed = verifier.budgeted_for_source(90, 3, Some([1; 32]), 3);
+        assert!(!shed.verify_spend_at_epoch(b"registered key", &[7; 32], &[7; 32], 0));
+        assert!(shed.limited());
+    }
+
+    #[test]
+    fn armed_slh_spend_verification_spends_cpu_weighted_allowance() {
+        let verifier = fixture();
+        let source = [0x0A; 32];
+        let units = bloch_pos_committee::fee_market::verify_cost_units(&slh_key()) as usize;
+        assert_eq!(units, 15);
+        assert_eq!(bloch_pos_committee::fee_market::verify_cost_units(b"registered key"), 1);
+        // Two SLH verifications fit a 30-unit allowance; a third does not,
+        // and is shed without reaching the cryptographic verifier.
+        for n in 0u8..2 {
+            let bounded = verifier.budgeted_for_source(92, 30, Some(source), 30);
+            assert!(!bounded.verify_spend_gated(&slh_key(), &[n; 32], &[0xCC; 8], 5, true));
+            assert!(!bounded.limited());
+        }
+        assert_eq!(verifier.budget_used_at(92), 2 * units);
+        let shed = verifier.budgeted_for_source(92, 30, Some(source), 30);
+        assert!(!shed.verify_spend_gated(&slh_key(), &[9; 32], &[0xCC; 8], 5, true));
+        assert!(shed.limited());
+        drop(shed);
+        assert_eq!(verifier.verifier.calls.get(), 2);
+        // A hybrid verification is still one unit and is not starved by the
+        // weighting when the aggregate still has room for it.
+        let other = verifier.budgeted_for_source(93, 30, Some(source), 30);
+        assert!(other.verify_spend_gated(b"registered key", &[7; 32], &[7; 32], 5, true));
+        assert!(!other.limited());
+        drop(other);
+        assert_eq!(verifier.budget_used_at(93), 1);
+        // A replayed armed failure is served from the cache at no allowance.
+        let replay = verifier.budgeted_for_source(94, 30, Some(source), 30);
+        assert!(!replay.verify_spend_gated(&slh_key(), &[0; 32], &[0xCC; 8], 5, true));
+        assert_eq!(verifier.budget_used_at(94), 0);
+        assert_eq!(verifier.verifier.calls.get(), 3);
+    }
+
+    /// A witness memoized as invalid by the context-free path (e.g. a
+    /// suite-0x0003 spend seen before HF3) must not be served as a cached
+    /// failure on the armed spend path, whose verdict set is larger.
+    #[test]
+    fn armed_spend_path_does_not_inherit_pre_hf3_failures() {
+        struct EpochAware(Cell<usize>);
+        impl SignatureVerifier for EpochAware {
+            fn verify_with_key(&self, _: &[u8], _: &[u8; 32], _: &[u8]) -> bool { false }
+            fn verify_spend_at_epoch(&self, _: &[u8], _: &[u8; 32], _: &[u8], _: u64) -> bool {
+                self.0.set(self.0.get() + 1);
+                true
+            }
+        }
+        let verifier = GossipVerifier::new(EpochAware(Cell::new(0)));
+        let (pk, root, sig) = (slh_key(), [3u8; 32], [4u8; 9]);
+        assert!(!verifier.verify_with_key(&pk, &root, &sig));
+        assert!(verifier.is_known_failure(SignaturePolicy::Compatible, &pk, &root, &sig));
+        assert!(!verifier.verify_spend_gated(&pk, &root, &sig, 9, false), "below HF3: same cache");
+        assert!(verifier.verify_spend_gated(&pk, &root, &sig, 9, true), "armed: fresh verdict");
+        assert_eq!(verifier.verifier.0.get(), 1);
     }
 
     #[test]

@@ -4179,6 +4179,26 @@ impl CommittedState {
         Ok(())
     }
 
+    /// One eUTXO spend witness. Below HF3 this is exactly
+    /// `verify_with_key` — the pre-HF3 verdict cannot depend on how a verifier
+    /// implements the epoch-aware method. From `params::HF3_SLH_SUITE_EPOCH`
+    /// it is `verify_spend_at_epoch` at the block's committed epoch, which
+    /// the production verifier uses to admit suite 0x0003 witnesses (priced
+    /// per suite by `fee_market::eutxo_class_for_keys` on the same gate).
+    fn spend_witness_verifies(
+        verifier: &dyn SignatureVerifier,
+        epoch: u64,
+        pubkey: &[u8],
+        signing_root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        if crate::params::hf3_slh_suite_active(epoch) {
+            verifier.verify_spend_at_epoch(pubkey, signing_root, signature, epoch)
+        } else {
+            verifier.verify_with_key(pubkey, signing_root, signature)
+        }
+    }
+
     /// Authorise, price and apply one value transfer against the committed
     /// unspent set.
     ///
@@ -4259,7 +4279,13 @@ impl CommittedState {
         // The class term is the *actual* input count, not a number the
         // transaction asserts: gas buys node CPU, and one hybrid verification
         // per input is what this function is about to spend.
-        let class = fee_market::TxClass::Eutxo { inputs: inputs.len() as u32 };
+        // From the SLH-DSA suite flag day each witness is priced by its own
+        // envelope suite (`fee_market::eutxo_class_for_keys`); below it this is
+        // exactly `Eutxo { inputs: inputs.len() }`.
+        let class = fee_market::eutxo_class_for_keys(
+            self.epoch,
+            inputs.iter().map(|i| i.pubkey.as_slice()),
+        );
 
         // ── The price's two bounds, BEFORE anything is priced ───────────────
         //
@@ -4362,7 +4388,7 @@ impl CommittedState {
             .checked_signing_root_for_network(self.epoch, self.admission_network_domain.as_ref())
             .ok_or(TransferReject::MissingNetworkBinding)?;
         for i in inputs {
-            if !verifier.verify_with_key(&i.pubkey, &signing_root, &i.signature) {
+            if !Self::spend_witness_verifies(verifier, self.epoch, &i.pubkey, &signing_root, &i.signature) {
                 return Err(TransferReject::BadSignature);
             }
         }
@@ -4489,7 +4515,12 @@ impl CommittedState {
 
         // The class term is the TABLE length — see the charge below. Fixed
         // here because the gas ceiling is checked before anything is priced.
-        let class = fee_market::TxClass::Eutxo { inputs: keys.len() as u32 };
+        // Per-suite from the SLH-DSA flag day, as in V1 — one term per table
+        // entry, priced by that entry's envelope suite.
+        let class = fee_market::eutxo_class_for_keys(
+            self.epoch,
+            keys.iter().map(|k| k.pubkey.as_slice()),
+        );
 
         // ── The price's two bounds, BEFORE anything is priced ───────────────
         //
@@ -4675,7 +4706,7 @@ impl CommittedState {
                 .ok_or(TransferReject::MissingNetworkBinding)?,
         };
         for k in keys {
-            if !verifier.verify_with_key(&k.pubkey, &signing_root, &k.signature) {
+            if !Self::spend_witness_verifies(verifier, self.epoch, &k.pubkey, &signing_root, &k.signature) {
                 return Err(TransferReject::BadSignature);
             }
         }
@@ -6465,15 +6496,16 @@ impl<V: SignatureVerifier> Transition<V> {
         let mut minimum_bytes = 0u64;
         let mut minimum_gas = 0u64;
         for tx in transactions {
-            let (bytes, witnesses) = match tx {
-                PosTransaction::Transfer { inputs, tx_bytes, .. } => (*tx_bytes, inputs.len()),
-                PosTransaction::TransferV2 { keys, tx_bytes, .. } => (*tx_bytes, keys.len()),
-                PosTransaction::FundedDeposit(tx) => (tx.tx_bytes, 2),
+            let (bytes, class) = match tx {
+                PosTransaction::Transfer { inputs, tx_bytes, .. } => (*tx_bytes,
+                    fee_market::eutxo_class_for_keys(st.epoch, inputs.iter().map(|i| i.pubkey.as_slice()))),
+                PosTransaction::TransferV2 { keys, tx_bytes, .. } => (*tx_bytes,
+                    fee_market::eutxo_class_for_keys(st.epoch, keys.iter().map(|k| k.pubkey.as_slice()))),
+                PosTransaction::FundedDeposit(tx) => (tx.tx_bytes, fee_market::TxClass::Eutxo { inputs: 2 }),
                 _ => continue,
             };
             minimum_bytes = minimum_bytes.saturating_add(bytes);
-            minimum_gas = minimum_gas.saturating_add(fee_market::intrinsic_gas(
-                fee_market::TxClass::Eutxo { inputs: witnesses as u32 }, bytes));
+            minimum_gas = minimum_gas.saturating_add(fee_market::intrinsic_gas(class, bytes));
         }
         if minimum_gas > fee_market::BLOCK_GAS_LIMIT {
             return Err(TransitionError::BlockGasLimitExceeded);
@@ -12926,6 +12958,255 @@ mod tests {
         );
     }
 
+    // -- HF3_SLH_SUITE_EPOCH (optional suite 0x0003) ---------------------------
+
+    /// Tests for the HF3 consensus wiring: which verifier method a spend
+    /// witness reaches, at which epoch, and what it is charged.
+    mod hf3_slh_suite {
+        use super::*;
+        use std::cell::{Cell, RefCell};
+
+        /// A suite-0x0003-SHAPED key (envelope header + exact body length), so
+        /// the fee arm classifies it as an SLH witness. The bytes are toy.
+        fn slh_owner(tag: u8) -> Vec<u8> {
+            let mut k = vec![0xB1, 0x0C, 0x03, 0x00];
+            k.resize(fee_market::SLHDSA_FALCON_ENVELOPED_PUBKEY_LEN, tag);
+            k
+        }
+
+        /// Models the production split: `verify_with_key` (context-free) knows
+        /// only the toy "hybrid" signature; `verify_spend_at_epoch` also
+        /// accepts the toy "suite 0x0003" signature. Records every epoch the
+        /// epoch-aware path is asked about.
+        #[derive(Default)]
+        struct SuiteToyVerifier {
+            epoch_calls: RefCell<Vec<u64>>,
+            plain_calls: Cell<usize>,
+        }
+        fn slh_toy_sign(pubkey: &[u8], root: &[u8; 32]) -> Vec<u8> {
+            let mut s = toy_sign(pubkey, root);
+            s.extend_from_slice(b"/0x0003");
+            s
+        }
+        impl SignatureVerifier for SuiteToyVerifier {
+            fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+                self.plain_calls.set(self.plain_calls.get() + 1);
+                sig == toy_sign(pk, root).as_slice()
+            }
+            fn verify_spend_at_epoch(&self, pk: &[u8], root: &[u8; 32], sig: &[u8], epoch: u64) -> bool {
+                self.epoch_calls.borrow_mut().push(epoch);
+                sig == toy_sign(pk, root).as_slice() || sig == slh_toy_sign(pk, root).as_slice()
+            }
+        }
+
+        /// A conserving V1 transfer whose fee is computed with the class the
+        /// transition will derive at `g`'s epoch (per-suite when armed).
+        fn slh_transfer(
+            coin: &crate::state_root::EutxoEntry,
+            owner: &[u8],
+            epoch: u64,
+            price: u128,
+        ) -> PosTransaction {
+            let to = script_of(&owner_key(0x6A));
+            let inputs = vec![TransferInput {
+                txid: coin.txid,
+                vout: coin.vout,
+                pubkey: owner.to_vec(),
+                signature: vec![0u8; 32 + 7],
+            }];
+            let probe = PosTransaction::Transfer {
+                inputs: inputs.clone(),
+                outputs: vec![TransferOutput { value: 0, script_hash: to }],
+                tx_bytes: 0,
+                tip_millisat_per_gas: 0,
+            };
+            let tx_bytes = probe.canonical_bytes().len() as u64;
+            let class = fee_market::eutxo_class_for_keys(epoch, [owner]);
+            let c = fee_market::charge(class, tx_bytes, price, 0);
+            let mut tx = PosTransaction::Transfer {
+                inputs,
+                outputs: vec![TransferOutput {
+                    value: coin.value - (c.base_fee_sat + c.priority_fee_sat) as u64,
+                    script_hash: to,
+                }],
+                tx_bytes,
+                tip_millisat_per_gas: 0,
+            };
+            let root = tx.spend_signing_root();
+            if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+                inputs[0].signature = slh_toy_sign(owner, &root);
+            }
+            tx
+        }
+
+        /// TRIPWIRE: HF3 ships inert. Arming it is a release decision taken
+        /// together with `bloch_crypto::crypto::HF3_SLH_SUITE_EPOCH`.
+        #[test]
+        fn hf3_slh_suite_gate_is_inert() {
+            assert_eq!(crate::params::HF3_SLH_SUITE_EPOCH, u64::MAX);
+            for e in [0, 1, 6_017, u64::MAX - 1, u64::MAX] {
+                assert!(!crate::params::hf3_slh_suite_active(e));
+                assert!(!fee_market::per_suite_verify_gas_active(e));
+            }
+        }
+
+        /// Below the gate (the fleet's configuration — no rehearsal armed):
+        /// the spend path never reaches `verify_spend_at_epoch`, a witness
+        /// only the epoch-aware verifier would accept is `BadSignature`, and
+        /// the charge is today's suite-blind one.
+        #[test]
+        fn below_the_gate_spends_use_verify_with_key_only() {
+            let owner = slh_owner(0x61);
+            let coin = opening(0xA1, 0, 1_000_000_000_000_000, &owner);
+            let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+            let price = g.next_base_fee();
+            let tx = slh_transfer(&coin, &owner, g.epoch, price);
+            let v = SuiteToyVerifier::default();
+            assert_eq!(g.clone().apply_transfer(&tx, price, &v), Err(TransferReject::BadSignature));
+            assert!(v.epoch_calls.borrow().is_empty(), "epoch-aware path reached below HF3");
+            assert_eq!(v.plain_calls.get(), 1);
+            assert_eq!(
+                fee_market::eutxo_class_for_keys(g.epoch, [owner.as_slice()]),
+                fee_market::TxClass::Eutxo { inputs: 1 }
+            );
+            // The same holds one epoch before a rehearsal activation.
+            let _armed = crate::params::hf3_slh_rehearsal::arm(g.epoch + 1);
+            let v = SuiteToyVerifier::default();
+            assert_eq!(g.clone().apply_transfer(&tx, price, &v), Err(TransferReject::BadSignature));
+            assert!(v.epoch_calls.borrow().is_empty());
+        }
+
+        /// From the gate: the witness goes through `verify_spend_at_epoch` at
+        /// the state's committed epoch, applies, and is charged the SLH gas.
+        #[test]
+        fn from_the_gate_spends_use_the_epoch_verifier_and_pay_slh_gas() {
+            let owner = slh_owner(0x62);
+            let coin = opening(0xA2, 0, 1_000_000_000_000_000, &owner);
+            let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+            let _armed = crate::params::hf3_slh_rehearsal::arm(g.epoch);
+            let price = g.next_base_fee();
+            let tx = slh_transfer(&coin, &owner, g.epoch, price);
+            let v = SuiteToyVerifier::default();
+            let charge = g.clone().apply_transfer(&tx, price, &v).expect("armed 0x0003 spend applies");
+            assert_eq!(*v.epoch_calls.borrow(), vec![g.epoch]);
+            assert_eq!(v.plain_calls.get(), 0);
+            let tx_bytes = tx.canonical_bytes().len() as u64;
+            assert_eq!(
+                charge.gas,
+                fee_market::intrinsic_gas(
+                    fee_market::TxClass::EutxoSuites { hybrid: 0, slh_falcon: 1 },
+                    tx_bytes
+                )
+            );
+            assert!(charge.gas > fee_market::intrinsic_gas(fee_market::TxClass::Eutxo { inputs: 1 }, tx_bytes));
+            // Underpaying with the suite-blind fee is refused once armed: the
+            // fee arm and the verifier arm move together.
+            let _off = crate::params::hf3_slh_rehearsal::arm(u64::MAX);
+            let blind = slh_transfer(&coin, &owner, g.epoch, price);
+            drop(_off);
+            assert_eq!(
+                g.clone().apply_transfer(&blind, price, &v),
+                Err(TransferReject::ValueNotConserved)
+            );
+        }
+
+        /// Owner decision: HF3 is strictly opt-in. A suite-0x0001 transfer
+        /// (V1 and V2, hybrid-shaped keys) has the SAME validity, the SAME
+        /// charge and the SAME post-state with the gate closed and open, and a
+        /// bad 0x0001 signature is refused the same way on both sides.
+        #[test]
+        fn hybrid_transfer_validity_and_fee_are_identical_across_hf3() {
+            let owner = owner_key(0x66);
+            let coin = opening(0xA6, 0, 1_000_000_000_000_000, &owner);
+            let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+            let price = g.next_base_fee();
+            let to = script_of(&owner_key(0x67));
+            let v1 = transfer_spending(std::slice::from_ref(&coin), &owner, to, 20_000, 0, price);
+            let mut bad = v1.clone();
+            if let PosTransaction::Transfer { inputs, .. } = &mut bad {
+                inputs[0].signature[0] ^= 1;
+            }
+            let v2 = transfer_v2_raw(std::slice::from_ref(&coin), &[&owner], &[0], to, 20_000, 0, price);
+            let run = |armed: bool| {
+                let _gate = crate::params::hf3_slh_rehearsal::arm(if armed { g.epoch } else { u64::MAX });
+                assert_eq!(crate::params::hf3_slh_suite_active(g.epoch), armed);
+                let v = SuiteToyVerifier::default();
+                let mut s1 = g.clone();
+                let c1 = s1.apply_transfer(&v1, price, &v).expect("0x0001 V1 transfer applies");
+                let mut s2 = g.clone();
+                let c2 = s2.apply_transfer_v2(&v2, price, &v).expect("0x0001 V2 transfer applies");
+                let rb = g.clone().apply_transfer(&bad, price, &v);
+                let class = fee_market::eutxo_class_for_keys(g.epoch, [owner.as_slice()]);
+                (c1, c2, rb, class, s1.eutxos.clone(), s2.eutxos.clone())
+            };
+            let closed = run(false);
+            let open = run(true);
+            assert_eq!(closed.0, open.0, "V1 charge moved across HF3");
+            assert_eq!(closed.1, open.1, "V2 charge moved across HF3");
+            assert_eq!(closed.2, Err(TransferReject::BadSignature));
+            assert_eq!(open.2, Err(TransferReject::BadSignature));
+            assert_eq!(closed.3, fee_market::TxClass::Eutxo { inputs: 1 });
+            assert_eq!(closed.3, open.3);
+            assert_eq!(closed.4, open.4, "V1 post-state moved across HF3");
+            assert_eq!(closed.5, open.5, "V2 post-state moved across HF3");
+        }
+
+        /// The V2 table path is wired the same way: one epoch-aware call per
+        /// table entry, at the committed epoch.
+        #[test]
+        fn v2_table_entries_use_the_epoch_verifier_from_the_gate() {
+            let slh = slh_owner(0x63);
+            let hyb = owner_key(0x64);
+            let c1 = opening(0xA3, 0, 1_000_000_000_000_000, &slh);
+            let c2 = opening(0xA4, 0, 1_000_000_000_000_000, &hyb);
+            let (_t, g, _chains) = setup_funded(4, &[c1.clone(), c2.clone()]);
+            let _armed = crate::params::hf3_slh_rehearsal::arm(g.epoch);
+            let price = g.next_base_fee();
+            let to = script_of(&owner_key(0x65));
+            let mut table = vec![
+                WitnessKey { pubkey: slh.clone(), signature: vec![0u8; 39] },
+                WitnessKey { pubkey: hyb.clone(), signature: vec![0u8; 32] },
+            ];
+            table.sort_by(|a, b| a.pubkey.cmp(&b.pubkey));
+            let idx = |k: &[u8]| table.iter().position(|w| w.pubkey == k).unwrap() as u32;
+            let inputs = vec![
+                TransferInputV2 { txid: c1.txid, vout: 0, key_index: idx(&slh) },
+                TransferInputV2 { txid: c2.txid, vout: 0, key_index: idx(&hyb) },
+            ];
+            let probe = PosTransaction::TransferV2 {
+                keys: table.clone(),
+                inputs: inputs.clone(),
+                outputs: vec![TransferOutput { value: 0, script_hash: to }],
+                tx_bytes: 0,
+                tip_millisat_per_gas: 0,
+            };
+            let tx_bytes = probe.canonical_bytes().len() as u64;
+            let class = fee_market::eutxo_class_for_keys(g.epoch, table.iter().map(|k| k.pubkey.as_slice()));
+            assert_eq!(class, fee_market::TxClass::EutxoSuites { hybrid: 1, slh_falcon: 1 });
+            let c = fee_market::charge(class, tx_bytes, price, 0);
+            let mut tx = PosTransaction::TransferV2 {
+                keys: table,
+                inputs,
+                outputs: vec![TransferOutput {
+                    value: (c1.value as u128 + c2.value as u128 - c.base_fee_sat - c.priority_fee_sat) as u64,
+                    script_hash: to,
+                }],
+                tx_bytes,
+                tip_millisat_per_gas: 0,
+            };
+            let root = tx.spend_signing_root();
+            if let PosTransaction::TransferV2 { keys, .. } = &mut tx {
+                for k in keys.iter_mut() {
+                    k.signature = if k.pubkey == slh { slh_toy_sign(&k.pubkey, &root) } else { toy_sign(&k.pubkey, &root) };
+                }
+            }
+            let v = SuiteToyVerifier::default();
+            assert!(g.clone().apply_transfer_v2(&tx, price, &v).is_ok());
+            assert_eq!(*v.epoch_calls.borrow(), vec![g.epoch, g.epoch]);
+            assert_eq!(v.plain_calls.get(), 0);
+        }
+    }
+
     // -- TX_BYTES_BOUND_ACTIVATION_EPOCH (audit H-R7-2) -----------------------
 
     /// TRIPWIRE. `TX_BYTES_BOUND_ACTIVATION_EPOCH` must stay `u64::MAX` until
@@ -13314,6 +13595,7 @@ mod tests {
                 // lattice EMERGENCY is deliberately not opened: it freezes
                 // lattice-key spends by design and is never part of a
                 // scheduled release (`hard_forks::NEVER_IN_A_SCHEDULED_RELEASE`).
+                Box::new(crate::params::hf3_slh_rehearsal::arm(0)),
                 Box::new(crate::params::pq_migration_rehearsal::open_slh()),
             ]
         }
@@ -17849,4 +18131,83 @@ mod finality_order_observability {
         assert_eq!(next.finality_engine, finality_before);
         assert_eq!(next.epoch, 5);
     }
+}
+
+/// HF3: what the optional suite 0x0003 costs a user and a block, computed
+/// from the real canonical encoding rather than estimated. Run with
+/// `--nocapture` to print the table quoted in
+/// `spikes/slhdsa-verify-cost/RESULTS.md`.
+#[cfg(test)]
+mod slhdsa_fee_model_tests {
+    use super::*;
+    use fee_market::*;
+
+    /// (label, suite, pk body, typical sig body, verify gas, native ns/verify)
+    const SUITES: [(&str, u16, usize, usize, u64, u64); 2] = [
+        ("0x0001 ML-DSA-65+Falcon-1024", 0x0001, 1952 + 1793, 3309 + 1276,
+         HYBRID_VERIFY_GAS, HYBRID_VERIFY_NATIVE_NS),
+        ("SLH-128s+Falcon-1024", SUITE_SLHDSA128S_FALCON1024, 32 + 1793, 7856 + 1276,
+         SLHDSA_FALCON_VERIFY_GAS, SLHDSA128S_VERIFY_NATIVE_NS + FALCON1024_VERIFY_NATIVE_NS),
+    ];
+
+    fn one_in_two_out(suite: u16, pk_body: usize, sig_body: usize) -> PosTransaction {
+        let mut pubkey = vec![0xB1, 0x0C];
+        pubkey.extend_from_slice(&suite.to_le_bytes());
+        pubkey.resize(4 + pk_body, 0x11);
+        let mut signature = vec![0xB1, 0x0C];
+        signature.extend_from_slice(&suite.to_le_bytes());
+        signature.resize(4 + sig_body, 0x22);
+        let out = TransferOutput { value: 1_000_000, script_hash: [3; 32] };
+        PosTransaction::TransferV2 {
+            keys: vec![WitnessKey { pubkey, signature }],
+            inputs: vec![TransferInputV2 { txid: [1; 32], vout: 0, key_index: 0 }],
+            outputs: vec![out.clone(), out],
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        }
+    }
+
+    #[test]
+    fn typical_transfer_and_worst_case_block_per_suite() {
+        let cap = max_block_tx_bytes(BLOCK_BYTES_V2_ACTIVATION_EPOCH_FOR_TEST);
+        eprintln!("suite | tx_bytes | gas old | gas per-suite | fee@floor sat (old->new) | tx/block | verify ms/block | block KiB");
+        let mut rows = Vec::new();
+        for (label, suite, pk, sig, vgas, ns) in SUITES {
+            let tx = one_in_two_out(suite, pk, sig);
+            let bytes = tx.canonical_bytes().len() as u64;
+            let PosTransaction::TransferV2 { keys, .. } = &tx else { unreachable!() };
+            // The armed class, built as the transition builds it.
+            let armed = match fee_market::verify_suite_of(&keys[0].pubkey) {
+                VerifySuite::Hybrid => TxClass::Eutxo { inputs: 1 },
+                VerifySuite::SlhDsaFalcon => TxClass::EutxoSuites { hybrid: 0, slh_falcon: 1 },
+            };
+            assert_eq!(verify_gas(armed), vgas);
+            let old = charge(TxClass::Eutxo { inputs: 1 }, bytes, MIN_BASE_FEE_MILLISAT_PER_GAS, 0);
+            let new = charge(armed, bytes, MIN_BASE_FEE_MILLISAT_PER_GAS, 0);
+            let n = (cap / bytes).min(BLOCK_GAS_LIMIT / new.gas);
+            let ms = n * ns / 1_000_000;
+            eprintln!(
+                "{label} | {bytes} | {} | {} | {} -> {} | {n} | {ms} | {}",
+                old.gas, new.gas, old.base_fee_sat, new.base_fee_sat, n * bytes / 1024
+            );
+            rows.push((bytes, new.gas, n, ms));
+        }
+        let (hyb_bytes, hyb_gas, hyb_n, _) = rows[0];
+        // Today's transfer is unchanged by the arm.
+        assert_eq!(hyb_gas, intrinsic_gas(TxClass::Eutxo { inputs: 1 }, hyb_bytes));
+        for &(bytes, gas, n, ms) in &rows[1..] {
+            // More bytes and ~5-7x the gas of a hybrid transfer.
+            assert!(bytes > hyb_bytes && bytes < hyb_bytes * 2);
+            assert!(gas > hyb_gas * 5 && gas < hyb_gas * 7);
+            // Fewer SLH transfers fit; with verify priced, the gas axis sits
+            // within a few percent of the byte axis, so a block of SLH
+            // spends meters its CPU instead of riding free under the byte cap.
+            assert!(n < hyb_n && n * gas <= BLOCK_GAS_LIMIT);
+            assert!(n * gas > BLOCK_GAS_LIMIT * 3 / 4);
+            // A block of them costs well under one second of one core.
+            assert!(ms < 200, "worst-case verify per block {ms} ms");
+        }
+    }
+
+    const BLOCK_BYTES_V2_ACTIVATION_EPOCH_FOR_TEST: u64 = crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
 }
