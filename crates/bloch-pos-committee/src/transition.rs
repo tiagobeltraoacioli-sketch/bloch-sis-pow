@@ -13512,6 +13512,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hf2_slashing_v2_gate_ships_inert() {
+        assert_eq!(crate::params::HF2_SLASHING_V2_EPOCH, u64::MAX);
+        assert_eq!(
+            crate::params::NATIVE_SLASHING_ACTIVATION_EPOCH,
+            crate::params::HF2_SLASHING_V2_EPOCH,
+            "P5a admission rides the HF2 switch",
+        );
+        assert_eq!(
+            crate::params::PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH,
+            crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH,
+            "HF2 never moves the pre-activation offence refusal",
+        );
+        for epoch in [0, 2_884, 100_000, u64::MAX - 1] {
+            assert!(!crate::params::native_slashing_active(epoch));
+        }
+    }
+
     /// ST-04 candidate: self-slashing may still eject at E+1, because an
     /// exit queue must not become immunity from proven equivocation, but it
     /// must not release funds earlier than a voluntary exit requested in the

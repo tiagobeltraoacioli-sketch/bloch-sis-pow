@@ -1561,7 +1561,16 @@ pub const SLASHING_ECONOMICS_V2_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// evidence against `v` to exhaust `v`'s allowance and delay genuine
 /// evidence against `v` (and `v`'s own exit/commission/RANDAO messages).
 /// See `CommittedState::precheck_slashing_evidence`.
-pub const NATIVE_SLASHING_ACTIVATION_EPOCH: u64 = u64::MAX;
+pub const NATIVE_SLASHING_ACTIVATION_EPOCH: u64 = HF2_SLASHING_V2_EPOCH;
+
+/// HF2 (slashing v2) coordinated activation epoch. `u64::MAX` = INERT.
+///
+/// The single release-level switch for the HF2 slashing bundle; today it
+/// arms only the P5a evidence-admission policy above
+/// (`NATIVE_SLASHING_ACTIVATION_EPOCH` is an alias kept for the P5a code and
+/// tests). It is independent of `SLASHING_EVIDENCE_ACTIVATION_EPOCH` and of
+/// `PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH`, which it never moves.
+pub const HF2_SLASHING_V2_EPOCH: u64 = u64::MAX;
 
 /// Is the P5a evidence-admission policy armed at `wall_epoch`?
 pub const fn native_slashing_active(wall_epoch: u64) -> bool {
