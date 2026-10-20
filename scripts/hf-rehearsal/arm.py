@@ -110,8 +110,12 @@ def main() -> int:
     if not args.no_hf:
         epochs = {"HF1": args.hf1, "HF2": args.hf2, "HF3": args.hf3}
         conf: dict[str, int] = {}
+        literal: dict[str, int] = {}
         for line in GATES_CONF.read_text().splitlines():
             line = line.split("#", 1)[0].split()
+            if len(line) == 2 and line[1].startswith("="):
+                literal[line[0]] = int(line[1][1:])
+                continue
             if len(line) == 2:
                 m = re.fullmatch(r"(HF[123])(?:\+(\d+))?", line[1])
                 if not m:
@@ -119,7 +123,11 @@ def main() -> int:
                 conf[line[0]] = epochs[m.group(1)] + int(m.group(2) or 0)
         report["gates_conf"] = conf
 
+        report["literal_overrides"] = literal
+
         def hf(name: str, value: str):
+            if name in literal:
+                return literal[name]
             if value != "u64::MAX":
                 if name in conf:
                     report.setdefault("already_armed", []).append({"name": name, "value": value})
