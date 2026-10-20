@@ -140,6 +140,33 @@ pub trait SignatureVerifier {
     /// spending cheaper to forge than attesting.
     fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool;
 
+    /// HF3: verify an eUTXO **spend** witness at the block's `epoch`.
+    ///
+    /// The transition calls this — and only for transfer witnesses (V1
+    /// inputs, V2 key-table entries) — once `params::hf3_slh_suite_active`
+    /// holds; below that gate it calls [`Self::verify_with_key`] directly, so
+    /// no implementation can change a pre-HF3 verdict. The production
+    /// verifier maps it to `bloch_crypto::crypto::verify_at_epoch`, which
+    /// additionally accepts suite 0x0003 (SLH-DSA-SHAKE-128s ‖ Falcon-1024,
+    /// both halves). Validator keys (attestations, proposals, deposits,
+    /// funded flows) stay on `verify_with_key`: HF3 opens the suite for
+    /// spending only.
+    ///
+    /// The default is fail-closed for the new suite: it ignores `epoch` and
+    /// answers exactly as `verify_with_key`, so a verifier that has not opted
+    /// in never accepts anything new. Wrappers that budget or cache
+    /// `verify_with_key` must forward this too, or they silently disable HF3.
+    fn verify_spend_at_epoch(
+        &self,
+        pubkey: &[u8],
+        signing_root: &[u8; 32],
+        signature: &[u8],
+        epoch: u64,
+    ) -> bool {
+        let _ = epoch;
+        self.verify_with_key(pubkey, signing_root, signature)
+    }
+
     /// Deterministic native L2 proof check, using only parent-committed policy.
     /// Older verifier implementations cannot silently admit the new transaction.
     fn verify_l2_settlement(&self, _policy: &[u8; 32], _program: &[u8; 32],

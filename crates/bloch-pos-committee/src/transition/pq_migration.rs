@@ -38,8 +38,16 @@ const SUITE_MAGIC: [u8; 2] = [0xb1, 0x0c];
 const LEGACY_HYBRID_PK_BYTES: usize = staking::HYBRID_PK_BYTES;
 /// Envelope ‖ SLH-DSA-128s pk (32) ‖ Falcon-1024 pk (1793).
 pub const SLH_SUITE_PUBKEY_BYTES: usize = 4 + 32 + 1_793;
-/// Envelope ‖ SLH-DSA-128s sig (7856) ‖ Falcon-1024 sig (≤ 1280).
-pub const SLH_SUITE_SIGNATURE_MAX: usize = 4 + 7_856 + 1_280;
+/// Envelope ‖ SLH-DSA-128s sig (7856) ‖ Falcon-1024 compact sig (≤ 1462,
+/// PQClean `CRYPTO_BYTES`, not the 1280 B padded size). Equals
+/// `params::SLHDSA_FALCON_MAX_ENVELOPED_SIG_LEN` on codex/hf3-slhdsa-20261020;
+/// the 1280 draft bound refused valid long Falcon signatures.
+pub const SLH_SUITE_SIGNATURE_MAX: usize = 4 + 7_856 + 1_462;
+/// Verify gas of one suite-0x0003 signature (SLH-DSA-SHAKE-128s ‖
+/// Falcon-1024). MUST equal `fee_market::SLHDSA_FALCON_VERIFY_GAS` on the
+/// SLH-DSA suite line (codex/hf3-slhdsa-20261020, `41c2f765`); when the two
+/// lines merge, replace this literal with that constant.
+pub const SLH_SUITE_VERIFY_GAS: u64 = 1_067_610;
 /// Largest key/signature any accepted suite produces.
 const PUBKEY_MAX: usize = funded::ADMISSION_PQ_KEY_BYTES;
 const SIGNATURE_MAX: usize = SLH_SUITE_SIGNATURE_MAX;
@@ -462,10 +470,22 @@ impl CommittedState {
             self.matured_commitment(&commitment)?;
         }
         let root = tx.signing_root();
-        if !verifier.verify_with_key(&tx.authorizing_pubkey, &root, &tx.authorizing_signature) {
+        // Both keys are credential (spend-authority) keys, never consensus
+        // keys, and the new one is always suite 0x0003. They therefore go
+        // through the spend verifier, which accepts 0x0003 once the SLH
+        // suite gate (`HF3_SLH_SUITE_EPOCH`, codex/hf3-slhdsa-20261020) is
+        // open; `verify_with_key` refuses 0x0003 at every epoch, which would
+        // make every rotation fail its new-key check. For a lattice key the
+        // spend verifier answers exactly as `verify_with_key`.
+        if !verifier.verify_spend_at_epoch(
+            &tx.authorizing_pubkey,
+            &root,
+            &tx.authorizing_signature,
+            self.epoch,
+        ) {
             return Err(R::Signature);
         }
-        if !verifier.verify_with_key(&tx.new_pubkey, &root, &tx.new_key_signature) {
+        if !verifier.verify_spend_at_epoch(&tx.new_pubkey, &root, &tx.new_key_signature, self.epoch) {
             return Err(R::NewKeySignature);
         }
 
@@ -474,7 +494,24 @@ impl CommittedState {
         }
         let record = self.validators.get_mut(&tx.validator).ok_or(R::Validator)?;
         record.withdrawal_credentials = new_credential.to_vec();
-        Ok(Self::staking_tx_charge(self.epoch, 2, tx.canonical_bytes().len()))
+        Ok(Self::rotation_charge(self.epoch, tx))
+    }
+
+    /// Capacity charge of a rotation, priced per signature suite: a lattice
+    /// signature costs one hybrid verification, a suite-0x0003 signature
+    /// [`SLH_SUITE_VERIFY_GAS`]. The new key is always 0x0003, so a rotation
+    /// is never cheaper than one SLH verification plus one of the
+    /// authorising key's suite.
+    pub(super) fn rotation_charge(epoch: u64, tx: &WithdrawalCredentialRotation) -> fee_market::TxCharge {
+        let slh = [&tx.authorizing_pubkey, &tx.new_pubkey]
+            .into_iter()
+            .filter(|k| is_hash_based_key(k))
+            .count() as u32;
+        let mut charge = Self::staking_tx_charge(epoch, 2 - slh, tx.canonical_bytes().len());
+        if charge.gas != 0 {
+            charge.gas = charge.gas.saturating_add(SLH_SUITE_VERIFY_GAS.saturating_mul(slh as u64));
+        }
+        charge
     }
 
     pub(super) fn apply_rescue_commit(

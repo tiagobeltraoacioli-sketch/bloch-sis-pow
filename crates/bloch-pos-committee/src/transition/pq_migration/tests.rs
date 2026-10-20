@@ -545,3 +545,89 @@ fn pq_wire_bytes_follow_the_hf3_allocation() {
     assert_eq!(bytes[0], RESCUE_COMMIT_TAG);
     assert_eq!(PosTransaction::from_canonical_bytes(&bytes), Ok(tx));
 }
+
+/// Models the production split: `verify_with_key` refuses suite 0x0003 at
+/// every epoch (validator/consensus keys stay hybrid-only); only the spend
+/// verifier accepts it, and only from `slh_from`.
+struct SuiteSplitVerifier {
+    slh_from: u64,
+}
+
+impl SignatureVerifier for SuiteSplitVerifier {
+    fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+        !is_hash_based_key(pubkey) && ToyVerifier.verify_with_key(pubkey, root, sig)
+    }
+    fn verify_spend_at_epoch(&self, pubkey: &[u8], root: &[u8; 32], sig: &[u8], epoch: u64) -> bool {
+        if is_hash_based_key(pubkey) {
+            epoch >= self.slh_from && ToyVerifier.verify_with_key(pubkey, root, sig)
+        } else {
+            self.verify_with_key(pubkey, root, sig)
+        }
+    }
+}
+
+/// Ecosystem finding 2026-10-20: the new-key signature is always suite
+/// 0x0003, so checking it with `verify_with_key` failed every rotation. It
+/// now goes through the spend verifier and passes once the SLH suite is open.
+#[test]
+fn rotation_new_key_is_checked_by_the_spend_verifier() {
+    let _gate = pq_migration_rehearsal::open_slh();
+    let (st, owner) = rotation_fixture();
+    let wire = PosTransaction::WithdrawalCredentialRotation(rotation(&st, &owner, &slh_key(0x31)));
+
+    // SLH suite not yet open at this epoch: refused on the new key.
+    let mut closed = st.clone();
+    let closed_verifier = SuiteSplitVerifier { slh_from: st.epoch + 1 };
+    assert_eq!(
+        closed.apply_transaction(&wire, 0, 0, &closed_verifier),
+        Err(TxReject::PqMigration(PqMigrationReject::NewKeySignature))
+    );
+    assert_eq!(closed, st);
+
+    // Open: accepted, and a further 0x0003 -> 0x0003 rotation too.
+    let mut open = st.clone();
+    let open_verifier = SuiteSplitVerifier { slh_from: 0 };
+    open.apply_transaction(&wire, 0, 0, &open_verifier).unwrap();
+    assert_eq!(open.validators[&0].withdrawal_credentials, native_script(&slh_key(0x31)).to_vec());
+    let again = rotation(&open, &slh_key(0x31), &slh_key(0x32));
+    open.apply_transaction(&PosTransaction::WithdrawalCredentialRotation(again), 0, 0, &open_verifier)
+        .unwrap();
+}
+
+/// Ecosystem finding 2026-10-20: a rotation was priced as two hybrid
+/// verifications although at least one signature is SLH. Each signature is
+/// now priced by its key's suite.
+#[test]
+fn rotation_prices_each_signature_by_suite() {
+    use crate::fee_market::{intrinsic_gas, TxClass, HYBRID_VERIFY_GAS};
+    assert_eq!(SLH_SUITE_VERIFY_GAS, 1_067_610);
+    assert!(SLH_SUITE_VERIFY_GAS > 14 * HYBRID_VERIFY_GAS);
+    let (st, owner) = rotation_fixture();
+    // Any epoch past the withdrawal gate meters staking messages.
+    let epoch = crate::params::WITHDRAWAL_ACTIVATION_EPOCH;
+    let lattice_to_slh = rotation(&st, &owner, &slh_key(0x31));
+    let len = lattice_to_slh.canonical_bytes().len() as u64;
+    let charge = CommittedState::rotation_charge(epoch, &lattice_to_slh);
+    assert_eq!(charge.gas, intrinsic_gas(TxClass::Eutxo { inputs: 1 }, len) + SLH_SUITE_VERIFY_GAS);
+    let slh_to_slh = rotation(&st, &slh_key(0x31), &slh_key(0x32));
+    let len = slh_to_slh.canonical_bytes().len() as u64;
+    let charge = CommittedState::rotation_charge(epoch, &slh_to_slh);
+    assert_eq!(charge.gas, intrinsic_gas(TxClass::Eutxo { inputs: 0 }, len) + 2 * SLH_SUITE_VERIFY_GAS);
+    assert_eq!((charge.base_fee_sat, charge.priority_fee_sat), (0, 0));
+}
+
+/// A suite-0x0003 signature with a maximum-length compact Falcon half
+/// (1462 B) fits the rotation's wire bound.
+#[test]
+fn rotation_accepts_a_maximum_length_slh_signature() {
+    assert_eq!(SLH_SUITE_SIGNATURE_MAX, 4 + 7_856 + 1_462);
+    let (st, owner) = rotation_fixture();
+    let mut tx = rotation(&st, &owner, &slh_key(0x31));
+    tx.new_key_signature = vec![0x5A; SLH_SUITE_SIGNATURE_MAX];
+    let wire = PosTransaction::WithdrawalCredentialRotation(tx);
+    assert_eq!(PosTransaction::from_canonical_bytes(&wire.canonical_bytes()), Ok(wire.clone()));
+    let PosTransaction::WithdrawalCredentialRotation(mut tx) = wire else { unreachable!() };
+    tx.new_key_signature.push(0);
+    let over = PosTransaction::WithdrawalCredentialRotation(tx);
+    assert!(PosTransaction::from_canonical_bytes(&over.canonical_bytes()).is_err());
+}

@@ -2494,7 +2494,7 @@ pub(crate) mod funded_admission_rehearsal {
 /// hash-based `SLH-DSA-128s ‖ Falcon-1024` suite (id `0x0003`): below the
 /// gate the tag is refused before any field is read, which is the verdict an
 /// old binary reaches with `UnknownTag(0x18)`. It is a distinct name from the
-/// suite prototype's `NATIVE_SLHDSA_SUITE_ACTIVATION_EPOCH`
+/// suite line's `HF3_SLH_SUITE_EPOCH`
 /// (`codex/hf3-slhdsa-20261020`) so the two lines merge without a duplicate
 /// definition; the HF3 schedule must arm this gate at or after that one,
 /// because a rotation into suite `0x0003` is only useful once suite `0x0003`

@@ -8,10 +8,15 @@ leaf, no local-cache section), and the spend-freeze check is never evaluated,
 so historical replay is byte-identical. Not audited.
 
 Companion work: the suite itself (`SUITE_SLHDSA128S_FALCON1024 = 0x0003`,
-sign/verify, the `NATIVE_SLHDSA_SUITE_ACTIVATION_EPOCH` constant) is on
-`codex/bloch-p9a-slhdsa-20261019`. This branch defines the same constant name
-in `bloch-pos-committee::params` and mirrors the suite id. When the two merge
-there must be **one** definition, and the suite id must match.
+sign/verify, the `HF3_SLH_SUITE_EPOCH` gate, `SLHDSA_FALCON_VERIFY_GAS`,
+`SignatureVerifier::verify_spend_at_epoch`) is on
+`codex/hf3-slhdsa-20261020`. This line (`codex/hf3-tags-20261020`) has its
+own gate `HF3_PQ_MIGRATION_EPOCH`, which must be armed at or after
+`HF3_SLH_SUITE_EPOCH`; it mirrors the suite id, the SLH verify gas
+(`SLH_SUITE_VERIFY_GAS = 1,067,610`) and the maximum enveloped signature
+length (`4 + 7856 + 1462`), and declares `verify_spend_at_epoch` with the
+identical default body. At merge: keep one trait method, replace the gas
+literal with `SLHDSA_FALCON_VERIFY_GAS`, and keep the suite id equal.
 
 Code:
 `crates/bloch-pos-committee/src/transition/pq_migration.rs` (rules),
@@ -69,8 +74,8 @@ existing validators.
 
 ## 3. Path A: orderly migration (before any break)
 
-This path only needs `HF3_PQ_MIGRATION_EPOCH` (armed with or after p9a's
-`NATIVE_SLHDSA_SUITE_ACTIVATION_EPOCH`) and the
+This path only needs `HF3_PQ_MIGRATION_EPOCH` (armed with or after
+`HF3_SLH_SUITE_EPOCH`) and the
 node's CR-03 mempool policy to admit suite `0x0003`. Today
 `engine.rs::admissible` refuses any non-hybrid transfer key, and p9a/p9b must
 relax that for `0x0003` only.
@@ -177,7 +182,14 @@ that cannot move yet (vesting, multisig in flight).
 `WithdrawalCredentialRotation { network_domain, epoch, validator,
 authorizing_pubkey, new_pubkey, authorizing_signature, new_key_signature }`,
 gated by `HF3_PQ_MIGRATION_EPOCH` (hard fork 3; armed at or after the
-suite's `NATIVE_SLHDSA_SUITE_ACTIVATION_EPOCH`).
+suite's `HF3_SLH_SUITE_EPOCH`).
+
+Both signatures are checked with `SignatureVerifier::verify_spend_at_epoch`
+(the credential keys are spend-authority keys, not consensus keys): the new
+key is always suite `0x0003`, which `verify_with_key` refuses at every epoch.
+Gas: one hybrid verification (72,748) per lattice signature plus
+`SLH_SUITE_VERIFY_GAS` (1,067,610) per `0x0003` signature, on top of the
+flat and per-byte terms; no money fee (no input to draw it from).
 
 The rules:
 - The network matches and `epoch` equals the inclusion epoch (no replay at an

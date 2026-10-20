@@ -65,6 +65,30 @@ impl<V: SignatureVerifier> SignatureVerifier for LifecycleAdmissionVerifier<'_, 
         }
         self.inner.verify_with_key(public_key, message, signature)
     }
+
+    /// HF3: the credential rotation (0x18) checks both of its keys through
+    /// the spend verifier, which is the only path that accepts suite 0x0003.
+    /// Forwarded under the same allowance; without this override the trait
+    /// default would route it to `verify_with_key` and the lifecycle door
+    /// would refuse every rotation into an SLH key.
+    fn verify_spend_at_epoch(
+        &self,
+        public_key: &[u8],
+        message: &[u8; 32],
+        signature: &[u8],
+        epoch: u64,
+    ) -> bool {
+        if self.inner.is_known_failure(public_key, message, signature) {
+            return false;
+        }
+        if let Some(source) = self.source {
+            if !self.mempool.borrow_mut().reserve_lifecycle_verification(source, self.wall_slot) {
+                self.limited.set(true);
+                return false;
+            }
+        }
+        self.inner.verify_spend_at_epoch(public_key, message, signature, epoch)
+    }
 }
 
 #[cfg(test)]
