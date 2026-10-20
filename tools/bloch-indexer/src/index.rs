@@ -354,6 +354,10 @@ impl Index {
                         | PosTransaction::FundedDelegate(_)
                         | PosTransaction::FundedDelegationWithdraw(_)
                         | PosTransaction::Withdraw { .. } => 1,
+                        // Native L2 bridge: change at vout 0 (deposit, DA);
+                        // release at vout 0 and change at vout 1 (claim).
+                        PosTransaction::L2Deposit(_) | PosTransaction::L2DataAvailability(_) => 1,
+                        PosTransaction::L2WithdrawClaim(_) => 2,
                         _ => 0,
                     };
                     let outputs = (0..n).filter_map(|v| state.utxo(&id, v as u32)
@@ -766,8 +770,33 @@ fn transfer_parts(tx: &PosTransaction) -> (Vec<OutPoint>, Vec<(u64, ScriptHash)>
             d.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
             vec![(d.change.value, d.change.script_hash)], d.tx_bytes, d.tip_millisat_per_gas,
         ),
+        // Native L2 bridge transactions spend funding UTXOs and create
+        // eUTXOs like a transfer does. The escrowed deposit amount leaves the
+        // spendable set (it is L2 inbox state, not an output). Replay
+        // receipts replace these declared outputs with the outputs consensus
+        // actually created.
+        PosTransaction::L2Deposit(d) => (
+            d.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
+            nonzero_change(d.change.value, d.change.script_hash), d.tx_bytes, d.tip_millisat_per_gas,
+        ),
+        PosTransaction::L2DataAvailability(d) => (
+            d.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
+            nonzero_change(d.change.value, d.change.script_hash), d.tx_bytes, d.tip_millisat_per_gas,
+        ),
+        PosTransaction::L2WithdrawClaim(c) => {
+            let mut outs = vec![(c.sats, c.l1_recipient)];
+            outs.extend(nonzero_change(c.change.value, c.change.script_hash));
+            (
+                c.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
+                outs, c.tx_bytes, c.tip_millisat_per_gas,
+            )
+        }
         _ => (Vec::new(), Vec::new(), 0, 0),
     }
+}
+
+fn nonzero_change(value: u64, script_hash: ScriptHash) -> Vec<(u64, ScriptHash)> {
+    if value > 0 { vec![(value, script_hash)] } else { Vec::new() }
 }
 
 struct ArchiveVerifier;

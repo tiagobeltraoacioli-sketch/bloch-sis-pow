@@ -137,8 +137,8 @@ pub struct HistoryEntry {
 pub enum TxKind {
     L2Settlement,
     L2SettlementAsync,
-    /// Native L2 bridge (0x14-0x16). Recorded by kind only: the index does
-    /// not yet follow their escrow inputs/outputs (needed before activation).
+    /// Native L2 bridge (0x14-0x16). Their funding inputs and change/release
+    /// outputs are indexed like a transfer's; escrowed amounts are L2 state.
     L2Deposit,
     L2DataAvailability,
     L2WithdrawClaim,
