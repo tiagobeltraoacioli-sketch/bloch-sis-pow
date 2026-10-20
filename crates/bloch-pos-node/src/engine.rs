@@ -1048,6 +1048,7 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
         PosTransaction::L2Deposit(tx) => tx.tip_millisat_per_gas,
         PosTransaction::L2DataAvailability(tx) => tx.tip_millisat_per_gas,
         PosTransaction::L2WithdrawClaim(tx) => tx.tip_millisat_per_gas,
+        PosTransaction::RescueReveal(tx) => tx.tip_millisat_per_gas,
         _ => 0,
     }
 }
@@ -1088,6 +1089,8 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
         PosTransaction::L2Deposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::L2DataAvailability(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::L2WithdrawClaim(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::RescueReveal(tx) => Some(Sha3_256::digest(&tx.pubkey).into()),
+        PosTransaction::WithdrawalCredentialRotation(tx) => Some(validator_lifecycle_source(tx.validator)),
         _ => None,
     }
 }
@@ -3879,6 +3882,7 @@ impl Engine {
             PosTransaction::L2Deposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::L2DataAvailability(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::L2WithdrawClaim(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::RescueReveal(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             _ => None,
         }
     }
@@ -4446,6 +4450,7 @@ impl Engine {
                 PosTransaction::L2Deposit(tx) => tx.tx_bytes,
                 PosTransaction::L2DataAvailability(tx) => tx.tx_bytes,
                 PosTransaction::L2WithdrawClaim(tx) => tx.tx_bytes,
+                PosTransaction::RescueReveal(tx) => tx.tx_bytes,
                 _ => 0,
             };
             let n = (encoded.len() as u64).max(declared);
@@ -7324,6 +7329,27 @@ fn admissible_with_network_verifier(
             withdrawal
                 .validate_shape()
                 .map_err(|_| "invalid funded delegation withdrawal shape")
+        }
+        // Post-quantum migration (0x18-0x1A): refused at the door until their
+        // flag days; state rules (credential ownership, commitment maturity,
+        // sweep-all) run at the lifecycle door and again in consensus.
+        PosTransaction::WithdrawalCredentialRotation(_) => {
+            if !bloch_pos_committee::params::epoch_gate_active(
+                wall_epoch,
+                bloch_pos_committee::params::HF3_PQ_MIGRATION_EPOCH,
+            ) {
+                return Err("withdrawal credential rotation (tag 0x18) is not active");
+            }
+            Ok(())
+        }
+        PosTransaction::RescueCommit(_) | PosTransaction::RescueReveal(_) => {
+            if !bloch_pos_committee::params::epoch_gate_active(
+                wall_epoch,
+                bloch_pos_committee::params::LATTICE_EMERGENCY_ACTIVATION_EPOCH,
+            ) {
+                return Err("post-quantum rescue (tags 0x19/0x1A) is not active");
+            }
+            Ok(())
         }
         PosTransaction::ValidatorCommissionUpdate(update) => {
             if !bloch_pos_committee::params::epoch_gate_active(

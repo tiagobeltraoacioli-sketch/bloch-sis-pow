@@ -734,6 +734,11 @@ fn kind_of(tx: &PosTransaction) -> TxKind {
         PosTransaction::ExitV2 { .. } => TxKind::ExitV2,
         PosTransaction::RandaoRecommit { .. } => TxKind::RandaoRecommit,
         PosTransaction::SlashingEvidence(_) => TxKind::SlashingEvidence,
+        // Post-quantum migration (0x18-0x1A), gated inert. Recorded by tag
+        // only; the index must learn the reveal's sweep before activation.
+        PosTransaction::WithdrawalCredentialRotation(_) => TxKind::Unknown(0x18),
+        PosTransaction::RescueCommit(_) => TxKind::Unknown(0x19),
+        PosTransaction::RescueReveal(_) => TxKind::Unknown(0x1A),
     }
 }
 

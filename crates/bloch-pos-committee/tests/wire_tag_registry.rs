@@ -357,6 +357,20 @@ const TX_TAGS: &[(u8, Status)] = &[
     // M5 withdrawal claim (`devnet-l2-user-txs`); 0x16 checked free on every
     // local ref (327 refs) and on the mainnet tree (MAINNET_TX_TAGS) on 2026-10-10.
     (0x16, Status::Released { name: "L2WithdrawClaim", rivals: NO_RIVALS }),
+    // 0x17 is RESERVED for `KesRegister` (KES mainnet port,
+    // codex/hf3-kes-20261020, same byte as devnet4) and 0x1B for `KesRotate`
+    // (HF3 allocation, src/wire_alloc.rs). This tree has no KES variant, so
+    // both bytes are absent here and decode as UnknownTag; the KES merge adds
+    // their rows.
+    //
+    // Post-quantum suite migration (docs/PQ-SUITE-MIGRATION.md), consensus
+    // gated INERT. Originally drafted at 0x17-0x19, which collided with
+    // KesRegister; moved to 0x18-0x1A by the 2026-10-19 tag allocation and
+    // kept there by the HF3 allocation of 2026-10-20 (src/wire_alloc.rs,
+    // docs/WIRE-NAMESPACE-REGISTRY.md). Gate: HF3_PQ_MIGRATION_EPOCH.
+    (0x18, Status::Released { name: "WithdrawalCredentialRotation", rivals: NO_RIVALS }),
+    (0x19, Status::Released { name: "RescueCommit", rivals: NO_RIVALS }),
+    (0x1A, Status::Released { name: "RescueReveal", rivals: NO_RIVALS }),
 ];
 
 /// Three lineages that all intend the SAME flag day disagree on all three
@@ -559,6 +573,9 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         PosTransaction::L2Deposit(_) => 0x14,
         PosTransaction::L2DataAvailability(_) => 0x15,
         PosTransaction::L2WithdrawClaim(_) => 0x16,
+        PosTransaction::WithdrawalCredentialRotation(_) => 0x18,
+        PosTransaction::RescueCommit(_) => 0x19,
+        PosTransaction::RescueReveal(_) => 0x1A,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }
@@ -1191,17 +1208,18 @@ fn l2_transaction_tags_do_not_overlap_the_mainnet_tag_set() {
 // ===========================================================================
 
 /// The HF3 table reserves `0x17`–`0x1B` (KesRegister, the PQ trio,
-/// KesRotate). None is in this file's frozen table, and none may decode on a
-/// tree that has not merged its owning line. Each line's merge moves its
-/// bytes from this list into `TX_TAGS`.
-const HF3_RESERVED_NOT_IN_TREE: &[u8] = &[0x17, 0x18, 0x19, 0x1A, 0x1B];
+/// KesRotate). Bytes whose line has not merged into this tree are listed
+/// here: absent from the frozen table, and refused by the decoder. Each
+/// line's merge moves its bytes from this list into `TX_TAGS`. The PQ trio
+/// (`0x18`–`0x1A`) landed on this branch.
+const HF3_RESERVED_NOT_IN_TREE: &[u8] = &[0x17, 0x1B];
 
 #[test]
 fn hf3_reserved_tx_tags_are_unknown_until_their_line_lands() {
     use bloch_pos_committee::wire_alloc::{tx, TX_TABLE};
     assert_eq!(
         HF3_RESERVED_NOT_IN_TREE.iter().chain([&tx::NEXT_FREE]).count(),
-        6,
+        3,
         "update this list when an HF3 line lands"
     );
     for tag in HF3_RESERVED_NOT_IN_TREE {
@@ -1221,4 +1239,33 @@ fn hf3_reserved_tx_tags_are_unknown_until_their_line_lands() {
         PosTransaction::from_canonical_bytes(&[tx::NEXT_FREE]),
         Err(TxDecodeError::UnknownTag(tx::NEXT_FREE))
     );
+}
+
+/// The HF3 allocation (src/wire_alloc.rs): `0x17` is reserved for the KES
+/// port's `KesRegister` and `0x1B` for `KesRotate`, so the post-quantum
+/// migration sits at `0x18`-`0x1A`. On a tree without KES, `0x17` must stay
+/// unknown — never silently decoded as a PQ transaction.
+#[test]
+fn pq_migration_tags_follow_the_hf3_allocation() {
+    use bloch_pos_committee::transition::pq_migration as pq;
+    use bloch_pos_committee::wire_alloc::tx;
+    assert_eq!(pq::WITHDRAWAL_CREDENTIAL_ROTATION_TAG, 0x18);
+    assert_eq!(pq::RESCUE_COMMIT_TAG, 0x19);
+    assert_eq!(pq::RESCUE_REVEAL_TAG, 0x1A);
+    assert_eq!(pq::WITHDRAWAL_CREDENTIAL_ROTATION_TAG, tx::WITHDRAWAL_CREDENTIAL_ROTATION);
+    assert_eq!(pq::RESCUE_COMMIT_TAG, tx::RESCUE_COMMIT);
+    assert_eq!(pq::RESCUE_REVEAL_TAG, tx::RESCUE_REVEAL);
+    assert!(TX_TAGS.iter().all(|(tag, _)| *tag != 0x17), "0x17 is reserved for KesRegister");
+    assert_eq!(
+        PosTransaction::from_canonical_bytes(&[0x17]),
+        Err(TxDecodeError::UnknownTag(0x17)),
+        "0x17 must not decode on a tree without the KES port"
+    );
+    for tag in [0x18u8, 0x19, 0x1A] {
+        assert_ne!(
+            PosTransaction::from_canonical_bytes(&[tag]),
+            Err(TxDecodeError::UnknownTag(tag)),
+            "{tag:#04x} dispatches to the PQ decoders"
+        );
+    }
 }

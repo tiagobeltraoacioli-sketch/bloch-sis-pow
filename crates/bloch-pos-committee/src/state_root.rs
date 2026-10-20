@@ -296,6 +296,26 @@ pub(crate) fn insert_l2_settlement(tree: &mut Smt, bytes: &[u8]) {
     tree.insert(derive_key(TAG_L2_SETTLEMENT, &[]), hash_value(bytes));
 }
 
+/// Post-quantum rescue commitments (`transition::pq_migration`), one leaf per
+/// commitment, value = inclusion epoch (u64 LE). The map is empty — zero
+/// leaves — until `LATTICE_EMERGENCY_ACTIVATION_EPOCH` binds, so every
+/// historical root is unchanged.
+///
+/// `0x24`, not `0x22`: the HF3 allocation ([`crate::wire_alloc`],
+/// `docs/WIRE-NAMESPACE-REGISTRY.md`) gives `0x22` to `TAG_KES_ROOT` (the KES
+/// mainnet port) and `0x23` to `TAG_LC_ROSTER` (light client). Neither is in
+/// this tree; both bytes stay reserved here.
+const TAG_PQ_RESCUE_COMMIT: u8 = crate::wire_alloc::state::PQ_RESCUE_COMMIT;
+
+pub(crate) fn insert_pq_rescue_commits(
+    tree: &mut Smt,
+    commits: &std::collections::BTreeMap<[u8; 32], u64>,
+) {
+    for (commitment, epoch) in commits {
+        tree.insert(derive_key(TAG_PQ_RESCUE_COMMIT, commitment), hash_value(&epoch.to_le_bytes()));
+    }
+}
+
 /// Append-only registry of every component namespace in the live state SMT.
 ///
 /// This is the machine-readable authority for component count, names and tag
@@ -303,7 +323,7 @@ pub(crate) fn insert_l2_settlement(tree: &mut Smt, bytes: &[u8]) {
 /// compatibility DTO, not an exhaustive model of the live tree. New
 /// components must be appended here as well as in the tree fold; the
 /// uniqueness and spec-reconciliation tests consume this registry directly.
-pub const STATE_COMPONENT_TAGS: [(&str, u8); 33] = [
+pub const STATE_COMPONENT_TAGS: [(&str, u8); 34] = [
     ("TAG_EUTXO", TAG_EUTXO),
     ("TAG_VALIDATOR", TAG_VALIDATOR),
     ("TAG_PARTICIPATION_CURRENT", TAG_PARTICIPATION_CURRENT),
@@ -337,6 +357,7 @@ pub const STATE_COMPONENT_TAGS: [(&str, u8); 33] = [
     ("TAG_FUNDED_DELEGATION_OWNER", TAG_FUNDED_DELEGATION_OWNER),
     ("TAG_FUNDED_DELEGATION_LIFECYCLE", TAG_FUNDED_DELEGATION_LIFECYCLE),
     ("TAG_L2_SETTLEMENT", TAG_L2_SETTLEMENT),
+    ("TAG_PQ_RESCUE_COMMIT", TAG_PQ_RESCUE_COMMIT),
 ];
 
 
@@ -3723,6 +3744,10 @@ mod tests {
             "two state-root components share a tag byte"
         );
         assert_eq!(TAG_FC_RECENT_VOTE, 0x1A, "the O01 component takes the next free byte after 0x19");
+        // HF3 allocation (wire_alloc): 0x22 = TAG_KES_ROOT and 0x23 = TAG_LC_ROSTER
+        // live on other lines; neither byte may be claimed here.
+        assert_eq!(TAG_PQ_RESCUE_COMMIT, 0x24, "PQ rescue commitments sit past the KES/LC reservations");
+        assert!(STATE_COMPONENT_TAGS.iter().all(|(_, t)| *t != 0x22 && *t != 0x23), "0x22/0x23 are reserved");
     }
 
     #[test]

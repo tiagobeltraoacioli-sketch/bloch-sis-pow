@@ -2481,6 +2481,106 @@ pub(crate) mod funded_admission_rehearsal {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hard fork 3: post-quantum suite migration (docs/PQ-SUITE-MIGRATION.md).
+// BOTH INERT.
+// ---------------------------------------------------------------------------
+
+/// Hard fork 3 flag day for the post-quantum suite migration (wire tags
+/// `0x18`-`0x1A`, state tag `0x24`; allocation in [`crate::wire_alloc`]).
+/// `u64::MAX` = INERT.
+///
+/// It gates the withdrawal-credential rotation (wire `0x18`) into the
+/// hash-based `SLH-DSA-128s ‖ Falcon-1024` suite (id `0x0003`): below the
+/// gate the tag is refused before any field is read, which is the verdict an
+/// old binary reaches with `UnknownTag(0x18)`. It is a distinct name from the
+/// suite prototype's `NATIVE_SLHDSA_SUITE_ACTIVATION_EPOCH`
+/// (`codex/hf3-slhdsa-20261020`) so the two lines merge without a duplicate
+/// definition; the HF3 schedule must arm this gate at or after that one,
+/// because a rotation into suite `0x0003` is only useful once suite `0x0003`
+/// signatures verify.
+pub const HF3_PQ_MIGRATION_EPOCH: u64 = u64::MAX;
+
+/// Emergency flag day for a public break (or credible weakening) of BOTH
+/// lattice families in the hybrid suite. `u64::MAX` = INERT, and it can only
+/// be armed at or after [`HF3_PQ_MIGRATION_EPOCH`] (there must
+/// be a hash-based suite to rescue funds into).
+///
+/// From this epoch on:
+/// - `Transfer`/`TransferV2` inputs authorised by a lattice-suite key are
+///   refused (`PqMigrationReject::LatticeSpendFrozen`) — the signature no
+///   longer proves anything, so letting it move coins hands them to whoever
+///   forges fastest;
+/// - lattice-authorised credential rotations must cite a matured,
+///   finalized commitment;
+/// - the commit-reveal rescue (wire `0x19`/`0x1A`) becomes valid.
+pub const LATTICE_EMERGENCY_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Epochs a rescue commitment must age before a reveal may cite it (~1 day at
+/// 16-minute epochs). An attacker who learns a public key from a pending
+/// reveal must commit AFTER the owner and then wait this long, so the owner's
+/// reveal only has to survive censorship for this window.
+pub const RESCUE_COMMIT_MIN_DELAY_EPOCHS: u64 = 90;
+
+/// Epochs after which an unrevealed rescue commitment is pruned (~30 days).
+/// Bounds the commitment set: at most
+/// `RESCUE_COMMITS_PER_BLOCK × SLOTS_PER_EPOCH × RESCUE_COMMIT_TTL_EPOCHS`
+/// 32-byte entries.
+pub const RESCUE_COMMIT_TTL_EPOCHS: u64 = 2_700;
+
+/// Fee-free rescue commitments that fit in one block. Each commitment is
+/// charged `BLOCK_GAS_LIMIT / RESCUE_COMMITS_PER_BLOCK` gas and no money, so
+/// the block gas cap is the rate limit (a lattice-only holder has no
+/// spendable coin to pay a fee with once the emergency gate binds).
+pub const RESCUE_COMMITS_PER_BLOCK: u64 = 16;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    LATTICE_EMERGENCY_ACTIVATION_EPOCH,
+    HF3_PQ_MIGRATION_EPOCH
+));
+
+pub(crate) fn hf3_pq_migration_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if pq_migration_rehearsal::slh_enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, HF3_PQ_MIGRATION_EPOCH)
+}
+
+pub(crate) fn lattice_emergency_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if pq_migration_rehearsal::emergency_enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, LATTICE_EMERGENCY_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod pq_migration_rehearsal {
+    use std::cell::Cell;
+    thread_local! {
+        static SLH: Cell<bool> = const { Cell::new(false) };
+        static EMERGENCY: Cell<bool> = const { Cell::new(false) };
+    }
+    pub fn slh_enabled() -> bool { SLH.with(Cell::get) }
+    pub fn emergency_enabled() -> bool { EMERGENCY.with(Cell::get) }
+    struct Restore(bool, bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SLH.with(|v| v.set(self.0));
+            EMERGENCY.with(|v| v.set(self.1));
+        }
+    }
+    /// Arm the SLH suite gate only.
+    pub fn open_slh() -> impl Drop {
+        Restore(SLH.with(|v| v.replace(true)), EMERGENCY.with(Cell::get))
+    }
+    /// Arm the SLH suite gate AND the lattice emergency.
+    pub fn open_emergency() -> impl Drop {
+        Restore(SLH.with(|v| v.replace(true)), EMERGENCY.with(|v| v.replace(true)))
+    }
+}
+
 /// MAX is always an unarmed sentinel, including on synthetic boundary inputs.
 pub const fn epoch_gate_active(epoch: u64, activation: u64) -> bool {
     activation != u64::MAX && epoch >= activation

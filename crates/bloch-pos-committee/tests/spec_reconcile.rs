@@ -428,7 +428,7 @@ fn tx19_tokenomics_terminal_facts_match_code() {
 fn tx20_legacy_interfaces_are_classified_accurately() {
     assert_eq!(
         STATE_COMPONENT_TAGS.len(),
-        33,
+        34,
         "update the interface reconciliation when the append-only registry grows"
     );
 
@@ -436,7 +436,7 @@ fn tx20_legacy_interfaces_are_classified_accurately() {
     for claim in [
         "DTO with 14 top-level fields",
         "`STATE_COMPONENT_TAGS` registry",
-        "currently contains 33 components",
+        "currently contains 34 components",
         "winning error for a multiply-invalid block is not consensus data",
     ] {
         assert!(doc.contains(claim), "interface spec missing TX-20 claim {claim:?}");

@@ -29,6 +29,9 @@ fn is_lifecycle(tx: &PosTransaction) -> bool {
             | PosTransaction::FundedUndelegate(_)
             | PosTransaction::FundedDelegationWithdraw(_)
             | PosTransaction::ValidatorCommissionUpdate(_)
+            | PosTransaction::WithdrawalCredentialRotation(_)
+            | PosTransaction::RescueCommit(_)
+            | PosTransaction::RescueReveal(_)
             | PosTransaction::Withdraw { .. }
             | PosTransaction::ExitV2 { .. }
             | PosTransaction::RandaoRecommit { .. }
@@ -136,6 +139,9 @@ impl Engine {
             PosTransaction::FundedUndelegate(t) => Some(lifecycle_source_hash(b"funding-key", &t.funding_pubkey)),
             PosTransaction::FundedDelegationWithdraw(t) => Some(lifecycle_source_hash(b"funding-key", &t.funding_pubkey)),
             PosTransaction::ValidatorCommissionUpdate(t) => Some(validator_lifecycle_source(t.validator)),
+            PosTransaction::WithdrawalCredentialRotation(t) => Some(validator_lifecycle_source(t.validator)),
+            PosTransaction::RescueReveal(t) => Some(lifecycle_source_hash(b"rescue-key", &t.pubkey)),
+            PosTransaction::RescueCommit(t) => Some(lifecycle_source_hash(b"rescue-commit", &t.commitment)),
             PosTransaction::ExitV2 { pubkey_hash, .. } => self.state
                 .validator_index_by_hash(pubkey_hash).map(validator_lifecycle_source),
             PosTransaction::RandaoRecommit { validator, .. } =>
