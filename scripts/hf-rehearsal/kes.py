@@ -97,13 +97,21 @@ class KesRehearsal(Rehearsal):
         return next((e for e in (k or {}).get("registered", []) if e["validator"] == v), None)
 
     def register(self, v, data_dir: Path, via: int, tag: str) -> tuple[bool, str]:
-        out = self.work / "tx" / f"kes-register-v{v}-{tag}.hex"
-        out.parent.mkdir(exist_ok=True)
-        try:
-            self.kes("register", "--dir", data_dir, "--genesis", self.genesis, "--out", out, "--validator", v)
-        except SoakError as e:
-            return False, f"build refused: {e}"[:400]
-        return self.submit(via, out.read_text().strip())
+        # The hybrid signature's length varies (Falcon); one over
+        # ADMISSION_PQ_SIGNATURE_MAX is refused on size alone (observed
+        # 2026-10-20: 4596 > 4593). Re-sign (new file) up to 3 times.
+        (self.work / "tx").mkdir(exist_ok=True)
+        for attempt in range(3):
+            out = self.work / "tx" / f"kes-register-v{v}-{tag}-{attempt}.hex"
+            try:
+                self.kes("register", "--dir", data_dir, "--genesis", self.genesis, "--out", out, "--validator", v)
+            except SoakError as e:
+                return False, f"build refused: {e}"[:400]
+            ok, msg = self.submit(via, out.read_text().strip())
+            if ok or "out-of-range depth or signature length" not in msg:
+                return ok, msg
+            self.event("kes_register_oversized_signature", validator=v, tag=tag, attempt=attempt)
+        return ok, msg
 
     def disturb(self, v, start_slot, end_slot=None):
         self.windows.setdefault(v, []).append((start_slot, end_slot if end_slot is not None else 10**9))
@@ -345,9 +353,10 @@ class KesRehearsal(Rehearsal):
         res["inclusion_period_upper_bound"] = k and k["period"]
         self.checks.ok("S7 expired key: static re-registration (rescue) accepted", bool(expired) and ok
                        and e2 is not None and e2["root"] != (e or {}).get("root"), res)
-        self.checks.ok("S7 a second registration while the key has not expired is refused", not ok2,
-                       res["second_registration_unexpired"])
-        res["rescued_start_period"] = e2 and e2["start_period"]
+        self.checks.ok("S7 a second registration while the key has not expired is refused (once-only rule)",
+                       not ok2 and "already registered" in msg2, res["second_registration_unexpired"])
+        # Only a rescue that was applied (new root) has a start period to check.
+        res["rescued_start_period"] = e2["start_period"] if e2 and e2["root"] != (e or {}).get("root") else None
         return res
 
     # ── S6 ───────────────────────────────────────────────────────────────
