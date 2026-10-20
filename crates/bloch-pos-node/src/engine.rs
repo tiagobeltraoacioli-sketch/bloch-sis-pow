@@ -4375,11 +4375,52 @@ impl Engine {
         Self::pack_transactions(epoch, candidates)
     }
 
+    /// Node relay policy (HF2 sigdet): the proposer never selects a spend
+    /// whose witness the BASE verifier accepts but the FIPS 204 reference
+    /// verifier rejects (the only verdict that differs between ML-DSA
+    /// backends). A witness the base verifier itself rejects is left to the
+    /// existing propose/re-ingest/cleanup path (a bad signature must still be
+    /// able to enter a proposed block and be refused there — the slot-69
+    /// robustness design), so this guard adds ONLY the reference constraint
+    /// and never changes selection of base-valid or plainly-invalid witnesses.
+    /// `true` for transactions that carry no spend witness. Node-local; no
+    /// consensus effect.
+    fn spend_witnesses_pass_relay_policy(&self, tx: &PosTransaction, epoch: u64) -> bool {
+        let domain = self.state.admission_network_domain();
+        let Some(root) = tx.checked_signing_root_for_network(epoch, domain.as_ref()) else {
+            return !matches!(
+                tx,
+                PosTransaction::Transfer { .. } | PosTransaction::TransferV2 { .. }
+            );
+        };
+        // A witness is relay-unsafe iff the base rule accepts it and the
+        // reference rule does not.
+        let relay_unsafe = |pk: &[u8], sig: &[u8]| {
+            bloch_crypto::crypto::verify(pk, &root, sig)
+                && !bloch_crypto::crypto::verify_pinned(pk, &root, sig)
+        };
+        match tx {
+            PosTransaction::Transfer { inputs, .. } => {
+                !inputs.iter().any(|i| relay_unsafe(&i.pubkey, &i.signature))
+            }
+            PosTransaction::TransferV2 { keys, .. } => {
+                !keys.iter().any(|k| relay_unsafe(&k.pubkey, &k.signature))
+            }
+            _ => true,
+        }
+    }
+
     /// Immutable signatures were checked at admission. Re-evaluate only the
     /// parent/epoch-dependent backing shared by selection and capacity policy.
     fn candidate_is_backed(&self, tx: &PosTransaction, encoded: usize, epoch: u64,
         funded_context: &mut Option<(Arc<CommittedState>, u128)>) -> bool {
         if admission::check_transfer(&self.state, tx, encoded, epoch).is_err() { return false; }
+        // NODE RELAY POLICY (HF2 sigdet): the proposer never selects a spend
+        // whose witness fails the FIPS 204 reference verifier, even if it
+        // reached the mempool by a path that skipped `admissible`. Not a
+        // consensus rule — the transition still judges the block it builds
+        // with the base verifier.
+        if !self.spend_witnesses_pass_relay_policy(tx, epoch) { return false; }
         // Proposer policy (incident 2026-10-19): never include evidence for an
         // offence that predates slashing, even if it reached the mempool by a
         // path that skipped `admissible`.
@@ -7221,6 +7262,54 @@ pub(crate) fn l2_admission_refusal(
     }
 }
 
+/// NODE-ONLY RELAY POLICY (HF2 sigdet), live and ungated: in addition to the
+/// base verifier, require the FIPS 204 reference (pinned) verdict for every
+/// signature, for every suite. This keeps signatures that only one ML-DSA
+/// backend accepts off this node's mempool and out of the blocks it proposes.
+/// It changes NO consensus rule: block and vote validation run the base
+/// verifier exactly as before, so a block that is consensus-valid is still
+/// accepted. Every shipped signer produces reference signatures, so no honest
+/// transaction is refused.
+struct StrictRelayVerifier<'a> {
+    inner: &'a dyn SignatureVerifier,
+}
+
+impl<'a> StrictRelayVerifier<'a> {
+    fn new(inner: &'a dyn SignatureVerifier) -> Self {
+        Self { inner }
+    }
+}
+
+impl SignatureVerifier for StrictRelayVerifier<'_> {
+    fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool {
+        // The base rule first (it carries the budget / failure-cache side
+        // effects), THEN the pinned reference check. AND, never OR: a relay
+        // verdict is never weaker than the base one.
+        self.inner.verify_with_key(pubkey, signing_root, signature)
+            && bloch_crypto::crypto::verify_pinned(pubkey, signing_root, signature)
+    }
+
+    fn verify_l2_settlement(&self, policy: &[u8; 32], program: &[u8; 32], values: &[u8], proof: &[u8]) -> bool {
+        // L2 settlement is a SNARK proof, not an ML-DSA signature — unchanged.
+        self.inner.verify_l2_settlement(policy, program, values, proof)
+    }
+}
+
+/// A fresh [`HybridVerifier`] under the node relay policy, for the admission
+/// arms that verify a self-contained (budget-free) hybrid authorization.
+fn strict_relay_hybrid() -> impl SignatureVerifier {
+    struct Owned(HybridVerifier);
+    impl SignatureVerifier for Owned {
+        fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+            self.0.verify_with_key(pk, root, sig) && bloch_crypto::crypto::verify_pinned(pk, root, sig)
+        }
+        fn verify_l2_settlement(&self, p: &[u8; 32], pr: &[u8; 32], v: &[u8], pf: &[u8]) -> bool {
+            self.0.verify_l2_settlement(p, pr, v, pf)
+        }
+    }
+    Owned(HybridVerifier::new())
+}
+
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     admissible_with_verifier(tx, wall_epoch, &HybridVerifier::new())
 }
@@ -7235,6 +7324,10 @@ fn admissible_with_network_verifier(
     network_domain: Option<&[u8; 32]>,
     verifier: &dyn SignatureVerifier,
 ) -> Result<(), &'static str> {
+    // NODE RELAY POLICY (HF2 sigdet): every signature checked below must also
+    // pass the FIPS 204 reference verifier. Not a consensus rule.
+    let strict = StrictRelayVerifier::new(verifier);
+    let verifier: &dyn SignatureVerifier = &strict;
     match tx {
         PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => Err("native L2 settlement is not enabled by a shipping genesis manifest"),
         // Whether the network's L2 admits DA, claims and deposits is a state
@@ -7246,7 +7339,7 @@ fn admissible_with_network_verifier(
             if bloch_pos_committee::l2_settlement::da::batch_count(&batch.payload).is_none() {
                 return Err("L2 data availability payload is not one canonical batch");
             }
-            if HybridVerifier::new().verify_with_key(&batch.funding_pubkey, &batch.intent_root(), &batch.signature) {
+            if strict_relay_hybrid().verify_with_key(&batch.funding_pubkey, &batch.intent_root(), &batch.signature) {
                 Ok(())
             } else {
                 Err("invalid L2 data availability hybrid PQ authorization")
@@ -7258,20 +7351,20 @@ fn admissible_with_network_verifier(
             if claim.validate_shape().is_err() {
                 return Err("L2 withdrawal claim has an invalid shape or release output");
             }
-            if !HybridVerifier::new().verify_with_key(&claim.funding_pubkey, &claim.intent_root(), &claim.signature) {
+            if !strict_relay_hybrid().verify_with_key(&claim.funding_pubkey, &claim.intent_root(), &claim.signature) {
                 return Err("invalid L2 withdrawal claim hybrid PQ authorization");
             }
             // The attestors sign the root the proof folds to, so their
             // signatures check here without state; only "is this the
             // policy's set" waits for consensus.
-            if !claim.verify_attestation(&HybridVerifier::new()) {
+            if !claim.verify_attestation(&strict_relay_hybrid()) {
                 return Err("invalid L2 withdrawal claim attestation");
             }
             Ok(())
         }
         PosTransaction::L2Deposit(deposit) => {
             // State checks (inputs, ownership, conservation) run in consensus.
-            if HybridVerifier::new().verify_with_key(&deposit.funding_pubkey, &deposit.intent_root(), &deposit.signature) {
+            if strict_relay_hybrid().verify_with_key(&deposit.funding_pubkey, &deposit.intent_root(), &deposit.signature) {
                 Ok(())
             } else {
                 Err("invalid L2 deposit hybrid PQ authorization")
@@ -8492,6 +8585,122 @@ mod admission_authorisation {
             .is_ok(),
             "a V1 transfer must be admitted identically after the V2 flag day"
         );
+    }
+
+    // ── HF2 sigdet node relay policy ─────────────────────────────────────────
+
+    /// Accept-everything base verifier: a stand-in for "whatever verdict the
+    /// base/consensus verifier would reach" so a relay-policy test does not
+    /// have to reproduce a backend-specific acceptance.
+    struct AcceptAll;
+    impl bloch_pos_committee::attestation::SignatureVerifier for AcceptAll {
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
+        }
+    }
+
+    /// Every honest reference signature — produced by each compiled PQClean
+    /// ML-DSA-65 backend (clean, and avx2/neon where the CPU supports it),
+    /// under the same hedging randomness — is byte-identical and is admitted.
+    #[test]
+    fn honest_reference_signatures_from_every_backend_are_admitted() {
+        use pqcrypto_mldsa::ffi;
+        use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
+        const MPK: usize = 1952;
+        const MSK: usize = 4032;
+        const MSIG: usize = 3309;
+
+        // Hybrid key; split out the ML-DSA halves the backends operate on.
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[9u8; 32]).unwrap();
+        let (_, pk_body) = bloch_crypto::crypto::split_envelope(&pk).unwrap();
+        let (_, sk_body) = bloch_crypto::crypto::split_envelope(&sk).unwrap();
+        let mpk: [u8; MPK] = pk_body[..MPK].try_into().unwrap();
+        let msk: [u8; MSK] = sk_body[..MSK].try_into().unwrap();
+        let root = [0x5Au8; 32];
+
+        type Sign = unsafe extern "C" fn(*mut u8, *mut usize, *const u8, usize, *const u8, usize, *const u8) -> core::ffi::c_int;
+        let mut signers: Vec<(&str, Sign)> = vec![("clean", ffi::PQCLEAN_MLDSA65_CLEAN_crypto_sign_signature_ctx)];
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            signers.push(("avx2", ffi::PQCLEAN_MLDSA65_AVX2_crypto_sign_signature_ctx));
+        }
+        #[cfg(target_arch = "aarch64")]
+        signers.push(("aarch64", ffi::PQCLEAN_MLDSA65_AARCH64_crypto_sign_signature_ctx));
+        assert!(signers.len() >= 1);
+
+        let mut reference: Option<Vec<u8>> = None;
+        for (name, sign) in &signers {
+            let mut sig = vec![0u8; MSIG];
+            let mut len = 0usize;
+            // Same seeded hedging stream for every backend, so an honest
+            // signature is a function of the key and message, not the CPU.
+            let rc = pqcrypto_internals::with_seeded_rng_scope(&[0x77u8; 32], || unsafe {
+                sign(sig.as_mut_ptr(), &mut len, root.as_ptr(), root.len(), core::ptr::null(), 0, msk.as_ptr())
+            });
+            assert_eq!((rc, len), (0, MSIG), "{name} signer");
+            // Accepted by the FIPS 204 reference verifier used by the relay policy.
+            assert!(bloch_mldsa_clean::verify(&mpk, &root, &sig), "{name} honest sig rejected by reference");
+            match &reference {
+                None => reference = Some(sig),
+                Some(r) => assert_eq!(&sig, r, "{name} honest signature differs from clean"),
+            }
+        }
+
+        // End to end: an honest hybrid transfer reaches the mempool under the
+        // relay policy.
+        let (tx, _) = signed_transfer();
+        assert!(admissible(&tx, 0).is_ok(), "an honest hybrid transfer must be admitted");
+        let _ = reference;
+    }
+
+    /// The relay policy refuses a signature the BASE verifier would accept but
+    /// the FIPS 204 reference verifier rejects, while the base verifier (what
+    /// the consensus transition uses to judge a block) still accepts it — so
+    /// the tx is kept out of this node's mempool yet a block carrying it is
+    /// not rejected by consensus. Uses `AcceptAll` as the base stand-in and an
+    /// arbitrary non-reference signature, so no backend-specific signature is
+    /// generated here.
+    #[test]
+    fn relay_policy_refuses_what_the_base_accepts_while_consensus_still_accepts() {
+        // Honest transfer, then replace its witness with a structurally valid
+        // 0x0001 signature envelope full of zeros: cryptographically invalid,
+        // so no backend-specific signature is generated here.
+        let (mut tx, _) = signed_transfer();
+        let pubkey = match &tx {
+            PosTransaction::Transfer { inputs, .. } => inputs[0].pubkey.clone(),
+            _ => unreachable!(),
+        };
+        let root = tx.spend_signing_root();
+        let falcon_len = bloch_crypto::crypto::falcon::padded_signature_len();
+        let mut bogus = vec![0xB1u8, 0x0C, 0x01, 0x00];
+        bogus.resize(4 + bloch_crypto::crypto::MLDSA_SIG_LEN + falcon_len, 0);
+        if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+            inputs[0].signature = bogus.clone();
+        }
+        // The FIPS 204 reference verifier rejects it; the accept-all base
+        // (standing in for whatever the consensus verifier would decide) does not.
+        assert!(!bloch_crypto::crypto::verify_pinned(&pubkey, &root, &bogus));
+        assert!(AcceptAll.verify_with_key(&pubkey, &root, &bogus));
+        // The mempool door, run with the accept-all BASE verifier, still refuses
+        // it, because the relay policy adds the reference check on top — so a
+        // block that consensus (the base verifier) would accept is kept out of
+        // this node's mempool and off the wire.
+        assert!(
+            admissible_with_network_verifier(&tx, 0, None, &AcceptAll).is_err(),
+            "the relay policy must refuse a non-reference signature even when the base accepts"
+        );
+    }
+
+    /// The relay policy lives only on the node's admission and proposer-
+    /// selection paths; the consensus crate never applies it.
+    #[test]
+    fn relay_policy_is_confined_to_the_node_admission_path() {
+        let committee = include_str!("../../bloch-pos-committee/src/transition.rs");
+        assert!(!committee.contains("StrictRelayVerifier"));
+        assert!(!committee.contains("verify_pinned"));
+        let here = include_str!("engine.rs");
+        assert!(here.contains("struct StrictRelayVerifier"));
+        assert!(here.contains("fn spend_witnesses_pass_relay_policy"));
     }
 
     /// **H1, at the mempool door.** A transfer whose tip or declared gas is
