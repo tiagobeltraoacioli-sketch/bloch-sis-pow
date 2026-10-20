@@ -145,6 +145,13 @@ ensure_reference() {
       fi || { log "reference $kind dump failed"; rm -f "$out"; exit 2; }
     fi
   done
+  local rg="$CACHE/dumps/ref-${REF:0:12}.golden"
+  if [ "${HF_GUARD_SKIP_GOLDEN:-0}" != 1 ] && [ ! -f "$rg" ]; then
+    log "reference golden tests"
+    ( cd "$REFTREE" && $NICE cargo test --release -p bloch-pos-committee --test '*' --no-fail-fast ) >"$CACHE/logs/ref-golden.log" 2>&1
+    grep -qE '^error\[|^error: could not compile' "$CACHE/logs/ref-golden.log" && { log "reference golden tests do not build"; exit 2; }
+    grep -E '^test .* \.\.\. FAILED$' "$CACHE/logs/ref-golden.log" | awk '{print $2}' | sort > "$rg"
+  fi
   # Sanity on the reference itself: every fixture block accepted, every
   # mainnet id reproduced. Otherwise the guard proves nothing.
   if grep -qE ' (REJECT|PANIC) ' "$CACHE/dumps/ref-${REF:0:12}.fixtures"; then
@@ -180,9 +187,11 @@ check_target() { # $1=branch-or-commit
     # bloch-pos-committee; the target's own src/ is left untouched.
     rm -rf "$tree/crates/bloch-pos-committee/tests"
     cp -R "$REFTREE/crates/bloch-pos-committee/tests" "$tree/crates/bloch-pos-committee/tests"
-    ( cd "$tree" && $NICE cargo test --release -p bloch-pos-committee --tests --no-fail-fast ) >"$base.golden.log" 2>&1
-    local failed; failed="$(grep -E '^test .* \.\.\. FAILED$' "$base.golden.log" | awk '{print $2}' | tr '\n' ' ')"
-    if grep -qE '^error(\[|:)' "$base.golden.log"; then
+    ( cd "$tree" && $NICE cargo test --release -p bloch-pos-committee --test '*' --no-fail-fast ) >"$base.golden.log" 2>&1
+    # Only failures the reference does not also show count.
+    local failed; failed="$(grep -E '^test .* \.\.\. FAILED$' "$base.golden.log" | awk '{print $2}' | sort \
+      | comm -23 - "$CACHE/dumps/ref-${REF:0:12}.golden" | tr '\n' ' ')"
+    if grep -qE '^error\[|^error: could not compile' "$base.golden.log"; then
       gold="BUILD-FAIL"; verdict=FAIL; notes+=("golden: reference tests do not compile against target ($base.golden.log)")
     elif [ -n "$failed" ]; then
       gold="FAIL"; verdict=FAIL; notes+=("golden: $failed")
