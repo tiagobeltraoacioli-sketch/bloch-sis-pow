@@ -68,6 +68,17 @@ pqcrypto-mldsa     = "=0.1.2"
 pqcrypto-falcon    = { version = "=0.4.1", default-features = false, features = ["std"] }
 pqcrypto-traits    = "0.3"
 pqcrypto-internals = "0.2"
+# HF3 optional suite 0x0003 (SLH-DSA-SHAKE-128s || Falcon-1024), FIPS 205.
+# Resolved to the VENDORED, hash-pinned copy at crates/fips205 through the
+# workspace [patch.crates-io] (byte-identical fips205 0.4.1 sources: pure
+# Rust, #![deny(unsafe_code)], MIT OR Apache-2.0, NOT independently audited).
+# Pinned exact like the other PQ primitives. Only the one parameter set is
+# compiled and no default features (no getrandom 0.2): opt_rand is drawn from
+# the workspace rand 0.9 RNG. Consensus acceptance is gated by
+# crypto::HF3_SLH_SUITE_EPOCH (u64::MAX = never).
+fips205   = { version = "=0.4.1", default-features = false, features = ["slh_dsa_shake_128s"] }
+# rand_core 0.6 trait only (fips205's RNG interface); no OS-RNG features.
+rand_core = { version = "0.6.4", default-features = false }
 
 # Hashing / KDF / AEAD.
 sha2   = "0.10"

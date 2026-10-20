@@ -1,0 +1,85 @@
+# VENDORED COPY of fips205 0.4.1 (IntegrityChain, MIT OR Apache-2.0) — the
+# SLH-DSA (FIPS 205) implementation behind optional signature suite 0x0003
+# (SLH-DSA-SHAKE-128s || Falcon-1024, hard fork HF3, gated by
+# HF3_SLH_SUITE_EPOCH = u64::MAX in bloch-crypto and bloch-pos-committee).
+#
+# PROVENANCE: `src/`, `README.md`, `CHANGELOG.md`, `SECURITY.md` and the two
+# LICENSE files are byte-identical to the crates.io package fips205 0.4.1
+# (.crate sha256 2f5626bf5534df4ebdbd2536465d7eaa8a9dc2cdeb7e036e0ecf291dcc80ffb6,
+# upstream git a9b02e92cdf9169db537027f23dbe570ec35f6a4). VENDOR.toml pins a
+# SHA-256 of every one of those files and `tests/vendor_pin.rs` recomputes
+# them on every `cargo test`, so any edit to the vendored algorithm code fails
+# the build until it is deliberately re-pinned (a crypto-review event).
+#
+# LOCAL CHANGES — this manifest only:
+#   * upstream integration tests, benches and most dev-dependencies are dropped (they pin
+#     serde =1.0.210 and criterion 0.4, which would add duplicate versions the
+#     workspace's `multiple-versions = "deny"` policy forbids); FIPS 205 KATs
+#     (NIST ACVP-Server, SLH-DSA-SHAKE-128s) run from bloch-crypto's
+#     tests/acvp_slhdsa.rs against exactly this build instead;
+#   * the `default` feature set is `slh_dsa_shake_128s` only (no getrandom
+#     0.2 OS-RNG stack, no other parameter sets); bloch-crypto additionally
+#     names it explicitly with default-features = false;
+#   * a vendor-pin test (sha2/toml/serde dev-deps, same versions as
+#     crates/pqcrypto-internals) is added; rand_chacha 0.3 stays as the one
+#     upstream dev-dependency, for upstream's in-crate unit tests.
+#
+# WHY VENDORED: the implementation is NOT independently audited. Freezing the
+# exact bytes in-tree makes every future change a reviewed diff instead of a
+# `cargo update`, mirrors crates/pqcrypto-internals, and keeps the workspace
+# buildable with no network dependency on this crate's registry entry.
+[package]
+name = "fips205"
+version = "0.4.1"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "FIPS 205: Stateless Hash-Based Digital Signature Standard (Bloch vendored copy of fips205 0.4.1)"
+authors = ["Eric Schorn <eschorn@integritychain.com>"]
+repository = "https://github.com/integritychain/fips205"
+readme = "README.md"
+publish = false
+autotests = false
+autobenches = false
+autoexamples = false
+
+[lib]
+name = "fips205"
+path = "src/lib.rs"
+
+[[test]]
+name = "vendor_pin"
+path = "tests/vendor_pin.rs"
+
+[dependencies]
+zeroize = { version = "1.6.0", default-features = false, features = ["zeroize_derive"] }
+rand_core = { version = "0.6.4", default-features = false }
+sha3 = { version = "0.10.2", default-features = false }
+sha2 = { version = "0.10.8", default-features = false }
+
+[dev-dependencies]
+# Upstream's in-crate unit tests (src/lib.rs) seed a ChaCha8 RNG; same
+# version as upstream's dev-dependency, already in the workspace graph.
+rand_chacha = "0.3.1"
+sha2 = "0.10"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+[features]
+# Only the parameter set Bloch uses (upstream's default is all twelve plus the
+# getrandom 0.2 OS RNG). Non-empty so `cargo test -p fips205` builds on its
+# own: with no parameter set the crate's `deny(dead_code)` rejects itself.
+default = ["slh_dsa_shake_128s"]
+default-rng = ["rand_core/getrandom"]
+slh_dsa_sha2_128s = []
+slh_dsa_shake_128s = []
+slh_dsa_sha2_128f = []
+slh_dsa_shake_128f = []
+slh_dsa_sha2_192s = []
+slh_dsa_shake_192s = []
+slh_dsa_sha2_192f = []
+slh_dsa_shake_192f = []
+slh_dsa_sha2_256s = []
+slh_dsa_shake_256s = []
+slh_dsa_sha2_256f = []
+slh_dsa_shake_256f = []

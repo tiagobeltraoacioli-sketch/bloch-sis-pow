@@ -41,6 +41,16 @@ pub const SUITE_MLDSA65_FALCON1024: u16 = 0x0001;
 /// ML-DSA-65 only — the "Falcon removed" suite (proof that Falcon is removable).
 pub const SUITE_MLDSA65_ONLY: u16 = 0x0002;
 
+// HF3 optional suite 0x0003: SLH-DSA-SHAKE-128s ‖ Falcon-1024. Accepted by
+// consensus only through `verify_spend` with the caller's HF3 gate open
+// (the one constant is bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH,
+// u64::MAX = never); see `slhdsa_suite`.
+pub mod slhdsa_suite;
+pub use slhdsa_suite::{
+    is_slhdsa_hybrid_public_key, is_spend_public_key_admissible, max_slhdsa_suite_signature_len,
+    SUITE_SLHDSA128S_FALCON1024,
+};
+
 /// Maximum encoded signature length emitted by the currently supported signers.
 /// Producers may reserve this before signing; this does not change wire rules.
 pub fn max_signature_len() -> usize {
@@ -215,6 +225,9 @@ pub fn sign(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoEr
             let out = mldsa65::detached_sign(message, &sk).as_bytes().to_vec();
             Ok(wrap_envelope(suite, &out))
         }
+        // HF3 suite 0x0003. Signing is wallet-side and consensus-neutral: no
+        // verifier accepts the result before the HF3 gate opens.
+        SUITE_SLHDSA128S_FALCON1024 => slhdsa_suite::sign_body(sk_body, message),
         _ => Err(CryptoError::InvalidKey(format!("unknown/reserved suite {:#06x}", suite))),
     }
 }
@@ -285,6 +298,52 @@ pub fn verify(public_key_bytes: &[u8], message: &[u8], signature_bytes: &[u8]) -
     let (pk_suite, pk_body) = parse_pubkey_envelope_or_legacy(public_key_bytes);
     let (sig_suite, sig_body) = parse_envelope_or_legacy(signature_bytes);
     verify_parsed(pk_suite, pk_body, message, sig_suite, sig_body)
+}
+
+/// Verifier for consensus spend witnesses (HF3).
+///
+/// `slh_suite_enabled` is the caller's HF3 gate verdict — consensus passes
+/// `bloch_pos_committee::params::hf3_slh_suite_active(epoch)`; this crate
+/// holds no activation constant of its own. With it `false` this IS
+/// [`verify`] — the same function on the same bytes, so today's verdict is
+/// unchanged and a suite-0x0003 object takes today's unknown/reserved-suite
+/// arm. With it `true` suite 0x0003 (SLH-DSA-SHAKE-128s ‖ Falcon-1024) is
+/// additionally accepted: both objects must carry the explicit 0x0003
+/// envelope (no legacy fallback can produce it), the suites must match, and
+/// both halves must verify (Falcon first, see `slhdsa_suite::verify_body`).
+/// Every other suite and the legacy raw hybrid behave exactly as in [`verify`].
+pub fn verify_spend(
+    public_key_bytes: &[u8],
+    message: &[u8],
+    signature_bytes: &[u8],
+    slh_suite_enabled: bool,
+) -> bool {
+    if !slh_suite_enabled {
+        return verify(public_key_bytes, message, signature_bytes);
+    }
+    let (pk_suite, pk_body) = parse_pubkey_envelope_or_legacy(public_key_bytes);
+    let (sig_suite, sig_body) = parse_envelope_or_legacy(signature_bytes);
+    if pk_suite == SUITE_SLHDSA128S_FALCON1024 || sig_suite == SUITE_SLHDSA128S_FALCON1024 {
+        if pk_suite != sig_suite {
+            debug!("crypto::verify_spend: suite mismatch (pk={:#06x}, sig={:#06x})", pk_suite, sig_suite);
+            return false;
+        }
+        return slhdsa_suite::verify_body(pk_body, message, sig_body);
+    }
+    verify_parsed(pk_suite, pk_body, message, sig_suite, sig_body)
+}
+
+/// [`verify_spend`] with the gate given as an explicit activation epoch
+/// (wallet offline checks / tests). Consensus code must use [`verify_spend`]
+/// with its own gate verdict.
+pub(crate) fn verify_with_slhdsa_activation(
+    public_key_bytes: &[u8],
+    message: &[u8],
+    signature_bytes: &[u8],
+    epoch: u64,
+    activation: u64,
+) -> bool {
+    verify_spend(public_key_bytes, message, signature_bytes, slhdsa_suite::active_under(epoch, activation))
 }
 
 /// Verify objects whose trusted format contract requires an explicit suite envelope.
