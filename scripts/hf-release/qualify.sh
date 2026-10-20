@@ -144,6 +144,17 @@ say "kit: $(git -C "$REPO" rev-parse HEAD)  engine: $ENGINE  source: $SOURCE"
 # ── 1. canonical build ────────────────────────────────────────────────────
 WT="$OUT/src"
 git -C "$REPO" worktree add --detach "$WT" "$COMMIT" >/dev/null
+# The ML-DSA pin's QUALIFICATION-ONLY feature arms MLDSA_PIN_ACTIVATION_EPOCH
+# at 0 (all of history under the pinned rule). It must never reach a release
+# build: not in a default feature set, not in the release build script.
+if grep -nE '^[[:space:]]*default[[:space:]]*=.*mldsa-pin-replay-qualification' \
+    "$WT/crates/bloch-pos-node/Cargo.toml" "$WT/crates/bloch-pos-committee/Cargo.toml"; then
+  die "a default feature set enables mldsa-pin-replay-qualification"
+fi
+if grep -n 'mldsa-pin-replay-qualification' "$WT/scripts/build-pos-release-container.sh"; then
+  die "the release build script enables mldsa-pin-replay-qualification"
+fi
+record qualification-features-off PASS "mldsa-pin-replay-qualification not enabled by the release build"
 say "building in the canonical container (log: $OUT/build.log)"
 if (cd "$WT" && CONTAINER_ENGINE="$ENGINE" scripts/build-pos-release-container.sh "$OUT/release") > "$OUT/build.log" 2>&1; then
   BIN="$OUT/release/bloch-pos"
