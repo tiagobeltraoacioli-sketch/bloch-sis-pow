@@ -108,7 +108,7 @@ pub const ACTIVATION_DELAY_EPOCHS: u64 = 8;
 pub const MAX_ACTIVATIONS_PER_EPOCH: usize = 4;
 
 /// Growth-cap window, consulted only behind
-/// `params::NATIVE_GROWTH_CAP_ACTIVATION_EPOCH`: 24 epochs is 6.4 hours,
+/// `params::HF2_GROWTH_CAP_EPOCH`: 24 epochs is 6.4 hours,
 /// about one ObenBlock epoch, so the ObenBlock bound carries over unchanged.
 pub const GROWTH_WINDOW_EPOCHS: u64 = 24;
 

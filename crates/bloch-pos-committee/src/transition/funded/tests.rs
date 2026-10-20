@@ -696,10 +696,10 @@ fn finality_recovery_activates_without_backdating_or_bypassing_churn() {
 }
 
 #[test]
-fn native_growth_cap_gate_is_inert() {
-    assert_eq!(crate::params::NATIVE_GROWTH_CAP_ACTIVATION_EPOCH, u64::MAX);
+fn hf2_growth_cap_gate_is_inert() {
+    assert_eq!(crate::params::HF2_GROWTH_CAP_EPOCH, u64::MAX);
     for epoch in [0, 2_884, 6_016, u64::MAX - 1, u64::MAX] {
-        assert!(!crate::params::native_growth_cap_active(epoch));
+        assert!(!crate::params::hf2_growth_cap_active(epoch));
     }
 }
 
@@ -722,7 +722,7 @@ fn growth_budget_is_w_over_64_with_a_minimum_deposit_floor() {
 /// to the budget of the (grown) weight then.
 #[test]
 fn growth_cap_bounds_activated_weight_per_window_when_rehearsed() {
-    let _g = crate::params::native_growth_cap_rehearsal::open();
+    let _g = crate::params::hf2_growth_cap_rehearsal::open();
     run(|| {
         let deposits: Vec<_> = (50..55).map(deposit).collect();
         let (t, mut state, mut chains) = fixture(&deposits);
@@ -766,4 +766,112 @@ fn growth_cap_bounds_activated_weight_per_window_when_rehearsed() {
         assert!(n == 4 || (n + 1) * staking::MIN_DEPOSIT_SAT > budget, "FIFO fills the budget");
         assert!(state.finality().finalized.epoch >= 44);
     });
+}
+
+/// HF2 invariant: the growth cap only ever WITHHOLDS a pending activation.
+/// At every epoch boundary of the armed scenario above, the capped activation
+/// step (a) leaves every already-registered record, and the rest of the
+/// committed state, byte-identical except `activation_epoch` on the bonds it
+/// admits; (b) admits a subset of what today's rule admits; and (c) never
+/// lowers the roster weight of a validator already active, nor the share of
+/// the already-active set, compared with today's rule.
+#[test]
+fn growth_cap_never_reduces_existing_active_validators_weight() {
+    let _g = crate::params::hf2_growth_cap_rehearsal::open();
+    run(|| {
+        let deposits: Vec<_> = (50..55).map(deposit).collect();
+        let (t, mut state, mut chains) = fixture(&deposits);
+        for tx in &deposits { apply(&mut state, tx).unwrap(); }
+        for _ in 0..20 { state = t.process_epoch(&state).unwrap(); }
+        for tag in 50..55 { chains.push(RandaoChain::generate([tag; 32])); }
+        let newly = |before: &CommittedState, after: &CommittedState| -> Vec<u32> {
+            after.validators.iter()
+                .filter(|(i, r)| r.activation_epoch != before.validators[i].activation_epoch)
+                .map(|(i, _)| *i)
+                .collect()
+        };
+        let weights = |s: &CommittedState, e: u64| -> std::collections::BTreeMap<u32, u128> {
+            s.duty_roster_at(e).iter().map(|v| (v.index, u128::from(v.effective_stake))).collect()
+        };
+        let mut target = [0; 32];
+        let mut withheld_somewhere = false;
+        let mut admitted_somewhere = false;
+        for slot in (20 * SLOTS_PER_EPOCH)..=(47 * SLOTS_PER_EPOCH) {
+            if slot % SLOTS_PER_EPOCH == 0 && slot > 20 * SLOTS_PER_EPOCH {
+                // `state` closes epoch `slot / SLOTS_PER_EPOCH - 1`.
+                let next = slot / SLOTS_PER_EPOCH;
+                let before = state.clone();
+                let mut on = before.clone();
+                on.activate_finalized_deposits(next);
+                let mut off = before.clone();
+                {
+                    let _closed = crate::params::hf2_growth_cap_rehearsal::closed();
+                    off.activate_finalized_deposits(next);
+                }
+                let (n_on, n_off) = (newly(&before, &on), newly(&before, &off));
+                // (a) only pending -> `next` transitions, nothing else moves.
+                let mut reverted = on.clone();
+                for i in &n_on {
+                    assert_eq!(before.validators[i].activation_epoch, u64::MAX);
+                    assert_eq!(on.validators[i].activation_epoch, next);
+                    reverted.validators.get_mut(i).unwrap().activation_epoch = u64::MAX;
+                }
+                assert!(reverted == before, "capped step touched more than activation_epoch");
+                // (b) subset of today's admissions.
+                assert!(n_on.iter().all(|i| n_off.contains(i)), "{n_on:?} vs {n_off:?}");
+                withheld_somewhere |= n_on.len() < n_off.len();
+                admitted_somewhere |= !n_on.is_empty();
+                // (c) existing active weight is never reduced.
+                let (w_before, w_on, w_off) =
+                    (weights(&before, next), weights(&on, next), weights(&off, next));
+                let existing: Vec<u32> = w_before.keys().copied().collect();
+                for i in &existing {
+                    assert!(w_on[i] >= w_before[i], "validator {i} lost weight");
+                    assert!(w_on[i] >= w_off[i], "validator {i} below today's rule");
+                }
+                let share = |w: &std::collections::BTreeMap<u32, u128>| -> (u128, u128) {
+                    (existing.iter().map(|i| w[i]).sum(), w.values().sum())
+                };
+                let ((e_on, t_on), (e_off, t_off)) = (share(&w_on), share(&w_off));
+                assert!(e_on * t_off >= e_off * t_on, "existing share diluted beyond today");
+            }
+            let atts = if slot % SLOTS_PER_EPOCH == SLOTS_PER_EPOCH - 1 {
+                full_epoch_attestations(&state, target)
+            } else { Vec::new() };
+            let b = build_block(&t, &state, slot, &atts, &[], &mut chains);
+            state = t.apply_block(&state, &b, &atts, &[]).unwrap();
+            if slot % SLOTS_PER_EPOCH == 0 { target = *state.head.as_bytes(); }
+        }
+        assert!(admitted_somewhere, "scenario never admitted under the cap");
+        assert!(withheld_somewhere, "scenario never exercised the cap");
+    });
+}
+
+/// HF2 onboarding check at the live weight (epoch 6090, 2026-10-20:
+/// 204.66M BLCH): `validator-join` deposits the 25,000 BLCH minimum, and a
+/// full window of churn-limited minimum bonds (4 x 24 = 96) is admitted
+/// whole. A bond at the 1% deposit ceiling always fits an empty window. The
+/// cap starts to throttle minimum joins only below 96 x 25,000 x 64 BLCH.
+#[test]
+fn growth_cap_does_not_delay_minimum_bond_onboarding_at_live_weight() {
+    let w = 204_660_000 * staking::SAT_PER_BLOCH;
+    let budget = staking::growth_budget_sat(w);
+    let per_window = staking::MAX_ACTIVATIONS_PER_EPOCH * staking::GROWTH_WINDOW_EPOCHS as usize;
+    assert_eq!(per_window, 96);
+    let mut used = 0u128;
+    for _ in 0..staking::GROWTH_WINDOW_EPOCHS {
+        let batch = [staking::MIN_DEPOSIT_SAT; staking::MAX_ACTIVATIONS_PER_EPOCH];
+        let n = staking::growth_admissions(used, budget, &batch);
+        assert_eq!(n, staking::MAX_ACTIVATIONS_PER_EPOCH, "minimum join delayed");
+        used += batch.iter().sum::<u128>();
+    }
+    let threshold = per_window as u128 * staking::MIN_DEPOSIT_SAT * staking::GROWTH_DIV;
+    assert_eq!(threshold, 153_600_000 * staking::SAT_PER_BLOCH);
+    assert!(w >= threshold);
+    // Largest admissible bond (1% of active stake) fits an empty window alone.
+    assert_eq!(staking::growth_admissions(0, budget, &[w / 100]), 1);
+    // Below the threshold the floor still lets the queue drain.
+    let small = staking::growth_budget_sat(threshold / 2);
+    assert!(small >= staking::MIN_DEPOSIT_SAT);
+    assert_eq!(staking::growth_admissions(0, small, &[staking::MIN_DEPOSIT_SAT; 4]), 4);
 }

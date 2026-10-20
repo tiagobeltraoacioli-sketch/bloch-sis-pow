@@ -38,7 +38,7 @@ impl CommittedState {
             .collect();
         eligible.sort_unstable();
         eligible.truncate(staking::MAX_ACTIVATIONS_PER_EPOCH);
-        if crate::params::native_growth_cap_active(next_epoch) && !eligible.is_empty() {
+        if crate::params::hf2_growth_cap_active(next_epoch) && !eligible.is_empty() {
             // Weight of the closing epoch, as finality counts it (after the
             // per-validator and cohort caps, before the leak).
             let w: u128 = self

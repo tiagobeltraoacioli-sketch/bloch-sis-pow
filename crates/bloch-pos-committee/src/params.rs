@@ -2472,24 +2472,43 @@ pub(crate) mod activation_queue_v2_rehearsal {
 /// [`crate::staking::GROWTH_WINDOW_EPOCHS`] window is bounded by
 /// [`crate::staking::growth_budget_sat`] (`max(W/64, MIN_DEPOSIT)`), FIFO,
 /// with the head always admitted into an empty window so the queue drains.
-/// Capturing 2/3 from honest weight `W` then needs at least
-/// `71 x 24` epochs (about 19 days), the ObenBlock bound.
+/// Capturing 2/3 from honest weight `W` through own stake alone then needs
+/// at least `71 x 24` epochs (about 19 days), the ObenBlock bound.
+///
+/// Scope, stated plainly: this bounds OWN stake only. Funded delegation
+/// (live since [`FUNDED_DELEGATION_ACTIVATION_EPOCH`]) warms up under its own
+/// budget, `max(25 bps of active DELEGATED stake, 500,000 BLCH)` per epoch
+/// (`delegation::Registry::resolve`), and one active validator accepts up to
+/// 500M BLCH of it, more than 2x today's whole weight. So once this gate is
+/// armed the delegation path, untouched here, is the binding one: about 5 to
+/// 7.6 days to 2/3 at the epoch-6090 weight (204.66M BLCH), 4 to 6 days with
+/// both paths combined. The cap removes the hours-scale own-stake path; it
+/// does not by itself deliver the ~19-day figure.
+///
+/// Onboarding: the `validator-join` wizard deposits the 25,000 BLCH minimum.
+/// The churn limit admits at most `4 x 24 = 96` activations per window, i.e.
+/// 2.4M BLCH of minimum bonds, below the budget whenever `W >= 153.6M` BLCH,
+/// so at today's weight minimum-bond joins are never delayed by this cap. A
+/// bond up to the 1% deposit ceiling always fits an empty window (1% < 1/64).
+/// The cap only ever delays a pending activation; it never touches a
+/// validator that is already active (see the tests in
+/// `transition::funded::tests`).
 ///
 /// This changes which epoch a queued validator activates, a committed field,
 /// so it needs historical replay and a coordinated epoch.
-/// `native_growth_cap_gate_is_inert` pins the inert value.
-pub const NATIVE_GROWTH_CAP_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// `hf2_growth_cap_gate_is_inert` pins the inert value.
+pub const HF2_GROWTH_CAP_EPOCH: u64 = u64::MAX;
 
-pub(crate) fn native_growth_cap_active(epoch: u64) -> bool {
+pub(crate) fn hf2_growth_cap_active(epoch: u64) -> bool {
     #[cfg(test)]
-    if native_growth_cap_rehearsal::enabled() {
+    if hf2_growth_cap_rehearsal::enabled() {
         return true;
     }
-    epoch_gate_active(epoch, NATIVE_GROWTH_CAP_ACTIVATION_EPOCH)
+    epoch_gate_active(epoch, HF2_GROWTH_CAP_EPOCH)
 }
 
 #[cfg(test)]
-pub(crate) mod native_growth_cap_rehearsal {
+pub(crate) mod hf2_growth_cap_rehearsal {
     use std::cell::Cell;
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
     pub fn enabled() -> bool { ENABLED.with(Cell::get) }
@@ -2497,6 +2516,12 @@ pub(crate) mod native_growth_cap_rehearsal {
         struct Restore(bool);
         impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
         Restore(ENABLED.with(|v| v.replace(true)))
+    }
+    /// Force the gate shut inside an open rehearsal (restores on drop).
+    pub fn closed() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(false)))
     }
 }
 
