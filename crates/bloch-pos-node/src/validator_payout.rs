@@ -355,7 +355,7 @@ fn sign(args: &[String]) -> Result<(), String> {
         return Err("keystore does not own this payout".into());
     }
     if let PosTransaction::TransferV2 { keys, .. } = &mut tx {
-        keys[0].signature = signer.sign(&root);
+        keys[0].signature = signer.sign_fitting(&root, ADMISSION_PQ_SIGNATURE_MAX)?;
     }
     inspect(&tx, &o)?;
     write_tx(out, &tx)

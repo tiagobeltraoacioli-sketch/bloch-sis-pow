@@ -170,6 +170,10 @@ fn sealed_offline_roles_prepare_sign_inspect_and_refuse_overwrite() {
     let PosTransaction::FundedDeposit(tx) = complete else {
         panic!("wrong transaction kind")
     };
+    // Both roles sign through `sign_fitting`: within the admission bound.
+    let bound = bloch_pos_committee::transition::funded::ADMISSION_PQ_SIGNATURE_MAX;
+    assert!(tx.funding_signature.len() <= bound);
+    assert!(tx.proof_of_possession.len() <= bound);
     assert!(bloch_crypto::crypto::verify(
         &tx.funding_pubkey,
         &tx.funding_root(),

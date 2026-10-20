@@ -185,6 +185,13 @@ fn sealed_payout_round_trip_matches_consensus_wire_and_fee_rules() {
         &tx.checked_signing_root(5000),
         &keys[0].signature
     ));
+    // The payout reserves ADMISSION_PQ_SIGNATURE_MAX bytes and signs through
+    // `sign_fitting`, so the declared size always covers the encoding.
+    assert!(
+        keys[0].signature.len()
+            <= bloch_pos_committee::transition::funded::ADMISSION_PQ_SIGNATURE_MAX
+    );
+    assert!(*tx_bytes >= tx.canonical_bytes().len() as u64);
     let charge = fee_market::charge(
         TxClass::Eutxo { inputs: 1 },
         *tx_bytes,

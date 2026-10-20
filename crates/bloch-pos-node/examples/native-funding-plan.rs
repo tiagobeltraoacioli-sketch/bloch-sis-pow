@@ -168,7 +168,7 @@ where
     if key.public_key != raw {
         return Err("Wallet public key does not match the legacy funding key".into());
     }
-    let signature = key.sign(&root)?;
+    let signature = key.sign_fitting(&root, ADMISSION_PQ_SIGNATURE_MAX)?;
     if signature.len() > ADMISSION_PQ_SIGNATURE_MAX
         || !verify_native_funding_signature(raw, &p.native_key, &root, &signature)
     {

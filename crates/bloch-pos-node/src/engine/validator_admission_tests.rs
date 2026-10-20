@@ -9,8 +9,10 @@ use bloch_pos_committee::{
 
 fn authorize(tx: &mut FundedDeposit, funding: &Keystore, joining: &Keystore) {
     tx.tx_bytes = tx.reserved_tx_bytes();
-    tx.funding_signature = funding.sign(&tx.funding_root());
-    tx.proof_of_possession = joining.sign(&tx.possession_root());
+    tx.funding_signature =
+        funding.sign_fitting(&tx.funding_root(), ADMISSION_PQ_SIGNATURE_MAX).unwrap();
+    tx.proof_of_possession =
+        joining.sign_fitting(&tx.possession_root(), ADMISSION_PQ_SIGNATURE_MAX).unwrap();
 }
 
 

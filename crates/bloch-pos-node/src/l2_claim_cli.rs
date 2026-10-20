@@ -223,7 +223,11 @@ fn attest(args: &[String]) -> Result<(), String> {
     let pubkey = keys.get(usize::from(index)).ok_or("--signer-index is outside the set")?;
     let digest = withdrawal::attestation_digest(&domain(get(&o, "--genesis")?)?, proof.chain_id, &proof.root);
     let sk = zeroize::Zeroizing::new(codec::unhex(read_text(get(&o, "--key")?)?.trim())?);
-    let signature = bloch_crypto::crypto::sign(&sk, &digest).map_err(|e| format!("signing failed: {e:?}"))?;
+    // Each attestor signature is bounded by ADMISSION_PQ_SIGNATURE_MAX inside
+    // the claim; re-sign until it fits rather than hand the aggregator an
+    // oversized (still valid) Falcon draw that consensus would refuse.
+    let signature = bloch_crypto::crypto::sign_fitting(&sk, &digest, ADMISSION_PQ_SIGNATURE_MAX)
+        .map_err(|e| format!("signing failed: {e:?}"))?;
     if !HybridVerifier::new().verify_with_key(pubkey, &digest, &signature) {
         return Err("signature does not verify under the set's key at --signer-index; wrong key or index".into());
     }
@@ -275,6 +279,13 @@ fn prepare(args: &[String]) -> Result<(), String> {
                 let (index, signed, signature) = read_partial(partial)?;
                 if signed != digest {
                     return Err(format!("{partial}: signed another root or network"));
+                }
+                if signature.len() > ADMISSION_PQ_SIGNATURE_MAX {
+                    return Err(format!(
+                        "{partial}: attestor signature is {} bytes, above the {ADMISSION_PQ_SIGNATURE_MAX}-byte \
+                         claim bound; ask attestor {index} to re-run `l2-claim attest`, which re-signs until it fits",
+                        signature.len()
+                    ));
                 }
                 signatures.push((index, signature));
             }
@@ -354,7 +365,7 @@ fn sign(args: &[String]) -> Result<(), String> {
         return Err("keystore does not own the funding key".into());
     }
     inspect(&tx);
-    tx.signature = keys.sign(&tx.intent_root());
+    tx.signature = keys.sign_fitting(&tx.intent_root(), ADMISSION_PQ_SIGNATURE_MAX)?;
     if !bloch_crypto::crypto::verify(&tx.funding_pubkey, &tx.intent_root(), &tx.signature) {
         return Err("produced signature does not verify".into());
     }
@@ -421,7 +432,9 @@ mod tests {
         assert!(keys.iter().all(|k| k.len() == ADMISSION_PQ_KEY_BYTES), "ws-keygen keys fit the claim");
         let domain = [0x91; 32];
         let digest = withdrawal::attestation_digest(&domain, p.chain_id, &p.root);
-        let sign = |i: usize| (i as u8, bloch_crypto::crypto::sign(&pairs[i].1, &digest).unwrap());
+        let sign = |i: usize| {
+            (i as u8, bloch_crypto::crypto::sign_fitting(&pairs[i].1, &digest, ADMISSION_PQ_SIGNATURE_MAX).unwrap())
+        };
         let mut a = Attestation { threshold: 2, keys: keys.clone(), signatures: vec![sign(0), sign(2)] };
         check_set(&a).unwrap();
         assert!(a.verify(&domain, p.chain_id, &p.root, &HybridVerifier::new()));

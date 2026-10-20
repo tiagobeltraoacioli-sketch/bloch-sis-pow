@@ -227,6 +227,18 @@ fn sealed_review_bound_delegation_intents_and_negative_cases() {
             inspect.extend(["--pubkey", path(&pubfile)]);
         }
         assert!(ok(&inspect).contains("\"signed\":true"));
+        let signature_len = match decode(&signed) {
+            PosTransaction::FundedDelegate(t) => t.funding_signature.len(),
+            PosTransaction::FundedUndelegate(t) => t.signature.len(),
+            PosTransaction::FundedDelegationWithdraw(t) => t.signature.len(),
+            PosTransaction::ValidatorCommissionUpdate(t) => t.signature.len(),
+            _ => unreachable!(),
+        };
+        assert!(
+            signature_len > 0
+                && signature_len
+                    <= bloch_pos_committee::transition::funded::ADMISSION_PQ_SIGNATURE_MAX
+        );
         let original = std::fs::read(&signed).unwrap();
         assert!(!sign(&genesis, &owner, &root, &draft, &signed)
             .status

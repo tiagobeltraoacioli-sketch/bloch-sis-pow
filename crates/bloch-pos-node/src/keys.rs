@@ -951,6 +951,17 @@ impl Keystore {
         let allow_unvetted = std::env::var_os(ALLOW_UNVETTED_PLATFORM_ENV).is_some_and(|v| v == "1");
         signer_self_test_with(&self.secret, &self.pubkey, allow_unvetted)
     }
+
+    /// Sign a 32-byte signing root for a field whose consensus length bound
+    /// (`max_len`) is below the maximum hybrid signature length — e.g.
+    /// `funded::ADMISSION_PQ_SIGNATURE_MAX`. Falcon-1024 signatures are
+    /// variable length, so this re-signs with fresh randomness until the
+    /// encoding fits ([`bloch_crypto::crypto::sign_fitting`]). An `Err` means
+    /// no attempt fit within the retry budget; nothing is emitted then.
+    pub fn sign_fitting(&self, signing_root: &[u8; 32], max_len: usize) -> Result<Vec<u8>, String> {
+        bloch_crypto::crypto::sign_fitting(&self.secret, signing_root, max_len)
+            .map_err(|e| format!("signing failed: {e}"))
+    }
 }
 
 /// Signing attempts before [`Keystore::sign`] gives up and aborts.
@@ -1978,6 +1989,23 @@ mod tests {
 
     /// A sealed keystore round-trips, and the reloaded key really is the same
     /// key — proved by a signature that verifies under the public half.
+    #[test]
+    fn sign_fitting_stays_within_the_admission_bound_and_verifies() {
+        use bloch_pos_committee::transition::funded::ADMISSION_PQ_SIGNATURE_MAX;
+        let dir = tmp_dir("sign-fitting");
+        let ks = Keystore::generate_with(&dir, 0, &Unlock::PlaintextOptIn).expect("gen");
+        for i in 0u8..32 {
+            let root = [i; 32];
+            let sig = ks.sign_fitting(&root, ADMISSION_PQ_SIGNATURE_MAX).expect("fits");
+            assert!(sig.len() <= ADMISSION_PQ_SIGNATURE_MAX, "{} bytes", sig.len());
+            assert!(HybridVerifier::new().verify_with_key(&ks.pubkey, &root, &sig));
+        }
+        let unreachable = bloch_crypto::crypto::SUITE_HEADER_LEN + bloch_crypto::crypto::MLDSA_SIG_LEN;
+        let err = ks.sign_fitting(&[0; 32], unreachable).unwrap_err();
+        assert!(err.contains("attempts"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_sealed_keystore_round_trips_and_still_signs() {
         let dir = tmp_dir("roundtrip");

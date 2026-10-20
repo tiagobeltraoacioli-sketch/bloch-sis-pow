@@ -217,7 +217,7 @@ fn sign(args: &[String]) -> Result<(), String> {
         return Err("keystore does not own the funding key".into());
     }
     inspect(&tx);
-    tx.signature = keys.sign(&tx.intent_root());
+    tx.signature = keys.sign_fitting(&tx.intent_root(), ADMISSION_PQ_SIGNATURE_MAX)?;
     if !bloch_crypto::crypto::verify(&tx.funding_pubkey, &tx.intent_root(), &tx.signature) {
         return Err("produced signature does not verify".into());
     }

@@ -8,7 +8,7 @@ use crate::{
 };
 use bloch_pos_committee::attestation::SignatureVerifier;
 use bloch_pos_committee::transition::{
-    FundedDelegate, FundedDelegationWithdraw, FundedUndelegate, FundingInput, PosTransaction,
+    funded, FundedDelegate, FundedDelegationWithdraw, FundedUndelegate, FundingInput, PosTransaction,
     TransferOutput, ValidatorCommissionUpdate,
 };
 use sha3::{Digest, Sha3_256};
@@ -393,7 +393,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             let keys=Keystore::load(Path::new(a.get("--dir")?)).map_err(|e|e.to_string())?;
             let expected=match &tx {PosTransaction::FundedDelegate(t)=>Some(&t.funding_pubkey),PosTransaction::FundedUndelegate(t)=>Some(&t.funding_pubkey),PosTransaction::FundedDelegationWithdraw(t)=>Some(&t.funding_pubkey),_=>None};
             if expected.is_some_and(|key|key!=&keys.pubkey){return Err("keystore is not the intent owner".into());}
-            let signed=keys.sign(&root);
+            let signed=keys.sign_fitting(&root,funded::ADMISSION_PQ_SIGNATURE_MAX)?;
             match &mut tx {PosTransaction::FundedDelegate(t)=>t.funding_signature=signed,PosTransaction::FundedUndelegate(t)=>t.signature=signed,PosTransaction::FundedDelegationWithdraw(t)=>t.signature=signed,PosTransaction::ValidatorCommissionUpdate(t)=>t.signature=signed,_=>unreachable!()}
             let info=inspect(&tx,Some(&keys.pubkey))?;write_tx(a.get("--out")?,&tx)?;println!("{}", info.to_string());Ok(())
         },
