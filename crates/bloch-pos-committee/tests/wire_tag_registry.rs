@@ -1185,3 +1185,40 @@ fn l2_transaction_tags_do_not_overlap_the_mainnet_tag_set() {
         assert_ne!(decoded, Err(TxDecodeError::UnknownTag(old)), "{old:#04x} is a mainnet tag here");
     }
 }
+
+// ===========================================================================
+//          HF3 ALLOCATION 2026-10-20 (src/wire_alloc.rs) — RESERVED BYTES
+// ===========================================================================
+
+/// The HF3 table reserves `0x17`–`0x1B` (KesRegister, the PQ trio,
+/// KesRotate). None is in this file's frozen table, and none may decode on a
+/// tree that has not merged its owning line. Each line's merge moves its
+/// bytes from this list into `TX_TAGS`.
+const HF3_RESERVED_NOT_IN_TREE: &[u8] = &[0x17, 0x18, 0x19, 0x1A, 0x1B];
+
+#[test]
+fn hf3_reserved_tx_tags_are_unknown_until_their_line_lands() {
+    use bloch_pos_committee::wire_alloc::{tx, TX_TABLE};
+    assert_eq!(
+        HF3_RESERVED_NOT_IN_TREE.iter().chain([&tx::NEXT_FREE]).count(),
+        6,
+        "update this list when an HF3 line lands"
+    );
+    for tag in HF3_RESERVED_NOT_IN_TREE {
+        assert!(TX_TAGS.iter().all(|(t, _)| t != tag), "{tag:#04x} is in the frozen table");
+        assert!(TX_TABLE.iter().any(|r| r.tag == *tag), "{tag:#04x} is not allocated in wire_alloc");
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&[*tag]),
+            Err(TxDecodeError::UnknownTag(*tag)),
+            "{tag:#04x} must not decode before its line lands"
+        );
+    }
+    // Every byte in the frozen table appears in the allocation table.
+    for (tag, _) in TX_TAGS {
+        assert!(TX_TABLE.iter().any(|r| r.tag == *tag), "{tag:#04x} missing from wire_alloc");
+    }
+    assert_eq!(
+        PosTransaction::from_canonical_bytes(&[tx::NEXT_FREE]),
+        Err(TxDecodeError::UnknownTag(tx::NEXT_FREE))
+    );
+}
