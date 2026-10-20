@@ -183,6 +183,34 @@ restored-backup or second-host case after the doppelganger window closed.
 `--no-signer-anchor` / `BLOCH_NO_SIGNER_ANCHOR=1` disables the anchor (logged
 loudly). The existing 64-slot doppelganger wait is unchanged.
 
+#### Anchor root under hardened systemd units
+
+The default root `$HOME/.bloch-signer` is best effort. Units with
+`ProtectHome=yes|read-only`, `ProtectSystem=strict` whose `ReadWritePaths=`
+cover only the data dir, or no `HOME` at all, cannot write it. The node then
+logs `SIGNER ANCHOR: UNAVAILABLE (...)` and boots exactly as releases without
+the anchor did (data-dir record and data-dir lock only); it never refuses to
+boot because of the default root. A held key lock, a `SIGNER-RETIRED` marker,
+a corrupt or foreign anchor record and a rolled-back data dir stay fatal.
+(`ProtectHome=tmpfs` gives each unit a private, ephemeral home: the anchor
+then works per boot only and cannot see other units.)
+
+To enable the anchor on such units, use one shared directory per host and
+name it explicitly; an explicit root that cannot be created or locked is a
+boot refusal, not a warning:
+
+```ini
+# /etc/systemd/system/bloch-nNN.service.d/zz-signer-anchor.conf
+[Service]
+Environment=BLOCH_SIGNER_ANCHOR_DIR=/var/lib/bloch-signer
+ReadWritePaths=/var/lib/bloch-signer
+```
+
+Create it once (`install -d -m 0700 -o <service user> /var/lib/bloch-signer`)
+and give every unit of that host the same value, so the per-key lock spans
+all of them. Pass the same `--signer-anchor-dir` to the offline
+`slashing-protection` commands.
+
 ### Planned migration, old host A → new host B (toolkit order)
 
 1. On A: stop the node and confirm the process exited.

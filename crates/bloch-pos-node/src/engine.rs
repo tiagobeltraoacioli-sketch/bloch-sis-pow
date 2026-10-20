@@ -2537,6 +2537,12 @@ impl Engine {
     /// can conflict with it; and when the sighting is live network evidence,
     /// duties stop until an operator restarts the node.
     fn note_own_signature(&mut self, index: u32, seen: crate::slashprot::Published, live_evidence: bool) {
+        // Cheap pre-filter: skip the registry probe for every other validator.
+        match self.keys.as_ref() {
+            None => return,
+            Some(k) if k.index != crate::keys::AUTO_VALIDATOR_INDEX && k.index != index => return,
+            Some(_) => {}
+        }
         let Some(my_index) = self.duty_index(&self.state) else { return };
         if index != my_index || !self.slashprot.is_uncovered(seen) {
             return;
@@ -5979,17 +5985,42 @@ fn attach_signer_anchor(
         anchor::ENV_ACCEPT_ROLLBACK,
         std::env::var_os(anchor::ENV_ACCEPT_ROLLBACK),
     )?;
-    let root = anchor::default_root().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "no signer anchor directory: set --signer-anchor-dir / {} (or HOME), or \
-                 disable it explicitly with --no-signer-anchor",
-                anchor::ENV_DIR
-            ),
-        )
-    })?;
-    let held = anchor::SignerAnchor::acquire(&root, &binding)?;
+    let unavailable = |why: String| {
+        eprintln!(
+            "SIGNER ANCHOR: UNAVAILABLE ({why}). Booting WITHOUT the host signer anchor \
+             (data-dir record and data-dir lock only, as before the anchor existed). To \
+             enable it, pass --signer-anchor-dir <dir> (or {}) naming a directory this \
+             service can write, e.g. one listed in the unit's ReadWritePaths=.",
+            anchor::ENV_DIR
+        );
+    };
+    let held = match anchor::resolve_root() {
+        Some(anchor::RootSource::Explicit(root)) => {
+            anchor::SignerAnchor::acquire(&root, &binding).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("signer anchor dir {} (--signer-anchor-dir / {}): {e}", root.display(), anchor::ENV_DIR),
+                )
+            })?
+        }
+        Some(anchor::RootSource::Default(root)) => {
+            match anchor::SignerAnchor::acquire_default(&root, &binding)? {
+                Some(held) => held,
+                None => {
+                    unavailable(format!(
+                        "default {} is not writable from this process: sandboxed home \
+                         (ProtectHome=/ProtectSystem=strict) or missing home",
+                        root.display()
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+        None => {
+            unavailable("HOME is unset and no --signer-anchor-dir was given".into());
+            return Ok(());
+        }
+    };
     let dir = held.dir().to_path_buf();
     let check = protection.attach_anchor(held, accept_rollback)?;
     println!("SIGNER ANCHOR: {} ({check:?}); signer lock held", dir.display());

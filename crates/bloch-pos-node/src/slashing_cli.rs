@@ -66,11 +66,32 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     // retire marks it. Taking its lock also proves no node of this key runs.
     let anchor_root = options
         .get("--signer-anchor-dir")
-        .map(|value| std::path::PathBuf::from(*value))
-        .or_else(signer_anchor::default_root);
+        .map(|value| signer_anchor::RootSource::Explicit(std::path::PathBuf::from(*value)))
+        .or_else(signer_anchor::resolve_root);
     let held_anchor = match &anchor_root {
-        Some(root) if signer_anchor::key_dir(root, &binding).is_dir() || action == "retire" => {
-            Some(signer_anchor::SignerAnchor::acquire_for_tool(root, &binding).map_err(|e| e.to_string())?)
+        Some(source)
+            if signer_anchor::key_dir(source.path(), &binding).is_dir() || action == "retire" =>
+        {
+            match signer_anchor::SignerAnchor::acquire_for_tool(source.path(), &binding) {
+                Ok(anchor) => Some(anchor),
+                // A default root this user cannot write (and that holds no
+                // anchor for the key) is not an error for `retire`: the data
+                // dir marker is still written below.
+                Err(e)
+                    if matches!(source, signer_anchor::RootSource::Default(_))
+                        && e.kind() != std::io::ErrorKind::AddrInUse
+                        && signer_anchor::is_unreachable_root_error(&e)
+                        && !signer_anchor::key_dir(source.path(), &binding).is_dir() =>
+                {
+                    eprintln!(
+                        "Signer anchor {} is not writable here; skipping it. Pass \
+                         --signer-anchor-dir if this host's nodes use another anchor root.",
+                        source.path().display()
+                    );
+                    None
+                }
+                Err(e) => return Err(e.to_string()),
+            }
         }
         _ => None,
     };

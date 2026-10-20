@@ -1399,6 +1399,46 @@ mod tests {
         assert!(crate::signer_anchor::SignerAnchor::acquire_for_tool(&root.0, &KEY_A).is_ok());
     }
 
+    /// Sandboxed default root (systemd `ProtectHome=` / `ProtectSystem=strict`
+    /// turn `$HOME` read-only or invisible): the DEFAULT anchor degrades to
+    /// "unavailable" instead of refusing boot; the explicit path stays strict.
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_default_root_degrades_but_explicit_root_is_strict() {
+        use crate::signer_anchor::{is_unreachable_root_error, SignerAnchor};
+        use std::os::unix::fs::PermissionsExt;
+        let home = dir("sandbox-home");
+        fs::create_dir_all(&home.0).unwrap();
+        fs::set_permissions(&home.0, fs::Permissions::from_mode(0o500)).unwrap();
+        let root = home.0.join(".bloch-signer");
+        // Running as root ignores mode bits; nothing to simulate then.
+        if fs::create_dir(&root).is_ok() {
+            fs::set_permissions(&home.0, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        assert!(matches!(SignerAnchor::acquire_default(&root, &KEY_A), Ok(None)));
+        let err = SignerAnchor::acquire(&root, &KEY_A).expect_err("explicit root must be strict");
+        assert!(is_unreachable_root_error(&err), "{err}");
+        // A missing parent (ProtectHome=true hides /home entirely) also degrades.
+        let hidden = home.0.join("absent").join(".bloch-signer");
+        assert!(matches!(SignerAnchor::acquire_default(&hidden, &KEY_A), Ok(None)));
+        fs::set_permissions(&home.0, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// The degraded path never swallows a held key lock or a retirement.
+    #[test]
+    fn default_root_still_refuses_a_second_signer_and_a_retired_key() {
+        use crate::signer_anchor::SignerAnchor;
+        let root = dir("default-root");
+        let first = SignerAnchor::acquire_default(&root.0, &KEY_A).unwrap().expect("writable root");
+        let err = SignerAnchor::acquire_default(&root.0, &KEY_A).expect_err("second signer");
+        assert!(err.to_string().contains("SECOND SIGNER REFUSED"), "{err}");
+        drop(first);
+        crate::signer_anchor::write_retired(&crate::signer_anchor::key_dir(&root.0, &KEY_A), "moved").unwrap();
+        let err = SignerAnchor::acquire_default(&root.0, &KEY_A).expect_err("retired");
+        assert!(err.to_string().contains("RETIRED"), "{err}");
+    }
+
     /// Runtime rollback guard: a published signature of this key beyond the
     /// record is detected and the record is raised so no later duty conflicts.
     #[test]

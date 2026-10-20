@@ -402,7 +402,9 @@ fn print_help() {
                              [--accept-signing-rollback]\n\
                Signer anchor (default $HOME/.bloch-signer): one lock per\n\
                validator key on this host, and a refusal to sign from a data\n\
-               dir older than the key's last signature.\n\
+               dir older than the key's last signature. An unwritable\n\
+               default (systemd ProtectHome=, missing HOME) only warns;\n\
+               an explicit --signer-anchor-dir must be usable.\n\
            bloch-pos watch-equivocation --rpc HOST:PORT [--rpc ...] --state FILE --out EVIDENCE.jsonl\n\
                [--from-slot N] [--to-slot N] [--window-epochs 256]   (read-only double/surround vote detector)\n\
            bloch-pos ws-keygen --out <prefix>\n\

@@ -25,7 +25,19 @@
 //! `SIGNER-RETIRED` (written by `slashing-protection retire` after a migration
 //! export) makes the anchor refuse every later boot of this key on this host.
 //!
-//! Defaults: root = `$BLOCH_SIGNER_ANCHOR_DIR`, else `$HOME/.bloch-signer`.
+//! Root resolution:
+//!
+//! - `--signer-anchor-dir` / `$BLOCH_SIGNER_ANCHOR_DIR` (explicit): strict.
+//!   If it cannot be created or locked the node refuses to boot.
+//! - otherwise `$HOME/.bloch-signer` (default): best effort. Hardened systemd
+//!   units (`ProtectHome=`, `ProtectSystem=strict` with `ReadWritePaths=`
+//!   limited to the data dir) make `$HOME` read-only or invisible, and some
+//!   units run without `HOME` at all. In those cases the default anchor is
+//!   reported UNAVAILABLE, loudly, and the node boots exactly as it did
+//!   before the anchor existed (data-dir record + data-dir lock only).
+//!   A held lock (second signer), a retirement marker, a corrupt or foreign
+//!   record, or a rolled-back data dir stay fatal in both modes.
+//!
 //! `BLOCH_NO_SIGNER_ANCHOR=1` (`--no-signer-anchor`) disables it, loudly.
 
 use std::fs;
@@ -40,14 +52,55 @@ pub const ENV_ACCEPT_ROLLBACK: &str = "BLOCH_ACCEPT_SIGNING_ROLLBACK";
 pub const RECORD_FILE: &str = "signing_record.bin";
 pub const RETIRED_FILE: &str = "SIGNER-RETIRED";
 
+/// Directory name of the default anchor root under `$HOME`.
+pub const DEFAULT_DIR_NAME: &str = ".bloch-signer";
+
+/// Where the anchor root came from; decides how an unusable root is handled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RootSource {
+    /// `--signer-anchor-dir` / `$BLOCH_SIGNER_ANCHOR_DIR`: failures are fatal.
+    Explicit(PathBuf),
+    /// `$HOME/.bloch-signer`: a sandboxed or missing home degrades loudly.
+    Default(PathBuf),
+}
+
+impl RootSource {
+    pub fn path(&self) -> &Path {
+        match self {
+            RootSource::Explicit(p) | RootSource::Default(p) => p,
+        }
+    }
+}
+
+/// The explicitly configured anchor root, if any.
+pub fn explicit_root() -> Option<PathBuf> {
+    std::env::var_os(ENV_DIR).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
 /// The anchor root this process would use, or `None` when none can be named.
-pub fn default_root() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os(ENV_DIR).filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(dir));
+pub fn resolve_root() -> Option<RootSource> {
+    if let Some(dir) = explicit_root() {
+        return Some(RootSource::Explicit(dir));
     }
     std::env::var_os("HOME")
         .filter(|v| !v.is_empty())
-        .map(|home| PathBuf::from(home).join(".bloch-signer"))
+        .map(|home| RootSource::Default(PathBuf::from(home).join(DEFAULT_DIR_NAME)))
+}
+
+/// The anchor root path this process would use (explicit or default).
+pub fn default_root() -> Option<PathBuf> {
+    resolve_root().map(|r| r.path().to_path_buf())
+}
+
+/// True for the errors a service sandbox produces on a path outside its
+/// writable set (`ProtectHome=`, `ProtectSystem=strict`, a missing or
+/// foreign-owned home): read-only file system, permission denied, missing
+/// parent. Never true for a held lock (`AddrInUse`) or bad data.
+pub fn is_unreachable_root_error(e: &io::Error) -> bool {
+    const EROFS: i32 = 30; // identical on Linux and the BSDs/macOS
+    matches!(e.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound)
+        || e.raw_os_error() == Some(EROFS)
+        || e.kind() == io::ErrorKind::ReadOnlyFilesystem
 }
 
 /// Per-key directory under `root`.
@@ -99,6 +152,29 @@ impl std::fmt::Debug for SignerAnchor {
 impl SignerAnchor {
     /// Create `<root>/<key>` (0700) and take its exclusive lock, or refuse.
     pub fn acquire(root: &Path, binding: &Binding) -> io::Result<SignerAnchor> {
+        let anchor = Self::lock_only(root, binding)?;
+        check_not_retired(&[&anchor.dir])?;
+        Ok(anchor)
+    }
+
+    /// [`Self::acquire`] for the DEFAULT root (`$HOME/.bloch-signer`):
+    /// `Ok(None)` when the root is unreachable from this process (service
+    /// sandbox, missing or foreign home; see [`is_unreachable_root_error`]),
+    /// so the node can boot without the anchor. Every other failure (a held
+    /// key lock, a retirement marker) is returned unchanged.
+    pub fn acquire_default(root: &Path, binding: &Binding) -> io::Result<Option<SignerAnchor>> {
+        let anchor = match Self::lock_only(root, binding) {
+            Ok(anchor) => anchor,
+            Err(e) if e.kind() != io::ErrorKind::AddrInUse && is_unreachable_root_error(&e) => {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
+        };
+        check_not_retired(&[&anchor.dir])?;
+        Ok(Some(anchor))
+    }
+
+    fn lock_only(root: &Path, binding: &Binding) -> io::Result<SignerAnchor> {
         let dir = key_dir(root, binding);
         create_private_dir(&dir)?;
         let lock = crate::store::DirLock::acquire(&dir).map_err(|e| {
@@ -118,7 +194,6 @@ impl SignerAnchor {
                 e
             }
         })?;
-        check_not_retired(&[&dir])?;
         Ok(SignerAnchor { dir, _lock: lock })
     }
 
