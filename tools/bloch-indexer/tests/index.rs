@@ -544,9 +544,14 @@ fn legacy_read_routes_refuse_stale_or_failed_sync() {
         assert_eq!(bloch_indexer::api::route(path, "", &shared).0, 200);
     }
     shared.write().unwrap().sync_error = Some("synthetic log failure".into());
-    for path in ["/status", "/supply", "/blocks", balance.as_str()] {
+    for path in ["/supply", "/blocks", balance.as_str()] {
         assert_eq!(bloch_indexer::api::route(path, "", &shared).0, 503);
     }
+    // /status stays readable so an operator can see WHY data is refused.
+    let (code, body) = bloch_indexer::api::route("/status", "", &shared);
+    assert_eq!(code, 200);
+    let body = body.to_string();
+    assert!(body.contains("\"serving\":false") && body.contains("synthetic log failure"), "{body}");
     {
         let mut ix = shared.write().unwrap();
         ix.sync_error = None;
@@ -643,4 +648,68 @@ fn holder_route_rejects_stale_or_failed_index_snapshots() {
         snapshot.checked_at = Instant::now() - Duration::from_secs(31);
     }
     assert_eq!(bloch_indexer::api::route("/holders", "limit=64", &index).0, 503);
+}
+
+
+// ── Flag days ───────────────────────────────────────────────────────────────
+
+/// A block this build cannot apply (here: a transaction tag the linked
+/// consensus crate does not know, the shape of a flag day the binary
+/// predates) halts the index at the block before it. Everything applied
+/// stays; the halt names the block; the read API refuses data but /status and
+/// /consensus explain. When the log no longer carries that block (reorg), the
+/// next sync clears the halt.
+#[test]
+fn a_block_this_build_cannot_apply_halts_at_the_previous_height_and_says_why() {
+    let d = tmpdir("halt");
+    let p = d.join("blocks.log");
+    let alice = h32(0xA1);
+    let bob = h32(0xB0);
+    let coin = ([7u8; 32], 0u32);
+    let genesis_id = h32(0x00);
+    let opening = vec![(
+        OutPoint { txid: coin.0, vout: coin.1 },
+        Utxo { value_sat: 1_000_000, script_hash: alice, created_height: 0 },
+    )];
+
+    let b1 = envelope(header(1, genesis_id, 0, 1), vec![transfer(vec![coin], vec![(990_000, bob)])], vec![]);
+    let b1_id = *BlockId::of(&b1.header).as_bytes();
+    // Slot 40 is epoch 1. Tag 0x7F is unknown to every build.
+    let mut b2 = envelope(header(40, b1_id, 1, 2), vec![], vec![]);
+    b2.body.transactions.push(vec![0x7F, 1, 2, 3]);
+    let b2_id = *BlockId::of(&b2.header).as_bytes();
+
+    write_log(&p, &[b1.clone(), b2]);
+    let mut reader = LogReader::open(&p).unwrap();
+    let mut ix = Index::new(genesis_id, opening, 64);
+    let e = ix.sync(&mut reader).unwrap_err();
+    assert_eq!(ix.height(), 1, "the block before the refused one stays applied");
+    assert_eq!(ix.balance_of(&bob), 990_000);
+    let halt = ix.halted.clone().expect("halt recorded");
+    assert_eq!((halt.height, halt.slot, halt.epoch, halt.block_id), (2, 40, 1, b2_id));
+    assert!(halt.reason.contains("transaction decode"), "{}", halt.reason);
+    assert!(e.to_string().contains("Rebuild the indexer"), "{e}");
+
+    // Serving view: data refused, diagnostics explain.
+    ix.sync_error = Some(e.to_string());
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(ix));
+    let balance = format!("/script/{}/balance", bloch_indexer::hex32(&bob));
+    assert_eq!(bloch_indexer::api::route(&balance, "", &shared).0, 503);
+    let (code, status) = bloch_indexer::api::route("/status", "", &shared);
+    assert_eq!(code, 200);
+    let status = status.to_string();
+    assert!(status.contains("\"halt\":{\"height\":2,\"slot\":40,\"epoch\":1"), "{status}");
+    let (code, consensus) = bloch_indexer::api::route("/consensus", "", &shared);
+    assert_eq!(code, 200);
+    assert!(consensus.to_string().contains("L2_SETTLEMENT_ACTIVATION_EPOCH"));
+
+    // The refused block leaves the canonical chain: the next sync converges
+    // and the halt clears.
+    let mut ix = std::sync::Arc::try_unwrap(shared).ok().unwrap().into_inner().unwrap();
+    write_log(&p, &[b1]);
+    reader.reopen().unwrap();
+    ix.sync(&mut reader).unwrap();
+    assert!(ix.halted.is_none());
+    assert_eq!(ix.height(), 1);
+    std::fs::remove_dir_all(d).unwrap();
 }

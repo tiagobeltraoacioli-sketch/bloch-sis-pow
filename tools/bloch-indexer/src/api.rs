@@ -207,10 +207,18 @@ pub fn route(path: &str, query: &str, index: &Shared) -> (u16, Json) {
         Ok(g) => g,
         Err(_) => return (500, err("index lock poisoned")),
     };
+    let seg: Vec<&str> = path.trim_matches('/').split('/').collect();
+    // Diagnostics answer even when the index is not serving data: an
+    // operator (or the gateway) must be able to read WHY it is unavailable,
+    // and which consensus schedule this binary replays with.
+    match seg.as_slice() {
+        ["status"] => return (200, status_json(&ix)),
+        ["consensus"] => return (200, consensus_json(&ix)),
+        _ => {}
+    }
     if ix.sync_error.is_some() || ix.checked_at.elapsed().as_secs() > 30 {
         return (503, err("index synchronization unavailable; retry later"));
     }
-    let seg: Vec<&str> = path.trim_matches('/').split('/').collect();
     if matches!(seg.first(), Some(&"health" | &"utxos" | &"history" | &"transactions" | &"outpoint"))
         || matches!(seg.as_slice(), ["tx", _] | ["block", _, "transactions"]) {
         return crate::explorer::route(path, query, &ix);
@@ -230,8 +238,6 @@ pub fn route(path: &str, query: &str, index: &Shared) -> (u16, Json) {
     }
     match seg.as_slice() {
         [""] | ["health"] => (200, Json::Obj(vec![("ok", Json::Bool(true))])),
-
-        ["status"] => (200, status_json(&ix)),
 
         ["holders"] => {
             if ix.sync_error.is_some() || ix.checked_at.elapsed().as_secs() > 30 {
@@ -578,7 +584,11 @@ fn shape_of(sh: &ScriptHash) -> &'static str {
         "carried (Genesis-3 hash160, zero-extended) — or a native hash that landed here by \
          chance, p = 2^-96"
     } else {
-        "native (SHA3-256 of a hybrid public key)"
+        // Suite-agnostic on purpose: a native script hash is SHA3-256 of a
+        // suite-tagged public key, and the hash does not say which suite
+        // (0x0002 ML-DSA-65 + Falcon-1024 today; 0x0003 SLH-DSA + Falcon-1024
+        // once that suite activates). Only a spend reveals the key.
+        "native (SHA3-256 of a suite-tagged public key; the suite is revealed only by a spend)"
     }
 }
 
@@ -610,9 +620,40 @@ pub fn holders_json(ix: &Index, limit: usize) -> Json {
     ])
 }
 
+/// The consensus schedule this binary replays with (see `consensus.rs`), and
+/// where the chain is relative to it.
+fn consensus_json(ix: &Index) -> Json {
+    use crate::consensus as c;
+    let tip_epoch = ix.tip().epoch;
+    Json::Obj(vec![
+        ("build_commit", Json::s(c::build_commit())),
+        ("gate_digest", Json::hex32(&c::gate_digest())),
+        ("highest_armed_epoch", c::highest_armed_epoch().map(Json::u).unwrap_or(Json::Null)),
+        ("tip_epoch", Json::u(tip_epoch)),
+        ("gates", Json::Arr(c::GATES.iter().map(|g| Json::Obj(vec![
+            ("name", Json::s(g.name)),
+            ("epoch", if g.armed() { Json::u(g.epoch) } else { Json::Null }),
+            ("active_at_tip", Json::Bool(g.armed() && tip_epoch >= g.epoch)),
+        ])).collect())),
+    ])
+}
+
 fn status_json(ix: &Index) -> Json {
     let tip = ix.tip();
+    let serving = ix.sync_error.is_none() && ix.checked_at.elapsed().as_secs() <= 30;
     Json::Obj(vec![
+        ("serving", Json::Bool(serving)),
+        ("sync_error", ix.sync_error.as_deref().map(Json::s).unwrap_or(Json::Null)),
+        ("halt", ix.halted.as_ref().map(|h| Json::Obj(vec![
+            ("height", Json::u(h.height)),
+            ("slot", Json::u(h.slot)),
+            ("epoch", Json::u(h.epoch)),
+            ("block_id", Json::hex32(&h.block_id)),
+            ("reason", Json::s(h.reason.clone())),
+        ])).unwrap_or(Json::Null)),
+        ("ledger_check", Json::Bool(ix.ledger_check)),
+        ("build_commit", Json::s(crate::consensus::build_commit())),
+        ("gate_digest", Json::hex32(&crate::consensus::gate_digest())),
         ("height", Json::u(ix.height())),
         ("tip_slot", Json::u(tip.slot)),
         ("tip_epoch", Json::u(tip.epoch)),
