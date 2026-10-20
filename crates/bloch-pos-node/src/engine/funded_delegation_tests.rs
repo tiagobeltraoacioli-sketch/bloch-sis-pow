@@ -4,7 +4,7 @@
 use super::*;
 use crate::keys::Unlock;
 use bloch_pos_committee::transition::{
-    FundedDelegate, FundedDelegationWithdraw, FundedUndelegate, FundingInput, TransferOutput,
+    funded::ADMISSION_PQ_SIGNATURE_MAX, FundedDelegate, FundedDelegationWithdraw, FundedUndelegate, FundingInput, TransferOutput,
     ValidatorCommissionUpdate,
 };
 
@@ -47,7 +47,7 @@ fn fixture() -> (Engine, perf_support::TestDir, Keystore, FundedDelegate) {
     };
     node.state = StateCell::new(node.manifest.genesis_state());
     tx.network_domain = node.state.admission_network_domain().unwrap();
-    tx.funding_signature = owner.sign(&tx.signing_root());
+    tx.funding_signature = owner.sign_fitting(&tx.signing_root(), ADMISSION_PQ_SIGNATURE_MAX).unwrap();
     (node, dir, owner, tx)
 }
 
@@ -59,7 +59,7 @@ fn commission(node: &Engine, epoch: u64) -> ValidatorCommissionUpdate {
         commission_bps: 500,
         signature: Vec::new(),
     };
-    tx.signature = node.keys.as_ref().unwrap().sign(&tx.signing_root());
+    tx.signature = node.keys.as_ref().unwrap().sign_fitting(&tx.signing_root(), ADMISSION_PQ_SIGNATURE_MAX).unwrap();
     tx
 }
 
@@ -72,7 +72,7 @@ fn undelegate(owner: &Keystore, network_domain: [u8; 32], epoch: u64) -> FundedU
         funding_pubkey: owner.pubkey.clone(),
         signature: Vec::new(),
     };
-    tx.signature = owner.sign(&tx.signing_root());
+    tx.signature = owner.sign_fitting(&tx.signing_root(), ADMISSION_PQ_SIGNATURE_MAX).unwrap();
     tx
 }
 
@@ -87,7 +87,7 @@ fn withdrawal(owner: &Keystore, network_domain: [u8; 32], epoch: u64) -> FundedD
         max_base_fee_millisat_per_gas: 100,
         signature: Vec::new(),
     };
-    tx.signature = owner.sign(&tx.signing_root());
+    tx.signature = owner.sign_fitting(&tx.signing_root(), ADMISSION_PQ_SIGNATURE_MAX).unwrap();
     tx
 }
 
@@ -163,7 +163,7 @@ fn real_hybrid_exit_and_withdrawal_are_owner_and_role_bound() {
     wrong_role.signature = payout.signature;
     assert!(wrong_role.verify_authorization(&verifier).is_err());
     let mut operator = exit.clone();
-    operator.signature = node.keys.as_ref().unwrap().sign(&operator.signing_root());
+    operator.signature = node.keys.as_ref().unwrap().sign_fitting(&operator.signing_root(), ADMISSION_PQ_SIGNATURE_MAX).unwrap();
     assert!(
         operator.verify_authorization(&verifier).is_err(),
         "operator cannot withdraw the owner's principal"
@@ -189,7 +189,7 @@ fn real_hybrid_commission_requires_the_validator_and_binds_rate() {
     let mut raised = tx.clone();
     raised.commission_bps += 1;
     assert!(!verifier.verify_with_key(key, &raised.signing_root(), &raised.signature));
-    assert!(!verifier.verify_with_key(key, &tx.signing_root(), &owner.sign(&tx.signing_root())));
+    assert!(!verifier.verify_with_key(key, &tx.signing_root(), &owner.sign_fitting(&tx.signing_root(), ADMISSION_PQ_SIGNATURE_MAX).unwrap()));
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn real_hybrid_funded_delegation_full_lifecycle() {
     assert_eq!(node.state.delegator_issuance_reward_sat(0), 0);
     let mut repeated = payout;
     repeated.destination_script_hash[0] ^= 1;
-    repeated.signature = owner.sign(&repeated.signing_root());
+    repeated.signature = owner.sign_fitting(&repeated.signing_root(), ADMISSION_PQ_SIGNATURE_MAX).unwrap();
     let repeated = PosTransaction::FundedDelegationWithdraw(repeated);
     {
         let _clock = validator_lifecycle::clock_at(slot + 1);
@@ -360,7 +360,7 @@ fn funded_delegation_admission_refuses_forgery_and_reserves_inputs() {
     forged.funding_signature[14] ^= 1;
     assert!(node.on_transaction(PosTransaction::FundedDelegate(forged)).is_err());
     let mut commission_tx = commission(&node, 0);
-    commission_tx.signature = owner.sign(&commission_tx.signing_root());
+    commission_tx.signature = owner.sign_fitting(&commission_tx.signing_root(), ADMISSION_PQ_SIGNATURE_MAX).unwrap();
     assert!(node.on_transaction(PosTransaction::ValidatorCommissionUpdate(commission_tx)).is_err());
     assert!(node.on_transaction(PosTransaction::FundedUndelegate(undelegate(&owner, tx.network_domain, 0))).is_err());
     assert!(node.on_transaction(PosTransaction::FundedDelegationWithdraw(withdrawal(&owner, tx.network_domain, 0))).is_err());
@@ -369,7 +369,7 @@ fn funded_delegation_admission_refuses_forgery_and_reserves_inputs() {
     node.on_transaction(PosTransaction::FundedDelegate(tx.clone())).unwrap();
     let mut conflicting = tx.clone();
     conflicting.change.script_hash[0] ^= 1;
-    conflicting.funding_signature = owner.sign(&conflicting.signing_root());
+    conflicting.funding_signature = owner.sign_fitting(&conflicting.signing_root(), ADMISSION_PQ_SIGNATURE_MAX).unwrap();
     assert!(node.on_transaction(PosTransaction::FundedDelegate(conflicting)).is_err());
     assert_eq!(node.mempool.len(), 1);
     assert_eq!(root, node.state.state_root());

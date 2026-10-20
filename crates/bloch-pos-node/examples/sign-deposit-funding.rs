@@ -134,7 +134,10 @@ where
     if native != tx.funding_pubkey {
         return Err("Wallet does not own funding authority".into());
     }
-    tx.funding_signature = key.sign(&tx.funding_root())?;
+    tx.funding_signature = key.sign_fitting(
+        &tx.funding_root(),
+        bloch_pos_committee::transition::funded::ADMISSION_PQ_SIGNATURE_MAX,
+    )?;
     check(tx, approved, expected, true)
 }
 fn run() -> Result<(), String> {

@@ -219,6 +219,44 @@ pub fn sign(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoEr
     }
 }
 
+/// Upper bound on fresh signing attempts made by [`sign_fitting`].
+///
+/// Each attempt draws fresh signing randomness, so the attempts are
+/// independent. With the 1,280-byte Falcon budget used by the admission
+/// bounds, the measured per-attempt overflow rate is about 0.1% (50 of
+/// 50,000 samples; see `sign_fitting_falcon_overflow_rate` in the tests), so
+/// 64 attempts fail only if the bound is unreachable for the key's suite.
+pub const SIGN_FITTING_MAX_ATTEMPTS: usize = 64;
+
+/// Sign `message` and return an encoded signature no longer than `max_len`.
+///
+/// Falcon-1024 compact signatures are variable length and randomized, so a
+/// valid hybrid signature can be up to [`max_signature_len`] bytes. Several
+/// transaction fields carry a tighter length bound. This helper re-signs with
+/// fresh randomness until the encoded signature fits, at most
+/// [`SIGN_FITTING_MAX_ATTEMPTS`] times, and returns `SignFailed` otherwise.
+///
+/// The returned bytes are an ordinary output of [`sign`]: verification and
+/// the wire format are unchanged. Only the signer discards oversized draws.
+pub fn sign_fitting(
+    secret_key_bytes: &[u8],
+    message: &[u8],
+    max_len: usize,
+) -> Result<Vec<u8>, CryptoError> {
+    let mut last_len = 0usize;
+    for _ in 0..SIGN_FITTING_MAX_ATTEMPTS {
+        let signature = sign(secret_key_bytes, message)?;
+        if signature.len() <= max_len {
+            return Ok(signature);
+        }
+        last_len = signature.len();
+    }
+    Err(CryptoError::SignFailed(format!(
+        "no signature within {max_len} bytes after {SIGN_FITTING_MAX_ATTEMPTS} attempts \
+         (last attempt was {last_len} bytes)"
+    )))
+}
+
 /// Parse a suite envelope, or fall back to the LEGACY pre-envelope encoding:
 /// carry-over wallets created before the 4-byte header (their address is
 /// `SHA3-256(raw hybrid pubkey)`) present a bare `mldsa ‖ falcon` body with no

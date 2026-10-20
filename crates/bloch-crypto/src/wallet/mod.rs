@@ -792,6 +792,21 @@ impl Drop for Keypair {
 
 impl Keypair {
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, String> {
+        self.with_enveloped_secret(|sk| crypto::sign(sk, msg))
+    }
+
+    /// Like [`Self::sign`], but re-signs with fresh randomness until the
+    /// encoded signature is at most `max_len` bytes (see
+    /// [`crypto::sign_fitting`]). Use it for any field whose length bound is
+    /// below [`crypto::max_signature_len`].
+    pub fn sign_fitting(&self, msg: &[u8], max_len: usize) -> Result<Vec<u8>, String> {
+        self.with_enveloped_secret(|sk| crypto::sign_fitting(sk, msg, max_len))
+    }
+
+    fn with_enveloped_secret(
+        &self,
+        sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, crypto::CryptoError>,
+    ) -> Result<Vec<u8>, String> {
         // Legacy v2 keystores stored the RAW private key (no 4-byte suite envelope),
         // while newer keys and crypto::sign use the enveloped form. If this key is
         // un-enveloped, wrap it under the SAME suite the (enveloped) public key
@@ -799,13 +814,13 @@ impl Keypair {
         // the stored key. The temporary owned wrapper contains the entire secret,
         // so keep it in zeroizing storage instead of a plain `Cow::Owned` buffer.
         if crypto::parse_envelope(&self.private_key).is_some() {
-            crypto::sign(&self.private_key, msg).map_err(|e| e.to_string())
+            sign(&self.private_key).map_err(|e| e.to_string())
         } else {
             let suite = crypto::parse_envelope(&self.public_key)
                 .map(|(s, _)| s)
                 .unwrap_or(crypto::SUITE_MLDSA65_FALCON1024);
             let sk = Zeroizing::new(crypto::wrap_envelope(suite, &self.private_key));
-            crypto::sign(&sk, msg).map_err(|e| e.to_string())
+            sign(&sk).map_err(|e| e.to_string())
         }
     }
 

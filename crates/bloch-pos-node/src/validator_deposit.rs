@@ -5,7 +5,10 @@
 use crate::{codec, genesis::Manifest, keys::Keystore};
 use bloch_pos_committee::{
     beacon::RandaoChain,
-    transition::{FundedDeposit, FundingInput, PosTransaction, TransferOutput},
+    transition::{
+        funded::ADMISSION_PQ_SIGNATURE_MAX, FundedDeposit, FundingInput, PosTransaction,
+        TransferOutput,
+    },
 };
 use sha3::{Digest, Sha3_256};
 use std::{
@@ -311,9 +314,10 @@ fn sign(args: &[String]) -> Result<(), String> {
         return Err("validator keystore does not open the signed RANDAO commitment".into());
     }
     if role == "funding" {
-        tx.funding_signature = keys.sign(&tx.funding_root());
+        tx.funding_signature = keys.sign_fitting(&tx.funding_root(), ADMISSION_PQ_SIGNATURE_MAX)?;
     } else {
-        tx.proof_of_possession = keys.sign(&tx.possession_root());
+        tx.proof_of_possession =
+            keys.sign_fitting(&tx.possession_root(), ADMISSION_PQ_SIGNATURE_MAX)?;
     }
     if !tx.funding_signature.is_empty() && !tx.proof_of_possession.is_empty() {
         tx.verify_authorizations(&crate::keys::HybridVerifier::new())

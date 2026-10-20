@@ -391,7 +391,7 @@ pub fn build_transfer_v2(
         outputs[0].value = paid_sat;
     }
     let signing_root = tx.checked_signing_root(epoch);
-    let signature = keys.sign(&signing_root);
+    let signature = keys.sign_fitting(&signing_root, ADMISSION_PQ_SIGNATURE_MAX)?;
     if let PosTransaction::TransferV2 { keys, .. } = &mut tx {
         keys[0].signature = signature;
     }
@@ -722,9 +722,14 @@ mod tests {
         assert!(Manifest::decode(&at_cap.encode()).is_ok());
         let over = devnet_manifest(&ks, (0..65).map(alloc).collect());
         assert!(Manifest::decode(&over.encode()).is_err());
-        // The reservation's premise: a real hybrid signature never exceeds the
-        // placeholder it is measured against.
-        assert!(ks.sign(&[7u8; 32]).len() <= ADMISSION_PQ_SIGNATURE_MAX);
+        // The reservation's premise: the signature the tool emits never
+        // exceeds the placeholder it is measured against. A plain hybrid
+        // signature can (Falcon-1024 is variable length, up to 1462 bytes),
+        // which is why the tool signs through `sign_fitting`.
+        for i in 0u8..16 {
+            let sig = ks.sign_fitting(&[i; 32], ADMISSION_PQ_SIGNATURE_MAX).expect("fits");
+            assert!(sig.len() <= ADMISSION_PQ_SIGNATURE_MAX);
+        }
     }
 
     #[test]
