@@ -1000,3 +1000,27 @@ impl bloch_pos_committee::attestation::SignatureVerifier for ArchiveVerifier {
         )
     }
 }
+
+#[cfg(test)]
+mod hf23_rereview_tests {
+    use super::ArchiveVerifier;
+    use bloch_pos_committee::attestation::SignatureVerifier;
+
+    /// HF23 re-review R-2 (integrated 87feb406). KES leaves are signed in the
+    /// bound v2 form (`KesKey::sign` -> `sign_bound`) and the node verifies
+    /// them with `verify_bound` (`HybridVerifier::verify_kes_leaf`). The
+    /// indexer's replay verifier does not override `verify_kes_leaf`, so the
+    /// trait default runs the v1 `crypto::verify`: from the first KES-bound
+    /// block, a correctly rebuilt indexer fails replay. FAILS on 87feb406.
+    #[test]
+    fn hf23_archive_verifier_must_accept_bound_kes_leaf_signatures() {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        let message = [0x5Au8; 32];
+        let leaf_sig = bloch_crypto::crypto::sign_bound(&sk, &message).unwrap();
+        assert!(bloch_crypto::crypto::verify_bound(&pk, &message, &leaf_sig), "control: the node's leaf rule accepts it");
+        assert!(
+            ArchiveVerifier.verify_kes_leaf(&pk, &message, &leaf_sig),
+            "indexer replay rejects a KES leaf signature the node accepts"
+        );
+    }
+}

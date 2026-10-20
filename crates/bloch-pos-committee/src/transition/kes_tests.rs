@@ -1251,4 +1251,45 @@ mod kes_rules {
         assert!(!pre.key_binding_final, "a KES registration is branch-dependent: never a final binding");
         assert_eq!(st.verify_precheck_signatures(&pre, &ToyVerifier), Some(true));
     }
+
+    /// HF23 re-review R-1 (integrated 87feb406). An equivocation signed by
+    /// the KES key in force in period p must stay provable after the
+    /// offender rotates: `KesEntry::settled` drops the replaced key at the
+    /// SECOND rotation, after which `in_force(p)` resolves to the successor
+    /// (whose leaves start at p + 1) and the genuine evidence fails as
+    /// `BadSignature`. Two leaf-signed rotations in consecutive periods
+    /// (about two days at 90-epoch periods) erase an offence that otherwise
+    /// has no evidence age limit. FAILS on 87feb406.
+    #[test]
+    fn hf23_rotation_must_not_erase_provable_kes_equivocation() {
+        let _armed = Armed::enforcing(2, 1); // period == epoch - 2
+        let (_t, g, _chains) = setup_with(4, ToyVerifier, &[]);
+        let mut st = bound(g.clone());
+        let k0 = toy_kes_public(3);
+        st.kes.insert(3, k0.into());
+        // Period 1 (epoch 3): validator 3 double-votes under K0.
+        st.epoch = 3;
+        let slot = 3 * 32 + 1;
+        let first = vote(&st, 3, slot, 0xAA, |r| honest_own(&st, 3, 1, r));
+        let second = vote(&st, 3, slot, 0xBB, |r| honest_own(&st, 3, 1, r));
+        let pair = crate::slashing::SlashingEvidence { first, second };
+        let dels: [crate::delegation::Delegation; 0] = [];
+        assert!(crate::slashing::SlashingState::new()
+            .process(&pair, 4, 0, &dels, 1_000_000, 0, &ToyVerifier, &view(&st))
+            .is_ok(), "control: provable before any rotation");
+        // Same period: rotate K0 -> K1 (K1 starts at period 2).
+        let k1_pks = tree_from(0x71, DEPTH);
+        let r1 = rotate(&st, 3, 1, &k0, &tree(3).0, &k1_pks);
+        apply(&mut st, &r1).expect("first rotation");
+        // Period 2 (epoch 4): rotate K1 -> K2, signed by K1's leaf of period 2.
+        st.epoch = 4;
+        let k1 = { let p = public_of(&k1_pks); KesPublic::new(p.depth, p.root, 2) };
+        let k2_pks = tree_from(0x72, DEPTH);
+        let r2 = rotate(&st, 3, 2, &k1, &k1_pks, &k2_pks);
+        apply(&mut st, &r2).expect("second rotation");
+        let outcome = crate::slashing::SlashingState::new()
+            .process(&pair, 4, 0, &dels, 1_000_000, 0, &ToyVerifier, &view(&st))
+            .map(|_| ());
+        assert_eq!(outcome, Ok(()), "two rotations made a provable period-1 equivocation unprovable");
+    }
 }
