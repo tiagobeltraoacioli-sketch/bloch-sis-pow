@@ -395,9 +395,12 @@ impl Index {
     ///
     /// With `replay` initialized (the serving CLI's path), re-execute the state
     /// transition and check the resulting state root before updating tables.
-    /// `ArchiveVerifier` skips cryptographic signature verification; this is
-    /// state-consistency checking of a trusted archive, not independent node
-    /// validation. Fixture callers without replay use bookkeeping alone.
+    /// `ArchiveVerifier` verifies every signature with the node's production
+    /// rules (`bloch_crypto`: static keys under their policy, spend witnesses
+    /// per epoch, KES leaves in the bound v2 form), so replay fails on any
+    /// block the node would refuse. It is still replay of a local archive,
+    /// not a peer-to-peer node. Fixture callers without replay use
+    /// bookkeeping alone.
     pub fn apply(&mut self, env: &BlockEnvelope, frame_len: u32) {
         self.try_apply(env, frame_len).expect("valid index block");
     }
@@ -998,6 +1001,13 @@ impl bloch_pos_committee::attestation::SignatureVerifier for ArchiveVerifier {
             signature,
             bloch_pos_committee::params::hf3_slh_suite_active(epoch),
         )
+    }
+
+    /// KES leaves, exactly as the node's `HybridVerifier::verify_kes_leaf`:
+    /// the canonical, suite-bound v2 form (review R-2). The trait default
+    /// (v1 `verify_with_key`) would fail replay at the first KES-bound block.
+    fn verify_kes_leaf(&self, leaf_pk: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        bloch_crypto::crypto::verify_bound(leaf_pk, message, signature)
     }
 }
 
