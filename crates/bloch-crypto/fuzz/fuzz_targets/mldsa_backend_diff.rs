@@ -1,12 +1,12 @@
 #![no_main]
 //! Differential ML-DSA-65 verification across EVERY backend in the binary:
-//! PQClean `clean`, PQClean `avx2` (x86_64 with AVX2), and the independent
-//! pure-Rust FIPS 204 implementation `fips204` (IntegrityChain). Consensus runs
-//! whichever PQClean backend the host CPU dispatches to (pqcrypto-mldsa is
-//! built with default features), so any accept/reject disagreement between
-//! backends is a chain-split. Mutations target c~, z and the hint region (the
-//! classes behind RUSTSEC-2026-0077/-0125 and CVE-2026-24850 in other ML-DSA
-//! crates), plus the context string and the public key.
+//! PQClean `clean`, PQClean `avx2` (x86_64 with AVX2), PQClean `aarch64` (ARM
+//! hosts), and the independent pure-Rust FIPS 204 implementation `fips204`
+//! (IntegrityChain). From MLDSA_PIN_ACTIVATION_EPOCH consensus is pinned to the
+//! FIPS 204 reference behaviour (`clean`) on every platform (bloch-mldsa-clean).
+//! This target keeps `clean` == AVX2 == AArch64 == fips204 == the pinned
+//! production rule. Mutations target c~, z and the hint region, plus the
+//! context string and the public key.
 mod common;
 use common::*;
 use fips204::ml_dsa_65 as oracle;
@@ -56,14 +56,19 @@ fuzz_target!(|data: &[u8]| {
         let avx2 = run(ffi::PQCLEAN_MLDSA65_AVX2_crypto_sign_verify_ctx, &pk, &msg, &ctx, &sig);
         assert_eq!(clean, avx2, "PQClean clean vs AVX2 disagree");
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let aarch64 = run(ffi::PQCLEAN_MLDSA65_AARCH64_crypto_sign_verify_ctx, &pk, &msg, &ctx, &sig);
+        assert_eq!(clean, aarch64, "PQClean clean vs AArch64 disagree");
+    }
     let ora = match (oracle::PublicKey::try_from_bytes(pk), <[u8; MLDSA_SIG]>::try_from(sig.as_slice())) {
         (Ok(p), Ok(s)) => p.verify(&msg, &s, &ctx),
         _ => false,
     };
     assert_eq!(clean, ora, "PQClean vs fips204 disagree");
-    // Production wrapper = empty-context pure verify.
+    // Pinned consensus rule = empty-context pure verify on `clean`.
     if ctx.is_empty() {
-        assert_eq!(bloch_crypto::crypto::verify_mldsa65_raw(&pk, &msg, &sig), clean);
+        assert_eq!(bloch_crypto::crypto::verify_mldsa65_raw_pinned(&pk, &msg, &sig), clean);
     }
     if !mutated { assert!(clean, "genuine signature rejected"); }
 });

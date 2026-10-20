@@ -62,6 +62,9 @@ devnet-l2-user-txs = ["devnet-l2-deposits", "bloch-pos-committee/devnet-l2-user-
 l2-activation-rehearsal = ["bloch-pos-committee/l2-activation-rehearsal"]
 # QUALIFICATION BUILDS ONLY; the rehearsal with the mainnet policy values.
 l2-activation-rehearsal-mainnet-policy = ["l2-activation-rehearsal", "bloch-pos-committee/l2-activation-rehearsal-mainnet-policy"]
+# QUALIFICATION BUILDS ONLY; see bloch-pos-committee (full-history replay
+# under the pinned ML-DSA rule, params::MLDSA_PIN_ACTIVATION_EPOCH docs).
+mldsa-pin-replay-qualification = ["bloch-pos-committee/mldsa-pin-replay-qualification"]
 
 [dependencies]
 bloch-l2-proof = { path = "../bloch-l2-proof" }

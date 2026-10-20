@@ -56,7 +56,18 @@ auxpow-rehearsal = []
 # could silently change keygen's internal byte consumption and rotate every
 # derived key. Bumping this pin is a deliberate, reviewed action, not
 # something `cargo update` should ever do on its own.
+#
+# HF2 sigdet: production keeps pqcrypto-mldsa's DEFAULT features (avx2,
+# neon), exactly as the base release, so the historical consensus
+# verification path is byte-identical until MLDSA_PIN_ACTIVATION_EPOCH.
+# crypto/mod.rs keeps the CPU-dispatching wrapper ONLY in
+# `mldsa65_verify_legacy` and reaches the FIPS 204 reference behaviour through
+# `bloch-mldsa-clean`, which calls `PQCLEAN_MLDSA65_CLEAN_*` through `ffi`
+# explicitly whatever features are on. Signing always uses `clean`
+# (byte-identical output for the same `rnd` on every backend,
+# tests/hf2_sigdet_backends.rs).
 pqcrypto-mldsa     = "=0.1.2"
+bloch-mldsa-clean  = { path = "../bloch-mldsa-clean" }
 # F1 (BLOCH-FALCON-ONLINE-SIGNING.md §3.2): default features ("avx2","neon")
 # dispatch Falcon SIGNING to PQClean's native floating-point variants — forbidden
 # for a PoS validator that signs on a public schedule. `default-features = false`
@@ -111,7 +122,14 @@ async-trait = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only (already on via the production defaults; kept explicit so the
+# differential tests never silently lose a backend): PQClean AVX2/AArch64 next to `clean`
+# so tests/acvp_fips204_full.rs can check every backend against NIST ACVP and
+# against the pinned (`clean`) verifier.
+pqcrypto-mldsa = { version = "=0.1.2", features = ["avx2", "neon"] }
 tokio    = { version = "1", features = ["full"] }
 # Property-based invariant tests for the Genesis-locked emission / halving /
 # founder-vesting math in src/core/tokenomics_v2.rs (consensus-critical).
 proptest = "1"
+# HF2 sigdet tests call the pinned clean verifier directly with a context.
+bloch-mldsa-clean = { path = "../bloch-mldsa-clean" }

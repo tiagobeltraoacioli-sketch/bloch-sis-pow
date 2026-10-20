@@ -5,11 +5,12 @@
 //! happens to pick on the test host.
 //!
 //! Why per-backend: `pqcrypto-mldsa` is built WITH its default features
-//! (`avx2`, `neon`), so consensus verification runs PQClean's AVX2 code on
-//! x86_64 hosts with AVX2, the AArch64 code on ARM hosts and `clean` elsewhere.
-//! A verification divergence between backends is a chain-split bug (precedent:
-//! RUSTSEC-2026-0125, an AVX2-only `use_hint` accept bug in another ML-DSA
-//! crate). The pre-existing `acvp_mldsa.rs` only exercises the dispatched one.
+//! (`avx2`, `neon`), so the historical verification path runs PQClean's AVX2
+//! code on x86_64 hosts with AVX2, the AArch64 code on ARM hosts and `clean`
+//! elsewhere; from MLDSA_PIN_ACTIVATION_EPOCH consensus uses `clean`
+//! everywhere (bloch-mldsa-clean). This file checks every compiled backend
+//! against NIST. The pre-existing `acvp_mldsa.rs` only exercises the
+//! dispatched one.
 //!
 //! Vectors: NIST ACVP-Server `internalProjection.json` files (ML-DSA-65,
 //! external interface, pure mode), see `vectors/ACVP-FIPS204-FULL-PROVENANCE.md`.
@@ -147,5 +148,92 @@ fn acvp_sigver_all_outcomes_match_on_every_backend() {
             assert_eq!(verify_on(f, &pk, &msg, &ctx, &sig), want,
                 "{name} tcId {} ({})", case["tcId"], case["reason"]);
         }
+    }
+}
+
+// ── P9f: consensus verification is pinned to `clean` on every platform ──────
+//
+// `bloch_crypto::crypto` signs ML-DSA-65 through PQClean's `clean` FFI, and
+// its pinned rule (`verify_mldsa65_raw_pinned`, `verify_pinned`, consensus
+// from MLDSA_PIN_ACTIVATION_EPOCH) verifies through it too. These checks bind the consensus result to NIST's
+// expected answer AND to every other compiled backend, for every ACVP sigVer
+// case the production (empty-context, pure) interface can express, plus
+// the boundary cases below.
+
+#[test]
+fn p9f_consensus_verify_matches_nist_and_every_backend_on_sigver() {
+    let v = fixture();
+    let mut checked = 0;
+    for case in v["sigVer"].as_array().unwrap() {
+        let (pk, msg, ctx, sig) = (b(case, "pk"), b(case, "message"), b(case, "context"), b(case, "signature"));
+        let want = case["testPassed"].as_bool().unwrap();
+        let prod = bloch_crypto::crypto::verify_mldsa65_raw_pinned(&pk, &msg, &sig);
+        if ctx.is_empty() {
+            assert_eq!(prod, want, "consensus vs NIST tcId {} ({})", case["tcId"], case["reason"]);
+            checked += 1;
+        }
+        // Whatever the context, consensus == every backend run with EMPTY ctx.
+        for (name, f) in backends() {
+            assert_eq!(prod, verify_on(f, &pk, &msg, b"", &sig), "consensus vs {name} tcId {}", case["tcId"]);
+        }
+    }
+    eprintln!("p9f: {checked} empty-context sigVer cases checked against NIST");
+}
+
+#[test]
+fn p9f_consensus_verify_matches_every_backend_on_mutated_siggen() {
+    let v = fixture();
+    for case in v["sigGen"].as_array().unwrap() {
+        let (pk, msg, ctx, sig) = (b(case, "pk"), b(case, "message"), b(case, "context"), b(case, "signature"));
+        if !ctx.is_empty() {
+            continue;
+        }
+        // Genuine + mutations over c~, z, hint region, hint counters, pk.
+        let mut variants: Vec<(Vec<u8>, Vec<u8>)> = vec![(pk.clone(), sig.clone())];
+        for &i in &[0usize, 47, 48, 1000, 3247, 3309 - 61, 3309 - 7, 3309 - 6, 3309 - 1] {
+            for &x in &[0x01u8, 0x80, 0xff] {
+                let mut s = sig.clone();
+                s[i] ^= x;
+                variants.push((pk.clone(), s));
+            }
+        }
+        for &i in &[0usize, 31, 32, 1951] {
+            let mut p = pk.clone();
+            p[i] ^= 1;
+            variants.push((p, sig.clone()));
+        }
+        for (p, s) in &variants {
+            let prod = bloch_crypto::crypto::verify_mldsa65_raw_pinned(p, &msg, s);
+            for (name, f) in backends() {
+                assert_eq!(prod, verify_on(f, p, &msg, b"", s), "consensus vs {name} tcId {}", case["tcId"]);
+            }
+        }
+        assert!(bloch_crypto::crypto::verify_mldsa65_raw_pinned(&pk, &msg, &sig));
+        // Wrong lengths are rejected before any backend runs.
+        assert!(!bloch_crypto::crypto::verify_mldsa65_raw_pinned(&pk, &msg, &sig[..3308]));
+        let mut long = sig.clone();
+        long.push(0);
+        assert!(!bloch_crypto::crypto::verify_mldsa65_raw_pinned(&pk, &msg, &long));
+        assert!(!bloch_crypto::crypto::verify_mldsa65_raw_pinned(&pk[..1951], &msg, &sig));
+    }
+}
+
+#[test]
+fn p9f_production_signatures_verify_on_every_backend() {
+    let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+    let (_, pk_body) = bloch_crypto::crypto::split_envelope(&pk).expect("pk envelope");
+    let mpk = &pk_body[..1952];
+    for i in 0..8u8 {
+        let msg = [b"p9f clean signer ".as_slice(), &[i]].concat();
+        let sig = bloch_crypto::crypto::sign(&sk, &msg).unwrap();
+        assert!(bloch_crypto::crypto::verify(&pk, &msg, &sig));
+        let (_, sig_body) = bloch_crypto::crypto::split_envelope(&sig).expect("sig envelope");
+        let msig = &sig_body[..3309];
+        for (name, f) in backends() {
+            assert!(verify_on(f, mpk, &msg, b"", msig), "{name} rejects production signature");
+        }
+        let spk = mldsa65::PublicKey::from_bytes(mpk).unwrap();
+        let ssig = mldsa65::DetachedSignature::from_bytes(msig).unwrap();
+        assert!(mldsa65::verify_detached_signature(&ssig, &msg, &spk).is_ok());
     }
 }

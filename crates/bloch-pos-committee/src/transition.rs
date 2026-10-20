@@ -3609,6 +3609,16 @@ impl CommittedState {
         base_fee_millisat_per_gas: u128,
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, TxReject> {
+        // HF2 scope (owner decision): every transaction witness below is
+        // judged under the TRANSACTION rule, which accepts every v1 encoding
+        // before and after SIG_CANONICAL_ACTIVATION_EPOCH; only the ML-DSA
+        // backend is pinned from MLDSA_PIN_ACTIVATION_EPOCH. `self.epoch` is
+        // the committed epoch rolled to the judged block, never a clock.
+        let gated = crate::attestation::PolicyVerifier::new(
+            verifier,
+            crate::attestation::SignaturePolicy::transaction(self.epoch),
+        );
+        let verifier: &dyn SignatureVerifier = &gated;
         match tx {
             PosTransaction::L2Settlement(settlement) | PosTransaction::L2SettlementAsync(settlement) => {
                 let asynchronous = matches!(tx, PosTransaction::L2SettlementAsync(_));
@@ -6110,6 +6120,13 @@ impl<V: SignatureVerifier> Transition<V> {
         let roster = st.consensus_roster_at(st.epoch);
         let seed = st.seed_for_epoch(st.epoch);
 
+        // Audit e9b52781 + HF2 review: the proposer signature and every
+        // transaction signature are judged under the block epoch's consensus
+        // rule; each included attestation and each slashing-evidence message
+        // under the rule of ITS OWN epoch (see step 8 and slashing.rs), which
+        // is the rule its signer used.
+        let block_verifier = crate::attestation::PolicyVerifier::consensus(&self.verifier, block_epoch);
+
         // 4. The proposer must be the validator drawn for this slot
         //    (schedule.rs) — a hash away, checked before any signature.
         match schedule::proposer(&seed, header.slot, &roster) {
@@ -6179,7 +6196,7 @@ impl<V: SignatureVerifier> Transition<V> {
         let Some(proposer_key) = st.validators.pubkey(header.proposer_index) else {
             return Err(TransitionError::Proposal(ProposalReject::UnknownProposer));
         };
-        if !self.verifier.verify_with_key(
+        if !block_verifier.verify_with_key(
             proposer_key,
             &header.proposal_signing_root(),
             &envelope.proposer_sig,
@@ -6323,7 +6340,14 @@ impl<V: SignatureVerifier> Transition<V> {
             // chunks — a fact this line declines to assume.
             let idx = (att.data.slot % crate::params::SLOTS_PER_EPOCH) as usize;
             let committee = partition.get(idx).unwrap_or(&empty_committee);
-            if attestation::validate(att, committee, header.slot, &self.verifier, &st.validators)
+            // Judged under the vote's OWN epoch rule, never the including
+            // block's (HF2 review): at the flag day a block may carry votes
+            // of the previous epoch, signed under the previous rule.
+            let att_verifier = crate::attestation::PolicyVerifier::consensus(
+                &self.verifier,
+                crate::epoch_of(att.data.slot),
+            );
+            if attestation::validate(att, committee, header.slot, &att_verifier, &st.validators)
                 .is_err()
             {
                 return Err(reject);
@@ -6434,6 +6458,10 @@ impl<V: SignatureVerifier> Transition<V> {
                         ev,
                         header.proposer_index,
                         &roster,
+                        // Unwrapped: each evidence message is judged under
+                        // the rule of its own epoch (slashing.rs), not the
+                        // including block's — a pre-flag-day offence stays
+                        // provable after the flag day (HF2 review).
                         &self.verifier,
                     )
                     // R7 M1: two hybrid verifications — `apply_slashing_evidence`
@@ -6443,6 +6471,9 @@ impl<V: SignatureVerifier> Transition<V> {
                         CommittedState::staking_tx_charge(st.epoch, 2, tx.canonical_bytes().len())
                     })
                     .map_err(|()| TxReject::StakingRule),
+                // Unwrapped: `apply_transaction` applies the TRANSACTION rule
+                // itself; the block's consensus rule must not reach a wallet
+                // signature (HF2 scope).
                 _ => st.apply_transaction(tx, total_active, base_fee, &self.verifier),
             };
             match applied {
@@ -8073,6 +8104,252 @@ mod tests {
             Err(TransitionError::Attestation(1)),
             "a pair-only cache would wrongly accept the invalid signature variant"
         );
+    }
+
+    // -- SIG_CANONICAL_ACTIVATION_EPOCH (audit e9b52781) ----------------------
+
+    /// Records the signature policy of every check; accepts everything.
+    struct PolicyRecorder(std::sync::Arc<std::sync::Mutex<Vec<crate::attestation::SignaturePolicy>>>);
+    impl SignatureVerifier for PolicyRecorder {
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            // An unpinned call: it would bypass the epoch's policy.
+            panic!("consensus signature check reached the verifier without a policy");
+        }
+        fn verify_with_key_under(
+            &self,
+            policy: crate::attestation::SignaturePolicy,
+            _pk: &[u8],
+            _root: &[u8; 32],
+            _sig: &[u8],
+        ) -> bool {
+            self.0.lock().unwrap().push(policy);
+            true
+        }
+    }
+
+    /// TRIPWIRE. Arming is a founder decision and a wallet-facing flag day.
+    #[test]
+    fn sig_canonical_gate_is_inert() {
+        assert_eq!(crate::params::SIG_CANONICAL_ACTIVATION_EPOCH, u64::MAX);
+        for epoch in [0, 4_669, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::sig_canonical_active(epoch));
+            assert_eq!(
+                crate::attestation::SignaturePolicy::consensus(epoch),
+                crate::attestation::SignaturePolicy::Compatible
+            );
+        }
+    }
+
+    /// HF2 review (flag-day boundary), votes in blocks. Step 8 admits only
+    /// votes of the block's own epoch, so a post-flag-day block can never
+    /// carry a pre-flag-day vote (it is refused structurally, before any
+    /// signature is checked); each admitted vote is judged under the rule of
+    /// its own epoch, which is therefore the block's. Pinned on both sides of
+    /// a flag day.
+    #[test]
+    fn flag_day_boundary_votes_are_judged_under_their_own_epoch() {
+        use crate::attestation::SignaturePolicy::{Bound, Compatible};
+        let (_t, s, mut chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+        assert_eq!(crate::epoch_of(att_slot), 1);
+        let atts = vec![attest(&s, member, att_slot, *s.head.as_bytes())];
+
+        // Epoch-1 vote in an epoch-2 block, flag day 2: refused before any
+        // vote signature is checked; only the proposer (epoch 2) was judged.
+        {
+            let _gate = crate::params::sig_canonical_gate_at_guard(2);
+            let (_t2, _s2, mut c) = epoch1_fixture(); // fresh, deterministic reveals
+            let env = build_header_over(&s, 64, &atts, &mut c);
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let r = Transition::new(PolicyRecorder(seen.clone())).apply_block(&s, &env, &atts, &[]);
+            assert!(matches!(r, Err(TransitionError::Attestation(0))), "{r:?}");
+            assert_eq!(seen.lock().unwrap().clone(), vec![Bound]);
+        }
+        // Same-epoch vote: the rule of epoch 1, on each side of a flag day.
+        let env = build_header_over(&s, 63, &atts, &mut chains);
+        for (flag_day, want) in [(1, Bound), (2, Compatible)] {
+            let _gate = crate::params::sig_canonical_gate_at_guard(flag_day);
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let _ = Transition::new(PolicyRecorder(seen.clone())).apply_block(&s, &env, &atts, &[]);
+            let got = seen.lock().unwrap().clone();
+            assert!(got.len() >= 2 && got.iter().all(|p| *p == want), "flag day {flag_day}: {got:?}");
+        }
+    }
+
+    /// HF2 review (slashing escape): evidence for an offence of the last
+    /// pre-flag-day epoch, included after the flag day, is verified under
+    /// the rule its messages were signed under, so it stays provable; and
+    /// evidence messages of a post-flag-day epoch are held to `Bound`.
+    #[test]
+    fn flag_day_boundary_evidence_is_judged_under_each_messages_own_epoch() {
+        use crate::attestation::SignaturePolicy::{Bound, Compatible};
+        let (_t, g, _c) = setup(4);
+        let offender = 0;
+        let roster = g.consensus_roster_at(g.epoch);
+        // double_vote_evidence signs slot 32 (epoch 1).
+        for (flag_day, want) in [(2, Compatible), (1, Bound), (0, Bound)] {
+            let _gate = crate::params::sig_canonical_gate_at_guard(flag_day);
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut st = g.clone();
+            let _ = st.apply_slashing_evidence(
+                &double_vote_evidence(offender),
+                1,
+                &roster,
+                &PolicyRecorder(seen.clone()),
+            );
+            let got = seen.lock().unwrap().clone();
+            assert_eq!(got, vec![want, want], "flag day {flag_day}");
+        }
+        // Even through a strict outer wrapper the inner rule cannot loosen,
+        // so the transition passes the UNWRAPPED verifier (pinned by source).
+        let src = include_str!("transition.rs");
+        let at = src.find(".apply_slashing_evidence(\n                        ev,").expect("call site");
+        let call = &src[at..at + 700];
+        assert!(call.contains("&self.verifier,") && !call.contains("&block_verifier"), "{call}");
+    }
+
+    /// TRIPWIRE (HF2 sigdet). Arming moves the ML-DSA half of every consensus
+    /// signature from the CPU-dispatching backend to the pinned FIPS 204
+    /// reference verifier. Coordinated upgrade only.
+    #[test]
+    #[cfg(not(feature = "mldsa-pin-replay-qualification"))]
+    fn mldsa_pin_gate_is_inert() {
+        use crate::attestation::SignaturePolicy::*;
+        assert_eq!(crate::params::MLDSA_PIN_ACTIVATION_EPOCH, u64::MAX);
+        for epoch in [0, 4_669, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::mldsa_pin_active(epoch));
+        }
+        // Gate table: (pin, canonical) -> consensus policy.
+        assert_eq!(crate::attestation::SignaturePolicy::consensus(7), Compatible);
+        {
+            let _pin = crate::params::mldsa_pin_gate_open_guard();
+            assert_eq!(crate::attestation::SignaturePolicy::consensus(7), CompatiblePinned);
+            assert_eq!(crate::attestation::SignaturePolicy::transaction(7), CompatiblePinned);
+            let _canon = crate::params::sig_canonical_gate_open_guard();
+            assert_eq!(crate::attestation::SignaturePolicy::consensus(7), Bound);
+        }
+        let _canon = crate::params::sig_canonical_gate_open_guard();
+        assert_eq!(crate::attestation::SignaturePolicy::consensus(7), Bound, "canonical implies pinned");
+        assert_eq!(crate::attestation::SignaturePolicy::transaction(7), CompatiblePinned);
+        for pin in [false, true] {
+            for canon in [false, true] {
+                let t = crate::attestation::SignaturePolicy::transaction_for(pin, canon);
+                assert!(matches!(t, Compatible | CompatiblePinned), "transactions never canonical");
+            }
+        }
+    }
+
+    /// With only the ML-DSA pin armed, block and transaction signatures are
+    /// judged under `CompatiblePinned`, with no unpinned call left over.
+    #[test]
+    fn mldsa_pin_gate_routes_block_and_transaction_signatures() {
+        use crate::attestation::SignaturePolicy::CompatiblePinned;
+        let _pin = crate::params::mldsa_pin_gate_open_guard();
+        let (_t, s, mut chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+        let atts = vec![attest(&s, member, att_slot, *s.head.as_bytes())];
+        let env = build_header_over(&s, 63, &atts, &mut chains);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _ = Transition::new(PolicyRecorder(seen.clone())).apply_block(&s, &env, &atts, &[]);
+        let got = seen.lock().unwrap().clone();
+        assert!(got.len() >= 2 && got.iter().all(|p| *p == CompatiblePinned), "{got:?}");
+
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
+        let (_t, g, _chains) = setup(4);
+        let tx = signed_deposit(hybrid_shaped_key(0x46), 500);
+        let fee = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(g.clone().apply_transaction(&tx, 0, fee, &PolicyRecorder(seen.clone())).is_ok());
+        let got = seen.lock().unwrap().clone();
+        assert!(!got.is_empty() && got.iter().all(|p| *p == CompatiblePinned), "{got:?}");
+    }
+
+    /// Proposer and attestation signatures are judged under the BLOCK
+    /// epoch's consensus policy, with no unpinned call left over.
+    #[test]
+    fn block_signatures_are_judged_under_the_block_epoch_policy() {
+        use crate::attestation::SignaturePolicy::{Bound, Compatible};
+        for open in [false, true] {
+            let _gate = open.then(crate::params::sig_canonical_gate_open_guard);
+            let (_t, s, mut chains) = epoch1_fixture();
+            let (att_slot, member) = a_committee_seat(&s);
+            let atts = vec![attest(&s, member, att_slot, *s.head.as_bytes())];
+            let env = build_header_over(&s, 63, &atts, &mut chains);
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let _ = Transition::new(PolicyRecorder(seen.clone())).apply_block(&s, &env, &atts, &[]);
+            let seen = seen.lock().unwrap();
+            assert!(seen.len() >= 2, "proposer + attestation must be checked: {seen:?}");
+            let want = if open { Bound } else { Compatible };
+            assert!(seen.iter().all(|p| *p == want), "open={open}: {seen:?}");
+        }
+    }
+
+    /// OWNER DECISION (HF2 scope): a transaction witness is judged under the
+    /// TRANSACTION rule at E2-1, E2 and E2+1000 (E2 = canonical flag day) —
+    /// never a canonical policy — even when the including block's consensus
+    /// messages are judged under `Bound`. (The node test
+    /// `v1_transfer_forms_stay_valid_across_the_canonical_flag_day` proves the
+    /// real hybrid verifier accepts every v1 form under that rule.)
+    #[test]
+    fn transaction_signatures_keep_the_v1_rule_across_the_canonical_flag_day() {
+        use crate::attestation::{PolicyVerifier, SignaturePolicy::*};
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
+        let (_t, g, _chains) = setup(4);
+        let tx = signed_deposit(hybrid_shaped_key(0x45), 500);
+        let fee = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        // The policy function itself, at absolute epochs around E2 = 5000.
+        {
+            let _gate = crate::params::sig_canonical_gate_at_guard(5_000);
+            for (e, label) in [(4_999, "E2-1"), (5_000, "E2"), (6_000, "E2+1000")] {
+                let t = crate::attestation::SignaturePolicy::transaction(e);
+                assert!(matches!(t, Compatible | CompatiblePinned), "{label}: {t:?}");
+                assert_eq!(crate::attestation::SignaturePolicy::consensus(e) == Bound, label != "E2-1");
+            }
+        }
+        // The transition's routing, with the committed epoch on each side of
+        // the flag day.
+        for (at, label) in [(g.epoch + 1, "E2-1"), (g.epoch, "E2")] {
+            let _gate = crate::params::sig_canonical_gate_at_guard(at);
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            assert!(g.clone().apply_transaction(&tx, 0, fee, &PolicyRecorder(seen.clone())).is_ok(), "{label}");
+            let want = if label == "E2" { CompatiblePinned } else { Compatible };
+            let got = seen.lock().unwrap().clone();
+            assert!(!got.is_empty() && got.iter().all(|p| *p == want), "{label}: {got:?}");
+        }
+        // An outer wrapper can only tighten, never loosen (strictest).
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = PolicyRecorder(seen.clone());
+        let outer = PolicyVerifier::new(&recorder, CanonicalUnbound);
+        assert!(g.clone().apply_transaction(&tx, 0, fee, &outer).is_ok());
+        assert!(seen.lock().unwrap().iter().all(|p| *p == CanonicalUnbound));
+    }
+
+    /// The block's transactions reach `apply_transaction` unwrapped (no
+    /// consensus `Bound` wrapper around a wallet signature), pinned by source.
+    #[test]
+    fn apply_block_passes_transactions_the_unwrapped_verifier() {
+        let src = include_str!("transition.rs");
+        let call = |v: &str| format!("{}(tx, total_active, base_fee, {v})", "apply_transaction");
+        assert!(src.contains(&call("&self.verifier")));
+        assert!(!src.contains(&call("&block_verifier")));
+    }
+
+    #[test]
+    fn strictest_policy_table() {
+        use crate::attestation::SignaturePolicy::*;
+        // Total order, weakest first: each admits a subset of the previous.
+        let all = [Compatible, CompatiblePinned, CanonicalUnbound, Bound];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(a.strictest(*b), all[i.max(j)], "{a:?} vs {b:?}");
+            }
+        }
+        // Cache tags are distinct.
+        let tags: std::collections::BTreeSet<u8> = all.iter().map(|p| p.tag()).collect();
+        assert_eq!(tags.len(), all.len());
+        let _gate = crate::params::sig_canonical_gate_open_guard();
+        assert_eq!(crate::attestation::SignaturePolicy::transaction(0), CompatiblePinned);
+        assert_eq!(crate::attestation::SignaturePolicy::consensus(0), Bound);
     }
 
     // -- ATTESTATION_DEDUP_ACTIVATION_EPOCH (audit R3 M-2) -------------------
@@ -12975,6 +13252,9 @@ mod tests {
                 Box::new(crate::params::native_claim_finality_test::open()),
                 Box::new(crate::params::native_finality_set_test::open()),
                 Box::new(crate::params::hf2_growth_cap_rehearsal::open()),
+                Box::new(crate::params::own_target_votes_test::open()),
+                Box::new(crate::params::sig_canonical_gate_open_guard()),
+                Box::new(crate::params::mldsa_pin_gate_open_guard()),
             ]
         }
         fn run() -> ([u8; 32], Vec<(([u8; 32], u32), u64)>, u128, Result<u128, TransferReject>, Vec<(([u8; 32], u32), u64)>) {

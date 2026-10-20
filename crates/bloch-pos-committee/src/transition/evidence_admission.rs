@@ -66,8 +66,8 @@ pub fn evidence_structure(
                 first.validator,
                 pair.id(),
                 [
-                    (first.data.target_epoch, first.data.signing_root(), first.signature.as_slice()),
-                    (second.data.target_epoch, second.data.signing_root(), second.signature.as_slice()),
+                    (crate::epoch_of(first.data.slot), first.data.signing_root(), first.signature.as_slice()),
+                    (crate::epoch_of(second.data.slot), second.data.signing_root(), second.signature.as_slice()),
                 ],
             ))
         }

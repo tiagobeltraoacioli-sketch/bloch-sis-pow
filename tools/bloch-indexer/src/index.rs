@@ -941,4 +941,21 @@ impl bloch_pos_committee::attestation::SignatureVerifier for ArchiveVerifier {
     fn verify_with_key(&self, key: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
         bloch_crypto::crypto::verify(key, root, signature)
     }
+    fn verify_with_key_under(
+        &self,
+        policy: bloch_pos_committee::attestation::SignaturePolicy,
+        key: &[u8],
+        root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        use bloch_crypto::crypto::SignaturePolicy as C;
+        use bloch_pos_committee::attestation::SignaturePolicy as P;
+        let policy = match policy {
+            P::Compatible => C::Compatible,
+            P::CompatiblePinned => C::CompatiblePinned,
+            P::CanonicalUnbound => C::CanonicalUnbound,
+            P::Bound => C::Bound,
+        };
+        bloch_crypto::crypto::verify_with_policy(policy, key, root, signature)
+    }
 }

@@ -278,8 +278,12 @@ pub fn proposer_evidence_id(
 /// the node's pre-admission (`CommittedState::verify_precheck_signatures`)
 /// call THIS function, so any change to key resolution (for example a
 /// per-epoch KES leaf) changes both together and the relay can never refuse
-/// evidence that consensus would slash. Today the key is the static
-/// registered key and `message_epoch` does not affect the result.
+/// evidence that consensus would slash. The key is the static registered
+/// key; `message_epoch` (the epoch of the vote's SLOT, or of the header's
+/// slot — the epoch the signer signed under) selects the consensus signature
+/// rule the message is judged by (HF2 sigdet: each message under the rule of
+/// its own epoch, so a pre-flag-day offence stays provable after the flag
+/// day and a block's rule cannot tighten it).
 pub fn verify_offender_signature(
     keys: &dyn KeyLookup,
     verifier: &dyn SignatureVerifier,
@@ -288,9 +292,9 @@ pub fn verify_offender_signature(
     signing_root: &[u8; 32],
     signature: &[u8],
 ) -> Option<bool> {
-    let _ = message_epoch;
     let pubkey = keys.pubkey(validator)?;
-    Some(verifier.verify_with_key(pubkey, signing_root, signature))
+    let policy = crate::attestation::SignaturePolicy::consensus(message_epoch);
+    Some(verifier.verify_with_key_under(policy, pubkey, signing_root, signature))
 }
 
 /// Everything one applied slash produced. Balances live outside this crate,
@@ -540,7 +544,7 @@ impl SlashingState {
                 keys,
                 verifier,
                 validator,
-                att.data.target_epoch,
+                crate::epoch_of(att.data.slot),
                 &att.data.signing_root(),
                 &att.signature,
             ) {

@@ -152,6 +152,7 @@ dependencies = [
  "base64",
  "bincode",
  "bip39",
+ "bloch-mldsa-clean",
  "bloch-sis-pow",
  "chrono",
  "coherence-core",
@@ -171,6 +172,13 @@ dependencies = [
  "sha3 0.10.9",
  "thiserror",
  "zeroize",
+]
+
+[[package]]
+name = "bloch-mldsa-clean"
+version = "0.1.0"
+dependencies = [
+ "pqcrypto-mldsa",
 ]
 
 [[package]]

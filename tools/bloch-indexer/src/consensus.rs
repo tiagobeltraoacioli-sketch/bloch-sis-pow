@@ -90,6 +90,8 @@ gates!(
     HF2_SLASHING_V2_EPOCH,
     NATIVE_SLASHING_ACTIVATION_EPOCH,
     HF2_GROWTH_CAP_EPOCH,
+    SIG_CANONICAL_ACTIVATION_EPOCH,
+    MLDSA_PIN_ACTIVATION_EPOCH,
 );
 
 /// Source commit of this build, when the builder exported

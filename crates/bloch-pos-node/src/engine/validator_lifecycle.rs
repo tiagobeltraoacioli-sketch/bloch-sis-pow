@@ -82,9 +82,24 @@ struct LifecycleAdmissionVerifier<'a, V> {
 
 impl<V: SignatureVerifier> SignatureVerifier for LifecycleAdmissionVerifier<'_, V> {
     fn verify_with_key(&self, public_key: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        self.verify_with_key_under(
+            bloch_pos_committee::SignaturePolicy::Compatible,
+            public_key,
+            message,
+            signature,
+        )
+    }
+
+    fn verify_with_key_under(
+        &self,
+        policy: bloch_pos_committee::SignaturePolicy,
+        public_key: &[u8],
+        message: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
         // Exact immutable failures are already cheap and must not let a replay
         // consume the allowance that exists to bound actual cryptography.
-        if self.inner.is_known_failure(public_key, message, signature) {
+        if self.inner.is_known_failure(policy, public_key, message, signature) {
             return false;
         }
         if let Some(source) = self.source {
@@ -93,7 +108,7 @@ impl<V: SignatureVerifier> SignatureVerifier for LifecycleAdmissionVerifier<'_, 
                 return false;
             }
         }
-        self.inner.verify_with_key(public_key, message, signature)
+        self.inner.verify_with_key_under(policy, public_key, message, signature)
     }
 }
 
@@ -152,6 +167,10 @@ impl Engine {
             mempool: std::cell::RefCell::new(&mut self.mempool),
             source, wall_slot, limited: std::cell::Cell::new(false),
         };
+        // HF2 scope: no relay signature policy. Lifecycle transactions are
+        // judged under the committee's TRANSACTION rule (v1 forms always
+        // valid) and slashing evidence under each message's own epoch rule,
+        // both applied inside `validate_lifecycle_transaction`.
         let verdict = self.state.validate_lifecycle_transaction(tx, total, fee, &verifier);
         if verifier.limited.get() {
             return Err(Refusal::LifecycleVerificationLimited {
@@ -425,6 +444,8 @@ impl Engine {
             );
             let signature = match self.slashprot.guard_recommit(
                 wall_epoch, generation, new_commitment, signing_root,
+                // A RANDAO re-commit is a lifecycle TRANSACTION: always v1
+                // (HF2 scope), so it stays valid in whatever block includes it.
                 || keys.sign(&signing_root),
             ) {
                 Ok(signature) => signature,

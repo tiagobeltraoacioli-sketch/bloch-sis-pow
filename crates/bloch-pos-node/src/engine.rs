@@ -2657,7 +2657,7 @@ impl Engine {
             slot,
             data.source_epoch,
             data.target_epoch,
-            || keys.sign(&root),
+            || keys.sign_for_epoch(epoch_of(data.slot), &root),
         ) {
             Ok(sig) => sig,
             Err(refusal) => {
@@ -2851,7 +2851,9 @@ impl Engine {
             return;
         };
         let root = header.proposal_signing_root();
-        let proposer_sig = match self.slashprot.guard_proposal(slot, || keys.sign(&root)) {
+        let proposer_sig = match self.slashprot.guard_proposal(slot, || {
+            keys.sign_for_epoch(epoch_of(header.slot), &root)
+        }) {
             Ok(sig) => sig,
             Err(refusal) => {
                 eprintln!("[slot {slot}] {refusal}");
@@ -3365,7 +3367,11 @@ impl Engine {
                         src.verification_source(),
                         GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
                     );
-                    let verified = verifier.verify_with_key(
+                    // The CONSENSUS signature rule of the header's own epoch,
+                    // exactly what the transition applies, so gossip and
+                    // block validation never disagree.
+                    let verified = verifier.verify_with_key_under(
+                        bloch_pos_committee::SignaturePolicy::consensus(epoch_of(env.header.slot)),
                         pk,
                         &env.header.proposal_signing_root(),
                         &env.proposer_sig,
@@ -3382,7 +3388,8 @@ impl Engine {
             Some(pk) => prior_authentication
                 .as_ref()
                 .is_some_and(|proof| proof.matches(&env, pk))
-                || self.gossip_verifier.verify_with_key(
+                || self.gossip_verifier.verify_with_key_under(
+                    bloch_pos_committee::SignaturePolicy::consensus(epoch_of(env.header.slot)),
                     pk,
                     &env.header.proposal_signing_root(),
                     &env.proposer_sig,
@@ -8700,6 +8707,65 @@ mod admission_authorisation {
             inputs[0].signature = sig.clone();
         }
         (tx, sig)
+    }
+
+    /// OWNER DECISION (HF2 scope): every v1 byte form of a spend signature
+    /// that today's wallets/exchanges can produce (canonical, zero-padded
+    /// Falcon half, headerless legacy) is admitted by the mempool and valid
+    /// under the consensus TRANSACTION rule at E2-1, E2 and E2+1000, where E2
+    /// is the canonical (v2) flag day — with or without the ML-DSA pin.
+    #[test]
+    fn v1_transfer_forms_stay_valid_across_the_canonical_flag_day() {
+        use bloch_crypto::crypto::{
+            falcon, sign, sign_bound, verify, MLDSA_SIG_LEN, SUITE_HEADER_LEN,
+        };
+        use bloch_pos_committee::SignaturePolicy;
+        let (template, _) = signed_transfer();
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[9u8; 32]).unwrap();
+        let root = template.spend_signing_root();
+        let with_sig = |sig: &[u8]| {
+            let mut tx = template.clone();
+            if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+                inputs[0].signature = sig.to_vec();
+            }
+            tx
+        };
+        let padded_len = SUITE_HEADER_LEN + MLDSA_SIG_LEN + falcon::padded_signature_len();
+        let sig = (0..64)
+            .map(|_| sign(&sk, &root).unwrap())
+            .find(|s| s.len() < padded_len && s[SUITE_HEADER_LEN..SUITE_HEADER_LEN + 2] != [0xB1, 0x0C])
+            .expect("a compact fixture with padding room");
+        let mut padded = sig.clone();
+        padded.resize(padded_len, 0);
+        let headerless = sig[SUITE_HEADER_LEN..].to_vec();
+        let forms = [("canonical", sig.clone()), ("padded", padded), ("headerless", headerless)];
+        for (name, form) in &forms {
+            assert!(verify(&pk, &root, form), "{name} is consensus-valid today");
+            // Mempool: no relay signature policy, admitted unconditionally.
+            assert!(admissible(&with_sig(form), 0).is_ok(), "{name} admitted by the mempool");
+        }
+        // Consensus transaction rule around a hypothetical flag day E2.
+        let e2: u64 = 10_000;
+        let v = HybridVerifier::new();
+        for pin_armed in [false, true] {
+            for (epoch, label) in [(e2 - 1, "E2-1"), (e2, "E2"), (e2 + 1_000, "E2+1000")] {
+                let policy = SignaturePolicy::transaction_for(pin_armed, epoch >= e2);
+                assert!(
+                    matches!(policy, SignaturePolicy::Compatible | SignaturePolicy::CompatiblePinned),
+                    "{label}: {policy:?}"
+                );
+                for (name, form) in &forms {
+                    assert!(v.verify_with_key_under(policy, &pk, &root, form), "{name} at {label} pin={pin_armed}");
+                    assert!(
+                        bloch_pos_committee::PolicyVerifier::new(&v, policy).verify_with_key(&pk, &root, form),
+                        "{name} at {label} through the policy wrapper"
+                    );
+                }
+            }
+        }
+        // A v2 signature is never a transaction witness.
+        let v2 = sign_bound(&sk, &root).unwrap();
+        assert!(admissible(&with_sig(&v2), 0).is_err());
     }
 
     #[test]

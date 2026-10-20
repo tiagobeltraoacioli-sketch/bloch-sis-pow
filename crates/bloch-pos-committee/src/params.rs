@@ -2090,6 +2090,161 @@ pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = 2_884;
 /// `sighash_network_binding_gate_is_inert` pins the value.
 pub const SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag day for the platform-independent ML-DSA-65 verification rule
+/// (HF2 sigdet; audit e9b52781 MED "ML-DSA verify backend CPU-dependent").
+///
+/// Below it the ML-DSA half of every consensus signature is judged exactly as
+/// the release did: by pqcrypto-mldsa's CPU-dispatching wrapper (PQClean AVX2
+/// on x86_64 hosts with AVX2, AArch64 on ARM, `clean` elsewhere). From it,
+/// consensus uses [`crate::attestation::SignaturePolicy::CompatiblePinned`]:
+/// same encodings, ML-DSA verification pinned to the FIPS 204 reference
+/// behaviour (PQClean `clean`) on every platform.
+///
+/// Arming it is a coordinated upgrade, not a wallet flag day: every shipped
+/// signer already produces FIPS 204 reference signatures, so no signer
+/// changes anything. [`SIG_CANONICAL_ACTIVATION_EPOCH`] implies it (its
+/// policies always use the pinned verifier). Ships INERT at `u64::MAX`;
+/// `mldsa_pin_gate_is_inert` pins the value.
+///
+/// # GO criterion: full-history replay, byte-identical, x86_64 AND aarch64
+///
+/// Arming is conditional on a full-history replay under the pinned rule
+/// reproducing the canonical chain. The `mldsa-pin-replay-qualification` feature (node
+/// and committee; QUALIFICATION BUILDS ONLY, never ship it) sets this epoch to
+/// 0, i.e. judges ALL of history under the pinned rule. On each of an x86_64
+/// AVX2 host and an aarch64 host (build hosts, never validator hosts):
+///
+/// ```text
+/// cargo build --release -p bloch-pos-node                                    # stock
+/// cargo build --release -p bloch-pos-node --features mldsa-pin-replay-qualification \
+///     --target-dir target-qual                                               # pinned
+/// # COPY of a synced data dir: block log + manifest only, NEVER validator.key;
+/// # give the copy a throwaway key (`bloch-pos keygen --dir copy --index <i>`
+/// # for an index NOT in the roster).
+/// for bin in target/release/bloch-pos target-qual/release/bloch-pos; do
+///   # --replay-from-genesis ignores any local state cache: full replay
+///   $bin run copy --replay-from-genesis --stop-at-slot <frozen head slot> \
+///       --rpc-port off   (no --peer; firewalled)  2>&1 | grep 'replayed .* blocks'
+/// done
+/// ```
+///
+/// GO only if all four runs (2 binaries x 2 architectures) print the same
+/// `replayed N blocks: head slot S, state root R, justified .., finalized ..`
+/// line. Any rejected block in the pinned runs is a NO-GO for an epoch at or
+/// before that block (the per-epoch gate allows a later one).
+#[cfg(not(feature = "mldsa-pin-replay-qualification"))]
+pub const MLDSA_PIN_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// QUALIFICATION BUILD: all of history judged under the pinned rule.
+#[cfg(feature = "mldsa-pin-replay-qualification")]
+pub const MLDSA_PIN_ACTIVATION_EPOCH: u64 = 0;
+
+#[cfg(test)]
+thread_local! {
+    static MLDSA_PIN_GATE_OPEN_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: open [`MLDSA_PIN_ACTIVATION_EPOCH`] for this thread until the
+/// guard drops (including on unwind). Production has no override.
+#[cfg(test)]
+pub(crate) fn mldsa_pin_gate_open_guard() -> impl Drop {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MLDSA_PIN_GATE_OPEN_TL.with(|c| c.set(self.0));
+        }
+    }
+    Restore(MLDSA_PIN_GATE_OPEN_TL.with(|c| c.replace(true)))
+}
+
+/// Is the platform-independent ML-DSA-65 verification rule active in `epoch`?
+pub fn mldsa_pin_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if MLDSA_PIN_GATE_OPEN_TL.with(|c| c.get()) {
+        return true;
+    }
+    epoch_gate_active(epoch, MLDSA_PIN_ACTIVATION_EPOCH)
+}
+
+/// Flag day for canonical hybrid-signature encodings AND the v2 per-suite
+/// signing context (audit e9b52781) — for CONSENSUS MESSAGES ONLY.
+///
+/// Owner decision (HF2 scope): it governs attestations/votes, block proposer
+/// signatures, slashing evidence and KES leaf signatures. Transaction
+/// witnesses (transfers, deposits, withdrawals, lifecycle and L2 bridge
+/// transactions) are NEVER subject to it — they are judged under
+/// [`crate::attestation::SignaturePolicy::transaction`], which keeps every
+/// v1 encoding valid before and after this epoch. Each consensus message is
+/// judged under the rule of ITS OWN epoch (the epoch of the slot it signs),
+/// never the including block's, exactly as its signer chose the rule.
+///
+/// Below it every consensus signature check keeps the historical rule
+/// (`bloch_crypto::crypto::verify`), which admits several byte forms of one
+/// signature (header optional, Falcon half compact or zero-padded, halves
+/// from two signing runs recombinable) and signs both suites' ML-DSA half
+/// with an empty context. From it, consensus admits only
+/// [`crate::attestation::SignaturePolicy::Bound`]: one canonical byte form,
+/// ML-DSA signed under a suite-specific FIPS 204 context and the Falcon half
+/// bound to its ML-DSA half.
+///
+/// # ARMING IS A FOUNDER DECISION AND A VALIDATOR-FACING FLAG DAY
+///
+/// Every validator signer (attestations, proposals, KES leaves) must sign v2
+/// for messages of this epoch onward; the whole fleet must run a binary that
+/// carries the v2 verifier first. Wallets and exchanges are NOT affected.
+/// Ships INERT at `u64::MAX`; `sig_canonical_gate_is_inert` pins the value.
+/// The judged epoch is the signed message's own epoch, never a clock.
+pub const SIG_CANONICAL_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+#[cfg(test)]
+thread_local! {
+    static SIG_CANONICAL_GATE_OPEN_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: open [`SIG_CANONICAL_ACTIVATION_EPOCH`] for this thread until
+/// the guard drops (including on unwind). Production has no override.
+#[cfg(test)]
+pub(crate) fn sig_canonical_gate_open_guard() -> impl Drop {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SIG_CANONICAL_GATE_OPEN_TL.with(|c| c.set(self.0));
+        }
+    }
+    Restore(SIG_CANONICAL_GATE_OPEN_TL.with(|c| c.replace(true)))
+}
+
+#[cfg(test)]
+thread_local! {
+    static SIG_CANONICAL_GATE_AT_TL: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: arm [`SIG_CANONICAL_ACTIVATION_EPOCH`] at `epoch` for this
+/// thread until the guard drops, so flag-day BOUNDARY behaviour (messages of
+/// the last pre-flag-day epoch carried by post-flag-day blocks) is testable.
+#[cfg(test)]
+pub(crate) fn sig_canonical_gate_at_guard(epoch: u64) -> impl Drop {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SIG_CANONICAL_GATE_AT_TL.with(|c| c.set(self.0));
+        }
+    }
+    Restore(SIG_CANONICAL_GATE_AT_TL.with(|c| c.replace(Some(epoch))))
+}
+
+/// Is the canonical/suite-bound signature rule active in `epoch`?
+pub fn sig_canonical_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if SIG_CANONICAL_GATE_OPEN_TL.with(|c| c.get()) {
+        return true;
+    }
+    #[cfg(test)]
+    if let Some(at) = SIG_CANONICAL_GATE_AT_TL.with(|c| c.get()) {
+        return epoch >= at;
+    }
+    epoch_gate_active(epoch, SIG_CANONICAL_ACTIVATION_EPOCH)
+}
+
 /// Candidate flag day for genesis-bound validator duty signatures.
 ///
 /// This remains deliberately unarmed. Attestation and proposal candidate roots

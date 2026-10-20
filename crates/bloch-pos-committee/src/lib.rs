@@ -150,7 +150,9 @@ pub mod ws;
 pub mod wire_alloc;
 pub mod hard_forks;
 
-pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
+pub use attestation::{
+    Attestation, AttestationData, PolicyVerifier, RejectReason, SignaturePolicy, SignatureVerifier,
+};
 pub use beacon::{mix_in, process_reveal, BeaconError, RandaoChain, RevealState};
 pub use forkchoice::{BlockTree, LatestMessage, Store};
 pub use gossip::{

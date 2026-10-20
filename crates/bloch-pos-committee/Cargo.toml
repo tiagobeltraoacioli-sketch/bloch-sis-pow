@@ -42,6 +42,10 @@ l2-activation-rehearsal = []
 # mainnet policy values (chain id 700770, async, mainnet limits, attestor set)
 # instead of the development ones. Final qualification only. Never ship it.
 l2-activation-rehearsal-mainnet-policy = ["l2-activation-rehearsal"]
+# QUALIFICATION BUILDS ONLY (HF2 sigdet GO criterion). Sets
+# params::MLDSA_PIN_ACTIVATION_EPOCH = 0 so a full-history replay judges every
+# ML-DSA half with the pinned FIPS 204 verifier. Replay copies only; never ship.
+mldsa-pin-replay-qualification = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
