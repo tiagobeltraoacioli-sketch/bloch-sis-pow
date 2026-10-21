@@ -1,0 +1,53 @@
+{
+  "release": "bloch-pos-2026-10-21-node-hardening",
+  "source_commit": "1708953d839d55d461afed80802abacfdb8360c2",
+  "platform": "linux-x86_64",
+  "binary": "bloch-pos",
+  "binary_sha256": "d540e0e446cb7f6761b705bf38d2c348e954954e46d055ced2f4fbbfc604a444",
+  "checksum_manifest": "SHA256SUMS",
+  "checksum_signature": "SHA256SUMS.minisig",
+  "minisign_public_key": "bloch-release-20260922.pub",
+  "upgrade_only": true,
+  "new_hard_forks_armed": false,
+  "signed": true,
+  "status": "release-qualified",
+  "signature_verified": true,
+  "canary_validated_at_utc": "2026-10-21T17:35:12.430905+00:00",
+  "production_canaries": [
+    {
+      "node": "n01",
+      "first_attestation": {
+        "slot": 198204,
+        "epoch": 6193
+      },
+      "observed_slot": 198247,
+      "behind_by_slots": 0,
+      "finalized": {
+        "epoch": 6193,
+        "root": "235f07c552acfa958ebaa04feae1ee672d0011cbfe41a968ebb16cadc05f5198"
+      },
+      "restarts": 0,
+      "signer_anchor_lock_held": true,
+      "host_lock_released": true
+    },
+    {
+      "node": "n45",
+      "first_attestation": {
+        "slot": 198219,
+        "epoch": 6194
+      },
+      "observed_slot": 198247,
+      "behind_by_slots": 0,
+      "finalized": {
+        "epoch": 6193,
+        "root": "235f07c552acfa958ebaa04feae1ee672d0011cbfe41a968ebb16cadc05f5198"
+      },
+      "restarts": 0,
+      "signer_anchor_lock_held": true,
+      "host_lock_released": true
+    }
+  ],
+  "fleet_migration_complete": false,
+  "github_tag": "node-1708953d-node-hardening",
+  "website": "https://blochl1.com/releases/2026-10-21-node-hardening/"
+}
