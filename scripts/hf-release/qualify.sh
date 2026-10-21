@@ -212,6 +212,7 @@ run_tests() {
   say "tests: live debug, legacy release, proof release, explicit indexer lib (logs: $OUT/tests)"
   set +e
   "$ENGINE" run --rm --name "bloch-hf-qualify-tests-$C12-$$" \
+    --ulimit nofile=65536:65536 \
     -e "BLOCH_BUILD_COMMIT=$COMMIT" -e BLOCH_BUILD_TREE_ASSERTION=clean -e CARGO_TERM_COLOR=never \
     --mount "type=bind,src=$OUT/tests,dst=/results" \
     "$tag" python3 -I scripts/hf-release/test-matrix.py /results \

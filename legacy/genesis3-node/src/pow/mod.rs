@@ -475,9 +475,13 @@ mod tests {
         // sneaks past k=8 with probability ≈ 1/4096, so mine until one fails
         // (more than 8 mines has probability ≈ 4096^-8 — never).
         let preimage = b"bloch-sf1-k4-rejected-at-h";
-        let bits = target_to_bits(&Target::MAX);
+        // The difficulty selector uses the legacy compact decoder, whose
+        // representable exponent stops at 32. Target::MAX encodes with 33
+        // and would select k=8 through that decoder's invalid-target fallback.
+        let bits = 0x203fffc0;
         let strict_bits = 0x0500ffff;
         let h = K_RULE_ACTIVATION_HEIGHT;
+        assert_eq!(canonical_residual_coeffs(h, bits), TESTNET_RESIDUAL_COEFFS);
         assert_eq!(canonical_residual_coeffs(h - 1, strict_bits), TESTNET_RESIDUAL_COEFFS);
         assert_eq!(canonical_residual_coeffs(h, strict_bits), CANONICAL_RESIDUAL_COEFFS);
 
