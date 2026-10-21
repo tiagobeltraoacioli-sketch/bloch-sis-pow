@@ -17,7 +17,7 @@
 //!
 //! ## The u64 hazard, front and centre
 //!
-//! 100 B BLCH at 8 decimals is 10^19 satoshis — **54.21% of `u64::MAX`**. One
+//! A supply of 100 billion tokens at 8 decimals is 10^19 satoshis — **54.21% of `u64::MAX`**. One
 //! balance fits a `u64`, but with only 1.84x of headroom: the sum of any two
 //! balances above half the supply wraps, and release builds wrap silently. A
 //! wrapped consensus value is a chain split. Every quantity here is therefore

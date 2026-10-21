@@ -107,9 +107,9 @@ pub const ACTIVATION_DELAY_EPOCHS: u64 = 8;
 /// `set_size / 4` epochs of publicly visible queue traffic to take a majority.
 pub const MAX_ACTIVATIONS_PER_EPOCH: usize = 4;
 
-/// Growth-cap window, consulted only behind
-/// `params::HF2_GROWTH_CAP_EPOCH`: 24 epochs is 6.4 hours,
-/// about one ObenBlock epoch, so the ObenBlock bound carries over unchanged.
+/// Growth-cap window: 24 epochs span 6.4 hours, about one ObenBlock epoch,
+/// so the ObenBlock bound carries over unchanged. Consulted only behind
+/// `params::HF2_GROWTH_CAP_EPOCH`.
 pub const GROWTH_WINDOW_EPOCHS: u64 = 24;
 
 /// At most `W / GROWTH_DIV` of new own stake activates per window.

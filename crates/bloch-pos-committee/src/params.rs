@@ -2583,7 +2583,7 @@ pub(crate) mod funded_delegation_rehearsal {
 }
 
 /// Flag day for the native L2 settlement on a network that is already running
-/// (M8 part 2). `u64::MAX` means INERT.
+/// (M8 part 2), activated on mainnet at the epoch recorded below.
 ///
 /// Before the gate, a network without an L2 policy keeps no L2 state, the
 /// L2 state component is absent from the state root (historical roots are

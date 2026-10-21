@@ -70,7 +70,7 @@ COMMIT_ARG="${1:-}"; [ $# -gt 0 ] && shift
 SOURCE="" BASELINE_BIN="" OUT="" BASE_COMMIT=b4a21fb657d0beb17f64c62889b605c9a7a2d031
 FORCE_EPOCH="" WINDOW=16 JOBS=8 EXPECT_SLOT="" EXPECT_ROOT=""
 SKIP_TESTS=0 SKIP_FORCED=0 UNSANDBOXED=0 GATES_ONLY=0
-GATE_ARGS=() ALLOW_FAIL=() ALLOW_FAIL_SET=0 ALLOW_TEST=()
+GATE_ARGS=() ALLOW_FAIL=() ALLOW_TEST=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --source) SOURCE="$2"; shift 2 ;;
@@ -84,7 +84,7 @@ while [ $# -gt 0 ]; do
     --jobs) JOBS="$2"; shift 2 ;;
     --expect-slot) EXPECT_SLOT="$2"; shift 2 ;;
     --expect-root) EXPECT_ROOT="$2"; shift 2 ;;
-    --tests-allow-fail) ALLOW_FAIL+=("$2"); ALLOW_FAIL_SET=1; shift 2 ;;
+    --tests-allow-fail) ALLOW_FAIL+=("$2"); shift 2 ;;
     --tests-allow-test) ALLOW_TEST+=("$2"); shift 2 ;;
     --skip-tests) SKIP_TESTS=1; shift ;;
     --skip-forced) SKIP_FORCED=1; shift ;;

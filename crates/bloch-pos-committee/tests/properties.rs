@@ -699,7 +699,7 @@ fn unlocked_supply_never_exceeds_total_supply() {
 
 // ═══ 6. NO OVERFLOW AT THE V4 SUPPLY SCALE ══════════════════════════════════
 //
-// 100 B BLCH at 8 decimals is 10^19 sat — 54% of u64::MAX. Any u64 accumulator
+// A supply of 100 billion tokens at 8 decimals is 10^19 sat — 54% of u64::MAX. Any u64 accumulator
 // over more than one large balance wraps. These run in debug (overflow-checked)
 // builds, so a wrap is a panic, not a silent wrong answer.
 
