@@ -40,9 +40,9 @@ mod security_tests {
             "negative compact difficulty must never become a permissive target"
         );
         assert!(!block.validate_pow(), "invalid compact difficulty must fail PoW");
-        // Positive control: the same hash is accepted under a valid easy
-        // target. This catches a broken decoder/verifier that rejects all work.
-        assert!(hash_meets_target(&hash, &bits_to_target(0x2100ffff)));
+        // Positive control: a nonzero hash is accepted under a representable
+        // easy target. This catches a decoder/verifier that rejects all work.
+        assert!(hash_meets_target(&[1u8; 32], &bits_to_target(0x207fffff)));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
