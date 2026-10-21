@@ -1651,7 +1651,7 @@ mod tests {
     fn vesting_is_not_enforced() {
         let mut src = Vec::new();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../bloch-pos-committee/src");
+            .join("../../crates/bloch-pos-committee/src");
         let mut stack = vec![root.clone()];
         while let Some(d) = stack.pop() {
             for e in std::fs::read_dir(&d).expect("bloch-pos-committee/src is readable") {

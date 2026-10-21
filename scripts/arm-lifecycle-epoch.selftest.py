@@ -158,6 +158,38 @@ def main() -> None:
         # A manifest without the magic is refused before anything is read.
         (a / "genesis/mainnet.manifest").write_bytes(b"NOTAMANIFEST" + b"\0" * 16)
         expect("manifest without magic refused", run(a, "--epoch", "3400"), 1, "BPOSMAN")
+
+        # RANDAO has a production constant and a feature-gated devnet override.
+        # Declaration order must not decide which one --write changes.
+        declaration = "pub const RANDAO_RECOMMIT_ACTIVATION_EPOCH: u64 = u64::MAX;"
+        prod = '#[cfg(not(feature = "devnet-randao-recommit"))]\n' + declaration
+        dev = '#[cfg(feature = "devnet-randao-recommit")]\n' + declaration.replace("u64::MAX", "0")
+        for order, definitions in enumerate(((prod, dev), (dev, prod))):
+            c = base / f"conditional-{order}"
+            build_tree(c, genesis_epochs_ago=2536, tripwires=False)
+            p = c / "crates/bloch-pos-committee/src/params.rs"
+            p.write_text(p.read_text().replace(declaration, "\n/// Test override.\n".join(definitions)))
+            expect(f"cfg {order}: verify reads production", run(c, "--verify"), 0, "unarmed", "consistent")
+            expect(f"cfg {order}: write production only", run(c, "--write", "--epoch", "3400"), 0, "armed:")
+            assert dev in p.read_text(), "devnet definition changed"
+            assert prod.replace("u64::MAX", "3400") in p.read_text()
+            expect(f"cfg {order}: armed production verifies", run(c, "--verify"), 0, "consistent")
+
+        for label, replacement in (
+            ("unguarded duplicates", declaration + "\n" + declaration),
+            ("missing production", dev),
+            ("unknown cfg", prod.replace("devnet-randao-recommit", "unreviewed-feature") + "\n" + dev),
+            ("duplicate production", prod + "\n" + prod),
+            ("extra attribute", '#[cfg(feature = "other")]\n' + prod + "\n" + dev),
+        ):
+            c = base / label.replace(" ", "-")
+            build_tree(c, genesis_epochs_ago=2536)
+            p = c / "crates/bloch-pos-committee/src/params.rs"
+            p.write_text(p.read_text().replace(declaration, replacement))
+            original = p.read_text()
+            expect(label + ": verify refused", run(c, "--verify"), 1, "ambiguous or unsupported")
+            expect(label + ": write refused", run(c, "--write", "--epoch", "3400"), 1, "ambiguous or unsupported")
+            assert p.read_text() == original, "refused write changed source"
     print("arm-lifecycle-epoch.selftest: all cases behave as documented")
 
 
