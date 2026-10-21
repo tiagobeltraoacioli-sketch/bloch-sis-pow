@@ -5,8 +5,8 @@
 #
 #   1. build   the candidate in the canonical release container
 #              (the candidate's own scripts/build-pos-release-container.sh);
-#   2. tests   `cargo test --workspace --locked --no-fail-fast` in the same
-#              pinned toolchain image (Dockerfile target `build`);
+#   2. tests   every workspace package in the pinned toolchain, with complete
+#              tracked fixtures and Python; legacy/proof suites use --release;
 #   3. replay  a COPY of mainnet history from genesis with the gates at their
 #              configured epochs, candidate and fleet baseline side by side:
 #              both must re-apply every block and end on the same head. Every
@@ -47,8 +47,7 @@
 #     --jobs N              concurrent replays (default 8)
 #     --expect-slot N --expect-root HEX   head reported by the archivals for --source
 #     --tests-allow-fail PKG  package whose test failures are reported, not fatal
-#                           (repeatable; default: bloch = legacy/genesis3-node, the
-#                           closed Genesis-3 PoW node outside the CI blocking set)
+#                           (repeatable; default: no allowed failing packages)
 #     --tests-allow-test NAME test (full path or final segment) whose failure is
 #                           expected (tests that pin an ARMED gate to u64::MAX are
 #                           found and accepted automatically; see hf-gates.py tripwires)
@@ -100,7 +99,6 @@ for n in "$WINDOW" "$JOBS" ${FORCE_EPOCH:+"$FORCE_EPOCH"}; do
   case "$n" in ''|*[!0-9]*) echo "numeric option expected, got '$n'" >&2; exit 2 ;; esac
 done
 [ "$JOBS" -ge 1 ] || JOBS=1
-[ "$ALLOW_FAIL_SET" = 1 ] || ALLOW_FAIL=(bloch)
 [ "$GATES_ONLY" = 0 ] || [ ${#GATE_ARGS[@]} -gt 0 ] || { echo "--gates-only needs --gate" >&2; exit 2; }
 
 die() { echo "qualify: FAIL - $*" >&2; exit 1; }
@@ -193,54 +191,42 @@ fi
 
 # ── 2. workspace tests (in the background) ────────────────────────────────
 run_tests() {
-  local ctx="$OUT/test-ctx" tag="bloch-hf-qualify:$C12" trc passed failed blocking allowed
-  mkdir -p "$ctx"
+  local ctx="$OUT/test-ctx" build_tag="bloch-hf-qualify:$C12" tag="bloch-hf-tests:$C12" trc verdict
+  local allow_args=() a
+  mkdir -p "$ctx" "$OUT/tests"
   git -C "$REPO" archive --format=tar "$COMMIT" | tar -xf - -C "$ctx"
-  say "tests: image $tag (pinned toolchain, Dockerfile target build)"
-  if ! "$ENGINE" buildx build --progress=plain --target build --load -t "$tag" \
+  say "tests: canonical build image $build_tag"
+  if ! "$ENGINE" buildx build --progress=plain --target build --load -t "$build_tag" \
     --build-arg "BLOCH_BUILD_COMMIT=$COMMIT" --build-arg "SOURCE_DATE_EPOCH=$SDE" \
     --file "$ctx/deploy/pos-release/Dockerfile" "$ctx" > "$OUT/tests-image.log" 2>&1; then
+    record tests FAIL "base image build failed (tests-image.log)"; return 0
+  fi
+  if ! "$ENGINE" buildx build --progress=plain --load -t "$tag" \
+    --build-arg "BUILD_IMAGE=$build_tag" \
+    --file "$ctx/scripts/hf-release/Tests.Dockerfile" "$ctx" >> "$OUT/tests-image.log" 2>&1; then
     record tests FAIL "test image build failed (tests-image.log)"; return 0
   fi
   rm -rf "$ctx"
-  say "tests: cargo test --workspace --locked --no-fail-fast (log: $OUT/tests.log)"
+  for a in ${ALLOW_FAIL[@]+"${ALLOW_FAIL[@]}"}; do allow_args+=(--allow-package "$a"); done
+  for a in ${ALLOW_TEST[@]+"${ALLOW_TEST[@]}"}; do allow_args+=(--allow-test "$a"); done
+  say "tests: live debug, legacy release, proof release, explicit indexer lib (logs: $OUT/tests)"
   set +e
   "$ENGINE" run --rm --name "bloch-hf-qualify-tests-$C12-$$" \
     -e "BLOCH_BUILD_COMMIT=$COMMIT" -e BLOCH_BUILD_TREE_ASSERTION=clean -e CARGO_TERM_COLOR=never \
-    "$tag" cargo test --workspace --locked --no-fail-fast > "$OUT/tests.log" 2>&1
+    --mount "type=bind,src=$OUT/tests,dst=/results" \
+    "$tag" python3 -I scripts/hf-release/test-matrix.py /results \
+    ${allow_args[@]+"${allow_args[@]}"} > "$OUT/tests.log" 2>&1
   trc=$?
   set -e
-  passed=$(awk '/^test result:/{s+=$4} END{print s+0}' "$OUT/tests.log")
-  failed=$(awk '/^test result:/{s+=$6} END{print s+0}' "$OUT/tests.log")
-  # Every failing test with its PACKAGE: "<package> <test path>". With
-  # --no-fail-fast cargo prints, right after each failing test binary,
-  # "error: test failed, to rerun pass `-p <package> ...`"; the FAILED lines
-  # since the previous binary belong to that package ("?" if none follows).
-  awk '
-    /^ *(Running|Doc-tests) / { for (i in pend) print "?", pend[i]; delete pend; n = 0 }
-    /^test .* \.\.\. FAILED$/ { pend[++n] = $2 }
-    /to rerun pass `-p / { match($0, /`-p [A-Za-z0-9_-]+/); pkg = substr($0, RSTART + 4, RLENGTH - 4)
-                           for (i in pend) print pkg, pend[i]; delete pend; n = 0 }
-    END { for (i in pend) print "?", pend[i] }
-  ' "$OUT/tests.log" | sort -u > "$OUT/tests-failed.txt"
-  blocking="" allowed=""
-  while read -r crate name; do
-    [ -n "$name" ] || continue
-    local ok=0 a
-    for a in "${ALLOW_FAIL[@]}"; do [ "$crate" = "$a" ] && ok=1; done
-    for a in ${ALLOW_TEST[@]+"${ALLOW_TEST[@]}"}; do
-      case "$name" in "$a"|*"::$a") ok=1 ;; esac
-    done
-    if [ "$ok" = 1 ]; then allowed="$allowed $crate:$name"; else blocking="$blocking $crate:$name"; fi
-  done < "$OUT/tests-failed.txt"
-  if [ "$trc" = 0 ]; then
-    record tests PASS "$passed passed, $failed failed"
-  elif [ -s "$OUT/tests-failed.txt" ] && [ -z "$blocking" ]; then
-    record tests WARN "$passed passed, $failed failed, all allowed:$allowed (tests.log)"
-  else
-    grep -E '^error(\[|:)' "$OUT/tests.log" | sort -u | head -20 || true
-    record tests FAIL "rc=$trc, $passed passed, $failed failed; blocking:${blocking:- none attributed (build error?)} (tests.log)"
+  if [ "$trc" != 0 ] || [ ! -f "$OUT/tests/summary.json" ]; then
+    record tests FAIL "rc=$trc; all four stages must complete (tests.log, tests/*.log)"
+    return 0
   fi
+  verdict=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$OUT/tests/summary.json")
+  case "$verdict" in
+    PASS|WARN) record tests "$verdict" "all four stages completed (tests/summary.json)" ;;
+    *) record tests FAIL "unexpected matrix verdict $verdict" ;;
+  esac
 }
 TESTS_PID=""
 if [ "$SKIP_TESTS" = 1 ]; then

@@ -1,0 +1,13 @@
+# Complete tracked test fixtures, with the same secret exclusions as releases.
+target/
+**/target/
+.git/
+**/validator.key
+**/*.sk
+**/*.pem
+**/slashing-protection.bin
+**/passphrase*
+**/.env
+**/.env.*
+**/id_rsa*
+**/id_ed25519*
