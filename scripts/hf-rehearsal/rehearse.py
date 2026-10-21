@@ -174,6 +174,26 @@ class Rehearsal:
                 except SoakError as e:
                     shutil.rmtree(sdir, ignore_errors=True)
                     self.suite3_error = str(e)[-300:]
+        # Invariance: per round, a TransferV2, a funded validator deposit and a
+        # funded delegation signed with TODAY's tools (the baseline binary's CLI)
+        # must be included after every gate. One funder per kind, one opening
+        # allocation per round (amounts differ by a few sat so outpoints are distinct).
+        self.inv_rounds = [] if getattr(self.a, "no_invariance", True) else ["pre-HF1", "post-HF1", "post-HF2", "post-HF3"]
+        self.inv_keys: dict[str, tuple[Path, str]] = {}
+        for k, (role, idx) in enumerate((("transfer", 910), ("deposit", 911), ("delegate", 912))):
+            if not self.inv_rounds:
+                break
+            d = self.work / "keys" / f"inv-{role}"
+            self.base.keygen(d, idx)
+            _, pk, _ = self.base.keygen_public(d)
+            (d / "pubkey.hex").write_text(pk + "\n")
+            self.inv_keys[role] = (d, pk)
+            for r_i, r in enumerate(self.inv_rounds):
+                sat = (25_010 if role == "deposit" else 200) * 100_000_000 + r_i
+                allocs.append((lib.sha3_hex(pk), sat)); names.append(f"inv-{role}-{r}")
+        for r in self.inv_rounds:
+            jd = self.work / "keys" / f"inv-joiner-{r}"
+            self.base.keygen(jd, "auto")
         args = ["genesis", "--keys", ",".join(map(str, keydirs)), "--out", str(self.genesis),
                 "--slot-ms", str(self.a.slot_ms), "--start-in", str(self.a.start_in)]
         if self.a.bind_genesis:
@@ -365,6 +385,11 @@ class Rehearsal:
                 self.checks.ok("evidence refused while slashing is not yet active",
                                not pre["submitted_before_gate"]["accepted"], pre["submitted_before_gate"])
 
+            inv_results = []
+            if self.inv_rounds:
+                self.wait_epoch(a.hf1 - 2, 4)
+                inv_results.append(self.invariance_round("pre-HF1"))
+
             # L2 installed at --l2-epoch (< HF1): claim finality must record
             # nothing before HF1 and the chain's own checkpoint roots after it.
             l2_snaps = {}
@@ -384,6 +409,9 @@ class Rehearsal:
             self.wait_epoch(heal)
             self.mesh.heal_between(minority_set, other)
             self.event("partition_heal")
+            if self.inv_rounds:
+                self.wait_epoch(heal, 12)
+                inv_results.append(self.invariance_round("post-HF1"))
 
             if a.l2_epoch is not None:
                 self.wait_epoch(a.hf2, 8)
@@ -412,6 +440,10 @@ class Rehearsal:
                     post = {"error": str(e)[-600:], "slot": slot, "intended_validator": q}
                     self.event("post_activation_offence_failed", **post)
             self.checks.ok("post-activation offence injected", bool(post.get("ids")), post)
+
+            if self.inv_rounds:
+                self.wait_epoch(a.hf2 + 1, 20)
+                inv_results.append(self.invariance_round("post-HF2"))
 
             # e16: 0x0003 spend before HF3 must be refused.
             self.wait_epoch(a.hf2 + 2, 4)
@@ -472,6 +504,10 @@ class Rehearsal:
                                 {"reason": "candidate build has no suite-0x0003 keygen",
                                  "error": getattr(self, "suite3_error", None)})
             self.kes_rotation(report)
+            if self.inv_rounds:
+                self.wait_epoch(a.hf3 + 1, 20)
+                inv_results.append(self.invariance_round("post-HF3"))
+            report["invariance"] = inv_results
 
             # e20-e26 inactivity.
             slashed_v = post.get("validator")
@@ -501,6 +537,8 @@ class Rehearsal:
                                     "stake_after": {v: (after[v]["own_stake_sat"], after[v]["effective_stake_sat"]) for v in after}}
 
             self.wait_epoch(a.stop_epoch)
+            if inv_results:
+                self.invariance_verdicts(inv_results)
             report["final_live"] = {i: self.latest(i) for i in range(self.total_nodes)}
             self.stop_sampler.set()
             sampler.join(timeout=10)
@@ -543,6 +581,93 @@ class Rehearsal:
             print(f"VERDICT: {report['status']}  ({sum(c['status']=='PASS' for c in self.checks.rows)} pass, "
                   f"{len(fails)} fail, {sum(c['status']=='SKIP' for c in self.checks.rows)} skip)  report: {self.work/'report.json'}")
         return 1 if report["status"] != "PASS" else 0
+
+    def invariance_round(self, r: str) -> dict:
+        """Sign with the baseline (release) binary's CLIs, submit to an upgraded node."""
+        res: dict = {"round": r, "epoch": self.clock.wall_epoch()}
+        txdir = self.work / "tx"
+        txdir.mkdir(exist_ok=True)
+        fee = int(self.rpc(0, "getvalidatoradmission")["next_base_fee_millisat_per_gas"])
+        epoch = self.clock.wall_epoch()
+        via = next(v for v in range(self.n) if self.nodes[v].alive())
+        # TransferV2
+        d, _ = self.inv_keys["transfer"]
+        txid, msg = self.transfer_v2(self.base, d, self.allocs[f"inv-transfer-{r}"], txdir / f"inv-transfer-{r}.hex")
+        res["transfer"] = {"accepted": bool(txid), "reply": msg[:200]}
+        # Funded validator deposit
+        fd, fpk = self.inv_keys["deposit"]
+        jd = self.work / "keys" / f"inv-joiner-{r}"
+        _, vpk, randao = self.base.keygen_public(jd)
+        (jd / "pubkey.hex").write_text(vpk + "\n")
+        a = self.allocs[f"inv-deposit-{r}"]
+        fsh = lib.sha3_hex(fpk)
+        p0, p1, p2 = (txdir / f"inv-deposit-{r}.{k}.hex" for k in range(3))
+        try:
+            self.base.run(["validator-deposit", "prepare", "--genesis", str(self.genesis),
+                           "--funding-pubkey", str(fd / "pubkey.hex"), "--validator-pubkey", str(jd / "pubkey.hex"),
+                           "--randao", randao, "--withdrawal", fsh, "--change", fsh,
+                           "--stake", str(25_000 * 100_000_000), "--input", f"{a['txid']}:{a['vout']}:{a['sat']}",
+                           "--max-base-fee", str(fee * 2 + 100), "--tip", "5", "--expiry", str(epoch + 6),
+                           "--commission", "500", "--out", str(p0)], timeout=120)
+            self.base.run(["validator-deposit", "sign", "--genesis", str(self.genesis), "--tx", str(p0),
+                           "--role", "funding", "--dir", str(fd), "--out", str(p1)], timeout=600)
+            self.base.run(["validator-deposit", "sign", "--genesis", str(self.genesis), "--tx", str(p1),
+                           "--role", "validator", "--dir", str(jd), "--out", str(p2)], timeout=600)
+            ok, msg = self.submit(via, p2.read_text().strip())
+        except SoakError as e:
+            ok, msg = False, f"tool refused: {e}"
+        res["deposit"] = {"accepted": ok, "reply": msg[:200], "validator_pubkey_hash": lib.sha3_hex(vpk)}
+        # Funded delegation to a live, unslashed genesis validator
+        gd, gpk = self.inv_keys["delegate"]
+        target = None
+        for v in range(self.n):
+            try:
+                rec = self.rpc(via, "getvalidator", [v])
+            except SoakError:
+                continue
+            if rec.get("state") == "active" and not rec.get("slashed"):
+                target = v
+                break
+        a = self.allocs[f"inv-delegate-{r}"]
+        q0, q1 = (txdir / f"inv-delegate-{r}.{k}.hex" for k in range(2))
+        try:
+            tpk = self.rpc(via, "getvalidator", [target])["pubkey_hash"]
+            self.base.run(["funded-delegation", "prepare-delegate", "--genesis", str(self.genesis),
+                           "--pubkey", str(gd / "pubkey.hex"), "--validator-hash", tpk,
+                           "--amount", str(100 * 100_000_000), "--input", f"{a['txid']}:{a['vout']}:{a['sat']}",
+                           "--change", lib.sha3_hex(gpk), "--max-base-fee", str(fee * 2 + 100), "--tip", "5",
+                           "--expiry", str(epoch + 6), "--out", str(q0)], timeout=120)
+            info = json.loads(self.base.run(["funded-delegation", "inspect", "--tx", str(q0)], timeout=60).stdout)
+            self.base.run(["funded-delegation", "sign", "--genesis", str(self.genesis), "--tx", str(q0),
+                           "--dir", str(gd), "--expected-root", info["signing_root"], "--out", str(q1)], timeout=600)
+            ok, msg = self.submit(via, q1.read_text().strip())
+        except (SoakError, KeyError, ValueError) as e:
+            ok, msg = False, f"tool refused: {e}"
+        res["delegate"] = {"accepted": ok, "reply": msg[:200], "target": target}
+        self.event("invariance_round", **{k: (v if not isinstance(v, dict) else v.get("accepted")) for k, v in res.items()})
+        return res
+
+    def invariance_verdicts(self, rounds: list[dict]) -> None:
+        via = next(v for v in range(self.n) if self.nodes[v].alive())
+        for res in rounds:
+            r = res["round"]
+            def spent(name):
+                a = self.allocs[name]
+                try:
+                    return self.rpc(via, "gettxout", [a["txid"], a["vout"]]).get("unspent") is False
+                except SoakError:
+                    return False
+            t = spent(f"inv-transfer-{r}")
+            d = spent(f"inv-deposit-{r}")
+            try:
+                known = bool(self.rpc(via, "getvalidatorbykey", [res["deposit"]["validator_pubkey_hash"]]))
+            except SoakError:
+                known = False
+            g = spent(f"inv-delegate-{r}")
+            for kind, ok in (("TransferV2", t), ("validator deposit", d and known), ("funded delegation", g)):
+                key = {"TransferV2": "transfer", "validator deposit": "deposit", "funded delegation": "delegate"}[kind]
+                self.checks.ok(f"invariance {r}: {kind} signed with today's CLI is included",
+                               bool(ok), dict(res[key], included=bool(ok), **({"registered": known} if kind == "validator deposit" else {})))
 
     def l2_snapshot(self) -> dict:
         snap = {"wall_slot": self.clock.wall_slot(), "nodes": {}}
@@ -661,9 +786,13 @@ class Rehearsal:
         # (own - effective), and an online validator's gap must not grow.
         def gap(snap, v):
             return int(snap[v][0]) - int(snap[v][1])
-        bites = {v: gap(inact["stake_after"], v) - gap(inact["stake_before"], v) for v in inact["stake_after"]}
-        self.checks.ok("inactivity: leak bit every offline validator", all(bites[v] > 0 for v in offline),
-                       {v: bites[v] for v in offline})
+        # A slashed validator reports null stakes; it has no leak to measure.
+        def numeric(snap, v):
+            return v in snap and all(x is not None for x in snap[v])
+        bites = {v: gap(inact["stake_after"], v) - gap(inact["stake_before"], v) for v in inact["stake_after"]
+                 if v != inact.get("slashed") and numeric(inact["stake_after"], v) and numeric(inact["stake_before"], v)}
+        self.checks.ok("inactivity: leak bit every offline validator", all(bites.get(v, 0) > 0 for v in offline),
+                       {v: bites.get(v) for v in offline})
         # Online reference: only a validator whose OWN node logged an attestation
         # for every epoch in which the leak could charge it ([stop_e-1, start_e])
         # must come out at zero. A node log line is "signed and broadcast", not
@@ -671,7 +800,7 @@ class Rehearsal:
         # make without decoding block bodies. Partial attesters are reported
         # with the epochs they missed, never failed.
         need = set(range(stop_e - 1, start_e + 1))
-        online = [v for v in upgraded if v not in offline and v != inact.get("slashed")]
+        online = [v for v in upgraded if v not in offline and v in bites]
         attested = {v: {int(e) for e in re.findall(r"\] attested \(epoch (\d+)", self.nodes[v].log_text())} & need
                     for v in online}
         full = [v for v in online if attested[v] == need]
@@ -814,6 +943,8 @@ def main() -> int:
     ap.add_argument("--stop-epoch", type=int, default=31)
     ap.add_argument("--port-base", type=int, default=27400)
     ap.add_argument("--bind-genesis", action="store_true", help="BPOSMAN2 manifest (default: the format mainnet launched with)")
+    ap.add_argument("--no-invariance", action="store_true",
+                    help="skip the deposit/withdrawal invariance rounds (TransferV2, deposit, delegation per gate)")
     ap.add_argument("--l2-epoch", type=int, help="the L2 install epoch both binaries were built with (run.sh --l2-epoch)")
     a = ap.parse_args()
     if not 8 <= a.validators <= 15:
