@@ -107,7 +107,7 @@
 <tr><th scope="row">Inactivity leak</th><td>Still reduces rewards and balances; does not change the finality denominator</td></tr>
 <tr><th scope="row">Vote eligibility</th><td>A vote counts only when its source and target are checkpoints of the voter’s own chain; foreign votes count as absent</td></tr>
 </tbody></table></div>
-<p>The frozen-set review still has three failing activation tests. This mechanism remains disabled in release 1708953d.</p>
+<p>Activation remains subject to further qualification. This mechanism remains disabled in release 1708953d.</p>
 <div class="spec-callout"><h3>The intended quorum property</h3><p>Each side needs at least two thirds of the weight of the same frozen set C. Two disjoint groups of validators cannot each hold two thirds of one total, so conflicting checkpoints cannot both reach the quorum.</p></div></section>
 
 <section id="certificates" aria-labelledby="certificates-title"><h2 id="certificates-title">3. Finality certificates.</h2>
