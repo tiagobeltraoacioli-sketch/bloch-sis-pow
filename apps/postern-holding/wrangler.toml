@@ -1,0 +1,19 @@
+name = "posternlabs-holding"
+main = "worker.js"
+compatibility_date = "2026-10-06"
+# Other paths are fetched from the existing Pages site on the same zone, not from this Worker again.
+compatibility_flags = ["global_fetch_private_origin"]
+workers_dev = false
+preview_urls = false
+
+# Both domains serve the same holding site. Other paths pass through to their Pages origin.
+routes = [
+  { pattern = "posternlabs.com/*", zone_name = "posternlabs.com" },
+  { pattern = "blochprotocol.io/*", zone_name = "blochprotocol.io" },
+  { pattern = "www.blochprotocol.io/*", zone_name = "blochprotocol.io" }
+]
+
+[assets]
+directory = "public"
+binding = "ASSETS"
+run_worker_first = true
