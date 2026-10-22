@@ -152,6 +152,8 @@ fn spawn_node(
     let err = out.try_clone().expect("dup log");
     Command::new(BIN)
         .env(KEYSTORE_POLICY.0, KEYSTORE_POLICY.1)
+        // Keep the host signer anchor inside this throwaway test root.
+        .env("BLOCH_SIGNER_ANCHOR_DIR", dir.with_extension("signer-anchor"))
         .args([
             "run",
             "--data-dir",
@@ -197,6 +199,10 @@ fn spawn_node(
 }
 
 #[test]
+#[cfg_attr(
+    any(feature = "devnet-randao-recommit", feature = "devnet-l2-deposits"),
+    ignore = "uses a BPOSMAN1 genesis, which development-feature builds refuse by design"
+)]
 fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
     let root = tmp_root();
     let genesis = root.join("genesis.bin");

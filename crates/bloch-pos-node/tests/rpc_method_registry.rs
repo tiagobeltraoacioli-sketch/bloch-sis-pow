@@ -93,6 +93,9 @@ use std::path::PathBuf;
 const ROUTED: &[(&str, &str)] = &[
     ("getchaininfo", "ChainInfo"),
     ("getbuildinfo", "BuildInfo"),
+    ("getl2settlement", "L2Settlement"),
+    ("getkes", "Kes"),
+    ("getblockraw", "BlockRaw"),
     ("getblockcount", "BlockCount"),
     ("getblockbyslot", "BlockBySlot"),
     ("getblockbyid", "BlockById"),
@@ -100,6 +103,8 @@ const ROUTED: &[(&str, &str)] = &[
     ("getvalidatorcount", "ValidatorCount"),
     ("getvalidatorbykey", "ValidatorByKey"),
     ("getvalidatoradmission", "ValidatorAdmission"),
+    // A funded position and its owner ledger are not exposed by validator queries.
+    ("getfundeddelegation", "FundedDelegation"),
     ("getbalance", "Balance"),
     ("gettxout", "TxOut"),
     ("getutxos", "Utxos"),
@@ -113,6 +118,8 @@ const ROUTED: &[(&str, &str)] = &[
     // own two-layer discipline.
     ("getvalidators", "Validators"),
     ("gettxstatus", "TxStatus"),
+    // Freeze bump (2026-10-19): finality certificates, a new variant.
+    ("getfinalitycertificate", "FinalityCertificate"),
 ];
 
 /// Names that are routed and answer with a REFUSAL rather than a variant.

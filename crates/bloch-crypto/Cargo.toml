@@ -56,7 +56,18 @@ auxpow-rehearsal = []
 # could silently change keygen's internal byte consumption and rotate every
 # derived key. Bumping this pin is a deliberate, reviewed action, not
 # something `cargo update` should ever do on its own.
+#
+# HF2 sigdet: production keeps pqcrypto-mldsa's DEFAULT features (avx2,
+# neon), exactly as the base release, so the historical consensus
+# verification path is byte-identical until MLDSA_PIN_ACTIVATION_EPOCH.
+# crypto/mod.rs keeps the CPU-dispatching wrapper ONLY in
+# `mldsa65_verify_legacy` and reaches the FIPS 204 reference behaviour through
+# `bloch-mldsa-clean`, which calls `PQCLEAN_MLDSA65_CLEAN_*` through `ffi`
+# explicitly whatever features are on. Signing always uses `clean`
+# (byte-identical output for the same `rnd` on every backend,
+# tests/hf2_sigdet_backends.rs).
 pqcrypto-mldsa     = "=0.1.2"
+bloch-mldsa-clean  = { path = "../bloch-mldsa-clean" }
 # F1 (BLOCH-FALCON-ONLINE-SIGNING.md §3.2): default features ("avx2","neon")
 # dispatch Falcon SIGNING to PQClean's native floating-point variants — forbidden
 # for a PoS validator that signs on a public schedule. `default-features = false`
@@ -68,6 +79,17 @@ pqcrypto-mldsa     = "=0.1.2"
 pqcrypto-falcon    = { version = "=0.4.1", default-features = false, features = ["std"] }
 pqcrypto-traits    = "0.3"
 pqcrypto-internals = "0.2"
+# HF3 optional suite 0x0003 (SLH-DSA-SHAKE-128s || Falcon-1024), FIPS 205.
+# Resolved to the VENDORED, hash-pinned copy at crates/fips205 through the
+# workspace [patch.crates-io] (byte-identical fips205 0.4.1 sources: pure
+# Rust, #![deny(unsafe_code)], MIT OR Apache-2.0, NOT independently audited).
+# Pinned exact like the other PQ primitives. Only the one parameter set is
+# compiled and no default features (no getrandom 0.2): opt_rand is drawn from
+# the workspace rand 0.9 RNG. Consensus acceptance is gated by
+# crypto::HF3_SLH_SUITE_EPOCH (u64::MAX = never).
+fips205   = { version = "=0.4.1", default-features = false, features = ["slh_dsa_shake_128s"] }
+# rand_core 0.6 trait only (fips205's RNG interface); no OS-RNG features.
+rand_core = { version = "0.6.4", default-features = false }
 
 # Hashing / KDF / AEAD.
 sha2   = "0.10"
@@ -111,7 +133,14 @@ async-trait = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only (already on via the production defaults; kept explicit so the
+# differential tests never silently lose a backend): PQClean AVX2/AArch64 next to `clean`
+# so tests/acvp_fips204_full.rs can check every backend against NIST ACVP and
+# against the pinned (`clean`) verifier.
+pqcrypto-mldsa = { version = "=0.1.2", features = ["avx2", "neon"] }
 tokio    = { version = "1", features = ["full"] }
 # Property-based invariant tests for the Genesis-locked emission / halving /
 # founder-vesting math in src/core/tokenomics_v2.rs (consensus-critical).
 proptest = "1"
+# HF2 sigdet tests call the pinned clean verifier directly with a context.
+bloch-mldsa-clean = { path = "../bloch-mldsa-clean" }

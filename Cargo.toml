@@ -13,8 +13,10 @@ resolver = "2"
 members = [
     "tools/bloch-indexer",
     # ── Genesis-4, proof of stake. THE LIVE CHAIN. ──
+    "crates/bloch-l2-proof",        # deterministic succinct verifier, no prover
     "crates/bloch-pos-committee",  # frozen consensus math (pure, sha3-only)
     "crates/bloch-pos-node",       # the `bloch-pos` binary the fleet runs
+    "crates/bloch-finality-cert",  # finality certificates + standalone verifier (RPC/library only)
     "tools/genesis4-ceremony",     # assembled the live genesis block
 
     # ── Shared protocol crates. Used by BOTH eras; not PoW-only. ──
@@ -22,11 +24,13 @@ members = [
     # Falcon-1024), and it pulls bloch-sis-pow + coherence-core, which is why
     # those two stay here rather than moving under legacy/.
     "crates/bloch-crypto",
+    "crates/bloch-mldsa-clean", # consensus ML-DSA-65 pinned to PQClean `clean` (P9f); hosts the FFI bloch-crypto forbids
     "crates/bloch-ustav",   # PQ-only native-token kernel; no live-node dependency
     "crates/bloch-sis-pow", "crates/coherence-core", "crates/pqcrypto-internals",
     "crates/bloch-btc-wallet",
     "crates/bloch-pq-vault",   # non-custodial PQ-shield vault (P2WSH commit-delay-reveal + PQ clawback anchor)
     "crates/libp2p-yamux",     # VENDORED libp2p-yamux fork: yamux-0.12 backend removed (GHSA-vxx9-2994-q338); see its Cargo.toml
+    "crates/fips205",          # VENDORED fips205 0.4.1 (SLH-DSA, FIPS 205) for HF3 suite 0x0003; hash-pinned, see its Cargo.toml
 
     # ── Genesis-3, proof of work. CLOSED — kept buildable for audit. ──
     "legacy/genesis3-node",    # the `bloch` binary; ran mainnet to h39,918
@@ -70,6 +74,13 @@ opt-level = 3
 [profile.dev.package.bloch-sis-pow]
 opt-level = 3
 
+# SLH-DSA-SHAKE-128s signs in ~0.3 s optimised and minutes unoptimised; the
+# FIPS 205 ACVP vectors and suite-0x0003 tests sign dozens of times. Upstream
+# fips205 ships `[profile.dev] opt-level = 3` for the same reason. Dev/test
+# only; the release profile is unchanged.
+[profile.dev.package.fips205]
+opt-level = 3
+
 [profile.release]
 opt-level      = 3
 lto            = true
@@ -101,3 +112,8 @@ pqcrypto-internals = { path = "crates/pqcrypto-internals" }
 # `multiple-versions = "deny"` both fail the build if a second yamux returns.
 # Drop this patch when an upstream libp2p release sheds the yamux 0.12 dep.
 libp2p-yamux = { path = "crates/libp2p-yamux" }
+# fips205 0.4.1 VENDORED at crates/fips205 (HF3 suite 0x0003, SLH-DSA-SHAKE-128s).
+# Byte-identical upstream sources, hash-pinned by crates/fips205/VENDOR.toml;
+# only its manifest is local. Not independently audited — freezing it in-tree
+# makes any change a reviewed diff. See crates/fips205/Cargo.toml.
+fips205 = { path = "crates/fips205" }

@@ -178,8 +178,10 @@ fn tx_validity_is_invariant_to_dual_and_pow() {
             // Cheap SHA-256d gate first.
             if sha256d_pow_valid(&h.pow_hash(), &sha_target, HEIGHT) {
                 // SIS solve BOUND to THIS exact nonce (budget capped so it can't
-                // wander to a different nonce -> upholds the coupling).
-                if let Some((got, sol)) = pow::mine_sis_pow_testnet(&preimage, sis_bits, nonce, 8_192) {
+                // wander to a different nonce -> upholds the coupling). The
+                // adapter searches 4096 candidates per nonce; a larger budget
+                // would allow it to advance to a nonce that failed the SHA gate.
+                if let Some((got, sol)) = pow::mine_sis_pow_testnet(&preimage, sis_bits, nonce, 4_096) {
                     assert_eq!(got, nonce, "coupling: SIS witness must bind the SHA nonce");
                     break (nonce, sol.to_vec());
                 }

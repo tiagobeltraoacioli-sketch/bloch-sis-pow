@@ -47,14 +47,22 @@
 mod codec;
 mod connection_limit;
 mod devnet_tools;
+mod l2_da_cli;
+mod l2_claim_cli;
+mod l2_deposit_cli;
 mod engine;
+mod equivocation_watch;
 mod genesis;
+mod funded_delegation_cli;
 mod keys;
+mod kes_key;
+mod kes_cli;
 mod metrics;
 mod net;
 mod p2p;
 mod rpc;
 mod slashprot;
+mod signer_anchor;
 mod slashing_cli;
 mod store;
 mod ws_boot;
@@ -99,6 +107,7 @@ fn plaintext_opt_in_flag(args: &[String]) -> bool {
         return false;
     }
     let switches = ["--allow-finality-rewind", "--no-doppelganger-check", "--replay-from-genesis",
+        "--no-signer-anchor", "--accept-signing-rollback",
         "--require-state-cache", "--behind-proxy", "--bind-genesis"];
     let mut rest = args.iter().skip(1);
     while let Some(arg) = rest.next() {
@@ -215,9 +224,45 @@ fn main() {
                 exit(2);
             }
         }
+        Some("watch-equivocation") => {
+            if let Err(error) = equivocation_watch::run(&args[1..]) {
+                eprintln!("watch-equivocation: {error}\n{}", equivocation_watch::USAGE);
+                exit(2);
+            }
+        }
         Some("genesis") => genesis_cmd(&args[1..]),
         Some("genesis-mainnet") => genesis_mainnet(&args[1..]),
         Some("submit-tx") => submit_tx(&args[1..]),
+        Some("funded-delegation") => {
+            if let Err(error) = funded_delegation_cli::run(&args[1..]) {
+                eprintln!("funded-delegation: {error}");
+                exit(2);
+            }
+        }
+        Some("l2-deposit") => {
+            if let Err(error) = l2_deposit_cli::run(&args[1..]) {
+                eprintln!("l2-deposit: {error}");
+                exit(2);
+            }
+        }
+        Some("l2-da") => {
+            if let Err(error) = l2_da_cli::run(&args[1..]) {
+                eprintln!("l2-da: {error}");
+                exit(2);
+            }
+        }
+        Some("kes") => {
+            if let Err(error) = kes_cli::run(&args[1..]) {
+                eprintln!("kes: {error}");
+                exit(2);
+            }
+        }
+        Some("l2-claim") => {
+            if let Err(error) = l2_claim_cli::run(&args[1..]) {
+                eprintln!("l2-claim: {error}");
+                exit(2);
+            }
+        }
         Some("validator-deposit") => {
             if let Err(error) = validator_deposit::run(&args[1..]) {
                 eprintln!("validator-deposit: {error}");
@@ -314,6 +359,7 @@ fn print_help() {
                Print the PUBLIC header of validator.key: format, index,\n\
                pubkey sha3, KDF cost, file mode. Opens nothing, prints no\n\
                secret. Also reports whether the data dir lock is free.\n\
+           bloch-pos funded-delegation --help
            bloch-pos validator-deposit --help
            bloch-pos validator-lifecycle --help
            bloch-pos validator-payout --help
@@ -352,11 +398,23 @@ fn print_help() {
                epoch from running nodes (all --rpc endpoints must agree),\n\
                writing <prefix>.bin (154 canonical bytes) + <prefix>.json\n\
                and printing the ws digest the signers sign.\n\
-           bloch-pos slashing-protection <export|import|set-floor>\n\
+           bloch-pos slashing-protection <export|import|set-floor|retire>\n\
                --data-dir <dir> --validator-pubkey-sha3 <hex32>\n\
-               --genesis-digest <hex32> [--out <file>|--in <file>|--min-slot <n>]\n\
+               --genesis-digest <hex32> [--signer-anchor-dir <dir>]\n\
+               [--out <file>|--in <file>|--min-slot <n>|--note <text>]\n\
                Offline only: stop this node and fence any previous signer.\n\
                Import merges monotone watermarks; it never lowers protection.\n\
+               Export merges the host signer anchor; retire blocks this key\n\
+               from booting on this host again (after a migration export).\n\
+           bloch-pos run ... [--signer-anchor-dir <dir>] [--no-signer-anchor]\n\
+                             [--accept-signing-rollback]\n\
+               Signer anchor (default $HOME/.bloch-signer): one lock per\n\
+               validator key on this host, and a refusal to sign from a data\n\
+               dir older than the key's last signature. An unwritable\n\
+               default (systemd ProtectHome=, missing HOME) only warns;\n\
+               an explicit --signer-anchor-dir must be usable.\n\
+           bloch-pos watch-equivocation --rpc HOST:PORT [--rpc ...] --state FILE --out EVIDENCE.jsonl\n\
+               [--from-slot N] [--to-slot N] [--window-epochs 256]   (read-only double/surround vote detector)\n\
            bloch-pos ws-keygen --out <prefix>\n\
            bloch-pos ws-signer-set --id <n> --threshold <m>\n\
                                    --min-external <k> --adopted-epoch <e>\n\
@@ -759,6 +817,8 @@ fn run_switch(args: &[String], name: &str) -> bool {
         "--behind-proxy",
         "--bind-genesis",
         "--no-doppelganger-check",
+        "--no-signer-anchor",
+        "--accept-signing-rollback",
         "--replay-from-genesis",
         "--require-state-cache",
     ];
@@ -1064,6 +1124,10 @@ fn keygen(args: &[String]) {
 /// about which balance set this chain opens with, and the file itself is
 /// checked later, at node start, against exactly these four fields.
 fn genesis_mainnet(args: &[String]) {
+    if arg_value(args, "--l2-settlement-config").is_some() {
+        eprintln!("L2 settlement is restricted to a fresh unfunded development genesis");
+        exit(2);
+    }
     use bloch_pos_committee::tokenomics_v4 as t;
 
     let Some(cohort_path) = arg_value(args, "--cohort") else {
@@ -1253,6 +1317,14 @@ fn genesis_mainnet(args: &[String]) {
 }
 
 fn genesis_cmd(args: &[String]) {
+    let format = if let Some(path) = arg_value(args, "--l2-settlement-config") {
+        if !args.iter().any(|a| a == "--bind-genesis") {
+            eprintln!("L2 settlement requires --bind-genesis"); exit(2);
+        }
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| { eprintln!("L2 config: {e}"); exit(2) });
+        let config = genesis::L2Config::decode(&bytes).unwrap_or_else(|e| { eprintln!("L2 config: {e}"); exit(2) });
+        genesis::ManifestFormat::V3L2Async(config)
+    } else { manifest_format(args) };
     let Some(keys_csv) = arg_value(args, "--keys") else {
         eprintln!("genesis: --keys <dir1,dir2,...> is required");
         exit(2);
@@ -1304,27 +1376,52 @@ fn genesis_cmd(args: &[String]) {
     // `--alloc` opening balances (devnet_tools): liquid LIQUIDITY-purpose
     // allocations, the one funding path a fresh devnet has. Refused past the
     // manifest's decode cap or with an amount that does not fit a u64 UTXO.
-    let allocations = match devnet_tools::parse_allocs(args) {
+    let mut allocations = match devnet_tools::parse_allocs(args) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("genesis: {e}");
             exit(2);
         }
     };
+    // Development L2 networks may fund test accounts at genesis (liquid at
+    // epoch 0) so native deposits can be exercised. Refused for any other
+    // manifest format: a funded network never takes balances from a flag.
+    let mut flags = args.iter();
+    while let Some(flag) = flags.next() {
+        if flag != "--dev-allocation" {
+            continue;
+        }
+        if !matches!(format, genesis::ManifestFormat::V3L2Async(_)) || !cfg!(feature = "devnet-l2-deposits") {
+            eprintln!("genesis: --dev-allocation needs a BPOSMAN3 manifest and a devnet-l2-deposits build");
+            exit(2);
+        }
+        let value = flags.next().unwrap_or_else(|| { eprintln!("genesis: --dev-allocation needs SCRIPT_HASH:SATS"); exit(2) });
+        let (hash, sats) = value.split_once(':').unwrap_or_else(|| { eprintln!("genesis: --dev-allocation needs SCRIPT_HASH:SATS"); exit(2) });
+        let script_hash: [u8; 32] = codec::unhex(hash).ok().and_then(|b| b.try_into().ok())
+            .unwrap_or_else(|| { eprintln!("genesis: --dev-allocation script hash must be 32 bytes of hex"); exit(2) });
+        let amount_sat: u64 = sats.parse().unwrap_or_else(|_| { eprintln!("genesis: --dev-allocation amount must be integer sats"); exit(2) });
+        allocations.push(genesis::GenesisAllocation {
+            purpose: genesis::alloc_purpose::LIQUIDITY,
+            script_hash,
+            amount_sat: u128::from(amount_sat),
+            unlock_epoch: 0,
+        });
+    }
     let manifest = genesis::Manifest {
         genesis_time_ms: genesis_time_from_now(start_in),
         slot_ms,
         validators,
         cohort: Vec::new(),
         // `genesis` builds devnet manifests: no carried balances, and only
-        // the `--alloc` balances given on the command line (empty by
+        // the `--alloc` balances (and, on BPOSMAN3 L2 devnets, the
+        // `--dev-allocation`s) given on the command line (empty by
         // default). The mainnet manifest is assembled by a separate path
         // that takes the signed Genesis-3 snapshot as input, because its
         // inputs come from a ceremony and not from a command line.
         carryover: None,
         allocations,
         carryover_entries: Vec::new(),
-        format: manifest_format(args),
+        format,
         pre_state_root: std::sync::OnceLock::new(),
     };
     if let Err(e) = manifest.validate_new_validator_set() {
@@ -1336,7 +1433,9 @@ fn genesis_cmd(args: &[String]) {
         exit(1);
     }
     let bytes = manifest.encode();
-    if let Err(e) = std::fs::write(&out, &bytes) {
+    use std::io::Write;
+    if let Err(e) = std::fs::OpenOptions::new().write(true).create_new(true).open(&out)
+        .and_then(|mut f| f.write_all(&bytes)) {
         eprintln!("genesis: cannot write {out}: {e}");
         exit(1);
     }
@@ -1615,6 +1714,16 @@ fn run_cmd(args: &[String]) {
     // on `BLOCH_NO_DOPPELGANGER`.
     if args.iter().any(|a| a == "--no-doppelganger-check") {
         unsafe { std::env::set_var("BLOCH_NO_DOPPELGANGER", "1") };
+    }
+    // Host-level signer anchor (key lock + rollback guard): see signer_anchor.rs.
+    if run_switch(args, "--no-signer-anchor") {
+        unsafe { std::env::set_var(signer_anchor::ENV_DISABLE, "1") };
+    }
+    if run_switch(args, "--accept-signing-rollback") {
+        unsafe { std::env::set_var(signer_anchor::ENV_ACCEPT_ROLLBACK, "1") };
+    }
+    if let Some(value) = arg_value(args, "--signer-anchor-dir") {
+        unsafe { std::env::set_var(signer_anchor::ENV_DIR, value) };
     }
     if let Some(value) = arg_value(args, "--max-replay-blocks") {
         if value.parse::<usize>().is_err() {

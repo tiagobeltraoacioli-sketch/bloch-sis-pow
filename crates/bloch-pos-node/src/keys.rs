@@ -91,7 +91,7 @@ const KEYSTORE_MAGIC_V2: &[u8; 8] = b"BPOSKEY2";
 
 /// The only KDF this format knows. A byte rather than an implied constant so
 /// a future KDF is a *refusal* on old binaries instead of a misparse.
-const KDF_ARGON2ID: u8 = 1;
+pub(crate) const KDF_ARGON2ID: u8 = 1;
 
 /// Upper bound on the Argon2 memory cost this node will honour when opening a
 /// file. The parameters live in the keystore, and a keystore is a file an
@@ -202,7 +202,7 @@ impl KdfParams {
     }
 
     /// Argon2id(passphrase, salt) → 32-byte AEAD key, zeroized on drop.
-    fn derive(self, passphrase: &str, salt: &[u8; 32]) -> io::Result<Zeroizing<[u8; 32]>> {
+    pub(crate) fn derive(self, passphrase: &str, salt: &[u8; 32]) -> io::Result<Zeroizing<[u8; 32]>> {
         self.derive_with_legacy_work(passphrase, salt, false)
     }
 
@@ -545,6 +545,21 @@ impl Keystore {
         Ok(ks)
     }
 
+    /// TEST ONLY: [`Keystore::generate_with`] with the hybrid keypair and the
+    /// RANDAO seed derived from `seed`, so a multi-validator fixture is the
+    /// same chain on every run (proposer draws depend on both).
+    #[cfg(test)]
+    pub(crate) fn generate_seeded_for_test(dir: &Path, index: u32, seed: [u8; 32], unlock: &Unlock) -> io::Result<Keystore> {
+        use sha3::{Digest, Sha3_256};
+        fs::create_dir_all(dir)?;
+        let (pubkey, secret) = bloch_crypto::crypto::generate_keypair_from_seed(&seed)
+            .map_err(|e| io::Error::other(format!("seeded keygen: {e:?}")))?;
+        let randao_seed: [u8; 32] = Sha3_256::new_with_prefix(b"bloch-test-randao-seed").chain_update(seed).finalize().into();
+        let ks = Keystore { index, pubkey, secret: Zeroizing::new(secret), randao_seed };
+        ks.save_with(dir, unlock)?;
+        Ok(ks)
+    }
+
     /// Write `dir/validator.key`, sealed unless the caller explicitly asked
     /// for plaintext.
     pub fn save_with(&self, dir: &Path, unlock: &Unlock) -> io::Result<()> {
@@ -857,10 +872,209 @@ impl Keystore {
     // never-actually-fails error through every proposer/attester call site
     // in `engine.rs`, for a case this module's own construction paths
     // already rule out. Left COUNTED by the hardened ratchet on purpose.
+    //
+    // p9e finding 2 (Falcon signing on hot hosts): every signature is now
+    // verified under this keystore's own public key before it is returned —
+    // the standard countermeasure against fault attacks on lattice signers,
+    // where a faulted signature that gets published can leak key material.
+    // The returned bytes are exactly what `bloch_crypto::crypto::sign`
+    // produced; nothing about the wire format or any verifier changes. A
+    // signature that does not verify is withheld and signing is retried with
+    // fresh randomness; if that keeps failing the signer is broken (hardware
+    // fault, or public and secret halves that disagree) and the process
+    // aborts rather than keep exercising the key. A restart runs the
+    // power-on self-test (`prepare_signing_host`) before signing again.
     pub fn sign(&self, signing_root: &[u8; 32]) -> Vec<u8> {
-        bloch_crypto::crypto::sign(&self.secret, signing_root)
-            .expect("hybrid signing over a well-formed keystore key cannot fail")
+        self.sign_released(signing_root, bloch_crypto::crypto::sign, bloch_crypto::crypto::verify)
     }
+
+    /// Sign so the signature verifies under `policy` — the consensus rule of
+    /// the epoch the signed object is judged in (audit e9b52781). Identical
+    /// to [`Self::sign`] until `SIG_CANONICAL_ACTIVATION_EPOCH` arms.
+    pub fn sign_under(
+        &self,
+        policy: bloch_pos_committee::SignaturePolicy,
+        signing_root: &[u8; 32],
+    ) -> Vec<u8> {
+        // Released through the p9e path: the signature is verified under
+        // the SAME policy before it leaves the keystore.
+        self.sign_released(
+            signing_root,
+            |sk, m| bloch_crypto::crypto::sign_with_policy(crypto_policy(policy), sk, m),
+            |pk, m, s| bloch_crypto::crypto::verify_with_policy(crypto_policy(policy), pk, m, s),
+        )
+    }
+
+    /// [`Self::sign_under`] with the consensus policy of `epoch` — for
+    /// CONSENSUS MESSAGES ONLY (attestations, proposals; `epoch` is the
+    /// signed message's own epoch). Transactions, including validator
+    /// lifecycle ones, always sign v1 with [`Self::sign`] (HF2 scope).
+    pub fn sign_for_epoch(&self, epoch: u64, signing_root: &[u8; 32]) -> Vec<u8> {
+        self.sign_under(bloch_pos_committee::SignaturePolicy::consensus(epoch), signing_root)
+    }
+
+    /// The release path shared by every signing entry point: sign with
+    /// `sign_fn`, return the signature only if `verify_fn` accepts it under
+    /// this keystore's public key, retry with fresh randomness, abort when the
+    /// signer keeps failing. A policy-specific signer must be paired with the
+    /// verifier of the same policy.
+    fn sign_released(
+        &self,
+        signing_root: &[u8; 32],
+        sign_fn: impl Fn(&[u8], &[u8]) -> Result<Vec<u8>, bloch_crypto::crypto::CryptoError>,
+        verify_fn: impl Fn(&[u8], &[u8], &[u8]) -> bool,
+    ) -> Vec<u8> {
+        let started = std::time::Instant::now();
+        for _attempt in 0..SIGN_VERIFY_ATTEMPTS {
+            match bloch_crypto::crypto::hardening::sign_verified_with(
+                &sign_fn,
+                &verify_fn,
+                &self.secret,
+                &self.pubkey,
+                signing_root,
+            ) {
+                Ok(signature) => {
+                    pad_signing_latency(started, signing_latency_floor());
+                    return signature;
+                }
+                Err(e) => eprintln!("SIGNER FAULT (validator {}): {e}", self.index),
+            }
+        }
+        eprintln!(
+            "SIGNER FAULT (validator {}): {SIGN_VERIFY_ATTEMPTS} consecutive signatures failed \
+             verification under the keystore's own public key. Aborting so that no faulty \
+             signature is ever released; on restart the signer self-test runs before any \
+             signing. Check the host for hardware faults and the keystore for a pubkey/secret \
+             mismatch (p9e finding 2, docs/CRYPTO-AUDIT-STATUS-20261020.md).",
+            self.index
+        );
+        std::process::abort()
+    }
+
+    /// Power-on checks for a host about to sign with this keystore
+    /// (p9e finding 2). Run once at node start, before the first duty:
+    ///
+    /// 1. the build targets an architecture on which the integer-only Falcon
+    ///    signer has been vetted (x86_64, aarch64) — overridable only with
+    ///    `BLOCH_ALLOW_UNVETTED_SIGNING_PLATFORM=1`;
+    /// 2. the Falcon-1024 known-answer self-test passes;
+    /// 3. this keystore's secret and public halves are pairwise consistent.
+    ///
+    /// Failure is an error: the node must not start signing on a host whose
+    /// signer is not the one that was reviewed.
+    pub fn signer_self_test(&self) -> io::Result<()> {
+        let allow_unvetted = std::env::var_os(ALLOW_UNVETTED_PLATFORM_ENV).is_some_and(|v| v == "1");
+        signer_self_test_with(&self.secret, &self.pubkey, allow_unvetted)
+    }
+
+    /// Sign a 32-byte signing root for a field whose consensus length bound
+    /// (`max_len`) is below the maximum hybrid signature length — e.g.
+    /// `funded::ADMISSION_PQ_SIGNATURE_MAX`. Falcon-1024 signatures are
+    /// variable length, so this re-signs with fresh randomness until the
+    /// encoding fits ([`bloch_crypto::crypto::sign_fitting`]). An `Err` means
+    /// no attempt fit within the retry budget; nothing is emitted then.
+    pub fn sign_fitting(&self, signing_root: &[u8; 32], max_len: usize) -> Result<Vec<u8>, String> {
+        bloch_crypto::crypto::sign_fitting(&self.secret, signing_root, max_len)
+            .map_err(|e| format!("signing failed: {e}"))
+    }
+}
+
+/// Signing attempts before [`Keystore::sign`] gives up and aborts.
+pub const SIGN_VERIFY_ATTEMPTS: u32 = 3;
+
+/// Opt-in for signing on an architecture outside
+/// `bloch_crypto::crypto::hardening::VETTED_SIGNING_ARCHES`.
+pub const ALLOW_UNVETTED_PLATFORM_ENV: &str = "BLOCH_ALLOW_UNVETTED_SIGNING_PLATFORM";
+
+/// Optional constant-latency floor for [`Keystore::sign`], in milliseconds.
+///
+/// A validator signs on a public schedule, and the time at which its message
+/// appears on the network includes the signing latency. With a floor set,
+/// `sign` does not return before `floor` has elapsed since it started, so the
+/// observable latency is the floor rather than the (integer-only, designed
+/// constant-time) signer's own running time whenever signing is faster than
+/// the floor. Off by default (0); recommended 100 for mainnet validators.
+/// Capped at [`SIGN_LATENCY_FLOOR_MAX_MS`].
+pub const SIGN_LATENCY_FLOOR_ENV: &str = "BLOCH_SIGN_LATENCY_FLOOR_MS";
+
+/// Upper bound on [`SIGN_LATENCY_FLOOR_ENV`]; a slot is 30 s.
+pub const SIGN_LATENCY_FLOOR_MAX_MS: u64 = 2_000;
+
+/// Opt-out of [`harden_signing_process`]'s core-dump suppression, for
+/// deliberate debugging on a non-production host.
+pub const ALLOW_CORE_DUMPS_ENV: &str = "BLOCH_ALLOW_CORE_DUMPS";
+
+fn parse_latency_floor(raw: Option<&str>) -> std::time::Duration {
+    let ms = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(SIGN_LATENCY_FLOOR_MAX_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+fn signing_latency_floor() -> std::time::Duration {
+    static FLOOR: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| parse_latency_floor(std::env::var(SIGN_LATENCY_FLOOR_ENV).ok().as_deref()))
+}
+
+fn pad_signing_latency(started: std::time::Instant, floor: std::time::Duration) {
+    if let Some(remaining) = floor.checked_sub(started.elapsed()) {
+        std::thread::sleep(remaining);
+    }
+}
+
+fn signer_self_test_with(secret: &[u8], pubkey: &[u8], allow_unvetted_platform: bool) -> io::Result<()> {
+    use bloch_crypto::crypto::hardening;
+    let fail = |what: String| io::Error::other(format!("signer self-test: {what}"));
+    if let Err(e) = hardening::signing_platform_check() {
+        if allow_unvetted_platform {
+            eprintln!("WARNING: {e}. Continuing because {ALLOW_UNVETTED_PLATFORM_ENV}=1.");
+        } else {
+            return Err(fail(format!("{e}. Set {ALLOW_UNVETTED_PLATFORM_ENV}=1 only after reviewing this platform")));
+        }
+    }
+    hardening::falcon_signing_self_test().map_err(fail)?;
+    hardening::pairwise_consistency_test(secret, pubkey).map_err(fail)?;
+    Ok(())
+}
+
+/// Process-level hardening for a node that holds a signing key in memory
+/// (p9e finding 2). Disables core dumps (`RLIMIT_CORE = 0`) so a crash cannot
+/// write the hybrid secret key to `/var/crash` or systemd-coredump, and on
+/// Linux marks the process non-dumpable (`PR_SET_DUMPABLE = 0`), which also
+/// stops other processes running as the same user from ptrace-attaching to
+/// it or reading its memory through `/proc/<pid>/mem`.
+///
+/// Side effects an operator should know: `/proc/<pid>/{fd,environ,maps,smaps,
+/// mem}` become root-only (world-readable `stat`, `statm`, `status` — what
+/// `ps`/`top` use — are unaffected), and same-user debuggers cannot attach.
+/// `BLOCH_ALLOW_CORE_DUMPS=1` skips all of this. Returns what was applied.
+pub fn harden_signing_process() -> io::Result<&'static str> {
+    if std::env::var_os(ALLOW_CORE_DUMPS_ENV).is_some_and(|v| v == "1") {
+        return Ok("skipped (BLOCH_ALLOW_CORE_DUMPS=1)");
+    }
+    #[cfg(unix)]
+    {
+        let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: plain syscall on a stack value; no memory is retained.
+        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: PR_SET_DUMPABLE takes integer arguments only.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(if cfg!(target_os = "linux") {
+        "core dumps disabled, process non-dumpable"
+    } else if cfg!(unix) {
+        "core dumps disabled"
+    } else {
+        "not applicable on this platform"
+    })
 }
 
 /// Read `validator.key`, refusing a file that anyone but its owner can read.
@@ -871,7 +1085,7 @@ impl Keystore {
 /// normal. `NotFound` is passed through unchanged: it is the observer signal
 /// `load_optional` depends on, and `fs::metadata` reports it with the same
 /// kind `fs::read` did.
-fn read_keystore_file(path: &Path) -> io::Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn read_keystore_file(path: &Path) -> io::Result<Zeroizing<Vec<u8>>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1309,6 +1523,10 @@ impl Default for HybridVerifier {
 }
 
 impl bloch_pos_committee::attestation::SignatureVerifier for HybridVerifier {
+    fn verify_l2_settlement(&self, policy: &[u8; 32], program: &[u8; 32], values: &[u8], proof: &[u8]) -> bool {
+        bloch_l2_proof::verify(policy, program, values, proof)
+    }
+
     /// The suite check itself. Robust to arbitrary key bytes by contract:
     /// `bloch_crypto::crypto::verify` documents "any body parse failure ⇒
     /// false, never a panic (consensus rule)" and guards every length before
@@ -1321,7 +1539,70 @@ impl bloch_pos_committee::attestation::SignatureVerifier for HybridVerifier {
     fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool {
         bloch_crypto::crypto::verify(pubkey, signing_root, signature)
     }
+
+    /// Audit e9b52781: the same suite check under an explicit encoding /
+    /// signing-context policy. `Compatible` is exactly `verify_with_key`.
+    fn verify_with_key_under(
+        &self,
+        policy: bloch_pos_committee::SignaturePolicy,
+        pubkey: &[u8],
+        signing_root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        bloch_crypto::crypto::verify_with_policy(crypto_policy(policy), pubkey, signing_root, signature)
+    }
+
+    /// HF3 spend witnesses: `bloch_crypto::crypto::verify_spend` with the
+    /// gate decided by the ONE HF3 constant
+    /// (`bloch_pos_committee::params::hf3_slh_suite_active`). Closed, it is
+    /// exactly `verify`; open, it also accepts suite 0x0003
+    /// (SLH-DSA-SHAKE-128s ‖ Falcon-1024, both halves, Falcon first).
+    fn verify_spend_at_epoch(
+        &self,
+        pubkey: &[u8],
+        signing_root: &[u8; 32],
+        signature: &[u8],
+        epoch: u64,
+    ) -> bool {
+        bloch_crypto::crypto::verify_spend(
+            pubkey,
+            signing_root,
+            signature,
+            bloch_pos_committee::params::hf3_slh_suite_active(epoch),
+        )
+    }
+
+    /// KES leaves are canonical and suite-bound (v2) from the first KES
+    /// signature (review F-1): `bloch_crypto::crypto::verify_bound`, never
+    /// the v1 form, so the `SIG_CANONICAL` flag day does not touch them.
+    fn verify_kes_leaf(&self, leaf_pk: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        bloch_crypto::crypto::verify_bound(leaf_pk, message, signature)
+    }
 }
+
+/// The committee's signature policy, in `bloch_crypto`'s vocabulary.
+pub fn crypto_policy(
+    policy: bloch_pos_committee::SignaturePolicy,
+) -> bloch_crypto::crypto::SignaturePolicy {
+    use bloch_crypto::crypto::SignaturePolicy as C;
+    use bloch_pos_committee::SignaturePolicy as P;
+    match policy {
+        P::Compatible => C::Compatible,
+        P::CompatiblePinned => C::CompatiblePinned,
+        P::CanonicalUnbound => C::CanonicalUnbound,
+        P::Bound => C::Bound,
+    }
+}
+
+// HF3: the activation epoch exists ONLY in bloch-pos-committee (params);
+// bloch-crypto takes the gate verdict as an argument. The wire constants that
+// both crates must agree on are pinned here, the one crate linking both (the
+// lengths are runtime functions in bloch-crypto, so they are pinned by the
+// test `hf3_suite_shape_constants_match_bloch_crypto`).
+const _: () = assert!(
+    bloch_pos_committee::params::SUITE_SLHDSA128S_FALCON1024
+        == bloch_crypto::crypto::SUITE_SLHDSA128S_FALCON1024
+);
 
 /// Accept-everything verifier for the producer's own `compute_post_state`
 /// probe: the state a block commits does not depend on the verifier, and the
@@ -1331,13 +1612,24 @@ impl bloch_pos_committee::attestation::SignatureVerifier for HybridVerifier {
 pub struct ProbeVerifier;
 
 impl bloch_pos_committee::attestation::SignatureVerifier for ProbeVerifier {
+    fn verify_l2_settlement(&self, policy: &[u8; 32], program: &[u8; 32], values: &[u8], proof: &[u8]) -> bool {
+        bloch_l2_proof::verify(policy, program, values, proof)
+    }
+
     fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+        true
+    }
+
+    /// The probe's proposer signature is empty; from KES enforcement on it
+    /// must pass here exactly as it does through `verify_with_key` before
+    /// (devnet4 halted at its KES activation without this, 2026-10-14).
+    fn verify_kes(&self, _public: &bloch_pos_committee::kes::KesPublic, _period: u64, _message: &[u8; 32], _sig: &[u8]) -> bool {
         true
     }
 }
 
 /// Fill `buf` from the OS entropy pool (`/dev/urandom`). Devnet-grade.
-fn os_random(buf: &mut [u8]) -> io::Result<()> {
+pub(crate) fn os_random(buf: &mut [u8]) -> io::Result<()> {
     use std::io::Read;
     let mut f = fs::File::open("/dev/urandom")?;
     f.read_exact(buf)
@@ -1345,6 +1637,32 @@ fn os_random(buf: &mut [u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hf3_suite_shape_constants_match_bloch_crypto() {
+        use bloch_pos_committee::params as p;
+        assert_eq!(
+            p::SLHDSA_FALCON_ENVELOPED_PUBKEY_LEN,
+            bloch_crypto::crypto::SUITE_HEADER_LEN
+                + bloch_crypto::crypto::slhdsa_suite::slhdsa_suite_pubkey_body_len()
+        );
+        assert_eq!(p::SLHDSA_FALCON_MAX_ENVELOPED_SIG_LEN, bloch_crypto::crypto::max_slhdsa_suite_signature_len());
+        assert_eq!(p::HF3_SLH_SUITE_EPOCH, u64::MAX, "HF3 ships inert");
+    }
+
+    #[test]
+    fn both_proposal_and_validation_verify_real_l2_proofs() {
+        use bloch_pos_committee::attestation::SignatureVerifier;
+        let values=include_bytes!("../../bloch-l2-proof/tests/fixtures/source-contract.values");
+        let proof=include_bytes!("../../bloch-l2-proof/tests/fixtures/source-contract.proof");
+        let key: [u8;32]=values[22+6*32..22+7*32].try_into().unwrap();
+        let policy=bloch_l2_proof::policy_commitment();
+        for verifier in [&super::HybridVerifier as &dyn SignatureVerifier,&super::ProbeVerifier] {
+            assert!(verifier.verify_l2_settlement(&policy,&key,values,proof));
+            let mut bad=*proof;bad[12]^=1;
+            assert!(!verifier.verify_l2_settlement(&policy,&key,values,&bad));
+        }
+    }
     use super::*;
     use bloch_pos_committee::attestation::SignatureVerifier;
 
@@ -1533,6 +1851,40 @@ mod tests {
         assert!(HybridVerifier::new().verify_with_key(&pk, &root, &sig));
     }
 
+    /// Audit e9b52781: the PQ verifier honours every committee policy, and
+    /// the keystore signs for the epoch's consensus policy (v1 while inert).
+    #[test]
+    fn hybrid_verifier_applies_each_signature_policy() {
+        use bloch_crypto::crypto::{falcon, MLDSA_SIG_LEN, SUITE_HEADER_LEN};
+        use bloch_pos_committee::SignaturePolicy::{Bound, CanonicalUnbound, Compatible, CompatiblePinned};
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        let root = [0x5Bu8; 32];
+        let v = HybridVerifier::new();
+        let verdicts = |sig: &[u8]| {
+            [Compatible, CompatiblePinned, CanonicalUnbound, Bound].map(|p| v.verify_with_key_under(p, &pk, &root, sig))
+        };
+        let padded_len = SUITE_HEADER_LEN + MLDSA_SIG_LEN + falcon::padded_signature_len();
+        let v1 = (0..64)
+            .map(|_| bloch_crypto::crypto::sign(&sk, &root).unwrap())
+            .find(|s| s.len() < padded_len)
+            .unwrap();
+        assert_eq!(verdicts(&v1), [true, true, true, false]);
+        let mut padded = v1.clone();
+        padded.resize(padded_len, 0);
+        assert_eq!(verdicts(&padded), [true, true, false, false]);
+        let v2 = bloch_crypto::crypto::sign_bound(&sk, &root).unwrap();
+        assert_eq!(verdicts(&v2), [false, false, false, true]);
+
+        let dir = tmp_dir("sigpolicy");
+        let ks = Keystore::generate_with(&dir, 0, &Unlock::PlaintextOptIn).expect("gen plaintext");
+        let sig = ks.sign_for_epoch(0, &root);
+        assert!(HybridVerifier::new().verify_with_key(&ks.pubkey, &root, &sig));
+        assert!(v.verify_with_key_under(CanonicalUnbound, &ks.pubkey, &root, &sig));
+        let bound = ks.sign_under(Bound, &root);
+        assert!(v.verify_with_key_under(Bound, &ks.pubkey, &root, &bound));
+        assert!(!v.verify_with_key(&ks.pubkey, &root, &bound));
+    }
+
     #[test]
     fn a_tampered_signature_fails() {
         let (pk, sk) = bloch_crypto::crypto::generate_keypair();
@@ -1652,6 +2004,23 @@ mod tests {
 
     /// A sealed keystore round-trips, and the reloaded key really is the same
     /// key — proved by a signature that verifies under the public half.
+    #[test]
+    fn sign_fitting_stays_within_the_admission_bound_and_verifies() {
+        use bloch_pos_committee::transition::funded::ADMISSION_PQ_SIGNATURE_MAX;
+        let dir = tmp_dir("sign-fitting");
+        let ks = Keystore::generate_with(&dir, 0, &Unlock::PlaintextOptIn).expect("gen");
+        for i in 0u8..32 {
+            let root = [i; 32];
+            let sig = ks.sign_fitting(&root, ADMISSION_PQ_SIGNATURE_MAX).expect("fits");
+            assert!(sig.len() <= ADMISSION_PQ_SIGNATURE_MAX, "{} bytes", sig.len());
+            assert!(HybridVerifier::new().verify_with_key(&ks.pubkey, &root, &sig));
+        }
+        let unreachable = bloch_crypto::crypto::SUITE_HEADER_LEN + bloch_crypto::crypto::MLDSA_SIG_LEN;
+        let err = ks.sign_fitting(&[0; 32], unreachable).unwrap_err();
+        assert!(err.contains("attempts"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_sealed_keystore_round_trips_and_still_signs() {
         let dir = tmp_dir("roundtrip");
@@ -2186,5 +2555,90 @@ mod tests {
         assert_ne!(next, other.randao_seed_for(&network, 1));
         let _ = fs::remove_dir_all(dir);
         let _ = fs::remove_dir_all(dir2);
+    }
+}
+
+#[cfg(test)]
+mod signer_hardening_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-signer-hardening-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn sign_releases_only_signatures_that_verify_under_the_keystore_pubkey() {
+        let dir = tmp("sign");
+        let ks = Keystore::generate_with(&dir, 3, &Unlock::PlaintextOptIn).expect("generate");
+        for byte in [0u8, 0x5A, 0xFF] {
+            let root = [byte; 32];
+            let sig = ks.sign(&root);
+            assert!(bloch_crypto::crypto::verify(&ks.pubkey, &root, &sig));
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn signer_self_test_passes_for_a_consistent_keystore() {
+        let dir = tmp("selftest-ok");
+        let ks = Keystore::generate_with(&dir, 4, &Unlock::PlaintextOptIn).expect("generate");
+        ks.signer_self_test().expect("self-test on a fresh keystore");
+        signer_self_test_with(&ks.secret, &ks.pubkey, false).expect("explicit, no override");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn signer_self_test_refuses_a_keystore_whose_halves_disagree() {
+        let (_, secret) = bloch_crypto::crypto::generate_keypair();
+        let (pubkey, _) = bloch_crypto::crypto::generate_keypair();
+        let ks = Keystore { index: 9, pubkey, secret: Zeroizing::new(secret), randao_seed: [0; 32] };
+        let err = ks.signer_self_test().expect_err("mismatched halves must fail the self-test");
+        assert!(err.to_string().contains("pairwise consistency"), "{err}");
+    }
+
+    #[test]
+    fn latency_floor_is_off_by_default_parsed_and_capped() {
+        use std::time::Duration;
+        assert_eq!(parse_latency_floor(None), Duration::ZERO);
+        assert_eq!(parse_latency_floor(Some("")), Duration::ZERO);
+        assert_eq!(parse_latency_floor(Some("abc")), Duration::ZERO);
+        assert_eq!(parse_latency_floor(Some("-5")), Duration::ZERO);
+        assert_eq!(parse_latency_floor(Some(" 100 ")), Duration::from_millis(100));
+        assert_eq!(
+            parse_latency_floor(Some("999999999")),
+            Duration::from_millis(SIGN_LATENCY_FLOOR_MAX_MS)
+        );
+    }
+
+    #[test]
+    fn latency_padding_waits_out_the_floor_and_never_shortens() {
+        use std::time::{Duration, Instant};
+        let started = Instant::now();
+        pad_signing_latency(started, Duration::from_millis(30));
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        let started = Instant::now();
+        pad_signing_latency(started, Duration::ZERO);
+        assert!(started.elapsed() < Duration::from_millis(30));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_signing_process_disables_core_dumps() {
+        if std::env::var_os(ALLOW_CORE_DUMPS_ENV).is_some() {
+            return;
+        }
+        let applied = harden_signing_process().expect("hardening");
+        assert!(applied.starts_with("core dumps disabled"), "{applied}");
+        let mut limit = libc::rlimit { rlim_cur: 1, rlim_max: 1 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) }, 0);
+        assert_eq!((limit.rlim_cur, limit.rlim_max), (0, 0));
+        #[cfg(target_os = "linux")]
+        assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
     }
 }

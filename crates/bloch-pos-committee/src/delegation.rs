@@ -495,6 +495,20 @@ impl Registry {
             .collect()
     }
 
+    /// Activated delegated weight under an explicit absolute limit.
+    /// Unlike the legacy percentage cap, zero means zero weight and never
+    /// bypasses the limit. The caller selects this rule at its consensus gate;
+    /// legacy replay continues to use `validators` unchanged.
+    pub fn validators_with_absolute_cap(&self, cap: u128) -> Vec<Validator> {
+        self.stakes
+            .iter()
+            .map(|(index, stake)| Validator {
+                index: *index,
+                effective_stake: (*stake).min(cap).min(u64::MAX as u128) as u64,
+            })
+            .collect()
+    }
+
     /// Uncapped active stake behind one operator.
     pub fn stake_of(&self, validator: u32) -> u128 {
         self.stakes

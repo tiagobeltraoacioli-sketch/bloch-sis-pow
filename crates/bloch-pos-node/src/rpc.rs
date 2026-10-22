@@ -880,6 +880,12 @@ pub enum RpcRequest {
     ChainInfo,
     /// `getbuildinfo` — which binary is answering. Reads no chain state.
     BuildInfo,
+    /// Committed asynchronous settlement source and cursor.
+    L2Settlement,
+    /// `getkes`: the KES schedule and every registered forward-secure key.
+    Kes,
+    /// Exact public envelope for independent consensus replay.
+    BlockRaw([u8; 32]),
     /// `getblockcount` — the polling method, carrying finality with it.
     BlockCount,
     BlockBySlot(u64),
@@ -888,6 +894,7 @@ pub enum RpcRequest {
     ValidatorCount,
     ValidatorByKey([u8; 32]),
     ValidatorAdmission,
+    FundedDelegation(u32),
     Balance([u8; 32]),
     Utxos { script_hash: [u8; 32], limit: usize },
     /// `gettxout` — is this ONE output still unspent?
@@ -931,6 +938,13 @@ pub enum RpcRequest {
     /// and `Engine::tx_slot_index` (`included`/`justified`/`finalized`); see
     /// `Engine::serve_rpc`'s arm for the exact precedence.
     TxStatus([u8; 32]),
+    /// `getfinalitycertificate(epoch|"latest", block?, set_source_epoch?)`:
+    /// a self-contained finality certificate (see `bloch-finality-cert`).
+    FinalityCertificate {
+        epoch: Option<u64>,
+        block: Option<[u8; 32]>,
+        set_source_epoch: Option<u64>,
+    },
 }
 
 /// Whatever can answer an [`RpcRequest`]. In production this is the channel to
@@ -1113,6 +1127,7 @@ impl EngineBackend {
             | RpcRequest::ValidatorCount
             | RpcRequest::ValidatorByKey(_)
             | RpcRequest::ValidatorAdmission
+            | RpcRequest::FundedDelegation(_)
             | RpcRequest::Validators => {}
             _ => return None,
         }
@@ -1132,6 +1147,7 @@ impl EngineBackend {
             RpcRequest::ValidatorCount => Some(Ok(validator_count_json(&state))),
             RpcRequest::ValidatorByKey(hash) => Some(validator_by_key_json(&state, hash)),
             RpcRequest::ValidatorAdmission => Some(Ok(validator_admission_json(&state))),
+            RpcRequest::FundedDelegation(position) => Some(Ok(funded_delegation_json(&state, *position))),
             RpcRequest::Validators => Some(Ok(validator_registry_json(&state))),
             RpcRequest::TxOut { txid, vout } => Some(Ok(txout_json(&state, txid, *vout))),
             RpcRequest::Balance(script_hash) => Some(Ok(balance_json(&state, script_hash))),
@@ -1269,6 +1285,9 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
     Ok(match method {
         "getchaininfo" => RpcRequest::ChainInfo,
         "getbuildinfo" => RpcRequest::BuildInfo,
+        "getl2settlement" => RpcRequest::L2Settlement,
+        "getkes" => RpcRequest::Kes,
+        "getblockraw" => RpcRequest::BlockRaw(want_hex32(params, 0, "block id")?),
         "getblockcount" => RpcRequest::BlockCount,
         "getblockbyslot" => RpcRequest::BlockBySlot(want_u64(params, 0, "slot")?),
         "getblockbyid" => RpcRequest::BlockById(want_hex32(params, 0, "block_id")?),
@@ -1276,6 +1295,7 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
         "getvalidatorcount" => RpcRequest::ValidatorCount,
         "getvalidatorbykey" => RpcRequest::ValidatorByKey(want_hex32(params, 0, "pubkey_hash")?),
         "getvalidatoradmission" => RpcRequest::ValidatorAdmission,
+        "getfundeddelegation" => RpcRequest::FundedDelegation(want_u32(params, 0, "position")?),
         "getbalance" => RpcRequest::Balance(want_hex32(params, 0, "script_hash")?),
         // Refused on purpose, and permanently for this build. See the doc
         // comments on the two constructors for the full reasoning.
@@ -1337,6 +1357,24 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
         // R4 F-11.
         "getvalidators" => RpcRequest::Validators,
         "gettxstatus" => RpcRequest::TxStatus(want_hex32(params, 0, "txid")?),
+        "getfinalitycertificate" => {
+            let epoch = match pick(params, 0, "epoch") {
+                None | Some(Json::Null) => None,
+                Some(v) if v.as_str() == Some("latest") => None,
+                Some(v) => Some(v.as_u64().ok_or_else(|| {
+                    RpcError::invalid_params("`epoch` must be a non-negative integer or \"latest\"")
+                })?),
+            };
+            let block = match pick(params, 1, "block") {
+                None | Some(Json::Null) => None,
+                Some(_) => Some(want_hex32(params, 1, "block")?),
+            };
+            let set_source_epoch = match pick(params, 2, "set_source_epoch") {
+                None | Some(Json::Null) => None,
+                Some(_) => Some(want_u64(params, 2, "set_source_epoch")?),
+            };
+            RpcRequest::FinalityCertificate { epoch, block, set_source_epoch }
+        }
         other => return Err(RpcError::method_not_found(other)),
     })
 }
@@ -2190,6 +2228,16 @@ impl PreparedSubmission {
             // match is exhaustive on purpose, and an operator reading the field
             // post-activation needs the honest name.
             PosTransaction::RandaoRecommit { .. } => "randao_recommit",
+            PosTransaction::KesRegister { .. } => "kes_register",
+            PosTransaction::KesRotate { .. } => "kes_rotate",
+            PosTransaction::L2Settlement(_) => "l2_settlement",
+            PosTransaction::L2SettlementAsync(_) => "l2_settlement_async",
+            PosTransaction::L2Deposit(_) => "l2_deposit",
+            PosTransaction::L2DataAvailability(_) => "l2_data_availability",
+            PosTransaction::L2WithdrawClaim(_) => "l2_withdraw_claim",
+            PosTransaction::WithdrawalCredentialRotation(_) => "withdrawal_credential_rotation",
+            PosTransaction::RescueCommit(_) => "pq_rescue_commit",
+            PosTransaction::RescueReveal(_) => "pq_rescue_reveal",
         };
         Self {
             kind,
@@ -2781,5 +2829,211 @@ pub fn validator_admission_json(state: &bloch_pos_committee::transition::Committ
         ("maximum_activations_per_epoch", Json::u(staking::MAX_ACTIVATIONS_PER_EPOCH as u64)),
         ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
         ("legacy_unfunded_deposit_enabled", Json::Bool(false)),
+    ])
+}
+
+/// One funded position and its owner ledger at the committed head; null if absent.
+/// Clients must confirm the containing transaction's finality with gettxstatus.
+pub fn funded_delegation_json(state: &CommittedState, position: u32) -> Json {
+    let Some(view) = state.funded_delegation_view(position) else { return Json::Null; };
+    let d = view.delegation;
+    let epoch = epoch_of(state.slot());
+    Json::obj(vec![
+        ("position", Json::u(position.into())),
+        ("delegator", Json::u(d.delegator.into())),
+        ("validator", Json::u(d.validator.into())),
+        ("owner_pubkey_hash", Json::hex(&view.owner)),
+        ("as_of_slot", Json::u(state.slot())),
+        ("principal_sat", Json::sat(d.amount_sat)),
+        ("activated_sat", Json::sat(view.activated_sat)),
+        ("requested_epoch", Json::u(d.requested_epoch)),
+        ("deactivate_epoch", d.deactivate_epoch.map_or(Json::Null, Json::u)),
+        ("inactive_since", view.inactive_since.map_or(Json::Null, Json::u)),
+        ("withdrawable_epoch", view.withdrawable_epoch.map_or(Json::Null, Json::u)),
+        ("withdrawn", Json::Bool(view.withdrawn)),
+        ("mature", Json::Bool(!view.withdrawn && view.activated_sat == 0
+            && view.withdrawable_epoch.is_some_and(|e| epoch >= e))),
+        ("fee_rewards_sat", Json::sat(state.delegator_fee_reward_sat(d.delegator))),
+        ("issuance_rewards_sat", Json::sat(state.delegator_issuance_reward_sat(d.delegator))),
+        ("slash_losses_sat", Json::sat(state.delegator_slash_loss_sat(d.delegator))),
+        ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
+    ])
+}
+
+/// Public, committed source for the bounded asynchronous proof worker.
+/// `getkes`: the compiled schedule (`null` epochs when unarmed), the head's
+/// epoch and KES period, and the registered keys by validator.
+pub fn kes_json(state: &bloch_pos_committee::transition::CommittedState) -> Json {
+    use bloch_pos_committee::params::{kes_period, kes_registration_open, KES_ACTIVATION_EPOCH, KES_PERIOD_EPOCHS, KES_REGISTRATION_EPOCH};
+    let epoch = bloch_pos_committee::epoch_of(state.slot());
+    let armed = |e: u64| if e == u64::MAX { Json::Null } else { Json::u(e) };
+    Json::obj(vec![
+        ("registration_epoch", armed(KES_REGISTRATION_EPOCH)),
+        ("activation_epoch", armed(KES_ACTIVATION_EPOCH)),
+        ("period_epochs", Json::u(KES_PERIOD_EPOCHS)),
+        ("epoch", Json::u(epoch)),
+        ("registration_open", Json::Bool(kes_registration_open(epoch))),
+        ("period", kes_period(epoch).map_or(Json::Null, Json::u)),
+        ("enforced_from", state.kes_enforced_from().map_or(Json::Null, Json::u)),
+        ("registered_stake_bps", Json::u(state.kes_registered_stake_bps(epoch))),
+        ("min_registered_stake_bps", Json::u(bloch_pos_committee::params::KES_MIN_REGISTERED_STAKE_BPS)),
+        ("registered", Json::Arr(state.kes_roots().iter().map(|(validator, entry)| {
+            // The key in force at the head's period (period 0 before
+            // enforcement), and a rotated-in successor waiting for its start.
+            let at = kes_period(epoch).unwrap_or(0);
+            let key = |public: &bloch_pos_committee::kes::KesPublic| Json::obj(vec![
+                ("depth", Json::u(u64::from(public.depth))),
+                ("periods", Json::u(public.periods())),
+                ("root", Json::hex(&public.root)),
+                ("start_period", Json::u(public.start_period)),
+                ("end_period", Json::u(public.end_period())),
+            ]);
+            let in_force = entry.in_force(at);
+            Json::obj(vec![
+                ("validator", Json::u(u64::from(*validator))),
+                ("depth", Json::u(u64::from(in_force.depth))),
+                ("periods", Json::u(in_force.periods())),
+                ("root", Json::hex(&in_force.root)),
+                ("start_period", Json::u(in_force.start_period)),
+                ("end_period", Json::u(in_force.end_period())),
+                ("periods_remaining", Json::u(in_force.remaining_periods(at))),
+                ("pending_rotation", entry.pending_at(at).as_ref().map_or(Json::Null, key)),
+            ])
+        }).collect())),
+    ])
+}
+
+pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedState) -> Json {
+    let Some(l2) = state.l2_settlement() else { return Json::Null; };
+    let policy = l2.policy();
+    let source = l2.frozen_source().map_or(Json::Null, |source| Json::obj(vec![
+        ("block", Json::hex(&source.block)), ("slot", Json::u(source.slot)),
+        ("height", Json::u(source.height)), ("commitment", Json::hex(&source.commitment)),
+        ("inbox_root", Json::hex(&source.inbox_root)),
+        ("inbox_count", Json::u(source.inbox_count)),
+        ("consumed_start", Json::u(l2.consumed())),
+        ("consumed_end", Json::u(l2.consumed() + l2.pending_for(&source).len() as u64)),
+        // The exact records the next settlement must mint, in order.
+        ("pending", Json::Arr(l2.pending_for(&source).iter().map(|r| Json::obj(vec![
+            ("height", Json::u(r.height)), ("tx_index", Json::u(u64::from(r.tx_index))),
+            ("txid", Json::hex(&r.txid)), ("vout", Json::u(u64::from(r.vout))),
+            ("sats", Json::u(r.sats)), ("recipient", Json::s(crate::codec::hex(&r.recipient))),
+        ])).collect())),
+        ("request", Json::s(format!("{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            crate::codec::hex32(&policy.identities[0]), crate::codec::hex32(&policy.identities[1]),
+            crate::codec::hex32(&source.block), source.slot, source.height,
+            crate::codec::hex32(&source.commitment), crate::codec::hex32(&source.inbox_root)))),
+    ]));
+    Json::obj(vec![
+        ("asynchronous", Json::Bool(l2.asynchronous())), ("native_height", Json::u(l2.height())),
+        ("network", Json::hex(&policy.identities[0])), ("genesis", Json::hex(&policy.identities[1])),
+        ("chain_id", Json::u(policy.chain_id)), ("source", source),
+        // What this L2 admits, fixed at installation: a development genesis
+        // follows the node's devnet features; the running-network flag day
+        // ("activated") admits everything on every build.
+        ("profile", Json::obj(vec![
+            ("activated", Json::Bool(l2.profile().is_activated())),
+            ("deposits", Json::Bool(l2.deposits_enabled())),
+            ("user_transactions", Json::Bool(l2.user_transactions())),
+        ])),
+        ("inbox", Json::obj(vec![
+            ("count", Json::u(l2.inbox().len() as u64)), ("consumed", Json::u(l2.consumed())),
+            ("escrow_sat", Json::s(l2.escrow_sat().to_string())),
+        ])),
+        // Retained L1 data-availability records (M3), oldest first.
+        ("data_availability", Json::Arr(l2.data_availability().iter().map(|r| Json::obj(vec![
+            ("l2_number", Json::u(r.l2_number)), ("commitment", Json::hex(&r.commitment)),
+            ("height", Json::u(r.height)),
+        ])).collect())),
+        // Withdrawal tree after the accepted head and the retained roots of
+        // settlements that added withdrawals (M4), oldest first.
+        ("withdrawals", {
+            let (root, count) = l2.withdrawal_head();
+            // `finalized` everywhere below is the consensus predicate a claim
+            // in the next block must pass (from finalized_claims_from_height
+            // on): the accepting block is in the FFG-finalized prefix and,
+            // once the native-claim-finality rule is armed, the finalized
+            // checkpoint is this chain's own. "matured" alone is only the
+            // delay; a matured record that is not finalized is refused.
+            let finalized = |height: u64| state.l2_record_finalized_for_claim(height);
+            let next = l2.height().saturating_add(1);
+            let gate = |r: &bloch_pos_committee::l2_settlement::withdrawal::Record, sats: u64| {
+                r.height.saturating_add(l2.limits().delay_for(sats)) <= next
+            };
+            let record = |r: &bloch_pos_committee::l2_settlement::withdrawal::Record| Json::obj(vec![
+                ("l2_number", Json::u(r.l2_number)), ("root", Json::hex(&r.root)),
+                ("count", Json::u(r.count)), ("height", Json::u(r.height)),
+                ("finalized", Json::Bool(finalized(r.height))),
+            ]);
+            // The newest record a claim of that size can prove against in
+            // the next block: matured AND finalized.
+            let claimable = |sats: u64| l2.withdrawal_roots().iter().rev()
+                .find(|r| gate(r, sats) && finalized(r.height))
+                .map_or(Json::Null, record);
+            let fin = state.finality().finalized;
+            Json::obj(vec![
+                ("root", Json::hex(&root)), ("count", Json::u(count)),
+                ("roots", Json::Arr(l2.withdrawal_roots().iter().map(record).collect())),
+                ("finalized_claims_from_height", Json::u(l2.profile().finalized_claims_from_height)),
+                // The finalized checkpoint claims rely on, and this chain's
+                // own root at its epoch (null before the rule records one).
+                // `own_root` != `root` means this node's chain carries a
+                // finality that is not its own: treat claims as unsafe.
+                ("finalized_checkpoint", Json::obj(vec![
+                    ("epoch", Json::u(fin.epoch)), ("root", Json::hex(&fin.root)),
+                    ("own_root", l2.checkpoint_root(fin.epoch).map_or(Json::Null, |r| Json::hex(&r))),
+                    ("own_chain_rule_active", Json::Bool(bloch_pos_committee::params::epoch_gate_active(
+                        bloch_pos_committee::epoch_of(state.slot()),
+                        bloch_pos_committee::params::HF1_CLAIM_FINALITY_EPOCH,
+                    ))),
+                ])),
+                ("claimable", claimable(0)),
+                ("claimable_large", claimable(l2.limits().large_claim_sat)),
+                // M5 claims: the newest root a claim in the next block may
+                // prove against, and the nullifier set as its frontier
+                // (words below `floor` fully claimed; `words` maps a 256-leaf
+                // word index to its bitmap, bit i of byte j = leaf 256w+8j+i).
+                ("delay_blocks", Json::u(l2.limits().delay_blocks)),
+                // Delay only. Use `claimable`: a matured root whose
+                // `finalized` is false is refused NotFinalized.
+                ("matured", l2.matured_withdrawals().map_or(Json::Null, |r| record(&r))),
+                ("claimed", Json::obj(vec![
+                    ("count", Json::u(l2.claimed().claims())), ("floor", Json::u(l2.claimed().floor())),
+                    ("words", Json::Arr(l2.claimed().words().map(|(w, bits)| Json::obj(vec![
+                        ("word", Json::u(w)), ("bits", Json::hex(bits)),
+                    ])).collect())),
+                ])),
+                // M6: claims of at least large_claim_sat wait
+                // large_delay_blocks (matured_large is their newest root),
+                // and each window releases at most its cap (only an attested
+                // first claim of a window, or any first claim on a policy
+                // without attestors, may exceed it).
+                ("large_claim_sat", Json::sat(u128::from(l2.limits().large_claim_sat))),
+                ("large_delay_blocks", Json::u(l2.limits().large_delay_blocks)),
+                ("retention_blocks", Json::u(l2.limits().retention_blocks)),
+                ("matured_large", l2.matured_large_withdrawals().map_or(Json::Null, |r| record(&r))),
+                ("release_window", {
+                    let w = l2.release_window();
+                    Json::obj(vec![
+                        ("window", Json::u(w.window)),
+                        ("blocks", Json::u(l2.limits().release_window_blocks)),
+                        ("bps", Json::u(l2.limits().release_window_bps)),
+                        ("floor_sat", Json::sat(u128::from(l2.limits().release_floor_sat))),
+                        ("released_sat", Json::sat(w.released)), ("cap_sat", Json::sat(w.cap)),
+                        ("remaining_sat", Json::sat(w.remaining())),
+                    ])
+                }),
+                // M6: with attestor_set non-null, claims of at least
+                // attested_claim_sat need the attestors' k-of-n signature
+                // (claim version 2).
+                ("attestor_set", if policy.attestor_set == [0; 32] { Json::Null } else { Json::hex(&policy.attestor_set) }),
+                ("attested_claim_sat", Json::sat(u128::from(l2.limits().large_claim_sat))),
+                ("released_sat", Json::sat(l2.released_sat())),
+                ("escrow_conserved", Json::Bool(l2.escrow_conserved())),
+            ])
+        }),
+        ("accepted", l2.head().map_or(Json::Null, |(commitment, statement)| Json::obj(vec![
+            ("commitment", Json::hex(&commitment)), ("statement", Json::s(crate::codec::hex(&statement))),
+        ]))),
     ])
 }

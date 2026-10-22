@@ -74,13 +74,15 @@
 //! carries the slashing-cost retraction an integrator needs: the latch stops
 //! THIS node rewinding itself; it is not an economic guarantee across nodes.
 //!
-//! The store is **rebuilt from scratch on every head computation** rather than
-//! carried as mutable node state. That is the §5.5 posture applied where it is
-//! cheapest to get wrong: a cached fork-choice store is exactly the kind of
-//! node-local mutable state that made two honest nodes disagree in the
-//! `expected_bits` incident. Rebuilding is O(blocks x attestations) per call
-//! and, on a devnet, free; when it stops being free the fix is an incremental
-//! store with a test proving it equals the rebuild, not a cache with a comment.
+//! Latest messages and current stakes are rebuilt on every head computation.
+//! `BlockInventory` maintains parent/child and historical-vote indexes in the
+//! same container as the envelopes; all mutations update those indexes. The
+//! weight walk needs only descendants of the justified checkpoint, but the
+//! vote fold retains the full rebuild's exact block-ID/body/pool ordering:
+//! legacy equivocation detection is order-sensitive, so an arrival-order
+//! latest-message cache would change heads. Differential tests compare both
+//! tie-break regimes against the unchanged full rebuild through insertion,
+//! replacement, removal, stake changes, missing parents and synthetic cycles.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -108,6 +110,9 @@ use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition
 use bloch_pos_committee::interfaces::TransitionError;
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 use sha3::{Digest, Sha3_256};
+
+mod block_inventory;
+use block_inventory::BlockInventory;
 
 mod validator_lifecycle;
 mod admission;
@@ -490,6 +495,41 @@ fn node_is_behind(
         && now_ms.saturating_sub(last_applied_ms) > stale_after_ms
 }
 
+/// Whether this slot-loop turn may sign the attestation for wall slot `slot`.
+///
+/// Below `ANCESTRY_SEED_ACTIVATION_EPOCH` the committee seed of epoch `e` is
+/// the RANDAO mix of the last block before `first_slot_of_epoch(e)`, and the
+/// target is that same block. An attester that signs at the very start of an
+/// epoch's slot while its head is still in `e - 1` AND the boundary slot
+/// `first_slot_of_epoch(e) - 1` is empty in its view is betting that no block
+/// for that slot is still in flight. When one is, the vote is drawn from the
+/// wrong seed and names the wrong target, so it is never included; worse,
+/// once the late block lands the validator's real committee slot comes up
+/// later in the same epoch and slashing protection correctly refuses it as a
+/// double vote. One late block costs the whole epoch's vote.
+///
+/// So in exactly that case the signature waits until half the slot has
+/// elapsed, giving the late boundary block time to arrive. Every other case —
+/// head already in `e`, or head on the boundary slot itself — signs at once,
+/// unchanged, so same-slot inclusion (the only inclusion an epoch's last
+/// slot ever gets) is not touched.
+fn attestation_due(
+    head_slot: u64,
+    slot: u64,
+    now_ms: u64,
+    slot_start_ms: u64,
+    slot_ms: u64,
+) -> bool {
+    let e = epoch_of(slot);
+    if epoch_of(head_slot) >= e {
+        return true;
+    }
+    let boundary_seen = first_slot_of_epoch(e)
+        .and_then(|first| first.checked_sub(1))
+        .is_none_or(|last_of_prev| head_slot >= last_of_prev);
+    boundary_seen || now_ms.saturating_sub(slot_start_ms) >= slot_ms / 2
+}
+
 /// Remaining wall-clock epochs before a single block extending `head_slot`
 /// would exceed the consensus epoch-walk ceiling.
 ///
@@ -809,6 +849,24 @@ const _: () = assert!(
 /// correct slow path underneath it, never a limit on what can be reorganised.
 const REORG_STATE_WINDOW: usize = 2;
 
+/// Released finalized bodies after which [`return_freed_heap_to_os`] runs.
+const RELEASE_TRIM_THRESHOLD: usize = 1_024;
+
+/// Ask glibc to return free heap pages to the kernel.
+///
+/// Released block bodies are thousands of small allocations spread through
+/// the heap; glibc only shrinks the heap from its top, so without this the
+/// node's resident size would stay at its boot high-water mark (the whole
+/// block log, decoded) after the bodies are gone. No-op off glibc.
+fn return_freed_heap_to_os() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim` takes no pointers; it only walks glibc's own free
+    // lists under the allocator's locks and is safe to call from any thread.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// Ceiling on blocks parked waiting for a parent this node has never seen.
 ///
 /// **The bound is the whole point.** Before this existed, `ingest` stored
@@ -1022,6 +1080,10 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
         PosTransaction::Transfer { tip_millisat_per_gas, .. }
         | PosTransaction::TransferV2 { tip_millisat_per_gas, .. } => *tip_millisat_per_gas,
         PosTransaction::FundedDeposit(tx) => tx.tip_millisat_per_gas,
+        PosTransaction::L2Deposit(tx) => tx.tip_millisat_per_gas,
+        PosTransaction::L2DataAvailability(tx) => tx.tip_millisat_per_gas,
+        PosTransaction::L2WithdrawClaim(tx) => tx.tip_millisat_per_gas,
+        PosTransaction::RescueReveal(tx) => tx.tip_millisat_per_gas,
         _ => 0,
     }
 }
@@ -1050,7 +1112,9 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
         PosTransaction::ExitV2 { pubkey_hash, .. } =>
             Some(lifecycle_source_hash(b"exit", pubkey_hash)),
         PosTransaction::Withdraw { validator }
-        | PosTransaction::RandaoRecommit { validator, .. } =>
+        | PosTransaction::RandaoRecommit { validator, .. }
+        | PosTransaction::KesRegister { validator, .. }
+        | PosTransaction::KesRotate { validator, .. } =>
             Some(validator_lifecycle_source(*validator)),
         PosTransaction::SlashingEvidence(evidence) => {
             let validator = match evidence {
@@ -1059,8 +1123,36 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
             };
             Some(validator_lifecycle_source(validator))
         }
+        PosTransaction::L2Deposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::L2DataAvailability(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::L2WithdrawClaim(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::RescueReveal(tx) => Some(Sha3_256::digest(&tx.pubkey).into()),
+        PosTransaction::WithdrawalCredentialRotation(tx) => Some(validator_lifecycle_source(tx.validator)),
+        // F-9: a rescue commitment is free and names no key, so every one
+        // shares ONE source. The flood can then hold at most
+        // MEMPOOL_MAX_PER_SOURCE (64) of the MEMPOOL_MAX entries, i.e. 16
+        // blocks' worth at RESCUE_COMMITS_MAX_PER_BLOCK, and never displaces
+        // a paying transaction.
+        PosTransaction::RescueCommit(_) => Some(rescue_commit_pool_source()),
         _ => None,
     }
+}
+
+fn rescue_commit_pool_source() -> [u8; 32] {
+    lifecycle_source_hash(b"rescue-commit-pool", &[])
+}
+
+/// Proposer order among rescue commitments (F-9): they carry no tip, so the
+/// fee order ties them all and the canonical-bytes tie-break would hand
+/// every slot to whoever grinds the lowest commitment bytes. Instead rank by
+/// `SHA3(domain ‖ parent block id ‖ commitment)`: unknown until the parent
+/// exists, so it cannot be ground in advance, and re-drawn every block.
+fn rescue_commit_rank(seed: &[u8; 32], commitment: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(b"bloch/proposer/rescue-commit-order/v1");
+    h.update(seed);
+    h.update(commitment);
+    h.finalize().into()
 }
 
 fn lifecycle_source_hash(domain: &[u8], identity: &[u8]) -> [u8; 32] {
@@ -1409,6 +1501,10 @@ pub use state_cell::SharedHead;
 #[cfg(test)]
 mod replay_bench;
 
+/// Hard-fork port guard: "gates off is byte-identical". `cfg(test)`, instrumentation only.
+#[cfg(test)]
+mod hf_replay_guard;
+
 #[cfg(test)]
 mod proposal_revalidation_tests;
 
@@ -1417,6 +1513,9 @@ mod ws_lifecycle_tests;
 
 mod local_cache;
 mod verification;
+mod finality_cert;
+#[cfg(test)]
+mod finality_cert_tests;
 
 struct Engine {
     manifest: Manifest,
@@ -1441,6 +1540,10 @@ struct Engine {
     /// keystore, is how you equivocate and get slashed. There is no safe
     /// version of that, so there is this.
     keys: Option<Keystore>,
+    /// Forward-secure signing key (`crate::kes_key`), loaded when
+    /// `validator.kes` exists. From `KES_ACTIVATION_EPOCH` on, proposals and
+    /// votes are signed with it and `keys` signs transactions only.
+    kes: Option<KesSigner>,
     /// Every block this node has *authenticated and connected*, canonical or
     /// not, by id.
     ///
@@ -1467,7 +1570,7 @@ struct Engine {
     /// from them — so this still grows with the chain. That is the chain's
     /// own size, not an attacker's budget, and it is the honest remaining
     /// limitation.
-    blocks: BTreeMap<[u8; 32], BlockEnvelope>,
+    blocks: BlockInventory,
     observed_proposals: BTreeMap<(u64, u32), ProposalEnvelope>,
     /// Canonical chain, ascending slot, genesis first.
     chain: Vec<(u64, BlockId)>,
@@ -1483,6 +1586,9 @@ struct Engine {
     /// the wrong branch". A block that leaves the canonical chain and later
     /// returns has the same post-state both times.
     recent_states: VecDeque<([u8; 32], Arc<CommittedState>)>,
+    /// Retained checkpoint registry proofs + built certificates for
+    /// `getfinalitycertificate`. RPC-only; see `engine/finality_cert.rs`.
+    finality_certs: finality_cert::FinalityCertStore,
     /// Attestations available to fork choice and to the next proposal, keyed
     /// by content so duplicates collapse. This is the *aggregation* store.
     pool: BTreeMap<(u32, [u8; 32]), Attestation>,
@@ -1854,6 +1960,13 @@ enum Refusal {
     /// The per-identity or aggregate lifecycle hybrid-verification allowance
     /// is exhausted for the wall slot. The caller may retry next slot.
     LifecycleVerificationLimited { until_slot: u64 },
+    /// P5a (`NATIVE_SLASHING_ACTIVATION_EPOCH`): slashing evidence whose bytes
+    /// alone prove it wrong on every honest node — two signers, no conflict,
+    /// or a forged signature under a finalized key binding. Unlike
+    /// [`Refusal::Invalid`] this is attributable: the gossip path penalises
+    /// the delivering peer (`Verdict::Reject`), as ObenBlock's PoCI ingress
+    /// does, so forged evidence is never free to relay.
+    EvidenceFault(&'static str),
     /// Per-source or aggregate block/attestation/transaction admission
     /// verification is exhausted for this wall slot. This is local load,
     /// never invalid bytes.
@@ -1866,7 +1979,7 @@ impl Refusal {
     fn reason(&self) -> &'static str {
         match self {
             Refusal::AtCapacity => "mempool is at capacity",
-            Refusal::Invalid(why) | Refusal::StateDependent(why) => why,
+            Refusal::Invalid(why) | Refusal::StateDependent(why) | Refusal::EvidenceFault(why) => why,
             Refusal::PreviouslyRefused { .. } => {
                 "this node's proposer already had the transition refuse this transaction"
             }
@@ -1920,7 +2033,9 @@ enum AttestationAdmission {
 }
 
 /// Local, non-forgeable evidence that this exact signed header already passed
-/// gossip authentication under one registry key. Construction is private and
+/// gossip authentication under one registry authority
+/// (`bloch_pos_committee::kes::authority_fingerprint`: `SHA3(static key)`
+/// before KES enforcement, static key ‖ KES key ‖ domain ‖ period after). Construction is private and
 /// the type is move-only. Promotion consumes it; a block that is parked again
 /// receives a fresh binding only after this proof matches the current key or
 /// a fresh verification succeeds.
@@ -1932,22 +2047,21 @@ struct AuthenticatedBlockAdmission {
 }
 
 impl AuthenticatedBlockAdmission {
-    fn new(env: &BlockEnvelope, pubkey: &[u8]) -> Self {
+    fn new(env: &BlockEnvelope, authority: &[u8; 32]) -> Self {
         Self {
             block_id: *env.block_id().as_bytes(),
             signing_root: env.header.proposal_signing_root(),
             signature_sha3: Sha3_256::digest(&env.proposer_sig).into(),
-            pubkey_sha3: Sha3_256::digest(pubkey).into(),
+            pubkey_sha3: *authority,
         }
     }
 
-    fn matches(&self, env: &BlockEnvelope, pubkey: &[u8]) -> bool {
+    fn matches(&self, env: &BlockEnvelope, authority: &[u8; 32]) -> bool {
         let signature_sha3: [u8; 32] = Sha3_256::digest(&env.proposer_sig).into();
-        let pubkey_sha3: [u8; 32] = Sha3_256::digest(pubkey).into();
         self.block_id == *env.block_id().as_bytes()
             && self.signing_root == env.header.proposal_signing_root()
             && self.signature_sha3 == signature_sha3
-            && self.pubkey_sha3 == pubkey_sha3
+            && self.pubkey_sha3 == *authority
     }
 }
 
@@ -2389,6 +2503,195 @@ impl Engine {
         (rec.pubkey == keys.pubkey).then_some(keys.index)
     }
 
+    /// Make the KES key ready to sign for `validator` in `epoch`: `Ok(None)`
+    /// before KES enforcement (the static key signs, exactly as before),
+    /// `Ok(Some((period, key in force)))` once evolved — on disk first — to
+    /// the leaf the chain assigns that period (`KesPublic::leaf_index`: the
+    /// period minus the key's on-chain start period), `Err` when this node
+    /// must not sign (no KES key here or on chain, a file that is not the key
+    /// in force, an erased or expired leaf, or a failed write). Promotes a
+    /// rotated-in successor the chain has made the key in force. Called only
+    /// once a duty is settled, so an idle validator does not evolve or log.
+    fn prepare_kes(&mut self, epoch: u64, validator: u32) -> Result<Option<(u64, bloch_pos_committee::kes::KesPublic)>, String> {
+        use bloch_pos_committee::kes::SigningMode;
+        // The same rule every verifier runs (`kes::signing_mode`): static
+        // before KES binds on chain, and for a never-registered validator
+        // after (fallback); the KES leaf for a registered one.
+        let period = match bloch_pos_committee::kes::signing_mode(&*self.state, validator, epoch) {
+            SigningMode::Static => return Ok(None),
+            SigningMode::FailClosed => return Err("KES enforcement state unknown".into()),
+            SigningMode::Kes(period) => period,
+        };
+        let head_period = bloch_pos_committee::params::kes_period(epoch_of(self.state.slot()));
+        let Some(kes) = self.kes.as_mut() else {
+            return Err(format!(
+                "KES is enforced from epoch {} and no {} is loaded",
+                bloch_pos_committee::params::KES_ACTIVATION_EPOCH,
+                crate::kes_key::FILE_NAME
+            ));
+        };
+        let Some(public) = self.state.kes_public_at(validator, period) else {
+            return Err(format!("no KES key is registered on chain for v{validator}"));
+        };
+        kes.adopt_successor(&public)?;
+        if kes.key.index() != validator && kes.key.index() != crate::keys::AUTO_VALIDATOR_INDEX {
+            return Err(format!(
+                "{} belongs to v{}, not v{validator}",
+                crate::kes_key::FILE_NAME,
+                kes.key.index()
+            ));
+        }
+        if !kes.key.public().same_tree(&public) {
+            return Err(format!(
+                "{} (root {}) is not v{validator}'s KES key in force for period {period} (root {})",
+                crate::kes_key::FILE_NAME,
+                crate::codec::hex8(&kes.key.public().root),
+                crate::codec::hex8(&public.root)
+            ));
+        }
+        let Some(leaf) = public.leaf_index(period) else {
+            return Err(format!(
+                "v{validator}'s KES key does not cover period {period} (start {}, end {}): expired or not yet started",
+                public.start_period,
+                public.end_period()
+            ));
+        };
+        if leaf < kes.key.period() {
+            return Err(format!("KES leaf {leaf} (period {period}) is erased (key at leaf {})", kes.key.period()));
+        }
+        if leaf > kes.key.period() {
+            // Evolution timing (review F-7, jitter): a key evolves at its
+            // validator's FIRST duty of the new period, i.e. its attestation
+            // slot, which the committee shuffle spreads over the 32 slots of
+            // the period's first epoch; and re-sealing reuses the cached
+            // Argon2id-derived key (`KesKey` seal cache), so co-hosted
+            // validators neither evolve in one slot nor run a 64 MiB KDF.
+            // Review F-5: erasure cannot be undone, so a clock that jumped
+            // forward must not erase periods the chain has not reached. The
+            // key moves at most one period past where it is, or past the
+            // head's period, unless the operator confirms the target period
+            // (`BLOCH_KES_ALLOW_PERIOD_JUMP=<period>`).
+            let key_period = public.start_period.saturating_add(kes.key.period());
+            if !kes_evolution_allowed(key_period, head_period, period, kes_period_jump_confirmed()) {
+                return Err(format!(
+                    "refusing to erase KES periods {key_period}..{period}: the chain head is at period {:?}; \
+                     a clock jump? set BLOCH_KES_ALLOW_PERIOD_JUMP={period} to confirm",
+                    head_period
+                ));
+            }
+            if leaf > kes.key.period() + 1 {
+                eprintln!("KES WARNING: evolving across {} periods at once (to period {period})", leaf - kes.key.period());
+            }
+            kes.key
+                .evolve_to(&kes.dir, &kes.unlock, leaf)
+                .map_err(|e| format!("KES evolve to leaf {leaf} (period {period}): {e}"))?;
+            println!("KES key evolved to leaf {leaf} (period {period}); earlier seeds erased on disk");
+        }
+        Ok(Some((period, public)))
+    }
+
+    /// HF3 automatic KES rotation, once per slot turn for a validator node
+    /// (docs/KES-MAINNET-READINESS.md §3 item 3). No operator action: when the
+    /// key in force has at most `KES_ROTATE_REMAINING_PERIODS` (+ a per-index
+    /// stagger) periods left, generate the successor tree in the background,
+    /// seal it as `validator.kes.next`, submit a `KesRotate` signed by the
+    /// current leaf (again each period until included), and swap the files
+    /// once the chain makes the successor the key in force. Inert before KES
+    /// enforcement, while behind the clock, and for observers.
+    pub(super) fn maintain_kes(&mut self, wall_epoch: u64) {
+        if self.kes.is_none()
+            || self.doppelganger_blocks_duties(self.wall_slot)
+            || epoch_of(self.state.slot()) != wall_epoch
+        {
+            return;
+        }
+        let Some(period) = bloch_pos_committee::params::kes_period(wall_epoch) else {
+            return;
+        };
+        let Some(index) = self.duty_index(&self.state) else {
+            return;
+        };
+        let Some(entry) = self.state.kes_roots().get(&index).cloned() else {
+            return;
+        };
+        let Some(kes) = self.kes.as_mut() else {
+            return;
+        };
+        kes.poll_keygen();
+        if let Err(why) = kes.adopt_successor(&entry.in_force(period)) {
+            eprintln!("KES rotation for v{index}: {why}");
+            return;
+        }
+        let step = kes_rotation_step(
+            &entry,
+            period,
+            index,
+            &kes.key.public(),
+            kes.next.as_ref().map(|next| next.public()),
+            kes.keygen.is_some(),
+            kes.rotation_submitted == Some(period),
+        );
+        match step {
+            KesRotationStep::Idle | KesRotationStep::AwaitHandover => {}
+            KesRotationStep::Foreign => eprintln!(
+                "KES rotation for v{index}: the chain holds a pending successor that is not {}; \
+                 this node will not be able to sign once it takes over",
+                crate::kes_key::NEXT_FILE_NAME
+            ),
+            KesRotationStep::Generate { depth } => kes.spawn_keygen(index, depth),
+            KesRotationStep::Submit => self.submit_kes_rotation(wall_epoch, period, index),
+        }
+    }
+
+    fn submit_kes_rotation(&mut self, wall_epoch: u64, period: u64, index: u32) {
+        let in_force = match self.prepare_kes(wall_epoch, index) {
+            Ok(Some((p, public))) if p == period => public,
+            Ok(_) => return,
+            Err(why) => {
+                eprintln!("KES rotation for v{index} deferred: {why}");
+                return;
+            }
+        };
+        let Some(kes) = self.kes.as_ref() else {
+            return;
+        };
+        let Some(next) = kes.next.as_ref().map(|next| next.public()) else {
+            return;
+        };
+        let domain = KeyLookup::kes_network_domain(&*self.state);
+        let rotate_root = bloch_pos_committee::kes::rotate_signing_root(
+            &domain.unwrap_or([0; 32]),
+            index,
+            period,
+            next.depth,
+            &next.root,
+        );
+        let Some(message) = bloch_pos_committee::kes::leaf_message(domain, index, &in_force, period, &rotate_root) else {
+            return;
+        };
+        let signature = match kes.key.sign(&message) {
+            Ok(signature) => signature,
+            Err(e) => {
+                eprintln!("KES rotation for v{index}: leaf signing failed: {e}");
+                return;
+            }
+        };
+        let tx = PosTransaction::KesRotate { validator: index, period, depth: next.depth, root: next.root, signature };
+        match self.on_transaction(tx) {
+            Ok(_) => {
+                println!(
+                    "KES rotation for v{index} submitted in period {period}: successor root {} from period {}",
+                    crate::codec::hex8(&next.root),
+                    period + 1
+                );
+                if let Some(kes) = self.kes.as_mut() {
+                    kes.rotation_submitted = Some(period);
+                }
+            }
+            Err(reason) => eprintln!("KES rotation for v{index} deferred: {reason:?}"),
+        }
+    }
+
     /// Publish participation eligibility, not a scheduled or completed duty.
     /// Read the current registry on every turn so activation, exit and reorg
     /// key mappings cannot leave a boot-time value behind. These are the same
@@ -2460,17 +2763,156 @@ impl Engine {
         );
     }
 
+    /// Rollback guard, runtime half (node-local). An authenticated signature
+    /// of THIS key that the signing record does not cover means the record is
+    /// stale (restored data dir) or another instance of the key is signing.
+    /// Either way the record is raised durably to cover it, so no later duty
+    /// can conflict with it; and when the sighting is live network evidence,
+    /// duties stop until an operator restarts the node.
+    fn note_own_signature(&mut self, index: u32, seen: crate::slashprot::Published, live_evidence: bool) {
+        // Cheap pre-filter: skip the registry probe for every other validator.
+        match self.keys.as_ref() {
+            None => return,
+            Some(k) if k.index != crate::keys::AUTO_VALIDATOR_INDEX && k.index != index => return,
+            Some(_) => {}
+        }
+        let Some(my_index) = self.duty_index(&self.state) else { return };
+        if index != my_index || !self.slashprot.is_uncovered(seen) {
+            return;
+        }
+        let before = self.slashprot.watermarks();
+        match self.slashprot.raise_to_published(seen) {
+            Ok(after) if live_evidence => {
+                self.doppelganger_halted = true;
+                eprintln!(
+                    "SIGNING RECORD STALE: validator {index} signed {seen:?} on the network, which \
+                     this node's record {before:?} does not cover. Either the data dir was \
+                     restored from a backup or ANOTHER INSTANCE of this key is signing. Record \
+                     raised to {after:?}; duties STOPPED until restart. Confirm only one \
+                     instance of this key runs before restarting."
+                );
+            }
+            Ok(after) => eprintln!(
+                "SIGNING RECORD STALE: replayed chain shows validator {index} signed {seen:?} \
+                 beyond the record {before:?}; record raised to {after:?} before any duty."
+            ),
+            Err(e) => {
+                self.doppelganger_halted = true;
+                eprintln!(
+                    "SIGNING RECORD STALE: validator {index} signed {seen:?} beyond the record \
+                     and the record could not be raised ({e}); duties STOPPED."
+                );
+            }
+        }
+    }
+
+    /// Late retry of this epoch's attestation duty that the slot loop could
+    /// not perform on time (node-local liveness; no consensus change).
+    ///
+    /// # Why
+    ///
+    /// Each active validator has exactly one attestation duty slot per epoch.
+    /// The slot loop only calls [`Self::attest`] for the CURRENT wall slot, and
+    /// only while the stale-head gate (`node_is_behind` + [`DutySyncGate`]) and
+    /// the other duty blockers are open. A run of two or more empty slots
+    /// (missing proposers) closes that gate for an online, fully synced node;
+    /// if the validator's single duty slot falls inside the run, the old loop
+    /// never came back to it, the validator cast no vote for the epoch, and
+    /// it was charged as offline (inactivity leak) although it was online.
+    ///
+    /// Once the gate reopens at wall slot `w` of the SAME epoch `e`, this
+    /// signs the vote for the missed duty slot `d < w`: `data.slot = d` (so
+    /// the committee check, which keys on `data.slot`, still passes),
+    /// `target = (e, checkpoint_root(e))`, source = current justified view,
+    /// head = current head. Consensus accepts an attestation of the current
+    /// epoch whose slot is not in the future (`attestation::validate`,
+    /// step 8, gossip window of 2 epochs), so the vote is includable by any
+    /// block of epoch `e` at slot `>= d`.
+    ///
+    /// # Slashing safety (slashing protection stays the single authority)
+    ///
+    /// - Signing goes through the same `guard_attestation` as the on-time
+    ///   path: the watermark (slot, source, target) is fsync-ed BEFORE the
+    ///   signature exists, across restarts and processes.
+    /// - Double vote: the guard refuses any `target_epoch <= watermark`. The
+    ///   on-time vote and a retry both target `e`, so whichever is signed
+    ///   first makes every other vote for `e` impossible. This function also
+    ///   pre-checks the watermark and stays silent once `e` is covered; the
+    ///   pre-check is an optimisation, never the protection.
+    /// - Surround vote: source is the current justified epoch, refused by
+    ///   the guard if below the source watermark; with target strictly above
+    ///   the target watermark, the new vote cannot surround or be surrounded
+    ///   by any vote this key signed.
+    /// - Same-slot (fork-choice) equivocation: the guard requires
+    ///   `data.slot > attestation_slot watermark`. All earlier votes are from
+    ///   earlier epochs (slots `< first_slot(e) <= d`), and no later vote for
+    ///   slot `d` can follow, so no two votes of this key share a slot.
+    /// - Bounded to the epoch: only `epoch_of(d) == epoch_of(w)` is ever
+    ///   retried; a duty from an epoch that has ended is dropped, never
+    ///   signed late.
+    /// - Restart mid-epoch: nothing here is in memory; the decision is the
+    ///   durable watermark. A node restarted after signing for `e` does not
+    ///   sign again; one restarted after missing `d` votes once.
+    fn retry_missed_attestation(&mut self, wall_slot: u64) {
+        if self.keys.is_none() || self.doppelganger_blocks_duties(wall_slot) {
+            return;
+        }
+        let e = epoch_of(wall_slot);
+        if e == 0 {
+            return;
+        }
+        // Cheap pre-check (see above): already voted for this target epoch.
+        if self.slashprot.watermarks().target_epoch.is_some_and(|t| t >= e) {
+            return;
+        }
+        let Some(duty_slot) = self.attestation_duty_slot(e) else {
+            return;
+        };
+        if duty_slot >= wall_slot || epoch_of(duty_slot) != e {
+            // Not yet due (the on-time path handles it), or not this epoch.
+            return;
+        }
+        println!("[slot {wall_slot}] retrying the missed attestation duty of slot {duty_slot} (epoch {e})");
+        self.attest_for(duty_slot, wall_slot);
+    }
+
+    /// This validator's attestation duty slot in epoch `e`, from the same
+    /// snapshot, seed and roster [`Self::attest`] uses (one epoch partition).
+    fn attestation_duty_slot(&mut self, e: u64) -> Option<u64> {
+        let rolled = self.rolled_to(e);
+        let index = self.duty_index(&rolled)?;
+        let roster = rolled.active_validators();
+        let seed = Self::seed_for(&rolled, e);
+        let partition = committees::epoch_committees(&seed, e, &roster);
+        let first = first_slot_of_epoch(e)?;
+        partition
+            .iter()
+            .position(|c| c.binary_search(&index).is_ok())
+            .and_then(|i| first.checked_add(i as u64))
+    }
+
     fn attest(&mut self, slot: u64) {
+        self.attest_for(slot, slot);
+    }
+
+    /// Sign the duty of `slot` (the attestation's `data.slot`) at wall slot
+    /// `wall_slot >= slot`, same epoch. On time, the two are equal.
+    fn attest_for(&mut self, slot: u64, wall_slot: u64) {
+        // Never a future duty, never a duty of another (ended) epoch.
+        if slot > wall_slot || epoch_of(slot) != epoch_of(wall_slot) {
+            return;
+        }
         // An observer holds no key and therefore has no duty. Bound here, once,
         // and used to sign below — nothing between reads `keys` mutably.
         //
         // Borrow shape: `keys` is read inside the signing closure while
         // `slashprot` is borrowed mutably, so the key is resolved to a local
-        // rather than through `self`.
-        let Some(keys) = self.keys.as_ref() else {
+        // rather than through `self` — after `prepare_kes`, which may rewrite
+        // the KES key on disk.
+        if self.keys.is_none() {
             return;
-        };
-        if self.doppelganger_blocks_duties(slot) {
+        }
+        if self.doppelganger_blocks_duties(wall_slot) {
             return;
         }
         let e = epoch_of(slot);
@@ -2492,29 +2934,72 @@ impl Engine {
             return;
         }
         let fin = rolled.finality();
+        // From `params::HF1_OWN_TARGET_VOTES_EPOCH` the tally of the
+        // head's chain counts a vote only if its target is the root that
+        // chain RECORDED for `e` (and its source that chain's justified
+        // checkpoint, which is then always its own). `rolled` is the head's
+        // state rolled into `e`, so its record is that root; vote it, so the
+        // vote is by construction one the head's own chain counts. It is the
+        // same convention as `checkpoint_root` (last block strictly before
+        // `e`'s first slot); a disagreement means the canonical index and the
+        // head state have diverged, and the state is the one consensus reads.
+        let canonical_target = self.checkpoint_root(e);
+        let target_root = match rolled.own_checkpoint_root(e) {
+            Some(own) => {
+                if own != canonical_target {
+                    eprintln!(
+                        "[slot {slot}] checkpoint of epoch {e}: head state records {} but the \
+                         canonical index gives {}; voting the head state's own root",
+                        crate::codec::hex8(&own),
+                        crate::codec::hex8(&canonical_target),
+                    );
+                }
+                own
+            }
+            None => canonical_target,
+        };
         let data = AttestationData {
             slot,
             head: *self.head_id().as_bytes(),
             source_epoch: fin.justified.epoch,
             source_root: fin.justified.root,
             target_epoch: e,
-            target_root: self.checkpoint_root(e),
+            target_root,
         };
         // SLASHING PROTECTION. The duty is settled; the signature is not made
         // until the watermark for it is on disk and fsync-ed. `slot` here is
-        // the wall-clock slot — the slot loop derives it from `wall_slot()`
-        // and hands it in — so "refuse unless the slot exceeds the watermark"
-        // is exactly "refuse unless the wall clock has moved past what we
-        // already signed", including after an NTP step backwards or a restart
-        // inside the same slot.
+        // the wall-clock slot on time, or an earlier duty slot of the SAME
+        // epoch for a late retry (`retry_missed_attestation`, whose doc holds
+        // the full slashing-safety argument). Either way the guard refuses
+        // unless the slot exceeds the slot watermark AND the target epoch
+        // exceeds the target watermark, so one key signs at most one vote per
+        // target epoch, including after an NTP step backwards or a restart.
         //
+        // KES: the vote's period is its target epoch's, which is this slot's.
+        let kes_period = match self.prepare_kes(e, index) {
+            Ok(period) => period,
+            Err(why) => {
+                eprintln!("[slot {slot}] not attesting: {why}");
+                return;
+            }
+        };
+        let Some(keys) = self.keys.as_ref() else {
+            return;
+        };
+        let kes = self.kes.as_ref();
         let root = data.signing_root();
         let signature = match self.slashprot.guard_attestation(
             slot,
             data.source_epoch,
             data.target_epoch,
-            || keys.sign(&root),
+            || sign_duty(keys, kes, kes_period, KeyLookup::kes_network_domain(&*rolled), index, epoch_of(data.slot), &root),
         ) {
+            // An empty signature means signing failed (review F-7 residual):
+            // the watermark is spent, but nothing is sent.
+            Ok(sig) if sig.is_empty() => {
+                eprintln!("[slot {slot}] not attesting: the duty signature could not be produced");
+                return;
+            }
             Ok(sig) => sig,
             Err(refusal) => {
                 eprintln!("[slot {slot}] {refusal}");
@@ -2535,9 +3020,10 @@ impl Engine {
             .insert((att.validator, att.data.signing_root()), att);
         self.net.broadcast(frame);
         println!(
-            "[slot {slot}] attested (epoch {e}, head {}, target {})",
+            "[slot {slot}] attested (epoch {e}, head {}, target {}){}",
             crate::codec::hex8(&data.head),
-            crate::codec::hex8(&data.target_root)
+            crate::codec::hex8(&data.target_root),
+            if slot < wall_slot { format!(" late, at wall slot {wall_slot}") } else { String::new() }
         );
     }
 
@@ -2700,14 +3186,35 @@ impl Engine {
         // proposer offence, and everything above this line — the post-state,
         // the transaction selection — is discardable work; the signature is
         // not.
+        // KES: the proposal's period is its slot's epoch's. Prepared only
+        // now that this node is certain to sign.
+        let kes_period = match self.prepare_kes(e, index) {
+            Ok(period) => period,
+            Err(why) => {
+                eprintln!("[slot {slot}] not proposing: {why}");
+                return;
+            }
+        };
         // `keys.is_none()` returned at the top of this function and nothing
         // in between writes `keys`; the arm is unreachable and returning
         // without a block is the observer's behaviour.
         let Some(keys) = self.keys.as_ref() else {
             return;
         };
+        let kes = self.kes.as_ref();
         let root = header.proposal_signing_root();
-        let proposer_sig = match self.slashprot.guard_proposal(slot, || keys.sign(&root)) {
+        let proposer_sig = match self
+            .slashprot
+            .guard_proposal(slot, || {
+                sign_duty(keys, kes, kes_period, KeyLookup::kes_network_domain(&*rolled), index, epoch_of(header.slot), &root)
+            })
+        {
+            // An empty signature means signing failed (review F-7 residual):
+            // the watermark is spent, but no block is broadcast.
+            Ok(sig) if sig.is_empty() => {
+                eprintln!("[slot {slot}] not proposing: the proposer signature could not be produced");
+                return;
+            }
             Ok(sig) => sig,
             Err(refusal) => {
                 eprintln!("[slot {slot}] {refusal}");
@@ -3207,11 +3714,23 @@ impl Engine {
         // accumulate: such blocks enter `blocks`, all but one lose the
         // fork-choice tie, and `advance` — which only ever removes the block
         // it tried to apply — never touches the rest.
-        let authenticated = match KeyLookup::pubkey(&*self.state, env.header.proposer_index) {
-            Some(pk) if src.bounded_by_wall_clock() => {
+        //
+        // From KES enforcement on, the proposer signs with the leaf of its
+        // slot's period (`bloch_pos_committee::kes::verify_validator`, the
+        // transition's own step 7), and the authority a cached proof is bound
+        // to also commits to the KES key (`kes::authority_fingerprint`);
+        // before it, both are exactly the static-key forms.
+        let proposer_epoch = epoch_of(env.header.slot);
+        let authority = bloch_pos_committee::kes::authority_fingerprint(
+            &*self.state,
+            env.header.proposer_index,
+            proposer_epoch,
+        );
+        let authenticated = match authority {
+            Some(authority) if src.bounded_by_wall_clock() => {
                 let proof_matches = prior_authentication
                     .as_ref()
-                    .is_some_and(|proof| proof.matches(&env, pk));
+                    .is_some_and(|proof| proof.matches(&env, &authority));
                 if proof_matches {
                     true
                 } else {
@@ -3221,11 +3740,17 @@ impl Engine {
                         src.verification_source(),
                         GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
                     );
-                    let verified = verifier.verify_with_key(
-                        pk,
+                    let verified = bloch_pos_committee::kes::verify_validator(
+                        &*self.state,
+                        // HF2: the consensus signature rule of the header's own
+                        // epoch, exactly what the transition applies; HF3: the
+                        // KES leaf of that epoch's period once KES binds.
+                        &bloch_pos_committee::PolicyVerifier::consensus(&verifier, proposer_epoch),
+                        env.header.proposer_index,
+                        proposer_epoch,
                         &env.header.proposal_signing_root(),
                         &env.proposer_sig,
-                    );
+                    ) == Some(true);
                     if verifier.limited() {
                         // Local overload is not proof of a forgery. Ignore so an
                         // honest relay is not scored; sync retries from the
@@ -3235,14 +3760,17 @@ impl Engine {
                     verified
                 }
             }
-            Some(pk) => prior_authentication
+            Some(authority) => prior_authentication
                 .as_ref()
-                .is_some_and(|proof| proof.matches(&env, pk))
-                || self.gossip_verifier.verify_with_key(
-                    pk,
+                .is_some_and(|proof| proof.matches(&env, &authority))
+                || bloch_pos_committee::kes::verify_validator(
+                    &*self.state,
+                    &bloch_pos_committee::PolicyVerifier::consensus(&self.gossip_verifier, proposer_epoch),
+                    env.header.proposer_index,
+                    proposer_epoch,
                     &env.header.proposal_signing_root(),
                     &env.proposer_sig,
-                ),
+                ) == Some(true),
             None => {
                 // Unknown identity: hold it, ask for the gap, decide nothing.
                 self.park_orphan(id, env, src);
@@ -3265,11 +3793,10 @@ impl Engine {
             ));
             return (Verdict::Reject, None);
         }
-        let Some(authenticated_pubkey) = KeyLookup::pubkey(&*self.state, env.header.proposer_index)
-        else {
+        let Some(authenticated_authority) = authority else {
             return (Verdict::Ignore, None);
         };
-        let authenticated = AuthenticatedBlockAdmission::new(&env, authenticated_pubkey);
+        let authenticated = AuthenticatedBlockAdmission::new(&env, &authenticated_authority);
 
         if !self.admit_proposal_variant(
             id,
@@ -3357,6 +3884,11 @@ impl Engine {
         let proposer_slot = env.header.slot;
         self.observe_proposer_equivocation(&env);
         self.blocks.insert(id, env);
+        self.note_own_signature(
+            proposer_index,
+            crate::slashprot::Published::Proposal { slot: proposer_slot },
+            src.bounded_by_wall_clock(),
+        );
         if src.bounded_by_wall_clock() {
             self.note_possible_doppelganger(proposer_index, proposer_slot);
         }
@@ -3570,10 +4102,22 @@ impl Engine {
         slot: u64,
     ) -> bool {
         if let Some(index) = culprit_index(err, txs.len()) {
-            let bad = txs.remove(index).canonical_bytes();
+            let tx = txs.remove(index);
+            // `Transaction(i)` is frozen and carries no reason; for an L2
+            // withdrawal claim, ask the pre-state why (RateLimited,
+            // AttestationRequired, NotFinalized, ...).
+            let why = match &tx {
+                PosTransaction::L2WithdrawClaim(claim) => self
+                    .state
+                    .l2_withdraw_claim_refusal(claim)
+                    .map(|r| format!(" (L2 withdrawal claim index {} refused, {r:?})", claim.index))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            let bad = tx.canonical_bytes();
             self.mempool.remove(&bad);
             self.reject_transaction(bad, slot);
-            eprintln!("[slot {slot}] removing indexed transaction refused by transition: {err:?}");
+            eprintln!("[slot {slot}] removing indexed transaction refused by transition: {err:?}{why}");
             true
         } else if txs.pop().is_some() {
             eprintln!("[slot {slot}] narrowing proposal after unattributed refusal: {err:?}");
@@ -3644,14 +4188,7 @@ impl Engine {
     /// The LMD-GHOST head over every block this node has seen, canonical or
     /// not.
     ///
-    /// Rebuilt from scratch each call (see the module docs on why there is no
-    /// cached store). Deterministic despite the map iteration: `Store::observe`
-    /// keeps the highest-slot message per validator and bars any validator that
-    /// signed two different heads in one slot, so the resulting store is a
-    /// function of the message *set*, never of arrival order — the property
-    /// that was found violated in `forkchoice.rs` on 2026-08-11 and fixed
-    /// there. Sibling lists are sorted so the tie-break is stable too.
-    /// Everything [`lmd_ghost_head`] reads, in a form cheap enough to compare
+    /// Everything fork choice reads, in a form cheap enough to compare
     /// on every turn of `advance`'s loop.
     ///
     /// The two state inputs are compared by value. The two collection inputs
@@ -3688,12 +4225,11 @@ impl Engine {
     fn forkchoice_head(&self) -> [u8; 32] {
         // Instrumentation only; compiled out without `perf-timing`.
         let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::ForkChoice);
-        lmd_ghost_head_at_epoch(
-            &self.blocks,
+        self.blocks.head(
             self.pool.values(),
             &self.state.active_validators(),
             self.state.finality().justified.root,
-            epoch_of(self.state.slot()),
+            bloch_pos_committee::params::forkchoice_slot_tiebreak_active(epoch_of(self.state.slot())),
         )
     }
 
@@ -3842,6 +4378,11 @@ impl Engine {
                 Some(inputs.iter().map(|i| (i.txid, i.vout)).collect())
             }
             PosTransaction::FundedDeposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::FundedDelegate(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::L2Deposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::L2DataAvailability(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::L2WithdrawClaim(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::RescueReveal(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             _ => None,
         }
     }
@@ -4236,28 +4777,45 @@ impl Engine {
                 return Err(Refusal::Invalid("funded deposit belongs to a different genesis manifest"));
             }
         }
-        let verifier = self.gossip_verifier.budgeted_for_source(
-            self.wall_slot(),
-            GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
-            verification_source,
-            GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
-        );
-        let admission = admissible_with_network_verifier(
-            &tx,
-            epoch_of(self.wall_slot()),
-            self.state.admission_network_domain().as_ref(),
-            &verifier,
-        );
-        let limited = verifier.limited();
-        drop(verifier);
-        if limited {
-            return Err(Refusal::GossipVerificationLimited {
-                until_slot: self.wall_slot().saturating_add(1),
-            });
+        if let Some(why) = l2_admission_refusal(&tx, self.state.l2_settlement()) {
+            return Err(Refusal::Invalid(why));
         }
-        admission.map_err(Refusal::Invalid)?;
+        if let PosTransaction::L2SettlementAsync(settlement) = &tx {
+            let state = self.state.l2_settlement().ok_or(Refusal::Invalid("L2 settlement is not configured"))?;
+            if self.mempool.values().any(|pending| matches!(pending, PosTransaction::L2SettlementAsync(_))) {
+                return Err(Refusal::Invalid("one L2 proof is already pending"));
+            }
+            state.validate_async(settlement, &HybridVerifier::new())
+                .map_err(|_| Refusal::Invalid("L2 settlement policy, source, successor or proof failed"))?;
+        } else {
+            let verifier = self.gossip_verifier.budgeted_for_source(
+                self.wall_slot(),
+                GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+                verification_source,
+                GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+            );
+            let admission = admissible_with_network_verifier(
+                &tx,
+                epoch_of(self.wall_slot()),
+                self.state.admission_network_domain().as_ref(),
+                &verifier,
+            );
+            let limited = verifier.limited();
+            drop(verifier);
+            if limited {
+                return Err(Refusal::GossipVerificationLimited {
+                    until_slot: self.wall_slot().saturating_add(1),
+                });
+            }
+            admission.map_err(Refusal::Invalid)?;
+        }
         if self.funded_mempool_conflict(&tx, &capacity.stale) {
             return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
+        }
+        if let PosTransaction::SlashingEvidence(evidence) = &tx {
+            if validator_lifecycle::native_slashing_admission_active(epoch_of(self.wall_slot())) {
+                self.precheck_slashing_evidence(evidence, verification_source)?;
+            }
         }
         self.validate_lifecycle_admission(&tx)?;
         // Commit only after every incoming admission check succeeds. Removing
@@ -4310,6 +4868,10 @@ impl Engine {
     /// it builds a block every other node rejects — so the epoch comes from
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
+        // A proof reserves the whole gas budget. Never pack it with transfers.
+        if let Some(tx) = self.mempool.values().find(|tx| matches!(tx, PosTransaction::L2SettlementAsync(_))) {
+            return vec![tx.clone()];
+        }
         // Admission is a historical observation, not a reservation of inputs or
         // fees. Recheck against this proposal's parent and fee epoch before a
         // stale high-tip transaction can consume candidate capacity (EN-06).
@@ -4319,7 +4881,42 @@ impl Engine {
         let candidates = self.mempool.iter().filter(|(encoded, tx)| {
             self.candidate_is_backed(tx, encoded.len(), epoch, &mut funded_context)
         }).collect();
-        Self::pack_transactions(epoch, candidates)
+        Self::pack_transactions(epoch, *self.state.head().as_bytes(), candidates)
+    }
+
+    /// Node relay policy (HF2 sigdet): the proposer never selects a spend
+    /// whose witness the BASE verifier accepts but the FIPS 204 reference
+    /// verifier rejects (the only verdict that differs between ML-DSA
+    /// backends). A witness the base verifier itself rejects is left to the
+    /// existing propose/re-ingest/cleanup path (a bad signature must still be
+    /// able to enter a proposed block and be refused there — the slot-69
+    /// robustness design), so this guard adds ONLY the reference constraint
+    /// and never changes selection of base-valid or plainly-invalid witnesses.
+    /// `true` for transactions that carry no spend witness. Node-local; no
+    /// consensus effect.
+    fn spend_witnesses_pass_relay_policy(&self, tx: &PosTransaction, epoch: u64) -> bool {
+        let domain = self.state.admission_network_domain();
+        let Some(root) = tx.checked_signing_root_for_network(epoch, domain.as_ref()) else {
+            return !matches!(
+                tx,
+                PosTransaction::Transfer { .. } | PosTransaction::TransferV2 { .. }
+            );
+        };
+        // A witness is relay-unsafe iff the base rule accepts it and the
+        // reference rule does not.
+        let relay_unsafe = |pk: &[u8], sig: &[u8]| {
+            bloch_crypto::crypto::verify(pk, &root, sig)
+                && !bloch_crypto::crypto::verify_pinned(pk, &root, sig)
+        };
+        match tx {
+            PosTransaction::Transfer { inputs, .. } => {
+                !inputs.iter().any(|i| relay_unsafe(&i.pubkey, &i.signature))
+            }
+            PosTransaction::TransferV2 { keys, .. } => {
+                !keys.iter().any(|k| relay_unsafe(&k.pubkey, &k.signature))
+            }
+            _ => true,
+        }
     }
 
     /// Immutable signatures were checked at admission. Re-evaluate only the
@@ -4327,6 +4924,18 @@ impl Engine {
     fn candidate_is_backed(&self, tx: &PosTransaction, encoded: usize, epoch: u64,
         funded_context: &mut Option<(Arc<CommittedState>, u128)>) -> bool {
         if admission::check_transfer(&self.state, tx, encoded, epoch).is_err() { return false; }
+        // NODE RELAY POLICY (HF2 sigdet): the proposer never selects a spend
+        // whose witness fails the FIPS 204 reference verifier, even if it
+        // reached the mempool by a path that skipped `admissible`. Not a
+        // consensus rule — the transition still judges the block it builds
+        // with the base verifier.
+        if !self.spend_witnesses_pass_relay_policy(tx, epoch) { return false; }
+        // Proposer policy (incident 2026-10-19): never include evidence for an
+        // offence that predates slashing, even if it reached the mempool by a
+        // path that skipped `admissible`.
+        if let PosTransaction::SlashingEvidence(ev) = tx {
+            if bloch_pos_committee::slashing::offence_predates_activation(ev) { return false; }
+        }
         if matches!(tx, PosTransaction::FundedDeposit(_)) {
             if !bloch_pos_committee::params::funded_validator_admission_active(epoch) { return false; }
             let (rolled, total) = funded_context.get_or_insert_with(|| {
@@ -4339,7 +4948,11 @@ impl Engine {
         true
     }
 
-    fn pack_transactions(epoch: u64, mut ordered: Vec<(&Vec<u8>, &PosTransaction)>) -> Vec<PosTransaction> {
+    fn pack_transactions(
+        epoch: u64,
+        seed: [u8; 32],
+        mut ordered: Vec<(&Vec<u8>, &PosTransaction)>,
+    ) -> Vec<PosTransaction> {
         let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
         let mut out = Vec::new();
         let mut bytes = 0u64;
@@ -4355,8 +4968,21 @@ impl Engine {
         // without it costing security: candidates tied on fee are
         // interchangeable by construction.
         let mut reserved = BTreeSet::new();
+        // Consensus caps DA batches per block; the highest tips win the slots.
+        let mut da_batches = 0usize;
+        // F-9: consensus admits at most RESCUE_COMMITS_MAX_PER_BLOCK
+        // commitments; they rank after every tipped transaction and among
+        // themselves by `rescue_commit_rank`.
+        let mut rescue_commits = 0u64;
+        let rescue_key = |tx: &PosTransaction| match tx {
+            PosTransaction::RescueCommit(c) => Some(rescue_commit_rank(&seed, &c.commitment)),
+            _ => None,
+        };
         ordered.sort_by(|(ka, ta), (kb, tb)| {
-            tx_tip_rate(tb).cmp(&tx_tip_rate(ta)).then_with(|| ka.cmp(kb))
+            tx_tip_rate(tb).cmp(&tx_tip_rate(ta))
+                .then_with(|| rescue_key(ta).is_some().cmp(&rescue_key(tb).is_some()))
+                .then_with(|| rescue_key(ta).cmp(&rescue_key(tb)))
+                .then_with(|| ka.cmp(kb))
         });
         for (encoded, tx) in ordered {
             // Legacy unauthenticated exits are never proposed, even if a
@@ -4382,6 +5008,10 @@ impl Engine {
                 PosTransaction::Transfer { tx_bytes, .. }
                 | PosTransaction::TransferV2 { tx_bytes, .. } => *tx_bytes,
                 PosTransaction::FundedDeposit(tx) => tx.tx_bytes,
+                PosTransaction::L2Deposit(tx) => tx.tx_bytes,
+                PosTransaction::L2DataAvailability(tx) => tx.tx_bytes,
+                PosTransaction::L2WithdrawClaim(tx) => tx.tx_bytes,
+                PosTransaction::RescueReveal(tx) => tx.tx_bytes,
                 _ => 0,
             };
             let n = (encoded.len() as u64).max(declared);
@@ -4391,6 +5021,18 @@ impl Engine {
             let points = Self::spent_outpoints(tx).unwrap_or_default();
             if points.iter().any(|point| reserved.contains(point)) {
                 continue;
+            }
+            if matches!(tx, PosTransaction::L2DataAvailability(_)) {
+                if da_batches >= bloch_pos_committee::l2_settlement::da::MAX_PER_BLOCK {
+                    continue;
+                }
+                da_batches += 1;
+            }
+            if matches!(tx, PosTransaction::RescueCommit(_)) {
+                if rescue_commits >= bloch_pos_committee::params::RESCUE_COMMITS_MAX_PER_BLOCK {
+                    continue;
+                }
+                rescue_commits = rescue_commits.saturating_add(1);
             }
             reserved.extend(points);
             bytes = bytes.saturating_add(n); // checked against `cap` just above
@@ -4426,6 +5068,9 @@ impl Engine {
                 self.remember_state(*id.as_bytes(), snapshot);
                 self.canonical.insert(*id.as_bytes());
                 self.chain.push((env.header.slot, id));
+                // RPC-only: retain the registry proof of a checkpoint block
+                // when this block opened a new epoch (once per epoch).
+                self.note_checkpoint_registry();
                 self.head_slot.store(env.header.slot, Ordering::Relaxed);
                 self.last_applied_ms = now_ms();
                 // Finality latch (F-03): arm/raise the floor the moment the
@@ -4603,25 +5248,39 @@ impl Engine {
             .position(|(_, cid)| cid.as_bytes() == &id)
             .expect("replay target is canonical");
         let mut st = self.manifest.genesis_state();
-        // Borrow each stored envelope in canonical order. The transition only
-        // reads the block, so cloning the whole prefix (including every body,
-        // transaction, attestation and signature) into a temporary Vec added
-        // work proportional to retained history without changing the fold.
-        for (_, cid) in &self.chain[1..=cut] {
-            let env = self
-                .blocks
-                .get(cid.as_bytes())
-                .expect("canonical block stored");
+        let apply = |st: &CommittedState, env: &BlockEnvelope| {
             let envelope = ProposalEnvelope {
                 header: env.header.clone(),
                 proposer_sig: env.proposer_sig.clone(),
             };
             let txs = body_transactions(env)
                 .expect("a canonical block's body decoded when it was applied");
-            st = self
-                .tr
-                .apply_block(&st, &envelope, &env.body.attestations, &txs)
-                .expect("canonical prefix replay cannot fail (it applied before)");
+            self.tr
+                .apply_block(st, &envelope, &env.body.attestations, &txs)
+                .expect("canonical prefix replay cannot fail (it applied before)")
+        };
+        // Borrow each stored envelope in canonical order. The transition only
+        // reads the block, so cloning the whole prefix (including every body,
+        // transaction, attestation and signature) into a temporary Vec added
+        // work proportional to retained history without changing the fold.
+        // Released (finalized) bodies are streamed back from the block log a
+        // page at a time instead.
+        let mut i = 1;
+        while i <= cut {
+            let id = *self.chain[i].1.as_bytes();
+            if self.blocks.is_hollow(&id) {
+                let mut end = i + 1;
+                while end <= cut && self.blocks.is_hollow(self.chain[end].1.as_bytes()) {
+                    end += 1;
+                }
+                self.read_logged_canonical(i, end, |env| st = apply(&st, &env))
+                    .expect("released canonical bodies are readable from the block log");
+                i = end;
+            } else {
+                let env = self.blocks.get(&id).expect("canonical block stored");
+                st = apply(&st, env);
+                i += 1;
+            }
         }
         st
     }
@@ -4648,6 +5307,90 @@ impl Engine {
             Some((floor, _)) if floor >= h => {}
             _ => self.finalized_latch = Some((h, fin.root)),
         }
+        self.hollow_finalized_bodies();
+    }
+
+    /// Release the bodies of canonical blocks strictly below the finality
+    /// latch (see [`block_inventory::BlockInventory::hollow`]).
+    ///
+    /// Newest first, stopping at the first block already released, so after
+    /// the first call this is O(newly finalized blocks). Skipped while a reorg
+    /// rewrite of the block log is pending: a block adopted by that reorg is
+    /// not yet in the published log, and a released body must always be
+    /// readable back from it.
+    fn hollow_finalized_bodies(&mut self) {
+        let Some((latch, _)) = self.finalized_latch else { return };
+        if self.store.rewrite_pending() {
+            return;
+        }
+        let top = usize::try_from(latch).unwrap_or(usize::MAX).min(self.chain.len());
+        let mut released = 0usize;
+        for i in (1..top).rev() {
+            let id = *self.chain[i].1.as_bytes();
+            if self.blocks.is_hollow(&id) {
+                break;
+            }
+            if self.blocks.hollow(&id) {
+                released = released.saturating_add(1);
+            }
+        }
+        // A finality step releases about an epoch of blocks, which the next
+        // blocks reuse. A large batch (boot replay, the first run after an
+        // upgrade) frees most of the chain at once, and glibc keeps freed
+        // pages in the middle of the heap resident unless asked.
+        if released >= RELEASE_TRIM_THRESHOLD {
+            return_freed_heap_to_os();
+        }
+    }
+
+    /// Canonical envelopes `chain[from..to]`, read back from the block log in
+    /// order. Used for blocks whose body was released from memory.
+    ///
+    /// The log equals the canonical chain at every height below the finality
+    /// latch, which is the only place a released body can be; each frame's id
+    /// is still checked against the chain, and a disagreement is an error,
+    /// never a silently different block.
+    fn read_logged_canonical(
+        &self,
+        from: usize,
+        to: usize,
+        mut each: impl FnMut(BlockEnvelope),
+    ) -> io::Result<()> {
+        const PAGE_BLOCKS: usize = 256;
+        if from == 0 || from > to || to > self.chain.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "canonical range out of bounds"));
+        }
+        let dir = self.store.directory();
+        let mut at = from;
+        let mut after_slot = self.chain[from - 1].0;
+        while at < to {
+            let page = crate::store::Store::blocks_after(dir, after_slot, (to - at).min(PAGE_BLOCKS))?;
+            if page.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "block log ends before a canonical block"));
+            }
+            for bytes in page {
+                if at >= to {
+                    break;
+                }
+                let env = crate::codec::decode_envelope(&bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                if env.block_id().as_bytes() != self.chain[at].1.as_bytes() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "block log disagrees with the canonical chain"));
+                }
+                // The id hashes the header only. The header commits to the
+                // body through these two roots, so recomputing them makes a
+                // body damaged on disk an error instead of a served block.
+                if env.header.attestation_root != derive::attestation_root(&env.body.attestations)
+                    || env.header.body_root != derive::body_root(&env.body.transactions)
+                {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "logged block body does not match its header"));
+                }
+                after_slot = env.header.slot;
+                each(env);
+                at += 1;
+            }
+        }
+        Ok(())
     }
 
     /// Would truncating the canonical chain at `ancestor` cut below the
@@ -4807,6 +5550,23 @@ impl Engine {
             return false;
         }
 
+        // Only under the operator's rewind override can the cut fall below
+        // released bodies; those blocks are about to leave the canonical
+        // chain and may be re-adopted later, so restore them in full first.
+        let released_above_cut: Vec<usize> = (after_cut..self.chain.len())
+            .filter(|&i| self.blocks.is_hollow(self.chain[i].1.as_bytes()))
+            .collect();
+        if let (Some(&first), Some(&last)) = (released_above_cut.first(), released_above_cut.last()) {
+            let mut restored = Vec::with_capacity(last + 1 - first);
+            if let Err(e) = self.read_logged_canonical(first, last + 1, |env| restored.push(env)) {
+                eprintln!("reorg refused: could not restore released bodies above the cut: {e}");
+                return false;
+            }
+            for env in restored {
+                self.blocks.insert(*env.block_id().as_bytes(), env);
+            }
+        }
+
         let base = self.state_at_canonical(ancestor);
         // Post-states of the branch, so the ring is refilled for the branch
         // that just won without recomputing anything.
@@ -4892,6 +5652,9 @@ impl Engine {
             self.chain.push((env.header.slot, id));
         }
         self.canonical = canonical;
+        // RPC-only: the reorg ring holds the new head and its parent, so
+        // the head's boundary (if it opened an epoch) can be retained.
+        self.note_checkpoint_registry();
         self.head_slot
             .store(self.head_slot_now(), Ordering::Relaxed);
         self.last_applied_ms = now_ms();
@@ -4904,11 +5667,14 @@ impl Engine {
         self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
         self.revalidate_lifecycle_mempool();
         if self.live {
-            let canonical_envs: Vec<BlockEnvelope> = self.chain[1..]
-                .iter()
-                .map(|(_, id)| self.blocks.get(id.as_bytes()).expect("stored").clone())
-                .collect();
-            if let Err(e) = self.store.rewrite_async(canonical_envs) {
+            // The log equals the pre-reorg canonical chain, so its first
+            // `cut` frames are exactly `chain[1..=cut]` and stay as they are
+            // on disk. Only the adopted branch is handed to the writer: the
+            // old code cloned every canonical envelope here, a transient copy
+            // of the whole chain that every node on a host paid at the same
+            // moment of a network-wide reorg.
+            let expected_last = (cut > 0).then_some(ancestor);
+            if let Err(e) = self.store.rewrite_tail_async(cut as u64, expected_last, branch.clone()) {
                 eprintln!("FATAL: could not start block log rewrite: {e}");
                 std::process::exit(1);
             }
@@ -5127,6 +5893,7 @@ impl Engine {
                 // R6 HIGH-8: an accepted attestation is a real, signature-
                 // checked duty by `att.validator` — exactly the class of
                 // sighting doppelgänger protection exists to catch.
+                self.note_own_signature(att.validator, published_attestation(&att), true);
                 self.note_possible_doppelganger(att.validator, att.data.slot);
                 self.pool
                     .insert((att.validator, att.data.signing_root()), att);
@@ -5183,6 +5950,7 @@ impl Engine {
                 if let Some(evidence) = slashing_candidate {
                     self.report_equivocation((*evidence).into());
                 }
+                self.note_own_signature(att.validator, published_attestation(&att), true);
                 self.note_possible_doppelganger(att.validator, att.data.slot);
                 let frame = net::att_frame(&att);
                 self.pool
@@ -5318,6 +6086,14 @@ impl Engine {
         if self.chain[0].1.as_bytes() == id {
             return Some(Cow::Owned(self.genesis_envelope()));
         }
+        if self.blocks.is_hollow(id) {
+            let height = usize::try_from(self.height_of(id)?).ok()?;
+            let mut found = None;
+            if let Err(e) = self.read_logged_canonical(height, height + 1, |env| found = Some(env)) {
+                eprintln!("rpc: could not read released block {} from the log: {e}", crate::codec::hex8(id));
+            }
+            return found.map(Cow::Owned);
+        }
         self.blocks.get(id).map(Cow::Borrowed)
     }
 
@@ -5401,6 +6177,7 @@ impl Engine {
 
             RpcRequest::ValidatorByKey(hash) => rpc::validator_by_key_json(&self.state, &hash),
             RpcRequest::ValidatorAdmission => Ok(rpc::validator_admission_json(&self.state)),
+            RpcRequest::FundedDelegation(position) => Ok(rpc::funded_delegation_json(&self.state, position)),
             RpcRequest::Validator(index) => rpc::validator_record_json(&self.state, index),
 
             RpcRequest::ValidatorCount => Ok(rpc::validator_count_json(&self.state)),
@@ -5476,7 +6253,7 @@ impl Engine {
                     Err(Refusal::StateDependent(why)) => Err(RpcError::tx_refused_retryable(
                         self.wall_slot().saturating_add(1), why,
                     )),
-                    Err(Refusal::Invalid(why)) => Err(RpcError::new(
+                    Err(Refusal::Invalid(why) | Refusal::EvidenceFault(why)) => Err(RpcError::new(
                         rpc::TX_REFUSED,
                         format!("{why} — this transaction cannot be admitted; retrying \
                              the same bytes will not help"),
@@ -5511,6 +6288,12 @@ impl Engine {
 
             // Identity of the binary, not of the chain: no state read, no
             // lock taken, constant cost at any height.
+            RpcRequest::L2Settlement => Ok(rpc::l2_settlement_json(&self.state)),
+            RpcRequest::Kes => Ok(rpc::kes_json(&self.state)),
+            RpcRequest::BlockRaw(id) => {
+                let env = self.envelope_by_id(&id).ok_or_else(|| RpcError::new(rpc::BLOCK_NOT_FOUND, "unknown block"))?;
+                Ok(rpc::Json::s(crate::codec::hex(&crate::codec::encode_envelope(&env))))
+            }
             RpcRequest::BuildInfo => Ok(rpc::build_info_json()),
             RpcRequest::MempoolInfo => Ok(rpc::mempool_info_json(
                 self.mempool.len(),
@@ -5527,6 +6310,10 @@ impl Engine {
             RpcRequest::Validators => Ok(rpc::validator_registry_json(&self.state)),
 
             RpcRequest::TxStatus(txid) => Ok(rpc::tx_status_json(self.tx_status(&txid))),
+
+            RpcRequest::FinalityCertificate { epoch, block, set_source_epoch } => {
+                self.finality_certificate(epoch, block, set_source_epoch)
+            }
         }
     }
 }
@@ -5538,163 +6325,9 @@ impl Engine {
 /// that the log of a multi-hour replay stays readable.
 const REPLAY_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Verdict of the boot-time keystore identity gate ("gate 3").
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum KeystoreIdentity {
-    /// The keystore is the manifest's validator at that index, and its local
-    /// RANDAO chain opens the committed head.
-    Ok,
-    /// No manifest validator carries this (index, pubkey) pair.
-    NotInGenesisSet,
-    /// The validator is in the manifest, but the local RANDAO seed does not
-    /// regenerate the committed commitment.
-    RandaoMismatch,
-}
-
-/// The boot-time identity gate, extracted from `run` so it can be tested.
-///
-/// # This gate is the third thing blocking an open network, and it is
-/// # independent of the verifier
-///
-/// A validator added by an on-chain deposit is, by construction, NOT in the
-/// genesis manifest. So even once the verifier reads the registry and the
-/// network can *count* a newcomer's votes, the newcomer's own node still
-/// refuses to boot with `keystore does not match the genesis manifest's
-/// validator set`. Fixing the verifier alone gets you a validator everyone
-/// else can verify and that cannot start.
-///
-/// The root cause is the same one the verifier had: **identity is being read
-/// from the genesis manifest instead of from the committed registry.** A
-/// validator's index, key and RANDAO commitment are all committed state
-/// (`ValidatorRecord`), and a deposit writes all three. The manifest is only
-/// the registry's value at height 0.
-///
-/// **That fix is now made, in [`check_registry_identity`] below, and this
-/// function is no longer authoritative.** It survives as a *fast pre-pass*
-/// only: the registry is not reachable here (the store is not open, the log
-/// and neither replay nor the local restart cache has reconstructed the
-/// committed registry), so the authoritative check waits for state recovery. Keeping a cheap
-/// manifest look first means a genesis operator who mistyped a seed still
-/// learns it in a second instead of after a replay.
-///
-/// What changed is which verdicts are fatal. `NotInGenesisSet` is no longer
-/// an error at all — it is the *normal and expected* state of every validator
-/// the network will ever add by deposit, and refusing to boot on it is
-/// precisely the wall that kept a deposit-added validator off the network.
-/// It is now advisory, and [`check_registry_identity`] decides.
-///
-/// # One latent defect fixed in the extraction
-///
-/// The original read the RANDAO commitment as
-/// `manifest.validators[keys.index as usize]` — indexing by POSITION after
-/// having found the record by its `index` FIELD. Those coincide only while
-/// the manifest is dense and sorted; otherwise it compares against another
-/// validator's commitment, or panics out of bounds. This version uses the
-/// record it already found. On the live fleet's dense manifest the two are
-/// identical; everywhere else this one is correct and the old one was not.
-/// (`Manifest::pubkeys()` carries the same position-vs-index assumption and
-/// silently yields an EMPTY key for an out-of-range index — see
-/// `genesis::tests::the_manifest_table_silently_empties_sparse_indices`.)
-pub(crate) fn check_keystore_identity(
-    manifest: &crate::genesis::Manifest,
-    index: u32,
-    pubkey: &[u8],
-    randao_seed: [u8; 32],
-) -> KeystoreIdentity {
-    let Some(v) = manifest.validators.iter().find(|v| v.index == index) else {
-        return KeystoreIdentity::NotInGenesisSet;
-    };
-    if v.pubkey != pubkey {
-        return KeystoreIdentity::NotInGenesisSet;
-    }
-    if RandaoChain::generate(randao_seed).commitment() != v.randao_commitment {
-        return KeystoreIdentity::RandaoMismatch;
-    }
-    KeystoreIdentity::Ok
-}
-
-/// Verdict of the authoritative, registry-backed identity gate.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum RegistryIdentity {
-    /// The committed registry holds this index, it carries exactly this
-    /// keystore's key, and the local RANDAO chain opens its committed
-    /// commitment. Duties are armed.
-    Active,
-    /// Registered identity, but its exit has taken effect. Keep following
-    /// the chain so automatic withdrawal can run when the lock matures.
-    Inactive,
-    /// The registry has no such index *yet*. Not an error: it is what a
-    /// deposit-added validator looks like before its deposit is applied.
-    /// Boot, follow the chain, sign nothing, re-check every slot.
-    PendingActivation,
-    /// The registry holds this index and it belongs to a DIFFERENT key.
-    /// Fatal — see the double-signing note on [`check_registry_identity`].
-    WrongValidator,
-    /// The right key at the right index, but the local RANDAO seed does not
-    /// regenerate the committed commitment. Fatal: this node cannot produce a
-    /// reveal the network will accept, so every block it proposes is refused.
-    RandaoMismatch,
-}
-
-/// The identity gate that actually decides, read from the **committed
-/// registry** rather than from the genesis manifest.
-///
-/// # Why this had to move past replay
-///
-/// The committed registry is reconstructed by full replay or a compatible
-/// local cache plus verified tail replay. At the point `run` loads the
-/// keystore neither recovery path has run, so there is no registry to
-/// consult — no `Store`, no log, no `Engine`. The only registry that exists
-/// before replay is the manifest's, i.e. the height-0 one, which by
-/// construction cannot contain anyone added since height 0. Any gate placed
-/// there can only ever ask "were you in the genesis set?", which is the wrong
-/// question. This one runs after replay, where `engine.state` is the registry
-/// as of the node's own head. The weak-subjectivity gate already sets that
-/// precedent for the same reason.
-///
-/// # Why absence must not be fatal, and why a mismatch must be
-///
-/// The two cases were one branch before, and collapsing them is what closed
-/// the network:
-///
-/// - **Absent** means "your deposit has not been applied on this node's head
-///   yet" — a newcomer that has just deposited, or one still replaying. It is
-///   a temporary, self-healing condition, and the honest response is to
-///   follow the chain and keep checking.
-/// - **Present but a different key** means another validator already owns
-///   this index. Signing there is signing *as them*: two conflicting messages
-///   under one index is exactly the equivocation `slashing.rs` exists to
-///   punish. This must refuse to boot, and it is the real safety value the
-///   old gate was providing — preserved here, and now aimed at the case that
-///   actually warrants it.
-///
-/// # The re-check is a safety requirement, not a convenience
-///
-/// It is tempting to conclude that pending-activation needs no machinery,
-/// because `attest` and `propose` already return early when the index is not
-/// in the roster they derive from committed state. That is true and it is not
-/// sufficient. Indices are allocated `keys().next_back() + 1`, so an operator
-/// whose keystore was minted for index 64 *before* depositing can be beaten
-/// to index 64 by somebody else's deposit. The roster check would then pass —
-/// the index is active — and this node would sign under a key that is not
-/// its own. So the duty path re-checks the *key*, not just the index, every
-/// time it is about to sign: see `Engine::duty_index`.
-pub(crate) fn check_registry_identity(
-    state: &CommittedState, index: u32, pubkey: &[u8], randao_seed: [u8; 32],
-) -> RegistryIdentity {
-    let Some(rec) = state.validator_record(index) else { return RegistryIdentity::PendingActivation };
-    if rec.pubkey != pubkey { return RegistryIdentity::WrongValidator; }
-    let mut chain = RandaoChain::generate(randao_seed);
-    let mut commitment = chain.commitment();
-    for _ in 0..state.validator_reveals_used(index).unwrap_or(0) {
-        let Some(reveal) = chain.next_reveal() else { return RegistryIdentity::RandaoMismatch };
-        commitment = reveal;
-    }
-    if commitment != rec.randao_commitment { return RegistryIdentity::RandaoMismatch; }
-    if rec.activation_epoch > epoch_of(state.slot()) { return RegistryIdentity::PendingActivation; }
-    if epoch_of(state.slot()) >= rec.exit_epoch { return RegistryIdentity::Inactive; }
-    RegistryIdentity::Active
-}
+#[path = "engine_identity.rs"]
+mod identity;
+pub(crate) use identity::{check_keystore_identity, check_registry_identity, KeystoreIdentity, RegistryIdentity};
 
 fn start_devnet(
     cfg: &Config,
@@ -5806,6 +6439,85 @@ mod boot_switch_tests {
     }
 }
 
+fn published_attestation(att: &Attestation) -> crate::slashprot::Published {
+    crate::slashprot::Published::Attestation {
+        slot: att.data.slot,
+        source_epoch: att.data.source_epoch,
+        target_epoch: att.data.target_epoch,
+    }
+}
+
+/// Host-level signer anchor (node-local): one flock per validator key across
+/// every data dir on this host, plus a record copy outside the data dir that
+/// refuses a rolled-back data dir. See [`crate::signer_anchor`].
+fn attach_signer_anchor(
+    data_dir: &std::path::Path,
+    binding: crate::slashprot::Binding,
+    protection: &mut SlashingProtection,
+) -> io::Result<()> {
+    use crate::signer_anchor as anchor;
+    anchor::check_not_retired(&[data_dir])?;
+    if parse_boot_switch(anchor::ENV_DISABLE, std::env::var_os(anchor::ENV_DISABLE))? {
+        println!(
+            "SIGNER ANCHOR: DISABLED ({} is set). Nothing on this host stops a second \
+             instance of this key in another data dir, or a restored data dir, from signing.",
+            anchor::ENV_DISABLE
+        );
+        return Ok(());
+    }
+    let accept_rollback = parse_boot_switch(
+        anchor::ENV_ACCEPT_ROLLBACK,
+        std::env::var_os(anchor::ENV_ACCEPT_ROLLBACK),
+    )?;
+    let unavailable = |why: String| {
+        eprintln!(
+            "SIGNER ANCHOR: UNAVAILABLE ({why}). Booting WITHOUT the host signer anchor \
+             (data-dir record and data-dir lock only, as before the anchor existed). To \
+             enable it, pass --signer-anchor-dir <dir> (or {}) naming a directory this \
+             service can write, e.g. one listed in the unit's ReadWritePaths=.",
+            anchor::ENV_DIR
+        );
+    };
+    let held = match anchor::resolve_root() {
+        Some(anchor::RootSource::Explicit(root)) => {
+            anchor::SignerAnchor::acquire(&root, &binding).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("signer anchor dir {} (--signer-anchor-dir / {}): {e}", root.display(), anchor::ENV_DIR),
+                )
+            })?
+        }
+        Some(anchor::RootSource::Default(root)) => {
+            match anchor::SignerAnchor::acquire_default(&root, &binding)? {
+                Some(held) => held,
+                None => {
+                    unavailable(format!(
+                        "default {} is not writable from this process: sandboxed home \
+                         (ProtectHome=/ProtectSystem=strict) or missing home",
+                        root.display()
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+        None => {
+            unavailable("HOME is unset and no --signer-anchor-dir was given".into());
+            return Ok(());
+        }
+    };
+    let dir = held.dir().to_path_buf();
+    let check = protection.attach_anchor(held, accept_rollback)?;
+    println!("SIGNER ANCHOR: {} ({check:?}); signer lock held", dir.display());
+    if check == crate::slashprot::AnchorCheck::DataDirRolledForward {
+        eprintln!(
+            "SIGNER ANCHOR: the data-dir record was OLDER than the anchor and was raised \
+             to it under --accept-signing-rollback. Watermarks now {:?}.",
+            protection.watermarks()
+        );
+    }
+    Ok(())
+}
+
 pub fn run(cfg: Config) -> io::Result<()> {
     // Metrics FIRST, before the manifest is even read (audit C-R6-2): the
     // replay window is the one stretch where the node is alive, mute, and
@@ -5833,6 +6545,30 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
+    // A build with consensus rules armed for development networks must never
+    // join a funded network: refuse anything but a BPOSMAN3 development manifest.
+    #[cfg(any(feature = "devnet-randao-recommit", feature = "devnet-l2-deposits"))]
+    {
+        if !matches!(manifest.format, crate::genesis::ManifestFormat::V3L2Async(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "this build has development consensus features (devnet-randao-recommit / devnet-l2-deposits) and runs only BPOSMAN3 development manifests",
+            ));
+        }
+        println!("DEVELOPMENT BUILD: {}", env!("BLOCH_BUILD_VERSION"));
+    }
+    // A mixed-fleet rehearsal build arms the L2 flag day at a compile-time
+    // epoch: it must never run a funded network.
+    #[cfg(feature = "l2-activation-rehearsal")]
+    {
+        if crate::codec::hex32(&digest) == GENESIS4_MAINNET_NETWORK_DIGEST || manifest.carryover.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "this is an L2 activation rehearsal build; it refuses the Genesis-4 mainnet manifest and any funded (carryover) manifest",
+            ));
+        }
+        println!("L2 ACTIVATION REHEARSAL BUILD: {}", env!("BLOCH_BUILD_VERSION"));
+    }
 
     // The opening ledger, before anything else touches the manifest. A
     // manifest that commits to a carryover is not usable until the snapshot
@@ -5885,7 +6621,16 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // silent observer, printing the reassuring line below and attesting
     // nothing. There is no error kind left here to misread.
     let keys = match Keystore::load_optional(&cfg.data_dir)? {
-        Some(k) => Some(k),
+        Some(k) => {
+            // p9e finding 2 (Falcon signing on hot hosts): before the first
+            // duty, keep the key out of core dumps and same-user ptrace, and
+            // refuse to sign unless the signer passes its power-on self-test.
+            let hardening = crate::keys::harden_signing_process()?;
+            k.signer_self_test()?;
+            println!("signer self-test: ok (platform {}, Falcon-1024 KAT, pairwise); {hardening}",
+                bloch_crypto::crypto::hardening::target_arch());
+            Some(k)
+        }
         None => {
             println!(
                 "observer mode: no keystore in {}. This node follows the chain, applies \
@@ -5957,10 +6702,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let slashprot = match keys.as_ref() {
         Some(k) => {
             let pkh: [u8; 32] = <sha3::Sha3_256 as sha3::Digest>::digest(&k.pubkey).into();
-            SlashingProtection::open_bound(
-                &cfg.data_dir,
-                crate::slashprot::Binding { validator_pubkey_sha3: pkh, genesis_digest: digest },
-            )?
+            let binding =
+                crate::slashprot::Binding { validator_pubkey_sha3: pkh, genesis_digest: digest };
+            let mut protection = SlashingProtection::open_bound(&cfg.data_dir, binding)?;
+            attach_signer_anchor(&cfg.data_dir, binding, &mut protection)?;
+            protection
         }
         None => SlashingProtection::open(&cfg.data_dir)?,
     };
@@ -6117,6 +6863,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         std::env::var_os("BLOCH_NO_DOPPELGANGER"),
     )?;
 
+    let kes = load_kes_signer(&cfg.data_dir, keys.is_some())?;
     let mut engine = Engine {
         state: StateCell::new(genesis_state),
         tr: Transition::new(verifier.clone()),
@@ -6124,11 +6871,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
         gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
         verifier,
         keys,
-        blocks: BTreeMap::new(),
+        kes,
+        blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
         recent_states: VecDeque::new(),
+        finality_certs: Default::default(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
         held_release_roots: VecDeque::new(),
@@ -6670,10 +7419,19 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // this function's stack — a restart forgets them entirely. They stop
         // duplicate work within one run; `slashprot` is what stops a second
         // signature across runs and across processes.
-        if !duties_blocked && slot > last_attested {
+        if !duties_blocked
+            && slot > last_attested
+            && attestation_due(engine.state.slot(), slot, now, slot_start, slot_ms)
+        {
             engine.maintain_validator_lifecycle(wall_epoch);
+            engine.maintain_kes(wall_epoch);
             engine.attest(slot);
             last_attested = slot;
+            // A duty slot of this epoch skipped while duties were blocked
+            // (empty-slot run, sync, boot grace) is voted now, at most once
+            // per epoch; see `retry_missed_attestation` for the safety case.
+            // Inside the `attestation_due` gate, like the on-time duty.
+            engine.retry_missed_attestation(slot);
         }
         let propose_at = slot_start.saturating_add(slot_ms / 3); // a deadline
         if !duties_blocked && now >= propose_at && slot > last_built {
@@ -6884,6 +7642,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
                                 origin.verification_source(),
                             ) {
                                 Ok(_) => Verdict::Accept,
+                                // P5a: a context-free evidence fault is the
+                                // deliverer's own, on every branch.
+                                Err(Refusal::EvidenceFault(_)) => Verdict::Reject,
                                 // A peer may have a different head, fee, epoch
                                 // or pending input. Refuse relay without scoring
                                 // that local-state difference as misconduct.
@@ -7123,6 +7884,383 @@ fn declared_size_bound(tx: &PosTransaction, declared: u64) -> Result<(), &'stati
     Ok(())
 }
 
+/// The stateful L2 door of `on_transaction`: DA, claims and deposits enter
+/// the mempool only when the head's installed L2 admits them. Its profile
+/// decides (development genesis: the build's devnet features; running-network
+/// activation: always), so a mainnet build refuses them before the flag day
+/// and admits them after it without a cargo feature. Consensus re-checks.
+/// SHA3-256 of `genesis/mainnet.manifest` (the Genesis-4 network digest).
+#[cfg(feature = "l2-activation-rehearsal")]
+const GENESIS4_MAINNET_NETWORK_DIGEST: &str = "f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966";
+
+pub(crate) fn l2_admission_refusal(
+    tx: &PosTransaction,
+    l2: Option<&bloch_pos_committee::l2_settlement::State>,
+) -> Option<&'static str> {
+    let user_transactions = l2.is_some_and(|l2| l2.user_transactions());
+    match tx {
+        PosTransaction::L2DataAvailability(_) if !user_transactions => {
+            Some("L2 data availability is not active on this network")
+        }
+        PosTransaction::L2WithdrawClaim(_) if !user_transactions => Some("L2 withdrawal claims are not active on this network"),
+        PosTransaction::L2Deposit(_) if !l2.is_some_and(|l2| l2.deposits_enabled()) => {
+            Some("native L2 deposits are not active on this network")
+        }
+        _ => None,
+    }
+}
+
+/// The loaded KES key with what it needs to rewrite itself on evolution,
+/// and the HF3 rotation state: the sealed successor (`validator.kes.next`),
+/// a background keygen in flight, and the period a rotation was last
+/// submitted in.
+pub(crate) struct KesSigner {
+    key: crate::kes_key::KesKey,
+    dir: PathBuf,
+    unlock: crate::keys::Unlock,
+    next: Option<crate::kes_key::KesKey>,
+    keygen: Option<std::sync::mpsc::Receiver<io::Result<crate::kes_key::KesKey>>>,
+    rotation_submitted: Option<u64>,
+}
+
+impl KesSigner {
+    pub(crate) fn new(key: crate::kes_key::KesKey, dir: PathBuf, unlock: crate::keys::Unlock) -> Self {
+        KesSigner { key, dir, unlock, next: None, keygen: None, rotation_submitted: None }
+    }
+
+    /// If the chain's key in force is the sealed successor, swap the files
+    /// (`kes_key::promote_next`) and sign with it from now on.
+    fn adopt_successor(&mut self, in_force: &bloch_pos_committee::kes::KesPublic) -> Result<(), String> {
+        let promote = !self.key.public().same_tree(in_force)
+            && self.next.as_ref().is_some_and(|next| next.public().same_tree(in_force));
+        if !promote {
+            return Ok(());
+        }
+        crate::kes_key::promote_next(&self.dir).map_err(|e| format!("KES successor swap failed: {e}"))?;
+        if let Some(next) = self.next.take() {
+            self.key = next;
+        }
+        self.rotation_submitted = None;
+        println!(
+            "KES successor in force from period {}: {} replaced, old key shredded",
+            in_force.start_period,
+            crate::kes_key::FILE_NAME
+        );
+        Ok(())
+    }
+
+    /// Collect a finished background keygen: seal it as `validator.kes.next`.
+    fn poll_keygen(&mut self) {
+        let Some(rx) = self.keygen.as_ref() else {
+            return;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(io::Error::new(io::ErrorKind::Other, "KES keygen thread exited"))
+            }
+        };
+        self.keygen = None;
+        match outcome.and_then(|key| key.save_next(&self.dir, &self.unlock).map(|()| key)) {
+            Ok(key) => {
+                println!(
+                    "KES successor generated and sealed as {}: depth {}, root {}",
+                    crate::kes_key::NEXT_FILE_NAME,
+                    key.public().depth,
+                    crate::codec::hex8(&key.public().root)
+                );
+                self.next = Some(key);
+            }
+            Err(e) => eprintln!("KES successor keygen failed (retried next turn): {e}"),
+        }
+    }
+
+    /// Generate the successor tree on a background thread (depth 12 is a few
+    /// CPU-minutes; duties keep running on the current key meanwhile).
+    fn spawn_keygen(&mut self, index: u32, depth: u8) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("kes-keygen".into()).spawn(move || {
+            let _ = tx.send(crate::kes_key::KesKey::generate(index, depth, |_| {}));
+        });
+        match spawned {
+            Ok(_) => {
+                println!("KES successor keygen started for v{index} (depth {depth})");
+                self.keygen = Some(rx);
+            }
+            Err(e) => eprintln!("KES successor keygen could not start: {e}"),
+        }
+    }
+}
+
+/// Structural bounds of a `KesRegister` at the mempool door: depth in the
+/// codec range and a non-empty signature of at most the TRUE hybrid maximum
+/// (`kes::HYBRID_SIGNATURE_MAX`, compact Falcon up to 1,462 bytes), not the
+/// padded-Falcon admission bound (rehearsal kes-1: 4,596-byte signatures).
+pub(crate) fn admissible_kes_register_shape(depth: u8, signature: &[u8]) -> bool {
+    (bloch_pos_committee::kes::MIN_DEPTH..=bloch_pos_committee::kes::MAX_DEPTH).contains(&depth)
+        && !signature.is_empty()
+        && signature.len() <= bloch_pos_committee::kes::HYBRID_SIGNATURE_MAX
+}
+
+/// Review F-5: may the KES key erase its way from global period `key_period`
+/// to `target`? At most one period past the key's own period or the head's,
+/// or exactly the period an operator confirmed.
+pub(crate) fn kes_evolution_allowed(key_period: u64, head_period: Option<u64>, target: u64, confirmed: Option<u64>) -> bool {
+    target <= key_period.max(head_period.unwrap_or(0)).saturating_add(1) || confirmed == Some(target)
+}
+
+/// The operator's confirmation of a multi-period KES jump (review F-5).
+fn kes_period_jump_confirmed() -> Option<u64> {
+    std::env::var("BLOCH_KES_ALLOW_PERIOD_JUMP").ok()?.trim().parse().ok()
+}
+
+/// What the node's KES rotation does this turn (`Engine::maintain_kes`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KesRotationStep {
+    /// Nothing to do: far from expiry, or a keygen is running.
+    Idle,
+    /// Start generating a successor of this depth.
+    Generate { depth: u8 },
+    /// Submit (or resubmit, once per period) a `KesRotate` to the successor.
+    Submit,
+    /// The successor is committed on chain and takes over next period.
+    AwaitHandover,
+    /// The chain's pending successor is not the one this node holds.
+    Foreign,
+}
+
+/// The node's rotation policy, pure: from the committed entry, the global
+/// period, the validator index, the tree in `validator.kes`, the tree in
+/// `validator.kes.next` (if any), whether a keygen is running and whether a
+/// rotation was already submitted this period. Keygen starts once
+/// `remaining ≤ KES_ROTATE_REMAINING_PERIODS + index % KES_ROTATION_STAGGER_PERIODS`;
+/// a sealed successor is submitted whenever one exists.
+pub(crate) fn kes_rotation_step(
+    entry: &bloch_pos_committee::kes::KesEntry,
+    period: u64,
+    index: u32,
+    key: &bloch_pos_committee::kes::KesPublic,
+    next: Option<bloch_pos_committee::kes::KesPublic>,
+    generating: bool,
+    submitted_this_period: bool,
+) -> KesRotationStep {
+    use bloch_pos_committee::params::{KES_ROTATE_REMAINING_PERIODS, KES_ROTATION_STAGGER_PERIODS};
+    let in_force = entry.in_force(period);
+    if let Some(pending) = entry.pending_at(period) {
+        return if next.is_some_and(|next| next.same_tree(&pending)) {
+            KesRotationStep::AwaitHandover
+        } else {
+            KesRotationStep::Foreign
+        };
+    }
+    if !key.same_tree(&in_force) || in_force.leaf_index(period).is_none() {
+        // Not this node's key in force, or already expired: a leaf-signed
+        // rotation is impossible (the static key cannot rotate).
+        return KesRotationStep::Idle;
+    }
+    // A sealed successor is rotated in whenever it exists: the scheduled one
+    // below, or one an operator generated early for incident response
+    // (`bloch-pos kes keygen --next`, then a restart).
+    let usable_next = next.filter(|next| !next.same_tree(&in_force));
+    if usable_next.is_some() {
+        return if submitted_this_period { KesRotationStep::Idle } else { KesRotationStep::Submit };
+    }
+    let horizon = KES_ROTATE_REMAINING_PERIODS + u64::from(index) % KES_ROTATION_STAGGER_PERIODS;
+    if generating || in_force.remaining_periods(period) > horizon {
+        return KesRotationStep::Idle;
+    }
+    KesRotationStep::Generate { depth: in_force.depth }
+}
+
+/// Load `validator.kes` for a validator node, under the keystore's passphrase
+/// policy. Absent file: `None` (a node without one keeps signing statically
+/// until KES enforcement, then stops signing loudly instead of signing with a
+/// key consensus refuses).
+fn load_kes_signer(dir: &std::path::Path, validator: bool) -> io::Result<Option<KesSigner>> {
+    if !validator {
+        return Ok(None);
+    }
+    crate::kes_key::finish_interrupted_rotation(dir)?;
+    if !crate::kes_key::KesKey::path(dir).exists() {
+        return Ok(None);
+    }
+    let unlock = crate::keys::Unlock::from_env()?;
+    let Some(key) = crate::kes_key::KesKey::load_optional(dir, &unlock)? else {
+        return Ok(None);
+    };
+    println!(
+        "KES key loaded: depth {}, period {}, root {}",
+        key.public().depth,
+        key.period(),
+        crate::codec::hex8(&key.public().root)
+    );
+    let next = crate::kes_key::KesKey::load_next(dir, &unlock)?;
+    if let Some(next) = &next {
+        println!(
+            "KES successor loaded: depth {}, root {}",
+            next.public().depth,
+            crate::codec::hex8(&next.public().root)
+        );
+    }
+    let mut signer = KesSigner::new(key, dir.to_path_buf(), unlock);
+    signer.next = next;
+    Ok(Some(signer))
+}
+
+/// One consensus signature for a duty, made inside the slashing-protection
+/// guard: the static key before KES enforcement (`kes_duty` `None`), the
+/// KES leaf of the prepared period after it, bound to the on-chain key in
+/// force (`prepare_kes`).
+///
+/// The leaf signs `kes::leaf_message` — the root bound to the duty state's
+/// network domain, the duty's validator index, the key's tree and the period — the
+/// same function every verifier runs. A duty the bound message cannot be
+/// formed for (no KES key, no domain) returns an empty signature, which
+/// consensus refuses, rather than a signature over the wrong bytes;
+/// `prepare_kes` has already refused the no-key case before the guard.
+fn sign_duty(
+    keys: &Keystore,
+    kes: Option<&KesSigner>,
+    kes_duty: Option<(u64, bloch_pos_committee::kes::KesPublic)>,
+    network_domain: Option<[u8; 32]>,
+    validator: u32,
+    epoch: u64,
+    root: &[u8; 32],
+) -> Vec<u8> {
+    // Static key (before KES binds, or never registered): the consensus
+    // signature rule of the duty's own epoch (HF2), never a bare v1 sign.
+    let Some((period, public)) = kes_duty else {
+        return keys.sign_for_epoch(epoch, root);
+    };
+    let Some(kes) = kes else {
+        return Vec::new();
+    };
+    let domain = network_domain;
+    let Some(message) = bloch_pos_committee::kes::leaf_message(domain, validator, &public, period, root) else {
+        return Vec::new();
+    };
+    match kes.key.sign(&message) {
+        Ok(signature) => signature,
+        Err(e) => {
+            // Callers refuse to send an empty signature.
+            eprintln!("KES leaf signing failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// NODE-ONLY RELAY POLICY (HF2 sigdet), live and ungated: in addition to the
+/// base verifier, require the FIPS 204 reference (pinned) verdict for every
+/// signature, for every suite. This keeps signatures that only one ML-DSA
+/// backend accepts off this node's mempool and out of the blocks it proposes.
+/// It changes NO consensus rule: block and vote validation run the base
+/// verifier exactly as before, so a block that is consensus-valid is still
+/// accepted. Every shipped signer produces reference signatures, so no honest
+/// transaction is refused.
+struct StrictRelayVerifier<'a> {
+    inner: &'a dyn SignatureVerifier,
+}
+
+impl<'a> StrictRelayVerifier<'a> {
+    fn new(inner: &'a dyn SignatureVerifier) -> Self {
+        Self { inner }
+    }
+}
+
+impl SignatureVerifier for StrictRelayVerifier<'_> {
+    fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool {
+        // The base rule first (it carries the budget / failure-cache side
+        // effects), THEN the pinned reference check. AND, never OR: a relay
+        // verdict is never weaker than the base one.
+        self.inner.verify_with_key(pubkey, signing_root, signature)
+            && bloch_crypto::crypto::verify_pinned(pubkey, signing_root, signature)
+    }
+
+    fn verify_l2_settlement(&self, policy: &[u8; 32], program: &[u8; 32], values: &[u8], proof: &[u8]) -> bool {
+        // L2 settlement is a SNARK proof, not an ML-DSA signature — unchanged.
+        self.inner.verify_l2_settlement(policy, program, values, proof)
+    }
+
+    // Integration (HF2 policy, HF3 spends, HF3 KES): every other verification
+    // entry point keeps the base verdict and adds the reference check only
+    // where the base rule does not already use it.
+
+    fn verify_with_key_under(
+        &self,
+        policy: bloch_pos_committee::SignaturePolicy,
+        pubkey: &[u8],
+        signing_root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        self.inner.verify_with_key_under(policy, pubkey, signing_root, signature)
+            && relay_reference_check(policy, pubkey, signing_root, signature)
+    }
+
+    fn verify_spend_at_epoch(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8], epoch: u64) -> bool {
+        self.inner.verify_spend_at_epoch(pubkey, signing_root, signature, epoch)
+            && relay_spend_reference_check(pubkey, signing_root, signature)
+    }
+
+    fn verify_kes(&self, public: &bloch_pos_committee::kes::KesPublic, period: u64, message: &[u8; 32], signature: &[u8]) -> bool {
+        self.inner.verify_kes(public, period, message, signature)
+    }
+
+    fn verify_kes_leaf(&self, leaf_pk: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        // KES leaves are verified in the bound form, which already uses the
+        // reference ML-DSA rule.
+        self.inner.verify_kes_leaf(leaf_pk, message, signature)
+    }
+}
+
+/// The relay reference check for a policy-judged signature. The historical
+/// `Compatible` rule dispatches ML-DSA by CPU, so the reference verdict is
+/// added on top; every other policy already verifies ML-DSA with the
+/// reference rule (and a bound signature is not a v1 form `verify_pinned`
+/// could judge).
+fn relay_reference_check(
+    policy: bloch_pos_committee::SignaturePolicy,
+    pubkey: &[u8],
+    signing_root: &[u8; 32],
+    signature: &[u8],
+) -> bool {
+    !matches!(policy, bloch_pos_committee::SignaturePolicy::Compatible)
+        || bloch_crypto::crypto::verify_pinned(pubkey, signing_root, signature)
+}
+
+/// The relay reference check for a spend witness: suite 0x0003 carries no
+/// ML-DSA half (nothing for the reference rule to add); every lattice key
+/// needs the reference verdict.
+fn relay_spend_reference_check(pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool {
+    bloch_pos_committee::transition::pq_migration::key_suite(pubkey)
+        == Some(bloch_pos_committee::params::SUITE_SLHDSA128S_FALCON1024)
+        || bloch_crypto::crypto::verify_pinned(pubkey, signing_root, signature)
+}
+
+/// A fresh [`HybridVerifier`] under the node relay policy, for the admission
+/// arms that verify a self-contained (budget-free) hybrid authorization.
+fn strict_relay_hybrid() -> impl SignatureVerifier {
+    struct Owned(HybridVerifier);
+    impl SignatureVerifier for Owned {
+        fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+            self.0.verify_with_key(pk, root, sig) && bloch_crypto::crypto::verify_pinned(pk, root, sig)
+        }
+        fn verify_l2_settlement(&self, p: &[u8; 32], pr: &[u8; 32], v: &[u8], pf: &[u8]) -> bool {
+            self.0.verify_l2_settlement(p, pr, v, pf)
+        }
+        fn verify_with_key_under(&self, policy: bloch_pos_committee::SignaturePolicy, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+            self.0.verify_with_key_under(policy, pk, root, sig) && relay_reference_check(policy, pk, root, sig)
+        }
+        fn verify_spend_at_epoch(&self, pk: &[u8], root: &[u8; 32], sig: &[u8], epoch: u64) -> bool {
+            self.0.verify_spend_at_epoch(pk, root, sig, epoch) && relay_spend_reference_check(pk, root, sig)
+        }
+        fn verify_kes_leaf(&self, leaf_pk: &[u8], message: &[u8; 32], sig: &[u8]) -> bool {
+            self.0.verify_kes_leaf(leaf_pk, message, sig)
+        }
+    }
+    Owned(HybridVerifier::new())
+}
+
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     admissible_with_verifier(tx, wall_epoch, &HybridVerifier::new())
 }
@@ -7131,13 +8269,75 @@ fn admissible_with_verifier(tx: &PosTransaction, wall_epoch: u64, verifier: &dyn
     admissible_with_network_verifier(tx, wall_epoch, None, verifier)
 }
 
+/// The mempool mirror of `CommittedState::spend_witness_verifies`, on the
+/// wall epoch (node-local policy; see the V2 arm for why wall, not head):
+/// below HF3 exactly `verify_with_key`, from it `verify_spend_at_epoch`.
+fn admission_spend_witness_verifies(
+    verifier: &dyn SignatureVerifier,
+    wall_epoch: u64,
+    pubkey: &[u8],
+    signing_root: &[u8; 32],
+    signature: &[u8],
+) -> bool {
+    if bloch_pos_committee::params::hf3_slh_suite_active(wall_epoch) {
+        verifier.verify_spend_at_epoch(pubkey, signing_root, signature, wall_epoch)
+    } else {
+        verifier.verify_with_key(pubkey, signing_root, signature)
+    }
+}
+
 fn admissible_with_network_verifier(
     tx: &PosTransaction,
     wall_epoch: u64,
     network_domain: Option<&[u8; 32]>,
     verifier: &dyn SignatureVerifier,
 ) -> Result<(), &'static str> {
+    // NODE RELAY POLICY (HF2 sigdet): every signature checked below must also
+    // pass the FIPS 204 reference verifier. Not a consensus rule.
+    let strict = StrictRelayVerifier::new(verifier);
+    let verifier: &dyn SignatureVerifier = &strict;
     match tx {
+        PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => Err("native L2 settlement is not enabled by a shipping genesis manifest"),
+        // Whether the network's L2 admits DA, claims and deposits is a state
+        // question (the installed L2's profile), answered at the stateful door
+        // by `l2_admission_refusal`; here only shape and signatures.
+        PosTransaction::L2DataAvailability(batch) => {
+            // Shape and payload are rechecked in consensus; refuse the
+            // obviously unusable batch before the signature.
+            if bloch_pos_committee::l2_settlement::da::batch_count(&batch.payload).is_none() {
+                return Err("L2 data availability payload is not one canonical batch");
+            }
+            if strict_relay_hybrid().verify_with_key(&batch.funding_pubkey, &batch.intent_root(), &batch.signature) {
+                Ok(())
+            } else {
+                Err("invalid L2 data availability hybrid PQ authorization")
+            }
+        }
+        PosTransaction::L2WithdrawClaim(claim) => {
+            // The proof, maturity, nullifier and escrow are state checks and
+            // run in consensus; refuse a malformed claim before the signature.
+            if claim.validate_shape().is_err() {
+                return Err("L2 withdrawal claim has an invalid shape or release output");
+            }
+            if !strict_relay_hybrid().verify_with_key(&claim.funding_pubkey, &claim.intent_root(), &claim.signature) {
+                return Err("invalid L2 withdrawal claim hybrid PQ authorization");
+            }
+            // The attestors sign the root the proof folds to, so their
+            // signatures check here without state; only "is this the
+            // policy's set" waits for consensus.
+            if !claim.verify_attestation(&strict_relay_hybrid()) {
+                return Err("invalid L2 withdrawal claim attestation");
+            }
+            Ok(())
+        }
+        PosTransaction::L2Deposit(deposit) => {
+            // State checks (inputs, ownership, conservation) run in consensus.
+            if strict_relay_hybrid().verify_with_key(&deposit.funding_pubkey, &deposit.intent_root(), &deposit.signature) {
+                Ok(())
+            } else {
+                Err("invalid L2 deposit hybrid PQ authorization")
+            }
+        }
         PosTransaction::FundedDeposit(deposit) => {
             if !bloch_pos_committee::params::funded_validator_admission_active(wall_epoch) {
                 return Err("funded validator admission is not active: FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH is unarmed or not reached");
@@ -7185,6 +8385,27 @@ fn admissible_with_network_verifier(
             withdrawal
                 .validate_shape()
                 .map_err(|_| "invalid funded delegation withdrawal shape")
+        }
+        // Post-quantum migration (0x18-0x1A): refused at the door until their
+        // flag days; state rules (credential ownership, commitment maturity,
+        // sweep-all) run at the lifecycle door and again in consensus.
+        PosTransaction::WithdrawalCredentialRotation(_) => {
+            if !bloch_pos_committee::params::epoch_gate_active(
+                wall_epoch,
+                bloch_pos_committee::params::HF3_PQ_MIGRATION_EPOCH,
+            ) {
+                return Err("withdrawal credential rotation (tag 0x18) is not active");
+            }
+            Ok(())
+        }
+        PosTransaction::RescueCommit(_) | PosTransaction::RescueReveal(_) => {
+            if !bloch_pos_committee::params::epoch_gate_active(
+                wall_epoch,
+                bloch_pos_committee::params::LATTICE_EMERGENCY_ACTIVATION_EPOCH,
+            ) {
+                return Err("post-quantum rescue (tags 0x19/0x1A) is not active");
+            }
+            Ok(())
         }
         PosTransaction::ValidatorCommissionUpdate(update) => {
             if !bloch_pos_committee::params::epoch_gate_active(
@@ -7267,9 +8488,15 @@ fn admissible_with_network_verifier(
             // output cannot safely be declared nonexistent without a state
             // inventory and a flag day. The shared classifier also preserves
             // exact-length legacy raw hybrid keys, including magic collisions.
+            // HF3: from params::HF3_SLH_SUITE_EPOCH (wall epoch, as for V2
+            // below) a well-formed suite-0x0003 key is also admissible; below
+            // it this is exactly `is_hybrid_public_key`.
             if inputs
                 .iter()
-                .any(|i| !bloch_crypto::crypto::is_hybrid_public_key(&i.pubkey))
+                .any(|i| !bloch_crypto::crypto::is_spend_public_key_admissible(
+                    &i.pubkey,
+                    bloch_pos_committee::params::hf3_slh_suite_active(wall_epoch),
+                ))
             {
                 return Err(
                     "transfer uses a non-hybrid public-key suite — live spends require \
@@ -7302,9 +8529,7 @@ fn admissible_with_network_verifier(
                 );
             }
             price_bounds(
-                fee_market::TxClass::Eutxo {
-                    inputs: inputs.len() as u32,
-                },
+                fee_market::eutxo_class_for_keys(wall_epoch, inputs.iter().map(|i| i.pubkey.as_slice())),
                 *tx_bytes,
                 *tip_millisat_per_gas,
             )?;
@@ -7328,7 +8553,7 @@ fn admissible_with_network_verifier(
                 .checked_signing_root_for_network(wall_epoch, network_domain)
                 .ok_or("network-bound spend gate requires a committed genesis domain")?;
             for i in inputs {
-                if !verifier.verify_with_key(&i.pubkey, &signing_root, &i.signature) {
+                if !admission_spend_witness_verifies(verifier, wall_epoch, &i.pubkey, &signing_root, &i.signature) {
                     return Err("transfer carries a signature that does not verify");
                 }
             }
@@ -7431,7 +8656,10 @@ fn admissible_with_network_verifier(
             // expensive signature verification.
             if keys
                 .iter()
-                .any(|k| !bloch_crypto::crypto::is_hybrid_public_key(&k.pubkey))
+                .any(|k| !bloch_crypto::crypto::is_spend_public_key_admissible(
+                    &k.pubkey,
+                    bloch_pos_committee::params::hf3_slh_suite_active(wall_epoch),
+                ))
             {
                 return Err(
                     "transfer uses a non-hybrid public-key suite — live spends require \
@@ -7441,9 +8669,7 @@ fn admissible_with_network_verifier(
             // The two price bounds, on the V2 class term (one verification
             // per TABLE entry) — mirroring `apply_transfer_v2`.
             price_bounds(
-                fee_market::TxClass::Eutxo {
-                    inputs: keys.len() as u32,
-                },
+                fee_market::eutxo_class_for_keys(wall_epoch, keys.iter().map(|k| k.pubkey.as_slice())),
                 *tx_bytes,
                 *tip_millisat_per_gas,
             )?;
@@ -7489,7 +8715,7 @@ fn admissible_with_network_verifier(
                 .checked_signing_root_for_network(wall_epoch, network_domain)
                 .ok_or("network-bound spend gate requires a committed genesis domain")?;
             for k in keys {
-                if !verifier.verify_with_key(&k.pubkey, &signing_root, &k.signature) {
+                if !admission_spend_witness_verifies(verifier, wall_epoch, &k.pubkey, &signing_root, &k.signature) {
                     return Err("transfer carries a signature that does not verify");
                 }
             }
@@ -7564,12 +8790,23 @@ fn admissible_with_network_verifier(
             }
             Ok(())
         }
-        PosTransaction::SlashingEvidence(_) => {
+        PosTransaction::SlashingEvidence(ev) => {
             if !bloch_pos_committee::params::epoch_gate_active(wall_epoch, bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH) {
                 return Err(
                     "slashing evidence (tag 0x05) is not active: the transaction ships \
                      behind a flag day (SLASHING_EVIDENCE_ACTIVATION_EPOCH) that this \
                      chain has not reached, so no block could carry it",
+                );
+            }
+            // Node policy, unconditional (incident 2026-10-19): an offence
+            // committed before slashing existed is never relayed. Consensus
+            // still accepts such evidence until
+            // PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH binds; this only stops
+            // THIS node from carrying it to a proposer.
+            if bloch_pos_committee::slashing::offence_predates_activation(ev) {
+                return Err(
+                    "slashing evidence for an offence committed before \
+                     SLASHING_EVIDENCE_ACTIVATION_EPOCH is refused by node policy",
                 );
             }
             Ok(())
@@ -7581,6 +8818,42 @@ fn admissible_with_network_verifier(
         // unconditional; post-activation the signature half still belongs to
         // consensus alone (this function is stateless — no registry to
         // resolve the validator's committed key against).
+        // KES registration (0x17): refused before `KES_REGISTRATION_EPOCH`
+        // exactly like every other flag-day format. After it, the structural
+        // bounds here; the signature, the once-only rule and the registry
+        // checks belong to `validate_lifecycle_transaction` (committed state)
+        // and to consensus.
+        PosTransaction::KesRegister { depth, signature, .. } => {
+            if !bloch_pos_committee::params::kes_registration_open(wall_epoch) {
+                return Err(
+                    "KES registration (tag 0x17) is not active: the format ships behind a \
+                     flag day (KES_REGISTRATION_EPOCH) that this chain has not reached",
+                );
+            }
+            if !admissible_kes_register_shape(*depth, signature) {
+                return Err("KES registration has an out-of-range depth or signature length");
+            }
+            Ok(())
+        }
+        // HF3 KES rotation: refused before `HF3_KES_EPOCH` exactly like every
+        // other flag-day format. After it, the structural bounds here; the
+        // period, the leaf signature, the one-per-period rule and the
+        // registry checks belong to `validate_lifecycle_transaction`
+        // (committed state) and to consensus.
+        PosTransaction::KesRotate { depth, signature, .. } => {
+            if !bloch_pos_committee::params::kes_registration_open(wall_epoch) {
+                return Err(
+                    "KES rotation is not active: the format ships behind a flag day \
+                     (HF3_KES_EPOCH) that this chain has not reached",
+                );
+            }
+            if !(bloch_pos_committee::kes::MIN_DEPTH..=bloch_pos_committee::kes::MAX_DEPTH).contains(depth)
+                || bloch_pos_committee::kes::KesSignature::decode(signature).is_none()
+            {
+                return Err("KES rotation has an out-of-range depth or a malformed KES signature");
+            }
+            Ok(())
+        }
         PosTransaction::RandaoRecommit { .. } => {
             if !bloch_pos_committee::params::epoch_gate_active(wall_epoch, bloch_pos_committee::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH) {
                 return Err(
@@ -7645,7 +8918,7 @@ mod forkchoice_tests {
     use super::*;
     use bloch_pos_committee::sample::Validator;
 
-    fn header(parent: [u8; 32], slot: u64, marker: u8) -> BlockHeaderV4 {
+    pub(super) fn header(parent: [u8; 32], slot: u64, marker: u8) -> BlockHeaderV4 {
         BlockHeaderV4 {
             version: VERSION_G4,
             parent,
@@ -7662,7 +8935,7 @@ mod forkchoice_tests {
         }
     }
 
-    fn attest(validator: u32, slot: u64, head: [u8; 32]) -> Attestation {
+    pub(super) fn attest(validator: u32, slot: u64, head: [u8; 32]) -> Attestation {
         Attestation {
             validator,
             data: AttestationData {
@@ -7703,7 +8976,7 @@ mod forkchoice_tests {
         (blocks, ids)
     }
 
-    fn vals(n: u32) -> Vec<Validator> {
+    pub(super) fn vals(n: u32) -> Vec<Validator> {
         (0..n)
             .map(|index| Validator {
                 index,
@@ -7803,6 +9076,42 @@ mod forkchoice_tests {
                 err.contains("SLASHING_EVIDENCE_ACTIVATION_EPOCH"),
                 "the refusal must name the gate: {err}"
             );
+        }
+    }
+
+    /// Incident 2026-10-19 node policy: past the flag day, evidence for an
+    /// offence committed BEFORE it is refused at the door; a post-activation
+    /// offence is still admitted.
+    #[test]
+    fn pre_activation_offence_is_refused_at_the_door_after_the_flag_day() {
+        let gate = bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH;
+        let ev = |target: u64| {
+            let attest = |head: u8| bloch_pos_committee::Attestation {
+                data: bloch_pos_committee::AttestationData {
+                    slot: target * bloch_pos_committee::SLOTS_PER_EPOCH,
+                    head: [head; 32],
+                    source_epoch: target - 1,
+                    source_root: [1; 32],
+                    target_epoch: target,
+                    target_root: [head; 32],
+                },
+                validator: 2,
+                signature: vec![0u8; 8],
+            };
+            PosTransaction::SlashingEvidence(
+                bloch_pos_committee::interfaces::SlashingEvidence::AttestationOffence {
+                    first: attest(0xAA),
+                    second: attest(0xBB),
+                },
+            )
+        };
+        for wall_epoch in [gate, 6_026, 50_000] {
+            for target in [1u64, 100, 900, gate - 1] {
+                let err = admissible(&ev(target), wall_epoch).expect_err("pre-activation offence admitted");
+                assert!(err.contains("before"), "{err}");
+            }
+            assert!(admissible(&ev(gate), wall_epoch).is_ok());
+            assert!(admissible(&ev(wall_epoch), wall_epoch).is_ok());
         }
     }
 
@@ -8283,6 +9592,65 @@ mod admission_authorisation {
         (tx, sig)
     }
 
+    /// OWNER DECISION (HF2 scope): every v1 byte form of a spend signature
+    /// that today's wallets/exchanges can produce (canonical, zero-padded
+    /// Falcon half, headerless legacy) is admitted by the mempool and valid
+    /// under the consensus TRANSACTION rule at E2-1, E2 and E2+1000, where E2
+    /// is the canonical (v2) flag day — with or without the ML-DSA pin.
+    #[test]
+    fn v1_transfer_forms_stay_valid_across_the_canonical_flag_day() {
+        use bloch_crypto::crypto::{
+            falcon, sign, sign_bound, verify, MLDSA_SIG_LEN, SUITE_HEADER_LEN,
+        };
+        use bloch_pos_committee::SignaturePolicy;
+        let (template, _) = signed_transfer();
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[9u8; 32]).unwrap();
+        let root = template.spend_signing_root();
+        let with_sig = |sig: &[u8]| {
+            let mut tx = template.clone();
+            if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+                inputs[0].signature = sig.to_vec();
+            }
+            tx
+        };
+        let padded_len = SUITE_HEADER_LEN + MLDSA_SIG_LEN + falcon::padded_signature_len();
+        let sig = (0..64)
+            .map(|_| sign(&sk, &root).unwrap())
+            .find(|s| s.len() < padded_len && s[SUITE_HEADER_LEN..SUITE_HEADER_LEN + 2] != [0xB1, 0x0C])
+            .expect("a compact fixture with padding room");
+        let mut padded = sig.clone();
+        padded.resize(padded_len, 0);
+        let headerless = sig[SUITE_HEADER_LEN..].to_vec();
+        let forms = [("canonical", sig.clone()), ("padded", padded), ("headerless", headerless)];
+        for (name, form) in &forms {
+            assert!(verify(&pk, &root, form), "{name} is consensus-valid today");
+            // Mempool: no relay signature policy, admitted unconditionally.
+            assert!(admissible(&with_sig(form), 0).is_ok(), "{name} admitted by the mempool");
+        }
+        // Consensus transaction rule around a hypothetical flag day E2.
+        let e2: u64 = 10_000;
+        let v = HybridVerifier::new();
+        for pin_armed in [false, true] {
+            for (epoch, label) in [(e2 - 1, "E2-1"), (e2, "E2"), (e2 + 1_000, "E2+1000")] {
+                let policy = SignaturePolicy::transaction_for(pin_armed, epoch >= e2);
+                assert!(
+                    matches!(policy, SignaturePolicy::Compatible | SignaturePolicy::CompatiblePinned),
+                    "{label}: {policy:?}"
+                );
+                for (name, form) in &forms {
+                    assert!(v.verify_with_key_under(policy, &pk, &root, form), "{name} at {label} pin={pin_armed}");
+                    assert!(
+                        bloch_pos_committee::PolicyVerifier::new(&v, policy).verify_with_key(&pk, &root, form),
+                        "{name} at {label} through the policy wrapper"
+                    );
+                }
+            }
+        }
+        // A v2 signature is never a transaction witness.
+        let v2 = sign_bound(&sk, &root).unwrap();
+        assert!(admissible(&with_sig(&v2), 0).is_err());
+    }
+
     #[test]
     fn a_correctly_signed_transfer_is_still_admitted() {
         // THE REGRESSION THAT WOULD MATTER MOST. A signature check that refuses
@@ -8306,6 +9674,148 @@ mod admission_authorisation {
             .is_ok(),
             "a V1 transfer must be admitted identically after the V2 flag day"
         );
+    }
+
+    /// OWNER SCOPE (HF2): every offline CLI that signs a TRANSACTION
+    /// (transfer-v2, validator-deposit, funded-delegation, validator-payout,
+    /// and any future tx CLI) emits a v1 signature via `keys.sign` /
+    /// `crypto::sign`. Consensus judges transactions under
+    /// `SignaturePolicy::transaction`, which is never a canonical policy — so
+    /// that v1 signature verifies at EVERY epoch, whatever the ML-DSA-pin and
+    /// canonical gates say (this exercises all four gate states).
+    #[test]
+    fn offline_cli_v1_signatures_verify_under_the_transaction_policy_at_every_epoch() {
+        use bloch_pos_committee::SignaturePolicy::{self, Compatible, CompatiblePinned};
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[0x3Cu8; 32]).unwrap();
+        let v = HybridVerifier::new();
+        for root in [[0u8; 32], [0x5A; 32], [0xFF; 32]] {
+            // Exactly what the offline CLIs produce for a transaction root.
+            let sig = bloch_crypto::crypto::sign(&sk, &root).unwrap();
+            for (pin, canon) in [(false, false), (true, false), (true, true), (false, true)] {
+                let policy = SignaturePolicy::transaction_for(pin, canon);
+                assert!(matches!(policy, Compatible | CompatiblePinned), "{policy:?}");
+                assert!(
+                    v.verify_with_key_under(policy, &pk, &root, &sig),
+                    "v1 transaction signature rejected under {policy:?} (pin={pin}, canon={canon})"
+                );
+            }
+        }
+    }
+
+    // ── HF2 sigdet node relay policy ─────────────────────────────────────────
+
+    /// Accept-everything base verifier: a stand-in for "whatever verdict the
+    /// base/consensus verifier would reach" so a relay-policy test does not
+    /// have to reproduce a backend-specific acceptance.
+    struct AcceptAll;
+    impl bloch_pos_committee::attestation::SignatureVerifier for AcceptAll {
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
+        }
+    }
+
+    /// Every honest reference signature — produced by each compiled PQClean
+    /// ML-DSA-65 backend (clean, and avx2/neon where the CPU supports it),
+    /// under the same hedging randomness — is byte-identical and is admitted.
+    #[test]
+    fn honest_reference_signatures_from_every_backend_are_admitted() {
+        use pqcrypto_mldsa::ffi;
+        use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
+        const MPK: usize = 1952;
+        const MSK: usize = 4032;
+        const MSIG: usize = 3309;
+
+        // Hybrid key; split out the ML-DSA halves the backends operate on.
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[9u8; 32]).unwrap();
+        let (_, pk_body) = bloch_crypto::crypto::split_envelope(&pk).unwrap();
+        let (_, sk_body) = bloch_crypto::crypto::split_envelope(&sk).unwrap();
+        let mpk: [u8; MPK] = pk_body[..MPK].try_into().unwrap();
+        let msk: [u8; MSK] = sk_body[..MSK].try_into().unwrap();
+        let root = [0x5Au8; 32];
+
+        type Sign = unsafe extern "C" fn(*mut u8, *mut usize, *const u8, usize, *const u8, usize, *const u8) -> core::ffi::c_int;
+        let mut signers: Vec<(&str, Sign)> = vec![("clean", ffi::PQCLEAN_MLDSA65_CLEAN_crypto_sign_signature_ctx)];
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            signers.push(("avx2", ffi::PQCLEAN_MLDSA65_AVX2_crypto_sign_signature_ctx));
+        }
+        #[cfg(target_arch = "aarch64")]
+        signers.push(("aarch64", ffi::PQCLEAN_MLDSA65_AARCH64_crypto_sign_signature_ctx));
+        assert!(signers.len() >= 1);
+
+        let mut reference: Option<Vec<u8>> = None;
+        for (name, sign) in &signers {
+            let mut sig = vec![0u8; MSIG];
+            let mut len = 0usize;
+            // Same seeded hedging stream for every backend, so an honest
+            // signature is a function of the key and message, not the CPU.
+            let rc = pqcrypto_internals::with_seeded_rng_scope(&[0x77u8; 32], || unsafe {
+                sign(sig.as_mut_ptr(), &mut len, root.as_ptr(), root.len(), core::ptr::null(), 0, msk.as_ptr())
+            });
+            assert_eq!((rc, len), (0, MSIG), "{name} signer");
+            // Accepted by the FIPS 204 reference verifier used by the relay policy.
+            assert!(bloch_mldsa_clean::verify(&mpk, &root, &sig), "{name} honest sig rejected by reference");
+            match &reference {
+                None => reference = Some(sig),
+                Some(r) => assert_eq!(&sig, r, "{name} honest signature differs from clean"),
+            }
+        }
+
+        // End to end: an honest hybrid transfer reaches the mempool under the
+        // relay policy.
+        let (tx, _) = signed_transfer();
+        assert!(admissible(&tx, 0).is_ok(), "an honest hybrid transfer must be admitted");
+        let _ = reference;
+    }
+
+    /// The relay policy refuses a signature the BASE verifier would accept but
+    /// the FIPS 204 reference verifier rejects, while the base verifier (what
+    /// the consensus transition uses to judge a block) still accepts it — so
+    /// the tx is kept out of this node's mempool yet a block carrying it is
+    /// not rejected by consensus. Uses `AcceptAll` as the base stand-in and an
+    /// arbitrary non-reference signature, so no backend-specific signature is
+    /// generated here.
+    #[test]
+    fn relay_policy_refuses_what_the_base_accepts_while_consensus_still_accepts() {
+        // Honest transfer, then replace its witness with a structurally valid
+        // 0x0001 signature envelope full of zeros: cryptographically invalid,
+        // so no backend-specific signature is generated here.
+        let (mut tx, _) = signed_transfer();
+        let pubkey = match &tx {
+            PosTransaction::Transfer { inputs, .. } => inputs[0].pubkey.clone(),
+            _ => unreachable!(),
+        };
+        let root = tx.spend_signing_root();
+        let falcon_len = bloch_crypto::crypto::falcon::padded_signature_len();
+        let mut bogus = vec![0xB1u8, 0x0C, 0x01, 0x00];
+        bogus.resize(4 + bloch_crypto::crypto::MLDSA_SIG_LEN + falcon_len, 0);
+        if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+            inputs[0].signature = bogus.clone();
+        }
+        // The FIPS 204 reference verifier rejects it; the accept-all base
+        // (standing in for whatever the consensus verifier would decide) does not.
+        assert!(!bloch_crypto::crypto::verify_pinned(&pubkey, &root, &bogus));
+        assert!(AcceptAll.verify_with_key(&pubkey, &root, &bogus));
+        // The mempool door, run with the accept-all BASE verifier, still refuses
+        // it, because the relay policy adds the reference check on top — so a
+        // block that consensus (the base verifier) would accept is kept out of
+        // this node's mempool and off the wire.
+        assert!(
+            admissible_with_network_verifier(&tx, 0, None, &AcceptAll).is_err(),
+            "the relay policy must refuse a non-reference signature even when the base accepts"
+        );
+    }
+
+    /// The relay policy lives only on the node's admission and proposer-
+    /// selection paths; the consensus crate never applies it.
+    #[test]
+    fn relay_policy_is_confined_to_the_node_admission_path() {
+        let committee = include_str!("../../bloch-pos-committee/src/transition.rs");
+        assert!(!committee.contains("StrictRelayVerifier"));
+        assert!(!committee.contains("verify_pinned"));
+        let here = include_str!("engine.rs");
+        assert!(here.contains("struct StrictRelayVerifier"));
+        assert!(here.contains("fn spend_witnesses_pass_relay_policy"));
     }
 
     /// **H1, at the mempool door.** A transfer whose tip or declared gas is
@@ -8678,6 +10188,65 @@ mod admission_authorisation {
         assert!(admissible(&signed_transfer_v2(2), V2_FLAG_DAY).is_ok());
     }
 
+    /// HF3 ships inert: a transfer authorised by a REAL suite-0x0003
+    /// (SLH-DSA-SHAKE-128s ‖ Falcon-1024) key and signature is refused at
+    /// admission in both encodings, by the unchanged suite policy and before
+    /// any verification, at every epoch; and the production verifier refuses
+    /// its witness on both entry points, while the hybrid controls pass.
+    #[test]
+    fn hf3_suite_0x0003_spends_are_refused_while_the_gate_is_inert() {
+        use bloch_pos_committee::attestation::SignatureVerifier;
+        struct MustNotVerify;
+        impl SignatureVerifier for MustNotVerify {
+            fn verify_with_key(&self, _: &[u8], _: &[u8; 32], _: &[u8]) -> bool {
+                panic!("suite policy must run before signature verification")
+            }
+        }
+        assert_eq!(bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH, u64::MAX);
+        let (pk, sk) = bloch_crypto::crypto::slhdsa_suite::generate_keypair_from_seed(&[0x33u8; 32])
+            .expect("suite-0x0003 keypair");
+        let mut v1 = signed_transfer().0;
+        let root = v1.spend_signing_root();
+        let sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign with the 0x0003 key");
+        if let PosTransaction::Transfer { inputs, .. } = &mut v1 {
+            inputs[0].pubkey = pk.clone();
+            inputs[0].signature = sig.clone();
+        }
+        let root = v1.spend_signing_root();
+        let sig = bloch_crypto::crypto::sign(&sk, &root).expect("re-sign over the final root");
+        if let PosTransaction::Transfer { inputs, .. } = &mut v1 {
+            inputs[0].signature = sig.clone();
+        }
+        let mut v2 = signed_transfer_v2(2);
+        if let PosTransaction::TransferV2 { keys, .. } = &mut v2 {
+            keys[0].pubkey = pk.clone();
+        }
+        let root2 = v2.spend_signing_root();
+        if let PosTransaction::TransferV2 { keys, .. } = &mut v2 {
+            keys[0].signature = bloch_crypto::crypto::sign(&sk, &root2).expect("sign V2 root");
+        }
+        for epoch in [0, V2_FLAG_DAY, 6_017, u64::MAX] {
+            let err = admissible_with_verifier(&v1, epoch, &MustNotVerify)
+                .expect_err("suite 0x0003 must not enter the V1 mempool before HF3");
+            assert!(err.contains("non-hybrid"), "wrong refusal: {err}");
+            if epoch >= V2_FLAG_DAY {
+                let err = admissible_with_verifier(&v2, epoch, &MustNotVerify)
+                    .expect_err("suite 0x0003 must not enter the V2 mempool before HF3");
+                assert!(err.contains("non-hybrid"), "wrong refusal: {err}");
+            }
+            assert!(!HybridVerifier::new().verify_spend_at_epoch(&pk, &root, &sig, epoch));
+        }
+        assert!(!HybridVerifier::new().verify_with_key(&pk, &root, &sig));
+        // Controls: the hybrid fixtures traverse the real verifier on both
+        // entry points.
+        let (h, hsig) = signed_transfer();
+        let PosTransaction::Transfer { inputs, .. } = &h else { unreachable!() };
+        let hroot = h.spend_signing_root();
+        assert!(HybridVerifier::new().verify_with_key(&inputs[0].pubkey, &hroot, &hsig));
+        assert!(HybridVerifier::new().verify_spend_at_epoch(&inputs[0].pubkey, &hroot, &hsig, 0));
+        assert!(admissible(&h, 0).is_ok());
+    }
+
     /// The flag day itself, with the unit pinned: both epochs are DERIVED
     /// FROM SLOTS via `epoch_of`, because the gate compares EPOCHS against
     /// `params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` and a call
@@ -8975,11 +10544,13 @@ mod transfer_v2_end_to_end {
             gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: None,
-            blocks: BTreeMap::new(),
+            kes: None,
+            blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+            finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
@@ -9280,6 +10851,100 @@ mod transfer_v2_end_to_end {
         );
     }
 
+    fn rescue_commit(k: u16) -> PosTransaction {
+        let mut commitment = [0u8; 32];
+        commitment[..2].copy_from_slice(&k.to_le_bytes());
+        PosTransaction::RescueCommit(bloch_pos_committee::transition::RescueCommit {
+            network_domain: [0x5D; 32],
+            commitment,
+        })
+    }
+
+    fn zero_tip_transfer(i: u8) -> PosTransaction {
+        PosTransaction::Transfer {
+            inputs: vec![bloch_pos_committee::transition::TransferInput {
+                txid: [i; 32],
+                vout: 0,
+                pubkey: vec![7, i],
+                signature: vec![8],
+            }],
+            outputs: vec![TransferOutput { value: 1, script_hash: [i; 32] }],
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        }
+    }
+
+    /// F-9, proposer side: a mempool holding a flood of free rescue
+    /// commitments and some zero-tip transfers yields a block with EVERY
+    /// transfer and at most `RESCUE_COMMITS_MAX_PER_BLOCK` commitments, the
+    /// commitments ranked after even zero-tip transfers.
+    #[test]
+    fn a_rescue_commit_flood_cannot_crowd_out_transfers_in_selection() {
+        let epoch = V2_FLAG_DAY + 1;
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+        for k in 0..200u16 {
+            let tx = rescue_commit(k);
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        for i in 0..10u8 {
+            let tx = zero_tip_transfer(i);
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        let selected = Engine::pack_transactions(epoch, [0x11; 32], node.mempool.iter().collect());
+        let commits = selected.iter().filter(|tx| matches!(tx, PosTransaction::RescueCommit(_))).count();
+        let transfers = selected.iter().filter(|tx| matches!(tx, PosTransaction::Transfer { .. })).count();
+        assert_eq!(transfers, 10, "every transfer is selected despite the flood");
+        assert_eq!(commits as u64, bloch_pos_committee::params::RESCUE_COMMITS_MAX_PER_BLOCK);
+        let first_commit = selected.iter().position(|tx| matches!(tx, PosTransaction::RescueCommit(_))).unwrap();
+        assert!(selected[..first_commit].iter().all(|tx| matches!(tx, PosTransaction::Transfer { .. })));
+        assert_eq!(first_commit, 10, "commitments rank after zero-tip transfers");
+    }
+
+    /// F-9: which commitments win the scarce slots is re-drawn from the
+    /// parent block id, so grinding commitment bytes low (the canonical-bytes
+    /// tie-break) does not buy every slot, and the draw changes per block.
+    #[test]
+    fn rescue_commit_slots_are_drawn_from_the_parent_not_from_byte_order() {
+        let epoch = V2_FLAG_DAY + 1;
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+        for k in 0..64u16 {
+            let tx = rescue_commit(k);
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        let pick = |seed: [u8; 32]| -> Vec<PosTransaction> {
+            Engine::pack_transactions(epoch, seed, node.mempool.iter().collect())
+        };
+        let a = pick([0x01; 32]);
+        let b = pick([0x02; 32]);
+        assert_eq!(a, pick([0x01; 32]), "deterministic for one parent");
+        assert_ne!(a, b, "a different parent re-draws the slots");
+        let lowest: Vec<PosTransaction> = (0..64u16).map(rescue_commit)
+            .map(|tx| (tx.canonical_bytes(), tx)).collect::<BTreeMap<_, _>>()
+            .into_values().take(a.len()).collect();
+        assert!(a != lowest || b != lowest, "byte order does not decide the winners");
+    }
+
+    /// F-9, mempool side: every commitment shares one source, so a flood
+    /// holds at most `MEMPOOL_MAX_PER_SOURCE` entries and a paying transfer
+    /// is still admitted while the commitment pool is full.
+    #[test]
+    fn rescue_commits_share_one_mempool_source() {
+        let epoch = V2_FLAG_DAY + 1;
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+        for k in 0..MEMPOOL_MAX_PER_SOURCE as u16 {
+            let tx = rescue_commit(k);
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        assert_eq!(node.mempool.source_count(&rescue_commit_pool_source()), MEMPOOL_MAX_PER_SOURCE);
+        let one_more = rescue_commit(9_999);
+        assert!(matches!(
+            node.plan_mempool_capacity(&one_more, one_more.canonical_bytes().len(), epoch),
+            Err(Refusal::TooManyFromSource)
+        ));
+        let transfer = zero_tip_transfer(1);
+        assert!(node.plan_mempool_capacity(&transfer, transfer.canonical_bytes().len(), epoch).is_ok());
+    }
+
     /// **H-R7-2, the proposer**: `select_transactions` must budget by the
     /// size CONSENSUS will count — each transfer's declared `tx_bytes` — not
     /// by wire length. Packing by wire length selected one tiny transfer
@@ -9336,7 +11001,7 @@ mod transfer_v2_end_to_end {
 
         // Exercise the byte packer independently of eligibility; these
         // synthetic transactions intentionally have no committed inputs.
-        let selected = Engine::pack_transactions(epoch, node.mempool.iter().collect());
+        let selected = Engine::pack_transactions(epoch, [0u8; 32], node.mempool.iter().collect());
         assert!(!selected.is_empty(), "an empty selection would prove nothing");
         // The property the transition enforces at step 10b: the sum of the
         // sizes consensus counts must fit the cap. `max` mirrors the packer:
@@ -10190,6 +11855,17 @@ mod perf_support {
     pub(super) fn proposing_engine_funded(
         opening: &[bloch_pos_committee::state_root::EutxoEntry],
     ) -> (Engine, TestDir) {
+        let (engine, dir, _) = proposing_engine_n(opening, 1);
+        (engine, dir)
+    }
+
+    /// `n` genesis validators with real hybrid keystores (each in its own
+    /// subdirectory). The engine signs as validator 0; the other keystores are
+    /// returned so a test can swap them in to attest/propose as the whole set.
+    pub(super) fn proposing_engine_n(
+        opening: &[bloch_pos_committee::state_root::EutxoEntry],
+        n: u32,
+    ) -> (Engine, TestDir, Vec<Keystore>) {
         static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "bloch-pos-perf-{}-{}",
@@ -10204,17 +11880,29 @@ mod perf_support {
         // in an unoptimized test binary would dominate the suite.
         let ks = Keystore::generate_with(&dir, 0, &crate::keys::Unlock::PlaintextOptIn)
             .expect("generate a devnet keystore");
+        let others: Vec<Keystore> = (1..n)
+            .map(|i| {
+                let sub = dir.join(format!("v{i}"));
+                std::fs::create_dir_all(&sub).expect("create a validator subdir");
+                Keystore::generate_with(&sub, i, &crate::keys::Unlock::PlaintextOptIn)
+                    .expect("generate a devnet keystore")
+            })
+            .collect();
         let manifest = Manifest {
             genesis_time_ms: now_ms(),
             slot_ms: 1_000,
-            validators: vec![ManifestValidator {
-                index: 0,
-                stake_sat: 200_000 * SAT_PER_BLOCH,
-                randao_commitment: RandaoChain::generate(ks.randao_seed).commitment(),
-                pubkey: ks.pubkey.clone(),
-                withdrawal_credentials: Vec::new(),
-                commission_bps: 0,
-            }],
+            validators: std::iter::once(&ks)
+                .chain(others.iter())
+                .enumerate()
+                .map(|(i, k)| ManifestValidator {
+                    index: i as u32,
+                    stake_sat: 200_000 * SAT_PER_BLOCH,
+                    randao_commitment: RandaoChain::generate(k.randao_seed).commitment(),
+                    pubkey: k.pubkey.clone(),
+                    withdrawal_credentials: Vec::new(),
+                    commission_bps: 0,
+                })
+                .collect(),
             cohort: Vec::new(),
             carryover: None,
             allocations: Vec::new(),
@@ -10238,11 +11926,13 @@ mod perf_support {
             gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: Some(ks),
-            blocks: BTreeMap::new(),
+            kes: None,
+            blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+            finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
@@ -10295,7 +11985,7 @@ mod perf_support {
             doppelganger_observe_until: None,
             doppelganger_halted: false,
         };
-        (engine, TestDir(dir))
+        (engine, TestDir(dir), others)
     }
 }
 
@@ -10325,6 +12015,152 @@ mod local_attestation_ownership {
             frame < insert && insert < broadcast,
             "frame preparation, pool ownership and publication order changed"
         );
+    }
+}
+
+/// Missed-duty retry: a validator whose single attestation slot of an epoch
+/// fell while duties were blocked (an empty-slot run closing the stale-head
+/// gate) still votes once in that epoch, never twice, never after it ends.
+#[cfg(test)]
+mod missed_duty_retry_tests {
+    use super::*;
+    use bloch_pos_committee::SLOTS_PER_EPOCH;
+
+    /// First epoch >= 1 whose duty slot is not the epoch's last slot, so a
+    /// later wall slot of the same epoch exists. Returns (epoch, duty slot).
+    fn epoch_with_room(engine: &mut Engine) -> (u64, u64) {
+        for e in 1..64 {
+            let d = engine.attestation_duty_slot(e).expect("the only validator has a duty");
+            assert_eq!(epoch_of(d), e);
+            if d + 1 < (e + 1) * SLOTS_PER_EPOCH {
+                return (e, d);
+            }
+        }
+        panic!("no epoch with a duty before its last slot");
+    }
+
+    fn own_votes(engine: &Engine, target: u64) -> Vec<Attestation> {
+        engine.pool.values().filter(|a| a.data.target_epoch == target).cloned().collect()
+    }
+
+    #[test]
+    fn a_duty_skipped_in_an_empty_slot_gap_is_voted_later_in_the_same_epoch() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let (e, d) = epoch_with_room(&mut engine);
+        let last = (e + 1) * SLOTS_PER_EPOCH - 1;
+        let w = (d + 2).min(last);
+        // The slot loop was blocked for d..w-1; at w the gate reopens.
+        engine.attest(w);
+        assert!(own_votes(&engine, e).is_empty(), "w is not the duty slot");
+        engine.retry_missed_attestation(w);
+        let votes = own_votes(&engine, e);
+        assert_eq!(votes.len(), 1, "exactly one late vote for epoch {e}");
+        let v = &votes[0];
+        assert_eq!(v.data.slot, d, "the vote is for the duty slot, not the wall slot");
+        assert_eq!(v.data.target_root, engine.checkpoint_root(e));
+        let keys = engine.keys.as_ref().unwrap();
+        assert!(engine.verifier.verify_with_key(&keys.pubkey, &v.data.signing_root(), &v.signature));
+        // Consensus-side acceptance of the late vote: same committee check,
+        // slot not in the future relative to any later block of the epoch.
+        let rolled = engine.rolled_to(e);
+        let committee =
+            committees::committee_for_slot(&Engine::seed_for(&rolled, e), v.data.slot, &rolled.active_validators());
+        assert!(committee.binary_search(&v.validator).is_ok());
+        let wm = engine.slashprot.watermarks();
+        assert_eq!((wm.attestation_slot, wm.target_epoch), (Some(d), Some(e)));
+    }
+
+    #[test]
+    fn never_a_second_vote_for_the_same_epoch() {
+        // Late vote first, then every later turn of the epoch: no new vote.
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let (e, d) = epoch_with_room(&mut engine);
+        let last = (e + 1) * SLOTS_PER_EPOCH - 1;
+        engine.retry_missed_attestation(d + 1);
+        assert_eq!(engine.pool.len(), 1);
+        for w in d + 1..=last {
+            engine.attest(w);
+            engine.retry_missed_attestation(w);
+        }
+        assert_eq!(engine.pool.len(), 1, "the retry must never sign twice");
+
+        // On-time vote first: the retry stays silent for the rest of the epoch.
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let (e, d) = epoch_with_room(&mut engine);
+        engine.attest(d);
+        engine.retry_missed_attestation(d);
+        assert_eq!(own_votes(&engine, e).len(), 1);
+        for w in d + 1..(e + 1) * SLOTS_PER_EPOCH {
+            engine.retry_missed_attestation(w);
+        }
+        assert_eq!(own_votes(&engine, e).len(), 1, "on-time vote covers the epoch");
+
+        // Even a direct second signature for another slot of the epoch is
+        // refused by slashing protection, the single authority.
+        if d + 1 < (e + 1) * SLOTS_PER_EPOCH {
+            engine.attest_for(d, d + 1);
+            assert_eq!(own_votes(&engine, e).len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_duty_of_an_ended_epoch_is_never_signed() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let (e, d) = epoch_with_room(&mut engine);
+        let _ = d;
+        // Blocked through the whole rest of epoch e; the gate reopens in e+1.
+        let next_first = (e + 1) * SLOTS_PER_EPOCH;
+        let next_duty = engine.attestation_duty_slot(e + 1).unwrap();
+        for w in next_first..=next_duty.max(next_first) {
+            engine.attest(w);
+            engine.retry_missed_attestation(w);
+        }
+        assert!(own_votes(&engine, e).is_empty(), "epoch {e}'s duty must not be signed in e+1");
+        assert!(engine.pool.values().all(|a| epoch_of(a.data.slot) == a.data.target_epoch));
+        // A forged call shape for the past epoch is refused too.
+        engine.attest_for(d, next_first);
+        assert!(own_votes(&engine, e).is_empty());
+    }
+
+    #[test]
+    fn restart_mid_epoch_reads_the_durable_watermark() {
+        // Signed (late) before the restart: the restarted node does not sign again.
+        let (mut engine, dir) = perf_support::proposing_engine();
+        let (e, d) = epoch_with_room(&mut engine);
+        engine.retry_missed_attestation(d + 1);
+        assert_eq!(own_votes(&engine, e).len(), 1);
+        engine.pool.clear();
+        engine.slashprot = SlashingProtection::open(&dir.0).expect("reopen as the next boot");
+        for w in d + 1..(e + 1) * SLOTS_PER_EPOCH {
+            engine.attest(w);
+            engine.retry_missed_attestation(w);
+        }
+        assert!(own_votes(&engine, e).is_empty(), "a restart must not produce a second vote");
+
+        // Restarted after missing the duty (nothing signed): votes once.
+        let (mut engine, dir) = perf_support::proposing_engine();
+        let (e, d) = epoch_with_room(&mut engine);
+        engine.slashprot = SlashingProtection::open(&dir.0).expect("fresh boot");
+        engine.retry_missed_attestation(d + 1);
+        engine.retry_missed_attestation(d + 1);
+        assert_eq!(own_votes(&engine, e).len(), 1);
+    }
+
+    #[test]
+    fn the_slot_loop_retries_after_the_on_time_attest() {
+        let source = include_str!("engine.rs");
+        let call = source
+            .find("            engine.attest(slot);\n")
+            .expect("slot-loop attest call");
+        let retry = source[call..]
+            .find("engine.retry_missed_attestation(slot);")
+            .expect("slot loop must retry a missed duty");
+        // Integration with hf-node-only: its gate test pins `attest` directly
+        // followed by the `last_attested` latch, so the retry follows the
+        // latch; it must still sit inside the same gated branch, i.e. before
+        // the proposer step that follows that branch.
+        let end = source[call..].find("let propose_at").expect("end of the attest branch");
+        assert!(retry < end && retry < 600, "the retry must sit inside the unblocked attest branch");
     }
 }
 
@@ -10593,6 +12429,9 @@ mod doppelganger_tests {
         engine.start_doppelganger_observation(100);
         let mut old = sample_attestation_for(index);
         old.data.slot = 99;
+        // This node's own historical work: persist-before-sign means its
+        // record covers it (an uncovered one is the stale-record case below).
+        engine.slashprot.raise_to_published(published_attestation(&old)).unwrap();
         engine.apply_decision(old, GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
         assert!(!engine.doppelganger_halted);
         let mut current = sample_attestation_for(index);
@@ -10600,6 +12439,30 @@ mod doppelganger_tests {
         engine.apply_decision(current, GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
         assert!(engine.doppelganger_halted);
         assert!(engine.doppelganger_blocks_duties(10_000));
+    }
+
+    /// Rollback guard, runtime half: after the window, a gossip duty of this
+    /// key that the signing record does NOT cover (restored data dir, or a
+    /// second instance elsewhere) stops duties and raises the record durably.
+    #[test]
+    fn uncovered_own_duty_after_the_window_halts_and_raises_the_record() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
+        engine.doppelganger_observe_until = Some(10);
+        engine.wall_slot = 500;
+        let mut foreign = sample_attestation_for(my_index);
+        foreign.data.slot = 480;
+        foreign.data.source_epoch = 3;
+        foreign.data.target_epoch = 4;
+        engine.apply_decision(foreign, GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
+        assert!(engine.doppelganger_halted, "an uncovered own signature must stop duties");
+        let wm = engine.slashprot.watermarks();
+        assert_eq!((wm.attestation_slot, wm.target_epoch), (Some(480), Some(4)));
+        // Another validator's duty never trips it.
+        let (mut other, _d2) = perf_support::proposing_engine();
+        let idx = other.keys.as_ref().unwrap().index;
+        other.apply_decision(sample_attestation_for(idx + 1), GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
+        assert!(!other.doppelganger_halted);
     }
 
     fn sample_attestation_for(validator: u32) -> Attestation {
@@ -10668,6 +12531,11 @@ mod doppelganger_tests {
         let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
         engine.doppelganger_observe_until = Some(10);
         engine.wall_slot = 50; // past the window
+        // Its own duty: the record covers it, because it was persisted first.
+        engine
+            .slashprot
+            .raise_to_published(published_attestation(&sample_attestation_for(my_index)))
+            .unwrap();
 
         engine.apply_decision(
             sample_attestation_for(my_index),
@@ -11914,6 +13782,92 @@ mod reorg_state_tests {
             "borrowed replay diverged from the state root committed by the canonical block"
         );
     }
+
+    fn encoded(env: &BlockEnvelope) -> Vec<u8> {
+        let mut out = Vec::new();
+        crate::codec::write_envelope(&mut out, env).expect("encode");
+        out
+    }
+
+    /// Released bodies leave fork-choice inputs and replay untouched, and the
+    /// full block is served back from the log byte for byte.
+    #[test]
+    fn released_bodies_replay_and_serve_from_the_block_log() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        for slot in 1..=6 {
+            engine.propose(slot);
+        }
+        let ids: Vec<[u8; 32]> = engine.chain[1..].iter().map(|(_, id)| *id.as_bytes()).collect();
+        let full: Vec<Vec<u8>> = ids.iter().map(|id| encoded(&engine.blocks[id])).collect();
+        let target = ids[4];
+        let expected = engine.replay_to(target);
+        let votes_before: Vec<_> = engine.blocks.iter().map(|(id, _)| *id).collect();
+
+        // As if the latch had reached height 5: heights 1..=4 are released.
+        engine.finalized_latch = Some((5, target));
+        engine.hollow_finalized_bodies();
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(engine.blocks.is_hollow(id), i < 4, "height {}", i + 1);
+        }
+        let released = &engine.blocks[&ids[0]];
+        assert!(released.proposer_sig.is_empty() && released.body.attestations.is_empty());
+        assert_eq!(
+            engine.blocks.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            votes_before,
+            "released blocks stay in the inventory"
+        );
+
+        assert_eq!(engine.replay_to(target), expected, "replay streams released bodies from the log");
+        for (id, bytes) in ids.iter().zip(&full) {
+            let served = engine.envelope_by_id(id).expect("every canonical block is served");
+            assert_eq!(&encoded(served.as_ref()), bytes, "served block is the original");
+        }
+
+        // A body damaged on disk under an intact header (same block id) is
+        // refused, not served or replayed.
+        {
+            let mut logged: Vec<BlockEnvelope> = full.iter()
+                .map(|bytes| crate::codec::decode_envelope(bytes).expect("decode"))
+                .collect();
+            logged[1].body.transactions.push(vec![0x42]);
+            assert_eq!(logged[1].block_id().as_bytes(), &ids[1], "the id does not cover the body");
+            engine.store.rewrite(&logged).expect("tamper the log");
+            assert!(engine.read_logged_canonical(1, 2, |_| ()).is_ok(), "an intact frame still reads");
+            let err = engine.read_logged_canonical(2, 3, |_| ()).expect_err("tampered body refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(engine.envelope_by_id(&ids[1]).is_none(), "RPC does not serve it");
+            logged[1].body.transactions.pop();
+            engine.store.rewrite(&logged).expect("restore the log");
+            assert!(engine.envelope_by_id(&ids[1]).is_some());
+        }
+
+        // Idempotent, and a later latch releases only the new blocks.
+        engine.hollow_finalized_bodies();
+        engine.finalized_latch = Some((6, ids[5]));
+        engine.hollow_finalized_bodies();
+        assert!(engine.blocks.is_hollow(&ids[4]) && !engine.blocks.is_hollow(&ids[5]));
+    }
+
+    /// Under the operator rewind override a reorg may cut below released
+    /// bodies; they are restored in full first, so the old branch can be
+    /// re-adopted later.
+    #[test]
+    fn an_override_reorg_below_released_bodies_restores_them() {
+        let (mut engine, _dir, fork_point, rival) = forked(3);
+        let above: Vec<[u8; 32]> = engine.chain[2..].iter().map(|(_, id)| *id.as_bytes()).collect();
+        let full: Vec<Vec<u8>> = above.iter().map(|id| encoded(&engine.blocks[id])).collect();
+        let top = engine.chain.len() as u64 - 1;
+        engine.finalized_latch = Some((top, *engine.chain[top as usize].1.as_bytes()));
+        engine.hollow_finalized_bodies();
+        assert!(above[..above.len() - 1].iter().all(|id| engine.blocks.is_hollow(id)));
+
+        engine.finality_rewind_override = true;
+        assert!(engine.do_reorg(fork_point, vec![rival]), "override reorg succeeds");
+        for (id, bytes) in above.iter().zip(&full) {
+            assert!(!engine.blocks.is_hollow(id), "restored before leaving the chain");
+            assert_eq!(&encoded(&engine.blocks[id]), bytes);
+        }
+    }
 }
 
 /// **The invariant `getchaininfo` is about to rest on.**
@@ -12244,10 +14198,15 @@ mod duty_view_anchor {
         let keys: Vec<Keystore> = (0..n)
             .map(|i| {
                 // Disposable devnet keys, plaintext by explicit opt-in — see
-                // the note in the single-validator harness above.
-                Keystore::generate_with(
+                // the note in the single-validator harness above. Seeded, so
+                // the proposer draws (and therefore which slots this node
+                // proposes in) are the same on every run.
+                let mut seed = [0x5Du8; 32];
+                seed[..4].copy_from_slice(&i.to_le_bytes());
+                Keystore::generate_seeded_for_test(
                     &dir.0.join(format!("v{i}")),
                     i,
+                    seed,
                     &crate::keys::Unlock::PlaintextOptIn,
                 )
                 .expect("generate a devnet keystore")
@@ -12292,11 +14251,13 @@ mod duty_view_anchor {
             gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: Some(ks0),
-            blocks: BTreeMap::new(),
+            kes: None,
+            blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+            finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
@@ -12560,11 +14521,13 @@ mod slot_horizon {
             gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: None,
-            blocks: BTreeMap::new(),
+            kes: None,
+            blocks: BlockInventory::default(),
             observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+            finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
@@ -15475,6 +17438,10 @@ mod finality_latch_tests {
 mod validator_admission_tests;
 
 #[cfg(test)]
+#[path = "engine/funded_delegation_tests.rs"]
+mod funded_delegation_tests;
+
+#[cfg(test)]
 mod branch_gap_repair_tests {
     use super::*;
 
@@ -15597,6 +17564,55 @@ mod stale_head_duty_gate_tests {
         assert!(!validator_duties_blocked(false, false, false, false, false));
     }
 
+    /// Epoch-start slot 191296 with the head on 191294 while the boundary
+    /// block 191295 is still in flight: signing at slot start would vote the
+    /// wrong target, so the vote waits half a slot for the boundary block.
+    #[test]
+    fn an_epoch_start_vote_waits_while_the_boundary_slot_is_empty_in_view() {
+        let slot_ms = 30_000;
+        let (slot, start) = (191_296u64, 1_000_000u64);
+        assert_eq!(slot % SLOTS_PER_EPOCH, 0);
+        assert!(!attestation_due(191_294, slot, start, start, slot_ms));
+        assert!(!attestation_due(191_294, slot, start + slot_ms / 2 - 1, start, slot_ms));
+        assert!(attestation_due(191_294, slot, start + slot_ms / 2, start, slot_ms));
+        // The late block landed: the seed and target are now pinned.
+        assert!(attestation_due(191_295, slot, start, start, slot_ms));
+    }
+
+    #[test]
+    fn later_slots_of_an_epoch_with_no_block_yet_still_wait_on_a_missing_boundary() {
+        let slot_ms = 30_000;
+        // Slots 191296..191298 empty in view, head still on 191294.
+        assert!(!attestation_due(191_294, 191_298, 0, 0, slot_ms));
+        assert!(attestation_due(191_294, 191_298, slot_ms / 2, 0, slot_ms));
+    }
+
+    #[test]
+    fn ordinary_and_epoch_end_votes_are_signed_at_slot_start() {
+        let slot_ms = 30_000;
+        // Head on the boundary slot: the usual epoch start, unchanged.
+        assert!(attestation_due(191_295, 191_296, 0, 0, slot_ms));
+        // Head already inside the epoch, even across empty slots.
+        assert!(attestation_due(191_296, 191_310, 0, 0, slot_ms));
+        // An epoch's last slot depends on same-slot inclusion; never delayed.
+        assert!(attestation_due(191_320, 191_327, 0, 0, slot_ms));
+        assert_eq!(191_327 % SLOTS_PER_EPOCH, SLOTS_PER_EPOCH - 1);
+        // Epoch 0 has no previous boundary.
+        assert!(attestation_due(0, 5, 0, 0, slot_ms));
+    }
+
+    #[test]
+    fn the_slot_loop_gates_attest_on_attestation_due() {
+        let source = include_str!("engine.rs");
+        let call = source
+            .find("            engine.attest(slot);\n            last_attested = slot;")
+            .expect("slot-loop attest call");
+        let gate = source[..call]
+            .rfind("&& attestation_due(engine.state.slot(), slot, now, slot_start, slot_ms)")
+            .expect("attestation_due gate");
+        assert!(call - gate < 200, "the gate must guard the slot-loop attest call");
+    }
+
     #[test]
     fn distance_without_a_stalled_head_does_not_claim_sync_lag() {
         assert!(!node_is_behind(90, 100, 50_000, 40_000, 20_000));
@@ -15654,3 +17670,64 @@ mod stale_head_duty_gate_tests {
         assert!(!node_is_behind(1, 100, 10, 20, 1));
     }
 }
+
+#[cfg(test)]
+mod l2_admission_tests {
+    use super::*;
+    use bloch_pos_committee::l2_settlement::{withdrawal, Activation, Policy, State};
+    use bloch_pos_committee::transition::{FundingInput, L2DataAvailability, L2Deposit, TransferOutput};
+
+    fn policy() -> Policy {
+        Policy {
+            identities: std::array::from_fn(|i| [i as u8 + 1; 32]),
+            proof_policy: [0x0b; 32],
+            chain_id: 700771,
+            initial_l2_parent: [0x0c; 32],
+            initial_l2_state: [0x0d; 32],
+            attestor_set: [0; 32],
+        }
+    }
+    fn txs() -> Vec<PosTransaction> {
+        let change = TransferOutput { value: 1, script_hash: [3; 32] };
+        let input = FundingInput { txid: [4; 32], vout: 0 };
+        vec![
+            PosTransaction::L2Deposit(L2Deposit {
+                network_domain: [1; 32], funding_pubkey: vec![5; 8], inputs: vec![input.clone()],
+                amount_sat: 1, recipient: [6; 20], change: change.clone(), tx_bytes: 0,
+                tip_millisat_per_gas: 0, signature: Vec::new(),
+            }),
+            PosTransaction::L2DataAvailability(L2DataAvailability {
+                network_domain: [1; 32], funding_pubkey: vec![5; 8], inputs: vec![input],
+                l2_chain_id: 700771, l2_block_number: 1, payload: vec![0, 0, 0, 1, 0, 0, 0, 1, 7],
+                change, tx_bytes: 0, tip_millisat_per_gas: 0, signature: Vec::new(),
+            }),
+        ]
+    }
+
+    /// The mempool's L2 door reads the installed L2's profile, not the build:
+    /// no L2 (a running network before its flag day) refuses on every
+    /// build; an activated L2 admits on every build, a mainnet build included.
+    #[test]
+    fn l2_admission_follows_the_installed_profile_not_the_build() {
+        for tx in txs() {
+            assert!(l2_admission_refusal(&tx, None).is_some(), "{tx:?}");
+        }
+        let limits = withdrawal::Limits::DEVELOPMENT;
+        let on = State::activated(Activation { policy: policy(), asynchronous: true, limits }).unwrap();
+        for tx in txs() {
+            assert_eq!(l2_admission_refusal(&tx, Some(&on)), None, "{tx:?}");
+        }
+        // Synchronous activation: no inbox, so no deposits; DA still enters.
+        let sync = State::activated(Activation { policy: policy(), asynchronous: false, limits }).unwrap();
+        let [deposit, da] = <[PosTransaction; 2]>::try_from(txs()).unwrap();
+        assert!(l2_admission_refusal(&deposit, Some(&sync)).is_some());
+        assert_eq!(l2_admission_refusal(&da, Some(&sync)), None);
+        // A development genesis follows the build's devnet features.
+        let dev = State::genesis(policy()).unwrap();
+        assert_eq!(l2_admission_refusal(&da, Some(&dev)).is_none(), cfg!(feature = "devnet-l2-user-txs"));
+    }
+}
+
+#[cfg(test)]
+#[path = "engine/kes_tests.rs"]
+mod kes_tests;

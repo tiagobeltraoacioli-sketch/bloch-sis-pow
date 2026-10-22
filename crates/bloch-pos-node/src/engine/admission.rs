@@ -220,7 +220,7 @@ pub(super) fn check_transfer(
     encoded: usize,
     epoch: u64,
 ) -> Result<(), Refusal> {
-    let (points, outputs, declared, tip, verifications): (Vec<_>, _, _, _, _) = match tx {
+    let (points, outputs, declared, tip, class): (Vec<_>, _, _, _, _) = match tx {
         PosTransaction::Transfer {
             inputs,
             outputs,
@@ -234,7 +234,7 @@ pub(super) fn check_transfer(
             outputs,
             *tx_bytes,
             *tip_millisat_per_gas,
-            inputs.len(),
+            fee_market::eutxo_class_for_keys(epoch, inputs.iter().map(|i| i.pubkey.as_slice())),
         ),
         PosTransaction::TransferV2 {
             inputs,
@@ -255,7 +255,7 @@ pub(super) fn check_transfer(
                 outputs,
                 *tx_bytes,
                 *tip_millisat_per_gas,
-                keys.len(),
+                fee_market::eutxo_class_for_keys(epoch, keys.iter().map(|k| k.pubkey.as_slice())),
             )
         }
         PosTransaction::FundedDeposit(tx) => {
@@ -272,9 +272,6 @@ pub(super) fn check_transfer(
     if declared < encoded as u64 {
         return Err(Refusal::Invalid("transaction underdeclares encoded bytes"));
     }
-    let class = fee_market::TxClass::Eutxo {
-        inputs: verifications as u32,
-    };
     price_bounds(class, declared, tip).map_err(Refusal::Invalid)?;
     let mut seen = BTreeSet::new();
     let mut spent = 0u128;

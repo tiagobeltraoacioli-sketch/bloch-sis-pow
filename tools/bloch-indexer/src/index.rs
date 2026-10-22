@@ -94,6 +94,50 @@ pub struct Stats {
     pub undecodable_txs: u64,
 }
 
+/// Where and why the index stopped applying the log.
+///
+/// A block the archival accepted but this binary cannot apply is not a reorg
+/// and not an I/O fault: re-reading or rebuilding produces the same refusal,
+/// because the consensus rules compiled in here disagree with the chain's.
+/// The one cause seen so far is a flag day that this build predates (the
+/// native L2 activation at epoch 5850). The index therefore keeps everything
+/// up to the last block it could apply, stops, and says so, instead of
+/// exiting (a systemd restart loop) or rebuilding from genesis on every poll
+/// (tens of minutes of CPU and several GB each time, for the same answer).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Halt {
+    /// Height the refused block would have had.
+    pub height: u64,
+    pub slot: u64,
+    pub epoch: u64,
+    pub block_id: BlockId,
+    pub reason: String,
+}
+
+impl Halt {
+    pub fn describe(&self) -> String {
+        let past_known = match crate::consensus::highest_armed_epoch() {
+            Some(e) if self.epoch >= e => format!(
+                " Epoch {} is at or past the newest activation gate this build knows (epoch {e}); \
+                 a flag day this build predates is the likely cause.",
+                self.epoch
+            ),
+            _ => String::new(),
+        };
+        format!(
+            "halted before height {} (slot {}, epoch {}, block {}): {}.{past_known} Rebuild the \
+             indexer from the node release the network runs (bloch-indexer gates shows this \
+             build's activation schedule) and restart; the index up to height {} is intact.",
+            self.height,
+            self.slot,
+            self.epoch,
+            crate::hex32(&self.block_id),
+            self.reason,
+            self.height.saturating_sub(1)
+        )
+    }
+}
+
 /// The whole index.
 pub struct Index {
     /// The node's selected chain as the index has applied it. `chain[0]` is
@@ -136,6 +180,14 @@ pub struct Index {
     pub replay: Option<CommittedState>,
     pub checked_at: std::time::Instant,
     pub sync_error: Option<String>,
+    /// Set when a block could not be applied (see [`Halt`]); cleared by the
+    /// next sync that applies the whole log.
+    pub halted: Option<Halt>,
+    /// Cross-check the index's live-output count against the replayed
+    /// consensus state after every block (see `try_apply`). On by default;
+    /// switched off only if the opening ledgers already disagree, or by the
+    /// operator (`--no-ledger-check`).
+    pub ledger_check: bool,
 }
 
 impl Index {
@@ -172,6 +224,8 @@ impl Index {
             replay: None,
             checked_at: std::time::Instant::now(),
             sync_error: None,
+            halted: None,
+            ledger_check: true,
         };
         for (op, u) in genesis_outputs {
             ix.eutxo_total_sat += u.value_sat as u128;
@@ -310,14 +364,28 @@ impl Index {
             self.stats.blocks_rolled_back += depth;
         }
 
-        // 3. Re-apply.
+        // 3. Re-apply. A block this build cannot apply halts the index at the
+        //    block before it (see `Halt`); the caller decides whether to keep
+        //    serving the applied prefix.
         let mut applied = 0u64;
         for i in agree_upto..frames.len() {
             let env = reader.envelope_at(i)?;
-            self.try_apply(&env, frames[i].len)?;
+            if let Err(e) = self.try_apply(&env, frames[i].len) {
+                let halt = Halt {
+                    height: self.height() + 1,
+                    slot: env.header.slot,
+                    epoch: bloch_pos_committee::epoch_of(env.header.slot),
+                    block_id: *CommitteeBlockId::of(&env.header).as_bytes(),
+                    reason: e.to_string(),
+                };
+                let msg = halt.describe();
+                self.halted = Some(halt);
+                return Err(io::Error::new(e.kind(), msg));
+            }
             applied += 1;
             if applied % 5000 == 0 { eprintln!("replay: height {} / {}, slot {}", self.height(), frames.len(), self.tip().slot); }
         }
+        self.halted = None;
         Ok((applied, rolled))
     }
 
@@ -327,9 +395,12 @@ impl Index {
     ///
     /// With `replay` initialized (the serving CLI's path), re-execute the state
     /// transition and check the resulting state root before updating tables.
-    /// `ArchiveVerifier` skips cryptographic signature verification; this is
-    /// state-consistency checking of a trusted archive, not independent node
-    /// validation. Fixture callers without replay use bookkeeping alone.
+    /// `ArchiveVerifier` verifies every signature with the node's production
+    /// rules (`bloch_crypto`: static keys under their policy, spend witnesses
+    /// per epoch, KES leaves in the bound v2 form), so replay fails on any
+    /// block the node would refuse. It is still replay of a local archive,
+    /// not a peer-to-peer node. Fixture callers without replay use
+    /// bookkeeping alone.
     pub fn apply(&mut self, env: &BlockEnvelope, frame_len: u32) {
         self.try_apply(env, frame_len).expect("valid index block");
     }
@@ -340,6 +411,10 @@ impl Index {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("transaction decode: {e:?}"))))
             .collect::<io::Result<_>>()?;
         let mut receipts = Vec::new();
+        // Outputs consensus created past the count `created_output_bound`
+        // allows for the transaction's kind: (tx index, vout).
+        let mut unmodeled_outputs: Vec<(usize, u32)> = Vec::new();
+        let all_outputs = &self.all_outputs;
         let post = if let Some(pre) = &self.replay {
             let proposal = bloch_pos_committee::interfaces::ProposalEnvelope {
                 header: env.header.clone(), proposer_sig: env.proposer_sig.clone(),
@@ -348,16 +423,15 @@ impl Index {
                 pre, &proposal, &env.body.attestations, &decoded, |i, state, charge| {
                     let tx = &decoded[i];
                     let id = tx.txid();
-                    let n = match tx {
-                        PosTransaction::Transfer { outputs, .. } | PosTransaction::TransferV2 { outputs, .. } => outputs.len(),
-                        PosTransaction::FundedDeposit(_)
-                        | PosTransaction::FundedDelegate(_)
-                        | PosTransaction::FundedDelegationWithdraw(_)
-                        | PosTransaction::Withdraw { .. } => 1,
-                        _ => 0,
-                    };
+                    let n = created_output_bound(tx);
                     let outputs = (0..n).filter_map(|v| state.utxo(&id, v as u32)
                         .map(|u| (u.value, u.script_hash))).collect::<Vec<_>>();
+                    // A new output past the modelled bound means consensus
+                    // gave this kind a ledger effect the index does not know.
+                    let past = OutPoint { txid: id, vout: n as u32 };
+                    if state.utxo(&id, n as u32).is_some() && !all_outputs.contains_key(&past) {
+                        unmodeled_outputs.push((i, n as u32));
+                    }
                     receipts.push((outputs, charge.base_fee_sat + charge.priority_fee_sat));
                 }).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("state replay: {e:?}")))?;
             if bloch_pos_committee::interfaces::StateReader::state_root(&post) != env.header.state_root {
@@ -365,6 +439,11 @@ impl Index {
             }
             Some(post)
         } else { None };
+        if let Some(&(i, vout)) = unmodeled_outputs.first() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "transaction {i} ({}) created output vout {vout}, past what this indexer models for \
+                 that kind; balances would drift", kind_of(&decoded[i]).name())));
+        }
         // Preflight the complete block before mutating index tables. This also
         // handles a transaction spending an output created earlier in this block.
         let mut staged = HashSet::new();
@@ -381,6 +460,25 @@ impl Index {
                 let op = OutPoint { txid: tx.txid(), vout: v as u32 };
                 if self.all_outputs.contains_key(&op) || !staged.insert(op) {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "output collision"));
+                }
+            }
+        }
+        // Ledger cross-check: after this block the index will hold
+        // `utxo + created - spent` live outputs; consensus says how many it
+        // holds. A difference means a transaction spent or created outputs
+        // this build does not model (a new kind after a flag day, or a kind
+        // whose effect changed). Stop here, loudly, rather than serve
+        // balances that are internally consistent and wrong. O(1): the
+        // committed set is a `BTreeMap` and its iterator knows its length.
+        if let (Some(post), true) = (&post, self.ledger_check) {
+            if let (lo, Some(hi)) = post.utxos().size_hint() {
+                let predicted = self.utxo.len() + staged.len() - consumed.len();
+                if lo == hi && lo != predicted {
+                    let kinds: Vec<String> = decoded.iter().map(|t| kind_of(t).name()).collect();
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                        "ledger drift: consensus holds {lo} live outputs after this block, the index \
+                         would hold {predicted}; transaction kinds in the block: [{}]",
+                        kinds.join(", "))));
                 }
             }
         }
@@ -715,6 +813,11 @@ fn push_history(
 
 fn kind_of(tx: &PosTransaction) -> TxKind {
     match tx {
+        PosTransaction::L2Settlement(_) => TxKind::L2Settlement,
+        PosTransaction::L2SettlementAsync(_) => TxKind::L2SettlementAsync,
+        PosTransaction::L2Deposit(_) => TxKind::L2Deposit,
+        PosTransaction::L2DataAvailability(_) => TxKind::L2DataAvailability,
+        PosTransaction::L2WithdrawClaim(_) => TxKind::L2WithdrawClaim,
         PosTransaction::Transfer { .. } => TxKind::Transfer,
         PosTransaction::TransferV2 { .. } => TxKind::TransferV2,
         PosTransaction::Deposit { .. } => TxKind::Deposit,
@@ -729,6 +832,12 @@ fn kind_of(tx: &PosTransaction) -> TxKind {
         PosTransaction::ExitV2 { .. } => TxKind::ExitV2,
         PosTransaction::RandaoRecommit { .. } => TxKind::RandaoRecommit,
         PosTransaction::SlashingEvidence(_) => TxKind::SlashingEvidence,
+        // Post-quantum migration (0x18-0x1A). Names match the node's RPC.
+        PosTransaction::WithdrawalCredentialRotation(_) => TxKind::WithdrawalCredentialRotation,
+        PosTransaction::RescueCommit(_) => TxKind::PqRescueCommit,
+        PosTransaction::KesRegister { .. } => TxKind::KesRegister,
+        PosTransaction::KesRotate { .. } => TxKind::KesRotate,
+        PosTransaction::RescueReveal(_) => TxKind::PqRescueReveal,
     }
 }
 
@@ -761,13 +870,167 @@ fn transfer_parts(tx: &PosTransaction) -> (Vec<OutPoint>, Vec<(u64, ScriptHash)>
             d.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
             vec![(d.change.value, d.change.script_hash)], d.tx_bytes, d.tip_millisat_per_gas,
         ),
-        _ => (Vec::new(), Vec::new(), 0, 0),
+        // Native L2 bridge transactions spend funding UTXOs and create
+        // eUTXOs like a transfer does. The escrowed deposit amount leaves the
+        // spendable set (it is L2 inbox state, not an output). Replay
+        // receipts replace these declared outputs with the outputs consensus
+        // actually created.
+        PosTransaction::L2Deposit(d) => (
+            d.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
+            nonzero_change(d.change.value, d.change.script_hash), d.tx_bytes, d.tip_millisat_per_gas,
+        ),
+        PosTransaction::L2DataAvailability(d) => (
+            d.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
+            nonzero_change(d.change.value, d.change.script_hash), d.tx_bytes, d.tip_millisat_per_gas,
+        ),
+        PosTransaction::L2WithdrawClaim(c) => {
+            let mut outs = vec![(c.sats, c.l1_recipient)];
+            outs.extend(nonzero_change(c.change.value, c.change.script_hash));
+            (
+                c.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
+                outs, c.tx_bytes, c.tip_millisat_per_gas,
+            )
+        }
+        // Post-quantum rescue reveal (0x1A): spends every output of the
+        // revealed key (both script forms) and creates ONE output at vout 0
+        // for `destination_script_hash` worth inputs minus fee. The value is
+        // known only after the fee, so the output comes from the replay
+        // receipt (`created_output_bound` = 1), never from a declaration.
+        PosTransaction::RescueReveal(r) => (
+            r.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
+            Vec::new(), r.tx_bytes, r.tip_millisat_per_gas,
+        ),
+        // No eUTXO inputs. Withdraw-style payouts (FundedDelegationWithdraw,
+        // Withdraw) create an output that only consensus can value; it comes
+        // from the replay receipt (`created_output_bound`).
+        //
+        // NO wildcard arm. A new transaction kind must be classified here
+        // (does it spend eUTXOs? which?) before the indexer compiles; the
+        // flag-day checklist in docs/BLOCH-INDEXER.md says how.
+        PosTransaction::L2Settlement(_)
+        | PosTransaction::L2SettlementAsync(_)
+        | PosTransaction::FundedUndelegate(_)
+        | PosTransaction::FundedDelegationWithdraw(_)
+        | PosTransaction::ValidatorCommissionUpdate(_)
+        | PosTransaction::Deposit { .. }
+        | PosTransaction::Exit { .. }
+        | PosTransaction::Delegate { .. }
+        | PosTransaction::Withdraw { .. }
+        | PosTransaction::ExitV2 { .. }
+        | PosTransaction::RandaoRecommit { .. }
+        | PosTransaction::SlashingEvidence(_)
+        // Credential rotation (0x18) rewrites where a later `Withdraw` pays;
+        // that payout already comes from the receipt. Rescue commit (0x19)
+        // is fee-free state only.
+        | PosTransaction::WithdrawalCredentialRotation(_)
+        | PosTransaction::RescueCommit(_)
+        | PosTransaction::KesRegister { .. }
+        | PosTransaction::KesRotate { .. } => (Vec::new(), Vec::new(), 0, 0),
     }
+}
+
+/// How many outputs (vout `0..n`) consensus can create for one transaction of
+/// this kind. Replay reads exactly these back from the post-state; anything
+/// at vout `n` is reported as unmodelled. NO wildcard arm, for the same
+/// reason as `transfer_parts`.
+fn created_output_bound(tx: &PosTransaction) -> usize {
+    match tx {
+        PosTransaction::Transfer { outputs, .. } | PosTransaction::TransferV2 { outputs, .. } => outputs.len(),
+        PosTransaction::FundedDeposit(_)
+        | PosTransaction::FundedDelegate(_)
+        | PosTransaction::FundedDelegationWithdraw(_)
+        | PosTransaction::Withdraw { .. } => 1,
+        // Native L2 bridge: change at vout 0 (deposit, DA); release at vout 0
+        // and change at vout 1 (claim).
+        PosTransaction::L2Deposit(_) | PosTransaction::L2DataAvailability(_) => 1,
+        PosTransaction::L2WithdrawClaim(_) => 2,
+        PosTransaction::RescueReveal(_) => 1,
+        PosTransaction::WithdrawalCredentialRotation(_)
+        | PosTransaction::RescueCommit(_)
+        | PosTransaction::KesRegister { .. }
+        | PosTransaction::KesRotate { .. } => 0,
+        PosTransaction::L2Settlement(_)
+        | PosTransaction::L2SettlementAsync(_)
+        | PosTransaction::FundedUndelegate(_)
+        | PosTransaction::ValidatorCommissionUpdate(_)
+        | PosTransaction::Deposit { .. }
+        | PosTransaction::Exit { .. }
+        | PosTransaction::Delegate { .. }
+        | PosTransaction::ExitV2 { .. }
+        | PosTransaction::RandaoRecommit { .. }
+        | PosTransaction::SlashingEvidence(_) => 0,
+    }
+}
+
+fn nonzero_change(value: u64, script_hash: ScriptHash) -> Vec<(u64, ScriptHash)> {
+    if value > 0 { vec![(value, script_hash)] } else { Vec::new() }
 }
 
 struct ArchiveVerifier;
 impl bloch_pos_committee::attestation::SignatureVerifier for ArchiveVerifier {
     fn verify_with_key(&self, key: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
         bloch_crypto::crypto::verify(key, root, signature)
+    }
+    fn verify_with_key_under(
+        &self,
+        policy: bloch_pos_committee::attestation::SignaturePolicy,
+        key: &[u8],
+        root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        use bloch_crypto::crypto::SignaturePolicy as C;
+        use bloch_pos_committee::attestation::SignaturePolicy as P;
+        let policy = match policy {
+            P::Compatible => C::Compatible,
+            P::CompatiblePinned => C::CompatiblePinned,
+            P::CanonicalUnbound => C::CanonicalUnbound,
+            P::Bound => C::Bound,
+        };
+        bloch_crypto::crypto::verify_with_policy(policy, key, root, signature)
+    }
+
+    /// HF3 spend witnesses, exactly as the node's production verifier
+    /// (`keys.rs`) judges them. The trait default is fail-closed for suite
+    /// 0x0003, so without this override the first 0x0003 spend after
+    /// `HF3_SLH_SUITE_EPOCH` would fail replay and halt the index at a block
+    /// the network accepted.
+    fn verify_spend_at_epoch(&self, key: &[u8], root: &[u8; 32], signature: &[u8], epoch: u64) -> bool {
+        bloch_crypto::crypto::verify_spend(
+            key,
+            root,
+            signature,
+            bloch_pos_committee::params::hf3_slh_suite_active(epoch),
+        )
+    }
+
+    /// KES leaves, exactly as the node's `HybridVerifier::verify_kes_leaf`:
+    /// the canonical, suite-bound v2 form (review R-2). The trait default
+    /// (v1 `verify_with_key`) would fail replay at the first KES-bound block.
+    fn verify_kes_leaf(&self, leaf_pk: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        bloch_crypto::crypto::verify_bound(leaf_pk, message, signature)
+    }
+}
+
+#[cfg(test)]
+mod hf23_rereview_tests {
+    use super::ArchiveVerifier;
+    use bloch_pos_committee::attestation::SignatureVerifier;
+
+    /// HF23 re-review R-2 (integrated 87feb406). KES leaves are signed in the
+    /// bound v2 form (`KesKey::sign` -> `sign_bound`) and the node verifies
+    /// them with `verify_bound` (`HybridVerifier::verify_kes_leaf`). The
+    /// indexer's replay verifier does not override `verify_kes_leaf`, so the
+    /// trait default runs the v1 `crypto::verify`: from the first KES-bound
+    /// block, a correctly rebuilt indexer fails replay. FAILS on 87feb406.
+    #[test]
+    fn hf23_archive_verifier_must_accept_bound_kes_leaf_signatures() {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        let message = [0x5Au8; 32];
+        let leaf_sig = bloch_crypto::crypto::sign_bound(&sk, &message).unwrap();
+        assert!(bloch_crypto::crypto::verify_bound(&pk, &message, &leaf_sig), "control: the node's leaf rule accepts it");
+        assert!(
+            ArchiveVerifier.verify_kes_leaf(&pk, &message, &leaf_sig),
+            "indexer replay rejects a KES leaf signature the node accepts"
+        );
     }
 }

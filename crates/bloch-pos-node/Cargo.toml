@@ -41,6 +41,10 @@ publish = false
 name = "bloch-pos"
 path = "src/main.rs"
 
+[lib]
+test = false
+doctest = false
+
 [features]
 # Phase timers for the end-to-end replay benchmark (src/replay_bench.rs).
 # OFF by default; with it off every span in engine.rs and in the committee
@@ -48,14 +52,31 @@ path = "src/main.rs"
 # The benchmark runs the SAME code either way — the feature only decides
 # whether the breakdown is available. Never enable it on a producing node.
 perf-timing = ["bloch-pos-committee/perf-timing"]
+# DEVELOPMENT NETWORKS ONLY; see bloch-pos-committee. Refuses non-BPOSMAN3 manifests.
+devnet-randao-recommit = ["bloch-pos-committee/devnet-randao-recommit"]
+# DEVELOPMENT NETWORKS ONLY; see bloch-pos-committee.
+devnet-l2-deposits = ["bloch-pos-committee/devnet-l2-deposits"]
+# DEVELOPMENT NETWORKS ONLY; see bloch-pos-committee (user transactions before DA).
+devnet-l2-user-txs = ["devnet-l2-deposits", "bloch-pos-committee/devnet-l2-user-txs"]
+# QUALIFICATION BUILDS ONLY; see bloch-pos-committee. Refuses funded manifests.
+l2-activation-rehearsal = ["bloch-pos-committee/l2-activation-rehearsal"]
+# QUALIFICATION BUILDS ONLY; the rehearsal with the mainnet policy values.
+l2-activation-rehearsal-mainnet-policy = ["l2-activation-rehearsal", "bloch-pos-committee/l2-activation-rehearsal-mainnet-policy"]
+# QUALIFICATION BUILDS ONLY; see bloch-pos-committee (full-history replay
+# under the pinned ML-DSA rule, params::MLDSA_PIN_ACTIVATION_EPOCH docs).
+mldsa-pin-replay-qualification = ["bloch-pos-committee/mldsa-pin-replay-qualification"]
 
 [dependencies]
+bloch-l2-proof = { path = "../bloch-l2-proof" }
 # The frozen consensus math (pure, sha3-only).
 bloch-pos-committee = { path = "../bloch-pos-committee", features = ["local-state-cache"] }
 # The hybrid ML-DSA-65 ‖ Falcon-1024 suite (M2: keys/ + KeyVerifier). Path
 # dependency, one-way; pulls the PQClean FFI tree, which is why this crate's
 # build stopped being instant at M2 — planned in the integration doc §6.
 bloch-crypto = { path = "../bloch-crypto" }
+# Finality certificates (getfinalitycertificate): wire format + registry proofs.
+# Library/RPC only; no consensus path reads it.
+bloch-finality-cert = { path = "../bloch-finality-cert" }
 sha3 = "0.10"
 
 # Keystore encryption at rest (src/keys.rs, audit I-H1): Argon2id derives the
@@ -107,3 +128,8 @@ sha3 = "0.10"
 [dev-dependencies]
 # Deterministic adversarial signature fixtures in offline-tool tests only.
 pqcrypto-internals = { path = "../pqcrypto-internals" }
+# HF2 sigdet relay-policy tests: exercise every compiled ML-DSA-65 backend
+# (clean + avx2/neon) so the honest-signature check is per-backend.
+pqcrypto-mldsa = { version = "=0.1.2", features = ["avx2", "neon", "std"] }
+pqcrypto-traits = "0.3"
+bloch-mldsa-clean = { path = "../bloch-mldsa-clean" }

@@ -67,7 +67,10 @@ def case(label, directory, sig=None, mode="", repeat=False):
 
     def until(marker):
         nonlocal output
-        deadline = time.monotonic() + 10
+        # Generous margin: under a loaded test host the worker can take
+        # several seconds to react to a signal. The deadline only bounds a
+        # hang; it does not change what is asserted.
+        deadline = time.monotonic() + 60
         while marker not in output and time.monotonic() < deadline:
             if select.select([master], [], [], .05)[0]:
                 output += os.read(master, 4096)

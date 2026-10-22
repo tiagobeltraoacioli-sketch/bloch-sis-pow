@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use bloch_pos_committee::header::BlockEnvelope;
+use sha3::{Digest, Sha3_256};
 
 const META_MAGIC: &[u8; 8] = b"BPOSMETA";
 
@@ -415,6 +416,58 @@ fn index_start(dir: &Path, after_slot: u64, log_len: u64) -> io::Result<Option<S
     Ok(Some(Start::At { offset: hit.offset, expect_slot: Some(hit.slot) }))
 }
 
+/// The exact framed bytes written to one durable log generation. Keeping the
+/// sponge state makes each restart-cache checkpoint independent of log size.
+#[derive(Clone)]
+struct LogFingerprint {
+    bytes: u64,
+    hash: Sha3_256,
+}
+
+impl LogFingerprint {
+    fn new() -> Self { Self { bytes: 0, hash: Sha3_256::new() } }
+
+    fn update(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.bytes = self.bytes.checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::other("block-log fingerprint length overflow"))?;
+        self.hash.update(bytes);
+        Ok(())
+    }
+
+    fn read(path: &Path, len: u64) -> io::Result<Self> {
+        let mut reader = File::open(path)?.take(len);
+        let mut fingerprint = Self::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 { break; }
+            fingerprint.update(&buffer[..count])?;
+        }
+        if fingerprint.bytes != len {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "block-log fingerprint prefix is truncated"));
+        }
+        Ok(fingerprint)
+    }
+
+    fn digest(&self) -> [u8; 32] { self.hash.clone().finalize().into() }
+}
+
+/// Hash only bytes actually accepted by the writer, including short writes.
+/// The caller publishes this fingerprint only after the corresponding fsync.
+struct FingerprintWriter<'a, W> {
+    writer: &'a mut W,
+    fingerprint: &'a mut LogFingerprint,
+}
+
+impl<W: Write> Write for FingerprintWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let count = self.writer.write(bytes)?;
+        self.fingerprint.update(&bytes[..count])?;
+        Ok(count)
+    }
+    fn flush(&mut self) -> io::Result<()> { self.writer.flush() }
+}
+
 pub struct Store {
     dir: PathBuf,
     log: File,
@@ -427,13 +480,16 @@ pub struct Store {
     /// Bytes in `blocks.log`, so an append knows the offset it is writing at
     /// without asking the filesystem.
     log_len: u64,
+    /// None after an ambiguous write failure or while a replacement is staged.
+    /// Recovery re-reads the authoritative log; no unconfirmed digest is used.
+    log_fingerprint: Option<LogFingerprint>,
     /// Exclusive ownership of `dir`, held for as long as the store is. Never
     /// read; its `Drop` is the whole point. See [`DirLock`].
     _lock: DirLock,
     generation: std::sync::Arc<std::sync::RwLock<()>>,
     /// A whole-log replacement being written and published by the dedicated
     /// reorg writer. Ordinary appends join it first, preserving log order.
-    pending_rewrite: Option<mpsc::Receiver<io::Result<u64>>>,
+    pending_rewrite: Option<mpsc::Receiver<io::Result<LogFingerprint>>>,
     /// Completion can be observed after an append had to join the writer.
     rewrite_completed: bool,
 }
@@ -1072,11 +1128,14 @@ fn rewrite_files(
     dir: &Path,
     generation: &std::sync::Arc<std::sync::RwLock<()>>,
     envs: &[BlockEnvelope],
-) -> io::Result<u64> {
+) -> io::Result<LogFingerprint> {
     let destination = dir.join("blocks.log");
     let mut staging = PrivateStagingFile::create_for(&destination)?;
+    let mut fingerprint = LogFingerprint::new();
     for env in envs {
-        write_log_envelope(staging.file_mut(), env)?;
+        write_log_envelope(&mut FingerprintWriter {
+            writer: staging.file_mut(), fingerprint: &mut fingerprint,
+        }, env)?;
     }
     staging.file_mut().sync_all()?;
 
@@ -1087,7 +1146,103 @@ fn rewrite_files(
         .read(true)
         .write(true)
         .open(&index_path)?;
-    publish_staged_rewrite(dir, generation, staging, &mut idx)
+    let len = publish_staged_rewrite(dir, generation, staging, &mut idx)?;
+    if fingerprint.bytes != len {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "rewritten log fingerprint length differs"));
+    }
+    Ok(fingerprint)
+}
+
+/// Durable reorg publication that keeps the log's first `keep_frames` frames
+/// byte-for-byte and appends `tail` after them.
+///
+/// The prefix is copied from the current log file through a fixed-size
+/// buffer instead of being re-encoded from in-memory envelopes, so a reorg no
+/// longer has to clone the whole canonical chain into the writer's heap. The
+/// publication sequence (staging file, fsync, index invalidation, rename,
+/// index rebuild) is the one [`rewrite_files`] uses.
+///
+/// `expected_last` is the block id the last kept frame must carry. The log
+/// and the canonical chain are equal outside a pending rewrite (`Store::append`
+/// joins the writer first, and boot refuses a log whose replay does not reach
+/// every logged block), so a mismatch means that invariant broke; the rewrite
+/// fails closed rather than publishing a log of a different chain.
+fn rewrite_tail_files(
+    dir: &Path,
+    generation: &std::sync::Arc<std::sync::RwLock<()>>,
+    keep_frames: u64,
+    expected_last: Option<[u8; 32]>,
+    tail: &[BlockEnvelope],
+) -> io::Result<LogFingerprint> {
+    let destination = dir.join("blocks.log");
+    let mut source = File::open(&destination)?;
+    let source_len = source.metadata()?.len();
+    let corrupt = |what: &str| io::Error::new(io::ErrorKind::InvalidData, format!("reorg prefix copy: {what}"));
+    // Walk the length prefixes only; bodies are not read except the last kept one.
+    let mut at = 0u64;
+    let mut last: Option<(u64, usize)> = None;
+    for _ in 0..keep_frames {
+        source.seek(SeekFrom::Start(at))?;
+        let mut prefix = [0u8; 4];
+        source.read_exact(&mut prefix)?;
+        let len = u32::from_le_bytes(prefix) as usize;
+        if len > crate::codec::MAX_FIELD_LEN {
+            return Err(corrupt("frame over cap"));
+        }
+        let end = at
+            .checked_add(4)
+            .and_then(|body| body.checked_add(len as u64))
+            .ok_or_else(|| corrupt("frame length overflow"))?;
+        if end > source_len {
+            return Err(corrupt("log shorter than the retained prefix"));
+        }
+        last = Some((at, len));
+        at = end;
+    }
+    match (last, expected_last) {
+        (None, None) => {}
+        (Some((offset, len)), Some(expected)) => {
+            source.seek(SeekFrom::Start(offset.saturating_add(4)))?;
+            let mut payload = Vec::new();
+            read_frame_payload(&mut source, &mut payload, len)?;
+            let env = crate::codec::decode_envelope(&payload)
+                .map_err(|e| corrupt(&e.to_string()))?;
+            if *env.block_id().as_bytes() != expected {
+                return Err(corrupt("last retained frame is not the reorg ancestor"));
+            }
+        }
+        _ => return Err(corrupt("retained frame count disagrees with the ancestor")),
+    }
+
+    let mut staging = PrivateStagingFile::create_for(&destination)?;
+    let mut fingerprint = LogFingerprint::new();
+    source.seek(SeekFrom::Start(0))?;
+    let copied = io::copy(
+        &mut Read::by_ref(&mut source).take(at),
+        &mut FingerprintWriter { writer: staging.file_mut(), fingerprint: &mut fingerprint },
+    )?;
+    if copied != at {
+        return Err(corrupt("short prefix copy"));
+    }
+    drop(source);
+    for env in tail {
+        write_log_envelope(&mut FingerprintWriter {
+            writer: staging.file_mut(), fingerprint: &mut fingerprint,
+        }, env)?;
+    }
+    staging.file_mut().sync_all()?;
+
+    let mut idx = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join("blocks.idx"))?;
+    let len = publish_staged_rewrite(dir, generation, staging, &mut idx)?;
+    if fingerprint.bytes != len {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "rewritten log fingerprint length differs"));
+    }
+    Ok(fingerprint)
 }
 
 /// The short publication transaction shared by synchronous tests/tools and
@@ -1116,6 +1271,20 @@ fn publish_staged_rewrite(
 
 impl Store {
     pub(crate) fn directory(&self) -> &Path { &self.dir }
+
+    /// Constant-sized work on the slot loop. Startup cache validation still
+    /// independently hashes the on-disk prefix before trusting cached state.
+    pub(crate) fn durable_log_fingerprint(&self) -> io::Result<(u64, [u8; 32])> {
+        if self.rewrite_pending() {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "block-log replacement is not yet durable"));
+        }
+        let fingerprint = self.log_fingerprint.as_ref()
+            .ok_or_else(|| io::Error::other("block-log fingerprint unavailable; restart required"))?;
+        if fingerprint.bytes != self.log_len || self.log.metadata()?.len() != self.log_len {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "durable block-log length changed"));
+        }
+        Ok((self.log_len, fingerprint.digest()))
+    }
 
     /// Open (or initialize) a data dir for the network identified by
     /// `genesis_digest`. A dir initialized for any other genesis — or holding
@@ -1178,12 +1347,14 @@ impl Store {
         // Rebuild from header-only log reads; covered length is not identity.
         idx.set_len(0)?;
         repair_index(&mut idx, &dir.join("blocks.log"), log_len)?;
+        let log_fingerprint = LogFingerprint::read(&dir.join("blocks.log"), log_len)?;
         Ok(Store {
             dir: dir.to_path_buf(),
             log,
             idx,
             index_append_enabled: true,
             log_len,
+            log_fingerprint: Some(log_fingerprint),
             _lock,
             generation: std::sync::Arc::clone(&generation),
             pending_rewrite: None,
@@ -1201,8 +1372,24 @@ impl Store {
         // normal completion poll. The consensus thread is otherwise free
         // while the rewrite runs.
         self.finish_pending_rewrite()?;
-        let (frame_len, payload_len) = write_log_envelope(&mut self.log, env)?;
-        self.log.sync_data()?;
+        let mut fingerprint = self.log_fingerprint.take()
+            .ok_or_else(|| io::Error::other("block-log fingerprint unavailable; restart required"))?;
+        let previous = fingerprint.clone();
+        let written = write_log_envelope(&mut FingerprintWriter {
+            writer: &mut self.log, fingerprint: &mut fingerprint,
+        }, env).and_then(|sizes| { self.log.sync_data()?; Ok(sizes) });
+        let (frame_len, payload_len) = match written {
+            Ok(sizes) => sizes,
+            Err(error) => {
+                // A preflight refusal or zero-byte write failure did not
+                // change the log. A partial write or failed fsync must never
+                // leave an apparently usable digest for a restart cache.
+                if fingerprint.bytes == previous.bytes {
+                    self.log_fingerprint = Some(previous);
+                }
+                return Err(error);
+            }
+        };
         // Index AFTER the log is durable. A crash in between leaves the index
         // one record short, which the next `open` fixes and which
         // `blocks_after` already tolerates by scanning the unindexed tail —
@@ -1217,6 +1404,7 @@ impl Store {
         {
             self.log_len += frame_len as u64;
         }
+        self.log_fingerprint = Some(fingerprint);
         // Seek to the end explicitly rather than trusting the handle's cursor:
         // `repair_index` reads records through this same handle, and a record
         // written at a stale cursor would not append to the index, it would
@@ -1248,13 +1436,21 @@ impl Store {
         self.finish_pending_rewrite()?;
         let destination = self.dir.join("blocks.log");
         let mut staging = PrivateStagingFile::create_for(&destination)?;
+        let mut fingerprint = LogFingerprint::new();
         for env in envs {
-            write_log_envelope(staging.file_mut(), env)?;
+            write_log_envelope(&mut FingerprintWriter {
+                writer: staging.file_mut(), fingerprint: &mut fingerprint,
+            }, env)?;
         }
         staging.file_mut().sync_all()?;
         let generation = std::sync::Arc::clone(&self.generation);
-        publish_staged_rewrite(&self.dir, &generation, staging, &mut self.idx)?;
+        self.log_fingerprint = None;
+        let len = publish_staged_rewrite(&self.dir, &generation, staging, &mut self.idx)?;
         self.reopen_after_rewrite()?;
+        if len != fingerprint.bytes || len != self.log_len {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "rewritten log fingerprint length differs"));
+        }
+        self.log_fingerprint = Some(fingerprint);
         Ok(())
     }
 
@@ -1277,6 +1473,32 @@ impl Store {
                 let _ = tx.send(result);
             })?;
         self.pending_rewrite = Some(rx);
+        self.log_fingerprint = None;
+        Ok(())
+    }
+
+    /// [`Store::rewrite_async`] for a reorg: keep the log's first
+    /// `keep_frames` frames as they are on disk and replace everything after
+    /// them with `tail`. Only the tail is held in memory; see
+    /// [`rewrite_tail_files`] for the prefix check.
+    pub fn rewrite_tail_async(
+        &mut self,
+        keep_frames: u64,
+        expected_last: Option<[u8; 32]>,
+        tail: Vec<BlockEnvelope>,
+    ) -> io::Result<()> {
+        self.finish_pending_rewrite()?;
+        let dir = self.dir.clone();
+        let generation = std::sync::Arc::clone(&self.generation);
+        let (tx, rx) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("block-log-reorg-writer".into())
+            .spawn(move || {
+                let result = rewrite_tail_files(&dir, &generation, keep_frames, expected_last, &tail);
+                let _ = tx.send(result);
+            })?;
+        self.pending_rewrite = Some(rx);
+        self.log_fingerprint = None;
         Ok(())
     }
 
@@ -1317,14 +1539,15 @@ impl Store {
         self.complete_rewrite(result?)
     }
 
-    fn complete_rewrite(&mut self, log_len: u64) -> io::Result<()> {
+    fn complete_rewrite(&mut self, fingerprint: LogFingerprint) -> io::Result<()> {
         self.reopen_after_rewrite()?;
-        if self.log_len != log_len {
+        if self.log_len != fingerprint.bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "published block-log length changed before writer completion",
             ));
         }
+        self.log_fingerprint = Some(fingerprint);
         self.rewrite_completed = true;
         Ok(())
     }
@@ -2070,6 +2293,149 @@ mod tests {
         assert_eq!(served, slots, "rebuilt index and authoritative log agree");
         drop(store);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tail_rewrite_keeps_the_prefix_bytes_and_replaces_only_the_suffix() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-tail-rewrite-{}", std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x74; 32]).unwrap();
+        for slot in 1..=5 {
+            store.append(&sample_envelope(slot)).unwrap();
+        }
+        let before = fs::read(dir.join("blocks.log")).unwrap();
+        let ancestor = *sample_envelope(3).block_id().as_bytes();
+
+        store.rewrite_tail_async(3, Some(ancestor), vec![sample_envelope(40), sample_envelope(50)]).unwrap();
+        store.append(&sample_envelope(60)).unwrap();
+        assert!(store.poll_rewrite().unwrap());
+
+        let slots: Vec<_> = store.read_all().unwrap().into_iter()
+            .map(|env| env.header.slot).collect();
+        assert_eq!(slots, vec![1, 2, 3, 40, 50, 60]);
+        let after = fs::read(dir.join("blocks.log")).unwrap();
+        let prefix_len = before.len() - 2 * (before.len() / 5);
+        assert_eq!(&after[..prefix_len], &before[..prefix_len], "kept frames are byte-identical");
+        let served: Vec<_> = Store::blocks_after(&dir, 0, 10).unwrap().into_iter()
+            .map(|bytes| crate::codec::decode_envelope(&bytes).unwrap().header.slot)
+            .collect();
+        assert_eq!(served, slots, "rebuilt index and authoritative log agree");
+
+        // The fingerprint covers the copied prefix too: it must match a
+        // fresh read of the published file, as after a whole-log rewrite.
+        let (len, digest) = store.durable_log_fingerprint().unwrap();
+        let fresh = LogFingerprint::read(&dir.join("blocks.log"), len).unwrap();
+        assert_eq!(digest, fresh.digest());
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tail_rewrite_from_genesis_and_refusal_on_a_foreign_prefix() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-tail-rewrite-refuse-{}", std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x75; 32]).unwrap();
+        for slot in 1..=3 {
+            store.append(&sample_envelope(slot)).unwrap();
+        }
+        // An ancestor that is not the last retained frame: nothing published.
+        let wrong = *sample_envelope(1).block_id().as_bytes();
+        store.rewrite_tail_async(2, Some(wrong), vec![sample_envelope(9)]).unwrap();
+        assert!(store.flush_rewrite().is_err(), "foreign prefix fails closed");
+        let slots: Vec<_> = store.read_all().unwrap().into_iter()
+            .map(|env| env.header.slot).collect();
+        assert_eq!(slots, vec![1, 2, 3], "the old log is untouched");
+        drop(store);
+
+        // Reorg down to genesis keeps no frame at all.
+        let mut store = Store::open(&dir, &[0x75; 32]).unwrap();
+        store.rewrite_tail_async(0, None, vec![sample_envelope(7)]).unwrap();
+        assert!(store.flush_rewrite().unwrap());
+        let slots: Vec<_> = store.read_all().unwrap().into_iter()
+            .map(|env| env.header.slot).collect();
+        assert_eq!(slots, vec![7]);
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn durable_fingerprint_matches_disk_across_appends_replacements_and_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-fingerprint-generations-{}", std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let check = |store: &Store| {
+            let bytes = fs::read(dir.join("blocks.log")).unwrap();
+            assert_eq!(store.durable_log_fingerprint().unwrap(),
+                (bytes.len() as u64, Sha3_256::digest(&bytes).into()));
+        };
+        let mut store = Store::open(&dir, &[0x68; 32]).unwrap();
+        check(&store);
+        for slot in 1..=35 {
+            store.append(&sample_envelope(slot)).unwrap();
+            check(&store);
+        }
+        let original = store.durable_log_fingerprint().unwrap();
+        let replacement: Vec<_> = (101..=135).map(sample_envelope).collect();
+        store.rewrite(&replacement).unwrap();
+        check(&store);
+        let replaced = store.durable_log_fingerprint().unwrap();
+        assert_eq!(original.0, replaced.0, "same-size replacement must change identity");
+        assert_ne!(original.1, replaced.1);
+        store.append(&sample_envelope(136)).unwrap();
+        check(&store);
+
+        store.rewrite_async(vec![sample_envelope(201)]).unwrap();
+        assert_eq!(store.durable_log_fingerprint().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        store.append(&sample_envelope(202)).unwrap(); // joins the replacement
+        check(&store);
+        drop(store);
+        // A crash's partial trailing frame is repaired before seeding the
+        // digest. It must not contaminate a later cached prefix.
+        OpenOptions::new().append(true).open(dir.join("blocks.log")).unwrap()
+            .write_all(&[0xFF, 0x01]).unwrap();
+        let mut store = Store::open(&dir, &[0x68; 32]).unwrap();
+        check(&store);
+        store.append(&sample_envelope(203)).unwrap();
+        check(&store);
+        let before = store.durable_log_fingerprint().unwrap();
+        let mut oversized = sample_envelope(204);
+        oversized.proposer_sig.resize(crate::codec::MAX_FIELD_LEN, 0xAB);
+        assert!(store.append(&oversized).is_err());
+        assert_eq!(store.durable_log_fingerprint().unwrap(), before);
+        store.append(&sample_envelope(205)).unwrap();
+        check(&store);
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fingerprint_stream_accounts_for_short_writes_and_partial_failures() {
+        struct ShortWriter { bytes: Vec<u8>, fail_at: usize }
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.bytes.len() == self.fail_at { return Err(io::Error::other("injected write failure")); }
+                let count = bytes.len().min(3).min(self.fail_at - self.bytes.len());
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let block = sample_envelope(77);
+        for fail_at in [0, 2, 4, 25, usize::MAX] {
+            let mut writer = ShortWriter { bytes: Vec::new(), fail_at };
+            let mut fingerprint = LogFingerprint::new();
+            let result = write_log_envelope(&mut FingerprintWriter {
+                writer: &mut writer, fingerprint: &mut fingerprint,
+            }, &block);
+            assert_eq!(result.is_ok(), fail_at == usize::MAX);
+            assert_eq!(fingerprint.bytes, writer.bytes.len() as u64);
+            assert_eq!(fingerprint.digest(), <[u8; 32]>::from(Sha3_256::digest(&writer.bytes)));
+        }
     }
 
     #[test]

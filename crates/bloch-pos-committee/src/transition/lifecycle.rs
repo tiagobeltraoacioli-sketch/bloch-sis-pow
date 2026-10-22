@@ -37,10 +37,31 @@ impl CommittedState {
             })
             .collect();
         eligible.sort_unstable();
-        for (_, _, _, index) in eligible
-            .into_iter()
-            .take(staking::MAX_ACTIVATIONS_PER_EPOCH)
-        {
+        eligible.truncate(staking::MAX_ACTIVATIONS_PER_EPOCH);
+        if crate::params::hf2_growth_cap_active(next_epoch) && !eligible.is_empty() {
+            // Weight of the closing epoch, as finality counts it (after the
+            // per-validator and cohort caps, before the leak).
+            let w: u128 = self
+                .duty_roster_at(next_epoch.saturating_sub(1))
+                .iter()
+                .map(|v| u128::from(v.effective_stake))
+                .sum();
+            let window_start = next_epoch.saturating_sub(staking::GROWTH_WINDOW_EPOCHS - 1);
+            let used: u128 = self
+                .funded_validators
+                .iter()
+                .filter_map(|i| self.validators.get(i))
+                .filter(|r| r.activation_epoch >= window_start && r.activation_epoch < next_epoch)
+                .map(|r| r.staked_sat)
+                .fold(0u128, u128::saturating_add);
+            let stakes: Vec<u128> = eligible
+                .iter()
+                .map(|(_, _, _, i)| self.validators.get(i).map_or(0, |r| r.staked_sat))
+                .collect();
+            let n = staking::growth_admissions(used, staking::growth_budget_sat(w), &stakes);
+            eligible.truncate(n);
+        }
+        for (_, _, _, index) in eligible {
             if let Some(rec) = self.validators.get_mut(&index) {
                 rec.activation_epoch = next_epoch;
             }
@@ -198,12 +219,41 @@ impl CommittedState {
                 if !Self::slashing_evidence_active(self.epoch) {
                     return Err(TxReject::EvidenceNotActive);
                 }
+                if crate::params::pre_activation_offence_refusal_active(self.epoch)
+                    && crate::slashing::offence_predates_activation(evidence)
+                {
+                    return Err(TxReject::EvidenceNotActive);
+                }
                 let roster = self.consensus_roster_at(self.epoch);
                 self.clone()
                     .apply_slashing_evidence(evidence, 0, &roster, verifier)
                     .map_err(|_| TxReject::StakingRule)
             }
-            PosTransaction::ExitV2 { .. } | PosTransaction::RandaoRecommit { .. } => self
+            // Same gate and rules as the consensus arm, without cloning the
+            // state: `check_kes_register` mutates nothing.
+            PosTransaction::KesRegister { validator, depth, root, signature } => {
+                if !crate::params::kes_registration_open(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
+                self.check_kes_register(*validator, *depth, root, signature, verifier).map(|_| ())
+            }
+            // Same gate and rules as the consensus arm: `check_kes_rotate`
+            // mutates nothing. Judged at this state's epoch, so a rotation
+            // signed for a period the head has left is refused (and evicted).
+            PosTransaction::KesRotate { validator, period, depth, root, signature } => {
+                if !crate::params::kes_registration_open(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
+                self.check_kes_rotate(*validator, *period, *depth, root, signature, verifier).map(|_| ())
+            }
+            PosTransaction::FundedDelegate(_)
+            | PosTransaction::FundedUndelegate(_)
+            | PosTransaction::FundedDelegationWithdraw(_)
+            | PosTransaction::ValidatorCommissionUpdate(_)
+            | PosTransaction::WithdrawalCredentialRotation(_)
+            | PosTransaction::RescueCommit(_)
+            | PosTransaction::RescueReveal(_)
+            | PosTransaction::ExitV2 { .. } | PosTransaction::RandaoRecommit { .. } => self
                 .clone()
                 .apply_transaction(tx, total_active_sat, base_fee, verifier)
                 .map(|_| ()),

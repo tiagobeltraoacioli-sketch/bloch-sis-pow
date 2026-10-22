@@ -135,6 +135,13 @@ pub struct HistoryEntry {
 /// the bytes are one seek away in the log when a caller does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxKind {
+    L2Settlement,
+    L2SettlementAsync,
+    /// Native L2 bridge (0x14-0x16). Their funding inputs and change/release
+    /// outputs are indexed like a transfer's; escrowed amounts are L2 state.
+    L2Deposit,
+    L2DataAvailability,
+    L2WithdrawClaim,
     Transfer,
     TransferV2,
     FundedDeposit,
@@ -152,6 +159,19 @@ pub enum TxKind {
     /// messages in through the roots they were signed over, so nothing
     /// recovers an envelope from it. Recorded as present rather than dropped.
     SlashingEvidence,
+    /// Post-quantum migration (0x18): a validator's withdrawal credential
+    /// moves to a hash-based-suite key. No eUTXO effect.
+    WithdrawalCredentialRotation,
+    /// Lattice-break rescue commitment (0x19). No eUTXO effect, fee-free.
+    PqRescueCommit,
+    /// Lattice-break rescue reveal (0x1A): sweeps every output of one key
+    /// into one output at vout 0.
+    PqRescueReveal,
+    /// HF3 KES registration (0x17): a validator commits its forward-secure
+    /// key tree. No eUTXO effect.
+    KesRegister,
+    /// HF3 KES rotation (0x1B), leaf-authorised. No eUTXO effect.
+    KesRotate,
     /// A tag this build does not know. Recorded, never fatal: an index that
     /// aborts on an unknown tag stops being available exactly when a new
     /// transaction type ships.
@@ -161,6 +181,11 @@ pub enum TxKind {
 impl TxKind {
     pub fn name(&self) -> String {
         match self {
+            TxKind::L2Settlement => "l2_settlement".into(),
+            TxKind::L2SettlementAsync => "l2_settlement_async".into(),
+            TxKind::L2Deposit => "l2_deposit".into(),
+            TxKind::L2DataAvailability => "l2_data_availability".into(),
+            TxKind::L2WithdrawClaim => "l2_withdraw_claim".into(),
             TxKind::Transfer => "transfer".into(),
             TxKind::TransferV2 => "transfer_v2".into(),
             TxKind::FundedDeposit => "funded_deposit".into(),
@@ -175,6 +200,11 @@ impl TxKind {
             TxKind::Exit => "exit".into(),
             TxKind::Delegate => "delegate".into(),
             TxKind::SlashingEvidence => "slashing_evidence".into(),
+            TxKind::WithdrawalCredentialRotation => "withdrawal_credential_rotation".into(),
+            TxKind::PqRescueCommit => "pq_rescue_commit".into(),
+            TxKind::PqRescueReveal => "pq_rescue_reveal".into(),
+            TxKind::KesRegister => "kes_register".into(),
+            TxKind::KesRotate => "kes_rotate".into(),
             TxKind::Unknown(t) => format!("unknown_{t:#04x}"),
         }
     }

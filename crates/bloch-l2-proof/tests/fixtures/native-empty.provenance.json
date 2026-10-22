@@ -1,0 +1,14 @@
+{
+  "classification": "real-groth16-proof-of-deterministic-native-empty-inbox-rehearsal",
+  "native_block_signature_fixture": "deterministic-test-double-not-operational-quorum",
+  "production_source_authority": false,
+  "source_artifact_sha256": "76bf1ef94595bcc410bcb00bd74151cba9c8664d54583af9cd2f9a761c46f4f8",
+  "canonical_proof_sha256": "fd7921662b2e8461a6e84ec2a80a106071748eb9ebe0e932edfd66e5e47207b6",
+  "public_values_sha256": "f4800615c47de92f41d157378ea2068ca8cf82afb117104c7608a6240ef7f408",
+  "wrapper_vk_sha256": "4388a21c687fdd5f218d7e3d13190cac4c5355818d3605fd5fb811df468ee696",
+  "guest_elf_sha256": "8e24512ffa42d7c7e87db8c10df8c2a1d09c3977170e6615d559f9b5f9da8c4b",
+  "qualification_host_sha256": "6896ceb7e2ca81aca468225c34d520251b472f79cc37967b8236baa817983aad",
+  "request_sha256": "3ba0e09dd68c1a933ccd5e9d06d18bb5f3f1e7c5912f8a0b5e427d2a88602447",
+  "prover_source_archive_sha256": "fcdbf465120d640c70d44769e5b0e4b2b10fc14da2b6de13e7024b552cbaaf11",
+  "program_bn254": "00f47fd903d685e85cec17ba027d9bdbab3f51c2ee5f92c078b5e03ca6c3a41a"
+}

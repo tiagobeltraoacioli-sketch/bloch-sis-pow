@@ -126,11 +126,40 @@ def const_pattern(name: str) -> re.Pattern:
     )
 
 
+def constant_match(source: str, name: str) -> re.Match:
+    """Select the production definition, without editing a devnet override.
+
+    This is deliberately not a Rust cfg evaluator. Accept only an unconditional
+    declaration or the exact RANDAO production/devnet pair used by this tree;
+    unfamiliar attributes and ambiguous duplicates require a tool update.
+    """
+    hits = list(const_pattern(name).finditer(source))
+
+    def attributes(hit: re.Match) -> list[str]:
+        attrs = []
+        for line in reversed(source[:hit.start()].splitlines()):
+            line = line.strip()
+            if not line or line.startswith("//"):
+                continue
+            if line.startswith("#") or line.endswith("]"):
+                attrs.append(line)
+            else:
+                break
+        return attrs
+
+    guards = [attributes(hit) for hit in hits]
+    if len(hits) == 1 and guards == [[]]:
+        return hits[0]
+    production = ['#[cfg(not(feature = "devnet-randao-recommit"))]']
+    devnet = ['#[cfg(feature = "devnet-randao-recommit")]']
+    if name == "RANDAO_RECOMMIT" and len(hits) == 2 and production in guards and devnet in guards:
+        return hits[guards.index(production)]
+    die(f"{name}_ACTIVATION_EPOCH has ambiguous or unsupported declarations in {PARAMS}; "
+        f"found {len(hits)}, attributes={guards}")
+
+
 def read_constant(source: str, name: str) -> str:
-    hits = const_pattern(name).findall(source)
-    if len(hits) != 1:
-        die(f"{name}_ACTIVATION_EPOCH must be declared exactly once in {PARAMS}; found {len(hits)}")
-    return hits[0]
+    return constant_match(source, name).group(1)
 
 
 def as_epoch(value: str) -> int | None:
@@ -219,15 +248,14 @@ def set_runbook_value(text: str, value: str) -> str:
 def arm_source(source: str, epoch: int) -> str:
     out = source
     for gate in GATES:
-        current = read_constant(out, gate)
+        match = constant_match(out, gate)
+        current = match.group(1)
         if current != "u64::MAX":
             die(
                 f"{gate}_ACTIVATION_EPOCH is already {current}; this tool arms an "
                 "unarmed tree only. A second change of the epoch is a new flag day."
             )
-        out = const_pattern(gate).sub(
-            f"pub const {gate}_ACTIVATION_EPOCH: u64 = {epoch};", out, count=1
-        )
+        out = out[:match.start(1)] + str(epoch) + out[match.end(1):]
     for gate in PINNED_MAX:
         if read_constant(out, gate) != "u64::MAX":
             die(f"{gate}_ACTIVATION_EPOCH must stay u64::MAX (ADR-041 D5)")

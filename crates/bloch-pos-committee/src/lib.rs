@@ -118,6 +118,7 @@ pub mod forkchoice;
 pub mod gossip;
 pub mod header;
 pub mod interfaces;
+pub mod kes;
 pub mod params;
 // Instrumentation only, and compiled out unless `perf-timing` is on — see
 // the module docs. No consensus rule reads it.
@@ -145,9 +146,14 @@ pub mod schedule;
 pub mod slashing;
 pub mod derive;
 pub mod transition;
+pub mod l2_settlement;
 pub mod ws;
+pub mod wire_alloc;
+pub mod hard_forks;
 
-pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
+pub use attestation::{
+    Attestation, AttestationData, PolicyVerifier, RejectReason, SignaturePolicy, SignatureVerifier,
+};
 pub use beacon::{mix_in, process_reveal, BeaconError, RandaoChain, RevealState};
 pub use forkchoice::{BlockTree, LatestMessage, Store};
 pub use gossip::{
@@ -184,7 +190,7 @@ pub use staking::{
 pub use state_root::{
     build_state_tree, state_root, verify_inclusion, BaseFeeRecord, CheckpointRecord,
     ConsensusState, DelegationRecord, DelegatorFeeRecord, DepositQueueRecord, EutxoEntry,
-    FcEquivocatorRecord, FcMessageRecord, FcRecentVoteRecord, FinalityRecord, InclusionProof, LeakRecord,
+    FcEquivocatorRecord, FcMessageRecord, FcRecentVoteRecord, FinalityRecord, FinalitySetRecord, InclusionProof, LeakRecord,
     ParticipationRecord, PendingFeeRecord, PendingVoteRecord, RandaoMix, Smt, STATE_COMPONENT_TAGS,
 };
 pub use header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, DecodeError, VERSION_G4};

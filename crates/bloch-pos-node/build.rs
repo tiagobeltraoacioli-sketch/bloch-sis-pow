@@ -549,7 +549,26 @@ fn main() {
         }
     };
 
-    println!("cargo:rustc-env=BLOCH_BUILD_VERSION={pkg} ({commit}{dirty})");
+    // Consensus-relevant development features are part of the build identity.
+    let mut devnet = String::new();
+    if std::env::var_os("CARGO_FEATURE_DEVNET_RANDAO_RECOMMIT").is_some() {
+        devnet.push_str("+devnet-randao-recommit");
+    }
+    if std::env::var_os("CARGO_FEATURE_DEVNET_L2_DEPOSITS").is_some() {
+        devnet.push_str("+devnet-l2-deposits");
+    }
+    if std::env::var_os("CARGO_FEATURE_DEVNET_L2_USER_TXS").is_some() {
+        devnet.push_str("+devnet-l2-user-txs");
+    }
+    if std::env::var_os("CARGO_FEATURE_L2_ACTIVATION_REHEARSAL").is_some() {
+        let epoch = std::env::var("BLOCH_L2_REHEARSAL_ACTIVATION_EPOCH").unwrap_or_default();
+        devnet.push_str(&format!("+l2-activation-rehearsal-e{epoch}"));
+        if std::env::var_os("CARGO_FEATURE_L2_ACTIVATION_REHEARSAL_MAINNET_POLICY").is_some() {
+            devnet.push_str("+mainnet-policy");
+        }
+    }
+    println!("cargo:rerun-if-env-changed=BLOCH_L2_REHEARSAL_ACTIVATION_EPOCH");
+    println!("cargo:rustc-env=BLOCH_BUILD_VERSION={pkg} ({commit}{dirty}){devnet}");
 
     // ── The machine-readable half, for `getbuildinfo` ──────────────────────
     //

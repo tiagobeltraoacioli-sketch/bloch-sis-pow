@@ -139,6 +139,259 @@ pub trait SignatureVerifier {
     /// that checked one half for spending and two for attesting would make
     /// spending cheaper to forge than attesting.
     fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool;
+
+    /// [`Self::verify_with_key`] under an explicit [`SignaturePolicy`]
+    /// (audit e9b52781: canonical encodings and suite-bound context).
+    ///
+    /// The default forwards to `verify_with_key` and is correct ONLY for
+    /// verifiers with no notion of byte encodings (test doubles, the
+    /// accept-all producer probe). The real PQ verifier and every wrapper
+    /// around one MUST override it — a wrapper left on the default would
+    /// silently apply the compatibility rule after the flag day.
+    fn verify_with_key_under(
+        &self,
+        policy: SignaturePolicy,
+        pubkey: &[u8],
+        signing_root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        let _ = policy;
+        self.verify_with_key(pubkey, signing_root, signature)
+    }
+
+    /// HF3: verify an eUTXO **spend** witness at the block's `epoch`.
+    ///
+    /// The transition calls this — and only for transfer witnesses (V1
+    /// inputs, V2 key-table entries) — once `params::hf3_slh_suite_active`
+    /// holds; below that gate it calls [`Self::verify_with_key`] directly, so
+    /// no implementation can change a pre-HF3 verdict. The production
+    /// verifier maps it to `bloch_crypto::crypto::verify_at_epoch`, which
+    /// additionally accepts suite 0x0003 (SLH-DSA-SHAKE-128s ‖ Falcon-1024,
+    /// both halves). Validator keys (attestations, proposals, deposits,
+    /// funded flows) stay on `verify_with_key`: HF3 opens the suite for
+    /// spending only.
+    ///
+    /// The default is fail-closed for the new suite: it ignores `epoch` and
+    /// answers exactly as `verify_with_key`, so a verifier that has not opted
+    /// in never accepts anything new. Wrappers that budget or cache
+    /// `verify_with_key` must forward this too, or they silently disable HF3.
+    fn verify_spend_at_epoch(
+        &self,
+        pubkey: &[u8],
+        signing_root: &[u8; 32],
+        signature: &[u8],
+        epoch: u64,
+    ) -> bool {
+        let _ = epoch;
+        self.verify_with_key(pubkey, signing_root, signature)
+    }
+
+    /// Verify a KES signature (`crate::kes`): `signature` over `message` (the
+    /// already bound `kes::leaf_message`) by `public`'s leaf of global period
+    /// `period`. The default is the full check — decode, leaf index, Merkle
+    /// path, then [`Self::verify_with_key`] on the leaf key, so wrappers that
+    /// cache or budget `verify_with_key` cover KES leaves too. It is a trait
+    /// method, not a free function every caller runs, so a verifier that
+    /// accepts every signature accepts these too: the producer's post-state
+    /// probe carries an EMPTY proposer signature, which the structural checks
+    /// would refuse before any key is consulted (devnet4 halted on exactly
+    /// that at its KES activation, 2026-10-14; fixed there by 694a5960).
+    fn verify_kes(&self, public: &crate::kes::KesPublic, period: u64, message: &[u8; 32], signature: &[u8]) -> bool {
+        crate::kes::verify(self, public, period, message, signature)
+    }
+
+    /// Verify one KES LEAF signature (`crate::kes::verify` calls this after
+    /// the Merkle path checks out). KES leaves are signed in the canonical,
+    /// suite-bound v2 form (`bloch_crypto::crypto::sign_bound`) from the
+    /// first KES signature, independent of any signature-policy flag day
+    /// (review F-1: the v1 form would die at `SIG_CANONICAL`). The real
+    /// verifier (`bloch-pos-node` `HybridVerifier`) overrides this with
+    /// `verify_bound`; every wrapper (caching, budgeting, policy-pinning)
+    /// MUST forward it to its inner verifier unchanged. The default — the
+    /// plain `verify_with_key` — exists for test doubles that model no
+    /// encoding.
+    fn verify_kes_leaf(&self, leaf_pk: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        self.verify_with_key(leaf_pk, message, signature)
+    }
+
+    /// Deterministic native L2 proof check, using only parent-committed policy.
+    /// Older verifier implementations cannot silently admit the new transaction.
+    fn verify_l2_settlement(&self, _policy: &[u8; 32], _program: &[u8; 32],
+        _values: &[u8], _proof: &[u8]) -> bool { false }
+}
+
+/// Which hybrid-signature byte forms and signing context are admitted.
+/// Mirrors `bloch_crypto::crypto::SignaturePolicy` (this crate stays free of
+/// the PQ stack; the node maps one onto the other).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SignaturePolicy {
+    /// Historical consensus rule: every byte form `crypto::verify` accepts
+    /// (headerless, zero-padded Falcon, recombined halves, unbound suite),
+    /// ML-DSA half judged by the CPU-dispatching backend.
+    Compatible,
+    /// The historical byte forms, ML-DSA half judged by the pinned,
+    /// platform-independent FIPS 204 verifier (`crypto::verify_pinned`).
+    /// Consensus from [`crate::params::MLDSA_PIN_ACTIVATION_EPOCH`].
+    CompatiblePinned,
+    /// Today's context-free signing math in its one canonical byte form.
+    /// Opt-in verification policy (bloch-crypto); no consensus or mempool
+    /// path selects it.
+    CanonicalUnbound,
+    /// Canonical byte form AND the v2 per-suite signing context (Falcon half
+    /// bound to its ML-DSA half). Consensus from
+    /// [`crate::params::SIG_CANONICAL_ACTIVATION_EPOCH`].
+    Bound,
+}
+
+impl SignaturePolicy {
+    /// The consensus rule for signatures judged in `epoch` (the judged
+    /// block's committed epoch, never a clock).
+    pub fn consensus(epoch: u64) -> Self {
+        if crate::params::sig_canonical_active(epoch) {
+            SignaturePolicy::Bound
+        } else if crate::params::mldsa_pin_active(epoch) {
+            SignaturePolicy::CompatiblePinned
+        } else {
+            SignaturePolicy::Compatible
+        }
+    }
+
+    /// The rule for TRANSACTION witnesses (every L1 transaction users,
+    /// exchanges and validators sign: transfers, deposits, withdrawals,
+    /// delegation/lifecycle transactions, L2 bridge deposits and withdrawal
+    /// claims) judged in `epoch`.
+    ///
+    /// OWNER DECISION (HF2 scope): the canonical/suite-bound rule
+    /// ([`crate::params::SIG_CANONICAL_ACTIVATION_EPOCH`]) applies to
+    /// consensus messages only (votes, proposer signatures, slashing
+    /// evidence, KES leaves). Transactions keep accepting exactly today's v1
+    /// encodings (headerless, padded Falcon, recombined halves) before and
+    /// after it, so no wallet, exchange or pre-signed transaction is affected.
+    /// The only thing that ever changes here is the ML-DSA BACKEND
+    /// ([`Self::CompatiblePinned`] from `MLDSA_PIN_ACTIVATION_EPOCH`): the
+    /// FIPS 204 reference behaviour, which every shipped signer satisfies.
+    pub fn transaction(epoch: u64) -> Self {
+        Self::transaction_for(
+            crate::params::mldsa_pin_active(epoch),
+            crate::params::sig_canonical_active(epoch),
+        )
+    }
+
+    /// [`Self::transaction`] as a pure function of the two gates. Never a
+    /// canonical policy, whatever the gates say.
+    pub fn transaction_for(mldsa_pin_active: bool, sig_canonical_active: bool) -> Self {
+        if mldsa_pin_active || sig_canonical_active {
+            SignaturePolicy::CompatiblePinned
+        } else {
+            SignaturePolicy::Compatible
+        }
+    }
+
+    /// The stricter of two policies. `Bound` dominates (its signing context
+    /// is what consensus will demand), then `CanonicalUnbound`, then
+    /// `CompatiblePinned`, then `Compatible` (each admits a subset of the
+    /// next one's signatures; both canonical policies use the pinned ML-DSA
+    /// verifier). Lets an outer policy wrapper sit around the transition's own
+    /// wrapper without the inner one loosening it.
+    pub fn strictest(self, other: Self) -> Self {
+        use SignaturePolicy::*;
+        match (self, other) {
+            (Bound, _) | (_, Bound) => Bound,
+            (CanonicalUnbound, _) | (_, CanonicalUnbound) => CanonicalUnbound,
+            (CompatiblePinned, _) | (_, CompatiblePinned) => CompatiblePinned,
+            (Compatible, Compatible) => Compatible,
+        }
+    }
+
+    /// One stable byte per policy, for callers that key caches on a verdict.
+    pub fn tag(self) -> u8 {
+        match self {
+            SignaturePolicy::Compatible => 0,
+            SignaturePolicy::CanonicalUnbound => 1,
+            SignaturePolicy::Bound => 2,
+            SignaturePolicy::CompatiblePinned => 3,
+        }
+    }
+}
+
+/// Pins a [`SignaturePolicy`] onto a verifier: its `verify_with_key` is the
+/// inner verifier's `verify_with_key_under(policy, ..)`, and an explicit
+/// policy passed through it is combined with [`SignaturePolicy::strictest`]. Wrapping is how the
+/// state transition applies the epoch's rule to every call site below it
+/// without threading the epoch through each one.
+pub struct PolicyVerifier<'a> {
+    inner: &'a dyn SignatureVerifier,
+    policy: SignaturePolicy,
+}
+
+impl<'a> PolicyVerifier<'a> {
+    pub fn new(inner: &'a dyn SignatureVerifier, policy: SignaturePolicy) -> Self {
+        PolicyVerifier { inner, policy }
+    }
+
+    /// The consensus rule for `epoch`.
+    pub fn consensus(inner: &'a dyn SignatureVerifier, epoch: u64) -> Self {
+        Self::new(inner, SignaturePolicy::consensus(epoch))
+    }
+
+    pub fn policy(&self) -> SignaturePolicy {
+        self.policy
+    }
+}
+
+impl SignatureVerifier for PolicyVerifier<'_> {
+    fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool {
+        self.inner.verify_with_key_under(self.policy, pubkey, signing_root, signature)
+    }
+
+    fn verify_with_key_under(
+        &self,
+        policy: SignaturePolicy,
+        pubkey: &[u8],
+        signing_root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        self.inner
+            .verify_with_key_under(self.policy.strictest(policy), pubkey, signing_root, signature)
+    }
+
+    /// The whole KES check (decode, path, leaf) is delegated to the inner
+    /// verifier unchanged, so a verifier that accepts every signature (the
+    /// producer's post-state probe) still does so through this wrapper.
+    fn verify_kes(&self, public: &crate::kes::KesPublic, period: u64, message: &[u8; 32], signature: &[u8]) -> bool {
+        self.inner.verify_kes(public, period, message, signature)
+    }
+
+    /// KES leaves are consensus messages signed in the v2 bound form from the
+    /// first KES signature, independent of any policy flag day: forwarded to
+    /// the inner verifier unchanged (never tightened or loosened here).
+    fn verify_kes_leaf(&self, leaf_pk: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        self.inner.verify_kes_leaf(leaf_pk, message, signature)
+    }
+
+    /// HF3 spends through the transaction policy wrapper. A suite-0x0003
+    /// witness has no ML-DSA half, and the ML-DSA backend is the only thing a
+    /// transaction policy selects, so it is judged by the inner verifier's
+    /// spend rule. Every other key is judged exactly as [`Self::verify_with_key`]
+    /// under this wrapper's policy, so HF3 never changes a lattice verdict and
+    /// the HF2 policy is never bypassed through the spend path.
+    fn verify_spend_at_epoch(
+        &self,
+        pubkey: &[u8],
+        signing_root: &[u8; 32],
+        signature: &[u8],
+        epoch: u64,
+    ) -> bool {
+        if crate::transition::pq_migration::key_suite(pubkey) == Some(crate::params::SUITE_SLHDSA128S_FALCON1024) {
+            self.inner.verify_spend_at_epoch(pubkey, signing_root, signature, epoch)
+        } else {
+            self.verify_with_key(pubkey, signing_root, signature)
+        }
+    }
+
+    fn verify_l2_settlement(&self, policy: &[u8; 32], program: &[u8; 32], values: &[u8], proof: &[u8]) -> bool {
+        self.inner.verify_l2_settlement(policy, program, values, proof)
+    }
 }
 
 /// Resolves a validator index to its registered public key.
@@ -194,6 +447,31 @@ pub trait KeyLookup {
     /// such index. `None` must be treated as a verification failure by the
     /// caller — never as "skip the check".
     fn pubkey(&self, validator: u32) -> Option<&[u8]>;
+
+    /// The validator's forward-secure key (`crate::kes`) in force for global
+    /// KES period `period` (`crate::kes::KesEntry::in_force`), if any. Only
+    /// committed state carries KES keys; other lookups have none.
+    fn kes_public(&self, _validator: u32, _period: u64) -> Option<crate::kes::KesPublic> {
+        None
+    }
+
+    /// The network domain KES leaf signatures are bound to
+    /// (`crate::kes::leaf_message`): the committed admission domain, zero when
+    /// the manifest set none (the same value `KesRegister` is signed over).
+    /// `None` — every lookup that is not committed state — makes every KES
+    /// signature fail closed.
+    fn kes_network_domain(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    /// Whether KES binds and since when (`CommittedState::kes_enforced_from`):
+    /// `Some(None)` not yet bound (static keys sign), `Some(Some(e))` bound
+    /// from epoch `e`. `None` — every lookup that is not committed state —
+    /// means "cannot tell": past the compiled enforcement gate every
+    /// signature check through it fails closed.
+    fn kes_enforced_from(&self) -> Option<Option<u64>> {
+        None
+    }
 }
 
 /// Why an attestation was rejected. Distinct variants because "invalid" alone
@@ -256,10 +534,20 @@ pub fn validate(
     // The registry read, last, beside the verify it feeds. A committee member
     // with no registry key cannot be dismissed as a bad signature: it means
     // this registry does not know the validator, which is a different fact.
-    let Some(pubkey) = keys.pubkey(att.validator) else {
+    // From KES enforcement on, the vote must carry the leaf of its target
+    // epoch's period (`crate::kes::verify_validator`); before it, this is
+    // exactly the static-key check it always was.
+    let Some(valid) = crate::kes::verify_validator(
+        keys,
+        verifier,
+        att.validator,
+        att.data.target_epoch,
+        &att.data.signing_root(),
+        &att.signature,
+    ) else {
         return Err(RejectReason::UnknownValidator);
     };
-    if !verifier.verify_with_key(pubkey, &att.data.signing_root(), &att.signature) {
+    if !valid {
         return Err(RejectReason::BadSignature);
     }
     Ok(())

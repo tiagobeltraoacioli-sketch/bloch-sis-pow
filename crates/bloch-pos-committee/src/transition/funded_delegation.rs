@@ -10,6 +10,13 @@ pub const FUNDED_UNDELEGATE_TAG: u8 = 0x0f;
 pub const FUNDED_DELEGATION_WITHDRAW_TAG: u8 = 0x10;
 pub const VALIDATOR_COMMISSION_UPDATE_TAG: u8 = 0x11;
 
+/// Maximum total delegated principal accepted by one validator. Pending,
+/// active, cooling-down, and withdrawable positions reserve this capacity
+/// until withdrawal. Own bonded stake is not delegated principal.
+/// Enforced only behind the complete funded-delegation activation gate.
+pub const MAX_FUNDED_DELEGATION_PER_VALIDATOR_SAT: u128 =
+    500_000_000 * tokenomics_v4::SAT_PER_BLOCH;
+
 const KEY_BYTES: usize = funded::ADMISSION_PQ_KEY_BYTES;
 const SIGNATURE_MAX: usize = funded::ADMISSION_PQ_SIGNATURE_MAX;
 const HYBRID_HEADER: [u8; 4] = [0xb1, 0x0c, 1, 0];
@@ -80,6 +87,7 @@ pub enum FundedDelegationReject {
     Position,
     Ownership,
     Stake,
+    DelegationLimit,
     MissingInput,
     FeeCap,
     Conservation,
@@ -423,7 +431,33 @@ impl ValidatorCommissionUpdate {
     }
 }
 
+/// Read-only, committed position data. Inactivity alone does not permit withdrawal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FundedDelegationView {
+    pub delegation: Delegation,
+    pub owner: [u8; 32],
+    pub activated_sat: u128,
+    pub inactive_since: Option<u64>,
+    pub withdrawable_epoch: Option<u64>,
+    pub withdrawn: bool,
+}
+
 impl CommittedState {
+    pub fn funded_delegation_view(&self, position: u32) -> Option<FundedDelegationView> {
+        let delegation = *self.delegations.get(position as usize)?;
+        let owner = *self.funded_delegation_owners.get(&delegation.delegator)?;
+        let (inactive, withdrawn) = self.funded_delegation_lifecycle
+            .get(&position).copied().unwrap_or((u64::MAX, false));
+        let inactive_since = (inactive != u64::MAX).then_some(inactive);
+        Some(FundedDelegationView {
+            delegation, owner,
+            activated_sat: delegation::Registry::resolve(&self.delegations, self.epoch)
+                .activated_sat(&delegation),
+            inactive_since,
+            withdrawable_epoch: inactive_since.and_then(|e| e.checked_add(staking::WITHDRAWAL_DELAY_EPOCHS)),
+            withdrawn,
+        })
+    }
     fn funded_owner_matches(
         &self,
         delegator_id: u32,
@@ -459,6 +493,20 @@ impl CommittedState {
         let record = self.validators.get(&validator).ok_or(R::Validator)?;
         if record.slashed || record.exit_epoch != u64::MAX || record.activation_epoch > self.epoch {
             return Err(R::Validator);
+        }
+        let reserved = self.delegations.iter().enumerate()
+            .filter(|(position, delegation)| {
+                delegation.validator == validator
+                    && !self.funded_delegation_lifecycle
+                        .get(&(*position as u32))
+                        .is_some_and(|(_, withdrawn)| *withdrawn)
+            })
+            .try_fold(0u128, |total, (_, delegation)| total.checked_add(delegation.amount_sat))
+            .ok_or(R::Arithmetic)?;
+        if reserved.checked_add(tx.amount_sat).ok_or(R::Arithmetic)?
+            > MAX_FUNDED_DELEGATION_PER_VALIDATOR_SAT
+        {
+            return Err(R::DelegationLimit);
         }
         if base_fee > tx.max_base_fee_millisat_per_gas {
             return Err(R::FeeCap);

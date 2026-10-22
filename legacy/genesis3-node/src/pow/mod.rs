@@ -447,21 +447,21 @@ mod tests {
     }
 
     #[test]
-    fn canonical_mine_verify_roundtrip_at_k8() {
-        // (d) height-aware mine → verify roundtrip at a post-activation
-        // height, plus the subset property through the node seam.
+    fn canonical_mine_verify_roundtrip_at_low_difficulty() {
+        // At low difficulty, the height-aware selector keeps k=4 even after
+        // activation. The explicit k=8 roundtrip is tested in bloch-sis-pow.
         let bits = target_to_bits(&Target::MAX);
         let h = CANONICAL_K_ACTIVATION_HEIGHT;
 
         let (nonce, s) = mine_sis_pow(K8_E2E_PREIMAGE, bits, h, K8_E2E_START_NONCE, 4096)
-            .expect("pinned window must contain a k=8 solution — if solver \
+            .expect("pinned window must contain a solution — if solver \
                      internals changed, re-run the sf1_search utility");
 
-        // Verifies at the height it was mined for (k = 8)...
+        assert_eq!(canonical_residual_coeffs(h, bits), TESTNET_RESIDUAL_COEFFS);
+        // Verifies at the height it was mined for (k = 4)...
         assert!(verify_sis_pow(K8_E2E_PREIMAGE, nonce, &s, bits, h).is_ok());
         assert!(verify_sis_pow(K8_E2E_PREIMAGE, nonce, &s, bits, h + 1).is_ok());
-        // ...and below H too (k = 4 is a prefix subset of k = 8): un-upgraded
-        // peers accept post-fork blocks — the soft-fork no-partition property.
+        // ...and below H too: low-difficulty witnesses use the same width.
         assert!(verify_sis_pow(K8_E2E_PREIMAGE, nonce, &s, bits, 0).is_ok());
         assert!(verify_sis_pow_testnet(K8_E2E_PREIMAGE, nonce, &s, bits).is_ok());
         // Tampering the nonce breaks it at the canonical height.
@@ -469,14 +469,21 @@ mod tests {
     }
 
     #[test]
-    fn k4_mined_block_rejected_at_canonical_height() {
-        // (b) at the node seam: a k=4 (pre-fork style) witness must be
-        // rejected by the height-aware verify at/above H. A k=4 solution
+    fn k4_witness_rejected_when_difficulty_selects_k8() {
+        // At the node seam, a k=4 witness must fail the residual check when
+        // both height and difficulty select k=8. A k=4 solution
         // sneaks past k=8 with probability ≈ 1/4096, so mine until one fails
         // (more than 8 mines has probability ≈ 4096^-8 — never).
         let preimage = b"bloch-sf1-k4-rejected-at-h";
-        let bits = target_to_bits(&Target::MAX);
-        let h = CANONICAL_K_ACTIVATION_HEIGHT;
+        // The difficulty selector uses the legacy compact decoder, whose
+        // representable exponent stops at 32. Target::MAX encodes with 33
+        // and would select k=8 through that decoder's invalid-target fallback.
+        let bits = 0x203fffc0;
+        let strict_bits = 0x0500ffff;
+        let h = K_RULE_ACTIVATION_HEIGHT;
+        assert_eq!(canonical_residual_coeffs(h, bits), TESTNET_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(h - 1, strict_bits), TESTNET_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(h, strict_bits), CANONICAL_RESIDUAL_COEFFS);
 
         let mut rejected = None;
         for i in 0..8u64 {
@@ -484,7 +491,17 @@ mod tests {
                 .expect("k=4 testnet regime must be brute-force mineable");
             // Height-aware verify agrees with the testnet verify below H.
             assert!(verify_sis_pow(preimage, nonce, &s, bits, h - 1).is_ok());
-            if verify_sis_pow(preimage, nonce, &s, bits, h).is_err() {
+            assert!(verify_sis_pow(preimage, nonce, &s, bits, h).is_ok());
+            // A hard target can reject the auxiliary hash before activation,
+            // but must not reject these four valid residual coefficients.
+            assert!(!matches!(
+                verify_sis_pow(preimage, nonce, &s, strict_bits, h - 1),
+                Err(VerifyError::ResidualTooLarge { .. })
+            ));
+            if matches!(
+                verify_sis_pow(preimage, nonce, &s, strict_bits, h),
+                Err(VerifyError::ResidualTooLarge { .. })
+            ) {
                 rejected = Some((nonce, s));
                 break;
             }
@@ -492,7 +509,7 @@ mod tests {
         let (nonce, s) = rejected
             .expect("8 consecutive k=4 solutions all passed k=8 — gate broken");
         assert!(matches!(
-            verify_sis_pow(preimage, nonce, &s, bits, h).unwrap_err(),
+            verify_sis_pow(preimage, nonce, &s, strict_bits, h).unwrap_err(),
             VerifyError::ResidualTooLarge { .. }
         ));
     }

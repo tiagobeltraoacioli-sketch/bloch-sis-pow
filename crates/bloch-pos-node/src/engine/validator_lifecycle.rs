@@ -21,15 +21,98 @@ pub(super) fn clock_at(slot: u64) -> impl Drop {
     Restore(WALL_SLOT.with(|s| s.replace(Some(slot))))
 }
 
+#[cfg(test)]
+thread_local! { static NATIVE_SLASHING_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+/// Test-only: arm the P5a evidence-admission policy for this thread until
+/// the guard drops (also on unwind).
+#[cfg(test)]
+pub(super) fn native_slashing_open() -> impl Drop {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NATIVE_SLASHING_FORCED.with(|c| c.set(self.0));
+        }
+    }
+    Restore(NATIVE_SLASHING_FORCED.with(|c| c.replace(true)))
+}
+
+/// Is the P5a evidence-admission policy armed at this WALL epoch? Node-local
+/// relay policy: no block validity or state root depends on it.
+pub(super) fn native_slashing_admission_active(wall_epoch: u64) -> bool {
+    #[cfg(test)]
+    if NATIVE_SLASHING_FORCED.with(|c| c.get()) {
+        return true;
+    }
+    params::native_slashing_active(wall_epoch)
+}
+
+fn evidence_offender(evidence: &SlashingEvidence) -> u32 {
+    match evidence {
+        SlashingEvidence::AttestationOffence { first, .. } => first.validator,
+        SlashingEvidence::ProposerEquivocation { first, .. } => first.header.proposer_index,
+    }
+}
+
 fn is_lifecycle(tx: &PosTransaction) -> bool {
     matches!(
         tx,
         PosTransaction::FundedDeposit(_)
+            | PosTransaction::FundedDelegate(_)
+            | PosTransaction::FundedUndelegate(_)
+            | PosTransaction::FundedDelegationWithdraw(_)
+            | PosTransaction::ValidatorCommissionUpdate(_)
+            | PosTransaction::WithdrawalCredentialRotation(_)
+            | PosTransaction::RescueCommit(_)
+            | PosTransaction::RescueReveal(_)
             | PosTransaction::Withdraw { .. }
             | PosTransaction::ExitV2 { .. }
             | PosTransaction::RandaoRecommit { .. }
             | PosTransaction::SlashingEvidence(_)
+            | PosTransaction::KesRegister { .. }
+            | PosTransaction::KesRotate { .. }
     )
+}
+
+/// Mempool hygiene for KES registration (0x17), which consensus accepts once
+/// per validator (`check_kes_register` refuses a validator that already has a
+/// key). Relay policy only: consensus repeats its own check on the block's
+/// pre-state and nothing here changes block validity (devnet line 7606f74f).
+///
+/// Two refusals, each with its own reason so an operator can tell them apart:
+/// a key already in COMMITTED state, and a registration for the same validator
+/// already PENDING here (two pending registrations for one validator can never
+/// both apply; first come, first kept — the rule the funded deposit uses for a
+/// joining key). Once the first is included, `revalidate_lifecycle_mempool`
+/// evicts anything left behind against committed state. Both checks are
+/// cheap and run before any signature verification.
+pub(super) fn kes_register_conflict(
+    state: &CommittedState,
+    mempool: &BTreeMap<Vec<u8>, PosTransaction>,
+    tx: &PosTransaction,
+) -> Result<(), Refusal> {
+    if let PosTransaction::KesRotate { validator, .. } = tx {
+        return kes_rotate_conflict(state, mempool, *validator);
+    }
+    let PosTransaction::KesRegister { validator, .. } = tx else {
+        return Ok(());
+    };
+    // Mirrors consensus (`check_kes_register`): an existing key refuses a
+    // re-registration unless it is an expired key's static-key rescue.
+    if state.kes_public(*validator).is_some() && !state.kes_rescue_open(*validator) {
+        return Err(Refusal::Invalid(
+            "KES key already registered for this validator: registration (tag 0x17) \
+             is once-only and consensus refuses a re-registration",
+        ));
+    }
+    if mempool.values().any(|pending| {
+        matches!(pending, PosTransaction::KesRegister { validator: other, .. } if other == validator)
+    }) {
+        return Err(Refusal::Invalid(
+            "a KES registration for this validator is already pending; only one can apply",
+        ));
+    }
+    Ok(())
 }
 
 /// Delegates only cryptographic calls that survive consensus' cheap-first
@@ -45,9 +128,24 @@ struct LifecycleAdmissionVerifier<'a, V> {
 
 impl<V: SignatureVerifier> SignatureVerifier for LifecycleAdmissionVerifier<'_, V> {
     fn verify_with_key(&self, public_key: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        self.verify_with_key_under(
+            bloch_pos_committee::SignaturePolicy::Compatible,
+            public_key,
+            message,
+            signature,
+        )
+    }
+
+    fn verify_with_key_under(
+        &self,
+        policy: bloch_pos_committee::SignaturePolicy,
+        public_key: &[u8],
+        message: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
         // Exact immutable failures are already cheap and must not let a replay
         // consume the allowance that exists to bound actual cryptography.
-        if self.inner.is_known_failure(public_key, message, signature) {
+        if self.inner.is_known_failure(policy, public_key, message, signature) {
             return false;
         }
         if let Some(source) = self.source {
@@ -56,7 +154,51 @@ impl<V: SignatureVerifier> SignatureVerifier for LifecycleAdmissionVerifier<'_, 
                 return false;
             }
         }
-        self.inner.verify_with_key(public_key, message, signature)
+        self.inner.verify_with_key_under(policy, public_key, message, signature)
+    }
+
+    /// HF3: the credential rotation (0x18) checks both of its keys through
+    /// the spend verifier, which is the only path that accepts suite 0x0003.
+    /// Forwarded under the same allowance; without this override the trait
+    /// default would route it to `verify_with_key` and the lifecycle door
+    /// would refuse every rotation into an SLH key.
+    fn verify_spend_at_epoch(
+        &self,
+        public_key: &[u8],
+        message: &[u8; 32],
+        signature: &[u8],
+        epoch: u64,
+    ) -> bool {
+        if self.inner.is_known_failure(bloch_pos_committee::SignaturePolicy::Compatible, public_key, message, signature) {
+            return false;
+        }
+        if let Some(source) = self.source {
+            if !self.mempool.borrow_mut().reserve_lifecycle_verification(source, self.wall_slot) {
+                self.limited.set(true);
+                return false;
+            }
+        }
+        self.inner.verify_spend_at_epoch(public_key, message, signature, epoch)
+    }
+
+    /// KES leaves (a `KesRotate`): the same per-source allowance, forwarded
+    /// to the inner leaf hook (bound form).
+    fn verify_kes_leaf(&self, public_key: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        if self.inner.is_known_failure(
+            bloch_pos_committee::SignaturePolicy::Compatible,
+            public_key,
+            &verification::GossipVerifier::<V>::kes_leaf_cache_root(message),
+            signature,
+        ) {
+            return false;
+        }
+        if let Some(source) = self.source {
+            if !self.mempool.borrow_mut().reserve_lifecycle_verification(source, self.wall_slot) {
+                self.limited.set(true);
+                return false;
+            }
+        }
+        self.inner.verify_kes_leaf(public_key, message, signature)
     }
 }
 
@@ -100,11 +242,42 @@ mod verification_budget_tests {
     }
 }
 
+/// Mempool hygiene for HF3 KES rotation, which consensus accepts at most once
+/// per validator per period (`check_kes_rotate`). Relay policy only, applied
+/// from day one (readiness doc §3 item 2): one pending rotation per validator
+/// (first come, first kept), and none while the committed state already
+/// holds a successor waiting for its period. Stale rotations (signed for a
+/// period the head has left) fail `validate_lifecycle_transaction` and are
+/// evicted by `revalidate_lifecycle_mempool`.
+fn kes_rotate_conflict(
+    state: &CommittedState,
+    mempool: &BTreeMap<Vec<u8>, PosTransaction>,
+    validator: u32,
+) -> Result<(), Refusal> {
+    let period = params::kes_period(epoch_of(state.slot()));
+    if let (Some(entry), Some(period)) = (state.kes_roots().get(&validator), period) {
+        if entry.pending_at(period).is_some() {
+            return Err(Refusal::Invalid(
+                "a KES rotation for this validator is already committed and waits for its period",
+            ));
+        }
+    }
+    if mempool.values().any(|pending| {
+        matches!(pending, PosTransaction::KesRotate { validator: other, .. } if *other == validator)
+    }) {
+        return Err(Refusal::Invalid(
+            "a KES rotation for this validator is already pending; only one can apply per period",
+        ));
+    }
+    Ok(())
+}
+
 impl Engine {
     pub(super) fn validate_lifecycle_admission(&mut self, tx: &PosTransaction) -> Result<(), Refusal> {
         if !is_lifecycle(tx) {
             return Ok(());
         }
+        kes_register_conflict(&self.state, &self.mempool, tx)?;
         let total = self.state.active_validators().iter()
             .map(|v| u128::from(v.effective_stake)).sum();
         let fee = self.state.next_base_fee();
@@ -115,6 +288,10 @@ impl Engine {
             mempool: std::cell::RefCell::new(&mut self.mempool),
             source, wall_slot, limited: std::cell::Cell::new(false),
         };
+        // HF2 scope: no relay signature policy. Lifecycle transactions are
+        // judged under the committee's TRANSACTION rule (v1 forms always
+        // valid) and slashing evidence under each message's own epoch rule,
+        // both applied inside `validate_lifecycle_transaction`.
         let verdict = self.state.validate_lifecycle_transaction(tx, total, fee, &verifier);
         if verifier.limited.get() {
             return Err(Refusal::LifecycleVerificationLimited {
@@ -128,20 +305,119 @@ impl Engine {
         match tx {
             PosTransaction::FundedDeposit(deposit) =>
                 Some(lifecycle_source_hash(b"funding-key", &deposit.funding_pubkey)),
+            PosTransaction::FundedDelegate(t) => Some(lifecycle_source_hash(b"funding-key", &t.funding_pubkey)),
+            PosTransaction::FundedUndelegate(t) => Some(lifecycle_source_hash(b"funding-key", &t.funding_pubkey)),
+            PosTransaction::FundedDelegationWithdraw(t) => Some(lifecycle_source_hash(b"funding-key", &t.funding_pubkey)),
+            PosTransaction::ValidatorCommissionUpdate(t) => Some(validator_lifecycle_source(t.validator)),
+            PosTransaction::WithdrawalCredentialRotation(t) => Some(validator_lifecycle_source(t.validator)),
+            PosTransaction::RescueReveal(t) => Some(lifecycle_source_hash(b"rescue-key", &t.pubkey)),
+            PosTransaction::RescueCommit(t) => Some(lifecycle_source_hash(b"rescue-commit", &t.commitment)),
             PosTransaction::ExitV2 { pubkey_hash, .. } => self.state
                 .validator_index_by_hash(pubkey_hash).map(validator_lifecycle_source),
-            PosTransaction::RandaoRecommit { validator, .. } =>
+            PosTransaction::RandaoRecommit { validator, .. }
+            | PosTransaction::KesRegister { validator, .. }
+            | PosTransaction::KesRotate { validator, .. } =>
                 Some(validator_lifecycle_source(*validator)),
-            PosTransaction::SlashingEvidence(evidence) => {
-                let validator = match evidence {
-                    SlashingEvidence::AttestationOffence { first, .. } => first.validator,
-                    SlashingEvidence::ProposerEquivocation { first, .. } => first.header.proposer_index,
-                };
-                Some(validator_lifecycle_source(validator))
-            }
+            // P5a: once armed, `precheck_slashing_evidence` has already
+            // charged both verifications to the DELIVERER; charging the
+            // accused again would let forgers drain its allowance.
+            PosTransaction::SlashingEvidence(_)
+                if native_slashing_admission_active(epoch_of(self.wall_slot())) => None,
+            PosTransaction::SlashingEvidence(evidence) =>
+                Some(validator_lifecycle_source(evidence_offender(evidence))),
             PosTransaction::Withdraw { .. } => None,
             _ => None,
         }
+    }
+
+    /// P5a — evidence pre-admission (ObenBlock PoCI ingress port), armed by
+    /// `NATIVE_SLASHING_ACTIVATION_EPOCH`. Before any state clone:
+    ///
+    /// 1. Context-free structure (two signers, no conflict) → `EvidenceFault`.
+    /// 2. Chain context (unknown index, applied, already slashed) → state
+    ///    dependent; never a peer fault, an honest peer may be on a branch
+    ///    where it still applies.
+    /// 3. Both signatures, under EXACTLY the consensus key resolution
+    ///    (`CommittedState::verify_precheck_signatures`), charged to the
+    ///    DELIVERING source's gossip allowance, never to the accused's
+    ///    lifecycle allowance. Local observations (`None`) are this node's
+    ///    own verified gossip and run unbudgeted, so `report_equivocation`
+    ///    cannot be starved. A bad signature is a fault only when the
+    ///    index→key binding is identical on every branch (genesis keys); a
+    ///    key that does not resolve here is never a fault.
+    /// 4. One pending evidence per offender: a re-signed (malleated) copy of
+    ///    pending evidence is a different txid but the same offence. This
+    ///    O(mempool) scan runs only after the budgeted verification, so
+    ///    forged evidence is bounded by the allowance before it can cost a
+    ///    scan.
+    pub(super) fn precheck_slashing_evidence(
+        &self,
+        evidence: &SlashingEvidence,
+        source: Option<[u8; 32]>,
+    ) -> Result<(), Refusal> {
+        use bloch_pos_committee::transition::EvidencePrecheckError as E;
+        let pre = match self.state.precheck_slashing_evidence(evidence) {
+            Ok(pre) => pre,
+            Err(E::ContextFree(_)) => {
+                return Err(Refusal::EvidenceFault(
+                    "slashing evidence is malformed: the two messages do not name one \
+                     signer in a double, surround or proposer conflict",
+                ))
+            }
+            Err(E::Context(_)) => {
+                return Err(Refusal::StateDependent(
+                    "slashing evidence does not apply to this node's committed state \
+                     (unknown validator, already applied, or already slashed)",
+                ))
+            }
+        };
+        let signed = match source {
+            None => self.state.verify_precheck_signatures(&pre, &self.gossip_verifier),
+            Some(_) => {
+                let wall_slot = self.wall_slot();
+                let verifier = self.gossip_verifier.budgeted_for_source(
+                    wall_slot,
+                    GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+                    source,
+                    GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+                );
+                let signed = self.state.verify_precheck_signatures(&pre, &verifier);
+                if verifier.limited() {
+                    return Err(Refusal::GossipVerificationLimited {
+                        until_slot: wall_slot.saturating_add(1),
+                    });
+                }
+                signed
+            }
+        };
+        match signed {
+            Some(true) => {}
+            None => {
+                return Err(Refusal::StateDependent(
+                    "slashing evidence names a validator whose key does not resolve \
+                     in this node's committed state",
+                ))
+            }
+            Some(false) => {
+                return Err(if pre.key_binding_final {
+                    Refusal::EvidenceFault("slashing evidence carries a forged signature")
+                } else {
+                    Refusal::StateDependent(
+                        "slashing evidence signature does not verify under this node's \
+                         branch-dependent key binding",
+                    )
+                })
+            }
+        }
+        let offender = pre.offender;
+        if self.mempool.values().any(|tx| {
+            matches!(tx, PosTransaction::SlashingEvidence(e) if evidence_offender(e) == offender)
+        }) {
+            return Err(Refusal::StateDependent(
+                "slashing evidence against this validator is already pending",
+            ));
+        }
+        Ok(())
     }
 
     /// Reserve funded inputs against every pending spend and reserve the
@@ -151,8 +427,8 @@ impl Engine {
         let incoming = Self::spent_outpoints(tx).unwrap_or_default();
         self.mempool.iter().any(|(key, other)| {
             if evicted.contains(key) { return false; }
-            let funded = matches!(tx, PosTransaction::FundedDeposit(_))
-                || matches!(other, PosTransaction::FundedDeposit(_));
+            let funded = matches!(tx, PosTransaction::FundedDeposit(_) | PosTransaction::FundedDelegate(_))
+                || matches!(other, PosTransaction::FundedDeposit(_) | PosTransaction::FundedDelegate(_));
             if !funded {
                 return false;
             }
@@ -294,6 +570,8 @@ impl Engine {
             );
             let signature = match self.slashprot.guard_recommit(
                 wall_epoch, generation, new_commitment, signing_root,
+                // A RANDAO re-commit is a lifecycle TRANSACTION: always v1
+                // (HF2 scope), so it stays valid in whatever block includes it.
                 || keys.sign(&signing_root),
             ) {
                 Ok(signature) => signature,
@@ -330,5 +608,142 @@ mod audit_reward_attribution_tests {
         assert!(message.contains("v7 admitted and broadcast"));
         assert!(message.contains("observer earns no protocol reward"));
         assert!(message.contains("proposer of a block that includes the evidence"));
+    }
+}
+
+#[cfg(test)]
+mod p5a_evidence_admission_tests {
+    use super::*;
+    use bloch_pos_committee::{Attestation, AttestationData};
+
+    const GATE_SLOT: u64 = params::SLASHING_EVIDENCE_ACTIVATION_EPOCH * SLOTS_PER_EPOCH + 1;
+
+    fn att(engine: &Engine, v: u32, head: u8, sign: bool) -> Attestation {
+        let data = AttestationData {
+            // A post-activation offence: the 609070ee node policy refuses any
+            // offence committed before SLASHING_EVIDENCE_ACTIVATION_EPOCH in
+            // `admissible`, before P5a pre-admission is ever reached.
+            slot: GATE_SLOT,
+            head: [head; 32],
+            source_epoch: 0,
+            source_root: [1; 32],
+            target_epoch: params::SLASHING_EVIDENCE_ACTIVATION_EPOCH,
+            target_root: [head; 32],
+        };
+        let signature = if sign {
+            engine.keys.as_ref().unwrap().sign(&data.signing_root())
+        } else {
+            let mut s = engine.keys.as_ref().unwrap().sign(&[head; 32]);
+            s[7] ^= 1;
+            s
+        };
+        Attestation { data, validator: v, signature }
+    }
+
+    fn ev(first: Attestation, second: Attestation) -> SlashingEvidence {
+        SlashingEvidence::AttestationOffence { first, second }
+    }
+
+    fn src(n: u8) -> Option<[u8; 32]> {
+        Some([n; 32])
+    }
+
+    #[test]
+    fn closed_gate_keeps_the_legacy_refusal_shape() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let _clock = clock_at(GATE_SLOT);
+        let malformed = ev(att(&engine, 0, 0xAA, true), att(&engine, 0, 0xAA, true));
+        let refusal = engine
+            .on_transaction_from(PosTransaction::SlashingEvidence(malformed), src(1))
+            .unwrap_err();
+        assert!(!matches!(refusal, Refusal::EvidenceFault(_)), "{refusal:?}");
+    }
+
+    #[test]
+    fn malformed_evidence_is_the_deliverers_fault() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let _gate = native_slashing_open();
+        let _clock = clock_at(GATE_SLOT);
+        for bad in [
+            ev(att(&engine, 0, 0xAA, true), att(&engine, 0, 0xAA, true)),
+            ev(att(&engine, 0, 0xAA, true), att(&engine, 1, 0xBB, true)),
+        ] {
+            assert!(matches!(
+                engine.on_transaction_from(PosTransaction::SlashingEvidence(bad), src(1)),
+                Err(Refusal::EvidenceFault(_))
+            ));
+        }
+        assert!(engine.mempool.is_empty());
+    }
+
+    #[test]
+    fn forged_evidence_cannot_drain_the_accused_validators_allowance() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let _gate = native_slashing_open();
+        let _clock = clock_at(GATE_SLOT);
+        for n in 0..16u8 {
+            let mut forged = ev(att(&engine, 0, 0xAA, false), att(&engine, 0, 0xBB, false));
+            if let SlashingEvidence::AttestationOffence { first, .. } = &mut forged {
+                first.signature[11] ^= n;
+            }
+            assert!(matches!(
+                engine.on_transaction_from(PosTransaction::SlashingEvidence(forged), src(n)),
+                Err(Refusal::EvidenceFault(_))
+            ));
+        }
+        // Validator 0's own lifecycle allowance for this slot is intact.
+        let accused = validator_lifecycle_source(0);
+        for _ in 0..LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT {
+            assert!(engine.mempool.reserve_lifecycle_verification(accused, GATE_SLOT));
+        }
+    }
+
+    #[test]
+    fn genuine_evidence_passes_and_unknown_or_pending_is_context_only() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let _gate = native_slashing_open();
+        let _clock = clock_at(GATE_SLOT);
+        let genuine = ev(att(&engine, 0, 0xAA, true), att(&engine, 0, 0xBB, true));
+        engine.precheck_slashing_evidence(&genuine, src(1)).unwrap();
+        engine.precheck_slashing_evidence(&genuine, None).unwrap();
+        // An index this chain never registered: context, never a fault.
+        let unknown = ev(att(&engine, 9, 0xAA, true), att(&engine, 9, 0xBB, true));
+        assert!(matches!(
+            engine.precheck_slashing_evidence(&unknown, src(1)),
+            Err(Refusal::StateDependent(_))
+        ));
+        // One pending evidence per offender: a second pair (or a re-signed
+        // copy) is refused once its signatures are judged.
+        let tx = PosTransaction::SlashingEvidence(genuine);
+        engine.mempool.insert(tx.canonical_bytes(), tx);
+        let other = ev(att(&engine, 0, 0xCC, true), att(&engine, 0, 0xDD, true));
+        assert!(matches!(
+            engine.precheck_slashing_evidence(&other, src(2)),
+            Err(Refusal::StateDependent(_))
+        ));
+    }
+
+    /// HF2 review F-10: the O(mempool) pending-offender scan runs only after
+    /// the budgeted verification, so forged evidence against an offender with
+    /// pending evidence is still charged to (and judged against) the
+    /// deliverer's allowance, and is refused as the fault it is.
+    #[test]
+    fn verification_budget_runs_before_the_pending_scan() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let _gate = native_slashing_open();
+        let _clock = clock_at(GATE_SLOT);
+        let genuine = ev(att(&engine, 0, 0xAA, true), att(&engine, 0, 0xBB, true));
+        let tx = PosTransaction::SlashingEvidence(genuine);
+        engine.mempool.insert(tx.canonical_bytes(), tx);
+        let before = engine.gossip_verifier.budget_used_at(GATE_SLOT);
+        let forged = ev(att(&engine, 0, 0xCC, false), att(&engine, 0, 0xDD, false));
+        assert!(matches!(
+            engine.precheck_slashing_evidence(&forged, src(3)),
+            Err(Refusal::EvidenceFault(_))
+        ));
+        assert!(
+            engine.gossip_verifier.budget_used_at(GATE_SLOT) > before,
+            "the deliverer's allowance is charged before any mempool scan"
+        );
     }
 }

@@ -343,6 +343,37 @@ const TX_TAGS: &[(u8, Status)] = &[
     (0x0A, Status::Released { name: "RandaoRecommit", rivals: NO_RIVALS }),
     (0x0C, Status::Released { name: "ExitV2", rivals: NO_RIVALS }),
     (0x0D, Status::Released { name: "Withdraw", rivals: NO_RIVALS }),
+    // New experimental format; no shipping genesis enables this rule.
+    // Moved 2026-10-10 from 0x0E/0x0F/0x10, which mainnet assigns to funded
+    // delegation (see MAINNET_TX_TAGS below). Development history settled under
+    // the old bytes (devnet3) is not replayable by this tree.
+    (0x12, Status::Released { name: "L2Settlement", rivals: NO_RIVALS }),
+    (0x13, Status::Released { name: "L2SettlementAsync", rivals: NO_RIVALS }),
+    // Development networks only (`devnet-l2-deposits`); inert otherwise.
+    (0x14, Status::Released { name: "L2Deposit", rivals: NO_RIVALS }),
+    // M3 data availability (`devnet-l2-user-txs`); 0x15 checked free on every
+    // local ref and on the mainnet tree (MAINNET_TX_TAGS) on 2026-10-10.
+    (0x15, Status::Released { name: "L2DataAvailability", rivals: NO_RIVALS }),
+    // M5 withdrawal claim (`devnet-l2-user-txs`); 0x16 checked free on every
+    // local ref (327 refs) and on the mainnet tree (MAINNET_TX_TAGS) on 2026-10-10.
+    (0x16, Status::Released { name: "L2WithdrawClaim", rivals: NO_RIVALS }),
+    // Forward-secure validator keys (KES registration). Same byte devnet4 used
+    // (devnet line 4847d708); free on this tree above the L2 range. Refused by
+    // consensus before params::KES_REGISTRATION_EPOCH (u64::MAX).
+    (0x17, Status::Released { name: "KesRegister", rivals: NO_RIVALS }),
+    // Post-quantum suite migration (docs/PQ-SUITE-MIGRATION.md), consensus
+    // gated INERT. Originally drafted at 0x17-0x19, which collided with
+    // KesRegister; moved to 0x18-0x1A by the 2026-10-19 tag allocation and
+    // kept there by the HF3 allocation of 2026-10-20 (src/wire_alloc.rs,
+    // docs/WIRE-NAMESPACE-REGISTRY.md). Gate: HF3_PQ_MIGRATION_EPOCH.
+    (0x18, Status::Released { name: "WithdrawalCredentialRotation", rivals: NO_RIVALS }),
+    (0x19, Status::Released { name: "RescueCommit", rivals: NO_RIVALS }),
+    (0x1A, Status::Released { name: "RescueReveal", rivals: NO_RIVALS }),
+    // HF3 KES rotation, leaf-authorised: 0x1B per the HF3 tag table
+    // (codex/hf3-tags-20261020 e0bfbfff, wire_alloc::tx::KES_ROTATE; 0x18-0x1A
+    // are the PQ migration's). Refused by consensus before
+    // params::HF3_KES_EPOCH (u64::MAX).
+    (0x1B, Status::Released { name: "KesRotate", rivals: NO_RIVALS }),
 ];
 
 /// Three lineages that all intend the SAME flag day disagree on all three
@@ -540,6 +571,16 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         PosTransaction::FundedUndelegate(_) => 0x0F,
         PosTransaction::FundedDelegationWithdraw(_) => 0x10,
         PosTransaction::ValidatorCommissionUpdate(_) => 0x11,
+        PosTransaction::L2Settlement(_) => 0x12,
+        PosTransaction::L2SettlementAsync(_) => 0x13,
+        PosTransaction::L2Deposit(_) => 0x14,
+        PosTransaction::L2DataAvailability(_) => 0x15,
+        PosTransaction::L2WithdrawClaim(_) => 0x16,
+        PosTransaction::KesRegister { .. } => 0x17,
+        PosTransaction::WithdrawalCredentialRotation(_) => 0x18,
+        PosTransaction::RescueCommit(_) => 0x19,
+        PosTransaction::RescueReveal(_) => 0x1A,
+        PosTransaction::KesRotate { .. } => 0x1B,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }
@@ -1103,5 +1144,146 @@ fn domain_separators_match_the_frozen_registry() {
                 found[i].0, found[j].0, found[i].1
             );
         }
+    }
+}
+
+// ===========================================================================
+//          L2 TAGS MUST NOT COLLIDE WITH THE MAINNET TRANSACTION SPACE
+// ===========================================================================
+
+/// Transaction tags assigned on the mainnet protocol tree, copied from
+/// `crates/bloch-pos-committee/tests/wire_tag_registry.rs` (`TX_TAGS`) and
+/// `transition/funded_delegation.rs` on branch/worktree
+/// `wallet-delegation-protocol-20261003` (commit 46e2f4d2), 2026-10-10:
+/// 0x01-0x06 released, 0x07-0x09 tombstoned, 0x0A RandaoRecommit,
+/// 0x0B FundedDeposit, 0x0C ExitV2, 0x0D Withdraw, 0x0E FundedDelegate,
+/// 0x0F FundedUndelegate, 0x10 FundedDelegationWithdraw,
+/// 0x11 ValidatorCommissionUpdate. Highest mainnet tag: 0x11.
+/// Update this list whenever mainnet assigns a new tag.
+const MAINNET_TX_TAGS: &[u8] = &[
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11,
+];
+
+/// The development-only L2 transactions must be portable to mainnet without
+/// re-pointing any byte the mainnet decoder already gives a meaning.
+#[test]
+fn l2_transaction_tags_do_not_overlap_the_mainnet_tag_set() {
+    let l2: Vec<(u8, &str)> = TX_TAGS
+        .iter()
+        .filter_map(|(tag, status)| match status {
+            Status::Released { name, .. } if name.starts_with("L2") => Some((*tag, *name)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        l2,
+        vec![
+            (0x12, "L2Settlement"),
+            (0x13, "L2SettlementAsync"),
+            (0x14, "L2Deposit"),
+            (0x15, "L2DataAvailability"),
+            (0x16, "L2WithdrawClaim"),
+        ],
+        "the L2 rows of the registry changed"
+    );
+    for (tag, name) in &l2 {
+        assert!(
+            !MAINNET_TX_TAGS.contains(tag),
+            "{name} uses {tag:#04x}, which the mainnet tree already assigns"
+        );
+        assert!(*tag > *MAINNET_TX_TAGS.iter().max().unwrap(), "{name} is inside the mainnet range");
+    }
+    // The encoders agree with the registry.
+    assert_eq!(bloch_pos_committee::l2_settlement::WIRE_TAG, 0x12);
+    assert_eq!(bloch_pos_committee::l2_settlement::ASYNC_WIRE_TAG, 0x13);
+    assert_eq!(bloch_pos_committee::transition::l2_deposit::L2_DEPOSIT_TAG, 0x14);
+    assert_eq!(bloch_pos_committee::transition::l2_da::L2_DATA_AVAILABILITY_TAG, 0x15);
+    assert_eq!(bloch_pos_committee::transition::l2_claim::L2_WITHDRAW_CLAIM_TAG, 0x16);
+    assert_eq!(bloch_pos_committee::kes::REGISTER_TAG, 0x17);
+    assert!(!MAINNET_TX_TAGS.contains(&0x17), "KesRegister must stay outside the deployed mainnet range");
+    assert_eq!(bloch_pos_committee::kes::ROTATE_TAG, 0x1B);
+    assert!(!MAINNET_TX_TAGS.contains(&0x1B), "KesRotate must stay outside the deployed mainnet range");
+    for reserved in [0x18, 0x19, 0x1A] {
+        assert_ne!(bloch_pos_committee::kes::ROTATE_TAG, reserved, "0x18-0x1A belong to the PQ migration (2026-10-19 allocation)");
+    }
+    // The pre-renumbering L2 bytes now belong to funded delegation: they
+    // dispatch to its decoders (a bare tag is truncated, not unknown).
+    for old in [0x0E, 0x0F, 0x10, 0x11] {
+        let decoded = PosTransaction::from_canonical_bytes(&[old]);
+        assert!(decoded.is_err(), "{old:#04x}: a bare tag is not a transaction");
+        assert_ne!(decoded, Err(TxDecodeError::UnknownTag(old)), "{old:#04x} is a mainnet tag here");
+    }
+}
+
+// ===========================================================================
+//          HF3 ALLOCATION 2026-10-20 (src/wire_alloc.rs) — RESERVED BYTES
+// ===========================================================================
+
+/// The HF3 table reserves `0x17`–`0x1B` (KesRegister, the PQ trio,
+/// KesRotate). Each line's merge moves its bytes from
+/// `HF3_RESERVED_NOT_IN_TREE` into `TX_TAGS`; on this integration tree every
+/// HF3 line has landed (KES 0x17/0x1B, PQ migration 0x18-0x1A).
+const HF3_RESERVED_NOT_IN_TREE: &[u8] = &[];
+/// HF3 bytes this tree implements: in `TX_TAGS` and decodable.
+const HF3_LANDED_IN_TREE: &[u8] = &[0x17, 0x18, 0x19, 0x1A, 0x1B];
+
+#[test]
+fn hf3_reserved_tx_tags_are_unknown_until_their_line_lands() {
+    use bloch_pos_committee::wire_alloc::{tx, TX_TABLE};
+    assert_eq!(
+        HF3_RESERVED_NOT_IN_TREE.iter().chain(HF3_LANDED_IN_TREE).chain([&tx::NEXT_FREE]).count(),
+        6,
+        "update this list when an HF3 line lands"
+    );
+    for tag in HF3_LANDED_IN_TREE {
+        assert!(TX_TAGS.iter().any(|(t, _)| t == tag), "{tag:#04x} landed but is not in the frozen table");
+        assert!(TX_TABLE.iter().any(|r| r.tag == *tag), "{tag:#04x} is not allocated in wire_alloc");
+        assert_ne!(
+            PosTransaction::from_canonical_bytes(&[*tag]),
+            Err(TxDecodeError::UnknownTag(*tag)),
+            "{tag:#04x} dispatches to its decoder on this tree (a bare tag is truncated, not unknown)"
+        );
+    }
+    for tag in HF3_RESERVED_NOT_IN_TREE {
+        assert!(TX_TAGS.iter().all(|(t, _)| t != tag), "{tag:#04x} is in the frozen table");
+        assert!(TX_TABLE.iter().any(|r| r.tag == *tag), "{tag:#04x} is not allocated in wire_alloc");
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&[*tag]),
+            Err(TxDecodeError::UnknownTag(*tag)),
+            "{tag:#04x} must not decode before its line lands"
+        );
+    }
+    // Every byte in the frozen table appears in the allocation table.
+    for (tag, _) in TX_TAGS {
+        assert!(TX_TABLE.iter().any(|r| r.tag == *tag), "{tag:#04x} missing from wire_alloc");
+    }
+    assert_eq!(
+        PosTransaction::from_canonical_bytes(&[tx::NEXT_FREE]),
+        Err(TxDecodeError::UnknownTag(tx::NEXT_FREE))
+    );
+}
+
+/// The HF3 allocation (src/wire_alloc.rs): `0x17` is the KES port's
+/// `KesRegister` and `0x1B` its `KesRotate`, so the post-quantum migration
+/// sits at `0x18`-`0x1A`. `0x17` must never decode as a PQ transaction.
+#[test]
+fn pq_migration_tags_follow_the_hf3_allocation() {
+    use bloch_pos_committee::transition::pq_migration as pq;
+    use bloch_pos_committee::wire_alloc::tx;
+    assert_eq!(pq::WITHDRAWAL_CREDENTIAL_ROTATION_TAG, 0x18);
+    assert_eq!(pq::RESCUE_COMMIT_TAG, 0x19);
+    assert_eq!(pq::RESCUE_REVEAL_TAG, 0x1A);
+    assert_eq!(pq::WITHDRAWAL_CREDENTIAL_ROTATION_TAG, tx::WITHDRAWAL_CREDENTIAL_ROTATION);
+    assert_eq!(pq::RESCUE_COMMIT_TAG, tx::RESCUE_COMMIT);
+    assert_eq!(pq::RESCUE_REVEAL_TAG, tx::RESCUE_REVEAL);
+    assert_eq!(tx::KES_REGISTER, 0x17);
+    assert_eq!(bloch_pos_committee::kes::REGISTER_TAG, 0x17, "0x17 is KesRegister, not a PQ transaction");
+    assert!(TX_TAGS.iter().any(|(tag, s)| *tag == 0x17 && matches!(s, Status::Released { name: "KesRegister", .. })));
+    for tag in [0x18u8, 0x19, 0x1A] {
+        assert_ne!(
+            PosTransaction::from_canonical_bytes(&[tag]),
+            Err(TxDecodeError::UnknownTag(tag)),
+            "{tag:#04x} dispatches to the PQ decoders"
+        );
     }
 }

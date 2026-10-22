@@ -40,6 +40,7 @@ use crate::{
 use bloch_pos_committee::{
     fee_market,
     header::BlockEnvelope,
+    interfaces::{ProposalEnvelope, SlashingEvidence},
     params::{MIN_TRANSFER_OUTPUT_SAT, TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH},
     transition::{
         funded::ADMISSION_PQ_SIGNATURE_MAX, PosTransaction, TransferInputV2, TransferOutput,
@@ -90,7 +91,7 @@ TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH onward.";
 pub const EQUIVOCATE_HELP: &str = "Proposer-equivocation injector (DEVNET ONLY; never point it at a real network)
 
 devnet-equivocate --genesis FILE --dir KEYSTORE_DIR --data-dir NODE_DATA_DIR
-                  --slot S --to HOST:PORT
+                  --slot S [--to HOST:PORT] [--evidence-out NEW_FILE]
 
 Reads the committed block at slot S from the node's block log (blocks.log
 and blocks.idx, read-only: the running node's LOCK is not taken, so
@@ -102,7 +103,13 @@ over the new proposal signing root, and sends the envelope to --to as a
 devnet FRAME_BLOCK frame, the way submit-tx sends a transaction. Both block
 ids are printed. Send it while the original is still recent: a node keeps
 observed proposals for about two epochs and needs the block's parent.
-Refused unless the manifest is devnet-shaped (empty cohort, no carryover).";
+Refused unless the manifest is devnet-shaped (empty cohort, no carryover).
+
+--evidence-out writes the canonical SlashingEvidence transaction (tag 0x05,
+ProposerEquivocation over the original and the conflicting header) as hex to
+a NEW file (mode 0600) for a later sendrawtransaction; this is how a
+rehearsal holds evidence for an offence committed BEFORE slashing activates
+and submits it after. At least one of --to and --evidence-out is required.";
 
 fn error(message: impl ToString) -> String {
     message.to_string()
@@ -391,7 +398,7 @@ pub fn build_transfer_v2(
         outputs[0].value = paid_sat;
     }
     let signing_root = tx.checked_signing_root(epoch);
-    let signature = keys.sign(&signing_root);
+    let signature = keys.sign_fitting(&signing_root, ADMISSION_PQ_SIGNATURE_MAX)?;
     if let PosTransaction::TransferV2 { keys, .. } = &mut tx {
         keys[0].signature = signature;
     }
@@ -596,7 +603,13 @@ pub fn check_signed_by(env: &BlockEnvelope, keys: &Keystore) -> Result<(), Strin
 pub fn forge_conflicting(env: &BlockEnvelope, keys: &Keystore) -> BlockEnvelope {
     let mut conflicting = env.clone();
     conflicting.header.state_root[0] ^= 1;
-    conflicting.proposer_sig = keys.sign(&conflicting.header.proposal_signing_root());
+    // The proposer signature is a CONSENSUS message: sign under the rule of
+    // the block's own epoch (v1 before SIG_CANONICAL_ACTIVATION_EPOCH, v2
+    // from it) so the forged block stays a valid equivocation after the gate.
+    conflicting.proposer_sig = keys.sign_for_epoch(
+        bloch_pos_committee::epoch_of(conflicting.header.slot),
+        &conflicting.header.proposal_signing_root(),
+    );
     conflicting
 }
 
@@ -606,28 +619,58 @@ pub fn equivocate(args: &[String]) -> Result<(), String> {
         println!("{EQUIVOCATE_HELP}");
         return Ok(());
     }
-    let a = Flags::parse(args, &["--genesis", "--dir", "--data-dir", "--slot", "--to"], &[])?;
+    let a = Flags::parse(
+        args,
+        &["--genesis", "--dir", "--data-dir", "--slot", "--to", "--evidence-out"],
+        &[],
+    )?;
     let (manifest, digest) = Manifest::load(Path::new(a.get("--genesis")?)).map_err(error)?;
     require_devnet_shape(&manifest)?;
     let data_dir = Path::new(a.get("--data-dir")?);
     check_data_dir_network(data_dir, &digest)?;
     let slot: u64 = a.number("--slot")?;
-    let to = a.get("--to")?;
+    let to = a.0.get("--to").and_then(|v| v.first()).cloned();
+    let evidence_out = a.0.get("--evidence-out").and_then(|v| v.first()).cloned();
+    if to.is_none() && evidence_out.is_none() {
+        return Err("one of --to and --evidence-out is required".into());
+    }
     let keys = Keystore::load(Path::new(a.get("--dir")?)).map_err(error)?;
     let original = read_block_at_slot(data_dir, slot)?;
     check_signed_by(&original, &keys)?;
     let conflicting = forge_conflicting(&original, &keys);
-    net::send_block(to, &conflicting).map_err(|e| format!("cannot send to {to}: {e}"))?;
     println!(
-        "slot {slot}, proposer_index {}\noriginal block id:    {}\nconflicting block id: {}\n\
-         sent to {to} as FRAME_BLOCK; this transport does not acknowledge — watch the receiving \
-         node for `slashing evidence against v{} admitted and broadcast`",
+        "slot {slot}, proposer_index {}\noriginal block id:    {}\nconflicting block id: {}",
         original.header.proposer_index,
         codec::hex32(original.block_id().as_bytes()),
         codec::hex32(conflicting.block_id().as_bytes()),
-        original.header.proposer_index,
     );
+    if let Some(out) = evidence_out.as_deref() {
+        let tx = equivocation_evidence(&original, &conflicting);
+        write_hex_file(out, &tx.canonical_bytes())?;
+        println!("evidence transaction id: {}\nevidence written to {out}", codec::hex32(&tx.txid()));
+    }
+    if let Some(to) = to.as_deref() {
+        net::send_block(to, &conflicting).map_err(|e| format!("cannot send to {to}: {e}"))?;
+        println!(
+            "sent to {to} as FRAME_BLOCK; this transport does not acknowledge — watch the receiving \
+             node for `slashing evidence against v{} admitted and broadcast`",
+            original.header.proposer_index,
+        );
+    }
     Ok(())
+}
+
+/// The `SlashingEvidence` transaction the observing node would build from the
+/// pair (`observe_proposer_equivocation`): original first, conflicting second.
+pub fn equivocation_evidence(original: &BlockEnvelope, conflicting: &BlockEnvelope) -> PosTransaction {
+    let proposal = |env: &BlockEnvelope| ProposalEnvelope {
+        header: env.header.clone(),
+        proposer_sig: env.proposer_sig.clone(),
+    };
+    PosTransaction::SlashingEvidence(SlashingEvidence::ProposerEquivocation {
+        first: proposal(original),
+        second: proposal(conflicting),
+    })
 }
 
 #[cfg(test)]
@@ -722,9 +765,14 @@ mod tests {
         assert!(Manifest::decode(&at_cap.encode()).is_ok());
         let over = devnet_manifest(&ks, (0..65).map(alloc).collect());
         assert!(Manifest::decode(&over.encode()).is_err());
-        // The reservation's premise: a real hybrid signature never exceeds the
-        // placeholder it is measured against.
-        assert!(ks.sign(&[7u8; 32]).len() <= ADMISSION_PQ_SIGNATURE_MAX);
+        // The reservation's premise: the signature the tool emits never
+        // exceeds the placeholder it is measured against. A plain hybrid
+        // signature can (Falcon-1024 is variable length, up to 1462 bytes),
+        // which is why the tool signs through `sign_fitting`.
+        for i in 0u8..16 {
+            let sig = ks.sign_fitting(&[i; 32], ADMISSION_PQ_SIGNATURE_MAX).expect("fits");
+            assert!(sig.len() <= ADMISSION_PQ_SIGNATURE_MAX);
+        }
     }
 
     #[test]

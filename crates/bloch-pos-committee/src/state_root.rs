@@ -287,6 +287,54 @@ const TAG_FUNDED_DELEGATION_OWNER: u8 = 0x1F;
 /// the funded position has not yet begun deactivation.
 const TAG_FUNDED_DELEGATION_LIFECYCLE: u8 = 0x20;
 
+/// Native L2 settlement policy/cursor/inbox/withdrawal component. Absent
+/// (no leaf) on every network without an L2 policy, preserving historical
+/// roots. 0x1F/0x20 belong to funded delegation on Genesis-4.
+const TAG_L2_SETTLEMENT: u8 = 0x21;
+
+pub(crate) fn insert_l2_settlement(tree: &mut Smt, bytes: &[u8]) {
+    tree.insert(derive_key(TAG_L2_SETTLEMENT, &[]), hash_value(bytes));
+}
+
+/// Registered forward-secure (KES) keys (`crate::kes`), one leaf per
+/// validator: key `u32` index, value `KesEntry::committed_bytes()` (the key
+/// in force `depth ‖ root ‖ start_period`, then the pending successor's, if
+/// any). Inserted only for registered validators, so every state
+/// root before the first registration is unchanged. 0x22: the byte devnet4
+/// used, free on this line after the L2's 0x21.
+const TAG_KES_ROOT: u8 = crate::wire_alloc::state::KES_ROOT;
+
+pub(crate) fn insert_kes_roots(tree: &mut Smt, roots: &BTreeMap<u32, crate::kes::KesEntry>, enforced_from: Option<u64>) {
+    for (validator, public) in roots {
+        tree.insert(derive_key(TAG_KES_ROOT, &validator.to_le_bytes()), hash_value(&public.committed_bytes()));
+    }
+    // The enforcement bind epoch: an 8-byte key, so it never shares a key
+    // with a 4-byte validator index.
+    if let Some(epoch) = enforced_from {
+        tree.insert(derive_key(TAG_KES_ROOT, b"enforced"), hash_value(&epoch.to_le_bytes()));
+    }
+}
+
+/// Post-quantum rescue commitments (`transition::pq_migration`), one leaf per
+/// commitment, value = inclusion epoch (u64 LE). The map is empty — zero
+/// leaves — until `LATTICE_EMERGENCY_ACTIVATION_EPOCH` binds, so every
+/// historical root is unchanged.
+///
+/// `0x24`, not `0x22`: the HF3 allocation ([`crate::wire_alloc`],
+/// `docs/WIRE-NAMESPACE-REGISTRY.md`) gives `0x22` to `TAG_KES_ROOT` (the KES
+/// mainnet port, below) and `0x23` to `TAG_LC_ROSTER` (light client, not in
+/// this tree; reserved).
+const TAG_PQ_RESCUE_COMMIT: u8 = crate::wire_alloc::state::PQ_RESCUE_COMMIT;
+
+pub(crate) fn insert_pq_rescue_commits(
+    tree: &mut Smt,
+    commits: &std::collections::BTreeMap<[u8; 32], u64>,
+) {
+    for (commitment, epoch) in commits {
+        tree.insert(derive_key(TAG_PQ_RESCUE_COMMIT, commitment), hash_value(&epoch.to_le_bytes()));
+    }
+}
+
 /// Append-only registry of every component namespace in the live state SMT.
 ///
 /// This is the machine-readable authority for component count, names and tag
@@ -294,7 +342,7 @@ const TAG_FUNDED_DELEGATION_LIFECYCLE: u8 = 0x20;
 /// compatibility DTO, not an exhaustive model of the live tree. New
 /// components must be appended here as well as in the tree fold; the
 /// uniqueness and spec-reconciliation tests consume this registry directly.
-pub const STATE_COMPONENT_TAGS: [(&str, u8); 32] = [
+pub const STATE_COMPONENT_TAGS: [(&str, u8); 35] = [
     ("TAG_EUTXO", TAG_EUTXO),
     ("TAG_VALIDATOR", TAG_VALIDATOR),
     ("TAG_PARTICIPATION_CURRENT", TAG_PARTICIPATION_CURRENT),
@@ -327,6 +375,9 @@ pub const STATE_COMPONENT_TAGS: [(&str, u8); 32] = [
     ("TAG_FUNDED_VALIDATOR", TAG_FUNDED_VALIDATOR),
     ("TAG_FUNDED_DELEGATION_OWNER", TAG_FUNDED_DELEGATION_OWNER),
     ("TAG_FUNDED_DELEGATION_LIFECYCLE", TAG_FUNDED_DELEGATION_LIFECYCLE),
+    ("TAG_L2_SETTLEMENT", TAG_L2_SETTLEMENT),
+    ("TAG_KES_ROOT", TAG_KES_ROOT),
+    ("TAG_PQ_RESCUE_COMMIT", TAG_PQ_RESCUE_COMMIT),
 ];
 
 
@@ -1093,6 +1144,94 @@ pub fn verify_inclusion(
     h == *root
 }
 
+/// Proof that `key` is NOT committed under a root: the 256 siblings of the
+/// key's path, folded from the empty leaf slot instead of a leaf.
+///
+/// Library-only (finality certificates, light clients). It reads the same
+/// tree [`Smt::prove`] reads and changes nothing the state root commits.
+impl Smt {
+    /// Absence proof for `key`, or `None` if the key IS committed.
+    pub fn prove_absence(&self, key: &[u8; 32]) -> Option<InclusionProof> {
+        let mut siblings = Vec::with_capacity(TREE_DEPTH);
+        let mut node = &self.root;
+        let mut d = 0;
+        while d < TREE_DEPTH {
+            match node {
+                None => {
+                    for dd in d..TREE_DEPTH {
+                        siblings.push(self.empty[dd + 1]);
+                    }
+                    return Some(InclusionProof { siblings });
+                }
+                Some(Node::Leaf(l)) => {
+                    if l.key == *key {
+                        return None;
+                    }
+                    // The lone leaf sits in this subtree; walk until our key's
+                    // path leaves it, then the rest of our path is empty.
+                    let mut dd = d;
+                    while dd < TREE_DEPTH && bit(key, dd) == bit(&l.key, dd) {
+                        siblings.push(self.empty[dd + 1]);
+                        dd += 1;
+                    }
+                    if dd == TREE_DEPTH {
+                        return None;
+                    }
+                    siblings.push(singleton_subtree_root(&l.key, &l.value_hash, dd + 1, &self.empty));
+                    for e in (dd + 1)..TREE_DEPTH {
+                        siblings.push(self.empty[e + 1]);
+                    }
+                    return Some(InclusionProof { siblings });
+                }
+                Some(Node::Split(s)) => {
+                    let (on_path, off_path) =
+                        if bit(key, d) == 0 { (&s.left, &s.right) } else { (&s.right, &s.left) };
+                    siblings.push(hash_of(off_path, d + 1, &self.empty));
+                    node = on_path;
+                }
+            }
+            d += 1;
+        }
+        match node {
+            Some(Node::Leaf(l)) if l.key == *key => None,
+            None => Some(InclusionProof { siblings }),
+            _ => None,
+        }
+    }
+}
+
+/// Verify that nothing is committed at `key` under `root` (see
+/// [`Smt::prove_absence`]). Free function, no tree needed.
+pub fn verify_absence(root: &[u8; 32], key: &[u8; 32], proof: &InclusionProof) -> bool {
+    if proof.siblings.len() != TREE_DEPTH {
+        return false;
+    }
+    let mut h = sha3(&[&[MARK_EMPTY]]);
+    for d in (0..TREE_DEPTH).rev() {
+        let sib = &proof.siblings[d];
+        h = if bit(key, d) == 0 { node_hash(&h, sib) } else { node_hash(sib, &h) };
+    }
+    h == *root
+}
+
+/// The empty-subtree constants (`[d]` = root of an empty subtree at depth
+/// `d`; `[TREE_DEPTH]` = the empty leaf slot). Public so a proof can be
+/// shipped compressed (empty siblings elided) and re-expanded by a verifier.
+pub fn empty_subtree_hashes() -> Vec<[u8; 32]> {
+    empty_hashes()
+}
+
+/// Tree key of the validator registry record at `index` (component
+/// `TAG_VALIDATOR`). The single definition the state root itself uses.
+pub fn validator_leaf_key(index: u32) -> [u8; 32] {
+    derive_key(TAG_VALIDATOR, &index.to_le_bytes())
+}
+
+/// Leaf value hash of a canonical serialization (`SHA3(DS_STATE ‖ 0x04 ‖ bytes)`).
+pub fn leaf_value_hash(serialized: &[u8]) -> [u8; 32] {
+    hash_value(serialized)
+}
+
 // -- Committed state components ---------------------------------------------
 //
 // Serialization here is canonical by construction: fixed field order, fixed
@@ -1212,6 +1351,50 @@ pub struct ValidatorRecord {
 }
 
 impl ValidatorRecord {
+    /// The exact bytes the state root hashes for this record (library-only
+    /// accessor; the format is the committed one, unchanged).
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        self.serialize()
+    }
+
+    /// Strict inverse of [`Self::canonical_bytes`]: every byte consumed,
+    /// lengths bounded, `slashed` exactly 0/1. `None` on anything else.
+    pub fn from_canonical_bytes(b: &[u8]) -> Option<Self> {
+        struct R<'a>(&'a [u8]);
+        impl<'a> R<'a> {
+            fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+                if self.0.len() < n { return None; }
+                let (h, t) = self.0.split_at(n);
+                self.0 = t;
+                Some(h)
+            }
+            fn u32(&mut self) -> Option<u32> { Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?)) }
+            fn u64(&mut self) -> Option<u64> { Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?)) }
+            fn a32(&mut self) -> Option<[u8; 32]> { self.take(32)?.try_into().ok() }
+        }
+        let mut r = R(b);
+        let index = r.u32()?;
+        let pk_len = r.u32()? as usize;
+        if pk_len > 65_536 { return None; }
+        let pubkey = r.take(pk_len)?.to_vec();
+        let stake = r.u64()?;
+        let activation_epoch = r.u64()?;
+        let exit_epoch = r.u64()?;
+        let slashed = match r.take(1)?[0] { 0 => false, 1 => true, _ => return None };
+        let randao_commitment = r.a32()?;
+        let reveals_used = r.u32()?;
+        let withdrawable_epoch = r.u64()?;
+        let wc_len = r.u32()? as usize;
+        if wc_len > 65_536 { return None; }
+        let withdrawal_credentials = r.take(wc_len)?.to_vec();
+        let commission_bps = u128::from_le_bytes(r.take(16)?.try_into().ok()?);
+        if !r.0.is_empty() { return None; }
+        Some(ValidatorRecord {
+            index, pubkey, stake, activation_epoch, exit_epoch, slashed, randao_commitment,
+            reveals_used, withdrawable_epoch, withdrawal_credentials, commission_bps,
+        })
+    }
+
     fn entry_key(&self) -> Vec<u8> {
         self.index.to_le_bytes().to_vec()
     }
@@ -1354,6 +1537,56 @@ pub struct FinalityRecord {
     pub leaked: Vec<LeakRecord>,
     /// Next epoch the engine will accept — the "dense, in-order" clock.
     pub next_epoch: u64,
+    /// Frozen finality set (`params::HF1_FROZEN_FINALITY_SET_EPOCH`).
+    /// `None` below the gate, and then NOTHING is appended to the leaf, so
+    /// every historical root is byte-identical.
+    pub finality_set: Option<FinalitySetRecord>,
+    /// The chain's own checkpoint roots the FFG tally reads, any order —
+    /// serialization sorts by epoch. Empty below
+    /// `params::HF1_OWN_TARGET_VOTES_EPOCH`, and then not written at
+    /// all, so every earlier leaf keeps its bytes. At most two entries.
+    pub own_checkpoints: Vec<CheckpointRecord>,
+}
+
+/// The frozen finality set, its pending handoff candidate and the presence
+/// ledger that prunes it. Lists in any order; serialization sorts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalitySetRecord {
+    pub current_epoch: u64,
+    pub current: Vec<(u32, u64)>,
+    pub pending: Option<(u64, Vec<(u32, u64)>)>,
+    pub last_seen: Vec<(u32, u64)>,
+}
+
+/// Domain tag opening the optional finality-set extension of the finality
+/// leaf. Its presence is what distinguishes a gated leaf from a legacy one.
+const FINALITY_SET_EXTENSION_TAG: &[u8; 16] = b"BLOCH-FFG-FSETv1";
+
+impl FinalitySetRecord {
+    fn write_pairs(s: &mut Vec<u8>, pairs: &[(u32, u64)]) {
+        let mut sorted = pairs.to_vec();
+        sorted.sort_unstable();
+        s.extend_from_slice(&(sorted.len() as u64).to_le_bytes());
+        for (v, x) in &sorted {
+            s.extend_from_slice(&v.to_le_bytes());
+            s.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+
+    fn write_into(&self, s: &mut Vec<u8>) {
+        s.extend_from_slice(FINALITY_SET_EXTENSION_TAG);
+        s.extend_from_slice(&self.current_epoch.to_le_bytes());
+        Self::write_pairs(s, &self.current);
+        match &self.pending {
+            None => s.push(0),
+            Some((epoch, members)) => {
+                s.push(1);
+                s.extend_from_slice(&epoch.to_le_bytes());
+                Self::write_pairs(s, members);
+            }
+        }
+        Self::write_pairs(s, &self.last_seen);
+    }
 }
 
 impl FinalityRecord {
@@ -1381,9 +1614,27 @@ impl FinalityRecord {
             s.extend_from_slice(&l.leaked_sat.to_le_bytes());
         }
         s.extend_from_slice(&self.next_epoch.to_le_bytes());
+        if let Some(fs) = &self.finality_set {
+            fs.write_into(&mut s);
+        }
+        // Trailing, tagged, absent while empty: below the gate the leaf is
+        // byte-identical to the one every historical header commits.
+        if !self.own_checkpoints.is_empty() {
+            let mut own = self.own_checkpoints.clone();
+            own.sort_by_key(|c| c.epoch);
+            s.extend_from_slice(OWN_CHECKPOINTS_TAG);
+            s.extend_from_slice(&(own.len() as u64).to_le_bytes());
+            for c in &own {
+                c.write_into(&mut s);
+            }
+        }
         s
     }
 }
+
+/// Marks the optional own-checkpoint section of the finality leaf
+/// (`params::HF1_OWN_TARGET_VOTES_EPOCH`).
+pub const OWN_CHECKPOINTS_TAG: &[u8] = b"BLOCH:FINALITY:OWN-CHECKPOINTS:1";
 
 /// One epoch-boundary vote awaiting the finality tally, committed per entry
 /// under [`TAG_PENDING_VOTE`]. Keyed by `(validator, signing_root)` — exactly
@@ -3235,6 +3486,8 @@ mod tests {
             finalized: CheckpointRecord { epoch: 40, root: val(0x50) },
             leaked: vec![LeakRecord { validator: 3, leaked_sat: 77 }],
             next_epoch: 43,
+            finality_set: None,
+            own_checkpoints: Vec::new(),
         };
         let pending_votes: Vec<PendingVoteRecord> = (0..3u32)
             .map(|i| PendingVoteRecord {
@@ -3713,6 +3966,11 @@ mod tests {
             "two state-root components share a tag byte"
         );
         assert_eq!(TAG_FC_RECENT_VOTE, 0x1A, "the O01 component takes the next free byte after 0x19");
+        // HF3 allocation (wire_alloc): 0x22 = TAG_KES_ROOT (landed with the KES
+        // line) and 0x23 = TAG_LC_ROSTER (light client, another line; reserved).
+        assert_eq!(TAG_KES_ROOT, 0x22, "KES keys take the allocated byte");
+        assert_eq!(TAG_PQ_RESCUE_COMMIT, 0x24, "PQ rescue commitments sit past the KES/LC allocations");
+        assert!(STATE_COMPONENT_TAGS.iter().all(|(_, t)| *t != 0x23), "0x23 is reserved for the light client");
     }
 
     #[test]
@@ -4010,5 +4268,80 @@ mod tests {
             })
             .collect();
         assert_eq!(total_effective_stake(&validators), 3u128 * u64::MAX as u128);
+    }
+
+    /// HF1 integration (review L-3): the frozen-set and own-checkpoint
+    /// extensions of the finality leaf have one fixed order (FSET, then
+    /// OWN-CHECKPOINTS, as `wire_alloc::finality_leaf` records), and either
+    /// one alone keeps exactly the bytes it has on its own.
+    #[test]
+    fn finality_leaf_extensions_have_one_order_and_compose() {
+        let base = FinalityRecord {
+            justified: vec![CheckpointRecord { epoch: 3, root: [3; 32] }],
+            current_justified: CheckpointRecord { epoch: 3, root: [3; 32] },
+            previous_justified: CheckpointRecord { epoch: 2, root: [2; 32] },
+            finalized: CheckpointRecord { epoch: 2, root: [2; 32] },
+            leaked: Vec::new(),
+            next_epoch: 4,
+            finality_set: None,
+            own_checkpoints: Vec::new(),
+        };
+        let legacy = base.serialize();
+        let fs = FinalitySetRecord { current_epoch: 2, current: vec![(0, 100), (1, 100)], pending: None, last_seen: vec![] };
+        let own = vec![CheckpointRecord { epoch: 3, root: [3; 32] }, CheckpointRecord { epoch: 4, root: [4; 32] }];
+        let mut only_fs = base.clone();
+        only_fs.finality_set = Some(fs.clone());
+        let mut only_own = base.clone();
+        only_own.own_checkpoints = own.clone();
+        let mut both = base.clone();
+        both.finality_set = Some(fs);
+        both.own_checkpoints = own;
+        let (a, b, c) = (only_fs.serialize(), only_own.serialize(), both.serialize());
+        assert!(a.starts_with(&legacy) && b.starts_with(&legacy) && c.starts_with(&legacy));
+        let fs_ext = &a[legacy.len()..];
+        let own_ext = &b[legacy.len()..];
+        assert!(fs_ext.starts_with(crate::wire_alloc::finality_leaf::FINALITY_SET));
+        assert!(own_ext.starts_with(crate::wire_alloc::finality_leaf::OWN_CHECKPOINTS));
+        // Both: exactly FSET's bytes, then OWN's bytes.
+        assert_eq!(c, [legacy.as_slice(), fs_ext, own_ext].concat());
+    }
+
+    /// Frozen finality set: `None` appends nothing (every pre-gate leaf is
+    /// the legacy bytes); `Some` extends the leaf and is order-insensitive.
+    #[test]
+    fn finality_set_extension_is_absent_below_the_gate() {
+        let base = FinalityRecord {
+            justified: vec![CheckpointRecord { epoch: 3, root: [3; 32] }],
+            current_justified: CheckpointRecord { epoch: 3, root: [3; 32] },
+            previous_justified: CheckpointRecord { epoch: 2, root: [2; 32] },
+            finalized: CheckpointRecord { epoch: 2, root: [2; 32] },
+            leaked: vec![LeakRecord { validator: 1, leaked_sat: 5 }],
+            next_epoch: 4,
+            finality_set: None,
+            own_checkpoints: Vec::new(),
+        };
+        let legacy = base.serialize();
+        assert_eq!(legacy.len(), 8 + 40 + 40 * 3 + 8 + 12 + 8);
+        let mut gated = base.clone();
+        gated.finality_set = Some(FinalitySetRecord {
+            current_epoch: 2,
+            current: vec![(1, 100), (0, 100)],
+            pending: Some((3, vec![(0, 100)])),
+            last_seen: vec![(1, 3), (0, 3)],
+        });
+        let bytes = gated.serialize();
+        assert_eq!(&bytes[..legacy.len()], &legacy[..]);
+        assert!(bytes.len() > legacy.len());
+        let mut shuffled = gated.clone();
+        if let Some(fs) = shuffled.finality_set.as_mut() {
+            fs.current.reverse();
+            fs.last_seen.reverse();
+        }
+        assert_eq!(shuffled.serialize(), bytes);
+        let mut other = gated.clone();
+        if let Some(fs) = other.finality_set.as_mut() {
+            fs.pending = None;
+        }
+        assert_ne!(other.serialize(), bytes);
     }
 }

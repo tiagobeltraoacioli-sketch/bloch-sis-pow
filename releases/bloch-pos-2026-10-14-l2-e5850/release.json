@@ -1,0 +1,12 @@
+{
+  "release": "bloch-pos-2026-10-14-l2-e5850",
+  "source_commit": "78b7343a347d2c53944a7058b7cb1c2ca4efe842",
+  "platform": "linux-x86_64",
+  "binary": "bloch-pos",
+  "binary_sha256": "fa9996eda48a8d3a5beff249c1c7d9f666d9e8207c4f0a1825ba3dba3889fc18",
+  "checksum_manifest": "SHA256SUMS",
+  "checksum_signature": "SHA256SUMS.minisig",
+  "minisign_public_key": "bloch-release-20260922.pub",
+  "upgrade_only": true,
+  "signed": true
+}

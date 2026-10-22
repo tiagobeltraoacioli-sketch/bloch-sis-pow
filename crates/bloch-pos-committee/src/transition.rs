@@ -128,15 +128,28 @@ use crate::params::SLOTS_PER_EPOCH;
 pub mod funded;
 pub mod funded_delegation;
 mod lifecycle;
+mod slashing_rehearsal;
+pub use slashing_rehearsal::EvidenceRehearsal;
+pub mod evidence_admission;
+pub use evidence_admission::{EvidencePrecheck, EvidencePrecheckError, SignedMessage};
 pub use funded::{FundedDeposit, FundedDepositReject, FundingInput};
 pub use funded_delegation::{
     FundedDelegate, FundedDelegationReject, FundedDelegationWithdraw, FundedUndelegate,
     ValidatorCommissionUpdate,
 };
+pub mod l2_deposit;
+pub use l2_deposit::{L2Deposit, L2DepositReject};
+pub mod l2_da;
+pub use l2_da::{L2DataAvailability, L2DataAvailabilityReject};
+pub mod l2_claim;
+pub use l2_claim::{L2WithdrawClaim, L2WithdrawClaimReject};
+pub mod pq_migration;
+pub use pq_migration::{
+    PqMigrationReject, RescueCommit, RescueReveal, WithdrawalCredentialRotation,
+};
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
 use crate::schedule;
-use crate::attestation::KeyLookup as _;
 use crate::slashing;
 use crate::staking::{self, QueuedDeposit};
 use crate::fee_market;
@@ -292,6 +305,10 @@ pub struct TransferOutput {
 /// not receive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PosTransaction {
+    /// Experimental native settlement (0x12); rejected without a genesis policy.
+    L2Settlement(Box<crate::l2_settlement::Transaction>),
+    /// Manifest-bound asynchronous settlement (0x13).
+    L2SettlementAsync(Box<crate::l2_settlement::Transaction>),
     /// PQ-authorized, UTXO-funded validator registration (wire 0x0B).
     FundedDeposit(FundedDeposit),
     /// PQ-authorized, UTXO-funded delegation to an existing validator (wire
@@ -303,6 +320,23 @@ pub enum PosTransaction {
     FundedDelegationWithdraw(FundedDelegationWithdraw),
     /// Validator-authorized commission update for future delegation (wire 0x11).
     ValidatorCommissionUpdate(ValidatorCommissionUpdate),
+    /// Escrow BLCH into the asynchronous L2 inbox (development networks).
+    L2Deposit(L2Deposit),
+    /// Publish one L2 block's user-transaction batch on L1 (0x15,
+    /// development networks with `devnet-l2-user-txs`).
+    L2DataAvailability(L2DataAvailability),
+    /// Release one settled, matured L2 withdrawal from escrow to its L1
+    /// recipient (0x16, development networks with `devnet-l2-user-txs`).
+    L2WithdrawClaim(L2WithdrawClaim),
+    /// Rotate a validator's withdrawal credential to a hash-based-suite key
+    /// (0x18). INERT until `params::HF3_PQ_MIGRATION_EPOCH`.
+    WithdrawalCredentialRotation(WithdrawalCredentialRotation),
+    /// Publish a lattice-break rescue commitment (0x19). INERT until
+    /// `params::LATTICE_EMERGENCY_ACTIVATION_EPOCH`.
+    RescueCommit(RescueCommit),
+    /// Sweep a lattice key's outputs against a matured commitment (0x1A).
+    /// INERT until `params::LATTICE_EMERGENCY_ACTIVATION_EPOCH`.
+    RescueReveal(RescueReveal),
     /// A value transfer against the committed eUTXO set, priced by the L1 fee
     /// market: **gas × price**, where the gas is derived (class + size,
     /// `fee_market::intrinsic_gas`) and the price is the base fee this block's
@@ -545,6 +579,36 @@ pub enum PosTransaction {
         /// [`crate::beacon::recommit_signing_root`].
         signature: Vec<u8>,
     },
+    /// Register a forward-secure (KES) key for a validator, once (wire
+    /// 0x17). Refused before [`crate::params::KES_REGISTRATION_EPOCH`].
+    /// Authorised by the validator's registered static key over
+    /// [`crate::kes::register_signing_root`] (network domain, index, depth,
+    /// root). From [`crate::params::KES_ACTIVATION_EPOCH`] on, the
+    /// validator's proposals and votes verify only under this root.
+    KesRegister {
+        validator: u32,
+        depth: u8,
+        root: [u8; 32],
+        /// Hybrid signature by the registered static key.
+        signature: Vec<u8>,
+    },
+    /// Replace a validator's KES key from the next period on (HF3, wire
+    /// [`crate::kes::ROTATE_TAG`]). Refused before
+    /// [`crate::params::HF3_KES_EPOCH`] and before KES enforcement (there is
+    /// no period to sign in). Authorised ONLY by the leaf of period `period`
+    /// of the key in force, over [`crate::kes::rotate_signing_root`] bound
+    /// through [`crate::kes::leaf_message`]; valid only in a block of that
+    /// period; at most one per validator per period. The new tree signs from
+    /// `period + 1` (its start period).
+    KesRotate {
+        validator: u32,
+        /// Global KES period the rotation is signed in (the block's).
+        period: u64,
+        depth: u8,
+        root: [u8; 32],
+        /// Encoded `crate::kes::KesSignature` by the current leaf.
+        signature: Vec<u8>,
+    },
     /// Bond delegated stake behind an operator.
     Delegate {
         delegator: u32,
@@ -674,6 +738,12 @@ impl PosTransaction {
             PosTransaction::FundedUndelegate(tx) => return tx.signing_root(),
             PosTransaction::FundedDelegationWithdraw(tx) => return tx.signing_root(),
             PosTransaction::ValidatorCommissionUpdate(tx) => return tx.signing_root(),
+            PosTransaction::L2Deposit(tx) => return tx.intent_root(),
+            PosTransaction::L2DataAvailability(tx) => return tx.intent_root(),
+            PosTransaction::L2WithdrawClaim(tx) => return tx.intent_root(),
+            PosTransaction::WithdrawalCredentialRotation(tx) => return tx.signing_root(),
+            PosTransaction::RescueCommit(tx) => return tx.signing_root(),
+            PosTransaction::RescueReveal(tx) => return tx.signing_root(),
             other => h.update(other.canonical_bytes()),
         }
         h.finalize().into()
@@ -837,11 +907,19 @@ impl PosTransaction {
             b.extend_from_slice(bytes);
         };
         match self {
+            PosTransaction::L2Settlement(tx) => return tx.encode(),
+            PosTransaction::L2SettlementAsync(tx) => return tx.encode_async(),
             PosTransaction::FundedDeposit(tx) => return tx.canonical_bytes(),
             PosTransaction::FundedDelegate(tx) => return tx.canonical_bytes(),
             PosTransaction::FundedUndelegate(tx) => return tx.canonical_bytes(),
             PosTransaction::FundedDelegationWithdraw(tx) => return tx.canonical_bytes(),
             PosTransaction::ValidatorCommissionUpdate(tx) => return tx.canonical_bytes(),
+            PosTransaction::L2Deposit(tx) => return tx.canonical_bytes(),
+            PosTransaction::L2DataAvailability(tx) => return tx.canonical_bytes(),
+            PosTransaction::L2WithdrawClaim(tx) => return tx.canonical_bytes(),
+            PosTransaction::WithdrawalCredentialRotation(tx) => return tx.canonical_bytes(),
+            PosTransaction::RescueCommit(tx) => return tx.canonical_bytes(),
+            PosTransaction::RescueReveal(tx) => return tx.canonical_bytes(),
             PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
                 // Counts are length prefixes like every other variable-length
@@ -932,6 +1010,23 @@ impl PosTransaction {
                 b.push(0x0C);
                 b.extend_from_slice(pubkey_hash);
                 b.extend_from_slice(&epoch.to_le_bytes());
+                put(&mut b, signature);
+            }
+            PosTransaction::KesRegister { validator, depth, root, signature } => {
+                // Fixed-width fields, then a length-prefixed signature.
+                b.push(crate::kes::REGISTER_TAG);
+                b.extend_from_slice(&validator.to_le_bytes());
+                b.push(*depth);
+                b.extend_from_slice(root);
+                put(&mut b, signature);
+            }
+            PosTransaction::KesRotate { validator, period, depth, root, signature } => {
+                // Fixed-width fields, then a length-prefixed KES signature.
+                b.push(crate::kes::ROTATE_TAG);
+                b.extend_from_slice(&validator.to_le_bytes());
+                b.extend_from_slice(&period.to_le_bytes());
+                b.push(*depth);
+                b.extend_from_slice(root);
                 put(&mut b, signature);
             }
             PosTransaction::RandaoRecommit { validator, new_commitment, epoch, signature } => {
@@ -1026,6 +1121,14 @@ impl PosTransaction {
     /// reaches at its decoder; at and above it, the transition judges the
     /// evidence.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, TxDecodeError> {
+        if bytes.first() == Some(&crate::l2_settlement::WIRE_TAG) {
+            return crate::l2_settlement::Transaction::decode(bytes)
+                .map(|tx| Self::L2Settlement(Box::new(tx))).ok_or(TxDecodeError::Truncated);
+        }
+        if bytes.first() == Some(&crate::l2_settlement::ASYNC_WIRE_TAG) {
+            return crate::l2_settlement::Transaction::decode_async(bytes)
+                .map(|tx| Self::L2SettlementAsync(Box::new(tx))).ok_or(TxDecodeError::Truncated);
+        }
         let mut r = TxReader { b: bytes, i: 0 };
         let tag = r.u8()?;
         let tx = match tag {
@@ -1038,6 +1141,14 @@ impl PosTransaction {
                 PosTransaction::FundedDelegationWithdraw(FundedDelegationWithdraw::decode(&mut r)?),
             funded_delegation::VALIDATOR_COMMISSION_UPDATE_TAG =>
                 PosTransaction::ValidatorCommissionUpdate(ValidatorCommissionUpdate::decode(&mut r)?),
+            l2_deposit::L2_DEPOSIT_TAG => PosTransaction::L2Deposit(L2Deposit::decode(&mut r)?),
+            l2_da::L2_DATA_AVAILABILITY_TAG => PosTransaction::L2DataAvailability(L2DataAvailability::decode(&mut r)?),
+            l2_claim::L2_WITHDRAW_CLAIM_TAG => PosTransaction::L2WithdrawClaim(L2WithdrawClaim::decode(&mut r)?),
+            pq_migration::WITHDRAWAL_CREDENTIAL_ROTATION_TAG => PosTransaction::WithdrawalCredentialRotation(
+                WithdrawalCredentialRotation::decode(&mut r)?,
+            ),
+            pq_migration::RESCUE_COMMIT_TAG => PosTransaction::RescueCommit(RescueCommit::decode(&mut r)?),
+            pq_migration::RESCUE_REVEAL_TAG => PosTransaction::RescueReveal(RescueReveal::decode(&mut r)?),
             0x01 => {
                 // Counts are read from untrusted bytes, so nothing is
                 // preallocated from them: a 4-billion-input header on a 40-byte
@@ -1095,6 +1206,12 @@ impl PosTransaction {
                 pubkey_hash: r.h32()?, epoch: r.u64()?, signature: r.bytes()?,
             },
             0x0D => PosTransaction::Withdraw { validator: r.u32()? },
+            crate::kes::REGISTER_TAG => PosTransaction::KesRegister {
+                validator: r.u32()?, depth: r.u8()?, root: r.h32()?, signature: r.bytes()?,
+            },
+            crate::kes::ROTATE_TAG => PosTransaction::KesRotate {
+                validator: r.u32()?, period: r.u64()?, depth: r.u8()?, root: r.h32()?, signature: r.bytes()?,
+            },
             0x0A => PosTransaction::RandaoRecommit {
                 validator: r.u32()?, new_commitment: r.h32()?,
                 epoch: r.u64()?, signature: r.bytes()?,
@@ -1243,8 +1360,15 @@ impl core::fmt::Display for TxDecodeError {
 /// refuses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxReject {
+    L2Settlement(crate::l2_settlement::Reject),
     FundedDeposit(FundedDepositReject),
     FundedDelegation(FundedDelegationReject),
+    L2Deposit(L2DepositReject),
+    L2DataAvailability(L2DataAvailabilityReject),
+    L2WithdrawClaim(L2WithdrawClaimReject),
+    /// A post-quantum migration rule (credential rotation, lattice-spend
+    /// freeze, rescue commit/reveal) refused the transaction.
+    PqMigration(PqMigrationReject),
     /// A value transfer broke one of the eUTXO rules.
     Transfer(TransferReject),
     /// A deposit, exit or delegation failed its state-dependent rule.
@@ -1719,13 +1843,14 @@ pub struct CommittedState {
     /// [`Self::delegator_fee_rewards`], for exactly the same ledger reason:
     /// crediting a delegation record's `amount_sat` directly would
     /// retroactively reshuffle every later warm-up admission under the
-    /// shared churn budget. Below
-    /// [`crate::params::REWARDS_V2_ACTIVATION_EPOCH`] the issuance loop
+    /// shared churn budget. Below both
+    /// [`crate::params::REWARDS_V2_ACTIVATION_EPOCH`] and
+    /// [`crate::params::FUNDED_DELEGATION_ACTIVATION_EPOCH`] the issuance loop
     /// calls `rewards::distribute` with `delegated_stake: 0`, so
     /// `Payout::delegators` is always zero and this map is never written —
     /// it contributes ZERO leaves under `TAG_DELEGATOR_ISSUANCE_REWARD`
     /// while empty, so every pre-gate root is unchanged by its mere
-    /// existence. At and above the gate, `close_epoch` settles each
+    /// existence. Once either gate is active, `close_epoch` settles each
     /// validator's `payout.delegators` here, split pro-rata by activated
     /// stake (mirroring the fee path's `split_delegator_fees`). Read by the
     /// wallet surface ([`Self::delegator_issuance_reward_sat`]).
@@ -1762,6 +1887,25 @@ pub struct CommittedState {
     /// The node's execution layer computes it; this transition only commits
     /// it, exactly like the Coherence roots above.
     evm: EvmCommitment,
+    l2_settlement: Option<crate::l2_settlement::State>,
+    /// Lattice-break rescue commitments (commitment → inclusion epoch),
+    /// `transition::pq_migration`. EMPTY until
+    /// `params::LATTICE_EMERGENCY_ACTIVATION_EPOCH` binds (its only writer is
+    /// behind that gate), and an empty map adds no state-root leaf and no
+    /// local-cache section, so every historical root and cache is unchanged.
+    pq_rescue_commits: BTreeMap<[u8; 32], u64>,
+    /// Forward-secure validator keys (`crate::kes`): registered once by wire
+    /// 0x17, replaced only by a leaf-signed `KesRotate`. Each entry is the key
+    /// in force and at most one successor (`crate::kes::KesEntry`). Committed
+    /// under its own state-root component (tag 0x22) only once non-empty, so
+    /// history without a registration keeps every state root it had.
+    kes: BTreeMap<u32, crate::kes::KesEntry>,
+    /// The epoch KES enforcement bound on chain (`None` until it does): the
+    /// first epoch boundary at or after `HF3_KES_ENFORCE_EPOCH` where
+    /// registered, unexpired KES keys cover
+    /// `KES_MIN_REGISTERED_STAKE_BPS` of the consensus roster's stake. Never
+    /// cleared. Committed under component 0x22 only once set.
+    kes_enforced_from: Option<u64>,
     /// Cumulative issued supply in satoshis — the hard-cap invariant's
     /// counter (2026-08-12), committed under `TAG_ISSUED_SUPPLY`.
     ///
@@ -1860,6 +2004,45 @@ impl crate::attestation::KeyLookup for BTreeMap<u32, ValidatorRecord> {
 impl crate::attestation::KeyLookup for CommittedState {
     fn pubkey(&self, validator: u32) -> Option<&[u8]> {
         self.validators.pubkey(validator)
+    }
+    fn kes_public(&self, validator: u32, period: u64) -> Option<crate::kes::KesPublic> {
+        self.kes.get(&validator).map(|entry| entry.in_force(period))
+    }
+    fn kes_network_domain(&self) -> Option<[u8; 32]> {
+        Some(self.admission_network_domain.unwrap_or([0; 32]))
+    }
+    fn kes_enforced_from(&self) -> Option<Option<u64>> {
+        Some(self.kes_enforced_from)
+    }
+}
+
+/// The registry, its KES keys and the network domain, borrowed field by field
+/// so a transition step can hold it while mutating other parts of the same
+/// state (the reason the map impl above exists). Every consensus signature
+/// check inside the transition resolves through this view, so the static key
+/// before KES enforcement and the KES leaf after it come from one pre-state.
+pub(crate) struct RegistryView<'a> {
+    pub(crate) validators: &'a BTreeMap<u32, ValidatorRecord>,
+    pub(crate) kes: &'a BTreeMap<u32, crate::kes::KesEntry>,
+    /// `CommittedState::admission_network_domain`, which KES leaf signatures
+    /// commit to (`crate::kes::leaf_message`).
+    pub(crate) network_domain: Option<[u8; 32]>,
+    /// `CommittedState::kes_enforced_from`.
+    pub(crate) enforced_from: Option<u64>,
+}
+
+impl crate::attestation::KeyLookup for RegistryView<'_> {
+    fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+        self.validators.pubkey(validator)
+    }
+    fn kes_public(&self, validator: u32, period: u64) -> Option<crate::kes::KesPublic> {
+        self.kes.get(&validator).map(|entry| entry.in_force(period))
+    }
+    fn kes_network_domain(&self) -> Option<[u8; 32]> {
+        Some(self.network_domain.unwrap_or([0; 32]))
+    }
+    fn kes_enforced_from(&self) -> Option<Option<u64>> {
+        Some(self.enforced_from)
     }
 }
 
@@ -2331,6 +2514,10 @@ impl CommittedState {
             coherence_accumulator_root,
             coherence_nullifier_root,
             evm,
+            l2_settlement: None,
+            pq_rescue_commits: BTreeMap::new(),
+            kes: BTreeMap::new(),
+            kes_enforced_from: None,
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
             eutxos: opening_balances.iter().cloned().collect(),
         };
@@ -2421,6 +2608,46 @@ impl CommittedState {
             &self.coherence_accumulator_root,
             &self.coherence_nullifier_root,
         )
+    }
+
+    /// New-network setup only; existing manifests never call this constructor.
+    pub fn configure_l2_genesis(mut self, policy: crate::l2_settlement::Policy)
+        -> Result<Self, crate::l2_settlement::Reject> {
+        if self.slot != 0 || self.epoch != 0 || self.l2_settlement.is_some()
+            || self.admission_network_domain != Some(policy.identities[0])
+            || self.head.as_bytes() != &policy.identities[1] {
+            return Err(crate::l2_settlement::Reject::Policy);
+        }
+        self.l2_settlement = Some(crate::l2_settlement::State::genesis(policy)?);
+        Ok(self)
+    }
+    /// A separate committed mode: existing genesis constructors keep 0x0E semantics.
+    pub fn configure_l2_genesis_async(self, policy: crate::l2_settlement::Policy)
+        -> Result<Self, crate::l2_settlement::Reject> {
+        let mut state = self.configure_l2_genesis(policy.clone())?;
+        state.l2_settlement = Some(crate::l2_settlement::State::genesis_async(policy)?);
+        Ok(state)
+    }
+    pub fn l2_settlement(&self) -> Option<&crate::l2_settlement::State> { self.l2_settlement.as_ref() }
+    /// This chain's own checkpoint root of `epoch` as recorded for the FFG
+    /// tally (`params::HF1_OWN_TARGET_VOTES_EPOCH`): `None` below the
+    /// gate and for epochs no longer retained. The node's attester votes this
+    /// root when present, so its vote is exactly what the tally of its own
+    /// head's chain counts.
+    pub fn own_checkpoint_root(&self, epoch: u64) -> Option<[u8; 32]> {
+        self.finality_engine.own_checkpoint_root(epoch)
+    }
+    /// Whether `data` names this chain's own checkpoints: its target is the
+    /// recorded own root of its target epoch, and its source the recorded own
+    /// root of its source epoch when one is recorded (a pre-gate source has
+    /// none; see `finality::FinalityState::process_epoch`). Meaningful only
+    /// from `params::HF1_OWN_TARGET_VOTES_EPOCH`.
+    pub(crate) fn names_own_checkpoints(&self, data: &AttestationData) -> bool {
+        self.finality_engine.own_checkpoint_root(data.target_epoch) == Some(data.target_root)
+            && self
+                .finality_engine
+                .own_checkpoint_root(data.source_epoch)
+                .is_none_or(|root| root == data.source_root)
     }
 
     pub fn head(&self) -> BlockId {
@@ -2595,11 +2822,19 @@ impl CommittedState {
     /// one is still reachable through the real evidence-processing path — see
     /// the updated docs on both.
     fn duty_roster_at(&self, epoch: u64) -> Vec<Validator> {
-        // Delegated stake resolved by the delegation module's own fold; its
-        // per-validator cap uses the fixed-point form (rule 3 — the cap is
-        // measured against the capped total, not the total it reduces).
+        // Delegated stake resolved by the delegation module's warm-up fold.
         let reg = delegation::Registry::resolve(&self.delegations, epoch);
-        let delegated = reg.validators(); // sorted by index
+        // Funded delegation uses the fixed principal ceiling. Reusing the
+        // legacy percentage fixed point here can round the cap to zero and
+        // bypass it, or collapse an adjacent cardinality to a few satoshis.
+        // The historical branch remains byte-identical below activation.
+        let delegated = if crate::params::funded_delegation_active(epoch) {
+            reg.validators_with_absolute_cap(
+                funded_delegation::MAX_FUNDED_DELEGATION_PER_VALIDATOR_SAT,
+            )
+        } else {
+            reg.validators()
+        }; // sorted by index
 
         let mut roster: Vec<Validator> = Vec::new();
         for (idx, rec) in &self.validators {
@@ -2720,7 +2955,28 @@ impl CommittedState {
         ROOT_COMPUTATION_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
         // Instrumentation only; compiled out without `perf-timing`.
         let _perf = crate::perf::span(crate::perf::Phase::StateRoot);
-        let validators: Vec<CommittedValidatorRecord> = self
+        self.compute_tree().root()
+    }
+
+    /// The full committed state tree whose root is [`Self::compute_root`].
+    ///
+    /// Library-only accessor for proof producers (finality certificates):
+    /// the SAME construction the root uses, split out so a proof cannot be
+    /// built against a different tree than the one the header commits. Pure,
+    /// read-only; it changes no root and no consensus input.
+    pub fn state_tree(&self) -> crate::state_root::Smt {
+        self.compute_tree()
+    }
+
+    /// Canonical committed bytes of every validator registry record, by
+    /// index ascending — the exact leaves [`Self::state_tree`] holds under
+    /// `TAG_VALIDATOR`.
+    pub fn committed_validator_records(&self) -> Vec<CommittedValidatorRecord> {
+        self.committed_validators()
+    }
+
+    fn committed_validators(&self) -> Vec<CommittedValidatorRecord> {
+        self
             .validators
             .values()
             .map(|r| CommittedValidatorRecord {
@@ -2743,7 +2999,11 @@ impl CommittedState {
                 withdrawal_credentials: r.withdrawal_credentials.clone(),
                 commission_bps: r.commission_bps,
             })
-            .collect();
+            .collect()
+    }
+
+    fn compute_tree(&self) -> crate::state_root::Smt {
+        let validators: Vec<CommittedValidatorRecord> = self.committed_validators();
         let current: Vec<ParticipationRecord> = self
             .current_participation
             .iter()
@@ -2780,6 +3040,16 @@ impl CommittedState {
                 .map(|(validator, leaked_sat)| LeakRecord { validator, leaked_sat })
                 .collect(),
             next_epoch: self.finality_engine.next_epoch(),
+            finality_set: self.finality_engine.finality_set().map(|fs| {
+                let pairs = |m: &BTreeMap<u32, u64>| m.iter().map(|(v, x)| (*v, *x)).collect();
+                crate::state_root::FinalitySetRecord {
+                    current_epoch: fs.current.epoch,
+                    current: pairs(&fs.current.members),
+                    pending: fs.pending.as_ref().map(|p| (p.epoch, pairs(&p.members))),
+                    last_seen: pairs(&fs.last_seen),
+                }
+            }),
+            own_checkpoints: self.finality_engine.own_checkpoints().map(cp).collect(),
         };
         // The signing root travels from the accumulation key into the leaf
         // key untouched — computed once, in attestation.rs, never re-derived.
@@ -2935,7 +3205,7 @@ impl CommittedState {
         // (It genuinely WAS `&[]` once, under a comment saying the node
         // supplied it, and nothing did: every block from genesis committed an
         // empty balance component. Hence the emphasis.)
-        crate::state_root::state_root_with_eutxo_tree(&ConsensusState {
+        let mut tree = crate::state_root::build_state_tree_with_eutxo_tree(&ConsensusState {
             written_off_sat: self.written_off_sat,
             funded_validators: &self.funded_validators.iter().copied().collect::<Vec<_>>(),
             stake_low_water: &self.stake_low_water.iter().map(|(k,v)| (*k,*v)).collect::<Vec<_>>(),
@@ -2972,7 +3242,15 @@ impl CommittedState {
             coherence_nullifier_root: self.coherence_nullifier_root,
             evm: self.evm,
             issued_sat: self.issued_sat,
-        }, self.eutxos.tree())
+        }, self.eutxos.tree());
+        if let Some(state) = &self.l2_settlement {
+            crate::state_root::insert_l2_settlement(&mut tree, &state.committed_bytes());
+        }
+        if !self.kes.is_empty() || self.kes_enforced_from.is_some() {
+            crate::state_root::insert_kes_roots(&mut tree, &self.kes, self.kes_enforced_from);
+        }
+        crate::state_root::insert_pq_rescue_commits(&mut tree, &self.pq_rescue_commits);
+        tree
     }
 
     // ── Fork-choice accumulation ────────────────────────────────────────────
@@ -3474,7 +3752,28 @@ impl CommittedState {
         base_fee_millisat_per_gas: u128,
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, TxReject> {
+        // HF2 scope (owner decision): every transaction witness below is
+        // judged under the TRANSACTION rule, which accepts every v1 encoding
+        // before and after SIG_CANONICAL_ACTIVATION_EPOCH; only the ML-DSA
+        // backend is pinned from MLDSA_PIN_ACTIVATION_EPOCH. `self.epoch` is
+        // the committed epoch rolled to the judged block, never a clock.
+        let gated = crate::attestation::PolicyVerifier::new(
+            verifier,
+            crate::attestation::SignaturePolicy::transaction(self.epoch),
+        );
+        let verifier: &dyn SignatureVerifier = &gated;
         match tx {
+            PosTransaction::L2Settlement(settlement) | PosTransaction::L2SettlementAsync(settlement) => {
+                let asynchronous = matches!(tx, PosTransaction::L2SettlementAsync(_));
+                let state = self.l2_settlement.as_mut()
+                    .ok_or(TxReject::L2Settlement(crate::l2_settlement::Reject::NotActive))?;
+                state.apply(settlement, *self.head.as_bytes(), self.slot, asynchronous, verifier).map_err(TxReject::L2Settlement)?;
+                // Protocol-only empty-inbox transaction: no synthetic fee credit.
+                // One verification reserves the complete block gas budget.
+                Ok(fee_market::TxCharge { gas: fee_market::BLOCK_GAS_LIMIT,
+                    tx_bytes: (1 + 32 + settlement.statement.len() + crate::l2_settlement::PROOF_BYTES) as u64,
+                    base_fee_sat: 0, priority_fee_sat: 0 })
+            }
             PosTransaction::Withdraw { validator } => self.apply_withdrawal(*validator, tx),
             PosTransaction::FundedDeposit(deposit) => self
                 .apply_funded_deposit(deposit, total_active_sat, base_fee_millisat_per_gas, verifier)
@@ -3491,9 +3790,31 @@ impl CommittedState {
             PosTransaction::ValidatorCommissionUpdate(update) => self
                 .apply_validator_commission_update(update, verifier)
                 .map_err(TxReject::FundedDelegation),
-            PosTransaction::Transfer { .. } => self
-                .apply_transfer(tx, base_fee_millisat_per_gas, verifier)
-                .map_err(TxReject::Transfer),
+            PosTransaction::L2Deposit(deposit) => self
+                .apply_l2_deposit(deposit, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::L2Deposit),
+            PosTransaction::L2DataAvailability(batch) => self
+                .apply_l2_data_availability(batch, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::L2DataAvailability),
+            PosTransaction::L2WithdrawClaim(claim) => self
+                .apply_l2_withdraw_claim(claim, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::L2WithdrawClaim),
+            PosTransaction::WithdrawalCredentialRotation(rotation) => self
+                .apply_withdrawal_credential_rotation(rotation, verifier)
+                .map_err(TxReject::PqMigration),
+            PosTransaction::RescueCommit(commit) => self
+                .apply_rescue_commit(commit)
+                .map_err(TxReject::PqMigration),
+            PosTransaction::RescueReveal(reveal) => self
+                .apply_rescue_reveal(reveal, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::PqMigration),
+            PosTransaction::Transfer { .. } => {
+                // Emergency freeze (INERT: never evaluated below
+                // `LATTICE_EMERGENCY_ACTIVATION_EPOCH`).
+                self.check_lattice_spend_freeze(tx)?;
+                self.apply_transfer(tx, base_fee_millisat_per_gas, verifier)
+                    .map_err(TxReject::Transfer)
+            }
             PosTransaction::TransferV2 { .. } => {
                 // THE FLAG-DAY GATE, FIRST — before any other look at the
                 // transaction. Read from `self.epoch`, which is COMMITTED
@@ -3507,6 +3828,7 @@ impl CommittedState {
                 if self.epoch < crate::params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH {
                     return Err(TxReject::Transfer(TransferReject::FormatNotActive));
                 }
+                self.check_lattice_spend_freeze(tx)?;
                 self.apply_transfer_v2(tx, base_fee_millisat_per_gas, verifier)
                     .map_err(TxReject::Transfer)
             }
@@ -3666,6 +3988,32 @@ impl CommittedState {
                 // R7 M1: one hybrid verification, paid inside `apply_exit_v2`.
                 let epoch_for_charge = self.epoch;
                 self.apply_exit_v2(pubkey_hash, *epoch, signature, verifier).map(|()| {
+                    Self::staking_tx_charge(epoch_for_charge, 1, tx.canonical_bytes().len())
+                })
+            }
+            PosTransaction::KesRegister { validator, depth, root, signature } => {
+                // THE FLAG-DAY GATE, FIRST, from committed state: before
+                // `KES_REGISTRATION_EPOCH` a block carrying 0x17 is refused
+                // exactly as the previous release refused the undecodable tag.
+                if !crate::params::kes_registration_open(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
+                // One hybrid verification, like the other validator-signed arms.
+                let epoch_for_charge = self.epoch;
+                self.apply_kes_register(*validator, *depth, root, signature, verifier).map(|()| {
+                    Self::staking_tx_charge(epoch_for_charge, 1, tx.canonical_bytes().len())
+                })
+            }
+            PosTransaction::KesRotate { validator, period, depth, root, signature } => {
+                // THE HF3 GATE, FIRST, from committed state: before
+                // `HF3_KES_EPOCH` the tag is refused exactly as the previous
+                // release refused the undecodable byte.
+                if !crate::params::kes_registration_open(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
+                // One leaf (hybrid) verification plus a Merkle path.
+                let epoch_for_charge = self.epoch;
+                self.apply_kes_rotate(*validator, *period, *depth, root, signature, verifier).map(|()| {
                     Self::staking_tx_charge(epoch_for_charge, 1, tx.canonical_bytes().len())
                 })
             }
@@ -3904,6 +4252,214 @@ impl CommittedState {
     /// the exhaustion precondition, and only then the one hybrid
     /// verification (~145 µs). Every check runs before any mutation, so a
     /// refused re-commit leaves the state untouched.
+    /// Wire 0x17: record `validator`'s KES key, once ([`Self::check_kes_register`]
+    /// first; the insertion is the only mutation).
+    fn apply_kes_register(
+        &mut self,
+        validator: u32,
+        depth: u8,
+        root: &[u8; 32],
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<(), TxReject> {
+        let public = self.check_kes_register(validator, depth, root, signature, verifier)?;
+        // A rescue keeps the expired key in the history (review R-1), so
+        // evidence it signed stays provable.
+        let entry = match self.kes.get(&validator) {
+            Some(old) => old.replaced_by(public, crate::params::kes_period(self.epoch).unwrap_or(0)),
+            None => public.into(),
+        };
+        self.kes.insert(validator, entry);
+        Ok(())
+    }
+
+    /// Every rule of a KES registration except the flag-day gate, against
+    /// this state and without mutating it (consensus and mempool share it):
+    /// refused for an unknown, slashed or exited validator, an out-of-range
+    /// depth, a validator that already has a key, or a signature that is not
+    /// the registered static key's over [`crate::kes::register_signing_root`].
+    /// The one hybrid verification runs last.
+    pub(crate) fn check_kes_register(
+        &self,
+        validator: u32,
+        depth: u8,
+        root: &[u8; 32],
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<crate::kes::KesPublic, TxReject> {
+        if !(crate::params::kes_schedule().min_depth.max(crate::kes::MIN_DEPTH)..=crate::kes::MAX_DEPTH).contains(&depth) {
+            return Err(TxReject::StakingRule);
+        }
+        let Some(rec) = self.validators.get(&validator) else {
+            return Err(TxReject::StakingRule);
+        };
+        if rec.slashed || rec.exit_epoch <= self.epoch {
+            return Err(TxReject::StakingRule);
+        }
+        let period = crate::params::kes_period(self.epoch);
+        let bound = self.kes_enforced_from.is_some_and(|from| self.epoch >= from);
+        // Per-key start (readiness blocker B1): period 0 while KES does not
+        // bind yet, else the period after the one it is included in.
+        let mut start_period = match (bound, period) {
+            (true, Some(p)) => p.saturating_add(1),
+            _ => 0,
+        };
+        if let Some(entry) = self.kes.get(&validator) {
+            // Registration is once-only, except as a RESCUE (readiness B3):
+            // after KES binds, once the key in force has EXPIRED with no
+            // successor pending, the static key may register a fresh tree,
+            // which starts `KES_RESCUE_DELAY_PERIODS` later. An unexpired key
+            // is never replaced by the static key: a static key stolen or
+            // sold later must not take over forward-secure signing
+            // (long-range). Renewal of a live key is `KesRotate`; a lost but
+            // unexpired `validator.kes` is recovered by exit and re-join.
+            if !self.kes_rescue_open(validator) {
+                return Err(TxReject::StakingRule);
+            }
+            start_period = period.unwrap_or(0).saturating_add(crate::params::KES_RESCUE_DELAY_PERIODS);
+            if entry.in_force(period.unwrap_or(0)).root == *root
+                || entry.next.is_some_and(|next| next.root == *root)
+                || entry.retired.iter().any(|r| r.public.root == *root)
+            {
+                return Err(TxReject::StakingRule);
+            }
+        }
+        let public = crate::kes::KesPublic::new(depth, *root, start_period);
+        let domain = self.admission_network_domain.unwrap_or([0; 32]);
+        let message = crate::kes::register_signing_root(&domain, validator, &public);
+        if !verifier.verify_with_key(&rec.pubkey, &message, signature) {
+            return Err(TxReject::StakingRule);
+        }
+        Ok(public)
+    }
+
+    /// Wire `ROTATE_TAG`: settle a successor already in force, then record
+    /// the new key from `period + 1` ([`Self::check_kes_rotate`] first).
+    fn apply_kes_rotate(
+        &mut self,
+        validator: u32,
+        period: u64,
+        depth: u8,
+        root: &[u8; 32],
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<(), TxReject> {
+        let entry = self.check_kes_rotate(validator, period, depth, root, signature, verifier)?;
+        self.kes.insert(validator, entry);
+        Ok(())
+    }
+
+    /// Every rule of a KES rotation except the HF3 gate, against this state
+    /// and without mutating it (consensus and mempool share it). Returns the
+    /// entry the rotation leaves. Refused when: KES is not enforced at this
+    /// epoch, or `period` is not this epoch's period (a rotation is valid
+    /// only in a block of the period it was signed in); the validator is
+    /// unknown, slashed, exited or has no KES key; a rotation is already
+    /// pending (one per validator per period); the depth is out of range or
+    /// the new tree repeats the key in force; or the signature is not the
+    /// in-force key's leaf of `period` over
+    /// [`crate::kes::rotate_signing_root`]. The static key has no say here.
+    pub(crate) fn check_kes_rotate(
+        &self,
+        validator: u32,
+        period: u64,
+        depth: u8,
+        root: &[u8; 32],
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<crate::kes::KesEntry, TxReject> {
+        if crate::params::kes_period(self.epoch) != Some(period)
+            || !(crate::params::kes_schedule().min_depth.max(crate::kes::MIN_DEPTH)..=crate::kes::MAX_DEPTH).contains(&depth)
+        {
+            return Err(TxReject::StakingRule);
+        }
+        let Some(entry) = self.kes.get(&validator) else {
+            return Err(TxReject::StakingRule);
+        };
+        let Some(rec) = self.validators.get(&validator) else {
+            return Err(TxReject::StakingRule);
+        };
+        if rec.slashed || rec.exit_epoch <= self.epoch {
+            return Err(TxReject::StakingRule);
+        }
+        let settled = entry.settled(period);
+        if settled.pending_at(period).is_some() {
+            return Err(TxReject::StakingRule);
+        }
+        let current = settled.in_force(period);
+        let next = crate::kes::KesPublic::new(depth, *root, period.saturating_add(1));
+        // Never back to the tree in force or to one in the history: a reused
+        // tree's old leaves may already be compromised.
+        if next.same_tree(&current) || settled.retired.iter().any(|r| r.public.same_tree(&next)) {
+            return Err(TxReject::StakingRule);
+        }
+        let domain = self.admission_network_domain.unwrap_or([0; 32]);
+        let message = crate::kes::rotate_signing_root(&domain, validator, period, depth, root);
+        let view = RegistryView { validators: &self.validators, kes: &self.kes, network_domain: self.admission_network_domain, enforced_from: self.kes_enforced_from };
+        if crate::kes::verify_validator_in(&view, verifier, validator, Some(period), &message, signature) != Some(true) {
+            return Err(TxReject::StakingRule);
+        }
+        Ok(crate::kes::KesEntry { next: Some(next), ..settled })
+    }
+
+    /// Share (basis points) of the consensus roster's effective stake at
+    /// `epoch` held by validators whose KES key in force at `epoch`'s period
+    /// (period 0 before the gate) is registered and unexpired. The binding
+    /// precondition of KES enforcement.
+    pub fn kes_registered_stake_bps(&self, epoch: u64) -> u64 {
+        let period = crate::params::kes_period(epoch).unwrap_or(0);
+        let roster = self.consensus_roster_at(epoch);
+        let total: u128 = roster.iter().map(|v| u128::from(v.effective_stake)).sum();
+        if total == 0 {
+            return 0;
+        }
+        let covered: u128 = roster
+            .iter()
+            .filter(|v| {
+                self.kes
+                    .get(&v.index)
+                    .is_some_and(|entry| entry.in_force(period).leaf_index(period).is_some())
+            })
+            .map(|v| u128::from(v.effective_stake))
+            .sum();
+        (covered * 10_000 / total) as u64
+    }
+
+    /// May `validator` re-register with its static key now (readiness B3
+    /// rescue)? Only once KES binds, its key in force has expired at this
+    /// state's period, and no rotation is pending. The one rule
+    /// `check_kes_register` and the node's mempool dedupe share.
+    pub fn kes_rescue_open(&self, validator: u32) -> bool {
+        let Some(entry) = self.kes.get(&validator) else {
+            return false;
+        };
+        let bound = self.kes_enforced_from.is_some_and(|from| self.epoch >= from);
+        let p = crate::params::kes_period(self.epoch).unwrap_or(0);
+        bound && p >= entry.in_force(p).end_period() && entry.pending_at(p).is_none()
+    }
+
+    /// The epoch KES enforcement bound on chain, if it has.
+    pub fn kes_enforced_from(&self) -> Option<u64> {
+        self.kes_enforced_from
+    }
+
+    /// The KES key of `validator` in force at global period `period`, if any.
+    pub fn kes_public_at(&self, validator: u32, period: u64) -> Option<crate::kes::KesPublic> {
+        self.kes.get(&validator).map(|entry| entry.in_force(period))
+    }
+
+    /// The KES key of `validator` in force at this state's epoch (its first
+    /// key before enforcement), if any.
+    pub fn kes_public(&self, validator: u32) -> Option<crate::kes::KesPublic> {
+        let period = crate::params::kes_period(self.epoch).unwrap_or(0);
+        self.kes_public_at(validator, period)
+    }
+
+    /// Every validator's KES entry (key in force and pending successor).
+    pub fn kes_roots(&self) -> &BTreeMap<u32, crate::kes::KesEntry> {
+        &self.kes
+    }
+
     fn apply_randao_recommit(
         &mut self,
         validator: u32,
@@ -3963,6 +4519,26 @@ impl CommittedState {
         self.reveals_used.insert(validator, 0);
         self.randao_generations.insert(validator, generation);
         Ok(())
+    }
+
+    /// One eUTXO spend witness. Below HF3 this is exactly
+    /// `verify_with_key` — the pre-HF3 verdict cannot depend on how a verifier
+    /// implements the epoch-aware method. From `params::HF3_SLH_SUITE_EPOCH`
+    /// it is `verify_spend_at_epoch` at the block's committed epoch, which
+    /// the production verifier uses to admit suite 0x0003 witnesses (priced
+    /// per suite by `fee_market::eutxo_class_for_keys` on the same gate).
+    fn spend_witness_verifies(
+        verifier: &dyn SignatureVerifier,
+        epoch: u64,
+        pubkey: &[u8],
+        signing_root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        if crate::params::hf3_slh_suite_active(epoch) {
+            verifier.verify_spend_at_epoch(pubkey, signing_root, signature, epoch)
+        } else {
+            verifier.verify_with_key(pubkey, signing_root, signature)
+        }
     }
 
     /// Authorise, price and apply one value transfer against the committed
@@ -4045,7 +4621,13 @@ impl CommittedState {
         // The class term is the *actual* input count, not a number the
         // transaction asserts: gas buys node CPU, and one hybrid verification
         // per input is what this function is about to spend.
-        let class = fee_market::TxClass::Eutxo { inputs: inputs.len() as u32 };
+        // From the SLH-DSA suite flag day each witness is priced by its own
+        // envelope suite (`fee_market::eutxo_class_for_keys`); below it this is
+        // exactly `Eutxo { inputs: inputs.len() }`.
+        let class = fee_market::eutxo_class_for_keys(
+            self.epoch,
+            inputs.iter().map(|i| i.pubkey.as_slice()),
+        );
 
         // ── The price's two bounds, BEFORE anything is priced ───────────────
         //
@@ -4148,7 +4730,7 @@ impl CommittedState {
             .checked_signing_root_for_network(self.epoch, self.admission_network_domain.as_ref())
             .ok_or(TransferReject::MissingNetworkBinding)?;
         for i in inputs {
-            if !verifier.verify_with_key(&i.pubkey, &signing_root, &i.signature) {
+            if !Self::spend_witness_verifies(verifier, self.epoch, &i.pubkey, &signing_root, &i.signature) {
                 return Err(TransferReject::BadSignature);
             }
         }
@@ -4275,7 +4857,12 @@ impl CommittedState {
 
         // The class term is the TABLE length — see the charge below. Fixed
         // here because the gas ceiling is checked before anything is priced.
-        let class = fee_market::TxClass::Eutxo { inputs: keys.len() as u32 };
+        // Per-suite from the SLH-DSA flag day, as in V1 — one term per table
+        // entry, priced by that entry's envelope suite.
+        let class = fee_market::eutxo_class_for_keys(
+            self.epoch,
+            keys.iter().map(|k| k.pubkey.as_slice()),
+        );
 
         // ── The price's two bounds, BEFORE anything is priced ───────────────
         //
@@ -4461,7 +5048,7 @@ impl CommittedState {
                 .ok_or(TransferReject::MissingNetworkBinding)?,
         };
         for k in keys {
-            if !verifier.verify_with_key(&k.pubkey, &signing_root, &k.signature) {
+            if !Self::spend_witness_verifies(verifier, self.epoch, &k.pubkey, &signing_root, &k.signature) {
                 return Err(TransferReject::BadSignature);
             }
         }
@@ -4586,7 +5173,7 @@ impl CommittedState {
                     offender_effective_sat,
                     including_proposer,
                     verifier,
-                    &self.validators,
+                    &RegistryView { validators: &self.validators, kes: &self.kes, network_domain: self.admission_network_domain, enforced_from: self.kes_enforced_from },
                 )
             }
             SlashingEvidence::ProposerEquivocation { first, second } => {
@@ -4600,7 +5187,7 @@ impl CommittedState {
                     offender_effective_sat,
                     including_proposer,
                     verifier,
-                    &self.validators,
+                    &RegistryView { validators: &self.validators, kes: &self.kes, network_domain: self.admission_network_domain, enforced_from: self.kes_enforced_from },
                 )
             }
         }
@@ -4704,8 +5291,7 @@ impl CommittedState {
 
     /// Total issuance reward settled to one delegator account, in satoshis
     /// (audit R1 M4) — the issuance mirror of [`Self::delegator_fee_reward_sat`].
-    /// Zero everywhere until [`crate::params::REWARDS_V2_ACTIVATION_EPOCH`]
-    /// binds.
+    /// Zero until rewards-v2 or the complete funded-delegation lifecycle binds.
     pub fn delegator_issuance_reward_sat(&self, delegator: u32) -> u128 {
         self.delegator_issuance_rewards.get(&delegator).copied().unwrap_or(0)
     }
@@ -4920,7 +5506,10 @@ impl CommittedState {
             + self.pending_fee_rewards.values().sum::<u128>()
             + self.delegator_fee_rewards.values().sum::<u128>()
             + self.validator_fee_rewards.values().sum::<u128>()
-            + self.delegator_issuance_rewards.values().sum::<u128>();
+            + self.delegator_issuance_rewards.values().sum::<u128>()
+            // L2 escrow is held BLCH (deposits move value in, claims move it
+            // back out); zero on every network without an L2 policy.
+            + self.l2_settlement.as_ref().map_or(0, |l2| l2.escrow_sat());
         let burned = self.delegator_slash_losses.values().sum::<u128>();
         held.saturating_sub(burned)
     }
@@ -5196,9 +5785,13 @@ impl CommittedState {
 
         // R1 M1 + M3 + M4, R7 M5 — behind ONE gate; see
         // `REWARDS_V2_ACTIVATION_EPOCH`'s docs for why all four are bound
-        // together. Below it every branch below takes the ORIGINAL arm,
-        // byte for byte the chain as it stands.
+        // together. Historical behavior is preserved below both this gate
+        // and the complete funded-delegation lifecycle gate.
         let rewards_v2 = Self::rewards_v2_active(closing);
+        // Funded positions must receive their issuance share as part of the
+        // complete lifecycle. This does not opt into rewards-v2's separate
+        // changes to vote validity, leak pricing, or proposer credits.
+        let funded_rewards = crate::params::funded_delegation_active(closing);
 
         // R1 M1: participation credit, scoped to what can actually justify.
         // A vote counts only if it is the validator's ONE vote this epoch —
@@ -5213,6 +5806,33 @@ impl CommittedState {
         // naming any other source could not have been cast against this
         // chain's own history).
         let mut valid_credit: BTreeMap<u32, bool> = BTreeMap::new();
+
+        // Own-chain credit (`params::HF1_OWN_TARGET_VOTES_EPOCH`): a
+        // validator whose vote for this epoch names a checkpoint that is not
+        // this chain's own was ABSENT for the tally above (no quorum weight,
+        // leak, no recovery), so it is absent for issuance too — the same
+        // rule, read off the same recorded roots. Credited only if it has a
+        // vote for `closing` and every such vote names own checkpoints (one
+        // foreign vote beside an own one is a double vote: no credit either).
+        // `None` below the gate: credit is exactly what it was.
+        let own_chain_credit: Option<BTreeSet<u32>> =
+            if crate::params::own_target_votes_active(closing) {
+                let mut own: BTreeSet<u32> = BTreeSet::new();
+                let mut foreign: BTreeSet<u32> = BTreeSet::new();
+                for ((validator, _), data) in &st.pending_votes {
+                    if data.target_epoch != closing {
+                        continue;
+                    }
+                    if st.names_own_checkpoints(data) {
+                        own.insert(*validator);
+                    } else {
+                        foreign.insert(*validator);
+                    }
+                }
+                Some(own.difference(&foreign).copied().collect())
+            } else {
+                None
+            };
         if rewards_v2 {
             let mut seen_root: BTreeMap<u32, [u8; 32]> = BTreeMap::new();
             let mut equivocated: BTreeSet<u32> = BTreeSet::new();
@@ -5250,13 +5870,11 @@ impl CommittedState {
 
         // R1 M4: the delegation registry, resolved once, used both to price
         // each validator's delegated stake/commission and to split the
-        // delegators' share pro-rata by ACTIVATED stake. Only computed
-        // behind the gate — `Registry::resolve` is provably a no-op below it
-        // anyway (nothing reads its result), but there is no reason to pay
-        // even the short-circuited cost of R1 M5 on a live chain that will
-        // not use it.
-        let issuance_registry =
-            if rewards_v2 { Some(delegation::Registry::resolve(&st.delegations, closing)) } else { None };
+        // delegators' share pro-rata by ACTIVATED stake. Funded delegation
+        // also needs this ledger, independently of rewards-v2's credit rules.
+        let issuance_registry = if rewards_v2 || funded_rewards {
+            Some(delegation::Registry::resolve(&st.delegations, closing))
+        } else { None };
 
         // R7 M5: which validators were SCHEDULED to propose at least one
         // slot of the closing epoch, off the same seed and the same
@@ -5279,32 +5897,47 @@ impl CommittedState {
                 // Stake basis is the CAPPED effective stake: stake above the
                 // per-validator or cohort cap carries no weight and earns
                 // nothing — the caps would be decorative otherwise.
-                // `issuance_registry` is `Some` exactly when `rewards_v2`
-                // (resolved above under that very flag), so binding it here
-                // IS the gate test — with no panic site for the impossible
-                // `rewards_v2 && None` case (hardened ratchet, O07).
+                // The registry is present when either issuance splitting
+                // gate is active. Credit rules still follow rewards-v2 alone.
                 let (attested, delegated_stake, commission_bps, extra_credit, extra_max) =
                     if let Some(registry) = issuance_registry.as_ref() {
-                        let attested = valid_credit.get(&v.index).copied().unwrap_or(false);
+                        let attested = (if rewards_v2 {
+                            valid_credit.get(&v.index).copied().unwrap_or(false)
+                        } else {
+                            st.current_participation.get(&v.index).copied().unwrap_or(false)
+                        }) && own_chain_credit.as_ref().is_none_or(|own| own.contains(&v.index));
                         let delegated_stake = registry.stake_of(v.index);
                         let commission_bps =
                             st.validators.get(&v.index).map_or(0, |r| r.commission_bps);
-                        let scheduled = scheduled_to_propose.contains(&v.index);
-                        let produced = *st.current_proposed.get(&v.index).unwrap_or(&false);
+                        let scheduled = rewards_v2 && scheduled_to_propose.contains(&v.index);
+                        let produced = rewards_v2 && *st.current_proposed.get(&v.index).unwrap_or(&false);
                         (attested, delegated_stake, commission_bps, u64::from(scheduled && produced), u64::from(scheduled))
                     } else {
-                        let attested = *st.current_participation.get(&v.index).unwrap_or(&false);
+                        let attested = *st.current_participation.get(&v.index).unwrap_or(&false)
+                            && own_chain_credit.as_ref().is_none_or(|own| own.contains(&v.index));
                         (attested, 0u128, 0u128, 0u64, 0u64)
                     };
-                // The operator/delegator split below the gate happens where
-                // per-delegator accounts exist (DEV-3's wallet surface);
-                // consensus commits only the total, into the bond. At and
-                // above the gate the split is real (R1 M4) and the credit
-                // denominator can include a forfeitable proposer slice
-                // (R7 M5).
+                // The roster's effective stake already includes delegation.
+                // Split that fixed weight between origins; adding delegated
+                // stake to it again would mint a second reward for the same
+                // stake. Scale both origins through the cohort/leak caps.
+                let (self_stake, delegated_stake) = if funded_rewards {
+                    let effective = u128::from(v.effective_stake);
+                    let own = st.validators.get(&v.index).map_or(0, |r| r.staked_sat);
+                    let delegated = delegated_stake.min(
+                        funded_delegation::MAX_FUNDED_DELEGATION_PER_VALIDATOR_SAT,
+                    );
+                    let total = own + delegated;
+                    let delegated_weight = if total == 0 { 0 } else {
+                        effective * delegated / total
+                    };
+                    (effective - delegated_weight, delegated_weight)
+                } else {
+                    (u128::from(v.effective_stake), delegated_stake)
+                };
                 let payout = rewards::distribute(
                     &StakeAccount {
-                        self_stake: v.effective_stake as u128,
+                        self_stake,
                         delegated_stake,
                         commission_bps,
                         credits: u64::from(attested) + extra_credit,
@@ -5333,7 +5966,7 @@ impl CommittedState {
                 // issuance ledger, pro-rata by ACTIVATED stake — mirroring
                 // the fee path's `split_delegator_fees` below (reused as-is:
                 // the arithmetic is a generic pro-rata split, not specific to
-                // fees). Below the gate `delegated_stake` is always 0 above,
+                // fees). Below both gates `delegated_stake` is always 0 above,
                 // so `payout.delegators` is always 0 and this never runs.
                 // `payout.delegators > 0` implies `delegated_stake > 0`, which
                 // is only ever non-zero when the registry above is `Some`; the
@@ -5361,7 +5994,7 @@ impl CommittedState {
                             // unconditional supply-conservation check reject
                             // the first rewards-v2 boundary that has an active
                             // delegation. This branch remains behind the inert
-                            // rewards-v2 gate, so historical/pre-activation
+                            // issuance-splitting gates, so pre-activation
                             // state roots are unchanged.
                             if !mutation_mints_from_nothing() {
                                 st.issued_sat += reward;
@@ -5501,6 +6134,61 @@ impl CommittedState {
         // 5. Open E+1. The cohort cap for the new epoch is applied inside
         //    duty_roster_at (genesis_cohort.rs closed form — rule 3).
         st.epoch = next_epoch;
+        // Rescue commitments past their TTL (no-op on the empty pre-gate map).
+        st.prune_pq_rescue_commits(next_epoch);
+        // HF3 KES: enforcement is decided at the first boundary past the
+        // compiled gate where registered keys cover the stake threshold
+        // (review F-2), and takes effect `KES_BIND_DELAY_EPOCHS` later, so a
+        // node whose head has not crossed this boundary yet still judges the
+        // first KES-signed votes and blocks under the right rule.
+        // Inert while `HF3_KES_ENFORCE_EPOCH` is the sentinel.
+        if st.kes_enforced_from.is_none()
+            && crate::params::kes_period(next_epoch).is_some()
+            && st.kes_registered_stake_bps(next_epoch) >= crate::params::KES_MIN_REGISTERED_STAKE_BPS
+        {
+            st.kes_enforced_from = Some(next_epoch.saturating_add(crate::params::KES_BIND_DELAY_EPOCHS));
+        }
+        // M8 part 2: a running network without L2 state installs the pinned
+        // activation policy at the flag day, only if the policy names this
+        // network. Inert while `L2_SETTLEMENT_ACTIVATION_EPOCH` is the sentinel.
+        if st.l2_settlement.is_none() && crate::params::l2_settlement_active(next_epoch) {
+            if let Some(activation) = crate::l2_settlement::activation_for(st.admission_network_domain) {
+                // The activated profile admits deposits, DA, user
+                // transactions and claims on every build (no cargo
+                // feature), with the pinned limits. An invalid pinned
+                // activation is refused by `armed_l2_gate_has_a_policy`;
+                // it never reaches consensus.
+                if let Ok(state) = crate::l2_settlement::State::activated(activation) {
+                    st.l2_settlement = Some(state);
+                }
+            }
+        }
+        // Claim finality on this chain (HF1_CLAIM_FINALITY_EPOCH):
+        // record this chain's checkpoint of the epoch being opened. `head` is
+        // still the parent here — the last block strictly before the new
+        // epoch's first slot, the root `Engine::checkpoint_root` has
+        // attesters vote — also across empty epochs rolled in one block.
+        // Inert below the gate: nothing recorded, L2 bytes unchanged.
+        if crate::params::native_claim_finality_active(next_epoch) {
+            let finalized_epoch = st.finality_engine.finalized().epoch;
+            let root = *st.head.as_bytes();
+            if let Some(l2) = st.l2_settlement.as_mut() {
+                l2.record_checkpoint_root(next_epoch, root, finalized_epoch);
+            }
+        }
+        // FFG on this chain only (HF1_OWN_TARGET_VOTES_EPOCH): record this
+        // chain's checkpoint of the epoch being opened in the finality state,
+        // where the tally of that epoch reads it. `head` is still the parent
+        // here — the last block strictly before the new epoch's first slot,
+        // the root `Engine::checkpoint_root` has attesters vote — also across
+        // empty epochs rolled in one block. Independent of L2: finality
+        // exists on every network. After the
+        // closing epoch's tally on purpose — retention keeps the justified
+        // checkpoint that tally produced. Inert below the gate.
+        if crate::params::own_target_votes_active(next_epoch) {
+            let root = *st.head.as_bytes();
+            st.finality_engine.record_own_checkpoint(next_epoch, root);
+        }
         // A funded position becomes withdrawable only after both the fixed
         // cool-down and the churn-budget drain have completed. A crowded exit
         // queue can take longer than the nominal cool-down.
@@ -5868,6 +6556,13 @@ impl<V: SignatureVerifier> Transition<V> {
         let roster = st.consensus_roster_at(st.epoch);
         let seed = st.seed_for_epoch(st.epoch);
 
+        // Audit e9b52781 + HF2 review: the proposer signature and every
+        // transaction signature are judged under the block epoch's consensus
+        // rule; each included attestation and each slashing-evidence message
+        // under the rule of ITS OWN epoch (see step 8 and slashing.rs), which
+        // is the rule its signer used.
+        let block_verifier = crate::attestation::PolicyVerifier::consensus(&self.verifier, block_epoch);
+
         // 4. The proposer must be the validator drawn for this slot
         //    (schedule.rs) — a hash away, checked before any signature.
         match schedule::proposer(&seed, header.slot, &roster) {
@@ -5934,15 +6629,20 @@ impl<V: SignatureVerifier> Transition<V> {
         //    signature is bound to its index and cannot be replayed under
         //    another. (Attestation signing roots are NOT so bound; see the
         //    note in step 8.)
-        let Some(proposer_key) = st.validators.pubkey(header.proposer_index) else {
-            return Err(TransitionError::Proposal(ProposalReject::UnknownProposer));
-        };
-        if !self.verifier.verify_with_key(
-            proposer_key,
+        //    From KES enforcement on, the proposer signs with the leaf of its
+        //    slot's period under its registered KES key (`crate::kes`);
+        //    before it this is exactly the static-key check.
+        match crate::kes::verify_validator(
+            &RegistryView { validators: &st.validators, kes: &st.kes, network_domain: st.admission_network_domain, enforced_from: st.kes_enforced_from },
+            &block_verifier,
+            header.proposer_index,
+            crate::epoch_of(header.slot),
             &header.proposal_signing_root(),
             &envelope.proposer_sig,
         ) {
-            return Err(TransitionError::Proposal(ProposalReject::BadSignature));
+            None => return Err(TransitionError::Proposal(ProposalReject::UnknownProposer)),
+            Some(false) => return Err(TransitionError::Proposal(ProposalReject::BadSignature)),
+            Some(true) => {}
         }
 
         // R7 M5 (behind REWARDS_V2_ACTIVATION_EPOCH): the proposer named
@@ -6081,8 +6781,21 @@ impl<V: SignatureVerifier> Transition<V> {
             // chunks — a fact this line declines to assume.
             let idx = (att.data.slot % crate::params::SLOTS_PER_EPOCH) as usize;
             let committee = partition.get(idx).unwrap_or(&empty_committee);
-            if attestation::validate(att, committee, header.slot, &self.verifier, &st.validators)
-                .is_err()
+            // Judged under the vote's OWN epoch rule, never the including
+            // block's (HF2 review): at the flag day a block may carry votes
+            // of the previous epoch, signed under the previous rule.
+            let att_verifier = crate::attestation::PolicyVerifier::consensus(
+                &self.verifier,
+                crate::epoch_of(att.data.slot),
+            );
+            if attestation::validate(
+                att,
+                committee,
+                header.slot,
+                &att_verifier,
+                &RegistryView { validators: &st.validators, kes: &st.kes, network_domain: st.admission_network_domain, enforced_from: st.kes_enforced_from },
+            )
+            .is_err()
             {
                 return Err(reject);
             }
@@ -6125,6 +6838,31 @@ impl<V: SignatureVerifier> Transition<V> {
         let mut block_bytes: u64 = 0;
         // Satoshis this block bonds without spending an output. See the
         // conservation check at step 11b.
+        // The parent is already committed. Pin it before transactions, and keep
+        // it across all subsequent blocks until a valid proof consumes it.
+        if let Some(l2) = st.l2_settlement.as_mut() {
+            l2.prepare_source(*pre.head.as_bytes(), pre.slot);
+        }
+        // Bound proof invocations before any transaction proof is executed.
+        if transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_))).count() > 1 {
+            return Err(TransitionError::BlockGasLimitExceeded);
+        }
+        // DA batches per block are capped like blobs: it bounds the retained
+        // DA records (`l2_settlement::da::MAX_RECORDS`) independently of fees.
+        if transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2DataAvailability(_))).count()
+            > crate::l2_settlement::da::MAX_PER_BLOCK
+        {
+            return Err(TransitionError::BlockGasLimitExceeded);
+        }
+        // F-9: free rescue commitments may take at most a quarter of the
+        // block (params::RESCUE_COMMITS_MAX_PER_BLOCK). Only once the
+        // emergency gate binds: below it each one is refused on its own.
+        if crate::params::lattice_emergency_active(block_epoch)
+            && transactions.iter().filter(|tx| matches!(tx, PosTransaction::RescueCommit(_))).count() as u64
+                > crate::params::RESCUE_COMMITS_MAX_PER_BLOCK
+        {
+            return Err(TransitionError::BlockGasLimitExceeded);
+        }
         let mut unfunded_bonded: u128 = 0;
         // Preflight the transfer budgets before executing any spend or
         // rebuilding any output paths (TX-02). These are the same declared
@@ -6132,15 +6870,16 @@ impl<V: SignatureVerifier> Transition<V> {
         let mut minimum_bytes = 0u64;
         let mut minimum_gas = 0u64;
         for tx in transactions {
-            let (bytes, witnesses) = match tx {
-                PosTransaction::Transfer { inputs, tx_bytes, .. } => (*tx_bytes, inputs.len()),
-                PosTransaction::TransferV2 { keys, tx_bytes, .. } => (*tx_bytes, keys.len()),
-                PosTransaction::FundedDeposit(tx) => (tx.tx_bytes, 2),
+            let (bytes, class) = match tx {
+                PosTransaction::Transfer { inputs, tx_bytes, .. } => (*tx_bytes,
+                    fee_market::eutxo_class_for_keys(st.epoch, inputs.iter().map(|i| i.pubkey.as_slice()))),
+                PosTransaction::TransferV2 { keys, tx_bytes, .. } => (*tx_bytes,
+                    fee_market::eutxo_class_for_keys(st.epoch, keys.iter().map(|k| k.pubkey.as_slice()))),
+                PosTransaction::FundedDeposit(tx) => (tx.tx_bytes, fee_market::TxClass::Eutxo { inputs: 2 }),
                 _ => continue,
             };
             minimum_bytes = minimum_bytes.saturating_add(bytes);
-            minimum_gas = minimum_gas.saturating_add(fee_market::intrinsic_gas(
-                fee_market::TxClass::Eutxo { inputs: witnesses as u32 }, bytes));
+            minimum_gas = minimum_gas.saturating_add(fee_market::intrinsic_gas(class, bytes));
         }
         if minimum_gas > fee_market::BLOCK_GAS_LIMIT {
             return Err(TransitionError::BlockGasLimitExceeded);
@@ -6161,11 +6900,25 @@ impl<V: SignatureVerifier> Transition<V> {
                 {
                     Err(TxReject::EvidenceNotActive)
                 }
+                // Incident 2026-10-19: the gate above judges only the
+                // including block. Once PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH
+                // binds, an offence committed before slashing existed is not
+                // slashable, whatever block carries it.
+                PosTransaction::SlashingEvidence(ev)
+                    if crate::params::pre_activation_offence_refusal_active(block_epoch)
+                        && slashing::offence_predates_activation(ev) =>
+                {
+                    Err(TxReject::EvidenceNotActive)
+                }
                 PosTransaction::SlashingEvidence(ev) => st
                     .apply_slashing_evidence(
                         ev,
                         header.proposer_index,
                         &roster,
+                        // Unwrapped: each evidence message is judged under
+                        // the rule of its own epoch (slashing.rs), not the
+                        // including block's — a pre-flag-day offence stays
+                        // provable after the flag day (HF2 review).
                         &self.verifier,
                     )
                     // R7 M1: two hybrid verifications — `apply_slashing_evidence`
@@ -6175,6 +6928,9 @@ impl<V: SignatureVerifier> Transition<V> {
                         CommittedState::staking_tx_charge(st.epoch, 2, tx.canonical_bytes().len())
                     })
                     .map_err(|()| TxReject::StakingRule),
+                // Unwrapped: `apply_transaction` applies the TRANSACTION rule
+                // itself; the block's consensus rule must not reach a wallet
+                // signature (HF2 scope).
                 _ => st.apply_transaction(tx, total_active, base_fee, &self.verifier),
             };
             match applied {
@@ -6315,6 +7071,9 @@ impl<V: SignatureVerifier> Transition<V> {
             return Err(TransitionError::SupplyNotConserved);
         }
 
+        if let Some(state) = st.l2_settlement.as_mut() {
+            state.advance_height().map_err(|_| TransitionError::StateRootMismatch)?;
+        }
         st.slot = header.slot;
         st.head = BlockId::of(header);
         Ok(st)
@@ -6695,6 +7454,8 @@ mod tx_codec_tests {
 
 #[cfg(test)]
 mod tests {
+    include!("transition/l2_settlement_tests.rs");
+    include!("transition/kes_tests.rs");
     use super::*;
     mod validator_lifecycle {
         use super::*;
@@ -6708,6 +7469,10 @@ mod tests {
     mod funded_delegation_lifecycle {
         use super::*;
         include!("transition/funded_delegation/tests.rs");
+    }
+    mod pq_migration {
+        use super::*;
+        include!("transition/pq_migration/tests.rs");
     }
     use crate::header::BlockHeaderV4;
 
@@ -7500,6 +8265,19 @@ mod tests {
         // Signed twice because the signing root covers `state_root`: the probe
         // header (root still zero) and the final header are different messages.
         let sign_for = |h: &BlockHeaderV4| -> Vec<u8> {
+            // From KES enforcement on (only ever under a test-armed schedule),
+            // the proposer signs with its toy KES leaf for the slot's period.
+            if let crate::kes::SigningMode::Kes(period) = crate::kes::signing_mode(pre, p, crate::epoch_of(h.slot)) {
+                let message = crate::kes::leaf_message(
+                    crate::attestation::KeyLookup::kes_network_domain(pre),
+                    p,
+                    &kes_rules::toy_kes_public(p),
+                    period,
+                    &h.proposal_signing_root(),
+                )
+                .unwrap_or([0; 32]);
+                return kes_rules::toy_kes_sign(p, period, &message);
+            }
             match crate::attestation::KeyLookup::pubkey(pre, p) {
                 Some(pk) => toy_sign(pk, &h.proposal_signing_root()),
                 // A fixture whose registry has no such index: leave the stub
@@ -7801,6 +8579,252 @@ mod tests {
             Err(TransitionError::Attestation(1)),
             "a pair-only cache would wrongly accept the invalid signature variant"
         );
+    }
+
+    // -- SIG_CANONICAL_ACTIVATION_EPOCH (audit e9b52781) ----------------------
+
+    /// Records the signature policy of every check; accepts everything.
+    struct PolicyRecorder(std::sync::Arc<std::sync::Mutex<Vec<crate::attestation::SignaturePolicy>>>);
+    impl SignatureVerifier for PolicyRecorder {
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            // An unpinned call: it would bypass the epoch's policy.
+            panic!("consensus signature check reached the verifier without a policy");
+        }
+        fn verify_with_key_under(
+            &self,
+            policy: crate::attestation::SignaturePolicy,
+            _pk: &[u8],
+            _root: &[u8; 32],
+            _sig: &[u8],
+        ) -> bool {
+            self.0.lock().unwrap().push(policy);
+            true
+        }
+    }
+
+    /// TRIPWIRE. Arming is a founder decision and a wallet-facing flag day.
+    #[test]
+    fn sig_canonical_gate_is_inert() {
+        assert_eq!(crate::params::SIG_CANONICAL_ACTIVATION_EPOCH, u64::MAX);
+        for epoch in [0, 4_669, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::sig_canonical_active(epoch));
+            assert_eq!(
+                crate::attestation::SignaturePolicy::consensus(epoch),
+                crate::attestation::SignaturePolicy::Compatible
+            );
+        }
+    }
+
+    /// HF2 review (flag-day boundary), votes in blocks. Step 8 admits only
+    /// votes of the block's own epoch, so a post-flag-day block can never
+    /// carry a pre-flag-day vote (it is refused structurally, before any
+    /// signature is checked); each admitted vote is judged under the rule of
+    /// its own epoch, which is therefore the block's. Pinned on both sides of
+    /// a flag day.
+    #[test]
+    fn flag_day_boundary_votes_are_judged_under_their_own_epoch() {
+        use crate::attestation::SignaturePolicy::{Bound, Compatible};
+        let (_t, s, mut chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+        assert_eq!(crate::epoch_of(att_slot), 1);
+        let atts = vec![attest(&s, member, att_slot, *s.head.as_bytes())];
+
+        // Epoch-1 vote in an epoch-2 block, flag day 2: refused before any
+        // vote signature is checked; only the proposer (epoch 2) was judged.
+        {
+            let _gate = crate::params::sig_canonical_gate_at_guard(2);
+            let (_t2, _s2, mut c) = epoch1_fixture(); // fresh, deterministic reveals
+            let env = build_header_over(&s, 64, &atts, &mut c);
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let r = Transition::new(PolicyRecorder(seen.clone())).apply_block(&s, &env, &atts, &[]);
+            assert!(matches!(r, Err(TransitionError::Attestation(0))), "{r:?}");
+            assert_eq!(seen.lock().unwrap().clone(), vec![Bound]);
+        }
+        // Same-epoch vote: the rule of epoch 1, on each side of a flag day.
+        let env = build_header_over(&s, 63, &atts, &mut chains);
+        for (flag_day, want) in [(1, Bound), (2, Compatible)] {
+            let _gate = crate::params::sig_canonical_gate_at_guard(flag_day);
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let _ = Transition::new(PolicyRecorder(seen.clone())).apply_block(&s, &env, &atts, &[]);
+            let got = seen.lock().unwrap().clone();
+            assert!(got.len() >= 2 && got.iter().all(|p| *p == want), "flag day {flag_day}: {got:?}");
+        }
+    }
+
+    /// HF2 review (slashing escape): evidence for an offence of the last
+    /// pre-flag-day epoch, included after the flag day, is verified under
+    /// the rule its messages were signed under, so it stays provable; and
+    /// evidence messages of a post-flag-day epoch are held to `Bound`.
+    #[test]
+    fn flag_day_boundary_evidence_is_judged_under_each_messages_own_epoch() {
+        use crate::attestation::SignaturePolicy::{Bound, Compatible};
+        let (_t, g, _c) = setup(4);
+        let offender = 0;
+        let roster = g.consensus_roster_at(g.epoch);
+        // double_vote_evidence signs slot 32 (epoch 1).
+        for (flag_day, want) in [(2, Compatible), (1, Bound), (0, Bound)] {
+            let _gate = crate::params::sig_canonical_gate_at_guard(flag_day);
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut st = g.clone();
+            let _ = st.apply_slashing_evidence(
+                &double_vote_evidence(offender),
+                1,
+                &roster,
+                &PolicyRecorder(seen.clone()),
+            );
+            let got = seen.lock().unwrap().clone();
+            assert_eq!(got, vec![want, want], "flag day {flag_day}");
+        }
+        // Even through a strict outer wrapper the inner rule cannot loosen,
+        // so the transition passes the UNWRAPPED verifier (pinned by source).
+        let src = include_str!("transition.rs");
+        let at = src.find(".apply_slashing_evidence(\n                        ev,").expect("call site");
+        let call = &src[at..at + 700];
+        assert!(call.contains("&self.verifier,") && !call.contains("&block_verifier"), "{call}");
+    }
+
+    /// TRIPWIRE (HF2 sigdet). Arming moves the ML-DSA half of every consensus
+    /// signature from the CPU-dispatching backend to the pinned FIPS 204
+    /// reference verifier. Coordinated upgrade only.
+    #[test]
+    #[cfg(not(feature = "mldsa-pin-replay-qualification"))]
+    fn mldsa_pin_gate_is_inert() {
+        use crate::attestation::SignaturePolicy::*;
+        assert_eq!(crate::params::MLDSA_PIN_ACTIVATION_EPOCH, u64::MAX);
+        for epoch in [0, 4_669, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::mldsa_pin_active(epoch));
+        }
+        // Gate table: (pin, canonical) -> consensus policy.
+        assert_eq!(crate::attestation::SignaturePolicy::consensus(7), Compatible);
+        {
+            let _pin = crate::params::mldsa_pin_gate_open_guard();
+            assert_eq!(crate::attestation::SignaturePolicy::consensus(7), CompatiblePinned);
+            assert_eq!(crate::attestation::SignaturePolicy::transaction(7), CompatiblePinned);
+            let _canon = crate::params::sig_canonical_gate_open_guard();
+            assert_eq!(crate::attestation::SignaturePolicy::consensus(7), Bound);
+        }
+        let _canon = crate::params::sig_canonical_gate_open_guard();
+        assert_eq!(crate::attestation::SignaturePolicy::consensus(7), Bound, "canonical implies pinned");
+        assert_eq!(crate::attestation::SignaturePolicy::transaction(7), CompatiblePinned);
+        for pin in [false, true] {
+            for canon in [false, true] {
+                let t = crate::attestation::SignaturePolicy::transaction_for(pin, canon);
+                assert!(matches!(t, Compatible | CompatiblePinned), "transactions never canonical");
+            }
+        }
+    }
+
+    /// With only the ML-DSA pin armed, block and transaction signatures are
+    /// judged under `CompatiblePinned`, with no unpinned call left over.
+    #[test]
+    fn mldsa_pin_gate_routes_block_and_transaction_signatures() {
+        use crate::attestation::SignaturePolicy::CompatiblePinned;
+        let _pin = crate::params::mldsa_pin_gate_open_guard();
+        let (_t, s, mut chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+        let atts = vec![attest(&s, member, att_slot, *s.head.as_bytes())];
+        let env = build_header_over(&s, 63, &atts, &mut chains);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _ = Transition::new(PolicyRecorder(seen.clone())).apply_block(&s, &env, &atts, &[]);
+        let got = seen.lock().unwrap().clone();
+        assert!(got.len() >= 2 && got.iter().all(|p| *p == CompatiblePinned), "{got:?}");
+
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
+        let (_t, g, _chains) = setup(4);
+        let tx = signed_deposit(hybrid_shaped_key(0x46), 500);
+        let fee = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(g.clone().apply_transaction(&tx, 0, fee, &PolicyRecorder(seen.clone())).is_ok());
+        let got = seen.lock().unwrap().clone();
+        assert!(!got.is_empty() && got.iter().all(|p| *p == CompatiblePinned), "{got:?}");
+    }
+
+    /// Proposer and attestation signatures are judged under the BLOCK
+    /// epoch's consensus policy, with no unpinned call left over.
+    #[test]
+    fn block_signatures_are_judged_under_the_block_epoch_policy() {
+        use crate::attestation::SignaturePolicy::{Bound, Compatible};
+        for open in [false, true] {
+            let _gate = open.then(crate::params::sig_canonical_gate_open_guard);
+            let (_t, s, mut chains) = epoch1_fixture();
+            let (att_slot, member) = a_committee_seat(&s);
+            let atts = vec![attest(&s, member, att_slot, *s.head.as_bytes())];
+            let env = build_header_over(&s, 63, &atts, &mut chains);
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let _ = Transition::new(PolicyRecorder(seen.clone())).apply_block(&s, &env, &atts, &[]);
+            let seen = seen.lock().unwrap();
+            assert!(seen.len() >= 2, "proposer + attestation must be checked: {seen:?}");
+            let want = if open { Bound } else { Compatible };
+            assert!(seen.iter().all(|p| *p == want), "open={open}: {seen:?}");
+        }
+    }
+
+    /// OWNER DECISION (HF2 scope): a transaction witness is judged under the
+    /// TRANSACTION rule at E2-1, E2 and E2+1000 (E2 = canonical flag day) —
+    /// never a canonical policy — even when the including block's consensus
+    /// messages are judged under `Bound`. (The node test
+    /// `v1_transfer_forms_stay_valid_across_the_canonical_flag_day` proves the
+    /// real hybrid verifier accepts every v1 form under that rule.)
+    #[test]
+    fn transaction_signatures_keep_the_v1_rule_across_the_canonical_flag_day() {
+        use crate::attestation::{PolicyVerifier, SignaturePolicy::*};
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
+        let (_t, g, _chains) = setup(4);
+        let tx = signed_deposit(hybrid_shaped_key(0x45), 500);
+        let fee = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        // The policy function itself, at absolute epochs around E2 = 5000.
+        {
+            let _gate = crate::params::sig_canonical_gate_at_guard(5_000);
+            for (e, label) in [(4_999, "E2-1"), (5_000, "E2"), (6_000, "E2+1000")] {
+                let t = crate::attestation::SignaturePolicy::transaction(e);
+                assert!(matches!(t, Compatible | CompatiblePinned), "{label}: {t:?}");
+                assert_eq!(crate::attestation::SignaturePolicy::consensus(e) == Bound, label != "E2-1");
+            }
+        }
+        // The transition's routing, with the committed epoch on each side of
+        // the flag day.
+        for (at, label) in [(g.epoch + 1, "E2-1"), (g.epoch, "E2")] {
+            let _gate = crate::params::sig_canonical_gate_at_guard(at);
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            assert!(g.clone().apply_transaction(&tx, 0, fee, &PolicyRecorder(seen.clone())).is_ok(), "{label}");
+            let want = if label == "E2" { CompatiblePinned } else { Compatible };
+            let got = seen.lock().unwrap().clone();
+            assert!(!got.is_empty() && got.iter().all(|p| *p == want), "{label}: {got:?}");
+        }
+        // An outer wrapper can only tighten, never loosen (strictest).
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = PolicyRecorder(seen.clone());
+        let outer = PolicyVerifier::new(&recorder, CanonicalUnbound);
+        assert!(g.clone().apply_transaction(&tx, 0, fee, &outer).is_ok());
+        assert!(seen.lock().unwrap().iter().all(|p| *p == CanonicalUnbound));
+    }
+
+    /// The block's transactions reach `apply_transaction` unwrapped (no
+    /// consensus `Bound` wrapper around a wallet signature), pinned by source.
+    #[test]
+    fn apply_block_passes_transactions_the_unwrapped_verifier() {
+        let src = include_str!("transition.rs");
+        let call = |v: &str| format!("{}(tx, total_active, base_fee, {v})", "apply_transaction");
+        assert!(src.contains(&call("&self.verifier")));
+        assert!(!src.contains(&call("&block_verifier")));
+    }
+
+    #[test]
+    fn strictest_policy_table() {
+        use crate::attestation::SignaturePolicy::*;
+        // Total order, weakest first: each admits a subset of the previous.
+        let all = [Compatible, CompatiblePinned, CanonicalUnbound, Bound];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(a.strictest(*b), all[i.max(j)], "{a:?} vs {b:?}");
+            }
+        }
+        // Cache tags are distinct.
+        let tags: std::collections::BTreeSet<u8> = all.iter().map(|p| p.tag()).collect();
+        assert_eq!(tags.len(), all.len());
+        let _gate = crate::params::sig_canonical_gate_open_guard();
+        assert_eq!(crate::attestation::SignaturePolicy::transaction(0), CompatiblePinned);
+        assert_eq!(crate::attestation::SignaturePolicy::consensus(0), Bound);
     }
 
     // -- ATTESTATION_DEDUP_ACTIVATION_EPOCH (audit R3 M-2) -------------------
@@ -9082,6 +10106,69 @@ mod tests {
         assert_eq!(fin.justified, Checkpoint { epoch: 2, root: *cp2.as_bytes() });
         assert_eq!(fin.finalized, Checkpoint { epoch: 1, root: *cp1.as_bytes() });
         assert_eq!(fin.previous_justified, Checkpoint { epoch: 1, root: *cp1.as_bytes() });
+    }
+
+    /// Frozen finality set, end to end through real blocks: the same
+    /// justification/finality as `justification_and_finality_advance_across_epochs`,
+    /// the set is committed into the state root (so roots differ from the
+    /// inert build only once the gate binds), and it survives the local cache.
+    #[test]
+    fn frozen_finality_set_keeps_normal_finality_and_is_committed() {
+        let run = |armed: bool| {
+            let _g = armed.then(crate::params::native_finality_set_test::open);
+            let (t, g, mut chains) = setup(8);
+            let b1 = build_block(&t, &g, 32, &[], &[], &mut chains);
+            let s1 = t.apply_block(&g, &b1, &[], &[]).unwrap();
+            let cp1 = s1.head();
+            let atts1 = full_epoch_attestations(&s1, *cp1.as_bytes());
+            let b2 = build_block(&t, &s1, 63, &atts1, &[], &mut chains);
+            let s2 = t.apply_block(&s1, &b2, &atts1, &[]).unwrap();
+            let b3 = build_block(&t, &s2, 64, &[], &[], &mut chains);
+            let s3 = t.apply_block(&s2, &b3, &[], &[]).unwrap();
+            let cp2 = s3.head();
+            let atts2 = full_epoch_attestations(&s3, *cp2.as_bytes());
+            let b4 = build_block(&t, &s3, 95, &atts2, &[], &mut chains);
+            let s4 = t.apply_block(&s3, &b4, &atts2, &[]).unwrap();
+            let b5 = build_block(&t, &s4, 96, &[], &[], &mut chains);
+            let s5 = t.apply_block(&s4, &b5, &[], &[]).unwrap();
+            (s1, s5)
+        };
+        let (legacy1, legacy) = run(false);
+        let (armed1, armed) = run(true);
+        // Same epochs justified/finalized. Roots from epoch 2 on differ only
+        // because the committed leaf (hence every later block id) does.
+        assert_eq!(legacy.finality().finalized, armed.finality().finalized);
+        assert_eq!(legacy.finality().justified.epoch, armed.finality().justified.epoch);
+        assert_eq!(armed.finality().finalized.epoch, 1);
+        assert!(legacy.finality_engine.finality_set().is_none());
+        let fs = armed.finality_engine.finality_set().expect("gate created the set");
+        assert_eq!(fs.current.members.len(), 8);
+        assert_eq!(fs.current.total(), legacy1.duty_roster_at(1).iter().map(|v| v.effective_stake as u128).sum::<u128>());
+        // Epoch 0 closes nothing, so the first block's root is the same; from
+        // the first gated boundary on, the committed leaf carries the set.
+        assert_eq!(legacy1.state_root(), armed1.state_root());
+        assert_ne!(legacy.state_root(), armed.state_root());
+        #[cfg(feature = "local-state-cache")]
+        {
+            let mut st = armed.clone();
+            let header = BlockHeaderV4 {
+                version: BLOCK_VERSION_V4, parent: [0; 32], state_root: st.compute_root(),
+                body_root: [0; 32], slot: st.slot, proposer_index: 0,
+                randao_reveal: [0; 32], randao_mix: st.randao_mix,
+                justified_root: [0; 32], finalized_root: [0; 32],
+                attestation_root: [0; 32], coherence_root: [0; 32],
+            };
+            st.head = header.id();
+            let bytes = st.encode_local_cache().unwrap();
+            let restored = CommittedState::decode_local_cache(&bytes, &header).unwrap();
+            assert_eq!(restored, st);
+            let mut cut = st.clone();
+            cut.finality_engine.restore_finality_set(None);
+            let short = cut.encode_local_cache().unwrap();
+            assert!(CommittedState::decode_local_cache(&short, &header).is_err(), "losing the set must fail the root check");
+            let mut trailing = bytes.clone(); trailing.push(0);
+            assert!(CommittedState::decode_local_cache(&trailing, &header).is_err());
+        }
     }
 
     // ── B6: the supply-conservation invariant, shown refusing ────────────
@@ -10556,10 +11643,21 @@ mod tests {
     /// Pin the operator-scheduled ADR-041 release boundary. Moving it requires
     /// another coordinated release; implementing a decoder alone is insufficient.
     #[test]
+    #[cfg(not(feature = "devnet-randao-recommit"))]
     fn randao_recommit_gate_matches_the_lifecycle_schedule() {
         assert_eq!(crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH, 2_884);
         assert_eq!(crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH,
             crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH);
+    }
+
+    /// The development build arms only the re-commit gate, from genesis.
+    #[test]
+    #[cfg(feature = "devnet-randao-recommit")]
+    fn devnet_build_arms_only_the_recommit_gate() {
+        assert_eq!(crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH, 0);
+        assert!(CommittedState::randao_recommit_active(0));
+        assert_eq!(crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH, 2_884);
+        assert_eq!(crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH, 2_884);
     }
 
     /// Build the signed re-commit a validator would actually send, under
@@ -10579,6 +11677,7 @@ mod tests {
     /// re-commit for a genuinely exhausted validator is consensus-invalid,
     /// so today's fleet behaviour — chains are terminal — is unchanged.
     #[test]
+    #[cfg(not(feature = "devnet-randao-recommit"))]
     fn below_the_gate_a_perfectly_signed_recommit_is_consensus_invalid() {
         let (_t, g, _chains) = setup(4);
         let mut probe = g.clone();
@@ -11882,6 +12981,88 @@ mod tests {
         );
     }
 
+    /// F-9 fixture: a funded state with a pinned network domain and `n`
+    /// distinct, free rescue commitments for it.
+    fn rescue_flood_fixture(
+        n: u8,
+    ) -> (Transition<ToyVerifier>, CommittedState, Vec<RandaoChain>, Vec<PosTransaction>, crate::state_root::EutxoEntry, Vec<u8>) {
+        // A hash-based (suite 0x0003-shaped) owner: once the emergency binds,
+        // lattice keys may not spend directly, and the paying user in these
+        // tests must be one who still can.
+        let mut owner = vec![0x37u8; crate::transition::pq_migration::SLH_SUITE_PUBKEY_BYTES];
+        owner[..4].copy_from_slice(&[0xb1, 0x0c, 0x03, 0x00]);
+        let coin = opening(0x91, 0, 21_000_000_000_000_000, &owner);
+        let (t, mut g, chains) = setup_funded(4, std::slice::from_ref(&coin));
+        let net = [0x5Du8; 32];
+        g.admission_network_domain = Some(net);
+        let commits = (0..n)
+            .map(|k| {
+                PosTransaction::RescueCommit(RescueCommit { network_domain: net, commitment: [k.wrapping_add(1); 32] })
+            })
+            .collect();
+        (t, g, chains, commits, coin, owner)
+    }
+
+    /// F-9: with the emergency armed, a block may carry at most
+    /// `RESCUE_COMMITS_MAX_PER_BLOCK` free commitments; one more makes the
+    /// whole block invalid, so a proposer cannot be paid (or fooled) into
+    /// filling a block with them.
+    #[test]
+    fn rescue_commitments_are_capped_per_block_once_armed() {
+        let _gate = crate::params::pq_migration_rehearsal::open_emergency();
+        let max = crate::params::RESCUE_COMMITS_MAX_PER_BLOCK as u8;
+        let (t, g, mut chains, commits, _, _) = rescue_flood_fixture(max + 1);
+        let env = probe_env(&g, 1, &commits, &mut chains);
+        assert_eq!(
+            t.compute_post_state(&g, &env, &[], &commits).unwrap_err(),
+            TransitionError::BlockGasLimitExceeded,
+        );
+        let at_cap = &commits[..max as usize];
+        let (t, g, mut chains, _, _, _) = rescue_flood_fixture(0);
+        let env = probe_env(&g, 1, at_cap, &mut chains);
+        let post = t.compute_post_state(&g, &env, &[], at_cap).unwrap();
+        let per_commit = fee_market::BLOCK_GAS_LIMIT / crate::params::RESCUE_COMMITS_PER_BLOCK;
+        assert_eq!(post.block_gas_used, per_commit * max as u64);
+        assert!(post.block_gas_used <= fee_market::BLOCK_GAS_LIMIT / 4, "the flood holds at most a quarter of the gas");
+    }
+
+    /// F-9: a maximal flood of commitments cannot exclude a paying
+    /// transaction. The same block carries every commitment consensus allows
+    /// AND a transfer charged more than half the block's gas.
+    #[test]
+    fn a_rescue_flood_cannot_exclude_a_paying_transfer() {
+        let _gate = crate::params::pq_migration_rehearsal::open_emergency();
+        let max = crate::params::RESCUE_COMMITS_MAX_PER_BLOCK as u8;
+        let (t, g, mut chains, commits, coin, owner) = rescue_flood_fixture(max);
+        let to = script_of(&owner_key(0x38));
+        // A transfer declaring every byte the commitments leave in the block:
+        // the largest block a paying user could have built alone. An uncapped
+        // flood (16 commitments = the whole gas) left room for nothing.
+        let commit_bytes: u64 = commits.iter().map(|c| c.canonical_bytes().len() as u64).sum();
+        let room = fee_market::max_block_tx_bytes(1) - commit_bytes;
+        let heavy = transfer_spending(std::slice::from_ref(&coin), &owner, to, room, 0, g.next_base_fee());
+        let heavy_gas = fee_market::intrinsic_gas(fee_market::TxClass::Eutxo { inputs: 1 }, room);
+        let mut body = commits.clone();
+        body.push(heavy);
+        let env = probe_env(&g, 1, &body, &mut chains);
+        let post = t.compute_post_state(&g, &env, &[], &body).unwrap();
+        let flood_gas = fee_market::BLOCK_GAS_LIMIT / crate::params::RESCUE_COMMITS_PER_BLOCK * max as u64;
+        assert_eq!(post.block_gas_used, flood_gas + heavy_gas);
+        assert!(fee_market::BLOCK_GAS_LIMIT - flood_gas >= 3 * (fee_market::BLOCK_GAS_LIMIT / 4));
+        assert_eq!(post.pq_rescue_commits.len(), max as usize);
+    }
+
+    /// Below the emergency gate the cap is not consulted: an over-cap block
+    /// of commitments keeps its pre-F-9 verdict (the first commitment is
+    /// refused as a transaction), byte-identical to the inert release.
+    #[test]
+    fn rescue_commit_cap_is_inert_below_the_gate() {
+        let max = crate::params::RESCUE_COMMITS_MAX_PER_BLOCK as u8;
+        let (t, g, mut chains, commits, _, _) = rescue_flood_fixture(max + 1);
+        let env = probe_env(&g, 1, &commits, &mut chains);
+        assert_eq!(t.compute_post_state(&g, &env, &[], &commits).unwrap_err(), TransitionError::Transaction(0));
+    }
+
     #[test]
     fn the_two_block_caps_are_enforced() {
         let owner = owner_key(0x37);
@@ -12247,6 +13428,255 @@ mod tests {
         );
     }
 
+    // -- HF3_SLH_SUITE_EPOCH (optional suite 0x0003) ---------------------------
+
+    /// Tests for the HF3 consensus wiring: which verifier method a spend
+    /// witness reaches, at which epoch, and what it is charged.
+    mod hf3_slh_suite {
+        use super::*;
+        use std::cell::{Cell, RefCell};
+
+        /// A suite-0x0003-SHAPED key (envelope header + exact body length), so
+        /// the fee arm classifies it as an SLH witness. The bytes are toy.
+        fn slh_owner(tag: u8) -> Vec<u8> {
+            let mut k = vec![0xB1, 0x0C, 0x03, 0x00];
+            k.resize(fee_market::SLHDSA_FALCON_ENVELOPED_PUBKEY_LEN, tag);
+            k
+        }
+
+        /// Models the production split: `verify_with_key` (context-free) knows
+        /// only the toy "hybrid" signature; `verify_spend_at_epoch` also
+        /// accepts the toy "suite 0x0003" signature. Records every epoch the
+        /// epoch-aware path is asked about.
+        #[derive(Default)]
+        struct SuiteToyVerifier {
+            epoch_calls: RefCell<Vec<u64>>,
+            plain_calls: Cell<usize>,
+        }
+        fn slh_toy_sign(pubkey: &[u8], root: &[u8; 32]) -> Vec<u8> {
+            let mut s = toy_sign(pubkey, root);
+            s.extend_from_slice(b"/0x0003");
+            s
+        }
+        impl SignatureVerifier for SuiteToyVerifier {
+            fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+                self.plain_calls.set(self.plain_calls.get() + 1);
+                sig == toy_sign(pk, root).as_slice()
+            }
+            fn verify_spend_at_epoch(&self, pk: &[u8], root: &[u8; 32], sig: &[u8], epoch: u64) -> bool {
+                self.epoch_calls.borrow_mut().push(epoch);
+                sig == toy_sign(pk, root).as_slice() || sig == slh_toy_sign(pk, root).as_slice()
+            }
+        }
+
+        /// A conserving V1 transfer whose fee is computed with the class the
+        /// transition will derive at `g`'s epoch (per-suite when armed).
+        fn slh_transfer(
+            coin: &crate::state_root::EutxoEntry,
+            owner: &[u8],
+            epoch: u64,
+            price: u128,
+        ) -> PosTransaction {
+            let to = script_of(&owner_key(0x6A));
+            let inputs = vec![TransferInput {
+                txid: coin.txid,
+                vout: coin.vout,
+                pubkey: owner.to_vec(),
+                signature: vec![0u8; 32 + 7],
+            }];
+            let probe = PosTransaction::Transfer {
+                inputs: inputs.clone(),
+                outputs: vec![TransferOutput { value: 0, script_hash: to }],
+                tx_bytes: 0,
+                tip_millisat_per_gas: 0,
+            };
+            let tx_bytes = probe.canonical_bytes().len() as u64;
+            let class = fee_market::eutxo_class_for_keys(epoch, [owner]);
+            let c = fee_market::charge(class, tx_bytes, price, 0);
+            let mut tx = PosTransaction::Transfer {
+                inputs,
+                outputs: vec![TransferOutput {
+                    value: coin.value - (c.base_fee_sat + c.priority_fee_sat) as u64,
+                    script_hash: to,
+                }],
+                tx_bytes,
+                tip_millisat_per_gas: 0,
+            };
+            let root = tx.spend_signing_root();
+            if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+                inputs[0].signature = slh_toy_sign(owner, &root);
+            }
+            tx
+        }
+
+        /// TRIPWIRE: HF3 ships inert. Arming it is a release decision taken
+        /// together with `bloch_crypto::crypto::HF3_SLH_SUITE_EPOCH`.
+        #[test]
+        fn hf3_slh_suite_gate_is_inert() {
+            assert_eq!(crate::params::HF3_SLH_SUITE_EPOCH, u64::MAX);
+            for e in [0, 1, 6_017, u64::MAX - 1, u64::MAX] {
+                assert!(!crate::params::hf3_slh_suite_active(e));
+                assert!(!fee_market::per_suite_verify_gas_active(e));
+            }
+        }
+
+        /// Below the gate (the fleet's configuration — no rehearsal armed):
+        /// the spend path never reaches `verify_spend_at_epoch`, a witness
+        /// only the epoch-aware verifier would accept is `BadSignature`, and
+        /// the charge is today's suite-blind one.
+        #[test]
+        fn below_the_gate_spends_use_verify_with_key_only() {
+            let owner = slh_owner(0x61);
+            let coin = opening(0xA1, 0, 1_000_000_000_000_000, &owner);
+            let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+            let price = g.next_base_fee();
+            let tx = slh_transfer(&coin, &owner, g.epoch, price);
+            let v = SuiteToyVerifier::default();
+            assert_eq!(g.clone().apply_transfer(&tx, price, &v), Err(TransferReject::BadSignature));
+            assert!(v.epoch_calls.borrow().is_empty(), "epoch-aware path reached below HF3");
+            assert_eq!(v.plain_calls.get(), 1);
+            assert_eq!(
+                fee_market::eutxo_class_for_keys(g.epoch, [owner.as_slice()]),
+                fee_market::TxClass::Eutxo { inputs: 1 }
+            );
+            // The same holds one epoch before a rehearsal activation.
+            let _armed = crate::params::hf3_slh_rehearsal::arm(g.epoch + 1);
+            let v = SuiteToyVerifier::default();
+            assert_eq!(g.clone().apply_transfer(&tx, price, &v), Err(TransferReject::BadSignature));
+            assert!(v.epoch_calls.borrow().is_empty());
+        }
+
+        /// From the gate: the witness goes through `verify_spend_at_epoch` at
+        /// the state's committed epoch, applies, and is charged the SLH gas.
+        #[test]
+        fn from_the_gate_spends_use_the_epoch_verifier_and_pay_slh_gas() {
+            let owner = slh_owner(0x62);
+            let coin = opening(0xA2, 0, 1_000_000_000_000_000, &owner);
+            let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+            let _armed = crate::params::hf3_slh_rehearsal::arm(g.epoch);
+            let price = g.next_base_fee();
+            let tx = slh_transfer(&coin, &owner, g.epoch, price);
+            let v = SuiteToyVerifier::default();
+            let charge = g.clone().apply_transfer(&tx, price, &v).expect("armed 0x0003 spend applies");
+            assert_eq!(*v.epoch_calls.borrow(), vec![g.epoch]);
+            assert_eq!(v.plain_calls.get(), 0);
+            let tx_bytes = tx.canonical_bytes().len() as u64;
+            assert_eq!(
+                charge.gas,
+                fee_market::intrinsic_gas(
+                    fee_market::TxClass::EutxoSuites { hybrid: 0, slh_falcon: 1 },
+                    tx_bytes
+                )
+            );
+            assert!(charge.gas > fee_market::intrinsic_gas(fee_market::TxClass::Eutxo { inputs: 1 }, tx_bytes));
+            // Underpaying with the suite-blind fee is refused once armed: the
+            // fee arm and the verifier arm move together.
+            let _off = crate::params::hf3_slh_rehearsal::arm(u64::MAX);
+            let blind = slh_transfer(&coin, &owner, g.epoch, price);
+            drop(_off);
+            assert_eq!(
+                g.clone().apply_transfer(&blind, price, &v),
+                Err(TransferReject::ValueNotConserved)
+            );
+        }
+
+        /// Owner decision: HF3 is strictly opt-in. A suite-0x0001 transfer
+        /// (V1 and V2, hybrid-shaped keys) has the SAME validity, the SAME
+        /// charge and the SAME post-state with the gate closed and open, and a
+        /// bad 0x0001 signature is refused the same way on both sides.
+        #[test]
+        fn hybrid_transfer_validity_and_fee_are_identical_across_hf3() {
+            let owner = owner_key(0x66);
+            let coin = opening(0xA6, 0, 1_000_000_000_000_000, &owner);
+            let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+            let price = g.next_base_fee();
+            let to = script_of(&owner_key(0x67));
+            let v1 = transfer_spending(std::slice::from_ref(&coin), &owner, to, 20_000, 0, price);
+            let mut bad = v1.clone();
+            if let PosTransaction::Transfer { inputs, .. } = &mut bad {
+                inputs[0].signature[0] ^= 1;
+            }
+            let v2 = transfer_v2_raw(std::slice::from_ref(&coin), &[&owner], &[0], to, 20_000, 0, price);
+            let run = |armed: bool| {
+                let _gate = crate::params::hf3_slh_rehearsal::arm(if armed { g.epoch } else { u64::MAX });
+                assert_eq!(crate::params::hf3_slh_suite_active(g.epoch), armed);
+                let v = SuiteToyVerifier::default();
+                let mut s1 = g.clone();
+                let c1 = s1.apply_transfer(&v1, price, &v).expect("0x0001 V1 transfer applies");
+                let mut s2 = g.clone();
+                let c2 = s2.apply_transfer_v2(&v2, price, &v).expect("0x0001 V2 transfer applies");
+                let rb = g.clone().apply_transfer(&bad, price, &v);
+                let class = fee_market::eutxo_class_for_keys(g.epoch, [owner.as_slice()]);
+                (c1, c2, rb, class, s1.eutxos.clone(), s2.eutxos.clone())
+            };
+            let closed = run(false);
+            let open = run(true);
+            assert_eq!(closed.0, open.0, "V1 charge moved across HF3");
+            assert_eq!(closed.1, open.1, "V2 charge moved across HF3");
+            assert_eq!(closed.2, Err(TransferReject::BadSignature));
+            assert_eq!(open.2, Err(TransferReject::BadSignature));
+            assert_eq!(closed.3, fee_market::TxClass::Eutxo { inputs: 1 });
+            assert_eq!(closed.3, open.3);
+            assert_eq!(closed.4, open.4, "V1 post-state moved across HF3");
+            assert_eq!(closed.5, open.5, "V2 post-state moved across HF3");
+        }
+
+        /// The V2 table path is wired the same way: one epoch-aware call per
+        /// table entry, at the committed epoch.
+        #[test]
+        fn v2_table_entries_use_the_epoch_verifier_from_the_gate() {
+            let slh = slh_owner(0x63);
+            let hyb = owner_key(0x64);
+            let c1 = opening(0xA3, 0, 1_000_000_000_000_000, &slh);
+            let c2 = opening(0xA4, 0, 1_000_000_000_000_000, &hyb);
+            let (_t, g, _chains) = setup_funded(4, &[c1.clone(), c2.clone()]);
+            let _armed = crate::params::hf3_slh_rehearsal::arm(g.epoch);
+            let price = g.next_base_fee();
+            let to = script_of(&owner_key(0x65));
+            let mut table = vec![
+                WitnessKey { pubkey: slh.clone(), signature: vec![0u8; 39] },
+                WitnessKey { pubkey: hyb.clone(), signature: vec![0u8; 32] },
+            ];
+            table.sort_by(|a, b| a.pubkey.cmp(&b.pubkey));
+            let idx = |k: &[u8]| table.iter().position(|w| w.pubkey == k).unwrap() as u32;
+            let inputs = vec![
+                TransferInputV2 { txid: c1.txid, vout: 0, key_index: idx(&slh) },
+                TransferInputV2 { txid: c2.txid, vout: 0, key_index: idx(&hyb) },
+            ];
+            let probe = PosTransaction::TransferV2 {
+                keys: table.clone(),
+                inputs: inputs.clone(),
+                outputs: vec![TransferOutput { value: 0, script_hash: to }],
+                tx_bytes: 0,
+                tip_millisat_per_gas: 0,
+            };
+            let tx_bytes = probe.canonical_bytes().len() as u64;
+            let class = fee_market::eutxo_class_for_keys(g.epoch, table.iter().map(|k| k.pubkey.as_slice()));
+            assert_eq!(class, fee_market::TxClass::EutxoSuites { hybrid: 1, slh_falcon: 1 });
+            let c = fee_market::charge(class, tx_bytes, price, 0);
+            let mut tx = PosTransaction::TransferV2 {
+                keys: table,
+                inputs,
+                outputs: vec![TransferOutput {
+                    value: (c1.value as u128 + c2.value as u128 - c.base_fee_sat - c.priority_fee_sat) as u64,
+                    script_hash: to,
+                }],
+                tx_bytes,
+                tip_millisat_per_gas: 0,
+            };
+            let root = tx.spend_signing_root();
+            if let PosTransaction::TransferV2 { keys, .. } = &mut tx {
+                for k in keys.iter_mut() {
+                    k.signature = if k.pubkey == slh { slh_toy_sign(&k.pubkey, &root) } else { toy_sign(&k.pubkey, &root) };
+                }
+            }
+            let v = SuiteToyVerifier::default();
+            assert!(g.clone().apply_transfer_v2(&tx, price, &v).is_ok());
+            assert_eq!(*v.epoch_calls.borrow(), vec![g.epoch, g.epoch]);
+            assert_eq!(v.plain_calls.get(), 0);
+        }
+    }
+
     // -- TX_BYTES_BOUND_ACTIVATION_EPOCH (audit H-R7-2) -----------------------
 
     /// TRIPWIRE. `TX_BYTES_BOUND_ACTIVATION_EPOCH` must stay `u64::MAX` until
@@ -12609,6 +14039,83 @@ mod tests {
             reverted.compute_root(),
             "the unspent set is not bound by the state root"
         );
+    }
+
+    /// **Hard forks 1-3 leave transfers alone** (owner scope 2026-10-20:
+    /// "do everything without touching withdrawals and deposits").
+    ///
+    /// The same V1 `Transfer` and V2 `TransferV2`, built and signed the way
+    /// today's wallet builds them, are applied with every HF gate that has a
+    /// test override forced open at genesis and with every gate shut. The
+    /// verdict, the fee charged, the unspent set and the state root must be
+    /// identical. A hard-fork gate that starts touching user transfers fails
+    /// here; when a new HF gate with a test override lands, add it to
+    /// `all_hf_gates_open`.
+    #[test]
+    fn hf_gates_leave_transfers_byte_identical() {
+        fn all_hf_gates_open() -> Vec<Box<dyn Drop>> {
+            vec![
+                Box::new(crate::params::native_claim_finality_test::open()),
+                Box::new(crate::params::native_finality_set_test::open()),
+                Box::new(crate::params::hf2_growth_cap_rehearsal::open()),
+                Box::new(crate::params::own_target_votes_test::open()),
+                Box::new(crate::params::sig_canonical_gate_open_guard()),
+                Box::new(crate::params::mldsa_pin_gate_open_guard()),
+                // HF3 suite migration (rotation into suite 0x0003). The
+                // lattice EMERGENCY is deliberately not opened: it freezes
+                // lattice-key spends by design and is never part of a
+                // scheduled release (`hard_forks::NEVER_IN_A_SCHEDULED_RELEASE`).
+                Box::new(crate::params::hf3_slh_rehearsal::arm(0)),
+                Box::new(crate::params::pq_migration_rehearsal::open_slh()),
+            ]
+        }
+        fn run() -> ([u8; 32], Vec<(([u8; 32], u32), u64)>, u128, Result<u128, TransferReject>, Vec<(([u8; 32], u32), u64)>) {
+            let alice = owner_key(0x5A);
+            let bob_script = script_of(&owner_key(0x5B));
+            let coin_a = opening(0x8A, 0, 60_000_000, &alice);
+            let coin_b = opening(0x8A, 1, 40_000_000, &alice);
+            let (t, g, mut chains) = setup_funded(4, &[coin_a.clone(), coin_b.clone()]);
+            let price = g.next_base_fee();
+
+            // V1 through a whole block.
+            let tx = transfer_spending(&[coin_a.clone(), coin_b.clone()], &alice, bob_script, 512, 2, price);
+            let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
+            let s1 = t.apply_block(&g, &b, &[], std::slice::from_ref(&tx)).unwrap();
+            let before: u128 = u128::from(coin_a.value) + u128::from(coin_b.value);
+            let after: u128 = s1.eutxos.values().map(|e| u128::from(e.value)).sum();
+            let set1 = s1.eutxos.values().map(|e| ((e.txid, e.vout), e.value)).collect();
+
+            // V2 applied directly.
+            let v2 = transfer_v2_raw(&[coin_a, coin_b], &[&alice], &[0, 0], bob_script, 0, 2, price);
+            let mut g2 = g.clone();
+            let v2_fee = g2
+                .apply_transfer_v2(&v2, price, &ToyVerifier)
+                .map(|c| c.base_fee_sat + c.priority_fee_sat);
+            let set2 = g2.eutxos.values().map(|e| ((e.txid, e.vout), e.value)).collect();
+            (s1.state_root(), set1, before - after, v2_fee, set2)
+        }
+
+        let shut = run();
+        let open = {
+            let _gates = all_hf_gates_open();
+            // HF3 KES registration and enforcement from genesis (no validator
+            // registers here, so every signer stays on its static key).
+            crate::params::kes_rehearsal::set(Some(crate::params::KesSchedule {
+                registration_epoch: 0,
+                activation_epoch: 0,
+                period_epochs: crate::params::KES_PERIOD_EPOCHS,
+                min_depth: crate::params::KES_MIN_REGISTERED_DEPTH,
+            }));
+            let r = run();
+            crate::params::kes_rehearsal::set(None);
+            r
+        };
+        assert!(shut.3.is_ok(), "control: the V2 transfer must apply: {:?}", shut.3);
+        assert_eq!(open.1, shut.1, "V1 transfer: unspent set differs with HF gates open");
+        assert_eq!(open.2, shut.2, "V1 transfer: fee differs with HF gates open");
+        assert_eq!(open.3, shut.3, "V2 transfer: verdict or fee differs with HF gates open");
+        assert_eq!(open.4, shut.4, "V2 transfer: unspent set differs with HF gates open");
+        assert_eq!(open.0, shut.0, "V1 transfer block: state root differs with HF gates open");
     }
 
     /// **Conservation.** A transfer whose outputs plus fee do not equal its
@@ -13337,6 +14844,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hf2_slashing_v2_gate_ships_inert() {
+        assert_eq!(crate::params::HF2_SLASHING_V2_EPOCH, u64::MAX);
+        assert_eq!(
+            crate::params::NATIVE_SLASHING_ACTIVATION_EPOCH,
+            crate::params::HF2_SLASHING_V2_EPOCH,
+            "P5a admission rides the HF2 switch",
+        );
+        assert_eq!(
+            crate::params::PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH,
+            crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH,
+            "HF2 never moves the pre-activation offence refusal",
+        );
+        for epoch in [0, 2_884, 100_000, u64::MAX - 1] {
+            assert!(!crate::params::native_slashing_active(epoch));
+        }
+    }
+
     /// ST-04 candidate: self-slashing may still eject at E+1, because an
     /// exit queue must not become immunity from proven equivocation, but it
     /// must not release funds earlier than a voluntary exit requested in the
@@ -13715,6 +15240,77 @@ mod tests {
         );
     }
 
+    /// Incident 2026-10-19: once `PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH`
+    /// binds, evidence for an offence committed before slashing existed
+    /// (target epoch 1 here, < 2884) invalidates the block that carries it;
+    /// with the refusal unbound the very same evidence slashes (control).
+    #[test]
+    fn pre_activation_offence_rejects_the_block_once_the_refusal_binds() {
+        let _gate = crate::params::rehearsal::slashing_gate_open_guard();
+        let (t, g, mut chains) = setup(4);
+        let p1 = schedule::proposer(&g.seed_for_epoch(0), 1, &g.duty_roster()).unwrap();
+        let offender = (p1 + 1) % 4;
+        let ev = PosTransaction::SlashingEvidence(double_vote_evidence(offender));
+        let PosTransaction::SlashingEvidence(inner) = &ev else { unreachable!() };
+        assert!(slashing::offence_predates_activation(inner));
+        {
+            let _refuse = crate::params::rehearsal::pre_activation_refusal_guard();
+            let env = probe_env(&g, 1, std::slice::from_ref(&ev), &mut chains);
+            assert_eq!(
+                t.compute_post_state(&g, &env, &[], std::slice::from_ref(&ev)).unwrap_err(),
+                TransitionError::Transaction(0),
+            );
+            // Relay validation mirrors consensus.
+            assert_eq!(
+                g.validate_lifecycle_transaction(&ev, 0, 0, &OkVerifier),
+                Err(TxReject::EvidenceNotActive)
+            );
+        }
+        let (_, _, mut fresh) = setup(4);
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&ev), &mut fresh);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&ev)).unwrap();
+        assert!(s1.validator_record(offender).unwrap().slashed, "control: unbound refusal slashes");
+    }
+
+    /// The refusal is about WHEN the offence happened, not when it is
+    /// reported: a pair whose later vote targets an epoch at or after
+    /// activation stays slashable with the refusal bound.
+    #[test]
+    fn post_activation_offence_still_slashes_under_the_refusal() {
+        let _gate = crate::params::rehearsal::slashing_gate_open_guard();
+        let _refuse = crate::params::rehearsal::pre_activation_refusal_guard();
+        let (t, g, mut chains) = setup(4);
+        let p1 = schedule::proposer(&g.seed_for_epoch(0), 1, &g.duty_roster()).unwrap();
+        let offender = (p1 + 1) % 4;
+        let te = crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH;
+        let data = |head: u8| AttestationData {
+            slot: te * crate::params::SLOTS_PER_EPOCH,
+            head: [head; 32],
+            source_epoch: te - 1,
+            source_root: [1; 32],
+            target_epoch: te,
+            target_root: [head; 32],
+        };
+        let ev = PosTransaction::SlashingEvidence(SlashingEvidence::AttestationOffence {
+            first: Attestation { data: data(0xAA), validator: offender, signature: vec![0u8; 8] },
+            second: Attestation { data: data(0xBB), validator: offender, signature: vec![0u8; 8] },
+        });
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&ev), &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&ev)).unwrap();
+        assert!(s1.validator_record(offender).unwrap().slashed);
+    }
+
+    /// Armed at slashing activation (owner decision 2026-10-19): replay-safe
+    /// because no canonical block in [2884, now) carries slashing evidence and
+    /// no validator is slashed.
+    #[test]
+    fn pre_activation_refusal_is_armed_at_slashing_activation() {
+        let gate = crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH;
+        assert_eq!(crate::params::PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH, gate);
+        assert!(!crate::params::pre_activation_offence_refusal_active(gate - 1));
+        assert!(crate::params::pre_activation_offence_refusal_active(gate));
+    }
+
     #[test]
     fn evidence_against_an_unregistered_index_rejects_the_block() {
         let _gate = crate::params::rehearsal::slashing_gate_open_guard();
@@ -13762,6 +15358,111 @@ mod tests {
             t.compute_post_state(&s1, &env3, &[], std::slice::from_ref(&swapped)).unwrap_err(),
             TransitionError::Transaction(0),
         );
+    }
+
+    /// P5a audit pin — evidence across two branches. A validator that votes
+    /// for target epoch 1 on two sibling branches has double-voted; the pair
+    /// is prosecutable on EITHER branch (the signing root binds no branch
+    /// state), applies exactly once per branch, a slash on one branch is
+    /// invisible on the other until that branch includes the evidence, and
+    /// replay (either order) is refused on both.
+    #[test]
+    fn evidence_across_two_branches_slashes_once_per_branch() {
+        let _gate = crate::params::rehearsal::slashing_gate_open_guard();
+        let (t, g, mut chains_a) = setup(4);
+        let (_, _, mut chains_b) = setup(4);
+        let a1 = build_block(&t, &g, 1, &[], &[], &mut chains_a);
+        let sa1 = t.apply_block(&g, &a1, &[], &[]).unwrap();
+        let b1 = build_block(&t, &g, 2, &[], &[], &mut chains_b);
+        let sb1 = t.apply_block(&g, &b1, &[], &[]).unwrap();
+        assert_ne!(sa1.head, sb1.head, "two real sibling branches");
+        let vote = |root: [u8; 32]| Attestation {
+            data: AttestationData {
+                slot: 33,
+                head: root,
+                source_epoch: 0,
+                source_root: [1; 32],
+                target_epoch: 1,
+                target_root: root,
+            },
+            validator: 0,
+            signature: vec![0u8; 8],
+        };
+        let p3 = schedule::proposer(&sa1.seed_for_epoch(0), 3, &sa1.duty_roster()).unwrap();
+        let p4 = schedule::proposer(&sb1.seed_for_epoch(0), 4, &sb1.duty_roster()).unwrap();
+        let offender = (0..4).find(|v| *v != p3 && *v != p4).unwrap();
+        let mut a = vote(*sa1.head.as_bytes());
+        let mut b = vote(*sb1.head.as_bytes());
+        a.validator = offender;
+        b.validator = offender;
+        let ev = PosTransaction::SlashingEvidence(SlashingEvidence::AttestationOffence {
+            first: a.clone(),
+            second: b.clone(),
+        });
+        let swapped = PosTransaction::SlashingEvidence(SlashingEvidence::AttestationOffence {
+            first: b,
+            second: a,
+        });
+        let a2 = build_block(&t, &sa1, 3, &[], std::slice::from_ref(&ev), &mut chains_a);
+        let sa2 = t.apply_block(&sa1, &a2, &[], std::slice::from_ref(&ev)).unwrap();
+        assert!(sa2.validator_record(offender).unwrap().slashed);
+        assert!(!sb1.validator_record(offender).unwrap().slashed, "branch B unaffected");
+        // Branch B includes the swapped order — one offence, fresh on B.
+        let b2 = build_block(&t, &sb1, 4, &[], std::slice::from_ref(&swapped), &mut chains_b);
+        let sb2 = t.apply_block(&sb1, &b2, &[], std::slice::from_ref(&swapped)).unwrap();
+        assert!(sb2.validator_record(offender).unwrap().slashed);
+        assert_eq!(
+            sa2.validator_record(offender).unwrap().staked_sat,
+            sb2.validator_record(offender).unwrap().staked_sat,
+            "the same offence prices identically on both branches",
+        );
+        // Replay on each branch, both orders: dead on arrival.
+        for (pre, slot) in [(&sa2, 5u64), (&sb2, 6u64)] {
+            for tx in [&ev, &swapped] {
+                let (_, _, mut c) = setup(4);
+                let env = probe_env(pre, slot, std::slice::from_ref(tx), &mut c);
+                assert_eq!(
+                    t.compute_post_state(pre, &env, &[], std::slice::from_ref(tx)).unwrap_err(),
+                    TransitionError::Transaction(0),
+                );
+            }
+        }
+    }
+
+    /// P5a audit pin — malformed evidence in a block costs the PROPOSER the
+    /// whole block (consensus never charges or records it), and its id is
+    /// not burned: the genuine evidence still applies afterwards.
+    #[test]
+    fn malformed_evidence_forfeits_the_block_and_burns_no_id() {
+        let _gate = crate::params::rehearsal::slashing_gate_open_guard();
+        let (t, g, mut chains) = setup(4);
+        let p1 = schedule::proposer(&g.seed_for_epoch(0), 1, &g.duty_roster()).unwrap();
+        let offender = (p1 + 1) % 4;
+        let SlashingEvidence::AttestationOffence { first, second } = double_vote_evidence(offender)
+        else {
+            unreachable!()
+        };
+        let mut other = second.clone();
+        other.validator = (offender + 1) % 4;
+        for bad in [
+            SlashingEvidence::AttestationOffence { first: first.clone(), second: other },
+            SlashingEvidence::AttestationOffence { first: first.clone(), second: first.clone() },
+        ] {
+            let tx = PosTransaction::SlashingEvidence(bad);
+            let (_, _, mut c) = setup(4);
+            let env = probe_env(&g, 1, std::slice::from_ref(&tx), &mut c);
+            assert_eq!(
+                t.compute_post_state(&g, &env, &[], std::slice::from_ref(&tx)).unwrap_err(),
+                TransitionError::Transaction(0),
+            );
+        }
+        // Truncated wire bytes never decode.
+        let good = PosTransaction::SlashingEvidence(double_vote_evidence(offender));
+        let bytes = good.canonical_bytes();
+        assert!(PosTransaction::from_canonical_bytes(&bytes[..bytes.len() - 1]).is_err());
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&good), &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&good)).unwrap();
+        assert!(s1.validator_record(offender).unwrap().slashed);
     }
 
     /// THE GATE, CLOSED — the configuration every node runs today, asserted
@@ -14504,6 +16205,12 @@ mod tests {
             // no satoshi in either direction. Beacon state, not value state;
             // it cannot touch the cap.
             PosTransaction::RandaoRecommit { .. } => {}
+            // A KES registration records one (depth, root) pair per validator
+            // and moves no satoshi: registry metadata, not value.
+            PosTransaction::KesRegister { .. } => {}
+            // A KES rotation replaces that pair from the next period on and
+            // moves no satoshi either.
+            PosTransaction::KesRotate { .. } => {}
             // Funded admission transfers UTXO value into bonded stake and fees.
             PosTransaction::FundedDeposit(_) => {}
             // Funded delegation moves existing UTXO value through a bonded
@@ -14512,6 +16219,21 @@ mod tests {
             | PosTransaction::FundedUndelegate(_)
             | PosTransaction::FundedDelegationWithdraw(_)
             | PosTransaction::ValidatorCommissionUpdate(_) => {}
+            // Escrow removes spendable value; nothing is issued.
+            PosTransaction::L2Deposit(_) => {}
+            // A DA batch only pays fees from its inputs; nothing is issued.
+            PosTransaction::L2DataAvailability(_) => {}
+            // A claim moves escrowed value (counted in the accounted
+            // supply) to an output; its fee comes from the relayer's inputs.
+            PosTransaction::L2WithdrawClaim(_) => {}
+            PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => {} // Cursor only; no balances.
+            // Rewrites one registry column (the credential); no satoshi moves.
+            PosTransaction::WithdrawalCredentialRotation(_) => {}
+            // Inserts a 32-byte commitment; no satoshi moves.
+            PosTransaction::RescueCommit(_) => {}
+            // Sweeps existing outputs into one output minus the market fee
+            // (strict conservation); nothing is issued.
+            PosTransaction::RescueReveal(_) => {}
         }
 
         // Monotone under blocks and boundaries, and never above the cap.
@@ -16863,6 +18585,7 @@ mod epoch_advance_bound {
         // And it must still be a bound: anything near u64::MAX is not one.
         assert!(MAX_EPOCH_ADVANCE < 1 << 20, "a ceiling that large is not a ceiling");
     }
+
 }
 
 #[cfg(feature = "local-state-cache")]
@@ -16894,4 +18617,83 @@ mod finality_order_observability {
         assert_eq!(next.finality_engine, finality_before);
         assert_eq!(next.epoch, 5);
     }
+}
+
+/// HF3: what the optional suite 0x0003 costs a user and a block, computed
+/// from the real canonical encoding rather than estimated. Run with
+/// `--nocapture` to print the table quoted in
+/// `spikes/slhdsa-verify-cost/RESULTS.md`.
+#[cfg(test)]
+mod slhdsa_fee_model_tests {
+    use super::*;
+    use fee_market::*;
+
+    /// (label, suite, pk body, typical sig body, verify gas, native ns/verify)
+    const SUITES: [(&str, u16, usize, usize, u64, u64); 2] = [
+        ("0x0001 ML-DSA-65+Falcon-1024", 0x0001, 1952 + 1793, 3309 + 1276,
+         HYBRID_VERIFY_GAS, HYBRID_VERIFY_NATIVE_NS),
+        ("SLH-128s+Falcon-1024", SUITE_SLHDSA128S_FALCON1024, 32 + 1793, 7856 + 1276,
+         SLHDSA_FALCON_VERIFY_GAS, SLHDSA128S_VERIFY_NATIVE_NS + FALCON1024_VERIFY_NATIVE_NS),
+    ];
+
+    fn one_in_two_out(suite: u16, pk_body: usize, sig_body: usize) -> PosTransaction {
+        let mut pubkey = vec![0xB1, 0x0C];
+        pubkey.extend_from_slice(&suite.to_le_bytes());
+        pubkey.resize(4 + pk_body, 0x11);
+        let mut signature = vec![0xB1, 0x0C];
+        signature.extend_from_slice(&suite.to_le_bytes());
+        signature.resize(4 + sig_body, 0x22);
+        let out = TransferOutput { value: 1_000_000, script_hash: [3; 32] };
+        PosTransaction::TransferV2 {
+            keys: vec![WitnessKey { pubkey, signature }],
+            inputs: vec![TransferInputV2 { txid: [1; 32], vout: 0, key_index: 0 }],
+            outputs: vec![out.clone(), out],
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        }
+    }
+
+    #[test]
+    fn typical_transfer_and_worst_case_block_per_suite() {
+        let cap = max_block_tx_bytes(BLOCK_BYTES_V2_ACTIVATION_EPOCH_FOR_TEST);
+        eprintln!("suite | tx_bytes | gas old | gas per-suite | fee@floor sat (old->new) | tx/block | verify ms/block | block KiB");
+        let mut rows = Vec::new();
+        for (label, suite, pk, sig, vgas, ns) in SUITES {
+            let tx = one_in_two_out(suite, pk, sig);
+            let bytes = tx.canonical_bytes().len() as u64;
+            let PosTransaction::TransferV2 { keys, .. } = &tx else { unreachable!() };
+            // The armed class, built as the transition builds it.
+            let armed = match fee_market::verify_suite_of(&keys[0].pubkey) {
+                VerifySuite::Hybrid => TxClass::Eutxo { inputs: 1 },
+                VerifySuite::SlhDsaFalcon => TxClass::EutxoSuites { hybrid: 0, slh_falcon: 1 },
+            };
+            assert_eq!(verify_gas(armed), vgas);
+            let old = charge(TxClass::Eutxo { inputs: 1 }, bytes, MIN_BASE_FEE_MILLISAT_PER_GAS, 0);
+            let new = charge(armed, bytes, MIN_BASE_FEE_MILLISAT_PER_GAS, 0);
+            let n = (cap / bytes).min(BLOCK_GAS_LIMIT / new.gas);
+            let ms = n * ns / 1_000_000;
+            eprintln!(
+                "{label} | {bytes} | {} | {} | {} -> {} | {n} | {ms} | {}",
+                old.gas, new.gas, old.base_fee_sat, new.base_fee_sat, n * bytes / 1024
+            );
+            rows.push((bytes, new.gas, n, ms));
+        }
+        let (hyb_bytes, hyb_gas, hyb_n, _) = rows[0];
+        // Today's transfer is unchanged by the arm.
+        assert_eq!(hyb_gas, intrinsic_gas(TxClass::Eutxo { inputs: 1 }, hyb_bytes));
+        for &(bytes, gas, n, ms) in &rows[1..] {
+            // More bytes and ~5-7x the gas of a hybrid transfer.
+            assert!(bytes > hyb_bytes && bytes < hyb_bytes * 2);
+            assert!(gas > hyb_gas * 5 && gas < hyb_gas * 7);
+            // Fewer SLH transfers fit; with verify priced, the gas axis sits
+            // within a few percent of the byte axis, so a block of SLH
+            // spends meters its CPU instead of riding free under the byte cap.
+            assert!(n < hyb_n && n * gas <= BLOCK_GAS_LIMIT);
+            assert!(n * gas > BLOCK_GAS_LIMIT * 3 / 4);
+            // A block of them costs well under one second of one core.
+            assert!(ms < 200, "worst-case verify per block {ms} ms");
+        }
+    }
+
+    const BLOCK_BYTES_V2_ACTIVATION_EPOCH_FOR_TEST: u64 = crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
 }

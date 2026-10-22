@@ -193,7 +193,7 @@ fn eutxos(n: u32, owned: u32, owner_script: [u8; 32]) -> Vec<EutxoEntry> {
 /// convenience copy constructor is how two nodes end up on two networks. The
 /// benchmark needs one per replay run, so it rebuilds it field by field here
 /// rather than deriving `Clone` on a production type for a test's sake.
-fn clone_manifest(m: &Manifest) -> Manifest {
+pub(super) fn clone_manifest(m: &Manifest) -> Manifest {
     Manifest {
         genesis_time_ms: m.genesis_time_ms,
         slot_ms: m.slot_ms,
@@ -226,8 +226,8 @@ struct Coin {
 /// to. So replay measures validation of a *valid* chain — which is what boot
 /// replay is — and a fixture bug cannot quietly turn the benchmark into a
 /// measurement of the rejection path.
-struct Generator {
-    manifest: Manifest,
+pub(super) struct Generator {
+    pub(super) manifest: Manifest,
     tr: Transition<HybridVerifier>,
     probe: Transition<ProbeVerifier>,
     keys: Vec<Keystore>,
@@ -275,7 +275,7 @@ struct Generator {
 }
 
 impl Generator {
-    fn new(dir: &Path, carryover_n: u32, participation_pct: u32) -> Generator {
+    pub(super) fn new(dir: &Path, carryover_n: u32, participation_pct: u32) -> Generator {
         let (spender_pk, spender_sk) = bloch_crypto::crypto::generate_keypair();
         let owner_script: [u8; 32] = Sha3_256::digest(&spender_pk).into();
         // 4 (suite header) + 3,309 (ML-DSA-65) + 1,462 (Falcon-1024 maximum) —
@@ -497,7 +497,7 @@ impl Generator {
     ///
     /// Built exactly the way `Engine::propose` builds one — same derivations,
     /// same RANDAO positioning, same attestation filter.
-    fn block_at(&mut self, slot: u64) -> Option<BlockEnvelope> {
+    pub(super) fn block_at(&mut self, slot: u64) -> Option<BlockEnvelope> {
         let e = epoch_of(slot);
         let rolled = self.rolled_to(e);
         let roster = rolled.active_validators();
@@ -622,7 +622,7 @@ fn median(xs: &mut [f64]) -> f64 {
 /// `live = false` is the load-bearing part. It is what boot replay sets, and
 /// it suppresses the block-log append and the per-block log line — so this
 /// measures the consensus work and not the terminal.
-fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
+pub(super) fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
     let store = Store::open(dir, &[0u8; 32]).expect("store");
     let genesis_state = manifest.genesis_state();
     let genesis_id = manifest.genesis_id();
@@ -647,7 +647,8 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         gossip_verifier: super::verification::GossipVerifier::new(verifier.clone()),
         verifier,
         keys: None, // observer: replay proposes nothing and attests nothing
-        blocks: BTreeMap::new(),
+        kes: None,
+        blocks: super::BlockInventory::default(),
         observed_proposals: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -656,6 +657,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         // empty ring means the first reorg it meets takes the `replay_to`
         // fallback — which is what a real cold boot does too.
         recent_states: VecDeque::new(),
+        finality_certs: Default::default(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
         held_release_roots: VecDeque::new(),

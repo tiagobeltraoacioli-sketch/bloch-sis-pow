@@ -81,10 +81,26 @@
 //! same_epoch`, and settled in
 //! `docs/post-mortems/2026-08-24-finality-divergence.md`. Anyone quoting the
 //! safety argument to an integrator must quote this section with it.
+//!
+//! ## The frozen finality set (gated, inert)
+//!
+//! `params::HF1_FROZEN_FINALITY_SET_EPOCH` restores the "one 3/3
+//! total" premise across the network (ObenBlock PoCI, ported). From the gate
+//! the quorum is `3·w ≥ 2·total(C)` over a frozen set `C` whose stakes are
+//! unleaked and whose membership changes only when the checkpoint it was
+//! snapshotted at FINALIZES under the previous `C` (absence pruning rides on
+//! that handoff), or at a coordinated recovery epoch. Every branch of a
+//! split shares the `C` in force at the split and none can change it without
+//! finalizing, so two disjoint sides cannot both reach two thirds of it.
+//! `≥` (not PoCI's strict `>`) is kept: disjointness already needs
+//! `4/3·total`, the boundary is pinned by `exactly_two_thirds_justifies`,
+//! and the only thing `>` would add is "strictly more than" one third
+//! accountable in a conflict instead of "at least". See
+//! `frozen_set_tests`.
 
 use crate::attestation::AttestationData;
 use crate::params::{
-    INACTIVITY_LEAK_QUOTIENT, INACTIVITY_LEAK_RECOVERY_QUOTIENT,
+    INACTIVITY_LEAK_RECOVERY_QUOTIENT,
     INACTIVITY_LEAK_THRESHOLD_EPOCHS, MIN_QUORUM_DENOMINATOR_DEN, MIN_QUORUM_DENOMINATOR_NUM,
 };
 use crate::sample::Validator;
@@ -183,6 +199,58 @@ pub struct FinalityState {
     leaked: BTreeMap<u32, u64>,
     /// Next epoch this state will accept — makes "dense, in-order" checkable.
     next_epoch: u64,
+    /// Frozen finality set (`params::HF1_FROZEN_FINALITY_SET_EPOCH`).
+    /// `None` on every epoch below the gate, which is what keeps the committed
+    /// finality leaf and the local cache bytes identical for history. Skipped
+    /// by serde: the local cache carries it as its own trailing section
+    /// (`transition/local_cache.rs`), so caches written before it existed
+    /// keep decoding.
+    #[cfg_attr(feature = "local-state-cache", serde(skip))]
+    finality_set: Option<Box<FinalitySetState>>,
+    /// The chain's OWN checkpoint roots (epoch -> root), recorded by the
+    /// transition at each epoch boundary from
+    /// `params::HF1_OWN_TARGET_VOTES_EPOCH` and empty before it. From
+    /// that gate a vote counts only if its target is the own root of the
+    /// epoch being tallied and its source the own root of the source epoch.
+    /// At most two entries (see [`FinalityState::record_own_checkpoint`]).
+    /// Committed in the finality leaf (last, absent while empty); the local
+    /// cache carries it in its own trailing section, so the cached bytes of
+    /// this struct do not change.
+    #[cfg_attr(feature = "local-state-cache", serde(skip))]
+    own_checkpoints: BTreeMap<u64, [u8; 32]>,
+}
+
+/// A frozen `(validator -> stake)` map: the denominator and the vote weights
+/// of the finality quorum while it is in force. Stakes are UNLEAKED duty
+/// roster stakes as of `epoch`; zero-stake entries are never stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
+pub struct FinalitySet {
+    /// Epoch whose duty roster this set was taken from.
+    pub epoch: u64,
+    /// Member stakes, index order.
+    pub members: BTreeMap<u32, u64>,
+}
+
+impl FinalitySet {
+    /// Sum of member stakes. u128: 2^32 members x u64 stakes cannot overflow.
+    pub fn total(&self) -> u128 {
+        self.members.values().map(|s| *s as u128).sum()
+    }
+}
+
+/// Everything the frozen-finality-set rule keeps between epochs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
+pub struct FinalitySetState {
+    /// The set every tally is measured against until the next handoff.
+    pub current: FinalitySet,
+    /// The candidate snapshotted at the close of the last processed epoch. It
+    /// becomes `current` exactly when that epoch's checkpoint finalizes.
+    pub pending: Option<FinalitySet>,
+    /// Last epoch each duty-roster member had a non-equivocating epoch vote
+    /// included (or first appeared on the roster). Drives absence pruning.
+    pub last_seen: BTreeMap<u32, u64>,
 }
 
 impl FinalityState {
@@ -198,6 +266,8 @@ impl FinalityState {
             finalized: genesis,
             leaked: BTreeMap::new(),
             next_epoch: genesis.epoch + 1,
+            finality_set: None,
+            own_checkpoints: BTreeMap::new(),
         }
     }
 
@@ -390,6 +460,19 @@ impl FinalityState {
             leak_adjusted.max(floor)
         };
 
+        // FROZEN FINALITY SET (PoCI port), gated. From the gate on the
+        // denominator is the total of a frozen set the leak cannot touch, and
+        // votes weigh what the set says, unleaked. See
+        // `params::HF1_FROZEN_FINALITY_SET_EPOCH`.
+        let frozen = crate::params::native_finality_set_active(votes.epoch);
+        if frozen {
+            self.open_finality_set(votes);
+        }
+        let total_active: u128 = match (&self.finality_set, frozen) {
+            (Some(fs), true) => fs.current.total(),
+            _ => total_active,
+        };
+
         // ── 1. Collect valid votes ─────────────────────────────────────────
         // A vote counts only if all of these hold; anything else makes the
         // validator "absent" for both quorum and leak purposes:
@@ -429,6 +512,11 @@ impl FinalityState {
             first_vote.remove(v);
         }
 
+        // Presence for the frozen set's absence pruning: every
+        // non-equivocating vote for this target, before the source filter.
+        let present: BTreeSet<u32> =
+            if frozen { first_vote.keys().copied().collect() } else { BTreeSet::new() };
+
         // Keep only votes linking from the current justified checkpoint.
         let source = self.current_justified;
         let valid: BTreeMap<u32, AttestationData> = first_vote
@@ -444,13 +532,45 @@ impl FinalityState {
             })
             .collect();
 
+        // Own chain only (`params::HF1_OWN_TARGET_VOTES_EPOCH`).
+        // Without ancestry the tally above would let a branch carrying the
+        // other side's votes justify — and finalize — the other side's
+        // checkpoint. From the gate a vote counts only if it names this
+        // chain's own checkpoints: target = the own root recorded at the
+        // boundary that opened this epoch, source = the own root of the
+        // source epoch when one is recorded. A source justified before the
+        // gate has no recorded root; its votes may still justify an own
+        // target (or the chain could never justify again), but the link is
+        // not trusted to finalize it (`source_is_own` below). After the
+        // gate every justified checkpoint passed this filter, so the source
+        // check is the induction's base case plus defence in depth.
+        //
+        // A filtered vote is ABSENT for everything below: no quorum weight,
+        // leak during a stall, no recovery — the same as not voting.
+        let own_rule = crate::params::own_target_votes_active(votes.epoch);
+        let own_target = self.own_checkpoints.get(&votes.epoch).copied();
+        let own_source = self.own_checkpoints.get(&source.epoch).copied();
+        let mut valid = valid;
+        if own_rule {
+            valid.retain(|_, d| {
+                Some(d.target_root) == own_target
+                    && own_source.is_none_or(|root| root == d.source_root)
+            });
+        }
+        let source_is_own = !own_rule || own_source == Some(source.root);
+
         // ── 2. Justify / finalize ──────────────────────────────────────────
         let mut tally: BTreeMap<[u8; 32], u128> = BTreeMap::new();
         // Cannot overflow: `valid` is keyed by u32 validator index, so a tally
         // sums at most 2^32 distinct u64 stakes — under 2^96 in u128.
         #[allow(clippy::arithmetic_side_effects)]
         for (validator, data) in &valid {
-            *tally.entry(data.target_root).or_insert(0) += stake[validator] as u128;
+            let weight = match (&self.finality_set, frozen) {
+                // Outside the frozen set (newcomer, pruned): counts zero.
+                (Some(fs), true) => fs.current.members.get(validator).copied().unwrap_or(0),
+                _ => stake[validator],
+            };
+            *tally.entry(data.target_root).or_insert(0) += weight as u128;
         }
 
         // ≥ 2/3 as 3·w ≥ 2·total: exact in integers, so the boundary case is
@@ -491,10 +611,16 @@ impl FinalityState {
             // unequal instead of panicking.
             if source.epoch.checked_add(1) == Some(cp.epoch)
                 && source.epoch > self.finalized.epoch
+                && source_is_own
             {
                 self.finalized = source;
                 finalized_now = Some(source);
             }
+        }
+
+        // ── 2b. Finalized handoff and next candidate (gated) ──────────────
+        if frozen {
+            self.close_finality_set(votes, finalized_now, &present);
         }
 
         // ── 3. Inactivity leak ─────────────────────────────────────────────
@@ -527,7 +653,9 @@ impl FinalityState {
                 // Cannot overflow: `remaining` and `t` are both u64 values, so
                 // their u128 product is < 2^128.
                 #[allow(clippy::arithmetic_side_effects)]
-                let bite = ((remaining as u128 * t) / INACTIVITY_LEAK_QUOTIENT).max(1) as u64;
+                let bite = ((remaining as u128 * t)
+                    / crate::params::inactivity_leak_quotient(votes.epoch))
+                .max(1) as u64;
                 let bite = bite.min(remaining);
                 // Cannot overflow: `remaining = effective_stake - leaked` (the
                 // `stake` map, saturating; a zero skipped above), and
@@ -657,6 +785,130 @@ impl FinalityState {
     pub fn leaked_stakes(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
         self.leaked.iter().map(|(v, s)| (*v, *s))
     }
+
+    /// The frozen-finality-set state; `None` below
+    /// `params::HF1_FROZEN_FINALITY_SET_EPOCH`.
+    pub fn finality_set(&self) -> Option<&FinalitySetState> {
+        self.finality_set.as_deref()
+    }
+
+    /// Local-cache restore only (`transition/local_cache.rs`): the field is
+    /// serde-skipped and travels in its own trailing section.
+    pub fn restore_finality_set(&mut self, set: Option<FinalitySetState>) {
+        self.finality_set = set.map(Box::new);
+    }
+
+    /// The candidate set of `votes.epoch`: its duty roster (non-zero stake)
+    /// minus members whose last included vote is at least
+    /// `NATIVE_FINALITY_SET_PRUNE_AFTER_EPOCHS` old.
+    fn snapshot(votes: &EpochVotes<'_>, last_seen: &BTreeMap<u32, u64>) -> FinalitySet {
+        let horizon = crate::params::NATIVE_FINALITY_SET_PRUNE_AFTER_EPOCHS;
+        let members = votes
+            .active_set
+            .iter()
+            .filter(|v| v.effective_stake > 0)
+            .filter(|v| {
+                let seen = last_seen.get(&v.index).copied().unwrap_or(votes.epoch);
+                votes.epoch.saturating_sub(seen) < horizon
+            })
+            .map(|v| (v.index, v.effective_stake))
+            .collect();
+        FinalitySet { epoch: votes.epoch, members }
+    }
+
+    /// Start of a gated epoch: create the first set at the gate (the duty
+    /// roster of the first gated epoch, nobody pruned), or re-form it at a
+    /// coordinated recovery epoch. Nothing else may change `current` here.
+    fn open_finality_set(&mut self, votes: &EpochVotes<'_>) {
+        match &mut self.finality_set {
+            None => {
+                let first = Self::snapshot(votes, &BTreeMap::new());
+                self.finality_set = Some(Box::new(FinalitySetState {
+                    current: first,
+                    pending: None,
+                    last_seen: BTreeMap::new(),
+                }));
+            }
+            Some(fs) if crate::params::native_finality_set_recovery_at(votes.epoch) => {
+                fs.current = Self::snapshot(votes, &fs.last_seen);
+                fs.pending = None;
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// End of a gated epoch: (1) if this epoch finalized the checkpoint the
+    /// pending candidate was taken at, hand off to it — the only automatic
+    /// way `current` changes, authorized by two thirds of the old set;
+    /// (2) record presence; (3) snapshot the next candidate.
+    fn close_finality_set(
+        &mut self,
+        votes: &EpochVotes<'_>,
+        finalized_now: Option<Checkpoint>,
+        present: &BTreeSet<u32>,
+    ) {
+        let Some(fs) = self.finality_set.as_deref_mut() else { return };
+        if let (Some(f), Some(p)) = (finalized_now, fs.pending.as_ref()) {
+            if p.epoch == f.epoch {
+                fs.current = p.clone();
+            }
+        }
+        // Presence: any non-equivocating vote for this target epoch, whatever
+        // its source — liveness, not agreement. Newcomers get a grace start.
+        // Entries leave with the roster, so the map stays roster-sized.
+        let roster: BTreeSet<u32> = votes.active_set.iter().map(|v| v.index).collect();
+        fs.last_seen.retain(|v, _| roster.contains(v));
+        for v in &roster {
+            if present.contains(v) {
+                fs.last_seen.insert(*v, votes.epoch);
+            } else {
+                fs.last_seen.entry(*v).or_insert(votes.epoch);
+            }
+        }
+        fs.pending = Some(Self::snapshot(votes, &fs.last_seen));
+    }
+
+    /// Record `root` as this chain's own checkpoint of `epoch`, the epoch the
+    /// boundary opens (`params::HF1_OWN_TARGET_VOTES_EPOCH`; the
+    /// transition is the only caller, after the closing epoch's tally).
+    ///
+    /// Retention: the tally of an epoch reads exactly two roots — its own
+    /// (recorded when it opened, i.e. the newest entry) and the source's,
+    /// which is always `current_justified` (the uniform-link rule). The
+    /// justified checkpoint only moves inside `process_epoch`, which runs
+    /// before the next record, so keeping {`epoch`, `current_justified.epoch`}
+    /// keeps every root a later tally can read: at most two entries
+    /// (2 × 40 committed bytes), whatever the length of a stall. Older roots
+    /// are not needed — a vote naming an older source is already discarded by
+    /// the uniform-link rule.
+    pub fn record_own_checkpoint(&mut self, epoch: u64, root: [u8; 32]) {
+        self.own_checkpoints.insert(epoch, root);
+        let justified = self.current_justified.epoch;
+        self.own_checkpoints.retain(|e, _| *e == epoch || *e == justified);
+    }
+
+    /// This chain's own checkpoint root of `epoch`, if recorded.
+    pub fn own_checkpoint_root(&self, epoch: u64) -> Option<[u8; 32]> {
+        self.own_checkpoints.get(&epoch).copied()
+    }
+
+    /// The recorded own checkpoints, in epoch order — read by the state
+    /// commitment and the local cache only.
+    pub fn own_checkpoints(&self) -> impl Iterator<Item = Checkpoint> + '_ {
+        self.own_checkpoints.iter().map(|(epoch, root)| Checkpoint { epoch: *epoch, root: *root })
+    }
+
+    /// Local-cache restore only; the state-root check that follows a restore
+    /// authenticates what is put back.
+    #[cfg(feature = "local-state-cache")]
+    pub fn restore_own_checkpoints(&mut self, roots: BTreeMap<u64, [u8; 32]>) {
+        self.own_checkpoints = roots;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_own_checkpoints_for_test(&mut self, roots: BTreeMap<u64, [u8; 32]>) {
+        self.own_checkpoints = roots;
+    }
 }
 
 #[cfg(test)]
@@ -690,6 +942,176 @@ mod tests {
                 target_root: target,
             },
         )
+    }
+
+    // ── Own-chain checkpoints (params::HF1_OWN_TARGET_VOTES_EPOCH) ──
+
+    /// One epoch with the own-target rule on and `own` recorded as this
+    /// chain's checkpoint of `epoch` (what the transition does at the
+    /// boundary that opens it).
+    fn own_epoch(
+        st: &mut FinalityState,
+        epoch: u64,
+        own: [u8; 32],
+        committee: &[Validator],
+        atts: &[(u32, AttestationData)],
+    ) -> EpochOutcome {
+        st.record_own_checkpoint(epoch, own);
+        st.process_epoch(&EpochVotes { epoch, active_set: committee, attestations: atts }).unwrap()
+    }
+
+    /// The tally without ancestry, below the gate: a supermajority naming a
+    /// root this chain does not have justifies it, and the next epoch
+    /// finalizes it. Above the gate the same votes are absent.
+    #[test]
+    fn own_target_rule_refuses_a_foreign_supermajority() {
+        let committee = [validator(0, 100), validator(1, 100), validator(2, 100)];
+        let foreign = root(0xF1);
+        let atts1 = [vote(0, 1, foreign, genesis()), vote(1, 1, foreign, genesis()), vote(2, 1, foreign, genesis())];
+        let fcp = Checkpoint { epoch: 1, root: foreign };
+        let atts2 = [vote(0, 2, root(0xF2), fcp), vote(1, 2, root(0xF2), fcp), vote(2, 2, root(0xF2), fcp)];
+
+        let mut legacy = FinalityState::new(genesis());
+        legacy.process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts1 }).unwrap();
+        legacy.process_epoch(&EpochVotes { epoch: 2, active_set: &committee, attestations: &atts2 }).unwrap();
+        assert_eq!(legacy.finalized(), fcp, "below the gate the foreign root finalizes");
+
+        let _rule = crate::params::own_target_votes_test::open();
+        let mut st = FinalityState::new(genesis());
+        assert_eq!(own_epoch(&mut st, 1, root(1), &committee, &atts1).justified, None);
+        assert_eq!(own_epoch(&mut st, 2, root(2), &committee, &atts2).justified, None);
+        assert_eq!(st.current_justified(), genesis());
+        assert_eq!(st.finalized(), genesis());
+    }
+
+    /// Normal finality is unchanged: own votes justify and finalize exactly
+    /// as below the gate, and the justified checkpoints are the own ones.
+    #[test]
+    fn own_target_rule_keeps_normal_finality() {
+        let committee = [validator(0, 100), validator(1, 100), validator(2, 100)];
+        let epoch_votes = |e: u64| -> Vec<(u32, AttestationData)> {
+            let source = if e == 1 { genesis() } else { Checkpoint { epoch: e - 1, root: root((e - 1) as u8) } };
+            (0..3).map(|v| vote(v, e, root(e as u8), source)).collect()
+        };
+        let mut legacy = FinalityState::new(genesis());
+        let legacy_out: Vec<EpochOutcome> = (1..=6u64)
+            .map(|e| legacy.process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &epoch_votes(e) }).unwrap())
+            .collect();
+        let _rule = crate::params::own_target_votes_test::open();
+        let mut st = FinalityState::new(genesis());
+        for e in 1..=6u64 {
+            let out = own_epoch(&mut st, e, root(e as u8), &committee, &epoch_votes(e));
+            assert_eq!(out, legacy_out[(e - 1) as usize], "epoch {e}");
+            assert!(st.own_checkpoints().count() <= 2);
+        }
+        assert_eq!(st.finalized(), Checkpoint { epoch: 5, root: root(5) });
+        assert_eq!(st.finalized(), legacy.finalized());
+        assert_eq!(st.justified_checkpoints().collect::<Vec<_>>(), legacy.justified_checkpoints().collect::<Vec<_>>());
+    }
+
+    /// Mixed epoch: 2/3 own + 1/3 foreign justifies the own root; 1/3 own +
+    /// 2/3 foreign justifies nothing (below the gate it would justify the
+    /// foreign root). A double voter (own and foreign) counts for neither.
+    #[test]
+    fn own_target_rule_mixed_votes() {
+        let committee = [validator(0, 100), validator(1, 100), validator(2, 100)];
+        let _rule = crate::params::own_target_votes_test::open();
+        let own = root(1);
+        let foreign = root(0xF1);
+
+        let mut st = FinalityState::new(genesis());
+        let atts = [vote(0, 1, own, genesis()), vote(1, 1, own, genesis()), vote(2, 1, foreign, genesis())];
+        assert_eq!(own_epoch(&mut st, 1, own, &committee, &atts).justified, Some(Checkpoint { epoch: 1, root: own }));
+
+        let mut st = FinalityState::new(genesis());
+        let atts = [vote(0, 1, own, genesis()), vote(1, 1, foreign, genesis()), vote(2, 1, foreign, genesis())];
+        assert_eq!(own_epoch(&mut st, 1, own, &committee, &atts).justified, None);
+
+        let mut st = FinalityState::new(genesis());
+        let atts = [
+            vote(0, 1, own, genesis()), vote(1, 1, own, genesis()),
+            vote(1, 1, foreign, genesis()), vote(2, 1, own, genesis()),
+        ];
+        let out = own_epoch(&mut st, 1, own, &committee, &atts);
+        assert_eq!(out.equivocators, vec![1]);
+        assert_eq!(out.justified, Some(Checkpoint { epoch: 1, root: own }));
+    }
+
+    /// The activation boundary: the justified checkpoint inherited from
+    /// before the gate has no recorded own root. Votes sourcing it still
+    /// justify an own target (otherwise the chain could never justify
+    /// again), but that link does not finalize the unverified source; the
+    /// next own link finalizes the first own checkpoint, one epoch later.
+    #[test]
+    fn own_target_rule_does_not_finalize_an_unrecorded_source() {
+        let committee = [validator(0, 100), validator(1, 100), validator(2, 100)];
+        let mut st = FinalityState::new(genesis());
+        let atts: Vec<_> = (0..3).map(|v| vote(v, 1, root(1), genesis())).collect();
+        st.process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts }).unwrap();
+        let pre_gate = Checkpoint { epoch: 1, root: root(1) };
+        assert_eq!(st.current_justified(), pre_gate);
+
+        let _rule = crate::params::own_target_votes_test::open();
+        let atts: Vec<_> = (0..3).map(|v| vote(v, 2, root(2), pre_gate)).collect();
+        let out = own_epoch(&mut st, 2, root(2), &committee, &atts);
+        assert_eq!(out.justified, Some(Checkpoint { epoch: 2, root: root(2) }));
+        assert_eq!(out.finalized, None, "an unrecorded source is not finalized");
+        let atts: Vec<_> = (0..3).map(|v| vote(v, 3, root(3), Checkpoint { epoch: 2, root: root(2) })).collect();
+        let out = own_epoch(&mut st, 3, root(3), &committee, &atts);
+        assert_eq!(out.finalized, Some(Checkpoint { epoch: 2, root: root(2) }));
+    }
+
+    /// Fail closed: with the rule on and no own root recorded for the epoch,
+    /// no vote counts.
+    #[test]
+    fn own_target_rule_without_a_record_counts_nothing() {
+        let committee = [validator(0, 100), validator(1, 100), validator(2, 100)];
+        let _rule = crate::params::own_target_votes_test::open();
+        let mut st = FinalityState::new(genesis());
+        let atts: Vec<_> = (0..3).map(|v| vote(v, 1, root(1), genesis())).collect();
+        let out = st.process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts }).unwrap();
+        assert_eq!(out.justified, None);
+    }
+
+    /// Leak accounting: during a stall a validator voting a foreign
+    /// checkpoint is charged exactly as one that did not vote, and does not
+    /// recover; an own voter is spared.
+    #[test]
+    fn foreign_voters_leak_like_absentees() {
+        let committee = [validator(0, 50_000_000), validator(1, 25_000_000), validator(2, 25_000_000)];
+        let _rule = crate::params::own_target_votes_test::open();
+        let mut st = FinalityState::new(genesis());
+        for e in 1..=(INACTIVITY_LEAK_THRESHOLD_EPOCHS + 6) {
+            // 0 votes own (50%: no quorum), 1 votes the other side, 2 is silent.
+            let atts = [vote(0, e, root(e as u8), genesis()), vote(1, e, root(0xF0), genesis())];
+            own_epoch(&mut st, e, root(e as u8), &committee, &atts);
+        }
+        assert_eq!(st.finalized(), genesis());
+        assert_eq!(st.leaked_of(0), 0, "the own voter is spared");
+        assert!(st.leaked_of(1) > 0);
+        assert_eq!(st.leaked_of(1), st.leaked_of(2), "a foreign vote is an absence");
+    }
+
+    /// Storage bound: whatever the stall, at most two own roots are kept —
+    /// the newest (the epoch being tallied next) and the justified one (the
+    /// only admissible source).
+    #[test]
+    fn own_checkpoints_stay_at_two_through_a_stall() {
+        let mut st = FinalityState::new(genesis());
+        let committee = [validator(0, 100), validator(1, 100), validator(2, 100)];
+        let _rule = crate::params::own_target_votes_test::open();
+        let atts: Vec<_> = (0..3).map(|v| vote(v, 1, root(1), genesis())).collect();
+        own_epoch(&mut st, 1, root(1), &committee, &atts);
+        for e in 2..200u64 {
+            own_epoch(&mut st, e, root(e as u8), &committee, &[]);
+            assert!(st.own_checkpoints().count() <= 2);
+        }
+        st.record_own_checkpoint(200, root(200));
+        assert_eq!(
+            st.own_checkpoints().map(|c| c.epoch).collect::<Vec<_>>(),
+            vec![1, 200],
+            "the justified source survives the stall"
+        );
     }
 
     #[test]
@@ -902,6 +1324,47 @@ mod tests {
         assert!(st.leaked_of(1) > 0);
         assert!(st.leaked_of(2) > 0);
         assert_eq!(st.leaked_of(0), 0, "a validly voting member never leaks");
+    }
+
+    #[test]
+    fn the_eth_paced_quotient_arms_exactly_at_its_flag_day() {
+        use crate::params::{
+            inactivity_leak_quotient, ETH_PACED_LEAK_ACTIVATION_EPOCH, INACTIVITY_LEAK_QUOTIENT,
+            INACTIVITY_LEAK_QUOTIENT_ETH_PACED,
+        };
+        assert_eq!(inactivity_leak_quotient(ETH_PACED_LEAK_ACTIVATION_EPOCH - 1), INACTIVITY_LEAK_QUOTIENT);
+        assert_eq!(inactivity_leak_quotient(ETH_PACED_LEAK_ACTIVATION_EPOCH), INACTIVITY_LEAK_QUOTIENT_ETH_PACED);
+    }
+
+    /// Ethereum's figures, measured through `process_epoch`: an absent
+    /// validator keeps >99.8% of its weight after a day of non-finality and
+    /// about half after three weeks. 40% present / 60% absent so the stall
+    /// cannot end before the 50% mark (it ends near a 2/3 loss).
+    #[test]
+    fn the_eth_paced_leak_halves_an_absent_validator_in_about_three_weeks() {
+        let _open = crate::params::eth_paced_leak_rehearsal::open();
+        let committee = [validator(0, 40_000_000), validator(1, 60_000_000)];
+        let mut st = FinalityState::new(genesis());
+        let epochs_per_day = 24 * 3600 / (32 * crate::params::SLOT_DURATION_SECS);
+        let mut kept_after_a_day = None;
+        for e in 1..=(21 * epochs_per_day + INACTIVITY_LEAK_THRESHOLD_EPOCHS) {
+            let atts = [vote(0, e, [(e % 251) as u8 + 1; 32], genesis())];
+            let out = st
+                .process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &atts })
+                .unwrap();
+            assert!(out.finalized.is_none(), "the 40/60 stall must not end before the 50% mark");
+            if e == epochs_per_day + INACTIVITY_LEAK_THRESHOLD_EPOCHS {
+                kept_after_a_day = Some(60_000_000 - st.leaked_of(1));
+            }
+        }
+        let day = kept_after_a_day.unwrap();
+        assert!(day * 1000 >= 60_000_000 * 998, "after one day kept {day} of 60M");
+        let weeks = 60_000_000 - st.leaked_of(1);
+        assert!(
+            (25_000_000..=35_000_000).contains(&weeks),
+            "after 21 days kept {weeks} of 60M; Ethereum's pace is about half"
+        );
+        assert_eq!(st.leaked_of(0), 0);
     }
 
     #[test]
@@ -2042,3 +2505,382 @@ mod local_cache_tests {
         assert_eq!(restored.leaked.get(&7), Some(&123456));
     }
 }
+
+/// Frozen finality set (`params::HF1_FROZEN_FINALITY_SET_EPOCH`): the
+/// partition, normal-operation, pruning, recovery and replay properties.
+#[cfg(test)]
+mod frozen_set_tests {
+    use super::*;
+    use crate::params::native_finality_set_test as gate;
+    use crate::params::NATIVE_FINALITY_SET_PRUNE_AFTER_EPOCHS as PRUNE;
+
+    const G: Checkpoint = Checkpoint { epoch: 0, root: [0xAA; 32] };
+
+    fn roster(stakes: &[u64]) -> Vec<Validator> {
+        stakes.iter().enumerate().map(|(i, s)| Validator { index: i as u32, effective_stake: *s }).collect()
+    }
+
+    fn branch_root(marker: u8, epoch: u64) -> [u8; 32] {
+        let mut out = [marker; 32];
+        out[..8].copy_from_slice(&epoch.to_le_bytes());
+        out
+    }
+
+    fn votes_of(voters: &[u32], epoch: u64, target: [u8; 32], st: &FinalityState) -> Vec<(u32, AttestationData)> {
+        let src = st.current_justified();
+        voters
+            .iter()
+            .map(|v| {
+                (*v, AttestationData {
+                    slot: epoch * crate::params::SLOTS_PER_EPOCH,
+                    head: target,
+                    source_epoch: src.epoch,
+                    source_root: src.root,
+                    target_epoch: epoch,
+                    target_root: target,
+                })
+            })
+            .collect()
+    }
+
+    fn step(st: &mut FinalityState, set: &[Validator], voters: &[u32], epoch: u64, marker: u8) -> EpochOutcome {
+        let atts = votes_of(voters, epoch, branch_root(marker, epoch), st);
+        st.process_epoch(&EpochVotes { epoch, active_set: set, attestations: &atts }).unwrap()
+    }
+
+    /// Common history (everyone votes one branch) up to `split`, then each
+    /// side votes only its own branch for `epochs` more. Returns, per side,
+    /// the finalized checkpoints that lie on that side's own branch (i.e.
+    /// after the split).
+    fn run_split(stakes: &[u64], sides: &[Vec<u32>], split: u64, epochs: u64) -> Vec<Vec<Checkpoint>> {
+        let set = roster(stakes);
+        let all: Vec<u32> = (0..stakes.len() as u32).collect();
+        let mut common = FinalityState::new(G);
+        for e in 1..=split {
+            step(&mut common, &set, &all, e, 0x01);
+        }
+        let mut out = Vec::new();
+        for (i, side) in sides.iter().enumerate() {
+            let mut st = common.clone();
+            let mut fins = Vec::new();
+            for e in split + 1..=split + epochs {
+                if let Some(f) = step(&mut st, &set, side, e, 0xB0 + i as u8).finalized {
+                    if f.epoch > split {
+                        fins.push(f);
+                    }
+                }
+            }
+            out.push(fins);
+        }
+        out
+    }
+
+    fn sides_that_finalized(r: &[Vec<Checkpoint>]) -> usize {
+        r.iter().filter(|f| !f.is_empty()).count()
+    }
+
+    /// THE PROPERTY. Today's rules (floor 1/2, leak-adjusted denominator)
+    /// finalize both sides of a 50/50 and a 60/40 split and two of a three-way
+    /// split (devnet4, 2026-10-17); the frozen set finalizes none of them,
+    /// and only the >= 2/3 side of a 70/30 split.
+    #[test]
+    fn partitions_finalize_at_most_one_side_under_the_frozen_set() {
+        let _floor = crate::params::rehearsal::gates_open_guard();
+        let ten = [100u64; 10];
+        let cases: Vec<(&[u64], Vec<Vec<u32>>, usize, usize)> = vec![
+            // (stakes, sides, sides finalizing today, sides finalizing gated)
+            (&ten, vec![(0..5).collect(), (5..10).collect()], 2, 0),
+            (&ten, vec![(0..6).collect(), (6..10).collect()], 2, 0),
+            (&[100, 100, 100], vec![vec![0], vec![1], vec![2]], 3, 0),
+            (&ten, vec![(0..7).collect(), (7..10).collect()], 1, 1),
+        ];
+        for (stakes, sides, today, gated) in cases {
+            let legacy = run_split(stakes, &sides, 6, 400);
+            assert_eq!(sides_that_finalized(&legacy), today, "legacy {sides:?}");
+            let _g = gate::open();
+            let frozen = run_split(stakes, &sides, 6, 400);
+            assert_eq!(sides_that_finalized(&frozen), gated, "frozen {sides:?}");
+            assert!(sides_that_finalized(&frozen) <= 1);
+            if gated == 1 {
+                // The 70% side keeps finalizing immediately, as it does today.
+                assert_eq!(frozen[0].first().map(|c| c.epoch), legacy[0].first().map(|c| c.epoch));
+            }
+        }
+    }
+
+    /// The denominator a split side is measured against is the pre-split set,
+    /// for as long as the split lasts: no absence, leak or timeout moves it.
+    #[test]
+    fn a_split_side_never_changes_its_finality_set() {
+        let _g = gate::open();
+        let set = roster(&[100; 10]);
+        let all: Vec<u32> = (0..10).collect();
+        let mut st = FinalityState::new(G);
+        for e in 1..=6 {
+            step(&mut st, &set, &all, e, 0x01);
+        }
+        let before = st.finality_set().unwrap().current.clone();
+        assert_eq!(before.total(), 1_000);
+        let side: Vec<u32> = (0..6).collect();
+        for e in 7..=7 + 3 * PRUNE {
+            assert_eq!(step(&mut st, &set, &side, e, 0xB0).finalized, None);
+        }
+        assert_eq!(st.finality_set().unwrap().current, before);
+        assert!(st.leaked_total() > 0, "the leak still accrues; it just buys no finality");
+    }
+
+    /// Normal operation: outcomes are identical, epoch by epoch, under any
+    /// participation pattern, including stalls the set does not need to
+    /// rescue and the exact-2/3 boundary (>= is kept).
+    #[test]
+    fn normal_operation_finality_is_unchanged() {
+        let _floor = crate::params::rehearsal::gates_open_guard();
+        let stakes = [300u64, 200, 150, 100, 100, 50, 50, 25, 25, 1];
+        let set = roster(&stakes);
+        let patterns: Vec<Box<dyn Fn(u64) -> Vec<u32>>> = vec![
+            Box::new(|_| (0..10).collect()),
+            Box::new(|_| (0..4).collect()),                       // 750/1001
+            Box::new(|e| if e % 3 == 0 { vec![0, 1] } else { (0..10).collect() }),
+            Box::new(|e| if e % 7 < 2 { vec![0, 1, 2] } else { (0..10).collect() }),
+        ];
+        // (A member that NEVER votes is pruned after
+        // `NATIVE_FINALITY_SET_PRUNE_AFTER_EPOCHS`, which can only make a
+        // later quorum easier: that is the intended difference, exercised by
+        // `fading_weight_is_pruned_by_the_old_set_and_can_rejoin`.)
+        for p in &patterns {
+            let mut legacy = FinalityState::new(G);
+            let mut frozen = FinalityState::new(G);
+            for e in 1..=300 {
+                let a = step(&mut legacy, &set, &p(e), e, 0x01);
+                let b = {
+                    let _g = gate::open();
+                    step(&mut frozen, &set, &p(e), e, 0x01)
+                };
+                assert_eq!(a, b, "epoch {e}");
+            }
+            assert_eq!(legacy.finalized(), frozen.finalized());
+        }
+        // Exactly two thirds of the frozen total still justifies.
+        let _g = gate::open();
+        let mut st = FinalityState::new(G);
+        let out = step(&mut st, &roster(&[200, 100]), &[0], 1, 0x01);
+        assert!(out.justified.is_some());
+    }
+
+    /// Normal operation with churn: a newcomer and a leaver. The set lags the
+    /// roster by the handoff, so the outcome under full participation is the
+    /// same; the newcomer enters the set by a finalized handoff.
+    #[test]
+    fn churn_enters_the_set_through_finalized_handoffs() {
+        let _g = gate::open();
+        let base = roster(&[100; 9]);
+        let mut grown = base.clone();
+        grown.push(Validator { index: 9, effective_stake: 100 });
+        let mut st = FinalityState::new(G);
+        for e in 1..=40u64 {
+            let set: Vec<Validator> = match e {
+                0..=9 => base.clone(),
+                10..=29 => grown.clone(),
+                _ => grown.iter().copied().filter(|v| v.index != 0).collect(),
+            };
+            let voters: Vec<u32> = set.iter().map(|v| v.index).collect();
+            let out = step(&mut st, &set, &voters, e, 0x01);
+            assert_eq!(out.justified.map(|c| c.epoch), Some(e));
+            if e >= 2 {
+                assert_eq!(out.finalized.map(|c| c.epoch), Some(e - 1));
+            }
+            let members = &st.finality_set().unwrap().current.members;
+            // After epoch e finalizes e-1, the set in force is the roster of
+            // e-1: two epochs of lag behind the roster, never ahead of it.
+            assert_eq!(members.contains_key(&9), e >= 11, "epoch {e}");
+            assert_eq!(members.contains_key(&0), e < 31, "epoch {e}");
+        }
+    }
+
+    /// >1/3 vanishing: the leak used to buy finality back; under the frozen
+    /// set finality halts, and the coordinated recovery epoch resumes it.
+    #[test]
+    fn more_than_a_third_gone_halts_until_coordinated_recovery() {
+        let _floor = crate::params::rehearsal::gates_open_guard();
+        let set = roster(&[100; 10]);
+        let all: Vec<u32> = (0..10).collect();
+        let live: Vec<u32> = (0..6).collect();
+        let run = |recover_at: Option<u64>| -> (Option<u64>, FinalityState) {
+            let mut st = FinalityState::new(G);
+            let mut first = None;
+            for e in 1..=400 {
+                let voters = if e <= 5 { &all } else { &live };
+                let out = if let Some(r) = recover_at {
+                    let _g = gate::open();
+                    let _r = gate::recovery(&[r]);
+                    step(&mut st, &set, voters, e, 0x01)
+                } else {
+                    step(&mut st, &set, voters, e, 0x01)
+                };
+                if first.is_none() && out.finalized.is_some_and(|c| c.epoch > 5) {
+                    first = Some(e);
+                }
+            }
+            (first, st)
+        };
+        let (legacy, _) = run(None);
+        assert!(legacy.is_some(), "today the leak rescues a 60% chain");
+        let (never, st) = {
+            let _g = gate::open();
+            let mut st = FinalityState::new(G);
+            let mut first = None;
+            for e in 1..=400 {
+                let voters = if e <= 5 { &all } else { &live };
+                if step(&mut st, &set, voters, e, 0x01).finalized.is_some_and(|c| c.epoch > 5) {
+                    first = Some(e);
+                }
+            }
+            (first, st)
+        };
+        assert_eq!(never, None, "frozen set: no automatic rescue");
+        assert_eq!(st.finality_set().unwrap().current.total(), 1_000);
+        // Recovery once the absent are past the pruning horizon.
+        let r = 6 + PRUNE + 10;
+        let (resumed, st) = run(Some(r));
+        assert_eq!(resumed, Some(r + 1), "recovery set justifies at r, finalizes r at r+1");
+        assert_eq!(st.finality_set().unwrap().current.total(), 600);
+    }
+
+    /// Absence pruning: weight that fades out is removed by finalized
+    /// handoffs while the set still has its quorum, so a second outage that
+    /// would halt an unpruned set does not; a pruned validator rejoins by
+    /// voting again.
+    #[test]
+    fn fading_weight_is_pruned_by_the_old_set_and_can_rejoin() {
+        let _g = gate::open();
+        let set = roster(&[100; 12]);
+        let mut st = FinalityState::new(G);
+        let run = |st: &mut FinalityState, voters: Vec<u32>, n: u64| -> usize {
+            let mut fin = 0;
+            for _ in 0..n {
+                let e = st.next_epoch();
+                if step(st, &set, &voters, e, 0x01).finalized.is_some() {
+                    fin += 1;
+                }
+            }
+            fin
+        };
+        run(&mut st, (0..12).collect(), 5);
+        // 3 of 12 go dark: 75% keeps finalizing every epoch.
+        let n = PRUNE + 5;
+        assert_eq!(run(&mut st, (3..12).collect(), n), n as usize);
+        assert_eq!(st.finality_set().unwrap().current.total(), 900, "pruned by handoff");
+        // A second outage of 3: 600 of the pruned 900 is exactly 2/3.
+        let mut unpruned = st.clone();
+        assert_eq!(run(&mut st, (6..12).collect(), 20), 20);
+        // Counterfactual: the same outage before pruning had finished halts.
+        unpruned.finality_set.as_mut().unwrap().current = FinalitySet {
+            epoch: 0,
+            members: (0..12).map(|i| (i, 100)).collect(),
+        };
+        assert_eq!(run(&mut unpruned, (6..12).collect(), 20), 0);
+        // Rejoin: validator 0 votes again and is back after one handoff.
+        run(&mut st, [0].into_iter().chain(6..12).collect(), 2);
+        assert!(st.finality_set().unwrap().current.members.contains_key(&0));
+    }
+
+    /// Replay below the gate is byte-identical: the armed fold equals the
+    /// legacy fold on every epoch before the gate (state and outcome), and
+    /// the extra state appears only from the gate on.
+    #[test]
+    fn replay_before_the_gate_is_identical() {
+        let _floor = crate::params::rehearsal::gates_open_guard();
+        let set = roster(&[100; 10]);
+        let gate_epoch = 60;
+        let voters = |e: u64| -> Vec<u32> { if (20..45).contains(&e) { (0..5).collect() } else { (0..10).collect() } };
+        let mut legacy = FinalityState::new(G);
+        let mut armed = FinalityState::new(G);
+        let mut max_leak = 0;
+        for e in 1..gate_epoch + 20 {
+            let a = step(&mut legacy, &set, &voters(e), e, 0x01);
+            max_leak = max_leak.max(legacy.leaked_total());
+            let b = {
+                let _g = gate::arm_at(gate_epoch);
+                step(&mut armed, &set, &voters(e), e, 0x01)
+            };
+            if e < gate_epoch {
+                assert_eq!(a, b, "outcome at {e}");
+                assert_eq!(legacy, armed, "state at {e}");
+                assert!(armed.finality_set().is_none());
+            } else {
+                assert!(armed.finality_set().is_some());
+            }
+        }
+        assert!(max_leak > 0, "the pre-gate window exercised the leak");
+    }
+
+    /// The frozen set changes the quorum, not who is charged by the leak.
+    /// Rehearsal shape: stakes 20/40/60 x 4, the four validators 8..=11
+    /// (about 41% of the stake) go offline, so finality stalls and the leak
+    /// starts; every other validator keeps voting except v0, which misses
+    /// one epoch's duty. Under both rules, epoch by epoch, the leak ledger is
+    /// identical: the offline validators leak, an online validator that voted
+    /// every epoch leaks nothing, and v0 leaks only for the epoch it missed.
+    /// (Missing a duty during a leak is what charges an online validator,
+    /// with or without the frozen set.)
+    #[test]
+    fn the_frozen_set_does_not_change_who_the_leak_charges() {
+        let _floor = crate::params::rehearsal::gates_open_guard();
+        for eth_paced in [false, true] {
+            let _q = eth_paced.then(crate::params::eth_paced_leak_rehearsal::open);
+            let unit = 1_000_000_000_000u64;
+            let stakes: Vec<u64> = (0..12u64).map(|i| (i % 3 + 1) * 20 * unit).collect();
+            let set = roster(&stakes);
+            let all: Vec<u32> = (0..12).collect();
+            let offline = [8u32, 9, 10, 11];
+            let missed_by_v0 = 12u64;
+            let mut legacy = FinalityState::new(G);
+            let mut frozen = FinalityState::new(G);
+            for e in 1..=6 {
+                step(&mut legacy, &set, &all, e, 0x01);
+                let _g = gate::open();
+                step(&mut frozen, &set, &all, e, 0x01);
+            }
+            assert_eq!(legacy.finalized().epoch, 5);
+            let mut v0_leaked_at = None;
+            for e in 7..=14u64 {
+                let voters: Vec<u32> = all
+                    .iter()
+                    .copied()
+                    .filter(|v| !offline.contains(v) && !(*v == 0 && e == missed_by_v0))
+                    .collect();
+                let a = step(&mut legacy, &set, &voters, e, 0x01);
+                let b = {
+                    let _g = gate::open();
+                    step(&mut frozen, &set, &voters, e, 0x01)
+                };
+                assert_eq!((a.justified, b.justified), (None, None), "epoch {e}: the stall holds under both");
+                let l: Vec<(u32, u64)> = legacy.leaked_stakes().collect();
+                let f: Vec<(u32, u64)> = frozen.leaked_stakes().collect();
+                assert_eq!(l, f, "epoch {e}: same leak ledger under both rules");
+                for (v, _) in &f {
+                    assert!(offline.contains(v) || *v == 0, "epoch {e}: online v{v} leaked");
+                }
+                if v0_leaked_at.is_none() && f.iter().any(|(v, _)| *v == 0) {
+                    v0_leaked_at = Some(e);
+                }
+            }
+            assert!(legacy.leaked_total() > 0, "the window exercised the leak");
+            assert_eq!(v0_leaked_at, Some(missed_by_v0), "v0 is charged for its missed epoch only");
+        }
+    }
+
+    #[test]
+    fn the_gate_ships_inert() {
+        assert_eq!(crate::params::HF1_FROZEN_FINALITY_SET_EPOCH, u64::MAX);
+        assert!(crate::params::NATIVE_FINALITY_SET_RECOVERY_EPOCHS.is_empty());
+        for epoch in [0, 5_850, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::native_finality_set_active(epoch));
+        }
+    }
+}
+
+/// HF1 security review (2026-10-20); see docs/HARD-FORKS-1-2-3-INTEGRATION.md.
+#[cfg(test)]
+#[path = "finality_hf1_review_tests.rs"]
+mod hf1_review_tests;

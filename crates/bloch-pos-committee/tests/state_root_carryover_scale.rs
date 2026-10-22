@@ -272,6 +272,8 @@ fn fixture() -> Fixture {
             finalized: ck(821),
             leaked: Vec::new(),
             next_epoch: 823,
+            finality_set: None,
+            own_checkpoints: Vec::new(),
         },
     }
 }

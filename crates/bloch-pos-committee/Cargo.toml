@@ -21,6 +21,31 @@ native-dex-rehearsal = ["dep:bloch-euvm"]
 # node that is producing.
 perf-timing = []
 local-state-cache = ["dep:serde", "dep:bincode"]
+# DEVELOPMENT NETWORKS ONLY. Arms RANDAO re-commits from genesis (all other
+# lifecycle gates unchanged). A node built with it refuses non-BPOSMAN3
+# manifests. Never enable it for Genesis-4 or any funded network.
+devnet-randao-recommit = []
+# DEVELOPMENT NETWORKS ONLY. Native L2 deposits: escrowed BLCH appended to the
+# L2 inbox, and settlements must mint exactly the consumed inbox records.
+devnet-l2-deposits = []
+# DEVELOPMENT NETWORKS ONLY. Admits settlement V3 statements with
+# user_tx_count > 0. Without it the native verifier refuses them
+# (Reject::UserTransactions) until L1 data availability (M3) exists.
+devnet-l2-user-txs = ["devnet-l2-deposits"]
+# QUALIFICATION BUILDS ONLY (mixed-fleet rehearsal of the L2 flag day, M9).
+# Arms params::L2_SETTLEMENT_ACTIVATION_EPOCH at the compile-time value of
+# BLOCH_L2_REHEARSAL_ACTIVATION_EPOCH with a rehearsal policy bound to the
+# running network. The node refuses the Genesis-4 mainnet manifest and any
+# manifest with a carryover. Never ship it.
+l2-activation-rehearsal = []
+# QUALIFICATION BUILDS ONLY: the rehearsal above, installing the approved
+# mainnet policy values (chain id 700770, async, mainnet limits, attestor set)
+# instead of the development ones. Final qualification only. Never ship it.
+l2-activation-rehearsal-mainnet-policy = ["l2-activation-rehearsal"]
+# QUALIFICATION BUILDS ONLY (HF2 sigdet GO criterion). Sets
+# params::MLDSA_PIN_ACTIVATION_EPOCH = 0 so a full-history replay judges every
+# ML-DSA half with the pinned FIPS 204 verifier. Replay copies only; never ship.
+mldsa-pin-replay-qualification = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
@@ -29,7 +54,9 @@ bloch-euvm = { path = "../bloch-euvm", optional = true }
 sha3 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
+bloch-l2-proof = { path = "../bloch-l2-proof" }
 hex = "0.4"
+serde_json = "1.0"
 
 # SHA3/Keccak dev-profile overrides live in the root Cargo.toml, the only
 # location Cargo honors for workspace members.

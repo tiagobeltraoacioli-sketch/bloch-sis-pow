@@ -9,6 +9,8 @@ use sha3::{Digest, Sha3_256};
 const MAGIC: &[u8; 8] = b"BPOSST01";
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub(super) const INTERVAL: usize = 32;
+#[cfg(test)]
+thread_local! { static LOG_HASH_READ_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
 fn invalid(s: impl ToString) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, s.to_string()) }
 
 pub(super) fn check_replay_budget(blocks: usize, limit: Option<usize>) -> io::Result<()> {
@@ -26,6 +28,8 @@ fn log_hash(path: &std::path::Path, len: u64) -> io::Result<[u8; 32]> {
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 { break; }
+        #[cfg(test)]
+        LOG_HASH_READ_BYTES.with(|bytes| bytes.set(bytes.get().saturating_add(n as u64)));
         hash.update(&buf[..n]);
         seen = seen.checked_add(n as u64).ok_or_else(|| invalid("cache log prefix length overflow"))?;
     }
@@ -39,14 +43,16 @@ impl Engine {
         if self.chain.len() <= 1 { return Ok(()); }
         let started = std::time::Instant::now();
         let dir = self.store.directory();
-        let log = dir.join("blocks.log");
-        let len = log.metadata()?.len();
+        // Store tracks the exact framed bytes through durable appends and
+        // generation replacements. Rehashing all history here every 32
+        // blocks used to pause the consensus loop for an increasing time.
+        let (len, log_digest) = self.store.durable_log_fingerprint()?;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&Sha3_256::digest(self.manifest.encode()));
         bytes.extend_from_slice(&Sha3_256::digest(env!("BLOCH_SOURCE_DIGEST").as_bytes()));
         bytes.extend_from_slice(&len.to_le_bytes());
-        bytes.extend_from_slice(&log_hash(&log, len)?);
+        bytes.extend_from_slice(&log_digest);
         let block_count = self.chain.len().checked_sub(1)
             .ok_or_else(|| invalid("cache canonical chain is empty"))?;
         bytes.extend_from_slice(&(block_count as u64).to_le_bytes());
@@ -254,6 +260,33 @@ mod tests {
         assert_eq!(logged.len(), 70, "failed restore must preserve every replay block");
         for block in logged { assert!(engine.ingest_replay(block)); }
         assert_eq!(engine.state.slot(), 70);
+    }
+
+    #[test]
+    fn cache_writes_do_not_rescan_history_but_recovery_still_verifies_disk() {
+        let (mut engine, dir, mut logged) = fixture();
+        let log_path = dir.0.join("blocks.log");
+        let log = fs::read(&log_path).unwrap();
+        LOG_HASH_READ_BYTES.with(|bytes| bytes.set(0));
+        for _ in 0..3 { engine.write_local_cache().unwrap(); }
+        assert_eq!(LOG_HASH_READ_BYTES.with(|bytes| bytes.get()), 0,
+            "periodic cache writes must not hash the growing history on the slot loop");
+        reset(&mut engine);
+        assert_eq!(engine.restore_local_cache(&mut logged).unwrap(), 70);
+        assert_eq!(LOG_HASH_READ_BYTES.with(|bytes| bytes.get()), log.len() as u64,
+            "restart must independently verify the complete on-disk prefix");
+
+        // An out-of-band, same-length disk modification cannot be blessed by
+        // the writer's in-memory fingerprint, even if another cache is saved.
+        let mut changed = log;
+        *changed.last_mut().unwrap() ^= 1;
+        fs::write(&log_path, changed).unwrap();
+        engine.write_local_cache().unwrap();
+        logged = engine.chain[1..].iter().map(|(_, id)| engine.blocks[id.as_bytes()].clone()).collect();
+        reset(&mut engine);
+        assert!(engine.restore_local_cache(&mut logged).is_err());
+        assert_eq!(engine.state.slot(), 0);
+        assert_eq!(logged.len(), 70);
     }
 
     #[test]
