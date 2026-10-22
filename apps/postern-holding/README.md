@@ -10,6 +10,12 @@ blochinc.xyz stylesheets; `holding.css` adds the group components).
 (wallet, protocol, docs, supply, releases, API routes, ...) passes through to the
 existing Pages origin unchanged. The Worker does not redirect either domain.
 
+The original Institutional Dossier 2.0 is also served at the established URL
+`/Bloch-SIS-PoW-Institutional-Dossier-EN.pdf`. Its bytes are preserved from the
+historical Pages deployment `52b26b60.posternlabs.pages.dev` (13 August 2026
+edition): SHA-256 `51f8758cdf3f253c7acfab7542f1b7e0e3a80225d066e51af8f9b917f9cb13d7`.
+The homepage identifies it as a historical edition, separate from current releases.
+
 Corporate facts come from the published blochinc.xyz structure section; product statuses from
 the published blochinc.xyz and posternlabs.com pages. Update them there first.
 

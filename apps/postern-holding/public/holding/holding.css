@@ -171,3 +171,4 @@
 .roadmap-heading p{max-width:560px;margin:0;color:var(--muted)}
 .roadmap-future{grid-template-columns:repeat(2,minmax(0,1fr))}
 @media(max-width:720px){.release-features{grid-template-columns:1fr;gap:22px}.roadmap-heading{display:block}.roadmap-heading p{margin-top:20px}.roadmap-future{grid-template-columns:1fr}}
+.whitepaper-note{display:flex;flex-wrap:wrap;align-items:baseline;gap:14px 28px;margin:34px 0;color:var(--muted);font-size:.82rem}.whitepaper-note>span{max-width:640px}

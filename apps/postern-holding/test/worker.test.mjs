@@ -50,3 +50,13 @@ test('both domains serve identical site routes and preserve technical routes',as
     }
   }
 });
+
+test('the canonical dossier URL serves the same PDF asset on all hosts',async()=>{
+  for(const host of hosts){
+    const path='/Bloch-SIS-PoW-Institutional-Dossier-EN.pdf';
+    const response=await handlePosternLabs({request:new Request('https://'+host+path),env:{ASSETS:assets},fetcher:()=>{throw new Error('dossier must not reach Pages');}});
+    assert.equal(await response.text(),'asset:/holding'+path);
+    assert.equal(response.headers.get('content-type'),'application/pdf');
+    assert.match(response.headers.get('content-disposition'),/^inline;/);
+  }
+});
