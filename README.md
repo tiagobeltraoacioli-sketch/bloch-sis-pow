@@ -16,9 +16,12 @@ changed. If you cloned one of these, you are in the right place.
 
 ## Read this first if you want to run a node on the live chain
 
-**Current signed Linux x86-64 validator upgrade:** [September 24, 2026 — `4d4c5075`](releases/bloch-pos-2026-09-24/README.md).
+**Current signed Linux x86-64 validator upgrade:** [October 21, 2026 — `1708953d`](releases/bloch-pos-2026-10-21-node-hardening/README.md).
 The package includes the binary, signed checksum and upgrade instructions.
-[Download from the site](https://blochl1.com/releases/2026-09-24/bloch-pos).
+[Download from the site](https://blochl1.com/releases/2026-10-21-node-hardening/bloch-pos).
+This release adds validator signing safeguards, improved attestation retries,
+strict node-local ML-DSA relay verification and a finality-certificate RPC.
+It schedules no new hard fork; the new HF1/HF2/HF3 consensus gates remain disabled.
 
 **Fresh observer installation:** use the [September 26 public observer guide](docs/PUBLIC-OBSERVER-2026-09-26.md)
 and [epoch-3328 checkpoint package](checkpoints/epoch-3328/README.md). The envelope

@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#050706">
+  <meta name="description" content="Bloch node release 1708953d and the network upgrade roadmap: released validator safeguards and finality certificates, with future consensus features disabled.">
+  <meta property="og:title" content="Node release and network upgrades — technical specification">
+  <meta property="og:description" content="Signature suites, finality under partitions, finality certificates, validator signer protection, KES and Bloch L2 mainnet: parameters, measured numbers and status.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://posternlabs.com/upgrades">
+  <title>Node release and network upgrades — technical specification — Postern Labs</title>
+  <link rel="icon" href="/holding/postern.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/holding/bloch-site.css?v=20261022a">
+  <link rel="stylesheet" href="/holding/corporate.css?v=20261022a">
+  <link rel="stylesheet" href="/holding/holding.css?v=20261022a">
+  <script src="/holding/site.js?v=20261022a" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="scroll-progress" aria-hidden="true"><span></span></div>
+
+  <header class="site-header" data-header>
+    <a class="brand postern-brand" href="/" aria-label="Postern Labs home">
+      <img src="/holding/postern.svg" width="34" height="34" alt=""><span>postern<span class="postern-light">labs</span></span>
+    </a>
+    <nav class="desktop-nav" aria-label="Primary navigation">
+      <a href="/#group">The group</a>
+      <a href="/#holding">Postern Labs</a>
+      <a href="/#bloch-inc">Bloch Inc</a>
+      <a href="/#protocol">Bloch Protocol</a>
+      <a href="/#roadmap">Updates</a>
+      <a href="/#structure">Structure</a>
+      <a href="/#products">Products</a>
+      <a href="/#team">Team</a>
+    </nav>
+    <a class="header-link" href="https://posternlabs.com/Bloch-SIS-PoW-Institutional-Dossier-EN.pdf" aria-label="Read the Institutional Dossier 2.0 whitepaper, PDF">Whitepaper <span aria-hidden="true">↗</span></a>
+    <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="mobile-nav"><span>Menu</span><i aria-hidden="true"></i></button>
+    <nav class="mobile-nav" id="mobile-nav" aria-label="Mobile navigation" hidden>
+      <a href="/#group">The group</a><a href="/#holding">Postern Labs</a><a href="/#bloch-inc">Bloch Inc</a><a href="/#protocol">Bloch Protocol</a><a href="/#roadmap">Updates</a><a href="/#structure">Structure</a><a href="/#products">Products</a><a href="/#team">Team</a><a href="https://posternlabs.com/Bloch-SIS-PoW-Institutional-Dossier-EN.pdf">Whitepaper / Dossier 2.0 ↗</a><a href="https://blochinc.xyz/">Visit Bloch Inc ↗</a>
+    </nav>
+  </header>
+
+    <main id="main" class="spec-page">
+    <section class="spec-hero" aria-labelledby="spec-title">
+      <p class="spec-crumb"><a href="/">Postern Labs</a> / <a href="/#roadmap">Updates</a> / Technical specification</p>
+      <p class="eyebrow"><span></span> 05 / Updates / Technical specification</p>
+      <h1 id="spec-title">Node release and network upgrades — <em>technical specification.</em></h1>
+      <p class="spec-lead">What has shipped, what remains in testing and the parameters of each feature. Signed node release 1708953d includes validator hardening and the finality-certificate RPC. It schedules no new hard fork: all new HF1/HF2/HF3 activation gates remain disabled.</p>
+      <div class="status-pill"><i></i> Updated 22 October 2026 / release 1708953d</div>
+    </section>
+    <div class="spec-layout">
+      <nav class="spec-index" aria-label="On this page"><p>On this page</p><a href="#released">Current node release</a><a href="#status">Status labels</a><a href="#suites">1. Signature suites</a><a href="#finality">2. Finality under partitions</a><a href="#certificates">3. Finality certificates</a><a href="#signer">4. Validator signer protection</a><a href="#kes">5. Key-evolving signatures</a><a href="#l2">6. Bloch L2 mainnet</a></nav>
+      <div class="spec-content">
+<section id="released" aria-labelledby="released-title"><h2 id="released-title">Current node release.</h2>
+<p class="spec-status"><b>RELEASED</b><span>1708953d / signed Linux x86-64 / 21 October 2026</span></p>
+<p>The Genesis-4 upgrade includes durable signing-history protection, host-level signer locking and a strict signer anchor, duplicate-validator detection, improved attestation retries, stricter node-local ML-DSA relay verification and the finality-certificate RPC.</p>
+<p>All 61 managed fleet validators were upgraded and verified on 22 October 2026. Frozen-set finality, own-target votes, canonical-signature activation, the ML-DSA consensus pin, growth cap, the new post-quantum suite and KES remain disabled. Existing mainnet activation epochs are unchanged.</p>
+<p><a class="text-link" href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/tag/node-1708953d-node-hardening">Signed release, checksums and notes ↗</a> · <a class="text-link" href="https://blochl1.com/validators/guide">Verification and upgrade guide ↗</a></p>
+</section>
+
+<section id="status" aria-labelledby="status-title"><h2 id="status-title">Status labels.</h2>
+<div class="spec-table-wrap" tabindex="0" role="region" aria-label="Status labels"><table><caption>Every item below carries exactly one of these labels</caption><thead><tr><th scope="col">Label</th><th scope="col">Meaning</th></tr></thead><tbody>
+<tr><th scope="row">Implemented — in testing; activation disabled</th><td>Consensus change awaiting qualification and a separately announced activation. The released binary does not activate these features.</td></tr>
+<tr><th scope="row">Released — node 1708953d</th><td>Node feature included in the signed release. Operators enable the relevant protections through the documented node configuration; no new hard fork is scheduled.</td></tr>
+</tbody></table></div></section>
+
+<section id="suites" aria-labelledby="suites-title"><h2 id="suites-title">1. Signature suites.</h2>
+<p class="spec-status"><b>STATUS</b><span>Implemented — in testing; activation disabled</span></p>
+<p>Bloch authorizes spending with <strong>hybrid post-quantum signatures</strong>: two independent schemes combined with AND, so a signature is valid only if both parts verify. Suite <strong>0x0001</strong> stays the default and does not change. The upgrade adds an optional suite <strong>0x0003</strong> that pairs a stateless hash-based scheme with Falcon-1024.</p>
+<div class="spec-table-wrap" tabindex="0" role="region" aria-label="Signature suite parameters"><table class="spec-table"><caption>Signature suites. Timings measured on an Intel Xeon, single thread.</caption><thead><tr><th scope="col">Parameter</th><th scope="col">Suite 0x0001 — default, unchanged</th><th scope="col">Suite 0x0003 — new, optional</th></tr></thead><tbody>
+<tr><th scope="row">Construction</th><td>ML-DSA-65 AND Falcon-1024</td><td>SLH-DSA-SHAKE-128s AND Falcon-1024</td></tr>
+<tr><th scope="row">First scheme</th><td>ML-DSA-65 — FIPS 204, module lattices, NIST security category 3</td><td>SLH-DSA-SHAKE-128s — FIPS 205, stateless hash-based, category 1</td></tr>
+<tr><th scope="row">Second scheme</th><td>Falcon-1024 — FN-DSA, draft FIPS 206, category 5</td><td>Falcon-1024 — FN-DSA, draft FIPS 206, category 5</td></tr>
+<tr><th scope="row">Security statement</th><td>Both lattice signatures must verify</td><td>Category 3-level assurance while lattice schemes hold, and a hash-based floor (category 1) if lattice cryptography is weakened</td></tr>
+<tr><th scope="row">Public key</th><td>3,749 B</td><td>1,829 B</td></tr>
+<tr><th scope="row">Signature</th><td>4,587 B (ML-DSA part 3,309 B fixed; Falcon part variable)</td><td>≈9,132 B (maximum 9,322 B)</td></tr>
+<tr><th scope="row">Key generation</th><td>—</td><td>334 ms</td></tr>
+<tr><th scope="row">Sign</th><td>10.9 ms</td><td>≈2.5 s</td></tr>
+<tr><th scope="row">Verify</th><td>≈0.2–0.3 ms</td><td>≈2.2 ms</td></tr>
+<tr><th scope="row">Intended use</th><td>Everything; the default for all accounts and validator votes</td><td>Cold storage, treasury, long-term holdings and validator withdrawal credentials. Not for validator votes.</td></tr>
+</tbody></table></div>
+<p>Suite 0x0003 uses the SHA-3/SHAKE hash family, consistent with Bloch’s SHA3-256 hashing.</p>
+<h3>Rules</h3>
+<ul>
+<li><strong>AND combination.</strong> Both signatures in a suite must verify; an attacker must break both schemes.</li>
+<li><strong>Addresses commit to their suite.</strong> An address is the SHA3-256 hash of the suite-tagged public key, which prevents downgrade and cross-suite key reuse.</li>
+<li><strong>Verification cost is charged per suite.</strong> A 0x0003 signature is priced from its measured verification time; a typical 0x0003 transfer costs about 6× today’s fee.</li>
+<li><strong>Nothing to do for suite 0x0001 users.</strong> Existing keys and addresses keep working unchanged.</li>
+</ul>
+<h3>Implementation notes</h3>
+<ul>
+<li>ML-DSA verification is deterministic and platform-independent: one portable implementation runs on every CPU.</li>
+<li>Canonical signature encoding is enforced, and the suite identifier is bound into the signed context.</li>
+<li>The SLH-DSA implementation passes the NIST ACVP test vectors.</li>
+<li>An independent external audit is planned before activation.</li>
+</ul></section>
+
+<section id="finality" aria-labelledby="finality-title"><h2 id="finality-title">2. Finality under partitions.</h2>
+<p class="spec-status"><b>STATUS</b><span>Implemented — in testing; activation disabled</span></p>
+<p>The proposed upgrade counts finality over a <strong>frozen validator set C</strong> instead of the live active set. The set changes only through a finalized checkpoint, so both sides of a network partition measure their votes against the same total — and two disjoint sides can never both reach the quorum.</p>
+<div class="spec-table-wrap" tabindex="0" role="region" aria-label="Finality parameters"><table class="spec-table"><caption>Finality rule parameters</caption><thead><tr><th scope="col">Parameter</th><th scope="col">Value</th></tr></thead><tbody>
+<tr><th scope="row">Quorum</th><td>3·w ≥ 2·total, where w is the weight of included votes and total is the weight of C</td></tr>
+<tr><th scope="row">Validator set C</th><td>Frozen; changes only through a finalized checkpoint</td></tr>
+<tr><th scope="row">Leaving C</th><td>No included vote for 90 epochs (24 h)</td></tr>
+<tr><th scope="row">Rejoining C</th><td>Automatic when the validator votes again</td></tr>
+<tr><th scope="row">Inactivity leak</th><td>Still reduces rewards and balances; does not change the finality denominator</td></tr>
+<tr><th scope="row">Vote eligibility</th><td>A vote counts only when its source and target are checkpoints of the voter’s own chain; foreign votes count as absent</td></tr>
+</tbody></table></div>
+<p>Activation remains subject to further qualification. This mechanism remains disabled in release 1708953d.</p>
+<div class="spec-callout"><h3>The intended quorum property</h3><p>Each side needs at least two thirds of the weight of the same frozen set C. Two disjoint groups of validators cannot each hold two thirds of one total, so conflicting checkpoints cannot both reach the quorum.</p></div></section>
+
+<section id="certificates" aria-labelledby="certificates-title"><h2 id="certificates-title">3. Finality certificates.</h2>
+<p class="spec-status"><b>STATUS</b><span>Released — node 1708953d</span></p>
+<p>A finality certificate carries <strong>proof data for independent verification</strong> of a checkpoint. Verification starts from a trusted earlier finalized checkpoint and checks signed votes, validator-set proofs and ancestry; it does not remove that trust-anchor requirement.</p>
+<div class="spec-table-wrap" tabindex="0" role="region" aria-label="Finality certificate parameters"><table class="spec-table"><caption>Finality certificate contents and sizes</caption><thead><tr><th scope="col">Parameter</th><th scope="col">Value</th></tr></thead><tbody>
+<tr><th scope="row">RPC method</th><td><code>getfinalitycertificate</code></td></tr>
+<tr><th scope="row">Format</th><td><code>BLOCHFC1</code></td></tr>
+<tr><th scope="row">Votes</th><td>The justifying and finalizing vote sets, with full hybrid signatures</td></tr>
+<tr><th scope="row">Validator set</th><td>Merkle inclusion and absence proofs</td></tr>
+<tr><th scope="row">Ancestry</th><td>Included</td></tr>
+<tr><th scope="row">Verifier</th><td>Standalone <code>bloch-finality-verify</code></td></tr>
+<tr><th scope="row">Size, 106 validators</th><td>≈1.4 MB</td></tr>
+<tr><th scope="row">Size, minimal 2/3 vote set</th><td>≈1.1 MB</td></tr>
+</tbody></table></div></section>
+
+<section id="signer" aria-labelledby="signer-title"><h2 id="signer-title">4. Validator signer protection.</h2>
+<p class="spec-status"><b>STATUS</b><span>Released — node 1708953d</span></p>
+<p>With a persistent strict signer anchor configured, the validator keeps signing history outside its data directory and checks for local duplicate signers or restored stale data. Network observation also detects unexpected signatures from the same validator identity.</p>
+<ul>
+<li><strong>Record before release.</strong> The signing record is persisted before any signature is released.</li>
+<li><strong>Per-key lock.</strong> A host-level lock per key, held outside the data directory: a second local signer using that anchor refuses to start.</li>
+<li><strong>Rollback detection.</strong> The strict signer anchor detects data-directory signing records that fall behind the preserved anchor. Preserve both during recovery.</li>
+<li><strong>Host migration.</strong> Preserve identity, signing records and the signer anchor; retire the old signer before moving to a new host. Follow the published operator guide.</li>
+</ul></section>
+
+<section id="kes" aria-labelledby="kes-title"><h2 id="kes-title">5. Key-evolving signatures (KES).</h2>
+<p class="spec-status"><b>STATUS</b><span>Implemented — in testing; activation disabled</span></p>
+<p>Each validator signs with a <strong>key-evolving signature</strong> key. The key moves forward one period at a time and the keys of past periods are erased, so a key compromised today cannot sign for earlier periods (forward security).</p>
+<div class="spec-table-wrap" tabindex="0" role="region" aria-label="KES parameters"><table class="spec-table"><caption>KES parameters</caption><thead><tr><th scope="col">Parameter</th><th scope="col">Value</th></tr></thead><tbody>
+<tr><th scope="row">Scope</th><td>Per validator</td></tr>
+<tr><th scope="row">Period</th><td>90 epochs (24 h)</td></tr>
+<tr><th scope="row">Tree depth</th><td>12 (≈11 years of periods)</td></tr>
+<tr><th scope="row">Rotation</th><td>Automatic before expiry; no recurring manual signing</td></tr>
+<tr><th scope="row">Domain binding</th><td>Signed messages are bound to the network domain, validator index, key root, depth and period</td></tr>
+<tr><th scope="row">Forward security</th><td>Keys of past periods are erased</td></tr>
+<tr><th scope="row">Vote size</th><td>≈8.7 KB</td></tr>
+</tbody></table></div></section>
+
+<section id="l2" aria-labelledby="l2-title"><h2 id="l2-title">6. Bloch L2 mainnet.</h2>
+<p class="spec-status"><b>STATUS</b><span>Activated on mainnet at epoch 5850; operations launching</span></p>
+<p>Bloch L2 is an <strong>EVM network settled on Bloch L1</strong> with zero-knowledge validity proofs.</p>
+<div class="spec-table-wrap" tabindex="0" role="region" aria-label="Bloch L2 parameters"><table class="spec-table"><caption>Bloch L2 mainnet parameters</caption><thead><tr><th scope="col">Parameter</th><th scope="col">Value</th></tr></thead><tbody>
+<tr><th scope="row">Execution</th><td>EVM</td></tr>
+<tr><th scope="row">Chain ID</th><td>700770 (0xab162)</td></tr>
+<tr><th scope="row">Native coin</th><td>BLCH, 18 decimals on L2</td></tr>
+<tr><th scope="row">Settlement</th><td>Bloch L1, SP1 zero-knowledge proofs (Groth16)</td></tr>
+<tr><th scope="row">Proof cadence</th><td>One L2 block per proof (≈13–15 min)</td></tr>
+<tr><th scope="row">Withdrawals under 100 BLCH</th><td>After 64 L1 blocks</td></tr>
+<tr><th scope="row">Larger withdrawals</th><td>3-of-5 post-quantum attestor signatures and 2,880 L1 blocks</td></tr>
+<tr><th scope="row">Public RPC and explorer</th><td>Coming</td></tr>
+</tbody></table></div>
+<a class="text-link" href="/#roadmap">Back to updates <span aria-hidden="true">↑</span></a></section>
+      </div>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <a class="brand postern-brand" href="/" aria-label="Postern Labs home"><img src="/holding/postern.svg" width="34" height="34" alt=""><span>postern<span class="postern-light">labs</span></span></a>
+    <p>Ownership. Treasury. Long-term direction.</p>
+    <div><a href="https://blochinc.xyz/">Bloch Inc ↗</a><a href="https://blochl1.com/">Bloch Explorer ↗</a><a href="/protocol">Protocol</a><a href="/docs">Research &amp; docs</a><a href="https://posternlabs.com/Bloch-SIS-PoW-Institutional-Dossier-EN.pdf">Whitepaper / Dossier 2.0 ↗</a><a href="/build">Developers</a><a href="/brand">Brand</a><a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">GitHub ↗</a><a href="https://x.com/blochprotocol">X @blochprotocol ↗</a><a href="https://t.me/posternlabs">Telegram ↗</a><a href="https://discord.gg/kCAcjz2xC3">Discord ↗</a></div>
+    <p class="corporate-footer">Postern Labs Ltda (Brazil), in the process of transforming into Postern Labs S.A., is the holding company and treasury of the group and holds 100% of the share capital of Bloch Inc, incorporated in Panama. <a href="/#structure">Corporate structure ↑</a></p>
+    <small>© 2026 Postern Labs Ltda. Product and service availability varies by stage and jurisdiction.</small>
+  </footer>
+</body>
+</html>
