@@ -4218,8 +4218,29 @@ impl Engine {
             // A memo key over two counters; saturating like the counters are.
             pool: (self.pool.len() as u64).saturating_add(self.fc_covered_removals),
             justified: self.state.finality().justified.root,
-            validators: self.state.active_validators(),
+            validators: self.forkchoice_validators(),
         }
+    }
+
+    /// The stake vector fork choice weighs votes with: the active roster of
+    /// the CURRENT head's state.
+    ///
+    /// That makes the weights a function of which branch is canonical. Two
+    /// sibling branches on opposite sides of an epoch boundary carry
+    /// different rosters while the inactivity leak runs (the later branch has
+    /// already charged the leak for the closing epoch, the earlier one has
+    /// not), so each can prefer the other — see `advance` for what that does
+    /// and how the loop is kept from chasing it.
+    ///
+    /// Test builds may substitute the vector per head through
+    /// [`forkchoice_cycle_tests`]' thread-local hook; release builds read the
+    /// state and nothing else.
+    fn forkchoice_validators(&self) -> Vec<bloch_pos_committee::sample::Validator> {
+        #[cfg(test)]
+        if let Some(validators) = forkchoice_cycle_tests::stake_override(self.head_id().as_bytes()) {
+            return validators;
+        }
+        self.state.active_validators()
     }
 
     fn forkchoice_head(&self) -> [u8; 32] {
@@ -4227,7 +4248,7 @@ impl Engine {
         let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::ForkChoice);
         self.blocks.head(
             self.pool.values(),
-            &self.state.active_validators(),
+            &self.forkchoice_validators(),
             self.state.finality().justified.root,
             bloch_pos_committee::params::forkchoice_slot_tiebreak_active(epoch_of(self.state.slot())),
         )
@@ -4313,6 +4334,26 @@ impl Engine {
         // function of exactly those inputs (that is why §5.5 made it a free
         // function), so equal inputs mean an equal head, bit for bit.
         let mut memo: Option<(ForkChoiceInputs, [u8; 32])> = None;
+        // Heads this call has held and then moved away from.
+        //
+        // The convergence argument above has a hole: the stake vector is read
+        // from the CURRENT head's state (`forkchoice_validators`), so it is a
+        // function of the very choice it decides. Two siblings on opposite
+        // sides of an epoch boundary carry different rosters while the
+        // inactivity leak runs, and each can prefer the other — there is then
+        // no fixed point, and this loop reorganised between the two until its
+        // bound ran out (rehearsal 2026-10-25, node 2: a bound of ~1,350
+        // reorgs on a 670-block store, over 100 of them logged before the run
+        // ended, with the engine thread — RPC and block import with it —
+        // blocked throughout, so the blocks and votes that would have broken
+        // the tie were never processed).
+        //
+        // A target this call already left is that cycle. Stop on the head
+        // held now: it is the head the latest recompute moved TO, and the
+        // next event (a block or a vote, both of which change the weights)
+        // runs fork choice again from it. Node-local — no block validity and
+        // no committed state depends on which branch this node holds.
+        let mut left: Vec<[u8; 32]> = Vec::new();
         // Bounded: every iteration either advances the canonical head or
         // deletes an invalid block, and both are finite.
         for _ in 0..=self.blocks.len().saturating_mul(2).saturating_add(2) {
@@ -4325,6 +4366,20 @@ impl Engine {
             let head = *self.head_id().as_bytes();
             if target == head {
                 return;
+            }
+            if left.contains(&target) {
+                eprintln!(
+                    "FORK CHOICE CYCLE: head {} would move back to {}, which this pass already \
+                     left — the stake vector depends on the head (epoch boundary under the leak). \
+                     Holding {} until a block or vote changes the weights.",
+                    crate::codec::hex8(&head),
+                    crate::codec::hex8(&target),
+                    crate::codec::hex8(&head),
+                );
+                return;
+            }
+            if !left.contains(&head) {
+                left.push(head);
             }
             let Some((ancestor, branch)) = self.path_to_canonical(target) else {
                 // Missing lineage: ask the mesh, and keep the chain we have
@@ -17731,3 +17786,133 @@ mod l2_admission_tests {
 #[cfg(test)]
 #[path = "engine/kes_tests.rs"]
 mod kes_tests;
+
+/// Fork choice whose stake vector depends on which branch is canonical.
+///
+/// Rehearsal 2026-10-25 (`hf-run`, node 2): after the inactivity leak, two
+/// siblings of block 0fc9991f (slot 870) were held up by one 40k-stake vote
+/// each — slot 871 (epoch 27) and the branch 872/877/901 (901 is epoch 28).
+/// On the epoch-27 state the stakes tied and the larger root (the 872 side)
+/// won; on the epoch-28 state the leak had just charged the 872 side's voter,
+/// whose epoch-27 vote that branch never included, and the 871 side won.
+/// `advance` recomputed the head after every reorg, so it reorganised between
+/// the two for as long as its bound (two per stored block, ~1,350 on a
+/// 670-block store) allowed — over 100 reorgs logged before the run ended,
+/// with the engine thread (and so RPC and block import) blocked throughout.
+///
+/// The hook below substitutes the vector per head so the shape can be built
+/// from two ordinary sibling blocks instead of five epochs of leak.
+#[cfg(test)]
+mod forkchoice_cycle_tests {
+    use super::forkchoice_tests::attest;
+    use super::*;
+    use bloch_pos_committee::sample::Validator;
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn Fn(&[u8; 32]) -> Option<Vec<Validator>>>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
+        static SEEN: RefCell<Vec<[u8; 32]>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Read by `Engine::forkchoice_validators` in test builds only.
+    pub(super) fn stake_override(head: &[u8; 32]) -> Option<Vec<Validator>> {
+        HOOK.with(|hook| {
+            let hook = hook.borrow();
+            let f = hook.as_ref()?;
+            SEEN.with(|seen| seen.borrow_mut().push(*head));
+            f(head)
+        })
+    }
+
+    /// Installs the hook for one test and removes it on drop, panics included.
+    struct Installed;
+
+    impl Installed {
+        fn new(f: impl Fn(&[u8; 32]) -> Option<Vec<Validator>> + 'static) -> Self {
+            HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+            SEEN.with(|seen| seen.borrow_mut().clear());
+            Installed
+        }
+
+        /// How many times the canonical head changed while fork choice ran.
+        fn head_changes(&self) -> usize {
+            SEEN.with(|seen| {
+                let seen = seen.borrow();
+                seen.windows(2).filter(|w| w[0] != w[1]).count()
+            })
+        }
+    }
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            HOOK.with(|hook| *hook.borrow_mut() = None);
+            SEEN.with(|seen| seen.borrow_mut().clear());
+        }
+    }
+
+    fn stakes(v0: u64, v1: u64) -> Vec<Validator> {
+        vec![
+            Validator { index: 0, effective_stake: v0 },
+            Validator { index: 1, effective_stake: v1 },
+        ]
+    }
+
+    /// The canonical tip and a stored sibling-branch block, each held up by
+    /// one vote: validator 0 for the tip, validator 1 for the rival.
+    fn two_branches() -> (Engine, perf_support::TestDir, [u8; 32], [u8; 32]) {
+        let (mut engine, dir, _fork_point, rival) = reorg_state_tests::forked(1);
+        let tip = *engine.head_id().as_bytes();
+        let rival = *rival.block_id().as_bytes();
+        assert_ne!(tip, rival, "fixture: the rival must not be the canonical tip");
+        for att in [attest(0, 3, tip), attest(1, 3, rival)] {
+            engine.pool.insert((att.validator, att.data.signing_root()), att);
+        }
+        (engine, dir, tip, rival)
+    }
+
+    /// Each branch's own stake vector prefers the other branch. There is no
+    /// fixed point; `advance` must notice that it is back where it started
+    /// and stop instead of reorganising until its bound runs out.
+    #[test]
+    fn a_head_dependent_stake_vector_does_not_trap_advance_in_a_reorg_loop() {
+        let (mut engine, _dir, tip, rival) = two_branches();
+        let hook = Installed::new(move |head| {
+            if *head == tip {
+                Some(stakes(99, 100)) // on the tip's state the rival's voter weighs more
+            } else if *head == rival {
+                Some(stakes(100, 99)) // and on the rival's state the tip's voter does
+            } else {
+                None
+            }
+        });
+
+        engine.advance();
+
+        let changes = hook.head_changes();
+        let head = *engine.head_id().as_bytes();
+        assert!(
+            head == tip || head == rival,
+            "advance must end on one of the two branches"
+        );
+        assert!(
+            changes <= 1,
+            "fork choice flipped the head {changes} times inside one advance call; \
+             a head it already left must end the loop, not restart the reorg"
+        );
+    }
+
+    /// Control: when the stake vector does NOT depend on the head, the loop
+    /// still reorganises to the heavier branch and settles there.
+    #[test]
+    fn a_head_independent_stake_vector_still_reorganises_to_the_heavier_branch() {
+        let (mut engine, _dir, _tip, rival) = two_branches();
+        let hook = Installed::new(|_| Some(stakes(99, 100)));
+
+        engine.advance();
+
+        assert_eq!(*engine.head_id().as_bytes(), rival, "the rival carries more stake");
+        assert_eq!(hook.head_changes(), 1, "exactly one reorg, onto the rival");
+    }
+}
