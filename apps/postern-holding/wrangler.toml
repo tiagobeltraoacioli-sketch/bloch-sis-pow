@@ -9,6 +9,9 @@ preview_urls = false
 # Both domains serve the same holding site. Other paths pass through to their Pages origin.
 routes = [
   { pattern = "posternlabs.com/*", zone_name = "posternlabs.com" },
+  # Exact homepage routes override the legacy validator-guide navigation injection.
+  { pattern = "blochprotocol.io/", zone_name = "blochprotocol.io" },
+  { pattern = "blochprotocol.io/index.html", zone_name = "blochprotocol.io" },
   { pattern = "blochprotocol.io/*", zone_name = "blochprotocol.io" },
   { pattern = "www.blochprotocol.io/*", zone_name = "blochprotocol.io" }
 ]
