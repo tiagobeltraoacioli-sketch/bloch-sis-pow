@@ -249,6 +249,22 @@ fn getchaininfo_reports_slot_epoch_head_root_and_both_checkpoints() {
     assert_eq!(v.get("wall_slot").unwrap().as_u64(), Some(12));
     assert_eq!(v.get("behind_by_slots").unwrap().as_u64(), Some(12));
     assert_eq!(v.get("mempool").unwrap().as_u64(), Some(3));
+
+    // Additive fields (2026-10-25): present, shaped, and read from params.
+    let Some(Json::Arr(suites)) = v.get("signature_suites") else { panic!("signature_suites must be an array") };
+    assert_eq!(suites.len(), 3);
+    let s3 = &suites[2];
+    assert_eq!(s3.get("suite").unwrap().as_str(), Some("0x0003"));
+    assert_eq!(
+        s3.get("active"),
+        Some(&Json::Bool(bloch_pos_committee::params::hf3_slh_suite_active(0)))
+    );
+    assert_eq!(suites[1].get("spend_allowed"), Some(&Json::Bool(false)));
+    let hf = v.get("hard_forks").expect("hard_forks");
+    let claim = hf.get("hf1_claim_finality").expect("hf1_claim_finality");
+    let e = bloch_pos_committee::params::HF1_CLAIM_FINALITY_EPOCH;
+    assert_eq!(claim.get("activation_epoch"), Some(&if e == u64::MAX { Json::Null } else { Json::u(e) }));
+    assert_eq!(claim.get("active"), Some(&Json::Bool(e == 0)));
 }
 
 #[test]

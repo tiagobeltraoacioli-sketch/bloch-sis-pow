@@ -2034,6 +2034,12 @@ pub fn chain_info_json(
                 ),
             ]),
         ),
+        // Additive (2026-10-25), node-only: the signature suites and HF1/HF2/
+        // HF3 gates this binary enforces, read from the consensus crate's own
+        // constants. `null` activation = inert (`u64::MAX`). See
+        // `rpc/consensus_gates.rs` for which epoch each flag is read at.
+        ("signature_suites", consensus_gates::signature_suites_json(epoch_of(slot), epoch_of(wall_slot))),
+        ("hard_forks", consensus_gates::hard_forks_json(epoch_of(slot))),
     ])
 }
 
@@ -2788,6 +2794,10 @@ pub fn build_info_json() -> Json {
 
 #[cfg(test)]
 mod tests;
+
+// `getchaininfo.signature_suites` / `getchaininfo.hard_forks`, projected from
+// `bloch_pos_committee::hard_forks::HARD_FORK_GATES` and the suite gates.
+mod consensus_gates;
 
 // The frozen method registry — layer 1 of the guard against two methods
 // answering one question. It lives in its OWN file, at a path no other branch

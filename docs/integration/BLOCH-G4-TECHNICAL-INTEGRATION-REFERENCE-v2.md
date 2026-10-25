@@ -1366,6 +1366,29 @@ answers `getchaininfo` with a plausible height and a moving, `"finalized"`
 epoch. **Poll `transport.peers`, not just `behind_by_slots`, to detect "alone
 on my own fork."**
 
+Two additive fields (2026-10-25, node-only, no consensus change) report the
+activation gates compiled into the answering binary:
+
+- `signature_suites`: array of `{suite: "0x0001"|"0x0002"|"0x0003", name,
+  activation_epoch: u64|null, active: bool, spend_allowed: bool}`.
+  `0x0001` (ML-DSA-65+Falcon-1024) is the live hybrid. `0x0002` (ML-DSA-65)
+  is known to the verifier but every new spend authorised by it is refused at
+  admission (`spend_allowed: false`, ungated). `0x0003`
+  (SLH-DSA-SHAKE-128s+Falcon-1024) opens at `HF3_SLH_SUITE_EPOCH`. Lattice
+  suites report `spend_allowed: false` from the lattice-emergency epoch.
+- `hard_forks`: object keyed `hf1_claim_finality`, `hf1_frozen_set`,
+  `hf1_own_target`, `hf2_slashing_v2`, `hf2_growth_cap`, `hf2_sig_canonical`,
+  `hf2_mldsa_pin`, `hf3_kes_registration`, `hf3_kes_enforce`, `hf3_slh`,
+  `hf3_pq_migration`, `hf3_lattice_emergency`; each `{activation_epoch:
+  u64|null, active: bool}`, taken from the consensus crate's
+  `HARD_FORK_GATES`.
+
+`activation_epoch: null` means the gate is inert (`u64::MAX`). `active` is
+evaluated at the head epoch, `spend_allowed` at the wall epoch (what mempool
+admission reads). These fields describe the answering binary, so two nodes on
+different releases legitimately differ here; do not compare them for
+corroboration — compare the finality checkpoints.
+
 ### 10.4 `getutxos`/`listunspent` — the correct enumeration pattern (edition 1's is wrong)
 
 <div class="warn">
