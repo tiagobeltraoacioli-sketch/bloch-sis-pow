@@ -51,9 +51,11 @@ fn at_epoch(st: &mut CommittedState, epoch: u64, finalized_epoch: u64) {
 /// with a replay, a mixed-fleet qualification and a coordinated epoch.
 #[test]
 fn pq_migration_gates_ship_inert() {
-    assert_eq!(crate::params::HF3_PQ_MIGRATION_EPOCH, u64::MAX);
+    assert_eq!(crate::params::HF3_PQ_MIGRATION_EPOCH, 7360);
     assert_eq!(crate::params::LATTICE_EMERGENCY_ACTIVATION_EPOCH, u64::MAX);
-    assert!(!crate::params::hf3_pq_migration_active(u64::MAX - 1));
+    assert!(!crate::params::hf3_pq_migration_active(7_359));
+    assert!(crate::params::hf3_pq_migration_active(7_360));
+    assert!(crate::params::hf3_pq_migration_active(u64::MAX - 1));
     assert!(!crate::params::lattice_emergency_active(u64::MAX - 1));
 }
 

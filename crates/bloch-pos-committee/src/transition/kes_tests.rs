@@ -158,7 +158,7 @@ mod kes_rules {
         // refused exactly as the previous release refused the unknown tag,
         // in consensus and at the relay.
         let (_t, g, _chains) = setup_with(4, ToyVerifier, &[]);
-        for epoch in [0, 1, 4_669, 1 << 32] {
+        for epoch in [0, 1, 4_669, 7_359] {
             let mut st = g.clone();
             st.epoch = epoch;
             let root_before = st.state_root();
@@ -702,7 +702,7 @@ mod kes_rules {
         st.kes.insert(1, toy_kes_public(1).into());
         let tx = rotate(&st, 1, 0, &toy_kes_public(1), &tree(1).0, &tree_from(0x51, DEPTH));
         // Compiled schedule: refused as the old binary refused the unknown tag.
-        for epoch in [0, 4_669, 1 << 32] {
+        for epoch in [0, 4_669, 7_359] {
             st.epoch = epoch;
             let root_before = st.state_root();
             assert_eq!(apply(&mut st, &tx), Err(TxReject::StakingNotActive), "epoch {epoch}");

@@ -546,11 +546,11 @@ mod tests {
     /// context-free one — one unit per call, same cache — whatever the key.
     #[test]
     fn spend_path_below_hf3_is_the_context_free_path() {
-        assert_eq!(bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH, u64::MAX);
+        assert_eq!(bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH, 7360);
         let verifier = fixture();
         for n in 0u8..3 {
             let bounded = verifier.budgeted_for_source(90, 3, Some([1; 32]), 3);
-            assert!(!bounded.verify_spend_at_epoch(&slh_key(), &[n; 32], &[0xCC; 8], u64::MAX));
+            assert!(!bounded.verify_spend_at_epoch(&slh_key(), &[n; 32], &[0xCC; 8], 7_359));
             assert!(!bounded.limited());
         }
         assert_eq!(verifier.budget_used_at(90), 3, "one unit per SLH-shaped call below HF3");

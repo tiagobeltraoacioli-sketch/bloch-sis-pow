@@ -697,9 +697,9 @@ fn finality_recovery_activates_without_backdating_or_bypassing_churn() {
 
 #[test]
 fn hf2_growth_cap_gate_is_inert() {
-    assert_eq!(crate::params::HF2_GROWTH_CAP_EPOCH, u64::MAX);
-    for epoch in [0, 2_884, 6_016, u64::MAX - 1, u64::MAX] {
-        assert!(!crate::params::hf2_growth_cap_active(epoch));
+    assert_eq!(crate::params::HF2_GROWTH_CAP_EPOCH, 7270);
+    for epoch in [0, 2_884, 6_016, 7_269, 7_270, u64::MAX - 1, u64::MAX] {
+        assert_eq!(crate::params::hf2_growth_cap_active(epoch), epoch >= 7270);
     }
 }
 

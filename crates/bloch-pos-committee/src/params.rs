@@ -1570,7 +1570,7 @@ pub const NATIVE_SLASHING_ACTIVATION_EPOCH: u64 = HF2_SLASHING_V2_EPOCH;
 /// (`NATIVE_SLASHING_ACTIVATION_EPOCH` is an alias kept for the P5a code and
 /// tests). It is independent of `SLASHING_EVIDENCE_ACTIVATION_EPOCH` and of
 /// `PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH`, which it never moves.
-pub const HF2_SLASHING_V2_EPOCH: u64 = u64::MAX;
+pub const HF2_SLASHING_V2_EPOCH: u64 = 7270;
 
 /// Is the P5a evidence-admission policy armed at `wall_epoch`?
 pub const fn native_slashing_active(wall_epoch: u64) -> bool {
@@ -2039,7 +2039,7 @@ pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// time): a verifier that accepts the suite while fees still price it as a
 /// hybrid sells ~1.07 M gas of CPU for 72,748. `u64::MAX` = never, even at
 /// `u64::MAX`. Ships INERT; `hf3_slh_suite_gate_is_inert` pins the value.
-pub const HF3_SLH_SUITE_EPOCH: u64 = u64::MAX;
+pub const HF3_SLH_SUITE_EPOCH: u64 = 7360;
 
 /// HF3 suite id: SLH-DSA-SHAKE-128s ‖ Falcon-1024. The canonical consensus
 /// copy; bloch-pos-node pins it to `bloch_crypto::crypto::SUITE_SLHDSA128S_FALCON1024`.
@@ -2199,7 +2199,7 @@ pub const SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// line. Any rejected block in the pinned runs is a NO-GO for an epoch at or
 /// before that block (the per-epoch gate allows a later one).
 #[cfg(not(feature = "mldsa-pin-replay-qualification"))]
-pub const MLDSA_PIN_ACTIVATION_EPOCH: u64 = u64::MAX;
+pub const MLDSA_PIN_ACTIVATION_EPOCH: u64 = 7270;
 /// QUALIFICATION BUILD: all of history judged under the pinned rule.
 #[cfg(feature = "mldsa-pin-replay-qualification")]
 pub const MLDSA_PIN_ACTIVATION_EPOCH: u64 = 0;
@@ -2259,7 +2259,7 @@ pub fn mldsa_pin_active(epoch: u64) -> bool {
 /// carries the v2 verifier first. Wallets and exchanges are NOT affected.
 /// Ships INERT at `u64::MAX`; `sig_canonical_gate_is_inert` pins the value.
 /// The judged epoch is the signed message's own epoch, never a clock.
-pub const SIG_CANONICAL_ACTIVATION_EPOCH: u64 = u64::MAX;
+pub const SIG_CANONICAL_ACTIVATION_EPOCH: u64 = 7270;
 
 #[cfg(test)]
 thread_local! {
@@ -2719,7 +2719,7 @@ const _: () = assert!(hf1_gates_coherent(HF1_CLAIM_FINALITY_EPOCH, HF1_FROZEN_FI
 /// that applies today is refused after it), so the whole fleet must run the
 /// new release before the epoch. `native_claim_finality_gate_is_inert` pins
 /// the inert value.
-pub const HF1_CLAIM_FINALITY_EPOCH: u64 = u64::MAX;
+pub const HF1_CLAIM_FINALITY_EPOCH: u64 = 7180;
 
 pub(crate) fn native_claim_finality_active(epoch: u64) -> bool {
     #[cfg(test)]
@@ -2778,7 +2778,7 @@ pub(crate) mod native_claim_finality_test {
 /// which is committed state, so the whole fleet must run the new release
 /// before the epoch. `hf1_own_target_votes_gate_is_inert` pins the inert
 /// value.
-pub const HF1_OWN_TARGET_VOTES_EPOCH: u64 = u64::MAX;
+pub const HF1_OWN_TARGET_VOTES_EPOCH: u64 = 7186;
 
 pub(crate) fn own_target_votes_active(epoch: u64) -> bool {
     #[cfg(test)]
@@ -2842,7 +2842,7 @@ pub(crate) mod own_target_votes_test {
 /// ARMING THIS IS A FOUNDER DECISION. It trades the leak's liveness rescue
 /// for partition safety, and the activation epoch must be reached by a
 /// finalizing chain (the first set is the duty roster at that epoch).
-pub const HF1_FROZEN_FINALITY_SET_EPOCH: u64 = u64::MAX;
+pub const HF1_FROZEN_FINALITY_SET_EPOCH: u64 = 7180;
 
 /// Absence pruning horizon of the finality set: a member with no included
 /// epoch vote for this many epochs is left out of the next handoff. 90
@@ -2910,12 +2910,12 @@ mod hf1_tests {
 
     #[test]
     fn hf1_ships_inert_as_a_whole() {
-        assert_eq!(HF1_CLAIM_FINALITY_EPOCH, u64::MAX);
-        assert_eq!(HF1_FROZEN_FINALITY_SET_EPOCH, u64::MAX);
+        assert_eq!(HF1_CLAIM_FINALITY_EPOCH, 7180);
+        assert_eq!(HF1_FROZEN_FINALITY_SET_EPOCH, 7180);
         assert!(hf1_gates_coherent(HF1_CLAIM_FINALITY_EPOCH, HF1_FROZEN_FINALITY_SET_EPOCH));
-        for epoch in [0, 5_850, 8_610, 8_616, u64::MAX - 1, u64::MAX] {
-            assert!(!native_claim_finality_active(epoch));
-            assert!(!native_finality_set_active(epoch));
+        for epoch in [0, 5_850, 7_179, 7_180, 8_610, 8_616, u64::MAX - 1, u64::MAX] {
+            assert_eq!(native_claim_finality_active(epoch), epoch >= 7180);
+            assert_eq!(native_finality_set_active(epoch), epoch >= 7180);
         }
     }
 
@@ -3058,7 +3058,7 @@ pub(crate) mod activation_queue_v2_rehearsal {
 /// This changes which epoch a queued validator activates, a committed field,
 /// so it needs historical replay and a coordinated epoch.
 /// `hf2_growth_cap_gate_is_inert` pins the inert value.
-pub const HF2_GROWTH_CAP_EPOCH: u64 = u64::MAX;
+pub const HF2_GROWTH_CAP_EPOCH: u64 = 7270;
 
 pub(crate) fn hf2_growth_cap_active(epoch: u64) -> bool {
     #[cfg(test)]
@@ -3123,7 +3123,7 @@ pub(crate) mod funded_admission_rehearsal {
 /// definition; the HF3 schedule must arm this gate at or after that one,
 /// because a rotation into suite `0x0003` is only useful once suite `0x0003`
 /// signatures verify.
-pub const HF3_PQ_MIGRATION_EPOCH: u64 = u64::MAX;
+pub const HF3_PQ_MIGRATION_EPOCH: u64 = 7360;
 
 /// Emergency flag day for a public break (or credible weakening) of BOTH
 /// lattice families in the hybrid suite. `u64::MAX` = INERT, and it can only
@@ -3331,11 +3331,11 @@ pub(crate) mod audit_recovery_test {
 
 /// HF3: opens KES registration (wire 0x17) and rotation (`kes::ROTATE_TAG`).
 /// Unarmed.
-pub const HF3_KES_EPOCH: u64 = u64::MAX;
+pub const HF3_KES_EPOCH: u64 = 7360;
 /// HF3 KES enforcement: proposals and votes must carry a KES leaf signature
 /// from this epoch on. Unarmed; must come at least
 /// `KES_MIN_REGISTRATION_WINDOW_EPOCHS` after `HF3_KES_EPOCH`.
-pub const HF3_KES_ENFORCE_EPOCH: u64 = u64::MAX;
+pub const HF3_KES_ENFORCE_EPOCH: u64 = 8620;
 /// Opens KES registration (wire 0x17): `HF3_KES_EPOCH`.
 pub const KES_REGISTRATION_EPOCH: u64 = HF3_KES_EPOCH;
 /// KES enforcement: `HF3_KES_ENFORCE_EPOCH`.
@@ -3496,13 +3496,13 @@ mod kes_schedule_tests {
 
     #[test]
     fn the_mainnet_schedule_is_unarmed() {
-        assert_eq!(HF3_KES_EPOCH, u64::MAX);
-        assert_eq!(HF3_KES_ENFORCE_EPOCH, u64::MAX);
-        assert_eq!(KES_REGISTRATION_EPOCH, u64::MAX);
-        assert_eq!(KES_ACTIVATION_EPOCH, u64::MAX);
-        for epoch in [0, 4_669, 1 << 40, u64::MAX - 1, u64::MAX] {
-            assert!(!kes_registration_open(epoch));
-            assert_eq!(kes_period(epoch), None);
+        assert_eq!(HF3_KES_EPOCH, 7360);
+        assert_eq!(HF3_KES_ENFORCE_EPOCH, 8620);
+        assert_eq!(KES_REGISTRATION_EPOCH, 7360);
+        assert_eq!(KES_ACTIVATION_EPOCH, 8620);
+        for epoch in [0, 4_669, 7_359, 7_360, 8_619, 8_620, 8_709, 8_710, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert_eq!(kes_registration_open(epoch), epoch >= 7360);
+            assert_eq!(kes_period(epoch), (epoch >= 8620).then(|| (epoch - 8620) / 90));
         }
     }
 

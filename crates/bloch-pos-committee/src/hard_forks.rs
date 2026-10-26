@@ -99,9 +99,25 @@ pub const HARD_FORK_GATES: &[HardForkGate] = &[
 /// public break of both lattice families and needs its own decision.
 pub const NEVER_IN_A_SCHEDULED_RELEASE: &[&str] = &["params::LATTICE_EMERGENCY_ACTIVATION_EPOCH"];
 
-/// Gates the next release may arm (owner decision 2026-10-20: claim
-/// finality only). Everything else must stay `u64::MAX`.
-pub const RELEASE_ARMABLE: &[&str] = &["params::HF1_CLAIM_FINALITY_EPOCH"];
+/// Gates the next release may arm (owner decision 2026-10-25: HF1, HF2 and
+/// HF3 at E1 7180 / 7186, E2 7270, E3 7360, KES enforcement 8620; the
+/// lattice emergency is never armed). Everything else must stay `u64::MAX`.
+pub const RELEASE_ARMABLE: &[&str] = &[
+    "params::HF1_CLAIM_FINALITY_EPOCH",
+    "params::HF1_FROZEN_FINALITY_SET_EPOCH",
+    "params::HF1_OWN_TARGET_VOTES_EPOCH",
+    "params::HF2_SLASHING_V2_EPOCH",
+    "params::NATIVE_SLASHING_ACTIVATION_EPOCH",
+    "params::HF2_GROWTH_CAP_EPOCH",
+    "params::SIG_CANONICAL_ACTIVATION_EPOCH",
+    "params::MLDSA_PIN_ACTIVATION_EPOCH",
+    "params::HF3_KES_EPOCH",
+    "params::KES_REGISTRATION_EPOCH",
+    "params::HF3_KES_ENFORCE_EPOCH",
+    "params::KES_ACTIVATION_EPOCH",
+    "params::HF3_SLH_SUITE_EPOCH",
+    "params::HF3_PQ_MIGRATION_EPOCH",
+];
 
 /// Minimum spacing between HF1 claim finality and any HF2 gate (one day).
 pub const HF2_MIN_EPOCHS_AFTER_HF1: u64 = 90;

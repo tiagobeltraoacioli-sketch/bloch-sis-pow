@@ -1647,7 +1647,7 @@ mod tests {
                 + bloch_crypto::crypto::slhdsa_suite::slhdsa_suite_pubkey_body_len()
         );
         assert_eq!(p::SLHDSA_FALCON_MAX_ENVELOPED_SIG_LEN, bloch_crypto::crypto::max_slhdsa_suite_signature_len());
-        assert_eq!(p::HF3_SLH_SUITE_EPOCH, u64::MAX, "HF3 ships inert");
+        assert_eq!(p::HF3_SLH_SUITE_EPOCH, 7360, "HF3 armed at the notice epoch");
     }
 
     #[test]

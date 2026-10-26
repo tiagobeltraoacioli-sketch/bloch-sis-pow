@@ -23,10 +23,10 @@ fn registration(engine: &Engine, validator: u32, root_byte: u8) -> PosTransactio
 /// not relayed, and leaves the mempool and committed state untouched.
 #[test]
 fn registration_is_refused_before_its_window() {
-    assert_eq!(bloch_pos_committee::params::KES_REGISTRATION_EPOCH, u64::MAX);
+    assert_eq!(bloch_pos_committee::params::KES_REGISTRATION_EPOCH, 7360);
     let (mut engine, _dir) = perf_support::proposing_engine();
     let tx = registration(&engine, 0, 0x11);
-    for epoch in [0, 4_669, 1 << 40] {
+    for epoch in [0, 4_669, 7_359] {
         let why = admissible(&tx, epoch).expect_err("unarmed");
         assert!(why.contains("KES_REGISTRATION_EPOCH"), "{why}");
     }
@@ -145,8 +145,8 @@ fn getkes_reports_the_unarmed_schedule() {
     let mut json = String::new();
     rpc::kes_json(&engine.state).write(&mut json);
     for field in [
-        "\"registration_epoch\":null",
-        "\"activation_epoch\":null",
+        "\"registration_epoch\":7360",
+        "\"activation_epoch\":8620",
         "\"period_epochs\":90",
         "\"registration_open\":false",
         "\"period\":null",
@@ -207,9 +207,9 @@ fn a_second_pending_rotation_for_the_same_validator_is_refused() {
 /// flag-day reason (and a malformed one is refused even structurally).
 #[test]
 fn rotation_is_refused_at_the_door_while_hf3_is_unarmed() {
-    assert_eq!(bloch_pos_committee::params::HF3_KES_EPOCH, u64::MAX);
+    assert_eq!(bloch_pos_committee::params::HF3_KES_EPOCH, 7360);
     let (mut engine, _dir) = perf_support::proposing_engine();
-    for epoch in [0, 4_669, 1 << 40] {
+    for epoch in [0, 4_669, 7_359] {
         let why = admissible(&rotation(0, 0, 0x11), epoch).expect_err("unarmed");
         assert!(why.contains("HF3_KES_EPOCH"), "{why}");
     }

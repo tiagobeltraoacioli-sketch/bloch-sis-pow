@@ -8605,12 +8605,12 @@ mod tests {
     /// TRIPWIRE. Arming is a founder decision and a wallet-facing flag day.
     #[test]
     fn sig_canonical_gate_is_inert() {
-        assert_eq!(crate::params::SIG_CANONICAL_ACTIVATION_EPOCH, u64::MAX);
-        for epoch in [0, 4_669, u64::MAX - 1, u64::MAX] {
-            assert!(!crate::params::sig_canonical_active(epoch));
+        assert_eq!(crate::params::SIG_CANONICAL_ACTIVATION_EPOCH, 7270);
+        for epoch in [0, 4_669, 7_269, 7_270, u64::MAX - 1, u64::MAX] {
+            assert_eq!(crate::params::sig_canonical_active(epoch), epoch >= 7270);
             assert_eq!(
                 crate::attestation::SignaturePolicy::consensus(epoch),
-                crate::attestation::SignaturePolicy::Compatible
+                if epoch >= 7270 { crate::attestation::SignaturePolicy::Bound } else { crate::attestation::SignaturePolicy::Compatible }
             );
         }
     }
@@ -8690,9 +8690,9 @@ mod tests {
     #[cfg(not(feature = "mldsa-pin-replay-qualification"))]
     fn mldsa_pin_gate_is_inert() {
         use crate::attestation::SignaturePolicy::*;
-        assert_eq!(crate::params::MLDSA_PIN_ACTIVATION_EPOCH, u64::MAX);
-        for epoch in [0, 4_669, u64::MAX - 1, u64::MAX] {
-            assert!(!crate::params::mldsa_pin_active(epoch));
+        assert_eq!(crate::params::MLDSA_PIN_ACTIVATION_EPOCH, 7270);
+        for epoch in [0, 4_669, 7_269, 7_270, u64::MAX - 1, u64::MAX] {
+            assert_eq!(crate::params::mldsa_pin_active(epoch), epoch >= 7270);
         }
         // Gate table: (pin, canonical) -> consensus policy.
         assert_eq!(crate::attestation::SignaturePolicy::consensus(7), Compatible);
@@ -13513,10 +13513,10 @@ mod tests {
         /// together with `bloch_crypto::crypto::HF3_SLH_SUITE_EPOCH`.
         #[test]
         fn hf3_slh_suite_gate_is_inert() {
-            assert_eq!(crate::params::HF3_SLH_SUITE_EPOCH, u64::MAX);
-            for e in [0, 1, 6_017, u64::MAX - 1, u64::MAX] {
-                assert!(!crate::params::hf3_slh_suite_active(e));
-                assert!(!fee_market::per_suite_verify_gas_active(e));
+            assert_eq!(crate::params::HF3_SLH_SUITE_EPOCH, 7360);
+            for e in [0, 1, 6_017, 7_359, 7_360, u64::MAX - 1, u64::MAX] {
+                assert_eq!(crate::params::hf3_slh_suite_active(e), e >= 7360);
+                assert_eq!(fee_market::per_suite_verify_gas_active(e), e >= 7360);
             }
         }
 
@@ -14846,7 +14846,7 @@ mod tests {
 
     #[test]
     fn hf2_slashing_v2_gate_ships_inert() {
-        assert_eq!(crate::params::HF2_SLASHING_V2_EPOCH, u64::MAX);
+        assert_eq!(crate::params::HF2_SLASHING_V2_EPOCH, 7270);
         assert_eq!(
             crate::params::NATIVE_SLASHING_ACTIVATION_EPOCH,
             crate::params::HF2_SLASHING_V2_EPOCH,
@@ -14857,8 +14857,8 @@ mod tests {
             crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH,
             "HF2 never moves the pre-activation offence refusal",
         );
-        for epoch in [0, 2_884, 100_000, u64::MAX - 1] {
-            assert!(!crate::params::native_slashing_active(epoch));
+        for epoch in [0, 2_884, 7_269, 7_270, 100_000, u64::MAX - 1] {
+            assert_eq!(crate::params::native_slashing_active(epoch), epoch >= 7270);
         }
     }
 

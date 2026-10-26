@@ -10257,7 +10257,7 @@ mod admission_authorisation {
                 panic!("suite policy must run before signature verification")
             }
         }
-        assert_eq!(bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH, u64::MAX);
+        assert_eq!(bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH, 7360);
         let (pk, sk) = bloch_crypto::crypto::slhdsa_suite::generate_keypair_from_seed(&[0x33u8; 32])
             .expect("suite-0x0003 keypair");
         let mut v1 = signed_transfer().0;
@@ -10280,7 +10280,7 @@ mod admission_authorisation {
         if let PosTransaction::TransferV2 { keys, .. } = &mut v2 {
             keys[0].signature = bloch_crypto::crypto::sign(&sk, &root2).expect("sign V2 root");
         }
-        for epoch in [0, V2_FLAG_DAY, 6_017, u64::MAX] {
+        for epoch in [0, V2_FLAG_DAY, 6_017, 7_359] {
             let err = admissible_with_verifier(&v1, epoch, &MustNotVerify)
                 .expect_err("suite 0x0003 must not enter the V1 mempool before HF3");
             assert!(err.contains("non-hybrid"), "wrong refusal: {err}");

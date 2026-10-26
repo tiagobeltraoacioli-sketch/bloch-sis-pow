@@ -2872,10 +2872,10 @@ mod frozen_set_tests {
 
     #[test]
     fn the_gate_ships_inert() {
-        assert_eq!(crate::params::HF1_FROZEN_FINALITY_SET_EPOCH, u64::MAX);
+        assert_eq!(crate::params::HF1_FROZEN_FINALITY_SET_EPOCH, 7180);
         assert!(crate::params::NATIVE_FINALITY_SET_RECOVERY_EPOCHS.is_empty());
-        for epoch in [0, 5_850, 1 << 40, u64::MAX - 1, u64::MAX] {
-            assert!(!crate::params::native_finality_set_active(epoch));
+        for epoch in [0, 5_850, 7_179, 7_180, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert_eq!(crate::params::native_finality_set_active(epoch), epoch >= 7180);
         }
     }
 }

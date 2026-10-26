@@ -3456,7 +3456,7 @@ mod l2_tests {
     /// above runs below the gate).
     #[test]
     fn below_the_claim_finality_gate_nothing_is_recorded() {
-        assert_eq!(crate::params::HF1_CLAIM_FINALITY_EPOCH, u64::MAX);
+        assert_eq!(crate::params::HF1_CLAIM_FINALITY_EPOCH, 7180);
         let split_claims::Split { a, b, .. } = split_claims::split();
         for st in [&a, &b] {
             let l2 = st.l2_settlement().unwrap();
@@ -3592,7 +3592,7 @@ mod l2_tests {
     /// finality leaf, hence every state root, and the cache keep their bytes.
     #[test]
     fn below_the_own_target_gate_nothing_is_recorded() {
-        assert_eq!(crate::params::HF1_OWN_TARGET_VOTES_EPOCH, u64::MAX);
+        assert_eq!(crate::params::HF1_OWN_TARGET_VOTES_EPOCH, 7186);
         let split_claims::Split { a, b, .. } = split_claims::split();
         for st in [&a, &b] {
             assert_eq!(st.finality_engine.own_checkpoints().count(), 0);
@@ -3607,9 +3607,9 @@ mod l2_tests {
 
     #[test]
     fn native_claim_finality_gate_is_inert() {
-        assert_eq!(crate::params::HF1_CLAIM_FINALITY_EPOCH, u64::MAX);
-        for epoch in [0, 5_850, 10_000, u64::MAX - 1, u64::MAX] {
-            assert!(!crate::params::native_claim_finality_active(epoch));
+        assert_eq!(crate::params::HF1_CLAIM_FINALITY_EPOCH, 7180);
+        for epoch in [0, 5_850, 7_179, 7_180, 7_185, 7_186, 10_000, u64::MAX - 1, u64::MAX] {
+            assert_eq!(crate::params::native_claim_finality_active(epoch), epoch >= 7180);
         }
     }
 
@@ -3672,9 +3672,9 @@ mod l2_tests {
 
     #[test]
     fn hf1_own_target_votes_gate_is_inert() {
-        assert_eq!(crate::params::HF1_OWN_TARGET_VOTES_EPOCH, u64::MAX);
-        for epoch in [0, 5_850, 10_000, u64::MAX - 1, u64::MAX] {
-            assert!(!crate::params::own_target_votes_active(epoch));
+        assert_eq!(crate::params::HF1_OWN_TARGET_VOTES_EPOCH, 7186);
+        for epoch in [0, 5_850, 7_179, 7_180, 7_185, 7_186, 10_000, u64::MAX - 1, u64::MAX] {
+            assert_eq!(crate::params::own_target_votes_active(epoch), epoch >= 7186);
         }
     }
 
