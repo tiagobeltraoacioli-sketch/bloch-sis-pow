@@ -465,6 +465,18 @@ pub struct Config {
     /// Port for `GET /health` + `GET /metrics`. `None` (the default — the
     /// flag is opt-in) starts no listener at all.
     pub metrics_port: Option<u16>,
+    /// Devnet transport: `--mesh-security`, `--mesh-allow` (see `mesh_pq.rs`).
+    /// Resolved in [`run`] once the genesis id is known, because the
+    /// handshake binds every connection to it.
+    pub mesh: MeshPlan,
+}
+
+/// The mesh security the operator asked for, before [`run`] has the genesis
+/// id to build it with.
+#[derive(Clone, Debug)]
+pub struct MeshPlan {
+    pub mode: crate::mesh_pq::Mode,
+    pub allow: Option<PathBuf>,
 }
 
 fn now_ms() -> u64 {
@@ -6386,10 +6398,18 @@ pub(crate) use identity::{check_keystore_identity, check_registry_identity, Keys
 
 fn start_devnet(
     cfg: &Config,
+    genesis_id: [u8; 32],
     tx: mpsc::Sender<EngineEvent>,
     head_slot: &Arc<AtomicU64>,
     inflight: &Arc<net::QueueBudget>,
 ) -> io::Result<net::DevnetMesh> {
+    let security = Arc::new(crate::mesh_pq::MeshSecurity::load(
+        cfg.mesh.mode,
+        genesis_id,
+        &cfg.data_dir,
+        cfg.mesh.allow.as_deref(),
+    )?);
+    println!("mesh security: {}", security.summary());
     net::start(
         &cfg.listen_addr,
         cfg.listen,
@@ -6398,6 +6418,7 @@ fn start_devnet(
         cfg.data_dir.clone(),
         head_slot.clone(),
         inflight.clone(),
+        security,
     )
 }
 
@@ -6854,7 +6875,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // is the other two, unmodified, in one process.
     let net = match cfg.transport {
         Transport::Devnet => {
-            net::Net::Devnet(start_devnet(&cfg, tx.clone(), &head_slot, &inflight)?)
+            net::Net::Devnet(start_devnet(&cfg, *genesis_id.as_bytes(), tx.clone(), &head_slot, &inflight)?)
         }
         Transport::Libp2p => net::Net::Libp2p(start_libp2p(&cfg, net_tx, &head_slot, &inflight)?),
         Transport::Dual => {
@@ -6863,7 +6884,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             // both must not come up holding one: half a dual node is a node
             // that looks like it is bridging two populations and is not.
             // `?` on either line aborts the whole start.
-            let mesh = start_devnet(&cfg, tx.clone(), &head_slot, &inflight)?;
+            let mesh = start_devnet(&cfg, *genesis_id.as_bytes(), tx.clone(), &head_slot, &inflight)?;
             let handle = start_libp2p(&cfg, net_tx, &head_slot, &inflight)?;
             net::Net::Both(mesh, handle)
         }

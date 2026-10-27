@@ -58,6 +58,7 @@ mod keys;
 mod kes_key;
 mod kes_cli;
 mod metrics;
+mod mesh_pq;
 mod net;
 mod p2p;
 mod rpc;
@@ -509,6 +510,17 @@ fn print_help() {
                This transport has no authentication and no admission\n\
                control, so a routable bind MUST be firewalled to the known\n\
                peer addresses.\n\
+                         [--mesh-security plain|offer|require]\n\
+                         [--mesh-allow <file>]\n\
+               Post-quantum mesh security (default plain = unchanged wire):\n\
+               hybrid ML-KEM-768 + X25519 key exchange, ML-DSA-65 mutual\n\
+               authentication, ChaCha20-Poly1305 records. `offer` seals\n\
+               connections to upgraded peers and still talks plain to legacy\n\
+               ones (a migration state: an active attacker can force plain);\n\
+               `require` refuses anything unsealed. The node's transport\n\
+               identity is printed at startup (`mesh security:`); list\n\
+               identities one per line in --mesh-allow to admit only them.\n\
+               Roll out plain -> offer -> require, one node at a time.\n\
          \n\
              libp2p transport:\n\
                          [--p2p-listen <multiaddr>[,...]] (default\n\
@@ -1571,7 +1583,7 @@ pub(crate) fn decide_transport(args: &[String]) -> Result<TransportPlan, String>
         }
     }
     if !runs_devnet {
-        for f in ["--listen", "--listen-addr", "--peers"] {
+        for f in ["--listen", "--listen-addr", "--peers", "--mesh-security", "--mesh-allow"] {
             if present(f) {
                 contradictions.push(f.to_string());
             }
@@ -1815,6 +1827,20 @@ fn run_cmd(args: &[String]) {
         exit(2);
     });
 
+    let mesh = engine::MeshPlan {
+        mode: match arg_value(args, "--mesh-security") {
+            None => mesh_pq::Mode::Plain,
+            Some(s) => mesh_pq::Mode::parse(&s).unwrap_or_else(|error| {
+                eprintln!("run: {error}");
+                exit(2);
+            }),
+        },
+        allow: arg_value(args, "--mesh-allow").map(PathBuf::from),
+    };
+    if mesh.allow.is_some() && mesh.mode == mesh_pq::Mode::Plain {
+        eprintln!("run: --mesh-allow needs --mesh-security offer or require");
+        exit(2);
+    }
     let cfg = engine::Config {
         data_dir: PathBuf::from(data_dir),
         genesis_path: PathBuf::from(genesis_path),
@@ -1845,6 +1871,7 @@ fn run_cmd(args: &[String]) {
         // status for anyone who can reach it.
         metrics_bind,
         metrics_port,
+        mesh,
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");

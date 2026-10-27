@@ -1616,13 +1616,18 @@ dependencies = [
  "cc",
  "chacha20poly1305",
  "futures",
+ "getrandom 0.2.17",
+ "hkdf",
  "libc",
  "libp2p",
  "pqcrypto-internals",
  "pqcrypto-mldsa",
+ "pqcrypto-mlkem",
  "pqcrypto-traits",
+ "rand_core 0.6.4",
  "sha3 0.10.9",
  "tokio",
+ "x25519-dalek",
  "zeroize",
 ]
 
@@ -6054,6 +6059,19 @@ dependencies = [
  "glob",
  "libc",
  "paste",
+ "pqcrypto-internals",
+ "pqcrypto-traits",
+]
+
+[[package]]
+name = "pqcrypto-mlkem"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb14d207f3749e8a59a026c22ceaa72d70fff931cfbf4c8d9b08f3fc56dc6e60"
+dependencies = [
+ "cc",
+ "glob",
+ "libc",
  "pqcrypto-internals",
  "pqcrypto-traits",
 ]

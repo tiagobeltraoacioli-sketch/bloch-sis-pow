@@ -70,6 +70,12 @@
 //! so `gossip.rs`'s verdicts have nowhere to go on this path — the engine
 //! still runs the pool, but a `Reject` costs the sender nothing here.
 //!
+//! **`--mesh-security` (see `mesh_pq.rs`).** With `offer` or `require` a
+//! connection first runs a hybrid ML-KEM-768 + X25519 handshake with
+//! ML-DSA-65 mutual authentication, and every frame below then travels as a
+//! ChaCha20-Poly1305 record instead of in the clear. The default, `plain`,
+//! is this paragraph's absence: the wire is byte-for-byte what it was.
+//!
 //! Wire: `u32 LE frame length ‖ type byte ‖ payload`.
 //! Types: 0x01 block envelope, 0x02 attestation, 0x03 get-blocks{after_slot},
 //! 0x04 transaction ([`FRAME_TX`], payload = one transaction's canonical
@@ -820,13 +826,13 @@ impl Drop for ConnectionHalf {
 
 fn run_inbound_writer(
     rx: Receiver<SharedFrame>,
-    socket: Arc<Mutex<TcpStream>>,
+    socket: Arc<Mutex<MeshWriter>>,
     half: ConnectionHalf,
 ) {
     run_connection_writer(&rx, socket, half);
 }
 
-fn run_connection_writer(rx: &Receiver<SharedFrame>, socket: Arc<Mutex<TcpStream>>, half: ConnectionHalf) {
+fn run_connection_writer(rx: &Receiver<SharedFrame>, socket: Arc<Mutex<MeshWriter>>, half: ConnectionHalf) {
     while !half.0.closed.load(Ordering::Acquire) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(frame) => {
@@ -834,7 +840,7 @@ fn run_connection_writer(rx: &Receiver<SharedFrame>, socket: Arc<Mutex<TcpStream
                 if half.0.closed.load(Ordering::Acquire) { return; }
                 if frame.first() == Some(&FRAME_GET_BLOCKS)
                     && !half.0.take_sync_request(frame.as_ref(), Instant::now()) { continue; }
-                if write_frame(&mut *writer, frame.as_ref()).is_err() { return; }
+                if writer.write_frame(frame.as_ref()).is_err() { return; }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -844,7 +850,7 @@ fn run_connection_writer(rx: &Receiver<SharedFrame>, socket: Arc<Mutex<TcpStream
 
 #[derive(Clone)]
 struct SyncResponder {
-    socket: Arc<Mutex<TcpStream>>,
+    socket: Arc<Mutex<MeshWriter>>,
     data_dir: PathBuf,
     budget: Arc<Mutex<SyncBudget>>,
 }
@@ -889,7 +895,7 @@ impl SyncResponder {
 /// still accepts writes; retaining that writer would silently lose all inbound
 /// data and keep a sync permit occupied until the process restarts.
 fn run_outbound_reader(
-    mut socket: TcpStream,
+    mut socket: MeshReader,
     events: Sender<EngineEvent>,
     budget: Arc<QueueBudget>,
     _half: ConnectionHalf,
@@ -898,7 +904,7 @@ fn run_outbound_reader(
     let Ok(address) = socket.peer_addr() else { return };
     let mut limiter = GetBlocksLimiter::new();
     loop {
-        match read_frame(&mut socket) {
+        match socket.read_frame() {
             Ok(frame) => {
                 if frame.first() == Some(&FRAME_GET_BLOCKS) {
                     responder.answer(&_half.0, address.ip(), frame, &mut limiter);
@@ -1219,6 +1225,101 @@ fn write_typed_frame<W: Write>(
     writer.write_all(payload)
 }
 
+/// Write half of one mesh connection: length-prefixed plain frames, or
+/// sealed records once `--mesh-security` has completed its handshake on the
+/// socket (see `mesh_pq.rs`). Callers hand it the same `type ‖ payload` frame
+/// either way.
+pub(crate) struct MeshWriter {
+    sock: TcpStream,
+    sealer: Option<crate::mesh_pq::Sealer>,
+}
+
+impl MeshWriter {
+    #[cfg(test)]
+    pub(crate) fn plain(sock: TcpStream) -> Self {
+        MeshWriter { sock, sealer: None }
+    }
+
+    fn write_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        match &mut self.sealer {
+            None => write_frame(&mut self.sock, frame),
+            Some(sealer) => sealer.write_record(&mut self.sock, &[frame]),
+        }
+    }
+
+    fn write_typed_frame(&mut self, frame_type: u8, payload: &[u8]) -> std::io::Result<()> {
+        match &mut self.sealer {
+            None => write_typed_frame(&mut self.sock, frame_type, payload),
+            Some(sealer) => sealer.write_record(&mut self.sock, &[&[frame_type], payload]),
+        }
+    }
+}
+
+/// Read half of one mesh connection; the twin of [`MeshWriter`].
+pub(crate) struct MeshReader {
+    sock: TcpStream,
+    opener: Option<crate::mesh_pq::Opener>,
+}
+
+impl MeshReader {
+    fn read_frame(&mut self) -> std::io::Result<Vec<u8>> {
+        match &mut self.opener {
+            None => read_frame(&mut self.sock),
+            Some(opener) => {
+                let deadline = Instant::now().checked_add(DEVNET_IO_TIMEOUT)
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame deadline out of range"))?;
+                opener.read_record(&mut self.sock, deadline)
+            }
+        }
+    }
+
+    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.sock.peer_addr()
+    }
+}
+
+/// Split a socket that has been through the handshake step into its two
+/// halves. Restores the steady-state write timeout the handshake narrowed.
+fn split_session(sock: TcpStream, session: crate::mesh_pq::Session) -> std::io::Result<(MeshReader, MeshWriter)> {
+    sock.set_write_timeout(Some(DEVNET_IO_TIMEOUT))?;
+    let rsock = sock.try_clone()?;
+    Ok(match session {
+        crate::mesh_pq::Session::Plain => (
+            MeshReader { sock: rsock, opener: None },
+            MeshWriter { sock, sealer: None },
+        ),
+        crate::mesh_pq::Session::Sealed { sealer, opener, .. } => (
+            MeshReader { sock: rsock, opener: Some(opener) },
+            MeshWriter { sock, sealer: Some(sealer) },
+        ),
+    })
+}
+
+/// Handshake refusals, at most one line per [`REFUSAL_LOG_EVERY`]. A port on
+/// a routable address gets scanned; a scanner on a `require` node must not
+/// turn into a log flood, and one line is enough to tell an operator that a
+/// peer is misconfigured.
+const REFUSAL_LOG_EVERY: Duration = Duration::from_secs(10);
+
+fn log_refusal(direction: &str, peer: &str, e: &std::io::Error) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let now = Instant::now();
+    let Ok(mut last) = LAST.lock() else { return };
+    if last.is_some_and(|t| now.saturating_duration_since(t) < REFUSAL_LOG_EVERY) {
+        return;
+    }
+    *last = Some(now);
+    eprintln!("net: mesh handshake {direction} {peer} refused: {e}");
+}
+
+/// A dialer in `offer` mode met a node that closed on the handshake's first
+/// bytes — what a legacy node does when it reads `"BPQ1"` as an 827 MB
+/// frame length.
+fn closed_on_handshake(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(e.kind(), UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe)
+}
+
 /// Send one block envelope to a running node and disconnect — the
 /// `FRAME_BLOCK` twin of [`send_transaction`], for the devnet equivocation
 /// injector (`devnet_tools::equivocate`). Same contract: the node judges it
@@ -1249,7 +1350,7 @@ fn read_frame_until(sock: &mut TcpStream, deadline: Instant) -> std::io::Result<
 
 /// A single frame budget covers both its length prefix and payload. `read_exact`
 /// with a fixed socket timeout would renew the budget on every partial read.
-fn read_exact_until(sock: &mut TcpStream, mut buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
+pub(crate) fn read_exact_until(sock: &mut TcpStream, mut buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
     while !buf.is_empty() {
         let remaining = deadline.checked_duration_since(Instant::now())
             .filter(|d| !d.is_zero())
@@ -1363,7 +1464,7 @@ impl SyncBudget {
 /// answer is hundreds of megabytes, and holding it throughout would stall every
 /// broadcast to this peer for the duration.
 fn serve_get_blocks(
-    sock: &Arc<Mutex<TcpStream>>,
+    sock: &Arc<Mutex<MeshWriter>>,
     data_dir: &PathBuf,
     frame: &[u8],
     connection: &Connection,
@@ -1392,7 +1493,7 @@ fn serve_get_blocks(
             for b in blocks {
                 let Ok(mut w) = sock.lock() else { return };
                 if connection.closed.load(Ordering::Acquire) { return; }
-                if write_typed_frame(&mut *w, FRAME_BLOCK, &b).is_err() {
+                if w.write_typed_frame(FRAME_BLOCK, &b).is_err() {
                     // A partial frame cannot be followed by more framed data.
                     connection.closed.store(true, Ordering::Release);
                     let _ = connection.socket.shutdown(Shutdown::Both);
@@ -1413,8 +1514,12 @@ fn serve_get_blocks(
 /// and no peer scoring** — `gossip.rs` is not wired here — so anything that
 /// can reach the port can feed it frames. Binding a routable address is
 /// therefore opt-in (`--listen-addr`), and when it is used the operator is
-/// responsible for restricting the port to known peers at the firewall. The
-/// production answer is the libp2p stack, not this.
+/// responsible for restricting the port to known peers at the firewall.
+///
+/// `security` changes that: under `require` with an allow-list only listed
+/// ML-DSA-65 identities get a connection, and every frame is encrypted and
+/// authenticated (`mesh_pq.rs`). Keep the firewall anyway; under `plain` the
+/// paragraph above is the whole truth.
 pub fn start(
     bind_addr: &str,
     listen_port: u16,
@@ -1423,6 +1528,7 @@ pub fn start(
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
     inflight: Arc<QueueBudget>,
+    security: Arc<crate::mesh_pq::MeshSecurity>,
 ) -> std::io::Result<DevnetMesh> {
     // Inbound: accept, then per-connection: read frames; data frames go to
     // the engine; get-blocks is answered by a globally bounded serving worker.
@@ -1451,6 +1557,7 @@ pub fn start(
         let inbound_live = inbound_live.clone();
         let scheduler = Arc::downgrade(&sync);
         let sync_budget = sync_budget.clone();
+        let security = security.clone();
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(sock) = conn else { continue };
@@ -1477,49 +1584,67 @@ pub fn start(
                 {
                     continue;
                 }
-                // Reading and writing need separate handles: the reader blocks
-                // in `read_frame` for as long as the peer is quiet, and a
-                // broadcast must not wait behind it.
-                let Ok(rsock) = sock.try_clone() else { continue };
-                let Ok(shutdown_socket) = sock.try_clone() else { continue };
-                let connection = Arc::new(Connection {
-                    socket: shutdown_socket,
-                    closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
-                    _counts: (ConnCount::new(&live), Some(ConnCount::new(&inbound_live))),
-                    _ip_permit: Some(ip_permit),
-                });
-                let wsock = Arc::new(Mutex::new(sock));
-
-                // One writer thread per connection, fed by a bounded queue, so
-                // a peer that stops reading fills its own queue and is dropped
-                // from there rather than blocking this node's broadcast loop.
-                let (tx, rx) = mpsc::sync_channel::<SharedFrame>(INBOUND_QUEUE_DEPTH);
-                {
-                    let wsock = wsock.clone();
-                    let half = ConnectionHalf(connection.clone());
-                    thread::spawn(move || {
-                        run_inbound_writer(rx, wsock, half);
-                    });
-                }
-                let peer = InboundPeer { frames: tx, connection: Arc::downgrade(&connection) };
-                if let Ok(mut reg) = inbound.lock() { reg.push(peer.clone()); }
-                if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer, Instant::now()); }
-
+                // The inbound slot is taken here, before the handshake, so a
+                // flood of half-open handshakes is bounded by the same caps as
+                // established connections. The handshake itself runs on the
+                // connection's own thread: a slow or silent dialer must not
+                // hold up the accept loop.
+                let inbound_slot = ConnCount::new(&inbound_live);
                 let events = events.clone();
                 let data_dir = data_dir.clone();
                 let inflight = inflight.clone();
-                let mut rsock = rsock;
-                // Counted from here to wherever this thread leaves. The guards
-                // are moved into the closure, so every `return` below and any
-                // unwind releases both.
-                let half = ConnectionHalf(connection);
-                let responder = SyncResponder { socket: wsock, data_dir: data_dir.clone(), budget: sync_budget.clone() };
+                let inbound = inbound.clone();
+                let live = live.clone();
+                let scheduler = scheduler.clone();
+                let sync_budget = sync_budget.clone();
+                let security = security.clone();
                 thread::spawn(move || {
-                    let _half = half;
+                    let mut sock = sock;
+                    let session = match crate::mesh_pq::handshake_inbound(&mut sock, &security) {
+                        Ok(session) => session,
+                        Err(e) => {
+                            log_refusal("from", &address.to_string(), &e);
+                            return;
+                        }
+                    };
+                    let Ok(shutdown_socket) = sock.try_clone() else { return };
+                    // Reading and writing need separate handles: the reader
+                    // blocks in `read_frame` for as long as the peer is quiet,
+                    // and a broadcast must not wait behind it.
+                    let Ok((mut reader, writer)) = split_session(sock, session) else { return };
+                    let connection = Arc::new(Connection {
+                        socket: shutdown_socket,
+                        closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
+                        _counts: (ConnCount::new(&live), Some(inbound_slot)),
+                        _ip_permit: Some(ip_permit),
+                    });
+                    let wsock = Arc::new(Mutex::new(writer));
+
+                    // One writer thread per connection, fed by a bounded queue,
+                    // so a peer that stops reading fills its own queue and is
+                    // dropped from there rather than blocking this node's
+                    // broadcast loop.
+                    let (tx, rx) = mpsc::sync_channel::<SharedFrame>(INBOUND_QUEUE_DEPTH);
+                    {
+                        let wsock = wsock.clone();
+                        let half = ConnectionHalf(connection.clone());
+                        thread::spawn(move || {
+                            run_inbound_writer(rx, wsock, half);
+                        });
+                    }
+                    let peer = InboundPeer { frames: tx, connection: Arc::downgrade(&connection) };
+                    if let Ok(mut reg) = inbound.lock() { reg.push(peer.clone()); }
+                    if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer, Instant::now()); }
+
+                    // Counted from here to wherever this thread leaves. The
+                    // guards live in `_half`, so every `return` below and any
+                    // unwind releases both.
+                    let _half = ConnectionHalf(connection);
+                    let responder = SyncResponder { socket: wsock, data_dir: data_dir.clone(), budget: sync_budget };
                     // Per-connection (R3 M-4 / R1 A3-M2): see [`GetBlocksLimiter`].
                     let mut get_blocks_limiter = GetBlocksLimiter::new();
                     loop {
-                        match read_frame(&mut rsock) {
+                        match reader.read_frame() {
                             Ok(frame) => {
                                 if frame.first() == Some(&FRAME_GET_BLOCKS) {
                                     responder.answer(&_half.0, address.ip(), frame, &mut get_blocks_limiter);
@@ -1554,16 +1679,46 @@ pub fn start(
         let events = events.clone();
         let inflight = inflight.clone();
         let live = live.clone();
-        thread::spawn(move || loop {
-            let Ok(sock) = TcpStream::connect(&addr) else {
+        let security = security.clone();
+        thread::spawn(move || {
+            // `offer` against a legacy peer: a handshake the peer closed on
+            // sends the NEXT connection plain; when that plain session ends
+            // the handshake is tried again, so an upgraded peer is picked up
+            // on its first reconnect with no restart here.
+            let mut fallback_plain = false;
+            loop {
+            let Ok(mut sock) = TcpStream::connect(&addr) else {
                 thread::sleep(Duration::from_millis(300));
                 continue;
+            };
+            let session = if fallback_plain {
+                fallback_plain = false;
+                Ok(crate::mesh_pq::Session::Plain)
+            } else {
+                crate::mesh_pq::handshake_outbound(&mut sock, &security)
+            };
+            let session = match session {
+                Ok(session) => session,
+                Err(e) if security.mode() == crate::mesh_pq::Mode::Offer && closed_on_handshake(&e) => {
+                    fallback_plain = true;
+                    continue;
+                }
+                Err(e) => {
+                    log_refusal("to", &addr, &e);
+                    // Not a busy loop against a peer that will refuse again.
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
             };
             // Both halves own one connected lifetime. A read timeout must
             // close the writer too: otherwise it can keep sending forever
             // while no worker consumes the peer's blocks or sync replies.
-            let Ok(rsock) = sock.try_clone() else { continue };
             let Ok(shutdown_socket) = sock.try_clone() else { continue };
+            // R3 M-4 / R1 A3-M2: same bound as the inbound side — see
+            // [`DEVNET_IO_TIMEOUT`]. Best-effort; a platform that refuses the
+            // option gets an unbounded-latency socket, not a broken one.
+            let _ = sock.set_read_timeout(Some(DEVNET_IO_TIMEOUT));
+            let Ok((reader, writer)) = split_session(sock, session) else { continue };
             let connection = Arc::new(Connection {
                 socket: shutdown_socket,
                 closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
@@ -1575,13 +1730,7 @@ pub fn start(
             }
             let writer_half = ConnectionHalf(connection.clone());
             let reader_half = ConnectionHalf(connection);
-            let wsock = sock;
-            // R3 M-4 / R1 A3-M2: same bound as the inbound side — see
-            // [`DEVNET_IO_TIMEOUT`]. Best-effort; a platform that refuses the
-            // option gets an unbounded-latency socket, not a broken one.
-            let _ = wsock.set_read_timeout(Some(DEVNET_IO_TIMEOUT));
-            let _ = wsock.set_write_timeout(Some(DEVNET_IO_TIMEOUT));
-            let wsock = Arc::new(Mutex::new(wsock));
+            let wsock = Arc::new(Mutex::new(writer));
             // Reader half also answers reverse-direction requests, so an
             // inbound-only connection can participate in recovery.
             {
@@ -1589,10 +1738,11 @@ pub fn start(
                 let inflight = inflight.clone();
                 let responder = SyncResponder { socket: wsock.clone(), data_dir: data_dir.clone(), budget: sync_budget.clone() };
                 thread::spawn(move || {
-                    run_outbound_reader(rsock, events, inflight, reader_half, responder);
+                    run_outbound_reader(reader, events, inflight, reader_half, responder);
                 });
             }
             run_connection_writer(&rx, wsock, writer_half);
+            }
         });
     }
 
@@ -1853,7 +2003,7 @@ mod tests {
         let (events, received) = mpsc::channel();
         let mesh = start("127.0.0.1", 0,
             vec![silent_a.local_addr().unwrap().to_string(), silent_b.local_addr().unwrap().to_string()],
-            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
+            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(), Arc::new(crate::mesh_pq::MeshSecurity::plain())).unwrap();
         let port = mesh.listen_addr().port();
         let (mut a, _) = silent_a.accept().unwrap();
         let (mut b, _) = silent_b.accept().unwrap();
@@ -1881,7 +2031,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let (events, _received) = mpsc::channel();
         let _mesh = start("127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
-            events, dir.clone(), Arc::new(AtomicU64::new(43)), QueueBudget::new()).unwrap();
+            events, dir.clone(), Arc::new(AtomicU64::new(43)), QueueBudget::new(), Arc::new(crate::mesh_pq::MeshSecurity::plain())).unwrap();
         let (mut remote, _) = listener.accept().unwrap();
         assert_eq!(read_frame_until(&mut remote, Instant::now() + Duration::from_secs(3)).unwrap(), get_blocks_frame(43));
         write_frame(&mut remote, &get_blocks_frame(42)).unwrap();
@@ -1908,10 +2058,10 @@ mod tests {
         let (left_tx, left_rx) = mpsc::channel();
         let (right_tx, right_rx) = mpsc::channel();
         let left = start("127.0.0.1", 0, Vec::new(), left_tx, left_dir,
-            Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
+            Arc::new(AtomicU64::new(42)), QueueBudget::new(), Arc::new(crate::mesh_pq::MeshSecurity::plain())).unwrap();
         let port = left.listen_addr().port();
         let right = start("127.0.0.1", 0, vec![format!("127.0.0.1:{port}")], right_tx, right_dir,
-            Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
+            Arc::new(AtomicU64::new(42)), QueueBudget::new(), Arc::new(crate::mesh_pq::MeshSecurity::plain())).unwrap();
         for received in [left_rx, right_rx] {
             match received.recv_timeout(Duration::from_secs(8)).unwrap() {
                 EngineEvent::Net(NetEvent::Block(actual, _)) => assert_eq!(actual.body.transactions, block.body.transactions),
@@ -1924,6 +2074,64 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    /// Two real meshes, right dialling left, each holding one 4 MiB block and
+    /// asking the other for it. True when both sides received the other's
+    /// page within the timeout.
+    fn sync_across(left: crate::mesh_pq::MeshSecurity, right: crate::mesh_pq::MeshSecurity, tag: &str) -> bool {
+        let base = std::env::temp_dir().join(format!("bloch-mesh-pq-{tag}-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let left_dir = base.join("left");
+        let right_dir = base.join("right");
+        let mut block = sync_test_block();
+        block.body.transactions.push(vec![0xA5; 4 * 1024 * 1024]);
+        let mut left_store = crate::store::Store::open(&left_dir, &[7; 32]).unwrap();
+        let mut right_store = crate::store::Store::open(&right_dir, &[7; 32]).unwrap();
+        left_store.append(&block).unwrap();
+        right_store.append(&block).unwrap();
+        let (left_tx, left_rx) = mpsc::channel();
+        let (right_tx, right_rx) = mpsc::channel();
+        let left_mesh = start("127.0.0.1", 0, Vec::new(), left_tx, left_dir,
+            Arc::new(AtomicU64::new(42)), QueueBudget::new(), Arc::new(left)).unwrap();
+        let port = left_mesh.listen_addr().port();
+        let right_mesh = start("127.0.0.1", 0, vec![format!("127.0.0.1:{port}")], right_tx, right_dir,
+            Arc::new(AtomicU64::new(42)), QueueBudget::new(), Arc::new(right)).unwrap();
+        let delivered = [left_rx, right_rx].into_iter().all(|received| {
+            matches!(received.recv_timeout(Duration::from_secs(8)),
+                Ok(EngineEvent::Net(NetEvent::Block(actual, _))) if actual.body.transactions == block.body.transactions)
+        });
+        drop((left_mesh, right_mesh, left_store, right_store));
+        let _ = std::fs::remove_dir_all(base);
+        delivered
+    }
+
+    #[test]
+    fn mesh_security_modes_interoperate_as_documented() {
+        use crate::mesh_pq::{MeshSecurity, Mode};
+        let net = [9; 32];
+        let pq = |mode| MeshSecurity::ephemeral(mode, net, None);
+        // Sealed end to end, including 4 MiB sync pages in both directions.
+        assert!(sync_across(pq(Mode::Require), pq(Mode::Require), "req-req"));
+        assert!(sync_across(pq(Mode::Offer), pq(Mode::Require), "offer-req"));
+        // `offer` keeps talking to legacy nodes, in either direction.
+        assert!(sync_across(pq(Mode::Offer), MeshSecurity::plain(), "offer-plain"));
+        assert!(sync_across(MeshSecurity::plain(), pq(Mode::Offer), "plain-offer"));
+        // `require` does not, in either direction, and neither does another network.
+        assert!(!sync_across(pq(Mode::Require), MeshSecurity::plain(), "req-plain"));
+        assert!(!sync_across(MeshSecurity::plain(), pq(Mode::Require), "plain-req"));
+        assert!(!sync_across(pq(Mode::Require), MeshSecurity::ephemeral(Mode::Require, [8; 32], None), "other-net"));
+    }
+
+    #[test]
+    fn mesh_allow_list_admits_only_listed_identities() {
+        use crate::mesh_pq::{MeshSecurity, Mode};
+        let net = [9; 32];
+        let member = MeshSecurity::ephemeral(Mode::Require, net, None);
+        let gate = |allowed| MeshSecurity::ephemeral(Mode::Require, net, Some(std::collections::HashSet::from([allowed])));
+        let member_id = member.identity_id().unwrap();
+        assert!(sync_across(gate(member_id), member, "allow-member"));
+        assert!(!sync_across(gate(member_id), MeshSecurity::ephemeral(Mode::Require, net, None), "allow-stranger"));
+    }
+
     #[test]
     fn shared_sync_serving_cap_survives_reconnect_generations_and_closes_failed_writes() {
         let dir = std::env::temp_dir().join(format!("bloch-sync-workers-{}-{}", std::process::id(),
@@ -1931,7 +2139,7 @@ mod tests {
         let mut store = crate::store::Store::open(&dir, &[7; 32]).unwrap();
         store.append(&sync_test_block()).unwrap();
         let peers: Vec<_> = (0..=MAX_SYNC_SERVING_WORKERS).map(|_| sync_test_peer()).collect();
-        let sockets: Vec<_> = peers.iter().map(|p| Arc::new(Mutex::new(p.connection.socket.try_clone().unwrap()))).collect();
+        let sockets: Vec<_> = peers.iter().map(|p| Arc::new(Mutex::new(MeshWriter::plain(p.connection.socket.try_clone().unwrap())))).collect();
         let budget = Arc::new(Mutex::new(SyncBudget::new()));
         let responders: Vec<_> = sockets.iter().map(|s| SyncResponder { socket: s.clone(), data_dir: dir.clone(), budget: budget.clone() }).collect();
         let ip = "127.0.0.1".parse().unwrap();
@@ -1968,6 +2176,7 @@ mod tests {
         let mesh = start(
             "127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
             events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(),
+            Arc::new(crate::mesh_pq::MeshSecurity::plain()),
         ).unwrap();
         // More reconnects than the sync fanout: a leaked permit would leave
         // the third connection without its initial history request.
@@ -2025,7 +2234,7 @@ mod tests {
         // condition that previously stranded `for frame in rx` forever.
         let (done_tx, done_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
-            run_inbound_writer(rx, Arc::new(Mutex::new(socket)), writer);
+            run_inbound_writer(rx, Arc::new(Mutex::new(MeshWriter::plain(socket))), writer);
             done_tx.send(()).unwrap();
         });
         drop(reader);
@@ -2687,6 +2896,7 @@ mod tests {
             std::env::temp_dir(),
             head_slot,
             inflight,
+            Arc::new(crate::mesh_pq::MeshSecurity::plain()),
         )
         .expect("bind the devnet transport");
         let port = mesh.listen_addr().port();
