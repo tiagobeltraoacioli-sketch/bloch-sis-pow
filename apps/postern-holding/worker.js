@@ -5,7 +5,7 @@ const DOSSIER='/Bloch-SIS-PoW-Institutional-Dossier-EN.pdf';
 // Holding-site pages beyond the home page, served from public/holding with the same headers.
 const PAGES=new Map([['/upgrades','/holding/upgrades.html']]);
 const HTML_HEADERS={
-  'content-security-policy':"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-requests",
+  'content-security-policy':"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; media-src 'self'; font-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-requests",
   'x-content-type-options':'nosniff','x-frame-options':'DENY','referrer-policy':'strict-origin-when-cross-origin',
   'permissions-policy':'camera=(), microphone=(), geolocation=(), payment=()','cache-control':'public, max-age=300'};
 
@@ -21,7 +21,9 @@ export async function handlePosternLabs({request,env,fetcher=fetch}){
   if(!page&&!asset&&!dossier)return fetcher(request);
   if(!['GET','HEAD'].includes(request.method))return new Response('Method not allowed',{status:405,headers:{allow:'GET, HEAD'}});
   const target=new URL(page||(dossier?'/holding'+DOSSIER:url.pathname),url.origin);
-  const response=await env.ASSETS.fetch(new Request(target,{method:request.method}));
+  // Range is forwarded so the soundtrack can stream and seek (Safari requires partial responses).
+  const range=request.headers.get('range');
+  const response=await env.ASSETS.fetch(new Request(target,{method:request.method,headers:range?{range}:{}}));
   if(page)return withHeaders(response,HTML_HEADERS);
   if(dossier&&response.status===200)return withHeaders(response,{'content-type':'application/pdf','content-disposition':'inline; filename="Bloch-SIS-PoW-Institutional-Dossier-EN.pdf"','x-content-type-options':'nosniff','cache-control':'public, max-age=300'});
   return withHeaders(response,{'x-content-type-options':'nosniff','cache-control':'public, max-age=3600'});

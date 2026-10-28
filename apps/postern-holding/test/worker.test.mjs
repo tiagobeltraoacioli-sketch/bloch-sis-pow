@@ -60,3 +60,12 @@ test('the canonical dossier URL serves the same PDF asset on all hosts',async()=
     assert.match(response.headers.get('content-disposition'),/^inline;/);
   }
 });
+
+test('the soundtrack is allowed by the page policy and streams with byte ranges',async()=>{
+  const page=await handlePosternLabs({request:new Request('https://posternlabs.com/'),env:{ASSETS:assets}});
+  assert.match(page.headers.get('content-security-policy'),/media-src 'self'/);
+  let seen=null;
+  const ranged={async fetch(request){seen=request.headers.get('range');return new Response('part',{status:206,headers:{'content-range':'bytes 0-1/4'}});}};
+  const response=await handlePosternLabs({request:new Request('https://blochprotocol.io/holding/audio/uberbloch-sovereign-of-our-lives.m4a',{headers:{range:'bytes=0-1'}}),env:{ASSETS:ranged}});
+  assert.equal(seen,'bytes=0-1');assert.equal(response.status,206);assert.equal(response.headers.get('content-range'),'bytes 0-1/4');
+});
