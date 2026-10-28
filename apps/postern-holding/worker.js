@@ -5,7 +5,7 @@ const DOSSIER='/Bloch-SIS-PoW-Institutional-Dossier-EN.pdf';
 // Holding-site pages beyond the home page, served from public/holding with the same headers.
 const PAGES=new Map([['/upgrades','/holding/upgrades.html']]);
 const HTML_HEADERS={
-  'content-security-policy':"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-requests",
+  'content-security-policy':"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; frame-src https://www.youtube-nocookie.com; base-uri 'none'; object-src 'none'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-requests",
   'x-content-type-options':'nosniff','x-frame-options':'DENY','referrer-policy':'strict-origin-when-cross-origin',
   'permissions-policy':'camera=(), microphone=(), geolocation=(), payment=()','cache-control':'public, max-age=300'};
 
