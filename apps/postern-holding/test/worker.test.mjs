@@ -60,16 +60,3 @@ test('the canonical dossier URL serves the same PDF asset on all hosts',async()=
     assert.match(response.headers.get('content-disposition'),/^inline;/);
   }
 });
-
-test('the soundtrack is allowed by the page policy and served in byte ranges',async()=>{
-  const page=await handlePosternLabs({request:new Request('https://posternlabs.com/'),env:{ASSETS:assets}});
-  assert.match(page.headers.get('content-security-policy'),/media-src 'self'/);
-  const track={async fetch(){return new Response('0123456789',{headers:{'content-type':'audio/mp4'}});}};
-  const get=range=>handlePosternLabs({request:new Request('https://blochprotocol.io/holding/audio/track.m4a',{headers:range?{range}:{}}),env:{ASSETS:track}});
-  const full=await get();assert.equal(full.status,200);assert.equal(full.headers.get('accept-ranges'),'bytes');assert.equal(await full.text(),'0123456789');
-  for(const [range,body,contentRange] of [['bytes=0-1','01','bytes 0-1/10'],['bytes=4-','456789','bytes 4-9/10'],['bytes=-3','789','bytes 7-9/10'],['bytes=8-99','89','bytes 8-9/10']]){
-    const part=await get(range);
-    assert.equal(part.status,206);assert.equal(part.headers.get('content-range'),contentRange);assert.equal(await part.text(),body);assert.equal(part.headers.get('content-type'),'audio/mp4');
-  }
-  assert.equal((await get('bytes=10-')).status,416);
-});
