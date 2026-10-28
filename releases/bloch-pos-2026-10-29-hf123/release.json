@@ -1,0 +1,37 @@
+{
+  "release": "bloch-pos-2026-10-29-hf123",
+  "source_commit": "78d4921c3ec6ba41829f3878eed47f8d3bb96230",
+  "platform": "linux-x86_64",
+  "binary": "bloch-pos",
+  "binary_sha256": "700631b040a3a4b2299017162dd4a2c5f521bb49d5fa3c9ed677ba285673794e",
+  "checksum_manifest": "SHA256SUMS",
+  "checksum_signature": "SHA256SUMS.minisig",
+  "minisign_public_key": "bloch-release-20260922.pub",
+  "minisign_key_id": "1A5D96A5C4955EF7",
+  "upgrade_only": true,
+  "new_hard_forks_armed": true,
+  "install_before": {"epoch": 7180, "utc": "2026-11-01T16:11:19Z"},
+  "l2_and_indexer_install_before": {"epoch": 7178, "utc": "2026-11-01T15:39:19Z"},
+  "activations": [
+    {"name": "HF1 claim finality + frozen finality set", "epoch": 7180, "utc": "2026-11-01T16:11:19Z"},
+    {"name": "HF1 own-target vote counting", "epoch": 7186, "utc": "2026-11-01T17:47:19Z"},
+    {"name": "HF2", "epoch": 7270, "utc": "2026-11-02T16:11:19Z"},
+    {"name": "HF3 (KES registration opens)", "epoch": 7360, "utc": "2026-11-03T16:11:19Z"},
+    {"name": "HF3 KES enforcement", "epoch": 8620, "utc": "2026-11-17T16:11:19Z"}
+  ],
+  "signed": true,
+  "signature_verified": true,
+  "status": "release-qualified",
+  "qualification": {
+    "tests_passed": 4062,
+    "tests_ignored": 71,
+    "replayed_blocks": 174032,
+    "replayed_head_slot": 211072,
+    "replayed_state_root": "4cec3a86e80ef9a7f399d82891531438ad879ab62a81205081b793ffb41336f4",
+    "replay_identical_to": "1708953d839d55d461afed80802abacfdb8360c2",
+    "early_activation_replay": "pass"
+  },
+  "previous_release": "node-1708953d-node-hardening",
+  "github_tag": "node-78d4921c-hf123",
+  "website": "https://blochl1.com/releases/2026-10-29-hf123/"
+}
