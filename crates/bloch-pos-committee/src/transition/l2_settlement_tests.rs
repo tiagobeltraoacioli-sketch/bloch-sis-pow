@@ -3227,6 +3227,90 @@ mod l2_tests {
     }
 
 
+    /// Operator check for an externally produced mainnet settlement proof
+    /// (bloch-l2-evm `settler_v3.parse_proof_artifact` output): runs the exact
+    /// native verifier call of `L2Settlement::apply` (`bloch_l2_proof::verify`
+    /// with the pinned `mainnet::PROGRAM` policy and BN254 key) plus the
+    /// statement checks `apply` makes before it (policy, the seven identities,
+    /// chain id, first-settlement successor fields, V3 reserved fields) and,
+    /// with BLOCH_EXTERNAL_PROOF_STRICT_SOURCE=1, the source fields against the
+    /// 11-line native request taken from the live `getl2settlement`.
+    /// `BLOCH_EXTERNAL_PROOF_DIR=<dir with values, proof, request>
+    ///  cargo test -p bloch-pos-committee --lib mainnet_program_external_proof -- --ignored --nocapture`
+    #[test]
+    #[ignore = "operator check; needs BLOCH_EXTERNAL_PROOF_DIR"]
+    fn mainnet_program_external_proof() {
+        use crate::l2_settlement::{deposits_hash, mainnet, v3, MAINNET_CHAIN_ID, STATEMENT_V3_BYTES, STATEMENT_V3_TAG};
+        let dir = std::path::PathBuf::from(std::env::var("BLOCH_EXTERNAL_PROOF_DIR").expect("BLOCH_EXTERNAL_PROOF_DIR"));
+        let strict = std::env::var("BLOCH_EXTERNAL_PROOF_STRICT_SOURCE").as_deref() == Ok("1");
+        let values = std::fs::read(dir.join("values")).unwrap();
+        let proof = std::fs::read(dir.join("proof")).unwrap();
+        let request = std::fs::read_to_string(dir.join("request")).unwrap();
+        let lines: Vec<&str> = request.lines().collect();
+        assert_eq!(lines.len(), 11, "native request has 11 lines");
+        let program = mainnet::PROGRAM.expect("the mainnet program is pinned");
+        let n = |o: usize| u64::from_be_bytes(values[o..o + 8].try_into().unwrap());
+        assert_eq!(values.len(), STATEMENT_V3_BYTES);
+        assert!(values.starts_with(STATEMENT_V3_TAG));
+        assert_eq!(proof.len(), 356);
+        for (i, id) in program.identities.iter().enumerate() {
+            assert_eq!(hash_at(&values, S + i * 32), *id, "identity {i}");
+        }
+        assert_eq!(n(S + 256), MAINNET_CHAIN_ID);
+        // First settlement: zero previous, number 1, pinned L2 genesis parent/state.
+        assert_eq!(hash_at(&values, S + 224), [0; 32]);
+        assert_eq!(n(S + 264), 1);
+        assert_eq!(hash_at(&values, S + 272), program.initial_l2_parent);
+        assert_eq!(hash_at(&values, S + 304), program.initial_l2_state);
+        assert_ne!(hash_at(&values, S + 336), [0; 32]);
+        assert_ne!(hash_at(&values, S + 368), [0; 32]);
+        assert_ne!(hash_at(&values, S + 536), [0; 32]);
+        assert_ne!(hash_at(&values, S + v3::TRANSACTIONS_ROOT), [0; 32]);
+        assert_ne!(hash_at(&values, S + v3::RECEIPTS_ROOT), [0; 32]);
+        let users = n(S + v3::USER_TX_COUNT);
+        if users == 0 {
+            assert_eq!(hash_at(&values, S + v3::DA_COMMITMENT), [0; 32]);
+        }
+        let source_fields = [
+            ("block", hex::encode(hash_at(&values, S + 400)) == lines[2]),
+            ("slot", n(S + 432).to_string() == lines[3]),
+            ("height", n(S + 440).to_string() == lines[4]),
+            ("commitment", hex::encode(hash_at(&values, S + 448)) == lines[5]),
+            ("inbox_root", hex::encode(hash_at(&values, S + 480)) == lines[6]),
+            ("inbox_count", n(S + 512).to_string() == lines[8]),
+            ("consumed_start", n(S + 520).to_string() == lines[9]),
+            ("consumed_end", n(S + 528).to_string() == lines[10]),
+        ];
+        // The live source has an empty inbox: the deposits must be the empty list.
+        let empty_deposits = hash_at(&values, S + v3::DEPOSITS_HASH) == deposits_hash(&[]);
+        // The native verifier call of `L2Settlement::apply` (HybridVerifier::verify_l2_settlement).
+        let verified = bloch_l2_proof::verify(&program.proof_policy, &program.identities[6], &values, &proof);
+        let mut flipped = proof.clone();
+        flipped[12] ^= 1;
+        let mut moved = values.clone();
+        moved[S + 336] ^= 1;
+        let refused_flipped = !bloch_l2_proof::verify(&program.proof_policy, &program.identities[6], &values, &flipped);
+        let refused_moved = !bloch_l2_proof::verify(&program.proof_policy, &program.identities[6], &moved, &proof);
+        let refused_v2 = !bloch_l2_proof::verify(&bloch_l2_proof::policy_commitment(), &program.identities[6], &values, &proof);
+        println!(
+            "EXTERNAL-PROOF l2_hash={} state_root={} user_tx_count={} source={:?} empty_deposits={} verified={} refused_flipped_proof={} refused_flipped_statement={} refused_v2_policy={}",
+            hex::encode(hash_at(&values, S + 336)),
+            hex::encode(hash_at(&values, S + 368)),
+            users,
+            source_fields,
+            empty_deposits,
+            verified,
+            refused_flipped,
+            refused_moved,
+            refused_v2
+        );
+        assert!(verified && refused_flipped && refused_moved && refused_v2);
+        if strict {
+            assert!(source_fields.iter().all(|(_, ok)| *ok), "source fields differ from the native request");
+            assert!(empty_deposits, "deposits differ from the live (empty) inbox");
+        }
+    }
+
     // ── Claim finality must lie on the claim's own chain (2026-10-19) ──
     //
     // `wd::record_finalized` compares EPOCHS only, and the FFG tally counts
