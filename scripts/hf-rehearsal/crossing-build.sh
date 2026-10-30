@@ -19,7 +19,8 @@
 #
 #   crossing-build.sh WORK NATIVE_FA_TAR NATIVE_78_TAR L2_SRC RETH_SRC NATIVE_LOCK [L2_TARGET_SEED]
 #
-# Env (epochs): PAST L2E HF1 OWN HF2 HF3 KESE KESW HF2MIN; JOBS (<= 6); MEM (GiB cap per cargo).
+# Env (epochs): PAST L2E HF1 OWN HF2 HF3 KESE KESW HF2MIN; JOBS (<= 6); MEM (GiB cap per cargo);
+# NATIVE_ONLY=1 builds candidate, baseline and tool only (NATIVE_78_TAR and the L2 arguments ignored).
 # Asserts: the candidate's source-digest differs from release 78d4921c
 # (35c2b943...) and from release fa980367 (a4c4af85...); the armed consensus
 # crates are byte-identical between the fa980367 and 78d4921c exports.
@@ -60,16 +61,18 @@ export_tar() { rm -rf "$2"; mkdir -p "$2"; tar -x -C "$2" -f "$1"; }
 log "fresh exports"
 export_tar "$FA_TAR" "$W/src/cand"
 export_tar "$FA_TAR" "$W/src/base"
-export_tar "$N78_TAR" "$W/src/bloch-validator-payout"
+NATIVE_ONLY=${NATIVE_ONLY:-0}
+[ "$NATIVE_ONLY" = 1 ] || export_tar "$N78_TAR" "$W/src/bloch-validator-payout"
 ARM="$W/src/cand/scripts/hf-rehearsal/arm.py"
 log "arm candidate (fa980367)"
 python3 -I "$ARM" "$W/src/cand" --hf1 "$HF1" --hf2 "$HF2" --hf3 "$HF3" --past-gate "$PAST" --only-listed \
   --conf "$W/crossing.conf" --report "$W/out/arming-candidate.json"
+log "arm baseline (past flag days only)"
+python3 -I "$ARM" "$W/src/base" --no-hf --past-gate "$PAST" --report "$W/out/arming-baseline.json"
+if [ "$NATIVE_ONLY" != 1 ]; then
 log "arm L2 native (78d4921c), identical rescheduling"
 python3 -I "$ARM" "$W/src/bloch-validator-payout" --hf1 "$HF1" --hf2 "$HF2" --hf3 "$HF3" --past-gate "$PAST" --only-listed \
   --conf "$W/crossing.conf" --report "$W/out/arming-l2-native.json"
-log "arm baseline (past flag days only)"
-python3 -I "$ARM" "$W/src/base" --no-hf --past-gate "$PAST" --report "$W/out/arming-baseline.json"
 for c in bloch-pos-committee bloch-crypto; do
   diff -r "$W/src/cand/crates/$c" "$W/src/bloch-validator-payout/crates/$c" > /dev/null \
     || die "armed $c differs between the fa980367 and 78d4921c exports"
@@ -79,6 +82,7 @@ for f in codec.rs genesis.rs genesis_l2.rs lib.rs; do
     || die "bloch-pos-node/src/$f differs between the exports"
 done
 echo "armed consensus crates identical across fa980367 / 78d4921c exports" | tee "$W/out/armed-identical.txt"
+fi
 
 native_build() { # $1 src $2 label $3 target
   log "native $2"
@@ -105,6 +109,7 @@ grep -q "= $HF1;" <(grep 'pub const HF1_CLAIM_FINALITY_EPOCH' "$W/src/cand/crate
   || die "candidate params.rs is not armed at HF1=$HF1"
 echo "candidate source-digest $CD differs from releases 78d4921c ($RELEASE_78...) and fa980367 ($RELEASE_FA...)" | tee -a "$W/out/versions.txt"
 
+if [ "$NATIVE_ONLY" = 1 ]; then (cd "$W/out" && sha256sum * > SHA256SUMS); log "BUILD OK (native only): $W/out"; exit 0; fi
 log "L2 follower + produce-dev against the armed 78d4921c export"
 cp -a "$L2_SRC" "$W/src/bloch-l2-evm"
 cp -a "$RETH_SRC" "$W/src/reth-bloch-rpc-snapshot"
