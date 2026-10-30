@@ -159,7 +159,7 @@ class Crossing(Rehearsal):
             node.start()
             time.sleep(0.2)
         self.event("launched", nodes=self.total_nodes, observer=self.obs, mesh_security=self.a.mesh_security)
-        if self.a.l2_follower:
+        if self.a.l2_follower and self.a.l2_follower.exists():
             self.start_follower()
 
     def start_follower(self) -> None:
@@ -272,6 +272,12 @@ class Crossing(Rehearsal):
                 and epoch >= a.hf2 + 3:
             self.extra["pre_hf3_done"] = True
             self.pre_hf3_negatives()
+        if self.a.l2_follower and self.follower is None and self.a.l2_follower.exists() \
+                and os.access(self.a.l2_follower, os.X_OK):
+            # The follower may be built while the network runs; it re-verifies
+            # from the pinned genesis when it starts, so a late start is complete.
+            time.sleep(2)
+            self.start_follower()
         super().wait_epoch(epoch, slot_in_epoch)
         if self.follower and self.follower.poll() is not None and not self.extra.get("follower_exit"):
             self.extra["follower_exit"] = {"rc": self.follower.returncode, "epoch": self.clock.wall_epoch()}
