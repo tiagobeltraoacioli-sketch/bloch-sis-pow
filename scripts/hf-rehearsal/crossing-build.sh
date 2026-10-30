@@ -61,12 +61,19 @@ export_tar() { rm -rf "$2"; mkdir -p "$2"; tar -x -C "$2" -f "$1"; }
 log "fresh exports"
 export_tar "$FA_TAR" "$W/src/cand"
 export_tar "$FA_TAR" "$W/src/base"
+export_tar "$FA_TAR" "$W/src/tooling"
 NATIVE_ONLY=${NATIVE_ONLY:-0}
 [ "$NATIVE_ONLY" = 1 ] || export_tar "$N78_TAR" "$W/src/bloch-validator-payout"
 ARM="$W/src/cand/scripts/hf-rehearsal/arm.py"
 log "arm candidate (fa980367)"
 python3 -I "$ARM" "$W/src/cand" --hf1 "$HF1" --hf2 "$HF2" --hf3 "$HF3" --past-gate "$PAST" --only-listed \
   --conf "$W/crossing.conf" --report "$W/out/arming-candidate.json"
+log "arm tooling copy (candidate gates + devnet-equivocate epoch-policy patch; devnet_tools.rs only)"
+{ cat "$W/crossing.conf"; echo '!devnet-equivocate-tooling'; } > "$W/crossing-tooling.conf"
+python3 -I "$ARM" "$W/src/tooling" --hf1 "$HF1" --hf2 "$HF2" --hf3 "$HF3" --past-gate "$PAST" --only-listed \
+  --conf "$W/crossing-tooling.conf" --report "$W/out/arming-tooling.json"
+diff -r "$W/src/cand/crates/bloch-pos-committee" "$W/src/tooling/crates/bloch-pos-committee" > /dev/null \
+  || die "tooling copy changed consensus"
 log "arm baseline (past flag days only)"
 python3 -I "$ARM" "$W/src/base" --no-hf --past-gate "$PAST" --report "$W/out/arming-baseline.json"
 if [ "$NATIVE_ONLY" != 1 ]; then
@@ -97,6 +104,8 @@ log "tool example"
   CARGO_BUILD_JOBS=$JOBS capped cargo +1.94.1 build --locked --release -p bloch-pos-node --example hf3_rehearsal_tool \
   --features l2-activation-rehearsal-mainnet-policy) > "$W/build-tool.log" 2>&1 || { tail -40 "$W/build-tool.log"; die "build tool"; }
 cp "$W/target-cand/release/examples/hf3_rehearsal_tool" "$W/out/hf3_rehearsal_tool"
+native_build "$W/src/tooling" tooling "$W/target-cand"
+cp "$W/target-cand/release/bloch-pos" "$W/out/bloch-pos-tooling-REHEARSAL-ONLY"
 native_build "$W/src/base" baseline "$W/target-base"
 cp "$W/target-base/release/bloch-pos" "$W/out/bloch-pos-baseline-REHEARSAL-ONLY"
 

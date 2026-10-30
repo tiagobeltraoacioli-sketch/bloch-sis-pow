@@ -192,7 +192,7 @@ class Crossing(Rehearsal):
         try:
             proc = self.tool.run(["slh-transfer", "--dir", str(keydir),
                                   "--input", f"{alloc['txid']}:{alloc['vout']}:{alloc['sat']}",
-                                  "--to", lib.sha3_hex("00" * 32), "--base-fee", str(fee * 2), "--tip", "1000",
+                                  "--to", lib.sha3_hex("00" * 32), "--base-fee", str(fee), "--tip", "1000",
                                   "--epoch", str(self.clock.wall_epoch()), "--out", str(out)], timeout=600)
         except SoakError as e:
             return None, f"build refused: {e}"
@@ -201,6 +201,20 @@ class Crossing(Rehearsal):
         self.extra.setdefault("slh_transfers", []).append({"txid": txid, "accepted": ok, "reply": msg[:300],
                                                            "tool": proc.stdout[-300:], "epoch": self.clock.wall_epoch()})
         return (txid if ok else None), msg
+
+    def equivocate(self, validator: int, slot: int, *, to, evidence_out):
+        """rehearse.equivocate with the TOOLING binary (consensus-identical to the
+        candidate; only devnet_tools.rs differs: check_signed_by judges the block
+        under its epoch's signature policy, which the release tool does not do
+        after SIG_CANONICAL). The nodes keep running the unpatched candidate."""
+        if not self.a.equivocate_bin:
+            return super().equivocate(validator, slot, to=to, evidence_out=evidence_out)
+        real = self.cand
+        self.cand = lib.Bin(self.a.equivocate_bin.resolve(), self.env, self.work / "commands.log")
+        try:
+            return super().equivocate(validator, slot, to=to, evidence_out=evidence_out)
+        finally:
+            self.cand = real
 
     def joiner_index(self) -> int | None:
         jd = self.work / "keys" / "inv-joiner-pre-HF1"
@@ -474,6 +488,8 @@ def main() -> int:
     ap.add_argument("--baseline-bin", type=Path, required=True)
     ap.add_argument("--tool", type=Path, required=True, help="hf3_rehearsal_tool example binary")
     ap.add_argument("--l2-follower", type=Path, help="bloch-l2-native-follower built against the same rescheduled native")
+    ap.add_argument("--equivocate-bin", type=Path,
+                    help="bloch-pos built with arm.py !devnet-equivocate-tooling (devnet-equivocate only)")
     ap.add_argument("--arming", type=Path)
     ap.add_argument("--work", type=Path, required=True)
     ap.add_argument("--validators", type=int, default=8)
