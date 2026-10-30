@@ -75,8 +75,10 @@ class Crossing(Rehearsal):
             keydirs.append(d)
         # KES trees before the genesis clock starts (depth 12 takes a while).
         t0 = time.time()
-        for d in keydirs:
-            self.cand.run(["kes", "keygen", "--dir", str(d), "--depth", str(self.a.kes_depth)], timeout=3600)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(keydirs)) as pool:
+            list(pool.map(lambda d: self.cand.run(["kes", "keygen", "--dir", str(d), "--depth", str(self.a.kes_depth)],
+                                                  timeout=3600), keydirs))
         self.extra["kes_keygen_seconds"] = round(time.time() - t0, 1)
         allocs: list[tuple[str, int]] = []
         names: list[str] = []
