@@ -73,6 +73,11 @@ class Crossing(Rehearsal):
             d = self.work / "keys" / f"v{i}"
             self.base.keygen(d, i)
             keydirs.append(d)
+        # KES trees before the genesis clock starts (depth 12 takes a while).
+        t0 = time.time()
+        for d in keydirs:
+            self.cand.run(["kes", "keygen", "--dir", str(d), "--depth", str(self.a.kes_depth)], timeout=3600)
+        self.extra["kes_keygen_seconds"] = round(time.time() - t0, 1)
         allocs: list[tuple[str, int]] = []
         names: list[str] = []
         fdir = self.work / "keys" / "funder-classic"
@@ -123,13 +128,11 @@ class Crossing(Rehearsal):
 
     # ── launch: KES trees, mesh offer, L2 follower ───────────────────────
     def launch_all(self) -> None:
-        t0 = time.time()
+        # MOVE (never copy) each KES tree into its data dir before first start.
         for v in range(self.n):
-            self.cand.run(["kes", "keygen", "--dir", str(self.keydirs[v]), "--depth", str(self.a.kes_depth)], timeout=3600)
             d = self.work / f"node{v}"
             d.mkdir(parents=True, exist_ok=True)
             shutil.move(str(self.keydirs[v] / "validator.kes"), str(d / "validator.kes"))
-        self.extra["kes_keygen_seconds"] = round(time.time() - t0, 1)
         self.mesh = lib.RelayMesh(self.total_nodes, self.relay_base(), self.a.port_base + 200)
         self.mesh.start_all()
         for i in range(self.total_nodes):
@@ -271,6 +274,17 @@ class Crossing(Rehearsal):
         if self.follower and self.follower.poll() is not None and not self.extra.get("follower_exit"):
             self.extra["follower_exit"] = {"rc": self.follower.returncode, "epoch": self.clock.wall_epoch()}
             self.event("l2_follower_exited", **self.extra["follower_exit"])
+        st = self.work / "l2-follower" / "status.json"
+        if st.exists():
+            try:
+                j = json.loads(st.read_text())
+                tl = self.extra.setdefault("l2_timeline", [])
+                row = {"wall_epoch": self.clock.wall_epoch(), "verified_slot": j.get("verified_slot"),
+                       "finalized_epoch": j.get("native_finalized_epoch")}
+                if not tl or tl[-1]["verified_slot"] != row["verified_slot"]:
+                    tl.append(row)
+            except (ValueError, OSError):
+                pass
         k = self.getkes() if self.clock.wall_epoch() >= a.hf3 else None
         if k:
             self.kes_samples.append({"wall_slot": self.clock.wall_slot(), "epoch": k.get("epoch"),
@@ -430,20 +444,20 @@ class Crossing(Rehearsal):
                                      "status_keys": sorted(status)[:40], "exit": self.extra.get("follower_exit"),
                                      "status_excerpt": json.dumps(status)[:1500]}
         top_gate = max(e for _, e in self.boundaries)
-        last_slot = None
-        if (d / "state" / "index").exists() and n_index:
-            last_id = open(d / "state" / "index").read().split()[-1]
-            try:
-                b = self.rpc(0, "getblockbyid", [last_id]) if any(n.alive() for n in self.nodes) else None
-            except SoakError:
-                b = None
-            last_slot = b and b.get("slot")
-        self.extra["l2_follower"]["last_verified_slot"] = last_slot
+        fin_epoch = status.get("native_finalized_epoch")
+        vslot = status.get("verified_slot")
+        self.extra["l2_follower"].update({"verified_slot": vslot, "native_finalized_epoch": fin_epoch,
+                                          "l2_genesis": status.get("l2_genesis"),
+                                          "timeline": self.extra.get("l2_timeline", [])[-80:]})
         self.checks.ok("L2 native follower never halted", not halted and not self.extra.get("follower_exit"),
-                       self.extra["l2_follower"])
-        self.checks.ok("L2 native follower verified blocks across every gate (incl. KES enforcement)",
-                       n_index > 0 and not halted, {"verified_blocks": n_index, "last_gate_epoch": top_gate,
-                                                    "last_verified_slot": last_slot})
+                       {k: self.extra["l2_follower"][k] for k in ("verified_blocks", "halted", "exit")})
+        self.checks.ok("L2 native follower verified finalized blocks past every gate (last gate e%d)" % top_gate,
+                       not halted and fin_epoch is not None and int(fin_epoch) > top_gate and vslot is not None
+                       and int(vslot) >= (top_gate + 1) * SPE,
+                       {"verified_blocks": n_index, "verified_slot": vslot, "follower_finalized_epoch": fin_epoch,
+                        "gates": self.boundaries})
+        self.checks.ok("L2 genesis installed and finalized in the follower's verified prefix",
+                       bool(status.get("l2_genesis") and status["l2_genesis"].get("finalized")), status.get("l2_genesis"))
 
 
 def main() -> int:
