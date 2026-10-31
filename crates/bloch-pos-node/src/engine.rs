@@ -6381,6 +6381,8 @@ impl Engine {
             RpcRequest::FinalityCertificate { epoch, block, set_source_epoch } => {
                 self.finality_certificate(epoch, block, set_source_epoch)
             }
+
+            RpcRequest::LcProof { epoch, set_source_epoch, block } => self.lc_proof(epoch, set_source_epoch, block),
         }
     }
 }

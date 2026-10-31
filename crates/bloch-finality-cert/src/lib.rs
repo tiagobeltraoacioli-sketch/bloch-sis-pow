@@ -42,6 +42,9 @@
 //! denominator yields a certificate this verifier refuses. That is the safe
 //! direction for an exchange.
 
+pub mod lc_proof;
+pub mod state;
+
 use bloch_pos_committee::attestation::AttestationData;
 use bloch_pos_committee::header::{BlockHeaderV4, BlockId};
 use bloch_pos_committee::state_root::{
@@ -588,7 +591,15 @@ pub fn registry_proof(
     state: &bloch_pos_committee::transition::CommittedState,
     header: BlockHeaderV4,
 ) -> Option<RegistryProof> {
-    let tree = state.state_tree();
+    registry_proof_in(&state.state_tree(), state, header)
+}
+
+/// [`registry_proof`] against an already built `tree` of `state`.
+pub(crate) fn registry_proof_in(
+    tree: &bloch_pos_committee::state_root::Smt,
+    state: &bloch_pos_committee::transition::CommittedState,
+    header: BlockHeaderV4,
+) -> Option<RegistryProof> {
     if tree.root() != header.state_root {
         return None;
     }

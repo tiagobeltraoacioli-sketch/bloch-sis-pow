@@ -11,6 +11,7 @@
 //! test vectors for `crates/bloch-finality-cert/tests/`.
 
 use super::*;
+use bloch_finality_cert::lc_proof;
 use bloch_finality_cert::{size_report, verify, verify_chain, Certificate, HybridSigCheck, Refusal, TrustAnchors};
 
 fn cert_of(engine: &mut Engine, epoch: Option<u64>, block: Option<[u8; 32]>, src: Option<u64>) -> (Json, Certificate) {
@@ -107,6 +108,46 @@ fn real_chain_certificates_verify_chain_and_refuse_forgeries() {
         j2.get("bytes").map(|b| b.to_string()).unwrap_or_default()
     );
     let _ = jl;
+
+    // getlcproof: the same certificate as a BLCLMP01 proof, on this chain's
+    // pre-HF1 state (no frozen set, KES registration closed).
+    let lc_of = |engine: &mut Engine, epoch: Option<u64>, src: Option<u64>, block: Option<[u8; 32]>| {
+        let j = engine
+            .serve_rpc(RpcRequest::LcProof { epoch, set_source_epoch: src, block })
+            .unwrap_or_else(|e| panic!("lc proof e{epoch:?}: {e:?}"));
+        assert_eq!(j.get("format").and_then(|f| f.as_str()), Some("BLCLMP01"));
+        let hex = j.get("proof").and_then(|p| p.as_str()).expect("proof hex").to_string();
+        let bytes = bloch_finality_cert::from_hex(&hex).expect("hex");
+        let p = lc_proof::MainnetProof::decode(&bytes).expect("decodes");
+        assert_eq!(p.encode(), bytes, "canonical round trip");
+        (j, p)
+    };
+    let (lj2, l2) = lc_of(&mut engine, Some(2), None, None);
+    let (_, l3) = lc_of(&mut engine, Some(3), None, None);
+    let (lj4, l4) = lc_of(&mut engine, None, None, Some(block_in_e2));
+    assert_eq!(l2.cert, c2, "same certificate as getfinalitycertificate");
+    assert_eq!(l4.cert, c4);
+    assert_eq!(lj2.get("weights").and_then(|w| w.as_str()), Some("bond"));
+    assert_eq!(lj4.get("kes").map(|k| k.to_string()), Some("null".to_string()));
+    assert!(l2.finality_set.is_none() && l2.kes.is_none(), "no extension below the gates");
+    let cfg = lc_proof::Config::mainnet();
+    let sigs = lc_proof::HybridConsensusVerifier;
+    let mut trusted: BTreeSet<[u8; 32]> = [anchor].into_iter().collect();
+    let lc_ok = lc_proof::verify_chain(&[l2, l3, l4], &mut trusted, &cfg, &sigs)
+        .unwrap_or_else(|(i, e)| panic!("proof {i}: {e:?}"));
+    for (a, b) in ok.iter().zip(&lc_ok) {
+        assert_eq!((a.epoch, a.root, a.votes, a.stake), (b.epoch, b.root, b.votes, b.stake), "same verdict");
+    }
+    // A cached reply, and an RPC error for what this node cannot prove.
+    assert_eq!(lc_of(&mut engine, Some(2), None, None).0.to_string(), lj2.to_string());
+    assert!(engine.serve_rpc(RpcRequest::LcProof { epoch: Some(fin + 1), set_source_epoch: None, block: None }).is_err());
+    // The accessor the extension relies on commits exactly what the root does.
+    let tree = engine.state.state_tree();
+    assert_eq!(
+        tree.get(&bloch_pos_committee::state_root::finality_leaf_key()),
+        Some(bloch_pos_committee::state_root::leaf_value_hash(&engine.state.committed_finality_record().committed_bytes())),
+        "committed_finality_record must be the leaf the state root holds"
+    );
 
     if let Ok(dir) = std::env::var("BLOCH_FINCERT_VECTORS") {
         let d = std::path::Path::new(&dir);

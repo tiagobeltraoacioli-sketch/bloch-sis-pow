@@ -346,6 +346,50 @@ no consensus rule, state-root component or wire message changed.
   `crates/bloch-finality-cert/tests/vectors/README` (1.42 MB full, 1.10 MB with a
   minimal 2/3 vote subset; registry 0.44 MB, each vote 4,637 B).
 
+
+### 4.5b `getlcproof [epoch | "latest", set_source_epoch?, block?]` (2026-10-30)
+
+The certificate of section 4.5a with the state proofs needed to judge it under
+the consensus rule of its epoch. Same trust model: the client trusts one block
+id, and each verified checkpoint becomes trusted for the next. Implemented in
+`crates/bloch-pos-node/src/engine/finality_cert.rs`, with format and verifier in
+`crates/bloch-finality-cert/src/lc_proof.rs` (CLI `bloch-finality-verify`).
+RPC/library only: no consensus rule, state-root component or wire message
+changed.
+
+`proof` (hex, format `BLCLMP01`), little-endian:
+`"BLCLMP01" ‖ u32 len ‖ BLOCHFC1 certificate`, then
+`u8 has_set` `[ u32 len ‖ finality leaf ‖ PROOF ]`, then
+`u8 has_kes` `[ u8 has_bind [u64 bind epoch] ‖ PROOF ‖ u32 n ‖ n × (u32 validator ‖ u8 has_entry [u32 len ‖ KES entry] ‖ PROOF) ]`,
+where `PROOF` is `bitmap[32] ‖ u16 count ‖ count × sibling[32]`. Every proof is
+against the state root of the certificate's set-source block.
+
+- **Finality leaf (component 0x09), from HF1 (e7180).** Votes weigh the frozen
+  finality set, the chain's own weights, instead of own bond. If the leaf carries
+  a `pending` set, each link must reach two thirds of both sets. `weights` says
+  which rule applies.
+- **KES (component 0x22), once registration opens (e7360).** The bind epoch, or
+  proof that it is absent, and for each voter its entry, or proof that it has
+  none (static-key fallback). Past `KES_ACTIVATION_EPOCH` (e8620) a proof without
+  this section is refused, and that includes any bare `BLOCHFC1` certificate.
+- Reply fields: `epoch`, `root`, `checkpoint_slot`, `set_source_epoch`,
+  `set_source_root`, `justifying_source_epoch`, `votes`, `weights`
+  (`bond`/`frozen`), `kes` (`null`, or `enforced_from`, `entries`, `absent`),
+  `ancestry`, `bytes`, `format`, `proof`.
+- Votes the set source cannot judge (validator unknown to it, or not active at
+  the link's target) are left out. They weigh nothing under that set, and the
+  verifier would otherwise refuse the whole proof. A set source far behind the
+  target can still fail closed: a KES key registered or rotated after it does
+  not verify. Keep hops short, as the default set source does.
+- Node: the extensions are computed once per epoch boundary from the same state
+  tree as the registry proof and retained for the same
+  `BLOCH_FINALITY_CERT_EPOCHS` checkpoints. KES proofs cost nothing before
+  e7360. Bytes that do not match the tree's leaf are never served.
+
+`bloch-finality-verify` reads either format and applies each vote's epoch
+policy. The earlier verifier checked the v1 form only, so it refuses every
+certificate whose votes are in the bound form, from HF2 (e7270).
+
 ### 4.6 Open — vesting-lock visibility (`getvestingstatus`)
 
 With taint dissolved, the only coin-class question left is **vesting**:
