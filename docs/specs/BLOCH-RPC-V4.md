@@ -400,6 +400,11 @@ against the state root of the certificate's set-source block.
 - Operator requirement: that recovery needs the set source retained. A prover's
   follower must run with `BLOCH_FINALITY_CERT_EPOCHS` of at least 300, because
   the default of 16 epochs is about 4.3 hours and the hop bound is 256 epochs.
+  The setting is an environment variable, capped at 4096. An invalid value falls
+  back to 16 with a warning, and the node logs the retention it uses at boot.
+  The ring is not persisted. A boot from the state cache rebuilds it only from
+  blocks applied in that boot, so a follower that must serve an older set source
+  right after a restart has to boot with `--replay-from-genesis`.
 - Node: the extensions are computed once per epoch boundary from the same state
   tree as the registry proof and retained for the same
   `BLOCH_FINALITY_CERT_EPOCHS` checkpoints. KES proofs cost nothing before

@@ -159,3 +159,21 @@ fn real_chain_certificates_verify_chain_and_refuse_forgeries() {
         std::fs::write(d.join("ancestry_block.hex"), bloch_finality_cert::to_hex(&block_in_e2)).unwrap();
     }
 }
+
+#[test]
+fn the_retention_setting_is_parsed_without_refusing_to_start() {
+    use super::finality_cert::parse_cert_epochs;
+    assert_eq!(parse_cert_epochs(None), (16, None), "default");
+    assert_eq!(parse_cert_epochs(Some("0")), (0, None), "0 disables");
+    assert_eq!(parse_cert_epochs(Some("300")), (300, None), "the prover's value");
+    assert_eq!(parse_cert_epochs(Some(" 300\n")), (300, None), "whitespace from an env file");
+    assert_eq!(parse_cert_epochs(Some("4096")), (4096, None), "the limit itself");
+    let (n, why) = parse_cert_epochs(Some("5000"));
+    assert_eq!(n, 4096, "above the limit is capped");
+    assert!(why.is_some_and(|w| w.contains("above the limit")));
+    for bad in ["300x", "", "-1", "3e2"] {
+        let (n, why) = parse_cert_epochs(Some(bad));
+        assert_eq!(n, 16, "{bad:?} falls back to the default");
+        assert!(why.is_some_and(|w| w.contains("not a number")), "{bad:?} must be reported");
+    }
+}

@@ -7011,6 +7011,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // historical 0.59 s/block estimate predates the incremental eUTXO tree and
     // must not be treated as a restart SLA for this binary.
     let recovery_started = std::time::Instant::now();
+    finality_cert::announce_finality_cert_retention();
     let force_replay = parse_boot_switch(
         "BLOCH_REPLAY_FROM_GENESIS",
         std::env::var_os("BLOCH_REPLAY_FROM_GENESIS"),

@@ -30,17 +30,55 @@ use super::*;
 use bloch_finality_cert::lc_proof::{self, CheckpointExtensions, MainnetProof};
 use bloch_finality_cert::{Certificate, Link, RegistryProof, Vote};
 
+/// Most checkpoints the ring may hold, whatever the environment asks.
+const MAX_CERT_EPOCHS: usize = 4096;
+
+/// Checkpoints retained when `BLOCH_FINALITY_CERT_EPOCHS` is unset or invalid.
+const DEFAULT_CERT_EPOCHS: usize = 16;
+
+/// The smallest retention that lets a client hop across the verifier's whole
+/// default bound (256 epochs). A prover's follower needs at least this.
+const PROVER_CERT_EPOCHS: usize = 300;
+
+/// `BLOCH_FINALITY_CERT_EPOCHS` as the ring size, with what an operator should
+/// be told about the value. Never refuses to start: this is an RPC-only setting.
+pub(super) fn parse_cert_epochs(raw: Option<&str>) -> (usize, Option<String>) {
+    let Some(raw) = raw else {
+        return (DEFAULT_CERT_EPOCHS, None);
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(n) if n > MAX_CERT_EPOCHS => (
+            MAX_CERT_EPOCHS,
+            Some(format!("BLOCH_FINALITY_CERT_EPOCHS={n} is above the limit; using {MAX_CERT_EPOCHS}")),
+        ),
+        Ok(n) => (n, None),
+        Err(_) => (
+            DEFAULT_CERT_EPOCHS,
+            Some(format!("BLOCH_FINALITY_CERT_EPOCHS={raw:?} is not a number; using {DEFAULT_CERT_EPOCHS}")),
+        ),
+    }
+}
+
 /// How many checkpoint registry proofs to retain. `0` disables the feature
 /// (and its once-per-epoch cost) entirely.
 pub(super) fn finality_cert_epochs() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("BLOCH_FINALITY_CERT_EPOCHS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(16)
-            .min(4096)
-    })
+    *N.get_or_init(|| parse_cert_epochs(std::env::var("BLOCH_FINALITY_CERT_EPOCHS").ok().as_deref()).0)
+}
+
+/// Says at boot what the ring holds, so a mistyped setting on a prover's
+/// follower shows in the log and not in the first refused hop.
+pub(super) fn announce_finality_cert_retention() {
+    let raw = std::env::var("BLOCH_FINALITY_CERT_EPOCHS").ok();
+    if let Some(warning) = parse_cert_epochs(raw.as_deref()).1 {
+        eprintln!("finality-cert: WARNING: {warning}");
+    }
+    let n = finality_cert_epochs();
+    println!(
+        "finality-cert: retaining {n} checkpoint proofs (BLOCH_FINALITY_CERT_EPOCHS; a prover's \
+         follower needs at least {PROVER_CERT_EPOCHS}; the ring is rebuilt only from blocks \
+         applied in this boot, so a boot from the state cache starts it near empty)"
+    );
 }
 
 /// Built certificates are immutable once their epoch is finalized (the
