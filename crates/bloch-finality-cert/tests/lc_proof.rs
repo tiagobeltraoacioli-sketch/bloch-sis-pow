@@ -102,6 +102,8 @@ struct World {
     enforced: Option<u64>,
     /// The checkpoint epoch E (links E-1 -> E, E -> E+1).
     epoch: u64,
+    /// The bind is committed by the checkpoint's state, not the set source's.
+    bind_in_checkpoint: bool,
 }
 
 struct Built {
@@ -194,13 +196,16 @@ fn build(w: &World, voters: &[(u32, Sig)], with_set: bool, with_kes: bool) -> Bu
     for (v, e) in &entries {
         smt.insert(kes_leaf_key(*v), leaf_value_hash(&e.committed_bytes()));
     }
-    if let Some(b) = w.enforced {
+    if let Some(b) = w.enforced.filter(|_| !w.bind_in_checkpoint) {
         smt.insert(kes_enforced_leaf_key(), leaf_value_hash(&b.to_le_bytes()));
     }
+    // The checkpoint's own state, when it is the one committing the bind.
+    let mut cp_smt = Smt::new();
+    cp_smt.insert(kes_enforced_leaf_key(), leaf_value_hash(&w.enforced.unwrap_or(0).to_le_bytes()));
     let e = w.epoch;
     let src = header((e - 1) * SLOTS_PER_EPOCH - 1, [9; 32], smt.root());
     let src_id = *BlockId::of(&src).as_bytes();
-    let cp = header(e * SLOTS_PER_EPOCH - 1, src_id, [0xAB; 32]);
+    let cp = header(e * SLOTS_PER_EPOCH - 1, src_id, if w.bind_in_checkpoint { cp_smt.root() } else { [0xAB; 32] });
     let cp_id = *BlockId::of(&cp).as_bytes();
     let link = |source: (u64, [u8; 32]), target: (u64, [u8; 32])| {
         let votes = voters
@@ -235,6 +240,7 @@ fn build(w: &World, voters: &[(u32, Sig)], with_set: bool, with_kes: bool) -> Bu
         enforced: (
             w.enforced,
             compress(&match w.enforced {
+                Some(_) if w.bind_in_checkpoint => cp_smt.prove(&kes_enforced_leaf_key()).unwrap(),
                 Some(_) => smt.prove(&kes_enforced_leaf_key()).unwrap(),
                 None => smt.prove_absence(&kes_enforced_leaf_key()).unwrap(),
             }),
@@ -270,6 +276,7 @@ fn kes_world(epoch: u64) -> World {
         kes: vec![0, 1, 2],
         enforced: Some(params::HF3_KES_ENFORCE_EPOCH),
         epoch,
+        bind_in_checkpoint: false,
     }
 }
 
@@ -534,4 +541,23 @@ fn dump_a_post_kes_proof_when_asked() {
     let b = build(&kes_world(8700), &ALL, true, true);
     std::fs::write(format!("{dir}/post-kes-e8700.bin"), b.proof.encode()).unwrap();
     std::fs::write(format!("{dir}/post-kes-e8700.src"), bloch_finality_cert::to_hex(&b.src_id)).unwrap();
+}
+
+/// The bind crossing, found on a forced-KES private chain: the last checkpoint
+/// before the bind has a set source that cannot commit it, yet its finalizing
+/// link is KES-signed. Without the checkpoint-state rule a proof chain stops here.
+#[test]
+fn the_last_checkpoint_before_the_bind_verifies_from_its_own_state_root() {
+    let mut w = kes_world(8700);
+    w.enforced = Some(8701);
+    w.bind_in_checkpoint = true;
+    let v = run(&build(&w, &ALL, true, true)).expect("crosses the bind");
+    assert_eq!(v.kes_votes, 3, "validators 0..2 sign only the finalizing link with KES leaves");
+    // The justifying link still decides the checkpoint: below 2/3 it is refused.
+    let few = [(3, Sig::Proper)];
+    assert!(matches!(run(&build(&w, &few, true, true)).unwrap_err(), Refusal::InsufficientWeight { link: 0, .. }));
+    // A bind at or before E must come from the set source.
+    let mut w = kes_world(8700);
+    w.bind_in_checkpoint = true;
+    assert_eq!(run(&build(&w, &ALL, true, true)).unwrap_err(), Refusal::Kes("bind epoch not proven"));
 }

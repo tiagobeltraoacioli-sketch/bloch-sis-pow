@@ -323,13 +323,19 @@ impl Engine {
         let set_source_id = *bloch_pos_committee::header::BlockId::of(&cert.registry.header).as_bytes();
         lc_proof::retain_provable_votes(&mut cert);
         let voters: BTreeSet<u32> = cert.links.iter().flat_map(|l| l.votes.iter().map(|v| v.validator)).collect();
-        let ext = self
-            .finality_certs
-            .extensions
-            .iter()
-            .find(|(id, _)| *id == set_source_id)
-            .map(|(_, x)| x.for_voters(&voters))
-            .unwrap_or_default();
+        let extensions_of = |id: &[u8; 32]| self.finality_certs.extensions.iter().find(|(x, _)| x == id).map(|(_, x)| x);
+        let mut ext = extensions_of(&set_source_id).map(|x| x.for_voters(&voters)).unwrap_or_default();
+        // The bind crossing: see `lc_proof::verify`. The set source does not
+        // commit the bind yet, but the checkpoint does, for a later epoch.
+        let checkpoint_id = cert.root();
+        if let Some(k) = ext.kes.as_mut().filter(|k| k.enforced.0.is_none()) {
+            if let Some(bind) = extensions_of(&checkpoint_id)
+                .and_then(|x| x.kes.as_ref())
+                .filter(|c| c.enforced.0.is_some_and(|b| b > e))
+            {
+                k.enforced = bind.enforced.clone();
+            }
+        }
         let votes = [cert.links[0].votes.len() as u64, cert.links[1].votes.len() as u64];
         let weights = if ext.finality_set.is_some() { "frozen" } else { "bond" };
         let kes_json = match &ext.kes {

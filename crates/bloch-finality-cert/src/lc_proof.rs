@@ -262,7 +262,26 @@ pub fn verify(
         Some(kp) => {
             let (enforced, ep) = &kp.enforced;
             let ok = match enforced {
-                Some(epoch) => prove_leaf(&root, &kes_enforced_leaf_key(), &epoch.to_le_bytes(), ep),
+                // The bind crossing. The set source of the last checkpoint
+                // before the bind cannot commit the bind, but its finalizing
+                // link is already KES-signed, and with no way past this one
+                // checkpoint a chain of proofs would stop for good. A bind
+                // strictly after E may therefore be proven against the
+                // checkpoint's own state root: the justifying link has
+                // target E < bind, so it is judged by static keys, and step 6
+                // checks it, quorum included, before the finalizing link is
+                // judged under this bind. The state root is thus backed by two
+                // thirds of the set source's weight.
+                Some(epoch) => {
+                    prove_leaf(&root, &kes_enforced_leaf_key(), &epoch.to_le_bytes(), ep)
+                        || (*epoch > e
+                            && prove_leaf(
+                                &cert.checkpoint_header.state_root,
+                                &kes_enforced_leaf_key(),
+                                &epoch.to_le_bytes(),
+                                ep,
+                            ))
+                }
                 None => prove_absent(&root, &kes_enforced_leaf_key(), ep),
             };
             if !ok {

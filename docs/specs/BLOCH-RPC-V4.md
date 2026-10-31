@@ -381,6 +381,15 @@ against the state root of the certificate's set-source block.
   verifier would otherwise refuse the whole proof. A set source far behind the
   target can still fail closed: a KES key registered or rotated after it does
   not verify. Keep hops short, as the default set source does.
+- The bind crossing: the last checkpoint before the bind has a set source that
+  cannot commit the bind, while its finalizing link is already KES-signed. For a
+  bind strictly after `epoch`, the bind leaf is proven against the checkpoint's
+  own state root, which the justifying link (static keys, checked first) backs.
+  A hop cannot skip the bind: from a set source before it, later checkpoints are
+  refused, so a client takes the crossing checkpoint first.
+- A checkpoint can verify short of two thirds in its listed votes after a stall,
+  because votes come from canonical blocks of the target epoch. The refusal is
+  closed; the client asks for a later checkpoint from the same set source.
 - Node: the extensions are computed once per epoch boundary from the same state
   tree as the registry proof and retained for the same
   `BLOCH_FINALITY_CERT_EPOCHS` checkpoints. KES proofs cost nothing before
