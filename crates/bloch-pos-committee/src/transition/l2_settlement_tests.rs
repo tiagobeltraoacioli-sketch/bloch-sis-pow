@@ -2926,6 +2926,27 @@ mod l2_tests {
         assert_eq!(next.l2_settlement().unwrap().settled_number(), 1);
     }
 
+    /// A real proof of the candidate program against the native verifier, with
+    /// BLOCH_NEXT_VALUES and BLOCH_NEXT_PROOF naming the settler-format files.
+    /// The statement is a synthetic empty block; L1 would refuse its source.
+    #[test]
+    #[ignore = "needs a real proof of the candidate program"]
+    fn next_program_real_groth16_passes_the_native_verifier() {
+        let values = std::fs::read(std::env::var_os("BLOCH_NEXT_VALUES").unwrap()).unwrap();
+        let proof = std::fs::read(std::env::var_os("BLOCH_NEXT_PROOF").unwrap()).unwrap();
+        let next = mainnet::PROGRAM_NEXT;
+        let key = next.identities[3];
+        assert!(bloch_l2_proof::verify(&next.proof_policy, &key, &values, &proof));
+        let old = mainnet::PROGRAM.unwrap();
+        assert!(!bloch_l2_proof::verify(&old.proof_policy, &old.identities[6], &values, &proof));
+        let mut flipped = proof.clone();
+        flipped[100] ^= 1;
+        assert!(!bloch_l2_proof::verify(&next.proof_policy, &key, &values, &flipped));
+        let mut changed = values.clone();
+        changed[700] ^= 1;
+        assert!(!bloch_l2_proof::verify(&next.proof_policy, &key, &changed, &proof));
+    }
+
     #[test]
     fn the_release_rule_follows_the_program() {
         let leaves = [([1; 32], 1_000_000), ([2; 32], 200 * BLCH), ([3; 32], 300 * BLCH)];
