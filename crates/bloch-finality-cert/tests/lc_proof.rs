@@ -104,6 +104,8 @@ struct World {
     epoch: u64,
     /// The bind is committed by the checkpoint's state, not the set source's.
     bind_in_checkpoint: bool,
+    /// The finality leaf commits no frozen set yet.
+    no_set_in_leaf: bool,
 }
 
 struct Built {
@@ -124,7 +126,7 @@ fn finality_record(w: &World) -> FinalityRecord {
         finalized: cp(w.epoch - 3),
         leaked: vec![LeakRecord { validator: 2, leaked_sat: 7 }],
         next_epoch: w.epoch - 1,
-        finality_set: Some(FinalitySetRecord {
+        finality_set: (!w.no_set_in_leaf).then(|| FinalitySetRecord {
             current_epoch: w.epoch - 4,
             current: w.frozen.clone(),
             pending: w.pending.clone().map(|p| (w.epoch - 3, p)),
@@ -277,6 +279,7 @@ fn kes_world(epoch: u64) -> World {
         enforced: Some(params::HF3_KES_ENFORCE_EPOCH),
         epoch,
         bind_in_checkpoint: false,
+        no_set_in_leaf: false,
     }
 }
 
@@ -383,14 +386,47 @@ fn a_forged_kes_entry_is_refused() {
 /// The frozen set, not the bond, decides: 0+1 hold 70 % of the frozen set
 /// but 50 % of the bond; 1+2+3 hold 60 % of the set but 75 % of the bond.
 #[test]
-fn frozen_weights_and_bond_weights_give_different_verdicts() {
+fn frozen_weights_decide_where_bond_weights_would_differ() {
     let w = kes_world(8700);
     let a = [(0, Sig::Proper), (1, Sig::Proper)];
     assert!(run(&build(&w, &a, true, true)).is_ok());
-    assert!(matches!(run(&build(&w, &a, false, true)).unwrap_err(), Refusal::InsufficientWeight { .. }));
     let b = [(1, Sig::Proper), (2, Sig::Proper), (3, Sig::Proper)];
     assert!(matches!(run(&build(&w, &b, true, true)).unwrap_err(), Refusal::InsufficientWeight { .. }));
-    assert!(run(&build(&w, &b, false, true)).is_ok());
+}
+
+/// A prover must not choose the weight rule by omitting the leaf: these voters
+/// reach 2/3 of bond but not of the frozen set.
+#[test]
+fn a_prover_cannot_choose_the_bond_rule_past_the_frozen_gate() {
+    let w = kes_world(8700);
+    let b = [(1, Sig::Proper), (2, Sig::Proper), (3, Sig::Proper)];
+    assert!(matches!(run(&build(&w, &b, false, true)).unwrap_err(), Refusal::FinalitySet(_)));
+}
+
+/// The fold of an epoch runs at its closing boundary, so the set source of the
+/// gate epoch's last block commits no set yet. That block must still prove its
+/// leaf; only then, and only there, the bond rule applies.
+#[test]
+fn only_the_gate_epochs_set_source_may_prove_a_leaf_without_a_set() {
+    let voters: Vec<(u32, Sig)> = (0..4).map(|v| (v, Sig::StaticV1)).collect();
+    let gate = params::HF1_FROZEN_FINALITY_SET_EPOCH;
+    let world = |epoch| {
+        let mut w = kes_world(epoch);
+        w.kes = vec![];
+        w.enforced = None;
+        w
+    };
+    // Set source's block in the last pre-gate epoch: the leaf is optional.
+    assert_eq!(run(&build(&world(gate + 1), &voters, false, false)).unwrap().weights, Weights::Bond);
+    // In the gate epoch: omission is refused, a proven set-less leaf is bond.
+    let mut w = world(gate + 2);
+    assert!(matches!(run(&build(&w, &voters, false, false)).unwrap_err(), Refusal::FinalitySet(_)));
+    w.no_set_in_leaf = true;
+    assert_eq!(run(&build(&w, &voters, true, false)).unwrap().weights, Weights::Bond);
+    // Past it, a state with no set is not a state of this chain.
+    let mut w = world(gate + 3);
+    w.no_set_in_leaf = true;
+    assert!(matches!(run(&build(&w, &voters, true, false)).unwrap_err(), Refusal::FinalitySet(_)));
 }
 
 #[test]
@@ -467,7 +503,7 @@ fn the_released_certificate_verifier_refuses_kes_votes() {
     let anchors = bloch_finality_cert::TrustAnchors::new([b.src_id]);
     let err = bloch_finality_cert::verify(&b.proof.cert, &anchors, &bloch_finality_cert::HybridSigCheck).unwrap_err();
     assert!(matches!(err, bloch_finality_cert::Refusal::BadSignature { validator: 0, .. }), "{err:?}");
-    assert!(run(&b).is_ok());
+    assert!(run(&build(&kes_world(8700), &ALL, true, true)).is_ok());
 }
 
 /// The second step of the same finding, reached first on the calendar: from
@@ -481,7 +517,7 @@ fn the_released_certificate_verifier_refuses_hf2_votes_and_this_one_does_not() {
     let anchors = bloch_finality_cert::TrustAnchors::new([b.src_id]);
     let err = bloch_finality_cert::verify(&b.proof.cert, &anchors, &bloch_finality_cert::HybridSigCheck).unwrap_err();
     assert!(matches!(err, bloch_finality_cert::Refusal::BadSignature { validator: 0, .. }), "{err:?}");
-    assert_eq!(run(&b).expect("policy-aware").weights, Weights::Bond);
+    assert!(run(&build(&w, &ALL, true, false)).is_ok(), "policy-aware");
 }
 
 /// A voter the set source does not know, or one already out at the target,

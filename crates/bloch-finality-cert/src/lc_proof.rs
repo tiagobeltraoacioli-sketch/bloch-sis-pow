@@ -11,14 +11,15 @@
 //!
 //! * from `params::SIG_CANONICAL_ACTIVATION_EPOCH` (HF2) votes use the bound v2
 //!   form. Votes here go through `PolicyVerifier::consensus`, the call the
-//!   transition makes, so the certificate alone keeps verifying;
+//!   transition makes;
 //! * from the KES bind (`params::KES_ACTIVATION_EPOCH` or later) a registered
 //!   validator signs with a KES leaf, and its key lives in component 0x22.
 //!   [`KesProofs`] proves the bind epoch and each voter's entry or absence.
 //!
 //! [`FinalitySetProof`] adds the finality leaf (0x09) so that, from HF1, votes
-//! are weighed by the frozen finality set the chain itself uses instead of the
-//! stricter own-bond rule of a bare certificate. See `docs/specs/BLOCH-RPC-V4.md`
+//! are weighed by the frozen finality set the chain itself uses. It is mandatory
+//! from a set source in the gate epoch on, so a bare certificate stops verifying
+//! there. See `docs/specs/BLOCH-RPC-V4.md`
 //! section 4.5b and `docs/LC-MAINNET-PATH.md` on the light-client branch, whose
 //! `ffg` module is the origin of this rule and shares this wire format.
 
@@ -194,16 +195,28 @@ pub fn verify(
     }
     let root = src.state_root;
 
-    // 3. Weights: the frozen finality set if proven, else the bond rule.
+    // 3. Weights. No choice of rule: bond and frozen weights disagree in both
+    //    directions, so a prover free to omit the leaf could pick the rule that
+    //    accepts. From the gate epoch on the leaf is mandatory. An epoch's fold
+    //    runs at its closing boundary, so a set source in the gate epoch commits
+    //    no set yet: only there may a proven leaf without a set mean bond.
+    let src_epoch = epoch_of(src.slot);
+    let gate = params::HF1_FROZEN_FINALITY_SET_EPOCH;
     let frozen: Option<(FrozenSet, Option<FrozenSet>)> = match &p.finality_set {
+        None if src_epoch >= gate => {
+            return Err(Refusal::FinalitySet("finality leaf required from the frozen-set gate"));
+        }
         None => None,
         Some(fp) => {
             if !prove_leaf(&root, &finality_leaf_key(), &fp.leaf, &fp.proof) {
                 return Err(Refusal::FinalitySet("leaf not committed"));
             }
             let leaf = FinalityLeaf::decode(&fp.leaf).ok_or(Refusal::FinalitySet("malformed leaf"))?;
-            let set = leaf.finality_set.ok_or(Refusal::FinalitySet("no frozen set in this state"))?;
-            Some((set.current, set.pending))
+            match leaf.finality_set {
+                Some(set) => Some((set.current, set.pending)),
+                None if src_epoch <= gate => None,
+                None => return Err(Refusal::FinalitySet("no frozen set in this state")),
+            }
         }
     };
 
@@ -593,7 +606,7 @@ pub fn checkpoint_proofs(
 ) -> Option<(RegistryProof, CheckpointExtensions)> {
     let tree = state.state_tree();
     let registry = crate::registry_proof_in(&tree, state, header)?;
-    let finality_set = finality_set_proof(&tree, state);
+    let finality_set = finality_set_proof(&tree, state, epoch_of(header.slot));
     let kes = kes_proofs(&tree, state, epoch_of(header.slot));
     Some((registry, CheckpointExtensions { finality_set, kes }))
 }
@@ -605,9 +618,14 @@ fn compress(p: &bloch_pos_committee::state_root::InclusionProof) -> CompressedPr
 fn finality_set_proof(
     tree: &Smt,
     state: &bloch_pos_committee::transition::CommittedState,
+    epoch: u64,
 ) -> Option<FinalitySetProof> {
     let record = state.committed_finality_record();
-    record.finality_set.as_ref()?;
+    // Pre-gate blocks need no leaf; a block of the gate epoch serves its leaf
+    // even without a set, because `verify` requires it there.
+    if record.finality_set.is_none() && epoch < params::HF1_FROZEN_FINALITY_SET_EPOCH {
+        return None;
+    }
     let leaf = record.committed_bytes();
     let key = finality_leaf_key();
     // The tree is the authority: bytes it does not commit are never served.

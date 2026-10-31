@@ -15,9 +15,10 @@
 //! one JSON line per proof on stdout.
 //!
 //! Votes are judged by the consensus rule of their epoch: the v1 or bound v2
-//! form, and KES leaves once KES binds. Past the KES gate a bare `BLOCHFC1`
-//! certificate is refused, because it cannot prove which key a voter signs
-//! with: use `getlcproof`. `--network-domain` defaults to Genesis-4 mainnet's
+//! form, and KES leaves once KES binds. A bare `BLOCHFC1` certificate is refused
+//! from a set source in the frozen-set gate epoch (e7180) on, because it does not
+//! prove the weights, and past the KES gate, because it does not prove the keys:
+//! use `getlcproof`. `--network-domain` defaults to Genesis-4 mainnet's
 //! and is what KES signatures commit to (`getvalidatoradmission`).
 
 use bloch_finality_cert::lc_proof::{self, Config, HybridConsensusVerifier, MainnetProof, Weights};

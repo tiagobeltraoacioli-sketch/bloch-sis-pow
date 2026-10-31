@@ -367,7 +367,10 @@ against the state root of the certificate's set-source block.
 - **Finality leaf (component 0x09), from HF1 (e7180).** Votes weigh the frozen
   finality set, the chain's own weights, instead of own bond. If the leaf carries
   a `pending` set, each link must reach two thirds of both sets. `weights` says
-  which rule applies.
+  which rule applies. The leaf is mandatory from a set source in e7180 on, so a
+  prover cannot choose the rule by omitting it, and a bare `BLOCHFC1` certificate
+  is refused there. An epoch's fold runs at its closing boundary, so a set source
+  in e7180 itself commits no set yet: its proven leaf without a set means bond.
 - **KES (component 0x22), once registration opens (e7360).** The bind epoch, or
   proof that it is absent, and for each voter its entry, or proof that it has
   none (static-key fallback). Past `KES_ACTIVATION_EPOCH` (e8620) a proof without
@@ -387,17 +390,25 @@ against the state root of the certificate's set-source block.
   own state root, which the justifying link (static keys, checked first) backs.
   A hop cannot skip the bind: from a set source before it, later checkpoints are
   refused, so a client takes the crossing checkpoint first.
-- A checkpoint can verify short of two thirds in its listed votes after a stall,
-  because votes come from canonical blocks of the target epoch. The refusal is
-  closed; the client asks for a later checkpoint from the same set source.
+- `epoch <= finalized` does not mean finalized directly. A checkpoint that
+  became final only as an ancestor of a later one can be served with votes below
+  two thirds on its finalizing link, and the verifier refuses it, correctly.
+  Example from a private chain: three of seven validators stopped in e31, e30 was
+  never finalized directly, and it became final as an ancestor of e38. The client
+  asks for the next directly finalized checkpoint from the same set source
+  (`getlcproof [38, 29]`).
+- Operator requirement: that recovery needs the set source retained. A prover's
+  follower must run with `BLOCH_FINALITY_CERT_EPOCHS` of at least 300, because
+  the default of 16 epochs is about 4.3 hours and the hop bound is 256 epochs.
 - Node: the extensions are computed once per epoch boundary from the same state
   tree as the registry proof and retained for the same
   `BLOCH_FINALITY_CERT_EPOCHS` checkpoints. KES proofs cost nothing before
   e7360. Bytes that do not match the tree's leaf are never served.
 
 `bloch-finality-verify` reads either format and applies each vote's epoch
-policy. The earlier verifier checked the v1 form only, so it refuses every
-certificate whose votes are in the bound form, from HF2 (e7270).
+policy, with the certificate alone accepted only below e7180. The earlier
+verifier checked the v1 form only, so it refuses every certificate whose votes
+are in the bound form, from HF2 (e7270).
 
 ### 4.6 Open — vesting-lock visibility (`getvestingstatus`)
 

@@ -337,7 +337,10 @@ impl Engine {
             }
         }
         let votes = [cert.links[0].votes.len() as u64, cert.links[1].votes.len() as u64];
-        let weights = if ext.finality_set.is_some() { "frozen" } else { "bond" };
+        let has_set = |fs: &lc_proof::FinalitySetProof| {
+            bloch_finality_cert::state::FinalityLeaf::decode(&fs.leaf).is_some_and(|l| l.finality_set.is_some())
+        };
+        let weights = if ext.finality_set.as_ref().is_some_and(has_set) { "frozen" } else { "bond" };
         let kes_json = match &ext.kes {
             None => Json::Null,
             Some(k) => Json::Obj(vec![
