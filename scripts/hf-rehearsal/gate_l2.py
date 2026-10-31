@@ -236,6 +236,24 @@ exec /usr/bin/flock {LOCK} /usr/bin/systemd-run --user --scope -q -p MemoryMax=6
             self.spawn(f'agent{i}', ['/usr/bin/python3', '-u', Path(__file__).resolve(), 'agent', i],
                        {k: os.environ[k] for k in os.environ if k.startswith('GL_')})
 
+    def adopt(self):
+        """Resume after a driver restart: the stack keeps running, only the driver's state is rebuilt."""
+        class Pid:
+            def __init__(self, pid):
+                self.pid, self.returncode = pid, None
+
+            def poll(self):
+                try:
+                    os.kill(self.pid, 0)
+                except ProcessLookupError:
+                    self.returncode = -1
+                return self.returncode
+        for f in RUN.glob('*.pid'):
+            self.pids[f.stem] = Pid(int(f.read_text()))
+        for name in ('alice', 'bob'):
+            self.st[f'addr_{name}'] = produce('address', '--key', RUN / f'{name}.l2.key')['address']
+        log('adopted', processes=sorted(self.pids), epoch=self.epoch())
+
     def wallet_input(self):
         utxos = rpc('getutxos', [self.scripts['wallet'], 64]).get('utxos', [])
         u = max(utxos, key=lambda u: int(u['value_sat']))
@@ -440,21 +458,24 @@ exec /usr/bin/flock {LOCK} /usr/bin/systemd-run --user --scope -q -p MemoryMax=6
     def watch(self):
         while self.epoch() < L2_EPOCH + 1:
             time.sleep(1)
-        self.start()
-        self.deposit('alice', 3_000 * BLCH)
-        self.deposit('bob', 50 * BLCH)
+        if (RUN / 'settler.json').exists():
+            self.adopt()
+        else:
+            self.start()
+            self.deposit('alice', 3_000 * BLCH)
+            self.deposit('bob', 50 * BLCH)
         while self.epoch() < STOP - 3:
             try:
                 self.health()
                 snap, status = self.observe()
                 ep = snap['epoch']
                 if time.time() - self.last_traffic > 300 and (snap['l2_head'] or 0) >= 1:
+                    self.last_traffic = time.time()  # also paces retries while the first deposit is unsettled
                     want_large = any(ep >= at and at not in self.large_done for at in LARGE_AT)
                     self.deposit('bob' if self.st['traffic'] % 2 else 'alice', 2 * BLCH)
                     self.traffic(want_large)
                     if want_large:
                         self.large_done.update(at for at in LARGE_AT if ep >= at)
-                    self.last_traffic = time.time()
                 self.claims()
                 for name, gate in GATES:
                     if ep >= gate:
