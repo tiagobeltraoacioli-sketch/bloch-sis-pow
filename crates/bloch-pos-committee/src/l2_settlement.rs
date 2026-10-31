@@ -578,9 +578,19 @@ pub mod withdrawal {
             let share = escrow_sat.saturating_mul(u128::from(limits.release_window_bps)) / 10_000;
             Self { window, released: 0, cap: share.max(u128::from(limits.release_floor_sat)) }
         }
-        /// Whether `sats` more fits. An `exempt` claim (see
-        /// [`RELEASE_WINDOW_BPS`]) may exceed the cap as the window's first.
+        /// Whether `sats` more fits under the next program's rule. An `exempt`
+        /// claim (see [`RELEASE_WINDOW_BPS`]) may exceed the cap once per window,
+        /// whatever smaller claims came before it. A claim without the exemption
+        /// never takes `released` above the cap, so `released > cap` means exactly
+        /// that the window's one exemption is spent, and no new state is needed.
+        /// A window therefore releases at most its cap plus one exempt claim.
         pub fn admits(&self, sats: u64, exempt: bool) -> bool {
+            self.released.saturating_add(u128::from(sats)) <= self.cap || (exempt && self.released <= self.cap)
+        }
+        /// The rule of the program the epoch-5850 activation pinned: an `exempt`
+        /// claim may exceed the cap only as the window's first, so any small claim
+        /// landing first closes the exemption for the whole window.
+        pub fn admits_v1(&self, sats: u64, exempt: bool) -> bool {
             self.released.saturating_add(u128::from(sats)) <= self.cap || (exempt && self.released == 0)
         }
         /// Room left in the window (an exempt first claim may exceed it).
@@ -996,6 +1006,30 @@ pub mod mainnet {
     /// `--assemble`): set hash
     /// `1c06adbb7fef042f58d7efd11587689e324c036c3b467081a63b1cf79caccc4b`.
     pub const ATTESTOR_SET: Option<&str> = Some(include_str!("../l2-mainnet/attestors.set"));
+
+    /// CANDIDATE, not scheduled: the program that replaces [`PROGRAM`] at
+    /// [`crate::params::L2_NEXT_PROGRAM_EPOCH`]. Identities 0, 1 and 2, the
+    /// genesis pins, the attestor set and the limits stay as activated.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct NextProgram {
+        /// Replaces identities 3 (configuration), 4 (ELF), 5 and 6 (keys).
+        pub identities: [[u8; 32]; 4],
+        pub proof_policy: [u8; 32],
+    }
+    /// `settlement_v3_mainnet` of bloch-l2-evm `codex/l2-next-consensus-r3-20261031`
+    /// 776c6cb: guest ELF SHA-256 `44d4c9d7…ce47` (3 076 992 bytes, macOS x86_64).
+    /// The configuration carries a PLACEHOLDER fee-sweep recipient, `TBD-owner`,
+    /// so these four values change once the recipient is fixed.
+    pub const PROGRAM_NEXT: NextProgram = NextProgram {
+        identities: [
+            h32("975ec2585246abeaea86421dd5726918b632dd91a246f635fe74990b68bcd878"),
+            h32("f3c20f71b84bb09cbab76a75c83a62c507fbefff4b347f787ef2d89aceb6f2b8"),
+            h32("50bd69a513f2463e748a8a62277bc25a08df69a4420a660e2a2ee3f957dca9f7"),
+            h32("00a17ad34a4fc918fba454531277bc25a11bed3490829983951771fcd7dca9f7"),
+        ],
+        // The wrapper VK and the V3 tag are unchanged, so the policy is too.
+        proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
+    };
 
     /// The L2 program and genesis the activation pins: the seven V2
     /// identities (Genesis-4 admission domain, native genesis, L2 domain,
@@ -1501,6 +1535,32 @@ impl State {
     pub fn attestation_required(&self, sats: u64) -> bool {
         self.policy.attestor_set != [0; 32] && sats >= self.profile.limits.large_claim_sat
     }
+    /// Replace the program at the compiled gate. The state keeps its head, inbox,
+    /// claims and window, and `source_at` binds only identities 0 to 2, so the
+    /// frozen source survives. A statement of the old program gets
+    /// [`Reject::Policy`] from here on and must be proved again. Acts only on the
+    /// exact policy the activation pinned, so it runs once and on no other L2.
+    /// Blocks before the gate replay unchanged, because nothing here runs for them.
+    pub(crate) fn install_next_program(&mut self) {
+        let Some(pinned) = mainnet::PROGRAM else { return };
+        if self.policy.identities == pinned.identities && self.policy.proof_policy == pinned.proof_policy {
+            self.replace_program(&mainnet::PROGRAM_NEXT);
+        }
+    }
+    fn replace_program(&mut self, next: &mainnet::NextProgram) {
+        self.policy.identities[3..7].copy_from_slice(&next.identities);
+        self.policy.proof_policy = next.proof_policy;
+    }
+    /// Test hook: move any L2 to `next`, for settlement checks across the swap.
+    #[cfg(test)]
+    pub(crate) fn replace_program_for_test(&mut self, next: &mainnet::NextProgram) {
+        self.replace_program(next);
+    }
+    /// Whether the next program's release rule applies. The rule follows from
+    /// the committed policy, so it adds no state bytes.
+    pub fn next_program_active(&self) -> bool {
+        self.policy.identities[4] == mainnet::PROGRAM_NEXT.identities[1]
+    }
     /// The release window a claim in the next native block sees.
     pub fn release_window(&self) -> withdrawal::ReleaseWindow {
         self.release_window.at(&self.profile.limits, self.native_height.saturating_add(1), self.escrow_sat)
@@ -1582,7 +1642,10 @@ impl State {
         if self.escrow_sat < u128::from(sats) {
             return Err(R::Escrow);
         }
-        if !self.release_window().admits(sats, self.window_exempt(attested)) {
+        let window = self.release_window();
+        let exempt = self.window_exempt(attested);
+        let admitted = if self.next_program_active() { window.admits(sats, exempt) } else { window.admits_v1(sats, exempt) };
+        if !admitted {
             return Err(R::RateLimited);
         }
         Ok(record)

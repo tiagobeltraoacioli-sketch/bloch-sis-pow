@@ -6163,6 +6163,13 @@ impl CommittedState {
                 }
             }
         }
+        // The next L2 program. Inert while `L2_NEXT_PROGRAM_EPOCH` is the
+        // sentinel; L2 bytes are unchanged below the gate and on any other L2.
+        if crate::params::l2_next_program_active(next_epoch) {
+            if let Some(l2) = st.l2_settlement.as_mut() {
+                l2.install_next_program();
+            }
+        }
         // Claim finality on this chain (HF1_CLAIM_FINALITY_EPOCH):
         // record this chain's checkpoint of the epoch being opened. `head` is
         // still the parent here — the last block strictly before the new

@@ -2729,6 +2729,33 @@ pub(crate) fn native_claim_finality_active(epoch: u64) -> bool {
     epoch_gate_active(epoch, HF1_CLAIM_FINALITY_EPOCH)
 }
 
+/// CANDIDATE, not scheduled: the epoch boundary that replaces the mainnet L2
+/// program with `l2_settlement::mainnet::PROGRAM_NEXT` (timestamp and prevrandao
+/// bound in the guest, fee-vault sweep, and the release rule of
+/// `ReleaseWindow::admits`). `u64::MAX` means INERT. No epoch has been chosen.
+pub const L2_NEXT_PROGRAM_EPOCH: u64 = u64::MAX;
+const _: () = assert!(gate_is_inert_or_not_before(L2_NEXT_PROGRAM_EPOCH, HF3_KES_ENFORCE_EPOCH));
+
+pub(crate) fn l2_next_program_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_next_program_test::forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_NEXT_PROGRAM_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_next_program_test {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod native_claim_finality_test {
     use std::cell::Cell;

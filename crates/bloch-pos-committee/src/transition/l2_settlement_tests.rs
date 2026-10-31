@@ -2830,7 +2830,137 @@ mod l2_tests {
         assert!(!fresh.admits(100 * BLCH + 1, false));
         assert!(fresh.admits(100 * BLCH + 1, true));
         let after = wd::ReleaseWindow { released: 1, ..fresh };
-        assert!(!after.admits(100 * BLCH, true));
+        assert!(!after.admits_v1(100 * BLCH, true));
+        // The next program: one exemption per window, whatever came first.
+        assert!(after.admits(100 * BLCH, true));
+        assert!(!after.admits(100 * BLCH, false));
+        let full = wd::ReleaseWindow { released: sat(100), ..fresh };
+        assert!(full.admits(200 * BLCH, true), "claims filling the cap do not spend the exemption");
+        assert!(!full.admits(1, false));
+        let spent = wd::ReleaseWindow { released: sat(100) + 1, ..fresh };
+        assert!(!spent.admits(1, true), "one exemption per window");
+        assert!(!spent.admits(1, false));
+    }
+
+    // ── The next L2 program (candidate; the gate stays the sentinel) ──
+
+    fn mainnet_l2_state() -> crate::l2_settlement::State {
+        crate::l2_settlement::State::activated(mainnet::activation().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn next_program_gate_is_inert_and_chooses_no_epoch() {
+        assert_eq!(crate::params::L2_NEXT_PROGRAM_EPOCH, u64::MAX);
+        for epoch in [0, 5_850, 8_620, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::l2_next_program_active(epoch));
+        }
+        let (pinned, next) = (mainnet::PROGRAM.unwrap(), mainnet::PROGRAM_NEXT);
+        assert_eq!(next.proof_policy, pinned.proof_policy, "the circuits and the tag stay");
+        for (a, b) in next.identities.iter().zip(&pinned.identities[3..7]) {
+            assert_ne!(a, b);
+        }
+    }
+
+    #[test]
+    fn next_program_replaces_only_the_program_at_the_gate_and_only_on_mainnet() {
+        let (mut pre, _) = fixture();
+        let other = pre.l2_settlement().unwrap().clone();
+        // Below the gate nothing moves on an epoch boundary.
+        pre.l2_settlement = Some(mainnet_l2_state());
+        let below = pre.close_epoch();
+        let before = pre.l2_settlement().unwrap().clone();
+        assert_eq!(below.l2_settlement().unwrap().policy(), before.policy());
+        assert!(!below.l2_settlement().unwrap().next_program_active());
+
+        let _gate = crate::params::l2_next_program_test::open();
+        let crossed = pre.close_epoch();
+        let after = crossed.l2_settlement().unwrap();
+        let (old, new) = (before.policy(), after.policy());
+        assert_eq!(new.identities[..3], old.identities[..3]);
+        assert_eq!(new.identities[3..7], mainnet::PROGRAM_NEXT.identities);
+        assert_eq!(new.proof_policy, old.proof_policy);
+        assert_eq!(new.chain_id, old.chain_id);
+        assert_eq!(new.initial_l2_parent, old.initial_l2_parent);
+        assert_eq!(new.initial_l2_state, old.initial_l2_state);
+        assert_eq!(new.attestor_set, old.attestor_set);
+        assert_eq!(after.limits(), before.limits());
+        assert!(after.next_program_active());
+        assert_ne!(crossed.state_root(), below.state_root(), "the policy is committed");
+        // A later boundary keeps the same program.
+        assert_eq!(crossed.close_epoch().l2_settlement().unwrap().policy(), new);
+
+        // An L2 on any other policy is left alone.
+        pre.l2_settlement = Some(other.clone());
+        assert_eq!(pre.close_epoch().l2_settlement().unwrap().policy(), other.policy());
+    }
+
+    #[test]
+    fn settlements_follow_the_program_across_the_swap() {
+        let (pre, mut chains) = fixture();
+        let t = Transition::new(ProofDouble);
+
+        // One settlement under the old program.
+        let old_tx = PosTransaction::L2Settlement(Box::new(transaction(&pre)));
+        let block = build_block(&t, &pre, 2, &[], std::slice::from_ref(&old_tx), &mut chains);
+        let settled = t.apply_block(&pre, &block, &[], std::slice::from_ref(&old_tx)).unwrap();
+        let head = settled.l2_settlement().unwrap().head().unwrap();
+
+        // The swap keeps the head; what was proved for the old program is refused.
+        // A second identical fixture, because building a block spends its RANDAO chains.
+        let (mut swapped, mut chains) = fixture();
+        assert_eq!(swapped.state_root(), pre.state_root());
+        let mut l2 = swapped.l2_settlement().unwrap().clone();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        swapped.l2_settlement = Some(l2);
+        assert!(t.apply_block(&swapped, &block, &[], std::slice::from_ref(&old_tx)).is_err());
+        let mut state = swapped.l2_settlement().unwrap().clone();
+        let PosTransaction::L2Settlement(old) = &old_tx else { unreachable!() };
+        assert_eq!(state.apply(old, *swapped.head.as_bytes(), swapped.slot, false, &ProofDouble), Err(crate::l2_settlement::Reject::Policy));
+
+        // The same block under the new identities settles, as the successor rule sees it.
+        let new_tx = PosTransaction::L2Settlement(Box::new(transaction(&swapped)));
+        let block = build_block(&t, &swapped, 2, &[], std::slice::from_ref(&new_tx), &mut chains);
+        let next = t.apply_block(&swapped, &block, &[], std::slice::from_ref(&new_tx)).unwrap();
+        let new_head = next.l2_settlement().unwrap().head().unwrap();
+        assert_ne!(new_head.0, head.0);
+        assert_eq!(next.l2_settlement().unwrap().settled_number(), 1);
+    }
+
+    #[test]
+    fn the_release_rule_follows_the_program() {
+        let leaves = [([1; 32], 1_000_000), ([2; 32], 200 * BLCH), ([3; 32], 300 * BLCH)];
+        let tree: Vec<[u8; 32]> =
+            leaves.iter().enumerate().map(|(i, (r, sats))| wd::leaf(mainnet::activation().unwrap().policy.chain_id, i as u64, r, *sats)).collect();
+        let chain = mainnet::activation().unwrap().policy.chain_id;
+        let build = || {
+            let mut l2 = mainnet_l2_state();
+            l2.append_deposit(crate::l2_settlement::InboxRecord {
+                height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 1_000 * BLCH, recipient: [0x42; 20],
+            })
+            .unwrap();
+            l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&tree), count: 3, height: 1 });
+            for _ in 0..(2 * mainnet::LIMITS.release_window_blocks) {
+                l2.advance_height().unwrap();
+            }
+            l2
+        };
+        let claim = |l2: &mut crate::l2_settlement::State, i: usize, attested: bool| {
+            l2.release_withdrawal(chain, i as u64, &leaves[i].0, leaves[i].1, &wd::proof(&tree, i as u64).unwrap(), attested)
+        };
+
+        // The activated program: a 0.01 BLCH claim first delays the attested one.
+        let mut old = build();
+        claim(&mut old, 0, false).unwrap();
+        assert_eq!(claim(&mut old, 1, true), Err(wd::ClaimRefusal::RateLimited));
+
+        // The next program: it passes, and it spends the window's one exemption.
+        let mut new = build();
+        new.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        assert!(new.next_program_active());
+        claim(&mut new, 0, false).unwrap();
+        claim(&mut new, 1, true).unwrap();
+        assert_eq!(claim(&mut new, 2, true), Err(wd::ClaimRefusal::RateLimited));
+        assert!(new.escrow_conserved());
     }
 
     /// Signatures of `signers` (indices into `keys`, signed with `signing`
