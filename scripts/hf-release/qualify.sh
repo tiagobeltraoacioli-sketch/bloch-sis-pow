@@ -63,6 +63,8 @@
 #                           gates (repeatable), e.g. an HF1-only set
 #     --expect-halt LABEL=SLOT  first refused slot the set must pinpoint to
 #     --allow-inert LABEL   accept a forced set that re-applies all of history
+#     --relax-order         forced builds also make the compile-time gate ordering
+#                           rules always true, so a single gate can be forced alone
 #     --pin-candidates K    gate-boundary blocks tested to pinpoint a refusal (default 4)
 #     --forced-only         skip tests and the configured/baseline replays and the
 #                           schedule check; never a release verdict (PARTIAL);
@@ -95,7 +97,7 @@ case "${1:-}" in -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;; e
 COMMIT_ARG="${1:-}"; [ $# -gt 0 ] && shift
 SOURCE="" BASELINE_BIN="" OUT="" BASE_COMMIT=b4a21fb657d0beb17f64c62889b605c9a7a2d031
 FORCE_EPOCH="" WINDOW=16 JOBS=8 PIN_CANDIDATES=4 EXPECT_SLOT="" EXPECT_ROOT=""
-SKIP_TESTS=0 SKIP_FORCED=0 UNSANDBOXED=0 GATES_ONLY=0 FORCED_ONLY=0
+SKIP_TESTS=0 SKIP_FORCED=0 UNSANDBOXED=0 GATES_ONLY=0 FORCED_ONLY=0 RELAX_ORDER=0
 GATE_ARGS=() ALLOW_FAIL=() ALLOW_TEST=() SET_ARGS=() EXPECT_HALT=() ALLOW_INERT=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -109,6 +111,7 @@ while [ $# -gt 0 ]; do
     --expect-halt) EXPECT_HALT+=("$2"); shift 2 ;;
     --allow-inert) ALLOW_INERT+=("$2"); shift 2 ;;
     --forced-only) FORCED_ONLY=1; SKIP_TESTS=1; shift ;;
+    --relax-order) RELAX_ORDER=1; shift ;;
     --pin-candidates) PIN_CANDIDATES="$2"; shift 2 ;;
     --force-epoch) FORCE_EPOCH="$2"; shift 2 ;;
     --window) WINDOW="$2"; shift 2 ;;
@@ -384,6 +387,9 @@ for item in ${forced[@]+"${forced[@]}"}; do
   for kv in ${spec//,/ }; do
     python3 -I "$GATES_PY" force --tree "$d/tree" --gate "${kv%%=*}" --epoch "${kv#*=}" >> "$d/patch.txt" || ok=0
   done
+  if [ "$RELAX_ORDER" = 1 ]; then
+    python3 -I "$GATES_PY" relax-order --tree "$d/tree" >> "$d/patch.txt" || ok=0
+  fi
   if [ "$ok" = 0 ]; then echo "FAIL	could not patch $spec" > "$d/verdict"; continue; fi
   # The hashed source must actually change; then predict the digest the
   # forced binary has to report.
