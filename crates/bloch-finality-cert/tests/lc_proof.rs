@@ -525,3 +525,13 @@ fn real_mainnet_certificates_keep_their_verdict() {
     let mut trusted: BTreeSet<[u8; 32]> = [anchor].into_iter().collect();
     assert_eq!(ffg::verify(&bad, &mut trusted, &Config::mainnet(), &HybridConsensusVerifier).unwrap_err(), Refusal::BadSignature(v));
 }
+
+/// With `LC_PROOF_DUMP_DIR` set, writes a post-KES proof for wire-compatibility
+/// checks against the light-client crate.
+#[test]
+fn dump_a_post_kes_proof_when_asked() {
+    let Ok(dir) = std::env::var("LC_PROOF_DUMP_DIR") else { return };
+    let b = build(&kes_world(8700), &ALL, true, true);
+    std::fs::write(format!("{dir}/post-kes-e8700.bin"), b.proof.encode()).unwrap();
+    std::fs::write(format!("{dir}/post-kes-e8700.src"), bloch_finality_cert::to_hex(&b.src_id)).unwrap();
+}
