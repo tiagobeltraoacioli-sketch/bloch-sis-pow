@@ -1131,6 +1131,59 @@ mod kes_rules {
         assert_eq!(st.kes_enforced_from(), Some(bind));
     }
 
+    /// The mainnet schedule's numbers (registration e7360, gate e8620, 90-epoch
+    /// periods) with 9 of 10 equal validators registered: exactly 9000 bps.
+    /// Decided at the boundary into e8620, in force from e8622, first period
+    /// handover at e8710, which counts from the gate and so is bind + 88.
+    #[test]
+    fn mainnet_numbers_first_governed_epoch_is_8622_at_exactly_9000_bps() {
+        let _armed = Armed::at(7_360, 8_620, 90);
+        let (_t, g, _chains) = setup_with(10, ToyVerifier, &[]);
+        let mut st = g.clone();
+        st.epoch = 8_618;
+        for v in 0..9 {
+            let tx = register(&st, v, toy_kes_public(v));
+            apply(&mut st, &tx).unwrap();
+        }
+        st = st.close_epoch();
+        assert_eq!(st.epoch, 8_619);
+        assert_eq!(st.kes_enforced_from(), None, "a boundary before the gate decides nothing");
+        st = st.close_epoch();
+        assert_eq!(st.epoch, 8_620);
+        assert_eq!(st.kes_registered_stake_bps(8_620), 9_000);
+        assert_eq!(st.kes_enforced_from(), Some(8_622));
+        assert!(!crate::kes::is_bound(&view(&st), 8_621));
+        assert!(crate::kes::is_bound(&view(&st), 8_622));
+        assert_eq!(crate::kes::signing_mode(&view(&st), 0, 8_621), crate::kes::SigningMode::Static);
+        assert_eq!(crate::kes::signing_mode(&view(&st), 0, 8_622), crate::kes::SigningMode::Kes(0));
+        assert_eq!(crate::kes::signing_mode(&view(&st), 9, 8_622), crate::kes::SigningMode::Static, "static-key fallback");
+        assert_eq!(crate::params::kes_period(8_709), Some(0));
+        assert_eq!(crate::params::kes_period(8_710), Some(1));
+    }
+
+    /// Below 9000 bps at the first boundary nothing binds; the first later
+    /// boundary at the threshold decides, and the bind moves with it.
+    #[test]
+    fn mainnet_numbers_below_threshold_at_the_gate_moves_the_bind() {
+        let _armed = Armed::at(7_360, 8_620, 90);
+        let (_t, g, _chains) = setup_with(10, ToyVerifier, &[]);
+        let mut st = g.clone();
+        st.epoch = 8_619;
+        for v in 0..8 {
+            let tx = register(&st, v, toy_kes_public(v));
+            apply(&mut st, &tx).unwrap();
+        }
+        st = st.close_epoch();
+        assert_eq!(st.epoch, 8_620);
+        assert_eq!(st.kes_registered_stake_bps(8_620), 8_000);
+        assert_eq!(st.kes_enforced_from(), None);
+        let tx = register(&st, 8, toy_kes_public(8));
+        apply(&mut st, &tx).unwrap();
+        st = st.close_epoch();
+        assert_eq!(st.kes_enforced_from(), Some(8_623));
+        assert_eq!(crate::params::kes_period(8_623), Some(0));
+    }
+
     #[test]
     fn after_binding_an_unregistered_validator_falls_back_to_its_static_key() {
         let _armed = Armed::enforcing(2, 1);
