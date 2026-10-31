@@ -38,7 +38,7 @@ def main():
             if not (a.out / "admission.json").exists():
                 adm = call(a.rpc_port, "getvalidatoradmission", [])
                 (a.out / "admission.json").write_text(json.dumps(adm))
-            fin = info.get("finalized_epoch") or info.get("finality", {}).get("finalized_epoch") or 0
+            fin = (info.get("finalized") or {}).get("epoch") or 0
         except (OSError, ValueError, KeyError) as e:
             print(f"waiting: {e}", flush=True)
             continue
