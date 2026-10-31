@@ -402,7 +402,7 @@ class Rehearsal:
                 l2_snaps["post_hf1"] = self.l2_snapshot()
 
             # e10 HF1, e11-e13 partition.
-            cut, heal = a.hf1 + 1, a.hf1 + 3
+            cut, heal = a.hf1 + 1, a.hf1 + 1 + getattr(a, "partition_epochs", 2)
             self.wait_epoch(cut)
             minority_set = set(minority)
             other = set(range(self.total_nodes)) - minority_set
@@ -769,7 +769,12 @@ class Rehearsal:
         maj_gain = (max((s["fin"] for s in maj), default=0) - min((s["fin"] for s in maj), default=0))
         self.checks.ok("partition: minority (~1/3) finality frozen while cut",
                        bool(mid) and max(min_fins) - min(min_fins) <= 1, {"minority_fin_values": sorted(min_fins)})
-        self.checks.ok("partition: majority (~2/3) kept finalizing while cut", maj_gain >= 1, {"gain_epochs": maj_gain})
+        # FFG needs about 2 epochs to finalize, and the first epochs of the window may
+        # still show the pre-cut value: a cut of N epochs must show at least N - 3.
+        need_gain = max(1, heal - cut - 3)
+        self.checks.ok("partition: majority (~2/3) kept finalizing while cut", maj_gain >= need_gain,
+                       {"gain_epochs": maj_gain, "required": need_gain, "cut_epochs": heal - cut,
+                        "minority_stake_share": sum(self.stakes[v] for v in minority) / sum(self.stakes.values())})
         healed = self.window(set(upgraded), heal + 3, heal + 4)
         last = {}
         for s in healed:

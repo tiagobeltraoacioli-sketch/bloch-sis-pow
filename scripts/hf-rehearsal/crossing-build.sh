@@ -57,6 +57,9 @@ KES_MIN_REGISTRATION_WINDOW_EPOCHS  =$KESW
 !inert LATTICE_EMERGENCY_ACTIVATION_EPOCH
 EOF
 
+# Optional throwaway attestor set for the L2 policy (ATTESTORS_SET=file), so a large claim can
+# be attested on the private net. Copied into every tree, the baseline included.
+set_attestors() { [ -z "${ATTESTORS_SET:-}" ] || cp "$ATTESTORS_SET" "$1/crates/bloch-pos-committee/l2-mainnet/attestors.set"; }
 export_tar() { rm -rf "$2"; mkdir -p "$2"; tar -x -C "$2" -f "$1"; }
 log "fresh exports"
 export_tar "$FA_TAR" "$W/src/cand"
@@ -64,6 +67,8 @@ export_tar "$FA_TAR" "$W/src/base"
 export_tar "$FA_TAR" "$W/src/tooling"
 NATIVE_ONLY=${NATIVE_ONLY:-0}
 [ "$NATIVE_ONLY" = 1 ] || export_tar "$N78_TAR" "$W/src/bloch-validator-payout"
+for t in cand base tooling; do set_attestors "$W/src/$t"; done
+[ "$NATIVE_ONLY" = 1 ] || set_attestors "$W/src/bloch-validator-payout"
 ARM="$W/src/cand/scripts/hf-rehearsal/arm.py"
 log "arm candidate (fa980367)"
 python3 -I "$ARM" "$W/src/cand" --hf1 "$HF1" --hf2 "$HF2" --hf3 "$HF3" --past-gate "$PAST" --only-listed \

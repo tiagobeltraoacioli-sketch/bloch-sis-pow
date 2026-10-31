@@ -112,6 +112,10 @@ class Crossing(Rehearsal):
                 allocs.append((lib.sha3_hex(pk), sat)); names.append(f"inv-{role}-{r}")
         for r in self.inv_rounds:
             self.base.keygen(self.work / "keys" / f"inv-joiner-{r}", "auto")
+        # Extra allocations for an attached stack (gate_l2.py): SCRIPT_HASH:SATS.
+        for i, spec in enumerate(self.a.extra_alloc):
+            sh, sat = spec.split(":")
+            allocs.append((sh, int(sat))); names.append(f"extra-{i}")
         args = ["genesis", "--keys", ",".join(map(str, keydirs)), "--out", str(self.genesis),
                 "--slot-ms", str(self.a.slot_ms), "--start-in", str(self.a.start_in)]
         if self.a.bind_genesis:
@@ -309,7 +313,7 @@ class Crossing(Rehearsal):
                 pass
         k = self.getkes() if self.clock.wall_epoch() >= a.hf3 else None
         if k:
-            self.kes_samples.append({"wall_slot": self.clock.wall_slot(), "epoch": k.get("epoch"),
+            self.kes_samples.append({"wall_slot": self.clock.wall_slot(), "epoch": k.get("epoch"), "period": k.get("period"),
                                      "enforced_from": k.get("enforced_from"), "bps": k.get("registered_stake_bps"),
                                      "registered": len(k.get("registered") or [])})
 
@@ -326,11 +330,18 @@ class Crossing(Rehearsal):
         """Called by rehearse.run() at HF3+1 slot 4 (after the 0x0003 spend):
         KES registration by every validator and the 0x0018 credential rotation."""
         a = self.a
-        regs = {v: self.kes_register(v, "hf3") for v in range(self.n)}
-        self.extra["kes_register_hf3"] = {v: {"accepted": r[0], "reply": r[1][:200]} for v, r in regs.items()}
         # A slashed validator cannot register (check_kes_register, StakingRule):
         # the offender of the slashing phase must be refused, the others accepted.
         slashed = (report.get("slashing") or {}).get("post", {}).get("validator")
+        # Static-key fallback: one live validator never registers. It is chosen here so
+        # it is not the slashed one and is not in the partition minority or the outage
+        # set (both take the highest indices); nodes 0-2 serve the L2 stack.
+        self.unregistered = None
+        if a.static_fallback:
+            self.unregistered = next(v for v in range(3, self.n) if v != slashed)
+        regs = {v: self.kes_register(v, "hf3") for v in range(self.n) if v != self.unregistered}
+        self.extra["static_fallback_validator"] = self.unregistered
+        self.extra["kes_register_hf3"] = {v: {"accepted": r[0], "reply": r[1][:200]} for v, r in regs.items()}
         self.checks.ok("KES registration accepted after HF3 for every validator not slashed",
                        all(r[0] for v, r in regs.items() if v != slashed), self.extra["kes_register_hf3"])
         if slashed is not None:
@@ -374,6 +385,20 @@ class Crossing(Rehearsal):
         if bind is not None:
             gates.append(("KES enforcement", int(bind)))
             self.boundaries.append(("KES enforcement", int(bind)))
+            # params.rs: the first boundary at or past the gate with >= 9000 bps decides,
+            # and the bind is KES_BIND_DELAY_EPOCHS (2) later.
+            self.checks.ok("KES bound exactly at enforce + 2 (first deciding boundary, delay 2) with >= 9000 bps",
+                           int(bind) == a.kes_enforce + 2 and (k.get("bps") or 0) >= 9000,
+                           {"enforced_from": bind, "kes_enforce": a.kes_enforce, "bps": k.get("bps")})
+        handover = a.kes_enforce + a.kes_period_epochs
+        if a.stop_epoch > handover:
+            gates.append(("KES period 1 handover", handover))
+            self.boundaries.append(("KES period 1 handover", handover))
+            self.checks.ok(f"KES period 1 reached under enforcement (starts e{handover}, counted from the gate)",
+                           k.get("period") == (a.stop_epoch - a.kes_enforce) // a.kes_period_epochs and (k.get("period") or 0) >= 1,
+                           {"final_sample": k, "handover": handover})
+            evolved = {i: re.findall(r"KES key evolved[^\n]*", self.nodes[i].log_text())[:3] for i in upgraded}
+            self.extra["kes_evolved_lines"] = evolved
         for name, b in gates:
             first = {}
             for s in self.samples:
@@ -435,6 +460,22 @@ class Crossing(Rehearsal):
         kes_window = by_window["KES..stop"]
         slashed = (report.get("slashing") or {}).get("post", {}).get("validator")
         expected = set(range(self.n)) - {slashed}
+        handover = self.a.kes_enforce + self.a.kes_period_epochs
+        if self.a.stop_epoch > handover:
+            props = {}
+            for slot, p in self.proposers.items():
+                if slot >= handover * SPE and p is not None:
+                    props[p] = props.get(p, 0) + 1
+            self.extra["proposals"]["period1..stop"] = {"blocks": sum(props.values()), "by_proposer": props}
+            self.checks.ok("after the KES period handover every validator not slashed proposed canonical blocks",
+                           expected.issubset(set(props)), {"by_proposer": props, "slashed": slashed})
+        u = getattr(self, "unregistered", None)
+        if u is not None:
+            n = sum(1 for s, p in self.proposers.items() if p == u and self.kes_bind and s >= int(self.kes_bind) * SPE)
+            attested = {int(e) for e in re.findall(r"\] attested \(epoch (\d+)", self.nodes[u].log_text())}
+            after = sorted(e for e in attested if self.kes_bind and e >= int(self.kes_bind))
+            self.checks.ok(f"static-key fallback: unregistered v{u} proposes and attests after the bind",
+                           n > 0 and bool(after), {"canonical_blocks_after_bind": n, "attested_epochs_after_bind": len(after)})
         self.checks.ok("after KES enforcement every genesis validator not slashed still proposed canonical blocks",
                        expected.issubset(set(kes_window["by_proposer"])) and kes_window["blocks"] > 0,
                        dict(kes_window, slashed=slashed))
@@ -515,7 +556,13 @@ def main() -> int:
     ap.add_argument("--l2-epoch", type=int, default=7)
     ap.add_argument("--bind-genesis", action="store_true", default=True)
     ap.add_argument("--no-invariance", action="store_true")
+    ap.add_argument("--partition-epochs", type=int, default=2, help="length of the cut after HF1 (default 2)")
+    ap.add_argument("--static-fallback", action="store_true", help="one live validator never registers a KES key")
+    ap.add_argument("--extra-alloc", action="append", default=[], help="SCRIPT_HASH:SATS genesis allocation")
+    ap.add_argument("--kes-period-epochs", type=int, default=90, help="KES_PERIOD_EPOCHS of the build")
     a = ap.parse_args()
+    if a.hf1 + 1 + a.partition_epochs + 5 > a.own_target:
+        sys.exit("own-target must come at least 5 epochs after the partition heals")
     if not (4 < a.hf1 < a.own_target < a.hf2 < a.hf3 <= a.kes_enforce and a.hf3 + 13 <= a.stop_epoch
             and a.kes_enforce + 8 <= a.stop_epoch):
         sys.exit("need 4 < hf1 < own-target < hf2 < hf3 <= kes-enforce, stop >= hf3+13 and >= kes-enforce+8")
