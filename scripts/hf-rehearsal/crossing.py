@@ -328,8 +328,14 @@ class Crossing(Rehearsal):
         a = self.a
         regs = {v: self.kes_register(v, "hf3") for v in range(self.n)}
         self.extra["kes_register_hf3"] = {v: {"accepted": r[0], "reply": r[1][:200]} for v, r in regs.items()}
-        self.checks.ok("KES registration accepted after HF3 for every validator", all(r[0] for r in regs.values()),
-                       self.extra["kes_register_hf3"])
+        # A slashed validator cannot register (check_kes_register, StakingRule):
+        # the offender of the slashing phase must be refused, the others accepted.
+        slashed = (report.get("slashing") or {}).get("post", {}).get("validator")
+        self.checks.ok("KES registration accepted after HF3 for every validator not slashed",
+                       all(r[0] for v, r in regs.items() if v != slashed), self.extra["kes_register_hf3"])
+        if slashed is not None:
+            self.checks.ok(f"KES registration refused for the slashed validator v{slashed}", not regs[slashed][0],
+                           self.extra["kes_register_hf3"][slashed])
         r = self.rotation("post-hf3")
         self.extra["rotation_post_hf3"] = r
         self.checks.ok("PQ migration (0x18 credential rotation) accepted after HF3", r.get("accepted") is True, r)
@@ -427,9 +433,11 @@ class Crossing(Rehearsal):
             by_window[name] = {"blocks": sum(props.values()), "slots": (int(hi) - lo) * SPE, "by_proposer": props}
         self.extra["proposals"] = by_window
         kes_window = by_window["KES..stop"]
-        genesis_set = set(range(self.n))
-        self.checks.ok("after KES enforcement every genesis validator still proposed canonical blocks",
-                       genesis_set.issubset(set(kes_window["by_proposer"])) and kes_window["blocks"] > 0, kes_window)
+        slashed = (report.get("slashing") or {}).get("post", {}).get("validator")
+        expected = set(range(self.n)) - {slashed}
+        self.checks.ok("after KES enforcement every genesis validator not slashed still proposed canonical blocks",
+                       expected.issubset(set(kes_window["by_proposer"])) and kes_window["blocks"] > 0,
+                       dict(kes_window, slashed=slashed))
 
     def run(self) -> int:
         try:

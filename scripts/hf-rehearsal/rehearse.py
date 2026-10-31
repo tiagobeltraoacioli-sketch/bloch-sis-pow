@@ -139,7 +139,9 @@ class Rehearsal:
                 try:
                     s.bind(("127.0.0.1", self.a.port_base + off))
                 except OSError:
-                    raise SoakError(f"port {self.a.port_base + off} is busy; pick another --port-base")
+                    raise SoakError(f"port {self.a.port_base + off} is busy; pick another --port-base "
+                                    "(below net.ipv4.ip_local_port_range, or outgoing sockets collide; "
+                                    "a run uses base..base+499 and base+1000..base+1255)")
         bi = {"candidate": self.cand.buildinfo(), "baseline": self.base.buildinfo()}
         (self.work / "buildinfo.json").write_text(json.dumps(bi, indent=2) + "\n")
         self.cand_help = self.cand.run(["--help"], timeout=30).stdout
