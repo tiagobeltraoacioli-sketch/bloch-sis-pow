@@ -403,8 +403,15 @@ against the state root of the certificate's set-source block.
   The setting is an environment variable, capped at 4096. An invalid value falls
   back to 16 with a warning, and the node logs the retention it uses at boot.
   The ring is not persisted. A boot from the state cache rebuilds it only from
-  blocks applied in that boot, so a follower that must serve an older set source
-  right after a restart has to boot with `--replay-from-genesis`.
+  blocks applied in that boot. Measured on a mainnet log copy: with no tail to
+  replay, every set source before the boot answers `-32004`, the previous epoch
+  included. A client that trusts only checkpoints from before the boot cannot
+  advance from that node, so a prover's follower must boot with
+  `--replay-from-genesis`.
+- The hop bound counts from the epoch of the set source's block, which is the
+  last block before its checkpoint epoch's boundary. Measured at e6594: a set
+  source 255 checkpoints back verifies, and one 256 back is refused with
+  `SetSourceDistance`.
 - Node: the extensions are computed once per epoch boundary from the same state
   tree as the registry proof and retained for the same
   `BLOCH_FINALITY_CERT_EPOCHS` checkpoints. KES proofs cost nothing before
