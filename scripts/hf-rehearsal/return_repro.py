@@ -41,6 +41,9 @@ ap.add_argument('--validators', type=int, default=8)
 ap.add_argument('--register-at', type=int, help='every validator registers a KES key in this epoch')
 ap.add_argument('--kes-depth', type=int, default=8)
 ap.add_argument('--heal-at', type=int, help='restart one returned node, then (5 epochs later) all of them')
+ap.add_argument('--transport', default='devnet', choices=['devnet', 'libp2p'])
+ap.add_argument('--ip-mode', default='none', choices=['none', 'node', 'group'],
+                help='devnet: relays connect from a distinct 127.1.0.x per node, or per side of the group split')
 ap.add_argument('--doppelganger', action='store_true', help='leave doppelganger protection on, as a production node does')
 ap.add_argument('--wipe-at', type=int, help='stop the group, delete its chain data (keys and slashing protection stay), restart')
 ap.add_argument('--no-stop', action='store_true', help='the group is never stopped: only --hold-cut/--partition isolate it')
@@ -60,7 +63,12 @@ class R(Rehearsal):
                 d = self.work / f'node{v}'
                 d.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(self.keydirs[v] / 'validator.kes'), str(d / 'validator.kes'))
+        if a.transport == 'libp2p':
+            return self.launch_libp2p()
         self.mesh = lib.RelayMesh(self.total_nodes, self.relay_base(), self.a.port_base + 200)
+        if a.ip_mode != 'none':
+            for (i, j), relay in self.mesh.relays.items():
+                relay.source = f'127.1.0.{i + 1}' if a.ip_mode == 'node' else ('127.1.0.1' if i in off else '127.1.0.2')
         self.mesh.start_all()
         for i in range(self.total_nodes):
             d = self.work / f'node{i}'
@@ -78,6 +86,40 @@ class R(Rehearsal):
             time.sleep(0.2)
 
 
+def p2p_cmd(self, i, listen, peers):
+    d = self.work / f'node{i}'
+    return [str(self.cand.path), 'run', '--data-dir', str(d), '--genesis', str(self.genesis), '--transport', 'libp2p',
+            *([] if a.doppelganger else ['--no-doppelganger-check']), '--p2p-listen', f'/ip4/127.0.0.1/tcp/{listen}',
+            *(['--p2p-peer', ','.join(peers)] if peers else []), '--behind-proxy',
+            '--rpc-bind', '127.0.0.1', '--rpc-port', str(self.rpc_port(i)),
+            '--metrics-bind', '127.0.0.1', '--metrics-port', str(self.metrics_port(i))]
+
+
+def peer_id(self, i):
+    for _ in range(300):
+        m = re.search(r'12D3Koo\w+', self.nodes[i].log_text()) if self.nodes[i].log_path.exists() else None
+        if m:
+            return m.group(0)
+        time.sleep(0.1)
+    raise SystemExit(f'node{i} printed no peer id')
+
+
+def launch_libp2p(self):
+    self.ids = {}
+    for i in range(self.total_nodes):
+        d = self.work / f'node{i}'
+        d.mkdir(parents=True, exist_ok=True)
+        if i != self.obs:
+            shutil.copy2(self.keydirs[i] / 'validator.key', d / 'validator.key')
+        peers = [f'/ip4/127.0.0.1/tcp/{self.mesh_port(j)}/p2p/{self.ids[j]}' for j in range(i)]
+        self.nodes.append(lib.Node(name=f'node{i}', slot=i, data_dir=d, rpc_port=self.rpc_port(i), mesh_port=self.mesh_port(i),
+                                   metrics_port=self.metrics_port(i), cmd=p2p_cmd(self, i, self.mesh_port(i), peers),
+                                   env=self.env, log_path=d / 'run.log', has_key=i != self.obs))
+        self.nodes[i].start()
+        self.ids[i] = peer_id(self, i)
+
+
+R.launch_libp2p = launch_libp2p
 r = R(ns)
 r.work.mkdir(mode=0o700, parents=True, exist_ok=False)
 out = {'args': vars(a).copy(), 'phases': []}
@@ -119,7 +161,12 @@ try:
     r.wait_epoch(a.back_at)
     out['before_return'] = {i: r.latest(i)['fin'] for i in (0, 1)}
     others = set(range(r.total_nodes)) - set(off)
-    if a.hold_cut:
+    if a.hold_cut and a.transport == 'libp2p':
+        # No relays to cut: isolation is a restart on another port with only the group as peers.
+        alt = {v: r.a.port_base + 600 + v for v in off}
+        for v in off:
+            r.nodes[v].cmd = p2p_cmd(r, v, alt[v], [f'/ip4/127.0.0.1/tcp/{alt[w]}/p2p/{r.ids[w]}' for w in off if w != v])
+    elif a.hold_cut:
         r.mesh.cut_between(set(off), others)
     for k, v in enumerate([] if a.no_stop else off):
         if k and a.stagger_slots:
@@ -127,7 +174,17 @@ try:
         r.nodes[v].start()
         r.nodes[v].stopped_on_purpose = False
 
-    if a.hold_cut:
+    if a.hold_cut and a.transport == 'libp2p':
+        time.sleep(a.hold_cut)
+        for v in off:
+            r.nodes[v].stop()
+        time.sleep(1)
+        for v in off:
+            full = [f'/ip4/127.0.0.1/tcp/{r.mesh_port(w)}/p2p/{r.ids[w]}' for w in range(r.total_nodes) if w != v]
+            r.nodes[v].cmd = p2p_cmd(r, v, r.mesh_port(v), full)
+            r.nodes[v].start()
+        out['hold_cut_healed_at'] = r.clock.wall_epoch()
+    elif a.hold_cut:
         time.sleep(a.hold_cut)
         r.mesh.heal_between(set(off), others)
         out['hold_cut_healed_at'] = r.clock.wall_epoch()
