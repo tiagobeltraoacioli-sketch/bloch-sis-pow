@@ -561,8 +561,8 @@ def main() -> int:
     ap.add_argument("--extra-alloc", action="append", default=[], help="SCRIPT_HASH:SATS genesis allocation")
     ap.add_argument("--kes-period-epochs", type=int, default=90, help="KES_PERIOD_EPOCHS of the build")
     a = ap.parse_args()
-    if a.hf1 + 1 + a.partition_epochs + 5 > a.own_target:
-        sys.exit("own-target must come at least 5 epochs after the partition heals")
+    if a.hf1 + 1 + a.partition_epochs + 3 > a.own_target:
+        sys.exit("own-target must come at least 3 epochs after the partition heals")
     if not (4 < a.hf1 < a.own_target < a.hf2 < a.hf3 <= a.kes_enforce and a.hf3 + 13 <= a.stop_epoch
             and a.kes_enforce + 8 <= a.stop_epoch):
         sys.exit("need 4 < hf1 < own-target < hf2 < hf3 <= kes-enforce, stop >= hf3+13 and >= kes-enforce+8")

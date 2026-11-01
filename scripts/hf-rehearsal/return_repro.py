@@ -42,7 +42,7 @@ ap.add_argument('--register-at', type=int, help='every validator registers a KES
 ap.add_argument('--kes-depth', type=int, default=8)
 ap.add_argument('--heal-at', type=int, help='restart one returned node, then (5 epochs later) all of them')
 ap.add_argument('--transport', default='devnet', choices=['devnet', 'libp2p'])
-ap.add_argument('--ip-mode', default='none', choices=['none', 'node', 'group'],
+ap.add_argument('--ip-mode', default='none', choices=['none', 'node', 'group', 'host6'],
                 help='devnet: relays connect from a distinct 127.1.0.x per node, or per side of the group split')
 ap.add_argument('--doppelganger', action='store_true', help='leave doppelganger protection on, as a production node does')
 ap.add_argument('--wipe-at', type=int, help='stop the group, delete its chain data (keys and slashing protection stay), restart')
@@ -68,7 +68,8 @@ class R(Rehearsal):
         self.mesh = lib.RelayMesh(self.total_nodes, self.relay_base(), self.a.port_base + 200)
         if a.ip_mode != 'none':
             for (i, j), relay in self.mesh.relays.items():
-                relay.source = f'127.1.0.{i + 1}' if a.ip_mode == 'node' else ('127.1.0.1' if i in off else '127.1.0.2')
+                relay.source = {'node': f'127.1.0.{i + 1}', 'host6': f'127.1.0.{i % 6 + 1}',
+                                'group': '127.1.0.1' if i in off else '127.1.0.2'}[a.ip_mode]
         self.mesh.start_all()
         for i in range(self.total_nodes):
             d = self.work / f'node{i}'
