@@ -55,6 +55,7 @@ HF3_KES_ENFORCE_EPOCH               =$KESE
 HF2_MIN_EPOCHS_AFTER_HF1            =$HF2MIN
 KES_MIN_REGISTRATION_WINDOW_EPOCHS  =$KESW
 !inert LATTICE_EMERGENCY_ACTIVATION_EPOCH
+${EXTRA_CONF:-}
 EOF
 
 # Optional throwaway attestor set for the L2 policy (ATTESTORS_SET=file), so a large claim can
