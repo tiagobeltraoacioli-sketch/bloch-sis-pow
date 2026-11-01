@@ -710,6 +710,17 @@ pub mod withdrawal {
         pub fn claims(&self) -> u64 {
             self.claims
         }
+        /// Whether any leaf at or above `index` is claimed.
+        pub fn any_at_or_above(&self, index: u64) -> bool {
+            if self.floor.saturating_mul(256) > index {
+                return true;
+            }
+            self.words.iter().any(|(word, bits)| {
+                (0..256u64).any(|bit| {
+                    bits[(bit / 8) as usize] & (1 << (bit % 8)) != 0 && word.saturating_mul(256).saturating_add(bit) >= index
+                })
+            })
+        }
         /// Words below this index are fully claimed (and not stored).
         pub fn floor(&self) -> u64 {
             self.floor
@@ -1031,6 +1042,28 @@ pub mod mainnet {
         proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
     };
 
+    /// OPTION, an owner decision, absent by default: a one-time reset of the
+    /// settled L2 head, applied by [`super::State::install_next_program`] in the
+    /// same transition as the swap. Without it the swap prevents an off-rule block
+    /// but cannot recover from one that landed before the gate: its state root is
+    /// unknown to everyone but its author, so nobody else can build on it.
+    ///
+    /// L1 cannot tell an off-rule block by itself (the statement carries neither
+    /// value), so the target is named by whoever writes the emergency release,
+    /// from what the attestors could not rebuild. There is no key and no runtime
+    /// input: it is a compiled constant that every validator must choose to run.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct HeadReset {
+        /// The last block to keep. Zero means the L2 genesis (no statement).
+        pub number: u64,
+        /// The accepted head's commitment at that block (zero for the genesis).
+        pub commitment: [u8; 32],
+        /// The accepted V3 statement of that block, as hex (`None` for the genesis).
+        pub statement: Option<&'static str>,
+    }
+    /// `None`: the release ships no reset and the swap changes the program only.
+    pub const HEAD_RESET: Option<HeadReset> = None;
+
     /// The L2 program and genesis the activation pins: the seven V2
     /// identities (Genesis-4 admission domain, native genesis, L2 domain,
     /// L2 configuration, guest ELF, KoalaBear key, BN254 key), the proof
@@ -1111,7 +1144,7 @@ pub mod mainnet {
         ProgramUnset,
     }
 
-    fn unhex(text: &str) -> Option<Vec<u8>> {
+    pub(super) fn unhex(text: &str) -> Option<Vec<u8>> {
         let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
         let bytes = text.as_bytes();
         if bytes.len() % 2 != 0 {
@@ -1543,13 +1576,65 @@ impl State {
     /// Blocks before the gate replay unchanged, because nothing here runs for them.
     pub(crate) fn install_next_program(&mut self) {
         let Some(pinned) = mainnet::PROGRAM else { return };
-        if self.policy.identities == pinned.identities && self.policy.proof_policy == pinned.proof_policy {
+        // Identities 0 and 1 name the network, so a private rehearsal of the
+        // mainnet program holds other values there (`rehearsal_activation`).
+        if self.policy.identities[2..] == pinned.identities[2..] && self.policy.proof_policy == pinned.proof_policy {
             self.replace_program(&mainnet::PROGRAM_NEXT);
+            if let Some(reset) = mainnet::HEAD_RESET.as_ref() {
+                self.reset_head(reset);
+            }
         }
+    }
+    /// Move the settled head back to `reset`: the inbox cursor returns to what
+    /// that block had consumed, so its deposits mint again on the new chain, and
+    /// withdrawal roots of later blocks are forgotten. Escrow, deposits, claims
+    /// and the release window stay. Returns whether it applied.
+    ///
+    /// It does nothing when the head is not above the target, when the statement
+    /// is malformed, or when a leaf the target did not publish was already paid:
+    /// the rollback would then credit on L2 what already left the escrow.
+    pub(crate) fn reset_head(&mut self, reset: &mainnet::HeadReset) -> bool {
+        if self.settled_number() <= reset.number {
+            return false;
+        }
+        let (head, consumed) = match reset.statement {
+            None if reset.number == 0 => (None, 0),
+            Some(text) => {
+                let Some(statement) = mainnet::unhex(text.trim()) else { return false };
+                if StatementVersion::of(&statement) != Some(StatementVersion::V3)
+                    || n(&statement, S + 264) != reset.number
+                    || (0..3).any(|i| h(&statement, S + i * 32) != self.policy.identities[i])
+                {
+                    return false;
+                }
+                let consumed = n(&statement, S + 528);
+                (Some((reset.commitment, statement)), consumed)
+            }
+            None => return false,
+        };
+        let (_, count) = withdrawal::tree_after(head.as_ref().map(|(_, s): &([u8; 32], Vec<u8>)| s.as_slice()));
+        if self.claimed.any_at_or_above(count) || consumed > self.inbox.len() as u64 {
+            return false;
+        }
+        self.head = head;
+        self.consumed = consumed;
+        self.withdrawals.retain(|r| r.l2_number <= reset.number);
+        true
     }
     fn replace_program(&mut self, next: &mainnet::NextProgram) {
         self.policy.identities[3..7].copy_from_slice(&next.identities);
         self.policy.proof_policy = next.proof_policy;
+    }
+    /// Test hook: mark a leaf as claimed without a claim.
+    #[cfg(test)]
+    pub(crate) fn claimed_insert_for_test(&mut self, index: u64) {
+        self.claimed.insert(index);
+    }
+    /// Test hook: install an accepted head without a settlement.
+    #[cfg(test)]
+    pub(crate) fn set_head_for_test(&mut self, digest: [u8; 32], statement: Vec<u8>, consumed: u64) {
+        self.head = Some((digest, statement));
+        self.consumed = consumed;
     }
     /// Test hook: move any L2 to `next`, for settlement checks across the swap.
     #[cfg(test)]

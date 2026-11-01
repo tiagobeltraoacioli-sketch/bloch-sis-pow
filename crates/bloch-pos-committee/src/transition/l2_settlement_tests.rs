@@ -2926,6 +2926,142 @@ mod l2_tests {
         assert_eq!(next.l2_settlement().unwrap().settled_number(), 1);
     }
 
+    // ── The optional head reset (owner decision; `mainnet::HEAD_RESET` is `None`) ──
+
+    #[test]
+    fn head_reset_ships_absent() {
+        assert_eq!(mainnet::HEAD_RESET, None);
+        let (mut pre, _) = fixture();
+        let mut l2 = mainnet_l2_state();
+        l2.set_head_for_test([9; 32], statement_at(&l2, 5, [0xaa; 32], 2), 0);
+        pre.l2_settlement = Some(l2);
+        let _gate = crate::params::l2_next_program_test::open();
+        let crossed = pre.close_epoch();
+        let after = crossed.l2_settlement().unwrap();
+        assert!(after.next_program_active());
+        assert_eq!(after.settled_number(), 5, "without the option the swap keeps the head");
+    }
+
+    /// A V3 statement of `state`'s network for block `number`, withdrawal count `count`.
+    fn statement_at(state: &crate::l2_settlement::State, number: u64, root: [u8; 32], count: u64) -> Vec<u8> {
+        use crate::l2_settlement::{v3, STATEMENT_TAG, STATEMENT_V3_BYTES, STATEMENT_V3_TAG};
+        let tag = STATEMENT_TAG.len();
+        let mut s = vec![0u8; STATEMENT_V3_BYTES];
+        s[..tag].copy_from_slice(STATEMENT_V3_TAG);
+        for (i, id) in state.policy().identities.iter().enumerate() {
+            s[tag + i * 32..tag + (i + 1) * 32].copy_from_slice(id);
+        }
+        s[tag + 264..tag + 272].copy_from_slice(&number.to_be_bytes());
+        s[tag + 528..tag + 536].copy_from_slice(&number.to_be_bytes());
+        s[tag + 336..tag + 368].copy_from_slice(&[number as u8; 32]);
+        s[tag + 368..tag + 400].copy_from_slice(&[number as u8 ^ 0xff; 32]);
+        s[tag + v3::WITHDRAWAL_ROOT..tag + v3::WITHDRAWAL_ROOT + 32].copy_from_slice(&root);
+        s[tag + v3::WITHDRAWAL_COUNT..tag + v3::WITHDRAWAL_COUNT + 8].copy_from_slice(&count.to_be_bytes());
+        s
+    }
+
+    fn leaked_hex(bytes: &[u8]) -> &'static str {
+        Box::leak(bytes.iter().map(|b| format!("{b:02x}")).collect::<String>().into_boxed_str())
+    }
+
+    /// An L2 at block 7 with 8 inbox records consumed and withdrawal records at 2 and 6.
+    fn state_with_bad_tail() -> crate::l2_settlement::State {
+        let mut l2 = mainnet_l2_state();
+        for i in 0..8u32 {
+            l2.append_deposit(crate::l2_settlement::InboxRecord {
+                height: 1, tx_index: i, txid: [0x77; 32], vout: 1, sats: 10 * BLCH, recipient: [0x42; 20],
+            })
+            .unwrap();
+        }
+        l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: [0xaa; 32], count: 2, height: 1 });
+        l2.insert_withdrawal_record(wd::Record { l2_number: 6, root: [0xbb; 32], count: 5, height: 2 });
+        let bad = statement_at(&l2, 7, [0xbb; 32], 5);
+        l2.set_head_for_test([7; 32], bad, 7);
+        l2
+    }
+
+    #[test]
+    fn head_reset_to_a_settled_block_keeps_its_tree_and_rewinds_the_inbox() {
+        let mut l2 = state_with_bad_tail();
+        let escrow = l2.escrow_sat();
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)) };
+        assert!(l2.reset_head(&reset));
+        assert_eq!(l2.head().unwrap(), ([3; 32], keep));
+        assert_eq!(l2.settled_number(), 3);
+        assert_eq!(l2.consumed(), 3, "records 3..8 mint again on the new chain");
+        assert_eq!(l2.withdrawal_head(), ([0xaa; 32], 2));
+        assert_eq!(l2.withdrawal_roots().iter().map(|r| r.l2_number).collect::<Vec<_>>(), [2]);
+        assert_eq!(l2.escrow_sat(), escrow);
+        assert!(l2.escrow_conserved());
+        assert!(!l2.reset_head(&reset), "the head is no longer above the target");
+    }
+
+    #[test]
+    fn head_reset_to_the_genesis_clears_the_head() {
+        let mut l2 = state_with_bad_tail();
+        assert!(l2.reset_head(&mainnet::HeadReset { number: 0, commitment: [0; 32], statement: None }));
+        assert_eq!(l2.head(), None);
+        assert_eq!((l2.settled_number(), l2.consumed()), (0, 0));
+        assert!(l2.withdrawal_roots().is_empty());
+    }
+
+    #[test]
+    fn head_reset_refuses_to_forget_a_paid_leaf() {
+        let mut l2 = state_with_bad_tail();
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)) };
+        // Leaf 1 is inside the target's tree: paid, and still published after the reset.
+        let mut inside = l2.clone();
+        inside.claimed_insert_for_test(1);
+        assert!(inside.reset_head(&reset));
+        // Leaf 4 only exists in the discarded tail: the reset must not apply.
+        l2.claimed_insert_for_test(4);
+        let before = l2.clone();
+        assert!(!l2.reset_head(&reset));
+        assert_eq!(l2, before);
+    }
+
+    #[test]
+    fn head_reset_refuses_a_malformed_or_foreign_statement() {
+        let l2 = state_with_bad_tail();
+        let good = statement_at(&l2, 3, [0xaa; 32], 2);
+        let refused = |statement: Option<&'static str>, number: u64| {
+            let mut copy = l2.clone();
+            let before = copy.clone();
+            assert!(!copy.reset_head(&mainnet::HeadReset { number, commitment: [3; 32], statement }));
+            assert_eq!(copy, before);
+        };
+        refused(None, 3);
+        refused(Some("00ff"), 3);
+        refused(Some(leaked_hex(&good)), 4);
+        let mut other_network = good.clone();
+        other_network[crate::l2_settlement::STATEMENT_TAG.len()] ^= 1;
+        refused(Some(leaked_hex(&other_network)), 3);
+        // At or below the target there is nothing to reset.
+        refused(Some(leaked_hex(&statement_at(&l2, 7, [0xbb; 32], 5))), 7);
+    }
+
+    #[test]
+    fn a_reset_head_takes_the_next_settlement_under_the_new_program() {
+        let (pre, mut chains) = fixture();
+        let t = Transition::new(ProofDouble);
+        // Block 1 settles, then the head goes back to the genesis.
+        let first = PosTransaction::L2Settlement(Box::new(transaction(&pre)));
+        let block = build_block(&t, &pre, 2, &[], std::slice::from_ref(&first), &mut chains);
+        let mut settled = t.apply_block(&pre, &block, &[], std::slice::from_ref(&first)).unwrap();
+        let mut l2 = settled.l2_settlement().unwrap().clone();
+        assert_eq!(l2.settled_number(), 1);
+        assert!(l2.reset_head(&mainnet::HeadReset { number: 0, commitment: [0; 32], statement: None }));
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        settled.l2_settlement = Some(l2);
+        // The successor of the genesis is accepted again, and only it.
+        let again = PosTransaction::L2Settlement(Box::new(transaction(&settled)));
+        let block = build_block(&t, &settled, 3, &[], std::slice::from_ref(&again), &mut chains);
+        let next = t.apply_block(&settled, &block, &[], std::slice::from_ref(&again)).unwrap();
+        assert_eq!(next.l2_settlement().unwrap().settled_number(), 1);
+    }
+
     /// A real proof of the candidate program against the native verifier, with
     /// BLOCH_NEXT_VALUES and BLOCH_NEXT_PROOF naming the settler-format files.
     /// The statement is a synthetic empty block; L1 would refuse its source.

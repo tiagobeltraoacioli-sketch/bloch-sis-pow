@@ -2938,6 +2938,13 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
         ("asynchronous", Json::Bool(l2.asynchronous())), ("native_height", Json::u(l2.height())),
         ("network", Json::hex(&policy.identities[0])), ("genesis", Json::hex(&policy.identities[1])),
         ("chain_id", Json::u(policy.chain_id)), ("source", source),
+        // The program a settlement must prove now. It changes only at the
+        // compiled gate (`params::L2_NEXT_PROGRAM_EPOCH`).
+        ("program", Json::obj(vec![
+            ("configuration", Json::hex(&policy.identities[3])), ("elf_keccak", Json::hex(&policy.identities[4])),
+            ("vkey_koalabear", Json::hex(&policy.identities[5])), ("vkey_bn254", Json::hex(&policy.identities[6])),
+            ("proof_policy", Json::hex(&policy.proof_policy)),
+        ])),
         // What this L2 admits, fixed at installation: a development genesis
         // follows the node's devnet features; the running-network flag day
         // ("activated") admits everything on every build.
