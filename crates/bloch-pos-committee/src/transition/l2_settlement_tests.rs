@@ -4462,11 +4462,19 @@ mod l2_tests {
         assert_eq!(refused_by_new_only, 1);
     }
 
-    /// One block at slot 3 on a fresh `slot_fixture`, carrying `plan`.
+    /// The post-state of one block at slot 3 on a fresh `slot_fixture`,
+    /// carrying `plan`. Built by hand (as `more_than_four_da_batches_in_one_block_are_refused`
+    /// does), because `build_block` panics on a block the transition refuses.
     fn slot_attempt(keys: &[Vec<u8>], plan: &[(usize, u64, Vec<u8>)]) -> Result<CommittedState, TransitionError> {
         let (pre, mut chains) = slot_fixture(keys);
         let txs = slot_batches(&pre, keys, plan);
-        apply(&pre, 3, &txs, &mut chains)
+        let t = Transition::new(ProofDouble);
+        let mut block = build_block(&t, &pre, 3, &[], &[], &mut chains);
+        block.header.body_root =
+            crate::derive::body_root(&txs.iter().map(PosTransaction::canonical_bytes).collect::<Vec<_>>());
+        let pk = crate::attestation::KeyLookup::pubkey(&pre, block.header.proposer_index).unwrap();
+        block.proposer_sig = toy_sign(pk, &block.header.proposal_signing_root());
+        t.compute_post_state(&pre, &block, &[], &txs)
     }
 
     #[test]
