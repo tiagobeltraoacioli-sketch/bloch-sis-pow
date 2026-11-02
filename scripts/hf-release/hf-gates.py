@@ -5,7 +5,7 @@
   hf-gates.py discover --repo <git dir> --base <fleet commit> --candidate <commit> [--gate NAME ...]
       Prints TSV: name, base value, candidate value, status. A gate is every
       single-line `pub const <NAME>_EPOCH: u64 = <value>;` under crates/ whose
-      name contains ACTIVATION or REFUSAL or starts with HF<n>_ and whose definition is new or changed
+      name contains ACTIVATION or REFUSAL or starts with HF<n>_ or L2_ and whose definition is new or changed
       between the fleet release and the candidate, plus any --gate given.
       status: scheduled:<epoch> | inert (u64::MAX) | alias:<expr> | missing
 
@@ -31,8 +31,11 @@ U64_MAX = (1 << 64) - 1
 
 
 def is_gate_name(name):
+    # L2_*_EPOCH: the L2 program swap and its rollback (L2_NEXT_PROGRAM_EPOCH, L2_PROGRAM_ROLLBACK_EPOCH),
+    # which qualify would otherwise only see with an explicit --gate.
     return name.endswith("_EPOCH") and (
-        "ACTIVATION" in name or "REFUSAL" in name or re.match(r"HF[0-9]+_", name) is not None)
+        "ACTIVATION" in name or "REFUSAL" in name or re.match(r"HF[0-9]+_", name) is not None
+        or re.match(r"L2_[A-Z0-9_]+_EPOCH$", name) is not None)
 
 
 def definitions(repo, commit):
