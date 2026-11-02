@@ -1028,8 +1028,9 @@ pub mod mainnet {
         pub proof_policy: [u8; 32],
     }
     /// `settlement_v3_mainnet_sparse` of bloch-l2-evm
-    /// `codex/sparse-witness-r4-20261101`: the sparse witness under the next
-    /// rules, guest ELF SHA-256 `75b9c635…418e` (3 216 728 bytes). The state
+    /// `codex/sparse-audit-r7-20261102` b772f2d (code by hash, I1 and I3 fixed),
+    /// built in its pinned container: the sparse witness under the next rules,
+    /// guest ELF SHA-256 `78c533fa…7bea` (3 218 240 bytes). The state
     /// transition and the statement bytes are those of the complete witness.
     /// The configuration carries a PLACEHOLDER fee-sweep recipient, `TBD-owner`,
     /// and the guest is a candidate, so these values are examples until
@@ -1037,9 +1038,9 @@ pub mod mainnet {
     pub const PROGRAM_NEXT: NextProgram = NextProgram {
         identities: [
             h32("975ec2585246abeaea86421dd5726918b632dd91a246f635fe74990b68bcd878"),
-            h32("54d264b8969845b82b3c8d0cec54562567ab7ee6f59dae7e2678c7d9e848c011"),
-            h32("5f802b085c7520f54383ee604e867d4d327a0d554388ca79254748973cf6c126"),
-            h32("00bf00561171d483d61c1f7304e867d4d64f41aab0e2329e52a3a44bbcf6c126"),
+            h32("1f755262230baf9f1fded98a698cd3e31aa7f23a146116d4bd7e21e2bee2a5e0"),
+            h32("7e5b3c3345608ab36aced4db40f7692147a3fca80ace7a285bc335f342ee5910"),
+            h32("00fcb6786715822acf5676a6dc0f769218f47f9502b39e8a2de19af9c2ee5910"),
         ],
         // The wrapper VK and the V3 tag are unchanged, so the policy is too.
         proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
