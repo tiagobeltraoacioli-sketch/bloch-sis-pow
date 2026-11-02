@@ -2941,6 +2941,19 @@ pub fn kes_json(state: &bloch_pos_committee::transition::CommittedState) -> Json
 }
 
 pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedState) -> Json {
+    l2_settlement_json_with(state, &|_, _| None)
+}
+
+/// A forced record's L2 envelope, read from the L1 block at `height` holding
+/// the transaction `txid`; `None` when that block is not readable here.
+pub type ForcedEnvelopeLookup<'a> = dyn Fn(u64, &[u8; 32]) -> Option<Vec<u8>> + 'a;
+
+/// [`l2_settlement_json`], with each due forced record's envelope read
+/// through `envelope` (the engine reads its canonical blocks).
+pub fn l2_settlement_json_with(
+    state: &bloch_pos_committee::transition::CommittedState,
+    envelope: &ForcedEnvelopeLookup<'_>,
+) -> Json {
     let Some(l2) = state.l2_settlement() else { return Json::Null; };
     let policy = l2.policy();
     let source = l2.frozen_source().map_or(Json::Null, |source| Json::obj(vec![
@@ -3092,19 +3105,42 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
     // L1 forced inclusion (candidate): present only once the queue is enabled,
     // so the response keeps its exact fields while the gate is inert.
     if let (Json::Obj(fields), Some(queue)) = (&mut out, l2.forced_queue()) {
-        fields.push(("forced".to_string(), l2_forced_json(queue)));
+        fields.push(("forced".to_string(), l2_forced_json_with(queue, envelope)));
     }
     out
 }
 
 /// `getl2settlement.forced`: the queue, and the records the next settlement
 /// must consume, in order (`due`), with the `deposits_hash` slot they need.
+#[cfg(test)]
 pub(crate) fn l2_forced_json(queue: &bloch_pos_committee::l2_settlement::forced::Queue) -> Json {
-    use bloch_pos_committee::l2_settlement::forced;
-    let record = |r: &forced::Record| Json::obj(vec![
+    l2_forced_json_with(queue, &|_, _| None)
+}
+
+/// One due record. `envelope` is the signed L2 envelope (hex) read from its
+/// L1 transaction, which a producer, settler or rebuilder needs to run it; it
+/// is `null` when the block is not readable here or the bytes do not hash to
+/// the record (never trusted: the guest checks the hash again).
+pub(crate) fn l2_forced_record_json(
+    r: &bloch_pos_committee::l2_settlement::forced::Record,
+    envelope: &ForcedEnvelopeLookup<'_>,
+) -> Json {
+    use sha3::{Digest, Keccak256};
+    let bytes = envelope(r.height, &r.l1_txid)
+        .filter(|bytes| <[u8; 32]>::from(Keccak256::digest(bytes)) == r.envelope_hash);
+    Json::obj(vec![
         ("height", Json::u(r.height)), ("l1_txid", Json::hex(&r.l1_txid)),
         ("envelope_hash", Json::hex(&r.envelope_hash)), ("gas_limit", Json::u(r.gas_limit)),
-    ]);
+        ("envelope", bytes.map_or(Json::Null, |b| Json::s(crate::codec::hex(&b)))),
+    ])
+}
+
+pub(crate) fn l2_forced_json_with(
+    queue: &bloch_pos_committee::l2_settlement::forced::Queue,
+    envelope: &ForcedEnvelopeLookup<'_>,
+) -> Json {
+    use bloch_pos_committee::l2_settlement::forced;
+    let record = |r: &forced::Record| l2_forced_record_json(r, envelope);
     let pending = queue.pending().len() as u64;
     let weight = queue.pending_weight();
     Json::obj(vec![
