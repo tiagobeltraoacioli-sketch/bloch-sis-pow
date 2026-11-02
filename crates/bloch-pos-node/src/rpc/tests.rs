@@ -2126,3 +2126,20 @@ fn rpc_source_identity_survives_queueing_and_normalizes_mapped_ipv4() {
         assert_eq!(worker.join().unwrap().unwrap(), Json::Null);
     }
 }
+
+/// `getl2settlement.forced` (candidate): the queue's fields, the due records
+/// and the next surcharge. The field is absent while the gate is inert, so
+/// `l2_settlement_json` keeps its exact keys on every network today.
+#[test]
+fn l2_forced_json_reports_the_queue_and_the_next_surcharge() {
+    use bloch_pos_committee::l2_settlement::forced;
+    let queue = forced::Queue::default();
+    let Json::Obj(fields) = l2_forced_json(&queue) else { panic!("not an object") };
+    let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, ["queued", "consumed", "pending", "root", "due", "due_hash", "next_surcharge_sat"]);
+    let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
+    assert_eq!(get("due"), Json::Arr(vec![]));
+    assert_eq!(get("due_hash"), Json::hex(&forced::hash(&[])));
+    assert_eq!(get("next_surcharge_sat"), Json::sat(1_000));
+    assert_eq!(bloch_pos_committee::params::L2_FORCED_INCLUSION_EPOCH, u64::MAX);
+}
