@@ -305,12 +305,15 @@ mod tests {
     }
 
     #[test]
-    fn the_l2_program_gates_ship_inert_and_outside_the_release_scope() {
+    fn the_l2_program_gates_ship_inert_or_armed_by_the_release_kit() {
+        // Inert: outside the release scope. Armed (only by
+        // `scripts/hf-release/l2-rollback/arm.py`): inside it, with final programs.
         for name in ["params::L2_NEXT_PROGRAM_EPOCH", "params::L2_PROGRAM_ROLLBACK_EPOCH"] {
             let g = HARD_FORK_GATES.iter().find(|g| g.name == name).expect("listed");
             assert_eq!(g.fork, Fork::L2Program);
-            assert!(!g.armed() && !g.node_policy_only);
-            assert!(!RELEASE_ARMABLE.contains(&name));
+            assert!(!g.node_policy_only);
+            assert_eq!(RELEASE_ARMABLE.contains(&name), g.armed(), "{name}");
+            assert!(!g.armed() || crate::l2_settlement::mainnet::PROGRAM_NEXT_FINAL, "{name}");
         }
     }
 
@@ -344,7 +347,10 @@ mod tests {
         assert!(l2_program_may_arm(10_000, 10_001, true));
         assert!(!l2_program_may_arm(10_000, M, false));
         assert!(!l2_program_may_arm(M, 10_001, false));
-        assert!(!crate::l2_settlement::mainnet::PROGRAM_NEXT_FINAL, "the candidate carries a placeholder recipient");
+        assert!(
+            l2_program_may_arm(params::L2_NEXT_PROGRAM_EPOCH, params::L2_PROGRAM_ROLLBACK_EPOCH, crate::l2_settlement::mainnet::PROGRAM_NEXT_FINAL),
+            "an armed gate needs final programs"
+        );
     }
 
     #[test]
