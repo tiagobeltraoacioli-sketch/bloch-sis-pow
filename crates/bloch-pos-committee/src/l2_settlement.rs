@@ -1320,19 +1320,21 @@ pub mod mainnet {
         pub proof_policy: [u8; 32],
     }
     /// `settlement_v3_mainnet_sparse` of bloch-l2-evm
-    /// `codex/sparse-audit-r7-20261102` b772f2d (code by hash, I1 and I3 fixed),
-    /// built in its pinned container: the sparse witness under the next rules,
-    /// guest ELF SHA-256 `78c533fa…7bea` (3 218 240 bytes). The state
-    /// transition and the statement bytes are those of the complete witness.
+    /// `codex/forced-guest-r8-20261102` 595d914 (agent 115's sparse guest with
+    /// L1 forced inclusion, agent 137), built in its pinned container on two
+    /// hosts: the sparse witness under the next rules with the forced prefix,
+    /// guest ELF SHA-256 `bc35e838…b048`. Its configuration `b4663ab8…a29d`
+    /// (tag `BLOCH:EVM:CONFIG:4:CANCUN`) is the next rules plus forced
+    /// inclusion, and is listed in [`FORCED_INCLUSION_CONFIGURATIONS`].
     /// The configuration carries a PLACEHOLDER fee-sweep recipient, `TBD-owner`,
     /// and the guest is a candidate, so these values are examples until
     /// [`PROGRAM_NEXT_FINAL`] says otherwise.
     pub const PROGRAM_NEXT: NextProgram = NextProgram {
         identities: [
-            h32("975ec2585246abeaea86421dd5726918b632dd91a246f635fe74990b68bcd878"),
-            h32("1f755262230baf9f1fded98a698cd3e31aa7f23a146116d4bd7e21e2bee2a5e0"),
-            h32("7e5b3c3345608ab36aced4db40f7692147a3fca80ace7a285bc335f342ee5910"),
-            h32("00fcb6786715822acf5676a6dc0f769218f47f9502b39e8a2de19af9c2ee5910"),
+            h32("b4663ab88607a1ebf7d1801920365fdde276889e211e097011bf48fcd0f7a29d"),
+            h32("1f744da8d3e0302cd39152e24e91071d7f0cfec7639245566a471cd6083a6b18"),
+            h32("6a140f117b84dd524b3681b9447422e5281451295144b5747197d0df5db6afc9"),
+            h32("00d4281e23ee13754a59b40dcc47422e55028a2534512d5d38cbe86fddb6afc9"),
         ],
         // The wrapper VK and the V3 tag are unchanged, so the policy is too.
         proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
@@ -1342,10 +1344,17 @@ pub mod mainnet {
     /// 776c6cb, the complete witness under the same rules, guest ELF SHA-256
     /// `44d4c9d7…ce47` (3 076 992 bytes).
     ///
-    /// It must keep the configuration of [`PROGRAM_NEXT`], which the assert below
-    /// pins: the swap to the next rules is one-way on the L2, because blocks under
-    /// them hold the vault code, so [`PROGRAM`] cannot prove any successor of such
-    /// a block. A rollback changes which guest proves the rules, never the rules.
+    /// It proves the next rules, which the assert below pins: the swap to the
+    /// next rules is one-way on the L2, because blocks under them hold the vault
+    /// code, so [`PROGRAM`] cannot prove any successor of such a block. A
+    /// rollback changes which guest proves the rules, never the rules.
+    ///
+    /// CANDIDATE gap: [`PROGRAM_NEXT`] now adds forced inclusion, and this guest
+    /// does not implement it (configuration `975ec258…`, unlisted). The assert
+    /// below admits exactly that difference, and
+    /// `hard_forks::l2_forced_rollback_may_arm` refuses to arm the rollback
+    /// together with forced inclusion until a complete-witness guest with the
+    /// forced rule replaces this one.
     pub const PROGRAM_FALLBACK: NextProgram = NextProgram {
         identities: [
             h32("975ec2585246abeaea86421dd5726918b632dd91a246f635fe74990b68bcd878"),
@@ -1360,12 +1369,12 @@ pub mod mainnet {
     /// this is true (`hard_forks::l2_program_may_arm`).
     pub const PROGRAM_NEXT_FINAL: bool = false;
     /// L2 configurations (identity 3) whose guest executes the forced records
-    /// of [`super::forced`] and publishes [`super::forced::inbox_hash`]. EMPTY:
-    /// neither [`PROGRAM_NEXT`] nor [`PROGRAM_FALLBACK`] implements it, so
-    /// [`crate::params::L2_FORCED_INCLUSION_EPOCH`] cannot be armed
-    /// (`hard_forks::l2_forced_inclusion_may_arm`). The configuration (and with
-    /// it the ELF and both keys) changes when the guest gains the rule.
-    pub const FORCED_INCLUSION_CONFIGURATIONS: &[[u8; 32]] = &[];
+    /// of [`super::forced`] and publishes [`super::forced::inbox_hash`]: the
+    /// next configuration (`BLOCH:EVM:CONFIG:4:CANCUN`). [`PROGRAM_FALLBACK`]
+    /// does not implement it. [`crate::params::L2_FORCED_INCLUSION_EPOCH`]
+    /// stays inert (`hard_forks::l2_forced_inclusion_may_arm`).
+    pub const FORCED_INCLUSION_CONFIGURATIONS: &[[u8; 32]] =
+        &[h32("b4663ab88607a1ebf7d1801920365fdde276889e211e097011bf48fcd0f7a29d")];
 
     const fn same_hash(a: &[u8; 32], b: &[u8; 32]) -> bool {
         let mut i = 0;
@@ -1377,7 +1386,14 @@ pub mod mainnet {
         }
         true
     }
-    const _: () = assert!(same_hash(&PROGRAM_NEXT.identities[0], &PROGRAM_FALLBACK.identities[0]));
+    // The fallback proves the next rules: the same configuration, or the next
+    // one without forced inclusion only (the next configuration is then the
+    // forced one and the fallback's is unlisted; see PROGRAM_FALLBACK).
+    const _: () = assert!(
+        same_hash(&PROGRAM_NEXT.identities[0], &PROGRAM_FALLBACK.identities[0])
+            || (crate::hard_forks::listed(FORCED_INCLUSION_CONFIGURATIONS, &PROGRAM_NEXT.identities[0])
+                && !crate::hard_forks::listed(FORCED_INCLUSION_CONFIGURATIONS, &PROGRAM_FALLBACK.identities[0]))
+    );
     const _: () = assert!(same_hash(&PROGRAM_NEXT.proof_policy, &PROGRAM_FALLBACK.proof_policy));
 
     /// OPTION, an owner decision, absent by default: a one-time reset of the
@@ -2135,9 +2151,12 @@ impl State {
     }
     /// Whether the next rules hold, and with them the next release rule. It
     /// follows from the committed configuration, so it adds no state bytes and
-    /// survives a rollback, which changes the guest and not the rules.
+    /// survives a rollback, which changes the guest and not the rules (the
+    /// fallback's configuration is the next one, or the next one without forced
+    /// inclusion).
     pub fn next_program_active(&self) -> bool {
         self.policy.identities[3] == mainnet::PROGRAM_NEXT.identities[0]
+            || self.policy.identities[3] == mainnet::PROGRAM_FALLBACK.identities[0]
     }
     /// The release window a claim in the next native block sees.
     pub fn release_window(&self) -> withdrawal::ReleaseWindow {

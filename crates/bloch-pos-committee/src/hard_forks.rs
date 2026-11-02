@@ -389,10 +389,15 @@ mod tests {
         assert!(l2_forced_rollback_may_arm(M, 10_100, false));
         assert!(!l2_forced_rollback_may_arm(10_060, 10_100, false));
         assert!(l2_forced_rollback_may_arm(10_060, 10_100, true));
-        // The fallback proves the same rules, so listing the next configuration
-        // lists the fallback's too (`mainnet` pins them equal).
-        assert_eq!(PROGRAM_FALLBACK.identities[0], PROGRAM_NEXT.identities[0]);
-        assert_eq!(listed(LIST, &PROGRAM_FALLBACK.identities[0]), listed(LIST, &PROGRAM_NEXT.identities[0]));
+        // The fallback either has the next configuration, or is the next rules
+        // without forced inclusion and then unlisted: in that case no release
+        // may arm a rollback together with forced inclusion.
+        let fallback_listed = listed(LIST, &PROGRAM_FALLBACK.identities[0]);
+        if PROGRAM_FALLBACK.identities[0] != PROGRAM_NEXT.identities[0] {
+            assert!(listed(LIST, &PROGRAM_NEXT.identities[0]) && !fallback_listed);
+            assert!(!l2_forced_rollback_may_arm(10_060, 10_100, fallback_listed));
+        }
+        assert!(l2_forced_rollback_may_arm(params::L2_FORCED_INCLUSION_EPOCH, params::L2_PROGRAM_ROLLBACK_EPOCH, fallback_listed));
         // Inert is always coherent.
         assert!(l2_forced_inclusion_may_arm(M, M, false));
         assert!(l2_forced_inclusion_may_arm(M, 10_060, true));

@@ -68,9 +68,15 @@
         l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
         assert_eq!(l2.forced_inclusion_program(), listed);
         assert_eq!(l2.enable_forced_inclusion(), listed && l2.user_transactions() && l2.asynchronous());
-        // The fallback keeps the rules, and with them the queue.
+        // The fallback keeps the next rules; it implements forced inclusion only
+        // if its configuration is listed (today it is not, so a rollback cannot
+        // be armed with forced inclusion: `hard_forks::l2_forced_rollback_may_arm`).
         l2.replace_program_for_test(&mainnet::PROGRAM_FALLBACK);
-        assert_eq!(l2.forced_inclusion_program(), listed);
+        assert!(l2.next_program_active());
+        assert_eq!(
+            l2.forced_inclusion_program(),
+            mainnet::FORCED_INCLUSION_CONFIGURATIONS.contains(&mainnet::PROGRAM_FALLBACK.identities[0])
+        );
     }
 
     #[test]
