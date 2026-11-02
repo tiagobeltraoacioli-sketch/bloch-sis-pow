@@ -1046,9 +1046,12 @@ pub mod mainnet {
         proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
     };
     /// The program a rollback installs at [`crate::params::L2_PROGRAM_ROLLBACK_EPOCH`]:
-    /// `settlement_v3_mainnet` of bloch-l2-evm `codex/l2-next-consensus-r3-20261031`
-    /// 776c6cb, the complete witness under the same rules, guest ELF SHA-256
-    /// `44d4c9d7…ce47` (3 076 992 bytes).
+    /// `settlement_v3_mainnet` of bloch-l2-evm `codex/fork-candidate-l2-r7-20261102`
+    /// e8feb2b, built in the pinned container of the sparse guests
+    /// (`integrations/sp1-execution/guest/build-container.sh`): the complete
+    /// witness under the same rules, guest ELF SHA-256 `3ad3a4f0…53b3`
+    /// (3 073 328 bytes). It replaces `44d4c9d7…ce47`, which neither that tree
+    /// nor the container reproduces.
     ///
     /// It must keep the configuration of [`PROGRAM_NEXT`], which the assert below
     /// pins: the swap to the next rules is one-way on the L2, because blocks under
@@ -1057,9 +1060,9 @@ pub mod mainnet {
     pub const PROGRAM_FALLBACK: NextProgram = NextProgram {
         identities: [
             h32("975ec2585246abeaea86421dd5726918b632dd91a246f635fe74990b68bcd878"),
-            h32("f3c20f71b84bb09cbab76a75c83a62c507fbefff4b347f787ef2d89aceb6f2b8"),
-            h32("50bd69a513f2463e748a8a62277bc25a08df69a4420a660e2a2ee3f957dca9f7"),
-            h32("00a17ad34a4fc918fba454531277bc25a11bed3490829983951771fcd7dca9f7"),
+            h32("c9f8cd40b703b47c1fdfb183c223da9977ac9839e3d1c436c28c9b7f331aacf8"),
+            h32("792452aa47ddaef1523907c03c39d3917df21180585eec804b27841626027d60"),
+            h32("00f248a5551f76bbc691c83e03c39d391fbe42301617bb202593c20b26027d60"),
         ],
         proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
     };
