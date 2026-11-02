@@ -2742,6 +2742,33 @@ pub const L2_NEXT_PROGRAM_EPOCH: u64 = u64::MAX;
 /// itself, and there is no key and no runtime input.
 pub const L2_PROGRAM_ROLLBACK_EPOCH: u64 = u64::MAX;
 
+/// CANDIDATE, not scheduled: the epoch boundary that enables L1 forced
+/// inclusion of L2 transactions (`l2_settlement::forced`, wire 0x1C) on an L2
+/// whose program implements it. `u64::MAX` means INERT. It cannot be armed while
+/// `l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS` is empty, nor
+/// before `L2_NEXT_PROGRAM_EPOCH` (`hard_forks::l2_forced_inclusion_may_arm`).
+pub const L2_FORCED_INCLUSION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn l2_forced_inclusion_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_forced_inclusion_test::forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_FORCED_INCLUSION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_forced_inclusion_test {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 pub(crate) fn l2_next_program_active(epoch: u64) -> bool {
     #[cfg(test)]
     if l2_next_program_test::forced() {

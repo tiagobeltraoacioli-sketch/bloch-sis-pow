@@ -1095,6 +1095,7 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
         PosTransaction::L2Deposit(tx) => tx.tip_millisat_per_gas,
         PosTransaction::L2DataAvailability(tx) => tx.tip_millisat_per_gas,
         PosTransaction::L2WithdrawClaim(tx) => tx.tip_millisat_per_gas,
+        PosTransaction::L2ForcedTransaction(tx) => tx.tip_millisat_per_gas,
         PosTransaction::RescueReveal(tx) => tx.tip_millisat_per_gas,
         _ => 0,
     }
@@ -1138,6 +1139,7 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
         PosTransaction::L2Deposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::L2DataAvailability(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::L2WithdrawClaim(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::L2ForcedTransaction(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::RescueReveal(tx) => Some(Sha3_256::digest(&tx.pubkey).into()),
         PosTransaction::WithdrawalCredentialRotation(tx) => Some(validator_lifecycle_source(tx.validator)),
         // F-9: a rescue commitment is free and names no key, so every one
@@ -4449,6 +4451,7 @@ impl Engine {
             PosTransaction::L2Deposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::L2DataAvailability(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::L2WithdrawClaim(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::L2ForcedTransaction(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::RescueReveal(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             _ => None,
         }
@@ -5042,6 +5045,7 @@ impl Engine {
         let mut reserved = BTreeSet::new();
         // Consensus caps DA batches per block; the highest tips win the slots.
         let mut da_batches = 0usize;
+        let mut forced_txs = 0usize;
         // F-9: consensus admits at most RESCUE_COMMITS_MAX_PER_BLOCK
         // commitments; they rank after every tipped transaction and among
         // themselves by `rescue_commit_rank`.
@@ -5083,6 +5087,7 @@ impl Engine {
                 PosTransaction::L2Deposit(tx) => tx.tx_bytes,
                 PosTransaction::L2DataAvailability(tx) => tx.tx_bytes,
                 PosTransaction::L2WithdrawClaim(tx) => tx.tx_bytes,
+                PosTransaction::L2ForcedTransaction(tx) => tx.tx_bytes,
                 PosTransaction::RescueReveal(tx) => tx.tx_bytes,
                 _ => 0,
             };
@@ -5099,6 +5104,12 @@ impl Engine {
                     continue;
                 }
                 da_batches += 1;
+            }
+            if matches!(tx, PosTransaction::L2ForcedTransaction(_)) {
+                if forced_txs >= bloch_pos_committee::l2_settlement::forced::MAX_PER_BLOCK {
+                    continue;
+                }
+                forced_txs += 1;
             }
             if matches!(tx, PosTransaction::RescueCommit(_)) {
                 if rescue_commits >= bloch_pos_committee::params::RESCUE_COMMITS_MAX_PER_BLOCK {
@@ -8006,6 +8017,9 @@ pub(crate) fn l2_admission_refusal(
         PosTransaction::L2Deposit(_) if !l2.is_some_and(|l2| l2.deposits_enabled()) => {
             Some("native L2 deposits are not active on this network")
         }
+        PosTransaction::L2ForcedTransaction(_) if !l2.is_some_and(|l2| l2.forced_queue().is_some()) => {
+            Some("L2 forced inclusion is not active on this network")
+        }
         _ => None,
     }
 }
@@ -8436,6 +8450,14 @@ fn admissible_with_network_verifier(
                 Ok(())
             } else {
                 Err("invalid L2 deposit hybrid PQ authorization")
+            }
+        }
+        PosTransaction::L2ForcedTransaction(forced) => {
+            // Queue state, fees and the surcharge run in consensus.
+            if strict_relay_hybrid().verify_with_key(&forced.funding_pubkey, &forced.intent_root(), &forced.signature) {
+                Ok(())
+            } else {
+                Err("invalid L2 forced transaction hybrid PQ authorization")
             }
         }
         PosTransaction::FundedDeposit(deposit) => {

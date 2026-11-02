@@ -2241,6 +2241,7 @@ impl PreparedSubmission {
             PosTransaction::L2Deposit(_) => "l2_deposit",
             PosTransaction::L2DataAvailability(_) => "l2_data_availability",
             PosTransaction::L2WithdrawClaim(_) => "l2_withdraw_claim",
+            PosTransaction::L2ForcedTransaction(_) => "l2_forced_transaction",
             PosTransaction::WithdrawalCredentialRotation(_) => "withdrawal_credential_rotation",
             PosTransaction::RescueCommit(_) => "pq_rescue_commit",
             PosTransaction::RescueReveal(_) => "pq_rescue_reveal",
