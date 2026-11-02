@@ -205,6 +205,91 @@ fn deposit_da_claim_and_their_rollback_move_exactly_the_right_balances() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Every table a reader sees, for comparing an index that went through a reorg with one that did not.
+fn assert_same_tables(ix: &Index, fresh: &Index, when: &str) {
+    assert_eq!(ix.utxo, fresh.utxo, "{when}: utxo");
+    assert_eq!(ix.all_outputs, fresh.all_outputs, "{when}: all_outputs");
+    assert_eq!(ix.spent_at, fresh.spent_at, "{when}: spent_at");
+    assert_eq!(ix.balance, fresh.balance, "{when}: balance");
+    // A rollback leaves an empty set for a script it emptied; no answer reads it differently from an absent one.
+    let non_empty = |i: &Index| i.by_script.iter().filter(|(_, set)| !set.is_empty()).map(|(k, v)| (*k, v.clone())).collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(non_empty(ix), non_empty(fresh), "{when}: by_script");
+    assert_eq!(ix.history, fresh.history, "{when}: history");
+    assert_eq!(ix.txs, fresh.txs, "{when}: txs");
+    assert_eq!(ix.by_txid, fresh.by_txid, "{when}: by_txid");
+    assert_eq!(ix.chain, fresh.chain, "{when}: chain");
+    assert_eq!(ix.epochs, fresh.epochs, "{when}: epochs");
+    assert_eq!(ix.participation, fresh.participation, "{when}: participation");
+    assert_eq!(ix.eutxo_total_sat(), fresh.eutxo_total_sat(), "{when}: eutxo total");
+    let escrow = |i: &Index, f: fn(&TxRow) -> u128| i.txs.iter().map(f).sum::<u128>();
+    assert_eq!(escrow(ix, |t| t.l2_escrow_in_sat), escrow(fresh, |t| t.l2_escrow_in_sat), "{when}: escrow in");
+    assert_eq!(escrow(ix, |t| t.l2_escrow_out_sat), escrow(fresh, |t| t.l2_escrow_out_sat), "{when}: escrow out");
+}
+
+/// An L1 reorg onto a competing branch at the same height and back, repeatedly. Same-slot replacement included: the
+/// shape that a slot comparison misses. Nothing may count twice, compared table by table with a fresh index of the
+/// branch. Bookkeeping only: no replay, these blocks carry no real signatures.
+#[test]
+fn switching_between_competing_branches_counts_nothing_twice() {
+    let genesis = h32(1);
+    let (funder, r1, r2) = (h32(0xF0), h32(0xE0), h32(0xE1));
+    let coin = OutPoint { txid: h32(10), vout: 0 };
+    let opening = vec![(coin, Utxo { value_sat: OPENING, script_hash: funder, created_height: 0 })];
+
+    let d = deposit(coin, 700, 290, funder);
+    let b1 = envelope(header(1, genesis, 1), std::slice::from_ref(&d));
+    let shared = OutPoint { txid: d.txid(), vout: 0 };
+    let id1 = *BlockId::of(&b1.header).as_bytes();
+
+    // Branch A: a claim of 300 to r1, then more on top.
+    let a_claim = claim(shared, 300, r1, 250, funder);
+    let a2 = envelope(header(2, id1, 2), std::slice::from_ref(&a_claim));
+    let a_da = data_availability(OutPoint { txid: a_claim.txid(), vout: 1 }, 200, funder);
+    let a3 = envelope(header(3, *BlockId::of(&a2.header).as_bytes(), 3), std::slice::from_ref(&a_da));
+    // Branch B: same slots, same height. The funder's coin pays a data record, and a smaller claim goes to r2.
+    let b_da = data_availability(shared, 280, funder);
+    let b2 = envelope(header(2, id1, 12), std::slice::from_ref(&b_da));
+    let b_claim = claim(OutPoint { txid: b_da.txid(), vout: 0 }, 100, r2, 270, funder);
+    let b3 = envelope(header(3, *BlockId::of(&b2.header).as_bytes(), 13), std::slice::from_ref(&b_claim));
+
+    let dir = std::env::temp_dir().join(format!("bloch-indexer-l2-branches-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("blocks.log");
+    let fresh = |blocks: &[BlockEnvelope], name: &str| {
+        let p = dir.join(name);
+        write_log(&p, blocks);
+        let mut ix = Index::new(genesis, opening.clone(), 64);
+        ix.sync(&mut LogReader::open(&p).unwrap()).unwrap();
+        ix
+    };
+    let branch_a = [b1.clone(), a2, a3];
+    let branch_b = [b1, b2, b3];
+    let fresh_a = fresh(&branch_a, "a.log");
+    let fresh_b = fresh(&branch_b, "b.log");
+    assert_eq!(fresh_a.balance_of(&r1), 300);
+    assert_eq!(fresh_b.balance_of(&r2), 100);
+
+    write_log(&path, &branch_a);
+    let mut reader = LogReader::open(&path).unwrap();
+    let mut ix = Index::new(genesis, opening.clone(), 64);
+    ix.sync(&mut reader).unwrap();
+    assert_same_tables(&ix, &fresh_a, "first A");
+    for round in 0..5 {
+        write_log(&path, &branch_b);
+        reader.reopen().unwrap();
+        assert_eq!(ix.sync(&mut reader).unwrap(), (2, 2));
+        assert_same_tables(&ix, &fresh_b, &format!("round {round}, B"));
+        assert_eq!(ix.balance_of(&r1), 0, "the orphaned claim is gone");
+        write_log(&path, &branch_a);
+        reader.reopen().unwrap();
+        assert_eq!(ix.sync(&mut reader).unwrap(), (2, 2));
+        assert_same_tables(&ix, &fresh_a, &format!("round {round}, A"));
+        assert_eq!(ix.balance_of(&r2), 0, "the orphaned claim is gone");
+    }
+    assert_eq!(ix.stats.reorgs_handled, 10);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A zero change value creates no output (consensus: `change.value > 0`). A
 /// settlement touches no eUTXO and has a fee of zero.
 #[test]
