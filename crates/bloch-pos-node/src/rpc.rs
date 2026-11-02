@@ -2992,6 +2992,26 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
             ("count", Json::u(l2.inbox().len() as u64)), ("consumed", Json::u(l2.consumed())),
             ("escrow_sat", Json::s(l2.escrow_sat().to_string())),
         ])),
+        // DA slots of the next block on this head: the registered key owns
+        // `reserved_per_block` of them once `params::L2_DA_RESERVED_SLOT_EPOCH`
+        // binds (`reserved_key` is then non-null). A settler whose funding key
+        // hash equals `reserved_key` cannot be crowded out by other DA.
+        ("data_availability_slots", {
+            use bloch_pos_committee::l2_settlement::da;
+            let reserved = da::reserved_key_at(epoch_of(state.slot()));
+            Json::obj(vec![
+                ("per_block", Json::u(da::MAX_PER_BLOCK as u64)),
+                ("open_per_block", Json::u(if reserved.is_some() { da::OPEN_PER_BLOCK } else { da::MAX_PER_BLOCK } as u64)),
+                ("reserved_per_block", Json::u(if reserved.is_some() { da::RESERVED_PER_BLOCK as u64 } else { 0 })),
+                ("reserved_key", reserved.as_ref().map_or(Json::Null, |k| Json::hex(k))),
+                ("reserved_slot_epoch", if bloch_pos_committee::params::L2_DA_RESERVED_SLOT_EPOCH == u64::MAX {
+                    Json::Null
+                } else {
+                    Json::u(bloch_pos_committee::params::L2_DA_RESERVED_SLOT_EPOCH)
+                }),
+                ("registered_key", da::registered_key().as_ref().map_or(Json::Null, |k| Json::hex(k))),
+            ])
+        }),
         // Retained L1 data-availability records (M3), oldest first.
         ("data_availability", Json::Arr(l2.data_availability().iter().map(|r| Json::obj(vec![
             ("l2_number", Json::u(r.l2_number)), ("commitment", Json::hex(&r.commitment)),

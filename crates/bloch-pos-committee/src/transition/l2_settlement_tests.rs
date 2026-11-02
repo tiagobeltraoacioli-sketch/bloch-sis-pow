@@ -4335,6 +4335,208 @@ mod l2_tests {
         assert!(CommittedState::decode_local_cache(&swapped, &header).is_err());
     }
 
+    // ── Reserved DA slot (params::L2_DA_RESERVED_SLOT_EPOCH) ────────────────
+    //
+    // Agent 78's crowd-out: third parties fill all `da::MAX_PER_BLOCK` DA slots
+    // at tip 0, so the settler's batch never lands and no user-transaction
+    // block settles. Past the gate one slot is the registered key's.
+
+    fn slot_key(byte: u8) -> Vec<u8> {
+        vec![byte; crate::transition::funded::ADMISSION_PQ_KEY_BYTES]
+    }
+
+    /// `funded_async_fixture` with one `FUNDED` coin per key, at txid
+    /// `[0x60 + i; 32]`, plus one empty block that anchors the source.
+    fn slot_fixture(keys: &[Vec<u8>]) -> (CommittedState, Vec<RandaoChain>) {
+        let coins: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| crate::state_root::EutxoEntry {
+                txid: [0x60 + i as u8; 32],
+                vout: 0,
+                value: FUNDED,
+                script_hash: script_of(key),
+            })
+            .collect();
+        let (_, mut genesis, mut chains) = setup_with(4, ToyVerifier, &coins);
+        let identities = std::array::from_fn(|i| hash_at(TEMPLATE, S + i * 32));
+        let mut policy = Policy {
+            identities,
+            proof_policy: bloch_l2_proof::policy_commitment(),
+            chain_id: 700771,
+            initial_l2_parent: hash_at(TEMPLATE, S + 272),
+            initial_l2_state: hash_at(TEMPLATE, S + 304),
+            attestor_set: [0; 32],
+        };
+        policy.identities[0] = [0x91; 32];
+        policy.identities[1] = *genesis.head.as_bytes();
+        genesis.admission_network_domain = Some(policy.identities[0]);
+        genesis = genesis.configure_l2_genesis_async(policy).unwrap();
+        let t = Transition::new(ToyVerifier);
+        let first = build_block(&t, &genesis, 1, &[], &[], &mut chains);
+        let s1 = t.apply_block(&genesis, &first, &[], &[]).unwrap();
+        let s2 = apply(&s1, 2, &[], &mut chains).unwrap();
+        (s2, chains)
+    }
+
+    /// Signed DA transactions, one per `(key index, l2 number, payload)`,
+    /// each key spending its own coin and then its own change, so they can
+    /// all go in one block on `pre`.
+    fn slot_batches(pre: &CommittedState, keys: &[Vec<u8>], plan: &[(usize, u64, Vec<u8>)]) -> Vec<PosTransaction> {
+        let mut coins: Vec<(([u8; 32], u32), u64)> =
+            (0..keys.len()).map(|i| (([0x60 + i as u8; 32], 0), FUNDED)).collect();
+        let fee = pre.next_base_fee();
+        let mut scratch = pre.clone();
+        let mut out = Vec::new();
+        for (who, number, payload) in plan {
+            let key = &keys[*who];
+            let (outpoint, value) = coins[*who];
+            let mut tx = L2DataAvailability {
+                network_domain: [0x91; 32],
+                funding_pubkey: key.clone(),
+                inputs: vec![crate::transition::FundingInput { txid: outpoint.0, vout: outpoint.1 }],
+                l2_chain_id: 700771,
+                l2_block_number: *number,
+                payload: payload.clone(),
+                change: TransferOutput { value: 0, script_hash: script_of(key) },
+                tx_bytes: 0,
+                tip_millisat_per_gas: 0,
+                signature: vec![0; 32],
+            };
+            tx.tx_bytes = tx.canonical_bytes().len() as u64;
+            let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, tx.tx_bytes, fee, 0);
+            tx.change.value = (u128::from(value) - charge.base_fee_sat - charge.priority_fee_sat) as u64;
+            tx.signature = toy_sign(key, &tx.intent_root());
+            let wire = PosTransaction::L2DataAvailability(tx.clone());
+            scratch.apply_transaction(&wire, 0, fee, &ToyVerifier).expect("each batch is valid on its own");
+            coins[*who] = ((wire.txid(), 0), tx.change.value);
+            out.push(wire);
+        }
+        out
+    }
+
+    /// Junk for an unsettled number, as the attack sends: canonical, unrelated.
+    fn junk(i: u8) -> Vec<u8> {
+        batch(&[&[0xd0, i]])
+    }
+
+    #[test]
+    fn the_reserved_da_slot_is_inert_and_registers_no_key() {
+        assert_eq!(crate::params::L2_DA_RESERVED_SLOT_EPOCH, u64::MAX);
+        assert_eq!(da::REGISTERED_KEY, crate::l2_settlement::mainnet::DA_RESERVED_KEY);
+        for epoch in [0, 5_850, 7_360, 10_060, u64::MAX - 1] {
+            assert_eq!(da::reserved_key_at(epoch), None, "{epoch}");
+        }
+        // Inert: four DA from anyone, as today.
+        let any = slot_key(0x01);
+        let keys = [any.as_slice(); 4];
+        assert!(da::block_admits(10_060, keys));
+        assert!(!da::block_admits(10_060, [any.as_slice(); 5]));
+        // Gate forced but no key registered: still the old rule.
+        let _gate = crate::params::l2_da_reserved_slot_test::open(None);
+        assert_eq!(da::reserved_key_at(10_060), None);
+        assert!(da::block_admits(10_060, [any.as_slice(); 4]));
+    }
+
+    /// Every block the new rule admits, the old rule admits: the gate is a
+    /// soft fork, and a non-upgraded validator follows an upgraded proposer.
+    #[test]
+    fn the_reserved_slot_only_refuses_blocks_the_old_rule_admitted() {
+        let own = slot_key(0xee);
+        let other = slot_key(0x01);
+        let _gate = crate::params::l2_da_reserved_slot_test::open(Some(da::funder(&own)));
+        let mut refused_by_new_only = 0;
+        for n_own in 0..=6usize {
+            for n_other in 0..=6usize {
+                let keys: Vec<&[u8]> = std::iter::repeat_n(own.as_slice(), n_own)
+                    .chain(std::iter::repeat_n(other.as_slice(), n_other))
+                    .collect();
+                let new = da::block_admits(7, keys.iter().copied());
+                let old = n_own + n_other <= da::MAX_PER_BLOCK;
+                assert!(!new || old, "{n_own} own, {n_other} other");
+                assert_eq!(new, old && n_other <= da::OPEN_PER_BLOCK, "{n_own} own, {n_other} other");
+                refused_by_new_only += usize::from(old && !new);
+            }
+        }
+        // Exactly the blocks with four third-party batches.
+        assert_eq!(refused_by_new_only, 1);
+    }
+
+    /// The post-state of one block at slot 3 on a fresh `slot_fixture`,
+    /// carrying `plan`. Built by hand (as `more_than_four_da_batches_in_one_block_are_refused`
+    /// does), because `build_block` panics on a block the transition refuses.
+    fn slot_attempt(keys: &[Vec<u8>], plan: &[(usize, u64, Vec<u8>)]) -> Result<CommittedState, TransitionError> {
+        let (pre, mut chains) = slot_fixture(keys);
+        let txs = slot_batches(&pre, keys, plan);
+        let t = Transition::new(ProofDouble);
+        let mut block = build_block(&t, &pre, 3, &[], &[], &mut chains);
+        block.header.body_root =
+            crate::derive::body_root(&txs.iter().map(PosTransaction::canonical_bytes).collect::<Vec<_>>());
+        let pk = crate::attestation::KeyLookup::pubkey(&pre, block.header.proposer_index).unwrap();
+        block.proposer_sig = toy_sign(pk, &block.header.proposal_signing_root());
+        t.compute_post_state(&pre, &block, &[], &txs)
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn past_the_gate_three_slots_are_open_and_one_is_the_registered_keys() {
+        let keys = vec![slot_key(0x01), slot_key(0xee)];
+        let four_junk: Vec<_> = (0..4u8).map(|i| (0, 1 + u64::from(i % 2), junk(i))).collect();
+        // Below the gate the attack block is valid: a proposer may fill every slot.
+        assert!(slot_attempt(&keys, &four_junk).is_ok());
+
+        let _gate = crate::params::l2_da_reserved_slot_test::open(Some(da::funder(&keys[1])));
+        assert_eq!(
+            slot_attempt(&keys, &four_junk).err(),
+            Some(TransitionError::BlockGasLimitExceeded),
+            "four third-party batches are refused past the gate"
+        );
+        assert!(slot_attempt(&keys, &four_junk[..3]).is_ok(), "three are fine");
+        let payload = batch(&[&[0x02, 0xc0], b"user tx"]);
+        let mixed = [(0, 1, junk(0)), (0, 2, junk(1)), (0, 1, junk(2)), (1, 1, payload.clone())];
+        assert!(slot_attempt(&keys, &mixed).is_ok(), "three others and the registered key");
+        let mut five = mixed.to_vec();
+        five.push((1, 2, junk(9)));
+        assert_eq!(slot_attempt(&keys, &five).err(), Some(TransitionError::BlockGasLimitExceeded), "the total cap stays 4");
+        let own_only: Vec<_> = (0..4u8).map(|i| (1, 1 + u64::from(i), junk(i))).collect();
+        assert!(slot_attempt(&keys, &own_only).is_ok(), "the registered key may use the open slots too");
+    }
+
+    /// The crowd-out end to end on the transition: under attack, the block
+    /// that carries the settler's batch is valid only with at most three
+    /// junk batches, and the next block settles the user-transaction block.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn under_a_da_flood_the_registered_keys_batch_lands_and_its_block_settles() {
+        let keys = vec![slot_key(0x01), slot_key(0x02), slot_key(0x03), slot_key(0xee)];
+        let (pre, mut chains) = slot_fixture(&keys);
+        let _gate = crate::params::l2_da_reserved_slot_test::open(Some(da::funder(&keys[3])));
+        let payload = batch(&[&[0x02, 0xc0], b"user tx"]);
+        let commitment = da::commitment(700771, 1, &payload);
+        let block = slot_batches(&pre, &keys, &[(0, 1, junk(0)), (1, 1, junk(1)), (2, 2, junk(2)), (3, 1, payload.clone())]);
+        let s3 = apply(&pre, 3, &block, &mut chains).expect("three junk batches and the settler's");
+        let records = s3.l2_settlement().unwrap().data_availability().to_vec();
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().any(|r| r.l2_number == 1 && r.commitment == commitment));
+        let settle = PosTransaction::L2SettlementAsync(Box::new(v3_with_da(&s3, commitment)));
+        let s4 = apply(&s3, 4, std::slice::from_ref(&settle), &mut chains).expect("settles with the settler's DA");
+        assert_eq!(s4.l2_settlement().unwrap().settled_number(), 1);
+    }
+
+    /// The gate moves no committed byte: the same block gives the same state
+    /// root on either side of it (history replays unchanged).
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn the_reserved_slot_changes_no_state_byte() {
+        let keys = vec![slot_key(0x01), slot_key(0xee)];
+        let plan = [(0, 1, junk(0)), (1, 1, junk(1))];
+        let before = slot_attempt(&keys, &plan).unwrap();
+        let _gate = crate::params::l2_da_reserved_slot_test::open(Some(da::funder(&keys[1])));
+        let after = slot_attempt(&keys, &plan).unwrap();
+        assert_eq!(before.state_root(), after.state_root());
+        assert_eq!(before, after);
+    }
+
     // Adversarial multi-branch FFG suite (p2b).
     mod ffg_branch_tests {
         use super::*;

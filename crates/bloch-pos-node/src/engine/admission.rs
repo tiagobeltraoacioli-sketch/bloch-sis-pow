@@ -316,6 +316,8 @@ pub(super) fn check_transfer(
 pub(super) struct CapacityPlan {
     pub stale: BTreeSet<Vec<u8>>,
     pub lower_fee: Option<Vec<u8>>,
+    /// Entries the registered DA key's batch displaces (reserved DA slot).
+    pub displaced: Vec<Vec<u8>>,
 }
 
 impl Engine {
@@ -324,7 +326,7 @@ impl Engine {
         let mut count = self.mempool.len();
         let mut bytes = self.mempool.bytes();
         let mut source_count = source.map_or(0, |s| self.mempool.source_count(&s));
-        let mut plan = CapacityPlan { stale: BTreeSet::new(), lower_fee: None };
+        let mut plan = CapacityPlan { stale: BTreeSet::new(), lower_fee: None, displaced: Vec::new() };
         let mut funded_context = None;
         // No full-pool revalidation on ordinary admission. Under any capacity
         // pressure, stale backing must not retain priority through claimed tips.
@@ -345,6 +347,26 @@ impl Engine {
                 if same_source { source_count = source_count.saturating_sub(1); }
                 if count < MEMPOOL_MAX && bytes.saturating_add(encoded) <= MAX_MEMPOOL_BYTES
                     && source_count < MEMPOOL_MAX_PER_SOURCE { break; }
+            }
+        }
+        // The registered DA key's batch (past `L2_DA_RESERVED_SLOT_EPOCH`)
+        // displaces the lowest-tip entries that are not its own, whatever
+        // their tip, until it fits by count and bytes. Otherwise a pool full
+        // of valid tip-0 DA keeps it out of every mempool and the reserved
+        // block slot serves nobody. Its own per-source cap bounds what it can
+        // displace; the others lose a place in the queue, never a fee.
+        let reserved = da_reserved_key(epoch);
+        if is_reserved_da(incoming, reserved) && source_count < MEMPOOL_MAX_PER_SOURCE
+            && (count >= MEMPOOL_MAX || bytes.saturating_add(encoded) > MAX_MEMPOOL_BYTES) {
+            let mut victims: Vec<_> = self.mempool.iter()
+                .filter(|(key, tx)| !plan.stale.contains(*key) && !is_reserved_da(tx, reserved))
+                .collect();
+            victims.sort_by_key(|(key, tx)| (tx_tip_rate(tx), std::cmp::Reverse(key.len())));
+            for (key, _) in victims {
+                if count < MEMPOOL_MAX && bytes.saturating_add(encoded) <= MAX_MEMPOOL_BYTES { break; }
+                plan.displaced.push(key.clone());
+                count = count.saturating_sub(1);
+                bytes = bytes.saturating_sub(key.len());
             }
         }
         if bytes.saturating_add(encoded) > MAX_MEMPOOL_BYTES { return Err(Refusal::AtCapacity); }

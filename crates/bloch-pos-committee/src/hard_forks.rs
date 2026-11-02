@@ -52,6 +52,8 @@ pub enum Fork {
     Hf3,
     /// The L2 program swap and its rollback, on no HF line of their own.
     L2Program,
+    /// The reserved DA slot of the registered L2 DA key, on no HF line.
+    L2DataAvailability,
 }
 
 /// One activation gate of the HF1/HF2/HF3 lines.
@@ -104,6 +106,8 @@ pub const HARD_FORK_GATES: &[HardForkGate] = &[
     // The next L2 program: inert, outside `RELEASE_ARMABLE`.
     gate!(L2Program, params::L2_NEXT_PROGRAM_EPOCH, false),
     gate!(L2Program, params::L2_PROGRAM_ROLLBACK_EPOCH, false),
+    // The reserved DA slot: inert, outside `RELEASE_ARMABLE`.
+    gate!(L2DataAvailability, params::L2_DA_RESERVED_SLOT_EPOCH, false),
 ];
 
 /// Gates that no scheduled release may arm (owner scope 2026-10-20: nothing
@@ -159,6 +163,13 @@ pub const fn l2_program_schedule_coherent(kes_enforcement: u64, next: u64, rollb
 /// An armed swap or rollback names final programs, not the candidate's examples.
 pub const fn l2_program_may_arm(next: u64, rollback: u64, program_final: bool) -> bool {
     program_final || (!armed(next) && !armed(rollback))
+}
+
+/// The reserved DA slot is inert, or a DA key is registered for it. With no
+/// key the rule would bind nothing (`da::reserved_key_at`), so an armed gate
+/// without one is a release mistake, refused at compile time.
+pub const fn l2_da_reserved_slot_may_arm(epoch: u64, key: Option<[u8; 32]>) -> bool {
+    !armed(epoch) || key.is_some()
 }
 
 /// The ordering rules between all HF1/HF2/HF3 gates (see the module docs).
@@ -223,6 +234,10 @@ const _: () = assert!(l2_program_may_arm(
     params::L2_NEXT_PROGRAM_EPOCH,
     params::L2_PROGRAM_ROLLBACK_EPOCH,
     crate::l2_settlement::mainnet::PROGRAM_NEXT_FINAL,
+));
+const _: () = assert!(l2_da_reserved_slot_may_arm(
+    params::L2_DA_RESERVED_SLOT_EPOCH,
+    crate::l2_settlement::da::REGISTERED_KEY,
 ));
 // The P5a alias must follow the HF2 release switch.
 const _: () = assert!(params::NATIVE_SLASHING_ACTIVATION_EPOCH == params::HF2_SLASHING_V2_EPOCH);
@@ -312,6 +327,20 @@ mod tests {
             assert!(!g.armed() && !g.node_policy_only);
             assert!(!RELEASE_ARMABLE.contains(&name));
         }
+    }
+
+    #[test]
+    fn the_reserved_da_slot_ships_inert_outside_the_release_scope_and_needs_a_key() {
+        let name = "params::L2_DA_RESERVED_SLOT_EPOCH";
+        let g = HARD_FORK_GATES.iter().find(|g| g.name == name).expect("listed");
+        assert_eq!(g.fork, Fork::L2DataAvailability);
+        assert!(!g.armed() && !g.node_policy_only);
+        assert!(!RELEASE_ARMABLE.contains(&name));
+        assert_eq!(params::L2_DA_RESERVED_SLOT_EPOCH, M);
+        assert_eq!(crate::l2_settlement::mainnet::DA_RESERVED_KEY, None, "TBD-owner");
+        assert!(l2_da_reserved_slot_may_arm(M, None));
+        assert!(!l2_da_reserved_slot_may_arm(9_000, None));
+        assert!(l2_da_reserved_slot_may_arm(9_000, Some([7; 32])));
     }
 
     #[test]
