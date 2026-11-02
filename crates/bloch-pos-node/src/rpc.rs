@@ -945,6 +945,14 @@ pub enum RpcRequest {
         block: Option<[u8; 32]>,
         set_source_epoch: Option<u64>,
     },
+    /// `getlcproof(epoch|"latest", set_source_epoch?, block?)`: the same
+    /// certificate as a `BLCLMP01` proof, with the finality-leaf and 0x22
+    /// proofs (see `bloch_finality_cert::lc_proof`).
+    LcProof {
+        epoch: Option<u64>,
+        set_source_epoch: Option<u64>,
+        block: Option<[u8; 32]>,
+    },
 }
 
 /// Whatever can answer an [`RpcRequest`]. In production this is the channel to
@@ -1374,6 +1382,24 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
                 Some(_) => Some(want_u64(params, 2, "set_source_epoch")?),
             };
             RpcRequest::FinalityCertificate { epoch, block, set_source_epoch }
+        }
+        "getlcproof" => {
+            let epoch = match pick(params, 0, "epoch") {
+                None | Some(Json::Null) => None,
+                Some(v) if v.as_str() == Some("latest") => None,
+                Some(v) => Some(v.as_u64().ok_or_else(|| {
+                    RpcError::invalid_params("`epoch` must be a non-negative integer or \"latest\"")
+                })?),
+            };
+            let set_source_epoch = match pick(params, 1, "set_source_epoch") {
+                None | Some(Json::Null) => None,
+                Some(_) => Some(want_u64(params, 1, "set_source_epoch")?),
+            };
+            let block = match pick(params, 2, "block") {
+                None | Some(Json::Null) => None,
+                Some(_) => Some(want_hex32(params, 2, "block")?),
+            };
+            RpcRequest::LcProof { epoch, set_source_epoch, block }
         }
         other => return Err(RpcError::method_not_found(other)),
     })

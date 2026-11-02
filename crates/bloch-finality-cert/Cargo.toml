@@ -23,3 +23,7 @@ sha3 = "0.10"
 name = "bloch-finality-verify"
 path = "src/bin/bloch-finality-verify.rs"
 required-features = ["hybrid"]
+
+[[test]]
+name = "lc_proof"
+required-features = ["hybrid"]

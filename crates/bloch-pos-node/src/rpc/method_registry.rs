@@ -109,6 +109,9 @@ fn frozen_method_space(req: &RpcRequest) -> &'static str {
         // Finality certificates (2026-10-19): a new question — "prove this
         // checkpoint is final to someone who runs no node" — not an alias.
         RpcRequest::FinalityCertificate { .. } => "getfinalitycertificate",
+        // Light-client proofs (2026-10-30): "prove it under the rule of its
+        // epoch" (frozen set, KES), which a bare certificate cannot.
+        RpcRequest::LcProof { .. } => "getlcproof",
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }
@@ -167,7 +170,10 @@ fn every_frozen_variant_routes_under_its_registered_name() {
         ("getvalidatoradmission", "[]"),
         ("getmempoolinfo", "[]"),
         ("getvalidators", "[]"),
+        ("getl2settlement", "[]"),
+        ("getkes", "[]"),
         ("getfinalitycertificate", "[\"latest\"]"),
+        ("getlcproof", "[\"latest\"]"),
     ];
     for (name, params) in cases {
         let p = parse_json(params).expect("test params parse");

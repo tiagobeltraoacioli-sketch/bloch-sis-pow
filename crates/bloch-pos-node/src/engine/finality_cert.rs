@@ -20,21 +20,65 @@
 //! Nothing here feeds a consensus input. A certificate this node cannot build
 //! (registry not retained, epoch not finalized) is an RPC error, never a
 //! change in behaviour.
+//!
+//! `getlcproof` is the same certificate plus the state proofs a client needs
+//! to judge it after HF1 and after KES binds (`bloch_finality_cert::lc_proof`):
+//! the finality leaf and the 0x22 entries, proven at the same boundary, from the
+//! same tree, as the registry.
 
 use super::*;
+use bloch_finality_cert::lc_proof::{self, CheckpointExtensions, MainnetProof};
 use bloch_finality_cert::{Certificate, Link, RegistryProof, Vote};
+
+/// Most checkpoints the ring may hold, whatever the environment asks.
+const MAX_CERT_EPOCHS: usize = 4096;
+
+/// Checkpoints retained when `BLOCH_FINALITY_CERT_EPOCHS` is unset or invalid.
+const DEFAULT_CERT_EPOCHS: usize = 16;
+
+/// The smallest retention that lets a client hop across the verifier's whole
+/// default bound (256 epochs). A prover's follower needs at least this.
+const PROVER_CERT_EPOCHS: usize = 300;
+
+/// `BLOCH_FINALITY_CERT_EPOCHS` as the ring size, with what an operator should
+/// be told about the value. Never refuses to start: this is an RPC-only setting.
+pub(super) fn parse_cert_epochs(raw: Option<&str>) -> (usize, Option<String>) {
+    let Some(raw) = raw else {
+        return (DEFAULT_CERT_EPOCHS, None);
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(n) if n > MAX_CERT_EPOCHS => (
+            MAX_CERT_EPOCHS,
+            Some(format!("BLOCH_FINALITY_CERT_EPOCHS={n} is above the limit; using {MAX_CERT_EPOCHS}")),
+        ),
+        Ok(n) => (n, None),
+        Err(_) => (
+            DEFAULT_CERT_EPOCHS,
+            Some(format!("BLOCH_FINALITY_CERT_EPOCHS={raw:?} is not a number; using {DEFAULT_CERT_EPOCHS}")),
+        ),
+    }
+}
 
 /// How many checkpoint registry proofs to retain. `0` disables the feature
 /// (and its once-per-epoch cost) entirely.
 pub(super) fn finality_cert_epochs() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("BLOCH_FINALITY_CERT_EPOCHS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(16)
-            .min(4096)
-    })
+    *N.get_or_init(|| parse_cert_epochs(std::env::var("BLOCH_FINALITY_CERT_EPOCHS").ok().as_deref()).0)
+}
+
+/// Says at boot what the ring holds, so a mistyped setting on a prover's
+/// follower shows in the log and not in the first refused hop.
+pub(super) fn announce_finality_cert_retention() {
+    let raw = std::env::var("BLOCH_FINALITY_CERT_EPOCHS").ok();
+    if let Some(warning) = parse_cert_epochs(raw.as_deref()).1 {
+        eprintln!("finality-cert: WARNING: {warning}");
+    }
+    let n = finality_cert_epochs();
+    println!(
+        "finality-cert: retaining {n} checkpoint proofs (BLOCH_FINALITY_CERT_EPOCHS; a prover's \
+         follower needs at least {PROVER_CERT_EPOCHS}; the ring is rebuilt only from blocks \
+         applied in this boot, so a boot from the state cache starts it near empty)"
+    );
 }
 
 /// Built certificates are immutable once their epoch is finalized (the
@@ -48,8 +92,12 @@ const MAX_ANCESTRY: usize = bloch_finality_cert::MAX_ANCESTRY;
 pub(super) struct FinalityCertStore {
     /// `(checkpoint block id, registry proof)`, oldest first.
     registry: VecDeque<([u8; 32], Arc<RegistryProof>)>,
+    /// `(checkpoint block id, extensions)`, parallel to `registry`.
+    extensions: VecDeque<([u8; 32], Arc<CheckpointExtensions>)>,
     /// `((epoch, block, set source epoch), reply)`, oldest first.
     cache: VecDeque<((u64, Option<[u8; 32]>, u64), Json)>,
+    /// The same, for `getlcproof` (its `set_source_epoch` as requested).
+    lc_cache: VecDeque<((u64, Option<[u8; 32]>, Option<u64>), Json)>,
 }
 
 impl Engine {
@@ -78,14 +126,16 @@ impl Engine {
         let Some(header) = self.envelope_by_id(&pid).map(|e| e.header.clone()) else {
             return;
         };
-        let Some(proof) = bloch_finality_cert::registry_proof(&state, header) else {
+        let Some((proof, extensions)) = lc_proof::checkpoint_proofs(&state, header) else {
             // The retained post-state does not commit to the header's root
             // (e.g. an unbound genesis header). Nothing to serve; not an error.
             return;
         };
         self.finality_certs.registry.push_back((pid, Arc::new(proof)));
+        self.finality_certs.extensions.push_back((pid, Arc::new(extensions)));
         while self.finality_certs.registry.len() > cap {
             self.finality_certs.registry.pop_front();
+            self.finality_certs.extensions.pop_front();
         }
     }
 
@@ -284,5 +334,80 @@ impl Engine {
             self.finality_certs.cache.pop_front();
         }
         Ok(reply)
+    }
+
+    /// `getlcproof`: the certificate of `epoch` with its extensions, as one
+    /// `BLCLMP01` blob. The certificate comes from `finality_certificate`
+    /// unchanged, apart from dropping votes its set source cannot judge.
+    pub(super) fn lc_proof(
+        &mut self,
+        epoch: Option<u64>,
+        set_source_epoch: Option<u64>,
+        block: Option<[u8; 32]>,
+    ) -> RpcResult {
+        let e = epoch.unwrap_or(self.state.finality().finalized.epoch);
+        let key = (e, block, set_source_epoch);
+        if let Some((_, j)) = self.finality_certs.lc_cache.iter().find(|(k, _)| *k == key) {
+            return Ok(j.clone());
+        }
+        let reply = self.finality_certificate(Some(e), block, set_source_epoch)?;
+        let field = |name: &str| reply.get(name).cloned().ok_or_else(|| RpcError::unavailable(format!("certificate reply has no `{name}`")));
+        let cert_hex = field("certificate")?;
+        let cert_bytes = cert_hex
+            .as_str()
+            .and_then(bloch_finality_cert::from_hex)
+            .ok_or_else(|| RpcError::unavailable("certificate reply is not hex"))?;
+        let mut cert = Certificate::decode(&cert_bytes).map_err(|e| RpcError::unavailable(format!("own certificate: {e}")))?;
+        let set_source_id = *bloch_pos_committee::header::BlockId::of(&cert.registry.header).as_bytes();
+        lc_proof::retain_provable_votes(&mut cert);
+        let voters: BTreeSet<u32> = cert.links.iter().flat_map(|l| l.votes.iter().map(|v| v.validator)).collect();
+        let extensions_of = |id: &[u8; 32]| self.finality_certs.extensions.iter().find(|(x, _)| x == id).map(|(_, x)| x);
+        let mut ext = extensions_of(&set_source_id).map(|x| x.for_voters(&voters)).unwrap_or_default();
+        // The bind crossing: see `lc_proof::verify`. The set source does not
+        // commit the bind yet, but the checkpoint does, for a later epoch.
+        let checkpoint_id = cert.root();
+        if let Some(k) = ext.kes.as_mut().filter(|k| k.enforced.0.is_none()) {
+            if let Some(bind) = extensions_of(&checkpoint_id)
+                .and_then(|x| x.kes.as_ref())
+                .filter(|c| c.enforced.0.is_some_and(|b| b > e))
+            {
+                k.enforced = bind.enforced.clone();
+            }
+        }
+        let votes = [cert.links[0].votes.len() as u64, cert.links[1].votes.len() as u64];
+        let has_set = |fs: &lc_proof::FinalitySetProof| {
+            bloch_finality_cert::state::FinalityLeaf::decode(&fs.leaf).is_some_and(|l| l.finality_set.is_some())
+        };
+        let weights = if ext.finality_set.as_ref().is_some_and(has_set) { "frozen" } else { "bond" };
+        let kes_json = match &ext.kes {
+            None => Json::Null,
+            Some(k) => Json::Obj(vec![
+                ("enforced_from".into(), k.enforced.0.map_or(Json::Null, Json::u)),
+                ("entries".into(), Json::u(k.entries.iter().filter(|(_, b, _)| b.is_some()).count() as u64)),
+                ("absent".into(), Json::u(k.entries.iter().filter(|(_, b, _)| b.is_none()).count() as u64)),
+            ]),
+        };
+        let proof = MainnetProof { cert, finality_set: ext.finality_set, kes: ext.kes };
+        let bytes = proof.encode();
+        let out = Json::Obj(vec![
+            ("epoch".into(), Json::u(e)),
+            ("root".into(), field("root")?),
+            ("checkpoint_slot".into(), field("checkpoint_slot")?),
+            ("set_source_epoch".into(), field("set_source_epoch")?),
+            ("set_source_root".into(), field("set_source_root")?),
+            ("justifying_source_epoch".into(), field("justifying_source_epoch")?),
+            ("votes".into(), Json::Arr(votes.iter().map(|v| Json::u(*v)).collect())),
+            ("weights".into(), Json::s(weights)),
+            ("kes".into(), kes_json),
+            ("ancestry".into(), field("ancestry")?),
+            ("bytes".into(), Json::u(bytes.len() as u64)),
+            ("format".into(), Json::s("BLCLMP01")),
+            ("proof".into(), Json::s(crate::codec::hex(&bytes))),
+        ]);
+        self.finality_certs.lc_cache.push_back((key, out.clone()));
+        while self.finality_certs.lc_cache.len() > CERT_CACHE {
+            self.finality_certs.lc_cache.pop_front();
+        }
+        Ok(out)
     }
 }

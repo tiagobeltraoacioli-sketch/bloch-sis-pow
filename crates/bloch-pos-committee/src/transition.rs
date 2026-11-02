@@ -2975,6 +2975,41 @@ impl CommittedState {
         self.committed_validators()
     }
 
+    /// The finality leaf as [`Self::state_tree`] commits it, for proof
+    /// producers (`getlcproof`). Read-only. It deliberately repeats the
+    /// construction in `compute_tree` instead of sharing it, so that adding
+    /// this accessor leaves the root computation's source untouched; the only
+    /// caller checks these bytes against the tree's own leaf and serves no
+    /// proof on a mismatch, so a drift can only ever be an RPC error.
+    pub fn committed_finality_record(&self) -> FinalityRecord {
+        let cp = |c: finality::Checkpoint| CheckpointRecord { epoch: c.epoch, root: c.root };
+        FinalityRecord {
+            justified: self.finality_engine.justified_checkpoints().map(cp).collect(),
+            current_justified: cp(self.finality_engine.current_justified()),
+            previous_justified: CheckpointRecord {
+                epoch: self.previous_justified.epoch,
+                root: self.previous_justified.root,
+            },
+            finalized: cp(self.finality_engine.finalized()),
+            leaked: self
+                .finality_engine
+                .leaked_stakes()
+                .map(|(validator, leaked_sat)| LeakRecord { validator, leaked_sat })
+                .collect(),
+            next_epoch: self.finality_engine.next_epoch(),
+            finality_set: self.finality_engine.finality_set().map(|fs| {
+                let pairs = |m: &BTreeMap<u32, u64>| m.iter().map(|(v, x)| (*v, *x)).collect();
+                crate::state_root::FinalitySetRecord {
+                    current_epoch: fs.current.epoch,
+                    current: pairs(&fs.current.members),
+                    pending: fs.pending.as_ref().map(|p| (p.epoch, pairs(&p.members))),
+                    last_seen: pairs(&fs.last_seen),
+                }
+            }),
+            own_checkpoints: self.finality_engine.own_checkpoints().map(cp).collect(),
+        }
+    }
+
     fn committed_validators(&self) -> Vec<CommittedValidatorRecord> {
         self
             .validators

@@ -1232,6 +1232,26 @@ pub fn leaf_value_hash(serialized: &[u8]) -> [u8; 32] {
     hash_value(serialized)
 }
 
+/// Tree key of the finality leaf (component `TAG_FINALITY`, 0x09): the one
+/// leaf holding [`FinalityRecord`], including the HF1 frozen finality set.
+/// Read-only accessor for light clients and state-proof RPCs; the state root
+/// uses the same definition.
+pub fn finality_leaf_key() -> [u8; 32] {
+    derive_key(TAG_FINALITY, &[])
+}
+
+/// Tree key of `validator`'s KES entry (component `TAG_KES_ROOT`, 0x22).
+/// Read-only accessor; see [`insert_kes_roots`].
+pub fn kes_leaf_key(validator: u32) -> [u8; 32] {
+    derive_key(TAG_KES_ROOT, &validator.to_le_bytes())
+}
+
+/// Tree key of the KES enforcement bind epoch (component `TAG_KES_ROOT`,
+/// entry key `b"enforced"`). Read-only accessor; see [`insert_kes_roots`].
+pub fn kes_enforced_leaf_key() -> [u8; 32] {
+    derive_key(TAG_KES_ROOT, b"enforced")
+}
+
 // -- Committed state components ---------------------------------------------
 //
 // Serialization here is canonical by construction: fixed field order, fixed
@@ -1590,6 +1610,13 @@ impl FinalitySetRecord {
 }
 
 impl FinalityRecord {
+    /// The committed bytes of the finality leaf (the value
+    /// [`finality_leaf_key`] commits, hashed with [`leaf_value_hash`]).
+    /// Read-only accessor for light clients and state-proof RPCs.
+    pub fn committed_bytes(&self) -> Vec<u8> {
+        self.serialize()
+    }
+
     fn serialize(&self) -> Vec<u8> {
         // Canonicalise here, not in the builder: the committed bytes must be
         // a function of the *content*, whichever order a caller assembled the
