@@ -4351,4 +4351,5 @@ mod l2_tests {
     }
 
     include!("l2_forced_tests.rs");
+    include!("l2_forced_review_tests.rs");
 }

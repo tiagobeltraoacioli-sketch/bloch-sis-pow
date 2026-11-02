@@ -1919,6 +1919,13 @@ impl State {
         self.forced = Some(queue);
         true
     }
+    /// Test hook (review 164): consume what is due now, as a settlement would.
+    #[cfg(test)]
+    pub(crate) fn forced_consume_due_for_review(&mut self) {
+        if let Some(queue) = self.forced.as_mut() {
+            queue.consume_due();
+        }
+    }
     /// Test hook: enable forced inclusion whatever the configuration.
     #[cfg(test)]
     pub(crate) fn enable_forced_inclusion_for_test(&mut self) -> bool {
