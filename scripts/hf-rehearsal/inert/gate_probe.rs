@@ -131,9 +131,7 @@ fn slh_transfer(m: &BTreeMap<String, String>) -> R<()> {
 }
 
 /// A valid hybrid transfer whose ML-DSA half starts with the marker byte the
-/// fault-injected pinned verifier of the pin nets refuses, and which every
-/// other verifier accepts. Without the fault injection the pinned and legacy
-/// verifiers agree on every valid signature, so nothing else can tell them apart.
+/// fault-injected build of the pin nets refuses under the pinned policy.
 fn marker_transfer(m: &BTreeMap<String, String>) -> R<()> {
     let (pk, sk) = load_plain(get(m, "--dir")?)?;
     let epoch: u64 = if m.contains_key("--epoch") { num(m, "--epoch")? } else { 0 };
