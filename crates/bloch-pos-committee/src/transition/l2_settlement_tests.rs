@@ -4542,4 +4542,6 @@ mod l2_tests {
         use super::*;
         include!("ffg_branch_tests.rs");
     }
+
+    include!("l2_forced_tests.rs");
 }

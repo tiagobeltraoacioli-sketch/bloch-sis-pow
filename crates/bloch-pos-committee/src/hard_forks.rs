@@ -108,6 +108,8 @@ pub const HARD_FORK_GATES: &[HardForkGate] = &[
     gate!(L2Program, params::L2_PROGRAM_ROLLBACK_EPOCH, false),
     // The reserved DA slot: inert, outside `RELEASE_ARMABLE`.
     gate!(L2DataAvailability, params::L2_DA_RESERVED_SLOT_EPOCH, false),
+    // L1 forced inclusion of L2 transactions: inert, outside `RELEASE_ARMABLE`.
+    gate!(L2Program, params::L2_FORCED_INCLUSION_EPOCH, false),
 ];
 
 /// Gates that no scheduled release may arm (owner scope 2026-10-20: nothing
@@ -170,6 +172,13 @@ pub const fn l2_program_may_arm(next: u64, rollback: u64, program_final: bool) -
 /// without one is a release mistake, refused at compile time.
 pub const fn l2_da_reserved_slot_may_arm(epoch: u64, key: Option<[u8; 32]>) -> bool {
     !armed(epoch) || key.is_some()
+}
+
+/// Forced inclusion needs a guest that executes the queue, so it is armed only
+/// with a listed configuration, and never before the program swap that brings
+/// that guest (the same epoch is allowed: the swap runs first in `close_epoch`).
+pub const fn l2_forced_inclusion_may_arm(forced: u64, next: u64, configured: bool) -> bool {
+    !armed(forced) || (configured && armed(next) && forced >= next)
 }
 
 /// The ordering rules between all HF1/HF2/HF3 gates (see the module docs).
@@ -238,6 +247,12 @@ const _: () = assert!(l2_program_may_arm(
 const _: () = assert!(l2_da_reserved_slot_may_arm(
     params::L2_DA_RESERVED_SLOT_EPOCH,
     crate::l2_settlement::da::REGISTERED_KEY,
+));
+#[cfg(not(feature = "l2-activation-rehearsal"))]
+const _: () = assert!(l2_forced_inclusion_may_arm(
+    params::L2_FORCED_INCLUSION_EPOCH,
+    params::L2_NEXT_PROGRAM_EPOCH,
+    !crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS.is_empty(),
 ));
 // The P5a alias must follow the HF2 release switch.
 const _: () = assert!(params::NATIVE_SLASHING_ACTIVATION_EPOCH == params::HF2_SLASHING_V2_EPOCH);
@@ -341,6 +356,27 @@ mod tests {
         assert!(l2_da_reserved_slot_may_arm(M, None));
         assert!(!l2_da_reserved_slot_may_arm(9_000, None));
         assert!(l2_da_reserved_slot_may_arm(9_000, Some([7; 32])));
+    }
+
+    #[test]
+    fn forced_inclusion_ships_inert_and_needs_a_guest_and_the_swap() {
+        let g = HARD_FORK_GATES.iter().find(|g| g.name == "params::L2_FORCED_INCLUSION_EPOCH").expect("listed");
+        assert_eq!(g.fork, Fork::L2Program);
+        assert!(!g.armed() && !g.node_policy_only);
+        assert!(!RELEASE_ARMABLE.contains(&"params::L2_FORCED_INCLUSION_EPOCH"));
+        assert_eq!(params::L2_FORCED_INCLUSION_EPOCH, M);
+        assert!(crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS.is_empty());
+        // Inert is always coherent.
+        assert!(l2_forced_inclusion_may_arm(M, M, false));
+        assert!(l2_forced_inclusion_may_arm(M, 10_060, true));
+        // No listed guest: refused, whatever the swap.
+        assert!(!l2_forced_inclusion_may_arm(10_060, 10_060, false));
+        // No swap, or a gate before the swap: refused.
+        assert!(!l2_forced_inclusion_may_arm(10_060, M, true));
+        assert!(!l2_forced_inclusion_may_arm(10_059, 10_060, true));
+        // At or after the swap with a listed guest: allowed.
+        assert!(l2_forced_inclusion_may_arm(10_060, 10_060, true));
+        assert!(l2_forced_inclusion_may_arm(11_320, 10_060, true));
     }
 
     #[test]

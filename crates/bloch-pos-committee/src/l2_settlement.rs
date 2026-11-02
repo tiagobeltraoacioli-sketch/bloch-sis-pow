@@ -804,6 +804,245 @@ pub mod withdrawal {
     }
 }
 
+/// L1 forced inclusion of L2 transactions (CANDIDATE, inert: no L2 enables it
+/// while [`crate::params::L2_FORCED_INCLUSION_EPOCH`] is the sentinel).
+///
+/// Why: settlement is open, so a third party that lands a rule-conforming block
+/// once per finality window keeps the sequencer from ever including a user
+/// transaction (agents 42 and 66), and the sequencer itself can censor. Nothing
+/// on L1 forced a settlement to carry any user transaction.
+///
+/// What: an `L2ForcedTransaction` (wire 0x1C) publishes ONE signed L2 envelope
+/// on L1 and queues `(native height, L1 txid, keccak256(envelope), declared gas
+/// limit)`. The queue is frozen with the source, exactly like the deposit
+/// inbox, and every V3 settlement, whoever proves it, must consume everything
+/// queued at its anchor, at most [`MAX_PER_SETTLEMENT`], in queue order. There
+/// is no delay window and no sequencer identity: the rule is the same for the
+/// sequencer and for any other settler.
+///
+/// How L1 binds it without a new statement field: the guest executes the
+/// consumed envelopes right after the deposits, before the sequencer's
+/// transactions, skipping exactly those that are not valid at that point
+/// (decoding, chain, signature, gas limit above the declared one, nonce, funds,
+/// base fee), and publishes [`inbox_hash`] in the statement's `deposits_hash`
+/// slot. With nothing consumed, [`inbox_hash`] IS the deposits hash, so blocks
+/// without forced transactions keep their exact statement bytes. Skipped
+/// envelopes are consumed too, so an invalid envelope cannot block the queue.
+/// The envelopes are their own data availability: they are in the L1 block.
+///
+/// Shared format (pinned by `forced_hash_matches_the_l2_golden_vector` here and
+/// by `forced_inclusion_golden_vector` in bloch-l2-evm):
+///
+/// * record: `l1_height (u64 BE) || l1_txid (32) || keccak256(envelope) (32)
+///   || declared gas limit (u64 BE)`;
+/// * forced hash: `keccak256` of the concatenated records (`keccak256("")`
+///   when empty);
+/// * inbox hash: `keccak256("BLOCH:L2:INBOX:2" || deposits_hash || forced hash)`
+///   when at least one record is consumed, else `deposits_hash`.
+pub mod forced {
+    use sha3::{Digest, Keccak256};
+
+    /// Records one settlement consumes at most, from the front of the queue.
+    /// Separate from the deposit cap, so a full queue never slows deposits.
+    pub const MAX_PER_SETTLEMENT: u64 = 16;
+    /// Queue capacity in weight units ([`weight`]: one per started 21k of
+    /// declared gas). A submission that would exceed it is refused
+    /// ([`surcharge_sat`]). Weighting by gas makes the drain rate, at most
+    /// [`MAX_GAS_PER_SETTLEMENT`] per settlement, the same whatever record sizes
+    /// a filler picks, so keeping the queue full always costs the same per
+    /// settlement.
+    pub const MAX_PENDING_WEIGHT: u64 = 256;
+    /// Forced submissions per native block, like DA batches.
+    pub const MAX_PER_BLOCK: usize = 4;
+    /// One signed L2 envelope (EIP-2718) at most this long.
+    pub const MAX_ENVELOPE_BYTES: usize = 8 * 1024;
+    /// Declared gas limit bounds: at least an intrinsic transfer, at most this.
+    /// The guest skips an envelope whose own gas limit is above the declared
+    /// one, so the declared gas bounds what an envelope can execute.
+    pub const MIN_GAS: u64 = 21_000;
+    pub const MAX_GAS: u64 = 300_000;
+    /// Declared gas one settlement must consume at most: the due prefix stops
+    /// before the record that would cross it. Forced envelopes bypass the
+    /// sequencer's proving budget, so this is what bounds their proving work.
+    /// The worst measured EVM-gas-to-SP1-gas ratio is about 216 (a modexp,
+    /// agent 90), so 300k gas is at most about 65M SP1 gas on top of the block:
+    /// inside the proven range, with room for the sequencer's transactions.
+    /// To be re-measured on the final sparse guest before the gate is armed.
+    pub const MAX_GAS_PER_SETTLEMENT: u64 = 300_000;
+    const _: () = assert!(MAX_GAS <= MAX_GAS_PER_SETTLEMENT);
+    /// Queue-depth price, burned on top of the ordinary fee: `BASE_SURCHARGE_SAT`
+    /// per weight unit, doubled every `SURCHARGE_DOUBLING` pending units. An
+    /// empty queue costs the base per unit; the last units of a full queue
+    /// cost `2^7` times it.
+    pub const BASE_SURCHARGE_SAT: u64 = 1_000;
+    pub const SURCHARGE_DOUBLING: u64 = 32;
+    const _: () = assert!(MAX_PENDING_WEIGHT / SURCHARGE_DOUBLING < 32);
+    pub const INBOX_DOMAIN: &[u8] = b"BLOCH:L2:INBOX:2";
+
+    #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Record {
+        /// Native height of the block that included the forced transaction.
+        pub height: u64,
+        /// Its L1 txid: where a rebuilder reads the envelope.
+        pub l1_txid: [u8; 32],
+        /// keccak256 of the envelope, which is its L2 transaction hash.
+        pub envelope_hash: [u8; 32],
+        /// Declared gas limit, in [`MIN_GAS`]..=[`MAX_GAS`].
+        pub gas_limit: u64,
+    }
+    impl Record {
+        pub fn encode(&self) -> [u8; 80] {
+            let mut out = [0u8; 80];
+            out[..8].copy_from_slice(&self.height.to_be_bytes());
+            out[8..40].copy_from_slice(&self.l1_txid);
+            out[40..72].copy_from_slice(&self.envelope_hash);
+            out[72..].copy_from_slice(&self.gas_limit.to_be_bytes());
+            out
+        }
+    }
+
+    /// keccak256 of the concatenated records.
+    pub fn hash(records: &[Record]) -> [u8; 32] {
+        let mut h = Keccak256::new();
+        for r in records {
+            h.update(r.encode());
+        }
+        h.finalize().into()
+    }
+
+    /// What a V3 statement's `deposits_hash` slot holds under forced inclusion.
+    pub fn inbox_hash(deposits_hash: [u8; 32], consumed: &[Record]) -> [u8; 32] {
+        if consumed.is_empty() {
+            return deposits_hash;
+        }
+        let mut h = Keccak256::new();
+        h.update(INBOX_DOMAIN);
+        h.update(deposits_hash);
+        h.update(hash(consumed));
+        h.finalize().into()
+    }
+
+    /// Weight units of a record declaring `gas`: one per started [`MIN_GAS`]
+    /// (1 for a transfer, 15 at [`MAX_GAS`]).
+    pub const fn weight(gas: u64) -> u64 {
+        gas.div_ceil(MIN_GAS)
+    }
+
+    /// The burned surcharge of a submission of `weight` units that finds
+    /// `pending` units queued, or `None` when it does not fit.
+    pub const fn surcharge_sat(pending: u64, weight: u64) -> Option<u64> {
+        if weight == 0 || pending.saturating_add(weight) > MAX_PENDING_WEIGHT {
+            return None;
+        }
+        Some((BASE_SURCHARGE_SAT << (pending / SURCHARGE_DOUBLING)) * weight)
+    }
+
+    /// The queue, present only on an L2 where forced inclusion is enabled.
+    #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Queue {
+        /// Unconsumed records, oldest first. Consumed ones are dropped: the
+        /// running root keeps the history.
+        pub(crate) pending: Vec<Record>,
+        /// Records ever queued and ever consumed.
+        pub(crate) queued: u64,
+        pub(crate) consumed: u64,
+        /// Running root over every record ever queued.
+        pub(crate) root: [u8; 32],
+        /// Pending count frozen with the source anchor.
+        pub(crate) anchor: Option<u64>,
+    }
+    impl Queue {
+        pub(crate) fn new() -> Self {
+            Self { root: Keccak256::digest(b"BLOCH:NATIVE:L2:EMPTY-FORCED:1").into(), ..Self::default() }
+        }
+        pub fn pending(&self) -> &[Record] {
+            &self.pending
+        }
+        pub fn queued(&self) -> u64 {
+            self.queued
+        }
+        pub fn consumed(&self) -> u64 {
+            self.consumed
+        }
+        pub fn root(&self) -> [u8; 32] {
+            self.root
+        }
+        /// What the next settlement must consume: everything pending at the
+        /// anchor, in order, up to [`MAX_PER_SETTLEMENT`] records and
+        /// [`MAX_GAS_PER_SETTLEMENT`] declared gas. Before an anchor, what is
+        /// pending now, with the same caps.
+        pub fn due(&self) -> &[Record] {
+            let frozen = self.anchor.unwrap_or(self.pending.len() as u64);
+            let mut gas = 0u64;
+            let mut n = 0usize;
+            for r in self.pending.iter().take(frozen.min(MAX_PER_SETTLEMENT) as usize) {
+                gas = gas.saturating_add(r.gas_limit);
+                if gas > MAX_GAS_PER_SETTLEMENT {
+                    break;
+                }
+                n += 1;
+            }
+            &self.pending[..n]
+        }
+        /// Weight units pending ([`weight`]), at most [`MAX_PENDING_WEIGHT`].
+        pub fn pending_weight(&self) -> u64 {
+            self.pending.iter().map(|r| weight(r.gas_limit)).sum()
+        }
+        pub(crate) fn push(&mut self, record: Record) -> Result<(), Refusal> {
+            if surcharge_sat(self.pending_weight(), weight(record.gas_limit)).is_none() {
+                return Err(Refusal::Full);
+            }
+            let mut h = Keccak256::new();
+            h.update(b"BLOCH:NATIVE:L2:FORCED:1");
+            h.update(self.root);
+            h.update(record.encode());
+            self.root = h.finalize().into();
+            self.pending.push(record);
+            self.queued += 1;
+            Ok(())
+        }
+        pub(crate) fn consume_due(&mut self) {
+            let n = self.due().len();
+            self.pending.drain(..n);
+            self.consumed += n as u64;
+            self.anchor = None;
+        }
+        pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:FORCED-STATE:1");
+            out.extend_from_slice(&self.queued.to_le_bytes());
+            out.extend_from_slice(&self.consumed.to_le_bytes());
+            out.extend_from_slice(&self.root);
+            match self.anchor {
+                None => out.push(0),
+                Some(count) => {
+                    out.push(1);
+                    out.extend_from_slice(&count.to_le_bytes());
+                }
+            }
+            out.extend_from_slice(&(self.pending.len() as u64).to_le_bytes());
+            for r in &self.pending {
+                out.extend_from_slice(&r.encode());
+            }
+        }
+    }
+
+    /// Why the L2 state refused to queue a forced transaction.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Refusal {
+        /// Forced inclusion is not enabled on this L2.
+        NotActive,
+        /// The submission names another L2 chain.
+        Chain,
+        /// Declared gas outside [`MIN_GAS`]..=[`MAX_GAS`], or an empty or
+        /// oversized envelope.
+        Shape,
+        /// The record does not fit in [`MAX_PENDING_WEIGHT`].
+        Full,
+    }
+}
+
 /// Records one settlement must consume, when pending: min(pending, this).
 pub const MAX_INBOX_PER_SETTLEMENT: u64 = 64;
 /// Exact L2 body framing tag (`bloch_l2_evm::node_primitives::NodeBodyV2`).
@@ -1129,6 +1368,13 @@ pub mod mainnet {
     /// the reproducible release guests. An armed gate refuses to compile until
     /// this is true (`hard_forks::l2_program_may_arm`).
     pub const PROGRAM_NEXT_FINAL: bool = false;
+    /// L2 configurations (identity 3) whose guest executes the forced records
+    /// of [`super::forced`] and publishes [`super::forced::inbox_hash`]. EMPTY:
+    /// neither [`PROGRAM_NEXT`] nor [`PROGRAM_FALLBACK`] implements it, so
+    /// [`crate::params::L2_FORCED_INCLUSION_EPOCH`] cannot be armed
+    /// (`hard_forks::l2_forced_inclusion_may_arm`). The configuration (and with
+    /// it the ELF and both keys) changes when the guest gains the rule.
+    pub const FORCED_INCLUSION_CONFIGURATIONS: &[[u8; 32]] = &[];
 
     /// TBD-owner: the hash (`Sha3_256`) of the mainnet settler's DA funding
     /// public key, which owns the reserved DA slot
@@ -1538,6 +1784,13 @@ pub struct State {
     /// cached bytes of this struct do not change.
     #[cfg_attr(feature = "local-state-cache", serde(skip))]
     checkpoint_roots: std::collections::BTreeMap<u64, [u8; 32]>,
+    /// L1 forced-inclusion queue ([`forced`]). `None` until
+    /// [`crate::params::L2_FORCED_INCLUSION_EPOCH`] enables it; committed
+    /// last and absent while `None`, so every earlier state keeps its bytes.
+    /// The local cache carries it in its own trailing section, like
+    /// `checkpoint_roots`, so the cached bytes of this struct do not change.
+    #[cfg_attr(feature = "local-state-cache", serde(skip))]
+    forced: Option<forced::Queue>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -1564,6 +1817,10 @@ pub enum Reject {
     /// L1 data-availability record (same L2 block number) included in a
     /// strictly earlier native block and still retained.
     DataUnavailable,
+    /// Forced inclusion is enabled and the statement does not consume exactly
+    /// the forced records due at its anchor ([`forced::inbox_hash`]), or a V2
+    /// statement arrives while forced records are due.
+    Forced,
 }
 
 /// Whether an L2 from a development genesis manifest admits user
@@ -1593,6 +1850,7 @@ impl State {
             release_window: withdrawal::ReleaseWindow::default(),
             profile: Profile::development(),
             checkpoint_roots: std::collections::BTreeMap::new(),
+            forced: None,
         })
     }
     pub(crate) fn genesis_async(policy: Policy) -> Result<Self, Reject> {
@@ -1626,7 +1884,70 @@ impl State {
     pub(crate) fn prepare_source(&mut self, parent: [u8; 32], parent_slot: u64) {
         if self.asynchronous && self.source_anchor.is_none() && self.native_height > 0 {
             self.source_anchor = Some((parent, parent_slot, self.native_height, self.inbox.len() as u64, self.inbox_root));
+            // The forced queue freezes with the source: what a settlement on
+            // this anchor must consume cannot grow while it is being proved.
+            if let Some(queue) = self.forced.as_mut() {
+                queue.anchor = Some(queue.pending.len() as u64);
+            }
         }
+    }
+    /// The forced-inclusion queue, `None` while forced inclusion is not enabled.
+    pub fn forced_queue(&self) -> Option<&forced::Queue> {
+        self.forced.as_ref()
+    }
+    /// Whether this L2 runs rules whose guest implements forced inclusion.
+    /// It follows the committed configuration, like [`Self::next_program_active`]:
+    /// an L2 is enabled only if its configuration is listed in
+    /// [`mainnet::FORCED_INCLUSION_CONFIGURATIONS`] (empty: no program does).
+    pub fn forced_inclusion_program(&self) -> bool {
+        mainnet::FORCED_INCLUSION_CONFIGURATIONS.contains(&self.policy.identities[3])
+    }
+    /// Enable forced inclusion at [`crate::params::L2_FORCED_INCLUSION_EPOCH`].
+    /// Only on an L2 that admits user transactions, settles asynchronously and
+    /// runs a program that implements it; once.
+    pub(crate) fn enable_forced_inclusion(&mut self) -> bool {
+        self.enable_forced_inclusion_if(self.forced_inclusion_program())
+    }
+    fn enable_forced_inclusion_if(&mut self, program: bool) -> bool {
+        if self.forced.is_some() || !program || !self.profile.user_transactions || !self.asynchronous {
+            return false;
+        }
+        let mut queue = forced::Queue::new();
+        // Enabled between an anchor and its settlement: nothing is due yet.
+        if self.source_anchor.is_some() {
+            queue.anchor = Some(0);
+        }
+        self.forced = Some(queue);
+        true
+    }
+    /// Test hook: enable forced inclusion whatever the configuration.
+    #[cfg(test)]
+    pub(crate) fn enable_forced_inclusion_for_test(&mut self) -> bool {
+        self.enable_forced_inclusion_if(true)
+    }
+    /// Queue a forced L2 transaction published at the next native height.
+    /// The caller has already charged and authorized the L1 transaction.
+    pub(crate) fn queue_forced(
+        &mut self,
+        chain_id: u64,
+        l1_txid: [u8; 32],
+        envelope: &[u8],
+        gas_limit: u64,
+    ) -> Result<(), forced::Refusal> {
+        use forced::Refusal as R;
+        let height = self.native_height.checked_add(1).ok_or(R::Full)?;
+        let queue = self.forced.as_mut().ok_or(R::NotActive)?;
+        if chain_id != self.policy.chain_id {
+            return Err(R::Chain);
+        }
+        if envelope.is_empty()
+            || envelope.len() > forced::MAX_ENVELOPE_BYTES
+            || !(forced::MIN_GAS..=forced::MAX_GAS).contains(&gas_limit)
+        {
+            return Err(R::Shape);
+        }
+        let envelope_hash: [u8; 32] = Keccak256::digest(envelope).into();
+        queue.push(forced::Record { height, l1_txid, envelope_hash, gas_limit })
     }
     /// Escrow a native deposit into the next inbox position. The caller has
     /// already removed exactly `record.sats` from the spendable supply.
@@ -1849,6 +2170,11 @@ impl State {
     #[cfg(feature = "local-state-cache")]
     pub(crate) fn restore_checkpoint_roots(&mut self, roots: std::collections::BTreeMap<u64, [u8; 32]>) {
         self.checkpoint_roots = roots;
+    }
+    /// Local-cache restore only, like [`Self::restore_checkpoint_roots`].
+    #[cfg(feature = "local-state-cache")]
+    pub(crate) fn restore_forced_queue(&mut self, queue: forced::Queue) {
+        self.forced = Some(queue);
     }
     /// Leaves `0..matured_count` are claimable in the next native block.
     pub fn matured_count(&self) -> u64 {
@@ -2121,6 +2447,11 @@ impl State {
                 out.extend_from_slice(root);
             }
         }
+        // Absent until forced inclusion is enabled, so every state below
+        // L2_FORCED_INCLUSION_EPOCH keeps its bytes.
+        if let Some(queue) = &self.forced {
+            queue.encode(&mut out);
+        }
         out
     }
     /// Only the transition can supply the native parent. No expected statement
@@ -2201,6 +2532,9 @@ impl State {
                 if self.profile.deposits && h(s, S + 536) != expected_body_commitment(consumed) {
                     return Err(Reject::Deposits);
                 }
+                if self.forced.as_ref().is_some_and(|q| !q.due().is_empty()) {
+                    return Err(Reject::Forced);
+                }
             }
             // V3: user transactions allowed; the minted deposits must be
             // exactly the consumed inbox records, in order.
@@ -2209,8 +2543,11 @@ impl State {
                 if users != 0 && !self.profile.user_transactions {
                     return Err(Reject::UserTransactions);
                 }
-                if h(s, S + v3::DEPOSITS_HASH) != deposits_hash(consumed) {
-                    return Err(Reject::Deposits);
+                // Under forced inclusion the slot also binds the forced records
+                // due at the anchor; with none due it is the deposits hash.
+                let due = self.forced.as_ref().map_or(&[][..], |q| q.due());
+                if h(s, S + v3::DEPOSITS_HASH) != forced::inbox_hash(deposits_hash(consumed), due) {
+                    return Err(if due.is_empty() { Reject::Deposits } else { Reject::Forced });
                 }
                 let da_commitment = h(s, S + v3::DA_COMMITMENT);
                 if h(s, S + v3::TRANSACTIONS_ROOT) == [0; 32]
@@ -2260,6 +2597,9 @@ impl State {
         self.head = Some((tx.commitment(), s.to_vec()));
         self.source_anchor = None;
         self.consumed = end;
+        if let Some(queue) = self.forced.as_mut() {
+            queue.consume_due();
+        }
         // Records for settled blocks can never be used again.
         self.da.retain(|r| r.l2_number > number);
         Ok(())
@@ -2295,6 +2635,15 @@ impl State {
         }
         if self.consumed > self.inbox.len() as u64 {
             return Err("cached L2 inbox cursor is past the inbox".into());
+        }
+        if let Some(q) = &self.forced {
+            let pending = q.pending.len() as u64;
+            if q.queued.checked_sub(q.consumed) != Some(pending)
+                || q.pending_weight() > forced::MAX_PENDING_WEIGHT
+                || q.anchor.is_some_and(|a| a > pending)
+            {
+                return Err("cached L2 forced queue is inconsistent".into());
+            }
         }
         if deposited.checked_sub(self.released_sat) != Some(self.escrow_sat) {
             return Err("cached L2 escrow does not match deposits and releases".into());

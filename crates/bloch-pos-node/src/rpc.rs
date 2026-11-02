@@ -2267,6 +2267,7 @@ impl PreparedSubmission {
             PosTransaction::L2Deposit(_) => "l2_deposit",
             PosTransaction::L2DataAvailability(_) => "l2_data_availability",
             PosTransaction::L2WithdrawClaim(_) => "l2_withdraw_claim",
+            PosTransaction::L2ForcedTransaction(_) => "l2_forced_transaction",
             PosTransaction::WithdrawalCredentialRotation(_) => "withdrawal_credential_rotation",
             PosTransaction::RescueCommit(_) => "pq_rescue_commit",
             PosTransaction::RescueReveal(_) => "pq_rescue_reveal",
@@ -2960,7 +2961,7 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
             crate::codec::hex32(&source.block), source.slot, source.height,
             crate::codec::hex32(&source.commitment), crate::codec::hex32(&source.inbox_root)))),
     ]));
-    Json::obj(vec![
+    let mut out = Json::obj(vec![
         ("asynchronous", Json::Bool(l2.asynchronous())), ("native_height", Json::u(l2.height())),
         ("network", Json::hex(&policy.identities[0])), ("genesis", Json::hex(&policy.identities[1])),
         ("chain_id", Json::u(policy.chain_id)), ("source", source),
@@ -3107,5 +3108,33 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
         ("accepted", l2.head().map_or(Json::Null, |(commitment, statement)| Json::obj(vec![
             ("commitment", Json::hex(&commitment)), ("statement", Json::s(crate::codec::hex(&statement))),
         ]))),
+    ]);
+    // L1 forced inclusion (candidate): present only once the queue is enabled,
+    // so the response keeps its exact fields while the gate is inert.
+    if let (Json::Obj(fields), Some(queue)) = (&mut out, l2.forced_queue()) {
+        fields.push(("forced".to_string(), l2_forced_json(queue)));
+    }
+    out
+}
+
+/// `getl2settlement.forced`: the queue, and the records the next settlement
+/// must consume, in order (`due`), with the `deposits_hash` slot they need.
+pub(crate) fn l2_forced_json(queue: &bloch_pos_committee::l2_settlement::forced::Queue) -> Json {
+    use bloch_pos_committee::l2_settlement::forced;
+    let record = |r: &forced::Record| Json::obj(vec![
+        ("height", Json::u(r.height)), ("l1_txid", Json::hex(&r.l1_txid)),
+        ("envelope_hash", Json::hex(&r.envelope_hash)), ("gas_limit", Json::u(r.gas_limit)),
+    ]);
+    let pending = queue.pending().len() as u64;
+    let weight = queue.pending_weight();
+    Json::obj(vec![
+        ("queued", Json::u(queue.queued())), ("consumed", Json::u(queue.consumed())),
+        ("pending", Json::u(pending)), ("pending_weight", Json::u(weight)),
+        ("max_pending_weight", Json::u(forced::MAX_PENDING_WEIGHT)), ("root", Json::hex(&queue.root())),
+        ("due", Json::Arr(queue.due().iter().map(record).collect())),
+        ("due_hash", Json::hex(&forced::hash(queue.due()))),
+        // What one weight unit (a transfer) pays on top of its fee in the next
+        // block; null when full. A record of w units pays w times the unit price.
+        ("next_surcharge_sat", forced::surcharge_sat(weight, 1).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
     ])
 }
