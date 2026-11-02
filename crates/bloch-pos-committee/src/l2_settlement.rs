@@ -120,6 +120,65 @@ pub mod da {
     pub const MAX_RECORDS: usize = MAX_PER_BLOCK * (RETENTION_BLOCKS as usize + 1);
     const _: () = assert!(MAX_RECORDS == 4_100);
 
+    /// DA slots per block that only the registered key may fill once
+    /// `params::L2_DA_RESERVED_SLOT_EPOCH` binds. The total stays
+    /// [`MAX_PER_BLOCK`], so [`MAX_RECORDS`] is unchanged.
+    pub const RESERVED_PER_BLOCK: usize = 1;
+    /// DA transactions per block from any other funding key, past the gate.
+    pub const OPEN_PER_BLOCK: usize = MAX_PER_BLOCK - RESERVED_PER_BLOCK;
+    const _: () = assert!(OPEN_PER_BLOCK >= 1 && RESERVED_PER_BLOCK >= 1);
+
+    /// The registered DA funding key: `Sha3_256(funding_pubkey)`, the same
+    /// hash as the key's script hash. Set once in the release
+    /// (`mainnet::DA_RESERVED_KEY`); a qualification build
+    /// (`l2-activation-rehearsal`) takes it from `BLOCH_L2_REHEARSAL_DA_KEY`
+    /// at compile time instead. No key, vote or runtime input changes it.
+    #[cfg(not(feature = "l2-activation-rehearsal"))]
+    pub const REGISTERED_KEY: Option<[u8; 32]> = super::mainnet::DA_RESERVED_KEY;
+    #[cfg(feature = "l2-activation-rehearsal")]
+    pub const REGISTERED_KEY: Option<[u8; 32]> = match option_env!("BLOCH_L2_REHEARSAL_DA_KEY") {
+        Some(text) => Some(super::mainnet::h32(text)),
+        None => None,
+    };
+
+    /// The registered key, or a test's override of it.
+    pub fn registered_key() -> Option<[u8; 32]> {
+        #[cfg(test)]
+        if let Some(key) = crate::params::l2_da_reserved_slot_test::key() {
+            return Some(key);
+        }
+        REGISTERED_KEY
+    }
+
+    /// The key that owns the reserved slot in a block of `epoch`: `None`
+    /// below the gate, or when no key is registered (then the old rule of
+    /// [`MAX_PER_BLOCK`] slots for anyone applies unchanged).
+    pub fn reserved_key_at(epoch: u64) -> Option<[u8; 32]> {
+        if crate::params::l2_da_reserved_slot_active(epoch) { registered_key() } else { None }
+    }
+
+    /// `Sha3_256(funding_pubkey)`, the hash [`reserved_key_at`] names.
+    pub fn funder(funding_pubkey: &[u8]) -> [u8; 32] {
+        use sha3::Sha3_256;
+        Sha3_256::digest(funding_pubkey).into()
+    }
+
+    /// Whether a block of `epoch` may carry DA transactions from these
+    /// funding keys, in any order: at most [`MAX_PER_BLOCK`] in all and,
+    /// past the gate, at most [`OPEN_PER_BLOCK`] from keys other than the
+    /// registered one.
+    pub fn block_admits<'a>(epoch: u64, funding_pubkeys: impl IntoIterator<Item = &'a [u8]>) -> bool {
+        let reserved = reserved_key_at(epoch);
+        let (mut total, mut open) = (0usize, 0usize);
+        for key in funding_pubkeys {
+            total += 1;
+            if reserved != Some(funder(key)) {
+                open += 1;
+            }
+        }
+        total <= MAX_PER_BLOCK && (reserved.is_none() || open <= OPEN_PER_BLOCK)
+    }
+
     /// Number of transactions in a canonical batch payload, or `None` if the
     /// payload is not exactly one canonical batch within the size cap.
     pub fn batch_count(payload: &[u8]) -> Option<u32> {
@@ -1067,6 +1126,14 @@ pub mod mainnet {
     /// this is true (`hard_forks::l2_program_may_arm`).
     pub const PROGRAM_NEXT_FINAL: bool = false;
 
+    /// TBD-owner: the hash (`Sha3_256`) of the mainnet settler's DA funding
+    /// public key, which owns the reserved DA slot
+    /// (`params::L2_DA_RESERVED_SLOT_EPOCH`). Unset, so that gate cannot be
+    /// armed (`hard_forks::l2_da_reserved_slot_may_arm`). Losing or leaking
+    /// this key costs no funds: the slot then serves nobody, or the leaker,
+    /// and DA is back to the open auction of today.
+    pub const DA_RESERVED_KEY: Option<[u8; 32]> = None;
+
     const fn same_hash(a: &[u8; 32], b: &[u8; 32]) -> bool {
         let mut i = 0;
         while i < 32 {
@@ -1118,7 +1185,7 @@ pub mod mainnet {
         pub initial_l2_state: [u8; 32],
     }
     /// 64 hex characters as 32 bytes, at compile time (a typo fails the build).
-    const fn h32(text: &str) -> [u8; 32] {
+    pub(crate) const fn h32(text: &str) -> [u8; 32] {
         let b = text.as_bytes();
         assert!(b.len() == 64, "32-byte hex");
         let mut out = [0u8; 32];
