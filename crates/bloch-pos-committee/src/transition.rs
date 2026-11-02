@@ -143,6 +143,8 @@ pub mod l2_da;
 pub use l2_da::{L2DataAvailability, L2DataAvailabilityReject};
 pub mod l2_claim;
 pub use l2_claim::{L2WithdrawClaim, L2WithdrawClaimReject};
+pub mod l2_forced;
+pub use l2_forced::{L2ForcedTransaction, L2ForcedTransactionReject};
 pub mod pq_migration;
 pub use pq_migration::{
     PqMigrationReject, RescueCommit, RescueReveal, WithdrawalCredentialRotation,
@@ -328,6 +330,9 @@ pub enum PosTransaction {
     /// Release one settled, matured L2 withdrawal from escrow to its L1
     /// recipient (0x16, development networks with `devnet-l2-user-txs`).
     L2WithdrawClaim(L2WithdrawClaim),
+    /// Queue one L2 transaction for forced inclusion (0x1C). INERT until
+    /// `params::L2_FORCED_INCLUSION_EPOCH`.
+    L2ForcedTransaction(L2ForcedTransaction),
     /// Rotate a validator's withdrawal credential to a hash-based-suite key
     /// (0x18). INERT until `params::HF3_PQ_MIGRATION_EPOCH`.
     WithdrawalCredentialRotation(WithdrawalCredentialRotation),
@@ -741,6 +746,7 @@ impl PosTransaction {
             PosTransaction::L2Deposit(tx) => return tx.intent_root(),
             PosTransaction::L2DataAvailability(tx) => return tx.intent_root(),
             PosTransaction::L2WithdrawClaim(tx) => return tx.intent_root(),
+            PosTransaction::L2ForcedTransaction(tx) => return tx.intent_root(),
             PosTransaction::WithdrawalCredentialRotation(tx) => return tx.signing_root(),
             PosTransaction::RescueCommit(tx) => return tx.signing_root(),
             PosTransaction::RescueReveal(tx) => return tx.signing_root(),
@@ -917,6 +923,7 @@ impl PosTransaction {
             PosTransaction::L2Deposit(tx) => return tx.canonical_bytes(),
             PosTransaction::L2DataAvailability(tx) => return tx.canonical_bytes(),
             PosTransaction::L2WithdrawClaim(tx) => return tx.canonical_bytes(),
+            PosTransaction::L2ForcedTransaction(tx) => return tx.canonical_bytes(),
             PosTransaction::WithdrawalCredentialRotation(tx) => return tx.canonical_bytes(),
             PosTransaction::RescueCommit(tx) => return tx.canonical_bytes(),
             PosTransaction::RescueReveal(tx) => return tx.canonical_bytes(),
@@ -1144,6 +1151,9 @@ impl PosTransaction {
             l2_deposit::L2_DEPOSIT_TAG => PosTransaction::L2Deposit(L2Deposit::decode(&mut r)?),
             l2_da::L2_DATA_AVAILABILITY_TAG => PosTransaction::L2DataAvailability(L2DataAvailability::decode(&mut r)?),
             l2_claim::L2_WITHDRAW_CLAIM_TAG => PosTransaction::L2WithdrawClaim(L2WithdrawClaim::decode(&mut r)?),
+            l2_forced::L2_FORCED_TRANSACTION_TAG => {
+                PosTransaction::L2ForcedTransaction(L2ForcedTransaction::decode(&mut r)?)
+            }
             pq_migration::WITHDRAWAL_CREDENTIAL_ROTATION_TAG => PosTransaction::WithdrawalCredentialRotation(
                 WithdrawalCredentialRotation::decode(&mut r)?,
             ),
@@ -1366,6 +1376,7 @@ pub enum TxReject {
     L2Deposit(L2DepositReject),
     L2DataAvailability(L2DataAvailabilityReject),
     L2WithdrawClaim(L2WithdrawClaimReject),
+    L2ForcedTransaction(L2ForcedTransactionReject),
     /// A post-quantum migration rule (credential rotation, lattice-spend
     /// freeze, rescue commit/reveal) refused the transaction.
     PqMigration(PqMigrationReject),
@@ -3834,6 +3845,9 @@ impl CommittedState {
             PosTransaction::L2WithdrawClaim(claim) => self
                 .apply_l2_withdraw_claim(claim, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::L2WithdrawClaim),
+            PosTransaction::L2ForcedTransaction(forced) => self
+                .apply_l2_forced_transaction(forced, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::L2ForcedTransaction),
             PosTransaction::WithdrawalCredentialRotation(rotation) => self
                 .apply_withdrawal_credential_rotation(rotation, verifier)
                 .map_err(TxReject::PqMigration),
@@ -6212,6 +6226,15 @@ impl CommittedState {
                 l2.install_fallback_program();
             }
         }
+        // L1 forced inclusion, after the swap so that a gate at the swap's
+        // epoch sees the new configuration. Enables once, only on an L2 whose
+        // configuration implements it. Inert while
+        // `L2_FORCED_INCLUSION_EPOCH` is the sentinel: no queue, L2 bytes unchanged.
+        if crate::params::l2_forced_inclusion_active(next_epoch) {
+            if let Some(l2) = st.l2_settlement.as_mut() {
+                l2.enable_forced_inclusion();
+            }
+        }
         // Claim finality on this chain (HF1_CLAIM_FINALITY_EPOCH):
         // record this chain's checkpoint of the epoch being opened. `head` is
         // still the parent here — the last block strictly before the new
@@ -6900,6 +6923,12 @@ impl<V: SignatureVerifier> Transition<V> {
         // DA records (`l2_settlement::da::MAX_RECORDS`) independently of fees.
         if transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2DataAvailability(_))).count()
             > crate::l2_settlement::da::MAX_PER_BLOCK
+        {
+            return Err(TransitionError::BlockGasLimitExceeded);
+        }
+        // Forced L2 transactions per block are capped the same way.
+        if transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2ForcedTransaction(_))).count()
+            > crate::l2_settlement::forced::MAX_PER_BLOCK
         {
             return Err(TransitionError::BlockGasLimitExceeded);
         }
@@ -16272,6 +16301,9 @@ mod tests {
             PosTransaction::L2Deposit(_) => {}
             // A DA batch only pays fees from its inputs; nothing is issued.
             PosTransaction::L2DataAvailability(_) => {}
+            // A forced L2 transaction pays fees and a burned surcharge from
+            // its inputs; nothing is issued.
+            PosTransaction::L2ForcedTransaction(_) => {}
             // A claim moves escrowed value (counted in the accounted
             // supply) to an output; its fee comes from the relayer's inputs.
             PosTransaction::L2WithdrawClaim(_) => {}

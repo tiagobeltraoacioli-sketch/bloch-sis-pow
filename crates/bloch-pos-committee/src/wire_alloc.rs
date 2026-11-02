@@ -78,9 +78,12 @@ pub mod tx {
     pub const RESCUE_REVEAL: u8 = 0x1A;
     /// HF3: KES leaf-authorised rotation (p8b proposal, moved from 0x18).
     pub const KES_ROTATE: u8 = 0x1B;
+    /// CANDIDATE: L1 forced inclusion of one L2 transaction
+    /// (`params::L2_FORCED_INCLUSION_EPOCH`, inert).
+    pub const L2_FORCED_TRANSACTION: u8 = 0x1C;
 
     /// Next unallocated transaction tag.
-    pub const NEXT_FREE: u8 = 0x1C;
+    pub const NEXT_FREE: u8 = 0x1D;
 }
 
 /// State-root component tags — key prefix in the state SMT.
@@ -105,6 +108,8 @@ pub mod local_cache {
     pub const L2: &[u8; 16] = b"BPOSST01:L2:v1\0\0";
     /// Pending: `codex/native-claim-finality-20261019` (L2 checkpoint roots).
     pub const L2_CHECKPOINTS: &[u8; 16] = b"BPOSST01:L2CP:v1";
+    /// Candidate: `codex/forced-inclusion-r7-20261102` (L2 forced queue).
+    pub const L2_FORCED: &[u8; 16] = b"BPOSST01:L2FI:v1";
     /// HF3 KES (`v2`: entries with start periods and the enforcement bind
     /// epoch; the devnet lineage's `v1` section is not accepted).
     /// `v3` adds the retired-key history (review R-1); `v1`/`v2` sections
@@ -117,7 +122,7 @@ pub mod local_cache {
     /// HF1 own-target checkpoints (p2a).
     pub const OWN_CHECKPOINTS: &[u8; 16] = b"BPOSST01:FFGO:v1";
     /// Fixed merge/parse order.
-    pub const ORDER: [&[u8; 16]; 6] = [L2, L2_CHECKPOINTS, KES, PQ, FINALITY_SET, OWN_CHECKPOINTS];
+    pub const ORDER: [&[u8; 16]; 7] = [L2, L2_CHECKPOINTS, L2_FORCED, KES, PQ, FINALITY_SET, OWN_CHECKPOINTS];
 }
 
 /// Trailing extensions of the finality leaf (state tag `0x09`). Absent while
@@ -205,6 +210,11 @@ pub const TX_TABLE: &[Row] = &[
         name: "KesRotate",
         status: Status::Pending { gate: "HF3_KES_EPOCH", branch: "codex/hf3-kes-20261020" },
     },
+    Row {
+        tag: tx::L2_FORCED_TRANSACTION,
+        name: "L2ForcedTransaction",
+        status: Status::Pending { gate: "L2_FORCED_INCLUSION_EPOCH", branch: "codex/forced-inclusion-r7-20261102" },
+    },
 ];
 
 /// State-root tags allocated beyond the mainnet range, ascending.
@@ -228,7 +238,7 @@ mod tests {
             TX_TABLE.iter().filter(|r| r.status != Status::Tombstoned).map(|r| r.name).collect();
         assert_eq!(names.len(), TX_TABLE.len() - 3, "a name is allocated twice");
         assert_eq!(TX_TABLE.last().unwrap().tag + 1, tx::NEXT_FREE);
-        assert_eq!(TX_TABLE.len(), 0x1B, "0x01..=0x1B allocated without gaps");
+        assert_eq!(TX_TABLE.len(), 0x1C, "0x01..=0x1C allocated without gaps");
     }
 
     /// The 2026-10-20 ruling, pinned byte by byte. Changing any line here
@@ -240,7 +250,8 @@ mod tests {
         assert_eq!(tx::RESCUE_COMMIT, 0x19);
         assert_eq!(tx::RESCUE_REVEAL, 0x1A);
         assert_eq!(tx::KES_ROTATE, 0x1B);
-        assert_eq!(tx::NEXT_FREE, 0x1C);
+        assert_eq!(tx::L2_FORCED_TRANSACTION, 0x1C);
+        assert_eq!(tx::NEXT_FREE, 0x1D);
         assert_eq!(state::KES_ROOT, 0x22);
         assert_eq!(state::LC_ROSTER, 0x23);
         assert_eq!(state::PQ_RESCUE_COMMIT, 0x24);
