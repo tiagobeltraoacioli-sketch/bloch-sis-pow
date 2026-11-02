@@ -351,3 +351,25 @@ It exits non-zero only on `EXPIRED`, so the alert should also match the word
 - The arrangement's own clock refuses envelopes for epochs above 41,040
   (2027-11-12), and warns after epoch 32,850 (2027-08-13); a new arrangement
   is needed before that.
+
+## 9. How this runbook was checked
+
+- `cargo test -p bloch-pos-node --bin bloch-pos ws` on this branch: 68 passed,
+  including three tests that pin this runbook's numbers
+  (`owner_runbook_window_for_an_epoch_7168_checkpoint`,
+  `owner_runbook_restart_during_sync_before_the_checkpoint_block_halts`,
+  `owner_runbook_resigning_is_safe_reminting_is_not`).
+- The whole command sequence of §4 and §6 was run offline with throwaway keys,
+  the real `genesis/mainnet.manifest` and a synthetic loopback RPC serving
+  fake chain data for epoch 7168: mint, registry re-run (byte-identical),
+  operator re-derivation with `--issued-at` (byte-identical), read, sign,
+  assemble, verify `FRESH` at 7290, `STALE` at 8176 and 9183, `EXPIRED` and
+  exit 1 at 9184. Refusals seen: disagreeing RPCs, unfinalized epoch, `.sk`
+  readable by others, one signature, swapped slot index, no clock with
+  `--require-fresh`.
+- The published epoch 3328 envelope and `signer-set-1.bin` verify under this
+  code (3 of 3 signatures valid, shape accepted): `ACCEPTED` at epoch 3959,
+  `EXPIRED` at 7290. So arrangement 1 can sign the next checkpoint unchanged.
+- Agent 106 booted the mainnet binary from an empty directory with a
+  throwaway-signed checkpoint on a copy of mainnet history and measured the
+  sync. No checkpoint was minted from the live chain for this runbook.
