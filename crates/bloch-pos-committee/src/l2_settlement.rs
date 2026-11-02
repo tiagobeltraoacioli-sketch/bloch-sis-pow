@@ -1633,13 +1633,18 @@ impl State {
     /// gets [`Reject::Policy`], as at the swap. Acts only on the exact policy the
     /// swap installed, so it runs once, after the swap, and on no other L2.
     pub(crate) fn install_fallback_program(&mut self) {
+        self.install_fallback_with(mainnet::ROLLBACK_HEAD_RESET.as_ref());
+    }
+    /// A refused `reset` leaves the head where it is. The program still moves:
+    /// the guest is replaced because it misbehaved, whatever the head can do.
+    fn install_fallback_with(&mut self, reset: Option<&mainnet::HeadReset>) {
         let Some(pinned) = mainnet::PROGRAM else { return };
         if self.policy.identities[2] == pinned.identities[2]
             && self.policy.identities[3..7] == mainnet::PROGRAM_NEXT.identities
             && self.policy.proof_policy == mainnet::PROGRAM_NEXT.proof_policy
         {
             self.replace_program(&mainnet::PROGRAM_FALLBACK);
-            if let Some(reset) = mainnet::ROLLBACK_HEAD_RESET.as_ref() {
+            if let Some(reset) = reset {
                 self.reset_head(reset);
             }
         }
@@ -1712,6 +1717,11 @@ impl State {
     fn replace_program(&mut self, next: &mainnet::NextProgram) {
         self.policy.identities[3..7].copy_from_slice(&next.identities);
         self.policy.proof_policy = next.proof_policy;
+    }
+    /// Test hook: the rollback with a reset other than the compiled one.
+    #[cfg(test)]
+    pub(crate) fn install_fallback_with_for_test(&mut self, reset: &mainnet::HeadReset) {
+        self.install_fallback_with(Some(reset));
     }
     /// Test hook: the schedule under gates other than the compiled ones.
     #[cfg(test)]

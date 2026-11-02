@@ -3189,6 +3189,32 @@ mod l2_tests {
         assert!(l2.next_program_active());
     }
 
+    #[test]
+    fn a_rollback_with_a_reset_moves_the_head_and_a_refused_reset_still_moves_the_program() {
+        let mut l2 = state_with_bad_tail();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)) };
+
+        let mut applied = l2.clone();
+        applied.install_fallback_with_for_test(&reset);
+        assert_eq!(program_of(&applied), mainnet::PROGRAM_FALLBACK.identities);
+        assert_eq!((applied.settled_number(), applied.consumed()), (3, 3));
+        assert!(applied.next_program_active() && applied.escrow_conserved());
+
+        // A leaf only the discarded tail published was paid: the head stays.
+        let mut refused = l2.clone();
+        refused.claimed_insert_for_test(4);
+        refused.install_fallback_with_for_test(&reset);
+        assert_eq!(program_of(&refused), mainnet::PROGRAM_FALLBACK.identities);
+        assert_eq!(refused.settled_number(), 7);
+
+        // On any other program it does neither.
+        let mut activated = state_with_bad_tail();
+        activated.install_fallback_with_for_test(&reset);
+        assert_eq!(activated, state_with_bad_tail());
+    }
+
     /// A real proof of the fallback guest against its pin, with
     /// BLOCH_FALLBACK_VALUES and BLOCH_FALLBACK_PROOF naming settler-format files.
     #[test]
