@@ -794,10 +794,18 @@ pub mod forced {
     pub const MAX_ENVELOPE_BYTES: usize = 8 * 1024;
     /// Declared gas limit bounds: at least an intrinsic transfer, at most this.
     /// The guest skips an envelope whose own gas limit is above the declared
-    /// one, so L1 bounds the proving work of one settlement by
-    /// `MAX_PER_SETTLEMENT * MAX_GAS` (8M gas).
+    /// one, so the declared gas bounds what an envelope can execute.
     pub const MIN_GAS: u64 = 21_000;
-    pub const MAX_GAS: u64 = 500_000;
+    pub const MAX_GAS: u64 = 300_000;
+    /// Declared gas one settlement must consume at most: the due prefix stops
+    /// before the record that would cross it. Forced envelopes bypass the
+    /// sequencer's proving budget, so this is what bounds their proving work.
+    /// The worst measured EVM-gas-to-SP1-gas ratio is about 216 (a modexp,
+    /// agent 90), so 300k gas is at most about 65M SP1 gas on top of the block:
+    /// inside the proven range, with room for the sequencer's transactions.
+    /// To be re-measured on the final sparse guest before the gate is armed.
+    pub const MAX_GAS_PER_SETTLEMENT: u64 = 300_000;
+    const _: () = assert!(MAX_GAS <= MAX_GAS_PER_SETTLEMENT);
     /// Queue-depth price, burned on top of the ordinary fee: `BASE_SURCHARGE_SAT`
     /// doubled every `SURCHARGE_DOUBLING` pending records. An empty queue costs
     /// the base; keeping the queue full costs `2^8` times it per record.
@@ -891,10 +899,21 @@ pub mod forced {
             self.root
         }
         /// What the next settlement must consume: everything pending at the
-        /// anchor, capped. Before an anchor, what is pending now (capped).
+        /// anchor, in order, up to [`MAX_PER_SETTLEMENT`] records and
+        /// [`MAX_GAS_PER_SETTLEMENT`] declared gas. Before an anchor, what is
+        /// pending now, with the same caps.
         pub fn due(&self) -> &[Record] {
             let frozen = self.anchor.unwrap_or(self.pending.len() as u64);
-            &self.pending[..frozen.min(MAX_PER_SETTLEMENT) as usize]
+            let mut gas = 0u64;
+            let mut n = 0usize;
+            for r in self.pending.iter().take(frozen.min(MAX_PER_SETTLEMENT) as usize) {
+                gas = gas.saturating_add(r.gas_limit);
+                if gas > MAX_GAS_PER_SETTLEMENT {
+                    break;
+                }
+                n += 1;
+            }
+            &self.pending[..n]
         }
         pub(crate) fn push(&mut self, record: Record) -> Result<(), Refusal> {
             if self.pending.len() as u64 >= MAX_PENDING {

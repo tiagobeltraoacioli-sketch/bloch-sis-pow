@@ -251,13 +251,27 @@
         assert_eq!(l2.queue_forced(MAINNET_CHAIN_ID, [0xee; 32], &envelope(0), 21_000), Err(R::Full));
         let queue = l2.forced_queue().unwrap();
         assert_eq!(queue.pending().len() as u64, forced::MAX_PENDING);
-        // One settlement owes at most 16, from the front, in order.
-        assert_eq!(queue.due().len() as u64, forced::MAX_PER_SETTLEMENT);
+        // At the gas cap: one record of MAX_GAS per settlement, from the front.
+        assert_eq!(queue.due().len(), 1);
         assert_eq!(queue.due()[0].l1_txid, [0; 32]);
-        assert_eq!(queue.due()[15].l1_txid, [15; 32]);
-        // Proving work one settlement can be forced to do is bounded.
-        assert!(forced::MAX_PER_SETTLEMENT * forced::MAX_GAS <= 8_000_000);
         assert_ne!(l2.committed_bytes(), start);
+        // Small records: the record cap binds first; mixed: the gas cap does.
+        let mut small = mainnet_l2_state();
+        assert!(small.enable_forced_inclusion_for_test());
+        for i in 0..20u8 {
+            small.queue_forced(MAINNET_CHAIN_ID, [i; 32], &envelope(i), 21_000).unwrap();
+        }
+        // 14 * 21k = 294k fits, a 15th would cross 300k.
+        assert_eq!(small.forced_queue().unwrap().due().len(), 14);
+        let mut mixed = mainnet_l2_state();
+        assert!(mixed.enable_forced_inclusion_for_test());
+        for (i, gas) in [100_000u64, 150_000, 60_000, 21_000].into_iter().enumerate() {
+            mixed.queue_forced(MAINNET_CHAIN_ID, [i as u8; 32], &envelope(i as u8), gas).unwrap();
+        }
+        // 100k + 150k fit; 60k would cross; the 21k behind it waits too (order is kept).
+        assert_eq!(mixed.forced_queue().unwrap().due().len(), 2);
+        // Proving work one settlement can be forced to do is bounded by the gas cap.
+        assert!(forced::MAX_GAS <= forced::MAX_GAS_PER_SETTLEMENT);
     }
 
     #[test]
@@ -323,7 +337,7 @@
         cases.push(("chain", resign(L2ForcedTransaction { l2_chain_id: 700772, ..base.clone() }), ForcedReject::Chain));
         cases.push(("network", resign(L2ForcedTransaction { network_domain: [0x92; 32], ..base.clone() }), ForcedReject::Network));
         cases.push(("gas low", resign(L2ForcedTransaction { gas_limit: 20_999, ..base.clone() }), ForcedReject::Shape));
-        cases.push(("gas high", resign(L2ForcedTransaction { gas_limit: 500_001, ..base.clone() }), ForcedReject::Shape));
+        cases.push(("gas high", resign(L2ForcedTransaction { gas_limit: forced::MAX_GAS + 1, ..base.clone() }), ForcedReject::Shape));
         cases.push(("empty", resign(L2ForcedTransaction { envelope: vec![], ..base.clone() }), ForcedReject::Shape));
         let mut short = base.clone();
         short.tx_bytes -= 1;
@@ -350,4 +364,89 @@
         assert!(PosTransaction::from_canonical_bytes(&PosTransaction::L2ForcedTransaction(big).canonical_bytes()).is_err());
         let mut st = pre.clone();
         assert!(st.apply_transaction(&PosTransaction::L2ForcedTransaction(base), 0, pre.next_base_fee(), &ToyVerifier).is_ok());
+    }
+
+    /// A V3 statement for `l2`'s frozen source and head, built from the
+    /// state alone (the `transaction` + `settlement` + `to_v3` fixtures).
+    fn statement_on(l2: &crate::l2_settlement::State, inbox: [u8; 32], salt: u8) -> Transaction {
+        let source = l2.frozen_source().expect("anchored");
+        let mut s = TEMPLATE.to_vec();
+        for (i, id) in l2.policy().identities.iter().enumerate() {
+            s[S + i * 32..S + (i + 1) * 32].copy_from_slice(id);
+        }
+        s[S + 256..S + 264].copy_from_slice(&l2.policy().chain_id.to_be_bytes());
+        for (offset, value) in [(400, source.block), (448, source.commitment), (480, source.inbox_root)] {
+            s[S + offset..S + offset + 32].copy_from_slice(&value);
+        }
+        s[S + 432..S + 440].copy_from_slice(&source.slot.to_be_bytes());
+        s[S + 440..S + 448].copy_from_slice(&source.height.to_be_bytes());
+        let end = source.inbox_count.min(l2.consumed() + crate::l2_settlement::MAX_INBOX_PER_SETTLEMENT);
+        s[S + 512..S + 520].copy_from_slice(&source.inbox_count.to_be_bytes());
+        s[S + 520..S + 528].copy_from_slice(&l2.consumed().to_be_bytes());
+        s[S + 528..S + 536].copy_from_slice(&end.to_be_bytes());
+        if let Some((digest, old)) = l2.head() {
+            s[S + 224..S + 256].copy_from_slice(&digest);
+            let number = u64::from_be_bytes(old[S + 264..S + 272].try_into().unwrap()) + 1;
+            s[S + 264..S + 272].copy_from_slice(&number.to_be_bytes());
+            s[S + 272..S + 304].copy_from_slice(&old[S + 336..S + 368]);
+            s[S + 304..S + 336].copy_from_slice(&old[S + 368..S + 400]);
+        }
+        s[S + 336] ^= salt; // a distinct header per settlement
+        let tx = Transaction { proof_policy: l2.policy().proof_policy, statement: s, proof: [1; 356] };
+        to_v3(tx, inbox, 0)
+    }
+
+    /// Agent 66's griefing, at the transition: a third party lands one block
+    /// every `window` native blocks (one finality window on mainnet) and the
+    /// sequencer lands none. A forced transaction, submitted at any offset in
+    /// the window, is consumed by the second settlement after it, never later:
+    /// latency in `window..2*window` blocks. The griefer that tries to leave it
+    /// out is refused every time. Twenty at once drain 16 + 4.
+    #[test]
+    fn under_griefing_a_forced_transaction_lands_within_two_settlement_intervals() {
+        let (_, policy) = running_without_l2();
+        let window = 8u64;
+        let mut worst = 0;
+        for submit in window + 1..=3 * window {
+            for burst in [1u64, 20] {
+                let mut l2 = crate::l2_settlement::State::activated(activation(policy.clone(), true)).unwrap();
+                assert!(l2.enable_forced_inclusion_for_test());
+                let mut landed: Vec<(u64, u64)> = Vec::new();
+                let mut settlements = 0u8;
+                for h in 1..=8 * window {
+                    l2.advance_height().unwrap();
+                    l2.prepare_source(Keccak256::digest(h.to_be_bytes()).into(), h);
+                    if h == submit {
+                        for i in 0..burst {
+                            l2.queue_forced(700771, [i as u8; 32], &envelope(i as u8), 21_000).unwrap();
+                        }
+                    }
+                    if h % window != 0 {
+                        continue;
+                    }
+                    let due = l2.forced_queue().unwrap().due().to_vec();
+                    let consumed_before = l2.forced_queue().unwrap().consumed();
+                    settlements += 1;
+                    if !due.is_empty() {
+                        let omit = statement_on(&l2, no_deposits(), settlements);
+                        assert_eq!(l2.clone().apply(&omit, [0; 32], 0, true, &ProofDouble), Err(Reject::Forced));
+                    }
+                    let good = statement_on(&l2, forced::inbox_hash(no_deposits(), &due), settlements);
+                    l2.apply(&good, [0; 32], 0, true, &ProofDouble).expect("the griefer's block settles");
+                    let consumed = l2.forced_queue().unwrap().consumed();
+                    for index in consumed_before..consumed {
+                        landed.push((index, h));
+                    }
+                }
+                assert_eq!(landed.len() as u64, burst, "submit {submit} burst {burst}");
+                let first = landed[0].1 - submit;
+                assert!((window..2 * window).contains(&first), "submit {submit}: {first} blocks");
+                let last = landed.last().unwrap().1 - submit;
+                // 20 transfers are 420k declared gas: 14 in the first due settlement, 6 in the next.
+                let bound = if burst > 1 { 3 * window } else { 2 * window };
+                assert!(last < bound, "submit {submit} burst {burst}: {last} blocks");
+                worst = worst.max(last);
+            }
+        }
+        assert_eq!(worst, 3 * window - 1);
     }
