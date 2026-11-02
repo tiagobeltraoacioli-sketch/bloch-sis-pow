@@ -13,6 +13,13 @@ private rehearsal net, with real binaries unless the text says otherwise) or
 **[R]** (read from the code, not run). No L2 mainnet exists yet to measure.
 The L1 sections were not re-read against the public nodes in this refresh.
 
+**Update of 2026-11-02 (agent 148), draft, not published, nothing sent:**
+§6.5.2 and the new §6.8 describe the **next build** (build commit `17383fe`,
+release `bloch-l2-2026-11-02-next-native-78d4921c`, signing target release
+`SHA256SUMS` `116bfaba…`, **unsigned**; kit tip `f1c8033`). Sources are named
+per statement: `PINS-NEXT.md`, agent reports 92, 93, 106, 124, 127, 139, and
+the kit files at `f1c8033`. Nothing in §6.8 was measured on a mainnet L2.
+
 This page is for exchanges and custodians that list BLCH. It supplements
 [`BLOCH-G4-TECHNICAL-INTEGRATION-REFERENCE-v2.md`](./BLOCH-G4-TECHNICAL-INTEGRATION-REFERENCE-v2.md)
 (the full method, address and transaction reference). Where the two
@@ -528,7 +535,17 @@ python3 bloch-l2-withdraw.py fetch --l2-rpc http://L2_RPC --l1-rpc http://YOUR_L
 | 0 | `fetch`: proof verified, file written. `verify`: valid and **not claimed**. **Never "paid"** | go on to the claim | **[M]** |
 | 1 | refused: bad proof, wrong owner or network, or a method the RPC lacks | **do not retry blindly**, read the message | **[M]** wrong network pin; `-32601` on v2.1 |
 | 3 | not ready: retry later, with `--wait` the tool does so itself | wait | **[M]** unknown index (`-32042`), refused connection, HTML error page |
-| 4 | index already claimed on L1 | do not resend; check your ledger | **[M]** |
+| 4 | index already claimed on L1 (`status`: claimed; finality of the paying output not shown) | do not resend; check your ledger | **[M]** |
+| 5 | `status` only: still unclaimed long after sending, presumed dropped, nothing moved | build a new claim | **[R]** tool docstring at `f1c8033` |
+
+On the next build the tool is in the kit as
+`deployment/mainnet/withdraw/bloch-l2-withdraw.py` `1791d8ca…` (PINS-NEXT kit
+table; hash re-read at `f1c8033`), with subcommands `burn`, `find`, `fetch`,
+`verify` and `status`. **[R]** The next settled RPC serves
+`bloch_getWithdrawalProof [index]` or `[index, root]`, which `fetch` calls.
+**[R]** Withdraw suite 35 OK at 17383fe and 36 OK at 583d8ec, Mac. **[M]**,
+agent 124. Use `status` after sending to decide credit or retry; exit 0 of
+`verify` is never a payment. **[R]**
 
 - `-32001`, `-32041`, `-32042`, `-32043`, `-32045`, `-32046`, `-32005`, `-32053`
   are exit 3 in the current tool. **[R]**; review tests ran these with stub RPCs.
@@ -596,6 +613,86 @@ A v2.1 attestor kit given a v3 file signs nothing and raises no alert. **[R]**
   provisional v2.1. No claim fell inside the HF1, own-target or HF2 windows, and
   no settlement or claim was exercised after the first KES handover (period 1,
   e8710 on mainnet).
+
+### 6.8 The next build (17383fe) at launch
+
+Draft for the next build launch. The owner has not signed `116bfaba…` yet.
+
+**Finality levels.**
+- `safe` follows an L1 reorg **down**, never below `finalized` (602f1a6), and
+  by-hash reads check the canonical hash (ff9753a). **[R]**, agent 124. Do not
+  credit at `safe`; nothing that moves value in the kit reads it. **[R]**, agent
+  46's survey spot-checked by 124. A falling `safe` is normal after an L1 reorg.
+- `finalized` answers **`-32001`** ("this level is closed") until the RPC has
+  read a follower status file, where v2.1 answered `null`. **[M]**, agent 139,
+  settled-rpc `e5754d05…` (a harness that expected `null` died on it). Treat
+  `-32001` as "not yet", not as an error to page on at once; the reference
+  checker already does (§7).
+- A foreign settlement closes `safe` only, no longer `finalized` (§6.3.3).
+  **[M]** on a dev build.
+
+**Deposit-only launch, idle blocks.** User transactions on the L2 are off.
+The settler is configured with `--skip-idle-blocks --max-idle-seconds 86400
+--min-block-interval 1800`: no block without demand, a heartbeat block at most
+every 24 h, at most one block every 30 min. **[R]**, go-live plan D15 (agent
+127, from agent 92). So **the L2 head can be up to 24 h old while healthy.**
+Do not alert on head age alone. Tell idle from stuck:
+- `l2_monitor.py` adds `--max-idle-seconds` to the head, settlement and
+  finalized age thresholds (`idle_thresholds`), so `l2_head_age` is graded
+  against 25/45 min **plus** 24 h. **[R]**, `l2_monitor.py` `71f14a64…`.
+  `l2_head_age` went CRIT on agent 92's rehearsal anyway, because the head's
+  time is its anchor and older than its acceptance by the proof time; plan
+  D18 suggests N + 45 min + proof time. **[R]**, agent 127.
+- `deposit_wait` is the stuck signal: time since L1 deposits began waiting with
+  none consumed (`--backlog-state` file). Idle with no deposits waiting is
+  healthy; deposits waiting and `deposit_wait` growing is stuck. Defaults
+  45/90 min; plan D18 suggests 5,400/10,800 s for 30 min pacing (agent 127's
+  value, **not measured**). **[R]**
+- From outside, the same test: `getl2settlement` → `source.pending[]`
+  non-empty with no new accepted settlement past your expected wait means
+  stuck. **[R]**
+
+**Proof cadence and times.** With 30 min pacing and proofs of about 30–60 min
+per block, expect:
+- a deposit to mint in about **40–70 min** (two blocks after an idle
+  stretch), longer as proofs slow with height. **[R]**, plan D15; not measured
+  end to end on mainnet;
+- then `finalized` on L2 after the L1 finalizes the settlement (§6.3), and
+  for withdrawals the claim delay and L1 finality on top (§6.5).
+Proof time by height, real proofs on 32 vCPU, dense guest `203114bf…`: 814–944
+s at block 2048, 1,563 s at 4097, 2,731–2,809 s at 8191 (about 46 min).
+**[M]**, agent 93. The monitor WARNs around block 4,000 at 1,800 s interval.
+**[R]**, plan D16. Set customer-facing estimates to at least 2 h for deposits
+and allow more as height grows (my suggestion, not measured).
+
+**`RateLimited` large claims.** A claim larger than what remains of the release
+window (`release_window.remaining_sat`) is answered `accepted` by
+`sendrawtransaction` and then refused with `RateLimited`; nothing moves. **[M]**,
+agent 67 (the unexplained case of §6.5 step 4); **[R]** for the rule, withdraw
+README. A claim above `cap_sat` fits only as the **first** claim of a window,
+so any earlier claim, however small, blocks it for that window (2,880 blocks).
+**[R]** Confirm with `status` / the `claimed` bitmap, never with the reply.
+
+**Spool expiry while user transactions are off.** The RPC drops a queued
+transaction 3 h after it first saw it (`SPOOL_LIMITS.ttl`), whether or not a
+block could include it, and a dropped nonce makes the sender's later nonces
+expire too. **[R]**, PINS-NEXT trap (agent 55 finding 3), settled-rpc source at
+17383fe. It does not affect the deposit-only launch, since user transactions
+are off; it **must be fixed before they turn on**. Do not build any queuing
+of user L2 transactions on this build.
+
+**For node operators: a stuck L1 node.** On mainnet, do **not** wipe the data
+dir: an empty mainnet node exits with `ERR_WS_REQUIRE_CHECKPOINT` (genesis anchor
+beyond the 2016-epoch weak-subjectivity window), with or without
+`ws_latest.bin`. **[M]**, agent 106, mainnet binary `01c98b68…`. Instead
+refill from a healthy node you operate: stop it, copy its chain files by name
+(`blocks.*`, `meta.*`, `ws_latest*`, `state.cache*`), **never key files**,
+then start. Measured 97 s to serve the head (2.9 GB local copy; host transfer
+time comes on top). **[M]**, agent 106. Without `state.cache` the node
+replays the full chain in 51–54 min. **[M]** With a signed checkpoint it is
+about 11.5–15 h (extrapolated). **[M]**/extrapolated. The runbook fix is on
+`codex/recovery-r6-20261102`; check that your copy of
+`docs/L1-STUCK-NODE-RUNBOOK.md` has the refill steps. **[R]**, agents 106, 127.
 
 ## 7. Reference checker
 
