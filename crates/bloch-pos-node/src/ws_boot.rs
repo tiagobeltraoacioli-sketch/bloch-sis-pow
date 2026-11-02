@@ -2167,4 +2167,177 @@ mod tests {
         // Nothing was adopted.
         assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), genesis_anchor());
     }
+
+    // -- owner runbook evidence (docs/WS-CHECKPOINT-OWNER-RUNBOOK.md) -------
+    //
+    // These pin the mainnet numbers the owner runbook relies on: the window
+    // around a checkpoint at epoch 7168, the restart-during-sync halt, and the
+    // difference between re-signing (safe) and re-minting (halts nodes).
+
+    fn owner_set_and_secrets(id: u32) -> (SignerSet, Vec<Vec<u8>>) {
+        let mut signers = Vec::new();
+        let mut secrets = Vec::new();
+        for external in [true, true, true] {
+            let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+            let mut pubkey = [0u8; HYBRID_PK_BYTES];
+            pubkey.copy_from_slice(&strip(&pk));
+            signers.push(Signer { pubkey, external });
+            secrets.push(sk.to_vec());
+        }
+        let set = SignerSet {
+            id,
+            signers,
+            threshold: ws::WS_PHASE_A_THRESHOLD,
+            min_external: ws::WS_PHASE_A_MIN_EXTERNAL,
+            adopted_epoch: 0,
+        };
+        (set, secrets)
+    }
+
+    fn owner_envelope(cp: WeakSubjectivityCheckpoint, secrets: &[Vec<u8>], who: &[u8]) -> CheckpointEnvelope {
+        let signatures = who
+            .iter()
+            .map(|i| (*i, strip(&bloch_crypto::crypto::sign(&secrets[*i as usize], &cp.ws_digest()).unwrap())))
+            .collect();
+        CheckpointEnvelope { checkpoint: cp, signatures }
+    }
+
+    fn write_artifacts(dir: &Path, tag: &str, env: &CheckpointEnvelope, set: &SignerSet) -> WsConfig {
+        let env_path = dir.join(format!("{tag}-env.bin"));
+        let set_path = dir.join(format!("{tag}-set.bin"));
+        fs::write(&env_path, encode_envelope_file(env)).unwrap();
+        fs::write(&set_path, encode_signer_set_file(set)).unwrap();
+        pinned_config(env_path, set_path)
+    }
+
+    /// Mainnet today: a wiped node holding only the genesis anchor refuses
+    /// (agent 106's ERR_WS_REQUIRE_CHECKPOINT); an epoch-7168 envelope admits
+    /// it and is persisted, after which restarts need no flags until wall
+    /// epoch 9183 inclusive; from 9184 a node without finality refuses again.
+    #[test]
+    fn owner_runbook_window_for_an_epoch_7168_checkpoint() {
+        let dir = tmpdir("owner-7168");
+        let wall = 7290;
+        let refusal = boot(
+            &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
+            wall, false, (0, GEN), |_| None, |_| false, |_| None,
+        )
+        .unwrap()
+        .expect_err("the genesis anchor is 7290 epochs old");
+        assert!(refusal.contains("ERR_WS_REQUIRE_CHECKPOINT"), "{refusal}");
+
+        let (set, secrets) = owner_set_and_secrets(1);
+        let env = owner_envelope(checkpoint(7168), &secrets, &[0, 1]);
+        let cfg = write_artifacts(&dir, "e7168", &env, &set);
+        let ok = boot(
+            &cfg, &dir, NET, &GEN, &genesis_anchor(),
+            wall, false, (0, GEN), |_| None, |_| false, |_| None,
+        )
+        .unwrap()
+        .expect("a fresh 2-of-3 envelope admits a wiped node");
+        assert_eq!(ok.anchor_epoch, 7168);
+        assert!(ok.anchor_is_hard);
+        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), checkpoint(7168));
+
+        let last_ok = 7168 + WS_PERIOD_EPOCHS - 1;
+        assert_eq!(last_ok, 9183);
+        boot(
+            &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
+            last_ok, false, (0, GEN), |_| None, |_| false, |_| None,
+        )
+        .unwrap()
+        .expect("the stored ws_latest still admits a fresh boot at 9183");
+        let refusal = boot(
+            &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
+            last_ok + 1, false, (0, GEN), |_| None, |_| false, |_| None,
+        )
+        .unwrap()
+        .expect_err("at 9184 the 7168 checkpoint has aged out");
+        assert!(refusal.contains("ERR_WS_REQUIRE_CHECKPOINT"), "{refusal}");
+        assert!(refusal.contains("checkpoint at epoch 7168"), "{refusal}");
+    }
+
+    /// A node syncing from genesis under a checkpoint has its OWN finality
+    /// after the first finalized epochs. If it restarts while that finality
+    /// is still 2016 or more epochs behind the wall clock and before it holds
+    /// the checkpoint block, the boot halts for the operator (ERR_WS_STALE
+    /// recovery halted, exit 78). Inside the window it resumes with a
+    /// warning, and once the checkpoint block is canonical it continues.
+    #[test]
+    fn owner_runbook_restart_during_sync_before_the_checkpoint_block_halts() {
+        let dir = tmpdir("owner-midsync");
+        save_latest(&dir, &checkpoint(7168)).unwrap();
+        let wall = 7290;
+        let halted = boot(
+            &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
+            wall, true, (3000, [0x55; 32]), |_| None, |_| false, |_| None,
+        )
+        .unwrap()
+        .expect_err("own finality 4290 epochs old, checkpoint block not yet local");
+        assert!(halted.contains("ERR_WS_STALE recovery halted"), "{halted}");
+
+        let resumed = boot(
+            &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
+            wall, true, (wall - WS_PERIOD_EPOCHS + 1, [0x55; 32]), |_| None, |_| false, |_| None,
+        )
+        .unwrap()
+        .expect("own finality inside the window resumes");
+        assert!(resumed.warnings.iter().any(|w| w.contains("WARNING")), "{:?}", resumed.warnings);
+
+        boot(
+            &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
+            wall, true, (3000, [0x55; 32]), |_| None, |_| true, |_| None,
+        )
+        .unwrap()
+        .expect("a checkpoint block already on the local chain continues forward");
+
+        let wiped = tmpdir("owner-midsync-wiped");
+        save_latest(&wiped, &checkpoint(7168)).unwrap();
+        boot(
+            &no_flags(), &wiped, NET, &GEN, &genesis_anchor(),
+            wall, false, (0, GEN), |_| None, |_| false, |_| None,
+        )
+        .unwrap()
+        .expect("chain files removed, ws_latest.bin kept: starts again as a fresh node");
+    }
+
+    /// Signatures are randomised, so two signing sessions over the SAME
+    /// checkpoint bytes give different envelopes; both verify and the second
+    /// is a no-op. Minting the same epoch again with another issued_at gives
+    /// a different digest and refuses the boot of every node that stored the
+    /// first.
+    #[test]
+    fn owner_runbook_resigning_is_safe_reminting_is_not() {
+        let dir = tmpdir("owner-resign");
+        let (set, secrets) = owner_set_and_secrets(1);
+        let cp = checkpoint(7168);
+        let first = owner_envelope(cp, &secrets, &[0, 1]);
+        let second = owner_envelope(cp, &secrets, &[0, 2]);
+        let again = owner_envelope(cp, &secrets, &[0, 1]);
+        assert_ne!(first.signatures[0].1, again.signatures[0].1, "signatures are randomised");
+        for env in [&first, &second, &again] {
+            ws::verify_envelope(env, &set, NET, &GEN, &WsHybridVerifier).expect("each verifies");
+        }
+        let wall = 7290;
+        let cfg = write_artifacts(&dir, "first", &first, &set);
+        boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), wall, false, (0, GEN), |_| None, |_| false, |_| None)
+            .unwrap()
+            .expect("first envelope admitted");
+        let cfg = write_artifacts(&dir, "second", &second, &set);
+        let ok = boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), wall, false, (0, GEN), |_| None, |_| false, |_| None)
+            .unwrap()
+            .expect("a re-signed envelope of the same bytes is a no-op");
+        assert!(ok.warnings.iter().any(|w| w.contains("not newer")), "{:?}", ok.warnings);
+
+        let mut reminted = cp;
+        reminted.issued_at += 1;
+        assert_ne!(reminted.ws_digest(), cp.ws_digest());
+        let env = owner_envelope(reminted, &secrets, &[0, 1]);
+        let cfg = write_artifacts(&dir, "reminted", &env, &set);
+        let refusal = boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), wall, false, (0, GEN), |_| None, |_| false, |_| None)
+            .unwrap()
+            .expect_err("a re-mint of a stored epoch refuses the boot");
+        assert!(refusal.contains("WS_CONFLICT"), "{refusal}");
+        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), cp);
+    }
 }
