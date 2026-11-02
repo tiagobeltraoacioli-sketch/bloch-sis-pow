@@ -191,6 +191,8 @@ mod tests {
             "hf3_slh",
             "hf3_pq_migration",
             "hf3_lattice_emergency",
+            "l2_next_program",
+            "l2_program_rollback",
         ];
         let Json::Obj(fields) = &v else { panic!("not an object") };
         assert_eq!(fields.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), expected);

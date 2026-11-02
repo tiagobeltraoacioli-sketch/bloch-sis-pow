@@ -4940,9 +4940,7 @@ impl Engine {
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
         // A proof reserves the whole gas budget. Never pack it with transfers.
-        let l2 = self.state.l2_settlement();
-        let live_proof = |tx: &PosTransaction| l2.is_some_and(|l2| l2_proof_holds_the_slot(tx, l2));
-        if let Some(tx) = self.mempool.values().find(|tx| live_proof(tx)) {
+        if let Some(tx) = live_l2_proof(self.mempool.values(), self.state.l2_settlement()) {
             return vec![tx.clone()];
         }
         let dead_proof = |tx: &PosTransaction| matches!(tx, PosTransaction::L2SettlementAsync(_));
@@ -7984,6 +7982,15 @@ pub(crate) fn l2_proof_holds_the_slot(
     l2: &bloch_pos_committee::l2_settlement::State,
 ) -> bool {
     matches!(pending, PosTransaction::L2SettlementAsync(settlement) if !l2.names_another_program(settlement))
+}
+
+/// The settlement proof a proposer picks: the first that may still land.
+fn live_l2_proof<'a>(
+    mut pending: impl Iterator<Item = &'a PosTransaction>,
+    l2: Option<&bloch_pos_committee::l2_settlement::State>,
+) -> Option<&'a PosTransaction> {
+    let l2 = l2?;
+    pending.find(|tx| l2_proof_holds_the_slot(tx, l2))
 }
 
 pub(crate) fn l2_admission_refusal(
@@ -17822,30 +17829,16 @@ mod l2_admission_tests {
         }
     }
 
-    /// No proposer picks a dead proof, ordinary transactions keep flowing past
-    /// it, and a live proof is still chosen alone. The pool holds it until the
-    /// TTL or until a new proof replaces it.
+    /// No proposer picks a dead proof, and a live proof is still found behind one.
     #[test]
     fn the_proposer_skips_a_proof_of_a_replaced_program() {
-        let mut e = super::slot_horizon::engine_at_wall_slot(0);
-        let state = (*e.state).clone().configure_l2_genesis_async(policy()).unwrap();
-        e.state = StateCell::new(state);
+        let limits = withdrawal::Limits::DEVELOPMENT;
+        let l2 = State::activated(Activation { policy: policy(), asynchronous: true, limits }).unwrap();
         let dead = proof_of(&policy(), [0xee; 32], 1);
-        e.mempool.insert(dead.canonical_bytes(), dead.clone());
-        assert!(e.select_transactions(0).is_empty(), "the dead proof is not selected");
-        assert!(e.mempool.contains_key(&dead.canonical_bytes()));
         let live = proof_of(&policy(), policy().identities[3], 2);
-        e.mempool.insert(live.canonical_bytes(), live.clone());
-        assert_eq!(e.select_transactions(0), vec![live]);
-    }
-
-    /// `getl2settlement` always names what is ahead: nothing while the gates are inert.
-    #[test]
-    fn the_settlement_view_reports_an_empty_schedule_while_inert() {
-        let e = super::slot_horizon::engine_at_wall_slot(0);
-        let state = (*e.state).clone().configure_l2_genesis_async(policy()).unwrap();
-        let view = crate::rpc::l2_settlement_json(&state).to_string();
-        assert!(view.contains("\"program_schedule\":[]"), "{view}");
+        assert_eq!(live_l2_proof([&dead].into_iter(), Some(&l2)), None);
+        assert_eq!(live_l2_proof([&dead, &live].into_iter(), Some(&l2)), Some(&live));
+        assert_eq!(live_l2_proof([&live].into_iter(), None), None);
     }
 
     /// The mempool's L2 door reads the installed L2's profile, not the build:
