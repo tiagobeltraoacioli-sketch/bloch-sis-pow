@@ -2136,7 +2136,10 @@ fn l2_forced_json_reports_the_queue_and_the_next_surcharge() {
     let queue = forced::Queue::default();
     let Json::Obj(fields) = l2_forced_json(&queue) else { panic!("not an object") };
     let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
-    assert_eq!(keys, ["queued", "consumed", "pending", "root", "due", "due_hash", "next_surcharge_sat"]);
+    assert_eq!(
+        keys,
+        ["queued", "consumed", "pending", "pending_weight", "max_pending_weight", "root", "due", "due_hash", "next_surcharge_sat"]
+    );
     let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
     assert_eq!(get("due"), Json::Arr(vec![]));
     assert_eq!(get("due_hash"), Json::hex(&forced::hash(&[])));

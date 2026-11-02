@@ -786,8 +786,13 @@ pub mod forced {
     /// Records one settlement consumes at most, from the front of the queue.
     /// Separate from the deposit cap, so a full queue never slows deposits.
     pub const MAX_PER_SETTLEMENT: u64 = 16;
-    /// Pending records at most. A submission past it is refused ([`surcharge_sat`]).
-    pub const MAX_PENDING: u64 = 256;
+    /// Queue capacity in weight units ([`weight`]: one per started 21k of
+    /// declared gas). A submission that would exceed it is refused
+    /// ([`surcharge_sat`]). Weighting by gas makes the drain rate, at most
+    /// [`MAX_GAS_PER_SETTLEMENT`] per settlement, the same whatever record sizes
+    /// a filler picks, so keeping the queue full always costs the same per
+    /// settlement.
+    pub const MAX_PENDING_WEIGHT: u64 = 256;
     /// Forced submissions per native block, like DA batches.
     pub const MAX_PER_BLOCK: usize = 4;
     /// One signed L2 envelope (EIP-2718) at most this long.
@@ -807,11 +812,12 @@ pub mod forced {
     pub const MAX_GAS_PER_SETTLEMENT: u64 = 300_000;
     const _: () = assert!(MAX_GAS <= MAX_GAS_PER_SETTLEMENT);
     /// Queue-depth price, burned on top of the ordinary fee: `BASE_SURCHARGE_SAT`
-    /// doubled every `SURCHARGE_DOUBLING` pending records. An empty queue costs
-    /// the base; keeping the queue full costs `2^8` times it per record.
+    /// per weight unit, doubled every `SURCHARGE_DOUBLING` pending units. An
+    /// empty queue costs the base per unit; the last units of a full queue
+    /// cost `2^7` times it.
     pub const BASE_SURCHARGE_SAT: u64 = 1_000;
     pub const SURCHARGE_DOUBLING: u64 = 32;
-    const _: () = assert!(MAX_PENDING / SURCHARGE_DOUBLING < 32);
+    const _: () = assert!(MAX_PENDING_WEIGHT / SURCHARGE_DOUBLING < 32);
     pub const INBOX_DOMAIN: &[u8] = b"BLOCH:L2:INBOX:2";
 
     #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
@@ -858,13 +864,19 @@ pub mod forced {
         h.finalize().into()
     }
 
-    /// The burned surcharge of a submission that finds `pending` records
-    /// queued, or `None` when the queue is full.
-    pub const fn surcharge_sat(pending: u64) -> Option<u64> {
-        if pending >= MAX_PENDING {
+    /// Weight units of a record declaring `gas`: one per started [`MIN_GAS`]
+    /// (1 for a transfer, 15 at [`MAX_GAS`]).
+    pub const fn weight(gas: u64) -> u64 {
+        gas.div_ceil(MIN_GAS)
+    }
+
+    /// The burned surcharge of a submission of `weight` units that finds
+    /// `pending` units queued, or `None` when it does not fit.
+    pub const fn surcharge_sat(pending: u64, weight: u64) -> Option<u64> {
+        if weight == 0 || pending.saturating_add(weight) > MAX_PENDING_WEIGHT {
             return None;
         }
-        Some(BASE_SURCHARGE_SAT << (pending / SURCHARGE_DOUBLING))
+        Some((BASE_SURCHARGE_SAT << (pending / SURCHARGE_DOUBLING)) * weight)
     }
 
     /// The queue, present only on an L2 where forced inclusion is enabled.
@@ -915,8 +927,12 @@ pub mod forced {
             }
             &self.pending[..n]
         }
+        /// Weight units pending ([`weight`]), at most [`MAX_PENDING_WEIGHT`].
+        pub fn pending_weight(&self) -> u64 {
+            self.pending.iter().map(|r| weight(r.gas_limit)).sum()
+        }
         pub(crate) fn push(&mut self, record: Record) -> Result<(), Refusal> {
-            if self.pending.len() as u64 >= MAX_PENDING {
+            if surcharge_sat(self.pending_weight(), weight(record.gas_limit)).is_none() {
                 return Err(Refusal::Full);
             }
             let mut h = Keccak256::new();
@@ -963,7 +979,7 @@ pub mod forced {
         /// Declared gas outside [`MIN_GAS`]..=[`MAX_GAS`], or an empty or
         /// oversized envelope.
         Shape,
-        /// [`MAX_PENDING`] records are queued.
+        /// The record does not fit in [`MAX_PENDING_WEIGHT`].
         Full,
     }
 }
@@ -2552,7 +2568,7 @@ impl State {
         if let Some(q) = &self.forced {
             let pending = q.pending.len() as u64;
             if q.queued.checked_sub(q.consumed) != Some(pending)
-                || pending > forced::MAX_PENDING
+                || q.pending_weight() > forced::MAX_PENDING_WEIGHT
                 || q.anchor.is_some_and(|a| a > pending)
             {
                 return Err("cached L2 forced queue is inconsistent".into());

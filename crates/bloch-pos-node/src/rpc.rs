@@ -3080,12 +3080,15 @@ pub(crate) fn l2_forced_json(queue: &bloch_pos_committee::l2_settlement::forced:
         ("envelope_hash", Json::hex(&r.envelope_hash)), ("gas_limit", Json::u(r.gas_limit)),
     ]);
     let pending = queue.pending().len() as u64;
+    let weight = queue.pending_weight();
     Json::obj(vec![
         ("queued", Json::u(queue.queued())), ("consumed", Json::u(queue.consumed())),
-        ("pending", Json::u(pending)), ("root", Json::hex(&queue.root())),
+        ("pending", Json::u(pending)), ("pending_weight", Json::u(weight)),
+        ("max_pending_weight", Json::u(forced::MAX_PENDING_WEIGHT)), ("root", Json::hex(&queue.root())),
         ("due", Json::Arr(queue.due().iter().map(record).collect())),
         ("due_hash", Json::hex(&forced::hash(queue.due()))),
-        // What a submission in the next block pays on top of its fee; null when full.
-        ("next_surcharge_sat", forced::surcharge_sat(pending).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
+        // What one weight unit (a transfer) pays on top of its fee in the next
+        // block; null when full. A record of w units pays w times the unit price.
+        ("next_surcharge_sat", forced::surcharge_sat(weight, 1).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
     ])
 }

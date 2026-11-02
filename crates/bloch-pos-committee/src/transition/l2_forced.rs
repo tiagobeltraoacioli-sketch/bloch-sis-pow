@@ -83,7 +83,7 @@ pub enum L2ForcedTransactionReject {
     Signature,
     /// The envelope names another L2 chain.
     Chain,
-    /// `forced::MAX_PENDING` records are queued.
+    /// The record does not fit in `forced::MAX_PENDING_WEIGHT`.
     Full,
     Arithmetic,
 }
@@ -206,7 +206,7 @@ impl CommittedState {
     ) -> Result<fee_market::TxCharge, L2ForcedTransactionReject> {
         use L2ForcedTransactionReject as R;
         let pending = match self.l2_settlement.as_ref().and_then(|l2| l2.forced_queue()) {
-            Some(queue) => queue.pending().len() as u64,
+            Some(queue) => queue.pending_weight(),
             None => return Err(R::NotActive),
         };
         tx.validate_shape()?;
@@ -219,7 +219,7 @@ impl CommittedState {
         if fee_market::intrinsic_gas(tx.class(), tx.tx_bytes) > fee_market::MAX_TX_GAS {
             return Err(R::GasCeiling);
         }
-        let surcharge = forced::surcharge_sat(pending).ok_or(R::Full)?;
+        let surcharge = forced::surcharge_sat(pending, forced::weight(tx.gas_limit)).ok_or(R::Full)?;
         let owner: [u8; 32] = Sha3_256::digest(&tx.funding_pubkey).into();
         let mut spent = 0u128;
         for input in &tx.inputs {

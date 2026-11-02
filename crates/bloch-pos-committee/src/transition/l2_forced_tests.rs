@@ -32,8 +32,8 @@
         let pending = pre
             .l2_settlement()
             .and_then(|l2| l2.forced_queue())
-            .map_or(0, |q| q.pending().len() as u64);
-        let surcharge = forced::surcharge_sat(pending).unwrap_or(0);
+            .map_or(0, |q| q.pending_weight());
+        let surcharge = forced::surcharge_sat(pending, forced::weight(gas)).unwrap_or(0);
         let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, tx.tx_bytes, pre.next_base_fee(), 0);
         tx.change.value =
             (u128::from(value) - charge.base_fee_sat - charge.priority_fee_sat - u128::from(surcharge)) as u64;
@@ -125,7 +125,8 @@
         let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, tx.tx_bytes, opened.next_base_fee(), 0);
         assert_eq!(
             u128::from(s2.eutxos.get(&(wire.txid(), 0)).unwrap().value),
-            u128::from(FUNDED) - charge.base_fee_sat - u128::from(forced::BASE_SURCHARGE_SAT)
+            // 60k declared gas is 3 weight units: 3 * 1000 sat on an empty queue.
+            u128::from(FUNDED) - charge.base_fee_sat - 3 * u128::from(forced::BASE_SURCHARGE_SAT)
         );
         // Replay: the input is gone.
         let mut replay = s2.clone();
@@ -236,25 +237,40 @@
         assert_eq!(l2.queue_forced(MAINNET_CHAIN_ID, [1; 32], &big, 21_000), Err(R::Shape));
         assert_eq!(l2.committed_bytes(), start);
 
-        // The surcharge doubles every 32 pending records; the queue holds 256.
-        assert_eq!(forced::surcharge_sat(0), Some(1_000));
-        assert_eq!(forced::surcharge_sat(31), Some(1_000));
-        assert_eq!(forced::surcharge_sat(32), Some(2_000));
-        assert_eq!(forced::surcharge_sat(255), Some(1_000 << 7));
-        assert_eq!(forced::surcharge_sat(256), None);
+        // Weight: one unit per started 21k of declared gas.
+        assert_eq!((forced::weight(21_000), forced::weight(21_001), forced::weight(forced::MAX_GAS)), (1, 2, 15));
+        // The unit price doubles every 32 pending units; the queue holds 256 units.
+        assert_eq!(forced::surcharge_sat(0, 1), Some(1_000));
+        assert_eq!(forced::surcharge_sat(31, 1), Some(1_000));
+        assert_eq!(forced::surcharge_sat(32, 1), Some(2_000));
+        assert_eq!(forced::surcharge_sat(32, 15), Some(30_000));
+        assert_eq!(forced::surcharge_sat(255, 1), Some(1_000 << 7));
+        assert_eq!(forced::surcharge_sat(256, 1), None);
+        assert_eq!(forced::surcharge_sat(242, 15), None, "a large record must fit whole");
+        assert_eq!(forced::surcharge_sat(0, 0), None);
         let mut roots = std::collections::BTreeSet::new();
-        for i in 0..forced::MAX_PENDING {
+        for i in 0..forced::MAX_PENDING_WEIGHT {
             let txid = [i as u8; 32];
-            l2.queue_forced(MAINNET_CHAIN_ID, txid, &envelope(i as u8), forced::MAX_GAS).unwrap();
+            l2.queue_forced(MAINNET_CHAIN_ID, txid, &envelope(i as u8), forced::MIN_GAS).unwrap();
             assert!(roots.insert(l2.forced_queue().unwrap().root()));
         }
         assert_eq!(l2.queue_forced(MAINNET_CHAIN_ID, [0xee; 32], &envelope(0), 21_000), Err(R::Full));
         let queue = l2.forced_queue().unwrap();
-        assert_eq!(queue.pending().len() as u64, forced::MAX_PENDING);
-        // At the gas cap: one record of MAX_GAS per settlement, from the front.
-        assert_eq!(queue.due().len(), 1);
-        assert_eq!(queue.due()[0].l1_txid, [0; 32]);
+        assert_eq!(queue.pending_weight(), forced::MAX_PENDING_WEIGHT);
         assert_ne!(l2.committed_bytes(), start);
+        // Large records fill it faster but drain at the same gas rate:
+        // 17 of 300k are 255 units, one transfer fits, then it is full.
+        let mut large = mainnet_l2_state();
+        assert!(large.enable_forced_inclusion_for_test());
+        for i in 0..17u8 {
+            large.queue_forced(MAINNET_CHAIN_ID, [i; 32], &envelope(i), forced::MAX_GAS).unwrap();
+        }
+        assert_eq!(large.queue_forced(MAINNET_CHAIN_ID, [17; 32], &envelope(17), forced::MAX_GAS), Err(R::Full));
+        large.queue_forced(MAINNET_CHAIN_ID, [18; 32], &envelope(18), forced::MIN_GAS).unwrap();
+        assert_eq!(large.queue_forced(MAINNET_CHAIN_ID, [19; 32], &envelope(19), forced::MIN_GAS), Err(R::Full));
+        // At the gas cap: one 300k record per settlement, from the front.
+        assert_eq!(large.forced_queue().unwrap().due().len(), 1);
+        assert_eq!(large.forced_queue().unwrap().due()[0].l1_txid, [0; 32]);
         // Small records: the record cap binds first; mixed: the gas cap does.
         let mut small = mainnet_l2_state();
         assert!(small.enable_forced_inclusion_for_test());
