@@ -54,6 +54,12 @@ build_variant() { # name relax(0/1) fault(0/1) tooling(0/1)  env carries the mov
   echo "$v $d" >> "$W/out/DIGESTS"
   rm -rf "$s"
 }
+pinset() {
+build_variant pinfi-both 0 1 0
+PIN=$LATE build_variant pinfi-pinlate 1 1 0
+SIG=$LATE build_variant pinfi-pinonly 1 1 0
+PIN=$LATE SIG=$LATE build_variant pinfi-nopin 1 1 0
+}
 all() {
 build_variant cand 0 0 0
 build_variant tool 0 0 1

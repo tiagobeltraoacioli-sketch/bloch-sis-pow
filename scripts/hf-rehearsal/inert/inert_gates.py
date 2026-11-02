@@ -245,6 +245,16 @@ class Net:
         ok, msg = self.submit(via, p[2].read_text().strip())
         return ok, msg, lib.sha3_hex(vpk)
 
+    def deposit_retry(self, name, stake_blch):
+        """The funding key has a per-slot verification allowance: one try per fresh slot."""
+        ok, msg, h = self.deposit(name, stake_blch)
+        for _ in range(8):
+            if ok or "allowance" not in msg:
+                break
+            time.sleep(1.2)
+            ok, msg = self.submit(1, (self.w / "tx" / f"dep-{name}.2.hex").read_text().strip())
+        return ok, msg, h
+
     def val_by_hash(self, h, via=1):
         try:
             r = self.rpc(via, "getvalidatorbykey", [h])
@@ -321,11 +331,11 @@ class Net:
         self.joiners = {}
         for n in ["A0", "A1", "A2", "A3"]:
             ok, msg, h = self.deposit(n, 50_000)
-            self.joiners[n] = h; self.cell("growth_deposit", batch="A", name=n, accepted=ok, reply=msg, hash=h)
+            self.joiners[n] = h; self.cell("growth_deposit", batch="A", joiner=n, accepted=ok, reply=msg, hash=h)
         self.wait(20, 4)
         for n in ["B0", "B1", "B2"]:
             ok, msg, h = self.deposit(n, 50_000)
-            self.joiners[n] = h; self.cell("growth_deposit", batch="B", name=n, accepted=ok, reply=msg, hash=h)
+            self.joiners[n] = h; self.cell("growth_deposit", batch="B", joiner=n, accepted=ok, reply=msg, hash=h)
         # Slashing v2 evidence admission.
         self.wait(HF2 - 2, 2); self.evidence_round("pre", accused=12)
         self.wait(HF2 - 1, 20); self.evidence_replies("pre-last-epoch")
@@ -345,7 +355,7 @@ class Net:
             ok, msg, o = self.rotation(jv, 9); self.cell("pq_early_side_admit", epoch=e, accepted=ok, reply=msg)
         ok, msg, o = self.rotation(jv, 1); self.cell("pq_on_side_refuse_early", accepted=ok, reply=msg)
         # Last slots of e35: refused. First slots of e36: accepted.
-        self.wait(HF3 - 1, 24)
+        self.wait(HF3 - 1, 18)
         ok, msg, _ = self.kes_register(1, 1); self.cell("kes_last_epoch_before", accepted=ok, reply=msg)
         ok, msg, o = self.slh_spend(1); self.cell("slh_last_epoch_before", accepted=ok, reply=msg)
         ok, msg, o = self.rotation(jv, 1); self.cell("pq_last_epoch_before", accepted=ok, reply=msg)
@@ -395,6 +405,76 @@ class Net:
             except SoakError:
                 pass
             time.sleep(0.5)
+
+    def run_k(self):
+        """First slots of the opening epoch, and a suite-0x0003 spend included early by a side proposer."""
+        vals = ["cand"] * 6
+        vals[3] = "slh-early"
+        self.build_net(vals, ["slh-late"], kes={1, 2, 4}, allocs=[("slh", "slh-spend", 1000 * BLCH)])
+        self.wait(1); self.gates_seen()
+        self.wait(33, 1)
+        ok, msg, o = self.slh_spend(3, price_epoch=HF3); self.cell("slh_early_side_admit", accepted=ok, reply=msg, tool=o[-120:])
+        ok, msg, o = self.slh_spend(1, price_epoch=HF3); self.cell("slh_on_side_refuse_early", accepted=ok, reply=msg)
+        self.wait(HF3, 0)
+        head = lambda: self.rpc(1, "getchaininfo")["slot"]
+        h0 = head()
+        ok, msg, hx = self.kes_register(1, 1); self.cell("kes_opening_try", attempt=0, head_slot=h0, accepted=ok, reply=msg)
+        while head() < HF3 * SPE:
+            time.sleep(0.05)
+        h1 = head()
+        ok2, msg2 = self.submit(1, hx); self.cell("kes_opening_same_bytes_after_first_block", head_slot=h1, accepted=ok2, reply=msg2)
+        ok3, msg3, _ = self.kes_register(2, 1); self.cell("kes_opening_try", attempt=1, head_slot=h1, accepted=ok3, reply=msg3)
+        ok4, msg4, _ = self.kes_register(1, 2); self.cell("kes_opening_fresh_bytes_same_validator", head_slot=head(), accepted=ok4, reply=msg4)
+        ok5, msg5, _ = self.kes_register(4, 1); self.cell("kes_opening_try", attempt=2, head_slot=head(), accepted=ok5, reply=msg5)
+        self.wait(HF3 + 2)
+        k = self.rpc(1, "getkes")
+        self.cell("kes_after", registered=k.get("registered"), bps=k.get("registered_stake_bps"))
+        self.cell("slh_side_blocks", rows=self.early_blocks(3))
+        self.cell("slh_side_fork", divergence=self.first_divergence(3, 1, 32 * SPE, (HF3 + 1) * SPE))
+        self.finish()
+
+    def run_l(self):
+        """A node that keeps the KES registration gate closed, facing the first 0x17 block."""
+        self.build_net(["cand"] * 6, ["kes-late"], kes={1}, allocs=[("ctl", "funder", 1000 * BLCH)])
+        self.wait(1); self.gates_seen()
+        self.wait(HF3, 4)
+        ok, msg, _ = self.kes_register(1, 1); self.cell("kes_accepted", accepted=ok, reply=msg)
+        self.wait(HF3 + 1, 8)
+        self.cell("kes_after", registered=self.rpc(1, "getkes").get("registered"))
+        self.cell("kes_late_fork", divergence=self.first_divergence(6, 1, HF3 * SPE, (HF3 + 1) * SPE))
+        self.finish()
+
+    def run_g(self):
+        """Growth cap only: a batch that exceeds the budget before the gate, another after it."""
+        allocs = [(f"dep-{n}", "funder", (50_010 * BLCH) + i) for i, n in enumerate(["A0", "A1", "A2", "A3", "B0", "B1", "B2"])]
+        self.build_net(["cand"] * 14, ["growth-late"], kes=set(), allocs=allocs)
+        self.wait(1); self.gates_seen()
+        self.wait(13, 4)
+        self.joiners = {}
+        for n in ["A0", "A1", "A2", "A3"]:
+            ok, msg, h = self.deposit_retry(n, 50_000)
+            self.joiners[n] = h; self.cell("growth_deposit", batch="A", joiner=n, accepted=ok, reply=msg[:120], hash=h)
+        self.wait(20, 4)
+        for n in ["B0", "B1", "B2"]:
+            ok, msg, h = self.deposit_retry(n, 50_000)
+            self.joiners[n] = h; self.cell("growth_deposit", batch="B", joiner=n, accepted=ok, reply=msg[:120], hash=h)
+        for e in (24, 26, 28, 30, 36, 44, 47, 48, 49, self.a.stop_epoch):
+            self.wait(e, 2)
+            self.cell("growth_activation", at_epoch=e, activations=self.activations(14))
+        self.cell("late_side_fork", side="growth-late", divergence=self.first_divergence(14, 1, (HF2 - 2) * SPE, self.clock.wall_slot() - 40))
+        self.finish()
+
+    def activations(self, late):
+        act = {}
+        for n, h in self.joiners.items():
+            v = self.val_by_hash(h)
+            try:
+                r = self.rpc(1, "getvalidator", [v]) if v is not None else {}
+                ro = self.rpc(late, "getvalidator", [v]) if v is not None else {}
+                act[n] = {"validator": v, "on_side": r.get("activation_epoch"), "state": r.get("state"), "late_side": ro.get("activation_epoch")}
+            except SoakError as e:
+                act[n] = {"validator": v, "error": str(e)[:100]}
+        return act
 
     def bad_evidence(self, slot, slot2, kind, tag):
         out = self.txfile(f"ev-{kind}-{tag}")
@@ -582,7 +662,7 @@ class Net:
             self.build_net(vals, [], kes=set(), allocs=allocs)
             late_side = 3
         self.wait(1); self.gates_seen()
-        self.wait(HF2 - 1, 16)
+        self.wait(HF2 - 1, 8)
         self.marker("m1", 1, "pin_marker_before")
         self.wait(HF2, 0)
         self.marker("m2", 1, "pin_marker_after_first_slots")
@@ -590,17 +670,17 @@ class Net:
         self.marker("m3", late_side, "pin_marker_after_on_late_side")
         self.wait(HF2 + 3)
         self.cell("pin_spent", m1=self.spent("m1"), m2=self.spent("m2"), m3=self.spent("m3"), p1=self.spent("p1"))
-        if net == "C2":
-            self.cell("pin_side_blocks", rows=self.early_blocks(3))
-            self.cell("pin_side_fork", divergence=self.first_divergence(3, 1, (HF2 - 1) * SPE, (HF2 + 2) * SPE))
-        else:
-            self.cell("pin_side_fork", divergence=self.first_divergence(6, 1, (HF2 - 1) * SPE, (HF2 + 2) * SPE))
+        refused = {i: [l for l in self.log(i).splitlines() if "REFUSED OWN BLOCK" in l or "StateRootMismatch" in l or re.search(r"reject [0-9a-f]+ at slot", l)][:6]
+                   for i in range(len(self.nodes))}
+        self.cell("pin_refusal_lines", lines=refused)
+        self.cell("pin_side_blocks", rows=self.early_blocks(late_side))
+        self.cell("pin_side_fork", divergence=self.first_divergence(late_side, 1, (HF2 - 1) * SPE, (HF2 + 2) * SPE))
         self.finish()
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--net", required=True, choices=["A", "B", "C1", "C2", "smoke"])
+    ap.add_argument("--net", required=True, choices=["A", "B", "C1", "C2", "G", "K", "L", "smoke"])
     ap.add_argument("--bins", type=Path, required=True)
     ap.add_argument("--work", type=Path, required=True)
     ap.add_argument("--port-base", type=int, default=28300)
@@ -610,7 +690,7 @@ def main():
     a.bins = a.bins.resolve()
     n = Net(a)
     try:
-        {"smoke": n.run_smoke, "A": n.run_a, "B": n.run_b, "C1": lambda: n.run_c("C1"), "C2": lambda: n.run_c("C2")}[a.net]()
+        {"smoke": n.run_smoke, "L": n.run_l, "K": n.run_k, "G": n.run_g, "A": n.run_a, "B": n.run_b, "C1": lambda: n.run_c("C1"), "C2": lambda: n.run_c("C2")}[a.net]()
     except BaseException as e:
         n.cell("DRIVER_ERROR", error=repr(e))
         raise

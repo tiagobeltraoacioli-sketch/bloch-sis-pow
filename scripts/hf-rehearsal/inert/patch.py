@@ -25,12 +25,13 @@ if mode == "tooling":
         "    let mut sock = TcpStream::connect(addr)?;\n    write_frame(&mut sock, &att_frame(att))\n}\n\n"
         "pub fn send_block(addr: &str, env: &BlockEnvelope) -> std::io::Result<()> {\n")
 elif mode == "pin-fault":
-    # FAULT INJECTION: the pinned verifier refuses signatures whose ML-DSA half
-    # starts with the marker byte; the legacy verifier is untouched. It gives
-    # the pin gate an observable effect on a private net. Nothing else changes.
+    # FAULT INJECTION: under the CompatiblePinned policy only (the consensus
+    # route of the pin gate), refuse signatures whose ML-DSA half starts with
+    # the marker byte. The relay policy calls verify_pinned directly and is not
+    # touched, so a marked transaction still reaches blocks. It gives the pin
+    # gate an observable effect on a private net. Nothing else changes.
     sub(root / "crates/bloch-crypto/src/crypto/mod.rs",
-        "    bloch_mldsa_clean::verify(pk, message, sig)\n}\n\n/// [`verify`] with the ML-DSA half judged by the pinned",
-        "    if sig[0] == 0xA5 {\n        return false;\n    }\n"
-        "    bloch_mldsa_clean::verify(pk, message, sig)\n}\n\n/// [`verify`] with the ML-DSA half judged by the pinned")
+        "        SignaturePolicy::CompatiblePinned => verify_pinned(public_key_bytes, message, signature_bytes),",
+        "        SignaturePolicy::CompatiblePinned => signature_bytes.get(4) != Some(&0xA5) && verify_pinned(public_key_bytes, message, signature_bytes),")
 else:
     sys.exit("unknown mode")
