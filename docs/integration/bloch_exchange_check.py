@@ -26,7 +26,9 @@ Subcommands:
 
   l2tx TXHASH --l2-rpc URL [--wait SECONDS]
       Check an L2 (EVM) transaction: receipt status 0x1 and block number at or
-      below the L2 "finalized" tag.
+      below the L2 "finalized" tag. A -32001 or a null tag is "not yet" (exit 1),
+      never a credit and never a refusal. bloch_finality.status is printed but
+      proves nothing about currency on its own (see the guide, 6.3.2).
 
 Exit status: 0 = final/claimable, 1 = not yet, 2 = refused, disagreement or
 error. Every node in --rpc must be an independent, upgraded node; the defaults
@@ -50,10 +52,14 @@ EXPECTED_GATES = {"hf1_claim_finality": 7180, "hf2_sig_canonical": 7270, "hf3_sl
 MAX_BEHIND_SLOTS = 2
 
 FINAL, NOT_YET, REFUSED = 0, 1, 2
+# Answers of the settled RPC or its gateway that mean "ask again", not "refused".
+L2_NOT_NOW = {-32001: "this RPC has closed its finality levels", -32053: "no L2 backend available"}
 
 
 class RpcError(Exception):
-    pass
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 def rpc(url, method, params):
@@ -65,7 +71,8 @@ def rpc(url, method, params):
     except Exception as exc:
         raise RpcError(f"{url} {method}: {exc}") from exc
     if doc.get("error"):
-        raise RpcError(f"{url} {method}: {doc['error']}")
+        error = doc["error"]
+        raise RpcError(f"{url} {method}: {error}", error.get("code") if isinstance(error, dict) else None)
     return doc.get("result")
 
 
@@ -244,7 +251,7 @@ def check_claim_on(url, args):
                     f"of {args.sats} sat fits only a later window, or as the first claim of a window if it "
                     f"carries attestor signatures (mainnet has an attestor set)")
     msgs.append(f"{url}: CLAIMABLE against root {root['root']} (L2 block {root['l2_number']}, "
-                f"L1 height {root['height']}, finalized checkpoint epoch {fc['epoch']})")
+                f"L2-record height {root['height']}, finalized checkpoint epoch {fc['epoch']})")
     return FINAL, root["root"], msgs
 
 
@@ -286,10 +293,22 @@ def check_l2tx(args):
     if receipt["status"] != "0x1":
         print("REFUSED: transaction reverted (status 0x0)")
         return REFUSED
-    fin = rpc(url, "eth_getBlockByNumber", ["finalized", False])
+    try:
+        fin = rpc(url, "eth_getBlockByNumber", ["finalized", False])
+    except RpcError as exc:
+        if exc.code in L2_NOT_NOW:
+            print(f"WAIT: {L2_NOT_NOW[exc.code]}: {exc}")
+            return NOT_YET
+        raise
     if fin is None:
-        print("WAIT: the RPC serves no finalized block (follower not verified)")
+        print("WAIT: the RPC names no finalized block. This does not prove that nothing is final: "
+              "the RPC may be starting, or may hold no follower status")
         return NOT_YET
+    try:
+        status = (rpc(url, "bloch_finality", []) or {}).get("status")
+    except RpcError:
+        status = None
+    print(f"bloch_finality.status: {status}")
     block, final = int(receipt["blockNumber"], 16), int(fin["number"], 16)
     if block <= final:
         canonical = rpc(url, "eth_getBlockByNumber", [hex(block), False])

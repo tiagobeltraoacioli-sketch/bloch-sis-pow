@@ -6,6 +6,13 @@ the public RPC endpoints `80.240.16.185:8080`, `199.247.22.8:8080` and
 `139.180.173.231:8080` (all three report build `fa980367`, which is
 `78d4921c` plus a node-only network transport change) at L1 epoch 7022.
 
+**Draft of 2026-11-01 for the owner: not published.** §6 and §7 were
+refreshed for the L2 v2.1 settled RPC (`18be911a…`, unsigned at the time of
+writing). In those sections each statement carries **[M]** (measured on a
+private rehearsal net, with real binaries unless the text says otherwise) or
+**[R]** (read from the code, not run). No L2 mainnet exists yet to measure.
+The L1 sections were not re-read against the public nodes in this refresh.
+
 This page is for exchanges and custodians that list BLCH. It supplements
 [`BLOCH-G4-TECHNICAL-INTEGRATION-REFERENCE-v2.md`](./BLOCH-G4-TECHNICAL-INTEGRATION-REFERENCE-v2.md)
 (the full method, address and transaction reference). Where the two
@@ -173,6 +180,11 @@ finalized a checkpoint (`epoch`, `root`, `checkpoint_slot`, `votes`,
 `format: "BLOCHFC1"`, `certificate` hex; about 1.6 MB). It lets an auditor
 check finality offline. It is not needed for crediting.
 
+The `bloch-finality-verify` built from the current release sources counts own
+bond, so its verdict does not follow the chain's rule from HF1 (e7180), and it
+refuses every certificate with bound votes from HF2 (e7270). Rely on
+`gettxstatus` until the release that adds `getlcproof`.
+
 ## 4. L1 withdrawals (unchanged at every fork)
 
 1. Select inputs (`getutxos`/`gettxout`); exclude outpoints you already
@@ -191,6 +203,8 @@ check finality offline. It is not needed for crediting.
    `{"accepted": true, "status": "accepted"|"duplicate", "kind", "bytes", "tx_hash", ...}`.
    `tx_hash` is only a local handle; **the consensus `txid` is the one your
    signer computed**. Track it with `gettxstatus [txid]` until `finalized`.
+   **`accepted: true` means only that the node's mempool took the bytes.**
+   It is not inclusion and not payment (§6.5).
 5. Errors: `-32002` not a canonical transaction (do not retry the bytes);
    `-32008` refused on its merits (rebuild); `-32009` retryable after
    `error.data.until_slot` (usually a stale base fee: rebuild); `-32003`
@@ -254,7 +268,7 @@ touch transactions, addresses, fees or RPC fields an exchange uses.
 
 ## 6. L2 (chain 700770)
 
-### 6.1 Status on 2026-10-30
+### 6.1 Status on 2026-10-30 (not re-read for this draft)
 
 The L2 was activated on L1 at epoch 5850 (slot 187200), but the operators
 have not started it. Read-only `getl2settlement` on the public nodes:
@@ -292,25 +306,123 @@ settled blocks. Until then, list BLCH on L1 only.
 List the L2 as a separate network ("BLCH — Bloch L2 (EVM)"). Never accept
 an L1 address for an L2 withdrawal or the reverse.
 
-### 6.3 L2 deposits and withdrawals on the L2 itself
+### 6.3 Crediting on the L2 itself
 
-Use the standard Ethereum post-Merge pattern on the settled L2 RPC:
+Use the standard Ethereum post-Merge pattern on the settled L2 RPC.
 
-1. `eth_chainId` must be `0xab162`.
-2. `eth_getBlockByNumber ["finalized", false]` → `F`. `finalized` advances
+1. `eth_chainId` must be `0xab162`. **[M]**
+2. `eth_getBlockByNumber ["finalized", false]` gives `F`. `finalized` advances
    only after the L2 block's settlement is in the L1 finalized prefix, as
-   verified by an independent follower that replays L1. `bloch_finality`
-   returns the `latest`/`safe`/`finalized` levels with their L1 anchors, and
-   `bloch_settlement [number]` returns the L1 settlement of a finalized L2
-   block (or `null`).
-3. Credit an L2 transaction when `eth_getTransactionReceipt` has
-   `status` `0x1` and `blockNumber` ≤ `F`.
-4. Bridge mints (L1 → L2 deposits) and contract transfers have no
-   top-level L2 transaction: reconcile with `eth_getBalance [address, F]`.
+   verified by a follower that replays L1. `bloch_finality` returns the levels
+   with their L1 anchors, and `bloch_settlement [number]` returns the L1
+   settlement of a finalized L2 block, or `null`. **[M]** for the answers,
+   **[R]** for the derivation.
+3. Credit an L2 transaction when `eth_getTransactionReceipt` has `status` `0x1`
+   and `blockNumber` ≤ `F`. **[M]**
+4. Bridge mints (L1 → L2 deposits) and contract transfers have no top-level L2
+   transaction: reconcile with `eth_getBalance [address, "finalized"]`. **[M]**
+   for the call.
 
-Expected timing on mainnet (to be re-measured on the first blocks): one L2
-block every 12 to 15 minutes, `finalized` about 100 minutes after
-inclusion. Details: `bloch-l2-evm/docs/MAINNET-EXCHANGE-INTEGRATION.md`.
+```
+curl -s -X POST http://L2_RPC -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"bloch_finality","params":[]}'
+```
+
+Answer on a healthy v2.1 RPC, shortened **[M]**:
+
+```json
+{"finalized_height": 60,
+ "finalized": {"number": "0x3c", "hash": "0x…"},
+ "safe": {"number": "0x3c"}, "latest": {"number": "0x3d"},
+ "l1": {"finalized": {"epoch": 1507, "slot": 48223, "root": "…"}, "safe_settlement": {"…": "…"}},
+ "status": {"state": "ok", "written_at_unix": 1793581692, "age_s": 4},
+ "trust": "finalized: native FFG replay from the pinned genesis; safe: the local native node's head; no checkpoint signatures"}
+```
+
+**Do not credit on `latest` or `safe`.** After an L1 reorganization of an
+accepted settlement, an RPC can keep serving `latest` and `safe` blocks that L1
+dropped until its operator repairs it. `finalized` stayed correct. **[M]**
+
+**A reply to `eth_sendRawTransaction` is not inclusion.** Follow the receipt.
+On v2.1 a forward clock step on an RPC host can evict acknowledged spooled
+transactions: +4 h evicted 3 of 3 on an earlier build with the same spool code.
+**[M]** on v2 `4fc9fa1e…`; absence of the fix from v2.1 is **[R]**. Through the
+gateway, a send with no sequencer answers `-32053`. **[M]**
+
+Timing: no mainnet cadence exists. Settlements on private nets took 5.3 to 15
+minutes each, and 24 to 37 minutes from block to acceptance when proofs queued
+for a shared prover. **[M]**, not mainnet. The earlier estimate of about 100
+minutes from inclusion to `finalized` is unmeasured.
+
+#### 6.3.1 `-32001` on `finalized`
+
+```json
+{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"finality unavailable: this node has lost a valid follower status; safe and finalized are closed"}}
+```
+
+Treat it as **unavailable: retry, do not credit, do not refuse, and do not
+read it as a reversal.** Finality already seen remains final.
+
+| While an RPC is closed (v2.1) | Answer | |
+| --- | --- | --- |
+| `finalized`, `safe` tags on block methods, `eth_getBalance`, `eth_call`, `eth_getLogs` | `-32001` | **[M]** |
+| `latest`, numbered blocks, `eth_blockNumber` | served | **[M]** |
+| `bloch_finality.status.state` | `missing` or `invalid` | **[M]** |
+| `bloch_settlement` | `null`, **the same as "not settled"**: do not read it as an answer about the block | **[M]** |
+| Valid status again | reopens within a poll | **[M]** |
+
+- Causes measured: status file deleted, corrupt or contradicting the local
+  chain, or above the v2.1 size limit (30,194 settlements, unreachable while
+  settlement stops at block 4097, §6.7), or a foreign settlement (§6.3.3). **[M]**
+  Those status files were written by the tests.
+- The v2.1 gateway passes `-32001` through and does not try the other backend
+  for that read, and its `/health` shows `finalized: null`. **[R]**
+- **`null` is not "nothing is final".** A v2.1 RPC started without a status, or
+  one whose database has not reached the tip, answers `finalized: null`, and
+  the first also `bloch_finality: null`. Treat `null` like `-32001`. **[M]**
+  for a start without status on v2.1; the lagging start was run on the next
+  build only.
+
+#### 6.3.2 What `age_s` does and does not tell you
+
+`bloch_finality.status.age_s` has no enforced threshold: nothing closes when it
+grows. **[M]**
+
+| Situation (v2.1) | `state` | `age_s` | `finalized` |
+| --- | --- | --- | --- |
+| Follower stopped, status file frozen | `ok` | grows (76,384 s seen) | still served **[M]** |
+| Database behind the status: it names a block this RPC lacks | `ok` | **stands still near 0** (file 7,204 s old, `age_s` 0 and still 0 nine seconds later) | served, not advancing **[M]** |
+
+So **a small `age_s` does not prove that finality is current on v2.1.** An old
+`finalized` is still true, so this delays credits and makes `finalized` balances
+old. It does not credit anything falsely.
+
+To detect staleness, compare with your own L1 node:
+
+- `bloch_finality.l1.finalized.epoch` against `getchaininfo.finalized.epoch`.
+  The gap was 3 epochs on three healthy private nets. **[M]** That the field
+  freezes along with the rest of the document is **[R]**. There is no mainnet
+  figure yet, so set your alert after the first settlements.
+- Whether `finalized_height` advances while L1 shows new accepted settlements
+  (`getl2settlement.accepted`). **[R]**
+
+The next RPC build computes `age_s` at the call and adds state `lagging`, and
+`status.schema`, whose absence identifies v2.1. **[M]** on a dev build; it is
+not a release.
+
+#### 6.3.3 `-32001` caused by a foreign settlement
+
+Anyone can settle a rule-conforming L2 block on L1. On v2.1, if the status's
+`safe_settlement` names a block the RPC's database holds with another hash, the
+RPC closes **both** `safe` and `finalized` with `state: invalid`, although the
+finalized prefix is still good. **[M]**, with a synthetic `safe_settlement`
+written by the test. The follower takes that field from `getl2settlement`.
+**[R]**
+
+It fails closed: nothing false is served. On the sequencer's RPC it lasts until
+recovery finishes, about 2.5 epochs plus the rebuild and restart, and returns
+with each new foreign block. An RPC with no such local block stays open, so
+another backend may serve. **[R]** Handle it as §6.3.1, and escalate if it lasts
+over several epochs. The next build closes `safe` only. **[M]** on a dev build.
 
 ### 6.4 Moving BLCH from L1 to L2 (L1 tag 0x14)
 
@@ -345,26 +457,145 @@ inclusion. Details: `bloch-l2-evm/docs/MAINNET-EXCHANGE-INTEGRATION.md`.
      or later finalizes); a different non-null `own_root` means your node's
      chain carries a finality that is not its own: **stop claiming and
      crediting**;
-   - the index must not be set in `claimed` (bit `index mod 256` of word
-     `index div 256`, or any word below `claimed.floor`);
+   - the index must not be set in `claimed` (§6.5.1);
    - `escrow_conserved` must be `true`.
    Do **not** use `matured`/`matured_large`; they mean only that the delay
-   has passed.
-3. Build the claim with `bloch-l2-produce-dev withdrawal-proof` (the proof
-   for your index against the claimable root), then
-   `bloch-pos l2-claim prepare` / `sign`, funded by a suite `0x0001` key
-   that pays the fee. Claims of 100 BLCH or more also need the attestors'
-   partial signatures. If `release_window.remaining_sat` is below the
-   amount, the claim fits a later window (or, attested, as the first claim
-   of a window).
-4. Broadcast with `sendrawtransaction` and track the claim txid with
-   `gettxstatus` to `finalized`. The recipient output is **vout 0** of the
-   claim and pays exactly the withdrawn sats to `l1Recipient`. Credit it as
-   an L1 deposit (§3.2).
+   has passed. **[R]** Measured `own_root` = `root` on private nets after the
+   rule's gate. **[M]**
+3. Get the proof, and build the claim with `bloch-pos l2-claim prepare` /
+   `sign`, funded by a suite `0x0001` key that pays the fee. Claims of 100 BLCH
+   or more also need the attestors' partial signatures. If
+   `release_window.remaining_sat` is below the amount, the claim fits a later
+   window (or, attested, as the first claim of a window). The proof comes from:
+   - **On a v2.1 RPC:** `bloch-l2-produce-dev withdrawal-proof` on your own L2
+     database. **v2.1 has no `bloch_getWithdrawalProof`: it answers `-32601`.**
+     **[M]**
+   - **On the next RPC build:** `bloch-l2-withdraw.py` (§6.5.2), which needs no
+     local database. **[M]** on a provisional build.
+4. Broadcast with `sendrawtransaction`, then **confirm from L1 state, not from
+   the reply.**
 
-A claim broadcast too early is refused (`NotMatured`, `NotFinalized`,
-`AttestationRequired`, window cap) and must be broadcast again later; it
-is never paid twice (the index is marked in `claimed`).
+   `accepted` and `duplicate` mean only that the mempool took the bytes.
+   Admission does not check the nullifier, root, delay, attestation or fee.
+   On one private net, 12 observed sends all answered `accepted: true`, and
+   8 moved nothing: a repeat with the same bytes, a repeat as a new
+   transaction, a wrong recipient, a stale base fee, a claim on an unfinalized
+   settlement, a large claim before its delay, one with no attestation, and one
+   large claim that also returned `accepted`. **[M]** The cause of the last one
+   was not established at the time of writing. Escrow was conserved; no second
+   payment occurred. **[M]**
+
+   `tx_hash` in the reply is a local handle, not a txid. **[R]** A claim is
+   paid when its index is set in `claimed` **and** the claim's txid is
+   `finalized`. The recipient output is **vout 0** and pays exactly the
+   withdrawn sats to `l1Recipient`. Credit it as an L1 deposit (§3.2).
+
+A refused claim can be built and sent again later; an index is never paid
+twice. **[M]**
+
+#### 6.5.1 Reading claim status from the bitmap
+
+`getl2settlement` → `withdrawals.claimed` is authoritative:
+
+```json
+"claimed": {"count": 5, "floor": 0, "words": [{"word": 0, "bits": "2f00…00"}]}
+```
+
+An index `i` is claimed if `i div 256` is below `floor`, or if the word
+`i div 256` is listed and bit `(i mod 256) mod 8` of byte `(i mod 256) div 8` of
+`bits` is set, counting bits from the least significant. A word that is not
+listed and not below `floor` has nothing claimed. **[R]**, native `rpc.rs`.
+`count` is only a total: it does not say which indexes.
+
+Worked example **[M]**: `2f` is `00101111`, so indexes 0, 1, 2, 3 and 5 are
+claimed and index 4 is not, with `count` 5. The checker and the withdraw tool
+both read that net this way.
+
+Read `claimed` at a node you trust and, for crediting, only after the claim's
+transaction is `finalized`: `claimed` is the node's view at its head. **[R]**
+
+#### 6.5.2 `bloch-l2-withdraw.py` and its exit codes
+
+The tool is on the next RPC branch, not in the v2.1 kit. It holds no key and
+sends nothing. **[R]** Give it your own L1 node.
+
+```
+python3 bloch-l2-withdraw.py fetch --l2-rpc http://L2_RPC --l1-rpc http://YOUR_L1_NODE:8080 --index I --any-recipient --out proof.json --wait 7200
+```
+
+| Exit | Meaning | Action | Seen with |
+| --- | --- | --- | --- |
+| 0 | `fetch`: proof verified, file written. `verify`: valid and **not claimed**. **Never "paid"** | go on to the claim | **[M]** |
+| 1 | refused: bad proof, wrong owner or network, or a method the RPC lacks | **do not retry blindly**, read the message | **[M]** wrong network pin; `-32601` on v2.1 |
+| 3 | not ready: retry later, with `--wait` the tool does so itself | wait | **[M]** unknown index (`-32042`), refused connection, HTML error page |
+| 4 | index already claimed on L1 | do not resend; check your ledger | **[M]** |
+
+- `-32001`, `-32041`, `-32042`, `-32043`, `-32045`, `-32046`, `-32005`, `-32053`
+  are exit 3 in the current tool. **[R]**; review tests ran these with stub RPCs.
+- **Exit 3 can hide an operator problem.** A wrong URL serving HTML, or a single
+  own RPC with frozen proofs (`-32046`), looks like "later" until `--wait` ends.
+  The message names the cause. Alert on exit 3 lasting beyond your expected
+  settlement time. **[M]** for HTML; **[R]** for `-32046`.
+- An older copy of the tool (8f4cd9c) gives exit 1 for an HTML page **[M]**, and
+  for `-32001` and `-32046` **[R]**. Use the current one.
+- A `verify` of a proof whose root has left the L1's retained list refuses
+  (exit 1) before it looks at `claimed`. **[R]** Use §6.5.1 for old claims.
+- The tool's default pins are mainnet. On any other net pass `--network` and
+  `--genesis-hash`, or it refuses. **[M]**
+
+#### 6.5.3 Raw height fields
+
+Several raw fields named as L1 heights hold the **L2 record count**, not the L1
+chain height.
+
+| Field | Holds |
+| --- | --- |
+| Statement and provenance field `l1_height`, explorer variable `l1Height` | L2 count **[R]** |
+| `getl2settlement`: `native_height`, `source.height`, `withdrawals.roots[].height` | L2 count **[M]** |
+| `getchaininfo.height`, `getblockbyid.height` | L1 chain height **[M]** |
+
+Measured on one block of a private net: `source.height` 4137 and
+`getblockbyid.height` 4201 at the same `source.slot` 4689; `native_height` 29606
+against `getchaininfo.height` 29670. The offset was 64 there and 0 on a net with
+L2 active from its first block. **[M]** On mainnet it was about 152,014 when read.
+**[R]** It follows from where the L2 activated, so do not hard-code it.
+
+To locate a settlement on L1 use its `slot` or block id. Compare these fields
+only with each other: the claim delay compares a record's `height` with the L2
+count, so the delay of 64 blocks is still 64 L1 blocks. **[R]**
+
+### 6.6 If you run your own settled RPC
+
+Upgrade **the RPC before the follower's status schema**. A v2.1 RPC closes
+`safe` and `finalized` on a v3 status: **[M]** with a real follower's file. Readers
+that see a closed RPC recover when it is upgraded (0.2 s on the same database
+and file, **[M]** in the larger-status case).
+
+| Step | What |
+| --- | --- |
+| 1 | Next settled RPC on every host serving this status |
+| 2 | Readers of the file on that host: attestor kit, replica kit, bridge signers |
+| 3 | New follower binary, schema still v2, the default |
+| 4 | `BLOCH_L2_STATUS_SCHEMA=v3` in `follower.env`, restart, one host at a time. Check `bloch_finality.status.schema` |
+
+Going back is a restart with v2. A flip back and forth under a live RPC gave no
+error and no height change in a rehearsal. **[M]** on a dev build, with the
+systemd override not started. The new follower's default of v2 and this order are
+on a provisional branch, and no release has these hashes yet.
+
+A v2.1 attestor kit given a v3 file signs nothing and raises no alert. **[R]**
+
+### 6.7 Known limits of v2.1
+
+- **Settlement stops at L2 block 4097** (`MAX_REPLAY_BLOCKS` = 4096). `finalized`
+  stops advancing and deposits and withdrawals wait; no funds move. **[R]**: no
+  chain was run to that block. A release must fix this first.
+- On a compressed rehearsal schedule, settlements in flight crossed HF1,
+  own-target, HF2, HF3 and the KES gate, claims were honoured after them, escrow
+  was conserved and rebuilds from L1 matched. **[M]**, rehearsal builds of
+  provisional v2.1. No claim fell inside the HF1, own-target or HF2 windows, and
+  no settlement or claim was exercised after the first KES handover (period 1,
+  e8710 on mainnet).
 
 ## 7. Reference checker
 
@@ -391,7 +622,18 @@ its canonical chain, is not on the armed release (`hard_forks` check), or
 if two nodes report different roots for the same finalized epoch. `claim`
 applies every condition of §6.5 step 2 and reports the attestation and
 release-window conditions. `l2tx` checks receipt status, canonical block
-hash and the `finalized` tag.
+hash and the `finalized` tag; a `-32001`, `-32053` or null `finalized` is exit 1,
+and it prints `bloch_finality.status` (§6.3.2).
+
+The exit codes differ from `bloch-l2-withdraw.py` (§6.5.2): here an already
+claimed index is exit 2 (tool: 4), and "not yet" is exit 1 (tool: 3).
+
+Run on 2026-11-01 against private nets, read-only: `l2tx` on the v2.1 RPC gave
+`CREDITABLE` (exit 0) and `WAIT` (exit 1) for a block above `finalized`; the
+claim verdicts for claimed, claimable and beyond-count indexes came from the
+function behind `claim`, since `claim` and `tx` correctly halt on a private net
+whose gates differ from the armed schedule (exit 2). A stub replaying the real
+`-32001` text gave exit 1.
 
 Run on 2026-10-30 against the three public nodes: `tx` above returned
 `CREDITABLE` (exit 0); the same with `--amount 10000001` returned
@@ -422,3 +664,9 @@ returned `no L2 settlement accepted yet` (exit 1).
 - [ ] No signer change; no need to re-sign pending withdrawals at any fork.
 - [ ] L2 not listed until the operators publish the L2 RPC and settled blocks.
 - [ ] L2 claims: use `claimable`/`claimable_large`, never `matured`; check `own_root` = `root` from epoch 7180.
+- [ ] Treat `-32001` and a null `finalized` as "unavailable": no credit, no refusal, retry, alert.
+- [ ] Do not take a small `age_s` as proof of currency on v2.1: compare `bloch_finality.l1.finalized.epoch` with your own L1 node.
+- [ ] Never treat `accepted` as paid: confirm a claim from `claimed` and the finalized claim txid.
+- [ ] Handle withdraw tool exit 3 as retry, with an alert if it persists; exit 4 as "do not resend".
+- [ ] Do not read `source.height`, `native_height`, `roots[].height` or `l1_height` as L1 chain height.
+- [ ] Own RPC: upgrade the RPC before any follower moves to status schema v3.
