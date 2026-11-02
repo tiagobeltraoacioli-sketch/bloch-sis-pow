@@ -819,6 +819,12 @@ pub mod forced {
     pub const SURCHARGE_DOUBLING: u64 = 32;
     const _: () = assert!(MAX_PENDING_WEIGHT / SURCHARGE_DOUBLING < 32);
     pub const INBOX_DOMAIN: &[u8] = b"BLOCH:L2:INBOX:2";
+    /// Consumed records kept, with the L2 number of the settlement that
+    /// consumed them, so that a rollback head reset can queue them again
+    /// ([`Queue::requeue_after`]). At [`MAX_PER_SETTLEMENT`] per settlement
+    /// this covers at least 64 settlements; a reset deeper than the log is
+    /// refused rather than losing forced transactions.
+    pub const CONSUMED_LOG: usize = 1_024;
 
     #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -893,6 +899,11 @@ pub mod forced {
         pub(crate) root: [u8; 32],
         /// Pending count frozen with the source anchor.
         pub(crate) anchor: Option<u64>,
+        /// The newest consumed records, oldest first, each with the L2 number
+        /// of the settlement that consumed it; at most [`CONSUMED_LOG`].
+        pub(crate) log: Vec<(u64, Record)>,
+        /// Highest L2 number among records dropped from `log` (0: none).
+        pub(crate) log_floor: u64,
     }
     impl Queue {
         pub(crate) fn new() -> Self {
@@ -944,14 +955,50 @@ pub mod forced {
             self.queued += 1;
             Ok(())
         }
-        pub(crate) fn consume_due(&mut self) {
+        /// Consume the due records in the settlement of L2 block `l2_number`.
+        pub(crate) fn consume_due(&mut self, l2_number: u64) {
             let n = self.due().len();
-            self.pending.drain(..n);
+            self.log.extend(self.pending.drain(..n).map(|r| (l2_number, r)));
             self.consumed += n as u64;
             self.anchor = None;
+            if self.log.len() > CONSUMED_LOG {
+                let excess = self.log.len() - CONSUMED_LOG;
+                for (number, _) in self.log.drain(..excess) {
+                    self.log_floor = self.log_floor.max(number);
+                }
+            }
+        }
+        /// The consumed log.
+        pub fn consumed_log(&self) -> &[(u64, Record)] {
+            &self.log
+        }
+        /// Whether a head reset to L2 block `number` can queue again every
+        /// record a later settlement consumed.
+        pub fn covers_reset_to(&self, number: u64) -> bool {
+            self.log_floor <= number
+        }
+        /// Head reset to L2 block `number`: every record consumed by a later
+        /// settlement goes back to the front of the queue, in its original
+        /// order, as the deposit cursor goes back for deposits. The running
+        /// root is unchanged (nothing new is queued). A frozen anchor grows by
+        /// the records put back, which were queued before it. Returns the
+        /// number put back, or `None` (no change) when the log does not reach.
+        pub(crate) fn requeue_after(&mut self, number: u64) -> Option<u64> {
+            if !self.covers_reset_to(number) {
+                return None;
+            }
+            let keep = self.log.iter().position(|(n, _)| *n > number).unwrap_or(self.log.len());
+            let back: Vec<Record> = self.log.drain(keep..).map(|(_, r)| r).collect();
+            let count = back.len() as u64;
+            self.pending.splice(0..0, back);
+            self.consumed -= count;
+            if let Some(anchor) = self.anchor.as_mut() {
+                *anchor += count;
+            }
+            Some(count)
         }
         pub(crate) fn encode(&self, out: &mut Vec<u8>) {
-            out.extend_from_slice(b"BLOCH:NATIVE:L2:FORCED-STATE:1");
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:FORCED-STATE:2");
             out.extend_from_slice(&self.queued.to_le_bytes());
             out.extend_from_slice(&self.consumed.to_le_bytes());
             out.extend_from_slice(&self.root);
@@ -964,6 +1011,12 @@ pub mod forced {
             }
             out.extend_from_slice(&(self.pending.len() as u64).to_le_bytes());
             for r in &self.pending {
+                out.extend_from_slice(&r.encode());
+            }
+            out.extend_from_slice(&self.log_floor.to_le_bytes());
+            out.extend_from_slice(&(self.log.len() as u64).to_le_bytes());
+            for (number, r) in &self.log {
+                out.extend_from_slice(&number.to_le_bytes());
                 out.extend_from_slice(&r.encode());
             }
         }
@@ -1855,6 +1908,11 @@ impl State {
     pub(crate) fn enable_forced_inclusion_for_test(&mut self) -> bool {
         self.enable_forced_inclusion_if(true)
     }
+    /// Test hook: the queue, mutable.
+    #[cfg(test)]
+    pub(crate) fn forced_queue_mut_for_test(&mut self) -> Option<&mut forced::Queue> {
+        self.forced.as_mut()
+    }
     /// Queue a forced L2 transaction published at the next native height.
     /// The caller has already charged and authorized the L1 transaction.
     pub(crate) fn queue_forced(
@@ -2030,6 +2088,15 @@ impl State {
         let (_, count) = withdrawal::tree_after(head.as_ref().map(|(_, s): &([u8; 32], Vec<u8>)| s.as_slice()));
         if self.claimed.any_at_or_above(count) || consumed > self.inbox.len() as u64 {
             return false;
+        }
+        // Forced records consumed after the target go back into the queue, as
+        // the deposit cursor goes back; a reset the consumed log cannot cover
+        // is refused, so that no forced transaction is silently dropped.
+        if self.forced.as_ref().is_some_and(|q| !q.covers_reset_to(reset.number)) {
+            return false;
+        }
+        if let Some(queue) = self.forced.as_mut() {
+            queue.requeue_after(reset.number);
         }
         self.head = head;
         self.consumed = consumed;
@@ -2528,7 +2595,7 @@ impl State {
         self.source_anchor = None;
         self.consumed = end;
         if let Some(queue) = self.forced.as_mut() {
-            queue.consume_due();
+            queue.consume_due(number);
         }
         // Records for settled blocks can never be used again.
         self.da.retain(|r| r.l2_number > number);
@@ -2569,7 +2636,12 @@ impl State {
         if let Some(q) = &self.forced {
             let pending = q.pending.len() as u64;
             if q.queued.checked_sub(q.consumed) != Some(pending)
-                || q.pending_weight() > forced::MAX_PENDING_WEIGHT
+                // A head reset can queue consumed records again past the
+                // submission capacity: bounded by the consumed log.
+                || q.pending_weight() > forced::MAX_PENDING_WEIGHT + (forced::CONSUMED_LOG as u64) * forced::weight(forced::MAX_GAS)
+                || q.log.len() > forced::CONSUMED_LOG
+                || q.log.windows(2).any(|w| w[0].0 > w[1].0)
+                || q.log.first().is_some_and(|(n, _)| *n < q.log_floor)
                 || q.anchor.is_some_and(|a| a > pending)
             {
                 return Err("cached L2 forced queue is inconsistent".into());

@@ -170,6 +170,32 @@ pub const fn l2_forced_inclusion_may_arm(forced: u64, next: u64, configured: boo
     !armed(forced) || (configured && armed(next) && forced >= next)
 }
 
+/// A rollback must reinstate a program that can consume the forced queue: with
+/// forced inclusion armed, an armed rollback needs [`PROGRAM_FALLBACK`]'s
+/// configuration listed as implementing it. Otherwise every settlement after
+/// the rollback would be refused while a record is due, which halts the L2.
+///
+/// [`PROGRAM_FALLBACK`]: crate::l2_settlement::mainnet::PROGRAM_FALLBACK
+pub const fn l2_forced_rollback_may_arm(forced: u64, rollback: u64, fallback_listed: bool) -> bool {
+    !armed(forced) || !armed(rollback) || fallback_listed
+}
+
+/// Whether `configuration` is in `list` (const).
+pub const fn listed(list: &[[u8; 32]], configuration: &[u8; 32]) -> bool {
+    let mut i = 0;
+    while i < list.len() {
+        let mut j = 0;
+        while j < 32 && list[i][j] == configuration[j] {
+            j += 1;
+        }
+        if j == 32 {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// The ordering rules between all HF1/HF2/HF3 gates (see the module docs).
 /// `later` is inert, or `earlier` is armed at the same epoch or before it.
 pub const fn requires_no_later(earlier: u64, later: u64) -> bool {
@@ -237,7 +263,19 @@ const _: () = assert!(l2_program_may_arm(
 const _: () = assert!(l2_forced_inclusion_may_arm(
     params::L2_FORCED_INCLUSION_EPOCH,
     params::L2_NEXT_PROGRAM_EPOCH,
-    !crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS.is_empty(),
+    listed(
+        crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS,
+        &crate::l2_settlement::mainnet::PROGRAM_NEXT.identities[0],
+    ),
+));
+#[cfg(not(feature = "l2-activation-rehearsal"))]
+const _: () = assert!(l2_forced_rollback_may_arm(
+    params::L2_FORCED_INCLUSION_EPOCH,
+    params::L2_PROGRAM_ROLLBACK_EPOCH,
+    listed(
+        crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS,
+        &crate::l2_settlement::mainnet::PROGRAM_FALLBACK.identities[0],
+    ),
 ));
 // The P5a alias must follow the HF2 release switch.
 const _: () = assert!(params::NATIVE_SLASHING_ACTIVATION_EPOCH == params::HF2_SLASHING_V2_EPOCH);
@@ -336,7 +374,25 @@ mod tests {
         assert!(!g.armed() && !g.node_policy_only);
         assert!(!RELEASE_ARMABLE.contains(&"params::L2_FORCED_INCLUSION_EPOCH"));
         assert_eq!(params::L2_FORCED_INCLUSION_EPOCH, M);
-        assert!(crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS.is_empty());
+        // It rides with the swap.
+        assert_eq!(params::L2_FORCED_INCLUSION_EPOCH, params::L2_NEXT_PROGRAM_EPOCH);
+        // A listed configuration is always the next program's: no other guest
+        // could publish the inbox hash at the swap.
+        use crate::l2_settlement::mainnet::{FORCED_INCLUSION_CONFIGURATIONS as LIST, PROGRAM_FALLBACK, PROGRAM_NEXT};
+        assert!(LIST.iter().all(|c| *c == PROGRAM_NEXT.identities[0]), "only the next configuration may be listed");
+        assert!(LIST.len() <= 1);
+        assert!(listed(&[[1; 32], [2; 32]], &[2; 32]) && !listed(&[[1; 32]], &[2; 32]) && !listed(&[], &[2; 32]));
+        // The rollback rule: an armed rollback under armed forced inclusion
+        // needs a listed fallback configuration.
+        assert!(l2_forced_rollback_may_arm(M, M, false));
+        assert!(l2_forced_rollback_may_arm(10_060, M, false));
+        assert!(l2_forced_rollback_may_arm(M, 10_100, false));
+        assert!(!l2_forced_rollback_may_arm(10_060, 10_100, false));
+        assert!(l2_forced_rollback_may_arm(10_060, 10_100, true));
+        // The fallback proves the same rules, so listing the next configuration
+        // lists the fallback's too (`mainnet` pins them equal).
+        assert_eq!(PROGRAM_FALLBACK.identities[0], PROGRAM_NEXT.identities[0]);
+        assert_eq!(listed(LIST, &PROGRAM_FALLBACK.identities[0]), listed(LIST, &PROGRAM_NEXT.identities[0]));
         // Inert is always coherent.
         assert!(l2_forced_inclusion_may_arm(M, M, false));
         assert!(l2_forced_inclusion_may_arm(M, 10_060, true));

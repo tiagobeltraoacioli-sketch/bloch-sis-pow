@@ -55,14 +55,22 @@
     fn forced_inclusion_gate_ships_inert_and_no_program_implements_it() {
         assert_eq!(crate::params::L2_FORCED_INCLUSION_EPOCH, u64::MAX);
         assert!(!crate::params::l2_forced_inclusion_active(u64::MAX - 1));
-        assert!(mainnet::FORCED_INCLUSION_CONFIGURATIONS.is_empty());
-        // The mainnet L2, before and after the program swap: never enabled.
+        // Only the next program's configuration may be listed.
+        assert!(mainnet::FORCED_INCLUSION_CONFIGURATIONS.iter().all(|c| *c == mainnet::PROGRAM_NEXT.identities[0]));
+        let listed = !mainnet::FORCED_INCLUSION_CONFIGURATIONS.is_empty();
+        // The mainnet L2 before the swap never runs it; after the swap it does
+        // exactly when the next configuration is listed (the gate is inert, so
+        // no compiled boundary calls this today).
         let mut l2 = mainnet_l2_state();
         assert!(!l2.forced_inclusion_program());
         assert!(!l2.enable_forced_inclusion());
-        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
-        assert!(!l2.enable_forced_inclusion());
         assert!(l2.forced_queue().is_none());
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        assert_eq!(l2.forced_inclusion_program(), listed);
+        assert_eq!(l2.enable_forced_inclusion(), listed && l2.user_transactions() && l2.asynchronous());
+        // The fallback keeps the rules, and with them the queue.
+        l2.replace_program_for_test(&mainnet::PROGRAM_FALLBACK);
+        assert_eq!(l2.forced_inclusion_program(), listed);
     }
 
     #[test]
@@ -465,4 +473,120 @@
             }
         }
         assert_eq!(worst, 3 * window - 1);
+    }
+
+    #[test]
+    fn a_head_reset_queues_again_what_later_settlements_consumed() {
+        let (opened, mut chains) = activated_fixture(true, [0; 32]);
+        let opened = enabled(opened);
+        let mut slot = crate::params::SLOTS_PER_EPOCH + 1;
+        let mut next = |pre: &CommittedState, txs: &[PosTransaction], chains: &mut Vec<RandaoChain>| {
+            let post = apply(pre, slot, txs, chains);
+            slot += 1;
+            post
+        };
+        let tx = forced_tx(&opened, ([0x33; 32], 0), FUNDED, envelope(7), 60_000);
+        let s2 = next(&opened, &[PosTransaction::L2ForcedTransaction(tx)], &mut chains).unwrap();
+        let record = s2.l2_settlement().unwrap().forced_queue().unwrap().pending()[0];
+        // Block 1 settles on the earlier anchor; block 2 consumes the record.
+        let s3 = next(&s2, &[PosTransaction::L2SettlementAsync(Box::new(statement_with_inbox(&s2, no_deposits())))], &mut chains)
+            .unwrap();
+        let (kept_commitment, kept_statement) = s3.l2_settlement().unwrap().head().unwrap();
+        let s4 = next(&s3, &[], &mut chains).unwrap();
+        let good = statement_with_inbox(&s4, forced::inbox_hash(no_deposits(), &[record]));
+        let s5 = next(&s4, &[PosTransaction::L2SettlementAsync(Box::new(good))], &mut chains).unwrap();
+        let queue = s5.l2_settlement().unwrap().forced_queue().unwrap();
+        assert_eq!((queue.consumed(), queue.pending().len()), (1, 0));
+        assert_eq!(queue.consumed_log(), &[(2, record)]);
+
+        // A head reset back to block 1 puts the record back, as the inbox cursor goes back.
+        let reset = mainnet::HeadReset { number: 1, commitment: kept_commitment, statement: Some(leaked_hex(&kept_statement)) };
+        let mut reset_state = s5.clone();
+        let root = reset_state.l2_settlement().unwrap().forced_queue().unwrap().root();
+        assert!(reset_state.l2_settlement.as_mut().unwrap().reset_head(&reset));
+        let queue = reset_state.l2_settlement().unwrap().forced_queue().unwrap();
+        assert_eq!(reset_state.l2_settlement().unwrap().settled_number(), 1);
+        assert_eq!((queue.queued(), queue.consumed(), queue.pending()), (1, 0, &[record][..]));
+        assert!(queue.consumed_log().is_empty());
+        assert_eq!(queue.root(), root, "nothing new was queued");
+        assert_ne!(reset_state.state_root(), s5.state_root());
+
+        // The next block 2 must consume it again: omission is refused, inclusion settles.
+        let s6 = next(&reset_state, &[], &mut chains).unwrap();
+        assert_eq!(s6.l2_settlement().unwrap().forced_queue().unwrap().due(), &[record]);
+        let mut l2 = s6.l2_settlement().unwrap().clone();
+        assert_eq!(
+            l2.apply(&statement_with_inbox(&s6, no_deposits()), *s6.head.as_bytes(), s6.slot, true, &ProofDouble),
+            Err(Reject::Forced)
+        );
+        let again = statement_with_inbox(&s6, forced::inbox_hash(no_deposits(), &[record]));
+        let s7 = next(&s6, &[PosTransaction::L2SettlementAsync(Box::new(again))], &mut chains).expect("consumed again");
+        let queue = s7.l2_settlement().unwrap().forced_queue().unwrap();
+        assert_eq!(s7.l2_settlement().unwrap().settled_number(), 2);
+        assert_eq!((queue.queued(), queue.consumed(), queue.pending().len()), (1, 1, 0));
+        #[cfg(feature = "local-state-cache")]
+        for state in [&reset_state, &s6, &s7] {
+            let (restored, _, _) = local_cache_round_trip(state);
+            assert_eq!(restored.l2_settlement().unwrap().forced_queue(), state.l2_settlement().unwrap().forced_queue());
+        }
+    }
+
+    #[test]
+    fn a_head_reset_deeper_than_the_consumed_log_is_refused() {
+        let record = |i: u64| forced::Record { height: i, l1_txid: [i as u8; 32], envelope_hash: [0x5a; 32], gas_limit: 21_000 };
+        // Unit level: the log keeps the newest CONSUMED_LOG records.
+        let mut queue = forced::Queue::new();
+        let mut number = 0u64;
+        let mut i = 0u64;
+        while queue.covers_reset_to(0) {
+            number += 1;
+            for _ in 0..14 {
+                i += 1;
+                queue.push(record(i)).unwrap();
+            }
+            queue.consume_due(number);
+            assert!(queue.consumed_log().len() <= forced::CONSUMED_LOG);
+            assert!(number < 200);
+        }
+        let floor = queue.log_floor;
+        assert!(floor >= 1 && queue.consumed_log()[0].0 >= floor);
+        assert!(queue.covers_reset_to(floor) && !queue.covers_reset_to(floor - 1));
+        let mut copy = queue.clone();
+        assert_eq!(copy.requeue_after(floor - 1), None);
+        assert_eq!(copy, queue, "a refused re-queue changes nothing");
+        let back = copy.requeue_after(number - 1).unwrap();
+        assert_eq!(back, 14);
+        assert_eq!(copy.pending().len(), 14);
+        assert_eq!(copy.consumed(), queue.consumed() - 14);
+        assert_eq!(copy.pending()[0], record(i - 13), "original order");
+
+        // State level: a reset below the log floor keeps the head.
+        let mut l2 = state_with_bad_tail();
+        assert!(l2.enable_forced_inclusion_for_test());
+        let q = l2.forced_queue_mut_for_test().unwrap();
+        for n in 1..=7u64 {
+            for _ in 0..14 {
+                i += 1;
+                q.push(record(i)).unwrap();
+            }
+            q.consume_due(n);
+        }
+        // Drop the old entries as a long history would.
+        let keep = q.consumed_log().iter().filter(|(n, _)| *n >= 5).count();
+        while q.consumed_log().len() > keep {
+            let (n, _) = q.log.remove(0);
+            q.log_floor = q.log_floor.max(n);
+        }
+        let deep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let refused = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&deep)) };
+        let before = l2.clone();
+        assert!(!l2.reset_head(&refused));
+        assert_eq!(l2, before);
+        let shallow = statement_at(&l2, 6, [0xbb; 32], 5);
+        let applied = mainnet::HeadReset { number: 6, commitment: [6; 32], statement: Some(leaked_hex(&shallow)) };
+        assert!(l2.reset_head(&applied));
+        assert_eq!(l2.settled_number(), 6);
+        let q = l2.forced_queue().unwrap();
+        assert_eq!(q.pending().len(), 14, "the records block 7 consumed are due again");
+        assert!(q.consumed_log().iter().all(|(n, _)| *n <= 6));
     }
