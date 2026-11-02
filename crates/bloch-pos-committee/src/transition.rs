@@ -6170,6 +6170,13 @@ impl CommittedState {
                 l2.install_next_program();
             }
         }
+        // Its rollback, after the swap so that an order of the two gates is the
+        // only order. Inert while `L2_PROGRAM_ROLLBACK_EPOCH` is the sentinel.
+        if crate::params::l2_program_rollback_active(next_epoch) {
+            if let Some(l2) = st.l2_settlement.as_mut() {
+                l2.install_fallback_program();
+            }
+        }
         // Claim finality on this chain (HF1_CLAIM_FINALITY_EPOCH):
         // record this chain's checkpoint of the epoch being opened. `head` is
         // still the parent here — the last block strictly before the new

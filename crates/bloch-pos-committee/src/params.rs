@@ -2730,11 +2730,17 @@ pub(crate) fn native_claim_finality_active(epoch: u64) -> bool {
 }
 
 /// CANDIDATE, not scheduled: the epoch boundary that replaces the mainnet L2
-/// program with `l2_settlement::mainnet::PROGRAM_NEXT` (timestamp and prevrandao
-/// bound in the guest, fee-vault sweep, and the release rule of
-/// `ReleaseWindow::admits`). `u64::MAX` means INERT. No epoch has been chosen.
+/// program with `l2_settlement::mainnet::PROGRAM_NEXT` (sparse witness,
+/// timestamp and prevrandao bound in the guest, fee-vault sweep, and the release
+/// rule of `ReleaseWindow::admits`). `u64::MAX` means INERT. No epoch has been
+/// chosen. Its ordering rule is `hard_forks::l2_program_schedule_coherent`.
 pub const L2_NEXT_PROGRAM_EPOCH: u64 = u64::MAX;
-const _: () = assert!(gate_is_inert_or_not_before(L2_NEXT_PROGRAM_EPOCH, HF3_KES_ENFORCE_EPOCH));
+/// The boundary that rolls that program back to
+/// `l2_settlement::mainnet::PROGRAM_FALLBACK`, the same rules under the complete
+/// witness. `u64::MAX` means INERT, and a release that swaps the program ships it
+/// so. Only an emergency release moves it: L1 cannot tell a misbehaving guest by
+/// itself, and there is no key and no runtime input.
+pub const L2_PROGRAM_ROLLBACK_EPOCH: u64 = u64::MAX;
 
 pub(crate) fn l2_next_program_active(epoch: u64) -> bool {
     #[cfg(test)]
@@ -2744,15 +2750,32 @@ pub(crate) fn l2_next_program_active(epoch: u64) -> bool {
     epoch_gate_active(epoch, L2_NEXT_PROGRAM_EPOCH)
 }
 
+pub(crate) fn l2_program_rollback_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_next_program_test::rollback_forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_PROGRAM_ROLLBACK_EPOCH)
+}
+
 #[cfg(test)]
 pub(crate) mod l2_next_program_test {
     use std::cell::Cell;
-    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static ROLLBACK: Cell<bool> = const { Cell::new(false) };
+    }
     pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn rollback_forced() -> bool { ROLLBACK.with(Cell::get) }
     pub fn open() -> impl Drop {
         struct Restore(bool);
         impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
         Restore(ENABLED.with(|v| v.replace(true)))
+    }
+    pub fn open_rollback() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ROLLBACK.with(|v| v.set(self.0)); } }
+        Restore(ROLLBACK.with(|v| v.replace(true)))
     }
 }
 

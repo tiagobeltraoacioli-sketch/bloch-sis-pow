@@ -4849,11 +4849,15 @@ impl Engine {
         }
         if let PosTransaction::L2SettlementAsync(settlement) = &tx {
             let state = self.state.l2_settlement().ok_or(Refusal::Invalid("L2 settlement is not configured"))?;
-            if self.mempool.values().any(|pending| matches!(pending, PosTransaction::L2SettlementAsync(_))) {
+            if self.mempool.values().any(|pending| l2_proof_holds_the_slot(pending, state)) {
                 return Err(Refusal::Invalid("one L2 proof is already pending"));
             }
             state.validate_async(settlement, &HybridVerifier::new())
                 .map_err(|_| Refusal::Invalid("L2 settlement policy, source, successor or proof failed"))?;
+            // A proof of the replaced program can never settle, and left alone it
+            // would refuse the program's new proof until the TTL. Removed only now
+            // that the proof taking its place has passed.
+            self.mempool.retain(|_, pending| !matches!(pending, PosTransaction::L2SettlementAsync(_)));
         } else {
             let verifier = self.gossip_verifier.budgeted_for_source(
                 self.wall_slot(),
@@ -4936,9 +4940,12 @@ impl Engine {
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
         // A proof reserves the whole gas budget. Never pack it with transfers.
-        if let Some(tx) = self.mempool.values().find(|tx| matches!(tx, PosTransaction::L2SettlementAsync(_))) {
+        let l2 = self.state.l2_settlement();
+        let live_proof = |tx: &PosTransaction| l2.is_some_and(|l2| l2_proof_holds_the_slot(tx, l2));
+        if let Some(tx) = self.mempool.values().find(|tx| live_proof(tx)) {
             return vec![tx.clone()];
         }
+        let dead_proof = |tx: &PosTransaction| matches!(tx, PosTransaction::L2SettlementAsync(_));
         // Admission is a historical observation, not a reservation of inputs or
         // fees. Recheck against this proposal's parent and fee epoch before a
         // stale high-tip transaction can consume candidate capacity (EN-06).
@@ -4946,7 +4953,7 @@ impl Engine {
         // again, making the exact same signed transaction eligible later.
         let mut funded_context = None;
         let candidates = self.mempool.iter().filter(|(encoded, tx)| {
-            self.candidate_is_backed(tx, encoded.len(), epoch, &mut funded_context)
+            !dead_proof(tx) && self.candidate_is_backed(tx, encoded.len(), epoch, &mut funded_context)
         }).collect();
         Self::pack_transactions(epoch, *self.state.head().as_bytes(), candidates)
     }
@@ -7968,6 +7975,16 @@ fn declared_size_bound(tx: &PosTransaction, declared: u64) -> Result<(), &'stati
 /// SHA3-256 of `genesis/mainnet.manifest` (the Genesis-4 network digest).
 #[cfg(feature = "l2-activation-rehearsal")]
 const GENESIS4_MAINNET_NETWORK_DIGEST: &str = "f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966";
+
+/// Whether `pending` is a settlement proof that may still land on `l2`. A proof
+/// of a program the L2 no longer holds may not: it keeps no proof slot and no
+/// proposer picks it, so a program swap costs no block and delays no new proof.
+pub(crate) fn l2_proof_holds_the_slot(
+    pending: &PosTransaction,
+    l2: &bloch_pos_committee::l2_settlement::State,
+) -> bool {
+    matches!(pending, PosTransaction::L2SettlementAsync(settlement) if !l2.names_another_program(settlement))
+}
 
 pub(crate) fn l2_admission_refusal(
     tx: &PosTransaction,
@@ -17778,6 +17795,57 @@ mod l2_admission_tests {
                 change, tx_bytes: 0, tip_millisat_per_gas: 0, signature: Vec::new(),
             }),
         ]
+    }
+
+    /// A settlement proof whose statement names `configuration` as its program.
+    fn proof_of(policy: &Policy, configuration: [u8; 32], number: u8) -> PosTransaction {
+        use bloch_pos_committee::l2_settlement::{Transaction, STATEMENT_TAG, STATEMENT_V3_BYTES, STATEMENT_V3_TAG};
+        let tag = STATEMENT_TAG.len();
+        let mut statement = vec![number; STATEMENT_V3_BYTES];
+        statement[..tag].copy_from_slice(STATEMENT_V3_TAG);
+        for (i, id) in policy.identities.iter().enumerate() {
+            statement[tag + i * 32..tag + (i + 1) * 32].copy_from_slice(id);
+        }
+        statement[tag + 96..tag + 128].copy_from_slice(&configuration);
+        PosTransaction::L2SettlementAsync(Box::new(Transaction { proof_policy: policy.proof_policy, statement, proof: [1; 356] }))
+    }
+
+    /// Only a proof of the program the L2 holds keeps the one proof slot.
+    #[test]
+    fn a_proof_of_a_replaced_program_holds_no_slot() {
+        let limits = withdrawal::Limits::DEVELOPMENT;
+        let l2 = State::activated(Activation { policy: policy(), asynchronous: true, limits }).unwrap();
+        assert!(l2_proof_holds_the_slot(&proof_of(&policy(), policy().identities[3], 1), &l2));
+        assert!(!l2_proof_holds_the_slot(&proof_of(&policy(), [0xee; 32], 1), &l2));
+        for tx in txs() {
+            assert!(!l2_proof_holds_the_slot(&tx, &l2), "{tx:?}");
+        }
+    }
+
+    /// No proposer picks a dead proof, ordinary transactions keep flowing past
+    /// it, and a live proof is still chosen alone. The pool holds it until the
+    /// TTL or until a new proof replaces it.
+    #[test]
+    fn the_proposer_skips_a_proof_of_a_replaced_program() {
+        let mut e = super::slot_horizon::engine_at_wall_slot(0);
+        let state = (*e.state).clone().configure_l2_genesis_async(policy()).unwrap();
+        e.state = StateCell::new(state);
+        let dead = proof_of(&policy(), [0xee; 32], 1);
+        e.mempool.insert(dead.canonical_bytes(), dead.clone());
+        assert!(e.select_transactions(0).is_empty(), "the dead proof is not selected");
+        assert!(e.mempool.contains_key(&dead.canonical_bytes()));
+        let live = proof_of(&policy(), policy().identities[3], 2);
+        e.mempool.insert(live.canonical_bytes(), live.clone());
+        assert_eq!(e.select_transactions(0), vec![live]);
+    }
+
+    /// `getl2settlement` always names what is ahead: nothing while the gates are inert.
+    #[test]
+    fn the_settlement_view_reports_an_empty_schedule_while_inert() {
+        let e = super::slot_horizon::engine_at_wall_slot(0);
+        let state = (*e.state).clone().configure_l2_genesis_async(policy()).unwrap();
+        let view = crate::rpc::l2_settlement_json(&state).to_string();
+        assert!(view.contains("\"program_schedule\":[]"), "{view}");
     }
 
     /// The mempool's L2 door reads the installed L2's profile, not the build:

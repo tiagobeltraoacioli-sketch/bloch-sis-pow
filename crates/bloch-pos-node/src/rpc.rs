@@ -2945,6 +2945,15 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
             ("vkey_koalabear", Json::hex(&policy.identities[5])), ("vkey_bn254", Json::hex(&policy.identities[6])),
             ("proof_policy", Json::hex(&policy.proof_policy)),
         ])),
+        // The compiled program changes still ahead of this L2, in order: empty
+        // while the gates are inert. A settler stops starting proofs that cannot
+        // land before the first entry; `program` above moves only at the gate.
+        ("program_schedule", Json::Arr(l2.program_schedule().iter().map(|(epoch, next)| Json::obj(vec![
+            ("epoch", Json::u(*epoch)),
+            ("configuration", Json::hex(&next.identities[0])), ("elf_keccak", Json::hex(&next.identities[1])),
+            ("vkey_koalabear", Json::hex(&next.identities[2])), ("vkey_bn254", Json::hex(&next.identities[3])),
+            ("proof_policy", Json::hex(&next.proof_policy)),
+        ])).collect())),
         // What this L2 admits, fixed at installation: a development genesis
         // follows the node's devnet features; the running-network flag day
         // ("activated") admits everything on every build.

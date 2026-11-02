@@ -2926,6 +2926,261 @@ mod l2_tests {
         assert_eq!(next.l2_settlement().unwrap().settled_number(), 1);
     }
 
+    // ── The sparse guest: the swap, what is in flight across it, the rollback ──
+
+    /// The flag day of a rehearsal network that holds the mainnet program: the
+    /// gates act on it, and the funded depositor and the L2 are real.
+    fn swap_fixture() -> (CommittedState, Vec<RandaoChain>) {
+        let (pre, mut policy, mut chains) = funded_running_without_l2();
+        let pinned = mainnet::PROGRAM.unwrap();
+        policy.identities[2..7].copy_from_slice(&pinned.identities[2..7]);
+        policy.proof_policy = pinned.proof_policy;
+        let _gate = crate::params::l2_settlement_rehearsal::open();
+        let _policy = crate::l2_settlement::activation_rehearsal::set(activation(policy, true));
+        let opened = apply(&pre, crate::params::SLOTS_PER_EPOCH, &[], &mut chains).unwrap();
+        (opened, chains)
+    }
+
+    fn program_of(state: &crate::l2_settlement::State) -> [[u8; 32]; 4] {
+        state.policy().identities[3..7].try_into().unwrap()
+    }
+
+    #[test]
+    fn the_rollback_gate_is_inert_and_the_fallback_proves_the_same_rules() {
+        assert_eq!(crate::params::L2_PROGRAM_ROLLBACK_EPOCH, u64::MAX);
+        for epoch in [0, 8_620, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::l2_program_rollback_active(epoch));
+        }
+        assert_eq!(mainnet::ROLLBACK_HEAD_RESET, None);
+        let (next, fallback, pinned) = (mainnet::PROGRAM_NEXT, mainnet::PROGRAM_FALLBACK, mainnet::PROGRAM.unwrap());
+        assert_eq!(next.identities[0], fallback.identities[0], "same rules");
+        assert_eq!(next.proof_policy, fallback.proof_policy);
+        for i in 1..4 {
+            assert_ne!(next.identities[i], fallback.identities[i], "another guest");
+        }
+        assert_ne!(fallback.identities[0], pinned.identities[3], "the next rules are one-way");
+    }
+
+    #[test]
+    fn the_schedule_is_empty_while_inert_and_names_only_what_is_ahead() {
+        let mut l2 = mainnet_l2_state();
+        assert!(l2.program_schedule().is_empty());
+        assert!(l2.program_schedule_for_test(u64::MAX, u64::MAX).is_empty());
+        let both = [(10_000, mainnet::PROGRAM_NEXT), (10_500, mainnet::PROGRAM_FALLBACK)];
+        assert_eq!(l2.program_schedule_for_test(10_000, 10_500), both);
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        assert_eq!(l2.program_schedule_for_test(10_000, 10_500), both[1..]);
+        assert!(l2.program_schedule_for_test(10_000, u64::MAX).is_empty());
+        l2.replace_program_for_test(&mainnet::PROGRAM_FALLBACK);
+        assert!(l2.program_schedule_for_test(10_000, 10_500).is_empty());
+        // Any other L2 hears nothing.
+        let (other, _) = fixture();
+        assert!(other.l2_settlement().unwrap().program_schedule_for_test(10_000, 10_500).is_empty());
+    }
+
+    #[test]
+    fn the_rollback_acts_only_on_the_swapped_program_and_only_once() {
+        let (mut pre, _) = fixture();
+        let other = pre.l2_settlement().unwrap().clone();
+        pre.l2_settlement = Some(mainnet_l2_state());
+
+        // Armed before any swap happened it leaves the activated program alone.
+        {
+            let _rollback = crate::params::l2_next_program_test::open_rollback();
+            assert_eq!(pre.close_epoch().l2_settlement().unwrap().policy(), pre.l2_settlement().unwrap().policy());
+        }
+        let _gate = crate::params::l2_next_program_test::open();
+        let swapped = pre.close_epoch();
+        assert_eq!(program_of(swapped.l2_settlement().unwrap()), mainnet::PROGRAM_NEXT.identities);
+
+        let stayed = swapped.close_epoch();
+        let _rollback = crate::params::l2_next_program_test::open_rollback();
+        let back = swapped.close_epoch();
+        let l2 = back.l2_settlement().unwrap();
+        assert_eq!(program_of(l2), mainnet::PROGRAM_FALLBACK.identities);
+        let (old, new) = (swapped.l2_settlement().unwrap().policy(), l2.policy());
+        assert_eq!(new.identities[..3], old.identities[..3]);
+        assert_eq!(new.identities[3], old.identities[3], "the rules stay");
+        assert_eq!(
+            (new.proof_policy, new.chain_id, new.initial_l2_parent, new.initial_l2_state, new.attestor_set),
+            (old.proof_policy, old.chain_id, old.initial_l2_parent, old.initial_l2_state, old.attestor_set),
+        );
+        assert_ne!(back.state_root(), stayed.state_root(), "the policy is committed");
+
+        // Both gates stay open and neither moves it again.
+        assert_eq!(back.close_epoch().l2_settlement().unwrap().policy(), new);
+        // Open together on an unswapped L2 they run in the one order.
+        assert_eq!(program_of(pre.close_epoch().l2_settlement().unwrap()), mainnet::PROGRAM_FALLBACK.identities);
+        // Any other L2 is left alone.
+        pre.l2_settlement = Some(other.clone());
+        assert_eq!(pre.close_epoch().l2_settlement().unwrap().policy(), other.policy());
+    }
+
+    /// Settlement N under the activated program; a proof of N+1 in flight when
+    /// the gate passes; N+1 under the sparse guest; then the same at a rollback.
+    #[test]
+    fn what_is_in_flight_crosses_the_swap_and_the_rollback() {
+        let (opened, mut chains) = swap_fixture();
+        let deposit = deposit_tx(&opened, 7_000_000_000);
+        let s1 = apply(&opened, 33, &[PosTransaction::L2Deposit(deposit)], &mut chains).unwrap();
+        let empty = crate::l2_settlement::expected_body_commitment(&[]);
+
+        // N: settled under the activated program, with withdrawals.
+        let leaves = wleaves(3);
+        let with_tree = |mut tx: Transaction| {
+            tx.statement[S + v3::WITHDRAWAL_ROOT..S + v3::WITHDRAWAL_ROOT + 32].copy_from_slice(&wd::root(&leaves));
+            tx.statement[S + v3::WITHDRAWAL_COUNT..S + v3::WITHDRAWAL_COUNT + 8].copy_from_slice(&3u64.to_be_bytes());
+            tx
+        };
+        let first = with_tree(to_v3(settlement(&s1, empty), no_deposits(), 0));
+        let s2 = apply(&s1, 34, &[PosTransaction::L2SettlementAsync(Box::new(first))], &mut chains).unwrap();
+        let (head_n, _) = s2.l2_settlement().unwrap().head().unwrap();
+        let s3 = apply(&s2, 35, &[], &mut chains).unwrap();
+
+        // N+1: proved under the activated program against the frozen source, with
+        // its data-availability record in place, not landed when the gate passes.
+        let record = s3.l2_settlement().unwrap().inbox()[0];
+        let minted = crate::l2_settlement::deposits_hash(&[record]);
+        let in_flight = with_tree(to_v3(settlement(&s3, empty), minted, 0));
+        let mut s3 = s3;
+        let da = crate::l2_settlement::da::Record { l2_number: 2, commitment: [0xd8; 32], height: s3.l2_settlement().unwrap().height() };
+        s3.l2_settlement.as_mut().unwrap().insert_da_record(da);
+        let parent = *s3.head.as_bytes();
+        let before = s3.l2_settlement().unwrap().clone();
+        assert_eq!(before.validate_async(&in_flight, &ProofDouble), Ok(()), "valid below the gate");
+        assert!(!before.names_another_program(&in_flight));
+
+        let swapped = {
+            let _gate = crate::params::l2_next_program_test::open();
+            apply(&s3, 2 * crate::params::SLOTS_PER_EPOCH, &[], &mut chains).unwrap()
+        };
+        let l2 = swapped.l2_settlement().unwrap();
+        assert_eq!(program_of(l2), mainnet::PROGRAM_NEXT.identities);
+        // Head, source, inbox cursor, DA, withdrawal roots and escrow stay.
+        assert_eq!(l2.head(), before.head());
+        assert_eq!(l2.frozen_source(), before.frozen_source());
+        assert_eq!(l2.consumed(), before.consumed());
+        assert_eq!(l2.data_availability().iter().filter(|r| r.l2_number == 2).count(), 1);
+        assert_eq!(l2.withdrawal_roots(), before.withdrawal_roots());
+        assert_eq!(l2.escrow_sat(), before.escrow_sat());
+        assert!(l2.next_program_active());
+
+        // The proof in flight is dead, by its pin and before any proof check.
+        assert!(l2.names_another_program(&in_flight));
+        assert_eq!(l2.validate_async(&in_flight, &ProofDouble), Err(Reject::Policy));
+        let mut copy = l2.clone();
+        assert_eq!(copy.apply(&in_flight, parent, 35, true, &ProofDouble), Err(Reject::Policy));
+        assert_eq!(&copy, l2, "a refusal changes nothing");
+
+        // The rebuilt proof differs from it in the four program pins only.
+        let rebuilt = with_tree(to_v3(settlement(&swapped, empty), minted, 0));
+        assert!(!l2.names_another_program(&rebuilt));
+        let moved: Vec<usize> = (0..in_flight.statement.len()).filter(|i| in_flight.statement[*i] != rebuilt.statement[*i]).collect();
+        assert!(moved.iter().all(|i| (S + 96..S + 224).contains(i)), "only identities 3 to 6 move: {moved:?}");
+        let s4 = {
+            let _gate = crate::params::l2_next_program_test::open();
+            apply(&swapped, 65, &[PosTransaction::L2SettlementAsync(Box::new(rebuilt))], &mut chains).unwrap()
+        };
+        let l2 = s4.l2_settlement().unwrap();
+        assert_eq!(l2.settled_number(), 2);
+        let (head_n1, statement) = l2.head().unwrap();
+        assert_eq!(statement[S + 224..S + 256], head_n, "the commitment chain runs across the swap");
+        assert!(l2.data_availability().iter().all(|r| r.l2_number > 2), "the settled block's record goes");
+        assert_eq!(l2.consumed(), 1, "the deposit minted once");
+
+        // The rollback: a proof of the sparse guest in flight dies the same way.
+        let s5 = {
+            let _gate = crate::params::l2_next_program_test::open();
+            apply(&s4, 66, &[], &mut chains).unwrap()
+        };
+        let sparse = with_tree(to_v3(settlement(&s5, empty), no_deposits(), 0));
+        let back = {
+            let _gate = crate::params::l2_next_program_test::open();
+            let _rollback = crate::params::l2_next_program_test::open_rollback();
+            apply(&s5, 3 * crate::params::SLOTS_PER_EPOCH, &[], &mut chains).unwrap()
+        };
+        let l2 = back.l2_settlement().unwrap();
+        assert_eq!(program_of(l2), mainnet::PROGRAM_FALLBACK.identities);
+        assert_eq!(l2.validate_async(&sparse, &ProofDouble), Err(Reject::Policy));
+        let complete = with_tree(to_v3(settlement(&back, empty), no_deposits(), 0));
+        let s6 = {
+            let _gate = crate::params::l2_next_program_test::open();
+            let _rollback = crate::params::l2_next_program_test::open_rollback();
+            apply(&back, 97, &[PosTransaction::L2SettlementAsync(Box::new(complete))], &mut chains).unwrap()
+        };
+        let l2 = s6.l2_settlement().unwrap();
+        assert_eq!(l2.settled_number(), 3);
+        assert_eq!(l2.head().unwrap().1[S + 224..S + 256], head_n1);
+        assert_eq!(l2.withdrawal_head().1, 3, "the tree of the first program is still the tree");
+        assert!(l2.next_program_active(), "a rollback keeps the rules");
+        assert!(l2.escrow_conserved());
+    }
+
+    /// A claim, and an attestation signed before the gate, spend across it: the
+    /// attestors sign a withdrawal root and no program, and the proof is a Merkle
+    /// path to a record the swap keeps.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn a_claim_signed_before_the_gate_applies_after_the_swap_and_the_rollback() {
+        let leaves = [([1; 32], 150 * BLCH), ([2; 32], 5 * BLCH)];
+        let pre = attested_fixture(&leaves, true);
+        let tx = claim_of(&pre, &leaves, 0, Some(attest(&leaves, &[0, 1])));
+        for program in [None, Some(mainnet::PROGRAM_NEXT), Some(mainnet::PROGRAM_FALLBACK)] {
+            let mut state = pre.clone();
+            if let Some(program) = &program {
+                state.l2_settlement.as_mut().unwrap().replace_program_for_test(program);
+            }
+            assert_eq!(state.l2_withdraw_claim_refusal(&tx), None);
+            let post = try_claim(&state, &tx).expect("the claim applies");
+            let l2 = post.l2_settlement().unwrap();
+            assert_eq!(l2.released_sat(), u128::from(150 * BLCH));
+            assert!(l2.claimed().contains(0) && l2.escrow_conserved());
+        }
+    }
+
+    /// The gate never refuses a claim the old rule admitted, so nothing admitted
+    /// to a mempool below the gate turns invalid at it. The reverse does not hold,
+    /// which is why a rollback keeps the next rule.
+    #[test]
+    fn the_next_release_rule_only_adds_to_the_old_one() {
+        let mut widened = false;
+        for cap in [0u128, 1, 10, 1_000] {
+            for released in [0u128, 1, 9, 10, 11, 1_000, 1_001] {
+                for sats in [0u64, 1, 10, 11, 1_000, 5_000] {
+                    for exempt in [false, true] {
+                        let window = wd::ReleaseWindow { window: 1, released, cap };
+                        let (old, new) = (window.admits_v1(sats, exempt), window.admits(sats, exempt));
+                        assert!(!old || new, "{released} {cap} {sats} {exempt}");
+                        widened |= new && !old;
+                    }
+                }
+            }
+        }
+        assert!(widened);
+    }
+
+    #[test]
+    fn the_release_rule_stays_after_a_rollback() {
+        let mut l2 = mainnet_l2_state();
+        assert!(!l2.next_program_active());
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        assert!(l2.next_program_active());
+        l2.replace_program_for_test(&mainnet::PROGRAM_FALLBACK);
+        assert!(l2.next_program_active());
+    }
+
+    /// A real proof of the fallback guest against its pin, with
+    /// BLOCH_FALLBACK_VALUES and BLOCH_FALLBACK_PROOF naming settler-format files.
+    #[test]
+    #[ignore = "needs a real proof of the fallback program"]
+    fn fallback_program_real_groth16_passes_the_native_verifier() {
+        let values = std::fs::read(std::env::var_os("BLOCH_FALLBACK_VALUES").unwrap()).unwrap();
+        let proof = std::fs::read(std::env::var_os("BLOCH_FALLBACK_PROOF").unwrap()).unwrap();
+        let fallback = mainnet::PROGRAM_FALLBACK;
+        assert!(bloch_l2_proof::verify(&fallback.proof_policy, &fallback.identities[3], &values, &proof));
+        assert!(!bloch_l2_proof::verify(&fallback.proof_policy, &mainnet::PROGRAM_NEXT.identities[3], &values, &proof));
+    }
+
     // ── The optional head reset (owner decision; `mainnet::HEAD_RESET` is `None`) ──
 
     #[test]

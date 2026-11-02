@@ -1027,20 +1027,58 @@ pub mod mainnet {
         pub identities: [[u8; 32]; 4],
         pub proof_policy: [u8; 32],
     }
-    /// `settlement_v3_mainnet` of bloch-l2-evm `codex/l2-next-consensus-r3-20261031`
-    /// 776c6cb: guest ELF SHA-256 `44d4c9d7…ce47` (3 076 992 bytes, macOS x86_64).
+    /// `settlement_v3_mainnet_sparse` of bloch-l2-evm
+    /// `codex/sparse-witness-r4-20261101`: the sparse witness under the next
+    /// rules, guest ELF SHA-256 `75b9c635…418e` (3 216 728 bytes). The state
+    /// transition and the statement bytes are those of the complete witness.
     /// The configuration carries a PLACEHOLDER fee-sweep recipient, `TBD-owner`,
-    /// so these four values change once the recipient is fixed.
+    /// and the guest is a candidate, so these values are examples until
+    /// [`PROGRAM_NEXT_FINAL`] says otherwise.
     pub const PROGRAM_NEXT: NextProgram = NextProgram {
+        identities: [
+            h32("975ec2585246abeaea86421dd5726918b632dd91a246f635fe74990b68bcd878"),
+            h32("54d264b8969845b82b3c8d0cec54562567ab7ee6f59dae7e2678c7d9e848c011"),
+            h32("5f802b085c7520f54383ee604e867d4d327a0d554388ca79254748973cf6c126"),
+            h32("00bf00561171d483d61c1f7304e867d4d64f41aab0e2329e52a3a44bbcf6c126"),
+        ],
+        // The wrapper VK and the V3 tag are unchanged, so the policy is too.
+        proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
+    };
+    /// The program a rollback installs at [`crate::params::L2_PROGRAM_ROLLBACK_EPOCH`]:
+    /// `settlement_v3_mainnet` of bloch-l2-evm `codex/l2-next-consensus-r3-20261031`
+    /// 776c6cb, the complete witness under the same rules, guest ELF SHA-256
+    /// `44d4c9d7…ce47` (3 076 992 bytes).
+    ///
+    /// It must keep the configuration of [`PROGRAM_NEXT`], which the assert below
+    /// pins: the swap to the next rules is one-way on the L2, because blocks under
+    /// them hold the vault code, so [`PROGRAM`] cannot prove any successor of such
+    /// a block. A rollback changes which guest proves the rules, never the rules.
+    pub const PROGRAM_FALLBACK: NextProgram = NextProgram {
         identities: [
             h32("975ec2585246abeaea86421dd5726918b632dd91a246f635fe74990b68bcd878"),
             h32("f3c20f71b84bb09cbab76a75c83a62c507fbefff4b347f787ef2d89aceb6f2b8"),
             h32("50bd69a513f2463e748a8a62277bc25a08df69a4420a660e2a2ee3f957dca9f7"),
             h32("00a17ad34a4fc918fba454531277bc25a11bed3490829983951771fcd7dca9f7"),
         ],
-        // The wrapper VK and the V3 tag are unchanged, so the policy is too.
         proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
     };
+    /// Whether the fee-sweep recipient is final and the two programs above are
+    /// the reproducible release guests. An armed gate refuses to compile until
+    /// this is true (`hard_forks::l2_program_may_arm`).
+    pub const PROGRAM_NEXT_FINAL: bool = false;
+
+    const fn same_hash(a: &[u8; 32], b: &[u8; 32]) -> bool {
+        let mut i = 0;
+        while i < 32 {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    const _: () = assert!(same_hash(&PROGRAM_NEXT.identities[0], &PROGRAM_FALLBACK.identities[0]));
+    const _: () = assert!(same_hash(&PROGRAM_NEXT.proof_policy, &PROGRAM_FALLBACK.proof_policy));
 
     /// OPTION, an owner decision, absent by default: a one-time reset of the
     /// settled L2 head, applied by [`super::State::install_next_program`] in the
@@ -1063,6 +1101,10 @@ pub mod mainnet {
     }
     /// `None`: the release ships no reset and the swap changes the program only.
     pub const HEAD_RESET: Option<HeadReset> = None;
+    /// The same option for the rollback, applied with it. Names the last block
+    /// before what the misbehaving guest settled; an emergency release fills it
+    /// only when that guest settled a block the rules do not give.
+    pub const ROLLBACK_HEAD_RESET: Option<HeadReset> = None;
 
     /// The L2 program and genesis the activation pins: the seven V2
     /// identities (Genesis-4 admission domain, native genesis, L2 domain,
@@ -1585,6 +1627,52 @@ impl State {
             }
         }
     }
+    /// Roll the program back at the compiled gate: from [`mainnet::PROGRAM_NEXT`]
+    /// to [`mainnet::PROGRAM_FALLBACK`], which proves the same rules. Head, inbox,
+    /// frozen source, claims and window stay, and a proof of the replaced guest
+    /// gets [`Reject::Policy`], as at the swap. Acts only on the exact policy the
+    /// swap installed, so it runs once, after the swap, and on no other L2.
+    pub(crate) fn install_fallback_program(&mut self) {
+        let Some(pinned) = mainnet::PROGRAM else { return };
+        if self.policy.identities[2] == pinned.identities[2]
+            && self.policy.identities[3..7] == mainnet::PROGRAM_NEXT.identities
+            && self.policy.proof_policy == mainnet::PROGRAM_NEXT.proof_policy
+        {
+            self.replace_program(&mainnet::PROGRAM_FALLBACK);
+            if let Some(reset) = mainnet::ROLLBACK_HEAD_RESET.as_ref() {
+                self.reset_head(reset);
+            }
+        }
+    }
+    /// The program changes this L2 will see, in order, as `(epoch, program)`.
+    /// Empty while the gates are inert and on any other L2. A settler reads it to
+    /// stop starting proofs that cannot land before the gate. Not a consensus input.
+    pub fn program_schedule(&self) -> Vec<(u64, mainnet::NextProgram)> {
+        self.program_schedule_from(crate::params::L2_NEXT_PROGRAM_EPOCH, crate::params::L2_PROGRAM_ROLLBACK_EPOCH)
+    }
+    fn program_schedule_from(&self, next: u64, rollback: u64) -> Vec<(u64, mainnet::NextProgram)> {
+        let Some(pinned) = mainnet::PROGRAM else { return Vec::new() };
+        if self.policy.identities[2] != pinned.identities[2] || self.policy.proof_policy != pinned.proof_policy {
+            return Vec::new();
+        }
+        let activated = self.policy.identities[3..7] == pinned.identities[3..7];
+        let swapped = self.policy.identities[3..7] == mainnet::PROGRAM_NEXT.identities;
+        let mut schedule = Vec::new();
+        if activated && next != u64::MAX {
+            schedule.push((next, mainnet::PROGRAM_NEXT));
+        }
+        if (activated || swapped) && rollback != u64::MAX {
+            schedule.push((rollback, mainnet::PROGRAM_FALLBACK));
+        }
+        schedule
+    }
+    /// Whether `tx` proves another program than the one this L2 holds. It can
+    /// never settle here. No proof is checked, so this costs next to nothing.
+    pub fn names_another_program(&self, tx: &Transaction) -> bool {
+        tx.proof_policy != self.policy.proof_policy
+            || tx.statement.len() < S + 7 * 32
+            || (3..7).any(|i| h(&tx.statement, S + i * 32) != self.policy.identities[i])
+    }
     /// Move the settled head back to `reset`: the inbox cursor returns to what
     /// that block had consumed, so its deposits mint again on the new chain, and
     /// withdrawal roots of later blocks are forgotten. Escrow, deposits, claims
@@ -1625,6 +1713,11 @@ impl State {
         self.policy.identities[3..7].copy_from_slice(&next.identities);
         self.policy.proof_policy = next.proof_policy;
     }
+    /// Test hook: the schedule under gates other than the compiled ones.
+    #[cfg(test)]
+    pub(crate) fn program_schedule_for_test(&self, next: u64, rollback: u64) -> Vec<(u64, mainnet::NextProgram)> {
+        self.program_schedule_from(next, rollback)
+    }
     /// Test hook: mark a leaf as claimed without a claim.
     #[cfg(test)]
     pub(crate) fn claimed_insert_for_test(&mut self, index: u64) {
@@ -1641,10 +1734,11 @@ impl State {
     pub(crate) fn replace_program_for_test(&mut self, next: &mainnet::NextProgram) {
         self.replace_program(next);
     }
-    /// Whether the next program's release rule applies. The rule follows from
-    /// the committed policy, so it adds no state bytes.
+    /// Whether the next rules hold, and with them the next release rule. It
+    /// follows from the committed configuration, so it adds no state bytes and
+    /// survives a rollback, which changes the guest and not the rules.
     pub fn next_program_active(&self) -> bool {
-        self.policy.identities[4] == mainnet::PROGRAM_NEXT.identities[1]
+        self.policy.identities[3] == mainnet::PROGRAM_NEXT.identities[0]
     }
     /// The release window a claim in the next native block sees.
     pub fn release_window(&self) -> withdrawal::ReleaseWindow {

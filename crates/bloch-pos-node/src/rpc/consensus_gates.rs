@@ -43,6 +43,8 @@ const HARD_FORK_KEYS: &[(&str, Option<&str>)] = &[
     ("params::HF3_SLH_SUITE_EPOCH", Some("hf3_slh")),
     ("params::HF3_PQ_MIGRATION_EPOCH", Some("hf3_pq_migration")),
     ("params::LATTICE_EMERGENCY_ACTIVATION_EPOCH", Some("hf3_lattice_emergency")),
+    ("params::L2_NEXT_PROGRAM_EPOCH", Some("l2_next_program")),
+    ("params::L2_PROGRAM_ROLLBACK_EPOCH", Some("l2_program_rollback")),
 ];
 
 /// The RPC key for a gate. A gate added to `HARD_FORK_GATES` by a later
