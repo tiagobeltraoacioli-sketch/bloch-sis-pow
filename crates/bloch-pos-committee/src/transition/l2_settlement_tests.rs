@@ -3116,6 +3116,26 @@ mod l2_tests {
         assert!(l2.escrow_conserved());
     }
 
+    /// The boundary rolls before a block's transactions, so already the first
+    /// block of the new epoch refuses the old program and takes the new one.
+    #[test]
+    fn the_first_block_past_the_gate_takes_only_the_new_program() {
+        let (opened, mut chains) = swap_fixture();
+        let s1 = apply(&opened, 33, &[], &mut chains).unwrap();
+        let empty = crate::l2_settlement::expected_body_commitment(&[]);
+        let old = to_v3(settlement(&s1, empty), no_deposits(), 0);
+        let mut new = old.clone();
+        for (i, id) in mainnet::PROGRAM_NEXT.identities.iter().enumerate() {
+            new.statement[S + (3 + i) * 32..S + (4 + i) * 32].copy_from_slice(id);
+        }
+        let (old, new) = (PosTransaction::L2SettlementAsync(Box::new(old)), PosTransaction::L2SettlementAsync(Box::new(new)));
+        let _gate = crate::params::l2_next_program_test::open();
+        let post = refuse_then_apply(&s1, 2 * crate::params::SLOTS_PER_EPOCH, &[old], 0, &[new], &mut chains);
+        let l2 = post.l2_settlement().unwrap();
+        assert_eq!(l2.settled_number(), 1);
+        assert_eq!(program_of(l2), mainnet::PROGRAM_NEXT.identities);
+    }
+
     /// A claim, and an attestation signed before the gate, spend across it: the
     /// attestors sign a withdrawal root and no program, and the proof is a Merkle
     /// path to a record the swap keeps.
