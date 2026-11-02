@@ -416,7 +416,7 @@ fn a_registration_ahead_of_the_head_is_retryable_not_terminal() {
     let tx = registration(&engine, 0, 0x11);
 
     // First slot of the opening epoch: open by the wall clock, not by the head.
-    let first = first_slot_of_epoch(gate);
+    let first = first_slot_of_epoch(gate).expect("the gate epoch has a first slot");
     {
         let _clock = validator_lifecycle::clock_at(first);
         match engine.on_transaction(tx.clone()) {
