@@ -18321,8 +18321,8 @@ mod l2_brake_engine_tests {
         let epoch = epoch_of(engine.wall_slot());
         assert_eq!(engine.select_transactions(epoch), vec![tx.clone()], "unbraked: the proof is proposed alone");
         engage(&engine, &dir, &sk, true);
-        // The file is re-read at most once per slot: this slot already read "no file".
-        assert_eq!(engine.select_transactions(epoch), vec![tx.clone()], "same slot: not yet re-read");
+        // The file is re-read at most once per slot (unit-tested in l2_brake with
+        // fixed slots); here the wall clock moves, so force the next slot's read.
         engine.l2_brake.refresh(engine.wall_slot() + 1, epoch, engine.state.admission_network_domain(), Some(700_771));
         assert!(!engine.select_transactions(epoch).contains(&tx), "braked: not proposed");
         assert_eq!(engine.mempool.len(), 1, "kept in the mempool, not dropped or barred");
