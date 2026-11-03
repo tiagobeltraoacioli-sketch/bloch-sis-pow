@@ -74,8 +74,8 @@
         assert_eq!(l2.forced_inclusion_program(), listed);
         assert_eq!(l2.enable_forced_inclusion(), listed && l2.user_transactions() && l2.asynchronous());
         // The fallback keeps the next rules; it implements forced inclusion only
-        // if its configuration is listed (today it is not, so a rollback cannot
-        // be armed with forced inclusion: `hard_forks::l2_forced_rollback_may_arm`).
+        // if its configuration is listed (it is since agent 216's guest, so a
+        // rollback may be armed with forced inclusion).
         l2.replace_program_for_test(&mainnet::PROGRAM_FALLBACK);
         assert!(l2.next_program_active());
         assert_eq!(
@@ -851,17 +851,23 @@
         (255, 1, 1_024_000),
     ];
 
-    /// R1 at run time: after a rollback to a fallback guest that is not listed,
-    /// no new record is taken (the arming rule already forbids the combination).
+    /// R1 closed (agent 216): the fallback guest implements forced inclusion,
+    /// so its configuration is the listed next one and a rollback keeps the
+    /// queue working: records queued before the rollback stay due and new ones
+    /// are taken. The run-time refusal for an unlisted fallback stays in place
+    /// for any later pin that would drop the rule (the compile-time assert
+    /// in `mainnet` now forbids such a pin).
     #[test]
-    fn an_unlisted_fallback_takes_no_new_forced_record() {
+    fn the_listed_fallback_keeps_taking_forced_records() {
         let mut l2 = mainnet_l2_state();
         l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
         assert!(l2.enable_forced_inclusion_for_test());
         l2.queue_forced(MAINNET_CHAIN_ID, [1; 32], &envelope(1), forced::MIN_GAS).unwrap();
         l2.replace_program_for_test(&mainnet::PROGRAM_FALLBACK);
-        assert!(!l2.forced_inclusion_program());
+        assert_eq!(mainnet::PROGRAM_FALLBACK.identities[0], mainnet::PROGRAM_NEXT.identities[0]);
+        assert!(l2.forced_inclusion_program());
+        assert!(l2.next_program_active());
         let before = l2.clone();
-        assert_eq!(l2.queue_forced(MAINNET_CHAIN_ID, [2; 32], &envelope(2), forced::MIN_GAS), Err(forced::Refusal::NotActive));
-        assert_eq!(l2, before);
+        l2.queue_forced(MAINNET_CHAIN_ID, [2; 32], &envelope(2), forced::MIN_GAS).unwrap();
+        assert_ne!(l2, before);
     }
