@@ -4826,4 +4826,6 @@ mod l2_tests {
             assert!(l2.window_exempt(true), "a real attestation would be exempt");
         }
     }
+
+    include!("l2_revenue_tests.rs");
 }

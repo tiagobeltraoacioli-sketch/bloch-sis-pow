@@ -13,7 +13,7 @@ use crate::{
 };
 use bloch_pos_committee::attestation::SignatureVerifier;
 use bloch_pos_committee::{
-    fee_market,
+    fee_market, l2_revenue,
     l2_settlement::withdrawal::{self, TREE_DEPTH},
     transition::{
         funded::{ADMISSION_PQ_KEY_BYTES, ADMISSION_PQ_SIGNATURE_MAX},
@@ -28,7 +28,7 @@ const HELP: &str = "Native L2 withdrawal claim: release one settled L2 withdrawa
 
 prepare --genesis FILE --funding-pubkey HEX_FILE --input TXID:VOUT:SAT [--input ...]
         --proof JSON_FILE --base-fee MILLISAT_PER_GAS --tip MILLISAT_PER_GAS
-        [--attestors SET_FILE --attestation PARTIAL [--attestation ...]] --out FILE
+        [--attestors SET_FILE --attestation PARTIAL [--attestation ...]] [--epoch EPOCH] --out FILE
 inspect --tx FILE
 sign --genesis TRUSTED_FILE --tx FILE --dir KEYSTORE_DIR --out NEW_FILE
 
@@ -55,7 +55,10 @@ withdrawals.large_delay_blocks (use withdrawals.claimable_large). Each release w
 withdrawals.release_window.cap_sat; a claim that does not fit is refused and
 fits a later window (the first claim of a window is always admitted).
 The funding inputs pay the fee and the rest returns as change to the funding
-key; the recipient output is exactly the withdrawn sats. Consensus requires
+key; the recipient output is exactly the withdrawn sats, or, from the L2
+protocol-fee gate (getchaininfo hard_forks.l2_revenue), the withdrawn sats less
+the protocol fee (5 bps, floor 0.00005 BLCH, cap 1 BLCH; paid to the treasury
+as output 2). --epoch (the including block's epoch) is then required. Consensus requires
 exact conservation at the including block's base fee (getchaininfo
 next_base_fee_millisat_per_gas). The network's L2 must admit it (getl2settlement profile): a development
 genesis on a devnet-l2-user-txs build, or a network past its L2 flag day.";
@@ -247,7 +250,7 @@ fn attest(args: &[String]) -> Result<(), String> {
 fn prepare(args: &[String]) -> Result<(), String> {
     let o = options(
         args,
-        &["--genesis", "--funding-pubkey", "--input", "--proof", "--base-fee", "--tip", "--attestors", "--attestation", "--out"],
+        &["--genesis", "--funding-pubkey", "--input", "--proof", "--base-fee", "--tip", "--attestors", "--attestation", "--epoch", "--out"],
     )?;
     let funding_pubkey = codec::unhex(read_text(get(&o, "--funding-pubkey")?)?.trim())?;
     let mut inputs = Vec::new();
@@ -266,6 +269,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
     let proof = parse_proof(&read_text(get(&o, "--proof")?)?)?;
     let base_fee: u128 = get(&o, "--base-fee")?.parse().map_err(|_| "bad --base-fee")?;
     let tip: u128 = get(&o, "--tip")?.parse().map_err(|_| "bad --tip")?;
+    let protocol_fee = crate::l2_deposit_cli::protocol_fee(&o, |epoch| l2_revenue::claim_fee_at_epoch(epoch, proof.sats))?;
     let owner: [u8; 32] = Sha3_256::digest(&funding_pubkey).into();
     let network_domain = domain(get(&o, "--genesis")?)?;
     let attestation = match get(&o, "--attestors") {
@@ -306,7 +310,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
         l1_recipient: proof.l1_recipient,
         sats: proof.sats,
         siblings: proof.siblings,
-        release: TransferOutput { value: proof.sats, script_hash: proof.l1_recipient },
+        release: TransferOutput { value: proof.sats - protocol_fee, script_hash: proof.l1_recipient },
         change: TransferOutput { value: 0, script_hash: owner },
         tx_bytes: 0,
         tip_millisat_per_gas: tip,
@@ -319,6 +323,9 @@ fn prepare(args: &[String]) -> Result<(), String> {
     let change = total.checked_sub(charge.base_fee_sat + charge.priority_fee_sat).ok_or("inputs do not cover the fee")?;
     tx.change.value = u64::try_from(change).map_err(|_| "change exceeds u64")?;
     println!("  proven root    : {}", codec::hex32(&proof.root));
+    if protocol_fee > 0 {
+        println!("  protocol fee   : {protocol_fee} sat to the L2 treasury (output 2); the recipient receives {} sat", tx.release.value);
+    }
     inspect(&tx);
     write_tx(get(&o, "--out")?, &tx)
 }
