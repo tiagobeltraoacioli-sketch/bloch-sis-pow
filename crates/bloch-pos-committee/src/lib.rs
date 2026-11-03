@@ -147,6 +147,7 @@ pub mod slashing;
 pub mod derive;
 pub mod transition;
 pub mod l2_settlement;
+pub mod l2_revenue;
 pub mod ws;
 pub mod wire_alloc;
 pub mod hard_forks;

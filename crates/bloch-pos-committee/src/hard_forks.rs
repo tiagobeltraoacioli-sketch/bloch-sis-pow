@@ -54,6 +54,8 @@ pub enum Fork {
     L2Program,
     /// The reserved DA slot of the registered L2 DA key, on no HF line.
     L2DataAvailability,
+    /// The L2 protocol fee on deposits and claims (L1 only), on no HF line.
+    L2Revenue,
 }
 
 /// One activation gate of the HF1/HF2/HF3 lines.
@@ -110,6 +112,8 @@ pub const HARD_FORK_GATES: &[HardForkGate] = &[
     gate!(L2DataAvailability, params::L2_DA_RESERVED_SLOT_EPOCH, false),
     // L1 forced inclusion of L2 transactions: inert, outside `RELEASE_ARMABLE`.
     gate!(L2Program, params::L2_FORCED_INCLUSION_EPOCH, false),
+    // The L2 protocol fee: inert, outside `RELEASE_ARMABLE`.
+    gate!(L2Revenue, params::L2_REVENUE_EPOCH, false),
 ];
 
 /// Gates that no scheduled release may arm (owner scope 2026-10-20: nothing
@@ -179,6 +183,29 @@ pub const fn l2_da_reserved_slot_may_arm(epoch: u64, key: Option<[u8; 32]>) -> b
 /// that guest (the same epoch is allowed: the swap runs first in `close_epoch`).
 pub const fn l2_forced_inclusion_may_arm(forced: u64, next: u64, configured: bool) -> bool {
     !armed(forced) || (configured && armed(next) && forced >= next)
+}
+
+/// The L2 protocol fee is inert, or it has a treasury (a real script hash, not
+/// zero) and comes strictly after the first KES period, like the program swap,
+/// so it never shares a boundary with the KES bind. It may share the swap's
+/// epoch: it changes no L2 rule.
+pub const fn l2_revenue_may_arm(revenue: u64, kes_enforcement: u64, treasury: Option<[u8; 32]>) -> bool {
+    if !armed(revenue) {
+        return true;
+    }
+    let has_treasury = match treasury {
+        Some(t) => {
+            let mut i = 0;
+            let mut nonzero = false;
+            while i < 32 {
+                nonzero |= t[i] != 0;
+                i += 1;
+            }
+            nonzero
+        }
+        None => false,
+    };
+    has_treasury && armed(kes_enforcement) && revenue > kes_enforcement.saturating_add(L2_PROGRAM_MIN_EPOCHS_AFTER_KES)
 }
 
 /// The ordering rules between all HF1/HF2/HF3 gates (see the module docs).
@@ -253,6 +280,11 @@ const _: () = assert!(l2_forced_inclusion_may_arm(
     params::L2_FORCED_INCLUSION_EPOCH,
     params::L2_NEXT_PROGRAM_EPOCH,
     !crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS.is_empty(),
+));
+const _: () = assert!(l2_revenue_may_arm(
+    params::L2_REVENUE_EPOCH,
+    params::HF3_KES_ENFORCE_EPOCH,
+    crate::l2_revenue::TREASURY_SCRIPT_HASH,
 ));
 // The P5a alias must follow the HF2 release switch.
 const _: () = assert!(params::NATIVE_SLASHING_ACTIVATION_EPOCH == params::HF2_SLASHING_V2_EPOCH);
@@ -377,6 +409,29 @@ mod tests {
         // At or after the swap with a listed guest: allowed.
         assert!(l2_forced_inclusion_may_arm(10_060, 10_060, true));
         assert!(l2_forced_inclusion_may_arm(11_320, 10_060, true));
+    }
+
+    #[test]
+    fn the_l2_revenue_fee_ships_inert_and_needs_a_treasury_after_kes() {
+        let g = HARD_FORK_GATES.iter().find(|g| g.name == "params::L2_REVENUE_EPOCH").expect("listed");
+        assert_eq!(g.fork, Fork::L2Revenue);
+        assert!(!g.armed() && !g.node_policy_only);
+        assert!(!RELEASE_ARMABLE.contains(&"params::L2_REVENUE_EPOCH"));
+        assert_eq!(params::L2_REVENUE_EPOCH, M);
+        assert_eq!(crate::l2_revenue::TREASURY_SCRIPT_HASH, None, "TBD-owner");
+        let kes = params::HF3_KES_ENFORCE_EPOCH;
+        let after = kes + L2_PROGRAM_MIN_EPOCHS_AFTER_KES + 1;
+        // Inert is always coherent.
+        assert!(l2_revenue_may_arm(M, kes, None));
+        // No treasury, or the zero hash: refused.
+        assert!(!l2_revenue_may_arm(after, kes, None));
+        assert!(!l2_revenue_may_arm(after, kes, Some([0; 32])));
+        // At or before the first KES period, or without KES: refused.
+        for gate in [0, kes, kes + L2_PROGRAM_MIN_EPOCHS_AFTER_KES] {
+            assert!(!l2_revenue_may_arm(gate, kes, Some([7; 32])), "{gate}");
+        }
+        assert!(!l2_revenue_may_arm(10_000, M, Some([7; 32])));
+        assert!(l2_revenue_may_arm(after, kes, Some([7; 32])));
     }
 
     #[test]

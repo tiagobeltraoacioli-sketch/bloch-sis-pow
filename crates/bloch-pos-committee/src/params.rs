@@ -2757,6 +2757,41 @@ pub(crate) fn l2_forced_inclusion_active(epoch: u64) -> bool {
     epoch_gate_active(epoch, L2_FORCED_INCLUSION_EPOCH)
 }
 
+/// CANDIDATE, not scheduled: the epoch from which L1 charges the L2 protocol
+/// fee (`l2_revenue`): a fee on every L2 deposit (0x14), paid from the
+/// depositor's inputs, and a fee on every withdrawal claim (0x16), taken from
+/// the release. Both go to one compiled treasury output; nothing is burned.
+/// `u64::MAX` means INERT. It cannot be armed while
+/// `l2_revenue::TREASURY_SCRIPT_HASH` is `None`, nor at or before the first KES
+/// period (`hard_forks::l2_revenue_may_arm`). It changes no L2 rule.
+pub const L2_REVENUE_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn l2_revenue_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_revenue_test::forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_REVENUE_EPOCH)
+}
+
+/// Public view for tooling (the offline CLIs): whether a block in `epoch`
+/// charges the L2 protocol fee on this build.
+pub fn l2_revenue_active_at(epoch: u64) -> bool {
+    l2_revenue_active(epoch)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_revenue_test {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod l2_forced_inclusion_test {
     use std::cell::Cell;
