@@ -491,7 +491,8 @@ pub fn combine(
     if cp.version != ws::WS_FORMAT_VERSION {
         return Err(CombineReject::WrongVersion { got: cp.version });
     }
-    if cp.signer_set_id == ws::WS_GENESIS_SIGNER_SET_ID || set.id == ws::WS_GENESIS_SIGNER_SET_ID {
+    if cp.signer_set_id == ws::WS_GENESIS_SIGNER_SET_ID || set.id == ws::WS_GENESIS_SIGNER_SET_ID
+        || cp.signer_set_id == WS_OPERATOR_TRUSTED_SIGNER_SET_ID || set.id == WS_OPERATOR_TRUSTED_SIGNER_SET_ID {
         return Err(CombineReject::ReservedSignerSet);
     }
     if cp.signer_set_id != set.id {
@@ -626,12 +627,50 @@ pub fn save_latest(dir: &Path, cp: &WeakSubjectivityCheckpoint) -> io::Result<()
 // Boot
 // ---------------------------------------------------------------------------
 
+/// Reserved `signer_set_id` of an operator-trusted checkpoint: the Ethereum
+/// model, where no one signs anything and the operator who boots a fresh
+/// node decides which finalized root is real (Prysm/Teku
+/// `--weak-subjectivity-checkpoint`, Lighthouse `--checkpoint-sync-url`).
+/// No arrangement may claim this id, so such a checkpoint can never be
+/// mistaken for, or combined into, a signed envelope.
+pub const WS_OPERATOR_TRUSTED_SIGNER_SET_ID: u32 = u32::MAX;
+
+/// Where an unsigned, operator-trusted checkpoint comes from.
+#[derive(Debug, Clone)]
+pub enum TrustedSource {
+    /// `--ws-trusted-checkpoint <file>`: the artifact `ws-checkpoint
+    /// --operator-trusted` derives from several RPC endpoints.
+    File(PathBuf),
+    /// `--checkpoint-sync-url`: fetched at boot from the operator's nodes
+    /// ([`crate::ws_tool::fetch_trusted_checkpoint`]).
+    Fetched(WeakSubjectivityCheckpoint),
+}
+
+/// An unsigned checkpoint the operator vouches for. `block_root`, when given
+/// (`--ws-trusted-root`), is the root the operator compared through a SECOND,
+/// independent channel (an explorer, another operator); the checkpoint must
+/// name exactly it. Optional, as Ethereum's `--wss-checkpoint` is.
+#[derive(Debug, Clone)]
+pub struct TrustedCheckpoint {
+    pub source: TrustedSource,
+    pub block_root: Option<[u8; 32]>,
+}
+
 /// CLI-supplied weak-subjectivity inputs.
+#[derive(Default)]
 pub struct WsConfig {
     pub checkpoint: Option<PathBuf>,
     pub signer_set: Option<PathBuf>,
     /// Independently obtained SHA3-256 of the complete BPOSWSS1 file bytes.
     pub signer_set_sha3: Option<[u8; 32]>,
+    /// `--ws-trusted-checkpoint` [+ `--ws-trusted-root`]: the unsigned path.
+    pub trusted: Option<TrustedCheckpoint>,
+    /// `--checkpoint-sync-url <host:port>[,...]`: the friction-free unsigned
+    /// path. Consulted ONLY when this node lacks fresh finality of its own
+    /// (a new node, or one offline for weeks); a running node never needs it.
+    pub checkpoint_sync: Vec<String>,
+    /// `--ws-trusted-root` given together with `--checkpoint-sync-url`.
+    pub checkpoint_sync_pin: Option<[u8; 32]>,
 }
 
 impl WsConfig {
@@ -639,11 +678,15 @@ impl WsConfig {
         let mut checkpoint = None;
         let mut signer_set = None;
         let mut pin = None;
+        let mut trusted_file = None;
+        let mut trusted_root = None;
+        let mut sync_urls = None;
         let mut index = 0;
         while index < args.len() {
             if args[index] == "--" {
                 if args[index + 1..].iter().any(|arg| matches!(arg.as_str(),
-                    "--ws-checkpoint" | "--ws-signer-set" | "--ws-signer-set-sha3")) {
+                    "--ws-checkpoint" | "--ws-signer-set" | "--ws-signer-set-sha3"
+                    | "--ws-trusted-checkpoint" | "--ws-trusted-root" | "--checkpoint-sync-url")) {
                     return Err("weak-subjectivity options must appear before `--`".into());
                 }
                 break;
@@ -652,6 +695,9 @@ impl WsConfig {
                 "--ws-checkpoint" => Some((&mut checkpoint, "--ws-checkpoint")),
                 "--ws-signer-set" => Some((&mut signer_set, "--ws-signer-set")),
                 "--ws-signer-set-sha3" => Some((&mut pin, "--ws-signer-set-sha3")),
+                "--ws-trusted-checkpoint" => Some((&mut trusted_file, "--ws-trusted-checkpoint")),
+                "--ws-trusted-root" => Some((&mut trusted_root, "--ws-trusted-root")),
+                "--checkpoint-sync-url" => Some((&mut sync_urls, "--checkpoint-sync-url")),
                 _ => None,
             };
             if let Some((slot, name)) = destination {
@@ -675,10 +721,34 @@ impl WsConfig {
             let bytes = crate::codec::unhex(&value).map_err(|error| format!("--ws-signer-set-sha3: {error}"))?;
             bytes.try_into().map_err(|_| "--ws-signer-set-sha3 requires exactly 32 bytes (64 hex characters)".to_string())
         }).transpose()?;
+        let mut checkpoint_sync = Vec::new();
+        for url in sync_urls.as_deref().unwrap_or("").split(',').map(str::trim).filter(|url| !url.is_empty()) {
+            if url.starts_with("https://") {
+                return Err("--checkpoint-sync-url takes a node RPC as host:port (plain HTTP); https is not supported".into());
+            }
+            checkpoint_sync.push(url.trim_start_matches("http://").trim_end_matches('/').to_string());
+        }
+        let block_root: Option<[u8; 32]> = trusted_root.map(|root| {
+            let bytes = crate::codec::unhex(&root).map_err(|error| format!("--ws-trusted-root: {error}"))?;
+            bytes.try_into().map_err(|_| "--ws-trusted-root requires exactly 32 bytes (64 hex characters)".to_string())
+        }).transpose()?;
+        let sources = usize::from(checkpoint.is_some()) + usize::from(trusted_file.is_some())
+            + usize::from(!checkpoint_sync.is_empty());
+        if sources > 1 {
+            return Err("--ws-checkpoint, --ws-trusted-checkpoint and --checkpoint-sync-url are alternatives; supply one".into());
+        }
+        if block_root.is_some() && trusted_file.is_none() && checkpoint_sync.is_empty() {
+            return Err("--ws-trusted-root compares a checkpoint: supply it with --checkpoint-sync-url or --ws-trusted-checkpoint".into());
+        }
+        let checkpoint_sync_pin = if checkpoint_sync.is_empty() { None } else { block_root };
+        let trusted = trusted_file.map(|path| TrustedCheckpoint { source: TrustedSource::File(PathBuf::from(path)), block_root });
         Ok(Self {
             checkpoint: checkpoint.map(PathBuf::from),
             signer_set: signer_set.map(PathBuf::from),
             signer_set_sha3,
+            trusted,
+            checkpoint_sync,
+            checkpoint_sync_pin,
         })
     }
 }
@@ -746,6 +816,83 @@ fn check_local_state(
     Ok(())
 }
 
+/// [`ws::accept`], except that two checkpoints naming the SAME finalized
+/// block and state at one epoch are one fact, not an equivocation, even when
+/// their digests differ because one is operator-trusted and the other signed
+/// (or issued at another time). Different roots stay a loud conflict.
+fn same_fact_accept(stored: &WeakSubjectivityCheckpoint, incoming: &WeakSubjectivityCheckpoint) -> Acceptance {
+    match ws::accept(Some(stored), incoming) {
+        Acceptance::Conflict
+            if incoming.block_root == stored.block_root && incoming.state_root == stored.state_root =>
+        {
+            Acceptance::Ignore
+        }
+        other => other,
+    }
+}
+
+/// Load and check an operator-trusted checkpoint. Nothing here is a
+/// signature: the trust is the operator's, exactly as on Ethereum. What the
+/// node still enforces is everything it CAN check by itself — the network,
+/// the genesis, the format, agreement with the root the operator compared
+/// independently, and agreement with any block it has already validated.
+/// Freshness, own-finality cross-check and anti-rollback run afterwards on
+/// the same path as a signed envelope.
+fn trusted_checkpoint(
+    trusted: &TrustedCheckpoint,
+    network_id: u32,
+    genesis_root: &[u8; 32],
+    genesis_anchor: &WeakSubjectivityCheckpoint,
+    local_state_root: &impl Fn(&[u8; 32]) -> Option<[u8; 32]>,
+    warnings: &mut Vec<String>,
+) -> io::Result<WeakSubjectivityCheckpoint> {
+    let bad = boot_refused;
+    let (cp, origin) = match &trusted.source {
+        TrustedSource::File(path) => {
+            let cp = decode_checkpoint(&fs::read(path)?)
+                .map_err(|e| bad(format!("{}: {e}", path.display())))?;
+            (cp, path.display().to_string())
+        }
+        TrustedSource::Fetched(cp) => (*cp, "--checkpoint-sync-url".to_string()),
+    };
+    if cp.version != ws::WS_FORMAT_VERSION {
+        return Err(bad(format!("{origin}: unsupported checkpoint version {}", cp.version)));
+    }
+    if cp.network_id != network_id || &cp.genesis_root != genesis_root {
+        return Err(bad(format!("{origin}: checkpoint belongs to a different network; refusing")));
+    }
+    if cp.signer_set_id != WS_OPERATOR_TRUSTED_SIGNER_SET_ID {
+        return Err(bad(format!(
+            "{origin}: not an operator-trusted checkpoint (signer-set id {}); derive one with \
+             `bloch-pos ws-checkpoint --operator-trusted`, or pass a signed envelope with --ws-checkpoint",
+            cp.signer_set_id
+        )));
+    }
+    if cp.epoch == 0 {
+        return Err(bad("an operator-trusted checkpoint at epoch 0 is the genesis anchor, which every node already has".into()));
+    }
+    match trusted.block_root {
+        Some(expected) if expected != cp.block_root => {
+            return Err(bad(format!(
+                "operator-trusted checkpoint from {origin} names block {} at epoch {}, but --ws-trusted-root is {}; \
+                 the two channels disagree, so neither is trusted. Investigate before booting",
+                hex32(&cp.block_root), cp.epoch, hex32(&expected)
+            )));
+        }
+        Some(_) => {}
+        None => warnings.push(format!(
+            "no --ws-trusted-root given: compare block {} (epoch {}) with the explorer or another operator",
+            hex32(&cp.block_root), cp.epoch
+        )),
+    }
+    check_local_state(&cp, genesis_anchor, local_state_root, warnings)?;
+    warnings.push(format!(
+        "operator-trusted checkpoint: epoch {} block {} from {origin} (no signatures; the operator vouched for this root)",
+        cp.epoch, hex32(&cp.block_root)
+    ));
+    Ok(cp)
+}
+
 /// The whole boot sequence described in the module docs. `local_root_at`
 /// returns this node's own finalized checkpoint root at an epoch (`None` if
 /// its finality has not reached it); `is_canonical` answers whether a block
@@ -781,9 +928,9 @@ pub fn boot(
 
     check_local_state(&anchor, genesis_anchor, &local_state_root, &mut warnings)?;
 
-    // 2. Operator-supplied envelope (§4.1 precedence, source 1).
-    let mut published: Option<WeakSubjectivityCheckpoint> = None;
-    if let Some(path) = &cfg.checkpoint {
+    // 2. Operator-supplied envelope (§4.1 precedence, source 1), or the
+    //    unsigned operator-trusted checkpoint (the Ethereum model).
+    let incoming: Option<WeakSubjectivityCheckpoint> = if let Some(path) = &cfg.checkpoint {
         let bad = boot_refused;
         let env = decode_envelope_file(&fs::read(path)?)
             .map_err(|e| bad(format!("{}: {e}", path.display())))?;
@@ -831,6 +978,13 @@ pub fn boot(
         let Some((threshold, signers, min_external)) = shape_policy_of(&set) else {
             return Err(bad(shape_policy_refusal(&set, &set_path.display().to_string())));
         };
+        if env.checkpoint.signer_set_id == WS_OPERATOR_TRUSTED_SIGNER_SET_ID || set.id == WS_OPERATOR_TRUSTED_SIGNER_SET_ID {
+            return Err(bad(format!(
+                "checkpoint envelope {} REFUSED: signer-set id {WS_OPERATOR_TRUSTED_SIGNER_SET_ID} is reserved for \
+                 operator-trusted checkpoints, which are never signed (use --ws-trusted-checkpoint)",
+                path.display()
+            )));
+        }
         let ok = ws::verify_envelope_with_shape_policy(
             &env,
             &set,
@@ -883,7 +1037,15 @@ pub fn boot(
         }
         let cp = env.checkpoint;
         check_local_state(&cp, genesis_anchor, &local_state_root, &mut warnings)?;
+        Some(cp)
+    } else if let Some(trusted) = &cfg.trusted {
+        Some(trusted_checkpoint(trusted, network_id, genesis_root, genesis_anchor, &local_state_root, &mut warnings)?)
+    } else {
+        None
+    };
 
+    let mut published: Option<WeakSubjectivityCheckpoint> = None;
+    if let Some(cp) = incoming {
         // 4 (order matters): the cross-check against OWN finality comes
         // before admission. A published checkpoint that contradicts what this
         // node itself finalized is an alarm and is NOT admitted as an anchor;
@@ -921,7 +1083,7 @@ pub fn boot(
 
         // 3. Anti-rollback against the stored ws_latest (§4.1).
         if let Some(cp) = published {
-            match ws::accept(Some(&anchor), &cp) {
+            match same_fact_accept(&anchor, &cp) {
                 Acceptance::Store => {
                     save_latest(data_dir, &cp)?;
                     anchor = cp;
@@ -961,7 +1123,7 @@ pub fn boot(
                 "WARNING: this node's finalized knowledge is {age} epochs old — inside \
                  the weak-subjectivity window ({} epochs) but past the freshness \
                  threshold ({}). Resuming from own finality, but fetch a fresh \
-                 checkpoint (--ws-checkpoint) before following any peer that offers a \
+                 checkpoint (--ws-trusted-checkpoint or --ws-checkpoint) before following any peer that offers a \
                  competing finalized branch.",
                 ws::WS_PERIOD_EPOCHS,
                 ws::WS_FRESH_EPOCHS,
@@ -1030,8 +1192,8 @@ pub fn boot(
                      withdrawn, and could sign a conflicting continuation for free; \
                      the local markers are no longer a defense, so no peer can be \
                      safely followed. This refusal is the mechanism working, not a \
-                     fault. Recover by obtaining a recent signed checkpoint OUT OF \
-                     BAND (see below) and restarting with --ws-checkpoint <file>.\n\n{}",
+                     fault. Recover by obtaining a recent checkpoint OUT OF BAND \
+                     (operator-trusted or signed, see below) and restarting with it.\n\n{}",
                     ws::WS_PERIOD_EPOCHS,
                     window_days(),
                     where_checkpoints_come_from(),
@@ -1075,7 +1237,18 @@ fn require_checkpoint_message(anchor: &WeakSubjectivityCheckpoint, anchor_age: u
 }
 
 fn where_checkpoints_come_from() -> String {
-    "To obtain a checkpoint (BLOCH-WEAK-SUBJECTIVITY.md §2.3, §4.1):\n  \
+    "Easiest (checkpoint sync, the Ethereum model — no files, no signatures):\n  \
+     restart with --checkpoint-sync-url <host:port>,<host:port> naming RPCs of nodes \
+     you trust (your own, or other operators'). Every endpoint must agree. Then compare \
+     the printed block root with the explorer; add --ws-trusted-root <root> to pin it.\n\n\
+     Operator-trusted checkpoint file (offline variant):\n  \
+     1. Derive it from nodes you trust — your own, or other operators' — with \
+     `bloch-pos ws-checkpoint --operator-trusted --genesis <manifest> --rpc <a>,<b>,<c> \
+     --epoch <recent finalized epoch> --out <prefix>`; every endpoint must agree.\n  \
+     2. Compare the printed block root against a SECOND, independent channel (the \
+     explorer, another operator) — TWO independent channels at least.\n  \
+     3. Restart with --ws-trusted-checkpoint <prefix>.bin --ws-trusted-root <block root>.\n\n\
+     Signed checkpoint (BLOCH-WEAK-SUBJECTIVITY.md §2.3, §4.1):\n  \
      1. Fetch the latest signed checkpoint envelope from a channel you trust: the \
      Foundation site, the GitHub/GitLab release pages, the explorer front page, or \
      the announcement channel.\n  \
@@ -1138,7 +1311,7 @@ mod tests {
     }
 
     fn no_flags() -> WsConfig {
-        WsConfig { checkpoint: None, signer_set: None, signer_set_sha3: None }
+        WsConfig { checkpoint: None, signer_set: None, signer_set_sha3: None, trusted: None, ..WsConfig::default() }
     }
 
     // -- codecs -------------------------------------------------------------
@@ -1712,6 +1885,8 @@ mod tests {
             checkpoint: None,
             signer_set: None,
             signer_set_sha3: Some([0x11; 32]),
+            trusted: None,
+            ..WsConfig::default()
         };
         let dir = tmpdir("pin-missing-artifacts");
         let error = boot(&invalid, &dir, NET, &GEN, &genesis_anchor(), 0, false,
@@ -1738,7 +1913,7 @@ mod tests {
         fs::write(&arrangement_path, encode_signer_set_file(&changed)).unwrap();
         fs::write(&checkpoint_path, encode_envelope_file(&envelope)).unwrap();
         let config = WsConfig { checkpoint: Some(checkpoint_path), signer_set: Some(arrangement_path.clone()),
-            signer_set_sha3: Some(signer_set_fingerprint(&original)) };
+            signer_set_sha3: Some(signer_set_fingerprint(&original)), trusted: None, ..WsConfig::default() };
         let error = boot(&config, &dir, NET, &GEN, &genesis_anchor(), 70, false,
             (0, GEN), |_| None, |_| false, |_| None).err().unwrap();
         assert!(is_non_retryable(&error));
@@ -1782,7 +1957,7 @@ mod tests {
         let arrangement = dir.join("arrangement.bin");
         fs::write(&envelope, encode_envelope_file(&CheckpointEnvelope { checkpoint: cp, signatures })).unwrap();
         fs::write(&arrangement, encode_signer_set_file(&set)).unwrap();
-        let unpinned = WsConfig { checkpoint: Some(envelope.clone()), signer_set: Some(arrangement.clone()), signer_set_sha3: None };
+        let unpinned = WsConfig { checkpoint: Some(envelope.clone()), signer_set: Some(arrangement.clone()), signer_set_sha3: None, trusted: None, ..WsConfig::default() };
         let error = boot(&unpinned, &dir, NET, &GEN, &genesis_anchor(), 70, true,
             (64, cp.block_root), |_| Some(cp.block_root), |_| true, |_| None).err().unwrap();
         assert!(is_non_retryable(&error));
@@ -1809,7 +1984,7 @@ mod tests {
     fn audit_malformed_ws_artifacts_are_typed_but_raw_io_errors_are_not() {
         let dir = tmpdir("operator-errors");
         let path = dir.join("checkpoint.bin");
-        let config = WsConfig { checkpoint: Some(path.clone()), signer_set: None, signer_set_sha3: None };
+        let config = WsConfig { checkpoint: Some(path.clone()), signer_set: None, signer_set_sha3: None, trusted: None, ..WsConfig::default() };
         let attempt = || boot(&config, &dir, NET, &GEN, &genesis_anchor(), 0, false, (0, GEN), |_| None, |_| false, |_| None);
         let missing = attempt().err().unwrap();
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
@@ -2084,6 +2259,8 @@ mod tests {
             checkpoint: Some(checkpoint),
             signer_set: Some(signer_set),
             signer_set_sha3: Some(signer_set_fingerprint(&bytes)),
+            trusted: None,
+            ..WsConfig::default()
         }
     }
 
@@ -2339,5 +2516,171 @@ mod tests {
             .expect_err("a re-mint of a stored epoch refuses the boot");
         assert!(refusal.contains("WS_CONFLICT"), "{refusal}");
         assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), cp);
+    }
+
+    // ── operator-trusted (unsigned) checkpoints: the Ethereum model ────────
+
+    fn trusted_cp(epoch: u64) -> WeakSubjectivityCheckpoint {
+        WeakSubjectivityCheckpoint {
+            validator_set_root: [0; 32],
+            signer_set_id: WS_OPERATOR_TRUSTED_SIGNER_SET_ID,
+            ..checkpoint(epoch)
+        }
+    }
+
+    fn trusted_config(dir: &Path, cp: &WeakSubjectivityCheckpoint, root: [u8; 32]) -> WsConfig {
+        let path = dir.join("trusted.bin");
+        fs::write(&path, cp.canonical_serialize()).unwrap();
+        WsConfig { trusted: Some(TrustedCheckpoint { source: TrustedSource::File(path), block_root: Some(root) }), ..WsConfig::default() }
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn trusted_flags_parse_and_sources_are_alternatives() {
+        let root = "22".repeat(32);
+        let cfg = WsConfig::from_args(&args(&["--ws-trusted-checkpoint", "cp.bin", "--ws-trusted-root", &root])).unwrap();
+        let trusted = cfg.trusted.expect("parsed");
+        assert!(matches!(&trusted.source, TrustedSource::File(p) if *p == PathBuf::from("cp.bin")));
+        assert_eq!(trusted.block_root, Some([0x22; 32]));
+        // The comparison root is optional, as Ethereum's --wss-checkpoint is.
+        let cfg = WsConfig::from_args(&args(&["--ws-trusted-checkpoint", "cp.bin"])).unwrap();
+        assert_eq!(cfg.trusted.expect("parsed").block_root, None);
+        // ...but a root alone compares nothing.
+        assert!(WsConfig::from_args(&args(&["--ws-trusted-root", &root])).is_err());
+        assert!(WsConfig::from_args(&args(&["--ws-trusted-checkpoint", "cp.bin", "--ws-trusted-root", "22"])).is_err());
+
+        let cfg = WsConfig::from_args(&args(&["--checkpoint-sync-url", "http://10.0.0.1:8080/, 10.0.0.2:8080",
+            "--ws-trusted-root", &root])).unwrap();
+        assert_eq!(cfg.checkpoint_sync, vec!["10.0.0.1:8080".to_string(), "10.0.0.2:8080".to_string()]);
+        assert_eq!(cfg.checkpoint_sync_pin, Some([0x22; 32]));
+        assert!(cfg.trusted.is_none(), "filled only at boot, and only when needed");
+        assert!(WsConfig::from_args(&args(&["--checkpoint-sync-url", "https://rpc.example"])).is_err());
+
+        let both = args(&["--ws-trusted-checkpoint", "cp.bin", "--ws-trusted-root", &root,
+            "--ws-checkpoint", "e", "--ws-signer-set", "s", "--ws-signer-set-sha3", &root]);
+        assert!(WsConfig::from_args(&both).err().unwrap().contains("alternatives"));
+        let both = args(&["--ws-trusted-checkpoint", "cp.bin", "--checkpoint-sync-url", "a:1"]);
+        assert!(WsConfig::from_args(&both).err().unwrap().contains("alternatives"));
+    }
+
+    /// --checkpoint-sync-url hands boot an in-memory checkpoint; no file, no pin.
+    #[test]
+    fn fetched_checkpoint_boots_a_fresh_node_without_any_file() {
+        let dir = tmpdir("trusted-fetched");
+        let cp = trusted_cp(5000);
+        let cfg = WsConfig {
+            trusted: Some(TrustedCheckpoint { source: TrustedSource::Fetched(cp), block_root: None }),
+            ..WsConfig::default()
+        };
+        let out = boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), 5010, false, (0, GEN), |_| None, |_| false, |_| None)
+            .unwrap()
+            .expect("fetched checkpoint anchors the sync");
+        assert_eq!(out.anchor_epoch, 5000);
+        assert!(out.warnings.iter().any(|w| w.contains("no --ws-trusted-root")));
+        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), cp);
+    }
+
+    /// The point of the feature: past the trust-once window a fresh node
+    /// boots with no signature from anyone, under the root its operator chose.
+    #[test]
+    fn fresh_node_boots_under_an_operator_trusted_checkpoint() {
+        let dir = tmpdir("trusted-fresh");
+        let cp = trusted_cp(5000);
+        let out = boot(
+            &trusted_config(&dir, &cp, cp.block_root), &dir, NET, &GEN, &genesis_anchor(),
+            5010, false, (0, GEN), |_| None, |_| false, |_| None,
+        )
+        .unwrap()
+        .expect("a fresh operator-trusted checkpoint must let a fresh node sync");
+        assert_eq!(out.anchor_epoch, 5000);
+        assert_eq!(out.anchor_root, cp.block_root);
+        assert!(out.anchor_is_hard, "with no own finality the anchor is the only defense");
+        assert!(out.warnings.iter().any(|w| w.contains("operator-trusted")));
+        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), cp);
+    }
+
+    #[test]
+    fn trusted_checkpoint_refuses_a_root_the_operator_did_not_compare() {
+        let dir = tmpdir("trusted-root-mismatch");
+        let cp = trusted_cp(5000);
+        let error = boot(
+            &trusted_config(&dir, &cp, [0x99; 32]), &dir, NET, &GEN, &genesis_anchor(),
+            5010, false, (0, GEN), |_| None, |_| false, |_| None,
+        )
+        .err()
+        .expect("disagreeing channels must refuse");
+        assert!(is_non_retryable(&error));
+        assert!(error.to_string().contains("disagree"));
+        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), genesis_anchor());
+    }
+
+    #[test]
+    fn trusted_checkpoint_refuses_signed_ids_other_networks_and_epoch_zero() {
+        let dir = tmpdir("trusted-shape");
+        let attempt = |cp: WeakSubjectivityCheckpoint| boot(
+            &trusted_config(&dir, &cp, cp.block_root), &dir, NET, &GEN, &genesis_anchor(),
+            5010, false, (0, GEN), |_| None, |_| false, |_| None,
+        );
+        let signed_id = WeakSubjectivityCheckpoint { signer_set_id: 1, ..trusted_cp(5000) };
+        assert!(attempt(signed_id).err().unwrap().to_string().contains("not an operator-trusted"));
+        let other_net = WeakSubjectivityCheckpoint { network_id: NET + 1, ..trusted_cp(5000) };
+        assert!(attempt(other_net).err().unwrap().to_string().contains("different network"));
+        assert!(attempt(trusted_cp(0)).is_err());
+    }
+
+    /// Unsigned does not mean unbounded: a stale root still cannot sync.
+    #[test]
+    fn stale_trusted_checkpoint_still_refuses() {
+        let dir = tmpdir("trusted-stale");
+        let cp = trusted_cp(100);
+        let refusal = boot(
+            &trusted_config(&dir, &cp, cp.block_root), &dir, NET, &GEN, &genesis_anchor(),
+            100 + WS_PERIOD_EPOCHS, false, (0, GEN), |_| None, |_| false, |_| None,
+        )
+        .unwrap()
+        .expect_err("a checkpoint at or beyond the window must not anchor a sync");
+        assert!(refusal.contains("ERR_WS_REQUIRE_CHECKPOINT"));
+        assert!(refusal.contains("--ws-trusted-checkpoint"));
+    }
+
+    /// The operator's word moves a newcomer, never a running node.
+    #[test]
+    fn trusted_checkpoint_never_overrides_own_finality() {
+        let dir = tmpdir("trusted-vs-own");
+        let cp = trusted_cp(64);
+        let out = boot(
+            &trusted_config(&dir, &cp, cp.block_root), &dir, NET, &GEN, &genesis_anchor(),
+            70, true, (66, [0x55; 32]), |_| Some([0x55; 32]), |_| true, |_| None,
+        )
+        .unwrap()
+        .expect("own finality resumes");
+        assert!(out.warnings.iter().any(|w| w.contains("WS_CONFLICT")));
+        assert_eq!(out.anchor_epoch, 0, "a contradicting checkpoint is not admitted");
+        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), genesis_anchor());
+    }
+
+    /// A signed and an operator-trusted checkpoint of the same block are one
+    /// fact; different blocks at one epoch stay an equivocation.
+    #[test]
+    fn same_epoch_same_roots_is_not_an_equivocation() {
+        let signed = checkpoint(512);
+        let trusted = WeakSubjectivityCheckpoint { issued_at: 1, ..trusted_cp(512) };
+        assert_ne!(signed.ws_digest(), trusted.ws_digest());
+        assert!(matches!(same_fact_accept(&signed, &trusted), Acceptance::Ignore));
+        let forked = WeakSubjectivityCheckpoint { block_root: [0x77; 32], ..trusted };
+        assert!(matches!(same_fact_accept(&signed, &forked), Acceptance::Conflict));
+    }
+
+    #[test]
+    fn the_operator_trusted_id_can_never_be_combined_into_an_envelope() {
+        let cp = trusted_cp(1536);
+        let set = SignerSet { id: WS_OPERATOR_TRUSTED_SIGNER_SET_ID, ..a_set(WS_PHASE_A_MIN_EXTERNAL, 0) };
+        assert!(matches!(
+            combine(&cp, &set, &[a_partial(&cp, 0), a_partial(&cp, 2)]),
+            Err(CombineReject::ReservedSignerSet)
+        ));
     }
 }

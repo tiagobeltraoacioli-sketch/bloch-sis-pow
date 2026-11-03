@@ -7202,8 +7202,33 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let local_at: Vec<(u64, [u8; 32])> = (0..=fin.epoch)
             .filter_map(|e| engine.own_finalized_root_at(e).map(|r| (e, r)))
             .collect();
+        // --checkpoint-sync-url is consulted only by a node that needs it: one
+        // with no finality of its own, or with finality past the freshness
+        // threshold. A running node keeps resuming from its own finality and
+        // the ws_latest it already stored; it never depends on these URLs.
+        let needs_checkpoint = !has_local_finality
+            || wall_epoch.saturating_sub(fin.epoch) >= bloch_pos_committee::ws::WS_FRESH_EPOCHS;
+        let fetched;
+        let ws_cfg = if !cfg.ws.checkpoint_sync.is_empty() && needs_checkpoint {
+            println!("checkpoint sync: fetching the finalized checkpoint from {}", cfg.ws.checkpoint_sync.join(", "));
+            if cfg.ws.checkpoint_sync.len() == 1 {
+                println!("checkpoint sync: WARNING single endpoint — this node trusts that one node's word");
+            }
+            let cp = crate::ws_tool::fetch_trusted_checkpoint(&cfg.ws.checkpoint_sync, network_id, genesis_root)
+                .map_err(|e| crate::ws_boot::boot_refused(format!("checkpoint sync failed: {e}")))?;
+            fetched = crate::ws_boot::WsConfig {
+                trusted: Some(crate::ws_boot::TrustedCheckpoint {
+                    source: crate::ws_boot::TrustedSource::Fetched(cp),
+                    block_root: cfg.ws.checkpoint_sync_pin,
+                }),
+                ..Default::default()
+            };
+            &fetched
+        } else {
+            &cfg.ws
+        };
         let outcome = crate::ws_boot::boot(
-            &cfg.ws,
+            ws_cfg,
             &cfg.data_dir,
             network_id,
             &genesis_root,
