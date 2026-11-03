@@ -1423,6 +1423,11 @@ fn require_checkpoint_message(anchor: &WeakSubjectivityCheckpoint, anchor_age: u
 }
 
 fn where_checkpoints_come_from() -> String {
+    let unsigned = if AUTO_CHECKPOINT_ENABLED { UNSIGNED_SOURCES } else { "" };
+    format!("{unsigned}{SIGNED_SOURCE}")
+}
+
+const UNSIGNED_SOURCES: &str =
     "Easiest (checkpoint sync, the Ethereum model — no files, no signatures):\n  \
      restart with --checkpoint-sync-url <host:port>,<host:port> naming RPCs of nodes \
      you trust (your own, or other operators'). Every endpoint must agree. Then compare \
@@ -1433,8 +1438,10 @@ fn where_checkpoints_come_from() -> String {
      --epoch <recent finalized epoch> --out <prefix>`; every endpoint must agree.\n  \
      2. Compare the printed block root against a SECOND, independent channel (the \
      explorer, another operator) — TWO independent channels at least.\n  \
-     3. Restart with --ws-trusted-checkpoint <prefix>.bin --ws-trusted-root <block root>.\n\n\
-     Signed checkpoint (BLOCH-WEAK-SUBJECTIVITY.md §2.3, §4.1):\n  \
+     3. Restart with --ws-trusted-checkpoint <prefix>.bin --ws-trusted-root <block root>.\n\n";
+
+const SIGNED_SOURCE: &str =
+    "Signed checkpoint (BLOCH-WEAK-SUBJECTIVITY.md §2.3, §4.1):\n  \
      1. Fetch the latest signed checkpoint envelope from a channel you trust: the \
      Foundation site, the GitHub/GitLab release pages, the explorer front page, or \
      the announcement channel.\n  \
@@ -1443,9 +1450,7 @@ fn where_checkpoints_come_from() -> String {
      say-so.\n  \
      3. Obtain the signer-arrangement SHA3-256 fingerprint through an independent \
      trusted channel, then restart with all three inputs: --ws-checkpoint <file> \
-     --ws-signer-set <file> --ws-signer-set-sha3 <independently-verified-hex32>."
-        .to_string()
-}
+     --ws-signer-set <file> --ws-signer-set-sha3 <independently-verified-hex32>.";
 
 // ---------------------------------------------------------------------------
 // Tests
