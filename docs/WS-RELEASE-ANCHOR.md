@@ -48,10 +48,14 @@ feature, `ws-auto-checkpoint`. Release builds refuse them.
 
 | Item | Value |
 |---|---|
-| Baked epoch | see `ws_release_anchor.rs` and the release record |
-| Fresh installs refused from | wall epoch E + 2016 |
-
-For E = 7305 that is epoch 9321, 2026-11-25 11:07 UTC. A node that has synced
+| Baked epoch E | 7306 (minted 2026-11-03 02:21 UTC, the newest finalized epoch then) |
+| Boundary block | slot 233791, `c2afdb5e523016b6c797ff509ae723d577dab182956fafe15ff4b9aa60fb55c3` |
+| State root | `2905fe3fa97d31fc408f13c57b71e6e165b018cb5485bd22e5d3bb06b3ea44c2` |
+| `issued_at` | 1793672494 |
+| 154-byte file SHA-256 | `86f23350517773156318016bc06cf659e340b37de57692d2c39493efaee9f343` |
+| ws digest | `80e8b1d55e73f28d789cb74159fec2b298c0093cfee5572810a19c6587126f20` |
+| Fresh installs refused from | wall epoch E + 2016 = 9322, 2026-11-25 11:23 UTC |
+ A node that has synced
 once keeps running on its own finality after that date; only new installs,
 and nodes offline for more than 2016 epochs, need a newer anchor.
 
