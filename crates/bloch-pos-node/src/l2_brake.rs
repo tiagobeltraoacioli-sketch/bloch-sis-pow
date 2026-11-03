@@ -293,6 +293,7 @@ impl BrakeCell {
         held
     }
 
+    #[cfg(test)]
     pub fn status(&self) -> Status {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).status.clone()
     }
