@@ -272,6 +272,45 @@ fn kes_rotate_conflict(
     Ok(())
 }
 
+/// Message for a lifecycle transaction refused only because the committed
+/// head has not reached the flag day the wall clock has. Served as
+/// `TX_REFUSED_RETRYABLE` (-32009), never as the terminal -32008.
+pub(super) const FLAG_DAY_AHEAD_OF_HEAD: &str =
+    "the flag day for this transaction format has opened by the wall clock, but this \
+     node's committed head is still in an earlier epoch, so the transaction could only be \
+     judged against pre-flag-day state. The bytes were not judged invalid: resubmit the \
+     same bytes once a block of the opening epoch exists (from `error.data.until_slot` on)";
+
+/// Gate of a lifecycle format whose door check (`admissible`) reads the
+/// wall-clock epoch while `validate_lifecycle_transaction` reads the
+/// committed head's epoch. `None` for formats without such a split.
+fn lifecycle_flag_day_open(tx: &PosTransaction, epoch: u64) -> Option<bool> {
+    match tx {
+        PosTransaction::KesRegister { .. } | PosTransaction::KesRotate { .. } => {
+            Some(params::kes_registration_open(epoch))
+        }
+        PosTransaction::WithdrawalCredentialRotation(_) => {
+            Some(params::epoch_gate_active(epoch, params::HF3_PQ_MIGRATION_EPOCH))
+        }
+        PosTransaction::RescueCommit(_) | PosTransaction::RescueReveal(_) => Some(
+            params::epoch_gate_active(epoch, params::LATTICE_EMERGENCY_ACTIVATION_EPOCH),
+        ),
+        _ => None,
+    }
+}
+
+/// True when `tx`'s flag day is open at the wall-clock epoch but not at the
+/// committed head's epoch. That happens in the first slots of the opening
+/// epoch, before its first block exists (agent 83, net K: head at slot 1151,
+/// wall slot 1152; the same bytes were accepted once the head reached 1152).
+/// The refusal is then a fact about this node's head, which the next block
+/// changes, not about the bytes.
+pub(super) fn flag_day_opened_after_head(tx: &PosTransaction, head_epoch: u64, wall_epoch: u64) -> bool {
+    head_epoch < wall_epoch
+        && lifecycle_flag_day_open(tx, wall_epoch) == Some(true)
+        && lifecycle_flag_day_open(tx, head_epoch) == Some(false)
+}
+
 impl Engine {
     pub(super) fn validate_lifecycle_admission(&mut self, tx: &PosTransaction) -> Result<(), Refusal> {
         if !is_lifecycle(tx) {
@@ -298,7 +337,15 @@ impl Engine {
                 until_slot: wall_slot.saturating_add(1),
             });
         }
-        verdict.map_err(|_| Refusal::Invalid("lifecycle transaction fails committed-state validation"))
+        let head_epoch = epoch_of(self.state.slot());
+        let wall_epoch = epoch_of(wall_slot);
+        verdict.map_err(|_| {
+            if flag_day_opened_after_head(tx, head_epoch, wall_epoch) {
+                Refusal::StateDependent(FLAG_DAY_AHEAD_OF_HEAD)
+            } else {
+                Refusal::Invalid("lifecycle transaction fails committed-state validation")
+            }
+        })
     }
 
     fn lifecycle_verification_source(&self, tx: &PosTransaction) -> Option<[u8; 32]> {

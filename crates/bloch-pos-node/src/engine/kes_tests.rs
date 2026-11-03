@@ -399,3 +399,75 @@ fn the_registration_dedupe_defers_to_the_consensus_rescue_rule() {
         "the already-registered refusal must exempt an open rescue"
     );
 }
+
+/// Agent 83, net K: a registration sent in the first slot of the opening
+/// epoch, before that epoch's first block exists, passes the wall-clock door
+/// and is then judged against a committed head still before the flag day.
+/// That refusal lifts with the next block, so it must reach the client as
+/// `TX_REFUSED_RETRYABLE` (-32009) with a deadline, never as the terminal
+/// -32008 "retrying the same bytes will not help". On a head that has not
+/// reached the gate and a wall clock that has not either, the door refusal
+/// is unchanged.
+#[test]
+fn a_registration_ahead_of_the_head_is_retryable_not_terminal() {
+    let gate = bloch_pos_committee::params::KES_REGISTRATION_EPOCH;
+    let (mut engine, _dir) = perf_support::proposing_engine();
+    assert!(epoch_of(engine.state.slot()) < gate, "the fixture head must be before the gate");
+    let tx = registration(&engine, 0, 0x11);
+
+    // First slot of the opening epoch: open by the wall clock, not by the head.
+    let first = first_slot_of_epoch(gate).expect("the gate epoch has a first slot");
+    {
+        let _clock = validator_lifecycle::clock_at(first);
+        match engine.on_transaction(tx.clone()) {
+            Err(Refusal::StateDependent(why)) => {
+                assert_eq!(why, validator_lifecycle::FLAG_DAY_AHEAD_OF_HEAD);
+                assert!(!why.contains("will not help"), "{why}");
+            }
+            other => panic!("expected the retryable flag-day refusal, got {other:?}"),
+        }
+        let RpcResult::Err(e) = engine.serve_rpc(RpcRequest::SendRawTransaction(tx.clone())) else {
+            panic!("a registration ahead of the head must produce an RPC error");
+        };
+        assert_eq!(e.code, rpc::TX_REFUSED_RETRYABLE, "{e:?}");
+        assert!(!e.message.contains("will not help"), "{}", e.message);
+        assert!(e.message.contains("resubmit the same bytes"), "{}", e.message);
+        let data = e.data.as_ref().expect("-32009 carries error.data");
+        assert_eq!(data.get("retryable"), Some(&rpc::Json::Bool(true)));
+        assert_eq!(data.get("until_slot").and_then(rpc::Json::as_u64), Some(first + 1));
+        assert!(engine.mempool.is_empty());
+        assert!(engine.state.kes_roots().is_empty());
+    }
+
+    // Last slot before the gate: the door refuses on the flag day, terminal
+    // as before (the wall clock has not reached the gate).
+    {
+        let _clock = validator_lifecycle::clock_at(first - 1);
+        match engine.on_transaction(tx.clone()) {
+            Err(Refusal::Invalid(why)) => assert!(why.contains("KES_REGISTRATION_EPOCH"), "{why}"),
+            other => panic!("expected the door's flag-day refusal, got {other:?}"),
+        }
+    }
+}
+
+/// The classifier itself: only the gated lifecycle formats, only while the
+/// gate lies strictly between the head's epoch and the wall clock's.
+#[test]
+fn the_flag_day_classifier_names_only_a_gate_between_head_and_wall() {
+    use validator_lifecycle::flag_day_opened_after_head as ahead;
+    let gate = bloch_pos_committee::params::KES_REGISTRATION_EPOCH;
+    let register = PosTransaction::KesRegister { validator: 0, depth: 12, root: [1; 32], signature: vec![7; 40] };
+    assert!(ahead(&register, gate - 1, gate));
+    assert!(ahead(&register, 0, gate + 5));
+    // Head already at or past the gate: a refusal there is on the bytes.
+    assert!(!ahead(&register, gate, gate));
+    assert!(!ahead(&register, gate, gate + 1));
+    // Wall clock not at the gate yet: the door's flag-day refusal applies.
+    assert!(!ahead(&register, gate - 2, gate - 1));
+    // Head ahead of the wall clock (clock skew): never retryable on this path.
+    assert!(!ahead(&register, gate, gate - 1));
+    // A format without a wall/head gate split is never reclassified.
+    assert!(!ahead(&PosTransaction::Withdraw { validator: 0 }, gate - 1, gate));
+    // HF3 PQ migration shares the epoch and the split.
+    assert_eq!(bloch_pos_committee::params::HF3_PQ_MIGRATION_EPOCH, gate);
+}
