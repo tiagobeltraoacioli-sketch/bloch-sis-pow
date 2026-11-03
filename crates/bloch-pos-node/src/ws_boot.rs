@@ -1242,7 +1242,11 @@ pub fn boot(
 
         // 3. Anti-rollback against the stored ws_latest (§4.1).
         if let Some(cp) = published {
-            match same_fact_accept(&anchor, &cp) {
+            // The same-fact rule is part of the prototype: a default build
+            // keeps fa980367's anti-rollback exactly (a re-mint with another
+            // issued_at is WS_CONFLICT even when the roots agree).
+            let decision = if AUTO_CHECKPOINT_ENABLED { same_fact_accept(&anchor, &cp) } else { ws::accept(Some(&anchor), &cp) };
+            match decision {
                 Acceptance::Store => {
                     save_latest(data_dir, &cp)?;
                     anchor = cp;
@@ -2693,10 +2697,15 @@ mod tests {
         assert_ne!(reminted.ws_digest(), cp.ws_digest());
         let env = owner_envelope(reminted, &secrets, &[0, 1]);
         let cfg = write_artifacts(&dir, "reminted", &env, &set);
-        let refusal = boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), wall, false, (0, GEN), |_| None, |_| false, |_| None)
-            .unwrap()
-            .expect_err("a re-mint of a stored epoch refuses the boot");
-        assert!(refusal.contains("WS_CONFLICT"), "{refusal}");
+        let attempt = boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), wall, false, (0, GEN), |_| None, |_| false, |_| None)
+            .unwrap();
+        if AUTO_CHECKPOINT_ENABLED {
+            // Prototype same-fact rule: same block and state, so one fact.
+            attempt.expect("same roots at one epoch are not an equivocation under ws-auto-checkpoint");
+        } else {
+            let refusal = attempt.expect_err("a re-mint of a stored epoch refuses the boot");
+            assert!(refusal.contains("WS_CONFLICT"), "{refusal}");
+        }
         assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), cp);
     }
 
@@ -2847,6 +2856,7 @@ mod tests {
 
     /// A signed and an operator-trusted checkpoint of the same block are one
     /// fact; different blocks at one epoch stay an equivocation.
+    #[cfg(feature = "ws-auto-checkpoint")]
     #[test]
     fn same_epoch_same_roots_is_not_an_equivocation() {
         let signed = checkpoint(512);
