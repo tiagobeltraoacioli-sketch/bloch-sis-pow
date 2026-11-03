@@ -2809,6 +2809,52 @@ pub(crate) mod l2_next_program_test {
     }
 }
 
+/// CANDIDATE, not scheduled: the epoch from which one of the
+/// `l2_settlement::da::MAX_PER_BLOCK` DA slots of every block is reserved
+/// for the L2's registered DA funding key (`l2_settlement::da::reserved_key`).
+/// `u64::MAX` means INERT. No epoch has been chosen.
+///
+/// From the first block of this epoch, a block may carry at most
+/// `da::OPEN_PER_BLOCK` (3) DA transactions funded by any other key; the
+/// total cap of `da::MAX_PER_BLOCK` (4) is unchanged. Without it, four
+/// third-party DA transactions per block at tip 0 take every slot for about
+/// 0.012 BLCH an hour (the tip tie-break is the canonical bytes, which start
+/// with the funding key), and no user-transaction block can settle while
+/// they do. The rule only refuses blocks the old rule accepted, so it is a
+/// soft fork: no committed byte changes at the gate, and history replays
+/// unchanged. Arming needs the registered key (`hard_forks`).
+pub const L2_DA_RESERVED_SLOT_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn l2_da_reserved_slot_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_da_reserved_slot_test::forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_DA_RESERVED_SLOT_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_da_reserved_slot_test {
+    use std::cell::Cell;
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static KEY: Cell<Option<[u8; 32]>> = const { Cell::new(None) };
+    }
+    pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn key() -> Option<[u8; 32]> { KEY.with(Cell::get) }
+    /// Arms the gate and registers `key` (a funding-key hash) on this thread.
+    pub fn open(key: Option<[u8; 32]>) -> impl Drop {
+        struct Restore(bool, Option<[u8; 32]>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ENABLED.with(|v| v.set(self.0));
+                KEY.with(|v| v.set(self.1));
+            }
+        }
+        Restore(ENABLED.with(|v| v.replace(true)), KEY.with(|v| v.replace(key)))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod native_claim_finality_test {
     use std::cell::Cell;

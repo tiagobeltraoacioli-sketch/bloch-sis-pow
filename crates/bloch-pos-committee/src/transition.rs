@@ -6921,9 +6921,15 @@ impl<V: SignatureVerifier> Transition<V> {
         }
         // DA batches per block are capped like blobs: it bounds the retained
         // DA records (`l2_settlement::da::MAX_RECORDS`) independently of fees.
-        if transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2DataAvailability(_))).count()
-            > crate::l2_settlement::da::MAX_PER_BLOCK
-        {
+        // Past `params::L2_DA_RESERVED_SLOT_EPOCH`, one of those slots is the
+        // registered key's (`da::block_admits`); below it this is the old cap.
+        if !crate::l2_settlement::da::block_admits(
+            block_epoch,
+            transactions.iter().filter_map(|tx| match tx {
+                PosTransaction::L2DataAvailability(da) => Some(da.funding_pubkey.as_slice()),
+                _ => None,
+            }),
+        ) {
             return Err(TransitionError::BlockGasLimitExceeded);
         }
         // Forced L2 transactions per block are capped the same way.

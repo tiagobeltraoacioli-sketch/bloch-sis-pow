@@ -120,6 +120,65 @@ pub mod da {
     pub const MAX_RECORDS: usize = MAX_PER_BLOCK * (RETENTION_BLOCKS as usize + 1);
     const _: () = assert!(MAX_RECORDS == 4_100);
 
+    /// DA slots per block that only the registered key may fill once
+    /// `params::L2_DA_RESERVED_SLOT_EPOCH` binds. The total stays
+    /// [`MAX_PER_BLOCK`], so [`MAX_RECORDS`] is unchanged.
+    pub const RESERVED_PER_BLOCK: usize = 1;
+    /// DA transactions per block from any other funding key, past the gate.
+    pub const OPEN_PER_BLOCK: usize = MAX_PER_BLOCK - RESERVED_PER_BLOCK;
+    const _: () = assert!(OPEN_PER_BLOCK >= 1 && RESERVED_PER_BLOCK >= 1);
+
+    /// The registered DA funding key: `Sha3_256(funding_pubkey)`, the same
+    /// hash as the key's script hash. Set once in the release
+    /// (`mainnet::DA_RESERVED_KEY`); a qualification build
+    /// (`l2-activation-rehearsal`) takes it from `BLOCH_L2_REHEARSAL_DA_KEY`
+    /// at compile time instead. No key, vote or runtime input changes it.
+    #[cfg(not(feature = "l2-activation-rehearsal"))]
+    pub const REGISTERED_KEY: Option<[u8; 32]> = super::mainnet::DA_RESERVED_KEY;
+    #[cfg(feature = "l2-activation-rehearsal")]
+    pub const REGISTERED_KEY: Option<[u8; 32]> = match option_env!("BLOCH_L2_REHEARSAL_DA_KEY") {
+        Some(text) => Some(super::mainnet::h32(text)),
+        None => None,
+    };
+
+    /// The registered key, or a test's override of it.
+    pub fn registered_key() -> Option<[u8; 32]> {
+        #[cfg(test)]
+        if let Some(key) = crate::params::l2_da_reserved_slot_test::key() {
+            return Some(key);
+        }
+        REGISTERED_KEY
+    }
+
+    /// The key that owns the reserved slot in a block of `epoch`: `None`
+    /// below the gate, or when no key is registered (then the old rule of
+    /// [`MAX_PER_BLOCK`] slots for anyone applies unchanged).
+    pub fn reserved_key_at(epoch: u64) -> Option<[u8; 32]> {
+        if crate::params::l2_da_reserved_slot_active(epoch) { registered_key() } else { None }
+    }
+
+    /// `Sha3_256(funding_pubkey)`, the hash [`reserved_key_at`] names.
+    pub fn funder(funding_pubkey: &[u8]) -> [u8; 32] {
+        use sha3::Sha3_256;
+        Sha3_256::digest(funding_pubkey).into()
+    }
+
+    /// Whether a block of `epoch` may carry DA transactions from these
+    /// funding keys, in any order: at most [`MAX_PER_BLOCK`] in all and,
+    /// past the gate, at most [`OPEN_PER_BLOCK`] from keys other than the
+    /// registered one.
+    pub fn block_admits<'a>(epoch: u64, funding_pubkeys: impl IntoIterator<Item = &'a [u8]>) -> bool {
+        let reserved = reserved_key_at(epoch);
+        let (mut total, mut open) = (0usize, 0usize);
+        for key in funding_pubkeys {
+            total += 1;
+            if reserved != Some(funder(key)) {
+                open += 1;
+            }
+        }
+        total <= MAX_PER_BLOCK && (reserved.is_none() || open <= OPEN_PER_BLOCK)
+    }
+
     /// Number of transactions in a canonical batch payload, or `None` if the
     /// payload is not exactly one canonical batch within the size cap.
     pub fn batch_count(payload: &[u8]) -> Option<u32> {
@@ -1500,9 +1559,12 @@ pub mod mainnet {
         proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
     };
     /// The program a rollback installs at [`crate::params::L2_PROGRAM_ROLLBACK_EPOCH`]:
-    /// `settlement_v3_mainnet` of bloch-l2-evm `codex/l2-next-consensus-r3-20261031`
-    /// 776c6cb, the complete witness under the same rules, guest ELF SHA-256
-    /// `44d4c9d7…ce47` (3 076 992 bytes).
+    /// `settlement_v3_mainnet` of bloch-l2-evm `codex/fork-candidate-l2-r7-20261102`
+    /// e8feb2b, built in the pinned container of the sparse guests
+    /// (`integrations/sp1-execution/guest/build-container.sh`): the complete
+    /// witness under the same rules, guest ELF SHA-256 `3ad3a4f0…53b3`
+    /// (3 073 328 bytes). It replaces `44d4c9d7…ce47`, which neither that tree
+    /// nor the container reproduces.
     ///
     /// It proves the next rules, which the assert below pins: the swap to the
     /// next rules is one-way on the L2, because blocks under them hold the vault
@@ -1518,9 +1580,9 @@ pub mod mainnet {
     pub const PROGRAM_FALLBACK: NextProgram = NextProgram {
         identities: [
             h32("975ec2585246abeaea86421dd5726918b632dd91a246f635fe74990b68bcd878"),
-            h32("f3c20f71b84bb09cbab76a75c83a62c507fbefff4b347f787ef2d89aceb6f2b8"),
-            h32("50bd69a513f2463e748a8a62277bc25a08df69a4420a660e2a2ee3f957dca9f7"),
-            h32("00a17ad34a4fc918fba454531277bc25a11bed3490829983951771fcd7dca9f7"),
+            h32("c9f8cd40b703b47c1fdfb183c223da9977ac9839e3d1c436c28c9b7f331aacf8"),
+            h32("792452aa47ddaef1523907c03c39d3917df21180585eec804b27841626027d60"),
+            h32("00f248a5551f76bbc691c83e03c39d391fbe42301617bb202593c20b26027d60"),
         ],
         proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
     };
@@ -1541,6 +1603,14 @@ pub mod mainnet {
     /// `hard_forks::l2_forced_inclusion_may_arm` refuses to arm the gate while
     /// it is unset. Revenue rule (2026-11-02 22:30): the treasury, never a burn.
     pub const FORCED_INCLUSION_TREASURY: Option<[u8; 32]> = None;
+
+    /// TBD-owner: the hash (`Sha3_256`) of the mainnet settler's DA funding
+    /// public key, which owns the reserved DA slot
+    /// (`params::L2_DA_RESERVED_SLOT_EPOCH`). Unset, so that gate cannot be
+    /// armed (`hard_forks::l2_da_reserved_slot_may_arm`). Losing or leaking
+    /// this key costs no funds: the slot then serves nobody, or the leaker,
+    /// and DA is back to the open auction of today.
+    pub const DA_RESERVED_KEY: Option<[u8; 32]> = None;
 
     const fn same_hash(a: &[u8; 32], b: &[u8; 32]) -> bool {
         let mut i = 0;
@@ -1600,7 +1670,7 @@ pub mod mainnet {
         pub initial_l2_state: [u8; 32],
     }
     /// 64 hex characters as 32 bytes, at compile time (a typo fails the build).
-    const fn h32(text: &str) -> [u8; 32] {
+    pub(crate) const fn h32(text: &str) -> [u8; 32] {
         let b = text.as_bytes();
         assert!(b.len() == 64, "32-byte hex");
         let mut out = [0u8; 32];

@@ -1101,6 +1101,38 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
     }
 }
 
+/// The funding-key hash that owns the reserved DA slot in a block of `epoch`
+/// (`da::reserved_key_at`: `None` while `L2_DA_RESERVED_SLOT_EPOCH` is inert).
+/// Tests set it with `da_reserved_test::open`.
+fn da_reserved_key(epoch: u64) -> Option<[u8; 32]> {
+    #[cfg(test)]
+    if let Some(key) = da_reserved_test::key() {
+        return Some(key);
+    }
+    bloch_pos_committee::l2_settlement::da::reserved_key_at(epoch)
+}
+
+/// A DA batch funded by the `reserved` key.
+fn is_reserved_da(tx: &PosTransaction, reserved: Option<[u8; 32]>) -> bool {
+    match (tx, reserved) {
+        (PosTransaction::L2DataAvailability(batch), Some(key)) =>
+            bloch_pos_committee::l2_settlement::da::funder(&batch.funding_pubkey) == key,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod da_reserved_test {
+    use std::cell::Cell;
+    thread_local! { static KEY: Cell<Option<[u8; 32]>> = const { Cell::new(None) }; }
+    pub fn key() -> Option<[u8; 32]> { KEY.with(Cell::get) }
+    pub fn open(key: [u8; 32]) -> impl Drop {
+        struct Restore(Option<[u8; 32]>);
+        impl Drop for Restore { fn drop(&mut self) { KEY.with(|v| v.set(self.0)); } }
+        Restore(KEY.with(|v| v.replace(Some(key))))
+    }
+}
+
 /// The spend-authority hash of this transaction's FIRST input — its "source"
 /// for [`MEMPOOL_MAX_PER_SOURCE`] (R7 M6). Lifecycle messages use their
 /// validator identity, domain-separated from spend keys. `None` remains only
@@ -4899,6 +4931,12 @@ impl Engine {
             self.mempool_admitted_at.remove(stale);
             self.mempool_suspect.remove(stale);
         }
+        for displaced in &capacity.displaced {
+            self.mempool.remove(displaced);
+            self.mempool_admitted_at.remove(displaced);
+            self.mempool_suspect.remove(displaced);
+            self.mempool_evicted_low_fee = self.mempool_evicted_low_fee.saturating_add(1);
+        }
         if let Some(lowest_key) = capacity.lower_fee {
             self.mempool.remove(&lowest_key);
             self.mempool_admitted_at.remove(&lowest_key);
@@ -5026,7 +5064,18 @@ impl Engine {
     fn pack_transactions(
         epoch: u64,
         seed: [u8; 32],
+        ordered: Vec<(&Vec<u8>, &PosTransaction)>,
+    ) -> Vec<PosTransaction> {
+        Self::pack_transactions_with(epoch, seed, ordered, da_reserved_key(epoch))
+    }
+
+    /// [`Self::pack_transactions`] with the reserved DA key given, so the
+    /// rule is testable without arming the compiled gate.
+    fn pack_transactions_with(
+        epoch: u64,
+        seed: [u8; 32],
         mut ordered: Vec<(&Vec<u8>, &PosTransaction)>,
+        da_reserved: Option<[u8; 32]>,
     ) -> Vec<PosTransaction> {
         let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
         let mut out = Vec::new();
@@ -5044,7 +5093,11 @@ impl Engine {
         // interchangeable by construction.
         let mut reserved = BTreeSet::new();
         // Consensus caps DA batches per block; the highest tips win the slots.
+        // Past `params::L2_DA_RESERVED_SLOT_EPOCH` only the registered key may
+        // take the last one (`da::block_admits`): other keys stop at
+        // `da::OPEN_PER_BLOCK`, whatever their tip or bytes.
         let mut da_batches = 0usize;
+        let mut da_open = 0usize;
         let mut forced_txs = 0usize;
         // F-9: consensus admits at most RESCUE_COMMITS_MAX_PER_BLOCK
         // commitments; they rank after every tipped transaction and among
@@ -5099,11 +5152,17 @@ impl Engine {
             if points.iter().any(|point| reserved.contains(point)) {
                 continue;
             }
-            if matches!(tx, PosTransaction::L2DataAvailability(_)) {
-                if da_batches >= bloch_pos_committee::l2_settlement::da::MAX_PER_BLOCK {
+            if let PosTransaction::L2DataAvailability(batch) = tx {
+                use bloch_pos_committee::l2_settlement::da;
+                if da_batches >= da::MAX_PER_BLOCK {
+                    continue;
+                }
+                let open = !is_reserved_da(tx, da_reserved);
+                if da_reserved.is_some() && open && da_open >= da::OPEN_PER_BLOCK {
                     continue;
                 }
                 da_batches += 1;
+                da_open += usize::from(open);
             }
             if matches!(tx, PosTransaction::L2ForcedTransaction(_)) {
                 if forced_txs >= bloch_pos_committee::l2_settlement::forced::MAX_PER_BLOCK {
@@ -11052,6 +11111,100 @@ mod transfer_v2_end_to_end {
         let first_commit = selected.iter().position(|tx| matches!(tx, PosTransaction::RescueCommit(_))).unwrap();
         assert!(selected[..first_commit].iter().all(|tx| matches!(tx, PosTransaction::Transfer { .. })));
         assert_eq!(first_commit, 10, "commitments rank after zero-tip transfers");
+    }
+
+    fn da_batch(key_byte: u8, number: u64, tip: u128) -> PosTransaction {
+        use bloch_pos_committee::transition::{FundingInput, L2DataAvailability};
+        let key = vec![key_byte; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        PosTransaction::L2DataAvailability(L2DataAvailability {
+            network_domain: [0x91; 32],
+            funding_pubkey: key,
+            inputs: vec![FundingInput { txid: [key_byte; 32], vout: number as u32 }],
+            l2_chain_id: 700_770,
+            l2_block_number: number,
+            payload: vec![0, 0, 0, 1, 0, 0, 0, 1, key_byte],
+            change: TransferOutput { value: 1, script_hash: [key_byte; 32] },
+            tx_bytes: 2_000,
+            tip_millisat_per_gas: tip,
+            signature: vec![9; 64],
+        })
+    }
+
+    /// Agent 78's crowd-out, proposer side: eight third-party DA batches at
+    /// tip 0 whose funding keys sort below the settler's take all four slots
+    /// under the old rule. With the settler's key registered, the proposer
+    /// gives the others at most `OPEN_PER_BLOCK` slots and the settler its
+    /// batch, and a higher tip from the others does not buy the last slot.
+    #[test]
+    fn a_zero_tip_da_flood_cannot_take_the_registered_keys_slot() {
+        use bloch_pos_committee::l2_settlement::da;
+        let epoch = V2_FLAG_DAY + 1;
+        let settler_key = vec![0xee; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let settler = da::funder(&settler_key);
+        for tip in [0u128, 1_000] {
+            let mut node = engine_at_wall_epoch(epoch, &[]);
+            for k in 0..8u8 {
+                let tx = da_batch(0x10 + k, 2, tip);
+                node.mempool.insert(tx.canonical_bytes(), tx);
+            }
+            let own = da_batch(0xee, 1, 0);
+            node.mempool.insert(own.canonical_bytes(), own.clone());
+            let is_own = |tx: &PosTransaction| matches!(tx, PosTransaction::L2DataAvailability(d) if da::funder(&d.funding_pubkey) == settler);
+            let das = |sel: &[PosTransaction]| sel.iter().filter(|tx| matches!(tx, PosTransaction::L2DataAvailability(_))).count();
+
+            let old = Engine::pack_transactions_with(epoch, [0x11; 32], node.mempool.iter().collect(), None);
+            assert_eq!(das(&old), da::MAX_PER_BLOCK);
+            assert!(!old.iter().any(is_own), "old rule, tip {tip}: the settler is crowded out");
+
+            let new = Engine::pack_transactions_with(epoch, [0x11; 32], node.mempool.iter().collect(), Some(settler));
+            assert_eq!(das(&new), da::MAX_PER_BLOCK);
+            assert_eq!(new.iter().filter(|tx| is_own(tx)).count(), 1, "tip {tip}: the settler's batch is selected");
+            assert_eq!(das(&new) - 1, da::OPEN_PER_BLOCK);
+            // What the proposer builds is what consensus admits.
+            let keys = |sel: &[PosTransaction]| sel.iter().filter_map(|tx| match tx {
+                PosTransaction::L2DataAvailability(d) => Some(d.funding_pubkey.clone()),
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert!(da::block_admits(epoch, keys(&new).iter().map(Vec::as_slice)));
+        }
+        // The registered key may also use the open slots.
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+        for n in 1..=6u64 {
+            let tx = da_batch(0xee, n, 0);
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        let only_own = Engine::pack_transactions_with(epoch, [0x11; 32], node.mempool.iter().collect(), Some(settler));
+        assert_eq!(only_own.len(), da::MAX_PER_BLOCK);
+    }
+
+    /// The mempool side of the reserved DA slot: a pool full of valid tip-0
+    /// DA from other keys refuses the settler's tip-0 batch under the old
+    /// rule, and admits it past the gate by displacing one of them.
+    #[test]
+    fn a_full_mempool_of_da_cannot_keep_out_the_registered_keys_batch() {
+        use bloch_pos_committee::l2_settlement::da;
+        let epoch = V2_FLAG_DAY + 1;
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+        let mut filled = 0;
+        'fill: for k in 0..80u8 {
+            for n in 1..=64u64 {
+                if filled == MEMPOOL_MAX { break 'fill; }
+                let tx = da_batch(0x10 + k, n, 0);
+                node.mempool.insert(tx.canonical_bytes(), tx);
+                filled += 1;
+            }
+        }
+        assert_eq!(node.mempool.len(), MEMPOOL_MAX);
+        let own = da_batch(0xee, 1, 0);
+        let other = da_batch(0x05, 1, 0);
+        let len = own.canonical_bytes().len();
+        assert!(matches!(node.plan_mempool_capacity(&own, len, epoch), Err(Refusal::AtCapacity)), "old rule: crowded out of the pool");
+        let settler_key = vec![0xee; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let _reserved = da_reserved_test::open(da::funder(&settler_key));
+        let plan = node.plan_mempool_capacity(&own, len, epoch).expect("the registered key is admitted");
+        assert_eq!(plan.displaced.len(), 1);
+        assert!(!plan.displaced.contains(&own.canonical_bytes()));
+        assert!(matches!(node.plan_mempool_capacity(&other, len, epoch), Err(Refusal::AtCapacity)), "others still are not");
     }
 
     /// F-9: which commitments win the scarce slots is re-drawn from the
