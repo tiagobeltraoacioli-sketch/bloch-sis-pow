@@ -1559,30 +1559,30 @@ pub mod mainnet {
         proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
     };
     /// The program a rollback installs at [`crate::params::L2_PROGRAM_ROLLBACK_EPOCH`]:
-    /// `settlement_v3_mainnet` of bloch-l2-evm `codex/fork-candidate-l2-r7-20261102`
-    /// e8feb2b, built in the pinned container of the sparse guests
-    /// (`integrations/sp1-execution/guest/build-container.sh`): the complete
-    /// witness under the same rules, guest ELF SHA-256 `3ad3a4f0…53b3`
-    /// (3 073 328 bytes). It replaces `44d4c9d7…ce47`, which neither that tree
-    /// nor the container reproduces.
+    /// `settlement_v3_mainnet` of the `integrations/sp1-execution/guest-fallback`
+    /// crate of bloch-l2-evm `codex/fallback-forced-r11-20261103` (agent 216),
+    /// built in the pinned container of the sparse guests
+    /// (`guest-fallback/build-container.sh`): the complete witness under the
+    /// same rules, L1 forced inclusion included, guest ELF SHA-256
+    /// `7fd7f3c0…5b5303` (3 138 944 bytes). It replaces `3ad3a4f0…53b3`, which
+    /// did not run the forced rule.
     ///
     /// It proves the next rules, which the assert below pins: the swap to the
     /// next rules is one-way on the L2, because blocks under them hold the vault
     /// code, so [`PROGRAM`] cannot prove any successor of such a block. A
     /// rollback changes which guest proves the rules, never the rules.
     ///
-    /// CANDIDATE gap: [`PROGRAM_NEXT`] now adds forced inclusion, and this guest
-    /// does not implement it (configuration `975ec258…`, unlisted). The assert
-    /// below admits exactly that difference, and
-    /// `hard_forks::l2_forced_rollback_may_arm` refuses to arm the rollback
-    /// together with forced inclusion until a complete-witness guest with the
-    /// forced rule replaces this one.
+    /// Forced inclusion: this guest runs the forced records after the deposits
+    /// and publishes [`super::forced::inbox_hash`] exactly as [`PROGRAM_NEXT`]
+    /// does (bloch-l2-evm `src/forced_complete.rs`; the forced list is the
+    /// guest's fifth input), so its configuration is the forced next one
+    /// (`b4663ab8…`, listed) and a rollback keeps forced inclusion working.
     pub const PROGRAM_FALLBACK: NextProgram = NextProgram {
         identities: [
-            h32("975ec2585246abeaea86421dd5726918b632dd91a246f635fe74990b68bcd878"),
-            h32("c9f8cd40b703b47c1fdfb183c223da9977ac9839e3d1c436c28c9b7f331aacf8"),
-            h32("792452aa47ddaef1523907c03c39d3917df21180585eec804b27841626027d60"),
-            h32("00f248a5551f76bbc691c83e03c39d391fbe42301617bb202593c20b26027d60"),
+            h32("b4663ab88607a1ebf7d1801920365fdde276889e211e097011bf48fcd0f7a29d"),
+            h32("d95185a60668b0d4e1da49be00d85b9c550b412f13c5155be454e72889f90bf1"),
+            h32("432fa77548114c6431d3d64a09c851e8178e83b4744681fb73c3e2d368b11546"),
+            h32("00865f4eeb204531918e9eb2509c851e82f1d0769d11a07ef9e1f169e8b11546"),
         ],
         proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
     };
@@ -1592,8 +1592,8 @@ pub mod mainnet {
     pub const PROGRAM_NEXT_FINAL: bool = false;
     /// L2 configurations (identity 3) whose guest executes the forced records
     /// of [`super::forced`] and publishes [`super::forced::inbox_hash`]: the
-    /// next configuration (`BLOCH:EVM:CONFIG:4:CANCUN`). [`PROGRAM_FALLBACK`]
-    /// does not implement it. [`crate::params::L2_FORCED_INCLUSION_EPOCH`]
+    /// next configuration (`BLOCH:EVM:CONFIG:4:CANCUN`), which [`PROGRAM_NEXT`]
+    /// and [`PROGRAM_FALLBACK`] both carry. [`crate::params::L2_FORCED_INCLUSION_EPOCH`]
     /// stays inert (`hard_forks::l2_forced_inclusion_may_arm`).
     pub const FORCED_INCLUSION_CONFIGURATIONS: &[[u8; 32]] =
         &[h32("b4663ab88607a1ebf7d1801920365fdde276889e211e097011bf48fcd0f7a29d")];
@@ -1624,14 +1624,10 @@ pub mod mainnet {
         }
         true
     }
-    // The fallback proves the next rules: the same configuration, or the next
-    // one without forced inclusion only (the next configuration is then the
-    // forced one and the fallback's is unlisted; see PROGRAM_FALLBACK).
-    const _: () = assert!(
-        same_hash(&PROGRAM_NEXT.identities[0], &PROGRAM_FALLBACK.identities[0])
-            || (crate::hard_forks::listed(FORCED_INCLUSION_CONFIGURATIONS, &PROGRAM_NEXT.identities[0])
-                && !crate::hard_forks::listed(FORCED_INCLUSION_CONFIGURATIONS, &PROGRAM_FALLBACK.identities[0]))
-    );
+    // The fallback proves exactly the next rules, forced inclusion included:
+    // the same configuration (agent 216 removed the earlier escape for a
+    // fallback on the next rules without forced inclusion).
+    const _: () = assert!(same_hash(&PROGRAM_NEXT.identities[0], &PROGRAM_FALLBACK.identities[0]));
     const _: () = assert!(same_hash(&PROGRAM_NEXT.proof_policy, &PROGRAM_FALLBACK.proof_policy));
 
     /// OPTION, an owner decision, absent by default: a one-time reset of the
