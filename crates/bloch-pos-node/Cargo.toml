@@ -65,6 +65,14 @@ l2-activation-rehearsal-mainnet-policy = ["l2-activation-rehearsal", "bloch-pos-
 # QUALIFICATION BUILDS ONLY; see bloch-pos-committee (full-history replay
 # under the pinned ML-DSA rule, params::MLDSA_PIN_ACTIVATION_EPOCH docs).
 mldsa-pin-replay-qualification = ["bloch-pos-committee/mldsa-pin-replay-qualification"]
+# PROTOTYPE, OFF by default (agent 208, round 11): non-recurring weak-
+# subjectivity anchors. Enables (1) the release-baked checkpoint read from
+# release/ws-anchor.bin (empty in the tree: bakes nothing until a release
+# fills it), (2) the unsigned operator-trusted checkpoint flags
+# (--checkpoint-sync-url, --ws-trusted-checkpoint, --ws-trusted-root), and
+# (3) resuming a checkpoint sync after a restart instead of ERR_WS_STALE.
+# Node-local boot policy only; no consensus rule changes.
+ws-auto-checkpoint = []
 
 [dependencies]
 bloch-l2-proof = { path = "../bloch-l2-proof" }

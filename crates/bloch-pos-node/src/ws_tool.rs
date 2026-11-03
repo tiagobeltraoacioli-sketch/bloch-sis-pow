@@ -413,8 +413,8 @@ fn signer_set(args: &[String]) -> Result<(), String> {
              (ws::WS_GENESIS_SIGNER_SET_ID); the first real arrangement is id 1 (§6.1 Phase A)"
         ));
     }
-    if id == ws_boot::WS_OPERATOR_TRUSTED_SIGNER_SET_ID {
-        return Err(format!("signer-set id {id} is reserved for operator-trusted (unsigned) checkpoints"));
+    if ws_boot::is_unsigned_anchor_id(id) {
+        return Err(format!("signer-set id {id} is reserved for release-baked and operator-trusted (unsigned) checkpoints"));
     }
     let threshold: usize =
         req(args, "--threshold")?.parse().map_err(|_| "--threshold must be a count".to_string())?;
@@ -731,11 +731,18 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
     // --operator-trusted: the Ethereum model. Nobody signs the result; the
     // operator who boots with it (--ws-trusted-checkpoint) vouches for it.
     let operator_trusted = args.iter().any(|a| a == "--operator-trusted");
-    let signer_set_id: u32 = if operator_trusted {
+    // --release-anchor: the checkpoint a release engineer bakes into the node
+    // release (crates/bloch-pos-node/release/ws-anchor.bin). Never signed;
+    // its trust is the release's own.
+    let release_anchor = args.iter().any(|a| a == "--release-anchor");
+    if release_anchor && operator_trusted {
+        return Err("--release-anchor and --operator-trusted are alternatives".into());
+    }
+    let signer_set_id: u32 = if operator_trusted || release_anchor {
         if crate::arg_value(args, "--signer-set-id").is_some() {
-            return Err("--operator-trusted and --signer-set-id are alternatives: an operator-trusted checkpoint is never signed".into());
+            return Err("--operator-trusted/--release-anchor and --signer-set-id are alternatives: an unsigned checkpoint is never signed".into());
         }
-        ws_boot::WS_OPERATOR_TRUSTED_SIGNER_SET_ID
+        if release_anchor { ws_boot::WS_RELEASE_SIGNER_SET_ID } else { ws_boot::WS_OPERATOR_TRUSTED_SIGNER_SET_ID }
     } else {
         let id: u32 = req(args, "--signer-set-id")?
             .parse()
@@ -743,8 +750,8 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
         if id == WS_GENESIS_SIGNER_SET_ID {
             return Err("signer-set id 0 is reserved for the genesis anchor".into());
         }
-        if id == ws_boot::WS_OPERATOR_TRUSTED_SIGNER_SET_ID {
-            return Err("this signer-set id is reserved for operator-trusted checkpoints; use --operator-trusted".into());
+        if ws_boot::is_unsigned_anchor_id(id) {
+            return Err("this signer-set id is reserved for unsigned checkpoints; use --operator-trusted or --release-anchor".into());
         }
         id
     };
@@ -879,6 +886,19 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
     write_file(&json_path, format!("{}\n", view.to_string()).as_bytes(), false)?;
 
     println!("wrote {bin_path} ({} canonical bytes) and {json_path}", bytes.len());
+    if release_anchor {
+        ws_boot::decode_release_anchor(&bytes).map_err(|e| format!("self-check failed: {e}"))?;
+        println!("release-baked checkpoint (unsigned): epoch {epoch}, block root");
+        println!("  {}", hex32(&cp.block_root));
+        println!(
+            "next: copy {bin_path} to crates/bloch-pos-node/release/ws-anchor.bin in the release \
+             tree, build with --features ws-auto-checkpoint, and quote epoch, block root and the \
+             file's SHA-256 in the release notes. Anyone with a synced node re-derives it with \
+             the same command and --issued-at {}",
+            cp.issued_at
+        );
+        return Ok(());
+    }
     if operator_trusted {
         println!("operator-trusted checkpoint (unsigned): epoch {epoch}, block root");
         println!("  {}", hex32(&cp.block_root));

@@ -393,7 +393,7 @@ fn print_help() {
                spending key. No acknowledgement: confirmation is seeing\n\
                it in a block.\n\
            bloch-pos ws-checkpoint --genesis <manifest> --rpc <a>[,<b>...]\n\
-                                   --epoch <E> (--signer-set-id <n> | --operator-trusted)\n\
+                                   --epoch <E> (--signer-set-id <n> | --operator-trusted | --release-anchor)\n\
                                    --out <prefix> [--publication-dir <0700 registry>]\n\
                Derive the weak-subjectivity checkpoint for a FINALIZED\n\
                epoch from running nodes (all --rpc endpoints must agree),\n\
@@ -596,6 +596,9 @@ fn print_help() {
                younger than the weak-subjectivity period that needs no\n\
                checkpoint at all; past it, a fresh node requires\n\
                --ws-checkpoint and says so rather than syncing blindly.\n\
+               PROTOTYPE (built only with --features ws-auto-checkpoint):\n\
+               a release-baked checkpoint, the three unsigned flags below,\n\
+               and resuming a checkpoint sync after a restart.\n\
                --checkpoint-sync-url is the easy way in (the Ethereum model):\n\
                a new node asks those RPCs for their latest finalized\n\
                checkpoint, requires them all to agree, and syncs under it.\n\

@@ -492,7 +492,7 @@ pub fn combine(
         return Err(CombineReject::WrongVersion { got: cp.version });
     }
     if cp.signer_set_id == ws::WS_GENESIS_SIGNER_SET_ID || set.id == ws::WS_GENESIS_SIGNER_SET_ID
-        || cp.signer_set_id == WS_OPERATOR_TRUSTED_SIGNER_SET_ID || set.id == WS_OPERATOR_TRUSTED_SIGNER_SET_ID {
+        || is_unsigned_anchor_id(cp.signer_set_id) || is_unsigned_anchor_id(set.id) {
         return Err(CombineReject::ReservedSignerSet);
     }
     if cp.signer_set_id != set.id {
@@ -635,6 +635,67 @@ pub fn save_latest(dir: &Path, cp: &WeakSubjectivityCheckpoint) -> io::Result<()
 /// mistaken for, or combined into, a signed envelope.
 pub const WS_OPERATOR_TRUSTED_SIGNER_SET_ID: u32 = u32::MAX;
 
+/// Reserved `signer_set_id` of a **release-baked** checkpoint: a finalized
+/// (epoch, block, state) compiled into the node release itself, exactly as
+/// the genesis anchor is. Its trust is the release binary's trust — the same
+/// trust every operator already places in the code that enforces the window
+/// — so it adds no key, no ceremony and no new root of trust. Like the
+/// operator-trusted id, no arrangement may claim it and it is never signed.
+pub const WS_RELEASE_SIGNER_SET_ID: u32 = u32::MAX - 1;
+
+/// The ids that name an unsigned anchor and can never appear in a signed
+/// arrangement or envelope.
+pub const fn is_unsigned_anchor_id(id: u32) -> bool {
+    id == WS_OPERATOR_TRUSTED_SIGNER_SET_ID || id == WS_RELEASE_SIGNER_SET_ID
+}
+
+/// True when this binary was built with the `ws-auto-checkpoint` prototype
+/// feature. Without it the node behaves exactly as fa980367: the unsigned
+/// flags are refused, no release anchor is consulted, and a restart part-way
+/// through a checkpoint sync still halts with `ERR_WS_STALE`.
+pub const AUTO_CHECKPOINT_ENABLED: bool = cfg!(feature = "ws-auto-checkpoint");
+
+/// Decode the release-baked checkpoint file. An EMPTY file means "this
+/// release bakes no checkpoint" (the state of every build until a release
+/// engineer mints one with `ws-checkpoint --release-anchor`).
+pub fn decode_release_anchor(bytes: &[u8]) -> Result<Option<WeakSubjectivityCheckpoint>, String> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let cp = decode_checkpoint(bytes).map_err(|e| format!("release-baked checkpoint: {e}"))?;
+    if cp.version != ws::WS_FORMAT_VERSION {
+        return Err(format!("release-baked checkpoint: unsupported version {}", cp.version));
+    }
+    if cp.signer_set_id != WS_RELEASE_SIGNER_SET_ID {
+        return Err(format!(
+            "release-baked checkpoint carries signer-set id {}, not the reserved release id {WS_RELEASE_SIGNER_SET_ID}; \
+             mint it with `bloch-pos ws-checkpoint --release-anchor`",
+            cp.signer_set_id
+        ));
+    }
+    if cp.epoch == 0 {
+        return Err("release-baked checkpoint at epoch 0 duplicates the genesis anchor".into());
+    }
+    if cp.validator_set_root != [0; 32] {
+        return Err("release-baked checkpoint has a nonzero validator_set_root this node cannot derive".into());
+    }
+    Ok(Some(cp))
+}
+
+/// The checkpoint compiled into this binary, if any. Only builds with the
+/// `ws-auto-checkpoint` feature read `release/ws-anchor.bin`; the file in the
+/// tree is empty, so even those builds bake nothing until a release fills it.
+pub fn compiled_release_anchor() -> Result<Option<WeakSubjectivityCheckpoint>, String> {
+    #[cfg(feature = "ws-auto-checkpoint")]
+    {
+        decode_release_anchor(include_bytes!("../release/ws-anchor.bin"))
+    }
+    #[cfg(not(feature = "ws-auto-checkpoint"))]
+    {
+        Ok(None)
+    }
+}
+
 /// Where an unsigned, operator-trusted checkpoint comes from.
 #[derive(Debug, Clone)]
 pub enum TrustedSource {
@@ -671,6 +732,16 @@ pub struct WsConfig {
     pub checkpoint_sync: Vec<String>,
     /// `--ws-trusted-root` given together with `--checkpoint-sync-url`.
     pub checkpoint_sync_pin: Option<[u8; 32]>,
+    /// Release-baked checkpoint ([`WS_RELEASE_SIGNER_SET_ID`]), consulted on
+    /// every boot before any operator input. `None` unless the binary was
+    /// built with `ws-auto-checkpoint` AND its `release/ws-anchor.bin` is set.
+    pub release_anchor: Option<WeakSubjectivityCheckpoint>,
+    /// Restart-during-checkpoint-sync fix (agent 181's ERR_WS_STALE finding):
+    /// a node whose own finality is beyond the window but BEHIND a fresh,
+    /// already-verified anchor keeps syncing under that anchor as a hard
+    /// anchor, exactly as it did before the restart. Off unless built with
+    /// `ws-auto-checkpoint`.
+    pub resume_sync_under_anchor: bool,
 }
 
 impl WsConfig {
@@ -740,6 +811,10 @@ impl WsConfig {
         if block_root.is_some() && trusted_file.is_none() && checkpoint_sync.is_empty() {
             return Err("--ws-trusted-root compares a checkpoint: supply it with --checkpoint-sync-url or --ws-trusted-checkpoint".into());
         }
+        if !AUTO_CHECKPOINT_ENABLED && (trusted_file.is_some() || block_root.is_some() || !checkpoint_sync.is_empty()) {
+            return Err("--checkpoint-sync-url, --ws-trusted-checkpoint and --ws-trusted-root are a prototype \
+                        (cargo feature `ws-auto-checkpoint`) and are not enabled in this build".into());
+        }
         let checkpoint_sync_pin = if checkpoint_sync.is_empty() { None } else { block_root };
         let trusted = trusted_file.map(|path| TrustedCheckpoint { source: TrustedSource::File(PathBuf::from(path)), block_root });
         Ok(Self {
@@ -749,6 +824,8 @@ impl WsConfig {
             trusted,
             checkpoint_sync,
             checkpoint_sync_pin,
+            release_anchor: compiled_release_anchor()?,
+            resume_sync_under_anchor: AUTO_CHECKPOINT_ENABLED,
         })
     }
 }
@@ -893,6 +970,74 @@ fn trusted_checkpoint(
     Ok(cp)
 }
 
+/// Admit the release-baked checkpoint, if it applies to this network. The
+/// order of checks is the signed envelope's: identity, local evidence,
+/// own-finality cross-check (a contradiction is the `WS_CONFLICT` alarm and
+/// is not admitted — a release can never reorganize a running node), then
+/// anti-rollback with the same-fact rule.
+#[allow(clippy::too_many_arguments)]
+fn admit_release_anchor(
+    release: &WeakSubjectivityCheckpoint,
+    data_dir: &Path,
+    network_id: u32,
+    genesis_root: &[u8; 32],
+    genesis_anchor: &WeakSubjectivityCheckpoint,
+    has_local_finality: bool,
+    local_root_at: &impl Fn(u64) -> Option<[u8; 32]>,
+    local_state_root: &impl Fn(&[u8; 32]) -> Option<[u8; 32]>,
+    anchor: &mut WeakSubjectivityCheckpoint,
+    warnings: &mut Vec<String>,
+) -> io::Result<Result<(), String>> {
+    if release.signer_set_id != WS_RELEASE_SIGNER_SET_ID {
+        return Err(boot_refused("release-baked checkpoint does not carry the reserved release id; refusing"));
+    }
+    if release.network_id != network_id || &release.genesis_root != genesis_root {
+        // A mainnet release run against a devnet manifest: not this chain's
+        // fact, so it is neither an anchor nor an error.
+        warnings.push(format!(
+            "release-baked checkpoint (epoch {}) is for network {:#010x}, not this one; ignored",
+            release.epoch, release.network_id
+        ));
+        return Ok(Ok(()));
+    }
+    check_local_state(release, genesis_anchor, local_state_root, warnings)?;
+    if has_local_finality {
+        if let CrossCheck::Conflict { local_root, published_root } = ws::cross_check(local_root_at(release.epoch), release) {
+            warnings.push(format!(
+                "WS_CONFLICT: the release-baked checkpoint contradicts this node's OWN finality at epoch {}.\n  \
+                 local finalized root: {}\n  release root:         {}\n\
+                 Own finality stands: NOT reorganizing, NOT adopting the release anchor. Either this \
+                 node is on a forged branch or the release was built against a wrong chain; alert the operator.",
+                release.epoch, hex32(&local_root), hex32(&published_root)
+            ));
+            return Ok(Ok(()));
+        }
+    }
+    match same_fact_accept(anchor, release) {
+        Acceptance::Store => {
+            save_latest(data_dir, release)?;
+            *anchor = *release;
+            warnings.push(format!(
+                "release-baked checkpoint adopted: epoch {} block {} (trust = this release binary; no signatures)",
+                release.epoch, hex32(&release.block_root)
+            ));
+        }
+        Acceptance::Ignore => warnings.push(format!(
+            "release-baked checkpoint epoch {} is not newer than stored ws_latest (epoch {}); ignored",
+            release.epoch, anchor.epoch
+        )),
+        Acceptance::Conflict => {
+            return Ok(Err(format!(
+                "WS_CONFLICT (release-baked checkpoint): this release names block {} at epoch {}, but the \
+                 stored ws_latest names block {} at the same epoch. Refusing to start; compare both roots \
+                 with operators you trust before choosing.",
+                hex32(&release.block_root), release.epoch, hex32(&anchor.block_root)
+            )));
+        }
+    }
+    Ok(Ok(()))
+}
+
 /// The whole boot sequence described in the module docs. `local_root_at`
 /// returns this node's own finalized checkpoint root at an epoch (`None` if
 /// its finality has not reached it); `is_canonical` answers whether a block
@@ -927,6 +1072,20 @@ pub fn boot(
     };
 
     check_local_state(&anchor, genesis_anchor, &local_state_root, &mut warnings)?;
+
+    // 1b. Release-baked checkpoint (prototype, `ws-auto-checkpoint`): the
+    //     same trust as the genesis anchor — the release binary — at a recent
+    //     epoch. It goes through every rule a signed envelope goes through
+    //     except the signature check, because there is nothing to sign: the
+    //     bytes are part of the code that enforces the window.
+    if let Some(release) = &cfg.release_anchor {
+        if let Err(message) = admit_release_anchor(
+            release, data_dir, network_id, genesis_root, genesis_anchor, has_local_finality,
+            &local_root_at, &local_state_root, &mut anchor, &mut warnings,
+        )? {
+            return Ok(Err(message));
+        }
+    }
 
     // 2. Operator-supplied envelope (§4.1 precedence, source 1), or the
     //    unsigned operator-trusted checkpoint (the Ethereum model).
@@ -978,10 +1137,10 @@ pub fn boot(
         let Some((threshold, signers, min_external)) = shape_policy_of(&set) else {
             return Err(bad(shape_policy_refusal(&set, &set_path.display().to_string())));
         };
-        if env.checkpoint.signer_set_id == WS_OPERATOR_TRUSTED_SIGNER_SET_ID || set.id == WS_OPERATOR_TRUSTED_SIGNER_SET_ID {
+        if is_unsigned_anchor_id(env.checkpoint.signer_set_id) || is_unsigned_anchor_id(set.id) {
             return Err(bad(format!(
-                "checkpoint envelope {} REFUSED: signer-set id {WS_OPERATOR_TRUSTED_SIGNER_SET_ID} is reserved for \
-                 operator-trusted checkpoints, which are never signed (use --ws-trusted-checkpoint)",
+                "checkpoint envelope {} REFUSED: signer-set ids {WS_RELEASE_SIGNER_SET_ID} and {WS_OPERATOR_TRUSTED_SIGNER_SET_ID} are reserved for \
+                 release-baked and operator-trusted checkpoints, which are never signed (use --ws-trusted-checkpoint)",
                 path.display()
             )));
         }
@@ -1116,6 +1275,7 @@ pub fn boot(
     let (fin_epoch, fin_root) = local_finalized;
     let age = wall_epoch.saturating_sub(fin_epoch);
     let anchor_age = wall_epoch.saturating_sub(anchor.epoch);
+    let mut hard_anchor = !has_local_finality;
     let gate: Result<(), String> = match ws::boot_decision(has_local_finality, age) {
         BootDecision::Resume => Ok(()),
         BootDecision::ResumeStaleWarn => {
@@ -1152,7 +1312,29 @@ pub fn boot(
                 // can only be established against blocks this node already
                 // has — header-sync-forward does not exist at this milestone.
                 let descends = is_canonical(&anchor.block_root);
-                match ws::reconcile(&anchor, fin_root, descends) {
+                // Agent 181's finding: a node restarted part-way through a
+                // checkpoint sync has some own finality, all of it older than
+                // the window, and has not replayed up to the anchor block yet,
+                // so `descends` is false and the old rule halted it. The
+                // anchor is fresh, verified and AHEAD of everything this node
+                // finalized: the node is in exactly the state it was in before
+                // the restart, so it continues under the anchor as a HARD
+                // anchor (a contradiction when its finality reaches the
+                // anchor epoch exits 78, as for a fresh node). Nothing is
+                // discarded, so no evidence disappears.
+                let syncing_under_anchor = cfg.resume_sync_under_anchor
+                    && anchor.signer_set_id != ws::WS_GENESIS_SIGNER_SET_ID
+                    && anchor.epoch > fin_epoch;
+                if !descends && syncing_under_anchor {
+                    hard_anchor = true;
+                    warnings.push(format!(
+                        "resuming a checkpoint sync: own finality (epoch {fin_epoch}) is {age} epochs old, \
+                         behind the verified anchor at epoch {}; continuing under that anchor as the only \
+                         defense (hard), as before the restart",
+                        anchor.epoch
+                    ));
+                    Ok(())
+                } else { match ws::reconcile(&anchor, fin_root, descends) {
                     Reconciliation::ContinueForward => {
                         warnings.push(format!(
                             "own finality is {age} epochs old (beyond the {}-epoch \
@@ -1182,7 +1364,7 @@ pub fn boot(
                         hex32(&local_finalized_root),
                         hex32(&checkpoint_root),
                     )),
-                }
+                } }
             } else {
                 Err(format!(
                     "ERR_WS_STALE: this node's own finalized knowledge is {age} epochs \
@@ -1207,7 +1389,7 @@ pub fn boot(
             checkpoint: anchor,
             anchor_epoch: anchor.epoch,
             anchor_root: anchor.block_root,
-            anchor_is_hard: !has_local_finality,
+            anchor_is_hard: hard_anchor,
             warnings,
         }),
         Err(msg) => Err(msg),
@@ -2538,6 +2720,7 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    #[cfg(feature = "ws-auto-checkpoint")]
     #[test]
     fn trusted_flags_parse_and_sources_are_alternatives() {
         let root = "22".repeat(32);
@@ -2682,5 +2865,192 @@ mod tests {
             combine(&cp, &set, &[a_partial(&cp, 0), a_partial(&cp, 2)]),
             Err(CombineReject::ReservedSignerSet)
         ));
+    }
+
+    // ── agent 208: release-baked anchor and restart-during-sync (prototype) ──
+
+    fn release_cp(epoch: u64) -> WeakSubjectivityCheckpoint {
+        WeakSubjectivityCheckpoint {
+            validator_set_root: [0; 32],
+            signer_set_id: WS_RELEASE_SIGNER_SET_ID,
+            ..checkpoint(epoch)
+        }
+    }
+
+    fn release_config(cp: WeakSubjectivityCheckpoint) -> WsConfig {
+        WsConfig { release_anchor: Some(cp), ..WsConfig::default() }
+    }
+
+    #[test]
+    fn default_build_is_inert() {
+        assert_eq!(AUTO_CHECKPOINT_ENABLED, cfg!(feature = "ws-auto-checkpoint"));
+        let parsed = WsConfig::from_args(&args(&["--data-dir", "x"])).unwrap();
+        assert_eq!(parsed.resume_sync_under_anchor, AUTO_CHECKPOINT_ENABLED);
+        // The tree's release/ws-anchor.bin is empty: no build bakes an anchor.
+        assert!(parsed.release_anchor.is_none());
+        assert!(compiled_release_anchor().unwrap().is_none());
+        if !AUTO_CHECKPOINT_ENABLED {
+            for flags in [
+                vec!["--checkpoint-sync-url", "127.0.0.1:1"],
+                vec!["--ws-trusted-checkpoint", "cp.bin"],
+            ] {
+                let error = WsConfig::from_args(&args(&flags)).err().expect("refused without the feature");
+                assert!(error.contains("not enabled in this build"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn release_anchor_file_decoding() {
+        assert_eq!(decode_release_anchor(&[]).unwrap(), None);
+        let cp = release_cp(7168);
+        assert_eq!(decode_release_anchor(&cp.canonical_serialize()).unwrap(), Some(cp));
+        let signed = WeakSubjectivityCheckpoint { validator_set_root: [0; 32], ..checkpoint(7168) };
+        assert!(decode_release_anchor(&signed.canonical_serialize()).unwrap_err().contains("reserved release id"));
+        let trusted = WeakSubjectivityCheckpoint { signer_set_id: WS_OPERATOR_TRUSTED_SIGNER_SET_ID, ..cp };
+        assert!(decode_release_anchor(&trusted.canonical_serialize()).is_err());
+        assert!(decode_release_anchor(&release_cp(0).canonical_serialize()).is_err());
+        let nonzero = WeakSubjectivityCheckpoint { validator_set_root: [1; 32], ..cp };
+        assert!(decode_release_anchor(&nonzero.canonical_serialize()).is_err());
+        assert!(decode_release_anchor(&cp.canonical_serialize()[..100]).is_err());
+    }
+
+    /// The headline: a wiped mainnet node at wall epoch 7290 boots with no
+    /// flag and no signature because its release bakes epoch 7168.
+    #[test]
+    fn release_anchor_boots_a_fresh_node_with_no_flags() {
+        let dir = tmpdir("release-fresh");
+        let wall = 7290;
+        let out = boot(&release_config(release_cp(7168)), &dir, NET, &GEN, &genesis_anchor(), wall, false,
+            (0, GEN), |_| None, |_| false, |_| None).unwrap().expect("release anchor admits a fresh node");
+        assert_eq!(out.anchor_epoch, 7168);
+        assert!(out.anchor_is_hard);
+        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), release_cp(7168));
+        assert!(out.warnings.iter().any(|w| w.contains("release-baked checkpoint adopted")), "{:?}", out.warnings);
+        // The window is unchanged: a release older than 2016 epochs is refused
+        // like any other stale anchor, and the message still says where to go.
+        let old = tmpdir("release-stale");
+        let refusal = boot(&release_config(release_cp(7168)), &old, NET, &GEN, &genesis_anchor(),
+            7168 + WS_PERIOD_EPOCHS, false, (0, GEN), |_| None, |_| false, |_| None)
+            .unwrap().expect_err("an aged release anchor does not stretch the window");
+        assert!(refusal.contains("ERR_WS_REQUIRE_CHECKPOINT"), "{refusal}");
+    }
+
+    #[test]
+    fn release_anchor_for_another_network_is_ignored_not_fatal() {
+        let dir = tmpdir("release-other-net");
+        let foreign = WeakSubjectivityCheckpoint { network_id: NET ^ 1, ..release_cp(64) };
+        let out = boot(&release_config(foreign), &dir, NET, &GEN, &genesis_anchor(), 70, false,
+            (0, GEN), |_| None, |_| false, |_| None).unwrap().expect("young devnet boots on genesis");
+        assert_eq!(out.anchor_epoch, 0);
+        assert!(out.warnings.iter().any(|w| w.contains("not this one; ignored")), "{:?}", out.warnings);
+    }
+
+    /// A release can never move a running node: a contradiction with own
+    /// finality is the WS_CONFLICT alarm, the anchor is not adopted, and the
+    /// node keeps its own finality.
+    #[test]
+    fn release_anchor_never_overrides_own_finality() {
+        let dir = tmpdir("release-conflict");
+        let out = boot(&release_config(release_cp(7168)), &dir, NET, &GEN, &genesis_anchor(), 7290, true,
+            (7280, [0x77; 32]), |_| Some([0x99; 32]), |_| true, |_| None).unwrap().expect("own finality resumes");
+        assert!(!out.anchor_is_hard);
+        assert_ne!(out.anchor_epoch, 7168);
+        assert!(out.warnings.iter().any(|w| w.contains("WS_CONFLICT")), "{:?}", out.warnings);
+        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), genesis_anchor());
+    }
+
+    /// The release anchor, a signed envelope and an operator-trusted file for
+    /// the same block are one fact. A different block at the same epoch is a
+    /// loud refusal. An older release never rolls a newer stored anchor back.
+    #[test]
+    fn release_anchor_same_fact_conflict_and_anti_rollback() {
+        let dir = tmpdir("release-same-fact");
+        save_latest(&dir, &checkpoint(7168)).unwrap();
+        boot(&release_config(release_cp(7168)), &dir, NET, &GEN, &genesis_anchor(), 7290, false,
+            (0, GEN), |_| None, |_| false, |_| None).unwrap().expect("same block and state: one fact");
+        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), checkpoint(7168));
+
+        let other = WeakSubjectivityCheckpoint { block_root: [0x23; 32], ..release_cp(7168) };
+        let refusal = boot(&release_config(other), &dir, NET, &GEN, &genesis_anchor(), 7290, false,
+            (0, GEN), |_| None, |_| false, |_| None).unwrap().expect_err("same epoch, other block");
+        assert!(refusal.contains("WS_CONFLICT (release-baked checkpoint)"), "{refusal}");
+
+        let newer = tmpdir("release-rollback");
+        save_latest(&newer, &checkpoint(7424)).unwrap();
+        let out = boot(&release_config(release_cp(7168)), &newer, NET, &GEN, &genesis_anchor(), 7500, false,
+            (0, GEN), |_| None, |_| false, |_| None).unwrap().expect("stored newer anchor stands");
+        assert_eq!(out.anchor_epoch, 7424);
+        assert!(out.warnings.iter().any(|w| w.contains("not newer")), "{:?}", out.warnings);
+    }
+
+    /// No arrangement, partial or envelope may use the reserved release id.
+    #[test]
+    fn the_release_id_can_never_be_signed() {
+        let cp = release_cp(1536);
+        let set = SignerSet { id: WS_RELEASE_SIGNER_SET_ID, ..a_set(WS_PHASE_A_MIN_EXTERNAL, 0) };
+        assert!(matches!(combine(&cp, &set, &[a_partial(&cp, 0), a_partial(&cp, 2)]),
+            Err(CombineReject::ReservedSignerSet)));
+        let dir = tmpdir("release-id-envelope");
+        let (owner_set, secrets) = owner_set_and_secrets(WS_RELEASE_SIGNER_SET_ID);
+        let env = owner_envelope(cp, &secrets, &[0, 1]);
+        let cfg = write_artifacts(&dir, "reserved", &env, &owner_set);
+        let error = boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), 1600, false,
+            (0, GEN), |_| None, |_| false, |_| None).err().expect("reserved id refused");
+        assert!(error.to_string().contains("reserved"), "{error}");
+    }
+
+    /// Agent 181's finding, fixed behind the prototype switch: the same
+    /// restart that halts today (own finality 4290 epochs old, checkpoint
+    /// block not yet local) resumes under the stored anchor, as a HARD anchor.
+    #[test]
+    fn restart_during_checkpoint_sync_resumes_under_the_anchor() {
+        let dir = tmpdir("resume-midsync");
+        save_latest(&dir, &checkpoint(7168)).unwrap();
+        let wall = 7290;
+        let on = WsConfig { resume_sync_under_anchor: true, ..WsConfig::default() };
+        let out = boot(&on, &dir, NET, &GEN, &genesis_anchor(), wall, true,
+            (3000, [0x55; 32]), |_| None, |_| false, |_| None).unwrap().expect("resumes under the anchor");
+        assert_eq!(out.anchor_epoch, 7168);
+        assert!(out.anchor_is_hard, "the anchor stays the only defense");
+        assert!(out.warnings.iter().any(|w| w.contains("resuming a checkpoint sync")), "{:?}", out.warnings);
+
+        // Switch off: today's behaviour is unchanged.
+        let halted = boot(&no_flags(), &dir, NET, &GEN, &genesis_anchor(), wall, true,
+            (3000, [0x55; 32]), |_| None, |_| false, |_| None).unwrap().expect_err("still halts when off");
+        assert!(halted.contains("ERR_WS_STALE recovery halted"), "{halted}");
+
+        // Not widened: an anchor that is itself past the window still refuses,
+        // and so does a stale node whose only anchor is the genesis anchor.
+        let refused = boot(&on, &dir, NET, &GEN, &genesis_anchor(), 7168 + WS_PERIOD_EPOCHS, true,
+            (3000, [0x55; 32]), |_| None, |_| false, |_| None).unwrap().expect_err("aged anchor");
+        assert!(refused.contains("ERR_WS_STALE"), "{refused}");
+        let genesis_only = tmpdir("resume-genesis-only");
+        let refused = boot(&on, &genesis_only, NET, &GEN, &genesis_anchor(), wall, true,
+            (3000, [0x55; 32]), |_| None, |_| false, |_| None).unwrap().expect_err("genesis anchor is stale");
+        assert!(refused.contains("ERR_WS_STALE"), "{refused}");
+
+        // Why `anchor.epoch > fin_epoch` always holds on this branch: it is
+        // reached only with age >= WS_PERIOD and anchor_age < WS_PERIOD, so
+        // the anchor is strictly newer than own finality. A stored anchor at
+        // or below own finality never needs this rule.
+    }
+
+    /// The whole non-recurring path: release anchor on a wiped node, a
+    /// restart mid-sync, then the node's own finality takes over.
+    #[test]
+    fn release_anchor_and_resume_together() {
+        let dir = tmpdir("release-and-resume");
+        let mut cfg = release_config(release_cp(7168));
+        cfg.resume_sync_under_anchor = true;
+        boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), 7290, false, (0, GEN), |_| None, |_| false, |_| None)
+            .unwrap().expect("fresh boot");
+        let out = boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), 7300, true, (2500, [0x55; 32]),
+            |_| None, |_| false, |_| None).unwrap().expect("restart mid-sync");
+        assert!(out.anchor_is_hard);
+        let caught_up = boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), 7400, true, (7398, [0x22; 32]),
+            |e| (e == 7168).then_some([0x22; 32]), |_| true, |_| None).unwrap().expect("synced");
+        assert!(!caught_up.anchor_is_hard);
+        assert!(caught_up.warnings.iter().any(|w| w.contains("not newer")), "{:?}", caught_up.warnings);
     }
 }
