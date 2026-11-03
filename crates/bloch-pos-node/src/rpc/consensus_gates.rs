@@ -43,6 +43,10 @@ const HARD_FORK_KEYS: &[(&str, Option<&str>)] = &[
     ("params::HF3_SLH_SUITE_EPOCH", Some("hf3_slh")),
     ("params::HF3_PQ_MIGRATION_EPOCH", Some("hf3_pq_migration")),
     ("params::LATTICE_EMERGENCY_ACTIVATION_EPOCH", Some("hf3_lattice_emergency")),
+    ("params::L2_NEXT_PROGRAM_EPOCH", Some("l2_next_program")),
+    ("params::L2_PROGRAM_ROLLBACK_EPOCH", Some("l2_program_rollback")),
+    ("params::L2_DA_RESERVED_SLOT_EPOCH", Some("l2_da_reserved_slot")),
+    ("params::L2_FORCED_INCLUSION_EPOCH", Some("l2_forced_inclusion")),
 ];
 
 /// The RPC key for a gate. A gate added to `HARD_FORK_GATES` by a later
@@ -189,6 +193,10 @@ mod tests {
             "hf3_slh",
             "hf3_pq_migration",
             "hf3_lattice_emergency",
+            "l2_next_program",
+            "l2_program_rollback",
+            "l2_da_reserved_slot",
+            "l2_forced_inclusion",
         ];
         let Json::Obj(fields) = &v else { panic!("not an object") };
         assert_eq!(fields.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), expected);

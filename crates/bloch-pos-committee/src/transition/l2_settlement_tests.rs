@@ -2830,7 +2830,595 @@ mod l2_tests {
         assert!(!fresh.admits(100 * BLCH + 1, false));
         assert!(fresh.admits(100 * BLCH + 1, true));
         let after = wd::ReleaseWindow { released: 1, ..fresh };
-        assert!(!after.admits(100 * BLCH, true));
+        assert!(!after.admits_v1(100 * BLCH, true));
+        // The next program: one exemption per window, whatever came first.
+        assert!(after.admits(100 * BLCH, true));
+        assert!(!after.admits(100 * BLCH, false));
+        let full = wd::ReleaseWindow { released: sat(100), ..fresh };
+        assert!(full.admits(200 * BLCH, true), "claims filling the cap do not spend the exemption");
+        assert!(!full.admits(1, false));
+        let spent = wd::ReleaseWindow { released: sat(100) + 1, ..fresh };
+        assert!(!spent.admits(1, true), "one exemption per window");
+        assert!(!spent.admits(1, false));
+    }
+
+    // ── The next L2 program (candidate; the gate stays the sentinel) ──
+
+    fn mainnet_l2_state() -> crate::l2_settlement::State {
+        crate::l2_settlement::State::activated(mainnet::activation().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn next_program_gate_is_inert_and_chooses_no_epoch() {
+        assert_eq!(crate::params::L2_NEXT_PROGRAM_EPOCH, u64::MAX);
+        for epoch in [0, 5_850, 8_620, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::l2_next_program_active(epoch));
+        }
+        let (pinned, next) = (mainnet::PROGRAM.unwrap(), mainnet::PROGRAM_NEXT);
+        assert_eq!(next.proof_policy, pinned.proof_policy, "the circuits and the tag stay");
+        for (a, b) in next.identities.iter().zip(&pinned.identities[3..7]) {
+            assert_ne!(a, b);
+        }
+    }
+
+    #[test]
+    fn next_program_replaces_only_the_program_at_the_gate_and_only_on_mainnet() {
+        let (mut pre, _) = fixture();
+        let other = pre.l2_settlement().unwrap().clone();
+        // Below the gate nothing moves on an epoch boundary.
+        pre.l2_settlement = Some(mainnet_l2_state());
+        let below = pre.close_epoch();
+        let before = pre.l2_settlement().unwrap().clone();
+        assert_eq!(below.l2_settlement().unwrap().policy(), before.policy());
+        assert!(!below.l2_settlement().unwrap().next_program_active());
+
+        let _gate = crate::params::l2_next_program_test::open();
+        let crossed = pre.close_epoch();
+        let after = crossed.l2_settlement().unwrap();
+        let (old, new) = (before.policy(), after.policy());
+        assert_eq!(new.identities[..3], old.identities[..3]);
+        assert_eq!(new.identities[3..7], mainnet::PROGRAM_NEXT.identities);
+        assert_eq!(new.proof_policy, old.proof_policy);
+        assert_eq!(new.chain_id, old.chain_id);
+        assert_eq!(new.initial_l2_parent, old.initial_l2_parent);
+        assert_eq!(new.initial_l2_state, old.initial_l2_state);
+        assert_eq!(new.attestor_set, old.attestor_set);
+        assert_eq!(after.limits(), before.limits());
+        assert!(after.next_program_active());
+        assert_ne!(crossed.state_root(), below.state_root(), "the policy is committed");
+        // A later boundary keeps the same program.
+        assert_eq!(crossed.close_epoch().l2_settlement().unwrap().policy(), new);
+
+        // An L2 on any other policy is left alone.
+        pre.l2_settlement = Some(other.clone());
+        assert_eq!(pre.close_epoch().l2_settlement().unwrap().policy(), other.policy());
+    }
+
+    #[test]
+    fn settlements_follow_the_program_across_the_swap() {
+        let (pre, mut chains) = fixture();
+        let t = Transition::new(ProofDouble);
+
+        // One settlement under the old program.
+        let old_tx = PosTransaction::L2Settlement(Box::new(transaction(&pre)));
+        let block = build_block(&t, &pre, 2, &[], std::slice::from_ref(&old_tx), &mut chains);
+        let settled = t.apply_block(&pre, &block, &[], std::slice::from_ref(&old_tx)).unwrap();
+        let head = settled.l2_settlement().unwrap().head().unwrap();
+
+        // The swap keeps the head; what was proved for the old program is refused.
+        // A second identical fixture, because building a block spends its RANDAO chains.
+        let (mut swapped, mut chains) = fixture();
+        assert_eq!(swapped.state_root(), pre.state_root());
+        let mut l2 = swapped.l2_settlement().unwrap().clone();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        swapped.l2_settlement = Some(l2);
+        assert!(t.apply_block(&swapped, &block, &[], std::slice::from_ref(&old_tx)).is_err());
+        let mut state = swapped.l2_settlement().unwrap().clone();
+        let PosTransaction::L2Settlement(old) = &old_tx else { unreachable!() };
+        assert_eq!(state.apply(old, *swapped.head.as_bytes(), swapped.slot, false, &ProofDouble), Err(crate::l2_settlement::Reject::Policy));
+
+        // The same block under the new identities settles, as the successor rule sees it.
+        let new_tx = PosTransaction::L2Settlement(Box::new(transaction(&swapped)));
+        let block = build_block(&t, &swapped, 2, &[], std::slice::from_ref(&new_tx), &mut chains);
+        let next = t.apply_block(&swapped, &block, &[], std::slice::from_ref(&new_tx)).unwrap();
+        let new_head = next.l2_settlement().unwrap().head().unwrap();
+        assert_ne!(new_head.0, head.0);
+        assert_eq!(next.l2_settlement().unwrap().settled_number(), 1);
+    }
+
+    // ── The sparse guest: the swap, what is in flight across it, the rollback ──
+
+    /// The flag day of a rehearsal network that holds the mainnet program: the
+    /// gates act on it, and the funded depositor and the L2 are real.
+    fn swap_fixture() -> (CommittedState, Vec<RandaoChain>) {
+        let (pre, mut policy, mut chains) = funded_running_without_l2();
+        let pinned = mainnet::PROGRAM.unwrap();
+        policy.identities[2..7].copy_from_slice(&pinned.identities[2..7]);
+        policy.proof_policy = pinned.proof_policy;
+        let _gate = crate::params::l2_settlement_rehearsal::open();
+        let _policy = crate::l2_settlement::activation_rehearsal::set(activation(policy, true));
+        let opened = apply(&pre, crate::params::SLOTS_PER_EPOCH, &[], &mut chains).unwrap();
+        (opened, chains)
+    }
+
+    fn program_of(state: &crate::l2_settlement::State) -> [[u8; 32]; 4] {
+        state.policy().identities[3..7].try_into().unwrap()
+    }
+
+    #[test]
+    fn the_rollback_gate_is_inert_and_the_fallback_proves_the_same_rules() {
+        assert_eq!(crate::params::L2_PROGRAM_ROLLBACK_EPOCH, u64::MAX);
+        for epoch in [0, 8_620, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::l2_program_rollback_active(epoch));
+        }
+        assert_eq!(mainnet::ROLLBACK_HEAD_RESET, None);
+        let (next, fallback, pinned) = (mainnet::PROGRAM_NEXT, mainnet::PROGRAM_FALLBACK, mainnet::PROGRAM.unwrap());
+        assert_eq!(next.identities[0], fallback.identities[0], "same rules");
+        assert_eq!(next.proof_policy, fallback.proof_policy);
+        for i in 1..4 {
+            assert_ne!(next.identities[i], fallback.identities[i], "another guest");
+        }
+        assert_ne!(fallback.identities[0], pinned.identities[3], "the next rules are one-way");
+    }
+
+    #[test]
+    fn the_schedule_is_empty_while_inert_and_names_only_what_is_ahead() {
+        let mut l2 = mainnet_l2_state();
+        assert!(l2.program_schedule().is_empty());
+        assert!(l2.program_schedule_for_test(u64::MAX, u64::MAX).is_empty());
+        let both = [(10_000, mainnet::PROGRAM_NEXT), (10_500, mainnet::PROGRAM_FALLBACK)];
+        assert_eq!(l2.program_schedule_for_test(10_000, 10_500), both);
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        assert_eq!(l2.program_schedule_for_test(10_000, 10_500), both[1..]);
+        assert!(l2.program_schedule_for_test(10_000, u64::MAX).is_empty());
+        l2.replace_program_for_test(&mainnet::PROGRAM_FALLBACK);
+        assert!(l2.program_schedule_for_test(10_000, 10_500).is_empty());
+        // Any other L2 hears nothing.
+        let (other, _) = fixture();
+        assert!(other.l2_settlement().unwrap().program_schedule_for_test(10_000, 10_500).is_empty());
+    }
+
+    #[test]
+    fn the_rollback_acts_only_on_the_swapped_program_and_only_once() {
+        let (mut pre, _) = fixture();
+        let other = pre.l2_settlement().unwrap().clone();
+        pre.l2_settlement = Some(mainnet_l2_state());
+
+        // Armed before any swap happened it leaves the activated program alone.
+        {
+            let _rollback = crate::params::l2_next_program_test::open_rollback();
+            assert_eq!(pre.close_epoch().l2_settlement().unwrap().policy(), pre.l2_settlement().unwrap().policy());
+        }
+        let _gate = crate::params::l2_next_program_test::open();
+        let swapped = pre.close_epoch();
+        assert_eq!(program_of(swapped.l2_settlement().unwrap()), mainnet::PROGRAM_NEXT.identities);
+
+        let stayed = swapped.close_epoch();
+        let _rollback = crate::params::l2_next_program_test::open_rollback();
+        let back = swapped.close_epoch();
+        let l2 = back.l2_settlement().unwrap();
+        assert_eq!(program_of(l2), mainnet::PROGRAM_FALLBACK.identities);
+        let (old, new) = (swapped.l2_settlement().unwrap().policy(), l2.policy());
+        assert_eq!(new.identities[..3], old.identities[..3]);
+        assert_eq!(new.identities[3], old.identities[3], "the rules stay");
+        assert_eq!(
+            (new.proof_policy, new.chain_id, new.initial_l2_parent, new.initial_l2_state, new.attestor_set),
+            (old.proof_policy, old.chain_id, old.initial_l2_parent, old.initial_l2_state, old.attestor_set),
+        );
+        assert_ne!(back.state_root(), stayed.state_root(), "the policy is committed");
+
+        // Both gates stay open and neither moves it again.
+        assert_eq!(back.close_epoch().l2_settlement().unwrap().policy(), new);
+        // Open together on an unswapped L2 they run in the one order.
+        assert_eq!(program_of(pre.close_epoch().l2_settlement().unwrap()), mainnet::PROGRAM_FALLBACK.identities);
+        // Any other L2 is left alone.
+        pre.l2_settlement = Some(other.clone());
+        assert_eq!(pre.close_epoch().l2_settlement().unwrap().policy(), other.policy());
+    }
+
+    /// Settlement N under the activated program; a proof of N+1 in flight when
+    /// the gate passes; N+1 under the sparse guest; then the same at a rollback.
+    #[test]
+    fn what_is_in_flight_crosses_the_swap_and_the_rollback() {
+        let (opened, mut chains) = swap_fixture();
+        let deposit = deposit_tx(&opened, 7_000_000_000);
+        let s1 = apply(&opened, 33, &[PosTransaction::L2Deposit(deposit)], &mut chains).unwrap();
+        let empty = crate::l2_settlement::expected_body_commitment(&[]);
+
+        // N: settled under the activated program, with withdrawals.
+        let leaves = wleaves(3);
+        let with_tree = |mut tx: Transaction| {
+            tx.statement[S + v3::WITHDRAWAL_ROOT..S + v3::WITHDRAWAL_ROOT + 32].copy_from_slice(&wd::root(&leaves));
+            tx.statement[S + v3::WITHDRAWAL_COUNT..S + v3::WITHDRAWAL_COUNT + 8].copy_from_slice(&3u64.to_be_bytes());
+            tx
+        };
+        let first = with_tree(to_v3(settlement(&s1, empty), no_deposits(), 0));
+        let s2 = apply(&s1, 34, &[PosTransaction::L2SettlementAsync(Box::new(first))], &mut chains).unwrap();
+        let (head_n, _) = s2.l2_settlement().unwrap().head().unwrap();
+        let s3 = apply(&s2, 35, &[], &mut chains).unwrap();
+
+        // N+1: proved under the activated program against the frozen source, with
+        // its data-availability record in place, not landed when the gate passes.
+        let record = s3.l2_settlement().unwrap().inbox()[0];
+        let minted = crate::l2_settlement::deposits_hash(&[record]);
+        let in_flight = with_tree(to_v3(settlement(&s3, empty), minted, 0));
+        let mut s3 = s3;
+        let da = crate::l2_settlement::da::Record { l2_number: 2, commitment: [0xd8; 32], height: s3.l2_settlement().unwrap().height() };
+        s3.l2_settlement.as_mut().unwrap().insert_da_record(da);
+        let parent = *s3.head.as_bytes();
+        let before = s3.l2_settlement().unwrap().clone();
+        assert_eq!(before.validate_async(&in_flight, &ProofDouble), Ok(()), "valid below the gate");
+        assert!(!before.names_another_program(&in_flight));
+
+        let swapped = {
+            let _gate = crate::params::l2_next_program_test::open();
+            apply(&s3, 2 * crate::params::SLOTS_PER_EPOCH, &[], &mut chains).unwrap()
+        };
+        let l2 = swapped.l2_settlement().unwrap();
+        assert_eq!(program_of(l2), mainnet::PROGRAM_NEXT.identities);
+        // Head, source, inbox cursor, DA, withdrawal roots and escrow stay.
+        assert_eq!(l2.head(), before.head());
+        assert_eq!(l2.frozen_source(), before.frozen_source());
+        assert_eq!(l2.consumed(), before.consumed());
+        assert_eq!(l2.data_availability().iter().filter(|r| r.l2_number == 2).count(), 1);
+        assert_eq!(l2.withdrawal_roots(), before.withdrawal_roots());
+        assert_eq!(l2.escrow_sat(), before.escrow_sat());
+        assert!(l2.next_program_active());
+
+        // The proof in flight is dead, by its pin and before any proof check.
+        assert!(l2.names_another_program(&in_flight));
+        assert_eq!(l2.validate_async(&in_flight, &ProofDouble), Err(Reject::Policy));
+        let mut copy = l2.clone();
+        assert_eq!(copy.apply(&in_flight, parent, 35, true, &ProofDouble), Err(Reject::Policy));
+        assert_eq!(&copy, l2, "a refusal changes nothing");
+
+        // The rebuilt proof differs from it in the four program pins only.
+        let rebuilt = with_tree(to_v3(settlement(&swapped, empty), minted, 0));
+        assert!(!l2.names_another_program(&rebuilt));
+        let moved: Vec<usize> = (0..in_flight.statement.len()).filter(|i| in_flight.statement[*i] != rebuilt.statement[*i]).collect();
+        assert!(moved.iter().all(|i| (S + 96..S + 224).contains(i)), "only identities 3 to 6 move: {moved:?}");
+        let s4 = {
+            let _gate = crate::params::l2_next_program_test::open();
+            apply(&swapped, 65, &[PosTransaction::L2SettlementAsync(Box::new(rebuilt))], &mut chains).unwrap()
+        };
+        let l2 = s4.l2_settlement().unwrap();
+        assert_eq!(l2.settled_number(), 2);
+        let (head_n1, statement) = l2.head().unwrap();
+        assert_eq!(statement[S + 224..S + 256], head_n, "the commitment chain runs across the swap");
+        assert!(l2.data_availability().iter().all(|r| r.l2_number > 2), "the settled block's record goes");
+        assert_eq!(l2.consumed(), 1, "the deposit minted once");
+
+        // The rollback: a proof of the sparse guest in flight dies the same way.
+        let s5 = {
+            let _gate = crate::params::l2_next_program_test::open();
+            apply(&s4, 66, &[], &mut chains).unwrap()
+        };
+        let sparse = with_tree(to_v3(settlement(&s5, empty), no_deposits(), 0));
+        let back = {
+            let _gate = crate::params::l2_next_program_test::open();
+            let _rollback = crate::params::l2_next_program_test::open_rollback();
+            apply(&s5, 3 * crate::params::SLOTS_PER_EPOCH, &[], &mut chains).unwrap()
+        };
+        let l2 = back.l2_settlement().unwrap();
+        assert_eq!(program_of(l2), mainnet::PROGRAM_FALLBACK.identities);
+        assert_eq!(l2.validate_async(&sparse, &ProofDouble), Err(Reject::Policy));
+        let complete = with_tree(to_v3(settlement(&back, empty), no_deposits(), 0));
+        let s6 = {
+            let _gate = crate::params::l2_next_program_test::open();
+            let _rollback = crate::params::l2_next_program_test::open_rollback();
+            apply(&back, 97, &[PosTransaction::L2SettlementAsync(Box::new(complete))], &mut chains).unwrap()
+        };
+        let l2 = s6.l2_settlement().unwrap();
+        assert_eq!(l2.settled_number(), 3);
+        assert_eq!(l2.head().unwrap().1[S + 224..S + 256], head_n1);
+        assert_eq!(l2.withdrawal_head().1, 3, "the tree of the first program is still the tree");
+        assert!(l2.next_program_active(), "a rollback keeps the rules");
+        assert!(l2.escrow_conserved());
+    }
+
+    /// The boundary rolls before a block's transactions, so already the first
+    /// block of the new epoch refuses the old program and takes the new one.
+    #[test]
+    fn the_first_block_past_the_gate_takes_only_the_new_program() {
+        let (opened, mut chains) = swap_fixture();
+        let s1 = apply(&opened, 33, &[], &mut chains).unwrap();
+        let empty = crate::l2_settlement::expected_body_commitment(&[]);
+        let old = to_v3(settlement(&s1, empty), no_deposits(), 0);
+        let mut new = old.clone();
+        for (i, id) in mainnet::PROGRAM_NEXT.identities.iter().enumerate() {
+            new.statement[S + (3 + i) * 32..S + (4 + i) * 32].copy_from_slice(id);
+        }
+        let (old, new) = (PosTransaction::L2SettlementAsync(Box::new(old)), PosTransaction::L2SettlementAsync(Box::new(new)));
+        let _gate = crate::params::l2_next_program_test::open();
+        let post = refuse_then_apply(&s1, 2 * crate::params::SLOTS_PER_EPOCH, &[old], 0, &[new], &mut chains);
+        let l2 = post.l2_settlement().unwrap();
+        assert_eq!(l2.settled_number(), 1);
+        assert_eq!(program_of(l2), mainnet::PROGRAM_NEXT.identities);
+    }
+
+    /// A claim, and an attestation signed before the gate, spend across it: the
+    /// attestors sign a withdrawal root and no program, and the proof is a Merkle
+    /// path to a record the swap keeps.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn a_claim_signed_before_the_gate_applies_after_the_swap_and_the_rollback() {
+        let leaves = [([1; 32], 150 * BLCH), ([2; 32], 5 * BLCH)];
+        let pre = attested_fixture(&leaves, true);
+        let tx = claim_of(&pre, &leaves, 0, Some(attest(&leaves, &[0, 1])));
+        for program in [None, Some(mainnet::PROGRAM_NEXT), Some(mainnet::PROGRAM_FALLBACK)] {
+            let mut state = pre.clone();
+            if let Some(program) = &program {
+                state.l2_settlement.as_mut().unwrap().replace_program_for_test(program);
+            }
+            assert_eq!(state.l2_withdraw_claim_refusal(&tx), None);
+            let post = try_claim(&state, &tx).expect("the claim applies");
+            let l2 = post.l2_settlement().unwrap();
+            assert_eq!(l2.released_sat(), u128::from(150 * BLCH));
+            assert!(l2.claimed().contains(0) && l2.escrow_conserved());
+        }
+    }
+
+    /// The gate never refuses a claim the old rule admitted, so nothing admitted
+    /// to a mempool below the gate turns invalid at it. The reverse does not hold,
+    /// which is why a rollback keeps the next rule.
+    #[test]
+    fn the_next_release_rule_only_adds_to_the_old_one() {
+        let mut widened = false;
+        for cap in [0u128, 1, 10, 1_000] {
+            for released in [0u128, 1, 9, 10, 11, 1_000, 1_001] {
+                for sats in [0u64, 1, 10, 11, 1_000, 5_000] {
+                    for exempt in [false, true] {
+                        let window = wd::ReleaseWindow { window: 1, released, cap };
+                        let (old, new) = (window.admits_v1(sats, exempt), window.admits(sats, exempt));
+                        assert!(!old || new, "{released} {cap} {sats} {exempt}");
+                        widened |= new && !old;
+                    }
+                }
+            }
+        }
+        assert!(widened);
+    }
+
+    #[test]
+    fn the_release_rule_stays_after_a_rollback() {
+        let mut l2 = mainnet_l2_state();
+        assert!(!l2.next_program_active());
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        assert!(l2.next_program_active());
+        l2.replace_program_for_test(&mainnet::PROGRAM_FALLBACK);
+        assert!(l2.next_program_active());
+    }
+
+    #[test]
+    fn a_rollback_with_a_reset_moves_the_head_and_a_refused_reset_still_moves_the_program() {
+        let mut l2 = state_with_bad_tail();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)) };
+
+        let mut applied = l2.clone();
+        applied.install_fallback_with_for_test(&reset);
+        assert_eq!(program_of(&applied), mainnet::PROGRAM_FALLBACK.identities);
+        assert_eq!((applied.settled_number(), applied.consumed()), (3, 3));
+        assert!(applied.next_program_active() && applied.escrow_conserved());
+
+        // A leaf only the discarded tail published was paid: the head stays.
+        let mut refused = l2.clone();
+        refused.claimed_insert_for_test(4);
+        refused.install_fallback_with_for_test(&reset);
+        assert_eq!(program_of(&refused), mainnet::PROGRAM_FALLBACK.identities);
+        assert_eq!(refused.settled_number(), 7);
+
+        // On any other program it does neither.
+        let mut activated = state_with_bad_tail();
+        activated.install_fallback_with_for_test(&reset);
+        assert_eq!(activated, state_with_bad_tail());
+    }
+
+    /// A real proof of the fallback guest against its pin, with
+    /// BLOCH_FALLBACK_VALUES and BLOCH_FALLBACK_PROOF naming settler-format files.
+    #[test]
+    #[ignore = "needs a real proof of the fallback program"]
+    fn fallback_program_real_groth16_passes_the_native_verifier() {
+        let values = std::fs::read(std::env::var_os("BLOCH_FALLBACK_VALUES").unwrap()).unwrap();
+        let proof = std::fs::read(std::env::var_os("BLOCH_FALLBACK_PROOF").unwrap()).unwrap();
+        let fallback = mainnet::PROGRAM_FALLBACK;
+        assert!(bloch_l2_proof::verify(&fallback.proof_policy, &fallback.identities[3], &values, &proof));
+        assert!(!bloch_l2_proof::verify(&fallback.proof_policy, &mainnet::PROGRAM_NEXT.identities[3], &values, &proof));
+    }
+
+    // ── The optional head reset (owner decision; `mainnet::HEAD_RESET` is `None`) ──
+
+    #[test]
+    fn head_reset_ships_absent() {
+        assert_eq!(mainnet::HEAD_RESET, None);
+        let (mut pre, _) = fixture();
+        let mut l2 = mainnet_l2_state();
+        l2.set_head_for_test([9; 32], statement_at(&l2, 5, [0xaa; 32], 2), 0);
+        pre.l2_settlement = Some(l2);
+        let _gate = crate::params::l2_next_program_test::open();
+        let crossed = pre.close_epoch();
+        let after = crossed.l2_settlement().unwrap();
+        assert!(after.next_program_active());
+        assert_eq!(after.settled_number(), 5, "without the option the swap keeps the head");
+    }
+
+    /// A V3 statement of `state`'s network for block `number`, withdrawal count `count`.
+    fn statement_at(state: &crate::l2_settlement::State, number: u64, root: [u8; 32], count: u64) -> Vec<u8> {
+        use crate::l2_settlement::{v3, STATEMENT_TAG, STATEMENT_V3_BYTES, STATEMENT_V3_TAG};
+        let tag = STATEMENT_TAG.len();
+        let mut s = vec![0u8; STATEMENT_V3_BYTES];
+        s[..tag].copy_from_slice(STATEMENT_V3_TAG);
+        for (i, id) in state.policy().identities.iter().enumerate() {
+            s[tag + i * 32..tag + (i + 1) * 32].copy_from_slice(id);
+        }
+        s[tag + 264..tag + 272].copy_from_slice(&number.to_be_bytes());
+        s[tag + 528..tag + 536].copy_from_slice(&number.to_be_bytes());
+        s[tag + 336..tag + 368].copy_from_slice(&[number as u8; 32]);
+        s[tag + 368..tag + 400].copy_from_slice(&[number as u8 ^ 0xff; 32]);
+        s[tag + v3::WITHDRAWAL_ROOT..tag + v3::WITHDRAWAL_ROOT + 32].copy_from_slice(&root);
+        s[tag + v3::WITHDRAWAL_COUNT..tag + v3::WITHDRAWAL_COUNT + 8].copy_from_slice(&count.to_be_bytes());
+        s
+    }
+
+    fn leaked_hex(bytes: &[u8]) -> &'static str {
+        Box::leak(bytes.iter().map(|b| format!("{b:02x}")).collect::<String>().into_boxed_str())
+    }
+
+    /// An L2 at block 7 with 8 inbox records consumed and withdrawal records at 2 and 6.
+    fn state_with_bad_tail() -> crate::l2_settlement::State {
+        let mut l2 = mainnet_l2_state();
+        for i in 0..8u32 {
+            l2.append_deposit(crate::l2_settlement::InboxRecord {
+                height: 1, tx_index: i, txid: [0x77; 32], vout: 1, sats: 10 * BLCH, recipient: [0x42; 20],
+            })
+            .unwrap();
+        }
+        l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: [0xaa; 32], count: 2, height: 1 });
+        l2.insert_withdrawal_record(wd::Record { l2_number: 6, root: [0xbb; 32], count: 5, height: 2 });
+        let bad = statement_at(&l2, 7, [0xbb; 32], 5);
+        l2.set_head_for_test([7; 32], bad, 7);
+        l2
+    }
+
+    #[test]
+    fn head_reset_to_a_settled_block_keeps_its_tree_and_rewinds_the_inbox() {
+        let mut l2 = state_with_bad_tail();
+        let escrow = l2.escrow_sat();
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)) };
+        assert!(l2.reset_head(&reset));
+        assert_eq!(l2.head().unwrap(), ([3; 32], keep));
+        assert_eq!(l2.settled_number(), 3);
+        assert_eq!(l2.consumed(), 3, "records 3..8 mint again on the new chain");
+        assert_eq!(l2.withdrawal_head(), ([0xaa; 32], 2));
+        assert_eq!(l2.withdrawal_roots().iter().map(|r| r.l2_number).collect::<Vec<_>>(), [2]);
+        assert_eq!(l2.escrow_sat(), escrow);
+        assert!(l2.escrow_conserved());
+        assert!(!l2.reset_head(&reset), "the head is no longer above the target");
+    }
+
+    #[test]
+    fn head_reset_to_the_genesis_clears_the_head() {
+        let mut l2 = state_with_bad_tail();
+        assert!(l2.reset_head(&mainnet::HeadReset { number: 0, commitment: [0; 32], statement: None }));
+        assert_eq!(l2.head(), None);
+        assert_eq!((l2.settled_number(), l2.consumed()), (0, 0));
+        assert!(l2.withdrawal_roots().is_empty());
+    }
+
+    #[test]
+    fn head_reset_refuses_to_forget_a_paid_leaf() {
+        let mut l2 = state_with_bad_tail();
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)) };
+        // Leaf 1 is inside the target's tree: paid, and still published after the reset.
+        let mut inside = l2.clone();
+        inside.claimed_insert_for_test(1);
+        assert!(inside.reset_head(&reset));
+        // Leaf 4 only exists in the discarded tail: the reset must not apply.
+        l2.claimed_insert_for_test(4);
+        let before = l2.clone();
+        assert!(!l2.reset_head(&reset));
+        assert_eq!(l2, before);
+    }
+
+    #[test]
+    fn head_reset_refuses_a_malformed_or_foreign_statement() {
+        let l2 = state_with_bad_tail();
+        let good = statement_at(&l2, 3, [0xaa; 32], 2);
+        let refused = |statement: Option<&'static str>, number: u64| {
+            let mut copy = l2.clone();
+            let before = copy.clone();
+            assert!(!copy.reset_head(&mainnet::HeadReset { number, commitment: [3; 32], statement }));
+            assert_eq!(copy, before);
+        };
+        refused(None, 3);
+        refused(Some("00ff"), 3);
+        refused(Some(leaked_hex(&good)), 4);
+        let mut other_network = good.clone();
+        other_network[crate::l2_settlement::STATEMENT_TAG.len()] ^= 1;
+        refused(Some(leaked_hex(&other_network)), 3);
+        // At or below the target there is nothing to reset.
+        refused(Some(leaked_hex(&statement_at(&l2, 7, [0xbb; 32], 5))), 7);
+    }
+
+    #[test]
+    fn a_reset_head_takes_the_next_settlement_under_the_new_program() {
+        let (pre, mut chains) = fixture();
+        let t = Transition::new(ProofDouble);
+        // Block 1 settles, then the head goes back to the genesis.
+        let first = PosTransaction::L2Settlement(Box::new(transaction(&pre)));
+        let block = build_block(&t, &pre, 2, &[], std::slice::from_ref(&first), &mut chains);
+        let mut settled = t.apply_block(&pre, &block, &[], std::slice::from_ref(&first)).unwrap();
+        let mut l2 = settled.l2_settlement().unwrap().clone();
+        assert_eq!(l2.settled_number(), 1);
+        assert!(l2.reset_head(&mainnet::HeadReset { number: 0, commitment: [0; 32], statement: None }));
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        settled.l2_settlement = Some(l2);
+        // The successor of the genesis is accepted again, and only it.
+        let again = PosTransaction::L2Settlement(Box::new(transaction(&settled)));
+        let block = build_block(&t, &settled, 3, &[], std::slice::from_ref(&again), &mut chains);
+        let next = t.apply_block(&settled, &block, &[], std::slice::from_ref(&again)).unwrap();
+        assert_eq!(next.l2_settlement().unwrap().settled_number(), 1);
+    }
+
+    /// A real proof of the candidate program against the native verifier, with
+    /// BLOCH_NEXT_VALUES and BLOCH_NEXT_PROOF naming the settler-format files.
+    /// The statement is a synthetic empty block; L1 would refuse its source.
+    #[test]
+    #[ignore = "needs a real proof of the candidate program"]
+    fn next_program_real_groth16_passes_the_native_verifier() {
+        let values = std::fs::read(std::env::var_os("BLOCH_NEXT_VALUES").unwrap()).unwrap();
+        let proof = std::fs::read(std::env::var_os("BLOCH_NEXT_PROOF").unwrap()).unwrap();
+        let next = mainnet::PROGRAM_NEXT;
+        let key = next.identities[3];
+        assert!(bloch_l2_proof::verify(&next.proof_policy, &key, &values, &proof));
+        let old = mainnet::PROGRAM.unwrap();
+        assert!(!bloch_l2_proof::verify(&old.proof_policy, &old.identities[6], &values, &proof));
+        let mut flipped = proof.clone();
+        flipped[100] ^= 1;
+        assert!(!bloch_l2_proof::verify(&next.proof_policy, &key, &values, &flipped));
+        let mut changed = values.clone();
+        changed[700] ^= 1;
+        assert!(!bloch_l2_proof::verify(&next.proof_policy, &key, &changed, &proof));
+    }
+
+    #[test]
+    fn the_release_rule_follows_the_program() {
+        let leaves = [([1; 32], 1_000_000), ([2; 32], 200 * BLCH), ([3; 32], 300 * BLCH)];
+        let tree: Vec<[u8; 32]> =
+            leaves.iter().enumerate().map(|(i, (r, sats))| wd::leaf(mainnet::activation().unwrap().policy.chain_id, i as u64, r, *sats)).collect();
+        let chain = mainnet::activation().unwrap().policy.chain_id;
+        let build = || {
+            let mut l2 = mainnet_l2_state();
+            l2.append_deposit(crate::l2_settlement::InboxRecord {
+                height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 1_000 * BLCH, recipient: [0x42; 20],
+            })
+            .unwrap();
+            l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&tree), count: 3, height: 1 });
+            for _ in 0..(2 * mainnet::LIMITS.release_window_blocks) {
+                l2.advance_height().unwrap();
+            }
+            l2
+        };
+        let claim = |l2: &mut crate::l2_settlement::State, i: usize, attested: bool| {
+            l2.release_withdrawal(chain, i as u64, &leaves[i].0, leaves[i].1, &wd::proof(&tree, i as u64).unwrap(), attested)
+        };
+
+        // The activated program: a 0.01 BLCH claim first delays the attested one.
+        let mut old = build();
+        claim(&mut old, 0, false).unwrap();
+        assert_eq!(claim(&mut old, 1, true), Err(wd::ClaimRefusal::RateLimited));
+
+        // The next program: it passes, and it spends the window's one exemption.
+        let mut new = build();
+        new.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        assert!(new.next_program_active());
+        claim(&mut new, 0, false).unwrap();
+        claim(&mut new, 1, true).unwrap();
+        assert_eq!(claim(&mut new, 2, true), Err(wd::ClaimRefusal::RateLimited));
+        assert!(new.escrow_conserved());
     }
 
     /// Signatures of `signers` (indices into `keys`, signed with `signing`
@@ -3831,9 +4419,213 @@ mod l2_tests {
         assert!(CommittedState::decode_local_cache(&swapped, &header).is_err());
     }
 
+    // ── Reserved DA slot (params::L2_DA_RESERVED_SLOT_EPOCH) ────────────────
+    //
+    // Agent 78's crowd-out: third parties fill all `da::MAX_PER_BLOCK` DA slots
+    // at tip 0, so the settler's batch never lands and no user-transaction
+    // block settles. Past the gate one slot is the registered key's.
+
+    fn slot_key(byte: u8) -> Vec<u8> {
+        vec![byte; crate::transition::funded::ADMISSION_PQ_KEY_BYTES]
+    }
+
+    /// `funded_async_fixture` with one `FUNDED` coin per key, at txid
+    /// `[0x60 + i; 32]`, plus one empty block that anchors the source.
+    fn slot_fixture(keys: &[Vec<u8>]) -> (CommittedState, Vec<RandaoChain>) {
+        let coins: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| crate::state_root::EutxoEntry {
+                txid: [0x60 + i as u8; 32],
+                vout: 0,
+                value: FUNDED,
+                script_hash: script_of(key),
+            })
+            .collect();
+        let (_, mut genesis, mut chains) = setup_with(4, ToyVerifier, &coins);
+        let identities = std::array::from_fn(|i| hash_at(TEMPLATE, S + i * 32));
+        let mut policy = Policy {
+            identities,
+            proof_policy: bloch_l2_proof::policy_commitment(),
+            chain_id: 700771,
+            initial_l2_parent: hash_at(TEMPLATE, S + 272),
+            initial_l2_state: hash_at(TEMPLATE, S + 304),
+            attestor_set: [0; 32],
+        };
+        policy.identities[0] = [0x91; 32];
+        policy.identities[1] = *genesis.head.as_bytes();
+        genesis.admission_network_domain = Some(policy.identities[0]);
+        genesis = genesis.configure_l2_genesis_async(policy).unwrap();
+        let t = Transition::new(ToyVerifier);
+        let first = build_block(&t, &genesis, 1, &[], &[], &mut chains);
+        let s1 = t.apply_block(&genesis, &first, &[], &[]).unwrap();
+        let s2 = apply(&s1, 2, &[], &mut chains).unwrap();
+        (s2, chains)
+    }
+
+    /// Signed DA transactions, one per `(key index, l2 number, payload)`,
+    /// each key spending its own coin and then its own change, so they can
+    /// all go in one block on `pre`.
+    fn slot_batches(pre: &CommittedState, keys: &[Vec<u8>], plan: &[(usize, u64, Vec<u8>)]) -> Vec<PosTransaction> {
+        let mut coins: Vec<(([u8; 32], u32), u64)> =
+            (0..keys.len()).map(|i| (([0x60 + i as u8; 32], 0), FUNDED)).collect();
+        let fee = pre.next_base_fee();
+        let mut scratch = pre.clone();
+        let mut out = Vec::new();
+        for (who, number, payload) in plan {
+            let key = &keys[*who];
+            let (outpoint, value) = coins[*who];
+            let mut tx = L2DataAvailability {
+                network_domain: [0x91; 32],
+                funding_pubkey: key.clone(),
+                inputs: vec![crate::transition::FundingInput { txid: outpoint.0, vout: outpoint.1 }],
+                l2_chain_id: 700771,
+                l2_block_number: *number,
+                payload: payload.clone(),
+                change: TransferOutput { value: 0, script_hash: script_of(key) },
+                tx_bytes: 0,
+                tip_millisat_per_gas: 0,
+                signature: vec![0; 32],
+            };
+            tx.tx_bytes = tx.canonical_bytes().len() as u64;
+            let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, tx.tx_bytes, fee, 0);
+            tx.change.value = (u128::from(value) - charge.base_fee_sat - charge.priority_fee_sat) as u64;
+            tx.signature = toy_sign(key, &tx.intent_root());
+            let wire = PosTransaction::L2DataAvailability(tx.clone());
+            scratch.apply_transaction(&wire, 0, fee, &ToyVerifier).expect("each batch is valid on its own");
+            coins[*who] = ((wire.txid(), 0), tx.change.value);
+            out.push(wire);
+        }
+        out
+    }
+
+    /// Junk for an unsettled number, as the attack sends: canonical, unrelated.
+    fn junk(i: u8) -> Vec<u8> {
+        batch(&[&[0xd0, i]])
+    }
+
+    #[test]
+    fn the_reserved_da_slot_is_inert_and_registers_no_key() {
+        assert_eq!(crate::params::L2_DA_RESERVED_SLOT_EPOCH, u64::MAX);
+        assert_eq!(da::REGISTERED_KEY, crate::l2_settlement::mainnet::DA_RESERVED_KEY);
+        for epoch in [0, 5_850, 7_360, 10_060, u64::MAX - 1] {
+            assert_eq!(da::reserved_key_at(epoch), None, "{epoch}");
+        }
+        // Inert: four DA from anyone, as today.
+        let any = slot_key(0x01);
+        let keys = [any.as_slice(); 4];
+        assert!(da::block_admits(10_060, keys));
+        assert!(!da::block_admits(10_060, [any.as_slice(); 5]));
+        // Gate forced but no key registered: still the old rule.
+        let _gate = crate::params::l2_da_reserved_slot_test::open(None);
+        assert_eq!(da::reserved_key_at(10_060), None);
+        assert!(da::block_admits(10_060, [any.as_slice(); 4]));
+    }
+
+    /// Every block the new rule admits, the old rule admits: the gate is a
+    /// soft fork, and a non-upgraded validator follows an upgraded proposer.
+    #[test]
+    fn the_reserved_slot_only_refuses_blocks_the_old_rule_admitted() {
+        let own = slot_key(0xee);
+        let other = slot_key(0x01);
+        let _gate = crate::params::l2_da_reserved_slot_test::open(Some(da::funder(&own)));
+        let mut refused_by_new_only = 0;
+        for n_own in 0..=6usize {
+            for n_other in 0..=6usize {
+                let keys: Vec<&[u8]> = std::iter::repeat_n(own.as_slice(), n_own)
+                    .chain(std::iter::repeat_n(other.as_slice(), n_other))
+                    .collect();
+                let new = da::block_admits(7, keys.iter().copied());
+                let old = n_own + n_other <= da::MAX_PER_BLOCK;
+                assert!(!new || old, "{n_own} own, {n_other} other");
+                assert_eq!(new, old && n_other <= da::OPEN_PER_BLOCK, "{n_own} own, {n_other} other");
+                refused_by_new_only += usize::from(old && !new);
+            }
+        }
+        // Exactly the blocks with four third-party batches.
+        assert_eq!(refused_by_new_only, 1);
+    }
+
+    /// The post-state of one block at slot 3 on a fresh `slot_fixture`,
+    /// carrying `plan`. Built by hand (as `more_than_four_da_batches_in_one_block_are_refused`
+    /// does), because `build_block` panics on a block the transition refuses.
+    fn slot_attempt(keys: &[Vec<u8>], plan: &[(usize, u64, Vec<u8>)]) -> Result<CommittedState, TransitionError> {
+        let (pre, mut chains) = slot_fixture(keys);
+        let txs = slot_batches(&pre, keys, plan);
+        let t = Transition::new(ProofDouble);
+        let mut block = build_block(&t, &pre, 3, &[], &[], &mut chains);
+        block.header.body_root =
+            crate::derive::body_root(&txs.iter().map(PosTransaction::canonical_bytes).collect::<Vec<_>>());
+        let pk = crate::attestation::KeyLookup::pubkey(&pre, block.header.proposer_index).unwrap();
+        block.proposer_sig = toy_sign(pk, &block.header.proposal_signing_root());
+        t.compute_post_state(&pre, &block, &[], &txs)
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn past_the_gate_three_slots_are_open_and_one_is_the_registered_keys() {
+        let keys = vec![slot_key(0x01), slot_key(0xee)];
+        let four_junk: Vec<_> = (0..4u8).map(|i| (0, 1 + u64::from(i % 2), junk(i))).collect();
+        // Below the gate the attack block is valid: a proposer may fill every slot.
+        assert!(slot_attempt(&keys, &four_junk).is_ok());
+
+        let _gate = crate::params::l2_da_reserved_slot_test::open(Some(da::funder(&keys[1])));
+        assert_eq!(
+            slot_attempt(&keys, &four_junk).err(),
+            Some(TransitionError::BlockGasLimitExceeded),
+            "four third-party batches are refused past the gate"
+        );
+        assert!(slot_attempt(&keys, &four_junk[..3]).is_ok(), "three are fine");
+        let payload = batch(&[&[0x02, 0xc0], b"user tx"]);
+        let mixed = [(0, 1, junk(0)), (0, 2, junk(1)), (0, 1, junk(2)), (1, 1, payload.clone())];
+        assert!(slot_attempt(&keys, &mixed).is_ok(), "three others and the registered key");
+        let mut five = mixed.to_vec();
+        five.push((1, 2, junk(9)));
+        assert_eq!(slot_attempt(&keys, &five).err(), Some(TransitionError::BlockGasLimitExceeded), "the total cap stays 4");
+        let own_only: Vec<_> = (0..4u8).map(|i| (1, 1 + u64::from(i), junk(i))).collect();
+        assert!(slot_attempt(&keys, &own_only).is_ok(), "the registered key may use the open slots too");
+    }
+
+    /// The crowd-out end to end on the transition: under attack, the block
+    /// that carries the settler's batch is valid only with at most three
+    /// junk batches, and the next block settles the user-transaction block.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn under_a_da_flood_the_registered_keys_batch_lands_and_its_block_settles() {
+        let keys = vec![slot_key(0x01), slot_key(0x02), slot_key(0x03), slot_key(0xee)];
+        let (pre, mut chains) = slot_fixture(&keys);
+        let _gate = crate::params::l2_da_reserved_slot_test::open(Some(da::funder(&keys[3])));
+        let payload = batch(&[&[0x02, 0xc0], b"user tx"]);
+        let commitment = da::commitment(700771, 1, &payload);
+        let block = slot_batches(&pre, &keys, &[(0, 1, junk(0)), (1, 1, junk(1)), (2, 2, junk(2)), (3, 1, payload.clone())]);
+        let s3 = apply(&pre, 3, &block, &mut chains).expect("three junk batches and the settler's");
+        let records = s3.l2_settlement().unwrap().data_availability().to_vec();
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().any(|r| r.l2_number == 1 && r.commitment == commitment));
+        let settle = PosTransaction::L2SettlementAsync(Box::new(v3_with_da(&s3, commitment)));
+        let s4 = apply(&s3, 4, std::slice::from_ref(&settle), &mut chains).expect("settles with the settler's DA");
+        assert_eq!(s4.l2_settlement().unwrap().settled_number(), 1);
+    }
+
+    /// The gate moves no committed byte: the same block gives the same state
+    /// root on either side of it (history replays unchanged).
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn the_reserved_slot_changes_no_state_byte() {
+        let keys = vec![slot_key(0x01), slot_key(0xee)];
+        let plan = [(0, 1, junk(0)), (1, 1, junk(1))];
+        let before = slot_attempt(&keys, &plan).unwrap();
+        let _gate = crate::params::l2_da_reserved_slot_test::open(Some(da::funder(&keys[1])));
+        let after = slot_attempt(&keys, &plan).unwrap();
+        assert_eq!(before.state_root(), after.state_root());
+        assert_eq!(before, after);
+    }
+
     // Adversarial multi-branch FFG suite (p2b).
     mod ffg_branch_tests {
         use super::*;
         include!("ffg_branch_tests.rs");
     }
+
+    include!("l2_forced_tests.rs");
 }

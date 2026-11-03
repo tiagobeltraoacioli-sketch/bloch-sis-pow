@@ -1095,8 +1095,41 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
         PosTransaction::L2Deposit(tx) => tx.tip_millisat_per_gas,
         PosTransaction::L2DataAvailability(tx) => tx.tip_millisat_per_gas,
         PosTransaction::L2WithdrawClaim(tx) => tx.tip_millisat_per_gas,
+        PosTransaction::L2ForcedTransaction(tx) => tx.tip_millisat_per_gas,
         PosTransaction::RescueReveal(tx) => tx.tip_millisat_per_gas,
         _ => 0,
+    }
+}
+
+/// The funding-key hash that owns the reserved DA slot in a block of `epoch`
+/// (`da::reserved_key_at`: `None` while `L2_DA_RESERVED_SLOT_EPOCH` is inert).
+/// Tests set it with `da_reserved_test::open`.
+fn da_reserved_key(epoch: u64) -> Option<[u8; 32]> {
+    #[cfg(test)]
+    if let Some(key) = da_reserved_test::key() {
+        return Some(key);
+    }
+    bloch_pos_committee::l2_settlement::da::reserved_key_at(epoch)
+}
+
+/// A DA batch funded by the `reserved` key.
+fn is_reserved_da(tx: &PosTransaction, reserved: Option<[u8; 32]>) -> bool {
+    match (tx, reserved) {
+        (PosTransaction::L2DataAvailability(batch), Some(key)) =>
+            bloch_pos_committee::l2_settlement::da::funder(&batch.funding_pubkey) == key,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod da_reserved_test {
+    use std::cell::Cell;
+    thread_local! { static KEY: Cell<Option<[u8; 32]>> = const { Cell::new(None) }; }
+    pub fn key() -> Option<[u8; 32]> { KEY.with(Cell::get) }
+    pub fn open(key: [u8; 32]) -> impl Drop {
+        struct Restore(Option<[u8; 32]>);
+        impl Drop for Restore { fn drop(&mut self) { KEY.with(|v| v.set(self.0)); } }
+        Restore(KEY.with(|v| v.replace(Some(key))))
     }
 }
 
@@ -1138,6 +1171,7 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
         PosTransaction::L2Deposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::L2DataAvailability(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::L2WithdrawClaim(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::L2ForcedTransaction(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::RescueReveal(tx) => Some(Sha3_256::digest(&tx.pubkey).into()),
         PosTransaction::WithdrawalCredentialRotation(tx) => Some(validator_lifecycle_source(tx.validator)),
         // F-9: a rescue commitment is free and names no key, so every one
@@ -4449,6 +4483,7 @@ impl Engine {
             PosTransaction::L2Deposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::L2DataAvailability(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::L2WithdrawClaim(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::L2ForcedTransaction(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::RescueReveal(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             _ => None,
         }
@@ -4849,11 +4884,15 @@ impl Engine {
         }
         if let PosTransaction::L2SettlementAsync(settlement) = &tx {
             let state = self.state.l2_settlement().ok_or(Refusal::Invalid("L2 settlement is not configured"))?;
-            if self.mempool.values().any(|pending| matches!(pending, PosTransaction::L2SettlementAsync(_))) {
+            if self.mempool.values().any(|pending| l2_proof_holds_the_slot(pending, state)) {
                 return Err(Refusal::Invalid("one L2 proof is already pending"));
             }
             state.validate_async(settlement, &HybridVerifier::new())
                 .map_err(|_| Refusal::Invalid("L2 settlement policy, source, successor or proof failed"))?;
+            // A proof of the replaced program can never settle, and left alone it
+            // would refuse the program's new proof until the TTL. Removed only now
+            // that the proof taking its place has passed.
+            self.mempool.retain(|_, pending| !matches!(pending, PosTransaction::L2SettlementAsync(_)));
         } else {
             let verifier = self.gossip_verifier.budgeted_for_source(
                 self.wall_slot(),
@@ -4891,6 +4930,12 @@ impl Engine {
             self.mempool.remove(stale);
             self.mempool_admitted_at.remove(stale);
             self.mempool_suspect.remove(stale);
+        }
+        for displaced in &capacity.displaced {
+            self.mempool.remove(displaced);
+            self.mempool_admitted_at.remove(displaced);
+            self.mempool_suspect.remove(displaced);
+            self.mempool_evicted_low_fee = self.mempool_evicted_low_fee.saturating_add(1);
         }
         if let Some(lowest_key) = capacity.lower_fee {
             self.mempool.remove(&lowest_key);
@@ -4936,9 +4981,10 @@ impl Engine {
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
         // A proof reserves the whole gas budget. Never pack it with transfers.
-        if let Some(tx) = self.mempool.values().find(|tx| matches!(tx, PosTransaction::L2SettlementAsync(_))) {
+        if let Some(tx) = live_l2_proof(self.mempool.values(), self.state.l2_settlement()) {
             return vec![tx.clone()];
         }
+        let dead_proof = |tx: &PosTransaction| matches!(tx, PosTransaction::L2SettlementAsync(_));
         // Admission is a historical observation, not a reservation of inputs or
         // fees. Recheck against this proposal's parent and fee epoch before a
         // stale high-tip transaction can consume candidate capacity (EN-06).
@@ -4946,7 +4992,7 @@ impl Engine {
         // again, making the exact same signed transaction eligible later.
         let mut funded_context = None;
         let candidates = self.mempool.iter().filter(|(encoded, tx)| {
-            self.candidate_is_backed(tx, encoded.len(), epoch, &mut funded_context)
+            !dead_proof(tx) && self.candidate_is_backed(tx, encoded.len(), epoch, &mut funded_context)
         }).collect();
         Self::pack_transactions(epoch, *self.state.head().as_bytes(), candidates)
     }
@@ -5018,7 +5064,18 @@ impl Engine {
     fn pack_transactions(
         epoch: u64,
         seed: [u8; 32],
+        ordered: Vec<(&Vec<u8>, &PosTransaction)>,
+    ) -> Vec<PosTransaction> {
+        Self::pack_transactions_with(epoch, seed, ordered, da_reserved_key(epoch))
+    }
+
+    /// [`Self::pack_transactions`] with the reserved DA key given, so the
+    /// rule is testable without arming the compiled gate.
+    fn pack_transactions_with(
+        epoch: u64,
+        seed: [u8; 32],
         mut ordered: Vec<(&Vec<u8>, &PosTransaction)>,
+        da_reserved: Option<[u8; 32]>,
     ) -> Vec<PosTransaction> {
         let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
         let mut out = Vec::new();
@@ -5036,7 +5093,12 @@ impl Engine {
         // interchangeable by construction.
         let mut reserved = BTreeSet::new();
         // Consensus caps DA batches per block; the highest tips win the slots.
+        // Past `params::L2_DA_RESERVED_SLOT_EPOCH` only the registered key may
+        // take the last one (`da::block_admits`): other keys stop at
+        // `da::OPEN_PER_BLOCK`, whatever their tip or bytes.
         let mut da_batches = 0usize;
+        let mut da_open = 0usize;
+        let mut forced_txs = 0usize;
         // F-9: consensus admits at most RESCUE_COMMITS_MAX_PER_BLOCK
         // commitments; they rank after every tipped transaction and among
         // themselves by `rescue_commit_rank`.
@@ -5078,6 +5140,7 @@ impl Engine {
                 PosTransaction::L2Deposit(tx) => tx.tx_bytes,
                 PosTransaction::L2DataAvailability(tx) => tx.tx_bytes,
                 PosTransaction::L2WithdrawClaim(tx) => tx.tx_bytes,
+                PosTransaction::L2ForcedTransaction(tx) => tx.tx_bytes,
                 PosTransaction::RescueReveal(tx) => tx.tx_bytes,
                 _ => 0,
             };
@@ -5089,11 +5152,23 @@ impl Engine {
             if points.iter().any(|point| reserved.contains(point)) {
                 continue;
             }
-            if matches!(tx, PosTransaction::L2DataAvailability(_)) {
-                if da_batches >= bloch_pos_committee::l2_settlement::da::MAX_PER_BLOCK {
+            if let PosTransaction::L2DataAvailability(batch) = tx {
+                use bloch_pos_committee::l2_settlement::da;
+                if da_batches >= da::MAX_PER_BLOCK {
+                    continue;
+                }
+                let open = !is_reserved_da(tx, da_reserved);
+                if da_reserved.is_some() && open && da_open >= da::OPEN_PER_BLOCK {
                     continue;
                 }
                 da_batches += 1;
+                da_open += usize::from(open);
+            }
+            if matches!(tx, PosTransaction::L2ForcedTransaction(_)) {
+                if forced_txs >= bloch_pos_committee::l2_settlement::forced::MAX_PER_BLOCK {
+                    continue;
+                }
+                forced_txs += 1;
             }
             if matches!(tx, PosTransaction::RescueCommit(_)) {
                 if rescue_commits >= bloch_pos_committee::params::RESCUE_COMMITS_MAX_PER_BLOCK {
@@ -7972,6 +8047,25 @@ fn declared_size_bound(tx: &PosTransaction, declared: u64) -> Result<(), &'stati
 #[cfg(feature = "l2-activation-rehearsal")]
 const GENESIS4_MAINNET_NETWORK_DIGEST: &str = "f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966";
 
+/// Whether `pending` is a settlement proof that may still land on `l2`. A proof
+/// of a program the L2 no longer holds may not: it keeps no proof slot and no
+/// proposer picks it, so a program swap costs no block and delays no new proof.
+pub(crate) fn l2_proof_holds_the_slot(
+    pending: &PosTransaction,
+    l2: &bloch_pos_committee::l2_settlement::State,
+) -> bool {
+    matches!(pending, PosTransaction::L2SettlementAsync(settlement) if !l2.names_another_program(settlement))
+}
+
+/// The settlement proof a proposer picks: the first that may still land.
+fn live_l2_proof<'a>(
+    mut pending: impl Iterator<Item = &'a PosTransaction>,
+    l2: Option<&bloch_pos_committee::l2_settlement::State>,
+) -> Option<&'a PosTransaction> {
+    let l2 = l2?;
+    pending.find(|tx| l2_proof_holds_the_slot(tx, l2))
+}
+
 pub(crate) fn l2_admission_refusal(
     tx: &PosTransaction,
     l2: Option<&bloch_pos_committee::l2_settlement::State>,
@@ -7984,6 +8078,9 @@ pub(crate) fn l2_admission_refusal(
         PosTransaction::L2WithdrawClaim(_) if !user_transactions => Some("L2 withdrawal claims are not active on this network"),
         PosTransaction::L2Deposit(_) if !l2.is_some_and(|l2| l2.deposits_enabled()) => {
             Some("native L2 deposits are not active on this network")
+        }
+        PosTransaction::L2ForcedTransaction(_) if !l2.is_some_and(|l2| l2.forced_queue().is_some()) => {
+            Some("L2 forced inclusion is not active on this network")
         }
         _ => None,
     }
@@ -8415,6 +8512,14 @@ fn admissible_with_network_verifier(
                 Ok(())
             } else {
                 Err("invalid L2 deposit hybrid PQ authorization")
+            }
+        }
+        PosTransaction::L2ForcedTransaction(forced) => {
+            // Queue state, fees and the surcharge run in consensus.
+            if strict_relay_hybrid().verify_with_key(&forced.funding_pubkey, &forced.intent_root(), &forced.signature) {
+                Ok(())
+            } else {
+                Err("invalid L2 forced transaction hybrid PQ authorization")
             }
         }
         PosTransaction::FundedDeposit(deposit) => {
@@ -10977,6 +11082,100 @@ mod transfer_v2_end_to_end {
         let first_commit = selected.iter().position(|tx| matches!(tx, PosTransaction::RescueCommit(_))).unwrap();
         assert!(selected[..first_commit].iter().all(|tx| matches!(tx, PosTransaction::Transfer { .. })));
         assert_eq!(first_commit, 10, "commitments rank after zero-tip transfers");
+    }
+
+    fn da_batch(key_byte: u8, number: u64, tip: u128) -> PosTransaction {
+        use bloch_pos_committee::transition::{FundingInput, L2DataAvailability};
+        let key = vec![key_byte; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        PosTransaction::L2DataAvailability(L2DataAvailability {
+            network_domain: [0x91; 32],
+            funding_pubkey: key,
+            inputs: vec![FundingInput { txid: [key_byte; 32], vout: number as u32 }],
+            l2_chain_id: 700_770,
+            l2_block_number: number,
+            payload: vec![0, 0, 0, 1, 0, 0, 0, 1, key_byte],
+            change: TransferOutput { value: 1, script_hash: [key_byte; 32] },
+            tx_bytes: 2_000,
+            tip_millisat_per_gas: tip,
+            signature: vec![9; 64],
+        })
+    }
+
+    /// Agent 78's crowd-out, proposer side: eight third-party DA batches at
+    /// tip 0 whose funding keys sort below the settler's take all four slots
+    /// under the old rule. With the settler's key registered, the proposer
+    /// gives the others at most `OPEN_PER_BLOCK` slots and the settler its
+    /// batch, and a higher tip from the others does not buy the last slot.
+    #[test]
+    fn a_zero_tip_da_flood_cannot_take_the_registered_keys_slot() {
+        use bloch_pos_committee::l2_settlement::da;
+        let epoch = V2_FLAG_DAY + 1;
+        let settler_key = vec![0xee; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let settler = da::funder(&settler_key);
+        for tip in [0u128, 1_000] {
+            let mut node = engine_at_wall_epoch(epoch, &[]);
+            for k in 0..8u8 {
+                let tx = da_batch(0x10 + k, 2, tip);
+                node.mempool.insert(tx.canonical_bytes(), tx);
+            }
+            let own = da_batch(0xee, 1, 0);
+            node.mempool.insert(own.canonical_bytes(), own.clone());
+            let is_own = |tx: &PosTransaction| matches!(tx, PosTransaction::L2DataAvailability(d) if da::funder(&d.funding_pubkey) == settler);
+            let das = |sel: &[PosTransaction]| sel.iter().filter(|tx| matches!(tx, PosTransaction::L2DataAvailability(_))).count();
+
+            let old = Engine::pack_transactions_with(epoch, [0x11; 32], node.mempool.iter().collect(), None);
+            assert_eq!(das(&old), da::MAX_PER_BLOCK);
+            assert!(!old.iter().any(is_own), "old rule, tip {tip}: the settler is crowded out");
+
+            let new = Engine::pack_transactions_with(epoch, [0x11; 32], node.mempool.iter().collect(), Some(settler));
+            assert_eq!(das(&new), da::MAX_PER_BLOCK);
+            assert_eq!(new.iter().filter(|tx| is_own(tx)).count(), 1, "tip {tip}: the settler's batch is selected");
+            assert_eq!(das(&new) - 1, da::OPEN_PER_BLOCK);
+            // What the proposer builds is what consensus admits.
+            let keys = |sel: &[PosTransaction]| sel.iter().filter_map(|tx| match tx {
+                PosTransaction::L2DataAvailability(d) => Some(d.funding_pubkey.clone()),
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert!(da::block_admits(epoch, keys(&new).iter().map(Vec::as_slice)));
+        }
+        // The registered key may also use the open slots.
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+        for n in 1..=6u64 {
+            let tx = da_batch(0xee, n, 0);
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        let only_own = Engine::pack_transactions_with(epoch, [0x11; 32], node.mempool.iter().collect(), Some(settler));
+        assert_eq!(only_own.len(), da::MAX_PER_BLOCK);
+    }
+
+    /// The mempool side of the reserved DA slot: a pool full of valid tip-0
+    /// DA from other keys refuses the settler's tip-0 batch under the old
+    /// rule, and admits it past the gate by displacing one of them.
+    #[test]
+    fn a_full_mempool_of_da_cannot_keep_out_the_registered_keys_batch() {
+        use bloch_pos_committee::l2_settlement::da;
+        let epoch = V2_FLAG_DAY + 1;
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+        let mut filled = 0;
+        'fill: for k in 0..80u8 {
+            for n in 1..=64u64 {
+                if filled == MEMPOOL_MAX { break 'fill; }
+                let tx = da_batch(0x10 + k, n, 0);
+                node.mempool.insert(tx.canonical_bytes(), tx);
+                filled += 1;
+            }
+        }
+        assert_eq!(node.mempool.len(), MEMPOOL_MAX);
+        let own = da_batch(0xee, 1, 0);
+        let other = da_batch(0x05, 1, 0);
+        let len = own.canonical_bytes().len();
+        assert!(matches!(node.plan_mempool_capacity(&own, len, epoch), Err(Refusal::AtCapacity)), "old rule: crowded out of the pool");
+        let settler_key = vec![0xee; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let _reserved = da_reserved_test::open(da::funder(&settler_key));
+        let plan = node.plan_mempool_capacity(&own, len, epoch).expect("the registered key is admitted");
+        assert_eq!(plan.displaced.len(), 1);
+        assert!(!plan.displaced.contains(&own.canonical_bytes()));
+        assert!(matches!(node.plan_mempool_capacity(&other, len, epoch), Err(Refusal::AtCapacity)), "others still are not");
     }
 
     /// F-9: which commitments win the scarce slots is re-drawn from the
@@ -17781,6 +17980,43 @@ mod l2_admission_tests {
                 change, tx_bytes: 0, tip_millisat_per_gas: 0, signature: Vec::new(),
             }),
         ]
+    }
+
+    /// A settlement proof whose statement names `configuration` as its program.
+    fn proof_of(policy: &Policy, configuration: [u8; 32], number: u8) -> PosTransaction {
+        use bloch_pos_committee::l2_settlement::{Transaction, STATEMENT_TAG, STATEMENT_V3_BYTES, STATEMENT_V3_TAG};
+        let tag = STATEMENT_TAG.len();
+        let mut statement = vec![number; STATEMENT_V3_BYTES];
+        statement[..tag].copy_from_slice(STATEMENT_V3_TAG);
+        for (i, id) in policy.identities.iter().enumerate() {
+            statement[tag + i * 32..tag + (i + 1) * 32].copy_from_slice(id);
+        }
+        statement[tag + 96..tag + 128].copy_from_slice(&configuration);
+        PosTransaction::L2SettlementAsync(Box::new(Transaction { proof_policy: policy.proof_policy, statement, proof: [1; 356] }))
+    }
+
+    /// Only a proof of the program the L2 holds keeps the one proof slot.
+    #[test]
+    fn a_proof_of_a_replaced_program_holds_no_slot() {
+        let limits = withdrawal::Limits::DEVELOPMENT;
+        let l2 = State::activated(Activation { policy: policy(), asynchronous: true, limits }).unwrap();
+        assert!(l2_proof_holds_the_slot(&proof_of(&policy(), policy().identities[3], 1), &l2));
+        assert!(!l2_proof_holds_the_slot(&proof_of(&policy(), [0xee; 32], 1), &l2));
+        for tx in txs() {
+            assert!(!l2_proof_holds_the_slot(&tx, &l2), "{tx:?}");
+        }
+    }
+
+    /// No proposer picks a dead proof, and a live proof is still found behind one.
+    #[test]
+    fn the_proposer_skips_a_proof_of_a_replaced_program() {
+        let limits = withdrawal::Limits::DEVELOPMENT;
+        let l2 = State::activated(Activation { policy: policy(), asynchronous: true, limits }).unwrap();
+        let dead = proof_of(&policy(), [0xee; 32], 1);
+        let live = proof_of(&policy(), policy().identities[3], 2);
+        assert_eq!(live_l2_proof([&dead].into_iter(), Some(&l2)), None);
+        assert_eq!(live_l2_proof([&dead, &live].into_iter(), Some(&l2)), Some(&live));
+        assert_eq!(live_l2_proof([&live].into_iter(), None), None);
     }
 
     /// The mempool's L2 door reads the installed L2's profile, not the build:

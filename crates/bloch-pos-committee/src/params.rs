@@ -2729,6 +2729,129 @@ pub(crate) fn native_claim_finality_active(epoch: u64) -> bool {
     epoch_gate_active(epoch, HF1_CLAIM_FINALITY_EPOCH)
 }
 
+/// CANDIDATE, not scheduled: the epoch boundary that replaces the mainnet L2
+/// program with `l2_settlement::mainnet::PROGRAM_NEXT` (sparse witness,
+/// timestamp and prevrandao bound in the guest, fee-vault sweep, and the release
+/// rule of `ReleaseWindow::admits`). `u64::MAX` means INERT. No epoch has been
+/// chosen. Its ordering rule is `hard_forks::l2_program_schedule_coherent`.
+pub const L2_NEXT_PROGRAM_EPOCH: u64 = u64::MAX;
+/// The boundary that rolls that program back to
+/// `l2_settlement::mainnet::PROGRAM_FALLBACK`, the same rules under the complete
+/// witness. `u64::MAX` means INERT, and a release that swaps the program ships it
+/// so. Only an emergency release moves it: L1 cannot tell a misbehaving guest by
+/// itself, and there is no key and no runtime input.
+pub const L2_PROGRAM_ROLLBACK_EPOCH: u64 = u64::MAX;
+
+/// CANDIDATE, not scheduled: the epoch boundary that enables L1 forced
+/// inclusion of L2 transactions (`l2_settlement::forced`, wire 0x1C) on an L2
+/// whose program implements it. `u64::MAX` means INERT. It cannot be armed while
+/// `l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS` is empty, nor
+/// before `L2_NEXT_PROGRAM_EPOCH` (`hard_forks::l2_forced_inclusion_may_arm`).
+pub const L2_FORCED_INCLUSION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn l2_forced_inclusion_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_forced_inclusion_test::forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_FORCED_INCLUSION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_forced_inclusion_test {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+pub(crate) fn l2_next_program_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_next_program_test::forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_NEXT_PROGRAM_EPOCH)
+}
+
+pub(crate) fn l2_program_rollback_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_next_program_test::rollback_forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_PROGRAM_ROLLBACK_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_next_program_test {
+    use std::cell::Cell;
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static ROLLBACK: Cell<bool> = const { Cell::new(false) };
+    }
+    pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn rollback_forced() -> bool { ROLLBACK.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+    pub fn open_rollback() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ROLLBACK.with(|v| v.set(self.0)); } }
+        Restore(ROLLBACK.with(|v| v.replace(true)))
+    }
+}
+
+/// CANDIDATE, not scheduled: the epoch from which one of the
+/// `l2_settlement::da::MAX_PER_BLOCK` DA slots of every block is reserved
+/// for the L2's registered DA funding key (`l2_settlement::da::reserved_key`).
+/// `u64::MAX` means INERT. No epoch has been chosen.
+///
+/// From the first block of this epoch, a block may carry at most
+/// `da::OPEN_PER_BLOCK` (3) DA transactions funded by any other key; the
+/// total cap of `da::MAX_PER_BLOCK` (4) is unchanged. Without it, four
+/// third-party DA transactions per block at tip 0 take every slot for about
+/// 0.012 BLCH an hour (the tip tie-break is the canonical bytes, which start
+/// with the funding key), and no user-transaction block can settle while
+/// they do. The rule only refuses blocks the old rule accepted, so it is a
+/// soft fork: no committed byte changes at the gate, and history replays
+/// unchanged. Arming needs the registered key (`hard_forks`).
+pub const L2_DA_RESERVED_SLOT_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn l2_da_reserved_slot_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_da_reserved_slot_test::forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_DA_RESERVED_SLOT_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_da_reserved_slot_test {
+    use std::cell::Cell;
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static KEY: Cell<Option<[u8; 32]>> = const { Cell::new(None) };
+    }
+    pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn key() -> Option<[u8; 32]> { KEY.with(Cell::get) }
+    /// Arms the gate and registers `key` (a funding-key hash) on this thread.
+    pub fn open(key: Option<[u8; 32]>) -> impl Drop {
+        struct Restore(bool, Option<[u8; 32]>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ENABLED.with(|v| v.set(self.0));
+                KEY.with(|v| v.set(self.1));
+            }
+        }
+        Restore(ENABLED.with(|v| v.replace(true)), KEY.with(|v| v.replace(key)))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod native_claim_finality_test {
     use std::cell::Cell;

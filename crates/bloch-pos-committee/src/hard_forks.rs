@@ -29,6 +29,14 @@
 //!   canonicalization before a new suite) extend this function when their
 //!   line is merged.
 //!
+//! - **The L2 program after KES.** The swap to the next L2 program and its
+//!   rollback are listed here too ([`Fork::L2Program`]), so that the checks
+//!   below hold them to `u64::MAX`. [`l2_program_schedule_coherent`]: an armed
+//!   swap comes strictly after the first KES period starts, one day of epochs
+//!   after enforcement, so a replacement release can still move it once KES is
+//!   live and the two state changes never share a boundary. A rollback needs an
+//!   armed swap before it.
+//!
 //! [`RELEASE_ARMABLE`] lists the gates the next release is allowed to arm.
 //! `only_release_armable_gates_are_armed` fails if any other gate leaves
 //! `u64::MAX`, so arming a gate outside the agreed scope cannot slip
@@ -42,6 +50,10 @@ pub enum Fork {
     Hf1,
     Hf2,
     Hf3,
+    /// The L2 program swap and its rollback, on no HF line of their own.
+    L2Program,
+    /// The reserved DA slot of the registered L2 DA key, on no HF line.
+    L2DataAvailability,
 }
 
 /// One activation gate of the HF1/HF2/HF3 lines.
@@ -91,6 +103,13 @@ pub const HARD_FORK_GATES: &[HardForkGate] = &[
     gate!(Hf3, params::HF3_SLH_SUITE_EPOCH, false),
     gate!(Hf3, params::HF3_PQ_MIGRATION_EPOCH, false),
     gate!(Hf3, params::LATTICE_EMERGENCY_ACTIVATION_EPOCH, false),
+    // The next L2 program: inert, outside `RELEASE_ARMABLE`.
+    gate!(L2Program, params::L2_NEXT_PROGRAM_EPOCH, false),
+    gate!(L2Program, params::L2_PROGRAM_ROLLBACK_EPOCH, false),
+    // The reserved DA slot: inert, outside `RELEASE_ARMABLE`.
+    gate!(L2DataAvailability, params::L2_DA_RESERVED_SLOT_EPOCH, false),
+    // L1 forced inclusion of L2 transactions: inert, outside `RELEASE_ARMABLE`.
+    gate!(L2Program, params::L2_FORCED_INCLUSION_EPOCH, false),
 ];
 
 /// Gates that no scheduled release may arm (owner scope 2026-10-20: nothing
@@ -130,6 +149,36 @@ const fn armed(e: u64) -> bool {
 /// [`HF2_MIN_EPOCHS_AFTER_HF1`] after it.
 pub const fn hf2_after_hf1(claim_finality: u64, hf2: u64) -> bool {
     !armed(hf2) || (armed(claim_finality) && hf2 >= claim_finality.saturating_add(HF2_MIN_EPOCHS_AFTER_HF1))
+}
+
+/// Epochs from KES enforcement to the first KES period handover: an armed L2
+/// program swap comes strictly after it (see the module docs).
+pub const L2_PROGRAM_MIN_EPOCHS_AFTER_KES: u64 = 90;
+
+/// `next` is inert, or strictly after [`L2_PROGRAM_MIN_EPOCHS_AFTER_KES`] past an
+/// armed KES enforcement; `rollback` is inert, or strictly after an armed `next`.
+pub const fn l2_program_schedule_coherent(kes_enforcement: u64, next: u64, rollback: u64) -> bool {
+    (!armed(next) || (armed(kes_enforcement) && next > kes_enforcement.saturating_add(L2_PROGRAM_MIN_EPOCHS_AFTER_KES)))
+        && (!armed(rollback) || (armed(next) && rollback > next))
+}
+
+/// An armed swap or rollback names final programs, not the candidate's examples.
+pub const fn l2_program_may_arm(next: u64, rollback: u64, program_final: bool) -> bool {
+    program_final || (!armed(next) && !armed(rollback))
+}
+
+/// The reserved DA slot is inert, or a DA key is registered for it. With no
+/// key the rule would bind nothing (`da::reserved_key_at`), so an armed gate
+/// without one is a release mistake, refused at compile time.
+pub const fn l2_da_reserved_slot_may_arm(epoch: u64, key: Option<[u8; 32]>) -> bool {
+    !armed(epoch) || key.is_some()
+}
+
+/// Forced inclusion needs a guest that executes the queue, so it is armed only
+/// with a listed configuration, and never before the program swap that brings
+/// that guest (the same epoch is allowed: the swap runs first in `close_epoch`).
+pub const fn l2_forced_inclusion_may_arm(forced: u64, next: u64, configured: bool) -> bool {
+    !armed(forced) || (configured && armed(next) && forced >= next)
 }
 
 /// The ordering rules between all HF1/HF2/HF3 gates (see the module docs).
@@ -181,6 +230,29 @@ const _: () = assert!(hard_fork_schedule_coherent(
     params::HF3_SLH_SUITE_EPOCH,
     params::HF3_PQ_MIGRATION_EPOCH,
     params::LATTICE_EMERGENCY_ACTIVATION_EPOCH,
+));
+// A rehearsal compresses the schedule and uses the candidate on a private network.
+#[cfg(not(feature = "l2-activation-rehearsal"))]
+const _: () = assert!(l2_program_schedule_coherent(
+    params::HF3_KES_ENFORCE_EPOCH,
+    params::L2_NEXT_PROGRAM_EPOCH,
+    params::L2_PROGRAM_ROLLBACK_EPOCH,
+));
+#[cfg(not(feature = "l2-activation-rehearsal"))]
+const _: () = assert!(l2_program_may_arm(
+    params::L2_NEXT_PROGRAM_EPOCH,
+    params::L2_PROGRAM_ROLLBACK_EPOCH,
+    crate::l2_settlement::mainnet::PROGRAM_NEXT_FINAL,
+));
+const _: () = assert!(l2_da_reserved_slot_may_arm(
+    params::L2_DA_RESERVED_SLOT_EPOCH,
+    crate::l2_settlement::da::REGISTERED_KEY,
+));
+#[cfg(not(feature = "l2-activation-rehearsal"))]
+const _: () = assert!(l2_forced_inclusion_may_arm(
+    params::L2_FORCED_INCLUSION_EPOCH,
+    params::L2_NEXT_PROGRAM_EPOCH,
+    !crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS.is_empty(),
 ));
 // The P5a alias must follow the HF2 release switch.
 const _: () = assert!(params::NATIVE_SLASHING_ACTIVATION_EPOCH == params::HF2_SLASHING_V2_EPOCH);
@@ -260,6 +332,84 @@ mod tests {
                 assert!(HARD_FORK_GATES.iter().any(|g| g.name == full), "{full} missing from HARD_FORK_GATES");
             }
         }
+    }
+
+    #[test]
+    fn the_l2_program_gates_ship_inert_and_outside_the_release_scope() {
+        for name in ["params::L2_NEXT_PROGRAM_EPOCH", "params::L2_PROGRAM_ROLLBACK_EPOCH"] {
+            let g = HARD_FORK_GATES.iter().find(|g| g.name == name).expect("listed");
+            assert_eq!(g.fork, Fork::L2Program);
+            assert!(!g.armed() && !g.node_policy_only);
+            assert!(!RELEASE_ARMABLE.contains(&name));
+        }
+    }
+
+    #[test]
+    fn the_reserved_da_slot_ships_inert_outside_the_release_scope_and_needs_a_key() {
+        let name = "params::L2_DA_RESERVED_SLOT_EPOCH";
+        let g = HARD_FORK_GATES.iter().find(|g| g.name == name).expect("listed");
+        assert_eq!(g.fork, Fork::L2DataAvailability);
+        assert!(!g.armed() && !g.node_policy_only);
+        assert!(!RELEASE_ARMABLE.contains(&name));
+        assert_eq!(params::L2_DA_RESERVED_SLOT_EPOCH, M);
+        assert_eq!(crate::l2_settlement::mainnet::DA_RESERVED_KEY, None, "TBD-owner");
+        assert!(l2_da_reserved_slot_may_arm(M, None));
+        assert!(!l2_da_reserved_slot_may_arm(9_000, None));
+        assert!(l2_da_reserved_slot_may_arm(9_000, Some([7; 32])));
+    }
+
+    #[test]
+    fn forced_inclusion_ships_inert_and_needs_a_guest_and_the_swap() {
+        let g = HARD_FORK_GATES.iter().find(|g| g.name == "params::L2_FORCED_INCLUSION_EPOCH").expect("listed");
+        assert_eq!(g.fork, Fork::L2Program);
+        assert!(!g.armed() && !g.node_policy_only);
+        assert!(!RELEASE_ARMABLE.contains(&"params::L2_FORCED_INCLUSION_EPOCH"));
+        assert_eq!(params::L2_FORCED_INCLUSION_EPOCH, M);
+        assert!(crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS.is_empty());
+        // Inert is always coherent.
+        assert!(l2_forced_inclusion_may_arm(M, M, false));
+        assert!(l2_forced_inclusion_may_arm(M, 10_060, true));
+        // No listed guest: refused, whatever the swap.
+        assert!(!l2_forced_inclusion_may_arm(10_060, 10_060, false));
+        // No swap, or a gate before the swap: refused.
+        assert!(!l2_forced_inclusion_may_arm(10_060, M, true));
+        assert!(!l2_forced_inclusion_may_arm(10_059, 10_060, true));
+        // At or after the swap with a listed guest: allowed.
+        assert!(l2_forced_inclusion_may_arm(10_060, 10_060, true));
+        assert!(l2_forced_inclusion_may_arm(11_320, 10_060, true));
+    }
+
+    #[test]
+    fn the_l2_program_swap_comes_after_the_first_kes_period() {
+        let kes = params::HF3_KES_ENFORCE_EPOCH;
+        assert_eq!(kes, 8_620);
+        assert!(l2_program_schedule_coherent(kes, M, M));
+        // Enforcement, the bind two epochs later, and period 1 at e8710 are refused.
+        for gate in [0, 7_360, kes, kes + 2, kes + L2_PROGRAM_MIN_EPOCHS_AFTER_KES] {
+            assert!(!l2_program_schedule_coherent(kes, gate, M), "{gate}");
+        }
+        assert!(l2_program_schedule_coherent(kes, kes + L2_PROGRAM_MIN_EPOCHS_AFTER_KES + 1, M));
+        // A swap needs KES armed at all.
+        assert!(!l2_program_schedule_coherent(M, 10_000, M));
+    }
+
+    #[test]
+    fn the_l2_program_rollback_needs_an_armed_swap_before_it() {
+        let kes = params::HF3_KES_ENFORCE_EPOCH;
+        assert!(l2_program_schedule_coherent(kes, 10_000, 10_001));
+        for rollback in [0, 9_999, 10_000] {
+            assert!(!l2_program_schedule_coherent(kes, 10_000, rollback), "{rollback}");
+        }
+        assert!(!l2_program_schedule_coherent(kes, M, 10_001));
+    }
+
+    #[test]
+    fn an_armed_l2_program_gate_needs_final_programs() {
+        assert!(l2_program_may_arm(M, M, false));
+        assert!(l2_program_may_arm(10_000, 10_001, true));
+        assert!(!l2_program_may_arm(10_000, M, false));
+        assert!(!l2_program_may_arm(M, 10_001, false));
+        assert!(!crate::l2_settlement::mainnet::PROGRAM_NEXT_FINAL, "the candidate carries a placeholder recipient");
     }
 
     #[test]
