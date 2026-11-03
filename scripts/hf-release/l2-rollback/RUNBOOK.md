@@ -45,7 +45,7 @@ Each item is a blocker for this runbook being usable in hours rather than days.
 | # | Prerequisite | Why |
 |---|---|---|
 | P1 | The December release contains this kit (126's commits, this file) | `build.sh` takes `arm.py` from the base; a mismatch should stop the build (`build.sh:32` only WARNs) |
-| P2 | Final `PROGRAM_FALLBACK` pins from a pinned-container build (126 finding; 142's `3ad3a4f0…`) and the fallback ELF and keys staged on the prover host | No guest build during an emergency |
+| P2 | Final `PROGRAM_FALLBACK` pins from a pinned-container build (126 finding; 142's `3ad3a4f0…` is replaced in fork candidate v3 by 216's forced fallback `7fd7f3c0…`, Keccak `d95185a6…`, BN254 `00865f4e…`, configuration equal to `PROGRAM_NEXT`'s; final values follow the owner's sweep recipient) and the fallback ELF and keys staged on the prover host | No guest build during an emergency |
 | P3 | Settler config already carries `fallback_program` at the December install | It is used only when L1 reports the fallback (`settler_v3.py:1036-1041`, `program_of`) |
 | P4 | Decision on fence or forfeit-reset (TABLETOP-R10.md, recommendation 1) | Without it, G2 with an active attacker is unrecoverable |
 | P5 | Decision on the node-local brake; if yes, in the December node release | Only thing that can hold claims inside the 40-minute window |
