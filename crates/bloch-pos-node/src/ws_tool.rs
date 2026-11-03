@@ -732,7 +732,7 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
     // operator who boots with it (--ws-trusted-checkpoint) vouches for it.
     let operator_trusted = args.iter().any(|a| a == "--operator-trusted");
     // --release-anchor: the checkpoint a release engineer bakes into the node
-    // release (crates/bloch-pos-node/release/ws-anchor.bin). Never signed;
+    // release (crates/bloch-pos-node/src/ws_release_anchor.rs). Never signed;
     // its trust is the release's own.
     let release_anchor = args.iter().any(|a| a == "--release-anchor");
     if release_anchor && operator_trusted {
@@ -891,12 +891,13 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
         println!("release-baked checkpoint (unsigned): epoch {epoch}, block root");
         println!("  {}", hex32(&cp.block_root));
         println!(
-            "next: copy {bin_path} to crates/bloch-pos-node/release/ws-anchor.bin in the release \
-             tree, build with --features ws-auto-checkpoint, and quote epoch, block root and the \
-             file's SHA-256 in the release notes. Anyone with a synced node re-derives it with \
-             the same command and --issued-at {}",
+            "next: set RELEASE_ANCHOR_HEX in crates/bloch-pos-node/src/ws_release_anchor.rs to the \
+             hex below (docs/WS-RELEASE-ANCHOR.md), build the release (its Dockerfile enables \
+             --features ws-release-anchor), and quote epoch, block root and this hex in the release \
+             notes. Anyone with a synced node re-derives it with the same command and --issued-at {}",
             cp.issued_at
         );
+        println!("RELEASE_ANCHOR_HEX = {}", crate::codec::hex(&bytes));
         return Ok(());
     }
     if operator_trusted {

@@ -569,6 +569,8 @@ fn main() {
     }
     if std::env::var_os("CARGO_FEATURE_WS_AUTO_CHECKPOINT").is_some() {
         devnet.push_str("+ws-auto-checkpoint");
+    } else if std::env::var_os("CARGO_FEATURE_WS_RELEASE_ANCHOR").is_some() {
+        devnet.push_str("+ws-release-anchor");
     }
     println!("cargo:rerun-if-env-changed=BLOCH_L2_REHEARSAL_ACTIVATION_EPOCH");
     println!("cargo:rustc-env=BLOCH_BUILD_VERSION={pkg} ({commit}{dirty}){devnet}");

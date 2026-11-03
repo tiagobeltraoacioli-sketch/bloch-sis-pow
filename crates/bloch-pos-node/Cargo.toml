@@ -65,14 +65,20 @@ l2-activation-rehearsal-mainnet-policy = ["l2-activation-rehearsal", "bloch-pos-
 # QUALIFICATION BUILDS ONLY; see bloch-pos-committee (full-history replay
 # under the pinned ML-DSA rule, params::MLDSA_PIN_ACTIVATION_EPOCH docs).
 mldsa-pin-replay-qualification = ["bloch-pos-committee/mldsa-pin-replay-qualification"]
-# PROTOTYPE, OFF by default (agent 208, round 11): non-recurring weak-
-# subjectivity anchors. Enables (1) the release-baked checkpoint read from
-# release/ws-anchor.bin (empty in the tree: bakes nothing until a release
-# fills it), (2) the unsigned operator-trusted checkpoint flags
-# (--checkpoint-sync-url, --ws-trusted-checkpoint, --ws-trusted-root), and
-# (3) resuming a checkpoint sync after a restart instead of ERR_WS_STALE.
-# Node-local boot policy only; no consensus rule changes.
-ws-auto-checkpoint = []
+# Weak-subjectivity anchors without recurring signatures (agents 208, 242).
+# OFF by default: without either feature the node behaves as fa980367.
+#
+# ws-release-anchor: what node release A ships with (the canonical release
+# Dockerfile enables it). (1) the release-baked checkpoint compiled from
+# src/ws_release_anchor.rs, which lies inside the source digest; (2) resuming
+# a checkpoint sync after a restart instead of ERR_WS_STALE; (3) the same-fact
+# rule (a signed and a release checkpoint naming one block are one fact).
+ws-release-anchor = []
+# ws-auto-checkpoint: PROTOTYPE, never in a release yet. Everything above plus
+# the unsigned operator-trusted inputs (--checkpoint-sync-url,
+# --ws-trusted-checkpoint, --ws-trusted-root). Owner decision (round 11):
+# operator checkpoint sync stays unit-tested only.
+ws-auto-checkpoint = ["ws-release-anchor"]
 
 [dependencies]
 bloch-l2-proof = { path = "../bloch-l2-proof" }

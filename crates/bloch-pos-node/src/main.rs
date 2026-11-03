@@ -67,6 +67,8 @@ mod signer_anchor;
 mod slashing_cli;
 mod store;
 mod ws_boot;
+#[cfg(feature = "ws-release-anchor")]
+mod ws_release_anchor;
 mod validator_deposit;
 mod validator_lifecycle;
 mod validator_payout;
@@ -596,9 +598,12 @@ fn print_help() {
                younger than the weak-subjectivity period that needs no\n\
                checkpoint at all; past it, a fresh node requires\n\
                --ws-checkpoint and says so rather than syncing blindly.\n\
-               PROTOTYPE (built only with --features ws-auto-checkpoint):\n\
-               a release-baked checkpoint, the three unsigned flags below,\n\
-               and resuming a checkpoint sync after a restart.\n\
+               Release builds (--features ws-release-anchor, shown as\n\
+               +ws-release-anchor in --version) bake a recent finalized\n\
+               checkpoint into the binary and resume a checkpoint sync\n\
+               after a restart; such a node needs no flag at all.\n\
+               PROTOTYPE (built only with --features ws-auto-checkpoint,\n\
+               refused by release builds): the three unsigned flags below.\n\
                --checkpoint-sync-url is the easy way in (the Ethereum model):\n\
                a new node asks those RPCs for their latest finalized\n\
                checkpoint, requires them all to agree, and syncs under it.\n\

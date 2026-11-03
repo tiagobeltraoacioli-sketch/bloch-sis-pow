@@ -34,8 +34,12 @@ RUN case "$BLOCH_BUILD_COMMIT" in \
  && test ! -e crates/bloch-pos-committee/Cargo.lock
 
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+# Node release A onward: the release-baked weak-subjectivity checkpoint and
+# the restart-mid-sync fix (cargo feature ws-release-anchor; owner decision,
+# round 11). The prototype ws-auto-checkpoint (unsigned operator inputs) must
+# never be enabled here.
 RUN BLOCH_BUILD_COMMIT="$BLOCH_BUILD_COMMIT" BLOCH_BUILD_TREE_ASSERTION=clean cargo build \
-      --release --locked -p bloch-pos-node --bin bloch-pos
+      --release --locked -p bloch-pos-node --bin bloch-pos --features ws-release-anchor
 
 RUN set -eu; \
     mkdir /release; \
@@ -49,6 +53,7 @@ RUN set -eu; \
     version="$(sed -n '1p' "$version_file")"; \
     source_identity="$(sed -n '2p' "$version_file")"; \
     printf '%s\n' "$version" | grep -F "${BLOCH_BUILD_COMMIT%${BLOCH_BUILD_COMMIT#????????????}}"; \
+    printf '%s\n' "$version" | grep -F '+ws-release-anchor'; \
     printf '%s\n' "$source_identity" | grep -E '^source-digest sha3-256:[0-9a-f]{64} \([0-9]+ files, [0-9]+ bytes\) commit-source:asserted tree:asserted-clean$'; \
     { \
       printf 'artifact_kind=canonical-container-candidate\n'; \

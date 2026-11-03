@@ -650,10 +650,17 @@ pub const fn is_unsigned_anchor_id(id: u32) -> bool {
 }
 
 /// True when this binary was built with the `ws-auto-checkpoint` prototype
-/// feature. Without it the node behaves exactly as fa980367: the unsigned
-/// flags are refused, no release anchor is consulted, and a restart part-way
-/// through a checkpoint sync still halts with `ERR_WS_STALE`.
+/// feature: the unsigned operator-trusted inputs (`--checkpoint-sync-url`,
+/// `--ws-trusted-checkpoint`, `--ws-trusted-root`) are accepted. Never in a
+/// release yet (owner decision, round 11).
 pub const AUTO_CHECKPOINT_ENABLED: bool = cfg!(feature = "ws-auto-checkpoint");
+
+/// True when this binary was built with `ws-release-anchor` (implied by
+/// `ws-auto-checkpoint`): the release-baked checkpoint is compiled in, a
+/// restart part-way through a checkpoint sync resumes, and the same-fact rule
+/// applies. Without it the node behaves exactly as fa980367: no release
+/// anchor, and a restart mid-sync still halts with `ERR_WS_STALE`.
+pub const RELEASE_ANCHOR_ENABLED: bool = cfg!(feature = "ws-release-anchor");
 
 /// Decode the release-baked checkpoint file. An EMPTY file means "this
 /// release bakes no checkpoint" (the state of every build until a release
@@ -685,17 +692,23 @@ pub fn decode_release_anchor(bytes: &[u8]) -> Result<Option<WeakSubjectivityChec
 /// Workspace-relative path of the file `compiled_release_anchor` compiles in.
 /// It must lie inside the source-digest scope (build_source_digest.rs), so
 /// that a binary's reported source digest also binds the anchor it bakes.
-pub const RELEASE_ANCHOR_SOURCE: &str = "crates/bloch-pos-node/release/ws-anchor.bin";
+pub const RELEASE_ANCHOR_SOURCE: &str = "crates/bloch-pos-node/src/ws_release_anchor.rs";
+
+/// Decode the hex text of `src/ws_release_anchor.rs` (empty: no anchor).
+#[cfg_attr(not(feature = "ws-release-anchor"), allow(dead_code))]
+pub fn decode_release_anchor_hex(text: &str) -> Result<Option<WeakSubjectivityCheckpoint>, String> {
+    let bytes = crate::codec::unhex(text.trim()).map_err(|e| format!("release-baked checkpoint hex: {e}"))?;
+    decode_release_anchor(&bytes)
+}
 
 /// The checkpoint compiled into this binary, if any. Only builds with the
-/// `ws-auto-checkpoint` feature read `release/ws-anchor.bin`; the file in the
-/// tree is empty, so even those builds bake nothing until a release fills it.
+/// `ws-release-anchor` feature read `src/ws_release_anchor.rs`.
 pub fn compiled_release_anchor() -> Result<Option<WeakSubjectivityCheckpoint>, String> {
-    #[cfg(feature = "ws-auto-checkpoint")]
+    #[cfg(feature = "ws-release-anchor")]
     {
-        decode_release_anchor(include_bytes!("../release/ws-anchor.bin"))
+        decode_release_anchor_hex(crate::ws_release_anchor::RELEASE_ANCHOR_HEX)
     }
-    #[cfg(not(feature = "ws-auto-checkpoint"))]
+    #[cfg(not(feature = "ws-release-anchor"))]
     {
         Ok(None)
     }
@@ -739,13 +752,13 @@ pub struct WsConfig {
     pub checkpoint_sync_pin: Option<[u8; 32]>,
     /// Release-baked checkpoint ([`WS_RELEASE_SIGNER_SET_ID`]), consulted on
     /// every boot before any operator input. `None` unless the binary was
-    /// built with `ws-auto-checkpoint` AND its `release/ws-anchor.bin` is set.
+    /// built with `ws-release-anchor` AND `src/ws_release_anchor.rs` is set.
     pub release_anchor: Option<WeakSubjectivityCheckpoint>,
     /// Restart-during-checkpoint-sync fix (agent 181's ERR_WS_STALE finding):
     /// a node whose own finality is beyond the window but BEHIND a fresh,
     /// already-verified anchor keeps syncing under that anchor as a hard
     /// anchor, exactly as it did before the restart. Off unless built with
-    /// `ws-auto-checkpoint`.
+    /// `ws-release-anchor`.
     pub resume_sync_under_anchor: bool,
 }
 
@@ -830,7 +843,7 @@ impl WsConfig {
             checkpoint_sync,
             checkpoint_sync_pin,
             release_anchor: compiled_release_anchor()?,
-            resume_sync_under_anchor: AUTO_CHECKPOINT_ENABLED,
+            resume_sync_under_anchor: RELEASE_ANCHOR_ENABLED,
         })
     }
 }
@@ -1078,7 +1091,7 @@ pub fn boot(
 
     check_local_state(&anchor, genesis_anchor, &local_state_root, &mut warnings)?;
 
-    // 1b. Release-baked checkpoint (prototype, `ws-auto-checkpoint`): the
+    // 1b. Release-baked checkpoint (`ws-release-anchor`): the
     //     same trust as the genesis anchor — the release binary — at a recent
     //     epoch. It goes through every rule a signed envelope goes through
     //     except the signature check, because there is nothing to sign: the
@@ -1247,10 +1260,10 @@ pub fn boot(
 
         // 3. Anti-rollback against the stored ws_latest (§4.1).
         if let Some(cp) = published {
-            // The same-fact rule is part of the prototype: a default build
+            // The same-fact rule comes with the release anchor: a default build
             // keeps fa980367's anti-rollback exactly (a re-mint with another
             // issued_at is WS_CONFLICT even when the roots agree).
-            let decision = if AUTO_CHECKPOINT_ENABLED { same_fact_accept(&anchor, &cp) } else { ws::accept(Some(&anchor), &cp) };
+            let decision = if RELEASE_ANCHOR_ENABLED { same_fact_accept(&anchor, &cp) } else { ws::accept(Some(&anchor), &cp) };
             match decision {
                 Acceptance::Store => {
                     save_latest(data_dir, &cp)?;
@@ -1292,10 +1305,11 @@ pub fn boot(
                 "WARNING: this node's finalized knowledge is {age} epochs old — inside \
                  the weak-subjectivity window ({} epochs) but past the freshness \
                  threshold ({}). Resuming from own finality, but fetch a fresh \
-                 checkpoint (--ws-trusted-checkpoint or --ws-checkpoint) before following any peer that offers a \
+                 checkpoint ({}) before following any peer that offers a \
                  competing finalized branch.",
                 ws::WS_PERIOD_EPOCHS,
                 ws::WS_FRESH_EPOCHS,
+                if AUTO_CHECKPOINT_ENABLED { "--ws-trusted-checkpoint or --ws-checkpoint" } else { "--ws-checkpoint" },
             ));
             Ok(())
         }
@@ -1383,10 +1397,11 @@ pub fn boot(
                      withdrawn, and could sign a conflicting continuation for free; \
                      the local markers are no longer a defense, so no peer can be \
                      safely followed. This refusal is the mechanism working, not a \
-                     fault. Recover by obtaining a recent checkpoint OUT OF BAND \
-                     (operator-trusted or signed, see below) and restarting with it.\n\n{}",
+                     fault. Recover by obtaining a recent {} OUT OF BAND \
+                     (see below) and restarting with it.\n\n{}",
                     ws::WS_PERIOD_EPOCHS,
                     window_days(),
+                    if AUTO_CHECKPOINT_ENABLED { "checkpoint (operator-trusted or signed)" } else { "signed checkpoint" },
                     where_checkpoints_come_from(),
                 ))
             }
@@ -2709,9 +2724,9 @@ mod tests {
         let cfg = write_artifacts(&dir, "reminted", &env, &set);
         let attempt = boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), wall, false, (0, GEN), |_| None, |_| false, |_| None)
             .unwrap();
-        if AUTO_CHECKPOINT_ENABLED {
-            // Prototype same-fact rule: same block and state, so one fact.
-            attempt.expect("same roots at one epoch are not an equivocation under ws-auto-checkpoint");
+        if RELEASE_ANCHOR_ENABLED {
+            // Same-fact rule: same block and state, so one fact.
+            attempt.expect("same roots at one epoch are not an equivocation under ws-release-anchor");
         } else {
             let refusal = attempt.expect_err("a re-mint of a stored epoch refuses the boot");
             assert!(refusal.contains("WS_CONFLICT"), "{refusal}");
@@ -2906,10 +2921,15 @@ mod tests {
     fn default_build_is_inert() {
         assert_eq!(AUTO_CHECKPOINT_ENABLED, cfg!(feature = "ws-auto-checkpoint"));
         let parsed = WsConfig::from_args(&args(&["--data-dir", "x"])).unwrap();
-        assert_eq!(parsed.resume_sync_under_anchor, AUTO_CHECKPOINT_ENABLED);
-        // The tree's release/ws-anchor.bin is empty: no build bakes an anchor.
-        assert!(parsed.release_anchor.is_none());
-        assert!(compiled_release_anchor().unwrap().is_none());
+        assert_eq!(RELEASE_ANCHOR_ENABLED, cfg!(feature = "ws-release-anchor"));
+        assert!(RELEASE_ANCHOR_ENABLED || !AUTO_CHECKPOINT_ENABLED, "ws-auto-checkpoint implies ws-release-anchor");
+        assert_eq!(parsed.resume_sync_under_anchor, RELEASE_ANCHOR_ENABLED);
+        // Only a ws-release-anchor build compiles the anchor in.
+        if !RELEASE_ANCHOR_ENABLED {
+            assert!(parsed.release_anchor.is_none());
+            assert!(compiled_release_anchor().unwrap().is_none());
+        }
+        assert_eq!(parsed.release_anchor, compiled_release_anchor().unwrap());
         if !AUTO_CHECKPOINT_ENABLED {
             for flags in [
                 vec!["--checkpoint-sync-url", "127.0.0.1:1"],
@@ -3110,5 +3130,42 @@ mod tests {
         let out = boot(&no_flags(), &dir, NET, &GEN, &genesis_anchor(), 7300, true,
             (7298, [0x22; 32]), |e| (e == 7168).then_some([0x22; 32]), |_| true, |_| None).unwrap().expect("synced node");
         assert!(!out.anchor_is_hard);
+    }
+
+    /// Mainnet genesis block id (genesis/mainnet.manifest; network 1228832244).
+    const MAINNET_GENESIS_ROOT_HEX: &str = "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415";
+
+    /// R242: the anchor a ws-release-anchor build compiles is exactly the
+    /// file named by RELEASE_ANCHOR_SOURCE (which the source digest hashes),
+    /// and a baked anchor is the mainnet chain's.
+    #[test]
+    fn the_compiled_anchor_is_the_hashed_file_and_names_mainnet() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text = fs::read_to_string(root.join(RELEASE_ANCHOR_SOURCE)).expect("anchor source file");
+        let start = text.find("RELEASE_ANCHOR_HEX: &str = \"").expect("hex constant") + "RELEASE_ANCHOR_HEX: &str = \"".len();
+        let hex = &text[start..start + text[start..].find('"').expect("closing quote")];
+        let on_disk = decode_release_anchor_hex(hex).expect("valid anchor file");
+        if RELEASE_ANCHOR_ENABLED {
+            assert_eq!(compiled_release_anchor().unwrap(), on_disk);
+        }
+        if let Some(cp) = on_disk {
+            assert_eq!(cp.network_id, 1_228_832_244, "a release bakes the mainnet anchor only");
+            assert_eq!(hex32(&cp.genesis_root), MAINNET_GENESIS_ROOT_HEX);
+            assert_eq!(cp.signer_set_id, WS_RELEASE_SIGNER_SET_ID);
+        }
+    }
+
+    /// R242: a ws-release-anchor build without ws-auto-checkpoint refuses the
+    /// unsigned operator inputs (owner decision: unit-tested only).
+    #[test]
+    fn the_release_configuration_refuses_operator_inputs() {
+        for flags in [
+            vec!["--checkpoint-sync-url", "127.0.0.1:1"],
+            vec!["--ws-trusted-checkpoint", "cp.bin"],
+            vec!["--ws-trusted-checkpoint", "cp.bin", "--ws-trusted-root", &"22".repeat(32)],
+        ] {
+            let parsed = WsConfig::from_args(&args(&flags));
+            assert_eq!(parsed.is_ok(), AUTO_CHECKPOINT_ENABLED, "{flags:?}");
+        }
     }
 }
