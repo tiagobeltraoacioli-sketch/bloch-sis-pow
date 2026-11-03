@@ -2138,12 +2138,21 @@ fn l2_forced_json_reports_the_queue_and_the_next_surcharge() {
     let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(
         keys,
-        ["queued", "consumed", "pending", "pending_weight", "max_pending_weight", "root", "due", "due_hash", "next_surcharge_sat"]
+        [
+            "queued", "consumed", "pending", "pending_weight", "max_pending_weight", "root", "due", "due_hash",
+            "next_surcharge_sat", "transfer_surcharge_sat", "max_gas_surcharge_sat", "drain_settlements", "treasury",
+        ]
     );
     let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
     assert_eq!(get("due"), Json::Arr(vec![]));
     assert_eq!(get("due_hash"), Json::hex(&forced::hash(&[])));
     assert_eq!(get("next_surcharge_sat"), Json::sat(1_000));
+    assert_eq!(get("transfer_surcharge_sat"), Json::sat(1_000));
+    assert_eq!(get("max_gas_surcharge_sat"), Json::sat(14_000));
+    assert_eq!(get("drain_settlements"), Json::u(0));
+    // TBD-owner: no treasury is compiled, so forced inclusion cannot be enabled.
+    assert_eq!(get("treasury"), Json::Null);
+    assert_eq!(bloch_pos_committee::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY, None);
     assert_eq!(bloch_pos_committee::params::L2_FORCED_INCLUSION_EPOCH, u64::MAX);
 }
 

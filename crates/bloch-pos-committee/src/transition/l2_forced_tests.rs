@@ -13,7 +13,9 @@
     }
 
     /// A signed forced transaction spending `coin` (value, at `outpoint`) with
-    /// all remaining value back as change, at the surcharge `pre` asks for.
+    /// all remaining value back as change, signing as its maximum surcharge the
+    /// ceiling one price tier deeper than the queue `pre` shows (a wallet's
+    /// default headroom); the unused part comes back as the refund output.
     fn forced_tx(pre: &CommittedState, outpoint: ([u8; 32], u32), value: u64, env: Vec<u8>, gas: u64) -> L2ForcedTransaction {
         let key = depositor();
         let mut tx = L2ForcedTransaction {
@@ -22,6 +24,7 @@
             inputs: vec![crate::transition::FundingInput { txid: outpoint.0, vout: outpoint.1 }],
             l2_chain_id: 700771,
             gas_limit: gas,
+            max_surcharge_sat: 0,
             envelope: env,
             change: TransferOutput { value: 0, script_hash: script_of(&key) },
             tx_bytes: 0,
@@ -33,10 +36,12 @@
             .l2_settlement()
             .and_then(|l2| l2.forced_queue())
             .map_or(0, |q| q.pending_weight());
-        let surcharge = forced::surcharge_sat(pending, forced::weight(gas)).unwrap_or(0);
+        tx.max_surcharge_sat = forced::surcharge_ceiling_sat(pending + forced::SURCHARGE_DOUBLING, gas).unwrap_or(0);
         let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, tx.tx_bytes, pre.next_base_fee(), 0);
-        tx.change.value =
-            (u128::from(value) - charge.base_fee_sat - charge.priority_fee_sat - u128::from(surcharge)) as u64;
+        tx.change.value = (u128::from(value)
+            - charge.base_fee_sat
+            - charge.priority_fee_sat
+            - u128::from(tx.max_surcharge_sat)) as u64;
         tx.signature = toy_sign(&key, &tx.intent_root());
         tx
     }
@@ -134,14 +139,22 @@
         assert_eq!(record.envelope_hash, <[u8; 32]>::from(Keccak256::digest(envelope(7))));
         assert_eq!(record.gas_limit, 60_000);
         assert!(queue.due().is_empty(), "frozen before it landed");
-        // Fees: inputs = change + base fee + tip + the burned surcharge.
+        // Fees: inputs = change + base fee + tip + the signed maximum surcharge.
+        // The charged surcharge goes to the treasury, the rest back to the payer.
         assert!(s2.eutxos.get(&([0x33; 32], 0)).is_none());
         let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, tx.tx_bytes, opened.next_base_fee(), 0);
+        let change = s2.eutxos.get(&(wire.txid(), 0)).unwrap();
         assert_eq!(
-            u128::from(s2.eutxos.get(&(wire.txid(), 0)).unwrap().value),
-            // 60k declared gas is 3 weight units: 3 * 1000 sat on an empty queue.
-            u128::from(FUNDED) - charge.base_fee_sat - 3 * u128::from(forced::BASE_SURCHARGE_SAT)
+            u128::from(change.value),
+            u128::from(FUNDED) - charge.base_fee_sat - u128::from(tx.max_surcharge_sat)
         );
+        // 60k declared gas is 3 weight units: 3 * 1000 sat on an empty queue.
+        let charged = 3 * forced::BASE_SURCHARGE_SAT;
+        let treasury = s2.eutxos.get(&(wire.txid(), crate::transition::l2_forced::TREASURY_VOUT)).unwrap();
+        assert_eq!((treasury.value, treasury.script_hash), (charged, forced::treasury_test::TREASURY));
+        let refund = s2.eutxos.get(&(wire.txid(), crate::transition::l2_forced::REFUND_VOUT)).unwrap();
+        assert_eq!((refund.value, refund.script_hash), (tx.max_surcharge_sat - charged, script_of(&depositor())));
+        assert!(tx.max_surcharge_sat > charged);
         // Replay: the input is gone.
         let mut replay = s2.clone();
         assert_eq!(
@@ -251,16 +264,19 @@
         assert_eq!(l2.queue_forced(MAINNET_CHAIN_ID, [1; 32], &big, 21_000), Err(R::Shape));
         assert_eq!(l2.committed_bytes(), start);
 
-        // Weight: one unit per started 21k of declared gas.
-        assert_eq!((forced::weight(21_000), forced::weight(21_001), forced::weight(forced::MAX_GAS)), (1, 2, 15));
-        // The unit price doubles every 32 pending units; the queue holds 256 units.
+        // Weight: a record's share of a settlement, ceil(gas * 14 / 300k).
+        assert_eq!((forced::weight(21_000), forced::weight(21_001), forced::weight(forced::MAX_GAS)), (1, 1, 14));
+        assert_eq!((forced::weight(21_429), forced::weight(150_001), forced::weight(100_001)), (2, 8, 5));
+        // The unit price doubles every 24 positions; the queue holds 256 units.
         assert_eq!(forced::surcharge_sat(0, 1), Some(1_000));
-        assert_eq!(forced::surcharge_sat(31, 1), Some(1_000));
-        assert_eq!(forced::surcharge_sat(32, 1), Some(2_000));
-        assert_eq!(forced::surcharge_sat(32, 15), Some(30_000));
-        assert_eq!(forced::surcharge_sat(255, 1), Some(1_000 << 7));
+        assert_eq!(forced::surcharge_sat(23, 1), Some(1_000));
+        assert_eq!(forced::surcharge_sat(24, 1), Some(2_000));
+        assert_eq!(forced::surcharge_sat(24, 14), Some(28_000));
+        // Each unit at its own position: 23 at 1_000, then 13 at 2_000.
+        assert_eq!(forced::surcharge_sat(23, 14), Some(1_000 + 13 * 2_000));
+        assert_eq!(forced::surcharge_sat(255, 1), Some(1_000 << 10));
         assert_eq!(forced::surcharge_sat(256, 1), None);
-        assert_eq!(forced::surcharge_sat(242, 15), None, "a large record must fit whole");
+        assert_eq!(forced::surcharge_sat(243, 14), None, "a large record must fit whole");
         assert_eq!(forced::surcharge_sat(0, 0), None);
         let mut roots = std::collections::BTreeSet::new();
         for i in 0..forced::MAX_PENDING_WEIGHT {
@@ -272,16 +288,19 @@
         let queue = l2.forced_queue().unwrap();
         assert_eq!(queue.pending_weight(), forced::MAX_PENDING_WEIGHT);
         assert_ne!(l2.committed_bytes(), start);
-        // Large records fill it faster but drain at the same gas rate:
-        // 17 of 300k are 255 units, one transfer fits, then it is full.
+        // Large records fill it in settlement-sized steps: 18 of 300k are
+        // 252 units, four transfers fit, then it is full.
         let mut large = mainnet_l2_state();
         assert!(large.enable_forced_inclusion_for_test());
-        for i in 0..17u8 {
+        for i in 0..18u8 {
             large.queue_forced(MAINNET_CHAIN_ID, [i; 32], &envelope(i), forced::MAX_GAS).unwrap();
         }
-        assert_eq!(large.queue_forced(MAINNET_CHAIN_ID, [17; 32], &envelope(17), forced::MAX_GAS), Err(R::Full));
-        large.queue_forced(MAINNET_CHAIN_ID, [18; 32], &envelope(18), forced::MIN_GAS).unwrap();
-        assert_eq!(large.queue_forced(MAINNET_CHAIN_ID, [19; 32], &envelope(19), forced::MIN_GAS), Err(R::Full));
+        assert_eq!(large.forced_queue().unwrap().pending_weight(), 252);
+        assert_eq!(large.queue_forced(MAINNET_CHAIN_ID, [18; 32], &envelope(18), forced::MAX_GAS), Err(R::Full));
+        for i in 19..23u8 {
+            large.queue_forced(MAINNET_CHAIN_ID, [i; 32], &envelope(i), forced::MIN_GAS).unwrap();
+        }
+        assert_eq!(large.queue_forced(MAINNET_CHAIN_ID, [23; 32], &envelope(23), forced::MIN_GAS), Err(R::Full));
         // At the gas cap: one 300k record per settlement, from the front.
         assert_eq!(large.forced_queue().unwrap().due().len(), 1);
         assert_eq!(large.forced_queue().unwrap().due()[0].l1_txid, [0; 32]);
@@ -372,10 +391,17 @@
         let mut short = base.clone();
         short.tx_bytes -= 1;
         cases.push(("size", resign(short), ForcedReject::UnderdeclaredSize));
-        // Paying the fee without the surcharge breaks conservation.
+        // Paying the fee without funding the signed maximum breaks conservation.
         let mut cheap = base.clone();
         cheap.change.value += forced::BASE_SURCHARGE_SAT;
         cases.push(("surcharge", resign(cheap), ForcedReject::Conservation));
+        // A signed maximum below what the queue charges is refused (the payer
+        // re-signs; nothing is taken).
+        let mut low = base.clone();
+        let charged = pre.l2_settlement().unwrap().forced_queue().unwrap().surcharge_for(low.gas_limit).unwrap();
+        low.change.value += low.max_surcharge_sat - (charged - 1);
+        low.max_surcharge_sat = charged - 1;
+        cases.push(("maximum", resign(low), ForcedReject::SurchargeAboveMax));
         let mut unsigned = base.clone();
         unsigned.signature = vec![1; 32];
         cases.push(("signature", unsigned, ForcedReject::Signature));
@@ -388,6 +414,29 @@
             );
             assert_eq!(st, pre, "{name} mutated state");
         }
+        // Without a treasury nothing is charged and nothing is queued.
+        {
+            let _unset = forced::treasury_test::unset();
+            let mut st = pre.clone();
+            assert_eq!(
+                st.apply_transaction(&PosTransaction::L2ForcedTransaction(base.clone()), 0, pre.next_base_fee(), &ToyVerifier),
+                Err(TxReject::L2ForcedTransaction(ForcedReject::NotActive))
+            );
+            assert_eq!(st, pre);
+            let (fresh, _) = activated_fixture(true, [0; 32]);
+            assert!(!fresh.l2_settlement().unwrap().clone().enable_forced_inclusion_for_test(), "never enabled");
+        }
+        // An exact maximum leaves no refund output.
+        let mut exact = base.clone();
+        let charged = pre.l2_settlement().unwrap().forced_queue().unwrap().surcharge_for(exact.gas_limit).unwrap();
+        exact.change.value += exact.max_surcharge_sat - charged;
+        exact.max_surcharge_sat = charged;
+        let exact = resign(exact);
+        let mut st = pre.clone();
+        let wire = PosTransaction::L2ForcedTransaction(exact);
+        st.apply_transaction(&wire, 0, pre.next_base_fee(), &ToyVerifier).expect("exact maximum");
+        assert!(st.eutxos.get(&(wire.txid(), crate::transition::l2_forced::REFUND_VOUT)).is_none());
+        assert_eq!(st.eutxos.get(&(wire.txid(), crate::transition::l2_forced::TREASURY_VOUT)).unwrap().value, charged);
         // An oversized envelope does not even decode.
         let mut big = base.clone();
         big.envelope = vec![0; forced::MAX_ENVELOPE_BYTES + 1];
@@ -595,4 +644,224 @@
         let q = l2.forced_queue().unwrap();
         assert_eq!(q.pending().len(), 14, "the records block 7 consumed are due again");
         assert!(q.consumed_log().iter().all(|(n, _)| *n <= 6));
+    }
+
+    // ── Agent 215 (round 11): decided changes R3-R6 of review 164 ─────────
+
+    fn record_n(i: u64, gas: u64) -> forced::Record {
+        forced::Record { height: i, l1_txid: Keccak256::digest(i.to_be_bytes()).into(), envelope_hash: [0x5a; 32], gas_limit: gas }
+    }
+
+    /// A small deterministic generator for adversarial gas sequences.
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    /// R3: every record is consumed by the `ceil(p / 14)`-th settlement after
+    /// it, where `p` is the queue position its record ends at, whatever the
+    /// sizes and the mix, and with a filler topping the queue up between
+    /// settlements. So a full queue drains in at most 19 settlements.
+    #[test]
+    fn every_record_lands_within_its_position_bound_whatever_the_mix() {
+        let patterns: Vec<(&str, Vec<u64>)> = vec![
+            ("transfers", vec![forced::MIN_GAS]),
+            ("150_001", vec![150_001]),
+            ("100_001", vec![100_001]),
+            ("300k", vec![forced::MAX_GAS]),
+            ("small then large", vec![forced::MIN_GAS, 290_000]),
+            ("odd shares", vec![21_429, 280_000, 42_858]),
+            ("half and a transfer", vec![150_001, forced::MIN_GAS, 150_001]),
+        ];
+        let mut seeds: Vec<(String, Vec<u64>)> = patterns.into_iter().map(|(n, p)| (n.to_string(), p)).collect();
+        for seed in 0..24u64 {
+            let mut s = seed;
+            let gas = (0..64).map(|_| forced::MIN_GAS + lcg(&mut s) % (forced::MAX_GAS - forced::MIN_GAS + 1)).collect();
+            seeds.push((format!("random {seed}"), gas));
+        }
+        let mut worst_drain = 0u64;
+        for (name, pattern) in &seeds {
+            for refill in [false, true] {
+                let mut queue = forced::Queue::new();
+                let mut next = 0usize;
+                let mut i = 0u64;
+                // (record, the settlement index it must land by)
+                let mut bounds: Vec<(forced::Record, u64)> = Vec::new();
+                let mut push_all = |queue: &mut forced::Queue, settled: u64, bounds: &mut Vec<(forced::Record, u64)>| {
+                    loop {
+                        let gas = pattern[next % pattern.len()];
+                        let record = record_n(i, gas);
+                        if queue.push(record).is_err() {
+                            break;
+                        }
+                        next += 1;
+                        i += 1;
+                        let end = queue.pending_weight();
+                        bounds.push((record, settled + end.div_ceil(forced::UNITS_PER_SETTLEMENT)));
+                    }
+                };
+                push_all(&mut queue, 0, &mut bounds);
+                assert!(queue.pending_weight() <= forced::MAX_PENDING_WEIGHT);
+                let initial = bounds.len();
+                let mut settled = 0u64;
+                while !queue.pending().is_empty() {
+                    settled += 1;
+                    let due: Vec<forced::Record> = queue.due().to_vec();
+                    assert!(!due.is_empty(), "{name}: progress");
+                    queue.consume_due(settled);
+                    for r in &due {
+                        let (_, bound) = bounds.iter().find(|(b, _)| b == r).unwrap();
+                        assert!(settled <= *bound, "{name} refill {refill}: record {} landed in {settled}, bound {bound}", r.height);
+                    }
+                    if refill && settled < 60 {
+                        push_all(&mut queue, settled, &mut bounds);
+                    }
+                    if !refill {
+                        assert!(settled <= forced::MAX_DRAIN_SETTLEMENTS, "{name}: {settled} settlements");
+                    }
+                    assert!(settled < 200);
+                }
+                if !refill {
+                    worst_drain = worst_drain.max(settled);
+                    assert!(initial > 0);
+                }
+            }
+        }
+        assert!(worst_drain <= forced::MAX_DRAIN_SETTLEMENTS);
+        assert_eq!(worst_drain, forced::MAX_DRAIN_SETTLEMENTS, "transfers reach the bound");
+    }
+
+    /// R6 arithmetic: what keeping the queue full costs per settlement, for
+    /// the filler's best pattern, against 1_024_000 sat before (review 164:
+    /// 8 units x 128_000 with 150_001-gas records). The surcharge is paid to
+    /// the treasury.
+    #[test]
+    fn keeping_the_queue_full_costs_about_ten_times_more_than_before() {
+        let hold = |pattern: &[u64]| -> (u64, u64) {
+            let mut queue = forced::Queue::new();
+            let mut i = 0u64;
+            let mut fill = |queue: &mut forced::Queue| -> u64 {
+                let mut paid = 0;
+                loop {
+                    let gas = pattern[i as usize % pattern.len()];
+                    let Some(s) = queue.surcharge_for(gas) else { break };
+                    queue.push(record_n(i, gas)).unwrap();
+                    paid += s;
+                    i += 1;
+                }
+                paid
+            };
+            let first = fill(&mut queue);
+            // Steady state: the cheapest of the later rounds, summed over two
+            // settlements (a mixed pattern alternates group sizes).
+            let mut rounds = Vec::new();
+            for n in 1..=12 {
+                queue.consume_due(n);
+                rounds.push(fill(&mut queue));
+            }
+            let per_two = rounds.windows(2).skip(4).map(|w| w[0] + w[1]).min().unwrap();
+            (first, per_two / 2)
+        };
+        let (fill_transfers, transfers) = hold(&[forced::MIN_GAS]);
+        assert_eq!(fill_transfers, 24_000 * ((1 << 10) - 1) + 16 * 1_024_000, "40_936_000 sat from empty");
+        assert_eq!(transfers, 14 * 1_024_000);
+        let (_, half) = hold(&[150_001]);
+        assert_eq!(half, 8 * 512_000 + 6 * 1_024_000);
+        let before = 8 * 128_000u64;
+        let mut cheapest = u64::MAX;
+        for pattern in [&[forced::MIN_GAS][..], &[150_001], &[100_001], &[forced::MAX_GAS], &[60_001], &[forced::MIN_GAS, 290_000], &[21_429, 280_000]] {
+            let (_, per) = hold(pattern);
+            cheapest = cheapest.min(per);
+        }
+        assert_eq!(cheapest, 10_240_000, "the filler's cheapest full hold");
+        assert_eq!(cheapest / before, 10);
+    }
+
+    /// R5 and R4: each unit is priced at its own position, a record pays for
+    /// the room it leaves in the group it closes, and the signed ceiling covers
+    /// every charge up to the depth it was computed for.
+    #[test]
+    fn records_pay_for_their_own_positions_and_the_ceiling_covers_them() {
+        // A record that closes a group pays for the room it leaves.
+        let mut queue = forced::Queue::new();
+        queue.push(record_n(0, forced::MIN_GAS)).unwrap();
+        assert_eq!(queue.pending_weight(), 1);
+        assert_eq!(queue.charged_weight(290_000), (1, 13 + 14), "13 units of room plus its own 14");
+        assert_eq!(queue.charged_weight(forced::MIN_GAS), (1, 1));
+        assert_eq!(forced::MAX_CHARGED_WEIGHT, 27);
+        // Each unit at its own position, never the entry tier only.
+        for p in 0..forced::MAX_PENDING_WEIGHT {
+            for w in 1..=forced::MAX_CHARGED_WEIGHT {
+                let one_by_one: Option<u64> = (p..p + w).map(|u| forced::surcharge_sat(u, 1)).sum();
+                assert_eq!(forced::surcharge_sat(p, w), one_by_one, "{p} {w}");
+            }
+        }
+        // The ceiling at depth d covers any record of that gas at any queue
+        // whose position is at most d.
+        let mut seed = 7u64;
+        for _ in 0..400 {
+            let mut queue = forced::Queue::new();
+            let mut i = 0;
+            let target = lcg(&mut seed) % forced::MAX_PENDING_WEIGHT;
+            while queue.pending_weight() < target {
+                let gas = forced::MIN_GAS + lcg(&mut seed) % (forced::MAX_GAS - forced::MIN_GAS + 1);
+                if queue.push(record_n(i, gas)).is_err() {
+                    break;
+                }
+                i += 1;
+            }
+            let depth = queue.pending_weight();
+            for gas in [forced::MIN_GAS, 21_429, 60_001, 150_001, forced::MAX_GAS] {
+                if let Some(charged) = queue.surcharge_for(gas) {
+                    for headroom in [0, forced::SURCHARGE_DOUBLING] {
+                        assert!(charged <= forced::surcharge_ceiling_sat(depth + headroom, gas).unwrap(), "{depth} {gas}");
+                    }
+                }
+            }
+        }
+        assert_eq!(forced::surcharge_ceiling_sat(0, 20_999), None);
+        assert_eq!(forced::surcharge_ceiling_sat(0, forced::MIN_GAS), Some(14 * 1_000));
+        assert_eq!(forced::surcharge_ceiling_sat(u64::MAX, forced::MAX_GAS), forced::surcharge_sat(229, 27));
+    }
+
+    /// Pricing golden vector, mirrored by bloch-l2-evm
+    /// `deployment/mainnet/test_l2_monitor.py` (`FORCED_PRICING_VECTOR`).
+    #[test]
+    fn forced_pricing_matches_the_golden_vector() {
+        let got: Vec<(u64, u64, u64)> = FORCED_PRICING_VECTOR
+            .iter()
+            .map(|&(p, w, _)| (p, w, forced::surcharge_sat(p, w).unwrap()))
+            .collect();
+        assert_eq!(got, FORCED_PRICING_VECTOR);
+        let weights: Vec<u64> = [21_000, 21_429, 60_000, 100_001, 150_001, 300_000].iter().map(|g| forced::weight(*g)).collect();
+        assert_eq!(weights, [1, 2, 3, 5, 8, 14]);
+        assert_eq!(
+            (forced::UNITS_PER_SETTLEMENT, forced::MAX_PENDING_WEIGHT, forced::SURCHARGE_DOUBLING, forced::MAX_DRAIN_SETTLEMENTS),
+            (14, 256, 24, 19)
+        );
+    }
+    const FORCED_PRICING_VECTOR: &[(u64, u64, u64)] = &[
+        (0, 1, 1_000),
+        (0, 14, 14_000),
+        (23, 14, 27_000),
+        (100, 3, 48_000),
+        (232, 14, 10_240_000),
+        (242, 14, 14_336_000),
+        (229, 27, 22_016_000),
+        (255, 1, 1_024_000),
+    ];
+
+    /// R1 at run time: after a rollback to a fallback guest that is not listed,
+    /// no new record is taken (the arming rule already forbids the combination).
+    #[test]
+    fn an_unlisted_fallback_takes_no_new_forced_record() {
+        let mut l2 = mainnet_l2_state();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        assert!(l2.enable_forced_inclusion_for_test());
+        l2.queue_forced(MAINNET_CHAIN_ID, [1; 32], &envelope(1), forced::MIN_GAS).unwrap();
+        l2.replace_program_for_test(&mainnet::PROGRAM_FALLBACK);
+        assert!(!l2.forced_inclusion_program());
+        let before = l2.clone();
+        assert_eq!(l2.queue_forced(MAINNET_CHAIN_ID, [2; 32], &envelope(2), forced::MIN_GAS), Err(forced::Refusal::NotActive));
+        assert_eq!(l2, before);
     }

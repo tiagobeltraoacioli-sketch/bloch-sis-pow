@@ -3149,8 +3149,19 @@ pub(crate) fn l2_forced_json_with(
         ("max_pending_weight", Json::u(forced::MAX_PENDING_WEIGHT)), ("root", Json::hex(&queue.root())),
         ("due", Json::Arr(queue.due().iter().map(record).collect())),
         ("due_hash", Json::hex(&forced::hash(queue.due()))),
-        // What one weight unit (a transfer) pays on top of its fee in the next
-        // block; null when full. A record of w units pays w times the unit price.
+        // What the next weight unit (a transfer that closes no group) pays on
+        // top of its fee; null when full. Each unit is priced at its own
+        // position, and a record also pays for the room it leaves in the group
+        // it closes: `transfer_surcharge_sat` and `max_gas_surcharge_sat` are
+        // the exact charges now for 21k and 300k of declared gas. Wallets sign
+        // a maximum (`bloch-pos l2-forced prepare --pending-weight`) and get the
+        // rest back; the charge goes to the protocol treasury.
         ("next_surcharge_sat", forced::surcharge_sat(weight, 1).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
+        ("transfer_surcharge_sat", queue.surcharge_for(forced::MIN_GAS).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
+        ("max_gas_surcharge_sat", queue.surcharge_for(forced::MAX_GAS).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
+        // A record ending at position p is consumed by the ceil(p / 14)-th
+        // settlement anchored after it: the bound for a record queued now.
+        ("drain_settlements", Json::u(weight.div_ceil(forced::UNITS_PER_SETTLEMENT))),
+        ("treasury", forced::treasury().map_or(Json::Null, |t| Json::hex(&t))),
     ])
 }

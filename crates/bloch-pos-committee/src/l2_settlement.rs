@@ -785,13 +785,21 @@ pub mod forced {
 
     /// Records one settlement consumes at most, from the front of the queue.
     /// Separate from the deposit cap, so a full queue never slows deposits.
+    /// It never binds before the gas cap (16 x 21k > 300k); it stays a guard.
     pub const MAX_PER_SETTLEMENT: u64 = 16;
-    /// Queue capacity in weight units ([`weight`]: one per started 21k of
-    /// declared gas). A submission that would exceed it is refused
-    /// ([`surcharge_sat`]). Weighting by gas makes the drain rate, at most
-    /// [`MAX_GAS_PER_SETTLEMENT`] per settlement, the same whatever record sizes
-    /// a filler picks, so keeping the queue full always costs the same per
-    /// settlement.
+    /// Queue capacity in weight units: the queue's position ([`Queue::pending_weight`]),
+    /// which counts every settlement-sized group of the due rule ([`Packing`])
+    /// at no less than [`UNITS_PER_SETTLEMENT`]. A submission whose record would
+    /// end past it is refused ([`surcharge_sat`]).
+    ///
+    /// Latency bound (review 164 R3, decided 2026-11-02 22:30): each settlement
+    /// whose anchor follows a record consumes at least one whole group ahead of
+    /// it, and each group counts at least [`UNITS_PER_SETTLEMENT`] units, so a
+    /// record that ends at position `p` is consumed by the `ceil(p / 14)`-th
+    /// settlement anchored after it. At capacity that is [`MAX_DRAIN_SETTLEMENTS`]
+    /// = 19, whatever record sizes or mix a filler picks; on an empty queue it
+    /// is the first one (the second settlement after the submission, counting
+    /// the one in flight).
     pub const MAX_PENDING_WEIGHT: u64 = 256;
     /// Forced submissions per native block, like DA batches.
     pub const MAX_PER_BLOCK: usize = 4;
@@ -811,13 +819,37 @@ pub mod forced {
     /// To be re-measured on the final sparse guest before the gate is armed.
     pub const MAX_GAS_PER_SETTLEMENT: u64 = 300_000;
     const _: () = assert!(MAX_GAS <= MAX_GAS_PER_SETTLEMENT);
-    /// Queue-depth price, burned on top of the ordinary fee: `BASE_SURCHARGE_SAT`
-    /// per weight unit, doubled every `SURCHARGE_DOUBLING` pending units. An
-    /// empty queue costs the base per unit; the last units of a full queue
-    /// cost `2^7` times it.
+    /// Weight units one settlement drains at least: one transfer is one unit,
+    /// and a settlement holds 14 of them.
+    pub const UNITS_PER_SETTLEMENT: u64 = MAX_GAS_PER_SETTLEMENT / MIN_GAS;
+    const _: () = assert!(UNITS_PER_SETTLEMENT == 14);
+    /// Settlements anchored after a record that consume it at the latest, at
+    /// capacity (see [`MAX_PENDING_WEIGHT`]).
+    pub const MAX_DRAIN_SETTLEMENTS: u64 = MAX_PENDING_WEIGHT.div_ceil(UNITS_PER_SETTLEMENT);
+    const _: () = assert!(MAX_DRAIN_SETTLEMENTS == 19);
+    /// Queue-depth price per weight unit, at the unit's own position `u`:
+    /// `BASE_SURCHARGE_SAT << (u / SURCHARGE_DOUBLING)` ([`unit_price_sat`]).
+    /// A record pays the sum over the positions it occupies, including the room
+    /// it leaves unused in the group it closes ([`surcharge_sat`], review 164 R5).
+    /// An empty queue costs the base per unit; the last units of a full queue
+    /// cost `2^10` times it.
+    ///
+    /// Doubling every 24 units (not 32) is the steeper ladder decided on review
+    /// 164 R6 (target about 10x the cost of keeping the queue full, 8 units x
+    /// 128_000 = 1_024_000 sat per settlement before). Holding the queue full
+    /// now means buying back, every settlement, the whole group the settlement
+    /// consumed, at least 14 units at the top of the queue. The cheapest full
+    /// hold is 150_001-gas records at position 246: positions 232..=245 each
+    /// settlement, `8 x 512_000 + 6 x 1_024_000 = 10_240_000` sat (0.1024
+    /// BLCH, 10.0x); with transfers it is positions 242..=255, `14 x 1_024_000
+    /// = 14_336_000` sat. Filling it from empty costs `24_000 x (2^10 - 1) + 16
+    /// x 1_024_000 = 40_936_000` sat (0.409 BLCH).
     pub const BASE_SURCHARGE_SAT: u64 = 1_000;
-    pub const SURCHARGE_DOUBLING: u64 = 32;
+    pub const SURCHARGE_DOUBLING: u64 = 24;
     const _: () = assert!(MAX_PENDING_WEIGHT / SURCHARGE_DOUBLING < 32);
+    /// The largest weight one record can be charged: up to 13 units of room it
+    /// leaves in the group it closes, plus its own (14 at [`MAX_GAS`]).
+    pub const MAX_CHARGED_WEIGHT: u64 = UNITS_PER_SETTLEMENT - 1 + weight(MAX_GAS);
     pub const INBOX_DOMAIN: &[u8] = b"BLOCH:L2:INBOX:2";
     /// Consumed records kept, with the L2 number of the settlement that
     /// consumed them, so that a rollback head reset can queue them again
@@ -870,19 +902,129 @@ pub mod forced {
         h.finalize().into()
     }
 
-    /// Weight units of a record declaring `gas`: one per started [`MIN_GAS`]
-    /// (1 for a transfer, 15 at [`MAX_GAS`]).
+    /// Weight units of a record declaring `gas`: its share of one settlement,
+    /// `ceil(gas * 14 / 300k)` (1 for a transfer, 8 at 150_001, 14 at [`MAX_GAS`]).
     pub const fn weight(gas: u64) -> u64 {
-        gas.div_ceil(MIN_GAS)
+        gas.saturating_mul(UNITS_PER_SETTLEMENT).div_ceil(MAX_GAS_PER_SETTLEMENT)
     }
 
-    /// The burned surcharge of a submission of `weight` units that finds
-    /// `pending` units queued, or `None` when it does not fit.
+    /// The price of the weight unit at queue position `position`.
+    pub const fn unit_price_sat(position: u64) -> u64 {
+        BASE_SURCHARGE_SAT << (position / SURCHARGE_DOUBLING)
+    }
+
+    /// The surcharge of `weight` units occupying positions `pending..pending +
+    /// weight`, each priced at its own position, or `None` when they do not
+    /// fit (or `weight` is 0). At most two price tiers per record, summed in
+    /// closed form.
     pub const fn surcharge_sat(pending: u64, weight: u64) -> Option<u64> {
         if weight == 0 || pending.saturating_add(weight) > MAX_PENDING_WEIGHT {
             return None;
         }
-        Some((BASE_SURCHARGE_SAT << (pending / SURCHARGE_DOUBLING)) * weight)
+        let end = pending + weight;
+        let mut at = pending;
+        let mut total = 0u64;
+        while at < end {
+            let tier_end = (at / SURCHARGE_DOUBLING + 1) * SURCHARGE_DOUBLING;
+            let stop = if tier_end < end { tier_end } else { end };
+            total += unit_price_sat(at) * (stop - at);
+            at = stop;
+        }
+        Some(total)
+    }
+
+    /// The most a record declaring `gas` can be charged while the queue's
+    /// position is at most `pending`: what a wallet signs as its maximum
+    /// surcharge (`pending` = the position it read plus its headroom). Any
+    /// surplus over the charged surcharge is refunded to the sender, so the
+    /// ceiling only ties up funds for one block. `None` for a shape-invalid gas.
+    pub const fn surcharge_ceiling_sat(pending: u64, gas: u64) -> Option<u64> {
+        if gas < MIN_GAS || gas > MAX_GAS {
+            return None;
+        }
+        let span = UNITS_PER_SETTLEMENT - 1 + weight(gas);
+        let mut hi = pending.saturating_add(span);
+        if hi > MAX_PENDING_WEIGHT {
+            hi = MAX_PENDING_WEIGHT;
+        }
+        let lo = hi.saturating_sub(span);
+        surcharge_sat(lo, hi - lo)
+    }
+
+    /// Settlement-sized groups of the due rule, built front to back exactly as
+    /// successive settlements consume them ([`Queue::due`]: in order, at most
+    /// [`MAX_PER_SETTLEMENT`] records and [`MAX_GAS_PER_SETTLEMENT`] declared
+    /// gas). A group is closed by the first record that does not fit; a closed
+    /// group counts `max(UNITS_PER_SETTLEMENT, its weight)`, so the record that
+    /// closes it pays for the room it leaves unused. The open group counts its
+    /// weight. Removing whole groups from the front leaves the later groups as
+    /// they were, and removing part of the first one never adds a group (the
+    /// greedy rule stays ahead), so a record's group number only goes down.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Packing {
+        /// Units of the closed groups.
+        pub closed: u64,
+        /// Declared gas, records and weight of the open group.
+        pub gas: u64,
+        pub records: u64,
+        pub units: u64,
+    }
+    impl Packing {
+        pub const fn add(mut self, gas: u64) -> Self {
+            if self.records > 0
+                && (self.gas.saturating_add(gas) > MAX_GAS_PER_SETTLEMENT || self.records >= MAX_PER_SETTLEMENT)
+            {
+                let units = if self.units > UNITS_PER_SETTLEMENT { self.units } else { UNITS_PER_SETTLEMENT };
+                self.closed = self.closed.saturating_add(units);
+                self.gas = 0;
+                self.records = 0;
+                self.units = 0;
+            }
+            self.gas = self.gas.saturating_add(gas);
+            self.records += 1;
+            self.units += weight(gas);
+            self
+        }
+        /// The queue position: units of everything packed so far.
+        pub const fn position(&self) -> u64 {
+            self.closed.saturating_add(self.units)
+        }
+    }
+
+    /// The protocol treasury that receives every charged surcharge (decided
+    /// 2026-11-02 22:30: not burned, and not shared with the block producer).
+    /// `None` until the owner names it ([`super::mainnet::FORCED_INCLUSION_TREASURY`]);
+    /// forced inclusion is never enabled without it, and
+    /// `hard_forks::l2_forced_inclusion_may_arm` refuses to arm without it.
+    pub fn treasury() -> Option<[u8; 32]> {
+        #[cfg(test)]
+        {
+            treasury_test::get()
+        }
+        #[cfg(not(test))]
+        {
+            super::mainnet::FORCED_INCLUSION_TREASURY
+        }
+    }
+    /// Tests run with a throwaway treasury unless a test unsets it.
+    #[cfg(test)]
+    pub(crate) mod treasury_test {
+        use std::cell::Cell;
+        pub const TREASURY: [u8; 32] = [0x7e; 32];
+        thread_local! { static SET: Cell<bool> = const { Cell::new(true) }; }
+        pub fn get() -> Option<[u8; 32]> {
+            SET.with(Cell::get).then_some(TREASURY)
+        }
+        pub fn unset() -> impl Drop {
+            struct Restore(bool);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    SET.with(|v| v.set(self.0));
+                }
+            }
+            let was = SET.with(|v| v.replace(false));
+            Restore(was)
+        }
     }
 
     /// The queue, present only on an L2 where forced inclusion is enabled.
@@ -938,12 +1080,30 @@ pub mod forced {
             }
             &self.pending[..n]
         }
-        /// Weight units pending ([`weight`]), at most [`MAX_PENDING_WEIGHT`].
+        fn packing(&self) -> Packing {
+            self.pending.iter().fold(Packing::default(), |p, r| p.add(r.gas_limit))
+        }
+        /// The queue position in weight units ([`Packing`]), at most
+        /// [`MAX_PENDING_WEIGHT`] (more only after a head reset re-queues).
         pub fn pending_weight(&self) -> u64 {
-            self.pending.iter().map(|r| weight(r.gas_limit)).sum()
+            self.packing().position()
+        }
+        /// Where a record declaring `gas` would start and how many units it
+        /// would be charged: its own weight plus the room it leaves unused in
+        /// the group it closes.
+        pub fn charged_weight(&self, gas: u64) -> (u64, u64) {
+            let before = self.packing();
+            let after = before.add(gas);
+            (before.position(), after.position() - before.position())
+        }
+        /// The surcharge a record declaring `gas` pays now, or `None` when it
+        /// does not fit.
+        pub fn surcharge_for(&self, gas: u64) -> Option<u64> {
+            let (at, units) = self.charged_weight(gas);
+            surcharge_sat(at, units)
         }
         pub(crate) fn push(&mut self, record: Record) -> Result<(), Refusal> {
-            if surcharge_sat(self.pending_weight(), weight(record.gas_limit)).is_none() {
+            if self.surcharge_for(record.gas_limit).is_none() {
                 return Err(Refusal::Full);
             }
             let mut h = Keccak256::new();
@@ -1375,6 +1535,12 @@ pub mod mainnet {
     /// stays inert (`hard_forks::l2_forced_inclusion_may_arm`).
     pub const FORCED_INCLUSION_CONFIGURATIONS: &[[u8; 32]] =
         &[h32("b4663ab88607a1ebf7d1801920365fdde276889e211e097011bf48fcd0f7a29d")];
+    /// TBD-owner: the script hash of the protocol treasury that receives every
+    /// charged forced-inclusion surcharge (`super::forced::treasury`). `None`
+    /// keeps forced inclusion from being enabled, and
+    /// `hard_forks::l2_forced_inclusion_may_arm` refuses to arm the gate while
+    /// it is unset. Revenue rule (2026-11-02 22:30): the treasury, never a burn.
+    pub const FORCED_INCLUSION_TREASURY: Option<[u8; 32]> = None;
 
     const fn same_hash(a: &[u8; 32], b: &[u8; 32]) -> bool {
         let mut i = 0;
@@ -1908,7 +2074,12 @@ impl State {
         self.enable_forced_inclusion_if(self.forced_inclusion_program())
     }
     fn enable_forced_inclusion_if(&mut self, program: bool) -> bool {
-        if self.forced.is_some() || !program || !self.profile.user_transactions || !self.asynchronous {
+        if self.forced.is_some()
+            || !program
+            || !self.profile.user_transactions
+            || !self.asynchronous
+            || forced::treasury().is_none()
+        {
             return false;
         }
         let mut queue = forced::Queue::new();
@@ -1948,6 +2119,13 @@ impl State {
     ) -> Result<(), forced::Refusal> {
         use forced::Refusal as R;
         let height = self.native_height.checked_add(1).ok_or(R::Full)?;
+        // A rollback to a fallback guest that does not implement the rule takes
+        // no new record (review 164 R1). `hard_forks::l2_forced_inclusion_may_arm`
+        // already refuses to arm forced inclusion with an unlisted fallback;
+        // this keeps the L2 from owing what its guest cannot prove anyway.
+        if self.policy.identities[3..7] == mainnet::PROGRAM_FALLBACK.identities && !self.forced_inclusion_program() {
+            return Err(R::NotActive);
+        }
         let queue = self.forced.as_mut().ok_or(R::NotActive)?;
         if chain_id != self.policy.chain_id {
             return Err(R::Chain);
@@ -2664,8 +2842,12 @@ impl State {
             let pending = q.pending.len() as u64;
             if q.queued.checked_sub(q.consumed) != Some(pending)
                 // A head reset can queue consumed records again past the
-                // submission capacity: bounded by the consumed log.
-                || q.pending_weight() > forced::MAX_PENDING_WEIGHT + (forced::CONSUMED_LOG as u64) * forced::weight(forced::MAX_GAS)
+                // submission capacity: bounded by the consumed log. Every
+                // record weighs at least one unit, so at most this many are
+                // pending, and each group (at least one record) counts at most
+                // its records' weight or a settlement's units.
+                || pending > forced::MAX_PENDING_WEIGHT + forced::CONSUMED_LOG as u64
+                || q.pending_weight() > pending * forced::UNITS_PER_SETTLEMENT
                 || q.log.len() > forced::CONSUMED_LOG
                 || q.log.windows(2).any(|w| w[0].0 > w[1].0)
                 || q.log.first().is_some_and(|(n, _)| *n < q.log_floor)

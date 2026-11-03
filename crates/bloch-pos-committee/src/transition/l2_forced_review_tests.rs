@@ -131,7 +131,8 @@
             let l2 = pre.l2_settlement.as_mut().unwrap();
             l2.queue_forced(chain, [i as u8; 32], &envelope(i as u8), forced::MIN_GAS).unwrap();
         }
-        assert_eq!(pre.l2_settlement().unwrap().forced_queue().unwrap().pending_weight(), 31);
+        // Adapted (agent 215): the tier boundary is SURCHARGE_DOUBLING (24 after R6), not 32.
+        assert_eq!(pre.l2_settlement().unwrap().forced_queue().unwrap().pending_weight(), forced::SURCHARGE_DOUBLING - 1);
         let honest = forced_tx(&pre, ([0x33; 32], 0), FUNDED, envelope(0xaa), forced::MIN_GAS);
         // A griefer's single transfer-size record lands first in the same block.
         let mut st = pre.clone();
@@ -147,10 +148,13 @@
     /// the ladder suggests.
     #[test]
     fn review_the_surcharge_prices_every_unit_at_its_own_depth() {
-        let one_by_one: u64 = (31..31 + 15).map(|p| forced::surcharge_sat(p, 1).unwrap()).sum();
+        // Adapted (agent 215): the tier boundary moved from 32 to 24 (R6), so the
+        // window starts at SURCHARGE_DOUBLING - 1 instead of 31; same literal.
+        let at = forced::SURCHARGE_DOUBLING - 1;
+        let one_by_one: u64 = (at..at + 15).map(|p| forced::surcharge_sat(p, 1).unwrap()).sum();
         assert_eq!(one_by_one, 1_000 + 14 * 2_000);
         assert_eq!(
-            forced::surcharge_sat(31, 15),
+            forced::surcharge_sat(at, 15),
             Some(one_by_one),
             "a large record skips the tier it crosses"
         );
@@ -168,7 +172,9 @@
             for w in 1..=forced::weight(forced::MAX_GAS) {
                 if let Some(s) = forced::surcharge_sat(p, w) {
                     assert!(p + w <= forced::MAX_PENDING_WEIGHT);
-                    assert!(s <= (forced::BASE_SURCHARGE_SAT << 7) * 15);
+                    // Adapted (agent 215): the top tier is 2^10 after R6 and a record
+                    // can be charged up to MAX_CHARGED_WEIGHT units (room it closes).
+                    assert!(s <= forced::unit_price_sat(forced::MAX_PENDING_WEIGHT - 1) * forced::MAX_CHARGED_WEIGHT);
                 }
             }
         }
