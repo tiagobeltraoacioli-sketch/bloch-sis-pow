@@ -3012,7 +3012,7 @@ mod tests {
         let env = owner_envelope(cp, &secrets, &[0, 1]);
         let cfg = write_artifacts(&dir, "reserved", &env, &owner_set);
         let error = boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), 1600, false,
-            (0, GEN), |_| None, |_| false, |_| None).err().expect("reserved id refused");
+            (0, GEN), |_| None, |_| false, |_| None).expect_err("reserved id refused");
         assert!(error.to_string().contains("reserved"), "{error}");
     }
 
