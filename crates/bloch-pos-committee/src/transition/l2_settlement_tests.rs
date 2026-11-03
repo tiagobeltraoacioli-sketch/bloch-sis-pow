@@ -5005,7 +5005,7 @@ mod l2_tests {
 
             let honest_root = wd::root(&leaves[..4]);
             let keep = keep_statement(&l2, honest_root, 4);
-            let reset = mainnet::HeadReset { number: KEEP, commitment: [KEEP as u8; 32], statement: Some(leaked_hex(&keep)) };
+            let reset = mainnet::HeadReset { number: KEEP, commitment: [KEEP as u8; 32], statement: Some(leaked_hex(&keep)), forfeit: false };
             let escrow = l2.escrow_sat();
             assert!(l2.reset_head(&reset), "no forged leaf claimed yet, so the reset applies");
 
@@ -5042,7 +5042,7 @@ mod l2_tests {
 
             let honest_root = wd::root(&leaves[..4]);
             let keep = keep_statement(&l2, honest_root, 4);
-            let reset = mainnet::HeadReset { number: KEEP, commitment: [KEEP as u8; 32], statement: Some(leaked_hex(&keep)) };
+            let reset = mainnet::HeadReset { number: KEEP, commitment: [KEEP as u8; 32], statement: Some(leaked_hex(&keep)), forfeit: false };
             let before = l2.clone();
             assert!(!l2.reset_head(&reset), "a leaf beyond N's tree was paid: the reset must refuse");
             assert_eq!(l2, before, "a refused reset changes nothing");

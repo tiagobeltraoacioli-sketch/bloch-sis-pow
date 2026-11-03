@@ -20,7 +20,7 @@
         l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
         assert!(l2.enable_forced_inclusion_for_test());
         // Rollback; the reset is refused (nothing settled) but the program moves.
-        let reset = mainnet::HeadReset { number: 5, commitment: [5; 32], statement: None };
+        let reset = mainnet::HeadReset { number: 5, commitment: [5; 32], statement: None, forfeit: false };
         l2.install_fallback_with_for_test(&reset);
         assert_eq!(program_of(&l2), mainnet::PROGRAM_FALLBACK.identities);
         assert!(l2.forced_inclusion_program(), "the fallback is listed: it executes forced records");
@@ -63,7 +63,7 @@
         assert_eq!(l2.settled_number(), 1);
         assert!(l2.forced_queue().unwrap().pending().is_empty());
         // Discard block 1: back to the L2 genesis.
-        let reset = mainnet::HeadReset { number: 0, commitment: [0; 32], statement: None };
+        let reset = mainnet::HeadReset { number: 0, commitment: [0; 32], statement: None, forfeit: false };
         assert!(l2.reset_head(&reset), "the reset applies");
         assert_eq!(l2.settled_number(), 0);
         let queue = l2.forced_queue().unwrap();

@@ -555,7 +555,7 @@
         assert_eq!(queue.consumed_log(), &[(2, record)]);
 
         // A head reset back to block 1 puts the record back, as the inbox cursor goes back.
-        let reset = mainnet::HeadReset { number: 1, commitment: kept_commitment, statement: Some(leaked_hex(&kept_statement)) };
+        let reset = mainnet::HeadReset { number: 1, commitment: kept_commitment, statement: Some(leaked_hex(&kept_statement)), forfeit: false };
         let mut reset_state = s5.clone();
         let root = reset_state.l2_settlement().unwrap().forced_queue().unwrap().root();
         assert!(reset_state.l2_settlement.as_mut().unwrap().reset_head(&reset));
@@ -633,12 +633,12 @@
             q.log_floor = q.log_floor.max(n);
         }
         let deep = statement_at(&l2, 3, [0xaa; 32], 2);
-        let refused = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&deep)) };
+        let refused = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&deep)), forfeit: false };
         let before = l2.clone();
         assert!(!l2.reset_head(&refused));
         assert_eq!(l2, before);
         let shallow = statement_at(&l2, 6, [0xbb; 32], 5);
-        let applied = mainnet::HeadReset { number: 6, commitment: [6; 32], statement: Some(leaked_hex(&shallow)) };
+        let applied = mainnet::HeadReset { number: 6, commitment: [6; 32], statement: Some(leaked_hex(&shallow)), forfeit: false };
         assert!(l2.reset_head(&applied));
         assert_eq!(l2.settled_number(), 6);
         let q = l2.forced_queue().unwrap();
