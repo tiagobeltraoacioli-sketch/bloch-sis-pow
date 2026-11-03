@@ -2117,8 +2117,9 @@ impl State {
     /// current height, so honest leaves wait one delay and do not wait for the
     /// next settlement. Returns whether it applied.
     ///
-    /// It does nothing when the head is not above the target or when the
-    /// statement is malformed. When a leaf the target did not publish was already
+    /// It does nothing when the head is not above the target, when the
+    /// statement is malformed, or when its withdrawal tree contradicts the
+    /// retained records or the head's tree. When a leaf the target did not publish was already
     /// paid, the rollback would credit on L2 what already left the escrow: a
     /// plain reset then does nothing, and a FORFEIT reset applies and forgets
     /// those claims ([`mainnet::HeadReset::forfeit`]).
@@ -2142,6 +2143,14 @@ impl State {
             None => return false,
         };
         let (root, count) = withdrawal::tree_after(head.as_ref().map(|(_, s): &([u8; 32], Vec<u8>)| s.as_slice()));
+        // The target's tree is recorded again below, so it must not contradict
+        // what L1 accepted: the tail only extends it, and a retained record at or
+        // below the target never has more leaves, nor another root at the same count.
+        if count > self.withdrawal_head().1
+            || self.withdrawals.iter().any(|r| r.l2_number <= reset.number && (r.count > count || (r.count == count && r.root != root)))
+        {
+            return false;
+        }
         let paid_beyond = self.claimed.any_at_or_above(count);
         if (paid_beyond && !reset.forfeit) || consumed > self.inbox.len() as u64 {
             return false;

@@ -3477,6 +3477,25 @@ mod l2_tests {
         assert!(genesis.withdrawal_roots().is_empty() && genesis.claimed().claims() == 0);
     }
 
+    /// The reset records the target's root again, so a reset whose tree
+    /// contradicts what L1 accepted is refused in both forms.
+    #[test]
+    fn a_reset_whose_tree_contradicts_the_retained_records_is_refused() {
+        let l2 = state_with_bad_tail();
+        for forfeit in [false, true] {
+            let refused = |root: [u8; 32], count: u64, number: u64| {
+                let mut copy = l2.clone();
+                let keep = statement_at(&l2, number, root, count);
+                let reset = mainnet::HeadReset { number, commitment: [3; 32], statement: Some(leaked_hex(&keep)), forfeit };
+                assert!(!copy.reset_head(&reset), "{root:?} {count} {number}");
+                assert_eq!(copy, l2);
+            };
+            refused([0xcc; 32], 2, 3); // another root at the retained count 2
+            refused([0xcc; 32], 1, 3); // fewer leaves than a retained record at or below N
+            refused([0xcc; 32], 6, 6); // more leaves than the head's tree
+        }
+    }
+
     /// Every claim forgotten while sats stay released: the claim section stays
     /// committed, so the release accounting is still bound by the state root.
     #[test]
