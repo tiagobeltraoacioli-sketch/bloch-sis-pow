@@ -2850,9 +2850,10 @@ mod l2_tests {
 
     #[test]
     fn next_program_gate_is_inert_and_chooses_no_epoch() {
-        assert_eq!(crate::params::L2_NEXT_PROGRAM_EPOCH, u64::MAX);
-        for epoch in [0, 5_850, 8_620, 1 << 40, u64::MAX - 1, u64::MAX] {
-            assert!(!crate::params::l2_next_program_active(epoch));
+        // Inert in the candidate; an armed release acts from its epoch exactly.
+        let gate = crate::params::L2_NEXT_PROGRAM_EPOCH;
+        for epoch in [0, 5_850, 8_620, gate.saturating_sub(1), gate, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert_eq!(crate::params::l2_next_program_active(epoch), gate != u64::MAX && epoch >= gate, "{epoch}");
         }
         let (pinned, next) = (mainnet::PROGRAM.unwrap(), mainnet::PROGRAM_NEXT);
         assert_eq!(next.proof_policy, pinned.proof_policy, "the circuits and the tag stay");
@@ -2947,11 +2948,17 @@ mod l2_tests {
 
     #[test]
     fn the_rollback_gate_is_inert_and_the_fallback_proves_the_same_rules() {
-        assert_eq!(crate::params::L2_PROGRAM_ROLLBACK_EPOCH, u64::MAX);
-        for epoch in [0, 8_620, 1 << 40, u64::MAX - 1, u64::MAX] {
-            assert!(!crate::params::l2_program_rollback_active(epoch));
+        // Inert in the candidate; the emergency release (arm.py) sets the epoch and,
+        // only with it, an optional head reset.
+        let gate = crate::params::L2_PROGRAM_ROLLBACK_EPOCH;
+        for epoch in [0, 8_620, gate.saturating_sub(1), gate, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert_eq!(crate::params::l2_program_rollback_active(epoch), gate != u64::MAX && epoch >= gate, "{epoch}");
         }
-        assert_eq!(mainnet::ROLLBACK_HEAD_RESET, None);
+        if gate == u64::MAX {
+            assert_eq!(mainnet::ROLLBACK_HEAD_RESET, None);
+        } else {
+            assert!(gate > crate::params::L2_NEXT_PROGRAM_EPOCH && crate::params::L2_NEXT_PROGRAM_EPOCH != u64::MAX);
+        }
         let (next, fallback, pinned) = (mainnet::PROGRAM_NEXT, mainnet::PROGRAM_FALLBACK, mainnet::PROGRAM.unwrap());
         assert_eq!(next.identities[0], fallback.identities[0], "same rules");
         assert_eq!(next.proof_policy, fallback.proof_policy);
@@ -2964,7 +2971,9 @@ mod l2_tests {
     #[test]
     fn the_schedule_is_empty_while_inert_and_names_only_what_is_ahead() {
         let mut l2 = mainnet_l2_state();
-        assert!(l2.program_schedule().is_empty());
+        let (next_e, back_e) = (crate::params::L2_NEXT_PROGRAM_EPOCH, crate::params::L2_PROGRAM_ROLLBACK_EPOCH);
+        assert_eq!(l2.program_schedule(), l2.program_schedule_for_test(next_e, back_e));
+        assert_eq!(l2.program_schedule().is_empty(), next_e == u64::MAX && back_e == u64::MAX);
         assert!(l2.program_schedule_for_test(u64::MAX, u64::MAX).is_empty());
         let both = [(10_000, mainnet::PROGRAM_NEXT), (10_500, mainnet::PROGRAM_FALLBACK)];
         assert_eq!(l2.program_schedule_for_test(10_000, 10_500), both);
