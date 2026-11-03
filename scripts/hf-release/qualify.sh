@@ -115,7 +115,7 @@ SLOTS_PER_EPOCH=32
 
 case "${1:-}" in -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;; esac
 COMMIT_ARG="${1:-}"; [ $# -gt 0 ] && shift
-SOURCE="" BASELINE_BIN="" OUT="" BASE_COMMIT=b4a21fb657d0beb17f64c62889b605c9a7a2d031
+SOURCE="" BASELINE_BIN="" OUT="" BASE_COMMIT=b4a21fb657d0beb17f64c62889b605c9a7a2d031 BASE_COMMIT_DEFAULT=1
 FORCE_EPOCH="" WINDOW=16 JOBS=8 PIN_CANDIDATES=4 EXPECT_SLOT="" EXPECT_ROOT=""
 SKIP_TESTS=0 SKIP_FORCED=0 UNSANDBOXED=0 GATES_ONLY=0 FORCED_ONLY=0 RELAX_ORDER=0 DRY_RUN=0
 # Source-digests of the releases the fleet has run (78d4921c, fa980367).
@@ -126,7 +126,7 @@ while [ $# -gt 0 ]; do
     --source) SOURCE="$2"; shift 2 ;;
     --baseline-bin) BASELINE_BIN="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
-    --base-commit) BASE_COMMIT="$2"; shift 2 ;;
+    --base-commit) BASE_COMMIT="$2"; BASE_COMMIT_DEFAULT=0; shift 2 ;;
     --gate) GATE_ARGS+=("$2"); shift 2 ;;
     --gates-only) GATES_ONLY=1; shift ;;
     --forced-set) SET_ARGS+=("$2"); shift 2 ;;
@@ -183,6 +183,32 @@ BASE_COMMIT="$(git -C "$REPO" rev-parse --verify --quiet "$BASE_COMMIT^{commit}"
 # forks before it.
 git -C "$REPO" merge-base --is-ancestor "$BASE_COMMIT" "$COMMIT" \
   || die "$COMMIT does not descend from the fleet release $BASE_COMMIT"
+# Tabletop finding G-3 (169): an emergency L2 program swap or rollback build arms
+# L2_NEXT_PROGRAM_EPOCH / L2_PROGRAM_ROLLBACK_EPOCH on top of a SHIPPED release that
+# already activated HF1-3, KES and (for a rollback) the swap. Gate discovery diffs
+# the candidate against --base-commit; with the default fleet release b4a21fb6 every
+# one of those inherited gates shows as newly armed and lands before the replayed
+# head, so the gate-schedule check FAILs misleadingly and the only real change
+# (the rollback epoch) is drowned out. The fix: when the candidate arms either L2
+# program gate and --base-commit was left at the default, refuse with the one thing
+# the operator must pass -- the commit of the release the fleet is actually running.
+l2_gate_armed() {
+  local v
+  v="$(git -C "$REPO" show "$COMMIT:crates/bloch-pos-committee/src/params.rs" 2>/dev/null \
+       | sed -n "s/^pub const $1: u64 = \\([0-9_]*\\);$/\\1/p" | tr -d '_')"
+  [ -n "$v" ]
+}
+if [ "$BASE_COMMIT_DEFAULT" = 1 ]; then
+  for g in L2_PROGRAM_ROLLBACK_EPOCH L2_NEXT_PROGRAM_EPOCH; do
+    if l2_gate_armed "$g"; then
+      die "$COMMIT arms $g but --base-commit is the default fleet release. An emergency
+       L2 program build is qualified against the SHIPPED release it is built on, or
+       the inherited HF1-3/KES/swap gates all count as changed and the gate-schedule
+       check fails. Re-run with --base-commit <the commit the fleet runs today> (for a
+       rollback, the swap release's commit)."
+    fi
+  done
+fi
 C12="${COMMIT:0:12}"
 OUT="${OUT:-$HOME/hf-qualify-$C12-$(date -u +%Y%m%dT%H%M%SZ)}"
 [ ! -e "$OUT" ] || die "$OUT exists; give a new directory"
