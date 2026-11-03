@@ -11259,6 +11259,85 @@ mod transfer_v2_end_to_end {
         assert!(matches!(node.plan_mempool_capacity(&other, len, epoch), Err(Refusal::AtCapacity)), "others still are not");
     }
 
+    fn forced_envelope_tx(key_byte: u8, number: u32, tip: u128) -> PosTransaction {
+        use bloch_pos_committee::transition::{FundingInput, L2ForcedTransaction};
+        let key = vec![key_byte; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        PosTransaction::L2ForcedTransaction(L2ForcedTransaction {
+            network_domain: [0x91; 32],
+            funding_pubkey: key,
+            inputs: vec![FundingInput { txid: [key_byte; 32], vout: number }],
+            l2_chain_id: 700_770,
+            gas_limit: 21_000,
+            max_surcharge_sat: 1_000,
+            envelope: vec![0x02, key_byte, number as u8, (number >> 8) as u8],
+            change: TransferOutput { value: 1, script_hash: [key_byte; 32] },
+            tx_bytes: 2_000,
+            tip_millisat_per_gas: tip,
+            signature: vec![9; 64],
+        })
+    }
+
+    fn is_forced(tx: &PosTransaction) -> bool { matches!(tx, PosTransaction::L2ForcedTransaction(_)) }
+
+    /// A full pool: `forced` tip-0 forced envelopes (wire 0x1C) and
+    /// third-party DA batches at tip 1 for the rest.
+    fn pool_with_forced_and_da(epoch: u64, forced: usize) -> Engine {
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+        for i in 0..forced {
+            let tx = forced_envelope_tx(0x30 + (i / MEMPOOL_MAX_PER_SOURCE) as u8, i as u32, 0);
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        let mut filled = forced;
+        'fill: for k in 0..80u8 {
+            for n in 1..=64u64 {
+                if filled == MEMPOOL_MAX { break 'fill; }
+                let tx = da_batch(0x90 + k, n, 1);
+                node.mempool.insert(tx.canonical_bytes(), tx);
+                filled += 1;
+            }
+        }
+        assert_eq!(node.mempool.len(), MEMPOOL_MAX);
+        node
+    }
+
+    /// Open item of 143/215: past the DA-slot gate, the registered key's
+    /// batch displaced the lowest-tip entries whatever their kind, so tip-0
+    /// forced envelopes (which pay the depth-priced surcharge, not a tip) went
+    /// first. A DA batch must never displace a forced envelope while any
+    /// other entry can make room.
+    #[test]
+    fn a_registered_da_batch_never_displaces_forced_envelopes() {
+        use bloch_pos_committee::l2_settlement::da;
+        let epoch = V2_FLAG_DAY + 1;
+        let node = pool_with_forced_and_da(epoch, 16);
+        let own = da_batch(0xee, 1, 0);
+        let len = own.canonical_bytes().len();
+        let settler_key = vec![0xee; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let _reserved = da_reserved_test::open(da::funder(&settler_key));
+        let plan = node.plan_mempool_capacity(&own, len, epoch).expect("the registered key is admitted");
+        assert_eq!(plan.displaced.len(), 1);
+        for key in &plan.displaced {
+            assert!(!is_forced(&node.mempool.values().find(|tx| tx.canonical_bytes() == *key).unwrap().clone()),
+                "a forced envelope was displaced by a DA batch");
+        }
+    }
+
+    /// The lower-fee path at capacity: a higher-tip DA batch (any key) takes
+    /// the place of the lowest-tip entry, but never of a forced envelope in
+    /// the reserved room.
+    #[test]
+    fn a_higher_tip_da_batch_never_evicts_a_forced_envelope() {
+        let epoch = V2_FLAG_DAY + 1;
+        let node = pool_with_forced_and_da(epoch, 16);
+        let other = da_batch(0x05, 1, 2);
+        let plan = node.plan_mempool_capacity(&other, other.canonical_bytes().len(), epoch)
+            .expect("a higher tip is admitted at capacity");
+        let evicted = plan.lower_fee.expect("one entry makes room");
+        let evicted = node.mempool.values().find(|tx| tx.canonical_bytes() == evicted).unwrap().clone();
+        assert!(!is_forced(&evicted), "a forced envelope was evicted for a DA batch");
+        assert_eq!(tx_tip_rate(&evicted), 1);
+    }
+
     /// F-9: which commitments win the scarce slots is re-drawn from the
     /// parent block id, so grinding commitment bytes low (the canonical-bytes
     /// tie-break) does not buy every slot, and the draw changes per block.
