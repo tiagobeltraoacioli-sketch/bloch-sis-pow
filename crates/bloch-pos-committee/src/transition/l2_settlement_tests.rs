@@ -4349,4 +4349,194 @@ mod l2_tests {
         use super::*;
         include!("ffg_branch_tests.rs");
     }
+
+    // ── G2 reset crossing (agent 221): a forged settlement after the swap, the
+    // escrow it drains per window, and the head-reset that recovers or refuses.
+    // Models tabletop finding G-2 (169) in real consensus code (no proof needed:
+    // a forged block is settled with a test-only head hook, never in release code).
+    mod reset_crossing_g2 {
+        use super::*;
+        use crate::l2_settlement::InboxRecord;
+
+        const KEEP: u64 = 10; // the last honest block N
+        const FORGED: u64 = 11; // N+1, the forged block the rules do not give
+
+        /// A swapped-era L2 with escrow `escrow_blch`, an honest withdrawal tree of
+        /// `count_keep` leaves at block N, and a forged tree of `count_keep + count_forged`
+        /// leaves settled as the head at N+1. Returns the state and every leaf.
+        fn forged_l2(escrow_blch: u64, count_keep: u64, count_forged: u64, sats_each: u64) -> (crate::l2_settlement::State, Vec<[u8; 32]>) {
+            let mut l2 = mainnet_l2_state();
+            l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+            let chain = l2.policy().chain_id;
+            l2.append_deposit(InboxRecord { height: 1, tx_index: 0, txid: [0x77; 32], vout: 0, sats: escrow_blch * BLCH, recipient: [0x42; 20] })
+                .unwrap();
+            let recip = [0x42u8; 32];
+            let total = count_keep + count_forged;
+            let sats = sats_each * BLCH;
+            let leaves: Vec<[u8; 32]> = (0..total).map(|i| wd::leaf(chain, i, &recip, sats)).collect();
+            let honest_root = wd::root(&leaves[..count_keep as usize]);
+            let forged_root = wd::root(&leaves);
+            l2.insert_withdrawal_record(wd::Record { l2_number: KEEP, root: honest_root, count: count_keep, height: 1 });
+            l2.insert_withdrawal_record(wd::Record { l2_number: FORGED, root: forged_root, count: total, height: 2 });
+            l2.set_head_for_test([FORGED as u8; 32], statement_at(&l2, FORGED, forged_root, total), 1);
+            for _ in 0..200 {
+                l2.advance_height().unwrap();
+            }
+            (l2, leaves)
+        }
+
+        /// The reset target's statement: the honest tree at N, consumed rewound to 1
+        /// (we deposited one escrow record, so the field must be <= inbox length).
+        fn keep_statement(l2: &crate::l2_settlement::State, root: [u8; 32], count: u64) -> Vec<u8> {
+            let mut keep = statement_at(l2, KEEP, root, count);
+            keep[S + 528..S + 536].copy_from_slice(&1u64.to_be_bytes());
+            keep
+        }
+
+        fn try_small_claim(l2: &mut crate::l2_settlement::State, leaves: &[[u8; 32]], index: u64, sats: u64) -> Result<(), wd::ClaimRefusal> {
+            let chain = l2.policy().chain_id;
+            let siblings = wd::proof(leaves, index).unwrap();
+            l2.release_withdrawal(chain, index, &[0x42u8; 32], sats, &siblings, false)
+        }
+
+        /// The release rule bounds a non-attested drain to about 10% of the escrow per
+        /// aligned 2,880-block window; the escrow compounds, so k windows lose
+        /// 1 - 0.9^k. This is the pure consensus rule (ReleaseWindow), and it reproduces
+        /// the tabletop figures exactly.
+        #[test]
+        fn the_window_rule_compounds_to_the_tabletop_drain_figures() {
+            let e0 = 10_000u128 * u128::from(BLCH);
+            let mut percent = vec![];
+            for k in [4u64, 5, 6, 10, 30] {
+                let mut escrow = e0;
+                for w in 0..k {
+                    let window = wd::ReleaseWindow::default().at(&mainnet::LIMITS, w * mainnet::LIMITS.release_window_blocks + 1, escrow);
+                    escrow -= window.cap; // an attacker reaches the cap with small non-exempt claims
+                }
+                let drained = ((e0 - escrow) * 10_000 / e0) as f64 / 100.0;
+                percent.push((k, drained));
+            }
+            eprintln!("G2 window drain, % of escrow: {percent:?}");
+            // 1 - 0.9^k, within integer-sat rounding.
+            let want = [(4u64, 34.3), (5, 40.9), (6, 46.8), (10, 65.1), (30, 95.7)];
+            for ((k, got), (wk, wv)) in percent.iter().zip(want) {
+                assert_eq!(*k, wk);
+                assert!((got - wv).abs() < 0.2, "k={k}: drain {got}% not ~{wv}%");
+            }
+        }
+
+        /// The same bound through real claims: a forged settlement after the swap lets
+        /// an attacker claim forged leaves, and the escrow falls about 10% per window.
+        #[test]
+        fn a_forged_settlement_drains_about_ten_percent_per_window_through_real_claims() {
+            let e = 10_000u64;
+            let sats = 50 * BLCH; // below large_claim_sat (100 BLCH): no attestation needed
+            let (mut l2, leaves) = forged_l2(e, 4, 400, 50);
+            let start = l2.escrow_sat();
+            assert_eq!(start, u128::from(e) * u128::from(BLCH));
+            let mut idx = 4u64; // the first forged leaf (index >= honest count)
+            let mut per_window = vec![];
+            for _ in 0..5u64 {
+                let before = l2.escrow_sat();
+                let mut drained = 0u128;
+                loop {
+                    match try_small_claim(&mut l2, &leaves, idx, sats) {
+                        Ok(()) => {
+                            drained += u128::from(sats);
+                            idx += 1;
+                        }
+                        Err(wd::ClaimRefusal::RateLimited) => break,
+                        Err(other) => panic!("unexpected refusal {other:?} at leaf {idx}"),
+                    }
+                }
+                let cap = (before * u128::from(mainnet::LIMITS.release_window_bps) / 10_000).max(u128::from(mainnet::LIMITS.release_floor_sat));
+                assert!(drained <= cap && cap - drained < u128::from(sats), "window drain {drained} vs cap {cap}");
+                assert!(l2.escrow_conserved());
+                per_window.push(drained / u128::from(BLCH));
+                for _ in 0..mainnet::LIMITS.release_window_blocks {
+                    l2.advance_height().unwrap();
+                }
+            }
+            let total: u128 = per_window.iter().sum();
+            eprintln!("G2 real-claim drain per window (BLCH): {per_window:?}; total {total} of {e} ({:.1}%)", total as f64 / e as f64 * 100.0);
+            // ~1 - 0.9^5 = 41%, a little less at 50-BLCH granularity.
+            assert!((0.37..0.41).contains(&(total as f64 / e as f64)));
+        }
+
+        /// The honest recovery: a reset to N applied before any forged leaf is claimed
+        /// drops the forged records and keeps the honest ones, so honest leaves pay and
+        /// forged leaves no longer prove. This is the clean reset-crossing verdict.
+        #[test]
+        fn a_reset_before_any_forged_claim_recovers_cleanly() {
+            let sats = 50 * BLCH;
+            let (mut l2, leaves) = forged_l2(10_000, 4, 8, 50);
+            let chain = l2.policy().chain_id;
+            let recip = [0x42u8; 32];
+            // Before the reset both an honest leaf (0) and a forged leaf (4) are claimable.
+            assert!(l2.check_claim(chain, 0, &recip, sats, &wd::proof(&leaves, 0).unwrap(), false).is_ok());
+            assert!(l2.check_claim(chain, 4, &recip, sats, &wd::proof(&leaves, 4).unwrap(), false).is_ok());
+
+            let honest_root = wd::root(&leaves[..4]);
+            let keep = keep_statement(&l2, honest_root, 4);
+            let reset = mainnet::HeadReset { number: KEEP, commitment: [KEEP as u8; 32], statement: Some(leaked_hex(&keep)) };
+            let escrow = l2.escrow_sat();
+            assert!(l2.reset_head(&reset), "no forged leaf claimed yet, so the reset applies");
+
+            assert_eq!(l2.settled_number(), KEEP);
+            assert_eq!(l2.withdrawal_head(), (honest_root, 4));
+            assert_eq!(l2.withdrawal_roots().iter().map(|r| r.l2_number).collect::<Vec<_>>(), [KEEP]);
+            assert_eq!(l2.escrow_sat(), escrow, "the reset keeps the escrow");
+            assert!(l2.escrow_conserved());
+            // Operational finding: after the reset only the honest (prefix) root survives,
+            // so a proof cut against the forged tree is stale and must be regenerated against
+            // the honest root. A cached forged-era proof of an honest leaf no longer folds.
+            let honest_proof = wd::proof(&leaves[..4], 0).unwrap();
+            let stale_forged_proof = wd::proof(&leaves, 0).unwrap();
+            assert_eq!(l2.check_claim(chain, 0, &recip, sats, &stale_forged_proof, false), Err(wd::ClaimRefusal::Proof),
+                       "a forged-era proof of an honest leaf is stale after the reset");
+            assert!(l2.check_claim(chain, 0, &recip, sats, &honest_proof, false).is_ok(),
+                    "a proof regenerated against the honest root pays");
+            // The forged leaf's root is gone entirely: no proof can revive it.
+            assert_eq!(l2.check_claim(chain, 4, &recip, sats, &wd::proof(&leaves, 4).unwrap(), false), Err(wd::ClaimRefusal::Proof));
+            assert!(l2.release_withdrawal(chain, 0, &recip, sats, &honest_proof, false).is_ok());
+            assert_eq!(l2.escrow_sat(), escrow - u128::from(sats));
+        }
+
+        /// G-2: one forged claim before R makes the reset refuse, and the program still
+        /// rolls back. The forged record then stays the newest, so the escrow keeps
+        /// draining after R — exactly the unrecoverable case the runbook warns of.
+        #[test]
+        fn a_forged_claim_before_r_makes_the_reset_refuse_and_the_drain_continue() {
+            let sats = 50 * BLCH;
+            let (mut l2, leaves) = forged_l2(10_000, 4, 8, 50);
+            let chain = l2.policy().chain_id;
+            // The attacker claims one forged leaf (index 4 >= honest count 4).
+            assert!(try_small_claim(&mut l2, &leaves, 4, sats).is_ok());
+
+            let honest_root = wd::root(&leaves[..4]);
+            let keep = keep_statement(&l2, honest_root, 4);
+            let reset = mainnet::HeadReset { number: KEEP, commitment: [KEEP as u8; 32], statement: Some(leaked_hex(&keep)) };
+            let before = l2.clone();
+            assert!(!l2.reset_head(&reset), "a leaf beyond N's tree was paid: the reset must refuse");
+            assert_eq!(l2, before, "a refused reset changes nothing");
+
+            // The rollback still moves the program (the guest misbehaved), head unchanged.
+            l2.install_fallback_with_for_test(&reset);
+            assert_eq!(program_of(&l2), mainnet::PROGRAM_FALLBACK.identities);
+            assert_eq!(l2.settled_number(), FORGED, "the head stays on the forged block");
+            // And the escrow keeps draining: the next forged leaf still pays.
+            assert!(try_small_claim(&mut l2, &leaves, 5, sats).is_ok());
+        }
+
+        /// The attacker cannot use the once-per-window exemption: the mainnet policy has
+        /// an attestor set, so an unattested claim is never exempt. This is what bounds
+        /// the drain to the cap rather than the whole escrow at once.
+        #[test]
+        fn an_unattested_forged_claim_is_never_window_exempt() {
+            let l2 = mainnet_l2_state();
+            assert!(l2.policy().attestor_set != [0; 32]);
+            assert!(!l2.window_exempt(false), "no attestation: not exempt");
+            assert!(l2.window_exempt(true), "a real attestation would be exempt");
+        }
+    }
 }
