@@ -7,29 +7,25 @@
     // agents/164-forced-review.md.
 
     /// R1 (rollback). The rollback swaps the program to `PROGRAM_FALLBACK`.
-    /// Forced inclusion stays enabled and keeps accepting submissions even when
-    /// the fallback's configuration is not in `FORCED_INCLUSION_CONFIGURATIONS`,
-    /// i.e. when the fallback guest cannot publish `inbox_hash`. One forced
-    /// submission then makes every settlement the fallback can prove fail with
-    /// `Reject::Forced`: settlement halts for the price of one L1 transaction.
+    /// Forced inclusion stays enabled, so the fallback must be a guest that
+    /// publishes `inbox_hash`, or one forced submission halts settlement for
+    /// the price of one L1 transaction. Agent 216's fallback guest implements
+    /// the rule and carries the listed next configuration, so after the
+    /// rollback the queue keeps working and every due record stays provable.
+    /// (Originally agent 164's test asserted the refusal for an unlisted
+    /// fallback; that run-time guard stays in `queue_forced` for any later pin.)
     #[test]
-    fn review_after_a_rollback_to_an_unlisted_program_nothing_forced_is_owed() {
+    fn review_after_a_rollback_the_fallback_still_implements_forced_inclusion() {
         let mut l2 = mainnet_l2_state();
         l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
-        // As if PROGRAM_NEXT were listed: the gate enabled the queue.
         assert!(l2.enable_forced_inclusion_for_test());
         // Rollback; the reset is refused (nothing settled) but the program moves.
         let reset = mainnet::HeadReset { number: 5, commitment: [5; 32], statement: None };
         l2.install_fallback_with_for_test(&reset);
         assert_eq!(program_of(&l2), mainnet::PROGRAM_FALLBACK.identities);
-        assert!(!l2.forced_inclusion_program(), "the fallback is not listed");
-        // A guest that cannot execute forced records must never owe one.
-        let queued = l2.queue_forced(MAINNET_CHAIN_ID, [7; 32], &envelope(7), forced::MIN_GAS);
-        assert_eq!(
-            queued,
-            Err(forced::Refusal::NotActive),
-            "an unlisted (fallback) program keeps accepting forced records: the next due record halts settlement"
-        );
+        assert!(l2.forced_inclusion_program(), "the fallback is listed: it executes forced records");
+        assert_eq!(mainnet::PROGRAM_FALLBACK.identities[0], mainnet::PROGRAM_NEXT.identities[0]);
+        assert_eq!(l2.queue_forced(MAINNET_CHAIN_ID, [7; 32], &envelope(7), forced::MIN_GAS), Ok(()));
     }
 
     /// R1, at the arming rule: an armed rollback under armed forced inclusion
