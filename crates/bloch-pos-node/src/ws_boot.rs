@@ -2840,7 +2840,8 @@ mod tests {
         .unwrap()
         .expect_err("a checkpoint at or beyond the window must not anchor a sync");
         assert!(refusal.contains("ERR_WS_REQUIRE_CHECKPOINT"));
-        assert!(refusal.contains("--ws-trusted-checkpoint"));
+        // Only prototype builds point operators at the unsigned flags.
+        assert_eq!(refusal.contains("--ws-trusted-checkpoint"), AUTO_CHECKPOINT_ENABLED);
     }
 
     /// The operator's word moves a newcomer, never a running node.
