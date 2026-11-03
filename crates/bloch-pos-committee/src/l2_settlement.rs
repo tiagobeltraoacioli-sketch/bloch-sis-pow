@@ -1602,7 +1602,9 @@ pub mod mainnet {
     /// keeps forced inclusion from being enabled, and
     /// `hard_forks::l2_forced_inclusion_may_arm` refuses to arm the gate while
     /// it is unset. Revenue rule (2026-11-02 22:30): the treasury, never a burn.
-    pub const FORCED_INCLUSION_TREASURY: Option<[u8; 32]> = None;
+    /// Alias of `params::PROTOCOL_TREASURY_SCRIPT_HASH` (one treasury for every
+    /// L1 protocol revenue rule).
+    pub const FORCED_INCLUSION_TREASURY: Option<[u8; 32]> = crate::params::PROTOCOL_TREASURY_SCRIPT_HASH;
 
     /// TBD-owner: the hash (`Sha3_256`) of the mainnet settler's DA funding
     /// public key, which owns the reserved DA slot

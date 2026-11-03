@@ -200,7 +200,7 @@ pub const fn l2_forced_inclusion_may_arm(forced: u64, next: u64, configured: boo
             crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS,
             &crate::l2_settlement::mainnet::PROGRAM_FALLBACK.identities[0],
         ),
-        crate::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY.is_some(),
+        treasury_is_real(crate::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY),
     )
 }
 
@@ -245,11 +245,10 @@ pub const fn listed(list: &[[u8; 32]], configuration: &[u8; 32]) -> bool {
 /// zero) and comes strictly after the first KES period, like the program swap,
 /// so it never shares a boundary with the KES bind. It may share the swap's
 /// epoch: it changes no L2 rule.
-pub const fn l2_revenue_may_arm(revenue: u64, kes_enforcement: u64, treasury: Option<[u8; 32]>) -> bool {
-    if !armed(revenue) {
-        return true;
-    }
-    let has_treasury = match treasury {
+/// A protocol treasury is set and is not the zero hash. Shared by every rule
+/// that pays the protocol treasury (`params::PROTOCOL_TREASURY_SCRIPT_HASH`).
+pub const fn treasury_is_real(treasury: Option<[u8; 32]>) -> bool {
+    match treasury {
         Some(t) => {
             let mut i = 0;
             let mut nonzero = false;
@@ -260,8 +259,14 @@ pub const fn l2_revenue_may_arm(revenue: u64, kes_enforcement: u64, treasury: Op
             nonzero
         }
         None => false,
-    };
-    has_treasury && armed(kes_enforcement) && revenue > kes_enforcement.saturating_add(L2_PROGRAM_MIN_EPOCHS_AFTER_KES)
+    }
+}
+
+pub const fn l2_revenue_may_arm(revenue: u64, kes_enforcement: u64, treasury: Option<[u8; 32]>) -> bool {
+    if !armed(revenue) {
+        return true;
+    }
+    treasury_is_real(treasury) && armed(kes_enforcement) && revenue > kes_enforcement.saturating_add(L2_PROGRAM_MIN_EPOCHS_AFTER_KES)
 }
 
 /// The ordering rules between all HF1/HF2/HF3 gates (see the module docs).
@@ -354,6 +359,29 @@ const _: () = assert!(l2_revenue_may_arm(
     params::HF3_KES_ENFORCE_EPOCH,
     crate::l2_revenue::TREASURY_SCRIPT_HASH,
 ));
+// One treasury for every L1 protocol revenue rule (forced-inclusion surcharge,
+// L2 crossing fee), and the crossing fee rides with the program swap.
+const _: () = assert!(params::L2_REVENUE_EPOCH == params::L2_NEXT_PROGRAM_EPOCH);
+const _: () = assert!(same_treasury(
+    crate::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY,
+    crate::l2_revenue::TREASURY_SCRIPT_HASH,
+));
+const fn same_treasury(a: Option<[u8; 32]>, b: Option<[u8; 32]>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            let mut i = 0;
+            while i < 32 {
+                if x[i] != y[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        _ => false,
+    }
+}
 // The P5a alias must follow the HF2 release switch.
 const _: () = assert!(params::NATIVE_SLASHING_ACTIVATION_EPOCH == params::HF2_SLASHING_V2_EPOCH);
 // The KES aliases must follow the HF3 switches.
@@ -535,6 +563,25 @@ mod tests {
         }
         assert!(!l2_revenue_may_arm(10_000, M, Some([7; 32])));
         assert!(l2_revenue_may_arm(after, kes, Some([7; 32])));
+    }
+
+    #[test]
+    fn one_protocol_treasury_pays_both_revenue_rules_and_must_be_real_to_arm() {
+        // One TBD-owner constant; both rules read it through their aliases.
+        assert_eq!(params::PROTOCOL_TREASURY_SCRIPT_HASH, None, "TBD-owner");
+        assert_eq!(crate::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY, params::PROTOCOL_TREASURY_SCRIPT_HASH);
+        assert_eq!(crate::l2_revenue::TREASURY_SCRIPT_HASH, params::PROTOCOL_TREASURY_SCRIPT_HASH);
+        assert!(same_treasury(None, None) && same_treasury(Some([7; 32]), Some([7; 32])));
+        assert!(!same_treasury(Some([7; 32]), None) && !same_treasury(Some([7; 32]), Some([8; 32])));
+        // The crossing fee rides with the program swap.
+        assert_eq!(params::L2_REVENUE_EPOCH, params::L2_NEXT_PROGRAM_EPOCH);
+        // Unset or zero: neither gate may arm.
+        assert!(!treasury_is_real(None) && !treasury_is_real(Some([0; 32])));
+        assert!(treasury_is_real(Some([7; 32])));
+        let (next, forced) = (10_060, 10_060);
+        assert!(!l2_forced_inclusion_may_arm_with(forced, next, true, true, treasury_is_real(None)));
+        assert!(!l2_forced_inclusion_may_arm_with(forced, next, true, true, treasury_is_real(Some([0; 32]))));
+        assert!(l2_forced_inclusion_may_arm_with(forced, next, true, true, treasury_is_real(Some([7; 32]))));
     }
 
     #[test]

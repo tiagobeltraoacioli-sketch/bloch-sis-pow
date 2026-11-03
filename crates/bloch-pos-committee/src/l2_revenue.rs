@@ -38,7 +38,9 @@ pub const TREASURY_VOUT: u32 = 2;
 /// The protocol treasury's L1 script hash. **TBD-owner**: `None` until the
 /// owner names it. While it is `None` the gate cannot be armed
 /// (`hard_forks::l2_revenue_may_arm`, compile-time).
-pub const TREASURY_SCRIPT_HASH: Option<[u8; 32]> = None;
+/// Alias of `params::PROTOCOL_TREASURY_SCRIPT_HASH`, shared with the
+/// forced-inclusion surcharge.
+pub const TREASURY_SCRIPT_HASH: Option<[u8; 32]> = crate::params::PROTOCOL_TREASURY_SCRIPT_HASH;
 
 const BPS_DENOMINATOR: u64 = 10_000;
 

@@ -2767,7 +2767,22 @@ pub(crate) fn l2_forced_inclusion_active(epoch: u64) -> bool {
 /// `u64::MAX` means INERT. It cannot be armed while
 /// `l2_revenue::TREASURY_SCRIPT_HASH` is `None`, nor at or before the first KES
 /// period (`hard_forks::l2_revenue_may_arm`). It changes no L2 rule.
-pub const L2_REVENUE_EPOCH: u64 = u64::MAX;
+///
+/// It rides with the program swap (coordinator, round 11): the fee starts at
+/// the same boundary as the next L2 rules, so it is an alias of
+/// [`L2_NEXT_PROGRAM_EPOCH`] and stays inert while that gate is inert.
+pub const L2_REVENUE_EPOCH: u64 = L2_NEXT_PROGRAM_EPOCH;
+
+/// **TBD-owner.** The script hash of the one L1 protocol treasury. It
+/// receives every charged forced-inclusion surcharge
+/// (`l2_settlement::mainnet::FORCED_INCLUSION_TREASURY`) and every L2
+/// crossing fee (`l2_revenue::TREASURY_SCRIPT_HASH`); both names are aliases
+/// of this constant, so the two revenue streams cannot be configured apart.
+/// `None` keeps both rules off: `hard_forks::l2_forced_inclusion_may_arm` and
+/// `hard_forks::l2_revenue_may_arm` refuse to arm their gates while it is
+/// unset or the zero hash (compile time). Revenue rule (2026-11-02): a real
+/// treasury, never a burn.
+pub const PROTOCOL_TREASURY_SCRIPT_HASH: Option<[u8; 32]> = None;
 
 pub(crate) fn l2_revenue_active(epoch: u64) -> bool {
     #[cfg(test)]
