@@ -3111,7 +3111,10 @@ mod tests {
         assert!(stale.contains("ERR_WS_STALE"), "{stale}");
         for message in [&text, &stale] {
             assert_eq!(message.contains("--ws-trusted-checkpoint"), AUTO_CHECKPOINT_ENABLED, "{message}");
-            assert_eq!(message.contains("operator-trusted"), AUTO_CHECKPOINT_ENABLED, "{message}");
+        }
+        assert_eq!(stale.contains("operator-trusted"), AUTO_CHECKPOINT_ENABLED, "{stale}");
+        if !AUTO_CHECKPOINT_ENABLED {
+            assert!(!text.contains("operator-trusted"), "{text}");
         }
     }
 
