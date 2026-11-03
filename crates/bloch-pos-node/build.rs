@@ -567,6 +567,9 @@ fn main() {
             devnet.push_str("+mainnet-policy");
         }
     }
+    if std::env::var_os("CARGO_FEATURE_WS_AUTO_CHECKPOINT").is_some() {
+        devnet.push_str("+ws-auto-checkpoint");
+    }
     println!("cargo:rerun-if-env-changed=BLOCH_L2_REHEARSAL_ACTIVATION_EPOCH");
     println!("cargo:rustc-env=BLOCH_BUILD_VERSION={pkg} ({commit}{dirty}){devnet}");
 

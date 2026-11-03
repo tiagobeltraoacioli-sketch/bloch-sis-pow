@@ -413,6 +413,9 @@ fn signer_set(args: &[String]) -> Result<(), String> {
              (ws::WS_GENESIS_SIGNER_SET_ID); the first real arrangement is id 1 (§6.1 Phase A)"
         ));
     }
+    if ws_boot::is_unsigned_anchor_id(id) {
+        return Err(format!("signer-set id {id} is reserved for release-baked and operator-trusted (unsigned) checkpoints"));
+    }
     let threshold: usize =
         req(args, "--threshold")?.parse().map_err(|_| "--threshold must be a count".to_string())?;
     let min_external: usize = req(args, "--min-external")?
@@ -651,6 +654,61 @@ fn coordinate_publication(
     result
 }
 
+/// `--checkpoint-sync-url`: the Ethereum-style checkpoint sync. Ask each of
+/// the operator's nodes for its finalized epoch, take the lowest one (every
+/// endpoint has finalized it), and derive that epoch's checkpoint from every
+/// endpoint. All must agree and all must sit on this node's genesis; the
+/// result is an unsigned, operator-trusted checkpoint — no ceremony, no files.
+pub fn fetch_trusted_checkpoint(
+    rpcs: &[String],
+    network_id: u32,
+    genesis_root: [u8; 32],
+) -> Result<WeakSubjectivityCheckpoint, String> {
+    let mut epoch = u64::MAX;
+    for addr in rpcs {
+        let info = rpc_call(addr, "getchaininfo", vec![])?;
+        let fin = info.get("finalized").ok_or_else(|| format!("{addr}: getchaininfo has no `finalized`"))?;
+        epoch = epoch.min(field_u64(fin, "epoch", "finalized")?);
+    }
+    if epoch == 0 || epoch == u64::MAX {
+        return Err("the checkpoint-sync nodes have finalized nothing past genesis".into());
+    }
+    let mut first: Option<(String, ChainView)> = None;
+    for addr in rpcs {
+        let view = view_of(addr, epoch)?;
+        if view.genesis_block != genesis_root {
+            return Err(format!("{addr} serves a different network (genesis {}); refusing", hex32(&view.genesis_block)));
+        }
+        match &first {
+            Some((first_addr, seen)) if *seen != view => {
+                return Err(format!(
+                    "{addr} and {first_addr} DISAGREE on the epoch-{epoch} checkpoint ({} vs {}); \
+                     refusing to pick a side — investigate the fork first",
+                    hex32(&view.block_root), hex32(&seen.block_root)
+                ));
+            }
+            Some(_) => {}
+            None => first = Some((addr.clone(), view)),
+        }
+    }
+    let (_, view) = first.ok_or("--checkpoint-sync-url needs at least one host:port")?;
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    Ok(WeakSubjectivityCheckpoint {
+        version: WS_FORMAT_VERSION,
+        network_id,
+        genesis_root,
+        epoch,
+        block_root: view.block_root,
+        state_root: view.state_root,
+        validator_set_root: [0; 32],
+        issued_at,
+        signer_set_id: ws_boot::WS_OPERATOR_TRUSTED_SIGNER_SET_ID,
+    })
+}
+
 fn checkpoint(args: &[String]) -> Result<(), String> {
     let manifest_path = req(args, "--genesis")?;
     let rpcs: Vec<String> = req(args, "--rpc")?
@@ -670,12 +728,33 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
                 .into(),
         );
     }
-    let signer_set_id: u32 = req(args, "--signer-set-id")?
-        .parse()
-        .map_err(|_| "--signer-set-id must be a u32".to_string())?;
-    if signer_set_id == WS_GENESIS_SIGNER_SET_ID {
-        return Err("signer-set id 0 is reserved for the genesis anchor".into());
+    // --operator-trusted: the Ethereum model. Nobody signs the result; the
+    // operator who boots with it (--ws-trusted-checkpoint) vouches for it.
+    let operator_trusted = args.iter().any(|a| a == "--operator-trusted");
+    // --release-anchor: the checkpoint a release engineer bakes into the node
+    // release (crates/bloch-pos-node/release/ws-anchor.bin). Never signed;
+    // its trust is the release's own.
+    let release_anchor = args.iter().any(|a| a == "--release-anchor");
+    if release_anchor && operator_trusted {
+        return Err("--release-anchor and --operator-trusted are alternatives".into());
     }
+    let signer_set_id: u32 = if operator_trusted || release_anchor {
+        if crate::arg_value(args, "--signer-set-id").is_some() {
+            return Err("--operator-trusted/--release-anchor and --signer-set-id are alternatives: an unsigned checkpoint is never signed".into());
+        }
+        if release_anchor { ws_boot::WS_RELEASE_SIGNER_SET_ID } else { ws_boot::WS_OPERATOR_TRUSTED_SIGNER_SET_ID }
+    } else {
+        let id: u32 = req(args, "--signer-set-id")?
+            .parse()
+            .map_err(|_| "--signer-set-id must be a u32".to_string())?;
+        if id == WS_GENESIS_SIGNER_SET_ID {
+            return Err("signer-set id 0 is reserved for the genesis anchor".into());
+        }
+        if ws_boot::is_unsigned_anchor_id(id) {
+            return Err("this signer-set id is reserved for unsigned checkpoints; use --operator-trusted or --release-anchor".into());
+        }
+        id
+    };
     let out = req(args, "--out")?;
     let issued_at: u64 = match crate::arg_value(args, "--issued-at") {
         Some(s) => s.parse().map_err(|_| "--issued-at must be unix seconds".to_string())?,
@@ -807,6 +886,30 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
     write_file(&json_path, format!("{}\n", view.to_string()).as_bytes(), false)?;
 
     println!("wrote {bin_path} ({} canonical bytes) and {json_path}", bytes.len());
+    if release_anchor {
+        ws_boot::decode_release_anchor(&bytes).map_err(|e| format!("self-check failed: {e}"))?;
+        println!("release-baked checkpoint (unsigned): epoch {epoch}, block root");
+        println!("  {}", hex32(&cp.block_root));
+        println!(
+            "next: copy {bin_path} to crates/bloch-pos-node/release/ws-anchor.bin in the release \
+             tree, build with --features ws-auto-checkpoint, and quote epoch, block root and the \
+             file's SHA-256 in the release notes. Anyone with a synced node re-derives it with \
+             the same command and --issued-at {}",
+            cp.issued_at
+        );
+        return Ok(());
+    }
+    if operator_trusted {
+        println!("operator-trusted checkpoint (unsigned): epoch {epoch}, block root");
+        println!("  {}", hex32(&cp.block_root));
+        println!(
+            "next: compare that block root against a SECOND, independent channel (the \
+             explorer, another operator). If they agree, boot the fresh node with  \
+             --ws-trusted-checkpoint {bin_path} --ws-trusted-root {}",
+            hex32(&cp.block_root)
+        );
+        return Ok(());
+    }
     println!("ws digest (what each signer signs, and what announcements quote):");
     println!("  {}", hex32(&digest));
     println!(
@@ -2362,5 +2465,73 @@ mod tests {
 
     fn s(v: &str) -> String {
         v.to_string()
+    }
+
+    // ── --checkpoint-sync-url against a scripted RPC ───────────────────────
+
+    /// A one-chain RPC: finalized at `epoch` with boundary block `root`.
+    fn fake_rpc(epoch: u64, root: [u8; 32], genesis: [u8; 32]) -> String {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read the head, then exactly Content-Length body bytes.
+                let body = loop {
+                    let Ok(n) = s.read(&mut chunk) else { break String::new() };
+                    if n == 0 { break String::new(); }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let len = head.lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+                        if body.len() >= len { break body.to_string(); }
+                    }
+                };
+                let req = parse_json(&body).unwrap();
+                let method = req.get("method").and_then(Json::as_str).unwrap_or("").to_string();
+                let slot = req.get("params").and_then(|p| match p { Json::Arr(a) => a.first().cloned(), _ => None })
+                    .and_then(|v| v.as_u64());
+                let result = match (method.as_str(), slot) {
+                    ("getchaininfo", _) => Some(Json::obj(vec![("finalized", Json::obj(vec![
+                        ("epoch", Json::u(epoch)), ("root", Json::hex(&root))]))])),
+                    ("getblockbyslot", Some(0)) => Some(Json::obj(vec![("block_id", Json::hex(&genesis))])),
+                    ("getblockbyslot", Some(s)) if s == epoch * SLOTS_PER_EPOCH - 1 => Some(Json::obj(vec![
+                        ("block_id", Json::hex(&root)), ("state_root", Json::hex(&[0x33; 32])),
+                        ("finalized", Json::Bool(true))])),
+                    _ => None,
+                };
+                let payload = match result {
+                    Some(r) => Json::obj(vec![("jsonrpc", Json::s("2.0")), ("id", Json::u(1)), ("result", r)]),
+                    None => Json::obj(vec![("jsonrpc", Json::s("2.0")), ("id", Json::u(1)),
+                        ("error", Json::s("no block"))]),
+                }.to_string();
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len());
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn checkpoint_sync_fetches_an_agreed_unsigned_checkpoint() {
+        let genesis = [0x61; 32];
+        let a = fake_rpc(40, [0x22; 32], genesis);
+        let b = fake_rpc(40, [0x22; 32], genesis);
+        let cp = fetch_trusted_checkpoint(&[a.clone(), b], 7, genesis).expect("agreeing nodes");
+        assert_eq!((cp.epoch, cp.block_root, cp.state_root), (40, [0x22; 32], [0x33; 32]));
+        assert_eq!(cp.signer_set_id, ws_boot::WS_OPERATOR_TRUSTED_SIGNER_SET_ID);
+        assert_eq!(cp.network_id, 7);
+
+        let forked = fake_rpc(40, [0x99; 32], genesis);
+        let err = fetch_trusted_checkpoint(&[a.clone(), forked], 7, genesis).unwrap_err();
+        assert!(err.contains("DISAGREE"), "{err}");
+
+        let err = fetch_trusted_checkpoint(&[a], 7, [0x62; 32]).unwrap_err();
+        assert!(err.contains("different network"), "{err}");
     }
 }
