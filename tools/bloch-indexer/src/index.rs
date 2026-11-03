@@ -515,6 +515,14 @@ impl Index {
                     PosTransaction::FundedDelegate(d) => d.amount_sat,
                     _ => 0,
                 },
+                l2_escrow_in_sat: match tx {
+                    PosTransaction::L2Deposit(d) => d.amount_sat as u128,
+                    _ => 0,
+                },
+                l2_escrow_out_sat: match tx {
+                    PosTransaction::L2WithdrawClaim(c) => c.sats as u128,
+                    _ => 0,
+                },
                 outputs: Vec::new(),
                 declared_bytes: 0,
                 tip_millisat_per_gas: 0,
@@ -605,7 +613,11 @@ impl Index {
                 }
 
                 row.fee_sat = if let Some(receipt) = receipts.get(tx_index) { Some(receipt.1) }
-                    else if all_inputs_valued { in_sat.checked_sub(out_sat).and_then(|v| v.checked_sub(row.stake_sat)) }
+                    else if all_inputs_valued {
+                        (in_sat + row.l2_escrow_out_sat).checked_sub(out_sat)
+                            .and_then(|v| v.checked_sub(row.stake_sat))
+                            .and_then(|v| v.checked_sub(row.l2_escrow_in_sat))
+                    }
                     else { None };
             }
 
@@ -691,6 +703,60 @@ impl Index {
         }
         self.stats.blocks_applied += 1;
         self.replay = post;
+        Ok(())
+    }
+
+    // ── Audit ───────────────────────────────────────────────────────────────
+
+    /// Compare every balance-bearing table with the replayed consensus state:
+    /// the outpoint set with values and owners, the per-script balances and
+    /// output lists, the eUTXO total, and each script's history. The cost is
+    /// linear in the outputs and the history, so this is for `audit-ledger`
+    /// and tests, never for the per-block path of `serve`.
+    pub fn audit_against_replay(&self) -> Result<(), String> {
+        let post = self.replay.as_ref().ok_or("consensus replay is not enabled")?;
+        let mut balances: HashMap<ScriptHash, u128> = HashMap::new();
+        let mut live = 0usize;
+        for e in post.utxos() {
+            live += 1;
+            *balances.entry(e.script_hash).or_insert(0) += e.value as u128;
+            let op = OutPoint { txid: e.txid, vout: e.vout };
+            match self.utxo.get(&op) {
+                None => return Err(format!("{}:{} is live in consensus, absent from the index", crate::hex32(&e.txid), e.vout)),
+                Some(u) if u.value_sat != e.value || u.script_hash != e.script_hash => return Err(format!(
+                    "{}:{} differs: index {} sat to {}, consensus {} sat to {}", crate::hex32(&e.txid), e.vout,
+                    u.value_sat, crate::hex32(&u.script_hash), e.value, crate::hex32(&e.script_hash))),
+                Some(_) => {}
+            }
+            if !self.by_script.get(&e.script_hash).is_some_and(|set| set.contains(&op)) {
+                return Err(format!("{}:{} is missing from its script's output list", crate::hex32(&e.txid), e.vout));
+            }
+        }
+        if live != self.utxo.len() {
+            return Err(format!("consensus holds {live} live outputs, the index {}", self.utxo.len()));
+        }
+        if self.eutxo_total_sat != post.total_unspent_sat() {
+            return Err(format!("eUTXO total: index {}, consensus {}", self.eutxo_total_sat, post.total_unspent_sat()));
+        }
+        let positive = self.balance.values().filter(|v| **v > 0).count();
+        if positive != balances.len() {
+            return Err(format!("{positive} indexed scripts hold a balance, {} in consensus", balances.len()));
+        }
+        for (script, want) in &balances {
+            if self.balance_of(script) != *want || post.balance_sat(script) != *want {
+                return Err(format!("balance of {}: index {}, consensus {want}", crate::hex32(script), self.balance_of(script)));
+            }
+        }
+        for (script, rows) in &self.history {
+            let net = rows.iter().fold(0i128, |sum, row| match row.direction {
+                Direction::In => sum + row.amount_sat as i128,
+                Direction::Out => sum - row.amount_sat as i128,
+            });
+            let want = balances.get(script).copied().unwrap_or(0) as i128;
+            if net != want {
+                return Err(format!("history of {} nets {net}, consensus balance {want}", crate::hex32(script)));
+            }
+        }
         Ok(())
     }
 
@@ -966,8 +1032,16 @@ fn nonzero_change(value: u64, script_hash: ScriptHash) -> Vec<(u64, ScriptHash)>
     if value > 0 { vec![(value, script_hash)] } else { Vec::new() }
 }
 
-struct ArchiveVerifier;
+pub struct ArchiveVerifier;
 impl bloch_pos_committee::attestation::SignatureVerifier for ArchiveVerifier {
+    /// Native L2 settlement proofs, exactly as the node's `HybridVerifier`.
+    /// The trait default answers `false`, so without this override the first
+    /// settlement on the chain fails replay with `L2Settlement(Proof)` and
+    /// halts the index at a block the network accepted.
+    fn verify_l2_settlement(&self, policy: &[u8; 32], program: &[u8; 32], values: &[u8], proof: &[u8]) -> bool {
+        bloch_l2_proof::verify(policy, program, values, proof)
+    }
+
     fn verify_with_key(&self, key: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
         bloch_crypto::crypto::verify(key, root, signature)
     }

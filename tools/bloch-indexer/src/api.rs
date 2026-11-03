@@ -566,7 +566,8 @@ pub fn route(path: &str, query: &str, index: &Shared) -> (u16, Json) {
                         Json::s(
                             "eutxo_total_sat is the satoshi held in unspent outputs, derived by \
                              replay. It is NOT the whole money supply: staked and delegated \
-                             balances live in the validator records, not in the eUTXO set.",
+                             balances live in the validator records, and the native L2 escrow \
+                             lives in L2 state, not in the eUTXO set.",
                         ),
                     ),
                     ("count", Json::u(rows.len() as u64)),
@@ -719,7 +720,7 @@ fn block_json(ix: &Index, r: &BlockRow) -> Json {
 }
 
 fn tx_json(t: &TxRow) -> Json {
-    Json::Obj(vec![
+    let mut fields = vec![
         ("permalink", Json::s(format!("/tx/{}/{}", crate::hex32(&t.block_id), t.tx_index))),
         ("txid", Json::hex32(&t.txid)),
         ("block_id", Json::hex32(&t.block_id)),
@@ -760,7 +761,12 @@ fn tx_json(t: &TxRow) -> Json {
         ("declared_bytes", Json::u(t.declared_bytes)),
         ("tip_millisat_per_gas", Json::sat(t.tip_millisat_per_gas)),
         ("fee_sat", t.fee_sat.map(Json::sat).unwrap_or(Json::Null)),
-    ])
+    ];
+    if t.kind.is_l2() {
+        fields.push(("l2_escrow_in_sat", Json::sat(t.l2_escrow_in_sat)));
+        fields.push(("l2_escrow_out_sat", Json::sat(t.l2_escrow_out_sat)));
+    }
+    Json::Obj(fields)
 }
 
 fn epoch_json(r: &EpochRow) -> Json {
