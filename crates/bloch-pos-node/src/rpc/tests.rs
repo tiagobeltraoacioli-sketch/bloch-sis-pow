@@ -26,6 +26,27 @@ use bloch_pos_committee::transition::GenesisValidator;
 #[path = "../../build_source_digest.rs"]
 mod build_source_digest_tests;
 
+/// R242: the release-baked weak-subjectivity checkpoint must be inside the
+/// source digest, or two binaries reporting one source identity could bake
+/// different anchors.
+#[test]
+fn the_release_baked_checkpoint_is_inside_the_source_digest() {
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_nanos();
+    let root = std::env::temp_dir().join(format!("a242-anchor-digest-{}-{nonce}", std::process::id()));
+    let anchor = root.join(crate::ws_boot::RELEASE_ANCHOR_SOURCE);
+    std::fs::create_dir_all(anchor.parent().expect("parent")).expect("dirs");
+    std::fs::write(root.join("Cargo.toml"), b"[workspace]\n").expect("manifest");
+    std::fs::write(root.join("Cargo.lock"), b"version = 4\n").expect("lock");
+    std::fs::write(root.join("rust-toolchain.toml"), b"[toolchain]\nchannel = \"stable\"\n").expect("toolchain");
+    std::fs::write(root.join("crates/lib.rs"), b"pub fn f() {}\n").expect("source");
+    std::fs::write(&anchor, b"").expect("empty anchor");
+    let empty = build_source_digest_tests::source_digest(&root).expect("digest");
+    std::fs::write(&anchor, b"pub const RELEASE_ANCHOR_HEX: &str = \"01\";\n").expect("baked anchor");
+    let baked = build_source_digest_tests::source_digest(&root).expect("digest");
+    let _ = std::fs::remove_dir_all(&root);
+    assert_ne!(empty.0, baked.0, "{} is outside the source digest", crate::ws_boot::RELEASE_ANCHOR_SOURCE);
+}
+
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
 fn entry(txid: u8, vout: u32, value: u64, script: u8) -> EutxoEntry {

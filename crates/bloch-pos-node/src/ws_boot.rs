@@ -682,6 +682,11 @@ pub fn decode_release_anchor(bytes: &[u8]) -> Result<Option<WeakSubjectivityChec
     Ok(Some(cp))
 }
 
+/// Workspace-relative path of the file `compiled_release_anchor` compiles in.
+/// It must lie inside the source-digest scope (build_source_digest.rs), so
+/// that a binary's reported source digest also binds the anchor it bakes.
+pub const RELEASE_ANCHOR_SOURCE: &str = "crates/bloch-pos-node/release/ws-anchor.bin";
+
 /// The checkpoint compiled into this binary, if any. Only builds with the
 /// `ws-auto-checkpoint` feature read `release/ws-anchor.bin`; the file in the
 /// tree is empty, so even those builds bake nothing until a release fills it.
@@ -3068,5 +3073,42 @@ mod tests {
             |e| (e == 7168).then_some([0x22; 32]), |_| true, |_| None).unwrap().expect("synced");
         assert!(!caught_up.anchor_is_hard);
         assert!(caught_up.warnings.iter().any(|w| w.contains("not newer")), "{:?}", caught_up.warnings);
+    }
+
+    // ── agent 242 review ─────────────────────────────────────────────────────
+
+    /// R242: a build without the unsigned operator flags must not point an
+    /// operator at them (feature-off output equals fa980367's guidance).
+    #[test]
+    fn builds_without_operator_flags_never_name_them() {
+        let dir = tmpdir("a242-stale-warn-text");
+        let out = boot(&no_flags(), &dir, NET, &GEN, &genesis_anchor(), 2000, true,
+            (2000 - bloch_pos_committee::ws::WS_FRESH_EPOCHS, [0x55; 32]), |_| None, |_| true, |_| None).unwrap().expect("resume, stale warn");
+        let text = out.warnings.join("\n");
+        assert!(text.contains("freshness"), "{text}");
+        let stale = boot(&no_flags(), &dir, NET, &GEN, &genesis_anchor(), 3000 + WS_PERIOD_EPOCHS, true,
+            (3000, [0x55; 32]), |_| None, |_| true, |_| None).unwrap().expect_err("ERR_WS_STALE");
+        assert!(stale.contains("ERR_WS_STALE"), "{stale}");
+        for message in [&text, &stale] {
+            assert_eq!(message.contains("--ws-trusted-checkpoint"), AUTO_CHECKPOINT_ENABLED, "{message}");
+            assert_eq!(message.contains("operator-trusted"), AUTO_CHECKPOINT_ENABLED, "{message}");
+        }
+    }
+
+    /// R242: a release can be rolled back to fa980367. That binary's boot
+    /// reads ws_latest without looking at the signer-set id, so a stored
+    /// release anchor keeps working there (this default build runs the same
+    /// code path) and is never a refusal.
+    #[test]
+    fn a_stored_release_anchor_boots_a_default_build() {
+        let dir = tmpdir("a242-rollback");
+        save_latest(&dir, &release_cp(7168)).unwrap();
+        let out = boot(&no_flags(), &dir, NET, &GEN, &genesis_anchor(), 7300, false,
+            (0, GEN), |_| None, |_| false, |_| None).unwrap().expect("fresh node under the stored release anchor");
+        assert_eq!(out.anchor_epoch, 7168);
+        assert!(out.anchor_is_hard);
+        let out = boot(&no_flags(), &dir, NET, &GEN, &genesis_anchor(), 7300, true,
+            (7298, [0x22; 32]), |e| (e == 7168).then_some([0x22; 32]), |_| true, |_| None).unwrap().expect("synced node");
+        assert!(!out.anchor_is_hard);
     }
 }
