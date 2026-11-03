@@ -48,6 +48,7 @@ mod codec;
 mod connection_limit;
 mod devnet_tools;
 mod l2_da_cli;
+mod l2_brake;
 mod l2_claim_cli;
 mod l2_deposit_cli;
 mod l2_forced_cli;
@@ -262,6 +263,12 @@ fn main() {
         Some("kes") => {
             if let Err(error) = kes_cli::run(&args[1..]) {
                 eprintln!("kes: {error}");
+                exit(2);
+            }
+        }
+        Some("l2-brake") => {
+            if let Err(error) = l2_brake::run(&args[1..]) {
+                eprintln!("l2-brake: {error}");
                 exit(2);
             }
         }
@@ -555,8 +562,14 @@ fn print_help() {
                manifest commits to none and the flag is then refused.\n\
                          [--rpc-bind <ip>] [--rpc-port <n>|off]\n\
                          [--metrics-bind <ip>] [--metrics-port <n>] [--allow-public-metrics]\n\
+                         [--l2-brake-key <pk file>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
                data persists in <dir>; a compatible local state cache skips its replay prefix.\n\
+               \n\
+               Node-local L2 brake (`--l2-brake-key`, off by default; not consensus):\n\
+               a <dir>/l2-brake.json signed by that key (`bloch-pos l2-brake sign`)\n\
+               makes this node leave held L2 claims/settlements out of its blocks\n\
+               and refuse them at its mempool as retry-later. See `bloch-pos l2-brake`.\n\
                \n\
                JSON-RPC 2.0 over HTTP is served on --rpc-bind:--rpc-port,\n\
                default 127.0.0.1:16310 (`--rpc-port off` disables it). It\n\
@@ -1879,6 +1892,8 @@ fn run_cmd(args: &[String]) {
         metrics_bind,
         metrics_port,
         mesh,
+        // Node-local L2 brake (not consensus): off unless a key is named.
+        l2_brake_key: arg_value(args, "--l2-brake-key").map(PathBuf::from),
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");

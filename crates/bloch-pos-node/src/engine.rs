@@ -469,6 +469,9 @@ pub struct Config {
     /// Resolved in [`run`] once the genesis id is known, because the
     /// handshake binds every connection to it.
     pub mesh: MeshPlan,
+    /// `--l2-brake-key`: the public key that signs the node-local L2 brake
+    /// file (`l2_brake.rs`). `None`: the brake is disabled and never read.
+    pub l2_brake_key: Option<PathBuf>,
 }
 
 /// The mesh security the operator asked for, before [`run`] has the genesis
@@ -1725,6 +1728,9 @@ struct Engine {
     /// a mempool under fee pressure and a mempool simply not receiving
     /// transactions both look like "it got smaller" without this.
     mempool_evicted_low_fee: u64,
+    /// Node-local L2 brake (`l2_brake.rs`): which L2 claims and settlements
+    /// this node leaves out of its blocks and its mempool. Not consensus.
+    l2_brake: crate::l2_brake::BrakeCell,
     /// Transactions the proposer's drop loop refused, keyed exactly like
     /// [`Self::mempool`] and mapping to `(slot the bar lifts at, times it has
     /// barred a re-offer)`.
@@ -4882,6 +4888,11 @@ impl Engine {
         if let Some(why) = l2_admission_refusal(&tx, self.state.l2_settlement()) {
             return Err(Refusal::Invalid(why));
         }
+        // Node-local L2 brake: retry later, never invalid, so no peer is
+        // penalized and the same bytes are admitted once the brake lifts.
+        if self.l2_brake_holds(&tx, self.wall_slot(), epoch_of(self.wall_slot())) {
+            return Err(Refusal::StateDependent("held by this node's L2 brake (node-local; retry later or elsewhere)"));
+        }
         if let PosTransaction::L2SettlementAsync(settlement) = &tx {
             let state = self.state.l2_settlement().ok_or(Refusal::Invalid("L2 settlement is not configured"))?;
             if self.mempool.values().any(|pending| l2_proof_holds_the_slot(pending, state)) {
@@ -4959,6 +4970,20 @@ impl Engine {
         Ok((Admitted::New, prepared))
     }
 
+    /// Whether the node-local L2 brake holds `tx` (refreshing the brake file
+    /// at most once per slot). Only L2 claims and settlements can be held.
+    fn l2_brake_holds(&self, tx: &PosTransaction, slot: u64, epoch: u64) -> bool {
+        if !matches!(
+            tx,
+            PosTransaction::L2WithdrawClaim(_) | PosTransaction::L2SettlementAsync(_) | PosTransaction::L2Settlement(_)
+        ) {
+            return false;
+        }
+        let chain = self.state.l2_settlement().map(|l2| l2.policy().chain_id);
+        self.l2_brake.refresh(slot, epoch, self.state.admission_network_domain(), chain);
+        self.l2_brake.holds(tx, epoch)
+    }
+
     /// Transactions for the block this node is about to propose.
     ///
     /// Bounded by both [`MAX_TXS_PER_BLOCK`] and the consensus byte cap, and
@@ -4980,8 +5005,12 @@ impl Engine {
     /// it builds a block every other node rejects — so the epoch comes from
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
+        // Node-local L2 brake: held claims and settlements are not proposed
+        // here. Blocks from other proposers that carry them validate as always.
+        let slot = self.wall_slot();
+        let braked = |tx: &PosTransaction| self.l2_brake_holds(tx, slot, epoch);
         // A proof reserves the whole gas budget. Never pack it with transfers.
-        if let Some(tx) = live_l2_proof(self.mempool.values(), self.state.l2_settlement()) {
+        if let Some(tx) = live_l2_proof(self.mempool.values().filter(|tx| !braked(tx)), self.state.l2_settlement()) {
             return vec![tx.clone()];
         }
         let dead_proof = |tx: &PosTransaction| matches!(tx, PosTransaction::L2SettlementAsync(_));
@@ -4992,7 +5021,7 @@ impl Engine {
         // again, making the exact same signed transaction eligible later.
         let mut funded_context = None;
         let candidates = self.mempool.iter().filter(|(encoded, tx)| {
-            !dead_proof(tx) && self.candidate_is_backed(tx, encoded.len(), epoch, &mut funded_context)
+            !dead_proof(tx) && !braked(tx) && self.candidate_is_backed(tx, encoded.len(), epoch, &mut funded_context)
         }).collect();
         Self::pack_transactions(epoch, *self.state.head().as_bytes(), candidates)
     }
@@ -6466,16 +6495,23 @@ impl Engine {
                 Ok(rpc::Json::s(crate::codec::hex(&crate::codec::encode_envelope(&env))))
             }
             RpcRequest::BuildInfo => Ok(rpc::build_info_json()),
-            RpcRequest::MempoolInfo => Ok(rpc::mempool_info_json(
-                self.mempool.len(),
-                MEMPOOL_MAX,
-                self.mempool.bytes(),
-                self.state.next_base_fee(),
-                self.rejected.len(),
-                self.rejected_hits,
-                self.mempool_expired,
-                self.mempool_evicted_low_fee,
-            )),
+            RpcRequest::MempoolInfo => {
+                let mut info = rpc::mempool_info_json(
+                    self.mempool.len(),
+                    MEMPOOL_MAX,
+                    self.mempool.bytes(),
+                    self.state.next_base_fee(),
+                    self.rejected.len(),
+                    self.rejected_hits,
+                    self.mempool_expired,
+                    self.mempool_evicted_low_fee,
+                );
+                // Node-local, so operators can confirm every own node is braked.
+                if let rpc::Json::Obj(fields) = &mut info {
+                    fields.push(("l2_brake".to_string(), self.l2_brake.json(epoch_of(self.wall_slot()))));
+                }
+                Ok(info)
+            }
 
             // R4 F-11.
             RpcRequest::Validators => Ok(rpc::validator_registry_json(&self.state)),
@@ -7046,6 +7082,20 @@ pub fn run(cfg: Config) -> io::Result<()> {
     )?;
 
     let kes = load_kes_signer(&cfg.data_dir, keys.is_some())?;
+    // Node-local L2 brake: strict when asked for, absent otherwise.
+    let l2_brake = match &cfg.l2_brake_key {
+        None => crate::l2_brake::BrakeCell::disabled(),
+        Some(path) => {
+            let key = crate::l2_brake::BrakeCell::read_key(path)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("--l2-brake-key: {e}")))?;
+            println!(
+                "L2 BRAKE: enabled; {} in the data dir is honoured when signed by {} (node-local, not consensus)",
+                crate::l2_brake::FILE,
+                path.display()
+            );
+            crate::l2_brake::BrakeCell::new(Some(cfg.data_dir.clone()), Some(key))
+        }
+    };
     let mut engine = Engine {
         state: StateCell::new(genesis_state),
         tr: Transition::new(verifier.clone()),
@@ -7069,6 +7119,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         mempool_admitted_at: BTreeMap::new(),
         mempool_expired: 0,
         mempool_evicted_low_fee: 0,
+        l2_brake,
         rejected: BTreeMap::new(),
         rejected_bytes: 0,
         rejected_expiry_hint: None,
@@ -10773,6 +10824,7 @@ mod transfer_v2_end_to_end {
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
+            l2_brake: crate::l2_brake::BrakeCell::disabled(),
             rejected: BTreeMap::new(),
             rejected_bytes: 0,
             rejected_expiry_hint: None,
@@ -12249,6 +12301,7 @@ mod perf_support {
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
+            l2_brake: crate::l2_brake::BrakeCell::disabled(),
             rejected: BTreeMap::new(),
             rejected_bytes: 0,
             rejected_expiry_hint: None,
@@ -14574,6 +14627,7 @@ mod duty_view_anchor {
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
+            l2_brake: crate::l2_brake::BrakeCell::disabled(),
             rejected: BTreeMap::new(),
             rejected_bytes: 0,
             rejected_expiry_hint: None,
@@ -14844,6 +14898,7 @@ mod slot_horizon {
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
+            l2_brake: crate::l2_brake::BrakeCell::disabled(),
             rejected: BTreeMap::new(),
             rejected_bytes: 0,
             rejected_expiry_hint: None,
@@ -18203,5 +18258,107 @@ mod forkchoice_cycle_tests {
 
         assert_eq!(*engine.head_id().as_bytes(), rival, "the rival carries more stake");
         assert_eq!(hook.head_changes(), 1, "exactly one reorg, onto the rival");
+    }
+}
+
+/// The node-local L2 brake inside the engine (agent 222): the mempool door
+/// refuses held transactions as retry-later and the proposer leaves them out;
+/// nothing else changes.
+#[cfg(test)]
+mod l2_brake_engine_tests {
+    use super::*;
+    use bloch_pos_committee::l2_settlement::{Transaction, STATEMENT_TAG, STATEMENT_V3_BYTES, STATEMENT_V3_TAG};
+
+    /// An engine whose genesis installs a development L2 (chain 700771), and a
+    /// brake directory with a fresh brake key.
+    fn engine_with_l2(dir_tag: &str) -> (Engine, PathBuf, Vec<u8>) {
+        let mut engine = super::slot_horizon::engine_at_wall_slot(64);
+        engine.manifest.format = crate::genesis::ManifestFormat::V3L2Async(crate::genesis::L2Config {
+            identities: [[3; 32]; 5],
+            proof_policy: bloch_l2_proof::policy_commitment(),
+            chain_id: 700_771,
+            initial_l2_parent: [4; 32],
+            initial_l2_state: [5; 32],
+            attestor_set: [0; 32],
+        });
+        engine.manifest.pre_state_root = std::sync::OnceLock::new();
+        engine.state = StateCell::new(engine.manifest.genesis_state());
+        assert!(engine.state.l2_settlement().is_some() && engine.state.admission_network_domain().is_some());
+        let dir = std::env::temp_dir().join(format!("a222-engine-brake-{dir_tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        engine.l2_brake = crate::l2_brake::BrakeCell::new(Some(dir.clone()), Some(pk));
+        (engine, dir, sk)
+    }
+
+    fn engage(engine: &Engine, dir: &std::path::Path, sk: &[u8], settlements: bool) {
+        let until = epoch_of(engine.wall_slot()) + 10;
+        let body = format!(
+            r#"{{"version":1,"chain_id":700771,"claims_from_leaf_index":0,"settlements":{settlements},"until_epoch":{until},"reason":"engine test"}}"#
+        );
+        let network = engine.state.admission_network_domain().unwrap();
+        let sig = bloch_crypto::crypto::sign_fitting(sk, &crate::l2_brake::digest(&network, body.as_bytes()), usize::MAX).unwrap();
+        std::fs::write(dir.join(crate::l2_brake::FILE), body).unwrap();
+        std::fs::write(dir.join(crate::l2_brake::SIG_FILE), crate::codec::hex(&sig)).unwrap();
+    }
+
+    /// A proof of the installed program (fake proof bytes: never verified here).
+    fn proof(engine: &Engine) -> PosTransaction {
+        let policy = engine.state.l2_settlement().unwrap().policy().clone();
+        let tag = STATEMENT_TAG.len();
+        let mut statement = vec![1; STATEMENT_V3_BYTES];
+        statement[..tag].copy_from_slice(STATEMENT_V3_TAG);
+        for (i, id) in policy.identities.iter().enumerate() {
+            statement[tag + i * 32..tag + (i + 1) * 32].copy_from_slice(id);
+        }
+        PosTransaction::L2SettlementAsync(Box::new(Transaction { proof_policy: policy.proof_policy, statement, proof: [1; 356] }))
+    }
+
+    #[test]
+    fn the_door_refuses_a_held_settlement_as_retry_later_and_only_while_held() {
+        let (mut engine, dir, sk) = engine_with_l2("door");
+        let tx = proof(&engine);
+        // Off: the proof is judged on its merits (a fake proof is invalid).
+        assert!(matches!(engine.on_transaction(tx.clone()), Err(Refusal::Invalid(_))));
+        engage(&engine, &dir, &sk, true);
+        engine.l2_brake = crate::l2_brake::BrakeCell::new(Some(dir.clone()), None);
+        // A cell without a key never reads the file: still judged on its merits.
+        assert!(matches!(engine.on_transaction(tx.clone()), Err(Refusal::Invalid(_))));
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        engine.l2_brake = crate::l2_brake::BrakeCell::new(Some(dir.clone()), Some(pk));
+        engage(&engine, &dir, &sk, true);
+        assert!(matches!(engine.on_transaction(tx.clone()), Err(Refusal::StateDependent(_))));
+        assert!(engine.mempool.len() == 0 && engine.rejected.is_empty(), "held, not admitted and not barred");
+        let info = engine.l2_brake.json(epoch_of(engine.wall_slot()));
+        assert_eq!(info.get("active"), Some(&rpc::Json::Bool(true)));
+        // Claims only (settlements false): the proof is judged on its merits again.
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        engine.l2_brake = crate::l2_brake::BrakeCell::new(Some(dir.clone()), Some(pk));
+        engage(&engine, &dir, &sk, false);
+        assert!(matches!(engine.on_transaction(tx), Err(Refusal::Invalid(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_proposer_leaves_a_held_settlement_out_and_takes_it_once_lifted() {
+        let (mut engine, dir, sk) = engine_with_l2("propose");
+        let tx = proof(&engine);
+        let key = tx.canonical_bytes();
+        let txid = tx.txid();
+        engine.mempool.insert_with_txid(key, tx.clone(), txid);
+        let epoch = epoch_of(engine.wall_slot());
+        assert_eq!(engine.select_transactions(epoch), vec![tx.clone()], "unbraked: the proof is proposed alone");
+        engage(&engine, &dir, &sk, true);
+        // The file is re-read at most once per slot (unit-tested in l2_brake with
+        // fixed slots); here the wall clock moves, so force the next slot's read.
+        engine.l2_brake.refresh(engine.wall_slot() + 1, epoch, engine.state.admission_network_domain(), Some(700_771));
+        assert!(!engine.select_transactions(epoch).contains(&tx), "braked: not proposed");
+        assert_eq!(engine.mempool.len(), 1, "kept in the mempool, not dropped or barred");
+        // Lifted by deleting the file: the next slot's refresh sees it gone.
+        std::fs::remove_file(dir.join(crate::l2_brake::FILE)).unwrap();
+        engine.l2_brake.refresh(engine.wall_slot() + 1, epoch, engine.state.admission_network_domain(), Some(700_771));
+        assert_eq!(engine.select_transactions(epoch), vec![tx]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

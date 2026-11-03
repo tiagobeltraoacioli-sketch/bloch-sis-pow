@@ -18,6 +18,17 @@ escrow per 2,880-block window after R as well. Unless a fence or forfeit-reset s
 release (TABLETOP-R10.md, recommendation 1), an attacker who claims once before R makes the L2
 unrecoverable and the drain open-ended.
 
+**[v3, agent 222] The December release carries the FORFEIT form** (`HeadReset.forfeit`, inert while
+`ROLLBACK_HEAD_RESET` is `None`). With `"forfeit": true` in `reset.json` the reset applies even after
+claims beyond N: the claims of leaves at or above C = N's withdrawal count are forgotten (so the new
+chain's leaves at those indices pay), the forged roots stop paying at R, the target's root is recorded
+again if retention had pruned it, and what the forged claims released stays released: that amount is
+the **forfeit**, the escrow shortfall the owner must cover (agents/222-g2-fence.md). Use it for G2a
+only. In G2b keep the plain form and the brake: a forfeit there forgets honest paid claims whose
+withdrawals the rebuild re-includes, and pays them twice. No fence (longer claim delay) ships: to keep
+the plain reset reachable it would have to exceed the whole response time, about 4 to 5 days, for
+every honest withdrawal.
+
 ## Files
 
 | File | Role |
@@ -25,7 +36,7 @@ unrecoverable and the drain open-ended.
 | `arm.py` | Deterministic arming of R (and S checked), optional `ROLLBACK_HEAD_RESET`, both L2 gates into `RELEASE_ARMABLE`. Refuses: R <= S, S <= 8710, lead < 270, base without the swap, candidate pins, rollback already armed, malformed reset. Writes `manifest.json` |
 | `build.sh` | Clone base, `arm.py`, commit with fixed author and the base's dates, canonical container build, `RELEASE.txt`. **[v2]** The armed commit exists only in `<out>/src` |
 | `TABLETOP-R10.md` | **[v2]** The exercise, the findings, the decision points |
-| `LOCAL-BRAKE-DESIGN.md` | **[v2]** The node-local brake (not built) |
+| `LOCAL-BRAKE-DESIGN.md` | **[v2]** The node-local brake; **[v3]** built by agent 222: `bloch-pos run … --l2-brake-key <pk>`, signed file `l2-brake.json` + `.sig`, `bloch-pos l2-brake sign/check` |
 
 ## Before the December release ships (prerequisites) [v2]
 
@@ -78,6 +89,20 @@ sudo touch /etc/bloch-l2-attestor/PAUSE
 A3. If the brake exists (P5), engage it on every own RPC node first, then on own validators, with
 `claims_from_leaf_index` = the withdrawal count of the last block you believe honest (best guess now,
 refined in B3), `settlements` = true for G2a, `until_epoch` = now + 450. See `LOCAL-BRAKE-DESIGN.md`.
+**[v3]** Write `l2-brake.json` (exact keys: `version` 1, `chain_id` 700770, `claims_from_leaf_index`,
+`settlements`, `until_epoch`, `reason`), sign it once with the brake key, copy both files into each
+node's data dir. Each node must have been started with `--l2-brake-key <brake public key file>` (the
+file outside the data dir, root-owned); without the flag the brake is disabled. Confirm with
+`getmempoolinfo` → `l2_brake.state` = `on` on every own node. A file that does not verify is ignored
+(`state` = `refused`, a CRIT line every slot).
+
+```
+bloch-pos l2-brake sign --genesis <genesis.json> --brake l2-brake.json --key <brake.sk> --pubkey <brake.pk> --out l2-brake.json.sig
+```
+
+```
+bloch-pos l2-brake check --genesis <genesis.json> --brake l2-brake.json --sig l2-brake.json.sig --pubkey <brake.pk> --epoch <current epoch>
+```
 
 A4. Ask the bridge guardians to pause the Ethereum vault (no new USDC deposits into a frozen L2).
 
@@ -122,10 +147,10 @@ B4. Decision D1, the form:
 |---|---|---|
 | G1, G3, G4 | — | Rollback, no reset |
 | G2a | yes | Rollback with reset to N; keep claims ≥ C held (brake) until R |
-| G2a | no, fence or forfeit shipped | Rollback with reset to N (forfeit) or fence at N |
+| G2a | no, forfeit shipped (December release) | **[v3]** Rollback with the FORFEIT reset to N (`"forfeit": true`); the drain stops at R; the shortfall is what the forged claims released |
 | G2a | no, neither shipped | See "Reset impossible" |
 | G2b | yes | Rollback with reset to N (recommended), or no reset and continue on the off-rule state |
-| G2b | no | No reset; continue on the off-rule state; attestor package with an exception for N+1; decide the shortfall |
+| G2b | no | No reset; continue on the off-rule state; attestor package with an exception for N+1; decide the shortfall. Not the forfeit form: it would forget honest paid claims that the rebuild pays again |
 
 **Reset impossible (G2a, nothing shipped).** The forged root stays the newest record after R and
 keeps paying up to 10% of the escrow per window. Nobody but the author can settle a successor. Roll
@@ -133,7 +158,8 @@ back anyway (it removes the sparse guest, so no new forged settlements), and pub
 the L2 is frozen and the escrow exposed. Start the design of a second emergency fork with a fence
 at N. That needs its own 270-epoch lead.
 
-B5. For a reset: produce `reset.json` for N (P7). Without the tool, by hand: the commitment of block
+B5. For a reset: produce `reset.json` for N (P7). **[v3]** Add `"forfeit": true` only in the G2a
+forfeit row of D1; `arm.py` refuses any other value than a JSON boolean and defaults to `false`. Without the tool, by hand: the commitment of block
 N is in the follower's settlement log (`<status stem>.settlements.jsonl`, field `commitment`, entry
 `l2_number` = N) on **both** hosts, and must be equal. The 766-byte statement is the bytes after the
 33-byte header of the `0x13` transaction in the L1 block named by that entry's `native_block`.

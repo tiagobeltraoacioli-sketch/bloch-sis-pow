@@ -16,8 +16,11 @@ usage:
   arm.py --tree DIR --swap-epoch S --rollback-epoch R --publish-epoch P
          [--head-reset reset.json] [--min-lead 270] [--candidate-pins] [--manifest out.json]
 
-reset.json: {"number": N, "commitment": "<64 hex>", "statement": "<hex>" | null}
-(number 0 = L2 genesis: commitment all zero, statement null).
+reset.json: {"number": N, "commitment": "<64 hex>", "statement": "<hex>" | null,
+             "forfeit": false | true}
+(number 0 = L2 genesis: commitment all zero, statement null). "forfeit" (default false)
+is the G2a form: the reset applies even after claims of leaves beyond N, and forgets
+them; what they released is the escrow shortfall (agents/222-g2-fence.md).
 """
 import argparse, hashlib, json, re, sys
 from pathlib import Path
@@ -82,6 +85,13 @@ def main():
     if o.head_reset:
         reset = json.loads(o.head_reset.read_text())
         n, c, st = int(reset['number']), reset['commitment'].lower(), reset.get('statement')
+        unknown = set(reset) - {'number', 'commitment', 'statement', 'forfeit'}
+        if unknown:
+            die(f'unknown reset.json keys: {sorted(unknown)}')
+        forfeit = reset.get('forfeit', False)
+        if not isinstance(forfeit, bool):
+            die('forfeit must be a JSON boolean')
+        reset['forfeit'] = forfeit
         if not re.fullmatch(r'[0-9a-f]{64}', c):
             die('commitment must be 64 hex')
         if n == 0:
@@ -93,7 +103,7 @@ def main():
                 die('statement must be the 766-byte V3 statement as hex')
             st_rs = f'Some("{st.lower()}")'
         body = ', '.join(f'0x{c[i:i+2]}' for i in range(0, 64, 2))
-        rs = f'Some(HeadReset {{ number: {n}, commitment: [{body}], statement: {st_rs} }})'
+        rs = f'Some(HeadReset {{ number: {n}, commitment: [{body}], statement: {st_rs}, forfeit: {"true" if forfeit else "false"} }})'
         lt = lt[:m.start(1)] + rs + lt[m.end(1):]
 
     m = one(ht, r'^pub const RELEASE_ARMABLE: &\[&str\] = &\[\n((?:    "params::[A-Z0-9_]+",\n)+)\];$', 'RELEASE_ARMABLE')

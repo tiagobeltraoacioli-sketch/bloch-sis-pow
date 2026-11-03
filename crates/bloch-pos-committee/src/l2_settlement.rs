@@ -769,6 +769,33 @@ pub mod withdrawal {
         pub fn claims(&self) -> u64 {
             self.claims
         }
+        /// Forget every claim at or above `index` (a forfeit reset): those
+        /// leaves become claimable again, by whatever the new chain publishes
+        /// at their indices. Claims below `index` stay. Returns how many were
+        /// forgotten; `claims` drops by as much, so it keeps counting set bits.
+        pub(crate) fn forget_at_or_above(&mut self, index: u64) -> u64 {
+            let first = index / 256;
+            // Fully claimed words at or above `first` are stored again, so
+            // their high bits can be cleared one by one.
+            while self.floor > first {
+                self.floor -= 1;
+                self.words.insert(self.floor, [0xff; 32]);
+            }
+            let mut forgotten = 0u64;
+            for (word, bits) in self.words.range_mut(first..) {
+                for bit in 0..256u64 {
+                    let at = word.saturating_mul(256).saturating_add(bit);
+                    let mask = 1u8 << (bit % 8);
+                    if at >= index && bits[(bit / 8) as usize] & mask != 0 {
+                        bits[(bit / 8) as usize] &= !mask;
+                        forgotten += 1;
+                    }
+                }
+            }
+            self.words.retain(|_, bits| *bits != [0; 32]);
+            self.claims -= forgotten;
+            forgotten
+        }
         /// Whether any leaf at or above `index` is claimed.
         pub fn any_at_or_above(&self, index: u64) -> bool {
             if self.floor.saturating_mul(256) > index {
@@ -1648,6 +1675,17 @@ pub mod mainnet {
         pub commitment: [u8; 32],
         /// The accepted V3 statement of that block, as hex (`None` for the genesis).
         pub statement: Option<&'static str>,
+        /// FORFEIT form (G2a, an attacker drained forged leaves before the gate).
+        /// `false`: the reset refuses, and the head stays, once any leaf the
+        /// target did not publish was claimed. `true`: the reset applies anyway,
+        /// and the claims of those leaves are forgotten, so the new chain's
+        /// withdrawals at the same indices can be paid. What they released stays
+        /// released: the escrow is short by exactly that amount (the forfeit),
+        /// and the forged roots stop paying at the gate. Only for a tail whose
+        /// paid leaves are not re-published by the rebuild: an honest withdrawal
+        /// of a dropped block that was paid and is included again on the new
+        /// chain would be paid twice.
+        pub forfeit: bool,
     }
     /// `None`: the release ships no reset and the swap changes the program only.
     pub const HEAD_RESET: Option<HeadReset> = None;
@@ -2331,11 +2369,18 @@ impl State {
     /// Move the settled head back to `reset`: the inbox cursor returns to what
     /// that block had consumed, so its deposits mint again on the new chain, and
     /// withdrawal roots of later blocks are forgotten. Escrow, deposits, claims
-    /// and the release window stay. Returns whether it applied.
+    /// and the release window stay. The target's own withdrawal root stays
+    /// claimable: if retention already pruned its record (a reset days after the
+    /// tail, whose newer records displaced it), it is recorded again at the
+    /// current height, so honest leaves wait one delay and do not wait for the
+    /// next settlement. Returns whether it applied.
     ///
-    /// It does nothing when the head is not above the target, when the statement
-    /// is malformed, or when a leaf the target did not publish was already paid:
-    /// the rollback would then credit on L2 what already left the escrow.
+    /// It does nothing when the head is not above the target, when the
+    /// statement is malformed, or when its withdrawal tree contradicts the
+    /// retained records or the head's tree. When a leaf the target did not publish was already
+    /// paid, the rollback would credit on L2 what already left the escrow: a
+    /// plain reset then does nothing, and a FORFEIT reset applies and forgets
+    /// those claims ([`mainnet::HeadReset::forfeit`]).
     pub(crate) fn reset_head(&mut self, reset: &mainnet::HeadReset) -> bool {
         if self.settled_number() <= reset.number {
             return false;
@@ -2355,8 +2400,17 @@ impl State {
             }
             None => return false,
         };
-        let (_, count) = withdrawal::tree_after(head.as_ref().map(|(_, s): &([u8; 32], Vec<u8>)| s.as_slice()));
-        if self.claimed.any_at_or_above(count) || consumed > self.inbox.len() as u64 {
+        let (root, count) = withdrawal::tree_after(head.as_ref().map(|(_, s): &([u8; 32], Vec<u8>)| s.as_slice()));
+        // The target's tree is recorded again below, so it must not contradict
+        // what L1 accepted: the tail only extends it, and a retained record at or
+        // below the target never has more leaves, nor another root at the same count.
+        if count > self.withdrawal_head().1
+            || self.withdrawals.iter().any(|r| r.l2_number <= reset.number && (r.count > count || (r.count == count && r.root != root)))
+        {
+            return false;
+        }
+        let paid_beyond = self.claimed.any_at_or_above(count);
+        if (paid_beyond && !reset.forfeit) || consumed > self.inbox.len() as u64 {
             return false;
         }
         // Forced records consumed after the target go back into the queue, as
@@ -2371,6 +2425,14 @@ impl State {
         self.head = head;
         self.consumed = consumed;
         self.withdrawals.retain(|r| r.l2_number <= reset.number);
+        // Records are added only when the count grows, so the target's tree is
+        // the newest retained record exactly when retention did not prune it.
+        if count > 0 && self.withdrawals.last().map(|r| (r.root, r.count)) != Some((root, count)) {
+            self.withdrawals.push(withdrawal::Record { l2_number: reset.number, root, count, height: self.native_height });
+        }
+        if paid_beyond {
+            self.claimed.forget_at_or_above(count);
+        }
         true
     }
     fn replace_program(&mut self, next: &mainnet::NextProgram) {
@@ -2391,6 +2453,12 @@ impl State {
     #[cfg(test)]
     pub(crate) fn claimed_insert_for_test(&mut self, index: u64) {
         self.claimed.insert(index);
+    }
+    /// Test hook: release `sats` of escrow without a claim (conservation kept).
+    #[cfg(test)]
+    pub(crate) fn released_for_test(&mut self, sats: u64) {
+        self.escrow_sat -= u128::from(sats);
+        self.released_sat += u128::from(sats);
     }
     /// Test hook: install an accepted head without a settlement.
     #[cfg(test)]
@@ -2688,7 +2756,10 @@ impl State {
             }
         }
         // Absent until the first claim, so states without claims keep their bytes.
-        if self.claimed.claims() != 0 {
+        // A forfeit reset can forget every claim while releases stay, so the
+        // section also stays while anything was released (before a forfeit the
+        // two conditions are the same: every release is a claim).
+        if self.claimed.claims() != 0 || self.released_sat != 0 {
             out.extend_from_slice(b"BLOCH:NATIVE:L2:CLAIM-STATE:1");
             out.extend_from_slice(&self.released_sat.to_le_bytes());
             self.claimed.encode(&mut out);

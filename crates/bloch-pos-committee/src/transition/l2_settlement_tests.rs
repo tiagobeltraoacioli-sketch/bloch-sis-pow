@@ -3212,7 +3212,7 @@ mod l2_tests {
         let mut l2 = state_with_bad_tail();
         l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
         let keep = statement_at(&l2, 3, [0xaa; 32], 2);
-        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)) };
+        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)), forfeit: false };
 
         let mut applied = l2.clone();
         applied.install_fallback_with_for_test(&reset);
@@ -3304,7 +3304,7 @@ mod l2_tests {
         let mut l2 = state_with_bad_tail();
         let escrow = l2.escrow_sat();
         let keep = statement_at(&l2, 3, [0xaa; 32], 2);
-        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)) };
+        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)), forfeit: false };
         assert!(l2.reset_head(&reset));
         assert_eq!(l2.head().unwrap(), ([3; 32], keep));
         assert_eq!(l2.settled_number(), 3);
@@ -3319,7 +3319,7 @@ mod l2_tests {
     #[test]
     fn head_reset_to_the_genesis_clears_the_head() {
         let mut l2 = state_with_bad_tail();
-        assert!(l2.reset_head(&mainnet::HeadReset { number: 0, commitment: [0; 32], statement: None }));
+        assert!(l2.reset_head(&mainnet::HeadReset { number: 0, commitment: [0; 32], statement: None, forfeit: false }));
         assert_eq!(l2.head(), None);
         assert_eq!((l2.settled_number(), l2.consumed()), (0, 0));
         assert!(l2.withdrawal_roots().is_empty());
@@ -3329,7 +3329,7 @@ mod l2_tests {
     fn head_reset_refuses_to_forget_a_paid_leaf() {
         let mut l2 = state_with_bad_tail();
         let keep = statement_at(&l2, 3, [0xaa; 32], 2);
-        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)) };
+        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)), forfeit: false };
         // Leaf 1 is inside the target's tree: paid, and still published after the reset.
         let mut inside = l2.clone();
         inside.claimed_insert_for_test(1);
@@ -3348,7 +3348,7 @@ mod l2_tests {
         let refused = |statement: Option<&'static str>, number: u64| {
             let mut copy = l2.clone();
             let before = copy.clone();
-            assert!(!copy.reset_head(&mainnet::HeadReset { number, commitment: [3; 32], statement }));
+            assert!(!copy.reset_head(&mainnet::HeadReset { number, commitment: [3; 32], statement, forfeit: false }));
             assert_eq!(copy, before);
         };
         refused(None, 3);
@@ -3361,6 +3361,237 @@ mod l2_tests {
         refused(Some(leaked_hex(&statement_at(&l2, 7, [0xbb; 32], 5))), 7);
     }
 
+    // ── G2 forfeit reset (agent 222; inert: ROLLBACK_HEAD_RESET ships None) ──
+
+    fn bitmap_consistent(b: &wd::ClaimBitmap) -> bool {
+        let stored: u64 = b.words().map(|(_, bits)| bits.iter().map(|x| u64::from(x.count_ones())).sum::<u64>()).sum();
+        b.words().all(|(w, bits)| w >= b.floor() && *bits != [0; 32]) && b.floor() * 256 + stored == b.claims()
+    }
+
+    #[test]
+    fn claim_bitmap_forgets_from_an_index_through_the_floor() {
+        let mut b = wd::ClaimBitmap::default();
+        for i in 0..600 {
+            assert!(b.insert(i));
+        }
+        assert_eq!((b.floor(), b.stored_words(), b.claims()), (2, 1, 600));
+        // Above everything: nothing to forget.
+        assert_eq!(b.forget_at_or_above(600), 0);
+        assert_eq!(b.claims(), 600);
+        // From inside a fully claimed word: the floor comes back down.
+        assert_eq!(b.forget_at_or_above(300), 300);
+        assert!(b.contains(299) && !b.contains(300) && !b.contains(511) && !b.contains(599));
+        assert_eq!((b.floor(), b.stored_words(), b.claims()), (1, 1, 300));
+        assert!(bitmap_consistent(&b));
+        assert!(!b.any_at_or_above(300) && b.any_at_or_above(299));
+        // The forgotten indices can be claimed once more, and only once.
+        assert!(b.insert(300) && !b.insert(300));
+        assert_eq!(b.claims(), 301);
+        // On a word boundary, and from zero.
+        assert_eq!(b.forget_at_or_above(256), 45);
+        assert_eq!((b.floor(), b.stored_words(), b.claims()), (1, 0, 256));
+        assert!(bitmap_consistent(&b));
+        assert_eq!(b.forget_at_or_above(0), 256);
+        assert_eq!((b.floor(), b.stored_words(), b.claims()), (0, 0, 0));
+        // Sparse claims far above the floor.
+        let mut s = wd::ClaimBitmap::default();
+        for i in [3u64, 700, 70_000, 1 << 31] {
+            s.insert(i);
+        }
+        assert_eq!(s.forget_at_or_above(701), 2);
+        assert!(s.contains(3) && s.contains(700) && !s.contains(70_000) && !s.contains(1 << 31));
+        assert!(bitmap_consistent(&s));
+    }
+
+    fn forfeit_reset(keep: &[u8]) -> mainnet::HeadReset {
+        mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(keep)), forfeit: true }
+    }
+
+    #[test]
+    fn a_forfeit_reset_applies_over_paid_tail_leaves_and_forgets_only_them() {
+        let mut l2 = state_with_bad_tail();
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        // Leaf 1 (inside the target's tree) and leaves 2 and 4 (only in the tail) were paid.
+        for i in [1, 2, 4] {
+            l2.claimed_insert_for_test(i);
+        }
+        let plain = mainnet::HeadReset { forfeit: false, ..forfeit_reset(&keep) };
+        let before = l2.clone();
+        assert!(!l2.reset_head(&plain), "the plain form still refuses");
+        assert_eq!(l2, before);
+        assert!(l2.reset_head(&forfeit_reset(&keep)));
+        assert_eq!((l2.settled_number(), l2.consumed()), (3, 3));
+        assert_eq!(l2.withdrawal_head(), ([0xaa; 32], 2));
+        assert_eq!(l2.withdrawal_roots().iter().map(|r| r.l2_number).collect::<Vec<_>>(), [2], "the tail's roots stop paying");
+        let claimed = l2.claimed();
+        assert!(claimed.contains(1) && !claimed.contains(2) && !claimed.contains(4));
+        assert_eq!(claimed.claims(), 1);
+        assert!(!claimed.any_at_or_above(2) && bitmap_consistent(claimed));
+        assert_eq!(l2.escrow_sat(), before.escrow_sat(), "what the tail released stays released");
+        assert!(l2.escrow_conserved());
+        assert!(!l2.reset_head(&forfeit_reset(&keep)), "it runs once: the head is no longer above the target");
+    }
+
+    #[test]
+    fn a_forfeit_reset_without_paid_tail_leaves_is_the_plain_reset() {
+        let l2 = state_with_bad_tail();
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let (mut plain, mut forfeit) = (l2.clone(), l2.clone());
+        assert!(plain.reset_head(&mainnet::HeadReset { forfeit: false, ..forfeit_reset(&keep) }));
+        assert!(forfeit.reset_head(&forfeit_reset(&keep)));
+        assert_eq!(plain, forfeit);
+        // Malformed or foreign statements are refused in the forfeit form too.
+        let mut copy = l2.clone();
+        let other = statement_at(&l2, 4, [0xaa; 32], 2);
+        assert!(!copy.reset_head(&mainnet::HeadReset { number: 3, ..forfeit_reset(&other) }));
+        assert_eq!(copy, l2);
+    }
+
+    /// Retention pruned the target's record long before the gate (a 4-day lead
+    /// against 2 880 retained blocks): the reset records the target's root again,
+    /// so honest leaves pay one delay after the gate instead of never.
+    #[test]
+    fn a_reset_republishes_the_target_root_when_retention_pruned_it() {
+        let mut l2 = mainnet_l2_state();
+        for i in 0..8u32 {
+            l2.append_deposit(crate::l2_settlement::InboxRecord {
+                height: 1, tx_index: i, txid: [0x77; 32], vout: 1, sats: 10 * BLCH, recipient: [0x42; 20],
+            })
+            .unwrap();
+        }
+        l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: [0xaa; 32], count: 2, height: 1 });
+        l2.insert_withdrawal_record(wd::Record { l2_number: 6, root: [0xbb; 32], count: 5, height: 2 });
+        let retention = mainnet::LIMITS.retention_blocks;
+        while l2.height() < 2 + retention + 10 {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(l2.withdrawal_roots().iter().map(|r| r.l2_number).collect::<Vec<_>>(), [6], "only the newest old record is kept");
+        l2.set_head_for_test([7; 32], statement_at(&l2, 7, [0xbb; 32], 5), 7);
+        l2.claimed_insert_for_test(4);
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let now = l2.height();
+        assert!(l2.reset_head(&forfeit_reset(&keep)));
+        assert_eq!(l2.withdrawal_roots(), &[wd::Record { l2_number: 3, root: [0xaa; 32], count: 2, height: now }]);
+        assert_eq!(l2.matured_withdrawals(), None, "a new delay starts at the gate");
+        for _ in 0..mainnet::LIMITS.delay_blocks {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(l2.matured_count(), 2);
+        // The genesis target publishes nothing to keep.
+        let mut genesis = mainnet_l2_state();
+        genesis.insert_withdrawal_record(wd::Record { l2_number: 6, root: [0xbb; 32], count: 5, height: 1 });
+        genesis.set_head_for_test([7; 32], statement_at(&genesis, 7, [0xbb; 32], 5), 0);
+        genesis.claimed_insert_for_test(0);
+        assert!(genesis.reset_head(&mainnet::HeadReset { number: 0, commitment: [0; 32], statement: None, forfeit: true }));
+        assert!(genesis.withdrawal_roots().is_empty() && genesis.claimed().claims() == 0);
+    }
+
+    /// The reset records the target's root again, so a reset whose tree
+    /// contradicts what L1 accepted is refused in both forms.
+    #[test]
+    fn a_reset_whose_tree_contradicts_the_retained_records_is_refused() {
+        let l2 = state_with_bad_tail();
+        for forfeit in [false, true] {
+            let refused = |root: [u8; 32], count: u64, number: u64| {
+                let mut copy = l2.clone();
+                let keep = statement_at(&l2, number, root, count);
+                let reset = mainnet::HeadReset { number, commitment: [3; 32], statement: Some(leaked_hex(&keep)), forfeit };
+                assert!(!copy.reset_head(&reset), "{root:?} {count} {number}");
+                assert_eq!(copy, l2);
+            };
+            refused([0xcc; 32], 2, 3); // another root at the retained count 2
+            refused([0xcc; 32], 1, 3); // fewer leaves than a retained record at or below N
+            refused([0xcc; 32], 6, 6); // more leaves than the head's tree
+        }
+    }
+
+    /// Every claim forgotten while sats stay released: the claim section stays
+    /// committed, so the release accounting is still bound by the state root.
+    #[test]
+    fn a_forfeit_that_forgets_every_claim_keeps_the_release_accounting_committed() {
+        let mut l2 = state_with_bad_tail();
+        l2.claimed_insert_for_test(4);
+        l2.released_for_test(10 * BLCH);
+        let marker: &[u8] = b"BLOCH:NATIVE:L2:CLAIM-STATE:1";
+        assert!(l2.committed_bytes().windows(marker.len()).any(|w| w == marker));
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        assert!(l2.reset_head(&forfeit_reset(&keep)));
+        assert_eq!(l2.claimed().claims(), 0);
+        assert!(l2.committed_bytes().windows(marker.len()).any(|w| w == marker));
+        let mut other = l2.clone();
+        other.released_for_test(1);
+        assert_ne!(l2.committed_bytes(), other.committed_bytes());
+    }
+
+    #[test]
+    fn a_forfeit_rollback_moves_the_head_where_the_plain_one_could_not() {
+        let mut l2 = state_with_bad_tail();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        l2.claimed_insert_for_test(4);
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let mut plain = l2.clone();
+        plain.install_fallback_with_for_test(&mainnet::HeadReset { forfeit: false, ..forfeit_reset(&keep) });
+        assert_eq!((program_of(&plain), plain.settled_number()), (mainnet::PROGRAM_FALLBACK.identities, 7));
+        let mut forfeit = l2.clone();
+        forfeit.install_fallback_with_for_test(&forfeit_reset(&keep));
+        assert_eq!((program_of(&forfeit), forfeit.settled_number()), (mainnet::PROGRAM_FALLBACK.identities, 3));
+        assert!(!forfeit.claimed().contains(4) && forfeit.escrow_conserved());
+    }
+
+    #[test]
+    fn the_forfeit_form_ships_unused() {
+        assert_eq!(mainnet::HEAD_RESET, None);
+        // Only an emergency release armed through the kit (arm.py) fills it.
+        if crate::params::L2_PROGRAM_ROLLBACK_EPOCH == u64::MAX {
+            assert_eq!(mainnet::ROLLBACK_HEAD_RESET, None);
+        }
+    }
+
+    /// End to end on a development L2: a forged root pays one small claim, the
+    /// forfeit reset forgets it, the forged proof no longer folds to a retained
+    /// root, and the new chain's own leaf at the same index is claimable.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn after_a_forfeit_reset_the_forged_leaf_is_dead_and_its_index_pays_the_new_chain() {
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let mut pre = attested_fixture(&honest, true);
+        let forged = [honest[0], honest[1], ([0xee; 32], 9 * BLCH)];
+        let tree = |leaves: &[([u8; 32], u64)]| -> Vec<[u8; 32]> {
+            leaves.iter().enumerate().map(|(i, (r, s))| wd::leaf(700771, i as u64, r, *s)).collect()
+        };
+        {
+            let l2 = pre.l2_settlement.as_mut().unwrap();
+            l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: wd::root(&tree(&forged)), count: 3, height: 2 });
+            let bad = statement_at(l2, 2, wd::root(&tree(&forged)), 3);
+            l2.set_head_for_test([2; 32], bad, 1);
+        }
+        let post = try_claim(&pre, &claim_of(&pre, &forged, 2, None)).expect("the forged small claim pays");
+        let mut l2 = post.l2_settlement().unwrap().clone();
+        assert!(l2.claimed().contains(2));
+        assert_eq!(l2.released_sat(), u128::from(9 * BLCH));
+        let keep = statement_at(&l2, 1, wd::root(&tree(&honest)), 2);
+        let reset = mainnet::HeadReset { number: 1, commitment: [1; 32], statement: Some(leaked_hex(&keep)), forfeit: true };
+        assert!(!l2.clone().reset_head(&mainnet::HeadReset { forfeit: false, ..reset }));
+        assert!(l2.reset_head(&reset));
+        assert!(!l2.claimed().contains(2) && l2.escrow_conserved());
+        assert_eq!(l2.released_sat(), u128::from(9 * BLCH), "the forfeit: released and gone");
+        let (r, s) = forged[2];
+        let siblings = wd::proof(&tree(&forged), 2).unwrap();
+        assert_eq!(l2.check_claim(700771, 2, &r, s, &siblings, false), Err(wd::ClaimRefusal::Proof));
+        // The honest leaves of the target still pay.
+        let (r0, s0) = honest[0];
+        assert!(l2.check_claim(700771, 0, &r0, s0, &wd::proof(&tree(&honest), 0).unwrap(), false).is_ok());
+        // The new chain publishes its own leaf 2; once matured it pays.
+        let new = [honest[0], honest[1], ([0x55; 32], 3 * BLCH)];
+        let at = l2.height() + 1;
+        l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: wd::root(&tree(&new)), count: 3, height: at });
+        for _ in 0..wd::WITHDRAW_DELAY_BLOCKS + 1 {
+            l2.advance_height().unwrap();
+        }
+        let (r2, s2) = new[2];
+        assert!(l2.check_claim(700771, 2, &r2, s2, &wd::proof(&tree(&new), 2).unwrap(), false).is_ok());
+    }
+
     #[test]
     fn a_reset_head_takes_the_next_settlement_under_the_new_program() {
         let (pre, mut chains) = fixture();
@@ -3371,7 +3602,7 @@ mod l2_tests {
         let mut settled = t.apply_block(&pre, &block, &[], std::slice::from_ref(&first)).unwrap();
         let mut l2 = settled.l2_settlement().unwrap().clone();
         assert_eq!(l2.settled_number(), 1);
-        assert!(l2.reset_head(&mainnet::HeadReset { number: 0, commitment: [0; 32], statement: None }));
+        assert!(l2.reset_head(&mainnet::HeadReset { number: 0, commitment: [0; 32], statement: None, forfeit: false }));
         l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
         settled.l2_settlement = Some(l2);
         // The successor of the genesis is accepted again, and only it.
