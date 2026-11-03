@@ -2138,11 +2138,51 @@ fn l2_forced_json_reports_the_queue_and_the_next_surcharge() {
     let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(
         keys,
-        ["queued", "consumed", "pending", "pending_weight", "max_pending_weight", "root", "due", "due_hash", "next_surcharge_sat"]
+        [
+            "queued", "consumed", "pending", "pending_weight", "max_pending_weight", "root", "due", "due_hash",
+            "next_surcharge_sat", "transfer_surcharge_sat", "max_gas_surcharge_sat", "drain_settlements", "treasury",
+        ]
     );
     let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
     assert_eq!(get("due"), Json::Arr(vec![]));
     assert_eq!(get("due_hash"), Json::hex(&forced::hash(&[])));
     assert_eq!(get("next_surcharge_sat"), Json::sat(1_000));
+    assert_eq!(get("transfer_surcharge_sat"), Json::sat(1_000));
+    assert_eq!(get("max_gas_surcharge_sat"), Json::sat(14_000));
+    assert_eq!(get("drain_settlements"), Json::u(0));
+    // TBD-owner: no treasury is compiled, so forced inclusion cannot be enabled.
+    assert_eq!(get("treasury"), Json::Null);
+    assert_eq!(bloch_pos_committee::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY, None);
     assert_eq!(bloch_pos_committee::params::L2_FORCED_INCLUSION_EPOCH, u64::MAX);
+}
+
+/// Each due record carries its L2 envelope, read from its L1 block, in the
+/// exact shape producers and settlers consume; bytes that do not hash to the
+/// record, or an unreadable block, give `null`.
+#[test]
+fn l2_forced_due_records_carry_their_envelope() {
+    use bloch_pos_committee::l2_settlement::forced;
+    use sha3::{Digest, Keccak256};
+    let envelope = vec![0x02, 0xf8, 0x6c, 0x01];
+    let record = forced::Record {
+        height: 9,
+        l1_txid: [0x1c; 32],
+        envelope_hash: Keccak256::digest(&envelope).into(),
+        gas_limit: 21_000,
+    };
+    let lookup = |height: u64, txid: &[u8; 32]| (height == 9 && *txid == [0x1c; 32]).then(|| envelope.clone());
+    let json = l2_forced_record_json(&record, &lookup);
+    let Json::Obj(fields) = &json else { panic!("not an object") };
+    let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, ["height", "l1_txid", "envelope_hash", "gas_limit", "envelope"]);
+    let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
+    assert_eq!(get("height"), Json::u(9));
+    assert_eq!(get("envelope"), Json::s("02f86c01".to_string()));
+    // Not found, or bytes of another envelope: null.
+    let missing = l2_forced_record_json(&record, &|_, _| None);
+    let wrong = l2_forced_record_json(&record, &|_, _| Some(vec![0x02]));
+    for json in [missing, wrong] {
+        let Json::Obj(fields) = json else { panic!("not an object") };
+        assert_eq!(fields.iter().find(|(n, _)| n == "envelope").map(|(_, v)| v.clone()), Some(Json::Null));
+    }
 }

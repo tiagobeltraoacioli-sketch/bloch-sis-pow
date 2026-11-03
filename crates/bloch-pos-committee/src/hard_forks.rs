@@ -181,8 +181,64 @@ pub const fn l2_da_reserved_slot_may_arm(epoch: u64, key: Option<[u8; 32]>) -> b
 /// Forced inclusion needs a guest that executes the queue, so it is armed only
 /// with a listed configuration, and never before the program swap that brings
 /// that guest (the same epoch is allowed: the swap runs first in `close_epoch`).
+///
+/// It also needs, from this build's compiled values (review 164 R1 and the
+/// revenue rule of 2026-11-02 22:30):
+/// * [`PROGRAM_FALLBACK`]'s configuration listed as well, so that the rollback,
+///   an emergency lever, can always be armed without halting the L2 on a due
+///   record its guest cannot prove (the fallback is rebuilt with the rule
+///   before forced inclusion ships);
+/// * the protocol treasury set, which receives every charged surcharge.
+///
+/// [`PROGRAM_FALLBACK`]: crate::l2_settlement::mainnet::PROGRAM_FALLBACK
 pub const fn l2_forced_inclusion_may_arm(forced: u64, next: u64, configured: bool) -> bool {
-    !armed(forced) || (configured && armed(next) && forced >= next)
+    l2_forced_inclusion_may_arm_with(
+        forced,
+        next,
+        configured,
+        listed(
+            crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS,
+            &crate::l2_settlement::mainnet::PROGRAM_FALLBACK.identities[0],
+        ),
+        crate::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY.is_some(),
+    )
+}
+
+/// [`l2_forced_inclusion_may_arm`] with every input explicit.
+pub const fn l2_forced_inclusion_may_arm_with(
+    forced: u64,
+    next: u64,
+    configured: bool,
+    fallback_listed: bool,
+    treasury_set: bool,
+) -> bool {
+    !armed(forced) || (configured && fallback_listed && treasury_set && armed(next) && forced >= next)
+}
+
+/// A rollback must reinstate a program that can consume the forced queue: with
+/// forced inclusion armed, an armed rollback needs [`PROGRAM_FALLBACK`]'s
+/// configuration listed as implementing it. Otherwise every settlement after
+/// the rollback would be refused while a record is due, which halts the L2.
+///
+/// [`PROGRAM_FALLBACK`]: crate::l2_settlement::mainnet::PROGRAM_FALLBACK
+pub const fn l2_forced_rollback_may_arm(forced: u64, rollback: u64, fallback_listed: bool) -> bool {
+    !armed(forced) || !armed(rollback) || fallback_listed
+}
+
+/// Whether `configuration` is in `list` (const).
+pub const fn listed(list: &[[u8; 32]], configuration: &[u8; 32]) -> bool {
+    let mut i = 0;
+    while i < list.len() {
+        let mut j = 0;
+        while j < 32 && list[i][j] == configuration[j] {
+            j += 1;
+        }
+        if j == 32 {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// The L2 protocol fee is inert, or it has a treasury (a real script hash, not
@@ -279,7 +335,19 @@ const _: () = assert!(l2_da_reserved_slot_may_arm(
 const _: () = assert!(l2_forced_inclusion_may_arm(
     params::L2_FORCED_INCLUSION_EPOCH,
     params::L2_NEXT_PROGRAM_EPOCH,
-    !crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS.is_empty(),
+    listed(
+        crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS,
+        &crate::l2_settlement::mainnet::PROGRAM_NEXT.identities[0],
+    ),
+));
+#[cfg(not(feature = "l2-activation-rehearsal"))]
+const _: () = assert!(l2_forced_rollback_may_arm(
+    params::L2_FORCED_INCLUSION_EPOCH,
+    params::L2_PROGRAM_ROLLBACK_EPOCH,
+    listed(
+        crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS,
+        &crate::l2_settlement::mainnet::PROGRAM_FALLBACK.identities[0],
+    ),
 ));
 const _: () = assert!(l2_revenue_may_arm(
     params::L2_REVENUE_EPOCH,
@@ -400,18 +468,50 @@ mod tests {
         assert!(!g.armed() && !g.node_policy_only);
         assert!(!RELEASE_ARMABLE.contains(&"params::L2_FORCED_INCLUSION_EPOCH"));
         assert_eq!(params::L2_FORCED_INCLUSION_EPOCH, M);
-        assert!(crate::l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS.is_empty());
+        // It rides with the swap.
+        assert_eq!(params::L2_FORCED_INCLUSION_EPOCH, params::L2_NEXT_PROGRAM_EPOCH);
+        // A listed configuration is always the next program's: no other guest
+        // could publish the inbox hash at the swap.
+        use crate::l2_settlement::mainnet::{FORCED_INCLUSION_CONFIGURATIONS as LIST, PROGRAM_FALLBACK, PROGRAM_NEXT};
+        assert!(LIST.iter().all(|c| *c == PROGRAM_NEXT.identities[0]), "only the next configuration may be listed");
+        assert!(LIST.len() <= 1);
+        assert!(listed(&[[1; 32], [2; 32]], &[2; 32]) && !listed(&[[1; 32]], &[2; 32]) && !listed(&[], &[2; 32]));
+        // The rollback rule: an armed rollback under armed forced inclusion
+        // needs a listed fallback configuration.
+        assert!(l2_forced_rollback_may_arm(M, M, false));
+        assert!(l2_forced_rollback_may_arm(10_060, M, false));
+        assert!(l2_forced_rollback_may_arm(M, 10_100, false));
+        assert!(!l2_forced_rollback_may_arm(10_060, 10_100, false));
+        assert!(l2_forced_rollback_may_arm(10_060, 10_100, true));
+        // The fallback either has the next configuration, or is the next rules
+        // without forced inclusion and then unlisted: in that case no release
+        // may arm a rollback together with forced inclusion.
+        let fallback_listed = listed(LIST, &PROGRAM_FALLBACK.identities[0]);
+        if PROGRAM_FALLBACK.identities[0] != PROGRAM_NEXT.identities[0] {
+            assert!(listed(LIST, &PROGRAM_NEXT.identities[0]) && !fallback_listed);
+            assert!(!l2_forced_rollback_may_arm(10_060, 10_100, fallback_listed));
+        }
+        assert!(l2_forced_rollback_may_arm(params::L2_FORCED_INCLUSION_EPOCH, params::L2_PROGRAM_ROLLBACK_EPOCH, fallback_listed));
         // Inert is always coherent.
-        assert!(l2_forced_inclusion_may_arm(M, M, false));
-        assert!(l2_forced_inclusion_may_arm(M, 10_060, true));
+        let may = l2_forced_inclusion_may_arm_with;
+        assert!(may(M, M, false, false, false));
+        assert!(may(M, 10_060, true, false, false));
         // No listed guest: refused, whatever the swap.
-        assert!(!l2_forced_inclusion_may_arm(10_060, 10_060, false));
+        assert!(!may(10_060, 10_060, false, true, true));
         // No swap, or a gate before the swap: refused.
-        assert!(!l2_forced_inclusion_may_arm(10_060, M, true));
-        assert!(!l2_forced_inclusion_may_arm(10_059, 10_060, true));
-        // At or after the swap with a listed guest: allowed.
-        assert!(l2_forced_inclusion_may_arm(10_060, 10_060, true));
-        assert!(l2_forced_inclusion_may_arm(11_320, 10_060, true));
+        assert!(!may(10_060, M, true, true, true));
+        assert!(!may(10_059, 10_060, true, true, true));
+        // An unlisted fallback (review 164 R1) or no treasury: refused.
+        assert!(!may(10_060, 10_060, true, false, true));
+        assert!(!may(10_060, 10_060, true, true, false));
+        // At or after the swap with listed guests and a treasury: allowed.
+        assert!(may(10_060, 10_060, true, true, true));
+        assert!(may(11_320, 10_060, true, true, true));
+        // The compiled rule reads this build's values: today the fallback is
+        // unlisted and the treasury is TBD-owner, so nothing may arm.
+        assert_eq!(crate::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY, None);
+        assert!(!l2_forced_inclusion_may_arm(10_060, 10_060, true));
+        assert!(l2_forced_inclusion_may_arm(M, 10_060, true));
     }
 
     #[test]

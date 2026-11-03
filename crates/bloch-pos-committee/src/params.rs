@@ -2747,7 +2747,10 @@ pub const L2_PROGRAM_ROLLBACK_EPOCH: u64 = u64::MAX;
 /// whose program implements it. `u64::MAX` means INERT. It cannot be armed while
 /// `l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS` is empty, nor
 /// before `L2_NEXT_PROGRAM_EPOCH` (`hard_forks::l2_forced_inclusion_may_arm`).
-pub const L2_FORCED_INCLUSION_EPOCH: u64 = u64::MAX;
+/// It rides with the program swap: the guest that implements it is the next
+/// program, so the two gates are one boundary (the swap runs first in
+/// `close_epoch`). A rehearsal forced build may still set a literal epoch.
+pub const L2_FORCED_INCLUSION_EPOCH: u64 = L2_NEXT_PROGRAM_EPOCH;
 
 pub(crate) fn l2_forced_inclusion_active(epoch: u64) -> bool {
     #[cfg(test)]

@@ -6239,6 +6239,31 @@ impl Engine {
         self.blocks.get(id).map(Cow::Borrowed)
     }
 
+    /// The L2 envelope of the forced transaction `txid` in the canonical block
+    /// at native `height` (`getl2settlement.forced.due[].envelope`).
+    /// The envelope of the forced record queued at L2-registry `height` with `txid`.
+    /// A record's height counts the blocks applied since the L2 registry was installed
+    /// (as `InboxRecord::height` does), which equals the chain height only on a network
+    /// with the L2 at genesis, so the canonical index is `height` plus the registry's
+    /// offset (head height minus the committed L2 height). Neighbouring blocks are also
+    /// tried; a miss is `None`, never a guess.
+    fn forced_envelope(&self, height: u64, txid: &[u8; 32]) -> Option<Vec<u8>> {
+        let l2_height = self.state.l2_settlement()?.height();
+        let offset = self.head_height().checked_sub(l2_height)?;
+        let index = height.checked_add(offset)?;
+        [index, index.wrapping_sub(1), index + 1, height].into_iter().find_map(|at| {
+            let (_, id) = self.chain.get(usize::try_from(at).ok()?)?;
+            let env = self.envelope_by_id(id.as_bytes())?;
+            body_transactions(&env).ok()?.into_iter().find_map(|tx| {
+                let id = tx.txid();
+                match tx {
+                    PosTransaction::L2ForcedTransaction(forced) if id == *txid => Some(forced.envelope),
+                    _ => None,
+                }
+            })
+        })
+    }
+
     fn block_reply(&self, env: &BlockEnvelope) -> Json {
         let id = *env.block_id().as_bytes();
         let canonical = self.canonical.contains(&id);
@@ -6430,7 +6455,11 @@ impl Engine {
 
             // Identity of the binary, not of the chain: no state read, no
             // lock taken, constant cost at any height.
-            RpcRequest::L2Settlement => Ok(rpc::l2_settlement_json(&self.state)),
+            // Reads at most the blocks of the due forced records, and only
+            // once forced inclusion is enabled.
+            RpcRequest::L2Settlement => Ok(rpc::l2_settlement_json_with(&self.state, &|height, txid| {
+                self.forced_envelope(height, txid)
+            })),
             RpcRequest::Kes => Ok(rpc::kes_json(&self.state)),
             RpcRequest::BlockRaw(id) => {
                 let env = self.envelope_by_id(&id).ok_or_else(|| RpcError::new(rpc::BLOCK_NOT_FOUND, "unknown block"))?;

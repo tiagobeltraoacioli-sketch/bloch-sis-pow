@@ -2960,7 +2960,12 @@ mod l2_tests {
             assert!(gate > crate::params::L2_NEXT_PROGRAM_EPOCH && crate::params::L2_NEXT_PROGRAM_EPOCH != u64::MAX);
         }
         let (next, fallback, pinned) = (mainnet::PROGRAM_NEXT, mainnet::PROGRAM_FALLBACK, mainnet::PROGRAM.unwrap());
-        assert_eq!(next.identities[0], fallback.identities[0], "same rules");
+        // Same rules, or the next rules without forced inclusion only: the next
+        // configuration is then listed for forced inclusion and the fallback's
+        // is not (no rollback can then be armed with forced inclusion).
+        let forced_only = mainnet::FORCED_INCLUSION_CONFIGURATIONS.contains(&next.identities[0])
+            && !mainnet::FORCED_INCLUSION_CONFIGURATIONS.contains(&fallback.identities[0]);
+        assert!(next.identities[0] == fallback.identities[0] || forced_only, "same rules");
         assert_eq!(next.proof_policy, fallback.proof_policy);
         for i in 1..4 {
             assert_ne!(next.identities[i], fallback.identities[i], "another guest");
@@ -3009,7 +3014,11 @@ mod l2_tests {
         assert_eq!(program_of(l2), mainnet::PROGRAM_FALLBACK.identities);
         let (old, new) = (swapped.l2_settlement().unwrap().policy(), l2.policy());
         assert_eq!(new.identities[..3], old.identities[..3]);
-        assert_eq!(new.identities[3], old.identities[3], "the rules stay");
+        // The rules stay: the configuration is the fallback's, which is the next
+        // one (or the next one without forced inclusion, see above).
+        assert_eq!(new.identities[3], mainnet::PROGRAM_FALLBACK.identities[0]);
+        assert!(old.identities[3] == new.identities[3] || mainnet::FORCED_INCLUSION_CONFIGURATIONS.contains(&old.identities[3]));
+        assert!(l2.next_program_active(), "the rules stay");
         assert_eq!(
             (new.proof_policy, new.chain_id, new.initial_l2_parent, new.initial_l2_state, new.attestor_set),
             (old.proof_policy, old.chain_id, old.initial_l2_parent, old.initial_l2_state, old.attestor_set),
@@ -4828,4 +4837,5 @@ mod l2_tests {
     }
 
     include!("l2_revenue_tests.rs");
+    include!("l2_forced_review_tests.rs");
 }

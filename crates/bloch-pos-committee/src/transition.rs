@@ -16307,8 +16307,9 @@ mod tests {
             PosTransaction::L2Deposit(_) => {}
             // A DA batch only pays fees from its inputs; nothing is issued.
             PosTransaction::L2DataAvailability(_) => {}
-            // A forced L2 transaction pays fees and a burned surcharge from
-            // its inputs; nothing is issued.
+            // A forced L2 transaction pays fees from its inputs and moves the
+            // charged surcharge to a treasury output (the rest of its signed
+            // maximum back to the payer); nothing is issued.
             PosTransaction::L2ForcedTransaction(_) => {}
             // A claim moves escrowed value (counted in the accounted
             // supply) to an output; its fee comes from the relayer's inputs.

@@ -844,13 +844,21 @@ pub mod forced {
 
     /// Records one settlement consumes at most, from the front of the queue.
     /// Separate from the deposit cap, so a full queue never slows deposits.
+    /// It never binds before the gas cap (16 x 21k > 300k); it stays a guard.
     pub const MAX_PER_SETTLEMENT: u64 = 16;
-    /// Queue capacity in weight units ([`weight`]: one per started 21k of
-    /// declared gas). A submission that would exceed it is refused
-    /// ([`surcharge_sat`]). Weighting by gas makes the drain rate, at most
-    /// [`MAX_GAS_PER_SETTLEMENT`] per settlement, the same whatever record sizes
-    /// a filler picks, so keeping the queue full always costs the same per
-    /// settlement.
+    /// Queue capacity in weight units: the queue's position ([`Queue::pending_weight`]),
+    /// which counts every settlement-sized group of the due rule ([`Packing`])
+    /// at no less than [`UNITS_PER_SETTLEMENT`]. A submission whose record would
+    /// end past it is refused ([`surcharge_sat`]).
+    ///
+    /// Latency bound (review 164 R3, decided 2026-11-02 22:30): each settlement
+    /// whose anchor follows a record consumes at least one whole group ahead of
+    /// it, and each group counts at least [`UNITS_PER_SETTLEMENT`] units, so a
+    /// record that ends at position `p` is consumed by the `ceil(p / 14)`-th
+    /// settlement anchored after it. At capacity that is [`MAX_DRAIN_SETTLEMENTS`]
+    /// = 19, whatever record sizes or mix a filler picks; on an empty queue it
+    /// is the first one (the second settlement after the submission, counting
+    /// the one in flight).
     pub const MAX_PENDING_WEIGHT: u64 = 256;
     /// Forced submissions per native block, like DA batches.
     pub const MAX_PER_BLOCK: usize = 4;
@@ -870,14 +878,44 @@ pub mod forced {
     /// To be re-measured on the final sparse guest before the gate is armed.
     pub const MAX_GAS_PER_SETTLEMENT: u64 = 300_000;
     const _: () = assert!(MAX_GAS <= MAX_GAS_PER_SETTLEMENT);
-    /// Queue-depth price, burned on top of the ordinary fee: `BASE_SURCHARGE_SAT`
-    /// per weight unit, doubled every `SURCHARGE_DOUBLING` pending units. An
-    /// empty queue costs the base per unit; the last units of a full queue
-    /// cost `2^7` times it.
+    /// Weight units one settlement drains at least: one transfer is one unit,
+    /// and a settlement holds 14 of them.
+    pub const UNITS_PER_SETTLEMENT: u64 = MAX_GAS_PER_SETTLEMENT / MIN_GAS;
+    const _: () = assert!(UNITS_PER_SETTLEMENT == 14);
+    /// Settlements anchored after a record that consume it at the latest, at
+    /// capacity (see [`MAX_PENDING_WEIGHT`]).
+    pub const MAX_DRAIN_SETTLEMENTS: u64 = MAX_PENDING_WEIGHT.div_ceil(UNITS_PER_SETTLEMENT);
+    const _: () = assert!(MAX_DRAIN_SETTLEMENTS == 19);
+    /// Queue-depth price per weight unit, at the unit's own position `u`:
+    /// `BASE_SURCHARGE_SAT << (u / SURCHARGE_DOUBLING)` ([`unit_price_sat`]).
+    /// A record pays the sum over the positions it occupies, including the room
+    /// it leaves unused in the group it closes ([`surcharge_sat`], review 164 R5).
+    /// An empty queue costs the base per unit; the last units of a full queue
+    /// cost `2^10` times it.
+    ///
+    /// Doubling every 24 units (not 32) is the steeper ladder decided on review
+    /// 164 R6 (target about 10x the cost of keeping the queue full, 8 units x
+    /// 128_000 = 1_024_000 sat per settlement before). Holding the queue full
+    /// now means buying back, every settlement, the whole group the settlement
+    /// consumed, at least 14 units at the top of the queue. The cheapest full
+    /// hold is 150_001-gas records at position 246: positions 232..=245 each
+    /// settlement, `8 x 512_000 + 6 x 1_024_000 = 10_240_000` sat (0.1024
+    /// BLCH, 10.0x); with transfers it is positions 242..=255, `14 x 1_024_000
+    /// = 14_336_000` sat. Filling it from empty costs `24_000 x (2^10 - 1) + 16
+    /// x 1_024_000 = 40_936_000` sat (0.409 BLCH).
     pub const BASE_SURCHARGE_SAT: u64 = 1_000;
-    pub const SURCHARGE_DOUBLING: u64 = 32;
+    pub const SURCHARGE_DOUBLING: u64 = 24;
     const _: () = assert!(MAX_PENDING_WEIGHT / SURCHARGE_DOUBLING < 32);
+    /// The largest weight one record can be charged: up to 13 units of room it
+    /// leaves in the group it closes, plus its own (14 at [`MAX_GAS`]).
+    pub const MAX_CHARGED_WEIGHT: u64 = UNITS_PER_SETTLEMENT - 1 + weight(MAX_GAS);
     pub const INBOX_DOMAIN: &[u8] = b"BLOCH:L2:INBOX:2";
+    /// Consumed records kept, with the L2 number of the settlement that
+    /// consumed them, so that a rollback head reset can queue them again
+    /// ([`Queue::requeue_after`]). At [`MAX_PER_SETTLEMENT`] per settlement
+    /// this covers at least 64 settlements; a reset deeper than the log is
+    /// refused rather than losing forced transactions.
+    pub const CONSUMED_LOG: usize = 1_024;
 
     #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -923,19 +961,129 @@ pub mod forced {
         h.finalize().into()
     }
 
-    /// Weight units of a record declaring `gas`: one per started [`MIN_GAS`]
-    /// (1 for a transfer, 15 at [`MAX_GAS`]).
+    /// Weight units of a record declaring `gas`: its share of one settlement,
+    /// `ceil(gas * 14 / 300k)` (1 for a transfer, 8 at 150_001, 14 at [`MAX_GAS`]).
     pub const fn weight(gas: u64) -> u64 {
-        gas.div_ceil(MIN_GAS)
+        gas.saturating_mul(UNITS_PER_SETTLEMENT).div_ceil(MAX_GAS_PER_SETTLEMENT)
     }
 
-    /// The burned surcharge of a submission of `weight` units that finds
-    /// `pending` units queued, or `None` when it does not fit.
+    /// The price of the weight unit at queue position `position`.
+    pub const fn unit_price_sat(position: u64) -> u64 {
+        BASE_SURCHARGE_SAT << (position / SURCHARGE_DOUBLING)
+    }
+
+    /// The surcharge of `weight` units occupying positions `pending..pending +
+    /// weight`, each priced at its own position, or `None` when they do not
+    /// fit (or `weight` is 0). At most two price tiers per record, summed in
+    /// closed form.
     pub const fn surcharge_sat(pending: u64, weight: u64) -> Option<u64> {
         if weight == 0 || pending.saturating_add(weight) > MAX_PENDING_WEIGHT {
             return None;
         }
-        Some((BASE_SURCHARGE_SAT << (pending / SURCHARGE_DOUBLING)) * weight)
+        let end = pending + weight;
+        let mut at = pending;
+        let mut total = 0u64;
+        while at < end {
+            let tier_end = (at / SURCHARGE_DOUBLING + 1) * SURCHARGE_DOUBLING;
+            let stop = if tier_end < end { tier_end } else { end };
+            total += unit_price_sat(at) * (stop - at);
+            at = stop;
+        }
+        Some(total)
+    }
+
+    /// The most a record declaring `gas` can be charged while the queue's
+    /// position is at most `pending`: what a wallet signs as its maximum
+    /// surcharge (`pending` = the position it read plus its headroom). Any
+    /// surplus over the charged surcharge is refunded to the sender, so the
+    /// ceiling only ties up funds for one block. `None` for a shape-invalid gas.
+    pub const fn surcharge_ceiling_sat(pending: u64, gas: u64) -> Option<u64> {
+        if gas < MIN_GAS || gas > MAX_GAS {
+            return None;
+        }
+        let span = UNITS_PER_SETTLEMENT - 1 + weight(gas);
+        let mut hi = pending.saturating_add(span);
+        if hi > MAX_PENDING_WEIGHT {
+            hi = MAX_PENDING_WEIGHT;
+        }
+        let lo = hi.saturating_sub(span);
+        surcharge_sat(lo, hi - lo)
+    }
+
+    /// Settlement-sized groups of the due rule, built front to back exactly as
+    /// successive settlements consume them ([`Queue::due`]: in order, at most
+    /// [`MAX_PER_SETTLEMENT`] records and [`MAX_GAS_PER_SETTLEMENT`] declared
+    /// gas). A group is closed by the first record that does not fit; a closed
+    /// group counts `max(UNITS_PER_SETTLEMENT, its weight)`, so the record that
+    /// closes it pays for the room it leaves unused. The open group counts its
+    /// weight. Removing whole groups from the front leaves the later groups as
+    /// they were, and removing part of the first one never adds a group (the
+    /// greedy rule stays ahead), so a record's group number only goes down.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Packing {
+        /// Units of the closed groups.
+        pub closed: u64,
+        /// Declared gas, records and weight of the open group.
+        pub gas: u64,
+        pub records: u64,
+        pub units: u64,
+    }
+    impl Packing {
+        pub const fn add(mut self, gas: u64) -> Self {
+            if self.records > 0
+                && (self.gas.saturating_add(gas) > MAX_GAS_PER_SETTLEMENT || self.records >= MAX_PER_SETTLEMENT)
+            {
+                let units = if self.units > UNITS_PER_SETTLEMENT { self.units } else { UNITS_PER_SETTLEMENT };
+                self.closed = self.closed.saturating_add(units);
+                self.gas = 0;
+                self.records = 0;
+                self.units = 0;
+            }
+            self.gas = self.gas.saturating_add(gas);
+            self.records += 1;
+            self.units += weight(gas);
+            self
+        }
+        /// The queue position: units of everything packed so far.
+        pub const fn position(&self) -> u64 {
+            self.closed.saturating_add(self.units)
+        }
+    }
+
+    /// The protocol treasury that receives every charged surcharge (decided
+    /// 2026-11-02 22:30: not burned, and not shared with the block producer).
+    /// `None` until the owner names it ([`super::mainnet::FORCED_INCLUSION_TREASURY`]);
+    /// forced inclusion is never enabled without it, and
+    /// `hard_forks::l2_forced_inclusion_may_arm` refuses to arm without it.
+    pub fn treasury() -> Option<[u8; 32]> {
+        #[cfg(test)]
+        {
+            treasury_test::get()
+        }
+        #[cfg(not(test))]
+        {
+            super::mainnet::FORCED_INCLUSION_TREASURY
+        }
+    }
+    /// Tests run with a throwaway treasury unless a test unsets it.
+    #[cfg(test)]
+    pub(crate) mod treasury_test {
+        use std::cell::Cell;
+        pub const TREASURY: [u8; 32] = [0x7e; 32];
+        thread_local! { static SET: Cell<bool> = const { Cell::new(true) }; }
+        pub fn get() -> Option<[u8; 32]> {
+            SET.with(Cell::get).then_some(TREASURY)
+        }
+        pub fn unset() -> impl Drop {
+            struct Restore(bool);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    SET.with(|v| v.set(self.0));
+                }
+            }
+            let was = SET.with(|v| v.replace(false));
+            Restore(was)
+        }
     }
 
     /// The queue, present only on an L2 where forced inclusion is enabled.
@@ -952,6 +1100,11 @@ pub mod forced {
         pub(crate) root: [u8; 32],
         /// Pending count frozen with the source anchor.
         pub(crate) anchor: Option<u64>,
+        /// The newest consumed records, oldest first, each with the L2 number
+        /// of the settlement that consumed it; at most [`CONSUMED_LOG`].
+        pub(crate) log: Vec<(u64, Record)>,
+        /// Highest L2 number among records dropped from `log` (0: none).
+        pub(crate) log_floor: u64,
     }
     impl Queue {
         pub(crate) fn new() -> Self {
@@ -986,12 +1139,30 @@ pub mod forced {
             }
             &self.pending[..n]
         }
-        /// Weight units pending ([`weight`]), at most [`MAX_PENDING_WEIGHT`].
+        fn packing(&self) -> Packing {
+            self.pending.iter().fold(Packing::default(), |p, r| p.add(r.gas_limit))
+        }
+        /// The queue position in weight units ([`Packing`]), at most
+        /// [`MAX_PENDING_WEIGHT`] (more only after a head reset re-queues).
         pub fn pending_weight(&self) -> u64 {
-            self.pending.iter().map(|r| weight(r.gas_limit)).sum()
+            self.packing().position()
+        }
+        /// Where a record declaring `gas` would start and how many units it
+        /// would be charged: its own weight plus the room it leaves unused in
+        /// the group it closes.
+        pub fn charged_weight(&self, gas: u64) -> (u64, u64) {
+            let before = self.packing();
+            let after = before.add(gas);
+            (before.position(), after.position() - before.position())
+        }
+        /// The surcharge a record declaring `gas` pays now, or `None` when it
+        /// does not fit.
+        pub fn surcharge_for(&self, gas: u64) -> Option<u64> {
+            let (at, units) = self.charged_weight(gas);
+            surcharge_sat(at, units)
         }
         pub(crate) fn push(&mut self, record: Record) -> Result<(), Refusal> {
-            if surcharge_sat(self.pending_weight(), weight(record.gas_limit)).is_none() {
+            if self.surcharge_for(record.gas_limit).is_none() {
                 return Err(Refusal::Full);
             }
             let mut h = Keccak256::new();
@@ -1003,14 +1174,50 @@ pub mod forced {
             self.queued += 1;
             Ok(())
         }
-        pub(crate) fn consume_due(&mut self) {
+        /// Consume the due records in the settlement of L2 block `l2_number`.
+        pub(crate) fn consume_due(&mut self, l2_number: u64) {
             let n = self.due().len();
-            self.pending.drain(..n);
+            self.log.extend(self.pending.drain(..n).map(|r| (l2_number, r)));
             self.consumed += n as u64;
             self.anchor = None;
+            if self.log.len() > CONSUMED_LOG {
+                let excess = self.log.len() - CONSUMED_LOG;
+                for (number, _) in self.log.drain(..excess) {
+                    self.log_floor = self.log_floor.max(number);
+                }
+            }
+        }
+        /// The consumed log.
+        pub fn consumed_log(&self) -> &[(u64, Record)] {
+            &self.log
+        }
+        /// Whether a head reset to L2 block `number` can queue again every
+        /// record a later settlement consumed.
+        pub fn covers_reset_to(&self, number: u64) -> bool {
+            self.log_floor <= number
+        }
+        /// Head reset to L2 block `number`: every record consumed by a later
+        /// settlement goes back to the front of the queue, in its original
+        /// order, as the deposit cursor goes back for deposits. The running
+        /// root is unchanged (nothing new is queued). A frozen anchor grows by
+        /// the records put back, which were queued before it. Returns the
+        /// number put back, or `None` (no change) when the log does not reach.
+        pub(crate) fn requeue_after(&mut self, number: u64) -> Option<u64> {
+            if !self.covers_reset_to(number) {
+                return None;
+            }
+            let keep = self.log.iter().position(|(n, _)| *n > number).unwrap_or(self.log.len());
+            let back: Vec<Record> = self.log.drain(keep..).map(|(_, r)| r).collect();
+            let count = back.len() as u64;
+            self.pending.splice(0..0, back);
+            self.consumed -= count;
+            if let Some(anchor) = self.anchor.as_mut() {
+                *anchor += count;
+            }
+            Some(count)
         }
         pub(crate) fn encode(&self, out: &mut Vec<u8>) {
-            out.extend_from_slice(b"BLOCH:NATIVE:L2:FORCED-STATE:1");
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:FORCED-STATE:2");
             out.extend_from_slice(&self.queued.to_le_bytes());
             out.extend_from_slice(&self.consumed.to_le_bytes());
             out.extend_from_slice(&self.root);
@@ -1023,6 +1230,12 @@ pub mod forced {
             }
             out.extend_from_slice(&(self.pending.len() as u64).to_le_bytes());
             for r in &self.pending {
+                out.extend_from_slice(&r.encode());
+            }
+            out.extend_from_slice(&self.log_floor.to_le_bytes());
+            out.extend_from_slice(&(self.log.len() as u64).to_le_bytes());
+            for (number, r) in &self.log {
+                out.extend_from_slice(&number.to_le_bytes());
                 out.extend_from_slice(&r.encode());
             }
         }
@@ -1326,19 +1539,21 @@ pub mod mainnet {
         pub proof_policy: [u8; 32],
     }
     /// `settlement_v3_mainnet_sparse` of bloch-l2-evm
-    /// `codex/sparse-audit-r7-20261102` b772f2d (code by hash, I1 and I3 fixed),
-    /// built in its pinned container: the sparse witness under the next rules,
-    /// guest ELF SHA-256 `78c533fa…7bea` (3 218 240 bytes). The state
-    /// transition and the statement bytes are those of the complete witness.
+    /// `codex/forced-guest-r8-20261102` 595d914 (agent 115's sparse guest with
+    /// L1 forced inclusion, agent 137), built in its pinned container on two
+    /// hosts: the sparse witness under the next rules with the forced prefix,
+    /// guest ELF SHA-256 `bc35e838…b048`. Its configuration `b4663ab8…a29d`
+    /// (tag `BLOCH:EVM:CONFIG:4:CANCUN`) is the next rules plus forced
+    /// inclusion, and is listed in [`FORCED_INCLUSION_CONFIGURATIONS`].
     /// The configuration carries a PLACEHOLDER fee-sweep recipient, `TBD-owner`,
     /// and the guest is a candidate, so these values are examples until
     /// [`PROGRAM_NEXT_FINAL`] says otherwise.
     pub const PROGRAM_NEXT: NextProgram = NextProgram {
         identities: [
-            h32("975ec2585246abeaea86421dd5726918b632dd91a246f635fe74990b68bcd878"),
-            h32("1f755262230baf9f1fded98a698cd3e31aa7f23a146116d4bd7e21e2bee2a5e0"),
-            h32("7e5b3c3345608ab36aced4db40f7692147a3fca80ace7a285bc335f342ee5910"),
-            h32("00fcb6786715822acf5676a6dc0f769218f47f9502b39e8a2de19af9c2ee5910"),
+            h32("b4663ab88607a1ebf7d1801920365fdde276889e211e097011bf48fcd0f7a29d"),
+            h32("1f744da8d3e0302cd39152e24e91071d7f0cfec7639245566a471cd6083a6b18"),
+            h32("6a140f117b84dd524b3681b9447422e5281451295144b5747197d0df5db6afc9"),
+            h32("00d4281e23ee13754a59b40dcc47422e55028a2534512d5d38cbe86fddb6afc9"),
         ],
         // The wrapper VK and the V3 tag are unchanged, so the policy is too.
         proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
@@ -1351,10 +1566,17 @@ pub mod mainnet {
     /// (3 073 328 bytes). It replaces `44d4c9d7…ce47`, which neither that tree
     /// nor the container reproduces.
     ///
-    /// It must keep the configuration of [`PROGRAM_NEXT`], which the assert below
-    /// pins: the swap to the next rules is one-way on the L2, because blocks under
-    /// them hold the vault code, so [`PROGRAM`] cannot prove any successor of such
-    /// a block. A rollback changes which guest proves the rules, never the rules.
+    /// It proves the next rules, which the assert below pins: the swap to the
+    /// next rules is one-way on the L2, because blocks under them hold the vault
+    /// code, so [`PROGRAM`] cannot prove any successor of such a block. A
+    /// rollback changes which guest proves the rules, never the rules.
+    ///
+    /// CANDIDATE gap: [`PROGRAM_NEXT`] now adds forced inclusion, and this guest
+    /// does not implement it (configuration `975ec258…`, unlisted). The assert
+    /// below admits exactly that difference, and
+    /// `hard_forks::l2_forced_rollback_may_arm` refuses to arm the rollback
+    /// together with forced inclusion until a complete-witness guest with the
+    /// forced rule replaces this one.
     pub const PROGRAM_FALLBACK: NextProgram = NextProgram {
         identities: [
             h32("975ec2585246abeaea86421dd5726918b632dd91a246f635fe74990b68bcd878"),
@@ -1369,12 +1591,18 @@ pub mod mainnet {
     /// this is true (`hard_forks::l2_program_may_arm`).
     pub const PROGRAM_NEXT_FINAL: bool = false;
     /// L2 configurations (identity 3) whose guest executes the forced records
-    /// of [`super::forced`] and publishes [`super::forced::inbox_hash`]. EMPTY:
-    /// neither [`PROGRAM_NEXT`] nor [`PROGRAM_FALLBACK`] implements it, so
-    /// [`crate::params::L2_FORCED_INCLUSION_EPOCH`] cannot be armed
-    /// (`hard_forks::l2_forced_inclusion_may_arm`). The configuration (and with
-    /// it the ELF and both keys) changes when the guest gains the rule.
-    pub const FORCED_INCLUSION_CONFIGURATIONS: &[[u8; 32]] = &[];
+    /// of [`super::forced`] and publishes [`super::forced::inbox_hash`]: the
+    /// next configuration (`BLOCH:EVM:CONFIG:4:CANCUN`). [`PROGRAM_FALLBACK`]
+    /// does not implement it. [`crate::params::L2_FORCED_INCLUSION_EPOCH`]
+    /// stays inert (`hard_forks::l2_forced_inclusion_may_arm`).
+    pub const FORCED_INCLUSION_CONFIGURATIONS: &[[u8; 32]] =
+        &[h32("b4663ab88607a1ebf7d1801920365fdde276889e211e097011bf48fcd0f7a29d")];
+    /// TBD-owner: the script hash of the protocol treasury that receives every
+    /// charged forced-inclusion surcharge (`super::forced::treasury`). `None`
+    /// keeps forced inclusion from being enabled, and
+    /// `hard_forks::l2_forced_inclusion_may_arm` refuses to arm the gate while
+    /// it is unset. Revenue rule (2026-11-02 22:30): the treasury, never a burn.
+    pub const FORCED_INCLUSION_TREASURY: Option<[u8; 32]> = None;
 
     /// TBD-owner: the hash (`Sha3_256`) of the mainnet settler's DA funding
     /// public key, which owns the reserved DA slot
@@ -1394,7 +1622,14 @@ pub mod mainnet {
         }
         true
     }
-    const _: () = assert!(same_hash(&PROGRAM_NEXT.identities[0], &PROGRAM_FALLBACK.identities[0]));
+    // The fallback proves the next rules: the same configuration, or the next
+    // one without forced inclusion only (the next configuration is then the
+    // forced one and the fallback's is unlisted; see PROGRAM_FALLBACK).
+    const _: () = assert!(
+        same_hash(&PROGRAM_NEXT.identities[0], &PROGRAM_FALLBACK.identities[0])
+            || (crate::hard_forks::listed(FORCED_INCLUSION_CONFIGURATIONS, &PROGRAM_NEXT.identities[0])
+                && !crate::hard_forks::listed(FORCED_INCLUSION_CONFIGURATIONS, &PROGRAM_FALLBACK.identities[0]))
+    );
     const _: () = assert!(same_hash(&PROGRAM_NEXT.proof_policy, &PROGRAM_FALLBACK.proof_policy));
 
     /// OPTION, an owner decision, absent by default: a one-time reset of the
@@ -1909,7 +2144,12 @@ impl State {
         self.enable_forced_inclusion_if(self.forced_inclusion_program())
     }
     fn enable_forced_inclusion_if(&mut self, program: bool) -> bool {
-        if self.forced.is_some() || !program || !self.profile.user_transactions || !self.asynchronous {
+        if self.forced.is_some()
+            || !program
+            || !self.profile.user_transactions
+            || !self.asynchronous
+            || forced::treasury().is_none()
+        {
             return false;
         }
         let mut queue = forced::Queue::new();
@@ -1920,10 +2160,23 @@ impl State {
         self.forced = Some(queue);
         true
     }
+    /// Test hook (review 164): consume what is due now, as a settlement would.
+    #[cfg(test)]
+    pub(crate) fn forced_consume_due_for_review(&mut self) {
+        let number = self.settled_number().saturating_add(1);
+        if let Some(queue) = self.forced.as_mut() {
+            queue.consume_due(number);
+        }
+    }
     /// Test hook: enable forced inclusion whatever the configuration.
     #[cfg(test)]
     pub(crate) fn enable_forced_inclusion_for_test(&mut self) -> bool {
         self.enable_forced_inclusion_if(true)
+    }
+    /// Test hook: the queue, mutable.
+    #[cfg(test)]
+    pub(crate) fn forced_queue_mut_for_test(&mut self) -> Option<&mut forced::Queue> {
+        self.forced.as_mut()
     }
     /// Queue a forced L2 transaction published at the next native height.
     /// The caller has already charged and authorized the L1 transaction.
@@ -1936,6 +2189,13 @@ impl State {
     ) -> Result<(), forced::Refusal> {
         use forced::Refusal as R;
         let height = self.native_height.checked_add(1).ok_or(R::Full)?;
+        // A rollback to a fallback guest that does not implement the rule takes
+        // no new record (review 164 R1). `hard_forks::l2_forced_inclusion_may_arm`
+        // already refuses to arm forced inclusion with an unlisted fallback;
+        // this keeps the L2 from owing what its guest cannot prove anyway.
+        if self.policy.identities[3..7] == mainnet::PROGRAM_FALLBACK.identities && !self.forced_inclusion_program() {
+            return Err(R::NotActive);
+        }
         let queue = self.forced.as_mut().ok_or(R::NotActive)?;
         if chain_id != self.policy.chain_id {
             return Err(R::Chain);
@@ -2101,6 +2361,15 @@ impl State {
         if self.claimed.any_at_or_above(count) || consumed > self.inbox.len() as u64 {
             return false;
         }
+        // Forced records consumed after the target go back into the queue, as
+        // the deposit cursor goes back; a reset the consumed log cannot cover
+        // is refused, so that no forced transaction is silently dropped.
+        if self.forced.as_ref().is_some_and(|q| !q.covers_reset_to(reset.number)) {
+            return false;
+        }
+        if let Some(queue) = self.forced.as_mut() {
+            queue.requeue_after(reset.number);
+        }
         self.head = head;
         self.consumed = consumed;
         self.withdrawals.retain(|r| r.l2_number <= reset.number);
@@ -2138,9 +2407,12 @@ impl State {
     }
     /// Whether the next rules hold, and with them the next release rule. It
     /// follows from the committed configuration, so it adds no state bytes and
-    /// survives a rollback, which changes the guest and not the rules.
+    /// survives a rollback, which changes the guest and not the rules (the
+    /// fallback's configuration is the next one, or the next one without forced
+    /// inclusion).
     pub fn next_program_active(&self) -> bool {
         self.policy.identities[3] == mainnet::PROGRAM_NEXT.identities[0]
+            || self.policy.identities[3] == mainnet::PROGRAM_FALLBACK.identities[0]
     }
     /// The release window a claim in the next native block sees.
     pub fn release_window(&self) -> withdrawal::ReleaseWindow {
@@ -2598,7 +2870,7 @@ impl State {
         self.source_anchor = None;
         self.consumed = end;
         if let Some(queue) = self.forced.as_mut() {
-            queue.consume_due();
+            queue.consume_due(number);
         }
         // Records for settled blocks can never be used again.
         self.da.retain(|r| r.l2_number > number);
@@ -2639,7 +2911,16 @@ impl State {
         if let Some(q) = &self.forced {
             let pending = q.pending.len() as u64;
             if q.queued.checked_sub(q.consumed) != Some(pending)
-                || q.pending_weight() > forced::MAX_PENDING_WEIGHT
+                // A head reset can queue consumed records again past the
+                // submission capacity: bounded by the consumed log. Every
+                // record weighs at least one unit, so at most this many are
+                // pending, and each group (at least one record) counts at most
+                // its records' weight or a settlement's units.
+                || pending > forced::MAX_PENDING_WEIGHT + forced::CONSUMED_LOG as u64
+                || q.pending_weight() > pending * forced::UNITS_PER_SETTLEMENT
+                || q.log.len() > forced::CONSUMED_LOG
+                || q.log.windows(2).any(|w| w[0].0 > w[1].0)
+                || q.log.first().is_some_and(|(n, _)| *n < q.log_floor)
                 || q.anchor.is_some_and(|a| a > pending)
             {
                 return Err("cached L2 forced queue is inconsistent".into());

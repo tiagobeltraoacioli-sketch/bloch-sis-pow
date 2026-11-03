@@ -2941,6 +2941,19 @@ pub fn kes_json(state: &bloch_pos_committee::transition::CommittedState) -> Json
 }
 
 pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedState) -> Json {
+    l2_settlement_json_with(state, &|_, _| None)
+}
+
+/// A forced record's L2 envelope, read from the L1 block at `height` holding
+/// the transaction `txid`; `None` when that block is not readable here.
+pub type ForcedEnvelopeLookup<'a> = dyn Fn(u64, &[u8; 32]) -> Option<Vec<u8>> + 'a;
+
+/// [`l2_settlement_json`], with each due forced record's envelope read
+/// through `envelope` (the engine reads its canonical blocks).
+pub fn l2_settlement_json_with(
+    state: &bloch_pos_committee::transition::CommittedState,
+    envelope: &ForcedEnvelopeLookup<'_>,
+) -> Json {
     let Some(l2) = state.l2_settlement() else { return Json::Null; };
     let policy = l2.policy();
     let source = l2.frozen_source().map_or(Json::Null, |source| Json::obj(vec![
@@ -3112,19 +3125,42 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
     // L1 forced inclusion (candidate): present only once the queue is enabled,
     // so the response keeps its exact fields while the gate is inert.
     if let (Json::Obj(fields), Some(queue)) = (&mut out, l2.forced_queue()) {
-        fields.push(("forced".to_string(), l2_forced_json(queue)));
+        fields.push(("forced".to_string(), l2_forced_json_with(queue, envelope)));
     }
     out
 }
 
 /// `getl2settlement.forced`: the queue, and the records the next settlement
 /// must consume, in order (`due`), with the `deposits_hash` slot they need.
+#[cfg(test)]
 pub(crate) fn l2_forced_json(queue: &bloch_pos_committee::l2_settlement::forced::Queue) -> Json {
-    use bloch_pos_committee::l2_settlement::forced;
-    let record = |r: &forced::Record| Json::obj(vec![
+    l2_forced_json_with(queue, &|_, _| None)
+}
+
+/// One due record. `envelope` is the signed L2 envelope (hex) read from its
+/// L1 transaction, which a producer, settler or rebuilder needs to run it; it
+/// is `null` when the block is not readable here or the bytes do not hash to
+/// the record (never trusted: the guest checks the hash again).
+pub(crate) fn l2_forced_record_json(
+    r: &bloch_pos_committee::l2_settlement::forced::Record,
+    envelope: &ForcedEnvelopeLookup<'_>,
+) -> Json {
+    use sha3::{Digest, Keccak256};
+    let bytes = envelope(r.height, &r.l1_txid)
+        .filter(|bytes| <[u8; 32]>::from(Keccak256::digest(bytes)) == r.envelope_hash);
+    Json::obj(vec![
         ("height", Json::u(r.height)), ("l1_txid", Json::hex(&r.l1_txid)),
         ("envelope_hash", Json::hex(&r.envelope_hash)), ("gas_limit", Json::u(r.gas_limit)),
-    ]);
+        ("envelope", bytes.map_or(Json::Null, |b| Json::s(crate::codec::hex(&b)))),
+    ])
+}
+
+pub(crate) fn l2_forced_json_with(
+    queue: &bloch_pos_committee::l2_settlement::forced::Queue,
+    envelope: &ForcedEnvelopeLookup<'_>,
+) -> Json {
+    use bloch_pos_committee::l2_settlement::forced;
+    let record = |r: &forced::Record| l2_forced_record_json(r, envelope);
     let pending = queue.pending().len() as u64;
     let weight = queue.pending_weight();
     Json::obj(vec![
@@ -3133,8 +3169,19 @@ pub(crate) fn l2_forced_json(queue: &bloch_pos_committee::l2_settlement::forced:
         ("max_pending_weight", Json::u(forced::MAX_PENDING_WEIGHT)), ("root", Json::hex(&queue.root())),
         ("due", Json::Arr(queue.due().iter().map(record).collect())),
         ("due_hash", Json::hex(&forced::hash(queue.due()))),
-        // What one weight unit (a transfer) pays on top of its fee in the next
-        // block; null when full. A record of w units pays w times the unit price.
+        // What the next weight unit (a transfer that closes no group) pays on
+        // top of its fee; null when full. Each unit is priced at its own
+        // position, and a record also pays for the room it leaves in the group
+        // it closes: `transfer_surcharge_sat` and `max_gas_surcharge_sat` are
+        // the exact charges now for 21k and 300k of declared gas. Wallets sign
+        // a maximum (`bloch-pos l2-forced prepare --pending-weight`) and get the
+        // rest back; the charge goes to the protocol treasury.
         ("next_surcharge_sat", forced::surcharge_sat(weight, 1).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
+        ("transfer_surcharge_sat", queue.surcharge_for(forced::MIN_GAS).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
+        ("max_gas_surcharge_sat", queue.surcharge_for(forced::MAX_GAS).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
+        // A record ending at position p is consumed by the ceil(p / 14)-th
+        // settlement anchored after it: the bound for a record queued now.
+        ("drain_settlements", Json::u(weight.div_ceil(forced::UNITS_PER_SETTLEMENT))),
+        ("treasury", forced::treasury().map_or(Json::Null, |t| Json::hex(&t))),
     ])
 }

@@ -50,6 +50,7 @@ mod devnet_tools;
 mod l2_da_cli;
 mod l2_claim_cli;
 mod l2_deposit_cli;
+mod l2_forced_cli;
 mod engine;
 mod equivocation_watch;
 mod genesis;
@@ -243,6 +244,12 @@ fn main() {
         Some("l2-deposit") => {
             if let Err(error) = l2_deposit_cli::run(&args[1..]) {
                 eprintln!("l2-deposit: {error}");
+                exit(2);
+            }
+        }
+        Some("l2-forced") => {
+            if let Err(error) = l2_forced_cli::run(&args[1..]) {
+                eprintln!("l2-forced: {error}");
                 exit(2);
             }
         }
