@@ -7221,6 +7221,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     source: crate::ws_boot::TrustedSource::Fetched(cp),
                     block_root: cfg.ws.checkpoint_sync_pin,
                 }),
+                // Keep the build's own anchor and restart policy: a fetched
+                // checkpoint is one more input, not a different boot.
+                release_anchor: cfg.ws.release_anchor,
+                resume_sync_under_anchor: cfg.ws.resume_sync_under_anchor,
                 ..Default::default()
             };
             &fetched
