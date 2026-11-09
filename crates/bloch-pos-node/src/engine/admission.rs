@@ -5,6 +5,22 @@ use super::*;
 /// Encoded payload budget. Transaction objects and bookkeeping add bounded
 /// overhead; this is not a claim that resident memory equals payload bytes.
 pub(super) const MAX_MEMPOOL_BYTES: usize = 16 * 1024 * 1024;
+/// Room kept for forced-inclusion envelopes (wire 0x1C) in a full pool. They
+/// carry no tip by design (the depth-priced surcharge pays for them), so the
+/// lowest-tip rules would drop them first and a pool kept full of cheap
+/// entries would censor the one path meant to resist censorship. Up to this
+/// many are never evicted or displaced to make room for another kind; a DA
+/// batch (0x15) never makes room at a forced envelope's expense at all, since
+/// the sequencer that is being bypassed is the party that sends DA. Beyond
+/// this room forced envelopes compete by tip like any entry, so they cannot be
+/// used to hold the pool either: one per-source cap of them fits here.
+/// No forced envelope exists before `L2_FORCED_INCLUSION_EPOCH`, so nothing
+/// changes while that gate is inert.
+pub(super) const MEMPOOL_FORCED_RESERVED: usize = 64;
+
+fn is_forced_envelope(tx: &PosTransaction) -> bool {
+    matches!(tx, PosTransaction::L2ForcedTransaction(_))
+}
 
 #[derive(Default)]
 pub(super) struct Mempool {
@@ -328,6 +344,13 @@ impl Engine {
         let mut source_count = source.map_or(0, |s| self.mempool.source_count(&s));
         let mut plan = CapacityPlan { stale: BTreeSet::new(), lower_fee: None, displaced: Vec::new() };
         let mut funded_context = None;
+        // Whether a pooled forced envelope may make room for `incoming`:
+        // never for a DA batch, and for other kinds only beyond the reserved
+        // room. Another forced envelope competes with them by tip as before.
+        let incoming_da = matches!(incoming, PosTransaction::L2DataAvailability(_));
+        let incoming_forced = is_forced_envelope(incoming);
+        let forced_pooled = if incoming_forced { 0 } else { self.mempool.values().filter(|tx| is_forced_envelope(tx)).count() };
+        let forced_protected = !incoming_forced && (incoming_da || forced_pooled <= MEMPOOL_FORCED_RESERVED);
         // No full-pool revalidation on ordinary admission. Under any capacity
         // pressure, stale backing must not retain priority through claimed tips.
         if count >= MEMPOOL_MAX || bytes.saturating_add(encoded) > MAX_MEMPOOL_BYTES
@@ -350,8 +373,8 @@ impl Engine {
             }
         }
         // The registered DA key's batch (past `L2_DA_RESERVED_SLOT_EPOCH`)
-        // displaces the lowest-tip entries that are not its own, whatever
-        // their tip, until it fits by count and bytes. Otherwise a pool full
+        // displaces the lowest-tip entries that are neither its own nor
+        // forced envelopes, whatever their tip, until it fits by count and bytes. Otherwise a pool full
         // of valid tip-0 DA keeps it out of every mempool and the reserved
         // block slot serves nobody. Its own per-source cap bounds what it can
         // displace; the others lose a place in the queue, never a fee.
@@ -359,7 +382,8 @@ impl Engine {
         if is_reserved_da(incoming, reserved) && source_count < MEMPOOL_MAX_PER_SOURCE
             && (count >= MEMPOOL_MAX || bytes.saturating_add(encoded) > MAX_MEMPOOL_BYTES) {
             let mut victims: Vec<_> = self.mempool.iter()
-                .filter(|(key, tx)| !plan.stale.contains(*key) && !is_reserved_da(tx, reserved))
+                .filter(|(key, tx)| !plan.stale.contains(*key) && !is_reserved_da(tx, reserved)
+                    && !is_forced_envelope(tx))
                 .collect();
             victims.sort_by_key(|(key, tx)| (tx_tip_rate(tx), std::cmp::Reverse(key.len())));
             for (key, _) in victims {
@@ -372,7 +396,8 @@ impl Engine {
         if bytes.saturating_add(encoded) > MAX_MEMPOOL_BYTES { return Err(Refusal::AtCapacity); }
         if source_count >= MEMPOOL_MAX_PER_SOURCE { return Err(Refusal::TooManyFromSource); }
         if count >= MEMPOOL_MAX {
-            let lowest = self.mempool.iter().filter(|(key, _)| !plan.stale.contains(*key))
+            let lowest = self.mempool.iter()
+                .filter(|(key, tx)| !plan.stale.contains(*key) && !(forced_protected && is_forced_envelope(tx)))
                 .min_by_key(|(_, tx)| tx_tip_rate(tx));
             match lowest {
                 Some((key, tx)) if tx_tip_rate(incoming) > tx_tip_rate(tx) => plan.lower_fee = Some(key.clone()),

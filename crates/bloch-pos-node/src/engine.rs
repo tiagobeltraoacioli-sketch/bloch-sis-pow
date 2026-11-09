@@ -11338,6 +11338,46 @@ mod transfer_v2_end_to_end {
         assert_eq!(tx_tip_rate(&evicted), 1);
     }
 
+    /// The reserved room is bounded: beyond `MEMPOOL_FORCED_RESERVED` pooled
+    /// forced envelopes, a higher-tip entry of another kind evicts the
+    /// lowest-tip one as before (so forced envelopes cannot hold the pool),
+    /// while a DA batch still never does.
+    #[test]
+    fn beyond_the_reserved_room_forced_envelopes_compete_by_tip_except_against_da() {
+        use super::admission::MEMPOOL_FORCED_RESERVED;
+        let epoch = V2_FLAG_DAY + 1;
+        let lowest = |node: &Engine, key: Vec<u8>| node.mempool.values().find(|tx| tx.canonical_bytes() == key).unwrap().clone();
+        let transfer = |tip| match zero_tip_transfer(7) {
+            PosTransaction::Transfer { inputs, outputs, tx_bytes, .. } =>
+                PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas: tip },
+            other => other,
+        };
+
+        let inside = pool_with_forced_and_da(epoch, MEMPOOL_FORCED_RESERVED);
+        let tx = transfer(2);
+        let plan = inside.plan_mempool_capacity(&tx, tx.canonical_bytes().len(), epoch).expect("a higher tip is admitted");
+        assert!(!is_forced(&lowest(&inside, plan.lower_fee.expect("one entry makes room"))), "inside the room");
+
+        let beyond = pool_with_forced_and_da(epoch, MEMPOOL_FORCED_RESERVED + 1);
+        let plan = beyond.plan_mempool_capacity(&tx, tx.canonical_bytes().len(), epoch).expect("a higher tip is admitted");
+        assert!(is_forced(&lowest(&beyond, plan.lower_fee.expect("one entry makes room"))), "beyond the room: by tip");
+        let batch = da_batch(0x05, 1, 2);
+        let plan = beyond.plan_mempool_capacity(&batch, batch.canonical_bytes().len(), epoch).expect("a higher tip is admitted");
+        assert!(!is_forced(&lowest(&beyond, plan.lower_fee.expect("one entry makes room"))), "never for a DA batch");
+
+        // A pool of forced envelopes only: a DA batch finds no room at all,
+        // and a forced envelope with a higher tip still replaces the lowest.
+        let mut full = engine_at_wall_epoch(epoch, &[]);
+        for i in 0..MEMPOOL_MAX {
+            let tx = forced_envelope_tx(0x30 + (i / MEMPOOL_MAX_PER_SOURCE) as u8, i as u32, 0);
+            full.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        assert!(matches!(full.plan_mempool_capacity(&batch, batch.canonical_bytes().len(), epoch), Err(Refusal::AtCapacity)));
+        let paying = forced_envelope_tx(0xa0, 1, 1);
+        let plan = full.plan_mempool_capacity(&paying, paying.canonical_bytes().len(), epoch).expect("forced against forced: by tip");
+        assert!(is_forced(&lowest(&full, plan.lower_fee.expect("one entry makes room"))));
+    }
+
     /// F-9: which commitments win the scarce slots is re-drawn from the
     /// parent block id, so grinding commitment bytes low (the canonical-bytes
     /// tie-break) does not buy every slot, and the draw changes per block.
