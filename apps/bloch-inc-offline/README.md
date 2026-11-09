@@ -1,5 +1,9 @@
 # Bloch Inc offline deployment
 
+The website was restored on 9 November 2026 at the owner's request, together
+with its previous Team section. This directory is retained only as an inactive
+offline deployment option. Normal site deployments use `apps/bloch-inc`.
+
 This isolated deployment takes the `bloch-inc` Cloudflare Pages project offline.
 Its advanced-mode Worker returns an empty HTTP `410 Gone` response for every
 path and request method, including old pages, static assets and downloads.
