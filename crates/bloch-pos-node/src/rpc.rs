@@ -59,9 +59,55 @@
 //! `--rpc-bind` defaults to `127.0.0.1` and why binding anything routable is an
 //! explicit act that the help text pairs with a firewall instruction. The
 //! bounds that *are* here are anti-exhaustion, not authorisation:
-//! [`MAX_BODY_BYTES`], [`MAX_HEADER_BYTES`], [`MAX_CONNECTIONS`] and the socket
-//! timeouts. They stop one client from consuming the node; they stop no one
-//! from reading it.
+//! [`MAX_BODY_BYTES`], [`MAX_HEADER_BYTES`], [`MAX_CONNECTIONS`] and the
+//! request and response deadlines. They stop one client from consuming the
+//! node; they stop no one from reading it.
+//!
+//! ## What is bounded, what is not, and per what
+//!
+//! There is no request-RATE limit anywhere in this module. What is limited is
+//! CONCURRENCY and TIME:
+//!
+//! | Bound | Value | Keyed by |
+//! |-------|-------|----------|
+//! | concurrent connections, listener-wide | [`MAX_CONNECTIONS`] (64) | nothing — global |
+//! | concurrent connections per source | [`MAX_CONNECTIONS_PER_IP`] (8) | source address |
+//! | calls queued for or running on the consensus thread | [`MAX_ENGINE_CALLS_PER_IP`] (16) | source address |
+//! | signature-verification budget for submitted transactions | see `net::source_budget` | source address |
+//! | time to send one request (head + body) | [`IO_TIMEOUT`] (30 s), one deadline | connection |
+//! | time to drain one response | 30 s to 300 s by size, one deadline (see [`response_timeout`]) | connection |
+//! | time a call waits for the consensus thread | [`ENGINE_TIMEOUT`] (10 s) | call |
+//!
+//! A refused connection is answered `503` with `Retry-After` when that costs
+//! one non-blocking write, and is then closed. A call that is still queued
+//! when its HTTP request times out, or when its client hangs up, is abandoned:
+//! its queue permit is released at once and the consensus thread skips it.
+//!
+//! **The source address is the TCP peer.** That is the right key only when
+//! clients connect to this port directly. Behind a reverse proxy, a tunnel
+//! (`cloudflared`) or a port forwarder (`socat`, `ssh -L`), every caller
+//! arrives from the proxy's address — usually `127.0.0.1` — so ALL of them
+//! share one 8-connection bucket, one 16-call queue and one verification
+//! budget, and one remote client can exhaust all three for everybody.
+//!
+//! There are exactly two honest answers to that, and the default is the first:
+//!
+//! 1. **No trusted proxy configured (the default).** Forwarded headers are
+//!    ignored — a client that can reach the port directly could otherwise type
+//!    any address it liked into one and get a fresh bucket per request. The
+//!    per-source bounds then separate nothing behind a proxy, and per-client
+//!    limiting MUST be done at the proxy.
+//! 2. **`--rpc-trusted-proxy <ip[,ip...]>` / `BLOCH_RPC_TRUSTED_PROXIES`.**
+//!    Only when the TCP peer is one of the listed addresses, the source is
+//!    taken from `X-Forwarded-For`: see [`TrustedProxies`] for exactly which
+//!    hop. Listing an address says "everything that can connect from here is
+//!    allowed to name the client"; listing `127.0.0.1` therefore extends that
+//!    to every local process. A proxy that does not append the address it
+//!    accepted the connection from to `X-Forwarded-For` (a bare `socat`) gains
+//!    nothing from being listed — its callers stay in one shared bucket.
+//!
+//! Either way the listener-wide cap is shared by everyone: these bounds keep
+//! the node alive under load, they do not guarantee any one caller service.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -94,11 +140,27 @@ const MAX_CONNECTIONS: usize = 64;
 /// Concurrent workers retained by one normalized source address.
 const MAX_CONNECTIONS_PER_IP: usize = 8;
 
+/// Connections from one trusted proxy whose request head has not arrived yet,
+/// so that no client address can be charged for them. Half the listener: a
+/// proxy that opens upstream connections before it has the head (or a client
+/// stalling through one) cannot take the slots direct callers use, and the
+/// charge moves to the client's own [`MAX_CONNECTIONS_PER_IP`] bucket as soon
+/// as the head is parsed. Unused unless a trusted proxy is configured.
+const MAX_UNATTRIBUTED_PROXY_CONNECTIONS: usize = MAX_CONNECTIONS / 2;
+
+/// Calls one source may have queued for, or running on, the consensus thread.
+const MAX_ENGINE_CALLS_PER_IP: usize = 16;
+
+/// What a refused connection is told to wait before retrying, in seconds.
+const RETRY_AFTER_SECS: u32 = 1;
+
 /// Own both listener admission charges through the complete worker lifetime.
 /// In particular, an unwind inside request parsing or a backend cannot leak a
 /// global slot while the per-IP guard is released automatically.
 struct RpcConnectionPermit {
-    _ip: crate::connection_limit::Permit,
+    /// Replaced, never removed: a proxied connection starts charged to its
+    /// proxy and is re-charged to the forwarded client once that is known.
+    ip: crate::connection_limit::Permit,
     live: Arc<AtomicUsize>,
 }
 
@@ -113,7 +175,16 @@ fn reserve_connection(
     live: &Arc<AtomicUsize>,
     ip_limits: &Arc<crate::connection_limit::Limits>,
 ) -> Option<RpcConnectionPermit> {
-    let ip_permit = ip_limits.reserve(ip, MAX_CONNECTIONS_PER_IP)?;
+    reserve_connection_capped(ip, live, ip_limits, MAX_CONNECTIONS_PER_IP)
+}
+
+fn reserve_connection_capped(
+    ip: IpAddr,
+    live: &Arc<AtomicUsize>,
+    ip_limits: &Arc<crate::connection_limit::Limits>,
+    per_ip: usize,
+) -> Option<RpcConnectionPermit> {
+    let ip_permit = ip_limits.reserve(ip, per_ip)?;
     // Reserve before spawning: incrementing inside the worker would let an
     // unbounded burst spawn first and count later.
     if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
@@ -121,20 +192,55 @@ fn reserve_connection(
         return None;
     }
     Some(RpcConnectionPermit {
-        _ip: ip_permit,
+        ip: ip_permit,
         live: Arc::clone(live),
     })
 }
 
-/// Total time allowed to receive a request, and per-write response timeout.
-/// Occasional bytes must not renew a connection's request budget.
+/// Total time allowed to receive a request, and the least time allowed to
+/// drain a response. Occasional bytes must not renew either budget.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The slowest reader a response is held open for: 64 KiB/s (about 0.5 Mbit/s).
+const RESPONSE_MIN_BYTES_PER_SEC: u64 = 64 * 1024;
+
+/// The longest any one response may hold a worker, whatever its size.
+const RESPONSE_MAX_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Total time allowed to write a response of `len` bytes: ONE deadline for the
+/// head and the whole body, as [`read_request_until`] has for the request.
+///
+/// A per-`write` timeout starts over each time the peer takes a few bytes, so
+/// a client that drains a large reply a trickle at a time held a worker for as
+/// long as it liked. The budget is the time `len` bytes take at
+/// [`RESPONSE_MIN_BYTES_PER_SEC`], never less than [`IO_TIMEOUT`] and never
+/// more than [`RESPONSE_MAX_TIMEOUT`]:
+///
+/// - up to 1.875 MiB (every ordinary reply; `getutxos` at its 1,000-entry page
+///   is a few hundred KiB): 30 s;
+/// - a multi-megabyte `getfinalitycertificate` / `getlcproof` reply (hundreds
+///   of hex-encoded post-quantum signatures): its size / 64 KiB/s, e.g. 160 s
+///   for 10 MiB;
+/// - 18.75 MiB and above: 300 s, so a reply larger than that needs a
+///   proportionally faster reader (20 MiB: about 68 KiB/s).
+///
+/// Bytes already handed to the kernel when the deadline passes are still
+/// delivered by it; what the deadline frees is the worker and its slot.
+fn response_timeout(len: usize) -> Duration {
+    let secs = u64::try_from(len).unwrap_or(u64::MAX) / RESPONSE_MIN_BYTES_PER_SEC;
+    Duration::from_secs(secs).clamp(IO_TIMEOUT, RESPONSE_MAX_TIMEOUT)
+}
 
 /// How long a request waits for the consensus thread to answer before giving
 /// up. The engine services RPC between slot duties, so a request arriving while
 /// a proposal is being signed waits for that signature; it should never wait
 /// for a whole slot.
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often a call waiting for the consensus thread checks that its client is
+/// still connected. The first check is one interval in, so a call the engine
+/// picks up promptly is never probed at all.
+const CLIENT_GONE_POLL: Duration = Duration::from_secs(1);
 
 /// Default and maximum page size for [`RpcRequest::Utxos`].
 const UTXO_PAGE_DEFAULT: usize = 100;
@@ -966,15 +1072,61 @@ pub trait RpcBackend: Send + Sync + 'static {
     fn call_from(&self, req: RpcRequest, _source: IpAddr) -> RpcResult {
         self.call(req)
     }
+
+    /// [`Self::call_from`], plus a probe that reports whether the HTTP client
+    /// has disconnected, so a backend that queues work can stop waiting for a
+    /// caller that is no longer there. Backends that answer inline ignore it.
+    fn call_from_connection(
+        &self,
+        req: RpcRequest,
+        source: IpAddr,
+        _client_gone: &dyn Fn() -> bool,
+    ) -> RpcResult {
+        self.call_from(req, source)
+    }
+}
+
+/// The request and its queue permit, owned by whichever side claims them
+/// first: the consensus thread when it starts the call, or the HTTP worker
+/// when it gives up on a call that has not started.
+type QueuedRpc = Arc<Mutex<Option<(RpcRequest, crate::connection_limit::Permit)>>>;
+
+fn claim_queued(queued: &QueuedRpc) -> Option<(RpcRequest, crate::connection_limit::Permit)> {
+    match queued.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    }
 }
 
 /// One in-flight request handed to the consensus thread, with the channel it
 /// must answer on.
+///
+/// The request itself is not a field: it sits with its queue permit in a slot
+/// shared with the HTTP worker, and [`Self::start`] claims both. A call whose
+/// worker timed out or whose client left before the consensus thread reached
+/// it was already claimed by the worker — permit released, request (up to
+/// [`MAX_BODY_BYTES`] of transaction) freed — and what is left in the engine's
+/// queue is this small husk, which `start` reports as `None`.
 pub struct RpcCall {
-    pub req: RpcRequest,
+    queued: QueuedRpc,
     pub reply: Sender<RpcResult>,
     pub(crate) verification_source: Option<[u8; 32]>,
+}
+
+/// A call the consensus thread has begun. The queue permit is held until this
+/// is dropped: once work has started, an HTTP timeout must not free capacity
+/// while the consensus thread still owes the work.
+pub(crate) struct StartedRpc {
+    pub(crate) req: RpcRequest,
     _permit: crate::connection_limit::Permit,
+}
+
+impl RpcCall {
+    /// Claim the call for execution, or `None` if it was abandoned while it
+    /// was queued — in which case it must not be executed or answered.
+    pub(crate) fn start(&self) -> Option<StartedRpc> {
+        claim_queued(&self.queued).map(|(req, permit)| StartedRpc { req, _permit: permit })
+    }
 }
 
 /// One complete `getblockcount` answer published after a canonical change.
@@ -1024,6 +1176,8 @@ pub struct EngineBackend {
     /// Complete canonical summary for the polling-only `getblockcount` call.
     block_count: Option<SharedBlockCount>,
     pending: Arc<crate::connection_limit::Limits>,
+    /// [`ENGINE_TIMEOUT`] in production; a field so a test can shorten it.
+    timeout: Duration,
 }
 
 impl EngineBackend {
@@ -1033,6 +1187,7 @@ impl EngineBackend {
             head: None,
             block_count: None,
             pending: Arc::default(),
+            timeout: ENGINE_TIMEOUT,
         }
     }
 
@@ -1047,6 +1202,7 @@ impl EngineBackend {
             head: Some(head),
             block_count: None,
             pending: Arc::default(),
+            timeout: ENGINE_TIMEOUT,
         }
     }
 
@@ -1063,6 +1219,7 @@ impl EngineBackend {
             head: Some(head),
             block_count: Some(block_count),
             pending: Arc::default(),
+            timeout: ENGINE_TIMEOUT,
         }
     }
 
@@ -1166,7 +1323,12 @@ impl EngineBackend {
         }
     }
 
-    fn call_attributed(&self, req: RpcRequest, source: Option<IpAddr>) -> RpcResult {
+    fn call_attributed(
+        &self,
+        req: RpcRequest,
+        source: Option<IpAddr>,
+        client_gone: &dyn Fn() -> bool,
+    ) -> RpcResult {
         if let Some(answered) = Self::locally(&req) {
             return answered;
         }
@@ -1176,11 +1338,16 @@ impl EngineBackend {
         if let Some(answered) = self.from_head(&req) {
             return answered;
         }
-        // Reservation travels with the queued request, so HTTP timeouts do
-        // not free capacity while the consensus thread still owes the work.
+        // The reservation is claimed by the consensus thread when it STARTS
+        // the call, and from then on an HTTP timeout does not free capacity
+        // while that thread still owes the work. Until then it is this
+        // worker's to give back: a call nobody is waiting for any more must
+        // not keep a slot, or sixteen abandoned calls lock a source — behind a
+        // proxy, every caller — out for as long as the engine is busy.
         let queue_source = source.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        let permit = self.pending.reserve(queue_source, 16)
+        let permit = self.pending.reserve(queue_source, MAX_ENGINE_CALLS_PER_IP)
             .ok_or_else(|| RpcError::unavailable("RPC engine queue is full; retry later"))?;
+        let queued: QueuedRpc = Arc::new(Mutex::new(Some((req, permit))));
         let verification_source = source.map(crate::net::verification_source_for_ip);
         let (tx, rx) = mpsc::channel::<RpcResult>();
         let sender = match self.engine.lock() {
@@ -1190,33 +1357,77 @@ impl EngineBackend {
             Err(poisoned) => poisoned.into_inner().clone(),
         };
         if sender.send(crate::engine::EngineEvent::Rpc(RpcCall {
-            req,
+            queued: Arc::clone(&queued),
             reply: tx,
             verification_source,
-            _permit: permit,
         })).is_err() {
             return Err(RpcError::unavailable("node is shutting down"));
         }
-        match rx.recv_timeout(ENGINE_TIMEOUT) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(RpcError::unavailable(format!(
-                "consensus thread did not answer within {}s",
-                ENGINE_TIMEOUT.as_secs()
-            ))),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(RpcError::unavailable("node is shutting down"))
+        let Some(deadline) = Instant::now().checked_add(self.timeout) else {
+            drop(claim_queued(&queued));
+            return Err(RpcError::unavailable("engine deadline out of range"));
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining.min(CLIENT_GONE_POLL)) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(RpcError::unavailable("node is shutting down"));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
+            let timed_out = Instant::now() >= deadline;
+            if !timed_out && !client_gone() {
+                continue;
+            }
+            // Claiming the slot is what decides the race with the consensus
+            // thread: if the call is still queued, this drops the request and
+            // its permit and the engine will skip the husk. If the engine got
+            // there first the permit stays with it until the work is done.
+            let abandoned = claim_queued(&queued).is_some();
+            if timed_out {
+                return Err(RpcError::unavailable(format!(
+                    "consensus thread did not answer within {}s",
+                    self.timeout.as_secs()
+                )));
+            }
+            if abandoned {
+                return Err(RpcError::unavailable("client disconnected before the call started"));
+            }
+            // Already running, client gone: nothing to release early, and the
+            // probe will keep saying so — just wait out the deadline.
+            return match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Err(RpcError::unavailable(format!(
+                        "consensus thread did not answer within {}s",
+                        self.timeout.as_secs()
+                    )))
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(RpcError::unavailable("node is shutting down"))
+                }
+            };
         }
     }
 }
 
 impl RpcBackend for EngineBackend {
     fn call(&self, req: RpcRequest) -> RpcResult {
-        self.call_attributed(req, None)
+        self.call_attributed(req, None, &|| false)
     }
 
     fn call_from(&self, req: RpcRequest, source: IpAddr) -> RpcResult {
-        self.call_attributed(req, Some(source))
+        self.call_attributed(req, Some(source), &|| false)
+    }
+
+    fn call_from_connection(
+        &self,
+        req: RpcRequest,
+        source: IpAddr,
+        client_gone: &dyn Fn() -> bool,
+    ) -> RpcResult {
+        self.call_attributed(req, Some(source), client_gone)
     }
 }
 
@@ -1452,7 +1663,7 @@ pub fn handle_body(body: &str, backend: &dyn RpcBackend) -> String {
 fn handle_body_from(
     body: &str,
     backend: &dyn RpcBackend,
-    source: Option<IpAddr>,
+    source: Option<(IpAddr, &dyn Fn() -> bool)>,
 ) -> String {
     let request = match parse_json(body) {
         Ok(v) => v,
@@ -1494,7 +1705,7 @@ fn handle_body_from(
 
     let params = request.get("params").filter(|p| !matches!(p, Json::Null));
     let outcome = route(method, params).and_then(|req| match source {
-        Some(source) => backend.call_from(req, source),
+        Some((source, client_gone)) => backend.call_from_connection(req, source, client_gone),
         None => backend.call(req),
     });
     envelope(id, outcome)
@@ -1516,6 +1727,21 @@ pub fn serve(
     port: u16,
     backend: Arc<dyn RpcBackend>,
 ) -> io::Result<SocketAddr> {
+    // A malformed list refuses to start rather than silently trusting nobody
+    // (limits the operator believes are per-client would not be) or anybody.
+    let proxies = TrustedProxies::from_env()
+        .map_err(|why| io::Error::new(io::ErrorKind::InvalidInput, why))?;
+    serve_behind(bind_addr, port, backend, proxies)
+}
+
+/// [`serve`] with the trusted-proxy list given rather than read from the
+/// environment, so a test can choose it without mutating process-global state.
+fn serve_behind(
+    bind_addr: &str,
+    port: u16,
+    backend: Arc<dyn RpcBackend>,
+    proxies: TrustedProxies,
+) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind((bind_addr, port))?;
     let local = listener.local_addr()?;
     let live = Arc::new(AtomicUsize::new(0));
@@ -1523,45 +1749,171 @@ pub fn serve(
     // address are both fixed for the life of this listener.
     let hosts = Arc::new(HostPolicy::new(bind_addr));
     let ip_limits = Arc::new(crate::connection_limit::Limits::default());
+    // Connections from a trusted proxy before their client is known. A
+    // separate table from `ip_limits` because it has a different cap, and a
+    // proxy's own address may also end up as a source there (no usable
+    // forwarded header).
+    let unattributed = Arc::new(crate::connection_limit::Limits::default());
+    let proxies = Arc::new(proxies);
+    let busy = busy_response();
     thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(sock) = conn else { continue };
             let Ok(address) = sock.peer_addr() else { continue };
-            let Some(permit) = reserve_connection(address.ip(), &live, &ip_limits) else {
+            let peer = address.ip();
+            let admitted = if proxies.contains(peer) {
+                reserve_connection_capped(
+                    peer,
+                    &live,
+                    &unattributed,
+                    MAX_UNATTRIBUTED_PROXY_CONNECTIONS,
+                )
+            } else {
+                reserve_connection(peer, &live, &ip_limits)
+            };
+            let Some(permit) = admitted else {
+                refuse_busy(&sock, &busy);
                 continue;
             };
             let backend = backend.clone();
             let hosts = hosts.clone();
+            let proxies = proxies.clone();
+            let ip_limits = ip_limits.clone();
             thread::spawn(move || {
-                let _permit = permit;
+                let mut permit = permit;
                 let mut sock = sock;
-                serve_connection(&mut sock, backend.as_ref(), &hosts, address.ip());
+                serve_connection(
+                    &mut sock,
+                    backend.as_ref(),
+                    &hosts,
+                    peer,
+                    &mut |forwarded: &[String]| {
+                        attribute_connection(&proxies, &ip_limits, peer, forwarded, &mut permit)
+                    },
+                );
             });
         }
     });
     Ok(local)
 }
 
+/// The complete answer a refused connection gets: `503`, `Retry-After`, and a
+/// JSON-RPC error body, built once per listener.
+fn busy_response() -> Vec<u8> {
+    let body = envelope(
+        Json::Null,
+        Err(RpcError::unavailable("RPC connection limit reached; retry shortly")),
+    );
+    format!(
+        "HTTP/1.1 503 Service Unavailable\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Retry-After: {RETRY_AFTER_SECS}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// Tell a connection that was refused admission why, then let it close.
+///
+/// Dropping it silently made a full listener look like a network fault: the
+/// client saw a reset or an empty reply and could not tell "retry in a moment"
+/// from "this node is gone". This runs on the accept thread, so it must never
+/// wait: ONE non-blocking write of a response far smaller than a fresh
+/// socket's send buffer, result ignored. It is best effort by construction —
+/// the request is not read, and a stack may discard the reply if the client's
+/// bytes arrive after the close.
+fn refuse_busy(sock: &TcpStream, response: &[u8]) {
+    if sock.set_nonblocking(true).is_ok() {
+        let mut sock = sock;
+        let _ = sock.write(response);
+    }
+}
+
+/// Decide which address a connection is charged to, once its head is parsed.
+///
+/// A connection from anything but a trusted proxy is charged to its TCP peer
+/// and already was, at accept: nothing changes and `forwarded` is not looked
+/// at. A connection from a trusted proxy was admitted against the proxy's
+/// unattributed allowance; here it is re-charged to the forwarded client's own
+/// [`MAX_CONNECTIONS_PER_IP`] bucket, or refused `503` if that is full.
+fn attribute_connection(
+    proxies: &TrustedProxies,
+    ip_limits: &Arc<crate::connection_limit::Limits>,
+    peer: IpAddr,
+    forwarded: &[String],
+    permit: &mut RpcConnectionPermit,
+) -> Result<IpAddr, HttpError> {
+    if !proxies.contains(peer) {
+        return Ok(peer);
+    }
+    let client = proxies.client_for(peer, forwarded);
+    let charged = ip_limits.reserve(client, MAX_CONNECTIONS_PER_IP).ok_or_else(|| {
+        http_err(503, "too many concurrent connections from this client address; retry shortly")
+    })?;
+    // Assigning drops the proxy's unattributed charge.
+    permit.ip = charged;
+    Ok(client)
+}
+
+/// True when the peer has closed or reset the connection. One non-blocking
+/// `peek`: a FIN reads as zero bytes, a reset as an error, and "nothing to
+/// read yet" as `WouldBlock`. Any failure to ask is reported as "still here".
+fn client_gone(sock: &TcpStream) -> bool {
+    if sock.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let seen = sock.peek(&mut [0u8; 1]);
+    if sock.set_nonblocking(false).is_err() {
+        // A socket stuck non-blocking cannot be answered reliably either.
+        return true;
+    }
+    match seen {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted),
+    }
+}
+
 fn serve_connection(
     sock: &mut TcpStream,
     backend: &dyn RpcBackend,
     hosts: &HostPolicy,
-    source: IpAddr,
+    peer: IpAddr,
+    attribute: &mut dyn FnMut(&[String]) -> Result<IpAddr, HttpError>,
 ) {
     let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
     let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
-    match read_request(sock, hosts) {
+    // The address the limits are keyed by: the TCP peer unless `attribute`
+    // names a client forwarded by a trusted proxy.
+    let mut source = peer;
+    let request = read_request(sock, hosts, &mut |forwarded| {
+        source = attribute(forwarded)?;
+        Ok(())
+    });
+    match request {
         Ok(body) => {
             // The body must be text before it can be JSON. Invalid UTF-8 is a
             // parse error with a JSON-RPC shape, not a dropped connection.
             let response = match std::str::from_utf8(&body) {
-                Ok(text) => handle_body_from(text, backend, Some(source)),
+                Ok(text) => {
+                    let probe: &TcpStream = sock;
+                    let gone: &dyn Fn() -> bool = &|| client_gone(probe);
+                    handle_body_from(text, backend, Some((source, gone)))
+                }
                 Err(_) => envelope(Json::Null, Err(RpcError::parse_error("body is not UTF-8"))),
             };
             let _ = respond(sock, 200, &response);
         }
         Err(HttpError { status, message }) => {
-            let _ = respond(sock, status, &envelope(Json::Null, Err(RpcError::invalid_request(message))));
+            // 503 is "at capacity, retry", which is not the client's mistake.
+            let error = if status == 503 {
+                RpcError::unavailable(message)
+            } else {
+                RpcError::invalid_request(message)
+            };
+            let _ = respond(sock, status, &envelope(Json::Null, Err(error)));
         }
     }
 }
@@ -1708,6 +2060,124 @@ fn valid_host_port_suffix(suffix: &str) -> bool {
         && port.parse::<u16>().is_ok()
 }
 
+// ─── Trusted proxies: whose word is taken for the client address ───────────
+
+/// Addresses of reverse proxies whose `X-Forwarded-For` is believed —
+/// comma-separated IP literals, e.g. `127.0.0.1,::1` for a proxy or tunnel on
+/// the same host. Set by `--rpc-trusted-proxy`, or directly. Unset or empty
+/// means none, which is the default. Read once per [`serve`].
+pub(crate) const RPC_TRUSTED_PROXIES_ENV: &str = "BLOCH_RPC_TRUSTED_PROXIES";
+
+/// The one forwarded header consulted. `Forwarded` (RFC 7239),
+/// `X-Real-IP`, `CF-Connecting-IP` and the rest are never read.
+const FORWARDED_HEADER: &str = "x-forwarded-for";
+
+/// The TCP peers that are allowed to say who the client is.
+///
+/// # What is believed, exactly
+///
+/// Nothing, unless the TCP peer of the connection is itself in this list.
+/// Then every `X-Forwarded-For` field line of the request is joined in the
+/// order received into one comma-separated list, and that list is read from
+/// the RIGHT: entries that are trusted proxies are skipped, and the first
+/// entry that is not is the client. That is the address the nearest trusted
+/// proxy saw its connection come from — the only entry in the header written
+/// by a party this node trusts about a party it does not.
+///
+/// The left-most entry is never used: it is whatever the client typed. A
+/// caller sending `X-Forwarded-For: 203.0.113.7` through a proxy that appends
+/// produces `203.0.113.7, <caller>`, and the right-most rule picks `<caller>`.
+///
+/// It falls back to the proxy's own address — one shared bucket, exactly the
+/// behaviour without this option — when the header is absent, when every
+/// entry is a trusted proxy, or when the entry reached is not an IP address
+/// (optionally with a port; `unknown` and obfuscated identifiers are not
+/// guessed at). A fallback never widens anyone's allowance.
+///
+/// Entries are single addresses, compared after IPv4-mapped IPv6 is folded
+/// to IPv4. There are no CIDR ranges: a proxy fleet is listed address by
+/// address, so a typo cannot trust a network.
+#[derive(Debug, Default)]
+pub(crate) struct TrustedProxies(Vec<IpAddr>);
+
+impl TrustedProxies {
+    fn from_env() -> Result<Self, String> {
+        match std::env::var(RPC_TRUSTED_PROXIES_ENV) {
+            Ok(list) => Self::parse(&list),
+            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(format!("{RPC_TRUSTED_PROXIES_ENV} is not valid UTF-8"))
+            }
+        }
+    }
+
+    /// Parse a comma-separated list of IP literals. Empty entries are
+    /// skipped; anything else that is not an IP address is an error, because
+    /// a silently dropped entry leaves a proxy's callers in one bucket while
+    /// the operator believes otherwise.
+    pub(crate) fn parse(list: &str) -> Result<Self, String> {
+        let mut proxies = Vec::new();
+        for entry in list.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let ip = entry.parse::<IpAddr>().map_err(|_| {
+                format!(
+                    "trusted proxy `{entry}` is not an IP address \
+                     (hostnames and CIDR ranges are not accepted)"
+                )
+            })?;
+            let ip = fold_mapped(ip);
+            if !proxies.contains(&ip) {
+                proxies.push(ip);
+            }
+        }
+        Ok(TrustedProxies(proxies))
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        !self.0.is_empty() && self.0.contains(&fold_mapped(ip))
+    }
+
+    /// The address a connection from `peer` is attributed to: see the type's
+    /// documentation. `forwarded` holds the `X-Forwarded-For` field values in
+    /// the order they appeared in the request.
+    fn client_for(&self, peer: IpAddr, forwarded: &[String]) -> IpAddr {
+        if !self.contains(peer) {
+            return peer;
+        }
+        for hop in forwarded.iter().rev().flat_map(|line| line.rsplit(',')) {
+            let Some(ip) = forwarded_hop(hop) else { return peer };
+            if !self.contains(ip) {
+                return ip;
+            }
+        }
+        peer
+    }
+}
+
+fn fold_mapped(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// One `X-Forwarded-For` entry as an address: `192.0.2.1`, `192.0.2.1:4711`,
+/// `2001:db8::1`, `[2001:db8::1]` or `[2001:db8::1]:4711`.
+fn forwarded_hop(hop: &str) -> Option<IpAddr> {
+    let hop = hop.trim_matches([' ', '\t']);
+    let ip = hop
+        .parse::<IpAddr>()
+        .or_else(|_| hop.parse::<SocketAddr>().map(|addr| addr.ip()))
+        .or_else(|_| {
+            hop.strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+                .unwrap_or("")
+                .parse::<std::net::Ipv6Addr>()
+                .map(IpAddr::V6)
+        })
+        .ok()?;
+    Some(fold_mapped(ip))
+}
+
 /// `Content-Type`, ignoring `;`-separated parameters (e.g. `; charset=utf-8`)
 /// and matched case-insensitively.
 fn content_type_allowed(ct: Option<&str>) -> bool {
@@ -1719,18 +2189,37 @@ fn content_type_allowed(ct: Option<&str>) -> bool {
 
 /// Read one HTTP request and return its body — after the browser-request
 /// gate above has passed.
-fn read_request(sock: &mut TcpStream, hosts: &HostPolicy) -> Result<Vec<u8>, HttpError> {
+///
+/// `on_head` is called once, after the head is parsed and before anything
+/// else is decided or the body is read, with the request's `X-Forwarded-For`
+/// field values in order. It is where a connection from a trusted proxy is
+/// re-charged to its client; an `Err` from it is the response.
+fn read_request(
+    sock: &mut TcpStream,
+    hosts: &HostPolicy,
+    on_head: &mut dyn FnMut(&[String]) -> Result<(), HttpError>,
+) -> Result<Vec<u8>, HttpError> {
     let deadline = Instant::now().checked_add(IO_TIMEOUT)
         .ok_or_else(|| http_err(408, "request deadline out of range"))?;
-    read_request_until(sock, hosts, deadline)
+    read_request_attributed(sock, hosts, deadline, on_head)
 }
 
 /// One deadline spans both the head and body. A socket timeout alone starts
 /// over on every `read`, allowing a slow sender to reserve a worker forever.
+#[cfg(test)]
 fn read_request_until(
     sock: &mut TcpStream,
     hosts: &HostPolicy,
     deadline: Instant,
+) -> Result<Vec<u8>, HttpError> {
+    read_request_attributed(sock, hosts, deadline, &mut |_| Ok(()))
+}
+
+fn read_request_attributed(
+    sock: &mut TcpStream,
+    hosts: &HostPolicy,
+    deadline: Instant,
+    on_head: &mut dyn FnMut(&[String]) -> Result<(), HttpError>,
 ) -> Result<Vec<u8>, HttpError> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
@@ -1777,6 +2266,7 @@ fn read_request_until(
     let mut content_type: Option<String> = None;
     let mut origin: Option<String> = None;
     let mut host: Option<String> = None;
+    let mut forwarded: Vec<String> = Vec::new();
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             return Err(http_err(400, "malformed header field"));
@@ -1812,8 +2302,13 @@ fn read_request_until(
             if host.replace(value.to_string()).is_some() {
                 return Err(http_err(400, "duplicate Host"));
             }
+        } else if name.eq_ignore_ascii_case(FORWARDED_HEADER) {
+            // Collected, not believed: whether any of it counts is decided by
+            // who the TCP peer is (see `TrustedProxies`).
+            forwarded.push(value.to_string());
         }
     }
+    on_head(&forwarded)?;
 
     // R1 A3-M4: the browser-request gate, before Content-Length is even
     // consulted — three header comparisons are cheaper than anything past
@@ -1901,6 +2396,12 @@ fn respond(sock: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
         503 => "Service Unavailable",
         _ => "Error",
     };
+    // Every 503 this server sends means "at capacity right now".
+    let retry_after = if status == 503 {
+        format!("Retry-After: {RETRY_AFTER_SECS}\r\n")
+    } else {
+        String::new()
+    };
     // `Connection: close` because this server does not implement keep-alive:
     // one request per connection, and the client is told so instead of being
     // left waiting on a socket that will never answer again.
@@ -1908,12 +2409,45 @@ fn respond(sock: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\r\n",
+         {retry_after}Connection: close\r\n\r\n",
         body.len()
     );
-    sock.write_all(head.as_bytes())?;
-    sock.write_all(body.as_bytes())?;
+    let deadline = Instant::now()
+        .checked_add(response_timeout(head.len().saturating_add(body.len())))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "response deadline out of range"))?;
+    respond_until(sock, &head, body, deadline)
+}
+
+/// One deadline spans the head and the whole body: see [`response_timeout`].
+fn respond_until(sock: &mut TcpStream, head: &str, body: &str, deadline: Instant) -> io::Result<()> {
+    write_before_deadline(sock, head.as_bytes(), deadline)?;
+    write_before_deadline(sock, body.as_bytes(), deadline)?;
     sock.flush()
+}
+
+/// `write_all` against a fixed deadline. The socket timeout is re-armed with
+/// the REMAINING budget before every write, so a peer that keeps accepting a
+/// few bytes cannot renew it; failure to install the timeout is an error,
+/// never an unbounded socket operation.
+fn write_before_deadline(sock: &mut TcpStream, mut buf: &[u8], deadline: Instant) -> io::Result<()> {
+    let expired = || io::Error::new(io::ErrorKind::TimedOut, "response deadline exceeded");
+    while !buf.is_empty() {
+        let remaining = deadline.checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(expired)?;
+        sock.set_write_timeout(Some(remaining))?;
+        match sock.write(buf) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "peer accepts no more bytes")),
+            Ok(n) => buf = buf.get(n..).unwrap_or_default(),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            // A send timeout surfaces as either kind, depending on platform.
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                return Err(expired());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 // ─── Formatting: pure projections of committed state ────────────────────────

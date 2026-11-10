@@ -2096,21 +2096,62 @@ fn audit_flat_json_amplification_and_composite_ids_are_refused() {
     }
 }
 
+/// How many engine-queue permits `source` can still take right now.
+fn free_engine_permits(backend: &EngineBackend, source: IpAddr) -> usize {
+    let mut held = Vec::new();
+    while let Some(permit) = backend.pending.reserve(source, MAX_ENGINE_CALLS_PER_IP) {
+        held.push(permit);
+    }
+    held.len()
+}
+
+/// RPC-2. This test used to pin the opposite for queued calls: every permit
+/// stayed taken after the HTTP timeout until the engine dropped the call, so
+/// sixteen abandoned calls locked their source out for as long as the engine
+/// was busy. Now a call the engine has STARTED still holds its permit past the
+/// timeout (the work is still owed), and a call that was only queued gives its
+/// permit back at the timeout and is skipped by the engine.
 #[test]
 fn audit_timed_out_rpc_work_remains_bounded_until_engine_drops_it() {
     let (tx, rx) = std::sync::mpsc::channel();
-    let backend = std::sync::Arc::new(EngineBackend::new(tx));
+    let mut backend = EngineBackend::new(tx);
+    backend.timeout = Duration::from_millis(300);
+    let backend = std::sync::Arc::new(backend);
+    let localhost = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
     let mut callers = Vec::new();
-    for _ in 0..16 {
+    for _ in 0..MAX_ENGINE_CALLS_PER_IP {
         let backend = backend.clone();
         callers.push(std::thread::spawn(move || backend.call(RpcRequest::ChainInfo)));
     }
-    let pending: Vec<_> = (0..16).map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
+    let pending: Vec<RpcCall> = (0..MAX_ENGINE_CALLS_PER_IP)
+        .map(|_| match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            crate::engine::EngineEvent::Rpc(call) => call,
+            _ => panic!("expected an RPC request"),
+        })
+        .collect();
     let refused = backend.call(RpcRequest::ChainInfo).unwrap_err();
     assert!(refused.message.contains("queue is full"));
-    for caller in callers { assert!(caller.join().unwrap().is_err()); }
-    assert!(backend.call(RpcRequest::ChainInfo).unwrap_err().message.contains("queue is full"));
+
+    // The engine reaches four of them before the HTTP side gives up.
+    let started: Vec<StartedRpc> =
+        pending.iter().take(4).map(|call| call.start().expect("still queued")).collect();
+    for caller in callers {
+        let error = caller.join().unwrap().unwrap_err();
+        assert!(error.message.contains("did not answer"), "{}", error.message);
+    }
+
+    assert_eq!(
+        free_engine_permits(&backend, localhost),
+        MAX_ENGINE_CALLS_PER_IP - 4,
+        "abandoned queued calls must release their permits; started ones must not",
+    );
+    for call in pending.iter().skip(4) {
+        assert!(call.start().is_none(), "an abandoned call must not be executed");
+    }
+    drop(started);
+    assert_eq!(free_engine_permits(&backend, localhost), MAX_ENGINE_CALLS_PER_IP);
     drop(pending);
+
     let next = {
         let backend = backend.clone();
         std::thread::spawn(move || backend.call(RpcRequest::ChainInfo))
@@ -2118,8 +2159,39 @@ fn audit_timed_out_rpc_work_remains_bounded_until_engine_drops_it() {
     let crate::engine::EngineEvent::Rpc(call) = rx.recv_timeout(Duration::from_secs(5)).unwrap() else {
         panic!("expected an RPC request");
     };
+    let work = call.start().expect("a live call is claimed by the engine");
+    assert_eq!(work.req, RpcRequest::ChainInfo);
     call.reply.send(Ok(Json::Null)).unwrap();
     assert_eq!(next.join().unwrap().unwrap(), Json::Null);
+}
+
+/// RPC-2: a queued call whose client hung up is abandoned at the next probe,
+/// long before the engine timeout, and its permit comes back with it.
+#[test]
+fn rpc2_a_queued_call_whose_client_left_releases_its_permit() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let backend = std::sync::Arc::new(EngineBackend::new(tx));
+    let source: IpAddr = "192.0.2.77".parse().unwrap();
+    let began = Instant::now();
+    let worker = {
+        let backend = backend.clone();
+        std::thread::spawn(move || {
+            backend.call_from_connection(RpcRequest::ChainInfo, source, &|| true)
+        })
+    };
+    let crate::engine::EngineEvent::Rpc(call) = rx.recv_timeout(Duration::from_secs(5)).unwrap() else {
+        panic!("expected an RPC request");
+    };
+    assert_eq!(free_engine_permits(&backend, source), MAX_ENGINE_CALLS_PER_IP - 1);
+    let error = worker.join().unwrap().unwrap_err();
+    assert_eq!(error.code, NODE_UNAVAILABLE);
+    assert!(error.message.contains("client disconnected"), "{}", error.message);
+    assert!(
+        began.elapsed() < ENGINE_TIMEOUT / 2,
+        "a departed client must not hold its worker for the whole engine timeout",
+    );
+    assert_eq!(free_engine_permits(&backend, source), MAX_ENGINE_CALLS_PER_IP);
+    assert!(call.start().is_none(), "the engine must skip the abandoned call");
 }
 
 #[test]
@@ -2146,4 +2218,261 @@ fn rpc_source_identity_survives_queueing_and_normalizes_mapped_ipv4() {
         call.reply.send(Ok(Json::Null)).unwrap();
         assert_eq!(worker.join().unwrap().unwrap(), Json::Null);
     }
+}
+
+// ─── RPC-2: response deadline, 503 on refusal, trusted proxies ──────────────
+
+#[test]
+fn rpc2_response_budget_scales_with_size_between_fixed_bounds() {
+    const MIB: usize = 1024 * 1024;
+    assert_eq!(response_timeout(0), Duration::from_secs(30));
+    assert_eq!(response_timeout(MIB), Duration::from_secs(30));
+    assert_eq!(response_timeout(10 * MIB), Duration::from_secs(160));
+    assert_eq!(response_timeout(64 * MIB), Duration::from_secs(300));
+    assert_eq!(response_timeout(usize::MAX), Duration::from_secs(300));
+}
+
+/// A reader that keeps taking a little is making "progress" on every write,
+/// so a per-write timeout never fires. One deadline over the whole response
+/// does, and the worker is free again.
+#[test]
+fn rpc2_slow_reader_is_cut_at_the_response_deadline() {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let reader = thread::spawn(move || {
+        let mut chunk = [0u8; 512];
+        let mut taken = 0usize;
+        // About 50 KiB/s, for at most four seconds.
+        for _ in 0..400 {
+            match client.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => taken += n,
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        taken
+    });
+    // Far more than loopback socket buffers can absorb on any platform.
+    let body = " ".repeat(64 * 1024 * 1024);
+    let began = Instant::now();
+    let result = respond_until(
+        &mut server,
+        "HTTP/1.1 200 OK\r\n\r\n",
+        &body,
+        began + Duration::from_millis(400),
+    );
+    let elapsed = began.elapsed();
+    drop(server);
+    let taken = reader.join().unwrap();
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert!(elapsed < Duration::from_secs(3), "the write outlived its deadline: {elapsed:?}");
+    assert!(taken > 0, "the reader was meant to be slow, not absent");
+    assert!(taken < body.len(), "the whole body was delivered; the test proved nothing");
+}
+
+/// Blocks `getchaininfo` until released, answers everything else at once, and
+/// records the source address each call was attributed to.
+struct Gate {
+    entered: std::sync::atomic::AtomicUsize,
+    open: Mutex<bool>,
+    opened: std::sync::Condvar,
+    sources: Mutex<Vec<IpAddr>>,
+}
+
+impl Gate {
+    fn new() -> Arc<Self> {
+        Arc::new(Gate {
+            entered: std::sync::atomic::AtomicUsize::new(0),
+            open: Mutex::new(false),
+            opened: std::sync::Condvar::new(),
+            sources: Mutex::new(Vec::new()),
+        })
+    }
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+    fn wait_for_entered(&self, n: usize) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while self.entered.load(std::sync::atomic::Ordering::SeqCst) < n {
+            assert!(Instant::now() < until, "held requests never reached the backend");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn last_source(&self) -> Option<IpAddr> {
+        self.sources.lock().unwrap().last().copied()
+    }
+}
+
+impl RpcBackend for Gate {
+    fn call(&self, req: RpcRequest) -> RpcResult {
+        self.call_from(req, IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+    }
+    fn call_from(&self, req: RpcRequest, source: IpAddr) -> RpcResult {
+        self.sources.lock().unwrap().push(source);
+        if matches!(req, RpcRequest::ChainInfo) {
+            self.entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+        }
+        Ok(Json::s("ok"))
+    }
+}
+
+fn forwarded_post(method: &str, forwarded: Option<&str>) -> String {
+    let body = request(method, "[]");
+    let forwarded = forwarded.map(|v| format!("X-Forwarded-For: {v}\r\n")).unwrap_or_default();
+    format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         {forwarded}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// Open a connection, send a complete request and leave it waiting.
+fn hold(addr: SocketAddr, raw: &str) -> TcpStream {
+    let mut sock = TcpStream::connect(addr).expect("connect to the test server");
+    sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    sock.write_all(raw.as_bytes()).unwrap();
+    sock
+}
+
+/// A refused connection is told so. It used to be closed without a byte,
+/// which a client cannot tell from a dead node.
+///
+/// No trusted proxy is configured here, so the differing `X-Forwarded-For`
+/// values on the held requests must change nothing: all of them are one
+/// source, the loopback peer.
+#[test]
+fn rpc2_full_listener_answers_503_with_retry_after() {
+    let gate = Gate::new();
+    let addr = serve_behind("127.0.0.1", 0, gate.clone(), TrustedProxies::default()).unwrap();
+    let held: Vec<TcpStream> = (0..MAX_CONNECTIONS_PER_IP)
+        .map(|i| hold(addr, &forwarded_post("getchaininfo", Some(&format!("198.51.100.{i}")))))
+        .collect();
+    gate.wait_for_entered(MAX_CONNECTIONS_PER_IP);
+    assert_eq!(
+        gate.last_source(),
+        Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        "a forwarded header from an untrusted peer must be ignored",
+    );
+
+    // Read without sending: the refusal must not depend on the request.
+    let mut refused = TcpStream::connect(addr).unwrap();
+    refused.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut reply = String::new();
+    let _ = refused.read_to_string(&mut reply);
+    assert!(reply.starts_with("HTTP/1.1 503 Service Unavailable\r\n"), "{reply:?}");
+    assert!(reply.contains("\r\nRetry-After: 1\r\n"), "{reply:?}");
+    assert!(reply.contains("\r\nConnection: close\r\n"), "{reply:?}");
+    let body = reply.split_once("\r\n\r\n").expect("a body").1;
+    assert_eq!(error_code(&parse_json(body).unwrap()), Some(NODE_UNAVAILABLE));
+
+    gate.release();
+    for mut sock in held {
+        let mut reply = String::new();
+        let _ = sock.read_to_string(&mut reply);
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply:?}");
+    }
+    // Slots come back as the workers exit.
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = http(addr, &forwarded_post("getblockcount", None));
+        if reply.starts_with("HTTP/1.1 200 OK") {
+            break;
+        }
+        assert!(Instant::now() < until, "the listener never recovered: {reply:?}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn rpc2_trusted_proxy_list_accepts_only_ip_literals() {
+    let proxies = TrustedProxies::parse(" 127.0.0.1 , ::1,, ::ffff:10.0.0.5 ").unwrap();
+    assert!(proxies.contains("127.0.0.1".parse().unwrap()));
+    assert!(proxies.contains("::ffff:127.0.0.1".parse().unwrap()), "mapped form is the same peer");
+    assert!(proxies.contains("::1".parse().unwrap()));
+    assert!(proxies.contains("10.0.0.5".parse().unwrap()));
+    assert!(!proxies.contains("10.0.0.6".parse().unwrap()));
+    assert!(!TrustedProxies::parse("").unwrap().contains("127.0.0.1".parse().unwrap()));
+    for bad in ["10.0.0.0/8", "proxy.internal", "127.0.0.1:8080", "127.0.0.1;::1", "*"] {
+        assert!(TrustedProxies::parse(bad).is_err(), "{bad} must be refused, not skipped");
+    }
+}
+
+#[test]
+fn rpc2_forwarded_client_is_the_rightmost_hop_that_is_not_a_trusted_proxy() {
+    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+    let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let proxy = ip("127.0.0.1");
+    let trusted = TrustedProxies::parse("127.0.0.1,10.0.0.5").unwrap();
+    let none = TrustedProxies::default();
+    let spoof = lines(&["203.0.113.7, 198.51.100.9"]);
+
+    // Not configured, or not from a listed proxy: the header is not read.
+    assert_eq!(none.client_for(proxy, &spoof), proxy);
+    assert_eq!(trusted.client_for(ip("192.0.2.1"), &spoof), ip("192.0.2.1"));
+
+    // From a trusted proxy: right-most, never the left-most (client-typed).
+    assert_eq!(trusted.client_for(proxy, &spoof), ip("198.51.100.9"));
+    // Trusted hops are skipped from the right, across field lines in order.
+    assert_eq!(
+        trusted.client_for(proxy, &lines(&["203.0.113.7", "198.51.100.9 ,10.0.0.5", "::ffff:127.0.0.1"])),
+        ip("198.51.100.9"),
+    );
+    // Ports and brackets are tolerated; mapped IPv4 folds to IPv4.
+    assert_eq!(trusted.client_for(proxy, &lines(&["198.51.100.9:4711"])), ip("198.51.100.9"));
+    assert_eq!(trusted.client_for(proxy, &lines(&["[2001:db8::1]:4711"])), ip("2001:db8::1"));
+    assert_eq!(trusted.client_for(proxy, &lines(&["[2001:db8::1]"])), ip("2001:db8::1"));
+    assert_eq!(trusted.client_for(proxy, &lines(&["::ffff:198.51.100.9"])), ip("198.51.100.9"));
+
+    // Nothing usable: fall back to the proxy's own (shared) bucket rather
+    // than to anything further left.
+    assert_eq!(trusted.client_for(proxy, &[]), proxy);
+    assert_eq!(trusted.client_for(proxy, &lines(&["10.0.0.5, 127.0.0.1"])), proxy);
+    assert_eq!(trusted.client_for(proxy, &lines(&["203.0.113.7, unknown"])), proxy);
+    assert_eq!(trusted.client_for(proxy, &lines(&["203.0.113.7,"])), proxy);
+    assert_eq!(trusted.client_for(proxy, &lines(&["203.0.113.7, _hidden, 10.0.0.5"])), proxy);
+}
+
+/// End to end through a listener that trusts its loopback peer: the forwarded
+/// client is what the backend is told, and what the connection limit counts.
+#[test]
+fn rpc2_trusted_proxy_connections_are_limited_per_forwarded_client() {
+    let gate = Gate::new();
+    let trusted = TrustedProxies::parse("127.0.0.1").unwrap();
+    let addr = serve_behind("127.0.0.1", 0, gate.clone(), trusted).unwrap();
+    let crowded = "198.51.100.9";
+
+    // The client-typed left-most entry varies; the hop the proxy appended
+    // does not, so these are all one source.
+    let held: Vec<TcpStream> = (0..MAX_CONNECTIONS_PER_IP)
+        .map(|i| hold(addr, &forwarded_post("getchaininfo", Some(&format!("203.0.113.{i}, {crowded}")))))
+        .collect();
+    gate.wait_for_entered(MAX_CONNECTIONS_PER_IP);
+    assert_eq!(gate.last_source(), Some(crowded.parse().unwrap()));
+
+    let reply = http(addr, &forwarded_post("getblockcount", Some(&format!("192.0.2.200, {crowded}"))));
+    assert!(reply.starts_with("HTTP/1.1 503 Service Unavailable\r\n"), "{reply:?}");
+    assert!(reply.contains("\r\nRetry-After: 1\r\n"), "{reply:?}");
+    assert!(reply.contains("-32004"), "{reply:?}");
+    assert_eq!(gate.last_source(), Some(crowded.parse().unwrap()), "a refused request reached the backend");
+
+    // Another client behind the same proxy is not locked out.
+    let reply = http(addr, &forwarded_post("getblockcount", Some("198.51.100.10")));
+    assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply:?}");
+    assert_eq!(gate.last_source(), Some("198.51.100.10".parse().unwrap()));
+
+    // No forwarded header: charged to the proxy itself, as without the option.
+    let reply = http(addr, &forwarded_post("getblockcount", None));
+    assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply:?}");
+    assert_eq!(gate.last_source(), Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
+
+    gate.release();
+    drop(held);
 }

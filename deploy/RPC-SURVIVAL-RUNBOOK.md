@@ -440,3 +440,94 @@ height 80,000 arrives.
   sweep was out of scope.
 - Did not verify the auxpow box's *intended* fate (full retirement vs. pool
   services only) — §6 is written to be safe under either.
+
+---
+
+## 9. Addendum (2026-11-10): what the node RPC limits, and what a proxy in front of it undoes
+
+§4 (socat `:PORT → 127.0.0.1`) and §5 (`cloudflared → http://127.0.0.1`) both put a
+forwarder between the internet and a node RPC bound to loopback. This section applies
+to that topology whenever the node behind it is the Genesis-4 `bloch-pos` node
+(`crates/bloch-pos-node/src/rpc.rs`); the same reasoning holds for any node RPC that
+keys its limits by peer address.
+
+### 9.1 What is and is not limited
+
+The RPC has **no authentication and no request-rate limit**. It bounds concurrency
+and time only:
+
+| Bound | Value | Keyed by |
+|---|---|---|
+| Concurrent connections, whole listener | 64 | global |
+| Concurrent connections | 8 | source address |
+| Calls queued for / running on the consensus thread | 16 | source address |
+| Signature-verification budget for submitted transactions | (see `net/source_budget.rs`) | source address |
+| Time to send one request | 30 s total | connection |
+| Time to drain one response | 30 s, rising with size at 64 KiB/s to at most 300 s, total | connection |
+| Wait for the consensus thread | 10 s | call |
+
+A connection refused for capacity is answered `503` with `Retry-After: 1` (best
+effort) rather than dropped. A call still queued when its request times out or its
+client disconnects gives its queue slot back immediately.
+
+Not limited by the node at all: requests per second, bytes per second, which methods
+a caller may use, and how many distinct sources may connect (up to the 64 total).
+
+### 9.2 Why a forwarder changes this
+
+"Source address" is the **TCP peer**. Behind socat, `ssh -L`, nginx or cloudflared the
+peer is always the forwarder — `127.0.0.1` in §4 and §5. Every user on the internet is
+then **one** source: they share one 8-connection bucket, one 16-call queue and one
+verification budget, and a single remote client holding eight slow connections locks
+out everyone else. The per-source limits separate nothing in that topology.
+
+### 9.3 What to do about it
+
+**Default (nothing configured): limit at the proxy.** The node ignores
+`X-Forwarded-For` and every other forwarded header unless told otherwise, because a
+client that can reach the port directly could put any address in one. With the default,
+per-client connection and rate limits MUST be enforced by the thing in front:
+Cloudflare rate-limiting rules for a tunnel, `limit_conn` / `limit_req` for nginx, or
+firewall connection limits (`ufw limit`, nftables `ct count`) for a bare port forward.
+A bare `socat` forward (§4 Step A) can do none of this and adds no header, so it has no
+per-client protection of any kind; put a real reverse proxy or the firewall in front of
+it if the port is public.
+
+**Optional: tell the node which peers are your proxy.**
+
+```bash
+bloch-pos run ... --rpc-trusted-proxy 127.0.0.1
+```
+
+or, equivalently, `BLOCH_RPC_TRUSTED_PROXIES=127.0.0.1` in the unit's environment
+(comma-separated IP literals; no hostnames, no CIDR ranges; a malformed list refuses to
+start). Then, **only for connections whose TCP peer is a listed address**:
+
+- the header read is `X-Forwarded-For`, and only that one (`Forwarded`, `X-Real-IP`,
+  `CF-Connecting-IP` are not consulted);
+- all its field lines are joined in order and read **from the right**; entries that are
+  themselves listed proxies are skipped; the first entry that is not is the client —
+  i.e. the address your nearest trusted proxy saw its connection come from;
+- the **left-most** entry is never used: it is whatever the client typed;
+- that client address becomes the key for the 8-connection limit, the 16-call queue
+  and the verification budget;
+- if the header is missing, every entry is a listed proxy, or the entry reached is not
+  an IP address, the connection is charged to the proxy's own address — one shared
+  bucket, the same as without the option.
+
+Before turning it on, check three things:
+
+1. **The proxy appends the address it accepted the connection from** to
+   `X-Forwarded-For` (nginx: `proxy_set_header X-Forwarded-For
+   $proxy_add_x_forwarded_for;`; Cloudflare's edge appends the connecting address for
+   tunnels). A proxy that passes the client's header through unchanged, or sets none,
+   must not be listed.
+2. **Nothing else can connect from a listed address.** Listing `127.0.0.1` trusts every
+   local process to name any client. That is appropriate on a box that runs the node
+   and its tunnel and nothing hostile; it is not appropriate on a shared host.
+3. **Every proxy hop you operate is listed**, or the client address found will be your
+   own outer proxy's.
+
+Even with the option on, the 64-connection total is shared by all callers, and there is
+still no rate limit: keep the proxy's own limits. The option makes the node's
+per-source bounds mean what they say; it does not replace the proxy.

@@ -7990,13 +7990,18 @@ pub fn run(cfg: Config) -> io::Result<()> {
                             engine.net.report(&origin, verdict);
                         }
                         EngineEvent::Rpc(call) => {
-                            let result = engine.serve_rpc_from(
-                                call.req,
-                                call.verification_source,
-                            );
-                            // A client that hung up between asking and being
-                            // answered is normal, not an error worth logging.
-                            let _ = call.reply.send(result);
+                            // `None`: the HTTP side gave up on this call while
+                            // it was queued and released its permit. Running
+                            // it now would be work nobody is waiting for.
+                            if let Some(started) = call.start() {
+                                let result = engine.serve_rpc_from(
+                                    started.req,
+                                    call.verification_source,
+                                );
+                                // A client that hung up between asking and being
+                                // answered is normal, not an error worth logging.
+                                let _ = call.reply.send(result);
+                            }
                         }
                     }
             }

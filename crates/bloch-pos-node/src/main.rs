@@ -552,6 +552,7 @@ fn print_help() {
                total — before a single balance is admitted. A devnet\n\
                manifest commits to none and the flag is then refused.\n\
                          [--rpc-bind <ip>] [--rpc-port <n>|off]\n\
+                         [--rpc-trusted-proxy <ip[,ip...]>]\n\
                          [--metrics-bind <ip>] [--metrics-port <n>] [--allow-public-metrics]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
                data persists in <dir>; a compatible local state cache skips its replay prefix.\n\
@@ -592,6 +593,19 @@ fn print_help() {
                port to the clients that are meant to reach it; anything that\n\
                can open a socket to it can read the node's entire state and\n\
                submit transactions.\n\
+               \n\
+               What the RPC does bound is concurrency, per source address:\n\
+               64 connections in all, 8 per source, 16 calls queued for the\n\
+               consensus thread per source. The source is the TCP peer, so\n\
+               behind a reverse proxy or tunnel (nginx, cloudflared, socat)\n\
+               EVERY caller is the proxy's address and shares one bucket —\n\
+               limit per client at the proxy. --rpc-trusted-proxy (or\n\
+               BLOCH_RPC_TRUSTED_PROXIES) names the proxy's own address(es),\n\
+               e.g. 127.0.0.1; only connections from those addresses then\n\
+               have their source taken from X-Forwarded-For (the right-most\n\
+               entry that is not itself a listed proxy). Default: none, and\n\
+               forwarded headers are ignored. List only addresses from\n\
+               which nothing but your proxy can connect.\n\
                A node started with an EMPTY data dir syncs from genesis: it\n\
                downloads every block from peers and validates each one\n\
                itself. No datadir is ever donated. While the chain is\n\
@@ -1825,6 +1839,23 @@ fn run_cmd(args: &[String]) {
             }
         },
     };
+
+    // Trusted reverse proxies for RPC source attribution. Sugar over the env
+    // var `rpc::serve` reads, like the operator flags above (same SAFETY
+    // note: still single-threaded here). Validated now, so a typo is a
+    // refusal at startup with the flag's name on it.
+    if let Some(value) = arg_value(args, "--rpc-trusted-proxy") {
+        if let Err(why) = rpc::TrustedProxies::parse(&value) {
+            eprintln!("run: --rpc-trusted-proxy: {why}");
+            exit(2);
+        }
+        unsafe { std::env::set_var(rpc::RPC_TRUSTED_PROXIES_ENV, value) };
+    } else if let Ok(value) = std::env::var(rpc::RPC_TRUSTED_PROXIES_ENV) {
+        if let Err(why) = rpc::TrustedProxies::parse(&value) {
+            eprintln!("run: {}: {why}", rpc::RPC_TRUSTED_PROXIES_ENV);
+            exit(2);
+        }
+    }
 
     // Metrics/health (audit C-R6-2). OPT-IN: no flag, no listener, so an
     // unflagged fleet binary behaves byte-for-byte as before. Same refusal
