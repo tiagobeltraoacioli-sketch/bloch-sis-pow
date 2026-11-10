@@ -111,7 +111,8 @@ fn plaintext_opt_in_flag(args: &[String]) -> bool {
     }
     let switches = ["--allow-finality-rewind", "--no-doppelganger-check", "--replay-from-genesis",
         "--no-signer-anchor", "--accept-signing-rollback",
-        "--require-state-cache", "--behind-proxy", "--bind-genesis"];
+        "--require-state-cache", "--behind-proxy", "--bind-genesis",
+        "--mesh-require-authenticated"];
     let mut rest = args.iter().skip(1);
     while let Some(arg) = rest.next() {
         if arg == "--" { break; }
@@ -506,7 +507,7 @@ fn print_help() {
          \n\
              devnet transport:\n\
                          --listen <port> [--listen-addr <ip>]\n\
-                         --peers <host:port,...>\n\
+                         --peers <host:port[=<mesh identity>],...>\n\
                --listen-addr binds the mesh listener somewhere other than\n\
                127.0.0.1, which is what a devnet spread across hosts needs.\n\
                This transport has no authentication and no admission\n\
@@ -514,15 +515,42 @@ fn print_help() {
                peer addresses.\n\
                          [--mesh-security plain|offer|require]\n\
                          [--mesh-allow <file>]\n\
+                         [--mesh-require-authenticated]\n\
                Post-quantum mesh security (default plain = unchanged wire):\n\
-               hybrid ML-KEM-768 + X25519 key exchange, ML-DSA-65 mutual\n\
-               authentication, ChaCha20-Poly1305 records. `offer` seals\n\
-               connections to upgraded peers and still talks plain to legacy\n\
-               ones (a migration state: an active attacker can force plain);\n\
-               `require` refuses anything unsealed. The node's transport\n\
-               identity is printed at startup (`mesh security:`); list\n\
-               identities one per line in --mesh-allow to admit only them.\n\
-               Roll out plain -> offer -> require, one node at a time.\n\
+               hybrid ML-KEM-768 + X25519 key exchange, ML-DSA-65 transport\n\
+               identities, ChaCha20-Poly1305 records. The handshake proves\n\
+               which key a peer holds; a peer is AUTHENTICATED only if this\n\
+               node was told which identity to expect. The node's identity\n\
+               (64 hex digits) is printed at startup (`mesh security:`).\n\
+               Give the other nodes' identities either way, or both:\n\
+                 --mesh-allow <file>   one identity per line; any listed\n\
+                                       identity is accepted on any connection.\n\
+                 --peers host:port=<identity>   pin: that address is accepted\n\
+                                       under exactly that identity. Pinned\n\
+                                       identities are also admitted inbound.\n\
+                                       Without --mesh-allow, pin every peer.\n\
+               What each mode guarantees:\n\
+                 plain    nothing: no encryption, no authentication.\n\
+                 offer    a migration state. Seals connections to upgraded\n\
+                          peers, still talks plain to legacy ones; an active\n\
+                          attacker can force plain, so nothing is guaranteed\n\
+                          against one. A pinned peer is never dialed plain.\n\
+                 require, no --mesh-allow and no pins\n\
+                          ENCRYPTION ONLY. Stops a passive observer; ANY\n\
+                          identity is accepted, so a party on the path or\n\
+                          able to reach the port can pose as a peer. The\n\
+                          node warns at every boot.\n\
+                 require + --mesh-allow\n\
+                          authenticated against the closed set of listed\n\
+                          identities, in both directions.\n\
+                 require + pins\n\
+                          authenticated per peer: each dialed address under\n\
+                          exactly its pinned identity; inbound only pinned\n\
+                          or listed identities.\n\
+               --mesh-require-authenticated refuses to start unless the mode\n\
+               is require with an allow-list or pins, instead of warning.\n\
+               Roll out plain -> offer -> require, one node at a time, then\n\
+               add identities and --mesh-require-authenticated.\n\
          \n\
              libp2p transport:\n\
                          [--p2p-listen <multiaddr>[,...]] (default\n\
@@ -862,6 +890,7 @@ fn run_switch(args: &[String], name: &str) -> bool {
         "--allow-public-metrics",
         "--behind-proxy",
         "--bind-genesis",
+        "--mesh-require-authenticated",
         "--no-doppelganger-check",
         "--no-signer-anchor",
         "--accept-signing-rollback",
@@ -1617,7 +1646,7 @@ pub(crate) fn decide_transport(args: &[String]) -> Result<TransportPlan, String>
         }
     }
     if !runs_devnet {
-        for f in ["--listen", "--listen-addr", "--peers", "--mesh-security", "--mesh-allow"] {
+        for f in ["--listen", "--listen-addr", "--peers", "--mesh-security", "--mesh-allow", "--mesh-require-authenticated"] {
             if present(f) {
                 contradictions.push(f.to_string());
             }
@@ -1878,6 +1907,13 @@ fn run_cmd(args: &[String]) {
         exit(2);
     });
 
+    // `--peers host:port=<identity>` pins the mesh identity expected at that
+    // address; the dialer gets the bare address and the pin travels with the
+    // mesh security plan. An entry without `=` is unchanged.
+    let (peers, peer_pins) = mesh_pq::split_peer_pins(&csv("--peers")).unwrap_or_else(|error| {
+        eprintln!("run: {error}");
+        exit(2);
+    });
     let mesh = engine::MeshPlan {
         mode: match arg_value(args, "--mesh-security") {
             None => mesh_pq::Mode::Plain,
@@ -1887,9 +1923,19 @@ fn run_cmd(args: &[String]) {
             }),
         },
         allow: arg_value(args, "--mesh-allow").map(PathBuf::from),
+        pins: peer_pins,
+        require_authenticated: args.iter().any(|a| a == "--mesh-require-authenticated"),
     };
     if mesh.allow.is_some() && mesh.mode == mesh_pq::Mode::Plain {
         eprintln!("run: --mesh-allow needs --mesh-security offer or require");
+        exit(2);
+    }
+    if !mesh.pins.is_empty() && mesh.mode == mesh_pq::Mode::Plain {
+        eprintln!("run: a pinned --peers entry (host:port=<identity>) needs --mesh-security offer or require");
+        exit(2);
+    }
+    if mesh.require_authenticated && mesh.mode != mesh_pq::Mode::Require {
+        eprintln!("run: --mesh-require-authenticated needs --mesh-security require");
         exit(2);
     }
     let cfg = engine::Config {
@@ -1900,7 +1946,7 @@ fn run_cmd(args: &[String]) {
         // Loopback unless asked otherwise: the devnet transport authenticates
         // nothing, so a routable bind is a deliberate act plus a firewall.
         listen_addr: arg_value(args, "--listen-addr").unwrap_or_else(|| "127.0.0.1".to_string()),
-        peers: csv("--peers"),
+        peers,
         p2p_listen,
         p2p_peers: csv("--p2p-peer"),
         max_peers: arg_value(args, "--max-peers")

@@ -465,7 +465,8 @@ pub struct Config {
     /// Port for `GET /health` + `GET /metrics`. `None` (the default — the
     /// flag is opt-in) starts no listener at all.
     pub metrics_port: Option<u16>,
-    /// Devnet transport: `--mesh-security`, `--mesh-allow` (see `mesh_pq.rs`).
+    /// Devnet transport: `--mesh-security`, `--mesh-allow`, the pins given
+    /// in `--peers`, `--mesh-require-authenticated` (see `mesh_pq.rs`).
     /// Resolved in [`run`] once the genesis id is known, because the
     /// handshake binds every connection to it.
     pub mesh: MeshPlan,
@@ -477,6 +478,11 @@ pub struct Config {
 pub struct MeshPlan {
     pub mode: crate::mesh_pq::Mode,
     pub allow: Option<PathBuf>,
+    /// `--peers host:port=<identity>`: dialed address → expected identity.
+    pub pins: Vec<(String, crate::mesh_pq::PeerId)>,
+    /// `--mesh-require-authenticated`: refuse to start unless every peer
+    /// must present an expected identity.
+    pub require_authenticated: bool,
 }
 
 fn now_ms() -> u64 {
@@ -6659,9 +6665,21 @@ fn start_devnet(
         genesis_id,
         &cfg.data_dir,
         cfg.mesh.allow.as_deref(),
+        &cfg.peers,
+        &cfg.mesh.pins,
+        cfg.mesh.require_authenticated,
     )?);
     println!("mesh security: {}", security.summary());
-    net::start(
+    // Said twice, like the transport line: before anything binds, and again
+    // once the listener is up, so it is still on screen under the bind
+    // output. On stderr, where the other boot warnings go.
+    let warn = || {
+        for w in security.warnings() {
+            eprintln!("mesh security: WARNING {w}");
+        }
+    };
+    warn();
+    let mesh = net::start(
         &cfg.listen_addr,
         cfg.listen,
         cfg.peers.clone(),
@@ -6669,8 +6687,10 @@ fn start_devnet(
         cfg.data_dir.clone(),
         head_slot.clone(),
         inflight.clone(),
-        security,
-    )
+        security.clone(),
+    )?;
+    warn();
+    Ok(mesh)
 }
 
 /// Start the libp2p stack. Called by the `Libp2p` and `Dual` arms of [`run`]

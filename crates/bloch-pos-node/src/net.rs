@@ -71,10 +71,13 @@
 //! still runs the pool, but a `Reject` costs the sender nothing here.
 //!
 //! **`--mesh-security` (see `mesh_pq.rs`).** With `offer` or `require` a
-//! connection first runs a hybrid ML-KEM-768 + X25519 handshake with
-//! ML-DSA-65 mutual authentication, and every frame below then travels as a
-//! ChaCha20-Poly1305 record instead of in the clear. The default, `plain`,
-//! is this paragraph's absence: the wire is byte-for-byte what it was.
+//! connection first runs a hybrid ML-KEM-768 + X25519 handshake in which
+//! each side proves possession of an ML-DSA-65 transport identity, and every
+//! frame below then travels as a ChaCha20-Poly1305 record instead of in the
+//! clear. That is encryption; it is authentication only when the node was
+//! told which identities to expect (`--mesh-allow`, or a pin on the dialed
+//! address, `--peers host:port=<identity>`). The default, `plain`, is this
+//! paragraph's absence: the wire is byte-for-byte what it was.
 //!
 //! Wire: `u32 LE frame length ‖ type byte ‖ payload`.
 //! Types: 0x01 block envelope, 0x02 attestation, 0x03 get-blocks{after_slot},
@@ -1536,10 +1539,12 @@ fn serve_get_blocks(
 /// therefore opt-in (`--listen-addr`), and when it is used the operator is
 /// responsible for restricting the port to known peers at the firewall.
 ///
-/// `security` changes that: under `require` with an allow-list only listed
-/// ML-DSA-65 identities get a connection, and every frame is encrypted and
-/// authenticated (`mesh_pq.rs`). Keep the firewall anyway; under `plain` the
-/// paragraph above is the whole truth.
+/// `security` changes that: under `require` with an allow-list or pinned
+/// peers only the expected ML-DSA-65 identities get a connection, and every
+/// frame is encrypted and authenticated (`mesh_pq.rs`). Under `require` with
+/// neither, frames are encrypted but any identity is accepted, so the
+/// paragraph above still holds against anything that can reach the port.
+/// Keep the firewall anyway; under `plain` that paragraph is the whole truth.
 pub fn start(
     bind_addr: &str,
     listen_port: u16,
@@ -1715,11 +1720,16 @@ pub fn start(
                 fallback_plain = false;
                 Ok(crate::mesh_pq::Session::Plain)
             } else {
-                crate::mesh_pq::handshake_outbound(&mut sock, &security)
+                crate::mesh_pq::handshake_outbound(&mut sock, &security, &addr)
             };
             let session = match session {
                 Ok(session) => session,
-                Err(e) if security.mode() == crate::mesh_pq::Mode::Offer && closed_on_handshake(&e) => {
+                // Never for a pinned peer: a pin says the peer speaks the
+                // handshake, so a close here is not a legacy node, and a
+                // plain session would skip the identity check the pin asks for.
+                Err(e) if security.mode() == crate::mesh_pq::Mode::Offer
+                    && !security.is_pinned(&addr)
+                    && closed_on_handshake(&e) => {
                     fallback_plain = true;
                     continue;
                 }
@@ -2098,6 +2108,16 @@ mod tests {
     /// asking the other for it. True when both sides received the other's
     /// page within the timeout.
     fn sync_across(left: crate::mesh_pq::MeshSecurity, right: crate::mesh_pq::MeshSecurity, tag: &str) -> bool {
+        sync_across_with(left, |_| right, tag)
+    }
+
+    /// [`sync_across`], with the dialing side built once it knows the address
+    /// it will dial, so it can pin it.
+    fn sync_across_with(
+        left: crate::mesh_pq::MeshSecurity,
+        right: impl FnOnce(&str) -> crate::mesh_pq::MeshSecurity,
+        tag: &str,
+    ) -> bool {
         let base = std::env::temp_dir().join(format!("bloch-mesh-pq-{tag}-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         let left_dir = base.join("left");
@@ -2113,7 +2133,9 @@ mod tests {
         let left_mesh = start("127.0.0.1", 0, Vec::new(), left_tx, left_dir,
             Arc::new(AtomicU64::new(42)), QueueBudget::new(), Arc::new(left)).unwrap();
         let port = left_mesh.listen_addr().port();
-        let right_mesh = start("127.0.0.1", 0, vec![format!("127.0.0.1:{port}")], right_tx, right_dir,
+        let dialed = format!("127.0.0.1:{port}");
+        let right = right(&dialed);
+        let right_mesh = start("127.0.0.1", 0, vec![dialed], right_tx, right_dir,
             Arc::new(AtomicU64::new(42)), QueueBudget::new(), Arc::new(right)).unwrap();
         let delivered = [left_rx, right_rx].into_iter().all(|received| {
             matches!(received.recv_timeout(Duration::from_secs(8)),
@@ -2150,6 +2172,23 @@ mod tests {
         let member_id = member.identity_id().unwrap();
         assert!(sync_across(gate(member_id), member, "allow-member"));
         assert!(!sync_across(gate(member_id), MeshSecurity::ephemeral(Mode::Require, net, None), "allow-stranger"));
+    }
+
+    #[test]
+    fn mesh_pin_binds_the_dialed_address_to_one_identity() {
+        use crate::mesh_pq::{MeshSecurity, Mode};
+        let net = [9; 32];
+        let pq = |mode| MeshSecurity::ephemeral(mode, net, None);
+        // The dialer pins the listener's real identity: sealed sync both ways.
+        let left = pq(Mode::Require);
+        let left_id = left.identity_id().unwrap();
+        assert!(sync_across_with(left, |addr| pq(Mode::Require).with_pin(addr, left_id), "pin-match"));
+        // The listener holds another key than the pinned one: no session.
+        assert!(!sync_across_with(pq(Mode::Require), |addr| pq(Mode::Require).with_pin(addr, [0x11; 32]), "pin-mismatch"));
+        // `offer` falls back to plain for an unpinned legacy peer (asserted
+        // in `mesh_security_modes_interoperate_as_documented`), but never
+        // for a pinned one.
+        assert!(!sync_across_with(MeshSecurity::plain(), |addr| pq(Mode::Offer).with_pin(addr, [0x11; 32]), "pin-no-plain"));
     }
 
     #[test]

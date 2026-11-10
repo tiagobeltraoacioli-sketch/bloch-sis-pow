@@ -33,11 +33,19 @@
 //!   ML-KEM-768 (FIPS 203) or X25519 holds: a harvest-now-decrypt-later
 //!   adversary has to break ML-KEM, and a flaw in the young ML-KEM
 //!   implementation still leaves classical X25519 in front of it.
-//! - **Post-quantum mutual authentication.** Each side signs the transcript
-//!   hash with an ML-DSA-65 transport identity, so a man in the middle who
-//!   substitutes either ephemeral key cannot produce a matching signature.
-//!   The two contexts differ, so a responder signature cannot be reflected
-//!   back as an initiator one.
+//! - **Post-quantum proof of key possession.** Each side signs the transcript
+//!   hash with an ML-DSA-65 transport identity, so the session is bound to
+//!   the two identities that were presented, and a man in the middle who
+//!   substitutes either ephemeral key cannot produce a signature *under the
+//!   identity the other side expects*. That last clause carries the whole
+//!   property: the handshake proves which key the peer holds, not that the
+//!   key is one this node has any reason to trust. A node that expects no
+//!   particular identity (no allow-list, no pin) accepts whatever key is
+//!   presented, and an on-path party can then complete one handshake with
+//!   each side under keys it generated a moment ago. Whether a connection is
+//!   *authenticated* is therefore decided by the configuration below, not by
+//!   the handshake alone. The two contexts differ, so a responder signature
+//!   cannot be reflected back as an initiator one.
 //! - **Network binding.** `network` is the genesis id. A node from another
 //!   chain (a devnet dialling mainnet by mistake) is refused before any key
 //!   material is spent on it.
@@ -51,25 +59,70 @@
 //! `mesh_identity.bin` in the data dir: an ML-DSA-65 key pair created on
 //! first start, written private (0600). **It is not a validator key and signs
 //! nothing of value** — the same status as libp2p's `p2p_identity.bin`. Its
-//! id, `SHA3-256(public key)`, is printed at startup; collect those ids into
-//! a `--mesh-allow` file to turn authentication into admission control.
+//! id, `SHA3-256(public key)`, is printed at startup (`mesh security:`).
+//! Those ids are what the operator hands to the *other* nodes, in one of two
+//! forms:
 //!
-//! ## Modes and the rollout
+//! - **Allow-list** (`--mesh-allow <file>`): a set of ids. Any listed id is
+//!   accepted on any connection, inbound or outbound. Right for a closed
+//!   fleet under one operator; a listed key can stand in for any other
+//!   listed node, so the list is only as strong as its weakest member.
+//! - **Pin** (`--peers host:port=<id>`): the id this node expects to find at
+//!   one dialed address. The dialer checks it before it sends its own
+//!   signature and refuses anything else, even an id that is on the
+//!   allow-list. A pin is sufficient for its own address: the pinned id
+//!   does not also have to be on the allow-list. Each mesh pair dials in
+//!   both directions and an inbound connection has no address to pin, so
+//!   the pinned ids are also admitted inbound, exactly as if they were on
+//!   the allow-list.
 //!
-//! - `plain` (default): byte-for-byte the old transport. Nothing changes for a
-//!   node that does not opt in.
+//! Once either is configured, every sealed connection must present an id
+//! that is pinned or listed. Without an allow-list every `--peers` entry
+//! must then carry a pin (the node refuses to start otherwise: an unpinned
+//! entry could never be admitted), and a node that only dials in must be
+//! put on the allow-list.
+//!
+//! There is deliberately no trust on first use: a first connection made
+//! through an on-path party would pin that party.
+//!
+//! ## Modes, what each one guarantees, and the rollout
+//!
+//! - `plain` (default): byte-for-byte the old transport. No encryption, no
+//!   authentication. Nothing changes for a node that does not opt in.
 //! - `offer`: dials with the handshake and falls back to plain against a peer
 //!   that does not speak it; accepts both, telling them apart by the first
 //!   four bytes (`"BPQ1"` read as a legacy length is 827 MB, far above
 //!   [`crate::codec::MAX_FIELD_LEN`], so a legacy node refuses it and closes,
-//!   and no legacy frame can start with it). **Offer is a migration state**:
-//!   an active attacker can still force plain, exactly as on today's mesh.
-//! - `require`: handshake or nothing, both directions. With `--mesh-allow`,
-//!   only listed identities get past the handshake.
+//!   and no legacy frame can start with it). **Offer is a migration state
+//!   and guarantees nothing against an active attacker**, who can still
+//!   force plain, exactly as on today's mesh. Sealed connections are
+//!   confidential against a passive observer, and an allow-list or pins are
+//!   applied to them, but a plain inbound connection bypasses both. The one
+//!   firm rule: a dial to a *pinned* address never falls back to plain (a
+//!   pin says the peer is upgraded).
+//! - `require` with neither allow-list nor pins: **encryption only.**
+//!   Handshake or nothing, in both directions, so a passive observer
+//!   (including harvest-now-decrypt-later) reads nothing, and a frame cannot
+//!   be injected into an established session. But no peer is authenticated:
+//!   anything that can reach the port, or sits on the path, can complete the
+//!   handshake under a fresh key and read, drop or inject frames as a peer.
+//!   The node says so at boot, loudly, and `--mesh-require-authenticated`
+//!   turns that warning into a refusal to start.
+//! - `require` with `--mesh-allow`: authenticated against the closed set.
+//!   Only listed (or pinned) ids get past the handshake in either direction;
+//!   an on-path party without a listed key gets nothing. Any listed key is
+//!   accepted at any address.
+//! - `require` with pins: authenticated per peer. A dialed address is
+//!   accepted only under exactly its pinned id; inbound connections only
+//!   under a pinned or listed id.
 //!
 //! Rollout: every node `plain → offer`, one at a time; when every peer of a
 //! node is upgraded its connections are already sealed; then
-//! `offer → require` (optionally with an allow-list), again one at a time.
+//! `offer → require`, again one at a time; then add pins and/or an
+//! allow-list (ids are stable once `mesh_identity.bin` exists, so they can
+//! be collected during `offer`), and finally `--mesh-require-authenticated`
+//! so a later configuration slip cannot silently drop back to
+//! encryption-only.
 //!
 //! ## What this does not cover
 //!
@@ -79,7 +132,7 @@
 //! - The libp2p stack keeps its Noise/X25519 handshake.
 //! - Traffic analysis: frame sizes and timing are visible.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
 use std::net::TcpStream;
@@ -177,6 +230,39 @@ pub struct MeshSecurity {
     network: [u8; 32],
     identity: Option<Identity>,
     allow: Option<HashSet<PeerId>>,
+    /// Dialed address (exactly as given in `--peers`) → the only identity
+    /// accepted there.
+    pins: HashMap<String, PeerId>,
+}
+
+/// Split `--peers` entries of the form `host:port=<64 hex id>` into the bare
+/// dial addresses (every entry, in order) and the pins. An entry without `=`
+/// is an unpinned address, as before.
+pub fn split_peer_pins(entries: &[String]) -> Result<(Vec<String>, Vec<(String, PeerId)>), String> {
+    let mut addrs = Vec::with_capacity(entries.len());
+    let mut pins: Vec<(String, PeerId)> = Vec::new();
+    for entry in entries {
+        let Some((addr, id)) = entry.split_once('=') else {
+            addrs.push(entry.clone());
+            continue;
+        };
+        if addr.is_empty() {
+            return Err(format!("--peers entry `{entry}`: no address before `=`"));
+        }
+        let id: PeerId = crate::codec::unhex(id)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| format!(
+                "--peers entry `{entry}`: the pin after `=` must be a mesh identity, 64 hex digits \
+                 (the peer prints it at startup as `mesh security: ... identity <id>`)"
+            ))?;
+        if pins.iter().any(|(a, pinned)| a == addr && *pinned != id) {
+            return Err(format!("--peers pins `{addr}` to two different identities"));
+        }
+        addrs.push(addr.to_string());
+        pins.push((addr.to_string(), id));
+    }
+    Ok((addrs, pins))
 }
 
 impl fmt::Debug for MeshSecurity {
@@ -185,6 +271,7 @@ impl fmt::Debug for MeshSecurity {
             .field("mode", &self.mode)
             .field("identity", &self.identity.as_ref().map(|i| crate::codec::hex(&i.id)))
             .field("allow", &self.allow.as_ref().map(HashSet::len))
+            .field("pins", &self.pins.len())
             .finish()
     }
 }
@@ -192,30 +279,66 @@ impl fmt::Debug for MeshSecurity {
 impl MeshSecurity {
     /// The old transport, unchanged.
     pub fn plain() -> Self {
-        MeshSecurity { mode: Mode::Plain, network: [0; 32], identity: None, allow: None }
+        MeshSecurity { mode: Mode::Plain, network: [0; 32], identity: None, allow: None, pins: HashMap::new() }
     }
 
-    /// Load (or create) the transport identity under `data_dir` and the
-    /// optional allow-list. `plain` loads nothing and creates no file.
+    /// Load (or create) the transport identity under `data_dir`, the
+    /// optional allow-list, and the pins for the dialed `peers`. `plain`
+    /// loads nothing and creates no file.
+    ///
+    /// `require_authenticated` (`--mesh-require-authenticated`) refuses any
+    /// configuration in which a peer could connect without presenting an
+    /// identity this node was told to expect.
     pub fn load(
         mode: Mode,
         network: [u8; 32],
         data_dir: &Path,
         allow_path: Option<&Path>,
+        peers: &[String],
+        pins: &[(String, PeerId)],
+        require_authenticated: bool,
     ) -> io::Result<Self> {
+        let refuse = |why: &str| Err(io::Error::new(io::ErrorKind::InvalidInput, why.to_string()));
+        if require_authenticated && mode != Mode::Require {
+            return refuse(
+                "--mesh-require-authenticated needs --mesh-security require: \
+                 plain authenticates nothing and offer still accepts plain connections",
+            );
+        }
         if mode == Mode::Plain {
             if allow_path.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "--mesh-allow needs --mesh-security offer or require",
-                ));
+                return refuse("--mesh-allow needs --mesh-security offer or require");
+            }
+            if !pins.is_empty() {
+                return refuse("a pinned --peers entry (host:port=<identity>) needs --mesh-security offer or require");
             }
             return Ok(Self::plain());
         }
+        let allow = allow_path.map(read_allow_list).transpose()?;
+        let pins: HashMap<String, PeerId> = pins.iter().cloned().collect();
+        if allow.is_none() && !pins.is_empty() {
+            // Once anything is pinned, an identity must be pinned or listed
+            // to be admitted, so an unpinned dial could never succeed. Say
+            // so at boot instead of refusing that peer forever at runtime.
+            if let Some(unpinned) = peers.iter().find(|addr| !pins.contains_key(*addr)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "--peers pins some peers but not `{unpinned}`, and there is no --mesh-allow: \
+                         pin every peer (host:port=<identity>) or list the others in --mesh-allow"
+                    ),
+                ));
+            }
+        }
+        if require_authenticated && allow.is_none() && pins.is_empty() {
+            return refuse(
+                "--mesh-require-authenticated: no --mesh-allow and no pinned --peers \
+                 (host:port=<identity>), so no peer would be authenticated",
+            );
+        }
         std::fs::create_dir_all(data_dir)?;
         let identity = load_or_create_identity(&data_dir.join(IDENTITY_FILE))?;
-        let allow = allow_path.map(read_allow_list).transpose()?;
-        Ok(MeshSecurity { mode, network, identity: Some(identity), allow })
+        Ok(MeshSecurity { mode, network, identity: Some(identity), allow, pins })
     }
 
     /// An in-memory identity, for tests.
@@ -223,7 +346,44 @@ impl MeshSecurity {
     pub fn ephemeral(mode: Mode, network: [u8; 32], allow: Option<HashSet<PeerId>>) -> Self {
         let (pk, sk) = mldsa65::keypair();
         let id = peer_id(pk.as_bytes());
-        MeshSecurity { mode, network, identity: Some(Identity { pk, sk, id }), allow }
+        MeshSecurity { mode, network, identity: Some(Identity { pk, sk, id }), allow, pins: HashMap::new() }
+    }
+
+    /// Pin a dialed address, for tests.
+    #[cfg(test)]
+    pub fn with_pin(mut self, addr: &str, id: PeerId) -> Self {
+        self.pins.insert(addr.to_string(), id);
+        self
+    }
+
+    /// True when a dial to `addr` must end in exactly one identity. The
+    /// `offer` dialer uses it to refuse the plain fallback for such a peer.
+    pub fn is_pinned(&self, addr: &str) -> bool {
+        self.pins.contains_key(addr)
+    }
+
+    /// True when every sealed connection must present an identity this node
+    /// was configured to expect (an allow-list, pins, or both).
+    fn checks_identities(&self) -> bool {
+        self.allow.is_some() || !self.pins.is_empty()
+    }
+
+    /// What the operator must be told at every boot, beyond [`Self::summary`].
+    /// Empty when the mode delivers what its name suggests.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.mode == Mode::Require && !self.checks_identities() {
+            out.push(
+                "ENCRYPTION ONLY, PEERS ARE NOT AUTHENTICATED. `--mesh-security require` without \
+                 --mesh-allow and without pinned --peers (host:port=<identity>) accepts ANY peer \
+                 identity: it stops a passive observer, but anything that can reach the mesh port \
+                 or sits on the path can complete the handshake under a fresh key and act as a \
+                 peer. Pin the peers or give an allow-list, then add --mesh-require-authenticated \
+                 so this state refuses to start instead of warning."
+                    .to_string(),
+            );
+        }
+        out
     }
 
     pub fn mode(&self) -> Mode {
@@ -242,13 +402,22 @@ impl MeshSecurity {
                 "plain (no authentication, no encryption)".to_string()
             }
             (Some(id), mode) => format!(
-                "{} (ML-KEM-768+X25519, ML-DSA-65 identity {}{})",
+                "{} (ML-KEM-768+X25519, ML-DSA-65 identity {}{}{}{})",
                 mode.name(),
                 crate::codec::hex(&id.id),
                 match &self.allow {
                     Some(a) => format!(", allow-list of {}", a.len()),
                     None => String::new(),
-                }
+                },
+                match self.pins.len() {
+                    0 => String::new(),
+                    n => format!(", {n} pinned peer address(es)"),
+                },
+                match (mode, self.checks_identities()) {
+                    (Mode::Require, false) => "; ENCRYPTION ONLY: no allow-list, no pins, peers not authenticated",
+                    (Mode::Require, true) => "; peers authenticated",
+                    _ => "; migration state: plain connections still accepted, peers not authenticated",
+                },
             ),
         }
     }
@@ -257,14 +426,40 @@ impl MeshSecurity {
         self.identity.as_ref().ok_or_else(|| io::Error::other("mesh: no transport identity loaded"))
     }
 
-    fn admit(&self, id: &PeerId) -> io::Result<()> {
-        match &self.allow {
-            Some(allow) if !allow.contains(id) => Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("mesh: peer identity {} is not on the allow-list", crate::codec::hex(id)),
-            )),
-            _ => Ok(()),
+    /// Decide whether the identity a peer proved is one this node expects.
+    /// `dialed` is the `--peers` address for an outbound connection and
+    /// `None` for an inbound one.
+    ///
+    /// - A pinned dialed address admits exactly its pin, nothing else.
+    /// - Otherwise, with an allow-list or any pin configured, the identity
+    ///   must be listed or be one of the pinned identities.
+    /// - With neither configured there is nothing to check it against, and
+    ///   the connection is encrypted but unauthenticated (see
+    ///   [`Self::warnings`]).
+    fn admit(&self, id: &PeerId, dialed: Option<&str>) -> io::Result<()> {
+        let denied = |why: String| Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
+        if let Some((addr, pin)) = dialed.and_then(|addr| self.pins.get(addr).map(|pin| (addr, pin))) {
+            if pin == id {
+                return Ok(());
+            }
+            return denied(format!(
+                "mesh: peer at {addr} presented identity {} but is pinned to {}",
+                crate::codec::hex(id),
+                crate::codec::hex(pin),
+            ));
         }
+        if !self.checks_identities() {
+            return Ok(());
+        }
+        let listed = self.allow.as_ref().is_some_and(|allow| allow.contains(id));
+        if listed || self.pins.values().any(|pin| pin == id) {
+            return Ok(());
+        }
+        denied(format!(
+            "mesh: peer identity {} is not on the allow-list{}",
+            crate::codec::hex(id),
+            if self.pins.is_empty() { "" } else { " and is not a pinned identity" },
+        ))
     }
 }
 
@@ -411,7 +606,9 @@ impl Opener {
 }
 
 /// What a connection runs on after the handshake step. `peer` is the
-/// authenticated identity; the allow-list has already been applied to it.
+/// identity the peer proved it holds; the pin and the allow-list, if any,
+/// have already been applied to it. With neither configured it is whatever
+/// key the peer chose to present.
 #[cfg_attr(not(test), allow(dead_code))]
 pub enum Session {
     Plain,
@@ -494,8 +691,11 @@ fn write_all_until(sock: &mut TcpStream, bytes: &[u8], deadline: Instant) -> io:
 }
 
 /// Run the initiator side on a freshly connected socket. `Plain` mode returns
-/// `Session::Plain` without touching the socket.
-pub fn handshake_outbound(sock: &mut TcpStream, sec: &MeshSecurity) -> io::Result<Session> {
+/// `Session::Plain` without touching the socket. `dialed` is the `--peers`
+/// address the socket was connected to: if it is pinned, the responder must
+/// prove exactly that identity, and it is checked before this side sends its
+/// own signature.
+pub fn handshake_outbound(sock: &mut TcpStream, sec: &MeshSecurity, dialed: &str) -> io::Result<Session> {
     if sec.mode == Mode::Plain {
         return Ok(Session::Plain);
     }
@@ -532,7 +732,7 @@ pub fn handshake_outbound(sock: &mut TcpStream, sec: &MeshSecurity) -> io::Resul
 
     let theirs = opener.read_record(sock, deadline)?;
     let peer = check_auth(&theirs, &h, CTX_RESPONDER)?;
-    sec.admit(&peer)?;
+    sec.admit(&peer, Some(dialed))?;
     let mine = auth_payload(me, &h, CTX_INITIATOR);
     let remaining = deadline.checked_duration_since(Instant::now()).unwrap_or_default();
     sock.set_write_timeout(Some(remaining.max(Duration::from_millis(1))))?;
@@ -617,7 +817,7 @@ pub fn handshake_inbound(sock: &mut TcpStream, sec: &MeshSecurity) -> io::Result
     sealer.write_record(sock, &[&mine])?;
     let theirs = opener.read_record(sock, deadline)?;
     let peer = check_auth(&theirs, &h, CTX_INITIATOR)?;
-    sec.admit(&peer)?;
+    sec.admit(&peer, None)?;
     Ok(Session::Sealed { sealer, opener, peer })
 }
 
@@ -633,8 +833,19 @@ mod tests {
         client: Arc<MeshSecurity>,
         server: Arc<MeshSecurity>,
     ) -> (io::Result<(Session, TcpStream)>, io::Result<(Session, TcpStream)>) {
+        pair_with(|_| client, server)
+    }
+
+    /// Like [`pair`], but the client is built once the listener's address is
+    /// known, so it can pin that address.
+    fn pair_with(
+        client: impl FnOnce(&str) -> Arc<MeshSecurity>,
+        server: Arc<MeshSecurity>,
+    ) -> (io::Result<(Session, TcpStream)>, io::Result<(Session, TcpStream)>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let dialed = addr.to_string();
+        let client = client(&dialed);
         let srv = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
             handshake_inbound(&mut s, &server).map(|x| (x, s))
@@ -642,7 +853,7 @@ mod tests {
         let mut c = TcpStream::connect(addr).unwrap();
         // A failed client drops its socket here, which is what unblocks a
         // server still waiting on it.
-        let cli = handshake_outbound(&mut c, &client).map(|x| (x, c));
+        let cli = handshake_outbound(&mut c, &client, &dialed).map(|x| (x, c));
         (cli, srv.join().unwrap())
     }
 
@@ -743,7 +954,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut c = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut s, _) = listener.accept().unwrap();
-        assert!(matches!(handshake_outbound(&mut c, &sec).unwrap(), Session::Plain));
+        assert!(matches!(handshake_outbound(&mut c, &sec, "127.0.0.1:1").unwrap(), Session::Plain));
         assert!(matches!(handshake_inbound(&mut s, &sec).unwrap(), Session::Plain));
     }
 
@@ -751,11 +962,11 @@ mod tests {
     fn identity_file_round_trips_and_rejects_garbage() {
         let dir = std::env::temp_dir().join(format!("mesh-id-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let first = MeshSecurity::load(Mode::Offer, NET, &dir, None).unwrap();
-        let again = MeshSecurity::load(Mode::Offer, NET, &dir, None).unwrap();
+        let first = MeshSecurity::load(Mode::Offer, NET, &dir, None, &[], &[], false).unwrap();
+        let again = MeshSecurity::load(Mode::Offer, NET, &dir, None, &[], &[], false).unwrap();
         assert_eq!(first.identity_id(), again.identity_id());
         std::fs::write(dir.join(IDENTITY_FILE), b"nope").unwrap();
-        assert!(MeshSecurity::load(Mode::Offer, NET, &dir, None).is_err());
+        assert!(MeshSecurity::load(Mode::Offer, NET, &dir, None, &[], &[], false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -766,5 +977,138 @@ mod tests {
         assert_eq!(parse_allow_list(&text).unwrap(), HashSet::from([id]));
         assert!(parse_allow_list("# nothing\n").is_err());
         assert!(parse_allow_list("abcd\n").is_err());
+    }
+
+    #[test]
+    fn pinned_dial_refuses_a_different_identity_and_accepts_the_pinned_one() {
+        let server = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
+        let server_id = server.identity_id().unwrap();
+        let other_id = MeshSecurity::ephemeral(Mode::Require, NET, None).identity_id().unwrap();
+
+        // The peer at the pinned address holds a different key: refused by
+        // the dialer, which names both identities.
+        let (cli, _srv) = pair_with(
+            |addr| Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None).with_pin(addr, other_id)),
+            server.clone(),
+        );
+        let err = cli.err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let text = err.to_string();
+        assert!(text.contains(&crate::codec::hex(&server_id)) && text.contains(&crate::codec::hex(&other_id)), "{text}");
+
+        // The matching pin is accepted and the session is with that identity.
+        let (cli, srv) = pair_with(
+            |addr| Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None).with_pin(addr, server_id)),
+            server,
+        );
+        let (Session::Sealed { peer, .. }, _c) = cli.unwrap() else { panic!("client not sealed") };
+        assert_eq!(peer, server_id);
+        assert!(srv.is_ok());
+    }
+
+    #[test]
+    fn a_pin_overrides_the_allow_list_for_its_address() {
+        // Both identities are on the allow-list, but the dialed address is
+        // pinned to one of them: the other listed key is refused there.
+        let server = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
+        let server_id = server.identity_id().unwrap();
+        let other_id = [0x5a; 32];
+        let allow = HashSet::from([server_id, other_id]);
+        let (cli, _srv) = pair_with(
+            |addr| Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, Some(allow.clone())).with_pin(addr, other_id)),
+            server.clone(),
+        );
+        assert_eq!(cli.err().unwrap().kind(), io::ErrorKind::PermissionDenied);
+        // A pin is sufficient on its own address: the pinned identity need
+        // not be on the allow-list as well.
+        let (cli, _srv) = pair_with(
+            |addr| Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, Some(HashSet::from([other_id]))).with_pin(addr, server_id)),
+            server,
+        );
+        assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn pins_admit_only_pinned_identities_inbound() {
+        // A node whose only configuration is a pin no longer accepts an
+        // arbitrary identity on its listener; the pinned peer dialling back
+        // is admitted.
+        let pinned = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
+        let gate = Arc::new(
+            MeshSecurity::ephemeral(Mode::Require, NET, None).with_pin("192.0.2.1:9000", pinned.identity_id().unwrap()),
+        );
+        let stranger = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
+        let (_cli, srv) = pair(stranger, gate.clone());
+        assert_eq!(srv.err().unwrap().kind(), io::ErrorKind::PermissionDenied);
+        let (cli, srv) = pair(pinned, gate);
+        assert!(cli.is_ok() && srv.is_ok());
+    }
+
+    #[test]
+    fn require_without_identities_warns_and_strict_refuses() {
+        let dir = std::env::temp_dir().join(format!("mesh-strict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id = [0xab; 32];
+        let allow_path = dir.join("allow.txt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&allow_path, format!("{}\n", crate::codec::hex(&id))).unwrap();
+        let peer = "192.0.2.1:9000".to_string();
+        let peers = [peer.clone()];
+        let pins = [(peer.clone(), id)];
+
+        // Default: starts, and says in the warning and in the summary that
+        // nobody is authenticated.
+        let open = MeshSecurity::load(Mode::Require, NET, &dir, None, &peers, &[], false).unwrap();
+        let warnings = open.warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("NOT AUTHENTICATED") && warnings[0].contains("--mesh-require-authenticated"));
+        assert!(open.summary().contains("ENCRYPTION ONLY"));
+
+        // Strict: the same configuration refuses to start.
+        let err = MeshSecurity::load(Mode::Require, NET, &dir, None, &peers, &[], true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // Strict makes no sense where plain connections are still accepted.
+        assert!(MeshSecurity::load(Mode::Offer, NET, &dir, Some(&allow_path), &peers, &[], true).is_err());
+        assert!(MeshSecurity::load(Mode::Plain, NET, &dir, None, &peers, &[], true).is_err());
+
+        // An allow-list or pins satisfy strict and silence the warning.
+        for (allow, pins) in [(Some(allow_path.as_path()), &[][..]), (None, &pins[..]), (Some(allow_path.as_path()), &pins[..])] {
+            for strict in [false, true] {
+                let sec = MeshSecurity::load(Mode::Require, NET, &dir, allow, &peers, pins, strict).unwrap();
+                assert!(sec.warnings().is_empty());
+                assert!(sec.summary().contains("peers authenticated"), "{}", sec.summary());
+            }
+        }
+        // `offer` and `plain` keep booting without a warning, as before.
+        assert!(MeshSecurity::load(Mode::Offer, NET, &dir, None, &peers, &[], false).unwrap().warnings().is_empty());
+        assert!(MeshSecurity::plain().warnings().is_empty());
+
+        // Pins without an allow-list must cover every dialed peer; with an
+        // allow-list the unpinned peer is checked against the list instead.
+        let two = [peer.clone(), "192.0.2.2:9000".to_string()];
+        assert!(MeshSecurity::load(Mode::Require, NET, &dir, None, &two, &pins, false).is_err());
+        assert!(MeshSecurity::load(Mode::Require, NET, &dir, Some(&allow_path), &two, &pins, false).is_ok());
+        // Pins mean nothing on the plain transport.
+        assert!(MeshSecurity::load(Mode::Plain, NET, &dir, None, &peers, &pins, false).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peer_pin_parsing() {
+        let id = [0xcd; 32];
+        let hex = crate::codec::hex(&id);
+        let entries = ["10.0.0.1:9000".to_string(), format!("10.0.0.2:9000={hex}"), format!("[::1]:9000={hex}")];
+        let (addrs, pins) = split_peer_pins(&entries).unwrap();
+        assert_eq!(addrs, ["10.0.0.1:9000", "10.0.0.2:9000", "[::1]:9000"]);
+        assert_eq!(pins, [("10.0.0.2:9000".to_string(), id), ("[::1]:9000".to_string(), id)]);
+        // Unpinned lists pass through untouched.
+        let plain = ["a:1".to_string(), "b:2".to_string()];
+        assert_eq!(split_peer_pins(&plain).unwrap(), (plain.to_vec(), Vec::new()));
+        for bad in ["10.0.0.1:9000=", "10.0.0.1:9000=abcd", "10.0.0.1:9000=zz", &format!("={hex}")] {
+            assert!(split_peer_pins(&[bad.to_string()]).is_err(), "{bad}");
+        }
+        let other = crate::codec::hex(&[0xce; 32]);
+        assert!(split_peer_pins(&[format!("a:1={hex}"), format!("a:1={other}")]).is_err());
+        assert!(split_peer_pins(&[format!("a:1={hex}"), format!("a:1={hex}")]).is_ok());
     }
 }
