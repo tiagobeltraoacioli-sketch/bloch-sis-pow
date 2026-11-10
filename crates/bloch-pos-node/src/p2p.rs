@@ -117,7 +117,9 @@
 //!   length of the chain.
 //! - **What one peer may make this node do is bounded on the serving side
 //!   too**, by [`SYNC_ANSWERS_PER_SEC`]/[`SYNC_ANSWER_BURST`] and
-//!   [`MAX_INFLIGHT_SYNC_PER_PEER`]. Capping the SIZE of an answer
+//!   [`MAX_INFLIGHT_SYNC_PER_PEER`] (held until the answer is WRITTEN, not
+//!   merely built) and, across all peers, by
+//!   [`MAX_PENDING_SYNC_RESPONSE_BYTES`]. Capping the SIZE of an answer
 //!   ([`MAX_SYNC_BLOCKS`], [`MAX_SYNC_FRAME`]) never bounded their NUMBER:
 //!   before those limits a peer could ask again as fast as it liked, on up to
 //!   [`MAX_CONCURRENT_SYNC_STREAMS`] substreams, and each eight-byte question
@@ -369,8 +371,17 @@ const MAX_DIALED_ADDRS: usize = 512;
 //   * the **token bucket** bounds the RATE — how many questions a peer may
 //     have answered per second, averaged, with a burst for the honest case;
 //   * the **in-flight cap** bounds the CONCURRENCY — how many answers this
-//     node is building for one peer at one instant, which is what actually
-//     consumes blocking-pool threads and memory.
+//     node is building OR STILL WRITING for one peer at one instant, which is
+//     what actually consumes blocking-pool threads and memory. The slot is
+//     held until libp2p reports the answer sent or failed: a built answer
+//     waits in the inbound stream task for as long as the peer does not read
+//     it (up to the request timeout), so a slot that came back when the build
+//     finished bounded only the disk read and let a peer that asks without
+//     reading pile up one multi-megabyte answer per admitted request.
+//
+// A third, global limit backs the per-peer one: [`MAX_PENDING_SYNC_RESPONSE_BYTES`]
+// bounds the answer bytes outstanding across ALL peers, because the per-peer
+// cap multiplies by however many identities connect.
 //
 // A refused request is answered with an empty page rather than dropped. The
 // channel exists either way; an empty answer costs no disk and tells a
@@ -390,10 +401,26 @@ pub const SYNC_ANSWERS_PER_SEC: f64 = 8.0;
 /// letting a burst be a strategy.
 pub const SYNC_ANSWER_BURST: f64 = 32.0;
 
-/// Answers being built for ONE peer at one instant. Two, not one: a peer may
-/// legitimately have its reconnect request and its page-chase request open at
-/// the same moment. Anything past that is not a sync pattern.
+/// Answers being built or awaiting write for ONE peer at one instant. Two,
+/// not one: a peer may legitimately have its reconnect request and its
+/// page-chase request open at the same moment, and its next question can
+/// arrive before this node has processed `ResponseSent` for the previous
+/// one. Anything past that is not a sync pattern.
 pub const MAX_INFLIGHT_SYNC_PER_PEER: usize = 2;
+
+/// Answer bytes this node will have outstanding — being built, or built and
+/// not yet written to the peer — across ALL peers.
+///
+/// An admitted request reserves a whole [`MAX_SYNC_FRAME`] up front (its size
+/// is unknown until the log is read), the reservation shrinks to the real
+/// size once the answer is built, and it is returned when libp2p reports the
+/// answer sent or failed. So this is a hard ceiling, not a high-water mark
+/// checked after the fact: sixteen worst-case answers, 128 MiB. Honest sync
+/// is far below it — a tip page is a few kilobytes and is written in
+/// milliseconds — while peers that request and do not read can pin at most
+/// this much for one request timeout. Past it, new requests are refused with
+/// the same empty page as any other refusal.
+pub const MAX_PENDING_SYNC_RESPONSE_BYTES: u64 = 16 * MAX_SYNC_FRAME;
 
 const _: () = assert!(
     MAX_INFLIGHT_SYNC_PER_PEER < MAX_CONCURRENT_SYNC_STREAMS,
@@ -406,8 +433,11 @@ const _: () = assert!(
 pub enum SyncRefusal {
     /// Over [`SYNC_ANSWERS_PER_SEC`] once the burst is spent.
     RateLimited,
-    /// Already [`MAX_INFLIGHT_SYNC_PER_PEER`] answers being built.
+    /// Already [`MAX_INFLIGHT_SYNC_PER_PEER`] answers being built or written.
     TooManyInFlight,
+    /// [`MAX_PENDING_SYNC_RESPONSE_BYTES`] of answers are already outstanding
+    /// across all peers.
+    ResponseBacklog,
 }
 
 #[derive(Debug)]
@@ -439,14 +469,17 @@ struct PeerSync {
 /// eyes.
 ///
 /// It is also the accounting token. Exactly one permit exists per occupied
-/// in-flight slot, it is moved into the blocking task and handed back to the
-/// swarm loop with the answer, and [`SyncLimiter::release`] consumes it — so a
-/// slot cannot be released twice, and a refused request (which holds no
-/// permit) cannot release one at all.
+/// in-flight slot, it is moved into the blocking task, handed back to the
+/// swarm loop with the answer, parked under the inbound request id while the
+/// answer is written, and [`SyncLimiter::release`] consumes it — so a slot
+/// cannot be released twice, and a refused request (which holds no permit)
+/// cannot release one at all.
 #[derive(Debug)]
 #[must_use = "dropping a permit without SyncLimiter::release leaks the peer's in-flight slot"]
 pub struct SyncPermit {
     peer: PeerId,
+    /// This answer's share of [`SyncLimiter::reserved_bytes`].
+    reserved: u64,
 }
 
 /// Per-peer admission for `get-blocks`: a token bucket and an in-flight cap.
@@ -456,6 +489,9 @@ pub struct SyncPermit {
 #[derive(Debug, Default)]
 pub struct SyncLimiter {
     peers: HashMap<PeerId, PeerSync>,
+    /// Sum of `SyncPermit::reserved` over every live permit; bounded by
+    /// [`MAX_PENDING_SYNC_RESPONSE_BYTES`].
+    reserved: u64,
 }
 
 impl SyncLimiter {
@@ -480,6 +516,12 @@ impl SyncLimiter {
         if e.inflight >= MAX_INFLIGHT_SYNC_PER_PEER {
             return Err(SyncRefusal::TooManyInFlight);
         }
+        // Likewise before a token is spent: the backlog is everybody's, and a
+        // peer refused for it has cost this node nothing. The size of the
+        // answer is not known yet, so the worst case is what must fit.
+        if self.reserved.saturating_add(MAX_SYNC_FRAME) > MAX_PENDING_SYNC_RESPONSE_BYTES {
+            return Err(SyncRefusal::ResponseBacklog);
+        }
         if e.tokens < 1.0 {
             return Err(SyncRefusal::RateLimited);
         }
@@ -489,10 +531,25 @@ impl SyncLimiter {
         // below that cap here — saturating is the intended semantics for a
         // counter regardless.
         e.inflight = e.inflight.saturating_add(1);
-        Ok(SyncPermit { peer })
+        self.reserved = self.reserved.saturating_add(MAX_SYNC_FRAME);
+        Ok(SyncPermit { peer, reserved: MAX_SYNC_FRAME })
     }
 
-    /// One answer finished (or failed): give the slot back.
+    /// The answer is built: shrink the permit's worst-case reservation to the
+    /// bytes actually waiting to be written. Never grows it — admission was
+    /// decided against the worst case.
+    pub fn settle(&mut self, permit: &mut SyncPermit, actual: u64) {
+        let keep = actual.min(permit.reserved);
+        self.reserved = self.reserved.saturating_sub(permit.reserved.saturating_sub(keep));
+        permit.reserved = keep;
+    }
+
+    /// Answer bytes currently reserved across all peers.
+    pub fn reserved_bytes(&self) -> u64 {
+        self.reserved
+    }
+
+    /// One answer was written (or failed): give the slot and its bytes back.
     ///
     /// Takes the permit **by value** on purpose. The first cut of this fix
     /// released by `PeerId` from the response channel, which every answer
@@ -502,6 +559,7 @@ impl SyncLimiter {
     /// the defence paid the attacker. Only a permit can be released now, and
     /// a refusal never gets one.
     pub fn release(&mut self, permit: SyncPermit) {
+        self.reserved = self.reserved.saturating_sub(permit.reserved);
         let mut remove = false;
         if let Some(e) = self.peers.get_mut(&permit.peer) {
             e.inflight = e.inflight.saturating_sub(1);
@@ -1303,6 +1361,9 @@ struct Loop {
     /// Per-peer admission for the `get-blocks` requests this node ANSWERS.
     /// See [`SyncLimiter`].
     sync_limiter: SyncLimiter,
+    /// Permits of answers handed to libp2p and not yet reported sent or
+    /// failed, by inbound request id. See [`deliver_sync_answer`].
+    sync_awaiting_write: HashMap<request_response::InboundRequestId, SyncPermit>,
     topics: Topics,
     /// Distinct peers with at least one connection up right now, shared with
     /// [`Handle::peer_count`] so the RPC can read it without touching the
@@ -1488,6 +1549,7 @@ async fn run_swarm(
         dialed: HashMap::new(),
         dialed_order: VecDeque::new(),
         sync_limiter: SyncLimiter::default(),
+        sync_awaiting_write: HashMap::new(),
         topics: Topics {
             blocks: IdentTopic::new(TOPIC_BLOCKS),
             attestations: IdentTopic::new(TOPIC_ATTESTATIONS),
@@ -1528,7 +1590,7 @@ async fn run_swarm(
     // here to be written to the substream — the swarm loop must never sit in
     // a file read while blocks and attestations wait behind it.
     let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<(
-        Option<SyncPermit>,
+        Option<(request_response::InboundRequestId, SyncPermit)>,
         request_response::ResponseChannel<SyncResponse>,
         SyncResponse,
     )>();
@@ -1596,15 +1658,7 @@ async fn run_swarm(
                 }
             }
             Some((permit, channel, resp)) = resp_rx.recv() => {
-                // The answer is built: release the in-flight slot whether or
-                // not the write succeeds, or a peer that hangs up mid-answer
-                // would leak its own budget away. `None` is a REFUSED request
-                // riding the same channel — it never took a slot, so it must
-                // not give one back.
-                if let Some(permit) = permit {
-                    st.sync_limiter.release(permit);
-                }
-                let _ = swarm.behaviour_mut().sync.send_response(channel, resp);
+                deliver_sync_answer(&mut swarm, &mut st, permit, channel, resp);
             }
             _ = redial.tick() => {
                 let connected: Vec<PeerId> = swarm.connected_peers().copied().collect();
@@ -1813,7 +1867,7 @@ fn handle_swarm_event(
     swarm: &mut Swarm,
     st: &mut Loop,
     resp_tx: &tokio::sync::mpsc::UnboundedSender<(
-        Option<SyncPermit>,
+        Option<(request_response::InboundRequestId, SyncPermit)>,
         request_response::ResponseChannel<SyncResponse>,
         SyncResponse,
     )>,
@@ -1930,8 +1984,8 @@ fn handle_swarm_event(
             message,
             ..
         })) => match message {
-            request_response::Message::Request { request, channel, .. } => {
-                serve_sync(st, resp_tx.clone(), peer, request, channel);
+            request_response::Message::Request { request_id, request, channel } => {
+                serve_sync(st, resp_tx.clone(), peer, request_id, request, channel);
             }
             request_response::Message::Response { request_id, response } => {
                 // Ignore an old connection generation without releasing a
@@ -1987,6 +2041,23 @@ fn handle_swarm_event(
             // node. Nothing to fall back to — deliberately: Genesis-3
             // compatibility is not a goal, it is the thing the prefix prevents.
             crate::net::rejection_log::emit(crate::net::rejection_log::Class::Sync, || eprintln!("p2p: sync request to {peer} failed: {error}"));
+        }
+        // The two ways an answer handed to libp2p ends. Either one returns the
+        // in-flight slot and the reserved bytes; see `deliver_sync_answer`.
+        SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::ResponseSent {
+            request_id,
+            ..
+        })) => {
+            finish_sync_answer(&mut st.sync_awaiting_write, &mut st.sync_limiter, &request_id);
+        }
+        SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::InboundFailure {
+            peer,
+            request_id,
+            error,
+            ..
+        })) => {
+            finish_sync_answer(&mut st.sync_awaiting_write, &mut st.sync_limiter, &request_id);
+            trace(|| format!("sync answer to {peer} not delivered: {error}"));
         }
         _ => {}
     }
@@ -2193,11 +2264,12 @@ fn has_source_reservation(ev: &NetEvent) -> bool {
 fn serve_sync(
     st: &mut Loop,
     resp_tx: tokio::sync::mpsc::UnboundedSender<(
-        Option<SyncPermit>,
+        Option<(request_response::InboundRequestId, SyncPermit)>,
         request_response::ResponseChannel<SyncResponse>,
         SyncResponse,
     )>,
     peer: PeerId,
+    request_id: request_response::InboundRequestId,
     request: SyncRequest,
     channel: request_response::ResponseChannel<SyncResponse>,
 ) {
@@ -2211,7 +2283,7 @@ fn serve_sync(
         Ok(permit) => permit,
         Err(why) => {
             let (permit, answer) = refusal_answer(peer, why);
-            let _ = resp_tx.send((permit, channel, answer));
+            let _ = resp_tx.send((permit.map(|p| (request_id, p)), channel, answer));
             return;
         }
     };
@@ -2219,8 +2291,96 @@ fn serve_sync(
     let limit = (limit as usize).min(MAX_SYNC_BLOCKS);
     tokio::task::spawn_blocking(move || {
         let envelopes = read_sync_page(&dir, &permit, after_slot, limit);
-        let _ = resp_tx.send((Some(permit), channel, SyncResponse::Blocks { envelopes }));
+        let _ = resp_tx.send((
+            Some((request_id, permit)),
+            channel,
+            SyncResponse::Blocks { envelopes },
+        ));
     });
+}
+
+/// Bytes a built answer holds in memory until it is written: the envelopes
+/// plus the `Vec` header of each.
+fn sync_response_bytes(resp: &SyncResponse) -> u64 {
+    let SyncResponse::Blocks { envelopes } = resp;
+    envelopes.iter().fold(0u64, |sum, e| {
+        sum.saturating_add((e.len() as u64).saturating_add(std::mem::size_of::<Vec<u8>>() as u64))
+    })
+}
+
+/// Hand a built answer to libp2p, keeping its permit until the write ends.
+///
+/// The permit used to be released here, as soon as the answer was BUILT. But
+/// libp2p then holds the answer (up to [`MAX_SYNC_FRAME`]) in the inbound
+/// stream task until the peer reads it or the request timeout fires, so the
+/// in-flight cap covered the disk read only: a peer that asked at the allowed
+/// rate and never read made this node hold one answer per admitted request.
+/// Now the permit is parked under the inbound request id and released by
+/// [`finish_sync_answer`] on `ResponseSent` or `InboundFailure`.
+///
+/// Every exit releases exactly once, so a peer that hangs up mid-answer still
+/// cannot leak its own budget away (the property the early release was there
+/// for):
+///
+/// * the request already failed while the answer was being built (timeout,
+///   connection closed) — libp2p has emitted its one event for it and will
+///   emit no other, which is what `is_pending_inbound` reports: release now;
+/// * `send_response` returns `Err` (the stream task is already gone):
+///   release now — the event for it, if still queued, finds nothing parked;
+/// * otherwise libp2p still tracks the request and owes exactly one of
+///   `ResponseSent` / `InboundFailure` (the latter also on connection close).
+///
+/// `None` is a REFUSED request riding the same channel — it never took a
+/// slot, so it must not give one back.
+fn deliver_sync_answer(
+    swarm: &mut Swarm,
+    st: &mut Loop,
+    permit: Option<(request_response::InboundRequestId, SyncPermit)>,
+    channel: request_response::ResponseChannel<SyncResponse>,
+    resp: SyncResponse,
+) {
+    let Some((request_id, mut permit)) = permit else {
+        let _ = swarm.behaviour_mut().sync.send_response(channel, resp);
+        return;
+    };
+    st.sync_limiter.settle(&mut permit, sync_response_bytes(&resp));
+    let sync = &mut swarm.behaviour_mut().sync;
+    if sync.is_pending_inbound(&permit.peer, &request_id)
+        && sync.send_response(channel, resp).is_ok()
+    {
+        hold_sync_permit(&mut st.sync_awaiting_write, &mut st.sync_limiter, request_id, permit);
+    } else {
+        st.sync_limiter.release(permit);
+    }
+}
+
+/// Park the permit of an answer that is being written. Generic over the key
+/// only so the tests can drive it: an `InboundRequestId` cannot be built
+/// outside libp2p.
+fn hold_sync_permit<K: std::hash::Hash + Eq>(
+    awaiting: &mut HashMap<K, SyncPermit>,
+    limiter: &mut SyncLimiter,
+    id: K,
+    permit: SyncPermit,
+) {
+    // Ids are unique per behaviour, so nothing is ever displaced; if one
+    // were, releasing it is what keeps the accounting exact.
+    if let Some(displaced) = awaiting.insert(id, permit) {
+        limiter.release(displaced);
+    }
+}
+
+/// The answer for `id` was sent or failed: release its permit, once. An id
+/// with nothing parked is a refusal, or an answer already released by
+/// [`deliver_sync_answer`], and frees nothing.
+fn finish_sync_answer<K: std::hash::Hash + Eq>(
+    awaiting: &mut HashMap<K, SyncPermit>,
+    limiter: &mut SyncLimiter,
+    id: &K,
+) {
+    if let Some(permit) = awaiting.remove(id) {
+        limiter.release(permit);
+    }
 }
 
 /// What a REFUSED `get-blocks` is answered with: an empty page and **no
@@ -2228,8 +2388,8 @@ fn serve_sync(
 ///
 /// The `None` is the whole point and is why this is a function rather than two
 /// inline lines. Refusals ride the same response channel as real answers, and
-/// the swarm loop releases an in-flight slot for whatever comes back down it —
-/// so a refusal that carried a releasable token would hand the flooder a slot
+/// the swarm loop parks and later releases an in-flight slot for whatever
+/// permit comes back down it — so a refusal that carried a releasable token would hand the flooder a slot
 /// per refusal it provoked, and the in-flight cap it had just tripped would
 /// stop binding. Pinned by `refused_requests_do_not_free_in_flight_slots`.
 fn refusal_answer(peer: PeerId, why: SyncRefusal) -> (Option<SyncPermit>, SyncResponse) {
@@ -2709,6 +2869,155 @@ mod tests {
         assert_eq!(lim.tracked(), 0, "a disconnected peer's bucket is never released");
     }
 
+    /// P2P-1: the in-flight slot is held until the answer is WRITTEN or has
+    /// FAILED, not until it is built. Before this, the swarm loop released
+    /// the permit and then handed the answer to libp2p, where it waits for
+    /// the peer to read it — so a peer that asked and never read held no
+    /// slot while this node held its multi-megabyte answers.
+    ///
+    /// Driven through the same `hold_sync_permit` / `finish_sync_answer` the
+    /// swarm loop calls, keyed by a plain integer because an
+    /// `InboundRequestId` cannot be constructed outside libp2p.
+    #[test]
+    fn sync_permit_is_held_until_the_answer_is_sent_or_fails() {
+        let mut lim = SyncLimiter::default();
+        let mut awaiting: HashMap<u64, SyncPermit> = HashMap::new();
+        let peer = PeerId::random();
+        let t0 = Instant::now();
+
+        // Two answers built and handed to libp2p; the peer reads neither.
+        for id in 0..MAX_INFLIGHT_SYNC_PER_PEER as u64 {
+            let mut permit = lim.begin(peer, t0).expect("under the cap");
+            lim.settle(&mut permit, 4 * 1024 * 1024);
+            hold_sync_permit(&mut awaiting, &mut lim, id, permit);
+        }
+        assert_eq!(
+            lim.begin(peer, t0).err(),
+            Some(SyncRefusal::TooManyInFlight),
+            "a built but unwritten answer no longer held its in-flight slot"
+        );
+        assert_eq!(lim.reserved_bytes(), 2 * 4 * 1024 * 1024);
+
+        // An event for some other request (a refusal's `ResponseSent`, or a
+        // failure that raced the build) frees nothing.
+        finish_sync_answer(&mut awaiting, &mut lim, &999);
+        assert_eq!(lim.begin(peer, t0).err(), Some(SyncRefusal::TooManyInFlight));
+
+        // `ResponseSent` for the first: exactly one slot comes back.
+        finish_sync_answer(&mut awaiting, &mut lim, &0);
+        let permit = lim.begin(peer, t0).expect("a sent answer must free its slot");
+        assert_eq!(lim.begin(peer, t0).err(), Some(SyncRefusal::TooManyInFlight));
+        lim.release(permit);
+
+        // A duplicate event for the same request must not free a second slot.
+        finish_sync_answer(&mut awaiting, &mut lim, &0);
+        let permit = lim.begin(peer, t0).expect("one slot is free");
+        assert_eq!(
+            lim.begin(peer, t0).err(),
+            Some(SyncRefusal::TooManyInFlight),
+            "one answer released two slots"
+        );
+        lim.release(permit);
+
+        // `InboundFailure` (timeout, reset, connection closed) for the second
+        // frees the other, and nothing is left behind.
+        finish_sync_answer(&mut awaiting, &mut lim, &1);
+        assert!(awaiting.is_empty());
+        assert_eq!(lim.reserved_bytes(), 0, "a failed answer leaked its reserved bytes");
+        let a = lim.begin(peer, t0).expect("both slots are back");
+        let b = lim.begin(peer, t0).expect("both slots are back");
+        lim.release(a);
+        lim.release(b);
+    }
+
+    /// P2P-1: no leak when the peer disconnects with an answer unwritten. The
+    /// one `forget` runs with the permit still parked; the connection-closed
+    /// `InboundFailure` then releases it and that finishes the removal, in
+    /// either order of the two events.
+    #[test]
+    fn sync_permit_awaiting_write_is_not_leaked_by_a_disconnect() {
+        for forget_first in [true, false] {
+            let mut lim = SyncLimiter::default();
+            let mut awaiting: HashMap<u64, SyncPermit> = HashMap::new();
+            let peer = PeerId::random();
+            let mut permit = lim.begin(peer, Instant::now()).expect("first request");
+            lim.settle(&mut permit, 1024);
+            hold_sync_permit(&mut awaiting, &mut lim, 7, permit);
+
+            if forget_first {
+                lim.forget(&peer);
+                assert_eq!(lim.tracked(), 1, "the slot must survive until the answer fails");
+                finish_sync_answer(&mut awaiting, &mut lim, &7);
+            } else {
+                finish_sync_answer(&mut awaiting, &mut lim, &7);
+                lim.forget(&peer);
+            }
+            assert!(awaiting.is_empty());
+            assert_eq!(lim.tracked(), 0, "a peer that hung up mid-answer leaked its bucket");
+            assert_eq!(lim.reserved_bytes(), 0, "a peer that hung up mid-answer leaked bytes");
+        }
+    }
+
+    /// P2P-1: the per-peer cap multiplies by the number of identities, so the
+    /// answer bytes outstanding are also bounded across ALL peers. Admission
+    /// reserves the worst case, so the bound holds before anything is built.
+    #[test]
+    fn sync_limiter_refuses_past_the_global_response_byte_cap() {
+        let mut lim = SyncLimiter::default();
+        let t0 = Instant::now();
+        let worst_case = (MAX_PENDING_SYNC_RESPONSE_BYTES / MAX_SYNC_FRAME) as usize;
+        assert!(worst_case >= MAX_INFLIGHT_SYNC_PER_PEER, "one honest peer must fit");
+
+        // Each from a different peer: no per-peer limit is in play.
+        let mut open: Vec<SyncPermit> = (0..worst_case)
+            .map(|i| match lim.begin(PeerId::random(), t0) {
+                Ok(permit) => permit,
+                Err(why) => panic!("answer {i} refused under the byte cap: {why:?}"),
+            })
+            .collect();
+        assert_eq!(lim.reserved_bytes(), MAX_PENDING_SYNC_RESPONSE_BYTES);
+
+        let late = PeerId::random();
+        assert_eq!(
+            lim.begin(late, t0).err(),
+            Some(SyncRefusal::ResponseBacklog),
+            "a request was admitted past MAX_PENDING_SYNC_RESPONSE_BYTES"
+        );
+
+        // A built answer counts for what it weighs, never for more than the
+        // worst case it was admitted against.
+        lim.settle(&mut open[0], MAX_SYNC_FRAME * 4);
+        assert_eq!(lim.reserved_bytes(), MAX_PENDING_SYNC_RESPONSE_BYTES);
+        assert_eq!(lim.begin(late, t0).err(), Some(SyncRefusal::ResponseBacklog));
+        lim.settle(&mut open[0], 0);
+        let permit = lim.begin(late, t0).expect("an empty answer must free its reservation");
+        assert_eq!(lim.begin(PeerId::random(), t0).err(), Some(SyncRefusal::ResponseBacklog));
+
+        // The refusals spent no token: the backlog is not the asker's doing.
+        // `late` was refused twice and admitted once, so the rest of its
+        // burst is intact.
+        lim.release(permit);
+        for _ in 1..(SYNC_ANSWER_BURST as usize) {
+            let permit = lim.begin(late, t0).expect("a backlog refusal cost the peer its burst");
+            lim.release(permit);
+        }
+        assert_eq!(lim.begin(late, t0).err(), Some(SyncRefusal::RateLimited));
+
+        for permit in open.drain(..) {
+            lim.release(permit);
+        }
+        assert_eq!(lim.reserved_bytes(), 0, "released answers left bytes reserved");
+    }
+
+    #[test]
+    fn sync_response_bytes_counts_every_envelope() {
+        let empty = SyncResponse::Blocks { envelopes: Vec::new() };
+        assert_eq!(sync_response_bytes(&empty), 0);
+        let page = SyncResponse::Blocks { envelopes: vec![vec![0u8; 1000], vec![0u8; 24]] };
+        let header = std::mem::size_of::<Vec<u8>>() as u64;
+        assert_eq!(sync_response_bytes(&page), 1024 + 2 * header);
+    }
+
     /// R3 M-7: production calls `forget` exactly ONCE per peer, from
     /// `ConnectionClosed` — there is no second disconnect event to retry a
     /// deferred removal the way the test above does. This is the shape that
@@ -2780,6 +3089,7 @@ mod tests {
             dialed: HashMap::new(),
             dialed_order: VecDeque::new(),
             sync_limiter: SyncLimiter::default(),
+            sync_awaiting_write: HashMap::new(),
             topics: Topics {
                 blocks: IdentTopic::new(TOPIC_BLOCKS),
                 attestations: IdentTopic::new(TOPIC_ATTESTATIONS),
