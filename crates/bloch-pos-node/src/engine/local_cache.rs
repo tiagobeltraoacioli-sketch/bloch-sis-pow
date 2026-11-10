@@ -89,6 +89,11 @@ impl Engine {
                         self.canonical.insert(*id.as_bytes());
                         self.note_tx_slots(env.header.slot, &body_transactions(&env).map_err(invalid)?);
                         self.blocks.insert(*id.as_bytes(), env);
+                        // The cached prefix is this node's own canonical log,
+                        // applied before the cache was written. It votes as
+                        // replayed history does (FC-1), and it must be marked
+                        // before the ratchet below releases finalized bodies.
+                        self.blocks.mark_validated(id.as_bytes());
                     }
                     self.state.set(state);
                     self.remember_state(*self.state.head().as_bytes(), self.state.arc());

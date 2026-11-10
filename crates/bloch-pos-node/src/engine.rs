@@ -83,6 +83,15 @@
 //! latest-message cache would change heads. Differential tests compare both
 //! tie-break regimes against the unchanged full rebuild through insertion,
 //! replacement, removal, stake changes, missing parents and synthetic cycles.
+//!
+//! Only blocks that passed the state transition vote from their body
+//! (security review 2026-11-10, FC-1). Admission stores a block after
+//! authenticating its proposer and its body commitments, and that is all it
+//! proves: the body attestations are verified by `apply_block`, when the
+//! block is applied. A stored block that was never applied therefore adds a
+//! parent edge to the tree and no weight; `BlockInventory::mark_validated`
+//! is what the apply, reorg and boot paths call to count a body. See
+//! `engine/block_inventory.rs`.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -1895,8 +1904,9 @@ struct Engine {
     /// A forward WS_CONFLICT is announced once, not every block.
     ws_conflict_reported: bool,
     /// Loose attestations dropped from `pool` because the block that carried
-    /// them became canonical — a removal fork choice cannot see, since it also
-    /// reads every stored block's body.
+    /// them became canonical — a removal that takes no vote away from fork
+    /// choice, since it also reads every validated block's body and the
+    /// apply that drops them is what validates that block.
     ///
     /// Monotone, and it exists only so [`Engine::forkchoice_inputs`] can tell
     /// that kind of pool shrinkage apart from the epoch `retain`, which fork
@@ -2040,7 +2050,7 @@ struct Engine {
     rejected_future: u64,
 }
 
-/// A fingerprint of the four values `lmd_ghost_head` reads, so `advance` can
+/// A fingerprint of the values `lmd_ghost_head` reads, so `advance` can
 /// tell whether recomputing it could possibly return anything new.
 ///
 /// Not a cache across calls — it is rebuilt from scratch inside each
@@ -2049,6 +2059,8 @@ struct Engine {
 #[derive(PartialEq, Eq)]
 struct ForkChoiceInputs {
     blocks: usize,
+    /// [`BlockInventory::vote_generation`]: which stored bodies vote.
+    votes: u64,
     pool: u64,
     justified: [u8; 32],
     validators: Vec<bloch_pos_committee::sample::Validator>,
@@ -3619,6 +3631,10 @@ impl Engine {
             Source::Local,
         );
         self.blocks.insert(id, env);
+        // `apply_canonical` ran the full transition above, before the block
+        // was stored, so its own `mark_validated` found nothing to index.
+        // Replayed history votes exactly as it did when it was first applied.
+        self.blocks.mark_validated(&id);
         true
     }
 
@@ -4056,6 +4072,44 @@ impl Engine {
             ));
             return (Verdict::Reject, None);
         }
+        // FC-1, defence in depth: a body attestation dated after its block,
+        // or outside its block's epoch, is refused before the block is stored
+        // or parked anywhere.
+        //
+        // This mirrors the transition and cannot refuse a block it would
+        // accept. Step 8 of `compute_post_state` rejects the whole block when
+        // any attestation has `epoch_of(att.data.slot) != st.epoch`, where
+        // `st` is the pre-state rolled to `epoch_of(header.slot)`, and
+        // `attestation::validate` rejects `att.data.slot > header.slot`. Both
+        // are ungated and depend on nothing but the two slots, so the verdict
+        // is the same on every branch.
+        //
+        // Body votes no longer weigh on fork choice before the block is
+        // applied (see `BlockInventory::mark_validated`), so this is not what
+        // keeps such a vote out of the head. It keeps a block that can never
+        // apply out of `blocks`, the orphan pool and the future-block pool,
+        // so it is never selected, replayed and removed, and it keeps the
+        // slot of every stored vote within its block's own epoch.
+        //
+        // `Ignore`, not `Reject`: a peer running a build without this check
+        // stores and relays such a block in good faith (its transition
+        // refuses it only if the branch is ever applied), and scoring that
+        // relay would let one proposer key turn upgraded nodes against the
+        // rest of the mesh while a fleet is being upgraded.
+        if let Some(att) = env.body.attestations.iter().find(|att| {
+            att.data.slot > env.header.slot
+                || epoch_of(att.data.slot) != epoch_of(env.header.slot)
+        }) {
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
+                "reject {}: body attestation by v{} names slot {}, outside block slot {} (epoch {})",
+                crate::codec::hex8(&id),
+                att.validator,
+                att.data.slot,
+                env.header.slot,
+                epoch_of(env.header.slot),
+            ));
+            return (Verdict::Ignore, None);
+        }
         // A block carrying transactions used to be rejected here, because the
         // node had no tx codec and failing closed was the honest response. The
         // codec exists now (`PosTransaction::from_canonical_bytes`), so bytes
@@ -4482,22 +4536,39 @@ impl Engine {
     /// `on_attestation` runs on a different event — so `apply_canonical`,
     /// `do_reorg` and the invalid-block removal only ever take entries out. A
     /// set that only loses elements is unchanged exactly when its size is.
+    /// (`do_reorg` may re-insert a released canonical body under the rewind
+    /// override; that replaces an entry already present and re-validates it,
+    /// so neither the count nor the folded votes move. The generation below
+    /// does, which costs one recompute and nothing else.)
+    ///
+    /// The third collection is the vote index: the body votes of validated
+    /// blocks. It is NOT shrink-only inside `advance` — applying a block is
+    /// exactly what starts counting its body (FC-1) — so it is compared by
+    /// the inventory's generation counter, which changes on every change to
+    /// the index. A turn that applied a block carrying attestations therefore
+    /// always recomputes the head, and it has to: those votes were not part
+    /// of the head that selected the block.
     ///
     /// `fc_covered_removals` is added back to the pool count for the one kind
     /// of shrinkage fork choice cannot observe: an attestation dropped because
     /// the block carrying it became canonical is still counted, from that
-    /// block's body. Adding the running total keeps the sum invariant across
-    /// those and lets it fall — forcing a recompute — for the epoch `retain`,
-    /// which drops attestations no stored block carries.
+    /// block's body, which the same apply marked validated. Adding the
+    /// running total keeps the sum invariant across those and lets it fall —
+    /// forcing a recompute — for the epoch `retain`, which drops attestations
+    /// no validated block carries. (Since FC-1 the apply that drops a covered
+    /// attestation also moves the vote generation, so that turn recomputes
+    /// regardless; the term is kept so the pool comparison stays exact on
+    /// its own.)
     ///
-    /// If a future edit inserts into either collection inside `advance`, this
-    /// stops being sound. That is why the invariant is written down here
+    /// If a future edit inserts into `blocks` or `pool` inside `advance`,
+    /// this stops being sound. That is why the invariant is written down here
     /// rather than assumed. The neutrality half of the claim is pinned by
     /// `an_attestation_its_block_carries_is_free_to_leave_the_pool`, which
     /// also carries the control showing the epoch `retain` is NOT neutral.
     fn forkchoice_inputs(&self) -> ForkChoiceInputs {
         ForkChoiceInputs {
             blocks: self.blocks.len(),
+            votes: self.blocks.vote_generation(),
             // A memo key over two counters; saturating like the counters are.
             pool: (self.pool.len() as u64).saturating_add(self.fc_covered_removals),
             justified: self.state.finality().justified.root,
@@ -4607,9 +4678,10 @@ impl Engine {
         // last iteration exists only to confirm the head stopped moving. That
         // confirmation is NOT free and it is NOT redundant: `apply_canonical`
         // advances `self.state`, which moves the justified root and can move
-        // the active validator set, and it prunes `self.pool`. All three are
-        // fork-choice inputs, so the value really can change and the loop
-        // really is the convergence.
+        // the active validator set, it prunes `self.pool`, and it is the point
+        // at which the applied block's body votes start to count (FC-1). All
+        // four are fork-choice inputs, so the value really can change and the
+        // loop really is the convergence.
         //
         // What is skippable is the case where none of them moved, and
         // `forkchoice_inputs` is what decides that. Reusing the previous
@@ -5426,6 +5498,13 @@ impl Engine {
                 self.remember_state(*id.as_bytes(), snapshot);
                 self.canonical.insert(*id.as_bytes());
                 self.chain.push((env.header.slot, id));
+                // FC-1: the transition just verified every body attestation
+                // against this block's pre-state, so from here its votes may
+                // weigh on fork choice. Before the pool drop below, which
+                // relies on the body carrying what it removes, and before the
+                // finality ratchet, which may release bodies. A no-op on the
+                // replay path, where the block is stored after this returns.
+                self.blocks.mark_validated(id.as_bytes());
                 // RPC-only: retain the registry proof of a checkpoint block
                 // when this block opened a new epoch (once per epoch).
                 self.note_checkpoint_registry();
@@ -5438,10 +5517,10 @@ impl Engine {
                 // Counted, because `advance` needs to tell this shrinkage
                 // apart from the `retain` four lines down. These attestations
                 // leave the loose pool and stay visible to fork choice, which
-                // observes every stored block's body as well as the pool, and
-                // `env` is one of the stored blocks. The `retain` below drops
-                // attestations nothing else carries — that one fork choice
-                // does see.
+                // observes every validated block's body as well as the pool,
+                // and `env` was marked validated above. The `retain` below
+                // drops attestations nothing else carries — that one fork
+                // choice does see.
                 for a in &env.body.attestations {
                     if self
                         .pool
@@ -5990,7 +6069,12 @@ impl Engine {
                 return false;
             }
             for env in restored {
-                self.blocks.insert(*env.block_id().as_bytes(), env);
+                let id = *env.block_id().as_bytes();
+                self.blocks.insert(id, env);
+                // Finalized canonical history: validated when it was applied.
+                // Re-inserting the full envelope dropped its vote index, so
+                // rebuild it from the restored body, as insertion used to.
+                self.blocks.mark_validated(&id);
             }
         }
 
@@ -6031,9 +6115,22 @@ impl Engine {
                         env.header.slot
                     ));
                     self.blocks.remove(env.block_id().as_bytes());
+                    // The blocks before the offender each passed the full
+                    // transition from the fork point. Their attestations are
+                    // verified, so their votes count from now on (FC-1) even
+                    // though this reorg is refused.
+                    for (id, _) in &applied {
+                        self.blocks.mark_validated(id);
+                    }
                     return false;
                 }
             }
+        }
+        // FC-1: every block of the branch passed the transition, so its body
+        // votes weigh on fork choice from here, exactly as the canonical
+        // blocks they are about to become.
+        for (id, _) in &applied {
+            self.blocks.mark_validated(id);
         }
         // R4 F-11: the OLD canonical tail is about to leave canonical
         // history (below). Any transaction it included that is NOT
@@ -8188,6 +8285,16 @@ pub fn run(cfg: Config) -> io::Result<()> {
 /// it can be reasoned about and tested without standing up a node. It is also
 /// what makes the divergence from longest-chain testable at all — see
 /// `forkchoice_tests::weight_beats_length` at the bottom of this file.
+///
+/// It folds the body of EVERY block in `blocks`, so the caller decides which
+/// bodies vote: pass only blocks whose attestations were verified. The node
+/// does not call this on its store (FC-1) — `BlockInventory::head` folds
+/// validated bodies only, and is tested against this function over the same
+/// blocks with the unvalidated bodies removed.
+///
+/// Test-only since FC-1, like the reference below: the binary must not carry
+/// a fork choice it can reach that counts the body of an unapplied block.
+#[cfg(test)]
 pub fn lmd_ghost_head<'a>(
     blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
     pool: impl Iterator<Item = &'a Attestation>,
@@ -8199,8 +8306,10 @@ pub fn lmd_ghost_head<'a>(
     fc.head(&tree, justified, &children)
 }
 
-/// LMD-GHOST with epoch-gated FC-05 candidate selection. The gate is inert,
-/// so production currently takes the exact [`lmd_ghost_head`] path above.
+/// LMD-GHOST with epoch-gated FC-05 candidate selection, over the same
+/// every-body fold as [`lmd_ghost_head`] and test-only for the same reason.
+/// The node applies the gate in `Engine::forkchoice_head`.
+#[cfg(test)]
 pub fn lmd_ghost_head_at_epoch<'a>(
     blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
     pool: impl Iterator<Item = &'a Attestation>,
@@ -8214,6 +8323,7 @@ pub fn lmd_ghost_head_at_epoch<'a>(
     lmd_ghost_head_with_slot_tiebreak(blocks, pool, validators, justified)
 }
 
+#[cfg(test)]
 fn lmd_ghost_head_with_slot_tiebreak<'a>(
     blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
     pool: impl Iterator<Item = &'a Attestation>,
@@ -8252,6 +8362,7 @@ pub fn lmd_ghost_head_reference<'a>(
 /// map and the sibling lists. Shared by the two entry points above so they
 /// cannot drift — a differential test whose two sides observe different
 /// message sets proves nothing.
+#[cfg(test)]
 #[allow(clippy::type_complexity)]
 fn forkchoice_store<'a>(
     blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
@@ -9923,17 +10034,19 @@ mod forkchoice_tests {
         }
     }
 
-    /// **Why `apply_canonical` may drop an attestation from the pool without
-    /// forcing `advance` to recompute.** Fork choice observes every stored
-    /// block's body *and* the loose pool. An attestation that leaves the pool
-    /// because the block carrying it became canonical is therefore still
-    /// observed, from that block — the head cannot move.
+    /// **Why an attestation `apply_canonical` drops from the pool is not a
+    /// vote lost.** Fork choice observes every validated block's body *and*
+    /// the loose pool. An attestation that leaves the pool because the block
+    /// carrying it became canonical is therefore still observed, from that
+    /// block — the head cannot move.
     ///
     /// That is the entire justification for `fc_covered_removals` in
     /// `Engine::forkchoice_inputs`. The second half of the test is the
     /// control: an attestation no stored block carries is NOT free to drop,
     /// which is why the epoch `retain` on the next line still invalidates the
-    /// memo.
+    /// memo. (Since FC-1 the block's body starts voting at that same apply,
+    /// which `advance` detects through the vote generation; this test is
+    /// about the pure function, where the body is folded in both runs.)
     #[test]
     fn an_attestation_its_block_carries_is_free_to_leave_the_pool() {
         let g = [0x99u8; 32];
@@ -17801,6 +17914,101 @@ mod ingest_admission_tests {
         assert_eq!(engine.orphans_evicted - before_orphans, 4);
     }
 
+    /// A copy of `template` under `parent` at `slot`, carrying one body
+    /// attestation dated `att_slot`, with the header commitment and the
+    /// proposer signature redone so the attestation's slot is the only thing
+    /// the door can hold against it.
+    fn carrying_vote_dated(
+        engine: &Engine,
+        template: &BlockEnvelope,
+        parent: [u8; 32],
+        slot: u64,
+        att_slot: u64,
+    ) -> BlockEnvelope {
+        let mut env = template.clone();
+        env.header.parent = parent;
+        env.header.slot = slot;
+        env.body.attestations = vec![Attestation {
+            data: AttestationData {
+                slot: att_slot,
+                head: parent,
+                source_epoch: 0,
+                source_root: [0; 32],
+                target_epoch: epoch_of(att_slot).max(1),
+                target_root: parent,
+            },
+            validator: 0,
+            signature: vec![0xA5; 64],
+        }];
+        env.header.attestation_root = derive::attestation_root(&env.body.attestations);
+        env.proposer_sig = engine
+            .keys
+            .as_ref()
+            .expect("the proposing fixture holds a keystore")
+            .sign(&env.header.proposal_signing_root());
+        env
+    }
+
+    /// **FC-1 (c): a body attestation dated after its block, or outside its
+    /// block's epoch, keeps the whole block out of every retention pool.**
+    ///
+    /// The transition rejects such a block on every branch (step 8: the vote's
+    /// epoch must be the block's epoch; `attestation::validate`: the vote's
+    /// slot must not exceed the block's slot), so nothing the transition
+    /// would accept is refused here. The control is the same block with the
+    /// vote dated at the block's own slot: it passes the door.
+    #[test]
+    fn a_body_attestation_outside_its_blocks_slot_range_is_refused_before_storage() {
+        let _clock = validator_lifecycle::clock_at(2 * SLOTS_PER_EPOCH);
+        let (mut engine, _dir, template, stored) = fixture();
+        let head = *engine.head_id().as_bytes();
+        let next_epoch = SLOTS_PER_EPOCH + 1;
+
+        let refused = [
+            // Dated one slot after the block that carries it.
+            carrying_vote_dated(&engine, &template, head, 2, 3),
+            // Dated at the far end of the slot space.
+            carrying_vote_dated(&engine, &template, head, 3, u64::MAX),
+            // An earlier slot, but of the epoch before the block's.
+            carrying_vote_dated(&engine, &template, head, next_epoch, SLOTS_PER_EPOCH - 1),
+            // Unknown parent: must not be parked as an orphan either.
+            carrying_vote_dated(&engine, &template, [0x9A; 32], 4, 5),
+            // Not yet due: must not be parked as a future block either.
+            carrying_vote_dated(&engine, &template, head, 2 * SLOTS_PER_EPOCH + 1, u64::MAX),
+        ];
+        for env in refused {
+            let id = *env.block_id().as_bytes();
+            let (slot, att_slot) = (env.header.slot, env.body.attestations[0].data.slot);
+            assert_eq!(
+                engine.ingest_judged(env),
+                Verdict::Ignore,
+                "block at slot {slot} carrying a vote dated {att_slot}: refused, and no \
+                 peer is charged for relaying it"
+            );
+            assert!(!engine.blocks.contains_key(&id), "slot {slot}/{att_slot}: stored");
+            assert_eq!(engine.blocks.len(), stored, "slot {slot}/{att_slot}: store changed");
+            assert!(engine.orphans.is_empty(), "slot {slot}/{att_slot}: parked as an orphan");
+            assert!(engine.deferred_orphans.is_empty());
+            assert!(engine.future_blocks.is_empty(), "slot {slot}/{att_slot}: parked as future");
+            assert_eq!(*engine.head_id().as_bytes(), head, "the head must not move");
+        }
+
+        // Control: the same shape with the vote dated at its block's slot is
+        // within the transition's range and passes the door.
+        let in_range = carrying_vote_dated(&engine, &template, head, 5, 5);
+        assert_eq!(
+            engine.ingest_judged(in_range),
+            Verdict::Accept,
+            "a vote dated at its own block's slot is not what this refusal is about"
+        );
+        let boundary = carrying_vote_dated(&engine, &template, head, next_epoch, SLOTS_PER_EPOCH);
+        assert_eq!(
+            engine.ingest_judged(boundary),
+            Verdict::Accept,
+            "the first slot of the block's own epoch is in range"
+        );
+    }
+
     /// **Pruning is finality-shaped, not slot-shaped.** With nothing finalized
     /// there is no floor, so nothing may be dropped; this pins that the sweep
     /// cannot start eating a live branch on a chain that has not finalized.
@@ -18969,5 +19177,193 @@ mod forkchoice_cycle_tests {
 
         assert_eq!(*engine.head_id().as_bytes(), rival, "the rival carries more stake");
         assert_eq!(hook.head_changes(), 1, "exactly one reorg, onto the rival");
+    }
+}
+
+/// FC-1 (security review 2026-11-10): body votes weigh on fork choice only
+/// for blocks that passed the state transition.
+///
+/// The inventory-level properties are pinned in `block_inventory.rs`. These
+/// drive the same claims through the engine's real paths: admission, apply,
+/// reorg, boot replay and the restart cache.
+#[cfg(test)]
+mod validated_vote_tests {
+    use super::*;
+
+    /// The pre-fix head: the full rebuild folding the body of EVERY stored
+    /// block. Equal to the node's head exactly when every stored body that
+    /// carries votes was validated (and none was released).
+    fn head_folding_every_stored_body(engine: &Engine) -> [u8; 32] {
+        lmd_ghost_head(
+            &engine.blocks,
+            engine.pool.values(),
+            &engine.forkchoice_validators(),
+            engine.state.finality().justified.root,
+        )
+    }
+
+    fn vote(validator: u32, slot: u64, head: [u8; 32]) -> Attestation {
+        Attestation {
+            validator,
+            data: AttestationData {
+                slot,
+                head,
+                source_epoch: 0,
+                source_root: [0u8; 32],
+                target_epoch: 1,
+                target_root: head,
+            },
+            signature: vec![0xA5; 64],
+        }
+    }
+
+    /// (a) A block stored on a side branch carries a vote, in the only
+    /// validator's name, that the transition would refuse (the signature is
+    /// not that validator's). It is stored — admission cannot judge it — and
+    /// the head stays where the signature-checked pool puts it.
+    #[test]
+    fn a_stored_unapplied_blocks_body_votes_do_not_move_the_head() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let (mut engine, _dir, _fork_point, rival) = reorg_state_tests::forked(1);
+        let tip = *engine.head_id().as_bytes();
+        let rival_id = *rival.block_id().as_bytes();
+        assert_ne!(tip, rival_id, "fixture: the rival is a sibling of the tip");
+
+        // The validator's own vote for the canonical tip, as the pool holds
+        // it after gossip admission.
+        let honest = vote(0, 3, tip);
+        engine.pool.insert((honest.validator, honest.data.signing_root()), honest);
+        assert_eq!(engine.forkchoice_head(), tip);
+
+        // A child of the rival whose body claims a later vote by the same
+        // validator for the rival's branch.
+        let mut carrier = rival.clone();
+        carrier.header.parent = rival_id;
+        carrier.header.slot = 4;
+        carrier.body.attestations = vec![vote(0, 4, rival_id)];
+        carrier.header.attestation_root = derive::attestation_root(&carrier.body.attestations);
+        carrier.proposer_sig = engine
+            .keys
+            .as_ref()
+            .expect("the proposing fixture holds a keystore")
+            .sign(&carrier.header.proposal_signing_root());
+        let carrier_id = *carrier.block_id().as_bytes();
+
+        assert_eq!(
+            engine.ingest_judged(carrier),
+            Verdict::Accept,
+            "fixture: the block passes admission and is stored"
+        );
+        assert!(engine.blocks.contains_key(&carrier_id), "stored, and never selected");
+        assert!(engine.blocks.contains_key(&rival_id));
+        assert!(
+            !engine.blocks.has_indexed_votes(&carrier_id),
+            "a stored block's body votes are not indexed before it is applied"
+        );
+        assert_eq!(engine.forkchoice_head(), tip, "unverified body votes moved the head");
+        assert_eq!(*engine.head_id().as_bytes(), tip, "and the canonical chain with it");
+        // Fixture guard: this is a case the old rule decided differently. A
+        // fold over every stored body retains the carried vote as the
+        // validator's latest message and walks to the carrier.
+        assert_eq!(
+            head_folding_every_stored_body(&engine),
+            carrier_id,
+            "fixture: the carried vote must be one the old fold would have counted"
+        );
+    }
+
+    /// (b) Validated history votes exactly as it did before: through live
+    /// apply, after being reorganised away, through boot replay and through
+    /// the restart cache, the head is the one the full rebuild over every
+    /// stored body selects.
+    #[test]
+    fn validated_blocks_vote_exactly_as_the_full_rebuild_counted_them() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.live = false;
+        // Epoch 0 carries no votes (its checkpoint is genesis). Run through
+        // epoch 1, stopping before its last block closes anything.
+        let last = 2 * SLOTS_PER_EPOCH - 1;
+        for slot in 1..=last {
+            engine.attest(slot);
+            engine.propose(slot);
+        }
+        assert_eq!(engine.state.slot(), last, "fixture: every proposal was adopted");
+        assert!(engine.finalized_latch.is_none(), "fixture: no body was released");
+        let logged: Vec<BlockEnvelope> = engine.chain[1..]
+            .iter()
+            .map(|(_, id)| engine.blocks[id.as_bytes()].clone())
+            .collect();
+        let carriers: Vec<[u8; 32]> = logged
+            .iter()
+            .filter(|env| !env.body.attestations.is_empty())
+            .map(|env| *env.block_id().as_bytes())
+            .collect();
+        assert!(!carriers.is_empty(), "fixture: some canonical block carries a vote");
+        let head = *engine.head_id().as_bytes();
+
+        let check = |engine: &Engine, path: &str| {
+            for id in &carriers {
+                assert!(engine.blocks.contains_key(id), "{path}: carrier missing");
+                assert!(engine.blocks.has_indexed_votes(id), "{path}: validated votes not indexed");
+            }
+            assert_eq!(
+                engine.forkchoice_head(),
+                head_folding_every_stored_body(engine),
+                "{path}: validated history must vote exactly as the full rebuild"
+            );
+        };
+        check(&engine, "live apply");
+        assert_eq!(engine.forkchoice_head(), head);
+
+        // Validated, then reorganised away: give back everything from the
+        // first carrier up. The blocks stay stored and keep voting.
+        let first_carrier = engine
+            .chain
+            .iter()
+            .position(|(_, id)| id.as_bytes() == &carriers[0])
+            .expect("the carrier is canonical");
+        let ancestor = *engine.chain[first_carrier - 1].1.as_bytes();
+        assert!(engine.do_reorg(ancestor, Vec::new()), "handing blocks back must succeed");
+        assert!(!engine.canonical.contains(&carriers[0]));
+        check(&engine, "reorganised away");
+        // And adopted again through a real reorg onto the same branch.
+        let branch = logged[first_carrier - 1..].to_vec();
+        assert!(engine.do_reorg(ancestor, branch), "the branch is valid");
+        assert_eq!(*engine.head_id().as_bytes(), head);
+        check(&engine, "re-adopted by reorg");
+
+        let reset = |engine: &mut Engine| {
+            let genesis = engine.manifest.genesis_id();
+            engine.state = StateCell::new(engine.manifest.genesis_state());
+            engine.chain = vec![(0, genesis)];
+            engine.canonical = BTreeSet::from([*genesis.as_bytes()]);
+            engine.blocks.clear();
+            engine.pool.clear();
+            engine.recent_states.clear();
+            engine.tx_slot_index.clear();
+            engine.tx_slot_index_order.clear();
+            engine.finalized_latch = None;
+        };
+
+        // Boot replay of the canonical log.
+        reset(&mut engine);
+        for env in logged.clone() {
+            assert!(engine.ingest_replay(env), "replay of validated history");
+        }
+        assert_eq!(*engine.head_id().as_bytes(), head);
+        check(&engine, "boot replay");
+
+        // Restart cache: the prefix is restored without re-running the
+        // transition, and must vote as the replayed prefix does.
+        engine.store.rewrite(&logged).expect("publish the log");
+        engine.write_local_cache().expect("write the restart cache");
+        reset(&mut engine);
+        let mut tail = logged.clone();
+        assert_eq!(
+            engine.restore_local_cache(&mut tail).expect("the cache restores"),
+            logged.len()
+        );
+        assert_eq!(*engine.head_id().as_bytes(), head);
+        check(&engine, "restart cache");
     }
 }
