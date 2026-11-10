@@ -9,11 +9,37 @@
 //! `start_period + i` (`bloch_pos_committee::kes::KesPublic::leaf_index`), and
 //! the node maps one to the other from committed state. [`KesKey::evolve_to`]
 //! writes the evolved state to disk (temp file, fsync, rename) **before** the
-//! caller signs anything with the new leaf, then replaces it in memory. Once
-//! that rename lands, no earlier seed exists anywhere this node wrote it, so
-//! nothing it holds can sign an earlier period — the long-range property.
-//! Operators must not keep older copies of this file: a backup of an earlier
-//! state is an earlier seed.
+//! caller signs anything with the new leaf, then replaces it in memory.
+//!
+//! What "erased" means (review CR-7). Once the rename lands the file NAME
+//! holds only the current seed, and the node then overwrites the replaced
+//! file's contents in place with zeros, through a descriptor it opened before
+//! the rename, and fsyncs ([`overwrite_replaced`]). On a file system that
+//! writes data in place (ext4 and XFS in their default modes) on a medium
+//! that does not remap writes, the earlier sealed seed is then gone from the
+//! blocks this node wrote it to, so the disk alone, or the disk plus the
+//! passphrase, no longer yields a seed of a past period. That is the
+//! long-range property, and it is best effort below the file system:
+//!
+//! - a copy-on-write or log-structured file system (btrfs, ZFS, APFS, F2FS),
+//!   a data-journaling mount (`data=journal`), an LVM/ZFS/cloud snapshot, or
+//!   an SSD's flash translation layer can keep the old blocks until they are
+//!   garbage-collected or trimmed; the overwrite cannot reach them;
+//! - a crash between the rename and the overwrite's fsync leaves the old
+//!   blocks released but not overwritten;
+//! - a backup of an earlier state is an earlier seed: operators must not
+//!   keep older copies of this file, and keep KES data dirs out of snapshots.
+//!
+//! The sealing key is not ratcheted per period, on purpose. After a restart
+//! the node has only the passphrase and the file, so whatever opens the
+//! current file must be derivable from the two; any per-period key would
+//! have to be stored wrapped under the passphrase-derived key beside the
+//! ciphertext, and someone holding the passphrase and an old ciphertext
+//! would hold the old wrapped key too. Against that attacker a ratchet
+//! reduces to erasing the old file, which is what the overwrite does;
+//! without the passphrase the sealing already protects every generation.
+//! With `--allow-plaintext-keystore` there is no sealing and the overwrite
+//! is the only protection of past seeds.
 //!
 //! Rotation (HF3): the successor tree is generated in the background and
 //! sealed as `validator.kes.next` ([`NEXT_FILE_NAME`]); once the chain makes
@@ -137,8 +163,11 @@ impl KesKey {
         dir.join(NEXT_FILE_NAME)
     }
 
-    /// Move to leaf `period`, erasing every earlier seed — on disk first,
-    /// then in memory. Refuses to go back and refuses past the last leaf.
+    /// Move to leaf `period`, erasing every earlier seed — on disk first
+    /// (new state durable under the file name, then the replaced file's
+    /// contents overwritten in place; see the module doc for what that
+    /// guarantees), then in memory. Refuses to go back and refuses past the
+    /// last leaf.
     pub fn evolve_to(&mut self, dir: &Path, unlock: &Unlock, period: u64) -> io::Result<()> {
         if period < self.period {
             return Err(io::Error::new(
@@ -308,8 +337,27 @@ impl KesKey {
             f.write_all(&out)?;
             f.sync_all()?;
         }
+        // The file this write replaces, if any, held open across the rename
+        // so its contents can be overwritten afterwards (review CR-7): a
+        // rename only drops the name, and the old inode's blocks would be
+        // released with an earlier seed still in them.
+        // Unix only: elsewhere an open handle can make the rename itself
+        // fail, and the atomic replace matters more than the overwrite.
+        #[cfg(unix)]
+        let replaced = match fs::OpenOptions::new().write(true).open(&path) {
+            Ok(f) => Some(f),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        #[cfg(not(unix))]
+        let replaced: Option<fs::File> = None;
         fs::rename(&tmp, &path)?;
         fs::File::open(dir)?.sync_all()?;
+        // Only now: the new state is durable under the name, so a crash
+        // during the overwrite cannot leave the node without a key.
+        if let Some(old) = replaced {
+            overwrite_replaced(old)?;
+        }
         Ok(())
     }
 
@@ -421,6 +469,25 @@ impl KesKey {
         }
         Ok(KesKey { index, public, leaves, period, seed, seal: std::cell::RefCell::new(seal_cache), leaf: Default::default() })
     }
+}
+
+/// Overwrite, in place, the contents of a file whose name has just been
+/// renamed over, through the descriptor opened before the rename, and fsync.
+/// Best effort against recovery from the file system, with the same limits
+/// as [`shred`]: a copy-on-write, log-structured or data-journaling file
+/// system, a snapshot, or a remapping medium (SSD) may still hold the old
+/// blocks, and a crash before the fsync leaves them released but intact.
+fn overwrite_replaced(mut old: fs::File) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut left = old.metadata()?.len();
+    old.seek(SeekFrom::Start(0))?;
+    let zeros = [0u8; 4096];
+    while left > 0 {
+        let n = left.min(zeros.len() as u64) as usize;
+        old.write_all(&zeros[..n])?;
+        left -= n as u64;
+    }
+    old.sync_all()
 }
 
 /// Overwrite `path` with zeros, fsync, and remove it. Best effort against
@@ -604,6 +671,56 @@ mod tests {
         assert!(kes::verify(&verifier, &public, 2, &root, &again));
         assert!(!kes::verify(&verifier, &public, 0, &root, &again));
         assert!(fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// CR-7: evolution overwrites the replaced file's contents, not only its
+    /// name. A second hard link stands in for "the old inode's blocks": after
+    /// the evolution it must hold no byte of the earlier sealed state, for
+    /// sealed and plaintext keystores alike, and the key must still reload.
+    #[cfg(unix)]
+    #[test]
+    fn evolution_overwrites_the_replaced_file_in_place() {
+        for (name, unlock) in [("overwrite-sealed", quick()), ("overwrite-plain", Unlock::PlaintextOptIn)] {
+            let dir = tmp(name);
+            let mut key = KesKey::generate(4, 2, |_| {}).unwrap();
+            key.save(&dir, &unlock).unwrap();
+            let before = fs::read(KesKey::path(&dir)).unwrap();
+            let old_inode = dir.join("old-inode");
+            fs::hard_link(KesKey::path(&dir), &old_inode).unwrap();
+
+            key.evolve_to(&dir, &unlock, 1).unwrap();
+
+            let after = fs::read(&old_inode).unwrap();
+            assert_eq!(after.len(), before.len(), "overwritten in place, not truncated");
+            assert!(after.iter().all(|b| *b == 0), "the earlier state must be overwritten");
+            // The live file is a different inode holding only period 1.
+            let reloaded = KesKey::load_optional(&dir, &unlock).unwrap().unwrap();
+            assert_eq!(reloaded.period(), 1);
+            assert_eq!(*reloaded.seed, kes::step(&KesKey::decode(&before, &unlock).unwrap().seed));
+            // A second evolution overwrites the period-1 file the same way.
+            let mid = dir.join("mid-inode");
+            fs::hard_link(KesKey::path(&dir), &mid).unwrap();
+            key.evolve_to(&dir, &unlock, 3).unwrap();
+            assert!(fs::read(&mid).unwrap().iter().all(|b| *b == 0));
+            assert_eq!(KesKey::load_optional(&dir, &unlock).unwrap().unwrap().period(), 3);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The first save has nothing to overwrite, and a failed evolution
+    /// (refused period) leaves the file untouched.
+    #[test]
+    fn a_refused_evolution_leaves_the_file_untouched() {
+        let dir = tmp("refused");
+        let unlock = quick();
+        let mut key = KesKey::generate(4, 1, |_| {}).unwrap();
+        key.save(&dir, &unlock).unwrap();
+        key.evolve_to(&dir, &unlock, 1).unwrap();
+        let bytes = fs::read(KesKey::path(&dir)).unwrap();
+        assert!(key.evolve_to(&dir, &unlock, 0).is_err());
+        assert!(key.evolve_to(&dir, &unlock, 2).is_err());
+        assert_eq!(fs::read(KesKey::path(&dir)).unwrap(), bytes);
         let _ = fs::remove_dir_all(&dir);
     }
 
