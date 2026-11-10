@@ -725,9 +725,29 @@ pub fn fs_free_bytes(path: &std::path::Path) -> u64 {
 /// shape as `rpc::serve`; GET-only, no body read, so the request handling is
 /// a fraction of the RPC's. Returns the bound address (port 0 supported, for
 /// tests).
+///
+/// # Host
+///
+/// Requests must carry a `Host` the JSON-RPC listener would accept for the
+/// same bind: a loopback literal or `localhost`, the literal `bind_addr`, or
+/// a name on `BLOCH_RPC_HOST_ALLOWLIST` — the rule is `rpc::HostPolicy`
+/// itself, not a copy. Without it a web page at an attacker-registered name
+/// that resolves to this listener (DNS rebinding) could read `/metrics` and
+/// `/health` through a victim's browser, because nothing here authenticates.
+///
+/// One addition, for `--allow-public-metrics` on a wildcard bind (`0.0.0.0`
+/// or `::`): a wildcard is never a `Host` value, so there the IP literal of
+/// the local address the connection actually arrived on is accepted too.
+/// That keeps a scraper addressing the node by IP working, and a rebinding
+/// page cannot use it: its `Host` is a name, not this machine's address. A
+/// scraper that addresses the node by DNS name must be put on the allowlist.
 pub fn serve(bind_addr: &str, port: u16, metrics: &'static NodeMetrics) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind((bind_addr, port))?;
     let local = listener.local_addr()?;
+    let hosts = Arc::new(MetricsHosts {
+        policy: crate::rpc::HostPolicy::new(bind_addr),
+        wildcard_bind: bind_addr == "0.0.0.0" || bind_addr == "::",
+    });
     let live = Arc::new(AtomicUsize::new(0));
     let ip_limits = Arc::new(crate::connection_limit::Limits::default());
     thread::spawn(move || {
@@ -742,16 +762,58 @@ pub fn serve(bind_addr: &str, port: u16, metrics: &'static NodeMetrics) -> std::
                 let _ = respond(&mut sock, 503, "text/plain", "too many connections");
                 continue;
             };
+            let hosts = Arc::clone(&hosts);
             thread::spawn(move || {
                 let _permit = permit;
-                serve_connection(&mut sock, metrics);
+                serve_connection(&mut sock, metrics, &hosts);
             });
         }
     });
     Ok(local)
 }
 
-fn serve_connection(sock: &mut TcpStream, metrics: &NodeMetrics) {
+/// The `Host` rule for this listener: the RPC's policy, plus the wildcard-bind
+/// case described on [`serve`].
+struct MetricsHosts {
+    policy: crate::rpc::HostPolicy,
+    wildcard_bind: bool,
+}
+
+impl MetricsHosts {
+    /// `local` is the address this connection was accepted on.
+    fn allows(&self, host: Option<&str>, local: Option<std::net::IpAddr>) -> bool {
+        if self.policy.allows(host) {
+            return true;
+        }
+        if !self.wildcard_bind {
+            return false;
+        }
+        let named = host
+            .and_then(crate::rpc::host_name_only)
+            .and_then(|name| name.parse::<std::net::IpAddr>().ok());
+        match (named, local) {
+            // `to_canonical`: a dual-stack `::` listener reports an IPv4
+            // peer's local address as `::ffff:a.b.c.d`.
+            (Some(named), Some(local)) => named.to_canonical() == local.to_canonical(),
+            _ => false,
+        }
+    }
+}
+
+/// The request's `Host`, or `Err` if it is sent more than once (two values
+/// are two answers to "which name did you ask for", so neither is trusted).
+fn host_header(head: &str) -> Result<Option<&str>, ()> {
+    let mut host = None;
+    for line in head.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        if name.eq_ignore_ascii_case("host") && host.replace(value.trim_matches([' ', '\t'])).is_some() {
+            return Err(());
+        }
+    }
+    Ok(host)
+}
+
+fn serve_connection(sock: &mut TcpStream, metrics: &NodeMetrics, hosts: &MetricsHosts) {
     let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
     let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
 
@@ -786,6 +848,17 @@ fn serve_connection(sock: &mut TcpStream, metrics: &NodeMetrics) {
         let _ = respond(sock, 405, "text/plain", "GET only");
         return;
     }
+    let local = sock.local_addr().ok().map(|a| a.ip());
+    if !host_header(&head).is_ok_and(|host| hosts.allows(host, local)) {
+        let _ = respond(
+            sock,
+            403,
+            "text/plain",
+            "Host does not match this server's bound address (or its configured allowlist); \
+             set BLOCH_RPC_HOST_ALLOWLIST if this Host is expected",
+        );
+        return;
+    }
     // Route on the path WITHOUT any query string.
     let path = path.split('?').next().unwrap_or("");
     match path {
@@ -810,6 +883,7 @@ fn serve_connection(sock: &mut TcpStream, metrics: &NodeMetrics) {
 fn respond(sock: &mut TcpStream, status: u16, ctype: &str, body: &str) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         431 => "Request Header Fields Too Large",
@@ -1062,7 +1136,9 @@ mod tests {
 
         let get = |path: &str| -> (u16, String) {
             let mut sock = TcpStream::connect(addr).expect("connect");
-            write!(sock, "GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+            // A Host this listener accepts: the loopback literal it is bound
+            // to (RPC-7a; an arbitrary Host is refused, see the test below).
+            write!(sock, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
             let mut resp = String::new();
             sock.read_to_string(&mut resp).expect("read");
             let status: u16 = resp
@@ -1115,6 +1191,110 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 405"), "{resp}");
     }
 
+    /// RPC-7a: `/metrics` and `/health` refuse a `Host` the JSON-RPC listener
+    /// would refuse — the DNS-rebinding shape, where a browser reaches this
+    /// loopback listener under a foreign name — and serve nothing with the
+    /// refusal. A dedicated static registry so this cannot race the
+    /// counter-delta test above.
+    #[test]
+    fn metrics_listener_refuses_a_foreign_host_header() {
+        static HOSTS: NodeMetrics = NodeMetrics::new();
+        let addr = serve("127.0.0.1", 0, &HOSTS).expect("bind");
+        let port = addr.port();
+
+        let status = |head: String| -> (u16, String) {
+            let mut sock = TcpStream::connect(addr).expect("connect");
+            sock.write_all(head.as_bytes()).unwrap();
+            let mut resp = String::new();
+            sock.read_to_string(&mut resp).expect("read");
+            let status = resp.split(' ').nth(1).and_then(|s| s.parse().ok()).expect("status line");
+            (status, resp)
+        };
+        let get = |path: &str, host: &str| status(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n"));
+
+        for path in ["/metrics", "/health", "/"] {
+            for host in [
+                "rebind.example".to_string(),
+                format!("rebind.example:{port}"),
+                "x".to_string(),
+                "192.0.2.7".to_string(),
+                "127.0.0.1.rebind.example".to_string(),
+                "127.0.0.1:notaport".to_string(),
+            ] {
+                let (code, resp) = get(path, &host);
+                assert_eq!(code, 403, "{path} with Host `{host}`: {resp}");
+                assert!(!resp.contains("bloch_pos_"), "a refusal must not carry metrics: {resp}");
+                assert!(!resp.contains("\"status\""), "a refusal must not carry health: {resp}");
+            }
+            // No Host at all, and two of them, are refused as well.
+            assert_eq!(status(format!("GET {path} HTTP/1.0\r\n\r\n")).0, 403);
+            assert_eq!(
+                status(format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: rebind.example\r\n\r\n"
+                ))
+                .0,
+                403
+            );
+        }
+
+        // What a local scraper sends is still served.
+        for host in [
+            "127.0.0.1".to_string(),
+            format!("127.0.0.1:{port}"),
+            format!("localhost:{port}"),
+            format!("LOCALHOST:{port}"),
+            format!("[::1]:{port}"),
+        ] {
+            let (code, resp) = get("/metrics", &host);
+            assert_eq!(code, 200, "Host `{host}`: {resp}");
+            assert_ne!(get("/health", &host).0, 403, "Host `{host}`");
+        }
+    }
+
+    /// RPC-7a must leave `--allow-public-metrics` working: a literal bind
+    /// accepts its own address, and a wildcard bind accepts the IP literal of
+    /// the address the connection arrived on — and only that.
+    #[test]
+    fn metrics_host_rule_accepts_the_bound_address_when_public() {
+        use std::net::IpAddr;
+        let hosts = |bind: &str, extra: Option<&str>| MetricsHosts {
+            policy: crate::rpc::HostPolicy::with_extra(bind, extra),
+            wildcard_bind: bind == "0.0.0.0" || bind == "::",
+        };
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+
+        // Literal public bind: its own address, with or without a port.
+        let literal = hosts("10.0.0.5", None);
+        assert!(literal.allows(Some("10.0.0.5:9100"), ip("10.0.0.5")));
+        assert!(literal.allows(Some("10.0.0.5"), ip("10.0.0.5")));
+        assert!(!literal.allows(Some("node.example:9100"), ip("10.0.0.5")));
+        assert!(!literal.allows(Some("10.0.0.6:9100"), ip("10.0.0.5")));
+        assert!(!literal.allows(None, ip("10.0.0.5")));
+
+        // Wildcard bind: the address the scraper actually connected to.
+        let wildcard = hosts("0.0.0.0", None);
+        assert!(wildcard.allows(Some("203.0.113.9:9100"), ip("203.0.113.9")));
+        assert!(wildcard.allows(Some("127.0.0.1:9100"), ip("127.0.0.1")));
+        assert!(!wildcard.allows(Some("203.0.113.10:9100"), ip("203.0.113.9")));
+        assert!(!wildcard.allows(Some("node.example:9100"), ip("203.0.113.9")));
+        assert!(!wildcard.allows(Some("0.0.0.0:9100"), ip("203.0.113.9")));
+        assert!(!wildcard.allows(Some("203.0.113.9:9100"), None));
+        assert!(!wildcard.allows(None, ip("203.0.113.9")));
+        // Dual-stack `::` reports an IPv4 arrival as an IPv4-mapped address.
+        let dual = hosts("::", None);
+        assert!(dual.allows(Some("203.0.113.9:9100"), ip("::ffff:203.0.113.9")));
+        assert!(dual.allows(Some("[2001:db8::7]:9100"), ip("2001:db8::7")));
+        assert!(!dual.allows(Some("[2001:db8::8]:9100"), ip("2001:db8::7")));
+
+        // A loopback bind gains nothing from the connection's address rule.
+        let loopback = hosts("127.0.0.1", None);
+        assert!(!loopback.allows(Some("203.0.113.9"), ip("203.0.113.9")));
+
+        // A scraper that uses a DNS name goes on the same allowlist the RPC reads.
+        let named = hosts("0.0.0.0", Some("node.example"));
+        assert!(named.allows(Some("node.example:9100"), ip("203.0.113.9")));
+    }
+
     /// R3 M-5's second half: `/health` and `/metrics` must be served off the
     /// accept thread so a slow scraper cannot stall accepts. A dedicated
     /// static registry (not the shared `NODE`) so this cannot race the
@@ -1139,7 +1319,7 @@ mod tests {
         // promptly, independent of the slow one.
         let mut fast = TcpStream::connect(addr).expect("connect (fast)");
         fast.set_read_timeout(Some(Duration::from_secs(2))).expect("set timeout");
-        write!(fast, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n").expect("write request");
+        write!(fast, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").expect("write request");
         let mut resp = String::new();
         fast.read_to_string(&mut resp)
             .expect("the fast connection must be served without waiting on the slow one");

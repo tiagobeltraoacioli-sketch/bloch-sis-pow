@@ -1992,17 +1992,20 @@ const RPC_HOST_ALLOWLIST_ENV: &str = "BLOCH_RPC_HOST_ALLOWLIST";
 /// Compared against the request's `Host` header with the port stripped —
 /// see [`host_name_only`] — because the identity that matters for DNS
 /// rebinding is the NAME, not the port a browser filled in from the URL.
-struct HostPolicy {
+///
+/// `pub(crate)` because the metrics listener applies the same rule
+/// (`metrics::serve`) and must not carry a second copy of it.
+pub(crate) struct HostPolicy {
     allowed: Vec<String>,
 }
 
 impl HostPolicy {
-    fn new(bind_addr: &str) -> Self {
+    pub(crate) fn new(bind_addr: &str) -> Self {
         let extra = std::env::var(RPC_HOST_ALLOWLIST_ENV).ok();
         Self::with_extra(bind_addr, extra.as_deref())
     }
 
-    fn with_extra(bind_addr: &str, extra: Option<&str>) -> Self {
+    pub(crate) fn with_extra(bind_addr: &str, extra: Option<&str>) -> Self {
         let mut allowed = vec!["127.0.0.1".to_string(), "localhost".to_string(), "::1".to_string()];
         // An operator who bound a specific, literal address made an explicit
         // decision to trust that name — `0.0.0.0`/`::` are wildcard BIND
@@ -2022,7 +2025,7 @@ impl HostPolicy {
         HostPolicy { allowed }
     }
 
-    fn allows(&self, host: Option<&str>) -> bool {
+    pub(crate) fn allows(&self, host: Option<&str>) -> bool {
         let Some(h) = host else { return false };
         let Some(name) = host_name_only(h) else { return false };
         let name = name.to_ascii_lowercase();
@@ -2034,7 +2037,7 @@ impl HostPolicy {
 /// `:<port>` stripped. Handles the IPv6 literal form (`[::1]:8080` or bare
 /// `[::1]`), and rejects malformed authorities rather than extracting an
 /// allowed prefix from them.
-fn host_name_only(host: &str) -> Option<&str> {
+pub(crate) fn host_name_only(host: &str) -> Option<&str> {
     let host = host.trim();
     if host.is_empty() {
         return None;

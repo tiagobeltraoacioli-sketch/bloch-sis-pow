@@ -609,6 +609,9 @@ fn print_help() {
                unauthenticated. A non-loopback bind is refused unless\n\
                --allow-public-metrics explicitly acknowledges the exposure;\n\
                that flag adds no authentication, so firewall it like RPC.\n\
+               Requests must carry a Host naming loopback, the bound\n\
+               address (on 0.0.0.0/::, the IP the scraper connected to) or\n\
+               a name in BLOCH_RPC_HOST_ALLOWLIST; others get 403.\n\
                  Methods: getbuildinfo, getchaininfo, getblockcount,\n\
                  getblockbyslot, getblockbyid, getvalidator,\n\
                  getvalidatorcount, getbalance, gettxout, getutxos (alias\n\
