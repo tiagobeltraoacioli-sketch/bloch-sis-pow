@@ -434,6 +434,64 @@ mod l2_tests {
         assert!(state.apply_transaction(&PosTransaction::L2SettlementAsync(Box::new(original)), 0, 1, &RealProof).is_err());
         assert_eq!(state, pre);
     }
+    /// The mempool preflight gives the verdict of `apply` on a copy, and a
+    /// settlement that fails policy, source or successor never reaches the
+    /// proof verifier.
+    #[test]
+    fn async_preflight_matches_apply_and_checks_the_proof_last() {
+        struct Counting(std::cell::Cell<usize>);
+        impl SignatureVerifier for Counting {
+            fn verify_with_key(&self, _: &[u8], _: &[u8; 32], _: &[u8]) -> bool { false }
+            fn verify_l2_settlement(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8], proof: &[u8]) -> bool {
+                self.0.set(self.0.get() + 1);
+                proof == [1; 356]
+            }
+        }
+        let verifier = Counting(std::cell::Cell::new(0));
+        let agree = |l2: &crate::l2_settlement::State, tx: &Transaction| {
+            let preflight = l2.validate_async(tx, &verifier);
+            assert_eq!(preflight, l2.clone().apply(tx, [0; 32], 0, true, &verifier));
+            preflight
+        };
+        // No anchor yet: refused before the proof.
+        let (pre, mut chains) = fixture_mode(true);
+        let l2 = pre.l2_settlement().unwrap();
+        assert_eq!(agree(l2, &transaction(&pre)), Err(Reject::NotActive));
+        let t = Transition::new(ProofDouble);
+        let block = build_block(&t, &pre, 2, &[], &[], &mut chains);
+        let pre = t.apply_block(&pre, &block, &[], &[]).unwrap();
+        let l2 = pre.l2_settlement().unwrap();
+        let original = transaction(&pre);
+        for (offset, why) in [
+            (S, Reject::Policy),
+            (S + 256, Reject::Policy),
+            (S + 400, Reject::Source),
+            (S + 448, Reject::Source),
+            (S + 512, Reject::Source),
+            (S + 224, Reject::Successor),
+            (S + 264, Reject::Successor),
+        ] {
+            let mut changed = original.clone();
+            changed.statement[offset] ^= 1;
+            assert_eq!(agree(l2, &changed), Err(why), "offset {offset}");
+        }
+        let mut policy = original.clone();
+        policy.proof_policy[0] ^= 1;
+        assert_eq!(agree(l2, &policy), Err(Reject::Policy));
+        assert_eq!(verifier.0.get(), 0, "cheap refusals never reach the proof verifier");
+
+        let mut forged = original.clone();
+        forged.proof = [2; 356];
+        assert_eq!(agree(l2, &forged), Err(Reject::Proof));
+        assert_eq!(verifier.0.get(), 2, "one verification each for the preflight and for apply");
+        assert_eq!(agree(l2, &original), Ok(()));
+        // The preflight left the state as it was; apply still moves the head.
+        assert_eq!(l2, pre.l2_settlement().unwrap());
+        let mut applied = l2.clone();
+        applied.apply(&original, [0; 32], 0, true, &verifier).unwrap();
+        assert_eq!(applied.head(), Some((original.commitment(), original.statement.clone())));
+        assert!(applied.frozen_source().is_none());
+    }
 
     // ── Native L2 deposits (devnet-l2-deposits) ─────────────────────────────
 

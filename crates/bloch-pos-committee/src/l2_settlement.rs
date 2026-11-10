@@ -1810,6 +1810,42 @@ impl State {
         asynchronous: bool,
         verifier: &dyn crate::attestation::SignatureVerifier,
     ) -> Result<(), Reject> {
+        let (end, number, new_withdrawals) = self.check_before_proof(tx, parent, slot, asynchronous)?;
+        let s = tx.statement.as_slice();
+        if !verifier.verify_l2_settlement(
+            &self.policy.proof_policy,
+            &self.policy.identities[6],
+            s,
+            &tx.proof,
+        ) {
+            return Err(Reject::Proof);
+        }
+        if let Some(record) = new_withdrawals {
+            if self.withdrawals.len() >= self.profile.limits.max_records() {
+                return Err(Reject::Limit);
+            }
+            self.withdrawals.push(record);
+        }
+        self.head = Some((tx.commitment(), s.to_vec()));
+        self.source_anchor = None;
+        self.consumed = end;
+        // Records for settled blocks can never be used again.
+        self.da.retain(|r| r.l2_number > number);
+        Ok(())
+    }
+
+    /// Every check of [`Self::apply`] that precedes the proof verification,
+    /// in the same order and against `&self`: policy, source, successor and
+    /// body shape. Returns the new inbox cursor, the settled L2 block number
+    /// and the withdrawal record the settlement would add. Shared by the
+    /// transition and the mempool preflight so the two cannot drift.
+    fn check_before_proof(
+        &self,
+        tx: &Transaction,
+        parent: [u8; 32],
+        slot: u64,
+        asynchronous: bool,
+    ) -> Result<(u64, u64, Option<withdrawal::Record>), Reject> {
         if asynchronous != self.asynchronous || (asynchronous && self.source_anchor.is_none()) {
             return Err(Reject::NotActive);
         }
@@ -1920,31 +1956,31 @@ impl State {
                 }
             }
         }
+        Ok((end, number, new_withdrawals))
+    }
+
+    /// Mempool preflight shares the transition checks and never mutates state.
+    ///
+    /// Accepts exactly what `apply` on a copy would accept, without the copy
+    /// (the inbox and the claim set grow with the chain) and with every check
+    /// that needs no proof, the record limit included, ahead of the proof
+    /// verification. `verifier` is therefore reached only by a settlement
+    /// whose policy, source, successor and body already match this state, so
+    /// a caller can meter it.
+    pub fn validate_async(&self, tx: &Transaction, verifier: &dyn crate::attestation::SignatureVerifier) -> Result<(), Reject> {
+        let (_, _, new_withdrawals) = self.check_before_proof(tx, [0; 32], 0, true)?;
+        if new_withdrawals.is_some() && self.withdrawals.len() >= self.profile.limits.max_records() {
+            return Err(Reject::Limit);
+        }
         if !verifier.verify_l2_settlement(
             &self.policy.proof_policy,
             &self.policy.identities[6],
-            s,
+            tx.statement.as_slice(),
             &tx.proof,
         ) {
             return Err(Reject::Proof);
         }
-        if let Some(record) = new_withdrawals {
-            if self.withdrawals.len() >= self.profile.limits.max_records() {
-                return Err(Reject::Limit);
-            }
-            self.withdrawals.push(record);
-        }
-        self.head = Some((tx.commitment(), s.to_vec()));
-        self.source_anchor = None;
-        self.consumed = end;
-        // Records for settled blocks can never be used again.
-        self.da.retain(|r| r.l2_number > number);
         Ok(())
-    }
-
-    /// Mempool preflight shares the transition checks and never mutates state.
-    pub fn validate_async(&self, tx: &Transaction, verifier: &dyn crate::attestation::SignatureVerifier) -> Result<(), Reject> {
-        self.clone().apply(tx, [0; 32], 0, true, verifier)
     }
 }
 

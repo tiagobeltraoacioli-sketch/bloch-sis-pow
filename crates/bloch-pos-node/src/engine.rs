@@ -1649,6 +1649,9 @@ mod proposal_revalidation_tests;
 #[cfg(test)]
 mod ws_lifecycle_tests;
 
+#[cfg(test)]
+mod l2_async_admission_tests;
+
 mod local_cache;
 mod verification;
 mod finality_cert;
@@ -5192,8 +5195,34 @@ impl Engine {
             if self.mempool.values().any(|pending| matches!(pending, PosTransaction::L2SettlementAsync(_))) {
                 return Err(Refusal::Invalid("one L2 proof is already pending"));
             }
-            state.validate_async(settlement, &HybridVerifier::new())
-                .map_err(|_| Refusal::Invalid("L2 settlement policy, source, successor or proof failed"))?;
+            // The proof draws on the same per-source and per-slot allowance
+            // as every signature (`L2_PROOF_VERIFICATION_UNITS` each), and
+            // `validate_async` reaches it only after policy, source and
+            // successor matched the committed L2 state, without copying it.
+            let verifier = self.gossip_verifier.budgeted_for_source(
+                self.wall_slot(),
+                GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+                verification_source,
+                GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+            );
+            let admission = state.validate_async(settlement, &verifier);
+            let limited = verifier.limited();
+            drop(verifier);
+            if limited {
+                return Err(Refusal::GossipVerificationLimited {
+                    until_slot: self.wall_slot().saturating_add(1),
+                });
+            }
+            if let Err(why) = admission {
+                // A proof that failed for this statement fails forever, so
+                // the same bytes are barred and cost nothing when re-offered.
+                // The other refusals depend on this node's head (a source it
+                // has not reached yet) and are cheap: they are not barred.
+                if why == bloch_pos_committee::l2_settlement::Reject::Proof {
+                    self.reject_transaction(key, self.wall_slot());
+                }
+                return Err(Refusal::Invalid("L2 settlement policy, source, successor or proof failed"));
+            }
         } else {
             let verifier = self.gossip_verifier.budgeted_for_source(
                 self.wall_slot(),

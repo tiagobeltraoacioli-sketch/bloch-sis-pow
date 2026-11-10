@@ -12,6 +12,14 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const MAX_FAILURES: usize = 4096;
 
+/// Allowance units one native L2 settlement proof reserves at mempool
+/// admission. A unit is one hybrid signature verification; the proof is a
+/// Groth16 pairing check, far above the 15 units of an SLH-DSA-suite spend.
+/// At 64, one source (128 units per slot) can have two proofs verified per
+/// slot and the whole node (1,024 units) sixteen, while an honest prover
+/// submits at most one settlement per source anchor.
+pub(super) const L2_PROOF_VERIFICATION_UNITS: usize = 64;
+
 #[derive(Default)]
 struct Failures {
     known: BTreeSet<[u8; 32]>,
@@ -423,6 +431,24 @@ impl<V: SignatureVerifier> SignatureVerifier for BudgetedVerifier<'_, V> {
             return false;
         }
         self.settle(self.owner.verify_with_key_under(policy, pubkey, root, signature), 1)
+    }
+
+    /// Native L2 settlement proofs at mempool admission. Not memoized here:
+    /// the engine bars the refused transaction bytes, which is the exact
+    /// replay. Reserves [`L2_PROOF_VERIFICATION_UNITS`] before the pairing
+    /// check and forwards to the fixed inner verifier.
+    fn verify_l2_settlement(&self, policy: &[u8; 32], program: &[u8; 32], values: &[u8], proof: &[u8]) -> bool {
+        if !self.owner.reserve_verification(
+            self.slot,
+            self.cap,
+            self.source,
+            self.source_cap,
+            L2_PROOF_VERIFICATION_UNITS,
+        ) {
+            self.limited.set(true);
+            return false;
+        }
+        self.owner.verifier.verify_l2_settlement(policy, program, values, proof)
     }
 
     /// Spend witnesses at `epoch`. Below HF3 this is exactly
@@ -929,6 +955,46 @@ mod tests {
             vec![[3u8; 32], [4u8; 32]],
             "the oldest id is forgotten at the cap",
         );
+    }
+
+    /// A settlement proof draws on the same per-source and per-slot
+    /// allowance as signatures, at its own weight, and a source that has
+    /// spent its share is shed before the proof verifier runs.
+    #[test]
+    fn l2_proof_verification_spends_weighted_source_allowance() {
+        struct Proofs(Cell<usize>);
+        impl SignatureVerifier for Proofs {
+            fn verify_with_key(&self, _: &[u8], _: &[u8; 32], _: &[u8]) -> bool { false }
+            fn verify_l2_settlement(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8], proof: &[u8]) -> bool {
+                self.0.set(self.0.get() + 1);
+                proof == [1]
+            }
+        }
+        let verifier = GossipVerifier::new(Proofs(Cell::new(0)));
+        let (noisy, honest) = ([0x0B; 32], [0x0C; 32]);
+        let (cap, source_cap) = (4 * L2_PROOF_VERIFICATION_UNITS, 2 * L2_PROOF_VERIFICATION_UNITS);
+        for n in 0u8..2 {
+            let bounded = verifier.budgeted_for_source(95, cap, Some(noisy), source_cap);
+            assert!(!bounded.verify_l2_settlement(&[0; 32], &[0; 32], &[n], &[2]));
+            assert!(!bounded.limited(), "an invalid proof within the allowance is invalid, not limited");
+        }
+        assert_eq!(verifier.budget_used_at(95), 2 * L2_PROOF_VERIFICATION_UNITS);
+        let shed = verifier.budgeted_for_source(95, cap, Some(noisy), source_cap);
+        assert!(!shed.verify_l2_settlement(&[0; 32], &[0; 32], &[9], &[1]));
+        assert!(shed.limited());
+        drop(shed);
+        assert_eq!(verifier.verifier.0.get(), 2, "the shed proof never reached the verifier");
+        // Another source keeps its share, and a valid proof passes.
+        let other = verifier.budgeted_for_source(95, cap, Some(honest), source_cap);
+        assert!(other.verify_l2_settlement(&[0; 32], &[0; 32], &[9], &[1]));
+        assert!(!other.limited());
+        drop(other);
+        assert_eq!(verifier.budget_used_at(95), 3 * L2_PROOF_VERIFICATION_UNITS);
+        // A source with less than one proof of allowance left is shed too.
+        let partial = verifier.budgeted_for_source(96, cap, Some(honest), L2_PROOF_VERIFICATION_UNITS - 1);
+        assert!(!partial.verify_l2_settlement(&[0; 32], &[0; 32], &[9], &[1]));
+        assert!(partial.limited());
+        assert!(L2_PROOF_VERIFICATION_UNITS <= super::super::GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT);
     }
 
     #[test]
