@@ -195,8 +195,9 @@
 //!   outgoing sync also shares one request window across all three callers.
 
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender as EngineSender;
@@ -210,7 +211,7 @@ use libp2p::gossipsub::{
     PeerScoreThresholds, TopicScoreParams, ValidationMode,
 };
 use libp2p::request_response::{self, Codec as RrCodec, Config as RrConfig, ProtocolSupport};
-use libp2p::swarm::SwarmEvent;
+use libp2p::swarm::{ConnectionId, SwarmEvent};
 use libp2p::{identify, identity, noise, yamux, PeerId, StreamProtocol, SwarmBuilder};
 
 /// Re-exported so the composition root can parse `--p2p-listen`/`--p2p-peer`
@@ -1425,6 +1426,7 @@ fn build_swarm(
             let limits = libp2p::connection_limits::ConnectionLimits::default()
                 .with_max_established(Some(max_peers.saturating_mul(2)))
                 .with_max_established_incoming(Some(max_peers))
+                .with_max_established_per_peer(Some(MAX_CONNECTIONS_PER_PEER))
                 .with_max_pending_incoming(Some(max_peers))
                 .with_max_pending_outgoing(Some(max_peers.max(1)));
             G4Behaviour {
@@ -1517,6 +1519,102 @@ struct Loop {
     /// `num_established` boundaries, so a peer holding the usual two
     /// connections (both sides dialled) counts once.
     peers_live: Arc<AtomicUsize>,
+    /// Per-source share of inbound connections. See [`InboundSources`].
+    inbound_sources: InboundSources,
+}
+
+/// Connections one peer id may hold, both directions together, enforced by
+/// `connection_limits`. An honest pair holds two when both sides dial; four
+/// leaves room for a simultaneous-dial race and for a reconnect that overlaps
+/// the connection it replaces. Without it one identity could take every
+/// inbound slot by itself.
+const MAX_CONNECTIONS_PER_PEER: u32 = 4;
+
+/// Share of the inbound connection ceiling (`max_peers`) one source may hold:
+/// an IPv4 address or an IPv6 /64, see [`crate::connection_limit::limit_key`].
+///
+/// One eighth, so 8 at the default `--max-peers 64`, and never below 2 so a
+/// peer can still replace its own connection on a small node. Peer ids are
+/// free to mint, so the per-peer limit alone leaves one host able to hold
+/// every inbound slot under as many identities as it likes; this binds the
+/// host. Gossipsub already graylists the sixth peer on one address (see
+/// [`peer_score_params`]), so an honest deployment does not come near it.
+fn inbound_share_per_source(max_peers: usize) -> usize {
+    (max_peers / 8).max(2)
+}
+
+/// Per-source accounting of established inbound connections.
+///
+/// `connection_limits` in this libp2p release counts per peer and in total
+/// but not per address, so the share is checked when a connection is
+/// established and a connection past it is closed at once.
+struct InboundSources {
+    /// `None` behind a proxy, where every inbound peer has the proxy's
+    /// address and a per-source share would refuse the whole network.
+    share: Option<usize>,
+    /// The operator's own `--p2p-peer` entries, by address and by peer id
+    /// where the entry carries one. These are never refused and never count
+    /// against a share.
+    configured_sources: HashSet<IpAddr>,
+    configured_peers: HashSet<PeerId>,
+    by_connection: HashMap<ConnectionId, IpAddr>,
+    held: HashMap<IpAddr, usize>,
+}
+
+/// The source a remote multiaddr is charged to, if it names an IP address.
+fn source_of(addr: &Multiaddr) -> Option<IpAddr> {
+    addr.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+        libp2p::multiaddr::Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+        _ => None,
+    })
+    .map(crate::connection_limit::limit_key)
+}
+
+impl InboundSources {
+    fn new<'a>(configured: impl Iterator<Item = &'a Multiaddr>, max_peers: usize, behind_proxy: bool) -> Self {
+        let mut sources = InboundSources {
+            share: (!behind_proxy).then(|| inbound_share_per_source(max_peers)),
+            configured_sources: HashSet::new(),
+            configured_peers: HashSet::new(),
+            by_connection: HashMap::new(),
+            held: HashMap::new(),
+        };
+        for addr in configured {
+            sources.configured_sources.extend(source_of(addr));
+            sources.configured_peers.extend(peer_id_of(addr));
+        }
+        sources
+    }
+
+    /// Record one established inbound connection. False means the source is
+    /// at its share and the caller must close the connection; nothing is
+    /// recorded for it. `dialed` is true when this node reached the same peer
+    /// id by dialling a configured address.
+    fn admit(&mut self, connection: ConnectionId, peer: &PeerId, remote: &Multiaddr, dialed: bool) -> bool {
+        let Some(share) = self.share else { return true };
+        let Some(source) = source_of(remote) else { return true };
+        if dialed || self.configured_peers.contains(peer) || self.configured_sources.contains(&source) {
+            return true;
+        }
+        let held = self.held.get(&source).copied().unwrap_or(0);
+        if held >= share {
+            return false;
+        }
+        self.held.insert(source, held.saturating_add(1));
+        self.by_connection.insert(connection, source);
+        true
+    }
+
+    fn release(&mut self, connection: &ConnectionId) {
+        let Some(source) = self.by_connection.remove(connection) else { return };
+        if let Some(held) = self.held.get_mut(&source) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                self.held.remove(&source);
+            }
+        }
+    }
 }
 
 /// Per-peer sync-chase budget (R1 A3-M3). See [`MAX_PAGES_WITHOUT_PROGRESS`].
@@ -1710,6 +1808,11 @@ async fn run_swarm(
             txs: IdentTopic::new(TOPIC_TXS),
         },
         peers_live,
+        inbound_sources: InboundSources::new(
+            cfg.peers.iter().filter(|a| !cfg.listen.contains(a)),
+            cfg.max_peers,
+            cfg.behind_proxy,
+        ),
     };
 
     // `listen_on` only queues a bind. Keep processing every swarm event while
@@ -2031,10 +2134,21 @@ fn handle_swarm_event(
         SwarmEvent::NewListenAddr { address, .. } => {
             println!("p2p: listening on {address}");
         }
-        SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, num_established, .. } => {
+        SwarmEvent::ConnectionEstablished { peer_id, connection_id, ref endpoint, num_established, .. } => {
             connection_diagnostic(|| println!("p2p: connected {peer_id}"));
             if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
                 st.note_dialed(address.clone(), peer_id);
+            }
+            if let libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } = endpoint {
+                // Every dial this node makes is to a configured address, so a
+                // peer id in `dialed` is one of the operator's own peers.
+                let dialed = st.dialed.values().any(|p| *p == peer_id);
+                if !st.inbound_sources.admit(connection_id, &peer_id, send_back_addr, dialed) {
+                    // Closed, not skipped: the bookkeeping below still runs so
+                    // that `ConnectionClosed` undoes exactly what was done.
+                    trace(|| format!("inbound {send_back_addr} refused: source at its share"));
+                    let _ = swarm.close_connection(connection_id);
+                }
             }
             // DO NOT call `gossipsub.add_explicit_peer()` here — see this
             // module's header. An explicit peer is excluded from mesh
@@ -2070,7 +2184,8 @@ fn handle_swarm_event(
                 request_peer_blocks(swarm, st, peer_id, after);
             }
         }
-        SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
+        SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, cause, .. } => {
+            st.inbound_sources.release(&connection_id);
             if num_established == 0 {
                 // Last connection to this peer gone: symmetric with the
                 // `== 1` increment above. `saturating` in effect, via
@@ -3253,6 +3368,67 @@ mod tests {
                 txs: IdentTopic::new(TOPIC_TXS),
             },
             peers_live: Arc::new(AtomicUsize::new(0)),
+            inbound_sources: InboundSources::new(std::iter::empty(), 8, true),
+        }
+    }
+
+    /// One source holds only its share of the inbound slots, whatever peer
+    /// ids it presents and whichever addresses of its /64 it uses; closing a
+    /// connection gives the slot back.
+    #[test]
+    fn inbound_share_binds_a_source_not_a_peer_id() {
+        assert_eq!(inbound_share_per_source(64), 8);
+        assert_eq!(inbound_share_per_source(4), 2);
+        let addr = |text: &str| text.parse::<Multiaddr>().unwrap();
+        let mut sources = InboundSources::new(std::iter::empty(), 16, false);
+        let id = ConnectionId::new_unchecked;
+        assert!(sources.admit(id(1), &PeerId::random(), &addr("/ip6/2001:db8:1:2::1/tcp/4001"), false));
+        assert!(sources.admit(id(2), &PeerId::random(), &addr("/ip6/2001:db8:1:2:ffff::2/tcp/4002"), false));
+        assert!(!sources.admit(id(3), &PeerId::random(), &addr("/ip6/2001:db8:1:2:abcd::3/tcp/4003"), false));
+        assert!(sources.admit(id(4), &PeerId::random(), &addr("/ip6/2001:db8:1:3::1/tcp/4001"), false));
+        assert!(sources.admit(id(5), &PeerId::random(), &addr("/ip4/192.0.2.7/tcp/1"), false));
+        assert!(sources.admit(id(6), &PeerId::random(), &addr("/ip6/::ffff:192.0.2.7/tcp/2"), false));
+        assert!(!sources.admit(id(7), &PeerId::random(), &addr("/ip4/192.0.2.7/tcp/3"), false));
+        // A refused connection holds nothing, so closing it releases nothing.
+        sources.release(&id(7));
+        assert!(!sources.admit(id(8), &PeerId::random(), &addr("/ip4/192.0.2.7/tcp/4"), false));
+        sources.release(&id(5));
+        assert!(sources.admit(id(9), &PeerId::random(), &addr("/ip4/192.0.2.7/tcp/5"), false));
+        sources.release(&id(1));
+        sources.release(&id(2));
+        sources.release(&id(4));
+        sources.release(&id(6));
+        sources.release(&id(9));
+        assert!(sources.held.is_empty() && sources.by_connection.is_empty());
+    }
+
+    /// Operator-configured peers are recognised by address, by the peer id
+    /// in their multiaddr, or by having been dialled, and are never refused
+    /// nor charged; behind a proxy the share is off altogether.
+    #[test]
+    fn inbound_share_exempts_configured_peers_and_proxied_nodes() {
+        let addr = |text: &str| text.parse::<Multiaddr>().unwrap();
+        let known = PeerId::random();
+        let configured = [
+            addr("/ip4/198.51.100.9/tcp/16400"),
+            addr(&format!("/dns4/validator.example/tcp/16400/p2p/{known}")),
+        ];
+        let mut sources = InboundSources::new(configured.iter(), 16, false);
+        let id = ConnectionId::new_unchecked;
+        for n in 0..10 {
+            assert!(sources.admit(id(n), &PeerId::random(), &addr("/ip4/198.51.100.9/tcp/1"), false));
+            assert!(sources.admit(id(100 + n), &known, &addr("/ip4/203.0.113.1/tcp/1"), false));
+            assert!(sources.admit(id(200 + n), &PeerId::random(), &addr("/ip4/203.0.113.2/tcp/1"), true));
+        }
+        assert!(sources.held.is_empty(), "configured peers do not use up a share");
+        // The same address is still limited for everyone else.
+        assert!(sources.admit(id(300), &PeerId::random(), &addr("/ip4/203.0.113.1/tcp/1"), false));
+        assert!(sources.admit(id(301), &PeerId::random(), &addr("/ip4/203.0.113.1/tcp/1"), false));
+        assert!(!sources.admit(id(302), &PeerId::random(), &addr("/ip4/203.0.113.1/tcp/1"), false));
+
+        let mut proxied = InboundSources::new(std::iter::empty(), 16, true);
+        for n in 0..40 {
+            assert!(proxied.admit(id(n), &PeerId::random(), &addr("/ip4/10.0.0.1/tcp/1"), false));
         }
     }
 

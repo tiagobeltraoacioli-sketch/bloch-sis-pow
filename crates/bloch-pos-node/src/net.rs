@@ -117,6 +117,7 @@ pub const FRAME_GET_BLOCKS: u8 = 0x03;
 pub const FRAME_TX: u8 = 0x04;
 
 pub use crate::p2p::{Origin, Verdict};
+mod inbound_slots;
 mod source_budget;
 pub(crate) mod rejection_log;
 pub(crate) use source_budget::Reservation as SourceReservation;
@@ -681,7 +682,61 @@ const OUTBOUND_QUEUE_DEPTH: usize = 256;
 /// peer count for inbound connections from peers that dialed first; past it a
 /// new connection is closed immediately, before either thread is spawned.
 const MAX_INBOUND_CONNECTIONS: usize = 128;
-const MAX_INBOUND_PER_IP: usize = 32;
+/// Inbound connections one source may hold: an IPv4 address or an IPv6 /64
+/// (see [`crate::connection_limit::limit_key`]).
+///
+/// One eighth of [`MAX_INBOUND_CONNECTIONS`]. This was 32 and keyed by full
+/// address, so four IPv4 hosts, or a single IPv6 /64, could hold every slot.
+/// At 16 a host can still run sixteen dial-in nodes behind one address, and
+/// filling the table takes eight sources that each keep sixteen connections
+/// delivering valid frames (see [`INBOUND_IDLE_EVICTION`]). Sources listed in
+/// `--peers` are exempt, so a fleet that puts more nodes than this on one
+/// host is unaffected as long as its nodes list each other.
+const MAX_INBOUND_PER_SOURCE: usize = 16;
+/// Inbound connections that have neither completed an authenticated
+/// handshake nor delivered a valid frame. They are counted inside
+/// [`MAX_INBOUND_CONNECTIONS`] but capped here, so connections that have
+/// proven nothing can never hold more than a quarter of the table.
+const MAX_PENDING_INBOUND: usize = 32;
+/// Share of [`MAX_PENDING_INBOUND`] one source may hold.
+const MAX_PENDING_INBOUND_PER_SOURCE: usize = 4;
+/// How long an inbound connection may stay pending before it is closed.
+///
+/// Covers the whole of [`crate::mesh_pq::HANDSHAKE_TIMEOUT`] plus the wait
+/// for a first frame. One slot: a dialer that has nothing to say for longer
+/// than that is closed and simply dials again.
+const PENDING_INBOUND_DEADLINE: Duration = Duration::from_secs(30);
+/// Minimum age before a connection that has not yet been useful can be
+/// displaced by an unconfigured newcomer. Without it a fast enough flood
+/// would evict every honest dialer before its handshake finished.
+const INBOUND_EVICTION_GRACE: Duration = Duration::from_secs(5);
+/// A useful inbound connection that has delivered no valid frame for this
+/// long may be evicted when the table is full and a new connection arrives.
+const INBOUND_IDLE_EVICTION: Duration = Duration::from_secs(30);
+/// Hard ceiling on inbound connections whose worker threads are still
+/// alive. An evicted connection leaves the slot table at once but its two
+/// threads take a moment to notice; this bounds how far the real resource
+/// count can run ahead of the table under eviction churn.
+const MAX_INBOUND_LIVE: usize = MAX_INBOUND_CONNECTIONS * 2;
+
+/// Sources remembered as operator-configured (see `start`).
+const MAX_CONFIGURED_SOURCES: usize = 1024;
+
+const INBOUND_POLICY: inbound_slots::Policy = inbound_slots::Policy {
+    total: MAX_INBOUND_CONNECTIONS,
+    pending: MAX_PENDING_INBOUND,
+    per_source: MAX_INBOUND_PER_SOURCE,
+    pending_per_source: MAX_PENDING_INBOUND_PER_SOURCE,
+    pending_deadline: PENDING_INBOUND_DEADLINE,
+    eviction_grace: INBOUND_EVICTION_GRACE,
+    idle_eviction: INBOUND_IDLE_EVICTION,
+    // Same horizon as the socket timeout, but measured in valid frames: a
+    // frame of unknown type resets the socket timer and must not reset this.
+    idle_close: DEVNET_IO_TIMEOUT,
+};
+
+type InboundSlots = Arc<Mutex<inbound_slots::Slots<TcpStream>>>;
+type InboundSlot = inbound_slots::Slot<TcpStream>;
 
 /// Socket read/write timeout for the devnet mesh (R3 M-4 / R1 A3-M2). This
 /// transport had none: a peer that stopped reading its socket could stall
@@ -803,7 +858,9 @@ struct Connection {
     pending_sync: Mutex<Option<(u64, Instant)>>,
     serving_sync: AtomicBool,
     _counts: (ConnCount, Option<ConnCount>),
-    _ip_permit: Option<crate::connection_limit::Permit>,
+    /// The inbound slot this connection holds; `None` on a connection this
+    /// node dialed.
+    slot: Option<InboundSlot>,
 }
 
 impl Connection {
@@ -1109,6 +1166,20 @@ fn framed_event_shape(frame: &[u8]) -> Option<(EventClass, usize)> {
     Some((class, frame.len().saturating_sub(1)))
 }
 
+/// What one inbound frame turned out to be, for the slot accounting in
+/// [`inbound_slots`].
+#[derive(Debug, PartialEq, Eq)]
+enum FrameOutcome {
+    /// A valid frame: it decoded canonically and went to the engine.
+    Delivered,
+    /// A known type, refused by the queue budget before it was decoded.
+    Shed,
+    /// Unknown type or malformed. Not activity of any kind.
+    Ignored,
+    /// The engine is gone; the caller stops its thread.
+    EngineGone,
+}
+
 /// Admit a legacy devnet frame before decoding it.
 fn decode_and_send_from_ip(
     events: &Sender<EngineEvent>,
@@ -1129,7 +1200,20 @@ fn decode_and_send_from_peer(
     frame: &[u8],
     configured: bool,
 ) -> bool {
-    let Some((class, size)) = framed_event_shape(frame) else { return true };
+    admit_frame_from_ip(events, budget, ip, frame, configured) != FrameOutcome::EngineGone
+}
+
+/// The admission core every devnet reader shares. It reports what became of
+/// the frame so the inbound slot table can tell a useful peer from an idle
+/// one; `configured` is as in [`decode_and_send_from_peer`].
+fn admit_frame_from_ip(
+    events: &Sender<EngineEvent>,
+    budget: &QueueBudget,
+    ip: std::net::IpAddr,
+    frame: &[u8],
+    configured: bool,
+) -> FrameOutcome {
+    let Some((class, size)) = framed_event_shape(frame) else { return FrameOutcome::Ignored };
     let Some(source_guard) = source_budget::Registry::reserve(
         &budget.sources,
         source_budget::Source::ip(ip),
@@ -1139,22 +1223,22 @@ fn decode_and_send_from_peer(
         budget.bytes_cap,
     ) else {
         budget.shed_counter(class).fetch_add(1, Ordering::Relaxed);
-        return true;
+        return FrameOutcome::Shed;
     };
     if !budget.reserve_raw(class, size) {
         budget.shed_counter(class).fetch_add(1, Ordering::Relaxed);
-        return true;
+        return FrameOutcome::Shed;
     }
 
     let Some(mut event) = decode_event(frame) else {
         budget.release_raw(size);
-        return true;
+        return FrameOutcome::Ignored;
     };
     // All three decoders are canonical. A future permissive decoder must not
     // release a different byte charge from the one reserved before it ran.
     if class_of(&event) != class || queued_bytes(&event) != size {
         budget.release_raw(size);
-        return true;
+        return FrameOutcome::Ignored;
     }
     match &mut event {
         NetEvent::Block(_, origin)
@@ -1168,9 +1252,9 @@ fn decode_and_send_from_peer(
     }
     if events.send(EngineEvent::Net(event)).is_err() {
         budget.release_raw(size);
-        return false;
+        return FrameOutcome::EngineGone;
     }
-    true
+    FrameOutcome::Delivered
 }
 
 fn send_to_engine(events: &Sender<EngineEvent>, budget: &QueueBudget, ev: NetEvent) -> bool {
@@ -1464,7 +1548,7 @@ struct SyncBudget {
 impl SyncBudget {
     fn new() -> Self { Self { serving: 0, addresses: Default::default(), global: GetBlocksLimiter { tokens: 128.0, last: Instant::now(), rate: 64.0, capacity: 128.0 } } }
     fn admit(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
-        let ip = match ip { std::net::IpAddr::V6(v) => v.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip), _ => ip };
+        let ip = crate::connection_limit::limit_key(ip);
         if !self.addresses.contains_key(&ip) {
             self.addresses.retain(|_, bucket| now.saturating_duration_since(bucket.last) < Duration::from_secs(60));
             if self.addresses.len() >= 1024 { return false; }
@@ -1569,7 +1653,27 @@ pub fn start(
     // inbound flood must not have that flood count against the outbound
     // side's accounting either.
     let inbound_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let ip_limits = Arc::new(crate::connection_limit::Limits::default());
+    let slots: InboundSlots = Arc::new(Mutex::new(inbound_slots::Slots::new(INBOUND_POLICY)));
+    // Sources of the operator's own `--peers`, exempt from the inbound
+    // shares, deadlines and eviction. Literal addresses are known now; a peer
+    // given by name is learned by its dialer thread on the first connection.
+    let configured: Arc<Mutex<std::collections::BTreeSet<std::net::IpAddr>>> = Arc::new(Mutex::new(
+        peer_addrs
+            .iter()
+            .filter_map(|addr| addr.parse::<SocketAddr>().ok())
+            .map(|addr| crate::connection_limit::limit_key(addr.ip()))
+            .collect(),
+    ));
+    {
+        // Deadlines must not wait for the next accept: a quiet listener would
+        // otherwise keep expired connections and their threads.
+        let slots = Arc::downgrade(&slots);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(1));
+            let Some(slots) = slots.upgrade() else { return };
+            if let Ok(mut slots) = slots.lock() { slots.reap(Instant::now()); };
+        });
+    }
     let sync_budget = Arc::new(Mutex::new(SyncBudget::new()));
     let sync = SyncScheduler::new(head_slot.clone(), inflight.clone());
     SyncScheduler::start_timer(&sync);
@@ -1583,6 +1687,7 @@ pub fn start(
         let scheduler = Arc::downgrade(&sync);
         let sync_budget = sync_budget.clone();
         let security = security.clone();
+        let configured = configured.clone();
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(sock) = conn else { continue };
@@ -1595,13 +1700,19 @@ pub fn start(
                 // — `sock` drops at the end of this iteration — before either
                 // thread below is spawned and before the socket costs this
                 // node anything beyond the accept itself.
-                if inbound_live.load(Ordering::Acquire) >= MAX_INBOUND_CONNECTIONS {
+                if inbound_live.load(Ordering::Acquire) >= MAX_INBOUND_LIVE {
                     continue;
                 }
                 let Ok(address) = sock.peer_addr() else { continue };
-                // Accommodate multiple validators per host, but one address
-                // cannot consume the global 128-connection allowance.
-                let Some(ip_permit) = ip_limits.reserve(address.ip(), MAX_INBOUND_PER_IP) else { continue };
+                let Ok(evict_handle) = sock.try_clone() else { continue };
+                let is_configured = configured
+                    .lock()
+                    .is_ok_and(|set| set.contains(&crate::connection_limit::limit_key(address.ip())));
+                // Shares, the pending pool and eviction are all decided here;
+                // see `inbound_slots`. A refusal drops `sock`, closing it.
+                let Some(slot) = InboundSlot::admit(&slots, address.ip(), is_configured, Instant::now(), evict_handle) else {
+                    continue;
+                };
                 // R3 M-4 / R1 A3-M2: bounded so a peer that stops reading or
                 // never writes cannot hold a thread and a queue open forever.
                 if sock.set_read_timeout(Some(DEVNET_IO_TIMEOUT)).is_err()
@@ -1609,11 +1720,11 @@ pub fn start(
                 {
                     continue;
                 }
-                // The inbound slot is taken here, before the handshake, so a
-                // flood of half-open handshakes is bounded by the same caps as
-                // established connections. The handshake itself runs on the
-                // connection's own thread: a slow or silent dialer must not
-                // hold up the accept loop.
+                // The inbound slot is taken here, before the handshake, in
+                // the pending pool: a flood of half-open handshakes is bounded
+                // by `MAX_PENDING_INBOUND` and cannot reach the main pool. The
+                // handshake itself runs on the connection's own thread: a slow
+                // or silent dialer must not hold up the accept loop.
                 let inbound_slot = ConnCount::new(&inbound_live);
                 let events = events.clone();
                 let data_dir = data_dir.clone();
@@ -1632,6 +1743,12 @@ pub fn start(
                             return;
                         }
                     };
+                    // An authenticated handshake leaves the pending pool. A
+                    // plain session has proven nothing yet and stays in it
+                    // until its first valid frame.
+                    if matches!(session, crate::mesh_pq::Session::Sealed { .. }) && !slot.mark_established() {
+                        return;
+                    }
                     let Ok(shutdown_socket) = sock.try_clone() else { return };
                     // Reading and writing need separate handles: the reader
                     // blocks in `read_frame` for as long as the peer is quiet,
@@ -1641,7 +1758,7 @@ pub fn start(
                         socket: shutdown_socket,
                         closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
                         _counts: (ConnCount::new(&live), Some(inbound_slot)),
-                        _ip_permit: Some(ip_permit),
+                        slot: Some(slot),
                     });
                     let wsock = Arc::new(Mutex::new(writer));
 
@@ -1659,7 +1776,14 @@ pub fn start(
                     }
                     let peer = InboundPeer { frames: tx, connection: Arc::downgrade(&connection) };
                     if let Ok(mut reg) = inbound.lock() { reg.push(peer.clone()); }
-                    if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer, Instant::now()); }
+                    // Not a sync source yet: a connection that has delivered
+                    // nothing would take a share of the sync leases and answer
+                    // none of them. It is registered on its first valid frame.
+                    // A configured source is the operator's own peer and is
+                    // asked from the start, as it always was.
+                    if is_configured {
+                        if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer.clone(), Instant::now()); }
+                    }
 
                     // Counted from here to wherever this thread leaves. The
                     // guards live in `_half`, so every `return` below and any
@@ -1671,15 +1795,28 @@ pub fn start(
                     loop {
                         match reader.read_frame() {
                             Ok(frame) => {
-                                if frame.first() == Some(&FRAME_GET_BLOCKS) {
+                                let outcome = if frame.first() == Some(&FRAME_GET_BLOCKS) {
+                                    let well_formed = frame.len() == 9;
                                     responder.answer(&_half.0, address.ip(), frame, &mut get_blocks_limiter);
-                                } else if !decode_and_send_from_ip(
-                                    &events,
-                                    &inflight,
-                                    address.ip(),
-                                    &frame,
-                                ) {
-                                    return;
+                                    if well_formed { FrameOutcome::Delivered } else { FrameOutcome::Ignored }
+                                } else {
+                                    admit_frame_from_ip(&events, &inflight, address.ip(), &frame, false)
+                                };
+                                let Some(slot) = _half.0.slot.as_ref() else { return };
+                                let now = Instant::now();
+                                match outcome {
+                                    FrameOutcome::EngineGone => return,
+                                    FrameOutcome::Delivered => match slot.mark_valid(now) {
+                                        // Expired or evicted while this frame was in flight.
+                                        None => return,
+                                        Some(true) if !is_configured => {
+                                            if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer.clone(), now); }
+                                        }
+                                        Some(_) => {}
+                                    },
+                                    FrameOutcome::Shed => slot.mark_shed(now),
+                                    // Unknown or malformed frames are not activity.
+                                    FrameOutcome::Ignored => {}
                                 }
                             }
                             Err(_) => return,
@@ -1705,6 +1842,7 @@ pub fn start(
         let inflight = inflight.clone();
         let live = live.clone();
         let security = security.clone();
+        let configured = configured.clone();
         thread::spawn(move || {
             // `offer` against a legacy peer: a handshake the peer closed on
             // sends the NEXT connection plain; when that plain session ends
@@ -1716,6 +1854,13 @@ pub fn start(
                 thread::sleep(Duration::from_millis(300));
                 continue;
             };
+            // Bounded: a name that resolves somewhere new on every dial must
+            // not grow this set for the life of the process.
+            if let (Ok(address), Ok(mut set)) = (sock.peer_addr(), configured.lock()) {
+                if set.len() < MAX_CONFIGURED_SOURCES {
+                    set.insert(crate::connection_limit::limit_key(address.ip()));
+                }
+            }
             let session = if fallback_plain {
                 fallback_plain = false;
                 Ok(crate::mesh_pq::Session::Plain)
@@ -1753,7 +1898,7 @@ pub fn start(
                 socket: shutdown_socket,
                 closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
                 _counts: (ConnCount::new(&live), None),
-                    _ip_permit: None,
+                    slot: None,
             });
             if let Some(scheduler) = scheduler.upgrade() {
                 scheduler.register(InboundPeer { frames: tx.clone(), connection: Arc::downgrade(&connection) }, Instant::now());
@@ -1821,7 +1966,7 @@ mod tests {
         let (socket, _) = listener.accept().unwrap();
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let connection = Arc::new(Connection { socket, closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
-            _counts: (ConnCount::new(&live), None), _ip_permit: None });
+            _counts: (ConnCount::new(&live), None), slot: None });
         let (frames, received) = mpsc::sync_channel(1);
         let peer = InboundPeer { frames, connection: Arc::downgrade(&connection) };
         SyncTestPeer { peer, received, connection, _remote: remote }
@@ -2280,7 +2425,7 @@ mod tests {
             socket: socket.try_clone().unwrap(),
             closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
             _counts: (ConnCount::new(&live), Some(ConnCount::new(&inbound_live))),
-                    _ip_permit: None,
+                    slot: None,
         });
         let reader = ConnectionHalf(connection.clone());
         let writer = ConnectionHalf(connection.clone());
@@ -2316,7 +2461,7 @@ mod tests {
             socket: socket.try_clone().unwrap(),
             closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
             _counts: (ConnCount::new(&live), Some(ConnCount::new(&live))),
-            _ip_permit: None,
+            slot: None,
         });
         let reader = ConnectionHalf(connection.clone());
         let writer = ConnectionHalf(connection);
@@ -2956,6 +3101,55 @@ mod tests {
         assert!(second_rx.try_recv().is_err(), "full queue must drop, not displace or append");
     }
 
+    /// An inbound connection becomes a sync source only once it has delivered
+    /// a valid frame. Silence and frames of unknown type earn nothing.
+    #[test]
+    fn inbound_connection_is_a_sync_source_only_after_a_valid_frame() {
+        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        let data_dir = std::env::temp_dir().join(format!("bloch-net-useful-{}", std::process::id()));
+        let mesh = start(
+            "127.0.0.1",
+            0,
+            Vec::new(),
+            events,
+            data_dir,
+            Arc::new(AtomicU64::new(0)),
+            QueueBudget::new(),
+            Arc::new(crate::mesh_pq::MeshSecurity::plain()),
+        )
+        .expect("bind the devnet transport");
+        let port = mesh.listen_addr().port();
+        let sources = || mesh.sync.schedule.lock().unwrap().peers.len();
+        let wait_for = |want: usize| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while sources() != want && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            sources()
+        };
+
+        let _silent = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut noisy = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut honest = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write_frame(&mut noisy, &[0xEE, 1, 2, 3]).unwrap();
+        // Known type, wrong length: malformed, so still nothing.
+        write_frame(&mut noisy, &[FRAME_GET_BLOCKS, 1]).unwrap();
+        write_frame(&mut honest, &get_blocks_frame(0)).unwrap();
+        assert_eq!(wait_for(1), 1);
+        // All three are connected and all three receive broadcasts; only the
+        // one that delivered a valid frame is asked for blocks.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mesh.peer_count() < 3 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(mesh.peer_count(), 3);
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(sources(), 1, "silent and unknown-frame connections must not become sync sources");
+
+        write_frame(&mut noisy, &get_blocks_frame(0)).unwrap();
+        assert_eq!(wait_for(2), 2);
+    }
+
     /// R3 M-4 / R1 A3-M2: the devnet listener accepts at most
     /// `MAX_INBOUND_CONNECTIONS` at once, and a connection past the cap is
     /// closed by the server immediately rather than left half-open. This
@@ -2992,7 +3186,7 @@ mod tests {
         // fixed amount, so this is fast on an idle box and still correct on
         // a loaded one.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while mesh.peer_count() < MAX_INBOUND_PER_IP && Instant::now() < deadline {
+        while mesh.peer_count() < MAX_PENDING_INBOUND_PER_SOURCE && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
         // One quiet moment so the count has settled — proving it never rises
@@ -3001,8 +3195,8 @@ mod tests {
 
         assert_eq!(
             mesh.peer_count(),
-            MAX_INBOUND_PER_IP,
-            "the transport must accept no more than MAX_INBOUND_CONNECTIONS inbound connections"
+            MAX_PENDING_INBOUND_PER_SOURCE,
+            "one unconfigured source that sends nothing holds only its share of the pending pool"
         );
 
         // And the excess connections were actually refused, not merely
