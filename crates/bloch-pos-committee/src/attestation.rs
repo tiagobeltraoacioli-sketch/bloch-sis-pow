@@ -449,7 +449,7 @@ pub trait KeyLookup {
     fn pubkey(&self, validator: u32) -> Option<&[u8]>;
 
     /// The validator's forward-secure key (`crate::kes`) in force for global
-    /// KES period `period` (`crate::kes::KesEntry::in_force`), if any. Only
+    /// KES period `period` (`crate::kes::KesEntry::resolve`), if any. Only
     /// committed state carries KES keys; other lookups have none.
     fn kes_public(&self, _validator: u32, _period: u64) -> Option<crate::kes::KesPublic> {
         None

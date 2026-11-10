@@ -2006,7 +2006,7 @@ impl crate::attestation::KeyLookup for CommittedState {
         self.validators.pubkey(validator)
     }
     fn kes_public(&self, validator: u32, period: u64) -> Option<crate::kes::KesPublic> {
-        self.kes.get(&validator).map(|entry| entry.in_force(period))
+        self.kes.get(&validator).and_then(|entry| entry.resolve(period))
     }
     fn kes_network_domain(&self) -> Option<[u8; 32]> {
         Some(self.admission_network_domain.unwrap_or([0; 32]))
@@ -2036,7 +2036,7 @@ impl crate::attestation::KeyLookup for RegistryView<'_> {
         self.validators.pubkey(validator)
     }
     fn kes_public(&self, validator: u32, period: u64) -> Option<crate::kes::KesPublic> {
-        self.kes.get(&validator).map(|entry| entry.in_force(period))
+        self.kes.get(&validator).and_then(|entry| entry.resolve(period))
     }
     fn kes_network_domain(&self) -> Option<[u8; 32]> {
         Some(self.network_domain.unwrap_or([0; 32]))

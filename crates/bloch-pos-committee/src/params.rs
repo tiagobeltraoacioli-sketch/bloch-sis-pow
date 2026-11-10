@@ -3456,6 +3456,87 @@ pub const KES_PERIOD_EPOCHS: u64 = 90;
 /// periods, about 11.2 years (option A). Consensus accepts any depth in
 /// `kes::MIN_DEPTH..=kes::MAX_DEPTH`; this is the operator default only.
 pub const KES_DEFAULT_DEPTH: u8 = 12;
+/// Security review CR-2 (first-key floor), deliberately UNARMED. From the
+/// first KES period that starts at or after this epoch:
+///
+/// * a period that precedes a validator's FIRST KES key resolves to no KES
+///   key (`kes::KesEntry::resolve`), so `kes::signing_mode` is `Static` for
+///   it, exactly as it was while the validator had not registered. Without
+///   the rule, a registration after KES binds (its key starts at the NEXT
+///   period) makes every earlier bound-era period resolve to that key, whose
+///   tree has no leaf for it: equivocation evidence for what the validator
+///   signed with its static key before registering can never verify, and the
+///   validator cannot sign for the rest of the inclusion period;
+/// * `kes::KesEntry` never prunes its oldest replaced key, so the first
+///   key's start period stays derivable from committed state (no new
+///   committed field, no encoding change).
+///
+/// Both change validity (which signatures verify; which history the 0x22
+/// state-root component keeps), so every node must run the armed build
+/// before the gate. Arm it at `HF3_KES_ENFORCE_EPOCH` (or earlier): later
+/// values leave static signatures made between the bind and the gate by
+/// late registrants unprovable. It must not be armed after the first epoch
+/// at which history can have been pruned
+/// (`kes_first_key_floor_is_armed_in_time`).
+pub const KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// The first-key floor is inert, or armed while no validator's key history
+/// can have been pruned yet: history exists only from enforcement on and
+/// lives `KES_KEY_HISTORY_PERIODS`, so until then the oldest key of every
+/// entry is still its first one.
+const fn kes_first_key_floor_is_armed_in_time(floor: u64, enforcement: u64) -> bool {
+    floor == u64::MAX
+        || (enforcement != u64::MAX && floor <= enforcement.saturating_add(KES_KEY_HISTORY_PERIODS * KES_PERIOD_EPOCHS))
+}
+
+const _: () = assert!(
+    kes_first_key_floor_is_armed_in_time(KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH, HF3_KES_ENFORCE_EPOCH),
+    "the KES first-key floor must be armed before key history can be pruned"
+);
+
+/// Is the first-key floor (`KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH`) in force
+/// for global KES period `period`? True when the period's first epoch is at
+/// or after the gate. A pure function of the period and the build, so the
+/// signature rule and the pruning rule switch on the same period everywhere.
+pub fn kes_first_key_floor_active(period: u64) -> bool {
+    #[cfg(test)]
+    let gate = kes_first_key_floor_rehearsal::get().unwrap_or(KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH);
+    #[cfg(not(test))]
+    let gate = KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH;
+    let s = kes_schedule();
+    if gate == u64::MAX || s.activation_epoch == u64::MAX {
+        return false;
+    }
+    match period.checked_mul(s.period_epochs).and_then(|epochs| epochs.checked_add(s.activation_epoch)) {
+        Some(first_epoch) => first_epoch >= gate,
+        // No real epoch is in such a period; stay monotonic in the period.
+        None => true,
+    }
+}
+
+/// Test-only, thread-local override of
+/// `KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH`. `cfg(test)`: it cannot exist in a
+/// shipped binary.
+#[cfg(test)]
+pub mod kes_first_key_floor_rehearsal {
+    use std::cell::Cell;
+    thread_local! {
+        static GATE: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+    pub(crate) fn get() -> Option<u64> {
+        GATE.with(|c| c.get())
+    }
+    /// Arm the floor at `epoch` on this thread until the guard drops.
+    pub fn arm(epoch: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                GATE.with(|c| c.set(self.0));
+            }
+        }
+        Restore(GATE.with(|c| c.replace(Some(epoch))))
+    }
+}
 
 
 /// Enforcement is inert, or registration is armed strictly before it.
@@ -3582,5 +3663,37 @@ mod kes_schedule_tests {
         assert_eq!(kes_period(190), Some(1));
         kes_rehearsal::set(None);
         assert_eq!(kes_period(190), None);
+    }
+
+    #[test]
+    fn the_first_key_floor_ships_inert_and_opens_by_period() {
+        assert_eq!(KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH, u64::MAX);
+        for period in [0, 1, 365, 1 << 40, u64::MAX] {
+            assert!(!kes_first_key_floor_active(period), "inert on the compiled schedule");
+        }
+        kes_rehearsal::set(Some(KesSchedule { registration_epoch: 10, activation_epoch: 100, period_epochs: 90, min_depth: 1 }));
+        assert!(!kes_first_key_floor_active(0), "still inert under an armed KES schedule");
+        {
+            let _floor = kes_first_key_floor_rehearsal::arm(100);
+            assert!(kes_first_key_floor_active(0) && kes_first_key_floor_active(7));
+            assert!(kes_first_key_floor_active(u64::MAX), "monotonic past the last real period");
+        }
+        {
+            // Mid-period: in force from the next period that starts after it.
+            let _floor = kes_first_key_floor_rehearsal::arm(191);
+            assert!(!kes_first_key_floor_active(0) && !kes_first_key_floor_active(1));
+            assert!(kes_first_key_floor_active(2));
+        }
+        {
+            let _floor = kes_first_key_floor_rehearsal::arm(u64::MAX);
+            assert!(!kes_first_key_floor_active(u64::MAX), "MAX is always the unarmed sentinel");
+        }
+        assert!(!kes_first_key_floor_active(5), "the guard restores the compiled gate");
+        kes_rehearsal::set(None);
+        assert!(kes_first_key_floor_is_armed_in_time(u64::MAX, u64::MAX));
+        assert!(kes_first_key_floor_is_armed_in_time(8_620, 8_620));
+        assert!(kes_first_key_floor_is_armed_in_time(8_620 + 365 * 90, 8_620));
+        assert!(!kes_first_key_floor_is_armed_in_time(8_620 + 365 * 90 + 1, 8_620));
+        assert!(!kes_first_key_floor_is_armed_in_time(8_620, u64::MAX));
     }
 }

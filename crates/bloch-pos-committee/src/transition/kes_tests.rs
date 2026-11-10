@@ -1492,4 +1492,197 @@ mod kes_rules {
             .process(&pair, VOTE_EPOCH + 1, 0, &dels, 1_000_000, 0, &ToyVerifier, &view(&pre))
             .is_ok());
     }
+
+    // ── Security review CR-2: the first-key floor ─────────────────────────
+
+    /// Validator 3, unregistered after the bind, double-votes with its
+    /// static key in period 3 (epoch 5 under `Armed::enforcing(2, 1)`), then
+    /// registers in the same period (its key starts at period 4). Returns
+    /// the state after the registration and the evidence.
+    fn late_registrant_with_static_evidence() -> (CommittedState, crate::slashing::SlashingEvidence) {
+        let (_t, g, _chains) = setup_with(4, ToyVerifier, &[]);
+        let mut st = bound(g);
+        st.epoch = 5;
+        let slot = 5 * 32 + 1;
+        let first = vote(&st, 3, slot, 0xAA, |r| toy_sign(&[3u8; 8], r));
+        let second = vote(&st, 3, slot, 0xBB, |r| toy_sign(&[3u8; 8], r));
+        let pair = crate::slashing::SlashingEvidence { first, second };
+        let dels: [crate::delegation::Delegation; 0] = [];
+        assert!(
+            crate::slashing::SlashingState::new().process(&pair, 5, 0, &dels, 1_000_000, 0, &ToyVerifier, &view(&st)).is_ok(),
+            "control: provable while the validator is unregistered"
+        );
+        let tx = register(&st, 3, toy_kes_public(3));
+        apply(&mut st, &tx).expect("late registration");
+        assert_eq!(st.kes_roots()[&3].current.start_period, 4);
+        (st, pair)
+    }
+
+    fn evidence_outcome(st: &CommittedState, pair: &crate::slashing::SlashingEvidence) -> Result<(), crate::slashing::EvidenceError> {
+        let dels: [crate::delegation::Delegation; 0] = [];
+        crate::slashing::SlashingState::new().process(pair, st.epoch, 0, &dels, 1_000_000, 0, &ToyVerifier, &view(st)).map(|_| ())
+    }
+
+    #[test]
+    fn cr2_static_signatures_from_before_a_late_registration_stay_provable() {
+        let _armed = Armed::enforcing(2, 1); // period == epoch - 2
+        let _floor = crate::params::kes_first_key_floor_rehearsal::arm(2);
+        let (mut st, pair) = late_registrant_with_static_evidence();
+        let public = st.kes_roots()[&3].current;
+        let pks = tree(3).0;
+        // Periods before the first key: no KES key, the static key's rule.
+        for epoch in 2..=5 {
+            assert_eq!(kes::signing_mode(&view(&st), 3, epoch), kes::SigningMode::Static, "epoch {epoch}");
+            assert_eq!(kes::signing_mode(&st, 3, epoch), kes::SigningMode::Static, "whole-state lookup, epoch {epoch}");
+        }
+        assert_eq!(crate::attestation::KeyLookup::kes_public(&st, 3, 3), None);
+        assert_eq!(evidence_outcome(&st, &pair), Ok(()), "the registration must not erase the static-key offence");
+        // The node pre-check and consensus agree.
+        let ev = SlashingEvidence::AttestationOffence { first: pair.first.clone(), second: pair.second.clone() };
+        let pre = st.precheck_slashing_evidence(&ev).expect("structure and context pass");
+        assert_eq!(st.verify_precheck_signatures(&pre, &ToyVerifier), Some(true));
+        // The honest operator keeps signing statically for the rest of the
+        // inclusion period; the new tree's leaves do not sign it.
+        let slot = 5 * 32 + 2;
+        let rest = vote(&st, 3, slot, 0xC1, |r| toy_sign(&[3u8; 8], r));
+        assert_eq!(crate::attestation::validate(&rest, &[3], slot, &ToyVerifier, &view(&st)), Ok(()));
+        assert!(!vote_verifies(&st, 3, 5, &public, &pks, 3), "no leaf signs a period before the key starts");
+        // Still provable, and still static, many periods later.
+        st.epoch = 15;
+        assert_eq!(evidence_outcome(&st, &pair), Ok(()));
+        assert_eq!(kes::signing_mode(&view(&st), 3, 5), kes::SigningMode::Static);
+    }
+
+    #[test]
+    fn cr2_the_signing_mode_from_the_first_kes_period_on_is_unchanged() {
+        let _armed = Armed::enforcing(2, 1);
+        let modes = |st: &CommittedState, v: u32| (2..40u64).map(|e| kes::signing_mode(&view(st), v, e)).collect::<Vec<_>>();
+        let fingerprints = |st: &CommittedState, v: u32| (2..40u64).map(|e| kes::authority_fingerprint(&view(st), v, e)).collect::<Vec<_>>();
+        let (inert, _) = late_registrant_with_static_evidence();
+        let _floor = crate::params::kes_first_key_floor_rehearsal::arm(2);
+        let (mut st, _) = late_registrant_with_static_evidence();
+        assert_eq!(st.state_root(), inert.state_root(), "a registration commits the same state under either rule");
+        let public = st.kes_roots()[&3].current;
+        let pks = tree(3).0;
+        // Late registrant: KES from its first period (4, epoch 6) on, to and
+        // past the tree's expiry, exactly as without the floor.
+        for epoch in 6..40u64 {
+            assert_eq!(kes::signing_mode(&view(&st), 3, epoch), kes::SigningMode::Kes(epoch - 2), "epoch {epoch}");
+        }
+        st.epoch = 6;
+        assert!(vote_verifies(&st, 3, 6, &public, &pks, 4));
+        let static_vote = vote(&st, 3, 6 * 32 + 1, 0xC2, |r| toy_sign(&[3u8; 8], r));
+        assert_eq!(
+            crate::attestation::validate(&static_vote, &[3], 6 * 32 + 1, &ToyVerifier, &view(&st)),
+            Err(crate::attestation::RejectReason::BadSignature),
+            "the static key signs nothing from the first KES period on"
+        );
+        // A validator registered before the bind (start 0) and one that
+        // never registered: every mode and fingerprint as without the floor.
+        st.kes.insert(1, toy_kes_public(1).into());
+        let mut without = inert.clone();
+        without.kes.insert(1, toy_kes_public(1).into());
+        let (with_modes, with_prints) = ((modes(&st, 1), modes(&st, 2)), (fingerprints(&st, 1), fingerprints(&st, 2)));
+        drop(_floor);
+        assert_eq!(with_modes, (modes(&without, 1), modes(&without, 2)));
+        assert_eq!(with_prints, (fingerprints(&without, 1), fingerprints(&without, 2)));
+        assert_eq!(modes(&st, 3)[4..], modes(&inert, 3)[4..], "late registrant from epoch 6 on");
+    }
+
+    #[test]
+    fn cr2_a_gap_after_the_first_key_never_falls_back_to_the_static_key() {
+        // Between an expired key and its rescue the validator WAS registered:
+        // the floor must not turn those periods static (a static key stolen
+        // later could sign for the past).
+        let _armed = Armed::enforcing(2, 1);
+        let _floor = crate::params::kes_first_key_floor_rehearsal::arm(2);
+        let (mut st, _) = late_registrant_with_static_evidence(); // v3: periods 4..20
+        st.epoch = 2 + 21;
+        assert!(st.kes_rescue_open(3));
+        let fresh = public_of(&tree_from(0xA3, DEPTH));
+        let tx = register(&st, 3, fresh);
+        apply(&mut st, &tx).expect("rescue");
+        let entry = st.kes_roots()[&3].clone();
+        assert_eq!((entry.current.start_period, entry.first_start_period()), (23, 4));
+        for period in [20u64, 21, 22] {
+            assert_eq!(kes::signing_mode(&view(&st), 3, 2 + period), kes::SigningMode::Kes(period), "gap period {period}");
+            let slot = (2 + period) * 32 + 1;
+            let att = vote(&st, 3, slot, 0xD0, |r| toy_sign(&[3u8; 8], r));
+            assert_eq!(
+                crate::attestation::validate(&att, &[3], slot, &ToyVerifier, &view(&st)),
+                Err(crate::attestation::RejectReason::BadSignature),
+                "gap period {period}"
+            );
+        }
+        assert_eq!(kes::signing_mode(&view(&st), 3, 5), kes::SigningMode::Static, "before the first key: still static");
+    }
+
+    #[test]
+    fn cr2_with_the_gate_inert_nothing_changes() {
+        let _armed = Armed::enforcing(2, 1);
+        assert_eq!(crate::params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH, u64::MAX);
+        let (st, pair) = late_registrant_with_static_evidence();
+        let entry = st.kes_roots()[&3].clone();
+        // Today's rule: every bound period of a registered validator is KES,
+        // judged against the current key even before it starts.
+        for epoch in 2..40u64 {
+            assert_eq!(kes::signing_mode(&view(&st), 3, epoch), kes::SigningMode::Kes(epoch - 2), "epoch {epoch}");
+            assert_eq!(entry.resolve(epoch - 2), Some(entry.in_force(epoch - 2)));
+            assert_eq!(crate::attestation::KeyLookup::kes_public(&st, 3, epoch - 2), Some(entry.in_force(epoch - 2)));
+        }
+        assert_eq!(evidence_outcome(&st, &pair), Err(crate::slashing::EvidenceError::BadSignature), "today's (unfixed) verdict");
+        let slot = 5 * 32 + 2;
+        let rest = vote(&st, 3, slot, 0xC1, |r| toy_sign(&[3u8; 8], r));
+        assert_eq!(
+            crate::attestation::validate(&rest, &[3], slot, &ToyVerifier, &view(&st)),
+            Err(crate::attestation::RejectReason::BadSignature)
+        );
+        // An armed gate governs only the periods that start at or after it.
+        let _floor = crate::params::kes_first_key_floor_rehearsal::arm(6);
+        assert_eq!(kes::signing_mode(&view(&st), 3, 5), kes::SigningMode::Kes(3), "period 3 precedes the gate");
+        assert_eq!(evidence_outcome(&st, &pair), Err(crate::slashing::EvidenceError::BadSignature));
+    }
+
+    #[test]
+    fn cr2_rotations_and_pruning_keep_the_first_key_and_the_static_era() {
+        let _armed = Armed::enforcing(2, 1);
+        let horizon = crate::params::KES_KEY_HISTORY_PERIODS;
+        let rotate_twice = |st: &mut CommittedState| {
+            // Period 4: K0 -> K1 (from 5). Period 5: K1 -> K2 (from 6).
+            let k0 = st.kes_roots()[&3].current;
+            let k1_pks = tree_from(0x81, DEPTH);
+            st.epoch = 6;
+            let r1 = rotate(st, 3, 4, &k0, &tree(3).0, &k1_pks);
+            apply(st, &r1).expect("first rotation");
+            st.epoch = 7;
+            let k1 = { let p = public_of(&k1_pks); KesPublic::new(p.depth, p.root, 5) };
+            let r2 = rotate(st, 3, 5, &k1, &k1_pks, &tree_from(0x82, DEPTH));
+            apply(st, &r2).expect("second rotation");
+        };
+        let (mut inert, _) = late_registrant_with_static_evidence();
+        rotate_twice(&mut inert);
+        let inert_entry = inert.kes_roots()[&3].clone();
+        assert!(inert_entry.settled(6 + horizon + 1).retired.is_empty(), "today: all history pruned");
+
+        let _floor = crate::params::kes_first_key_floor_rehearsal::arm(2);
+        let (mut st, pair) = late_registrant_with_static_evidence();
+        rotate_twice(&mut st);
+        let entry = st.kes_roots()[&3].clone();
+        assert_eq!(entry, inert_entry, "inside the horizon the committed entry is the same under either rule");
+        assert_eq!(evidence_outcome(&st, &pair), Ok(()), "rotations do not erase the static-key offence");
+        // Past the horizon the first key (K0, periods 4..5) is kept; K1 goes.
+        let far = entry.settled(6 + horizon + 1);
+        assert_eq!(far.retired.len(), 1);
+        assert_eq!(far.retired[0].public.start_period, 4);
+        assert_eq!(far.first_start_period(), 4, "pruning cannot move the first-key floor");
+        assert_eq!(far.resolve(3), None, "before the first key: static");
+        assert_eq!(far.resolve(4), Some(far.retired[0].public));
+        assert_eq!(far.resolve(5), Some(far.current), "pruned history between keys fails closed, never static");
+        assert_eq!(far.current.leaf_index(5), None);
+        st.kes.insert(3, far);
+        st.epoch = 2 + 6 + horizon + 1;
+        assert_eq!(kes::signing_mode(&view(&st), 3, 5), kes::SigningMode::Static);
+        assert_eq!(kes::signing_mode(&view(&st), 3, 7), kes::SigningMode::Kes(5));
+        assert_eq!(evidence_outcome(&st, &pair), Ok(()), "still provable after the history is pruned");
+    }
 }

@@ -264,6 +264,37 @@ impl KesEntry {
             .unwrap_or(self.current)
     }
 
+    /// The global period the validator's FIRST KES key started at: the
+    /// earliest start among the replaced keys and the key in force. Sound
+    /// because [`Self::prune`] keeps the oldest replaced key from
+    /// [`crate::params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH`] on, and no
+    /// history can have been pruned before that gate (it is armed, by a
+    /// compile-time rule, before any history can be old enough).
+    pub fn first_start_period(&self) -> u64 {
+        self.retired.iter().map(|r| r.public.start_period).fold(self.current.start_period, u64::min)
+    }
+
+    /// The key consensus judges a signature of global period `period` by:
+    /// [`Self::in_force`], except that, once the first-key floor is in force
+    /// for `period` (security review CR-2), a period that precedes the
+    /// validator's first KES key has NO key. The validator was not
+    /// registered then and signed with its static key
+    /// ([`signing_mode`] is `Static` for it), so what it signed stays
+    /// provable after it registers.
+    ///
+    /// Only that case changes. A period at or after the first key that no
+    /// key covers (between an expired key and its rescue, or history pruned
+    /// between keys) still resolves to the current key, whose leaf bounds
+    /// refuse it: the validator was KES-registered then, and falling back
+    /// to the static key there would let a static key stolen later sign for
+    /// the past.
+    pub fn resolve(&self, period: u64) -> Option<KesPublic> {
+        if crate::params::kes_first_key_floor_active(period) && period < self.first_start_period() {
+            return None;
+        }
+        Some(self.in_force(period))
+    }
+
     /// The same entry with a successor that is already in force at `period`
     /// promoted; the replaced key moves to the history (covering up to the
     /// successor's start) and history older than
@@ -302,10 +333,18 @@ impl KesEntry {
     }
 
     /// Drop history whose last covered period is more than
-    /// `KES_KEY_HISTORY_PERIODS` before `period`.
+    /// `KES_KEY_HISTORY_PERIODS` before `period`. Once the first-key floor
+    /// is in force at `period`, the oldest replaced key is never dropped:
+    /// it is the validator's first key, and its start period is what
+    /// [`Self::first_start_period`] derives (49 bytes per validator, once).
     fn prune(&mut self, period: u64) {
         let keep_from = period.saturating_sub(crate::params::KES_KEY_HISTORY_PERIODS);
-        self.retired.retain(|r| r.end_period > keep_from);
+        let keep_first = crate::params::kes_first_key_floor_active(period);
+        let mut oldest = true;
+        self.retired.retain(|r| {
+            let first = std::mem::take(&mut oldest);
+            (first && keep_first) || r.end_period > keep_from
+        });
     }
 
     /// The rotation waiting for a later period than `period`, if any.
@@ -475,7 +514,9 @@ pub fn leaf_message(
 pub enum SigningMode {
     /// The registered static key: before the compiled gate, before KES binds
     /// on chain (`kes_enforced_from`), or — after it binds — for a validator
-    /// that never registered a KES key (static-key fallback, review F-2).
+    /// that never registered a KES key (static-key fallback, review F-2) or,
+    /// from the first-key floor on, for a period before its first KES key
+    /// ([`KesEntry::resolve`]).
     Static,
     /// The KES leaf of this global period under the key in force.
     Kes(u64),

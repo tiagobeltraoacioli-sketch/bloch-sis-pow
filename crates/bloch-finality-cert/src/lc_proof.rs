@@ -148,7 +148,7 @@ impl KeyLookup for ProvenKeys<'_> {
         self.records.get(&validator).map(|r| r.pubkey.as_slice())
     }
     fn kes_public(&self, validator: u32, period: u64) -> Option<KesPublic> {
-        self.kes.get(&validator).map(|e| e.in_force(period))
+        self.kes.get(&validator).and_then(|e| e.resolve(period))
     }
     fn kes_network_domain(&self) -> Option<[u8; 32]> {
         Some(self.network_domain)
