@@ -899,6 +899,17 @@ const _: () = assert!(
 /// correct slow path underneath it, never a limit on what can be reorganised.
 const REORG_STATE_WINDOW: usize = 2;
 
+/// How many canonical blocks keep their KES authority (bind epoch and
+/// registered KES entries) so the gossip doors can read the FINALIZED one
+/// (`Engine::signature_failure_is_provable`, FC-4).
+///
+/// Unlike a full post-state this is small: the entry map is shared between
+/// consecutive blocks that did not change it, so a retained block costs its
+/// id and a handle. About 128 epochs; a node whose finalized checkpoint is
+/// older than that (or was not applied by this process) simply cannot prove a
+/// KES forgery and ignores instead of rejecting.
+const KES_AUTHORITY_WINDOW: usize = 4096;
+
 /// Released finalized bodies after which [`return_freed_heap_to_os`] runs.
 const RELEASE_TRIM_THRESHOLD: usize = 1_024;
 
@@ -1704,6 +1715,11 @@ struct Engine {
     /// the wrong branch". A block that leaves the canonical chain and later
     /// returns has the same post-state both times.
     recent_states: VecDeque<([u8; 32], Arc<CommittedState>)>,
+    /// The KES authority of recently applied canonical blocks, oldest first:
+    /// block id, post-state epoch, bind epoch, registered entries
+    /// ([`KES_AUTHORITY_WINDOW`]). Keyed by block id for the same reason as
+    /// `recent_states`: an entry can never describe another branch.
+    kes_authorities: VecDeque<([u8; 32], u64, Option<u64>, Arc<BTreeMap<u32, bloch_pos_committee::kes::KesEntry>>)>,
     /// Retained checkpoint registry proofs + built certificates for
     /// `getfinalitycertificate`. RPC-only; see `engine/finality_cert.rs`.
     finality_certs: finality_cert::FinalityCertStore,
@@ -3872,7 +3888,9 @@ impl Engine {
         //
         // So:
         //   * GENESIS index (present in the manifest), signature fails
-        //     → REFUSED, and `Reject`: the genesis registry is in the manifest
+        //     → REFUSED, and `Reject` (before the KES gate; from it on only
+        //     when the finalized state fixes the authority, see FC-4 below):
+        //     the genesis registry is in the manifest
         //     every node booted from, records are append-only per index
         //     (transition step 7's note: "records never removed"), so the key
         //     this node holds at `i` is the key EVERY branch holds at `i`, and
@@ -3982,6 +4000,19 @@ impl Engine {
                 // O04: a deposit-added identity whose key this branch may not
                 // hold. Not a verdict on the block, and not a charge on the
                 // peer — hold it and let the transition judge it in context.
+                self.park_orphan(id, env, src);
+                return (Verdict::Ignore, None);
+            }
+            if !self.signature_failure_is_provable(
+                &*self.state,
+                env.header.proposer_index,
+                proposer_epoch,
+            ) {
+                // FC-4: from the KES gate on, the key at a genesis index is
+                // no longer the same on every branch. This head may predate
+                // the bind or the proposer's registration and have judged a
+                // leaf signature against the static key. Unless the finalized
+                // state fixes the authority, hold it like the O04 case.
                 self.park_orphan(id, env, src);
                 return (Verdict::Ignore, None);
             }
@@ -5532,10 +5563,79 @@ impl Engine {
     /// Keep a canonical block's post-state for the reorg path. Oldest out
     /// first; see [`REORG_STATE_WINDOW`] for why the window is small.
     fn remember_state(&mut self, id: [u8; 32], state: Arc<CommittedState>) {
+        self.remember_kes_authority(id, &state);
         self.recent_states.push_back((id, state));
         while self.recent_states.len() > REORG_STATE_WINDOW {
             self.recent_states.pop_front();
         }
+    }
+
+    /// Keep a canonical block's KES authority; see [`KES_AUTHORITY_WINDOW`].
+    fn remember_kes_authority(&mut self, id: [u8; 32], state: &CommittedState) {
+        if self.kes_authorities.iter().any(|(seen, ..)| *seen == id) {
+            return;
+        }
+        let entries = match self.kes_authorities.back() {
+            Some((.., last)) if **last == *state.kes_roots() => Arc::clone(last),
+            _ => Arc::new(state.kes_roots().clone()),
+        };
+        self.kes_authorities
+            .push_back((id, epoch_of(state.slot()), state.kes_enforced_from(), entries));
+        while self.kes_authorities.len() > KES_AUTHORITY_WINDOW {
+            self.kes_authorities.pop_front();
+        }
+    }
+
+    /// May a failed consensus-signature check of `validator` for `epoch`,
+    /// judged against `keys` (this node's head or its forward projection), be
+    /// charged to the relaying peer as a forgery?
+    ///
+    /// Before the KES gate: yes, as always. From it on the key in force is
+    /// registered by transactions, so a head that predates the bind or the
+    /// validator's registration judges an honest leaf signature against the
+    /// static key and fails it (FC-4). Only a verdict fixed by this node's
+    /// FINALIZED state is the same on every branch it can still adopt:
+    /// `bloch_pos_committee::kes::failure_is_attributable`.
+    fn signature_failure_is_provable(&self, keys: &dyn KeyLookup, validator: u32, epoch: u64) -> bool {
+        let finalized_root = self.state.finality().finalized.root;
+        let finalized = self
+            .kes_authorities
+            .iter()
+            .rev()
+            .find(|(id, ..)| *id == finalized_root)
+            .map(|(_, epoch, enforced_from, entries)| bloch_pos_committee::kes::FinalizedAuthority {
+                epoch: *epoch,
+                enforced_from: *enforced_from,
+                entries,
+            });
+        bloch_pos_committee::kes::failure_is_attributable(keys, finalized.as_ref(), validator, epoch)
+    }
+
+    /// May a `NotInCommittee` or `BadSignature` verdict on an attestation of
+    /// `epoch` naming `target_root` be charged to the relaying peer?
+    ///
+    /// Both verdicts are read off `rolled_to(epoch)` of this node's head. If
+    /// that head is behind the attestation (a projection, not the state of
+    /// the attestation's own epoch), on another branch than its target, or
+    /// the node is still replaying or syncing, the roster and the keys may
+    /// simply be stale, and a stale view proves nothing about the peer
+    /// (FC-4, P2P-9). A bad signature must also be one no branch would
+    /// accept ([`Self::signature_failure_is_provable`]).
+    fn attestation_fault_is_provable(
+        &self,
+        reason: bloch_pos_committee::attestation::RejectReason,
+        keys: &dyn KeyLookup,
+        validator: u32,
+        epoch: u64,
+        target_root: &[u8; 32],
+    ) -> bool {
+        use bloch_pos_committee::attestation::RejectReason;
+        self.live
+            && !self.needs_sync
+            && epoch_of(self.state.slot()) >= epoch
+            && self.canonical.contains(target_root)
+            && (reason != RejectReason::BadSignature
+                || self.signature_failure_is_provable(keys, validator, epoch))
     }
 
     /// The committed post-state of a canonical block: from the snapshot ring
@@ -6152,6 +6252,7 @@ impl Engine {
         let known_root =
             |root: &[u8; 32]| self.canonical.contains(root) || self.blocks.contains_key(root);
         let target_root = admission.attestation().data.target_root;
+        let validator = admission.attestation().validator;
         let seed = match self.seed_for_attestation(&target_root, epoch) {
             Some(seed) => Some(seed),
             None if !known_root(&target_root) => None,
@@ -6208,7 +6309,18 @@ impl Engine {
                 &*rolled,
             ),
         };
-        locally_limited_gossip_decision(decision, verifier.limited())
+        match locally_limited_gossip_decision(decision, verifier.limited()) {
+            // FC-4 / P2P-9: the pool judged membership and the signature
+            // against `rolled`. Only a view that cannot be stale may turn
+            // that into a peer penalty.
+            GossipDecision::Reject(
+                reason @ (bloch_pos_committee::attestation::RejectReason::NotInCommittee
+                | bloch_pos_committee::attestation::RejectReason::BadSignature),
+            ) if !self.attestation_fault_is_provable(reason, &*rolled, validator, epoch, &target_root) => {
+                GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Unjudgeable)
+            }
+            decision => decision,
+        }
     }
 
     fn apply_decision(&mut self, att: Attestation, decision: GossipDecision, origin: &Origin) {
@@ -7232,6 +7344,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
         recent_states: VecDeque::new(),
+        kes_authorities: VecDeque::new(),
         finality_certs: Default::default(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
@@ -10944,6 +11057,7 @@ mod transfer_v2_end_to_end {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+        kes_authorities: VecDeque::new(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
@@ -12327,6 +12441,7 @@ mod perf_support {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+        kes_authorities: VecDeque::new(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
@@ -14653,6 +14768,7 @@ mod duty_view_anchor {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+        kes_authorities: VecDeque::new(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
@@ -14924,6 +15040,7 @@ mod slot_horizon {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+        kes_authorities: VecDeque::new(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
@@ -16774,6 +16891,155 @@ mod ingest_admission_tests {
         assert!(matches!(verdict, Verdict::Reject));
         assert_eq!(engine.blocks.len(), stored);
         assert_eq!(engine.rejected_unsigned, 1);
+    }
+
+    /// **FC-4: from the KES gate on, a signature failure under a GENESIS
+    /// index is a forgery only if the finalized state says so.**
+    ///
+    /// This head has not bound KES and holds no KES entry for the proposer,
+    /// so it judges every proposal of a post-gate epoch against the static
+    /// key. A proposer that registered and signs with its leaf on a more
+    /// advanced head fails that check honestly. The envelope is parked and
+    /// the relaying peer is not charged. Before the fix it was `Reject`ed and
+    /// counted as unsigned.
+    #[test]
+    fn past_the_kes_gate_an_unprovable_signature_failure_is_parked_not_refused() {
+        let gate = bloch_pos_committee::params::KES_ACTIVATION_EPOCH;
+        assert!(bloch_pos_committee::params::kes_period(gate).is_some());
+        let slot = first_slot_of_epoch(gate).expect("the gate epoch has a first slot") + 2;
+        let (mut engine, _dir, template, stored) = fixture();
+        let _clock = validator_lifecycle::clock_at(slot);
+        assert_eq!(engine.state.kes_enforced_from(), None, "the head predates the bind");
+        assert!(engine.state.kes_roots().is_empty(), "and the proposer's registration");
+
+        // Stands in for the leaf signature: bytes the static key did not sign.
+        let mut leaf_signed = repointed(&engine, &template, [0x9A; 32], slot);
+        leaf_signed.proposer_sig.fill(0);
+        let verdict = engine.ingest_judged(leaf_signed.clone());
+        assert!(matches!(verdict, Verdict::Ignore), "a lagging head proves nothing: {verdict:?}");
+        assert_eq!(engine.rejected_unsigned, 0, "not counted as a forgery");
+        assert_eq!(engine.blocks.len(), stored, "not stored: it may not weigh on fork choice");
+        assert_eq!(engine.orphans.len(), 1, "parked for the head that can judge it");
+
+        // A finalized view that has not bound KES either changes nothing.
+        let finalized_root = engine.state.finality().finalized.root;
+        let finalized_state = engine.manifest.genesis_state();
+        engine.remember_kes_authority(finalized_root, &finalized_state);
+        assert!(!engine.signature_failure_is_provable(&*engine.state, template.header.proposer_index, gate));
+
+        // Before the gate the same failure is the provable forgery it always
+        // was, on the same engine.
+        assert!(engine.signature_failure_is_provable(&*engine.state, template.header.proposer_index, gate - 1));
+    }
+
+    /// The KES authority ring follows the canonical chain and shares one
+    /// entry map between blocks that did not change it.
+    #[test]
+    fn every_canonical_block_keeps_its_kes_authority() {
+        let (mut engine, _dir, _template, _stored) = fixture();
+        engine.propose(2);
+        engine.propose(3);
+        let head = *engine.head_id().as_bytes();
+        let (id, epoch, enforced_from, entries) = engine.kes_authorities.back().expect("recorded");
+        assert_eq!((*id, *epoch, *enforced_from), (head, 0, None));
+        assert!(entries.is_empty());
+        assert_eq!(engine.kes_authorities.len(), 3);
+        assert!(Arc::ptr_eq(entries, &engine.kes_authorities[0].3));
+        let state = engine.state.arc();
+        engine.remember_kes_authority(head, &state);
+        assert_eq!(engine.kes_authorities.len(), 3, "one entry per block");
+    }
+
+    /// **FC-4 / P2P-9: a vote judged against a stale view is ignored, a
+    /// provable fault is still rejected.**
+    ///
+    /// `judge` reads the roster and the keys from `rolled_to(epoch)` of this
+    /// node's head. With the head inside the vote's epoch on the vote's own
+    /// chain, and the node live and synced, a forged signature and a signer
+    /// outside the roster are faults of the sender. With the head still in
+    /// the previous epoch, or the node syncing or replaying, the very same
+    /// frames may be honest on a head this node has not reached.
+    #[test]
+    fn attestation_faults_are_scored_only_from_a_head_that_reached_the_vote() {
+        use bloch_pos_committee::attestation::RejectReason;
+        use bloch_pos_committee::gossip::IgnoreReason;
+        let vote = |engine: &Engine, validator: u32, slot: u64| {
+            let head = *engine.head_id().as_bytes();
+            let data = AttestationData {
+                slot,
+                head,
+                source_epoch: 0,
+                source_root: *engine.chain[0].1.as_bytes(),
+                target_epoch: 1,
+                target_root: head,
+            };
+            // Bytes the validator's key did not sign.
+            Attestation { data, validator, signature: vec![0u8; 16] }
+        };
+        let judge_at = |engine: &Engine, validator: u32, slot: u64| {
+            engine.judge(&mut AttestationPool::new(), vote(engine, validator, slot), 1)
+        };
+
+        // The head is in the vote's epoch, on its chain; live and synced.
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.propose(1);
+        engine.propose(32);
+        engine.wall_slot = 63;
+        engine.needs_sync = false;
+        assert_eq!(epoch_of(engine.state.slot()), 1);
+        assert!(engine.live);
+        // Validator 0's own duty slot in epoch 1, from the vote's branch.
+        let head = *engine.head_id().as_bytes();
+        let seed = engine.seed_for_attestation(&head, 1).expect("the head's branch is held");
+        let roster = engine.rolled_to(1).active_validators();
+        let duty = (32..64)
+            .find(|slot| committees::committee_for_slot(&seed, *slot, &roster).contains(&0))
+            .expect("validator 0 attests once in the epoch");
+        let judge = |engine: &Engine, validator: u32| judge_at(engine, validator, duty);
+        let forged = judge(&engine, 0);
+        assert!(matches!(forged, GossipDecision::Reject(RejectReason::BadSignature)), "{forged:?}");
+        let outsider = judge(&engine, 9_999);
+        assert!(matches!(outsider, GossipDecision::Reject(RejectReason::NotInCommittee)), "{outsider:?}");
+
+        // Not synced, or still replaying: the view may be stale.
+        engine.needs_sync = true;
+        assert!(matches!(judge(&engine, 0), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
+        assert!(matches!(judge(&engine, 9_999), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
+        engine.needs_sync = false;
+        engine.live = false;
+        assert!(matches!(judge(&engine, 0), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
+        assert!(matches!(judge(&engine, 9_999), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
+
+        // The head is still in the previous epoch: the roster and the keys
+        // are a forward projection of a head behind the vote.
+        let (mut lagging, _dir) = perf_support::proposing_engine();
+        lagging.propose(1);
+        lagging.wall_slot = 63;
+        lagging.needs_sync = false;
+        assert_eq!(epoch_of(lagging.state.slot()), 0);
+        assert!(matches!(judge(&lagging, 0), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
+        assert!(matches!(judge(&lagging, 9_999), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
+    }
+
+    /// From the KES gate on, a bad vote signature needs the finalized
+    /// authority as well, exactly like a proposal.
+    #[test]
+    fn past_the_kes_gate_a_bad_vote_signature_needs_the_finalized_authority() {
+        use bloch_pos_committee::attestation::RejectReason;
+        let gate = bloch_pos_committee::params::KES_ACTIVATION_EPOCH;
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.propose(1);
+        engine.propose(32);
+        engine.needs_sync = false;
+        let head = *engine.head_id().as_bytes();
+        let state = engine.state.arc();
+        // Before the gate: provable from a head that reached the vote.
+        assert!(engine.attestation_fault_is_provable(RejectReason::BadSignature, &*state, 0, 1, &head));
+        assert!(!engine.attestation_fault_is_provable(RejectReason::BadSignature, &*state, 0, 1, &[0x9A; 32]),
+            "a target this chain does not contain");
+        // Past it, with a head that has not bound KES: never.
+        assert!(!engine.signature_failure_is_provable(&*state, 0, gate));
+        assert!(!engine.attestation_fault_is_provable(RejectReason::BadSignature, &*state, 0, gate, &head));
     }
 
     #[test]

@@ -562,6 +562,8 @@ pub fn signing_mode(keys: &dyn KeyLookup, validator: u32, epoch: u64) -> Signing
 /// not as a peer fault, unless the validator's entry
 /// (`CommittedState::kes_roots`) is identical in this node's finalized
 /// state. Static-key failures keep their existing attribution.
+/// [`failure_is_attributable`] is that rule; every relay door asks it
+/// before it charges a peer for a failure here.
 ///
 /// Rules: the static hybrid key,
 /// exactly as before, until KES binds (and for never-registered validators
@@ -643,6 +645,74 @@ pub fn authority_fingerprint(keys: &dyn KeyLookup, validator: u32, epoch: u64) -
         &domain.unwrap_or([0; 32]),
         &period.to_le_bytes(),
     ]))
+}
+
+/// The KES authority of a node's FINALIZED state: what every branch this
+/// node can still adopt has in common. Borrowed, so a relay can keep one
+/// shared map per finalized block.
+#[derive(Clone, Copy, Debug)]
+pub struct FinalizedAuthority<'a> {
+    /// The epoch of the finalized post-state. Every later registration or
+    /// rotation is applied in this epoch or after it.
+    pub epoch: u64,
+    /// `CommittedState::kes_enforced_from` of that state.
+    pub enforced_from: Option<u64>,
+    /// `CommittedState::kes_roots` of that state.
+    pub entries: &'a std::collections::BTreeMap<u32, KesEntry>,
+}
+
+/// May a relay treat a failed [`verify_validator`] of `validator`'s signature
+/// for `epoch`, judged against `keys`, as a provable forgery (a peer fault)?
+///
+/// Before the compiled KES gate: always, the static key signs and its
+/// failures keep their existing attribution. From the gate on, only when the
+/// verdict cannot differ on another branch or on a more advanced head, i.e.
+/// when the authority `keys` resolved is the one `finalized` fixes:
+///
+///   * the bind epoch is committed in the finalized state (it is set once)
+///     and `keys` reports the same one. A head that predates the bind selects
+///     the static key for a validator that already signs with its leaf;
+///   * `epoch` is before that bind (the static key signs on every branch), or
+///   * the validator has a KES entry in the finalized state, no later
+///     transaction can change which key is in force for `epoch`'s period,
+///     and `keys` resolves that same key. A registration takes effect in the
+///     period after the one that includes it (two periods for a rescue) and
+///     a rotation in the period after it, both counted from the finalized
+///     epoch at the earliest; while a rotation is pending no other is
+///     admitted, so the settled range extends to the pending key's start.
+///     A validator WITHOUT a finalized entry may have registered on a branch
+///     or a block this node has not applied: never attributable.
+///
+/// `finalized` is `None` when the caller does not hold its finalized state's
+/// KES view; nothing past the gate is attributable then. Node-local relay
+/// policy only: block and vote validity stay with the transition.
+pub fn failure_is_attributable(
+    keys: &dyn KeyLookup,
+    finalized: Option<&FinalizedAuthority<'_>>,
+    validator: u32,
+    epoch: u64,
+) -> bool {
+    let Some(period) = crate::params::kes_period(epoch) else {
+        return true;
+    };
+    let Some(finalized) = finalized else {
+        return false;
+    };
+    let Some(bound) = finalized.enforced_from else {
+        return false;
+    };
+    if keys.kes_enforced_from() != Some(Some(bound)) {
+        return false;
+    }
+    if epoch < bound {
+        return true;
+    }
+    let Some(entry) = finalized.entries.get(&validator) else {
+        return false;
+    };
+    let finalized_period = crate::params::kes_period(finalized.epoch).unwrap_or(0);
+    let settled_through = entry.pending_at(finalized_period).map_or(finalized_period, |next| next.start_period);
+    period <= settled_through && keys.kes_public(validator, period) == Some(entry.in_force(period))
 }
 
 #[cfg(test)]
@@ -872,5 +942,188 @@ mod history_tests {
         assert_eq!(e.in_force(3), old);
         assert_eq!(e.in_force(4), fresh, "nothing covers 4..6: the fresh key, whose leaves refuse it");
         assert_eq!(fresh.leaf_index(4), None);
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+    use crate::params::{kes_rehearsal, KesSchedule};
+    use std::collections::BTreeMap;
+
+    struct ToyVerifier;
+    impl SignatureVerifier for ToyVerifier {
+        fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+            signature == h(&[pubkey, root])
+        }
+    }
+
+    /// What committed state answers with: validator 4's static key, the KES
+    /// entries and the bind epoch of one state.
+    struct View {
+        entries: BTreeMap<u32, KesEntry>,
+        enforced_from: Option<u64>,
+    }
+
+    const STATIC_KEY: &[u8] = b"static-key-of-validator-4";
+    const DOMAIN: [u8; 32] = [0xD7; 32];
+
+    impl KeyLookup for View {
+        fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+            (validator == 4).then_some(STATIC_KEY)
+        }
+        fn kes_public(&self, validator: u32, period: u64) -> Option<KesPublic> {
+            self.entries.get(&validator).map(|entry| entry.in_force(period))
+        }
+        fn kes_network_domain(&self) -> Option<[u8; 32]> {
+            Some(DOMAIN)
+        }
+        fn kes_enforced_from(&self) -> Option<Option<u64>> {
+            Some(self.enforced_from)
+        }
+    }
+
+    impl View {
+        fn finalized(&self, epoch: u64) -> FinalizedAuthority<'_> {
+            FinalizedAuthority { epoch, enforced_from: self.enforced_from, entries: &self.entries }
+        }
+    }
+
+    /// A depth-3 toy tree and validator 4's leaf signature of `period` over
+    /// `root`, bound exactly as the duty signer binds it.
+    fn kes_key_and_signature(seed: u8, period: u64, root: &[u8; 32]) -> (KesPublic, Vec<u8>) {
+        let mut state = [seed; 32];
+        let mut pks = Vec::new();
+        for _ in 0..8 {
+            pks.push(leaf_seed(&state).to_vec());
+            state = step(&state);
+        }
+        let leaves: Vec<[u8; 32]> = pks.iter().map(|pk| leaf_hash(pk)).collect();
+        let public = KesPublic::new(3, merkle_root(&leaves), 0);
+        let message = bound_signing_root(&DOMAIN, 4, &public, period, root);
+        let leaf = period as usize;
+        let signature = KesSignature {
+            index: leaf as u32,
+            leaf_pk: pks[leaf].clone(),
+            sig: h(&[&pks[leaf], &message]).to_vec(),
+            path: auth_path(&leaves, leaf),
+        }
+        .encode();
+        (public, signature)
+    }
+
+    struct Rehearsal;
+    impl Rehearsal {
+        /// Gate at epoch 100, 90-epoch periods.
+        fn arm() -> Self {
+            kes_rehearsal::set(Some(KesSchedule { registration_epoch: 10, activation_epoch: 100, period_epochs: 90, min_depth: 1 }));
+            Rehearsal
+        }
+    }
+    impl Drop for Rehearsal {
+        fn drop(&mut self) {
+            kes_rehearsal::set(None);
+        }
+    }
+
+    /// FC-4: a head that predates the validator's KES registration (or the
+    /// bind) selects the static key, so the validator's honest leaf signature
+    /// fails there. That failure is not attributable, whether or not the
+    /// node holds a finalized view.
+    #[test]
+    fn a_kes_signature_failing_against_a_head_that_predates_the_registration_is_not_attributable() {
+        let _armed = Rehearsal::arm();
+        let root = [0x42; 32];
+        let epoch = 130; // period 0
+        let (public, signature) = kes_key_and_signature(7, 0, &root);
+        let ahead = View { entries: BTreeMap::from([(4, public.into())]), enforced_from: Some(104) };
+        assert_eq!(verify_validator(&ahead, &ToyVerifier, 4, epoch, &root, &signature), Some(true), "honest on its own branch");
+
+        // The lagging head: bound, but validator 4 has not registered yet.
+        let lagging = View { entries: BTreeMap::new(), enforced_from: Some(104) };
+        assert_eq!(signing_mode(&lagging, 4, epoch), SigningMode::Static);
+        assert_eq!(verify_validator(&lagging, &ToyVerifier, 4, epoch, &root, &signature), Some(false));
+        assert!(!failure_is_attributable(&lagging, Some(&lagging.finalized(120)), 4, epoch));
+        assert!(!failure_is_attributable(&lagging, None, 4, epoch));
+
+        // The head that predates the bind itself.
+        let unbound = View { entries: BTreeMap::new(), enforced_from: None };
+        assert_eq!(verify_validator(&unbound, &ToyVerifier, 4, epoch, &root, &signature), Some(false));
+        assert!(!failure_is_attributable(&unbound, Some(&unbound.finalized(120)), 4, epoch));
+        // A head that bound after a finalized state that had not.
+        assert!(!failure_is_attributable(&lagging, Some(&unbound.finalized(101)), 4, epoch));
+    }
+
+    /// A signature that fails against the key the FINALIZED state fixes for
+    /// the period is a forgery on every branch: still attributable.
+    #[test]
+    fn a_forgery_against_the_finalized_authority_stays_attributable() {
+        let _armed = Rehearsal::arm();
+        let root = [0x42; 32];
+        let epoch = 130;
+        let (public, signature) = kes_key_and_signature(7, 0, &root);
+        let state = View { entries: BTreeMap::from([(4, public.into())]), enforced_from: Some(104) };
+        let finalized = state.finalized(120);
+        assert_eq!(verify_validator(&state, &ToyVerifier, 4, epoch, &root, &signature), Some(true));
+
+        let mut forged = KesSignature::decode(&signature).unwrap();
+        forged.sig[0] ^= 1;
+        assert_eq!(verify_validator(&state, &ToyVerifier, 4, epoch, &root, &forged.encode()), Some(false));
+        assert!(failure_is_attributable(&state, Some(&finalized), 4, epoch));
+        // Another tree's leaf, and the static key after the bind: forgeries too.
+        let (_, foreign) = kes_key_and_signature(8, 0, &root);
+        assert_eq!(verify_validator(&state, &ToyVerifier, 4, epoch, &root, &foreign), Some(false));
+        let static_signature = h(&[STATIC_KEY, &root]);
+        assert_eq!(verify_validator(&state, &ToyVerifier, 4, epoch, &root, &static_signature), Some(false));
+        assert!(failure_is_attributable(&state, Some(&finalized), 4, epoch));
+    }
+
+    #[test]
+    fn static_key_failures_keep_their_attribution_where_every_branch_uses_the_static_key() {
+        let _armed = Rehearsal::arm();
+        let empty = View { entries: BTreeMap::new(), enforced_from: None };
+        // Before the compiled gate nothing changes, with or without a view.
+        assert!(failure_is_attributable(&empty, None, 4, 99));
+        assert!(failure_is_attributable(&empty, Some(&empty.finalized(50)), 4, 99));
+        // Past the gate, before a bind epoch that is already finalized.
+        let bound = View { entries: BTreeMap::new(), enforced_from: Some(104) };
+        assert!(failure_is_attributable(&bound, Some(&bound.finalized(102)), 4, 103));
+        assert!(!failure_is_attributable(&bound, Some(&bound.finalized(102)), 4, 104), "may have registered since");
+    }
+
+    /// The key a period resolves to must be beyond the reach of any
+    /// transaction after the finalized state.
+    #[test]
+    fn a_period_a_later_rotation_or_rescue_can_still_change_is_not_attributable() {
+        let _armed = Rehearsal::arm();
+        let k0 = KesPublic::new(3, [1; 32], 0);
+        let k1 = KesPublic::new(3, [2; 32], 2);
+        let state = View { entries: BTreeMap::from([(4, k0.into())]), enforced_from: Some(104) };
+        // Finalized in period 0 (epoch 120): a rotation in period 0 on some
+        // branch puts another key in force from period 1 (epoch 190).
+        assert!(failure_is_attributable(&state, Some(&state.finalized(120)), 4, 189));
+        assert!(!failure_is_attributable(&state, Some(&state.finalized(120)), 4, 190));
+        assert!(failure_is_attributable(&state, Some(&state.finalized(190)), 4, 190));
+
+        // A rotation pending in the finalized state blocks any other until
+        // its own start: settled through period 2, not period 3.
+        let pending = View { entries: BTreeMap::from([(4, KesEntry { next: Some(k1), ..k0.into() })]), enforced_from: Some(104) };
+        let finalized = pending.finalized(120);
+        assert!(failure_is_attributable(&pending, Some(&finalized), 4, 190));
+        assert!(failure_is_attributable(&pending, Some(&finalized), 4, 280));
+        assert!(!failure_is_attributable(&pending, Some(&finalized), 4, 370));
+
+        // The head resolved a different key than the finalized one for the
+        // period (it applied a rescue the finalized state lacks).
+        let rescued = View { entries: BTreeMap::from([(4, KesEntry::from(KesPublic::new(3, [9; 32], 0)))]), enforced_from: Some(104) };
+        assert!(!failure_is_attributable(&rescued, Some(&state.finalized(120)), 4, 130));
+        // A lookup that cannot say whether KES binds proves nothing.
+        struct Opaque;
+        impl KeyLookup for Opaque {
+            fn pubkey(&self, _validator: u32) -> Option<&[u8]> {
+                Some(STATIC_KEY)
+            }
+        }
+        assert!(!failure_is_attributable(&Opaque, Some(&state.finalized(120)), 4, 130));
     }
 }

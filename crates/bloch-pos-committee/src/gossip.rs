@@ -518,6 +518,10 @@ impl AttestationPool {
         //    are sorted by construction (committees.rs sorts each committee).
         //    A non-member cannot be honest timing skew — both ends compute
         //    membership from the same finalized state — so this is a Reject.
+        //    That premise is the CALLER's to hold: a node whose `committees`
+        //    come from a head behind the attestation, or from another branch,
+        //    must downgrade this verdict to Ignore (P2P-9; the node does, in
+        //    `Engine::judge_admission`).
         if committees.committee(slot).binary_search(&att.validator).is_err() {
             return GossipDecision::Reject(RejectReason::NotInCommittee);
         }
@@ -599,6 +603,9 @@ impl AttestationPool {
         //    parked, so a forger cannot frame a validator.
         //    From KES enforcement on, the leaf of the slot epoch's period
         //    signs (`crate::kes::verify_validator`); before it, the static key.
+        //    The KES key in force is branch-dependent, so the caller scores a
+        //    `BadSignature` only when `crate::kes::failure_is_attributable`
+        //    and its `keys` are not a stale projection (FC-4).
         let already_authenticated = authenticated_pubkey_sha3 == Some(current_pubkey_sha3);
         if !already_authenticated
             && crate::kes::verify_validator(
