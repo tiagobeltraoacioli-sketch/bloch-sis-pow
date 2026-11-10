@@ -2928,7 +2928,34 @@ impl Engine {
         if self.doppelganger_halted {
             return true;
         }
+        // Review CR-8, runtime half: a key that turns out to be registered
+        // only once the node has synced far enough is refused here.
+        if let Some(refusal) = self.missing_history_refusal(self.wall_slot) {
+            static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !ANNOUNCED.swap(true, Ordering::Relaxed) {
+                eprintln!("{refusal} Duties STOPPED until restart.");
+            }
+            return true;
+        }
         matches!(self.doppelganger_observe_until, Some(until) if slot < until)
+    }
+
+    /// Review CR-8: `Some(message)` when this node's key is in the registry
+    /// with duties that began before the slot from which its slashing
+    /// protection record is known to be complete
+    /// (`SlashingProtection::settle_missing_history`), and has not exited.
+    /// `None` for a key that is not registered yet or was activated later (a
+    /// genuinely new validator), and always when a record or anchor existed.
+    fn missing_history_refusal(&self, wall_slot: u64) -> Option<String> {
+        self.slashprot.unproven_before_slot()?;
+        let index = self.duty_index(&self.state)?;
+        let record = self.state.validator_record(index)?;
+        if !self.slashprot.missing_history_blocks(record.activation_epoch)
+            || epoch_of(self.state.slot()) >= record.exit_epoch
+        {
+            return None;
+        }
+        Some(self.slashprot.missing_history_refusal(index, record.activation_epoch, wall_slot))
     }
 
     fn start_doppelganger_observation(&mut self, wall_slot: u64) {
@@ -7418,6 +7445,26 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 crate::slashprot::Binding { validator_pubkey_sha3: pkh, genesis_digest: digest };
             let mut protection = SlashingProtection::open_bound(&cfg.data_dir, binding)?;
             attach_signer_anchor(&cfg.data_dir, binding, &mut protection)?;
+            // Review CR-8: settled here, before replay can create the record
+            // from on-chain evidence. Enforced once the registry is known
+            // (`Engine::missing_history_refusal`).
+            let acknowledged = parse_boot_switch(
+                crate::slashprot::ENV_ACK_MISSING,
+                std::env::var_os(crate::slashprot::ENV_ACK_MISSING),
+            )?;
+            let boot_wall_slot = now_ms().saturating_sub(manifest.genesis_time_ms) / manifest.slot_ms.max(1);
+            match protection.settle_missing_history(boot_wall_slot, acknowledged)? {
+                crate::slashprot::MissingHistory::Proven => {}
+                crate::slashprot::MissingHistory::Unproven { before_slot } => println!(
+                    "slashing protection: no record and no host signer anchor; this key may sign \
+                     only if its duties began at or after wall slot {before_slot}"
+                ),
+                crate::slashprot::MissingHistory::Acknowledged => println!(
+                    "SLASHING PROTECTION: MISSING RECORD ACKNOWLEDGED ({} is set). The operator \
+                     states this key has no signature this node does not know about.",
+                    crate::slashprot::ENV_ACK_MISSING
+                ),
+            }
             protection
         }
         None => SlashingProtection::open(&cfg.data_dir)?,
@@ -7796,6 +7843,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 ));
             }
         }
+    }
+
+    // Review CR-8, boot half: the registry is known now. A key that already
+    // had duties, with no slashing-protection record and no signer anchor,
+    // does not start. Non-retryable, so a supervisor does not loop on it.
+    let boot_wall_slot = now_ms().saturating_sub(engine.manifest.genesis_time_ms) / engine.manifest.slot_ms.max(1);
+    if let Some(refusal) = engine.missing_history_refusal(boot_wall_slot) {
+        return Err(crate::ws_boot::boot_refused(refusal));
     }
 
     // ── Weak subjectivity: may the node sync at all? (§4.2) ──
@@ -13340,6 +13395,48 @@ mod doppelganger_tests {
             engine.doppelganger_blocks_duties(9_999),
             "a detected duplicate must block duties indefinitely, not just until the window"
         );
+    }
+
+    /// Review CR-8: a registered key whose data dir had no slashing-protection
+    /// record and no signer anchor performs no duty; an acknowledgement, or a
+    /// key activated after the boot, is not blocked.
+    #[test]
+    fn a_registered_key_without_a_signing_record_performs_no_duty() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        assert!(engine.missing_history_refusal(0).is_none(), "fixture: unarmed");
+        let scratch = |tag: &str| {
+            perf_support::TestDir(std::env::temp_dir().join(format!("bloch-pos-cr8-{tag}-{}", std::process::id())))
+        };
+        let fresh = scratch("active");
+        let activation = engine
+            .state
+            .validator_record(engine.duty_index(&engine.state).expect("fixture: registered"))
+            .expect("record")
+            .activation_epoch;
+        let after = activation.saturating_add(3).saturating_mul(bloch_pos_committee::params::SLOTS_PER_EPOCH);
+
+        engine.slashprot = SlashingProtection::open(&fresh.0).expect("open");
+        engine.slashprot.settle_missing_history(after, false).expect("settle");
+        let refusal = engine.missing_history_refusal(after).expect("an already-active key must be refused");
+        assert!(refusal.contains("--acknowledge-missing-slashing-protection"), "{refusal}");
+        assert!(engine.doppelganger_blocks_duties(0));
+        assert!(engine.doppelganger_blocks_duties(u64::MAX));
+
+        // The same data dir, acknowledged on the next boot.
+        engine.slashprot = SlashingProtection::open(&fresh.0).expect("reopen");
+        engine.slashprot.settle_missing_history(after, true).expect("settle");
+        assert!(engine.missing_history_refusal(after).is_none());
+        assert!(!engine.doppelganger_blocks_duties(0));
+
+        // A key whose duties begin at or after the boot is a new validator.
+        let newcomer = scratch("new");
+        engine.slashprot = SlashingProtection::open(&newcomer.0).expect("open");
+        engine
+            .slashprot
+            .settle_missing_history(activation.saturating_mul(bloch_pos_committee::params::SLOTS_PER_EPOCH), false)
+            .expect("settle");
+        assert!(engine.missing_history_refusal(after).is_none());
+        assert!(!engine.doppelganger_blocks_duties(0));
     }
 
     /// No window armed (bypassed via `--no-doppelganger-check` /

@@ -195,6 +195,27 @@ a corrupt or foreign anchor record and a rolled-back data dir stay fatal.
 (`ProtectHome=tmpfs` gives each unit a private, ephemeral home: the anchor
 then works per boot only and cannot see other units.)
 
+One case does refuse without an anchor. A data dir with **no
+`slashing_protection.bin`** and no usable anchor gives the node nothing that
+says what the key has signed: a new validator and a key whose record was lost
+(data dir wiped for a resync, restored without the record, key copied to a new
+directory) look the same. The node records the wall slot of that first boot in
+`slashing_protection.unproven`. A key whose duties began at or after that slot
+starts as before. A key that already had duties on chain before it does not
+sign (`SLASHING PROTECTION MISSING`; exit status 78 at boot, or duties stopped
+if the registry only shows the key after syncing). On-chain signatures replayed
+into the record do not lift this: they do not cover votes that were signed and
+never included. After fencing every other instance of the key, do one of:
+
+- `slashing-protection import` the key's exported record;
+- `slashing-protection set-floor --min-slot <n>` above anything the key can
+  have signed (the refusal message prints the full command);
+- restart once with `--acknowledge-missing-slashing-protection`
+  (`BLOCH_ACK_MISSING_SLASHING_PROTECTION=1`) if the key has never signed
+  anywhere else.
+
+A validator that upgrades with its record in place is not affected.
+
 To enable the anchor on such units, use one shared directory per host and
 name it explicitly; an explicit root that cannot be created or locked is a
 boot refusal, not a warning:

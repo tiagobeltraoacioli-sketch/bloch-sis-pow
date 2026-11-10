@@ -110,7 +110,7 @@ fn plaintext_opt_in_flag(args: &[String]) -> bool {
         return false;
     }
     let switches = ["--allow-finality-rewind", "--no-doppelganger-check", "--replay-from-genesis",
-        "--no-signer-anchor", "--accept-signing-rollback",
+        "--no-signer-anchor", "--accept-signing-rollback", "--acknowledge-missing-slashing-protection",
         "--require-state-cache", "--behind-proxy", "--bind-genesis",
         "--mesh-require-authenticated"];
     let mut rest = args.iter().skip(1);
@@ -416,11 +416,17 @@ fn print_help() {
                from booting on this host again (after a migration export).\n\
            bloch-pos run ... [--signer-anchor-dir <dir>] [--no-signer-anchor]\n\
                              [--accept-signing-rollback]\n\
+                             [--acknowledge-missing-slashing-protection]\n\
                Signer anchor (default $HOME/.bloch-signer): one lock per\n\
                validator key on this host, and a refusal to sign from a data\n\
                dir older than the key's last signature. An unwritable\n\
                default (systemd ProtectHome=, missing HOME) only warns;\n\
                an explicit --signer-anchor-dir must be usable.\n\
+               A key that already had duties on chain, in a data dir with\n\
+               no slashing_protection.bin and no usable anchor, refuses to\n\
+               sign: import the record, set a floor (slashing-protection\n\
+               import|set-floor), or acknowledge that the key has signed\n\
+               nothing else. A key not yet active starts as before.\n\
            bloch-pos watch-equivocation --rpc HOST:PORT [--rpc ...] --state FILE --out EVIDENCE.jsonl\n\
                [--from-slot N] [--to-slot N] [--window-epochs 256]   (read-only double/surround vote detector)\n\
            bloch-pos ws-keygen --out <prefix>\n\
@@ -898,6 +904,7 @@ fn run_switch(args: &[String], name: &str) -> bool {
         "--no-doppelganger-check",
         "--no-signer-anchor",
         "--accept-signing-rollback",
+        "--acknowledge-missing-slashing-protection",
         "--replay-from-genesis",
         "--require-state-cache",
     ];
@@ -1803,6 +1810,12 @@ fn run_cmd(args: &[String]) {
     }
     if let Some(value) = arg_value(args, "--signer-anchor-dir") {
         unsafe { std::env::set_var(signer_anchor::ENV_DIR, value) };
+    }
+    // Review CR-8: a registered key with no slashing-protection record and no
+    // signer anchor refuses to sign unless the operator says the key has
+    // signed nothing this node does not know about.
+    if run_switch(args, "--acknowledge-missing-slashing-protection") {
+        unsafe { std::env::set_var(slashprot::ENV_ACK_MISSING, "1") };
     }
     if let Some(value) = arg_value(args, "--max-replay-blocks") {
         if value.parse::<usize>().is_err() {
