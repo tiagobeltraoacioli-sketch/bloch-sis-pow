@@ -658,6 +658,7 @@ pub(super) fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         // fallback — which is what a real cold boot does too.
         recent_states: VecDeque::new(),
         kes_authorities: VecDeque::new(),
+        reorg_anchors: Default::default(),
         finality_certs: Default::default(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),

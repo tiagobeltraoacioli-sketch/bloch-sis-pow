@@ -902,10 +902,12 @@ const _: () = assert!(
 /// smallest window that buys anything at all, and this is it.
 ///
 /// Two is chosen against the reorgs that happen — depth 1, occasionally 2 —
-/// and NOT as a guess at the worst case. Everything deeper falls back to the
-/// replay from genesis this node has always done, which is what makes a small
-/// window safe rather than merely cheap: the window is an optimisation with a
-/// correct slow path underneath it, never a limit on what can be reorganised.
+/// and NOT as a guess at the worst case. Everything deeper falls back to a
+/// replay — from the nearest [`ReorgAnchors`] entry, or from genesis as this
+/// node has always done when none covers the block — which is what makes a
+/// small window safe rather than merely cheap: the window is an optimisation
+/// with a correct slow path underneath it, never a limit on what can be
+/// reorganised.
 const REORG_STATE_WINDOW: usize = 2;
 
 /// How many canonical blocks keep their KES authority (bind epoch and
@@ -918,6 +920,56 @@ const REORG_STATE_WINDOW: usize = 2;
 /// older than that (or was not applied by this process) simply cannot prove a
 /// KES forgery and ignores instead of rejecting.
 const KES_AUTHORITY_WINDOW: usize = 4096;
+/// Canonical blocks after which the pending reorg anchor is re-taken at the
+/// head when finality has not passed it (see [`ReorgAnchors`]).
+///
+/// With finality advancing, the pending anchor is promoted within about
+/// three epochs and re-taken then, so this never fires. It exists for a
+/// finality stall, where the anchor would otherwise stay where the stall
+/// began and the replay above it would grow with the stall. Eight epochs is
+/// well above the promotion delay, so the refresh cannot starve promotion.
+const REORG_ANCHOR_REFRESH_BLOCKS: usize =
+    8 * bloch_pos_committee::params::SLOTS_PER_EPOCH as usize;
+
+/// One retained canonical post-state: `(canonical height, block id, state)`.
+type ReorgAnchor = (usize, [u8; 32], Arc<CommittedState>);
+
+/// Two older canonical post-states a deep reorg replays from instead of from
+/// genesis (finding FC-2).
+///
+/// [`REORG_STATE_WINDOW`] covers the head and its parent. A reorg whose
+/// common ancestor is older used to re-execute the whole chain from genesis
+/// on the consensus thread, so one depth-2 reorg stalled block import, RPC
+/// and duties for a full-chain replay. These anchors bound that replay to
+/// the blocks above the nearest one.
+///
+/// - `base` is at or below the finality latch. `do_reorg` refuses any cut
+///   below the latch, so `base` is at or below every ancestor a reorg can
+///   name and never leaves the canonical chain (the operator rewind override
+///   aside, which falls back to genesis as before).
+/// - `pending` is the head's post-state as of the last promotion. It serves
+///   every ancestor at or above it, and becomes `base` once the latch
+///   reaches it; the head is then taken as the new `pending`.
+///
+/// **Memory.** This is the budget [`REORG_STATE_WINDOW`] documents, and the
+/// cost here is at most TWO further states per node, never more. Each anchor
+/// is the `Arc` of a state that was live, so it is free when taken and
+/// becomes a real copy only once later blocks have moved the ledger; in the
+/// worst case that is two unshared states (measured at 128 MB each in that
+/// doc). Tracking the justified checkpoint exactly would need a third (the
+/// finalized, the justified and the next boundary), and the justified
+/// checkpoint of the head state can move down across a reorg, which the
+/// latch cannot.
+///
+/// An anchor is used only after checking that the canonical chain still has
+/// its block id at its height, so a stale entry can cost speed and never
+/// correctness: a block's post-state is a pure function of the block and its
+/// ancestry (see [`Engine::recent_states`]).
+#[derive(Default)]
+struct ReorgAnchors {
+    base: Option<ReorgAnchor>,
+    pending: Option<ReorgAnchor>,
+}
 
 /// Released finalized bodies after which [`return_freed_heap_to_os`] runs.
 const RELEASE_TRIM_THRESHOLD: usize = 1_024;
@@ -1732,6 +1784,8 @@ struct Engine {
     /// ([`KES_AUTHORITY_WINDOW`]). Keyed by block id for the same reason as
     /// `recent_states`: an entry can never describe another branch.
     kes_authorities: VecDeque<([u8; 32], u64, Option<u64>, Arc<BTreeMap<u32, bloch_pos_committee::kes::KesEntry>>)>,
+    /// Older canonical post-states for reorgs deeper than `recent_states`.
+    reorg_anchors: ReorgAnchors,
     /// Retained checkpoint registry proofs + built certificates for
     /// `getfinalitycertificate`. RPC-only; see `engine/finality_cert.rs`.
     finality_certs: finality_cert::FinalityCertStore,
@@ -5543,6 +5597,7 @@ impl Engine {
                 // adopted state finalizes something new. Outside `if live` on
                 // purpose — boot replay must rebuild the latch too.
                 self.ratchet_finalized();
+                self.retain_reorg_anchors();
                 // Counted, because `advance` needs to tell this shrinkage
                 // apart from the `retain` four lines down. These attestations
                 // leave the loose pool and stay visible to fork choice, which
@@ -5760,16 +5815,63 @@ impl Engine {
         if let Some((_, st)) = self.recent_states.iter().find(|(bid, _)| *bid == id) {
             return Arc::clone(st);
         }
-        Arc::new(self.replay_to(id))
+        // Deeper than the ring: start from the nearest retained anchor at or
+        // below the block, and from genesis only when none covers it.
+        let base = self
+            .chain
+            .iter()
+            .position(|(_, cid)| cid.as_bytes() == &id)
+            .and_then(|cut| self.reorg_anchor_at_or_below(cut));
+        match base {
+            Some((_, bid, st)) if bid == id => st,
+            base => Arc::new(self.replay_from(base, id)),
+        }
+    }
+
+    /// Maintain [`Engine::reorg_anchors`] after a canonical adoption (apply
+    /// or reorg), once the finality latch has been ratcheted. O(1).
+    fn retain_reorg_anchors(&mut self) {
+        let on_chain = |a: &ReorgAnchor| {
+            self.chain.get(a.0).is_some_and(|(_, cid)| cid.as_bytes() == &a.1)
+        };
+        let mut base = self.reorg_anchors.base.take().filter(on_chain);
+        let mut pending = self.reorg_anchors.pending.take().filter(on_chain);
+        // cannot underflow: the chain always holds genesis.
+        let head = self.chain.len().saturating_sub(1);
+        let floor = self.finalized_latch.map(|(h, _)| h);
+        if pending.as_ref().is_some_and(|p| floor.is_some_and(|f| p.0 as u64 <= f)) {
+            base = pending.take();
+        }
+        let stale = pending
+            .as_ref()
+            .is_none_or(|p| head.saturating_sub(p.0) >= REORG_ANCHOR_REFRESH_BLOCKS);
+        if stale && head > 0 {
+            // Free when taken: the live state, kept by handle.
+            pending = Some((head, *self.head_id().as_bytes(), self.state.arc()));
+        }
+        self.reorg_anchors = ReorgAnchors { base, pending };
+    }
+
+    /// The highest retained anchor at canonical height `cut` or below that is
+    /// still on the canonical chain.
+    fn reorg_anchor_at_or_below(&self, cut: usize) -> Option<ReorgAnchor> {
+        [&self.reorg_anchors.pending, &self.reorg_anchors.base]
+            .into_iter()
+            .flatten()
+            .filter(|a| a.0 <= cut)
+            .filter(|a| self.chain.get(a.0).is_some_and(|(_, cid)| cid.as_bytes() == &a.1))
+            .max_by_key(|a| a.0)
+            .cloned()
     }
 
     /// Rebuild a canonical block's post-state from genesis, re-executing the
     /// whole prefix through the same transition.
     ///
     /// This is what `do_reorg` used to do unconditionally, kept whole. It is
-    /// now the fallback for a reorg deeper than [`REORG_STATE_WINDOW`], and
-    /// it is also the reference the snapshot path is tested against — the
-    /// slow path staying correct is what lets the fast path be small.
+    /// now the last fallback for a reorg deeper than [`REORG_STATE_WINDOW`]
+    /// that no [`ReorgAnchors`] entry covers, and it is also the reference
+    /// the snapshot paths are tested against — the slow path staying correct
+    /// is what lets the fast path be small.
     // The four `expect`s below each name a canonical-chain invariant — the
     // target is canonical, canonical blocks are stored (`prune` skips them),
     // their bodies decoded and applied when they were adopted — and there is
@@ -5777,12 +5879,26 @@ impl Engine {
     // They stay COUNTED by the hardened ratchet on purpose: a panic site with
     // a hand proof is exactly what the ratchet exists to keep in view.
     fn replay_to(&self, id: [u8; 32]) -> CommittedState {
+        self.replay_from(None, id)
+    }
+
+    /// [`Engine::replay_to`]'s fold, started from `base` (a canonical block's
+    /// retained post-state at or below the target) instead of from genesis
+    /// when one is given. The same blocks go through the same transition in
+    /// the same order above the base, and the base is the fold's own value at
+    /// that block, so the result is the genesis replay's.
+    fn replay_from(&self, base: Option<ReorgAnchor>, id: [u8; 32]) -> CommittedState {
         let cut = self
             .chain
             .iter()
             .position(|(_, cid)| cid.as_bytes() == &id)
             .expect("replay target is canonical");
-        let mut st = self.manifest.genesis_state();
+        let (start, base) = match base.filter(|a| a.0 <= cut) {
+            Some((height, _, st)) => (height, st),
+            None => (0, Arc::new(self.manifest.genesis_state())),
+        };
+        // `None` until the first block above the base has been applied.
+        let mut st: Option<CommittedState> = None;
         let apply = |st: &CommittedState, env: &BlockEnvelope| {
             let envelope = ProposalEnvelope {
                 header: env.header.clone(),
@@ -5800,7 +5916,7 @@ impl Engine {
         // work proportional to retained history without changing the fold.
         // Released (finalized) bodies are streamed back from the block log a
         // page at a time instead.
-        let mut i = 1;
+        let mut i = start + 1;
         while i <= cut {
             let id = *self.chain[i].1.as_bytes();
             if self.blocks.is_hollow(&id) {
@@ -5808,16 +5924,18 @@ impl Engine {
                 while end <= cut && self.blocks.is_hollow(self.chain[end].1.as_bytes()) {
                     end += 1;
                 }
-                self.read_logged_canonical(i, end, |env| st = apply(&st, &env))
-                    .expect("released canonical bodies are readable from the block log");
+                self.read_logged_canonical(i, end, |env| {
+                    st = Some(apply(st.as_ref().unwrap_or(&base), &env))
+                })
+                .expect("released canonical bodies are readable from the block log");
                 i = end;
             } else {
                 let env = self.blocks.get(&id).expect("canonical block stored");
-                st = apply(&st, env);
+                st = Some(apply(st.as_ref().unwrap_or(&base), env));
                 i += 1;
             }
         }
-        st
+        st.unwrap_or_else(|| Arc::unwrap_or_clone(base))
     }
 
     // ── The finality latch (finding F-03) ───────────────────────────────────
@@ -6216,6 +6334,7 @@ impl Engine {
         // report LESS (a fork-point state always does); the ratchet ignores
         // that, which is what keeps the latch monotone across reorgs.
         self.ratchet_finalized();
+        self.retain_reorg_anchors();
         let cur_e = epoch_of(self.state.slot());
         self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
         self.revalidate_lifecycle_mempool();
@@ -7471,6 +7590,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
         recent_states: VecDeque::new(),
         kes_authorities: VecDeque::new(),
+        reorg_anchors: Default::default(),
         finality_certs: Default::default(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
@@ -11200,6 +11320,7 @@ mod transfer_v2_end_to_end {
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
         kes_authorities: VecDeque::new(),
+        reorg_anchors: Default::default(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
@@ -12584,6 +12705,7 @@ mod perf_support {
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
         kes_authorities: VecDeque::new(),
+        reorg_anchors: Default::default(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
@@ -14393,6 +14515,109 @@ mod reorg_state_tests {
         );
     }
 
+    /// FC-2: a reorg whose ancestor is older than the head's parent resolves
+    /// from a retained anchor, not from genesis, and lands on the state the
+    /// genesis replay computes.
+    ///
+    /// The anchors are observed two ways: by which one the selector names,
+    /// and by taking the block at height 1 out of the store, which the
+    /// genesis replay cannot do without (it would panic on the missing
+    /// block) and a replay that starts above it never reads.
+    #[test]
+    fn a_deep_reorg_replays_from_the_retained_anchor_not_from_genesis() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        for slot in 1..=3 {
+            engine.propose(slot);
+        }
+        let id_at = |engine: &Engine, h: usize| *engine.chain[h].1.as_bytes();
+        assert_eq!(
+            engine.reorg_anchors.pending.as_ref().map(|a| (a.0, a.1)),
+            Some((1, id_at(&engine, 1))),
+            "the first applied block is taken as the pending anchor"
+        );
+        assert!(engine.reorg_anchors.base.is_none(), "nothing is final yet");
+
+        // As if finality had reached height 3 (signing two epochs of votes
+        // is not what this test is about): the next adoption promotes the
+        // pending anchor and takes the head in its place.
+        engine.finalized_latch = Some((3, id_at(&engine, 3)));
+        for slot in 4..=8 {
+            engine.propose(slot);
+        }
+        assert_eq!(engine.chain.len(), 9);
+        assert_eq!(engine.reorg_anchors.base.as_ref().map(|a| a.0), Some(1));
+        assert_eq!(engine.reorg_anchors.pending.as_ref().map(|a| a.0), Some(4));
+        let start = |engine: &Engine, cut: usize| {
+            engine.reorg_anchor_at_or_below(cut).map(|a| a.0)
+        };
+        assert_eq!(start(&engine, 6), Some(4), "nearest anchor at or below the target");
+        assert_eq!(start(&engine, 3), Some(1), "below the pending anchor: the base");
+        assert_eq!(start(&engine, 0), None, "nothing covers genesis: genesis replay");
+
+        // The reference: the unchanged replay from genesis.
+        let targets = [3usize, 4, 6];
+        let expected: Vec<CommittedState> =
+            targets.iter().map(|&h| engine.replay_to(id_at(&engine, h))).collect();
+
+        let first = id_at(&engine, 1);
+        let taken = engine.blocks.remove(&first).expect("height 1 is stored");
+        for (&h, want) in targets.iter().zip(&expected) {
+            let id = id_at(&engine, h);
+            assert!(
+                !engine.recent_states.iter().any(|(bid, _)| *bid == id),
+                "height {h}: fixture — the target must be older than the head's parent"
+            );
+            let got = engine.state_at_canonical(id);
+            assert_eq!(*got, *want, "height {h}: anchored replay differs from the genesis replay");
+            assert_eq!(
+                got.state_root(),
+                engine.blocks.get(&id).expect("target is stored").header.state_root,
+                "height {h}: anchored replay differs from the committed state root"
+            );
+        }
+
+        // The reorg itself: give back everything above height 6, an ancestor
+        // two below the head's parent and above the finalized boundary.
+        let ancestor = id_at(&engine, 6);
+        assert!(engine.do_reorg(ancestor, Vec::new()), "the reorg is adopted");
+        assert_eq!(*engine.state, expected[2], "the reorg landed on a different state");
+        assert_eq!(*engine.head_id().as_bytes(), ancestor);
+        assert_eq!(
+            engine.reorg_anchors.pending.as_ref().map(|a| a.0),
+            Some(4),
+            "an anchor still on the canonical chain survives the reorg"
+        );
+
+        // An anchor above the cut has left the chain: it is dropped, never
+        // served, and the head is taken in its place.
+        engine.blocks.insert(first, taken);
+        let ancestor = id_at(&engine, 2);
+        // The latch is moved aside so this cut is allowed.
+        engine.finalized_latch = Some((2, ancestor));
+        assert!(engine.do_reorg(ancestor, Vec::new()), "the reorg is adopted");
+        assert_eq!(engine.reorg_anchors.base.as_ref().map(|a| a.0), Some(1));
+        assert_eq!(engine.reorg_anchors.pending.as_ref().map(|a| (a.0, a.1)), Some((2, ancestor)));
+    }
+
+    /// No anchor at or below the target: the genesis replay still answers,
+    /// so a node is never worse off than before the anchors existed.
+    #[test]
+    fn a_block_no_anchor_covers_still_replays_from_genesis() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        for slot in 1..=6 {
+            engine.propose(slot);
+        }
+        let target = *engine.chain[3].1.as_bytes();
+        let expected = engine.replay_to(target);
+        // An anchor that is not this chain's block at its height is ignored.
+        engine.reorg_anchors.base = None;
+        engine.reorg_anchors.pending = Some((2, [0xAB; 32], engine.state.arc()));
+        assert!(engine.reorg_anchor_at_or_below(3).is_none());
+        assert_eq!(*engine.state_at_canonical(target), expected);
+        engine.reorg_anchors.pending = None;
+        assert_eq!(*engine.state_at_canonical(target), expected);
+    }
+
     /// The deep-reorg fallback must borrow canonical bodies from the block
     /// store instead of first cloning the entire prefix into a temporary
     /// aggregate. The behavioural half above proves the borrowed fold is the
@@ -14911,6 +15136,7 @@ mod duty_view_anchor {
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
         kes_authorities: VecDeque::new(),
+        reorg_anchors: Default::default(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
@@ -15183,6 +15409,7 @@ mod slot_horizon {
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
         kes_authorities: VecDeque::new(),
+        reorg_anchors: Default::default(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
