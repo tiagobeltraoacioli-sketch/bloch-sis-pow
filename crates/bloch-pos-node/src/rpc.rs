@@ -1285,10 +1285,13 @@ impl EngineBackend {
         // Matched BEFORE the state is cloned, so a request that must go to the
         // loop does not even touch the lock.
         match req {
-            RpcRequest::Balance(_)
-            | RpcRequest::Utxos { .. }
-            | RpcRequest::TxOut { .. }
-            | RpcRequest::Validator(_)
+            RpcRequest::Balance(_) | RpcRequest::Utxos { .. } | RpcRequest::TxOut { .. } => {
+                // Ledger replies carry the node's finality line. Without a
+                // published summary to read it from, the loop answers: it
+                // owns the chain and derives the line itself.
+                self.block_count.as_ref()?;
+            }
+            RpcRequest::Validator(_)
             | RpcRequest::ValidatorCount
             | RpcRequest::ValidatorByKey(_)
             | RpcRequest::ValidatorAdmission
@@ -1314,10 +1317,28 @@ impl EngineBackend {
             RpcRequest::ValidatorAdmission => Some(Ok(validator_admission_json(&state))),
             RpcRequest::FundedDelegation(position) => Some(Ok(funded_delegation_json(&state, *position))),
             RpcRequest::Validators => Some(Ok(validator_registry_json(&state))),
-            RpcRequest::TxOut { txid, vout } => Some(Ok(txout_json(&state, txid, *vout))),
-            RpcRequest::Balance(script_hash) => Some(Ok(balance_json(&state, script_hash))),
-            RpcRequest::Utxos { script_hash, limit } => {
-                Some(Ok(utxos_json(&state, script_hash, *limit)))
+            RpcRequest::TxOut { .. } | RpcRequest::Balance(_) | RpcRequest::Utxos { .. } => {
+                // The finality line comes whole from the published
+                // `getblockcount` generation (height and epoch from one
+                // publication, never one from each). A summary this code
+                // cannot read is not guessed at: the loop answers instead.
+                let line = {
+                    let published = self.block_count.as_ref()?;
+                    let guard = match published.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    FinalityLine::from_block_count(&guard)?
+                };
+                let body = match req {
+                    RpcRequest::TxOut { txid, vout } => txout_json(&state, txid, *vout),
+                    RpcRequest::Balance(script_hash) => balance_json(&state, script_hash),
+                    RpcRequest::Utxos { script_hash, limit } => {
+                        utxos_json(&state, script_hash, *limit)
+                    }
+                    _ => return None,
+                };
+                Some(Ok(with_read_point(body, &state, line)))
             }
             _ => None,
         }
@@ -3125,6 +3146,63 @@ pub fn txout_json(state: &CommittedState, txid: &[u8; 32], vout: u32) -> Json {
             ("at_slot", Json::u(state.slot())),
         ]),
     }
+}
+
+/// This node's finality line, as `getblockcount` reports it: the canonical
+/// height of the finalized checkpoint (`None` when the node cannot place that
+/// checkpoint on its own canonical chain) and the finalized epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FinalityLine {
+    pub finalized_height: Option<u64>,
+    pub finalized_epoch: u64,
+}
+
+impl FinalityLine {
+    /// Read the line out of one published `getblockcount` answer.
+    ///
+    /// `None` unless both fields are present and well-formed. An absent
+    /// `finalized_height` must not be confused with its `null`, which is a
+    /// real statement (the checkpoint is not on this node's chain) that
+    /// integrators are told to halt on.
+    pub(crate) fn from_block_count(summary: &Json) -> Option<Self> {
+        let finalized_height = match summary.get("finalized_height")? {
+            Json::Null => None,
+            other => Some(other.as_u64()?),
+        };
+        let finalized_epoch = summary.get("finalized_epoch")?.as_u64()?;
+        Some(FinalityLine { finalized_height, finalized_epoch })
+    }
+}
+
+/// Say where a ledger read (`getbalance`, `getutxos`/`listunspent`,
+/// `gettxout`) was taken and where finality stands.
+///
+/// Those methods answer from the **unfinalized head state**. Without these
+/// fields a reply looked the same whether the output it reported was merely
+/// included or settled, and an integrator crediting on `getbalance` alone was
+/// crediting on inclusion. Added, never renamed:
+///
+/// - `at_slot` — the slot of the state the answer was read from (already on
+///   `gettxout`; left as it was there).
+/// - `finalized_height`, `finalized_epoch` — the node's finality line, same
+///   names and representation as `getblockcount`, `finalized_height: null`
+///   included.
+///
+/// The line is the node's, not a property of the reply's contents: nothing
+/// here says the outputs listed are final. On the published-head path it is
+/// read from the `getblockcount` summary, which is published just after the
+/// state, so it can be one block apart from `at_slot`.
+pub fn with_read_point(body: Json, state: &CommittedState, line: FinalityLine) -> Json {
+    let Json::Obj(mut fields) = body else { return body };
+    if !fields.iter().any(|(k, _)| k == "at_slot") {
+        fields.push(("at_slot".to_string(), Json::u(state.slot())));
+    }
+    fields.push((
+        "finalized_height".to_string(),
+        line.finalized_height.map_or(Json::Null, Json::u),
+    ));
+    fields.push(("finalized_epoch".to_string(), Json::u(line.finalized_epoch)));
+    Json::Obj(fields)
 }
 
 /// `getmempoolinfo`.

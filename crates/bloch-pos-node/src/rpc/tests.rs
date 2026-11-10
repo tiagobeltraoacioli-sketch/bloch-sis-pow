@@ -651,7 +651,12 @@ fn state_only_reads_are_served_off_the_published_head() {
     let (tx, rx) = std::sync::mpsc::channel();
     drop(rx); // there is no consensus thread; every send from here on fails.
 
-    let backend = EngineBackend::with_head(tx, head);
+    // Ledger replies carry the finality line, which the connection thread
+    // reads from the published `getblockcount` summary, so this backend
+    // publishes one (RPC-6).
+    let published: SharedBlockCount =
+        Arc::new(StdMutex::new(block_count_json(17, 23, Some(11), 2, 1)));
+    let backend = EngineBackend::with_published(tx, head, published);
 
     let v = backend
         .call(RpcRequest::Balance([0xAB; 32]))
@@ -769,6 +774,108 @@ fn build_info_is_answered_before_the_engine_queue() {
         backend.call(RpcRequest::ChainInfo).is_err(),
         "chain-owned reads must still cross the unavailable engine queue"
     );
+}
+
+/// **RPC-6.** `getbalance`, `getutxos` and `gettxout` answer from the
+/// unfinalized head. Each reply must say which slot it was read at and where
+/// the node's finality line is, in `getblockcount`'s names and representation,
+/// without renaming or dropping a field that was already there.
+#[test]
+fn ledger_reads_report_the_read_slot_and_the_finality_line() {
+    let st = state_with_balances();
+    let line = FinalityLine { finalized_height: Some(11), finalized_epoch: 1 };
+
+    let bare = balance_json(&st, &[0xAB; 32]);
+    let v = with_read_point(bare.clone(), &st, line);
+    assert_eq!(v.get("at_slot").unwrap().as_u64(), Some(st.slot()));
+    assert_eq!(v.get("finalized_height").unwrap().as_u64(), Some(11));
+    assert_eq!(v.get("finalized_epoch").unwrap().as_u64(), Some(1));
+    // Additive: every field of the old reply is still there, unchanged and in
+    // the same order, ahead of the new ones.
+    let (Json::Obj(before), Json::Obj(after)) = (&bare, &v) else { panic!("objects") };
+    assert_eq!(&after[..before.len()], &before[..]);
+    assert_eq!(after.len(), before.len() + 3);
+
+    let bare = utxos_json(&st, &[0xAB; 32], 2);
+    let u = with_read_point(bare.clone(), &st, line);
+    assert_eq!(u.get("at_slot").unwrap().as_u64(), Some(st.slot()));
+    assert_eq!(u.get("finalized_height").unwrap().as_u64(), Some(11));
+    assert_eq!(u.get("finalized_epoch").unwrap().as_u64(), Some(1));
+    let (Json::Obj(before), Json::Obj(after)) = (&bare, &u) else { panic!("objects") };
+    assert_eq!(&after[..before.len()], &before[..]);
+
+    // `gettxout` already had `at_slot`: it is kept, not repeated — for an
+    // output that exists and for one that does not.
+    let existing = st.eutxos().next().expect("the fixture has outputs");
+    for bare in [
+        txout_json(&st, &existing.txid, existing.vout),
+        txout_json(&st, &[0x5A; 32], 9),
+    ] {
+        let t = with_read_point(bare.clone(), &st, line);
+        let (Json::Obj(before), Json::Obj(after)) = (&bare, &t) else { panic!("objects") };
+        assert_eq!(&after[..before.len()], &before[..]);
+        assert_eq!(after.iter().filter(|(k, _)| k == "at_slot").count(), 1);
+        assert_eq!(t.get("at_slot").unwrap().as_u64(), Some(st.slot()));
+        assert_eq!(t.get("finalized_height").unwrap().as_u64(), Some(11));
+        assert_eq!(t.get("finalized_epoch").unwrap().as_u64(), Some(1));
+    }
+
+    // A checkpoint the node cannot place on its chain is `null`, exactly as
+    // on `getblockcount` — present, not omitted, and not a zero.
+    let unplaced = FinalityLine { finalized_height: None, finalized_epoch: 4 };
+    let v = with_read_point(balance_json(&st, &[0xAB; 32]), &st, unplaced);
+    assert_eq!(v.get("finalized_height"), Some(&Json::Null));
+    assert_eq!(v.get("finalized_epoch").unwrap().as_u64(), Some(4));
+}
+
+/// The published-head path takes the finality line whole from the published
+/// `getblockcount` generation, and never invents one: with no summary, or one
+/// it cannot read, the ledger read goes to the loop (here: fails, because
+/// nothing is listening) while other state-only reads still answer.
+#[test]
+fn published_ledger_reads_take_the_finality_line_from_the_published_summary() {
+    use std::sync::Mutex as StdMutex;
+
+    let st = Arc::new(state_with_balances());
+    let existing = st.eutxos().next().expect("the fixture has outputs");
+    let (txid, vout) = (existing.txid, existing.vout);
+    let requests = || {
+        [
+            RpcRequest::Balance([0xAB; 32]),
+            RpcRequest::Utxos { script_hash: [0xAB; 32], limit: 2 },
+            RpcRequest::TxOut { txid, vout },
+        ]
+    };
+    let backend_with = |summary: Option<Json>| {
+        let head: crate::engine::SharedHead = Arc::new(StdMutex::new(Arc::clone(&st)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        match summary {
+            Some(json) => EngineBackend::with_published(tx, head, Arc::new(StdMutex::new(json))),
+            None => EngineBackend::with_head(tx, head),
+        }
+    };
+
+    for (finalized_height, expected) in [(Some(11), Json::u(11)), (None, Json::Null)] {
+        let backend = backend_with(Some(block_count_json(17, 23, finalized_height, 2, 1)));
+        for req in requests() {
+            let v = backend.call(req).expect("answered with no consensus thread listening");
+            assert_eq!(v.get("at_slot").unwrap().as_u64(), Some(st.slot()));
+            assert_eq!(v.get("finalized_height"), Some(&expected));
+            assert_eq!(v.get("finalized_epoch").unwrap().as_u64(), Some(1));
+        }
+    }
+
+    for summary in [None, Some(Json::obj(vec![("height", Json::u(17))])), Some(Json::Null)] {
+        let backend = backend_with(summary);
+        for req in requests() {
+            assert!(
+                backend.call(req).is_err(),
+                "a ledger read with no readable finality line must cross to the loop,                  not answer without one"
+            );
+        }
+        assert!(backend.call(RpcRequest::ValidatorCount).is_ok());
+    }
 }
 
 /// The block-count polling response is one complete published generation and

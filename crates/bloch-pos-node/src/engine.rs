@@ -6770,6 +6770,15 @@ impl Engine {
         self.height_of(&self.state.finality().finalized.root)
     }
 
+    /// The finality line ledger reads report next to their answer: the same
+    /// two values `getblockcount` carries, derived the same way.
+    fn finality_line(&self) -> rpc::FinalityLine {
+        rpc::FinalityLine {
+            finalized_height: self.finalized_height(),
+            finalized_epoch: self.state.finality().finalized.epoch,
+        }
+    }
+
     /// The genesis block as an envelope.
     ///
     /// Genesis is synthesised from the manifest and never stored in `blocks`
@@ -6893,13 +6902,23 @@ impl Engine {
 
             RpcRequest::ValidatorCount => Ok(rpc::validator_count_json(&self.state)),
 
-            RpcRequest::Balance(script_hash) => Ok(rpc::balance_json(&self.state, &script_hash)),
+            RpcRequest::Balance(script_hash) => Ok(rpc::with_read_point(
+                rpc::balance_json(&self.state, &script_hash),
+                &self.state,
+                self.finality_line(),
+            )),
 
-            RpcRequest::Utxos { script_hash, limit } => {
-                Ok(rpc::utxos_json(&self.state, &script_hash, limit))
-            }
+            RpcRequest::Utxos { script_hash, limit } => Ok(rpc::with_read_point(
+                rpc::utxos_json(&self.state, &script_hash, limit),
+                &self.state,
+                self.finality_line(),
+            )),
 
-            RpcRequest::TxOut { txid, vout } => Ok(rpc::txout_json(&self.state, &txid, vout)),
+            RpcRequest::TxOut { txid, vout } => Ok(rpc::with_read_point(
+                rpc::txout_json(&self.state, &txid, vout),
+                &self.state,
+                self.finality_line(),
+            )),
 
             RpcRequest::SendRawTransaction(tx) => {
                 let canonical = tx.canonical_bytes();

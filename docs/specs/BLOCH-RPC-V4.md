@@ -254,6 +254,26 @@ types (`DepositTx` with suite-tagged pubkey + proof-of-possession, `ExitTx`,
 `estimatefee`, `estimatefeeadvanced`, `getpeerinfo`, `getpeers`,
 `getattestation` (TEE — see §5), and the feature-gated `euvm_*` trio.
 
+**Ledger reads state their read point (2026-11-10).** In `bloch-pos`,
+`getbalance`, `getutxos` / `listunspent` and `gettxout` answer from the
+**unfinalized head state**, so by R1 they must not look like a settled answer.
+Each reply carries, in addition to its existing fields (none renamed or
+removed):
+
+- `at_slot` — the slot of the head state the answer was read from (already
+  present on `gettxout`).
+- `finalized_height` (integer or `null`) and `finalized_epoch` — the node's
+  finality line, with the names and representation `getblockcount` uses;
+  `null` means the node cannot place the finalized checkpoint on its own
+  canonical chain.
+
+The finality line is the node's, not a property of the outputs returned: an
+output is final only when its containing block is at or below the finalized
+checkpoint (`gettxstatus`, or the block's `finalized`). On the path that
+serves these reads without the consensus thread the line is taken whole from
+the published `getblockcount` answer, which is published just after the
+state; it can therefore be one block apart from `at_slot`.
+
 ---
 
 ## 4. New — staking, delegation, commission, finality

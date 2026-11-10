@@ -114,6 +114,30 @@ address string. Convert each deposit address once (§5.1), then:
 | List | `getutxos [script_hash, limit]` (alias `listunspent`) | Up to 1,000 per call, `truncated` tells you if there are more. Each entry has `txid`, `vout`, `value_sat`, `script_hash`. |
 | One output | `gettxout [txid, vout]` | `unspent`, `utxo{txid,vout,value_sat,script_hash}`. `at_slot` is the node's head slot, not the output's inclusion slot. |
 
+**These three calls answer from the node's unfinalized head state.** A
+balance or output they report is *included*, not *finalized*, and can still
+be reorganized out. Nodes built from a release that carries the 2026-11-10
+change add three fields to each of the three replies (nothing was renamed or
+removed; older nodes simply do not send them, except `at_slot` on
+`gettxout`):
+
+| Field | Meaning |
+| --- | --- |
+| `at_slot` | Slot of the head state the answer was read from. |
+| `finalized_height` | Height of this node's finalized checkpoint block on its canonical chain, or `null`: the same value and representation as in `getblockcount` and `getchaininfo`. |
+| `finalized_epoch` | This node's finalized epoch, as in `getblockcount`. |
+
+The two `finalized_*` fields describe the **node's finality line, not the
+outputs in the reply**: they do not say that a listed output is final. Use
+them to see, in the same reply, that the answer is ahead of finality and by
+how much, and to stop on `finalized_height: null` with `finalized_epoch` > 0
+(§3.2). An output is final only when the block that carries it is at or
+below the finalized checkpoint, which is what `gettxstatus` = `finalized`
+and a block's `"finalized": true` (compare its `height` with
+`finalized_height`) report. The crediting rule in §3.2 is unchanged. The
+finality line is published one step after the state, so it can be one block
+apart from `at_slot`.
+
 Any transaction kind can create an output to your `script_hash`: transfers
 (`0x01`, `0x06`), validator payouts (`0x0D`), L2 withdrawal claims (`0x16`,
 vout 0), and, only after an emergency gate that is not armed, a
