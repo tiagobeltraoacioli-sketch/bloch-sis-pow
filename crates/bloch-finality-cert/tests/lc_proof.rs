@@ -502,7 +502,9 @@ fn the_released_certificate_verifier_refuses_kes_votes() {
     let b = build(&kes_world(8700), &ALL, false, true);
     let anchors = bloch_finality_cert::TrustAnchors::new([b.src_id]);
     let err = bloch_finality_cert::verify(&b.proof.cert, &anchors, &bloch_finality_cert::HybridSigCheck).unwrap_err();
-    assert!(matches!(err, bloch_finality_cert::Refusal::BadSignature { validator: 0, .. }), "{err:?}");
+    // FC-6: refused by epoch before any vote is read (it used to fail on the
+    // first KES signature), naming the verifier that can judge it.
+    assert!(matches!(err, bloch_finality_cert::Refusal::UseLcProofVerifier { target_epoch: 8701, .. }), "{err:?}");
     assert!(run(&build(&kes_world(8700), &ALL, true, true)).is_ok());
 }
 
@@ -516,8 +518,59 @@ fn the_released_certificate_verifier_refuses_hf2_votes_and_this_one_does_not() {
     let b = build(&w, &ALL, false, false);
     let anchors = bloch_finality_cert::TrustAnchors::new([b.src_id]);
     let err = bloch_finality_cert::verify(&b.proof.cert, &anchors, &bloch_finality_cert::HybridSigCheck).unwrap_err();
-    assert!(matches!(err, bloch_finality_cert::Refusal::BadSignature { validator: 0, .. }), "{err:?}");
+    // FC-6: HF2 is past the frozen-set gate, so the epoch ceiling refuses
+    // first (it used to fail on the first bound-form signature).
+    assert!(matches!(err, bloch_finality_cert::Refusal::UseLcProofVerifier { .. }), "{err:?}");
     assert!(run(&build(&w, &ALL, true, false)).is_ok(), "policy-aware");
+}
+
+/// FC-6. The bare certificate verifier counts bond weights and v1 static
+/// signatures. From the frozen-set gate the chain's quorum is the frozen
+/// set's, so a certificate with a link target at or past the gate is refused
+/// outright, with an error naming `lc_proof::verify`; below it the bare
+/// verifier still accepts, with the bond verdict `lc_proof` gives.
+#[test]
+fn the_bare_verifier_refuses_targets_from_the_frozen_set_gate() {
+    use bloch_finality_cert::{HybridSigCheck, Refusal as Bare, TrustAnchors};
+    let gate = params::HF1_FROZEN_FINALITY_SET_EPOCH;
+    let voters: Vec<(u32, Sig)> = (0..4).map(|v| (v, Sig::StaticV1)).collect();
+    let world = |epoch| {
+        let mut w = kes_world(epoch);
+        w.kes = vec![];
+        w.enforced = None;
+        w
+    };
+    let bare = |b: &Built| bloch_finality_cert::verify(&b.proof.cert, &TrustAnchors::new([b.src_id]), &HybridSigCheck);
+
+    // Both link targets below the gate (E = gate-2, E+1 = gate-1): accepted,
+    // and it is the verdict the gate-aware verifier reaches under bonds.
+    let below = build(&world(gate - 2), &voters, false, false);
+    let v = bare(&below).expect("below the gate the bare verifier still verifies");
+    let lc = run(&below).unwrap();
+    assert_eq!(lc.weights, Weights::Bond);
+    assert_eq!((v.epoch, v.root, v.stake, v.votes), (lc.epoch, lc.root, lc.stake, lc.votes));
+
+    // The finalizing link's target is the gate epoch (E = gate-1), the
+    // checkpoint itself is (E = gate), and well past it: all refused, even
+    // though these v1 votes would pass the bond rule.
+    for e in [gate - 1, gate, gate + 1, gate + 500] {
+        let b = build(&world(e), &voters, false, false);
+        let err = bare(&b).unwrap_err();
+        assert_eq!(err, Bare::UseLcProofVerifier { target_epoch: e + 1, gate_epoch: gate }, "E = {e}");
+        let text = err.to_string();
+        assert!(text.contains("bloch_finality_cert::lc_proof::verify"), "{text}");
+        assert!(text.contains("bloch-finality-verify"), "{text}");
+        // The chain mode refuses the same way, at the offending certificate.
+        let mut anchors = TrustAnchors::new([b.src_id]);
+        let chained = bloch_finality_cert::verify_chain(&[b.proof.cert.clone()], &mut anchors, &HybridSigCheck);
+        assert_eq!(chained.unwrap_err(), (0, err));
+    }
+
+    // The ceiling is an epoch rule, not a verdict on the contents: a
+    // malformed certificate is still reported as malformed.
+    let mut b = build(&world(gate), &voters, false, false);
+    b.proof.cert.links[1].target_epoch += 1;
+    assert!(matches!(bare(&b).unwrap_err(), Bare::LinkShape(_)));
 }
 
 /// A voter the set source does not know, or one already out at the target,

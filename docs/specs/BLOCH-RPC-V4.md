@@ -418,7 +418,13 @@ against the state root of the certificate's set-source block.
   e7360. Bytes that do not match the tree's leaf are never served.
 
 `bloch-finality-verify` reads either format and applies each vote's epoch
-policy, with the certificate alone accepted only below e7180. The earlier
+policy, with the certificate alone accepted only below e7180. The library's
+bare certificate verifier (`bloch_finality_cert::verify` / `verify_chain`,
+bond weights and v1 static signatures) enforces that ceiling itself since
+2026-11-10: it refuses a certificate with a link target at or past
+`params::HF1_FROZEN_FINALITY_SET_EPOCH` with `UseLcProofVerifier`, so the
+highest checkpoint it accepts is e7178 (finalizing link target e7179).
+Integrators call `lc_proof::verify` (the entry point the CLI uses). The earlier
 verifier checked the v1 form only, so it refuses every certificate whose votes
 are in the bound form, from HF2 (e7270).
 

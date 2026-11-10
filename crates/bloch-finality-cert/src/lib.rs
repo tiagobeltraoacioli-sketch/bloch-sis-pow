@@ -41,6 +41,18 @@
 //! premise — while a chain that finalized *only* thanks to a leak-shrunk
 //! denominator yields a certificate this verifier refuses. That is the safe
 //! direction for an exchange.
+//!
+//! ## Epoch ceiling of the bare verifier
+//!
+//! [`verify`] / [`verify_chain`] judge a certificate by bond weights and v1
+//! static signatures, which is the chain's premise only below the frozen
+//! finality set gate (`params::HF1_FROZEN_FINALITY_SET_EPOCH`). From that
+//! epoch on the chain measures the quorum against a frozen set whose weights
+//! disagree with the bonds in both directions, so the bare verifier refuses
+//! any certificate with a link target at or past the gate
+//! ([`Refusal::UseLcProofVerifier`]) rather than apply a rule the chain does
+//! not. The entry point for those epochs is [`lc_proof::verify`] (CLI
+//! `bloch-finality-verify`), which follows the gates.
 
 pub mod lc_proof;
 pub mod state;
@@ -399,11 +411,27 @@ pub enum Refusal {
     BadSignature { link: usize, validator: u32 },
     InsufficientStake { link: usize, signed: u128, total: u128 },
     AncestryBroken { at: usize },
+    /// A link targets an epoch at or past the frozen finality set gate
+    /// (`params::HF1_FROZEN_FINALITY_SET_EPOCH`, reported as `gate_epoch`).
+    /// From there the chain's quorum is the frozen set's, not the bonds this
+    /// verifier counts, and votes stop being v1 static signatures: this
+    /// verifier does not judge such a certificate at all. Use
+    /// [`lc_proof::verify`] (CLI `bloch-finality-verify`).
+    UseLcProofVerifier { target_epoch: u64, gate_epoch: u64 },
 }
 
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Refusal::UseLcProofVerifier { target_epoch, gate_epoch } => write!(
+                f,
+                "UseLcProofVerifier: link target epoch {target_epoch} is at or past the frozen \
+                 finality set gate (epoch {gate_epoch}); bloch_finality_cert::verify counts bond \
+                 weights and v1 static signatures, which is not the chain's quorum rule there. \
+                 Verify with bloch_finality_cert::lc_proof::verify (CLI bloch-finality-verify)"
+            ),
+            other => write!(f, "{other:?}"),
+        }
     }
 }
 
@@ -427,6 +455,11 @@ fn id(h: &BlockHeaderV4) -> [u8; 32] {
 }
 
 /// Verify `cert` under `anchors`. Pure: no clock, no I/O, no global state.
+///
+/// Only for certificates whose link targets are both below the frozen
+/// finality set gate; at or past it this returns
+/// [`Refusal::UseLcProofVerifier`] and [`lc_proof::verify`] is the entry
+/// point (see the crate docs, "Epoch ceiling of the bare verifier").
 pub fn verify(cert: &Certificate, anchors: &TrustAnchors, sigs: &dyn SigCheck) -> Result<Verified, Refusal> {
     let [l0, l1] = &cert.links;
     let e = l0.target_epoch;
@@ -440,6 +473,16 @@ pub fn verify(cert: &Certificate, anchors: &TrustAnchors, sigs: &dyn SigCheck) -
     }
     if e.checked_add(1) != Some(l1.target_epoch) {
         return Err(Refusal::LinkShape("finalizing link is not consecutive"));
+    }
+    // Epoch ceiling. The chain counts the votes of an epoch at or past the
+    // frozen-set gate against the frozen set (`finality.rs`, keyed on the
+    // votes' target epoch), and `l1` has the later target of the two links.
+    // The gate is read from `params`, the constant the chain and `lc_proof`
+    // use, so a build with another gate moves this with it; an inert gate
+    // (`u64::MAX`) never refuses.
+    let gate = bloch_pos_committee::params::HF1_FROZEN_FINALITY_SET_EPOCH;
+    if bloch_pos_committee::params::epoch_gate_active(l1.target_epoch, gate) {
+        return Err(Refusal::UseLcProofVerifier { target_epoch: l1.target_epoch, gate_epoch: gate });
     }
     if id(&cert.checkpoint_header) != l0.target_root {
         return Err(Refusal::CheckpointMismatch);
