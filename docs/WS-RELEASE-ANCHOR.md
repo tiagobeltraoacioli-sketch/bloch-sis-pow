@@ -84,6 +84,13 @@ curl -s -X POST http://139.180.173.231:8080 -H 'content-type: application/json' 
 bloch-pos ws-checkpoint --release-anchor --genesis genesis/mainnet.manifest --rpc 80.240.16.185:8080,199.247.22.8:8080,139.180.173.231:8080 --epoch <E> --out release-anchor-<E>
 ```
 
+   `--release-anchor` refuses fewer than two distinct `--rpc` endpoints, and
+   refuses if they disagree on the boundary slot or roots. It also aborts,
+   naming the slot, if any endpoint fails to answer for a slot in the
+   boundary scan with anything other than the explicit empty-slot code;
+   re-run when the endpoint is healthy. Never mint the anchor you bake with
+   `--allow-single-rpc`.
+
 3. The tool prints `RELEASE_ANCHOR_HEX = <hex>`. Put that hex into
    `crates/bloch-pos-node/src/ws_release_anchor.rs` as the value of
    `RELEASE_ANCHOR_HEX`, and commit it alone with the epoch and block root in
@@ -110,10 +117,12 @@ cargo test --locked -p bloch-pos-node --bin bloch-pos --features ws-release-anch
    This is the only check that compares the baked state root with a block
    the node validated itself.
 
-Anyone with a synced node can re-derive the same bytes:
+Anyone with a synced node can re-derive the same bytes. A single endpoint is
+refused by default; `--allow-single-rpc` is the explicit override for this
+check, where the release notes are the second witness:
 
 ```
-bloch-pos ws-checkpoint --release-anchor --genesis genesis/mainnet.manifest --rpc <their-node>:8080 --epoch <E> --issued-at <issued_at from the release notes> --out check-<E>
+bloch-pos ws-checkpoint --release-anchor --allow-single-rpc --genesis genesis/mainnet.manifest --rpc <their-node>:8080 --epoch <E> --issued-at <issued_at from the release notes> --out check-<E>
 ```
 
 ## Cadence

@@ -185,11 +185,107 @@ fn parse_hex32(s: &str, what: &str) -> Result<[u8; 32], String> {
 
 // ─── JSON-RPC client (the subset the ceremony needs) ────────────────────────
 
+/// Why one JSON-RPC call failed. The boundary scan must tell "this slot is
+/// empty" (the server said so, with its own code) from "this slot could not be
+/// read" (anything else); a flat string made the two indistinguishable, and a
+/// timeout at the true boundary slot then selected an earlier block.
+#[derive(Debug)]
+enum RpcError {
+    /// The node answered with a JSON-RPC error object. `code` is the server's
+    /// `error.code` when it sent an integer one.
+    Server { code: Option<i64>, context: String },
+    /// The read or write deadline passed before a complete response arrived.
+    Timeout(String),
+    /// The response exceeded the size cap and was not parsed.
+    Oversized(String),
+    /// Everything else between the socket and a JSON-RPC envelope: connect or
+    /// send failure, a truncated or malformed HTTP response, a non-200
+    /// status, bad JSON, a reply with neither `result` nor `error`.
+    Transport(String),
+}
+
+impl RpcError {
+    /// The JSON-RPC error code, only when the server itself sent one.
+    fn code(&self) -> Option<i64> {
+        match self {
+            RpcError::Server { code, .. } => *code,
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RpcError::Server { context, .. } => write!(f, "{context}"),
+            RpcError::Timeout(m) => write!(f, "{m} (timeout)"),
+            RpcError::Oversized(m) | RpcError::Transport(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl From<RpcError> for String {
+    fn from(e: RpcError) -> String {
+        e.to_string()
+    }
+}
+
+/// Largest HTTP response (head and body) `rpc_call` will read. The replies
+/// this tool consumes are `getchaininfo` and `getblockbyslot`
+/// (`rpc::chain_info_json`, `rpc::block_json`): fixed-shape objects of a few
+/// 32-byte hex roots and integers, under 2 KiB each, with no field that grows
+/// with chain or block content. 64 KiB is more than thirty times that, and
+/// still small enough that an endpoint cannot make the tool buffer without
+/// bound.
+const MAX_RPC_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Why [`read_http_response`] produced no response.
+pub(crate) enum ReadFail {
+    /// More than the cap arrived.
+    TooLarge,
+    /// The socket deadline passed with the response still incomplete.
+    Timeout,
+    /// The connection failed or closed with the response still incomplete.
+    Io(String),
+}
+
+/// Read one `Connection: close` HTTP response, refusing more than `cap`
+/// bytes. EOF is the normal end. A read error after a response that is
+/// complete by its own `Content-Length` is tolerated, because the bytes in
+/// hand are what matter; a response cut short is an error, never a shorter
+/// answer.
+pub(crate) fn read_http_response(sock: &mut TcpStream, cap: usize) -> Result<Vec<u8>, ReadFail> {
+    let mut raw = Vec::new();
+    let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+    let read = sock.take(limit).read_to_end(&mut raw);
+    if raw.len() > cap {
+        return Err(ReadFail::TooLarge);
+    }
+    // `Some(true)`: all `Content-Length` body bytes are here. `Some(false)`:
+    // fewer are. `None`: no head yet, or no usable `Content-Length`.
+    let complete = raw.windows(4).position(|w| w == b"\r\n\r\n").and_then(|head_end| {
+        let head = String::from_utf8_lossy(&raw[..head_end]);
+        let declared = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") { value.trim().parse::<usize>().ok() } else { None }
+        })?;
+        Some(raw.len() - (head_end + 4) >= declared)
+    });
+    match (read, complete) {
+        (_, Some(true)) | (Ok(_), None) => Ok(raw),
+        (Ok(_), Some(false)) => Err(ReadFail::Io("connection closed before the full response body arrived".into())),
+        (Err(e), _) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+            Err(ReadFail::Timeout)
+        }
+        (Err(e), _) => Err(ReadFail::Io(e.to_string())),
+    }
+}
+
 /// One JSON-RPC call over HTTP/1.1. The node's server answers one request per
 /// connection and closes (`rpc::serve_connection`), so the client writes one
 /// POST and reads to EOF; parsing reuses `rpc::parse_json` — the same JSON
 /// code the node itself runs.
-fn rpc_call(addr: &str, method: &str, params: Vec<Json>) -> Result<Json, String> {
+fn rpc_call(addr: &str, method: &str, params: Vec<Json>) -> Result<Json, RpcError> {
     let request = Json::obj(vec![
         ("jsonrpc", Json::s("2.0")),
         ("id", Json::u(1)),
@@ -198,7 +294,17 @@ fn rpc_call(addr: &str, method: &str, params: Vec<Json>) -> Result<Json, String>
     ])
     .to_string();
 
-    let mut sock = TcpStream::connect(addr).map_err(|e| format!("{addr}: connect: {e}"))?;
+    let io_err = |what: &str, e: std::io::Error| {
+        let text = format!("{addr}: {what}: {e}");
+        if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
+            RpcError::Timeout(text)
+        } else {
+            RpcError::Transport(text)
+        }
+    };
+    let transport = |what: String| RpcError::Transport(format!("{addr}: {what}"));
+
+    let mut sock = TcpStream::connect(addr).map_err(|e| io_err("connect", e))?;
     let timeout = Some(Duration::from_secs(10));
     let _ = sock.set_read_timeout(timeout);
     let _ = sock.set_write_timeout(timeout);
@@ -209,32 +315,76 @@ fn rpc_call(addr: &str, method: &str, params: Vec<Json>) -> Result<Json, String>
     );
     sock.write_all(head.as_bytes())
         .and_then(|()| sock.write_all(request.as_bytes()))
-        .map_err(|e| format!("{addr}: send: {e}"))?;
+        .map_err(|e| io_err("send", e))?;
 
-    let mut raw = Vec::new();
-    // EOF is the normal end; a timeout after a complete response is tolerated
-    // rather than fatal, because the bytes in hand are what matter.
-    let _ = sock.read_to_end(&mut raw);
+    let raw = read_http_response(&mut sock, MAX_RPC_RESPONSE_BYTES).map_err(|fail| match fail {
+        ReadFail::TooLarge => RpcError::Oversized(format!(
+            "{addr}: {method}: response exceeds {MAX_RPC_RESPONSE_BYTES} bytes; refusing to read it"
+        )),
+        ReadFail::Timeout => RpcError::Timeout(format!("{addr}: {method}: no complete response")),
+        ReadFail::Io(e) => transport(format!("{method}: {e}")),
+    })?;
     let text = String::from_utf8_lossy(&raw);
     let (status_line, rest) = text
         .split_once("\r\n")
-        .ok_or_else(|| format!("{addr}: malformed HTTP response"))?;
+        .ok_or_else(|| transport("malformed HTTP response".into()))?;
     if !status_line.contains(" 200 ") {
-        return Err(format!("{addr}: {status_line}"));
+        return Err(transport(status_line.to_string()));
     }
     let body = rest
         .split_once("\r\n\r\n")
         .map(|(_, b)| b)
-        .ok_or_else(|| format!("{addr}: response has no body"))?;
-    let json = parse_json(body.trim()).map_err(|e| format!("{addr}: bad JSON: {e}"))?;
+        .ok_or_else(|| transport("response has no body".into()))?;
+    let json = parse_json(body.trim()).map_err(|e| transport(format!("bad JSON: {e}")))?;
     if let Some(err) = json.get("error") {
         if !matches!(err, Json::Null) {
-            return Err(format!("{addr}: {method}: {}", err.to_string()));
+            let code = match err.get("code") {
+                Some(Json::Num(n)) => n.parse::<i64>().ok(),
+                _ => None,
+            };
+            return Err(RpcError::Server { code, context: format!("{addr}: {method}: {}", err.to_string()) });
         }
     }
     json.get("result")
         .cloned()
-        .ok_or_else(|| format!("{addr}: {method}: no result"))
+        .ok_or_else(|| transport(format!("{method}: no result")))
+}
+
+/// Attempts per slot in the boundary scan before the whole derivation aborts.
+const BOUNDARY_RPC_ATTEMPTS: u32 = 3;
+
+/// Pause before each retry in the boundary scan, multiplied by the attempt.
+const BOUNDARY_RPC_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// The canonical block at `slot`, or `None` when the node says, with its own
+/// `SLOT_EMPTY` code, that the slot carries no canonical block.
+///
+/// Nothing else counts as empty. A timeout, a refused connection,
+/// `NODE_UNAVAILABLE`, a busy server, a malformed or oversized reply all
+/// leave the slot's content unknown, and a scan that stepped past an unknown
+/// slot would settle on an EARLIER block — finalized too, so every later
+/// check would pass — and mint an anchor at the wrong root. Those failures
+/// are retried a bounded number of times and then abort the derivation.
+fn boundary_block_at(addr: &str, slot: u64) -> Result<Option<Json>, String> {
+    let mut attempts = 0;
+    let last = loop {
+        attempts += 1;
+        match rpc_call(addr, "getblockbyslot", vec![Json::u(slot)]) {
+            Ok(block) => return Ok(Some(block)),
+            Err(e) if e.code() == Some(crate::rpc::SLOT_EMPTY) => return Ok(None),
+            // The same endpoint will send the same oversized reply again.
+            Err(e @ RpcError::Oversized(_)) => break e,
+            Err(e) if attempts >= BOUNDARY_RPC_ATTEMPTS => break e,
+            Err(_) => std::thread::sleep(BOUNDARY_RPC_RETRY_DELAY * attempts),
+        }
+    };
+    Err(format!(
+        "cannot establish whether slot {slot} is empty: {last} (after {attempts} attempt(s)). \
+         Only the node's explicit empty-slot answer (code {}) lets the boundary scan pass a \
+         slot; refusing to derive a checkpoint, because skipping this slot could select an \
+         earlier block than the true epoch boundary. Retry when the endpoint is healthy",
+        crate::rpc::SLOT_EMPTY
+    ))
 }
 
 fn field_u64(j: &Json, key: &str, ctx: &str) -> Result<u64, String> {
@@ -286,13 +436,15 @@ fn view_of(addr: &str, epoch: u64) -> Result<ChainView, String> {
     // The boundary block: last canonical block strictly before the epoch's
     // first slot — `engine::checkpoint_root`'s convention, which is the root
     // this chain's own attesters voted and its finality store holds. Missed
-    // slots simply answer with an error, so scan downward.
+    // slots answer with the explicit `SLOT_EMPTY` code, so scan downward —
+    // and stop dead on any slot whose emptiness the node did not state
+    // (`boundary_block_at`).
     let first_slot = epoch
         .checked_mul(SLOTS_PER_EPOCH)
         .ok_or_else(|| format!("epoch {epoch} overflows the slot space"))?;
     let mut found: Option<(u64, Json)> = None;
     for s in (first_slot.saturating_sub(BOUNDARY_SCAN_SLOTS)..first_slot).rev() {
-        if let Ok(block) = rpc_call(addr, "getblockbyslot", vec![Json::u(s)]) {
+        if let Some(block) = boundary_block_at(addr, s)? {
             found = Some((s, block));
             break;
         }
@@ -551,6 +703,10 @@ fn signer_set(args: &[String]) -> Result<(), String> {
 ///  --epoch <E> --signer-set-id <n> [--issued-at <unix-secs>]
 ///  [--validator-set-root <hex32>] --out <prefix>`
 ///
+/// With `--release-anchor` (instead of `--signer-set-id`) at least two
+/// distinct `--rpc` endpoints are required; `--allow-single-rpc` is the
+/// explicit override for re-deriving a published anchor against one node.
+///
 /// Writes `<prefix>.bin` (the canonical 154 bytes — §2.3's
 /// `wscheckpoint-<epoch>.bin`) and `<prefix>.json` (the human view quoting
 /// the ws digest). The digest printed at the end is the exact 32 bytes each
@@ -755,6 +911,25 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
         }
         id
     };
+    // A release anchor is baked into every binary of a release and nobody
+    // signs it, so the corroboration a signing ceremony would add has to
+    // happen here: at least two distinct endpoints, which must agree on the
+    // boundary slot and roots (the comparison below). One endpoint is refused
+    // unless the operator says so explicitly — the documented case is a third
+    // party re-deriving a PUBLISHED anchor against their own node, where the
+    // release notes are the second witness.
+    if release_anchor {
+        let distinct: std::collections::BTreeSet<&str> = rpcs.iter().map(String::as_str).collect();
+        if distinct.len() != rpcs.len() {
+            return Err("--release-anchor: the same --rpc endpoint is listed twice; a repeated endpoint is one witness, not two".into());
+        }
+        if rpcs.len() < 2 && !args.iter().any(|a| a == "--allow-single-rpc") {
+            return Err(
+                "--release-anchor needs at least two --rpc endpoints (--rpc <a>,<b>, independently                  operated nodes) that agree on the boundary block; one node's word is not enough                  to bake into a release. To re-derive an already published anchor against a                  single node of your own, add --allow-single-rpc and compare the output with the                  release notes"
+                    .into(),
+            );
+        }
+    }
     let out = req(args, "--out")?;
     let issued_at: u64 = match crate::arg_value(args, "--issued-at") {
         Some(s) => s.parse().map_err(|_| "--issued-at must be unix seconds".to_string())?,
@@ -811,8 +986,10 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
             return Err(format!(
                 "{addr} and {first_addr} DISAGREE on the epoch-{epoch} checkpoint — refusing. \
                  Do not pick a side from this tool; investigate the fork first \
-                 ({addr}: block {}, {first_addr}: block {})",
+                 ({addr}: boundary slot {} block {}, {first_addr}: boundary slot {} block {})",
+                v.boundary_slot,
                 hex32(&v.block_root),
+                first.boundary_slot,
                 hex32(&first.block_root),
             ));
         }
@@ -825,7 +1002,13 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
             hex32(&genesis_root),
         ));
     }
-    if views.len() == 1 {
+    if views.len() == 1 && release_anchor {
+        println!(
+            "WARNING: single RPC endpoint (--allow-single-rpc) — this output rests on one \
+             node's word. Use it only to compare against an already published anchor; never \
+             bake it into a release."
+        );
+    } else if views.len() == 1 {
         println!(
             "WARNING: single RPC endpoint — this artifact rests on one node's word. \
              Re-run with --rpc <a>,<b> against independently operated nodes before the \
@@ -2470,8 +2653,20 @@ mod tests {
 
     // ── --checkpoint-sync-url against a scripted RPC ───────────────────────
 
-    /// A one-chain RPC: finalized at `epoch` with boundary block `root`.
-    fn fake_rpc(epoch: u64, root: [u8; 32], genesis: [u8; 32]) -> String {
+    /// What a scripted endpoint does with one request.
+    enum Reply {
+        Result(Json),
+        /// A JSON-RPC error object with this code.
+        Error(i64, &'static str),
+        /// A complete HTTP 200 response whose body is this many bytes.
+        Oversized(usize),
+        /// Accept the request and close without answering.
+        Hangup,
+    }
+
+    /// A scripted RPC endpoint: `script(method, first numeric param)` decides
+    /// each reply.
+    fn scripted_rpc(script: impl Fn(&str, Option<u64>) -> Reply + Send + 'static) -> String {
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -2498,24 +2693,174 @@ mod tests {
                 let method = req.get("method").and_then(Json::as_str).unwrap_or("").to_string();
                 let slot = req.get("params").and_then(|p| match p { Json::Arr(a) => a.first().cloned(), _ => None })
                     .and_then(|v| v.as_u64());
-                let result = match (method.as_str(), slot) {
-                    ("getchaininfo", _) => Some(Json::obj(vec![("finalized", Json::obj(vec![
-                        ("epoch", Json::u(epoch)), ("root", Json::hex(&root))]))])),
-                    ("getblockbyslot", Some(0)) => Some(Json::obj(vec![("block_id", Json::hex(&genesis))])),
-                    ("getblockbyslot", Some(s)) if s == epoch * SLOTS_PER_EPOCH - 1 => Some(Json::obj(vec![
-                        ("block_id", Json::hex(&root)), ("state_root", Json::hex(&[0x33; 32])),
-                        ("finalized", Json::Bool(true))])),
-                    _ => None,
+                let payload = match script(&method, slot) {
+                    Reply::Result(r) => Json::obj(vec![("jsonrpc", Json::s("2.0")), ("id", Json::u(1)), ("result", r)]).to_string(),
+                    Reply::Error(code, message) => format!(
+                        r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":{code},"message":"{message}"}}}}"#
+                    ),
+                    Reply::Oversized(len) => {
+                        let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n");
+                        let _ = s.write_all(&vec![b' '; len]);
+                        continue;
+                    }
+                    Reply::Hangup => continue,
                 };
-                let payload = match result {
-                    Some(r) => Json::obj(vec![("jsonrpc", Json::s("2.0")), ("id", Json::u(1)), ("result", r)]),
-                    None => Json::obj(vec![("jsonrpc", Json::s("2.0")), ("id", Json::u(1)),
-                        ("error", Json::s("no block"))]),
-                }.to_string();
                 let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len());
             }
         });
         addr
+    }
+
+    fn chaininfo_reply(epoch: u64, root: [u8; 32]) -> Reply {
+        Reply::Result(Json::obj(vec![("finalized", Json::obj(vec![
+            ("epoch", Json::u(epoch)), ("root", Json::hex(&root))]))]))
+    }
+
+    fn block_reply(root: [u8; 32]) -> Reply {
+        Reply::Result(Json::obj(vec![
+            ("block_id", Json::hex(&root)), ("state_root", Json::hex(&[0x33; 32])),
+            ("finalized", Json::Bool(true))]))
+    }
+
+    /// A one-chain RPC: finalized at `epoch` with boundary block `root`. Every
+    /// other slot is empty and says so with the node's own code.
+    fn fake_rpc(epoch: u64, root: [u8; 32], genesis: [u8; 32]) -> String {
+        scripted_rpc(move |method, slot| match (method, slot) {
+            ("getchaininfo", _) => chaininfo_reply(epoch, root),
+            ("getblockbyslot", Some(0)) => Reply::Result(Json::obj(vec![("block_id", Json::hex(&genesis))])),
+            ("getblockbyslot", Some(s)) if s == epoch * SLOTS_PER_EPOCH - 1 => block_reply(root),
+            _ => Reply::Error(crate::rpc::SLOT_EMPTY, "no canonical block"),
+        })
+    }
+
+    /// A node finalized PAST `epoch` (so the finalized-root cross-check does
+    /// not apply) whose true boundary slot answers `at_boundary` and whose
+    /// slot just below it holds an earlier, also finalized, block `earlier`.
+    fn rpc_with_boundary(epoch: u64, earlier: [u8; 32], at_boundary: fn() -> Reply) -> String {
+        scripted_rpc(move |method, slot| match (method, slot) {
+            ("getchaininfo", _) => chaininfo_reply(epoch + 5, [0x77; 32]),
+            ("getblockbyslot", Some(0)) => Reply::Result(Json::obj(vec![("block_id", Json::hex(&[0x61; 32]))])),
+            ("getblockbyslot", Some(s)) if s == epoch * SLOTS_PER_EPOCH - 1 => at_boundary(),
+            ("getblockbyslot", Some(s)) if s == epoch * SLOTS_PER_EPOCH - 2 => block_reply(earlier),
+            _ => Reply::Error(crate::rpc::SLOT_EMPTY, "no canonical block"),
+        })
+    }
+
+    #[test]
+    fn rpc3_boundary_scan_aborts_on_a_slot_whose_emptiness_is_not_established() {
+        let boundary = 40 * SLOTS_PER_EPOCH - 1;
+        // The node could not answer for the true boundary slot. The block one
+        // slot below is finalized and would pass every later check.
+        let unavailable = rpc_with_boundary(40, [0x22; 32], || {
+            Reply::Error(crate::rpc::NODE_UNAVAILABLE, "consensus thread did not answer")
+        });
+        let err = view_of(&unavailable, 40).err().expect("must abort, not select the earlier block");
+        assert!(err.contains(&format!("slot {boundary}")), "{err}");
+        assert!(err.contains("-32004"), "{err}");
+        assert!(err.contains(&format!("{BOUNDARY_RPC_ATTEMPTS} attempt(s)")), "{err}");
+
+        // An error object without the empty-slot code is not an empty slot
+        // either, and neither is a connection that closes without a reply.
+        let uncoded = rpc_with_boundary(40, [0x22; 32], || Reply::Error(-32000, "no canonical block"));
+        let err = view_of(&uncoded, 40).err().expect("a different code is not SLOT_EMPTY");
+        assert!(err.contains(&format!("slot {boundary}")), "{err}");
+        let hangup = rpc_with_boundary(40, [0x22; 32], || Reply::Hangup);
+        let err = view_of(&hangup, 40).err().expect("no reply is not an empty slot");
+        assert!(err.contains(&format!("slot {boundary}")), "{err}");
+
+        // The same abort reaches the checkpoint-sync path, which shares the scan.
+        let err = fetch_trusted_checkpoint(&[unavailable], 7, [0x61; 32]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn rpc3_boundary_scan_skips_an_explicitly_empty_slot() {
+        let node = rpc_with_boundary(40, [0x22; 32], || Reply::Error(crate::rpc::SLOT_EMPTY, "no canonical block"));
+        let view = view_of(&node, 40).expect("an explicit SLOT_EMPTY is a missed proposal");
+        assert_eq!(view.boundary_slot, 40 * SLOTS_PER_EPOCH - 2);
+        assert_eq!(view.block_root, [0x22; 32]);
+    }
+
+    #[test]
+    fn rpc3_rpc_call_reports_the_server_code_and_refuses_an_oversized_response() {
+        let node = scripted_rpc(|method, _| match method {
+            "getchaininfo" => Reply::Oversized(MAX_RPC_RESPONSE_BYTES + 1),
+            "getblockraw" => Reply::Hangup,
+            _ => Reply::Error(crate::rpc::SLOT_EMPTY, "no canonical block"),
+        });
+        let err = rpc_call(&node, "getchaininfo", vec![]).unwrap_err();
+        assert!(matches!(err, RpcError::Oversized(_)), "{err:?}");
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        assert_eq!(err.code(), None);
+
+        let err = rpc_call(&node, "getblockbyslot", vec![Json::u(7)]).unwrap_err();
+        assert_eq!(err.code(), Some(crate::rpc::SLOT_EMPTY), "{err:?}");
+
+        let err = rpc_call(&node, "getblockraw", vec![]).unwrap_err();
+        assert!(matches!(err, RpcError::Transport(_)), "{err:?}");
+        assert_eq!(err.code(), None);
+
+        // An oversized reply at the boundary slot aborts the derivation too.
+        let node = rpc_with_boundary(40, [0x22; 32], || Reply::Oversized(MAX_RPC_RESPONSE_BYTES + 1));
+        let err = view_of(&node, 40).err().expect("an oversized reply is not an empty slot");
+        assert!(err.contains("exceeds") && err.contains("1 attempt(s)"), "{err}");
+    }
+
+    const MAINNET_MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../genesis/mainnet.manifest");
+
+    fn release_anchor_args(rpc: &str, out: &str) -> Vec<String> {
+        vec![
+            s("--release-anchor"),
+            s("--genesis"), s(MAINNET_MANIFEST),
+            s("--rpc"), s(rpc),
+            s("--epoch"), s("40"),
+            s("--out"), s(out),
+        ]
+    }
+
+    #[test]
+    fn rpc3_release_anchor_refuses_a_single_endpoint_without_the_override() {
+        let dir = tmp("rpc3-single");
+        let out = format!("{dir}/anchor");
+        // Refused before any I/O: nothing listens on this address.
+        let err = checkpoint(&release_anchor_args("127.0.0.1:1", &out)).unwrap_err();
+        assert!(err.contains("at least two --rpc endpoints"), "{err}");
+        assert!(err.contains("--allow-single-rpc"), "{err}");
+        // One endpoint named twice is still one witness.
+        let err = checkpoint(&release_anchor_args("127.0.0.1:1,127.0.0.1:1", &out)).unwrap_err();
+        assert!(err.contains("listed twice"), "{err}");
+
+        // With the override the policy gate lets the run through to the RPC,
+        // which is then the thing that fails.
+        let mut args = release_anchor_args("127.0.0.1:1", &out);
+        args.push(s("--allow-single-rpc"));
+        let err = checkpoint(&args).unwrap_err();
+        assert!(err.contains("connect"), "{err}");
+        assert!(!Path::new(&format!("{out}.bin")).exists());
+    }
+
+    #[test]
+    fn rpc3_release_anchor_refuses_two_endpoints_that_disagree() {
+        let dir = tmp("rpc3-disagree");
+        let out = format!("{dir}/anchor");
+        let genesis = [0x61; 32];
+        // Same epoch, different boundary root.
+        let a = fake_rpc(40, [0x22; 32], genesis);
+        let forked = fake_rpc(40, [0x99; 32], genesis);
+        let err = checkpoint(&release_anchor_args(&format!("{a},{forked}"), &out)).unwrap_err();
+        assert!(err.contains("DISAGREE"), "{err}");
+
+        // Same root reported at a different boundary slot.
+        let shifted = rpc_with_boundary(40, [0x22; 32], || Reply::Error(crate::rpc::SLOT_EMPTY, "no canonical block"));
+        let b = scripted_rpc(move |method, slot| match (method, slot) {
+            ("getchaininfo", _) => chaininfo_reply(45, [0x77; 32]),
+            ("getblockbyslot", Some(0)) => Reply::Result(Json::obj(vec![("block_id", Json::hex(&genesis))])),
+            ("getblockbyslot", Some(s)) if s == 40 * SLOTS_PER_EPOCH - 1 => block_reply([0x22; 32]),
+            _ => Reply::Error(crate::rpc::SLOT_EMPTY, "no canonical block"),
+        });
+        let err = checkpoint(&release_anchor_args(&format!("{b},{shifted}"), &out)).unwrap_err();
+        assert!(err.contains("DISAGREE"), "{err}");
+        assert!(!Path::new(&format!("{out}.bin")).exists());
     }
 
     #[test]

@@ -32,6 +32,7 @@
 
 use crate::codec;
 use crate::rpc::{parse_json, Json};
+use crate::ws_tool::{read_http_response, ReadFail};
 use bloch_pos_committee::attestation::{Attestation, AttestationData};
 use bloch_pos_committee::header::BlockEnvelope;
 use bloch_pos_committee::interfaces::{ProposalEnvelope, SlashingEvidence as WireEvidence};
@@ -170,6 +171,13 @@ enum RpcErr {
     Transport(String),
 }
 
+/// Largest HTTP response `rpc_call` will read. The largest legitimate reply
+/// this tool consumes is `getblockraw`: one canonical block, hex-encoded. A
+/// canonical block was gossiped as a proposal, so it is bounded by the gossip
+/// frame; hex doubles it, and the slack covers the HTTP head and the JSON-RPC
+/// envelope. An endpoint cannot make the watcher buffer past this.
+const MAX_RPC_RESPONSE_BYTES: usize = 2 * crate::p2p::MAX_GOSSIP_BYTES + 64 * 1024;
+
 fn rpc_call(addr: &str, method: &str, params: Vec<Json>) -> Result<Json, RpcErr> {
     let request = Json::obj(vec![
         ("jsonrpc", Json::s("2.0")),
@@ -191,8 +199,11 @@ fn rpc_call(addr: &str, method: &str, params: Vec<Json>) -> Result<Json, RpcErr>
     sock.write_all(head.as_bytes())
         .and_then(|()| sock.write_all(request.as_bytes()))
         .map_err(|e| t(format!("send: {e}")))?;
-    let mut raw = Vec::new();
-    let _ = sock.read_to_end(&mut raw);
+    let raw = read_http_response(&mut sock, MAX_RPC_RESPONSE_BYTES).map_err(|fail| match fail {
+        ReadFail::TooLarge => t(format!("{method}: response exceeds {MAX_RPC_RESPONSE_BYTES} bytes; refusing to read it")),
+        ReadFail::Timeout => t(format!("{method}: timed out before a complete response")),
+        ReadFail::Io(e) => t(format!("{method}: {e}")),
+    })?;
     let text = String::from_utf8_lossy(&raw);
     let (status, rest) = text.split_once("\r\n").ok_or_else(|| t("malformed HTTP response".into()))?;
     if !status.contains(" 200 ") {

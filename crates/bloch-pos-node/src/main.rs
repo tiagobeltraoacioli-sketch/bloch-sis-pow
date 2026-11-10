@@ -398,10 +398,14 @@ fn print_help() {
            bloch-pos ws-checkpoint --genesis <manifest> --rpc <a>[,<b>...]\n\
                                    --epoch <E> (--signer-set-id <n> | --operator-trusted | --release-anchor)\n\
                                    --out <prefix> [--publication-dir <0700 registry>]\n\
+                                   [--allow-single-rpc]\n\
                Derive the weak-subjectivity checkpoint for a FINALIZED\n\
                epoch from running nodes (all --rpc endpoints must agree),\n\
                writing <prefix>.bin (154 canonical bytes) + <prefix>.json\n\
                and printing the ws digest the signers sign.\n\
+               --release-anchor refuses fewer than two --rpc endpoints;\n\
+               --allow-single-rpc overrides that, only to re-derive an\n\
+               already published anchor against one node of your own.\n\
            bloch-pos slashing-protection <export|import|set-floor|retire>\n\
                --data-dir <dir> --validator-pubkey-sha3 <hex32>\n\
                --genesis-digest <hex32> [--signer-anchor-dir <dir>]\n\

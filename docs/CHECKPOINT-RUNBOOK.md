@@ -209,6 +209,23 @@ forked node answers as confidently as a correct one; the tool refuses on any
 disagreement and prints a single-endpoint warning if you give it only one. This
 fleet has had real forks — treat the warning as a stop.
 
+For a release anchor (`--release-anchor`, `docs/WS-RELEASE-ANCHOR.md`) the
+warning is a refusal: nobody signs that artifact, so the tool itself requires
+at least two distinct `--rpc` endpoints that agree on the boundary slot and
+roots. `--allow-single-rpc` overrides the refusal and exists for one purpose
+only — re-deriving an already published anchor against a single node of your
+own and comparing the output with the release notes. Never bake the output of
+a single-endpoint run into a release.
+
+The boundary scan passes a slot only when the node answers it with the explicit
+empty-slot code (`-32007 SLOT_EMPTY`). Any other failure at a slot — a timeout,
+a refused connection, `-32004 NODE_UNAVAILABLE`, a busy or oversized reply — is
+retried three times and then aborts the whole command, naming the slot and the
+error. That abort is deliberate: stepping past a slot the node could not answer
+for would select an earlier block, which is finalized too and would pass every
+later check. Re-run when the endpoint is healthy, or use another endpoint; do
+not work around it.
+
 The command refuses any epoch the chain has not finalized, derives the
 epoch-boundary block by the same convention the finality store votes
 (`engine::checkpoint_root`: the last canonical block strictly before the
