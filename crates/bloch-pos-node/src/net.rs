@@ -337,6 +337,42 @@ const SYNC_FANOUT: usize = 2;
 /// when peers stay silent or the applied head has not moved.
 const SYNC_LEASE: Duration = Duration::from_secs(5);
 const MAX_SYNC_SERVING_WORKERS: usize = 4;
+/// Serving workers one normalized source address may hold at once. A worker
+/// is held for as long as its page takes to write, so without this a single
+/// address with a few connections could hold every worker and leave honest
+/// peers with silence. Two, not one, so nodes that legitimately share an
+/// address (one host, one NAT) do not serialize behind each other, while half
+/// of the workers always remain available to other sources.
+const MAX_SYNC_SERVING_PER_SOURCE: usize = 2;
+/// Slowest sustained read rate at which a peer is still served a whole page:
+/// 32 KiB/s (256 kbit/s). A node that cannot receive this fast cannot follow
+/// the chain either, since one maximal block body alone is 512 KiB.
+const SYNC_PAGE_MIN_BYTES_PER_SEC: u64 = 32 * 1024;
+/// Fixed allowance on top of the throughput budget, covering connection
+/// latency, frame overhead and broadcasts interleaved on the same socket.
+const SYNC_PAGE_WRITE_GRACE: Duration = Duration::from_secs(15);
+
+/// Whole-page deadline for one `get-blocks` answer of `page_bytes` bytes.
+///
+/// [`DEVNET_IO_TIMEOUT`] bounds a single stalled write and is renewed by any
+/// progress, so a peer reading a few bytes per minute could hold a serving
+/// worker indefinitely. This budget is total: `SYNC_PAGE_WRITE_GRACE` plus
+/// the time the page takes at `SYNC_PAGE_MIN_BYTES_PER_SEC`. A maximal page
+/// (`codec::MAX_FIELD_LEN`, 8 MiB) therefore gets 15 s + 256 s = 271 s, and a
+/// peer reading at 32 KiB/s or faster can never reach the deadline.
+fn sync_page_deadline(start: Instant, page_bytes: usize) -> Instant {
+    let seconds = (page_bytes as u64).div_ceil(SYNC_PAGE_MIN_BYTES_PER_SEC);
+    start + SYNC_PAGE_WRITE_GRACE + Duration::from_secs(seconds)
+}
+
+/// The address form used for per-source accounting: an IPv4-mapped IPv6
+/// address counts as its IPv4 address, as in `connection_limit`.
+/// The per-source key for sync serving: the same rule as every other
+/// per-source limit (IPv4 by address, IPv6 by /64, IPv4-mapped as IPv4), so
+/// one IPv6 prefix cannot occupy every serving worker.
+fn normalize_source(ip: std::net::IpAddr) -> std::net::IpAddr {
+    crate::connection_limit::limit_key(ip)
+}
 
 /// Blocks in one `FRAME_GET_BLOCKS` answer.
 ///
@@ -915,11 +951,17 @@ struct SyncResponder {
     budget: Arc<Mutex<SyncBudget>>,
 }
 
-struct SyncServingGuard(Arc<Connection>, Arc<Mutex<SyncBudget>>);
+struct SyncServingGuard(Arc<Connection>, Arc<Mutex<SyncBudget>>, std::net::IpAddr);
 impl Drop for SyncServingGuard {
     fn drop(&mut self) {
         self.0.serving_sync.store(false, Ordering::Release);
-        if let Ok(mut budget) = self.1.lock() { budget.serving = budget.serving.saturating_sub(1); }
+        if let Ok(mut budget) = self.1.lock() {
+            budget.serving = budget.serving.saturating_sub(1);
+            if let Some(held) = budget.serving_by_source.get_mut(&self.2) {
+                *held = held.saturating_sub(1);
+                if *held == 0 { budget.serving_by_source.remove(&self.2); }
+            }
+        }
     }
 }
 
@@ -929,9 +971,12 @@ impl SyncResponder {
         if connection.closed.load(Ordering::Acquire) || !limiter.admit(now) { return None; }
         let mut budget = self.budget.lock().ok()?;
         if !budget.admit(ip, now) || budget.serving >= MAX_SYNC_SERVING_WORKERS { return None; }
+        let source = normalize_source(ip);
+        if budget.serving_by_source.get(&source).is_some_and(|held| *held >= MAX_SYNC_SERVING_PER_SOURCE) { return None; }
         if connection.serving_sync.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() { return None; }
         budget.serving = budget.serving.saturating_add(1);
-        Some(SyncServingGuard(connection.clone(), self.budget.clone()))
+        *budget.serving_by_source.entry(source).or_default() += 1;
+        Some(SyncServingGuard(connection.clone(), self.budget.clone(), source))
     }
 
     fn answer(&self, connection: &Arc<Connection>, ip: std::net::IpAddr, frame: Vec<u8>, limiter: &mut GetBlocksLimiter) {
@@ -1354,11 +1399,39 @@ impl MeshWriter {
         }
     }
 
-    fn write_typed_frame(&mut self, frame_type: u8, payload: &[u8]) -> std::io::Result<()> {
-        match &mut self.sealer {
-            None => write_typed_frame(&mut self.sock, frame_type, payload),
-            Some(sealer) => sealer.write_record(&mut self.sock, &[&[frame_type], payload]),
-        }
+    /// Write a typed frame under a deadline that progress does not renew.
+    /// The steady-state write timeout is restored afterwards because
+    /// broadcasts share this socket.
+    fn write_typed_frame_until(&mut self, frame_type: u8, payload: &[u8], deadline: Instant) -> std::io::Result<()> {
+        let mut writer = DeadlineWriter { sock: &self.sock, deadline };
+        let result = match &mut self.sealer {
+            None => write_typed_frame(&mut writer, frame_type, payload),
+            Some(sealer) => sealer.write_record(&mut writer, &[&[frame_type], payload]),
+        };
+        let restored = self.sock.set_write_timeout(Some(DEVNET_IO_TIMEOUT));
+        result.and(restored)
+    }
+}
+
+/// The write twin of [`read_exact_until`]: every `write` may block only for
+/// what is left of one budget (and never longer than [`DEVNET_IO_TIMEOUT`]),
+/// so partial progress cannot renew it.
+struct DeadlineWriter<'a> {
+    sock: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl Write for DeadlineWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.deadline.checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "page deadline exceeded"))?;
+        self.sock.set_write_timeout(Some(remaining.min(DEVNET_IO_TIMEOUT)))?;
+        self.sock.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.sock.flush()
     }
 }
 
@@ -1544,9 +1617,12 @@ struct SyncBudget {
     addresses: std::collections::BTreeMap<std::net::IpAddr, GetBlocksLimiter>,
     global: GetBlocksLimiter,
     serving: usize,
+    /// Workers held per normalized source; entries exist only while nonzero,
+    /// so the map never exceeds MAX_SYNC_SERVING_WORKERS entries.
+    serving_by_source: std::collections::BTreeMap<std::net::IpAddr, usize>,
 }
 impl SyncBudget {
-    fn new() -> Self { Self { serving: 0, addresses: Default::default(), global: GetBlocksLimiter { tokens: 128.0, last: Instant::now(), rate: 64.0, capacity: 128.0 } } }
+    fn new() -> Self { Self { serving: 0, serving_by_source: Default::default(), addresses: Default::default(), global: GetBlocksLimiter { tokens: 128.0, last: Instant::now(), rate: 64.0, capacity: 128.0 } } }
     fn admit(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
         let ip = crate::connection_limit::limit_key(ip);
         if !self.addresses.contains_key(&ip) {
@@ -1597,18 +1673,46 @@ fn serve_get_blocks(
     // large enough to kill the receiver.
     match crate::store::Store::blocks_after(data_dir, after, SYNC_PAGE_BLOCKS) {
         Ok(blocks) => {
-            for b in blocks {
-                let Ok(mut w) = sock.lock() else { return };
-                if connection.closed.load(Ordering::Acquire) { return; }
-                if w.write_typed_frame(FRAME_BLOCK, &b).is_err() {
-                    // A partial frame cannot be followed by more framed data.
+            let page_bytes = blocks.iter().fold(0usize, |total, b| total.saturating_add(b.len()));
+            write_sync_page(sock, &blocks, connection, sync_page_deadline(Instant::now(), page_bytes));
+        }
+        Err(e) => eprintln!("net: get-blocks failed: {e}"),
+    }
+}
+
+/// Write one page, giving up and closing the connection at `deadline`. The
+/// caller's serving worker is therefore held for a bounded time whatever the
+/// peer does, including while a broadcast to the same slow peer holds the
+/// socket lock.
+fn write_sync_page(
+    sock: &Arc<Mutex<MeshWriter>>,
+    blocks: &[Vec<u8>],
+    connection: &Connection,
+    deadline: Instant,
+) {
+    for b in blocks {
+        let mut w = loop {
+            if connection.closed.load(Ordering::Acquire) { return; }
+            match sock.try_lock() {
+                Ok(w) => break w,
+                Err(std::sync::TryLockError::Poisoned(_)) => return,
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
                     connection.closed.store(true, Ordering::Release);
                     let _ = connection.socket.shutdown(Shutdown::Both);
                     return;
                 }
             }
+        };
+        if connection.closed.load(Ordering::Acquire) { return; }
+        if w.write_typed_frame_until(FRAME_BLOCK, b, deadline).is_err() {
+            // A partial frame cannot be followed by more framed data.
+            connection.closed.store(true, Ordering::Release);
+            let _ = connection.socket.shutdown(Shutdown::Both);
+            return;
         }
-        Err(e) => eprintln!("net: get-blocks failed: {e}"),
     }
 }
 
@@ -2349,8 +2453,10 @@ mod tests {
         let ip = "127.0.0.1".parse().unwrap();
         // Keep the same guards the worker owns alive, modelling outstanding
         // storage work deterministically across disconnected generations.
-        let guards: Vec<_> = peers.iter().zip(&responders).take(MAX_SYNC_SERVING_WORKERS).map(|(peer, responder)| {
-            responder.reserve(&peer.connection, ip, &mut GetBlocksLimiter::new()).unwrap()
+        // Distinct sources: one source alone is capped below the global limit.
+        let guards: Vec<_> = peers.iter().zip(&responders).take(MAX_SYNC_SERVING_WORKERS).enumerate().map(|(i, (peer, responder))| {
+            let source = std::net::IpAddr::from([10, 0, 0, i as u8 + 1]);
+            responder.reserve(&peer.connection, source, &mut GetBlocksLimiter::new()).unwrap()
         }).collect();
         assert_eq!(budget.lock().unwrap().serving, MAX_SYNC_SERVING_WORKERS);
         for peer in peers.iter().take(MAX_SYNC_SERVING_WORKERS) { peer.connection.closed.store(true, Ordering::Release); }
@@ -2370,6 +2476,113 @@ mod tests {
         }
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn one_source_cannot_hold_every_sync_serving_worker() {
+        let peers: Vec<_> = (0..=MAX_SYNC_SERVING_PER_SOURCE + 1).map(|_| sync_test_peer()).collect();
+        let budget = Arc::new(Mutex::new(SyncBudget::new()));
+        let responders: Vec<_> = peers.iter().map(|p| SyncResponder {
+            socket: Arc::new(Mutex::new(MeshWriter::plain(p.connection.socket.try_clone().unwrap()))),
+            data_dir: std::env::temp_dir(), budget: budget.clone(),
+        }).collect();
+        let reserve = |i: usize, ip: &str| responders[i].reserve(&peers[i].connection, ip.parse().unwrap(), &mut GetBlocksLimiter::new());
+        assert!(MAX_SYNC_SERVING_PER_SOURCE < MAX_SYNC_SERVING_WORKERS);
+        let mut held: Vec<_> = (0..MAX_SYNC_SERVING_PER_SOURCE).map(|i| reserve(i, "192.0.2.1").unwrap()).collect();
+        let next = MAX_SYNC_SERVING_PER_SOURCE;
+        assert!(reserve(next, "192.0.2.1").is_none(), "one source took more than its share of workers");
+        assert!(reserve(next, "::ffff:192.0.2.1").is_none(), "the IPv4-mapped form is the same source");
+        assert_eq!(budget.lock().unwrap().serving, MAX_SYNC_SERVING_PER_SOURCE);
+        let other = reserve(next + 1, "192.0.2.2").expect("another source must still be served");
+        held.pop();
+        held.push(reserve(next, "192.0.2.1").expect("a finished worker returns its source's share"));
+        drop((held, other));
+        let budget = budget.lock().unwrap();
+        assert_eq!(budget.serving, 0);
+        assert!(budget.serving_by_source.is_empty());
+    }
+
+    #[test]
+    fn sync_page_deadline_implies_the_documented_minimum_throughput() {
+        let start = Instant::now();
+        assert_eq!(sync_page_deadline(start, 0), start + SYNC_PAGE_WRITE_GRACE);
+        assert_eq!(sync_page_deadline(start, crate::codec::MAX_FIELD_LEN), start + Duration::from_secs(15 + 256));
+        // Per-write stalls stay bounded as before; the page budget is separate.
+        assert!(SYNC_PAGE_WRITE_GRACE < DEVNET_IO_TIMEOUT);
+    }
+
+    #[test]
+    fn slow_page_reader_is_cut_off_at_the_deadline_and_frees_its_worker() {
+        let peer = sync_test_peer();
+        let socket = Arc::new(Mutex::new(MeshWriter::plain(peer.connection.socket.try_clone().unwrap())));
+        let budget = Arc::new(Mutex::new(SyncBudget::new()));
+        let responder = SyncResponder { socket: socket.clone(), data_dir: std::env::temp_dir(), budget: budget.clone() };
+        let ip = "192.0.2.1".parse().unwrap();
+        let guard = responder.reserve(&peer.connection, ip, &mut GetBlocksLimiter::new()).unwrap();
+        // The peer keeps reading, far below the minimum rate. Each read is
+        // progress, which is what used to renew the write timeout forever.
+        let mut remote = peer._remote.try_clone().unwrap();
+        let reader = thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            while matches!(remote.read(&mut byte), Ok(1)) { thread::sleep(Duration::from_millis(10)); }
+        });
+        // Larger than any loopback socket buffer, so the write must block.
+        let blocks = vec![vec![0x5A; 4 << 20]; 8];
+        let started = Instant::now();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let guard = guard;
+            write_sync_page(&socket, &blocks, &guard.0, started + Duration::from_millis(400));
+            drop(guard);
+            done_tx.send(Instant::now()).unwrap();
+        });
+        let finished = done_rx.recv_timeout(Duration::from_secs(10)).expect("slow reader held its serving worker past the deadline");
+        worker.join().unwrap();
+        assert!(finished.duration_since(started) >= Duration::from_millis(400), "the page cannot have been written in full");
+        assert!(peer.connection.closed.load(Ordering::Acquire), "a page cut off mid-frame must close the connection");
+        assert_eq!(budget.lock().unwrap().serving, 0, "the worker slot was not released");
+        assert!(budget.lock().unwrap().serving_by_source.is_empty());
+        let next = sync_test_peer();
+        assert!(responder.reserve(&next.connection, ip, &mut GetBlocksLimiter::new()).is_some());
+        let _ = peer._remote.shutdown(Shutdown::Both);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn page_deadline_also_bounds_waiting_for_a_stuck_socket_writer() {
+        let peer = sync_test_peer();
+        let socket = Arc::new(Mutex::new(MeshWriter::plain(peer.connection.socket.try_clone().unwrap())));
+        // A broadcast stuck writing to the same slow peer holds this lock.
+        let stuck = socket.lock().unwrap();
+        let started = Instant::now();
+        write_sync_page(&socket, &[vec![1; 16]], &peer.connection, started + Duration::from_millis(200));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(peer.connection.closed.load(Ordering::Acquire));
+        drop(stuck);
+    }
+
+    #[test]
+    fn normal_page_reader_completes_within_the_production_deadline() {
+        let peer = sync_test_peer();
+        let socket = Arc::new(Mutex::new(MeshWriter::plain(peer.connection.socket.try_clone().unwrap())));
+        let blocks: Vec<Vec<u8>> = (0..8u8).map(|i| vec![i; 1 << 20]).collect();
+        let expected = blocks.clone();
+        let mut remote = peer._remote.try_clone().unwrap();
+        let reader = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            (0..8).map(|_| read_frame_until(&mut remote, deadline).unwrap()).collect::<Vec<_>>()
+        });
+        let page_bytes = blocks.iter().map(Vec::len).sum();
+        write_sync_page(&socket, &blocks, &peer.connection, sync_page_deadline(Instant::now(), page_bytes));
+        let received = reader.join().unwrap();
+        for (frame, block) in received.iter().zip(&expected) {
+            assert_eq!(frame[0], FRAME_BLOCK);
+            assert_eq!(&frame[1..], block.as_slice());
+        }
+        assert!(!peer.connection.closed.load(Ordering::Acquire), "an honest reader must not be disconnected");
+        // Broadcasts on this socket get their steady-state timeout back.
+        assert_eq!(peer.connection.socket.write_timeout().unwrap(), Some(DEVNET_IO_TIMEOUT));
     }
 
     #[test]
