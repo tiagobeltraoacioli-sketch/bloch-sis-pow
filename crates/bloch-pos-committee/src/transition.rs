@@ -583,7 +583,9 @@ pub enum PosTransaction {
     /// 0x17). Refused before [`crate::params::KES_REGISTRATION_EPOCH`].
     /// Authorised by the validator's registered static key over
     /// [`crate::kes::register_signing_root`] (network domain, index, depth,
-    /// root). From [`crate::params::KES_ACTIVATION_EPOCH`] on, the
+    /// root); from [`crate::params::KES_REGISTER_EPOCH_BINDING_EPOCH`] on,
+    /// over [`crate::kes::register_signing_root_v2`], which also binds the
+    /// inclusion epoch (same wire form, valid only in that epoch). From [`crate::params::KES_ACTIVATION_EPOCH`] on, the
     /// validator's proposals and votes verify only under this root.
     KesRegister {
         validator: u32,
@@ -4312,8 +4314,10 @@ impl CommittedState {
     /// this state and without mutating it (consensus and mempool share it):
     /// refused for an unknown, slashed or exited validator, an out-of-range
     /// depth, a validator that already has a key, or a signature that is not
-    /// the registered static key's over [`crate::kes::register_signing_root`].
-    /// The one hybrid verification runs last.
+    /// the registered static key's over
+    /// [`crate::kes::register_signing_root_at`] for this state's epoch (from
+    /// [`crate::params::KES_REGISTER_EPOCH_BINDING_EPOCH`] on, a registration
+    /// signed for any other epoch). The one hybrid verification runs last.
     pub(crate) fn check_kes_register(
         &self,
         validator: u32,
@@ -4361,7 +4365,13 @@ impl CommittedState {
         }
         let public = crate::kes::KesPublic::new(depth, *root, start_period);
         let domain = self.admission_network_domain.unwrap_or([0; 32]);
-        let message = crate::kes::register_signing_root(&domain, validator, &public);
+        // The message of THIS state's epoch (security review CR-5): from
+        // `KES_REGISTER_EPOCH_BINDING_EPOCH` on it binds the inclusion epoch,
+        // so a registration verifies only in the epoch it was signed for and
+        // one captured from the chain cannot be rebroadcast into a later
+        // rescue window once its tree has left the pruned history. Before the
+        // flag day it is the legacy message, byte for byte.
+        let message = crate::kes::register_signing_root_at(&domain, validator, &public, self.epoch);
         if !verifier.verify_with_key(&rec.pubkey, &message, signature) {
             return Err(TxReject::StakingRule);
         }

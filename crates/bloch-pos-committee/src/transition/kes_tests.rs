@@ -1250,6 +1250,129 @@ mod kes_rules {
         assert_eq!(apply(&mut st, &again), Err(TxReject::StakingRule));
     }
 
+    // ── Security review CR-5: the epoch-bound registration message ────────
+
+    /// A registration signed over the epoch-bound message for `epoch`.
+    fn register_for(st: &CommittedState, v: u32, public: KesPublic, epoch: u64) -> PosTransaction {
+        let domain = st.admission_network_domain.unwrap_or([0; 32]);
+        let pk = crate::attestation::KeyLookup::pubkey(st, v).expect("registered validator").to_vec();
+        PosTransaction::KesRegister {
+            validator: v,
+            depth: public.depth,
+            root: public.root,
+            signature: toy_sign(&pk, &kes::register_signing_root_v2(&domain, v, epoch, &public)),
+        }
+    }
+
+    #[test]
+    fn from_the_flag_day_a_registration_is_valid_only_in_the_epoch_it_was_signed_for() {
+        let _armed = Armed::at(0, u64::MAX, 90);
+        let _bound = crate::params::kes_register_binding_rehearsal::arm(20);
+        let (_t, g, _chains) = setup_with(4, ToyVerifier, &[]);
+        let mut st = g.clone();
+        // Before the flag day: the legacy message, and only it.
+        st.epoch = 19;
+        let early = register_for(&st, 1, toy_kes_public(1), 19);
+        assert_eq!(relay_check(&st, &early), Err(TxReject::StakingRule));
+        assert_eq!(apply(&mut st, &early), Err(TxReject::StakingRule), "the new form is not valid early");
+        let legacy = register(&st, 1, toy_kes_public(1));
+        assert_eq!(relay_check(&st, &legacy), Ok(()));
+        assert_eq!(apply(&mut st.clone(), &legacy), Ok(()), "the legacy form still is");
+        // From it on: the legacy signature no longer verifies...
+        st.epoch = 20;
+        assert_eq!(relay_check(&st, &legacy), Err(TxReject::StakingRule));
+        assert_eq!(apply(&mut st, &legacy), Err(TxReject::StakingRule), "legacy form after the flag day");
+        // ...and a bound one verifies in its own epoch only.
+        let fresh = register_for(&st, 1, toy_kes_public(1), 20);
+        let root_before = st.state_root();
+        for wrong in [19, 21, 22, 500] {
+            let mut other = st.clone();
+            other.epoch = wrong;
+            assert_eq!(relay_check(&other, &fresh), Err(TxReject::StakingRule), "epoch {wrong}");
+            assert_eq!(apply(&mut other, &fresh), Err(TxReject::StakingRule), "epoch {wrong}");
+            assert!(other.kes_roots().is_empty());
+        }
+        assert_eq!(st.state_root(), root_before);
+        assert_eq!(relay_check(&st, &fresh), Ok(()));
+        assert_eq!(apply(&mut st, &fresh), Ok(()), "a fresh registration in its epoch");
+        assert_eq!(st.kes_public(1), Some(toy_kes_public(1)));
+        // The wire form is the same one: the epoch is the block's, not a field.
+        assert_eq!(fresh.canonical_bytes().len(), legacy.canonical_bytes().len());
+    }
+
+    #[test]
+    fn a_retired_tree_pruned_from_the_history_cannot_be_registered_again_by_replay() {
+        // One-epoch periods, enforcement from epoch 2, bound on chain.
+        let _armed = Armed::enforcing(2, 1);
+        let _bound = crate::params::kes_register_binding_rehearsal::arm(0);
+        let (_t, g, _chains) = setup_with(4, ToyVerifier, &[]);
+        let mut st = bound(g.clone());
+        // Tree A is registered at epoch 5 (period 3; starts at period 4).
+        st.epoch = 5;
+        let tree_a = public_of(&tree_from(0xA1, DEPTH));
+        let original = register_for(&st, 1, tree_a, 5);
+        apply(&mut st, &original).unwrap();
+        assert_eq!(st.kes_roots()[&1].current.root, tree_a.root);
+        // Much later the validator is on tree C, A has left the pruned
+        // history, and C has expired with no successor: the rescue is open.
+        let tree_c = KesPublic::new(DEPTH, public_of(&tree_from(0xC3, DEPTH)).root, 1_000);
+        st.kes.insert(1, tree_c.into());
+        st.epoch = 2 + 1_000 + 16;
+        assert!(st.kes_rescue_open(1));
+        assert!(st.kes[&1].retired.is_empty(), "A is no longer in the history");
+        // The captured registration of A does not verify in this epoch.
+        let before = st.kes_roots()[&1].clone();
+        let root_before = st.state_root();
+        assert_eq!(relay_check(&st, &original), Err(TxReject::StakingRule));
+        assert_eq!(apply(&mut st, &original), Err(TxReject::StakingRule), "replayed registration");
+        assert_eq!(st.kes_roots()[&1], before);
+        assert_eq!(st.state_root(), root_before);
+        // The validator's own rescue, signed for this epoch, is accepted.
+        let tree_d = public_of(&tree_from(0xD4, DEPTH));
+        let rescue = register_for(&st, 1, tree_d, st.epoch);
+        assert_eq!(relay_check(&st, &rescue), Ok(()));
+        apply(&mut st, &rescue).unwrap();
+        assert_eq!(st.kes_roots()[&1].current.root, tree_d.root);
+        // And that rescue is itself dead one epoch on.
+        let mut later = st.clone();
+        later.kes.insert(1, tree_c.into());
+        later.epoch += 1;
+        assert_eq!(apply(&mut later, &rescue), Err(TxReject::StakingRule));
+    }
+
+    #[test]
+    fn with_the_flag_day_unarmed_the_registration_message_and_wire_form_are_the_legacy_ones() {
+        assert_eq!(crate::params::KES_REGISTER_EPOCH_BINDING_EPOCH, u64::MAX);
+        let _armed = Armed::at(0, u64::MAX, 90);
+        let (_t, g, _chains) = setup_with(4, ToyVerifier, &[]);
+        let public = toy_kes_public(1);
+        // The wire form, byte for byte: tag, validator LE, depth, root,
+        // u32 LE signature length, signature.
+        let fixed = PosTransaction::KesRegister { validator: 0x0102_0304, depth: 12, root: [0xAB; 32], signature: vec![0xCD; 3] };
+        let mut expected = vec![0x17, 0x04, 0x03, 0x02, 0x01, 12];
+        expected.extend_from_slice(&[0xAB; 32]);
+        expected.extend_from_slice(&[3, 0, 0, 0, 0xCD, 0xCD, 0xCD]);
+        assert_eq!(fixed.canonical_bytes(), expected);
+        assert_eq!(PosTransaction::from_canonical_bytes(&expected).unwrap(), fixed);
+        // One legacy-signed registration is valid at every epoch (today's
+        // rule, unchanged), and the epoch-bound form at none.
+        let legacy = register(&g, 1, public);
+        let mut roots = Vec::new();
+        for epoch in [0, 1, 7_360, 8_620, 1 << 40] {
+            let mut st = g.clone();
+            st.epoch = epoch;
+            assert_eq!(relay_check(&st, &legacy), Ok(()), "epoch {epoch}");
+            assert_eq!(apply(&mut st, &legacy), Ok(()), "epoch {epoch}");
+            assert_eq!(st.kes_public(1), Some(public));
+            roots.push(st.kes_roots()[&1].committed_bytes());
+            let mut other = g.clone();
+            other.epoch = epoch;
+            let bound_form = register_for(&other, 1, public, epoch);
+            assert_eq!(apply(&mut other, &bound_form), Err(TxReject::StakingRule), "epoch {epoch}");
+        }
+        assert!(roots.windows(2).all(|w| w[0] == w[1]), "the committed entry does not depend on the epoch");
+    }
+
     #[test]
     fn the_shipped_schedule_refuses_trees_shallower_than_the_floor() {
         assert_eq!(crate::params::kes_schedule().min_depth, crate::params::KES_MIN_REGISTERED_DEPTH);

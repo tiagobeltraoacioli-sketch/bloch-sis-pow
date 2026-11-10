@@ -3618,6 +3618,59 @@ pub fn kes_period(epoch: u64) -> Option<u64> {
     epoch_gate_active(epoch, s.activation_epoch).then(|| (epoch - s.activation_epoch) / s.period_epochs)
 }
 
+/// Flag day of the epoch-bound KES registration message (security review
+/// CR-5). Unarmed.
+///
+/// Before it, a `KesRegister` (wire 0x17) is authorised by the static key
+/// over `kes::register_signing_root`, which binds the network, the validator
+/// and the tree only: the signature never ages. The transition refuses a tree
+/// that is in force, pending or in the retired history, but the history is
+/// pruned after `KES_KEY_HISTORY_PERIODS`, so the registration of a
+/// long-retired tree could be rebroadcast by anyone into a later rescue
+/// window, putting back a key whose seeds the validator destroyed (or that it
+/// rotated away from because a seed leaked).
+///
+/// From it on, the static key signs `kes::register_signing_root_v2`, which
+/// also binds the inclusion epoch, and consensus verifies the signature
+/// against the epoch of the including block only (the `ExitV2` equality
+/// rule), so a registration is valid in exactly the epoch it was signed for.
+/// The wire encoding does not change: the epoch is the block's, not a field.
+///
+/// A hard fork (it changes which 0x17 transactions are valid): every node
+/// must run this code before the epoch. The cleanest arming is
+/// `HF3_KES_EPOCH` itself, so no unbound registration is ever valid on the
+/// network; armed later, registrations signed in the old form and not yet
+/// included simply stop verifying and are signed again.
+pub const KES_REGISTER_EPOCH_BINDING_EPOCH: u64 = u64::MAX;
+
+/// Must a `KesRegister` included at `epoch` be signed over the epoch-bound
+/// message ([`KES_REGISTER_EPOCH_BINDING_EPOCH`])? A pure function of the
+/// epoch and the build.
+pub fn kes_register_epoch_bound(epoch: u64) -> bool {
+    #[cfg(test)]
+    if let Some(activation) = kes_register_binding_rehearsal::activation() {
+        return epoch_gate_active(epoch, activation);
+    }
+    epoch_gate_active(epoch, KES_REGISTER_EPOCH_BINDING_EPOCH)
+}
+
+/// Thread-local rehearsal activation for
+/// [`KES_REGISTER_EPOCH_BINDING_EPOCH`]. `cfg(test)` only.
+#[cfg(test)]
+pub(crate) mod kes_register_binding_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ACTIVATION: Cell<Option<u64>> = const { Cell::new(None) }; }
+    pub fn activation() -> Option<u64> { ACTIVATION.with(Cell::get) }
+    /// Arm `activation` on this thread until the guard drops (also on unwind).
+    pub fn arm(activation: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore {
+            fn drop(&mut self) { ACTIVATION.with(|c| c.set(self.0)); }
+        }
+        Restore(ACTIVATION.with(|c| c.replace(Some(activation))))
+    }
+}
+
 /// Test-only, thread-local KES schedule override. `cfg(test)`: it cannot
 /// exist in a shipped binary.
 #[cfg(test)]
@@ -3649,6 +3702,18 @@ mod kes_schedule_tests {
             assert_eq!(kes_registration_open(epoch), epoch >= 7360);
             assert_eq!(kes_period(epoch), (epoch >= 8620).then(|| (epoch - 8620) / 90));
         }
+    }
+
+    #[test]
+    fn the_epoch_bound_registration_message_is_unarmed() {
+        assert_eq!(KES_REGISTER_EPOCH_BINDING_EPOCH, u64::MAX);
+        for epoch in [0, 7_359, 7_360, 8_620, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert!(!kes_register_epoch_bound(epoch), "epoch {epoch}");
+        }
+        let _armed = kes_register_binding_rehearsal::arm(7_360);
+        assert!(!kes_register_epoch_bound(7_359));
+        assert!(kes_register_epoch_bound(7_360));
+        assert!(kes_register_epoch_bound(u64::MAX));
     }
 
     #[test]

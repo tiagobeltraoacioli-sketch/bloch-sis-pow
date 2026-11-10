@@ -61,6 +61,7 @@ const DS_LEAF: &[u8] = b"BLOCH-KES-v1/leaf";
 const DS_PK: &[u8] = b"BLOCH-KES-v1/pk";
 const DS_NODE: &[u8] = b"BLOCH-KES-v1/node";
 const DS_REGISTER: &[u8] = b"BLOCH-KES-v1/register";
+const DS_REGISTER_V2: &[u8] = b"BLOCH-KES-v2/register";
 const DS_SIGN: &[u8] = b"BLOCH-KES-v2/sign";
 const DS_AUTHORITY: &[u8] = b"BLOCH-KES-v1/authority";
 const DS_ROTATE: &[u8] = b"BLOCH-KES-v1/rotate";
@@ -467,6 +468,31 @@ pub fn verify<V: SignatureVerifier + ?Sized>(
 /// registration cannot be replayed onto another network or validator.
 pub fn register_signing_root(network_domain: &[u8; 32], validator: u32, public: &KesPublic) -> [u8; 32] {
     h(&[DS_REGISTER, network_domain, &validator.to_le_bytes(), &[public.depth], &public.root])
+}
+
+/// The epoch-bound registration root (security review CR-5), in force from
+/// `params::KES_REGISTER_EPOCH_BINDING_EPOCH`: [`register_signing_root`]'s
+/// fields under a new domain tag, plus the epoch of the block that includes
+/// the registration. Consensus verifies against the including block's epoch
+/// only, so the signature is valid in exactly that epoch and a captured
+/// registration cannot be rebroadcast later (after its tree left the retired
+/// history) to put a destroyed or leaked key back in force. The distinct tag
+/// keeps the two forms from ever being taken for each other.
+pub fn register_signing_root_v2(network_domain: &[u8; 32], validator: u32, epoch: u64, public: &KesPublic) -> [u8; 32] {
+    h(&[DS_REGISTER_V2, network_domain, &validator.to_le_bytes(), &epoch.to_le_bytes(), &[public.depth], &public.root])
+}
+
+/// The registration message consensus verifies in a block of `epoch`, and so
+/// the one tooling must sign for a registration meant for that epoch:
+/// [`register_signing_root`] before the flag day,
+/// [`register_signing_root_v2`] from it on. The one rule the transition and
+/// `bloch-pos kes register` share.
+pub fn register_signing_root_at(network_domain: &[u8; 32], validator: u32, public: &KesPublic, epoch: u64) -> [u8; 32] {
+    if crate::params::kes_register_epoch_bound(epoch) {
+        register_signing_root_v2(network_domain, validator, epoch, public)
+    } else {
+        register_signing_root(network_domain, validator, public)
+    }
 }
 
 /// The root the CURRENT leaf of `validator`'s key in force signs (through
@@ -903,6 +929,66 @@ mod tests {
         assert_ne!(base, register_signing_root(&[2; 32], 3, &k));
         assert_ne!(base, register_signing_root(&[1; 32], 4, &k));
         assert_ne!(base, register_signing_root(&[1; 32], 3, &KesPublic::new(11, [5; 32], 0)));
+    }
+
+    /// The pre-flag-day registration message, pinned byte for byte: SHA3-256
+    /// of `"BLOCH-KES-v1/register" ‖ domain ‖ validator LE ‖ depth ‖ root`.
+    /// It must never change (signatures over it are on chain).
+    #[test]
+    fn the_legacy_registration_root_is_pinned() {
+        let k = KesPublic::new(12, [0x22; 32], 0);
+        let mut preimage = b"BLOCH-KES-v1/register".to_vec();
+        preimage.extend_from_slice(&[0x11; 32]);
+        preimage.extend_from_slice(&7u32.to_le_bytes());
+        preimage.push(12);
+        preimage.extend_from_slice(&[0x22; 32]);
+        let expected: [u8; 32] = Sha3_256::digest(&preimage).into();
+        assert_eq!(register_signing_root(&[0x11; 32], 7, &k), expected);
+        assert_eq!(hex(&expected), LEGACY_REGISTER_ROOT_VECTOR);
+        // The start period was never part of it.
+        assert_eq!(register_signing_root(&[0x11; 32], 7, &KesPublic::new(12, [0x22; 32], 9)), expected);
+        // While the flag day is unarmed, every epoch selects this form.
+        for epoch in [0, 7_360, 8_620, u64::MAX] {
+            assert_eq!(register_signing_root_at(&[0x11; 32], 7, &k, epoch), expected, "epoch {epoch}");
+        }
+    }
+
+    #[test]
+    fn the_epoch_bound_registration_root_binds_every_field_and_its_own_domain() {
+        let k = KesPublic::new(12, [0x22; 32], 0);
+        let base = register_signing_root_v2(&[0x11; 32], 7, 7_360, &k);
+        let mut preimage = b"BLOCH-KES-v2/register".to_vec();
+        preimage.extend_from_slice(&[0x11; 32]);
+        preimage.extend_from_slice(&7u32.to_le_bytes());
+        preimage.extend_from_slice(&7_360u64.to_le_bytes());
+        preimage.push(12);
+        preimage.extend_from_slice(&[0x22; 32]);
+        let expected: [u8; 32] = Sha3_256::digest(&preimage).into();
+        assert_eq!(base, expected);
+        assert_eq!(hex(&base), EPOCH_BOUND_REGISTER_ROOT_VECTOR);
+        assert_ne!(base, register_signing_root(&[0x11; 32], 7, &k), "never the legacy message");
+        assert_ne!(base, register_signing_root_v2(&[0x11; 32], 7, 7_361, &k), "the epoch");
+        assert_ne!(base, register_signing_root_v2(&[0x12; 32], 7, 7_360, &k), "the network");
+        assert_ne!(base, register_signing_root_v2(&[0x11; 32], 8, 7_360, &k), "the validator");
+        assert_ne!(base, register_signing_root_v2(&[0x11; 32], 7, 7_360, &KesPublic::new(11, [0x22; 32], 0)), "the depth");
+        assert_ne!(base, register_signing_root_v2(&[0x11; 32], 7, 7_360, &KesPublic::new(12, [0x23; 32], 0)), "the tree");
+        assert_ne!(base, rotate_signing_root(&[0x11; 32], 7, 7_360, 12, &[0x22; 32]), "never a rotation message");
+    }
+
+    #[test]
+    fn the_flag_day_selects_the_registration_message_by_inclusion_epoch() {
+        let _armed = crate::params::kes_register_binding_rehearsal::arm(100);
+        let k = KesPublic::new(12, [0x22; 32], 0);
+        assert_eq!(register_signing_root_at(&[1; 32], 7, &k, 99), register_signing_root(&[1; 32], 7, &k));
+        assert_eq!(register_signing_root_at(&[1; 32], 7, &k, 100), register_signing_root_v2(&[1; 32], 7, 100, &k));
+        assert_eq!(register_signing_root_at(&[1; 32], 7, &k, 101), register_signing_root_v2(&[1; 32], 7, 101, &k));
+    }
+
+    const LEGACY_REGISTER_ROOT_VECTOR: &str = "3d4ae40a237e92a94bd01d64621a4e0c1dc9343f75213bc7787ad1908bdc44f9";
+    const EPOCH_BOUND_REGISTER_ROOT_VECTOR: &str = "3d2c96375c269edca93fb4901e3584a4504fac2952aa1001090d6427127f1fa5";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 

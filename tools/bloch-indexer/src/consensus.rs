@@ -97,6 +97,9 @@ gates!(
     KES_REGISTRATION_EPOCH,
     HF3_KES_ENFORCE_EPOCH,
     KES_ACTIVATION_EPOCH,
+    // Security review CR-5: epoch-bound KES registration message. Same wire
+    // form and ledger effect as 0x17; nothing new to index.
+    KES_REGISTER_EPOCH_BINDING_EPOCH,
     HF3_SLH_SUITE_EPOCH,
     HF3_PQ_MIGRATION_EPOCH,
     LATTICE_EMERGENCY_ACTIVATION_EPOCH,
