@@ -1005,6 +1005,30 @@ pub mod rehearsal {
     }
 
     thread_local! {
+        static ATTESTATION_SLOT_EPOCH_BINDING_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat
+    /// [`super::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH`] as bound.
+    /// Its own switch, default CLOSED, because its inert value selects the
+    /// old rule.
+    pub fn attestation_slot_epoch_binding_forced() -> bool {
+        ATTESTATION_SLOT_EPOCH_BINDING_TL.with(|c| c.get())
+    }
+
+    /// Binds the vote slot-epoch binding for this thread until drop.
+    pub fn attestation_slot_epoch_binding_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ATTESTATION_SLOT_EPOCH_BINDING_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = ATTESTATION_SLOT_EPOCH_BINDING_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
+    thread_local! {
         static REWARDS_V2_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
     }
 
@@ -1785,6 +1809,46 @@ pub const TX_BYTES_BOUND_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// Ships INERT at `u64::MAX`; `attestation_dedup_gate_is_inert` pins the
 /// value.
 pub const ATTESTATION_DEDUP_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for **binding an in-block vote to its slot's epoch** (security
+/// review FC-3 / CR-1, 2026-11-10). `u64::MAX` = INERT: below it step 8 is
+/// byte-for-byte the rule the chain runs today.
+///
+/// Step 8 requires `epoch_of(att.data.slot) == st.epoch` and nothing of
+/// `att.data.target_epoch` beyond `source_epoch < target_epoch`, yet
+/// `attestation::validate` chose the vote's KES signing mode
+/// (`kes::signing_mode`) by `target_epoch`, while gossip and slashing-evidence
+/// verification choose it by `epoch_of(att.data.slot)`. `signing_mode`
+/// answers `Static` for any epoch below the bind (and for a period in which
+/// the validator had no key in force), so once KES binds a vote with a
+/// current slot and an old `target_epoch` would still be block-valid under
+/// the STATIC key of a KES-registered validator — the key forward security
+/// exists to retire — and two such conflicting votes could not be proven as
+/// evidence, which judges them under KES.
+///
+/// From this epoch on (the including block's committed epoch, which step 8
+/// already pins to the vote's slot epoch):
+///
+/// 1. a block carrying a vote with `target_epoch != epoch_of(slot)` is
+///    invalid — the honest attester has always set them equal;
+/// 2. `attestation::validate` selects the KES mode by `epoch_of(slot)`, the
+///    epoch every other verifier of the same vote uses.
+///
+/// Soft fork: it only removes blocks from the valid set, but a mixed fleet
+/// still splits on the first block that carries such a vote, so arming is a
+/// flag day. It should bind no later than KES enforcement
+/// ([`HF3_KES_ENFORCE_EPOCH`]); arming it earlier is harmless to honest votes.
+pub const ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Is the vote slot-epoch binding active in `epoch` (the vote's slot epoch,
+/// which block validation pins to the including block's committed epoch)?
+pub fn attestation_slot_epoch_binding_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    let forced = rehearsal::attestation_slot_epoch_binding_forced();
+    #[cfg(not(test))]
+    let forced = false;
+    forced || epoch_gate_active(epoch, ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH)
+}
 
 /// Flag day for **rewards v2** (audit R1 M1 + M3 + M4, R7 M5, 2026-09-06):
 /// one constant, four rules that all change committed state and therefore

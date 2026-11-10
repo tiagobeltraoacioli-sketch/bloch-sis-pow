@@ -545,9 +545,12 @@ impl AttestationPool {
         //    reason — see below.
         //    The fingerprint is `SHA3(static key)` before KES enforcement and
         //    also commits to the KES key, domain and period after it
-        //    (`crate::kes::authority_fingerprint`).
+        //    (`crate::kes::authority_fingerprint`). It is taken for the vote
+        //    SLOT's epoch, the same epoch step 7 verifies under, so a cached
+        //    verdict is always bound to the authority that produced it
+        //    (review FC-3 / CR-1; it used to be the signer-chosen target).
         let Some(current_pubkey_sha3) =
-            crate::kes::authority_fingerprint(keys, att.validator, att.data.target_epoch)
+            crate::kes::authority_fingerprint(keys, att.validator, crate::epoch_of(att.data.slot))
         else {
             // IGNORE, not Reject. A committee member this node cannot resolve
             // is a node that is BEHIND — its registry projection has not yet
@@ -594,7 +597,7 @@ impl AttestationPool {
         //    same key fingerprint; a defensive key mismatch takes the normal
         //    verification path. Only verified attestations are recorded or
         //    parked, so a forger cannot frame a validator.
-        //    From KES enforcement on, the leaf of the target epoch's period
+        //    From KES enforcement on, the leaf of the slot epoch's period
         //    signs (`crate::kes::verify_validator`); before it, the static key.
         let already_authenticated = authenticated_pubkey_sha3 == Some(current_pubkey_sha3);
         if !already_authenticated

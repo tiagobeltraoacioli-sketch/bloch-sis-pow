@@ -534,14 +534,27 @@ pub fn validate(
     // The registry read, last, beside the verify it feeds. A committee member
     // with no registry key cannot be dismissed as a bad signature: it means
     // this registry does not know the validator, which is a different fact.
-    // From KES enforcement on, the vote must carry the leaf of its target
-    // epoch's period (`crate::kes::verify_validator`); before it, this is
-    // exactly the static-key check it always was.
+    // From KES enforcement on, the vote must carry the leaf of its epoch's
+    // period (`crate::kes::verify_validator`); before it, this is exactly
+    // the static-key check it always was.
+    //
+    // Which epoch: the vote SLOT's — the one gossip and slashing-evidence
+    // verification use — from
+    // `params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH` on. Below
+    // that gate it stays the signer-chosen `target_epoch`, as shipped: after
+    // KES binds the two can select different keys (review FC-3 / CR-1), so
+    // the switch is a validity change and waits for the flag day.
+    let slot_epoch = crate::epoch_of(att.data.slot);
+    let authority_epoch = if crate::params::attestation_slot_epoch_binding_active(slot_epoch) {
+        slot_epoch
+    } else {
+        att.data.target_epoch
+    };
     let Some(valid) = crate::kes::verify_validator(
         keys,
         verifier,
         att.validator,
-        att.data.target_epoch,
+        authority_epoch,
         &att.data.signing_root(),
         &att.signature,
     ) else {

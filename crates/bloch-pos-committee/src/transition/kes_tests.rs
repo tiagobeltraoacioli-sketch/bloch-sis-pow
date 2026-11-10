@@ -1357,4 +1357,139 @@ mod kes_rules {
             .map(|_| ());
         assert_eq!(outcome, Ok(()), "two rotations made a provable period-1 equivocation unprovable");
     }
+
+    // ── Review FC-3 / CR-1: one epoch selects a vote's signing mode ───────
+
+    /// TRIPWIRE. `ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH` must stay
+    /// `u64::MAX` until the founder names an epoch: it tightens body validity
+    /// (a vote whose target is not its slot's epoch goes from accepted to
+    /// refused). Whoever arms it deletes this test first, and reads the
+    /// constant's docs while doing so.
+    #[test]
+    fn the_vote_slot_epoch_binding_gate_is_inert() {
+        assert_eq!(crate::params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH, u64::MAX);
+        for e in [0u64, 1, 8_619, 8_620, 100_000, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::attestation_slot_epoch_binding_active(e), "epoch {e} must be below");
+        }
+    }
+
+    const OLD_TARGET_EPOCH: u64 = 1; // below `Armed::enforcing(2, 1)`: static mode
+    const VOTE_EPOCH: u64 = 3; // period 3 - 2 = 1
+
+    /// KES bound, every validator registered, and a committee seat in
+    /// `VOTE_EPOCH`: `(transition, parent state, chains, vote slot, member)`.
+    /// The caller holds `Armed::enforcing(2, 1)`.
+    fn bound_fixture() -> (Transition<ToyVerifier>, CommittedState, Vec<RandaoChain>, u64, u32) {
+        let (t, g, chains) = setup_with(4, ToyVerifier, &[]);
+        let mut pre = bound(g);
+        for v in 0..4 {
+            pre.kes.insert(v, toy_kes_public(v).into());
+        }
+        let mut ctx = pre.clone();
+        while ctx.epoch < VOTE_EPOCH {
+            ctx = ctx.close_epoch();
+        }
+        let (slot, member) = a_committee_seat(&ctx);
+        assert_eq!(crate::epoch_of(slot), VOTE_EPOCH);
+        (t, pre, chains, slot, member)
+    }
+
+    /// A vote in `slot` whose target is the old, pre-enforcement epoch.
+    fn old_target_vote(st: &CommittedState, v: u32, slot: u64, signature: impl Fn(&[u8; 32]) -> Vec<u8>) -> Attestation {
+        let mut att = vote(st, v, slot, 0xA7, |_| Vec::new());
+        att.data.source_epoch = 0;
+        att.data.target_epoch = OLD_TARGET_EPOCH;
+        att.signature = signature(&att.data.signing_root());
+        att
+    }
+
+    #[test]
+    fn with_the_binding_armed_a_static_key_vote_with_an_old_target_is_refused_in_a_block() {
+        let _armed = Armed::enforcing(2, 1);
+        let (t, pre, mut chains, slot, member) = bound_fixture();
+        let block_slot = VOTE_EPOCH * 32 + 31;
+        let stale = old_target_vote(&pre, member, slot, |r| toy_sign(&[member as u8; 8], r));
+        // Gate inert: exactly today's rule. The static key of a KES-registered
+        // validator still makes this vote block-valid after the bind, because
+        // its old target selects the static mode (`build_block` applies it).
+        let env = build_block(&t, &pre, block_slot, std::slice::from_ref(&stale), &[], &mut chains);
+        assert!(t.compute_post_state(&pre, &env, std::slice::from_ref(&stale), &[]).is_ok(), "inert: unchanged");
+        // Armed: the same block is refused at step 8, naming the vote.
+        let _gate = crate::params::rehearsal::attestation_slot_epoch_binding_guard();
+        assert_eq!(
+            t.compute_post_state(&pre, &env, std::slice::from_ref(&stale), &[]).map(|_| ()),
+            Err(TransitionError::Attestation(0)),
+        );
+        // And so is one whose old target carries a genuine KES leaf: the
+        // target itself must be the slot's epoch.
+        let (t, pre, mut chains, slot, member) = bound_fixture();
+        let leaf = old_target_vote(&pre, member, slot, |r| honest_own(&pre, member, 1, r));
+        let honest_vote = vote(&pre, member, slot, 0xA7, |r| honest_own(&pre, member, 1, r));
+        let env = build_block(&t, &pre, block_slot, std::slice::from_ref(&honest_vote), &[], &mut chains);
+        assert!(
+            t.compute_post_state(&pre, &env, std::slice::from_ref(&honest_vote), &[]).is_ok(),
+            "armed: the honest vote (target == slot epoch, KES leaf) still applies"
+        );
+        let mut swapped = env;
+        swapped.header.attestation_root = crate::derive::attestation_root(std::slice::from_ref(&leaf));
+        swapped.proposer_sig = honest_own(&pre, swapped.header.proposer_index, 1, &swapped.header.proposal_signing_root());
+        assert_eq!(
+            t.compute_post_state(&pre, &swapped, std::slice::from_ref(&leaf), &[]).map(|_| ()),
+            Err(TransitionError::Attestation(0)),
+        );
+    }
+
+    #[test]
+    fn with_the_binding_inert_the_honest_vote_and_block_are_unchanged() {
+        let _armed = Armed::enforcing(2, 1);
+        let build = || {
+            let (t, pre, mut chains, slot, member) = bound_fixture();
+            let honest_vote = vote(&pre, member, slot, 0xA7, |r| honest_own(&pre, member, 1, r));
+            let env = build_block(&t, &pre, VOTE_EPOCH * 32 + 31, std::slice::from_ref(&honest_vote), &[], &mut chains);
+            let post = t.compute_post_state(&pre, &env, std::slice::from_ref(&honest_vote), &[]).expect("applies");
+            (env.header.id(), post.state_root())
+        };
+        let inert = build();
+        let _gate = crate::params::rehearsal::attestation_slot_epoch_binding_guard();
+        assert_eq!(build(), inert, "an honest chain is the same block and state on both sides of the gate");
+    }
+
+    #[test]
+    fn block_validation_and_evidence_agree_on_the_signing_mode_once_the_binding_is_armed() {
+        let _armed = Armed::enforcing(2, 1);
+        let (_t, pre, _chains, slot, member) = bound_fixture();
+        let by_static = old_target_vote(&pre, member, slot, |r| toy_sign(&[member as u8; 8], r));
+        let by_leaf = old_target_vote(&pre, member, slot, |r| honest_own(&pre, member, 1, r));
+        let block = |att: &Attestation| crate::attestation::validate(att, &[member], slot, &ToyVerifier, &view(&pre)).is_ok();
+        let evidence = |att: &Attestation| {
+            crate::slashing::verify_offender_signature(
+                &view(&pre),
+                &ToyVerifier,
+                member,
+                crate::epoch_of(att.data.slot),
+                &att.data.signing_root(),
+                &att.signature,
+            ) == Some(true)
+        };
+        // Evidence verification always judged by the slot's epoch: KES.
+        assert!(!evidence(&by_static) && evidence(&by_leaf));
+        // Gate inert: block validation still reads the target (the finding).
+        assert!(block(&by_static) && !block(&by_leaf), "inert: unchanged");
+        // Armed: both judge the same vote under the same key.
+        let _gate = crate::params::rehearsal::attestation_slot_epoch_binding_guard();
+        for att in [&by_static, &by_leaf] {
+            assert_eq!(block(att), evidence(att));
+        }
+        assert!(!block(&by_static), "the static key signs nothing for a KES-bound validator");
+        // A conflicting pair that block validation would count is provable.
+        let mut second = by_leaf.clone();
+        second.data.head = [0xB8; 32];
+        second.signature = honest_own(&pre, member, 1, &second.data.signing_root());
+        assert!(block(&second));
+        let dels: [crate::delegation::Delegation; 0] = [];
+        let pair = crate::slashing::SlashingEvidence { first: by_leaf, second };
+        assert!(crate::slashing::SlashingState::new()
+            .process(&pair, VOTE_EPOCH + 1, 0, &dels, 1_000_000, 0, &ToyVerifier, &view(&pre))
+            .is_ok());
+    }
 }

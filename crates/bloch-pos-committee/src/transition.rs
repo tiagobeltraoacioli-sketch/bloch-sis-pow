@@ -6782,6 +6782,7 @@ impl<V: SignatureVerifier> Transition<V> {
         //    here would reject bodies an older producer can legitimately
         //    build.
         let dedup_active = CommittedState::attestation_dedup_active(st.epoch);
+        let slot_epoch_binding_active = crate::params::attestation_slot_epoch_binding_active(st.epoch);
         let mut seen: BTreeSet<(u32, [u8; 32])> = BTreeSet::new();
         // Verdict-preserving replay suppression below the flag day. The live
         // rule still ACCEPTS a repeated pair, so it cannot use the gated
@@ -6798,6 +6799,13 @@ impl<V: SignatureVerifier> Transition<V> {
         for (i, att) in attestations.iter().enumerate() {
             let reject = TransitionError::Attestation(i as u32);
             if crate::epoch_of(att.data.slot) != st.epoch {
+                return Err(reject);
+            }
+            // Review FC-3 / CR-1 (gated, inert as shipped): a vote targets
+            // the epoch of its own slot, as the honest attester always has.
+            // Without it the signer-chosen target could select another KES
+            // signing mode than the slot epoch every other verifier uses.
+            if slot_epoch_binding_active && att.data.target_epoch != st.epoch {
                 return Err(reject);
             }
             let signing_root = att.data.signing_root();

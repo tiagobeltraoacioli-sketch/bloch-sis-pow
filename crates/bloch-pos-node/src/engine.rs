@@ -3189,6 +3189,11 @@ impl Engine {
                 epoch_of(a.data.slot) == e
                     && a.data.slot <= slot
                     && a.data.source_epoch < a.data.target_epoch
+                    // Gated step-8 rule (review FC-3 / CR-1): once it binds,
+                    // a vote whose target is not its slot's epoch would
+                    // invalidate the block.
+                    && (!bloch_pos_committee::params::attestation_slot_epoch_binding_active(e)
+                        || a.data.target_epoch == e)
                     && partition
                         .get((a.data.slot % SLOTS_PER_EPOCH) as usize)
                         .is_some_and(|c| c.binary_search(&a.validator).is_ok())
