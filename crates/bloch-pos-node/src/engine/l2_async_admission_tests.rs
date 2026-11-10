@@ -114,13 +114,17 @@ fn a_source_that_spent_its_allowance_is_limited_before_the_proof() {
     let slot = node.wall_slot();
     let noisy = Some([0xC4; 32]);
     let before = node.gossip_verifier.budget_used_at(slot);
-    let per_source = GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT / L2_PROOF_VERIFICATION_UNITS;
-    assert!(per_source >= 1, "one source can always have a proof verified");
-    for n in 0..per_source {
-        let tx = wire(settlement(&node, [n as u8 + 2; 356]));
-        assert_eq!(node.on_transaction_from(tx, noisy), Err(REFUSED));
-    }
-    let spent = before + per_source * L2_PROOF_VERIFICATION_UNITS;
+    assert!(
+        GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT >= L2_PROOF_VERIFICATION_UNITS,
+        "one source can always have a proof verified",
+    );
+    // One invalid proof is verified and refused. It is charged to the
+    // sender's failure allowance at the proof's full weight, which a single
+    // proof exhausts, so the sender's next proof this slot is never verified.
+    assert!(L2_PROOF_VERIFICATION_UNITS >= GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
+    let tx = wire(settlement(&node, [2; 356]));
+    assert_eq!(node.on_transaction_from(tx, noisy), Err(REFUSED));
+    let spent = before + L2_PROOF_VERIFICATION_UNITS;
     assert_eq!(node.gossip_verifier.budget_used_at(slot), spent);
 
     // The next distinct settlement from that source is shed: retryable, no

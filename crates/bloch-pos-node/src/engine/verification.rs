@@ -437,18 +437,19 @@ impl<V: SignatureVerifier> SignatureVerifier for BudgetedVerifier<'_, V> {
     /// the engine bars the refused transaction bytes, which is the exact
     /// replay. Reserves [`L2_PROOF_VERIFICATION_UNITS`] before the pairing
     /// check and forwards to the fixed inner verifier.
+    ///
+    /// It goes through the same `admit`/`settle` as every signature: a
+    /// source that has spent its failure allowance is refused before the
+    /// pairing check, and an invalid proof is charged to its sender at the
+    /// proof's full weight. Honest provers never submit an invalid proof.
     fn verify_l2_settlement(&self, policy: &[u8; 32], program: &[u8; 32], values: &[u8], proof: &[u8]) -> bool {
-        if !self.owner.reserve_verification(
-            self.slot,
-            self.cap,
-            self.source,
-            self.source_cap,
-            L2_PROOF_VERIFICATION_UNITS,
-        ) {
-            self.limited.set(true);
+        if !self.admit(L2_PROOF_VERIFICATION_UNITS) {
             return false;
         }
-        self.owner.verifier.verify_l2_settlement(policy, program, values, proof)
+        self.settle(
+            self.owner.verifier.verify_l2_settlement(policy, program, values, proof),
+            L2_PROOF_VERIFICATION_UNITS,
+        )
     }
 
     /// Spend witnesses at `epoch`. Below HF3 this is exactly
@@ -960,6 +961,49 @@ mod tests {
     /// A settlement proof draws on the same per-source and per-slot
     /// allowance as signatures, at its own weight, and a source that has
     /// spent its share is shed before the proof verifier runs.
+    /// An invalid settlement proof is charged to its sender's failure
+    /// allowance at full weight, so the sender's next proof in the slot is
+    /// refused before the pairing check while other sources are unaffected.
+    #[test]
+    fn invalid_l2_proof_spends_its_senders_failure_allowance() {
+        struct Proofs(Cell<usize>);
+        impl SignatureVerifier for Proofs {
+            fn verify_with_key(&self, _: &[u8], _: &[u8; 32], _: &[u8]) -> bool { false }
+            fn verify_l2_settlement(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8], proof: &[u8]) -> bool {
+                self.0.set(self.0.get() + 1);
+                proof == [1]
+            }
+        }
+        let verifier = GossipVerifier::new(Proofs(Cell::new(0)));
+        let (noisy, honest) = ([0x0D; 32], [0x0E; 32]);
+        let failures = super::super::GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT;
+        assert!(L2_PROOF_VERIFICATION_UNITS >= failures, "one bad proof must exhaust the allowance");
+        let open = |source| {
+            verifier
+                .budgeted_for_source(
+                    40,
+                    super::super::GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+                    Some(source),
+                    super::super::GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+                )
+                .with_failure_allowance(failures)
+        };
+        let first = open(noisy);
+        assert!(!first.verify_l2_settlement(&[0; 32], &[0; 32], &[0], &[2]));
+        assert!(!first.limited(), "the first invalid proof is verified and refused");
+        drop(first);
+        assert_eq!(verifier.verifier.0.get(), 1);
+        let second = open(noisy);
+        assert!(!second.verify_l2_settlement(&[0; 32], &[0; 32], &[0], &[1]));
+        assert!(second.failure_limited(), "the sender is past its failure allowance");
+        drop(second);
+        assert_eq!(verifier.verifier.0.get(), 1, "the second proof never reached the verifier");
+        let other = open(honest);
+        assert!(other.verify_l2_settlement(&[0; 32], &[0; 32], &[0], &[1]));
+        drop(other);
+        assert_eq!(verifier.verifier.0.get(), 2);
+    }
+
     #[test]
     fn l2_proof_verification_spends_weighted_source_allowance() {
         struct Proofs(Cell<usize>);
