@@ -916,6 +916,45 @@ const _: () = assert!(ORPHAN_BYTES_MAX >= crate::p2p::MAX_SYNC_FRAME as usize);
 /// receives the same one-block slice as ordinary admitted blocks.
 const ORPHAN_PROMOTIONS_PER_TURN: usize = 1;
 
+/// Longest back-off between two rewinds to a floor that yielded nothing, as
+/// a power of two of the sync cadence (two slots): 2^5 cadences is 64 slots,
+/// the same two epochs one rewind window reaches back.
+const SYNC_REWIND_BACKOFF_MAX_SHIFT: u32 = 5;
+
+/// Node-local back-off for sync rewinds that yield nothing (P2P-6).
+///
+/// A "rewind" is a `get_blocks` request whose cursor is below the applied
+/// head. Its only purpose is to fetch blocks a head-forward request cannot
+/// return: ancestors of a competing branch at or below this node's own head
+/// slot. A rewind is therefore fruitful exactly when a block at or below the
+/// head slot it was issued from is stored afterwards; otherwise every block
+/// it was answered with was a duplicate, paid for by honest peers.
+///
+/// After a fruitless rewind to floor `F`, a rewind to `F` or to any higher
+/// floor (a subset of the range already shown to hold nothing new) is held
+/// back for an interval that doubles with every consecutive fruitless
+/// attempt, up to [`SYNC_REWIND_BACKOFF_MAX_SHIFT`]. A strictly lower floor
+/// is never held back: that is how a genuine page chase walks backwards
+/// towards a fork point, and it is bounded below by the finalized slot.
+/// While a rewind is held back the node still syncs forward from its head.
+/// One stored block from the rewound range clears the whole state.
+#[derive(Default)]
+struct SyncRewindBackoff {
+    /// Floor of the rewind request whose outcome is not settled yet.
+    awaiting: Option<u64>,
+    /// Blocks stored at or below this slot count as the yield of a rewind:
+    /// the applied head slot when the latest rewind was issued.
+    yield_ceiling: u64,
+    /// Consecutive rewinds that yielded nothing.
+    fruitless: u32,
+    /// Floor of the latest fruitless rewind.
+    floor: u64,
+    /// Earliest time a rewind to `floor` or above may be issued again.
+    retry_at_ms: u64,
+    /// A wanted rewind was held back; retry it once `retry_at_ms` passes.
+    deferred: bool,
+}
+
 /// Distinct authenticated proposals retained per genesis validator duty.
 /// One is the protocol intent; two preserve the complete equivocation pair.
 /// A third proposal signed by the same key for the same slot proves nothing
@@ -1760,6 +1799,9 @@ struct Engine {
     /// False during boot replay: no log appends, no broadcasts, no logs.
     live: bool,
     needs_sync: bool,
+    /// Back-off for sync requests that reach below the applied head and
+    /// bring nothing back. See [`SyncRewindBackoff`].
+    sync_rewind: SyncRewindBackoff,
     last_applied_ms: u64,
     booted_ms: u64,
     /// The weak-subjectivity anchor this node booted under (epoch, root), and
@@ -1874,9 +1916,10 @@ struct Engine {
     /// parent has had the longest to arrive and has not, so it is the one
     /// least likely to ever connect.
     ///
-    /// Parking sets `needs_sync`, so the gap the orphan is evidence of is
-    /// asked for over the wire. That is what makes eviction cheap: the worst
-    /// case is a round trip, never a missed branch.
+    /// Parking an AUTHENTICATED orphan sets `needs_sync`, so the gap it is
+    /// evidence of is asked for over the wire. That is what makes eviction
+    /// cheap: the worst case is a round trip, never a missed branch.
+    /// Unauthenticated entries are evicted before authenticated ones.
     orphans: VecDeque<(
         [u8; 32],
         BlockEnvelope,
@@ -3360,15 +3403,76 @@ impl Engine {
     /// whose missing parent is older than that head. Start a bounded window
     /// before the earliest orphan; successive pages can move that window
     /// backwards until they connect, without rewinding consensus state.
+    ///
+    /// Only orphans whose proposer signature verified move the cursor
+    /// (P2P-6). An envelope naming an identity this node cannot check is
+    /// held, but its `slot` is an unauthenticated number off the wire and
+    /// must not choose how much history honest peers are asked to resend.
     fn sync_after_slot(&self) -> u64 {
-        if !self.needs_sync && self.orphans.is_empty() { return self.state.slot(); }
-        let missing_before = self.orphans.iter()
+        let mut authenticated = self.orphans.iter()
+            .filter(|(_, _, _, authentication, _)| authentication.is_some())
+            .peekable();
+        if !self.needs_sync && authenticated.peek().is_none() { return self.state.slot(); }
+        let missing_before = authenticated
             .map(|(_, env, _, _, _)| env.header.slot.saturating_sub(1))
             .min().unwrap_or(self.state.slot()).min(self.state.slot());
         let finalized = self.state.finality().finalized.root;
         let floor = self.chain.iter().rev().find(|(_, id)| *id.as_bytes() == finalized)
             .map_or(0, |(slot, _)| *slot);
         missing_before.saturating_sub(SLOTS_PER_EPOCH.saturating_mul(2)).max(floor)
+    }
+
+    /// The cursor for the sync request being sent now, with rewinds that
+    /// keep yielding nothing backed off. See [`SyncRewindBackoff`].
+    fn sync_request_after_slot(&mut self, now_ms: u64, cadence_ms: u64) -> u64 {
+        let head = self.state.slot();
+        let max_interval = cadence_ms
+            .saturating_mul(1u64 << SYNC_REWIND_BACKOFF_MAX_SHIFT);
+        if let Some(floor) = self.sync_rewind.awaiting.take() {
+            // Still unsettled when the next request is due: nothing from
+            // the rewound range was stored. A long quiet period since the
+            // previous fruitless attempt makes this an unrelated gap, not
+            // one more step of the same streak.
+            if now_ms > self.sync_rewind.retry_at_ms.saturating_add(max_interval) {
+                self.sync_rewind.fruitless = 0;
+            }
+            self.sync_rewind.fruitless = self.sync_rewind.fruitless.saturating_add(1);
+            self.sync_rewind.floor = floor;
+            let shift = self.sync_rewind.fruitless.min(SYNC_REWIND_BACKOFF_MAX_SHIFT);
+            self.sync_rewind.retry_at_ms = now_ms
+                .saturating_add(cadence_ms.saturating_mul(1u64 << shift));
+        }
+        self.sync_rewind.deferred = false;
+        let wanted = self.sync_after_slot();
+        if wanted >= head {
+            return wanted;
+        }
+        if self.sync_rewind.fruitless > 0
+            && wanted >= self.sync_rewind.floor
+            && now_ms < self.sync_rewind.retry_at_ms
+        {
+            // Held back, not forgotten: sync forward now, rewind later.
+            self.sync_rewind.deferred = true;
+            return head;
+        }
+        self.sync_rewind.awaiting = Some(wanted);
+        self.sync_rewind.yield_ceiling = head;
+        wanted
+    }
+
+    /// Whether a rewind that was held back may be tried again.
+    fn sync_rewind_due(&self, now_ms: u64) -> bool {
+        self.sync_rewind.deferred && now_ms >= self.sync_rewind.retry_at_ms
+    }
+
+    /// A block entered `blocks`. One at or below the head slot the latest
+    /// rewind was issued from is something only a rewind could have fetched.
+    fn note_sync_rewind_yield(&mut self, slot: u64) {
+        if (self.sync_rewind.awaiting.is_some() || self.sync_rewind.fruitless > 0)
+            && slot <= self.sync_rewind.yield_ceiling
+        {
+            self.sync_rewind = SyncRewindBackoff::default();
+        }
     }
 
     /// Ingest `env` and then everything it unblocks, discarding the verdict.
@@ -3784,7 +3888,9 @@ impl Engine {
                     &env.proposer_sig,
                 ) == Some(true),
             None => {
-                // Unknown identity: hold it, ask for the gap, decide nothing.
+                // Unknown identity: hold it, decide nothing. It does not
+                // ask for a gap either (P2P-6): nothing about this envelope
+                // is authenticated, so it may not steer the sync cursor.
                 self.park_orphan(id, env, src);
                 return (Verdict::Ignore, None);
             }
@@ -3896,6 +4002,7 @@ impl Engine {
         let proposer_slot = env.header.slot;
         self.observe_proposer_equivocation(&env);
         self.blocks.insert(id, env);
+        self.note_sync_rewind_yield(proposer_slot);
         self.note_own_signature(
             proposer_index,
             crate::slashprot::Published::Proposal { slot: proposer_slot },
@@ -3914,7 +4021,9 @@ impl Engine {
         (Verdict::Accept, Some((id, grew_registry)))
     }
 
-    /// Park a block whose parent is unknown, and ask the mesh for the gap.
+    /// Park a block whose parent is unknown or whose proposer this node
+    /// cannot check. Only one whose proposer signature verified
+    /// (`authentication` is `Some`) asks the mesh for the gap (P2P-6).
     ///
     /// Deduplicated by id across both waiting and ready-to-promote tails, so a
     /// mesh that hands the same orphan back on every heartbeat occupies one
@@ -3997,7 +4106,20 @@ impl Engine {
         while self.orphans.len().saturating_add(self.deferred_orphans.len()) >= ORPHAN_MAX
             || !retention_bytes_fit(held_bytes, retained_bytes, ORPHAN_BYTES_MAX)
         {
-            if let Some((_, _, _, _, evicted_bytes)) = self.orphans.pop_front() {
+            // P2P-6: the oldest UNAUTHENTICATED entry leaves first, and an
+            // unauthenticated newcomer never displaces an entry whose
+            // proposer signature verified — it is dropped instead. FIFO
+            // order is unchanged within each class.
+            let victim = match self.orphans.iter()
+                .position(|(_, _, _, held, _)| held.is_none())
+            {
+                Some(unauthenticated) => Some(unauthenticated),
+                None if authentication.is_some() && !self.orphans.is_empty() => Some(0),
+                None => None,
+            };
+            if let Some((_, _, _, _, evicted_bytes)) =
+                victim.and_then(|at| self.orphans.remove(at))
+            {
                 held_bytes = held_bytes.saturating_sub(evicted_bytes);
                 self.orphans_evicted = self.orphans_evicted.saturating_add(1);
             } else {
@@ -4005,9 +4127,15 @@ impl Engine {
                 return;
             }
         }
+        let authenticated = authentication.is_some();
         self.orphans.push_back((id, env, src, authentication, retained_bytes));
-        // The gap is real and the sync loop is the thing that closes it.
-        self.needs_sync = true;
+        // The gap is real and the sync loop is the thing that closes it —
+        // but only a verified proposer signature makes it real. An
+        // unauthenticated envelope is held so it can be judged if its branch
+        // arrives; it does not get to request history on its own word.
+        if authenticated {
+            self.needs_sync = true;
+        }
     }
 
     /// Record one authenticated proposal, returning false only when gossip
@@ -6978,6 +7106,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
         live: false,
         needs_sync: false,
+        sync_rewind: SyncRewindBackoff::default(),
         orphans: VecDeque::new(),
         deferred_orphans: VecDeque::new(),
         orphans_evicted: 0,
@@ -7482,7 +7611,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             engine.last_applied_ms,
             two_slots_ms,
         );
-        let sync_needed = behind || engine.needs_sync;
+        let sync_needed = behind || engine.needs_sync || engine.sync_rewind_due(now);
         let stale_head_quarantined = duty_sync_gate.update(
             behind,
             engine.state.slot(),
@@ -7509,9 +7638,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // can be cleared, so requesting sync cannot accidentally enable the
         // duties immediately below it.
         if sync_needed && now.saturating_sub(last_sync_req) > two_slots_ms {
+            let after_slot = engine.sync_request_after_slot(now, two_slots_ms);
             engine
                 .net
-                .broadcast(net::get_blocks_frame(engine.sync_after_slot()));
+                .broadcast(net::get_blocks_frame(after_slot));
             engine.needs_sync = false;
             last_sync_req = now;
         }
@@ -10681,6 +10811,7 @@ mod transfer_v2_end_to_end {
             block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
+            sync_rewind: SyncRewindBackoff::default(),
             orphans: VecDeque::new(),
             deferred_orphans: VecDeque::new(),
             orphans_evicted: 0,
@@ -12063,6 +12194,7 @@ mod perf_support {
             block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
+            sync_rewind: SyncRewindBackoff::default(),
             orphans: VecDeque::new(),
             deferred_orphans: VecDeque::new(),
             orphans_evicted: 0,
@@ -14388,6 +14520,7 @@ mod duty_view_anchor {
             block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
+            sync_rewind: SyncRewindBackoff::default(),
             orphans: VecDeque::new(),
             deferred_orphans: VecDeque::new(),
             orphans_evicted: 0,
@@ -14657,6 +14790,7 @@ mod slot_horizon {
             block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
+            sync_rewind: SyncRewindBackoff::default(),
             last_applied_ms: now_ms(),
             booted_ms: now_ms(),
             ws_anchor: None,
@@ -15027,6 +15161,229 @@ mod ingest_admission_tests {
         );
     }
 
+    /// An envelope naming a proposer index this node has not registered, on
+    /// a parent it has never seen. Nothing in it is authenticated.
+    fn unauthenticated_orphan(template: &BlockEnvelope, tag: u16, slot: u64) -> BlockEnvelope {
+        let mut env = template.clone();
+        env.header.proposer_index = 7;
+        env.header.slot = slot;
+        env.header.parent = [0x5C; 32];
+        env.header.parent[..2].copy_from_slice(&tag.to_le_bytes());
+        env
+    }
+
+    fn park_as_authenticated(engine: &mut Engine, env: BlockEnvelope) -> [u8; 32] {
+        let id = *env.block_id().as_bytes();
+        let proof = AuthenticatedBlockAdmission::new(&env, &[0u8; 32]);
+        engine.park_orphan_authenticated(id, env, Source::Local, Some(proof));
+        id
+    }
+
+    /// **P2P-6: an orphan nobody signed for does not steer sync.** It is
+    /// held, but it neither latches `needs_sync` nor lowers the cursor; the
+    /// same gap named by a block whose proposer signature verifies does both.
+    #[test]
+    fn only_an_authenticated_orphan_requests_sync_or_rewinds_the_cursor() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let (mut engine, _dir, template, stored) = fixture();
+        engine.needs_sync = false;
+        let head = engine.state.slot();
+        assert!(head > 0, "the fixture applied one block");
+        assert_eq!(engine.sync_after_slot(), head);
+
+        for tag in 0..4u16 {
+            let verdict = engine.ingest_judged_from_source(
+                unauthenticated_orphan(&template, tag, 1),
+                Some([tag as u8; 32]),
+            );
+            assert!(matches!(verdict, Verdict::Ignore), "held, never charged to the relay");
+        }
+        assert_eq!(engine.orphans.len(), 4, "unauthenticated orphans are still held");
+        assert_eq!(engine.blocks.len(), stored);
+        assert!(!engine.needs_sync, "an unverified envelope must not request history");
+        assert_eq!(
+            engine.sync_after_slot(),
+            head,
+            "an unverified slot number must not lower the sync cursor",
+        );
+        // Even once something else latches the request, the unverified
+        // entries add nothing to how far back it reaches.
+        engine.needs_sync = true;
+        let latched_only = engine.sync_after_slot();
+        engine.needs_sync = false;
+
+        let signed = repointed(&engine, &template, [0x9A; 32], 2);
+        engine.ingest(signed);
+        assert_eq!(engine.orphans.len(), 5);
+        assert!(engine.needs_sync, "a verified orphan is evidence of a real gap");
+        assert!(
+            engine.sync_after_slot() < head,
+            "and it rewinds the cursor below the applied head",
+        );
+        assert!(engine.sync_after_slot() <= latched_only);
+    }
+
+    /// **P2P-6: a rewind that brings nothing back is not repeated at once.**
+    /// The same floor is held back for an interval that doubles per fruitless
+    /// attempt, the node keeps syncing forward meanwhile, and one block from
+    /// the rewound range clears the back-off.
+    #[test]
+    fn repeated_fruitless_rewinds_back_off_and_a_yield_clears_them() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        const CADENCE: u64 = 1_000;
+        let head = engine.state.slot();
+        let gap = repointed(&engine, &template, [0x9A; 32], 2);
+        park_as_authenticated(&mut engine, gap);
+        let floor = engine.sync_after_slot();
+        assert!(floor < head, "the fixture's gap is a rewind");
+
+        let mut now = 100_000u64;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor, "first rewind is free");
+
+        // Nothing was stored. Count how long the same floor stays held back
+        // after each further fruitless attempt.
+        let mut held_for = Vec::new();
+        for _ in 0..3 {
+            now += CADENCE + 1;
+            assert_eq!(
+                engine.sync_request_after_slot(now, CADENCE),
+                head,
+                "a fruitless floor is not asked for again straight away; sync goes forward",
+            );
+            let held_from = now;
+            assert!(!engine.sync_rewind_due(now));
+            while engine.sync_request_after_slot(now, CADENCE) == head {
+                now += CADENCE + 1;
+            }
+            held_for.push(now - held_from);
+        }
+        assert!(
+            held_for[0] < held_for[1] && held_for[1] < held_for[2],
+            "the interval grows with every fruitless rewind: {held_for:?}",
+        );
+
+        // Held back again, and the slot loop is told when to retry.
+        now += CADENCE + 1;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), head);
+        assert!(!engine.sync_rewind_due(now));
+        assert!(engine.sync_rewind_due(engine.sync_rewind.retry_at_ms));
+
+        // A block above the head the rewind was issued from could have come
+        // from a forward request: not a yield.
+        engine.note_sync_rewind_yield(head + 1);
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), head);
+        // One at or below it could only have come from the rewind.
+        engine.note_sync_rewind_yield(head);
+        assert_eq!(
+            engine.sync_request_after_slot(now, CADENCE),
+            floor,
+            "a rewind that yielded clears the back-off",
+        );
+    }
+
+    /// **P2P-6: the back-off never exceeds its cap, and a lower floor is
+    /// never held back** — that is how a genuine page chase walks backwards.
+    #[test]
+    fn rewind_back_off_is_capped_and_does_not_hold_a_lower_floor() {
+        let (mut engine, _dir, _template, _stored) = fixture();
+        const CADENCE: u64 = 1_000;
+        engine.sync_rewind.fruitless = 40;
+        engine.sync_rewind.floor = 10;
+        engine.sync_rewind.awaiting = Some(10);
+        engine.sync_rewind.retry_at_ms = 50_000;
+        let _ = engine.sync_request_after_slot(50_001, CADENCE);
+        assert_eq!(
+            engine.sync_rewind.retry_at_ms,
+            50_001 + (CADENCE << SYNC_REWIND_BACKOFF_MAX_SHIFT),
+        );
+
+        let (mut engine, _dir, template, _stored) = fixture();
+        let head = engine.state.slot();
+        let gap = repointed(&engine, &template, [0x9A; 32], 2);
+        park_as_authenticated(&mut engine, gap);
+        let floor = engine.sync_after_slot();
+        assert!(floor < head);
+        engine.sync_rewind.fruitless = 3;
+        engine.sync_rewind.floor = floor + 1;
+        engine.sync_rewind.retry_at_ms = u64::MAX;
+        assert_eq!(
+            engine.sync_request_after_slot(1_000, CADENCE),
+            floor,
+            "a strictly lower floor is new ground and is asked for at once",
+        );
+    }
+
+    /// **P2P-6: unauthenticated orphans are the first to go.** They cannot
+    /// push out an orphan whose proposer signature verified, however many
+    /// sources send them.
+    #[test]
+    fn unauthenticated_orphans_are_evicted_before_authenticated_ones() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        const SIGNED: usize = 4;
+        let mut signed_ids = Vec::new();
+        for i in 0..SIGNED {
+            let mut env = template.clone();
+            env.header.parent = [0xA7; 32];
+            env.header.parent[0] = i as u8;
+            signed_ids.push(park_as_authenticated(&mut engine, env));
+        }
+        let mut unsigned_ids = Vec::new();
+        for i in 0..ORPHAN_MAX - SIGNED {
+            let env = unauthenticated_orphan(&template, i as u16, 2);
+            let id = *env.block_id().as_bytes();
+            unsigned_ids.push(id);
+            engine.park_orphan(id, env, Source::Gossip(Some([(i / ORPHANS_PER_SOURCE) as u8; 32])));
+        }
+        assert_eq!(engine.orphans.len(), ORPHAN_MAX);
+        assert_eq!(engine.orphans_evicted, 0);
+        let held = |engine: &Engine, id: &[u8; 32]| {
+            engine.orphans.iter().any(|(seen, _, _, _, _)| seen == id)
+        };
+
+        // A full pool, the four oldest entries authenticated: more
+        // unauthenticated envelopes displace only each other.
+        for i in 0..8u16 {
+            let env = unauthenticated_orphan(&template, 0x4000 + i, 2);
+            let id = *env.block_id().as_bytes();
+            engine.park_orphan(id, env, Source::Gossip(Some([0xF0; 32])));
+            assert!(held(&engine, &id));
+        }
+        assert_eq!(engine.orphans.len(), ORPHAN_MAX);
+        assert_eq!(engine.orphans_evicted, 8);
+        assert!(signed_ids.iter().all(|id| held(&engine, id)), "verified orphans stay");
+        assert!(
+            unsigned_ids[..8].iter().all(|id| !held(&engine, id))
+                && unsigned_ids[8..].iter().all(|id| held(&engine, id)),
+            "the oldest unauthenticated entries left, in FIFO order",
+        );
+
+        // A pool holding only authenticated orphans: an unauthenticated
+        // newcomer is dropped, an authenticated one evicts the oldest.
+        engine.orphans.retain(|(_, _, _, authentication, _)| authentication.is_some());
+        let mut i = 0u16;
+        while engine.orphans.len() < ORPHAN_MAX {
+            let mut env = template.clone();
+            env.header.parent = [0xB7; 32];
+            env.header.parent[..2].copy_from_slice(&i.to_le_bytes());
+            park_as_authenticated(&mut engine, env);
+            i += 1;
+        }
+        let before = engine.orphans_evicted;
+        let intruder = unauthenticated_orphan(&template, 0x7000, 2);
+        let intruder_id = *intruder.block_id().as_bytes();
+        engine.park_orphan(intruder_id, intruder, Source::Gossip(Some([0xF1; 32])));
+        assert!(!held(&engine, &intruder_id), "it is the newcomer that is dropped");
+        assert_eq!(engine.orphans_evicted, before + 1);
+        assert!(signed_ids.iter().all(|id| held(&engine, id)));
+
+        let mut env = template.clone();
+        env.header.parent = [0xC7; 32];
+        let newcomer = park_as_authenticated(&mut engine, env);
+        assert!(held(&engine, &newcomer));
+        assert!(!held(&engine, &signed_ids[0]), "authenticated work is FIFO among itself");
+        assert_eq!(engine.orphans.len(), ORPHAN_MAX);
+    }
+
     /// **A repeated orphan takes one slot, not one per delivery.** Without the
     /// dedup a full mesh re-offering the same block would evict the whole pool
     /// with copies of itself.
@@ -15237,7 +15594,16 @@ mod ingest_admission_tests {
         let incoming = orphan_with_encoded_len(&template, [0xEF; 32], first_large_bytes);
         let incoming_id = *incoming.block_id().as_bytes();
         let evicted_before = engine.orphans_evicted;
-        engine.park_orphan(incoming_id, incoming, Source::Gossip(Some([0xEF; 32])));
+        // Authenticated, because only a verified orphan requests recovery
+        // (P2P-6); the entries it displaces are all unauthenticated, so the
+        // eviction order under test is still plain FIFO.
+        let incoming_proof = AuthenticatedBlockAdmission::new(&incoming, &[0u8; 32]);
+        engine.park_orphan_authenticated(
+            incoming_id,
+            incoming,
+            Source::Gossip(Some([0xEF; 32])),
+            Some(incoming_proof),
+        );
 
         let expected_evictions = tiny_entries + 1;
         assert_eq!(
