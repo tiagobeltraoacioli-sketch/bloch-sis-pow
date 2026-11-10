@@ -683,12 +683,44 @@ const LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = 2;
 /// 30 seconds; overload is retryable in the next slot.
 const LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT: usize = 256;
 
-/// New hybrid verifications allowed across block, attestation and transaction
-/// network admission in one wall slot. Consensus execution and this node's own
+/// New hybrid verifications allowed across attestation, transaction and
+/// evidence network admission in one wall slot. Blocks draw on their own
+/// allowances below, so this traffic can never spend the units a block
+/// needs. Consensus execution and this node's own
 /// proposal are deliberately outside this node-local relay budget. At the
 /// 30-second cadence, 1,024 leaves large honest burst headroom while making
 /// unique-signature CPU finite even as the bounded transport queue drains.
+///
+/// With the two block allowances the worst case is 1,024 + 256 + 512 = 1,792
+/// units per wall slot (before the separate lifecycle allowance).
 const GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT: usize = 1_024;
+
+/// Proposer-signature verifications allowed for gossiped blocks in one wall
+/// slot, and one source's share of them. Live gossip carries about one new
+/// block per slot; the rest is headroom for forks and equivocations.
+const BLOCK_VERIFICATIONS_TOTAL_PER_SLOT: usize = 256;
+const BLOCK_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = 32;
+
+/// Proposer-signature verifications reserved for blocks from directed sync
+/// and from operator-configured peers ([`Source::Directed`]), so gossip can
+/// never starve catch-up. One source may spend one full sync page per slot,
+/// the share it had before the allowances were separated.
+const DIRECTED_BLOCK_VERIFICATIONS_TOTAL_PER_SLOT: usize = 4 * crate::p2p::MAX_SYNC_BLOCKS;
+const DIRECTED_BLOCK_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = crate::p2p::MAX_SYNC_BLOCKS;
+
+/// Units of FAILED proposer-signature verification one source may cause in
+/// one wall slot. Past it the source's blocks are ignored for the rest of
+/// the slot without verification, so invalid signatures are charged to their
+/// sender and cannot drain a shared allowance. An honest source essentially
+/// never relays an invalid signature.
+const BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT: usize = 8;
+
+/// The same rule for attestations, transactions and evidence, counted apart
+/// from blocks so invalid votes never close a source's block door. Wider
+/// than the block allowance because a peer on a branch with a different
+/// registry can relay votes this node's keys do not verify; a quarter of one
+/// source's share still leaves 32 sources, not 8, needed to spend the total.
+const GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT: usize = 32;
 
 /// Share one normalized transport source may spend from the aggregate relay
 /// verification allowance in one wall slot. Eight independent sources can
@@ -1014,6 +1046,11 @@ enum Source {
     /// Arrived over the network, or was promoted out of the orphan pool
     /// after arriving over the network.
     Gossip(Option<[u8; 32]>),
+    /// Arrived over the network in answer to this node's own sync request, or
+    /// from a peer the operator configured. Untrusted exactly like
+    /// [`Source::Gossip`]; it differs only in which verification allowance
+    /// its proposer signature draws on.
+    Directed(Option<[u8; 32]>),
     /// Built by this node's own `propose`.
     Local,
 }
@@ -1032,7 +1069,7 @@ impl Source {
     /// clock rule it was never meant to answer to.
     fn bounded_by_wall_clock(self) -> bool {
         match self {
-            Source::Gossip(_) => true,
+            Source::Gossip(_) | Source::Directed(_) => true,
             Source::Local => false,
         }
     }
@@ -1041,8 +1078,25 @@ impl Source {
     /// fairness. Missing attribution still receives the aggregate cap.
     fn verification_source(self) -> Option<[u8; 32]> {
         match self {
-            Source::Gossip(source) => source,
+            Source::Gossip(source) | Source::Directed(source) => source,
             Source::Local => None,
+        }
+    }
+
+    /// The per-slot allowance (lane, total, one source's share) a block from
+    /// this source verifies its proposer signature under.
+    fn block_verification_allowance(self) -> (verification::VerificationLane, usize, usize) {
+        match self {
+            Source::Directed(_) => (
+                verification::VerificationLane::DirectedBlock,
+                DIRECTED_BLOCK_VERIFICATIONS_TOTAL_PER_SLOT,
+                DIRECTED_BLOCK_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+            ),
+            Source::Gossip(_) | Source::Local => (
+                verification::VerificationLane::GossipBlock,
+                BLOCK_VERIFICATIONS_TOTAL_PER_SLOT,
+                BLOCK_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+            ),
         }
     }
 }
@@ -3618,6 +3672,7 @@ impl Engine {
         scheduler: &mut DeferredWorkScheduler,
         block_scheduler: &mut DeferredBlockScheduler,
     ) -> (bool, bool, bool) {
+        self.requeue_budget_parked_blocks(slot);
         let block_ready = self.ready_future_block_pending(slot)
             || !self.deferred_orphans.is_empty();
         let held_ready = !self.held_release_roots.is_empty();
@@ -3850,12 +3905,14 @@ impl Engine {
                 if proof_matches {
                     true
                 } else {
-                    let verifier = self.gossip_verifier.budgeted_for_source(
+                    let (lane, lane_cap, lane_source_cap) = src.block_verification_allowance();
+                    let verifier = self.gossip_verifier.budgeted_lane_for_source(
                         self.wall_slot(),
-                        GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+                        lane,
+                        lane_cap,
                         src.verification_source(),
-                        GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
-                    );
+                        lane_source_cap,
+                    ).with_failure_allowance(BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
                     let verified = bloch_pos_committee::kes::verify_validator(
                         &*self.state,
                         // HF2: the consensus signature rule of the header's own
@@ -3869,8 +3926,15 @@ impl Engine {
                     ) == Some(true);
                     if verifier.limited() {
                         // Local overload is not proof of a forgery. Ignore so an
-                        // honest relay is not scored; sync retries from the
-                        // applied head on its ordinary timer.
+                        // honest relay is not scored. A block refused only by
+                        // the allowance is held in the bounded orphan pool and
+                        // judged when the allowance renews; a source past its
+                        // failure allowance is ignored outright.
+                        let park = !verifier.failure_limited();
+                        drop(verifier);
+                        if park {
+                            self.park_budget_limited_block(id, env, src);
+                        }
                         return (Verdict::Ignore, None);
                     }
                     verified
@@ -4135,6 +4199,36 @@ impl Engine {
         // arrives; it does not get to request history on its own word.
         if authenticated {
             self.needs_sync = true;
+        }
+    }
+
+    /// Hold a block whose proposer signature was not checked only because
+    /// this wall slot's verification allowance was spent. It is parked
+    /// unauthenticated under the orphan pool's own count and byte shares, and
+    /// [`Self::requeue_budget_parked_blocks`] re-offers it next slot.
+    fn park_budget_limited_block(&mut self, id: [u8; 32], env: BlockEnvelope, src: Source) {
+        if self.orphans.iter().any(|(seen, _, _, _, _)| *seen == id)
+            || self.deferred_orphans.iter().any(|(seen, _, _, _, _)| *seen == id)
+        {
+            return;
+        }
+        self.park_orphan(id, env, src);
+        if self.orphans.back().is_some_and(|(seen, _, _, _, _)| *seen == id) {
+            self.gossip_verifier.note_budget_parked_block(self.wall_slot(), id, ORPHAN_MAX);
+        }
+    }
+
+    /// Move blocks parked by a spent allowance in a slot before `slot` to the
+    /// ready-to-promote tail. Promotion repeats the whole door, including the
+    /// proposer signature, under the renewed allowance.
+    fn requeue_budget_parked_blocks(&mut self, slot: u64) {
+        for id in self.gossip_verifier.take_budget_parked_blocks_before(slot) {
+            let Some(at) = self.orphans.iter().position(|(seen, _, _, _, _)| *seen == id) else {
+                continue;
+            };
+            if let Some(parked) = self.orphans.remove(at) {
+                self.deferred_orphans.push_back(parked);
+            }
         }
     }
 
@@ -4988,7 +5082,7 @@ impl Engine {
                 GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
                 verification_source,
                 GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
-            );
+            ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
             let admission = admissible_with_network_verifier(
                 &tx,
                 epoch_of(self.wall_slot()),
@@ -6056,7 +6150,7 @@ impl Engine {
             GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
             admission.verification_source(),
             GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
-        );
+        ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
         let decision = match admission {
             AttestationAdmission::Fresh { att, verification_source } => pool.process_from_source(
                 att,
@@ -7865,10 +7959,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
                             // Judge first, THEN speak. Nothing is relayed
                             // until the engine has an answer — the same
                             // contract the attestation arm below runs on.
-                            let verdict = engine.ingest_judged_from_source(
-                                env,
-                                origin.verification_source(),
-                            );
+                            let source = origin.verification_source();
+                            let verdict = if origin.directed_block() {
+                                engine.ingest_from_judged(env, Source::Directed(source))
+                            } else {
+                                engine.ingest_judged_from_source(env, source)
+                            };
                             engine.net.report(&origin, verdict);
                         }
                         EngineEvent::Net(NetEvent::Attestation(att, origin)) => {
@@ -16837,6 +16933,220 @@ mod ingest_admission_tests {
         assert!(!engine.release_orphan_turn());
         assert_eq!(engine.gossip_verifier.budget_used_at(2), 1);
         assert_eq!(*engine.head_id().as_bytes(), *child.block_id().as_bytes());
+    }
+
+    /// One proposed block, handed back so it can arrive over the network.
+    fn undelivered_block(slot: u64) -> (Engine, perf_support::TestDir, BlockEnvelope) {
+        let (mut engine, dir) = perf_support::proposing_engine();
+        let genesis = *engine.head_id().as_bytes();
+        engine.propose(slot);
+        let block = engine.blocks[engine.head_id().as_bytes()].clone();
+        assert!(engine.do_reorg(genesis, Vec::new()));
+        engine.blocks.remove(block.block_id().as_bytes()).expect("stored block");
+        (engine, dir, block)
+    }
+
+    /// Spend `lane` completely at `slot`: as many sources as it takes each
+    /// spend their whole share on distinct input (no failure allowance is
+    /// applied, so every unit is really spent).
+    fn spend_lane(
+        engine: &Engine,
+        slot: u64,
+        lane: verification::VerificationLane,
+        cap: usize,
+        source_cap: usize,
+    ) {
+        let mut n = 0u64;
+        while engine.gossip_verifier.lane_used_at(slot, lane) < cap {
+            let mut source = [0x5Au8; 32];
+            source[..8].copy_from_slice(&(n / source_cap as u64).to_le_bytes());
+            let mut root = [0u8; 32];
+            root[..8].copy_from_slice(&n.to_le_bytes());
+            root[31] = lane as u8;
+            let verifier = engine.gossip_verifier
+                .budgeted_lane_for_source(slot, lane, cap, Some(source), source_cap);
+            assert!(!verifier.verify_with_key(b"malformed", &root, b"malformed"));
+            assert!(!verifier.limited());
+            n = n.saturating_add(1);
+        }
+    }
+
+    /// P2P-3: attestations and transactions spending their whole allowance
+    /// must not stop a block from being verified in the same wall slot.
+    #[test]
+    fn spent_relay_allowance_does_not_stop_a_block_in_the_same_slot() {
+        let _clock = validator_lifecycle::clock_at(4);
+        let (mut engine, _dir, block) = undelivered_block(1);
+        spend_lane(
+            &engine,
+            4,
+            verification::VerificationLane::Relay,
+            GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+            GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+        );
+        let spent = engine.gossip_verifier.budgeted_for_source(
+            4,
+            GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+            Some([0xE1; 32]),
+            GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+        );
+        assert!(!spent.verify_with_key(b"malformed", &[0xE1; 32], b"malformed"));
+        assert!(spent.limited(), "the attestation and transaction allowance is spent");
+        drop(spent);
+
+        assert_eq!(
+            engine.ingest_judged_from_source(block.clone(), Some([0xE2; 32])),
+            Verdict::Accept,
+        );
+        assert_eq!(*engine.head_id().as_bytes(), *block.block_id().as_bytes());
+        assert_eq!(
+            engine.gossip_verifier.lane_used_at(4, verification::VerificationLane::GossipBlock),
+            1,
+        );
+        // The worst case stays finite and of the same order as before.
+        assert_eq!(
+            GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT
+                + BLOCK_VERIFICATIONS_TOTAL_PER_SLOT
+                + DIRECTED_BLOCK_VERIFICATIONS_TOTAL_PER_SLOT,
+            1_792,
+        );
+    }
+
+    /// P2P-3: gossiped blocks cannot spend the allowance reserved for
+    /// directed sync and operator-configured peers.
+    #[test]
+    fn spent_gossip_block_allowance_does_not_stop_a_directed_block() {
+        let _clock = validator_lifecycle::clock_at(4);
+        let (mut engine, _dir, block) = undelivered_block(1);
+        spend_lane(
+            &engine,
+            4,
+            verification::VerificationLane::GossipBlock,
+            BLOCK_VERIFICATIONS_TOTAL_PER_SLOT,
+            BLOCK_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+        );
+        assert_eq!(
+            engine.ingest_from_judged(block.clone(), Source::Directed(Some([0xE3; 32]))),
+            Verdict::Accept,
+        );
+        assert_eq!(*engine.head_id().as_bytes(), *block.block_id().as_bytes());
+        assert!(engine.orphans.is_empty());
+    }
+
+    /// P2P-3: forgeries are charged to the source that sent them. Past its
+    /// failure allowance the source is ignored without verification, without
+    /// spending a shared unit and without occupying the orphan pool; another
+    /// source is judged normally in the same slot.
+    #[test]
+    fn source_past_its_block_failure_allowance_is_ignored_unverified() {
+        let _clock = validator_lifecycle::clock_at(4);
+        let (mut engine, _dir, block) = undelivered_block(1);
+        let noisy = [0xE4; 32];
+        let lane = verification::VerificationLane::GossipBlock;
+        let forged = |n: usize| {
+            let mut forged = block.clone();
+            forged.proposer_sig.fill(0);
+            forged.proposer_sig[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            forged
+        };
+        for n in 0..BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT {
+            assert_eq!(
+                engine.ingest_judged_from_source(forged(n), Some(noisy)),
+                Verdict::Reject,
+            );
+        }
+        assert_eq!(
+            engine.gossip_verifier.lane_used_at(4, lane),
+            BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT,
+        );
+        let rejected = engine.rejected_unsigned;
+
+        engine.gossip_verifier.set_panic_on_verification(true);
+        for n in 100..140 {
+            assert_eq!(
+                engine.ingest_judged_from_source(forged(n), Some(noisy)),
+                Verdict::Ignore,
+            );
+        }
+        // Even its valid block waits for the next slot.
+        assert_eq!(
+            engine.ingest_judged_from_source(block.clone(), Some(noisy)),
+            Verdict::Ignore,
+        );
+        engine.gossip_verifier.set_panic_on_verification(false);
+        assert_eq!(
+            engine.gossip_verifier.lane_used_at(4, lane),
+            BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT,
+            "an ignored source spends no shared unit",
+        );
+        assert_eq!(engine.rejected_unsigned, rejected);
+        assert!(engine.orphans.is_empty(), "and is not parked");
+        assert!(engine.deferred_orphans.is_empty());
+
+        assert_eq!(
+            engine.ingest_judged_from_source(block.clone(), Some([0xE5; 32])),
+            Verdict::Accept,
+        );
+        assert_eq!(*engine.head_id().as_bytes(), *block.block_id().as_bytes());
+    }
+
+    /// P2P-3: a block refused only by the spent allowance is parked, not
+    /// dropped, stays parked for the rest of that slot, and is judged and
+    /// admitted when the next slot renews the allowance.
+    #[test]
+    fn budget_limited_block_is_parked_and_admitted_at_the_next_slot() {
+        let clock = validator_lifecycle::clock_at(4);
+        let (mut engine, _dir, block) = undelivered_block(1);
+        let genesis = *engine.head_id().as_bytes();
+        let id = *block.block_id().as_bytes();
+        let source = [0xE6; 32];
+        spend_lane(
+            &engine,
+            4,
+            verification::VerificationLane::GossipBlock,
+            BLOCK_VERIFICATIONS_TOTAL_PER_SLOT,
+            BLOCK_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+        );
+
+        assert_eq!(
+            engine.ingest_judged_from_source(block.clone(), Some(source)),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.orphans.len(), 1, "held, not dropped");
+        assert_eq!(engine.orphans[0].0, id);
+        assert_eq!(engine.orphans[0].2, Source::Gossip(Some(source)));
+        assert!(engine.orphans[0].3.is_none(), "and still unauthenticated");
+        assert!(!engine.blocks.contains_key(&id));
+        // A repeat is recognised without another park.
+        assert_eq!(
+            engine.ingest_judged_from_source(block.clone(), Some([0xE7; 32])),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.orphans.len(), 1);
+
+        let mut scheduler = DeferredWorkScheduler::default();
+        let mut block_scheduler = DeferredBlockScheduler::default();
+        assert_eq!(
+            engine.release_deferred_work_turn(4, &mut scheduler, &mut block_scheduler),
+            (false, false, false),
+            "the same slot has no allowance to judge it with",
+        );
+        assert_eq!(engine.orphans.len(), 1);
+        assert_eq!(*engine.head_id().as_bytes(), genesis);
+
+        drop(clock);
+        let _clock = validator_lifecycle::clock_at(5);
+        let (future_pending, orphans_pending, _) =
+            engine.release_deferred_work_turn(5, &mut scheduler, &mut block_scheduler);
+        assert!(!future_pending && !orphans_pending);
+        assert!(engine.orphans.is_empty());
+        assert!(engine.deferred_orphans.is_empty());
+        assert_eq!(*engine.head_id().as_bytes(), id, "admitted at the next slot");
+        assert_eq!(
+            engine.gossip_verifier.lane_used_at(5, verification::VerificationLane::GossipBlock),
+            1,
+            "its proposer signature was verified under the renewed allowance",
+        );
     }
 
     #[test]

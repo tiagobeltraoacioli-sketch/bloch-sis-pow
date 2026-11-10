@@ -908,7 +908,9 @@ fn run_outbound_reader(
             Ok(frame) => {
                 if frame.first() == Some(&FRAME_GET_BLOCKS) {
                     responder.answer(&_half.0, address.ip(), frame, &mut limiter);
-                } else if !decode_and_send_from_ip(&events, &budget, address.ip(), &frame) {
+                } else if !decode_and_send_from_peer(&events, &budget, address.ip(), &frame, true) {
+                    // `true`: this connection was dialled to an address the
+                    // operator configured, and it is the one sync is asked on.
                     return;
                 }
             }
@@ -1111,6 +1113,19 @@ fn decode_and_send_from_ip(
     ip: std::net::IpAddr,
     frame: &[u8],
 ) -> bool {
+    decode_and_send_from_peer(events, budget, ip, frame, false)
+}
+
+/// [`decode_and_send_from_ip`]; `configured` marks blocks read from a
+/// connection this node dialled, so the engine verifies them under the
+/// allowance reserved for sync and operator-configured peers.
+fn decode_and_send_from_peer(
+    events: &Sender<EngineEvent>,
+    budget: &QueueBudget,
+    ip: std::net::IpAddr,
+    frame: &[u8],
+    configured: bool,
+) -> bool {
     let Some((class, size)) = framed_event_shape(frame) else { return true };
     let Some(source_guard) = source_budget::Registry::reserve(
         &budget.sources,
@@ -1142,6 +1157,11 @@ fn decode_and_send_from_ip(
         NetEvent::Block(_, origin)
         | NetEvent::Attestation(_, origin)
         | NetEvent::Transaction(_, origin) => origin.set_reservation(source_guard),
+    }
+    if configured {
+        if let NetEvent::Block(_, origin) = &mut event {
+            origin.mark_directed_block();
+        }
     }
     if events.send(EngineEvent::Net(event)).is_err() {
         budget.release_raw(size);
@@ -2607,6 +2627,25 @@ mod tests {
             1,
             1 << 20,
         ).is_some(), "decode failure must release the per-IP charge");
+    }
+
+    /// Blocks read from a connection this node dialled are marked for the
+    /// verification allowance gossip cannot spend; inbound blocks are not.
+    #[test]
+    fn only_dialled_connections_mark_blocks_as_directed() {
+        let (tx, rx) = mpsc::channel::<EngineEvent>();
+        let budget = QueueBudget::with_caps(4, 1 << 20);
+        let ip = "192.0.2.46".parse().unwrap();
+        let frame = block_frame(&sync_test_block());
+        assert!(decode_and_send_from_ip(&tx, &budget, ip, &frame));
+        assert!(decode_and_send_from_peer(&tx, &budget, ip, &frame, true));
+        for directed in [false, true] {
+            let EngineEvent::Net(NetEvent::Block(_, origin)) = rx.recv().unwrap() else {
+                panic!("block event")
+            };
+            assert_eq!(origin.directed_block(), directed);
+        }
+        assert!(!Origin::none().directed_block());
     }
 
     #[test]

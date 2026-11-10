@@ -27,15 +27,57 @@ pub(super) struct GossipVerifier<V> {
     verifier: V,
     failures: RefCell<Failures>,
     budget: RefCell<SlotBudget>,
+    /// Ids of blocks parked only because a slot allowance was spent, with the
+    /// wall slot that refused them. Kept beside the budget that produced
+    /// them; the engine re-offers them once that slot has passed.
+    budget_parked: RefCell<VecDeque<(u64, [u8; 32])>>,
     #[cfg(test)]
     panic_on_verification: Cell<bool>,
+}
+
+/// Independent per-slot allowances. Votes and transactions can never spend
+/// the units a block needs, and gossiped blocks can never spend the units
+/// reserved for directed sync and operator-configured peers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum VerificationLane {
+    /// Attestations, transactions and slashing evidence.
+    Relay,
+    /// Blocks from ordinary gossip.
+    GossipBlock,
+    /// Blocks from directed sync or an operator-configured peer.
+    DirectedBlock,
+}
+
+const LANES: usize = 3;
+const FAILURE_GROUPS: usize = 2;
+
+impl VerificationLane {
+    fn index(self) -> usize {
+        match self {
+            VerificationLane::Relay => 0,
+            VerificationLane::GossipBlock => 1,
+            VerificationLane::DirectedBlock => 2,
+        }
+    }
+
+    /// Failures are counted per source for relay traffic and for blocks
+    /// separately, so invalid votes alone never close the block door.
+    fn failure_group(self) -> usize {
+        match self {
+            VerificationLane::Relay => 0,
+            VerificationLane::GossipBlock | VerificationLane::DirectedBlock => 1,
+        }
+    }
 }
 
 #[derive(Default)]
 struct SlotBudget {
     slot: Option<u64>,
-    used: usize,
-    by_source: BTreeMap<[u8; 32], usize>,
+    used: [usize; LANES],
+    by_source: BTreeMap<[u8; 32], [usize; LANES]>,
+    /// Units of failed verification per source. An entry exists only after a
+    /// reserved unit failed, so the map is bounded by the lane ceilings.
+    failed_by_source: BTreeMap<[u8; 32], [usize; FAILURE_GROUPS]>,
 }
 
 /// One node-local admission view of [`GossipVerifier`]. Exhaustion is exposed
@@ -47,7 +89,10 @@ pub(super) struct BudgetedVerifier<'a, V> {
     cap: usize,
     source: Option<[u8; 32]>,
     source_cap: usize,
+    lane: VerificationLane,
+    failure_cap: usize,
     limited: Cell<bool>,
+    failure_limited: Cell<bool>,
 }
 
 impl<V> GossipVerifier<V> {
@@ -56,6 +101,7 @@ impl<V> GossipVerifier<V> {
             verifier,
             failures: RefCell::new(Failures::default()),
             budget: RefCell::new(SlotBudget::default()),
+            budget_parked: RefCell::new(VecDeque::new()),
             #[cfg(test)]
             panic_on_verification: Cell::new(false),
         }
@@ -139,7 +185,10 @@ impl<V> GossipVerifier<V> {
             cap,
             source: None,
             source_cap: usize::MAX,
+            lane: VerificationLane::Relay,
+            failure_cap: usize::MAX,
             limited: Cell::new(false),
+            failure_limited: Cell::new(false),
         }
     }
 
@@ -150,7 +199,29 @@ impl<V> GossipVerifier<V> {
         source: Option<[u8; 32]>,
         source_cap: usize,
     ) -> BudgetedVerifier<'_, V> {
-        BudgetedVerifier { owner: self, slot, cap, source, source_cap, limited: Cell::new(false) }
+        self.budgeted_lane_for_source(slot, VerificationLane::Relay, cap, source, source_cap)
+    }
+
+    /// [`Self::budgeted_for_source`] drawing on `lane`'s own allowance.
+    pub(super) fn budgeted_lane_for_source(
+        &self,
+        slot: u64,
+        lane: VerificationLane,
+        cap: usize,
+        source: Option<[u8; 32]>,
+        source_cap: usize,
+    ) -> BudgetedVerifier<'_, V> {
+        BudgetedVerifier {
+            owner: self,
+            slot,
+            cap,
+            source,
+            source_cap,
+            lane,
+            failure_cap: usize::MAX,
+            limited: Cell::new(false),
+            failure_limited: Cell::new(false),
+        }
     }
 
     /// Reserve `units` of this slot's allowance. A unit is one suite-0x0001
@@ -160,6 +231,7 @@ impl<V> GossipVerifier<V> {
     fn reserve_verification(
         &self,
         slot: u64,
+        lane: VerificationLane,
         cap: usize,
         source: Option<[u8; 32]>,
         source_cap: usize,
@@ -168,28 +240,103 @@ impl<V> GossipVerifier<V> {
         let mut budget = self.budget.borrow_mut();
         if budget.slot != Some(slot) {
             budget.slot = Some(slot);
-            budget.used = 0;
+            budget.used = [0; LANES];
             budget.by_source.clear();
+            budget.failed_by_source.clear();
         }
+        let lane = lane.index();
         let units = units.max(1);
         if source.is_some_and(|key| {
-            budget.by_source.get(&key).copied().unwrap_or(0).saturating_add(units) > source_cap
+            budget.by_source.get(&key).map_or(0, |used| used[lane]).saturating_add(units) > source_cap
         }) {
             return false;
         }
-        if budget.used.saturating_add(units) > cap { return false; }
-        budget.used = budget.used.saturating_add(units);
+        if budget.used[lane].saturating_add(units) > cap { return false; }
+        budget.used[lane] = budget.used[lane].saturating_add(units);
         if let Some(key) = source {
             let used = budget.by_source.entry(key).or_default();
-            *used = used.saturating_add(units);
+            used[lane] = used[lane].saturating_add(units);
         }
         true
     }
 
+    /// Whether `source` already failed `failure_cap` units of `lane`'s
+    /// failure group in `slot`. Unattributed work has no failure allowance;
+    /// it stays bounded by the lane ceiling alone.
+    fn source_failures_spent(
+        &self,
+        slot: u64,
+        lane: VerificationLane,
+        source: Option<[u8; 32]>,
+        failure_cap: usize,
+    ) -> bool {
+        let Some(key) = source else { return false };
+        let budget = self.budget.borrow();
+        budget.slot == Some(slot)
+            && budget.failed_by_source.get(&key)
+                .is_some_and(|failed| failed[lane.failure_group()] >= failure_cap)
+    }
+
+    /// Charge a verification that ran and failed to the source that sent it.
+    fn note_source_failure(
+        &self,
+        slot: u64,
+        lane: VerificationLane,
+        source: Option<[u8; 32]>,
+        units: usize,
+    ) {
+        let Some(key) = source else { return };
+        let mut budget = self.budget.borrow_mut();
+        if budget.slot != Some(slot) { return; }
+        let failed = budget.failed_by_source.entry(key).or_default();
+        let group = lane.failure_group();
+        failed[group] = failed[group].saturating_add(units.max(1));
+    }
+
+    /// Remember that block `id` was parked in `slot` only because an
+    /// allowance was spent. At most `cap` ids are kept; the oldest is
+    /// forgotten first (that block then waits like any other parked block).
+    pub(super) fn note_budget_parked_block(&self, slot: u64, id: [u8; 32], cap: usize) {
+        let mut parked = self.budget_parked.borrow_mut();
+        if parked.iter().any(|(_, seen)| *seen == id) { return; }
+        while parked.len() >= cap.max(1) {
+            parked.pop_front();
+        }
+        parked.push_back((slot, id));
+    }
+
+    /// Remove and return the ids parked in a slot before `slot`: their
+    /// refusal was a statement about an allowance that has since renewed.
+    pub(super) fn take_budget_parked_blocks_before(&self, slot: u64) -> Vec<[u8; 32]> {
+        let mut parked = self.budget_parked.borrow_mut();
+        if !parked.iter().any(|(at, _)| *at < slot) { return Vec::new(); }
+        let mut ready = Vec::new();
+        parked.retain(|(at, id)| {
+            if *at < slot {
+                ready.push(*id);
+                false
+            } else {
+                true
+            }
+        });
+        ready
+    }
+
+    /// Units spent in `slot` across every lane.
     #[cfg(test)]
     pub(super) fn budget_used_at(&self, slot: u64) -> usize {
         let budget = self.budget.borrow();
-        if budget.slot == Some(slot) { budget.used } else { 0 }
+        if budget.slot == Some(slot) {
+            budget.used.iter().fold(0usize, |sum, used| sum.saturating_add(*used))
+        } else {
+            0
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn lane_used_at(&self, slot: u64, lane: VerificationLane) -> usize {
+        let budget = self.budget.borrow();
+        if budget.slot == Some(slot) { budget.used[lane.index()] } else { 0 }
     }
 
     #[cfg(test)]
@@ -198,8 +345,46 @@ impl<V> GossipVerifier<V> {
     }
 }
 
-impl<V> BudgetedVerifier<'_, V> {
+impl<'a, V> BudgetedVerifier<'a, V> {
     pub(super) fn limited(&self) -> bool { self.limited.get() }
+
+    /// Ignore this source, without verification, once `failure_cap` units of
+    /// its verifications have failed in this slot. Honest sources essentially
+    /// never relay an invalid signature, so invalid input is charged to its
+    /// sender instead of draining the allowance every source shares.
+    pub(super) fn with_failure_allowance(mut self, failure_cap: usize) -> BudgetedVerifier<'a, V> {
+        self.failure_cap = failure_cap;
+        self
+    }
+
+    /// Whether a verification was refused because this source spent its
+    /// failure allowance (implies [`Self::limited`]), as opposed to a spent
+    /// unit allowance.
+    pub(super) fn failure_limited(&self) -> bool { self.failure_limited.get() }
+
+    /// Reserve `units` for one real verification, or record why not.
+    fn admit(&self, units: usize) -> bool {
+        if self.owner.source_failures_spent(self.slot, self.lane, self.source, self.failure_cap) {
+            self.limited.set(true);
+            self.failure_limited.set(true);
+            return false;
+        }
+        if !self.owner.reserve_verification(
+            self.slot, self.lane, self.cap, self.source, self.source_cap, units,
+        ) {
+            self.limited.set(true);
+            return false;
+        }
+        true
+    }
+
+    /// Pass a real verification's result through, charging a failure.
+    fn settle(&self, verified: bool, units: usize) -> bool {
+        if !verified {
+            self.owner.note_source_failure(self.slot, self.lane, self.source, units);
+        }
+        verified
+    }
 }
 
 impl<V: SignatureVerifier> SignatureVerifier for BudgetedVerifier<'_, V> {
@@ -210,11 +395,10 @@ impl<V: SignatureVerifier> SignatureVerifier for BudgetedVerifier<'_, V> {
         if self.owner.is_known_failure(SignaturePolicy::Compatible, pubkey, &cache_root, signature) {
             return false;
         }
-        if !self.owner.reserve_verification(self.slot, self.cap, self.source, self.source_cap, 1) {
-            self.limited.set(true);
+        if !self.admit(1) {
             return false;
         }
-        self.owner.verify_kes_leaf(pubkey, root, signature)
+        self.settle(self.owner.verify_kes_leaf(pubkey, root, signature), 1)
     }
 
     fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
@@ -235,11 +419,10 @@ impl<V: SignatureVerifier> SignatureVerifier for BudgetedVerifier<'_, V> {
         }
         // The context-free path never runs an SLH-DSA verification (suite
         // 0x0003 is refused by its suite arm), so it costs one unit as before.
-        if !self.owner.reserve_verification(self.slot, self.cap, self.source, self.source_cap, 1) {
-            self.limited.set(true);
+        if !self.admit(1) {
             return false;
         }
-        self.owner.verify_with_key_under(policy, pubkey, root, signature)
+        self.settle(self.owner.verify_with_key_under(policy, pubkey, root, signature), 1)
     }
 
     /// Spend witnesses at `epoch`. Below HF3 this is exactly
@@ -265,11 +448,10 @@ impl<V: SignatureVerifier> BudgetedVerifier<'_, V> {
         }
         let units = usize::try_from(bloch_pos_committee::fee_market::verify_cost_units(pubkey))
             .unwrap_or(usize::MAX);
-        if !self.owner.reserve_verification(self.slot, self.cap, self.source, self.source_cap, units) {
-            self.limited.set(true);
+        if !self.admit(units) {
             return false;
         }
-        self.owner.verify_spend_gated(pubkey, root, signature, epoch, true)
+        self.settle(self.owner.verify_spend_gated(pubkey, root, signature, epoch, true), units)
     }
 }
 
@@ -614,6 +796,139 @@ mod tests {
         assert!(!verifier.verify_spend_gated(&pk, &root, &sig, 9, false), "below HF3: same cache");
         assert!(verifier.verify_spend_gated(&pk, &root, &sig, 9, true), "armed: fresh verdict");
         assert_eq!(verifier.verifier.0.get(), 1);
+    }
+
+    /// Votes and transactions draw on the relay lane; spending all of it
+    /// leaves both block lanes untouched, and gossiped blocks cannot spend
+    /// the lane reserved for directed sync.
+    #[test]
+    fn lanes_are_independent_allowances() {
+        let verifier = fixture();
+        let ok = |n: u8| [n; 32];
+        for n in 0u8..4 {
+            let relay = verifier.budgeted_for_source(95, 4, Some([1; 32]), 4);
+            assert!(relay.verify_with_key(b"registered key", &ok(n), &ok(n)));
+        }
+        let relay = verifier.budgeted_for_source(95, 4, Some([2; 32]), 4);
+        assert!(!relay.verify_with_key(b"registered key", &ok(9), &ok(9)));
+        assert!(relay.limited() && !relay.failure_limited());
+        drop(relay);
+
+        for n in 10u8..12 {
+            let gossip = verifier.budgeted_lane_for_source(
+                95, VerificationLane::GossipBlock, 2, Some([1; 32]), 2,
+            );
+            assert!(gossip.verify_with_key(b"registered key", &ok(n), &ok(n)));
+            assert!(!gossip.limited(), "the spent relay lane does not limit a block");
+        }
+        let gossip = verifier.budgeted_lane_for_source(
+            95, VerificationLane::GossipBlock, 2, Some([3; 32]), 2,
+        );
+        assert!(!gossip.verify_with_key(b"registered key", &ok(12), &ok(12)));
+        assert!(gossip.limited());
+        drop(gossip);
+
+        let directed = verifier.budgeted_lane_for_source(
+            95, VerificationLane::DirectedBlock, 2, Some([1; 32]), 2,
+        );
+        assert!(directed.verify_with_key(b"registered key", &ok(13), &ok(13)));
+        assert!(!directed.limited(), "gossiped blocks cannot spend the directed lane");
+        drop(directed);
+        assert_eq!(verifier.lane_used_at(95, VerificationLane::Relay), 4);
+        assert_eq!(verifier.lane_used_at(95, VerificationLane::GossipBlock), 2);
+        assert_eq!(verifier.lane_used_at(95, VerificationLane::DirectedBlock), 1);
+        assert_eq!(verifier.budget_used_at(95), 7);
+    }
+
+    /// A source that exceeds its failure allowance is ignored for the rest of
+    /// the slot without reaching the verifier or spending shared units, even
+    /// for input that would have verified. Other sources, the other failure
+    /// group and the next slot are unaffected.
+    #[test]
+    fn source_past_its_failure_allowance_is_ignored_without_spending_units() {
+        let verifier = fixture();
+        let noisy = [0x0B; 32];
+        let honest = [0x0C; 32];
+        let bad = [0xCC; 32];
+        for n in 0u8..2 {
+            let relay = verifier.budgeted_for_source(96, 100, Some(noisy), 100)
+                .with_failure_allowance(2);
+            assert!(!relay.verify_with_key(b"registered key", &[n; 32], &bad));
+            assert!(!relay.limited(), "failures inside the allowance are judged");
+        }
+        assert_eq!(verifier.budget_used_at(96), 2);
+        assert_eq!(verifier.verifier.calls.get(), 2);
+
+        for n in 2u8..40 {
+            let relay = verifier.budgeted_for_source(96, 100, Some(noisy), 100)
+                .with_failure_allowance(2);
+            assert!(!relay.verify_with_key(b"registered key", &[n; 32], &bad));
+            assert!(relay.limited() && relay.failure_limited());
+            // Even a valid signature from this source waits for the next slot.
+            assert!(!relay.verify_with_key(b"registered key", &[n; 32], &[n; 32]));
+            assert!(!relay.verify_kes_leaf(b"registered key", &[n; 32], &bad));
+            assert!(!relay.verify_spend_gated(b"registered key", &[n; 32], &bad, 5, true));
+        }
+        assert_eq!(verifier.budget_used_at(96), 2, "no shared unit was spent");
+        assert_eq!(verifier.verifier.calls.get(), 2, "and no cryptography ran");
+
+        // A remembered failure is still answered as a failure, not as limited.
+        let replay = verifier.budgeted_for_source(96, 100, Some(noisy), 100)
+            .with_failure_allowance(2);
+        assert!(!replay.verify_with_key(b"registered key", &[0; 32], &bad));
+        assert!(!replay.limited());
+        drop(replay);
+
+        // Relay failures do not close the same source's block lanes.
+        let block = verifier.budgeted_lane_for_source(
+            96, VerificationLane::GossipBlock, 100, Some(noisy), 100,
+        ).with_failure_allowance(2);
+        assert!(block.verify_with_key(b"registered key", &[50; 32], &[50; 32]));
+        assert!(!block.limited());
+        drop(block);
+        // Block failures are shared by both block lanes.
+        for n in 60u8..62 {
+            let block = verifier.budgeted_lane_for_source(
+                96, VerificationLane::GossipBlock, 100, Some(noisy), 100,
+            ).with_failure_allowance(2);
+            assert!(!block.verify_with_key(b"registered key", &[n; 32], &bad));
+            assert!(!block.limited());
+        }
+        let directed = verifier.budgeted_lane_for_source(
+            96, VerificationLane::DirectedBlock, 100, Some(noisy), 100,
+        ).with_failure_allowance(2);
+        assert!(!directed.verify_with_key(b"registered key", &[70; 32], &[70; 32]));
+        assert!(directed.failure_limited());
+        drop(directed);
+
+        let other = verifier.budgeted_for_source(96, 100, Some(honest), 100)
+            .with_failure_allowance(2);
+        assert!(other.verify_with_key(b"registered key", &[80; 32], &[80; 32]));
+        assert!(!other.limited(), "another source is judged normally");
+        drop(other);
+
+        let renewed = verifier.budgeted_for_source(97, 100, Some(noisy), 100)
+            .with_failure_allowance(2);
+        assert!(renewed.verify_with_key(b"registered key", &[90; 32], &[90; 32]));
+        assert!(!renewed.limited(), "the failure allowance renews with the slot");
+    }
+
+    #[test]
+    fn budget_parked_block_ids_are_bounded_and_released_only_after_their_slot() {
+        let verifier = fixture();
+        verifier.note_budget_parked_block(10, [1; 32], 2);
+        verifier.note_budget_parked_block(10, [1; 32], 2);
+        verifier.note_budget_parked_block(11, [2; 32], 2);
+        assert!(verifier.take_budget_parked_blocks_before(10).is_empty());
+        assert_eq!(verifier.take_budget_parked_blocks_before(11), vec![[1u8; 32]]);
+        assert!(verifier.take_budget_parked_blocks_before(11).is_empty());
+        verifier.note_budget_parked_block(11, [3; 32], 2);
+        verifier.note_budget_parked_block(11, [4; 32], 2);
+        assert_eq!(
+            verifier.take_budget_parked_blocks_before(12),
+            vec![[3u8; 32], [4u8; 32]],
+            "the oldest id is forgotten at the cap",
+        );
     }
 
     #[test]

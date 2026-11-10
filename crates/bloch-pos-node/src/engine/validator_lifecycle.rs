@@ -427,7 +427,7 @@ impl Engine {
                     GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
                     source,
                     GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
-                );
+                ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
                 let signed = self.state.verify_precheck_signatures(&pre, &verifier);
                 if verifier.limited() {
                     return Err(Refusal::GossipVerificationLimited {

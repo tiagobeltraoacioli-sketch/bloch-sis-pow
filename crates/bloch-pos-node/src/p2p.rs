@@ -619,6 +619,10 @@ pub struct Origin {
     /// sync responses, which have no gossipsub message id.
     block_hint: Option<(PeerId, u64)>,
     reservation: Option<Arc<crate::net::SourceReservation>>,
+    /// The block answers this node's own sync request or came from a peer
+    /// the operator configured. Node-local scheduling only: such a block is
+    /// verified under the allowance gossip cannot spend, never trusted more.
+    directed_block: bool,
 }
 
 impl Origin {
@@ -631,6 +635,15 @@ impl Origin {
     /// its authenticated peer id through the same reservation type.
     pub(crate) fn verification_source(&self) -> Option<[u8; 32]> {
         self.reservation.as_ref().map(|guard| guard.verification_source())
+    }
+
+    /// See the `directed_block` field.
+    pub(crate) fn directed_block(&self) -> bool {
+        self.directed_block
+    }
+
+    pub(crate) fn mark_directed_block(&mut self) {
+        self.directed_block = true;
     }
 
     /// Exact wire charge retained by the transport reservation after
@@ -646,6 +659,7 @@ impl Origin {
             inner: None,
             block_hint: None,
             reservation: None,
+            directed_block: false,
         }
     }
 
@@ -655,6 +669,7 @@ impl Origin {
             inner: None,
             block_hint: Some((peer, slot)),
             reservation: None,
+            directed_block: true,
         }
     }
 }
@@ -1505,6 +1520,14 @@ impl Loop {
         }
     }
 
+    /// Whether `peer` is one this node dialled. The only addresses this node
+    /// dials are the operator's configured peers, so a dialled connection is
+    /// how a configured peer is recognised; the entry goes when the peer's
+    /// last connection closes ([`Self::forget_peer`]).
+    fn is_configured_peer(&self, peer: &PeerId) -> bool {
+        self.dialed.values().any(|dialed| dialed == peer)
+    }
+
     /// A peer's last connection just closed: drop everything keyed by its
     /// identity so churn cannot grow any of these past the connected-peer
     /// count (R1 A3-M3, R1 A3-M5, R3 M-7's counterpart for the pull side).
@@ -2131,6 +2154,7 @@ fn on_gossip(
                     inner: Some((message_id.clone(), source)),
                     block_hint: Some((source, slot)),
                     reservation: None,
+                    directed_block: st.is_configured_peer(&source),
                 };
                 let mut event = NetEvent::Block(env, origin);
                 if crate::net::queued_bytes(&event) != message.data.len() {
@@ -2162,6 +2186,7 @@ fn on_gossip(
                     inner: Some((message_id.clone(), source)),
                     block_hint: None,
                     reservation: None,
+                    directed_block: false,
                 };
                 let mut event = NetEvent::Attestation(att, origin);
                 if crate::net::queued_bytes(&event) != message.data.len() {
@@ -2189,6 +2214,7 @@ fn on_gossip(
                     inner: Some((message_id.clone(), source)),
                     block_hint: None,
                     reservation: None,
+                    directed_block: false,
                 };
                 let mut event = NetEvent::Transaction(tx, origin);
                 if crate::net::queued_bytes(&event) != message.data.len() {
@@ -3504,6 +3530,7 @@ mod tests {
                 inner: None,
                 block_hint: None,
                 reservation: Some(guard),
+                directed_block: false,
             },
         );
         assert_eq!(
