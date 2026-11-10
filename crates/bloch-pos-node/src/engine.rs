@@ -1193,6 +1193,13 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Transactions whose spend witnesses selection or capacity planning
+    /// verified again (`Engine::spend_witnesses_pass_relay_policy`).
+    static RELAY_POLICY_REVERIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The spend-authority hash of this transaction's FIRST input — its "source"
 /// for [`MEMPOOL_MAX_PER_SOURCE`] (R7 M6). Lifecycle messages use their
 /// validator identity, domain-separated from spend keys. `None` remains only
@@ -5026,9 +5033,6 @@ impl Engine {
             return Err(Refusal::PreviouslyRefused { until_slot });
         }
         admission::check_transfer(&self.state, &tx, key.len(), epoch_of(self.wall_slot()))?;
-        // Plan capacity cleanup without mutating the pool. A forged incoming
-        // signature must never evict either stale or currently paying entries.
-        let capacity = self.plan_mempool_capacity(&tx, key.len(), epoch_of(self.wall_slot()))?;
         // Refuse the shapes consensus can never apply.
         //
         // Admission used to check duplicate-and-capacity only, so anything
@@ -5098,15 +5102,26 @@ impl Engine {
             }
             admission.map_err(Refusal::Invalid)?;
         }
-        if self.funded_mempool_conflict(&tx, &capacity.stale) {
-            return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
-        }
         if let PosTransaction::SlashingEvidence(evidence) = &tx {
             if validator_lifecycle::native_slashing_admission_active(epoch_of(self.wall_slot())) {
                 self.precheck_slashing_evidence(evidence, verification_source)?;
             }
         }
         self.validate_lifecycle_admission(&tx)?;
+        // Plan capacity cleanup without mutating the pool. A forged incoming
+        // signature must never evict either stale or currently paying entries.
+        //
+        // Only now, after every budgeted authentication of the incoming
+        // transaction above: planning walks this source's pending entries (or
+        // the whole pool under global pressure), and it used to run first, so
+        // a transaction nobody had authenticated yet bought pool-proportional
+        // work and was answered `TooManyFromSource` before its own signature
+        // was ever looked at. The plan also reserves pending inputs: see
+        // `plan_mempool_capacity`.
+        let capacity = self.plan_mempool_capacity(&tx, key.len(), epoch_of(self.wall_slot()))?;
+        if self.funded_mempool_conflict(&tx, &capacity.stale) {
+            return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
+        }
         // Commit only after every incoming admission check succeeds. Removing
         // state-dependent failures under pressure is retention, never a bar.
         for stale in &capacity.stale {
@@ -5168,7 +5183,7 @@ impl Engine {
         // again, making the exact same signed transaction eligible later.
         let mut funded_context = None;
         let candidates = self.mempool.iter().filter(|(encoded, tx)| {
-            self.candidate_is_backed(tx, encoded.len(), epoch, &mut funded_context)
+            self.candidate_is_backed(tx, encoded, epoch, &mut funded_context)
         }).collect();
         Self::pack_transactions(epoch, *self.state.head().as_bytes(), candidates)
     }
@@ -5184,6 +5199,8 @@ impl Engine {
     /// `true` for transactions that carry no spend witness. Node-local; no
     /// consensus effect.
     fn spend_witnesses_pass_relay_policy(&self, tx: &PosTransaction, epoch: u64) -> bool {
+        #[cfg(test)]
+        RELAY_POLICY_REVERIFICATIONS.with(|n| n.set(n.get() + 1));
         let domain = self.state.admission_network_domain();
         let Some(root) = tx.checked_signing_root_for_network(epoch, domain.as_ref()) else {
             return !matches!(
@@ -5210,15 +5227,25 @@ impl Engine {
 
     /// Immutable signatures were checked at admission. Re-evaluate only the
     /// parent/epoch-dependent backing shared by selection and capacity policy.
-    fn candidate_is_backed(&self, tx: &PosTransaction, encoded: usize, epoch: u64,
+    /// `key` is the entry's mempool key (its canonical bytes).
+    fn candidate_is_backed(&self, tx: &PosTransaction, key: &[u8], epoch: u64,
         funded_context: &mut Option<(Arc<CommittedState>, u128)>) -> bool {
-        if admission::check_transfer(&self.state, tx, encoded, epoch).is_err() { return false; }
+        if admission::check_transfer(&self.state, tx, key.len(), epoch).is_err() { return false; }
         // NODE RELAY POLICY (HF2 sigdet): the proposer never selects a spend
         // whose witness fails the FIPS 204 reference verifier, even if it
         // reached the mempool by a path that skipped `admissible`. Not a
         // consensus rule — the transition still judges the block it builds
         // with the base verifier.
-        if !self.spend_witnesses_pass_relay_policy(tx, epoch) { return false; }
+        //
+        // ONLY for such an entry. One that came through admission had every
+        // spend witness judged there under this same policy (base AND
+        // reference), and a signature does not change afterwards: if a later
+        // epoch signs a different root, the base rule refuses the old witness
+        // and the policy has nothing to add. Repeating that cryptography here
+        // was unbudgeted work on the consensus thread, once per pending entry
+        // per capacity plan, which any arriving transaction could trigger.
+        if !self.mempool.admission_verified(key)
+            && !self.spend_witnesses_pass_relay_policy(tx, epoch) { return false; }
         // Proposer policy (incident 2026-10-19): never include evidence for an
         // offence that predates slashing, even if it reached the mempool by a
         // path that skipped `admissible`.

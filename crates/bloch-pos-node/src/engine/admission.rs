@@ -11,6 +11,10 @@ pub(super) struct Mempool {
     entries: BTreeMap<Vec<u8>, PosTransaction>,
     identities: BTreeMap<[u8; 32], usize>,
     sources: BTreeMap<[u8; 32], usize>,
+    /// Outpoints named by pending entries, with how many entries name each.
+    spends: BTreeMap<([u8; 32], u32), usize>,
+    /// Keys inserted by [`Self::insert`], i.e. not through admission.
+    unverified: BTreeSet<Vec<u8>>,
     bytes: usize,
     lifecycle_verification_slot: Option<u64>,
     lifecycle_verifications_total: usize,
@@ -39,6 +43,15 @@ impl Mempool {
     pub(super) fn source_count(&self, source: &[u8; 32]) -> usize {
         self.sources.get(source).copied().unwrap_or(0)
     }
+    /// Whether any pending entry names `point` as an input.
+    pub(super) fn spends_outpoint(&self, point: &([u8; 32], u32)) -> bool {
+        self.spends.contains_key(point)
+    }
+    /// Whether the entry under `key` was inserted by the admission path,
+    /// which authenticates a transaction before it inserts it.
+    pub(super) fn admission_verified(&self, key: &[u8]) -> bool {
+        !self.unverified.contains(key)
+    }
     pub(super) fn reserve_lifecycle_verification(&mut self, source: [u8; 32], wall_slot: u64) -> bool {
         if self.lifecycle_verification_slot != Some(wall_slot) {
             self.lifecycle_verification_slot = Some(wall_slot);
@@ -56,13 +69,20 @@ impl Mempool {
     }
     pub(super) fn insert(&mut self, key: Vec<u8>, tx: PosTransaction) -> Option<PosTransaction> {
         let txid = tx.txid();
-        self.insert_with_txid(key, tx, txid)
+        let old = self.insert_with_txid(key.clone(), tx, txid);
+        // Nothing vouches for an entry placed here directly, so selection and
+        // capacity planning keep judging its witnesses themselves.
+        self.unverified.insert(key);
+        old
     }
     /// Insert with the identity already derived by the admission path from
     /// this exact transaction. Kept inside the engine module: the supplied
     /// identity drives duplicate accounting and must never come from another
     /// value. The ordinary fixture-facing [`Self::insert`] remains the
     /// self-contained authority for callers without a prepared identity.
+    ///
+    /// The caller is the admission path and has already authenticated `tx`:
+    /// the entry is recorded as verified (see [`Self::admission_verified`]).
     pub(super) fn insert_with_txid(
         &mut self,
         key: Vec<u8>,
@@ -77,6 +97,10 @@ impl Mempool {
             let count = self.sources.entry(source).or_default();
             *count = count.saturating_add(1);
         }
+        for point in Engine::spent_outpoints(&tx).unwrap_or_default() {
+            let count = self.spends.entry(point).or_default();
+            *count = count.saturating_add(1);
+        }
         self.entries.insert(key, tx);
         old
     }
@@ -87,6 +111,10 @@ impl Mempool {
         if let Some(source) = tx_source_hash(&tx) {
             decrement(&mut self.sources, source);
         }
+        for point in Engine::spent_outpoints(&tx).unwrap_or_default() {
+            decrement(&mut self.spends, point);
+        }
+        self.unverified.remove(key);
         Some(tx)
     }
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&Vec<u8>, &PosTransaction) -> bool) {
@@ -203,7 +231,7 @@ mod tests {
         assert_eq!(prepared.bytes(), 0);
     }
 }
-fn decrement(map: &mut BTreeMap<[u8; 32], usize>, key: [u8; 32]) {
+fn decrement<K: Ord>(map: &mut BTreeMap<K, usize>, key: K) {
     if let Some(n) = map.get_mut(&key) {
         *n = n.saturating_sub(1);
         if *n == 0 {
@@ -311,21 +339,64 @@ pub(super) fn check_transfer(
     Ok(())
 }
 
-/// Transactional capacity plan; callers commit it only after authenticating the
-/// incoming transaction. Stale entries are not placed in a rejection cache.
+/// Transactional capacity plan; callers build it and commit it only after
+/// authenticating the incoming transaction. Stale entries are not placed in a
+/// rejection cache.
 pub(super) struct CapacityPlan {
     pub stale: BTreeSet<Vec<u8>>,
     pub lower_fee: Option<Vec<u8>>,
 }
 
 impl Engine {
+    /// Pending spends reserve their inputs: two pending transactions naming
+    /// one outpoint can never both be included, so the second only took a
+    /// slot, a relay and (before this rule) a place in every later capacity
+    /// plan. The newcomer is refused while the entry holding the input is
+    /// still backed by the current state; an entry that no longer is (its fee
+    /// fell behind, its input was spent) is planned out as stale instead, so
+    /// an owner is never locked out of an input by their own dead transaction.
+    /// Returns the keys to plan out. Funded pairs are left to
+    /// `funded_mempool_conflict`, which also reserves the validator key.
+    fn plan_input_conflicts(&self, incoming: &PosTransaction, epoch: u64,
+        funded_context: &mut Option<(Arc<CommittedState>, u128)>) -> Result<BTreeSet<Vec<u8>>, Refusal> {
+        let funded = |tx: &PosTransaction| matches!(tx, PosTransaction::FundedDeposit(_) | PosTransaction::FundedDelegate(_));
+        let mut stale = BTreeSet::new();
+        let points = Self::spent_outpoints(incoming).unwrap_or_default();
+        // The common case costs one index lookup per input and no pool walk.
+        if funded(incoming) || !points.iter().any(|point| self.mempool.spends_outpoint(point)) {
+            return Ok(stale);
+        }
+        for (key, other) in &self.mempool {
+            if funded(other) { continue; }
+            let shares_input = Self::spent_outpoints(other)
+                .is_some_and(|theirs| theirs.iter().any(|point| points.contains(point)));
+            if !shares_input { continue; }
+            if self.candidate_is_backed(other, key, epoch, funded_context) {
+                return Err(Refusal::StateDependent("transaction spends an input that a pending transaction already spends"));
+            }
+            stale.insert(key.clone());
+        }
+        Ok(stale)
+    }
+
+    /// Callers authenticate `incoming` first: this walks pending entries.
     pub(super) fn plan_mempool_capacity(&self, incoming: &PosTransaction, encoded: usize, epoch: u64) -> Result<CapacityPlan, Refusal> {
         let source = tx_source_hash(incoming);
         let mut count = self.mempool.len();
         let mut bytes = self.mempool.bytes();
         let mut source_count = source.map_or(0, |s| self.mempool.source_count(&s));
-        let mut plan = CapacityPlan { stale: BTreeSet::new(), lower_fee: None };
         let mut funded_context = None;
+        let mut plan = CapacityPlan {
+            stale: self.plan_input_conflicts(incoming, epoch, &mut funded_context)?,
+            lower_fee: None,
+        };
+        for key in &plan.stale {
+            count = count.saturating_sub(1);
+            bytes = bytes.saturating_sub(key.len());
+            if source.is_some() && self.mempool.get(key).and_then(tx_source_hash) == source {
+                source_count = source_count.saturating_sub(1);
+            }
+        }
         // No full-pool revalidation on ordinary admission. Under any capacity
         // pressure, stale backing must not retain priority through claimed tips.
         if count >= MEMPOOL_MAX || bytes.saturating_add(encoded) > MAX_MEMPOOL_BYTES
@@ -338,7 +409,8 @@ impl Engine {
             }
             for (same_source, key, candidate) in candidates {
                 if source_count >= MEMPOOL_MAX_PER_SOURCE && !same_source { continue; }
-                if self.candidate_is_backed(candidate, key.len(), epoch, &mut funded_context) { continue; }
+                if plan.stale.contains(key) { continue; }
+                if self.candidate_is_backed(candidate, key, epoch, &mut funded_context) { continue; }
                 plan.stale.insert(key.clone());
                 count = count.saturating_sub(1);
                 bytes = bytes.saturating_sub(key.len());

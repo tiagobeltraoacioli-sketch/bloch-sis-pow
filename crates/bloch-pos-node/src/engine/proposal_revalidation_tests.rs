@@ -4,10 +4,14 @@ use super::*;
 use bloch_pos_committee::state_root::EutxoEntry;
 use bloch_pos_committee::transition::{TransferInput, TransferOutput};
 
-fn funds() -> Vec<EutxoEntry> {
+fn funds() -> Vec<EutxoEntry> { funds_of(3) }
+
+/// `count` outputs owned by one key, so one source can hold many pending
+/// spends without any two of them naming the same input.
+fn funds_of(count: u32) -> Vec<EutxoEntry> {
     let (pk, _) = bloch_crypto::crypto::generate_keypair_from_seed(&[71; 32]).unwrap();
     let script_hash: [u8; 32] = Sha3_256::digest(pk).into();
-    (0..3).map(|vout| EutxoEntry { txid: [72; 32], vout, value: 1_000_000_000, script_hash }).collect()
+    (0..count).map(|vout| EutxoEntry { txid: [72; 32], vout, value: 1_000_000_000, script_hash }).collect()
 }
 
 fn spend(entry: &EutxoEntry, declared: u64, tip: u128, base: u128) -> PosTransaction {
@@ -67,7 +71,11 @@ fn proposal_revalidation_packs_independent_spends_after_higher_tip_conflicts() {
     let low = spend(&funds[0], 9_000, 0, fee);
     let high = spend(&funds[0], 9_000, 2, fee);
     let independent = spend(&funds[1], 9_000, 0, fee);
-    for tx in [&low, &high, &independent] { assert_eq!(node.on_transaction(tx.clone()), Ok(Admitted::New)); }
+    for tx in [&low, &independent] { assert_eq!(node.on_transaction(tx.clone()), Ok(Admitted::New)); }
+    // Admission reserves pending inputs, so the conflicting spend is placed
+    // directly: packing must still resolve a conflict it finds in the pool.
+    assert!(matches!(node.on_transaction(high.clone()), Err(Refusal::StateDependent(_))));
+    node.mempool.insert(high.canonical_bytes(), high.clone());
     assert_eq!(node.select_transactions(0), vec![high, independent]);
     let low_key = low.canonical_bytes();
     assert!(node.mempool.contains_key(&low_key));
@@ -81,7 +89,7 @@ fn proposal_revalidation_packs_independent_spends_after_higher_tip_conflicts() {
 
 /// A real fee rise leaves an admitted high-tip transaction temporarily stale.
 fn stale_pool() -> (Engine, perf_support::TestDir, Vec<EutxoEntry>, PosTransaction) {
-    let funds = funds();
+    let funds = funds_of(4);
     let (mut node, dir) = perf_support::proposing_engine_funded(&funds);
     let fee = node.state.next_base_fee_at(0);
     let stale = spend(&funds[1], 9_000, 100, fee);
@@ -120,7 +128,8 @@ fn capacity_revalidation_reclaims_stale_high_tips_before_count_eviction() {
     assert!(!node.rejected.contains_key(&stale.canonical_bytes()));
     assert!(!node.mempool_admitted_at.contains_key(&stale.canonical_bytes()));
     assert_eq!(node.mempool_evicted_low_fee, 0, "stale retention cleanup is not paid-fee replacement");
-    let equally_priced = spend(&funds[2], 9_001, 0, node.state.next_base_fee_at(0));
+    // Its own input: a second spend of `funds[2]` would be a pending conflict.
+    let equally_priced = spend(&funds[3], 9_001, 0, node.state.next_base_fee_at(0));
     assert_eq!(node.on_transaction(equally_priced), Err(Refusal::AtCapacity),
         "once stale entries are gone, equal-fee arrivals still cannot evict current payers");
 }
@@ -142,21 +151,128 @@ fn capacity_revalidation_reclaims_stale_bytes_without_a_rejection_bar() {
 #[test]
 fn capacity_revalidation_reclaims_stale_source_slots_for_a_valid_same_owner() {
     let _clock = validator_lifecycle::clock_at(1);
-    let funds = funds();
+    // One input per pending spend: admission reserves pending inputs.
+    let funds = funds_of(MEMPOOL_MAX_PER_SOURCE as u32 + 2);
     let (mut node, _dir) = perf_support::proposing_engine_funded(&funds);
     let fee = node.state.next_base_fee_at(0);
-    for tip in 1..=MEMPOOL_MAX_PER_SOURCE as u128 {
-        assert_eq!(node.on_transaction(spend(&funds[1], 9_000, tip, fee)), Ok(Admitted::New));
+    for tip in 1..=MEMPOOL_MAX_PER_SOURCE {
+        assert_eq!(node.on_transaction(spend(&funds[tip], 9_000, tip as u128, fee)), Ok(Admitted::New));
     }
     let filler = spend(&funds[0], fee_market::max_block_tx_bytes(0), 101, fee);
     node.mempool.insert(filler.canonical_bytes(), filler);
     node.propose(1);
     assert_eq!(node.mempool.len(), MEMPOOL_MAX_PER_SOURCE);
-    let incoming = spend(&funds[2], 9_000, 0, node.state.next_base_fee_at(0));
+    let incoming = spend(&funds[MEMPOOL_MAX_PER_SOURCE + 1], 9_000, 0, node.state.next_base_fee_at(0));
     assert_eq!(node.on_transaction(incoming.clone()), Ok(Admitted::New));
     assert_eq!(node.mempool.len(), MEMPOOL_MAX_PER_SOURCE);
     assert_eq!(node.mempool.source_count(&tx_source_hash(&incoming).unwrap()), MEMPOOL_MAX_PER_SOURCE);
     assert!(node.rejected.is_empty());
+}
+
+fn relay_reverifications() -> usize { RELAY_POLICY_REVERIFICATIONS.with(|n| n.get()) }
+
+/// One source at its pending limit, every entry through real admission.
+fn source_at_limit() -> (Engine, perf_support::TestDir, PosTransaction) {
+    let funds = funds_of(MEMPOOL_MAX_PER_SOURCE as u32 + 1);
+    let (mut node, dir) = perf_support::proposing_engine_funded(&funds);
+    let fee = node.state.next_base_fee_at(0);
+    for entry in &funds[..MEMPOOL_MAX_PER_SOURCE] {
+        assert_eq!(node.on_transaction(spend(entry, 9_000, 0, fee)), Ok(Admitted::New));
+    }
+    let incoming = spend(&funds[MEMPOOL_MAX_PER_SOURCE], 9_000, 0, fee);
+    assert_eq!(node.mempool.source_count(&tx_source_hash(&incoming).unwrap()), MEMPOOL_MAX_PER_SOURCE);
+    (node, dir, incoming)
+}
+
+#[test]
+fn forged_transfer_from_a_source_at_its_limit_buys_no_pending_verification() {
+    let _clock = validator_lifecycle::clock_at(1);
+    let (mut node, _dir, incoming) = source_at_limit();
+    let mut forged = incoming.clone();
+    if let PosTransaction::Transfer { inputs, .. } = &mut forged { inputs[0].signature[0] ^= 1; }
+    let slot = node.wall_slot();
+    let used = node.gossip_verifier.budget_used_at(slot);
+    let pool: Vec<_> = node.mempool.keys().cloned().collect();
+    RELAY_POLICY_REVERIFICATIONS.with(|n| n.set(0));
+    assert!(matches!(node.on_transaction(forged), Err(Refusal::Invalid(_))),
+        "the forged signature is judged before the source limit is consulted");
+    assert_eq!(relay_reverifications(), 0, "an unauthenticated transaction must not buy pending-entry verification");
+    assert_eq!(node.gossip_verifier.budget_used_at(slot), used + 1,
+        "its own signature is the only cryptography, and it is charged to the slot allowance");
+    assert_eq!(node.mempool.keys().cloned().collect::<Vec<_>>(), pool);
+    // The honest overload answer is unchanged, and planning it re-verifies
+    // nothing either: every pending entry was authenticated when admitted.
+    assert_eq!(node.on_transaction(incoming), Err(Refusal::TooManyFromSource));
+    assert_eq!(relay_reverifications(), 0);
+    assert_eq!(node.gossip_verifier.budget_used_at(slot), used + 2);
+    // Selection relies on the same admission verdict.
+    assert!(!node.select_transactions(0).is_empty());
+    assert_eq!(relay_reverifications(), 0);
+}
+
+#[test]
+fn entries_that_skipped_admission_are_still_judged_by_capacity_and_selection() {
+    let _clock = validator_lifecycle::clock_at(1);
+    let funds = funds_of(MEMPOOL_MAX_PER_SOURCE as u32 + 1);
+    let (mut node, _dir) = perf_support::proposing_engine_funded(&funds);
+    let fee = node.state.next_base_fee_at(0);
+    for entry in &funds[..MEMPOOL_MAX_PER_SOURCE] {
+        let tx = spend(entry, 9_000, 0, fee);
+        node.mempool.insert(tx.canonical_bytes(), tx);
+    }
+    RELAY_POLICY_REVERIFICATIONS.with(|n| n.set(0));
+    let incoming = spend(&funds[MEMPOOL_MAX_PER_SOURCE], 9_000, 0, fee);
+    assert_eq!(node.on_transaction(incoming), Err(Refusal::TooManyFromSource));
+    assert_eq!(relay_reverifications(), MEMPOOL_MAX_PER_SOURCE);
+    assert!(!node.select_transactions(0).is_empty());
+    assert_eq!(relay_reverifications(), 2 * MEMPOOL_MAX_PER_SOURCE);
+}
+
+#[test]
+fn second_pending_spend_of_an_input_is_refused_and_the_first_is_kept() {
+    let _clock = validator_lifecycle::clock_at(1);
+    let funds = funds();
+    let (mut node, _dir) = perf_support::proposing_engine_funded(&funds);
+    let fee = node.state.next_base_fee_at(0);
+    let first = spend(&funds[0], 9_000, 0, fee);
+    assert_eq!(node.on_transaction(first.clone()), Ok(Admitted::New));
+    // A higher tip is not a replacement rule: the pending spend holds its input.
+    let second = spend(&funds[0], 9_000, 2, fee);
+    assert_ne!(second.txid(), first.txid());
+    assert!(matches!(node.on_transaction(second.clone()), Err(Refusal::StateDependent(_))));
+    assert_eq!(node.mempool.len(), 1);
+    assert!(node.mempool.contains_key(&first.canonical_bytes()));
+    assert!(!node.rejected.contains_key(&second.canonical_bytes()), "a pending conflict is not a bar");
+    // A forged conflicting spend is refused for its signature, as before.
+    let mut forged = second.clone();
+    if let PosTransaction::Transfer { inputs, .. } = &mut forged { inputs[0].signature[0] ^= 1; }
+    assert!(matches!(node.on_transaction(forged), Err(Refusal::Invalid(_))));
+    // Unrelated inputs and exact resubmission are unaffected.
+    assert_eq!(node.on_transaction(first.clone()), Ok(Admitted::Duplicate));
+    assert_eq!(node.on_transaction(spend(&funds[1], 9_000, 0, fee)), Ok(Admitted::New));
+    // Once the first spend is included, its input is gone rather than held.
+    node.propose(1);
+    assert!(!node.mempool.contains_key(&first.canonical_bytes()));
+    assert!(matches!(node.on_transaction(second), Err(Refusal::StateDependent(_))));
+    assert!(node.mempool.is_empty());
+}
+
+#[test]
+fn stale_pending_spend_yields_its_input_to_a_backed_one() {
+    let _clock = validator_lifecycle::clock_at(1);
+    let (mut node, _dir, funds, stale) = stale_pool();
+    // Same input, priced for the fee that left the pending spend behind.
+    let mut forged = spend(&funds[1], 9_000, 0, node.state.next_base_fee_at(0));
+    let fresh = forged.clone();
+    if let PosTransaction::Transfer { inputs, .. } = &mut forged { inputs[0].signature[0] ^= 1; }
+    assert!(matches!(node.on_transaction(forged), Err(Refusal::Invalid(_))));
+    assert!(node.mempool.contains_key(&stale.canonical_bytes()), "a forged spend must not displace a stale entry");
+    assert_eq!(node.on_transaction(fresh.clone()), Ok(Admitted::New));
+    assert!(!node.mempool.contains_key(&stale.canonical_bytes()));
+    assert!(!node.rejected.contains_key(&stale.canonical_bytes()), "displacement is retention, never a bar");
+    assert!(!node.mempool_admitted_at.contains_key(&stale.canonical_bytes()));
+    assert_eq!(node.mempool_evicted_low_fee, 0);
+    assert_eq!(node.select_transactions(0), vec![fresh]);
 }
 
 #[test]
