@@ -11378,6 +11378,52 @@ mod transfer_v2_end_to_end {
         assert!(is_forced(&lowest(&full, plan.lower_fee.expect("one entry makes room"))));
     }
 
+    /// Review R308-1 (agent 308, round 15). c05c62e3 took forced envelopes
+    /// out of what the registered DA key may displace, without a bound. A
+    /// forced envelope enters the pool on its signature alone (`admissible`
+    /// checks nothing else; inputs, surcharge and queue state are consensus
+    /// checks), so a pool can be filled with them at no cost, and then the
+    /// registered key's batch finds no room: the reserved DA slot serves
+    /// nobody again, which is what the displacement rule exists to prevent.
+    /// Expected: the registered key is admitted, displacing a forced envelope
+    /// outside the reserved room.
+    #[test]
+    fn r308_1_a_pool_of_forced_envelopes_cannot_keep_out_the_registered_da_key() {
+        use bloch_pos_committee::l2_settlement::da;
+        let epoch = V2_FLAG_DAY + 1;
+        let mut full = engine_at_wall_epoch(epoch, &[]);
+        for i in 0..MEMPOOL_MAX {
+            // Unfunded inputs, any tip: nothing at admission looks at either.
+            let tx = forced_envelope_tx(0x30 + (i / MEMPOOL_MAX_PER_SOURCE) as u8, i as u32, u128::MAX);
+            full.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        assert_eq!(full.mempool.len(), MEMPOOL_MAX);
+        let own = da_batch(0xee, 1, 0);
+        let settler_key = vec![0xee; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let _reserved = da_reserved_test::open(da::funder(&settler_key));
+        let plan = full.plan_mempool_capacity(&own, own.canonical_bytes().len(), epoch);
+        assert!(plan.is_ok(), "the registered DA key is locked out of a pool of forced envelopes");
+    }
+
+    /// Review R308-2 (agent 308, round 15). The reserved room protects a
+    /// forced envelope that is already pooled; it gives an arriving one no
+    /// place. A pool kept full of cheap entries of another kind (here tip-1
+    /// DA batches, admitted on a signature alone like every L2 kind) still
+    /// refuses a tip-0 forced envelope, so the censorship c05c62e3 names in
+    /// its message ("a pool kept full of cheap entries censored the forced
+    /// path") is still there at admission.
+    /// Expected: while fewer than MEMPOOL_FORCED_RESERVED forced envelopes
+    /// are pooled, an arriving one takes the place of the lowest-tip entry of
+    /// another kind.
+    #[test]
+    fn r308_2_a_forced_envelope_enters_a_pool_kept_full_of_cheap_entries() {
+        let epoch = V2_FLAG_DAY + 1;
+        let node = pool_with_forced_and_da(epoch, 0);
+        let forced = forced_envelope_tx(0x30, 1, 0);
+        let plan = node.plan_mempool_capacity(&forced, forced.canonical_bytes().len(), epoch);
+        assert!(plan.is_ok(), "a tip-0 forced envelope finds no room in a pool full of tip-1 entries");
+    }
+
     /// F-9: which commitments win the scarce slots is re-drawn from the
     /// parent block id, so grinding commitment bytes low (the canonical-bytes
     /// tie-break) does not buy every slot, and the draw changes per block.
