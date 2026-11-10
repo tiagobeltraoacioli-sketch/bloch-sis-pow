@@ -217,12 +217,17 @@ fn read_partial(path: &str) -> Result<(u8, [u8; 32], Vec<u8>), String> {
 
 fn attest(args: &[String]) -> Result<(), String> {
     let o = options(args, &["--genesis", "--proof", "--attestors", "--signer-index", "--key", "--out"])?;
+    // Before anything else is read: the attestor secret is plaintext hex, so
+    // it is held to the rule `ws-sign` applies to its own (0600 or stricter).
+    let key_path = get(&o, "--key")?;
+    crate::ws_tool::require_private_secret_file(key_path)?;
     let proof = parse_proof(&read_text(get(&o, "--proof")?)?)?;
     let (threshold, keys) = read_set(get(&o, "--attestors")?)?;
     let index: u8 = get(&o, "--signer-index")?.parse().map_err(|_| "bad --signer-index")?;
     let pubkey = keys.get(usize::from(index)).ok_or("--signer-index is outside the set")?;
     let digest = withdrawal::attestation_digest(&domain(get(&o, "--genesis")?)?, proof.chain_id, &proof.root);
-    let sk = zeroize::Zeroizing::new(codec::unhex(read_text(get(&o, "--key")?)?.trim())?);
+    // `read_hex_file` wipes the hex text once decoded; `sk` wipes the bytes.
+    let sk = zeroize::Zeroizing::new(crate::ws_tool::read_hex_file(key_path)?);
     // Each attestor signature is bounded by ADMISSION_PQ_SIGNATURE_MAX inside
     // the claim; re-sign until it fits rather than hand the aggregator an
     // oversized (still valid) Falcon draw that consensus would refuse.
@@ -453,5 +458,53 @@ mod tests {
         let p = parse_proof(&doc(false)).unwrap();
         assert_eq!((p.chain_id, p.index, p.l1_recipient, p.sats), (700771, 1, [2; 32], 1_000_001));
         assert!(parse_proof(&doc(true)).is_err(), "leaf mismatch refused");
+    }
+
+    /// RPC-7b: `attest --key` holds the plaintext attestor secret to the rule
+    /// `ws-sign` applies — a private regular file — and refuses before it
+    /// reads anything else.
+    #[cfg(unix)]
+    #[test]
+    fn attest_refuses_a_secret_key_file_others_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+        const REFUSAL: &str = "signer secret must be a private regular file (0600 or stricter)";
+
+        let dir = std::env::temp_dir().join(format!("bloch-l2-attest-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("attestor.sk");
+        std::fs::write(&key, "00ff\n").unwrap();
+        let missing = dir.join("absent").to_string_lossy().into_owned();
+        let run = |key_path: &str| {
+            let args: Vec<String> = [
+                "--genesis", &missing, "--proof", &missing, "--attestors", &missing,
+                "--signer-index", "0", "--key", key_path, "--out", &missing,
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            attest(&args).unwrap_err()
+        };
+        let key_path = key.to_string_lossy().into_owned();
+
+        for mode in [0o644, 0o640, 0o604, 0o660, 0o666] {
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(run(&key_path), REFUSAL, "mode {mode:o}");
+        }
+        // Not a regular file at all.
+        assert_eq!(run(&dir.to_string_lossy()), REFUSAL);
+
+        // A private file passes the gate: the command goes on to fail on the
+        // inputs this test did not provide, not on the key.
+        for mode in [0o600, 0o400] {
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
+            let error = run(&key_path);
+            assert_ne!(error, REFUSAL, "mode {mode:o}");
+            assert!(error.contains("No such file"), "mode {mode:o}: {error}");
+        }
+
+        // The shared reader decodes what `attest` used to decode itself.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(crate::ws_tool::read_hex_file(&key_path).unwrap(), vec![0x00, 0xff]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

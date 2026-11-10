@@ -117,9 +117,29 @@ fn all_values(args: &[String], name: &str) -> Vec<String> {
     out
 }
 
-fn read_hex_file(path: &str) -> Result<Vec<u8>, String> {
+/// Decode a hex file. The text is wiped when this returns, so a secret read
+/// through here leaves no hex copy behind; the caller owns wiping the bytes.
+pub(crate) fn read_hex_file(path: &str) -> Result<Vec<u8>, String> {
     let text = zeroize::Zeroizing::new(fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?);
     unhex(text.trim()).map_err(|e| format!("{path}: {e}"))
+}
+
+/// Refuse a plaintext signer secret that anyone but its owner can read.
+///
+/// One rule for every subcommand that takes a hex secret on `--key`
+/// (`ws-sign`, `l2-claim attest`): a regular file with no group or world
+/// permission bits. A key file left 0644 is a key every local account has.
+pub(crate) fn require_private_secret_file(path: &str) -> Result<(), String> {
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+            return Err("signer secret must be a private regular file (0600 or stricter)".into());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn write_file(path: &str, bytes: &[u8], secret: bool) -> Result<(), String> {
@@ -1123,13 +1143,7 @@ fn sign(args: &[String]) -> Result<(), String> {
     let cp = decode_checkpoint(&cp_bytes).map_err(|e| format!("{cp_path}: {e}"))?;
     let digest = cp.ws_digest();
 
-    #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = fs::metadata(&key_path).map_err(|e| format!("{key_path}: {e}"))?;
-        if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
-            return Err("signer secret must be a private regular file (0600 or stricter)".into());
-        }
-    }
+    require_private_secret_file(&key_path)?;
     let sk = zeroize::Zeroizing::new(read_hex_file(&key_path)?);
     let enveloped = bloch_crypto::crypto::sign(&sk, &digest)
         .map_err(|e| format!("signing failed: {e:?}"))?;
