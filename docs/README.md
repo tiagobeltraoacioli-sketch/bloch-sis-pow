@@ -121,8 +121,9 @@ implemented**, and the authorization model is an open founder decision.
 - `specs/BLOCH-SIS-ATTESTATION.md`, `specs/BLOCH-SIS-LINUX.md` — TEE
   attestation and the hardened node image. Consensus-independent.
 - `API.md`, `openapi.yaml` — the Genesis-3 JSON-RPC surface. Its
-  "Genesis-3 traps" section (DAG height, `getblocktemplate`) dies with PoW;
-  the transport, auth and error conventions do not.
+  "Genesis-3 traps" section (DAG height, `getblocktemplate`) dies with PoW,
+  and so do its authentication and rate limiting: the proof-of-stake node's
+  RPC is unauthenticated (current specification: `specs/BLOCH-RPC-V4.md`).
 - `releases/RELEASE_PROCESS.md` — how a release is cut.
 - `site/COPY.md`, `site/SITE-PLAN.md`, `site/BRAND-KIT.md` — the public site,
   written as the migration site.

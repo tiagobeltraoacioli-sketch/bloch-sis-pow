@@ -5,10 +5,24 @@
 > Genesis-4 relaunches as proof of stake; the ownerless thesis was
 > retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
 >
-> The transport, authentication, error-code and pagination conventions stand.
-> The "Heights, supply and emission (Genesis-3 traps)" section does not:
+> The JSON-RPC 2.0 envelope and the pagination conventions stand. The
+> "Heights, supply and emission (Genesis-3 traps)" section does not:
 > `getblocktemplate` is a mining RPC and the DAG-height-versus-chain-height
-> distinction has no meaning on a linear chain. Successor:
+> distinction has no meaning on a linear chain.
+>
+> **Authentication and rate limiting do NOT carry over to the proof-of-stake
+> node (`bloch-pos`).** Everything this document says about `--rpc-public`,
+> `--rpc-api-key-file`, `--rpc-require-auth-for-writes`, the `X-API-Key` /
+> `Authorization: Bearer` headers, the 60 reads / 5 writes per minute limits,
+> the 401/429 transport errors and port 16210 describes the Genesis-3 node
+> only. The `bloch-pos` RPC has **no API key, no rate limit and no per-method
+> authorisation**, and none of those flags exist: it binds `127.0.0.1:16310`
+> by default, `sendrawtransaction` is an unauthenticated write, and anything
+> that can open a socket to the port can read the node's state and submit
+> transactions. An operator who binds a routable address with `--rpc-bind`
+> must firewall the port or front it with an authenticating reverse proxy.
+> The V4 error convention also differs (failures are the top-level JSON-RPC
+> `error` object, rule R4). Current specification:
 > `docs/specs/BLOCH-RPC-V4.md`.
 
 **Version:** v0.5.9
@@ -21,6 +35,10 @@ method and response, read `openapi.yaml`.
 ---
 
 ## Transport
+
+> Genesis-3 node only. The proof-of-stake node (`bloch-pos`) has no
+> `--rpc-public` flag and serves on `--rpc-bind`:`--rpc-port`, default
+> `127.0.0.1:16310`. See the banner at the top of this document.
 
 Single endpoint: **`POST /`** on port **16210**.
 
@@ -50,6 +68,15 @@ Response:
 ```
 
 ## Authentication (Sprint M — v0.5.9+)
+
+> **Genesis-3 node only — none of this section applies to the proof-of-stake
+> node (`bloch-pos`).** The PoS RPC is unauthenticated by design: it has no
+> API key, no `X-API-Key` / `Authorization: Bearer` check, no
+> `--rpc-require-auth-for-writes`, no rate limit and no 401/429 responses.
+> Passing these flags to `bloch-pos` does not protect `sendrawtransaction`.
+> Keep the PoS RPC on loopback, or firewall it / front it with an
+> authenticating reverse proxy. Current specification:
+> `docs/specs/BLOCH-RPC-V4.md`.
 
 The node supports optional shared-secret API key authentication for
 write operations. Read methods are always public by design (explorers

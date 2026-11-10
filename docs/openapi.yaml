@@ -5,6 +5,17 @@ info:
   version: 0.6.0
   summary: Post-quantum-flavoured BlockDAG Layer 1 — JSON-RPC 2.0 interface
   description: |
+    > **Genesis-3 (V3) contract — legacy.** This file describes the Genesis-3
+    > proof-of-work node. **Its authentication and rate-limiting sections do
+    > NOT carry over to the proof-of-stake node (`bloch-pos`)**: that node has
+    > no API key, no `X-API-Key` / `Authorization: Bearer` check, no
+    > `require_auth_for_writes`, no per-IP rate limit and no 401/429 responses,
+    > and it serves on `127.0.0.1:16310` by default, not 16210. Its RPC is
+    > unauthenticated by design, `sendrawtransaction` included; an operator who
+    > binds it to a routable address must firewall the port or front it with an
+    > authenticating reverse proxy. Current specification:
+    > `docs/specs/BLOCH-RPC-V4.md`.
+
     Bloch exposes a single HTTP endpoint that speaks JSON-RPC 2.0. Every method
     described below is invoked by POSTing a JSON-RPC 2.0 envelope to the root
     `/` path. The node advertises itself as `chain: "bloch-sis"`, uses
@@ -94,6 +105,10 @@ info:
        standard `error` object.)
 
     ## Authentication & rate limiting
+    **Genesis-3 node only.** Nothing in this section exists in the
+    proof-of-stake node (`bloch-pos`), whose RPC has no authentication and no
+    rate limit. See the notice at the top and `docs/specs/BLOCH-RPC-V4.md`.
+
     - **Reads are public.** Every method except the writes below is a read and
       needs no key by default.
     - **Writes** are `sendrawtransaction` and `submitblock`. When the node runs
@@ -131,7 +146,7 @@ info:
 
 servers:
   - url: http://127.0.0.1:16210
-    description: Default local node (loopback; bypasses auth + rate limits)
+    description: Default local Genesis-3 node (loopback; bypasses auth + rate limits). The proof-of-stake node (bloch-pos) defaults to port 16310 and has no auth or rate limits.
   - url: http://{host}:{port}
     description: Custom node endpoint
     variables:
@@ -245,11 +260,11 @@ components:
       type: apiKey
       in: header
       name: X-API-Key
-      description: Shared secret for write methods when require_auth_for_writes is enabled. Localhost is exempt.
+      description: Shared secret for write methods when require_auth_for_writes is enabled. Localhost is exempt. Genesis-3 node only — the proof-of-stake node (bloch-pos) does not check this header; its RPC is unauthenticated.
     BearerAuth:
       type: http
       scheme: bearer
-      description: "Alternative to X-API-Key — `Authorization: Bearer <key>`."
+      description: "Alternative to X-API-Key — `Authorization: Bearer <key>`. Genesis-3 node only — not checked by the proof-of-stake node (bloch-pos)."
 
   schemas:
 
