@@ -6655,6 +6655,7 @@ fn start_devnet(
 /// log says.
 fn start_libp2p(
     cfg: &Config,
+    (genesis_time_ms, slot_ms): (u64, u64),
     net_tx: mpsc::Sender<NetEvent>,
     head_slot: &Arc<AtomicU64>,
     inflight: &Arc<net::QueueBudget>,
@@ -6682,6 +6683,8 @@ fn start_libp2p(
             data_dir: cfg.data_dir.clone(),
             max_peers: cfg.max_peers,
             behind_proxy: cfg.behind_proxy,
+            genesis_time_ms,
+            slot_ms,
         },
         net_tx,
         head_slot.clone(),
@@ -7101,7 +7104,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         Transport::Devnet => {
             net::Net::Devnet(start_devnet(&cfg, *genesis_id.as_bytes(), tx.clone(), &head_slot, &inflight)?)
         }
-        Transport::Libp2p => net::Net::Libp2p(start_libp2p(&cfg, net_tx, &head_slot, &inflight)?),
+        Transport::Libp2p => net::Net::Libp2p(start_libp2p(&cfg, (manifest.genesis_time_ms, manifest.slot_ms), net_tx, &head_slot, &inflight)?),
         Transport::Dual => {
             // Devnet FIRST. Binding its `TcpListener` is the cheap synchronous
             // failure — a port already in use — and a node that cannot bind
@@ -7109,7 +7112,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             // that looks like it is bridging two populations and is not.
             // `?` on either line aborts the whole start.
             let mesh = start_devnet(&cfg, *genesis_id.as_bytes(), tx.clone(), &head_slot, &inflight)?;
-            let handle = start_libp2p(&cfg, net_tx, &head_slot, &inflight)?;
+            let handle = start_libp2p(&cfg, (manifest.genesis_time_ms, manifest.slot_ms), net_tx, &head_slot, &inflight)?;
             net::Net::Both(mesh, handle)
         }
     };

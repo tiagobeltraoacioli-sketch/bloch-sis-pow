@@ -1067,21 +1067,141 @@ pub fn peer_score_thresholds() -> PeerScoreThresholds {
     }
 }
 
+/// Wall-clock epoch from which the gossipsub message id binds the topic.
+///
+/// The id used to be a hash of the payload alone. Gossipsub's duplicate cache
+/// and its per-message score record are keyed by that id and are consulted
+/// before the topic or the subscription is looked at, so bytes first seen on
+/// one topic decided the fate of the same bytes on every other topic: a block
+/// replayed on the transaction topic fails to decode there, is recorded as
+/// invalid, and the honest copy on the block topic is then dropped as a
+/// duplicate while its forwarder takes the invalid-message penalty.
+///
+/// **This is node-local policy, not consensus**, but it cannot be switched node
+/// by node: ids travel between peers in IHAVE/IWANT/IDONTWANT. Two peers with
+/// different id functions never recognise each other's advertisements, so the
+/// receiver asks (IWANT) for everything, gets messages whose locally computed
+/// id differs from the one it asked for, never resolves the promise, and
+/// charges the sender a broken-promise behaviour penalty (P7, weight -10,
+/// squared) for every advertised message. A handful per minute crosses
+/// `gossip_threshold`; the two populations stop gossiping to each other and
+/// prune each other from their meshes. Hence a wall-clock gate: every upgraded
+/// node changes function at the same instant, with no restart in between.
+///
+/// `u64::MAX` is inert: ids are byte-identical to the payload-only ones. Set
+/// it in a release (or [`GOSSIP_TOPIC_MSG_ID_EPOCH_ENV`] on every node) only
+/// once the whole fleet runs a build that has this gate.
+pub const GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Boot-time override of [`GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH`]: a decimal
+/// epoch number. Every node of a network must carry the same value. Anything
+/// that is not a decimal `u64` refuses to start the transport — a typo must
+/// not silently leave one node on the other id function.
+pub const GOSSIP_TOPIC_MSG_ID_EPOCH_ENV: &str = "BLOCH_GOSSIP_TOPIC_MSG_ID_EPOCH";
+
+/// Domain tag of the topic-bound message id. Fixed length, so it needs no
+/// length prefix of its own.
+const TOPIC_MSG_ID_TAG: &[u8] = b"bloch-g4/gossip-message-id/v2";
+
+/// The payload-only message id every node computed before the gate.
+fn legacy_message_id(data: &[u8]) -> MessageId {
+    use sha3::{Digest, Sha3_256};
+    let d = Sha3_256::digest(data);
+    MessageId::from(&d[..16])
+}
+
+/// The topic-bound message id: SHA3-256 over the domain tag, the topic hash
+/// (length-prefixed, so no topic/payload split is ambiguous) and the payload,
+/// truncated like the legacy one.
+fn topic_bound_message_id(topic: &gossipsub::TopicHash, data: &[u8]) -> MessageId {
+    use sha3::{Digest, Sha3_256};
+    let topic = topic.as_str().as_bytes();
+    let mut h = Sha3_256::new();
+    h.update(TOPIC_MSG_ID_TAG);
+    h.update((topic.len() as u64).to_le_bytes());
+    h.update(topic);
+    h.update(data);
+    let d = h.finalize();
+    MessageId::from(&d[..16])
+}
+
+/// When the message id changes function, as a wall-clock instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageIdSchedule {
+    /// Unix milliseconds of the first slot of the activation epoch; `None`
+    /// while the gate is inert (or the instant is not representable).
+    topic_bound_from_ms: Option<u64>,
+}
+
+impl MessageIdSchedule {
+    /// Payload-only ids forever: today's behaviour.
+    pub const INERT: Self = Self { topic_bound_from_ms: None };
+
+    /// The schedule of a network with this genesis and cadence.
+    pub fn new(genesis_time_ms: u64, slot_ms: u64, activation_epoch: u64) -> Self {
+        if activation_epoch == u64::MAX {
+            return Self::INERT;
+        }
+        let topic_bound_from_ms = activation_epoch
+            .checked_mul(bloch_pos_committee::SLOTS_PER_EPOCH)
+            .and_then(|slots| slots.checked_mul(slot_ms))
+            .and_then(|offset| genesis_time_ms.checked_add(offset));
+        Self { topic_bound_from_ms }
+    }
+
+    fn topic_bound_at(&self, now_ms: u64) -> bool {
+        self.topic_bound_from_ms.is_some_and(|from| now_ms >= from)
+    }
+
+    /// The id of `m` for a node whose clock reads `now_ms`.
+    fn message_id_at(&self, now_ms: u64, m: &gossipsub::Message) -> MessageId {
+        if self.topic_bound_at(now_ms) {
+            topic_bound_message_id(&m.topic, &m.data)
+        } else {
+            legacy_message_id(&m.data)
+        }
+    }
+
+    fn message_id(&self, m: &gossipsub::Message) -> MessageId {
+        // The inert schedule never reads the clock.
+        let now_ms = match self.topic_bound_from_ms {
+            None => 0,
+            Some(_) => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
+        };
+        self.message_id_at(now_ms, m)
+    }
+}
+
+/// The activation epoch this boot uses: the override if one is set, else the
+/// built-in constant.
+fn topic_msg_id_activation_epoch(raw: Option<&std::ffi::OsStr>) -> Result<u64, String> {
+    match raw {
+        None => Ok(GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH),
+        Some(raw) => raw
+            .to_str()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| {
+                format!("{GOSSIP_TOPIC_MSG_ID_EPOCH_ENV}={raw:?} is not a decimal epoch number")
+            }),
+    }
+}
+
 /// The gossipsub config.
 ///
 /// `validate_messages()` is the switch that makes `gossip.rs` load-bearing:
 /// with it on, gossipsub relays nothing until the node reports a verdict, so
 /// this node never forwards an attestation it has not judged.
-pub fn gossipsub_config() -> Result<gossipsub::Config, String> {
-    // Message id = SHA3-256 of the payload, truncated. Deterministic across
+pub fn gossipsub_config(schedule: MessageIdSchedule) -> Result<gossipsub::Config, String> {
+    // Message id = truncated SHA3-256, of the payload alone until `schedule`
+    // activates and of tag ‖ topic ‖ payload after (see
+    // [`GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH`]). Deterministic across
     // toolchains (the default hasher is not — two nodes on different Rust
     // versions computed different ids and broke dedup), and sha3 is already
     // this tree's only hash.
-    let msg_id_fn = |m: &gossipsub::Message| {
-        use sha3::{Digest, Sha3_256};
-        let d = Sha3_256::digest(&m.data);
-        MessageId::from(&d[..16])
-    };
+    let msg_id_fn = move |m: &gossipsub::Message| schedule.message_id(m);
     gossipsub::ConfigBuilder::default()
         .protocol_id_prefix(GOSSIP_PROTOCOL_PREFIX)
         .heartbeat_interval(Duration::from_secs(1))
@@ -1176,6 +1296,10 @@ pub struct Config {
     pub max_peers: usize,
     /// Zero the IP-colocation penalty (see [`peer_score_params`]).
     pub behind_proxy: bool,
+    /// The manifest's genesis time and slot cadence. Only used to turn
+    /// [`GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH`] into a wall-clock instant.
+    pub genesis_time_ms: u64,
+    pub slot_ms: u64,
 }
 
 /// Load, or create, this node's libp2p transport identity.
@@ -1269,7 +1393,14 @@ fn build_swarm(
     keypair: &identity::Keypair,
     cfg: &Config,
 ) -> io::Result<(Swarm, Vec<ListenerId>)> {
-    let gs_cfg = gossipsub_config().map_err(io::Error::other)?;
+    let msg_id_epoch =
+        topic_msg_id_activation_epoch(std::env::var_os(GOSSIP_TOPIC_MSG_ID_EPOCH_ENV).as_deref())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    if msg_id_epoch != u64::MAX {
+        println!("p2p: topic-bound gossip message ids from epoch {msg_id_epoch}");
+    }
+    let schedule = MessageIdSchedule::new(cfg.genesis_time_ms, cfg.slot_ms, msg_id_epoch);
+    let gs_cfg = gossipsub_config(schedule).map_err(io::Error::other)?;
     let mut gs = gossipsub::Behaviour::new(MessageAuthenticity::Signed(keypair.clone()), gs_cfg)
         .map_err(|e| io::Error::other(format!("gossipsub: {e}")))?;
     if let Err(e) = gs.with_peer_score(peer_score_params(cfg.behind_proxy), peer_score_thresholds()) {
@@ -3130,7 +3261,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _enter = runtime.enter();
         let key = identity::Keypair::generate_ed25519();
-        let cfg = Config { listen: Vec::new(), peers: Vec::new(), data_dir: PathBuf::new(), max_peers: 8, behind_proxy: true };
+        let cfg = Config { listen: Vec::new(), peers: Vec::new(), data_dir: PathBuf::new(), max_peers: 8, behind_proxy: true, genesis_time_ms: 0, slot_ms: 1_000 };
         let (mut swarm, _) = build_swarm(&key, &cfg).unwrap();
         let mut state = test_loop();
         let peer = PeerId::random();
@@ -3432,7 +3563,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _enter = runtime.enter();
         let key = identity::Keypair::generate_ed25519();
-        let cfg = Config { listen: Vec::new(), peers: Vec::new(), data_dir: PathBuf::new(), max_peers: 8, behind_proxy: true };
+        let cfg = Config { listen: Vec::new(), peers: Vec::new(), data_dir: PathBuf::new(), max_peers: 8, behind_proxy: true, genesis_time_ms: 0, slot_ms: 1_000 };
         let (mut swarm, _) = build_swarm(&key, &cfg).unwrap();
         let mut st = test_loop();
         let peer = PeerId::random();
@@ -3839,6 +3970,89 @@ mod tests {
         assert!(REGOSSIP_SUPPRESS_TTL >= DUPLICATE_CACHE_TIME);
     }
 
+    const MSG_ID_VECTOR: &[u8] = b"bloch p2p4 message id vector";
+
+    fn msg_on(topic: &str) -> gossipsub::Message {
+        gossipsub::Message {
+            source: None,
+            data: MSG_ID_VECTOR.to_vec(),
+            sequence_number: None,
+            topic: IdentTopic::new(topic).hash(),
+        }
+    }
+
+    fn id_hex(id: &MessageId) -> String {
+        crate::codec::hex(&id.0)
+    }
+
+    /// The shipped gate is inert, and an inert gate computes exactly the id
+    /// every deployed node computes: SHA3-256 of the payload, first 16 bytes,
+    /// whatever the topic and whatever the clock. The vector was produced
+    /// outside this crate.
+    #[test]
+    fn inert_message_id_is_the_legacy_payload_hash() {
+        assert_eq!(GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH, u64::MAX, "the gate ships inert");
+        assert_eq!(topic_msg_id_activation_epoch(None), Ok(u64::MAX));
+        let inert = MessageIdSchedule::new(1_700_000_000_000, 30_000, u64::MAX);
+        assert_eq!(inert, MessageIdSchedule::INERT);
+        for now_ms in [0, 1_700_000_000_000, u64::MAX] {
+            for topic in [TOPIC_BLOCKS, TOPIC_ATTESTATIONS, TOPIC_TXS] {
+                assert_eq!(
+                    id_hex(&inert.message_id_at(now_ms, &msg_on(topic))),
+                    "f28240f18615e38e81ffc059b7ccfd8e",
+                );
+            }
+        }
+        // And through the config gossipsub is actually given.
+        let cfg = gossipsub_config(MessageIdSchedule::INERT).expect("config builds");
+        assert_eq!(id_hex(&cfg.message_id(&msg_on(TOPIC_TXS))), "f28240f18615e38e81ffc059b7ccfd8e");
+    }
+
+    /// Once active, the same bytes on two topics are two messages: a payload
+    /// seen (and rejected) on the wrong topic no longer occupies the id of
+    /// the honest copy on the right one. Fixed vectors pin the function
+    /// across toolchains and releases.
+    #[test]
+    fn topic_bound_message_id_separates_topics_and_is_stable() {
+        let active = MessageIdSchedule::new(0, 1_000, 0);
+        let blocks = active.message_id_at(0, &msg_on(TOPIC_BLOCKS));
+        let txs = active.message_id_at(0, &msg_on(TOPIC_TXS));
+        assert_ne!(blocks, txs, "one payload on two topics must not share an id");
+        assert_eq!(id_hex(&blocks), "b4c07af1606bd6173250e7293167fea9");
+        assert_eq!(id_hex(&txs), "a0a95baeeb5d243128d304319a8d0345");
+        assert_ne!(blocks, legacy_message_id(MSG_ID_VECTOR));
+        assert_eq!(blocks, active.message_id_at(u64::MAX, &msg_on(TOPIC_BLOCKS)), "deterministic");
+        // The live closure, with the activation instant long past.
+        let cfg = gossipsub_config(active).expect("config builds");
+        assert_eq!(cfg.message_id(&msg_on(TOPIC_BLOCKS)), blocks);
+        assert_eq!(cfg.message_id(&msg_on(TOPIC_TXS)), txs);
+    }
+
+    /// The switch is the first millisecond of the activation epoch, on every
+    /// node alike; an instant that does not fit in a `u64` never arrives.
+    #[test]
+    fn message_id_switches_exactly_at_the_activation_epoch() {
+        let (genesis, slot_ms, epoch) = (1_000_000u64, 30_000u64, 7u64);
+        let at = genesis + epoch * bloch_pos_committee::SLOTS_PER_EPOCH * slot_ms;
+        let schedule = MessageIdSchedule::new(genesis, slot_ms, epoch);
+        let m = msg_on(TOPIC_BLOCKS);
+        assert_eq!(schedule.message_id_at(at - 1, &m), legacy_message_id(MSG_ID_VECTOR));
+        assert_eq!(schedule.message_id_at(at, &m), topic_bound_message_id(&m.topic, MSG_ID_VECTOR));
+        assert_eq!(MessageIdSchedule::new(genesis, slot_ms, u64::MAX - 1), MessageIdSchedule::INERT);
+    }
+
+    /// The override is a decimal epoch or a refusal to start — never a silent
+    /// fallback that leaves one node on the other id function.
+    #[test]
+    fn message_id_epoch_override_is_strict() {
+        use std::ffi::OsStr;
+        assert_eq!(topic_msg_id_activation_epoch(Some(OsStr::new("7400"))), Ok(7400));
+        assert_eq!(topic_msg_id_activation_epoch(Some(OsStr::new("0"))), Ok(0));
+        for bad in ["", "+7", "7400 ", "0x10", "epoch", "18446744073709551616"] {
+            assert!(topic_msg_id_activation_epoch(Some(OsStr::new(bad))).is_err(), "{bad:?}");
+        }
+    }
+
     /// A Genesis-4 node must not be able to talk to a Genesis-3 one. The
     /// Genesis-3 values are hard-coded here on purpose: this test fails if
     /// someone ever "simplifies" a prefix back to the default.
@@ -3860,7 +4074,7 @@ mod tests {
         );
         assert_ne!(GOSSIP_PROTOCOL_PREFIX, "/meshsub", "that is the default Genesis-3 speaks");
 
-        let cfg = gossipsub_config().expect("config builds");
+        let cfg = gossipsub_config(MessageIdSchedule::INERT).expect("config builds");
         assert!(cfg.validate_messages(), "gossip.rs cannot gate relay without validate_messages");
         assert_eq!(cfg.duplicate_cache_time(), DUPLICATE_CACHE_TIME);
         assert!(
@@ -3961,6 +4175,8 @@ mod tests {
                 data_dir: dir,
                 max_peers: 1,
                 behind_proxy: true,
+                genesis_time_ms: 0,
+                slot_ms: 1_000,
             },
             events,
             Arc::new(AtomicU64::new(0)),
@@ -4013,6 +4229,8 @@ mod tests {
                 // and because a test that grows two more nodes would otherwise
                 // graylist itself with nothing in the output to say so.
                 behind_proxy: true,
+                genesis_time_ms: 0,
+                slot_ms: 1_000,
             },
             tx,
             head.clone(),
