@@ -924,31 +924,10 @@ impl Keystore {
         sign_fn: impl Fn(&[u8], &[u8]) -> Result<Vec<u8>, bloch_crypto::crypto::CryptoError>,
         verify_fn: impl Fn(&[u8], &[u8], &[u8]) -> bool,
     ) -> Vec<u8> {
-        let started = std::time::Instant::now();
-        for _attempt in 0..SIGN_VERIFY_ATTEMPTS {
-            match bloch_crypto::crypto::hardening::sign_verified_with(
-                &sign_fn,
-                &verify_fn,
-                &self.secret,
-                &self.pubkey,
-                signing_root,
-            ) {
-                Ok(signature) => {
-                    pad_signing_latency(started, signing_latency_floor());
-                    return signature;
-                }
-                Err(e) => eprintln!("SIGNER FAULT (validator {}): {e}", self.index),
-            }
+        match sign_verified_released(self.index, &self.secret, &self.pubkey, signing_root, sign_fn, verify_fn) {
+            Ok(signature) => signature,
+            Err(SignerFault) => abort_on_signer_fault(self.index, "the keystore's own public key"),
         }
-        eprintln!(
-            "SIGNER FAULT (validator {}): {SIGN_VERIFY_ATTEMPTS} consecutive signatures failed \
-             verification under the keystore's own public key. Aborting so that no faulty \
-             signature is ever released; on restart the signer self-test runs before any \
-             signing. Check the host for hardware faults and the keystore for a pubkey/secret \
-             mismatch (p9e finding 2, docs/CRYPTO-AUDIT-STATUS-20261020.md).",
-            self.index
-        );
-        std::process::abort()
     }
 
     /// Power-on checks for a host about to sign with this keystore
@@ -979,7 +958,56 @@ impl Keystore {
     }
 }
 
-/// Signing attempts before [`Keystore::sign`] gives up and aborts.
+/// Every attempt of [`sign_verified_released`] produced a signature that did
+/// not verify. Nothing was released.
+#[derive(Debug)]
+pub(crate) struct SignerFault;
+
+/// The verify-before-release loop shared by the static key
+/// ([`Keystore::sign`]) and the forward-secure leaf key
+/// (`kes_key::KesKey::sign`): sign with `sign_fn`, return the signature only
+/// if `verify_fn` accepts it under `pubkey`, retry with fresh randomness up to
+/// [`SIGN_VERIFY_ATTEMPTS`] times, and apply the latency floor
+/// ([`SIGN_LATENCY_FLOOR_ENV`]) to a released signature. `Err` means no
+/// signature left this function; production callers then abort
+/// ([`abort_on_signer_fault`]).
+pub(crate) fn sign_verified_released(
+    validator: u32,
+    secret: &[u8],
+    pubkey: &[u8],
+    message: &[u8; 32],
+    sign_fn: impl Fn(&[u8], &[u8]) -> Result<Vec<u8>, bloch_crypto::crypto::CryptoError>,
+    verify_fn: impl Fn(&[u8], &[u8], &[u8]) -> bool,
+) -> Result<Vec<u8>, SignerFault> {
+    let started = std::time::Instant::now();
+    for _attempt in 0..SIGN_VERIFY_ATTEMPTS {
+        match bloch_crypto::crypto::hardening::sign_verified_with(&sign_fn, &verify_fn, secret, pubkey, message) {
+            Ok(signature) => {
+                pad_signing_latency(started, signing_latency_floor());
+                return Ok(signature);
+            }
+            Err(e) => eprintln!("SIGNER FAULT (validator {validator}): {e}"),
+        }
+    }
+    Err(SignerFault)
+}
+
+/// The signer keeps producing signatures that do not verify under `key`
+/// (hardware fault, or public and secret halves that disagree): abort rather
+/// than keep exercising the key. A restart runs the power-on self-test
+/// (`prepare_signing_host`) before signing again.
+pub(crate) fn abort_on_signer_fault(validator: u32, key: &str) -> ! {
+    eprintln!(
+        "SIGNER FAULT (validator {validator}): {SIGN_VERIFY_ATTEMPTS} consecutive signatures failed \
+         verification under {key}. Aborting so that no faulty \
+         signature is ever released; on restart the signer self-test runs before any \
+         signing. Check the host for hardware faults and the keystore for a pubkey/secret \
+         mismatch (p9e finding 2, docs/CRYPTO-AUDIT-STATUS-20261020.md)."
+    );
+    std::process::abort()
+}
+
+/// Signing attempts before [`sign_verified_released`] gives up (callers abort).
 pub const SIGN_VERIFY_ATTEMPTS: u32 = 3;
 
 /// Opt-in for signing on an architecture outside
@@ -2582,6 +2610,24 @@ mod signer_hardening_tests {
             assert!(bloch_crypto::crypto::verify(&ks.pubkey, &root, &sig));
         }
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A signer whose output never verifies releases nothing, after exactly
+    /// `SIGN_VERIFY_ATTEMPTS` attempts (the caller then aborts).
+    #[test]
+    fn a_signer_that_keeps_faulting_releases_nothing() {
+        let (pubkey, secret) = bloch_crypto::crypto::generate_keypair();
+        let attempts = std::cell::Cell::new(0u32);
+        let faulted = |sk: &[u8], m: &[u8]| {
+            attempts.set(attempts.get() + 1);
+            let mut sig = bloch_crypto::crypto::sign(sk, m)?;
+            let last = sig.len() - 1;
+            sig[last] ^= 1;
+            Ok(sig)
+        };
+        let out = sign_verified_released(1, &secret, &pubkey, &[7u8; 32], faulted, bloch_crypto::crypto::verify);
+        assert!(out.is_err(), "a faulted signature must be withheld");
+        assert_eq!(attempts.get(), SIGN_VERIFY_ATTEMPTS);
     }
 
     #[test]

@@ -34,7 +34,10 @@ use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use zeroize::Zeroizing;
 
-use crate::keys::{os_random, read_keystore_file, KdfParams, Unlock, KDF_ARGON2ID};
+use crate::keys::{
+    abort_on_signer_fault, os_random, read_keystore_file, sign_verified_released, KdfParams, SignerFault, Unlock,
+    KDF_ARGON2ID,
+};
 
 const MAGIC_PLAIN: &[u8; 8] = b"BPOSKES1";
 const MAGIC_SEALED: &[u8; 8] = b"BPOSKES2";
@@ -170,7 +173,30 @@ impl KesKey {
     /// Sign `message` — the bound `kes::leaf_message`, never a bare consensus
     /// root — with the current period's leaf (encoded `kes::KesSignature`).
     /// The caller evolves first.
+    ///
+    /// Released through the same hardening as the static key
+    /// (`keys::sign_verified_released`, p9e finding 2): the leaf signature is
+    /// verified under the leaf public key, with the verifier the network
+    /// applies (`HybridVerifier::verify_kes_leaf`), before it leaves the
+    /// process; a signature that does not verify is withheld and signing is
+    /// retried with fresh randomness; a signer that keeps failing aborts the
+    /// process; and the latency floor applies. The leaf key is also checked
+    /// against the tree before the secret is exercised.
     pub fn sign(&self, message: &[u8; 32]) -> io::Result<Vec<u8>> {
+        match self.sign_with(message, bloch_crypto::crypto::sign_bound)? {
+            Ok(signature) => Ok(signature),
+            Err(SignerFault) => abort_on_signer_fault(self.index, "the KES leaf public key"),
+        }
+    }
+
+    /// [`Self::sign`] with an explicit leaf signer. The outer `Err` is a
+    /// condition under which the key was never exercised; the inner one is a
+    /// signer whose every attempt failed verification (nothing released).
+    fn sign_with(
+        &self,
+        message: &[u8; 32],
+        sign_fn: impl Fn(&[u8], &[u8]) -> Result<Vec<u8>, bloch_crypto::crypto::CryptoError>,
+    ) -> io::Result<Result<Vec<u8>, SignerFault>> {
         let cached = self.leaf.borrow().as_ref().filter(|(leaf, _, _)| *leaf == self.period).map(|(_, pk, sk)| (pk.clone(), Zeroizing::new(sk.to_vec())));
         let (leaf_pk, sk) = match cached {
             Some(pair) => pair,
@@ -180,12 +206,25 @@ impl KesKey {
                 (pk, sk)
             }
         };
+        let index = u32::try_from(self.period).map_err(|_| bad("KES period exceeds u32"))?;
+        // The Merkle half of `kes::verify`: the leaf key must be the tree's
+        // leaf for this period. `leaves` hash to the registered root (checked
+        // at load) and the authentication path is computed from them, so this
+        // is the same condition. A seed that does not belong to the tree is
+        // not a transient fault: refuse without signing, do not retry.
+        if self.leaves.get(self.period as usize) != Some(&kes::leaf_hash(&leaf_pk)) {
+            return Err(bad("KES leaf key does not match the tree at this period; nothing signed"));
+        }
         // Canonical, suite-bound v2 form (review F-1), matching
         // `HybridVerifier::verify_kes_leaf`.
-        let sig = bloch_crypto::crypto::sign_bound(&sk, message)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("KES leaf signing: {e:?}")))?;
-        let index = u32::try_from(self.period).map_err(|_| bad("KES period exceeds u32"))?;
-        Ok(KesSignature { index, leaf_pk, sig, path: kes::auth_path(&self.leaves, self.period as usize) }.encode())
+        let released = sign_verified_released(self.index, &sk, &leaf_pk, message, sign_fn, |pk, m, s| {
+            bloch_crypto::crypto::verify_bound(pk, m, s)
+        });
+        let sig = match released {
+            Ok(sig) => sig,
+            Err(fault) => return Ok(Err(fault)),
+        };
+        Ok(Ok(KesSignature { index, leaf_pk, sig, path: kes::auth_path(&self.leaves, self.period as usize) }.encode()))
     }
 
     fn public_header(&self, out: &mut Vec<u8>) {
@@ -499,6 +538,42 @@ mod tests {
         let v1 = bloch_crypto::crypto::sign(&leaf_sk, &root).unwrap();
         assert!(!inner.verify_kes_leaf(&decoded.leaf_pk, &root, &v1), "a v1 leaf must not verify");
         assert!(inner.verify_kes_leaf(&decoded.leaf_pk, &root, &decoded.sig));
+    }
+
+    /// CR-6: a KES duty signature goes through verify-before-release. A leaf
+    /// signer whose output does not verify under the leaf key releases
+    /// nothing (production then aborts), and a seed that is not the tree's is
+    /// refused before the key is exercised.
+    #[test]
+    fn a_faulted_leaf_signature_is_withheld_and_a_foreign_seed_is_never_exercised() {
+        let key = KesKey::generate(4, 1, |_| {}).unwrap();
+        let root = [0x33u8; 32];
+        let attempts = std::cell::Cell::new(0u32);
+        let faulted = |sk: &[u8], m: &[u8]| {
+            attempts.set(attempts.get() + 1);
+            let mut sig = bloch_crypto::crypto::sign_bound(sk, m)?;
+            let last = sig.len() - 1;
+            sig[last] ^= 1;
+            Ok(sig)
+        };
+        assert!(key.sign_with(&root, faulted).unwrap().is_err(), "a faulted leaf signature must be withheld");
+        assert_eq!(attempts.get(), crate::keys::SIGN_VERIFY_ATTEMPTS);
+        // A signer in the wrong form (v1) is withheld by the same check.
+        assert!(key.sign_with(&root, bloch_crypto::crypto::sign).unwrap().is_err());
+        // The honest signer is released and is what the network accepts.
+        let sig = key.sign(&root).unwrap();
+        assert!(kes::verify(&HybridVerifier::new(), &key.public(), 0, &root, &sig));
+
+        let mut foreign = KesKey::generate(4, 1, |_| {}).unwrap();
+        foreign.leaves = key.leaves.clone();
+        foreign.public = key.public;
+        let signed = std::cell::Cell::new(false);
+        let out = foreign.sign_with(&root, |sk, m| {
+            signed.set(true);
+            bloch_crypto::crypto::sign_bound(sk, m)
+        });
+        assert!(out.is_err(), "a seed outside the tree must be refused");
+        assert!(!signed.get(), "and the leaf key must not have been exercised");
     }
 
     #[test]
