@@ -98,6 +98,11 @@ pub(super) struct FinalityCertStore {
     cache: VecDeque<((u64, Option<[u8; 32]>, u64), Json)>,
     /// The same, for `getlcproof` (its `set_source_epoch` as requested).
     lc_cache: VecDeque<((u64, Option<[u8; 32]>, Option<u64>), Json)>,
+    /// `(epoch, justifying source epoch)` of certificates already built. The
+    /// default set source of a finalized epoch never changes, so a repeated
+    /// request that names none can be answered from `cache` before any block
+    /// is read back from the log.
+    default_source: VecDeque<(u64, u64)>,
 }
 
 impl Engine {
@@ -137,6 +142,19 @@ impl Engine {
             self.finality_certs.registry.pop_front();
             self.finality_certs.extensions.pop_front();
         }
+    }
+
+    /// The header of a stored block, without reading the block log: a
+    /// released (hollow) block keeps its header in memory. Falls back to the
+    /// full lookup only for a block this node does not hold in `blocks`.
+    fn header_by_id(&self, id: &[u8; 32]) -> Option<bloch_pos_committee::header::BlockHeaderV4> {
+        if self.chain[0].1.as_bytes() == id {
+            return Some(self.manifest.genesis_header());
+        }
+        if let Some(env) = self.blocks.get(id) {
+            return Some(env.header.clone());
+        }
+        self.envelope_by_id(id).map(|e| e.header.clone())
     }
 
     /// Canonical block ids in `epoch`, ascending slot.
@@ -225,8 +243,42 @@ impl Engine {
                 format!("epoch {e} is not finalized on this node (finalized epoch {finalized})"),
             ));
         }
+        // Everything below reads released blocks back from the log on the
+        // consensus thread, and this method is reachable without
+        // authentication. Answer a repeated request from the cache, and
+        // refuse a `block` this certificate could never carry, before the
+        // first read.
+        let known_source = set_source_epoch.or_else(|| {
+            self.finality_certs.default_source.iter().find(|(k, _)| *k == e).map(|(_, s)| *s)
+        });
+        if let Some(src_epoch) = known_source {
+            let key = (e, block, src_epoch);
+            if let Some((_, j)) = self.finality_certs.cache.iter().find(|(k, _)| *k == key) {
+                return Ok(j.clone());
+            }
+        }
         let root = self.checkpoint_root(e);
         let next_root = self.checkpoint_root(e + 1);
+        if let Some(want) = block.filter(|want| *want != root) {
+            // The canonical chain is linear, so a canonical block is an
+            // ancestor of the checkpoint exactly when it sits below it, and
+            // the ancestry the certificate would carry is their height
+            // difference. Both are index lookups.
+            let Some(want_height) = self.height_of(&want) else {
+                return Err(RpcError::new(rpc::BLOCK_NOT_FOUND, "`block` is not canonical on this node"));
+            };
+            let root_height = self
+                .height_of(&root)
+                .ok_or_else(|| RpcError::unavailable("checkpoint block not readable"))?;
+            if want_height >= root_height {
+                return Err(RpcError::new(rpc::BLOCK_NOT_FOUND, "`block` is not an ancestor of the checkpoint"));
+            }
+            if root_height - want_height > MAX_ANCESTRY as u64 {
+                return Err(RpcError::invalid_params(format!(
+                    "`block` is more than {MAX_ANCESTRY} blocks below the checkpoint; use an older epoch"
+                )));
+            }
+        }
 
         // Justifying link: the source with the most votes for (e, root).
         let v_e = self.canonical_votes(e)?;
@@ -278,8 +330,7 @@ impl Engine {
             })?;
 
         let checkpoint_header = self
-            .envelope_by_id(&root)
-            .map(|e| e.header.clone())
+            .header_by_id(&root)
             .ok_or_else(|| RpcError::unavailable("checkpoint block not readable"))?;
 
         let mut ancestry = Vec::new();
@@ -295,10 +346,9 @@ impl Engine {
                             "`block` is more than {MAX_ANCESTRY} blocks below the checkpoint; use an older epoch"
                         )));
                     }
-                    let env = self
-                        .envelope_by_id(&cur)
+                    let h = self
+                        .header_by_id(&cur)
                         .ok_or_else(|| RpcError::new(rpc::BLOCK_NOT_FOUND, "`block` is not an ancestor of the checkpoint"))?;
-                    let h = env.header.clone();
                     let done = cur == want;
                     let genesis = cur == *self.chain[0].1.as_bytes();
                     cur = h.parent;
@@ -332,6 +382,12 @@ impl Engine {
         self.finality_certs.cache.push_back((key, reply.clone()));
         while self.finality_certs.cache.len() > CERT_CACHE {
             self.finality_certs.cache.pop_front();
+        }
+        if set_source_epoch.is_none() && !self.finality_certs.default_source.iter().any(|(k, _)| *k == e) {
+            self.finality_certs.default_source.push_back((e, src_epoch));
+            while self.finality_certs.default_source.len() > CERT_CACHE {
+                self.finality_certs.default_source.pop_front();
+            }
         }
         Ok(reply)
     }
