@@ -3143,10 +3143,18 @@ impl CommittedState {
             .collect();
         // Positionally keyed: the history's append order is chain order (see
         // DelegationRecord docs for why content cannot key duplicates).
+        //
+        // A pruned slot (`FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH`) is not
+        // committed: it holds the one fixed tombstone, so the leaves of the
+        // records that remain already determine it (see
+        // `prune_withdrawn_funded_delegations`). No record can equal the
+        // tombstone below that gate, so this filter passes everything and
+        // every root is unchanged while the gate is inert.
         let delegations: Vec<DelegationRecord> = self
             .delegations
             .iter()
             .enumerate()
+            .filter(|(_, d)| !d.is_pruned())
             .map(|(position, d)| DelegationRecord {
                 position: position as u64,
                 delegator: d.delegator,
@@ -6257,6 +6265,12 @@ impl CommittedState {
             for (position, inactive_since) in newly_inactive {
                 st.funded_delegation_lifecycle.insert(position, (inactive_since, false));
             }
+        }
+        // Security review ST-1: fully withdrawn positions leave the fold and
+        // the root, so neither grows with the positions ever created. Inert
+        // below its gate: nothing is pruned and the state is untouched.
+        if crate::params::funded_delegation_bound_active(next_epoch) {
+            st.prune_withdrawn_funded_delegations(next_epoch);
         }
         st.pending_votes.clear();
         let roster_next = st.consensus_roster_at(next_epoch);

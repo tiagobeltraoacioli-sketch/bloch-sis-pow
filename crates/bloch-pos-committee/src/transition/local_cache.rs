@@ -424,6 +424,15 @@ impl CommittedState {
         if !rest.is_empty() {
             return Err("unexpected bytes after the cached state".into());
         }
+        // A pruned delegation slot is not committed, so the root check below
+        // cannot see one. Inside the history its place is fixed by the
+        // positions of the committed records around it; at the end nothing
+        // fixes it, and the transition never leaves one there (the last
+        // record is never pruned). Refuse a cache that claims otherwise: it
+        // would restore a history length the root does not commit.
+        if value.delegations.last().is_some_and(|d| d.is_pruned()) {
+            return Err("cached delegation history ends in a pruned slot".into());
+        }
         let count = value.eutxos.len();
         let eutxos: EutxoSet = value.eutxos.into_iter().collect();
         if eutxos.entries.by_outpoint.len() != count { return Err("duplicate cached outpoint".into()); }

@@ -577,3 +577,124 @@ and 65,536 retained blocks, full rebuilds averaged 2.098, 28.142 and 65.574 ms;
 indexed computations averaged 0.060, 0.155 and 0.313 ms respectively, with
 identical selected heads. These are local synthetic measurements of fork
 choice, not whole-node throughput or a completed network qualification.
+
+## Bounded delegation state (security review ST-1, 2026-11-10)
+
+Status: the resolver change is not a consensus change and ships with the
+binary. The state bound is implemented and INERT:
+`FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH = u64::MAX`.
+
+### The problem
+
+Every funded position is a record in the committed delegation history, up to
+three leaves of the state root (record, owner, lifecycle) and an entry in the
+warm-up fold that every block resolves. The history is append-only: a
+withdrawn position stays in all three. A position costs 10 BLCH that its owner
+recovers, and the only limit was the 500,000,000 BLCH of principal per
+validator, not a count. The resolver also walked every epoch since genesis,
+twice over the whole list, on every call. The work of a block therefore grew
+with (current epoch x positions ever created), without bound.
+
+### Resolver (no consensus change)
+
+`delegation::Registry::resolve` returns exactly what it returned before, for
+every input. The walk now performs only the steps that move stake: it keeps
+the entries that can still warm up and the entries that still have stake to
+release, in queue order, and jumps over epochs in which both sets are empty.
+The previous implementation is kept verbatim in the test module and the two
+are compared on randomized histories, at every epoch of a history, and across
+the pruning rule below. The last result is memoised per thread, keyed by the
+epoch and the complete delegation list (compared record by record), so the
+several calls of one block and of one epoch boundary share one computation.
+The memo is node-local and is never part of committed state.
+
+Measured on one resolve at epoch 7,400 (optimised build, loaded laptop,
+`delegation::tests::measure_resolver_before_and_after_at_epoch_7400`):
+
+| Positions | Before | After, computed | After, memo hit |
+| ---: | ---: | ---: | ---: |
+| 1,000 | 19.9 ms | 0.19 ms | 0.003 ms |
+| 10,000 | 708 ms | 2.1 ms | 0.04 ms |
+| 100,000 | 9.0 s | 35 ms | 0.69 ms |
+
+What remains without the bound below is linear in the number of positions
+ever created, and no longer multiplied by the epoch: the resolver's sort, the
+comparison that guards the memo, and above all the state root, which still
+hashes every record, owner and lifecycle entry on every block. Measured on
+the same machine (`measure_state_root_with_many_funded_positions`, half of
+the positions deactivated):
+
+| Positions | One state root | One epoch boundary |
+| ---: | ---: | ---: |
+| 0 | 3 ms | 0.3 ms |
+| 1,000 | 36 ms | 1 ms |
+| 10,000 | 0.45 s | 8 ms |
+| 100,000 | 5.4 s | 0.12 s |
+
+These are local synthetic measurements on a small eUTXO set, not whole-node
+throughput. They are why the resolver change alone does not close the
+finding and the bound below is needed.
+
+### State bound (consensus change, gated)
+
+Once `FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH` is armed:
+
+1. **Position limits.** `FundedDelegate` is refused
+   (`FundedDelegationReject::PositionLimit`) when the history already holds
+   `MAX_FUNDED_POSITIONS` (4,096) unpruned positions in total, or
+   `MAX_FUNDED_POSITIONS_PER_VALIDATOR` (64) behind the target validator.
+   Once half of either limit is in use, a new position must carry at least
+   `CROWDED_FUNDED_POSITION_MIN_SAT` (10,000 BLCH). The 10 BLCH minimum is
+   unchanged for the first half. Pending, active, cooling-down and withdrawn
+   positions all count until they are pruned. Existing positions are never
+   affected, including on a validator that is already above a limit when the
+   gate opens.
+2. **Pruning.** At each epoch boundary, every fully withdrawn position is
+   overwritten with the fixed value `Delegation::PRUNED` and its owner and
+   lifecycle entries are removed. A pruned slot is in neither the fold nor
+   the state root. Positions keep their indices, so a `position` in a signed
+   intent never changes meaning. Two records are always kept: the last one
+   of the history and the one with the largest `delegator_id`. They pin the
+   next position index and the next identifier, so both stay monotonic and
+   the committed leaves still determine the whole history.
+
+Pruning must not change anyone else's stake. The resolver replays the history
+from epoch zero, so deleting a record rewrites the past: stake that once
+queued behind it would have warmed up sooner. `pruning_is_outcome_neutral`
+runs the walk with and without the withdrawn records and prunes only when
+every remaining record holds the same activated amount in both, which is
+sufficient for every later epoch. That is the case whenever the queue has
+been idle at least once since the withdrawn records drained; a withdrawal
+comes 2,048 epochs after that point. If a backlog has been open ever since,
+the records are kept and the next boundary asks again. The position limits
+hold either way.
+
+After pruning, `getfundeddelegation(position)` returns null for that
+position, and a second withdrawal or a deactivation of it is refused as an
+ownership failure rather than as already withdrawn.
+
+While the gate is inert no record can equal `Delegation::PRUNED` (both
+admission paths require the minimum amount and store `eligible = true`),
+nothing is pruned, and the committed encoding and every state root are
+unchanged.
+
+Arming requires what every consensus gate here requires: a historical replay
+of mainnet with the armed build, mixed-version qualification across the
+boundary, a coordinated epoch for the whole validating fleet, and an indexer
+built from the same release. Before choosing the epoch, read the number of
+unpruned positions per validator and in total from committed state: a
+validator already holding 32 positions accepts only positions of 10,000 BLCH
+or more from the first armed block, and one holding 64 accepts none until a
+withdrawal is pruned. The three constants are sized from the state-root
+measurement above (about 0.2 s per block at the global limit) and can be
+changed while the gate is inert.
+
+### Not done here
+
+The durable shape is an incremental resolver: commit each position's
+activated amount and each validator's total, advance them by one epoch at
+each boundary, and stop replaying history at all. Pruning then needs no
+neutrality check, and the root can keep the delegation leaves incrementally
+as it already does for the eUTXO set. It changes committed state and the
+state root for every delegation, so it needs its own gate, migration and
+replay qualification, and is left as follow-up work.

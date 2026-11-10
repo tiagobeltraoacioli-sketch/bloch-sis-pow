@@ -787,3 +787,485 @@ fn crowded_exit_waits_for_the_churn_budget_to_finish_draining() {
         0
     );
 }
+
+// ── Security review ST-1: bounded delegation state ──────────────────────────
+// (`params::FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH`)
+
+use crate::params::funded_delegation_bound_rehearsal;
+
+fn signed_undelegate(state: &CommittedState, owner: &FundedDelegate, position: u32) -> FundedUndelegate {
+    let mut tx = FundedUndelegate {
+        network_domain: owner.network_domain,
+        epoch: state.epoch,
+        delegator_id: position,
+        position,
+        funding_pubkey: owner.funding_pubkey.clone(),
+        signature: Vec::new(),
+    };
+    tx.signature = auth_sign(&tx.funding_pubkey, &tx.signing_root());
+    tx
+}
+
+fn signed_withdrawal(
+    state: &CommittedState,
+    owner: &FundedDelegate,
+    position: u32,
+) -> FundedDelegationWithdraw {
+    let mut tx = FundedDelegationWithdraw {
+        network_domain: owner.network_domain,
+        epoch: state.epoch,
+        delegator_id: position,
+        position,
+        funding_pubkey: owner.funding_pubkey.clone(),
+        destination_script_hash: [0x92; 32],
+        max_base_fee_millisat_per_gas: fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+        signature: Vec::new(),
+    };
+    tx.signature = auth_sign(&tx.funding_pubkey, &tx.signing_root());
+    tx
+}
+
+/// Deactivate `position`, let it drain, wait out the withdrawal delay and
+/// withdraw it, all through the real transactions and real epoch boundaries.
+fn withdraw_through_the_lifecycle(mut state: CommittedState, owner: &FundedDelegate, position: u32) -> CommittedState {
+    let base_fee = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+    let exit = signed_undelegate(&state, owner, position);
+    state.apply_funded_undelegate(&exit, &AuthVerifier).unwrap();
+    while state.funded_delegation_lifecycle[&position].0 == u64::MAX {
+        state = state.close_epoch();
+    }
+    let mature = state.funded_delegation_lifecycle[&position].0 + staking::WITHDRAWAL_DELAY_EPOCHS;
+    while state.epoch < mature {
+        state = state.close_epoch();
+    }
+    let withdrawal = signed_withdrawal(&state, owner, position);
+    state
+        .apply_funded_delegation_withdrawal(&withdrawal, base_fee, &AuthVerifier)
+        .unwrap();
+    assert!(state.funded_delegation_lifecycle[&position].1);
+    state
+}
+
+/// Three funded positions (indices 0, 1, 2 behind validators 0, 1, 0) with
+/// position 0 fully withdrawn. Built with only the funded-delegation gate
+/// open, so it is a state today's rules can produce.
+fn state_with_a_withdrawn_position() -> (CommittedState, FundedDelegate) {
+    let (mut state, first) = fixture();
+    let base_fee = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+    state.apply_funded_delegate(&first, base_fee, &AuthVerifier).unwrap();
+    for (tag, validator, amount_blch) in [(0x41, 1, 25u128), (0x42, 0, 1_000)] {
+        let tx = provision_delegation(
+            &mut state,
+            tag,
+            validator,
+            amount_blch * tokenomics_v4::SAT_PER_BLOCH,
+        );
+        state.apply_funded_delegate(&tx, base_fee, &AuthVerifier).unwrap();
+    }
+    let state = withdraw_through_the_lifecycle(state, &first, 0);
+    assert_eq!(state.delegations.len(), 3);
+    (state, first)
+}
+
+/// Append `count` synthetic funded positions behind `validator`, as if they
+/// had been created long ago: record plus owner entry, sequential ids.
+fn fill_positions(state: &mut CommittedState, validator: u32, count: usize) {
+    for _ in 0..count {
+        let id = state.delegations.len() as u32;
+        state.delegations.push(Delegation {
+            delegator: id,
+            validator,
+            amount_sat: delegation::MIN_DELEGATION_SAT,
+            requested_epoch: 0,
+            deactivate_epoch: None,
+            eligible: true,
+        });
+        state.funded_delegation_owners.insert(id, [0x77; 32]);
+    }
+}
+
+#[test]
+fn funded_delegation_bound_gate_is_inert() {
+    assert_eq!(crate::params::FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH, u64::MAX);
+    for epoch in [0, 4_669, 7_400, u64::MAX - 1, u64::MAX] {
+        assert!(!crate::params::funded_delegation_bound_active(epoch));
+    }
+    let _bound = funded_delegation_bound_rehearsal::open();
+    assert!(crate::params::funded_delegation_bound_active(0));
+}
+
+/// With the gate inert a boundary prunes nothing: the withdrawn record, its
+/// owner and its lifecycle entry are all still state, and still committed
+/// (touching the withdrawn record moves the root).
+#[test]
+fn inert_bound_gate_keeps_withdrawn_positions_committed_and_roots_unchanged() {
+    let _gate = funded_delegation_rehearsal::open();
+    let (state, _) = state_with_a_withdrawn_position();
+    assert!(state.delegations.iter().all(|d| !d.is_pruned()));
+
+    let closed = state.close_epoch();
+    assert_eq!(closed.delegations, state.delegations);
+    assert_eq!(closed.funded_delegation_owners, state.funded_delegation_owners);
+    assert_eq!(closed.funded_delegation_lifecycle, state.funded_delegation_lifecycle);
+    // One delegation leaf, one owner leaf per position; one lifecycle leaf
+    // for the position that was deactivated. Nothing left the tree.
+    assert_eq!(closed.delegations.len(), 3);
+    assert_eq!(closed.funded_delegation_owners.len(), 3);
+    assert_eq!(closed.funded_delegation_lifecycle.len(), 1);
+
+    let mut touched = closed.clone();
+    touched.delegations[0].amount_sat += 1;
+    assert_ne!(touched.state_root(), closed.state_root());
+
+    // The pruning entry point is only reachable behind the gate; called
+    // directly on this state it would prune, so the gate is what holds it.
+    let mut forced = closed.clone();
+    forced.prune_withdrawn_funded_delegations(forced.epoch);
+    assert!(forced.delegations[0].is_pruned());
+    assert_ne!(forced.state_root(), closed.state_root());
+}
+
+/// With the gate armed, the next boundary takes the withdrawn position out
+/// of the fold and out of the root, and nothing else changes.
+#[test]
+fn armed_bound_prunes_withdrawn_positions_from_the_fold_and_the_root() {
+    let _gate = funded_delegation_rehearsal::open();
+    let (state, owner) = state_with_a_withdrawn_position();
+    let base_fee = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+    let withdrawn_id = state.delegations[0].delegator;
+    let control = state.close_epoch();
+
+    let _bound = funded_delegation_bound_rehearsal::open();
+    let mut pruned = state.close_epoch();
+
+    // The slot is the tombstone; its owner and lifecycle entries are gone.
+    assert!(pruned.delegations[0].is_pruned());
+    assert_eq!(pruned.delegations.len(), 3, "positions keep their indices");
+    assert_eq!(pruned.delegations[1..], control.delegations[1..]);
+    assert!(!pruned.funded_delegation_owners.contains_key(&withdrawn_id));
+    assert!(!pruned.funded_delegation_lifecycle.contains_key(&0));
+    assert_eq!(pruned.funded_delegation_owners.len(), 2);
+
+    // Out of the fold: the resolver's queue no longer holds it...
+    let in_fold = |s: &CommittedState| {
+        s.delegations
+            .iter()
+            .filter(|d| d.eligible && d.amount_sat >= delegation::MIN_DELEGATION_SAT)
+            .count()
+    };
+    assert_eq!((in_fold(&control), in_fold(&pruned)), (3, 2));
+    // ...and nobody else can tell: same registry, same rosters, same supply,
+    // now and across the boundaries that follow.
+    let (mut with, mut without) = (control.clone(), pruned.clone());
+    for _ in 0..4 {
+        assert_eq!(
+            delegation::Registry::resolve(&without.delegations, without.epoch),
+            delegation::Registry::resolve(&with.delegations, with.epoch)
+        );
+        assert_eq!(without.duty_roster_at(without.epoch), with.duty_roster_at(with.epoch));
+        assert_eq!(without.accounted_supply_sat(), with.accounted_supply_sat());
+        assert_eq!(without.validators, with.validators);
+        assert_eq!(without.delegator_issuance_rewards, with.delegator_issuance_rewards);
+        (with, without) = (with.close_epoch(), without.close_epoch());
+    }
+
+    // Out of the root: three leaves fewer (record, owner, lifecycle).
+    assert_eq!(control.state_tree().len() - pruned.state_tree().len(), 3);
+    assert_ne!(pruned.state_root(), control.state_root());
+
+    // The pruned slot is not a position: no view, no second withdrawal, no
+    // deactivation, each refused without touching state.
+    assert!(pruned.funded_delegation_view(0).is_none());
+    assert!(pruned.funded_delegation_view(1).is_some());
+    let before = pruned.clone();
+    let again = signed_withdrawal(&pruned, &owner, 0);
+    assert_eq!(
+        pruned.apply_funded_delegation_withdrawal(&again, base_fee, &AuthVerifier),
+        Err(FundedDelegationReject::Ownership)
+    );
+    let exit = signed_undelegate(&pruned, &owner, 0);
+    assert_eq!(
+        pruned.apply_funded_undelegate(&exit, &AuthVerifier),
+        Err(FundedDelegationReject::Ownership)
+    );
+    assert_eq!(pruned, before);
+
+    // A boundary with nothing withdrawn prunes nothing.
+    let next = pruned.close_epoch();
+    assert_eq!(next.delegations, pruned.delegations);
+    assert_eq!(next.funded_delegation_owners, pruned.funded_delegation_owners);
+
+    // The next position still gets the next index and the next identifier.
+    let tx = provision_delegation(&mut pruned, 0x43, 1, delegation::MIN_DELEGATION_SAT);
+    pruned.apply_funded_delegate(&tx, base_fee, &AuthVerifier).unwrap();
+    assert_eq!(pruned.delegations.len(), 4);
+    assert_eq!(pruned.delegations[3].delegator, 3);
+    assert!(pruned.delegations[0].is_pruned());
+}
+
+/// A tombstone carries delegator id 0. The owner of the real delegator 0
+/// must not be able to address a pruned slot with it.
+#[test]
+fn a_pruned_slot_cannot_be_addressed_through_the_tombstone_identifier() {
+    let _gate = funded_delegation_rehearsal::open();
+    let (mut state, first) = fixture();
+    let base_fee = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+    state.apply_funded_delegate(&first, base_fee, &AuthVerifier).unwrap();
+    // Position 0 belongs to delegator 0 and is live; slot 1 is pruned.
+    state.delegations.push(Delegation::PRUNED);
+    fill_positions(&mut state, 1, 1);
+    assert_eq!(state.delegations[0].delegator, 0);
+
+    let before = state.clone();
+    let mut exit = signed_undelegate(&state, &first, 1);
+    exit.delegator_id = 0;
+    exit.signature = auth_sign(&exit.funding_pubkey, &exit.signing_root());
+    assert_eq!(
+        state.apply_funded_undelegate(&exit, &AuthVerifier),
+        Err(FundedDelegationReject::Position)
+    );
+    let mut withdrawal = signed_withdrawal(&state, &first, 1);
+    withdrawal.delegator_id = 0;
+    withdrawal.signature = auth_sign(&withdrawal.funding_pubkey, &withdrawal.signing_root());
+    assert_eq!(
+        state.apply_funded_delegation_withdrawal(&withdrawal, base_fee, &AuthVerifier),
+        Err(FundedDelegationReject::Position)
+    );
+    assert!(state.funded_delegation_view(1).is_none());
+    assert_eq!(state, before);
+}
+
+/// The last record and the record with the largest identifier are kept, so
+/// the root still commits the history length and identifiers never repeat.
+#[test]
+fn the_newest_position_is_never_pruned() {
+    let _gate = funded_delegation_rehearsal::open();
+    let _bound = funded_delegation_bound_rehearsal::open();
+    let (mut state, first) = fixture();
+    let base_fee = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+    state.apply_funded_delegate(&first, base_fee, &AuthVerifier).unwrap();
+    let mut state = withdraw_through_the_lifecycle(state, &first, 0);
+
+    // The only position, withdrawn: it stays, whole, through boundaries.
+    state = state.close_epoch();
+    assert!(!state.delegations[0].is_pruned());
+    assert!(state.funded_delegation_lifecycle[&0].1);
+    assert_eq!(state.funded_delegation_owners.len(), 1);
+
+    // A newer position takes its place as the newest; now it can go.
+    let tx = provision_delegation(&mut state, 0x44, 1, delegation::MIN_DELEGATION_SAT);
+    state.apply_funded_delegate(&tx, base_fee, &AuthVerifier).unwrap();
+    assert_eq!(state.delegations[1].delegator, 1);
+    state = state.close_epoch();
+    assert!(state.delegations[0].is_pruned());
+    assert!(!state.delegations[1].is_pruned());
+    assert_eq!(state.funded_delegation_owners.keys().copied().collect::<Vec<_>>(), [1]);
+    assert!(state.funded_delegation_lifecycle.is_empty());
+
+    let tx = provision_delegation(&mut state, 0x45, 1, delegation::MIN_DELEGATION_SAT);
+    state.apply_funded_delegate(&tx, base_fee, &AuthVerifier).unwrap();
+    assert_eq!(state.delegations.len(), 3);
+    assert_eq!(state.delegations[2].delegator, 2, "identifiers stay monotonic");
+}
+
+/// A withdrawn record that once stood ahead of a backlog which is still
+/// open is kept until the backlog closes: pruning it earlier would hand the
+/// stake behind it weight the chain never agreed on.
+#[test]
+fn pruning_waits_while_the_withdrawn_position_still_shapes_a_backlog() {
+    let (mut state, _) = fixture();
+    let blch = tokenomics_v4::SAT_PER_BLOCH;
+    state.delegations = vec![
+        Delegation {
+            delegator: 0,
+            validator: 0,
+            amount_sat: 5_000_000 * blch,
+            requested_epoch: 1,
+            deactivate_epoch: Some(2),
+            eligible: true,
+        },
+        Delegation {
+            delegator: 1,
+            validator: 1,
+            amount_sat: 40_000_000 * blch,
+            requested_epoch: 1,
+            deactivate_epoch: None,
+            eligible: true,
+        },
+    ];
+    state.funded_delegation_owners.insert(0, [0x71; 32]);
+    state.funded_delegation_owners.insert(1, [0x72; 32]);
+    state.funded_delegation_lifecycle.insert(0, (34, true));
+
+    let behind = state.delegations[1];
+    let weight_at = |s: &CommittedState, epoch| {
+        delegation::Registry::resolve(&s.delegations, epoch).activated_sat(&behind)
+    };
+    let mut early = state.clone();
+    early.prune_withdrawn_funded_delegations(40);
+    assert_eq!(early, state, "the backlog behind it is still warming up");
+    assert!(weight_at(&state, 40) < behind.amount_sat);
+
+    let mut late = state.clone();
+    late.prune_withdrawn_funded_delegations(200);
+    assert!(late.delegations[0].is_pruned());
+    for epoch in [200, 201, 260, 5_000] {
+        assert_eq!(weight_at(&late, epoch), weight_at(&state, epoch));
+        assert_eq!(late.duty_roster_at(epoch), state.duty_roster_at(epoch));
+    }
+}
+
+/// The count limits: inert today, and with the gate armed the next position
+/// past a limit is refused without touching state.
+#[test]
+fn armed_bound_refuses_the_position_past_each_limit() {
+    use funded_delegation::{
+        CROWDED_FUNDED_POSITION_MIN_SAT as LARGE, MAX_FUNDED_POSITIONS as GLOBAL,
+        MAX_FUNDED_POSITIONS_PER_VALIDATOR as PER_VALIDATOR,
+    };
+    let _gate = funded_delegation_rehearsal::open();
+    let base_fee = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+    let small = delegation::MIN_DELEGATION_SAT;
+    let refused = |state: &mut CommittedState, tag: u8, validator: u32, amount: u128| {
+        let tx = provision_delegation(state, tag, validator, amount);
+        let before = state.clone();
+        assert_eq!(
+            state.apply_funded_delegate(&tx, base_fee, &AuthVerifier),
+            Err(FundedDelegationReject::PositionLimit)
+        );
+        assert_eq!(*state, before, "a refusal must not touch state");
+    };
+    let accepted = |state: &mut CommittedState, tag: u8, validator: u32, amount: u128| {
+        let tx = provision_delegation(state, tag, validator, amount);
+        state.apply_funded_delegate(&tx, base_fee, &AuthVerifier).unwrap();
+    };
+
+    // Inert: no count is ever looked at.
+    {
+        let (mut state, _) = fixture();
+        fill_positions(&mut state, 0, PER_VALIDATOR + 5);
+        fill_positions(&mut state, 1, GLOBAL);
+        accepted(&mut state, 0x51, 0, small);
+        accepted(&mut state, 0x52, 2, small);
+    }
+
+    let _bound = funded_delegation_bound_rehearsal::open();
+
+    // Per validator. The first half of the slots takes any position...
+    let (mut state, _) = fixture();
+    fill_positions(&mut state, 0, PER_VALIDATOR / 2 - 1);
+    accepted(&mut state, 0x53, 0, small);
+    // ...the second half only substantial ones...
+    refused(&mut state, 0x54, 0, small);
+    refused(&mut state, 0x55, 0, LARGE - 1);
+    accepted(&mut state, 0x56, 0, LARGE);
+    // ...and a full validator takes none, while its neighbour is untouched.
+    fill_positions(&mut state, 0, PER_VALIDATOR / 2 - 1);
+    assert_eq!(state.delegations.iter().filter(|d| d.validator == 0).count(), PER_VALIDATOR);
+    refused(&mut state, 0x57, 0, LARGE);
+    refused(&mut state, 0x58, 0, small);
+    accepted(&mut state, 0x59, 1, small);
+
+    // A pruned slot is not a position: it gives its place back.
+    let last_of_validator_0 = state.delegations.iter().rposition(|d| d.validator == 0).unwrap();
+    let freed = state.delegations[last_of_validator_0].delegator;
+    state.delegations[last_of_validator_0] = Delegation::PRUNED;
+    state.funded_delegation_owners.remove(&freed);
+    accepted(&mut state, 0x5a, 0, LARGE);
+    refused(&mut state, 0x5b, 0, LARGE);
+
+    // Globally, the same two steps.
+    let (mut state, _) = fixture();
+    for validator in 1..8 {
+        fill_positions(&mut state, validator, (GLOBAL / 2 - 1) / 7);
+    }
+    let short = GLOBAL / 2 - 1 - state.delegations.len();
+    fill_positions(&mut state, 1, short);
+    accepted(&mut state, 0x61, 0, small);
+    assert_eq!(state.delegations.len(), GLOBAL / 2);
+    refused(&mut state, 0x62, 0, small);
+    accepted(&mut state, 0x63, 0, LARGE);
+    let room = GLOBAL - state.delegations.len();
+    fill_positions(&mut state, 2, room);
+    refused(&mut state, 0x64, 0, LARGE);
+    refused(&mut state, 0x65, 0, small);
+}
+
+/// A pruned state survives the local restart cache: the pruned slot comes
+/// back in place and the restored state has the header's root. A history
+/// that ends in a pruned slot is refused, because no committed leaf would
+/// pin its length.
+#[test]
+#[cfg(feature = "local-state-cache")]
+fn local_cache_round_trips_a_pruned_history_and_refuses_a_pruned_tail() {
+    let _gate = funded_delegation_rehearsal::open();
+    let (state, _) = state_with_a_withdrawn_position();
+    let mut pruned = {
+        let _bound = funded_delegation_bound_rehearsal::open();
+        state.close_epoch()
+    };
+    assert!(pruned.delegations[0].is_pruned());
+    // A restored state must sit at a slot of its own epoch.
+    pruned.slot = pruned.epoch * SLOTS_PER_EPOCH;
+    let header_for = |state: &CommittedState| BlockHeaderV4 {
+        version: BLOCK_VERSION_V4, parent: [0; 32], state_root: state.compute_root(),
+        body_root: [0; 32], slot: state.slot, proposer_index: 0,
+        randao_reveal: [0; 32], randao_mix: state.randao_mix,
+        justified_root: [0; 32], finalized_root: [0; 32],
+        attestation_root: [0; 32], coherence_root: [0; 32],
+    };
+    let header = header_for(&pruned);
+    pruned.head = header.id();
+    let bytes = pruned.encode_local_cache().unwrap();
+    assert_eq!(CommittedState::decode_local_cache(&bytes, &header).unwrap(), pruned);
+
+    let mut longer = pruned.clone();
+    longer.delegations.push(Delegation::PRUNED);
+    assert_eq!(longer.compute_root(), pruned.compute_root(), "a pruned slot is not committed");
+    let header = header_for(&longer);
+    longer.head = header.id();
+    let bytes = longer.encode_local_cache().unwrap();
+    let refusal = CommittedState::decode_local_cache(&bytes, &header).unwrap_err();
+    assert!(refusal.contains("pruned slot"), "{refusal}");
+}
+
+/// What one state root and one epoch boundary cost with many funded
+/// positions in committed state (not asserted on time). This is the part of
+/// the per-block cost the resolver rewrite does not touch and the position
+/// limit exists to bound.
+///
+/// ```sh
+/// cargo test --release -p bloch-pos-committee --lib \
+///     measure_state_root_with_many_funded_positions -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "measurement: run in release with --nocapture"]
+fn measure_state_root_with_many_funded_positions() {
+    use std::time::Instant;
+    let _gate = funded_delegation_rehearsal::open();
+    println!("positions | state root | epoch boundary | roster");
+    for n in [0usize, 1_000, 4_096, 10_000, 100_000] {
+        let (_, mut state, _) = setup_with(140, AuthVerifier, &[]);
+        state.admission_network_domain = Some([0x91; 32]);
+        for k in 0..n {
+            fill_positions(&mut state, (k % 139) as u32, 1);
+            // Half of them deactivated: those carry a lifecycle leaf too.
+            if k % 2 == 0 {
+                state.delegations[k].deactivate_epoch = Some(0);
+                state.funded_delegation_lifecycle.insert(k as u32, (0, false));
+            }
+        }
+        let _ = state.state_root();
+        let t = Instant::now();
+        std::hint::black_box(state.state_root());
+        let root = t.elapsed();
+        let t = Instant::now();
+        std::hint::black_box(state.close_epoch());
+        let boundary = t.elapsed();
+        let _ = state.duty_roster_at(state.epoch);
+        let t = Instant::now();
+        std::hint::black_box(state.duty_roster_at(state.epoch));
+        let roster = t.elapsed();
+        println!("{n:>9} | {root:>10.3?} | {boundary:>14.3?} | {roster:>10.3?}");
+    }
+}

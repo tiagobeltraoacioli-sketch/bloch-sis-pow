@@ -2646,6 +2646,70 @@ pub(crate) mod funded_delegation_rehearsal {
     }
 }
 
+/// Candidate ST-1 bound on funded-delegation state. `u64::MAX` means INERT.
+///
+/// Every funded position is a record in the committed delegation history, up
+/// to three leaves of the state root, and an entry of the warm-up fold
+/// (`delegation::Registry::resolve`) that every block reads. The history was
+/// append-only: a withdrawn position stayed in all three for ever, creating
+/// one costs 10 BLCH that the owner later recovers, and nothing limited how
+/// many could exist. The work of every block therefore grew with the number
+/// of positions ever created (security review ST-1). The resolver itself no
+/// longer walks every epoch (that part is not a consensus change and is not
+/// gated); this gate bounds what is left.
+///
+/// Once armed, it binds two rules together:
+///
+/// 1. **Position limits.** `FundedDelegate` refuses a new position when the
+///    committed history already holds
+///    [`crate::transition::funded_delegation::MAX_FUNDED_POSITIONS`] unpruned
+///    positions, or
+///    [`crate::transition::funded_delegation::MAX_FUNDED_POSITIONS_PER_VALIDATOR`]
+///    behind the same validator; and once half of either limit is in use it
+///    requires at least
+///    [`crate::transition::funded_delegation::CROWDED_FUNDED_POSITION_MIN_SAT`]
+///    of principal, so that minimum-size positions cannot occupy the slots
+///    that substantial stake needs.
+/// 2. **Pruning.** At each epoch boundary, fully withdrawn positions are
+///    overwritten with [`crate::delegation::Delegation::PRUNED`] and their
+///    owner and lifecycle entries are removed, provided the removal is
+///    invisible to every other position
+///    ([`crate::delegation::pruning_is_outcome_neutral`]). A pruned slot is
+///    in neither the fold nor the state root. Positions keep their indices.
+///
+/// Rule 1 changes which transactions are valid and rule 2 changes committed
+/// state, so arming needs a historical replay, mixed-fleet qualification and
+/// a coordinated epoch; there is no runtime override. Below the gate nothing
+/// is pruned, no committed record can equal the pruned constant, and every
+/// state root is what it was. It cannot precede funded delegation itself.
+/// `funded_delegation_bound_gate_is_inert` pins the inert value.
+pub const FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH,
+    FUNDED_DELEGATION_ACTIVATION_EPOCH
+));
+
+pub(crate) fn funded_delegation_bound_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if funded_delegation_bound_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod funded_delegation_bound_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Flag day for the native L2 settlement on a network that is already running
 /// (M8 part 2), activated on mainnet at the epoch recorded below.
 ///

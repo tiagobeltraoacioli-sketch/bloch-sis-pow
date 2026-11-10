@@ -17,6 +17,47 @@ pub const VALIDATOR_COMMISSION_UPDATE_TAG: u8 = 0x11;
 pub const MAX_FUNDED_DELEGATION_PER_VALIDATOR_SAT: u128 =
     500_000_000 * tokenomics_v4::SAT_PER_BLOCH;
 
+/// Most unpruned positions the committed delegation history may hold behind
+/// one validator. Enforced on creation, only behind
+/// [`crate::params::FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH`].
+///
+/// Every unpruned position is paid for by every block: it is hashed into the
+/// state root (one to three leaves) and walked by the delegation resolver. A
+/// count limit is what turns that from "everything ever created" into a
+/// constant. 64 per validator is far above today's use (the operational plan
+/// is one 10M BLCH position per expansion validator), and it lets 64
+/// validators fill up before the global limit binds. A withdrawn position
+/// frees its slot when it is pruned, normally at the next epoch boundary.
+pub const MAX_FUNDED_POSITIONS_PER_VALIDATOR: usize = 64;
+
+/// Most unpruned positions the committed delegation history may hold in
+/// total. The per-validator limit alone grows with the registry; this is the
+/// figure block cost is actually bounded by.
+///
+/// Sized from the state root, which is the expensive part: measured at about
+/// 36 to 45 microseconds per position per root computation (optimised build,
+/// `measure_state_root_with_many_funded_positions`: 36 ms at 1,000 positions,
+/// 0.45 s at 10,000, 5.4 s at 100,000). 4,096 keeps the worst case near
+/// 0.2 s per block on that machine, against a 30 s slot and validators that
+/// are not all fast. It is deliberately small: raising it is cheap once the
+/// delegation leaves are kept incrementally, lowering it after positions
+/// exist is not.
+pub const MAX_FUNDED_POSITIONS: usize = 4_096;
+
+/// Minimum principal of a new position once half of the per-validator limit
+/// or half of the global limit is in use.
+///
+/// A count limit makes slots scarce, and at the 10 BLCH minimum scarce slots
+/// would be cheap to occupy: 640 BLCH, recovered three weeks later, would
+/// close a validator to every other delegator. Reserving the second half of
+/// each limit for positions of at least 10,000 BLCH keeps the first half
+/// open to small delegators exactly as before, and prices closing a
+/// validator to substantial stake at 320,000 BLCH locked for the whole
+/// cool-down and withdrawal delay (about 20M BLCH for the whole network).
+/// It is far below the 500M BLCH principal ceiling, so it never binds
+/// before that ceiling does.
+pub const CROWDED_FUNDED_POSITION_MIN_SAT: u128 = 10_000 * tokenomics_v4::SAT_PER_BLOCH;
+
 const KEY_BYTES: usize = funded::ADMISSION_PQ_KEY_BYTES;
 const SIGNATURE_MAX: usize = funded::ADMISSION_PQ_SIGNATURE_MAX;
 const HYBRID_HEADER: [u8; 4] = [0xb1, 0x0c, 1, 0];
@@ -99,6 +140,9 @@ pub enum FundedDelegationReject {
     Commission,
     CommissionIncreaseWithDelegations,
     Arithmetic,
+    /// The position-count limits of
+    /// [`crate::params::FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH`].
+    PositionLimit,
 }
 
 fn put_bytes(out: &mut Vec<u8>, value: &[u8]) {
@@ -445,6 +489,11 @@ pub struct FundedDelegationView {
 impl CommittedState {
     pub fn funded_delegation_view(&self, position: u32) -> Option<FundedDelegationView> {
         let delegation = *self.delegations.get(position as usize)?;
+        // A pruned slot is not a position any more; its fields are the fixed
+        // tombstone and must not be read as an account.
+        if delegation.is_pruned() {
+            return None;
+        }
         let owner = *self.funded_delegation_owners.get(&delegation.delegator)?;
         let (inactive, withdrawn) = self.funded_delegation_lifecycle
             .get(&position).copied().unwrap_or((u64::MAX, false));
@@ -507,6 +556,29 @@ impl CommittedState {
             > MAX_FUNDED_DELEGATION_PER_VALIDATOR_SAT
         {
             return Err(R::DelegationLimit);
+        }
+        // Security review ST-1: bound the number of positions every block
+        // has to carry. Pending, active, cooling-down and withdrawn positions
+        // all count until they are pruned. Inert below the gate.
+        if crate::params::funded_delegation_bound_active(self.epoch) {
+            let (held, held_by_validator) = self
+                .delegations
+                .iter()
+                .filter(|delegation| !delegation.is_pruned())
+                .fold((0usize, 0usize), |(all, own), delegation| {
+                    (
+                        all.saturating_add(1),
+                        own.saturating_add(usize::from(delegation.validator == validator)),
+                    )
+                });
+            let crowded = held >= MAX_FUNDED_POSITIONS / 2
+                || held_by_validator >= MAX_FUNDED_POSITIONS_PER_VALIDATOR / 2;
+            if held >= MAX_FUNDED_POSITIONS
+                || held_by_validator >= MAX_FUNDED_POSITIONS_PER_VALIDATOR
+                || (crowded && tx.amount_sat < CROWDED_FUNDED_POSITION_MIN_SAT)
+            {
+                return Err(R::PositionLimit);
+            }
         }
         if base_fee > tx.max_base_fee_millisat_per_gas {
             return Err(R::FeeCap);
@@ -647,7 +719,7 @@ impl CommittedState {
         self.funded_owner_matches(tx.delegator_id, &tx.funding_pubkey)?;
         let position = usize::try_from(tx.position).map_err(|_| R::Position)?;
         let delegation = self.delegations.get(position).ok_or(R::Position)?;
-        if delegation.delegator != tx.delegator_id {
+        if delegation.delegator != tx.delegator_id || delegation.is_pruned() {
             return Err(R::Position);
         }
         if delegation.deactivate_epoch.is_some() {
@@ -696,7 +768,7 @@ impl CommittedState {
         self.funded_owner_matches(tx.delegator_id, &tx.funding_pubkey)?;
         let position = usize::try_from(tx.position).map_err(|_| R::Position)?;
         let delegation = *self.delegations.get(position).ok_or(R::Position)?;
-        if delegation.delegator != tx.delegator_id {
+        if delegation.delegator != tx.delegator_id || delegation.is_pruned() {
             return Err(R::Position);
         }
         let (inactive_since, withdrawn) = self
@@ -765,6 +837,69 @@ impl CommittedState {
         self.delegator_fee_rewards.remove(&tx.delegator_id);
         self.delegator_issuance_rewards.remove(&tx.delegator_id);
         Ok(charge)
+    }
+
+    /// Prune fully withdrawn positions at the boundary that opens `epoch`
+    /// ([`crate::params::FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH`]; the
+    /// caller checks the gate).
+    ///
+    /// A withdrawn position has paid out and cleared its three ledgers; all
+    /// that is left of it is a record that every block still hashes and
+    /// resolves. Pruning overwrites the record with
+    /// [`Delegation::PRUNED`] and removes its owner and lifecycle entries.
+    /// The slot stays, so later positions keep their indices, but it is in
+    /// neither the fold (the tombstone is ineligible) nor the state root
+    /// (`compute_tree` does not commit a pruned slot).
+    ///
+    /// Three conditions keep this from changing anything else:
+    ///
+    /// * The removal must be invisible to every other position, now and
+    ///   later. The resolver replays the history from epoch zero, so this is
+    ///   not automatic; [`delegation::pruning_is_outcome_neutral`] decides
+    ///   it exactly, for the whole set at once. If it says no (some backlog
+    ///   has been open ever since those positions drained), nothing is
+    ///   pruned and the next boundary asks again.
+    /// * The last record of the history is never pruned, so the root keeps
+    ///   committing the length of the history, which is where the next
+    ///   position index comes from.
+    /// * The record holding the largest delegator identifier is never
+    ///   pruned, so the next identifier is still larger than every one ever
+    ///   allocated.
+    ///
+    /// With those, the committed leaves determine the whole history: an
+    /// index below the committed length with no leaf is the tombstone, which
+    /// has no content of its own.
+    pub(super) fn prune_withdrawn_funded_delegations(&mut self, epoch: u64) {
+        let Some(last) = self.delegations.len().checked_sub(1) else { return };
+        let newest = self.delegations.iter().map(|d| d.delegator).max();
+        let positions: Vec<usize> = self
+            .funded_delegation_lifecycle
+            .iter()
+            .filter(|(_, (_, withdrawn))| *withdrawn)
+            .filter_map(|(position, _)| usize::try_from(*position).ok())
+            .filter(|position| {
+                *position < last
+                    && self.delegations.get(*position).is_some_and(|d| {
+                        !d.is_pruned()
+                            && Some(d.delegator) != newest
+                            && self.funded_delegation_owners.contains_key(&d.delegator)
+                    })
+            })
+            .collect();
+        if positions.is_empty()
+            || !delegation::pruning_is_outcome_neutral(&self.delegations, &positions, epoch)
+        {
+            return;
+        }
+        for position in positions {
+            let Some(slot) = self.delegations.get_mut(position) else { continue };
+            let delegator = slot.delegator;
+            *slot = Delegation::PRUNED;
+            self.funded_delegation_owners.remove(&delegator);
+            if let Ok(position) = u32::try_from(position) {
+                self.funded_delegation_lifecycle.remove(&position);
+            }
+        }
     }
 }
 
