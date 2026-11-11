@@ -1161,6 +1161,19 @@ impl Source {
         }
     }
 
+    /// Whether two sources draw on the same retention share (orphans,
+    /// future blocks). The share belongs to the peer, not to the road its
+    /// block took: a peer whose blocks arrive both by gossip and in answer
+    /// to this node's own sync request is still one peer, and comparing the
+    /// variants as well gave it every share twice.
+    fn same_retention_share(self, other: Source) -> bool {
+        match (self, other) {
+            (Source::Local, Source::Local) => true,
+            (Source::Local, _) | (_, Source::Local) => false,
+            _ => self.verification_source() == other.verification_source(),
+        }
+    }
+
     /// The per-slot allowance (lane, total, one source's share) a block from
     /// this source verifies its proposer signature under.
     fn block_verification_allowance(self) -> (verification::VerificationLane, usize, usize) {
@@ -1188,7 +1201,7 @@ fn future_retention_totals<'a>(
     incoming_source: Source,
 ) -> (usize, usize, usize) {
     retained.fold((0usize, 0usize, 0usize), |acc, (held_source, block_bytes)| {
-        let same_source = usize::from(*held_source == incoming_source);
+        let same_source = usize::from(held_source.same_retention_share(incoming_source));
         (
             acc.0.saturating_add(*block_bytes),
             acc.1.saturating_add(same_source),
@@ -4301,7 +4314,7 @@ impl Engine {
         if src.bounded_by_wall_clock()
             && self.orphans.iter()
                 .chain(self.deferred_orphans.iter())
-                .filter(|(_, _, held_source, _, _)| *held_source == src)
+                .filter(|(_, _, held_source, _, _)| held_source.same_retention_share(src))
                 .count()
                 >= ORPHANS_PER_SOURCE
         {
@@ -4315,7 +4328,7 @@ impl Engine {
         if src.bounded_by_wall_clock() {
             let source_bytes = self.orphans.iter()
                 .chain(self.deferred_orphans.iter())
-                .filter(|(_, _, held_source, _, _)| *held_source == src)
+                .filter(|(_, _, held_source, _, _)| held_source.same_retention_share(src))
                 .fold(0usize, |sum, (_, _, _, _, bytes)| sum.saturating_add(*bytes));
             if !retention_bytes_fit(source_bytes, retained_bytes, ORPHAN_BYTES_PER_SOURCE) {
                 self.orphans_evicted = self.orphans_evicted.saturating_add(1);
@@ -16412,6 +16425,42 @@ mod ingest_admission_tests {
         assert_eq!(engine.orphans_evicted, before + 1);
         assert_eq!(engine.orphans.len(), 1);
         assert_eq!(engine.orphans[0].0, waiting_id, "immutable deferred bytes make admission impossible, so waiting work is untouched");
+    }
+
+    /// V2-10: gossip and directed delivery are one peer's one share.
+    #[test]
+    fn a_peer_has_one_retention_share_whichever_way_its_blocks_arrive() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        let peer = [0xA1; 32];
+        let orphan = |parent: [u8; 32]| {
+            let mut env = template.clone();
+            env.header.proposer_index = 7;
+            env.header.parent = parent;
+            env.header.slot = 2;
+            env
+        };
+        for i in 0..ORPHANS_PER_SOURCE {
+            assert_eq!(engine.ingest_judged_from_source(orphan([i as u8 + 1; 32]), Some(peer)), Verdict::Ignore);
+        }
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE);
+        let evicted = engine.orphans_evicted;
+        assert_eq!(engine.ingest_from_judged(orphan([0xD1; 32]), Source::Directed(Some(peer))), Verdict::Ignore);
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE, "the directed road is not a second share");
+        assert_eq!(engine.orphans_evicted, evicted + 1);
+        assert_eq!(engine.ingest_from_judged(orphan([0xD2; 32]), Source::Directed(Some([0xB1; 32]))), Verdict::Ignore);
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE + 1, "another peer still has its own");
+
+        assert!(Source::Gossip(Some(peer)).same_retention_share(Source::Directed(Some(peer))));
+        assert!(Source::Gossip(None).same_retention_share(Source::Directed(None)));
+        assert!(!Source::Gossip(Some(peer)).same_retention_share(Source::Gossip(None)));
+        assert!(!Source::Local.same_retention_share(Source::Gossip(None)));
+        assert!(Source::Local.same_retention_share(Source::Local));
+        let bytes = 100usize;
+        let held = [(Source::Gossip(Some(peer)), bytes), (Source::Directed(Some(peer)), bytes), (Source::Gossip(None), bytes)];
+        assert_eq!(
+            future_retention_totals(held.iter().map(|(s, b)| (s, b)), Source::Directed(Some(peer))),
+            (300, 2, 200),
+        );
     }
 
     #[test]
