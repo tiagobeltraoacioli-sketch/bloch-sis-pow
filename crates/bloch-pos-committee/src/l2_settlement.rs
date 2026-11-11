@@ -869,6 +869,10 @@ pub mod withdrawal {
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
     pub struct PaidLeaves {
         /// `(leaf index, leaf hash, L2 number of the record)` in claim order.
+        /// An entry at index [`PaidLeaves::DROPPED_TAIL`] is not a leaf: it
+        /// says that a forfeit reset dropped the tail above its number, so
+        /// the earlier entries proven above that number belong to no
+        /// retained chain any more (review R308-2P-5).
         entries: Vec<(u64, [u8; 32], u64)>,
         /// Leaf index -> positions in `entries`. Derived, never serialized.
         #[cfg_attr(feature = "local-state-cache", serde(skip))]
@@ -877,10 +881,15 @@ pub mod withdrawal {
         root: [u8; 32],
     }
     impl PaidLeaves {
+        /// Not a leaf index (indices are below `2^TREE_DEPTH`): the entry
+        /// that marks a tail dropped by a forfeit reset.
+        pub const DROPPED_TAIL: u64 = u64::MAX;
         /// Whether exactly this leaf at `index` was paid.
         pub fn contains(&self, index: u64, leaf: &[u8; 32]) -> bool {
-            self.by_index.get(&index).is_some_and(|at| at.iter().any(|p| &self.entries[*p].1 == leaf))
+            index != Self::DROPPED_TAIL
+                && self.by_index.get(&index).is_some_and(|at| at.iter().any(|p| &self.entries[*p].1 == leaf))
         }
+        /// Entries recorded, dropped-tail marks included.
         pub fn len(&self) -> u64 {
             self.entries.len() as u64
         }
@@ -904,11 +913,28 @@ pub mod withdrawal {
             self.by_index.entry(index).or_default().push(self.entries.len());
             self.entries.push((index, leaf, l2_number));
         }
-        /// Indices with a leaf paid against a record above L2 block `number`,
-        /// ascending.
+        /// A forfeit reset dropped the tail above L2 block `number`: the
+        /// entries proven above it stay paid leaves and stop counting as
+        /// proven against a tail ([`Self::proven_above`]), because the
+        /// rebuilt chain uses those L2 numbers again.
+        pub(crate) fn record_dropped_tail(&mut self, number: u64) {
+            self.record(Self::DROPPED_TAIL, [0; 32], number);
+        }
+        /// Indices with a leaf paid against a record above L2 block `number`
+        /// that a forfeit reset has not dropped since, ascending.
         pub fn proven_above(&self, number: u64) -> Vec<u64> {
-            let indices: std::collections::BTreeSet<u64> =
-                self.entries.iter().filter(|(_, _, n)| *n > number).map(|(index, _, _)| *index).collect();
+            // Newest first: `kept` is the lowest number any later forfeit
+            // reset kept, so an entry above it was proven against a tail that
+            // is gone.
+            let mut kept = u64::MAX;
+            let mut indices = std::collections::BTreeSet::new();
+            for (index, _, n) in self.entries.iter().rev() {
+                if *index == Self::DROPPED_TAIL {
+                    kept = kept.min(*n);
+                } else if *n > number && *n <= kept {
+                    indices.insert(*index);
+                }
+            }
             indices.into_iter().collect()
         }
         pub(crate) fn encode(&self, out: &mut Vec<u8>) {
@@ -1823,6 +1849,10 @@ pub mod mainnet {
         /// refused, another leaf there is paid. For claims older than the swap
         /// (not recorded) the index alone decides, so that form is only for a
         /// tail whose paid leaves are not re-published by the rebuild.
+        /// A forfeit reset that dropped recorded claims marks the paid-leaf
+        /// log ([`super::withdrawal::PaidLeaves::DROPPED_TAIL`]): those claims
+        /// stay paid leaves and are not counted against a later reset, whose
+        /// tail uses the same L2 numbers again.
         /// A forfeit reset also applies when the tail consumed more forced
         /// records than [`super::forced::CONSUMED_LOG`] holds: the records the
         /// log still has are queued again and the older ones of the tail are
@@ -2617,6 +2647,13 @@ impl State {
             // by any leaf but the ones already paid ([`Self::check_claim`]).
             for index in &plan.tail_paid {
                 self.claimed.forget(*index);
+            }
+            // The dropped tail's entries stay paid leaves, and stop counting
+            // as proven against a tail: the rebuilt chain uses their L2
+            // numbers again, and a later plain reset must not refuse on them
+            // (review R308-2P-5).
+            if !plan.tail_paid.is_empty() {
+                self.paid.record_dropped_tail(reset.number);
             }
         }
         true

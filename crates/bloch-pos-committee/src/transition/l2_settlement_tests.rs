@@ -3708,7 +3708,14 @@ mod l2_tests {
         assert_eq!(l2.claimed().claims(), 0);
         assert!(bitmap_consistent(l2.claimed()) && l2.escrow_conserved());
         assert_eq!(l2.released_sat(), released, "what the tail released stays released");
-        assert_eq!(l2.paid_leaves(), before.paid_leaves(), "the record of what was paid stays");
+        // The record of what was paid stays, with the mark of the dropped tail after it.
+        assert_eq!(l2.paid_leaves().len(), before.paid_leaves().len() + 1);
+        assert_ne!(l2.paid_leaves().root(), before.paid_leaves().root());
+        for i in 0..2 {
+            let (r, sats) = forged[i as usize];
+            assert!(l2.paid_leaves().contains(i, &wd::leaf(chain, i, &r, sats)));
+        }
+        assert!(l2.paid_leaves().proven_above(1).is_empty(), "the dropped tail's claims are no tail claims any more");
 
         // Leaf 0 was paid: the same leaf is refused on the kept root.
         assert_eq!(pay(&mut l2, chain, &honest, 0), Err(wd::ClaimRefusal::Claimed));
@@ -3921,6 +3928,60 @@ mod l2_tests {
         assert!(l2.clone().reset_head(&plain));
     }
 
+    /// R308-2P-5: after a forfeit reset the dropped tail's paid leaves keep
+    /// their L2 numbers, which the rebuilt chain uses again. They must not
+    /// refuse a later plain reset (before the fix they did, for ever), they
+    /// stay paid, and a claim against the REBUILT tail still refuses it.
+    #[test]
+    fn r308_2p_5_a_dropped_tails_claims_do_not_refuse_a_later_plain_reset() {
+        use crate::l2_settlement::HeadResetRefusal as R;
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let forged = [honest[0], ([0xee; 32], 9 * BLCH), ([3; 32], 5 * BLCH)];
+        let (mut l2, chain) = next_program_with_tail(&honest, &forged);
+        pay(&mut l2, chain, &forged, 1).expect("the forged leaf 1, against the tail");
+        let plain = reset_to_block_1(&l2, chain, &honest, false);
+        let forfeit = mainnet::HeadReset { forfeit: true, ..plain };
+        assert_eq!(l2.paid_leaves().proven_above(1), [1]);
+        let unmarked = l2.committed_bytes();
+        assert!(l2.reset_head(&forfeit));
+        assert_ne!(l2.committed_bytes(), unmarked);
+        assert_eq!(l2.paid_leaves().len(), 2, "the paid leaf and the mark of the dropped tail");
+        assert!(l2.paid_leaves().proven_above(1).is_empty() && l2.paid_leaves().proven_above(0).is_empty());
+        assert!(l2.paid_leaves().contains(1, &wd::leaf(chain, 1, &forged[1].0, forged[1].1)), "it stays a paid leaf");
+        assert!(!l2.paid_leaves().contains(wd::PaidLeaves::DROPPED_TAIL, &[0; 32]), "the mark is not a leaf");
+
+        // The rebuilt chain settles block 2 again, with another tree.
+        let rebuilt = [honest[0], honest[1], ([4; 32], BLCH)];
+        let root = wd::root(&leaves_of(chain, &rebuilt));
+        let at = l2.height() + 1;
+        l2.insert_withdrawal_record(wd::Record { l2_number: 2, root, count: 3, height: at });
+        let head = statement_at(&l2, 2, root, 3);
+        l2.set_head_for_test([2; 32], head, 1);
+        for _ in 0..mainnet::LIMITS.delay_blocks + 1 {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(l2.settled_number(), 2);
+        // A later plain reset to block 1: the stale entry does not refuse it.
+        assert_eq!(l2.head_reset_refusal(&plain), None);
+        let mut again = l2.clone();
+        assert!(again.reset_head(&plain));
+        assert_eq!(again.paid_leaves(), l2.paid_leaves(), "a plain reset marks nothing");
+        // A claim against the rebuilt tail is a tail claim like any other.
+        pay(&mut l2, chain, &rebuilt, 2).expect("a new leaf of the rebuilt chain");
+        assert_eq!(l2.paid_leaves().proven_above(1), [2]);
+        assert_eq!(l2.head_reset_refusal(&plain), Some(R::PaidBeyondTarget { at_or_above_count: true, against_tail: vec![2] }));
+        // A second forfeit reset marks again, and only what it dropped.
+        assert!(l2.reset_head(&forfeit));
+        assert_eq!(l2.paid_leaves().len(), 4);
+        assert!(l2.paid_leaves().proven_above(0).is_empty());
+        // A forfeit reset with no claim proven against its tail marks nothing.
+        let (mut quiet, _) = next_program_with_tail(&honest, &forged);
+        pay(&mut quiet, chain, &honest, 0).expect("against the target's own root");
+        let paid = quiet.paid_leaves().clone();
+        assert!(quiet.reset_head(&forfeit));
+        assert_eq!(*quiet.paid_leaves(), paid);
+    }
+
     /// Review R308-2P-1 (agent 308, second pass). The state root commits the
     /// paid leaves as a length and a running root only, and the cache check
     /// (`PaidLeaves::consistent`) compares counts: the entries themselves are
@@ -3957,9 +4018,9 @@ mod l2_tests {
     }
 
     /// R308-2P-1, the rest of the rule: the entries restore only as they
-    /// were recorded. Another L2 number, another index, two entries in the
-    /// other order and a missing entry each refuse; the untouched cache
-    /// restores to an equal state.
+    /// were recorded. Another L2 number, two entries in the other order, a
+    /// missing entry and the mark of a dropped tail altered each refuse; the
+    /// untouched cache restores to an equal state, mark included.
     #[test]
     #[cfg(all(feature = "local-state-cache", feature = "devnet-l2-user-txs"))]
     fn r308_2p_1_paid_leaf_entries_restore_only_in_order_and_unaltered() {
@@ -3999,6 +4060,20 @@ mod l2_tests {
         missing[a - 2] = 1;
         refuses(&missing, "an entry missing");
 
+        // With the mark of a dropped tail: restores equal, and the mark is bound too.
+        let l2 = state.l2_settlement.as_mut().unwrap();
+        let reset = reset_to_block_1(l2, chain, &honest, true);
+        assert!(l2.reset_head(&reset));
+        assert_eq!(l2.paid_leaves().len(), 3);
+        let (restored, bytes, header) = local_cache_round_trip(&state);
+        assert!(restored.l2_settlement().unwrap().paid_leaves().proven_above(1).is_empty());
+        let section = bytes.windows(marker.len()).position(|w| w == marker).unwrap();
+        let at = section + bytes[section..].windows(32).position(|w| w == second).unwrap() + 33;
+        // The mark: the index `u64::MAX` (nine bytes), a zero leaf, the kept number 1.
+        assert_eq!((&bytes[at..at + 9], &bytes[at + 9..at + 41], bytes[at + 41]), (&[0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff][..], &[0u8; 32][..], 1));
+        let mut unmarked = bytes.clone();
+        unmarked[at + 41] = 0;
+        assert!(CommittedState::decode_local_cache(&unmarked, &header).is_err(), "restored with the mark moved");
     }
 
     #[test]
