@@ -106,11 +106,51 @@ struct World {
     bind_in_checkpoint: bool,
     /// The finality leaf commits no frozen set yet.
     no_set_in_leaf: bool,
+    /// Epochs between the set-source block's epoch and E (2: the block that
+    /// closes E-2, which is the checkpoint of E-1).
+    src_gap: u64,
+    /// Serve the checkpoint's own bind proof when the set source has none.
+    second_proof: bool,
 }
 
 struct Built {
     proof: MainnetProof,
     src_id: [u8; 32],
+}
+
+/// The committed state of world `w`: registry, finality leaf, KES entries
+/// and, when this state commits it, the bind epoch.
+fn state_smt(w: &World) -> Smt {
+    let mut smt = Smt::new();
+    for v in 0..w.bond.len() as u32 {
+        let r = record(v, w.bond[v as usize]);
+        smt.insert(validator_leaf_key(r.index), leaf_value_hash(&r.canonical_bytes()));
+    }
+    smt.insert(finality_leaf_key(), leaf_value_hash(&finality_record(w).committed_bytes()));
+    for v in &w.kes {
+        smt.insert(kes_leaf_key(*v), leaf_value_hash(&KesEntry::from(kes_public(*v).0).committed_bytes()));
+    }
+    if let Some(b) = w.enforced.filter(|_| !w.bind_in_checkpoint) {
+        smt.insert(kes_enforced_leaf_key(), leaf_value_hash(&b.to_le_bytes()));
+    }
+    smt
+}
+
+/// The world one epoch later, whose state the checkpoint block of `w`
+/// commits: the same registry and keys, and the bind if there is one.
+fn next_world(w: &World) -> World {
+    World {
+        bond: w.bond.clone(),
+        frozen: w.frozen.clone(),
+        pending: w.pending.clone(),
+        kes: w.kes.clone(),
+        enforced: w.enforced,
+        epoch: w.epoch + 1,
+        bind_in_checkpoint: false,
+        no_set_in_leaf: w.no_set_in_leaf,
+        src_gap: 2,
+        second_proof: w.second_proof,
+    }
 }
 
 fn compress(p: &bloch_pos_committee::state_root::InclusionProof) -> CompressedProof {
@@ -186,28 +226,25 @@ fn sign_vote(v: u32, data: &AttestationData, how: Sig, w: &World) -> Vec<u8> {
 }
 
 fn build(w: &World, voters: &[(u32, Sig)], with_set: bool, with_kes: bool) -> Built {
-    let mut smt = Smt::new();
+    build_on(w, voters, with_set, with_kes, None)
+}
+
+/// [`build`] on a given set-source header (the checkpoint header of the
+/// previous step of a chain), which must commit `state_smt(w)`.
+fn build_on(w: &World, voters: &[(u32, Sig)], with_set: bool, with_kes: bool, on: Option<BlockHeaderV4>) -> Built {
+    let smt = state_smt(w);
     let n = w.bond.len() as u32;
     let records: Vec<ValidatorRecord> = (0..n).map(|v| record(v, w.bond[v as usize])).collect();
-    for r in &records {
-        smt.insert(validator_leaf_key(r.index), leaf_value_hash(&r.canonical_bytes()));
-    }
     let fin = finality_record(w).committed_bytes();
-    smt.insert(finality_leaf_key(), leaf_value_hash(&fin));
     let entries: BTreeMap<u32, KesEntry> = w.kes.iter().map(|v| (*v, KesEntry::from(kes_public(*v).0))).collect();
-    for (v, e) in &entries {
-        smt.insert(kes_leaf_key(*v), leaf_value_hash(&e.committed_bytes()));
-    }
-    if let Some(b) = w.enforced.filter(|_| !w.bind_in_checkpoint) {
-        smt.insert(kes_enforced_leaf_key(), leaf_value_hash(&b.to_le_bytes()));
-    }
-    // The checkpoint's own state, when it is the one committing the bind.
-    let mut cp_smt = Smt::new();
-    cp_smt.insert(kes_enforced_leaf_key(), leaf_value_hash(&w.enforced.unwrap_or(0).to_le_bytes()));
+    // The checkpoint's own state: the next epoch's, which commits the bind
+    // from the checkpoint on when the set source did not.
+    let cp_smt = state_smt(&next_world(w));
     let e = w.epoch;
-    let src = header((e - 1) * SLOTS_PER_EPOCH - 1, [9; 32], smt.root());
+    let src = on.unwrap_or_else(|| header((e - w.src_gap + 1) * SLOTS_PER_EPOCH - 1, [9; 32], smt.root()));
+    assert_eq!(src.state_root, smt.root(), "the set source commits this world's state");
     let src_id = *BlockId::of(&src).as_bytes();
-    let cp = header(e * SLOTS_PER_EPOCH - 1, src_id, if w.bind_in_checkpoint { cp_smt.root() } else { [0xAB; 32] });
+    let cp = header(e * SLOTS_PER_EPOCH - 1, src_id, cp_smt.root());
     let cp_id = *BlockId::of(&cp).as_bytes();
     let link = |source: (u64, [u8; 32]), target: (u64, [u8; 32])| {
         let votes = voters
@@ -238,15 +275,27 @@ fn build(w: &World, voters: &[(u32, Sig)], with_set: bool, with_kes: bool) -> Bu
     };
     let finality_set = with_set
         .then(|| FinalitySetProof { leaf: fin.clone(), proof: compress(&smt.prove(&finality_leaf_key()).unwrap()) });
+    // What the set source commits about the bind, and what the checkpoint does.
+    let at_source = w.enforced.filter(|_| !w.bind_in_checkpoint);
     let kes = with_kes.then(|| KesProofs {
         enforced: (
-            w.enforced,
-            compress(&match w.enforced {
-                Some(_) if w.bind_in_checkpoint => cp_smt.prove(&kes_enforced_leaf_key()).unwrap(),
+            at_source,
+            compress(&match at_source {
                 Some(_) => smt.prove(&kes_enforced_leaf_key()).unwrap(),
                 None => smt.prove_absence(&kes_enforced_leaf_key()).unwrap(),
             }),
         ),
+        // As the node does: only from the KES gate on, so that earlier
+        // proofs keep the `BLCLMP01` encoding.
+        enforced_at_checkpoint: (at_source.is_none() && w.second_proof && params::kes_period(e + 1).is_some()).then(|| {
+            (
+                w.enforced,
+                compress(&match w.enforced {
+                    Some(_) => cp_smt.prove(&kes_enforced_leaf_key()).unwrap(),
+                    None => cp_smt.prove_absence(&kes_enforced_leaf_key()).unwrap(),
+                }),
+            )
+        }),
         entries: voters
             .iter()
             .map(|(v, _)| match entries.get(v) {
@@ -280,6 +329,8 @@ fn kes_world(epoch: u64) -> World {
         epoch,
         bind_in_checkpoint: false,
         no_set_in_leaf: false,
+        src_gap: 2,
+        second_proof: true,
     }
 }
 
@@ -640,13 +691,245 @@ fn the_last_checkpoint_before_the_bind_verifies_from_its_own_state_root() {
     let mut w = kes_world(8700);
     w.enforced = Some(8701);
     w.bind_in_checkpoint = true;
-    let v = run(&build(&w, &ALL, true, true)).expect("crosses the bind");
+    // The set source (epoch 8698) commits no bind and no later registration:
+    // its "no KES entry" for validator 3 is not evidence for epoch 8701, so
+    // that static vote is refused on the finalizing link...
+    assert_eq!(run(&build(&w, &ALL, true, true)).unwrap_err(), Refusal::Kes("voter absence too old"));
+    // ...and the three registered validators (90% of the weight) carry it.
+    let registered = [(0, Sig::Proper), (1, Sig::Proper), (2, Sig::Proper)];
+    // The builder drops it from the finalizing link only: the justifying
+    // link is not bound yet, and there the static vote is the right one.
+    let mut dropped = build(&w, &ALL, true, true);
+    let kes = dropped.proof.kes.clone().unwrap();
+    ffg::retain_fresh_static_votes(&mut dropped.proof.cert, &kes);
+    assert_eq!(dropped.proof.cert.links.iter().map(|l| l.votes.len()).collect::<Vec<_>>(), [4, 3]);
+    assert_eq!(run(&dropped).expect("crosses the bind").kes_votes, 3);
+    let b = build(&w, &registered, true, true);
+    assert_eq!(&b.proof.encode()[..8], b"BLCLMP02");
+    let v = run(&b).expect("crosses the bind");
     assert_eq!(v.kes_votes, 3, "validators 0..2 sign only the finalizing link with KES leaves");
     // The justifying link still decides the checkpoint: below 2/3 it is refused.
-    let few = [(3, Sig::Proper)];
+    let few = [(2, Sig::Proper)];
     assert!(matches!(run(&build(&w, &few, true, true)).unwrap_err(), Refusal::InsufficientWeight { link: 0, .. }));
-    // A bind at or before E must come from the set source.
+    // Without the checkpoint's proof the finalizing link has nothing to be
+    // judged under: the set source's absence does not reach its target.
+    w.second_proof = false;
+    assert_eq!(
+        run(&build(&w, &registered, true, true)).unwrap_err(),
+        Refusal::Kes("bind absence too old for this target")
+    );
+    // The checkpoint's state may not stand in for the set source's: a bind
+    // offered in the first slot must be committed by the set source.
+    w.second_proof = true;
+    let mut legacy = build(&w, &registered, true, true);
+    let k = legacy.proof.kes.as_mut().unwrap();
+    k.enforced = k.enforced_at_checkpoint.take().unwrap();
+    assert_eq!(run(&legacy).unwrap_err(), Refusal::Kes("bind epoch not proven"));
+    // Nor may it sit beside a bind the set source does commit.
+    let mut both = build(&kes_world(8700), &ALL, true, true);
+    let spare = build(&w, &registered, true, true).proof.kes.unwrap().enforced_at_checkpoint;
+    both.proof.kes.as_mut().unwrap().enforced_at_checkpoint = spare;
+    assert_eq!(
+        run(&both).unwrap_err(),
+        Refusal::Kes("checkpoint bind proof beside a bind at the set source")
+    );
+}
+
+// ── Security review round 2, CRY-2 / FC-5: KES freshness ────────────────────
+
+/// The attack the rule exists for: the chain bound KES at B, and a holder of
+/// old static keys shows a set source from before the bind decision, whose
+/// "no bind" is true, to have a target past B judged under static keys.
+#[test]
+fn an_old_bind_absence_does_not_reach_a_target_past_the_delay() {
+    let bind = params::HF3_KES_ENFORCE_EPOCH;
+    // Target B+5, set source at B-10: every vote is static, as a forger's
+    // would be, and every proof in it is genuine.
+    let mut forged = kes_world(bind + 5);
+    forged.enforced = None;
+    forged.src_gap = 15;
+    for second_proof in [true, false] {
+        forged.second_proof = second_proof;
+        assert_eq!(
+            run(&build(&forged, &ALL, true, true)).unwrap_err(),
+            Refusal::Kes("bind absence too old for this target")
+        );
+    }
+    // The distance itself is not the problem: before the KES gate the same
+    // hop verifies, as it always did.
+    let mut early = kes_world(params::KES_ACTIVATION_EPOCH - 20);
+    early.enforced = None;
+    early.src_gap = 15;
+    let v = run(&build(&early, &ALL, true, true)).expect("static epochs keep the long hop");
+    assert_eq!(v.kes_votes, 0);
+    // The same target from a set source that commits the bind verifies,
+    // under KES, near or far.
+    for src_gap in [2, 3] {
+        let mut w = kes_world(bind + 5);
+        w.src_gap = src_gap;
+        let v = run(&build(&w, &ALL, true, true)).expect("bind committed by the set source");
+        assert_eq!(v.kes_votes, 6);
+    }
+    // One epoch further than the delay covers is already refused.
+    let mut edge = kes_world(bind + 5);
+    edge.enforced = None;
+    edge.src_gap = 3;
+    assert_eq!(
+        run(&build(&edge, &ALL, true, true)).unwrap_err(),
+        Refusal::Kes("bind absence too old for this target")
+    );
+}
+
+/// While the chain has not bound, a step is still possible: the justifying
+/// link is within the delay of the set source, and the finalizing link takes
+/// the (absent) bind from the checkpoint's own state.
+#[test]
+fn before_the_bind_a_step_needs_the_checkpoints_own_absence_proof() {
     let mut w = kes_world(8700);
-    w.bind_in_checkpoint = true;
-    assert_eq!(run(&build(&w, &ALL, true, true)).unwrap_err(), Refusal::Kes("bind epoch not proven"));
+    w.enforced = None;
+    let b = build(&w, &ALL, true, true);
+    assert!(b.proof.kes.as_ref().unwrap().enforced_at_checkpoint.is_some());
+    assert_eq!(run(&b).expect("verifies").kes_votes, 0);
+    w.second_proof = false;
+    assert_eq!(
+        run(&build(&w, &ALL, true, true)).unwrap_err(),
+        Refusal::Kes("bind absence too old for this target")
+    );
+    // A second proof that the checkpoint's state does not commit is refused.
+    w.second_proof = true;
+    let mut wrong = build(&w, &ALL, true, true);
+    wrong.proof.kes.as_mut().unwrap().enforced_at_checkpoint.as_mut().unwrap().0 = Some(8_750);
+    assert_eq!(run(&wrong).unwrap_err(), Refusal::Kes("checkpoint bind epoch not proven"));
+}
+
+/// A voter with no KES entry at the set source may have registered since.
+/// Its static vote counts only while the set source is itself bound and in
+/// the target's KES period.
+#[test]
+fn a_voters_absence_at_the_set_source_must_be_fresh() {
+    let period = params::KES_PERIOD_EPOCHS;
+    let start = params::KES_ACTIVATION_EPOCH;
+    let registered = [(0, Sig::Proper), (1, Sig::Proper), (2, Sig::Proper)];
+    // Bound set source, same period: validator 3 (never registered) signs
+    // with its static key, as on chain.
+    assert_eq!(run(&build(&kes_world(start + 40), &ALL, true, true)).expect("fresh absence").kes_votes, 6);
+
+    // The bind is committed by the set source but starts after it: a
+    // validator absent there may have registered before the bind and would
+    // sign with KES from the bind on.
+    let mut w = kes_world(start + 40);
+    w.enforced = Some(start + 39);
+    assert_eq!(run(&build(&w, &ALL, true, true)).unwrap_err(), Refusal::Kes("voter absence too old"));
+    // The same certificate without that vote verifies: the quorum holds.
+    assert_eq!(run(&build(&w, &registered, true, true)).expect("without the stale vote").kes_votes, 6);
+    // The builder drops exactly that vote, on both links, and nothing when
+    // the absence is fresh.
+    let mut stale = build(&w, &ALL, true, true);
+    let kes = stale.proof.kes.clone().unwrap();
+    ffg::retain_fresh_static_votes(&mut stale.proof.cert, &kes);
+    for link in &stale.proof.cert.links {
+        assert_eq!(link.votes.iter().map(|v| v.validator).collect::<Vec<_>>(), [0, 1, 2]);
+    }
+    assert_eq!(run(&stale).expect("after the builder dropped it").kes_votes, 6);
+    let mut fresh = build(&kes_world(start + 40), &ALL, true, true);
+    let kes = fresh.proof.kes.clone().unwrap();
+    ffg::retain_fresh_static_votes(&mut fresh.proof.cert, &kes);
+    assert!(fresh.proof.cert.links.iter().all(|l| l.votes.len() == 4));
+
+    // Another KES period than the set source's: a registration made after
+    // the set source is in force by then. (Nobody is registered here, so
+    // every vote is static and the fixture needs no second-period leaf.)
+    let mut unregistered = kes_world(start + period);
+    unregistered.kes = vec![];
+    assert_eq!(
+        run(&build(&unregistered, &ALL, true, true)).unwrap_err(),
+        Refusal::Kes("voter absence too old")
+    );
+    unregistered.epoch = start + period - 2;
+    assert_eq!(run(&build(&unregistered, &ALL, true, true)).expect("same period").kes_votes, 0);
+}
+
+/// Three steps, each standing on the one before; afterwards only the newest
+/// checkpoint is trusted, so an older root cannot be a set source again and
+/// a client cannot be stepped backwards.
+#[test]
+fn a_chain_keeps_only_its_newest_checkpoint_as_a_set_source() {
+    let cfg = Config::mainnet();
+    let first = build(&kes_world(8700), &ALL, true, true);
+    let second = build_on(&kes_world(8701), &ALL, true, true, Some(first.proof.cert.checkpoint_header));
+    let third = build_on(&kes_world(8702), &ALL, true, true, Some(second.proof.cert.checkpoint_header));
+    let fourth = build_on(&kes_world(8703), &ALL, true, true, Some(third.proof.cert.checkpoint_header));
+    let root = |b: &Built| b.proof.cert.links[0].target_root;
+
+    let mut trusted: BTreeSet<[u8; 32]> = [first.src_id].into_iter().collect();
+    let steps = [first.proof.clone(), second.proof.clone(), third.proof.clone()];
+    let verified = ffg::verify_chain(&steps, &mut trusted, &cfg, &HybridConsensusVerifier).expect("three steps");
+    assert_eq!(verified.iter().map(|v| v.epoch).collect::<Vec<_>>(), [8700, 8701, 8702]);
+    assert_eq!(trusted, [root(&third)].into_iter().collect());
+
+    // A fourth proof whose set source is the first root: no longer trusted.
+    let stale = [second.proof.clone()];
+    assert_eq!(
+        ffg::verify_chain(&stale, &mut trusted, &cfg, &HybridConsensusVerifier).unwrap_err(),
+        (0, Refusal::UntrustedSetSource)
+    );
+    assert_eq!(trusted, [root(&third)].into_iter().collect(), "a refusal leaves the trusted set alone");
+    // The genuine next step still verifies.
+    let next = ffg::verify_next(&fourth.proof, &mut trusted, Some(8702), &cfg, &HybridConsensusVerifier).unwrap();
+    assert_eq!((next.epoch, trusted.len()), (8703, 1));
+
+    // A caller that manages its own set gets the same rule from the same
+    // function: a target at or before the checkpoint it stands on is refused
+    // even if an old root is still in the set.
+    let mut wide: BTreeSet<[u8; 32]> = [first.src_id, root(&first), root(&second)].into_iter().collect();
+    let before = wide.clone();
+    assert_eq!(
+        ffg::verify_next(&second.proof, &mut wide, Some(8701), &cfg, &HybridConsensusVerifier).unwrap_err(),
+        Refusal::Shape("target not after the trusted checkpoint")
+    );
+    assert_eq!(wide, before);
+    ffg::verify_next(&third.proof, &mut wide, Some(8701), &cfg, &HybridConsensusVerifier).unwrap();
+    assert_eq!(wide, [root(&third)].into_iter().collect());
+}
+
+/// The wire format: a proof without the second bind proof is `BLCLMP01`,
+/// byte for byte as before; with it, `BLCLMP02`; and neither magic decodes
+/// the other's body.
+#[test]
+fn the_second_bind_proof_has_its_own_wire_version() {
+    // Before the KES gate: no second proof, the released encoding.
+    let mut early = kes_world(params::SIG_CANONICAL_ACTIVATION_EPOCH + 10);
+    early.enforced = None;
+    let b = build(&early, &ALL, true, true);
+    let bytes = b.proof.encode();
+    assert_eq!(&bytes[..8], b"BLCLMP01");
+    let back = MainnetProof::decode(&bytes).expect("decodes");
+    assert!(back.kes.as_ref().unwrap().enforced_at_checkpoint.is_none());
+    assert_eq!(back.encode(), bytes);
+    assert!(run(&Built { proof: back, src_id: b.src_id }).is_ok());
+
+    // With the second proof.
+    let mut w = kes_world(8700);
+    w.enforced = None;
+    let b = build(&w, &ALL, true, true);
+    let bytes = b.proof.encode();
+    assert_eq!(&bytes[..8], b"BLCLMP02");
+    let back = MainnetProof::decode(&bytes).expect("decodes");
+    assert_eq!(back.kes, b.proof.kes);
+    assert_eq!(back.encode(), bytes);
+    assert!(run(&Built { proof: back, src_id: b.src_id }).is_ok());
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(MainnetProof::decode(&trailing).is_none());
+    assert!(MainnetProof::decode(&bytes[..bytes.len() - 1]).is_none());
+
+    // One proof, one encoding.
+    let mut relabelled = bytes.clone();
+    relabelled[..8].copy_from_slice(b"BLCLMP01");
+    assert!(MainnetProof::decode(&relabelled).is_none(), "01 never carries the second proof");
+    w.second_proof = false;
+    let mut plain = build(&w, &ALL, true, true).proof.encode();
+    assert_eq!(&plain[..8], b"BLCLMP01");
+    plain[..8].copy_from_slice(b"BLCLMP02");
+    assert!(MainnetProof::decode(&plain).is_none(), "02 always carries it");
 }
