@@ -42,10 +42,7 @@ fn json_field(text: &str, name: &str) -> Option<Result<String, String>> {
 
 fn load(path: &str) -> Result<Vec<u8>, String> {
     let raw = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    if raw.starts_with(bloch_finality_cert::MAGIC)
-        || raw.starts_with(lc_proof::PROOF_MAGIC)
-        || raw.starts_with(lc_proof::PROOF_MAGIC_V2)
-    {
+    if raw.starts_with(bloch_finality_cert::MAGIC) || raw.starts_with(lc_proof::PROOF_MAGIC) {
         return Ok(raw);
     }
     let text = String::from_utf8(raw).map_err(|_| format!("{path}: neither binary nor text"))?;
@@ -57,8 +54,8 @@ fn load(path: &str) -> Result<Vec<u8>, String> {
 }
 
 fn decode(bytes: &[u8]) -> Result<MainnetProof, String> {
-    if bytes.starts_with(lc_proof::PROOF_MAGIC) || bytes.starts_with(lc_proof::PROOF_MAGIC_V2) {
-        return MainnetProof::decode(bytes).ok_or_else(|| "decode: malformed BLCLMP01/02".to_string());
+    if bytes.starts_with(lc_proof::PROOF_MAGIC) {
+        return MainnetProof::decode(bytes).ok_or_else(|| "decode: malformed BLCLMP01".to_string());
     }
     let cert = Certificate::decode(bytes).map_err(|e| format!("decode: {e}"))?;
     Ok(MainnetProof { cert, finality_set: None, kes: None })
@@ -108,7 +105,6 @@ fn main() -> ExitCode {
         eprintln!("need at least one --anchor and one certificate file (see --help)");
         return ExitCode::from(2);
     }
-    let mut newest: Option<u64> = None;
     for f in &files {
         let proof = match load(f).and_then(|b| decode(&b)) {
             Ok(p) => p,
@@ -117,11 +113,9 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        // One implementation of the stepping rule: the verified checkpoint
-        // replaces the trusted set, and the next one must be newer.
-        match lc_proof::verify_next(&proof, &mut trusted, newest, &cfg, &HybridConsensusVerifier) {
+        match lc_proof::verify(&proof, &trusted, &cfg, &HybridConsensusVerifier) {
             Ok(v) => {
-                newest = Some(v.epoch);
+                trusted.insert(v.root);
                 println!(
                     "{{\"file\":\"{f}\",\"ok\":true,\"epoch\":{},\"root\":\"{}\",\"checkpoint_slot\":{},\
                      \"state_root\":\"{}\",\"set_source\":\"{}\",\"votes\":[{},{}],\
