@@ -27,6 +27,9 @@
 //!   garbage-collected or trimmed; the overwrite cannot reach them;
 //! - a crash between the rename and the overwrite's fsync leaves the old
 //!   blocks released but not overwritten;
+//! - a key file the operator made read-only (0400) is still replaced, but
+//!   its old contents cannot be overwritten by this process (review V1-5;
+//!   the node says so); keep the mode the node wrote, 0600;
 //! - a backup of an earlier state is an earlier seed: operators must not
 //!   keep older copies of this file, and keep KES data dirs out of snapshots.
 //!
@@ -343,10 +346,24 @@ impl KesKey {
         // released with an earlier seed still in them.
         // Unix only: elsewhere an open handle can make the rename itself
         // fail, and the atomic replace matters more than the overwrite.
+        //
+        // The node writes this file 0600. An operator who made it read-only
+        // (0400) must not thereby stop the key from evolving (review V1-5):
+        // the rename needs only the directory, and staying on an old period
+        // is worse than one inode this process cannot overwrite. That case
+        // is reported and the rename goes ahead.
         #[cfg(unix)]
         let replaced = match fs::OpenOptions::new().write(true).open(&path) {
             Ok(f) => Some(f),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "KES WARNING: {} is not writable by this node ({e}); it is replaced, but its old \
+                     contents (an earlier seed) could NOT be overwritten in place. Keep the file mode 0600.",
+                    path.display()
+                );
+                None
+            }
             Err(e) => return Err(e),
         };
         #[cfg(not(unix))]
@@ -706,6 +723,31 @@ mod tests {
             assert_eq!(KesKey::load_optional(&dir, &unlock).unwrap().unwrap().period(), 3);
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Review V1-5: a key file the operator made read-only does not block
+    /// evolution. The new state is published by the rename (which needs the
+    /// directory only); the old inode is left as it was and that is reported.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_key_file_does_not_block_evolution() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("read-only");
+        let unlock = quick();
+        let mut key = KesKey::generate(4, 2, |_| {}).unwrap();
+        key.save(&dir, &unlock).unwrap();
+        fs::set_permissions(KesKey::path(&dir), fs::Permissions::from_mode(0o400)).unwrap();
+        if fs::OpenOptions::new().write(true).open(KesKey::path(&dir)).is_ok() {
+            // Running as root: the mode does not restrict this process.
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        key.evolve_to(&dir, &unlock, 1).unwrap();
+        assert_eq!(key.period(), 1);
+        let reloaded = KesKey::load_optional(&dir, &unlock).unwrap().unwrap();
+        assert_eq!(reloaded.period(), 1, "the evolved state is what the name holds");
+        assert_eq!(fs::metadata(KesKey::path(&dir)).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The first save has nothing to overwrite, and a failed evolution
