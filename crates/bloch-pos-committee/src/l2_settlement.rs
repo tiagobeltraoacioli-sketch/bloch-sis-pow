@@ -796,6 +796,26 @@ pub mod withdrawal {
             self.claims -= forgotten;
             forgotten
         }
+        /// Forget the claim of `index` alone (a forfeit reset); false if it
+        /// was not claimed.
+        pub(crate) fn forget(&mut self, index: u64) -> bool {
+            if !self.contains(index) {
+                return false;
+            }
+            let word = index / 256;
+            // Fully claimed words down to this one are stored again.
+            while self.floor > word {
+                self.floor -= 1;
+                self.words.insert(self.floor, [0xff; 32]);
+            }
+            let bit = (index % 256) as usize;
+            if let Some(bits) = self.words.get_mut(&word) {
+                bits[bit / 8] &= !(1 << (bit % 8));
+            }
+            self.words.retain(|_, bits| *bits != [0; 32]);
+            self.claims -= 1;
+            true
+        }
         /// Whether any leaf at or above `index` is claimed.
         pub fn any_at_or_above(&self, index: u64) -> bool {
             if self.floor.saturating_mul(256) > index {
@@ -827,6 +847,73 @@ pub mod withdrawal {
                 out.extend_from_slice(&index.to_le_bytes());
                 out.extend_from_slice(word);
             }
+        }
+    }
+
+    /// The leaves paid under the next program (review R308-7), each with the
+    /// L2 number of the withdrawal record its claim was proven against.
+    ///
+    /// The claim bitmap says that an index was paid, not which leaf nor
+    /// against which root, and L1 does not check that a later root extends an
+    /// earlier tree. A head reset ([`super::State::reset_head`]) therefore
+    /// reads here which claims were proven against a root of the tail it
+    /// drops, at any index. A paid leaf is never paid again, whatever a
+    /// forfeit reset forgets of the bitmap.
+    ///
+    /// Empty until the first claim under the next program, so every earlier
+    /// state keeps its bytes. Committed as its length and a running root.
+    #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct PaidLeaves {
+        /// Leaf index -> `(leaf hash, L2 number of the record)`, in claim order.
+        leaves: std::collections::BTreeMap<u64, Vec<([u8; 32], u64)>>,
+        len: u64,
+        /// Running root over every entry, in claim order (zero while empty).
+        root: [u8; 32],
+    }
+    impl PaidLeaves {
+        /// Whether exactly this leaf at `index` was paid.
+        pub fn contains(&self, index: u64, leaf: &[u8; 32]) -> bool {
+            self.leaves.get(&index).is_some_and(|paid| paid.iter().any(|(l, _)| l == leaf))
+        }
+        pub fn len(&self) -> u64 {
+            self.len
+        }
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+        pub fn root(&self) -> [u8; 32] {
+            self.root
+        }
+        pub(crate) fn record(&mut self, index: u64, leaf: [u8; 32], l2_number: u64) {
+            let mut h = Keccak256::new();
+            h.update(b"BLOCH:NATIVE:L2:PAID-LEAF:1");
+            h.update(self.root);
+            h.update(index.to_le_bytes());
+            h.update(leaf);
+            h.update(l2_number.to_le_bytes());
+            self.root = h.finalize().into();
+            self.leaves.entry(index).or_default().push((leaf, l2_number));
+            self.len += 1;
+        }
+        /// Indices with a leaf paid against a record above L2 block `number`,
+        /// ascending.
+        pub fn proven_above(&self, number: u64) -> Vec<u64> {
+            self.leaves.iter().filter(|(_, paid)| paid.iter().any(|(_, n)| *n > number)).map(|(index, _)| *index).collect()
+        }
+        pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:PAID-LEAVES:1");
+            out.extend_from_slice(&self.len.to_le_bytes());
+            out.extend_from_slice(&self.root);
+        }
+        /// Whether the entries fold to the stored length. The running root is
+        /// order-dependent across indices and is authenticated by the state
+        /// root check that follows a cache restore.
+        #[cfg(feature = "local-state-cache")]
+        pub(crate) fn consistent(&self) -> bool {
+            self.leaves.values().all(|paid| !paid.is_empty())
+                && self.leaves.values().map(|paid| paid.len() as u64).sum::<u64>() == self.len
+                && (self.len == 0) == (self.root == [0; 32])
         }
     }
 }
@@ -940,8 +1027,10 @@ pub mod forced {
     /// Consumed records kept, with the L2 number of the settlement that
     /// consumed them, so that a rollback head reset can queue them again
     /// ([`Queue::requeue_after`]). At [`MAX_PER_SETTLEMENT`] per settlement
-    /// this covers at least 64 settlements; a reset deeper than the log is
-    /// refused rather than losing forced transactions.
+    /// this covers at least 64 settlements; a plain reset deeper than the log
+    /// is refused rather than losing forced transactions, and a forfeit reset
+    /// queues again what the log still has ([`Queue::requeue_logged_after`]),
+    /// so that what a tail consumes cannot keep the head on it.
     pub const CONSUMED_LOG: usize = 1_024;
 
     #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
@@ -1233,6 +1322,15 @@ pub mod forced {
             if !self.covers_reset_to(number) {
                 return None;
             }
+            Some(self.requeue_logged_after(number))
+        }
+        /// The same, whatever the log covers (a forfeit head reset): every
+        /// logged record consumed after L2 block `number` goes back; records
+        /// of later settlements that the log already dropped stay consumed
+        /// and are not executed by the new chain. The log then holds nothing
+        /// above `number`, and its floor is at most `number`. Returns the
+        /// number put back.
+        pub(crate) fn requeue_logged_after(&mut self, number: u64) -> u64 {
             let keep = self.log.iter().position(|(n, _)| *n > number).unwrap_or(self.log.len());
             let back: Vec<Record> = self.log.drain(keep..).map(|(_, r)| r).collect();
             let count = back.len() as u64;
@@ -1241,7 +1339,8 @@ pub mod forced {
             if let Some(anchor) = self.anchor.as_mut() {
                 *anchor += count;
             }
-            Some(count)
+            self.log_floor = self.log_floor.min(number);
+            count
         }
         pub(crate) fn encode(&self, out: &mut Vec<u8>) {
             out.extend_from_slice(b"BLOCH:NATIVE:L2:FORCED-STATE:2");
@@ -1656,7 +1755,6 @@ pub mod mainnet {
     // fallback on the next rules without forced inclusion).
     const _: () = assert!(same_hash(&PROGRAM_NEXT.identities[0], &PROGRAM_FALLBACK.identities[0]));
     const _: () = assert!(same_hash(&PROGRAM_NEXT.proof_policy, &PROGRAM_FALLBACK.proof_policy));
-
     /// OPTION, an owner decision, absent by default: a one-time reset of the
     /// settled L2 head, applied by [`super::State::install_next_program`] in the
     /// same transition as the swap. Without it the swap prevents an off-rule block
@@ -1681,10 +1779,17 @@ pub mod mainnet {
         /// and the claims of those leaves are forgotten, so the new chain's
         /// withdrawals at the same indices can be paid. What they released stays
         /// released: the escrow is short by exactly that amount (the forfeit),
-        /// and the forged roots stop paying at the gate. Only for a tail whose
-        /// paid leaves are not re-published by the rebuild: an honest withdrawal
-        /// of a dropped block that was paid and is included again on the new
-        /// chain would be paid twice.
+        /// and the forged roots stop paying at the gate. From the swap on the
+        /// leaves counted are those proven against a root above the target, at
+        /// any index, and a leaf that was paid is never paid again: the same
+        /// leaf at the same index on the kept root or on the rebuilt chain is
+        /// refused, another leaf there is paid. For claims older than the swap
+        /// (not recorded) the index alone decides, so that form is only for a
+        /// tail whose paid leaves are not re-published by the rebuild.
+        /// A forfeit reset also applies when the tail consumed more forced
+        /// records than [`super::forced::CONSUMED_LOG`] holds: the records the
+        /// log still has are queued again and the older ones of the tail are
+        /// not (their envelopes stay on L1 by txid, to be submitted again).
         pub forfeit: bool,
     }
     /// `None`: the release ships no reset and the swap changes the program only.
@@ -2062,6 +2167,12 @@ pub struct State {
     /// `checkpoint_roots`, so the cached bytes of this struct do not change.
     #[cfg_attr(feature = "local-state-cache", serde(skip))]
     forced: Option<forced::Queue>,
+    /// Leaves paid under the next program ([`withdrawal::PaidLeaves`]).
+    /// Empty before the swap; committed after the claim section and absent
+    /// while empty, so every earlier state keeps its bytes. The local cache
+    /// carries it in its own trailing section, like `forced`.
+    #[cfg_attr(feature = "local-state-cache", serde(skip))]
+    paid: withdrawal::PaidLeaves,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -2122,6 +2233,7 @@ impl State {
             profile: Profile::development(),
             checkpoint_roots: std::collections::BTreeMap::new(),
             forced: None,
+            paid: withdrawal::PaidLeaves::default(),
         })
     }
     pub(crate) fn genesis_async(policy: Policy) -> Result<Self, Reject> {
@@ -2380,7 +2492,12 @@ impl State {
     /// retained records or the head's tree. When a leaf the target did not publish was already
     /// paid, the rollback would credit on L2 what already left the escrow: a
     /// plain reset then does nothing, and a FORFEIT reset applies and forgets
-    /// those claims ([`mainnet::HeadReset::forfeit`]).
+    /// those claims ([`mainnet::HeadReset::forfeit`]). Such a claim is one at
+    /// an index at or above the target's count, or one proven against a
+    /// record above the target ([`withdrawal::PaidLeaves`]; L1 cannot tell
+    /// whether its leaf is also the target's, so a plain reset refuses on
+    /// any). A plain reset is also refused when the consumed forced log does
+    /// not reach the target; a forfeit reset never is.
     pub(crate) fn reset_head(&mut self, reset: &mainnet::HeadReset) -> bool {
         if self.settled_number() <= reset.number {
             return false;
@@ -2409,18 +2526,25 @@ impl State {
         {
             return false;
         }
-        let paid_beyond = self.claimed.any_at_or_above(count);
+        // A claim may have paid a leaf the target did not publish: at an
+        // index the target does not have, or (from the swap on, where the
+        // paid leaves are recorded) proven against a root of the tail, which
+        // nothing ties to the target's tree at any index.
+        let tail_paid = self.paid.proven_above(reset.number);
+        let paid_beyond = self.claimed.any_at_or_above(count) || !tail_paid.is_empty();
         if (paid_beyond && !reset.forfeit) || consumed > self.inbox.len() as u64 {
             return false;
         }
         // Forced records consumed after the target go back into the queue, as
-        // the deposit cursor goes back; a reset the consumed log cannot cover
-        // is refused, so that no forced transaction is silently dropped.
-        if self.forced.as_ref().is_some_and(|q| !q.covers_reset_to(reset.number)) {
+        // the deposit cursor goes back. A plain reset the consumed log cannot
+        // cover is refused, so that no forced transaction is silently dropped.
+        // A forfeit reset is not bounded by what the tail consumed: it puts
+        // back what the log still has (review R308-8).
+        if !reset.forfeit && self.forced.as_ref().is_some_and(|q| !q.covers_reset_to(reset.number)) {
             return false;
         }
         if let Some(queue) = self.forced.as_mut() {
-            queue.requeue_after(reset.number);
+            queue.requeue_logged_after(reset.number);
         }
         self.head = head;
         self.consumed = consumed;
@@ -2432,6 +2556,11 @@ impl State {
         }
         if paid_beyond {
             self.claimed.forget_at_or_above(count);
+            // Below the target's count as well: the index is claimable again,
+            // by any leaf but the ones already paid ([`Self::check_claim`]).
+            for index in tail_paid {
+                self.claimed.forget(index);
+            }
         }
         true
     }
@@ -2522,6 +2651,15 @@ impl State {
     pub fn claimed(&self) -> &withdrawal::ClaimBitmap {
         &self.claimed
     }
+    /// Leaves paid under the next program, with the record each was proven against.
+    pub fn paid_leaves(&self) -> &withdrawal::PaidLeaves {
+        &self.paid
+    }
+    /// Local-cache restore only, like [`Self::restore_checkpoint_roots`].
+    #[cfg(feature = "local-state-cache")]
+    pub(crate) fn restore_paid_leaves(&mut self, paid: withdrawal::PaidLeaves) {
+        self.paid = paid;
+    }
     /// Satoshis released from escrow by claims.
     pub fn released_sat(&self) -> u128 {
         self.released_sat
@@ -2560,7 +2698,9 @@ impl State {
         }
         let at = self.native_height.checked_add(1).ok_or(R::NotActive)?;
         let record = *withdrawal::matured_proof(&self.profile.limits, &self.withdrawals, at, chain_id, index, l1_recipient, sats, siblings)?;
-        if self.claimed.contains(index) {
+        // A leaf that was paid stays paid when a forfeit reset forgets its
+        // index, so that only another leaf can be claimed there.
+        if self.claimed.contains(index) || self.paid.contains(index, &withdrawal::leaf(chain_id, index, l1_recipient, sats)) {
             return Err(R::Claimed);
         }
         if self.escrow_sat < u128::from(sats) {
@@ -2586,13 +2726,17 @@ impl State {
         siblings: &[[u8; 32]; withdrawal::TREE_DEPTH],
         attested: bool,
     ) -> Result<(), withdrawal::ClaimRefusal> {
-        self.check_claim(chain_id, index, l1_recipient, sats, siblings, attested)?;
+        let record = self.check_claim(chain_id, index, l1_recipient, sats, siblings, attested)?;
         let released = self.released_sat.checked_add(u128::from(sats)).ok_or(withdrawal::ClaimRefusal::Escrow)?;
         let mut window = self.release_window();
         window.released = window.released.saturating_add(u128::from(sats));
         // No fallible step below: nullifier, escrow, total and window move together.
         let fresh = self.claimed.insert(index);
         debug_assert!(fresh);
+        // From the swap on, which leaf was paid and against which record.
+        if self.next_program_active() {
+            self.paid.record(index, withdrawal::leaf(chain_id, index, l1_recipient, sats), record.l2_number);
+        }
         self.escrow_sat -= u128::from(sats);
         self.released_sat = released;
         self.release_window = window;
@@ -2766,6 +2910,11 @@ impl State {
             out.extend_from_slice(&self.release_window.window.to_le_bytes());
             out.extend_from_slice(&self.release_window.released.to_le_bytes());
             out.extend_from_slice(&self.release_window.cap.to_le_bytes());
+        }
+        // Absent until the first claim under the next program, so every state
+        // below `L2_NEXT_PROGRAM_EPOCH` keeps its bytes.
+        if !self.paid.is_empty() {
+            self.paid.encode(&mut out);
         }
         // Absent while empty, so states without DA keep their bytes.
         if !self.da.is_empty() {
@@ -3006,6 +3155,9 @@ impl State {
             || full.checked_add(stored) != Some(self.claimed.claims())
         {
             return Err("cached L2 claim set is inconsistent".into());
+        }
+        if !self.paid.consistent() {
+            return Err("cached L2 paid-leaf log is inconsistent".into());
         }
         Ok(self)
     }

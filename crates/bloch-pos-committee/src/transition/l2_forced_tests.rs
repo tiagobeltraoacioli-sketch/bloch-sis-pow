@@ -677,6 +677,68 @@
         assert!(l2.reset_head(&reset), "1,036 forced records consumed by the tail: the reset is refused and the head stays on the bad block");
     }
 
+    /// R308-8, what the forfeit form does when the log does not reach: the
+    /// records the log still has (the newest of the tail) are due again in
+    /// their order, the older ones of the tail stay consumed, and the log
+    /// holds nothing above the target. The plain form is still refused and
+    /// changes nothing; where the log reaches, both forms are the same.
+    #[test]
+    fn r308_8_a_forfeit_reset_requeues_what_the_log_has_and_a_plain_one_is_still_refused() {
+        let record = |i: u64| forced::Record { height: i, l1_txid: [i as u8; 32], envelope_hash: [0x5a; 32], gas_limit: 21_000 };
+        let mut l2 = state_with_bad_tail();
+        assert!(l2.enable_forced_inclusion_for_test());
+        let bad = statement_at(&l2, 80, [0xbb; 32], 5);
+        l2.set_head_for_test([80; 32], bad, 7);
+        let q = l2.forced_queue_mut_for_test().unwrap();
+        let mut i = 0u64;
+        for n in 1..=80u64 {
+            for _ in 0..14 {
+                i += 1;
+                q.push(record(i)).unwrap();
+            }
+            q.consume_due(n);
+        }
+        // Two records nobody consumed yet.
+        q.push(record(i + 1)).unwrap();
+        q.push(record(i + 2)).unwrap();
+        let logged = q.consumed_log().to_vec();
+        assert_eq!(logged.len(), forced::CONSUMED_LOG);
+        assert!(!q.covers_reset_to(6) && q.covers_reset_to(79));
+        let (queued, consumed) = (q.queued(), q.consumed());
+        let keep = statement_at(&l2, 6, [0xbb; 32], 5);
+        let reset = mainnet::HeadReset { number: 6, commitment: [6; 32], statement: Some(leaked_hex(&keep)), forfeit: true };
+
+        let before = l2.clone();
+        assert!(!l2.reset_head(&mainnet::HeadReset { forfeit: false, ..reset }), "the plain form is refused");
+        assert_eq!(l2, before);
+
+        assert!(l2.reset_head(&reset));
+        assert_eq!(l2.settled_number(), 6);
+        let q = l2.forced_queue().unwrap();
+        let back: Vec<_> = logged.iter().map(|(_, r)| *r).collect();
+        assert_eq!(q.pending()[..back.len()], back[..], "the logged records, in their order");
+        assert_eq!(q.pending()[back.len()..], [record(i + 1), record(i + 2)]);
+        assert_eq!(q.queued(), queued);
+        assert_eq!(q.consumed(), consumed - forced::CONSUMED_LOG as u64, "the older records of the tail stay consumed");
+        assert_eq!(q.queued() - q.consumed(), q.pending().len() as u64);
+        assert!(q.consumed_log().is_empty());
+        assert!(q.covers_reset_to(6) && !q.covers_reset_to(5));
+        assert_eq!(q.root(), before.forced_queue().unwrap().root(), "nothing new is queued");
+        assert!(!q.due().is_empty());
+
+        // Where the log reaches, the forfeit form is the plain form.
+        let mut shallow = statement_at(&before, 79, [0xbb; 32], 5);
+        // Block 79 had consumed the 7 inbox records the head has.
+        let at = crate::l2_settlement::STATEMENT_TAG.len() + 528;
+        shallow[at..at + 8].copy_from_slice(&7u64.to_be_bytes());
+        let shallow = mainnet::HeadReset { number: 79, commitment: [79; 32], statement: Some(leaked_hex(&shallow)), forfeit: true };
+        let (mut plain, mut forfeit) = (before.clone(), before.clone());
+        assert!(plain.reset_head(&mainnet::HeadReset { forfeit: false, ..shallow }));
+        assert!(forfeit.reset_head(&shallow));
+        assert_eq!(plain, forfeit);
+        assert_eq!(plain.forced_queue().unwrap().pending().len(), 14 + 2);
+    }
+
     // ── Agent 215 (round 11): decided changes R3-R6 of review 164 ─────────
 
     fn record_n(i: u64, gas: u64) -> forced::Record {

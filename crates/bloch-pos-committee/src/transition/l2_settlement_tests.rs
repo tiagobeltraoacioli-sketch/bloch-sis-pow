@@ -3613,6 +3613,10 @@ mod l2_tests {
         };
         {
             let l2 = pre.l2_settlement.as_mut().unwrap();
+            // Added with the fix (agent 311): the tail of a rollback reset is
+            // settled by the next program, and paid leaves are recorded from
+            // the swap on, so that states below the gate keep their bytes.
+            l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
             l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: wd::root(&tree(&forged)), count: 3, height: 2 });
             let bad = statement_at(l2, 2, wd::root(&tree(&forged)), 3);
             l2.set_head_for_test([2; 32], bad, 1);
@@ -3631,6 +3635,192 @@ mod l2_tests {
             !plain_applied && honest_claim.is_ok(),
             "plain reset applied over a paid forged leaf: {plain_applied}; honest leaf 1 of the kept root after the forfeit reset: {honest_claim:?}"
         );
+    }
+
+    /// A mainnet L2 under the next program with 1 000 BLCH escrowed: the tree
+    /// of `honest` recorded at L2 block 1, the tree of `tail` at block 2 (the
+    /// head), both matured for small claims. Returns the chain id too.
+    fn next_program_with_tail(honest: &[([u8; 32], u64)], tail: &[([u8; 32], u64)]) -> (crate::l2_settlement::State, u64) {
+        let mut l2 = mainnet_l2_state();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        put_tail(&mut l2, honest, tail);
+        let chain = l2.policy().chain_id;
+        (l2, chain)
+    }
+
+    fn leaves_of(chain: u64, leaves: &[([u8; 32], u64)]) -> Vec<[u8; 32]> {
+        leaves.iter().enumerate().map(|(i, (r, s))| wd::leaf(chain, i as u64, r, *s)).collect()
+    }
+
+    fn put_tail(l2: &mut crate::l2_settlement::State, honest: &[([u8; 32], u64)], tail: &[([u8; 32], u64)]) {
+        let chain = l2.policy().chain_id;
+        l2.append_deposit(crate::l2_settlement::InboxRecord {
+            height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 1_000 * BLCH, recipient: [0x42; 20],
+        })
+        .unwrap();
+        let at = l2.height();
+        let (good, bad) = (wd::root(&leaves_of(chain, honest)), wd::root(&leaves_of(chain, tail)));
+        l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: good, count: honest.len() as u64, height: at });
+        l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: bad, count: tail.len() as u64, height: at });
+        let head = statement_at(l2, 2, bad, tail.len() as u64);
+        l2.set_head_for_test([2; 32], head, 1);
+        for _ in 0..mainnet::LIMITS.delay_blocks {
+            l2.advance_height().unwrap();
+        }
+    }
+
+    fn pay(l2: &mut crate::l2_settlement::State, chain: u64, leaves: &[([u8; 32], u64)], i: u64) -> Result<(), wd::ClaimRefusal> {
+        let (r, sats) = leaves[i as usize];
+        l2.release_withdrawal(chain, i, &r, sats, &wd::proof(&leaves_of(chain, leaves), i).unwrap(), false)
+    }
+
+    fn reset_to_block_1(l2: &crate::l2_settlement::State, chain: u64, honest: &[([u8; 32], u64)], forfeit: bool) -> mainnet::HeadReset {
+        let keep = statement_at(l2, 1, wd::root(&leaves_of(chain, honest)), honest.len() as u64);
+        mainnet::HeadReset { number: 1, commitment: [1; 32], statement: Some(leaked_hex(&keep)), forfeit }
+    }
+
+    /// R308-7, state level and on every build. The tail rewrote leaf 1 and
+    /// kept leaf 0. A claim proven against the tail's root is seen by the
+    /// reset at any index: the plain form refuses, the forfeit form frees the
+    /// index for the target's own leaf, and no leaf is paid twice.
+    #[test]
+    fn r308_7_a_forfeit_reset_frees_a_rewritten_index_and_pays_no_leaf_twice() {
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let forged = [honest[0], ([0xee; 32], 9 * BLCH), ([3; 32], 5 * BLCH)];
+        let (mut l2, chain) = next_program_with_tail(&honest, &forged);
+        // Leaf 0 (the same leaf in both trees) and the forged leaf 1, both
+        // proven against the tail's root.
+        pay(&mut l2, chain, &forged, 0).expect("leaf 0 against the tail root");
+        pay(&mut l2, chain, &forged, 1).expect("the forged leaf 1");
+        assert_eq!(l2.paid_leaves().len(), 2);
+        assert_eq!(l2.paid_leaves().proven_above(1), [0, 1]);
+        assert_eq!(l2.paid_leaves().proven_above(2), [] as [u64; 0]);
+        let released = l2.released_sat();
+        assert_eq!(released, u128::from(14 * BLCH));
+
+        let before = l2.clone();
+        assert!(!l2.reset_head(&reset_to_block_1(&l2, chain, &honest, false)), "the plain form refuses");
+        assert_eq!(l2, before);
+        assert!(l2.reset_head(&reset_to_block_1(&l2, chain, &honest, true)));
+        assert_eq!(l2.settled_number(), 1);
+        assert_eq!(l2.withdrawal_roots().iter().map(|r| r.l2_number).collect::<Vec<_>>(), [1]);
+        assert!(!l2.claimed().contains(0) && !l2.claimed().contains(1));
+        assert_eq!(l2.claimed().claims(), 0);
+        assert!(bitmap_consistent(l2.claimed()) && l2.escrow_conserved());
+        assert_eq!(l2.released_sat(), released, "what the tail released stays released");
+        assert_eq!(l2.paid_leaves(), before.paid_leaves(), "the record of what was paid stays");
+
+        // Leaf 0 was paid: the same leaf is refused on the kept root.
+        assert_eq!(pay(&mut l2, chain, &honest, 0), Err(wd::ClaimRefusal::Claimed));
+        // The forged leaf proves against no retained root any more.
+        assert_eq!(pay(&mut l2, chain, &forged, 1), Err(wd::ClaimRefusal::Proof));
+        // The target's own leaf 1 is paid, once.
+        pay(&mut l2, chain, &honest, 1).expect("the honest owner of leaf 1");
+        assert_eq!(pay(&mut l2, chain, &honest, 1), Err(wd::ClaimRefusal::Claimed));
+        assert_eq!(l2.released_sat(), released + u128::from(5 * BLCH));
+        assert!(l2.claimed().contains(1) && !l2.claimed().contains(0) && l2.escrow_conserved());
+        // The rebuilt chain publishes the paid leaf 0 again: still refused.
+        let rebuilt = [honest[0], honest[1], ([4; 32], BLCH)];
+        let at = l2.height() + 1;
+        l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: wd::root(&leaves_of(chain, &rebuilt)), count: 3, height: at });
+        for _ in 0..mainnet::LIMITS.delay_blocks + 1 {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(pay(&mut l2, chain, &rebuilt, 0), Err(wd::ClaimRefusal::Claimed));
+        pay(&mut l2, chain, &rebuilt, 2).expect("a new leaf of the rebuilt chain");
+    }
+
+    /// R308-7, the other side of the rule: a claim proven against the
+    /// target's own record (or an older one) is not a tail claim, so the
+    /// plain reset still applies and nothing is forgotten; and below the
+    /// swap nothing is recorded, the state keeps its bytes and the index
+    /// rule alone decides, as before.
+    #[test]
+    fn r308_7_claims_against_the_target_do_not_stop_a_plain_reset_and_nothing_is_recorded_before_the_swap() {
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let forged = [honest[0], ([0xee; 32], 9 * BLCH), ([3; 32], 5 * BLCH)];
+        let (mut l2, chain) = next_program_with_tail(&honest, &forged);
+        pay(&mut l2, chain, &honest, 0).expect("leaf 0 against the target's root");
+        assert_eq!(l2.paid_leaves().len(), 1);
+        assert!(l2.paid_leaves().proven_above(1).is_empty());
+        let (mut plain, mut forfeit) = (l2.clone(), l2.clone());
+        assert!(plain.reset_head(&reset_to_block_1(&l2, chain, &honest, false)));
+        assert!(forfeit.reset_head(&reset_to_block_1(&l2, chain, &honest, true)));
+        assert_eq!(plain, forfeit);
+        assert!(plain.claimed().contains(0) && plain.claimed().claims() == 1);
+
+        // The same claims under the program the activation pinned.
+        let mut old = mainnet_l2_state();
+        put_tail(&mut old, &honest, &forged);
+        let untouched = old.committed_bytes();
+        pay(&mut old, chain, &forged, 0).unwrap();
+        pay(&mut old, chain, &forged, 1).unwrap();
+        assert!(old.paid_leaves().is_empty());
+        let marker: &[u8] = b"BLOCH:NATIVE:L2:PAID-LEAVES:1";
+        let has_marker = |bytes: &[u8]| bytes.windows(marker.len()).any(|w| w == marker);
+        assert!(!has_marker(&untouched) && !has_marker(&old.committed_bytes()));
+        assert!(old.clone().reset_head(&reset_to_block_1(&old, chain, &honest, false)), "by index alone, as before the swap");
+
+        // Under the next program the section is committed with the first claim
+        // and binds index, leaf and record.
+        let (fresh, _) = next_program_with_tail(&honest, &forged);
+        assert!(!has_marker(&fresh.committed_bytes()));
+        let (mut a, mut b, mut c) = (fresh.clone(), fresh.clone(), fresh.clone());
+        pay(&mut a, chain, &forged, 0).unwrap();
+        pay(&mut b, chain, &honest, 0).unwrap();
+        pay(&mut c, chain, &forged, 0).unwrap();
+        assert!(has_marker(&a.committed_bytes()));
+        assert_ne!(a.committed_bytes(), b.committed_bytes(), "the record a claim proved against is committed");
+        assert_eq!(a.committed_bytes(), c.committed_bytes());
+        assert_ne!(a.paid_leaves().root(), [0; 32]);
+    }
+
+    #[test]
+    fn claim_bitmap_forgets_one_index_through_the_floor() {
+        let mut b = wd::ClaimBitmap::default();
+        for i in 0..600 {
+            assert!(b.insert(i));
+        }
+        assert_eq!(b.floor(), 2);
+        assert!(b.forget(300) && !b.forget(300) && !b.forget(700));
+        assert_eq!((b.floor(), b.claims()), (1, 599));
+        assert!(!b.contains(300) && b.contains(299) && b.contains(301) && b.contains(599) && bitmap_consistent(&b));
+        assert!(b.forget(5));
+        assert_eq!((b.floor(), b.claims()), (0, 598));
+        assert!(bitmap_consistent(&b));
+        // Claimed again, the words fold back under the floor.
+        assert!(b.insert(5) && b.insert(300));
+        assert_eq!((b.floor(), b.claims()), (2, 600));
+        assert!(bitmap_consistent(&b));
+        let mut one = wd::ClaimBitmap::default();
+        one.insert(9);
+        assert!(one.forget(9));
+        assert_eq!(one, wd::ClaimBitmap::default());
+    }
+
+    /// The restart cache carries the paid leaves in their own section, after
+    /// the forced queue's, and only once there is one.
+    #[test]
+    #[cfg(feature = "local-state-cache")]
+    fn local_cache_carries_the_paid_leaves() {
+        let (mut state, _) = activated_fixture(true, [0; 32]);
+        let marker: &[u8] = b"BPOSST01:L2PL:v1";
+        let (_, bytes, _) = local_cache_round_trip(&state);
+        assert!(!bytes.windows(marker.len()).any(|w| w == marker));
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let forged = [honest[0], ([0xee; 32], 9 * BLCH), ([3; 32], 5 * BLCH)];
+        let l2 = state.l2_settlement.as_mut().unwrap();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        put_tail(l2, &honest, &forged);
+        let chain = l2.policy().chain_id;
+        pay(l2, chain, &forged, 1).unwrap();
+        pay(l2, chain, &honest, 0).unwrap();
+        let (restored, bytes, header) = local_cache_round_trip(&state);
+        assert!(bytes.windows(marker.len()).any(|w| w == marker));
+        assert_eq!(restored.l2_settlement().unwrap().paid_leaves().proven_above(1), [1]);
+        // A cache that lost the section does not restore to this state root.
+        let at = bytes.windows(marker.len()).position(|w| w == marker).unwrap();
+        assert!(CommittedState::decode_local_cache(&bytes[..at], &header).is_err());
     }
 
     #[test]

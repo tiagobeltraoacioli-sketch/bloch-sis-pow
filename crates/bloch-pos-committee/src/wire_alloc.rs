@@ -110,6 +110,8 @@ pub mod local_cache {
     pub const L2_CHECKPOINTS: &[u8; 16] = b"BPOSST01:L2CP:v1";
     /// Candidate: `codex/forced-inclusion-r7-20261102` (L2 forced queue).
     pub const L2_FORCED: &[u8; 16] = b"BPOSST01:L2FI:v1";
+    /// Candidate: `codex/l2-r15-20261110` (L2 paid leaves, review R308-7).
+    pub const L2_PAID: &[u8; 16] = b"BPOSST01:L2PL:v1";
     /// HF3 KES (`v2`: entries with start periods and the enforcement bind
     /// epoch; the devnet lineage's `v1` section is not accepted).
     /// `v3` adds the retired-key history (review R-1); `v1`/`v2` sections
@@ -122,7 +124,7 @@ pub mod local_cache {
     /// HF1 own-target checkpoints (p2a).
     pub const OWN_CHECKPOINTS: &[u8; 16] = b"BPOSST01:FFGO:v1";
     /// Fixed merge/parse order.
-    pub const ORDER: [&[u8; 16]; 7] = [L2, L2_CHECKPOINTS, L2_FORCED, KES, PQ, FINALITY_SET, OWN_CHECKPOINTS];
+    pub const ORDER: [&[u8; 16]; 8] = [L2, L2_CHECKPOINTS, L2_FORCED, L2_PAID, KES, PQ, FINALITY_SET, OWN_CHECKPOINTS];
 }
 
 /// Trailing extensions of the finality leaf (state tag `0x09`). Absent while

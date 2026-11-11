@@ -16,6 +16,10 @@ const L2_CHECKPOINT_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2_CHEC
 /// Marks the optional section after [L2CP] holding the L2 forced-inclusion
 /// queue (`params::L2_FORCED_INCLUSION_EPOCH`). Written only once enabled.
 const L2_FORCED_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2_FORCED;
+/// Marks the optional section after [L2FI] holding the leaves paid under the
+/// next L2 program (`l2_settlement::withdrawal::PaidLeaves`). Written only
+/// when non-empty, so every earlier cache keeps its bytes.
+const L2_PAID_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2_PAID;
 /// Marks the optional trailing post-quantum rescue-commitment section. Written
 /// only when the map is non-empty (never before the emergency gate).
 const PQ_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::PQ;
@@ -237,6 +241,14 @@ impl CommittedState {
                     return Err(error.to_string());
                 }
             }
+            if !l2.paid_leaves().is_empty() {
+                bytes.extend_from_slice(L2_PAID_SECTION);
+                if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
+                    .serialize_into(&mut *bytes, l2.paid_leaves()) {
+                    bytes.truncate(original_len);
+                    return Err(error.to_string());
+                }
+            }
             if bytes.len() - original_len > LIMIT as usize {
                 bytes.truncate(original_len);
                 return Err("local cache payload exceeds its limit".into());
@@ -364,7 +376,7 @@ impl CommittedState {
         let value: CachedState = bincode::DefaultOptions::new().with_limit(LIMIT)
             .deserialize_from(&mut rest).map_err(|e| e.to_string())?;
         // Optional sections, in their only legal order
-        // (`wire_alloc::local_cache::ORDER`): L2 [L2CP] [L2FI], KES, PQ, FSET, FFGO.
+        // (`wire_alloc::local_cache::ORDER`): L2 [L2CP] [L2FI] [L2PL], KES, PQ, FSET, FFGO.
         let mut l2_settlement = None;
         if let Some(mut section) = rest.strip_prefix(L2_SECTION.as_slice()) {
             let mut l2: crate::l2_settlement::State = bincode::DefaultOptions::new().with_limit(LIMIT)
@@ -383,6 +395,15 @@ impl CommittedState {
                     .deserialize_from(&mut forced_section).map_err(|e| e.to_string())?;
                 l2.restore_forced_queue(queue);
                 section = forced_section;
+            }
+            if let Some(mut paid_section) = section.strip_prefix(L2_PAID_SECTION.as_slice()) {
+                let paid: crate::l2_settlement::withdrawal::PaidLeaves = bincode::DefaultOptions::new().with_limit(LIMIT)
+                    .deserialize_from(&mut paid_section).map_err(|e| e.to_string())?;
+                if paid.is_empty() {
+                    return Err("empty cached L2 paid-leaf section".into());
+                }
+                l2.restore_paid_leaves(paid);
+                section = paid_section;
             }
             l2_settlement = Some(l2.from_local_cache()?);
             rest = section;
