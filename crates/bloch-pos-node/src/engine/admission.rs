@@ -354,9 +354,9 @@ pub(super) fn check_transfer(
 ///
 /// Every refusal below is the transition's own, taken from the committee's
 /// shared check functions against `state` at the price of a block in `epoch`,
-/// so nothing is refused that the next block could carry; the one addition is
-/// the block byte budget, the relay bound transfers and funded deposits
-/// already have. Signatures are not judged here (admission verifies them
+/// so nothing is refused that the next block could carry; the additions are
+/// the block byte budget and the declared-size slack, the relay bounds
+/// transfers already have. Signatures are not judged here (admission verifies them
 /// after this, under the per-source budget).
 fn check_l2_funded(
     state: &CommittedState,
@@ -378,6 +378,15 @@ fn check_l2_funded(
     };
     if (encoded as u64).max(declared) > fee_market::max_block_tx_bytes(epoch) {
         return Err(Refusal::Invalid("transaction exceeds block byte budget"));
+    }
+    // Relay policy, the bound transfers already have (`declared_size_bound`,
+    // audit H-R7-2; review W1-1): the declared size is what the block byte
+    // cap counts, and consensus puts no ceiling on it for these types, so a
+    // small transaction declaring a block of bytes displaced everything
+    // behind it from a selection. Honest builders declare the unsigned
+    // encoding plus the largest signature, a few bytes above the encoding.
+    if declared > (encoded as u64).saturating_add(fee_market::TX_BYTES_DECLARE_SLACK) {
+        return Err(Refusal::Invalid("L2 transaction declares far more bytes than its encoding carries"));
     }
     let base_fee = state.next_base_fee_at(epoch);
     match tx {

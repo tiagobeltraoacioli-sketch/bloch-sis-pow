@@ -85,6 +85,35 @@ fn a_transaction_the_probe_refuses_does_not_cost_the_block_its_transactions() {
     assert!(node.rejected.contains_key(&key), "the refused transaction is barred");
 }
 
+/// W1-1 (re-selection bound): one more indexed refusal than the re-selection
+/// allowance covers. The proposer selects a last time and the block still
+/// carries the pending transfer; before, it kept the shrunken list, which
+/// here is empty.
+#[test]
+fn a_spent_reselection_allowance_still_leaves_the_block_its_transfer() {
+    let _clock = validator_lifecycle::clock_at(3);
+    let funds = funds_of(2);
+    let (mut node, _dir) = engine_with_frozen_source_funded(&funds);
+    let transfer = spend(&funds[0], 9_000, 0, node.state.next_base_fee_at(0));
+    assert_eq!(node.on_transaction(transfer.clone()), Ok(Admitted::New));
+    // Each is a whole selection the probe refuses (the proof does not verify).
+    let mut keys = Vec::new();
+    for i in 0..=PROPOSAL_RESELECTIONS_MAX {
+        let unproven = wire(settlement(&node, [2 + i as u8; 356]));
+        keys.push(unproven.canonical_bytes());
+        node.mempool.insert(unproven.canonical_bytes(), unproven);
+    }
+    assert_eq!(pending_settlements(&node), PROPOSAL_RESELECTIONS_MAX + 1);
+
+    node.propose(3);
+    assert_eq!(node.state.slot(), 3, "the block was produced");
+    assert_eq!(node.tx_slot_index.get(&transfer.txid()), Some(&3), "and carries the transfer");
+    for key in &keys {
+        assert!(!node.mempool.contains_key(key));
+        assert!(node.rejected.contains_key(key), "every refused transaction is barred");
+    }
+}
+
 #[cfg(feature = "devnet-l2-user-txs")]
 mod funded_l2_transactions {
     use super::*;
@@ -235,6 +264,9 @@ mod funded_l2_transactions {
         // The same without the absurd price: still nothing backs them.
         let mut modest = deposit(&node, 91, ABSENT, None, 0x43);
         modest.tip_millisat_per_gas = 0;
+        // Declared as a wallet does, over the unsigned encoding (W1-1: the
+        // door now bounds the declared size above the encoding).
+        modest.signature = Vec::new();
         modest.tx_bytes = (modest.canonical_bytes().len() + bloch_crypto::crypto::max_signature_len()) as u64;
         modest.signature = sign(&keypair(91).1, &modest.intent_root());
         assert!(matches!(
@@ -273,6 +305,171 @@ mod funded_l2_transactions {
         node.propose(3);
         assert_eq!(node.tx_slot_index.get(&honest.txid()), Some(&3));
         assert_eq!(node.state.l2_settlement().unwrap().data_availability().len(), 1);
+    }
+
+    fn da_records(node: &Engine) -> usize {
+        node.state.l2_settlement().unwrap().data_availability().len()
+    }
+
+    /// W1-1: six copies of one DA batch, each funded by its own output and
+    /// each valid alone, all pass admission. Only one is selected (the
+    /// transition refuses the others as duplicates once the first is in the
+    /// block), so the probe refuses nothing, nothing is barred, and the block
+    /// carries the batch and the transfer.
+    #[test]
+    fn duplicate_da_batches_are_not_selected_together() {
+        let _clock = validator_lifecycle::clock_at(3);
+        let funds = funds_of(7);
+        let (mut node, _dir) = engine(&funds);
+        let transfer = spend(&funds[0], 9_000, 0, node.state.next_base_fee_at(0));
+        assert_eq!(node.on_transaction(transfer.clone()), Ok(Admitted::New));
+        for coin in &funds[1..] {
+            let copy = data_availability(&node, OWNER, (coin.txid, coin.vout), Some(coin.value));
+            assert_eq!(node.on_transaction(PosTransaction::L2DataAvailability(copy)), Ok(Admitted::New));
+        }
+        let selected = node.select_transactions(0);
+        assert_eq!(selected.len(), 2, "one copy and the transfer: {selected:?}");
+        assert!(selected.contains(&transfer));
+
+        node.propose(3);
+        assert_eq!(node.state.slot(), 3);
+        assert_eq!(node.tx_slot_index.get(&transfer.txid()), Some(&3));
+        assert_eq!(da_records(&node), 1);
+        assert!(node.rejected.is_empty(), "the probe refused nothing");
+    }
+
+    /// W1-1: an L2 transaction that pays for, and declares, far more bytes
+    /// than it carries is refused at the door like a transfer that does, and
+    /// is not selected if it is in the pool anyway.
+    #[test]
+    fn an_l2_transaction_declaring_far_more_than_its_encoding_is_refused() {
+        const OVERDECLARED: Refusal = Refusal::Invalid("L2 transaction declares far more bytes than its encoding carries");
+        let _clock = validator_lifecycle::clock_at(3);
+        let funds = funds_of(3);
+        let (mut node, _dir) = engine(&funds);
+        let transfer = spend(&funds[0], 9_000, 0, node.state.next_base_fee_at(0));
+        assert_eq!(node.on_transaction(transfer.clone()), Ok(Admitted::New));
+        let sk = keypair(OWNER).1;
+        let over = fee_market::TX_BYTES_DECLARE_SLACK + 1;
+
+        // The fixtures declare the unsigned encoding plus the largest
+        // signature, which is what the CLIs do: at or above the encoding.
+        let mut batch = data_availability(&node, OWNER, (funds[1].txid, funds[1].vout), Some(funds[1].value));
+        batch.tx_bytes += over;
+        batch.change.value = funds[1].value - fee_of(&node, batch.tx_bytes);
+        batch.signature = sign(&sk, &batch.intent_root());
+        let batch = PosTransaction::L2DataAvailability(batch);
+
+        let mut dep = deposit(&node, OWNER, (funds[2].txid, funds[2].vout), Some(funds[2].value), 0x42);
+        dep.tx_bytes += over;
+        dep.change.value = funds[2].value - MIN_L2_DEPOSIT_SAT - fee_of(&node, dep.tx_bytes);
+        dep.signature = sign(&sk, &dep.intent_root());
+        let dep = PosTransaction::L2Deposit(dep);
+
+        for tx in [batch, dep] {
+            // Nothing else is wrong with it: the committed state would apply it.
+            let fee = node.state.next_base_fee_at(0);
+            match &tx {
+                PosTransaction::L2DataAvailability(tx) => assert_eq!(node.state.l2_data_availability_refusal_at(tx, fee), None),
+                PosTransaction::L2Deposit(tx) => assert_eq!(node.state.l2_deposit_refusal_at(tx, fee), None),
+                _ => unreachable!(),
+            }
+            assert_eq!(node.on_transaction(tx.clone()), Err(OVERDECLARED));
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        assert_eq!(node.select_transactions(0), vec![transfer]);
+    }
+
+    /// W1-1 (last selection): when the re-selection allowance is spent the
+    /// last selection leaves L2 user transactions out. The block carries the
+    /// transfer; the valid DA batch stays pending, not barred, for the next
+    /// block.
+    #[test]
+    fn the_last_selection_leaves_l2_user_transactions_pending() {
+        let _clock = validator_lifecycle::clock_at(3);
+        let funds = funds_of(2);
+        let (mut node, _dir) = engine(&funds);
+        let transfer = spend(&funds[0], 9_000, 0, node.state.next_base_fee_at(0));
+        assert_eq!(node.on_transaction(transfer.clone()), Ok(Admitted::New));
+        let honest = PosTransaction::L2DataAvailability(data_availability(
+            &node, OWNER, (funds[1].txid, funds[1].vout), Some(funds[1].value),
+        ));
+        let honest_key = honest.canonical_bytes();
+        assert_eq!(node.on_transaction(honest.clone()), Ok(Admitted::New));
+        assert_eq!(node.select_transactions(0).len(), 2);
+        assert_eq!(node.select_transactions_with(0, false), vec![transfer.clone()]);
+        for i in 0..=PROPOSAL_RESELECTIONS_MAX {
+            let unproven = wire(settlement(&node, [2 + i as u8; 356]));
+            node.mempool.insert(unproven.canonical_bytes(), unproven);
+        }
+
+        node.propose(3);
+        assert_eq!(node.state.slot(), 3);
+        assert_eq!(node.tx_slot_index.get(&transfer.txid()), Some(&3));
+        assert_eq!(da_records(&node), 0);
+        assert!(node.mempool.contains_key(&honest_key), "left for the next block");
+        assert!(!node.rejected.contains_key(&honest_key));
+        assert_eq!(node.select_transactions(0), vec![honest]);
+    }
+
+    /// W1-1: claims are packed once per leaf and within the escrow, as the
+    /// transition will judge them one after another. (Packing does not judge
+    /// the proofs; the preflight did.)
+    #[test]
+    fn claims_are_packed_once_per_leaf_and_within_the_escrow() {
+        let _clock = validator_lifecycle::clock_at(3);
+        let funds = funds_of(1);
+        let (mut node, _dir) = engine(&funds);
+        let escrowed = PosTransaction::L2Deposit(deposit(
+            &node, OWNER, (funds[0].txid, funds[0].vout), Some(funds[0].value), 0x42,
+        ));
+        assert_eq!(node.on_transaction(escrowed), Ok(Admitted::New));
+        node.propose(3);
+        let l2 = node.state.l2_settlement().unwrap();
+        assert_eq!(l2.escrow_sat(), u128::from(MIN_L2_DEPOSIT_SAT));
+        assert!(l2.release_window().cap >= u128::from(MIN_L2_DEPOSIT_SAT));
+
+        let claim = |seed: u8, index: u64, sats: u64, tip: u128| {
+            let mut tx = unpayable_claim(&node, seed);
+            // Each spends its own input: the outpoint reservation is not
+            // what keeps two of them apart.
+            tx.inputs[0].vout = u32::from(seed);
+            tx.index = index;
+            tx.sats = sats;
+            tx.release.value = sats;
+            tx.tip_millisat_per_gas = tip;
+            tx.tx_bytes = (tx.canonical_bytes().len() + bloch_crypto::crypto::max_signature_len()) as u64;
+            let tx = PosTransaction::L2WithdrawClaim(tx);
+            (tx.canonical_bytes(), tx)
+        };
+        let pack = |txs: &[&(Vec<u8>, PosTransaction)], with_state: bool| {
+            Engine::pack_transactions_on(0, [0; 32], txs.iter().map(|(k, tx)| (k, tx)).collect(), with_state.then_some(l2))
+        };
+        let whole = claim(92, 0, MIN_L2_DEPOSIT_SAT, 9);
+        let same_leaf = claim(93, 0, MIN_L2_DEPOSIT_SAT, 8);
+        let other_leaf = claim(94, 1, MIN_L2_DEPOSIT_SAT, 7);
+        let half = claim(95, 2, MIN_L2_DEPOSIT_SAT / 2, 6);
+        let other_half = claim(96, 3, MIN_L2_DEPOSIT_SAT / 2, 5);
+        let third_half = claim(97, 4, MIN_L2_DEPOSIT_SAT / 2, 4);
+
+        // Without the L2 state only the leaf is reserved.
+        assert_eq!(pack(&[&whole, &other_leaf], false), vec![whole.1.clone(), other_leaf.1.clone()]);
+        // One claim per leaf, with or without the L2 state.
+        assert_eq!(pack(&[&whole, &same_leaf], true), vec![whole.1.clone()]);
+        assert_eq!(pack(&[&whole, &same_leaf], false), vec![whole.1.clone()]);
+        // Together they would release more than the escrow holds.
+        assert_eq!(pack(&[&whole, &other_leaf], true), vec![whole.1.clone()]);
+        assert_eq!(
+            pack(&[&half, &other_half, &third_half], true),
+            vec![half.1.clone(), other_half.1.clone()],
+        );
+        // A claim skipped for the amount does not hold its leaf.
+        let too_large = claim(99, 1, MIN_L2_DEPOSIT_SAT, 4);
+        let small_same_leaf = claim(98, 1, MIN_L2_DEPOSIT_SAT / 2, 3);
+        assert_eq!(
+            pack(&[&half, &too_large, &small_same_leaf], true),
+            vec![half.1.clone(), small_same_leaf.1.clone()],
+        );
     }
 
     /// V2-1: a deposit by a key that does not own the input it names is

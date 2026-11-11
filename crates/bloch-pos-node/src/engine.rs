@@ -2509,7 +2509,9 @@ impl Refusal {
 /// How many times `propose` selects from the mempool again after the probe
 /// refused, and it dropped, one indexed transaction (review EXE-1). Each
 /// round costs one selection and one probe transition on the consensus
-/// thread, so it is small; past it the proposer keeps the reduced list.
+/// thread, so it is small. Past it the proposer selects one last time
+/// without the L2 user transactions (review W1-1) and then keeps the
+/// reduced list.
 const PROPOSAL_RESELECTIONS_MAX: usize = 4;
 
 fn culprit_index(err: &TransitionError, len: usize) -> Option<usize> {
@@ -3778,10 +3780,20 @@ impl Engine {
                     // entry, and after the limit the loop continues as it
                     // always did. Not after an unattributed narrowing, which
                     // removes nothing from the mempool and would be undone.
+                    //
+                    // W1-1: when the allowance is spent, one last selection
+                    // leaves out L2 deposits, DA batches and claims, the
+                    // types whose mutual exclusions inside one block the
+                    // per-transaction preflight cannot see, so ordinary
+                    // transactions still land instead of the shrunken list.
+                    // They stay pending for the next proposer.
                     narrowed |= !indexed;
-                    if indexed && !narrowed && reselections < PROPOSAL_RESELECTIONS_MAX {
+                    if indexed && !narrowed && reselections <= PROPOSAL_RESELECTIONS_MAX {
                         reselections += 1;
-                        let again = self.select_transactions(bloch_pos_committee::epoch_of(slot));
+                        let again = self.select_transactions_with(
+                            bloch_pos_committee::epoch_of(slot),
+                            reselections <= PROPOSAL_RESELECTIONS_MAX,
+                        );
                         if proposal_wire::fit(&header, &mut atts, &again) {
                             header.attestation_root = derive::attestation_root(&atts);
                             txs = again;
@@ -5867,6 +5879,13 @@ impl Engine {
     /// it builds a block every other node rejects — so the epoch comes from
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
+        self.select_transactions_with(epoch, true)
+    }
+
+    /// [`Self::select_transactions`]; `l2_user_txs: false` leaves out L2
+    /// deposits, DA batches and withdrawal claims (the last selection of a
+    /// proposal whose re-selection allowance is spent, review W1-1).
+    fn select_transactions_with(&self, epoch: u64, l2_user_txs: bool) -> Vec<PosTransaction> {
         // A proof reserves the whole gas budget. Never pack it with transfers.
         // Only one that still matches this head (review EXE-2): admission
         // judged it against the head of that moment, and a pending settlement
@@ -5884,9 +5903,11 @@ impl Engine {
         let candidates = self.mempool.iter().filter(|(encoded, tx)| {
             // A settlement is proposed alone (above) or not at all.
             !matches!(tx, PosTransaction::L2SettlementAsync(_))
+                && (l2_user_txs || !matches!(tx, PosTransaction::L2Deposit(_)
+                    | PosTransaction::L2DataAvailability(_) | PosTransaction::L2WithdrawClaim(_)))
                 && self.candidate_is_backed(tx, encoded, epoch, &mut funded_context)
         }).collect();
-        Self::pack_transactions(epoch, *self.state.head().as_bytes(), candidates)
+        Self::pack_transactions_on(epoch, *self.state.head().as_bytes(), candidates, self.state.l2_settlement())
     }
 
     /// Whether `tx` is an asynchronous L2 settlement that passes every
@@ -5978,10 +5999,22 @@ impl Engine {
         true
     }
 
+    #[cfg(test)]
     fn pack_transactions(
         epoch: u64,
         seed: [u8; 32],
+        ordered: Vec<(&Vec<u8>, &PosTransaction)>,
+    ) -> Vec<PosTransaction> {
+        Self::pack_transactions_on(epoch, seed, ordered, None)
+    }
+
+    /// `l2` is the head's L2 state, when it has one: claims are then also
+    /// packed against its release window and escrow.
+    fn pack_transactions_on(
+        epoch: u64,
+        seed: [u8; 32],
         mut ordered: Vec<(&Vec<u8>, &PosTransaction)>,
+        l2: Option<&bloch_pos_committee::l2_settlement::State>,
     ) -> Vec<PosTransaction> {
         let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
         let mut out = Vec::new();
@@ -6000,6 +6033,21 @@ impl Engine {
         let mut reserved = BTreeSet::new();
         // Consensus caps DA batches per block; the highest tips win the slots.
         let mut da_batches = 0usize;
+        // W1-1: what L2 transactions exclude each other on inside one block,
+        // reserved the way outpoints are. The preflight judges each entry
+        // alone against the head, so two that each pass it could be selected
+        // together and the transition refuses the second: a DA batch for the
+        // same `(L2 block, commitment)` (`Duplicate`), a claim of the same
+        // leaf (`Claimed`), or claims that together exceed the release window
+        // or the escrow (`RateLimited`, `Escrow`). The higher tip keeps the
+        // place; the other stays pending. The window and escrow are followed
+        // exactly as `release_withdrawal` moves them. A deposit earlier in
+        // the block can only raise what consensus allows, so this never
+        // selects together what the transition refuses.
+        let mut da_keys = BTreeSet::new();
+        let mut claimed = BTreeSet::new();
+        let mut release = l2.map(|l2| (l2, l2.release_window(), l2.escrow_sat()));
+        let exempt_after_earlier_claims = bloch_pos_committee::params::l2_release_exemption_active(epoch);
         // F-9: consensus admits at most RESCUE_COMMITS_MAX_PER_BLOCK
         // commitments; they rank after every tipped transaction and among
         // themselves by `rescue_commit_rank`.
@@ -6052,11 +6100,30 @@ impl Engine {
             if points.iter().any(|point| reserved.contains(point)) {
                 continue;
             }
-            if matches!(tx, PosTransaction::L2DataAvailability(_)) {
+            if let PosTransaction::L2DataAvailability(batch) = tx {
                 if da_batches >= bloch_pos_committee::l2_settlement::da::MAX_PER_BLOCK {
                     continue;
                 }
+                if !da_keys.insert((batch.l2_block_number, batch.commitment())) {
+                    continue;
+                }
                 da_batches += 1;
+            }
+            if let PosTransaction::L2WithdrawClaim(claim) = tx {
+                if claimed.contains(&claim.index) {
+                    continue;
+                }
+                if let Some((l2, window, escrow)) = release.as_mut() {
+                    let sats = u128::from(claim.sats);
+                    if *escrow < sats
+                        || !window.admits(claim.sats, l2.window_exempt(claim.attestation.is_some()), exempt_after_earlier_claims)
+                    {
+                        continue;
+                    }
+                    window.released = window.released.saturating_add(sats);
+                    *escrow -= sats; // checked just above
+                }
+                claimed.insert(claim.index);
             }
             if matches!(tx, PosTransaction::RescueCommit(_)) {
                 if rescue_commits >= bloch_pos_committee::params::RESCUE_COMMITS_MAX_PER_BLOCK {
