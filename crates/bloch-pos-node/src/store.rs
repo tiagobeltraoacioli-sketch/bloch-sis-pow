@@ -774,6 +774,16 @@ pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// How many occupied staging names [`PrivateStagingFile::create_for`] steps
+/// over before it reports the collision.
+const STAGING_NAME_ATTEMPTS: u32 = 1_024;
+
+/// Process-wide sequence number of staging file names.
+fn staging_sequence() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Exclusive, private staging for a streamed atomic replacement. A legacy
 /// predictable `.tmp` path is never opened or truncated. Cleanup owns only the
 /// exact file successfully created by this value; publication disarms cleanup.
@@ -785,21 +795,33 @@ pub(crate) struct PrivateStagingFile {
 impl PrivateStagingFile {
     pub(crate) fn create_for(destination: &Path) -> io::Result<Self> {
         let dir = destination.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent directory"))?;
-        let suffix = format!(".write-{}-{}.tmp", std::process::id(), {
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        });
-        let mut name = destination.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing filename"))?.to_os_string();
-        name.push(suffix);
-        let path = dir.join(name);
+        let base = destination.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing filename"))?.to_os_string();
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)] {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options.open(&path)?;
-        Ok(Self { path: Some(path), file })
+        // A name left by a killed process with the same PID (the rule for a
+        // node that runs as PID 1 in a container) must not fail the write
+        // (review W2-6): the boot-time `finality_latch.bin` write reaches the
+        // same counter value on every start. The leftover is never opened,
+        // truncated or removed here (it may belong to another process); the
+        // counter moves on to a name nobody holds. `create_new` is kept, so
+        // the staging file is still exclusively this value's own.
+        let mut attempts = 0u32;
+        loop {
+            let mut name = base.clone();
+            name.push(format!(".write-{}-{}.tmp", std::process::id(), staging_sequence()));
+            let path = dir.join(name);
+            match options.open(&path) {
+                Ok(file) => return Ok(Self { path: Some(path), file }),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempts < STAGING_NAME_ATTEMPTS => {
+                    attempts = attempts.saturating_add(1);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     pub(crate) fn file_mut(&mut self) -> &mut File { &mut self.file }
@@ -2230,6 +2252,38 @@ mod tests {
         assert!(legacy.is_symlink());
         assert_eq!(fs::read(&victim).unwrap(), b"must remain intact");
         drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Review W2-6: staging names left by a killed process with this PID do
+    /// not fail the write. They are stepped over, never opened or removed,
+    /// and the published file is private.
+    #[test]
+    fn a_leftover_staging_file_does_not_fail_an_atomic_write() {
+        let dir = std::env::temp_dir().join(format!("bloch-store-stale-stage-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("finality_latch.bin");
+        // Other tests draw from the same sequence concurrently, so occupy a
+        // run of the names that follow instead of exactly the next one.
+        let from = staging_sequence();
+        let leftovers: Vec<PathBuf> = (from..from + 200)
+            .map(|n| dir.join(format!("finality_latch.bin.write-{}-{n}.tmp", std::process::id())))
+            .collect();
+        for path in &leftovers {
+            fs::write(path, b"left by a killed process").unwrap();
+        }
+        atomic_private_write(&destination, b"record").expect("a leftover staging file must not fail the write");
+        assert_eq!(fs::read(&destination).unwrap(), b"record");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&destination).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        for path in &leftovers {
+            assert_eq!(fs::read(path).unwrap(), b"left by a killed process", "a leftover is not touched");
+        }
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), leftovers.len() + 1, "no staging file of this write remains");
         let _ = fs::remove_dir_all(dir);
     }
 

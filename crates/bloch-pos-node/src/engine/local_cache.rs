@@ -662,6 +662,43 @@ mod tests {
         assert_eq!(*engine.state, expected[2], "and lands on the genesis replay's state");
     }
 
+    /// W2-8 (4): after a cache restart with the finality latch restored (as
+    /// `reconcile_finalized_latch` does at boot), the bodies below it are
+    /// released. A replay from the base anchor then reads those blocks back
+    /// from the block log and reaches the same state.
+    #[test]
+    fn an_anchored_replay_after_a_cache_restart_reads_released_bodies_from_the_log() {
+        let (mut engine, dir) = perf_support::proposing_engine();
+        engine.live = false;
+        extend_and_cache(&mut engine, 1..=10);
+        extend_and_cache(&mut engine, 11..=20);
+        engine.finalized_latch = Some((15, *engine.chain[15].1.as_bytes()));
+        extend_and_cache(&mut engine, 21..=30);
+        let mut logged = extend_and_cache(&mut engine, 31..=40);
+        assert_eq!(peek_cache(&dir.0.join(ANCHOR)).map(|(_, count)| count), Some(10));
+        let id_at = |engine: &Engine, h: usize| *engine.chain[h].1.as_bytes();
+        let targets = [12usize, 14];
+        let expected: Vec<CommittedState> =
+            targets.iter().map(|&h| engine.replay_to(id_at(&engine, h))).collect();
+
+        reset(&mut engine);
+        engine.reorg_anchors = Default::default();
+        assert_eq!(engine.restore_local_cache(&mut logged).unwrap(), 40);
+        assert_eq!(engine.reorg_anchors.base.as_ref().map(|a| a.0), Some(10));
+        engine.finalized_latch = Some((15, id_at(&engine, 15)));
+        engine.hollow_finalized_bodies();
+        for h in 1..15 {
+            assert!(engine.blocks.is_hollow(&id_at(&engine, h)), "height {h}: body released below the latch");
+        }
+        for (&h, want) in targets.iter().zip(&expected) {
+            assert_eq!(
+                *engine.state_at_canonical(id_at(&engine, h)),
+                *want,
+                "height {h}: the anchored replay over released bodies differs"
+            );
+        }
+    }
+
     /// A boot that replayed the whole log writes the base anchor it holds,
     /// so the next restart from the cache has one before any generation was
     /// rotated into place.

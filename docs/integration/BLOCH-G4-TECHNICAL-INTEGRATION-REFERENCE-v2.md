@@ -269,6 +269,19 @@ three in-rules cuts). Since 2026-09-05 (finding F-03), an engine-level
   log at boot. If the log does not hold the recorded checkpoint at its
   height, the node refuses to start and names the checkpoint; the override
   above discards the record instead (`engine/finality_latch.rs`).
+  - A record that cannot be read or decoded is refused the same way (exit
+    status 78, not retried by a supervisor). The message prints the full path.
+    The remedy is to remove that one file (`rm <data-dir>/finality_latch.bin`)
+    and start again with the same flags; the node then writes a new record
+    from the checkpoint its block log finalizes. Starting once with
+    `--allow-finality-rewind` also discards it, but lifts the latch for that
+    whole run.
+  - A deliberate resync from an empty or replaced block log needs the same:
+    remove `finality_latch.bin` together with the log, or start once with the
+    override.
+  - After a rewind the override allowed, the record is rewritten to match the
+    chain the node is then on (or removed if that chain has finalized
+    nothing), so the override can be taken out again before the next restart.
 
 <div class="warn">
 

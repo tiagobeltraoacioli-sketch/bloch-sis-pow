@@ -1083,6 +1083,11 @@ const SIDE_BRANCH_STARTS_PER_SLOT: usize = 2;
 const SIDE_BRANCH_MAX_DEPTH: usize =
     64 * bloch_pos_committee::params::SLOTS_PER_EPOCH as usize;
 
+/// Cap on the side-branch blocks remembered as having failed the transition
+/// ([`SideValidation::failed`], review W2-5). Same order as
+/// [`MAX_PARKED_REFUSED_FINALITY`]: 32 bytes each, oldest forgotten first.
+const SIDE_BRANCH_FAILED_REMEMBERED: usize = 512;
+
 /// One retained canonical post-state: `(canonical height, block id, state)`.
 type ReorgAnchor = (usize, [u8; 32], Arc<CommittedState>);
 
@@ -1155,6 +1160,37 @@ struct SideValidation {
     /// Inventory revision and head at which the last scan found nothing to
     /// validate, so an unchanged store is not rescanned every turn.
     idle: Option<(u64, [u8; 32])>,
+    /// Side-branch blocks this fold ran through the transition and that
+    /// failed it (review W2-5), oldest first, at most
+    /// [`SIDE_BRANCH_FAILED_REMEMBERED`]. Such a block is removed from the
+    /// store, but admission stores it again when a peer offers it again,
+    /// and reaching its fork point's state can cost up to
+    /// [`REORG_ANCHOR_REFRESH_BLOCKS`] canonical re-executions each time. A
+    /// remembered block, and everything stored above it, is no longer a
+    /// candidate of [`Engine::side_branch_candidate`].
+    ///
+    /// This only withholds the OPTIONAL validation work. It is not consulted
+    /// by admission, fork choice or `do_reorg`, so it can never make this
+    /// node refuse to store or adopt a block; a block's verdict is a pure
+    /// function of the block and its ancestry, so the remembered verdict is
+    /// the one a second run would reach. In memory only.
+    failed: VecDeque<[u8; 32]>,
+    /// The same ids, for the lookup the candidate walk makes per block.
+    failed_index: std::collections::HashSet<[u8; 32]>,
+}
+
+impl SideValidation {
+    fn remember_failed(&mut self, id: [u8; 32]) {
+        if !self.failed_index.insert(id) {
+            return;
+        }
+        while self.failed.len() >= SIDE_BRANCH_FAILED_REMEMBERED {
+            if let Some(oldest) = self.failed.pop_front() {
+                self.failed_index.remove(&oldest);
+            }
+        }
+        self.failed.push_back(id);
+    }
 }
 
 /// The `(canonical height, block id)` of the state-cache generations this
@@ -2250,7 +2286,10 @@ struct Engine {
     /// The finality latch (finding F-03): the highest finalized checkpoint
     /// this node has EVER adopted, as `(canonical height, root)`. Ratcheted
     /// forward by [`Engine::ratchet_finalized`], never lowered, and consulted
-    /// by [`Engine::cut_below_finalized_latch`] before any reorg.
+    /// by [`Engine::cut_below_finalized_latch`] before any reorg. (One
+    /// exception, review W2-1: a rewind the operator override allowed takes
+    /// the latch block off the chain, and `do_reorg` then lets the latch
+    /// fall back to the fork point.)
     ///
     /// This is deliberately NOT `self.state.finality().finalized`: that value
     /// lives in replayed state, so a reorg REPLACES it — which is exactly how
@@ -6727,6 +6766,9 @@ impl Engine {
             self.refuse_finality_rewind(latch, &branch);
             return false;
         }
+        // Not refused although the cut is below the latch: the operator's
+        // rewind override admitted it (review W2-1, used at the adoption).
+        let rewinds_latch = self.finalized_latch.is_some_and(|(floor, _)| (cut as u64) < floor);
 
         // Only under the operator's rewind override can the cut fall below
         // released bodies; those blocks are about to leave the canonical
@@ -6858,6 +6900,19 @@ impl Engine {
         // FURTHER than the old branch did — ratchet up if so. It may equally
         // report LESS (a fork-point state always does); the ratchet ignores
         // that, which is what keeps the latch monotone across reorgs.
+        if rewinds_latch {
+            // Review W2-1: the override rewound below the latch, so the
+            // latch block left the canonical chain. Keeping it would leave
+            // `finality_latch.bin` naming the abandoned block (the next
+            // start without the override is then refused) and would release
+            // bodies of the adopted branch as if they were finalized. The
+            // fork point is the highest block of the old finalized prefix
+            // that is still canonical: the latch falls back to it, the
+            // ratchet below raises it to whatever the adopted state
+            // finalizes, and the stored record follows once the rewrite is
+            // published (`replace_rewound_stored_latch`).
+            self.finalized_latch = (cut > 0).then_some((cut as u64, ancestor));
+        }
         self.ratchet_finalized();
         self.retain_reorg_anchors();
         let cur_e = epoch_of(self.state.slot());
@@ -6950,11 +7005,14 @@ impl Engine {
         };
         let latch = self.finalized_latch.map_or(0, |(h, _)| usize::try_from(h).unwrap_or(usize::MAX));
         let floor = latch.max(height(&self.state.finality().justified.root));
+        // W2-5: a block that already failed the transition here is not
+        // judged again, and nothing above it is reachable.
+        let failed = &self.reorg_anchors.side.failed_index;
         type Rank = (usize, usize, std::cmp::Reverse<[u8; 32]>);
         let mut best: Option<(Rank, usize, Vec<[u8; 32]>)> = None;
         for (fork_height, (_, fork)) in self.chain.iter().enumerate().skip(floor) {
             for child in self.blocks.children_of(fork.as_bytes()) {
-                if self.canonical.contains(child) {
+                if self.canonical.contains(child) || failed.contains(child) {
                     continue;
                 }
                 // Depth-first below `child`. `path` is the branch from the
@@ -6984,12 +7042,15 @@ impl Engine {
                         if let Some(top) = stack.last_mut() {
                             top.1 = next.saturating_add(1);
                         }
-                        enter = Some(*kid);
+                        if !failed.contains(kid) {
+                            enter = Some(*kid);
+                        }
                         continue;
                     }
                     // Leaving `id`. It ends a branch when it has no stored
-                    // child, or when the depth limit stops the walk here.
-                    if (kids.is_empty() || !within_depth) && unvalidated > 0 {
+                    // child (one that failed before counts as none), or when
+                    // the depth limit stops the walk here.
+                    if (kids.iter().all(|kid| failed.contains(kid)) || !within_depth) && unvalidated > 0 {
                         let rank: Rank = (proposers.len(), path.len(), std::cmp::Reverse(id));
                         if best.as_ref().is_none_or(|(held, ..)| rank > *held) {
                             best = Some((rank, fork_height, path.clone()));
@@ -7212,6 +7273,7 @@ impl Engine {
                             crate::codec::hex8(&id),
                         ));
                         self.blocks.remove(&id);
+                        self.reorg_anchors.side.remember_failed(id);
                         break;
                     }
                 }
@@ -9898,6 +9960,20 @@ impl KesSigner {
                 self.next = Some(std::mem::replace(&mut self.key, old));
             }
             self.rotation_submitted = None;
+            // Review W2-2 (reported, not changed here): a successor that was
+            // in force for more than one period has erased its first leaves.
+            // Submitted again it starts at leaf 0 on chain and cannot sign
+            // until the chain reaches the leaf it holds. It is kept, because
+            // the branch that made it the key in force can still win.
+            if let Some(leaf) = self.next.as_ref().map(|next| next.period()).filter(|leaf| *leaf > 0) {
+                eprintln!(
+                    "KES WARNING: the successor put back in {} was already evolved to leaf {leaf}. \
+                     If it is rotated in again it cannot sign for its first {leaf} period(s) \
+                     after that handover. It is kept because the branch on which it was the \
+                     key in force can still win; this needs an operator's attention.",
+                    crate::kes_key::NEXT_FILE_NAME
+                );
+            }
             println!(
                 "KES handover reorganized out: the chain names the replaced key (root {}) again; {} \
                  restored and the successor is back in {}",
@@ -9918,8 +9994,13 @@ impl KesSigner {
     ///   epoch of the successor's start period: a `KesRotate` is only valid
     ///   in a block of an earlier period, so that block is an ancestor of
     ///   the finalized one and this node does not reorganize below it.
-    /// - Destroyed when the old tree no longer covers the period (expired):
-    ///   it could sign nothing even if the handover were undone.
+    /// - Destroyed when the finalized checkpoint is at or past the first
+    ///   epoch after the old tree's last period (expired): it could sign
+    ///   nothing on any chain this node can still follow. Judged by the
+    ///   finalized epoch like the rule above, never by the duty or wall
+    ///   period (review W2-4): erasure cannot be undone, and a clock that
+    ///   jumped forward must not destroy the key a reorg of the unfinalized
+    ///   handover would need.
     /// - Otherwise evolved to the old tree's leaf for the period, under the
     ///   same clock-jump rule as the key in force (review F-5), so it holds
     ///   no seed of a past period.
@@ -9945,7 +10026,10 @@ impl KesSigner {
             .chain(entry.retired.iter().rev().map(|r| r.public))
             .find(|public| public.same_tree(&old_tree));
         let leaf = on_chain.and_then(|public| public.leaf_index(period));
-        let expired = on_chain.is_some_and(|public| period >= public.end_period());
+        let expired = on_chain.is_some_and(|public| {
+            finalized_epoch
+                >= schedule.activation_epoch.saturating_add(public.end_period().saturating_mul(schedule.period_epochs))
+        });
         if finalized_epoch >= handover_epoch || expired {
             match crate::kes_key::shred_retired(&self.dir) {
                 Ok(()) => {
