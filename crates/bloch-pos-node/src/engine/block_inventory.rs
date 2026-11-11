@@ -25,6 +25,14 @@
 //! reorg takes it off the canonical chain, exactly as before. A block that is
 //! stored and not yet applied contributes its parent edge and nothing else;
 //! its branch gains weight from the signature-checked attestation pool.
+//!
+//! The inventory also remembers WHICH stored blocks passed the transition
+//! ([`BlockInventory::is_validated`]), including those that carry no
+//! attestations. The engine's bounded side-branch validation (finding V1-1)
+//! reads it to find stored blocks whose bodies were never judged, and it is
+//! the only other caller of [`BlockInventory::mark_validated`]: a side-branch
+//! block is marked after the same full transition, run on a state folded from
+//! its fork point, so the rule above is unchanged.
 
 use super::{Attestation, BlockEnvelope, BlockTree, FcStore, LatestMessage};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -46,6 +54,16 @@ pub(super) struct BlockInventory {
     /// index did not change in between, which is what lets `advance` reuse a
     /// head across a turn that validated nothing.
     vote_generation: u64,
+    /// Stored blocks that passed the state transition and still hold their
+    /// body: canonical blocks above the finality latch, blocks a reorg took
+    /// off the canonical chain, and side-branch blocks validated without
+    /// being adopted. A released body leaves this set (it is in `hollow`,
+    /// which implies validated), so the set is bounded by the unfinalized
+    /// window and never grows with the chain.
+    validated: HashSet<Root>,
+    /// Bumped whenever a block is stored or removed. Lets the engine skip a
+    /// rescan of the stored side branches when nothing was stored since.
+    revision: u64,
     /// Finalized canonical blocks whose body and proposer signature were
     /// released from memory (see [`BlockInventory::hollow`]). Their header,
     /// parent edge and vote index stay, so fork choice is unchanged; the full
@@ -83,6 +101,7 @@ impl BlockInventory {
             .expect_err("removed block must not remain indexed");
         children.insert(at, id);
         self.blocks.insert(id, block);
+        self.revision = self.revision.saturating_add(1);
         previous
     }
 
@@ -104,6 +123,7 @@ impl BlockInventory {
             return false;
         }
         let Some(block) = self.blocks.get(id) else { return false };
+        self.validated.insert(*id);
         if block.body.attestations.is_empty() {
             return false;
         }
@@ -129,6 +149,24 @@ impl BlockInventory {
     /// A counter that changes whenever the vote index does.
     pub(super) fn vote_generation(&self) -> u64 {
         self.vote_generation
+    }
+
+    /// Whether the stored block `id` passed the state transition (was marked
+    /// by [`BlockInventory::mark_validated`], or had its body released, which
+    /// only happens to validated blocks). False for a block that is not
+    /// stored.
+    pub(super) fn is_validated(&self, id: &Root) -> bool {
+        self.validated.contains(id) || self.hollow.contains(id)
+    }
+
+    /// Ids of the stored blocks whose parent is `id`, ascending.
+    pub(super) fn children_of(&self, id: &Root) -> &[Root] {
+        self.children.get(id).map_or(&[], Vec::as_slice)
+    }
+
+    /// A counter that changes whenever a block is stored or removed.
+    pub(super) fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Whether `id` currently contributes body votes to fork choice.
@@ -162,6 +200,7 @@ impl BlockInventory {
         if !self.hollow.insert(*id) {
             return false;
         }
+        self.validated.remove(id);
         block.proposer_sig = Vec::new();
         block.body.transactions = Vec::new();
         block.body.attestations = Vec::new();
@@ -176,6 +215,8 @@ impl BlockInventory {
     pub(super) fn remove(&mut self, id: &Root) -> Option<BlockEnvelope> {
         let block = self.blocks.remove(id)?;
         self.hollow.remove(id);
+        self.validated.remove(id);
+        self.revision = self.revision.saturating_add(1);
         let parent = block.header.parent;
         if let Some(children) = self.children.get_mut(&parent) {
             if let Ok(at) = children.binary_search(id) {
@@ -200,6 +241,8 @@ impl BlockInventory {
         self.votes.clear();
         self.vote_generation = self.vote_generation.saturating_add(1);
         self.hollow.clear();
+        self.validated.clear();
+        self.revision = self.revision.saturating_add(1);
     }
 
     /// Only descendants of the walk's starting checkpoint can affect the

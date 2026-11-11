@@ -92,6 +92,17 @@
 //! parent edge to the tree and no weight; `BlockInventory::mark_validated`
 //! is what the apply, reorg and boot paths call to count a body. See
 //! `engine/block_inventory.rs`.
+//!
+//! That rule alone strands a node on the wrong side of a fork whose two
+//! branches disagree on the validator set (finding V1-1): the other branch's
+//! gossip votes are judged against this node's roster and are never pooled,
+//! its body votes do not count until it is applied, and it is applied only
+//! if fork choice selects it. `Engine::validate_side_branch_turn` closes the
+//! loop without reopening FC-1: in bounded slices it runs the real
+//! transition over a stored side branch from its fork point, WITHOUT
+//! adopting it, and marks the blocks that pass. Their votes then weigh like
+//! any validated block's, and `advance` reorganises if the branch is
+//! heavier.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -1050,6 +1061,28 @@ const KES_AUTHORITY_WINDOW: usize = 4096;
 const REORG_ANCHOR_REFRESH_BLOCKS: usize =
     8 * bloch_pos_committee::params::SLOTS_PER_EPOCH as usize;
 
+/// Block applications one slot-loop turn may spend validating a stored side
+/// branch (finding V1-1, [`Engine::validate_side_branch_turn`]), so a turn
+/// never delays a duty by more than this many transitions.
+const SIDE_BRANCH_BLOCKS_PER_TURN: usize = 2;
+/// Block applications one WALL SLOT may spend on it. Canonical blocks
+/// re-executed to reach a fork point's state count like branch blocks.
+const SIDE_BRANCH_BLOCKS_PER_SLOT: usize = 16;
+/// Share of a wall slot it may occupy: once a slot has spent
+/// `slot_ms / SIDE_BRANCH_SLOT_SHARE` in it, no further block is started in
+/// that slot (the first block of a slot always may be, so slow blocks still
+/// make progress).
+const SIDE_BRANCH_SLOT_SHARE: u64 = 4;
+/// Times per wall slot the fold may start anywhere but where it last
+/// stopped, i.e. take up a different branch. Each such start may need the
+/// fork point's state rebuilt and replaces the one retained cursor state.
+const SIDE_BRANCH_STARTS_PER_SLOT: usize = 2;
+/// Blocks above its fork point up to which a side branch is validated.
+/// Sixty-four epochs of a branch carry every vote its validators cast in
+/// that time; a branch that is not the heavier one by then is left alone.
+const SIDE_BRANCH_MAX_DEPTH: usize =
+    64 * bloch_pos_committee::params::SLOTS_PER_EPOCH as usize;
+
 /// One retained canonical post-state: `(canonical height, block id, state)`.
 type ReorgAnchor = (usize, [u8; 32], Arc<CommittedState>);
 
@@ -1084,10 +1117,56 @@ type ReorgAnchor = (usize, [u8; 32], Arc<CommittedState>);
 /// its block id at its height, so a stale entry can cost speed and never
 /// correctness: a block's post-state is a pure function of the block and its
 /// ancestry (see [`Engine::recent_states`]).
+///
+/// After a boot that restored the state cache none of the cached prefix was
+/// applied, so both are seeded by the restore instead (PER-4): `pending`
+/// with the restored state, `base` from the anchor generation kept on disk
+/// next to the cache. See `engine/local_cache.rs`.
 #[derive(Default)]
 struct ReorgAnchors {
     base: Option<ReorgAnchor>,
     pending: Option<ReorgAnchor>,
+    /// Which state-cache generations on disk this process wrote, so one of
+    /// them can be kept as the anchor generation (PER-4).
+    cached: CachedGenerations,
+    /// Progress and budget of side-branch validation (V1-1).
+    side: SideValidation,
+}
+
+/// What [`Engine::validate_side_branch_turn`] keeps between turns.
+#[derive(Default)]
+struct SideValidation {
+    /// Post-state of the block the last fold stopped at, keyed by block id
+    /// like [`Engine::recent_states`]: a canonical block on the way to a
+    /// fork point, or a side-branch block that passed the transition. The
+    /// ONE state this feature retains; dropped when no side branch is left
+    /// to validate.
+    cursor: Option<([u8; 32], Arc<CommittedState>)>,
+    /// Wall slot the three counters below belong to.
+    slot: u64,
+    /// Block applications spent in `slot`.
+    spent: usize,
+    /// Wall time spent in `slot`, in milliseconds.
+    spent_ms: u64,
+    /// Folds started in `slot` that did not resume from `cursor`.
+    starts: usize,
+    /// A start was refused in `slot`; nothing more is tried in it.
+    closed: bool,
+    /// Inventory revision and head at which the last scan found nothing to
+    /// validate, so an unchanged store is not rescanned every turn.
+    idle: Option<(u64, [u8; 32])>,
+}
+
+/// The `(canonical height, block id)` of the state-cache generations this
+/// process wrote: `state.cache`, `state.cache.previous` and
+/// `state.cache.anchor.next`. `None` for a file left by an earlier run,
+/// which is never moved because its block cannot be checked against the
+/// chain without decoding it.
+#[derive(Clone, Copy, Default)]
+struct CachedGenerations {
+    current: Option<(usize, [u8; 32])>,
+    previous: Option<(usize, [u8; 32])>,
+    waiting: Option<(usize, [u8; 32])>,
 }
 
 /// Released finalized bodies after which [`return_freed_heap_to_os`] runs.
@@ -1856,6 +1935,9 @@ mod ws_lifecycle_tests;
 mod l2_async_admission_tests;
 
 mod local_cache;
+mod finality_latch;
+#[cfg(test)]
+mod side_branch_tests;
 mod verification;
 mod finality_cert;
 #[cfg(test)]
@@ -2128,9 +2210,15 @@ struct Engine {
     /// This is deliberately NOT `self.state.finality().finalized`: that value
     /// lives in replayed state, so a reorg REPLACES it — which is exactly how
     /// the measured finalized 6 -> 4 -> 2 -> 0 rewind happened. The latch is
-    /// engine-owned and survives every state swap. In-memory only: on boot it
-    /// is rebuilt by the replay of this node's own log, which re-finalizes
-    /// the same checkpoints in the same order.
+    /// engine-owned and survives every state swap.
+    ///
+    /// It also survives a restart (finding PER-3). Boot replay rebuilds it
+    /// only as far as the LOGGED chain's own states finalize, which after a
+    /// reorg that dropped the finalizing votes is lower than what this node
+    /// had latched. The latch is therefore mirrored to `finality_latch.bin`
+    /// and reconciled with the replayed chain at boot; see
+    /// `engine/finality_latch.rs` for when it is written and what a
+    /// disagreement does.
     finalized_latch: Option<(u64, [u8; 32])>,
     /// Reorgs refused because they would have cut canonical history below
     /// the latch. A rewind an operator cannot see is a rewind that gets
@@ -5740,6 +5828,7 @@ impl Engine {
             proposer_sig: env.proposer_sig.clone(),
         };
         let before = self.state.finality();
+        let latch_before = self.finalized_latch;
         let txs = match body_transactions(env) {
             Ok(t) => t,
             Err(e) => {
@@ -5826,6 +5915,12 @@ impl Engine {
                         );
                         eprintln!("FATAL: block log append failed: {e}");
                         std::process::exit(1);
+                    }
+                    // PER-3: the log is durable through this block, so the
+                    // checkpoint it finalized (an ancestor) is on disk. Mirror
+                    // a raised latch now, so a restart cannot rebuild it lower.
+                    if self.finalized_latch != latch_before {
+                        self.persist_finalized_latch();
                     }
                     if self.chain.len().checked_sub(1)
                         .and_then(|height| height.checked_rem(local_cache::INTERVAL)) == Some(0)
@@ -6027,7 +6122,8 @@ impl Engine {
             // Free when taken: the live state, kept by handle.
             pending = Some((head, *self.head_id().as_bytes(), self.state.arc()));
         }
-        self.reorg_anchors = ReorgAnchors { base, pending };
+        self.reorg_anchors.base = base;
+        self.reorg_anchors.pending = pending;
     }
 
     /// The highest retained anchor at canonical height `cut` or below that is
@@ -6557,6 +6653,339 @@ impl Engine {
         // accepted (or the process fail-stops) before readers see this head.
         self.publish_block_count();
         true
+    }
+
+    // ── Side-branch validation (finding V1-1) ───────────────────────────────
+
+    /// One block through the real transition on `pre`: the same call, with
+    /// the same signature-checking verifier, that `apply_canonical` and
+    /// `do_reorg` make. Nothing is adopted.
+    fn transition_on(&self, pre: &CommittedState, env: &BlockEnvelope) -> Result<CommittedState, String> {
+        let envelope = ProposalEnvelope {
+            header: env.header.clone(),
+            proposer_sig: env.proposer_sig.clone(),
+        };
+        let txs = body_transactions(env).map_err(|e| e.to_string())?;
+        self.tr
+            .apply_block(pre, &envelope, &env.body.attestations, &txs)
+            .map_err(|e| format!("{e:?}"))
+    }
+
+    /// The stored side branch to validate next: the canonical height it
+    /// forks at and its blocks, fork-point child first. `None` when every
+    /// stored block within reach has already passed the transition.
+    ///
+    /// **Which blocks.** Only blocks in `self.blocks`: admission stores a
+    /// block after its proposer signature verified and its parent is known,
+    /// so nothing unauthenticated or unconnected (the orphan and
+    /// future-block pools) is ever a candidate. Only branches fork choice
+    /// could select and a reorg could adopt: the fork point is at or above
+    /// both the finality latch and the justified checkpoint the fork-choice
+    /// walk starts from. Never below the latch. Blocks deeper than
+    /// [`SIDE_BRANCH_MAX_DEPTH`] above the fork point are not looked at.
+    ///
+    /// **Which branch first.** The tip whose path from the fork point was
+    /// signed by the most DISTINCT proposers, then the longer path, then the
+    /// lower tip id. Admission bounds how many variants one key can store
+    /// per slot, not how many slots it signs, so length alone is cheap for a
+    /// single key; a path many validators built is not. A branch the rest of
+    /// the network is on outranks anything a few keys can assemble.
+    ///
+    /// Cost: one walk of the stored non-canonical blocks above the floor,
+    /// which is what every fork-choice run already walks.
+    fn side_branch_candidate(&self) -> Option<(usize, Vec<[u8; 32]>)> {
+        let height = |root: &[u8; 32]| {
+            self.height_of(root).map_or(0, |h| usize::try_from(h).unwrap_or(usize::MAX))
+        };
+        let latch = self.finalized_latch.map_or(0, |(h, _)| usize::try_from(h).unwrap_or(usize::MAX));
+        let floor = latch.max(height(&self.state.finality().justified.root));
+        type Rank = (usize, usize, std::cmp::Reverse<[u8; 32]>);
+        let mut best: Option<(Rank, usize, Vec<[u8; 32]>)> = None;
+        for (fork_height, (_, fork)) in self.chain.iter().enumerate().skip(floor) {
+            for child in self.blocks.children_of(fork.as_bytes()) {
+                if self.canonical.contains(child) {
+                    continue;
+                }
+                // Depth-first below `child`. `path` is the branch from the
+                // fork point to the block being visited; `proposers` counts
+                // its signers and `unvalidated` its blocks still to judge.
+                let mut path: Vec<[u8; 32]> = Vec::new();
+                let mut proposers: HashMap<u32, usize> = HashMap::new();
+                let mut unvalidated = 0usize;
+                let mut stack: Vec<([u8; 32], usize)> = Vec::new();
+                let mut enter = Some(*child);
+                loop {
+                    if let Some(id) = enter.take() {
+                        if let Some(env) = self.blocks.get(&id) {
+                            let seen = proposers.entry(env.header.proposer_index).or_insert(0);
+                            *seen = seen.saturating_add(1);
+                        }
+                        if !self.blocks.is_validated(&id) {
+                            unvalidated = unvalidated.saturating_add(1);
+                        }
+                        path.push(id);
+                        stack.push((id, 0));
+                    }
+                    let Some(&(id, next)) = stack.last() else { break };
+                    let kids = self.blocks.children_of(&id);
+                    let within_depth = path.len() < SIDE_BRANCH_MAX_DEPTH;
+                    if let (true, Some(kid)) = (within_depth, kids.get(next)) {
+                        if let Some(top) = stack.last_mut() {
+                            top.1 = next.saturating_add(1);
+                        }
+                        enter = Some(*kid);
+                        continue;
+                    }
+                    // Leaving `id`. It ends a branch when it has no stored
+                    // child, or when the depth limit stops the walk here.
+                    if (kids.is_empty() || !within_depth) && unvalidated > 0 {
+                        let rank: Rank = (proposers.len(), path.len(), std::cmp::Reverse(id));
+                        if best.as_ref().is_none_or(|(held, ..)| rank > *held) {
+                            best = Some((rank, fork_height, path.clone()));
+                        }
+                    }
+                    stack.pop();
+                    path.pop();
+                    if let Some(env) = self.blocks.get(&id) {
+                        if let Some(seen) = proposers.get_mut(&env.header.proposer_index) {
+                            *seen = seen.saturating_sub(1);
+                            if *seen == 0 {
+                                proposers.remove(&env.header.proposer_index);
+                            }
+                        }
+                    }
+                    if !self.blocks.is_validated(&id) {
+                        unvalidated = unvalidated.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        best.map(|(_, fork_height, path)| (fork_height, path))
+    }
+
+    /// Validate a bounded slice of a stored side branch WITHOUT adopting it
+    /// (finding V1-1). Returns whether a block was newly validated.
+    ///
+    /// **Why.** Since FC-1 a stored block's body votes count only once the
+    /// block passed the transition, and a block is applied only if fork
+    /// choice selects its branch. A branch whose validator set differs from
+    /// this node's (a deposit activated, a validator slashed or exited on
+    /// one side only) cannot gain weight any other way either: its gossip
+    /// votes are judged against this node's roster, come out
+    /// `NotInCommittee` and are never pooled. Such a node stayed on its
+    /// branch until it was resynchronised by hand. Here the branch is run
+    /// through the transition from its fork point, so its body votes become
+    /// eligible, and `advance` then reorganises if it is the heavier one.
+    ///
+    /// **FC-1 is unchanged.** A block is marked validated only after
+    /// [`Engine::transition_on`] returned `Ok` for it on its own parent's
+    /// post-state, and that state is the fork point's canonical state (the
+    /// ring, a [`ReorgAnchors`] entry, or a replay of canonical blocks from
+    /// one) folded through the branch block by block. That is the fold
+    /// `do_reorg` runs, with the same verifier. A block that fails is
+    /// removed, exactly as a reorg removes it, and nothing above it is
+    /// reached. No vote of a block that has not passed the full transition
+    /// is ever indexed.
+    ///
+    /// **Bounds.** Nothing a peer sends can make this exceed them:
+    ///
+    /// - at most [`SIDE_BRANCH_BLOCKS_PER_TURN`] block applications per call
+    ///   and [`SIDE_BRANCH_BLOCKS_PER_SLOT`] per wall slot, canonical blocks
+    ///   replayed to reach the fork point included, and no new block once a
+    ///   slot has spent `slot_ms / SIDE_BRANCH_SLOT_SHARE` here;
+    /// - one branch per call, chosen by [`Engine::side_branch_candidate`],
+    ///   and at most [`SIDE_BRANCH_STARTS_PER_SLOT`] changes of branch per
+    ///   wall slot;
+    /// - one retained state, the cursor, which is what makes the budget
+    ///   resumable: a long branch, or a fork point far above the nearest
+    ///   anchor, is worked through over several slots instead of in one
+    ///   stall. No per-block states are kept;
+    /// - fork points at or above the finality latch only, and at most
+    ///   [`SIDE_BRANCH_MAX_DEPTH`] blocks above the fork point.
+    ///
+    /// Node-local: it changes which stored blocks this node has judged, and
+    /// through that which branch it follows. No block it refuses is one the
+    /// consensus rules accept, because the refusal IS the transition's.
+    fn validate_side_branch_turn(&mut self, wall_slot: u64) -> bool {
+        if !self.live {
+            return false;
+        }
+        // Nothing but the canonical chain is stored (genesis is not): the
+        // common case, decided without a walk.
+        if self.blocks.len() < self.chain.len() {
+            self.reorg_anchors.side.cursor = None;
+            return false;
+        }
+        let key = (self.blocks.revision(), *self.head_id().as_bytes());
+        let slot_share_ms = self.manifest.slot_ms / SIDE_BRANCH_SLOT_SHARE;
+        {
+            let side = &mut self.reorg_anchors.side;
+            if side.slot != wall_slot {
+                side.slot = wall_slot;
+                side.spent = 0;
+                side.spent_ms = 0;
+                side.starts = 0;
+                side.closed = false;
+            }
+            if side.idle == Some(key)
+                || side.closed
+                || side.spent >= SIDE_BRANCH_BLOCKS_PER_SLOT
+                || (side.spent > 0 && side.spent_ms >= slot_share_ms)
+            {
+                return false;
+            }
+        }
+        let Some((fork_height, path)) = self.side_branch_candidate() else {
+            let side = &mut self.reorg_anchors.side;
+            side.idle = Some(key);
+            side.cursor = None;
+            return false;
+        };
+
+        // Where the fold starts. Best: where the last one stopped, on this
+        // branch. Otherwise the highest canonical state held at or below the
+        // fork point (the ring, an anchor, or the cursor left on the
+        // canonical chain by an unfinished replay), and genesis when there
+        // is none, as for a reorg.
+        let cursor = self.reorg_anchors.side.cursor.clone();
+        // (The cursor is taken on the branch only when everything up to it
+        // is still marked validated; otherwise the fold starts below and
+        // judges those blocks again.)
+        let on_path = cursor.as_ref().and_then(|(id, st)| {
+            let at = path.iter().rposition(|p| p == id)?;
+            path.iter()
+                .take(at.saturating_add(1))
+                .all(|p| self.blocks.is_validated(p))
+                .then(|| (at, Arc::clone(st)))
+        });
+        let mut start: Option<(usize, Arc<CommittedState>, bool)> = None;
+        if on_path.is_none() {
+            let mut offer = |height: Option<u64>, st: &Arc<CommittedState>, is_cursor: bool| {
+                let Some(height) = height.and_then(|h| usize::try_from(h).ok()) else { return };
+                if height <= fork_height && start.as_ref().is_none_or(|(held, ..)| height > *held) {
+                    start = Some((height, Arc::clone(st), is_cursor));
+                }
+            };
+            for (id, st) in &self.recent_states {
+                offer(self.height_of(id), st, false);
+            }
+            if let Some((height, _, st)) = self.reorg_anchor_at_or_below(fork_height) {
+                offer(Some(height as u64), &st, false);
+            }
+            if let Some((id, st)) = &cursor {
+                offer(self.height_of(id), st, true);
+            }
+        }
+        let resumed = on_path.is_some() || start.as_ref().is_some_and(|(.., is_cursor)| *is_cursor);
+        if !resumed {
+            let side = &mut self.reorg_anchors.side;
+            if side.starts >= SIDE_BRANCH_STARTS_PER_SLOT {
+                // No further branch this slot: the remaining turns return
+                // before the walk above instead of repeating it.
+                side.closed = true;
+                return false;
+            }
+            side.starts = side.starts.saturating_add(1);
+        }
+        // `next_height` is the next canonical height to replay (none once it
+        // is past the fork point), `next_side` the next block of `path`.
+        let (mut state, mut next_height, mut next_side) = match (on_path, start) {
+            (Some((at, st)), _) => (st, fork_height.saturating_add(1), at.saturating_add(1)),
+            (None, Some((height, st, _))) => (st, height.saturating_add(1), 0),
+            (None, None) => (Arc::new(self.manifest.genesis_state()), 1, 0),
+        };
+
+        let budget = SIDE_BRANCH_BLOCKS_PER_TURN
+            .min(SIDE_BRANCH_BLOCKS_PER_SLOT.saturating_sub(self.reorg_anchors.side.spent));
+        let started = std::time::Instant::now();
+        let mut done = 0usize;
+        let mut stopped_at: Option<[u8; 32]> = None;
+        let mut newly_validated = false;
+        // A canonical block that would not replay: a local fault. Nothing is
+        // retried until the store or the head changes.
+        let mut stuck = false;
+        while done < budget {
+            if next_height <= fork_height {
+                // A canonical block on the way to the fork point. It applied
+                // before, so a failure here is a local fault (a released body
+                // the log no longer serves); give the turn up, adopt nothing.
+                let Some(id) = self.chain.get(next_height).map(|(_, id)| *id.as_bytes()) else { break };
+                let replayed = if self.blocks.is_hollow(&id) {
+                    let mut post = None;
+                    self.read_logged_canonical(next_height, next_height.saturating_add(1), |env| {
+                        post = Some(self.transition_on(&state, &env));
+                    })
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| post.unwrap_or_else(|| Err("block log returned no block".into())))
+                } else {
+                    match self.blocks.get(&id) {
+                        Some(env) => self.transition_on(&state, env),
+                        None => Err("canonical block is not stored".into()),
+                    }
+                };
+                done = done.saturating_add(1);
+                match replayed {
+                    Ok(post) => {
+                        state = Arc::new(post);
+                        stopped_at = Some(id);
+                        next_height = next_height.saturating_add(1);
+                    }
+                    Err(why) => {
+                        eprintln!(
+                            "side-branch validation: canonical block {} at height {next_height} did not replay: {why}",
+                            crate::codec::hex8(&id),
+                        );
+                        stuck = true;
+                        break;
+                    }
+                }
+            } else if let Some(id) = path.get(next_side).copied() {
+                let verdict = match self.blocks.get(&id) {
+                    Some(env) => self.transition_on(&state, env),
+                    None => break,
+                };
+                done = done.saturating_add(1);
+                match verdict {
+                    Ok(post) => {
+                        // The whole of FC-1's obligation: this block passed
+                        // the full transition on its own parent's post-state.
+                        newly_validated |= !self.blocks.is_validated(&id);
+                        self.blocks.mark_validated(&id);
+                        state = Arc::new(post);
+                        stopped_at = Some(id);
+                        next_side = next_side.saturating_add(1);
+                    }
+                    Err(why) => {
+                        crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
+                            "side-branch candidate {} invalid: {why}",
+                            crate::codec::hex8(&id),
+                        ));
+                        self.blocks.remove(&id);
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        let side = &mut self.reorg_anchors.side;
+        if stuck {
+            side.idle = Some(key);
+        }
+        side.spent = side.spent.saturating_add(done);
+        side.spent_ms = side
+            .spent_ms
+            .saturating_add(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        if let Some(id) = stopped_at {
+            side.cursor = Some((id, state));
+        }
+        if newly_validated {
+            // The branch's body votes count from here. Let fork choice see
+            // them; if the branch is the heavier one this is the reorg.
+            self.advance();
+            self.prune_below_finalized();
+        }
+        newly_validated
     }
 
     // ── Attestation admission, through the pure crate's gossip policy ───────
@@ -7983,6 +8412,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
     println!("recovery: mode={} skipped_blocks={skipped} replayed_blocks={n_logged} elapsed_ms={}",
         if skipped > 0 { "local-cache" } else { "full-replay" }, recovery_started.elapsed().as_millis());
+    // PER-3: the replayed chain is known. Take the higher of the stored and
+    // the replayed finality latch, or refuse a log the stored one contradicts.
+    engine.reconcile_finalized_latch()?;
     engine.live = true;
     if n_logged > 0 {
         println!(
@@ -8205,6 +8637,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
             eprintln!("state-cache: initial write failed; next restart may require full replay: {e}");
         }
     }
+    // PER-4: a boot that replayed the whole log holds a base reorg anchor in
+    // memory and none on disk until several cache generations have been
+    // written. Write it now, so an early second restart has one.
+    if skipped == 0 {
+        if let Err(e) = engine.seed_anchor_generation() {
+            eprintln!("state-cache: reorg anchor generation not written; a restart may come up without one: {e}");
+        }
+    }
 
     if engine.keys.is_some() {
         if no_doppelganger_check {
@@ -8309,6 +8749,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
     loop {
         match engine.store.poll_rewrite() {
             Ok(true) => {
+                // PER-3: a latch raised by the reorg waited for its branch to
+                // be durable in the log; it is now.
+                engine.persist_finalized_latch();
                 if let Err(e) = engine.write_local_cache() {
                     eprintln!("state-cache: post-reorg write failed; restart may require full replay: {e}");
                 }
@@ -8360,6 +8803,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
             &mut deferred_work_scheduler,
             &mut deferred_block_scheduler,
         );
+        // V1-1: one bounded slice of side-branch validation. A stored branch
+        // this node cannot weigh by gossip (its validator set differs) is
+        // judged by the transition instead; at most
+        // `SIDE_BRANCH_BLOCKS_PER_TURN` block applications here.
+        engine.validate_side_branch_turn(slot);
 
         if let Some(stop) = cfg.stop_at_slot {
             if slot >= stop
@@ -8368,6 +8816,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 && !deferred_orphans_pending
             {
                 if engine.store.flush_rewrite()? {
+                    engine.persist_finalized_latch();
                     if let Err(e) = engine.write_local_cache() {
                         eprintln!("state-cache: shutdown post-reorg write failed; restart may require full replay: {e}");
                     }
