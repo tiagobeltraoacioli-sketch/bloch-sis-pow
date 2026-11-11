@@ -85,24 +85,49 @@ pub(super) fn announce_finality_cert_retention() {
 /// finality latch forbids rewinding below it), so a few are cached.
 const CERT_CACHE: usize = 8;
 
+/// Refusals remembered, so a repeated request that cannot be answered costs
+/// a lookup and no block read. An entry is a key and a short message.
+const REFUSAL_CACHE: usize = 256;
+
+/// Certificates assembled from the block log per wall slot, across all
+/// callers. Assembly reads up to two epochs of blocks on the consensus
+/// thread and the method needs no authentication, so the work one slot can be
+/// made to do is bounded here. Cached answers and refusals decided before the
+/// first read are not counted. A light client at the head needs one assembly
+/// per epoch; a prover's follower catching up over the verifier's whole
+/// 256-epoch bound is served in 32 slots, retrying on [`rpc::NODE_UNAVAILABLE`].
+const CERT_BUILDS_PER_SLOT: u32 = 8;
+
 /// Most ancestry headers one certificate may carry.
 const MAX_ANCESTRY: usize = bloch_finality_cert::MAX_ANCESTRY;
 
 #[derive(Default)]
 pub(super) struct FinalityCertStore {
     /// `(checkpoint block id, registry proof)`, oldest first.
-    registry: VecDeque<([u8; 32], Arc<RegistryProof>)>,
+    pub(super) registry: VecDeque<([u8; 32], Arc<RegistryProof>)>,
     /// `(checkpoint block id, extensions)`, parallel to `registry`.
-    extensions: VecDeque<([u8; 32], Arc<CheckpointExtensions>)>,
+    pub(super) extensions: VecDeque<([u8; 32], Arc<CheckpointExtensions>)>,
     /// `((epoch, block, set source epoch), reply)`, oldest first.
-    cache: VecDeque<((u64, Option<[u8; 32]>, u64), Json)>,
+    pub(super) cache: VecDeque<((u64, Option<[u8; 32]>, u64), Json)>,
     /// The same, for `getlcproof` (its `set_source_epoch` as requested).
     lc_cache: VecDeque<((u64, Option<[u8; 32]>, Option<u64>), Json)>,
     /// `(epoch, justifying source epoch)` of certificates already built. The
     /// default set source of a finalized epoch never changes, so a repeated
     /// request that names none can be answered from `cache` before any block
     /// is read back from the log.
-    default_source: VecDeque<(u64, u64)>,
+    pub(super) default_source: VecDeque<(u64, u64)>,
+    /// `((epoch, block, set source epoch as requested), head, refusal)`,
+    /// oldest first. `head` is `None` for a refusal that can never change
+    /// (every block it was decided from is below the finality latch) and
+    /// otherwise the head it was decided at, the only one it is replayed for.
+    refused: VecDeque<((u64, Option<[u8; 32]>, Option<u64>), Option<[u8; 32]>, RpcError)>,
+    /// `(wall slot, assemblies started in it)`; see [`CERT_BUILDS_PER_SLOT`].
+    pub(super) builds: (u64, u32),
+    /// Set when the last assembly failed on a block read: a fault of this
+    /// node's disk, not a property of the request, and so never remembered.
+    read_failed: bool,
+    /// Vote scans (one epoch of blocks read back each) since boot.
+    pub(super) vote_scans: u64,
 }
 
 impl Engine {
@@ -224,6 +249,20 @@ impl Engine {
         }
     }
 
+    /// The registry proof retained for checkpoint block `id`, if any.
+    fn retained_registry(&self, id: &[u8; 32]) -> Option<Arc<RegistryProof>> {
+        self.finality_certs.registry.iter().find(|(x, _)| x == id).map(|(_, p)| Arc::clone(p))
+    }
+
+    fn registry_not_retained(src_epoch: u64, src_root: &[u8; 32]) -> RpcError {
+        RpcError::unavailable(format!(
+            "the registry proof for set-source epoch {src_epoch} (block {}) is not retained \
+             on this node (it keeps the last {} checkpoints; BLOCH_FINALITY_CERT_EPOCHS)",
+            crate::codec::hex8(src_root),
+            finality_cert_epochs()
+        ))
+    }
+
     pub(super) fn finality_certificate(
         &mut self,
         epoch: Option<u64>,
@@ -232,6 +271,45 @@ impl Engine {
     ) -> RpcResult {
         let finalized = self.state.finality().finalized.epoch;
         let e = epoch.unwrap_or(finalized);
+        let key = (e, block, set_source_epoch);
+        let head = self.chain.last().map(|(_, id)| *id.as_bytes());
+        if let Some((_, _, err)) = self
+            .finality_certs
+            .refused
+            .iter()
+            .find(|(k, at, _)| *k == key && (at.is_none() || *at == head))
+        {
+            return Err(err.clone());
+        }
+        let scans_before = self.finality_certs.vote_scans;
+        self.finality_certs.read_failed = false;
+        let result = self.assemble_finality_certificate(e, finalized, block, set_source_epoch);
+        if let Err(err) = &result {
+            // Only a refusal that cost block reads is worth remembering, and
+            // not the one that says "ask again shortly".
+            if self.finality_certs.vote_scans != scans_before && !self.finality_certs.read_failed {
+                // Blocks of epochs `e` and `e + 1` are all at or below the
+                // finalized checkpoint once `e + 1 < finalized`; the registry
+                // ring only ever loses its oldest entries. Such a refusal is
+                // permanent. A younger one holds for this head only.
+                let permanent = e.saturating_add(1) < finalized;
+                self.finality_certs.refused.retain(|(k, _, _)| *k != key);
+                self.finality_certs.refused.push_back((key, if permanent { None } else { head }, err.clone()));
+                while self.finality_certs.refused.len() > REFUSAL_CACHE {
+                    self.finality_certs.refused.pop_front();
+                }
+            }
+        }
+        result
+    }
+
+    fn assemble_finality_certificate(
+        &mut self,
+        e: u64,
+        finalized: u64,
+        block: Option<[u8; 32]>,
+        set_source_epoch: Option<u64>,
+    ) -> RpcResult {
         if e == 0 {
             return Err(RpcError::invalid_params(
                 "epoch 0 is the genesis root of trust; it has no certificate",
@@ -280,8 +358,47 @@ impl Engine {
             }
         }
 
+        // The registry proof decides whether a certificate can be built at
+        // all, and looking it up is an index walk: settle it before a block
+        // is read. A named set source is checked exactly. Without one the
+        // set source is the justifying source, some epoch before `e`, whose
+        // checkpoint block therefore sits below epoch `e`: if no retained
+        // proof is that old, none can be the one needed.
+        match set_source_epoch {
+            Some(src_epoch) => {
+                if src_epoch >= e {
+                    return Err(RpcError::invalid_params("`set_source_epoch` must be before `epoch`"));
+                }
+                let src_root = self.checkpoint_root(src_epoch);
+                if self.retained_registry(&src_root).is_none() {
+                    return Err(Self::registry_not_retained(src_epoch, &src_root));
+                }
+            }
+            None => {
+                let first = first_slot_of_epoch(e).unwrap_or(u64::MAX);
+                if !self.finality_certs.registry.iter().any(|(_, p)| p.header.slot < first) {
+                    return Err(RpcError::unavailable(format!(
+                        "no registry proof for a set source before epoch {e} is retained on this \
+                         node (it keeps the last {} checkpoints; BLOCH_FINALITY_CERT_EPOCHS)",
+                        finality_cert_epochs()
+                    )));
+                }
+            }
+        }
+        let slot = self.wall_slot();
+        if self.finality_certs.builds.0 != slot {
+            self.finality_certs.builds = (slot, 0);
+        }
+        if self.finality_certs.builds.1 >= CERT_BUILDS_PER_SLOT {
+            return Err(RpcError::unavailable(format!(
+                "this node assembles at most {CERT_BUILDS_PER_SLOT} finality certificates per slot; retry in the next slot"
+            )));
+        }
+        self.finality_certs.builds.1 += 1;
+
         // Justifying link: the source with the most votes for (e, root).
-        let v_e = self.canonical_votes(e)?;
+        self.finality_certs.vote_scans += 1;
+        let v_e = self.canonical_votes(e).inspect_err(|_| self.finality_certs.read_failed = true)?;
         let mut by_source: BTreeMap<(u64, [u8; 32]), usize> = BTreeMap::new();
         for (d, _) in v_e.values() {
             if d.target_root == root && d.source_epoch < e {
@@ -304,7 +421,8 @@ impl Engine {
         }
 
         let l0 = Self::link_from(&v_e, source, (e, root));
-        let v_next = self.canonical_votes(e + 1)?;
+        self.finality_certs.vote_scans += 1;
+        let v_next = self.canonical_votes(e + 1).inspect_err(|_| self.finality_certs.read_failed = true)?;
         let l1 = Self::link_from(&v_next, (e, root), (e + 1, next_root));
         if l1.votes.is_empty() {
             return Err(RpcError::new(
@@ -315,19 +433,8 @@ impl Engine {
 
         let src_root = self.checkpoint_root(src_epoch);
         let registry = self
-            .finality_certs
-            .registry
-            .iter()
-            .find(|(id, _)| *id == src_root)
-            .map(|(_, p)| Arc::clone(p))
-            .ok_or_else(|| {
-                RpcError::unavailable(format!(
-                    "the registry proof for set-source epoch {src_epoch} (block {}) is not retained \
-                     on this node (it keeps the last {} checkpoints; BLOCH_FINALITY_CERT_EPOCHS)",
-                    crate::codec::hex8(&src_root),
-                    finality_cert_epochs()
-                ))
-            })?;
+            .retained_registry(&src_root)
+            .ok_or_else(|| Self::registry_not_retained(src_epoch, &src_root))?;
 
         let checkpoint_header = self
             .header_by_id(&root)
