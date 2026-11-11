@@ -740,6 +740,15 @@ impl Origin {
         self.directed_block = true;
     }
 
+    /// The engine accepted this message after verifying it. Tells the devnet
+    /// mesh, which uses it to tell a peer that proved itself from one that
+    /// merely connected (`net::DeliveryProof`); a no-op for every other origin.
+    pub(crate) fn note_mesh_delivery_verified(&self) {
+        if let Some(reservation) = &self.reservation {
+            reservation.delivery_verified();
+        }
+    }
+
     /// Exact wire charge retained by the transport reservation after
     /// canonical decoding. `None` is local/source-free work, which falls back
     /// to computing its canonical size at queue admission.

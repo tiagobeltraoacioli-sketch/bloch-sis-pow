@@ -277,6 +277,12 @@ impl Net {
     /// has not judged — is one this node does not forward. The devnet mesh has
     /// no such notion and drops it.
     pub fn report(&self, origin: &Origin, verdict: Verdict) {
+        // The devnet mesh keeps no score, but it does remember which source
+        // addresses delivered something the engine verified (W4-1); a no-op
+        // for every origin that carries no [`DeliveryProof`].
+        if verdict == Verdict::Accept {
+            origin.note_mesh_delivery_verified();
+        }
         match self {
             Net::Devnet(_) => {}
             // On `Both` this routes only the messages that actually came from
@@ -792,37 +798,31 @@ const MAX_INBOUND_CONNECTIONS: usize = 128;
 /// Inbound connections one source may hold: an IPv4 address or an IPv6 /64
 /// (see [`crate::connection_limit::limit_key`]).
 ///
-/// One eighth of [`MAX_INBOUND_CONNECTIONS`]. This was 32 and keyed by full
-/// address, so four IPv4 hosts, or a single IPv6 /64, could hold every slot.
-/// At 16 a host can still run sixteen dial-in nodes behind one address, and
-/// filling the table takes eight sources that each keep sixteen connections
-/// delivering valid frames (see [`INBOUND_IDLE_EVICTION`]). Sources listed in
-/// `--peers` are exempt, so a fleet that puts more nodes than this on one
-/// host is unaffected as long as its nodes list each other. The exemption is
-/// sized by that list: an address at which `n` peers are configured holds up
-/// to `2n + 2` exempt connections (`inbound_slots::Standing::for_source`),
-/// and further connections from it count against this share like any other.
-const MAX_INBOUND_PER_SOURCE: usize = 16;
-/// Inbound connections that have neither completed an authenticated
-/// handshake nor delivered a valid frame. They are counted inside
-/// [`MAX_INBOUND_CONNECTIONS`] but capped here, so connections that have
-/// proven nothing can never hold more than a quarter of the table.
-const MAX_PENDING_INBOUND: usize = 32;
-/// Share of [`MAX_PENDING_INBOUND`] one source may hold.
-const MAX_PENDING_INBOUND_PER_SOURCE: usize = 4;
-/// How long an inbound connection may stay pending before it is closed.
-///
-/// Covers the whole of [`crate::mesh_pq::HANDSHAKE_TIMEOUT`] plus the wait
-/// for a first frame. One slot: a dialer that has nothing to say for longer
-/// than that is closed and simply dials again.
-const PENDING_INBOUND_DEADLINE: Duration = Duration::from_secs(30);
-/// Minimum age before a connection that has not yet been useful can be
-/// displaced by an unconfigured newcomer. Without it a fast enough flood
-/// would evict every honest dialer before its handshake finished.
-const INBOUND_EVICTION_GRACE: Duration = Duration::from_secs(5);
-/// A useful inbound connection that has delivered no valid frame for this
-/// long may be evicted when the table is full and a new connection arrives.
-const INBOUND_IDLE_EVICTION: Duration = Duration::from_secs(30);
+/// This was 32 and keyed by full address, so four IPv4 hosts, or a single
+/// IPv6 /64, could hold every slot. Twenty is sixteen nodes behind one
+/// address, which is what mainnet operators run without listing each other
+/// (review W4-1: two fleet hosts with 13 and 11 validators are in nobody's
+/// `--peers`), plus four connections of headroom: a node replaces a
+/// connection by dialing while the listener may still be counting the one it
+/// replaces. It applies whether or not the connections have said anything:
+/// a validator's only regular message is one vote per epoch, so "has proven
+/// nothing yet" describes every honest connection for up to sixteen minutes,
+/// and the pending pool that used to cap such connections at four per
+/// address refused most of an honest host. What protects the table from an
+/// address that fills its share with idle connections is no longer a timer
+/// but an order of eviction, applied only when the table is full; see
+/// [`inbound_slots`]. An address at which `n` peers are configured
+/// additionally holds up to `2n + 2` exempt connections
+/// (`inbound_slots::Standing::for_source`).
+const MAX_INBOUND_PER_SOURCE: usize = 20;
+/// How long one block or vote that the engine verified vouches for the
+/// source address that delivered it (see `inbound_slots::Slots::note_verified`).
+/// Just under four epochs: a validator that votes every epoch renews it with
+/// room for two missed or late votes, and a source that stops proving itself
+/// is an ordinary one again within the hour.
+const INBOUND_VOUCH_FOR: Duration = Duration::from_secs(3600);
+/// Sources remembered as vouched.
+const MAX_VOUCHED_SOURCES: usize = 1024;
 /// Hard ceiling on inbound connections whose worker threads are still
 /// alive. An evicted connection leaves the slot table at once but its two
 /// threads take a moment to notice; this bounds how far the real resource
@@ -834,19 +834,49 @@ const MAX_CONFIGURED_SOURCES: usize = 1024;
 
 const INBOUND_POLICY: inbound_slots::Policy = inbound_slots::Policy {
     total: MAX_INBOUND_CONNECTIONS,
-    pending: MAX_PENDING_INBOUND,
     per_source: MAX_INBOUND_PER_SOURCE,
-    pending_per_source: MAX_PENDING_INBOUND_PER_SOURCE,
-    pending_deadline: PENDING_INBOUND_DEADLINE,
-    eviction_grace: INBOUND_EVICTION_GRACE,
-    idle_eviction: INBOUND_IDLE_EVICTION,
-    // Same horizon as the socket timeout, but measured in valid frames: a
-    // frame of unknown type resets the socket timer and must not reset this.
+    // Same horizon as the socket timeout, but measured in well-formed frames:
+    // a frame of unknown type resets the socket timer and must not reset this.
     idle_close: DEVNET_IO_TIMEOUT,
+    vouch_for: INBOUND_VOUCH_FOR,
+    vouched_sources: MAX_VOUCHED_SOURCES,
 };
 
 type InboundSlots = Arc<Mutex<inbound_slots::Slots<TcpStream>>>;
 type InboundSlot = inbound_slots::Slot<TcpStream>;
+
+/// Travels with a block or vote read from an unconfigured inbound connection
+/// (inside its [`SourceReservation`]) so that the engine's verdict can come
+/// back to the slot table: [`Net::report`] with [`Verdict::Accept`] means the
+/// engine checked a signature by a key in the validator registry, and that
+/// vouches for the source address that delivered it.
+///
+/// This is the only evidence on this transport that an arbitrary host cannot
+/// manufacture. A frame that merely decodes costs its sender nothing; under
+/// `--mesh-security offer` without pins or an allow-list (mainnet) a
+/// completed handshake proves a key generated a moment ago. Transactions do
+/// not carry one: anybody with a funded account can have one accepted.
+#[derive(Clone)]
+pub(crate) struct DeliveryProof {
+    slots: Weak<Mutex<inbound_slots::Slots<TcpStream>>>,
+    source: std::net::IpAddr,
+}
+
+impl DeliveryProof {
+    pub(crate) fn verified(&self) {
+        if let Some(slots) = self.slots.upgrade() {
+            if let Ok(mut slots) = slots.lock() {
+                slots.note_verified(self.source, Instant::now());
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for DeliveryProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeliveryProof").field("source", &self.source).finish()
+    }
+}
 
 /// Socket read/write timeout for the devnet mesh (R3 M-4 / R1 A3-M2). This
 /// transport had none: a peer that stopped reading its socket could stall
@@ -855,11 +885,15 @@ type InboundSlot = inbound_slots::Slot<TcpStream>;
 /// held its reader thread — and its slot under [`MAX_INBOUND_CONNECTIONS`] —
 /// open forever.
 ///
-/// An honest peer's connection is never idle anywhere near this long: the
-/// dialer side below re-asks for history at least every 5 seconds while it
-/// holds a sync slot, and on a live chain a block or attestation broadcast
-/// arrives far more often than that. This is a generous multiple of that
-/// cadence, not a tight bound tuned to it.
+/// An honest connection IS idle this long, routinely (review W4-1): this
+/// mesh has no relay, so a connection carries only what its two ends
+/// authored, which for a validator is one vote per sixteen-minute epoch and
+/// a block about once an hour, plus a sync poll every `2.5 s` times the
+/// number of connections the dialer holds, well over two minutes on a node
+/// that dials or is dialed by most of the fleet. Such a connection is closed
+/// here and its dialer dials again at once; nothing is lost, because
+/// broadcasts wait in the dialer's queue. What the rest of this file must
+/// guarantee is that the dial is admitted again.
 const DEVNET_IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Sustained `get-blocks` answers this transport will build per connection,
@@ -991,6 +1025,14 @@ impl Drop for ConnectionHalf {
     fn drop(&mut self) {
         self.0.closed.store(true, Ordering::Release);
         let _ = self.0.socket.shutdown(Shutdown::Both);
+        // The table slot goes back now, not when the second worker notices:
+        // the peer's dialer redials the moment it sees the close, and that
+        // dial must not be refused for the share of the connection it
+        // replaces. The threads themselves stay counted until they are gone
+        // (`MAX_INBOUND_LIVE`).
+        if let Some(slot) = &self.0.slot {
+            slot.release();
+        }
     }
 }
 
@@ -1355,6 +1397,20 @@ fn admit_frame_from_ip(
     frame: &[u8],
     configured: bool,
 ) -> FrameOutcome {
+    admit_frame_with_proof(events, budget, ip, frame, configured, None)
+}
+
+/// [`admit_frame_from_ip`] for an unconfigured inbound connection: a block
+/// or vote takes `proof` along, so the engine's verdict on it can vouch for
+/// the connection's source.
+fn admit_frame_with_proof(
+    events: &Sender<EngineEvent>,
+    budget: &QueueBudget,
+    ip: std::net::IpAddr,
+    frame: &[u8],
+    configured: bool,
+    proof: Option<&DeliveryProof>,
+) -> FrameOutcome {
     let Some((class, size)) = framed_event_shape(frame) else { return FrameOutcome::Ignored };
     let Some(source_guard) = source_budget::Registry::reserve(
         &budget.sources,
@@ -1381,6 +1437,9 @@ fn admit_frame_from_ip(
     if class_of(&event) != class || queued_bytes(&event) != size {
         budget.release_raw(size);
         return FrameOutcome::Ignored;
+    }
+    if let Some(proof) = proof.filter(|_| class != EventClass::Transaction) {
+        source_guard.set_delivery_proof(proof.clone());
     }
     match &mut event {
         NetEvent::Block(_, origin)
@@ -1595,6 +1654,78 @@ fn log_refusal(direction: &str, peer: &str, e: &std::io::Error) {
 fn closed_on_handshake(e: &std::io::Error) -> bool {
     use std::io::ErrorKind::*;
     matches!(e.kind(), UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe)
+}
+
+/// First pause of a dialer whose peer accepted the TCP connection and then
+/// turned it away, and the ceiling the pause doubles up to (review W4-1).
+///
+/// A listener that is full, or whose share for this node's address is taken,
+/// closes the connection at accept. The dialer used to dial again at once,
+/// forever. The pause applies only after a connection that was established
+/// and then closed on this node; a peer that is down refuses the TCP
+/// connection itself and is retried on the old, shorter cadence, so
+/// reconnecting to a peer that restarts is not delayed by this. Each peer
+/// has its own dialer thread, so one peer's pause delays no other's.
+const REFUSED_DIAL_BACKOFF_MIN: Duration = Duration::from_millis(250);
+const REFUSED_DIAL_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// A session that ends sooner than this was not a working connection, and
+/// its redial is paced like a refusal.
+const SHORT_SESSION: Duration = Duration::from_secs(5);
+/// Closed handshakes in a row before an `offer` dialer tries a plain session
+/// with a peer that has completed the handshake before in this process.
+const SEALED_PEER_HANDSHAKE_RETRIES: u32 = 3;
+/// How long an `offer` dialer watches a plain fallback connection for an
+/// immediate close before it starts writing: at least this, at most
+/// [`PLAIN_PROBE_MAX`], otherwise three times what the TCP connect took.
+const PLAIN_PROBE_MIN: Duration = Duration::from_millis(250);
+const PLAIN_PROBE_MAX: Duration = Duration::from_secs(2);
+
+/// The pause between dials that were turned away; see [`REFUSED_DIAL_BACKOFF_MIN`].
+struct RefusalBackoff(Duration);
+
+impl RefusalBackoff {
+    fn new() -> Self {
+        RefusalBackoff(REFUSED_DIAL_BACKOFF_MIN)
+    }
+
+    fn reset(&mut self) {
+        self.0 = REFUSED_DIAL_BACKOFF_MIN;
+    }
+
+    /// The pause to take now. The next one is twice as long, up to the ceiling.
+    fn next(&mut self) -> Duration {
+        let pause = self.0;
+        self.0 = pause.saturating_mul(2).min(REFUSED_DIAL_BACKOFF_MAX);
+        pause
+    }
+}
+
+/// True when the peer closes or resets a freshly connected socket within
+/// `wait`, having sent nothing: what a listener does to a connection it
+/// refuses at accept. Nothing is read from the socket.
+///
+/// The plain fallback of an `offer` dialer has no handshake whose failure
+/// would show a refusal, and its writer used to start at once and drain the
+/// peer's queue, this node's vote of the epoch included, into the closed
+/// socket. With no relay on this mesh that vote was lost for that peer.
+fn closed_at_once(sock: &TcpStream, wait: Duration) -> bool {
+    if sock.set_read_timeout(Some(wait)).is_err() {
+        return false;
+    }
+    let mut probe = [0u8; 1];
+    loop {
+        match sock.peek(&mut probe) {
+            Ok(0) => return true,
+            Ok(_) => return false,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // A timeout is a peer that is still there and has nothing to say.
+            Err(e) => return closed_on_handshake(&e),
+        }
+    }
+}
+
+fn plain_probe_wait(connect_took: Duration) -> Duration {
+    connect_took.saturating_mul(3).clamp(PLAIN_PROBE_MIN, PLAIN_PROBE_MAX)
 }
 
 /// Send one block envelope to a running node and disconnect — the
@@ -1959,7 +2090,7 @@ pub fn start(
                 let Ok(held) = slots.lock().map(|slots| slots.configured_held(address.ip())) else { continue };
                 let standing = inbound_slots::Standing::for_source(peers_here, held);
                 let is_configured = standing.is_configured();
-                // Shares, the pending pool and eviction are all decided here;
+                // The share and, in a full table, eviction are decided here;
                 // see `inbound_slots`. A refusal drops `sock`, closing it.
                 let Some(slot) = InboundSlot::admit(&slots, address.ip(), standing, Instant::now(), evict_handle) else {
                     continue;
@@ -1971,9 +2102,9 @@ pub fn start(
                 {
                     continue;
                 }
-                // The inbound slot is taken here, before the handshake, in
-                // the pending pool: a flood of half-open handshakes is bounded
-                // by `MAX_PENDING_INBOUND` and cannot reach the main pool. The
+                // The inbound slot is taken here, before the handshake, so a
+                // flood of half-open handshakes is bounded by the table and
+                // by its source's share like any other connection. The
                 // handshake itself runs on the connection's own thread: a slow
                 // or silent dialer must not hold up the accept loop.
                 let inbound_slot = ConnCount::new(&inbound_live);
@@ -1985,6 +2116,10 @@ pub fn start(
                 let scheduler = scheduler.clone();
                 let sync_budget = sync_budget.clone();
                 let security = security.clone();
+                let proof = (!is_configured).then(|| DeliveryProof {
+                    slots: Arc::downgrade(&slots),
+                    source: address.ip(),
+                });
                 thread::spawn(move || {
                     let mut sock = sock;
                     let session = match crate::mesh_pq::handshake_inbound(&mut sock, &security) {
@@ -1994,12 +2129,13 @@ pub fn start(
                             return;
                         }
                     };
-                    // An authenticated handshake leaves the pending pool. A
-                    // plain session has proven nothing yet and stays in it
-                    // until its first valid frame; so does a sealed session
-                    // whose peer identity was checked against nothing
-                    // (encryption only; review CRY-7).
-                    if session.authenticated() && !slot.mark_established() {
+                    // A handshake against an allow-list or a pin vouches for
+                    // the connection. A plain session has proven nothing, and
+                    // neither has a sealed session whose peer identity was
+                    // checked against nothing (encryption only; review
+                    // CRY-7): those are vouched for by the first block or
+                    // vote from their address that the engine verifies.
+                    if session.authenticated() && !slot.mark_authenticated() {
                         return;
                     }
                     let Ok(shutdown_socket) = sock.try_clone() else { return };
@@ -2062,6 +2198,7 @@ pub fn start(
                                     // the only frame a dialer ever sends, and a
                                     // listener with a short log must be able
                                     // to ask it for history.
+                                    let well_formed = frame.len() == 9;
                                     if responder.answer(&_half.0, address.ip(), frame, &mut get_blocks_limiter) {
                                         let Some(slot) = _half.0.slot.as_ref() else { return };
                                         let now = Instant::now();
@@ -2070,10 +2207,16 @@ pub fn start(
                                             offered = true;
                                             if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer.clone(), now); }
                                         }
+                                    } else if well_formed {
+                                        // Still a peer that is alive and
+                                        // polling: the idle deadline must not
+                                        // close it because this node's
+                                        // serving pool was busy (W4-1).
+                                        if let Some(slot) = _half.0.slot.as_ref() { slot.mark_heard(Instant::now()); }
                                     }
                                     continue;
                                 }
-                                let outcome = admit_frame_from_ip(&events, &inflight, address.ip(), &frame, false);
+                                let outcome = admit_frame_with_proof(&events, &inflight, address.ip(), &frame, false, proof.as_ref());
                                 let Some(slot) = _half.0.slot.as_ref() else { return };
                                 let now = Instant::now();
                                 match outcome {
@@ -2087,7 +2230,7 @@ pub fn start(
                                         }
                                         Some(_) => {}
                                     },
-                                    FrameOutcome::Shed => slot.mark_shed(now),
+                                    FrameOutcome::Shed => slot.mark_heard(now),
                                     // Unknown or malformed frames are not activity.
                                     FrameOutcome::Ignored => {}
                                 }
@@ -2126,11 +2269,23 @@ pub fn start(
             // the handshake is tried again, so an upgraded peer is picked up
             // on its first reconnect with no restart here.
             let mut fallback_plain = false;
+            // W4-1. Whether this peer has completed the handshake before in
+            // this process (such a peer is not a legacy node, so a close on
+            // the handshake is a refusal or a restart, not a reason to go
+            // plain), how many handshakes in a row it closed on, and the
+            // pause before the next dial after being turned away. Frames
+            // broadcast meanwhile wait in `rx`; nothing is written until a
+            // connection is known to be open.
+            let mut sealed_before = false;
+            let mut closed_handshakes = 0u32;
+            let mut backoff = RefusalBackoff::new();
             loop {
+            let dialing = Instant::now();
             let Ok(mut sock) = TcpStream::connect(&addr) else {
                 thread::sleep(Duration::from_millis(300));
                 continue;
             };
+            let connect_took = dialing.elapsed();
             // Bounded: a name that resolves somewhere new on every dial must
             // not grow this set for the life of the process.
             if let (false, Ok(address), Ok(mut peers)) = (counted_at_start, sock.peer_addr(), configured.lock()) {
@@ -2147,6 +2302,12 @@ pub fn start(
             }
             let session = if fallback_plain {
                 fallback_plain = false;
+                // A legacy node keeps the connection open and waits for a
+                // frame. A listener that had no slot closed it already.
+                if closed_at_once(&sock, plain_probe_wait(connect_took)) {
+                    thread::sleep(backoff.next());
+                    continue;
+                }
                 Ok(crate::mesh_pq::Session::Plain)
             } else {
                 crate::mesh_pq::handshake_outbound(&mut sock, &security, &addr)
@@ -2159,7 +2320,18 @@ pub fn start(
                 Err(e) if security.mode() == crate::mesh_pq::Mode::Offer
                     && !security.is_pinned(&addr)
                     && closed_on_handshake(&e) => {
-                    fallback_plain = true;
+                    closed_handshakes = closed_handshakes.saturating_add(1);
+                    if sealed_before && closed_handshakes <= SEALED_PEER_HANDSHAKE_RETRIES {
+                        // Not a legacy node: it was turned away, or the peer
+                        // is restarting. Ask again, sealed, a little later.
+                        thread::sleep(backoff.next());
+                    } else {
+                        // A legacy node, as far as this dialer can tell, or a
+                        // peer that went back to one: the next connection is
+                        // plain, at once, as before. If that one is closed
+                        // too it was a refusal, and the probe above paces it.
+                        fallback_plain = true;
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -2177,7 +2349,13 @@ pub fn start(
             // [`DEVNET_IO_TIMEOUT`]. Best-effort; a platform that refuses the
             // option gets an unbounded-latency socket, not a broken one.
             let _ = sock.set_read_timeout(Some(DEVNET_IO_TIMEOUT));
+            let sealed = matches!(session, crate::mesh_pq::Session::Sealed { .. });
+            if sealed {
+                sealed_before = true;
+                closed_handshakes = 0;
+            }
             let Ok((reader, writer)) = split_session(sock, session) else { continue };
+            let session_started = Instant::now();
             let connection = Arc::new(Connection {
                 socket: shutdown_socket,
                 closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
@@ -2202,6 +2380,16 @@ pub fn start(
                 });
             }
             run_connection_writer(&rx, wsock, writer_half);
+            if session_started.elapsed() >= SHORT_SESSION {
+                backoff.reset();
+                closed_handshakes = 0;
+                // A plain session that worked: the peer is a legacy node now.
+                sealed_before = sealed;
+            } else {
+                // Admitted and closed straight away (evicted by a full
+                // listener, or the peer is going down): not a busy loop.
+                thread::sleep(backoff.next());
+            }
             }
         });
     }
@@ -3689,7 +3877,7 @@ mod tests {
         // fixed amount, so this is fast on an idle box and still correct on
         // a loaded one.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while mesh.peer_count() < MAX_PENDING_INBOUND_PER_SOURCE && Instant::now() < deadline {
+        while mesh.peer_count() < MAX_INBOUND_PER_SOURCE && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
         // One quiet moment so the count has settled — proving it never rises
@@ -3698,8 +3886,8 @@ mod tests {
 
         assert_eq!(
             mesh.peer_count(),
-            MAX_PENDING_INBOUND_PER_SOURCE,
-            "one unconfigured source that sends nothing holds only its share of the pending pool"
+            MAX_INBOUND_PER_SOURCE,
+            "one unconfigured source that sends nothing holds its share of the table and no more"
         );
 
         // And the excess connections were actually refused, not merely
@@ -3719,5 +3907,170 @@ mod tests {
         // them at end of scope, which is a normal client-side close and
         // proves nothing was already closed from the server's side.
         drop(conns);
+    }
+
+    /// W4-1, the listener's side, on real sockets and under the mode mainnet
+    /// runs (`offer`, no pins, no allow-list): sixteen nodes behind one
+    /// address that the listener does not list all hold a connection, every
+    /// vote each of them sends reaches the engine, and connections from the
+    /// same address that say nothing get what is left of the address's share
+    /// and not one slot more. The pending pool this replaces admitted four of
+    /// the sixteen and closed the rest at accept.
+    #[test]
+    fn sixteen_unlisted_nodes_behind_one_address_all_connect_and_deliver_every_vote() {
+        use crate::mesh_pq::{MeshSecurity, Mode};
+        let (events, received) = mpsc::channel::<EngineEvent>();
+        let mesh = start(
+            "127.0.0.1", 0, Vec::new(), events, std::env::temp_dir(),
+            Arc::new(AtomicU64::new(0)), QueueBudget::new(),
+            Arc::new(MeshSecurity::ephemeral(Mode::Offer, [9; 32], None)),
+        ).expect("bind the devnet transport");
+        let port = mesh.listen_addr().port();
+        let net = Net::Devnet(mesh);
+        let Net::Devnet(mesh) = &net else { unreachable!() };
+        let vote = |validator: usize, round: u64| {
+            let mut att = sample_attestation();
+            att.validator = validator as _;
+            att.data.slot = round;
+            att_frame(&att)
+        };
+        // All sixteen connect before any of them has said anything.
+        let mut validators: Vec<TcpStream> =
+            (0..16).map(|_| TcpStream::connect(("127.0.0.1", port)).expect("connect")).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        // The engine's side: take each vote and report it verified.
+        let collect = |seen: &mut std::collections::BTreeSet<(u64, u64)>, want: usize| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while seen.len() < want && Instant::now() < deadline {
+                if let Ok(EngineEvent::Net(NetEvent::Attestation(att, origin))) = received.recv_timeout(Duration::from_millis(50)) {
+                    seen.insert((att.validator as u64, att.data.slot));
+                    net.report(&origin, Verdict::Accept);
+                }
+            }
+            seen.len()
+        };
+        for round in 0..3u64 {
+            for (validator, sock) in validators.iter_mut().enumerate() {
+                write_frame(sock, &vote(validator, round)).expect("a sibling's connection was closed");
+            }
+            let want = 16 * (round as usize + 1);
+            assert_eq!(collect(&mut seen, want), want, "round {round}: a vote was lost");
+            assert_eq!(mesh.peer_count(), 16, "round {round}");
+        }
+
+        // Sixty-four more connections from the same address, saying nothing.
+        let idle: Vec<TcpStream> = (0..64).map(|_| TcpStream::connect(("127.0.0.1", port)).expect("connect")).collect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while mesh.peer_count() < MAX_INBOUND_PER_SOURCE && Instant::now() < deadline {
+            assert!(mesh.peer_count() <= MAX_INBOUND_PER_SOURCE);
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(mesh.peer_count(), MAX_INBOUND_PER_SOURCE, "the address holds its share and no more");
+        let closed = idle
+            .iter()
+            .filter(|sock| {
+                sock.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+                matches!((&**sock).read(&mut [0u8; 1]), Ok(0))
+            })
+            .count();
+        assert_eq!(closed, 64 - (MAX_INBOUND_PER_SOURCE - 16), "the rest were closed at accept");
+        // The sixteen are untouched.
+        for (validator, sock) in validators.iter_mut().enumerate() {
+            write_frame(sock, &vote(validator, 3)).expect("a sibling's connection was closed");
+        }
+        assert_eq!(collect(&mut seen, 64), 64, "a vote was lost");
+    }
+
+    fn read_until_frame(mut next: impl FnMut() -> std::io::Result<Vec<u8>>, wanted: &[u8]) -> bool {
+        loop {
+            match next() {
+                Ok(frame) if frame == wanted => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// W4-1, the dialer's side. A listener with no slot closes a connection
+    /// at accept, which an `offer` dialer cannot tell from a legacy node
+    /// closing on the handshake. Its plain retry used to start writing at
+    /// once: the vote waiting in the queue went into the closed socket and
+    /// was gone. Now the dialer looks before it writes, pauses, and the vote
+    /// is still queued when a connection is finally admitted.
+    #[test]
+    fn a_dialer_turned_away_at_accept_keeps_its_queued_vote_for_the_next_connection() {
+        use crate::mesh_pq::{MeshSecurity, Mode};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (events, _received) = mpsc::channel();
+        let mesh = start(
+            "127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
+            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(),
+            Arc::new(MeshSecurity::ephemeral(Mode::Offer, [9; 32], None)),
+        ).unwrap();
+        let vote = att_frame(&sample_attestation());
+        mesh.broadcast(vote.clone());
+        // Handshake, plain retry, handshake again: all three closed at accept.
+        let started = Instant::now();
+        for _ in 0..3 {
+            drop(listener.accept().unwrap());
+        }
+        assert!(started.elapsed() >= REFUSED_DIAL_BACKOFF_MIN, "a refused dial is retried after a pause");
+        // The fourth is the second plain retry, and this time it is kept.
+        let (mut sock, _) = listener.accept().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(
+            read_until_frame(|| read_frame_until(&mut sock, deadline), &vote),
+            "the queued vote was written into a connection the listener had closed"
+        );
+    }
+
+    /// W4-1: a peer that has completed the handshake before is not a legacy
+    /// node, so being closed on the handshake by it never downgrades the
+    /// next connection to plain; the dialer asks again, sealed, after a
+    /// pause, and what it queued meanwhile arrives encrypted.
+    #[test]
+    fn a_dialer_never_falls_back_to_plain_for_a_peer_that_spoke_the_handshake() {
+        use crate::mesh_pq::{handshake_inbound, MeshSecurity, Mode, Session};
+        let net = [9; 32];
+        let ours = MeshSecurity::ephemeral(Mode::Offer, net, None);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (events, _received) = mpsc::channel();
+        let mesh = start(
+            "127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
+            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(),
+            Arc::new(MeshSecurity::ephemeral(Mode::Offer, net, None)),
+        ).unwrap();
+        // First connection: sealed, then dropped.
+        let (mut sock, _) = listener.accept().unwrap();
+        assert!(matches!(handshake_inbound(&mut sock, &ours).unwrap(), Session::Sealed { .. }));
+        drop(sock);
+        // Second: turned away at accept. The vote is broadcast while the
+        // dialer has no connection.
+        drop(listener.accept().unwrap());
+        let vote = att_frame(&sample_attestation());
+        mesh.broadcast(vote.clone());
+        // Third: the dialer must be offering the handshake again.
+        let (mut sock, _) = listener.accept().unwrap();
+        let Session::Sealed { mut opener, .. } = handshake_inbound(&mut sock, &ours).unwrap() else {
+            panic!("the dialer downgraded a peer it had a sealed session with to plain");
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(
+            read_until_frame(|| opener.read_record(&mut sock, deadline), &vote),
+            "the vote queued while the dialer was turned away did not arrive"
+        );
+    }
+
+    #[test]
+    fn refused_dials_back_off_to_a_ceiling_and_start_over_after_a_working_session() {
+        let mut backoff = RefusalBackoff::new();
+        let pauses: Vec<u64> = (0..7).map(|_| backoff.next().as_millis() as u64).collect();
+        assert_eq!(pauses, [250, 500, 1000, 2000, 4000, 5000, 5000]);
+        backoff.reset();
+        assert_eq!(backoff.next(), REFUSED_DIAL_BACKOFF_MIN);
+        assert_eq!(plain_probe_wait(Duration::from_millis(1)), PLAIN_PROBE_MIN);
+        assert_eq!(plain_probe_wait(Duration::from_millis(200)), Duration::from_millis(600));
+        assert_eq!(plain_probe_wait(Duration::from_secs(30)), PLAIN_PROBE_MAX);
     }
 }
