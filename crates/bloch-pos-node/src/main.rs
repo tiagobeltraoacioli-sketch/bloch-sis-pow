@@ -170,9 +170,21 @@ fn abort_for_essential_thread(name: &'static str) {
          instead of leaving it running without that thread"
     );
     // In-process test swarms share the test binary; killing it would hide
-    // the panic message of the test that caused it.
+    // the panic message of the test that caused it. The name is recorded
+    // instead, so a test can assert that a given thread is guarded.
+    #[cfg(test)]
+    ESSENTIAL_THREAD_PANICS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(name);
     #[cfg(not(test))]
     std::process::abort();
+}
+
+#[cfg(test)]
+static ESSENTIAL_THREAD_PANICS: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+
+/// How many guarded threads named `name` have panicked in this test binary.
+#[cfg(test)]
+pub(crate) fn essential_thread_panics(name: &str) -> usize {
+    ESSENTIAL_THREAD_PANICS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().filter(|n| **n == name).count()
 }
 
 #[cfg(test)]

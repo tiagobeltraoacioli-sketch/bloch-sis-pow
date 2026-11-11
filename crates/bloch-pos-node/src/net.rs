@@ -1307,13 +1307,19 @@ impl SyncScheduler {
         if sent { schedule.requested_after = None; }
     }
 
-    fn start_timer(scheduler: &Arc<Self>) {
+    fn start_timer(scheduler: &Arc<Self>) -> std::io::Result<()> {
         let weak = Arc::downgrade(scheduler);
-        thread::spawn(move || loop {
+        spawn_essential("mesh-sync-timer", move || loop {
             thread::sleep(Duration::from_millis(250));
             let Some(scheduler) = weak.upgrade() else { return };
+            // `pump` gives up quietly on a poisoned lock, on every caller's
+            // thread. Here that would be a node that never asks for a block
+            // again (W4-3).
+            if scheduler.schedule.is_poisoned() {
+                panic!("mesh: the sync schedule lock is poisoned");
+            }
             scheduler.pump(Instant::now(), None);
-        });
+        })
     }
 }
 
@@ -1981,6 +1987,97 @@ fn write_sync_page(
     PageOutcome::Written(written)
 }
 
+/// Start a thread without which this node is deaf or mute on the mesh
+/// (review W4-3): the accept loop, each peer's dialer loop, the sync timer
+/// and the watchdog. It holds [`crate::EssentialThread`], so a panic on it
+/// ends the process and the supervisor restarts the node, instead of leaving
+/// a validator that keeps signing with nobody to hear it. An error here is
+/// the OS refusing the thread; [`start`] returns it and the node does not
+/// boot in that state.
+///
+/// A connection's own reader and writer are deliberately NOT started this
+/// way: a panic in one of those closes that connection and nothing else.
+fn spawn_essential(name: &'static str, body: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    thread::Builder::new().name(name.to_string()).spawn(move || {
+        let _essential = crate::EssentialThread::new(name);
+        body();
+    })?;
+    Ok(())
+}
+
+/// Failed attempts in a row to start a connection's worker thread, and the
+/// time they must span, before the watchdog ends the process (W4-3).
+///
+/// One refused thread is one refused connection: the peer dials again, or
+/// this node does. A node that cannot start any worker for a whole minute is
+/// losing its connections as they are replaced and can make no new ones; it
+/// would end up deaf and mute with its process up. Both conditions must
+/// hold, and any thread that does start clears the count, so a burst of
+/// failures during a short squeeze on the host never restarts a validator.
+const SPAWN_FAILURES_FATAL: u32 = 16;
+const SPAWN_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+
+/// When the current run of failed worker starts began, and how long it is.
+#[derive(Default)]
+struct SpawnHealth(Mutex<Option<(Instant, u32)>>);
+
+impl SpawnHealth {
+    fn run(&self) -> std::sync::MutexGuard<'_, Option<(Instant, u32)>> {
+        // Two plain fields: a panic elsewhere cannot leave them half-written.
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn started(&self) {
+        *self.run() = None;
+    }
+
+    fn failed(&self, now: Instant) {
+        let mut run = self.run();
+        *run = Some(run.map_or((now, 1), |(since, failures)| (since, failures.saturating_add(1))));
+    }
+
+    fn exhausted(&self, now: Instant) -> bool {
+        self.run().is_some_and(|(since, failures)| {
+            failures >= SPAWN_FAILURES_FATAL && now.saturating_duration_since(since) >= SPAWN_FAILURE_WINDOW
+        })
+    }
+}
+
+/// Start one connection's worker. False when the OS refused the thread; the
+/// worker's closure is dropped, which closes whatever it owned.
+fn spawn_connection(health: &SpawnHealth, name: &str, body: impl FnOnce() + Send + 'static) -> bool {
+    spawn_connection_with(health, name, body, |name, body| {
+        thread::Builder::new().name(name.to_string()).spawn(body).map(drop)
+    })
+}
+
+/// [`spawn_connection`] with the thread start spelled out, so a test can
+/// refuse it.
+fn spawn_connection_with<F: FnOnce() + Send + 'static>(
+    health: &SpawnHealth,
+    name: &str,
+    body: F,
+    spawn: impl FnOnce(&str, F) -> std::io::Result<()>,
+) -> bool {
+    match spawn(name, body) {
+        Ok(()) => {
+            health.started();
+            true
+        }
+        Err(e) => {
+            health.failed(Instant::now());
+            static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+            let now = Instant::now();
+            let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !last.is_some_and(|t| now.saturating_duration_since(t) < REFUSAL_LOG_EVERY) {
+                *last = Some(now);
+                eprintln!("net: could not start the `{name}` thread for a mesh connection ({e}); the connection is dropped");
+            }
+            false
+        }
+    }
+}
+
 /// Start the mesh: listen on `bind_addr:listen_port`, dial every peer, feed
 /// decoded events into `events`. `head_slot` is read when (re)dialing to ask
 /// peers for everything after our head.
@@ -2039,19 +2136,55 @@ pub fn start(
                 peers
             }),
     ));
+    let sync_budget = Arc::new(Mutex::new(SyncBudget::new()));
+    let spawn_health = Arc::new(SpawnHealth::default());
     {
         // Deadlines must not wait for the next accept: a quiet listener would
         // otherwise keep expired connections and their threads.
+        //
+        // The same tick is the mesh's watchdog (W4-3). Every lock below is
+        // taken with "if it is poisoned, do nothing" somewhere on a hot path,
+        // which is right for one connection's thread and wrong for the node:
+        // a poisoned slot table refuses every inbound connection, a poisoned
+        // source registry sheds every frame, a poisoned peer registry stops
+        // every broadcast to peers that dialed in, a poisoned serving budget
+        // answers no sync request, all silently and for good. A lock is
+        // poisoned only by a panic that held it, so this is a bug having
+        // fired, and the process ends here instead.
         let slots = Arc::downgrade(&slots);
-        thread::spawn(move || loop {
+        let inbound = inbound.clone();
+        let sync_budget = sync_budget.clone();
+        let configured = configured.clone();
+        let inflight = inflight.clone();
+        let spawn_health = spawn_health.clone();
+        spawn_essential("mesh-watchdog", move || loop {
             thread::sleep(Duration::from_secs(1));
             let Some(slots) = slots.upgrade() else { return };
-            if let Ok(mut slots) = slots.lock() { slots.reap(Instant::now()); };
-        });
+            let now = Instant::now();
+            match slots.lock() {
+                Ok(mut slots) => slots.reap(now),
+                Err(_) => panic!("mesh: the inbound slot table lock is poisoned"),
+            }
+            for (what, poisoned) in [
+                ("inbound peer registry", inbound.is_poisoned()),
+                ("sync serving budget", sync_budget.is_poisoned()),
+                ("configured source table", configured.is_poisoned()),
+                ("source admission registry", inflight.sources.is_poisoned()),
+            ] {
+                if poisoned {
+                    panic!("mesh: the {what} lock is poisoned");
+                }
+            }
+            if spawn_health.exhausted(now) {
+                panic!(
+                    "mesh: no connection thread could be started for {} s ({SPAWN_FAILURES_FATAL} or more attempts)",
+                    SPAWN_FAILURE_WINDOW.as_secs(),
+                );
+            }
+        })?;
     }
-    let sync_budget = Arc::new(Mutex::new(SyncBudget::new()));
     let sync = SyncScheduler::new(head_slot.clone(), inflight.clone());
-    SyncScheduler::start_timer(&sync);
+    SyncScheduler::start_timer(&sync)?;
     {
         let events = events.clone();
         let data_dir = data_dir.clone();
@@ -2063,13 +2196,21 @@ pub fn start(
         let sync_budget = sync_budget.clone();
         let security = security.clone();
         let configured = configured.clone();
-        thread::spawn(move || {
+        let spawn_health = spawn_health.clone();
+        spawn_essential("mesh-accept", move || {
             for conn in listener.incoming() {
-                let Ok(sock) = conn else { continue };
+                let Ok(sock) = conn else {
+                    // Out of descriptors, typically, and the connection is
+                    // still waiting: not a busy loop while that lasts.
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                };
                 // A quiet mesh may never broadcast. Prune on accept too, so
                 // connection churn cannot retain one dead sender per dial.
-                if let Ok(mut reg) = inbound.lock() {
-                    reg.retain(InboundPeer::is_open);
+                match inbound.lock() {
+                    Ok(mut reg) => reg.retain(InboundPeer::is_open),
+                    // W4-3: not "skip it": see the watchdog.
+                    Err(_) => panic!("mesh: the inbound peer registry lock is poisoned"),
                 }
                 // R3 M-4 / R1 A3-M2: past the cap, close the socket immediately
                 // — `sock` drops at the end of this iteration — before either
@@ -2087,7 +2228,11 @@ pub fn start(
                     .unwrap_or(0);
                 // This loop is the only thing that adds slots, so the count
                 // cannot grow between this read and the admission below.
-                let Ok(held) = slots.lock().map(|slots| slots.configured_held(address.ip())) else { continue };
+                let held = match slots.lock() {
+                    Ok(slots) => slots.configured_held(address.ip()),
+                    // W4-3: every later connection would be refused too.
+                    Err(_) => panic!("mesh: the inbound slot table lock is poisoned"),
+                };
                 let standing = inbound_slots::Standing::for_source(peers_here, held);
                 let is_configured = standing.is_configured();
                 // The share and, in a full table, eviction are decided here;
@@ -2120,7 +2265,12 @@ pub fn start(
                     slots: Arc::downgrade(&slots),
                     source: address.ip(),
                 });
-                thread::spawn(move || {
+                let workers = spawn_health.clone();
+                // W4-3: a thread the OS refuses is a refused connection (the
+                // closure owns the socket and the slot, and dropping it
+                // closes one and frees the other), not a panic that ends
+                // inbound accepting for the life of the process.
+                spawn_connection(&spawn_health, "mesh-in", move || {
                     let mut sock = sock;
                     let session = match crate::mesh_pq::handshake_inbound(&mut sock, &security) {
                         Ok(session) => session,
@@ -2159,9 +2309,11 @@ pub fn start(
                     {
                         let wsock = wsock.clone();
                         let half = ConnectionHalf(connection.clone());
-                        thread::spawn(move || {
-                            run_inbound_writer(rx, wsock, half);
-                        });
+                        // Without its writer this connection would take
+                        // broadcasts into a queue nobody drains.
+                        if !spawn_connection(&workers, "mesh-in-w", move || run_inbound_writer(rx, wsock, half)) {
+                            return;
+                        }
                     }
                     let peer = InboundPeer { frames: tx, connection: Arc::downgrade(&connection) };
                     if let Ok(mut reg) = inbound.lock() { reg.push(peer.clone()); }
@@ -2240,7 +2392,7 @@ pub fn start(
                     }
                 });
             }
-        });
+        })?;
     }
 
     // Both triggers use the same scheduler. Dialers only write queued frames;
@@ -2262,7 +2414,14 @@ pub fn start(
         // A literal address was counted when the set was built. A name is
         // counted where it last resolved, once, for as long as it stays there.
         let counted_at_start = addr.parse::<SocketAddr>().is_ok();
-        thread::spawn(move || {
+        let spawn_health = spawn_health.clone();
+        // W4-3: with this thread gone the peer is never dialed again and its
+        // queue fills and drops in silence.
+        spawn_essential("mesh-dialer", move || {
+            #[cfg(test)]
+            if addr == tests::PANICKING_PEER {
+                panic!("intentional: a dialer thread panics");
+            }
             let mut learned: Option<std::net::IpAddr> = None;
             // `offer` against a legacy peer: a handshake the peer closed on
             // sends the NEXT connection plain; when that plain session ends
@@ -2375,9 +2534,15 @@ pub fn start(
                 let inflight = inflight.clone();
                 // A dialled connection goes to an address the operator configured.
                 let responder = SyncResponder { socket: wsock.clone(), data_dir: data_dir.clone(), budget: sync_budget.clone(), configured: true };
-                thread::spawn(move || {
+                // W4-3: no reader, no connection. Dropping the closure drops
+                // its half and closes the socket; dial again after a pause.
+                if !spawn_connection(&spawn_health, "mesh-out-r", move || {
                     run_outbound_reader(reader, events, inflight, reader_half, responder);
-                });
+                }) {
+                    drop(writer_half);
+                    thread::sleep(backoff.next());
+                    continue;
+                }
             }
             run_connection_writer(&rx, wsock, writer_half);
             if session_started.elapsed() >= SHORT_SESSION {
@@ -2391,7 +2556,7 @@ pub fn start(
                 thread::sleep(backoff.next());
             }
             }
-        });
+        })?;
     }
 
     Ok(DevnetMesh { listen_addr, peers, sync, inbound, live })
@@ -2415,6 +2580,9 @@ mod tests {
     }
 
     use super::*;
+
+    /// A `--peers` entry whose dialer thread panics, to show it is guarded.
+    pub(super) const PANICKING_PEER: &str = "dialer-panics.invalid:1";
 
     struct SyncTestPeer {
         peer: InboundPeer,
@@ -4072,5 +4240,108 @@ mod tests {
         assert_eq!(plain_probe_wait(Duration::from_millis(1)), PLAIN_PROBE_MIN);
         assert_eq!(plain_probe_wait(Duration::from_millis(200)), Duration::from_millis(600));
         assert_eq!(plain_probe_wait(Duration::from_secs(30)), PLAIN_PROBE_MAX);
+    }
+
+    fn wait_for_essential_panic(name: &str, more_than: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::essential_thread_panics(name) <= more_than && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        crate::essential_thread_panics(name) > more_than
+    }
+
+    fn poison<T: Send + 'static>(lock: Arc<Mutex<T>>) {
+        let _ = thread::spawn(move || {
+            let _held = lock.lock().unwrap();
+            panic!("intentional: poison a mesh lock");
+        })
+        .join();
+    }
+
+    /// W4-3: the accept loop, the dialer loops, the sync timer and the
+    /// watchdog hold the essential-thread guard, and a poisoned lock on
+    /// their paths is a panic there rather than a node that silently stops
+    /// accepting, asking or broadcasting. (Under test the guard records the
+    /// thread's name; in the node it aborts the process.)
+    #[test]
+    fn the_mesh_threads_a_node_cannot_lose_end_the_process_instead_of_going_quiet() {
+        let before = |name| crate::essential_thread_panics(name);
+        let (helper, timer, watchdog, accept, dialer) = (
+            before("mesh-test-essential"), before("mesh-sync-timer"), before("mesh-watchdog"),
+            before("mesh-accept"), before("mesh-dialer"),
+        );
+        spawn_essential("mesh-test-essential", || panic!("intentional: an essential mesh thread panics")).unwrap();
+        assert!(wait_for_essential_panic("mesh-test-essential", helper));
+        // A guarded thread that returns is not a panic.
+        let (done_tx, done_rx) = mpsc::channel();
+        spawn_essential("mesh-test-essential", move || done_tx.send(()).unwrap()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(before("mesh-test-essential"), helper + 1);
+
+        let (events, _received) = mpsc::channel::<EngineEvent>();
+        let mesh = start(
+            "127.0.0.1", 0, vec![PANICKING_PEER.to_string()], events, std::env::temp_dir(),
+            Arc::new(AtomicU64::new(0)), QueueBudget::new(), Arc::new(crate::mesh_pq::MeshSecurity::plain()),
+        ).expect("bind the devnet transport");
+        assert!(wait_for_essential_panic("mesh-dialer", dialer), "a dialer loop is not guarded");
+
+        // A poisoned schedule made `pump` return early, forever.
+        let scheduler = mesh.sync.clone();
+        let _ = thread::spawn(move || {
+            let _held = scheduler.schedule.lock().unwrap();
+            panic!("intentional: poison the sync schedule");
+        })
+        .join();
+        assert!(wait_for_essential_panic("mesh-sync-timer", timer), "the sync timer kept running on a poisoned schedule");
+
+        // A poisoned registry made every broadcast skip the peers that dialed in.
+        poison(mesh.inbound.clone());
+        assert!(wait_for_essential_panic("mesh-watchdog", watchdog), "nothing noticed the poisoned peer registry");
+        let _dial = TcpStream::connect(mesh.listen_addr()).unwrap();
+        assert!(wait_for_essential_panic("mesh-accept", accept), "the accept loop kept running on a poisoned registry");
+    }
+
+    /// W4-3: a connection thread the OS refuses costs that connection and
+    /// nothing else, and only a minute-long run of nothing but refusals is
+    /// reported to the watchdog as fatal.
+    #[test]
+    fn a_refused_connection_thread_drops_the_connection_and_only_a_long_run_is_fatal() {
+        struct Owned(Arc<AtomicBool>);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let health = SpawnHealth::default();
+        let released = Arc::new(AtomicBool::new(false));
+        let owned = Owned(released.clone());
+        let started = spawn_connection_with(
+            &health,
+            "mesh-test",
+            move || drop(owned),
+            |_, body| {
+                drop(body);
+                Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "no more threads"))
+            },
+        );
+        assert!(!started);
+        assert!(released.load(Ordering::Acquire), "what the worker owned (socket, slot) was released");
+        assert!(!health.exhausted(Instant::now() + Duration::from_secs(3600)), "one refusal is never fatal");
+
+        let health = SpawnHealth::default();
+        let t0 = Instant::now();
+        for _ in 0..SPAWN_FAILURES_FATAL - 1 {
+            health.failed(t0);
+        }
+        assert!(!health.exhausted(t0 + Duration::from_secs(3600)), "too few attempts to conclude anything");
+        health.failed(t0 + Duration::from_secs(5));
+        assert!(!health.exhausted(t0 + SPAWN_FAILURE_WINDOW - Duration::from_secs(1)), "a short squeeze");
+        assert!(health.exhausted(t0 + SPAWN_FAILURE_WINDOW));
+        // One worker that does start clears the run.
+        let (done_tx, done_rx) = mpsc::channel();
+        assert!(spawn_connection(&health, "mesh-test", move || done_tx.send(()).unwrap()));
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!health.exhausted(t0 + Duration::from_secs(3600)));
     }
 }
