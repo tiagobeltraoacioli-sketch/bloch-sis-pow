@@ -701,12 +701,29 @@ pub fn decode_release_anchor_hex(text: &str) -> Result<Option<WeakSubjectivityCh
     decode_release_anchor(&bytes)
 }
 
+/// Review round 2, GATE-03: the release anchor is finalized canonical
+/// history. A gate that history was not produced under
+/// (`hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY`) cannot be armed at or
+/// below it; a build that does so refuses to start instead of failing
+/// replay on some later restart.
+#[cfg_attr(not(feature = "ws-release-anchor"), allow(dead_code))]
+fn gates_clear_of_anchor(anchor_epoch: u64) -> Result<(), String> {
+    bloch_pos_committee::hard_forks::check_gates_above_anchored_history(
+        bloch_pos_committee::hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY,
+        anchor_epoch,
+    )
+}
+
 /// The checkpoint compiled into this binary, if any. Only builds with the
 /// `ws-release-anchor` feature read `src/ws_release_anchor.rs`.
 pub fn compiled_release_anchor() -> Result<Option<WeakSubjectivityCheckpoint>, String> {
     #[cfg(feature = "ws-release-anchor")]
     {
-        decode_release_anchor_hex(crate::ws_release_anchor::RELEASE_ANCHOR_HEX)
+        let anchor = decode_release_anchor_hex(crate::ws_release_anchor::RELEASE_ANCHOR_HEX)?;
+        if let Some(cp) = &anchor {
+            gates_clear_of_anchor(cp.epoch)?;
+        }
+        Ok(anchor)
     }
     #[cfg(not(feature = "ws-release-anchor"))]
     {
@@ -3152,6 +3169,9 @@ mod tests {
             assert_eq!(compiled_release_anchor().unwrap(), on_disk);
         }
         if let Some(cp) = on_disk {
+            // GATE-03, in every build: no gate the chain was never checked
+            // against is armed at or below the baked anchor.
+            gates_clear_of_anchor(cp.epoch).expect("a gate is armed inside anchored history");
             assert_eq!(cp.network_id, 1_228_832_244, "a release bakes the mainnet anchor only");
             assert_eq!(hex32(&cp.genesis_root), MAINNET_GENESIS_ROOT_HEX);
             assert_eq!(cp.signer_set_id, WS_RELEASE_SIGNER_SET_ID);

@@ -503,6 +503,29 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Why boot replay of the durable log stopped at a block of `epoch`.
+///
+/// Review round 2, GATE-03: a gate the canonical chain was never checked
+/// against, armed at an epoch the chain had already passed, fails exactly
+/// here, on every restart. Name it, so the operator is not left with a
+/// corrupt-disk diagnosis for a release mistake.
+fn replay_failure_message(epoch: u64) -> String {
+    let mut msg =
+        String::from("durable block log failed consensus replay; refusing to serve a partial head");
+    let gates = bloch_pos_committee::hard_forks::gates_armed_at_or_below(
+        bloch_pos_committee::hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY,
+        epoch,
+    );
+    if !gates.is_empty() {
+        let list: Vec<String> = gates.iter().map(|(name, at)| format!("{name} = {at}")).collect();
+        msg.push_str(&format!(
+            ". The failing block is in epoch {epoch}, and this build arms {} at or below it: a rule that was              not in force when the block was produced. If the log is intact, this build's gate is armed in the              past and must be re-released with a future epoch",
+            list.join(", ")
+        ));
+    }
+    msg
+}
+
 /// Whether the local committed head is stale enough that validator duties
 /// must stop and the sync path must run first.
 ///
@@ -637,6 +660,102 @@ impl DutySyncGate {
         self.target_slot.is_some()
     }
 }
+
+/// Boot grace: one sync round before any duty, measured from the moment the
+/// slot loop starts (`loop_started_ms`), not from process start.
+///
+/// Review round 2, GATE-06: the grace used to be timed from engine
+/// construction, before replay. A replay longer than the grace had already
+/// used it up, and because replay refreshes `last_applied_ms` the stale-head
+/// test ([`node_is_behind`]) stayed false for the same length of time: for up
+/// to two slots a restarted validator could sign on a head hours old.
+/// Inclusive at the end so that the instant the grace ends is one at which
+/// [`node_is_behind`] already sees more than `grace_ms` without progress.
+fn in_boot_grace(now_ms: u64, loop_started_ms: u64, grace_ms: u64) -> bool {
+    now_ms.saturating_sub(loop_started_ms) <= grace_ms
+}
+
+/// Refuses validator duties after an implausible forward step of the wall
+/// clock (review round 2, GATE-07).
+///
+/// Every duty is addressed by the wall slot, and the slashing-protection
+/// watermark records it durably. A host clock that jumps forward (NTP step,
+/// bad RTC, a resumed VM) therefore spends the watermark at a future epoch;
+/// once the clock is corrected the validator refuses every attestation until
+/// real time catches up, and a KES key evolved to the future period has
+/// erased the leaves of the real one. Nothing compared the wall clock with a
+/// monotonic one.
+///
+/// This guard does, once per slot-loop turn. The wall clock may run ahead of
+/// the monotonic clock by at most `tolerance_ms` per turn; a larger forward
+/// step holds duties until either
+///
+/// * the wall clock is consistent again (the step is undone), or
+/// * the chain corroborates the new time: the canonical head is a block
+///   whose slot starts later than the pre-step clock would read now, which
+///   only peers on the new time can have produced (a slow clock that was
+///   corrected, or a host that was suspended).
+///
+/// It only ever ADDS a reason not to sign: the slashing-protection checks
+/// run unchanged behind it. A backward step is not its business (the
+/// watermark already refuses to sign below what was signed). A clock that is
+/// wrong when the process starts cannot be seen from inside; a restart is
+/// also how an operator confirms a stepped clock on a chain that is not
+/// producing blocks.
+#[derive(Default)]
+struct ClockStepGuard {
+    /// `(wall_ms, monotonic_ms)` of the last turn whose wall clock was
+    /// accepted. `None` until the first turn.
+    accepted: Option<(u64, u64)>,
+    /// Milliseconds the wall clock is ahead of the accepted baseline while
+    /// duties are held; `None` when they are not.
+    held_step_ms: Option<u64>,
+}
+
+impl ClockStepGuard {
+    /// One turn. `head_slot_start_ms` is the wall time at which the canonical
+    /// head's slot starts. Returns whether duties are held.
+    fn update(
+        &mut self,
+        wall_ms: u64,
+        monotonic_ms: u64,
+        head_slot_start_ms: u64,
+        tolerance_ms: u64,
+    ) -> bool {
+        let Some((base_wall, base_mono)) = self.accepted else {
+            self.accepted = Some((wall_ms, monotonic_ms));
+            return false;
+        };
+        // What the wall clock would read now had it advanced exactly as the
+        // monotonic clock did since the accepted baseline.
+        let expected_wall = base_wall.saturating_add(monotonic_ms.saturating_sub(base_mono));
+        let ahead = wall_ms.saturating_sub(expected_wall);
+        if ahead <= tolerance_ms {
+            // Consistent (or behind, which the watermark handles): follow it.
+            self.accepted = Some((wall_ms, monotonic_ms));
+            self.held_step_ms = None;
+            return false;
+        }
+        if head_slot_start_ms > expected_wall.saturating_add(tolerance_ms) {
+            // Corroborated by the chain: the new time is the network's.
+            self.accepted = Some((wall_ms, monotonic_ms));
+            self.held_step_ms = None;
+            return false;
+        }
+        self.held_step_ms = Some(ahead);
+        true
+    }
+
+    fn held_step_ms(&self) -> Option<u64> {
+        self.held_step_ms
+    }
+}
+
+/// Longest uncached roll (in epochs) an arriving attestation may cause
+/// without further conditions: a synced node whose head is still in the
+/// previous epoch judges votes of the wall epoch and of the next one.
+/// See `Engine::attestation_roll_admitted`.
+const ATTESTATION_FREE_ROLL_EPOCHS: u64 = 2;
 
 /// One gate for every local signing path driven by the slot loop.
 ///
@@ -1491,6 +1610,10 @@ mod state_cell {
         /// less than these two, not on there being only one.
         generation: u64,
         memo: RefCell<Vec<Entry>>,
+        /// The wall slot whose single long-roll allowance for arriving
+        /// attestations is spent (`try_spend_long_roll`). Node-local work
+        /// scheduling; it never changes what `rolled_to` returns.
+        long_roll_slot: std::cell::Cell<Option<u64>>,
     }
 
     impl StateCell {
@@ -1501,7 +1624,35 @@ mod state_cell {
                 state,
                 generation: 0,
                 memo: RefCell::new(Vec::new()),
+                long_roll_slot: std::cell::Cell::new(None),
             }
+        }
+
+        /// How many `process_epoch` calls `rolled_to(epoch)` would run right
+        /// now: the distance from the head's epoch, or from the nearest
+        /// memoized roll of this head at or below `epoch`.
+        pub(super) fn roll_distance(&self, epoch: u64) -> u64 {
+            let base_epoch = epoch_of(self.state.slot());
+            let from = self
+                .memo
+                .borrow()
+                .iter()
+                .filter(|e| e.generation == self.generation && e.epoch <= epoch)
+                .map(|e| e.epoch)
+                .max()
+                .map_or(base_epoch, |memoized| memoized.max(base_epoch));
+            epoch.saturating_sub(from)
+        }
+
+        /// Take the one long roll per wall slot that unauthenticated input
+        /// (an arriving attestation) may cause. `false` when this slot's
+        /// allowance is already spent.
+        pub(super) fn try_spend_long_roll(&self, wall_slot: u64) -> bool {
+            if self.long_roll_slot.get() == Some(wall_slot) {
+                return false;
+            }
+            self.long_roll_slot.set(Some(wall_slot));
+            true
         }
 
         /// Publish the current state to the read handle. Called by both
@@ -6478,6 +6629,43 @@ impl Engine {
         self.judge_admission(pool, AttestationAdmission::Pending(pending), epoch)
     }
 
+    /// May an arriving attestation of `epoch` make this node roll its head
+    /// forward to that epoch (review round 2, GATE-04)?
+    ///
+    /// `rolled_to` is the first work `judge_admission` does, ahead of every
+    /// check on the frame, and its cost is one `process_epoch` per epoch
+    /// between the head and the vote. The memo is per head, so a node that
+    /// is catching up (every applied block is a new head) paid that whole
+    /// distance again after each block, for votes it cannot use: its roster
+    /// is a projection of a head far behind them.
+    ///
+    /// Node-local, and it only ever turns work into `Ignore` (never a
+    /// penalty, never a block verdict):
+    ///
+    /// 1. A head more than `MAX_EPOCH_ADVANCE` epochs behind the vote cannot
+    ///    be extended into the vote's epoch by any valid block.
+    /// 2. A roll of at most [`ATTESTATION_FREE_ROLL_EPOCHS`] uncached epochs
+    ///    is the ordinary case (a synced node around an epoch boundary) and
+    ///    is always allowed; so is any roll this head already memoized.
+    /// 3. A longer roll needs a target this node holds: a vote whose target
+    ///    is unknown would only be parked, and a head that far behind does
+    ///    not reach the target while the vote is still in the window.
+    /// 4. A longer roll for a known target is what a genuinely stalled
+    ///    network needs (the head does not move, so it is rolled once and
+    ///    then served from the memo). It is allowed once per wall slot, which
+    ///    bounds what crafted frames naming an old known block can cost a
+    ///    syncing node: one long roll per slot instead of one per block.
+    fn attestation_roll_admitted(&self, epoch: u64, target_root: &[u8; 32]) -> bool {
+        if epoch.saturating_sub(epoch_of(self.state.slot())) > MAX_EPOCH_ADVANCE {
+            return false;
+        }
+        if self.state.roll_distance(epoch) <= ATTESTATION_FREE_ROLL_EPOCHS {
+            return true;
+        }
+        (self.canonical.contains(target_root) || self.blocks.contains_key(target_root))
+            && self.state.try_spend_long_roll(self.wall_slot)
+    }
+
     fn judge_admission(
         &self,
         pool: &mut AttestationPool,
@@ -6487,6 +6675,11 @@ impl Engine {
         // A forward projection cannot reconstruct a historical roster. Never
         // silently judge an older duty against the current registry.
         if epoch < epoch_of(self.state.slot()) {
+            return GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Unjudgeable);
+        }
+        // Review round 2, GATE-04: bound the roll BEFORE doing it. Nothing
+        // about the frame has been verified yet.
+        if !self.attestation_roll_admitted(epoch, &admission.attestation().data.target_root) {
             return GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Unjudgeable);
         }
         let rolled = self.rolled_to(epoch);
@@ -7303,6 +7496,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
+    // Review round 2, GATE-02: KES enforcement armed without the follow-up
+    // rules covering it is an open exposure the operator must see at every
+    // start, until the release that arms them.
+    for open in bloch_pos_committee::hard_forks::shipped_kes_follow_up_exposures() {
+        eprintln!(
+            "WARNING: KES enforcement is armed at epoch {} and {open}. Upgrade to the release that arms this gate before that epoch.",
+            bloch_pos_committee::params::HF3_KES_ENFORCE_EPOCH,
+        );
+    }
     // A build with consensus rules armed for development networks must never
     // join a funded network: refuse anything but a BPOSMAN3 development manifest.
     #[cfg(any(feature = "devnet-randao-recommit", feature = "devnet-l2-deposits"))]
@@ -7528,6 +7730,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let tx = tx.clone();
         let inflight = inflight.clone();
         std::thread::spawn(move || {
+            // GATE-08: without this thread no network event reaches the
+            // engine; a panic here must end the process, not the thread.
+            let _essential = crate::EssentialThread::new("net-event-forwarder");
             for ev in net_rx {
                 // COUNT IT IN, exactly as `net::send_to_engine` does on the
                 // devnet path.
@@ -7752,9 +7957,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // committed log, and must not be judged against a wall clock the log
         // knows nothing about. See `Engine::ingest_replay`.
         let expected_id = env.block_id();
+        let replay_epoch = epoch_of(env.header.slot);
         if !engine.ingest_replay(env) || engine.state.head() != expected_id {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
-                "durable block log failed consensus replay; refusing to serve a partial head"));
+                replay_failure_message(replay_epoch)));
         }
         // Time-based, not every-N-blocks: block cost varies by an order of
         // magnitude with how many transactions a block carries, so a fixed
@@ -8066,6 +8272,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut last_built: u64 = engine.state.slot();
     let mut last_sync_req: u64 = 0;
     let mut duty_sync_gate = DutySyncGate::default();
+    // GATE-06: boot grace runs from here, the end of replay and of the boot
+    // checks, not from engine construction.
+    engine.booted_ms = now_ms();
+    // GATE-07: the monotonic clock the wall clock is checked against.
+    let monotonic_origin = std::time::Instant::now();
+    let mut clock_step_guard = ClockStepGuard::default();
+    let mut clock_step_reported = false;
 
     // Metrics baseline (C-R6-2). The finality clock starts NOW: replay stamps
     // nothing (it re-finalizes the past), and a `last_finality_advance_unix`
@@ -8174,9 +8387,29 @@ pub fn run(cfg: Config) -> io::Result<()> {
             }
         }
 
+        // GATE-07: a wall clock that ran ahead of the monotonic clock by more
+        // than two slots in one turn is not trusted for signing until it is
+        // consistent again or the chain's head corroborates it.
+        let clock_step_held = clock_step_guard.update(
+            now,
+            monotonic_origin.elapsed().as_millis() as u64,
+            genesis_ms.saturating_add(engine.state.slot().saturating_mul(slot_ms)),
+            two_slots_ms,
+        );
+        if clock_step_held != clock_step_reported {
+            clock_step_reported = clock_step_held;
+            match clock_step_guard.held_step_ms() {
+                Some(step_ms) => eprintln!(
+                    "CLOCK STEP: the wall clock jumped {step_ms} ms ahead of the monotonic clock (wall slot {slot},                      head slot {}). Validator duties are HELD so the slashing-protection watermark is not spent                      at a future slot. They resume when the clock is consistent again or when the chain reaches                      the new time; if the new time is right and the chain is stalled, restart the node.",
+                    engine.state.slot()
+                ),
+                None => println!("clock step: the wall clock is consistent again; validator duties resume"),
+            }
+        }
+
         // Boot grace: give the mesh one round of sync before performing
         // duties, so a restarted proposer does not build on a stale head.
-        let in_grace = now.saturating_sub(engine.booted_ms) < two_slots_ms;
+        let in_grace = in_boot_grace(now, engine.booted_ms, two_slots_ms);
 
         // Decide freshness BEFORE any duty can roll the local state forward.
         // `rolled_to` is only a deterministic view of THIS head; it cannot
@@ -8212,7 +8445,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
             held_attestations_pending,
             deferred_orphans_pending,
         )
-            || engine.store.rewrite_pending();
+            || engine.store.rewrite_pending()
+            || clock_step_held;
 
         // Ask for the missing history before considering local signatures.
         // Rate-limited; idempotent on the receiving side (dedup discards
@@ -17504,6 +17738,191 @@ mod ingest_admission_tests {
         assert_eq!(epoch_of(lagging.state.slot()), 0);
         assert!(matches!(judge(&lagging, 0), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
         assert!(matches!(judge(&lagging, 9_999), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
+    }
+
+    /// **Review round 2, GATE-06: boot grace is timed from the end of
+    /// replay.** With a replay longer than the grace, the old timing (from
+    /// engine construction) left a window in which the node was neither in
+    /// grace nor "behind", because replay itself had refreshed
+    /// `last_applied_ms`.
+    #[test]
+    fn boot_grace_covers_the_restart_until_the_stale_head_test_takes_over() {
+        const SLOT_MS: u64 = 30_000;
+        let grace = 2 * SLOT_MS;
+        let constructed = 1_000_000;
+        // Replay took ten slots; its last block refreshed `last_applied_ms`.
+        let replay_done = constructed + 10 * SLOT_MS;
+        let last_applied = replay_done;
+        // A head hours old against the wall slot.
+        let (head_slot, wall_slot) = (100, 700);
+        // The slot loop starts at once, or after slow boot checks.
+        for loop_started in [replay_done, replay_done + 1, replay_done + 7_000] {
+            let mut now = loop_started;
+            while now <= loop_started + 4 * grace {
+                assert!(
+                    in_boot_grace(now, loop_started, grace)
+                        || node_is_behind(head_slot, wall_slot, now, last_applied, grace),
+                    "duties open on a stale head {} ms after the slot loop started",
+                    now - loop_started
+                );
+                now += 250;
+            }
+            assert!(in_boot_grace(loop_started, loop_started, grace));
+            assert!(in_boot_grace(loop_started + grace, loop_started, grace));
+            assert!(!in_boot_grace(loop_started + grace + 1, loop_started, grace));
+        }
+        // The defect: timed from construction, the first loop turn was
+        // outside the grace and the stale-head test was not yet true.
+        assert!(!in_boot_grace(replay_done, constructed, grace));
+        assert!(!node_is_behind(head_slot, wall_slot, replay_done, last_applied, grace));
+    }
+
+    /// **Review round 2, GATE-07: a forward wall-clock step holds duties.**
+    #[test]
+    fn a_forward_clock_step_holds_duties_until_the_clock_is_consistent() {
+        const SLOT_MS: u64 = 30_000;
+        let tol = 2 * SLOT_MS;
+        let genesis = 1_700_000_000_000u64;
+        let slot_start = |slot: u64| genesis + slot * SLOT_MS;
+        let hundred_epochs = 100 * SLOTS_PER_EPOCH * SLOT_MS;
+
+        // Normal running: both clocks advance together, with jitter, slew
+        // and one long turn (a slow block apply). Never held.
+        let mut guard = ClockStepGuard::default();
+        let (mut wall, mut mono) = (slot_start(1_000), 5_000u64);
+        assert!(!guard.update(wall, mono, slot_start(999), tol));
+        for (dw, dm) in [(500, 500), (510, 500), (495, 500), (600_000, 600_000), (tol, 0), (500, 400)] {
+            wall += dw;
+            mono += dm;
+            assert!(!guard.update(wall, mono, slot_start(999), tol), "held on +{dw}/+{dm}");
+        }
+        assert_eq!(guard.held_step_ms(), None);
+
+        // The wall clock jumps 100 epochs while monotonic time advances one
+        // slot. Held, and it stays held however long the clock stays wrong
+        // and the head stays where real time left it.
+        let before_step = wall;
+        wall += hundred_epochs;
+        mono += SLOT_MS;
+        assert!(guard.update(wall, mono, slot_start(1_001), tol));
+        assert_eq!(guard.held_step_ms(), Some(hundred_epochs - SLOT_MS));
+        for _ in 0..500 {
+            wall += SLOT_MS;
+            mono += SLOT_MS;
+            // The honest chain keeps producing on real time.
+            let real_slot = (before_step + (wall - before_step - hundred_epochs) - genesis) / SLOT_MS;
+            assert!(guard.update(wall, mono, slot_start(real_slot), tol), "released on a stepped clock");
+        }
+        // The clock is corrected: consistent with the baseline again.
+        wall -= hundred_epochs;
+        assert!(!guard.update(wall, mono, slot_start(1_500), tol));
+        assert_eq!(guard.held_step_ms(), None);
+
+        // A step just inside the tolerance is not a step; one just outside is.
+        let mut guard = ClockStepGuard::default();
+        assert!(!guard.update(1_000_000, 0, 0, tol));
+        assert!(!guard.update(1_000_000 + tol, 0, 0, tol));
+        assert!(guard.update(1_000_000 + 2 * tol + 1, 0, 0, tol));
+
+        // A legitimate correction of a slow clock (or a resumed host): the
+        // network is on the new time, the node syncs, and a head in the new
+        // time releases the hold.
+        let mut guard = ClockStepGuard::default();
+        let (wall, mono) = (slot_start(2_000), 0u64);
+        assert!(!guard.update(wall, mono, slot_start(1_999), tol));
+        let stepped = wall + hundred_epochs;
+        assert!(guard.update(stepped, mono + 500, slot_start(1_999), tol));
+        // Blocks of the old time do not corroborate, nor does one within the
+        // tolerance of the old clock.
+        assert!(guard.update(stepped + 500, mono + 1_000, slot_start(2_002), tol));
+        let new_time_slot = (stepped - genesis) / SLOT_MS - 1;
+        assert!(!guard.update(stepped + 1_000, mono + 1_500, slot_start(new_time_slot), tol));
+        // The new time is now the baseline: no hold on the next turn.
+        assert!(!guard.update(stepped + 1_500, mono + 2_000, slot_start(new_time_slot), tol));
+
+        // A backward step is left to the watermark: never held here.
+        let mut guard = ClockStepGuard::default();
+        assert!(!guard.update(5_000_000, 0, 0, tol));
+        assert!(!guard.update(1_000_000, 500, 0, tol));
+        assert!(!guard.update(1_000_500, 1_000, 0, tol));
+    }
+
+    /// **Review round 2, GATE-04: an arriving attestation cannot make a
+    /// lagging node roll its head across the whole gap for every block.**
+    #[test]
+    fn a_far_ahead_attestation_does_not_roll_a_lagging_head_per_block() {
+        use bloch_pos_committee::gossip::IgnoreReason;
+        let vote = |engine: &Engine, slot: u64, target_root: [u8; 32]| {
+            let data = AttestationData {
+                slot,
+                head: target_root,
+                source_epoch: 0,
+                source_root: *engine.chain[0].1.as_bytes(),
+                target_epoch: epoch_of(slot),
+                target_root,
+            };
+            Attestation { data, validator: 0, signature: vec![0u8; 16] }
+        };
+        let judge = |engine: &Engine, epoch: u64, target_root: [u8; 32]| {
+            engine.judge(&mut AttestationPool::new(), vote(engine, epoch * SLOTS_PER_EPOCH, target_root), epoch)
+        };
+        let unjudgeable = |d: &GossipDecision| matches!(d, GossipDecision::Ignore(IgnoreReason::Unjudgeable));
+
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.propose(1);
+        assert_eq!(epoch_of(engine.state.slot()), 0);
+        const WALL_EPOCH: u64 = 500;
+        engine.wall_slot = WALL_EPOCH * SLOTS_PER_EPOCH;
+
+        // Honest gossip while syncing: the target is a block this node does
+        // not hold yet. Ignored with no roll at all.
+        let d = judge(&engine, WALL_EPOCH, [0xAB; 32]);
+        assert!(unjudgeable(&d), "{d:?}");
+        assert_eq!(engine.state.memo_len(), 0, "an unknown-target vote must not roll the head");
+
+        // Beyond the consensus epoch walk nothing on this head can reach the
+        // vote's epoch: ignored with no roll, known target or not.
+        let head = *engine.head_id().as_bytes();
+        let d = judge(&engine, MAX_EPOCH_ADVANCE + 1, head);
+        assert!(unjudgeable(&d), "{d:?}");
+        assert_eq!(engine.state.memo_len(), 0);
+
+        // A known target (the stalled-network case): the long roll happens,
+        // once, and later votes of the same head are served from the memo.
+        assert_eq!(engine.state.roll_distance(WALL_EPOCH), WALL_EPOCH);
+        let _ = judge(&engine, WALL_EPOCH, head);
+        assert!(engine.state.memo_len() > 0, "a stalled head must still judge the wall epoch");
+        assert_eq!(engine.state.roll_distance(WALL_EPOCH), 0);
+        assert_eq!(engine.state.roll_distance(WALL_EPOCH + 1), 1);
+        assert!(engine.attestation_roll_admitted(WALL_EPOCH, &head));
+        assert!(engine.attestation_roll_admitted(WALL_EPOCH + 1, &head));
+
+        // Catch-up: the next applied block is a new head and empties the
+        // memo. A second long roll in the same wall slot is refused, so the
+        // cost is no longer the gap times the number of applied blocks.
+        engine.propose(2);
+        let head = *engine.head_id().as_bytes();
+        assert_eq!(engine.state.memo_len(), 0);
+        let d = judge(&engine, WALL_EPOCH, head);
+        assert!(unjudgeable(&d), "{d:?}");
+        assert_eq!(engine.state.memo_len(), 0, "the roll repeated after an applied block");
+
+        // The next wall slot has its own allowance.
+        engine.wall_slot += 1;
+        let _ = judge(&engine, WALL_EPOCH, head);
+        assert!(engine.state.memo_len() > 0);
+
+        // A synced node at an epoch boundary is never restricted: the wall
+        // epoch and the next one are within the free distance, known target
+        // or not, any number of times per slot.
+        let (mut synced, _dir) = perf_support::proposing_engine();
+        synced.propose(1);
+        synced.wall_slot = SLOTS_PER_EPOCH;
+        for _ in 0..3 {
+            assert!(synced.attestation_roll_admitted(1, &[0xAB; 32]));
+            assert!(synced.attestation_roll_admitted(2, &[0xAB; 32]));
+            synced.propose(synced.state.slot() + 1);
+        }
     }
 
     /// From the KES gate on, a bad vote signature needs the finalized
