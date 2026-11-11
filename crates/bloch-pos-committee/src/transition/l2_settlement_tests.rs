@@ -1736,6 +1736,66 @@ mod l2_tests {
         assert!(l2.escrow_conserved());
     }
 
+    /// W1-2: the node's preflight for a block in a later epoch than the head
+    /// skips the finality test and nothing else. A matured, not yet
+    /// finalized claim that pays no fee, spends nothing it owns or names an
+    /// absent input is refused for that; the transition's own verdict on the
+    /// same state is unchanged; and with finality the two checks agree.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn the_claim_preflight_before_finality_runs_every_other_check() {
+        let (mut young, _) = funded_async_fixture();
+        let l2 = young.l2_settlement.as_mut().unwrap();
+        l2.append_deposit(crate::l2_settlement::InboxRecord {
+            height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 50_000_000, recipient: [0x42; 20],
+        })
+        .unwrap();
+        let accepted = l2.height() + 1;
+        l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&wleaves(3)), count: 3, height: accepted });
+        for _ in 0..WITHDRAW_DELAY_BLOCKS {
+            l2.advance_height().unwrap();
+        }
+        let fee = young.next_base_fee();
+        let good = claim_tx(&young, ([0x33; 32], 0), FUNDED, 3, 1);
+        let mut unpaid = good.clone();
+        unpaid.change.value += 1;
+        let unpaid = resign_claim(unpaid);
+        let mut absent = good.clone();
+        absent.inputs[0].txid = [0x34; 32];
+        let absent = resign_claim(absent);
+        let mut unowned = good.clone();
+        unowned.funding_pubkey = vec![0x5b; crate::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let unowned = resign_claim(unowned);
+        let other_leaf = resign_claim(L2WithdrawClaim { index: 0, ..good.clone() });
+
+        let cases = [
+            (&good, None),
+            (&unpaid, Some(ClaimReject::Conservation)),
+            (&absent, Some(ClaimReject::MissingInput)),
+            (&unowned, Some(ClaimReject::Ownership)),
+            // What precedes the finality test is still judged first.
+            (&other_leaf, Some(ClaimReject::Proof)),
+        ];
+        for (tx, before_finality) in &cases {
+            if *before_finality != Some(ClaimReject::Proof) {
+                assert_eq!(young.l2_withdraw_claim_refusal_at(tx, fee), Some(ClaimReject::NotFinalized));
+                // The transition is unchanged: it still stops at finality.
+                let mut state = young.clone();
+                assert_eq!(
+                    state.apply_transaction(&claim(tx), 0, fee, &ToyVerifier),
+                    Err(TxReject::L2WithdrawClaim(ClaimReject::NotFinalized))
+                );
+                assert_eq!(state, young);
+            }
+            assert_eq!(young.l2_withdraw_claim_refusal_before_finality_at(tx, fee), *before_finality);
+        }
+        finalize_all(&mut young);
+        for (tx, verdict) in &cases {
+            assert_eq!(young.l2_withdraw_claim_refusal_at(tx, fee), *verdict);
+            assert_eq!(young.l2_withdraw_claim_refusal_before_finality_at(tx, fee), *verdict);
+        }
+    }
+
     #[test]
     #[cfg(feature = "devnet-l2-user-txs")]
     fn a_leaf_is_claimed_once_in_a_block_across_blocks_and_never_again() {

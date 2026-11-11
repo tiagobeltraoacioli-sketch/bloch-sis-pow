@@ -2815,7 +2815,7 @@ const _: () = assert!(gate_is_inert_or_not_before(
     L2_SETTLEMENT_ACTIVATION_EPOCH
 ));
 
-pub(crate) fn l2_release_exemption_active(epoch: u64) -> bool {
+pub fn l2_release_exemption_active(epoch: u64) -> bool {
     #[cfg(test)]
     if l2_release_exemption_rehearsal::enabled() {
         return true;
