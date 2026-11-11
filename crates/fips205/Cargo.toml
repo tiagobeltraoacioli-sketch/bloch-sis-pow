@@ -1,7 +1,9 @@
 # VENDORED COPY of fips205 0.4.1 (IntegrityChain, MIT OR Apache-2.0) — the
 # SLH-DSA (FIPS 205) implementation behind optional signature suite 0x0003
-# (SLH-DSA-SHAKE-128s || Falcon-1024, hard fork HF3, gated by
-# HF3_SLH_SUITE_EPOCH = u64::MAX in bloch-crypto and bloch-pos-committee).
+# (SLH-DSA-SHAKE-128s || Falcon-1024, hard fork HF3). The gate is ARMED:
+# bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH = 7360, the only HF3
+# constant (bloch-crypto holds none). From that epoch this crate is a
+# consensus verifier, not dead code.
 #
 # PROVENANCE: `src/`, `README.md`, `CHANGELOG.md`, `SECURITY.md` and the two
 # LICENSE files are byte-identical to the crates.io package fips205 0.4.1

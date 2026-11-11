@@ -13576,10 +13576,10 @@ mod tests {
             tx
         }
 
-        /// TRIPWIRE: HF3 ships inert. Arming it is a release decision taken
-        /// together with `bloch_crypto::crypto::HF3_SLH_SUITE_EPOCH`.
+        /// TRIPWIRE: HF3 is armed at epoch 7360. Moving it is a release
+        /// decision; `params::HF3_SLH_SUITE_EPOCH` is the only constant.
         #[test]
-        fn hf3_slh_suite_gate_is_inert() {
+        fn hf3_slh_suite_gate_is_armed_at_7360() {
             assert_eq!(crate::params::HF3_SLH_SUITE_EPOCH, 7360);
             for e in [0, 1, 6_017, 7_359, 7_360, u64::MAX - 1, u64::MAX] {
                 assert_eq!(crate::params::hf3_slh_suite_active(e), e >= 7360);
