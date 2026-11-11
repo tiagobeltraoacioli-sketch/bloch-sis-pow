@@ -141,6 +141,15 @@ sudo journalctl -u bloch-l2-mainnet-settler.service --since "<T0 - 6 h>" -o cat
 B3. **Can the reset still apply?** Let C = N's withdrawal count. If any bit at or above C is set in
 `withdrawals.claimed` (A6), `reset_head` will refuse at R. Re-check this every hour until R.
 
+**[v4, review R308-2P-3]** After the swap that is not the only refusal of the PLAIN form: it also
+refuses when any claim was proven against a withdrawal record above N, whatever leaf it paid. L1
+holds roots, not leaves, so one honest claim of a leaf of N's own tree, proven against a newer
+root as wallets do, is enough, and anyone can send one between the release and R. The forfeit
+form is not refused for it. Do not work this out by hand: a node that runs the armed release
+answers it in `getl2settlement.head_resets` (one entry per compiled reset: `pending`,
+`would_apply`, `refusal`, and for `paid_beyond_target` the leaf indices in `paid_against_tail`).
+`would_apply: false` while `pending: true` means that R will move the program and NOT the head.
+
 B4. Decision D1, the form:
 
 | Case | Reset still possible | Form |
@@ -238,7 +247,9 @@ from the first block of R.
 
 E2. **[v2]** Decision D5: did the reset apply? `getl2settlement.accepted.statement` decodes to
 L2 number N and `accepted.commitment` equals `reset.json`. If not, the reset refused: go to "Reset
-impossible" or G2b without reset.
+impossible" or G2b without reset. **[v4]** Every node logs one line in the block that moves the
+program: `L2 head reset APPLIED at slot ...`, or `CRITICAL: L2 head reset REFUSED at slot ...`
+with the reason.
 
 E3. A non-upgraded node stops at R's first slot with a state-root refusal. Point its operator at the
 release.
