@@ -194,6 +194,9 @@ pub enum FundedDelegationReject {
     AlreadyWithdrawn,
     Commission,
     CommissionIncreaseWithDelegations,
+    /// A second update for the same validator in one epoch
+    /// ([`crate::params::COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH`]).
+    CommissionAlreadyUpdated,
     Arithmetic,
     /// The position-count limits of
     /// [`crate::params::FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH`].
@@ -758,6 +761,14 @@ impl CommittedState {
         if tx.commission_bps == record.commission_bps {
             return Err(R::Commission);
         }
+        // Security review round 2, DET-3: the message has no nonce and pays
+        // no fee, so "differs from the committed value" let two signed
+        // values of one epoch be re-applied in turn by anyone. One update
+        // per validator per epoch. Inert below the gate.
+        let limited = crate::params::commission_update_limit_active(self.epoch);
+        if limited && self.commission_update_epochs.get(&tx.validator) == Some(&self.epoch) {
+            return Err(R::CommissionAlreadyUpdated);
+        }
         if tx.commission_bps > record.commission_bps {
             let registry = delegation::Registry::resolve(&self.delegations, self.epoch);
             if self.delegations.iter().any(|delegation| {
@@ -780,6 +791,9 @@ impl CommittedState {
             .ok_or(FundedDelegationReject::Validator)?;
 
         validator.commission_bps = tx.commission_bps;
+        if limited {
+            self.commission_update_epochs.insert(tx.validator, self.epoch);
+        }
         Ok(Self::staking_tx_charge(
             self.epoch,
             1,

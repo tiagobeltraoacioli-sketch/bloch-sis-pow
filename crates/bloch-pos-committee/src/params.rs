@@ -2729,6 +2729,57 @@ pub(crate) mod funded_delegation_bound_rehearsal {
     }
 }
 
+/// Security review round 2, DET-3: at most one `ValidatorCommissionUpdate`
+/// per validator per epoch. `u64::MAX` means INERT.
+///
+/// The update carries no nonce and pays no fee; its only replay protection
+/// was "the value must differ from the committed one". Once a validator had
+/// signed two values in one epoch, each message became valid again as soon as
+/// the other had been applied, any number of times in one block and from any
+/// sender: a third party chose which value stood at the end of the epoch,
+/// and a proposer had an unlimited supply of valid zero-fee transactions.
+///
+/// Once armed, an accepted update records its epoch for the validator
+/// (`CommittedState::commission_update_epochs`) and a further update for the
+/// same validator in the same epoch is refused
+/// (`FundedDelegationReject::CommissionAlreadyUpdated`). The record is
+/// committed state: one leaf per validator that has updated under the gate,
+/// keyed under the validator component with a key no validator index can
+/// produce, and one optional local-cache section. Below the gate nothing is
+/// recorded, so every state root and every cache keeps its bytes.
+///
+/// It changes which transactions are valid and it changes committed state,
+/// so arming needs a historical replay, mixed-fleet qualification and a
+/// coordinated epoch; there is no runtime override. It cannot precede funded
+/// delegation, which is what makes the message valid at all.
+/// `commission_update_limit_gate_is_inert` pins the inert value.
+pub const COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH,
+    FUNDED_DELEGATION_ACTIVATION_EPOCH
+));
+
+pub(crate) fn commission_update_limit_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if commission_update_limit_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod commission_update_limit_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Flag day for the native L2 settlement on a network that is already running
 /// (M8 part 2), activated on mainnet at the epoch recorded below.
 ///

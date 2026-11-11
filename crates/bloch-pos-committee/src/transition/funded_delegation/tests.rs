@@ -1421,6 +1421,146 @@ fn a_full_validator_admits_a_larger_position_by_displacing_the_smallest() {
     assert!(state.funded_delegation_lifecycle.get(&0).map_or(true, |entry| entry.1));
 }
 
+// ── Security review round 2, DET-3: one commission update per epoch ─────────
+// (`params::COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH`)
+
+use crate::params::commission_update_limit_rehearsal;
+
+#[test]
+fn commission_update_limit_gate_is_inert() {
+    assert_eq!(crate::params::COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH, u64::MAX);
+    for epoch in [0, 4_669, 7_400, u64::MAX - 1, u64::MAX] {
+        assert!(!crate::params::commission_update_limit_active(epoch));
+    }
+    let _limit = commission_update_limit_rehearsal::open();
+    assert!(crate::params::commission_update_limit_active(0));
+}
+
+/// Inert: the rule is what it was. Two signed values of one epoch can be
+/// applied in turn any number of times, nothing is recorded, and the state
+/// (root included) is what it is without this change.
+#[test]
+fn inert_commission_limit_records_nothing_and_keeps_todays_rule() {
+    let _gate = funded_delegation_rehearsal::open();
+    let (mut state, _) = fixture();
+    state.validators.get_mut(&0).unwrap().commission_bps = 0;
+    let to_500 = commission_update(&state, 500);
+    let to_300 = commission_update(&state, 300);
+    let leaves = state.state_tree().len();
+    for _ in 0..3 {
+        state.apply_validator_commission_update(&to_500, &AuthVerifier).unwrap();
+        state.apply_validator_commission_update(&to_300, &AuthVerifier).unwrap();
+    }
+    assert_eq!(state.validators[&0].commission_bps, 300);
+    assert!(state.commission_update_epochs.is_empty());
+    assert_eq!(state.state_tree().len(), leaves, "no leaf was added");
+    // The component is absent from the root while empty: recording an
+    // update is the only thing that moves it.
+    let mut recorded = state.clone();
+    recorded.commission_update_epochs.insert(0, recorded.epoch);
+    assert_ne!(recorded.state_root(), state.state_root());
+    assert_eq!(recorded.state_tree().len(), leaves + 1);
+    // A boundary leaves nothing behind either.
+    assert!(state.close_epoch().commission_update_epochs.is_empty());
+}
+
+/// Armed: the second signed value of the epoch is refused whoever sends it,
+/// in the same block or a later one, so neither message can be replayed;
+/// the next epoch starts clean.
+#[test]
+fn armed_commission_limit_admits_one_update_per_validator_per_epoch() {
+    let _gate = funded_delegation_rehearsal::open();
+    let _limit = commission_update_limit_rehearsal::open();
+    let (mut state, _) = fixture();
+    for record in state.validators.values_mut() {
+        record.commission_bps = 0;
+    }
+    let to_500 = commission_update(&state, 500);
+    let to_300 = commission_update(&state, 300);
+    let clean_root = state.state_root();
+    state.apply_validator_commission_update(&to_500, &AuthVerifier).unwrap();
+    assert_eq!(state.commission_update_epochs, BTreeMap::from([(0, state.epoch)]));
+
+    let before = state.clone();
+    for replayed in [&to_300, &to_500, &to_300] {
+        let refusal = state.apply_validator_commission_update(replayed, &AuthVerifier).unwrap_err();
+        assert!(matches!(
+            refusal,
+            FundedDelegationReject::CommissionAlreadyUpdated | FundedDelegationReject::Commission
+        ));
+        assert_eq!(state, before, "a refusal must not touch state");
+    }
+    assert_eq!(
+        state.apply_validator_commission_update(&to_300, &AuthVerifier),
+        Err(FundedDelegationReject::CommissionAlreadyUpdated)
+    );
+    assert_eq!(state.validators[&0].commission_bps, 500);
+
+    // Another validator still has its own update this epoch.
+    let mut other = commission_update(&state, 700);
+    other.validator = 1;
+    other.signature = auth_sign(&state.validators[&1].pubkey, &other.signing_root());
+    state.apply_validator_commission_update(&other, &AuthVerifier).unwrap();
+    assert_eq!(state.commission_update_epochs.len(), 2);
+
+    // The record is committed: a state that forgot it has another root.
+    let mut forgetful = state.clone();
+    forgetful.commission_update_epochs.clear();
+    assert_ne!(forgetful.state_root(), state.state_root());
+    assert_eq!(state.state_tree().len(), forgetful.state_tree().len() + 2);
+    assert_ne!(state.state_root(), clean_root);
+
+    // The boundary empties it, and the new epoch admits one update again.
+    let mut next = state.close_epoch();
+    assert!(next.commission_update_epochs.is_empty());
+    assert_eq!(next.state_tree().len(), forgetful.close_epoch().state_tree().len());
+    assert_eq!(next.state_root(), forgetful.close_epoch().state_root());
+    let later = commission_update(&next, 300);
+    next.apply_validator_commission_update(&later, &AuthVerifier).unwrap();
+    assert_eq!(next.validators[&0].commission_bps, 300);
+    let back = commission_update(&next, 500);
+    assert_eq!(
+        next.apply_validator_commission_update(&back, &AuthVerifier),
+        Err(FundedDelegationReject::CommissionAlreadyUpdated)
+    );
+}
+
+/// The record survives the local restart cache (a node restored in the
+/// middle of an epoch must refuse what the others refuse), and a state
+/// without it keeps exactly the cache bytes it had.
+#[test]
+#[cfg(feature = "local-state-cache")]
+fn local_cache_round_trips_the_commission_update_record() {
+    let _gate = funded_delegation_rehearsal::open();
+    let (mut state, _) = fixture();
+    state.validators.get_mut(&0).unwrap().commission_bps = 0;
+    state.slot = state.epoch * SLOTS_PER_EPOCH;
+    let header_for = |state: &CommittedState| BlockHeaderV4 {
+        version: BLOCK_VERSION_V4, parent: [0; 32], state_root: state.compute_root(),
+        body_root: [0; 32], slot: state.slot, proposer_index: 0,
+        randao_reveal: [0; 32], randao_mix: state.randao_mix,
+        justified_root: [0; 32], finalized_root: [0; 32],
+        attestation_root: [0; 32], coherence_root: [0; 32],
+    };
+    let plain = state.encode_local_cache().unwrap();
+    assert_eq!(plain, state.encode_local_cache_owned_reference().unwrap(), "no section while empty");
+
+    let _limit = commission_update_limit_rehearsal::open();
+    let update = commission_update(&state, 500);
+    state.apply_validator_commission_update(&update, &AuthVerifier).unwrap();
+    let header = header_for(&state);
+    state.head = header.id();
+    let bytes = state.encode_local_cache().unwrap();
+    assert!(bytes.len() > plain.len());
+    let restored = CommittedState::decode_local_cache(&bytes, &header).unwrap();
+    assert_eq!(restored, state);
+    assert_eq!(restored.commission_update_epochs, BTreeMap::from([(0, state.epoch)]));
+    // Dropping the section yields a state the header does not commit to.
+    let section = crate::wire_alloc::local_cache::COMMISSION_UPDATES;
+    let cut = bytes.windows(section.len()).rposition(|w| w == section).unwrap();
+    assert!(CommittedState::decode_local_cache(&bytes[..cut], &header).is_err());
+}
+
 /// A pruned state survives the local restart cache: the pruned slot comes
 /// back in place and the restored state has the header's root. A history
 /// that ends in a pruned slot is refused, because no committed leaf would
