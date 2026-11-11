@@ -4135,8 +4135,8 @@ mod tests {
 
     /// W3-3 (V2-6), through the accept loop: an address listed in `--peers`
     /// once gets `2 * 1 + 2` exempt connections, and the next ones from it
-    /// are ordinary (here: the pending share of a source that sends
-    /// nothing). With the accept loop treating every connection from a
+    /// are ordinary (here: the per-source share of an unconfigured address,
+    /// `MAX_INBOUND_PER_SOURCE`). With the accept loop treating every connection from a
     /// listed address as configured, all of them would be kept.
     #[test]
     fn the_accept_loop_rations_the_configured_standing_of_a_listed_address() {
@@ -4160,7 +4160,7 @@ mod tests {
         let exempt = 2 * listed_here + 2;
         assert!(inbound_slots::Standing::for_source(listed_here, exempt - 1).is_configured());
         assert!(!inbound_slots::Standing::for_source(listed_here, exempt).is_configured());
-        let kept = exempt + MAX_PENDING_INBOUND_PER_SOURCE;
+        let kept = exempt + MAX_INBOUND_PER_SOURCE;
         let total = kept + 6;
         let mut conns = Vec::with_capacity(total);
         for _ in 0..total {
@@ -4174,7 +4174,7 @@ mod tests {
         assert_eq!(
             mesh.peer_count(),
             kept,
-            "a listed address holds its exempt connections plus an ordinary source's pending share, no more"
+            "a listed address holds its exempt connections plus an ordinary source's share, no more"
         );
         // The accept loop is sequential, so the ones past both shares are
         // the last six, and the server closed them.
