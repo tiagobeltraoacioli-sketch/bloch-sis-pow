@@ -9937,8 +9937,13 @@ impl KesSigner {
     ///   epoch of the successor's start period: a `KesRotate` is only valid
     ///   in a block of an earlier period, so that block is an ancestor of
     ///   the finalized one and this node does not reorganize below it.
-    /// - Destroyed when the old tree no longer covers the period (expired):
-    ///   it could sign nothing even if the handover were undone.
+    /// - Destroyed when the finalized checkpoint is at or past the first
+    ///   epoch after the old tree's last period (expired): it could sign
+    ///   nothing on any chain this node can still follow. Judged by the
+    ///   finalized epoch like the rule above, never by the duty or wall
+    ///   period (review W2-4): erasure cannot be undone, and a clock that
+    ///   jumped forward must not destroy the key a reorg of the unfinalized
+    ///   handover would need.
     /// - Otherwise evolved to the old tree's leaf for the period, under the
     ///   same clock-jump rule as the key in force (review F-5), so it holds
     ///   no seed of a past period.
@@ -9964,7 +9969,10 @@ impl KesSigner {
             .chain(entry.retired.iter().rev().map(|r| r.public))
             .find(|public| public.same_tree(&old_tree));
         let leaf = on_chain.and_then(|public| public.leaf_index(period));
-        let expired = on_chain.is_some_and(|public| period >= public.end_period());
+        let expired = on_chain.is_some_and(|public| {
+            finalized_epoch
+                >= schedule.activation_epoch.saturating_add(public.end_period().saturating_mul(schedule.period_epochs))
+        });
         if finalized_epoch >= handover_epoch || expired {
             match crate::kes_key::shred_retired(&self.dir) {
                 Ok(()) => {

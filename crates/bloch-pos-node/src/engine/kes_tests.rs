@@ -403,6 +403,56 @@ fn a_replaced_kes_key_survives_a_reorg_across_the_handover_and_is_shredded_at_fi
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Review W2-4: the replaced key is destroyed on the chain's finalized epoch
+/// only. A duty or wall period far past the old tree's last period (a clock
+/// that jumped forward) while the handover is not final keeps it, so a
+/// reorg of that handover can still swap back; it goes once the finalized
+/// checkpoint is past the old tree's last period.
+#[test]
+fn a_clock_jump_does_not_destroy_the_replaced_kes_key() {
+    let dir = std::env::temp_dir().join(format!("bloch-kes-w24-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let unlock_for = || Unlock::passphrase_with("kes-w24-test-passphrase", KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 });
+    let unlock = unlock_for();
+    let key = crate::kes_key::KesKey::generate(4, 2, |_| {}).unwrap();
+    key.save(&dir, &unlock).unwrap();
+    let tree = key.public();
+    let old_chain = KesPublic::new(tree.depth, tree.root, 7);
+    let end = old_chain.end_period();
+    let retired_path = dir.join(crate::kes_key::RETIRED_FILE_NAME);
+    let schedule = bloch_pos_committee::params::kes_schedule();
+    let first_epoch = |period: u64| schedule.activation_epoch + period * schedule.period_epochs;
+
+    let mut signer = KesSigner::new(key, dir.clone(), unlock_for());
+    let successor = crate::kes_key::KesKey::generate(4, 1, |_| {}).unwrap();
+    successor.save_next(&dir, &unlock).unwrap();
+    let next_tree = successor.public();
+    signer.next = Some(successor);
+
+    // The successor takes over in the period after the old tree's last one,
+    // so only the expiry rule can destroy the old key before that handover
+    // is final.
+    let handover = end + 1;
+    let branch = entry(old_chain, Some(KesPublic::new(next_tree.depth, next_tree.root, handover)));
+    signer.adopt_successor(&branch.in_force(handover)).unwrap();
+    assert!(retired_path.exists());
+
+    // The wall clock says a period far past the old tree's end; the chain
+    // has finalized nothing past it.
+    signer.settle_replaced(&branch, end + 40, Some(handover), first_epoch(end) - 1);
+    assert!(signer.retired.is_some() && retired_path.exists(), "kept: the chain has not finalized past the old tree");
+    signer.adopt_successor(&old_chain).unwrap();
+    assert_eq!(signer.key.public().root, tree.root, "so a reorg of the handover can still swap back");
+    signer.adopt_successor(&branch.in_force(handover)).unwrap();
+
+    // Finalized past the old tree's last period (the handover itself is not
+    // final yet): destroyed.
+    signer.settle_replaced(&branch, handover, Some(handover), first_epoch(end));
+    assert!(signer.retired.is_none() && !retired_path.exists(), "shredded on the finalized epoch");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Review F-1: KES leaves are signed and verified in the canonical,
 /// suite-bound v2 form from the first KES signature, so the
 /// `SIG_CANONICAL` flag day cannot silence them. The plain (v1) check refuses
