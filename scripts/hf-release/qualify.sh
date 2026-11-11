@@ -115,7 +115,8 @@ SLOTS_PER_EPOCH=32
 
 case "${1:-}" in -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;; esac
 COMMIT_ARG="${1:-}"; [ $# -gt 0 ] && shift
-SOURCE="" BASELINE_BIN="" OUT="" BASE_COMMIT=b4a21fb657d0beb17f64c62889b605c9a7a2d031 BASE_COMMIT_DEFAULT=1
+FLEET_BASE_COMMIT=b4a21fb657d0beb17f64c62889b605c9a7a2d031
+SOURCE="" BASELINE_BIN="" OUT="" BASE_COMMIT=$FLEET_BASE_COMMIT BASE_COMMIT_DEFAULT=1
 FORCE_EPOCH="" WINDOW=16 JOBS=8 PIN_CANDIDATES=4 EXPECT_SLOT="" EXPECT_ROOT=""
 SKIP_TESTS=0 SKIP_FORCED=0 UNSANDBOXED=0 GATES_ONLY=0 FORCED_ONLY=0 RELAX_ORDER=0 DRY_RUN=0
 # Source-digests of the releases the fleet has run (78d4921c, fa980367).
@@ -177,6 +178,11 @@ done
 die() { echo "qualify: FAIL - $*" >&2; exit 1; }
 COMMIT="$(git -C "$REPO" rev-parse --verify --quiet "$COMMIT_ARG^{commit}")" || die "unknown commit $COMMIT_ARG"
 BASE_COMMIT="$(git -C "$REPO" rev-parse --verify --quiet "$BASE_COMMIT^{commit}")" || die "unknown base commit"
+# The default named explicitly is still the default (review R308-10): the G-3
+# refusal below keys on the commit, not on whether the option was typed.
+if [ "$BASE_COMMIT" = "$(git -C "$REPO" rev-parse --verify --quiet "$FLEET_BASE_COMMIT^{commit}" || true)" ]; then
+  BASE_COMMIT_DEFAULT=1
+fi
 # Release integrity (HF1 review H-3): the candidate must descend from the
 # fleet release, or it silently drops what that release fixed (for example
 # the pre-activation offence refusal). Never qualify a source branch that

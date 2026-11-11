@@ -250,7 +250,13 @@ impl BrakeCell {
         inner.stamp = stamp;
         inner.judged = judged;
         let read = |p: &Path, max: u64| -> Result<Vec<u8>, String> {
-            if std::fs::metadata(p).map_err(|e| format!("{}: {e}", p.display()))?.len() > max {
+            // A FIFO or a device at this path would block the reader or
+            // never end (review R308-11); a link to a regular file is read.
+            let meta = std::fs::metadata(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            if !meta.is_file() {
+                return Err(format!("{} is not a regular file", p.display()));
+            }
+            if meta.len() > max {
                 return Err(format!("{} exceeds {max} bytes", p.display()));
             }
             std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))
@@ -490,6 +496,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// R308-11: a FIFO at the brake file's path is refused without being
+    /// opened (reading it would block the slot loop). Skipped where `mkfifo`
+    /// is not available.
+    #[test]
+    #[cfg(unix)]
+    fn a_special_file_at_the_brake_path_is_refused_unread() {
+        let (pk, _) = bloch_crypto::crypto::generate_keypair();
+        let dir = scratch("fifo");
+        let made = std::process::Command::new("mkfifo").arg(dir.join(FILE)).status().is_ok_and(|s| s.success());
+        if !made {
+            return;
+        }
+        std::fs::write(dir.join(SIG_FILE), b"00").unwrap();
+        let cell = BrakeCell::new(Some(dir.clone()), Some(pk));
+        cell.refresh(1, 10_000, Some(NET), Some(700_770));
+        assert!(matches!(cell.status(), Status::Refused(why) if why.contains("not a regular file")));
     }
 
     #[test]

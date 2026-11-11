@@ -1755,6 +1755,21 @@ pub mod mainnet {
     // fallback on the next rules without forced inclusion).
     const _: () = assert!(same_hash(&PROGRAM_NEXT.identities[0], &PROGRAM_FALLBACK.identities[0]));
     const _: () = assert!(same_hash(&PROGRAM_NEXT.proof_policy, &PROGRAM_FALLBACK.proof_policy));
+    // Each program change, and the head reset compiled with it, runs once
+    // because the policy stops matching after the replacement: the replacing
+    // program must differ from the one it replaces (review R308-12).
+    const fn same_program(a: &[[u8; 32]; 4], b: &[[u8; 32]; 4]) -> bool {
+        same_hash(&a[0], &b[0]) && same_hash(&a[1], &b[1]) && same_hash(&a[2], &b[2]) && same_hash(&a[3], &b[3])
+    }
+    const _: () = assert!(!same_program(&PROGRAM_NEXT.identities, &PROGRAM_FALLBACK.identities));
+    const _: () = assert!(match &PROGRAM {
+        Some(pinned) => {
+            let [_, _, _, a, b, c, d] = &pinned.identities;
+            !same_program(&[*a, *b, *c, *d], &PROGRAM_NEXT.identities)
+        }
+        None => true,
+    });
+
     /// OPTION, an owner decision, absent by default: a one-time reset of the
     /// settled L2 head, applied by [`super::State::install_next_program`] in the
     /// same transition as the swap. Without it the swap prevents an off-rule block
