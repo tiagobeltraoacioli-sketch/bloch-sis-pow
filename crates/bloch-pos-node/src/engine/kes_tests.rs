@@ -314,6 +314,95 @@ fn the_duty_signer_signs_with_the_leaf_of_the_keys_own_start() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Review PER-1: the successor is promoted on unfinalized head state, so the
+/// replaced key must survive until the handover is final. With real hybrid
+/// leaves: after the swap the old key is kept and evolved (no seed of a past
+/// period); when a reorg removes the rotation and the chain names the old
+/// tree again, the node swaps back, signs a duty the old tree verifies, and
+/// can sign a new `KesRotate`; once the finalized checkpoint reaches the
+/// successor's first epoch the old key is shredded.
+#[test]
+fn a_replaced_kes_key_survives_a_reorg_across_the_handover_and_is_shredded_at_finality() {
+    let dir = std::env::temp_dir().join(format!("bloch-kes-per1-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let unlock_for = || Unlock::passphrase_with("kes-per1-test-passphrase", KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 });
+    let unlock = unlock_for();
+    let keys = Keystore::generate_with(&dir, 4, &Unlock::PlaintextOptIn).unwrap();
+    let key = crate::kes_key::KesKey::generate(4, 3, |_| {}).unwrap();
+    key.save(&dir, &unlock).unwrap();
+    let tree = key.public();
+    let old_chain = KesPublic::new(tree.depth, tree.root, 7);
+    let domain = Some([0xD7; 32]);
+    let verifier = HybridVerifier::new();
+    let root = [0x42; 32];
+    let retired_path = dir.join(crate::kes_key::RETIRED_FILE_NAME);
+    let schedule = bloch_pos_committee::params::kes_schedule();
+    let first_epoch = |period: u64| schedule.activation_epoch + period * schedule.period_epochs;
+
+    let mut signer = KesSigner::new(key, dir.clone(), unlock_for());
+    signer.key.evolve_to(&signer.dir, &signer.unlock, old_chain.leaf_index(9).unwrap()).unwrap();
+    let successor = crate::kes_key::KesKey::generate(4, 2, |_| {}).unwrap();
+    successor.save_next(&dir, &unlock).unwrap();
+    let next_tree = successor.public();
+    signer.next = Some(successor);
+
+    // Branch A: the rotation was included in period 9; period 10 begins.
+    let new_chain = KesPublic::new(next_tree.depth, next_tree.root, 10);
+    let branch_a = entry(old_chain, Some(new_chain));
+    signer.adopt_successor(&branch_a.in_force(10)).unwrap();
+    assert_eq!(signer.key.public().root, next_tree.root);
+    assert!(retired_path.exists(), "the replaced key is kept, not shredded");
+    assert_eq!(signer.retired.as_ref().unwrap().period(), 2, "still at its last leaf (period 9)");
+
+    // Not final yet: kept, and evolved to the old tree's leaf for period 10
+    // so the seed of period 9 is erased like any past period.
+    signer.settle_replaced(&branch_a, 10, Some(10), first_epoch(10) - 1);
+    assert_eq!(signer.retired.as_ref().unwrap().period(), 3);
+    assert_eq!(crate::kes_key::KesKey::load_retired(&dir, &unlock).unwrap().unwrap().period(), 3);
+    // A clock far ahead of the head does not erase further (review F-5).
+    signer.settle_replaced(&branch_a, 13, Some(10), first_epoch(10) - 1);
+    assert_eq!(signer.retired.as_ref().unwrap().period(), 3);
+
+    // Reorg to branch B, which forks below the including block: no rotation
+    // on chain, the old tree is the key in force for period 10.
+    let branch_b = entry(old_chain, None);
+    signer.adopt_successor(&branch_b.in_force(10)).unwrap();
+    assert_eq!(signer.key.public().root, tree.root, "the old key signs again");
+    assert_eq!(signer.next.as_ref().unwrap().public().root, next_tree.root, "the successor is sealed again");
+    assert!(signer.retired.is_none() && !retired_path.exists());
+    assert_eq!(crate::kes_key::KesKey::load_optional(&dir, &unlock).unwrap().unwrap().public().root, tree.root);
+    assert_eq!(crate::kes_key::KesKey::load_next(&dir, &unlock).unwrap().unwrap().public().root, next_tree.root);
+    let lookup = Registered { pk: keys.pubkey.clone(), kes: old_chain, domain };
+    let sig = sign_duty(&keys, Some(&signer), Some((10, old_chain)), domain, 4, 0, &root);
+    assert_eq!(kes::verify_validator_in(&lookup, &verifier, 4, Some(10), &root, &sig), Some(true), "a duty under the old tree");
+    // And it can rotate again: the policy submits, the old leaf signs it.
+    assert_eq!(
+        kes_rotation_step(&branch_b, 10, 4, &signer.key.public(), signer.next.as_ref().map(|n| n.public()), false, false),
+        KesRotationStep::Submit
+    );
+    let rotate_root = kes::rotate_signing_root(&domain.unwrap(), 4, 10, next_tree.depth, &next_tree.root);
+    let rotate_sig = signer.key.sign(&kes::leaf_message(domain, 4, &old_chain, 10, &rotate_root).unwrap()).unwrap();
+    assert_eq!(kes::verify_validator_in(&lookup, &verifier, 4, Some(10), &rotate_root, &rotate_sig), Some(true));
+
+    // The new rotation is included in period 10; the handover is period 11.
+    let new_chain = KesPublic::new(next_tree.depth, next_tree.root, 11);
+    let branch_b = entry(old_chain, Some(new_chain));
+    signer.adopt_successor(&branch_b.in_force(11)).unwrap();
+    assert_eq!(signer.key.public().root, next_tree.root);
+    signer.settle_replaced(&branch_b, 11, Some(11), first_epoch(11) - 1);
+    assert_eq!(signer.retired.as_ref().unwrap().period(), 4, "kept and evolved while unfinalized");
+    // A restart in this window loads the kept key.
+    assert_eq!(crate::kes_key::KesKey::load_retired(&dir, &unlock).unwrap().unwrap().public().root, tree.root);
+    // Final: destroyed.
+    signer.settle_replaced(&branch_b, 11, Some(11), first_epoch(11));
+    assert!(signer.retired.is_none() && !retired_path.exists(), "shredded once the handover is final");
+    // The chain can no longer name the old tree; nothing to swap back to.
+    signer.adopt_successor(&old_chain).unwrap();
+    assert_eq!(signer.key.public().root, next_tree.root);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Review F-1: KES leaves are signed and verified in the canonical,
 /// suite-bound v2 form from the first KES signature, so the
 /// `SIG_CANONICAL` flag day cannot silence them. The plain (v1) check refuses

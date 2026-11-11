@@ -46,7 +46,35 @@
 //!
 //! Rotation (HF3): the successor tree is generated in the background and
 //! sealed as `validator.kes.next` ([`NEXT_FILE_NAME`]); once the chain makes
-//! it the key in force, [`promote_next`] swaps it in and shreds the old file.
+//! it the key in force, [`promote_next`] swaps it in and the replaced key
+//! becomes `validator.kes.retired` ([`RETIRED_FILE_NAME`]).
+//!
+//! The replaced key is NOT destroyed at the swap (review PER-1). The swap
+//! follows the head state, which is not final: if the block that carried the
+//! `KesRotate` is reorganized out, the chain names the old tree as the key
+//! in force again, and a node that had destroyed it could not sign, could
+//! not rotate again (a rotation is signed by the old tree's current leaf)
+//! and could not be rescued by the static key until the old tree expired.
+//! So the replaced key is kept until this node's finalized checkpoint
+//! reaches the successor's first epoch (the including block is then an
+//! ancestor of a finalized block, and the node does not reorganize below
+//! its finality), or until the old tree has expired, and is shredded then.
+//! If the handover is reorganized out first, [`demote_promoted`] puts it
+//! back.
+//!
+//! What forward security means while it is kept: the retired file is evolved
+//! exactly like the key in force ([`KesKey::evolve_retired_to`]: at the swap
+//! to the old tree's leaf for the handover period, then once per period), so
+//! it never holds a seed for a period before the handover and, on a node
+//! that is running and at the head, none for a period before the current
+//! one. Every seed the old key had erased stays erased. What remains on disk
+//! until finality is the old tree's seed for the current and later periods:
+//! the seed this node would hold anyway had the rotation not been included.
+//! A signature made with it is valid only on a chain that does not contain
+//! the rotation; where the rotation stands, consensus judges those periods
+//! by the successor. The cost is that a host compromised between the swap
+//! and its finality (normally two to three epochs) yields that seed as well
+//! as the successor's; before this change it yielded the successor's alone.
 //!
 //! ```text
 //! BPOSKES2 (sealed):    magic ‖ kdf id ‖ m t p ‖ salt ‖ nonce ‖ index ‖ depth ‖ root ‖ leaves  [AAD]
@@ -73,8 +101,8 @@ const MAGIC_SEALED: &[u8; 8] = b"BPOSKES2";
 pub const FILE_NAME: &str = "validator.kes";
 /// The rotated-in successor, written before its `KesRotate` is submitted.
 pub const NEXT_FILE_NAME: &str = "validator.kes.next";
-/// The replaced key during a swap; shredded right after (and at startup if
-/// a crash interrupted the swap).
+/// The replaced key after a swap, kept until the handover is final (see the
+/// module doc, "Rotation").
 pub const RETIRED_FILE_NAME: &str = "validator.kes.retired";
 
 pub struct KesKey {
@@ -172,6 +200,16 @@ impl KesKey {
     /// guarantees), then in memory. Refuses to go back and refuses past the
     /// last leaf.
     pub fn evolve_to(&mut self, dir: &Path, unlock: &Unlock, period: u64) -> io::Result<()> {
+        self.evolve_named(dir, unlock, period, FILE_NAME)
+    }
+
+    /// [`Self::evolve_to`] for the replaced key kept as
+    /// `validator.kes.retired`: same erasure, in its own file.
+    pub fn evolve_retired_to(&mut self, dir: &Path, unlock: &Unlock, period: u64) -> io::Result<()> {
+        self.evolve_named(dir, unlock, period, RETIRED_FILE_NAME)
+    }
+
+    fn evolve_named(&mut self, dir: &Path, unlock: &Unlock, period: u64, name: &str) -> io::Result<()> {
         if period < self.period {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -197,7 +235,7 @@ impl KesKey {
             seal: std::cell::RefCell::new(self.seal.borrow().clone()),
             leaf: Default::default(),
         };
-        next.save_named(dir, unlock, FILE_NAME)?;
+        next.save_named(dir, unlock, name)?;
         *self = next;
         Ok(())
     }
@@ -388,6 +426,11 @@ impl KesKey {
         Self::load_path(&Self::next_path(dir), unlock)
     }
 
+    /// `Ok(None)` iff `dir/validator.kes.retired` does not exist.
+    pub fn load_retired(dir: &Path, unlock: &Unlock) -> io::Result<Option<KesKey>> {
+        Self::load_path(&dir.join(RETIRED_FILE_NAME), unlock)
+    }
+
     fn load_path(path: &Path, unlock: &Unlock) -> io::Result<Option<KesKey>> {
         let bytes = match read_keystore_file(path) {
             Ok(bytes) => bytes,
@@ -531,10 +574,14 @@ pub fn shred(path: &Path) -> io::Result<()> {
 }
 
 /// Make the rotation successor the key: `validator.kes` →
-/// `validator.kes.retired`, `validator.kes.next` → `validator.kes`, then
-/// shred the retired file. Each rename is atomic, so a crash leaves either
-/// the old key in place with the successor beside it, or the successor in
-/// place with a retired file that [`finish_interrupted_rotation`] shreds.
+/// `validator.kes.retired`, `validator.kes.next` → `validator.kes`. The
+/// retired file is kept (review PER-1; see the module doc) until
+/// [`shred_retired`]. Each rename is atomic, so a crash leaves either the
+/// old key in place with the successor beside it, or the successor in place
+/// with the retired file, or (between the renames) no `validator.kes`, which
+/// [`finish_interrupted_rotation`] completes. A retired file left by an
+/// earlier rotation is shredded first: one replaced key is kept, not a
+/// history.
 pub fn promote_next(dir: &Path) -> io::Result<()> {
     let current = dir.join(FILE_NAME);
     let next = dir.join(NEXT_FILE_NAME);
@@ -543,17 +590,45 @@ pub fn promote_next(dir: &Path) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::NotFound, "no validator.kes.next to promote"));
     }
     if current.exists() {
+        shred(&retired)?;
         fs::rename(&current, &retired)?;
     }
     fs::rename(&next, &current)?;
-    fs::File::open(dir)?.sync_all()?;
-    shred(&retired)
+    fs::File::open(dir)?.sync_all()
 }
 
-/// Startup: a swap interrupted after its renames leaves
-/// `validator.kes.retired`; shred it. A swap interrupted between the renames
-/// leaves `validator.kes.next` and `validator.kes.retired` but no
-/// `validator.kes`: finish it.
+/// Undo [`promote_next`] after the handover was reorganized out:
+/// `validator.kes` → `validator.kes.next`, `validator.kes.retired` →
+/// `validator.kes`. A crash between the renames leaves the same files as a
+/// crash inside `promote_next`; startup completes that to the promoted
+/// layout and the node demotes again when the chain still says so.
+pub fn demote_promoted(dir: &Path) -> io::Result<()> {
+    let current = dir.join(FILE_NAME);
+    let next = dir.join(NEXT_FILE_NAME);
+    let retired = dir.join(RETIRED_FILE_NAME);
+    if !retired.exists() || !current.exists() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "no retired KES key to put back"));
+    }
+    if next.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "validator.kes.next exists; refusing to overwrite a sealed successor",
+        ));
+    }
+    fs::rename(&current, &next)?;
+    fs::rename(&retired, &current)?;
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Destroy the replaced key once its handover is final (or it has expired).
+pub fn shred_retired(dir: &Path) -> io::Result<()> {
+    shred(&dir.join(RETIRED_FILE_NAME))
+}
+
+/// Startup: a swap interrupted between its renames leaves
+/// `validator.kes.next` and `validator.kes.retired` but no `validator.kes`:
+/// finish it. A `validator.kes.retired` beside `validator.kes` is the
+/// replaced key awaiting finality and is left for the node to load.
 pub fn finish_interrupted_rotation(dir: &Path) -> io::Result<()> {
     let current = dir.join(FILE_NAME);
     let next = dir.join(NEXT_FILE_NAME);
@@ -562,7 +637,7 @@ pub fn finish_interrupted_rotation(dir: &Path) -> io::Result<()> {
         fs::rename(&next, &current)?;
         fs::File::open(dir)?.sync_all()?;
     }
-    shred(&retired)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -767,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn the_successor_is_promoted_atomically_and_the_old_key_shredded() {
+    fn the_successor_is_promoted_atomically_and_the_old_key_kept_until_shredded() {
         let dir = tmp("promote");
         let unlock = quick();
         let old = KesKey::generate(4, 1, |_| {}).unwrap();
@@ -778,8 +853,37 @@ mod tests {
         promote_next(&dir).unwrap();
         assert_eq!(KesKey::load_optional(&dir, &unlock).unwrap().unwrap().public(), next.public());
         assert!(KesKey::load_next(&dir, &unlock).unwrap().is_none());
-        assert!(!dir.join(RETIRED_FILE_NAME).exists(), "the old key is gone");
+        // Review PER-1: the replaced key survives the swap, still loadable,
+        // and can be put back if the handover is reorganized out.
+        assert_eq!(KesKey::load_retired(&dir, &unlock).unwrap().unwrap().public(), old.public());
         assert!(promote_next(&dir).is_err(), "nothing left to promote");
+        demote_promoted(&dir).unwrap();
+        assert_eq!(KesKey::load_optional(&dir, &unlock).unwrap().unwrap().public(), old.public());
+        assert_eq!(KesKey::load_next(&dir, &unlock).unwrap().unwrap().public(), next.public());
+        assert!(!dir.join(RETIRED_FILE_NAME).exists());
+        assert!(demote_promoted(&dir).is_err(), "nothing retired to put back");
+        // Promoted again and final: the old key is destroyed.
+        promote_next(&dir).unwrap();
+        let old_inode = dir.join("old-inode");
+        fs::hard_link(dir.join(RETIRED_FILE_NAME), &old_inode).unwrap();
+        shred_retired(&dir).unwrap();
+        assert!(!dir.join(RETIRED_FILE_NAME).exists(), "the old key is gone");
+        assert!(fs::read(&old_inode).unwrap().iter().all(|b| *b == 0), "and overwritten");
+        fs::remove_file(&old_inode).unwrap();
+        assert!(demote_promoted(&dir).is_err());
+
+        // The retired key evolves in its own file and erases as the live one.
+        let kept = tmp("retired-evolve");
+        let mut a = KesKey::generate(4, 2, |_| {}).unwrap();
+        a.save(&kept, &unlock).unwrap();
+        KesKey::generate(4, 1, |_| {}).unwrap().save_next(&kept, &unlock).unwrap();
+        promote_next(&kept).unwrap();
+        let live = fs::read(KesKey::path(&kept)).unwrap();
+        a.evolve_retired_to(&kept, &unlock, 2).unwrap();
+        assert_eq!(KesKey::load_retired(&kept, &unlock).unwrap().unwrap().period(), 2);
+        assert_eq!(fs::read(KesKey::path(&kept)).unwrap(), live, "the key in force is untouched");
+        assert!(a.evolve_retired_to(&kept, &unlock, 1).is_err(), "cannot go back");
+        let _ = fs::remove_dir_all(&kept);
 
         // A crash between the two renames: no validator.kes, a retired one
         // and the successor. Startup finishes the swap.
@@ -791,7 +895,7 @@ mod tests {
         b.save_next(&crashed, &unlock).unwrap();
         finish_interrupted_rotation(&crashed).unwrap();
         assert_eq!(KesKey::load_optional(&crashed, &unlock).unwrap().unwrap().public(), b.public());
-        assert!(!crashed.join(RETIRED_FILE_NAME).exists());
+        assert_eq!(KesKey::load_retired(&crashed, &unlock).unwrap().unwrap().public(), a.public(), "kept, not shredded");
         assert!(!crashed.join(NEXT_FILE_NAME).exists());
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&crashed);
