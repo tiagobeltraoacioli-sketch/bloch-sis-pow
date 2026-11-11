@@ -675,6 +675,82 @@ fn in_boot_grace(now_ms: u64, loop_started_ms: u64, grace_ms: u64) -> bool {
     now_ms.saturating_sub(loop_started_ms) <= grace_ms
 }
 
+/// Refuses validator duties after an implausible forward step of the wall
+/// clock (review round 2, GATE-07).
+///
+/// Every duty is addressed by the wall slot, and the slashing-protection
+/// watermark records it durably. A host clock that jumps forward (NTP step,
+/// bad RTC, a resumed VM) therefore spends the watermark at a future epoch;
+/// once the clock is corrected the validator refuses every attestation until
+/// real time catches up, and a KES key evolved to the future period has
+/// erased the leaves of the real one. Nothing compared the wall clock with a
+/// monotonic one.
+///
+/// This guard does, once per slot-loop turn. The wall clock may run ahead of
+/// the monotonic clock by at most `tolerance_ms` per turn; a larger forward
+/// step holds duties until either
+///
+/// * the wall clock is consistent again (the step is undone), or
+/// * the chain corroborates the new time: the canonical head is a block
+///   whose slot starts later than the pre-step clock would read now, which
+///   only peers on the new time can have produced (a slow clock that was
+///   corrected, or a host that was suspended).
+///
+/// It only ever ADDS a reason not to sign: the slashing-protection checks
+/// run unchanged behind it. A backward step is not its business (the
+/// watermark already refuses to sign below what was signed). A clock that is
+/// wrong when the process starts cannot be seen from inside; a restart is
+/// also how an operator confirms a stepped clock on a chain that is not
+/// producing blocks.
+#[derive(Default)]
+struct ClockStepGuard {
+    /// `(wall_ms, monotonic_ms)` of the last turn whose wall clock was
+    /// accepted. `None` until the first turn.
+    accepted: Option<(u64, u64)>,
+    /// Milliseconds the wall clock is ahead of the accepted baseline while
+    /// duties are held; `None` when they are not.
+    held_step_ms: Option<u64>,
+}
+
+impl ClockStepGuard {
+    /// One turn. `head_slot_start_ms` is the wall time at which the canonical
+    /// head's slot starts. Returns whether duties are held.
+    fn update(
+        &mut self,
+        wall_ms: u64,
+        monotonic_ms: u64,
+        head_slot_start_ms: u64,
+        tolerance_ms: u64,
+    ) -> bool {
+        let Some((base_wall, base_mono)) = self.accepted else {
+            self.accepted = Some((wall_ms, monotonic_ms));
+            return false;
+        };
+        // What the wall clock would read now had it advanced exactly as the
+        // monotonic clock did since the accepted baseline.
+        let expected_wall = base_wall.saturating_add(monotonic_ms.saturating_sub(base_mono));
+        let ahead = wall_ms.saturating_sub(expected_wall);
+        if ahead <= tolerance_ms {
+            // Consistent (or behind, which the watermark handles): follow it.
+            self.accepted = Some((wall_ms, monotonic_ms));
+            self.held_step_ms = None;
+            return false;
+        }
+        if head_slot_start_ms > expected_wall.saturating_add(tolerance_ms) {
+            // Corroborated by the chain: the new time is the network's.
+            self.accepted = Some((wall_ms, monotonic_ms));
+            self.held_step_ms = None;
+            return false;
+        }
+        self.held_step_ms = Some(ahead);
+        true
+    }
+
+    fn held_step_ms(&self) -> Option<u64> {
+        self.held_step_ms
+    }
+}
+
 /// Longest uncached roll (in epochs) an arriving attestation may cause
 /// without further conditions: a synced node whose head is still in the
 /// previous epoch judges votes of the wall epoch and of the next one.
@@ -8196,6 +8272,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // GATE-06: boot grace runs from here, the end of replay and of the boot
     // checks, not from engine construction.
     engine.booted_ms = now_ms();
+    // GATE-07: the monotonic clock the wall clock is checked against.
+    let monotonic_origin = std::time::Instant::now();
+    let mut clock_step_guard = ClockStepGuard::default();
+    let mut clock_step_reported = false;
 
     // Metrics baseline (C-R6-2). The finality clock starts NOW: replay stamps
     // nothing (it re-finalizes the past), and a `last_finality_advance_unix`
@@ -8304,6 +8384,26 @@ pub fn run(cfg: Config) -> io::Result<()> {
             }
         }
 
+        // GATE-07: a wall clock that ran ahead of the monotonic clock by more
+        // than two slots in one turn is not trusted for signing until it is
+        // consistent again or the chain's head corroborates it.
+        let clock_step_held = clock_step_guard.update(
+            now,
+            monotonic_origin.elapsed().as_millis() as u64,
+            genesis_ms.saturating_add(engine.state.slot().saturating_mul(slot_ms)),
+            two_slots_ms,
+        );
+        if clock_step_held != clock_step_reported {
+            clock_step_reported = clock_step_held;
+            match clock_step_guard.held_step_ms() {
+                Some(step_ms) => eprintln!(
+                    "CLOCK STEP: the wall clock jumped {step_ms} ms ahead of the monotonic clock (wall slot {slot},                      head slot {}). Validator duties are HELD so the slashing-protection watermark is not spent                      at a future slot. They resume when the clock is consistent again or when the chain reaches                      the new time; if the new time is right and the chain is stalled, restart the node.",
+                    engine.state.slot()
+                ),
+                None => println!("clock step: the wall clock is consistent again; validator duties resume"),
+            }
+        }
+
         // Boot grace: give the mesh one round of sync before performing
         // duties, so a restarted proposer does not build on a stale head.
         let in_grace = in_boot_grace(now, engine.booted_ms, two_slots_ms);
@@ -8342,7 +8442,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
             held_attestations_pending,
             deferred_orphans_pending,
         )
-            || engine.store.rewrite_pending();
+            || engine.store.rewrite_pending()
+            || clock_step_held;
 
         // Ask for the missing history before considering local signatures.
         // Rate-limited; idempotent on the receiving side (dedup discards
@@ -17671,6 +17772,76 @@ mod ingest_admission_tests {
         // outside the grace and the stale-head test was not yet true.
         assert!(!in_boot_grace(replay_done, constructed, grace));
         assert!(!node_is_behind(head_slot, wall_slot, replay_done, last_applied, grace));
+    }
+
+    /// **Review round 2, GATE-07: a forward wall-clock step holds duties.**
+    #[test]
+    fn a_forward_clock_step_holds_duties_until_the_clock_is_consistent() {
+        const SLOT_MS: u64 = 30_000;
+        let tol = 2 * SLOT_MS;
+        let genesis = 1_700_000_000_000u64;
+        let slot_start = |slot: u64| genesis + slot * SLOT_MS;
+        let hundred_epochs = 100 * SLOTS_PER_EPOCH * SLOT_MS;
+
+        // Normal running: both clocks advance together, with jitter, slew
+        // and one long turn (a slow block apply). Never held.
+        let mut guard = ClockStepGuard::default();
+        let (mut wall, mut mono) = (slot_start(1_000), 5_000u64);
+        assert!(!guard.update(wall, mono, slot_start(999), tol));
+        for (dw, dm) in [(500, 500), (510, 500), (495, 500), (600_000, 600_000), (tol, 0), (500, 400)] {
+            wall += dw;
+            mono += dm;
+            assert!(!guard.update(wall, mono, slot_start(999), tol), "held on +{dw}/+{dm}");
+        }
+        assert_eq!(guard.held_step_ms(), None);
+
+        // The wall clock jumps 100 epochs while monotonic time advances one
+        // slot. Held, and it stays held however long the clock stays wrong
+        // and the head stays where real time left it.
+        let before_step = wall;
+        wall += hundred_epochs;
+        mono += SLOT_MS;
+        assert!(guard.update(wall, mono, slot_start(1_001), tol));
+        assert_eq!(guard.held_step_ms(), Some(hundred_epochs - SLOT_MS));
+        for _ in 0..500 {
+            wall += SLOT_MS;
+            mono += SLOT_MS;
+            // The honest chain keeps producing on real time.
+            let real_slot = (before_step + (wall - before_step - hundred_epochs) - genesis) / SLOT_MS;
+            assert!(guard.update(wall, mono, slot_start(real_slot), tol), "released on a stepped clock");
+        }
+        // The clock is corrected: consistent with the baseline again.
+        wall -= hundred_epochs;
+        assert!(!guard.update(wall, mono, slot_start(1_500), tol));
+        assert_eq!(guard.held_step_ms(), None);
+
+        // A step just inside the tolerance is not a step; one just outside is.
+        let mut guard = ClockStepGuard::default();
+        assert!(!guard.update(1_000_000, 0, 0, tol));
+        assert!(!guard.update(1_000_000 + tol, 0, 0, tol));
+        assert!(guard.update(1_000_000 + 2 * tol + 1, 0, 0, tol));
+
+        // A legitimate correction of a slow clock (or a resumed host): the
+        // network is on the new time, the node syncs, and a head in the new
+        // time releases the hold.
+        let mut guard = ClockStepGuard::default();
+        let (wall, mono) = (slot_start(2_000), 0u64);
+        assert!(!guard.update(wall, mono, slot_start(1_999), tol));
+        let stepped = wall + hundred_epochs;
+        assert!(guard.update(stepped, mono + 500, slot_start(1_999), tol));
+        // Blocks of the old time do not corroborate, nor does one within the
+        // tolerance of the old clock.
+        assert!(guard.update(stepped + 500, mono + 1_000, slot_start(2_002), tol));
+        let new_time_slot = (stepped - genesis) / SLOT_MS - 1;
+        assert!(!guard.update(stepped + 1_000, mono + 1_500, slot_start(new_time_slot), tol));
+        // The new time is now the baseline: no hold on the next turn.
+        assert!(!guard.update(stepped + 1_500, mono + 2_000, slot_start(new_time_slot), tol));
+
+        // A backward step is left to the watermark: never held here.
+        let mut guard = ClockStepGuard::default();
+        assert!(!guard.update(5_000_000, 0, 0, tol));
+        assert!(!guard.update(1_000_000, 500, 0, tol));
+        assert!(!guard.update(1_000_500, 1_000, 0, tol));
     }
 
     /// **Review round 2, GATE-04: an arriving attestation cannot make a
