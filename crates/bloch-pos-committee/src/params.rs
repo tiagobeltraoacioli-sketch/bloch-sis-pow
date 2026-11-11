@@ -2102,11 +2102,13 @@ pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///    (`fee_market::eutxo_class_for_keys`) instead of the suite-blind
 ///    `HYBRID_VERIFY_GAS`. Below it every charge is bit-identical.
 ///
-/// MUST equal `bloch_crypto::crypto::HF3_SLH_SUITE_EPOCH` (this crate does
-/// not depend on bloch-crypto; bloch-pos-node asserts the equality at compile
-/// time): a verifier that accepts the suite while fees still price it as a
-/// hybrid sells ~1.07 M gas of CPU for 72,748. `u64::MAX` = never, even at
-/// `u64::MAX`. Ships INERT; `hf3_slh_suite_gate_is_inert` pins the value.
+/// This is the ONLY HF3 constant: bloch-crypto holds none and is told the
+/// verdict (`hf3_slh_suite_active`) by its caller, so the verifier and the
+/// fee rule cannot arm apart (a verifier that accepts the suite while fees
+/// still price it as a hybrid sells ~1.07 M gas of CPU for 72,748).
+/// `u64::MAX` would mean never, even at `u64::MAX`. ARMED at 7360: from that
+/// epoch the SLH-DSA verifier is live consensus code.
+/// `hf3_slh_suite_gate_is_armed_at_7360` pins the value.
 pub const HF3_SLH_SUITE_EPOCH: u64 = 7360;
 
 /// HF3 suite id: SLH-DSA-SHAKE-128s ‖ Falcon-1024. The canonical consensus

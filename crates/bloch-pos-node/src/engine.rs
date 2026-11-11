@@ -3055,6 +3055,9 @@ impl Engine {
             return Err(format!("no KES key is registered on chain for v{validator}"));
         };
         kes.adopt_successor(&public)?;
+        if let Some(entry) = self.state.kes_roots().get(&validator) {
+            kes.settle_replaced(entry, period, head_period, self.state.finality().finalized.epoch);
+        }
         if kes.key.index() != validator && kes.key.index() != crate::keys::AUTO_VALIDATOR_INDEX {
             return Err(format!(
                 "{} belongs to v{}, not v{validator}",
@@ -3143,6 +3146,7 @@ impl Engine {
             eprintln!("KES rotation for v{index}: {why}");
             return;
         }
+        kes.settle_replaced(&entry, period, Some(period), self.state.finality().finalized.epoch);
         let step = kes_rotation_step(
             &entry,
             period,
@@ -8459,8 +8463,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
             match protection.settle_missing_history(boot_wall_slot, acknowledged)? {
                 crate::slashprot::MissingHistory::Proven => {}
                 crate::slashprot::MissingHistory::Unproven { before_slot } => println!(
-                    "slashing protection: no record and no host signer anchor; this key may sign \
-                     only if its duties began at or after wall slot {before_slot}"
+                    "slashing protection: no record and no host signer anchor that already held \
+                     one; this key may sign only if its duties began at or after wall slot {before_slot}"
                 ),
                 crate::slashprot::MissingHistory::Acknowledged => println!(
                     "SLASHING PROTECTION: MISSING RECORD ACKNOWLEDGED ({} is set). The operator \
@@ -8860,6 +8864,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // Review CR-8, boot half: the registry is known now. A key that already
     // had duties, with no slashing-protection record and no signer anchor,
     // does not start. Non-retryable, so a supervisor does not loop on it.
+    // Review PER-6: the replayed head bounds "now" from below, whatever the
+    // wall clock said when the reference slot was written.
+    engine.slashprot.raise_unproven_reference(engine.state.slot())?;
     let boot_wall_slot = now_ms().saturating_sub(engine.manifest.genesis_time_ms) / engine.manifest.slot_ms.max(1);
     if let Some(refusal) = engine.missing_history_refusal(boot_wall_slot) {
         return Err(crate::ws_boot::boot_refused(refusal));
@@ -9800,32 +9807,124 @@ pub(crate) struct KesSigner {
     next: Option<crate::kes_key::KesKey>,
     keygen: Option<std::sync::mpsc::Receiver<io::Result<crate::kes_key::KesKey>>>,
     rotation_submitted: Option<u64>,
+    /// The key the successor replaced (`validator.kes.retired`), kept until
+    /// the handover is final (review PER-1, `kes_key` module doc).
+    retired: Option<crate::kes_key::KesKey>,
 }
 
 impl KesSigner {
     pub(crate) fn new(key: crate::kes_key::KesKey, dir: PathBuf, unlock: crate::keys::Unlock) -> Self {
-        KesSigner { key, dir, unlock, next: None, keygen: None, rotation_submitted: None }
+        KesSigner { key, dir, unlock, next: None, keygen: None, rotation_submitted: None, retired: None }
     }
 
     /// If the chain's key in force is the sealed successor, swap the files
-    /// (`kes_key::promote_next`) and sign with it from now on.
+    /// (`kes_key::promote_next`) and sign with it from now on. The replaced
+    /// key is kept as `validator.kes.retired` (review PER-1): the head state
+    /// that names the successor is not final. If a reorg removed the
+    /// rotation and the chain names the replaced tree again, swap back
+    /// (`kes_key::demote_promoted`): the successor returns to
+    /// `validator.kes.next` and is submitted again by the rotation policy.
     fn adopt_successor(&mut self, in_force: &bloch_pos_committee::kes::KesPublic) -> Result<(), String> {
-        let promote = !self.key.public().same_tree(in_force)
-            && self.next.as_ref().is_some_and(|next| next.public().same_tree(in_force));
-        if !promote {
+        if self.key.public().same_tree(in_force) {
             return Ok(());
         }
-        crate::kes_key::promote_next(&self.dir).map_err(|e| format!("KES successor swap failed: {e}"))?;
-        if let Some(next) = self.next.take() {
-            self.key = next;
+        if self.next.as_ref().is_some_and(|next| next.public().same_tree(in_force)) {
+            crate::kes_key::promote_next(&self.dir).map_err(|e| format!("KES successor swap failed: {e}"))?;
+            if let Some(next) = self.next.take() {
+                self.retired = Some(std::mem::replace(&mut self.key, next));
+            }
+            self.rotation_submitted = None;
+            println!(
+                "KES successor in force from period {}: {} replaced; the old key is kept as {} until \
+                 the handover is final",
+                in_force.start_period,
+                crate::kes_key::FILE_NAME,
+                crate::kes_key::RETIRED_FILE_NAME
+            );
+            return Ok(());
         }
-        self.rotation_submitted = None;
-        println!(
-            "KES successor in force from period {}: {} replaced, old key shredded",
-            in_force.start_period,
-            crate::kes_key::FILE_NAME
-        );
+        if self.next.is_none() && self.retired.as_ref().is_some_and(|old| old.public().same_tree(in_force)) {
+            crate::kes_key::demote_promoted(&self.dir).map_err(|e| format!("KES swap back to the replaced key failed: {e}"))?;
+            if let Some(old) = self.retired.take() {
+                self.next = Some(std::mem::replace(&mut self.key, old));
+            }
+            self.rotation_submitted = None;
+            println!(
+                "KES handover reorganized out: the chain names the replaced key (root {}) again; {} \
+                 restored and the successor is back in {}",
+                crate::codec::hex8(&in_force.root),
+                crate::kes_key::FILE_NAME,
+                crate::kes_key::NEXT_FILE_NAME
+            );
+        }
         Ok(())
+    }
+
+    /// Look after the replaced key while it is kept (review PER-1). Called
+    /// after [`Self::adopt_successor`] with the validator's committed entry,
+    /// the duty or wall period, the head's period and the head state's
+    /// finalized epoch.
+    ///
+    /// - Destroyed once the finalized checkpoint is at or past the first
+    ///   epoch of the successor's start period: a `KesRotate` is only valid
+    ///   in a block of an earlier period, so that block is an ancestor of
+    ///   the finalized one and this node does not reorganize below it.
+    /// - Destroyed when the old tree no longer covers the period (expired):
+    ///   it could sign nothing even if the handover were undone.
+    /// - Otherwise evolved to the old tree's leaf for the period, under the
+    ///   same clock-jump rule as the key in force (review F-5), so it holds
+    ///   no seed of a past period.
+    fn settle_replaced(
+        &mut self,
+        entry: &bloch_pos_committee::kes::KesEntry,
+        period: u64,
+        head_period: Option<u64>,
+        finalized_epoch: u64,
+    ) {
+        let Some(old) = self.retired.as_mut() else {
+            return;
+        };
+        let in_force = entry.in_force(period);
+        if !self.key.public().same_tree(&in_force) {
+            return;
+        }
+        let schedule = bloch_pos_committee::params::kes_schedule();
+        let handover_epoch =
+            schedule.activation_epoch.saturating_add(in_force.start_period.saturating_mul(schedule.period_epochs));
+        let old_tree = old.public();
+        let on_chain = std::iter::once(entry.current)
+            .chain(entry.retired.iter().rev().map(|r| r.public))
+            .find(|public| public.same_tree(&old_tree));
+        let leaf = on_chain.and_then(|public| public.leaf_index(period));
+        let expired = on_chain.is_some_and(|public| period >= public.end_period());
+        if finalized_epoch >= handover_epoch || expired {
+            match crate::kes_key::shred_retired(&self.dir) {
+                Ok(()) => {
+                    self.retired = None;
+                    println!(
+                        "KES handover at period {} is {}: the replaced key {} is shredded",
+                        in_force.start_period,
+                        if expired { "past the old key's expiry" } else { "final" },
+                        crate::kes_key::RETIRED_FILE_NAME
+                    );
+                }
+                Err(e) => eprintln!("KES: could not shred {} (retried): {e}", crate::kes_key::RETIRED_FILE_NAME),
+            }
+            return;
+        }
+        let (Some(public), Some(leaf)) = (on_chain, leaf) else {
+            return;
+        };
+        if leaf <= old.period() {
+            return;
+        }
+        let key_period = public.start_period.saturating_add(old.period());
+        if !kes_evolution_allowed(key_period, head_period, period, kes_period_jump_confirmed()) {
+            return;
+        }
+        if let Err(e) = old.evolve_retired_to(&self.dir, &self.unlock, leaf) {
+            eprintln!("KES: could not evolve {} to leaf {leaf} (retried): {e}", crate::kes_key::RETIRED_FILE_NAME);
+        }
     }
 
     /// Collect a finished background keygen: seal it as `validator.kes.next`.
@@ -9982,8 +10081,28 @@ fn load_kes_signer(dir: &std::path::Path, validator: bool) -> io::Result<Option<
             crate::codec::hex8(&next.public().root)
         );
     }
+    // The replaced key of a handover that was not final when the node
+    // stopped (review PER-1). It is only ever needed if that handover is
+    // reorganized out, so a file that does not load must not stop the key in
+    // force from signing.
+    let retired = match crate::kes_key::KesKey::load_retired(dir, &unlock) {
+        Ok(retired) => retired,
+        Err(e) => {
+            eprintln!("KES WARNING: {} does not load and is ignored: {e}", crate::kes_key::RETIRED_FILE_NAME);
+            None
+        }
+    };
+    if let Some(retired) = &retired {
+        println!(
+            "KES replaced key kept until its handover is final: depth {}, leaf {}, root {}",
+            retired.public().depth,
+            retired.period(),
+            crate::codec::hex8(&retired.public().root)
+        );
+    }
     let mut signer = KesSigner::new(key, dir.to_path_buf(), unlock);
     signer.next = next;
+    signer.retired = retired;
     Ok(Some(signer))
 }
 

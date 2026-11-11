@@ -196,11 +196,15 @@ a corrupt or foreign anchor record and a rolled-back data dir stay fatal.
 then works per boot only and cannot see other units.)
 
 One case does refuse without an anchor. A data dir with **no
-`slashing_protection.bin`** and no usable anchor gives the node nothing that
-says what the key has signed: a new validator and a key whose record was lost
+`slashing_protection.bin`** and no anchor that already held this key's record
+before the boot gives the node nothing that says what the key has signed (an
+anchor directory created on that same boot is empty too, which is what a key
+copied to a new host looks like): a new validator and a key whose record was lost
 (data dir wiped for a resync, restored without the record, key copied to a new
 directory) look the same. The node records the wall slot of that first boot in
-`slashing_protection.unproven`. A key whose duties began at or after that slot
+`slashing_protection.unproven` (with a copy beside the anchor record when an
+anchor is attached, so wiping the data dir does not clear it; if the clock read
+earlier than the chain the node already holds, the head slot is used). A key whose duties began at or after that slot
 starts as before. A key that already had duties on chain before it does not
 sign (`SLASHING PROTECTION MISSING`; exit status 78 at boot, or duties stopped
 if the registry only shows the key after syncing). On-chain signatures replayed

@@ -1996,8 +1996,10 @@ pub fn start(
                     };
                     // An authenticated handshake leaves the pending pool. A
                     // plain session has proven nothing yet and stays in it
-                    // until its first valid frame.
-                    if matches!(session, crate::mesh_pq::Session::Sealed { .. }) && !slot.mark_established() {
+                    // until its first valid frame; so does a sealed session
+                    // whose peer identity was checked against nothing
+                    // (encryption only; review CRY-7).
+                    if session.authenticated() && !slot.mark_established() {
                         return;
                     }
                     let Ok(shutdown_socket) = sock.try_clone() else { return };
