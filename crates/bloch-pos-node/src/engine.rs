@@ -7625,6 +7625,11 @@ impl Engine {
                 // cannot yet validate. It is replayed by `release_held` when
                 // the block lands, and relayed then.
                 self.net.report(origin, Verdict::Ignore);
+                // W4-1: its signature was verified before it was parked
+                // (`AttestationPool::hold`), and that is all the devnet mesh
+                // asks of a peer that has to prove itself. A node that hears
+                // of a block by polling sees the votes for it first.
+                origin.note_mesh_delivery_verified();
             }
             GossipDecision::Reject(reason) => {
                 crate::net::rejection_log::emit(crate::net::rejection_log::Class::Attestation, || eprintln!("attestation from v{} REJECTED: {reason:?}", att.validator));
@@ -14609,6 +14614,29 @@ mod doppelganger_tests {
         assert!(engine.doppelganger_blocks_duties(10_000));
         assert!(engine.doppelganger_blocks_duties(10_063));
         assert!(!engine.doppelganger_blocks_duties(10_064));
+    }
+
+    /// W4-1: the devnet mesh learns which source addresses are honest
+    /// validators from the engine's own verdicts. A vote whose signature
+    /// was verified, accepted or parked for its block, vouches for the
+    /// address that delivered it; one the engine did not verify does not.
+    #[test]
+    fn a_verified_vote_vouches_for_the_mesh_address_that_delivered_it() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let index = engine.keys.as_ref().unwrap().index + 1;
+        let source: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        for (decision, proves) in [
+            (GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Duplicate), false),
+            (GossipDecision::Hold { missing_root: [7; 32] }, true),
+            (GossipDecision::Accept { slashing_candidate: None }, true),
+        ] {
+            let (origin, vouched) = net::test_mesh_origin(source);
+            assert!(!vouched());
+            engine.apply_decision(sample_attestation_for(index), decision, &origin);
+            assert_eq!(vouched(), proves);
+        }
+        // An origin that is not the mesh's is unaffected.
+        engine.apply_decision(sample_attestation_for(index), GossipDecision::Hold { missing_root: [7; 32] }, &Origin::none());
     }
 
     #[test]

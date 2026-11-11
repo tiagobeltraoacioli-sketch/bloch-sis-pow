@@ -70,6 +70,9 @@ pub(crate) struct Reservation {
     registry: Arc<Mutex<Registry>>,
     source: Source,
     bytes: usize,
+    /// Set for a block or vote read from an unconfigured devnet-mesh
+    /// connection; see [`super::DeliveryProof`].
+    delivery_proof: std::sync::OnceLock<super::DeliveryProof>,
 }
 
 impl Reservation {
@@ -84,6 +87,17 @@ impl Reservation {
     /// the guarded event reaches later queue accounting.
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    pub(super) fn set_delivery_proof(&self, proof: super::DeliveryProof) {
+        let _ = self.delivery_proof.set(proof);
+    }
+
+    /// The engine verified the message this reservation was made for.
+    pub(crate) fn delivery_verified(&self) {
+        if let Some(proof) = self.delivery_proof.get() {
+            proof.verified();
+        }
     }
 }
 
@@ -107,7 +121,7 @@ impl Registry {
         usage.bytes = source_bytes;
         state.total.count = state.total.count.saturating_add(1);
         state.total.bytes = total_bytes;
-        Some(Arc::new(Reservation { registry: registry.clone(), source, bytes }))
+        Some(Arc::new(Reservation { registry: registry.clone(), source, bytes, delivery_proof: std::sync::OnceLock::new() }))
     }
 }
 
