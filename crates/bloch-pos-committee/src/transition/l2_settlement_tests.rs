@@ -1794,7 +1794,7 @@ mod l2_tests {
         );
         assert_eq!(state, pre);
         assert_eq!(
-            pre.l2_settlement().unwrap().check_claim(700771, 1, &wleaf(1).0, wleaf(1).1, &tx.siblings, false),
+            pre.l2_settlement().unwrap().check_claim(700771, 1, &wleaf(1).0, wleaf(1).1, &tx.siblings, false, false),
             Err(wd::ClaimRefusal::NotActive)
         );
     }
@@ -1881,7 +1881,7 @@ mod l2_tests {
                         let expected_ok =
                             matured && in_tree && !paid.contains(&index) && l2.escrow_sat() >= u128::from(sats) && fits;
                         let before = l2.clone();
-                        let result = l2.release_withdrawal(700771, index, &recipient, sats, &siblings, false);
+                        let result = l2.release_withdrawal(700771, index, &recipient, sats, &siblings, false, false);
                         assert_eq!(result.is_ok(), expected_ok, "seed {seed} step {step}: {result:?}");
                         if result.is_ok() {
                             paid.insert(index);
@@ -2070,7 +2070,7 @@ mod l2_tests {
 
     fn release(l2: &mut crate::l2_settlement::State, tree: &[[u8; 32]], leaves: &[([u8; 32], u64)], i: u64) -> Result<(), wd::ClaimRefusal> {
         let (r, sats) = leaves[i as usize];
-        l2.release_withdrawal(700771, i, &r, sats, &wd::proof(tree, i).unwrap(), false)
+        l2.release_withdrawal(700771, i, &r, sats, &wd::proof(tree, i).unwrap(), false, false)
     }
 
     #[test]
@@ -2156,16 +2156,16 @@ mod l2_tests {
         assert_eq!(l2.release_window().cap, 30 * BLCH as u128);
         let proof = wd::proof(&tree, 0).unwrap();
         let state = l2.clone();
-        assert_eq!(l2.release_withdrawal(700771, 0, &[1; 32], 99 * BLCH, &proof, false), Err(wd::ClaimRefusal::RateLimited));
+        assert_eq!(l2.release_withdrawal(700771, 0, &[1; 32], 99 * BLCH, &proof, false, false), Err(wd::ClaimRefusal::RateLimited));
         assert_eq!(l2, state);
         // Within the cap, no attestation is needed; afterwards the window is
         // no longer empty, so even an attested 99 BLCH waits.
         release(&mut l2, &tree, &leaves, 1).unwrap();
-        assert_eq!(l2.release_withdrawal(700771, 0, &[1; 32], 99 * BLCH, &proof, true), Err(wd::ClaimRefusal::RateLimited));
+        assert_eq!(l2.release_withdrawal(700771, 0, &[1; 32], 99 * BLCH, &proof, true, false), Err(wd::ClaimRefusal::RateLimited));
         for _ in 0..wd::RELEASE_WINDOW_BLOCKS {
             l2.advance_height().unwrap();
         }
-        l2.release_withdrawal(700771, 0, &[1; 32], 99 * BLCH, &proof, true).expect("attested first claim of a window");
+        l2.release_withdrawal(700771, 0, &[1; 32], 99 * BLCH, &proof, true, false).expect("attested first claim of a window");
         assert!(l2.escrow_conserved());
         // Without attestors nobody can lift the cap, so the first claim stays
         // exempt (otherwise it would never pay).
@@ -2174,6 +2174,100 @@ mod l2_tests {
             bare.advance_height().unwrap();
         }
         release(&mut bare, &tree, &leaves, 0).expect("no attestors: first claim exempt");
+    }
+
+    // ── Security review round 2, EXE-4
+    //    (`params::L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH`) ──
+
+    #[test]
+    fn l2_release_exemption_gate_is_inert() {
+        assert_eq!(crate::params::L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH, u64::MAX);
+        for epoch in [0, 5_850, 7_400, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::l2_release_exemption_active(epoch));
+        }
+        let _gate = crate::params::l2_release_exemption_rehearsal::open();
+        assert!(crate::params::l2_release_exemption_active(0));
+    }
+
+    /// The window rule itself, both sides of the gate, over every state a
+    /// window can be in. Inert, it is the rule it always was.
+    #[test]
+    fn the_window_exemption_survives_an_earlier_claim_only_behind_the_gate() {
+        let cap = 100 * u128::from(BLCH);
+        let window = |released: u128| wd::ReleaseWindow { window: 7, released, cap };
+        let over = 100 * BLCH + 1;
+        for released in [0, 1, cap / 2, cap - 1, cap, cap + 1, 3 * cap] {
+            let w = window(released);
+            for sats in [1, BLCH, 100 * BLCH, over, 500 * BLCH] {
+                let fits = released + u128::from(sats) <= cap;
+                // Inert: exactly the old expression.
+                assert_eq!(w.admits(sats, false, false), fits);
+                assert_eq!(w.admits(sats, true, false), fits || released == 0);
+                // Armed: a claim that is not exempt is judged as before...
+                assert_eq!(w.admits(sats, false, true), fits);
+                // ...and an exempt one passes until the window is above its cap.
+                assert_eq!(w.admits(sats, true, true), fits || released <= cap);
+            }
+        }
+        // One dust claim first: the over-cap claim waits today, pays armed.
+        let dusted = window(1);
+        assert!(!dusted.admits(over, true, false));
+        assert!(dusted.admits(over, true, true));
+        // The exemption is spent by using it: the window is then above its
+        // cap and admits nothing more, exempt or not, however small.
+        let spent = window(1 + u128::from(over));
+        for sats in [1, over] {
+            assert!(!spent.admits(sats, true, true));
+            assert!(!spent.admits(sats, false, true));
+        }
+    }
+
+    /// Through the real claim transaction: a small claim lands first in the
+    /// window, then an attested claim above the cap. Refused with the gate
+    /// inert (and the state untouched), paid with it armed; a second claim
+    /// above the cap in that window is refused either way.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn a_small_claim_no_longer_blocks_the_attested_claim_above_the_cap() {
+        // Escrow 1 000 BLCH: cap 100 BLCH per window.
+        let leaves = [([1; 32], 150 * BLCH), ([2; 32], BLCH), ([3; 32], 120 * BLCH)];
+        let tree: Vec<[u8; 32]> =
+            leaves.iter().enumerate().map(|(i, (r, sats))| wd::leaf(700771, i as u64, r, *sats)).collect();
+        let mut pre = attested_fixture(&leaves, true);
+        {
+            let l2 = pre.l2_settlement.as_mut().unwrap();
+            assert_eq!(l2.release_window().cap, 100 * u128::from(BLCH));
+            l2.release_withdrawal(700771, 1, &[2; 32], BLCH, &wd::proof(&tree, 1).unwrap(), false, false)
+                .expect("the small claim that opens the window");
+        }
+        let large = claim_of(&pre, &leaves, 0, Some(attest(&leaves, &[0, 2])));
+
+        // Inert: today's rule, and the refusal changes nothing.
+        assert_eq!(
+            try_claim(&pre, &large).map(|_| ()),
+            Err(TxReject::L2WithdrawClaim(ClaimReject::RateLimited))
+        );
+        assert_eq!(pre.l2_withdraw_claim_refusal(&large), Some(ClaimReject::RateLimited));
+
+        let _gate = crate::params::l2_release_exemption_rehearsal::open();
+        assert_eq!(pre.l2_withdraw_claim_refusal(&large), None);
+        let mut post = try_claim(&pre, &large).expect("attested claim above the cap, after a small one");
+        let l2 = post.l2_settlement.as_mut().unwrap();
+        assert!(l2.claimed().contains(0));
+        assert_eq!(l2.release_window().released, u128::from(151 * BLCH));
+        assert!(l2.escrow_conserved());
+        // The window has paid its cap plus one exempt claim, and is closed.
+        let before = l2.clone();
+        assert_eq!(
+            l2.release_withdrawal(700771, 2, &[3; 32], 120 * BLCH, &wd::proof(&tree, 2).unwrap(), true, true),
+            Err(wd::ClaimRefusal::RateLimited)
+        );
+        assert_eq!(*l2, before);
+        // An unattested claim above the cap is still refused behind the gate.
+        let unattested = pre.l2_settlement.as_ref().unwrap().check_claim(
+            700771, 2, &[3; 32], 120 * BLCH, &wd::proof(&tree, 2).unwrap(), false, true,
+        );
+        assert_eq!(unattested, Err(wd::ClaimRefusal::RateLimited));
     }
 
     #[test]
@@ -2884,11 +2978,11 @@ mod l2_tests {
         assert_eq!((next.window, next.released, next.cap), (1, 0, sat(90)));
         // The cap is inclusive; only an exempt (attested) first claim exceeds it.
         let fresh = wd::ReleaseWindow::default().at(&limits, 0, sat(1_000));
-        assert!(fresh.admits(100 * BLCH, false));
-        assert!(!fresh.admits(100 * BLCH + 1, false));
-        assert!(fresh.admits(100 * BLCH + 1, true));
+        assert!(fresh.admits(100 * BLCH, false, false));
+        assert!(!fresh.admits(100 * BLCH + 1, false, false));
+        assert!(fresh.admits(100 * BLCH + 1, true, false));
         let after = wd::ReleaseWindow { released: 1, ..fresh };
-        assert!(!after.admits(100 * BLCH, true));
+        assert!(!after.admits(100 * BLCH, true, false));
     }
 
     /// Signatures of `signers` (indices into `keys`, signed with `signing`
