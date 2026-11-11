@@ -326,6 +326,28 @@ pub(crate) fn insert_kes_roots(tree: &mut Smt, roots: &BTreeMap<u32, crate::kes:
 /// this tree; reserved).
 const TAG_PQ_RESCUE_COMMIT: u8 = crate::wire_alloc::state::PQ_RESCUE_COMMIT;
 
+/// `ValidatorCommissionUpdate` epochs of the current epoch
+/// (`CommittedState::commission_update_epochs`, security review round 2
+/// DET-3), one leaf per validator, value = the epoch (u64 LE). The map is
+/// empty (zero leaves) below `COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH`
+/// and at the start of every epoch, so every historical root is unchanged.
+///
+/// It takes no component tag of its own (the state-tag table is frozen,
+/// [`crate::wire_alloc`]): the leaves live under `TAG_VALIDATOR` with a key
+/// of this prefix followed by the 4-byte index. A validator record's key is
+/// the 4-byte index alone, so the two can never be the same key preimage;
+/// `TAG_KES_ROOT` separates its bind-epoch leaf from its entries the same
+/// way.
+const COMMISSION_UPDATE_KEY_PREFIX: &[u8] = b"commission-update-epoch:";
+
+pub(crate) fn insert_commission_update_epochs(tree: &mut Smt, epochs: &BTreeMap<u32, u64>) {
+    for (validator, epoch) in epochs {
+        let mut key = COMMISSION_UPDATE_KEY_PREFIX.to_vec();
+        key.extend_from_slice(&validator.to_le_bytes());
+        tree.insert(derive_key(TAG_VALIDATOR, &key), hash_value(&epoch.to_le_bytes()));
+    }
+}
+
 pub(crate) fn insert_pq_rescue_commits(
     tree: &mut Smt,
     commits: &std::collections::BTreeMap<[u8; 32], u64>,

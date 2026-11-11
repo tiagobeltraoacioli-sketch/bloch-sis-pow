@@ -580,8 +580,19 @@ pub mod withdrawal {
         }
         /// Whether `sats` more fits. An `exempt` claim (see
         /// [`RELEASE_WINDOW_BPS`]) may exceed the cap as the window's first.
-        pub fn admits(&self, sats: u64, exempt: bool) -> bool {
-            self.released.saturating_add(u128::from(sats)) <= self.cap || (exempt && self.released == 0)
+        ///
+        /// `after_earlier_claims`
+        /// (`params::L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH`, security review
+        /// round 2 EXE-4): the exempt claim need not be the first. It may
+        /// exceed the cap while the window has released no more than its
+        /// cap, so an earlier small claim no longer pushes it to the next
+        /// window. Once it is paid `released > cap`, which is what records
+        /// that the window's one exemption is spent: nothing else fits, and
+        /// the window releases at most its cap plus that one claim.
+        pub fn admits(&self, sats: u64, exempt: bool, after_earlier_claims: bool) -> bool {
+            self.released.saturating_add(u128::from(sats)) <= self.cap
+                || (exempt
+                    && if after_earlier_claims { self.released <= self.cap } else { self.released == 0 })
         }
         /// Room left in the window (an exempt first claim may exceed it).
         pub fn remaining(&self) -> u128 {
@@ -1558,6 +1569,10 @@ impl State {
     }
     /// Check a claim of withdrawal `index` for the next native block without
     /// mutating state (mempool preflight, RPC, tooling).
+    /// `exempt_after_earlier_claims` is
+    /// `params::l2_release_exemption_active` at the claim's epoch (see
+    /// [`withdrawal::ReleaseWindow::admits`]); the caller knows the epoch,
+    /// this state does not.
     pub fn check_claim(
         &self,
         chain_id: u64,
@@ -1566,6 +1581,7 @@ impl State {
         sats: u64,
         siblings: &[[u8; 32]; withdrawal::TREE_DEPTH],
         attested: bool,
+        exempt_after_earlier_claims: bool,
     ) -> Result<withdrawal::Record, withdrawal::ClaimRefusal> {
         use withdrawal::ClaimRefusal as R;
         if !self.profile.user_transactions || !self.asynchronous {
@@ -1582,7 +1598,7 @@ impl State {
         if self.escrow_sat < u128::from(sats) {
             return Err(R::Escrow);
         }
-        if !self.release_window().admits(sats, self.window_exempt(attested)) {
+        if !self.release_window().admits(sats, self.window_exempt(attested), exempt_after_earlier_claims) {
             return Err(R::RateLimited);
         }
         Ok(record)
@@ -1598,8 +1614,9 @@ impl State {
         sats: u64,
         siblings: &[[u8; 32]; withdrawal::TREE_DEPTH],
         attested: bool,
+        exempt_after_earlier_claims: bool,
     ) -> Result<(), withdrawal::ClaimRefusal> {
-        self.check_claim(chain_id, index, l1_recipient, sats, siblings, attested)?;
+        self.check_claim(chain_id, index, l1_recipient, sats, siblings, attested, exempt_after_earlier_claims)?;
         let released = self.released_sat.checked_add(u128::from(sats)).ok_or(withdrawal::ClaimRefusal::Escrow)?;
         let mut window = self.release_window();
         window.released = window.released.saturating_add(u128::from(sats));

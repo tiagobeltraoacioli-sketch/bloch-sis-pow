@@ -2667,13 +2667,22 @@ pub(crate) mod funded_delegation_rehearsal {
 /// 1. **Position limits.** `FundedDelegate` refuses a new position when the
 ///    committed history already holds
 ///    [`crate::transition::funded_delegation::MAX_FUNDED_POSITIONS`] unpruned
-///    positions, or
+///    positions created under this gate, and from half of that limit on it
+///    requires a principal that doubles with every further 1/32 of the limit
+///    ([`crate::transition::funded_delegation::funded_position_minimum_sat`]).
+///    Behind one validator at most
 ///    [`crate::transition::funded_delegation::MAX_FUNDED_POSITIONS_PER_VALIDATOR`]
-///    behind the same validator; and once half of either limit is in use it
-///    requires at least
-///    [`crate::transition::funded_delegation::CROWDED_FUNDED_POSITION_MIN_SAT`]
-///    of principal, so that minimum-size positions cannot occupy the slots
-///    that substantial stake needs.
+///    positions may be live (not deactivating); when they are all taken a
+///    new position enters only by displacing the smallest of them, which
+///    it must be at least
+///    [`crate::transition::funded_delegation::FUNDED_DISPLACEMENT_FACTOR`]
+///    times as large as. The displaced position is deactivated exactly as
+///    its owner's `FundedUndelegate` would and is withdrawn by its owner
+///    through the ordinary path. Positions created before the gate do not
+///    count toward the global limit (they cost 10 BLCH each and nothing
+///    limited them, so counting them would let the limit be filled in
+///    advance: security review round 2, DET-1 and V1-4) but they hold
+///    per-validator slots and can be displaced like any other.
 /// 2. **Pruning.** At each epoch boundary, fully withdrawn positions are
 ///    overwritten with [`crate::delegation::Delegation::PRUNED`] and their
 ///    owner and lifecycle entries are removed, provided the removal is
@@ -2695,15 +2704,125 @@ const _: () = assert!(gate_is_inert_or_not_before(
 ));
 
 pub(crate) fn funded_delegation_bound_active(epoch: u64) -> bool {
+    funded_delegation_bound_epoch().is_some_and(|activation| epoch >= activation)
+}
+
+/// The epoch the bound took effect at, `None` while it is inert. A position
+/// whose `requested_epoch` is at or before it was created before the gate
+/// (a position created in epoch `c` requests `c + 1`).
+pub(crate) fn funded_delegation_bound_epoch() -> Option<u64> {
     #[cfg(test)]
-    if funded_delegation_bound_rehearsal::enabled() {
-        return true;
+    if let Some(epoch) = funded_delegation_bound_rehearsal::epoch() {
+        return Some(epoch);
     }
-    epoch_gate_active(epoch, FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH)
+    (FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH != u64::MAX).then_some(FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH)
 }
 
 #[cfg(test)]
 pub(crate) mod funded_delegation_bound_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static EPOCH: Cell<Option<u64>> = const { Cell::new(None) }; }
+    pub fn epoch() -> Option<u64> { EPOCH.with(Cell::get) }
+    /// Armed from genesis.
+    pub fn open() -> impl Drop { open_at(0) }
+    /// Armed from `epoch`, so a test can build state below the gate first.
+    pub fn open_at(epoch: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore { fn drop(&mut self) { EPOCH.with(|v| v.set(self.0)); } }
+        Restore(EPOCH.with(|v| v.replace(Some(epoch))))
+    }
+}
+
+/// Security review round 2, DET-3: at most one `ValidatorCommissionUpdate`
+/// per validator per epoch. `u64::MAX` means INERT.
+///
+/// The update carries no nonce and pays no fee; its only replay protection
+/// was "the value must differ from the committed one". Once a validator had
+/// signed two values in one epoch, each message became valid again as soon as
+/// the other had been applied, any number of times in one block and from any
+/// sender: a third party chose which value stood at the end of the epoch,
+/// and a proposer had an unlimited supply of valid zero-fee transactions.
+///
+/// Once armed, an accepted update records its epoch for the validator
+/// (`CommittedState::commission_update_epochs`) and a further update for the
+/// same validator in the same epoch is refused
+/// (`FundedDelegationReject::CommissionAlreadyUpdated`). The record is
+/// committed state: one leaf per validator that has updated under the gate,
+/// keyed under the validator component with a key no validator index can
+/// produce, and one optional local-cache section. Below the gate nothing is
+/// recorded, so every state root and every cache keeps its bytes.
+///
+/// It changes which transactions are valid and it changes committed state,
+/// so arming needs a historical replay, mixed-fleet qualification and a
+/// coordinated epoch; there is no runtime override. It cannot precede funded
+/// delegation, which is what makes the message valid at all.
+/// `commission_update_limit_gate_is_inert` pins the inert value.
+pub const COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH,
+    FUNDED_DELEGATION_ACTIVATION_EPOCH
+));
+
+pub(crate) fn commission_update_limit_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if commission_update_limit_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod commission_update_limit_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+/// Security review round 2, EXE-4: the L2 release window's over-cap
+/// exemption no longer depends on being the window's first claim.
+/// `u64::MAX` means INERT.
+///
+/// A claim above the window cap is payable only if it is exempt (attested,
+/// or on a policy without attestors). Before this gate it also had to be the
+/// first claim of its window, so any earlier claim of any size, including an
+/// ordinary small one, pushed every larger withdrawal to the next window,
+/// where the same could happen again; the L2 leaf fixes the amount, so the
+/// owner cannot split it.
+///
+/// Once armed, an exempt claim may exceed the cap while the window has not
+/// released more than its cap, and that claim closes the window (released is
+/// then above the cap, so nothing else fits). No state is added: "the
+/// exemption was used" is `released > cap`. The per-window bound changes from
+/// `max(cap, one exempt claim)` to `cap + one exempt claim`; an unattested
+/// claim is still bounded by the cap on a policy with attestors.
+///
+/// It changes which claims are valid, so arming needs a historical replay,
+/// mixed-fleet qualification and a coordinated epoch; there is no runtime
+/// override. It cannot precede the L2 settlement itself.
+/// `l2_release_exemption_gate_is_inert` pins the inert value.
+pub const L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+
+pub(crate) fn l2_release_exemption_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_release_exemption_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_release_exemption_rehearsal {
     use std::cell::Cell;
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
     pub fn enabled() -> bool { ENABLED.with(Cell::get) }

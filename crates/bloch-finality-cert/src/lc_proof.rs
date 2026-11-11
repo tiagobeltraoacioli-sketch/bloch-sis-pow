@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `getlcproof` / `BLCLMP01`: a finality certificate plus the state proofs
+//! `getlcproof` / `BLCLMP01` (`BLCLMP02` with a second bind proof): a finality certificate plus the state proofs
 //! needed to judge it under every consensus signature and weight rule, from
 //! one trusted block id. RPC and tool layer only: this reads committed state
 //! and signed votes, and nothing here feeds a consensus input.
@@ -45,11 +45,36 @@ pub const MAINNET_NETWORK_DOMAIN: [u8; 32] = [
 ];
 
 /// The KES extension: the bind-epoch leaf and one entry (or absence) per
-/// voter, all against the set-source state root.
+/// voter, all against the set-source state root, and optionally the
+/// bind-epoch leaf of the checkpoint's own state.
+///
+/// Freshness (security review round 2, CRY-2 / FC-5). The set source may be
+/// up to `max_hop_epochs` older than the target, and an absence proven in an
+/// old state says nothing about a later one:
+///
+/// * The bind is decided at the boundary into some epoch `n` and governs
+///   from `n + KES_BIND_DELAY_EPOCHS`; the leaf is in every state from `n`
+///   on. So "no bind" in a state of epoch `s` proves "static keys" only for
+///   targets `t <= s + KES_BIND_DELAY_EPOCHS`. A later target is refused.
+/// * A voter proven to have no entry may be judged by its static key past
+///   the bind only if the set source is itself bound and in the target's
+///   KES period: a first registration in a bound state starts in the period
+///   after its inclusion, whereas one made before the bind signs from the
+///   bind on, so an older absence cannot exclude it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KesProofs {
-    /// `Some(epoch)`: the committed bind epoch; `None`: proven absent.
+    /// Against the set-source state root. `Some(epoch)`: the committed bind
+    /// epoch; `None`: proven absent.
     pub enforced: (Option<u64>, CompressedProof),
+    /// The same leaf (or its absence) against the checkpoint header's state
+    /// root, for the finalizing link only, and only when the set source
+    /// proves the bind absent. The set source of a checkpoint cannot speak
+    /// for the finalizing link's target (two epochs past the newest state a
+    /// set source can be), so without this no step could be taken while the
+    /// chain has not bound, nor across the bind. It is used after the
+    /// justifying link has passed its quorum under the set source's proof,
+    /// which is what backs the checkpoint's state root.
+    pub enforced_at_checkpoint: Option<(Option<u64>, CompressedProof)>,
     /// `(validator, Some(entry bytes) | None, proof)`, ascending validator.
     pub entries: Vec<(u32, Option<Vec<u8>>, CompressedProof)>,
 }
@@ -125,6 +150,25 @@ pub struct Verified {
     pub kes_votes: usize,
     /// The lowest header of the ancestry (finalized by implication).
     pub ancestry_tip: Option<BlockHeaderV4>,
+}
+
+/// What a link knows about the KES bind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bind {
+    /// The committed bind epoch.
+    At(u64),
+    /// Proven absent in a state of this epoch.
+    AbsentIn(u64),
+}
+
+/// May a voter proven to have no KES entry in a set-source state of epoch
+/// `src_epoch` be judged by its static key at `target`, given that KES binds
+/// from `bound_from <= target`? Only if that state is itself bound (a first
+/// registration made in a bound state starts in the period after its
+/// inclusion; one made before the bind signs from the bind on) and in the
+/// target's KES period.
+fn static_fallback_is_fresh(bound_from: u64, src_epoch: u64, target: u64) -> bool {
+    src_epoch >= bound_from && params::kes_period(target) == params::kes_period(src_epoch)
 }
 
 fn id(h: &BlockHeaderV4) -> [u8; 32] {
@@ -258,7 +302,9 @@ pub fn verify(
         }
     }
 
-    // 5. KES keys (required for targets at or past the KES gate).
+    // 5. KES keys (required for targets at or past the KES gate). `binds`
+    //    is what each link is judged under.
+    let mut binds: [Option<Bind>; 2] = [None, None];
     let mut keys = ProvenKeys {
         records: &records,
         kes: BTreeMap::new(),
@@ -274,33 +320,42 @@ pub fn verify(
         }
         Some(kp) => {
             let (enforced, ep) = &kp.enforced;
+            // Against the set-source root only. (A bind proven solely by the
+            // checkpoint's own state used to be accepted here; that state is
+            // backed by nothing until the justifying link has been judged,
+            // and the justifying link was then judged under it.)
             let ok = match enforced {
-                // The bind crossing. The set source of the last checkpoint
-                // before the bind cannot commit the bind, but its finalizing
-                // link is already KES-signed, and with no way past this one
-                // checkpoint a chain of proofs would stop for good. A bind
-                // strictly after E may therefore be proven against the
-                // checkpoint's own state root: the justifying link has
-                // target E < bind, so it is judged by static keys, and step 6
-                // checks it, quorum included, before the finalizing link is
-                // judged under this bind. The state root is thus backed by two
-                // thirds of the set source's weight.
-                Some(epoch) => {
-                    prove_leaf(&root, &kes_enforced_leaf_key(), &epoch.to_le_bytes(), ep)
-                        || (*epoch > e
-                            && prove_leaf(
-                                &cert.checkpoint_header.state_root,
-                                &kes_enforced_leaf_key(),
-                                &epoch.to_le_bytes(),
-                                ep,
-                            ))
-                }
+                Some(epoch) => prove_leaf(&root, &kes_enforced_leaf_key(), &epoch.to_le_bytes(), ep),
                 None => prove_absent(&root, &kes_enforced_leaf_key(), ep),
             };
             if !ok {
                 return Err(Refusal::Kes("bind epoch not proven"));
             }
-            keys.enforced = Some(*enforced);
+            binds[0] = Some(match enforced {
+                Some(epoch) => Bind::At(*epoch),
+                None => Bind::AbsentIn(src_epoch),
+            });
+            binds[1] = binds[0];
+            // The finalizing link may take the bind from the checkpoint's
+            // own state root, when the set source does not commit one. Step
+            // 6 reads it only after the justifying link passed its quorum.
+            if let Some((at_checkpoint, cp)) = &kp.enforced_at_checkpoint {
+                if enforced.is_some() {
+                    return Err(Refusal::Kes("checkpoint bind proof beside a bind at the set source"));
+                }
+                let cp_root = cert.checkpoint_header.state_root;
+                let ok = match at_checkpoint {
+                    Some(epoch) => prove_leaf(&cp_root, &kes_enforced_leaf_key(), &epoch.to_le_bytes(), cp),
+                    None => prove_absent(&cp_root, &kes_enforced_leaf_key(), cp),
+                };
+                if !ok {
+                    return Err(Refusal::Kes("checkpoint bind epoch not proven"));
+                }
+                binds[1] = Some(match at_checkpoint {
+                    Some(epoch) => Bind::At(*epoch),
+                    None => Bind::AbsentIn(epoch_of(cert.checkpoint_header.slot)),
+                });
+            }
             let mut last = None;
             for (v, bytes, cp) in &kp.entries {
                 if last.is_some_and(|l| *v <= l) {
@@ -331,7 +386,24 @@ pub fn verify(
     for (li, link) in cert.links.iter().enumerate() {
         let t = link.target_epoch;
         let active = |r: &ValidatorRecord| r.activation_epoch <= t && t < r.exit_epoch;
-        let kes_on = params::kes_period(t).is_some() && matches!(keys.enforced, Some(Some(b)) if t >= b);
+        // An absence proves "static keys" only for the epochs a bind decided
+        // right after that state could not reach yet.
+        if let (Some(_), Some(Bind::AbsentIn(at))) = (params::kes_period(t), binds[li]) {
+            if t > at.saturating_add(params::KES_BIND_DELAY_EPOCHS) {
+                return Err(Refusal::Kes("bind absence too old for this target"));
+            }
+        }
+        keys.enforced = binds[li].map(|bind| match bind {
+            Bind::At(epoch) => Some(epoch),
+            Bind::AbsentIn(_) => None,
+        });
+        let bound_from = match binds[li] {
+            Some(Bind::At(b)) if params::kes_period(t).is_some() && t >= b => Some(b),
+            _ => None,
+        };
+        let kes_on = bound_from.is_some();
+        // Whether "no KES entry at the set source" still holds at `t`.
+        let absence_is_fresh = bound_from.is_some_and(|b| static_fallback_is_fresh(b, src_epoch, t));
         let mut signers: Vec<u32> = Vec::with_capacity(link.votes.len());
         let mut last: Option<u32> = None;
         for v in &link.votes {
@@ -347,6 +419,9 @@ pub fn verify(
             // proven unregistered (static fallback); an unproven one is refused.
             if kes_on && !keys.kes.contains_key(&v.validator) && !keys.kes_absent.contains(&v.validator) {
                 return Err(Refusal::Kes("voter's KES entry not proven"));
+            }
+            if kes_on && keys.kes_absent.contains(&v.validator) && !absence_is_fresh {
+                return Err(Refusal::Kes("voter absence too old"));
             }
             let verifier = PolicyVerifier::consensus(sigs, epoch_of(v.slot));
             let data = link.data(v);
@@ -413,17 +488,46 @@ pub fn verify(
     })
 }
 
-/// Chain-of-certificates: each verified checkpoint is trusted for the next.
+/// One step of a client that walks the chain: [`verify`], then the verified
+/// checkpoint becomes the ONLY trusted block id, and it must be newer than
+/// the checkpoint the client stood on (`after_epoch`, `None` for an anchor
+/// whose epoch the caller does not track).
+///
+/// Every caller that keeps a trusted set across steps goes through this
+/// (security review round 2, CRY-2 / FC-5). A set that only grows keeps old
+/// roots usable as set sources for ever, and the older the set source the
+/// less its state says about the keys in force at the target; a client that
+/// has verified epoch `E` has no use for a set source before it. On a
+/// refusal `trusted` is unchanged.
+pub fn verify_next(
+    p: &MainnetProof,
+    trusted: &mut BTreeSet<[u8; 32]>,
+    after_epoch: Option<u64>,
+    cfg: &Config,
+    sigs: &dyn SignatureVerifier,
+) -> Result<Verified, Refusal> {
+    let v = verify(p, trusted, cfg, sigs)?;
+    if after_epoch.is_some_and(|newest| v.epoch <= newest) {
+        return Err(Refusal::Shape("target not after the trusted checkpoint"));
+    }
+    trusted.clear();
+    trusted.insert(v.root);
+    Ok(v)
+}
+
+/// Chain-of-certificates: each verified checkpoint is the trusted one for
+/// the next ([`verify_next`]). On return `trusted` holds only the newest
+/// verified root.
 pub fn verify_chain(
     proofs: &[MainnetProof],
     trusted: &mut BTreeSet<[u8; 32]>,
     cfg: &Config,
     sigs: &dyn SignatureVerifier,
 ) -> Result<Vec<Verified>, (usize, Refusal)> {
-    let mut out = Vec::with_capacity(proofs.len());
+    let mut out: Vec<Verified> = Vec::with_capacity(proofs.len());
     for (i, p) in proofs.iter().enumerate() {
-        let v = verify(p, trusted, cfg, sigs).map_err(|e| (i, e))?;
-        trusted.insert(v.root);
+        let after = out.last().map(|v| v.epoch);
+        let v = verify_next(p, trusted, after, cfg, sigs).map_err(|e| (i, e))?;
         out.push(v);
     }
     Ok(out)
@@ -431,8 +535,15 @@ pub fn verify_chain(
 
 // ─── Wire format of a step proof (host → guest, RPC) ───────────────────────
 
-/// Magic + version of [`MainnetProof::encode`].
+/// Magic + version of [`MainnetProof::encode`] for a proof without
+/// [`KesProofs::enforced_at_checkpoint`]: the format every released verifier
+/// reads, byte for byte what it was.
 pub const PROOF_MAGIC: &[u8; 8] = b"BLCLMP01";
+/// Magic + version of a proof that carries
+/// [`KesProofs::enforced_at_checkpoint`], appended after the KES entries.
+/// One proof has one encoding: `02` always carries the second proof, `01`
+/// never does.
+pub const PROOF_MAGIC_V2: &[u8; 8] = b"BLCLMP02";
 
 fn put_proof(o: &mut Vec<u8>, p: &CompressedProof) {
     o.extend_from_slice(&p.bitmap);
@@ -491,7 +602,8 @@ impl<'a> Rd<'a> {
 
 impl MainnetProof {
     pub fn encode(&self) -> Vec<u8> {
-        let mut o = PROOF_MAGIC.to_vec();
+        let second = self.kes.as_ref().and_then(|k| k.enforced_at_checkpoint.as_ref());
+        let mut o = if second.is_some() { PROOF_MAGIC_V2.to_vec() } else { PROOF_MAGIC.to_vec() };
         put_bytes(&mut o, &self.cert.encode());
         match &self.finality_set {
             None => o.push(0),
@@ -525,6 +637,16 @@ impl MainnetProof {
                     }
                     put_proof(&mut o, p);
                 }
+                if let Some((at_checkpoint, p)) = &k.enforced_at_checkpoint {
+                    match at_checkpoint {
+                        None => o.push(0),
+                        Some(e) => {
+                            o.push(1);
+                            o.extend_from_slice(&e.to_le_bytes());
+                        }
+                    }
+                    put_proof(&mut o, p);
+                }
             }
         }
         o
@@ -533,9 +655,11 @@ impl MainnetProof {
     /// Strict inverse of [`Self::encode`].
     pub fn decode(b: &[u8]) -> Option<Self> {
         let mut r = Rd { b, at: 0 };
-        if r.take(8)? != PROOF_MAGIC {
-            return None;
-        }
+        let v2 = match r.take(8)? {
+            m if m == PROOF_MAGIC => false,
+            m if m == PROOF_MAGIC_V2 => true,
+            _ => return None,
+        };
         let cert = Certificate::decode(r.bytes()?).ok()?;
         let finality_set = match r.u8()? {
             0 => None,
@@ -565,10 +689,24 @@ impl MainnetProof {
                     };
                     entries.push((v, bytes, r.proof()?));
                 }
-                Some(KesProofs { enforced: (enforced, ep), entries })
+                let enforced_at_checkpoint = if v2 {
+                    let at_checkpoint = match r.u8()? {
+                        0 => None,
+                        1 => Some(r.u64()?),
+                        _ => return None,
+                    };
+                    Some((at_checkpoint, r.proof()?))
+                } else {
+                    None
+                };
+                Some(KesProofs { enforced: (enforced, ep), enforced_at_checkpoint, entries })
             }
             _ => return None,
         };
+        // `02` exists only to carry the second proof.
+        if v2 && kes.is_none() {
+            return None;
+        }
         (r.at == b.len()).then_some(MainnetProof { cert, finality_set, kes })
     }
 }
@@ -583,6 +721,22 @@ pub struct CheckpointExtensions {
     pub finality_set: Option<FinalitySetProof>,
     /// `None` before KES registration opens.
     pub kes: Option<KesProofs>,
+}
+
+impl KesProofs {
+    /// Attach the checkpoint's own bind proof (`checkpoint`: the extensions
+    /// proven for the checkpoint block) when [`verify`] needs it: the set
+    /// source proves the bind absent and the finalizing link's target
+    /// `finalizing_target` is at or past the KES gate. Otherwise the proof
+    /// is left as it is, and keeps the `BLCLMP01` encoding.
+    pub fn with_checkpoint_bind(mut self, checkpoint: Option<&KesProofs>, finalizing_target: u64) -> Self {
+        if self.enforced.0.is_none() && params::kes_period(finalizing_target).is_some() {
+            if let Some(cp) = checkpoint {
+                self.enforced_at_checkpoint = Some(cp.enforced.clone());
+            }
+        }
+        self
+    }
 }
 
 impl CheckpointExtensions {
@@ -668,7 +822,7 @@ fn kes_proofs(
             None => entries.push((rec.index, None, compress(&tree.prove_absence(&key)?))),
         }
     }
-    Some(KesProofs { enforced, entries })
+    Some(KesProofs { enforced, enforced_at_checkpoint: None, entries })
 }
 
 /// Drop votes the set source cannot judge. A validator activated after the
@@ -687,6 +841,30 @@ pub fn retain_provable_votes(cert: &mut Certificate) {
         link.votes.retain(|v| {
             records.get(&v.validator).is_some_and(|r| r.activation_epoch <= t && t < r.exit_epoch)
         });
+    }
+}
+
+/// Drop static votes [`verify`] would refuse as `voter absence too old`: on
+/// a link that KES binds, the votes of validators `kes` proves to have no
+/// entry, when the set source is not bound or not in the target's KES period
+/// (the bind is read as [`verify`] reads it: the checkpoint's proof for the
+/// finalizing link when there is one). The chain counted those votes under
+/// its own, later, state; this set source cannot vouch for them, and one of
+/// them makes the whole proof refused. Whether the quorum holds without
+/// them is for [`verify`] to say.
+pub fn retain_fresh_static_votes(cert: &mut Certificate, kes: &KesProofs) {
+    let src_epoch = epoch_of(cert.registry.header.slot);
+    let absent: BTreeSet<u32> = kes.entries.iter().filter(|(_, bytes, _)| bytes.is_none()).map(|(v, _, _)| *v).collect();
+    for (li, link) in cert.links.iter_mut().enumerate() {
+        let t = link.target_epoch;
+        let bind = match (&kes.enforced_at_checkpoint, li) {
+            (Some((at_checkpoint, _)), 1) if kes.enforced.0.is_none() => *at_checkpoint,
+            _ => kes.enforced.0,
+        };
+        let Some(b) = bind.filter(|b| params::kes_period(t).is_some() && t >= *b) else { continue };
+        if !static_fallback_is_fresh(b, src_epoch, t) {
+            link.votes.retain(|v| !absent.contains(&v.validator));
+        }
     }
 }
 

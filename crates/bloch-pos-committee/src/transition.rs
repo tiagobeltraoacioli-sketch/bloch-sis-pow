@@ -1896,6 +1896,13 @@ pub struct CommittedState {
     /// behind that gate), and an empty map adds no state-root leaf and no
     /// local-cache section, so every historical root and cache is unchanged.
     pq_rescue_commits: BTreeMap<[u8; 32], u64>,
+    /// Validator → the epoch of its `ValidatorCommissionUpdate` in the
+    /// current epoch (security review round 2, DET-3). Written only behind
+    /// `params::COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH` and emptied at
+    /// every epoch boundary, so it is EMPTY on every state below the gate
+    /// and at the start of every epoch. An empty map adds no state-root
+    /// leaf and no local-cache section.
+    commission_update_epochs: BTreeMap<u32, u64>,
     /// Forward-secure validator keys (`crate::kes`): registered once by wire
     /// 0x17, replaced only by a leaf-signed `KesRotate`. Each entry is the key
     /// in force and at most one successor (`crate::kes::KesEntry`). Committed
@@ -2518,6 +2525,7 @@ impl CommittedState {
             evm,
             l2_settlement: None,
             pq_rescue_commits: BTreeMap::new(),
+            commission_update_epochs: BTreeMap::new(),
             kes: BTreeMap::new(),
             kes_enforced_from: None,
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
@@ -3295,6 +3303,7 @@ impl CommittedState {
             crate::state_root::insert_kes_roots(&mut tree, &self.kes, self.kes_enforced_from);
         }
         crate::state_root::insert_pq_rescue_commits(&mut tree, &self.pq_rescue_commits);
+        crate::state_root::insert_commission_update_epochs(&mut tree, &self.commission_update_epochs);
         tree
     }
 
@@ -6189,6 +6198,9 @@ impl CommittedState {
         st.epoch = next_epoch;
         // Rescue commitments past their TTL (no-op on the empty pre-gate map).
         st.prune_pq_rescue_commits(next_epoch);
+        // DET-3: the one-update-per-epoch record only speaks about the epoch
+        // that just closed (no-op on the empty pre-gate map).
+        st.commission_update_epochs.clear();
         // HF3 KES: enforcement is decided at the first boundary past the
         // compiled gate where registered keys cover the stake threshold
         // (review F-2), and takes effect `KES_BIND_DELAY_EPOCHS` later, so a

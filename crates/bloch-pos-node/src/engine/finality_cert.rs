@@ -419,16 +419,17 @@ impl Engine {
         let voters: BTreeSet<u32> = cert.links.iter().flat_map(|l| l.votes.iter().map(|v| v.validator)).collect();
         let extensions_of = |id: &[u8; 32]| self.finality_certs.extensions.iter().find(|(x, _)| x == id).map(|(_, x)| x);
         let mut ext = extensions_of(&set_source_id).map(|x| x.for_voters(&voters)).unwrap_or_default();
-        // The bind crossing: see `lc_proof::verify`. The set source does not
-        // commit the bind yet, but the checkpoint does, for a later epoch.
+        // While the set source commits no bind, the finalizing link is
+        // judged by the checkpoint's own bind leaf (or its absence): see
+        // `lc_proof::KesProofs`. Attached only from the KES gate on, so
+        // earlier proofs keep the `BLCLMP01` encoding.
         let checkpoint_id = cert.root();
-        if let Some(k) = ext.kes.as_mut().filter(|k| k.enforced.0.is_none()) {
-            if let Some(bind) = extensions_of(&checkpoint_id)
-                .and_then(|x| x.kes.as_ref())
-                .filter(|c| c.enforced.0.is_some_and(|b| b > e))
-            {
-                k.enforced = bind.enforced.clone();
-            }
+        let checkpoint_kes = extensions_of(&checkpoint_id).and_then(|x| x.kes.clone());
+        ext.kes = ext.kes.take().map(|k| k.with_checkpoint_bind(checkpoint_kes.as_ref(), e.saturating_add(1)));
+        // Static votes this set source cannot vouch for any more (the voter
+        // may have registered a KES key since) would get the proof refused.
+        if let Some(k) = &ext.kes {
+            lc_proof::retain_fresh_static_votes(&mut cert, k);
         }
         let votes = [cert.links[0].votes.len() as u64, cert.links[1].votes.len() as u64];
         let has_set = |fs: &lc_proof::FinalitySetProof| {
@@ -457,7 +458,7 @@ impl Engine {
             ("kes".into(), kes_json),
             ("ancestry".into(), field("ancestry")?),
             ("bytes".into(), Json::u(bytes.len() as u64)),
-            ("format".into(), Json::s("BLCLMP01")),
+            ("format".into(), Json::s(if bytes.starts_with(lc_proof::PROOF_MAGIC_V2) { "BLCLMP02" } else { "BLCLMP01" })),
             ("proof".into(), Json::s(crate::codec::hex(&bytes))),
         ]);
         self.finality_certs.lc_cache.push_back((key, out.clone()));
