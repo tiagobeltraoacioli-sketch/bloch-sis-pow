@@ -881,7 +881,7 @@ mod tests {
             for listed in [0usize, 1, 3, 6] {
                 let t0 = Instant::now();
                 let mut slots = Slots::new(MAINNET);
-                let mut nodes = fleet(ip("45.77.67.52"), validators, t0);
+                let mut nodes = fleet(ip("100.64.1.52"), validators, t0);
                 let epochs = 2;
                 for second in 0..epochs * EPOCH {
                     let now = t0 + secs(second);
@@ -907,7 +907,7 @@ mod tests {
     fn a_thousand_idle_connections_from_one_address_hold_only_its_share() {
         let t0 = Instant::now();
         let mut slots = Slots::new(MAINNET);
-        let mut honest = fleet(ip("45.77.67.52"), 16, t0);
+        let mut honest = fleet(ip("100.64.1.52"), 16, t0);
         let flood: Vec<Probe> = (0..1000).map(|_| Probe::default()).collect();
         let mut admitted = 0usize;
         for second in 0..2 * EPOCH {
@@ -951,13 +951,13 @@ mod tests {
     fn idle_connections_from_250_addresses_are_bounded_and_displace_no_proven_peer() {
         let t0 = Instant::now();
         let mut slots = Slots::new(MAINNET);
-        let listed: [(&str, usize); 3] = [("80.240.16.185", 11), ("199.247.22.8", 13), ("45.77.67.251", 13)];
+        let listed: [(&str, usize); 3] = [("100.64.0.185", 11), ("100.64.0.8", 13), ("100.64.0.251", 13)];
         let mut nodes: Vec<(usize, Dialer)> = Vec::new();
         for (host, validators) in listed {
             nodes.extend(fleet(ip(host), validators, t0).into_iter().map(|node| (21, node)));
         }
-        nodes.extend(fleet(ip("45.77.67.52"), 13, t0).into_iter().map(|node| (0, node)));
-        nodes.extend(fleet(ip("140.82.35.231"), 11, t0).into_iter().map(|node| (0, node)));
+        nodes.extend(fleet(ip("100.64.1.52"), 13, t0).into_iter().map(|node| (0, node)));
+        nodes.extend(fleet(ip("100.64.1.231"), 11, t0).into_iter().map(|node| (0, node)));
         // 44 external validators: twenty alone, and three operators with
         // eight validators each behind one address.
         for n in 0..20u64 {
@@ -969,7 +969,7 @@ mod tests {
         }
         // Two archival nodes: they never vote, so nothing ever vouches for them.
         let archival_from = nodes.len();
-        nodes.extend((0..2).map(|_| (0, Dialer::new(ip("139.180.173.231"), None, t0))));
+        nodes.extend((0..2).map(|_| (0, Dialer::new(ip("100.64.2.231"), None, t0))));
         let honest = nodes.len();
         assert_eq!(honest, 107);
 
@@ -1046,7 +1046,7 @@ mod tests {
         for n in 0..MAINNET.total {
             slots.admit(flood_source(n), false, t0, Probe::default()).unwrap();
         }
-        let mut nodes = fleet(ip("45.77.67.52"), 13, t0);
+        let mut nodes = fleet(ip("100.64.1.52"), 13, t0);
         let mut proven_at = None;
         let mut longest_wait = 0u64;
         let mut waiting = 0u64;

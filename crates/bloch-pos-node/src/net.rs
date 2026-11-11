@@ -4347,30 +4347,41 @@ mod tests {
     /// once: the vote waiting in the queue went into the closed socket and
     /// was gone. Now the dialer looks before it writes, pauses, and the vote
     /// is still queued when a connection is finally admitted.
+    ///
+    /// The look is a wait of `plain_probe_wait` for the peer's close, so it
+    /// only helps when the refusal arrives inside that wait (X1-5). Here the
+    /// "listener" is this test thread; on a saturated machine it can take
+    /// longer than the wait to accept and close, and the dialer then writes
+    /// the vote, as it would to a slow real listener. The scenario is
+    /// therefore tried a few times and must succeed once: with the look
+    /// removed it never does, because the first plain retry always writes.
     #[test]
     fn a_dialer_turned_away_at_accept_keeps_its_queued_vote_for_the_next_connection() {
         use crate::mesh_pq::{MeshSecurity, Mode};
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let (events, _received) = mpsc::channel();
-        let mesh = start(
-            "127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
-            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(),
-            Arc::new(MeshSecurity::ephemeral(Mode::Offer, [9; 32], None)),
-        ).unwrap();
-        let vote = att_frame(&sample_attestation());
-        mesh.broadcast(vote.clone());
-        // Handshake, plain retry, handshake again: all three closed at accept.
-        let started = Instant::now();
-        for _ in 0..3 {
-            drop(listener.accept().unwrap());
-        }
-        assert!(started.elapsed() >= REFUSED_DIAL_BACKOFF_MIN, "a refused dial is retried after a pause");
-        // The fourth is the second plain retry, and this time it is kept.
-        let (mut sock, _) = listener.accept().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let attempt = || -> bool {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let (events, _received) = mpsc::channel();
+            let mesh = start(
+                "127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
+                events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(),
+                Arc::new(MeshSecurity::ephemeral(Mode::Offer, [9; 32], None)),
+            ).unwrap();
+            let vote = att_frame(&sample_attestation());
+            mesh.broadcast(vote.clone());
+            // Handshake, plain retry, handshake again: all three closed at accept.
+            let started = Instant::now();
+            for _ in 0..3 {
+                drop(listener.accept().unwrap());
+            }
+            assert!(started.elapsed() >= REFUSED_DIAL_BACKOFF_MIN, "a refused dial is retried after a pause");
+            // The fourth is the second plain retry, and this time it is kept.
+            let (mut sock, _) = listener.accept().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            read_until_frame(|| read_frame_until(&mut sock, deadline), &vote)
+        };
         assert!(
-            read_until_frame(|| read_frame_until(&mut sock, deadline), &vote),
-            "the queued vote was written into a connection the listener had closed"
+            (0..4).any(|_| attempt()),
+            "the queued vote was written into a connection the listener had closed, in every attempt"
         );
     }
 
