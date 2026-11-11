@@ -861,59 +861,81 @@ pub mod withdrawal {
     /// forfeit reset forgets of the bitmap.
     ///
     /// Empty until the first claim under the next program, so every earlier
-    /// state keeps its bytes. Committed as its length and a running root.
+    /// state keeps its bytes. Committed as its length and a running root. The
+    /// entries are kept in claim order, so the root folds again from them: a
+    /// cache restore refuses entries that do not fold to the committed root
+    /// (review R308-2P-1).
     #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
     pub struct PaidLeaves {
-        /// Leaf index -> `(leaf hash, L2 number of the record)`, in claim order.
-        leaves: std::collections::BTreeMap<u64, Vec<([u8; 32], u64)>>,
-        len: u64,
+        /// `(leaf index, leaf hash, L2 number of the record)` in claim order.
+        entries: Vec<(u64, [u8; 32], u64)>,
+        /// Leaf index -> positions in `entries`. Derived, never serialized.
+        #[cfg_attr(feature = "local-state-cache", serde(skip))]
+        by_index: std::collections::BTreeMap<u64, Vec<usize>>,
         /// Running root over every entry, in claim order (zero while empty).
         root: [u8; 32],
     }
     impl PaidLeaves {
         /// Whether exactly this leaf at `index` was paid.
         pub fn contains(&self, index: u64, leaf: &[u8; 32]) -> bool {
-            self.leaves.get(&index).is_some_and(|paid| paid.iter().any(|(l, _)| l == leaf))
+            self.by_index.get(&index).is_some_and(|at| at.iter().any(|p| &self.entries[*p].1 == leaf))
         }
         pub fn len(&self) -> u64 {
-            self.len
+            self.entries.len() as u64
         }
         pub fn is_empty(&self) -> bool {
-            self.len == 0
+            self.entries.is_empty()
         }
         pub fn root(&self) -> [u8; 32] {
             self.root
         }
-        pub(crate) fn record(&mut self, index: u64, leaf: [u8; 32], l2_number: u64) {
+        fn fold(root: &[u8; 32], index: u64, leaf: &[u8; 32], l2_number: u64) -> [u8; 32] {
             let mut h = Keccak256::new();
             h.update(b"BLOCH:NATIVE:L2:PAID-LEAF:1");
-            h.update(self.root);
+            h.update(root);
             h.update(index.to_le_bytes());
             h.update(leaf);
             h.update(l2_number.to_le_bytes());
-            self.root = h.finalize().into();
-            self.leaves.entry(index).or_default().push((leaf, l2_number));
-            self.len += 1;
+            h.finalize().into()
+        }
+        pub(crate) fn record(&mut self, index: u64, leaf: [u8; 32], l2_number: u64) {
+            self.root = Self::fold(&self.root, index, &leaf, l2_number);
+            self.by_index.entry(index).or_default().push(self.entries.len());
+            self.entries.push((index, leaf, l2_number));
         }
         /// Indices with a leaf paid against a record above L2 block `number`,
         /// ascending.
         pub fn proven_above(&self, number: u64) -> Vec<u64> {
-            self.leaves.iter().filter(|(_, paid)| paid.iter().any(|(_, n)| *n > number)).map(|(index, _)| *index).collect()
+            let indices: std::collections::BTreeSet<u64> =
+                self.entries.iter().filter(|(_, _, n)| *n > number).map(|(index, _, _)| *index).collect();
+            indices.into_iter().collect()
         }
         pub(crate) fn encode(&self, out: &mut Vec<u8>) {
             out.extend_from_slice(b"BLOCH:NATIVE:L2:PAID-LEAVES:1");
-            out.extend_from_slice(&self.len.to_le_bytes());
+            out.extend_from_slice(&self.len().to_le_bytes());
             out.extend_from_slice(&self.root);
         }
-        /// Whether the entries fold to the stored length. The running root is
-        /// order-dependent across indices and is authenticated by the state
-        /// root check that follows a cache restore.
+        /// The index over deserialized entries (a cache restore).
+        #[cfg(feature = "local-state-cache")]
+        pub(crate) fn reindexed(mut self) -> Self {
+            self.by_index.clear();
+            for (at, (index, _, _)) in self.entries.iter().enumerate() {
+                self.by_index.entry(*index).or_default().push(at);
+            }
+            self
+        }
+        /// Whether the entries fold, in order, to the stored running root,
+        /// and the index covers them. The state root check that follows a
+        /// cache restore authenticates the length and that root, so an
+        /// altered, missing, added or reordered entry does not restore.
         #[cfg(feature = "local-state-cache")]
         pub(crate) fn consistent(&self) -> bool {
-            self.leaves.values().all(|paid| !paid.is_empty())
-                && self.leaves.values().map(|paid| paid.len() as u64).sum::<u64>() == self.len
-                && (self.len == 0) == (self.root == [0; 32])
+            let folded = self.entries.iter().fold([0; 32], |root, (index, leaf, n)| Self::fold(&root, *index, leaf, *n));
+            folded == self.root
+                && (self.entries.is_empty()) == (self.root == [0; 32])
+                && self.by_index.values().map(Vec::len).sum::<usize>() == self.entries.len()
+                && self.by_index.iter().all(|(index, at)| at.iter().all(|p| self.entries.get(*p).is_some_and(|e| e.0 == *index)))
         }
     }
 }
@@ -2673,7 +2695,7 @@ impl State {
     /// Local-cache restore only, like [`Self::restore_checkpoint_roots`].
     #[cfg(feature = "local-state-cache")]
     pub(crate) fn restore_paid_leaves(&mut self, paid: withdrawal::PaidLeaves) {
-        self.paid = paid;
+        self.paid = paid.reindexed();
     }
     /// Satoshis released from escrow by claims.
     pub fn released_sat(&self) -> u128 {

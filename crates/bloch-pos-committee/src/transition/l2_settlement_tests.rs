@@ -3878,6 +3878,51 @@ mod l2_tests {
         );
     }
 
+    /// R308-2P-1, the rest of the rule: the entries restore only as they
+    /// were recorded. Another L2 number, another index, two entries in the
+    /// other order and a missing entry each refuse; the untouched cache
+    /// restores to an equal state.
+    #[test]
+    #[cfg(all(feature = "local-state-cache", feature = "devnet-l2-user-txs"))]
+    fn r308_2p_1_paid_leaf_entries_restore_only_in_order_and_unaltered() {
+        let (mut state, _) = activated_fixture(true, [0; 32]);
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let forged = [honest[0], ([0xee; 32], 9 * BLCH), ([3; 32], 5 * BLCH)];
+        let l2 = state.l2_settlement.as_mut().unwrap();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        put_tail(l2, &honest, &forged);
+        let chain = l2.policy().chain_id;
+        pay(l2, chain, &forged, 1).unwrap();
+        pay(l2, chain, &honest, 0).unwrap();
+        // `local_cache_round_trip` asserts that the untouched cache restores to an equal state.
+        let (_, bytes, header) = local_cache_round_trip(&state);
+        let first = wd::leaf(chain, 1, &forged[1].0, forged[1].1);
+        let second = wd::leaf(chain, 0, &honest[0].0, honest[0].1);
+        let marker: &[u8] = b"BPOSST01:L2PL:v1";
+        let section = bytes.windows(marker.len()).position(|w| w == marker).unwrap();
+        let find = |leaf: &[u8; 32]| section + bytes[section..].windows(32).position(|w| w == leaf).expect("the paid leaf is in its section");
+        let (a, b) = (find(&first), find(&second));
+        // An entry is `index, leaf, L2 number`, one byte each side of the leaf here.
+        assert_eq!((bytes[a - 1], bytes[a + 32], bytes[b - 1], bytes[b + 32], b), (1, 2, 0, 1, a + 34));
+        let refuses = |bytes: &[u8], what: &str| assert!(CommittedState::decode_local_cache(bytes, &header).is_err(), "restored with {what}");
+        let mut number = bytes.clone();
+        number[a + 32] = 1;
+        refuses(&number, "another L2 number");
+        let mut index = bytes.clone();
+        index[b - 1] = 2;
+        refuses(&index, "another leaf index");
+        let mut swapped = bytes.clone();
+        swapped[a - 1..a + 33].copy_from_slice(&bytes[b - 1..b + 33]);
+        swapped[b - 1..b + 33].copy_from_slice(&bytes[a - 1..a + 33]);
+        refuses(&swapped, "the entries in another order");
+        let mut missing = bytes.clone();
+        missing.drain(b - 1..b + 33);
+        assert_eq!(missing[a - 2], 2, "the entry count");
+        missing[a - 2] = 1;
+        refuses(&missing, "an entry missing");
+
+    }
+
     #[test]
     fn a_reset_head_takes_the_next_settlement_under_the_new_program() {
         let (pre, mut chains) = fixture();
