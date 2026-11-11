@@ -336,14 +336,41 @@ const SYNC_FANOUT: usize = 2;
 /// One request per lease; expiration permits another connection's turn even
 /// when peers stay silent or the applied head has not moved.
 const SYNC_LEASE: Duration = Duration::from_secs(5);
-const MAX_SYNC_SERVING_WORKERS: usize = 4;
+/// Each worker is one thread and one page in memory (at most
+/// `codec::MAX_FIELD_LEN` of block bytes), so this is also the memory bound
+/// of sync serving: 64 MiB at the very worst.
+const MAX_SYNC_SERVING_WORKERS: usize = 8;
+/// Workers only the operator's own `--peers` may use. However the rest of
+/// the pool is occupied, a configured peer that restarts can still catch up
+/// from this node.
+const SYNC_SERVING_RESERVED_FOR_CONFIGURED: usize = 2;
 /// Serving workers one normalized source address may hold at once. A worker
 /// is held for as long as its page takes to write, so without this a single
 /// address with a few connections could hold every worker and leave honest
 /// peers with silence. Two, not one, so nodes that legitimately share an
-/// address (one host, one NAT) do not serialize behind each other, while half
-/// of the workers always remain available to other sources.
+/// address (one host, one NAT) do not serialize behind each other. It is a
+/// quarter of the pool (a third of what unconfigured sources may use), so no
+/// two sources can take every worker.
 const MAX_SYNC_SERVING_PER_SOURCE: usize = 2;
+/// The share of a source that has not recently been written a whole page
+/// (see [`SYNC_SOURCE_PROVEN_FOR`]). An address this node knows nothing about
+/// gets one worker; nodes sharing that address are served one after the
+/// other until the first page completes, which a reading peer does in
+/// seconds, and side by side from then on.
+const MAX_SYNC_SERVING_PER_UNPROVEN_SOURCE: usize = 1;
+/// How long a completed page vouches for its source.
+const SYNC_SOURCE_PROVEN_FOR: Duration = Duration::from_secs(600);
+/// A page of at least this many bytes, written in full, is what proves a
+/// source reads what it asks for. An empty or tiny page fits in any socket
+/// buffer whether or not the peer reads.
+const SYNC_PROVING_PAGE_BYTES: usize = 256 * 1024;
+/// After a page to a source is cut off for falling below the minimum rate,
+/// that source is not served again for this long. Without it a source that
+/// never reads gets a new worker the moment the old one is taken away. A
+/// peer that honestly cannot read 32 KiB/s loses nothing it could have used.
+const SYNC_STALL_COOLDOWN: Duration = Duration::from_secs(60);
+/// Sources remembered in each of the two maps above; idle records expire.
+const MAX_SYNC_SOURCE_RECORDS: usize = 1024;
 /// Slowest sustained read rate at which a peer is still served a whole page:
 /// 32 KiB/s (256 kbit/s). A node that cannot receive this fast cannot follow
 /// the chain either, since one maximal block body alone is 512 KiB.
@@ -351,6 +378,11 @@ const SYNC_PAGE_MIN_BYTES_PER_SEC: u64 = 32 * 1024;
 /// Fixed allowance on top of the throughput budget, covering connection
 /// latency, frame overhead and broadcasts interleaved on the same socket.
 const SYNC_PAGE_WRITE_GRACE: Duration = Duration::from_secs(15);
+/// The same allowance for a source that is not proven. Five seconds still
+/// covers a slow connection's latency many times over; it is what a peer
+/// that reads nothing at all can hold a worker for, beyond the bytes the
+/// socket buffer swallows.
+const SYNC_PAGE_WRITE_GRACE_UNPROVEN: Duration = Duration::from_secs(5);
 
 /// Whole-page deadline for one `get-blocks` answer of `page_bytes` bytes.
 ///
@@ -360,9 +392,48 @@ const SYNC_PAGE_WRITE_GRACE: Duration = Duration::from_secs(15);
 /// the time the page takes at `SYNC_PAGE_MIN_BYTES_PER_SEC`. A maximal page
 /// (`codec::MAX_FIELD_LEN`, 8 MiB) therefore gets 15 s + 256 s = 271 s, and a
 /// peer reading at 32 KiB/s or faster can never reach the deadline.
+#[cfg(test)]
 fn sync_page_deadline(start: Instant, page_bytes: usize) -> Instant {
-    let seconds = (page_bytes as u64).div_ceil(SYNC_PAGE_MIN_BYTES_PER_SEC);
-    start + SYNC_PAGE_WRITE_GRACE + Duration::from_secs(seconds)
+    PagePace { start, grace: SYNC_PAGE_WRITE_GRACE, bytes_per_sec: SYNC_PAGE_MIN_BYTES_PER_SEC }.deadline(page_bytes)
+}
+
+/// The deadline of every block of one page, not only of its last.
+///
+/// One deadline for the whole page lets a peer that reads nothing hold the
+/// worker for the full budget of a page it will never receive. The budget is
+/// therefore spent block by block: block `k` must be written by the time the
+/// bytes up to and including it take at the minimum rate, plus the grace. A
+/// peer that reads at the minimum rate or faster meets every one of these, by
+/// the same arithmetic as the whole-page deadline, which is the last of them.
+#[derive(Clone, Copy)]
+struct PagePace {
+    start: Instant,
+    grace: Duration,
+    bytes_per_sec: u64,
+}
+
+impl PagePace {
+    fn starting_now(proven: bool) -> Self {
+        let grace = if proven { SYNC_PAGE_WRITE_GRACE } else { SYNC_PAGE_WRITE_GRACE_UNPROVEN };
+        Self { start: Instant::now(), grace, bytes_per_sec: SYNC_PAGE_MIN_BYTES_PER_SEC }
+    }
+
+    /// When the first `bytes` bytes of the page must have been written.
+    fn deadline(&self, bytes: usize) -> Instant {
+        let millis = (bytes as u128).saturating_mul(1000).div_ceil(u128::from(self.bytes_per_sec.max(1)));
+        self.start + self.grace + Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
+    }
+}
+
+/// How one page ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageOutcome {
+    /// Every block was written; the count of block bytes.
+    Written(usize),
+    /// Cut off at a deadline: the peer was not reading fast enough.
+    Stalled,
+    /// The connection ended for another reason.
+    Closed,
 }
 
 /// The address form used for per-source accounting: an IPv4-mapped IPv6
@@ -727,7 +798,10 @@ const MAX_INBOUND_CONNECTIONS: usize = 128;
 /// filling the table takes eight sources that each keep sixteen connections
 /// delivering valid frames (see [`INBOUND_IDLE_EVICTION`]). Sources listed in
 /// `--peers` are exempt, so a fleet that puts more nodes than this on one
-/// host is unaffected as long as its nodes list each other.
+/// host is unaffected as long as its nodes list each other. The exemption is
+/// sized by that list: an address at which `n` peers are configured holds up
+/// to `2n + 2` exempt connections (`inbound_slots::Standing::for_source`),
+/// and further connections from it count against this share like any other.
 const MAX_INBOUND_PER_SOURCE: usize = 16;
 /// Inbound connections that have neither completed an authenticated
 /// handshake nor delivered a valid frame. They are counted inside
@@ -949,14 +1023,19 @@ struct SyncResponder {
     socket: Arc<Mutex<MeshWriter>>,
     data_dir: PathBuf,
     budget: Arc<Mutex<SyncBudget>>,
+    /// The connection's source is one of the operator's own `--peers`.
+    configured: bool,
 }
 
-struct SyncServingGuard(Arc<Connection>, Arc<Mutex<SyncBudget>>, std::net::IpAddr);
+/// Connection, budget, normalized source, whether the source is configured,
+/// and whether it was proven when the worker was reserved.
+struct SyncServingGuard(Arc<Connection>, Arc<Mutex<SyncBudget>>, std::net::IpAddr, bool, bool);
 impl Drop for SyncServingGuard {
     fn drop(&mut self) {
         self.0.serving_sync.store(false, Ordering::Release);
         if let Ok(mut budget) = self.1.lock() {
             budget.serving = budget.serving.saturating_sub(1);
+            if !self.3 { budget.serving_unconfigured = budget.serving_unconfigured.saturating_sub(1); }
             if let Some(held) = budget.serving_by_source.get_mut(&self.2) {
                 *held = held.saturating_sub(1);
                 if *held == 0 { budget.serving_by_source.remove(&self.2); }
@@ -967,21 +1046,37 @@ impl Drop for SyncServingGuard {
 
 impl SyncResponder {
     fn reserve(&self, connection: &Arc<Connection>, ip: std::net::IpAddr, limiter: &mut GetBlocksLimiter) -> Option<SyncServingGuard> {
-        let now = Instant::now();
+        self.reserve_at(connection, ip, limiter, Instant::now())
+    }
+
+    fn reserve_at(&self, connection: &Arc<Connection>, ip: std::net::IpAddr, limiter: &mut GetBlocksLimiter, now: Instant) -> Option<SyncServingGuard> {
         if connection.closed.load(Ordering::Acquire) || !limiter.admit(now) { return None; }
         let mut budget = self.budget.lock().ok()?;
         if !budget.admit(ip, now) || budget.serving >= MAX_SYNC_SERVING_WORKERS { return None; }
         let source = normalize_source(ip);
-        if budget.serving_by_source.get(&source).is_some_and(|held| *held >= MAX_SYNC_SERVING_PER_SOURCE) { return None; }
+        if budget.cooling.get(&source).is_some_and(|until| now < *until) { return None; }
+        // The workers above the reserve are for every source; the reserve is
+        // for configured ones alone.
+        if !self.configured
+            && budget.serving_unconfigured >= MAX_SYNC_SERVING_WORKERS.saturating_sub(SYNC_SERVING_RESERVED_FOR_CONFIGURED)
+        {
+            return None;
+        }
+        let proven = budget.proven.get(&source).is_some_and(|at| now.saturating_duration_since(*at) < SYNC_SOURCE_PROVEN_FOR);
+        let share = if proven { MAX_SYNC_SERVING_PER_SOURCE } else { MAX_SYNC_SERVING_PER_UNPROVEN_SOURCE };
+        if budget.serving_by_source.get(&source).is_some_and(|held| *held >= share) { return None; }
         if connection.serving_sync.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() { return None; }
         budget.serving = budget.serving.saturating_add(1);
+        if !self.configured { budget.serving_unconfigured = budget.serving_unconfigured.saturating_add(1); }
         *budget.serving_by_source.entry(source).or_default() += 1;
-        Some(SyncServingGuard(connection.clone(), self.budget.clone(), source))
+        Some(SyncServingGuard(connection.clone(), self.budget.clone(), source, self.configured, proven))
     }
 
-    fn answer(&self, connection: &Arc<Connection>, ip: std::net::IpAddr, frame: Vec<u8>, limiter: &mut GetBlocksLimiter) {
-        if frame.len() != 9 { return; }
-        let Some(guard) = self.reserve(connection, ip, limiter) else { return };
+    /// True when a worker took the request. A refused request is answered
+    /// with silence and is not activity on the connection.
+    fn answer(&self, connection: &Arc<Connection>, ip: std::net::IpAddr, frame: Vec<u8>, limiter: &mut GetBlocksLimiter) -> bool {
+        if frame.len() != 9 { return false; }
+        let Some(guard) = self.reserve(connection, ip, limiter) else { return false };
         let responder = self.clone();
         // One worker per active connection, with no page queue. Keeping the
         // reader free is necessary when both peers request pages together:
@@ -989,9 +1084,11 @@ impl SyncResponder {
         thread::spawn(move || {
             let _guard = guard;
             if !_guard.0.closed.load(Ordering::Acquire) {
-                serve_get_blocks(&responder.socket, &responder.data_dir, &frame, &_guard.0);
+                let outcome = serve_get_blocks(&responder.socket, &responder.data_dir, &frame, &_guard.0, PagePace::starting_now(_guard.4));
+                if let Ok(mut budget) = _guard.1.lock() { budget.note_page(_guard.2, outcome, Instant::now()); }
             }
         });
+        true
     }
 }
 
@@ -1620,9 +1717,36 @@ struct SyncBudget {
     /// Workers held per normalized source; entries exist only while nonzero,
     /// so the map never exceeds MAX_SYNC_SERVING_WORKERS entries.
     serving_by_source: std::collections::BTreeMap<std::net::IpAddr, usize>,
+    /// Of `serving`, the workers held for sources that are not configured.
+    serving_unconfigured: usize,
+    /// Normalized source → when a whole page was last written to it.
+    proven: std::collections::BTreeMap<std::net::IpAddr, Instant>,
+    /// Normalized source → not served before this instant.
+    cooling: std::collections::BTreeMap<std::net::IpAddr, Instant>,
 }
 impl SyncBudget {
-    fn new() -> Self { Self { serving: 0, serving_by_source: Default::default(), addresses: Default::default(), global: GetBlocksLimiter { tokens: 128.0, last: Instant::now(), rate: 64.0, capacity: 128.0 } } }
+    fn new() -> Self { Self { serving: 0, serving_by_source: Default::default(), serving_unconfigured: 0, proven: Default::default(), cooling: Default::default(), addresses: Default::default(), global: GetBlocksLimiter { tokens: 128.0, last: Instant::now(), rate: 64.0, capacity: 128.0 } } }
+    /// Record how a page to `source` (already normalized) ended.
+    fn note_page(&mut self, source: std::net::IpAddr, outcome: PageOutcome, now: Instant) {
+        match outcome {
+            PageOutcome::Written(bytes) if bytes >= SYNC_PROVING_PAGE_BYTES => {
+                if !self.proven.contains_key(&source) {
+                    self.proven.retain(|_, at| now.saturating_duration_since(*at) < SYNC_SOURCE_PROVEN_FOR);
+                    if self.proven.len() >= MAX_SYNC_SOURCE_RECORDS { return; }
+                }
+                self.proven.insert(source, now);
+            }
+            PageOutcome::Stalled => {
+                self.proven.remove(&source);
+                if !self.cooling.contains_key(&source) {
+                    self.cooling.retain(|_, until| now < *until);
+                    if self.cooling.len() >= MAX_SYNC_SOURCE_RECORDS { return; }
+                }
+                self.cooling.insert(source, now + SYNC_STALL_COOLDOWN);
+            }
+            PageOutcome::Written(_) | PageOutcome::Closed => {}
+        }
+    }
     fn admit(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
         let ip = crate::connection_limit::limit_key(ip);
         if !self.addresses.contains_key(&ip) {
@@ -1651,9 +1775,10 @@ fn serve_get_blocks(
     data_dir: &PathBuf,
     frame: &[u8],
     connection: &Connection,
-) {
+    pace: PagePace,
+) -> PageOutcome {
     if frame.len() != 9 || connection.closed.load(Ordering::Acquire) {
-        return;
+        return PageOutcome::Closed;
     }
     // SyncResponder admits rate limits and the per-connection worker permit
     // before this function can touch disk.
@@ -1661,7 +1786,7 @@ fn serve_get_blocks(
     // exactly 8 bytes and the conversion cannot fail; the `else` arm keeps it
     // panic-free by construction rather than by an `unwrap`.
     let Ok(after_bytes) = frame[1..9].try_into() else {
-        return;
+        return PageOutcome::Closed;
     };
     let after = u64::from_le_bytes(after_bytes);
     // Paged at `SYNC_PAGE_BLOCKS`. This used to answer `usize::MAX` — the whole
@@ -1672,48 +1797,57 @@ fn serve_get_blocks(
     // full history still arrives; it just no longer arrives as one allocation
     // large enough to kill the receiver.
     match crate::store::Store::blocks_after(data_dir, after, SYNC_PAGE_BLOCKS) {
-        Ok(blocks) => {
-            let page_bytes = blocks.iter().fold(0usize, |total, b| total.saturating_add(b.len()));
-            write_sync_page(sock, &blocks, connection, sync_page_deadline(Instant::now(), page_bytes));
+        // The clock of the page starts after the read from disk: the peer
+        // is not charged for this node's storage.
+        Ok(blocks) => write_sync_page(sock, &blocks, connection, PagePace { start: Instant::now(), ..pace }),
+        Err(e) => {
+            eprintln!("net: get-blocks failed: {e}");
+            PageOutcome::Closed
         }
-        Err(e) => eprintln!("net: get-blocks failed: {e}"),
     }
 }
 
-/// Write one page, giving up and closing the connection at `deadline`. The
-/// caller's serving worker is therefore held for a bounded time whatever the
-/// peer does, including while a broadcast to the same slow peer holds the
-/// socket lock.
+/// Write one page, giving up and closing the connection as soon as a block
+/// misses its deadline under `pace`. The caller's serving worker is therefore
+/// held for a bounded time whatever the peer does, including while a
+/// broadcast to the same slow peer holds the socket lock, and a peer that
+/// reads nothing loses it after the first block the socket buffer refuses.
 fn write_sync_page(
     sock: &Arc<Mutex<MeshWriter>>,
     blocks: &[Vec<u8>],
     connection: &Connection,
-    deadline: Instant,
-) {
+    pace: PagePace,
+) -> PageOutcome {
+    let mut written = 0usize;
     for b in blocks {
+        let deadline = pace.deadline(written.saturating_add(b.len()));
         let mut w = loop {
-            if connection.closed.load(Ordering::Acquire) { return; }
+            if connection.closed.load(Ordering::Acquire) { return PageOutcome::Closed; }
             match sock.try_lock() {
                 Ok(w) => break w,
-                Err(std::sync::TryLockError::Poisoned(_)) => return,
+                Err(std::sync::TryLockError::Poisoned(_)) => return PageOutcome::Closed,
                 Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(2));
                 }
                 Err(std::sync::TryLockError::WouldBlock) => {
                     connection.closed.store(true, Ordering::Release);
                     let _ = connection.socket.shutdown(Shutdown::Both);
-                    return;
+                    return PageOutcome::Stalled;
                 }
             }
         };
-        if connection.closed.load(Ordering::Acquire) { return; }
+        if connection.closed.load(Ordering::Acquire) { return PageOutcome::Closed; }
         if w.write_typed_frame_until(FRAME_BLOCK, b, deadline).is_err() {
             // A partial frame cannot be followed by more framed data.
             connection.closed.store(true, Ordering::Release);
             let _ = connection.socket.shutdown(Shutdown::Both);
-            return;
+            // Past the deadline the peer was too slow; before it, the
+            // connection broke, which is nobody's stall.
+            return if Instant::now() >= deadline { PageOutcome::Stalled } else { PageOutcome::Closed };
         }
+        written = written.saturating_add(b.len());
     }
+    PageOutcome::Written(written)
 }
 
 /// Start the mesh: listen on `bind_addr:listen_port`, dial every peer, feed
@@ -1761,12 +1895,18 @@ pub fn start(
     // Sources of the operator's own `--peers`, exempt from the inbound
     // shares, deadlines and eviction. Literal addresses are known now; a peer
     // given by name is learned by its dialer thread on the first connection.
-    let configured: Arc<Mutex<std::collections::BTreeSet<std::net::IpAddr>>> = Arc::new(Mutex::new(
+    // The value is the number of configured peers at that source: the
+    // standing is granted by address, before any handshake, so it is
+    // rationed by what the operator actually configured there.
+    let configured: Arc<Mutex<std::collections::BTreeMap<std::net::IpAddr, usize>>> = Arc::new(Mutex::new(
         peer_addrs
             .iter()
             .filter_map(|addr| addr.parse::<SocketAddr>().ok())
             .map(|addr| crate::connection_limit::limit_key(addr.ip()))
-            .collect(),
+            .fold(std::collections::BTreeMap::new(), |mut peers, source| {
+                *peers.entry(source).or_insert(0usize) += 1;
+                peers
+            }),
     ));
     {
         // Deadlines must not wait for the next accept: a quiet listener would
@@ -1809,12 +1949,19 @@ pub fn start(
                 }
                 let Ok(address) = sock.peer_addr() else { continue };
                 let Ok(evict_handle) = sock.try_clone() else { continue };
-                let is_configured = configured
+                let peers_here = configured
                     .lock()
-                    .is_ok_and(|set| set.contains(&crate::connection_limit::limit_key(address.ip())));
+                    .ok()
+                    .and_then(|peers| peers.get(&crate::connection_limit::limit_key(address.ip())).copied())
+                    .unwrap_or(0);
+                // This loop is the only thing that adds slots, so the count
+                // cannot grow between this read and the admission below.
+                let Ok(held) = slots.lock().map(|slots| slots.configured_held(address.ip())) else { continue };
+                let standing = inbound_slots::Standing::for_source(peers_here, held);
+                let is_configured = standing.is_configured();
                 // Shares, the pending pool and eviction are all decided here;
                 // see `inbound_slots`. A refusal drops `sock`, closing it.
-                let Some(slot) = InboundSlot::admit(&slots, address.ip(), is_configured, Instant::now(), evict_handle) else {
+                let Some(slot) = InboundSlot::admit(&slots, address.ip(), standing, Instant::now(), evict_handle) else {
                     continue;
                 };
                 // R3 M-4 / R1 A3-M2: bounded so a peer that stops reading or
@@ -1893,19 +2040,38 @@ pub fn start(
                     // guards live in `_half`, so every `return` below and any
                     // unwind releases both.
                     let _half = ConnectionHalf(connection);
-                    let responder = SyncResponder { socket: wsock, data_dir: data_dir.clone(), budget: sync_budget };
+                    let responder = SyncResponder { socket: wsock, data_dir: data_dir.clone(), budget: sync_budget, configured: is_configured };
                     // Per-connection (R3 M-4 / R1 A3-M2): see [`GetBlocksLimiter`].
                     let mut get_blocks_limiter = GetBlocksLimiter::new();
+                    // Whether the sync scheduler already knows this peer.
+                    let mut offered = is_configured;
                     loop {
                         match reader.read_frame() {
                             Ok(frame) => {
-                                let outcome = if frame.first() == Some(&FRAME_GET_BLOCKS) {
-                                    let well_formed = frame.len() == 9;
-                                    responder.answer(&_half.0, address.ip(), frame, &mut get_blocks_limiter);
-                                    if well_formed { FrameOutcome::Delivered } else { FrameOutcome::Ignored }
-                                } else {
-                                    admit_frame_from_ip(&events, &inflight, address.ip(), &frame, false)
-                                };
+                                if frame.first() == Some(&FRAME_GET_BLOCKS) {
+                                    // A request the limiter or the worker pool
+                                    // refused is not activity. One a worker
+                                    // took keeps the connection open, which a
+                                    // node that is catching up needs, but nine
+                                    // bytes are not usefulness: the connection
+                                    // stays first in line for eviction. It is
+                                    // still offered to the sync scheduler: on
+                                    // a chain that produces no blocks this is
+                                    // the only frame a dialer ever sends, and a
+                                    // listener with a short log must be able
+                                    // to ask it for history.
+                                    if responder.answer(&_half.0, address.ip(), frame, &mut get_blocks_limiter) {
+                                        let Some(slot) = _half.0.slot.as_ref() else { return };
+                                        let now = Instant::now();
+                                        if !slot.mark_requested(now) { return; }
+                                        if !offered {
+                                            offered = true;
+                                            if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer.clone(), now); }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                let outcome = admit_frame_from_ip(&events, &inflight, address.ip(), &frame, false);
                                 let Some(slot) = _half.0.slot.as_ref() else { return };
                                 let now = Instant::now();
                                 match outcome {
@@ -1913,7 +2079,8 @@ pub fn start(
                                     FrameOutcome::Delivered => match slot.mark_valid(now) {
                                         // Expired or evicted while this frame was in flight.
                                         None => return,
-                                        Some(true) if !is_configured => {
+                                        Some(true) if !offered => {
+                                            offered = true;
                                             if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer.clone(), now); }
                                         }
                                         Some(_) => {}
@@ -1947,7 +2114,11 @@ pub fn start(
         let live = live.clone();
         let security = security.clone();
         let configured = configured.clone();
+        // A literal address was counted when the set was built. A name is
+        // counted where it last resolved, once, for as long as it stays there.
+        let counted_at_start = addr.parse::<SocketAddr>().is_ok();
         thread::spawn(move || {
+            let mut learned: Option<std::net::IpAddr> = None;
             // `offer` against a legacy peer: a handshake the peer closed on
             // sends the NEXT connection plain; when that plain session ends
             // the handshake is tried again, so an upgraded peer is picked up
@@ -1960,9 +2131,16 @@ pub fn start(
             };
             // Bounded: a name that resolves somewhere new on every dial must
             // not grow this set for the life of the process.
-            if let (Ok(address), Ok(mut set)) = (sock.peer_addr(), configured.lock()) {
-                if set.len() < MAX_CONFIGURED_SOURCES {
-                    set.insert(crate::connection_limit::limit_key(address.ip()));
+            if let (false, Ok(address), Ok(mut peers)) = (counted_at_start, sock.peer_addr(), configured.lock()) {
+                let source = crate::connection_limit::limit_key(address.ip());
+                if learned != Some(source) && (peers.contains_key(&source) || peers.len() < MAX_CONFIGURED_SOURCES) {
+                    if let Some(old) = learned.replace(source) {
+                        if let Some(count) = peers.get_mut(&old) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 { peers.remove(&old); }
+                        }
+                    }
+                    *peers.entry(source).or_insert(0) += 1;
                 }
             }
             let session = if fallback_plain {
@@ -2015,7 +2193,8 @@ pub fn start(
             {
                 let events = events.clone();
                 let inflight = inflight.clone();
-                let responder = SyncResponder { socket: wsock.clone(), data_dir: data_dir.clone(), budget: sync_budget.clone() };
+                // A dialled connection goes to an address the operator configured.
+                let responder = SyncResponder { socket: wsock.clone(), data_dir: data_dir.clone(), budget: sync_budget.clone(), configured: true };
                 thread::spawn(move || {
                     run_outbound_reader(reader, events, inflight, reader_half, responder);
                 });
@@ -2449,7 +2628,8 @@ mod tests {
         let peers: Vec<_> = (0..=MAX_SYNC_SERVING_WORKERS).map(|_| sync_test_peer()).collect();
         let sockets: Vec<_> = peers.iter().map(|p| Arc::new(Mutex::new(MeshWriter::plain(p.connection.socket.try_clone().unwrap())))).collect();
         let budget = Arc::new(Mutex::new(SyncBudget::new()));
-        let responders: Vec<_> = sockets.iter().map(|s| SyncResponder { socket: s.clone(), data_dir: dir.clone(), budget: budget.clone() }).collect();
+        // Configured, so the whole pool is theirs to fill (see the reserve test).
+        let responders: Vec<_> = sockets.iter().map(|s| SyncResponder { socket: s.clone(), data_dir: dir.clone(), budget: budget.clone(), configured: true }).collect();
         let ip = "127.0.0.1".parse().unwrap();
         // Keep the same guards the worker owns alive, modelling outstanding
         // storage work deterministically across disconnected generations.
@@ -2484,10 +2664,12 @@ mod tests {
         let budget = Arc::new(Mutex::new(SyncBudget::new()));
         let responders: Vec<_> = peers.iter().map(|p| SyncResponder {
             socket: Arc::new(Mutex::new(MeshWriter::plain(p.connection.socket.try_clone().unwrap()))),
-            data_dir: std::env::temp_dir(), budget: budget.clone(),
+            data_dir: std::env::temp_dir(), budget: budget.clone(), configured: false,
         }).collect();
         let reserve = |i: usize, ip: &str| responders[i].reserve(&peers[i].connection, ip.parse().unwrap(), &mut GetBlocksLimiter::new());
         assert!(MAX_SYNC_SERVING_PER_SOURCE < MAX_SYNC_SERVING_WORKERS);
+        // The full share belongs to a source that has been written a page.
+        budget.lock().unwrap().note_page("192.0.2.1".parse().unwrap(), PageOutcome::Written(SYNC_PROVING_PAGE_BYTES), Instant::now());
         let mut held: Vec<_> = (0..MAX_SYNC_SERVING_PER_SOURCE).map(|i| reserve(i, "192.0.2.1").unwrap()).collect();
         let next = MAX_SYNC_SERVING_PER_SOURCE;
         assert!(reserve(next, "192.0.2.1").is_none(), "one source took more than its share of workers");
@@ -2502,11 +2684,114 @@ mod tests {
         assert!(budget.serving_by_source.is_empty());
     }
 
+    /// One deadline for every block of the page, as before the pace existed.
+    fn fixed_deadline(start: Instant, after: Duration) -> PagePace {
+        PagePace { start, grace: after, bytes_per_sec: u64::MAX }
+    }
+
+    /// V2-3: two sources, each with its whole share stalled, do not leave a
+    /// third without a worker; unconfigured sources together cannot reach the
+    /// workers kept for configured peers.
+    #[test]
+    fn stalled_sources_leave_workers_for_others_and_for_configured_peers() {
+        let peers: Vec<_> = (0..MAX_SYNC_SERVING_WORKERS + 2).map(|_| sync_test_peer()).collect();
+        let budget = Arc::new(Mutex::new(SyncBudget::new()));
+        let responder = |i: usize, configured: bool| SyncResponder {
+            socket: Arc::new(Mutex::new(MeshWriter::plain(peers[i].connection.socket.try_clone().unwrap()))),
+            data_dir: std::env::temp_dir(), budget: budget.clone(), configured,
+        };
+        let now = Instant::now();
+        let reserve = |i: usize, ip: &str, configured: bool| {
+            responder(i, configured).reserve_at(&peers[i].connection, ip.parse().unwrap(), &mut GetBlocksLimiter::new(), now)
+        };
+        // Both stalling sources have earned the full share beforehand.
+        for ip in ["192.0.2.1", "192.0.2.2"] {
+            budget.lock().unwrap().note_page(ip.parse().unwrap(), PageOutcome::Written(SYNC_PROVING_PAGE_BYTES), now);
+        }
+        let mut held = vec![
+            reserve(0, "192.0.2.1", false).unwrap(), reserve(1, "192.0.2.1", false).unwrap(),
+            reserve(2, "192.0.2.2", false).unwrap(), reserve(3, "192.0.2.2", false).unwrap(),
+        ];
+        assert!(reserve(4, "192.0.2.2", false).is_none());
+        held.push(reserve(4, "192.0.2.3", false).expect("a third source is served"));
+        // A source with no completed page holds one worker, not two.
+        assert!(reserve(5, "192.0.2.3", false).is_none());
+        held.push(reserve(5, "192.0.2.4", false).unwrap());
+        assert_eq!(held.len(), MAX_SYNC_SERVING_WORKERS - SYNC_SERVING_RESERVED_FOR_CONFIGURED);
+        assert!(reserve(6, "192.0.2.5", false).is_none(), "the reserve is not for unconfigured sources");
+        for i in 0..SYNC_SERVING_RESERVED_FOR_CONFIGURED {
+            held.push(reserve(6 + i, &format!("198.51.100.{}", i + 1), true).expect("a configured peer is served from the reserve"));
+        }
+        assert_eq!(budget.lock().unwrap().serving, MAX_SYNC_SERVING_WORKERS);
+        drop(held);
+        let budget = budget.lock().unwrap();
+        assert_eq!((budget.serving, budget.serving_unconfigured), (0, 0));
+        assert!(budget.serving_by_source.is_empty());
+    }
+
+    /// V2-3: a source whose page was cut off for not reading is not handed
+    /// the next worker at once, and loses the share a completed page earned.
+    #[test]
+    fn a_stalled_source_waits_before_it_is_served_again() {
+        let peers: Vec<_> = (0..3).map(|_| sync_test_peer()).collect();
+        let budget = Arc::new(Mutex::new(SyncBudget::new()));
+        let source: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let reserve = |i: usize, now: Instant| SyncResponder {
+            socket: Arc::new(Mutex::new(MeshWriter::plain(peers[i].connection.socket.try_clone().unwrap()))),
+            data_dir: std::env::temp_dir(), budget: budget.clone(), configured: false,
+        }.reserve_at(&peers[i].connection, source, &mut GetBlocksLimiter::new(), now);
+        let t0 = Instant::now();
+        // A page too small to prove anything earns nothing; a real one does.
+        budget.lock().unwrap().note_page(source, PageOutcome::Written(SYNC_PROVING_PAGE_BYTES - 1), t0);
+        assert!(budget.lock().unwrap().proven.is_empty());
+        budget.lock().unwrap().note_page(source, PageOutcome::Written(SYNC_PROVING_PAGE_BYTES), t0);
+        // A connection that merely broke is not a stall.
+        budget.lock().unwrap().note_page(source, PageOutcome::Closed, t0);
+        drop((reserve(0, t0).unwrap(), reserve(1, t0).unwrap()));
+        budget.lock().unwrap().note_page(source, PageOutcome::Stalled, t0);
+        assert!(reserve(0, t0).is_none());
+        assert!(reserve(0, t0 + SYNC_STALL_COOLDOWN - Duration::from_millis(1)).is_none());
+        let again = reserve(0, t0 + SYNC_STALL_COOLDOWN).expect("served again after the cooldown");
+        assert!(reserve(1, t0 + SYNC_STALL_COOLDOWN).is_none(), "and with the unproven share");
+        drop(again);
+        // Another source was never affected.
+        let other = SyncResponder {
+            socket: Arc::new(Mutex::new(MeshWriter::plain(peers[2].connection.socket.try_clone().unwrap()))),
+            data_dir: std::env::temp_dir(), budget: budget.clone(), configured: false,
+        };
+        assert!(other.reserve_at(&peers[2].connection, "192.0.2.2".parse().unwrap(), &mut GetBlocksLimiter::new(), t0).is_some());
+    }
+
+    /// V2-3: a peer that reads nothing is cut off when the first block the
+    /// socket would not take misses its own deadline, long before the
+    /// deadline of the whole page.
+    #[test]
+    fn a_peer_that_reads_nothing_is_cut_off_long_before_the_page_deadline() {
+        let peer = sync_test_peer();
+        let socket = Arc::new(Mutex::new(MeshWriter::plain(peer.connection.socket.try_clone().unwrap())));
+        // 48 MiB at 2 MiB/s: the page as a whole has 24 s. The remote end
+        // never reads, so the socket buffers fill within the first blocks.
+        let blocks = vec![vec![0x5A; 1 << 20]; 48];
+        let pace = PagePace { start: Instant::now(), grace: Duration::from_millis(300), bytes_per_sec: 2 << 20 };
+        let whole_page = pace.deadline(48 << 20);
+        let outcome = write_sync_page(&socket, &blocks, &peer.connection, pace);
+        let finished = Instant::now();
+        assert_eq!(outcome, PageOutcome::Stalled);
+        assert!(peer.connection.closed.load(Ordering::Acquire));
+        assert!(finished + Duration::from_secs(10) < whole_page, "held for {:?} of a {:?} page budget", finished - pace.start, whole_page - pace.start);
+    }
+
     #[test]
     fn sync_page_deadline_implies_the_documented_minimum_throughput() {
         let start = Instant::now();
         assert_eq!(sync_page_deadline(start, 0), start + SYNC_PAGE_WRITE_GRACE);
         assert_eq!(sync_page_deadline(start, crate::codec::MAX_FIELD_LEN), start + Duration::from_secs(15 + 256));
+        // The pace of a page ends at that same instant and never asks for
+        // more than the minimum rate on the way there.
+        let pace = PagePace { start, grace: SYNC_PAGE_WRITE_GRACE, bytes_per_sec: SYNC_PAGE_MIN_BYTES_PER_SEC };
+        assert_eq!(pace.deadline(crate::codec::MAX_FIELD_LEN), sync_page_deadline(start, crate::codec::MAX_FIELD_LEN));
+        assert_eq!(pace.deadline(512 * 1024), start + Duration::from_secs(15 + 16));
+        assert!(SYNC_SERVING_RESERVED_FOR_CONFIGURED + 2 * MAX_SYNC_SERVING_PER_SOURCE < MAX_SYNC_SERVING_WORKERS);
         // Per-write stalls stay bounded as before; the page budget is separate.
         assert!(SYNC_PAGE_WRITE_GRACE < DEVNET_IO_TIMEOUT);
     }
@@ -2516,7 +2801,7 @@ mod tests {
         let peer = sync_test_peer();
         let socket = Arc::new(Mutex::new(MeshWriter::plain(peer.connection.socket.try_clone().unwrap())));
         let budget = Arc::new(Mutex::new(SyncBudget::new()));
-        let responder = SyncResponder { socket: socket.clone(), data_dir: std::env::temp_dir(), budget: budget.clone() };
+        let responder = SyncResponder { socket: socket.clone(), data_dir: std::env::temp_dir(), budget: budget.clone(), configured: false };
         let ip = "192.0.2.1".parse().unwrap();
         let guard = responder.reserve(&peer.connection, ip, &mut GetBlocksLimiter::new()).unwrap();
         // The peer keeps reading, far below the minimum rate. Each read is
@@ -2532,7 +2817,8 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
             let guard = guard;
-            write_sync_page(&socket, &blocks, &guard.0, started + Duration::from_millis(400));
+            let outcome = write_sync_page(&socket, &blocks, &guard.0, fixed_deadline(started, Duration::from_millis(400)));
+            assert_eq!(outcome, PageOutcome::Stalled);
             drop(guard);
             done_tx.send(Instant::now()).unwrap();
         });
@@ -2555,7 +2841,8 @@ mod tests {
         // A broadcast stuck writing to the same slow peer holds this lock.
         let stuck = socket.lock().unwrap();
         let started = Instant::now();
-        write_sync_page(&socket, &[vec![1; 16]], &peer.connection, started + Duration::from_millis(200));
+        let outcome = write_sync_page(&socket, &[vec![1; 16]], &peer.connection, fixed_deadline(started, Duration::from_millis(200)));
+        assert_eq!(outcome, PageOutcome::Stalled);
         assert!(started.elapsed() >= Duration::from_millis(200));
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(peer.connection.closed.load(Ordering::Acquire));
@@ -2573,8 +2860,9 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(20);
             (0..8).map(|_| read_frame_until(&mut remote, deadline).unwrap()).collect::<Vec<_>>()
         });
-        let page_bytes = blocks.iter().map(Vec::len).sum();
-        write_sync_page(&socket, &blocks, &peer.connection, sync_page_deadline(Instant::now(), page_bytes));
+        let page_bytes: usize = blocks.iter().map(Vec::len).sum();
+        let outcome = write_sync_page(&socket, &blocks, &peer.connection, PagePace::starting_now(false));
+        assert_eq!(outcome, PageOutcome::Written(page_bytes), "an unproven honest reader is served in full too");
         let received = reader.join().unwrap();
         for (frame, block) in received.iter().zip(&expected) {
             assert_eq!(frame[0], FRAME_BLOCK);

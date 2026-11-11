@@ -1229,6 +1229,11 @@ const ORPHAN_PROMOTIONS_PER_TURN: usize = 1;
 /// the same two epochs one rewind window reaches back.
 const SYNC_REWIND_BACKOFF_MAX_SHIFT: u32 = 5;
 
+/// Shortest interval between two rewinds that are let through a back-off
+/// because a new cause appeared, as a power of two of the sync cadence: 2^2
+/// cadences is 8 slots. See [`SyncRewindBackoff::causes`].
+const SYNC_REWIND_NEW_CAUSE_SHIFT: u32 = 2;
+
 /// Node-local back-off for sync rewinds that yield nothing (P2P-6).
 ///
 /// A "rewind" is a `get_blocks` request whose cursor is below the applied
@@ -1261,6 +1266,21 @@ struct SyncRewindBackoff {
     retry_at_ms: u64,
     /// A wanted rewind was held back; retry it once `retry_at_ms` passes.
     deferred: bool,
+    /// Unknown parents of the authenticated orphans that were waiting when
+    /// the latest rewind was issued: what that rewind was asked to find.
+    ///
+    /// The back-off is evidence about those gaps only. Any registered
+    /// validator can sign an orphan whose parent nobody has, and so grow the
+    /// back-off to its cap; without this, a competing branch that appears
+    /// afterwards would wait out an interval earned by somebody else's
+    /// orphan. An authenticated orphan with a parent not listed here is a new
+    /// cause and is let through, at most once per
+    /// [`SYNC_REWIND_NEW_CAUSE_SHIFT`] interval, so minting new orphans buys
+    /// one rewind per 8 slots and not the unbounded rewinds the back-off
+    /// exists to stop. At most `ORPHAN_MAX` ids.
+    causes: Vec<[u8; 32]>,
+    /// Earliest time a new cause may again pass a back-off.
+    new_cause_at_ms: u64,
 }
 
 /// Distinct authenticated proposals retained per genesis validator duty.
@@ -1359,6 +1379,19 @@ impl Source {
         }
     }
 
+    /// Whether two sources draw on the same retention share (orphans,
+    /// future blocks). The share belongs to the peer, not to the road its
+    /// block took: a peer whose blocks arrive both by gossip and in answer
+    /// to this node's own sync request is still one peer, and comparing the
+    /// variants as well gave it every share twice.
+    fn same_retention_share(self, other: Source) -> bool {
+        match (self, other) {
+            (Source::Local, Source::Local) => true,
+            (Source::Local, _) | (_, Source::Local) => false,
+            _ => self.verification_source() == other.verification_source(),
+        }
+    }
+
     /// The per-slot allowance (lane, total, one source's share) a block from
     /// this source verifies its proposer signature under.
     fn block_verification_allowance(self) -> (verification::VerificationLane, usize, usize) {
@@ -1386,7 +1419,7 @@ fn future_retention_totals<'a>(
     incoming_source: Source,
 ) -> (usize, usize, usize) {
     retained.fold((0usize, 0usize, 0usize), |acc, (held_source, block_bytes)| {
-        let same_source = usize::from(*held_source == incoming_source);
+        let same_source = usize::from(held_source.same_retention_share(incoming_source));
         (
             acc.0.saturating_add(*block_bytes),
             acc.1.saturating_add(same_source),
@@ -3948,14 +3981,25 @@ impl Engine {
         if wanted >= head {
             return wanted;
         }
+        let causes: Vec<[u8; 32]> = self.orphans.iter()
+            .filter(|(_, _, _, authentication, _)| authentication.is_some())
+            .map(|(_, env, _, _, _)| env.header.parent)
+            .collect();
         if self.sync_rewind.fruitless > 0
             && wanted >= self.sync_rewind.floor
             && now_ms < self.sync_rewind.retry_at_ms
         {
-            // Held back, not forgotten: sync forward now, rewind later.
-            self.sync_rewind.deferred = true;
-            return head;
+            let new_cause = now_ms >= self.sync_rewind.new_cause_at_ms
+                && causes.iter().any(|parent| !self.sync_rewind.causes.contains(parent));
+            if !new_cause {
+                // Held back, not forgotten: sync forward now, rewind later.
+                self.sync_rewind.deferred = true;
+                return head;
+            }
+            self.sync_rewind.new_cause_at_ms = now_ms
+                .saturating_add(cadence_ms.saturating_mul(1u64 << SYNC_REWIND_NEW_CAUSE_SHIFT));
         }
+        self.sync_rewind.causes = causes;
         self.sync_rewind.awaiting = Some(wanted);
         self.sync_rewind.yield_ceiling = head;
         wanted
@@ -4694,7 +4738,7 @@ impl Engine {
         if src.bounded_by_wall_clock()
             && self.orphans.iter()
                 .chain(self.deferred_orphans.iter())
-                .filter(|(_, _, held_source, _, _)| *held_source == src)
+                .filter(|(_, _, held_source, _, _)| held_source.same_retention_share(src))
                 .count()
                 >= ORPHANS_PER_SOURCE
         {
@@ -4708,7 +4752,7 @@ impl Engine {
         if src.bounded_by_wall_clock() {
             let source_bytes = self.orphans.iter()
                 .chain(self.deferred_orphans.iter())
-                .filter(|(_, _, held_source, _, _)| *held_source == src)
+                .filter(|(_, _, held_source, _, _)| held_source.same_retention_share(src))
                 .fold(0usize, |sum, (_, _, _, _, bytes)| sum.saturating_add(*bytes));
             if !retention_bytes_fit(source_bytes, retained_bytes, ORPHAN_BYTES_PER_SOURCE) {
                 self.orphans_evicted = self.orphans_evicted.saturating_add(1);
@@ -17041,6 +17085,57 @@ mod ingest_admission_tests {
         );
     }
 
+    /// **V2-8: a back-off earned by one orphan does not hold back the rewind
+    /// another branch needs**, and minting new orphans buys one rewind per
+    /// short interval, not an end to the back-off.
+    #[test]
+    fn a_new_authenticated_orphan_is_not_held_back_by_an_old_back_off() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        const CADENCE: u64 = 1_000;
+        let head = engine.state.slot();
+        let planted = repointed(&engine, &template, [0x9A; 32], 2);
+        park_as_authenticated(&mut engine, planted);
+        let floor = engine.sync_after_slot();
+        assert!(floor < head);
+
+        // Five fruitless rewinds for the planted orphan: the back-off is at
+        // its cap and the same cause stays held back.
+        let mut now = 100_000u64;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor);
+        for _ in 0..5 {
+            now += 1;
+            let _ = engine.sync_request_after_slot(now, CADENCE);
+            now = engine.sync_rewind.retry_at_ms;
+            assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor);
+        }
+        now += 1;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), head, "the old cause alone is held back");
+        let capped_until = engine.sync_rewind.retry_at_ms;
+        assert!(capped_until - now > 16 * CADENCE, "the back-off is long by now");
+
+        // A block of another branch arrives, signed, with a parent this node
+        // has never asked for: the very next request rewinds.
+        let genuine = repointed(&engine, &template, [0x9B; 32], 2);
+        park_as_authenticated(&mut engine, genuine);
+        now += CADENCE + 1;
+        assert!(now < capped_until);
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor, "a new cause rewinds at the next sync tick");
+
+        // The same two causes again: held back as before.
+        now += CADENCE + 1;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), head);
+
+        // A third parent straight away does not get another rewind until the
+        // new-cause interval has passed; then it does.
+        let minted = repointed(&engine, &template, [0x9C; 32], 2);
+        park_as_authenticated(&mut engine, minted);
+        now += 1;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), head, "new causes are rate-bound");
+        now = engine.sync_rewind.new_cause_at_ms;
+        assert!(now < engine.sync_rewind.retry_at_ms, "still inside the back-off");
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor);
+    }
+
     /// **P2P-6: the back-off never exceeds its cap, and a lower floor is
     /// never held back** — that is how a genuine page chase walks backwards.
     #[test]
@@ -17414,6 +17509,42 @@ mod ingest_admission_tests {
         assert_eq!(engine.orphans_evicted, before + 1);
         assert_eq!(engine.orphans.len(), 1);
         assert_eq!(engine.orphans[0].0, waiting_id, "immutable deferred bytes make admission impossible, so waiting work is untouched");
+    }
+
+    /// V2-10: gossip and directed delivery are one peer's one share.
+    #[test]
+    fn a_peer_has_one_retention_share_whichever_way_its_blocks_arrive() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        let peer = [0xA1; 32];
+        let orphan = |parent: [u8; 32]| {
+            let mut env = template.clone();
+            env.header.proposer_index = 7;
+            env.header.parent = parent;
+            env.header.slot = 2;
+            env
+        };
+        for i in 0..ORPHANS_PER_SOURCE {
+            assert_eq!(engine.ingest_judged_from_source(orphan([i as u8 + 1; 32]), Some(peer)), Verdict::Ignore);
+        }
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE);
+        let evicted = engine.orphans_evicted;
+        assert_eq!(engine.ingest_from_judged(orphan([0xD1; 32]), Source::Directed(Some(peer))), Verdict::Ignore);
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE, "the directed road is not a second share");
+        assert_eq!(engine.orphans_evicted, evicted + 1);
+        assert_eq!(engine.ingest_from_judged(orphan([0xD2; 32]), Source::Directed(Some([0xB1; 32]))), Verdict::Ignore);
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE + 1, "another peer still has its own");
+
+        assert!(Source::Gossip(Some(peer)).same_retention_share(Source::Directed(Some(peer))));
+        assert!(Source::Gossip(None).same_retention_share(Source::Directed(None)));
+        assert!(!Source::Gossip(Some(peer)).same_retention_share(Source::Gossip(None)));
+        assert!(!Source::Local.same_retention_share(Source::Gossip(None)));
+        assert!(Source::Local.same_retention_share(Source::Local));
+        let bytes = 100usize;
+        let held = [(Source::Gossip(Some(peer)), bytes), (Source::Directed(Some(peer)), bytes), (Source::Gossip(None), bytes)];
+        assert_eq!(
+            future_retention_totals(held.iter().map(|(s, b)| (s, b)), Source::Directed(Some(peer))),
+            (300, 2, 200),
+        );
     }
 
     #[test]

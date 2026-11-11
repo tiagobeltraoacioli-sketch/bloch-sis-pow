@@ -13,7 +13,12 @@
 //! - **configured**: its source is one of the operator's own `--peers`. Such
 //!   a connection is never refused by a share, never expired and never
 //!   evicted; only the absolute table size can turn it away, and only when
-//!   every slot is already held by another configured source.
+//!   every slot is already held by another configured source. The standing
+//!   is granted by source address at accept, before any handshake, so it is
+//!   rationed by the number of peers the operator configured at that address
+//!   (see [`Standing::for_source`]): whoever else can open connections from
+//!   there gets a bounded number of these slots, and no more evictions than
+//!   the configured peers themselves could cause.
 //!
 //! Sources are compared by [`crate::connection_limit::limit_key`]: an IPv4
 //! address, or an IPv6 /64.
@@ -43,6 +48,42 @@ pub(super) struct Policy {
     pub(super) idle_eviction: Duration,
     /// A connection with no valid frame for this long is closed outright.
     pub(super) idle_close: Duration,
+}
+
+/// How the table treats a connection, decided when it is accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Standing {
+    /// Subject to every share, the pending pool and the deadlines.
+    Unconfigured,
+    /// From a source the operator configured. `may_displace` adds the right
+    /// to take the slot of a young or busy unconfigured connection when the
+    /// table is full.
+    Configured { may_displace: bool },
+}
+
+impl Standing {
+    /// The standing of a new connection from a source at which the operator
+    /// configured `peers` peers and which already holds `held` configured
+    /// slots.
+    ///
+    /// Each configured peer needs one inbound connection, and briefly a
+    /// second while it replaces a broken one: `2 * peers + 2` configured
+    /// slots cover a whole fleet behind one address restarting at once. Past
+    /// that a connection is treated like anyone else's. The right to displace
+    /// a busy unconfigured connection is what makes room for a configured
+    /// peer in a full table, so it is given to as many connections as there
+    /// are configured peers at the address and to none beyond.
+    pub(super) fn for_source(peers: usize, held: usize) -> Self {
+        if peers == 0 || held >= peers.saturating_mul(2).saturating_add(2) {
+            Standing::Unconfigured
+        } else {
+            Standing::Configured { may_displace: held < peers }
+        }
+    }
+
+    pub(super) fn is_configured(self) -> bool {
+        matches!(self, Standing::Configured { .. })
+    }
 }
 
 /// What the table does to a connection it expires or evicts.
@@ -137,10 +178,24 @@ impl<H: Close> Slots<H> {
 
     /// Take a slot for a connection accepted from `ip`, or refuse it. The
     /// returned id is released with [`Slots::release`].
+    #[cfg(test)]
     pub(super) fn admit(&mut self, ip: IpAddr, configured: bool, now: Instant, handle: H) -> Option<u64> {
+        let standing = if configured { Standing::Configured { may_displace: true } } else { Standing::Unconfigured };
+        self.admit_as(ip, standing, now, handle)
+    }
+
+    /// Configured slots currently held by the source of `ip`.
+    pub(super) fn configured_held(&self, ip: IpAddr) -> usize {
+        let source = crate::connection_limit::limit_key(ip);
+        self.entries.values().filter(|e| e.configured && e.source == source).count()
+    }
+
+    /// [`Slots::admit`] with the standing spelled out.
+    pub(super) fn admit_as(&mut self, ip: IpAddr, standing: Standing, now: Instant, handle: H) -> Option<u64> {
         self.reap(now);
         let policy = self.policy;
         let source = crate::connection_limit::limit_key(ip);
+        let configured = standing.is_configured();
         if !configured {
             let mine = self.entries.values().filter(|e| !e.configured && e.source == source);
             let (held, pending) = mine.fold((0usize, 0usize), |(held, pending), e| {
@@ -156,12 +211,19 @@ impl<H: Close> Slots<H> {
                     .filter(|(_, e)| !e.established)
                     .min_by_key(|(_, e)| e.accepted)
                     .filter(|(_, e)| now.saturating_duration_since(e.accepted) >= policy.eviction_grace)
-                    .map(|(id, _)| *id)?;
-                self.evict(oldest);
+                    .map(|(id, _)| *id);
+                // Nothing is past the grace. The grace protects a dialer
+                // that is still shaking hands; it must not let a few sources
+                // that keep reopening their whole pending share hold the pool
+                // against everyone else. A source that would still hold more
+                // pending connections than the newcomer's, after giving one
+                // up, gives up its oldest.
+                let make_room = oldest.or_else(|| self.most_pending_source_oldest(pending.saturating_add(1)))?;
+                self.evict(make_room);
             }
         }
         if self.entries.len() >= policy.total {
-            let victim = self.victim(now, configured)?;
+            let victim = self.victim(now, matches!(standing, Standing::Configured { may_displace: true }))?;
             self.evict(victim);
         }
         let id = self.next_id;
@@ -178,6 +240,24 @@ impl<H: Close> Slots<H> {
             handle,
         });
         Some(id)
+    }
+
+    /// The oldest pending connection of the source holding the most pending
+    /// connections, if that source holds more than `floor` of them.
+    fn most_pending_source_oldest(&self, floor: usize) -> Option<u64> {
+        let mut by_source: BTreeMap<IpAddr, (usize, Instant, u64)> = BTreeMap::new();
+        for (id, e) in self.entries.iter().filter(|(_, e)| !e.established) {
+            let seen = by_source.entry(e.source).or_insert((0, e.accepted, *id));
+            seen.0 = seen.0.saturating_add(1);
+            if e.accepted < seen.1 {
+                (seen.1, seen.2) = (e.accepted, *id);
+            }
+        }
+        by_source
+            .values()
+            .filter(|(count, _, _)| *count > floor)
+            .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+            .map(|(_, _, id)| *id)
     }
 
     /// The connection completed an authenticated handshake: it leaves the
@@ -207,6 +287,18 @@ impl<H: Close> Slots<H> {
         }
     }
 
+    /// The connection asked for blocks and a serving worker took the request.
+    /// That is activity, and it is all a node that is still catching up has
+    /// to say, so the connection leaves the pending pool and stays open. It
+    /// is not usefulness: nine bytes prove nothing, so the connection remains
+    /// the first to go when the table is full. False when the slot is gone.
+    pub(super) fn mark_requested(&mut self, id: u64, now: Instant) -> bool {
+        let Some(entry) = self.entries.get_mut(&id) else { return false };
+        entry.established = true;
+        entry.last_active = now;
+        true
+    }
+
     pub(super) fn release(&mut self, id: u64) {
         self.entries.remove(&id);
     }
@@ -231,12 +323,16 @@ impl<H: Close> Slot<H> {
     pub(super) fn admit(
         slots: &Arc<Mutex<Slots<H>>>,
         ip: IpAddr,
-        configured: bool,
+        standing: Standing,
         now: Instant,
         handle: H,
     ) -> Option<Self> {
-        let id = slots.lock().ok()?.admit(ip, configured, now, handle)?;
+        let id = slots.lock().ok()?.admit_as(ip, standing, now, handle)?;
         Some(Self { slots: slots.clone(), id })
+    }
+
+    pub(super) fn mark_requested(&self, now: Instant) -> bool {
+        self.slots.lock().is_ok_and(|mut slots| slots.mark_requested(self.id, now))
     }
 
     pub(super) fn mark_established(&self) -> bool {
@@ -444,11 +540,119 @@ mod tests {
         assert!(!configured.closed(), "a configured peer is never evicted");
     }
 
+    /// V2-6: the configured standing follows the source address, so it is
+    /// rationed by what the operator configured there.
+    #[test]
+    fn a_configured_address_gets_bounded_slots_and_bounded_evictions() {
+        assert_eq!(Standing::for_source(0, 0), Standing::Unconfigured);
+        assert_eq!(Standing::for_source(1, 0), Standing::Configured { may_displace: true });
+        assert_eq!(Standing::for_source(1, 1), Standing::Configured { may_displace: false });
+        assert_eq!(Standing::for_source(1, 3), Standing::Configured { may_displace: false });
+        assert_eq!(Standing::for_source(1, 4), Standing::Unconfigured);
+        // Seventeen validators on one host, all listed: every one of them
+        // may displace, and all may reconnect at once.
+        assert_eq!(Standing::for_source(17, 16), Standing::Configured { may_displace: true });
+        assert_eq!(Standing::for_source(17, 35), Standing::Configured { may_displace: false });
+        assert_eq!(Standing::for_source(17, 36), Standing::Unconfigured);
+
+        // A full table of busy, useful, unconfigured peers, and a flood of
+        // connections from an address at which one peer is configured.
+        let mut slots = Slots::new(POLICY);
+        let t0 = Instant::now();
+        let honest: Vec<Probe> = (0..POLICY.total).map(|_| Probe::default()).collect();
+        for (n, probe) in honest.iter().enumerate() {
+            let id = slots.admit(ip(&format!("192.0.2.{}", n + 1)), false, t0, probe.clone()).unwrap();
+            slots.mark_valid(id, t0);
+        }
+        let shared = ip("198.51.100.1");
+        let mut admitted = 0;
+        for _ in 0..128 {
+            let standing = Standing::for_source(1, slots.configured_held(shared));
+            // Past its configured slots the address is an ordinary source.
+            if slots.admit_as(shared, standing, t0, Probe::default()).is_some() {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 1, "one configured peer makes room for one connection");
+        assert_eq!(honest.iter().filter(|p| p.closed()).count(), 1);
+        assert_eq!(slots.len(), POLICY.total);
+    }
+
+    /// V2-7: asking for blocks keeps a connection open but never makes it
+    /// useful, so it is the first to go when the table is full.
+    #[test]
+    fn a_connection_that_only_asks_for_blocks_is_never_useful() {
+        let mut slots = Slots::new(POLICY);
+        let t0 = Instant::now();
+        let asker = Probe::default();
+        let asker_id = slots.admit(ip("192.0.2.1"), false, t0, asker.clone()).unwrap();
+        assert!(slots.mark_requested(asker_id, t0 + secs(1)));
+        assert_eq!(slots.pending(), 0, "an accepted request leaves the pending pool");
+        // Requests are activity: no idle close while they keep coming.
+        assert!(slots.mark_requested(asker_id, t0 + secs(100)));
+        slots.reap(t0 + secs(200));
+        assert!(!asker.closed());
+        assert_eq!(slots.mark_valid(asker_id, t0 + secs(200)), Some(true), "its first real frame is still its first");
+        slots.release(asker_id);
+
+        // A table full of connections that only ask: a newcomer always gets
+        // in, at the cost of the oldest of them, however recently it asked.
+        let askers: Vec<Probe> = (0..POLICY.total).map(|_| Probe::default()).collect();
+        let now = t0 + secs(300);
+        for (n, probe) in askers.iter().enumerate() {
+            let id = slots.admit(ip(&format!("192.0.2.{}", n + 1)), false, now, probe.clone()).unwrap();
+            assert!(slots.mark_requested(id, now));
+        }
+        let later = now + secs(6);
+        for (_, e) in slots.entries.iter_mut() {
+            e.last_active = later;
+        }
+        assert!(slots.admit(ip("203.0.113.1"), false, later, Probe::default()).is_some());
+        assert!(askers[0].closed());
+        assert_eq!(askers.iter().filter(|p| p.closed()).count(), 1);
+        assert!(!slots.mark_requested(asker_id + 1, later), "an evicted slot cannot come back");
+    }
+
+    /// V2-7: sources that keep their whole pending share younger than the
+    /// grace do not shut a newcomer out of the pending pool.
+    #[test]
+    fn churning_sources_cannot_hold_the_pending_pool_against_a_newcomer() {
+        let policy = Policy { total: 16, pending: 4, ..POLICY };
+        let mut slots = Slots::new(policy);
+        let t0 = Instant::now();
+        let first = Probe::default();
+        slots.admit(ip("192.0.2.1"), false, t0, first.clone()).unwrap();
+        slots.admit(ip("192.0.2.1"), false, t0 + secs(1), Probe::default()).unwrap();
+        slots.admit(ip("192.0.2.2"), false, t0 + secs(1), Probe::default()).unwrap();
+        slots.admit(ip("192.0.2.2"), false, t0 + secs(1), Probe::default()).unwrap();
+        // The pool is full and nothing in it is past the grace.
+        let newcomer = slots.admit(ip("203.0.113.1"), false, t0 + secs(2), Probe::default());
+        assert!(newcomer.is_some(), "an honest dialer was locked out by pending churn");
+        assert!(first.closed(), "the source holding the most gave up its oldest");
+        assert_eq!(slots.pending(), policy.pending);
+        // Sources with one pending connection each are equals: the grace
+        // holds between them, as before.
+        let mut slots = Slots::new(policy);
+        let singles: Vec<Probe> = (0..4).map(|_| Probe::default()).collect();
+        for (n, probe) in singles.iter().enumerate() {
+            slots.admit(ip(&format!("192.0.2.{}", n + 1)), false, t0, probe.clone()).unwrap();
+        }
+        assert!(slots.admit(ip("203.0.113.1"), false, t0 + secs(2), Probe::default()).is_none());
+        // And a source does not evict others to add to its own pile.
+        let mut slots = Slots::new(policy);
+        slots.admit(ip("192.0.2.1"), false, t0, Probe::default()).unwrap();
+        slots.admit(ip("192.0.2.1"), false, t0, Probe::default()).unwrap();
+        slots.admit(ip("192.0.2.2"), false, t0, Probe::default()).unwrap();
+        slots.admit(ip("192.0.2.3"), false, t0, Probe::default()).unwrap();
+        assert!(slots.admit(ip("192.0.2.2"), false, t0 + secs(2), Probe::default()).is_none());
+        assert!(singles.iter().all(|p| !p.closed()));
+    }
+
     #[test]
     fn a_dropped_slot_is_released() {
         let slots = Arc::new(Mutex::new(Slots::new(POLICY)));
         let now = Instant::now();
-        let slot = Slot::admit(&slots, ip("192.0.2.1"), false, now, Probe::default()).unwrap();
+        let slot = Slot::admit(&slots, ip("192.0.2.1"), Standing::Unconfigured, now, Probe::default()).unwrap();
         assert_eq!(slot.mark_valid(now), Some(true));
         assert_eq!(slots.lock().unwrap().len(), 1);
         drop(slot);

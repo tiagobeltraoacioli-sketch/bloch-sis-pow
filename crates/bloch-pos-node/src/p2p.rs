@@ -423,6 +423,33 @@ pub const MAX_INFLIGHT_SYNC_PER_PEER: usize = 2;
 /// the same empty page as any other refusal.
 pub const MAX_PENDING_SYNC_RESPONSE_BYTES: u64 = 16 * MAX_SYNC_FRAME;
 
+/// One source address's share of [`MAX_PENDING_SYNC_RESPONSE_BYTES`].
+///
+/// Peer ids are free to mint, so the per-peer in-flight cap alone lets one
+/// host under eight identities reserve the whole ceiling and keep every other
+/// peer refused. Four worst-case answers is two peers each with a full
+/// [`MAX_INFLIGHT_SYNC_PER_PEER`]: nodes behind one address that sync from
+/// genesis together are served two full pages at a time each for two of
+/// them, and the others are answered as soon as one of those is written.
+/// Near the tip the limit is not felt: a built answer is charged at its real
+/// size, a few kilobytes.
+pub const MAX_PENDING_SYNC_SOURCE_BYTES: u64 = 4 * MAX_SYNC_FRAME;
+
+/// What every source that is not one of the operator's own peers may hold of
+/// [`MAX_PENDING_SYNC_RESPONSE_BYTES`] together. The remaining quarter is
+/// only ever reserved by configured or dialled peers, so however the rest is
+/// occupied, a configured peer that restarts is still answered.
+pub const MAX_PENDING_SYNC_UNCONFIGURED_BYTES: u64 = 12 * MAX_SYNC_FRAME;
+
+/// After an answer to a source times out unread, that source is refused for
+/// this long: one request timeout, the time its answer was held for. Without
+/// it the same source asks again at once and the bytes are never free. A
+/// peer that reads its answers never sees this.
+pub const SYNC_UNREAD_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Sources remembered as cooling down; expired records are dropped first.
+const MAX_COOLING_SYNC_SOURCES: usize = 1024;
+
 const _: () = assert!(
     MAX_INFLIGHT_SYNC_PER_PEER < MAX_CONCURRENT_SYNC_STREAMS,
     "the in-flight cap must bite before the substream cap, or it does nothing"
@@ -439,6 +466,10 @@ pub enum SyncRefusal {
     /// [`MAX_PENDING_SYNC_RESPONSE_BYTES`] of answers are already outstanding
     /// across all peers.
     ResponseBacklog,
+    /// The peer's source address holds its share of the outstanding answers
+    /// ([`MAX_PENDING_SYNC_SOURCE_BYTES`]), or an answer to it timed out
+    /// unread less than [`SYNC_UNREAD_COOLDOWN`] ago.
+    SourceBacklog,
 }
 
 #[derive(Debug)]
@@ -481,6 +512,9 @@ pub struct SyncPermit {
     peer: PeerId,
     /// This answer's share of [`SyncLimiter::reserved_bytes`].
     reserved: u64,
+    /// The source address the bytes are charged to; `None` for one of the
+    /// operator's own peers, which has no per-source share.
+    source: Option<IpAddr>,
 }
 
 /// Per-peer admission for `get-blocks`: a token bucket and an in-flight cap.
@@ -493,13 +527,27 @@ pub struct SyncLimiter {
     /// Sum of `SyncPermit::reserved` over every live permit; bounded by
     /// [`MAX_PENDING_SYNC_RESPONSE_BYTES`].
     reserved: u64,
+    /// The part of `reserved` held per unconfigured source address; entries
+    /// exist only while nonzero. Their sum is bounded by
+    /// [`MAX_PENDING_SYNC_UNCONFIGURED_BYTES`].
+    reserved_by_source: HashMap<IpAddr, u64>,
+    /// Source address → refused until; see [`SYNC_UNREAD_COOLDOWN`].
+    cooling: HashMap<IpAddr, Instant>,
 }
 
 impl SyncLimiter {
     /// Admit one request, or say why not. The [`SyncPermit`] returned on `Ok`
     /// holds the peer's in-flight slot until it is handed to
     /// [`SyncLimiter::release`].
+    #[cfg(test)]
     pub fn begin(&mut self, peer: PeerId, now: Instant) -> Result<SyncPermit, SyncRefusal> {
+        self.begin_from(peer, None, now)
+    }
+
+    /// [`Self::begin`] for a peer reached over an inbound connection from
+    /// `source` that is not one of the operator's own peers. `None` is a
+    /// configured or dialled peer: it answers to the global ceiling only.
+    pub fn begin_from(&mut self, peer: PeerId, source: Option<IpAddr>, now: Instant) -> Result<SyncPermit, SyncRefusal> {
         let e = self.peers.entry(peer).or_insert(PeerSync {
             tokens: SYNC_ANSWER_BURST,
             last: now,
@@ -523,6 +571,20 @@ impl SyncLimiter {
         if self.reserved.saturating_add(MAX_SYNC_FRAME) > MAX_PENDING_SYNC_RESPONSE_BYTES {
             return Err(SyncRefusal::ResponseBacklog);
         }
+        // And the same for the two shares inside that ceiling.
+        if let Some(source) = source {
+            if self.cooling.get(&source).is_some_and(|until| now < *until) {
+                return Err(SyncRefusal::SourceBacklog);
+            }
+            let held = self.reserved_by_source.get(&source).copied().unwrap_or(0);
+            if held.saturating_add(MAX_SYNC_FRAME) > MAX_PENDING_SYNC_SOURCE_BYTES {
+                return Err(SyncRefusal::SourceBacklog);
+            }
+            let unconfigured = self.reserved_by_source.values().fold(0u64, |sum, b| sum.saturating_add(*b));
+            if unconfigured.saturating_add(MAX_SYNC_FRAME) > MAX_PENDING_SYNC_UNCONFIGURED_BYTES {
+                return Err(SyncRefusal::ResponseBacklog);
+            }
+        }
         if e.tokens < 1.0 {
             return Err(SyncRefusal::RateLimited);
         }
@@ -533,7 +595,36 @@ impl SyncLimiter {
         // counter regardless.
         e.inflight = e.inflight.saturating_add(1);
         self.reserved = self.reserved.saturating_add(MAX_SYNC_FRAME);
-        Ok(SyncPermit { peer, reserved: MAX_SYNC_FRAME })
+        if let Some(source) = source {
+            let held = self.reserved_by_source.entry(source).or_insert(0);
+            *held = held.saturating_add(MAX_SYNC_FRAME);
+        }
+        Ok(SyncPermit { peer, reserved: MAX_SYNC_FRAME, source })
+    }
+
+    /// Give `bytes` of a permit's reservation back to its source's share.
+    fn unreserve_source(&mut self, source: Option<IpAddr>, bytes: u64) {
+        let Some(source) = source else { return };
+        if let Some(held) = self.reserved_by_source.get_mut(&source) {
+            *held = held.saturating_sub(bytes);
+            if *held == 0 {
+                self.reserved_by_source.remove(&source);
+            }
+        }
+    }
+
+    /// The answer this permit covers was handed to libp2p and timed out
+    /// without being read. Charged to the source address, not the peer id:
+    /// a new id costs nothing. Call before [`Self::release`].
+    pub fn note_unread(&mut self, permit: &SyncPermit, now: Instant) {
+        let Some(source) = permit.source else { return };
+        if !self.cooling.contains_key(&source) {
+            self.cooling.retain(|_, until| now < *until);
+            if self.cooling.len() >= MAX_COOLING_SYNC_SOURCES {
+                return;
+            }
+        }
+        self.cooling.insert(source, now + SYNC_UNREAD_COOLDOWN);
     }
 
     /// The answer is built: shrink the permit's worst-case reservation to the
@@ -542,6 +633,7 @@ impl SyncLimiter {
     pub fn settle(&mut self, permit: &mut SyncPermit, actual: u64) {
         let keep = actual.min(permit.reserved);
         self.reserved = self.reserved.saturating_sub(permit.reserved.saturating_sub(keep));
+        self.unreserve_source(permit.source, permit.reserved.saturating_sub(keep));
         permit.reserved = keep;
     }
 
@@ -561,6 +653,7 @@ impl SyncLimiter {
     /// a refusal never gets one.
     pub fn release(&mut self, permit: SyncPermit) {
         self.reserved = self.reserved.saturating_sub(permit.reserved);
+        self.unreserve_source(permit.source, permit.reserved);
         let mut remove = false;
         if let Some(e) = self.peers.get_mut(&permit.peer) {
             e.inflight = e.inflight.saturating_sub(1);
@@ -1637,6 +1730,13 @@ impl InboundSources {
         true
     }
 
+    /// The source an inbound connection is charged to. `None` for a
+    /// connection this node dialled, one from a configured peer or source,
+    /// and every connection behind a proxy: those have no per-source share.
+    fn charged_source(&self, connection: &ConnectionId) -> Option<IpAddr> {
+        self.by_connection.get(connection).copied()
+    }
+
     fn release(&mut self, connection: &ConnectionId) {
         let Some(source) = self.by_connection.remove(connection) else { return };
         if let Some(held) = self.held.get_mut(&source) {
@@ -2281,11 +2381,12 @@ fn handle_swarm_event(
         }
         SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::Message {
             peer,
+            connection_id,
             message,
-            ..
         })) => match message {
             request_response::Message::Request { request_id, request, channel } => {
-                serve_sync(st, resp_tx.clone(), peer, request_id, request, channel);
+                let source = st.inbound_sources.charged_source(&connection_id);
+                serve_sync(st, resp_tx.clone(), peer, source, request_id, request, channel);
             }
             request_response::Message::Response { request_id, response } => {
                 // Ignore an old connection generation without releasing a
@@ -2356,6 +2457,13 @@ fn handle_swarm_event(
             error,
             ..
         })) => {
+            // An answer that was handed over and never read is the one
+            // failure the peer's source is charged for.
+            if matches!(error, request_response::InboundFailure::Timeout) {
+                if let Some(permit) = st.sync_awaiting_write.get(&request_id) {
+                    st.sync_limiter.note_unread(permit, Instant::now());
+                }
+            }
             finish_sync_answer(&mut st.sync_awaiting_write, &mut st.sync_limiter, &request_id);
             trace(|| format!("sync answer to {peer} not delivered: {error}"));
         }
@@ -2572,6 +2680,7 @@ fn serve_sync(
         SyncResponse,
     )>,
     peer: PeerId,
+    source: Option<IpAddr>,
     request_id: request_response::InboundRequestId,
     request: SyncRequest,
     channel: request_response::ResponseChannel<SyncResponse>,
@@ -2582,7 +2691,7 @@ fn serve_sync(
     // hash lookup, not a disk read and a pool thread. The permit it mints is
     // what `read_sync_page` demands, so this check cannot be edited away
     // without the serving path ceasing to compile.
-    let permit = match st.sync_limiter.begin(peer, Instant::now()) {
+    let permit = match st.sync_limiter.begin_from(peer, source, Instant::now()) {
         Ok(permit) => permit,
         Err(why) => {
             let (permit, answer) = refusal_answer(peer, why);
@@ -3178,6 +3287,79 @@ mod tests {
     /// the peer to read it — so a peer that asked and never read held no
     /// slot while this node held its multi-megabyte answers.
     ///
+    /// V2-4: eight identities on one address, each with two answers nobody
+    /// reads, hold that address's share and no more: a peer on another
+    /// address and a configured peer are still served, and the address is
+    /// not answered again while an unread answer is being paid for.
+    #[test]
+    fn one_source_address_cannot_reserve_every_pending_sync_answer() {
+        let mut lim = SyncLimiter::default();
+        let t0 = Instant::now();
+        let host: IpAddr = "192.0.2.1".parse().unwrap();
+        let mut held = Vec::new();
+        let mut refused = 0;
+        for _ in 0..8 {
+            let peer = PeerId::random();
+            for _ in 0..MAX_INFLIGHT_SYNC_PER_PEER {
+                match lim.begin_from(peer, Some(host), t0) {
+                    Ok(permit) => held.push(permit),
+                    Err(why) => {
+                        assert_eq!(why, SyncRefusal::SourceBacklog);
+                        refused += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(lim.reserved_bytes(), MAX_PENDING_SYNC_SOURCE_BYTES);
+        assert_eq!((held.len(), refused), (4, 12));
+        let other = lim.begin_from(PeerId::random(), Some("192.0.2.2".parse().unwrap()), t0)
+            .expect("a peer on another address is served");
+
+        // Unconfigured sources together stop short of the ceiling ...
+        let mut more = Vec::new();
+        for n in 3..=4u8 {
+            for _ in 0..2 {
+                let peer = PeerId::random();
+                for _ in 0..MAX_INFLIGHT_SYNC_PER_PEER {
+                    if let Ok(permit) = lim.begin_from(peer, Some(IpAddr::from([192, 0, 2, n])), t0) {
+                        more.push(permit);
+                    }
+                }
+            }
+        }
+        assert_eq!(lim.reserved_bytes(), MAX_PENDING_SYNC_UNCONFIGURED_BYTES);
+        assert_eq!(
+            lim.begin_from(PeerId::random(), Some("192.0.2.9".parse().unwrap()), t0).err(),
+            Some(SyncRefusal::ResponseBacklog)
+        );
+        // ... and what is left is a configured peer's.
+        let configured = lim.begin(PeerId::random(), t0).expect("a configured peer is served");
+
+        // A built answer is charged at its real size, so honest peers near
+        // the tip do not hold their address's share.
+        assert_eq!(lim.begin_from(PeerId::random(), Some(host), t0).err(), Some(SyncRefusal::SourceBacklog));
+        let mut first = held.remove(0);
+        lim.settle(&mut first, 4096);
+        lim.settle(&mut held[0], 4096);
+        held.push(lim.begin_from(PeerId::random(), Some(host), t0).expect("the share is in bytes actually held"));
+
+        // The answer times out unread: the address waits out the cooldown.
+        lim.note_unread(&first, t0);
+        lim.release(first);
+        let peer = PeerId::random();
+        assert_eq!(lim.begin_from(peer, Some(host), t0).err(), Some(SyncRefusal::SourceBacklog));
+        for permit in held {
+            lim.release(permit);
+        }
+        assert_eq!(lim.begin_from(peer, Some(host), t0 + SYNC_UNREAD_COOLDOWN - Duration::from_millis(1)).err(), Some(SyncRefusal::SourceBacklog));
+        let again = lim.begin_from(peer, Some(host), t0 + SYNC_UNREAD_COOLDOWN).expect("served after the cooldown");
+        for permit in more.into_iter().chain([other, configured, again]) {
+            lim.release(permit);
+        }
+        assert_eq!(lim.reserved_bytes(), 0);
+        assert!(lim.reserved_by_source.is_empty(), "every byte went back to its source");
+    }
+
     /// Driven through the same `hold_sync_permit` / `finish_sync_answer` the
     /// swarm loop calls, keyed by a plain integer because an
     /// `InboundRequestId` cannot be constructed outside libp2p.

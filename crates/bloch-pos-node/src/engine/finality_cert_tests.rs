@@ -177,3 +177,90 @@ fn the_retention_setting_is_parsed_without_refusing_to_start() {
         assert!(why.is_some_and(|w| w.contains("not a number")), "{bad:?} must be reported");
     }
 }
+
+/// V2-2: a request this node can never answer, and a repeated request it
+/// already refused, must not read blocks back on the consensus thread; and
+/// the assemblies one slot can be made to do are bounded.
+#[test]
+fn refused_certificate_requests_read_no_blocks() {
+    let n = 4;
+    let (mut engine, _dir, others) = perf_support::proposing_engine_n(&[], n);
+    let mut vals: Vec<(Option<Keystore>, SlashingProtection)> = Vec::new();
+    let first = engine.keys.take();
+    for (i, k) in std::iter::once(first.expect("validator 0")).chain(others).enumerate() {
+        let d = _dir.0.join(format!("sp{i}"));
+        std::fs::create_dir_all(&d).unwrap();
+        vals.push((Some(k), SlashingProtection::open(&d).expect("slashprot")));
+    }
+    let as_each = |engine: &mut Engine, vals: &mut Vec<(Option<Keystore>, SlashingProtection)>, f: &dyn Fn(&mut Engine)| {
+        for v in vals.iter_mut() {
+            std::mem::swap(&mut engine.keys, &mut v.0);
+            std::mem::swap(&mut engine.slashprot, &mut v.1);
+            f(engine);
+            std::mem::swap(&mut engine.keys, &mut v.0);
+            std::mem::swap(&mut engine.slashprot, &mut v.1);
+        }
+    };
+    for slot in 1..=(9 * SLOTS_PER_EPOCH) {
+        as_each(&mut engine, &mut vals, &|e: &mut Engine| e.attest(slot));
+        as_each(&mut engine, &mut vals, &|e: &mut Engine| e.propose(slot));
+        if engine.state.finality().finalized.epoch >= 5 {
+            break;
+        }
+    }
+    assert!(engine.state.finality().finalized.epoch >= 5);
+    let ask = |engine: &mut Engine, epoch: u64, src: Option<u64>| {
+        engine.serve_rpc(RpcRequest::FinalityCertificate { epoch: Some(epoch), block: None, set_source_epoch: src })
+    };
+    let scans = |engine: &Engine| engine.finality_certs.vote_scans;
+
+    // A certificate this node can build costs two scans, once.
+    ask(&mut engine, 4, None).expect("epoch 4");
+    assert_eq!(scans(&engine), 2);
+    ask(&mut engine, 4, None).expect("epoch 4 again");
+    assert_eq!(scans(&engine), 2, "a repeated request is answered from the cache");
+
+    // The ring has moved on: the proofs of the checkpoints of epochs 1 to 3
+    // are gone, as on a node whose retention window is past them.
+    let keep: Vec<[u8; 32]> = (4..=6).map(|e| engine.checkpoint_root(e)).collect();
+    engine.finality_certs.registry.retain(|(id, _)| keep.contains(id));
+    engine.finality_certs.extensions.retain(|(id, _)| keep.contains(id));
+    assert!(!engine.finality_certs.registry.is_empty());
+    for (epoch, src) in [(2, None), (3, None), (3, Some(1)), (4, Some(2)), (5, Some(3))] {
+        let err = ask(&mut engine, epoch, src).unwrap_err();
+        assert_eq!(err.code, rpc::NODE_UNAVAILABLE, "{err:?}");
+        assert_eq!(scans(&engine), 2, "epoch {epoch} from {src:?} is refused before any block is read");
+    }
+    let err = engine.serve_rpc(RpcRequest::LcProof { epoch: Some(2), set_source_epoch: None, block: None }).unwrap_err();
+    assert_eq!(err.code, rpc::NODE_UNAVAILABLE);
+    assert_eq!(scans(&engine), 2);
+
+    // The per-slot bound: once it is spent, a request that would need the
+    // log is told to retry (and that answer is not remembered), while a
+    // cached one is still answered.
+    engine.finality_certs.builds = (engine.wall_slot(), u32::MAX);
+    let busy = ask(&mut engine, 5, None).unwrap_err();
+    assert!(busy.message.contains("per slot"), "{busy:?}");
+    assert_eq!(scans(&engine), 2);
+    ask(&mut engine, 4, None).expect("cached epoch 4");
+    engine.finality_certs.builds = (engine.wall_slot(), 0);
+    ask(&mut engine, 5, None).expect("epoch 5 in a later slot");
+    assert_eq!(scans(&engine), 4);
+
+    // A refusal that can only be decided after the scan (epoch 5 passes the
+    // window check, but the proof of its justifying source, the checkpoint
+    // of epoch 4, is now dropped too) is decided once.
+    let gone = engine.checkpoint_root(4);
+    engine.finality_certs.registry.retain(|(id, _)| *id != gone);
+    engine.finality_certs.extensions.retain(|(id, _)| *id != gone);
+    assert!(!engine.finality_certs.registry.is_empty());
+    engine.finality_certs.cache.clear();
+    engine.finality_certs.default_source.clear();
+    let first = ask(&mut engine, 5, None).unwrap_err();
+    let after_first = scans(&engine);
+    assert!(after_first > 4, "the first such request had to look");
+    for _ in 0..3 {
+        assert_eq!(ask(&mut engine, 5, None).unwrap_err(), first);
+    }
+    assert_eq!(scans(&engine), after_first, "a repeated failing request reads no blocks");
+}
