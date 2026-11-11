@@ -26,6 +26,15 @@
 //!   start, because every way of continuing is a way of following a chain
 //!   below a checkpoint it already finalized. The existing operator override
 //!   (`--allow-finality-rewind`) discards the record instead, loudly.
+//! - **After a rewind the override allowed** (review W2-1) the record is
+//!   replaced to match the chain the node is now on (or removed when that
+//!   chain has no finalized block of its own yet), once the reorg's rewrite
+//!   is published. Otherwise it would keep naming the abandoned block, and
+//!   the next start without the override would be refused. This is the only
+//!   case in which a record is lowered, and it needs the override.
+//! - **A record that cannot be read or decoded** is a refusal too (review
+//!   W2-9): the message names the file to remove. Under the override it is
+//!   discarded like a contradicted one.
 //!
 //! Node-local: no block or transaction validity depends on this file.
 use super::*;
@@ -119,14 +128,72 @@ impl Engine {
         crate::store::atomic_private_write(&self.finality_latch_path(), &record)
     }
 
+    /// Is `(height, root)` a block of the in-memory canonical chain?
+    fn latch_is_canonical(&self, height: u64, root: &[u8; 32]) -> bool {
+        usize::try_from(height)
+            .ok()
+            .and_then(|h| self.chain.get(h))
+            .is_some_and(|(_, id)| id.as_bytes() == root)
+    }
+
+    /// Remove the stored record, durably. An absent file is not an error.
+    fn remove_stored_latch(&self) -> io::Result<()> {
+        match std::fs::remove_file(self.finality_latch_path()) {
+            Ok(()) => crate::store::fsync_dir(self.store.directory()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Review W2-1. Under the operator's rewind override, and with no log
+    /// rewrite pending, a stored record that names a block this node's
+    /// canonical chain no longer holds was left behind by a rewind the
+    /// override allowed. Replace it with the in-memory latch, or remove it
+    /// when that names no canonical block. Returns whether it acted.
+    ///
+    /// Without the override nothing here runs: a cut below the latch is
+    /// refused, so the stored block cannot leave the chain.
+    fn replace_rewound_stored_latch(&self) -> io::Result<bool> {
+        if !self.finality_rewind_override {
+            return Ok(false);
+        }
+        let Some(stored) = self.stored_finalized_latch()? else { return Ok(false) };
+        if self.latch_is_canonical(stored.height, &stored.root) {
+            return Ok(false);
+        }
+        let now = self.finalized_latch.filter(|(height, root)| self.latch_is_canonical(*height, root));
+        eprintln!(
+            "FINALITY_LATCH: BLOCH_ALLOW_FINALITY_REWIND allowed a rewind below the stored \
+             finalized checkpoint {} (height {}, slot {}), which is no longer on this node's \
+             chain. {FILE} now records {}, so a later start without the override is not refused \
+             over the abandoned checkpoint.",
+            crate::codec::hex8(&stored.root),
+            stored.height,
+            stored.slot,
+            now.map_or_else(
+                || "nothing (removed) until this chain finalizes a block".to_string(),
+                |(height, root)| format!("height {height} ({})", crate::codec::hex8(&root)),
+            ),
+        );
+        match now {
+            Some((height, root)) => self.write_stored_latch(height, root)?,
+            None => self.remove_stored_latch()?,
+        }
+        Ok(true)
+    }
+
     /// Raise the stored record to the in-memory latch. Returns whether the
-    /// file was written. Never lowers it and never writes while a reorg's log
-    /// rewrite is pending (see the module docs).
+    /// file was written. Never lowers it (the override case of
+    /// [`Engine::replace_rewound_stored_latch`] aside) and never writes while
+    /// a reorg's log rewrite is pending (see the module docs).
     fn raise_stored_latch(&self) -> io::Result<bool> {
-        let Some((height, root)) = self.finalized_latch else { return Ok(false) };
         if self.store.rewrite_pending() {
             return Ok(false);
         }
+        if self.replace_rewound_stored_latch()? {
+            return Ok(true);
+        }
+        let Some((height, root)) = self.finalized_latch else { return Ok(false) };
         if self.stored_finalized_latch()?.is_some_and(|stored| stored.height >= height) {
             return Ok(false);
         }
@@ -153,12 +220,33 @@ impl Engine {
     pub(super) fn reconcile_finalized_latch(&mut self) -> io::Result<()> {
         let stored = match self.stored_finalized_latch() {
             Ok(stored) => stored,
+            Err(e) if self.finality_rewind_override => {
+                // Review W2-9: the override already means "accept what the
+                // block log finalizes", so it also covers a record that
+                // cannot be read.
+                eprintln!(
+                    "FINALITY_LATCH: BLOCH_ALLOW_FINALITY_REWIND is set — DISCARDING the \
+                     unusable record {} ({e}). The floor is now whatever the block log \
+                     finalizes. This must only happen with a human operator's deliberate, \
+                     informed consent.",
+                    self.finality_latch_path().display(),
+                );
+                self.remove_stored_latch()?;
+                None
+            }
             Err(e) => {
                 return Err(crate::ws_boot::boot_refused(format!(
-                    "{FILE} cannot be used ({e}). It records the highest checkpoint this node \
+                    "{path} cannot be used ({e}). It records the highest checkpoint this node \
                      finalized, and without it a restart may follow a chain below that \
-                     checkpoint. Restore the file, or delete it to accept the checkpoint \
-                     rebuilt from the block log."
+                     checkpoint. To continue, either restore that file from a copy taken \
+                     together with this data directory's block log, or remove it \
+                     (rm {path}) and start again with the same flags: the node then writes a \
+                     new record with the checkpoint rebuilt from the block log. No other file \
+                     needs to be removed. Alternatively start once with \
+                     --allow-finality-rewind (BLOCH_ALLOW_FINALITY_REWIND=1), which discards \
+                     the record but also lets that run rewind below its finalized checkpoint; \
+                     take the flag out again afterwards.",
+                    path = self.finality_latch_path().display(),
                 )));
             }
         };
@@ -191,20 +279,23 @@ impl Engine {
                 );
                 match self.finalized_latch {
                     Some((height, root)) => self.write_stored_latch(height, root)?,
-                    None => std::fs::remove_file(self.finality_latch_path())?,
+                    None => self.remove_stored_latch()?,
                 }
                 return Ok(());
             }
             return Err(crate::ws_boot::boot_refused(format!(
                 "this node finalized checkpoint {} at height {} (slot {}) and recorded it in \
-                 {FILE}, but {found}. Starting would let it follow a chain below a checkpoint \
+                 {path}, but {found}. Starting would let it follow a chain below a checkpoint \
                  it already finalized. If the block log was truncated, replaced or restored \
                  from an older copy, restore the log that matches; if a rewind below that \
-                 checkpoint is intended, restart with --allow-finality-rewind \
-                 (BLOCH_ALLOW_FINALITY_REWIND=1).",
+                 checkpoint is intended (including a deliberate resync from an empty or \
+                 replaced block log), restart with --allow-finality-rewind \
+                 (BLOCH_ALLOW_FINALITY_REWIND=1), or remove {path} (rm {path}) and start \
+                 again with the same flags.",
                 crate::codec::hex8(&stored.root),
                 stored.height,
                 stored.slot,
+                path = self.finality_latch_path().display(),
             )));
         }
         match self.finalized_latch {
@@ -373,9 +464,103 @@ mod tests {
         let err = engine.reconcile_finalized_latch().expect_err("damaged record");
         assert!(crate::ws_boot::is_non_retryable(&err), "{err}");
 
+        // W2-9: the refusal names the exact file to remove and the flag.
+        let text = err.to_string();
+        assert!(text.contains(&format!("rm {}", path.display())), "{text}");
+        assert!(text.contains("--allow-finality-rewind"), "{text}");
+        assert_eq!(std::fs::read(&path).expect("still there"), bytes, "a refusal leaves the file alone");
+
         // A record of another network is refused the same way.
         let foreign = encode(&[7u8; 32], &StoredLatch { height: 1, slot: 1, root: [1; 32] });
         assert!(decode(&engine.manifest_digest(), &foreign).is_err());
+
+        // Removing the file, as the message says, is enough: the node starts
+        // and records the checkpoint rebuilt from the block log.
+        std::fs::remove_file(&path).expect("operator removes the record");
+        engine.finalized_latch = Some((2, *engine.chain[2].1.as_bytes()));
+        engine.reconcile_finalized_latch().expect("no record is not a refusal");
+        assert_eq!(engine.stored_finalized_latch().expect("readable").map(|s| s.height), Some(2));
+
+        // The override discards a damaged record instead of refusing.
+        std::fs::write(&path, &bytes).expect("damage the record again");
+        engine.finality_rewind_override = true;
+        engine.reconcile_finalized_latch().expect("the override discards a damaged record");
+        assert_eq!(
+            engine.stored_finalized_latch().expect("readable").map(|s| s.height),
+            Some(2),
+            "replaced by the replayed checkpoint"
+        );
+    }
+
+    /// W2-1: a rewind the operator override allowed takes the latch block
+    /// off the canonical chain. The latch falls back to the fork point and,
+    /// once the reorg's rewrite is published, so does the stored record, so
+    /// the next start WITHOUT the override is not refused over the abandoned
+    /// checkpoint. Also W2-8 (2): nothing is written while the rewrite is
+    /// pending.
+    #[test]
+    fn a_rewind_the_override_allowed_does_not_refuse_the_next_boot() {
+        let (mut engine, dir, logged) = latched_at(5);
+        let path = dir.0.join(FILE);
+        let before = std::fs::read(&path).expect("record exists");
+        let ancestor = *engine.chain[3].1.as_bytes();
+
+        engine.finality_rewind_override = true;
+        assert!(engine.do_reorg(ancestor, Vec::new()), "the override allows the rewind");
+        assert_eq!(engine.chain.len(), 4);
+        assert_eq!(engine.finalized_latch, Some((3, ancestor)), "the latch fell back to the fork point");
+        if engine.store.rewrite_pending() {
+            // The log still holds the abandoned chain: the record must not
+            // move ahead of it.
+            engine.persist_finalized_latch();
+            assert_eq!(std::fs::read(&path).expect("record exists"), before, "not written while a rewrite is pending");
+        }
+        engine.store.flush_rewrite().expect("the rewrite is published");
+        assert!(!engine.store.rewrite_pending());
+        engine.persist_finalized_latch();
+        assert_eq!(
+            engine.stored_finalized_latch().expect("readable"),
+            Some(StoredLatch { height: 3, slot: engine.chain[3].0, root: ancestor }),
+            "the record names a block of the chain the node is on"
+        );
+
+        // The operator takes the override out again and the node restarts.
+        engine.finality_rewind_override = false;
+        restart(&mut engine);
+        replay(&mut engine, &logged[..3]);
+        engine.reconcile_finalized_latch().expect("the next boot without the override is not refused");
+        engine.live = true;
+        assert_eq!(engine.finalized_latch, Some((3, ancestor)));
+        let below = *engine.chain[2].1.as_bytes();
+        assert!(!engine.do_reorg(below, Vec::new()), "and the latch guards again");
+    }
+
+    /// W2-1, the two other shapes: a rewind to genesis leaves no finalized
+    /// block, so the record is removed; and without the override a record is
+    /// never lowered or removed by the live path.
+    #[test]
+    fn a_rewind_to_genesis_removes_the_record_and_only_the_override_lowers_it() {
+        let (mut engine, dir, _logged) = latched_at(3);
+        let path = dir.0.join(FILE);
+        let before = std::fs::read(&path).expect("record exists");
+
+        // No override: an in-memory latch that is lower, or gone, changes nothing.
+        engine.finalized_latch = None;
+        engine.persist_finalized_latch();
+        assert_eq!(std::fs::read(&path).expect("record exists"), before);
+        engine.finalized_latch = Some((3, *engine.chain[3].1.as_bytes()));
+
+        // Override on, but the stored block is still canonical: unchanged.
+        engine.finality_rewind_override = true;
+        engine.persist_finalized_latch();
+        assert_eq!(std::fs::read(&path).expect("record exists"), before);
+
+        let genesis = *engine.chain[0].1.as_bytes();
+        assert!(engine.do_reorg(genesis, Vec::new()), "the override allows the rewind");
+        assert_eq!(engine.finalized_latch, None, "genesis imposes no floor");
+        engine.store.flush_rewrite().expect("the rewrite is published");
+        engine.persist_finalized_latch();
+        assert!(!path.exists(), "nothing finalized on this chain: no record");
     }
 
     /// The live path: a checkpoint this node finalizes on its own votes is

@@ -2250,7 +2250,10 @@ struct Engine {
     /// The finality latch (finding F-03): the highest finalized checkpoint
     /// this node has EVER adopted, as `(canonical height, root)`. Ratcheted
     /// forward by [`Engine::ratchet_finalized`], never lowered, and consulted
-    /// by [`Engine::cut_below_finalized_latch`] before any reorg.
+    /// by [`Engine::cut_below_finalized_latch`] before any reorg. (One
+    /// exception, review W2-1: a rewind the operator override allowed takes
+    /// the latch block off the chain, and `do_reorg` then lets the latch
+    /// fall back to the fork point.)
     ///
     /// This is deliberately NOT `self.state.finality().finalized`: that value
     /// lives in replayed state, so a reorg REPLACES it — which is exactly how
@@ -6727,6 +6730,9 @@ impl Engine {
             self.refuse_finality_rewind(latch, &branch);
             return false;
         }
+        // Not refused although the cut is below the latch: the operator's
+        // rewind override admitted it (review W2-1, used at the adoption).
+        let rewinds_latch = self.finalized_latch.is_some_and(|(floor, _)| (cut as u64) < floor);
 
         // Only under the operator's rewind override can the cut fall below
         // released bodies; those blocks are about to leave the canonical
@@ -6858,6 +6864,19 @@ impl Engine {
         // FURTHER than the old branch did — ratchet up if so. It may equally
         // report LESS (a fork-point state always does); the ratchet ignores
         // that, which is what keeps the latch monotone across reorgs.
+        if rewinds_latch {
+            // Review W2-1: the override rewound below the latch, so the
+            // latch block left the canonical chain. Keeping it would leave
+            // `finality_latch.bin` naming the abandoned block (the next
+            // start without the override is then refused) and would release
+            // bodies of the adopted branch as if they were finalized. The
+            // fork point is the highest block of the old finalized prefix
+            // that is still canonical: the latch falls back to it, the
+            // ratchet below raises it to whatever the adopted state
+            // finalizes, and the stored record follows once the rewrite is
+            // published (`replace_rewound_stored_latch`).
+            self.finalized_latch = (cut > 0).then_some((cut as u64, ancestor));
+        }
         self.ratchet_finalized();
         self.retain_reorg_anchors();
         let cur_e = epoch_of(self.state.slot());
