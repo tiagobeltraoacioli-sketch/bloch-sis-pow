@@ -698,6 +698,7 @@ pub(super) fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         sync_rewind: super::SyncRewindBackoff::default(),
         orphans: VecDeque::new(),
         deferred_orphans: VecDeque::new(),
+        authority_parked: super::AuthorityParked::default(),
         orphans_evicted: 0,
         orphans_admitted: 0,
         blocks_pruned: 0,

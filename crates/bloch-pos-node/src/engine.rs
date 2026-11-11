@@ -1553,9 +1553,9 @@ mod state_cell {
             Arc::clone(&self.state)
         }
 
-        /// Which state this is. Test surface — the memo key's identity half,
-        /// exposed so a test can pin that it moves when the state does.
-        #[cfg(test)]
+        /// Which state this is: the memo key's identity half. It moves with
+        /// every write of the state, so a caller can tell "nothing was
+        /// written since I last looked" (V1-2), and a test can pin that.
         pub(super) fn generation(&self) -> u64 {
             self.generation
         }
@@ -1699,6 +1699,8 @@ mod hf_replay_guard;
 mod proposal_revalidation_tests;
 #[cfg(test)]
 mod vote_selection_tests;
+#[cfg(test)]
+mod authority_parked_tests;
 
 #[cfg(test)]
 mod ws_lifecycle_tests;
@@ -2095,6 +2097,9 @@ struct Engine {
         Option<AuthenticatedBlockAdmission>,
         usize,
     )>,
+    /// Blocks in `orphans` that are parked because their proposer could not
+    /// be authenticated, with what the door judged them against (V1-2).
+    authority_parked: AuthorityParked,
     /// Orphans dropped at the cap, and orphans later connected. Counted so
     /// "the bound is holding" is a measurement rather than an inference — a
     /// pool with evictions and zero admissions is a node that is not syncing.
@@ -2235,6 +2240,25 @@ fn culprit_index(err: &TransitionError, len: usize) -> Option<usize> {
         }
         _ => None,
     }
+}
+
+/// Blocks parked because the proposer signature did not verify under an
+/// authority that proves nothing (a deposit-added index, an index this
+/// registry does not hold, or a KES authority the finalized state does not
+/// fix), keyed by block id (review V1-2).
+///
+/// Such a block is not waiting for a parent, so a landing parent never
+/// releases it. It is judged again when the authority the door would use
+/// for it is no longer the one recorded here, and only then: a re-run under
+/// the same authority returns the same verdict.
+#[derive(Default)]
+struct AuthorityParked {
+    /// The state generation the entries were last compared at. The authority
+    /// is a function of the state, so nothing can have changed within one.
+    checked_generation: Option<u64>,
+    /// `None`: the registry did not hold the index. At most one entry per
+    /// parked block, so bounded by [`ORPHAN_MAX`].
+    judged: BTreeMap<[u8; 32], Option<[u8; 32]>>,
 }
 
 /// Pool votes one proposal may verify again with the real verifier because
@@ -3791,9 +3815,15 @@ impl Engine {
     }
 
     fn schedule_unblocked_orphans(&mut self, landed: [u8; 32], grew_registry: bool) {
+        // V1-2: also what was parked for its proposer's authority, once that
+        // authority is no longer the one it was refused under.
+        let rejudge = self.authority_parked_due();
         let mut i = 0;
         while i < self.orphans.len() {
-            if grew_registry || self.orphans[i].1.header.parent == landed {
+            if grew_registry
+                || self.orphans[i].1.header.parent == landed
+                || rejudge.contains(&self.orphans[i].0)
+            {
                 let Some((_, env, orphan_source, authentication, retained_bytes)) = self.orphans.remove(i) else {
                     break;
                 };
@@ -3808,6 +3838,71 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// The state the door reads a proposer's authority from: the post-state
+    /// of the block's parent when the reorg ring still retains it, which is
+    /// what the transition will judge the signature against, and otherwise
+    /// this node's head (V1-2). The ring holds canonical post-states only,
+    /// so the lookup costs a scan of [`REORG_STATE_WINDOW`] ids.
+    fn proposer_authority_state(&self, parent: &[u8; 32]) -> Arc<CommittedState> {
+        self.recent_states
+            .iter()
+            .find(|(id, _)| id == parent)
+            .map(|(_, state)| Arc::clone(state))
+            .unwrap_or_else(|| self.state.arc())
+    }
+
+    /// Park a block whose proposer could not be authenticated under
+    /// `judged`, and remember that authority so the block is judged again
+    /// when it changes (V1-2). Unauthenticated, like every such entry.
+    fn park_unjudgeable(&mut self, id: [u8; 32], env: BlockEnvelope, src: Source, judged: Option<[u8; 32]>) {
+        self.park_orphan(id, env, src);
+        if self.orphans.back().is_some_and(|(seen, _, _, _, _)| *seen == id) {
+            self.authority_parked.judged.insert(id, judged);
+            // A record can outlive its block (evicted, or released by its
+            // parent). Never hold more records than the pool has entries.
+            if self.authority_parked.judged.len() > ORPHAN_MAX {
+                let orphans = &self.orphans;
+                self.authority_parked
+                    .judged
+                    .retain(|id, _| orphans.iter().any(|(seen, _, _, _, _)| seen == id));
+            }
+        }
+    }
+
+    /// Ids of parked blocks whose proposer authority has changed since the
+    /// door refused to judge them (V1-2). Records of blocks that left the
+    /// orphan pool are dropped in the same pass, so the map never outgrows
+    /// it. One fingerprint per recorded entry, and only when the state has
+    /// been written since the last pass.
+    fn authority_parked_due(&mut self) -> BTreeSet<[u8; 32]> {
+        let mut due = BTreeSet::new();
+        let generation = self.state.generation();
+        if self.authority_parked.judged.is_empty()
+            || self.authority_parked.checked_generation == Some(generation)
+        {
+            return due;
+        }
+        let mut waiting = BTreeMap::new();
+        for (id, env, _, _, _) in &self.orphans {
+            let Some(judged) = self.authority_parked.judged.get(id) else {
+                continue;
+            };
+            let now = bloch_pos_committee::kes::authority_fingerprint(
+                &*self.proposer_authority_state(&env.header.parent),
+                env.header.proposer_index,
+                epoch_of(env.header.slot),
+            );
+            if now == *judged {
+                waiting.insert(*id, *judged);
+            } else {
+                due.insert(*id);
+            }
+        }
+        self.authority_parked.judged = waiting;
+        self.authority_parked.checked_generation = Some(generation);
+        due
     }
 
     /// Promote at most one previously parked block. Its prior gossip verdict
@@ -4081,9 +4176,14 @@ impl Engine {
         // transition's own step 7), and the authority a cached proof is bound
         // to also commits to the KES key (`kes::authority_fingerprint`);
         // before it, both are exactly the static-key forms.
+        //
+        // V1-2: the registry read is the parent's post-state whenever the
+        // reorg ring still holds it (a sibling of the head, or a child of
+        // it), which is exactly the transition's; only otherwise the head.
         let proposer_epoch = epoch_of(env.header.slot);
+        let judged_state = self.proposer_authority_state(&env.header.parent);
         let authority = bloch_pos_committee::kes::authority_fingerprint(
-            &*self.state,
+            &*judged_state,
             env.header.proposer_index,
             proposer_epoch,
         );
@@ -4104,7 +4204,7 @@ impl Engine {
                         lane_source_cap,
                     ).with_failure_allowance(BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
                     let verified = bloch_pos_committee::kes::verify_validator(
-                        &*self.state,
+                        &*judged_state,
                         // HF2: the consensus signature rule of the header's own
                         // epoch, exactly what the transition applies; HF3: the
                         // KES leaf of that epoch's period once KES binds.
@@ -4134,7 +4234,7 @@ impl Engine {
                 .as_ref()
                 .is_some_and(|proof| proof.matches(&env, &authority))
                 || bloch_pos_committee::kes::verify_validator(
-                    &*self.state,
+                    &*judged_state,
                     &bloch_pos_committee::PolicyVerifier::consensus(&self.gossip_verifier, proposer_epoch),
                     env.header.proposer_index,
                     proposer_epoch,
@@ -4145,7 +4245,7 @@ impl Engine {
                 // Unknown identity: hold it, decide nothing. It does not
                 // ask for a gap either (P2P-6): nothing about this envelope
                 // is authenticated, so it may not steer the sync cursor.
-                self.park_orphan(id, env, src);
+                self.park_unjudgeable(id, env, src, None);
                 return (Verdict::Ignore, None);
             }
         };
@@ -4154,11 +4254,11 @@ impl Engine {
                 // O04: a deposit-added identity whose key this branch may not
                 // hold. Not a verdict on the block, and not a charge on the
                 // peer — hold it and let the transition judge it in context.
-                self.park_orphan(id, env, src);
+                self.park_unjudgeable(id, env, src, authority);
                 return (Verdict::Ignore, None);
             }
             if !self.signature_failure_is_provable(
-                &*self.state,
+                &*judged_state,
                 env.header.proposer_index,
                 proposer_epoch,
             ) {
@@ -4167,7 +4267,7 @@ impl Engine {
                 // the bind or the proposer's registration and have judged a
                 // leaf signature against the static key. Unless the finalized
                 // state fixes the authority, hold it like the O04 case.
-                self.park_orphan(id, env, src);
+                self.park_unjudgeable(id, env, src, authority);
                 return (Verdict::Ignore, None);
             }
             self.rejected_unsigned = self.rejected_unsigned.saturating_add(1);
@@ -7893,6 +7993,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         sync_rewind: SyncRewindBackoff::default(),
         orphans: VecDeque::new(),
         deferred_orphans: VecDeque::new(),
+        authority_parked: AuthorityParked::default(),
         orphans_evicted: 0,
         orphans_admitted: 0,
         blocks_pruned: 0,
@@ -11632,6 +11733,7 @@ mod transfer_v2_end_to_end {
             sync_rewind: SyncRewindBackoff::default(),
             orphans: VecDeque::new(),
             deferred_orphans: VecDeque::new(),
+            authority_parked: AuthorityParked::default(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
@@ -13018,6 +13120,7 @@ mod perf_support {
             sync_rewind: SyncRewindBackoff::default(),
             orphans: VecDeque::new(),
             deferred_orphans: VecDeque::new(),
+            authority_parked: AuthorityParked::default(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
@@ -15492,6 +15595,7 @@ mod duty_view_anchor {
             sync_rewind: SyncRewindBackoff::default(),
             orphans: VecDeque::new(),
             deferred_orphans: VecDeque::new(),
+            authority_parked: AuthorityParked::default(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
@@ -15779,6 +15883,7 @@ mod slot_horizon {
             doppelganger_halted: false,
             orphans: VecDeque::new(),
             deferred_orphans: VecDeque::new(),
+            authority_parked: AuthorityParked::default(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
@@ -18203,7 +18308,11 @@ mod ingest_admission_tests {
 
         // Replace only the local registry projection. The queued proof is
         // still bound to the old key and therefore cannot authorize release.
+        // The reorg ring would still name the parent's real post-state, and
+        // the door reads the proposer's authority from it when it can
+        // (V1-2); drop it so the swapped projection is what is consulted.
         engine.state.set_arc(other_registry.state.arc());
+        engine.recent_states.clear();
         let rejected_before = engine.rejected_unsigned;
 
         drop(clock);
