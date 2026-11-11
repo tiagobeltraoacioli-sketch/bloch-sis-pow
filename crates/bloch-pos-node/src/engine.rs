@@ -9917,6 +9917,20 @@ impl KesSigner {
                 self.next = Some(std::mem::replace(&mut self.key, old));
             }
             self.rotation_submitted = None;
+            // Review W2-2 (reported, not changed here): a successor that was
+            // in force for more than one period has erased its first leaves.
+            // Submitted again it starts at leaf 0 on chain and cannot sign
+            // until the chain reaches the leaf it holds. It is kept, because
+            // the branch that made it the key in force can still win.
+            if let Some(leaf) = self.next.as_ref().map(|next| next.period()).filter(|leaf| *leaf > 0) {
+                eprintln!(
+                    "KES WARNING: the successor put back in {} was already evolved to leaf {leaf}. \
+                     If it is rotated in again it cannot sign for its first {leaf} period(s) \
+                     after that handover. It is kept because the branch on which it was the \
+                     key in force can still win; this needs an operator's attention.",
+                    crate::kes_key::NEXT_FILE_NAME
+                );
+            }
             println!(
                 "KES handover reorganized out: the chain names the replaced key (root {}) again; {} \
                  restored and the successor is back in {}",
