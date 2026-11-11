@@ -567,6 +567,21 @@ fn main() {
             devnet.push_str("+mainnet-policy");
         }
     }
+    // Review round 2, GATE-10: two switches that change consensus constants
+    // and were missing from the identity. The qualification build arms the
+    // ML-DSA pin at epoch 0; the environment variable moves the height from
+    // which development profiles accept finalized-only L2 claims (read with
+    // `option_env!` by bloch-pos-committee in the same cargo invocation).
+    if std::env::var_os("CARGO_FEATURE_MLDSA_PIN_REPLAY_QUALIFICATION").is_some() {
+        devnet.push_str("+mldsa-pin-replay-qualification");
+    }
+    println!("cargo:rerun-if-env-changed=BLOCH_DEVNET_FINALIZED_CLAIMS_FROM_HEIGHT");
+    if let Some(height) = std::env::var_os("BLOCH_DEVNET_FINALIZED_CLAIMS_FROM_HEIGHT") {
+        let height = height.to_string_lossy();
+        let height: String =
+            height.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        devnet.push_str(&format!("+devnet-finalized-claims-h{height}"));
+    }
     if std::env::var_os("CARGO_FEATURE_WS_AUTO_CHECKPOINT").is_some() {
         devnet.push_str("+ws-auto-checkpoint");
     } else if std::env::var_os("CARGO_FEATURE_WS_RELEASE_ANCHOR").is_some() {

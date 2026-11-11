@@ -8,9 +8,10 @@
 //! names them, checks the ordering rules between them at compile time, and
 //! pins in tests what a release may arm.
 //!
-//! All of them ship `u64::MAX` (INERT). Arming is a founder decision taken in
+//! A new gate ships `u64::MAX` (INERT). Arming is a founder decision taken in
 //! one release commit; the exact edit per constant is in
-//! `docs/HARD-FORKS-1-2-3-INTEGRATION.md`.
+//! `docs/HARD-FORKS-1-2-3-INTEGRATION.md`. The gates in [`RELEASE_ARMABLE`]
+//! are armed (owner decision 2026-10-25); the values are in `params.rs`.
 //!
 //! ## Ordering rules ([`hard_fork_schedule_coherent`])
 //!

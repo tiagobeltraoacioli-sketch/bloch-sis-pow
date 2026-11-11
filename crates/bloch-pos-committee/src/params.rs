@@ -3437,8 +3437,9 @@ pub(crate) mod audit_recovery_test {
 
 // ── Forward-secure validator keys (KES, `crate::kes`) ───────────────────────
 //
-// Hard fork 3 (HF3). Two mainnet flag days, both unarmed (`u64::MAX`) until
-// chosen, no cargo feature anywhere (docs/KES-MAINNET-READINESS.md §7).
+// Hard fork 3 (HF3). Two mainnet flag days, both armed by the owner decision
+// of 2026-10-25 (registration 7360, enforcement 8620), no cargo feature
+// anywhere (docs/KES-MAINNET-READINESS.md §7).
 //
 // `HF3_KES_EPOCH` IS ITSELF A HARD FORK, not a soft opening: a binary without
 // this line refuses tags 0x17/0x1B as unknown, so the first block carrying a
@@ -3462,11 +3463,14 @@ pub(crate) mod audit_recovery_test {
 // component is absent while no root is registered.
 
 /// HF3: opens KES registration (wire 0x17) and rotation (`kes::ROTATE_TAG`).
-/// Unarmed.
+/// Armed at 7360 (in force on mainnet).
 pub const HF3_KES_EPOCH: u64 = 7360;
 /// HF3 KES enforcement: proposals and votes must carry a KES leaf signature
-/// from this epoch on. Unarmed; must come at least
-/// `KES_MIN_REGISTRATION_WINDOW_EPOCHS` after `HF3_KES_EPOCH`.
+/// from this epoch on (once the registered-stake condition holds). Armed at
+/// 8620; must come at least
+/// `KES_MIN_REGISTRATION_WINDOW_EPOCHS` after `HF3_KES_EPOCH`. The follow-up
+/// gates that must cover it are tracked by
+/// `hard_forks::kes_follow_up_gates_cover_enforcement`.
 pub const HF3_KES_ENFORCE_EPOCH: u64 = 8620;
 /// Opens KES registration (wire 0x17): `HF3_KES_EPOCH`.
 pub const KES_REGISTRATION_EPOCH: u64 = HF3_KES_EPOCH;
