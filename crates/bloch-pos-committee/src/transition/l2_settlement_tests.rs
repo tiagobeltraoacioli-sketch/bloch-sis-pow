@@ -2693,6 +2693,84 @@ mod l2_tests {
 
     // ── Proof-free preflights for the node (review EXE-1, EXE-2) ──────────
 
+    /// The deposit and DA preflights the node runs at mempool admission and
+    /// proposer selection give the transition's own verdict, for the valid
+    /// transaction and for each state refusal: never stricter than consensus.
+    #[test]
+    fn l2_deposit_and_da_preflights_give_the_transitions_verdict() {
+        use crate::transition::L2DepositReject as DepositReject;
+        let (opened, mut chains) = activated_fixture(true, [0; 32]);
+        let fee = opened.next_base_fee();
+        let deposit_verdict = |state: &CommittedState, tx: &crate::transition::L2Deposit| {
+            let preflight = state.l2_deposit_refusal_at(tx, fee);
+            assert_eq!(preflight, state.clone().apply_l2_deposit(tx, fee, &ToyVerifier).err());
+            preflight
+        };
+        let resign_deposit = |mut tx: crate::transition::L2Deposit| {
+            tx.signature = toy_sign(&tx.funding_pubkey, &tx.intent_root());
+            tx
+        };
+        let good = deposit_tx(&opened, 70 * BLCH);
+        assert_eq!(deposit_verdict(&opened, &good), None);
+        let mut missing = good.clone();
+        missing.inputs[0].txid = [0x34; 32];
+        let mut foreign = good.clone();
+        foreign.funding_pubkey = vec![0x5b; crate::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let mut tip = good.clone();
+        tip.tip_millisat_per_gas = u128::MAX;
+        let mut oversize = good.clone();
+        oversize.tx_bytes = u64::MAX;
+        let mut unpaid = good.clone();
+        unpaid.change.value += 1;
+        let mut elsewhere = good.clone();
+        elsewhere.network_domain = [0x92; 32];
+        for (tx, why) in [
+            (missing, DepositReject::MissingInput),
+            (foreign, DepositReject::Ownership),
+            (tip, DepositReject::TipAboveCeiling),
+            (oversize, DepositReject::GasCeiling),
+            (unpaid, DepositReject::Conservation),
+            (elsewhere, DepositReject::Network),
+        ] {
+            assert_eq!(deposit_verdict(&opened, &resign_deposit(tx)), Some(why));
+        }
+        // The signature is not the preflight's business.
+        let mut unsigned = good.clone();
+        unsigned.signature = vec![0; 32];
+        assert_eq!(opened.l2_deposit_refusal_at(&unsigned, fee), None);
+        assert_eq!(opened.clone().apply_l2_deposit(&unsigned, fee, &ToyVerifier), Err(DepositReject::Signature));
+
+        let da_verdict = |state: &CommittedState, tx: &L2DataAvailability| {
+            let fee = state.next_base_fee();
+            let preflight = state.l2_data_availability_refusal_at(tx, fee);
+            assert_eq!(preflight, state.clone().apply_l2_data_availability(tx, fee, &ToyVerifier).err());
+            preflight
+        };
+        let coin = ([0x33; 32], 0);
+        let payload = batch(&[&[0x02, 0xc0], b"second"]);
+        let batch_tx = da_tx(&opened, coin, FUNDED, 1, payload.clone());
+        assert_eq!(da_verdict(&opened, &batch_tx), None);
+        assert_eq!(da_verdict(&opened, &da_tx(&opened, coin, FUNDED, 0, payload.clone())), Some(DaReject::Number));
+        let beyond = 1 + da::WINDOW;
+        assert_eq!(da_verdict(&opened, &da_tx(&opened, coin, FUNDED, beyond, payload.clone())), Some(DaReject::Number));
+        let mut other_chain = batch_tx.clone();
+        other_chain.l2_chain_id += 1;
+        assert_eq!(da_verdict(&opened, &resign(other_chain)), Some(DaReject::Chain));
+        let mut unowned = batch_tx.clone();
+        unowned.funding_pubkey = vec![0x5b; crate::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        assert_eq!(da_verdict(&opened, &resign(unowned)), Some(DaReject::Ownership));
+        // Once recorded, the same batch for the same block is a duplicate.
+        let wire = PosTransaction::L2DataAvailability(batch_tx.clone());
+        let recorded = apply(&opened, crate::params::SLOTS_PER_EPOCH + 1, std::slice::from_ref(&wire), &mut chains).expect("DA applies");
+        let again = da_tx(&recorded, (wire.txid(), 0), batch_tx.change.value, 1, payload);
+        assert_eq!(da_verdict(&recorded, &again), Some(DaReject::Duplicate));
+
+        // The claim preflight at an explicit price is the existing one.
+        let claim = claim_tx(&opened, coin, FUNDED, 3, 2);
+        assert_eq!(opened.l2_withdraw_claim_refusal_at(&claim, fee), opened.l2_withdraw_claim_refusal(&claim));
+        assert!(opened.l2_withdraw_claim_refusal_at(&claim, fee).is_some());
+    }
+
     /// The retention check for a settlement that is already pending judges it
     /// as the next block will: it accepts one whose source the next block
     /// pins, and refuses one the head has moved past, whatever its proof.

@@ -421,6 +421,13 @@ impl CommittedState {
         self.check_l2_withdraw_claim(tx, self.next_base_fee()).err()
     }
 
+    /// [`Self::l2_withdraw_claim_refusal`] at an explicit `base_fee` (the
+    /// price of the block being built). Node-local preflight (mempool
+    /// admission, proposer selection); the same checks the transition runs.
+    pub fn l2_withdraw_claim_refusal_at(&self, tx: &L2WithdrawClaim, base_fee: u128) -> Option<L2WithdrawClaimReject> {
+        self.check_l2_withdraw_claim(tx, base_fee).err()
+    }
+
     /// The state checks of [`Self::apply_l2_withdraw_claim`], in its order,
     /// up to (not including) the signatures.
     fn check_l2_withdraw_claim(

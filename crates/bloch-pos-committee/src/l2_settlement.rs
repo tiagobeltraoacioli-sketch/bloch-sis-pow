@@ -1448,6 +1448,13 @@ impl State {
             self.source_anchor = Some((parent, parent_slot, self.native_height, self.inbox.len() as u64, self.inbox_root));
         }
     }
+    /// Whether [`Self::append_deposit`] would accept a record of `sats`
+    /// (its two refusals, without mutating). Mempool preflight.
+    pub(crate) fn can_append_deposit(&self, sats: u64) -> bool {
+        self.asynchronous
+            && self.inbox.len() < u32::MAX as usize
+            && self.escrow_sat.checked_add(u128::from(sats)).is_some()
+    }
     /// Escrow a native deposit into the next inbox position. The caller has
     /// already removed exactly `record.sats` from the spendable supply.
     pub(crate) fn append_deposit(&mut self, record: InboxRecord) -> Result<(), Reject> {
@@ -1628,6 +1635,19 @@ impl State {
         l2_number: u64,
         commitment: [u8; 32],
     ) -> Result<(), da::Refusal> {
+        let height = self.check_data_availability(chain_id, l2_number, &commitment)?;
+        self.da.push(da::Record { l2_number, commitment, height });
+        Ok(())
+    }
+    /// Every refusal of [`Self::record_data_availability`], without mutating
+    /// (shared with the mempool preflight so the two cannot drift). Returns
+    /// the native height the record would carry.
+    pub(crate) fn check_data_availability(
+        &self,
+        chain_id: u64,
+        l2_number: u64,
+        commitment: &[u8; 32],
+    ) -> Result<u64, da::Refusal> {
         use da::Refusal as R;
         if !self.profile.user_transactions {
             return Err(R::NotActive);
@@ -1639,15 +1659,13 @@ impl State {
         if l2_number <= settled || l2_number > settled.saturating_add(da::WINDOW) {
             return Err(R::Number);
         }
-        if self.da.iter().any(|r| r.l2_number == l2_number && r.commitment == commitment) {
+        if self.da.iter().any(|r| r.l2_number == l2_number && r.commitment == *commitment) {
             return Err(R::Duplicate);
         }
         if self.da.len() >= da::MAX_RECORDS {
             return Err(R::Full);
         }
-        let height = self.native_height.checked_add(1).ok_or(R::Full)?;
-        self.da.push(da::Record { l2_number, commitment, height });
-        Ok(())
+        self.native_height.checked_add(1).ok_or(R::Full)
     }
     /// Test hook: configure the attestor set after genesis.
     #[cfg(test)]

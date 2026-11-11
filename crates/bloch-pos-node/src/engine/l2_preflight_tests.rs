@@ -84,3 +84,195 @@ fn a_transaction_the_probe_refuses_does_not_cost_the_block_its_transactions() {
     assert!(!node.mempool.contains_key(&key));
     assert!(node.rejected.contains_key(&key), "the refused transaction is barred");
 }
+
+#[cfg(feature = "devnet-l2-user-txs")]
+mod funded_l2_transactions {
+    use super::*;
+    use bloch_pos_committee::l2_settlement::withdrawal::TREE_DEPTH;
+    use bloch_pos_committee::state_root::EutxoEntry;
+    use bloch_pos_committee::transition::l2_deposit::MIN_L2_DEPOSIT_SAT;
+    use bloch_pos_committee::transition::{
+        FundingInput, L2DataAvailability, L2Deposit, L2WithdrawClaim, TransferOutput,
+    };
+
+    /// The key `funds_of` locks its outputs to.
+    const OWNER: u8 = 71;
+    const CHAIN: u64 = 700771;
+    const ABSENT: ([u8; 32], u32) = ([0xEE; 32], 0);
+
+    fn keypair(seed: u8) -> (Vec<u8>, Vec<u8>) {
+        bloch_crypto::crypto::generate_keypair_from_seed(&[seed; 32]).unwrap()
+    }
+    fn script(pk: &[u8]) -> [u8; 32] {
+        Sha3_256::digest(pk).into()
+    }
+    fn sign(sk: &[u8], root: &[u8; 32]) -> Vec<u8> {
+        bloch_crypto::crypto::sign(sk, root).unwrap()
+    }
+    fn domain(node: &Engine) -> [u8; 32] {
+        node.state.admission_network_domain().expect("bound genesis")
+    }
+    fn fee_of(node: &Engine, tx_bytes: u64) -> u64 {
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: 1 },
+            tx_bytes,
+            node.state.next_base_fee_at(0),
+            0,
+        );
+        (charge.base_fee_sat + charge.priority_fee_sat).try_into().unwrap()
+    }
+    fn batch(body: &[u8]) -> Vec<u8> {
+        let mut out = 1u32.to_be_bytes().to_vec();
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A deposit of the minimum amount by key `seed` spending `point`. With
+    /// `value` it declares its real size and conserves value at the current
+    /// base fee; without, it is the review's unpayable shape: the highest
+    /// tip and a whole block of declared bytes.
+    fn deposit(node: &Engine, seed: u8, point: ([u8; 32], u32), value: Option<u64>, recipient: u8) -> L2Deposit {
+        let (pk, sk) = keypair(seed);
+        let mut tx = L2Deposit {
+            network_domain: domain(node),
+            funding_pubkey: pk.clone(),
+            inputs: vec![FundingInput { txid: point.0, vout: point.1 }],
+            amount_sat: MIN_L2_DEPOSIT_SAT,
+            recipient: [recipient; 20],
+            change: TransferOutput { value: 0, script_hash: script(&pk) },
+            tx_bytes: fee_market::max_block_tx_bytes(0),
+            tip_millisat_per_gas: u128::MAX,
+            signature: Vec::new(),
+        };
+        if let Some(value) = value {
+            tx.tip_millisat_per_gas = 0;
+            tx.tx_bytes = (tx.canonical_bytes().len() + bloch_crypto::crypto::max_signature_len()) as u64;
+            tx.change.value = value - MIN_L2_DEPOSIT_SAT - fee_of(node, tx.tx_bytes);
+        }
+        tx.signature = sign(&sk, &tx.intent_root());
+        tx
+    }
+
+    fn data_availability(node: &Engine, seed: u8, point: ([u8; 32], u32), value: Option<u64>) -> L2DataAvailability {
+        let (pk, sk) = keypair(seed);
+        let mut tx = L2DataAvailability {
+            network_domain: domain(node),
+            funding_pubkey: pk.clone(),
+            inputs: vec![FundingInput { txid: point.0, vout: point.1 }],
+            l2_chain_id: CHAIN,
+            l2_block_number: 1,
+            payload: batch(&[seed, 0xc0]),
+            change: TransferOutput { value: 0, script_hash: script(&pk) },
+            tx_bytes: fee_market::max_block_tx_bytes(0),
+            tip_millisat_per_gas: u128::MAX,
+            signature: Vec::new(),
+        };
+        if let Some(value) = value {
+            tx.tip_millisat_per_gas = 0;
+            tx.tx_bytes = (tx.canonical_bytes().len() + bloch_crypto::crypto::max_signature_len()) as u64;
+            tx.change.value = value - fee_of(node, tx.tx_bytes);
+        }
+        tx.signature = sign(&sk, &tx.intent_root());
+        tx
+    }
+
+    /// A well-formed claim of a leaf no settlement ever added, funded by
+    /// nothing, at the highest tip and a whole block of declared bytes.
+    fn unpayable_claim(node: &Engine, seed: u8) -> L2WithdrawClaim {
+        let (pk, sk) = keypair(seed);
+        let recipient = [0x17; 32];
+        let mut tx = L2WithdrawClaim {
+            network_domain: domain(node),
+            funding_pubkey: pk.clone(),
+            inputs: vec![FundingInput { txid: ABSENT.0, vout: ABSENT.1 }],
+            l2_chain_id: CHAIN,
+            index: 0,
+            l1_recipient: recipient,
+            sats: MIN_L2_DEPOSIT_SAT,
+            siblings: [[0; 32]; TREE_DEPTH],
+            release: TransferOutput { value: MIN_L2_DEPOSIT_SAT, script_hash: recipient },
+            change: TransferOutput { value: 0, script_hash: script(&pk) },
+            tx_bytes: fee_market::max_block_tx_bytes(0),
+            tip_millisat_per_gas: u128::MAX,
+            attestation: None,
+            signature: Vec::new(),
+        };
+        tx.signature = sign(&sk, &tx.intent_root());
+        tx
+    }
+
+    fn engine(funds: &[EutxoEntry]) -> (Engine, perf_support::TestDir) {
+        let (node, dir) = engine_with_frozen_source_funded(funds);
+        let l2 = node.state.l2_settlement().unwrap();
+        assert!(l2.deposits_enabled() && l2.user_transactions());
+        (node, dir)
+    }
+
+    fn refused(outcome: Result<Admitted, Refusal>) -> bool {
+        matches!(outcome, Err(Refusal::Invalid(_) | Refusal::StateDependent(_)))
+    }
+
+    /// EXE-1: a deposit and a claim signed by a throwaway key, funded by
+    /// nothing, at the highest tip and declaring a whole block of bytes, are
+    /// refused at the door; and if they are in the pool anyway they are not
+    /// selected, so the block still carries the paying transfer.
+    #[test]
+    fn unpayable_deposits_and_claims_are_refused_and_never_selected() {
+        let _clock = validator_lifecycle::clock_at(3);
+        let funds = funds_of(2);
+        let (mut node, _dir) = engine(&funds);
+        let transfer = spend(&funds[0], 9_000, 0, node.state.next_base_fee_at(0));
+        assert_eq!(node.on_transaction(transfer.clone()), Ok(Admitted::New));
+
+        let unpayable = [
+            PosTransaction::L2Deposit(deposit(&node, 91, ABSENT, None, 0x42)),
+            PosTransaction::L2WithdrawClaim(unpayable_claim(&node, 92)),
+        ];
+        for tx in &unpayable {
+            assert!(refused(node.on_transaction_from(tx.clone(), Some([0xD0; 32]))));
+        }
+        // The same without the absurd price: still nothing backs them.
+        let mut modest = deposit(&node, 91, ABSENT, None, 0x43);
+        modest.tip_millisat_per_gas = 0;
+        modest.tx_bytes = (modest.canonical_bytes().len() + bloch_crypto::crypto::max_signature_len()) as u64;
+        modest.signature = sign(&keypair(91).1, &modest.intent_root());
+        assert!(matches!(
+            node.on_transaction(PosTransaction::L2Deposit(modest)),
+            Err(Refusal::StateDependent(_)),
+        ));
+        assert_eq!(node.mempool.len(), 1);
+
+        for tx in unpayable {
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        assert_eq!(node.select_transactions(0), vec![transfer.clone()]);
+        node.propose(3);
+        assert_eq!(node.state.slot(), 3);
+        assert_eq!(node.tx_slot_index.get(&transfer.txid()), Some(&3));
+    }
+
+    /// EXE-1: five unpayable DA batches at the highest tip do not take the
+    /// per-block DA slots from one honest batch.
+    #[test]
+    fn unpayable_da_batches_do_not_take_the_da_slots() {
+        let _clock = validator_lifecycle::clock_at(3);
+        let funds = funds_of(2);
+        let (mut node, _dir) = engine(&funds);
+        let honest = PosTransaction::L2DataAvailability(data_availability(
+            &node, OWNER, (funds[0].txid, funds[0].vout), Some(funds[0].value),
+        ));
+        assert_eq!(node.on_transaction(honest.clone()), Ok(Admitted::New));
+        for seed in 101..106 {
+            let tx = PosTransaction::L2DataAvailability(data_availability(&node, seed, ABSENT, None));
+            assert!(refused(node.on_transaction(tx.clone())));
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        assert_eq!(node.mempool.len(), 6);
+        assert_eq!(node.select_transactions(0), vec![honest.clone()]);
+        node.propose(3);
+        assert_eq!(node.tx_slot_index.get(&honest.txid()), Some(&3));
+        assert_eq!(node.state.l2_settlement().unwrap().data_availability().len(), 1);
+    }
+
+}

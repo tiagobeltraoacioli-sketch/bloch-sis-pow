@@ -292,6 +292,9 @@ pub(super) fn check_transfer(
             }
             return Ok(());
         }
+        PosTransaction::L2Deposit(_)
+        | PosTransaction::L2DataAvailability(_)
+        | PosTransaction::L2WithdrawClaim(_) => return check_l2_funded(state, tx, encoded, epoch),
         _ => return Ok(()),
     };
     if (encoded as u64).max(declared) > fee_market::max_block_tx_bytes(epoch) {
@@ -337,6 +340,119 @@ pub(super) fn check_transfer(
         ));
     }
     Ok(())
+}
+
+/// The proof-free state preflight of the three fee-paying L2 transactions
+/// (deposit 0x14, data availability 0x15, withdrawal claim 0x16), the
+/// counterpart of [`check_transfer`] for them (review EXE-1, V2-1).
+///
+/// Without it these types reached the mempool on a signature by any key and
+/// were "backed" forever: ordered by a tip nobody could be made to pay,
+/// budgeted by a self-declared size, and holding the input reservation of
+/// outpoints their key does not own. The proposer's probe then refused them
+/// and the block went out without the transactions they displaced.
+///
+/// Every refusal below is the transition's own, taken from the committee's
+/// shared check functions against `state` at the price of a block in `epoch`,
+/// so nothing is refused that the next block could carry; the one addition is
+/// the block byte budget, the relay bound transfers and funded deposits
+/// already have. Signatures are not judged here (admission verifies them
+/// after this, under the per-source budget).
+fn check_l2_funded(
+    state: &CommittedState,
+    tx: &PosTransaction,
+    encoded: usize,
+    epoch: u64,
+) -> Result<(), Refusal> {
+    use bloch_pos_committee::transition::{
+        L2DataAvailabilityReject as Da, L2DepositReject as Deposit, L2WithdrawClaimReject as Claim,
+    };
+    if let Some(why) = l2_admission_refusal(tx, state.l2_settlement()) {
+        return Err(Refusal::Invalid(why));
+    }
+    let declared = match tx {
+        PosTransaction::L2Deposit(tx) => tx.tx_bytes,
+        PosTransaction::L2DataAvailability(tx) => tx.tx_bytes,
+        PosTransaction::L2WithdrawClaim(tx) => tx.tx_bytes,
+        _ => return Ok(()),
+    };
+    if (encoded as u64).max(declared) > fee_market::max_block_tx_bytes(epoch) {
+        return Err(Refusal::Invalid("transaction exceeds block byte budget"));
+    }
+    let base_fee = state.next_base_fee_at(epoch);
+    match tx {
+        PosTransaction::L2Deposit(deposit) => match state.l2_deposit_refusal_at(deposit, base_fee) {
+            None => Ok(()),
+            Some(Deposit::MissingInput) => Err(Refusal::StateDependent(
+                "L2 deposit input is absent from committed state",
+            )),
+            Some(Deposit::Conservation) => Err(Refusal::StateDependent(
+                "L2 deposit value is not conserved at the current base fee",
+            )),
+            Some(Deposit::NotActive | Deposit::OutputCollision | Deposit::Inbox) => Err(
+                Refusal::StateDependent("L2 deposit cannot be applied to the current L2 state"),
+            ),
+            Some(Deposit::Ownership) => Err(Refusal::Invalid("L2 deposit key does not own its input")),
+            Some(_) => Err(Refusal::Invalid("L2 deposit fails committed-state validation")),
+        },
+        PosTransaction::L2DataAvailability(batch) => match state.l2_data_availability_refusal_at(batch, base_fee) {
+            None => Ok(()),
+            Some(Da::MissingInput) => Err(Refusal::StateDependent(
+                "L2 data availability input is absent from committed state",
+            )),
+            Some(Da::Conservation) => Err(Refusal::StateDependent(
+                "L2 data availability value is not conserved at the current base fee",
+            )),
+            Some(Da::Number | Da::Duplicate | Da::Full | Da::NotActive | Da::OutputCollision) => Err(
+                Refusal::StateDependent(
+                    "L2 data availability batch is settled, out of window, already recorded or the record set is full",
+                ),
+            ),
+            Some(Da::Ownership) => Err(Refusal::Invalid("L2 data availability key does not own its input")),
+            Some(_) => Err(Refusal::Invalid("L2 data availability fails committed-state validation")),
+        },
+        PosTransaction::L2WithdrawClaim(claim) => match state.l2_withdraw_claim_refusal_at(claim, base_fee) {
+            None => Ok(()),
+            // The one refusal an empty epoch boundary can lift: the block
+            // being built is judged on this state rolled to its epoch, and
+            // the roll may finalize the settlement the claim proves against.
+            // When the block is in a later epoch than the head, do not hold
+            // the head's finality against the claim (the transition will);
+            // the claim's funding is still required to exist and be owned.
+            Some(Claim::NotFinalized) if epoch > epoch_of(state.slot()) => {
+                let owner: [u8; 32] = Sha3_256::digest(&claim.funding_pubkey).into();
+                for input in &claim.inputs {
+                    let entry = state.utxo(&input.txid, input.vout).ok_or(Refusal::StateDependent(
+                        "L2 withdrawal claim input is absent from committed state",
+                    ))?;
+                    if owner != entry.script_hash
+                        && !(entry.script_hash[20..] == [0; 12] && owner[..20] == entry.script_hash[..20])
+                    {
+                        return Err(Refusal::Invalid("L2 withdrawal claim key does not own its input"));
+                    }
+                }
+                Ok(())
+            }
+            Some(Claim::MissingInput) => Err(Refusal::StateDependent(
+                "L2 withdrawal claim input is absent from committed state",
+            )),
+            Some(Claim::Conservation) => Err(Refusal::StateDependent(
+                "L2 withdrawal claim value is not conserved at the current base fee",
+            )),
+            Some(Claim::NotMatured | Claim::NotFinalized | Claim::RateLimited) => Err(Refusal::StateDependent(
+                "L2 withdrawal claim is not yet payable: its root is not matured or finalized, or the release window is used up",
+            )),
+            Some(
+                Claim::Proof | Claim::Index | Claim::AlreadyClaimed | Claim::Escrow | Claim::NotActive
+                | Claim::OutputCollision,
+            ) => Err(Refusal::StateDependent(
+                "L2 withdrawal claim does not prove an unclaimed leaf of a withdrawal root this node retains",
+            )),
+            Some(Claim::Ownership) => Err(Refusal::Invalid("L2 withdrawal claim key does not own its input")),
+            Some(_) => Err(Refusal::Invalid("L2 withdrawal claim fails committed-state validation")),
+        },
+        _ => Ok(()),
+    }
 }
 
 /// Transactional capacity plan; callers build it and commit it only after
