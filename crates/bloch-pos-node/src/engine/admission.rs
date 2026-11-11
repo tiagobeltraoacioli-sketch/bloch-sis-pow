@@ -8,12 +8,18 @@ pub(super) const MAX_MEMPOOL_BYTES: usize = 16 * 1024 * 1024;
 /// Room kept for forced-inclusion envelopes (wire 0x1C) in a full pool. They
 /// carry no tip by design (the depth-priced surcharge pays for them), so the
 /// lowest-tip rules would drop them first and a pool kept full of cheap
-/// entries would censor the one path meant to resist censorship. Up to this
-/// many are never evicted or displaced to make room for another kind; a DA
-/// batch (0x15) never makes room at a forced envelope's expense at all, since
-/// the sequencer that is being bypassed is the party that sends DA. Beyond
-/// this room forced envelopes compete by tip like any entry, so they cannot be
-/// used to hold the pool either: one per-source cap of them fits here.
+/// entries would censor the one path meant to resist censorship.
+///
+/// The room is the best `MEMPOOL_FORCED_RESERVED` pooled forced envelopes
+/// that are backed ([`check_l2_funding`]) and spend disjoint inputs, ranked by
+/// tip and then by age ([`Engine::forced_room`]). Those are never evicted or
+/// displaced to make room for another kind, and while the room is not full an
+/// arriving forced envelope takes the place of the lowest-tip entry of another
+/// kind whatever its tip. Outside the room a forced envelope competes by tip
+/// like any entry and the registered DA key may displace it, so forced
+/// envelopes cannot be used to hold the pool either (review R308-1, R308-2).
+/// A DA batch of any other key still never evicts a forced envelope: the
+/// sequencer that is being bypassed is the party that sends DA.
 /// No forced envelope exists before `L2_FORCED_INCLUSION_EPOCH`, so nothing
 /// changes while that gate is inert.
 pub(super) const MEMPOOL_FORCED_RESERVED: usize = 64;
@@ -280,6 +286,18 @@ pub(super) fn check_transfer(
             }
             return Ok(());
         }
+        PosTransaction::L2Deposit(_)
+        | PosTransaction::L2DataAvailability(_)
+        | PosTransaction::L2WithdrawClaim(_)
+        | PosTransaction::L2ForcedTransaction(_) => {
+            // A kind this network's L2 does not admit is refused, with its
+            // reason, by `l2_admission_refusal`.
+            if l2_admission_refusal(tx, state.l2_settlement()).is_some() {
+                return Ok(());
+            }
+            let queue = state.l2_settlement().and_then(|l2| l2.forced_queue());
+            return check_l2_funding(state, queue, tx, encoded, epoch);
+        }
         _ => return Ok(()),
     };
     if (encoded as u64).max(declared) > fee_market::max_block_tx_bytes(epoch) {
@@ -327,6 +345,110 @@ pub(super) fn check_transfer(
     Ok(())
 }
 
+/// The backing of the L2 kinds that spend funding inputs (deposit 0x14, DA
+/// batch 0x15, withdrawal claim, forced envelope 0x1C), checked before the
+/// signature like [`check_transfer`] does for transfers (review R308-3).
+///
+/// Node policy, a mirror of what `apply_l2_*` checks in consensus: the tip
+/// and gas ceilings, the funding inputs present in committed state and owned
+/// by the funding key, and value conserved at the current base fee. A forced
+/// envelope must also offer at least the current entry price of `queue`.
+/// Without it these kinds entered the pool on a signature alone with any
+/// claimed tip, and eviction at capacity is by claimed tip. An entry that
+/// stops passing is dropped under capacity pressure (`candidate_is_backed`).
+pub(super) fn check_l2_funding(
+    state: &CommittedState,
+    queue: Option<&bloch_pos_committee::l2_settlement::forced::Queue>,
+    tx: &PosTransaction,
+    encoded: usize,
+    epoch: u64,
+) -> Result<(), Refusal> {
+    use bloch_pos_committee::l2_settlement::forced;
+    // (funding key, inputs, declared bytes, tip, value owed besides the fees)
+    let (pubkey, inputs, declared, tip, owed) = match tx {
+        PosTransaction::L2Deposit(tx) => (
+            &tx.funding_pubkey,
+            &tx.inputs,
+            tx.tx_bytes,
+            tx.tip_millisat_per_gas,
+            u128::from(tx.amount_sat)
+                + u128::from(tx.change.value)
+                + state.l2_deposit_protocol_fee(tx.amount_sat).map_or(0, |(fee, _)| u128::from(fee)),
+        ),
+        PosTransaction::L2DataAvailability(tx) => {
+            (&tx.funding_pubkey, &tx.inputs, tx.tx_bytes, tx.tip_millisat_per_gas, u128::from(tx.change.value))
+        }
+        PosTransaction::L2WithdrawClaim(tx) => {
+            (&tx.funding_pubkey, &tx.inputs, tx.tx_bytes, tx.tip_millisat_per_gas, u128::from(tx.change.value))
+        }
+        PosTransaction::L2ForcedTransaction(tx) => {
+            if !(forced::MIN_GAS..=forced::MAX_GAS).contains(&tx.gas_limit) {
+                return Err(Refusal::Invalid("L2 forced transaction declares a gas limit outside the allowed range"));
+            }
+            if let Some(queue) = queue {
+                match queue.surcharge_for(tx.gas_limit) {
+                    None => return Err(Refusal::StateDependent("the L2 forced queue is full")),
+                    Some(price) if price > tx.max_surcharge_sat => {
+                        return Err(Refusal::StateDependent(
+                            "L2 forced transaction offers less than the current entry surcharge",
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+            (
+                &tx.funding_pubkey,
+                &tx.inputs,
+                tx.tx_bytes,
+                tx.tip_millisat_per_gas,
+                u128::from(tx.change.value) + u128::from(tx.max_surcharge_sat),
+            )
+        }
+        _ => return Ok(()),
+    };
+    if (encoded as u64).max(declared) > fee_market::max_block_tx_bytes(epoch) {
+        return Err(Refusal::Invalid("transaction exceeds block byte budget"));
+    }
+    if declared < encoded as u64 {
+        return Err(Refusal::Invalid("transaction underdeclares encoded bytes"));
+    }
+    let class = fee_market::TxClass::Eutxo { inputs: inputs.len() as u32 };
+    if tip > fee_market::MAX_TIP_MILLISAT_PER_GAS {
+        return Err(Refusal::Invalid("L2 transaction names a tip above the consensus ceiling"));
+    }
+    if fee_market::intrinsic_gas(class, declared) > fee_market::MAX_TX_GAS {
+        return Err(Refusal::Invalid("L2 transaction declares more gas than a whole block may spend"));
+    }
+    let owner: [u8; 32] = Sha3_256::digest(pubkey).into();
+    let mut seen = BTreeSet::new();
+    let mut spent = 0u128;
+    for input in inputs {
+        if !seen.insert((input.txid, input.vout)) {
+            return Err(Refusal::Invalid("L2 transaction repeats a funding input"));
+        }
+        let entry = state
+            .utxo(&input.txid, input.vout)
+            .ok_or(Refusal::StateDependent("L2 funding input is absent from committed state"))?;
+        if owner != entry.script_hash
+            && !(entry.script_hash[20..] == [0; 12] && owner[..20] == entry.script_hash[..20])
+        {
+            return Err(Refusal::Invalid("L2 funding key does not own its input"));
+        }
+        spent += u128::from(entry.value);
+    }
+    let charge = fee_market::charge(class, declared, state.next_base_fee_at(epoch), tip);
+    let required = owed
+        .checked_add(charge.base_fee_sat)
+        .and_then(|total| total.checked_add(charge.priority_fee_sat))
+        .ok_or(Refusal::Invalid("L2 transaction value and fee sum overflows"))?;
+    if spent != required {
+        return Err(Refusal::StateDependent(
+            "L2 funding value is not conserved at the current base fee",
+        ));
+    }
+    Ok(())
+}
+
 /// Transactional capacity plan; callers commit it only after authenticating the
 /// incoming transaction. Stale entries are not placed in a rejection cache.
 pub(super) struct CapacityPlan {
@@ -344,13 +466,8 @@ impl Engine {
         let mut source_count = source.map_or(0, |s| self.mempool.source_count(&s));
         let mut plan = CapacityPlan { stale: BTreeSet::new(), lower_fee: None, displaced: Vec::new() };
         let mut funded_context = None;
-        // Whether a pooled forced envelope may make room for `incoming`:
-        // never for a DA batch, and for other kinds only beyond the reserved
-        // room. Another forced envelope competes with them by tip as before.
         let incoming_da = matches!(incoming, PosTransaction::L2DataAvailability(_));
         let incoming_forced = is_forced_envelope(incoming);
-        let forced_pooled = if incoming_forced { 0 } else { self.mempool.values().filter(|tx| is_forced_envelope(tx)).count() };
-        let forced_protected = !incoming_forced && (incoming_da || forced_pooled <= MEMPOOL_FORCED_RESERVED);
         // No full-pool revalidation on ordinary admission. Under any capacity
         // pressure, stale backing must not retain priority through claimed tips.
         if count >= MEMPOOL_MAX || bytes.saturating_add(encoded) > MAX_MEMPOOL_BYTES
@@ -372,22 +489,47 @@ impl Engine {
                     && source_count < MEMPOOL_MAX_PER_SOURCE { break; }
             }
         }
-        // The registered DA key's batch (past `L2_DA_RESERVED_SLOT_EPOCH`)
-        // displaces the lowest-tip entries that are neither its own nor
-        // forced envelopes, whatever their tip, until it fits by count and bytes. Otherwise a pool full
-        // of valid tip-0 DA keeps it out of every mempool and the reserved
-        // block slot serves nobody. Its own per-source cap bounds what it can
-        // displace; the others lose a place in the queue, never a fee.
+        let fits = |count: usize, bytes: usize| count < MEMPOOL_MAX && bytes.saturating_add(encoded) <= MAX_MEMPOOL_BYTES;
+        // The reserved room of forced envelopes, needed only under pressure.
+        let room = if fits(count, bytes) { BTreeSet::new() } else { self.forced_room(&plan.stale, epoch) };
         let reserved = da_reserved_key(epoch);
-        if is_reserved_da(incoming, reserved) && source_count < MEMPOOL_MAX_PER_SOURCE
-            && (count >= MEMPOOL_MAX || bytes.saturating_add(encoded) > MAX_MEMPOOL_BYTES) {
+        // The registered DA key's batch (past `L2_DA_RESERVED_SLOT_EPOCH`)
+        // displaces the lowest-tip entries that are not its own, whatever
+        // their tip, until it fits by count and bytes. Otherwise a pool full
+        // of valid tip-0 DA keeps it out of every mempool and the reserved
+        // block slot serves nobody. Forced envelopes go last and only those
+        // outside the reserved room, lowest tip then youngest first. Its own
+        // per-source cap bounds what it can displace; the others lose a place
+        // in the queue, never a fee.
+        if is_reserved_da(incoming, reserved) && source_count < MEMPOOL_MAX_PER_SOURCE && !fits(count, bytes) {
             let mut victims: Vec<_> = self.mempool.iter()
-                .filter(|(key, tx)| !plan.stale.contains(*key) && !is_reserved_da(tx, reserved)
-                    && !is_forced_envelope(tx))
+                .filter(|(key, tx)| !plan.stale.contains(*key) && !is_reserved_da(tx, reserved) && !room.contains(*key))
+                .collect();
+            victims.sort_by_key(|(key, tx)| {
+                let forced = is_forced_envelope(tx);
+                let order = if forced { self.mempool_admitted_at.get(*key).copied().unwrap_or(u64::MAX) } else { key.len() as u64 };
+                (forced, tx_tip_rate(tx), std::cmp::Reverse(order))
+            });
+            for (key, _) in victims {
+                if fits(count, bytes) { break; }
+                plan.displaced.push(key.clone());
+                count = count.saturating_sub(1);
+                bytes = bytes.saturating_sub(key.len());
+            }
+        }
+        // While the reserved room is not full, an arriving forced envelope
+        // takes the place of the lowest-tip entries of another kind whatever
+        // their tip (it carries none by design). The caller has checked its
+        // backing (`check_transfer`) before planning. The registered DA key's
+        // batches are left alone: they would only displace their way back.
+        if incoming_forced && source_count < MEMPOOL_MAX_PER_SOURCE && !fits(count, bytes)
+            && room.len() < MEMPOOL_FORCED_RESERVED {
+            let mut victims: Vec<_> = self.mempool.iter()
+                .filter(|(key, tx)| !plan.stale.contains(*key) && !is_forced_envelope(tx) && !is_reserved_da(tx, reserved))
                 .collect();
             victims.sort_by_key(|(key, tx)| (tx_tip_rate(tx), std::cmp::Reverse(key.len())));
             for (key, _) in victims {
-                if count < MEMPOOL_MAX && bytes.saturating_add(encoded) <= MAX_MEMPOOL_BYTES { break; }
+                if fits(count, bytes) { break; }
                 plan.displaced.push(key.clone());
                 count = count.saturating_sub(1);
                 bytes = bytes.saturating_sub(key.len());
@@ -396,8 +538,14 @@ impl Engine {
         if bytes.saturating_add(encoded) > MAX_MEMPOOL_BYTES { return Err(Refusal::AtCapacity); }
         if source_count >= MEMPOOL_MAX_PER_SOURCE { return Err(Refusal::TooManyFromSource); }
         if count >= MEMPOOL_MAX {
+            // By tip. The reserved room does not make way for another kind,
+            // no forced envelope makes way for a DA batch, and forced
+            // envelopes compete among themselves.
+            let protected = |key: &Vec<u8>, tx: &PosTransaction| {
+                !incoming_forced && is_forced_envelope(tx) && (incoming_da || room.contains(key))
+            };
             let lowest = self.mempool.iter()
-                .filter(|(key, tx)| !plan.stale.contains(*key) && !(forced_protected && is_forced_envelope(tx)))
+                .filter(|(key, tx)| !plan.stale.contains(*key) && !plan.displaced.contains(*key) && !protected(key, tx))
                 .min_by_key(|(_, tx)| tx_tip_rate(tx));
             match lowest {
                 Some((key, tx)) if tx_tip_rate(incoming) > tx_tip_rate(tx) => plan.lower_fee = Some(key.clone()),
@@ -405,5 +553,31 @@ impl Engine {
             }
         }
         Ok(plan)
+    }
+
+    /// The pooled forced envelopes that hold the reserved room
+    /// ([`MEMPOOL_FORCED_RESERVED`]): backed against committed state, not in
+    /// `stale`, spending inputs no better-ranked one spends, best first by
+    /// tip and then by age. Unbacked envelopes and envelopes that re-spend one
+    /// output hold no room, so the room costs real surcharges to occupy.
+    pub(super) fn forced_room(&self, stale: &BTreeSet<Vec<u8>>, epoch: u64) -> BTreeSet<Vec<u8>> {
+        let queue = self.state.l2_settlement().and_then(|l2| l2.forced_queue());
+        let mut ranked: Vec<_> = self.mempool.iter()
+            .filter(|(key, tx)| is_forced_envelope(tx) && !stale.contains(*key)
+                && check_l2_funding(&self.state, queue, tx, key.len(), epoch).is_ok())
+            .collect();
+        ranked.sort_by_key(|(key, tx)| {
+            (std::cmp::Reverse(tx_tip_rate(tx)), self.mempool_admitted_at.get(*key).copied().unwrap_or(u64::MAX))
+        });
+        let mut spent = BTreeSet::new();
+        let mut room = BTreeSet::new();
+        for (key, tx) in ranked {
+            if room.len() == MEMPOOL_FORCED_RESERVED { break; }
+            let PosTransaction::L2ForcedTransaction(forced) = tx else { continue };
+            if forced.inputs.iter().any(|i| spent.contains(&(i.txid, i.vout))) { continue; }
+            spent.extend(forced.inputs.iter().map(|i| (i.txid, i.vout)));
+            room.insert(key.clone());
+        }
+        room
     }
 }
