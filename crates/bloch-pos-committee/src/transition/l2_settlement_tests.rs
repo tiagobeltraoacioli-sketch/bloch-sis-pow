@@ -3592,6 +3592,47 @@ mod l2_tests {
         assert!(l2.check_claim(700771, 2, &r2, s2, &wd::proof(&tree(&new), 2).unwrap(), false).is_ok());
     }
 
+    /// Review R308-7 (agent 308, round 15). The reset tells "a leaf the target
+    /// did not publish was paid" by index alone (`any_at_or_above(count)`).
+    /// Nothing on L1 checks that a tail root extends the target's tree
+    /// (`check_successor` compares counts and root equality only), and the
+    /// reset exists for a guest that settled what the rules do not give: such
+    /// a tail can rewrite a leaf BELOW the target's count. Here the forged
+    /// tree replaces the honest unclaimed leaf 1 (5 BLCH) by 9 BLCH to the
+    /// attacker and that leaf is paid. Expected: the plain reset refuses, as
+    /// its contract says, and after the forfeit reset the honest leaf 1 of the
+    /// kept target root is claimable.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn r308_7_a_forged_leaf_below_the_target_count_is_seen_by_the_reset() {
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let mut pre = attested_fixture(&honest, true);
+        let forged = [honest[0], ([0xee; 32], 9 * BLCH), ([3; 32], 5 * BLCH)];
+        let tree = |leaves: &[([u8; 32], u64)]| -> Vec<[u8; 32]> {
+            leaves.iter().enumerate().map(|(i, (r, s))| wd::leaf(700771, i as u64, r, *s)).collect()
+        };
+        {
+            let l2 = pre.l2_settlement.as_mut().unwrap();
+            l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: wd::root(&tree(&forged)), count: 3, height: 2 });
+            let bad = statement_at(l2, 2, wd::root(&tree(&forged)), 3);
+            l2.set_head_for_test([2; 32], bad, 1);
+        }
+        let post = try_claim(&pre, &claim_of(&pre, &forged, 1, None)).expect("the forged claim at an index below the target count pays");
+        let mut l2 = post.l2_settlement().unwrap().clone();
+        assert!(l2.claimed().contains(1));
+        assert_eq!(l2.released_sat(), u128::from(9 * BLCH));
+        let keep = statement_at(&l2, 1, wd::root(&tree(&honest)), 2);
+        let reset = mainnet::HeadReset { number: 1, commitment: [1; 32], statement: Some(leaked_hex(&keep)), forfeit: true };
+        let plain_applied = l2.clone().reset_head(&mainnet::HeadReset { forfeit: false, ..reset });
+        assert!(l2.reset_head(&reset));
+        let (r1, s1) = honest[1];
+        let honest_claim = l2.check_claim(700771, 1, &r1, s1, &wd::proof(&tree(&honest), 1).unwrap(), false);
+        assert!(
+            !plain_applied && honest_claim.is_ok(),
+            "plain reset applied over a paid forged leaf: {plain_applied}; honest leaf 1 of the kept root after the forfeit reset: {honest_claim:?}"
+        );
+    }
+
     #[test]
     fn a_reset_head_takes_the_next_settlement_under_the_new_program() {
         let (pre, mut chains) = fixture();

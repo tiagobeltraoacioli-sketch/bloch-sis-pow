@@ -646,6 +646,37 @@
         assert!(q.consumed_log().iter().all(|(n, _)| *n <= 6));
     }
 
+    /// Review R308-8 (agent 308, round 15). `reset_head` refuses when the
+    /// consumed log (1,024 records) no longer reaches the target, and the
+    /// program still moves. 74 settlements that each consume 14 forced
+    /// transfers (about 1,000 sat of surcharge each at the front of the queue)
+    /// put the target out of reach: whoever extends the bad tail, or ordinary
+    /// forced traffic over a day and a half, vetoes the rollback reset, the
+    /// forfeit form included. Expected: a compiled forfeit reset to the last
+    /// good block applies whatever the tail consumed.
+    #[test]
+    fn r308_8_forced_traffic_in_the_tail_cannot_veto_the_rollback_reset() {
+        let record = |i: u64| forced::Record { height: i, l1_txid: [i as u8; 32], envelope_hash: [0x5a; 32], gas_limit: 21_000 };
+        let mut l2 = state_with_bad_tail();
+        assert!(l2.enable_forced_inclusion_for_test());
+        // The bad tail runs from block 7 to block 80; block 6 is the last good one.
+        let bad = statement_at(&l2, 80, [0xbb; 32], 5);
+        l2.set_head_for_test([80; 32], bad, 7);
+        let q = l2.forced_queue_mut_for_test().unwrap();
+        let mut i = 0u64;
+        for n in 7..=80u64 {
+            for _ in 0..14 {
+                i += 1;
+                q.push(record(i)).unwrap();
+            }
+            q.consume_due(n);
+        }
+        assert_eq!(i, 74 * 14);
+        let keep = statement_at(&l2, 6, [0xbb; 32], 5);
+        let reset = mainnet::HeadReset { number: 6, commitment: [6; 32], statement: Some(leaked_hex(&keep)), forfeit: true };
+        assert!(l2.reset_head(&reset), "1,036 forced records consumed by the tail: the reset is refused and the head stays on the bad block");
+    }
+
     // ── Agent 215 (round 11): decided changes R3-R6 of review 164 ─────────
 
     fn record_n(i: u64, gas: u64) -> forced::Record {
