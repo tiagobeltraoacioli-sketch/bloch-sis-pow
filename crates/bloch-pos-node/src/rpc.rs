@@ -2940,6 +2940,57 @@ pub fn kes_json(state: &bloch_pos_committee::transition::CommittedState) -> Json
     ])
 }
 
+/// One entry of `getl2settlement.head_resets`.
+pub fn head_reset_json(report: &bloch_pos_committee::l2_settlement::HeadResetReport) -> Json {
+    use bloch_pos_committee::l2_settlement::HeadResetRefusal;
+    let (at_or_above_count, against_tail) = match &report.refusal {
+        Some(HeadResetRefusal::PaidBeyondTarget { at_or_above_count, against_tail }) => (*at_or_above_count, against_tail.as_slice()),
+        _ => (false, &[][..]),
+    };
+    Json::obj(vec![
+        ("gate", Json::s(report.gate.to_string())),
+        ("number", Json::u(report.number)),
+        ("forfeit", Json::Bool(report.forfeit)),
+        ("pending", Json::Bool(report.pending)),
+        ("would_apply", Json::Bool(report.refusal.is_none())),
+        ("refusal", report.refusal.as_ref().map_or(Json::Null, |why| Json::s(why.name().to_string()))),
+        // `paid_beyond_target` only: a claim at an index the target does not
+        // have, and the leaf indices paid against a record above the target
+        // (at most 64 listed; `paid_against_tail_count` is the whole number).
+        ("claimed_at_or_above_target_count", Json::Bool(at_or_above_count)),
+        ("paid_against_tail_count", Json::u(against_tail.len() as u64)),
+        ("paid_against_tail", Json::Arr(against_tail.iter().take(64).map(|index| Json::u(*index)).collect())),
+    ])
+}
+
+/// The node's log line when a block moved the L2 program and a compiled
+/// head reset ran with it (review R308-2P-4): a refused reset is not silent.
+pub fn head_reset_log_line(report: &bloch_pos_committee::l2_settlement::HeadResetReport, slot: u64) -> String {
+    use bloch_pos_committee::l2_settlement::HeadResetRefusal;
+    let form = if report.forfeit { "forfeit" } else { "plain" };
+    match &report.refusal {
+        None => format!(
+            "L2 head reset APPLIED at slot {slot} with the {} program change: head moved back to L2 block {} ({form} form)",
+            report.gate, report.number
+        ),
+        Some(why) => {
+            let detail = match why {
+                HeadResetRefusal::PaidBeyondTarget { at_or_above_count, against_tail } => format!(
+                    "; claim at or above the target's leaf count: {at_or_above_count}; leaves paid against the tail: {} (first indices {:?})",
+                    against_tail.len(),
+                    &against_tail[..against_tail.len().min(16)]
+                ),
+                _ => String::new(),
+            };
+            format!(
+                "CRITICAL: L2 head reset REFUSED at slot {slot} with the {} program change: the program moved and the settled head did NOT \
+                 move back to L2 block {} ({form} form); reason: {}{detail}",
+                report.gate, report.number, why.name()
+            )
+        }
+    }
+}
+
 pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedState) -> Json {
     l2_settlement_json_with(state, &|_, _| None)
 }
@@ -3126,6 +3177,18 @@ pub fn l2_settlement_json_with(
     // so the response keeps its exact fields while the gate is inert.
     if let (Json::Obj(fields), Some(queue)) = (&mut out, l2.forced_queue()) {
         fields.push(("forced".to_string(), l2_forced_json_with(queue, envelope)));
+    }
+    // The compiled head resets (one may ship with the swap, one with the
+    // rollback) and whether each would apply to this state NOW. Present only
+    // when the release compiles a reset, so the response keeps its exact
+    // fields otherwise. A refused reset leaves the head where it is while the
+    // program still moves, so read this before the gate: `would_apply: false`
+    // with `pending: true` means the gate will not move the head. After its
+    // gate (`pending: false`) an entry is only what a second run would do;
+    // the node logs the outcome at the gate (`head_reset_log_line`).
+    let resets = l2.head_reset_reports();
+    if let (Json::Obj(fields), false) = (&mut out, resets.is_empty()) {
+        fields.push(("head_resets".to_string(), Json::Arr(resets.iter().map(head_reset_json).collect())));
     }
     out
 }

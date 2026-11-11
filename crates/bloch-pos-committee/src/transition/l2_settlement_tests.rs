@@ -3824,23 +3824,101 @@ mod l2_tests {
     }
 
     /// Review R308-2P-3 (agent 308, second pass). After 92762a10 a plain
-    /// reset (`forfeit: false`, the form the fork's literals are compiled
-    /// with) refuses as soon as ANY claim was proven against a record above
-    /// the target, whatever leaf it paid. Here the tail is an honest
-    /// extension of the target's tree and the only claim is the target's own
-    /// leaf 0, proven against the newer root as any wallet would: nothing
-    /// left the escrow that the target does not owe, yet the reset refuses,
-    /// silently, while the program still moves. One small withdrawal claim
-    /// made during the 72 h between the release and the gate vetoes it.
-    /// Expected: a plain reset is not refused for a paid leaf that the
-    /// target's tree holds (or the form is not offered after the swap).
+    /// reset (`forfeit: false`) refuses as soon as ANY claim was proven
+    /// against a record above the target, whatever leaf it paid. Here the
+    /// tail is an honest extension of the target's tree and the only claim is
+    /// the target's own leaf 0, proven against the newer root as any wallet
+    /// would. L1 holds roots, not leaves, so it cannot tell that leaf from a
+    /// forged one and the plain form still refuses; the reviewer's test
+    /// asked that it apply. What changed with the fix is that the refusal is
+    /// no longer silent: it is readable before the gate (`head_reset_refusal`,
+    /// `head_reset_reports`: `getl2settlement.head_resets`) with the indices
+    /// that cause it, and reported when the program moves
+    /// (`head_reset_at_program_change`: the node's log). The forfeit form
+    /// applies.
     #[test]
-    fn r308_2p_3_one_honest_claim_against_a_newer_root_does_not_veto_the_plain_reset() {
+    fn r308_2p_3_one_honest_claim_against_a_newer_root_refuses_the_plain_reset_and_says_so() {
+        use crate::l2_settlement::{HeadResetRefusal, HeadResetReport};
         let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
         let extended = [honest[0], honest[1], ([3; 32], 5 * BLCH)];
         let (mut l2, chain) = next_program_with_tail(&honest, &extended);
+        let plain = reset_to_block_1(&l2, chain, &honest, false);
+        let forfeit = mainnet::HeadReset { forfeit: true, ..plain };
+        // Before the claim both forms apply, and the reports say so.
+        assert_eq!(l2.head_reset_refusal(&plain), None);
+        assert!(l2.clone().reset_head(&plain));
         pay(&mut l2, chain, &extended, 0).expect("the target's own leaf 0, proven against the newer root");
-        assert!(l2.reset_head(&reset_to_block_1(&l2, chain, &honest, false)), "the plain reset is refused");
+
+        let why = HeadResetRefusal::PaidBeyondTarget { at_or_above_count: false, against_tail: vec![0] };
+        assert_eq!(l2.head_reset_refusal(&plain), Some(why.clone()));
+        assert_eq!(why.name(), "paid_beyond_target");
+        assert_eq!(l2.head_reset_refusal(&forfeit), None);
+        // Read ahead of the gate: this L2 holds the next program, so the
+        // swap is behind it and the rollback ahead.
+        let reports = l2.head_reset_reports_for_test(Some(&forfeit), Some(&plain));
+        assert_eq!(reports, [
+            HeadResetReport { gate: HeadResetReport::NEXT_PROGRAM, number: 1, forfeit: true, pending: false, refusal: None },
+            HeadResetReport { gate: HeadResetReport::ROLLBACK, number: 1, forfeit: false, pending: true, refusal: Some(why.clone()) },
+        ]);
+        assert!(l2.head_reset_reports_for_test(None, None).is_empty(), "no compiled reset, nothing to report");
+        assert!(l2.head_reset_reports().is_empty(), "this release ships no reset");
+
+        // At the gate: the program moves, the head stays, and the change is reported with its reason.
+        let before = l2.clone();
+        let mut refused = l2.clone();
+        refused.install_fallback_with_for_test(&plain);
+        assert_eq!(refused.policy().identities[3..7], mainnet::PROGRAM_FALLBACK.identities);
+        assert_eq!(refused.settled_number(), 2, "the head stays on the tail");
+        assert_eq!(
+            refused.head_reset_at_program_change_for_test(&before, None, Some(&plain)),
+            Some(HeadResetReport { gate: HeadResetReport::ROLLBACK, number: 1, forfeit: false, pending: false, refusal: Some(why) })
+        );
+        assert_eq!(refused.head_reset_at_program_change_for_test(&before, None, None), None, "no reset compiled for the gate");
+        assert_eq!(before.head_reset_at_program_change_for_test(&before, None, Some(&plain)), None, "the program did not move");
+        // The forfeit form applies and is reported as applied.
+        let mut applied = l2.clone();
+        applied.install_fallback_with_for_test(&forfeit);
+        assert_eq!(applied.settled_number(), 1);
+        assert_eq!(
+            applied.head_reset_at_program_change_for_test(&before, None, Some(&forfeit)),
+            Some(HeadResetReport { gate: HeadResetReport::ROLLBACK, number: 1, forfeit: true, pending: false, refusal: None })
+        );
+        // The plain form itself is unchanged: still refused, state untouched.
+        assert!(!l2.reset_head(&plain));
+        assert_eq!(l2, before);
+    }
+
+    /// R308-2P-4: every way a reset is refused has a name, and the read-only
+    /// check agrees with the reset itself.
+    #[test]
+    fn r308_2p_4_every_refused_reset_names_its_reason() {
+        use crate::l2_settlement::HeadResetRefusal as R;
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let extended = [honest[0], honest[1], ([3; 32], 5 * BLCH)];
+        let (l2, chain) = next_program_with_tail(&honest, &extended);
+        let plain = reset_to_block_1(&l2, chain, &honest, false);
+        let refused = |l2: &crate::l2_settlement::State, reset: &mainnet::HeadReset, why: R| {
+            assert_eq!(l2.head_reset_refusal(reset), Some(why.clone()), "{}", why.name());
+            let mut after = l2.clone();
+            assert!(!after.reset_head(reset) && after == *l2, "{}", why.name());
+        };
+        refused(&l2, &mainnet::HeadReset { number: 2, ..plain }, R::HeadNotAbove);
+        refused(&l2, &mainnet::HeadReset { statement: None, ..plain }, R::Statement);
+        refused(&l2, &mainnet::HeadReset { statement: Some("zz"), ..plain }, R::Statement);
+        // A target tree with more leaves than the head's.
+        let more = [honest[0], honest[1], ([3; 32], 5 * BLCH), ([4; 32], BLCH)];
+        refused(&l2, &reset_to_block_1(&l2, chain, &more, false), R::Tree);
+        // A claim at an index the target does not have.
+        let mut beyond = l2.clone();
+        beyond.claimed_insert_for_test(2);
+        refused(&beyond, &plain, R::PaidBeyondTarget { at_or_above_count: true, against_tail: Vec::new() });
+        assert_eq!(beyond.head_reset_refusal(&mainnet::HeadReset { forfeit: true, ..plain }), None);
+        let names: std::collections::BTreeSet<_> =
+            [R::HeadNotAbove, R::Statement, R::Tree, R::PaidBeyondTarget { at_or_above_count: false, against_tail: Vec::new() }, R::Inbox, R::ForcedLog]
+                .iter().map(R::name).collect();
+        assert_eq!(names.len(), 6);
+        assert_eq!(l2.head_reset_refusal(&plain), None);
+        assert!(l2.clone().reset_head(&plain));
     }
 
     /// Review R308-2P-1 (agent 308, second pass). The state root commits the

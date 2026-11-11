@@ -2186,3 +2186,49 @@ fn l2_forced_due_records_carry_their_envelope() {
         assert_eq!(fields.iter().find(|(n, _)| n == "envelope").map(|(_, v)| v.clone()), Some(Json::Null));
     }
 }
+
+/// `getl2settlement.head_resets` (review R308-2P-3, R308-2P-4): a compiled
+/// head reset that would not apply says so, with the reason and the leaf
+/// indices behind it, and the node's line at the gate tells a refused reset
+/// from an applied one.
+#[test]
+fn head_reset_json_and_log_line_name_a_refused_reset() {
+    use bloch_pos_committee::l2_settlement::{HeadResetRefusal, HeadResetReport};
+    let field = |json: &Json, key: &str| json.get(key).cloned().unwrap_or_else(|| panic!("no {key}"));
+    let refused = HeadResetReport {
+        gate: HeadResetReport::NEXT_PROGRAM,
+        number: 41,
+        forfeit: false,
+        pending: true,
+        refusal: Some(HeadResetRefusal::PaidBeyondTarget { at_or_above_count: false, against_tail: vec![7, 9] }),
+    };
+    let json = head_reset_json(&refused);
+    let Json::Obj(fields) = &json else { panic!("not an object") };
+    let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, ["gate", "number", "forfeit", "pending", "would_apply", "refusal",
+        "claimed_at_or_above_target_count", "paid_against_tail_count", "paid_against_tail"]);
+    assert_eq!(field(&json, "gate"), Json::s("next_program"));
+    assert_eq!(field(&json, "number"), Json::u(41));
+    assert_eq!(field(&json, "pending"), Json::Bool(true));
+    assert_eq!(field(&json, "would_apply"), Json::Bool(false));
+    assert_eq!(field(&json, "refusal"), Json::s("paid_beyond_target"));
+    assert_eq!(field(&json, "paid_against_tail_count"), Json::u(2));
+    assert_eq!(field(&json, "paid_against_tail"), Json::Arr(vec![Json::u(7), Json::u(9)]));
+    let line = head_reset_log_line(&refused, 1_234);
+    assert!(line.starts_with("CRITICAL: L2 head reset REFUSED at slot 1234"), "{line}");
+    assert!(line.contains("did NOT move back to L2 block 41 (plain form)") && line.contains("reason: paid_beyond_target"), "{line}");
+    assert!(line.contains("leaves paid against the tail: 2 (first indices [7, 9])"), "{line}");
+
+    // Applied: no refusal, no alarm.
+    let applied = HeadResetReport { gate: HeadResetReport::ROLLBACK, number: 41, forfeit: true, pending: false, refusal: None };
+    let json = head_reset_json(&applied);
+    assert_eq!(field(&json, "would_apply"), Json::Bool(true));
+    assert_eq!(field(&json, "refusal"), Json::Null);
+    assert_eq!(field(&json, "paid_against_tail"), Json::Arr(Vec::new()));
+    let line = head_reset_log_line(&applied, 9);
+    assert!(line.starts_with("L2 head reset APPLIED at slot 9 with the rollback program change") && !line.contains("CRITICAL"), "{line}");
+    // Another reason carries no leaf detail.
+    let other = HeadResetReport { refusal: Some(HeadResetRefusal::ForcedLog), ..refused };
+    assert_eq!(field(&head_reset_json(&other), "refusal"), Json::s("forced_log"));
+    assert!(head_reset_log_line(&other, 1).ends_with("reason: forced_log"));
+}

@@ -2112,6 +2112,66 @@ impl Profile {
 /// Immutable network configuration, installed only by a new genesis constructor.
 /// The first seven hashes follow the V2 statement: native network/genesis,
 /// L2 domain/configuration, guest ELF, KoalaBear key and BN254 key.
+/// Why a head reset ([`mainnet::HeadReset`]) does not apply to a state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadResetRefusal {
+    /// The settled head is not above the target: nothing to reset.
+    HeadNotAbove,
+    /// The target's statement is missing, malformed, of another block or of another network.
+    Statement,
+    /// The target's withdrawal tree contradicts the head's or a retained record.
+    Tree,
+    /// A plain reset, and a leaf the target did not publish may have been
+    /// paid: a claim at an index at or above the target's count, or claims
+    /// proven against a record above the target (their leaf indices). L1
+    /// cannot tell whether such a leaf is also the target's, so ONE claim
+    /// proven against a newer root, honest or not, refuses the plain form.
+    /// The forfeit form is not refused for this.
+    PaidBeyondTarget { at_or_above_count: bool, against_tail: Vec<u64> },
+    /// The target consumed more deposits than the inbox holds.
+    Inbox,
+    /// A plain reset, and the consumed forced log does not reach the target.
+    ForcedLog,
+}
+impl HeadResetRefusal {
+    /// A stable name for RPC and logs.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::HeadNotAbove => "head_not_above_target",
+            Self::Statement => "statement",
+            Self::Tree => "withdrawal_tree",
+            Self::PaidBeyondTarget { .. } => "paid_beyond_target",
+            Self::Inbox => "inbox",
+            Self::ForcedLog => "forced_log",
+        }
+    }
+}
+/// A compiled head reset and what it does to one state (RPC and logs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadResetReport {
+    /// [`Self::NEXT_PROGRAM`] or [`Self::ROLLBACK`]: the gate it runs with.
+    pub gate: &'static str,
+    /// The last L2 block it keeps.
+    pub number: u64,
+    pub forfeit: bool,
+    /// Whether its gate is still ahead of the state.
+    pub pending: bool,
+    /// `None`: it applies (or applied). Otherwise why not.
+    pub refusal: Option<HeadResetRefusal>,
+}
+impl HeadResetReport {
+    pub const NEXT_PROGRAM: &'static str = "next_program";
+    pub const ROLLBACK: &'static str = "rollback";
+}
+/// What [`State::reset_head`] installs once every check passed.
+struct HeadResetPlan {
+    head: Option<([u8; 32], Vec<u8>)>,
+    consumed: u64,
+    root: [u8; 32],
+    count: u64,
+    tail_paid: Vec<u64>,
+    paid_beyond: bool,
+}
 #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -2474,6 +2534,9 @@ impl State {
     }
     /// A refused `reset` leaves the head where it is. The program still moves:
     /// the guest is replaced because it misbehaved, whatever the head can do.
+    /// Not silently: [`Self::head_reset_reports`] says before the gate whether
+    /// the compiled reset would apply, and the node logs the outcome at the
+    /// gate ([`Self::head_reset_at_program_change`]).
     fn install_fallback_with(&mut self, reset: Option<&mainnet::HeadReset>) {
         let Some(pinned) = mainnet::PROGRAM else { return };
         if self.policy.identities[2] == pinned.identities[2]
@@ -2536,41 +2599,75 @@ impl State {
     /// any). A plain reset is also refused when the consumed forced log does
     /// not reach the target; a forfeit reset never is.
     pub(crate) fn reset_head(&mut self, reset: &mainnet::HeadReset) -> bool {
+        let Ok(plan) = self.plan_head_reset(reset) else { return false };
+        if let Some(queue) = self.forced.as_mut() {
+            queue.requeue_logged_after(reset.number);
+        }
+        self.head = plan.head;
+        self.consumed = plan.consumed;
+        self.withdrawals.retain(|r| r.l2_number <= reset.number);
+        // Records are added only when the count grows, so the target's tree is
+        // the newest retained record exactly when retention did not prune it.
+        if plan.count > 0 && self.withdrawals.last().map(|r| (r.root, r.count)) != Some((plan.root, plan.count)) {
+            self.withdrawals.push(withdrawal::Record { l2_number: reset.number, root: plan.root, count: plan.count, height: self.native_height });
+        }
+        if plan.paid_beyond {
+            self.claimed.forget_at_or_above(plan.count);
+            // Below the target's count as well: the index is claimable again,
+            // by any leaf but the ones already paid ([`Self::check_claim`]).
+            for index in &plan.tail_paid {
+                self.claimed.forget(*index);
+            }
+        }
+        true
+    }
+    /// Why `reset` would not apply to this state now; `None` when it would.
+    /// Read-only: the same checks [`Self::reset_head`] runs (RPC, logs, tools).
+    pub fn head_reset_refusal(&self, reset: &mainnet::HeadReset) -> Option<HeadResetRefusal> {
+        self.plan_head_reset(reset).err()
+    }
+    /// Every check of [`Self::reset_head`], without touching the state.
+    fn plan_head_reset(&self, reset: &mainnet::HeadReset) -> Result<HeadResetPlan, HeadResetRefusal> {
+        use HeadResetRefusal as R;
         if self.settled_number() <= reset.number {
-            return false;
+            return Err(R::HeadNotAbove);
         }
         let (head, consumed) = match reset.statement {
             None if reset.number == 0 => (None, 0),
             Some(text) => {
-                let Some(statement) = mainnet::unhex(text.trim()) else { return false };
+                let Some(statement) = mainnet::unhex(text.trim()) else { return Err(R::Statement) };
                 if StatementVersion::of(&statement) != Some(StatementVersion::V3)
                     || n(&statement, S + 264) != reset.number
                     || (0..3).any(|i| h(&statement, S + i * 32) != self.policy.identities[i])
                 {
-                    return false;
+                    return Err(R::Statement);
                 }
                 let consumed = n(&statement, S + 528);
                 (Some((reset.commitment, statement)), consumed)
             }
-            None => return false,
+            None => return Err(R::Statement),
         };
         let (root, count) = withdrawal::tree_after(head.as_ref().map(|(_, s): &([u8; 32], Vec<u8>)| s.as_slice()));
-        // The target's tree is recorded again below, so it must not contradict
+        // The target's tree is recorded again by the reset, so it must not contradict
         // what L1 accepted: the tail only extends it, and a retained record at or
         // below the target never has more leaves, nor another root at the same count.
         if count > self.withdrawal_head().1
             || self.withdrawals.iter().any(|r| r.l2_number <= reset.number && (r.count > count || (r.count == count && r.root != root)))
         {
-            return false;
+            return Err(R::Tree);
         }
         // A claim may have paid a leaf the target did not publish: at an
         // index the target does not have, or (from the swap on, where the
         // paid leaves are recorded) proven against a root of the tail, which
         // nothing ties to the target's tree at any index.
         let tail_paid = self.paid.proven_above(reset.number);
-        let paid_beyond = self.claimed.any_at_or_above(count) || !tail_paid.is_empty();
-        if (paid_beyond && !reset.forfeit) || consumed > self.inbox.len() as u64 {
-            return false;
+        let at_or_above_count = self.claimed.any_at_or_above(count);
+        let paid_beyond = at_or_above_count || !tail_paid.is_empty();
+        if paid_beyond && !reset.forfeit {
+            return Err(R::PaidBeyondTarget { at_or_above_count, against_tail: tail_paid });
+        }
+        if consumed > self.inbox.len() as u64 {
+            return Err(R::Inbox);
         }
         // Forced records consumed after the target go back into the queue, as
         // the deposit cursor goes back. A plain reset the consumed log cannot
@@ -2578,28 +2675,68 @@ impl State {
         // A forfeit reset is not bounded by what the tail consumed: it puts
         // back what the log still has (review R308-8).
         if !reset.forfeit && self.forced.as_ref().is_some_and(|q| !q.covers_reset_to(reset.number)) {
-            return false;
+            return Err(R::ForcedLog);
         }
-        if let Some(queue) = self.forced.as_mut() {
-            queue.requeue_logged_after(reset.number);
+        Ok(HeadResetPlan { head, consumed, root, count, tail_paid, paid_beyond })
+    }
+    /// The compiled head resets of this L2 ([`mainnet::HEAD_RESET`] with the
+    /// swap, [`mainnet::ROLLBACK_HEAD_RESET`] with the rollback) and whether
+    /// each would apply to this state now. Empty when the release ships no
+    /// reset and on any other L2. Not a consensus input: an operator reads it
+    /// before the gate, because a refused reset leaves the head where it is
+    /// while the program still moves (review R308-2P-3, R308-2P-4).
+    pub fn head_reset_reports(&self) -> Vec<HeadResetReport> {
+        self.head_reset_reports_with(mainnet::HEAD_RESET.as_ref(), mainnet::ROLLBACK_HEAD_RESET.as_ref())
+    }
+    fn head_reset_reports_with(&self, swap: Option<&mainnet::HeadReset>, rollback: Option<&mainnet::HeadReset>) -> Vec<HeadResetReport> {
+        let Some(pinned) = mainnet::PROGRAM else { return Vec::new() };
+        if self.policy.identities[2] != pinned.identities[2] {
+            return Vec::new();
         }
-        self.head = head;
-        self.consumed = consumed;
-        self.withdrawals.retain(|r| r.l2_number <= reset.number);
-        // Records are added only when the count grows, so the target's tree is
-        // the newest retained record exactly when retention did not prune it.
-        if count > 0 && self.withdrawals.last().map(|r| (r.root, r.count)) != Some((root, count)) {
-            self.withdrawals.push(withdrawal::Record { l2_number: reset.number, root, count, height: self.native_height });
+        let activated = self.policy.identities[3..7] == pinned.identities[3..7] && self.policy.proof_policy == pinned.proof_policy;
+        let swapped = self.policy.identities[3..7] == mainnet::PROGRAM_NEXT.identities
+            && self.policy.proof_policy == mainnet::PROGRAM_NEXT.proof_policy;
+        let report = |gate, pending, reset: &mainnet::HeadReset| HeadResetReport {
+            gate,
+            number: reset.number,
+            forfeit: reset.forfeit,
+            pending,
+            refusal: self.head_reset_refusal(reset),
+        };
+        swap.map(|reset| report(HeadResetReport::NEXT_PROGRAM, activated, reset))
+            .into_iter()
+            .chain(rollback.map(|reset| report(HeadResetReport::ROLLBACK, activated || swapped, reset)))
+            .collect()
+    }
+    /// The compiled head reset that ran when the program moved from the one
+    /// `before` holds to the one `self` holds, with why it was refused (if it
+    /// was): `before` is the state the gate found. `None` when the program
+    /// did not move or the release ships no reset for that gate. For the
+    /// node's log at the gate; not a consensus input.
+    pub fn head_reset_at_program_change(&self, before: &State) -> Option<HeadResetReport> {
+        self.head_reset_at_program_change_with(before, mainnet::HEAD_RESET.as_ref(), mainnet::ROLLBACK_HEAD_RESET.as_ref())
+    }
+    fn head_reset_at_program_change_with(
+        &self,
+        before: &State,
+        swap: Option<&mainnet::HeadReset>,
+        rollback: Option<&mainnet::HeadReset>,
+    ) -> Option<HeadResetReport> {
+        let (was, now) = (&before.policy.identities[3..7], &self.policy.identities[3..7]);
+        if was == now {
+            return None;
         }
-        if paid_beyond {
-            self.claimed.forget_at_or_above(count);
-            // Below the target's count as well: the index is claimable again,
-            // by any leaf but the ones already paid ([`Self::check_claim`]).
-            for index in tail_paid {
-                self.claimed.forget(index);
-            }
-        }
-        true
+        // The rollback's gate is never before the swap's, so a state that
+        // holds the fallback program after one transition ran the swap's
+        // reset first only if it held the pinned program before.
+        let (gate, reset) = if now == mainnet::PROGRAM_NEXT.identities {
+            (HeadResetReport::NEXT_PROGRAM, swap?)
+        } else if now == mainnet::PROGRAM_FALLBACK.identities && was == mainnet::PROGRAM_NEXT.identities {
+            (HeadResetReport::ROLLBACK, rollback?)
+        } else {
+            return None;
+        };
+        Some(HeadResetReport { gate, number: reset.number, forfeit: reset.forfeit, pending: false, refusal: before.head_reset_refusal(reset) })
     }
     fn replace_program(&mut self, next: &mainnet::NextProgram) {
         self.policy.identities[3..7].copy_from_slice(&next.identities);
@@ -2609,6 +2746,21 @@ impl State {
     #[cfg(test)]
     pub(crate) fn install_fallback_with_for_test(&mut self, reset: &mainnet::HeadReset) {
         self.install_fallback_with(Some(reset));
+    }
+    /// Test hook: the reports with resets other than the compiled ones.
+    #[cfg(test)]
+    pub(crate) fn head_reset_reports_for_test(&self, swap: Option<&mainnet::HeadReset>, rollback: Option<&mainnet::HeadReset>) -> Vec<HeadResetReport> {
+        self.head_reset_reports_with(swap, rollback)
+    }
+    /// Test hook: the report at a program change with resets other than the compiled ones.
+    #[cfg(test)]
+    pub(crate) fn head_reset_at_program_change_for_test(
+        &self,
+        before: &State,
+        swap: Option<&mainnet::HeadReset>,
+        rollback: Option<&mainnet::HeadReset>,
+    ) -> Option<HeadResetReport> {
+        self.head_reset_at_program_change_with(before, swap, rollback)
     }
     /// Test hook: the schedule under gates other than the compiled ones.
     #[cfg(test)]

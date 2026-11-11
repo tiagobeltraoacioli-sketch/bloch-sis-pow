@@ -5232,6 +5232,13 @@ impl Engine {
             .apply_block(&self.state, &envelope, &env.body.attestations, &txs)
         {
             Ok(post) => {
+                // A compiled L2 head reset that ran with a program change in
+                // this block is logged, applied or refused (node log only).
+                if let (Some(was), Some(now)) = (self.state.l2_settlement(), post.l2_settlement()) {
+                    if let Some(report) = now.head_reset_at_program_change(was) {
+                        eprintln!("{}", rpc::head_reset_log_line(&report, env.header.slot));
+                    }
+                }
                 self.state.set(post);
                 // Snapshot for the reorg path. Free: this is the state that
                 // was just built, kept by handle, not copied.
