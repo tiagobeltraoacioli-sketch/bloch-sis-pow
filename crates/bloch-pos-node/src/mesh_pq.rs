@@ -636,11 +636,22 @@ impl Opener {
 /// What a connection runs on after the handshake step. `peer` is the
 /// identity the peer proved it holds; the pin and the allow-list, if any,
 /// have already been applied to it. With neither configured it is whatever
-/// key the peer chose to present.
+/// key the peer chose to present, and `authenticated` is false: the session
+/// is encrypted, but the peer is no more proven than a plain one (review
+/// CRY-7).
 #[cfg_attr(not(test), allow(dead_code))]
 pub enum Session {
     Plain,
-    Sealed { sealer: Sealer, opener: Opener, peer: PeerId },
+    Sealed { sealer: Sealer, opener: Opener, peer: PeerId, authenticated: bool },
+}
+
+impl Session {
+    /// True only for a sealed session whose peer identity was checked
+    /// against an allow-list or a pin. A handshake under a key generated a
+    /// moment ago is not that.
+    pub fn authenticated(&self) -> bool {
+        matches!(self, Session::Sealed { authenticated: true, .. })
+    }
 }
 
 // ── Handshake ───────────────────────────────────────────────────────────────
@@ -765,7 +776,7 @@ pub fn handshake_outbound(sock: &mut TcpStream, sec: &MeshSecurity, dialed: &str
     let remaining = deadline.checked_duration_since(Instant::now()).unwrap_or_default();
     sock.set_write_timeout(Some(remaining.max(Duration::from_millis(1))))?;
     sealer.write_record(sock, &[&mine])?;
-    Ok(Session::Sealed { sealer, opener, peer })
+    Ok(Session::Sealed { sealer, opener, peer, authenticated: sec.checks_identities() })
 }
 
 /// Wait until four bytes are readable without consuming them, or `deadline`.
@@ -846,7 +857,7 @@ pub fn handshake_inbound(sock: &mut TcpStream, sec: &MeshSecurity) -> io::Result
     let theirs = opener.read_auth_record(sock, deadline)?;
     let peer = check_auth(&theirs, &h, CTX_INITIATOR)?;
     sec.admit(&peer, None)?;
-    Ok(Session::Sealed { sealer, opener, peer })
+    Ok(Session::Sealed { sealer, opener, peer, authenticated: sec.checks_identities() })
 }
 
 #[cfg(test)]
@@ -894,8 +905,8 @@ mod tests {
         let a = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
         let b = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
         let (cli, srv) = pair(a.clone(), b.clone());
-        let (Session::Sealed { sealer: mut cs, opener: mut co, peer: cp }, mut csock) = cli.unwrap() else { panic!("client not sealed") };
-        let (Session::Sealed { sealer: mut ss, opener: mut so, peer: sp }, mut ssock) = srv.unwrap() else { panic!("server not sealed") };
+        let (Session::Sealed { sealer: mut cs, opener: mut co, peer: cp, .. }, mut csock) = cli.unwrap() else { panic!("client not sealed") };
+        let (Session::Sealed { sealer: mut ss, opener: mut so, peer: sp, .. }, mut ssock) = srv.unwrap() else { panic!("server not sealed") };
         assert_eq!(cp, b.identity_id().unwrap());
         assert_eq!(sp, a.identity_id().unwrap());
         cs.write_record(&mut csock, &[&[0x02], b"attestation"]).unwrap();
@@ -996,6 +1007,24 @@ mod tests {
         std::fs::write(dir.join(IDENTITY_FILE), b"nope").unwrap();
         assert!(MeshSecurity::load(Mode::Offer, NET, &dir, None, &[], &[], false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review CRY-7: only a session whose peer identity was checked counts
+    /// as authenticated. Encryption-only `require` (no allow-list, no pins)
+    /// seals the session and proves nothing about the peer.
+    #[test]
+    fn only_a_checked_identity_makes_a_session_authenticated() {
+        let a = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
+        let b = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
+        let (cli, srv) = pair(a.clone(), b);
+        assert!(!cli.unwrap().0.authenticated(), "no allow-list, no pin: encryption only");
+        assert!(!srv.unwrap().0.authenticated());
+        assert!(!Session::Plain.authenticated());
+
+        let gate = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, Some(HashSet::from([a.identity_id().unwrap()]))));
+        let (cli, srv) = pair(a, gate);
+        assert!(srv.unwrap().0.authenticated(), "the listed identity was checked");
+        assert!(!cli.unwrap().0.authenticated(), "the dialer checked nothing");
     }
 
     /// Review CRY-8: the identity record has one valid length. A peer that
