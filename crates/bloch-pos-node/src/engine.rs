@@ -11302,6 +11302,7 @@ mod transfer_v2_end_to_end {
             PosTransaction::L2DataAvailability(t) => (&t.funding_pubkey, &t.inputs[0], t.tx_bytes, t.tip_millisat_per_gas, t.change.value),
             PosTransaction::L2Deposit(t) => (&t.funding_pubkey, &t.inputs[0], t.tx_bytes, t.tip_millisat_per_gas,
                 t.change.value + t.amount_sat + deposit_fee),
+            PosTransaction::L2WithdrawClaim(t) => (&t.funding_pubkey, &t.inputs[0], t.tx_bytes, t.tip_millisat_per_gas, t.change.value),
             other => panic!("not a funded L2 fixture: {other:?}"),
         };
         let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, bytes, base_fee, tip);
@@ -11915,6 +11916,129 @@ mod transfer_v2_end_to_end {
         let check = |tx: &PosTransaction| check_l2_funding(&node.state, None, tx, tx.canonical_bytes().len(), epoch);
         assert!(check(&inside).is_ok(), "the last block of the window is backed");
         assert!(check(&beyond).is_err(), "a batch for block settled + WINDOW + 1 is backed although consensus refuses its number");
+    }
+
+    /// R308-3P-1, the window and the duplicate rule on their own
+    /// (`admission::check_da_recordable`), with a settled mark above zero.
+    /// Negative cases: the first and the last block of the window pass, and a
+    /// recorded block is still open to another commitment and a recorded
+    /// commitment to another block, as in `record_data_availability`.
+    #[test]
+    fn r308_3p_1_a_da_batch_repeating_a_recorded_commitment_is_not_backed() {
+        use super::admission::check_da_recordable;
+        use bloch_pos_committee::l2_settlement::da;
+        let settled = 10u64;
+        let records = [
+            da::Record { l2_number: 12, commitment: [0xa1; 32], height: 5 },
+            da::Record { l2_number: 13, commitment: [0xa2; 32], height: 6 },
+        ];
+        let check = |number: u64, commitment: [u8; 32]| check_da_recordable(settled, &records, number, || commitment);
+        assert!(matches!(check(settled, [1; 32]), Err(Refusal::StateDependent(_))), "the settled block");
+        assert!(check(settled + 1, [1; 32]).is_ok(), "the first unsettled block");
+        assert!(check(settled + da::WINDOW, [1; 32]).is_ok(), "the last block of the window");
+        assert!(matches!(check(settled + da::WINDOW + 1, [1; 32]), Err(Refusal::StateDependent(_))), "one beyond the window");
+        assert!(matches!(check(u64::MAX, [1; 32]), Err(Refusal::StateDependent(_))), "far beyond the window");
+        assert!(check_da_recordable(u64::MAX - 1, &[], u64::MAX, || [1; 32]).is_ok(), "the window's end saturates like consensus'");
+
+        assert_eq!(
+            check(12, [0xa1; 32]),
+            Err(Refusal::StateDependent("L2 data availability repeats a recorded commitment")),
+            "the recorded commitment of block 12, again"
+        );
+        assert!(check(12, [0xa3; 32]).is_ok(), "another commitment for a recorded block is recorded too");
+        assert!(check(14, [0xa1; 32]).is_ok(), "a recorded commitment under another block number is not a repeat");
+        assert!(check(13, [0xa1; 32]).is_ok(), "block 13 holds another commitment");
+        // A block without a record is decided without computing the commitment.
+        assert!(check_da_recordable(settled, &records, 14, || panic!("not asked")).is_ok());
+    }
+
+    /// A funded, well-formed withdrawal claim of leaf `index` for the test L2,
+    /// with an all-zero proof (it folds to no root a settlement recorded).
+    fn withdraw_claim(key_byte: u8, index: u64, release_sat: u64) -> PosTransaction {
+        use bloch_pos_committee::transition::{FundingInput, L2WithdrawClaim};
+        let mut claim = L2WithdrawClaim {
+            network_domain: L2_TEST_NETWORK,
+            funding_pubkey: vec![key_byte; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES],
+            inputs: vec![FundingInput { txid: [key_byte; 32], vout: 0 }],
+            l2_chain_id: L2_TEST_CHAIN,
+            index,
+            l1_recipient: [0x77; 32],
+            // The least consensus accepts (`MIN_L2_DEPOSIT_SAT`).
+            sats: 1_000_000,
+            siblings: [[0; 32]; bloch_pos_committee::l2_settlement::withdrawal::TREE_DEPTH],
+            release: TransferOutput { value: release_sat, script_hash: [0x77; 32] },
+            change: TransferOutput { value: 1, script_hash: [key_byte; 32] },
+            tx_bytes: 0,
+            tip_millisat_per_gas: 3,
+            attestation: None,
+            signature: vec![9; 64],
+        };
+        claim.tx_bytes = claim.canonical_bytes().len() as u64;
+        PosTransaction::L2WithdrawClaim(claim)
+    }
+
+    /// R308-3P-1, the claim part. A withdrawal claim that is funded exactly
+    /// but that consensus refuses on state (here: no
+    /// withdrawal root is recorded, so its proof folds to nothing retained;
+    /// without user transactions consensus refuses every claim) was backed:
+    /// never included, never spending its input, outbid by no transfer.
+    /// Expected: it is not backed, and the refusal is retryable. The funding
+    /// itself is shown sound: the same claim with one sat more of change is
+    /// refused for conservation, before the state question is asked.
+    #[test]
+    fn r308_3p_1_a_claim_consensus_refuses_on_state_is_not_backed() {
+        use super::admission::check_l2_funding;
+        use bloch_pos_committee::transition::L2WithdrawClaimReject as R;
+        let epoch = V2_FLAG_DAY + 1;
+        let blank = engine_at_wall_epoch_on(Some(L2_TEST_NETWORK), epoch, &[]);
+        let claim = withdraw_claim(0x61, 0, blank.state.l2_claim_release_sat(1_000_000));
+        let PosTransaction::L2WithdrawClaim(inner) = &claim else { unreachable!() };
+        assert!(inner.validate_shape().is_ok(), "the fixture is a claim consensus can read");
+        let node = engine_backing_with_l2(epoch, std::slice::from_ref(&claim));
+        let check = |tx: &PosTransaction| check_l2_funding(&node.state, None, tx, tx.canonical_bytes().len(), epoch);
+
+        let refusal = node.state.l2_withdraw_claim_refusal(inner);
+        if bloch_pos_committee::l2_settlement::USER_TRANSACTIONS_ENABLED {
+            assert_eq!(refusal, Some(R::Proof), "funded and well formed: consensus refuses it for its proof only");
+            assert_eq!(
+                check(&claim),
+                Err(Refusal::StateDependent("L2 withdrawal claim proves against no retained withdrawal root")),
+                "a funded claim against no retained root is backed although consensus refuses it"
+            );
+        } else {
+            assert_eq!(refusal, Some(R::NotActive));
+            assert!(matches!(check(&claim), Err(Refusal::StateDependent(_))), "a funded claim consensus refuses is backed");
+        }
+
+        let mut unbalanced = claim.clone();
+        if let PosTransaction::L2WithdrawClaim(c) = &mut unbalanced { c.change.value += 1; }
+        assert_eq!(
+            check(&unbalanced),
+            Err(Refusal::StateDependent("L2 funding value is not conserved at the current base fee")),
+            "the funding answer comes first and keeps its reason"
+        );
+    }
+
+    /// R308-3P-1, negative cases of the claim rule
+    /// (`admission::check_claim_applicable`): a claim consensus does not
+    /// refuse stays backed, a conservation answer is left to the funding
+    /// check (it is priced for the next block's epoch there), and every state
+    /// refusal is retryable, never a verdict on the bytes.
+    #[test]
+    fn r308_3p_1_a_claim_consensus_applies_stays_backed() {
+        use super::admission::check_claim_applicable;
+        use bloch_pos_committee::transition::L2WithdrawClaimReject as R;
+        assert_eq!(check_claim_applicable(None), Ok(()), "consensus applies it");
+        assert_eq!(check_claim_applicable(Some(R::Conservation)), Ok(()), "decided by the funding check");
+        for refused in [
+            R::NotActive, R::AlreadyClaimed, R::Proof, R::Index, R::NotMatured, R::NotFinalized, R::RateLimited,
+            R::Escrow, R::AttestationRequired, R::Attestation, R::ReleaseOutput, R::MissingInput, R::OutputCollision,
+        ] {
+            assert!(
+                matches!(check_claim_applicable(Some(refused)), Err(Refusal::StateDependent(_))),
+                "{refused:?} is a refusal against a state"
+            );
+        }
     }
 
     /// F-9: which commitments win the scarce slots is re-drawn from the

@@ -391,7 +391,9 @@ pub(super) fn check_l2_applicable(network: Option<[u8; 32]>, chain: Option<u64>,
 /// tip and gas ceilings, the funding inputs present in committed state and
 /// owned by the funding key, and value conserved at the current base fee. A
 /// forced envelope must also offer at least the current entry price of
-/// `queue`, and a DA batch must be for an L2 block that is not settled yet.
+/// `queue`, a DA batch must be one consensus would record
+/// ([`check_da_recordable`]) and a withdrawal claim one consensus would apply
+/// on this state ([`check_claim_applicable`], review R308-3P-1).
 /// Without it these kinds entered the pool on a signature alone with any
 /// claimed tip, and eviction at capacity is by claimed tip. An entry that
 /// stops passing is dropped under capacity pressure (`candidate_is_backed`).
@@ -406,11 +408,7 @@ pub(super) fn check_l2_funding(
     let l2 = state.l2_settlement();
     check_l2_applicable(state.admission_network_domain(), l2.map(|l2| l2.policy().chain_id), tx)?;
     if let (PosTransaction::L2DataAvailability(batch), Some(l2)) = (tx, l2) {
-        // Consensus records DA only above the settled block; a batch at or
-        // below it can no longer apply (a head reset may lower the mark).
-        if batch.l2_block_number <= l2.settled_number() {
-            return Err(Refusal::StateDependent("L2 data availability names a block that is already settled"));
-        }
+        check_da_recordable(l2.settled_number(), l2.data_availability(), batch.l2_block_number, || batch.commitment())?;
     }
     // (funding key, inputs, declared bytes, tip, value owed besides the fees)
     let (pubkey, inputs, declared, tip, owed) = match tx {
@@ -494,7 +492,76 @@ pub(super) fn check_l2_funding(
             "L2 funding value is not conserved at the current base fee",
         ));
     }
+    if let PosTransaction::L2WithdrawClaim(claim) = tx {
+        // Last: the funding answers above keep their own reasons.
+        check_claim_applicable(state.l2_withdraw_claim_refusal(claim))?;
+    }
     Ok(())
+}
+
+/// Whether consensus would record a DA batch for L2 block `number` with this
+/// commitment (review R308-3P-1): the number and duplicate refusals of
+/// `L2State::record_data_availability`, on the committed state's settled
+/// mark and DA records. Consensus records DA only for the next
+/// [`da::WINDOW`] unsettled blocks and only once per (block, commitment); a
+/// funded batch outside that is never included and never spends its output.
+/// The window moves with the settled mark (a head reset may lower it), so
+/// both number refusals are state dependent. A full record list is not
+/// mirrored: `da::MAX_RECORDS` is the per-block cap times the retention plus
+/// one block, so expiry keeps the list below it.
+///
+/// [`da::WINDOW`]: bloch_pos_committee::l2_settlement::da::WINDOW
+pub(super) fn check_da_recordable(
+    settled: u64,
+    records: &[bloch_pos_committee::l2_settlement::da::Record],
+    number: u64,
+    commitment: impl FnOnce() -> [u8; 32],
+) -> Result<(), Refusal> {
+    use bloch_pos_committee::l2_settlement::da;
+    if number <= settled {
+        return Err(Refusal::StateDependent("L2 data availability names a block that is already settled"));
+    }
+    if number > settled.saturating_add(da::WINDOW) {
+        return Err(Refusal::StateDependent("L2 data availability names a block beyond the unsettled window"));
+    }
+    if records.iter().any(|r| r.l2_number == number) {
+        let commitment = commitment();
+        if records.iter().any(|r| r.l2_number == number && r.commitment == commitment) {
+            return Err(Refusal::StateDependent("L2 data availability repeats a recorded commitment"));
+        }
+    }
+    Ok(())
+}
+
+/// A withdrawal claim is backed only if consensus would apply it on the
+/// committed state (review R308-3P-1). `refusal` is what
+/// `CommittedState::l2_withdraw_claim_refusal` answers: the state checks of
+/// `apply_l2_withdraw_claim` up to the signatures (index already claimed,
+/// proof against no retained root, root not matured or not final, release
+/// window used up, attestation missing, ...). A funded claim that fails one
+/// is never included and never spends its inputs. All of them are verdicts
+/// against a state, so the refusal is retryable.
+///
+/// `Conservation` is left to [`check_l2_funding`]: that refusal is priced
+/// with the state's own epoch, the funding check with the epoch of the next
+/// block, and the two differ on the first block of a byte-target flag day.
+pub(super) fn check_claim_applicable(
+    refusal: Option<bloch_pos_committee::transition::L2WithdrawClaimReject>,
+) -> Result<(), Refusal> {
+    use bloch_pos_committee::transition::L2WithdrawClaimReject as R;
+    Err(Refusal::StateDependent(match refusal {
+        None | Some(R::Conservation) => return Ok(()),
+        Some(R::AlreadyClaimed) => "L2 withdrawal claim names a leaf that is already claimed",
+        Some(R::Proof) => "L2 withdrawal claim proves against no retained withdrawal root",
+        Some(R::Index) => "L2 withdrawal claim names an index its withdrawal root does not hold",
+        Some(R::NotMatured) => "L2 withdrawal claim proves against a root younger than the withdrawal delay",
+        Some(R::NotFinalized) => "L2 withdrawal claim proves against a settlement that is not final yet",
+        Some(R::RateLimited) => "L2 withdrawal claim exceeds what the release window has left",
+        Some(R::Escrow) => "L2 withdrawal claim exceeds the escrow",
+        Some(R::AttestationRequired) => "L2 withdrawal claim needs the attestors' co-signature",
+        Some(R::Attestation) => "L2 withdrawal claim carries an attestation of another set",
+        Some(_) => "L2 withdrawal claim is refused by consensus on the committed state",
+    }))
 }
 
 /// Transactional capacity plan; callers commit it only after authenticating the
