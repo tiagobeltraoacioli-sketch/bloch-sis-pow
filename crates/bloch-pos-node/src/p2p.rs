@@ -3281,6 +3281,30 @@ mod tests {
         assert_eq!(lim.tracked(), 0, "a disconnected peer's bucket is never released");
     }
 
+    #[test]
+    fn the_swarm_loop_charges_sync_answers_to_the_connection_source() {
+        // W3-3 (V2-4): the limiter test below passes if the swarm loop
+        // hands it no source. `serve_sync` needs a libp2p `ResponseChannel`,
+        // which only a live swarm can make, so this reads the three call
+        // sites the fix depends on.
+        let source = include_str!("p2p.rs");
+        let start = source.find("fn handle_swarm_event(").expect("swarm event handler");
+        let end = source[start..].find("\nfn serve_sync(").map(|o| start + o).expect("serve_sync");
+        let handler = &source[start..end];
+        let request = handler.find("request_response::Message::Request { request_id, request, channel } => {").expect("request arm");
+        let arm = &handler[request..];
+        let arm = &arm[..arm.find("request_response::Message::Response").expect("end of the request arm")];
+        assert!(arm.contains("let source = st.inbound_sources.charged_source(&connection_id);"), "{arm}");
+        assert!(arm.contains("serve_sync(st, resp_tx.clone(), peer, source, request_id, request, channel);"), "{arm}");
+        let timeout = handler.find("if matches!(error, request_response::InboundFailure::Timeout) {").expect("unread answer");
+        let arm = &handler[timeout..];
+        let arm = &arm[..arm.find("finish_sync_answer(").expect("end of the timeout arm")];
+        assert!(arm.contains("st.sync_limiter.note_unread(permit, Instant::now());"), "{arm}");
+        let serve = &source[end..];
+        let serve = &serve[..serve.find("\n}\n").expect("end of serve_sync")];
+        assert!(serve.contains("st.sync_limiter.begin_from(peer, source, Instant::now())"), "serve_sync must admit by source");
+    }
+
     /// P2P-1: the in-flight slot is held until the answer is WRITTEN or has
     /// FAILED, not until it is built. Before this, the swarm loop released
     /// the permit and then handed the answer to libp2p, where it waits for

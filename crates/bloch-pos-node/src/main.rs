@@ -206,6 +206,33 @@ mod essential_thread_tests {
         assert!(joined.is_err());
         assert_eq!(PANICKED.load(Ordering::SeqCst), 1);
     }
+
+    /// W3-3 (GATE-08): the test above covers the drop guard with an injected
+    /// action. A panic cannot be injected into the swarm thread or the event
+    /// forwarder, and the abort is compiled out of the test binary, so this
+    /// reads the three places the fix lives in: both threads hold the guard
+    /// from their first statement, and the production action aborts.
+    #[test]
+    fn both_essential_threads_hold_the_guard_and_the_production_action_aborts() {
+        let p2p = include_str!("p2p.rs");
+        let spawn = p2p.find("std::thread::Builder::new().name(\"bloch-p2p\".into()).spawn(move || {").expect("swarm thread");
+        let guard = p2p.find("let _essential = crate::EssentialThread::new(\"bloch-p2p\");").expect("swarm thread guard");
+        let runtime = p2p[spawn..].find("tokio::runtime::Builder::new_current_thread()").map(|o| spawn + o).expect("swarm runtime");
+        assert!(spawn < guard && guard < runtime, "the swarm thread must hold the guard before it builds its runtime");
+
+        let engine = include_str!("engine.rs");
+        let guard = engine.find("let _essential = crate::EssentialThread::new(\"net-event-forwarder\");").expect("forwarder guard");
+        let work = engine[guard..].find("for ev in net_rx {").expect("forwarder loop after the guard");
+        assert!(work < 200, "the forwarder must hold the guard right before its loop");
+        let spawn = engine[..guard].rfind("std::thread::spawn(move || {").expect("forwarder thread");
+        assert!(!engine[spawn..guard].contains("net_rx"), "the forwarder reads events before it holds the guard");
+
+        let main = include_str!("main.rs");
+        assert!(main.contains("Self { name, on_panic: abort_for_essential_thread }"));
+        let action = main.find("fn abort_for_essential_thread(name: &'static str) {").expect("fatal action");
+        let body = &main[action..action + main[action..].find("\n}\n").expect("end of the action")];
+        assert!(body.contains("    #[cfg(not(test))]\n    std::process::abort();"), "the production action must abort");
+    }
 }
 
 fn main() {
