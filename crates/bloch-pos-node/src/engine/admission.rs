@@ -18,6 +18,10 @@ pub(super) const MAX_MEMPOOL_BYTES: usize = 16 * 1024 * 1024;
 /// kind whatever its tip. Outside the room a forced envelope competes by tip
 /// like any entry and the registered DA key may displace it, so forced
 /// envelopes cannot be used to hold the pool either (review R308-1, R308-2).
+/// Backed includes applicable: an envelope for another network or L2 chain,
+/// or of a shape consensus refuses, is refused at admission and holds no
+/// room, and a copy re-spending a pooled envelope's output displaces nothing
+/// (review R308-2P-2).
 /// A DA batch of any other key still never evicts a forced envelope: the
 /// sequencer that is being bypassed is the party that sends DA.
 /// No forced envelope exists before `L2_FORCED_INCLUSION_EPOCH`, so nothing
@@ -345,14 +349,49 @@ pub(super) fn check_transfer(
     Ok(())
 }
 
+/// Whether an L2 transaction can apply on this network at all (review
+/// R308-2P-2): signed for this network's domain, naming this L2's chain id
+/// (the kinds that carry one), and of a shape consensus accepts
+/// (`validate_shape`). `network` is the committed state's admission domain
+/// and `chain` the installed L2 policy's chain id; without an installed L2
+/// no kind is admitted (`l2_admission_refusal`), so no chain is compared.
+///
+/// Node policy, a mirror of the first refusals of `apply_l2_*`. A funded
+/// transaction for another network or chain is never included and never
+/// spends its inputs, so without this it stayed "backed" for ever.
+pub(super) fn check_l2_applicable(network: Option<[u8; 32]>, chain: Option<u64>, tx: &PosTransaction) -> Result<(), Refusal> {
+    let (domain, named, shaped) = match tx {
+        PosTransaction::L2Deposit(tx) => (tx.network_domain, None, tx.validate_shape().is_ok()),
+        PosTransaction::L2DataAvailability(tx) => (tx.network_domain, Some(tx.l2_chain_id), tx.validate_shape().is_ok()),
+        PosTransaction::L2WithdrawClaim(tx) => (tx.network_domain, Some(tx.l2_chain_id), tx.validate_shape().is_ok()),
+        PosTransaction::L2ForcedTransaction(tx) => (tx.network_domain, Some(tx.l2_chain_id), tx.validate_shape().is_ok()),
+        _ => return Ok(()),
+    };
+    if network != Some(domain) {
+        return Err(Refusal::Invalid("L2 transaction is signed for another network"));
+    }
+    if let (Some(here), Some(named)) = (chain, named) {
+        if here != named {
+            return Err(Refusal::Invalid("L2 transaction names another L2 chain"));
+        }
+    }
+    if !shaped {
+        return Err(Refusal::Invalid("L2 transaction has a shape consensus refuses"));
+    }
+    Ok(())
+}
+
 /// The backing of the L2 kinds that spend funding inputs (deposit 0x14, DA
 /// batch 0x15, withdrawal claim, forced envelope 0x1C), checked before the
 /// signature like [`check_transfer`] does for transfers (review R308-3).
+/// Backed means applicable, not only funded (review R308-2P-2).
 ///
-/// Node policy, a mirror of what `apply_l2_*` checks in consensus: the tip
-/// and gas ceilings, the funding inputs present in committed state and owned
-/// by the funding key, and value conserved at the current base fee. A forced
-/// envelope must also offer at least the current entry price of `queue`.
+/// Node policy, a mirror of what `apply_l2_*` checks in consensus: this
+/// network, this L2 chain and a valid shape ([`check_l2_applicable`]), the
+/// tip and gas ceilings, the funding inputs present in committed state and
+/// owned by the funding key, and value conserved at the current base fee. A
+/// forced envelope must also offer at least the current entry price of
+/// `queue`, and a DA batch must be for an L2 block that is not settled yet.
 /// Without it these kinds entered the pool on a signature alone with any
 /// claimed tip, and eviction at capacity is by claimed tip. An entry that
 /// stops passing is dropped under capacity pressure (`candidate_is_backed`).
@@ -364,6 +403,15 @@ pub(super) fn check_l2_funding(
     epoch: u64,
 ) -> Result<(), Refusal> {
     use bloch_pos_committee::l2_settlement::forced;
+    let l2 = state.l2_settlement();
+    check_l2_applicable(state.admission_network_domain(), l2.map(|l2| l2.policy().chain_id), tx)?;
+    if let (PosTransaction::L2DataAvailability(batch), Some(l2)) = (tx, l2) {
+        // Consensus records DA only above the settled block; a batch at or
+        // below it can no longer apply (a head reset may lower the mark).
+        if batch.l2_block_number <= l2.settled_number() {
+            return Err(Refusal::StateDependent("L2 data availability names a block that is already settled"));
+        }
+    }
     // (funding key, inputs, declared bytes, tip, value owed besides the fees)
     let (pubkey, inputs, declared, tip, owed) = match tx {
         PosTransaction::L2Deposit(tx) => (
@@ -522,8 +570,11 @@ impl Engine {
         // their tip (it carries none by design). The caller has checked its
         // backing (`check_transfer`) before planning. The registered DA key's
         // batches are left alone: they would only displace their way back.
+        // A copy that re-spends an output a pooled forced envelope already
+        // spends displaces nothing (one displacement per funding output,
+        // review R308-2P-2): only one of them can ever apply.
         if incoming_forced && source_count < MEMPOOL_MAX_PER_SOURCE && !fits(count, bytes)
-            && room.len() < MEMPOOL_FORCED_RESERVED {
+            && room.len() < MEMPOOL_FORCED_RESERVED && !self.respends_a_pooled_forced_input(incoming, &plan.stale) {
             let mut victims: Vec<_> = self.mempool.iter()
                 .filter(|(key, tx)| !plan.stale.contains(*key) && !is_forced_envelope(tx) && !is_reserved_da(tx, reserved))
                 .collect();
@@ -553,6 +604,17 @@ impl Engine {
             }
         }
         Ok(plan)
+    }
+
+    /// Whether a pooled forced envelope outside `stale` already spends one
+    /// of the funding inputs of the forced envelope `incoming`.
+    fn respends_a_pooled_forced_input(&self, incoming: &PosTransaction, stale: &BTreeSet<Vec<u8>>) -> bool {
+        let PosTransaction::L2ForcedTransaction(incoming) = incoming else { return false };
+        let inputs: BTreeSet<_> = incoming.inputs.iter().map(|i| (i.txid, i.vout)).collect();
+        self.mempool.iter().any(|(key, tx)| {
+            !stale.contains(key)
+                && matches!(tx, PosTransaction::L2ForcedTransaction(f) if f.inputs.iter().any(|i| inputs.contains(&(i.txid, i.vout))))
+        })
     }
 
     /// The pooled forced envelopes that hold the reserved room

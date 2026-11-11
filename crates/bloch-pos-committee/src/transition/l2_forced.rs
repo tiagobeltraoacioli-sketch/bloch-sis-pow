@@ -194,7 +194,8 @@ impl L2ForcedTransaction {
         })
     }
 
-    fn validate_shape(&self) -> Result<(), L2ForcedTransactionReject> {
+    /// State-free checks (also run at the mempool door).
+    pub fn validate_shape(&self) -> Result<(), L2ForcedTransactionReject> {
         use L2ForcedTransactionReject as R;
         if self.funding_pubkey.len() != ADMISSION_PQ_KEY_BYTES
             || self.signature.is_empty()

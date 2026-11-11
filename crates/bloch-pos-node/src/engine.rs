@@ -10749,6 +10749,16 @@ mod transfer_v2_end_to_end {
     /// at least that
     /// (+2 slots of margin so the epoch cannot regress mid-test).
     fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
+        engine_at_wall_epoch_on(None, epochs_past, entries)
+    }
+
+    /// The network domain the L2 fixtures of this module are signed for.
+    const L2_TEST_NETWORK: [u8; 32] = [0x91; 32];
+    /// The L2 chain id the L2 fixtures of this module name.
+    const L2_TEST_CHAIN: u64 = 700_770;
+
+    /// [`engine_at_wall_epoch`] with the committed state bound to `network`.
+    fn engine_at_wall_epoch_on(network: Option<[u8; 32]>, epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
         let slot_ms = 500u64;
         let back_ms = epochs_past
             .saturating_mul(SLOTS_PER_EPOCH)
@@ -10769,22 +10779,18 @@ mod transfer_v2_end_to_end {
         // `CommittedState::genesis` directly rather than
         // `manifest.genesis_state()`: the opening balances are the test's
         // fixture, not a carryover snapshot with a commitment to honour.
-        let state = CommittedState::genesis(
-            genesis_id,
-            GENESIS_MIX,
-            &[],
-            &[],
-            [0u8; 32],
-            [0u8; 32],
-            [0u8; 32],
-            EvmCommitment {
-                account_root: [0u8; 32],
-                receipts_root: [0u8; 32],
-                gas_used: 0,
-                base_fee_per_gas: 0,
-            },
-            entries,
-        );
+        let evm = EvmCommitment {
+            account_root: [0u8; 32],
+            receipts_root: [0u8; 32],
+            gas_used: 0,
+            base_fee_per_gas: 0,
+        };
+        let state = match network {
+            None => CommittedState::genesis(genesis_id, GENESIS_MIX, &[], &[], [0u8; 32], [0u8; 32], [0u8; 32], evm, entries),
+            Some(network) => CommittedState::genesis_with_network_domain(
+                network, genesis_id, GENESIS_MIX, &[], &[], [0u8; 32], [0u8; 32], [0u8; 32], evm, entries,
+            ),
+        };
         // Unique throwaway data dir per engine — two engines in one test
         // must never share a store.
         static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -11300,7 +11306,30 @@ mod transfer_v2_end_to_end {
     fn engine_backing(epoch: u64, backed: &[PosTransaction]) -> Engine {
         let base_fee = engine_at_wall_epoch(epoch, &[]).state.next_base_fee_at(epoch);
         let entries: Vec<_> = backed.iter().map(|tx| l2_backing(base_fee, tx, 0)).collect();
-        engine_at_wall_epoch(epoch, &entries)
+        engine_at_wall_epoch_on(Some(L2_TEST_NETWORK), epoch, &entries)
+    }
+
+    /// [`engine_backing`] with an L2 of chain `L2_TEST_CHAIN` installed at
+    /// genesis, so the chain id and the settled mark are there to compare.
+    fn engine_backing_with_l2(epoch: u64, backed: &[PosTransaction]) -> Engine {
+        use bloch_pos_committee::l2_settlement::Policy;
+        let mut node = engine_backing(epoch, backed);
+        let genesis = *node.chain[0].1.as_bytes();
+        let policy = Policy {
+            identities: std::array::from_fn(|i| match i {
+                0 => L2_TEST_NETWORK,
+                1 => genesis,
+                _ => [i as u8 + 1; 32],
+            }),
+            proof_policy: [0x0b; 32],
+            chain_id: L2_TEST_CHAIN,
+            initial_l2_parent: [0x0c; 32],
+            initial_l2_state: [0x0d; 32],
+            attestor_set: [0; 32],
+        };
+        let state = (*node.state).clone().configure_l2_genesis(policy).expect("an L2 at genesis");
+        node.state.set(state);
+        node
     }
 
     fn is_forced(tx: &PosTransaction) -> bool { matches!(tx, PosTransaction::L2ForcedTransaction(_)) }
@@ -11603,7 +11632,8 @@ mod transfer_v2_end_to_end {
             network_domain: [0x91; 32],
             funding_pubkey: key,
             inputs: vec![FundingInput { txid: [0x51; 32], vout: 0 }],
-            amount_sat: 50_000,
+            // The least consensus accepts (`MIN_L2_DEPOSIT_SAT`).
+            amount_sat: 1_000_000,
             recipient: [7; 20],
             change: TransferOutput { value: 1, script_hash: [0x51; 32] },
             tx_bytes: 0,
@@ -11615,7 +11645,7 @@ mod transfer_v2_end_to_end {
         if let PosTransaction::L2DataAvailability(b) = &mut batch { b.tx_bytes = b.canonical_bytes().len() as u64; }
         let txs = [PosTransaction::L2Deposit(deposit), batch, forced_envelope_tx(0x53, 1, 3)];
 
-        let blank = engine_at_wall_epoch(epoch, &[]);
+        let blank = engine_at_wall_epoch_on(Some(L2_TEST_NETWORK), epoch, &[]);
         let base_fee = blank.state.next_base_fee_at(epoch);
         let entries: Vec<_> = txs.iter().map(|tx| {
             let fee = match tx {
@@ -11624,7 +11654,7 @@ mod transfer_v2_end_to_end {
             };
             l2_backing(base_fee, tx, fee)
         }).collect();
-        let node = engine_at_wall_epoch(epoch, &entries);
+        let node = engine_at_wall_epoch_on(Some(L2_TEST_NETWORK), epoch, &entries);
         let check = |node: &Engine, tx: &PosTransaction| check_l2_funding(&node.state, None, tx, tx.canonical_bytes().len(), epoch);
         let with = |tx: &PosTransaction, edit: &dyn Fn(&mut u128, &mut u64, &mut Vec<FundingInput>, &mut Vec<u8>, &mut u64)| {
             let mut tx = tx.clone();
@@ -11735,6 +11765,123 @@ mod transfer_v2_end_to_end {
             !both && room <= 1,
             "envelopes for two different networks and L2 chains are both backed ({both}) and hold {room} places of the reserved room"
         );
+    }
+
+    /// R308-2P-2, each rule alone: an L2 deposit, DA batch or forced envelope
+    /// is applicable only when signed for this network, naming this L2 chain
+    /// (the kinds that carry a chain id) and of a shape consensus accepts.
+    /// Each refusal is shown against the same transaction passing.
+    #[test]
+    fn r308_2p_2_network_chain_and_shape_each_refuse_alone() {
+        use super::admission::check_l2_applicable;
+        use bloch_pos_committee::transition::{FundingInput, L2Deposit};
+        let mut deposit = L2Deposit {
+            network_domain: L2_TEST_NETWORK,
+            funding_pubkey: vec![0x51; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES],
+            inputs: vec![FundingInput { txid: [0x51; 32], vout: 0 }],
+            // The least consensus accepts (`MIN_L2_DEPOSIT_SAT`).
+            amount_sat: 1_000_000,
+            recipient: [7; 20],
+            change: TransferOutput { value: 1, script_hash: [0x51; 32] },
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+            signature: vec![9; 64],
+        };
+        deposit.tx_bytes = deposit.canonical_bytes().len() as u64;
+        let mut batch = da_batch(0x52, 1, 0);
+        if let PosTransaction::L2DataAvailability(b) = &mut batch { b.tx_bytes = b.canonical_bytes().len() as u64; }
+        let txs = [PosTransaction::L2Deposit(deposit), batch, forced_envelope_tx(0x53, 1, 0)];
+        let here = |tx: &PosTransaction| check_l2_applicable(Some(L2_TEST_NETWORK), Some(L2_TEST_CHAIN), tx);
+        let invalid = |verdict: Result<(), Refusal>| matches!(verdict, Err(Refusal::Invalid(_)));
+        for tx in &txs {
+            assert!(here(tx).is_ok(), "applicable here: {tx:?}");
+            // Another network, and a state bound to no network at all.
+            assert!(invalid(check_l2_applicable(Some([0xde; 32]), Some(L2_TEST_CHAIN), tx)), "another network");
+            assert!(invalid(check_l2_applicable(None, Some(L2_TEST_CHAIN), tx)), "no network domain");
+            // Another chain: only the kinds that name one.
+            let elsewhere = check_l2_applicable(Some(L2_TEST_NETWORK), Some(L2_TEST_CHAIN + 1), tx);
+            assert_eq!(invalid(elsewhere), !matches!(tx, PosTransaction::L2Deposit(_)), "another L2 chain: {tx:?}");
+            // No L2 installed: no chain to compare (the kind is refused by `l2_admission_refusal`).
+            assert!(check_l2_applicable(Some(L2_TEST_NETWORK), None, tx).is_ok());
+            // Shape: funding inputs out of order.
+            let mut unordered = tx.clone();
+            match &mut unordered {
+                PosTransaction::L2Deposit(t) => t.inputs.insert(0, FundingInput { txid: [0xff; 32], vout: 0 }),
+                PosTransaction::L2DataAvailability(t) => t.inputs.insert(0, FundingInput { txid: [0xff; 32], vout: 0 }),
+                PosTransaction::L2ForcedTransaction(t) => t.inputs.insert(0, FundingInput { txid: [0xff; 32], vout: 0 }),
+                other => panic!("{other:?}"),
+            }
+            assert!(invalid(here(&unordered)), "funding inputs out of order");
+        }
+        // Shape, per kind: a zero recipient, a payload that is not one batch, an empty envelope.
+        let mut shapeless = txs.clone();
+        if let PosTransaction::L2Deposit(t) = &mut shapeless[0] { t.recipient = [0; 20]; }
+        if let PosTransaction::L2DataAvailability(t) = &mut shapeless[1] { t.payload.clear(); }
+        if let PosTransaction::L2ForcedTransaction(t) = &mut shapeless[2] { t.envelope.clear(); }
+        for tx in &shapeless {
+            assert!(invalid(here(tx)), "shape: {tx:?}");
+        }
+    }
+
+    /// R308-2P-2 against a state with an L2 installed: `check_l2_funding`
+    /// takes the chain id from the L2 policy, and a DA batch for a block at
+    /// or below the settled mark is not backed (consensus refuses it too).
+    #[test]
+    fn r308_2p_2_backing_reads_the_chain_and_the_settled_mark_of_the_installed_l2() {
+        use super::admission::check_l2_funding;
+        let epoch = V2_FLAG_DAY + 1;
+        let envelope = forced_envelope_tx(0x30, 0, 0);
+        let mut other_chain = forced_envelope_tx(0x31, 0, 0);
+        if let PosTransaction::L2ForcedTransaction(f) = &mut other_chain { f.l2_chain_id = L2_TEST_CHAIN + 1; }
+        let mut batch = da_batch(0x32, 1, 0);
+        let mut settled = da_batch(0x33, 0, 0);
+        for tx in [&mut batch, &mut settled] {
+            if let PosTransaction::L2DataAvailability(b) = tx { b.tx_bytes = b.canonical_bytes().len() as u64; }
+        }
+        let txs = [envelope.clone(), other_chain.clone(), batch.clone(), settled.clone()];
+        let node = engine_backing_with_l2(epoch, &txs);
+        let l2 = node.state.l2_settlement().expect("installed");
+        assert_eq!((l2.policy().chain_id, l2.settled_number()), (L2_TEST_CHAIN, 0));
+        let check = |node: &Engine, tx: &PosTransaction| check_l2_funding(&node.state, None, tx, tx.canonical_bytes().len(), epoch);
+        assert!(check(&node, &envelope).is_ok());
+        assert!(matches!(check(&node, &other_chain), Err(Refusal::Invalid(_))), "an envelope for another L2 chain");
+        assert!(check(&node, &batch).is_ok());
+        assert!(matches!(check(&node, &settled), Err(Refusal::StateDependent(_))), "a batch for a settled block");
+        // Without an installed L2 the same two are funded and nothing else is compared.
+        let bare = engine_backing(epoch, &txs);
+        assert!(check(&bare, &other_chain).is_ok() && check(&bare, &settled).is_ok());
+    }
+
+    /// R308-2P-2 in the pool: a copy that re-spends the output of a pooled
+    /// envelope displaces nothing (one displacement per funding output),
+    /// while an envelope spending an output of its own still takes a place;
+    /// and a pooled envelope signed for another network is not backed and
+    /// holds no room (`candidate_is_backed` drops it as stale under capacity
+    /// pressure wherever forced inclusion is active).
+    #[test]
+    fn r308_2p_2_foreign_envelopes_hold_no_room_and_respending_copies_displace_nothing() {
+        use super::admission::check_l2_funding;
+        let epoch = V2_FLAG_DAY + 1;
+        let mut node = pool_with_forced_and_da(epoch, 1);
+        let pooled = forced_envelope_tx(0x30, 0, 0);
+        assert!(node.mempool.contains_key(&pooled.canonical_bytes()));
+        assert_eq!(node.forced_room(&BTreeSet::new(), epoch).len(), 1);
+        let mut copy = pooled.clone();
+        if let PosTransaction::L2ForcedTransaction(f) = &mut copy { f.change.script_hash = [0x77; 32]; }
+        assert!(matches!(node.plan_mempool_capacity(&copy, copy.canonical_bytes().len(), epoch), Err(Refusal::AtCapacity)),
+            "a copy re-spending a pooled envelope's output displaces nothing");
+        let fresh = forced_envelope_tx(0x20, 1, 0);
+        let plan = node.plan_mempool_capacity(&fresh, fresh.canonical_bytes().len(), epoch).expect("an output of its own");
+        assert_eq!(plan.displaced.len(), 1);
+
+        // The pooled envelope is now one signed for another network.
+        node.mempool.remove(&pooled.canonical_bytes());
+        let mut foreign = pooled.clone();
+        if let PosTransaction::L2ForcedTransaction(f) = &mut foreign { f.network_domain = [0xde; 32]; }
+        node.mempool.insert(foreign.canonical_bytes(), foreign.clone());
+        assert_eq!(node.mempool.len(), MEMPOOL_MAX);
+        assert!(matches!(check_l2_funding(&node.state, None, &foreign, foreign.canonical_bytes().len(), epoch), Err(Refusal::Invalid(_))));
+        assert!(node.forced_room(&BTreeSet::new(), epoch).is_empty(), "it holds no room");
     }
 
     /// F-9: which commitments win the scarce slots is re-drawn from the
