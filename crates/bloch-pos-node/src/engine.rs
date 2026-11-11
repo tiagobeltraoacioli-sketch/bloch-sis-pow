@@ -965,10 +965,30 @@ type ReorgAnchor = (usize, [u8; 32], Arc<CommittedState>);
 /// its block id at its height, so a stale entry can cost speed and never
 /// correctness: a block's post-state is a pure function of the block and its
 /// ancestry (see [`Engine::recent_states`]).
+///
+/// After a boot that restored the state cache none of the cached prefix was
+/// applied, so both are seeded by the restore instead (PER-4): `pending`
+/// with the restored state, `base` from the anchor generation kept on disk
+/// next to the cache. See `engine/local_cache.rs`.
 #[derive(Default)]
 struct ReorgAnchors {
     base: Option<ReorgAnchor>,
     pending: Option<ReorgAnchor>,
+    /// Which state-cache generations on disk this process wrote, so one of
+    /// them can be kept as the anchor generation (PER-4).
+    cached: CachedGenerations,
+}
+
+/// The `(canonical height, block id)` of the state-cache generations this
+/// process wrote: `state.cache`, `state.cache.previous` and
+/// `state.cache.anchor.next`. `None` for a file left by an earlier run,
+/// which is never moved because its block cannot be checked against the
+/// chain without decoding it.
+#[derive(Clone, Copy, Default)]
+struct CachedGenerations {
+    current: Option<(usize, [u8; 32])>,
+    previous: Option<(usize, [u8; 32])>,
+    waiting: Option<(usize, [u8; 32])>,
 }
 
 /// Released finalized bodies after which [`return_freed_heap_to_os`] runs.
@@ -5890,7 +5910,8 @@ impl Engine {
             // Free when taken: the live state, kept by handle.
             pending = Some((head, *self.head_id().as_bytes(), self.state.arc()));
         }
-        self.reorg_anchors = ReorgAnchors { base, pending };
+        self.reorg_anchors.base = base;
+        self.reorg_anchors.pending = pending;
     }
 
     /// The highest retained anchor at canonical height `cut` or below that is
@@ -8014,6 +8035,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
     if skipped == 0 || n_logged > 0 {
         if let Err(e) = engine.write_local_cache() {
             eprintln!("state-cache: initial write failed; next restart may require full replay: {e}");
+        }
+    }
+    // PER-4: a boot that replayed the whole log holds a base reorg anchor in
+    // memory and none on disk until several cache generations have been
+    // written. Write it now, so an early second restart has one.
+    if skipped == 0 {
+        if let Err(e) = engine.seed_anchor_generation() {
+            eprintln!("state-cache: reorg anchor generation not written; a restart may come up without one: {e}");
         }
     }
 
