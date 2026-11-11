@@ -9127,30 +9127,6 @@ fn relay_spend_reference_check(pubkey: &[u8], signing_root: &[u8; 32], signature
         || bloch_crypto::crypto::verify_pinned(pubkey, signing_root, signature)
 }
 
-/// A fresh [`HybridVerifier`] under the node relay policy, for the admission
-/// arms that verify a self-contained (budget-free) hybrid authorization.
-fn strict_relay_hybrid() -> impl SignatureVerifier {
-    struct Owned(HybridVerifier);
-    impl SignatureVerifier for Owned {
-        fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
-            self.0.verify_with_key(pk, root, sig) && bloch_crypto::crypto::verify_pinned(pk, root, sig)
-        }
-        fn verify_l2_settlement(&self, p: &[u8; 32], pr: &[u8; 32], v: &[u8], pf: &[u8]) -> bool {
-            self.0.verify_l2_settlement(p, pr, v, pf)
-        }
-        fn verify_with_key_under(&self, policy: bloch_pos_committee::SignaturePolicy, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
-            self.0.verify_with_key_under(policy, pk, root, sig) && relay_reference_check(policy, pk, root, sig)
-        }
-        fn verify_spend_at_epoch(&self, pk: &[u8], root: &[u8; 32], sig: &[u8], epoch: u64) -> bool {
-            self.0.verify_spend_at_epoch(pk, root, sig, epoch) && relay_spend_reference_check(pk, root, sig)
-        }
-        fn verify_kes_leaf(&self, leaf_pk: &[u8], message: &[u8; 32], sig: &[u8]) -> bool {
-            self.0.verify_kes_leaf(leaf_pk, message, sig)
-        }
-    }
-    Owned(HybridVerifier::new())
-}
-
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     admissible_with_verifier(tx, wall_epoch, &HybridVerifier::new())
 }
@@ -9191,38 +9167,49 @@ fn admissible_with_network_verifier(
         // Whether the network's L2 admits DA, claims and deposits is a state
         // question (the installed L2's profile), answered at the stateful door
         // by `l2_admission_refusal`; here only shape and signatures.
+        //
+        // The signatures go through the caller's `verifier` (review EXE-3):
+        // on the gossip and RPC path that is the per-source budgeted one, so
+        // each hybrid verification below draws one unit of the sender's
+        // allowance and a failure is charged to the sender, exactly as for a
+        // transfer. A version-2 claim therefore weighs one unit plus one per
+        // attestor signature. These arms used to build a private, unmetered
+        // verifier.
         PosTransaction::L2DataAvailability(batch) => {
             // Shape and payload are rechecked in consensus; refuse the
             // obviously unusable batch before the signature.
             if bloch_pos_committee::l2_settlement::da::batch_count(&batch.payload).is_none() {
                 return Err("L2 data availability payload is not one canonical batch");
             }
-            if strict_relay_hybrid().verify_with_key(&batch.funding_pubkey, &batch.intent_root(), &batch.signature) {
+            if verifier.verify_with_key(&batch.funding_pubkey, &batch.intent_root(), &batch.signature) {
                 Ok(())
             } else {
                 Err("invalid L2 data availability hybrid PQ authorization")
             }
         }
         PosTransaction::L2WithdrawClaim(claim) => {
-            // The proof, maturity, nullifier and escrow are state checks and
-            // run in consensus; refuse a malformed claim before the signature.
+            // The proof, maturity, nullifier and escrow are state checks:
+            // `admission::check_transfer` ran them (and compared the
+            // attestor set with the policy's) before this; refuse a
+            // malformed claim before the signature.
             if claim.validate_shape().is_err() {
                 return Err("L2 withdrawal claim has an invalid shape or release output");
             }
-            if !strict_relay_hybrid().verify_with_key(&claim.funding_pubkey, &claim.intent_root(), &claim.signature) {
+            if !verifier.verify_with_key(&claim.funding_pubkey, &claim.intent_root(), &claim.signature) {
                 return Err("invalid L2 withdrawal claim hybrid PQ authorization");
             }
             // The attestors sign the root the proof folds to, so their
             // signatures check here without state; only "is this the
             // policy's set" waits for consensus.
-            if !claim.verify_attestation(&strict_relay_hybrid()) {
+            if !claim.verify_attestation(verifier) {
                 return Err("invalid L2 withdrawal claim attestation");
             }
             Ok(())
         }
         PosTransaction::L2Deposit(deposit) => {
-            // State checks (inputs, ownership, conservation) run in consensus.
-            if strict_relay_hybrid().verify_with_key(&deposit.funding_pubkey, &deposit.intent_root(), &deposit.signature) {
+            // State checks (inputs, ownership, conservation) ran in
+            // `admission::check_transfer`, before this signature.
+            if verifier.verify_with_key(&deposit.funding_pubkey, &deposit.intent_root(), &deposit.signature) {
                 Ok(())
             } else {
                 Err("invalid L2 deposit hybrid PQ authorization")

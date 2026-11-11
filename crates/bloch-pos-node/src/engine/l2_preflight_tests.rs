@@ -315,4 +315,43 @@ mod funded_l2_transactions {
         assert_eq!(node.state.l2_settlement().unwrap().escrow_sat(), u128::from(MIN_L2_DEPOSIT_SAT));
     }
 
+    /// EXE-3: the funding signature of an L2 transaction is verified under
+    /// the sender's allowance. Deposits that pass the state preflight but
+    /// carry a bad signature are charged to their source, which is shed once
+    /// its failure allowance is spent; another source is unaffected.
+    #[test]
+    fn l2_funding_signatures_draw_on_the_senders_allowance() {
+        let _clock = validator_lifecycle::clock_at(3);
+        let funds = funds_of(1);
+        let (mut node, _dir) = engine(&funds);
+        let slot = node.wall_slot();
+        let point = (funds[0].txid, funds[0].vout);
+        let forged = |node: &Engine, recipient: u8| {
+            let mut tx = deposit(node, OWNER, point, Some(funds[0].value), recipient);
+            tx.signature[0] ^= 1;
+            PosTransaction::L2Deposit(tx)
+        };
+        let noisy = Some([0xD1; 32]);
+        let before = node.gossip_verifier.budget_used_at(slot);
+        for i in 0..GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT {
+            assert_eq!(
+                node.on_transaction_from(forged(&node, 1 + i as u8), noisy),
+                Err(Refusal::Invalid("invalid L2 deposit hybrid PQ authorization")),
+            );
+        }
+        let spent = before + GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT;
+        assert_eq!(node.gossip_verifier.budget_used_at(slot), spent, "one unit per verification");
+        for i in 0..4u8 {
+            assert_eq!(
+                node.on_transaction_from(forged(&node, 0x80 + i), noisy),
+                Err(Refusal::GossipVerificationLimited { until_slot: slot + 1 }),
+            );
+        }
+        assert_eq!(node.gossip_verifier.budget_used_at(slot), spent, "no verification ran for a shed source");
+        // Another source still has its own allowance, and a valid deposit
+        // from it is admitted.
+        let valid = PosTransaction::L2Deposit(deposit(&node, OWNER, point, Some(funds[0].value), 0x42));
+        assert_eq!(node.on_transaction_from(valid, Some([0xD2; 32])), Ok(Admitted::New));
+        assert_eq!(node.gossip_verifier.budget_used_at(slot), spent + 1);
+    }
 }
