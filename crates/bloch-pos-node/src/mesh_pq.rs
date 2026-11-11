@@ -430,6 +430,9 @@ impl MeshSecurity {
     /// `dialed` is the `--peers` address for an outbound connection and
     /// `None` for an inbound one.
     ///
+    /// - This node's own identity is never a peer (review CRY-9): a dial
+    ///   turned back to its own listener would otherwise complete on both
+    ///   ends wherever the fleet shares one allow-list that names every node.
     /// - A pinned dialed address admits exactly its pin, nothing else.
     /// - Otherwise, with an allow-list or any pin configured, the identity
     ///   must be listed or be one of the pinned identities.
@@ -438,6 +441,12 @@ impl MeshSecurity {
     ///   [`Self::warnings`]).
     fn admit(&self, id: &PeerId, dialed: Option<&str>) -> io::Result<()> {
         let denied = |why: String| Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
+        if self.identity.as_ref().is_some_and(|me| me.id == *id) {
+            return denied(format!(
+                "mesh: peer presented this node's own identity {} (a connection to itself, or a copied {IDENTITY_FILE})",
+                crate::codec::hex(id),
+            ));
+        }
         if let Some((addr, pin)) = dialed.and_then(|addr| self.pins.get(addr).map(|pin| (addr, pin))) {
             if pin == id {
                 return Ok(());
@@ -463,10 +472,13 @@ impl MeshSecurity {
     }
 }
 
+/// Load `mesh_identity.bin`, or create it (0600) on first use. Like
+/// `validator.key`, an existing file is loaded only when nobody but its
+/// owner can read it (review CRY-9): with an allow-list or pins this key is
+/// the node's credential to the whole fleet.
 fn load_or_create_identity(path: &Path) -> io::Result<Identity> {
-    match std::fs::read(path) {
+    match crate::keys::read_keystore_file(path) {
         Ok(bytes) => {
-            let bytes = Zeroizing::new(bytes);
             let pk_len = mldsa65::public_key_bytes();
             let sk_len = mldsa65::secret_key_bytes();
             let bad = || io::Error::new(io::ErrorKind::InvalidData, format!("{}: not a mesh identity", path.display()));
@@ -1010,6 +1022,49 @@ mod tests {
             assert!(err.to_string().contains("authentication record length"), "{err}");
         }
         drop(w);
+    }
+
+    /// Review CRY-9: a node never admits its own identity. A dial that is
+    /// turned back to the node's own listener fails on the dialer with the
+    /// self-identity refusal (and the listener's handshake fails with it),
+    /// with or without an allow-list that names the node.
+    #[test]
+    fn a_node_does_not_accept_its_own_identity_as_a_peer() {
+        let me = MeshSecurity::ephemeral(Mode::Require, NET, None);
+        let id = me.identity_id().unwrap();
+        let me = Arc::new(MeshSecurity { allow: Some(HashSet::from([id])), ..me });
+        let (cli, srv) = pair(me.clone(), me.clone());
+        let err = cli.err().expect("a self-connection must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("own identity"), "{err}");
+        assert!(srv.is_err());
+        assert!(me.admit(&id, None).is_err(), "inbound as well");
+
+        let open = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
+        let (cli, srv) = pair(open.clone(), open);
+        assert!(cli.is_err() && srv.is_err(), "encryption-only mode refuses itself too");
+    }
+
+    /// Review CRY-9: the transport identity is loaded only at owner-only
+    /// permissions, like `validator.key`.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_or_world_readable_identity_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mesh-id-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = MeshSecurity::load(Mode::Offer, NET, &dir, None, &[], &[], false).unwrap();
+        let path = dir.join(IDENTITY_FILE);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        for mode in [0o644, 0o640, 0o604] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = MeshSecurity::load(Mode::Offer, NET, &dir, None, &[], &[], false).err().expect("refused");
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{mode:o}: {err}");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let again = MeshSecurity::load(Mode::Offer, NET, &dir, None, &[], &[], false).unwrap();
+        assert_eq!(first.identity_id(), again.identity_id());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
