@@ -2221,6 +2221,12 @@ impl Refusal {
 /// index that was valid when the error was raised can be stale by the time it
 /// is used. Out of range falls back to `None`, and `None` means "drop the tail
 /// and retry", which is the behaviour that keeps the node producing.
+/// How many times `propose` selects from the mempool again after the probe
+/// refused, and it dropped, one indexed transaction (review EXE-1). Each
+/// round costs one selection and one probe transition on the consensus
+/// thread, so it is small; past it the proposer keeps the reduced list.
+const PROPOSAL_RESELECTIONS_MAX: usize = 4;
+
 fn culprit_index(err: &TransitionError, len: usize) -> Option<usize> {
     match err {
         TransitionError::Transfer(i, _) | TransitionError::Transaction(i) => {
@@ -3391,6 +3397,10 @@ impl Engine {
         // is bounded by the selection size and terminates. If the empty
         // selection also fails, the fault is not attributable to a transaction.
         let mut txs = self.select_transactions(bloch_pos_committee::epoch_of(slot));
+        // Selections made again after an indexed drop (review EXE-1), and
+        // whether a refusal that names no transaction narrowed the list.
+        let mut reselections = 0usize;
+        let mut narrowed = false;
         // Local production policy: never sign a block our smallest supported
         // gossip transport cannot carry. Incoming consensus acceptance stays
         // unchanged, and the pool keeps omitted votes for a later proposal.
@@ -3412,9 +3422,27 @@ impl Engine {
             {
                 Ok(p) => break (p, tx_bytes),
                 Err(err) => {
+                    let indexed = culprit_index(&err, txs.len()).is_some();
                     if !self.drop_failed_proposal_transaction(&mut txs, &err, slot) {
                         eprintln!("[slot {slot}] produce refused with no transactions: {err:?}");
                         return;
+                    }
+                    // The refused transaction is out of the mempool and
+                    // barred. What it displaced from the selection (byte
+                    // budget, DA slots, a whole block behind a settlement) is
+                    // still pending, so select again instead of proposing the
+                    // shrunken list. Bounded: each round removed one mempool
+                    // entry, and after the limit the loop continues as it
+                    // always did. Not after an unattributed narrowing, which
+                    // removes nothing from the mempool and would be undone.
+                    narrowed |= !indexed;
+                    if indexed && !narrowed && reselections < PROPOSAL_RESELECTIONS_MAX {
+                        reselections += 1;
+                        let again = self.select_transactions(bloch_pos_committee::epoch_of(slot));
+                        if proposal_wire::fit(&header, &mut atts, &again) {
+                            header.attestation_root = derive::attestation_root(&atts);
+                            txs = again;
+                        }
                     }
                 }
             }

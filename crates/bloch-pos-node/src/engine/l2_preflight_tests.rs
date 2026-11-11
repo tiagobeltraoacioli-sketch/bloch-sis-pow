@@ -56,3 +56,31 @@ fn a_pending_settlement_that_matches_the_head_is_kept_and_selected() {
     assert!(node.mempool.contains_key(&key));
     assert_eq!(node.select_transactions(0), vec![matching]);
 }
+
+/// EXE-1 (re-selection): the probe refuses the one transaction that was the
+/// whole selection. The proposer drops and bars it, selects again, and the
+/// block carries the pending transfer instead of going out empty.
+#[test]
+fn a_transaction_the_probe_refuses_does_not_cost_the_block_its_transactions() {
+    let _clock = validator_lifecycle::clock_at(3);
+    let funds = funds_of(2);
+    let (mut node, _dir) = engine_with_frozen_source_funded(&funds);
+    let transfer = spend(&funds[0], 9_000, 0, node.state.next_base_fee_at(0));
+    assert_eq!(node.on_transaction(transfer.clone()), Ok(Admitted::New));
+    // Statement matches the head; the proof does not verify (as if it had
+    // reached the pool without admission).
+    let unproven = wire(settlement(&node, [2; 356]));
+    let key = unproven.canonical_bytes();
+    node.mempool.insert(key.clone(), unproven.clone());
+    assert_eq!(node.select_transactions(0), vec![unproven]);
+
+    node.propose(3);
+    assert_eq!(node.state.slot(), 3, "the block was produced");
+    assert_eq!(
+        node.tx_slot_index.get(&transfer.txid()),
+        Some(&3),
+        "the transfer displaced by the refused transaction is in the block",
+    );
+    assert!(!node.mempool.contains_key(&key));
+    assert!(node.rejected.contains_key(&key), "the refused transaction is barred");
+}
