@@ -583,11 +583,27 @@ impl Opener {
     /// Read and open one record before `deadline`. Any failure is fatal for
     /// the connection: after a bad tag the stream cannot be trusted again.
     pub fn read_record(&mut self, sock: &mut TcpStream, deadline: Instant) -> io::Result<Vec<u8>> {
+        self.read_record_of(sock, deadline, None)
+    }
+
+    /// The handshake's identity record: the only valid one is exactly
+    /// [`auth_len`] bytes of plaintext, so any other length is refused
+    /// before a buffer is allocated for it (review CRY-8). Nothing is
+    /// authenticated at this point, and the general bound would let any
+    /// peer hold `MAX_FIELD_LEN` bytes per half-open handshake.
+    fn read_auth_record(&mut self, sock: &mut TcpStream, deadline: Instant) -> io::Result<Vec<u8>> {
+        self.read_record_of(sock, deadline, Some(auth_len()))
+    }
+
+    fn read_record_of(&mut self, sock: &mut TcpStream, deadline: Instant, exact_plain: Option<usize>) -> io::Result<Vec<u8>> {
         let mut len4 = [0u8; 4];
         crate::net::read_exact_until(sock, &mut len4, deadline)?;
         let len = u32::from_le_bytes(len4) as usize;
         if len <= TAG_LEN || len > crate::codec::MAX_FIELD_LEN + TAG_LEN {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad record length"));
+        }
+        if exact_plain.is_some_and(|plain| len != plain + TAG_LEN) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "mesh: bad authentication record length"));
         }
         let mut buf = vec![0u8; len];
         crate::net::read_exact_until(sock, &mut buf, deadline)?;
@@ -730,7 +746,7 @@ pub fn handshake_outbound(sock: &mut TcpStream, sec: &MeshSecurity, dialed: &str
     let mut sealer = Sealer::new(&i2r);
     let mut opener = Opener::new(&r2i);
 
-    let theirs = opener.read_record(sock, deadline)?;
+    let theirs = opener.read_auth_record(sock, deadline)?;
     let peer = check_auth(&theirs, &h, CTX_RESPONDER)?;
     sec.admit(&peer, Some(dialed))?;
     let mine = auth_payload(me, &h, CTX_INITIATOR);
@@ -815,7 +831,7 @@ pub fn handshake_inbound(sock: &mut TcpStream, sec: &MeshSecurity) -> io::Result
     write_all_until(sock, &msg2, deadline)?;
     let mine = auth_payload(me, &h, CTX_RESPONDER);
     sealer.write_record(sock, &[&mine])?;
-    let theirs = opener.read_record(sock, deadline)?;
+    let theirs = opener.read_auth_record(sock, deadline)?;
     let peer = check_auth(&theirs, &h, CTX_INITIATOR)?;
     sec.admit(&peer, None)?;
     Ok(Session::Sealed { sealer, opener, peer })
@@ -968,6 +984,32 @@ mod tests {
         std::fs::write(dir.join(IDENTITY_FILE), b"nope").unwrap();
         assert!(MeshSecurity::load(Mode::Offer, NET, &dir, None, &[], &[], false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review CRY-8: the identity record has one valid length. A peer that
+    /// announces a larger one is refused at once, before any buffer of that
+    /// size exists and without waiting for the bytes (the read would
+    /// otherwise run to the handshake deadline).
+    #[test]
+    fn an_oversized_authentication_record_is_refused_before_it_is_read() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut w = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (mut r, _) = l.accept().unwrap();
+        // Within the general record bound, far above the identity record.
+        w.write_all(&(1u32 << 20).to_le_bytes()).unwrap();
+        let started = Instant::now();
+        let err = Opener::new(&[9; 32]).read_auth_record(&mut r, far()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("authentication record length"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(2), "refused on the length alone");
+        // One byte short or long is refused the same way; the general
+        // reader still takes such a length (and then waits for the body).
+        for len in [auth_len() + TAG_LEN - 1, auth_len() + TAG_LEN + 1] {
+            w.write_all(&(len as u32).to_le_bytes()).unwrap();
+            let err = Opener::new(&[9; 32]).read_auth_record(&mut r, far()).unwrap_err();
+            assert!(err.to_string().contains("authentication record length"), "{err}");
+        }
+        drop(w);
     }
 
     #[test]
