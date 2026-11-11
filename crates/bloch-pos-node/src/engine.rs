@@ -11320,6 +11320,12 @@ mod transfer_v2_end_to_end {
     /// [`engine_backing`] with an L2 of chain `L2_TEST_CHAIN` installed at
     /// genesis, so the chain id and the settled mark are there to compare.
     fn engine_backing_with_l2(epoch: u64, backed: &[PosTransaction]) -> Engine {
+        engine_backing_with_l2_as(epoch, backed, false)
+    }
+
+    /// The same; `asynchronous` installs the L2 in the asynchronous form,
+    /// the one that takes withdrawal claims.
+    fn engine_backing_with_l2_as(epoch: u64, backed: &[PosTransaction], asynchronous: bool) -> Engine {
         use bloch_pos_committee::l2_settlement::Policy;
         let mut node = engine_backing(epoch, backed);
         let genesis = *node.chain[0].1.as_bytes();
@@ -11335,8 +11341,9 @@ mod transfer_v2_end_to_end {
             initial_l2_state: [0x0d; 32],
             attestor_set: [0; 32],
         };
-        let state = (*node.state).clone().configure_l2_genesis(policy).expect("an L2 at genesis");
-        node.state.set(state);
+        let state = (*node.state).clone();
+        let state = if asynchronous { state.configure_l2_genesis_async(policy) } else { state.configure_l2_genesis(policy) };
+        node.state.set(state.expect("an L2 at genesis"));
         node
     }
 
@@ -11994,7 +12001,7 @@ mod transfer_v2_end_to_end {
         let claim = withdraw_claim(0x61, 0, blank.state.l2_claim_release_sat(1_000_000));
         let PosTransaction::L2WithdrawClaim(inner) = &claim else { unreachable!() };
         assert!(inner.validate_shape().is_ok(), "the fixture is a claim consensus can read");
-        let node = engine_backing_with_l2(epoch, std::slice::from_ref(&claim));
+        let node = engine_backing_with_l2_as(epoch, std::slice::from_ref(&claim), true);
         let check = |tx: &PosTransaction| check_l2_funding(&node.state, None, tx, tx.canonical_bytes().len(), epoch);
 
         let refusal = node.state.l2_withdraw_claim_refusal(inner);
