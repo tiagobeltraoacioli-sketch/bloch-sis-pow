@@ -661,6 +661,20 @@ impl DutySyncGate {
     }
 }
 
+/// Boot grace: one sync round before any duty, measured from the moment the
+/// slot loop starts (`loop_started_ms`), not from process start.
+///
+/// Review round 2, GATE-06: the grace used to be timed from engine
+/// construction, before replay. A replay longer than the grace had already
+/// used it up, and because replay refreshes `last_applied_ms` the stale-head
+/// test ([`node_is_behind`]) stayed false for the same length of time: for up
+/// to two slots a restarted validator could sign on a head hours old.
+/// Inclusive at the end so that the instant the grace ends is one at which
+/// [`node_is_behind`] already sees more than `grace_ms` without progress.
+fn in_boot_grace(now_ms: u64, loop_started_ms: u64, grace_ms: u64) -> bool {
+    now_ms.saturating_sub(loop_started_ms) <= grace_ms
+}
+
 /// Longest uncached roll (in epochs) an arriving attestation may cause
 /// without further conditions: a synced node whose head is still in the
 /// previous epoch judges votes of the wall epoch and of the next one.
@@ -8179,6 +8193,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut last_built: u64 = engine.state.slot();
     let mut last_sync_req: u64 = 0;
     let mut duty_sync_gate = DutySyncGate::default();
+    // GATE-06: boot grace runs from here, the end of replay and of the boot
+    // checks, not from engine construction.
+    engine.booted_ms = now_ms();
 
     // Metrics baseline (C-R6-2). The finality clock starts NOW: replay stamps
     // nothing (it re-finalizes the past), and a `last_finality_advance_unix`
@@ -8289,7 +8306,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
         // Boot grace: give the mesh one round of sync before performing
         // duties, so a restarted proposer does not build on a stale head.
-        let in_grace = now.saturating_sub(engine.booted_ms) < two_slots_ms;
+        let in_grace = in_boot_grace(now, engine.booted_ms, two_slots_ms);
 
         // Decide freshness BEFORE any duty can roll the local state forward.
         // `rolled_to` is only a deterministic view of THIS head; it cannot
@@ -17617,6 +17634,43 @@ mod ingest_admission_tests {
         assert_eq!(epoch_of(lagging.state.slot()), 0);
         assert!(matches!(judge(&lagging, 0), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
         assert!(matches!(judge(&lagging, 9_999), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
+    }
+
+    /// **Review round 2, GATE-06: boot grace is timed from the end of
+    /// replay.** With a replay longer than the grace, the old timing (from
+    /// engine construction) left a window in which the node was neither in
+    /// grace nor "behind", because replay itself had refreshed
+    /// `last_applied_ms`.
+    #[test]
+    fn boot_grace_covers_the_restart_until_the_stale_head_test_takes_over() {
+        const SLOT_MS: u64 = 30_000;
+        let grace = 2 * SLOT_MS;
+        let constructed = 1_000_000;
+        // Replay took ten slots; its last block refreshed `last_applied_ms`.
+        let replay_done = constructed + 10 * SLOT_MS;
+        let last_applied = replay_done;
+        // A head hours old against the wall slot.
+        let (head_slot, wall_slot) = (100, 700);
+        // The slot loop starts at once, or after slow boot checks.
+        for loop_started in [replay_done, replay_done + 1, replay_done + 7_000] {
+            let mut now = loop_started;
+            while now <= loop_started + 4 * grace {
+                assert!(
+                    in_boot_grace(now, loop_started, grace)
+                        || node_is_behind(head_slot, wall_slot, now, last_applied, grace),
+                    "duties open on a stale head {} ms after the slot loop started",
+                    now - loop_started
+                );
+                now += 250;
+            }
+            assert!(in_boot_grace(loop_started, loop_started, grace));
+            assert!(in_boot_grace(loop_started + grace, loop_started, grace));
+            assert!(!in_boot_grace(loop_started + grace + 1, loop_started, grace));
+        }
+        // The defect: timed from construction, the first loop turn was
+        // outside the grace and the stale-head test was not yet true.
+        assert!(!in_boot_grace(replay_done, constructed, grace));
+        assert!(!node_is_behind(head_slot, wall_slot, replay_done, last_applied, grace));
     }
 
     /// **Review round 2, GATE-04: an arriving attestation cannot make a
