@@ -1083,6 +1083,11 @@ const SIDE_BRANCH_STARTS_PER_SLOT: usize = 2;
 const SIDE_BRANCH_MAX_DEPTH: usize =
     64 * bloch_pos_committee::params::SLOTS_PER_EPOCH as usize;
 
+/// Cap on the side-branch blocks remembered as having failed the transition
+/// ([`SideValidation::failed`], review W2-5). Same order as
+/// [`MAX_PARKED_REFUSED_FINALITY`]: 32 bytes each, oldest forgotten first.
+const SIDE_BRANCH_FAILED_REMEMBERED: usize = 512;
+
 /// One retained canonical post-state: `(canonical height, block id, state)`.
 type ReorgAnchor = (usize, [u8; 32], Arc<CommittedState>);
 
@@ -1155,6 +1160,37 @@ struct SideValidation {
     /// Inventory revision and head at which the last scan found nothing to
     /// validate, so an unchanged store is not rescanned every turn.
     idle: Option<(u64, [u8; 32])>,
+    /// Side-branch blocks this fold ran through the transition and that
+    /// failed it (review W2-5), oldest first, at most
+    /// [`SIDE_BRANCH_FAILED_REMEMBERED`]. Such a block is removed from the
+    /// store, but admission stores it again when a peer offers it again,
+    /// and reaching its fork point's state can cost up to
+    /// [`REORG_ANCHOR_REFRESH_BLOCKS`] canonical re-executions each time. A
+    /// remembered block, and everything stored above it, is no longer a
+    /// candidate of [`Engine::side_branch_candidate`].
+    ///
+    /// This only withholds the OPTIONAL validation work. It is not consulted
+    /// by admission, fork choice or `do_reorg`, so it can never make this
+    /// node refuse to store or adopt a block; a block's verdict is a pure
+    /// function of the block and its ancestry, so the remembered verdict is
+    /// the one a second run would reach. In memory only.
+    failed: VecDeque<[u8; 32]>,
+    /// The same ids, for the lookup the candidate walk makes per block.
+    failed_index: std::collections::HashSet<[u8; 32]>,
+}
+
+impl SideValidation {
+    fn remember_failed(&mut self, id: [u8; 32]) {
+        if !self.failed_index.insert(id) {
+            return;
+        }
+        while self.failed.len() >= SIDE_BRANCH_FAILED_REMEMBERED {
+            if let Some(oldest) = self.failed.pop_front() {
+                self.failed_index.remove(&oldest);
+            }
+        }
+        self.failed.push_back(id);
+    }
 }
 
 /// The `(canonical height, block id)` of the state-cache generations this
@@ -6969,11 +7005,14 @@ impl Engine {
         };
         let latch = self.finalized_latch.map_or(0, |(h, _)| usize::try_from(h).unwrap_or(usize::MAX));
         let floor = latch.max(height(&self.state.finality().justified.root));
+        // W2-5: a block that already failed the transition here is not
+        // judged again, and nothing above it is reachable.
+        let failed = &self.reorg_anchors.side.failed_index;
         type Rank = (usize, usize, std::cmp::Reverse<[u8; 32]>);
         let mut best: Option<(Rank, usize, Vec<[u8; 32]>)> = None;
         for (fork_height, (_, fork)) in self.chain.iter().enumerate().skip(floor) {
             for child in self.blocks.children_of(fork.as_bytes()) {
-                if self.canonical.contains(child) {
+                if self.canonical.contains(child) || failed.contains(child) {
                     continue;
                 }
                 // Depth-first below `child`. `path` is the branch from the
@@ -7003,12 +7042,15 @@ impl Engine {
                         if let Some(top) = stack.last_mut() {
                             top.1 = next.saturating_add(1);
                         }
-                        enter = Some(*kid);
+                        if !failed.contains(kid) {
+                            enter = Some(*kid);
+                        }
                         continue;
                     }
                     // Leaving `id`. It ends a branch when it has no stored
-                    // child, or when the depth limit stops the walk here.
-                    if (kids.is_empty() || !within_depth) && unvalidated > 0 {
+                    // child (one that failed before counts as none), or when
+                    // the depth limit stops the walk here.
+                    if (kids.iter().all(|kid| failed.contains(kid)) || !within_depth) && unvalidated > 0 {
                         let rank: Rank = (proposers.len(), path.len(), std::cmp::Reverse(id));
                         if best.as_ref().is_none_or(|(held, ..)| rank > *held) {
                             best = Some((rank, fork_height, path.clone()));
@@ -7231,6 +7273,7 @@ impl Engine {
                             crate::codec::hex8(&id),
                         ));
                         self.blocks.remove(&id);
+                        self.reorg_anchors.side.remember_failed(id);
                         break;
                     }
                 }

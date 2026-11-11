@@ -361,3 +361,108 @@ fn the_branch_signed_by_more_proposers_is_taken_first() {
     engine.finalized_latch = Some((2, *engine.chain[2].1.as_bytes()));
     assert_eq!(engine.side_branch_candidate(), None);
 }
+
+/// Review W2-5 and W2-8 (1). A stored side block whose fork point is far
+/// above the nearest retained state costs a replay of canonical blocks to
+/// reach it: those count against the same budget, the cursor rests on a
+/// canonical block between slots, and released bodies are read back from
+/// the block log. When the block then fails the transition it is
+/// remembered, so storing the same block again costs no block application
+/// at all, while the memory never touches what is stored or adopted.
+#[test]
+fn a_failed_side_block_is_remembered_and_not_replayed_for_again() {
+    let (mut engine, _dir) = perf_support::proposing_engine();
+    for slot in 1..=30 {
+        engine.propose(slot);
+    }
+    assert_eq!(engine.chain.len(), 31, "fixture: thirty blocks over genesis");
+    let tip = *engine.head_id().as_bytes();
+    // Bodies below height 6 are released, as below a finalized checkpoint.
+    engine.finalized_latch = Some((6, *engine.chain[6].1.as_bytes()));
+    engine.hollow_finalized_bodies();
+    assert!(engine.blocks.is_hollow(engine.chain[5].1.as_bytes()), "fixture: released bodies on the way");
+
+    let fork_height = 24usize;
+    let fork_point = *engine.chain[fork_height].1.as_bytes();
+    let (anchor_height, ..) = engine.reorg_anchor_at_or_below(fork_height).expect("fixture: an anchor below the fork point");
+    assert!(anchor_height < 6, "fixture: the replay starts below the released bodies");
+    let replayed = fork_height - anchor_height;
+    assert!(replayed > SIDE_BRANCH_BLOCKS_PER_SLOT, "fixture: reaching the fork point takes more than one slot");
+
+    // A sibling of the canonical block at height 25 that cannot pass the
+    // transition, stored as admission stores a connected block.
+    let mut invalid = engine.blocks[engine.chain[fork_height + 1].1.as_bytes()].clone();
+    assert_eq!(invalid.header.parent, fork_point);
+    invalid.header.state_root = [0xEE; 32];
+    let invalid_id = *invalid.block_id().as_bytes();
+    assert!(!engine.canonical.contains(&invalid_id));
+    engine.blocks.insert(invalid_id, invalid.clone());
+
+    // First slot: the whole slot budget goes into canonical blocks, and the
+    // cursor is left on one of them.
+    for _ in 0..2 * SIDE_BRANCH_BLOCKS_PER_SLOT {
+        engine.validate_side_branch_turn(1_000);
+    }
+    assert_eq!(engine.reorg_anchors.side.spent, SIDE_BRANCH_BLOCKS_PER_SLOT, "canonical replays are budgeted");
+    let cursor = engine.reorg_anchors.side.cursor.as_ref().map(|(id, _)| *id).expect("a cursor");
+    assert_eq!(
+        engine.height_of(&cursor),
+        Some((anchor_height + SIDE_BRANCH_BLOCKS_PER_SLOT) as u64),
+        "the cursor rests on the canonical block the slot budget reached"
+    );
+    assert!(engine.blocks.contains_key(&invalid_id), "not judged yet");
+
+    // The following slots finish the replay and judge the block.
+    let mut spent = SIDE_BRANCH_BLOCKS_PER_SLOT;
+    for slot in 1_001..1_010 {
+        for _ in 0..2 * SIDE_BRANCH_BLOCKS_PER_SLOT {
+            engine.validate_side_branch_turn(slot);
+        }
+        spent += engine.reorg_anchors.side.spent;
+        if !engine.blocks.contains_key(&invalid_id) {
+            break;
+        }
+    }
+    assert!(!engine.blocks.contains_key(&invalid_id), "the failing block is removed");
+    assert_eq!(spent, replayed + 1, "every canonical block once, then the side block");
+    assert_eq!(*engine.head_id().as_bytes(), tip);
+
+    // The same block is stored again (a peer offers it again).
+    engine.blocks.insert(invalid_id, invalid.clone());
+    for slot in 2_000..2_004 {
+        for _ in 0..4 {
+            assert!(!engine.validate_side_branch_turn(slot));
+        }
+        assert_eq!(engine.reorg_anchors.side.spent, 0, "no block application for a block that already failed");
+    }
+    assert!(!engine.blocks.is_validated(&invalid_id));
+    assert!(engine.blocks.contains_key(&invalid_id), "the memory removes nothing from the store");
+    assert_eq!(*engine.head_id().as_bytes(), tip);
+    // Nothing above it is a candidate either.
+    let mut child = invalid.clone();
+    child.header.parent = invalid_id;
+    child.header.slot += 1;
+    let child_id = *child.block_id().as_bytes();
+    engine.blocks.insert(child_id, child);
+    assert_eq!(engine.side_branch_candidate(), None);
+
+    // A different stored side block is still judged: the memory is per block.
+    let mut other = invalid;
+    other.header.state_root = [0xDD; 32];
+    let other_id = *other.block_id().as_bytes();
+    engine.blocks.insert(other_id, other);
+    assert_eq!(engine.side_branch_candidate(), Some((fork_height, vec![other_id])));
+
+    // Bounded, oldest first.
+    let side = &mut engine.reorg_anchors.side;
+    for i in 0..SIDE_BRANCH_FAILED_REMEMBERED as u64 {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&i.to_le_bytes());
+        id[31] = 1;
+        side.remember_failed(id);
+        side.remember_failed(id);
+    }
+    assert_eq!(side.failed.len(), SIDE_BRANCH_FAILED_REMEMBERED);
+    assert_eq!(side.failed_index.len(), SIDE_BRANCH_FAILED_REMEMBERED);
+    assert!(!side.failed_index.contains(&invalid_id), "the oldest entry was forgotten");
+}
