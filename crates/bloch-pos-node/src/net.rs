@@ -1654,6 +1654,26 @@ fn log_refusal(direction: &str, peer: &str, e: &std::io::Error) {
     eprintln!("net: mesh handshake {direction} {peer} refused: {e}");
 }
 
+/// How long a dialer waits before it tries again an address that turned out
+/// to be this node itself.
+const SELF_DIAL_RETRY: Duration = Duration::from_secs(60);
+/// The identity-conflict line (two nodes, one `mesh_identity.bin`) is logged
+/// at most this often, and never through the slot shared with ordinary
+/// refusals: it is the one refusal an operator has to act on, and a scanner
+/// or a refused stranger must not be able to keep it off the log (W4-2).
+const IDENTITY_CONFLICT_LOG_EVERY: Duration = Duration::from_secs(60);
+
+fn log_identity_conflict(direction: &str, peer: &str, e: &std::io::Error) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let now = Instant::now();
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if last.is_some_and(|t| now.saturating_duration_since(t) < IDENTITY_CONFLICT_LOG_EVERY) {
+        return;
+    }
+    *last = Some(now);
+    eprintln!("net: mesh handshake {direction} {peer} REFUSED: {e}");
+}
+
 /// A dialer in `offer` mode met a node that closed on the handshake's first
 /// bytes — what a legacy node does when it reads `"BPQ1"` as an 827 MB
 /// frame length.
@@ -2275,7 +2295,16 @@ pub fn start(
                     let session = match crate::mesh_pq::handshake_inbound(&mut sock, &security) {
                         Ok(session) => session,
                         Err(e) => {
-                            log_refusal("from", &address.to_string(), &e);
+                            use crate::mesh_pq::OwnIdentity;
+                            match crate::mesh_pq::own_identity_refusal(&e) {
+                                // This node's own dial, back at its own
+                                // listener. Its dialer says so, once.
+                                Some(OwnIdentity::SelfConnection) => {}
+                                Some(OwnIdentity::SharedIdentityFile) => {
+                                    log_identity_conflict("from", &address.to_string(), &e)
+                                }
+                                None => log_refusal("from", &address.to_string(), &e),
+                            }
                             return;
                         }
                     };
@@ -2438,6 +2467,7 @@ pub fn start(
             let mut sealed_before = false;
             let mut closed_handshakes = 0u32;
             let mut backoff = RefusalBackoff::new();
+            let mut said_self = false;
             loop {
             let dialing = Instant::now();
             let Ok(mut sock) = TcpStream::connect(&addr) else {
@@ -2493,8 +2523,27 @@ pub fn start(
                     }
                     continue;
                 }
+                // W4-2: the address is this node's own, or is routed back to
+                // it. Said once, outside the shared refusal line, and tried
+                // again only rarely in case the address changes hands.
+                Err(e) if crate::mesh_pq::own_identity_refusal(&e) == Some(crate::mesh_pq::OwnIdentity::SelfConnection) => {
+                    if !said_self {
+                        said_self = true;
+                        eprintln!(
+                            "net: --peers entry {addr} is this node itself (its own address, or one routed back \
+                             to it). It is not a peer and no connection is made; remove it from --peers to stop \
+                             the attempts."
+                        );
+                    }
+                    thread::sleep(SELF_DIAL_RETRY);
+                    continue;
+                }
                 Err(e) => {
-                    log_refusal("to", &addr, &e);
+                    if crate::mesh_pq::own_identity_refusal(&e).is_some() {
+                        log_identity_conflict("to", &addr, &e);
+                    } else {
+                        log_refusal("to", &addr, &e);
+                    }
                     // Not a busy loop against a peer that will refuse again.
                     thread::sleep(Duration::from_secs(2));
                     continue;
@@ -4343,5 +4392,33 @@ mod tests {
         assert!(spawn_connection(&health, "mesh-test", move || done_tx.send(()).unwrap()));
         done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(!health.exhausted(t0 + Duration::from_secs(3600)));
+    }
+
+    /// W4-2: a node whose own address is in its `--peers` (one list shared by
+    /// a whole fleet) recognises the dial that comes back to it, makes no
+    /// connection out of it, and goes on connecting to everyone else.
+    #[test]
+    fn a_node_that_lists_its_own_address_connects_to_its_other_peers_and_not_to_itself() {
+        use crate::mesh_pq::{handshake_inbound, MeshSecurity, Mode, Session};
+        let net = [9; 32];
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        // A free port for the node, so that it can be told its own address.
+        let own_port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (events, _received) = mpsc::channel();
+        let mesh = start(
+            "127.0.0.1", own_port,
+            vec![format!("127.0.0.1:{own_port}"), other.local_addr().unwrap().to_string()],
+            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(),
+            Arc::new(MeshSecurity::ephemeral(Mode::Offer, net, None)),
+        ).unwrap();
+        let (mut sock, _) = other.accept().unwrap();
+        let session = handshake_inbound(&mut sock, &MeshSecurity::ephemeral(Mode::Offer, net, None)).unwrap();
+        assert!(matches!(session, Session::Sealed { .. }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mesh.peer_count() < 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(mesh.peer_count(), 1, "the other peer, and no connection of the node to itself");
     }
 }

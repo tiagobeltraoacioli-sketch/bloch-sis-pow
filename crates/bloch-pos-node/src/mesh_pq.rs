@@ -136,7 +136,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
@@ -233,6 +234,57 @@ pub struct MeshSecurity {
     /// Dialed address (exactly as given in `--peers`) → the only identity
     /// accepted there.
     pins: HashMap<String, PeerId>,
+    /// Where the identity was loaded from, for the messages that tell an
+    /// operator what to do with that file.
+    identity_path: Option<PathBuf>,
+    /// Nonces of the handshakes this node is in the middle of, on either
+    /// side. A peer that presents this node's own identity is this node
+    /// itself exactly when the nonce it sent is one of these; otherwise it
+    /// is another node holding a copy of the identity file (review W4-2).
+    live_nonces: Mutex<HashSet<[u8; NONCE_LEN]>>,
+}
+
+/// Why a peer that presented this node's own identity was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnIdentity {
+    /// Both ends of the connection are this node: its own address is in
+    /// `--peers`, or the dialed address is routed back to it (a NAT
+    /// hairpin). Harmless, and never a connection.
+    SelfConnection,
+    /// Another node runs with a copy of this node's identity file.
+    SharedIdentityFile,
+}
+
+#[derive(Debug)]
+struct OwnIdentityRefusal {
+    kind: OwnIdentity,
+    text: String,
+}
+
+impl fmt::Display for OwnIdentityRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for OwnIdentityRefusal {}
+
+/// Which own-identity refusal a handshake error is, if it is one.
+pub fn own_identity_refusal(e: &io::Error) -> Option<OwnIdentity> {
+    e.get_ref()?.downcast_ref::<OwnIdentityRefusal>().map(|refusal| refusal.kind)
+}
+
+/// Keeps one handshake's nonce in [`MeshSecurity::live_nonces`] for as long
+/// as that handshake runs.
+struct LiveNonce<'a> {
+    live: &'a Mutex<HashSet<[u8; NONCE_LEN]>>,
+    nonce: [u8; NONCE_LEN],
+}
+
+impl Drop for LiveNonce<'_> {
+    fn drop(&mut self) {
+        self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&self.nonce);
+    }
 }
 
 /// Split `--peers` entries of the form `host:port=<64 hex id>` into the bare
@@ -279,7 +331,15 @@ impl fmt::Debug for MeshSecurity {
 impl MeshSecurity {
     /// The old transport, unchanged.
     pub fn plain() -> Self {
-        MeshSecurity { mode: Mode::Plain, network: [0; 32], identity: None, allow: None, pins: HashMap::new() }
+        MeshSecurity {
+            mode: Mode::Plain,
+            network: [0; 32],
+            identity: None,
+            allow: None,
+            pins: HashMap::new(),
+            identity_path: None,
+            live_nonces: Mutex::new(HashSet::new()),
+        }
     }
 
     /// Load (or create) the transport identity under `data_dir`, the
@@ -337,8 +397,17 @@ impl MeshSecurity {
             );
         }
         std::fs::create_dir_all(data_dir)?;
-        let identity = load_or_create_identity(&data_dir.join(IDENTITY_FILE))?;
-        Ok(MeshSecurity { mode, network, identity: Some(identity), allow, pins })
+        let identity_path = data_dir.join(IDENTITY_FILE);
+        let identity = load_or_create_identity(&identity_path)?;
+        Ok(MeshSecurity {
+            mode,
+            network,
+            identity: Some(identity),
+            allow,
+            pins,
+            identity_path: Some(identity_path),
+            live_nonces: Mutex::new(HashSet::new()),
+        })
     }
 
     /// An in-memory identity, for tests.
@@ -346,7 +415,15 @@ impl MeshSecurity {
     pub fn ephemeral(mode: Mode, network: [u8; 32], allow: Option<HashSet<PeerId>>) -> Self {
         let (pk, sk) = mldsa65::keypair();
         let id = peer_id(pk.as_bytes());
-        MeshSecurity { mode, network, identity: Some(Identity { pk, sk, id }), allow, pins: HashMap::new() }
+        MeshSecurity {
+            mode,
+            network,
+            identity: Some(Identity { pk, sk, id }),
+            allow,
+            pins: HashMap::new(),
+            identity_path: None,
+            live_nonces: Mutex::new(HashSet::new()),
+        }
     }
 
     /// Pin a dialed address, for tests.
@@ -426,6 +503,45 @@ impl MeshSecurity {
         self.identity.as_ref().ok_or_else(|| io::Error::other("mesh: no transport identity loaded"))
     }
 
+    fn live(&self, nonce: [u8; NONCE_LEN]) -> LiveNonce<'_> {
+        self.live_nonces.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(nonce);
+        LiveNonce { live: &self.live_nonces, nonce }
+    }
+
+    /// True when `nonce` belongs to a handshake this node is running now.
+    fn is_live(&self, nonce: &[u8]) -> bool {
+        <[u8; NONCE_LEN]>::try_from(nonce)
+            .is_ok_and(|nonce| self.live_nonces.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(&nonce))
+    }
+
+    /// The refusal for a peer (`who`) that proved possession of this node's
+    /// own identity. The two cases need opposite reactions from an operator,
+    /// so they are told apart and the conflict says what to do (W4-2).
+    fn own_identity_error(&self, kind: OwnIdentity, who: &str) -> io::Error {
+        let id = self.identity.as_ref().map(|me| crate::codec::hex(&me.id)).unwrap_or_default();
+        let text = match kind {
+            OwnIdentity::SelfConnection => format!(
+                "mesh: {who} is this node itself (its own address is in --peers, or the address is routed \
+                 back to it): not a peer, and no connection is made"
+            ),
+            OwnIdentity::SharedIdentityFile => format!(
+                "mesh: IDENTITY CONFLICT: {who} presented this node's own mesh identity {id}. TWO NODES ARE \
+                 RUNNING WITH COPIES OF ONE {IDENTITY_FILE} (a data directory that was cloned or restored \
+                 onto a second node); this is not a connection of this node to itself. The two will never \
+                 connect to each other. To fix it: stop ONE of the two nodes, delete its {IDENTITY_FILE}{} \
+                 and start it again. It creates a new identity and prints it as `mesh security: ... \
+                 identity <id>`. Nothing else in the data directory depends on that file; only a pin \
+                 (`--peers host:port=<id>`) or a --mesh-allow entry on other nodes that names the old \
+                 identity has to be changed to the new one.",
+                match &self.identity_path {
+                    Some(path) => format!(" (this node's copy is {})", path.display()),
+                    None => String::new(),
+                },
+            ),
+        };
+        io::Error::new(io::ErrorKind::PermissionDenied, OwnIdentityRefusal { kind, text })
+    }
+
     /// Decide whether the identity a peer proved is one this node expects.
     /// `dialed` is the `--peers` address for an outbound connection and
     /// `None` for an inbound one.
@@ -442,10 +558,9 @@ impl MeshSecurity {
     fn admit(&self, id: &PeerId, dialed: Option<&str>) -> io::Result<()> {
         let denied = |why: String| Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
         if self.identity.as_ref().is_some_and(|me| me.id == *id) {
-            return denied(format!(
-                "mesh: peer presented this node's own identity {} (a connection to itself, or a copied {IDENTITY_FILE})",
-                crate::codec::hex(id),
-            ));
+            // Both handshakes rule out a connection of this node to itself
+            // before they get here, so what is left is a second holder.
+            return Err(self.own_identity_error(OwnIdentity::SharedIdentityFile, "a peer"));
         }
         if let Some((addr, pin)) = dialed.and_then(|addr| self.pins.get(addr).map(|pin| (addr, pin))) {
             if pin == id {
@@ -507,6 +622,26 @@ fn load_or_create_identity(path: &Path) -> io::Result<Identity> {
             let id = peer_id(pk.as_bytes());
             Ok(Identity { pk, sk, id })
         }
+        // W4-4: this refusal stops the node at boot. Say that, and the one
+        // command that fixes it.
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && e.raw_os_error().is_none() => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "mesh identity file refused: {e}. The node does not start with --mesh-security offer or \
+                 require until this is fixed. The fix is one command, `chmod 600 {}`, then start the node \
+                 again: the file itself is fine, the identity stays the same and no peer has to be told.",
+                path.display(),
+            ),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "mesh identity file {} cannot be read ({e}). It must belong to the user this node runs as: \
+                 `chown` it to that user, `chmod 600 {}`, then start the node again.",
+                path.display(),
+                path.display(),
+            ),
+        )),
         Err(e) => Err(e),
     }
 }
@@ -750,7 +885,9 @@ pub fn handshake_outbound(sock: &mut TcpStream, sec: &MeshSecurity, dialed: &str
     msg1.extend_from_slice(&sec.network);
     msg1.extend_from_slice(x_public.as_bytes());
     msg1.extend_from_slice(ek.as_bytes());
-    msg1.extend_from_slice(&random_nonce()?);
+    let nonce = random_nonce()?;
+    let _live = sec.live(nonce);
+    msg1.extend_from_slice(&nonce);
     write_all_until(sock, &msg1, deadline)?;
 
     let mut msg2 = vec![0u8; msg2_len()];
@@ -771,6 +908,18 @@ pub fn handshake_outbound(sock: &mut TcpStream, sec: &MeshSecurity, dialed: &str
 
     let theirs = opener.read_auth_record(sock, deadline)?;
     let peer = check_auth(&theirs, &h, CTX_RESPONDER)?;
+    if peer == me.id {
+        // The responder's nonce is one this node generated a moment ago,
+        // for a handshake it is still in: the dial came back to its own
+        // listener. Any other node, with or without a copy of the identity
+        // file, drew its own.
+        let kind = if sec.is_live(&msg2[msg2.len() - NONCE_LEN..]) {
+            OwnIdentity::SelfConnection
+        } else {
+            OwnIdentity::SharedIdentityFile
+        };
+        return Err(sec.own_identity_error(kind, &format!("the node at {dialed}")));
+    }
     sec.admit(&peer, Some(dialed))?;
     let mine = auth_payload(me, &h, CTX_INITIATOR);
     let remaining = deadline.checked_duration_since(Instant::now()).unwrap_or_default();
@@ -832,6 +981,12 @@ pub fn handshake_inbound(sock: &mut TcpStream, sec: &MeshSecurity) -> io::Result
     if msg1[5..37] != sec.network {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "mesh: peer is on another network (genesis mismatch)"));
     }
+    // This node's own dial, arriving at its own listener. The dialing side
+    // recognises it and hangs up before it authenticates; the handshake goes
+    // on as usual here so that it gets that far, and the hang-up is then
+    // reported for what it is instead of as a refused peer.
+    let from_self = sec.is_live(&msg1[msg1.len() - NONCE_LEN..]);
+    let to_itself = || sec.own_identity_error(OwnIdentity::SelfConnection, "the dialer");
     let x_i = &msg1[37..37 + X25519_LEN];
     let ek = mlkem768::PublicKey::from_bytes(&msg1[37 + X25519_LEN..37 + X25519_LEN + mlkem768::public_key_bytes()])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "mesh: bad ML-KEM key"))?;
@@ -845,7 +1000,9 @@ pub fn handshake_inbound(sock: &mut TcpStream, sec: &MeshSecurity) -> io::Result
     msg2.push(VERSION);
     msg2.extend_from_slice(x_public.as_bytes());
     msg2.extend_from_slice(ct.as_bytes());
-    msg2.extend_from_slice(&random_nonce()?);
+    let nonce = random_nonce()?;
+    let _live = sec.live(nonce);
+    msg2.extend_from_slice(&nonce);
     let h = transcript(&msg1, &msg2);
     let (i2r, r2i) = derive_keys(&h, kem.as_bytes(), &*dh)?;
     let mut sealer = Sealer::new(&r2i);
@@ -854,8 +1011,15 @@ pub fn handshake_inbound(sock: &mut TcpStream, sec: &MeshSecurity) -> io::Result
     write_all_until(sock, &msg2, deadline)?;
     let mine = auth_payload(me, &h, CTX_RESPONDER);
     sealer.write_record(sock, &[&mine])?;
-    let theirs = opener.read_auth_record(sock, deadline)?;
+    let theirs = opener.read_auth_record(sock, deadline).map_err(|e| if from_self { to_itself() } else { e })?;
     let peer = check_auth(&theirs, &h, CTX_INITIATOR)?;
+    if peer == me.id {
+        return Err(if from_self {
+            to_itself()
+        } else {
+            sec.own_identity_error(OwnIdentity::SharedIdentityFile, "a node that dialed in")
+        });
+    }
     sec.admit(&peer, None)?;
     Ok(Session::Sealed { sealer, opener, peer, authenticated: sec.checks_identities() })
 }
@@ -1065,13 +1229,60 @@ mod tests {
         let (cli, srv) = pair(me.clone(), me.clone());
         let err = cli.err().expect("a self-connection must be refused");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-        assert!(err.to_string().contains("own identity"), "{err}");
-        assert!(srv.is_err());
+        assert_eq!(own_identity_refusal(&err), Some(OwnIdentity::SelfConnection), "{err}");
+        assert_eq!(own_identity_refusal(&srv.err().expect("refused")), Some(OwnIdentity::SelfConnection));
         assert!(me.admit(&id, None).is_err(), "inbound as well");
 
         let open = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
-        let (cli, srv) = pair(open.clone(), open);
+        let (cli, srv) = pair(open.clone(), open.clone());
         assert!(cli.is_err() && srv.is_err(), "encryption-only mode refuses itself too");
+        assert!(open.live_nonces.lock().unwrap().is_empty(), "a finished handshake leaves no nonce behind");
+    }
+
+    /// W4-2: a peer that presents this node's own identity is either this
+    /// node (its own address in `--peers`, a NAT hairpin) or another node
+    /// started from a copy of its data directory. The first is harmless and
+    /// is reported as such on both ends; the second is the one an operator
+    /// must act on, and it says so: what happened, and how to regenerate.
+    #[test]
+    fn a_copied_identity_file_is_told_apart_from_a_connection_to_itself() {
+        let dir = std::env::temp_dir().join(format!("mesh-id-twin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let node = || Arc::new(MeshSecurity::load(Mode::Require, NET, &dir, None, &[], &[], false).unwrap());
+        // Two nodes, one identity file.
+        let (first, second) = (node(), node());
+        assert_eq!(first.identity_id(), second.identity_id());
+        let (cli, srv) = pair(first.clone(), second);
+        let err = cli.err().expect("a node holding the same identity must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(own_identity_refusal(&err), Some(OwnIdentity::SharedIdentityFile), "{err}");
+        let text = err.to_string();
+        for needle in [
+            "IDENTITY CONFLICT",
+            "TWO NODES ARE RUNNING WITH COPIES OF ONE mesh_identity.bin",
+            "not a connection of this node to itself",
+            "stop ONE of the two nodes, delete its mesh_identity.bin",
+            &dir.join(IDENTITY_FILE).display().to_string(),
+            &crate::codec::hex(&first.identity_id().unwrap()),
+        ] {
+            assert!(text.contains(needle), "`{needle}` missing from: {text}");
+        }
+        // The dialer hangs up before it authenticates, so the listener sees
+        // a peer that went away, not one it could name.
+        assert_eq!(own_identity_refusal(&srv.err().expect("refused")), None);
+
+        // An old dialer (before CRY-9) does not check and authenticates:
+        // then it is the listener that names the conflict.
+        assert_eq!(own_identity_refusal(&first.admit(&first.identity_id().unwrap(), None).unwrap_err()),
+            Some(OwnIdentity::SharedIdentityFile));
+
+        // The same node at both ends is not that, with the same file.
+        let (cli, srv) = pair(first.clone(), first);
+        let err = cli.err().expect("refused");
+        assert_eq!(own_identity_refusal(&err), Some(OwnIdentity::SelfConnection), "{err}");
+        assert!(!err.to_string().contains("CONFLICT"), "{err}");
+        assert_eq!(own_identity_refusal(&srv.err().expect("refused")), Some(OwnIdentity::SelfConnection));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Review CRY-9: the transport identity is loaded only at owner-only
@@ -1089,6 +1300,11 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
             let err = MeshSecurity::load(Mode::Offer, NET, &dir, None, &[], &[], false).err().expect("refused");
             assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{mode:o}: {err}");
+            // W4-4: the refusal stops the node at boot, so it names the
+            // exact command that lets it start.
+            let text = err.to_string();
+            assert!(text.contains(&format!("`chmod 600 {}`", path.display())), "{text}");
+            assert!(text.contains(&format!("mode {mode:04o}")) && text.contains("does not start"), "{text}");
         }
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let again = MeshSecurity::load(Mode::Offer, NET, &dir, None, &[], &[], false).unwrap();
