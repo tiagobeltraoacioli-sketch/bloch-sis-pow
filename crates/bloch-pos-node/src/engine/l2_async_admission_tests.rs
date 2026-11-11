@@ -17,7 +17,14 @@ fn field(offset: usize) -> [u8; 32] {
 /// in: the second block froze the settlement source, so a settlement can
 /// pass every check that precedes the proof.
 fn engine_with_frozen_source() -> (Engine, perf_support::TestDir) {
-    let (mut node, dir) = perf_support::proposing_engine();
+    engine_with_frozen_source_funded(&[])
+}
+
+/// The same engine opening with a ledger.
+pub(super) fn engine_with_frozen_source_funded(
+    opening: &[bloch_pos_committee::state_root::EutxoEntry],
+) -> (Engine, perf_support::TestDir) {
+    let (mut node, dir) = perf_support::proposing_engine_funded(opening);
     let genesis = (*node.state.arc()).clone();
     let mut policy = Policy {
         identities: std::array::from_fn(|i| field(i * 32)),
@@ -39,7 +46,7 @@ fn engine_with_frozen_source() -> (Engine, perf_support::TestDir) {
 
 /// A settlement that matches the engine's committed policy, source and
 /// successor, carrying `proof`.
-fn settlement(node: &Engine, proof: [u8; 356]) -> Transaction {
+pub(super) fn settlement(node: &Engine, proof: [u8; 356]) -> Transaction {
     let l2 = node.state.l2_settlement().unwrap();
     let source = l2.frozen_source().unwrap();
     let mut statement = TEMPLATE.to_vec();
@@ -54,7 +61,7 @@ fn settlement(node: &Engine, proof: [u8; 356]) -> Transaction {
     Transaction { proof_policy: l2.policy().proof_policy, statement, proof }
 }
 
-fn wire(tx: Transaction) -> PosTransaction {
+pub(super) fn wire(tx: Transaction) -> PosTransaction {
     PosTransaction::L2SettlementAsync(Box::new(tx))
 }
 

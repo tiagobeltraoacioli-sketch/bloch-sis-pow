@@ -1703,6 +1703,8 @@ mod ws_lifecycle_tests;
 
 #[cfg(test)]
 mod l2_async_admission_tests;
+#[cfg(test)]
+mod l2_preflight_tests;
 
 mod local_cache;
 mod verification;
@@ -5397,7 +5399,11 @@ impl Engine {
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
         // A proof reserves the whole gas budget. Never pack it with transfers.
-        if let Some(tx) = self.mempool.values().find(|tx| matches!(tx, PosTransaction::L2SettlementAsync(_))) {
+        // Only one that still matches this head (review EXE-2): admission
+        // judged it against the head of that moment, and a pending settlement
+        // the head has moved past would be refused by the probe and leave the
+        // block without the transactions it displaced.
+        if let Some(tx) = self.mempool.values().find(|tx| self.pending_settlement_applies(tx)) {
             return vec![tx.clone()];
         }
         // Admission is a historical observation, not a reservation of inputs or
@@ -5407,9 +5413,22 @@ impl Engine {
         // again, making the exact same signed transaction eligible later.
         let mut funded_context = None;
         let candidates = self.mempool.iter().filter(|(encoded, tx)| {
-            self.candidate_is_backed(tx, encoded, epoch, &mut funded_context)
+            // A settlement is proposed alone (above) or not at all.
+            !matches!(tx, PosTransaction::L2SettlementAsync(_))
+                && self.candidate_is_backed(tx, encoded, epoch, &mut funded_context)
         }).collect();
         Self::pack_transactions(epoch, *self.state.head().as_bytes(), candidates)
+    }
+
+    /// Whether `tx` is an asynchronous L2 settlement that passes every
+    /// proof-free check of the transition against the current head (review
+    /// EXE-2). The proof itself was verified at admission and does not
+    /// change. Node-local; no consensus effect.
+    fn pending_settlement_applies(&self, tx: &PosTransaction) -> bool {
+        let PosTransaction::L2SettlementAsync(settlement) = tx else { return false };
+        self.state.l2_settlement().is_some_and(|l2| {
+            l2.pending_async_refusal(settlement, *self.state.head().as_bytes(), self.state.slot()).is_none()
+        })
     }
 
     /// Node relay policy (HF2 sigdet): the proposer never selects a spend
@@ -5455,6 +5474,8 @@ impl Engine {
     fn candidate_is_backed(&self, tx: &PosTransaction, key: &[u8], epoch: u64,
         funded_context: &mut Option<(Arc<CommittedState>, u128)>) -> bool {
         if admission::check_transfer(&self.state, tx, key.len(), epoch).is_err() { return false; }
+        // A pending settlement the head has moved past backs nothing (EXE-2).
+        if matches!(tx, PosTransaction::L2SettlementAsync(_)) { return self.pending_settlement_applies(tx); }
         // NODE RELAY POLICY (HF2 sigdet): the proposer never selects a spend
         // whose witness fails the FIPS 204 reference verifier, even if it
         // reached the mempool by a path that skipped `admissible`. Not a

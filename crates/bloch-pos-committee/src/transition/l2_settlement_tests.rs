@@ -2691,6 +2691,40 @@ mod l2_tests {
         refuse(&post, &claim_of(&post, &leaves, 3, None), ClaimReject::RateLimited);
     }
 
+    // ── Proof-free preflights for the node (review EXE-1, EXE-2) ──────────
+
+    /// The retention check for a settlement that is already pending judges it
+    /// as the next block will: it accepts one whose source the next block
+    /// pins, and refuses one the head has moved past, whatever its proof.
+    #[test]
+    fn pending_settlement_check_follows_the_head() {
+        let (pre, mut chains) = fixture_mode(true);
+        let l2 = pre.l2_settlement().unwrap();
+        assert!(l2.frozen_source().is_none());
+        let first = transaction(&pre);
+        // No source is pinned yet, so admission refuses it; the next block
+        // pins exactly this head, and the transition accepts it there.
+        assert_eq!(l2.validate_async(&first, &ProofDouble), Err(Reject::NotActive));
+        assert_eq!(l2.pending_async_refusal(&first, *pre.head.as_bytes(), pre.slot), None);
+        let wire = PosTransaction::L2SettlementAsync(Box::new(first.clone()));
+        let post = apply(&pre, 2, std::slice::from_ref(&wire), &mut chains).expect("applies in the next block");
+        // A second proof of the same statement can no longer apply.
+        let mut variant = first.clone();
+        variant.proof = [3; 356];
+        let l2 = post.l2_settlement().unwrap();
+        assert!(l2.pending_async_refusal(&variant, *post.head.as_bytes(), post.slot).is_some());
+        assert!(l2.pending_async_refusal(&first, *post.head.as_bytes(), post.slot).is_some());
+        assert!(post.clone().apply_transaction(&PosTransaction::L2SettlementAsync(Box::new(variant)), 0, 1, &ProofDouble).is_err());
+        // The successor for the new head passes, and a mismatch does not.
+        let empty = crate::l2_settlement::expected_body_commitment(&[]);
+        let next = settlement(&post, empty);
+        assert_eq!(l2.pending_async_refusal(&next, *post.head.as_bytes(), post.slot), None);
+        let mut wrong = next.clone();
+        wrong.statement[S + 264] ^= 1;
+        assert_eq!(l2.pending_async_refusal(&wrong, *post.head.as_bytes(), post.slot), Some(Reject::Successor));
+        assert!(apply(&post, 3, &[PosTransaction::L2SettlementAsync(Box::new(next))], &mut chains).is_ok());
+    }
+
     // ── Mainnet L2 policy approved 2026-10-14 ─────────────────────────────
 
     use crate::l2_settlement::mainnet;

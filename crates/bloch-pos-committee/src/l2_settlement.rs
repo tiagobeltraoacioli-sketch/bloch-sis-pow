@@ -1846,7 +1846,24 @@ impl State {
         slot: u64,
         asynchronous: bool,
     ) -> Result<(u64, u64, Option<withdrawal::Record>), Reject> {
-        if asynchronous != self.asynchronous || (asynchronous && self.source_anchor.is_none()) {
+        if asynchronous && self.source_anchor.is_none() {
+            return Err(Reject::NotActive);
+        }
+        self.check_against_source(tx, parent, slot, asynchronous)
+    }
+
+    /// [`Self::check_before_proof`] without its "a source is pinned" test:
+    /// with no anchor, the source is `(parent, slot)` at this height, which
+    /// is exactly what [`Self::prepare_source`] pins before the next block's
+    /// transactions.
+    fn check_against_source(
+        &self,
+        tx: &Transaction,
+        parent: [u8; 32],
+        slot: u64,
+        asynchronous: bool,
+    ) -> Result<(u64, u64, Option<withdrawal::Record>), Reject> {
+        if asynchronous != self.asynchronous {
             return Err(Reject::NotActive);
         }
         let s = tx.statement.as_slice();
@@ -1957,6 +1974,23 @@ impl State {
             }
         }
         Ok((end, number, new_withdrawals))
+    }
+
+    /// Whether an asynchronous settlement could still apply in the block
+    /// after `head` (this state's head block, at `head_slot`): every check
+    /// of [`Self::apply`] that needs no proof, the record limit included.
+    /// Node-local retention policy for a settlement that is already pending:
+    /// the proof was verified at admission, and what can change afterwards is
+    /// only whether the statement still matches the head. Unlike
+    /// [`Self::validate_async`] it judges a state with no pinned source the
+    /// way the next block's transition will (it pins `head` first), so a
+    /// settlement is never dropped for an anchor the next block provides.
+    pub fn pending_async_refusal(&self, tx: &Transaction, head: [u8; 32], head_slot: u64) -> Option<Reject> {
+        match self.check_against_source(tx, head, head_slot, true) {
+            Err(why) => Some(why),
+            Ok((_, _, Some(_))) if self.withdrawals.len() >= self.profile.limits.max_records() => Some(Reject::Limit),
+            Ok(_) => None,
+        }
     }
 
     /// Mempool preflight shares the transition checks and never mutates state.
