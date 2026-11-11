@@ -1349,6 +1349,9 @@ pub fn start(
     let peers_live_swarm = peers_live.clone();
 
     std::thread::Builder::new().name("bloch-p2p".into()).spawn(move || {
+        // GATE-08: a panic in the swarm (libp2p internals, an overflow check)
+        // must end the process, not leave a validator running with no network.
+        let _essential = crate::EssentialThread::new("bloch-p2p");
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
             Err(e) => {

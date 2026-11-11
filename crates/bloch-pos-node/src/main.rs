@@ -124,6 +124,90 @@ fn plaintext_opt_in_flag(args: &[String]) -> bool {
     false
 }
 
+/// Marks a thread the node cannot run without (review round 2, GATE-08).
+///
+/// The consensus loop is the main thread, so a panic there ends the process
+/// and the supervisor restarts it. A panic on any other thread ends only
+/// that thread: with the libp2p thread gone the engine kept running with no
+/// network, a frozen peer count and, after each quiet window, validator
+/// duties on its own head. Hold one of these for the life of such a thread;
+/// if the thread unwinds from a panic, the process aborts.
+///
+/// Deliberately not `panic = "abort"` in the release profile. That would
+/// also turn a panic on a thread the node CAN lose (one RPC connection, the
+/// metrics server, one devnet peer reader) from a dropped connection into a
+/// dead validator and a full replay, which makes any such panic a remote
+/// crash; and the test profile ignores the setting, so the tested behaviour
+/// and the shipped one would differ. A guard names exactly the threads whose
+/// loss is fatal and leaves the others as they are.
+pub(crate) struct EssentialThread {
+    name: &'static str,
+    on_panic: fn(&'static str),
+}
+
+impl EssentialThread {
+    pub(crate) fn new(name: &'static str) -> Self {
+        Self { name, on_panic: abort_for_essential_thread }
+    }
+
+    #[cfg(test)]
+    fn with(name: &'static str, on_panic: fn(&'static str)) -> Self {
+        Self { name, on_panic }
+    }
+}
+
+impl Drop for EssentialThread {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            (self.on_panic)(self.name);
+        }
+    }
+}
+
+fn abort_for_essential_thread(name: &'static str) {
+    eprintln!(
+        "FATAL: essential thread `{name}` panicked; aborting the process so the supervisor restarts the node \
+         instead of leaving it running without that thread"
+    );
+    // In-process test swarms share the test binary; killing it would hide
+    // the panic message of the test that caused it.
+    #[cfg(not(test))]
+    std::process::abort();
+}
+
+#[cfg(test)]
+mod essential_thread_tests {
+    use super::EssentialThread;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static PANICKED: AtomicUsize = AtomicUsize::new(0);
+
+    fn record(name: &'static str) {
+        assert_eq!(name, "test-essential");
+        PANICKED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn an_essential_thread_that_panics_runs_the_fatal_action() {
+        // A clean exit is not fatal.
+        std::thread::spawn(|| {
+            let _essential = EssentialThread::with("test-essential", record);
+        })
+        .join()
+        .expect("clean exit");
+        assert_eq!(PANICKED.load(Ordering::SeqCst), 0);
+        // A panic is, and the action runs on the panicking thread before it
+        // is gone.
+        let joined = std::thread::spawn(|| {
+            let _essential = EssentialThread::with("test-essential", record);
+            panic!("intentional: essential thread panic");
+        })
+        .join();
+        assert!(joined.is_err());
+        assert_eq!(PANICKED.load(Ordering::SeqCst), 1);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Audit I-H1. The keystore is sealed (Argon2id + XChaCha20-Poly1305) and

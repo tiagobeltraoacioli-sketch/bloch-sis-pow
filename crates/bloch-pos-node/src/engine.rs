@@ -7730,6 +7730,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let tx = tx.clone();
         let inflight = inflight.clone();
         std::thread::spawn(move || {
+            // GATE-08: without this thread no network event reaches the
+            // engine; a panic here must end the process, not the thread.
+            let _essential = crate::EssentialThread::new("net-event-forwarder");
             for ev in net_rx {
                 // COUNT IT IN, exactly as `net::send_to_engine` does on the
                 // devnet path.
