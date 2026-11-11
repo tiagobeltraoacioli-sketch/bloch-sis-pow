@@ -7303,6 +7303,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
+    // Review round 2, GATE-02: KES enforcement armed without the follow-up
+    // rules covering it is an open exposure the operator must see at every
+    // start, until the release that arms them.
+    for open in bloch_pos_committee::hard_forks::shipped_kes_follow_up_exposures() {
+        eprintln!(
+            "WARNING: KES enforcement is armed at epoch {} and {open}. Upgrade to the release that arms this gate before that epoch.",
+            bloch_pos_committee::params::HF3_KES_ENFORCE_EPOCH,
+        );
+    }
     // A build with consensus rules armed for development networks must never
     // join a funded network: refuse anything but a BPOSMAN3 development manifest.
     #[cfg(any(feature = "devnet-randao-recommit", feature = "devnet-l2-deposits"))]

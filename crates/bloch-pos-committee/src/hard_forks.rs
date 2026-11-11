@@ -91,6 +91,13 @@ pub const HARD_FORK_GATES: &[HardForkGate] = &[
     gate!(Hf3, params::HF3_SLH_SUITE_EPOCH, false),
     gate!(Hf3, params::HF3_PQ_MIGRATION_EPOCH, false),
     gate!(Hf3, params::LATTICE_EMERGENCY_ACTIVATION_EPOCH, false),
+    // HF3 KES follow-up rules from the security review (FC-3/CR-1, CR-2,
+    // CR-5). Listed so the RPC, the release-scope test and operators see
+    // them; see `kes_follow_up_gates_cover_enforcement` for how they relate
+    // to `HF3_KES_ENFORCE_EPOCH`.
+    gate!(Hf3, params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH, false),
+    gate!(Hf3, params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH, false),
+    gate!(Hf3, params::KES_REGISTER_EPOCH_BINDING_EPOCH, false),
 ];
 
 /// Gates that no scheduled release may arm (owner scope 2026-10-20: nothing
@@ -188,6 +195,153 @@ const _: () = assert!(params::NATIVE_SLASHING_ACTIVATION_EPOCH == params::HF2_SL
 const _: () = assert!(params::KES_REGISTRATION_EPOCH == params::HF3_KES_EPOCH);
 const _: () = assert!(params::KES_ACTIVATION_EPOCH == params::HF3_KES_ENFORCE_EPOCH);
 
+// ── KES follow-up gates versus KES enforcement (review round 2, GATE-02) ───
+//
+// Three rules repair defects that only bite once KES signatures are
+// enforced: the vote slot-epoch binding (FC-3/CR-1), the first-key floor
+// (CR-2) and the epoch-bound registration message (CR-5). Each has its own
+// gate so the owner chooses the flag day, but a build that arms enforcement
+// and leaves them inert ships the defects live.
+//
+// That combination exists today (enforcement 8620, all three `u64::MAX`), and
+// arming is the owner's decision, so a hard const assertion cannot be added
+// without either breaking the build or picking the epochs here. Instead:
+//
+// * [`KES_FOLLOW_UP_GATES_PENDING`] records, in one line, that the open
+//   combination is known. While it is `true` the node prints
+//   [`shipped_kes_follow_up_exposures`] at every boot.
+// * `the_kes_follow_up_flag_matches_the_shipped_gates` fails as soon as the
+//   flag and the constants disagree, in either direction, so the release
+//   that arms the gates must flip the flag to `false` in the same commit.
+// * Once it is `false`, the const assertion below makes the relation a
+//   compile-time rule: the gates can no longer be un-armed, or enforcement
+//   moved ahead of them, without a build failure.
+
+/// Last epoch at which [`params::KES_REGISTER_EPOCH_BINDING_EPOCH`] still
+/// precedes every pruning of retired KES key history: a retired tree can be
+/// re-registered from an old signature only after it has left the history,
+/// which is kept `KES_KEY_HISTORY_PERIODS` periods from enforcement on.
+pub const fn kes_register_binding_deadline(enforcement: u64) -> u64 {
+    enforcement.saturating_add(params::KES_KEY_HISTORY_PERIODS.saturating_mul(params::KES_PERIOD_EPOCHS))
+}
+
+/// The intended relation: KES enforcement is inert, or
+///
+/// * the vote slot-epoch binding is armed no later than enforcement,
+/// * the first-key floor is armed no later than enforcement, and
+/// * the registration epoch binding is armed no later than
+///   [`kes_register_binding_deadline`].
+pub const fn kes_follow_up_gates_cover_enforcement(
+    enforcement: u64,
+    slot_epoch_binding: u64,
+    first_key_floor: u64,
+    register_epoch_binding: u64,
+) -> bool {
+    !armed(enforcement)
+        || (requires_no_later(slot_epoch_binding, enforcement)
+            && requires_no_later(first_key_floor, enforcement)
+            && armed(register_epoch_binding)
+            && register_epoch_binding <= kes_register_binding_deadline(enforcement))
+}
+
+/// `true` while this line knowingly ships KES enforcement armed with at
+/// least one follow-up gate not covering it (see the block comment above).
+///
+/// OWNER: when the release arms the three gates so that
+/// [`kes_follow_up_gates_cover_enforcement`] holds, set this to `false` in
+/// the same commit. That is the only edit; the test and the const assertion
+/// do the rest.
+pub const KES_FOLLOW_UP_GATES_PENDING: bool = true;
+
+#[cfg(not(feature = "mldsa-pin-replay-qualification"))]
+const _: () = assert!(
+    KES_FOLLOW_UP_GATES_PENDING
+        || kes_follow_up_gates_cover_enforcement(
+            params::HF3_KES_ENFORCE_EPOCH,
+            params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH,
+            params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH,
+            params::KES_REGISTER_EPOCH_BINDING_EPOCH,
+        ),
+    "KES enforcement is armed without the slot-epoch binding, the first-key floor or the registration binding covering it"
+);
+
+/// One KES follow-up rule that is not in force when the defect it repairs
+/// becomes reachable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KesFollowUpExposure {
+    /// The gate that does not cover enforcement.
+    pub gate: &'static str,
+    /// Its value (`u64::MAX`: inert).
+    pub gate_epoch: u64,
+    /// First epoch at which the exposure can exist.
+    pub open_from_epoch: u64,
+    /// What is exposed, for the operator.
+    pub exposure: &'static str,
+}
+
+impl core::fmt::Display for KesFollowUpExposure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} is ", self.gate)?;
+        if armed(self.gate_epoch) {
+            write!(f, "armed at epoch {}, too late", self.gate_epoch)?;
+        } else {
+            write!(f, "NOT ARMED")?;
+        }
+        write!(f, ": open from epoch {} on: {}", self.open_from_epoch, self.exposure)
+    }
+}
+
+/// The follow-up rules that do not cover `enforcement`, in gate order. Empty
+/// exactly when [`kes_follow_up_gates_cover_enforcement`] holds.
+pub fn kes_follow_up_exposures(
+    enforcement: u64,
+    slot_epoch_binding: u64,
+    first_key_floor: u64,
+    register_epoch_binding: u64,
+) -> Vec<KesFollowUpExposure> {
+    let mut out = Vec::new();
+    if !armed(enforcement) {
+        return out;
+    }
+    if !requires_no_later(slot_epoch_binding, enforcement) {
+        out.push(KesFollowUpExposure {
+            gate: "params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH",
+            gate_epoch: slot_epoch_binding,
+            open_from_epoch: enforcement,
+            exposure: "once KES binds, a vote with a current slot and another target epoch is judged under                        different keys by gossip and by block validation (FC-3/CR-1): it stays block-valid under a                        retired static key, and equivocation evidence for it cannot be proven",
+        });
+    }
+    if !requires_no_later(first_key_floor, enforcement) {
+        out.push(KesFollowUpExposure {
+            gate: "params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH",
+            gate_epoch: first_key_floor,
+            open_from_epoch: enforcement,
+            exposure: "a validator that registers its first KES key after the bind cannot sign for the rest of                        that period, and what it signed with its static key before registering cannot be proven                        as evidence (CR-2)",
+        });
+    }
+    let deadline = kes_register_binding_deadline(enforcement);
+    if !armed(register_epoch_binding) || register_epoch_binding > deadline {
+        out.push(KesFollowUpExposure {
+            gate: "params::KES_REGISTER_EPOCH_BINDING_EPOCH",
+            gate_epoch: register_epoch_binding,
+            open_from_epoch: deadline,
+            exposure: "every KES registration signed before this gate never expires and can be re-broadcast by                        anyone once its tree leaves the retired-key history, restoring a retired key (CR-5); the                        later the gate, the more such signatures exist",
+        });
+    }
+    out
+}
+
+/// [`kes_follow_up_exposures`] for the constants this binary was built with.
+/// The node prints each entry at boot.
+pub fn shipped_kes_follow_up_exposures() -> Vec<KesFollowUpExposure> {
+    kes_follow_up_exposures(
+        params::HF3_KES_ENFORCE_EPOCH,
+        params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH,
+        params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH,
+        params::KES_REGISTER_EPOCH_BINDING_EPOCH,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +414,67 @@ mod tests {
                 assert!(HARD_FORK_GATES.iter().any(|g| g.name == full), "{full} missing from HARD_FORK_GATES");
             }
         }
+    }
+
+    /// GATE-02. Today the relation does NOT hold and the flag says so; the
+    /// release that arms the gates flips `KES_FOLLOW_UP_GATES_PENDING` and
+    /// nothing else here.
+    #[test]
+    fn the_kes_follow_up_flag_matches_the_shipped_gates() {
+        let covered = kes_follow_up_gates_cover_enforcement(
+            params::HF3_KES_ENFORCE_EPOCH,
+            params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH,
+            params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH,
+            params::KES_REGISTER_EPOCH_BINDING_EPOCH,
+        );
+        assert_eq!(
+            covered, !KES_FOLLOW_UP_GATES_PENDING,
+            "KES_FOLLOW_UP_GATES_PENDING is stale: the shipped gates {} cover KES enforcement.              Set the flag to {} in hard_forks.rs",
+            if covered { "now" } else { "do not" },
+            !covered,
+        );
+        // The boot warning is exactly the open part of the relation.
+        assert_eq!(shipped_kes_follow_up_exposures().is_empty(), covered);
+    }
+
+    #[test]
+    fn the_kes_follow_up_relation() {
+        let deadline = kes_register_binding_deadline(8_620);
+        assert_eq!(deadline, 8_620 + 365 * 90);
+        // Enforcement inert: nothing to cover.
+        assert!(kes_follow_up_gates_cover_enforcement(M, M, M, M));
+        assert!(kes_follow_up_exposures(M, M, M, M).is_empty());
+        // All three armed in time.
+        assert!(kes_follow_up_gates_cover_enforcement(8_620, 8_620, 8_620, 8_620));
+        assert!(kes_follow_up_gates_cover_enforcement(8_620, 8_500, 8_400, deadline));
+        assert!(kes_follow_up_exposures(8_620, 8_500, 8_400, deadline).is_empty());
+        // The shipped combination of 2026-11-10: every gate is reported.
+        assert!(!kes_follow_up_gates_cover_enforcement(8_620, M, M, M));
+        let open = kes_follow_up_exposures(8_620, M, M, M);
+        assert_eq!(
+            open.iter().map(|e| (e.gate, e.open_from_epoch)).collect::<Vec<_>>(),
+            [
+                ("params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH", 8_620),
+                ("params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH", 8_620),
+                ("params::KES_REGISTER_EPOCH_BINDING_EPOCH", deadline),
+            ]
+        );
+        let text = open[0].to_string();
+        assert!(text.contains("NOT ARMED") && text.contains("8620"), "{text}");
+        // Each gate alone, inert or late.
+        for (binding, floor, register, gate) in [
+            (M, 8_620, 8_620, "params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH"),
+            (8_621, 8_620, 8_620, "params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH"),
+            (8_620, M, 8_620, "params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH"),
+            (8_620, 8_621, 8_620, "params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH"),
+            (8_620, 8_620, M, "params::KES_REGISTER_EPOCH_BINDING_EPOCH"),
+            (8_620, 8_620, deadline + 1, "params::KES_REGISTER_EPOCH_BINDING_EPOCH"),
+        ] {
+            assert!(!kes_follow_up_gates_cover_enforcement(8_620, binding, floor, register), "{gate}");
+            let open = kes_follow_up_exposures(8_620, binding, floor, register);
+            assert_eq!(open.iter().map(|e| e.gate).collect::<Vec<_>>(), [gate]);
+        }
+        assert!(kes_follow_up_exposures(8_620, 8_621, 8_620, 8_620)[0].to_string().contains("too late"));
     }
 
     #[test]
