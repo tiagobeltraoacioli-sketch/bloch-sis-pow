@@ -7475,8 +7475,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
             match protection.settle_missing_history(boot_wall_slot, acknowledged)? {
                 crate::slashprot::MissingHistory::Proven => {}
                 crate::slashprot::MissingHistory::Unproven { before_slot } => println!(
-                    "slashing protection: no record and no host signer anchor; this key may sign \
-                     only if its duties began at or after wall slot {before_slot}"
+                    "slashing protection: no record and no host signer anchor that already held \
+                     one; this key may sign only if its duties began at or after wall slot {before_slot}"
                 ),
                 crate::slashprot::MissingHistory::Acknowledged => println!(
                     "SLASHING PROTECTION: MISSING RECORD ACKNOWLEDGED ({} is set). The operator \
@@ -7867,6 +7867,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // Review CR-8, boot half: the registry is known now. A key that already
     // had duties, with no slashing-protection record and no signer anchor,
     // does not start. Non-retryable, so a supervisor does not loop on it.
+    // Review PER-6: the replayed head bounds "now" from below, whatever the
+    // wall clock said when the reference slot was written.
+    engine.slashprot.raise_unproven_reference(engine.state.slot())?;
     let boot_wall_slot = now_ms().saturating_sub(engine.manifest.genesis_time_ms) / engine.manifest.slot_ms.max(1);
     if let Some(refusal) = engine.missing_history_refusal(boot_wall_slot) {
         return Err(crate::ws_boot::boot_refused(refusal));
