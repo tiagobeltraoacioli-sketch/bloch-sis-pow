@@ -3697,6 +3697,63 @@ mod tests {
         assert_eq!(wait_for(2), 2);
     }
 
+    /// W3-3 (V2-6), through the accept loop: an address listed in `--peers`
+    /// once gets `2 * 1 + 2` exempt connections, and the next ones from it
+    /// are ordinary (here: the pending share of a source that sends
+    /// nothing). With the accept loop treating every connection from a
+    /// listed address as configured, all of them would be kept.
+    #[test]
+    fn the_accept_loop_rations_the_configured_standing_of_a_listed_address() {
+        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        // A configured peer at 127.0.0.1 that is not running: the port was
+        // free a moment ago and nothing listens on it.
+        let absent_peer = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let mesh = start(
+            "127.0.0.1",
+            0,
+            vec![absent_peer.to_string()],
+            events,
+            std::env::temp_dir(),
+            Arc::new(AtomicU64::new(0)),
+            QueueBudget::new(),
+            Arc::new(crate::mesh_pq::MeshSecurity::plain()),
+        )
+        .expect("bind the devnet transport");
+        let port = mesh.listen_addr().port();
+        let listed_here = 1usize;
+        let exempt = 2 * listed_here + 2;
+        assert!(inbound_slots::Standing::for_source(listed_here, exempt - 1).is_configured());
+        assert!(!inbound_slots::Standing::for_source(listed_here, exempt).is_configured());
+        let kept = exempt + MAX_PENDING_INBOUND_PER_SOURCE;
+        let total = kept + 6;
+        let mut conns = Vec::with_capacity(total);
+        for _ in 0..total {
+            conns.push(TcpStream::connect(("127.0.0.1", port)).expect("connect"));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mesh.peer_count() < kept && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            mesh.peer_count(),
+            kept,
+            "a listed address holds its exempt connections plus an ordinary source's pending share, no more"
+        );
+        // The accept loop is sequential, so the ones past both shares are
+        // the last six, and the server closed them.
+        for mut sock in conns.split_off(kept) {
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 1];
+            match sock.read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => panic!("{n} unexpected bytes from a refused connection"),
+                Err(e) => panic!("a connection past the configured standing was not closed: {e}"),
+            }
+        }
+        drop(conns);
+    }
+
     /// R3 M-4 / R1 A3-M2: the devnet listener accepts at most
     /// `MAX_INBOUND_CONNECTIONS` at once, and a connection past the cap is
     /// closed by the server immediately rather than left half-open. This

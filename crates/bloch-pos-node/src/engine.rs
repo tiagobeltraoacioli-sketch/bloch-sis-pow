@@ -521,12 +521,15 @@ fn now_ms() -> u64 {
 /// here, on every restart. Name it, so the operator is not left with a
 /// corrupt-disk diagnosis for a release mistake.
 fn replay_failure_message(epoch: u64) -> String {
+    replay_failure_message_for(bloch_pos_committee::hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY, epoch)
+}
+
+/// [`replay_failure_message`] over an explicit gate list, so the message can
+/// be tested with a gate armed in the past (the shipped list has none).
+fn replay_failure_message_for(unarmed: &[bloch_pos_committee::hard_forks::UnarmedGate], epoch: u64) -> String {
     let mut msg =
         String::from("durable block log failed consensus replay; refusing to serve a partial head");
-    let gates = bloch_pos_committee::hard_forks::gates_armed_at_or_below(
-        bloch_pos_committee::hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY,
-        epoch,
-    );
+    let gates = bloch_pos_committee::hard_forks::gates_armed_at_or_below(unarmed, epoch);
     if !gates.is_empty() {
         let list: Vec<String> = gates.iter().map(|(name, at)| format!("{name} = {at}")).collect();
         msg.push_str(&format!(
@@ -18818,6 +18821,58 @@ mod ingest_admission_tests {
         // outside the grace and the stale-head test was not yet true.
         assert!(!in_boot_grace(replay_done, constructed, grace));
         assert!(!node_is_behind(head_slot, wall_slot, replay_done, last_applied, grace));
+    }
+
+    /// **W3-3 (GATE-06): the slot loop starts the boot grace itself.** The
+    /// test above covers the two pure functions and passes with the fix
+    /// line removed; the loop cannot be driven from a unit test, so this
+    /// reads it: `booted_ms` is set after replay and before the first turn,
+    /// and the grace is measured from it.
+    #[test]
+    fn the_slot_loop_times_the_boot_grace_from_its_own_start() {
+        let source = include_str!("engine.rs");
+        let replay = source.find("if !engine.ingest_replay(env) || engine.state.head() != expected_id {").expect("boot replay");
+        let loop_start = source.find("    // ── The slot loop ──").expect("slot loop");
+        let stamp = source.find("    engine.booted_ms = now_ms();\n").expect("the grace is started by the slot loop");
+        let first_use = source.find("let in_grace = in_boot_grace(now, engine.booted_ms, two_slots_ms);").expect("grace read");
+        assert!(replay < loop_start && loop_start < stamp && stamp < first_use, "boot grace is not timed from the end of replay");
+        // Nothing between the stamp and the loop's first turn is a block
+        // application: the stamp is taken after the last boot work.
+        let turn = source[stamp..].find("        let (now, monotonic_now) = sample_clocks(monotonic_origin);").map(|o| stamp + o).expect("first turn");
+        assert!(!source[stamp..turn].contains("ingest_replay("), "replay runs after the grace started");
+    }
+
+    /// **W3-3 (GATE-03): the replay failure names the gate armed in the
+    /// past, and boot replay reports through that message.**
+    #[test]
+    fn a_replay_failure_names_a_gate_armed_at_or_below_the_failing_epoch() {
+        const M: u64 = u64::MAX;
+        let plain = "durable block log failed consensus replay; refusing to serve a partial head";
+        let gates: &[bloch_pos_committee::hard_forks::UnarmedGate] =
+            &[("params::A_EPOCH", M), ("params::B_EPOCH", 7_360), ("params::C_EPOCH", 9_000)];
+        // Below every armed gate: the plain diagnosis.
+        assert_eq!(replay_failure_message_for(gates, 7_359), plain);
+        // At the gate's own epoch and above: the gate is named, the inert
+        // one and the one still ahead are not.
+        for epoch in [7_360, 8_000] {
+            let msg = replay_failure_message_for(gates, epoch);
+            assert!(msg.starts_with(plain), "{msg}");
+            assert!(msg.contains("params::B_EPOCH = 7360") && msg.contains(&format!("epoch {epoch}")), "{msg}");
+            assert!(!msg.contains("A_EPOCH") && !msg.contains("C_EPOCH"), "{msg}");
+            assert!(msg.contains("re-released with a future epoch"), "{msg}");
+        }
+        // As shipped nothing is armed, so the message stays the plain one.
+        assert_eq!(replay_failure_message(M - 1), plain);
+        // Wiring: the production message is the tested one over the
+        // canonical list, and boot replay fails with it.
+        let source = include_str!("engine.rs");
+        assert!(source.contains(
+            "    replay_failure_message_for(bloch_pos_committee::hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY, epoch)\n"
+        ));
+        let replay = source.find("if !engine.ingest_replay(env) || engine.state.head() != expected_id {").expect("boot replay");
+        let arm = &source[replay..];
+        let arm = &arm[..arm.find("\n        }\n").expect("end of the failure arm")];
+        assert!(arm.contains("replay_failure_message(replay_epoch)"), "boot replay no longer reports through the message");
     }
 
     /// What one clock scenario did to the step report and to the duty gates.
