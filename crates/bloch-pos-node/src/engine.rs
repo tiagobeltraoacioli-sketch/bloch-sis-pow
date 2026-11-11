@@ -11699,6 +11699,44 @@ mod transfer_v2_end_to_end {
         }
     }
 
+    /// Review R308-2P-2 (agent 308, second pass). `check_l2_funding` mirrors
+    /// the funding half of what consensus checks and calls the result
+    /// "backed", but it never looks at the fields that decide whether the
+    /// transaction can apply on THIS network at all: `network_domain`
+    /// (consensus `Network`), a forced envelope's `l2_chain_id` (consensus
+    /// `Chain`), nor the shape (`validate_shape`: input order, envelope
+    /// size). An envelope for another chain is therefore backed for ever, is
+    /// never included, never spends its output, holds a place in the
+    /// reserved room (`forced_room`), and its arrival displaces entries of
+    /// other kinds "whatever their tip". 64 outputs that are never spent
+    /// close the room to honest envelopes (R308-2 again), and input-sharing
+    /// copies at the tip ceiling evict and keep out paying transfers.
+    /// Two envelopes that differ only in chain and network cannot both be
+    /// applicable to one network. Expected: at most one is backed, and only
+    /// that one holds room.
+    #[test]
+    fn r308_2p_2_an_envelope_for_another_network_or_chain_is_not_backed_and_holds_no_room() {
+        use super::admission::check_l2_funding;
+        let epoch = V2_FLAG_DAY + 1;
+        let here = forced_envelope_tx(0x30, 0, 0);
+        let mut elsewhere = forced_envelope_tx(0x31, 0, 0);
+        if let PosTransaction::L2ForcedTransaction(f) = &mut elsewhere {
+            f.l2_chain_id = 1;
+            f.network_domain = [0xde; 32];
+        }
+        let mut node = engine_backing(epoch, &[here.clone(), elsewhere.clone()]);
+        let backed = |node: &Engine, tx: &PosTransaction| check_l2_funding(&node.state, None, tx, tx.canonical_bytes().len(), epoch).is_ok();
+        let both = backed(&node, &here) && backed(&node, &elsewhere);
+        for tx in [&here, &elsewhere] {
+            node.mempool.insert(tx.canonical_bytes(), tx.clone());
+        }
+        let room = node.forced_room(&BTreeSet::new(), epoch).len();
+        assert!(
+            !both && room <= 1,
+            "envelopes for two different networks and L2 chains are both backed ({both}) and hold {room} places of the reserved room"
+        );
+    }
+
     /// F-9: which commitments win the scarce slots is re-drawn from the
     /// parent block id, so grinding commitment bytes low (the canonical-bytes
     /// tie-break) does not buy every slot, and the draw changes per block.
