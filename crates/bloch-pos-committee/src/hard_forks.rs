@@ -342,6 +342,87 @@ pub fn shipped_kes_follow_up_exposures() -> Vec<KesFollowUpExposure> {
     )
 }
 
+// ── Gates that canonical history was not produced under (GATE-03) ──────────
+
+/// A gate that has never been in force on the canonical chain, with the
+/// value this binary was built with.
+pub type UnarmedGate = (&'static str, u64);
+
+macro_rules! unarmed {
+    ($path:path) => {
+        (stringify!($path), $path)
+    };
+}
+
+/// Every consensus gate that was inert when the canonical chain produced its
+/// history so far: blocks already on the chain were never checked against
+/// the rule behind it, and may contain what it forbids.
+///
+/// Arming one of them at an epoch the chain has already passed does not
+/// affect running nodes, but every restart and every deep reorg replays the
+/// durable log under the compiled constants and then fails on the first old
+/// block the new rule refuses. A gate on this list must therefore be armed
+/// at a FUTURE epoch only, with the usual flag-day margin.
+///
+/// Two checks read the list:
+///
+/// * a build with a release-baked weak-subjectivity checkpoint refuses to
+///   start when a listed gate is armed at or below the checkpoint's epoch
+///   (`ws_boot::compiled_release_anchor`; a unit test checks the same against
+///   the anchor file in every build). The anchor is finalized history, so
+///   this is a certain error; it is a lower bound, not the chain head, so an
+///   epoch above the anchor can still be in the past;
+/// * when boot replay fails, the node names the listed gates armed at or
+///   below the failing block's epoch.
+///
+/// Maintenance: a gate stays here after it is armed. Remove it only when the
+/// release anchor is re-baked at an epoch above the gate, at which point the
+/// rule is part of the anchored history.
+/// `every_inert_gate_in_params_is_listed_as_unarmed` keeps the list complete.
+pub const GATES_UNARMED_IN_CANONICAL_HISTORY: &[UnarmedGate] = &[
+    unarmed!(params::ANCESTRY_SEED_ACTIVATION_EPOCH),
+    unarmed!(params::DEPOSIT_ACTIVATION_EPOCH),
+    unarmed!(params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH),
+    unarmed!(params::SLASHING_ECONOMICS_V2_ACTIVATION_EPOCH),
+    unarmed!(params::DUST_RULE_ACTIVATION_EPOCH),
+    unarmed!(params::TX_BYTES_BOUND_ACTIVATION_EPOCH),
+    unarmed!(params::ATTESTATION_DEDUP_ACTIVATION_EPOCH),
+    unarmed!(params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH),
+    unarmed!(params::REWARDS_V2_ACTIVATION_EPOCH),
+    unarmed!(params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH),
+    unarmed!(params::FORKCHOICE_SLOT_TIEBREAK_ACTIVATION_EPOCH),
+    unarmed!(params::STAKING_TX_METERING_ACTIVATION_EPOCH),
+    unarmed!(params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH),
+    unarmed!(params::VALIDATOR_NETWORK_BINDING_ACTIVATION_EPOCH),
+    unarmed!(params::FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH),
+    unarmed!(params::FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH),
+    unarmed!(params::ACTIVATION_QUEUE_V2_ACTIVATION_EPOCH),
+    unarmed!(params::LATTICE_EMERGENCY_ACTIVATION_EPOCH),
+    unarmed!(params::DUTY_ROSTER_RECOVERY_ACTIVATION_EPOCH),
+    unarmed!(params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH),
+    unarmed!(params::KES_REGISTER_EPOCH_BINDING_EPOCH),
+];
+
+/// The gates of `gates` armed at or below `epoch`, in list order.
+pub fn gates_armed_at_or_below(gates: &[UnarmedGate], epoch: u64) -> Vec<UnarmedGate> {
+    gates.iter().copied().filter(|(_, gate)| armed(*gate) && *gate <= epoch).collect()
+}
+
+/// `Err` naming every gate of [`GATES_UNARMED_IN_CANONICAL_HISTORY`] that
+/// this binary arms at or below `anchor_epoch`, an epoch of finalized
+/// canonical history (the release-baked weak-subjectivity checkpoint).
+pub fn check_gates_above_anchored_history(gates: &[UnarmedGate], anchor_epoch: u64) -> Result<(), String> {
+    let bad = gates_armed_at_or_below(gates, anchor_epoch);
+    if bad.is_empty() {
+        return Ok(());
+    }
+    let list: Vec<String> = bad.iter().map(|(name, epoch)| format!("{name} = {epoch}")).collect();
+    Err(format!(
+        "this build arms {} at or below epoch {anchor_epoch}, the finalized checkpoint it was released with.          That rule was not in force when those blocks were produced, so replaying canonical history would fail.          Arm the gate at a future epoch",
+        list.join(", ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +556,46 @@ mod tests {
             assert_eq!(open.iter().map(|e| e.gate).collect::<Vec<_>>(), [gate]);
         }
         assert!(kes_follow_up_exposures(8_620, 8_621, 8_620, 8_620)[0].to_string().contains("too late"));
+    }
+
+    /// GATE-03: a gate that history was not produced under may not be armed
+    /// at or below an epoch of that history.
+    #[test]
+    fn a_gate_armed_into_anchored_history_is_refused() {
+        let gates: &[UnarmedGate] = &[("params::A_EPOCH", M), ("params::B_EPOCH", 7_360), ("params::C_EPOCH", 7_307)];
+        assert!(check_gates_above_anchored_history(gates, 7_306).is_ok());
+        assert_eq!(gates_armed_at_or_below(gates, 7_307), [("params::C_EPOCH", 7_307)]);
+        let err = check_gates_above_anchored_history(gates, 7_400).unwrap_err();
+        assert!(err.contains("params::B_EPOCH = 7360") && err.contains("params::C_EPOCH = 7307"), "{err}");
+        assert!(err.contains("epoch 7400") && !err.contains("A_EPOCH"), "{err}");
+        // Inert gates never trip, whatever the anchor.
+        assert!(check_gates_above_anchored_history(&[("params::A_EPOCH", M)], M).is_ok());
+        // As shipped, nothing on the list is armed at all.
+        assert!(gates_armed_at_or_below(GATES_UNARMED_IN_CANONICAL_HISTORY, M - 1).is_empty());
+    }
+
+    /// The list is complete: every `*_EPOCH` gate that `params.rs` ships at
+    /// `u64::MAX` is on it, and nothing is listed twice.
+    #[test]
+    fn every_inert_gate_in_params_is_listed_as_unarmed() {
+        let src = include_str!("params.rs");
+        for line in src.lines() {
+            let Some(rest) = line.strip_prefix("pub const ") else { continue };
+            let name: String =
+                rest.chars().take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_').collect();
+            if name.ends_with("_EPOCH") && rest[name.len()..].trim() == ": u64 = u64::MAX;" {
+                let full = format!("params::{name}");
+                assert!(
+                    GATES_UNARMED_IN_CANONICAL_HISTORY.iter().any(|(n, _)| *n == full),
+                    "{full} is inert but missing from GATES_UNARMED_IN_CANONICAL_HISTORY"
+                );
+            }
+        }
+        for (i, (a, _)) in GATES_UNARMED_IN_CANONICAL_HISTORY.iter().enumerate() {
+            for (b, _) in &GATES_UNARMED_IN_CANONICAL_HISTORY[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 
     #[test]

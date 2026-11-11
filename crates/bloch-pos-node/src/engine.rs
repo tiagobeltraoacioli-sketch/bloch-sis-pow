@@ -503,6 +503,29 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Why boot replay of the durable log stopped at a block of `epoch`.
+///
+/// Review round 2, GATE-03: a gate the canonical chain was never checked
+/// against, armed at an epoch the chain had already passed, fails exactly
+/// here, on every restart. Name it, so the operator is not left with a
+/// corrupt-disk diagnosis for a release mistake.
+fn replay_failure_message(epoch: u64) -> String {
+    let mut msg =
+        String::from("durable block log failed consensus replay; refusing to serve a partial head");
+    let gates = bloch_pos_committee::hard_forks::gates_armed_at_or_below(
+        bloch_pos_committee::hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY,
+        epoch,
+    );
+    if !gates.is_empty() {
+        let list: Vec<String> = gates.iter().map(|(name, at)| format!("{name} = {at}")).collect();
+        msg.push_str(&format!(
+            ". The failing block is in epoch {epoch}, and this build arms {} at or below it: a rule that was              not in force when the block was produced. If the log is intact, this build's gate is armed in the              past and must be re-released with a future epoch",
+            list.join(", ")
+        ));
+    }
+    msg
+}
+
 /// Whether the local committed head is stale enough that validator duties
 /// must stop and the sync path must run first.
 ///
@@ -7761,9 +7784,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // committed log, and must not be judged against a wall clock the log
         // knows nothing about. See `Engine::ingest_replay`.
         let expected_id = env.block_id();
+        let replay_epoch = epoch_of(env.header.slot);
         if !engine.ingest_replay(env) || engine.state.head() != expected_id {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
-                "durable block log failed consensus replay; refusing to serve a partial head"));
+                replay_failure_message(replay_epoch)));
         }
         // Time-based, not every-N-blocks: block cost varies by an order of
         // magnitude with how many transactions a block carries, so a fixed

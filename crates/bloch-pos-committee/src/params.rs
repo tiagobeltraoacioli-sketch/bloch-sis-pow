@@ -1837,7 +1837,11 @@ pub const ATTESTATION_DEDUP_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// Soft fork: it only removes blocks from the valid set, but a mixed fleet
 /// still splits on the first block that carries such a vote, so arming is a
 /// flag day. It should bind no later than KES enforcement
-/// ([`HF3_KES_ENFORCE_EPOCH`]); arming it earlier is harmless to honest votes.
+/// ([`HF3_KES_ENFORCE_EPOCH`]); arming it earlier is harmless to honest votes
+/// as long as the epoch is still in the FUTURE when the release ships: the
+/// chain was not checked against rule 1 so far, so a gate at or below an
+/// epoch the chain has passed can invalidate a canonical block on replay
+/// (`hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY`).
 pub const ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Is the vote slot-epoch binding active in `epoch` (the vote's slot epoch,
@@ -3537,7 +3541,8 @@ pub const KES_DEFAULT_DEPTH: u8 = 12;
 ///
 /// Both change validity (which signatures verify; which history the 0x22
 /// state-root component keeps), so every node must run the armed build
-/// before the gate. Arm it at `HF3_KES_ENFORCE_EPOCH` (or earlier): later
+/// before the gate. Arm it at `HF3_KES_ENFORCE_EPOCH` (or earlier, at an
+/// epoch still in the future when the release ships): later
 /// values leave static signatures made between the bind and the gate by
 /// late registrants unprovable. It must not be armed after the first epoch
 /// at which history can have been pruned
@@ -3701,10 +3706,20 @@ pub fn kes_period(epoch: u64) -> Option<u64> {
 /// The wire encoding does not change: the epoch is the block's, not a field.
 ///
 /// A hard fork (it changes which 0x17 transactions are valid): every node
-/// must run this code before the epoch. The cleanest arming is
-/// `HF3_KES_EPOCH` itself, so no unbound registration is ever valid on the
-/// network; armed later, registrations signed in the old form and not yet
-/// included simply stop verifying and are signed again.
+/// must run this code before the epoch.
+///
+/// ARM IT AT A FUTURE EPOCH ONLY, never at `HF3_KES_EPOCH` (7360) or any
+/// other epoch the chain has already passed: every `KesRegister` included
+/// since 7360 was signed in the legacy form, so a gate at or below an epoch
+/// that holds one makes that canonical block invalid on replay (each restart
+/// then fails with "durable block log failed consensus replay"; review
+/// round 2, GATE-03). The earliest safe value is a flag day ahead of the
+/// release that arms it; the latest useful one is
+/// `hard_forks::kes_register_binding_deadline(HF3_KES_ENFORCE_EPOCH)`, before
+/// any retired tree can leave the history. Registrations signed in the old
+/// form and not yet included at the gate simply stop verifying and are
+/// signed again. `hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY` carries the
+/// guard.
 pub const KES_REGISTER_EPOCH_BINDING_EPOCH: u64 = u64::MAX;
 
 /// Must a `KesRegister` included at `epoch` be signed over the epoch-bound
