@@ -639,16 +639,42 @@ finding and the bound below is needed.
 
 Once `FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH` is armed:
 
-1. **Position limits.** `FundedDelegate` is refused
-   (`FundedDelegationReject::PositionLimit`) when the history already holds
-   `MAX_FUNDED_POSITIONS` (4,096) unpruned positions in total, or
-   `MAX_FUNDED_POSITIONS_PER_VALIDATOR` (64) behind the target validator.
-   Once half of either limit is in use, a new position must carry at least
-   `CROWDED_FUNDED_POSITION_MIN_SAT` (10,000 BLCH). The 10 BLCH minimum is
-   unchanged for the first half. Pending, active, cooling-down and withdrawn
-   positions all count until they are pruned. Existing positions are never
-   affected, including on a validator that is already above a limit when the
-   gate opens.
+1. **Position limits** (revised 2026-11-10 after security review round 2,
+   DET-1 and V1-4; the gate had never been armed). `FundedDelegate` is
+   refused (`FundedDelegationReject::PositionLimit`) in three cases:
+   - *Global count.* The history already holds `MAX_FUNDED_POSITIONS`
+     (4,096) unpruned positions created under the gate. Pending, active,
+     cooling-down and withdrawn positions all count until they are pruned.
+     Positions created before the gate do not count: nothing limited them
+     and they cost 10 BLCH each, so counting them would let the limit be
+     filled before the flag day for 40,960 BLCH. They are a fixed set that
+     only shrinks; block cost is bounded by that set plus 4,096.
+   - *Priced minimum.* The first 2,048 such positions take the ordinary
+     10 BLCH minimum. From there the minimum doubles every 128 positions
+     (`funded_position_minimum_sat`): 20 BLCH, 40 BLCH, ... 655,360 BLCH
+     for the last 128. Raising everyone's minimum to `X` therefore costs
+     about `128 * X` (1.3M BLCH for a 10,240 BLCH minimum), and holding the
+     whole limit about 168M BLCH.
+   - *Per-validator slots.* At most `MAX_FUNDED_POSITIONS_PER_VALIDATOR`
+     (64) positions may be live (not deactivating) behind one validator,
+     whenever they were created. When all are taken, a new position enters
+     only if it carries at least `FUNDED_DISPLACEMENT_FACTOR` (2) times the
+     principal of the smallest live one (the newest of equals), which it
+     displaces. The displaced position is deactivated exactly as its
+     owner's `FundedUndelegate` would in that epoch: it cools down, waits
+     the withdrawal delay and is withdrawn by its owner through
+     `FundedDelegationWithdraw`. No stake moves at displacement.
+
+   What a delegator must know: a position behind a validator whose 64 slots
+   are full can be deactivated by someone delegating twice as much, after
+   which it stops earning at the end of the cool-down and is locked for the
+   withdrawal delay (2,048 epochs) like any deactivated position.
+
+   The alternative that was not chosen is to keep refusal instead of
+   displacement and price the per-validator slots with the same doubling
+   curve. It never deactivates anyone, but a full validator then stays
+   closed to everyone, however large, for as long as the holders choose,
+   at a fixed price that does not depend on what is being kept out.
 2. **Pruning.** At each epoch boundary, every fully withdrawn position is
    overwritten with the fixed value `Delegation::PRUNED` and its owner and
    lifecycle entries are removed. A pruned slot is in neither the fold nor
@@ -682,10 +708,10 @@ Arming requires what every consensus gate here requires: a historical replay
 of mainnet with the armed build, mixed-version qualification across the
 boundary, a coordinated epoch for the whole validating fleet, and an indexer
 built from the same release. Before choosing the epoch, read the number of
-unpruned positions per validator and in total from committed state: a
-validator already holding 32 positions accepts only positions of 10,000 BLCH
-or more from the first armed block, and one holding 64 accepts none until a
-withdrawal is pruned. The three constants are sized from the state-root
+unpruned positions per validator and in total from committed state: the
+total is what the 4,096 limit comes on top of, and a validator already
+holding 64 live positions admits a new one only by displacement from the
+first armed block. The constants are sized from the state-root
 measurement above (about 0.2 s per block at the global limit) and can be
 changed while the gate is inert.
 
