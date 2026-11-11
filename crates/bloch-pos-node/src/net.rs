@@ -392,6 +392,7 @@ const SYNC_PAGE_WRITE_GRACE_UNPROVEN: Duration = Duration::from_secs(5);
 /// the time the page takes at `SYNC_PAGE_MIN_BYTES_PER_SEC`. A maximal page
 /// (`codec::MAX_FIELD_LEN`, 8 MiB) therefore gets 15 s + 256 s = 271 s, and a
 /// peer reading at 32 KiB/s or faster can never reach the deadline.
+#[cfg(test)]
 fn sync_page_deadline(start: Instant, page_bytes: usize) -> Instant {
     PagePace { start, grace: SYNC_PAGE_WRITE_GRACE, bytes_per_sec: SYNC_PAGE_MIN_BYTES_PER_SEC }.deadline(page_bytes)
 }
@@ -797,7 +798,10 @@ const MAX_INBOUND_CONNECTIONS: usize = 128;
 /// filling the table takes eight sources that each keep sixteen connections
 /// delivering valid frames (see [`INBOUND_IDLE_EVICTION`]). Sources listed in
 /// `--peers` are exempt, so a fleet that puts more nodes than this on one
-/// host is unaffected as long as its nodes list each other.
+/// host is unaffected as long as its nodes list each other. The exemption is
+/// sized by that list: an address at which `n` peers are configured holds up
+/// to `2n + 2` exempt connections (`inbound_slots::Standing::for_source`),
+/// and further connections from it count against this share like any other.
 const MAX_INBOUND_PER_SOURCE: usize = 16;
 /// Inbound connections that have neither completed an authenticated
 /// handshake nor delivered a valid frame. They are counted inside
@@ -1891,12 +1895,18 @@ pub fn start(
     // Sources of the operator's own `--peers`, exempt from the inbound
     // shares, deadlines and eviction. Literal addresses are known now; a peer
     // given by name is learned by its dialer thread on the first connection.
-    let configured: Arc<Mutex<std::collections::BTreeSet<std::net::IpAddr>>> = Arc::new(Mutex::new(
+    // The value is the number of configured peers at that source: the
+    // standing is granted by address, before any handshake, so it is
+    // rationed by what the operator actually configured there.
+    let configured: Arc<Mutex<std::collections::BTreeMap<std::net::IpAddr, usize>>> = Arc::new(Mutex::new(
         peer_addrs
             .iter()
             .filter_map(|addr| addr.parse::<SocketAddr>().ok())
             .map(|addr| crate::connection_limit::limit_key(addr.ip()))
-            .collect(),
+            .fold(std::collections::BTreeMap::new(), |mut peers, source| {
+                *peers.entry(source).or_insert(0usize) += 1;
+                peers
+            }),
     ));
     {
         // Deadlines must not wait for the next accept: a quiet listener would
@@ -1939,12 +1949,19 @@ pub fn start(
                 }
                 let Ok(address) = sock.peer_addr() else { continue };
                 let Ok(evict_handle) = sock.try_clone() else { continue };
-                let is_configured = configured
+                let peers_here = configured
                     .lock()
-                    .is_ok_and(|set| set.contains(&crate::connection_limit::limit_key(address.ip())));
+                    .ok()
+                    .and_then(|peers| peers.get(&crate::connection_limit::limit_key(address.ip())).copied())
+                    .unwrap_or(0);
+                // This loop is the only thing that adds slots, so the count
+                // cannot grow between this read and the admission below.
+                let Ok(held) = slots.lock().map(|slots| slots.configured_held(address.ip())) else { continue };
+                let standing = inbound_slots::Standing::for_source(peers_here, held);
+                let is_configured = standing.is_configured();
                 // Shares, the pending pool and eviction are all decided here;
                 // see `inbound_slots`. A refusal drops `sock`, closing it.
-                let Some(slot) = InboundSlot::admit(&slots, address.ip(), is_configured, Instant::now(), evict_handle) else {
+                let Some(slot) = InboundSlot::admit(&slots, address.ip(), standing, Instant::now(), evict_handle) else {
                     continue;
                 };
                 // R3 M-4 / R1 A3-M2: bounded so a peer that stops reading or
@@ -2026,16 +2043,35 @@ pub fn start(
                     let responder = SyncResponder { socket: wsock, data_dir: data_dir.clone(), budget: sync_budget, configured: is_configured };
                     // Per-connection (R3 M-4 / R1 A3-M2): see [`GetBlocksLimiter`].
                     let mut get_blocks_limiter = GetBlocksLimiter::new();
+                    // Whether the sync scheduler already knows this peer.
+                    let mut offered = is_configured;
                     loop {
                         match reader.read_frame() {
                             Ok(frame) => {
-                                let outcome = if frame.first() == Some(&FRAME_GET_BLOCKS) {
-                                    let well_formed = frame.len() == 9;
-                                    responder.answer(&_half.0, address.ip(), frame, &mut get_blocks_limiter);
-                                    if well_formed { FrameOutcome::Delivered } else { FrameOutcome::Ignored }
-                                } else {
-                                    admit_frame_from_ip(&events, &inflight, address.ip(), &frame, false)
-                                };
+                                if frame.first() == Some(&FRAME_GET_BLOCKS) {
+                                    // A request the limiter or the worker pool
+                                    // refused is not activity. One a worker
+                                    // took keeps the connection open, which a
+                                    // node that is catching up needs, but nine
+                                    // bytes are not usefulness: the connection
+                                    // stays first in line for eviction. It is
+                                    // still offered to the sync scheduler: on
+                                    // a chain that produces no blocks this is
+                                    // the only frame a dialer ever sends, and a
+                                    // listener with a short log must be able
+                                    // to ask it for history.
+                                    if responder.answer(&_half.0, address.ip(), frame, &mut get_blocks_limiter) {
+                                        let Some(slot) = _half.0.slot.as_ref() else { return };
+                                        let now = Instant::now();
+                                        if !slot.mark_requested(now) { return; }
+                                        if !offered {
+                                            offered = true;
+                                            if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer.clone(), now); }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                let outcome = admit_frame_from_ip(&events, &inflight, address.ip(), &frame, false);
                                 let Some(slot) = _half.0.slot.as_ref() else { return };
                                 let now = Instant::now();
                                 match outcome {
@@ -2043,7 +2079,8 @@ pub fn start(
                                     FrameOutcome::Delivered => match slot.mark_valid(now) {
                                         // Expired or evicted while this frame was in flight.
                                         None => return,
-                                        Some(true) if !is_configured => {
+                                        Some(true) if !offered => {
+                                            offered = true;
                                             if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer.clone(), now); }
                                         }
                                         Some(_) => {}
@@ -2077,7 +2114,11 @@ pub fn start(
         let live = live.clone();
         let security = security.clone();
         let configured = configured.clone();
+        // A literal address was counted when the set was built. A name is
+        // counted where it last resolved, once, for as long as it stays there.
+        let counted_at_start = addr.parse::<SocketAddr>().is_ok();
         thread::spawn(move || {
+            let mut learned: Option<std::net::IpAddr> = None;
             // `offer` against a legacy peer: a handshake the peer closed on
             // sends the NEXT connection plain; when that plain session ends
             // the handshake is tried again, so an upgraded peer is picked up
@@ -2090,9 +2131,16 @@ pub fn start(
             };
             // Bounded: a name that resolves somewhere new on every dial must
             // not grow this set for the life of the process.
-            if let (Ok(address), Ok(mut set)) = (sock.peer_addr(), configured.lock()) {
-                if set.len() < MAX_CONFIGURED_SOURCES {
-                    set.insert(crate::connection_limit::limit_key(address.ip()));
+            if let (false, Ok(address), Ok(mut peers)) = (counted_at_start, sock.peer_addr(), configured.lock()) {
+                let source = crate::connection_limit::limit_key(address.ip());
+                if learned != Some(source) && (peers.contains_key(&source) || peers.len() < MAX_CONFIGURED_SOURCES) {
+                    if let Some(old) = learned.replace(source) {
+                        if let Some(count) = peers.get_mut(&old) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 { peers.remove(&old); }
+                        }
+                    }
+                    *peers.entry(source).or_insert(0) += 1;
                 }
             }
             let session = if fallback_plain {
