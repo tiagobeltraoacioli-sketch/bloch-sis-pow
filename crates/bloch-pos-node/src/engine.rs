@@ -11891,6 +11891,32 @@ mod transfer_v2_end_to_end {
         assert!(node.forced_room(&BTreeSet::new(), epoch).is_empty(), "it holds no room");
     }
 
+    /// Review R308-3P-1 (agent 308, third pass). edd4cf8c mirrors the lower
+    /// bound of consensus' DA number rule (`l2_number <= settled` is refused)
+    /// but not the upper one: `record_data_availability` also refuses
+    /// `l2_number > settled + da::WINDOW` (64), a commitment already recorded
+    /// and a full record list. A funded DA batch naming a block beyond the
+    /// window is therefore backed, is never included, never spends its
+    /// output, and sits in the pool at the ceiling tip: what is left of
+    /// R308-3 for the DA kind (64 keys, one output each, 64 batches per key).
+    /// Expected: a batch consensus refuses for its number is not backed.
+    #[test]
+    fn r308_3p_1_a_da_batch_beyond_the_window_is_not_backed() {
+        use super::admission::check_l2_funding;
+        use bloch_pos_committee::l2_settlement::da;
+        let epoch = V2_FLAG_DAY + 1;
+        let mut inside = da_batch(0x32, da::WINDOW, 0);
+        let mut beyond = da_batch(0x33, da::WINDOW + 1, 0);
+        for tx in [&mut inside, &mut beyond] {
+            if let PosTransaction::L2DataAvailability(b) = tx { b.tx_bytes = b.canonical_bytes().len() as u64; }
+        }
+        let node = engine_backing_with_l2(epoch, &[inside.clone(), beyond.clone()]);
+        assert_eq!(node.state.l2_settlement().expect("installed").settled_number(), 0);
+        let check = |tx: &PosTransaction| check_l2_funding(&node.state, None, tx, tx.canonical_bytes().len(), epoch);
+        assert!(check(&inside).is_ok(), "the last block of the window is backed");
+        assert!(check(&beyond).is_err(), "a batch for block settled + WINDOW + 1 is backed although consensus refuses its number");
+    }
+
     /// F-9: which commitments win the scarce slots is re-drawn from the
     /// parent block id, so grinding commitment bytes low (the canonical-bytes
     /// tie-break) does not buy every slot, and the draw changes per block.
