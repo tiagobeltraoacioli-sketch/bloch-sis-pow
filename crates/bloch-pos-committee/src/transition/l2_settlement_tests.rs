@@ -3823,6 +3823,41 @@ mod l2_tests {
         assert!(CommittedState::decode_local_cache(&bytes[..at], &header).is_err());
     }
 
+    /// Review R308-2P-1 (agent 308, second pass). The state root commits the
+    /// paid leaves as a length and a running root only, and the cache check
+    /// (`PaidLeaves::consistent`) compares counts: the entries themselves are
+    /// bound to nothing on a restore (the map keeps claim order per index
+    /// only, so the running root cannot be folded again). Every other L2
+    /// section is either committed in full (claim bitmap, forced queue) or
+    /// folded again on restore (inbox). A cache whose paid leaf differs in
+    /// one byte restores to the same state root, and that node then judges
+    /// claims and head resets differently from the rest.
+    /// Expected: a cache with an altered paid-leaf entry does not restore.
+    #[test]
+    #[cfg(all(feature = "local-state-cache", feature = "devnet-l2-user-txs"))]
+    fn r308_2p_1_an_altered_paid_leaf_entry_does_not_restore_from_the_cache() {
+        let (mut state, _) = activated_fixture(true, [0; 32]);
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let forged = [honest[0], ([0xee; 32], 9 * BLCH), ([3; 32], 5 * BLCH)];
+        let l2 = state.l2_settlement.as_mut().unwrap();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        put_tail(l2, &honest, &forged);
+        let chain = l2.policy().chain_id;
+        pay(l2, chain, &forged, 1).unwrap();
+        let (_, mut bytes, header) = local_cache_round_trip(&state);
+        let leaf = wd::leaf(chain, 1, &forged[1].0, forged[1].1);
+        let marker: &[u8] = b"BPOSST01:L2PL:v1";
+        let section = bytes.windows(marker.len()).position(|w| w == marker).unwrap();
+        let at = section + bytes[section..].windows(32).position(|w| w == leaf).expect("the paid leaf is in its section");
+        bytes[at] ^= 1;
+        let restored = CommittedState::decode_local_cache(&bytes, &header);
+        assert!(
+            restored.is_err(),
+            "restored with another paid leaf: the forged leaf 1 reads as paid = {}",
+            restored.unwrap().l2_settlement().unwrap().paid_leaves().contains(1, &leaf)
+        );
+    }
+
     #[test]
     fn a_reset_head_takes_the_next_settlement_under_the_new_program() {
         let (pre, mut chains) = fixture();
