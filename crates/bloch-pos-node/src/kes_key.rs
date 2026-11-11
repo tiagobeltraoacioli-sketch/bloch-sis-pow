@@ -554,6 +554,13 @@ fn overwrite_replaced(mut old: fs::File) -> io::Result<()> {
 /// recovery from the file system; a copy-on-write or journaled medium may
 /// still hold old blocks, which is why operators keep KES data dirs out of
 /// snapshots (docs/KES-MAINNET-READINESS.md §6).
+///
+/// A file the operator made read-only (0400; a rename keeps the mode, so a
+/// read-only `validator.kes` becomes a read-only `validator.kes.retired`)
+/// is still destroyed (review W2-3, as V1-5 for evolution): the owner's
+/// write bit is restored for the overwrite, and when even that is refused
+/// the file is unlinked without it and the node says so. Removing the name
+/// needs only the directory.
 pub fn shred(path: &Path) -> io::Result<()> {
     use std::io::Write;
     let len = match fs::metadata(path) {
@@ -561,10 +568,29 @@ pub fn shred(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    {
-        let mut f = fs::OpenOptions::new().write(true).open(path)?;
-        f.write_all(&vec![0u8; len as usize])?;
-        f.sync_all()?;
+    let open = || fs::OpenOptions::new().write(true).open(path);
+    let opened = match open() {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+            }
+            open()
+        }
+        opened => opened,
+    };
+    match opened {
+        Ok(mut f) => {
+            f.write_all(&vec![0u8; len as usize])?;
+            f.sync_all()?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => eprintln!(
+            "KES WARNING: {} is not writable by this node ({e}); it is removed, but its contents \
+             (an earlier seed) could NOT be overwritten in place. Keep the file mode 0600.",
+            path.display()
+        ),
+        Err(e) => return Err(e),
     }
     fs::remove_file(path)?;
     if let Some(dir) = path.parent() {
@@ -581,7 +607,9 @@ pub fn shred(path: &Path) -> io::Result<()> {
 /// with the retired file, or (between the renames) no `validator.kes`, which
 /// [`finish_interrupted_rotation`] completes. A retired file left by an
 /// earlier rotation is shredded first: one replaced key is kept, not a
-/// history.
+/// history. If that shred fails the swap still goes ahead (review W2-3): the
+/// rename replaces the earlier retired file's name, and a key that could not
+/// be destroyed must never keep the key in force from signing.
 pub fn promote_next(dir: &Path) -> io::Result<()> {
     let current = dir.join(FILE_NAME);
     let next = dir.join(NEXT_FILE_NAME);
@@ -590,7 +618,12 @@ pub fn promote_next(dir: &Path) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::NotFound, "no validator.kes.next to promote"));
     }
     if current.exists() {
-        shred(&retired)?;
+        if let Err(e) = shred(&retired) {
+            eprintln!(
+                "KES WARNING: could not destroy the earlier {RETIRED_FILE_NAME} ({e}); it is \
+                 replaced by name, but its contents (an older key's seed) were NOT overwritten."
+            );
+        }
         fs::rename(&current, &retired)?;
     }
     fs::rename(&next, &current)?;
@@ -899,6 +932,66 @@ mod tests {
         assert!(!crashed.join(NEXT_FILE_NAME).exists());
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&crashed);
+    }
+
+    /// Review W2-3: a read-only (0400) key file keeps its mode through the
+    /// swap, so the retired key is read-only too. It is still destroyed
+    /// (zeroed and removed), and a retired file that is in the way of the
+    /// next swap never stops that swap.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_retired_key_is_shredded_and_never_blocks_the_next_swap() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("read-only-retired");
+        let unlock = quick();
+        let read_only = |path: PathBuf| fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+        let first = KesKey::generate(4, 1, |_| {}).unwrap();
+        first.save(&dir, &unlock).unwrap();
+        read_only(KesKey::path(&dir));
+        let second = KesKey::generate(4, 1, |_| {}).unwrap();
+        second.save_next(&dir, &unlock).unwrap();
+        promote_next(&dir).unwrap();
+        let retired = dir.join(RETIRED_FILE_NAME);
+        assert_eq!(fs::metadata(&retired).unwrap().permissions().mode() & 0o777, 0o400, "the rename kept the mode");
+
+        // Final handover: the read-only retired key is zeroed and removed.
+        let old_inode = dir.join("old-inode");
+        fs::hard_link(&retired, &old_inode).unwrap();
+        shred_retired(&dir).expect("a read-only retired key is still destroyed");
+        assert!(!retired.exists(), "the old key is gone");
+        assert!(fs::read(&old_inode).unwrap().iter().all(|b| *b == 0), "and overwritten");
+        fs::remove_file(&old_inode).unwrap();
+
+        // A read-only retired file left in place (its shred never ran) does
+        // not stop the next swap either.
+        read_only(KesKey::path(&dir));
+        let third = KesKey::generate(4, 1, |_| {}).unwrap();
+        third.save_next(&dir, &unlock).unwrap();
+        promote_next(&dir).unwrap();
+        read_only(retired.clone());
+        let fourth = KesKey::generate(4, 1, |_| {}).unwrap();
+        fourth.save_next(&dir, &unlock).unwrap();
+        promote_next(&dir).expect("a read-only retired key must not block the swap");
+        assert_eq!(KesKey::load_optional(&dir, &unlock).unwrap().unwrap().public(), fourth.public());
+        assert_eq!(KesKey::load_retired(&dir, &unlock).unwrap().unwrap().public(), third.public());
+
+        // Even a retired path that cannot be shredded at all (a directory
+        // here) only costs the overwrite: the swap is refused by the rename
+        // alone, and only when the name itself cannot be replaced.
+        let blocked = tmp("retired-unshreddable");
+        KesKey::generate(4, 1, |_| {}).unwrap().save(&blocked, &unlock).unwrap();
+        let successor = KesKey::generate(4, 1, |_| {}).unwrap();
+        successor.save_next(&blocked, &unlock).unwrap();
+        fs::create_dir(blocked.join(RETIRED_FILE_NAME)).unwrap();
+        assert!(shred(&blocked.join(RETIRED_FILE_NAME)).is_err(), "fixture: this shred fails");
+        // An empty directory is not replaceable by a file rename; the point
+        // is that the failure is the rename's, after the shred was tried
+        // and reported, and that the key in force is left as it was.
+        assert!(promote_next(&blocked).is_err());
+        assert!(KesKey::load_optional(&blocked, &unlock).unwrap().is_some(), "the key in force is untouched");
+        assert_eq!(KesKey::load_next(&blocked, &unlock).unwrap().unwrap().public(), successor.public());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&blocked);
     }
 
     #[test]
