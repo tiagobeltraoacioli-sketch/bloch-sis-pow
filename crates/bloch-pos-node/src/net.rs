@@ -70,6 +70,15 @@
 //! so `gossip.rs`'s verdicts have nowhere to go on this path — the engine
 //! still runs the pool, but a `Reject` costs the sender nothing here.
 //!
+//! **It is nevertheless what Genesis-4 mainnet runs** (`--transport devnet
+//! --mesh-security offer`; review W4-1), with a topology the paragraph above
+//! does not describe: a dozen validators per public address, most of them in
+//! nobody's `--peers`, each with one thing to say per sixteen-minute epoch.
+//! Every limit in this file must hold for that fleet first. A limit that
+//! reads as generous for a devnet over localhost ("an honest peer says
+//! something every few seconds", "a host lists its own nodes") has already
+//! cut honest validators off once.
+//!
 //! **`--mesh-security` (see `mesh_pq.rs`).** With `offer` or `require` a
 //! connection first runs a hybrid ML-KEM-768 + X25519 handshake in which
 //! each side proves possession of an ML-DSA-65 transport identity, and every
@@ -870,6 +879,28 @@ impl DeliveryProof {
             }
         }
     }
+}
+
+/// For engine tests: the origin an unconfigured mesh connection from
+/// `source` attaches to a vote, and a probe that says whether the slot table
+/// behind it now vouches for that address.
+#[cfg(test)]
+pub(crate) fn test_mesh_origin(source: std::net::IpAddr) -> (Origin, impl Fn() -> bool) {
+    let slots: InboundSlots = Arc::new(Mutex::new(inbound_slots::Slots::new(INBOUND_POLICY)));
+    let budget = QueueBudget::new();
+    let guard = source_budget::Registry::reserve(
+        &budget.sources,
+        source_budget::Source::ip(source),
+        EventClass::Attestation,
+        1,
+        budget.count_cap,
+        budget.bytes_cap,
+    )
+    .expect("an empty budget admits one frame");
+    guard.set_delivery_proof(DeliveryProof { slots: Arc::downgrade(&slots), source });
+    let mut origin = Origin::none();
+    origin.set_reservation(guard);
+    (origin, move || slots.lock().unwrap().is_vouched(source))
 }
 
 impl std::fmt::Debug for DeliveryProof {

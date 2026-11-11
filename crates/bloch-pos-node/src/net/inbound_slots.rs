@@ -413,6 +413,11 @@ impl<H: Close> Slots<H> {
         self.entries.len()
     }
 
+    #[cfg(test)]
+    pub(super) fn is_vouched(&self, ip: IpAddr) -> bool {
+        self.source_vouched(crate::connection_limit::limit_key(ip), Instant::now())
+    }
+
     /// Connections that have proven nothing and said nothing useful yet.
     #[cfg(test)]
     pub(super) fn silent(&self) -> usize {
