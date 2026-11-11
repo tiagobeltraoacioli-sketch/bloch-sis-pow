@@ -368,6 +368,7 @@ const SYNC_PROVING_PAGE_BYTES: usize = 256 * 1024;
 /// that source is not served again for this long. Without it a source that
 /// never reads gets a new worker the moment the old one is taken away. A
 /// peer that honestly cannot read 32 KiB/s loses nothing it could have used.
+/// Connections of configured peers are exempt (see `reserve_at`).
 const SYNC_STALL_COOLDOWN: Duration = Duration::from_secs(60);
 /// Sources remembered in each of the two maps above; idle records expire.
 const MAX_SYNC_SOURCE_RECORDS: usize = 1024;
@@ -1054,7 +1055,13 @@ impl SyncResponder {
         let mut budget = self.budget.lock().ok()?;
         if !budget.admit(ip, now) || budget.serving >= MAX_SYNC_SERVING_WORKERS { return None; }
         let source = normalize_source(ip);
-        if budget.cooling.get(&source).is_some_and(|until| now < *until) { return None; }
+        // W3-2: the cooldown is keyed by address, and the operator's own
+        // `--peers` share addresses (one host, many validators). One frozen
+        // process must not lock its siblings out of this node for a minute,
+        // least of all while that host is recovering. A configured
+        // connection is therefore never refused for the cooldown; the
+        // unproven share below still limits what its address can hold.
+        if !self.configured && budget.cooling.get(&source).is_some_and(|until| now < *until) { return None; }
         // The workers above the reserve are for every source; the reserve is
         // for configured ones alone.
         if !self.configured
@@ -2762,6 +2769,43 @@ mod tests {
             data_dir: std::env::temp_dir(), budget: budget.clone(), configured: false,
         };
         assert!(other.reserve_at(&peers[2].connection, "192.0.2.2".parse().unwrap(), &mut GetBlocksLimiter::new(), t0).is_some());
+    }
+
+    /// W3-2: the stall cooldown is per address, and configured peers share
+    /// addresses. A stalled page on one configured connection does not lock
+    /// the other configured connections of that address out; an unconfigured
+    /// connection from the same address still waits, and the address still
+    /// holds only the unproven share.
+    #[test]
+    fn a_stalled_page_does_not_lock_out_the_configured_peers_of_its_address() {
+        let peers: Vec<_> = (0..4).map(|_| sync_test_peer()).collect();
+        let budget = Arc::new(Mutex::new(SyncBudget::new()));
+        let source: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        let reserve = |i: usize, configured: bool, now: Instant| SyncResponder {
+            socket: Arc::new(Mutex::new(MeshWriter::plain(peers[i].connection.socket.try_clone().unwrap()))),
+            data_dir: std::env::temp_dir(), budget: budget.clone(), configured,
+        }.reserve_at(&peers[i].connection, source, &mut GetBlocksLimiter::new(), now);
+        let t0 = Instant::now();
+        // Configured connection 0 is served a page and stalls it.
+        drop(reserve(0, true, t0).expect("a configured peer is served"));
+        budget.lock().unwrap().note_page(source, PageOutcome::Stalled, t0);
+        assert!(budget.lock().unwrap().cooling.contains_key(&source), "the stall is still recorded");
+        // Its configured sibling at the same address is served at once...
+        let sibling = reserve(1, true, t0).expect("a configured sibling is not locked out by the cooldown");
+        // ...and so is the stalled connection itself when it asks again;
+        // what bounds the address is the unproven share of one worker.
+        assert!(reserve(0, true, t0).is_none(), "one worker for an unproven address, configured or not");
+        drop(sibling);
+        drop(reserve(0, true, t0).expect("served again without waiting out the cooldown"));
+        // An unconfigured connection from that address waits as before.
+        assert!(reserve(2, false, t0).is_none());
+        assert!(reserve(2, false, t0 + SYNC_STALL_COOLDOWN - Duration::from_millis(1)).is_none());
+        assert!(reserve(2, false, t0 + SYNC_STALL_COOLDOWN).is_some());
+        // Every stall of a configured connection renews the record for the
+        // unconfigured ones; it never accumulates for the configured.
+        budget.lock().unwrap().note_page(source, PageOutcome::Stalled, t0 + SYNC_STALL_COOLDOWN);
+        assert!(reserve(3, false, t0 + SYNC_STALL_COOLDOWN).is_none());
+        assert!(reserve(3, true, t0 + SYNC_STALL_COOLDOWN).is_some());
     }
 
     /// V2-3: a peer that reads nothing is cut off when the first block the
