@@ -1705,6 +1705,7 @@ mod ws_lifecycle_tests;
 mod l2_async_admission_tests;
 
 mod local_cache;
+mod finality_latch;
 mod verification;
 mod finality_cert;
 #[cfg(test)]
@@ -1977,9 +1978,15 @@ struct Engine {
     /// This is deliberately NOT `self.state.finality().finalized`: that value
     /// lives in replayed state, so a reorg REPLACES it — which is exactly how
     /// the measured finalized 6 -> 4 -> 2 -> 0 rewind happened. The latch is
-    /// engine-owned and survives every state swap. In-memory only: on boot it
-    /// is rebuilt by the replay of this node's own log, which re-finalizes
-    /// the same checkpoints in the same order.
+    /// engine-owned and survives every state swap.
+    ///
+    /// It also survives a restart (finding PER-3). Boot replay rebuilds it
+    /// only as far as the LOGGED chain's own states finalize, which after a
+    /// reorg that dropped the finalizing votes is lower than what this node
+    /// had latched. The latch is therefore mirrored to `finality_latch.bin`
+    /// and reconciled with the replayed chain at boot; see
+    /// `engine/finality_latch.rs` for when it is written and what a
+    /// disagreement does.
     finalized_latch: Option<(u64, [u8; 32])>,
     /// Reorgs refused because they would have cut canonical history below
     /// the latch. A rewind an operator cannot see is a rewind that gets
@@ -5589,6 +5596,7 @@ impl Engine {
             proposer_sig: env.proposer_sig.clone(),
         };
         let before = self.state.finality();
+        let latch_before = self.finalized_latch;
         let txs = match body_transactions(env) {
             Ok(t) => t,
             Err(e) => {
@@ -5675,6 +5683,12 @@ impl Engine {
                         );
                         eprintln!("FATAL: block log append failed: {e}");
                         std::process::exit(1);
+                    }
+                    // PER-3: the log is durable through this block, so the
+                    // checkpoint it finalized (an ancestor) is on disk. Mirror
+                    // a raised latch now, so a restart cannot rebuild it lower.
+                    if self.finalized_latch != latch_before {
+                        self.persist_finalized_latch();
                     }
                     if self.chain.len().checked_sub(1)
                         .and_then(|height| height.checked_rem(local_cache::INTERVAL)) == Some(0)
@@ -7777,6 +7791,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
     println!("recovery: mode={} skipped_blocks={skipped} replayed_blocks={n_logged} elapsed_ms={}",
         if skipped > 0 { "local-cache" } else { "full-replay" }, recovery_started.elapsed().as_millis());
+    // PER-3: the replayed chain is known. Take the higher of the stored and
+    // the replayed finality latch, or refuse a log the stored one contradicts.
+    engine.reconcile_finalized_latch()?;
     engine.live = true;
     if n_logged > 0 {
         println!(
@@ -8096,6 +8113,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
     loop {
         match engine.store.poll_rewrite() {
             Ok(true) => {
+                // PER-3: a latch raised by the reorg waited for its branch to
+                // be durable in the log; it is now.
+                engine.persist_finalized_latch();
                 if let Err(e) = engine.write_local_cache() {
                     eprintln!("state-cache: post-reorg write failed; restart may require full replay: {e}");
                 }
@@ -8155,6 +8175,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 && !deferred_orphans_pending
             {
                 if engine.store.flush_rewrite()? {
+                    engine.persist_finalized_latch();
                     if let Err(e) = engine.write_local_cache() {
                         eprintln!("state-cache: shutdown post-reorg write failed; restart may require full replay: {e}");
                     }

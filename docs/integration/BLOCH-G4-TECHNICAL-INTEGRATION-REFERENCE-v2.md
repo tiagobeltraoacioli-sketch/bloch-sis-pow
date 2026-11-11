@@ -264,6 +264,11 @@ three in-rules cuts). Since 2026-09-05 (finding F-03), an engine-level
   `BLOCH_ALLOW_FINALITY_REWIND=1` lifts the latch, loudly logging every
   instance by name (`engine.rs:3357-3369,4626-4638`). Not recommended for an
   exchange's own observer node.
+- The latch **survives a restart**: it is mirrored to `finality_latch.bin` in
+  the data directory (only ever raised) and compared with the replayed block
+  log at boot. If the log does not hold the recorded checkpoint at its
+  height, the node refuses to start and names the checkpoint; the override
+  above discards the record instead (`engine/finality_latch.rs`).
 
 <div class="warn">
 
