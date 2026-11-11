@@ -275,4 +275,44 @@ mod funded_l2_transactions {
         assert_eq!(node.state.l2_settlement().unwrap().data_availability().len(), 1);
     }
 
+    /// V2-1: a deposit by a key that does not own the input it names is
+    /// refused before it can reserve that input, and one already in the pool
+    /// does not hold the input against its owner. A deposit by the owner is
+    /// admitted, holds its input, and is included.
+    #[test]
+    fn only_the_owner_of_an_input_can_reserve_it_with_an_l2_transaction() {
+        let _clock = validator_lifecycle::clock_at(3);
+        let funds = funds_of(2);
+        let (mut node, _dir) = engine(&funds);
+        let fee = node.state.next_base_fee_at(0);
+        let point = (funds[0].txid, funds[0].vout);
+
+        // Priced exactly, so ownership is the only thing wrong with it.
+        let squatter = PosTransaction::L2Deposit(deposit(&node, 99, point, Some(funds[0].value), 0x42));
+        assert_eq!(
+            node.on_transaction(squatter.clone()),
+            Err(Refusal::Invalid("L2 deposit key does not own its input")),
+        );
+        assert!(node.mempool.is_empty());
+        assert!(!node.mempool.spends_outpoint(&point));
+
+        let squatter_key = squatter.canonical_bytes();
+        node.mempool.insert(squatter_key.clone(), squatter);
+        let owner_transfer = spend(&funds[0], 9_000, 0, fee);
+        assert_eq!(node.on_transaction(owner_transfer.clone()), Ok(Admitted::New));
+        assert!(!node.mempool.contains_key(&squatter_key), "the unbacked entry yielded the input");
+
+        let own_point = (funds[1].txid, funds[1].vout);
+        let own = PosTransaction::L2Deposit(deposit(&node, OWNER, own_point, Some(funds[1].value), 0x42));
+        assert_eq!(node.on_transaction(own.clone()), Ok(Admitted::New));
+        assert!(matches!(
+            node.on_transaction(spend(&funds[1], 9_000, 0, fee)),
+            Err(Refusal::StateDependent(_)),
+        ));
+        node.propose(3);
+        assert_eq!(node.tx_slot_index.get(&own.txid()), Some(&3));
+        assert_eq!(node.tx_slot_index.get(&owner_transfer.txid()), Some(&3));
+        assert_eq!(node.state.l2_settlement().unwrap().escrow_sat(), u128::from(MIN_L2_DEPOSIT_SAT));
+    }
+
 }
