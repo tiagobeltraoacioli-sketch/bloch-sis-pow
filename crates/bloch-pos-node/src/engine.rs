@@ -1031,6 +1031,11 @@ const ORPHAN_PROMOTIONS_PER_TURN: usize = 1;
 /// the same two epochs one rewind window reaches back.
 const SYNC_REWIND_BACKOFF_MAX_SHIFT: u32 = 5;
 
+/// Shortest interval between two rewinds that are let through a back-off
+/// because a new cause appeared, as a power of two of the sync cadence: 2^2
+/// cadences is 8 slots. See [`SyncRewindBackoff::causes`].
+const SYNC_REWIND_NEW_CAUSE_SHIFT: u32 = 2;
+
 /// Node-local back-off for sync rewinds that yield nothing (P2P-6).
 ///
 /// A "rewind" is a `get_blocks` request whose cursor is below the applied
@@ -1063,6 +1068,21 @@ struct SyncRewindBackoff {
     retry_at_ms: u64,
     /// A wanted rewind was held back; retry it once `retry_at_ms` passes.
     deferred: bool,
+    /// Unknown parents of the authenticated orphans that were waiting when
+    /// the latest rewind was issued: what that rewind was asked to find.
+    ///
+    /// The back-off is evidence about those gaps only. Any registered
+    /// validator can sign an orphan whose parent nobody has, and so grow the
+    /// back-off to its cap; without this, a competing branch that appears
+    /// afterwards would wait out an interval earned by somebody else's
+    /// orphan. An authenticated orphan with a parent not listed here is a new
+    /// cause and is let through, at most once per
+    /// [`SYNC_REWIND_NEW_CAUSE_SHIFT`] interval, so minting new orphans buys
+    /// one rewind per 8 slots and not the unbounded rewinds the back-off
+    /// exists to stop. At most `ORPHAN_MAX` ids.
+    causes: Vec<[u8; 32]>,
+    /// Earliest time a new cause may again pass a back-off.
+    new_cause_at_ms: u64,
 }
 
 /// Distinct authenticated proposals retained per genesis validator duty.
@@ -3644,14 +3664,25 @@ impl Engine {
         if wanted >= head {
             return wanted;
         }
+        let causes: Vec<[u8; 32]> = self.orphans.iter()
+            .filter(|(_, _, _, authentication, _)| authentication.is_some())
+            .map(|(_, env, _, _, _)| env.header.parent)
+            .collect();
         if self.sync_rewind.fruitless > 0
             && wanted >= self.sync_rewind.floor
             && now_ms < self.sync_rewind.retry_at_ms
         {
-            // Held back, not forgotten: sync forward now, rewind later.
-            self.sync_rewind.deferred = true;
-            return head;
+            let new_cause = now_ms >= self.sync_rewind.new_cause_at_ms
+                && causes.iter().any(|parent| !self.sync_rewind.causes.contains(parent));
+            if !new_cause {
+                // Held back, not forgotten: sync forward now, rewind later.
+                self.sync_rewind.deferred = true;
+                return head;
+            }
+            self.sync_rewind.new_cause_at_ms = now_ms
+                .saturating_add(cadence_ms.saturating_mul(1u64 << SYNC_REWIND_NEW_CAUSE_SHIFT));
         }
+        self.sync_rewind.causes = causes;
         self.sync_rewind.awaiting = Some(wanted);
         self.sync_rewind.yield_ceiling = head;
         wanted
@@ -16050,6 +16081,57 @@ mod ingest_admission_tests {
             floor,
             "a rewind that yielded clears the back-off",
         );
+    }
+
+    /// **V2-8: a back-off earned by one orphan does not hold back the rewind
+    /// another branch needs**, and minting new orphans buys one rewind per
+    /// short interval, not an end to the back-off.
+    #[test]
+    fn a_new_authenticated_orphan_is_not_held_back_by_an_old_back_off() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        const CADENCE: u64 = 1_000;
+        let head = engine.state.slot();
+        let planted = repointed(&engine, &template, [0x9A; 32], 2);
+        park_as_authenticated(&mut engine, planted);
+        let floor = engine.sync_after_slot();
+        assert!(floor < head);
+
+        // Five fruitless rewinds for the planted orphan: the back-off is at
+        // its cap and the same cause stays held back.
+        let mut now = 100_000u64;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor);
+        for _ in 0..5 {
+            now += 1;
+            let _ = engine.sync_request_after_slot(now, CADENCE);
+            now = engine.sync_rewind.retry_at_ms;
+            assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor);
+        }
+        now += 1;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), head, "the old cause alone is held back");
+        let capped_until = engine.sync_rewind.retry_at_ms;
+        assert!(capped_until - now > 16 * CADENCE, "the back-off is long by now");
+
+        // A block of another branch arrives, signed, with a parent this node
+        // has never asked for: the very next request rewinds.
+        let genuine = repointed(&engine, &template, [0x9B; 32], 2);
+        park_as_authenticated(&mut engine, genuine);
+        now += CADENCE + 1;
+        assert!(now < capped_until);
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor, "a new cause rewinds at the next sync tick");
+
+        // The same two causes again: held back as before.
+        now += CADENCE + 1;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), head);
+
+        // A third parent straight away does not get another rewind until the
+        // new-cause interval has passed; then it does.
+        let minted = repointed(&engine, &template, [0x9C; 32], 2);
+        park_as_authenticated(&mut engine, minted);
+        now += 1;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), head, "new causes are rate-bound");
+        now = engine.sync_rewind.new_cause_at_ms;
+        assert!(now < engine.sync_rewind.retry_at_ms, "still inside the back-off");
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor);
     }
 
     /// **P2P-6: the back-off never exceeds its cap, and a lower floor is
