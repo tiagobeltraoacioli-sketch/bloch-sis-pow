@@ -661,6 +661,7 @@ pub(super) fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         reorg_anchors: Default::default(),
         finality_certs: Default::default(),
         pool: BTreeMap::new(),
+        pool_authority: BTreeMap::new(),
         att_pool: AttestationPool::new(),
         held_release_roots: VecDeque::new(),
         wall_slot: 0,

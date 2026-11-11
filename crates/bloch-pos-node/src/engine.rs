@@ -1697,6 +1697,8 @@ mod hf_replay_guard;
 
 #[cfg(test)]
 mod proposal_revalidation_tests;
+#[cfg(test)]
+mod vote_selection_tests;
 
 #[cfg(test)]
 mod ws_lifecycle_tests;
@@ -1792,6 +1794,12 @@ struct Engine {
     /// Attestations available to fork choice and to the next proposal, keyed
     /// by content so duplicates collapse. This is the *aggregation* store.
     pool: BTreeMap<(u32, [u8; 32]), Attestation>,
+    /// The authority (`kes::authority_fingerprint`) under which the signature
+    /// of a `pool` entry was last verified, by the same key (review VAL-1).
+    /// The producer includes a vote only while this equals the authority the
+    /// block's pre-state names for it. An entry without a record is verified
+    /// again before it is included. Pruned to the keys of `pool`.
+    pool_authority: BTreeMap<(u32, [u8; 32]), [u8; 32]>,
     /// The *admission* gate in front of `pool`:
     /// [`AttestationPool`](bloch_pos_committee::gossip::AttestationPool) from
     /// the pure crate — dedup, the equivocation cap, slashing-pair capture,
@@ -2228,6 +2236,16 @@ fn culprit_index(err: &TransitionError, len: usize) -> Option<usize> {
         _ => None,
     }
 }
+
+/// Pool votes one proposal may verify again with the real verifier because
+/// the authority they were verified under at gossip is unknown or is no
+/// longer the one the block's pre-state names (review VAL-1). The common case
+/// costs one hash per vote; this bounds the exceptional one on the consensus
+/// thread. Votes past the allowance stay pooled for a later proposal.
+const PROPOSAL_VOTE_REJUDGE_MAX: usize = 64;
+/// Votes one proposal may evict, one probe each, when the transition refuses
+/// them by index. Past it the block is built without votes (VAL-1).
+const PROPOSAL_VOTE_RETRY_MAX: usize = 8;
 
 /// Separates fresh wire input from a pool-issued, opaque authentication proof.
 /// Only the latter may use the held-replay fast path.
@@ -3301,11 +3319,14 @@ impl Engine {
                 epoch_of(a.data.slot) == e
                     && a.data.slot <= slot
                     && a.data.source_epoch < a.data.target_epoch
-                    // Gated step-8 rule (review FC-3 / CR-1): once it binds,
-                    // a vote whose target is not its slot's epoch would
-                    // invalidate the block.
-                    && (!bloch_pos_committee::params::attestation_slot_epoch_binding_active(e)
-                        || a.data.target_epoch == e)
+                    // A vote targets the epoch of its own slot, as every
+                    // honest attester's does. The gated step-8 rule (review
+                    // FC-3 / CR-1) makes any other invalid; below that gate
+                    // the transition takes the vote's signing authority from
+                    // its target epoch, which gossip never verified under
+                    // (VAL-1). Producer policy, so it does not wait for the
+                    // gate: this node simply never includes such a vote.
+                    && a.data.target_epoch == e
                     && partition
                         .get((a.data.slot % SLOTS_PER_EPOCH) as usize)
                         .is_some_and(|c| c.binary_search(&a.validator).is_ok())
@@ -3325,6 +3346,10 @@ impl Engine {
         // producers holding the same pool would cut the same way.
         atts.sort_by_key(|a| (a.data.slot, a.validator, a.data.signing_root()));
         atts.truncate(MAX_ATTESTATIONS_PER_BLOCK);
+        // VAL-1: the gossip verdict was reached on another state. Keep only
+        // votes known to verify under the authority this block's pre-state
+        // names, and evict the ones that no longer do.
+        self.retain_block_valid_votes(&mut atts, &rolled, e);
 
         // `keys.is_none()` returned at the top of `propose`, and a duty never
         // writes `keys`, so this arm is unreachable; returning without a
@@ -3397,6 +3422,7 @@ impl Engine {
             return;
         }
         header.attestation_root = derive::attestation_root(&atts);
+        let mut vote_retries = 0usize;
         let (post, tx_bytes) = loop {
             let tx_bytes: Vec<Vec<u8>> = txs.iter().map(PosTransaction::canonical_bytes).collect();
             header.body_root = derive::body_root(&tx_bytes);
@@ -3409,6 +3435,23 @@ impl Engine {
                 .compute_post_state(&self.state, &probe, &atts, &txs)
             {
                 Ok(p) => break (p, tx_bytes),
+                // VAL-1: a refused vote is not a transaction's fault. Evict
+                // it from the pool, so no later proposal selects it, and
+                // probe again without it. Each round removes one vote; past
+                // the allowance the block goes out without votes rather
+                // than not at all.
+                Err(TransitionError::Attestation(i)) if (i as usize) < atts.len() => {
+                    vote_retries = vote_retries.saturating_add(1);
+                    if vote_retries > PROPOSAL_VOTE_RETRY_MAX {
+                        eprintln!("[slot {slot}] the transition keeps refusing pooled votes; proposing without votes");
+                        atts.clear();
+                    } else {
+                        let bad = atts.remove(i as usize);
+                        eprintln!("[slot {slot}] evicting the vote by v{} refused by the transition", bad.validator);
+                        self.evict_pool_vote(&(bad.validator, bad.data.signing_root()));
+                    }
+                    header.attestation_root = derive::attestation_root(&atts);
+                }
                 Err(err) => {
                     if !self.drop_failed_proposal_transaction(&mut txs, &err, slot) {
                         eprintln!("[slot {slot}] produce refused with no transactions: {err:?}");
@@ -3460,6 +3503,11 @@ impl Engine {
                 return;
             }
         };
+        // VAL-1: what the refused-own-block diagnosis below needs. The votes
+        // themselves stay in the pool until a block carrying them is applied.
+        let signed = ProposalEnvelope { header: header.clone(), proposer_sig: proposer_sig.clone() };
+        let vote_keys: Vec<(u32, [u8; 32])> =
+            atts.iter().map(|a| (a.validator, a.data.signing_root())).collect();
         let env = BlockEnvelope {
             header,
             proposer_sig,
@@ -3497,6 +3545,12 @@ impl Engine {
         // The transactions go too. Keeping them would rebuild the same block
         // next slot and lose that one as well.
         if self.head_id() != id {
+            // VAL-1: a vote the real verifier refuses is evicted, and the
+            // transactions are kept. The slot is lost either way: the
+            // proposal watermark is spent, so there is no second block.
+            if self.evict_vote_refused_in_own_block(&signed, &vote_keys, &txs, slot) {
+                return;
+            }
             eprintln!(
                 "[slot {slot}] REFUSED OWN BLOCK {} — the transition did not adopt what this \
                  node just produced (h28080 class). Dropping its {} transaction(s) and \
@@ -6436,6 +6490,18 @@ impl Engine {
             self.net.report(&origin, Verdict::Ignore);
             return;
         }
+        // VAL-1: an honest attester always targets the epoch of its own slot
+        // (`attest_for`). Below the gated step-8 binding the transition takes
+        // the signing authority of an included vote from the signer-chosen
+        // target, while this door verifies under the slot's epoch, so a vote
+        // whose target differs can pass here and invalidate every block that
+        // carries it. It is not pooled and not relayed. `Ignore`, never
+        // `Reject`: the consensus rules still accept such a vote in a block
+        // while the gate is inert, so relaying it proves nothing about a peer.
+        if att.data.target_epoch != e {
+            self.net.report(&origin, Verdict::Ignore);
+            return;
+        }
         // `att_pool` is moved out for the call so the lookups below can borrow
         // the chain immutably; it is put back before returning.
         let mut pool = std::mem::take(&mut self.att_pool);
@@ -6606,8 +6672,9 @@ impl Engine {
                 // sighting doppelgänger protection exists to catch.
                 self.note_own_signature(att.validator, published_attestation(&att), true);
                 self.note_possible_doppelganger(att.validator, att.data.slot);
-                self.pool
-                    .insert((att.validator, att.data.signing_root()), att);
+                let (key, slot) = ((att.validator, att.data.signing_root()), att.data.slot);
+                self.pool.insert(key, att);
+                self.note_pool_authority(key, slot);
                 self.net.report(origin, Verdict::Accept);
             }
             GossipDecision::Ignore(_) => self.net.report(origin, Verdict::Ignore),
@@ -6622,6 +6689,147 @@ impl Engine {
                 self.net.report(origin, Verdict::Reject);
             }
         }
+    }
+
+    /// Record the authority a vote just accepted by the gossip pipeline was
+    /// verified under (VAL-1). `judge_admission` verified it against
+    /// `rolled_to(epoch_of(slot))` of the state this still is: nothing writes
+    /// the state between the verdict and this call.
+    fn note_pool_authority(&mut self, key: (u32, [u8; 32]), slot: u64) {
+        let epoch = epoch_of(slot);
+        let rolled = self.rolled_to(epoch);
+        match bloch_pos_committee::kes::authority_fingerprint(&*rolled, key.0, epoch) {
+            Some(authority) => self.pool_authority.insert(key, authority),
+            None => self.pool_authority.remove(&key),
+        };
+        // Pool entries leave on inclusion and at the epoch sweep; their
+        // records are dropped here, amortised, so the map stays within a
+        // constant factor of the pool on a node that never proposes.
+        if self.pool_authority.len() > self.pool.len().saturating_mul(2).saturating_add(64) {
+            let pool = &self.pool;
+            self.pool_authority.retain(|key, _| pool.contains_key(key));
+        }
+    }
+
+    /// Drop a vote the transition refuses for the block being built (VAL-1).
+    /// It stays visible to fork choice only through blocks that carry it.
+    fn evict_pool_vote(&mut self, key: &(u32, [u8; 32])) {
+        self.pool_authority.remove(key);
+        if self.pool.remove(key).is_some() {
+            // `forkchoice_inputs` keys its memo on `pool.len()` plus this
+            // counter. Two, so that neither this removal alone nor a later
+            // insertion can restore the sum and hide the change.
+            self.fc_covered_removals = self.fc_covered_removals.saturating_add(2);
+        }
+    }
+
+    /// Keep the candidate votes whose signature is known to verify under the
+    /// authority the transition will use for them in a block of epoch `e`
+    /// built on this head (VAL-1).
+    ///
+    /// Gossip accepted each vote under the authority of its slot's epoch on
+    /// the state it had then. The transition judges an included vote against
+    /// the block's pre-state: `rolled`. A KES registration, rotation or the
+    /// bind landing in between changes the key in force, and a vote that no
+    /// longer verifies makes the whole block invalid. The caller has already
+    /// required `target_epoch == e`, so the in-block authority epoch is `e`
+    /// below and above the slot-epoch binding gate.
+    ///
+    /// A vote whose recorded authority equals the current one costs one
+    /// hash. Any other is verified again with the real verifier, at most
+    /// [`PROPOSAL_VOTE_REJUDGE_MAX`] per call: it is kept and re-recorded on
+    /// success and evicted on failure. Votes past the allowance are left out
+    /// of this block and stay pooled.
+    fn retain_block_valid_votes(&mut self, atts: &mut Vec<Attestation>, rolled: &CommittedState, e: u64) {
+        let pool = &self.pool;
+        self.pool_authority.retain(|key, _| pool.contains_key(key));
+        let mut rejudged = 0usize;
+        let mut evicted = 0usize;
+        let mut kept = Vec::with_capacity(atts.len());
+        for att in atts.drain(..) {
+            let key = (att.validator, att.data.signing_root());
+            // A committee member is in `rolled`'s registry, so this is `Some`;
+            // if it were not, the transition would refuse the vote.
+            let Some(authority) = bloch_pos_committee::kes::authority_fingerprint(rolled, att.validator, e) else {
+                continue;
+            };
+            if self.pool_authority.get(&key) == Some(&authority) {
+                kept.push(att);
+                continue;
+            }
+            if rejudged >= PROPOSAL_VOTE_REJUDGE_MAX {
+                continue;
+            }
+            rejudged = rejudged.saturating_add(1);
+            // The transition's own check for an included vote (step 8).
+            let valid = bloch_pos_committee::kes::verify_validator(
+                rolled,
+                &bloch_pos_committee::PolicyVerifier::consensus(&self.verifier, e),
+                att.validator,
+                e,
+                &key.1,
+                &att.signature,
+            ) == Some(true);
+            if valid {
+                self.pool_authority.insert(key, authority);
+                kept.push(att);
+            } else {
+                self.evict_pool_vote(&key);
+                evicted = evicted.saturating_add(1);
+            }
+        }
+        if evicted > 0 {
+            eprintln!(
+                "evicted {evicted} pooled vote(s) that no longer verify under the authority of epoch {e} on this head"
+            );
+        }
+        *atts = kept;
+    }
+
+    /// This node's own block was refused by the real transition. If the
+    /// cause is one of its votes, evict that vote and report `true`: the
+    /// transactions are then not at fault and stay in the mempool (VAL-1).
+    ///
+    /// `votes` are the pool keys of the block's votes, in body order; they
+    /// are still pooled because only an applied block removes them. The
+    /// diagnosis runs the transition once more, only on this exceptional
+    /// path and only while the head is still the block's parent.
+    fn evict_vote_refused_in_own_block(
+        &mut self,
+        signed: &ProposalEnvelope,
+        votes: &[(u32, [u8; 32])],
+        txs: &[PosTransaction],
+        slot: u64,
+    ) -> bool {
+        let atts: Vec<Attestation> = votes.iter().filter_map(|key| self.pool.get(key).cloned()).collect();
+        if *self.head_id().as_bytes() != signed.header.parent || atts.len() != votes.len() {
+            // Not diagnosable. Verify every one of them again before it is
+            // selected a second time.
+            for key in votes {
+                self.pool_authority.remove(key);
+            }
+            return false;
+        }
+        let Err(TransitionError::Attestation(i)) =
+            self.tr.compute_post_state(&self.state, signed, &atts, txs)
+        else {
+            return false;
+        };
+        let Some(bad) = votes.get(i as usize) else {
+            return false;
+        };
+        // The recorded authorities promised this could not happen: trust
+        // none of them for this block's votes.
+        for key in votes {
+            self.pool_authority.remove(key);
+        }
+        self.evict_pool_vote(bad);
+        eprintln!(
+            "[slot {slot}] own block refused for its vote {i} by v{}; the vote is evicted, the \
+             transactions stay in the mempool",
+            bad.0,
+        );
+        true
     }
 
     /// A block landed: queue its authenticated waiters for bounded replay.
@@ -6664,8 +6872,9 @@ impl Engine {
                 self.note_own_signature(att.validator, published_attestation(&att), true);
                 self.note_possible_doppelganger(att.validator, att.data.slot);
                 let frame = net::att_frame(&att);
-                self.pool
-                    .insert((att.validator, att.data.signing_root()), att);
+                let (key, slot) = ((att.validator, att.data.signing_root()), att.data.slot);
+                self.pool.insert(key, att);
+                self.note_pool_authority(key, slot);
                 if self.live {
                     // Relay now: it was held, so nobody downstream got it from
                     // us. A duplicate publish is refused locally and costs
@@ -7659,6 +7868,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         reorg_anchors: Default::default(),
         finality_certs: Default::default(),
         pool: BTreeMap::new(),
+        pool_authority: BTreeMap::new(),
         att_pool: AttestationPool::new(),
         held_release_roots: VecDeque::new(),
         wall_slot: 0,
@@ -11397,6 +11607,7 @@ mod transfer_v2_end_to_end {
         reorg_anchors: Default::default(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
+            pool_authority: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
             wall_slot: 0,
@@ -12782,6 +12993,7 @@ mod perf_support {
         reorg_anchors: Default::default(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
+            pool_authority: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
             wall_slot: 0,
@@ -15255,6 +15467,7 @@ mod duty_view_anchor {
         reorg_anchors: Default::default(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
+            pool_authority: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
             wall_slot: 0,
@@ -15528,6 +15741,7 @@ mod slot_horizon {
         reorg_anchors: Default::default(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
+            pool_authority: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
             wall_slot: 0,
