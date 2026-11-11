@@ -3823,6 +3823,26 @@ mod l2_tests {
         assert!(CommittedState::decode_local_cache(&bytes[..at], &header).is_err());
     }
 
+    /// Review R308-2P-3 (agent 308, second pass). After 92762a10 a plain
+    /// reset (`forfeit: false`, the form the fork's literals are compiled
+    /// with) refuses as soon as ANY claim was proven against a record above
+    /// the target, whatever leaf it paid. Here the tail is an honest
+    /// extension of the target's tree and the only claim is the target's own
+    /// leaf 0, proven against the newer root as any wallet would: nothing
+    /// left the escrow that the target does not owe, yet the reset refuses,
+    /// silently, while the program still moves. One small withdrawal claim
+    /// made during the 72 h between the release and the gate vetoes it.
+    /// Expected: a plain reset is not refused for a paid leaf that the
+    /// target's tree holds (or the form is not offered after the swap).
+    #[test]
+    fn r308_2p_3_one_honest_claim_against_a_newer_root_does_not_veto_the_plain_reset() {
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let extended = [honest[0], honest[1], ([3; 32], 5 * BLCH)];
+        let (mut l2, chain) = next_program_with_tail(&honest, &extended);
+        pay(&mut l2, chain, &extended, 0).expect("the target's own leaf 0, proven against the newer root");
+        assert!(l2.reset_head(&reset_to_block_1(&l2, chain, &honest, false)), "the plain reset is refused");
+    }
+
     /// Review R308-2P-1 (agent 308, second pass). The state root commits the
     /// paid leaves as a length and a running root only, and the cache check
     /// (`PaidLeaves::consistent`) compares counts: the entries themselves are
