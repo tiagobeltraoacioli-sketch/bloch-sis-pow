@@ -1090,15 +1090,32 @@ pub fn peer_score_thresholds() -> PeerScoreThresholds {
 /// node changes function at the same instant, with no restart in between.
 ///
 /// `u64::MAX` is inert: ids are byte-identical to the payload-only ones. Set
-/// it in a release (or [`GOSSIP_TOPIC_MSG_ID_EPOCH_ENV`] on every node) only
-/// once the whole fleet runs a build that has this gate.
+/// it in a release only once the whole fleet runs a build that has this
+/// gate. On a funded network the value is this constant and nothing else
+/// (review round 2, GATE-09): it is part of the binary, so two nodes of one
+/// release cannot disagree on it.
 pub const GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Boot-time override of [`GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH`]: a decimal
 /// epoch number. Every node of a network must carry the same value. Anything
 /// that is not a decimal `u64` refuses to start the transport — a typo must
 /// not silently leave one node on the other id function.
+///
+/// DEVELOPMENT AND QUALIFICATION BUILDS ONLY
+/// ([`GOSSIP_TOPIC_MSG_ID_EPOCH_OVERRIDE_ALLOWED`]), where rehearsing the
+/// switch without a rebuild is the point. Any other build refuses to start
+/// the transport when the variable is set: a per-node value that peers
+/// cannot see partitions the mesh, and it is not in the build identity.
 pub const GOSSIP_TOPIC_MSG_ID_EPOCH_ENV: &str = "BLOCH_GOSSIP_TOPIC_MSG_ID_EPOCH";
+
+/// Whether this build honours [`GOSSIP_TOPIC_MSG_ID_EPOCH_ENV`]: only builds
+/// that already refuse funded manifests (`engine::run`) and carry their
+/// features in `BLOCH_BUILD_VERSION`.
+pub const GOSSIP_TOPIC_MSG_ID_EPOCH_OVERRIDE_ALLOWED: bool = cfg!(any(
+    feature = "devnet-randao-recommit",
+    feature = "devnet-l2-deposits",
+    feature = "l2-activation-rehearsal",
+));
 
 /// Domain tag of the topic-bound message id. Fixed length, so it needs no
 /// length prefix of its own.
@@ -1178,8 +1195,19 @@ impl MessageIdSchedule {
 /// The activation epoch this boot uses: the override if one is set, else the
 /// built-in constant.
 fn topic_msg_id_activation_epoch(raw: Option<&std::ffi::OsStr>) -> Result<u64, String> {
+    topic_msg_id_activation_epoch_for(raw, GOSSIP_TOPIC_MSG_ID_EPOCH_OVERRIDE_ALLOWED)
+}
+
+fn topic_msg_id_activation_epoch_for(
+    raw: Option<&std::ffi::OsStr>,
+    override_allowed: bool,
+) -> Result<u64, String> {
     match raw {
         None => Ok(GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH),
+        Some(raw) if !override_allowed => Err(format!(
+            "{GOSSIP_TOPIC_MSG_ID_EPOCH_ENV}={raw:?} is set, but only development and qualification builds \
+             honour it. In this build the gossip message-id epoch is compiled in; unset the variable"
+        )),
         Some(raw) => raw
             .to_str()
             .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
@@ -4225,11 +4253,37 @@ mod tests {
     #[test]
     fn message_id_epoch_override_is_strict() {
         use std::ffi::OsStr;
-        assert_eq!(topic_msg_id_activation_epoch(Some(OsStr::new("7400"))), Ok(7400));
-        assert_eq!(topic_msg_id_activation_epoch(Some(OsStr::new("0"))), Ok(0));
+        assert_eq!(topic_msg_id_activation_epoch_for(Some(OsStr::new("7400")), true), Ok(7400));
+        assert_eq!(topic_msg_id_activation_epoch_for(Some(OsStr::new("0")), true), Ok(0));
         for bad in ["", "+7", "7400 ", "0x10", "epoch", "18446744073709551616"] {
-            assert!(topic_msg_id_activation_epoch(Some(OsStr::new(bad))).is_err(), "{bad:?}");
+            assert!(topic_msg_id_activation_epoch_for(Some(OsStr::new(bad)), true).is_err(), "{bad:?}");
         }
+    }
+
+    /// Review round 2, GATE-09: outside development builds the epoch is the
+    /// compiled constant; a set override refuses to start instead of putting
+    /// one node on an id function its peers cannot see.
+    #[test]
+    fn message_id_epoch_override_is_refused_outside_development_builds() {
+        use std::ffi::OsStr;
+        assert_eq!(topic_msg_id_activation_epoch_for(None, false), Ok(GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH));
+        for value in ["7400", "0", "18446744073709551615", "", "epoch"] {
+            let err = topic_msg_id_activation_epoch_for(Some(OsStr::new(value)), false).unwrap_err();
+            assert!(err.contains(GOSSIP_TOPIC_MSG_ID_EPOCH_ENV) && err.contains("unset"), "{err}");
+        }
+        // The shipped default build is not a development build.
+        assert_eq!(
+            GOSSIP_TOPIC_MSG_ID_EPOCH_OVERRIDE_ALLOWED,
+            cfg!(any(
+                feature = "devnet-randao-recommit",
+                feature = "devnet-l2-deposits",
+                feature = "l2-activation-rehearsal"
+            ))
+        );
+        assert_eq!(
+            topic_msg_id_activation_epoch(Some(OsStr::new("7400"))).is_ok(),
+            GOSSIP_TOPIC_MSG_ID_EPOCH_OVERRIDE_ALLOWED
+        );
     }
 
     /// A Genesis-4 node must not be able to talk to a Genesis-3 one. The
