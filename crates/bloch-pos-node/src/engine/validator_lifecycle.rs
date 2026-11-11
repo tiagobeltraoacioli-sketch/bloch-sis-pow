@@ -498,9 +498,23 @@ impl Engine {
         let total = state.active_validators().iter().map(|v| u128::from(v.effective_stake)).sum();
         let fee = state.next_base_fee();
         let included = &self.tx_slot_index;
+        // Review EXE-2: a pending settlement is judged against the head once,
+        // at admission. One the head has moved past (another settlement of
+        // the same anchor was included, or a reorg changed the anchor) can
+        // never apply, and while it stayed it refused every newer proof
+        // ("one L2 proof is already pending") and was the whole selection of
+        // this node's next proposal. Proof-free: the proof does not change.
+        let (head, head_slot) = (*state.head().as_bytes(), state.slot());
+        let settlement_applies = |tx: &PosTransaction| match tx {
+            PosTransaction::L2SettlementAsync(settlement) => state.l2_settlement().is_some_and(|l2| {
+                l2.pending_async_refusal(settlement, head, head_slot).is_none()
+            }),
+            _ => true,
+        };
         self.mempool.retain(|_, tx| {
             // Also covers winning-branch transactions on the reorg path.
             !included.contains_key(&tx.txid())
+                && settlement_applies(tx)
                 && (!is_lifecycle(tx)
                     || state
                         .validate_lifecycle_transaction(tx, total, fee, &ProbeVerifier)

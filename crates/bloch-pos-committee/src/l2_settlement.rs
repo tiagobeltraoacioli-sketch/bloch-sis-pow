@@ -1459,6 +1459,13 @@ impl State {
             self.source_anchor = Some((parent, parent_slot, self.native_height, self.inbox.len() as u64, self.inbox_root));
         }
     }
+    /// Whether [`Self::append_deposit`] would accept a record of `sats`
+    /// (its two refusals, without mutating). Mempool preflight.
+    pub(crate) fn can_append_deposit(&self, sats: u64) -> bool {
+        self.asynchronous
+            && self.inbox.len() < u32::MAX as usize
+            && self.escrow_sat.checked_add(u128::from(sats)).is_some()
+    }
     /// Escrow a native deposit into the next inbox position. The caller has
     /// already removed exactly `record.sats` from the spendable supply.
     pub(crate) fn append_deposit(&mut self, record: InboxRecord) -> Result<(), Reject> {
@@ -1645,6 +1652,19 @@ impl State {
         l2_number: u64,
         commitment: [u8; 32],
     ) -> Result<(), da::Refusal> {
+        let height = self.check_data_availability(chain_id, l2_number, &commitment)?;
+        self.da.push(da::Record { l2_number, commitment, height });
+        Ok(())
+    }
+    /// Every refusal of [`Self::record_data_availability`], without mutating
+    /// (shared with the mempool preflight so the two cannot drift). Returns
+    /// the native height the record would carry.
+    pub(crate) fn check_data_availability(
+        &self,
+        chain_id: u64,
+        l2_number: u64,
+        commitment: &[u8; 32],
+    ) -> Result<u64, da::Refusal> {
         use da::Refusal as R;
         if !self.profile.user_transactions {
             return Err(R::NotActive);
@@ -1656,15 +1676,13 @@ impl State {
         if l2_number <= settled || l2_number > settled.saturating_add(da::WINDOW) {
             return Err(R::Number);
         }
-        if self.da.iter().any(|r| r.l2_number == l2_number && r.commitment == commitment) {
+        if self.da.iter().any(|r| r.l2_number == l2_number && r.commitment == *commitment) {
             return Err(R::Duplicate);
         }
         if self.da.len() >= da::MAX_RECORDS {
             return Err(R::Full);
         }
-        let height = self.native_height.checked_add(1).ok_or(R::Full)?;
-        self.da.push(da::Record { l2_number, commitment, height });
-        Ok(())
+        self.native_height.checked_add(1).ok_or(R::Full)
     }
     /// Test hook: configure the attestor set after genesis.
     #[cfg(test)]
@@ -1863,7 +1881,24 @@ impl State {
         slot: u64,
         asynchronous: bool,
     ) -> Result<(u64, u64, Option<withdrawal::Record>), Reject> {
-        if asynchronous != self.asynchronous || (asynchronous && self.source_anchor.is_none()) {
+        if asynchronous && self.source_anchor.is_none() {
+            return Err(Reject::NotActive);
+        }
+        self.check_against_source(tx, parent, slot, asynchronous)
+    }
+
+    /// [`Self::check_before_proof`] without its "a source is pinned" test:
+    /// with no anchor, the source is `(parent, slot)` at this height, which
+    /// is exactly what [`Self::prepare_source`] pins before the next block's
+    /// transactions.
+    fn check_against_source(
+        &self,
+        tx: &Transaction,
+        parent: [u8; 32],
+        slot: u64,
+        asynchronous: bool,
+    ) -> Result<(u64, u64, Option<withdrawal::Record>), Reject> {
+        if asynchronous != self.asynchronous {
             return Err(Reject::NotActive);
         }
         let s = tx.statement.as_slice();
@@ -1974,6 +2009,23 @@ impl State {
             }
         }
         Ok((end, number, new_withdrawals))
+    }
+
+    /// Whether an asynchronous settlement could still apply in the block
+    /// after `head` (this state's head block, at `head_slot`): every check
+    /// of [`Self::apply`] that needs no proof, the record limit included.
+    /// Node-local retention policy for a settlement that is already pending:
+    /// the proof was verified at admission, and what can change afterwards is
+    /// only whether the statement still matches the head. Unlike
+    /// [`Self::validate_async`] it judges a state with no pinned source the
+    /// way the next block's transition will (it pins `head` first), so a
+    /// settlement is never dropped for an anchor the next block provides.
+    pub fn pending_async_refusal(&self, tx: &Transaction, head: [u8; 32], head_slot: u64) -> Option<Reject> {
+        match self.check_against_source(tx, head, head_slot, true) {
+            Err(why) => Some(why),
+            Ok((_, _, Some(_))) if self.withdrawals.len() >= self.profile.limits.max_records() => Some(Reject::Limit),
+            Ok(_) => None,
+        }
     }
 
     /// Mempool preflight shares the transition checks and never mutates state.

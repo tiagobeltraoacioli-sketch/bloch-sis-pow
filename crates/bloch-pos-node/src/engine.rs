@@ -1970,6 +1970,8 @@ mod ws_lifecycle_tests;
 
 #[cfg(test)]
 mod l2_async_admission_tests;
+#[cfg(test)]
+mod l2_preflight_tests;
 
 mod local_cache;
 mod finality_latch;
@@ -2504,6 +2506,12 @@ impl Refusal {
 /// index that was valid when the error was raised can be stale by the time it
 /// is used. Out of range falls back to `None`, and `None` means "drop the tail
 /// and retry", which is the behaviour that keeps the node producing.
+/// How many times `propose` selects from the mempool again after the probe
+/// refused, and it dropped, one indexed transaction (review EXE-1). Each
+/// round costs one selection and one probe transition on the consensus
+/// thread, so it is small; past it the proposer keeps the reduced list.
+const PROPOSAL_RESELECTIONS_MAX: usize = 4;
+
 fn culprit_index(err: &TransitionError, len: usize) -> Option<usize> {
     match err {
         TransitionError::Transfer(i, _) | TransitionError::Transaction(i) => {
@@ -3714,6 +3722,10 @@ impl Engine {
         // is bounded by the selection size and terminates. If the empty
         // selection also fails, the fault is not attributable to a transaction.
         let mut txs = self.select_transactions(bloch_pos_committee::epoch_of(slot));
+        // Selections made again after an indexed drop (review EXE-1), and
+        // whether a refusal that names no transaction narrowed the list.
+        let mut reselections = 0usize;
+        let mut narrowed = false;
         // Local production policy: never sign a block our smallest supported
         // gossip transport cannot carry. Incoming consensus acceptance stays
         // unchanged, and the pool keeps omitted votes for a later proposal.
@@ -3753,9 +3765,27 @@ impl Engine {
                     header.attestation_root = derive::attestation_root(&atts);
                 }
                 Err(err) => {
+                    let indexed = culprit_index(&err, txs.len()).is_some();
                     if !self.drop_failed_proposal_transaction(&mut txs, &err, slot) {
                         eprintln!("[slot {slot}] produce refused with no transactions: {err:?}");
                         return;
+                    }
+                    // The refused transaction is out of the mempool and
+                    // barred. What it displaced from the selection (byte
+                    // budget, DA slots, a whole block behind a settlement) is
+                    // still pending, so select again instead of proposing the
+                    // shrunken list. Bounded: each round removed one mempool
+                    // entry, and after the limit the loop continues as it
+                    // always did. Not after an unattributed narrowing, which
+                    // removes nothing from the mempool and would be undone.
+                    narrowed |= !indexed;
+                    if indexed && !narrowed && reselections < PROPOSAL_RESELECTIONS_MAX {
+                        reselections += 1;
+                        let again = self.select_transactions(bloch_pos_committee::epoch_of(slot));
+                        if proposal_wire::fit(&header, &mut atts, &again) {
+                            header.attestation_root = derive::attestation_root(&atts);
+                            txs = again;
+                        }
                     }
                 }
             }
@@ -5838,7 +5868,11 @@ impl Engine {
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
         // A proof reserves the whole gas budget. Never pack it with transfers.
-        if let Some(tx) = self.mempool.values().find(|tx| matches!(tx, PosTransaction::L2SettlementAsync(_))) {
+        // Only one that still matches this head (review EXE-2): admission
+        // judged it against the head of that moment, and a pending settlement
+        // the head has moved past would be refused by the probe and leave the
+        // block without the transactions it displaced.
+        if let Some(tx) = self.mempool.values().find(|tx| self.pending_settlement_applies(tx)) {
             return vec![tx.clone()];
         }
         // Admission is a historical observation, not a reservation of inputs or
@@ -5848,9 +5882,22 @@ impl Engine {
         // again, making the exact same signed transaction eligible later.
         let mut funded_context = None;
         let candidates = self.mempool.iter().filter(|(encoded, tx)| {
-            self.candidate_is_backed(tx, encoded, epoch, &mut funded_context)
+            // A settlement is proposed alone (above) or not at all.
+            !matches!(tx, PosTransaction::L2SettlementAsync(_))
+                && self.candidate_is_backed(tx, encoded, epoch, &mut funded_context)
         }).collect();
         Self::pack_transactions(epoch, *self.state.head().as_bytes(), candidates)
+    }
+
+    /// Whether `tx` is an asynchronous L2 settlement that passes every
+    /// proof-free check of the transition against the current head (review
+    /// EXE-2). The proof itself was verified at admission and does not
+    /// change. Node-local; no consensus effect.
+    fn pending_settlement_applies(&self, tx: &PosTransaction) -> bool {
+        let PosTransaction::L2SettlementAsync(settlement) = tx else { return false };
+        self.state.l2_settlement().is_some_and(|l2| {
+            l2.pending_async_refusal(settlement, *self.state.head().as_bytes(), self.state.slot()).is_none()
+        })
     }
 
     /// Node relay policy (HF2 sigdet): the proposer never selects a spend
@@ -5896,6 +5943,8 @@ impl Engine {
     fn candidate_is_backed(&self, tx: &PosTransaction, key: &[u8], epoch: u64,
         funded_context: &mut Option<(Arc<CommittedState>, u128)>) -> bool {
         if admission::check_transfer(&self.state, tx, key.len(), epoch).is_err() { return false; }
+        // A pending settlement the head has moved past backs nothing (EXE-2).
+        if matches!(tx, PosTransaction::L2SettlementAsync(_)) { return self.pending_settlement_applies(tx); }
         // NODE RELAY POLICY (HF2 sigdet): the proposer never selects a spend
         // whose witness fails the FIPS 204 reference verifier, even if it
         // reached the mempool by a path that skipped `admissible`. Not a
@@ -10235,30 +10284,6 @@ fn relay_spend_reference_check(pubkey: &[u8], signing_root: &[u8; 32], signature
         || bloch_crypto::crypto::verify_pinned(pubkey, signing_root, signature)
 }
 
-/// A fresh [`HybridVerifier`] under the node relay policy, for the admission
-/// arms that verify a self-contained (budget-free) hybrid authorization.
-fn strict_relay_hybrid() -> impl SignatureVerifier {
-    struct Owned(HybridVerifier);
-    impl SignatureVerifier for Owned {
-        fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
-            self.0.verify_with_key(pk, root, sig) && bloch_crypto::crypto::verify_pinned(pk, root, sig)
-        }
-        fn verify_l2_settlement(&self, p: &[u8; 32], pr: &[u8; 32], v: &[u8], pf: &[u8]) -> bool {
-            self.0.verify_l2_settlement(p, pr, v, pf)
-        }
-        fn verify_with_key_under(&self, policy: bloch_pos_committee::SignaturePolicy, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
-            self.0.verify_with_key_under(policy, pk, root, sig) && relay_reference_check(policy, pk, root, sig)
-        }
-        fn verify_spend_at_epoch(&self, pk: &[u8], root: &[u8; 32], sig: &[u8], epoch: u64) -> bool {
-            self.0.verify_spend_at_epoch(pk, root, sig, epoch) && relay_spend_reference_check(pk, root, sig)
-        }
-        fn verify_kes_leaf(&self, leaf_pk: &[u8], message: &[u8; 32], sig: &[u8]) -> bool {
-            self.0.verify_kes_leaf(leaf_pk, message, sig)
-        }
-    }
-    Owned(HybridVerifier::new())
-}
-
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     admissible_with_verifier(tx, wall_epoch, &HybridVerifier::new())
 }
@@ -10299,38 +10324,49 @@ fn admissible_with_network_verifier(
         // Whether the network's L2 admits DA, claims and deposits is a state
         // question (the installed L2's profile), answered at the stateful door
         // by `l2_admission_refusal`; here only shape and signatures.
+        //
+        // The signatures go through the caller's `verifier` (review EXE-3):
+        // on the gossip and RPC path that is the per-source budgeted one, so
+        // each hybrid verification below draws one unit of the sender's
+        // allowance and a failure is charged to the sender, exactly as for a
+        // transfer. A version-2 claim therefore weighs one unit plus one per
+        // attestor signature. These arms used to build a private, unmetered
+        // verifier.
         PosTransaction::L2DataAvailability(batch) => {
             // Shape and payload are rechecked in consensus; refuse the
             // obviously unusable batch before the signature.
             if bloch_pos_committee::l2_settlement::da::batch_count(&batch.payload).is_none() {
                 return Err("L2 data availability payload is not one canonical batch");
             }
-            if strict_relay_hybrid().verify_with_key(&batch.funding_pubkey, &batch.intent_root(), &batch.signature) {
+            if verifier.verify_with_key(&batch.funding_pubkey, &batch.intent_root(), &batch.signature) {
                 Ok(())
             } else {
                 Err("invalid L2 data availability hybrid PQ authorization")
             }
         }
         PosTransaction::L2WithdrawClaim(claim) => {
-            // The proof, maturity, nullifier and escrow are state checks and
-            // run in consensus; refuse a malformed claim before the signature.
+            // The proof, maturity, nullifier and escrow are state checks:
+            // `admission::check_transfer` ran them (and compared the
+            // attestor set with the policy's) before this; refuse a
+            // malformed claim before the signature.
             if claim.validate_shape().is_err() {
                 return Err("L2 withdrawal claim has an invalid shape or release output");
             }
-            if !strict_relay_hybrid().verify_with_key(&claim.funding_pubkey, &claim.intent_root(), &claim.signature) {
+            if !verifier.verify_with_key(&claim.funding_pubkey, &claim.intent_root(), &claim.signature) {
                 return Err("invalid L2 withdrawal claim hybrid PQ authorization");
             }
             // The attestors sign the root the proof folds to, so their
             // signatures check here without state; only "is this the
             // policy's set" waits for consensus.
-            if !claim.verify_attestation(&strict_relay_hybrid()) {
+            if !claim.verify_attestation(verifier) {
                 return Err("invalid L2 withdrawal claim attestation");
             }
             Ok(())
         }
         PosTransaction::L2Deposit(deposit) => {
-            // State checks (inputs, ownership, conservation) run in consensus.
-            if strict_relay_hybrid().verify_with_key(&deposit.funding_pubkey, &deposit.intent_root(), &deposit.signature) {
+            // State checks (inputs, ownership, conservation) ran in
+            // `admission::check_transfer`, before this signature.
+            if verifier.verify_with_key(&deposit.funding_pubkey, &deposit.intent_root(), &deposit.signature) {
                 Ok(())
             } else {
                 Err("invalid L2 deposit hybrid PQ authorization")

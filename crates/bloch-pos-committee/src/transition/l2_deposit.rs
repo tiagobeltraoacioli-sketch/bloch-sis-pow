@@ -163,11 +163,30 @@ impl L2Deposit {
 }
 
 impl CommittedState {
-    pub(super) fn apply_l2_deposit(
-        &mut self,
+    /// Why this state would refuse `tx` in the next block at `base_fee`,
+    /// checking everything except the signature. Node-local preflight
+    /// (mempool admission, proposer selection): it shares
+    /// [`Self::check_l2_deposit`] with the transition, so it refuses nothing
+    /// the transition would accept in this state.
+    pub fn l2_deposit_refusal_at(&self, tx: &L2Deposit, base_fee: u128) -> Option<L2DepositReject> {
+        use L2DepositReject as R;
+        if let Err(why) = self.check_l2_deposit(tx, base_fee) {
+            return Some(why);
+        }
+        // The fallible steps that follow the signature in `apply_l2_deposit`.
+        let Some(l2) = self.l2_settlement.as_ref() else { return Some(R::NotActive) };
+        if l2.height().checked_add(1).is_none() {
+            return Some(R::Arithmetic);
+        }
+        (!l2.can_append_deposit(tx.amount_sat)).then_some(R::Inbox)
+    }
+
+    /// The state checks of [`Self::apply_l2_deposit`], in its order, up to
+    /// (not including) the signature.
+    fn check_l2_deposit(
+        &self,
         tx: &L2Deposit,
         base_fee: u128,
-        verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, L2DepositReject> {
         use L2DepositReject as R;
         // The installed L2's profile decides (development genesis: the
@@ -207,6 +226,18 @@ impl CommittedState {
         if self.eutxos.contains_key(&(txid, 0)) {
             return Err(R::OutputCollision);
         }
+        Ok(charge)
+    }
+
+    pub(super) fn apply_l2_deposit(
+        &mut self,
+        tx: &L2Deposit,
+        base_fee: u128,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<fee_market::TxCharge, L2DepositReject> {
+        use L2DepositReject as R;
+        let charge = self.check_l2_deposit(tx, base_fee)?;
+        let txid = PosTransaction::L2Deposit(tx.clone()).txid();
         // Expensive check last.
         if !verifier.verify_with_key(&tx.funding_pubkey, &tx.intent_root(), &tx.signature) {
             return Err(R::Signature);

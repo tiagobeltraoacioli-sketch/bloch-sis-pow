@@ -8,13 +8,13 @@ fn funds() -> Vec<EutxoEntry> { funds_of(3) }
 
 /// `count` outputs owned by one key, so one source can hold many pending
 /// spends without any two of them naming the same input.
-fn funds_of(count: u32) -> Vec<EutxoEntry> {
+pub(super) fn funds_of(count: u32) -> Vec<EutxoEntry> {
     let (pk, _) = bloch_crypto::crypto::generate_keypair_from_seed(&[71; 32]).unwrap();
     let script_hash: [u8; 32] = Sha3_256::digest(pk).into();
     (0..count).map(|vout| EutxoEntry { txid: [72; 32], vout, value: 1_000_000_000, script_hash }).collect()
 }
 
-fn spend(entry: &EutxoEntry, declared: u64, tip: u128, base: u128) -> PosTransaction {
+pub(super) fn spend(entry: &EutxoEntry, declared: u64, tip: u128, base: u128) -> PosTransaction {
     let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[71; 32]).unwrap();
     let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, declared, base, tip);
     let fee: u64 = charge.base_fee_sat.checked_add(charge.priority_fee_sat).unwrap().try_into().unwrap();
