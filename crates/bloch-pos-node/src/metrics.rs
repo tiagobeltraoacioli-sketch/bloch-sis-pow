@@ -177,6 +177,11 @@ pub struct NodeMetrics {
     /// in `engine.rs` for why the latch exists and why an unexported counter
     /// made the 6 -> 4 -> 2 -> 0 rewind a silent self-partition risk.
     pub finality_rewinds_refused_total: AtomicU64,
+    /// Blocks this node refused because they are, or descend from, an
+    /// operator-rejected root (`--reject-block-root`), at the door or
+    /// truncated from the block log at boot. Mirrors
+    /// `Engine::rejected_roots.refused` every turn.
+    pub rejected_blocks_total: AtomicU64,
 
     // ── Gauges — sampled by the slot loop every turn ──
     /// Slot of the node's committed head.
@@ -302,6 +307,7 @@ impl NodeMetrics {
             blocks_rejected_total: AtomicU64::new(0),
             equivocations_observed_total: AtomicU64::new(0),
             finality_rewinds_refused_total: AtomicU64::new(0),
+            rejected_blocks_total: AtomicU64::new(0),
             head_slot: AtomicU64::new(0),
             wall_slot: AtomicU64::new(0),
             behind_by_slots: AtomicU64::new(0),
@@ -429,6 +435,12 @@ impl NodeMetrics {
             "counter",
             "Reorgs refused because they would cut canonical history below this node's finality latch (R3 M-1)",
             self.get(&self.finality_rewinds_refused_total),
+        );
+        series(
+            "bloch_pos_rejected_blocks_total",
+            "counter",
+            "Blocks refused because they are, or descend from, an operator-rejected root (--reject-block-root)",
+            self.get(&self.rejected_blocks_total),
         );
         series(
             "bloch_pos_head_slot",
@@ -979,6 +991,7 @@ mod tests {
             // gauge and the parked-blocks gauge.
             "bloch_pos_equivocations_observed_total",
             "bloch_pos_finality_rewinds_refused_total",
+            "bloch_pos_rejected_blocks_total",
             "bloch_pos_boundary_vote_drops_total",
             "bloch_pos_peer_count_devnet",
             "bloch_pos_peer_count_p2p",

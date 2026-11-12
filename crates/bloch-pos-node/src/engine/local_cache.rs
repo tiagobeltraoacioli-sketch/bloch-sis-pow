@@ -271,7 +271,12 @@ impl Engine {
             .collect();
         let digests = log_hashes(&dir.join("blocks.log"), &lens)?;
         let anchor_count = peek_cache(&dir.join(ANCHOR)).and_then(|(_, count)| usize::try_from(count).ok());
-        for name in [CACHE, PREVIOUS] {
+        // The anchor generation is the last resort, after both recent ones:
+        // it is at or below the finality latch, so it still matches a log
+        // that was truncated above finality (`--reject-block-root` at boot,
+        // `Engine::truncate_rejected_log`), when both recent generations
+        // covered the truncated blocks. It is verified exactly like them.
+        for name in [CACHE, PREVIOUS, ANCHOR] {
             match self.read_local_cache(name, logged, &digests, anchor_count) {
                 Ok((state, count, anchor_len)) => {
                     // PER-4: the retained anchor generation, checked against
@@ -730,6 +735,29 @@ mod tests {
         // Nothing to write, and no error, when there is no base anchor.
         engine.reorg_anchors.base = None;
         engine.seed_anchor_generation().unwrap();
+    }
+
+    /// A log truncated above the latch but below both recent generations
+    /// (what `--reject-block-root` does at boot) restores from the anchor
+    /// generation instead of replaying from genesis.
+    #[test]
+    fn a_log_truncated_below_both_recent_generations_restores_from_the_anchor() {
+        let (mut engine, dir) = perf_support::proposing_engine();
+        engine.live = false;
+        extend_and_cache(&mut engine, 1..=10);
+        extend_and_cache(&mut engine, 11..=20);
+        engine.finalized_latch = Some((15, *engine.chain[15].1.as_bytes()));
+        extend_and_cache(&mut engine, 21..=30);
+        let logged = extend_and_cache(&mut engine, 31..=40);
+        assert_eq!(peek_cache(&dir.0.join(ANCHOR)).map(|(_, count)| count), Some(10));
+        let mut truncated = logged[..25].to_vec();
+        engine.store.rewrite(&truncated).unwrap();
+        reset(&mut engine);
+        engine.reorg_anchors = Default::default();
+        assert_eq!(engine.restore_local_cache(&mut truncated).unwrap(), 10);
+        assert_eq!(truncated.len(), 15, "only the tail above the anchor is left to replay");
+        for env in truncated { assert!(engine.ingest_replay(env)); }
+        assert_eq!(engine.head_id(), logged[24].block_id());
     }
 
     /// Without a retained generation the restore still seeds the pending

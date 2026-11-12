@@ -716,6 +716,7 @@ pub(super) fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         finality_rewinds_refused: 0,
         parked_refused_finality: VecDeque::new(),
         finality_rewind_override: false,
+        rejected_roots: Default::default(),
         tx_slot_index: BTreeMap::new(),
         tx_slot_index_order: VecDeque::new(),
         doppelganger_observe_until: None,

@@ -2005,6 +2005,8 @@ mod l2_preflight_tests;
 
 mod local_cache;
 mod finality_latch;
+mod reject_roots;
+pub(crate) use reject_roots::{parse_reject_block_root, ENV_REJECT_BLOCK_ROOTS};
 #[cfg(test)]
 mod side_branch_tests;
 mod verification;
@@ -2344,6 +2346,10 @@ struct Engine {
     /// so a legitimate divergence is not indistinguishable from an attack
     /// from the outside, not so it can be left on quietly.
     finality_rewind_override: bool,
+    /// Operator-rejected block roots (`--reject-block-root`), set once at
+    /// boot, and the descendants refused because of them. Node-local; see
+    /// `engine/reject_roots.rs`.
+    rejected_roots: reject_roots::RejectedRoots,
     /// Transaction id -> the slot it was included at, on the CURRENT
     /// canonical chain (R4 F-11 — `gettxstatus`). Maintained by
     /// [`Engine::note_tx_slots`] on every canonical apply (`apply_canonical`,
@@ -4401,6 +4407,14 @@ impl Engine {
         {
             // A child cannot make a locally finality-conflicting ancestor
             // adoptable. Do not convert it into a missing-parent sync request.
+            return (Verdict::Ignore, None);
+        }
+        // Operator-rejected roots (`--reject-block-root`): the block, or its
+        // parent, is rejected or a remembered rejected descendant. Refused
+        // before any signature work and never stored, so it never reaches
+        // fork choice. `Ignore`: the peer relaying it is honest.
+        if self.is_rejected_block(&id, &env.header.parent) {
+            self.refuse_rejected_block(id);
             return (Verdict::Ignore, None);
         }
         if env.header.slot == 0 {
@@ -6758,11 +6772,15 @@ impl Engine {
             self.parked_refused_finality.push_back(id);
             parked_ids.insert(id);
         }
-        // Entries may have arrived before the parent was refused. Remove the
-        // entire bounded pending subtree, including reverse arrival order.
-        // Retain unrelated gaps; they still need normal synchronization.
-        let mut refused: BTreeSet<[u8; 32]> = branch.iter()
-            .map(|env| *env.block_id().as_bytes()).collect();
+        self.drop_orphan_descendants(branch.iter().map(|env| *env.block_id().as_bytes()).collect());
+    }
+
+    /// Drop every parked orphan that descends from one of `refused`.
+    ///
+    /// Entries may have arrived before the parent was refused. Remove the
+    /// entire bounded pending subtree, including reverse arrival order.
+    /// Retain unrelated gaps; they still need normal synchronization.
+    fn drop_orphan_descendants(&mut self, mut refused: BTreeSet<[u8; 32]>) {
         let mut pending: VecDeque<[u8; 32]> = refused.iter().copied().collect();
         let mut children: BTreeMap<[u8; 32], Vec<[u8; 32]>> = BTreeMap::new();
         for (id, env, _, _, _) in &self.orphans {
@@ -7376,6 +7394,16 @@ impl Engine {
     /// (an attestation arriving milliseconds before the block it votes for) is
     /// precisely the one a naive implementation calls invalid.
     fn on_attestation(&mut self, att: Attestation, origin: Origin, wall_epoch: u64) {
+        // Operator-rejected roots (`--reject-block-root`): a vote whose head
+        // or target is a rejected block never reaches the fork-choice pool,
+        // and is not held waiting for a block this node will never store.
+        // Node-local and `Ignore`: the vote is not invalid.
+        if self.rejected_roots.contains(&att.data.head)
+            || self.rejected_roots.contains(&att.data.target_root)
+        {
+            self.net.report(&origin, Verdict::Ignore);
+            return;
+        }
         let e = epoch_of(att.data.slot);
         // Narrower than `gossip.rs`'s own two-epoch window, and for a reason
         // that belongs to the node, not the policy: committee membership must
@@ -7994,7 +8022,7 @@ impl Engine {
         verification_source: Option<[u8; 32]>,
     ) -> RpcResult {
         match req {
-            RpcRequest::ChainInfo => Ok(rpc::chain_info_json(
+            RpcRequest::ChainInfo => Ok(self.with_rejected_block_roots(rpc::chain_info_json(
                 &self.state,
                 &self.head_id(),
                 self.head_state_root(),
@@ -8009,7 +8037,7 @@ impl Engine {
                 // config, so it cannot disagree with what is bound.
                 self.net.transport_name(),
                 self.net.peer_counts(),
-            )),
+            ))),
 
             RpcRequest::BlockCount => Ok(self.block_count_reply()),
 
@@ -8801,6 +8829,23 @@ pub fn run(cfg: Config) -> io::Result<()> {
              informed consent."
         );
     }
+    // `--reject-block-root` / BLOCH_REJECT_BLOCK_ROOTS: read once, strictly,
+    // and announced in one line so the operator sees exactly what is armed.
+    let rejected_roots = reject_roots::reject_block_roots_from_env()?;
+    if rejected_roots.contains(genesis_id.as_bytes()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--reject-block-root names the genesis block, which every chain descends from",
+        ));
+    }
+    if !rejected_roots.is_empty() {
+        println!(
+            "REJECT_BLOCK_ROOT: this node will never adopt these {} block(s) or any descendant \
+             of them (node-local; no consensus rule changes): {}",
+            rejected_roots.len(),
+            rejected_roots.iter().map(crate::codec::hex32).collect::<Vec<_>>().join(", "),
+        );
+    }
 
     // Read the opt-out once, but arm observation only after replay and the
     // weak-subjectivity gate. Time spent reading disk is not live observation.
@@ -8870,6 +8915,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         finality_rewinds_refused: 0,
         parked_refused_finality: VecDeque::new(),
         finality_rewind_override: allow_finality_rewind,
+        rejected_roots: reject_roots::RejectedRoots::new(rejected_roots),
         tx_slot_index: BTreeMap::new(),
         tx_slot_index_order: VecDeque::new(),
         doppelganger_observe_until: None,
@@ -8896,6 +8942,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
     if force_replay && require_cache {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "--replay-from-genesis conflicts with --require-state-cache"));
     }
+    // Before the cache restore and the replay: neither may ever apply a
+    // block of an operator-rejected branch (`engine/reject_roots.rs`).
+    engine.truncate_rejected_log(&mut logged)?;
     let skipped = if force_replay { 0 } else {
         match engine.restore_local_cache(&mut logged) {
             Ok(n) => n,
@@ -9533,6 +9582,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             // cheap (one more atomic store) and correct either way, since the
             // counter only ever goes up.
             NodeMetrics::set(&NODE.finality_rewinds_refused_total, engine.finality_rewinds_refused);
+            NodeMetrics::set(&NODE.rejected_blocks_total, engine.rejected_roots.refused);
             // R3 M-5: the slot-progress signal `/health` corroborates the
             // heartbeat with. `genesis_unix`/`slot_secs` are effectively
             // constants of this manifest; setting them every turn costs one
@@ -12781,6 +12831,7 @@ mod transfer_v2_end_to_end {
             finality_rewinds_refused: 0,
             parked_refused_finality: VecDeque::new(),
             finality_rewind_override: false,
+            rejected_roots: Default::default(),
             tx_slot_index: BTreeMap::new(),
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
@@ -14174,6 +14225,7 @@ mod perf_support {
             finality_rewinds_refused: 0,
             parked_refused_finality: VecDeque::new(),
             finality_rewind_override: false,
+            rejected_roots: Default::default(),
             tx_slot_index: BTreeMap::new(),
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
@@ -16666,6 +16718,7 @@ mod duty_view_anchor {
             finality_rewinds_refused: 0,
             parked_refused_finality: VecDeque::new(),
             finality_rewind_override: false,
+            rejected_roots: Default::default(),
             tx_slot_index: BTreeMap::new(),
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
@@ -16930,6 +16983,7 @@ mod slot_horizon {
             finality_rewinds_refused: 0,
             parked_refused_finality: VecDeque::new(),
             finality_rewind_override: false,
+            rejected_roots: Default::default(),
             tx_slot_index: BTreeMap::new(),
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,

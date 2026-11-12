@@ -698,6 +698,10 @@ fn print_help() {
          \n\
                          [--stop-at-slot <n>]\n\
                          [--replay-from-genesis | --require-state-cache] [--max-replay-blocks <n>]\n\
+                         [--reject-block-root <block-id-hex64>]... (or\n\
+                          BLOCH_REJECT_BLOCK_ROOTS=<hex64>[,...]): never adopt\n\
+                          that block or any descendant; node-local; a logged\n\
+                          chain holding it is truncated to its parent at boot\n\
                          [--ws-checkpoint <file> --ws-signer-set <file>\n\
                           --ws-signer-set-sha3 <independently-verified-hex32>]\n\
                          [--checkpoint-sync-url <host:port>[,<host:port>...]]\n\
@@ -1020,30 +1024,51 @@ fn arg_after(args: &[String], i: usize) -> Option<&String> {
 /// reason. This parser intentionally needs to know only which run flags do not
 /// consume a following value; every other `--flag` consumes one token here.
 fn run_switch(args: &[String], name: &str) -> bool {
-    const SWITCHES: &[&str] = &[
-        "--allow-finality-rewind",
-        "--allow-plaintext-keystore",
-        "--allow-public-metrics",
-        "--behind-proxy",
-        "--bind-genesis",
-        "--mesh-require-authenticated",
-        "--no-doppelganger-check",
-        "--no-signer-anchor",
-        "--accept-signing-rollback",
-        "--acknowledge-missing-slashing-protection",
-        "--replay-from-genesis",
-        "--require-state-cache",
-    ];
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         if arg == "--" { break; }
         if arg == name { return true; }
-        if arg.starts_with("--") && !SWITCHES.contains(&arg.as_str()) && !arg.contains('=') {
+        if arg.starts_with("--") && !RUN_SWITCHES.contains(&arg.as_str()) && !arg.contains('=') {
             rest.next();
         }
     }
     false
 }
+
+/// Every value of the repeatable `--reject-block-root <hex>` run option, each
+/// checked to be exactly a 64-hex-digit block id. Walks argv the way
+/// [`run_switch`] does, so a token that is another option's value is data.
+fn reject_block_root_args(args: &[String]) -> Result<Vec<String>, String> {
+    let mut roots = Vec::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--" { break; }
+        if arg == "--reject-block-root" {
+            let value = rest.next().ok_or("--reject-block-root needs a 64-hex-digit block id")?;
+            engine::parse_reject_block_root(value)?;
+            roots.push(value.clone());
+        } else if arg.starts_with("--") && !RUN_SWITCHES.contains(&arg.as_str()) && !arg.contains('=') {
+            rest.next();
+        }
+    }
+    Ok(roots)
+}
+
+/// The run flags that do not consume a following value.
+const RUN_SWITCHES: &[&str] = &[
+    "--allow-finality-rewind",
+    "--allow-plaintext-keystore",
+    "--allow-public-metrics",
+    "--behind-proxy",
+    "--bind-genesis",
+    "--mesh-require-authenticated",
+    "--no-doppelganger-check",
+    "--no-signer-anchor",
+    "--accept-signing-rollback",
+    "--acknowledge-missing-slashing-protection",
+    "--replay-from-genesis",
+    "--require-state-cache",
+];
 
 /// Validate the metrics listener's exposure posture before the engine starts.
 /// Metrics are intentionally unauthenticated; an explicit flag acknowledges a
@@ -1955,6 +1980,24 @@ fn run_cmd(args: &[String]) {
     if args.iter().any(|a| a == "--require-state-cache") {
         unsafe { std::env::set_var("BLOCH_REQUIRE_STATE_CACHE", "1") };
     }
+    // Incident 2026-11-12: `--reject-block-root <hex>` (repeatable) is sugar
+    // over BLOCH_REJECT_BLOCK_ROOTS, folded into it so the engine reads one
+    // source; see `engine/reject_roots.rs`. Malformed input stops here.
+    match reject_block_root_args(args) {
+        Ok(roots) if roots.is_empty() => {}
+        Ok(mut roots) => {
+            if let Ok(existing) = std::env::var(engine::ENV_REJECT_BLOCK_ROOTS) {
+                if !existing.trim().is_empty() {
+                    roots.insert(0, existing);
+                }
+            }
+            unsafe { std::env::set_var(engine::ENV_REJECT_BLOCK_ROOTS, roots.join(",")) };
+        }
+        Err(e) => {
+            eprintln!("run: {e}");
+            exit(2);
+        }
+    }
     // The transport is decided by a pure function (`decide_transport`) and
     // then ANNOUNCED. Nothing below re-derives it, and nothing silently drops
     // a flag: what the operator asked for either becomes the plan or becomes
@@ -2412,6 +2455,34 @@ mod plaintext_flag_tests {
         assert!(!super::plaintext_opt_in_flag(&args(&["run", "--data-dir", "--allow-plaintext-keystore"])));
         assert!(!super::plaintext_opt_in_flag(&args(&["run", "--", "--allow-plaintext-keystore"])));
         assert!(!super::plaintext_opt_in_flag(&args(&["slashing-protection", "--allow-plaintext-keystore"])));
+    }
+}
+
+#[cfg(test)]
+mod reject_block_root_flag_tests {
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn repeatable_and_strict() {
+        let a = "ab".repeat(32);
+        let b = "CD".repeat(32);
+        assert_eq!(super::reject_block_root_args(&args(&["run"])).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            super::reject_block_root_args(&args(&[
+                "run", "--reject-block-root", &a, "--allow-finality-rewind", "--reject-block-root", &b,
+            ])).unwrap(),
+            vec![a.clone(), b.clone()],
+        );
+        // A token that is another option's value is data, not the flag.
+        assert!(super::reject_block_root_args(&args(&["run", "--data-dir", "--reject-block-root"])).unwrap().is_empty());
+        assert!(super::reject_block_root_args(&args(&["run", "--", "--reject-block-root", "zz"])).unwrap().is_empty());
+        for bad in [&["run", "--reject-block-root"][..], &["run", "--reject-block-root", "abc"][..]] {
+            assert!(super::reject_block_root_args(&args(bad)).is_err(), "{bad:?}");
+        }
+        let short = "ab".repeat(31);
+        assert!(super::reject_block_root_args(&args(&["run", "--reject-block-root", &short])).is_err());
     }
 }
 
