@@ -525,7 +525,8 @@ fn replay_failure_message(epoch: u64) -> String {
 }
 
 /// [`replay_failure_message`] over an explicit gate list, so the message can
-/// be tested with a gate armed in the past (the shipped list has none).
+/// be tested with a gate armed in the past (the shipped list arms none
+/// below epoch 8620).
 fn replay_failure_message_for(unarmed: &[bloch_pos_committee::hard_forks::UnarmedGate], epoch: u64) -> String {
     let mut msg =
         String::from("durable block log failed consensus replay; refusing to serve a partial head");
@@ -19094,8 +19095,20 @@ mod ingest_admission_tests {
             assert!(!msg.contains("A_EPOCH") && !msg.contains("C_EPOCH"), "{msg}");
             assert!(msg.contains("re-released with a future epoch"), "{msg}");
         }
-        // As shipped nothing is armed, so the message stays the plain one.
-        assert_eq!(replay_failure_message(M - 1), plain);
+        // As shipped the only armed gates on the list are the two armed
+        // 2026-11-13 at 8620: plain below them, named from 8620 on.
+        assert_eq!(replay_failure_message(8_619), plain);
+        let msg = replay_failure_message(8_620);
+        assert!(msg.contains("params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH = 8620"), "{msg}");
+        assert!(msg.contains("params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH = 8620"), "{msg}");
+        assert_eq!(
+            bloch_pos_committee::hard_forks::gates_armed_at_or_below(
+                bloch_pos_committee::hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY,
+                M - 1
+            )
+            .len(),
+            2
+        );
         // Wiring: the production message is the tested one over the
         // canonical list, and boot replay fails with it.
         let source = include_str!("engine.rs");

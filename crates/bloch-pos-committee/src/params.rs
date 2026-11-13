@@ -1811,8 +1811,10 @@ pub const TX_BYTES_BOUND_ACTIVATION_EPOCH: u64 = u64::MAX;
 pub const ATTESTATION_DEDUP_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Flag day for **binding an in-block vote to its slot's epoch** (security
-/// review FC-3 / CR-1, 2026-11-10). `u64::MAX` = INERT: below it step 8 is
-/// byte-for-byte the rule the chain runs today.
+/// review FC-3 / CR-1, 2026-11-10). ARMED at epoch 8620 (owner decision
+/// 2026-11-13): the same flag day as KES enforcement
+/// ([`HF3_KES_ENFORCE_EPOCH`]). Below the gate step 8 is byte-for-byte the
+/// rule the chain ran before it.
 ///
 /// Step 8 requires `epoch_of(att.data.slot) == st.epoch` and nothing of
 /// `att.data.target_epoch` beyond `source_epoch < target_epoch`, yet
@@ -1842,7 +1844,7 @@ pub const ATTESTATION_DEDUP_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// chain was not checked against rule 1 so far, so a gate at or below an
 /// epoch the chain has passed can invalidate a canonical block on replay
 /// (`hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY`).
-pub const ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
+pub const ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH: u64 = 8620;
 
 /// Is the vote slot-epoch binding active in `epoch` (the vote's slot epoch,
 /// which block validation pins to the including block's committed epoch)?
@@ -3649,8 +3651,9 @@ pub const KES_PERIOD_EPOCHS: u64 = 90;
 /// periods, about 11.2 years (option A). Consensus accepts any depth in
 /// `kes::MIN_DEPTH..=kes::MAX_DEPTH`; this is the operator default only.
 pub const KES_DEFAULT_DEPTH: u8 = 12;
-/// Security review CR-2 (first-key floor), deliberately UNARMED. From the
-/// first KES period that starts at or after this epoch:
+/// Security review CR-2 (first-key floor). ARMED at epoch 8620 (owner
+/// decision 2026-11-13), the KES enforcement flag day. From the first KES
+/// period that starts at or after this epoch:
 ///
 /// * a period that precedes a validator's FIRST KES key resolves to no KES
 ///   key (`kes::KesEntry::resolve`), so `kes::signing_mode` is `Static` for
@@ -3672,7 +3675,7 @@ pub const KES_DEFAULT_DEPTH: u8 = 12;
 /// late registrants unprovable. It must not be armed after the first epoch
 /// at which history can have been pruned
 /// (`kes_first_key_floor_is_armed_in_time`).
-pub const KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH: u64 = u64::MAX;
+pub const KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH: u64 = 8620;
 
 /// The first-key floor is inert, or armed while no validator's key history
 /// can have been pruned yet: history exists only from enforcement on and
@@ -3935,13 +3938,19 @@ mod kes_schedule_tests {
     }
 
     #[test]
-    fn the_first_key_floor_ships_inert_and_opens_by_period() {
-        assert_eq!(KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH, u64::MAX);
+    fn the_first_key_floor_ships_with_enforcement_and_opens_by_period() {
+        // Armed 2026-11-13 at the KES enforcement flag day: in force from the
+        // first bound period on the compiled schedule.
+        assert_eq!(KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH, 8620);
+        assert_eq!(KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH, HF3_KES_ENFORCE_EPOCH);
         for period in [0, 1, 365, 1 << 40, u64::MAX] {
-            assert!(!kes_first_key_floor_active(period), "inert on the compiled schedule");
+            assert!(kes_first_key_floor_active(period), "in force from period 0 on the compiled schedule");
         }
         kes_rehearsal::set(Some(KesSchedule { registration_epoch: 10, activation_epoch: 100, period_epochs: 90, min_depth: 1 }));
-        assert!(!kes_first_key_floor_active(0), "still inert under an armed KES schedule");
+        // Compiled gate 8620 against a schedule bound at epoch 100: period 94
+        // starts at 8560, period 95 at 8650.
+        assert!(!kes_first_key_floor_active(0), "below the compiled gate under an earlier KES schedule");
+        assert!(!kes_first_key_floor_active(94) && kes_first_key_floor_active(95));
         {
             let _floor = kes_first_key_floor_rehearsal::arm(100);
             assert!(kes_first_key_floor_active(0) && kes_first_key_floor_active(7));

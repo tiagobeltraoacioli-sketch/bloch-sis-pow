@@ -1009,8 +1009,17 @@ mod history_tests {
         // The old keys' leaves past their range are never selected.
         assert_eq!(e.in_force(5), k2, "k0's leaf 5 exists, but k0 does not cover period 5");
         let horizon = crate::params::KES_KEY_HISTORY_PERIODS;
-        assert_eq!(e.settled(2 + horizon).retired.len(), 1, "k0 (ends at 2) pruned past the horizon");
-        assert!(e.settled(3 + horizon).retired.is_empty());
+        // As shipped (first-key floor armed with enforcement, so in force
+        // from period 0): the first key is never pruned; later ones are.
+        assert_eq!(e.settled(2 + horizon).retired.len(), 2, "k0 is the first key: kept past the horizon");
+        assert_eq!(e.settled(3 + horizon).retired, vec![RetiredKes { public: k0, end_period: 2 }], "k1 pruned");
+        assert_eq!(e.settled(3 + horizon).first_start_period(), 0);
+        {
+            // The rule below the floor: plain horizon pruning.
+            let _inert = crate::params::kes_first_key_floor_rehearsal::arm(u64::MAX);
+            assert_eq!(e.settled(2 + horizon).retired.len(), 1, "k0 (ends at 2) pruned past the horizon");
+            assert!(e.settled(3 + horizon).retired.is_empty());
+        }
         // Committed bytes carry the history after a tag no key starts with.
         let bytes = e.committed_bytes();
         assert_eq!(bytes[41], RETIRED_SECTION_TAG);

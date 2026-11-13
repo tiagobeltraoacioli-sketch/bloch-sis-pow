@@ -109,7 +109,10 @@ pub const NEVER_IN_A_SCHEDULED_RELEASE: &[&str] = &["params::LATTICE_EMERGENCY_A
 
 /// Gates the next release may arm (owner decision 2026-10-25: HF1, HF2 and
 /// HF3 at E1 7180 / 7186, E2 7270, E3 7360, KES enforcement 8620; the
-/// lattice emergency is never armed). Everything else must stay `u64::MAX`.
+/// lattice emergency is never armed). Owner decision 2026-11-13: the vote
+/// slot-epoch binding (FC-3/CR-1) and the KES first-key floor (CR-2) are
+/// armed with KES enforcement at 8620; the registration epoch binding (CR-5)
+/// stays inert. Everything else must stay `u64::MAX`.
 pub const RELEASE_ARMABLE: &[&str] = &[
     "params::HF1_CLAIM_FINALITY_EPOCH",
     "params::HF1_FROZEN_FINALITY_SET_EPOCH",
@@ -125,6 +128,8 @@ pub const RELEASE_ARMABLE: &[&str] = &[
     "params::KES_ACTIVATION_EPOCH",
     "params::HF3_SLH_SUITE_EPOCH",
     "params::HF3_PQ_MIGRATION_EPOCH",
+    "params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH",
+    "params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH",
 ];
 
 /// Minimum spacing between HF1 claim finality and any HF2 gate (one day).
@@ -204,8 +209,9 @@ const _: () = assert!(params::KES_ACTIVATION_EPOCH == params::HF3_KES_ENFORCE_EP
 // gate so the owner chooses the flag day, but a build that arms enforcement
 // and leaves them inert ships the defects live.
 //
-// That combination exists today (enforcement 8620, all three `u64::MAX`), and
-// arming is the owner's decision, so a hard const assertion cannot be added
+// That combination exists today (enforcement 8620; the slot-epoch binding and
+// the first-key floor armed at 8620 on 2026-11-13, the registration binding
+// still `u64::MAX`), and arming is the owner's decision, so a hard const assertion cannot be added
 // without either breaking the build or picking the epochs here. Instead:
 //
 // * [`KES_FOLLOW_UP_GATES_PENDING`] records, in one line, that the open
@@ -500,9 +506,9 @@ mod tests {
         }
     }
 
-    /// GATE-02. Today the relation does NOT hold and the flag says so; the
-    /// release that arms the gates flips `KES_FOLLOW_UP_GATES_PENDING` and
-    /// nothing else here.
+    /// GATE-02. Today the relation does NOT hold (the registration binding is
+    /// still inert) and the flag says so; the release that arms it flips
+    /// `KES_FOLLOW_UP_GATES_PENDING` and nothing else here.
     #[test]
     fn the_kes_follow_up_flag_matches_the_shipped_gates() {
         let covered = kes_follow_up_gates_cover_enforcement(
@@ -519,6 +525,11 @@ mod tests {
         );
         // The boot warning is exactly the open part of the relation.
         assert_eq!(shipped_kes_follow_up_exposures().is_empty(), covered);
+        // Since 2026-11-13 only the registration binding (CR-5) is open.
+        assert_eq!(
+            shipped_kes_follow_up_exposures().iter().map(|e| e.gate).collect::<Vec<_>>(),
+            ["params::KES_REGISTER_EPOCH_BINDING_EPOCH"]
+        );
     }
 
     #[test]
@@ -573,8 +584,16 @@ mod tests {
         assert!(err.contains("epoch 7400") && !err.contains("A_EPOCH"), "{err}");
         // Inert gates never trip, whatever the anchor.
         assert!(check_gates_above_anchored_history(&[("params::A_EPOCH", M)], M).is_ok());
-        // As shipped, nothing on the list is armed at all.
-        assert!(gates_armed_at_or_below(GATES_UNARMED_IN_CANONICAL_HISTORY, M - 1).is_empty());
+        // As shipped, the gates armed 2026-11-13 (8620) are above anchored
+        // and current history (mainnet ~8210), and nothing else is armed.
+        assert!(check_gates_above_anchored_history(GATES_UNARMED_IN_CANONICAL_HISTORY, 8_619).is_ok());
+        assert_eq!(
+            gates_armed_at_or_below(GATES_UNARMED_IN_CANONICAL_HISTORY, M - 1),
+            [
+                ("params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH", 8_620),
+                ("params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH", 8_620),
+            ]
+        );
     }
 
     /// The list is complete: every `*_EPOCH` gate that `params.rs` ships at

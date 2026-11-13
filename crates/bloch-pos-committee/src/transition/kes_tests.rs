@@ -1483,16 +1483,19 @@ mod kes_rules {
 
     // ── Review FC-3 / CR-1: one epoch selects a vote's signing mode ───────
 
-    /// TRIPWIRE. `ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH` must stay
-    /// `u64::MAX` until the founder names an epoch: it tightens body validity
-    /// (a vote whose target is not its slot's epoch goes from accepted to
-    /// refused). Whoever arms it deletes this test first, and reads the
-    /// constant's docs while doing so.
+    /// Armed 2026-11-13 (owner decision) on the KES enforcement flag day: it
+    /// tightens body validity (a vote whose target is not its slot's epoch
+    /// goes from accepted to refused), so it may bind no later than
+    /// enforcement and only at an epoch still in the future when it ships.
     #[test]
-    fn the_vote_slot_epoch_binding_gate_is_inert() {
-        assert_eq!(crate::params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH, u64::MAX);
-        for e in [0u64, 1, 8_619, 8_620, 100_000, u64::MAX - 1, u64::MAX] {
+    fn the_vote_slot_epoch_binding_gate_binds_with_kes_enforcement() {
+        assert_eq!(crate::params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH, 8620);
+        assert_eq!(crate::params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH, crate::params::HF3_KES_ENFORCE_EPOCH);
+        for e in [0u64, 1, 8_210, 8_619] {
             assert!(!crate::params::attestation_slot_epoch_binding_active(e), "epoch {e} must be below");
+        }
+        for e in [8_620u64, 8_621, 100_000, u64::MAX - 1, u64::MAX] {
+            assert!(crate::params::attestation_slot_epoch_binding_active(e), "epoch {e} must be bound");
         }
     }
 
@@ -1741,9 +1744,12 @@ mod kes_rules {
     }
 
     #[test]
-    fn cr2_with_the_gate_inert_nothing_changes() {
+    fn cr2_below_the_gate_nothing_changes() {
         let _armed = Armed::enforcing(2, 1);
-        assert_eq!(crate::params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH, u64::MAX);
+        // The compiled gate (8620) is far above every period this test reads
+        // under the rehearsal schedule, so below it the pre-floor rule holds.
+        assert!(crate::params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH > 40);
+        assert!(!crate::params::kes_first_key_floor_active(40));
         let (st, pair) = late_registrant_with_static_evidence();
         let entry = st.kes_roots()[&3].clone();
         // Today's rule: every bound period of a registered validator is KES,
