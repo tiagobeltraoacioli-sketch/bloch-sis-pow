@@ -680,7 +680,10 @@ async fn anchor_verify(body: Bytes) -> Result<Json<Value>, ApiError> {
     })?;
     let trusted = hexbytes("trusted_pq_pubkey", trusted_hex)?;
 
-    let result = bloch_pq_vault::anchor::verify_anchor(&signed, &trusted);
+    // L1M-07: canonical encodings only. The compatibility verifier also accepts
+    // Falcon's zero-padded alternate form, so two different blobs of the same
+    // anchor would both answer `valid: true` and confuse byte-hash dedup.
+    let result = bloch_pq_vault::anchor::verify_anchor_canonical(&signed, &trusted);
     Ok(Json(json!({
         "valid": result.is_ok(),
         "reason": match &result {
@@ -986,6 +989,53 @@ mod tests {
         tampered.insert("designated_safe_dest".into(), json!(fixture_address(0x53)));
         let vr2 = anchor_verify(body(Value::Object(tampered))).await.expect("ok").0;
         assert_eq!(vr2["valid"], json!(false));
+    }
+
+    /// L1M-07: `/anchor/verify` uses the canonical verifier, so a Falcon
+    /// signature re-encoded with zero padding (a second byte string for the
+    /// same anchor) is refused. Pre-fix it answered `valid: true`.
+    #[tokio::test]
+    async fn anchor_verify_refuses_a_zero_padded_falcon_encoding() {
+        let (keys, _r, hr) = public_inputs();
+        let fields = json!({
+            "target_chain": "bitcoin",
+            "btc_vault_address": fixture_address(0x51),
+            "recovery_hash": hex::encode(hr),
+            "pq_recovery_pubkey": hex::encode(&keys.pq_pubkey),
+            "designated_safe_dest": fixture_address(0x52),
+            "csv_delay": 144u32,
+            "policy": "watchtower-01",
+        });
+        let anchor = PqShieldAnchor {
+            version: ANCHOR_VERSION,
+            target_chain: TargetChain::Bitcoin,
+            btc_vault_address: fixture_address(0x51).into_bytes(),
+            recovery_hash: hr,
+            pq_recovery_pubkey: keys.pq_pubkey.clone(),
+            designated_safe_dest: fixture_address(0x52).into_bytes(),
+            csv_delay: 144,
+            policy: b"watchtower-01".to_vec(),
+        };
+        let padded_len = bloch_crypto::crypto::SUITE_HEADER_LEN
+            + bloch_crypto::crypto::MLDSA_SIG_LEN
+            + bloch_crypto::crypto::falcon::padded_signature_len();
+        let signed = (0..64)
+            .map(|_| sign_anchor(&anchor, keys.pq_secret_key()).unwrap())
+            .find(|candidate| candidate.signature.len() < padded_len)
+            .expect("compact signature leaves room for Falcon padding");
+        let mut padded = signed.signature.clone();
+        padded.resize(padded_len, 0);
+        // The compatibility verifier still accepts the padded form...
+        assert!(verify_anchor(&SignedAnchor { anchor: anchor.clone(), signature: padded.clone() }, &keys.pq_pubkey).is_ok());
+        let ask = |sig: &[u8]| {
+            let mut req = fields.as_object().unwrap().clone();
+            req.insert("signature".into(), json!(hex::encode(sig)));
+            req.insert("trusted_pq_pubkey".into(), json!(hex::encode(&keys.pq_pubkey)));
+            body(Value::Object(req))
+        };
+        // ...the API accepts only the canonical one.
+        assert_eq!(anchor_verify(ask(&signed.signature)).await.expect("ok").0["valid"], json!(true));
+        assert_eq!(anchor_verify(ask(&padded)).await.expect("ok").0["valid"], json!(false));
     }
 
     /// REGRESSION (K-M6-anchor-selfcert), at the HTTP boundary — the shield path.
