@@ -154,6 +154,15 @@ Returns the unsigned tx + `sighashes[0]` (`sign_with: "recovery_key"`); witness
 locally (trailing empty item selects branch B). `safe_destination` must equal the
 anchored `designated_safe_dest` and be a **fresh, unexposed** address.
 
+**Anchor binding (L1M-12, optional, recommended).** Add `"signed_anchor_hex"`
+(the owner's `SignedAnchor`) and `"trusted_pq_pubkey"` (the owner's PQ key,
+known out-of-band). The server then verifies the anchor canonically on this
+network and refuses the request unless `safe_destination`, the vault's deposit
+address, `recovery_hash` and `csv_delay` all equal the anchored values. The
+response carries `"anchor_bound": true|false`; a signer should refuse to sign
+a clawback whose response is not `anchor_bound: true`. The same two fields
+apply to `/vault/clawback-ladder`.
+
 ### `POST /vault/clawback-ladder`
 Build two to 32 mutually replacing clawbacks for offline pre-signing before the
 vault is funded. The request replaces `fee_sat` above with a strictly increasing

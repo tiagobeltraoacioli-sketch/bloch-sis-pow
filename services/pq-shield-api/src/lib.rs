@@ -294,6 +294,12 @@ struct ClawbackReq {
     /// The anchored `designated_safe_dest`: a FRESH, unexposed (hidden-pubkey) address.
     safe_destination: String,
     fee_sat: u64,
+    /// L1M-12: optional anchor binding, see [`AnchorBinding`]. Plain fields,
+    /// not `flatten`, so `deny_unknown_fields` keeps working.
+    #[serde(default)]
+    signed_anchor_hex: Option<String>,
+    #[serde(default)]
+    trusted_pq_pubkey: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -306,6 +312,63 @@ struct ClawbackLadderReq {
     safe_destination: String,
     /// Absolute fees for mutually replacing transactions, lowest first.
     fee_ladder_sat: Vec<u64>,
+    /// L1M-12: optional anchor binding, see [`AnchorBinding`]. Plain fields,
+    /// not `flatten`, so `deny_unknown_fields` keeps working.
+    #[serde(default)]
+    signed_anchor_hex: Option<String>,
+    #[serde(default)]
+    trusted_pq_pubkey: Option<String>,
+}
+
+/// L1M-12: bind a clawback request to the owner's signed anchor. When
+/// `signed_anchor_hex` is given (with the owner's `trusted_pq_pubkey`), the
+/// anchor must verify canonically under that key on this network, and
+/// `safe_destination`, the vault's deposit address, `H(r)` and Δ must all be
+/// exactly what the owner anchored; otherwise the request is refused before
+/// any sighash is produced. A UI that swaps the destination therefore cannot
+/// get a sighash from this service for an anchored vault. The binding is only
+/// as strong as the client's insistence on sending the anchor: the owner's
+/// signer should require `anchor_bound: true`.
+struct AnchorBinding<'a> {
+    signed_anchor_hex: &'a Option<String>,
+    trusted_pq_pubkey: &'a Option<String>,
+}
+
+impl AnchorBinding<'_> {
+    /// `Ok(true)` when bound and consistent, `Ok(false)` when no anchor was
+    /// supplied, `Err` on any mismatch.
+    fn check(&self, network: Network, p: &VaultParams, safe: &bitcoin::Address) -> Result<bool, ApiError> {
+        let Some(blob) = self.signed_anchor_hex else {
+            if self.trusted_pq_pubkey.is_some() {
+                return Err(ApiError::bad("trusted_pq_pubkey given without signed_anchor_hex"));
+            }
+            return Ok(false);
+        };
+        let trusted_hex = self.trusted_pq_pubkey.as_ref().ok_or_else(|| {
+            ApiError::bad("signed_anchor_hex needs `trusted_pq_pubkey`: the anchor is not its own trust root")
+        })?;
+        let trusted = hexbytes("trusted_pq_pubkey", trusted_hex)?;
+        let raw = hexbytes("signed_anchor_hex", blob)?;
+        let signed = SignedAnchor::deserialize(&raw)
+            .map_err(|e| ApiError::bad(format!("signed_anchor_hex: malformed ({e:?})")))?;
+        bloch_pq_vault::anchor::verify_bitcoin_anchor_canonical(&signed, &trusted, network)
+            .map_err(|e| ApiError::bad(format!("signed anchor does not verify: {e:?}")))?;
+        let a = &signed.anchor;
+        let anchored = |field: &str, bytes: &[u8]| -> Result<bitcoin::Address, ApiError> {
+            let text = std::str::from_utf8(bytes).map_err(|_| ApiError::bad(format!("anchor {field} is not UTF-8")))?;
+            vaultlib::validate_destination(text, network).map_err(|_| ApiError::bad(format!("anchor {field} invalid")))
+        };
+        if anchored("designated_safe_dest", &a.designated_safe_dest)?.script_pubkey() != safe.script_pubkey() {
+            return Err(ApiError::bad("safe_destination differs from the anchored designated_safe_dest"));
+        }
+        if anchored("btc_vault_address", &a.btc_vault_address)?.script_pubkey() != deposit_address(p).script_pubkey() {
+            return Err(ApiError::bad("vault parameters do not match the anchored btc_vault_address"));
+        }
+        if a.recovery_hash != p.recovery_hash || a.csv_delay != p.csv_delay {
+            return Err(ApiError::bad("vault recovery_hash/csv_delay differ from the anchor"));
+        }
+        Ok(true)
+    }
 }
 
 #[derive(Deserialize)]
@@ -541,6 +604,8 @@ async fn clawback_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
     let trigger_op = req.trigger_outpoint.to_outpoint("trigger_outpoint")?;
     let safe = vaultlib::validate_destination(req.safe_destination.trim(), network)
         .map_err(|_| ApiError::bad("invalid safe_destination address"))?;
+    let anchor_bound = AnchorBinding { signed_anchor_hex: &req.signed_anchor_hex, trusted_pq_pubkey: &req.trusted_pq_pubkey }
+        .check(network, &p, &safe)?;
     let claw = build_clawback_tx_checked(trigger_op, req.trigger_amount_sat, &safe, req.fee_sat)
         .map_err(|error| ApiError::bad(error.to_string()))?;
     let trig_script = trigger_script(&p);
@@ -565,6 +630,7 @@ async fn clawback_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
             "vout": 0,
             "amount_sat": req.trigger_amount_sat.saturating_sub(req.fee_sat),
         },
+        "anchor_bound": anchor_bound,
         "notes": [
             "Immediate (no timelock) so you can beat the attacker's delayed branch A within Δ. \
              RBF-enabled; a keyless watchtower needs pre-signed replacements to fee-bump.",
@@ -584,6 +650,8 @@ async fn clawback_ladder(body: Bytes) -> Result<Json<Value>, ApiError> {
     let trigger_op = req.trigger_outpoint.to_outpoint("trigger_outpoint")?;
     let safe = vaultlib::validate_destination(req.safe_destination.trim(), network)
         .map_err(|_| ApiError::bad("invalid safe_destination address"))?;
+    let anchor_bound = AnchorBinding { signed_anchor_hex: &req.signed_anchor_hex, trusted_pq_pubkey: &req.trusted_pq_pubkey }
+        .check(network, &p, &safe)?;
     let ladder = build_clawback_fee_ladder_checked(
         &p,
         trigger_op,
@@ -611,6 +679,7 @@ async fn clawback_ladder(body: Bytes) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!({
         "replacements": replacements,
         "safe_destination": safe.to_string(),
+        "anchor_bound": anchor_bound,
         "pre_signing_required": true,
         "watchtower_needs_recovery_key": false,
         "warning": "Sign every SIGHASH_ALL candidate offline before funding and validate fee deltas against current relay policy. This is not dynamic fee estimation or a guarantee of BIP-125 acceptance.",
@@ -893,6 +962,77 @@ mod tests {
             hex::encode(p2wsh_sighash(&claw, 0, &trig, 99_500))
         );
         assert_eq!(resp["sighashes"][0]["sign_with"], "recovery_key (secp256k1)");
+    }
+
+    /// L1M-12: with the owner's signed anchor attached, a clawback whose
+    /// safe_destination is not the anchored designated_safe_dest is refused
+    /// before any sighash is produced (tx and ladder routes). Pre-fix the
+    /// service accepted any destination and had no anchor input at all.
+    #[tokio::test]
+    async fn clawback_refuses_a_destination_the_owner_did_not_anchor() {
+        let (keys, _r, hr) = public_inputs();
+        let p = VaultParams {
+            hot_pubkey: keys.hot_pubkey,
+            recovery_pubkey: keys.recovery_pubkey,
+            recovery_hash: hr,
+            csv_delay: 144,
+            network: Network::Regtest,
+        };
+        let safe = fixture_address(0x52);
+        let attacker = fixture_address(0x53);
+        let anchor = PqShieldAnchor {
+            version: ANCHOR_VERSION,
+            target_chain: TargetChain::Bitcoin,
+            btc_vault_address: deposit_address(&p).to_string().into_bytes(),
+            recovery_hash: hr,
+            pq_recovery_pubkey: keys.pq_pubkey.clone(),
+            designated_safe_dest: safe.clone().into_bytes(),
+            csv_delay: 144,
+            policy: b"l1m12".to_vec(),
+        };
+        let signed = sign_anchor(&anchor, keys.pq_secret_key()).unwrap();
+        let blob = hex::encode(signed.serialize());
+        let trusted = hex::encode(&keys.pq_pubkey);
+        let vault = json!({
+            "hot_pubkey": keys.hot_pubkey.to_string(),
+            "recovery_pubkey": keys.recovery_pubkey.to_string(),
+            "recovery_hash": hex::encode(hr),
+            "csv_delay": 144u16,
+        });
+        let tx_req = |dest: &str, with_anchor: bool, with_key: bool| {
+            let mut v = json!({
+                "network": NET, "vault": vault.clone(),
+                "trigger_outpoint": { "txid": "0000000000000000000000000000000000000000000000000000000000000002", "vout": 0u32 },
+                "trigger_amount_sat": 99_500u64, "safe_destination": dest, "fee_sat": 500u64,
+            });
+            if with_anchor { v["signed_anchor_hex"] = json!(blob); }
+            if with_key { v["trusted_pq_pubkey"] = json!(trusted); }
+            body(v)
+        };
+        assert_eq!(clawback_tx(tx_req(&safe, true, true)).await.expect("bound").0["anchor_bound"], json!(true));
+        assert_eq!(clawback_tx(tx_req(&safe, false, false)).await.expect("unbound").0["anchor_bound"], json!(false));
+        assert!(clawback_tx(tx_req(&attacker, true, true)).await.is_err(), "swapped destination must be refused");
+        assert!(clawback_tx(tx_req(&safe, true, false)).await.is_err(), "anchor without a trust root");
+        assert!(clawback_tx(tx_req(&safe, false, true)).await.is_err(), "trust root without an anchor");
+        // An anchor signed by another key is refused even with the right destination.
+        let other = derive_vault_keys(&[0xA7u8; 64], false).unwrap();
+        let mut foreign = json!({
+            "network": NET, "vault": vault.clone(),
+            "trigger_outpoint": { "txid": "0000000000000000000000000000000000000000000000000000000000000002", "vout": 0u32 },
+            "trigger_amount_sat": 99_500u64, "safe_destination": safe, "fee_sat": 500u64,
+            "signed_anchor_hex": blob,
+        });
+        foreign["trusted_pq_pubkey"] = json!(hex::encode(&other.pq_pubkey));
+        assert!(clawback_tx(body(foreign)).await.is_err());
+
+        let ladder_req = |dest: &str| body(json!({
+            "network": NET, "vault": vault.clone(),
+            "trigger_outpoint": { "txid": "0000000000000000000000000000000000000000000000000000000000000003", "vout": 0 },
+            "trigger_amount_sat": 100_000, "safe_destination": dest, "fee_ladder_sat": [500, 1_000],
+            "signed_anchor_hex": blob, "trusted_pq_pubkey": trusted,
+        }));
+        assert_eq!(clawback_ladder(ladder_req(&safe)).await.expect("bound").0["anchor_bound"], json!(true));
+        assert!(clawback_ladder(ladder_req(&attacker)).await.is_err());
     }
 
     #[tokio::test]
