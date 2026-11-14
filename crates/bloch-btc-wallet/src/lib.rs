@@ -52,8 +52,8 @@ pub enum IdentityError {
 const MIN_SEED_LEN: usize = 32;
 
 /// Which KDF derives the companion PQ keygen seed from the wallet's BIP39
-/// seed (I-13). `derive_identity`'s PQ half and `bloch_pq_vault::derive_vault_keys`'s
-/// PQ half are documented to be "the exact companion key" for the SAME
+/// seed (I-13). `derive_identity`'s PQ half and the legacy V1 vault's
+/// (`bloch_pq_vault::derive_legacy_v1_vault_keys_for_restore`) PQ half are documented to be "the exact companion key" for the SAME
 /// wallet, so this choice is shared across both crates and must stay in
 /// lock-step — see `bloch_pq_vault::VaultKeyDerivation`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +148,9 @@ fn derive_btc(seed: &[u8], path: &str, mainnet: bool) -> Result<(Vec<u8>, String
 /// Derive the full quantum-ready identity from a seed. Uses account 0, first receive
 /// index (BIP-84 `m/84'/0'/0'/0/0`, BIP-86 `m/86'/0'/0'/0/0`) for the BTC keys, and
 /// [`PqSeedKdf::V1RawSeedReuse`] (the historical, documented "exact companion key"
-/// of `bloch_pq_vault::derive_vault_keys`) for the PQ keypair.
+/// of the legacy V1 vault, `bloch_pq_vault::derive_legacy_v1_vault_keys_for_restore`)
+/// for the PQ keypair. New vaults (`bloch_pq_vault::derive_vault_keys`, V3) use a
+/// domain-separated PQ key instead.
 ///
 /// I-13: fails closed (`Err`) on a too-short seed instead of panicking through
 /// `generate_keypair_from_seed`'s `.expect(..)`. Kept as the default entry
@@ -377,7 +379,7 @@ mod tests {
         assert_eq!(v1.btc_p2wpkh, v2.btc_p2wpkh);
         assert_eq!(v1.btc_p2tr, v2.btc_p2tr);
         // `derive_identity`'s default must be V1 (documented "exact companion
-        // key" invariant with `bloch_pq_vault::derive_vault_keys`, unversioned).
+        // key" invariant with the legacy V1 vault derivation).
         let default = derive_identity(&seed, true).unwrap();
         assert_eq!(default.pq_pubkey, v1.pq_pubkey);
     }
@@ -385,7 +387,7 @@ mod tests {
     /// I-13 KAT: V1 (raw seed reuse) must remain byte-for-byte what it always
     /// was — the SAME pq_pubkey the pre-fix code produced for this seed —
     /// so nothing that already depends on the "exact companion key" invariant
-    /// with `bloch_pq_vault::derive_vault_keys` silently changes underfoot.
+    /// with the legacy V1 vault derivation silently changes underfoot.
     #[test]
     fn pq_seed_kdf_v1_matches_raw_seed_pq_keygen() {
         let seed = abandon_seed();

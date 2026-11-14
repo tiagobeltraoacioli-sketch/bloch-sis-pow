@@ -227,8 +227,9 @@ truncated. `version` is honored — an anchor from an unknown format version is 
 ## Example flow (curl): create vault → anchor → clawback
 
 `hot_pubkey`, `recovery_pubkey`, `H(r)`, and the PQ keypair are all derived
-**on the client** (e.g. via `bloch-pq-vault::derive_vault_keys` + `derive_recovery` in
-your own binary). Only public values are sent below.
+**on the client** (e.g. via `bloch-pq-vault::derive_vault_keys` — V3 hardened roles since
+L1M-01; restore pre-existing V1 vaults only with `derive_legacy_v1_vault_keys_for_restore` —
++ `derive_recovery` in your own binary). Only public values are sent below.
 
 ```bash
 BASE=http://127.0.0.1:8787

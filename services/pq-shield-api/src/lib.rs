@@ -777,7 +777,7 @@ mod tests {
     /// are used to derive the *public* material the client would send. The API never
     /// receives any of the secrets below.
     fn public_inputs() -> (VaultKeys, [u8; 32], [u8; 32]) {
-        let keys = derive_vault_keys(&seed(), false);
+        let keys = derive_vault_keys(&seed(), false).unwrap();
         let (r, hr) = derive_recovery(keys.pq_secret_key(), b"api-test-vault");
         (keys, r, hr)
     }
@@ -993,7 +993,7 @@ mod tests {
     async fn anchor_verify_rejects_forgery_and_demands_a_trust_root() {
         let (owner, _r, hr) = public_inputs();
         // A second, unrelated hybrid identity: the attacker. No owner secret involved.
-        let attacker = derive_vault_keys(&[0xA7u8; 64], false);
+        let attacker = derive_vault_keys(&[0xA7u8; 64], false).unwrap();
         assert_ne!(owner.pq_pubkey, attacker.pq_pubkey);
 
         // The attacker's anchor: same vault and same H(r), but THEIR payout address and
@@ -1254,7 +1254,7 @@ mod audit_edge_regressions {
 
     #[tokio::test]
     async fn unvault_route_uses_checked_builder_for_hostile_values() {
-        let keys = vaultlib::derive_vault_keys(&[7; 32], false);
+        let keys = vaultlib::derive_vault_keys(&[7; 32], false).unwrap();
         let request = |txid: &str, vout: u32, amount: u64, fee: u64| json!({
             "network": "regtest",
             "vault": { "hot_pubkey": keys.hot_pubkey.to_string(),
