@@ -236,16 +236,19 @@ pub fn derive_legacy_v1_vault_keys_for_restore(seed: &[u8], mainnet: bool) -> Re
     let secp = Secp256k1::new();
     let net = if mainnet { NetworkKind::Main } else { NetworkKind::Test };
     let coin = if mainnet { "0'" } else { "1'" };
-    let master = Xpriv::new_master(net, seed).map_err(|e| format!("bip32 master: {e}"))?;
+    let mut master = Xpriv::new_master(net, seed).map_err(|e| format!("bip32 master: {e}"))?;
     let derive = |idx: u32| -> Result<(SecretKey, PublicKey), String> {
         let path = DerivationPath::from_str(&format!("m/84'/{coin}/0'/0/{idx}"))
             .map_err(|e| format!("bip32 path: {e}"))?;
-        let xpriv = master.derive_priv(&secp, &path).map_err(|e| format!("bip32 derive: {e}"))?;
+        let mut xpriv = master.derive_priv(&secp, &path).map_err(|e| format!("bip32 derive: {e}"))?;
         let sk = xpriv.private_key;
+        xpriv.private_key.non_secure_erase();
         Ok((sk, PublicKey::new(sk.public_key(&secp))))
     };
-    let (hot_sk, hot_pubkey) = derive(0)?;
-    let (recovery_sk, recovery_pubkey) = derive(1)?;
+    let (hot, recovery) = (derive(0), derive(1));
+    master.private_key.non_secure_erase(); // L1M-08: best effort, see VaultKeys
+    let (hot_sk, hot_pubkey) = hot?;
+    let (recovery_sk, recovery_pubkey) = recovery?;
     let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(seed)
         .map_err(|e| format!("pq keygen: {e}"))?;
     Ok(VaultKeys { hot_sk, hot_pubkey, recovery_sk, recovery_pubkey, pq_pubkey, pq_secret,
@@ -287,18 +290,21 @@ pub fn derive_vault_keys_v2(seed: &[u8], mainnet: bool) -> Result<VaultKeys, Str
     let secp = Secp256k1::new();
     let net = if mainnet { NetworkKind::Main } else { NetworkKind::Test };
     let coin = if mainnet { "0'" } else { "1'" };
-    let master = Xpriv::new_master(net, seed).map_err(|e| format!("bip32 master: {e}"))?;
+    let mut master = Xpriv::new_master(net, seed).map_err(|e| format!("bip32 master: {e}"))?;
 
     let derive = |idx: u32| -> Result<(SecretKey, PublicKey), String> {
         let path = DerivationPath::from_str(&format!("m/{VAULT_PURPOSE_V2}/{coin}/0'/0/{idx}"))
             .map_err(|e| format!("bip32 path: {e}"))?;
-        let xpriv = master.derive_priv(&secp, &path).map_err(|e| format!("bip32 derive: {e}"))?;
+        let mut xpriv = master.derive_priv(&secp, &path).map_err(|e| format!("bip32 derive: {e}"))?;
         let sk = xpriv.private_key;
+        xpriv.private_key.non_secure_erase();
         let pk = PublicKey::new(sk.public_key(&secp));
         Ok((sk, pk))
     };
-    let (hot_sk, hot_pubkey) = derive(0)?;
-    let (recovery_sk, recovery_pubkey) = derive(1)?;
+    let (hot, recovery) = (derive(0), derive(1));
+    master.private_key.non_secure_erase(); // L1M-08: best effort, see VaultKeys
+    let (hot_sk, hot_pubkey) = hot?;
+    let (recovery_sk, recovery_pubkey) = recovery?;
 
     // Validate seed length + BTC-side reachability the same way
     // `derive_identity_versioned` does, then derive the PQ keypair directly —
@@ -306,8 +312,8 @@ pub fn derive_vault_keys_v2(seed: &[u8], mainnet: bool) -> Result<VaultKeys, Str
     // identity helper), and the vault needs the secret key too. Sharing
     // `pq_seed_for` (rather than re-hashing the domain tag here) keeps this
     // byte-for-byte identical to `derive_identity_versioned`'s PQ pubkey.
-    let pq_seed = Zeroizing::new(bloch_btc_wallet::pq_seed_for(seed, bloch_btc_wallet::PqSeedKdf::V2DomainSeparated)
-        .ok_or_else(|| format!("seed too short: {} bytes (need at least {})", seed.len(), MIN_SEED_LEN))?);
+    let pq_seed = bloch_btc_wallet::pq_seed_for_zeroizing(seed, bloch_btc_wallet::PqSeedKdf::V2DomainSeparated)
+        .ok_or_else(|| format!("seed too short: {} bytes (need at least {})", seed.len(), MIN_SEED_LEN))?;
     let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed[..])
         .map_err(|e| format!("pq keygen: {e}"))?;
 
@@ -342,15 +348,19 @@ pub fn derive_vault_keys_v3(seed: &[u8], mainnet: bool) -> Result<VaultKeys, Str
     let secp = Secp256k1::new();
     let net = if mainnet { NetworkKind::Main } else { NetworkKind::Test };
     let coin = if mainnet { "0'" } else { "1'" };
-    let master = Xpriv::new_master(net, seed).map_err(|e| format!("bip32 master: {e}"))?;
+    let mut master = Xpriv::new_master(net, seed).map_err(|e| format!("bip32 master: {e}"))?;
     let derive = |role: u32| -> Result<(SecretKey, PublicKey), String> {
         let path = DerivationPath::from_str(&format!("m/1999'/{coin}/0'/{role}'"))
             .map_err(|e| format!("bip32 path: {e}"))?;
-        let child = master.derive_priv(&secp, &path).map_err(|e| format!("bip32 derive: {e}"))?;
-        Ok((child.private_key, PublicKey::new(child.private_key.public_key(&secp))))
+        let mut child = master.derive_priv(&secp, &path).map_err(|e| format!("bip32 derive: {e}"))?;
+        let sk = child.private_key;
+        child.private_key.non_secure_erase();
+        Ok((sk, PublicKey::new(sk.public_key(&secp))))
     };
-    let (hot_sk, hot_pubkey) = derive(0)?;
-    let (recovery_sk, recovery_pubkey) = derive(1)?;
+    let (hot, recovery) = (derive(0), derive(1));
+    master.private_key.non_secure_erase(); // L1M-08: best effort, see VaultKeys
+    let (hot_sk, hot_pubkey) = hot?;
+    let (recovery_sk, recovery_pubkey) = recovery?;
     let pq_seed = derive_v3_pq_seed(seed, mainnet);
     let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed[..])
         .map_err(|e| format!("pq keygen: {e}"))?;
@@ -419,7 +429,8 @@ mod e2e_tests {
     /// Build a vault + its keys + preimage for a given vault id.
     fn setup(vault_id: &[u8]) -> (VaultKeys, VaultParams, [u8; 32]) {
         let keys = derive_vault_keys(&seed(), false).unwrap();
-        let (r, hr) = derive_recovery(&keys.pq_secret, vault_id);
+        let (r, hr) = derive_recovery_zeroizing(&keys.pq_secret, vault_id);
+        let r = *r;
         let p = VaultParams {
             hot_pubkey: keys.hot_pubkey,
             recovery_pubkey: keys.recovery_pubkey,

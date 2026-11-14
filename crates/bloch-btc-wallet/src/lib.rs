@@ -80,7 +80,14 @@ pub enum PqSeedKdf {
 /// Returns `None` if `seed` is shorter than [`MIN_SEED_LEN`] (I-13: fail
 /// closed on this public entry point too — `V1RawSeedReuse`'s fixed-size
 /// slice below would otherwise panic on a caller-supplied short seed).
+#[deprecated(note = "returns a plain copy of secret seed material; use `pq_seed_for_zeroizing` (L1M-08)")]
 pub fn pq_seed_for(seed: &[u8], kdf: PqSeedKdf) -> Option<[u8; 32]> {
+    pq_seed_for_zeroizing(seed, kdf).map(|s| *s)
+}
+
+/// Same bytes as the deprecated [`pq_seed_for`], returned in an owner that
+/// wipes them on drop (L1M-08). Prefer this for every new caller.
+pub fn pq_seed_for_zeroizing(seed: &[u8], kdf: PqSeedKdf) -> Option<Zeroizing<[u8; 32]>> {
     if seed.len() < MIN_SEED_LEN {
         return None;
     }
@@ -88,23 +95,24 @@ pub fn pq_seed_for(seed: &[u8], kdf: PqSeedKdf) -> Option<[u8; 32]> {
 }
 
 /// Precondition: `seed.len() >= MIN_SEED_LEN` — enforced by every caller
-/// (`derive_identity_versioned` and the public `pq_seed_for` wrapper) before
+/// (`derive_identity_versioned` and the public `pq_seed_for*` wrappers) before
 /// this is reached; not re-checked here to keep the hot path a single match.
-fn pq_seed(seed: &[u8], kdf: PqSeedKdf) -> [u8; 32] {
+/// The seed is written straight into its zeroizing owner (no stack copy).
+fn pq_seed(seed: &[u8], kdf: PqSeedKdf) -> Zeroizing<[u8; 32]> {
+    let mut out = Zeroizing::new([0u8; 32]);
     match kdf {
         PqSeedKdf::V1RawSeedReuse => {
-            let mut out = [0u8; 32];
             out.copy_from_slice(&seed[..32]);
-            out
         }
         PqSeedKdf::V2DomainSeparated => {
             use sha3::{Sha3_256, Digest};
             let mut h = Sha3_256::new();
             h.update(b"bloch-btc-wallet/pq-seed/v2");
             h.update(seed);
-            h.finalize().into()
+            h.finalize_into((&mut *out).into());
         }
     }
+    out
 }
 
 /// A quantum-ready wallet identity derived from one seed.
@@ -133,15 +141,22 @@ fn derive_btc(seed: &[u8], path: &str, mainnet: bool) -> Result<(Vec<u8>, String
     let secp = Secp256k1::new();
     let net = if mainnet { NetworkKind::Main } else { NetworkKind::Test };
     let hrp = if mainnet { KnownHrp::Mainnet } else { KnownHrp::Testnets };
-    let master = Xpriv::new_master(net, seed).map_err(|e| IdentityError::Bip32Master(e.to_string()))?;
+    let mut master = Xpriv::new_master(net, seed).map_err(|e| IdentityError::Bip32Master(e.to_string()))?;
     let dp = DerivationPath::from_str(path).map_err(|e| IdentityError::Bip32Path(e.to_string()))?;
-    let xpriv = master.derive_priv(&secp, &dp).map_err(|e| IdentityError::Bip32Derive(e.to_string()))?;
-    let kp = xpriv.to_keypair(&secp);
+    let derived = master.derive_priv(&secp, &dp);
+    // L1M-08: best-effort wipe of the extended private keys this function owns
+    // (secp256k1 key types are `Copy`; copies made inside the libraries cannot
+    // be reached from here).
+    master.private_key.non_secure_erase();
+    let mut xpriv = derived.map_err(|e| IdentityError::Bip32Derive(e.to_string()))?;
+    let mut kp = xpriv.to_keypair(&secp);
+    xpriv.private_key.non_secure_erase();
     let compressed = CompressedPublicKey(kp.public_key());
     let p2wpkh = Address::p2wpkh(&compressed, hrp).to_string();
     // BIP-86 key-path Taproot: tweak the internal key with no script.
     let (xonly, _parity) = kp.x_only_public_key();
     let p2tr = Address::p2tr(&secp, xonly, None, hrp).to_string();
+    kp.non_secure_erase();
     Ok((compressed.to_bytes().to_vec(), p2wpkh, p2tr))
 }
 
@@ -177,7 +192,7 @@ pub fn derive_identity_versioned(
     let (btc_pubkey, btc_p2wpkh, _) = derive_btc(seed, &format!("m/84'/{coin}/0'/0/0"), mainnet)?;
     let (_, _, btc_p2tr) = derive_btc(seed, &format!("m/86'/{coin}/0'/0/0"), mainnet)?;
 
-    let pq_seed_bytes = Zeroizing::new(pq_seed(seed, pq_kdf));
+    let pq_seed_bytes = pq_seed(seed, pq_kdf);
     let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed_bytes[..])
         .map_err(|e| IdentityError::PqKeygen(e.to_string()))?;
     let _pq_secret = Zeroizing::new(pq_secret);
@@ -369,6 +384,24 @@ mod tests {
     /// I-13: the two `PqSeedKdf` variants must derive DIFFERENT PQ keypairs
     /// for the identical seed — this is the point of domain-separating the
     /// PQ leg from the raw BTC master-seed bytes.
+    /// L1M-08: the zeroizing seed accessor returns the exact historical bytes
+    /// in an owner that wipes them; the deprecated plain copy is unchanged.
+    #[test]
+    #[allow(deprecated)]
+    fn zeroizing_pq_seed_matches_the_deprecated_copy() {
+        let seed = abandon_seed();
+        for kdf in [PqSeedKdf::V1RawSeedReuse, PqSeedKdf::V2DomainSeparated] {
+            let mut z = pq_seed_for_zeroizing(&seed, kdf).unwrap();
+            assert_eq!(*z, pq_seed_for(&seed, kdf).unwrap());
+            use zeroize::Zeroize;
+            z.zeroize();
+            assert_eq!(*z, [0u8; 32]);
+        }
+        let v1 = pq_seed_for_zeroizing(&seed, PqSeedKdf::V1RawSeedReuse).unwrap();
+        assert_eq!(&v1[..], &seed[..32]);
+        assert!(pq_seed_for_zeroizing(&seed[..31], PqSeedKdf::V2DomainSeparated).is_none());
+    }
+
     #[test]
     fn pq_seed_kdf_v1_and_v2_diverge() {
         let seed = abandon_seed();

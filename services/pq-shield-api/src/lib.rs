@@ -765,7 +765,7 @@ pub fn router() -> Router {
 mod tests {
     use super::*;
     use bloch_pq_vault::anchor::{sign_anchor, verify_anchor};
-    use bloch_pq_vault::preimage::derive_recovery;
+    use bloch_pq_vault::preimage::derive_recovery_zeroizing;
     use bloch_pq_vault::{derive_vault_keys, VaultKeys};
 
     const NET: &str = "regtest";
@@ -781,8 +781,8 @@ mod tests {
     /// receives any of the secrets below.
     fn public_inputs() -> (VaultKeys, [u8; 32], [u8; 32]) {
         let keys = derive_vault_keys(&seed(), false).unwrap();
-        let (r, hr) = derive_recovery(keys.pq_secret_key(), b"api-test-vault");
-        (keys, r, hr)
+        let (r, hr) = derive_recovery_zeroizing(keys.pq_secret_key(), b"api-test-vault");
+        (keys, *r, hr)
     }
 
     fn body(v: Value) -> Bytes {
