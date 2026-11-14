@@ -69,6 +69,17 @@ pub struct MainnetProof {
     pub kes: Option<KesProofs>,
 }
 
+/// L1M-04: how far past the frozen-set gate a checkpoint may still be judged
+/// by the set source's bond weights. A set source at or before the gate epoch
+/// commits no frozen set, so the first post-gate step(s) of a client whose
+/// anchor predates the gate must use bonds; without a bound that divergence
+/// from the chain's rule (which weighs every target >= gate by the frozen set)
+/// spanned the whole hop window, up to gate + 255. With this bound a client
+/// crosses with checkpoint E <= gate + 8 (whose header, in epoch >= gate + 1,
+/// commits the set used from then on); a client that cannot (no consecutive
+/// finalization in that window) needs a post-gate anchor.
+pub const FROZEN_GATE_BOND_CROSSING_EPOCHS: u64 = 8;
+
 /// What the light client is configured with, once.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -219,6 +230,14 @@ pub fn verify(
             }
         }
     };
+    // L1M-04: bond weights for a link the chain weighs by the frozen set are a
+    // crossing allowance only, not a rule for the whole hop window.
+    if frozen.is_none()
+        && params::epoch_gate_active(l1.target_epoch, gate)
+        && e > gate.saturating_add(FROZEN_GATE_BOND_CROSSING_EPOCHS)
+    {
+        return Err(Refusal::FinalitySet("bond weights refused past the frozen-set crossing window"));
+    }
 
     // 4. Registry records against the set-source root. The bond rule needs
     //    the registry complete (no member omitted to shrink the
