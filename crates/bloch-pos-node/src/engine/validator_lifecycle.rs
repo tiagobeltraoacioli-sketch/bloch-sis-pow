@@ -94,9 +94,16 @@ pub(super) fn kes_register_conflict(
     if let PosTransaction::KesRotate { validator, .. } = tx {
         return kes_rotate_conflict(state, mempool, *validator);
     }
-    let PosTransaction::KesRegister { validator, .. } = tx else {
+    let PosTransaction::KesRegister { validator, depth, .. } = tx else {
         return Ok(());
     };
+    if kes_registration_born_expired(state, epoch_of(state.slot()), *depth) {
+        return Err(Refusal::Invalid(
+            "KES registration would start already expired: before KES binds a first key \
+             starts at period 0, and a tree of this depth does not reach the current period; \
+             register a deeper tree",
+        ));
+    }
     // Mirrors consensus (`check_kes_register`): an existing key refuses a
     // re-registration unless it is an expired key's static-key rescue.
     if state.kes_public(*validator).is_some() && !state.kes_rescue_open(*validator) {
@@ -272,6 +279,26 @@ fn kes_rotate_conflict(
         ));
     }
     Ok(())
+}
+
+/// Audit L1-06 (node-local half): consensus gives a FIRST registration
+/// included past the KES gate but before the bind `start_period = 0`
+/// (`check_kes_register`), so once the bind is late enough a tree of `depth`
+/// is born expired and its validator would go silent at the bind until a
+/// rescue. The relay door refuses such a registration (the registering node's
+/// own included); block validity is unchanged. A rescue (an entry already
+/// exists) starts later and is judged by consensus alone. `epoch` is the
+/// state's open epoch (the head's, at the door).
+pub(super) fn kes_registration_born_expired(state: &CommittedState, epoch: u64, depth: u8) -> bool {
+    let Some(period) = params::kes_period(epoch) else {
+        return false;
+    };
+    let bound = state.kes_enforced_from().is_some_and(|from| epoch >= from);
+    if bound {
+        return false;
+    }
+    let lifetime = 1u64.checked_shl(u32::from(depth)).unwrap_or(u64::MAX);
+    lifetime <= period
 }
 
 /// Message for a lifecycle transaction refused only because the committed
