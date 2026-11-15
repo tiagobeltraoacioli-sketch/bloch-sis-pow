@@ -3099,12 +3099,45 @@ impl Engine {
     /// in force, an erased or expired leaf, or a failed write). Promotes a
     /// rotated-in successor the chain has made the key in force. Called only
     /// once a duty is settled, so an idle validator does not evolve or log.
-    fn prepare_kes(&mut self, epoch: u64, validator: u32) -> Result<Option<(u64, bloch_pos_committee::kes::KesPublic)>, String> {
+    ///
+    /// `rolled` is the head state rolled into `epoch` (`rolled_to(epoch)`),
+    /// the very state every verifier judges the duty against: block
+    /// application rolls the parent into the block's epoch and gossip rolls
+    /// the head into the vote's. The signing mode, the key in force and the
+    /// validator's KES entry are read from it, never from the unrolled head
+    /// (audit L1-01): the bind epoch (`kes_enforced_from`) is written by
+    /// `process_epoch`, so a head that has not crossed the deciding boundary
+    /// (empty epochs at the bind) would otherwise sign statically a duty every
+    /// verifier requires a KES leaf for, and no block would cross the bind.
+    /// Only the clock-jump guard and the replaced-key settlement keep reading
+    /// the head's own period and finalized checkpoint: they protect erasure,
+    /// which must never run ahead of what the chain has actually reached.
+    fn prepare_kes(
+        &mut self,
+        rolled: &CommittedState,
+        epoch: u64,
+        validator: u32,
+    ) -> Result<Option<(u64, bloch_pos_committee::kes::KesPublic)>, String> {
+        self.prepare_kes_in(rolled, rolled.kes_roots().get(&validator), epoch, validator)
+    }
+
+    /// [`Self::prepare_kes`] over the two things it reads from the rolled
+    /// state: the verifiers' key lookup and the validator's committed KES
+    /// entry. Split out so the decision can be exercised against a view that
+    /// differs from the head (audit L1-01) without building a chain to it.
+    fn prepare_kes_in(
+        &mut self,
+        rolled: &dyn KeyLookup,
+        entry: Option<&bloch_pos_committee::kes::KesEntry>,
+        epoch: u64,
+        validator: u32,
+    ) -> Result<Option<(u64, bloch_pos_committee::kes::KesPublic)>, String> {
         use bloch_pos_committee::kes::SigningMode;
-        // The same rule every verifier runs (`kes::signing_mode`): static
-        // before KES binds on chain, and for a never-registered validator
-        // after (fallback); the KES leaf for a registered one.
-        let period = match bloch_pos_committee::kes::signing_mode(&*self.state, validator, epoch) {
+        // The same rule every verifier runs (`kes::signing_mode`), on the
+        // same state: static before KES binds on chain, and for a
+        // never-registered validator after (fallback); the KES leaf for a
+        // registered one.
+        let period = match bloch_pos_committee::kes::signing_mode(rolled, validator, epoch) {
             SigningMode::Static => return Ok(None),
             SigningMode::FailClosed => return Err("KES enforcement state unknown".into()),
             SigningMode::Kes(period) => period,
@@ -3117,11 +3150,12 @@ impl Engine {
                 crate::kes_key::FILE_NAME
             ));
         };
-        let Some(public) = self.state.kes_public_at(validator, period) else {
+        // `CommittedState::kes_public_at`: the entry's key in force.
+        let Some(public) = entry.map(|entry| entry.in_force(period)) else {
             return Err(format!("no KES key is registered on chain for v{validator}"));
         };
         kes.adopt_successor(&public)?;
-        if let Some(entry) = self.state.kes_roots().get(&validator) {
+        if let Some(entry) = entry {
             kes.settle_replaced(entry, period, head_period, self.state.finality().finalized.epoch);
         }
         if kes.key.index() != validator && kes.key.index() != crate::keys::AUTO_VALIDATOR_INDEX {
@@ -3235,7 +3269,10 @@ impl Engine {
     }
 
     fn submit_kes_rotation(&mut self, wall_epoch: u64, period: u64, index: u32) {
-        let in_force = match self.prepare_kes(wall_epoch, index) {
+        // `maintain_kes` runs only with the head inside `wall_epoch`, so the
+        // head state is that epoch's rolled state.
+        let rolled = self.rolled_to(wall_epoch);
+        let in_force = match self.prepare_kes(&rolled, wall_epoch, index) {
             Ok(Some((p, public))) if p == period => public,
             Ok(_) => return,
             Err(why) => {
@@ -3594,7 +3631,7 @@ impl Engine {
         // target epoch, including after an NTP step backwards or a restart.
         //
         // KES: the vote's period is its target epoch's, which is this slot's.
-        let kes_period = match self.prepare_kes(e, index) {
+        let kes_period = match self.prepare_kes(&rolled, e, index) {
             Ok(period) => period,
             Err(why) => {
                 eprintln!("[slot {slot}] not attesting: {why}");
@@ -3868,7 +3905,7 @@ impl Engine {
         // not.
         // KES: the proposal's period is its slot's epoch's. Prepared only
         // now that this node is certain to sign.
-        let kes_period = match self.prepare_kes(e, index) {
+        let kes_period = match self.prepare_kes(&rolled, e, index) {
             Ok(period) => period,
             Err(why) => {
                 eprintln!("[slot {slot}] not proposing: {why}");
