@@ -121,11 +121,23 @@ func (c *Client) Call(method string, params []interface{}, out interface{}) erro
 	if hc == nil {
 		hc = http.DefaultClient
 	}
+	if c.APIKey != "" {
+		// L1M-18: never follow a redirect with the key attached (Go only strips
+		// Authorization/Cookie on a cross-host redirect, not X-API-Key).
+		noRedirect := *hc
+		noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		hc = &noRedirect
+	}
 	resp, err := hc.Do(req)
 	if err != nil {
 		return &TransportError{Method: method, Message: fmt.Sprintf("transport error: %v", err)}
 	}
 	defer resp.Body.Close()
+	if c.APIKey != "" && resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return &TransportError{Method: method, HTTPStatus: resp.StatusCode, Message: "redirect refused: the API key is not forwarded"}
+	}
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return &TransportError{Method: method, HTTPStatus: resp.StatusCode, Message: fmt.Sprintf("read body: %v", err)}

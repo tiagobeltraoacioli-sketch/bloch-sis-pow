@@ -432,6 +432,15 @@ def build_python_client(methods):
         "    )\n\n\n"
     )
 
+    out.append(
+        "class _NoRedirect(urllib.request.HTTPRedirectHandler):\n"
+        '    """L1M-18: a request that carries the API key never follows a redirect\n'
+        '    (urllib would resend the key header, e.g. on an https -> http downgrade)."""\n\n'
+        "    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]\n"
+        "        return None\n\n\n"
+        "_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)\n\n\n"
+    )
+
     out.append("class BlochClient:\n")
     out.append('    """A typed client for the Bloch JSON-RPC surface.\n\n')
     out.append("    Every method maps to one node RPC. Reads are public; the only write is\n")
@@ -477,7 +486,8 @@ def build_python_client(methods):
         "        status = 0\n"
         "        raw = b\"\"\n"
         "        try:\n"
-        "            with urllib.request.urlopen(req, timeout=self.timeout) as resp:\n"
+        "            opener = _NO_REDIRECT_OPENER.open if self.api_key is not None else urllib.request.urlopen\n"
+        "            with opener(req, timeout=self.timeout) as resp:\n"
         "                status = getattr(resp, \"status\", resp.getcode())\n"
         "                raw = resp.read()\n"
         "        except urllib.error.HTTPError as exc:\n"
@@ -491,6 +501,12 @@ def build_python_client(methods):
         "            raise BlochTransportError(\n"
         "                f\"RPC transport error calling {method}: {exc}\", method=method\n"
         "            ) from exc\n"
+        "        if self.api_key is not None and 300 <= status < 400:\n"
+        "            raise BlochTransportError(\n"
+        "                f\"RPC {method}: redirect refused (HTTP {status}); the API key is not forwarded\",\n"
+        "                method=method,\n"
+        "                http_status=status,\n"
+        "            )\n"
         "        try:\n"
         "            parsed = json.loads(raw.decode(\"utf-8\")) if raw else None\n"
         "        except (ValueError, UnicodeDecodeError) as exc:\n"
@@ -872,11 +888,23 @@ def build_go_client(methods):
         "\tif hc == nil {\n"
         "\t\thc = http.DefaultClient\n"
         "\t}\n"
+        "\tif c.APIKey != \"\" {\n"
+        "\t\t// L1M-18: never follow a redirect with the key attached (Go only strips\n"
+        "\t\t// Authorization/Cookie on a cross-host redirect, not X-API-Key).\n"
+        "\t\tnoRedirect := *hc\n"
+        "\t\tnoRedirect.CheckRedirect = func(*http.Request, []*http.Request) error {\n"
+        "\t\t\treturn http.ErrUseLastResponse\n"
+        "\t\t}\n"
+        "\t\thc = &noRedirect\n"
+        "\t}\n"
         "\tresp, err := hc.Do(req)\n"
         "\tif err != nil {\n"
         "\t\treturn &TransportError{Method: method, Message: fmt.Sprintf(\"transport error: %v\", err)}\n"
         "\t}\n"
         "\tdefer resp.Body.Close()\n"
+        "\tif c.APIKey != \"\" && resp.StatusCode >= 300 && resp.StatusCode < 400 {\n"
+        "\t\treturn &TransportError{Method: method, HTTPStatus: resp.StatusCode, Message: \"redirect refused: the API key is not forwarded\"}\n"
+        "\t}\n"
         "\traw, err := io.ReadAll(resp.Body)\n"
         "\tif err != nil {\n"
         "\t\treturn &TransportError{Method: method, HTTPStatus: resp.StatusCode, Message: fmt.Sprintf(\"read body: %v\", err)}\n"

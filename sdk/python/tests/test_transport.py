@@ -28,6 +28,50 @@ class ApiKeyTransport(unittest.TestCase):
         # Without a key, reads are unaffected by the check (no key to leak).
         self.assertFalse(BlochClient("http://192.0.2.1:16210").allow_insecure_http)
 
+    def test_keyed_requests_do_not_follow_redirects(self):
+        import http.server
+        import threading
+
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                seen.append((self.path, self.headers.get("X-API-Key")))
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                if self.path == "/":
+                    self.send_response(302)
+                    self.send_header("Location", "/elsewhere")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    body = b'{"jsonrpc":"2.0","result":7,"id":1}'
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            def do_GET(self):  # noqa: N802  (urllib turns a redirected POST into a GET)
+                seen.append((self.path, self.headers.get("X-API-Key")))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}/"
+            with self.assertRaises(BlochTransportError) as ctx:
+                BlochClient(url, api_key="secret").call("getblockcount")
+            self.assertIn("redirect refused", str(ctx.exception))
+            self.assertEqual(seen, [("/", "secret")], "the key must not be re-sent to the redirect target")
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

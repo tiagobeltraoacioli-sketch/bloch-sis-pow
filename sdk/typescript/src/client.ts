@@ -51,6 +51,8 @@ export type FetchLike = (
     headers: Record<string, string>;
     body: string;
     signal?: AbortSignal;
+    /** "error" when an API key is attached: a redirect must not carry it on. */
+    redirect?: "follow" | "error" | "manual";
   },
 ) => Promise<{
   ok: boolean;
@@ -175,6 +177,8 @@ export class BlochClient {
         headers,
         body,
         signal: controller.signal,
+        // L1M-18: never follow a redirect with the key (https -> http downgrade).
+        ...(this.apiKey !== undefined ? { redirect: "error" as const } : {}),
       });
     } catch (cause) {
       throw new BlochTransportError({

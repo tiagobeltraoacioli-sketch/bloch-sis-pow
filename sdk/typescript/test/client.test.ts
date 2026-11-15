@@ -97,6 +97,8 @@ test("L1M-18: an API key is never sent over plaintext http to a remote host", as
   }
   const optedIn = new BlochClient({ fetch, url: "http://rpc.example:16210", apiKey: "secret", allowInsecureHttp: true });
   assert.equal(await optedIn.getBlockCount(), 1);
+  assert.equal(calls[calls.length - 1].init.redirect, "error", "keyed requests must not follow redirects");
   const keyless = new BlochClient({ fetch, url: "http://rpc.example:16210" });
   assert.equal(await keyless.getBlockCount(), 1);
+  assert.equal(calls[calls.length - 1].init.redirect, undefined);
 });
