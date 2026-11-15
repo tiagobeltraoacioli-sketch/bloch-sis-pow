@@ -159,9 +159,16 @@ anchored `designated_safe_dest` and be a **fresh, unexposed** address.
 known out-of-band). The server then verifies the anchor canonically on this
 network and refuses the request unless `safe_destination`, the vault's deposit
 address, `recovery_hash` and `csv_delay` all equal the anchored values. The
-response carries `"anchor_bound": true|false`; a signer should refuse to sign
-a clawback whose response is not `anchor_bound: true`. The same two fields
-apply to `/vault/clawback-ladder`.
+response carries `"anchor_bound": true|false` and `"anchor_pq_pubkey_sha256"`
+(SHA-256 of the key the anchor was verified under, `null` when unbound). The
+same two fields apply to `/vault/clawback-ladder`.
+
+`anchor_bound: true` by itself is NOT a proof: the anchor and its key come in
+the same request, so a hostile UI can omit them or send an anchor signed by
+its own key. A signer must check that `anchor_pq_pubkey_sha256` is the hash of
+the owner's PQ key it already holds. A self-hosted instance should also set
+`PQ_SHIELD_PINNED_PQ_PUBKEY_SHA256=<64 hex>`: both clawback routes then refuse
+any request without an anchor or with a different trusted key.
 
 ### `POST /vault/clawback-ladder`
 Build two to 32 mutually replacing clawbacks for offline pre-signing before the
@@ -236,7 +243,7 @@ truncated. `version` is honored — an anchor from an unknown format version is 
 ## Example flow (curl): create vault → anchor → clawback
 
 `hot_pubkey`, `recovery_pubkey`, `H(r)`, and the PQ keypair are all derived
-**on the client** (e.g. via `bloch-pq-vault::derive_vault_keys` — V3 hardened roles since
+**on the client** (e.g. via `bloch-pq-vault::derive_new_vault_keys` — V3 hardened roles since
 L1M-01; restore pre-existing V1 vaults only with `derive_legacy_v1_vault_keys_for_restore` —
 + `derive_recovery` in your own binary). Only public values are sent below.
 
@@ -314,7 +321,7 @@ curl -s -X POST $BASE/vault/clawback-tx -d "{
 | `GET /health`, `GET /` | no | — |
 
 No route accepts, needs, stores, or produces a private key or signature. The crate's
-secret-requiring functions (`sign_anchor`, `ecdsa_witness_sig`, `derive_vault_keys`, the
+secret-requiring functions (`sign_anchor`, `ecdsa_witness_sig`, `derive_new_vault_keys`, the
 preimage derivation) are **never** called by the service.
 
 ## Hosting

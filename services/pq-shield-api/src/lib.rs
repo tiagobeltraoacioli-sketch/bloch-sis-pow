@@ -23,7 +23,7 @@
 //! script/address/tx/sighash builders, `PqShieldAnchor::commitment_bytes`,
 //! `verify_anchor` (against a caller-supplied trusted PQ key), and the anchor
 //! guard-hash helpers. It never calls
-//! `sign_anchor`, `ecdsa_witness_sig`, `derive_vault_keys`, or the preimage
+//! `sign_anchor`, `ecdsa_witness_sig`, `derive_new_vault_keys`, or the preimage
 //! derivation — those require secrets and belong on the client.
 
 use axum::{
@@ -326,28 +326,55 @@ struct ClawbackLadderReq {
 /// `safe_destination`, the vault's deposit address, `H(r)` and Δ must all be
 /// exactly what the owner anchored; otherwise the request is refused before
 /// any sighash is produced. A UI that swaps the destination therefore cannot
-/// get a sighash from this service for an anchored vault. The binding is only
-/// as strong as the client's insistence on sending the anchor: the owner's
-/// signer should require `anchor_bound: true`.
+/// get a sighash from this service for an anchored vault.
+///
+/// `anchor_bound: true` alone proves nothing to a signer: the anchor and its
+/// "trusted" key arrive in the same request, so a hostile UI can omit both or
+/// send an anchor signed by its own key. Two things close that (R-14):
+/// - the response echoes `anchor_pq_pubkey_sha256`, the SHA-256 of the key
+///   the anchor was verified under; the signer must compare it with the
+///   owner's key it already holds, and
+/// - a self-hosted instance can pin the owner's key with
+///   `PQ_SHIELD_PINNED_PQ_PUBKEY_SHA256` (hex). Then both clawback routes
+///   REQUIRE an anchor and refuse any trusted key other than the pinned one.
 struct AnchorBinding<'a> {
     signed_anchor_hex: &'a Option<String>,
     trusted_pq_pubkey: &'a Option<String>,
 }
 
 impl AnchorBinding<'_> {
-    /// `Ok(true)` when bound and consistent, `Ok(false)` when no anchor was
-    /// supplied, `Err` on any mismatch.
-    fn check(&self, network: Network, p: &VaultParams, safe: &bitcoin::Address) -> Result<bool, ApiError> {
+    /// `Ok(Some(sha256(trusted key)))` when bound and consistent, `Ok(None)`
+    /// when no anchor was supplied and none is required, `Err` on any
+    /// mismatch. `pin` is the server-side pinned key hash, if configured.
+    fn check(
+        &self,
+        network: Network,
+        p: &VaultParams,
+        safe: &bitcoin::Address,
+        pin: Option<[u8; 32]>,
+    ) -> Result<Option<[u8; 32]>, ApiError> {
         let Some(blob) = self.signed_anchor_hex else {
             if self.trusted_pq_pubkey.is_some() {
                 return Err(ApiError::bad("trusted_pq_pubkey given without signed_anchor_hex"));
             }
-            return Ok(false);
+            if pin.is_some() {
+                return Err(ApiError::bad(
+                    "this instance pins the owner's PQ key: clawback requests must carry signed_anchor_hex",
+                ));
+            }
+            return Ok(None);
         };
         let trusted_hex = self.trusted_pq_pubkey.as_ref().ok_or_else(|| {
             ApiError::bad("signed_anchor_hex needs `trusted_pq_pubkey`: the anchor is not its own trust root")
         })?;
         let trusted = hexbytes("trusted_pq_pubkey", trusted_hex)?;
+        let key_hash: [u8; 32] = {
+            use bitcoin::hashes::{sha256, Hash};
+            sha256::Hash::hash(&trusted).to_byte_array()
+        };
+        if pin.is_some_and(|pinned| pinned != key_hash) {
+            return Err(ApiError::bad("trusted_pq_pubkey is not the PQ key pinned by this instance"));
+        }
         let raw = hexbytes("signed_anchor_hex", blob)?;
         let signed = SignedAnchor::deserialize(&raw)
             .map_err(|e| ApiError::bad(format!("signed_anchor_hex: malformed ({e:?})")))?;
@@ -367,8 +394,24 @@ impl AnchorBinding<'_> {
         if a.recovery_hash != p.recovery_hash || a.csv_delay != p.csv_delay {
             return Err(ApiError::bad("vault recovery_hash/csv_delay differ from the anchor"));
         }
-        Ok(true)
+        Ok(Some(key_hash))
     }
+}
+
+/// R-14: parse the optional server-side pin (`PQ_SHIELD_PINNED_PQ_PUBKEY_SHA256`,
+/// 64 hex chars). A malformed value is an error, never "no pin".
+fn parse_pinned_key_hash(value: Option<&str>) -> Result<Option<[u8; 32]>, ApiError> {
+    let Some(text) = value.map(str::trim).filter(|t| !t.is_empty()) else { return Ok(None) };
+    let bytes = hex::decode(text)
+        .map_err(|_| ApiError::bad("PQ_SHIELD_PINNED_PQ_PUBKEY_SHA256 is not hex; refusing clawback requests"))?;
+    let hash: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| ApiError::bad("PQ_SHIELD_PINNED_PQ_PUBKEY_SHA256 must be 32 bytes; refusing clawback requests"))?;
+    Ok(Some(hash))
+}
+
+fn pinned_key_hash() -> Result<Option<[u8; 32]>, ApiError> {
+    parse_pinned_key_hash(std::env::var("PQ_SHIELD_PINNED_PQ_PUBKEY_SHA256").ok().as_deref())
 }
 
 #[derive(Deserialize)]
@@ -605,7 +648,7 @@ async fn clawback_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
     let safe = vaultlib::validate_destination(req.safe_destination.trim(), network)
         .map_err(|_| ApiError::bad("invalid safe_destination address"))?;
     let anchor_bound = AnchorBinding { signed_anchor_hex: &req.signed_anchor_hex, trusted_pq_pubkey: &req.trusted_pq_pubkey }
-        .check(network, &p, &safe)?;
+        .check(network, &p, &safe, pinned_key_hash()?)?;
     let claw = build_clawback_tx_checked(trigger_op, req.trigger_amount_sat, &safe, req.fee_sat)
         .map_err(|error| ApiError::bad(error.to_string()))?;
     let trig_script = trigger_script(&p);
@@ -630,7 +673,8 @@ async fn clawback_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
             "vout": 0,
             "amount_sat": req.trigger_amount_sat.saturating_sub(req.fee_sat),
         },
-        "anchor_bound": anchor_bound,
+        "anchor_bound": anchor_bound.is_some(),
+        "anchor_pq_pubkey_sha256": anchor_bound.map(hex::encode),
         "notes": [
             "Immediate (no timelock) so you can beat the attacker's delayed branch A within Δ. \
              RBF-enabled; a keyless watchtower needs pre-signed replacements to fee-bump.",
@@ -651,7 +695,7 @@ async fn clawback_ladder(body: Bytes) -> Result<Json<Value>, ApiError> {
     let safe = vaultlib::validate_destination(req.safe_destination.trim(), network)
         .map_err(|_| ApiError::bad("invalid safe_destination address"))?;
     let anchor_bound = AnchorBinding { signed_anchor_hex: &req.signed_anchor_hex, trusted_pq_pubkey: &req.trusted_pq_pubkey }
-        .check(network, &p, &safe)?;
+        .check(network, &p, &safe, pinned_key_hash()?)?;
     let ladder = build_clawback_fee_ladder_checked(
         &p,
         trigger_op,
@@ -679,7 +723,8 @@ async fn clawback_ladder(body: Bytes) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!({
         "replacements": replacements,
         "safe_destination": safe.to_string(),
-        "anchor_bound": anchor_bound,
+        "anchor_bound": anchor_bound.is_some(),
+        "anchor_pq_pubkey_sha256": anchor_bound.map(hex::encode),
         "pre_signing_required": true,
         "watchtower_needs_recovery_key": false,
         "warning": "Sign every SIGHASH_ALL candidate offline before funding and validate fee deltas against current relay policy. This is not dynamic fee estimation or a guarantee of BIP-125 acceptance.",
@@ -835,7 +880,7 @@ mod tests {
     use super::*;
     use bloch_pq_vault::anchor::{sign_anchor, verify_anchor};
     use bloch_pq_vault::preimage::derive_recovery_zeroizing;
-    use bloch_pq_vault::{derive_vault_keys, VaultKeys};
+    use bloch_pq_vault::{derive_new_vault_keys, VaultKeys};
 
     const NET: &str = "regtest";
 
@@ -849,7 +894,7 @@ mod tests {
     /// are used to derive the *public* material the client would send. The API never
     /// receives any of the secrets below.
     fn public_inputs() -> (VaultKeys, [u8; 32], [u8; 32]) {
-        let keys = derive_vault_keys(&seed(), false).unwrap();
+        let keys = derive_new_vault_keys(&seed(), false).unwrap();
         let (r, hr) = derive_recovery_zeroizing(keys.pq_secret_key(), b"api-test-vault");
         (keys, *r, hr)
     }
@@ -1009,13 +1054,36 @@ mod tests {
             if with_key { v["trusted_pq_pubkey"] = json!(trusted); }
             body(v)
         };
-        assert_eq!(clawback_tx(tx_req(&safe, true, true)).await.expect("bound").0["anchor_bound"], json!(true));
+        let bound = clawback_tx(tx_req(&safe, true, true)).await.expect("bound").0;
+        assert_eq!(bound["anchor_bound"], json!(true));
+        // R-14: the response names the key the anchor was verified under.
+        let owner_hash = {
+            use bitcoin::hashes::{sha256, Hash};
+            sha256::Hash::hash(&keys.pq_pubkey).to_byte_array()
+        };
+        assert_eq!(bound["anchor_pq_pubkey_sha256"], json!(hex::encode(owner_hash)));
+        // R-14: with a server-side pin, an omitted anchor and an anchor under
+        // any other key are both refused (fail closed), the owner's passes.
+        let p_net = Network::Regtest;
+        let safe_addr = vaultlib::validate_destination(&safe, p_net).unwrap();
+        let binding = |blob: &Option<String>, key: &Option<String>, pin| {
+            AnchorBinding { signed_anchor_hex: blob, trusted_pq_pubkey: key }.check(p_net, &p, &safe_addr, pin)
+        };
+        let (some_blob, some_key) = (Some(blob.clone()), Some(trusted.clone()));
+        assert_eq!(binding(&some_blob, &some_key, Some(owner_hash)).ok(), Some(Some(owner_hash)));
+        assert!(binding(&None, &None, Some(owner_hash)).is_err(), "pin makes the anchor mandatory");
+        assert!(binding(&some_blob, &some_key, Some([0x11; 32])).is_err(), "pin refuses another key");
+        assert_eq!(binding(&None, &None, None).ok(), Some(None));
+        assert!(parse_pinned_key_hash(Some("zz")).is_err());
+        assert!(parse_pinned_key_hash(Some("abcd")).is_err());
+        assert_eq!(parse_pinned_key_hash(None).ok(), Some(None));
+        assert_eq!(parse_pinned_key_hash(Some(&hex::encode(owner_hash))).ok(), Some(Some(owner_hash)));
         assert_eq!(clawback_tx(tx_req(&safe, false, false)).await.expect("unbound").0["anchor_bound"], json!(false));
         assert!(clawback_tx(tx_req(&attacker, true, true)).await.is_err(), "swapped destination must be refused");
         assert!(clawback_tx(tx_req(&safe, true, false)).await.is_err(), "anchor without a trust root");
         assert!(clawback_tx(tx_req(&safe, false, true)).await.is_err(), "trust root without an anchor");
         // An anchor signed by another key is refused even with the right destination.
-        let other = derive_vault_keys(&[0xA7u8; 64], false).unwrap();
+        let other = derive_new_vault_keys(&[0xA7u8; 64], false).unwrap();
         let mut foreign = json!({
             "network": NET, "vault": vault.clone(),
             "trigger_outpoint": { "txid": "0000000000000000000000000000000000000000000000000000000000000002", "vout": 0u32 },
@@ -1183,7 +1251,7 @@ mod tests {
     async fn anchor_verify_rejects_forgery_and_demands_a_trust_root() {
         let (owner, _r, hr) = public_inputs();
         // A second, unrelated hybrid identity: the attacker. No owner secret involved.
-        let attacker = derive_vault_keys(&[0xA7u8; 64], false).unwrap();
+        let attacker = derive_new_vault_keys(&[0xA7u8; 64], false).unwrap();
         assert_ne!(owner.pq_pubkey, attacker.pq_pubkey);
 
         // The attacker's anchor: same vault and same H(r), but THEIR payout address and
@@ -1444,7 +1512,7 @@ mod audit_edge_regressions {
 
     #[tokio::test]
     async fn unvault_route_uses_checked_builder_for_hostile_values() {
-        let keys = vaultlib::derive_vault_keys(&[7; 32], false).unwrap();
+        let keys = vaultlib::derive_new_vault_keys(&[7; 32], false).unwrap();
         let request = |txid: &str, vout: u32, amount: u64, fee: u64| json!({
             "network": "regtest",
             "vault": { "hot_pubkey": keys.hot_pubkey.to_string(),
