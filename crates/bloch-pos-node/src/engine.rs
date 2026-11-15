@@ -809,7 +809,8 @@ const MEMPOOL_MAX: usize = 4_096;
 /// source's worst case to 64 / 4,096 ≈ 1.6% of total mempool capacity.
 const MEMPOOL_MAX_PER_SOURCE: usize = 64;
 
-/// Expensive lifecycle authorization calls allowed for one identity in one
+/// Expensive lifecycle authorization calls allowed for one identity, as
+/// delivered by one source (audit L1-02: the pair, not the identity alone), in one
 /// wall slot. The consensus validator performs cheap state/shape checks before
 /// invoking the budgeted verifier. Two calls cover the largest transaction
 /// (four algorithm checks because every authorization is hybrid); a fresh
@@ -822,6 +823,14 @@ const LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = 2;
 /// validity. 256 calls retain two attempts for 128 independent identities in
 /// 30 seconds; overload is retryable in the next slot.
 const LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT: usize = 256;
+
+/// Expensive lifecycle authorization calls one deliverer (a peer or RPC
+/// client's verification source) may trigger across all identities in one
+/// wall slot (audit L1-02). With the per-(deliverer, identity) allowance this
+/// keeps a single source from exhausting the global ceiling by cycling
+/// identities: that now takes 256 / 16 = 16 distinct sources. This node's own
+/// submissions are exempt.
+const LIFECYCLE_VERIFICATIONS_PER_DELIVERER_PER_SLOT: usize = 16;
 
 /// New hybrid verifications allowed across attestation, transaction and
 /// evidence network admission in one wall slot. Blocks draw on their own
@@ -1561,6 +1570,13 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
             Some(Sha3_256::digest(pk).into())
         }
         PosTransaction::FundedDeposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        // Audit L1-13: these used to have no source and escaped
+        // `MEMPOOL_MAX_PER_SOURCE`. The funding key (shared with that key's
+        // deposits) and the validator index, as their lifecycle allowance.
+        PosTransaction::FundedDelegate(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::FundedUndelegate(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::FundedDelegationWithdraw(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::ValidatorCommissionUpdate(tx) => Some(validator_lifecycle_source(tx.validator)),
         PosTransaction::ExitV2 { pubkey_hash, .. } =>
             Some(lifecycle_source_hash(b"exit", pubkey_hash)),
         PosTransaction::Withdraw { validator }
@@ -3083,12 +3099,45 @@ impl Engine {
     /// in force, an erased or expired leaf, or a failed write). Promotes a
     /// rotated-in successor the chain has made the key in force. Called only
     /// once a duty is settled, so an idle validator does not evolve or log.
-    fn prepare_kes(&mut self, epoch: u64, validator: u32) -> Result<Option<(u64, bloch_pos_committee::kes::KesPublic)>, String> {
+    ///
+    /// `rolled` is the head state rolled into `epoch` (`rolled_to(epoch)`),
+    /// the very state every verifier judges the duty against: block
+    /// application rolls the parent into the block's epoch and gossip rolls
+    /// the head into the vote's. The signing mode, the key in force and the
+    /// validator's KES entry are read from it, never from the unrolled head
+    /// (audit L1-01): the bind epoch (`kes_enforced_from`) is written by
+    /// `process_epoch`, so a head that has not crossed the deciding boundary
+    /// (empty epochs at the bind) would otherwise sign statically a duty every
+    /// verifier requires a KES leaf for, and no block would cross the bind.
+    /// Only the clock-jump guard and the replaced-key settlement keep reading
+    /// the head's own period and finalized checkpoint: they protect erasure,
+    /// which must never run ahead of what the chain has actually reached.
+    fn prepare_kes(
+        &mut self,
+        rolled: &CommittedState,
+        epoch: u64,
+        validator: u32,
+    ) -> Result<Option<(u64, bloch_pos_committee::kes::KesPublic)>, String> {
+        self.prepare_kes_in(rolled, rolled.kes_roots().get(&validator), epoch, validator)
+    }
+
+    /// [`Self::prepare_kes`] over the two things it reads from the rolled
+    /// state: the verifiers' key lookup and the validator's committed KES
+    /// entry. Split out so the decision can be exercised against a view that
+    /// differs from the head (audit L1-01) without building a chain to it.
+    fn prepare_kes_in(
+        &mut self,
+        rolled: &dyn KeyLookup,
+        entry: Option<&bloch_pos_committee::kes::KesEntry>,
+        epoch: u64,
+        validator: u32,
+    ) -> Result<Option<(u64, bloch_pos_committee::kes::KesPublic)>, String> {
         use bloch_pos_committee::kes::SigningMode;
-        // The same rule every verifier runs (`kes::signing_mode`): static
-        // before KES binds on chain, and for a never-registered validator
-        // after (fallback); the KES leaf for a registered one.
-        let period = match bloch_pos_committee::kes::signing_mode(&*self.state, validator, epoch) {
+        // The same rule every verifier runs (`kes::signing_mode`), on the
+        // same state: static before KES binds on chain, and for a
+        // never-registered validator after (fallback); the KES leaf for a
+        // registered one.
+        let period = match bloch_pos_committee::kes::signing_mode(rolled, validator, epoch) {
             SigningMode::Static => return Ok(None),
             SigningMode::FailClosed => return Err("KES enforcement state unknown".into()),
             SigningMode::Kes(period) => period,
@@ -3101,11 +3150,12 @@ impl Engine {
                 crate::kes_key::FILE_NAME
             ));
         };
-        let Some(public) = self.state.kes_public_at(validator, period) else {
+        // `CommittedState::kes_public_at`: the entry's key in force.
+        let Some(public) = entry.map(|entry| entry.in_force(period)) else {
             return Err(format!("no KES key is registered on chain for v{validator}"));
         };
         kes.adopt_successor(&public)?;
-        if let Some(entry) = self.state.kes_roots().get(&validator) {
+        if let Some(entry) = entry {
             kes.settle_replaced(entry, period, head_period, self.state.finality().finalized.epoch);
         }
         if kes.key.index() != validator && kes.key.index() != crate::keys::AUTO_VALIDATOR_INDEX {
@@ -3219,7 +3269,10 @@ impl Engine {
     }
 
     fn submit_kes_rotation(&mut self, wall_epoch: u64, period: u64, index: u32) {
-        let in_force = match self.prepare_kes(wall_epoch, index) {
+        // `maintain_kes` runs only with the head inside `wall_epoch`, so the
+        // head state is that epoch's rolled state.
+        let rolled = self.rolled_to(wall_epoch);
+        let in_force = match self.prepare_kes(&rolled, wall_epoch, index) {
             Ok(Some((p, public))) if p == period => public,
             Ok(_) => return,
             Err(why) => {
@@ -3578,7 +3631,7 @@ impl Engine {
         // target epoch, including after an NTP step backwards or a restart.
         //
         // KES: the vote's period is its target epoch's, which is this slot's.
-        let kes_period = match self.prepare_kes(e, index) {
+        let kes_period = match self.prepare_kes(&rolled, e, index) {
             Ok(period) => period,
             Err(why) => {
                 eprintln!("[slot {slot}] not attesting: {why}");
@@ -3852,7 +3905,7 @@ impl Engine {
         // not.
         // KES: the proposal's period is its slot's epoch's. Prepared only
         // now that this node is certain to sign.
-        let kes_period = match self.prepare_kes(e, index) {
+        let kes_period = match self.prepare_kes(&rolled, e, index) {
             Ok(period) => period,
             Err(why) => {
                 eprintln!("[slot {slot}] not proposing: {why}");
@@ -4222,6 +4275,29 @@ impl Engine {
             .unwrap_or_else(|| self.state.arc())
     }
 
+    /// [`Self::proposer_authority_state`] for a block of `epoch` (audit
+    /// L1-01, block door). From the KES gate on, a block whose parent is the
+    /// head and whose epoch is past the head's is judged against the head
+    /// rolled into that epoch, which is the state the transition rolls the
+    /// parent to before it verifies the proposer (step 7). The bind epoch
+    /// (`kes_enforced_from`) is written by `process_epoch`, so the unrolled
+    /// head of a chain that crossed empty epochs after the bind decision
+    /// selects the static key for a proposer that rightly signs with its KES
+    /// leaf, and the door would park every block that crosses the bind.
+    /// Called only after the door's wall-clock bounds on the slot
+    /// (`MAX_FUTURE_SLOTS`), so the roll is bounded; before the gate the
+    /// answer is the unrolled state, exactly as before.
+    fn proposer_authority_state_at(&self, parent: &[u8; 32], epoch: u64) -> Arc<CommittedState> {
+        let head = self.state.arc();
+        if bloch_pos_committee::params::kes_period(epoch).is_some()
+            && parent == self.head_id().as_bytes()
+            && epoch > epoch_of(head.slot())
+        {
+            return self.rolled_to(epoch);
+        }
+        self.proposer_authority_state(parent)
+    }
+
     /// Park a block whose proposer could not be authenticated under
     /// `judged`, and remember that authority so the block is judged again
     /// when it changes (V1-2). Unauthenticated, like every such entry.
@@ -4259,7 +4335,7 @@ impl Engine {
                 continue;
             };
             let now = bloch_pos_committee::kes::authority_fingerprint(
-                &*self.proposer_authority_state(&env.header.parent),
+                &*self.proposer_authority_state_at(&env.header.parent, epoch_of(env.header.slot)),
                 env.header.proposer_index,
                 epoch_of(env.header.slot),
             );
@@ -4415,7 +4491,7 @@ impl Engine {
         // before any signature work and never stored, so it never reaches
         // fork choice. `Ignore`: the peer relaying it is honest.
         if self.is_rejected_block(&id, &env.header.parent) {
-            self.refuse_rejected_block(id);
+            self.refuse_rejected_block(&env, id, src);
             return (Verdict::Ignore, None);
         }
         if env.header.slot == 0 {
@@ -4558,7 +4634,7 @@ impl Engine {
         // reorg ring still holds it (a sibling of the head, or a child of
         // it), which is exactly the transition's; only otherwise the head.
         let proposer_epoch = epoch_of(env.header.slot);
-        let judged_state = self.proposer_authority_state(&env.header.parent);
+        let judged_state = self.proposer_authority_state_at(&env.header.parent, proposer_epoch);
         let authority = bloch_pos_committee::kes::authority_fingerprint(
             &*judged_state,
             env.header.proposer_index,
@@ -5862,7 +5938,7 @@ impl Engine {
                 self.precheck_slashing_evidence(evidence, verification_source)?;
             }
         }
-        self.validate_lifecycle_admission(&tx)?;
+        self.validate_lifecycle_admission(&tx, verification_source)?;
         // Plan capacity cleanup without mutating the pool. A forged incoming
         // signature must never evict either stale or currently paying entries.
         //
@@ -8833,6 +8909,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // `--reject-block-root` / BLOCH_REJECT_BLOCK_ROOTS: read once, strictly,
     // and announced in one line so the operator sees exactly what is armed.
     let rejected_roots = reject_roots::reject_block_roots_from_env()?;
+    let rewind_confirmed = reject_roots::reject_root_rewind_confirmations_from_env()?;
+    if !rewind_confirmed.is_empty() {
+        println!(
+            "REJECT_BLOCK_ROOT: {} is set — a boot truncation for {} rejected root(s) may cut \
+             below this node's finalized checkpoint (together with --allow-finality-rewind)",
+            reject_roots::ENV_REJECT_ROOT_FINALITY_REWIND,
+            rewind_confirmed.len(),
+        );
+    }
     if rejected_roots.contains(genesis_id.as_bytes()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -8916,7 +9001,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
         finality_rewinds_refused: 0,
         parked_refused_finality: VecDeque::new(),
         finality_rewind_override: allow_finality_rewind,
-        rejected_roots: reject_roots::RejectedRoots::new(rejected_roots),
+        rejected_roots: reject_roots::RejectedRoots {
+            rewind_confirmed,
+            ..reject_roots::RejectedRoots::new(rejected_roots)
+        },
         tx_slot_index: BTreeMap::new(),
         tx_slot_index_order: VecDeque::new(),
         doppelganger_observe_until: None,

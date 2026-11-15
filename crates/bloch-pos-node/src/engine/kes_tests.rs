@@ -610,3 +610,247 @@ fn the_flag_day_classifier_names_only_a_gate_between_head_and_wall() {
     // HF3 PQ migration shares the epoch and the split.
     assert_eq!(bloch_pos_committee::params::HF3_PQ_MIGRATION_EPOCH, gate);
 }
+
+/// What the head state rolled to a duty epoch answers with once the bind
+/// boundary has been crossed: validator 0's static key, its committed KES
+/// entry and the bind epoch.
+struct RolledView {
+    pk: Vec<u8>,
+    entry: kes::KesEntry,
+    enforced_from: Option<u64>,
+    domain: [u8; 32],
+}
+
+impl KeyLookup for RolledView {
+    fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+        (validator == 0).then_some(self.pk.as_slice())
+    }
+    fn kes_public(&self, validator: u32, period: u64) -> Option<KesPublic> {
+        (validator == 0).then(|| self.entry.resolve(period)).flatten()
+    }
+    fn kes_network_domain(&self) -> Option<[u8; 32]> {
+        Some(self.domain)
+    }
+    fn kes_enforced_from(&self) -> Option<Option<u64>> {
+        Some(self.enforced_from)
+    }
+}
+
+/// **Audit L1-01: a duty past a KES bind its head has not crossed signs
+/// under the rule every verifier applies.**
+///
+/// Mainnet numbers. The bind is decided at the boundary into the gate epoch
+/// X = 8620 and governs from X + `KES_BIND_DELAY_EPOCHS`; no block is applied
+/// in X and X+1, so the HEAD state still reads `kes_enforced_from = None`
+/// while the state every verifier rolls to the duty epoch X+2 binds KES.
+/// The signer used to decide on the unrolled head: it signed statically and
+/// every verifier refused the vote and the block, so no block could cross
+/// the bind. It now decides on the rolled view: the same engine, with the
+/// same lagging head, prepares the leaf, and what it signs verifies.
+#[test]
+fn a_duty_past_an_unseen_kes_bind_signs_the_leaf_verifiers_require() {
+    use bloch_pos_committee::params::{KES_ACTIVATION_EPOCH, KES_BIND_DELAY_EPOCHS};
+    let (mut engine, dir) = perf_support::proposing_engine();
+    let kes_dir = dir.0.join("kes");
+    std::fs::create_dir_all(&kes_dir).unwrap();
+    let unlock_for = || Unlock::passphrase_with("kes-l1-01-test-passphrase", KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 });
+    let key = crate::kes_key::KesKey::generate(0, 2, |_| {}).unwrap();
+    key.save(&kes_dir, &unlock_for()).unwrap();
+    let on_chain = KesPublic::new(key.public().depth, key.public().root, 0);
+    engine.kes = Some(KesSigner::new(key, kes_dir, unlock_for()));
+
+    let duty_epoch = KES_ACTIVATION_EPOCH + KES_BIND_DELAY_EPOCHS;
+    let domain = [0xD7; 32];
+    let pk = engine.keys.as_ref().unwrap().pubkey.clone();
+    // The head: registered, but the deciding boundary was never applied.
+    let head = RolledView { pk: pk.clone(), entry: on_chain.into(), enforced_from: None, domain };
+    // The same state rolled across X and X+1 into the duty epoch.
+    let rolled = RolledView { pk, entry: on_chain.into(), enforced_from: Some(duty_epoch), domain };
+    assert_eq!(engine.state.kes_enforced_from(), None, "the engine's own head predates the bind too");
+    assert_eq!(kes::signing_mode(&head, 0, duty_epoch), kes::SigningMode::Static);
+    assert_eq!(kes::signing_mode(&rolled, 0, duty_epoch), kes::SigningMode::Kes(0));
+
+    let verifier = HybridVerifier::new();
+    let root = [0x42; 32];
+    let verifies = |signature: &[u8]| kes::verify_validator(&rolled, &verifier, 0, duty_epoch, &root, signature);
+
+    // The old decision (the unrolled head): static, refused by every verifier.
+    let stale = engine.prepare_kes_in(&head, Some(&head.entry), duty_epoch, 0).unwrap();
+    assert_eq!(stale, None);
+    let static_sig = sign_duty(engine.keys.as_ref().unwrap(), engine.kes.as_ref(), stale, Some(domain), 0, duty_epoch, &root);
+    assert_eq!(verifies(&static_sig), Some(false), "the halt: a static signature in a KES-governed epoch");
+
+    // The fixed decision (the rolled view): the leaf, accepted.
+    let prepared = engine.prepare_kes_in(&rolled, Some(&rolled.entry), duty_epoch, 0).unwrap();
+    assert_eq!(prepared, Some((0, on_chain)));
+    let leaf_sig = sign_duty(engine.keys.as_ref().unwrap(), engine.kes.as_ref(), prepared, Some(domain), 0, duty_epoch, &root);
+    assert_eq!(verifies(&leaf_sig), Some(true), "the duty signed under the rolled rule verifies");
+    // One epoch earlier the static key still signs, on both views.
+    assert_eq!(engine.prepare_kes_in(&rolled, Some(&rolled.entry), duty_epoch - 1, 0).unwrap(), None);
+}
+
+/// Audit L1-01, block door: past the KES gate a block on the head, in a
+/// later epoch, is authenticated against the head rolled into its epoch
+/// (what the transition judges it by); before the gate, and for a parent
+/// that is not the head, the door reads the unrolled state as before.
+#[test]
+fn the_block_door_judges_a_post_gate_proposer_on_the_rolled_head() {
+    let (engine, _dir) = perf_support::proposing_engine();
+    let head = *engine.head_id().as_bytes();
+    let duty_epoch = bloch_pos_committee::params::KES_ACTIVATION_EPOCH + bloch_pos_committee::params::KES_BIND_DELAY_EPOCHS;
+    let judged = engine.proposer_authority_state_at(&head, duty_epoch);
+    assert!(Arc::ptr_eq(&judged, &engine.rolled_to(duty_epoch)), "the rolled head");
+    assert!(!Arc::ptr_eq(&judged, &engine.state.arc()));
+    let before_gate = bloch_pos_committee::params::KES_ACTIVATION_EPOCH - 1;
+    assert!(Arc::ptr_eq(&engine.proposer_authority_state_at(&head, before_gate), &engine.state.arc()), "unchanged before the gate");
+    assert!(Arc::ptr_eq(&engine.proposer_authority_state_at(&[0x9A; 32], duty_epoch), &engine.state.arc()), "not the head's child");
+}
+
+/// Drive a one-validator engine through each epoch of `epochs` (ascending):
+/// the validator votes at its duty slot and proposes right after it, in the
+/// same epoch, so the vote is included and the epoch is justified. Returns
+/// the last block's slot.
+fn live_epochs(engine: &mut Engine, epochs: impl IntoIterator<Item = u64>) -> u64 {
+    let mut last = engine.state.slot();
+    for e in epochs {
+        let duty = engine.attestation_duty_slot(e).unwrap_or_else(|| panic!("epoch {e}: no duty"));
+        let next = first_slot_of_epoch(e + 1).expect("a next epoch");
+        let block = if duty + 1 < next { duty + 1 } else { duty };
+        let _clock = validator_lifecycle::clock_at(block);
+        engine.wall_slot = duty;
+        engine.attest(duty);
+        engine.wall_slot = block;
+        engine.propose(block);
+        assert_eq!(engine.state.slot(), block, "epoch {e}: the block is applied");
+        last = block;
+    }
+    last
+}
+
+/// **Audit L1-01, end to end at mainnet numbers** (review R-11): a real
+/// chain, a real registration, the real `rolled_to`, and this node's own
+/// transition as the verifier.
+///
+/// One validator (all the stake) registers a depth-8 hybrid tree in the
+/// window and the head stops in epoch 8619, the last before the gate. The
+/// boundary into 8620 decides the bind (in force from 8622), but no block is
+/// applied in 8620 or 8621, so the head state never learns it. The duty of
+/// epoch 8622 is then signed from that lagging head: the vote must verify
+/// under the state rolled to its epoch, and the proposal must be applied by
+/// the transition, which rolls the parent into 8622 and requires the leaf.
+/// With the signer deciding on the unrolled head (906336fd) both are signed
+/// statically: the vote fails `attestation::validate` and the block is
+/// refused, i.e. the chain cannot cross the bind.
+///
+/// Ignored by default only for its run time (thousands of real hybrid
+/// signatures and state roots, several minutes in release):
+/// `cargo test --release -p bloch-pos-node --bin bloch-pos -- --ignored two_empty_epochs`.
+///
+/// The chain is kept live cheaply: two consecutive voted epochs out of
+/// every three until the Ethereum-paced leak (5700), then two out of
+/// sixteen, which keeps finality close enough that the validator's weight
+/// is never leaked away and uses fewer blocks than its RANDAO chain holds.
+#[test]
+#[ignore = "several minutes: drives a real chain to epoch 8622"]
+fn two_empty_epochs_after_the_bind_decision_do_not_halt_the_chain() {
+    use bloch_pos_committee::params::{
+        ETH_PACED_LEAK_ACTIVATION_EPOCH, KES_ACTIVATION_EPOCH, KES_BIND_DELAY_EPOCHS, KES_MIN_REGISTERED_DEPTH,
+        KES_REGISTRATION_EPOCH,
+    };
+    let (mut engine, dir) = perf_support::proposing_engine();
+    let kes_dir = dir.0.join("kes");
+    std::fs::create_dir_all(&kes_dir).unwrap();
+    let unlock_for = || Unlock::passphrase_with("kes-l1-01-e2e-passphrase", KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 });
+    let key = crate::kes_key::KesKey::generate(0, KES_MIN_REGISTERED_DEPTH, |_| {}).unwrap();
+    key.save(&kes_dir, &unlock_for()).unwrap();
+    let tree = key.public();
+    engine.kes = Some(KesSigner::new(key, kes_dir, unlock_for()));
+
+    let gate = KES_ACTIVATION_EPOCH;
+    let mut schedule: BTreeSet<u64> = BTreeSet::new();
+    let mut e = 1;
+    while e < ETH_PACED_LEAK_ACTIVATION_EPOCH {
+        schedule.extend([e, e + 1]);
+        e += 3;
+    }
+    while e < gate - 1 {
+        schedule.extend([e, e + 1]);
+        e += 16;
+    }
+    schedule.extend([KES_REGISTRATION_EPOCH, KES_REGISTRATION_EPOCH + 1, gate - 2, gate - 1]);
+    schedule.retain(|e| *e < gate);
+    assert!(schedule.len() < 8_000, "fewer blocks than one RANDAO chain holds");
+
+    // Up to the registration window, then the registration, then on to the
+    // last epoch before the gate.
+    let window = live_epochs(&mut engine, schedule.range(..=KES_REGISTRATION_EPOCH).copied());
+    assert_eq!(epoch_of(window), KES_REGISTRATION_EPOCH);
+    let domain = engine.state.admission_network_domain().unwrap_or([0; 32]);
+    let public = KesPublic::new(tree.depth, tree.root, 0);
+    let signature = engine.keys.as_ref().unwrap().sign(&kes::register_signing_root(&domain, 0, &public));
+    {
+        let _clock = validator_lifecycle::clock_at(window);
+        engine.wall_slot = window;
+        engine
+            .on_transaction(PosTransaction::KesRegister { validator: 0, depth: tree.depth, root: tree.root, signature })
+            .expect("the registration is admitted");
+    }
+    let before = live_epochs(&mut engine, schedule.range(KES_REGISTRATION_EPOCH + 1..).copied());
+    assert!(engine.state.kes_roots().contains_key(&0), "the registration is included");
+    assert_eq!(epoch_of(before), gate - 1, "the head stops in the last epoch before the gate");
+    assert_eq!(engine.state.kes_enforced_from(), None, "the head has not crossed the deciding boundary");
+
+    // Epochs X and X+1 stay empty; the duty is in X+2, the first governed.
+    let duty_epoch = gate + KES_BIND_DELAY_EPOCHS;
+    let rolled = engine.rolled_to(duty_epoch);
+    assert_eq!(rolled.kes_enforced_from(), Some(duty_epoch), "the real roll decides the bind at the gate boundary");
+    assert_eq!(kes::signing_mode(&*rolled, 0, duty_epoch), kes::SigningMode::Kes(0));
+    assert_eq!(kes::signing_mode(&*engine.state, 0, duty_epoch), kes::SigningMode::Static, "what the head alone says");
+    drop(rolled);
+
+    // The vote, signed from the lagging head, judged as gossip and block
+    // validation judge it: against the state rolled to its epoch.
+    let vote_slot = engine.attestation_duty_slot(duty_epoch).expect("the only validator has a duty");
+    let _clock = validator_lifecycle::clock_at(vote_slot);
+    engine.wall_slot = vote_slot;
+    engine.attest(vote_slot);
+    assert_eq!(engine.state.slot(), before, "voting does not move the head");
+    let vote = engine
+        .pool
+        .values()
+        .find(|a| a.validator == 0 && a.data.target_epoch == duty_epoch)
+        .cloned()
+        .expect("the vote is signed and pooled");
+    let rolled = engine.rolled_to(duty_epoch);
+    assert_eq!(
+        bloch_pos_committee::attestation::validate(&vote, &[0], vote.data.slot, &HybridVerifier::new(), &*rolled),
+        Ok(()),
+        "the vote verifies under the rule of the state rolled to its epoch"
+    );
+    drop(rolled);
+
+    // The proposal: applied by this node's own transition, which rolls the
+    // parent across the two empty epochs and requires the KES leaf.
+    engine.propose(vote_slot);
+    assert_eq!(engine.state.slot(), vote_slot, "the KES-signed proposal crosses the bind");
+    assert_eq!(engine.state.kes_enforced_from(), Some(duty_epoch));
+}
+
+/// Audit L1-06 (node-local half): past the gate and before the bind a first
+/// key starts at period 0, so a tree too shallow to reach the current period
+/// is refused at the door; a deep enough tree, and any registration before
+/// the gate, are not.
+#[test]
+fn a_registration_born_expired_is_refused_at_the_door() {
+    let (engine, _dir) = perf_support::proposing_engine();
+    assert!(!validator_lifecycle::kes_registration_born_expired(&engine.state, 0, 1), "before the gate");
+    let gate = bloch_pos_committee::params::KES_ACTIVATION_EPOCH;
+    let epoch = gate + 2 * bloch_pos_committee::params::KES_PERIOD_EPOCHS;
+    assert_eq!(bloch_pos_committee::params::kes_period(epoch), Some(2));
+    let rolled = engine.rolled_to(epoch);
+    assert_eq!(rolled.kes_enforced_from(), None, "nobody registered: KES has not bound");
+    assert!(validator_lifecycle::kes_registration_born_expired(&rolled, epoch, 1), "two periods of life, period 2");
+    assert!(!validator_lifecycle::kes_registration_born_expired(&rolled, epoch, 2), "four periods of life");
+    assert!(!validator_lifecycle::kes_registration_born_expired(&rolled, epoch, 8));
+    assert!(!validator_lifecycle::kes_registration_born_expired(&rolled, gate - 1, 1), "the epoch before the gate");
+}

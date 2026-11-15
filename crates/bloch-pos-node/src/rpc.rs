@@ -3042,17 +3042,19 @@ pub fn validator_count_json(state: &CommittedState) -> Json {
 
 /// State-only answer for `getvalidators`.
 pub fn validator_registry_json(state: &CommittedState) -> Json {
-    let active = state.active_validators();
+    // Audit L1-14: one index -> effective stake map instead of a linear
+    // search of the active set per registry entry (O(n^2) on the consensus
+    // thread). Same answer: the first active entry for an index.
+    let mut active: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    for v in state.active_validators().iter() {
+        active.entry(v.index).or_insert(v.effective_stake);
+    }
     let current_epoch = epoch_of(state.slot());
     let entries: Vec<(ValidatorRecord, Option<u64>)> =
         (0..state.validator_count() as u32)
             .filter_map(|index| {
                 let rec = state.validator_record(index)?;
-                let effective = active
-                    .iter()
-                    .find(|v| v.index == index)
-                    .map(|v| v.effective_stake);
-                Some((rec, effective))
+                Some((rec, active.get(&index).copied()))
             })
             .collect();
     validators_json(&entries, current_epoch)

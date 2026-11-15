@@ -126,6 +126,7 @@ pub const FRAME_GET_BLOCKS: u8 = 0x03;
 pub const FRAME_TX: u8 = 0x04;
 
 pub use crate::p2p::{Origin, Verdict};
+mod handshake_rate;
 mod inbound_slots;
 mod source_budget;
 pub(crate) mod rejection_log;
@@ -2256,6 +2257,8 @@ pub fn start(
         let configured = configured.clone();
         let spawn_health = spawn_health.clone();
         spawn_essential("mesh-accept", move || {
+            // Audit L1-04: only this loop admits, so the limiter needs no lock.
+            let mut handshake_rate = handshake_rate::HandshakeRate::new(Instant::now());
             for conn in listener.incoming() {
                 let Ok(sock) = conn else {
                     // Out of descriptors, typically, and the connection is
@@ -2286,13 +2289,30 @@ pub fn start(
                     .unwrap_or(0);
                 // This loop is the only thing that adds slots, so the count
                 // cannot grow between this read and the admission below.
-                let held = match slots.lock() {
-                    Ok(slots) => slots.configured_held(address.ip()),
+                let (held, vouched) = match slots.lock() {
+                    Ok(slots) => (slots.configured_held(address.ip()), slots.is_vouched(address.ip())),
                     // W4-3: every later connection would be refused too.
                     Err(_) => panic!("mesh: the inbound slot table lock is poisoned"),
                 };
                 let standing = inbound_slots::Standing::for_source(peers_here, held);
                 let is_configured = standing.is_configured();
+                // Audit L1-04: the handshake below costs an ML-KEM
+                // encapsulation and an ML-DSA-65 signature before the dialer
+                // has proven anything. Bound how fast strangers can buy it,
+                // per source and (strangers only) in total, before a slot is
+                // taken or a thread spawned. The operator's own peers are
+                // exempt, and a source the slot table vouches for is bound
+                // by its own bucket only (review R-07).
+                let dialer = if is_configured {
+                    handshake_rate::Dialer::Configured
+                } else if vouched {
+                    handshake_rate::Dialer::Vouched
+                } else {
+                    handshake_rate::Dialer::Stranger
+                };
+                if !handshake_rate.admit(address.ip(), dialer, Instant::now()) {
+                    continue;
+                }
                 // The share and, in a full table, eviction are decided here;
                 // see `inbound_slots`. A refusal drops `sock`, closing it.
                 let Some(slot) = InboundSlot::admit(&slots, address.ip(), standing, Instant::now(), evict_handle) else {

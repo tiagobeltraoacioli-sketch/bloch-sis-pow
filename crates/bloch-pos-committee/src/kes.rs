@@ -738,7 +738,11 @@ pub fn failure_is_attributable(
     };
     let finalized_period = crate::params::kes_period(finalized.epoch).unwrap_or(0);
     let settled_through = entry.pending_at(finalized_period).map_or(finalized_period, |next| next.start_period);
-    period <= settled_through && keys.kes_public(validator, period) == Some(entry.in_force(period))
+    // Audit L1-17: `resolve`, the rule consensus judges by, not `in_force`:
+    // from the first-key floor on, a period before the validator's first
+    // KES key has no key (the static key signs it), and that is as settled
+    // by the finalized entry as any later period.
+    period <= settled_through && keys.kes_public(validator, period) == entry.resolve(period)
 }
 
 #[cfg(test)]
@@ -1171,6 +1175,47 @@ mod attribution_tests {
         let static_signature = h(&[STATIC_KEY, &root]);
         assert_eq!(verify_validator(&state, &ToyVerifier, 4, epoch, &root, &static_signature), Some(false));
         assert!(failure_is_attributable(&state, Some(&finalized), 4, epoch));
+    }
+
+    /// Audit L1-17: a validator that registered late, judged for a period
+    /// before its first key once the first-key floor is in force. Every
+    /// branch from the finalized state signs that period with the static
+    /// key, so a forged static signature is attributable (it used to be
+    /// compared against `in_force`, which never matches the floor's `None`).
+    #[test]
+    fn a_static_forgery_before_a_late_registrants_first_key_is_attributable() {
+        struct Resolving(BTreeMap<u32, KesEntry>);
+        impl KeyLookup for Resolving {
+            fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+                (validator == 4).then_some(STATIC_KEY)
+            }
+            fn kes_public(&self, validator: u32, period: u64) -> Option<KesPublic> {
+                self.0.get(&validator).and_then(|entry| entry.resolve(period))
+            }
+            fn kes_network_domain(&self) -> Option<[u8; 32]> {
+                Some(DOMAIN)
+            }
+            fn kes_enforced_from(&self) -> Option<Option<u64>> {
+                Some(Some(104))
+            }
+        }
+        let _armed = Rehearsal::arm();
+        let _floor = crate::params::kes_first_key_floor_rehearsal::arm(100);
+        let root = [0x42; 32];
+        let (tree, _) = kes_key_and_signature(7, 0, &root);
+        let late = KesPublic::new(tree.depth, tree.root, 5);
+        let entries = BTreeMap::from([(4, KesEntry::from(late))]);
+        let head = Resolving(entries.clone());
+        let finalized = FinalizedAuthority { epoch: 100 + 4 * 90 + 5, enforced_from: Some(104), entries: &entries };
+        let epoch = 100 + 2 * 90 + 10; // period 2, before the first key's start
+        assert_eq!(signing_mode(&head, 4, epoch), SigningMode::Static);
+        let forged_static = h(&[b"not-the-static-key".as_slice(), &root]);
+        assert_eq!(verify_validator(&head, &ToyVerifier, 4, epoch, &root, &forged_static), Some(false));
+        assert!(failure_is_attributable(&head, Some(&finalized), 4, epoch));
+        // From the first key's period on, the leaf rule is unchanged.
+        let in_key = 100 + 5 * 90 + 1;
+        let finalized_later = FinalizedAuthority { epoch: in_key, enforced_from: Some(104), entries: &entries };
+        assert!(failure_is_attributable(&head, Some(&finalized_later), 4, in_key));
     }
 
     #[test]

@@ -26,8 +26,10 @@
 //! - **Boot** ([`Engine::truncate_rejected_log`]): a block log whose
 //!   canonical chain contains a rejected block is truncated, durably and
 //!   before any replay or state-cache restore, to the parent of the first
-//!   rejected block. A truncation below the stored finality latch refuses to
-//!   start unless `--allow-finality-rewind` is set.
+//!   rejected block. A truncation below the stored finality latch, or with
+//!   no readable latch record to check it against, refuses to start unless
+//!   `--allow-finality-rewind` is set AND the rejected root is named again in
+//!   `BLOCH_REJECT_ROOT_FINALITY_REWIND` (audit L1-09, L1-10).
 //!
 //! Configured through `--reject-block-root <hex>` (repeatable) or
 //! `BLOCH_REJECT_BLOCK_ROOTS=<hex>[,<hex>...]`; `main.rs` folds the flags
@@ -36,6 +38,14 @@ use super::*;
 
 /// The environment variable the engine reads the rejected roots from.
 pub(crate) const ENV_REJECT_BLOCK_ROOTS: &str = "BLOCH_REJECT_BLOCK_ROOTS";
+
+/// The dedicated consent for a boot truncation that cuts below the stored
+/// finality latch, or that cannot be checked against one (audit L1-09,
+/// L1-10): the rejected root(s), named again, as 64-hex block ids. Required
+/// in addition to `--allow-finality-rewind`, so a stale
+/// `BLOCH_ALLOW_FINALITY_REWIND=1` left in a unit file cannot by itself
+/// truncate finalized history.
+pub(crate) const ENV_REJECT_ROOT_FINALITY_REWIND: &str = "BLOCH_REJECT_ROOT_FINALITY_REWIND";
 
 /// The operator's rejected roots and what this node has refused because of
 /// them.
@@ -52,6 +62,20 @@ pub(super) struct RejectedRoots {
     /// evicted parent, if fetched again, is refused again on ITS parent, down
     /// to a configured root, which is never evicted.
     pub(super) descendants: VecDeque<[u8; 32]>,
+    /// Refused ids whose proposer signature this node could NOT verify
+    /// (audit L1-08): a header naming a rejected parent with garbage in place
+    /// of a signature, a child of such a header, or a real block refused
+    /// while the verification allowance was spent. Kept apart, with the same
+    /// cap, so unauthenticated junk can only evict other unauthenticated
+    /// junk and never a verified descendant out of `descendants`. Consulted
+    /// by the door like `descendants`: an id is a header hash, so an entry
+    /// here can only ever name a block whose parent is itself refused.
+    pub(super) unauthenticated: VecDeque<[u8; 32]>,
+    /// Rejected roots whose boot truncation the operator explicitly
+    /// confirmed may cut below (or past an unknown) finality
+    /// (`BLOCH_REJECT_ROOT_FINALITY_REWIND`, audit L1-10). Needed together
+    /// with `--allow-finality-rewind`; neither suffices alone.
+    pub(super) rewind_confirmed: BTreeSet<[u8; 32]>,
     /// Blocks refused, at the door or truncated from the log at boot.
     /// Exported as `bloch_pos_rejected_blocks_total`.
     pub(super) refused: u64,
@@ -65,8 +89,29 @@ impl RejectedRoots {
     /// Is `id` a rejected root or a remembered rejected descendant?
     pub(super) fn contains(&self, id: &[u8; 32]) -> bool {
         !self.configured.is_empty()
-            && (self.configured.contains(id) || self.descendants.contains(id))
+            && (self.configured.contains(id) || self.descendants.contains(id) || self.unauthenticated.contains(id))
     }
+
+    /// Is `id` a configured root or a descendant whose signature verified?
+    fn authenticated(&self, id: &[u8; 32]) -> bool {
+        self.configured.contains(id) || self.descendants.contains(id)
+    }
+}
+
+/// The anchor root, when the logged canonical chain holds it at or after
+/// index `first` (the first rejected block): the rejected block is then the
+/// anchor or one of its ancestors (audit L1-15).
+fn rejected_at_or_below_anchor(logged: &[BlockEnvelope], first: usize, anchor: Option<[u8; 32]>) -> Option<[u8; 32]> {
+    let anchor = anchor?;
+    logged.get(first..)?.iter().any(|env| *env.block_id().as_bytes() == anchor).then_some(anchor)
+}
+
+/// Push onto a bounded refusal FIFO, evicting the oldest entries.
+fn remember(fifo: &mut VecDeque<[u8; 32]>, id: [u8; 32]) {
+    while fifo.len() >= MAX_PARKED_REFUSED_FINALITY {
+        fifo.pop_front();
+    }
+    fifo.push_back(id);
 }
 
 /// Parse a comma-separated list of 64-hex-digit block ids. Strict: every
@@ -97,14 +142,24 @@ pub(crate) fn parse_reject_block_root(entry: &str) -> Result<[u8; 32], String> {
 /// The roots configured in the environment, or a boot error naming the
 /// malformed entry.
 pub(super) fn reject_block_roots_from_env() -> io::Result<BTreeSet<[u8; 32]>> {
-    let Some(raw) = std::env::var_os(ENV_REJECT_BLOCK_ROOTS) else {
+    roots_from_env(ENV_REJECT_BLOCK_ROOTS)
+}
+
+/// The roots whose finality-crossing truncation the operator confirmed
+/// (`BLOCH_REJECT_ROOT_FINALITY_REWIND`), parsed as strictly.
+pub(super) fn reject_root_rewind_confirmations_from_env() -> io::Result<BTreeSet<[u8; 32]>> {
+    roots_from_env(ENV_REJECT_ROOT_FINALITY_REWIND)
+}
+
+fn roots_from_env(name: &str) -> io::Result<BTreeSet<[u8; 32]>> {
+    let Some(raw) = std::env::var_os(name) else {
         return Ok(BTreeSet::new());
     };
     let raw = raw.to_str().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("{ENV_REJECT_BLOCK_ROOTS} is not UTF-8"))
+        io::Error::new(io::ErrorKind::InvalidInput, format!("{name} is not UTF-8"))
     })?;
     parse_reject_block_roots(raw).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("{ENV_REJECT_BLOCK_ROOTS}: {e}"))
+        io::Error::new(io::ErrorKind::InvalidInput, format!("{name}: {e}"))
     })
 }
 
@@ -130,7 +185,16 @@ impl Engine {
     /// Refuse a block of a rejected branch at the door: count it, remember
     /// it (unless it is a configured root, which is remembered anyway), and
     /// drop every parked orphan that descends from it.
-    pub(super) fn refuse_rejected_block(&mut self, id: [u8; 32]) {
+    ///
+    /// Audit L1-08: the door runs before any signature work, so what it is
+    /// handed may be junk. An id joins `descendants` (the FIFO that keeps
+    /// real descendants' children cheap to refuse) only when its parent is
+    /// itself authenticated and its proposer signature verifies, drawing on
+    /// the same per-source block allowance as the rest of the door; anything
+    /// else goes to the separate `unauthenticated` FIFO, where it can only
+    /// displace other unauthenticated entries. The refusal itself does not
+    /// depend on the verdict: the block is refused either way.
+    pub(super) fn refuse_rejected_block(&mut self, env: &BlockEnvelope, id: [u8; 32], src: Source) {
         self.rejected_roots.refused = self.rejected_roots.refused.saturating_add(1);
         crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
             "REJECT_BLOCK_ROOT: refused {} (an operator-rejected block or a descendant of one); \
@@ -138,14 +202,53 @@ impl Engine {
             crate::codec::hex8(&id),
             self.rejected_roots.refused,
         ));
-        let roots = &mut self.rejected_roots;
-        if !roots.configured.contains(&id) && !roots.descendants.contains(&id) {
-            while roots.descendants.len() >= MAX_PARKED_REFUSED_FINALITY {
-                roots.descendants.pop_front();
+        if !self.rejected_roots.authenticated(&id) {
+            let verified = self.rejected_roots.authenticated(&env.header.parent)
+                && self.rejected_descendant_signature_verifies(env, src);
+            let roots = &mut self.rejected_roots;
+            if verified {
+                roots.unauthenticated.retain(|seen| *seen != id);
+                remember(&mut roots.descendants, id);
+            } else if !roots.unauthenticated.contains(&id) {
+                remember(&mut roots.unauthenticated, id);
             }
-            roots.descendants.push_back(id);
         }
         self.drop_orphan_descendants(BTreeSet::from([id]));
+    }
+
+    /// The door's own proposer-signature check, for a block it refuses
+    /// (audit L1-08): the same authority state, rule and budgeted lane as
+    /// `ingest_one_deferred`. Any doubt (unknown identity, a spent allowance,
+    /// a branch-dependent key) is `false`, which only costs work later.
+    fn rejected_descendant_signature_verifies(&self, env: &BlockEnvelope, src: Source) -> bool {
+        let epoch = epoch_of(env.header.slot);
+        let judged_state = self.proposer_authority_state(&env.header.parent);
+        let root = env.header.proposal_signing_root();
+        if src.bounded_by_wall_clock() {
+            let (lane, lane_cap, lane_source_cap) = src.block_verification_allowance();
+            let verifier = self
+                .gossip_verifier
+                .budgeted_lane_for_source(self.wall_slot(), lane, lane_cap, src.verification_source(), lane_source_cap)
+                .with_failure_allowance(BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
+            let verified = bloch_pos_committee::kes::verify_validator(
+                &*judged_state,
+                &bloch_pos_committee::PolicyVerifier::consensus(&verifier, epoch),
+                env.header.proposer_index,
+                epoch,
+                &root,
+                &env.proposer_sig,
+            ) == Some(true);
+            verified && !verifier.limited()
+        } else {
+            bloch_pos_committee::kes::verify_validator(
+                &*judged_state,
+                &bloch_pos_committee::PolicyVerifier::consensus(&self.gossip_verifier, epoch),
+                env.header.proposer_index,
+                epoch,
+                &root,
+                &env.proposer_sig,
+            ) == Some(true)
+        }
     }
 
     /// Boot, before the state cache is restored and before replay: if the
@@ -160,10 +263,12 @@ impl Engine {
     /// log prefix and is refused by its own checks, so the restore falls back
     /// to an older generation or to replay.
     ///
-    /// A truncation below the stored finality latch is refused unless the
-    /// operator's `--allow-finality-rewind` override is set; with it, the
-    /// latch reconciliation after replay discards the record, loudly, as it
-    /// does for any log that ends below it.
+    /// A truncation below the stored finality latch, or without a readable
+    /// latch record, is refused unless the operator's `--allow-finality-rewind`
+    /// override is set and the rejected root is confirmed in
+    /// `BLOCH_REJECT_ROOT_FINALITY_REWIND`; with both, the latch
+    /// reconciliation after replay discards the record, loudly, as it does
+    /// for any log that ends below it.
     pub(super) fn truncate_rejected_log(&mut self, logged: &mut Vec<BlockEnvelope>) -> io::Result<()> {
         if self.rejected_roots.configured.is_empty() {
             return Ok(());
@@ -178,12 +283,36 @@ impl Engine {
         // `logged[i]` sits at canonical height `i + 1`; keeping `first`
         // frames leaves the parent, at height `first`, as the head.
         let kept_height = first as u64;
+        // Audit L1-15: the release-baked checkpoint is finalized canonical
+        // history this binary trusts. A rejected root at or below it on the
+        // logged chain would truncate the node to below its own anchor and
+        // leave it stuck in silence; that is an operator error, refused with
+        // no override.
+        let anchor = crate::ws_boot::compiled_release_anchor().ok().flatten().map(|cp| cp.block_root);
+        if let Some(anchor) = rejected_at_or_below_anchor(logged, first, anchor) {
+            return Err(crate::ws_boot::boot_refused(format!(
+                "--reject-block-root {} names a block at or below this release's weak-subjectivity \
+                 anchor {} (it is the anchor or one of its ancestors on the logged chain). The \
+                 anchor is finalized history this binary trusts; refusing to start. Remove the \
+                 rejected root.",
+                crate::codec::hex32(&rejected),
+                crate::codec::hex32(&anchor),
+            )));
+        }
+        // Audit L1-10: crossing finality here needs the generic override AND
+        // the rejected root named again in its own variable.
+        let consent = self.finality_rewind_override && self.rejected_roots.rewind_confirmed.contains(&rejected);
+        let consent_hint = format!(
+            "If that is intended, restart with --allow-finality-rewind \
+             (BLOCH_ALLOW_FINALITY_REWIND=1) AND {ENV_REJECT_ROOT_FINALITY_REWIND}={}",
+            crate::codec::hex32(&rejected)
+        );
         let stored = match self.stored_finalized_latch() {
             Ok(stored) => stored,
-            Err(e) if self.finality_rewind_override => {
+            Err(e) if consent => {
                 eprintln!(
                     "REJECT_BLOCK_ROOT: the finality latch record cannot be read ({e}); \
-                     truncating anyway because --allow-finality-rewind is set"
+                     truncating anyway because the operator confirmed this root's rewind"
                 );
                 None
             }
@@ -192,34 +321,54 @@ impl Engine {
                     "the block log contains the rejected block {} at height {}, but the finality \
                      latch record cannot be read ({e}), so this node cannot tell whether \
                      truncating to height {kept_height} would cut below a checkpoint it \
-                     finalized. Restore or remove the record, or start with \
-                     --allow-finality-rewind.",
+                     finalized. Restore the record, or confirm the cut. {consent_hint}.",
                     crate::codec::hex32(&rejected),
                     kept_height.saturating_add(1),
                 )));
             }
         };
-        if let Some(latch) = stored.filter(|latch| kept_height < latch.height) {
-            if !self.finality_rewind_override {
+        match stored {
+            // Audit L1-09: no record is not "no finality". The record may
+            // have been deleted (an earlier boot error suggests it) or its
+            // write may have failed; the log itself may finalize far above
+            // the cut. Without the record the cut cannot be checked, so it
+            // needs the same explicit consent as a cut below it.
+            None if !consent => {
                 return Err(crate::ws_boot::boot_refused(format!(
-                    "the block log contains the rejected block {} at height {}, and truncating \
-                     the chain to its parent (height {kept_height}) would cut below the finalized \
-                     checkpoint {} at height {} this node recorded. Refusing to start. If that is \
-                     intended, restart with --allow-finality-rewind \
-                     (BLOCH_ALLOW_FINALITY_REWIND=1).",
+                    "the block log contains the rejected block {} at height {}, but there is no \
+                     finality latch record, so this node cannot tell whether truncating to height \
+                     {kept_height} would cut below a checkpoint it finalized. Refusing to start. \
+                     {consent_hint}.",
                     crate::codec::hex32(&rejected),
                     kept_height.saturating_add(1),
-                    crate::codec::hex8(&latch.root),
-                    latch.height,
                 )));
             }
-            eprintln!(
-                "REJECT_BLOCK_ROOT: BLOCH_ALLOW_FINALITY_REWIND is set — truncating the block log \
-                 to height {kept_height}, BELOW the finalized checkpoint {} at height {}. This must \
-                 only happen with a human operator's deliberate, informed consent.",
-                crate::codec::hex8(&latch.root),
-                latch.height,
-            );
+            None => eprintln!(
+                "REJECT_BLOCK_ROOT: no finality latch record; truncating the block log to height \
+                 {kept_height} on the operator's explicit confirmation of {}",
+                crate::codec::hex32(&rejected),
+            ),
+            Some(latch) if kept_height < latch.height => {
+                if !consent {
+                    return Err(crate::ws_boot::boot_refused(format!(
+                        "the block log contains the rejected block {} at height {}, and truncating \
+                         the chain to its parent (height {kept_height}) would cut below the finalized \
+                         checkpoint {} at height {} this node recorded. Refusing to start. {consent_hint}.",
+                        crate::codec::hex32(&rejected),
+                        kept_height.saturating_add(1),
+                        crate::codec::hex8(&latch.root),
+                        latch.height,
+                    )));
+                }
+                eprintln!(
+                    "REJECT_BLOCK_ROOT: the operator confirmed it — truncating the block log to \
+                     height {kept_height}, BELOW the finalized checkpoint {} at height {}. This must \
+                     only happen with a human operator's deliberate, informed consent.",
+                    crate::codec::hex8(&latch.root),
+                    latch.height,
+                );
+            }
+            Some(_) => {}
         }
         let expected_last = first
             .checked_sub(1)
@@ -443,20 +592,67 @@ mod tests {
         assert!(crate::metrics::NODE.render().contains("# TYPE bloch_pos_rejected_blocks_total counter"));
     }
 
-    /// The remembered descendants are bounded like the finality refusals.
+    /// The remembered refusals are bounded like the finality refusals, and a
+    /// configured root is never evicted.
     #[test]
     fn remembered_descendants_are_bounded() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        reject(&mut engine, [0xAA; 32]);
-        for i in 0..=MAX_PARKED_REFUSED_FINALITY as u32 {
-            let mut id = [0u8; 32];
-            id[..4].copy_from_slice(&i.to_be_bytes());
-            engine.refuse_rejected_block(id);
+        let _clock = validator_lifecycle::clock_at(32);
+        let Fork { mut engine, _dir, fork_point: _, a: _, b } = fork();
+        let root = *b[0].block_id().as_bytes();
+        reject(&mut engine, root);
+        let mut first_junk = None;
+        for i in 0..=MAX_PARKED_REFUSED_FINALITY as u64 {
+            let mut junk = b[1].clone();
+            junk.header.slot = 1_000 + i;
+            junk.proposer_sig.fill(0);
+            let id = *junk.block_id().as_bytes();
+            first_junk.get_or_insert(id);
+            engine.refuse_rejected_block(&junk, id, Source::Gossip(None));
         }
-        assert_eq!(engine.rejected_roots.descendants.len(), MAX_PARKED_REFUSED_FINALITY);
+        assert_eq!(engine.rejected_roots.unauthenticated.len(), MAX_PARKED_REFUSED_FINALITY);
         assert_eq!(engine.rejected_roots.refused, MAX_PARKED_REFUSED_FINALITY as u64 + 1);
-        assert!(!engine.rejected_roots.contains(&[0u8; 32]), "the oldest is evicted first");
-        assert!(engine.rejected_roots.contains(&[0xAA; 32]), "a configured root is never evicted");
+        assert!(!engine.rejected_roots.contains(&first_junk.unwrap()), "the oldest is evicted first");
+        assert!(engine.rejected_roots.contains(&root), "a configured root is never evicted");
+    }
+
+    /// Audit L1-08: unsigned headers naming the rejected root are refused,
+    /// but cannot evict a real, verified descendant from the FIFO that keeps
+    /// its own children cheap to refuse; and a child of junk is never
+    /// counted as authenticated.
+    #[test]
+    fn unauthenticated_junk_cannot_evict_a_verified_descendant() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let Fork { mut engine, _dir, fork_point: _, a: _, b } = fork();
+        let root = *b[0].block_id().as_bytes();
+        let child = *b[1].block_id().as_bytes();
+        reject(&mut engine, root);
+        assert_eq!(engine.ingest_judged(b[1].clone()), Verdict::Ignore);
+        assert!(engine.rejected_roots.descendants.contains(&child), "a real child is remembered as verified");
+
+        for i in 0..(2 * MAX_PARKED_REFUSED_FINALITY as u64) {
+            let mut junk = b[1].clone();
+            junk.header.slot = 2_000 + i;
+            junk.proposer_sig.fill(0);
+            assert_eq!(engine.ingest_from_judged(junk, Source::Gossip(Some([0xBA; 32]))), Verdict::Ignore);
+        }
+        assert!(engine.rejected_roots.descendants.contains(&child), "junk never evicts it");
+        assert_eq!(engine.rejected_roots.descendants.len(), 1);
+        assert_eq!(engine.rejected_roots.unauthenticated.len(), MAX_PARKED_REFUSED_FINALITY);
+
+        // The grandchild is still refused on its remembered parent, and is
+        // itself verified; a header hanging from junk is refused but stays
+        // unauthenticated even with a real signature's bytes.
+        let honest = Source::Gossip(Some([0x60; 32]));
+        assert_eq!(engine.ingest_from_judged(b[2].clone(), honest), Verdict::Ignore);
+        assert!(engine.rejected_roots.descendants.contains(b[2].block_id().as_bytes()));
+        let junk_parent = *engine.rejected_roots.unauthenticated.back().unwrap();
+        let mut under_junk = b[2].clone();
+        under_junk.header.parent = junk_parent;
+        let under_junk_id = *under_junk.block_id().as_bytes();
+        assert_eq!(engine.ingest_judged(under_junk), Verdict::Ignore);
+        assert!(!engine.rejected_roots.descendants.contains(&under_junk_id));
+        assert!(engine.rejected_roots.unauthenticated.contains(&under_junk_id));
+        assert!(!engine.blocks.contains_key(&under_junk_id));
     }
 
     /// What a restart leaves of the engine before boot reads its log.
@@ -501,6 +697,10 @@ mod tests {
         let _clock = validator_lifecycle::clock_at(32);
         let (Fork { mut engine, _dir, fork_point, a, b }, mut logged) = on_branch_b();
         engine.write_local_cache().expect("a cache generation on branch B");
+        // The record says the fork point (height 1) is final: the cut to it
+        // is checkable and not below it.
+        engine.finalized_latch = Some((1, fork_point));
+        engine.persist_finalized_latch();
         restart(&mut engine);
         reject(&mut engine, *b[0].block_id().as_bytes());
 
@@ -561,9 +761,24 @@ mod tests {
         assert_eq!(above.len(), 3);
         engine.store.rewrite(&logged).expect("restore the full log for the override case");
 
-        // The override allows the cut; the latch reconciliation then
-        // discards the record, as for any log that ends below it.
+        // Audit L1-10: the generic override alone no longer cuts finalized
+        // history, nor does the confirmation alone, nor a confirmation of a
+        // different root; both together, naming this root, do.
         reject(&mut engine, *b[0].block_id().as_bytes());
+        engine.finality_rewind_override = true;
+        let mut attempt = logged.clone();
+        let err = engine.truncate_rejected_log(&mut attempt).expect_err("the override alone is not consent");
+        assert!(err.to_string().contains(ENV_REJECT_ROOT_FINALITY_REWIND), "{err}");
+        assert_eq!(attempt.len(), logged.len());
+        engine.rejected_roots.rewind_confirmed = BTreeSet::from([*b[1].block_id().as_bytes()]);
+        assert!(engine.truncate_rejected_log(&mut logged.clone()).is_err(), "another root's confirmation");
+        engine.finality_rewind_override = false;
+        engine.rejected_roots.rewind_confirmed = BTreeSet::from([*b[0].block_id().as_bytes()]);
+        assert!(engine.truncate_rejected_log(&mut logged.clone()).is_err(), "the confirmation alone");
+        assert_eq!(engine.store.read_all().expect("log").len(), logged.len(), "the log is still untouched");
+
+        // Both: the cut goes ahead; the latch reconciliation then discards
+        // the record, as for any log that ends below it.
         engine.finality_rewind_override = true;
         let mut allowed = logged.clone();
         engine.truncate_rejected_log(&mut allowed).expect("the override allows it");
@@ -573,6 +788,46 @@ mod tests {
         }
         engine.reconcile_finalized_latch().expect("the override discards the record");
         assert_eq!(engine.stored_finalized_latch().expect("readable"), None);
+    }
+
+    /// Audit L1-15: a rejected root that is the release anchor or one of its
+    /// logged ancestors is detected; one above it is not.
+    #[test]
+    fn a_rejected_root_at_or_below_the_release_anchor_is_detected() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let (Fork { engine: _, _dir, fork_point: _, a: _, b }, logged) = on_branch_b();
+        let at = |id: &BlockEnvelope| logged.iter().position(|env| env.block_id() == id.block_id()).unwrap();
+        let anchor = *b[1].block_id().as_bytes();
+        assert_eq!(rejected_at_or_below_anchor(&logged, at(&b[0]), Some(anchor)), Some(anchor), "an ancestor");
+        assert_eq!(rejected_at_or_below_anchor(&logged, at(&b[1]), Some(anchor)), Some(anchor), "the anchor itself");
+        assert_eq!(rejected_at_or_below_anchor(&logged, at(&b[2]), Some(anchor)), None, "above it");
+        assert_eq!(rejected_at_or_below_anchor(&logged, at(&b[0]), None), None, "no anchor baked");
+        assert_eq!(rejected_at_or_below_anchor(&logged, at(&b[0]), Some([0x5A; 32])), None, "an anchor not on this log");
+    }
+
+    /// Audit L1-09: with no finality latch record the cut cannot be checked
+    /// against finality, so it is refused like a cut below it, and allowed
+    /// only with the same explicit consent.
+    #[test]
+    fn truncation_without_a_latch_record_needs_explicit_consent() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let (Fork { mut engine, _dir, fork_point, a: _, b }, logged) = on_branch_b();
+        restart(&mut engine);
+        assert_eq!(engine.stored_finalized_latch().expect("readable"), None, "fixture: no record");
+        reject(&mut engine, *b[0].block_id().as_bytes());
+
+        let mut attempt = logged.clone();
+        let err = engine.truncate_rejected_log(&mut attempt).expect_err("an unknown latch is not 'no finality'");
+        assert!(crate::ws_boot::is_non_retryable(&err), "{err}");
+        assert!(err.to_string().contains("no finality latch record"), "{err}");
+        assert_eq!(attempt.len(), logged.len());
+        assert_eq!(engine.store.read_all().expect("log").len(), logged.len(), "the log is untouched");
+
+        engine.finality_rewind_override = true;
+        engine.rejected_roots.rewind_confirmed = BTreeSet::from([*b[0].block_id().as_bytes()]);
+        let mut allowed = logged.clone();
+        engine.truncate_rejected_log(&mut allowed).expect("explicit consent");
+        assert_eq!(ids(&allowed), vec![fork_point]);
     }
 
     /// (e) The node neither attests to nor proposes on a rejected block,

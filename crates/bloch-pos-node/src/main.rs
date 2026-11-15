@@ -1047,6 +1047,12 @@ fn reject_block_root_args(args: &[String]) -> Result<Vec<String>, String> {
             let value = rest.next().ok_or("--reject-block-root needs a 64-hex-digit block id")?;
             engine::parse_reject_block_root(value)?;
             roots.push(value.clone());
+        } else if let Some(value) = arg.strip_prefix("--reject-block-root=") {
+            // Audit L1-11: the `=` form used to be skipped as an unknown
+            // `--flag=value` token, so the node booted with no root armed.
+            // A safety control operated during a split is never ignored.
+            engine::parse_reject_block_root(value)?;
+            roots.push(value.to_string());
         } else if arg.starts_with("--") && !RUN_SWITCHES.contains(&arg.as_str()) && !arg.contains('=') {
             rest.next();
         }
@@ -2483,6 +2489,27 @@ mod reject_block_root_flag_tests {
         }
         let short = "ab".repeat(31);
         assert!(super::reject_block_root_args(&args(&["run", "--reject-block-root", &short])).is_err());
+    }
+
+    /// Audit L1-11: `--reject-block-root=<hex>` arms the root (it used to be
+    /// skipped in silence), strictly, and mixes with the spaced form.
+    #[test]
+    fn the_equals_form_is_honoured_and_strict() {
+        let a = "ab".repeat(32);
+        let b = "CD".repeat(32);
+        assert_eq!(
+            super::reject_block_root_args(&args(&["run", &format!("--reject-block-root={a}")])).unwrap(),
+            vec![a.clone()],
+        );
+        assert_eq!(
+            super::reject_block_root_args(&args(&[
+                "run", &format!("--reject-block-root={a}"), "--reject-block-root", &b,
+            ])).unwrap(),
+            vec![a.clone(), b.clone()],
+        );
+        for bad in ["--reject-block-root=", "--reject-block-root=zz", "--reject-block-root=0xab"] {
+            assert!(super::reject_block_root_args(&args(&["run", bad])).is_err(), "{bad}");
+        }
     }
 }
 
