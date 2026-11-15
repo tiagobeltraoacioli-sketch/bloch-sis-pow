@@ -769,6 +769,15 @@ const ATTESTATION_FREE_ROLL_EPOCHS: u64 = 2;
 /// a block in the first epoch the bind governs (two empty epochs between).
 const DOOR_FREE_ROLL_EPOCHS: u64 = bloch_pos_committee::params::KES_BIND_DELAY_EPOCHS + 1;
 
+/// Epochs of short (at most [`DOOR_FREE_ROLL_EPOCHS`]) uncached rolls the
+/// block door runs per wall slot (review RC2-01). Without it, a signed header
+/// for the head's epoch + 3 cost three `process_epoch` calls every time on a
+/// lagging head whose memo held higher epochs: the memo evicts its lowest
+/// epochs first, so the short roll's entries left it at once. Four headers'
+/// worth; a header past it is held and offered again next slot, like one
+/// past the long-roll allowance.
+const DOOR_SHORT_ROLL_EPOCHS_PER_SLOT: u64 = 4 * DOOR_FREE_ROLL_EPOCHS;
+
 /// What the KES half of the block door decided before the proposer check
 /// (audit L1-01; reviews RC-01 and RC-02). See `Engine::door_kes_state`.
 enum DoorKes {
@@ -782,6 +791,11 @@ enum DoorKes {
     /// or no state transition can accept the block (`EpochAdvanceTooLarge`
     /// from its parent, or a parent the transition refuses).
     Drop,
+    /// `Drop`, because the stored parent failed the transition on its own
+    /// parent's exact post-state (review RC2-07): remembered like a side
+    /// block the side-branch fold saw fail, so a re-offered child does not
+    /// run the parent through the transition again.
+    DropFailedParent([u8; 32]),
 }
 
 /// A verifier that accepts every KES leaf signature and nothing else. Run
@@ -1193,10 +1207,21 @@ struct ReorgAnchors {
 struct SideValidation {
     /// Post-state of the block the last fold stopped at, keyed by block id
     /// like [`Engine::recent_states`]: a canonical block on the way to a
-    /// fork point, or a side-branch block that passed the transition. The
-    /// ONE state this feature retains; dropped when no side branch is left
-    /// to validate.
+    /// fork point, or a side-branch block that passed the transition. One of
+    /// the two states this feature retains; dropped when no side branch is
+    /// left to validate.
     cursor: Option<([u8; 32], Arc<CommittedState>)>,
+    /// Post-state of the last side-branch block this fold validated while
+    /// blocks parked for their proposer's authority were waiting on it (as
+    /// their parent, or their parent's parent), keyed by block id
+    /// (review RC2-03). Those blocks were judged on `fallback` because no
+    /// exact parent state was held, and nothing else re-judges them while
+    /// the head does not move; the fold queues them again and keeps this
+    /// state so the door finds it ([`Engine::exact_parent_state`]) even
+    /// after the cursor has moved on or been dropped. The other retained
+    /// state; replaced by the next such block, dropped once the block is no
+    /// longer stored beside the chain.
+    waited: Option<([u8; 32], Arc<CommittedState>)>,
     /// Wall slot the three counters below belong to.
     slot: u64,
     /// Block applications spent in `slot`.
@@ -1309,6 +1334,12 @@ const _: () = assert!(ORPHAN_BYTES_MAX >= crate::p2p::MAX_SYNC_FRAME as usize);
 /// can execute a transition, rebuild fork choice, and unlock more work, so it
 /// receives the same one-block slice as ordinary admitted blocks.
 const ORPHAN_PROMOTIONS_PER_TURN: usize = 1;
+
+/// Parked blocks the side-branch fold queues for the door again per block it
+/// validates (review RC2-03, `Engine::rejudge_parked_on`). Honest traffic
+/// has one or two children per block; the bound only stops one validated
+/// block from moving the whole pool.
+const SIDE_PARKED_REJUDGE_PER_BLOCK: usize = 8;
 
 /// Longest back-off between two rewinds to a floor that yielded nothing, as
 /// a power of two of the sync cadence (two slots): 2^5 cadences is 64 slots,
@@ -1776,8 +1807,8 @@ mod state_cell {
     /// without evidence.
     const MEMO_CAP: usize = 4;
 
-    /// Rolled parent states the block door keeps for parents that are not
-    /// the head (review RC-02). Each is a whole `CommittedState`, but it
+    /// Rolled parent states the block door keeps (reviews RC-02, RC2-01).
+    /// Each is a whole `CommittedState`, but it
     /// shares its eUTXO map with the post-state it was rolled from, so the
     /// cost is the per-epoch fields plus, for a side-branch parent, that
     /// parent's own post-state. Two covers the case it exists for (the two
@@ -1835,6 +1866,9 @@ mod state_cell {
         long_roll_slot: std::cell::Cell<Option<u64>>,
         /// The same allowance for the block door (review RC-01).
         door_long_roll_slot: std::cell::Cell<Option<u64>>,
+        /// `(wall slot, epochs)`: the block door's short rolls spent in that
+        /// slot (review RC2-01). See `try_spend_door_short_roll`.
+        door_short_rolls: std::cell::Cell<(Option<u64>, u64)>,
         /// See [`StateCell::door_cached`].
         door_rolls: RefCell<Vec<DoorEntry>>,
         /// See [`StateCell::rolled_aside`]: `(generation, epoch, state)`.
@@ -1853,6 +1887,7 @@ mod state_cell {
                 memo: RefCell::new(Vec::new()),
                 long_roll_slot: std::cell::Cell::new(None),
                 door_long_roll_slot: std::cell::Cell::new(None),
+                door_short_rolls: std::cell::Cell::new((None, 0)),
                 door_rolls: RefCell::new(Vec::new()),
                 aside: RefCell::new(None),
                 #[cfg(test)]
@@ -2077,8 +2112,27 @@ mod state_cell {
             true
         }
 
+        /// Spend `epochs` of the block door's short-roll allowance of
+        /// `wall_slot` (review RC2-01): rolls of at most
+        /// [`super::DOOR_FREE_ROLL_EPOCHS`] epochs that need no long roll,
+        /// together at most [`super::DOOR_SHORT_ROLL_EPOCHS_PER_SLOT`] epochs
+        /// per wall slot.
+        /// `false` (nothing spent) when the request does not fit. Node-local
+        /// work scheduling; it never changes what any roll returns.
+        pub(super) fn try_spend_door_short_roll(&self, wall_slot: u64, epochs: u64) -> bool {
+            let (slot, spent) = self.door_short_rolls.get();
+            let spent = if slot == Some(wall_slot) { spent } else { 0 };
+            let total = spent.saturating_add(epochs);
+            if total > super::DOOR_SHORT_ROLL_EPOCHS_PER_SLOT {
+                return false;
+            }
+            self.door_short_rolls.set((Some(wall_slot), total));
+            true
+        }
+
         /// A parent post-state rolled to `epoch` that the block door already
-        /// computed for a parent that is not the head (review RC-02).
+        /// computed (reviews RC-02, RC2-01; the head's rolls are kept here
+        /// too, beside the memo).
         ///
         /// Keyed by the parent's block id and the epoch, and never
         /// invalidated: a block's post-state is a pure function of the block
@@ -2110,9 +2164,11 @@ mod state_cell {
         /// RC-04): for observers (the Sentinel's status) whose reads must not
         /// change which rolls the attestation door finds already paid for. A
         /// memo hit is read, never added to; anything else is rolled from the
-        /// furthest memoized epoch below `epoch` (or the head) and kept in a
-        /// single private slot keyed like the memo, dropped by every write of
-        /// the state.
+        /// furthest memoized epoch below `epoch`, the previous aside roll, or
+        /// the head, whichever is furthest along, and kept in a single
+        /// private slot keyed like the memo, dropped by every write of the
+        /// state. So the epochs rolled aside for one state never exceed the
+        /// furthest epoch asked for (review RC2-06).
         pub(super) fn rolled_aside<F>(&self, epoch: u64, roll: F) -> Arc<CommittedState>
         where
             F: Fn(&CommittedState) -> CommittedState,
@@ -2137,6 +2193,13 @@ mod state_cell {
             if let Some((generation, at, rolled)) = self.aside.borrow().as_ref() {
                 if *generation == self.generation && *at == epoch {
                     return Arc::clone(rolled);
+                }
+                // Review RC2-06: continue from the previous aside roll when it
+                // is further along than the memo, so a wall epoch that moves on
+                // costs one epoch, not a roll from the memo or the head again.
+                if *generation == self.generation && *at > cur_epoch && *at < epoch {
+                    cur_epoch = *at;
+                    cur = Arc::clone(rolled);
                 }
             }
             while cur_epoch < epoch {
@@ -4487,7 +4550,8 @@ impl Engine {
 
     /// The post-state of `parent` when this node holds it without doing any
     /// work: the head, a reorg-ring entry, or the side-branch validator's
-    /// cursor (all keyed by block id, so none can describe another block).
+    /// cursor or waited-on state (all keyed by block id, so none can
+    /// describe another block).
     fn exact_parent_state(&self, parent: &[u8; 32]) -> Option<Arc<CommittedState>> {
         if parent == self.head_id().as_bytes() {
             return Some(self.state.arc());
@@ -4497,21 +4561,21 @@ impl Engine {
             .find(|(id, _)| id == parent)
             .map(|(_, state)| Arc::clone(state))
             .or_else(|| {
-                self.reorg_anchors
-                    .side
-                    .cursor
-                    .as_ref()
-                    .filter(|(id, _)| id == parent)
+                let side = &self.reorg_anchors.side;
+                side.cursor
+                    .iter()
+                    .chain(side.waited.iter())
+                    .find(|(id, _)| id == parent)
                     .map(|(_, state)| Arc::clone(state))
             })
     }
 
     /// `parent`'s post-state rolled into `epoch`, if this node already holds
-    /// it: for the head, a memo hit (read, not written); for any other
-    /// parent, the door's own cache.
+    /// it: for the head, a memo hit (read, not written); for any parent,
+    /// the head included (review RC2-01), the door's own cache.
     fn door_rolled_cached(&self, parent: &[u8; 32], parent_is_head: bool, epoch: u64) -> Option<Arc<CommittedState>> {
-        if parent_is_head {
-            return (self.state.roll_distance(epoch) == 0).then(|| self.rolled_to(epoch));
+        if parent_is_head && self.state.roll_distance(epoch) == 0 {
+            return Some(self.rolled_to(epoch));
         }
         self.state.door_cached(parent, epoch)
     }
@@ -4559,12 +4623,14 @@ impl Engine {
     ///   `906336fd` plus at most one leaf check;
     /// - a parent more than `MAX_EPOCH_ADVANCE` epochs behind the block is
     ///   never rolled: every transition refuses it (`EpochAdvanceTooLarge`);
-    /// - rolls of at most [`DOOR_FREE_ROLL_EPOCHS`] uncached epochs are free;
+    /// - rolls of at most [`DOOR_FREE_ROLL_EPOCHS`] uncached epochs share
+    ///   [`DOOR_SHORT_ROLL_EPOCHS_PER_SLOT`] epochs per wall slot (RC2-01);
     ///   anything longer, and deriving a side-branch parent's post-state
     ///   (one block through the transition), takes the door's one long roll
-    ///   per wall slot, or the block is held and offered again next slot;
-    /// - every roll is cached by (parent id, epoch): for the head in the
-    ///   memo, for other parents in [`StateCell::door_cached`].
+    ///   per wall slot; past either allowance the block is held and offered
+    ///   again next slot;
+    /// - every roll is cached by (parent id, epoch) in
+    ///   [`StateCell::door_cached`], and for the head also in the memo.
     ///
     /// `Source::Local` (this node's own proposal) skips the probe and the
     /// allowance, and a block re-offered with a proof of a verification this
@@ -4675,6 +4741,10 @@ impl Engine {
                 let Some(parent_env) = self.blocks.get(&parent) else {
                     return unchanged(fallback);
                 };
+                if self.reorg_anchors.side.failed_index.contains(&parent) {
+                    // It failed the transition here before: so would this block.
+                    return DoorKes::Drop;
+                }
                 let Some(grandparent) = self.exact_parent_state(&parent_env.header.parent) else {
                     // Deeper than one block off a held state: as before.
                     return unchanged(fallback);
@@ -4689,7 +4759,12 @@ impl Engine {
                 match self.transition_on(&grandparent, parent_env) {
                     Ok(post) => Arc::new(post),
                     // The parent can never apply, so neither can this block.
-                    Err(_) => return DoorKes::Drop,
+                    // A hollow (body released) or canonical parent failing
+                    // here is a local fault, not a verdict: not remembered.
+                    Err(_) if self.blocks.is_hollow(&parent) || self.canonical.contains(&parent) => {
+                        return DoorKes::Drop;
+                    }
+                    Err(_) => return DoorKes::DropFailedParent(parent),
                 }
             }
         };
@@ -4702,13 +4777,14 @@ impl Engine {
     /// Roll `exact`, the post-state of `parent`, into `epoch` for the block
     /// door, within the door's bounds (review RC-01): never past
     /// `MAX_EPOCH_ADVANCE` (`Drop`: the transition refuses such a block from
-    /// this parent on every node), free up to [`DOOR_FREE_ROLL_EPOCHS`]
-    /// uncached epochs, otherwise only on the wall slot's one door long roll
-    /// (`Defer` once it is spent) unless `local` (this node's own block) or
-    /// `spent` (this header already took it). The result is what the
+    /// this parent on every node); up to [`DOOR_FREE_ROLL_EPOCHS`] uncached
+    /// epochs on the wall slot's short-roll allowance (RC2-01), otherwise
+    /// only on the wall slot's one door long roll (`Defer` once the one it
+    /// needs is spent) unless `local` (this node's own block) or `spent`
+    /// (this header already took the long roll). The result is what the
     /// transition rolls: the memo's `rolled_to` for the head, the same
-    /// `process_epoch` fold from `exact` (and cached by parent id and epoch)
-    /// for any other parent.
+    /// `process_epoch` fold from `exact` for any other parent; both are
+    /// cached by parent id and epoch.
     fn door_roll(
         &self,
         parent: [u8; 32],
@@ -4726,12 +4802,28 @@ impl Engine {
             return Ok(hit);
         }
         let distance = if parent_is_head { self.state.roll_distance(epoch) } else { epoch.saturating_sub(exact_epoch) };
-        if distance > DOOR_FREE_ROLL_EPOCHS && !spent && !local && !self.state.try_spend_door_long_roll(self.wall_slot()) {
-            return Err(DoorKes::Defer);
+        if !spent && !local && distance > 0 {
+            // A long roll takes the slot's one long roll; a short one a share
+            // of the slot's short-roll epochs (review RC2-01).
+            let granted = if distance > DOOR_FREE_ROLL_EPOCHS {
+                self.state.try_spend_door_long_roll(self.wall_slot())
+            } else {
+                self.state.try_spend_door_short_roll(self.wall_slot(), distance)
+            };
+            if !granted {
+                return Err(DoorKes::Defer);
+            }
         }
         self.state.note_door_roll(distance);
         if parent_is_head {
-            return Ok(self.rolled_to(epoch));
+            // Also in the door's cache, keyed by the head's block id (its
+            // post-state is a pure function of the id, so the entry cannot go
+            // stale): the memo evicts its lowest epochs first, and a short
+            // roll of a head whose memo holds higher epochs would otherwise
+            // be forgotten at once and paid again by the next header (RC2-01).
+            let rolled = self.rolled_to(epoch);
+            self.state.door_remember(parent, epoch, Arc::clone(&rolled));
+            return Ok(rolled);
         }
         let mut st = exact;
         let mut at = exact_epoch;
@@ -5096,6 +5188,10 @@ impl Engine {
                     return (Verdict::Ignore, None);
                 }
                 DoorKes::Drop => return (Verdict::Ignore, None),
+                DoorKes::DropFailedParent(parent) => {
+                    self.reorg_anchors.side.remember_failed(parent);
+                    return (Verdict::Ignore, None);
+                }
             };
         let authority = bloch_pos_committee::kes::authority_fingerprint(
             &*judged_state,
@@ -7746,6 +7842,16 @@ impl Engine {
     /// through that which branch it follows. No block it refuses is one the
     /// consensus rules accept, because the refusal IS the transition's.
     fn validate_side_branch_turn(&mut self, wall_slot: u64) -> bool {
+        if self
+            .reorg_anchors
+            .side
+            .waited
+            .as_ref()
+            .is_some_and(|(id, _)| !self.blocks.contains_key(id) || self.canonical.contains(id))
+        {
+            // Pruned, or adopted (the ring holds canonical post-states).
+            self.reorg_anchors.side.waited = None;
+        }
         if !self.live {
             return false;
         }
@@ -7891,6 +7997,7 @@ impl Engine {
                         newly_validated |= !self.blocks.is_validated(&id);
                         self.blocks.mark_validated(&id);
                         state = Arc::new(post);
+                        self.rejudge_parked_on(id, &state);
                         stopped_at = Some(id);
                         next_side = next_side.saturating_add(1);
                     }
@@ -7926,6 +8033,64 @@ impl Engine {
             self.prune_below_finalized();
         }
         newly_validated
+    }
+
+    /// The side-branch fold just validated `validated`, whose post-state is
+    /// `post` (review RC2-03). Blocks parked for their proposer's authority
+    /// whose parent, or parent's parent, is `validated` were judged on
+    /// `fallback` (the door held no exact state for their parent) and only a
+    /// head change re-judges them (`authority_parked_due`), which a stalled
+    /// network never produces. Queue them for the door again, as a head
+    /// change would, and keep `post` where the door looks for an exact
+    /// parent state. At most [`SIDE_PARKED_REJUDGE_PER_BLOCK`] per validated
+    /// block; each one re-runs the whole door under its own allowances (the
+    /// verification lane, the per-source failure quota, the long and short
+    /// roll allowances). Integer comparisons only when nothing is parked.
+    fn rejudge_parked_on(&mut self, validated: [u8; 32], post: &Arc<CommittedState>) {
+        if self.authority_parked.judged.is_empty() {
+            return;
+        }
+        let blocks = &self.blocks;
+        let waits = |env: &BlockEnvelope| {
+            env.header.parent == validated
+                || blocks.get(&env.header.parent).is_some_and(|parent| parent.header.parent == validated)
+        };
+        let mut moved = 0usize;
+        let mut i = 0;
+        while i < self.orphans.len() && moved < SIDE_PARKED_REJUDGE_PER_BLOCK {
+            let (id, env, ..) = &self.orphans[i];
+            if self.authority_parked.judged.contains_key(id) && waits(env) {
+                let Some(parked) = self.orphans.remove(i) else { break };
+                self.orphans_admitted = self.orphans_admitted.saturating_add(1);
+                self.deferred_orphans.push_back(parked);
+                moved = moved.saturating_add(1);
+            } else {
+                i = i.saturating_add(1);
+            }
+        }
+        // Which state to keep: a block's own parent beats its grandparent
+        // (from the parent the door rolls; from the grandparent it must also
+        // run the parent through the transition, on the long roll). A
+        // grandparent is validated first, so it is replaced when the fold
+        // reaches the parent, and never replaces a parent still waited on.
+        // Anything held in either FIFO on that parent is served by it.
+        let parent_of_waiting = |of: &[u8; 32]| {
+            self.orphans
+                .iter()
+                .chain(self.deferred_orphans.iter())
+                .any(|(_, env, ..)| env.header.parent == *of)
+        };
+        let keep = parent_of_waiting(&validated)
+            || (moved > 0
+                && self
+                    .reorg_anchors
+                    .side
+                    .waited
+                    .as_ref()
+                    .is_none_or(|(held, _)| !parent_of_waiting(held)));
+        if keep {
+            self.reorg_anchors.side.waited = Some((validated, Arc::clone(post)));
+        }
     }
 
     // ── Attestation admission, through the pure crate's gossip policy ───────

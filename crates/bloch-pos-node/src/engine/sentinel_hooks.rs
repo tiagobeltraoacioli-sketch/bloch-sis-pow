@@ -11,10 +11,11 @@
 //!
 //! Nor do they write any cache an admission door reads (review RC-04): the
 //! KES status view rolls the head beside the duty memo, never into it. With
-//! the Sentinel on it does cost CPU on the consensus thread: at most one roll
-//! of `KES_VIEW_MAX_ROLL_EPOCHS` epochs per applied block while the node is
-//! live and its head lags its wall clock, and nothing when the signer has
-//! already rolled the duty state of the wall epoch.
+//! the Sentinel on it does cost CPU on the consensus thread: at most
+//! `KES_VIEW_MAX_ROLL_EPOCHS` epochs rolled per applied block in total while
+//! the node is live and its head lags its wall clock (each new wall epoch
+//! continues the previous aside roll, review RC2-06), and nothing when the
+//! signer has already rolled the duty state of the wall epoch.
 
 use super::*;
 use crate::sentinel::{self, AdvertKind, ChainSnapshot, Observation};
@@ -62,8 +63,9 @@ impl Engine {
     /// the status filled the memo the attestation door consults
     /// (`attestation_roll_admitted`), so turning the Sentinel on changed
     /// which arriving votes were judged and which were ignored. The aside
-    /// roll is cached per (state generation, epoch): at most one roll of
-    /// `KES_VIEW_MAX_ROLL_EPOCHS` per applied block, never one per slot.
+    /// roll is cached per (state generation, epoch) and a later wall epoch
+    /// continues it: at most `KES_VIEW_MAX_ROLL_EPOCHS` epochs rolled per
+    /// applied block in total, never a roll per slot.
     ///
     /// Returns the state and the epoch it stands in: `wall_epoch` when
     /// rolled, the head's epoch when the unrolled head is reported instead.

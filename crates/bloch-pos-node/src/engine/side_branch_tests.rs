@@ -466,3 +466,50 @@ fn a_failed_side_block_is_remembered_and_not_replayed_for_again() {
     assert_eq!(side.failed_index.len(), SIDE_BRANCH_FAILED_REMEMBERED);
     assert!(!side.failed_index.contains(&invalid_id), "the oldest entry was forgotten");
 }
+
+/// Review RC2-03: a block parked for its proposer's authority on a side
+/// branch tip is judged again when the fold validates that tip, although
+/// the head never moves, and the tip's exact post-state stays where the
+/// door looks for it after the cursor is dropped.
+///
+/// The door parks such a block when it holds no exact state for its parent
+/// (sibling branches of two or more blocks, the parent's own parent off the
+/// chain) and so judged it on `fallback`. Until this fix only a change of
+/// the head re-judged it (`authority_parked_due`), which a stalled network
+/// never produces: it waited until eviction and a refetch.
+#[test]
+fn a_block_parked_on_a_side_tip_is_judged_again_when_the_fold_reaches_it() {
+    let (mut engine, _dir, tip, side) = held_head_with_side_branch(2);
+    let side_tip = side[1];
+    let mut child = engine.blocks[&side_tip].clone();
+    child.header.parent = side_tip;
+    child.header.slot += 1;
+    let child_id = *child.block_id().as_bytes();
+    let parked_under = bloch_pos_committee::kes::authority_fingerprint(
+        &*engine.proposer_authority_state(&side_tip),
+        child.header.proposer_index,
+        epoch_of(child.header.slot),
+    );
+    engine.park_unjudgeable(child_id, child, Source::Gossip(Some([0x61; 32])), parked_under);
+    assert!(engine.orphans.iter().any(|(id, ..)| *id == child_id), "fixture: parked");
+    assert!(engine.exact_parent_state(&side_tip).is_none(), "fixture: no exact state of its parent");
+    assert!(engine.authority_parked_due().is_empty(), "the head-change trigger does not fire");
+
+    validate_until(&mut engine, 500, 16, &|e| side.iter().all(|id| e.blocks.is_validated(id)));
+    assert_eq!(*engine.head_id().as_bytes(), tip, "the head did not move");
+    assert!(!engine.orphans.iter().any(|(id, ..)| *id == child_id), "out of the waiting pool");
+    assert!(engine.deferred_orphans.iter().any(|(id, ..)| *id == child_id), "queued for the door again");
+    let held = engine.exact_parent_state(&side_tip).expect("the tip's exact post-state is held");
+    assert_eq!(held.state_root(), engine.blocks[&side_tip].header.state_root, "and it is the tip's own");
+
+    // Nothing left to validate: the cursor goes, the waited-on state stays.
+    engine.validate_side_branch_turn(600);
+    engine.validate_side_branch_turn(600);
+    assert!(engine.reorg_anchors.side.cursor.is_none(), "the cursor is dropped");
+    assert!(engine.exact_parent_state(&side_tip).is_some(), "the waited-on state outlives it");
+
+    // Released once the block it describes leaves the store.
+    engine.blocks.remove(&side[1]);
+    engine.validate_side_branch_turn(601);
+    assert!(engine.reorg_anchors.side.waited.is_none());
+}
