@@ -266,6 +266,29 @@ mod tests {
         );
     }
 
+    /// Audit L1-13: a commission update has the validator's mempool source,
+    /// so `MEMPOOL_MAX_PER_SOURCE` bounds one validator's variants, and the
+    /// source does not depend on the commission or the signature bytes.
+    #[test]
+    fn commission_updates_have_a_mempool_source() {
+        let update = |validator: u32, commission_bps: u128, signature: Vec<u8>| {
+            PosTransaction::ValidatorCommissionUpdate(
+                bloch_pos_committee::transition::ValidatorCommissionUpdate {
+                    network_domain: [0x11; 32],
+                    epoch: 9,
+                    validator,
+                    commission_bps,
+                    signature,
+                },
+            )
+        };
+        let a = tx_source_hash(&update(7, 100, vec![1]));
+        assert!(a.is_some());
+        assert_eq!(a, tx_source_hash(&update(7, 200, vec![2, 3])));
+        assert_eq!(a, tx_source_hash(&PosTransaction::Withdraw { validator: 7 }));
+        assert_ne!(a, tx_source_hash(&update(8, 100, vec![1])));
+    }
+
     #[test]
     fn prepared_txid_insert_matches_authority_and_preserves_variant_multiplicity() {
         use bloch_pos_committee::transition::{TransferInput, TransferOutput};

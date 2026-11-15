@@ -1570,6 +1570,13 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
             Some(Sha3_256::digest(pk).into())
         }
         PosTransaction::FundedDeposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        // Audit L1-13: these used to have no source and escaped
+        // `MEMPOOL_MAX_PER_SOURCE`. The funding key (shared with that key's
+        // deposits) and the validator index, as their lifecycle allowance.
+        PosTransaction::FundedDelegate(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::FundedUndelegate(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::FundedDelegationWithdraw(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::ValidatorCommissionUpdate(tx) => Some(validator_lifecycle_source(tx.validator)),
         PosTransaction::ExitV2 { pubkey_hash, .. } =>
             Some(lifecycle_source_hash(b"exit", pubkey_hash)),
         PosTransaction::Withdraw { validator }
