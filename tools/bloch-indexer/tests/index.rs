@@ -671,6 +671,11 @@ fn holder_ranking_is_cached_per_sync_and_matches_a_full_sort() {
     assert!(page.contains("\"returned\":256"));
     assert!(page.contains("\"total_script_hashes_with_balance\":600"));
 
+    // The startup undo/replay qualification leaves the cache built (R-17).
+    ix.verify_undo_roundtrip(&mut reader, 1).unwrap();
+    assert!(ix.holders_top_is_cached(), "startup qualification must rebuild the holders cache");
+    assert_eq!(ix.holders_top().rows, naive(&ix));
+
     // Reorg back to genesis: the cache follows the rollback.
     write_log(&p, &[]); reader.reopen().unwrap(); ix.sync(&mut reader).unwrap();
     assert!(ix.holders_top_is_cached());

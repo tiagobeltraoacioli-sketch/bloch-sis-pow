@@ -338,6 +338,9 @@ impl Index {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "undo/replay roundtrip changed indexed data"));
         }
         self.stats = stats;
+        // The rollback/replay above invalidated the holders cache; rebuild it
+        // here so the first /holders requests after a restart are not O(n).
+        self.refresh_holders_top();
         eprintln!("verified rollback/replay of {depth} archival blocks; all ledger tables unchanged");
         Ok(())
     }
