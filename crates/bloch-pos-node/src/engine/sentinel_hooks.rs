@@ -44,21 +44,22 @@ const KES_VIEW_MAX_ROLL_EPOCHS: u64 = 64;
 
 impl Engine {
     /// The state the signer decides the KES mode on, for the status: the
-    /// head state rolled into `wall_epoch` — `rolled_to`, the same memoised
-    /// derivation `attest`/`propose` use and the audit L1-01 fix hands to
-    /// `prepare_kes` (review R-03). One place, so the merge with that fix
-    /// has a single line to agree on. Read-only: `rolled_to` returns a
-    /// shared derived value and never touches the canonical state.
+    /// head state rolled into `wall_epoch` — `Engine::duty_state`, the very
+    /// function `attest_for`/`propose`/`submit_kes_rotation` take the state
+    /// they hand to `prepare_kes` from (audit L1-01, review R-03). The mode
+    /// is then read with `Engine::duty_signing_mode`, the signer's own call.
+    /// Read-only: `duty_state` returns a shared derived value and never
+    /// touches the canonical state.
     ///
     /// Returns the state and the epoch it stands in: `wall_epoch` when
     /// rolled, the head's epoch when the unrolled head is reported instead.
     fn sentinel_kes_state(&self, wall_epoch: u64) -> (Arc<CommittedState>, u64) {
         let head_epoch = epoch_of(self.state.slot());
         if self.live && wall_epoch.saturating_sub(head_epoch) <= KES_VIEW_MAX_ROLL_EPOCHS {
-            (self.rolled_to(wall_epoch), wall_epoch.max(head_epoch))
+            (self.duty_state(wall_epoch), wall_epoch.max(head_epoch))
         } else {
             // `rolled_to` at or below the head's epoch is the head state.
-            (self.rolled_to(head_epoch), head_epoch)
+            (self.duty_state(head_epoch), head_epoch)
         }
     }
 
@@ -76,7 +77,7 @@ impl Engine {
         let validator = self.duty_index(&kes_state);
         let (mode, period) = match validator {
             None => ("no_validator", None),
-            Some(v) => match bloch_pos_committee::kes::signing_mode(&*kes_state, v, wall_epoch) {
+            Some(v) => match Self::duty_signing_mode(&*kes_state, v, wall_epoch) {
                 SigningMode::Static => ("static", None),
                 SigningMode::Kes(p) => ("kes", Some(p)),
                 SigningMode::FailClosed => ("fail_closed", None),

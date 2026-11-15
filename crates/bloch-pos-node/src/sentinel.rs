@@ -248,19 +248,19 @@ impl Doppelganger {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct KesView {
-    /// This node's duty validator in the head state, if it runs one.
+    /// This node's duty validator in the duty state, if it runs one.
     pub(crate) validator: Option<u32>,
     pub(crate) keystore_loaded: bool,
     pub(crate) kes_key_loaded: bool,
-    /// `static` | `kes` | `fail_closed` | `no_validator`, by the same
-    /// `kes::signing_mode` rule the verifiers run, for the wall epoch,
-    /// against the head state.
+    /// `static` | `kes` | `fail_closed` | `no_validator`, by the signer's
+    /// own call (`Engine::duty_signing_mode`, i.e. `kes::signing_mode`),
+    /// for the wall epoch, on the duty state.
     pub(crate) mode: &'static str,
     pub(crate) period: Option<u64>,
-    /// `kes_enforced_from` of the head state: `Some(None)` = not bound.
+    /// `kes_enforced_from` of the duty state: `Some(None)` = not bound.
     pub(crate) bind_epoch: Option<Option<u64>>,
     /// The epoch of the state those values were read from: the head state
-    /// rolled into the wall epoch (`Engine::rolled_to`, what the signer
+    /// rolled into the wall epoch (`Engine::duty_state`, what the signer
     /// reads), or the unrolled head when the node is not live or too far
     /// behind to roll cheaply.
     pub(crate) head_state_epoch: u64,

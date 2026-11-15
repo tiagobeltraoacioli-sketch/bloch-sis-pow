@@ -3092,6 +3092,28 @@ impl Engine {
         (rec.pubkey == keys.pubkey).then_some(keys.index)
     }
 
+    /// The state a duty of `epoch` is signed on: the head rolled into the
+    /// duty epoch (audit L1-01). `attest_for`, `attestation_duty_slot`,
+    /// `propose` and `submit_kes_rotation` take their `rolled` from here
+    /// and hand it to [`Self::prepare_kes`]; so does the
+    /// Sentinel's `kes` status view (`sentinel_hooks::sentinel_kes_state`),
+    /// so the status can never report a mode the signer is not using.
+    fn duty_state(&self, epoch: u64) -> Arc<CommittedState> {
+        self.rolled_to(epoch)
+    }
+
+    /// The KES signing decision for `validator` in `epoch` on a duty state
+    /// from [`Self::duty_state`]: the verifiers' own rule,
+    /// `kes::signing_mode`. The one place the signer (`prepare_kes_in`) and
+    /// the Sentinel status read the mode from.
+    fn duty_signing_mode(
+        rolled: &dyn KeyLookup,
+        validator: u32,
+        epoch: u64,
+    ) -> bloch_pos_committee::kes::SigningMode {
+        bloch_pos_committee::kes::signing_mode(rolled, validator, epoch)
+    }
+
     /// Make the KES key ready to sign for `validator` in `epoch`: `Ok(None)`
     /// before KES enforcement (the static key signs, exactly as before),
     /// `Ok(Some((period, key in force)))` once evolved — on disk first — to
@@ -3139,7 +3161,7 @@ impl Engine {
         // same state: static before KES binds on chain, and for a
         // never-registered validator after (fallback); the KES leaf for a
         // registered one.
-        let period = match bloch_pos_committee::kes::signing_mode(rolled, validator, epoch) {
+        let period = match Self::duty_signing_mode(rolled, validator, epoch) {
             SigningMode::Static => return Ok(None),
             SigningMode::FailClosed => return Err("KES enforcement state unknown".into()),
             SigningMode::Kes(period) => period,
@@ -3273,7 +3295,7 @@ impl Engine {
     fn submit_kes_rotation(&mut self, wall_epoch: u64, period: u64, index: u32) {
         // `maintain_kes` runs only with the head inside `wall_epoch`, so the
         // head state is that epoch's rolled state.
-        let rolled = self.rolled_to(wall_epoch);
+        let rolled = self.duty_state(wall_epoch);
         let in_force = match self.prepare_kes(&rolled, wall_epoch, index) {
             Ok(Some((p, public))) if p == period => public,
             Ok(_) => return,
@@ -3537,7 +3559,7 @@ impl Engine {
     /// This validator's attestation duty slot in epoch `e`, from the same
     /// snapshot, seed and roster [`Self::attest`] uses (one epoch partition).
     fn attestation_duty_slot(&mut self, e: u64) -> Option<u64> {
-        let rolled = self.rolled_to(e);
+        let rolled = self.duty_state(e);
         let index = self.duty_index(&rolled)?;
         let roster = rolled.active_validators();
         let seed = Self::seed_for(&rolled, e);
@@ -3579,7 +3601,7 @@ impl Engine {
             // a vote for it would be source==target, which is invalid.
             return;
         }
-        let rolled = self.rolled_to(e);
+        let rolled = self.duty_state(e);
         // Identity re-checked against the same snapshot that draws the
         // committee, before membership is even asked about.
         let Some(index) = self.duty_index(&rolled) else {
@@ -3694,7 +3716,7 @@ impl Engine {
             return;
         }
         let e = epoch_of(slot);
-        let rolled = self.rolled_to(e);
+        let rolled = self.duty_state(e);
         // Same rule as `attest`: the key, not just the index, and from the
         // same snapshot the schedule is drawn from.
         let Some(index) = self.duty_index(&rolled) else {

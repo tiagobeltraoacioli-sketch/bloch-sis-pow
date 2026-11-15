@@ -813,6 +813,16 @@ fn two_empty_epochs_after_the_bind_decision_do_not_halt_the_chain() {
     let vote_slot = engine.attestation_duty_slot(duty_epoch).expect("the only validator has a duty");
     let _clock = validator_lifecycle::clock_at(vote_slot);
     engine.wall_slot = vote_slot;
+    // The Sentinel's `kes` status reads the same duty state and the same
+    // mode call as the signer (`duty_state` + `duty_signing_mode`), so on
+    // the lagging head it reports the leaf the vote is about to be signed
+    // with, not the head's static mode.
+    let was_live = std::mem::replace(&mut engine.live, true);
+    let status = engine.sentinel_snapshot().kes;
+    engine.live = was_live;
+    assert_eq!((status.mode, status.period), ("kes", Some(0)), "the status agrees with the signer");
+    assert_eq!(status.bind_epoch, Some(Some(duty_epoch)));
+    assert_eq!(status.head_state_epoch, duty_epoch, "read on the state rolled to the duty epoch");
     engine.attest(vote_slot);
     assert_eq!(engine.state.slot(), before, "voting does not move the head");
     let vote = engine
