@@ -78,6 +78,13 @@ pub struct MainnetProof {
 /// crosses with checkpoint E <= gate + 8 (whose header, in epoch >= gate + 1,
 /// commits the set used from then on); a client that cannot (no consecutive
 /// finalization in that window) needs a post-gate anchor.
+///
+/// This narrows the divergence (targets gate..gate+9 are still judged by
+/// bond); it does not close it. It also changes this verifier's verdict for
+/// E > gate + 8 with a pre-gate set source: any SP1 guest compiled from an
+/// older revision of this crate still accepts those steps, so guests and
+/// hosts must be pinned to the same revision, and rebuilding a guest at this
+/// revision changes its vkey (plan the rotation).
 pub const FROZEN_GATE_BOND_CROSSING_EPOCHS: u64 = 8;
 
 /// What the light client is configured with, once.
