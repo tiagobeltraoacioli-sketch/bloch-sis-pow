@@ -60,6 +60,77 @@ ignore = [
     # ── Accepted vulnerabilities, no upstream bump path (mirrors deny.toml) ─────
     "RUSTSEC-2026-0118", # hickory-proto NSEC3 unbounded loop — libp2p 0.56-pinned
     "RUSTSEC-2026-0119", # hickory-proto O(n^2) name compression — libp2p-pinned
+    # ── EXCEPTIONS added 2026-11-15 (L1M-17, node release candidate after
+    #    84040ce0), re-review by 2027-02-14. Mirrored in deny.toml and
+    #    osv-scanner.toml; SECURITY_TOOLING.md §Advisory posture has the table.
+    #    The same pass FIXED, by in-semver Cargo.lock bumps, everything with a
+    #    compatible patch that reaches the bloch-pos binary: libp2p-gossipsub
+    #    0.49.4 -> 0.49.5 (RUSTSEC-2026-0536), tokio 1.52.1 -> 1.53.3
+    #    (RUSTSEC-2026-0386), rustix 1.1.4 -> 1.1.6 (RUSTSEC-2026-0486).
+    #
+    # (A) Compiled into bloch-pos, NOT reachable on the mainnet configuration.
+    #     The libp2p swarm (gossipsub, libp2p-dns/hickory) is built only under
+    #     `--transport libp2p|dual` (engine.rs start_libp2p); the default and the
+    #     whole fleet + bootnodes run `--transport devnet` (main.rs
+    #     decide_transport, deploy/bootnodes/bootnodes.txt). MUST be fixed before
+    #     any production unit runs libp2p or dual.
+    "RUSTSEC-2026-0534", # libp2p-gossipsub PRUNE for unknown topics -> unbounded
+                         # backoff state. Fix only in 0.50.1 (libp2p 0.57 line,
+                         # breaking); 0.49.5 caps each entry at 3600 s but not the
+                         # topic count. Fix path: vendored backport of
+                         # rust-libp2p#6707 (as crates/libp2p-yamux) or libp2p 0.57.
+    "RUSTSEC-2026-0487", # hickory-proto SVCB alpn text-parse panic   (no 0.25 fix)
+    "RUSTSEC-2026-0489", # hickory-proto SVCB quote text-parse panic  (no 0.25 fix)
+    "RUSTSEC-2026-0490", # hickory-proto zone-file lexer panic        (no 0.25 fix)
+    "RUSTSEC-2026-0491", # hickory-proto header record-count memory amplification
+    "RUSTSEC-2026-0504", # hickory-proto DNSSEC NSEC3 comparison
+    "RUSTSEC-2026-0505", # hickory-proto DNSSEC NSEC3 owner names
+    "RUSTSEC-2026-0511", # hickory-proto DNSSEC NXDOMAIN for empty non-terminal
+    "RUSTSEC-2026-0512", # hickory-proto DNSSEC unrelated signed RRset
+    "RUSTSEC-2026-0530", # hickory-proto DNSSEC parent-side NSEC at zone cut
+    "RUSTSEC-2026-0531", # hickory-proto DNSSEC child-side NSEC/NSEC3 for DS
+    "RUSTSEC-2026-0532", # hickory-proto DNSSEC parent-side NSEC3 at zone cut
+    "RUSTSEC-2026-0514", # hickory-resolver lookup() hides DNSSEC failures
+                         # All hickory: fix is >= 0.26.2, libp2p-dns 0.44 (libp2p
+                         # 0.56) pins 0.25. Even in libp2p mode the node resolves
+                         # only operator-written /dns* --p2p-peer addresses
+                         # (identify addresses are never dialled); hickory is
+                         # built without DNSSEC features, so the eight DNSSEC
+                         # advisories are not compiled; the text/zone-file parsers
+                         # are not on the wire path.
+    # (B) NOT in the bloch-pos dependency graph at all (`cargo tree -p
+    #     bloch-pos-node --features ws-release-anchor --target
+    #     x86_64-unknown-linux-gnu -e normal,build`): legacy Genesis-3 node,
+    #     reqwest TLS in tools, the SP1 prover stack, fuzz/pool/coherence-prover
+    #     lockfiles. Most have in-semver patches; bumping them is deferred to a
+    #     follow-up so the release lockfile delta stays minimal.
+    "RUSTSEC-2026-0338", # quinn-proto zero-length STREAM panic         (>=0.11.18)
+    "RUSTSEC-2026-0339", # quinn-proto CID retirement growth            (>=0.11.17)
+    "RUSTSEC-2026-0340", # quinn-proto min ACK delay panic              (>=0.11.18)
+    "RUSTSEC-2026-0341", # quinn-proto reassembly guard bypass          (>=0.11.17)
+    "RUSTSEC-2026-0342", # quinn-proto zero-length DATAGRAM             (>=0.11.17)
+    "RUSTSEC-2026-0343", # quinn-proto datagram accounting panic     (>=0.11.18)
+    "RUSTSEC-2026-0523", # quinn-proto MAX_STREAM_DATA stream limit     (>=0.11.19)
+    "RUSTSEC-2026-0524", # quinn-proto long Retry token (client)        (>=0.11.19)
+    "RUSTSEC-2026-0538", # quinn-udp truncated datagram spin            (>=0.5.16)
+    "RUSTSEC-2026-0346", # rustls session Debug exposes secrets         (>=0.23.46)
+    "RUSTSEC-2026-0347", # rustls ECH rejection buffered data           (>=0.23.46)
+    "RUSTSEC-2026-0348", # rustls Brotli cert decompression          (>=0.23.46)
+    "RUSTSEC-2026-0349", # rustls unauthenticated ServerHello downgrade (>=0.23.46)
+    "RUSTSEC-2026-0382", # rustls-webpki distrusted intermediates       (>=0.103.16)
+    "RUSTSEC-2026-0381", # webpki-roots distrusted emSign intermediates (>=1.0.10)
+    "RUSTSEC-2026-0387", # crypto-bigint 0.5 timing (fix 0.7.6, breaking; SP1/zk)
+    "RUSTSEC-2026-0410", # zstd-sys wasm allocator shim (legacy rocksdb, not wasm)
+    "RUSTSEC-2026-0418", # libz-sys build-script env leak (build host only)
+    # (C) Fixed in the root Cargo.lock by this pass; still present in the
+    #     separately locked pool, pool-proxy, pq-shield-api, coherence-prover and
+    #     fuzz workspaces, none of which is the node. No first-party code calls
+    #     tokio AsyncFd or rustix xattr functions (git grep).
+    "RUSTSEC-2026-0386", # tokio AsyncFd I/O-safety unsoundness (root: 1.53.3)
+    "RUSTSEC-2026-0486", # rustix xattr unsoundness             (root: 1.1.6)
+    # (D) Harness lockfiles only (audit/pq-conformance, crates/bloch-crypto/fuzz),
+    #     first scanned 2026-11-15; not in the root Cargo.lock at all.
+    "RUSTSEC-2026-0385", # ctutils 0.4.3 non-constant-time masks (>=0.4.4)
     # ── crates/coherence-prover/{script,service} ONLY (N-3, Round 3) ───────────
     # This config also governs `scripts/audit-all-lockfiles.sh`'s scan of the two
     # coherence-prover lockfiles (added by finding P123-sp1-verifier and, until

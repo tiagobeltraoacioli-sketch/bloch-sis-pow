@@ -98,6 +98,49 @@ ignore = [
     # Documented as an OPEN finding in SECURITY_TOOLING.md — accepted, not dismissed.
     "RUSTSEC-2026-0118", # hickory-proto NSEC3 closest-encloser unbounded loop (DoS)
     "RUSTSEC-2026-0119", # hickory-proto O(n^2) name compression CPU exhaustion (DoS)
+    # ── EXCEPTIONS added 2026-11-15 (L1M-17, node release candidate after
+    # 84040ce0), re-review by 2027-02-14. Same entries and rationale as
+    # .cargo/audit.toml (that file carries the per-id notes) and
+    # osv-scanner.toml. The same pass FIXED by in-semver Cargo.lock bumps what
+    # reaches bloch-pos and has a compatible patch: libp2p-gossipsub 0.49.5
+    # (RUSTSEC-2026-0536), tokio 1.53.3 (RUSTSEC-2026-0386), rustix 1.1.6.
+    #
+    # (A) Compiled into bloch-pos but NOT reachable on the mainnet
+    # configuration: the libp2p swarm (gossipsub, libp2p-dns/hickory) is built
+    # only under `--transport libp2p|dual`; the default and the whole fleet run
+    # `--transport devnet`. MUST be fixed before any production unit runs
+    # libp2p or dual. gossipsub -0534 is fixed only in 0.50.1 (libp2p 0.57,
+    # breaking) — fix path is a vendored backport of rust-libp2p#6707, like
+    # crates/libp2p-yamux. hickory: fix is >= 0.26.2, libp2p-dns 0.44 pins 0.25;
+    # the node resolves only operator-written /dns* --p2p-peer addresses,
+    # hickory is built without DNSSEC features (eight of these are DNSSEC-only)
+    # and the text/zone-file parsers are not on the wire path.
+    "RUSTSEC-2026-0534", # libp2p-gossipsub PRUNE unknown-topic backoff state
+    "RUSTSEC-2026-0487", # hickory-proto SVCB alpn text-parse panic
+    "RUSTSEC-2026-0489", # hickory-proto SVCB quote text-parse panic
+    "RUSTSEC-2026-0490", # hickory-proto zone-file lexer panic
+    "RUSTSEC-2026-0491", # hickory-proto header record-count memory amplification
+    "RUSTSEC-2026-0504", # hickory-proto DNSSEC NSEC3 comparison
+    "RUSTSEC-2026-0505", # hickory-proto DNSSEC NSEC3 owner names
+    "RUSTSEC-2026-0511", # hickory-proto DNSSEC NXDOMAIN empty non-terminal
+    "RUSTSEC-2026-0512", # hickory-proto DNSSEC unrelated signed RRset
+    "RUSTSEC-2026-0530", # hickory-proto DNSSEC parent-side NSEC at zone cut
+    "RUSTSEC-2026-0531", # hickory-proto DNSSEC child-side NSEC/NSEC3 for DS
+    "RUSTSEC-2026-0532", # hickory-proto DNSSEC parent-side NSEC3 at zone cut
+    "RUSTSEC-2026-0514", # hickory-resolver lookup() hides DNSSEC failures
+    # (B) NOT in the bloch-pos dependency graph (`cargo tree -p bloch-pos-node
+    # --features ws-release-anchor --target x86_64-unknown-linux-gnu -e
+    # normal,build`): legacy Genesis-3 node, reqwest TLS in tools. In-semver
+    # patches exist; bumping them is deferred so the release lockfile delta
+    # stays minimal.
+    "RUSTSEC-2026-0346", # rustls session Debug exposes secrets   (>=0.23.46)
+    "RUSTSEC-2026-0347", # rustls ECH rejection buffered data     (>=0.23.46)
+    "RUSTSEC-2026-0348", # rustls Brotli cert decompression       (>=0.23.46)
+    "RUSTSEC-2026-0349", # rustls ServerHello key-share downgrade (>=0.23.46)
+    "RUSTSEC-2026-0382", # rustls-webpki distrusted intermediates (>=0.103.16)
+    "RUSTSEC-2026-0381", # webpki-roots distrusted emSign roots   (>=1.0.10)
+    "RUSTSEC-2026-0410", # zstd-sys wasm allocator shim (legacy rocksdb, not wasm)
+    "RUSTSEC-2026-0418", # libz-sys build-script env leak (build host only)
 ]
 
 [bans]

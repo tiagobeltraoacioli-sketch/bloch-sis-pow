@@ -563,6 +563,10 @@ osv-scanner:
         --lockfile=spikes/prover-cost/rv32h/Cargo.lock
         --lockfile=spikes/prover-cost/rv32k/Cargo.lock
         --lockfile=tools/bloch-devkit/templates/svm/Cargo.lock
+        --lockfile=audit/pq-conformance/Cargo.lock
+        --lockfile=crates/bloch-crypto/fuzz/Cargo.lock
+        --lockfile=spikes/slhdsa-verify-cost/Cargo.lock
+        --lockfile=spikes/slhdsa-verify-cost/rv32s/Cargo.lock
   allow_failure: false
 
 # cargo-geiger — quantifies `unsafe` across the dependency tree (own code +

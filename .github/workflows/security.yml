@@ -199,6 +199,10 @@ jobs:
             --lockfile=spikes/prover-cost/rv32h/Cargo.lock
             --lockfile=spikes/prover-cost/rv32k/Cargo.lock
             --lockfile=tools/bloch-devkit/templates/svm/Cargo.lock
+            --lockfile=audit/pq-conformance/Cargo.lock
+            --lockfile=crates/bloch-crypto/fuzz/Cargo.lock
+            --lockfile=spikes/slhdsa-verify-cost/Cargo.lock
+            --lockfile=spikes/slhdsa-verify-cost/rv32s/Cargo.lock
 
   # gitleaks — catch committed credentials before they reach history (the
   # project has its own PAT-rotation lesson). BLOCKING since 2026-09-04 (finding

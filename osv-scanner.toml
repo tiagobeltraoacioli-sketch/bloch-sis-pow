@@ -209,3 +209,185 @@ reason = "coherence-prover/{script,service} only, serde=1.0.219-pinned; fix is t
 id = "GHSA-7gcf-g7xr-8hxj"   # serde_with 3.14.1, via alloy-consensus 0.14 (SP1)
 ignoreUntil = 2026-12-01
 reason = "coherence-prover/{script,service} only, serde=1.0.219-pinned; fix (serde_with >=3.21.0) pulls serde_json >=1.0.145, which needs serde_core >=1.0.220 — same conflict as the ruint/time entries above. GHSA-only (no RUSTSEC id), so cargo-audit cannot see it; osv-scanner is the only gate that does."
+
+# ── EXCEPTIONS added 2026-11-15 (L1M-17, node release candidate after 84040ce0) ──
+# Same ids and rationale as audit.toml / deny.toml (those carry the per-id
+# notes); SECURITY_TOOLING.md §Advisory posture has the table. The same pass
+# FIXED by in-semver Cargo.lock bumps: libp2p-gossipsub 0.49.5
+# (RUSTSEC-2026-0536), tokio 1.53.3 (RUSTSEC-2026-0386), rustix 1.1.6.
+# (A) compiled into bloch-pos, unreachable on mainnet config (libp2p only);
+# (B) not in the bloch-pos graph; (C) fixed in root, other lockfiles only.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0534"   # libp2p-gossipsub PRUNE unknown-topic backoff state
+ignoreUntil = 2027-02-14
+reason = "libp2p-gossipsub 0.49.5: fix only in 0.50.1 (libp2p 0.57, breaking); fix path is a vendored backport of rust-libp2p#6707. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0487"   # hickory SVCB alpn text-parse panic
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0489"   # hickory SVCB quote text-parse panic
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0490"   # hickory zone-file lexer panic
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0491"   # hickory header record-count memory amplification
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0504"   # hickory DNSSEC NSEC3 comparison
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0505"   # hickory DNSSEC NSEC3 owner names
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0511"   # hickory DNSSEC NXDOMAIN empty non-terminal
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0512"   # hickory DNSSEC unrelated signed RRset
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0530"   # hickory DNSSEC parent-side NSEC
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0531"   # hickory DNSSEC child-side NSEC/NSEC3
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0532"   # hickory DNSSEC parent-side NSEC3
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0514"   # hickory hickory-resolver lookup() hides DNSSEC failures
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "GHSA-6f2x-v7q7-m7m5"   # hickory-resolver follows irrelevant CNAME records (GHSA-only)
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0338"   # quinn-proto
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0339"   # quinn-proto
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0340"   # quinn-proto
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0341"   # quinn-proto
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0342"   # quinn-proto
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0343"   # quinn-proto
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0523"   # quinn-proto
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0524"   # quinn-proto
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0538"   # quinn-udp
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0346"   # rustls
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0347"   # rustls
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0348"   # rustls
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0349"   # rustls
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0382"   # rustls-webpki
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0381"   # webpki-roots
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"   # crypto-bigint 0.5 (fix 0.7.6, breaking)
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0410"   # zstd-sys
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0418"   # libz-sys (build script)
+ignoreUntil = 2027-02-14
+reason = "Not in the bloch-pos dependency graph (cargo tree -p bloch-pos-node --features ws-release-anchor --target x86_64-unknown-linux-gnu -e normal,build); legacy Genesis-3 node, tools, SP1 prover, fuzz/pool/coherence-prover lockfiles. In-semver patch deferred to keep the release lockfile delta minimal. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0386"   # tokio AsyncFd unsound
+ignoreUntil = 2027-02-14
+reason = "Fixed in the root Cargo.lock (tokio 1.53.3, rustix 1.1.6); remains only in the separately locked pool, pool-proxy, pq-shield-api, coherence-prover and fuzz workspaces, not the node. No first-party AsyncFd/xattr calls. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0486"   # rustix xattr unsound
+ignoreUntil = 2027-02-14
+reason = "Fixed in the root Cargo.lock (tokio 1.53.3, rustix 1.1.6); remains only in the separately locked pool, pool-proxy, pq-shield-api, coherence-prover and fuzz workspaces, not the node. No first-party AsyncFd/xattr calls. Mirrors audit.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0385"   # ctutils 0.4.3 non-constant-time masks
+ignoreUntil = 2027-02-14
+reason = "Harness lockfiles only (audit/pq-conformance, crates/bloch-crypto/fuzz), first scanned 2026-11-15; not in the root Cargo.lock, not the node. Patch is ctutils >= 0.4.4. Mirrors audit.toml; re-review 2027-02-14."
