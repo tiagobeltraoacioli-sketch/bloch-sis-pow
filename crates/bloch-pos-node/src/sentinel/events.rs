@@ -50,27 +50,30 @@ pub(crate) struct EventFile {
     max_bytes: u64,
 }
 
+/// Open the log for appending. Review R-06: the final path component is
+/// never followed if it is a symlink (`O_NOFOLLOW`, so there is no window
+/// between a check and the open), what was opened must be a regular file,
+/// and a file that already existed is narrowed to 0600.
 fn open_append(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut opts = OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    opts.create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = opts.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} exists and is not a regular file", path.display()),
+        ));
     }
-    opts.open(path)
+    if meta.permissions().mode() & 0o077 != 0 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 impl EventFile {
     pub(crate) fn open(path: &Path, max_bytes: u64) -> std::io::Result<Self> {
-        if let Ok(meta) = std::fs::symlink_metadata(path) {
-            if !meta.file_type().is_file() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{} exists and is not a regular file", path.display()),
-                ));
-            }
-        }
         let file = open_append(path)?;
         let size = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(EventFile { path: path.to_path_buf(), file, size, max_bytes: max_bytes.max(1024) })
@@ -257,6 +260,26 @@ mod tests {
     fn refuses_a_non_regular_path() {
         let dir = scratch("nonreg");
         assert!(EventFile::open(&dir, 1024).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R-06: a symlink at the path is not followed, and a pre-existing file
+    /// with an open mode is narrowed to 0600.
+    #[test]
+    fn does_not_follow_a_symlink_and_narrows_an_open_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("symlink");
+        let target = dir.join("target");
+        std::fs::write(&target, b"").unwrap();
+        let link = dir.join("events.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(EventFile::open(&link, 1024).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
+        let loose = dir.join("loose.jsonl");
+        std::fs::write(&loose, b"").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o666)).unwrap();
+        EventFile::open(&loose, 1024).unwrap();
+        assert_eq!(std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

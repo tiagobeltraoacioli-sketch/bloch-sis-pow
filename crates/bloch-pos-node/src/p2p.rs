@@ -2294,7 +2294,7 @@ fn handle_swarm_event(
                     _ => None,
                 }) {
                     // Bloch Sentinel ban (node-local; a no-op unless enabled).
-                    if crate::sentinel::refuse_inbound(ip, dialed) {
+                    if crate::sentinel::refuse_inbound_libp2p(ip, dialed) {
                         let _ = swarm.close_connection(connection_id);
                     }
                 }

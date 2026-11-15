@@ -2266,6 +2266,7 @@ pub fn start(
                     thread::sleep(Duration::from_millis(50));
                     continue;
                 };
+                crate::sentinel::note_inbound_attempt(&sock);
                 // A quiet mesh may never broadcast. Prune on accept too, so
                 // connection churn cannot retain one dead sender per dial.
                 match inbound.lock() {
@@ -2349,9 +2350,13 @@ pub fn start(
                                 Some(OwnIdentity::SharedIdentityFile) => {
                                     log_identity_conflict("from", &address.to_string(), &e)
                                 }
-                                None => log_refusal("from", &address.to_string(), &e),
+                                None => {
+                                    log_refusal("from", &address.to_string(), &e);
+                                    // Not this node's own dial or identity:
+                                    // a failure of the remote source.
+                                    crate::sentinel::note_handshake_failure(address.ip());
+                                }
                             }
-                            crate::sentinel::note_handshake_failure(address.ip());
                             return;
                         }
                     };

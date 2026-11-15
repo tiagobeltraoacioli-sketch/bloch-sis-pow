@@ -63,8 +63,10 @@ fn off_by_default() {
     assert!(!refuse_inbound("192.0.2.1".parse().unwrap(), false));
     note_verdict(Some([1; 32]), crate::net::Verdict::Reject);
     note_kes_error("attest", 0, "x");
-    let err = crate::rpc::security_status().unwrap_err();
-    assert_eq!(err, crate::rpc::RpcError::method_not_found("getsecuritystatus"));
+    for source in [None, Some("127.0.0.1".parse().unwrap()), Some("203.0.113.1".parse().unwrap())] {
+        let err = crate::rpc::security_status_for(source).unwrap_err();
+        assert_eq!(err, crate::rpc::RpcError::method_not_found("getsecuritystatus"));
+    }
 }
 
 #[test]
@@ -177,6 +179,9 @@ fn status_has_the_documented_shape() {
         "chain.finalized.root",
         "chain.finality_lag_epochs",
         "peer_finalized_ahead.count",
+        "peer_finalized_ahead.strong_count",
+        "peer_finalized_ahead.conflicting_strong_count",
+        "peer_finalized_ahead.unverified_observations_total",
         "peer_finalized_ahead.entries",
         "gossip_verdicts.top",
         "gossip_verdicts.window_secs",
@@ -223,6 +228,7 @@ fn status_stays_bounded_under_floods() {
             our_finalized_epoch: 0,
             our_finalized_root: [0; 32],
             verdict: "ignore",
+            verified: false,
         });
     }
     let status = s.status_json();
@@ -347,5 +353,138 @@ fn admin_socket_end_to_end() {
     let big = format!("{{\"cmd\":\"peer.bans\",\"pad\":\"{}\"}}", "x".repeat(5000));
     let r = ask(&big);
     assert!(!ok(&r));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn argv(a: &[&str]) -> Vec<String> {
+    a.iter().map(|s| s.to_string()).collect()
+}
+
+/// R-02: only loopback (and in-process) callers read the status unless the
+/// operator opted in, and a refused caller gets plain "method not found".
+#[test]
+fn status_is_served_to_loopback_callers_only() {
+    let local = test_sentinel(cfg_with_peers(&[]));
+    with_test_sentinel(local, || {
+        assert!(crate::rpc::security_status_for(None).is_ok());
+        assert!(crate::rpc::security_status_for(Some("127.0.0.1".parse().unwrap())).is_ok());
+        assert!(crate::rpc::security_status_for(Some("::1".parse().unwrap())).is_ok());
+        assert!(crate::rpc::security_status_for(Some("::ffff:127.0.0.1".parse().unwrap())).is_ok());
+        for remote in ["203.0.113.9", "10.0.0.5", "2001:db8::1"] {
+            let err = crate::rpc::security_status_for(Some(remote.parse().unwrap())).unwrap_err();
+            assert_eq!(err, crate::rpc::RpcError::method_not_found("getsecuritystatus"), "{remote}");
+        }
+    });
+    let remote = test_sentinel(Config { status: true, allow_remote_status: true, ..Default::default() });
+    with_test_sentinel(remote, || {
+        assert!(crate::rpc::security_status_for(Some("203.0.113.9".parse().unwrap())).is_ok());
+    });
+}
+
+/// R-02 at the HTTP-facing backend: the request never reaches the engine
+/// queue and the caller's address decides.
+#[test]
+fn the_rpc_backend_answers_status_before_the_queue_and_by_caller() {
+    use crate::rpc::{RpcBackend, RpcRequest};
+    let (tx, rx) = std::sync::mpsc::channel();
+    let backend = crate::rpc::EngineBackend::new(tx);
+    let s = test_sentinel(cfg_with_peers(&[]));
+    with_test_sentinel(s, || {
+        assert!(backend.call_from(RpcRequest::SecurityStatus, "127.0.0.1".parse().unwrap()).is_ok());
+        let err = backend.call_from(RpcRequest::SecurityStatus, "198.51.100.3".parse().unwrap()).unwrap_err();
+        assert_eq!(err, crate::rpc::RpcError::method_not_found("getsecuritystatus"));
+    });
+    assert!(rx.try_recv().is_err(), "nothing was queued for the consensus thread");
+}
+
+/// R-02 at boot, R-06 for the flag spellings.
+#[test]
+fn flags_are_parsed_strictly_and_a_routable_rpc_bind_is_refused() {
+    let parse = |a: &[&str], bind: Option<&str>| Config::from_args(&argv(a), vec![], vec![], bind);
+    assert_eq!(parse(&["run"], Some("0.0.0.0")).unwrap(), Config::default(), "off: any bind is fine");
+    let c = parse(&["run", "--security-status"], Some("127.0.0.1")).unwrap();
+    assert!(c.status && c.events.is_none() && c.admin_socket.is_none());
+    // Both spellings of a path option.
+    let c = parse(&["run", "--admin-socket", "/run/b/a.sock", "--security-events=/var/log/b/ev.jsonl"], Some("localhost")).unwrap();
+    assert_eq!(c.admin_socket, Some(PathBuf::from("/run/b/a.sock")));
+    assert_eq!(c.events, Some(PathBuf::from("/var/log/b/ev.jsonl")));
+    let c = parse(&["run", "--admin-socket=/run/b/a.sock"], Some("::1")).unwrap();
+    assert_eq!(c.admin_socket, Some(PathBuf::from("/run/b/a.sock")));
+    // Malformed: an error, never a silent "off".
+    for bad in [
+        &["run", "--admin-socket"][..],
+        &["run", "--admin-socket="][..],
+        &["run", "--admin-socket", "--security-status"][..],
+        &["run", "--security-events="][..],
+        &["run", "--security-status=1"][..],
+        &["run", "--admin-socket", "/a", "--admin-socket=/b"][..],
+        &["run", "--security-status-remote"][..],
+    ] {
+        assert!(parse(bad, Some("127.0.0.1")).is_err(), "{bad:?}");
+    }
+    // A routable RPC bind with the Sentinel on needs the explicit flag.
+    for bind in ["0.0.0.0", "10.1.2.3", "::", "node.example"] {
+        let e = parse(&["run", "--security-status"], Some(bind)).unwrap_err();
+        assert!(e.contains("not loopback"), "{e}");
+        assert!(parse(&["run", "--security-events", "/x"], Some(bind)).is_err());
+        assert!(parse(&["run", "--security-status", "--security-status-remote"], Some(bind)).unwrap().allow_remote_status);
+    }
+    // RPC off: nothing to expose.
+    assert!(parse(&["run", "--security-status"], None).is_ok());
+    // After `--`, tokens are not flags.
+    assert_eq!(parse(&["run", "--", "--security-status"], Some("0.0.0.0")).unwrap(), Config::default());
+}
+
+/// R-04: handshake counters are keyed per IPv4 address / IPv6 /64.
+#[test]
+fn handshake_counters_are_keyed_by_the_mesh_source() {
+    let s = test_sentinel(cfg_with_peers(&[]));
+    for host in 0..3000u32 {
+        let ip: IpAddr = format!("2001:db8:1:2::{host:x}").parse().unwrap();
+        s.note_handshake(ip, 1, 1);
+    }
+    let status = s.status_json();
+    let hs = status.get("handshakes").unwrap();
+    assert_eq!(hs.get("tracked_sources").and_then(Json::as_u64), Some(1), "one /64 is one source");
+    let top = hs.get("top").and_then(|t| t.at(0)).unwrap();
+    assert_eq!(top.get("addr").and_then(Json::as_str), Some("2001:db8:1:2::"));
+    assert_eq!(top.get("attempts").and_then(Json::as_u64), Some(3000));
+    assert_eq!(hs.get("overflow").and_then(|o| o.get("attempts")).and_then(Json::as_u64), Some(0));
+}
+
+/// R-05: the connection lifetime is absolute; a client trickling bytes is
+/// cut off at the deadline, not kept for as long as it keeps trickling.
+#[test]
+fn admin_connection_lifetime_is_absolute() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let s = test_sentinel(cfg_with_peers(&[]));
+    let started = Instant::now();
+    let handle = std::thread::spawn(move || admin::handle_connection_within(server, &s, Duration::from_millis(600)));
+    // One byte every 100 ms, never a newline: each read succeeds.
+    while started.elapsed() < Duration::from_secs(3) {
+        if client.write_all(b"x").is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        if handle.is_finished() {
+            break;
+        }
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(handle.is_finished(), "the handler outlived its lifetime");
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    handle.join().unwrap();
+}
+
+/// R-05: a group-writable directory is refused like a world-writable one.
+#[test]
+fn admin_socket_refuses_a_group_writable_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("grp");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let e = admin::check_path(&dir.join("a.sock")).unwrap_err();
+    assert!(e.contains("group-writable"), "{e}");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+    assert!(admin::check_path(&dir.join("a.sock")).is_ok());
     let _ = std::fs::remove_dir_all(&dir);
 }

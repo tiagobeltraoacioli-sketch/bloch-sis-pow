@@ -17,11 +17,11 @@
 //! accepted or refused, is logged and emitted as an `admin_command` event.
 //! All bounds live in [`super::bans`].
 //!
-//! The socket refuses to be created in a world-writable directory, or over
+//! The socket refuses to be created in a world- or group-writable directory, or over
 //! an existing path that is not a socket, and a connecting process whose uid
 //! is not the node's (or root's) is answered with nothing and closed.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
@@ -55,9 +55,17 @@ pub(crate) fn check_path(path: &Path) -> Result<(), String> {
     if !dir.is_dir() {
         return Err(format!("--admin-socket {shown}: {} is not a directory", parent.display()));
     }
-    if dir.permissions().mode() & 0o002 != 0 {
+    let dir_mode = dir.permissions().mode();
+    if dir_mode & 0o002 != 0 {
         return Err(format!(
             "--admin-socket {shown}: refusing a world-writable directory ({}); use a directory only the node user can write",
+            parent.display()
+        ));
+    }
+    // Review R-05: whoever can write the directory can replace the socket.
+    if dir_mode & 0o020 != 0 {
+        return Err(format!(
+            "--admin-socket {shown}: refusing a group-writable directory ({}); use a directory only the node user can write",
             parent.display()
         ));
     }
@@ -88,14 +96,18 @@ pub(crate) fn check_path(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Create the socket, 0600 from its first instant (umask 0177 around the
-/// bind — `start` runs before any other thread exists), then verify.
+/// Create the socket and make it 0600, then verify.
+///
+/// No `umask` here: it is process-wide, and narrowing it even briefly would
+/// leak into whatever another thread creates meanwhile. Between `bind` and
+/// `chmod` the socket has the process's ordinary creation mode; that window
+/// is covered twice over: [`check_path`] has already refused a directory
+/// anyone else can write, and [`serve`] refuses every client whose uid is
+/// not the node's or root's, whatever the file mode says.
 pub(crate) fn bind(path: &Path) -> Result<UnixListener, String> {
     use std::os::unix::fs::PermissionsExt;
     check_path(path)?;
-    let old = unsafe { libc::umask(0o177) };
     let bound = UnixListener::bind(path);
-    unsafe { libc::umask(old) };
     let listener = bound.map_err(|e| format!("--admin-socket {}: {e}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("--admin-socket {}: chmod 0600: {e}", path.display()))?;
@@ -162,39 +174,56 @@ pub(crate) fn serve(listener: UnixListener, sentinel: Arc<Sentinel>) {
     }
 }
 
+/// Read one `\n`-terminated line into `pending`, never past `deadline`.
+/// `Ok(Some(line))` (without the newline), `Ok(None)` when the line is
+/// longer than [`MAX_LINE_BYTES`], `Err` on EOF, timeout or I/O error.
+///
+/// Review R-05: every `read` gets the time that is LEFT, so a client that
+/// trickles a byte at a time cannot stretch a connection past its lifetime.
+fn read_line_until(stream: &mut UnixStream, pending: &mut Vec<u8>, deadline: Instant) -> std::io::Result<Option<Vec<u8>>> {
+    loop {
+        if let Some(at) = pending.iter().position(|b| *b == b'\n') {
+            let mut line: Vec<u8> = pending.drain(..=at).collect();
+            line.pop();
+            return Ok(if line.len() > MAX_LINE_BYTES { None } else { Some(line) });
+        }
+        if pending.len() > MAX_LINE_BYTES {
+            return Ok(None);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        stream.set_read_timeout(Some(left.min(IO_TIMEOUT)))?;
+        let mut buf = [0u8; 1024];
+        match stream.read(&mut buf)? {
+            0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            n => pending.extend_from_slice(buf.get(..n).unwrap_or(&[])),
+        }
+    }
+}
+
 fn handle_connection(stream: UnixStream, sentinel: &Sentinel) {
-    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    handle_connection_within(stream, sentinel, CONNECTION_LIFETIME)
+}
+
+pub(crate) fn handle_connection_within(mut stream: UnixStream, sentinel: &Sentinel, lifetime: Duration) {
+    let deadline = Instant::now() + lifetime;
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-    let Ok(write_half) = stream.try_clone() else { return };
-    let mut out = write_half;
-    let mut reader = BufReader::new(stream.take(
-        (MAX_LINE_BYTES as u64 + 1).saturating_mul(MAX_COMMANDS_PER_CONNECTION as u64),
-    ));
-    let started = Instant::now();
+    let mut pending = Vec::new();
     for _ in 0..MAX_COMMANDS_PER_CONNECTION {
-        if started.elapsed() > CONNECTION_LIFETIME {
-            return;
-        }
-        let mut line = Vec::new();
-        match (&mut reader).take(MAX_LINE_BYTES as u64 + 1).read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
-        }
-        let answer = if line.len() > MAX_LINE_BYTES {
-            error_json(None, &format!("line longer than {MAX_LINE_BYTES} bytes"))
-        } else {
-            match std::str::from_utf8(&line) {
+        let (answer, close) = match read_line_until(&mut stream, &mut pending, deadline) {
+            Err(_) => return,
+            Ok(None) => (error_json(None, &format!("line longer than {MAX_LINE_BYTES} bytes")), true),
+            Ok(Some(line)) => match std::str::from_utf8(&line) {
                 Ok(text) if text.trim().is_empty() => continue,
-                Ok(text) => handle_line(sentinel, text),
-                Err(_) => error_json(None, "line is not UTF-8"),
-            }
+                Ok(text) => (handle_line(sentinel, text), false),
+                Err(_) => (error_json(None, "line is not UTF-8"), false),
+            },
         };
         let mut text = answer.to_string();
         text.push('\n');
-        if out.write_all(text.as_bytes()).is_err() {
-            return;
-        }
-        if line.len() > MAX_LINE_BYTES {
+        if stream.write_all(text.as_bytes()).is_err() || close {
             return;
         }
     }
