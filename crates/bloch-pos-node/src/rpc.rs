@@ -1059,6 +1059,9 @@ pub enum RpcRequest {
         set_source_epoch: Option<u64>,
         block: Option<[u8; 32]>,
     },
+    /// `getsecuritystatus` — Bloch Sentinel hooks (node-local, read-only, off
+    /// unless a Sentinel flag is given; see `docs/SENTINEL-HOOKS.md`).
+    SecurityStatus,
 }
 
 /// Whatever can answer an [`RpcRequest`]. In production this is the channel to
@@ -1234,6 +1237,7 @@ impl EngineBackend {
     fn locally(req: &RpcRequest) -> Option<RpcResult> {
         match req {
             RpcRequest::BuildInfo => Some(Ok(build_info_json())),
+            RpcRequest::SecurityStatus => Some(security_status()),
             _ => None,
         }
     }
@@ -1633,8 +1637,15 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
             };
             RpcRequest::LcProof { epoch, set_source_epoch, block }
         }
+        "getsecuritystatus" => RpcRequest::SecurityStatus,
         other => return Err(RpcError::method_not_found(other)),
     })
+}
+
+/// `getsecuritystatus`: the Sentinel's snapshot, or exactly the "method not
+/// found" a node without the Sentinel gives when no Sentinel flag is set.
+pub(crate) fn security_status() -> RpcResult {
+    crate::sentinel::status_rpc().ok_or_else(|| RpcError::method_not_found("getsecuritystatus"))
 }
 
 fn envelope(id: Json, outcome: RpcResult) -> String {
