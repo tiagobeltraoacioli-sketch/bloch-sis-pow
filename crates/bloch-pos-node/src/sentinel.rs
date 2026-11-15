@@ -1003,6 +1003,13 @@ pub(crate) fn status_allowed_from(source: Option<IpAddr>) -> bool {
     }
 }
 
+/// May a request that came through a proxy read `getsecuritystatus`? Only
+/// with `--security-status-remote` (review RC-05): behind a proxy the
+/// loopback test proves nothing. See `rpc::security_status_for_relayed`.
+pub(crate) fn status_allowed_relayed() -> bool {
+    current().is_some_and(|s| s.cfg.allow_remote_status)
+}
+
 pub(crate) fn note_handshake_failure(ip: IpAddr) {
     if let Some(s) = current() {
         s.note_handshake(ip, 0, 1);

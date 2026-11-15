@@ -33,12 +33,19 @@ validator index, the KES state and the doppelganger window. Therefore:
 
 - the node refuses to start with any Sentinel flag and a non-loopback
   `--rpc-bind`, unless `--security-status-remote` is given;
-- at call time only loopback callers (the address the RPC attributes the
-  request to, after `--rpc-trusted-proxy`) are answered; anyone else gets
-  `-32601 method not found`, the same answer as a node without the Sentinel;
-- a reverse proxy on the same host that is **not** declared with
-  `--rpc-trusted-proxy` makes every caller look like loopback: do not enable
-  the Sentinel on such a node, or declare the proxy.
+- at call time only DIRECT loopback callers are answered: the TCP peer is
+  loopback, is not a declared `--rpc-trusted-proxy`, and the request carries
+  no forwarding header at all (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`,
+  `Via`, `X-Forwarded-Host`/`-Proto`/`-Port`/`-Server`, `X-Client-IP`,
+  `X-Cluster-Client-IP`, `True-Client-IP`, `CF-Connecting-IP`,
+  `Fastly-Client-IP`). Anyone else gets `-32601 method not found`, the same
+  answer as a node without the Sentinel (review RC-05). A request that came
+  through any proxy, declared or not, is therefore refused unless
+  `--security-status-remote` is given: a reverse proxy on the same host
+  makes every caller look like loopback, and a proxy that does not append
+  to `X-Forwarded-For` lets the caller choose the address the RPC would
+  believe. A proxy that strips every forwarding header is indistinguishable
+  from a local client: do not put such a proxy in front of a Sentinel node.
 
 ## 1. `getsecuritystatus` (JSON-RPC, existing RPC port, default bind 127.0.0.1)
 
@@ -66,7 +73,7 @@ address behind it).
 | `handshakes` | `{window_secs:600, tracked_sources, keyed_by, total_attempts, total_failures, overflow{attempts,failures}, top[≤16]{addr, attempts, failures}}` — inbound mesh connections (counted at TCP accept, before any cap) and failed mesh handshakes, per IPv4 address or IPv6 /64 (`addr` is that key). The node's own self-dial is not counted as a failure. |
 | `peers` | `{transport, devnet_connections, libp2p_peers, mesh_inbound, configured_peers, inbound_by_v4_24{buckets,max_in_one,top[≤16]{prefix,count}}, inbound_by_v6_64{…}}` |
 | `doppelganger` | `{state, halted, observe_until_slot}`; `state` ∈ `observing`, `window_passed`, `halted`, `inactive` |
-| `kes` | `{validator, keystore_loaded, kes_key_loaded, mode, mode_epoch, period, bind_epoch, bound, state_epoch, state_rolled_to_wall_epoch, last_error}`; `mode` ∈ `static`, `kes`, `fail_closed`, `no_validator` (the verifiers' `kes::signing_mode` rule for the wall epoch, on the head state **rolled into the wall epoch** — the state the signer decides on); `bind_epoch` is `kes_enforced_from` of that state (`null` = not bound). `state_rolled_to_wall_epoch` is false only when the node is not live or is more than 64 epochs behind; the values then come from the unrolled head (`state_epoch`) and must not be alerted on. `last_error`: `{duty, class, validator, wall_slot, at_ms, consecutive}`. |
+| `kes` | `{validator, keystore_loaded, kes_key_loaded, mode, mode_epoch, period, bind_epoch, bound, state_epoch, state_rolled_to_wall_epoch, last_error}`; `mode` ∈ `static`, `kes`, `fail_closed`, `no_validator` (the verifiers' `kes::signing_mode` rule for the wall epoch, on the head state **rolled into the wall epoch** — the state the signer decides on); `bind_epoch` is `kes_enforced_from` of that state (`null` = not bound). `state_rolled_to_wall_epoch` is false only when the node is not live or is more than 64 epochs behind; the values then come from the unrolled head (`state_epoch`) and must not be alerted on. The roll is the signer's own fold, taken beside the duty memo rather than through it (review RC-04), so reading the status never changes which rolls the attestation door finds already paid for. `last_error`: `{duty, class, validator, wall_slot, at_ms, consecutive}`. |
 | `bans` | `{active, max:256, refused_connections, entries[]{range, reason, ttl_secs, expires_in_secs, created_ms}}` |
 | `events` | `{enabled:false}` or `{enabled:true, emitted, written, dropped_rate_limited, dropped_queue_full, write_errors, rotations, max_file_bytes, per_type_per_minute}` |
 | `admin_commands` | commands received on the admin socket since start |

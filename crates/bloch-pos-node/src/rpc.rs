@@ -1660,6 +1660,46 @@ pub(crate) fn security_status_for(source: Option<IpAddr>) -> RpcResult {
     crate::sentinel::status_rpc().ok_or_else(|| RpcError::method_not_found("getsecuritystatus"))
 }
 
+/// `getsecuritystatus` for an HTTP request that came through a proxy: its
+/// TCP peer is a declared `--rpc-trusted-proxy`, or it carries any
+/// forwarding header ([`is_relay_header`]). Review RC-05: such a request is
+/// answered only with `--security-status-remote`. A loopback TCP peer then
+/// proves nothing about the caller (a reverse proxy on the same host makes
+/// every caller loopback), and the address a proxy forwards is only as good
+/// as that proxy's configuration, so the one rule that does not depend on
+/// either is "direct loopback connections only".
+pub(crate) fn security_status_for_relayed() -> RpcResult {
+    if !crate::sentinel::status_allowed_relayed() {
+        return Err(RpcError::method_not_found("getsecuritystatus"));
+    }
+    crate::sentinel::status_rpc().ok_or_else(|| RpcError::method_not_found("getsecuritystatus"))
+}
+
+/// Header fields a forwarding proxy adds (lower case). Their presence on a
+/// request marks it as relayed for [`security_status_for_relayed`]; none of
+/// them is believed for attribution (only `X-Forwarded-For` from a trusted
+/// proxy is, see [`TrustedProxies`]).
+const RELAY_HEADERS: &[&str] = &[
+    FORWARDED_HEADER,
+    "forwarded",
+    "x-real-ip",
+    "via",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-server",
+    "x-client-ip",
+    "x-cluster-client-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
+    "fastly-client-ip",
+];
+
+/// Is `name` a header field a forwarding proxy adds?
+fn is_relay_header(name: &str) -> bool {
+    RELAY_HEADERS.iter().any(|relay| name.eq_ignore_ascii_case(relay))
+}
+
 fn envelope(id: Json, outcome: RpcResult) -> String {
     let body = match outcome {
         Ok(result) => Json::Obj(vec![
@@ -1704,10 +1744,12 @@ pub fn handle_body(body: &str, backend: &dyn RpcBackend) -> String {
     handle_body_from(body, backend, None)
 }
 
+/// [`handle_body`] for one HTTP connection: the address it is attributed
+/// to, the disconnect probe, and whether it came through a proxy.
 fn handle_body_from(
     body: &str,
     backend: &dyn RpcBackend,
-    source: Option<(IpAddr, &dyn Fn() -> bool)>,
+    source: Option<(IpAddr, &dyn Fn() -> bool, bool)>,
 ) -> String {
     let request = match parse_json(body) {
         Ok(v) => v,
@@ -1749,7 +1791,8 @@ fn handle_body_from(
 
     let params = request.get("params").filter(|p| !matches!(p, Json::Null));
     let outcome = route(method, params).and_then(|req| match source {
-        Some((source, client_gone)) => backend.call_from_connection(req, source, client_gone),
+        Some((_, _, true)) if matches!(req, RpcRequest::SecurityStatus) => security_status_for_relayed(),
+        Some((source, client_gone, _)) => backend.call_from_connection(req, source, client_gone),
         None => backend.call(req),
     });
     envelope(id, outcome)
@@ -1805,7 +1848,8 @@ fn serve_behind(
             let Ok(sock) = conn else { continue };
             let Ok(address) = sock.peer_addr() else { continue };
             let peer = address.ip();
-            let admitted = if proxies.contains(peer) {
+            let peer_is_proxy = proxies.contains(peer);
+            let admitted = if peer_is_proxy {
                 reserve_connection_capped(
                     peer,
                     &live,
@@ -1831,6 +1875,7 @@ fn serve_behind(
                     backend.as_ref(),
                     &hosts,
                     peer,
+                    peer_is_proxy,
                     &mut |forwarded: &[String]| {
                         attribute_connection(&proxies, &ip_limits, peer, forwarded, &mut permit)
                     },
@@ -1925,6 +1970,7 @@ fn serve_connection(
     backend: &dyn RpcBackend,
     hosts: &HostPolicy,
     peer: IpAddr,
+    peer_is_proxy: bool,
     attribute: &mut dyn FnMut(&[String]) -> Result<IpAddr, HttpError>,
 ) {
     let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
@@ -1932,7 +1978,11 @@ fn serve_connection(
     // The address the limits are keyed by: the TCP peer unless `attribute`
     // names a client forwarded by a trusted proxy.
     let mut source = peer;
-    let request = read_request(sock, hosts, &mut |forwarded| {
+    // Through a proxy (review RC-05): a declared one, or any forwarding
+    // header at all.
+    let mut relayed = peer_is_proxy;
+    let request = read_request(sock, hosts, &mut |forwarded, relay_header| {
+        relayed |= relay_header;
         source = attribute(forwarded)?;
         Ok(())
     });
@@ -1944,7 +1994,7 @@ fn serve_connection(
                 Ok(text) => {
                     let probe: &TcpStream = sock;
                     let gone: &dyn Fn() -> bool = &|| client_gone(probe);
-                    handle_body_from(text, backend, Some((source, gone)))
+                    handle_body_from(text, backend, Some((source, gone, relayed)))
                 }
                 Err(_) => envelope(Json::Null, Err(RpcError::parse_error("body is not UTF-8"))),
             };
@@ -2239,12 +2289,13 @@ fn content_type_allowed(ct: Option<&str>) -> bool {
 ///
 /// `on_head` is called once, after the head is parsed and before anything
 /// else is decided or the body is read, with the request's `X-Forwarded-For`
-/// field values in order. It is where a connection from a trusted proxy is
+/// field values in order and whether the head carries any forwarding header
+/// ([`is_relay_header`]). It is where a connection from a trusted proxy is
 /// re-charged to its client; an `Err` from it is the response.
 fn read_request(
     sock: &mut TcpStream,
     hosts: &HostPolicy,
-    on_head: &mut dyn FnMut(&[String]) -> Result<(), HttpError>,
+    on_head: &mut dyn FnMut(&[String], bool) -> Result<(), HttpError>,
 ) -> Result<Vec<u8>, HttpError> {
     let deadline = Instant::now().checked_add(IO_TIMEOUT)
         .ok_or_else(|| http_err(408, "request deadline out of range"))?;
@@ -2259,14 +2310,14 @@ fn read_request_until(
     hosts: &HostPolicy,
     deadline: Instant,
 ) -> Result<Vec<u8>, HttpError> {
-    read_request_attributed(sock, hosts, deadline, &mut |_| Ok(()))
+    read_request_attributed(sock, hosts, deadline, &mut |_, _| Ok(()))
 }
 
 fn read_request_attributed(
     sock: &mut TcpStream,
     hosts: &HostPolicy,
     deadline: Instant,
-    on_head: &mut dyn FnMut(&[String]) -> Result<(), HttpError>,
+    on_head: &mut dyn FnMut(&[String], bool) -> Result<(), HttpError>,
 ) -> Result<Vec<u8>, HttpError> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
@@ -2314,6 +2365,7 @@ fn read_request_attributed(
     let mut origin: Option<String> = None;
     let mut host: Option<String> = None;
     let mut forwarded: Vec<String> = Vec::new();
+    let mut relay_header = false;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             return Err(http_err(400, "malformed header field"));
@@ -2326,6 +2378,7 @@ fn read_request_attributed(
             return Err(http_err(400, "malformed header field"));
         }
         let value = value.trim_matches([' ', '\t']);
+        relay_header |= is_relay_header(name);
         if name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() {
                 return Err(http_err(400, "duplicate Content-Length"));
@@ -2355,7 +2408,7 @@ fn read_request_attributed(
             forwarded.push(value.to_string());
         }
     }
-    on_head(&forwarded)?;
+    on_head(&forwarded, relay_header)?;
 
     // R1 A3-M4: the browser-request gate, before Content-Length is even
     // consulted — three header comparisons are cheaper than anything past
