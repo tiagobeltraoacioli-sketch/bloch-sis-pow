@@ -809,7 +809,8 @@ const MEMPOOL_MAX: usize = 4_096;
 /// source's worst case to 64 / 4,096 ≈ 1.6% of total mempool capacity.
 const MEMPOOL_MAX_PER_SOURCE: usize = 64;
 
-/// Expensive lifecycle authorization calls allowed for one identity in one
+/// Expensive lifecycle authorization calls allowed for one identity, as
+/// delivered by one source (audit L1-02: the pair, not the identity alone), in one
 /// wall slot. The consensus validator performs cheap state/shape checks before
 /// invoking the budgeted verifier. Two calls cover the largest transaction
 /// (four algorithm checks because every authorization is hybrid); a fresh
@@ -822,6 +823,14 @@ const LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = 2;
 /// validity. 256 calls retain two attempts for 128 independent identities in
 /// 30 seconds; overload is retryable in the next slot.
 const LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT: usize = 256;
+
+/// Expensive lifecycle authorization calls one deliverer (a peer or RPC
+/// client's verification source) may trigger across all identities in one
+/// wall slot (audit L1-02). With the per-(deliverer, identity) allowance this
+/// keeps a single source from exhausting the global ceiling by cycling
+/// identities: that now takes 256 / 16 = 16 distinct sources. This node's own
+/// submissions are exempt.
+const LIFECYCLE_VERIFICATIONS_PER_DELIVERER_PER_SLOT: usize = 16;
 
 /// New hybrid verifications allowed across attestation, transaction and
 /// evidence network admission in one wall slot. Blocks draw on their own
@@ -5862,7 +5871,7 @@ impl Engine {
                 self.precheck_slashing_evidence(evidence, verification_source)?;
             }
         }
-        self.validate_lifecycle_admission(&tx)?;
+        self.validate_lifecycle_admission(&tx, verification_source)?;
         // Plan capacity cleanup without mutating the pool. A forged incoming
         // signature must never evict either stale or currently paying entries.
         //

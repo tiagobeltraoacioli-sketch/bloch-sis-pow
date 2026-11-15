@@ -19,6 +19,24 @@ pub(super) struct Mempool {
     lifecycle_verification_slot: Option<u64>,
     lifecycle_verifications_total: usize,
     lifecycle_verifications: BTreeMap<[u8; 32], usize>,
+    lifecycle_verifications_by_deliverer: BTreeMap<[u8; 32], usize>,
+}
+
+/// The allowance key of one (deliverer, identity) pair (audit L1-02). This
+/// node's own submissions (`None`) have a key no remote source can produce.
+fn lifecycle_pair_key(deliverer: Option<[u8; 32]>, identity: &[u8; 32]) -> [u8; 32] {
+    use sha3::{Digest, Sha3_256};
+    let mut hash = Sha3_256::new();
+    hash.update(b"bloch-node-lifecycle-allowance-pair-v1");
+    match deliverer {
+        Some(deliverer) => {
+            hash.update([0x01]);
+            hash.update(deliverer);
+        }
+        None => hash.update([0x00]),
+    }
+    hash.update(identity);
+    hash.finalize().into()
 }
 impl std::ops::Deref for Mempool {
     type Target = BTreeMap<Vec<u8>, PosTransaction>;
@@ -52,19 +70,50 @@ impl Mempool {
     pub(super) fn admission_verified(&self, key: &[u8]) -> bool {
         !self.unverified.contains(key)
     }
-    pub(super) fn reserve_lifecycle_verification(&mut self, source: [u8; 32], wall_slot: u64) -> bool {
+    /// Reserve one expensive lifecycle authorization call for `identity`
+    /// (the validator, funding key or rescue key the transaction speaks for)
+    /// as delivered by `deliverer` (the peer or RPC client's verification
+    /// source; `None` for this node's own submissions).
+    ///
+    /// Audit L1-02: the allowance used to be keyed by the identity alone, a
+    /// value taken from the transaction's own fields, so anyone could spend a
+    /// chosen validator's two units per slot with well-formed forgeries and
+    /// starve its genuine `KesRotate`, `KesRegister`, exit or commission
+    /// update (including this node's automatic KES rotation). It is now keyed
+    /// by the (deliverer, identity) pair, so a forger only spends its own
+    /// pair; each deliverer is further capped across identities so one source
+    /// cannot exhaust the global ceiling alone; and this node's own
+    /// submissions draw on a private pair that no remote deliverer can touch
+    /// and are not subject to the per-deliverer or global ceilings.
+    pub(super) fn reserve_lifecycle_verification(
+        &mut self,
+        deliverer: Option<[u8; 32]>,
+        identity: [u8; 32],
+        wall_slot: u64,
+    ) -> bool {
         if self.lifecycle_verification_slot != Some(wall_slot) {
             self.lifecycle_verification_slot = Some(wall_slot);
             self.lifecycle_verifications_total = 0;
             self.lifecycle_verifications.clear();
+            self.lifecycle_verifications_by_deliverer.clear();
         }
-        if self.lifecycle_verifications_total >= LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT {
+        let pair = lifecycle_pair_key(deliverer, &identity);
+        if self.lifecycle_verifications.get(&pair).copied().unwrap_or(0) >= LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT {
             return false;
         }
-        let used = self.lifecycle_verifications.entry(source).or_default();
-        if *used >= LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT { return false; }
+        if let Some(deliverer) = deliverer {
+            if self.lifecycle_verifications_total >= LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT {
+                return false;
+            }
+            let by_deliverer = self.lifecycle_verifications_by_deliverer.entry(deliverer).or_default();
+            if *by_deliverer >= LIFECYCLE_VERIFICATIONS_PER_DELIVERER_PER_SLOT {
+                return false;
+            }
+            *by_deliverer = by_deliverer.saturating_add(1);
+            self.lifecycle_verifications_total = self.lifecycle_verifications_total.saturating_add(1);
+        }
+        let used = self.lifecycle_verifications.entry(pair).or_default();
         *used = used.saturating_add(1);
-        self.lifecycle_verifications_total = self.lifecycle_verifications_total.saturating_add(1);
         true
     }
     pub(super) fn insert(&mut self, key: Vec<u8>, tx: PosTransaction) -> Option<PosTransaction> {
@@ -141,32 +190,64 @@ mod tests {
     #[test]
     fn lifecycle_verification_budget_is_per_source_and_renews_each_slot() {
         let mut pool = Mempool::default();
+        let peer = Some([0x0a; 32]);
         let first = validator_lifecycle_source(7);
         let second = validator_lifecycle_source(8);
         for _ in 0..LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT {
-            assert!(pool.reserve_lifecycle_verification(first, 100));
+            assert!(pool.reserve_lifecycle_verification(peer, first, 100));
         }
-        assert!(!pool.reserve_lifecycle_verification(first, 100));
-        assert!(pool.reserve_lifecycle_verification(second, 100));
-        assert!(pool.reserve_lifecycle_verification(first, 101));
+        assert!(!pool.reserve_lifecycle_verification(peer, first, 100));
+        assert!(pool.reserve_lifecycle_verification(peer, second, 100));
+        assert!(pool.reserve_lifecycle_verification(peer, first, 101));
     }
 
     #[test]
     fn lifecycle_verification_budget_is_globally_bounded_and_renews_each_slot() {
         let mut pool = Mempool::default();
-        for identity in 0..LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT {
-            let mut source = [0u8; 32];
-            source[..8].copy_from_slice(&(identity as u64).to_le_bytes());
-            assert!(pool.reserve_lifecycle_verification(source, 200));
+        for n in 0..LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT {
+            let mut deliverer = [0u8; 32];
+            deliverer[..8].copy_from_slice(&((n / LIFECYCLE_VERIFICATIONS_PER_DELIVERER_PER_SLOT) as u64).to_le_bytes());
+            let mut identity = [0u8; 32];
+            identity[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            assert!(pool.reserve_lifecycle_verification(Some(deliverer), identity, 200));
         }
-        assert!(!pool.reserve_lifecycle_verification([0xff; 32], 200));
+        assert!(!pool.reserve_lifecycle_verification(Some([0xfe; 32]), [0xff; 32], 200));
         assert_eq!(
             pool.lifecycle_verifications.len(),
             LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT,
         );
-        assert!(pool.reserve_lifecycle_verification([0xff; 32], 201));
+        // This node's own submission is not subject to the global ceiling.
+        assert!(pool.reserve_lifecycle_verification(None, [0xff; 32], 200));
+        assert!(pool.reserve_lifecycle_verification(Some([0xfe; 32]), [0xff; 32], 201));
         assert_eq!(pool.lifecycle_verifications_total, 1);
         assert_eq!(pool.lifecycle_verifications.len(), 1);
+    }
+
+    /// Audit L1-02: forgeries naming a validator spend only their deliverer's
+    /// allowance for it, never another deliverer's or this node's own; and
+    /// one deliverer cannot exhaust the global ceiling by cycling identities.
+    #[test]
+    fn a_forger_cannot_spend_another_deliverers_lifecycle_allowance() {
+        let mut pool = Mempool::default();
+        let target = validator_lifecycle_source(5);
+        let attacker = Some([0xa1; 32]);
+        let honest = Some([0xb2; 32]);
+        for _ in 0..LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT {
+            assert!(pool.reserve_lifecycle_verification(attacker, target, 300));
+        }
+        assert!(!pool.reserve_lifecycle_verification(attacker, target, 300), "the attacker's own pair is spent");
+        assert!(pool.reserve_lifecycle_verification(honest, target, 300), "another deliverer still verifies it");
+        assert!(pool.reserve_lifecycle_verification(None, target, 300), "and so does this node's own submission");
+
+        let cycler = Some([0xc3; 32]);
+        let mut admitted = 0;
+        for n in 0..LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT {
+            if pool.reserve_lifecycle_verification(cycler, validator_lifecycle_source(1_000 + n as u32), 300) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, LIFECYCLE_VERIFICATIONS_PER_DELIVERER_PER_SLOT);
+        assert!(pool.lifecycle_verifications_total < LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT);
     }
 
     #[test]

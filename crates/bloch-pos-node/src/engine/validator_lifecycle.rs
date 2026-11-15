@@ -122,6 +122,8 @@ struct LifecycleAdmissionVerifier<'a, V> {
     inner: &'a verification::GossipVerifier<V>,
     mempool: std::cell::RefCell<&'a mut admission::Mempool>,
     source: Option<[u8; 32]>,
+    /// Who delivered the transaction (audit L1-02); `None` for this node.
+    deliverer: Option<[u8; 32]>,
     wall_slot: u64,
     limited: std::cell::Cell<bool>,
 }
@@ -149,7 +151,7 @@ impl<V: SignatureVerifier> SignatureVerifier for LifecycleAdmissionVerifier<'_, 
             return false;
         }
         if let Some(source) = self.source {
-            if !self.mempool.borrow_mut().reserve_lifecycle_verification(source, self.wall_slot) {
+            if !self.mempool.borrow_mut().reserve_lifecycle_verification(self.deliverer, source, self.wall_slot) {
                 self.limited.set(true);
                 return false;
             }
@@ -173,7 +175,7 @@ impl<V: SignatureVerifier> SignatureVerifier for LifecycleAdmissionVerifier<'_, 
             return false;
         }
         if let Some(source) = self.source {
-            if !self.mempool.borrow_mut().reserve_lifecycle_verification(source, self.wall_slot) {
+            if !self.mempool.borrow_mut().reserve_lifecycle_verification(self.deliverer, source, self.wall_slot) {
                 self.limited.set(true);
                 return false;
             }
@@ -193,7 +195,7 @@ impl<V: SignatureVerifier> SignatureVerifier for LifecycleAdmissionVerifier<'_, 
             return false;
         }
         if let Some(source) = self.source {
-            if !self.mempool.borrow_mut().reserve_lifecycle_verification(source, self.wall_slot) {
+            if !self.mempool.borrow_mut().reserve_lifecycle_verification(self.deliverer, source, self.wall_slot) {
                 self.limited.set(true);
                 return false;
             }
@@ -223,7 +225,7 @@ mod verification_budget_tests {
         {
             let verifier = LifecycleAdmissionVerifier {
                 inner: &inner, mempool: std::cell::RefCell::new(&mut mempool),
-                source: Some(source), wall_slot: 10, limited: std::cell::Cell::new(false),
+                source: Some(source), deliverer: Some([0x0a; 32]), wall_slot: 10, limited: std::cell::Cell::new(false),
             };
             assert!(!verifier.verify_with_key(&[], &[0; 32], &[1]));
             // An exact replay hits the failure cache and consumes no budget.
@@ -235,7 +237,7 @@ mod verification_budget_tests {
         assert_eq!(calls.get(), LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT);
         let verifier = LifecycleAdmissionVerifier {
             inner: &inner, mempool: std::cell::RefCell::new(&mut mempool),
-            source: Some(source), wall_slot: 11, limited: std::cell::Cell::new(false),
+            source: Some(source), deliverer: Some([0x0a; 32]), wall_slot: 11, limited: std::cell::Cell::new(false),
         };
         assert!(!verifier.verify_with_key(&[], &[0; 32], &[4]));
         assert_eq!(calls.get(), LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT + 1);
@@ -312,7 +314,14 @@ pub(super) fn flag_day_opened_after_head(tx: &PosTransaction, head_epoch: u64, w
 }
 
 impl Engine {
-    pub(super) fn validate_lifecycle_admission(&mut self, tx: &PosTransaction) -> Result<(), Refusal> {
+    /// `deliverer` is the peer or RPC client that handed this node `tx`
+    /// (`None` for this node's own submissions); the verification allowance
+    /// is charged to it, per identity (audit L1-02).
+    pub(super) fn validate_lifecycle_admission(
+        &mut self,
+        tx: &PosTransaction,
+        deliverer: Option<[u8; 32]>,
+    ) -> Result<(), Refusal> {
         if !is_lifecycle(tx) {
             return Ok(());
         }
@@ -325,7 +334,7 @@ impl Engine {
         let verifier = LifecycleAdmissionVerifier {
             inner: &self.gossip_verifier,
             mempool: std::cell::RefCell::new(&mut self.mempool),
-            source, wall_slot, limited: std::cell::Cell::new(false),
+            source, deliverer, wall_slot, limited: std::cell::Cell::new(false),
         };
         // HF2 scope: no relay signature policy. Lifecycle transactions are
         // judged under the committee's TRANSACTION rule (v1 forms always
@@ -755,7 +764,7 @@ mod p5a_evidence_admission_tests {
         // Validator 0's own lifecycle allowance for this slot is intact.
         let accused = validator_lifecycle_source(0);
         for _ in 0..LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT {
-            assert!(engine.mempool.reserve_lifecycle_verification(accused, GATE_SLOT));
+            assert!(engine.mempool.reserve_lifecycle_verification(None, accused, GATE_SLOT));
         }
     }
 
