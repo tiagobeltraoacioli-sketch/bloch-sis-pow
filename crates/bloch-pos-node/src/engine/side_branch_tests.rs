@@ -569,3 +569,176 @@ fn retained_side_states_are_bounded_and_keep_what_a_queued_block_waits_on() {
     let after: Vec<[u8; 32]> = engine.reorg_anchors.side.tips.iter().map(|(id, _)| *id).collect();
     assert_eq!(after, queued, "nothing waited on was evicted, and the new state was not kept");
 }
+
+/// Validate the whole side branch of `held_head_with_side_branch`, drop the
+/// cursor, then push `newer` later side states into the ring (as later
+/// validations of other side blocks do), so that neither the tip's nor its
+/// parent's exact post-state is held any more.
+fn validated_side_branch_evicted_from_the_ring(
+    engine: &mut Engine,
+    side: &[[u8; 32]],
+    newer: usize,
+) {
+    validate_until(engine, 500, 16, &|e| side.iter().all(|id| e.blocks.is_validated(id)));
+    engine.validate_side_branch_turn(600);
+    engine.validate_side_branch_turn(600);
+    assert!(engine.reorg_anchors.side.cursor.is_none(), "the cursor is dropped");
+    let post = engine.exact_parent_state(side.last().unwrap()).expect("the tip's state is held at first");
+    for k in 0..newer as u8 {
+        engine.retain_side_state([0xC0 + k; 32], &post);
+    }
+}
+
+/// A block on `parent`, parked for its proposer's authority as the door
+/// parks a block it judged on `fallback`.
+fn park_on(engine: &mut Engine, parent: [u8; 32], bump: u64, source: u8) -> [u8; 32] {
+    let mut child = engine.blocks[&parent].clone();
+    child.header.parent = parent;
+    child.header.slot += bump;
+    let id = *child.block_id().as_bytes();
+    let parked_under = bloch_pos_committee::kes::authority_fingerprint(
+        &*engine.proposer_authority_state(&parent),
+        child.header.proposer_index,
+        epoch_of(child.header.slot),
+    );
+    engine.park_unjudgeable(id, child, Source::Gossip(Some([source; 32])), parked_under);
+    assert!(engine.orphans.iter().any(|(seen, ..)| *seen == id), "fixture: parked");
+    id
+}
+
+/// Review RC4-01: SIDE_TIP_STATES newer side states evict the exact
+/// post-states of a validated side tip AND of its parent before a block on
+/// the tip arrives. The door then judges that block on `fallback` and parks
+/// it; the tip is validated, so it is no longer a fold candidate, and the
+/// head does not move, so nothing would ever judge the block again. With the
+/// door's request (`want_parent_state_for`) the fold recomputes the tip's
+/// state from the nearest exact ancestor within its budgets, keeps it, and
+/// queues the block for the door again.
+#[test]
+fn a_wanted_side_state_evicted_from_the_ring_is_recomputed_and_its_parked_block_judged_again() {
+    let (mut engine, _dir, tip, side) = held_head_with_side_branch(2);
+    let side_tip = side[1];
+    validated_side_branch_evicted_from_the_ring(&mut engine, &side, SIDE_TIP_STATES);
+    assert!(engine.exact_parent_state(&side_tip).is_none(), "fixture: the tip's state was evicted");
+    assert!(engine.exact_parent_state(&side[0]).is_none(), "fixture: and its parent's");
+    let child = park_on(&mut engine, side_tip, 1, 0x64);
+
+    // Without the request: the stall. Nothing re-judges the block.
+    for slot in 700..708 {
+        for _ in 0..2 * SIDE_BRANCH_BLOCKS_PER_SLOT {
+            engine.validate_side_branch_turn(slot);
+        }
+    }
+    assert!(engine.orphans.iter().any(|(id, ..)| *id == child), "still parked: RC4-01");
+    assert!(engine.exact_parent_state(&side_tip).is_none());
+
+    // With it: recomputed within the fold's bounds, kept, and re-judged.
+    engine.want_parent_state_for(child);
+    let slots = validate_until(&mut engine, 800, 16, &|e| {
+        e.deferred_orphans.iter().any(|(id, ..)| *id == child) && e.exact_parent_state(&side_tip).is_some()
+    });
+    assert!(slots <= 2, "a short branch is recomputed within a slot or two ({slots})");
+    assert!(engine.reorg_anchors.side.want_starts <= SIDE_WANT_STARTS_PER_SLOT);
+    assert!(!engine.orphans.iter().any(|(id, ..)| *id == child), "out of the waiting pool");
+    assert_eq!(*engine.head_id().as_bytes(), tip, "the head did not move");
+    let held = engine.exact_parent_state(&side_tip).expect("the tip's exact post-state is held again");
+    assert_eq!(held.state_root(), engine.blocks[&side_tip].header.state_root, "and it is the tip's own");
+    assert!(engine.reorg_anchors.side.tips.len() <= SIDE_TIP_STATES, "the ring stays bounded");
+    // Served: nothing more is wanted, and the next turns do no work for it.
+    engine.validate_side_branch_turn(900);
+    engine.validate_side_branch_turn(900);
+    assert!(engine.reorg_anchors.side.wanting.is_empty());
+    assert!(engine.reorg_anchors.side.want_cursor.is_none() && engine.reorg_anchors.side.want_target.is_none());
+    assert_eq!(engine.reorg_anchors.side.spent, 0, "no block was applied for nothing");
+}
+
+/// Review RC4-01, the bounds of the request: a request whose block is not
+/// parked, or whose parent is canonical, not yet validated, or not stored,
+/// costs no block application and is forgotten; a parent whose state is
+/// held again is served without running anything.
+#[test]
+fn a_wanted_side_state_is_recomputed_only_for_a_parked_block_on_a_stored_validated_side_parent() {
+    let (mut engine, _dir, tip, side) = held_head_with_side_branch(2);
+    // Not validated yet: the fold, not the request, is what reaches it.
+    let early = park_on(&mut engine, side[1], 1, 0x65);
+    engine.want_parent_state_for(early);
+    // On the canonical head: a head change is what re-judges it.
+    let on_head = park_on(&mut engine, tip, 1, 0x66);
+    engine.want_parent_state_for(on_head);
+    // Not parked at all.
+    engine.want_parent_state_for([0x5A; 32]);
+    assert!(engine.serve_wanted_side_state_turn().is_none(), "nothing to recompute");
+    assert!(engine.reorg_anchors.side.wanting.is_empty(), "every request was forgotten");
+    assert_eq!(engine.reorg_anchors.side.spent, 0, "and none cost a block application");
+    assert!(engine.orphans.iter().any(|(id, ..)| *id == on_head), "nothing was moved for them");
+
+    // Validated, and its state is held: queued at once, nothing applied.
+    validate_until(&mut engine, 500, 16, &|e| side.iter().all(|id| e.blocks.is_validated(id)));
+    engine.validate_side_branch_turn(600);
+    engine.validate_side_branch_turn(600);
+    let late = park_on(&mut engine, side[1], 2, 0x67);
+    engine.want_parent_state_for(late);
+    let spent = engine.reorg_anchors.side.spent;
+    assert_eq!(engine.serve_wanted_side_state_turn(), None);
+    assert_eq!(engine.reorg_anchors.side.spent, spent, "no block applied");
+    assert!(engine.deferred_orphans.iter().any(|(id, ..)| *id == late), "queued for the door");
+}
+
+/// Review RC4-02: a block held in the orphan pool only until a spent
+/// allowance renews keeps the side state it waits on in the ring, like one
+/// already queued for the door.
+#[test]
+fn a_budget_parked_block_keeps_the_side_state_it_waits_on() {
+    let (mut engine, _dir, _tip, side) = held_head_with_side_branch(2);
+    validate_until(&mut engine, 500, 16, &|e| side.iter().all(|id| e.blocks.is_validated(id)));
+    let side_tip = side[1];
+    let post = engine.exact_parent_state(&side_tip).expect("held");
+    let mut child = engine.blocks[&side_tip].clone();
+    child.header.parent = side_tip;
+    child.header.slot += 1;
+    let child_id = *child.block_id().as_bytes();
+    engine.wall_slot = 601;
+    engine.park_budget_limited_block(child_id, child, Source::Gossip(Some([0x68; 32])));
+    assert!(engine.orphans.iter().any(|(id, ..)| *id == child_id), "fixture: held in the pool");
+    assert!(engine.gossip_verifier.is_budget_parked(&child_id), "fixture: for a spent allowance");
+    for k in 0..2 * SIDE_TIP_STATES as u8 {
+        engine.retain_side_state([0xB0 + k; 32], &post);
+        assert!(engine.reorg_anchors.side.tips.len() <= SIDE_TIP_STATES, "bounded");
+        assert!(engine.reorg_anchors.side.tips.iter().any(|(id, _)| *id == side_tip), "the waited-on tip stays");
+    }
+    // Once the allowance renews it is queued for the door: still kept.
+    engine.requeue_budget_parked_blocks(602);
+    assert!(engine.deferred_orphans.iter().any(|(id, ..)| *id == child_id));
+    engine.retain_side_state([0xBF; 32], &post);
+    assert!(engine.reorg_anchors.side.tips.iter().any(|(id, _)| *id == side_tip));
+}
+
+/// Review RC4-03: with every entry waited on, an ordinary state is not
+/// kept, but one recomputed because the door asked for it is, in the place
+/// of the oldest entry, and the ring stays bounded.
+#[test]
+fn a_wanted_state_is_kept_even_when_every_entry_is_waited_on() {
+    let (mut engine, _dir, _tip, side) = held_head_with_side_branch(2);
+    validate_until(&mut engine, 500, 16, &|e| side.iter().all(|id| e.blocks.is_validated(id)));
+    let side_tip = side[1];
+    let post = engine.exact_parent_state(&side_tip).expect("held");
+    for k in 0..SIDE_TIP_STATES as u8 {
+        engine.retain_side_state([0xA0 + k; 32], &post);
+    }
+    let held: Vec<[u8; 32]> = engine.reorg_anchors.side.tips.iter().map(|(id, _)| *id).collect();
+    for (n, of) in held.iter().enumerate() {
+        let mut waiting = engine.blocks[&side_tip].clone();
+        waiting.header.parent = *of;
+        waiting.header.slot += 2 + n as u64;
+        let id = *waiting.block_id().as_bytes();
+        engine.deferred_orphans.push_back((id, waiting, Source::Gossip(Some([0x69; 32])), None, 0));
+    }
+    engine.retain_side_state([0xAE; 32], &post);
+    let after: Vec<[u8; 32]> = engine.reorg_anchors.side.tips.iter().map(|(id, _)| *id).collect();
+    assert_eq!(after, held, "an ordinary state is not kept");
+    engine.retain_side_state_as([0xAF; 32], &post, true);
+    let after: Vec<[u8; 32]> = engine.reorg_anchors.side.tips.iter().map(|(id, _)| *id).collect();
+    assert_eq!(after.len(), SIDE_TIP_STATES, "bounded");
+    assert_eq!(after.last(), Some(&[0xAF; 32]), "the wanted one is kept");
+    assert_eq!(&after[..SIDE_TIP_STATES - 1], &held[1..], "in the oldest entry's place");
+}

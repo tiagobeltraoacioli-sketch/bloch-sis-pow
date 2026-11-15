@@ -313,6 +313,12 @@ impl<V> GossipVerifier<V> {
         parked.push_back((slot, id));
     }
 
+    /// Whether block `id` is held only until a spent allowance renews
+    /// (review RC4-02: the side states it waits on are kept for it).
+    pub(super) fn is_budget_parked(&self, id: &[u8; 32]) -> bool {
+        self.budget_parked.borrow().iter().any(|(_, seen)| seen == id)
+    }
+
     /// Remove and return the ids parked in a slot before `slot`: their
     /// refusal was a statement about an allowance that has since renewed.
     pub(super) fn take_budget_parked_blocks_before(&self, slot: u64) -> Vec<[u8; 32]> {

@@ -1356,6 +1356,17 @@ fn a_bind_crossing_block_on_a_deeper_side_branch_is_admitted_once_the_fold_reach
 /// Returns the engine, its directory, the ids (a1, h1, h2, b), B and B's
 /// slot.
 fn deeper_siblings_fixture() -> (Engine, perf_support::TestDir, [[u8; 32]; 4], BlockEnvelope, u64) {
+    let (engine, dir, ids, env_b, sb, forks) = deeper_siblings_fixture_with(0);
+    assert!(forks.is_empty());
+    (engine, dir, ids, env_b, sb)
+}
+
+/// [`deeper_siblings_fixture`], plus `forks` one-block side forks on P in
+/// the slots after H2 (8619), stored as admission stores them (not
+/// validated). Their ids are returned last.
+fn deeper_siblings_fixture_with(
+    forks: usize,
+) -> (Engine, perf_support::TestDir, [[u8; 32]; 4], BlockEnvelope, u64, Vec<[u8; 32]>) {
     use bloch_pos_committee::params::{KES_ACTIVATION_EPOCH, KES_BIND_DELAY_EPOCHS};
     let gate = KES_ACTIVATION_EPOCH;
     let bind = gate + KES_BIND_DELAY_EPOCHS;
@@ -1384,6 +1395,15 @@ fn deeper_siblings_fixture() -> (Engine, perf_support::TestDir, [[u8; 32]; 4], B
     assert!(engine.do_reorg(p, Vec::new()), "hand A2, H2 back");
     engine.blocks.remove(&h2);
     engine.blocks.remove(&a2);
+    let mut fork_envs = Vec::new();
+    for k in 0..forks as u64 {
+        let (f, env_f) = propose_at(&mut engine, s0 + 4 + k);
+        assert_eq!(env_f.header.parent, p);
+        assert_eq!(epoch_of(env_f.header.slot), gate - 1, "fixture: the forks are in H2's epoch");
+        assert!(engine.do_reorg(p, Vec::new()), "hand the fork back");
+        engine.blocks.remove(&f);
+        fork_envs.push((f, env_f));
+    }
     engine.blocks.insert(a1, env_a1.clone());
     engine.blocks.insert(h1, env_h1.clone());
     assert!(engine.do_reorg(p, vec![env_a1.clone(), env_h1.clone()]), "onto H1 to build B");
@@ -1402,7 +1422,11 @@ fn deeper_siblings_fixture() -> (Engine, perf_support::TestDir, [[u8; 32]; 4], B
         engine.blocks.remove(&id);
         engine.blocks.insert(id, env.clone());
     }
-    engine.recent_states.retain(|(id, _)| *id != a1 && *id != h1);
+    for (f, env_f) in &fork_envs {
+        engine.blocks.insert(*f, env_f.clone());
+    }
+    let fork_ids: Vec<[u8; 32]> = fork_envs.iter().map(|(f, _)| *f).collect();
+    engine.recent_states.retain(|(id, _)| *id != a1 && *id != h1 && !fork_ids.contains(id));
     engine.reorg_anchors.side.cursor = None;
     let vote = forkchoice_tests::attest(0, s0 + 3, h2);
     engine.pool.insert((vote.validator, vote.data.signing_root()), vote);
@@ -1410,8 +1434,9 @@ fn deeper_siblings_fixture() -> (Engine, perf_support::TestDir, [[u8; 32]; 4], B
     assert_eq!(engine.forkchoice_head(), h2, "fixture: the vote holds the head");
     assert!(engine.exact_parent_state(&h1).is_none() && engine.exact_parent_state(&a1).is_none());
     assert!(!engine.blocks.is_validated(&a1) && !engine.blocks.is_validated(&h1));
+    assert!(fork_ids.iter().all(|f| !engine.blocks.is_validated(f) && !engine.canonical.contains(f)));
 
-    (engine, dir, [a1, h1, h2, b], env_b, sb)
+    (engine, dir, [a1, h1, h2, b], env_b, sb, fork_ids)
 }
 
 /// **Review RC3-01, end to end at mainnet numbers: the natural order.**
@@ -1489,4 +1514,89 @@ fn a_registration_born_expired_is_refused_at_the_door() {
     assert!(!validator_lifecycle::kes_registration_born_expired(&rolled, epoch, 2), "four periods of life");
     assert!(!validator_lifecycle::kes_registration_born_expired(&rolled, epoch, 8));
     assert!(!validator_lifecycle::kes_registration_born_expired(&rolled, gate - 1, 1), "the epoch before the gate");
+}
+
+/// **Review RC4-01, end to end at mainnet numbers.**
+///
+/// The natural order of the RC3-01 test, but before B arrives the fold also
+/// validates [`SIDE_TIP_STATES`] newer side blocks (one-block forks on P in
+/// 8619, as further proposers' variants or short forks of a stalled network
+/// produce), each of which keeps its state in the ring: H1's and A1's
+/// exact post-states are evicted. In 84040ce0 B was then judged on
+/// `fallback`, parked, and never judged again: H1 is validated, so no
+/// longer a fold candidate, and the head does not move. Now the door asks
+/// for H1's state, the fold recomputes it from the nearest exact ancestor
+/// within its budgets, B is queued again and admitted on H1's own state,
+/// rolled into 8622, while the head stays H2.
+///
+/// `cargo test --release -p bloch-pos-node --bin bloch-pos -- --ignored left_the_ring`.
+#[test]
+#[ignore = "several minutes: drives a real chain to epoch 8622"]
+fn a_bind_crossing_block_whose_validated_side_parent_left_the_ring_is_admitted_after_recomputation() {
+    use bloch_pos_committee::params::{KES_ACTIVATION_EPOCH, KES_BIND_DELAY_EPOCHS};
+    let bind = KES_ACTIVATION_EPOCH + KES_BIND_DELAY_EPOCHS;
+    let (mut engine, _dir, [a1, h1, h2, b], env_b, sb, forks) = deeper_siblings_fixture_with(SIDE_TIP_STATES);
+    engine.live = true;
+
+    // The fold: A1 and H1 first (the longer branch), then every fork.
+    let mut slot = sb;
+    let all_validated =
+        |e: &Engine| [a1, h1].iter().chain(forks.iter()).all(|id| e.blocks.is_validated(id));
+    while !all_validated(&engine) {
+        assert!(slot < sb + 64, "the fold validates every side block within a few slots");
+        let _w = wall_at(&mut engine, slot);
+        for _ in 0..4 {
+            engine.validate_side_branch_turn(slot);
+        }
+        slot += 1;
+    }
+    {
+        let _w = wall_at(&mut engine, slot);
+        engine.validate_side_branch_turn(slot);
+        engine.validate_side_branch_turn(slot);
+    }
+    assert!(engine.reorg_anchors.side.cursor.is_none(), "the cursor is dropped");
+    assert_eq!(*engine.head_id().as_bytes(), h2, "a stalled head: validation adopted nothing");
+    assert!(
+        engine.exact_parent_state(&h1).is_none() && engine.exact_parent_state(&a1).is_none(),
+        "RC4-01: newer side states evicted H1's and A1's"
+    );
+
+    // B by gossip: judged on `fallback`, parked, and H1's state is asked for.
+    {
+        let _w = wall_at(&mut engine, slot);
+        let (verdict, landed) = engine.ingest_one(env_b.clone(), Source::Gossip(Some([0x59; 32])));
+        assert_eq!(verdict, Verdict::Ignore);
+        assert!(landed.is_none());
+    }
+    assert!(engine.orphans.iter().any(|(id, ..)| *id == b), "B is parked");
+    assert!(engine.authority_parked.judged.contains_key(&b), "for its proposer's authority");
+    assert!(engine.authority_parked_due().is_empty(), "the head did not change: the old trigger never fires");
+    assert!(engine.reorg_anchors.side.wanting.contains(&b), "the door asked for H1's state");
+
+    // The fold recomputes it; B is queued again and admitted on it.
+    let mut admitted = false;
+    for _ in 0..32 {
+        slot += 1;
+        let _w = wall_at(&mut engine, slot);
+        engine.requeue_budget_parked_blocks(slot);
+        for _ in 0..4 {
+            engine.validate_side_branch_turn(slot);
+        }
+        while engine.deferred_orphans.iter().any(|(id, ..)| *id == b) {
+            engine.release_orphan_turn();
+        }
+        if engine.blocks.contains_key(&b) || engine.canonical.contains(&b) {
+            admitted = true;
+            break;
+        }
+    }
+    assert!(admitted, "B is admitted once H1's state is recomputed");
+    assert!(!engine.orphans.iter().any(|(id, ..)| *id == b), "not parked again");
+    assert_eq!(engine.state.door_cached(&h1, bind).expect("cached by (H1, 8622)").kes_enforced_from(), Some(bind));
+    {
+        let _w = wall_at(&mut engine, slot + 1);
+        engine.validate_side_branch_turn(slot + 1);
+    }
+    assert!(engine.reorg_anchors.side.wanting.is_empty(), "served, and the request is gone");
 }
