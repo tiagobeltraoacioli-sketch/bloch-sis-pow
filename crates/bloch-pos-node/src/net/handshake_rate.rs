@@ -37,8 +37,11 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Instant;
 
-/// Handshakes one non-configured source may start in a burst.
-pub(super) const PER_SOURCE_BURST: f64 = 8.0;
+/// Handshakes one non-configured source may start in a burst: exactly the
+/// connections the slot table lets it hold (`MAX_INBOUND_PER_SOURCE`), so a
+/// host running many nodes behind one address (sixteen co-hosted validators
+/// on mainnet) can still open all its connections at once after a restart.
+pub(super) const PER_SOURCE_BURST: f64 = super::MAX_INBOUND_PER_SOURCE as f64;
 /// Sustained handshakes per second for one non-configured source.
 pub(super) const PER_SOURCE_PER_SEC: f64 = 2.0;
 /// Handshakes all strangers together may start in a burst (general bucket).
