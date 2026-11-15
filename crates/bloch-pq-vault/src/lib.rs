@@ -140,7 +140,7 @@ const VAULT_PURPOSE_V2: &str = "1998'";
 /// of obtaining or replacing secret-bearing fields directly:
 ///
 /// ```compile_fail
-/// # let keys = bloch_pq_vault::derive_vault_keys(&[7u8; 32], false).unwrap();
+/// # let keys = bloch_pq_vault::derive_new_vault_keys(&[7u8; 32], false).unwrap();
 /// let copied = keys.pq_secret.clone();
 /// ```
 pub struct VaultKeys {
@@ -204,19 +204,25 @@ impl Drop for VaultKeys {
 /// at `m/1999'/coin'/0'/{0',1'}`, domain-separated PQ seed). Identical to
 /// [`derive_vault_keys_v3`]; persist `keys.key_derivation` with the backup.
 ///
-/// L1M-01: this function used to return the historical V1 derivation (hot key
-/// = the wallet's first BIP-84 receive key, recovery = its non-hardened
-/// sibling), so a spent-from receive address plus a leaked account xpub
-/// exposed BOTH vault branches. The signature changed from `-> VaultKeys`
-/// (panicking) to `-> Result<VaultKeys, String>` on purpose: every existing
-/// caller fails to compile and must choose between this secure default and
-/// the explicit legacy restore path below, instead of silently re-deriving a
-/// funded V1 vault to different keys.
+/// L1M-01: the historical unversioned `derive_vault_keys` returned the V1
+/// derivation (hot key = the wallet's first BIP-84 receive key, recovery = its
+/// non-hardened sibling), so a spent-from receive address plus a leaked
+/// account xpub exposed BOTH vault branches. That name is REMOVED on purpose
+/// (no alias, no deprecated shim): an integrator's build breaks with "not
+/// found" and cannot be repaired by adding `?`, which would silently
+/// re-derive a funded V1 vault to different addresses. Every caller must pick
+/// this function (new vault) or an explicit restore path.
 ///
 /// To RESTORE an existing vault, never call this: use
 /// [`derive_vault_keys_versioned`] with the persisted version, or
 /// [`derive_legacy_v1_vault_keys_for_restore`] for pre-versioning V1 vaults.
-pub fn derive_vault_keys(seed: &[u8], mainnet: bool) -> Result<VaultKeys, String> {
+///
+/// The removed name must stay removed:
+///
+/// ```compile_fail
+/// let _ = bloch_pq_vault::derive_vault_keys(&[7u8; 32], false);
+/// ```
+pub fn derive_new_vault_keys(seed: &[u8], mainnet: bool) -> Result<VaultKeys, String> {
     derive_vault_keys_v3(seed, mainnet)
 }
 
@@ -226,7 +232,7 @@ pub fn derive_vault_keys(seed: &[u8], mainnet: bool) -> Result<VaultKeys, String
 /// = `bloch_crypto::generate_keypair_from_seed(seed)`).
 ///
 /// Use this ONLY to recover funds from a vault that was already built with the
-/// historical unversioned `derive_vault_keys` (before L1M-01). Never build a
+/// historical unversioned `derive_vault_keys` (removed by L1M-01). Never build a
 /// new vault with it: the hot key is the wallet's first receive address and
 /// the recovery key is its non-hardened sibling, so hot_sk + the account xpub
 /// yields recovery_sk. Output bytes are unchanged from the historical V1
@@ -428,7 +434,7 @@ mod e2e_tests {
 
     /// Build a vault + its keys + preimage for a given vault id.
     fn setup(vault_id: &[u8]) -> (VaultKeys, VaultParams, [u8; 32]) {
-        let keys = derive_vault_keys(&seed(), false).unwrap();
+        let keys = derive_new_vault_keys(&seed(), false).unwrap();
         let (r, hr) = derive_recovery_zeroizing(&keys.pq_secret, vault_id);
         let r = *r;
         let p = VaultParams {
@@ -677,7 +683,7 @@ mod e2e_tests {
 
     // ── A4-M-5: vault key derivation versioning ─────────────────────────────
 
-    /// A4-M-5 KAT: `derive_vault_keys` (V1) must remain byte-for-byte what it
+    /// A4-M-5 KAT: the legacy V1 derivation must remain byte-for-byte what it
     /// always was for the canonical seed — the SAME hot/recovery pubkeys the
     /// pre-fix code produced. Pins the exact BIP-84 receive-chain keys so an
     /// existing vault built under V1 never silently re-derives to different
@@ -734,7 +740,7 @@ mod e2e_tests {
     /// receive key. Fails on the pre-fix code (default was V1).
     #[test]
     fn default_vault_keys_are_v3_not_the_wallet_receive_chain() {
-        let keys = derive_vault_keys(&seed(), false).unwrap();
+        let keys = derive_new_vault_keys(&seed(), false).unwrap();
         let v3 = derive_vault_keys_v3(&seed(), false).unwrap();
         let v1 = derive_legacy_v1_vault_keys_for_restore(&seed(), false).unwrap();
         assert_eq!(keys.key_derivation, VaultKeyDerivation::V3HardenedRoles);
@@ -746,7 +752,7 @@ mod e2e_tests {
         let identity = bloch_btc_wallet::derive_identity(&seed(), false).unwrap();
         assert_ne!(keys.hot_pubkey.to_bytes(), identity.btc_pubkey);
         // The default is fallible (no panic on a malformed seed).
-        assert!(derive_vault_keys(&[0x11u8; 8], false).is_err());
+        assert!(derive_new_vault_keys(&[0x11u8; 8], false).is_err());
         assert!(derive_legacy_v1_vault_keys_for_restore(&[0x11u8; 8], false).is_err());
     }
 

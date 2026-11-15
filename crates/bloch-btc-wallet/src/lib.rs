@@ -164,7 +164,7 @@ fn derive_btc(seed: &[u8], path: &str, mainnet: bool) -> Result<(Vec<u8>, String
 /// index (BIP-84 `m/84'/0'/0'/0/0`, BIP-86 `m/86'/0'/0'/0/0`) for the BTC keys, and
 /// [`PqSeedKdf::V1RawSeedReuse`] (the historical, documented "exact companion key"
 /// of the legacy V1 vault, `bloch_pq_vault::derive_legacy_v1_vault_keys_for_restore`)
-/// for the PQ keypair. New vaults (`bloch_pq_vault::derive_vault_keys`, V3) use a
+/// for the PQ keypair. New vaults (`bloch_pq_vault::derive_new_vault_keys`, V3) use a
 /// domain-separated PQ key instead.
 ///
 /// I-13: fails closed (`Err`) on a too-short seed instead of panicking through
