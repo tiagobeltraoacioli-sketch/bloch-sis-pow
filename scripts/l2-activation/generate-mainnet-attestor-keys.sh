@@ -35,8 +35,13 @@
 #                      Linux, a RAM disk on macOS, e.g.
 #                      `diskutil erasevolume HFS+ ATTRAM $(hdiutil attach -nomount ram://16384)`
 #                      then --ram-dir /Volumes/ATTRAM). Default on Linux:
-#                      /dev/shm, refused unless it is tmpfs/ramfs. On other
-#                      systems --ram-dir is required with --age-recipient.
+#                      /dev/shm. Verified on both systems (statfs type on
+#                      Linux; on macOS the volume must be an attached ram://
+#                      image per `hdiutil info`); anything else is refused.
+#                      Because it is RAM, the overwrite-then-unlink of the
+#                      staged plaintext is meaningful there (on APFS an
+#                      in-place overwrite is not, which is why plaintext is
+#                      never staged on disk).
 #   --plaintext-on-unencrypted-disk
 #                      without --age-recipient the .sk stays plaintext hex
 #                      (0600, dir 0700) in --out-dir, which is refused unless
@@ -75,7 +80,7 @@ while [[ $# -gt 0 ]]; do
         --age-recipient) AGE_RECIPIENT="${2:?}"; shift 2 ;;
         --ram-dir) RAM_DIR="${2:?}"; shift 2 ;;
         --plaintext-on-unencrypted-disk) PLAINTEXT_OK=1; shift ;;
-        -h|--help) sed -n '2,54p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,57p' "$0"; exit 0 ;;
         *) die "unknown argument $1" ;;
     esac
 done
@@ -110,25 +115,40 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# The block device DIR is mounted from (e.g. /dev/disk3s1).
+mount_device() { df -P "$1" 2>/dev/null | awk 'NR==2 {print $1}'; }
+
 # Is DIR on a RAM-backed filesystem? Linux: tmpfs/ramfs by statfs type.
-# Elsewhere the operator vouches for --ram-dir (a RAM disk cannot be told
-# apart from a disk volume portably).
+# macOS: the volume's device must belong to an attached `ram://` disk image
+# (`hdiutil info`), so a USB stick or a folder on the boot disk is refused.
+# Anything else: fail closed.
 ram_backed() {
-    local d="$1" t
+    local d="$1" t dev
     case "$(uname -s)" in
         Linux)
             t=$(stat -f -c %T "$d" 2>/dev/null) || return 1
             [[ "$t" == tmpfs || "$t" == ramfs ]] ;;
-        *) [[ -n "$RAM_DIR" ]] ;;
+        Darwin)
+            dev=$(mount_device "$d"); [[ "$dev" == /dev/disk* ]] || return 1
+            hdiutil info 2>/dev/null | awk -v dev="$dev" '
+                /^=+$/ { ram = 0 }
+                /^image-path[[:space:]]*:/ { ram = ($NF ~ /^ram:\/\//) }
+                ram && $1 == dev { found = 1 }
+                END { exit found ? 0 : 1 }' ;;
+        *) return 1 ;;
     esac
 }
 
-# Is DIR on an encrypted volume? macOS: FileVault; Linux: a dm-crypt device
-# under the mount. Anything undetectable counts as "no" (fail closed).
+# Is DIR on an encrypted volume? macOS: the volume DIR itself lives on must
+# report FileVault/encryption in `diskutil info` (not merely the boot volume,
+# which is all `fdesetup isactive` looks at); Linux: a dm-crypt device under
+# the mount. Anything undetectable counts as "no" (fail closed).
 encrypted_volume() {
     local d="$1" src
     case "$(uname -s)" in
-        Darwin) [[ "$(fdesetup isactive 2>/dev/null)" == true ]] ;;
+        Darwin)
+            src=$(mount_device "$d"); [[ "$src" == /dev/disk* ]] || return 1
+            diskutil info "$src" 2>/dev/null | grep -Eq '^[[:space:]]*(FileVault|Encrypted):[[:space:]]*Yes' ;;
         Linux)
             command -v findmnt >/dev/null && command -v lsblk >/dev/null || return 1
             src=$(findmnt -no SOURCE --target "$d" 2>/dev/null) || return 1
@@ -140,7 +160,7 @@ encrypted_volume() {
 if [[ "$MODE" != assemble ]]; then
     if [[ -n "$AGE_RECIPIENT" ]]; then
         if [[ -z "$RAM_DIR" ]]; then
-            [[ "$(uname -s)" == Linux ]] || die "--age-recipient needs --ram-dir on $(uname -s) (see --help)"
+            [[ "$(uname -s)" == Linux ]] || die "--age-recipient needs --ram-dir (a RAM disk) on $(uname -s) (see --help)"
             RAM_DIR=/dev/shm
         fi
         [[ -d "$RAM_DIR" ]] || die "--ram-dir $RAM_DIR is not a directory"
