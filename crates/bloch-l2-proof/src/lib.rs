@@ -43,6 +43,12 @@ pub fn policy_commitment_v3() -> [u8; 32] {
 /// Program identity and all other public fields must be selected and compared
 /// against committed state by the caller. This function checks the BN254 key
 /// matches the statement and invokes the actual pairing verifier.
+///
+/// L1M-15: Groth16 proofs are re-randomizable — anyone holding a valid proof
+/// can derive other valid proof byte strings for the same `values`. A proof's
+/// bytes (or their hash) must therefore never serve as an identifier, replay
+/// key or deduplication key; bind uniqueness to the public values (chain id,
+/// roots, batch) the caller commits, as `l2_settlement` does.
 pub fn verify(policy: &[u8; 32], program: &[u8; 32], values: &[u8], proof: &[u8]) -> bool {
     // The policy selects exactly one statement version; the other never verifies.
     let (tag, length) = if *policy == policy_commitment() {
