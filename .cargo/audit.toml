@@ -28,6 +28,10 @@ ignore = [
     "RUSTSEC-2026-0162", # pqcrypto-traits    unmaintained
     "RUSTSEC-2026-0163", # pqcrypto-internals unmaintained (vendored crate)
     "RUSTSEC-2024-0381", # pqcrypto-kyber     superseded by pqcrypto-mlkem
+    "RUSTSEC-2026-0161", # pqcrypto-mlkem unmaintained — EXCEPTION 2026-11-14
+                         # (L1M-06), re-review by 2027-02-14; no patched release.
+                         # Optional hybrid (ML-KEM-768 + X25519) mesh transport
+                         # only, never consensus. Mirrors deny.toml.
     # ── Transitive, no first-party call path ──────────────────────────────────
     "RUSTSEC-2025-0141", # bincode 1.3.3 unmaintained — node-local restart cache.
                          # First-party use now exists; cache is checksummed,

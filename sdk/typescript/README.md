@@ -147,6 +147,14 @@ try {
 }
 ```
 
+**API key transport (breaking change, L1M-18).** With `apiKey` set, the client
+refuses to call an `http://` URL whose host is not loopback (`127.0.0.0/8`,
+`::1`, `localhost`) and throws `BlochTransportError` before any request is
+made, because the key would cross the network in the clear. Use `https://`. If
+you knowingly run plaintext over a private link (VPN, WireGuard), pass
+`allowInsecureHttp: true`. A request carrying the key is sent with
+`redirect: "error"`. Key-less reads are unaffected.
+
 `BlochTransportError` is thrown for network failures, non-JSON bodies, and
 non-2xx responses that don't carry a JSON-RPC error.
 

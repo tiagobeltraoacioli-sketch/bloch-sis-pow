@@ -51,14 +51,47 @@ export interface Signer {
  *   stdout -> either raw signed tx hex, or a JSON object {"rawHex": "...", "txid?": "..."}
  *   exit 0 on success; non-zero => error (stderr surfaced)
  */
+/**
+ * L1M-13: turn FAUCET_SIGNER_CMD into an argv vector executed WITHOUT a shell.
+ * Accepted forms: a JSON array of strings (`["/usr/bin/bloch-wallet","faucet-sign"]`),
+ * or plain whitespace-separated words (`bloch-wallet faucet-sign`). Shell
+ * syntax (quotes, `$`, `|`, `;`, redirections, globs …) is refused instead of
+ * being silently mis-split: wrap anything fancier in a script and point at it.
+ */
+export function parseSignerCommand(cmd: string): string[] {
+  const t = cmd.trim();
+  let argv: unknown;
+  if (t.startsWith("[")) {
+    try {
+      argv = JSON.parse(t);
+    } catch {
+      throw new Error("FAUCET_SIGNER_CMD: invalid JSON argv array");
+    }
+    if (!Array.isArray(argv) || argv.length === 0 || !argv.every((a) => typeof a === "string" && a.length > 0)) {
+      throw new Error("FAUCET_SIGNER_CMD: JSON argv must be a non-empty array of non-empty strings");
+    }
+    return argv as string[];
+  }
+  if (/["'`$|;&<>(){}*?~\\\n]/.test(t)) {
+    throw new Error("FAUCET_SIGNER_CMD: shell syntax is not interpreted; use a JSON argv array or a wrapper script");
+  }
+  const words = t.split(/\s+/).filter((w) => w.length > 0);
+  if (words.length === 0) throw new Error("FAUCET_SIGNER_CMD: empty command");
+  return words;
+}
+
 export class ExternalCommandSigner implements Signer {
   readonly kind = "external-command";
-  constructor(private readonly cmd: string) {}
+  private readonly argv: string[];
+  constructor(cmd: string) {
+    this.argv = parseSignerCommand(cmd);
+  }
 
   buildSignedPayment(job: PaymentJob): Promise<SignerResult> {
     return new Promise((resolve, reject) => {
-      // Run via the shell so operators can configure e.g. "bloch-wallet faucet-sign".
-      const child = spawn(this.cmd, { shell: true, stdio: ["pipe", "pipe", "pipe"] });
+      // L1M-13: argv exec, no shell (operator config is not re-parsed by /bin/sh).
+      const [file, ...args] = this.argv;
+      const child = spawn(file!, args, { shell: false, stdio: ["pipe", "pipe", "pipe"] });
       let out = "";
       let err = "";
       child.stdout.on("data", (d) => (out += d.toString()));

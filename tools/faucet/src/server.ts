@@ -3,24 +3,43 @@
 // (no framework dependency).
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import type { FaucetConfig } from "./config.js";
+import { isIP } from "node:net";
+import { normalizeIp, type FaucetConfig } from "./config.js";
 import type { Faucet } from "./faucet.js";
 import type { RateLimiter } from "./ratelimit.js";
 import { parseAddress, encodeAddress } from "./address.js";
 import { renderForm } from "./web.js";
 
-// Only honor X-Forwarded-For when explicitly told we sit behind a trusted proxy
-// (FAUCET_TRUST_PROXY=1). Otherwise a client can rotate the XFF header to forge a
-// fresh source IP and bypass the per-IP rate limit — so we use the real socket
-// peer by default.
-const TRUST_PROXY = process.env["FAUCET_TRUST_PROXY"] === "1";
-
-function clientIp(req: IncomingMessage): string {
-  if (TRUST_PROXY) {
-    const xff = req.headers["x-forwarded-for"];
-    if (typeof xff === "string" && xff.length > 0) return xff.split(",")[0]!.trim();
+// L1M-02: X-Forwarded-For is honoured only when the TCP peer is a configured
+// trusted proxy (cfg.trustedProxies), and then it is read FROM THE RIGHT: each
+// trusted proxy APPENDS the address it accepted the connection from
+// (nginx `$proxy_add_x_forwarded_for`), so the left-most entries are whatever
+// the client typed and must never be used. Walking right-to-left and skipping
+// our own proxies, the first other entry is the address our outermost trusted
+// proxy actually saw. Before this fix the LEFT-most entry was used, so a client
+// rotating a forged XFF value got a fresh per-IP bucket on every request.
+// Missing header, all-proxy chain, or a non-IP entry → charge the TCP peer
+// (one shared bucket for the proxy, fail closed).
+export function clientIpFrom(
+  remoteAddress: string | undefined,
+  xff: string | string[] | undefined,
+  trustedProxies: readonly string[],
+): string {
+  const peer = remoteAddress === undefined ? "unknown" : normalizeIp(remoteAddress);
+  if (trustedProxies.length === 0 || !trustedProxies.includes(peer)) return peer;
+  const joined = Array.isArray(xff) ? xff.join(",") : xff;
+  if (typeof joined !== "string" || joined.length === 0) return peer;
+  const hops = joined.split(",").map((h) => normalizeIp(h));
+  for (let i = hops.length - 1; i >= 0; i--) {
+    const hop = hops[i]!;
+    if (trustedProxies.includes(hop)) continue;
+    return isIP(hop) === 0 ? peer : hop;
   }
-  return req.socket.remoteAddress ?? "unknown";
+  return peer;
+}
+
+function clientIp(req: IncomingMessage, trustedProxies: readonly string[]): string {
+  return clientIpFrom(req.socket.remoteAddress, req.headers["x-forwarded-for"], trustedProxies);
 }
 
 function json(res: ServerResponse, status: number, body: unknown): void {
@@ -50,7 +69,7 @@ async function readBody(req: IncomingMessage, limit = 64 * 1024): Promise<string
 export function createFaucetServer(cfg: FaucetConfig, faucet: Faucet, limiter: RateLimiter) {
   return createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
-    const ip = clientIp(req);
+    const ip = clientIp(req, cfg.trustedProxies);
 
     try {
       if (req.method === "GET" && url.pathname === "/") {

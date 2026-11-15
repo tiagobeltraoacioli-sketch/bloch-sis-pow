@@ -42,6 +42,10 @@ hex            = "0.4"
 tower          = { version = "0.4", features = ["limit", "util"] }
 tower-http     = { version = "0.6", features = ["timeout"] }
 
+[dev-dependencies]
+# Tests only: Falcon padded-length constants for the L1M-07 regression test.
+bloch-crypto   = { path = "../../crates/bloch-crypto" }
+
 # Mirror the parent workspace's vendored pqcrypto-internals fork (adds
 # `with_seeded_rng_scope`, required by bloch-crypto). A detached workspace does not
 # inherit the parent's [patch], so we restate it here with a re-based path.

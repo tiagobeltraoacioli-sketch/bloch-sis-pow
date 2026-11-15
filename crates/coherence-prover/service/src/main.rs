@@ -153,6 +153,23 @@ fn required_auth_token(
     }
 }
 
+/// L1M-14: listen address. `PROVER_BIND` (an IP literal) defaults to 0.0.0.0
+/// for the container deployments (Fly/Akash, behind their TLS edge), where the
+/// token is mandatory. Without a token (the debug-only opt-out) the service
+/// listens on loopback only and refuses a non-loopback `PROVER_BIND`.
+fn listen_addr(bind_env: Option<&str>, port: &str, authenticated: bool) -> Result<std::net::SocketAddr, String> {
+    let port: u16 = port.trim().parse().map_err(|_| format!("PORT {port:?} is not a port number"))?;
+    let default = if authenticated { "0.0.0.0" } else { "127.0.0.1" };
+    let host = bind_env.map(str::trim).filter(|h| !h.is_empty()).unwrap_or(default);
+    let ip: std::net::IpAddr = host.parse().map_err(|_| format!("PROVER_BIND {host:?} is not an IP literal"))?;
+    if !authenticated && !ip.is_loopback() {
+        return Err(format!(
+            "refusing to listen on {ip} without PROVER_AUTH_TOKEN: the unauthenticated debug mode is loopback-only"
+        ));
+    }
+    Ok(std::net::SocketAddr::new(ip, port))
+}
+
 /// TLS requirement configuration: plaintext opt-out is debug-build-only.
 fn require_tls(allow_plain_env: Option<&str>, debug_build: bool) -> Result<bool, String> {
     match allow_plain_env.map(str::trim) {
@@ -206,6 +223,7 @@ async fn main() {
     let (pk, vk) = client.setup(ELF);
     tracing::info!(vkey = %sp1_sdk::HashableKey::bytes32(&vk), "guest vkey (pin this in the node)");
 
+    let authenticated = auth_token.is_some();
     let policy = Arc::new(AccessPolicy { auth_token, require_tls: req_tls });
     let state = Arc::new(AppState { client, pk, vk,
         prove_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROVES)),
@@ -224,7 +242,13 @@ async fn main() {
     ).with_state(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
-    let addr = format!("0.0.0.0:{port}");
+    let addr = match listen_addr(std::env::var("PROVER_BIND").ok().as_deref(), &port, authenticated) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
     tracing::info!("coherence-prover-service listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
@@ -389,6 +413,20 @@ mod tests {
     }
 
     // ── P-3: fail-closed auth ────────────────────────────────────────────────
+    #[test]
+    fn unauthenticated_mode_listens_on_loopback_only() {
+        use std::net::SocketAddr;
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert_eq!(listen_addr(None, "8080", true), Ok(a("0.0.0.0:8080")));
+        assert_eq!(listen_addr(Some("127.0.0.1"), "9", true), Ok(a("127.0.0.1:9")));
+        assert_eq!(listen_addr(None, "8080", false), Ok(a("127.0.0.1:8080")));
+        assert_eq!(listen_addr(Some("::1"), "8080", false), Ok(a("[::1]:8080")));
+        assert!(listen_addr(Some("0.0.0.0"), "8080", false).is_err());
+        assert!(listen_addr(Some("10.0.0.5"), "8080", false).is_err());
+        assert!(listen_addr(Some("prover.example"), "8080", true).is_err());
+        assert!(listen_addr(None, "eighty", true).is_err());
+    }
+
     #[test]
     fn missing_token_fails_closed() {
         assert!(required_auth_token(None, None, false).is_err());
