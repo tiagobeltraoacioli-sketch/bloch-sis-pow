@@ -36,7 +36,32 @@ pub(super) fn header_seen(env: &BlockEnvelope, source: Option<[u8; 32]>) -> Opti
     })
 }
 
+/// Furthest the status roll goes past the head's epoch: the largest
+/// finality-lag threshold. Beyond it (and whenever the node is not live) the
+/// unrolled head is reported instead, flagged as such; rolling thousands of
+/// epochs for a status line is not worth a slot.
+const KES_VIEW_MAX_ROLL_EPOCHS: u64 = 64;
+
 impl Engine {
+    /// The state the signer decides the KES mode on, for the status: the
+    /// head state rolled into `wall_epoch` — `rolled_to`, the same memoised
+    /// derivation `attest`/`propose` use and the audit L1-01 fix hands to
+    /// `prepare_kes` (review R-03). One place, so the merge with that fix
+    /// has a single line to agree on. Read-only: `rolled_to` returns a
+    /// shared derived value and never touches the canonical state.
+    ///
+    /// Returns the state and the epoch it stands in: `wall_epoch` when
+    /// rolled, the head's epoch when the unrolled head is reported instead.
+    fn sentinel_kes_state(&self, wall_epoch: u64) -> (Arc<CommittedState>, u64) {
+        let head_epoch = epoch_of(self.state.slot());
+        if self.live && wall_epoch.saturating_sub(head_epoch) <= KES_VIEW_MAX_ROLL_EPOCHS {
+            (self.rolled_to(wall_epoch), wall_epoch.max(head_epoch))
+        } else {
+            // `rolled_to` at or below the head's epoch is the head state.
+            (self.rolled_to(head_epoch), head_epoch)
+        }
+    }
+
     /// Once per wall slot: publish the snapshot `getsecuritystatus` reads.
     pub(super) fn sentinel_slot_tick(&self) {
         let Some(s) = sentinel::current() else { return };
@@ -47,10 +72,11 @@ impl Engine {
         use bloch_pos_committee::kes::SigningMode;
         let fin = self.state.finality();
         let wall_epoch = epoch_of(self.wall_slot);
-        let validator = self.duty_index(&self.state);
+        let (kes_state, kes_state_epoch) = self.sentinel_kes_state(wall_epoch);
+        let validator = self.duty_index(&kes_state);
         let (mode, period) = match validator {
             None => ("no_validator", None),
-            Some(v) => match bloch_pos_committee::kes::signing_mode(&*self.state, v, wall_epoch) {
+            Some(v) => match bloch_pos_committee::kes::signing_mode(&*kes_state, v, wall_epoch) {
                 SigningMode::Static => ("static", None),
                 SigningMode::Kes(p) => ("kes", Some(p)),
                 SigningMode::FailClosed => ("fail_closed", None),
@@ -83,8 +109,8 @@ impl Engine {
                 kes_key_loaded: self.kes.is_some(),
                 mode,
                 period,
-                bind_epoch: KeyLookup::kes_enforced_from(&*self.state),
-                head_state_epoch: epoch_of(self.state.slot()),
+                bind_epoch: KeyLookup::kes_enforced_from(&*kes_state),
+                head_state_epoch: kes_state_epoch,
             },
         }
     }
@@ -100,10 +126,13 @@ impl Engine {
         if verdict == Verdict::Reject {
             return;
         }
-        if let Some(obs) = self.sentinel_classify(source, &seen, verdict) {
-            s.observe_advert(obs);
-        } else {
-            s.advert_agrees(&source);
+        match self.sentinel_classify(source, &seen, verdict) {
+            Some(obs) => s.observe_advert(obs),
+            // Only a block the engine accepted can withdraw an observation;
+            // an unauthenticated header proves agreement no more than it
+            // proves a split (review R-01).
+            None if verdict == Verdict::Accept => s.advert_agrees(&source),
+            None => {}
         }
     }
 
@@ -138,6 +167,10 @@ impl Engine {
             our_finalized_epoch: ours.epoch,
             our_finalized_root: ours.root,
             verdict: sentinel::verdict_name(verdict),
+            // `Accept` is the only verdict reached after the proposer
+            // signature, the ancestry and the transition were all checked;
+            // `Ignore` can be returned before any signature is looked at.
+            verified: verdict == Verdict::Accept,
         })
     }
 }
@@ -269,6 +302,68 @@ mod tests {
             let status = s.status_json();
             assert_eq!(status.get("peer_finalized_ahead").and_then(|p| p.get("count")).and_then(Json::as_u64), Some(0));
         });
+    }
+
+    /// R-01: an unsigned header (verdict `Ignore`) naming a side block we
+    /// hold as its finalized root is listed as unverified and produces NO
+    /// event; the same claim on an accepted block produces exactly one.
+    #[test]
+    fn an_unauthenticated_header_cannot_raise_a_conflicting_checkpoint_event() {
+        let (engine, _dir, _fork_point, rival) = super::super::reorg_state_tests::forked(2);
+        let rival_id = *rival.block_id().as_bytes();
+        let s = sentinel::test_sentinel(sentinel::Config { status: true, ..Default::default() });
+        sentinel::with_test_sentinel(s.clone(), || {
+            for _ in 0..100 {
+                engine.sentinel_observe_block(seen_with_finalized(&engine, rival_id), Verdict::Ignore);
+            }
+            assert!(sentinel::captured_events(&s).is_empty(), "unverified claims must not be evented");
+            let status = s.status_json();
+            let pfa = status.get("peer_finalized_ahead").unwrap();
+            assert_eq!(pfa.get("count").and_then(Json::as_u64), Some(1));
+            assert_eq!(pfa.get("conflicting_strong_count").and_then(Json::as_u64), Some(0));
+            assert_eq!(pfa.get("unverified_observations_total").and_then(Json::as_u64), Some(100));
+            let entry = pfa.get("entries").and_then(|e| e.at(0)).unwrap();
+            assert_eq!(entry.get("evidence").and_then(Json::as_str), Some("unverified"));
+            assert_eq!(entry.get("verified"), Some(&Json::Bool(false)));
+            // An unauthenticated "agreeing" header does not clear anything either.
+            let ours = engine.state.finality().finalized.root;
+            engine.sentinel_observe_block(seen_with_finalized(&engine, ours), Verdict::Ignore);
+            assert_eq!(s.status_json().get("peer_finalized_ahead").and_then(|p| p.get("count")).and_then(Json::as_u64), Some(1));
+
+            engine.sentinel_observe_block(seen_with_finalized(&engine, rival_id), Verdict::Accept);
+            engine.sentinel_observe_block(seen_with_finalized(&engine, rival_id), Verdict::Accept);
+            let events = sentinel::captured_events(&s);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert!(events[0].contains("\"conflicting_finalized_checkpoint\"") && events[0].contains("\"evidence\":\"verified\""));
+            let status = s.status_json();
+            assert_eq!(
+                status.get("peer_finalized_ahead").and_then(|p| p.get("conflicting_strong_count")).and_then(Json::as_u64),
+                Some(1)
+            );
+        });
+    }
+
+    /// R-03: the KES view is read from the state rolled into the wall epoch
+    /// (what the signer reads), not from the unrolled head.
+    #[test]
+    fn kes_view_is_computed_on_the_rolled_state() {
+        let (mut engine, _dir, _logged) = logged_chain(2);
+        engine.live = true;
+        let head_epoch = epoch_of(engine.state.slot());
+        engine.wall_slot = (head_epoch + 2) * SLOTS_PER_EPOCH;
+        let snap = engine.sentinel_snapshot();
+        assert_eq!(snap.kes.head_state_epoch, head_epoch + 2, "rolled into the wall epoch");
+        let rolled = engine.rolled_to(head_epoch + 2);
+        assert_eq!(snap.kes.bind_epoch, KeyLookup::kes_enforced_from(&*rolled));
+        assert_eq!(snap.kes.validator, engine.duty_index(&rolled));
+        // Not live, or too far behind: the unrolled head, flagged by its epoch.
+        engine.live = false;
+        assert_eq!(engine.sentinel_snapshot().kes.head_state_epoch, head_epoch);
+        engine.live = true;
+        engine.wall_slot = (head_epoch + KES_VIEW_MAX_ROLL_EPOCHS + 1) * SLOTS_PER_EPOCH;
+        assert_eq!(engine.sentinel_snapshot().kes.head_state_epoch, head_epoch);
+        // The canonical state did not move.
+        assert_eq!(epoch_of(engine.state.slot()), head_epoch);
     }
 
     #[test]
