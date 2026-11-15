@@ -2030,6 +2030,8 @@ mod verification;
 mod finality_cert;
 #[cfg(test)]
 mod finality_cert_tests;
+// Bloch Sentinel hooks: node-local, read-only, off by default.
+mod sentinel_hooks;
 
 struct Engine {
     manifest: Manifest,
@@ -3277,6 +3279,7 @@ impl Engine {
             Ok(_) => return,
             Err(why) => {
                 eprintln!("KES rotation for v{index} deferred: {why}");
+                crate::sentinel::note_kes_error("kes_rotation", index, &why);
                 return;
             }
         };
@@ -3635,6 +3638,7 @@ impl Engine {
             Ok(period) => period,
             Err(why) => {
                 eprintln!("[slot {slot}] not attesting: {why}");
+                crate::sentinel::note_kes_error("attest", index, &why);
                 return;
             }
         };
@@ -3909,6 +3913,7 @@ impl Engine {
             Ok(period) => period,
             Err(why) => {
                 eprintln!("[slot {slot}] not proposing: {why}");
+                crate::sentinel::note_kes_error("propose", index, &why);
                 return;
             }
         };
@@ -8307,6 +8312,12 @@ impl Engine {
             }
 
             RpcRequest::LcProof { epoch, set_source_epoch, block } => self.lc_proof(epoch, set_source_epoch, block),
+
+            // Bloch Sentinel (node-local). The RPC backend answers it before
+            // the queue, where the caller's address is known; a request that
+            // reaches the consensus thread has no caller to check and gets
+            // the answer of a node without the Sentinel.
+            RpcRequest::SecurityStatus => Err(RpcError::method_not_found("getsecuritystatus")),
         }
     }
 }
@@ -9463,6 +9474,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
             // reads no clock of its own, so this is the only thing that bounds
             // it — without the call its `seen` map grows with uptime.
             engine.att_pool.prune(slot);
+            // Bloch Sentinel (node-local, read-only; no-op unless enabled).
+            engine.sentinel_slot_tick();
         }
         // Future blocks, promoted orphans, and held attestations already
         // reported `Ignore`; replay is local and silent. Future/orphan work
@@ -9807,12 +9820,16 @@ pub fn run(cfg: Config) -> io::Result<()> {
                             // until the engine has an answer — the same
                             // contract the attestation arm below runs on.
                             let source = origin.verification_source();
+                            let sentinel_seen = sentinel_hooks::header_seen(&env, source);
                             let verdict = if origin.directed_block() {
                                 engine.ingest_from_judged(env, Source::Directed(source))
                             } else {
                                 engine.ingest_judged_from_source(env, source)
                             };
                             engine.net.report(&origin, verdict);
+                            if let Some(seen) = sentinel_seen {
+                                engine.sentinel_observe_block(seen, verdict);
+                            }
                         }
                         EngineEvent::Net(NetEvent::Attestation(att, origin)) => {
                             engine.on_attestation(att, origin, wall_epoch)

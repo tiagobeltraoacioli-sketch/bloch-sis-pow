@@ -112,6 +112,9 @@ fn frozen_method_space(req: &RpcRequest) -> &'static str {
         // Light-client proofs (2026-10-30): "prove it under the rule of its
         // epoch" (frozen set, KES), which a bare certificate cannot.
         RpcRequest::LcProof { .. } => "getlcproof",
+        // Bloch Sentinel hooks (2026-11-14): node-local security status, a
+        // new question (no existing method reports peers, bans or KES mode).
+        RpcRequest::SecurityStatus => "getsecuritystatus",
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }
@@ -174,6 +177,7 @@ fn every_frozen_variant_routes_under_its_registered_name() {
         ("getkes", "[]"),
         ("getfinalitycertificate", "[\"latest\"]"),
         ("getlcproof", "[\"latest\"]"),
+        ("getsecuritystatus", "[]"),
     ];
     for (name, params) in cases {
         let p = parse_json(params).expect("test params parse");

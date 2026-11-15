@@ -287,6 +287,9 @@ impl Net {
     /// has not judged — is one this node does not forward. The devnet mesh has
     /// no such notion and drops it.
     pub fn report(&self, origin: &Origin, verdict: Verdict) {
+        // Bloch Sentinel: count rejected/ignored per source (node-local,
+        // observe-only; a no-op unless enabled).
+        crate::sentinel::note_verdict(origin.verification_source(), verdict);
         // The devnet mesh keeps no score, but it does remember which source
         // addresses delivered something the engine verified (W4-1); a no-op
         // for every origin that carries no [`DeliveryProof`].
@@ -2266,6 +2269,7 @@ pub fn start(
                     thread::sleep(Duration::from_millis(50));
                     continue;
                 };
+                crate::sentinel::note_inbound_attempt(&sock);
                 // A quiet mesh may never broadcast. Prune on accept too, so
                 // connection churn cannot retain one dead sender per dial.
                 match inbound.lock() {
@@ -2287,6 +2291,11 @@ pub fn start(
                     .ok()
                     .and_then(|peers| peers.get(&crate::connection_limit::limit_key(address.ip())).copied())
                     .unwrap_or(0);
+                // Bloch Sentinel: a banned, non-configured source is closed
+                // here, before any slot or thread (a no-op unless enabled).
+                if crate::sentinel::refuse_inbound(address.ip(), peers_here > 0) {
+                    continue;
+                }
                 // This loop is the only thing that adds slots, so the count
                 // cannot grow between this read and the admission below.
                 let (held, vouched) = match slots.lock() {
@@ -2361,7 +2370,12 @@ pub fn start(
                                 Some(OwnIdentity::SharedIdentityFile) => {
                                     log_identity_conflict("from", &address.to_string(), &e)
                                 }
-                                None => log_refusal("from", &address.to_string(), &e),
+                                None => {
+                                    log_refusal("from", &address.to_string(), &e);
+                                    // Not this node's own dial or identity:
+                                    // a failure of the remote source.
+                                    crate::sentinel::note_handshake_failure(address.ip());
+                                }
                             }
                             return;
                         }
@@ -2533,6 +2547,9 @@ pub fn start(
                 continue;
             };
             let connect_took = dialing.elapsed();
+            if let Ok(address) = sock.peer_addr() {
+                crate::sentinel::note_outbound(address.ip());
+            }
             // Bounded: a name that resolves somewhere new on every dial must
             // not grow this set for the life of the process.
             if let (false, Ok(address), Ok(mut peers)) = (counted_at_start, sock.peer_addr(), configured.lock()) {
@@ -2666,8 +2683,12 @@ pub fn start(
         })?;
     }
 
+    sentinel_view::register(&inbound, &configured);
     Ok(DevnetMesh { listen_addr, peers, sync, inbound, live })
 }
+
+// Bloch Sentinel's window onto the mesh (node-local; see `crate::sentinel`).
+mod sentinel_view;
 
 #[cfg(test)]
 mod tests {

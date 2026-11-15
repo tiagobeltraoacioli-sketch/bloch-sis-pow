@@ -2288,6 +2288,15 @@ fn handle_swarm_event(
                     // that `ConnectionClosed` undoes exactly what was done.
                     trace(|| format!("inbound {send_back_addr} refused: source at its share"));
                     let _ = swarm.close_connection(connection_id);
+                } else if let Some(ip) = send_back_addr.iter().find_map(|p| match p {
+                    libp2p::multiaddr::Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+                    libp2p::multiaddr::Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+                    _ => None,
+                }) {
+                    // Bloch Sentinel ban (node-local; a no-op unless enabled).
+                    if crate::sentinel::refuse_inbound_libp2p(ip, dialed) {
+                        let _ = swarm.close_connection(connection_id);
+                    }
                 }
             }
             // DO NOT call `gossipsub.add_explicit_peer()` here — see this

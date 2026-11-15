@@ -1059,6 +1059,9 @@ pub enum RpcRequest {
         set_source_epoch: Option<u64>,
         block: Option<[u8; 32]>,
     },
+    /// `getsecuritystatus` — Bloch Sentinel hooks (node-local, read-only, off
+    /// unless a Sentinel flag is given; see `docs/SENTINEL-HOOKS.md`).
+    SecurityStatus,
 }
 
 /// Whatever can answer an [`RpcRequest`]. In production this is the channel to
@@ -1353,6 +1356,11 @@ impl EngineBackend {
         if let Some(answered) = Self::locally(&req) {
             return answered;
         }
+        // Bloch Sentinel: answered here, never queued, and only for callers
+        // allowed to read it (loopback unless the operator opted in).
+        if matches!(req, RpcRequest::SecurityStatus) {
+            return security_status_for(source);
+        }
         if let Some(answered) = self.from_block_count(&req) {
             return answered;
         }
@@ -1633,8 +1641,23 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
             };
             RpcRequest::LcProof { epoch, set_source_epoch, block }
         }
+        "getsecuritystatus" => RpcRequest::SecurityStatus,
         other => return Err(RpcError::method_not_found(other)),
     })
+}
+
+/// `getsecuritystatus` for a caller at `source` (`None`: in-process).
+///
+/// Exactly the "method not found" of a node without the Sentinel when no
+/// Sentinel flag is set, and also when the caller is not on loopback and
+/// `--security-status-remote` was not given (review R-02): the answer names
+/// inbound peers, bans, the validator index and the doppelganger window. A
+/// refused caller cannot tell a Sentinel node from any other.
+pub(crate) fn security_status_for(source: Option<IpAddr>) -> RpcResult {
+    if !crate::sentinel::status_allowed_from(source) {
+        return Err(RpcError::method_not_found("getsecuritystatus"));
+    }
+    crate::sentinel::status_rpc().ok_or_else(|| RpcError::method_not_found("getsecuritystatus"))
 }
 
 fn envelope(id: Json, outcome: RpcResult) -> String {

@@ -62,6 +62,7 @@ mod mesh_pq;
 mod net;
 mod p2p;
 mod rpc;
+mod sentinel;
 mod slashprot;
 mod signer_anchor;
 mod slashing_cli;
@@ -1074,6 +1075,8 @@ const RUN_SWITCHES: &[&str] = &[
     "--acknowledge-missing-slashing-protection",
     "--replay-from-genesis",
     "--require-state-cache",
+    "--security-status",
+    "--security-status-remote",
 ];
 
 /// Validate the metrics listener's exposure posture before the engine starts.
@@ -2128,6 +2131,15 @@ fn run_cmd(args: &[String]) {
     }
     if mesh.require_authenticated && mesh.mode != mesh_pq::Mode::Require {
         eprintln!("run: --mesh-require-authenticated needs --mesh-security require");
+        exit(2);
+    }
+    // Bloch Sentinel hooks (docs/SENTINEL-HOOKS.md): node-local, OFF unless
+    // one of these flags is given. Started here, before the engine, so a bad
+    // flag, path or socket stops the boot.
+    let sentinel_rpc_bind = rpc_port.map(|_| arg_value(args, "--rpc-bind").unwrap_or_else(|| "127.0.0.1".to_string()));
+    let sentinel_cfg = sentinel::Config::from_args(args, peers.clone(), csv("--p2p-peer"), sentinel_rpc_bind.as_deref());
+    if let Err(e) = sentinel_cfg.and_then(sentinel::start) {
+        eprintln!("run: {e}");
         exit(2);
     }
     let cfg = engine::Config {
