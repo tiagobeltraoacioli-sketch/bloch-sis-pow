@@ -4275,6 +4275,29 @@ impl Engine {
             .unwrap_or_else(|| self.state.arc())
     }
 
+    /// [`Self::proposer_authority_state`] for a block of `epoch` (audit
+    /// L1-01, block door). From the KES gate on, a block whose parent is the
+    /// head and whose epoch is past the head's is judged against the head
+    /// rolled into that epoch, which is the state the transition rolls the
+    /// parent to before it verifies the proposer (step 7). The bind epoch
+    /// (`kes_enforced_from`) is written by `process_epoch`, so the unrolled
+    /// head of a chain that crossed empty epochs after the bind decision
+    /// selects the static key for a proposer that rightly signs with its KES
+    /// leaf, and the door would park every block that crosses the bind.
+    /// Called only after the door's wall-clock bounds on the slot
+    /// (`MAX_FUTURE_SLOTS`), so the roll is bounded; before the gate the
+    /// answer is the unrolled state, exactly as before.
+    fn proposer_authority_state_at(&self, parent: &[u8; 32], epoch: u64) -> Arc<CommittedState> {
+        let head = self.state.arc();
+        if bloch_pos_committee::params::kes_period(epoch).is_some()
+            && parent == self.head_id().as_bytes()
+            && epoch > epoch_of(head.slot())
+        {
+            return self.rolled_to(epoch);
+        }
+        self.proposer_authority_state(parent)
+    }
+
     /// Park a block whose proposer could not be authenticated under
     /// `judged`, and remember that authority so the block is judged again
     /// when it changes (V1-2). Unauthenticated, like every such entry.
@@ -4312,7 +4335,7 @@ impl Engine {
                 continue;
             };
             let now = bloch_pos_committee::kes::authority_fingerprint(
-                &*self.proposer_authority_state(&env.header.parent),
+                &*self.proposer_authority_state_at(&env.header.parent, epoch_of(env.header.slot)),
                 env.header.proposer_index,
                 epoch_of(env.header.slot),
             );
@@ -4611,7 +4634,7 @@ impl Engine {
         // reorg ring still holds it (a sibling of the head, or a child of
         // it), which is exactly the transition's; only otherwise the head.
         let proposer_epoch = epoch_of(env.header.slot);
-        let judged_state = self.proposer_authority_state(&env.header.parent);
+        let judged_state = self.proposer_authority_state_at(&env.header.parent, proposer_epoch);
         let authority = bloch_pos_committee::kes::authority_fingerprint(
             &*judged_state,
             env.header.proposer_index,

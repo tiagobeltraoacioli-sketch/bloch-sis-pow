@@ -689,6 +689,23 @@ fn a_duty_past_an_unseen_kes_bind_signs_the_leaf_verifiers_require() {
     assert_eq!(engine.prepare_kes_in(&rolled, Some(&rolled.entry), duty_epoch - 1, 0).unwrap(), None);
 }
 
+/// Audit L1-01, block door: past the KES gate a block on the head, in a
+/// later epoch, is authenticated against the head rolled into its epoch
+/// (what the transition judges it by); before the gate, and for a parent
+/// that is not the head, the door reads the unrolled state as before.
+#[test]
+fn the_block_door_judges_a_post_gate_proposer_on_the_rolled_head() {
+    let (engine, _dir) = perf_support::proposing_engine();
+    let head = *engine.head_id().as_bytes();
+    let duty_epoch = bloch_pos_committee::params::KES_ACTIVATION_EPOCH + bloch_pos_committee::params::KES_BIND_DELAY_EPOCHS;
+    let judged = engine.proposer_authority_state_at(&head, duty_epoch);
+    assert!(Arc::ptr_eq(&judged, &engine.rolled_to(duty_epoch)), "the rolled head");
+    assert!(!Arc::ptr_eq(&judged, &engine.state.arc()));
+    let before_gate = bloch_pos_committee::params::KES_ACTIVATION_EPOCH - 1;
+    assert!(Arc::ptr_eq(&engine.proposer_authority_state_at(&head, before_gate), &engine.state.arc()), "unchanged before the gate");
+    assert!(Arc::ptr_eq(&engine.proposer_authority_state_at(&[0x9A; 32], duty_epoch), &engine.state.arc()), "not the head's child");
+}
+
 /// Drive a one-validator engine through each epoch of `epochs` (ascending):
 /// the validator votes at its duty slot and proposes right after it, in the
 /// same epoch, so the vote is included and the epoch is justified. Returns
