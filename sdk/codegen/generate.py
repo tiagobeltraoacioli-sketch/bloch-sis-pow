@@ -386,8 +386,10 @@ def build_python_client(methods):
     out.append("#   1. the standard top-level `error` object (transport/auth: -32001/-32002)\n")
     out.append("#   2. the non-standard string `result.error` (HTTP 200, most method errors)\n\n")
     out.append("from __future__ import annotations\n\n")
+    out.append("import ipaddress\n")
     out.append("import json\n")
     out.append("import socket\n")
+    out.append("import urllib.parse\n")
     out.append("import urllib.error\n")
     out.append("import urllib.request\n")
     out.append("from typing import Any, Dict, List, Optional, Union\n\n")
@@ -408,6 +410,28 @@ def build_python_client(methods):
         "    return [v for v, _ in items]\n\n\n"
     )
 
+    out.append(
+        "def _check_key_transport(url: str, allow_insecure_http: bool, method: str) -> None:\n"
+        '    """L1M-18: refuse to send an API key over plaintext http:// to a host that\n'
+        '    is not loopback (it would cross the network in the clear)."""\n'
+        "    parts = urllib.parse.urlsplit(url)\n"
+        '    if parts.scheme == "https" or allow_insecure_http:\n'
+        "        return\n"
+        '    host = (parts.hostname or "").lower()\n'
+        '    if host == "localhost":\n'
+        "        return\n"
+        "    try:\n"
+        "        if ipaddress.ip_address(host).is_loopback:\n"
+        "            return\n"
+        "    except ValueError:\n"
+        "        pass\n"
+        "    raise BlochTransportError(\n"
+        '        f"refusing to send the API key over {parts.scheme or \'?\'}:// to non-loopback host "\n'
+        '        f"{host!r}; use https:// or pass allow_insecure_http=True",\n'
+        "        method=method,\n"
+        "    )\n\n\n"
+    )
+
     out.append("class BlochClient:\n")
     out.append('    """A typed client for the Bloch JSON-RPC surface.\n\n')
     out.append("    Every method maps to one node RPC. Reads are public; the only write is\n")
@@ -423,8 +447,10 @@ def build_python_client(methods):
         "        bearer: bool = False,\n"
         "        timeout: float = 30.0,\n"
         "        headers: Optional[Dict[str, str]] = None,\n"
+        "        allow_insecure_http: bool = False,\n"
         "    ) -> None:\n"
         "        self.url = url\n"
+        "        self.allow_insecure_http = allow_insecure_http\n"
         "        self.api_key = api_key\n"
         "        self.bearer = bearer\n"
         "        self.timeout = timeout\n"
@@ -442,6 +468,7 @@ def build_python_client(methods):
         "        headers = {\"Content-Type\": \"application/json\"}\n"
         "        headers.update(self.static_headers)\n"
         "        if self.api_key is not None:\n"
+        "            _check_key_transport(self.url, self.allow_insecure_http, method)\n"
         "            if self.bearer:\n"
         '                headers["Authorization"] = f"Bearer {self.api_key}"\n'
         "            else:\n"
@@ -734,7 +761,9 @@ def build_go_client(methods):
     out.append('\t"encoding/json"\n')
     out.append('\t"fmt"\n')
     out.append('\t"io"\n')
+    out.append('\t"net"\n')
     out.append('\t"net/http"\n')
+    out.append('\t"net/url"\n')
     out.append('\t"sync/atomic"\n')
     out.append('\t"time"\n')
     out.append(")\n\n")
@@ -751,6 +780,10 @@ def build_go_client(methods):
         "\tHTTPClient *http.Client\n"
         "\tHeaders    map[string]string\n"
         "\tid         int64\n"
+        "\n"
+        "\t// AllowInsecureHTTP permits sending APIKey over plain http:// to a\n"
+        "\t// non-loopback host (L1M-18). Leave it false.\n"
+        "\tAllowInsecureHTTP bool\n"
         "}\n\n"
     )
     out.append(
@@ -760,6 +793,28 @@ def build_go_client(methods):
         "\t\turl = DefaultRPCURL\n"
         "\t}\n"
         "\treturn &Client{URL: url, HTTPClient: &http.Client{Timeout: 30 * time.Second}}\n"
+        "}\n\n"
+    )
+
+    out.append(
+        "// checkKeyTransport refuses to send an API key over plaintext http:// to a\n"
+        "// host that is not loopback (L1M-18).\n"
+        "func checkKeyTransport(rawURL string, allowInsecure bool) error {\n"
+        "\tu, err := url.Parse(rawURL)\n"
+        "\tif err != nil {\n"
+        "\t\treturn fmt.Errorf(\"invalid RPC URL: %v\", err)\n"
+        "\t}\n"
+        "\tif u.Scheme == \"https\" || allowInsecure || isLoopbackHost(u.Hostname()) {\n"
+        "\t\treturn nil\n"
+        "\t}\n"
+        "\treturn fmt.Errorf(\"refusing to send the API key over %s:// to non-loopback host %q; use https or set AllowInsecureHTTP\", u.Scheme, u.Hostname())\n"
+        "}\n\n"
+        "func isLoopbackHost(host string) bool {\n"
+        "\tif host == \"localhost\" {\n"
+        "\t\treturn true\n"
+        "\t}\n"
+        "\tip := net.ParseIP(host)\n"
+        "\treturn ip != nil && ip.IsLoopback()\n"
         "}\n\n"
     )
 
@@ -804,6 +859,9 @@ def build_go_client(methods):
         "\t\treq.Header.Set(k, v)\n"
         "\t}\n"
         "\tif c.APIKey != \"\" {\n"
+        "\t\tif err := checkKeyTransport(c.URL, c.AllowInsecureHTTP); err != nil {\n"
+        "\t\t\treturn &TransportError{Method: method, Message: err.Error()}\n"
+        "\t\t}\n"
         "\t\tif c.Bearer {\n"
         "\t\t\treq.Header.Set(\"Authorization\", \"Bearer \"+c.APIKey)\n"
         "\t\t} else {\n"

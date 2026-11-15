@@ -72,6 +72,26 @@ export interface BlochClientOptions {
   headers?: Record<string, string>;
   /** Override the fetch implementation (default: global fetch). */
   fetch?: FetchLike;
+  /**
+   * L1M-18: allow sending `apiKey` over plain `http://` to a non-loopback
+   * host. Off by default: the key would cross the network in the clear.
+   */
+  allowInsecureHttp?: boolean;
+}
+
+/** L1M-18: true when `url` may carry an API key (https, or a loopback host). */
+export function keyTransportAllowed(url: string, allowInsecureHttp = false): boolean {
+  if (allowInsecureHttp) return true;
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+  if (u.protocol === "https:") return true;
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (host === "localhost" || host === "::1") return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 
 export const DEFAULT_RPC_URL = "http://127.0.0.1:16210";
@@ -103,6 +123,7 @@ export class BlochClient {
   private readonly timeoutMs: number;
   private readonly staticHeaders: Record<string, string>;
   private readonly fetchImpl: FetchLike;
+  private readonly allowInsecureHttp: boolean;
   private idCounter = 0;
 
   constructor(options: BlochClientOptions = {}) {
@@ -111,6 +132,7 @@ export class BlochClient {
     this.bearer = options.bearer ?? false;
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.staticHeaders = options.headers ?? {};
+    this.allowInsecureHttp = options.allowInsecureHttp ?? false;
     const f = options.fetch ?? (globalThis as { fetch?: unknown }).fetch;
     if (typeof f !== "function") {
       throw new Error(
@@ -133,6 +155,12 @@ export class BlochClient {
       ...this.staticHeaders,
     };
     if (this.apiKey !== undefined) {
+      if (!keyTransportAllowed(this.url, this.allowInsecureHttp)) {
+        throw new BlochTransportError({
+          message: `refusing to send the API key over plaintext http to non-loopback ${this.url}; use https or set allowInsecureHttp`,
+          method,
+        });
+      }
       if (this.bearer) headers["Authorization"] = `Bearer ${this.apiKey}`;
       else headers["X-API-Key"] = this.apiKey;
     }
