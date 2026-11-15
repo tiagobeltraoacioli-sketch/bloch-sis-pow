@@ -8237,8 +8237,11 @@ impl Engine {
 
             RpcRequest::LcProof { epoch, set_source_epoch, block } => self.lc_proof(epoch, set_source_epoch, block),
 
-            // Bloch Sentinel (node-local); normally answered before the queue.
-            RpcRequest::SecurityStatus => rpc::security_status(),
+            // Bloch Sentinel (node-local). The RPC backend answers it before
+            // the queue, where the caller's address is known; a request that
+            // reaches the consensus thread has no caller to check and gets
+            // the answer of a node without the Sentinel.
+            RpcRequest::SecurityStatus => Err(RpcError::method_not_found("getsecuritystatus")),
         }
     }
 }

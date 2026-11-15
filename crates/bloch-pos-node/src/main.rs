@@ -1070,6 +1070,7 @@ const RUN_SWITCHES: &[&str] = &[
     "--replay-from-genesis",
     "--require-state-cache",
     "--security-status",
+    "--security-status-remote",
 ];
 
 /// Validate the metrics listener's exposure posture before the engine starts.
@@ -2127,16 +2128,11 @@ fn run_cmd(args: &[String]) {
         exit(2);
     }
     // Bloch Sentinel hooks (docs/SENTINEL-HOOKS.md): node-local, OFF unless
-    // one of these flags is given. Started here, while this process is still
-    // single-threaded: the admin socket is created under a temporary umask.
-    let sentinel_cfg = sentinel::Config {
-        status: run_switch(args, "--security-status"),
-        events: arg_value(args, "--security-events").map(PathBuf::from),
-        admin_socket: arg_value(args, "--admin-socket").map(PathBuf::from),
-        peers: peers.clone(),
-        p2p_peers: csv("--p2p-peer"),
-    };
-    if let Err(e) = sentinel::start(sentinel_cfg) {
+    // one of these flags is given. Started here, before the engine, so a bad
+    // flag, path or socket stops the boot.
+    let sentinel_rpc_bind = rpc_port.map(|_| arg_value(args, "--rpc-bind").unwrap_or_else(|| "127.0.0.1".to_string()));
+    let sentinel_cfg = sentinel::Config::from_args(args, peers.clone(), csv("--p2p-peer"), sentinel_rpc_bind.as_deref());
+    if let Err(e) = sentinel_cfg.and_then(sentinel::start) {
         eprintln!("run: {e}");
         exit(2);
     }

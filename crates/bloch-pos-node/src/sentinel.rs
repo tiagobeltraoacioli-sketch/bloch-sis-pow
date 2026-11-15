@@ -73,11 +73,97 @@ pub(crate) struct Config {
     /// (multiaddrs): the protected set the ban table may never cover.
     pub(crate) peers: Vec<String>,
     pub(crate) p2p_peers: Vec<String>,
+    /// `--security-status-remote`: also answer `getsecuritystatus` to
+    /// callers that are not on loopback, and allow a non-loopback
+    /// `--rpc-bind` with the Sentinel on. Off by default (review R-02).
+    pub(crate) allow_remote_status: bool,
+}
+
+/// The value of run option `name` in either spelling, `--name value` or
+/// `--name=value`. A Sentinel flag that is present but malformed is an
+/// error, never silently ignored (review R-06; same class as L1-11).
+fn option_value(args: &[String], name: &str) -> Result<Option<String>, String> {
+    let prefix = format!("{name}=");
+    let mut found = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--" {
+            break;
+        }
+        let value = if arg == name {
+            match rest.next() {
+                Some(v) if !v.starts_with("--") => v.clone(),
+                _ => return Err(format!("{name} needs a path")),
+            }
+        } else if let Some(v) = arg.strip_prefix(&prefix) {
+            v.to_string()
+        } else {
+            continue;
+        };
+        if value.is_empty() {
+            return Err(format!("{name} needs a path"));
+        }
+        if found.replace(value).is_some() {
+            return Err(format!("{name} given more than once"));
+        }
+    }
+    Ok(found)
+}
+
+fn switch(args: &[String], name: &str) -> Result<bool, String> {
+    let prefix = format!("{name}=");
+    let mut on = false;
+    for arg in args.iter().take_while(|a| *a != "--") {
+        if arg == name {
+            on = true;
+        } else if arg.starts_with(&prefix) {
+            return Err(format!("{name} is a switch and takes no value"));
+        }
+    }
+    Ok(on)
+}
+
+/// Is `--rpc-bind`'s value reachable from this host only?
+pub(crate) fn rpc_bind_is_loopback(bind: &str) -> bool {
+    bind == "localhost" || bind.parse::<IpAddr>().is_ok_and(|ip| cidr::normalize(ip).is_loopback())
 }
 
 impl Config {
     pub(crate) fn enabled(&self) -> bool {
         self.status || self.events.is_some() || self.admin_socket.is_some()
+    }
+
+    /// Read the Sentinel flags from the run command's argv. `rpc_bind` is
+    /// the RPC listener's address, `None` when the RPC is off.
+    pub(crate) fn from_args(
+        args: &[String],
+        peers: Vec<String>,
+        p2p_peers: Vec<String>,
+        rpc_bind: Option<&str>,
+    ) -> Result<Config, String> {
+        let cfg = Config {
+            status: switch(args, "--security-status")?,
+            events: option_value(args, "--security-events")?.map(PathBuf::from),
+            admin_socket: option_value(args, "--admin-socket")?.map(PathBuf::from),
+            peers,
+            p2p_peers,
+            allow_remote_status: switch(args, "--security-status-remote")?,
+        };
+        if cfg.allow_remote_status && !cfg.enabled() {
+            return Err("--security-status-remote needs --security-status, --security-events or --admin-socket".into());
+        }
+        // R-02: the status names inbound peers, bans, the validator index
+        // and the doppelganger window. It is not served from a routable RPC
+        // unless the operator says so.
+        if let (true, false, Some(bind)) = (cfg.enabled(), cfg.allow_remote_status, rpc_bind) {
+            if !rpc_bind_is_loopback(bind) {
+                return Err(format!(
+                    "the Sentinel flags expose getsecuritystatus, and --rpc-bind {bind} is not loopback; \
+                     bind the RPC to loopback, or add --security-status-remote to accept that exposure"
+                ));
+            }
+        }
+        Ok(cfg)
     }
 
     /// Literal addresses among the configured peers, as host ranges.
@@ -173,9 +259,10 @@ pub(crate) struct KesView {
     pub(crate) period: Option<u64>,
     /// `kes_enforced_from` of the head state: `Some(None)` = not bound.
     pub(crate) bind_epoch: Option<Option<u64>>,
-    /// The epoch of the head state those values were read from. When it is
-    /// behind `wall_epoch` the head state is not rolled to the duty epoch,
-    /// and a bind decided at the boundary in between is not visible here.
+    /// The epoch of the state those values were read from: the head state
+    /// rolled into the wall epoch (`Engine::rolled_to`, what the signer
+    /// reads), or the unrolled head when the node is not live or too far
+    /// behind to roll cheaply.
     pub(crate) head_state_epoch: u64,
 }
 
@@ -382,7 +469,7 @@ impl Sentinel {
     pub(crate) fn observe_advert(&self, obs: Observation) {
         let addr = lock(&self.names).name(&obs.source);
         let kind = obs.kind;
-        let fields = vec![
+        let mut fields = vec![
             ("source", Json::s(crate::codec::hex8(&obs.source))),
             ("addr", addr.map_or(Json::Null, |a| Json::s(a.to_string()))),
             ("kind", Json::s(kind.as_str())),
@@ -393,9 +480,14 @@ impl Sentinel {
             ("block_root", Json::hex(&obs.block_root)),
             ("block_slot", Json::u(obs.block_slot)),
             ("verdict", Json::s(obs.verdict)),
+            ("verified", Json::Bool(obs.verified)),
         ];
-        let news = lock(&self.adverts).record(obs, addr, Instant::now(), unix_ms());
-        if news {
+        // `Some` only at the verified or corroborated level, and at most
+        // once per source per interval (review R-01): an unauthenticated
+        // header alone never produces an event.
+        let level = lock(&self.adverts).record(obs, addr, Instant::now(), unix_ms());
+        if let Some(level) = level {
+            fields.push(("evidence", Json::s(level.as_str())));
             self.emit(
                 if kind == AdvertKind::Conflicting { "conflicting_finalized_checkpoint" } else { "peer_finalized_ahead" },
                 fields,
@@ -425,7 +517,10 @@ impl Sentinel {
     }
 
     pub(crate) fn note_handshake(&self, ip: IpAddr, attempts: u64, failures: u64) {
-        lock(&self.handshakes).add(&cidr::normalize(ip), attempts, failures, Instant::now());
+        // Keyed like the mesh's own per-source limits (an IPv4 address, or
+        // an IPv6 /64), so one /64 cannot fill the table (review R-04).
+        let key = crate::connection_limit::limit_key(cidr::normalize(ip));
+        lock(&self.handshakes).add(&key, attempts, failures, Instant::now());
     }
 
     // ── Bans ────────────────────────────────────────────────────────────
@@ -564,10 +659,25 @@ impl Sentinel {
             ]),
         };
 
-        let adverts = lock(&self.adverts).live(now);
-        let evicted = lock(&self.adverts).evicted;
+        let (adverts, evicted, unverified_total) = {
+            let table = lock(&self.adverts);
+            let live: Vec<(adverts::Entry, adverts::Evidence)> =
+                table.live(now).into_iter().map(|e| { let ev = table.evidence(&e); (e, ev) }).collect();
+            (live, table.evicted, table.unverified_total)
+        };
+        let strong = |k: Option<AdvertKind>| {
+            adverts
+                .iter()
+                .filter(|(e, ev)| *ev != adverts::Evidence::Unverified && k.map_or(true, |k| e.obs.kind == k))
+                .count() as u64
+        };
         let advert_json = Json::obj(vec![
             ("count", Json::u(adverts.len() as u64)),
+            ("strong_count", Json::u(strong(None))),
+            ("conflicting_strong_count", Json::u(strong(Some(AdvertKind::Conflicting)))),
+            ("unverified_count", Json::u(adverts.len() as u64 - strong(None))),
+            ("unverified_observations_total", Json::u(unverified_total)),
+            ("corroboration_sources", Json::u(adverts::CORROBORATION_SOURCES as u64)),
             ("max_entries", Json::u(adverts::MAX_ENTRIES as u64)),
             ("entry_ttl_secs", Json::u(adverts::ENTRY_TTL.as_secs())),
             ("evicted", Json::u(evicted)),
@@ -576,11 +686,13 @@ impl Sentinel {
                 Json::Arr(
                     adverts
                         .iter()
-                        .map(|e| {
+                        .map(|(e, evidence)| {
                             Json::obj(vec![
                                 ("source", Json::s(crate::codec::hex8(&e.obs.source))),
                                 ("addr", e.addr.map_or(Json::Null, |a| Json::s(a.to_string()))),
                                 ("kind", Json::s(e.obs.kind.as_str())),
+                                ("evidence", Json::s(evidence.as_str())),
+                                ("verified", Json::Bool(e.obs.verified)),
                                 ("advertised_finalized_root", Json::hex(&e.obs.advertised_finalized)),
                                 ("advertised_justified_root", Json::hex(&e.obs.advertised_justified)),
                                 ("root_slot", e.obs.root_slot.map_or(Json::Null, Json::u)),
@@ -635,6 +747,7 @@ impl Sentinel {
         let handshake_json = Json::obj(vec![
             ("window_secs", Json::u(hs.window_secs())),
             ("tracked_sources", Json::u(hs.tracked() as u64)),
+            ("keyed_by", Json::s("ipv4 address or ipv6 /64")),
             ("total_attempts", Json::u(hs.totals().a)),
             ("total_failures", Json::u(hs.totals().b)),
             ("overflow", Json::obj(vec![("attempts", Json::u(hs_overflow.a)), ("failures", Json::u(hs_overflow.b))])),
@@ -801,14 +914,13 @@ pub(crate) fn captured_events(s: &Sentinel) -> Vec<String> {
     s.events.as_ref().map(|e| e.captured.lock().map(|c| c.clone()).unwrap_or_default()).unwrap_or_default()
 }
 
-/// Start the Sentinel per `cfg`. Must run before the engine starts its
-/// threads (the admin socket is created under a temporary umask). A no-op
-/// returning `Ok` when `cfg` enables nothing.
+/// Start the Sentinel per `cfg`, before the engine starts, so a bad path
+/// or socket stops the boot. A no-op returning `Ok` when `cfg` enables
+/// nothing.
 pub(crate) fn start(cfg: Config) -> Result<(), String> {
     if !cfg.enabled() {
         return Ok(());
     }
-    // The socket first: it is the one with a umask window.
     let listener = match &cfg.admin_socket {
         Some(path) => Some(admin::bind(path)?),
         None => None,
@@ -859,8 +971,36 @@ pub(crate) fn status_rpc() -> Option<Json> {
 pub(crate) fn refuse_inbound(ip: IpAddr, configured: bool) -> bool {
     let Some(s) = current() else { return false };
     s.learn_source(ip);
-    s.note_handshake(ip, 1, 0);
     s.refuse_inbound(ip, configured)
+}
+
+/// Every accepted TCP connection on the mesh listener, counted before any
+/// cap can turn it away (review R-04): the flood that fills the mesh is the
+/// one that must show up.
+pub(crate) fn note_inbound_attempt(sock: &std::net::TcpStream) {
+    let Some(s) = current() else { return };
+    if let Ok(addr) = sock.peer_addr() {
+        s.note_handshake(addr.ip(), 1, 0);
+    }
+}
+
+/// libp2p has no separate accept hook: count the attempt with the check.
+pub(crate) fn refuse_inbound_libp2p(ip: IpAddr, configured: bool) -> bool {
+    let Some(s) = current() else { return false };
+    s.note_handshake(ip, 1, 0);
+    s.learn_source(ip);
+    s.refuse_inbound(ip, configured)
+}
+
+/// May a caller at `source` read `getsecuritystatus`? In-process callers
+/// (`None`) and loopback always; anything else only with
+/// `--security-status-remote` (review R-02).
+pub(crate) fn status_allowed_from(source: Option<IpAddr>) -> bool {
+    let Some(s) = current() else { return false };
+    match source {
+        None => true,
+        Some(ip) => cidr::normalize(ip).is_loopback() || s.cfg.allow_remote_status,
+    }
 }
 
 pub(crate) fn note_handshake_failure(ip: IpAddr) {
