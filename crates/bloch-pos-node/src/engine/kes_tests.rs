@@ -787,6 +787,56 @@ fn an_unsigned_header_far_past_the_gate_rolls_nothing() {
     assert_eq!(epoch_of(engine.state.slot()), 0, "the head did not move");
 }
 
+/// Reviews RC2-07, RC3-04 and RC3-06, through the whole door
+/// (`ingest_one`): a stored parent that fails the transition on its own
+/// parent's exact post-state, found while judging a really signed child, is
+/// remembered as failed and removed from the store, as the side-branch fold
+/// does with a block that fails; the child is ignored. When a peer offers
+/// the parent again and admission stores it again, a further child is
+/// dropped without running the parent through the transition again.
+#[test]
+fn a_parent_failing_the_transition_in_the_door_is_remembered_and_removed() {
+    use bloch_pos_committee::params::{KES_ACTIVATION_EPOCH, KES_BIND_DELAY_EPOCHS};
+    let (mut engine, _dir) = perf_support::proposing_engine();
+    engine.propose(1);
+    let head = *engine.head_id().as_bytes();
+    let template = engine.blocks.get(&head).expect("the block just proposed").clone();
+    let bind = KES_ACTIVATION_EPOCH + KES_BIND_DELAY_EPOCHS;
+    let mut parent_env = template.clone();
+    parent_env.header.parent = head;
+    parent_env.header.slot = first_slot_of_epoch(bind - 22).unwrap() + 1;
+    let parent = *parent_env.block_id().as_bytes();
+    engine.blocks.insert(parent, parent_env.clone());
+    let signed = |epoch: u64, engine: &Engine| {
+        let mut env = template.clone();
+        env.header.parent = parent;
+        env.header.slot = first_slot_of_epoch(epoch).unwrap() + 1;
+        env.proposer_sig = engine.keys.as_ref().unwrap().sign_for_epoch(epoch, &env.header.proposal_signing_root());
+        env
+    };
+    let wall = first_slot_of_epoch(bind + 4).unwrap();
+    {
+        let _w = wall_at(&mut engine, wall);
+        let child = signed(bind, &engine);
+        let (verdict, landed) = engine.ingest_one(child, Source::Gossip(Some([0xB1; 32])));
+        assert_eq!(verdict, Verdict::Ignore);
+        assert!(landed.is_none());
+        assert!(engine.reorg_anchors.side.failed_index.contains(&parent), "the parent is remembered as failed");
+        assert!(!engine.blocks.contains_key(&parent), "and removed from the store");
+        assert!(!engine.state.try_spend_door_long_roll(wall), "the long roll was taken for the transition");
+    }
+    engine.blocks.insert(parent, parent_env);
+    {
+        let _w = wall_at(&mut engine, wall + 1);
+        let child = signed(bind + 1, &engine);
+        let fallback = engine.proposer_authority_state(&parent);
+        let verdict = engine.door_kes_state(&child, Source::Gossip(Some([0xB2; 32])), None, fallback);
+        assert!(matches!(verdict, DoorKes::Drop), "a child of a remembered failed parent is dropped");
+        assert!(engine.state.try_spend_door_long_roll(wall + 1), "without taking the long roll");
+    }
+    assert_eq!(engine.state.door_rolled_epochs(), 0);
+}
+
 /// Review RC-01: the door's roll is exact, bounded, rationed and cached.
 /// Within `DOOR_FREE_ROLL_EPOCHS` it is free; a longer one takes the wall
 /// slot's single door long roll and the next is deferred until the slot
@@ -1255,7 +1305,61 @@ fn a_bind_crossing_block_on_a_deeper_side_branch_is_admitted_once_the_fold_reach
     use bloch_pos_committee::params::{KES_ACTIVATION_EPOCH, KES_BIND_DELAY_EPOCHS};
     let gate = KES_ACTIVATION_EPOCH;
     let bind = gate + KES_BIND_DELAY_EPOCHS;
-    let (mut engine, _dir) = registered_chain(gate - 2);
+    let (mut engine, _dir, [a1, h1, h2, b], env_b, sb) = deeper_siblings_fixture();
+
+    // B by gossip: judged on the head H2 (static), failed, parked.
+    engine.live = true;
+    {
+        let _w = wall_at(&mut engine, sb);
+        let (verdict, landed) = engine.ingest_one(env_b.clone(), Source::Gossip(Some([0x57; 32])));
+        assert_eq!(verdict, Verdict::Ignore);
+        assert!(landed.is_none());
+    }
+    assert!(engine.orphans.iter().any(|(id, ..)| *id == b), "B is parked");
+    assert!(engine.authority_parked.judged.contains_key(&b), "for its proposer's authority");
+    assert!(engine.authority_parked_due().is_empty(), "the head did not change: the old trigger never fires");
+
+    // The fold validates A1 and H1; the head stays H2; B is queued again.
+    let mut slot = sb;
+    while !(engine.blocks.is_validated(&a1) && engine.blocks.is_validated(&h1)) {
+        assert!(slot < sb + 32, "the fold validates the branch within a few slots");
+        let _w = wall_at(&mut engine, slot);
+        for _ in 0..4 {
+            engine.validate_side_branch_turn(slot);
+        }
+        slot += 1;
+    }
+    assert_eq!(*engine.head_id().as_bytes(), h2, "a stalled head: validation adopted nothing");
+    assert!(engine.deferred_orphans.iter().any(|(id, ..)| *id == b), "B is queued for the door again");
+    assert!(engine.exact_parent_state(&h1).is_some(), "H1's post-state is held for it");
+
+    // The promotion runs the whole door again, now on H1's own state.
+    let rolled_before = engine.state.door_rolled_epochs();
+    {
+        let _w = wall_at(&mut engine, slot);
+        while engine.deferred_orphans.iter().any(|(id, ..)| *id == b) {
+            engine.release_orphan_turn();
+        }
+    }
+    assert!(engine.blocks.contains_key(&b) || engine.canonical.contains(&b), "B is admitted and stored");
+    assert!(!engine.orphans.iter().any(|(id, ..)| *id == b), "not parked again");
+    assert_eq!(engine.state.door_rolled_epochs() - rolled_before, bind - (gate - 1), "H1's epoch to B's");
+    assert_eq!(engine.state.door_cached(&h1, bind).expect("cached by (H1, 8622)").kes_enforced_from(), Some(bind));
+}
+
+/// The fixture of the RC2-03 and RC3-01 end-to-end tests: on a registered
+/// chain stopped in 8618 at P, the sibling branches P→A1→H1 and P→A2→H2 in
+/// 8619, and B on H1 in 8622 (the first epoch the bind governs, signed with
+/// the KES leaf, applied by the transition). The node is left with its head
+/// on H2, held there by a vote, A1 and H1 stored as admission stores them
+/// (not validated), no post-state of A1 or H1 held, and B not yet seen.
+/// Returns the engine, its directory, the ids (a1, h1, h2, b), B and B's
+/// slot.
+fn deeper_siblings_fixture() -> (Engine, perf_support::TestDir, [[u8; 32]; 4], BlockEnvelope, u64) {
+    use bloch_pos_committee::params::{KES_ACTIVATION_EPOCH, KES_BIND_DELAY_EPOCHS};
+    let gate = KES_ACTIVATION_EPOCH;
+    let bind = gate + KES_BIND_DELAY_EPOCHS;
+    let (mut engine, dir) = registered_chain(gate - 2);
     let p = *engine.head_id().as_bytes();
     assert_eq!(engine.state.kes_enforced_from(), None);
     let propose_at = |engine: &mut Engine, slot: u64| {
@@ -1307,19 +1411,32 @@ fn a_bind_crossing_block_on_a_deeper_side_branch_is_admitted_once_the_fold_reach
     assert!(engine.exact_parent_state(&h1).is_none() && engine.exact_parent_state(&a1).is_none());
     assert!(!engine.blocks.is_validated(&a1) && !engine.blocks.is_validated(&h1));
 
-    // B by gossip: judged on the head H2 (static), failed, parked.
-    engine.live = true;
-    {
-        let _w = wall_at(&mut engine, sb);
-        let (verdict, landed) = engine.ingest_one(env_b.clone(), Source::Gossip(Some([0x57; 32])));
-        assert_eq!(verdict, Verdict::Ignore);
-        assert!(landed.is_none());
-    }
-    assert!(engine.orphans.iter().any(|(id, ..)| *id == b), "B is parked");
-    assert!(engine.authority_parked.judged.contains_key(&b), "for its proposer's authority");
-    assert!(engine.authority_parked_due().is_empty(), "the head did not change: the old trigger never fires");
+    (engine, dir, [a1, h1, h2, b], env_b, sb)
+}
 
-    // The fold validates A1 and H1; the head stays H2; B is queued again.
+/// **Review RC3-01, end to end at mainnet numbers: the natural order.**
+///
+/// The fixture of the RC2-03 test, but the side-branch fold validates A1
+/// and H1, and drops its cursor, BEFORE B arrives (in the network B comes
+/// two empty epochs after H1). Nothing waited on H1 when it was validated,
+/// so in 8a33e939 nothing kept its post-state: B was judged on `fallback`,
+/// parked, and never judged again (H1 is no longer a fold candidate and the
+/// head does not move). Now the fold keeps the exact post-states of the
+/// side blocks it validated, and B is admitted on H1's own state, rolled
+/// into 8622, as it arrives, while the head stays H2.
+///
+/// `cargo test --release -p bloch-pos-node --bin bloch-pos -- --ignored natural_order`.
+#[test]
+#[ignore = "several minutes: drives a real chain to epoch 8622"]
+fn a_bind_crossing_block_arriving_after_the_fold_validated_its_side_parent_is_admitted_natural_order() {
+    use bloch_pos_committee::params::{KES_ACTIVATION_EPOCH, KES_BIND_DELAY_EPOCHS};
+    let gate = KES_ACTIVATION_EPOCH;
+    let bind = gate + KES_BIND_DELAY_EPOCHS;
+    let (mut engine, _dir, [a1, h1, h2, b], env_b, sb) = deeper_siblings_fixture();
+    engine.live = true;
+
+    // The fold first: A1 and H1 validated, then a turn with nothing left
+    // drops the cursor. The head stays H2.
     let mut slot = sb;
     while !(engine.blocks.is_validated(&a1) && engine.blocks.is_validated(&h1)) {
         assert!(slot < sb + 32, "the fold validates the branch within a few slots");
@@ -1329,20 +1446,28 @@ fn a_bind_crossing_block_on_a_deeper_side_branch_is_admitted_once_the_fold_reach
         }
         slot += 1;
     }
+    {
+        let _w = wall_at(&mut engine, slot);
+        engine.validate_side_branch_turn(slot);
+        engine.validate_side_branch_turn(slot);
+    }
+    assert!(engine.reorg_anchors.side.cursor.is_none(), "the cursor is dropped");
     assert_eq!(*engine.head_id().as_bytes(), h2, "a stalled head: validation adopted nothing");
-    assert!(engine.deferred_orphans.iter().any(|(id, ..)| *id == b), "B is queued for the door again");
-    assert!(engine.exact_parent_state(&h1).is_some(), "H1's post-state is held for it");
+    assert!(
+        !engine.orphans.iter().chain(engine.deferred_orphans.iter()).any(|(_, env, ..)| env.header.parent == h1),
+        "nothing waited on H1"
+    );
+    assert!(engine.exact_parent_state(&h1).is_some(), "H1's exact post-state is still held");
 
-    // The promotion runs the whole door again, now on H1's own state.
+    // Then B, by gossip: admitted at once, on H1's own state.
     let rolled_before = engine.state.door_rolled_epochs();
     {
         let _w = wall_at(&mut engine, slot);
-        while engine.deferred_orphans.iter().any(|(id, ..)| *id == b) {
-            engine.release_orphan_turn();
-        }
+        let (verdict, landed) = engine.ingest_one(env_b.clone(), Source::Gossip(Some([0x58; 32])));
+        assert_eq!(verdict, Verdict::Accept, "B is admitted on its own parent's rolled state");
+        assert_eq!(landed.map(|(id, _)| id), Some(b));
     }
-    assert!(engine.blocks.contains_key(&b) || engine.canonical.contains(&b), "B is admitted and stored");
-    assert!(!engine.orphans.iter().any(|(id, ..)| *id == b), "not parked again");
+    assert!(!engine.orphans.iter().any(|(id, ..)| *id == b), "not parked");
     assert_eq!(engine.state.door_rolled_epochs() - rolled_before, bind - (gate - 1), "H1's epoch to B's");
     assert_eq!(engine.state.door_cached(&h1, bind).expect("cached by (H1, 8622)").kes_enforced_from(), Some(bind));
 }
