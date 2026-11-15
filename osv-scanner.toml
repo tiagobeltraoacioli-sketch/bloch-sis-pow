@@ -107,7 +107,7 @@ reason = "Mirrors audit.toml: transitive, superseded wrapper."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0161"   # pqcrypto-mlkem unmaintained (L1M-06, added 2026-11-14)
-ignoreUntil = 2026-12-01
+ignoreUntil = 2027-02-14   # the re-review date audit.toml and deny.toml carry (review RC-06)
 reason = "Mirrors audit.toml: no patched release; optional hybrid ML-KEM-768 + X25519 mesh transport only, never consensus."
 
 [[IgnoredVulns]]

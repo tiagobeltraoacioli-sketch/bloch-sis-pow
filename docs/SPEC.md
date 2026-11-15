@@ -219,7 +219,7 @@ salt `"mnemonic"` (`wallet/seed.rs`) — the seed BIP39 actually specifies, pinn
 to the official test vectors. Until audit finding K-M3 this used
 HMAC-**SHA256**, which silently produced a different 64-byte seed, and therefore
 a different PQ key, than every other BIP39 tool for the same phrase — including
-`bloch-btc-wallet::derive_identity` and `bloch-pq-vault::derive_vault_keys` in
+`bloch-btc-wallet::derive_identity` and `bloch-pq-vault::derive_new_vault_keys` in
 this repo. The pre-fix derivation survives as the deprecated
 `to_seed_bytes_legacy_sha256` for migration/sweep tooling only; whether any
 wallet in the wild needs that sweep is **needs-founder-decision**.

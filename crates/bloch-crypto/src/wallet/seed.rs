@@ -134,7 +134,7 @@ impl SeedPhrase {
     /// simply a different number, and the same mnemonic then yields a different
     /// key in every other BIP39 tool, including the two in this repo that are
     /// fed a canonical seed (`bloch_btc_wallet::derive_identity` and
-    /// `bloch_pq_vault::derive_vault_keys`). Pinned to the official vectors in
+    /// `bloch_pq_vault::derive_new_vault_keys`). Pinned to the official vectors in
     /// the tests below.
     ///
     /// The optional BIP39 passphrase ("25th word") is not implemented, so the
