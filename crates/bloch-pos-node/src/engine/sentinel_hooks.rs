@@ -8,6 +8,13 @@
 //! a state root, and each returns at its first line when the Sentinel is off
 //! (the default). The tests at the bottom replay a chain with the Sentinel on
 //! and compare it byte for byte with the same replay without it.
+//!
+//! Nor do they write any cache an admission door reads (review RC-04): the
+//! KES status view rolls the head beside the duty memo, never into it. With
+//! the Sentinel on it does cost CPU on the consensus thread: at most one roll
+//! of `KES_VIEW_MAX_ROLL_EPOCHS` epochs per applied block while the node is
+//! live and its head lags its wall clock, and nothing when the signer has
+//! already rolled the duty state of the wall epoch.
 
 use super::*;
 use crate::sentinel::{self, AdvertKind, ChainSnapshot, Observation};
@@ -48,15 +55,25 @@ impl Engine {
     /// function `attest_for`/`propose`/`submit_kes_rotation` take the state
     /// they hand to `prepare_kes` from (audit L1-01, review R-03). The mode
     /// is then read with `Engine::duty_signing_mode`, the signer's own call.
-    /// Read-only: `duty_state` returns a shared derived value and never
-    /// touches the canonical state.
+    /// Read-only, and since review RC-04 also memo-neutral: the roll is the
+    /// same `process_epoch` fold `duty_state` runs (so the same state and
+    /// the same mode), taken through `StateCell::rolled_aside`, which reads a
+    /// duty state the signer already memoized but never adds one. Before,
+    /// the status filled the memo the attestation door consults
+    /// (`attestation_roll_admitted`), so turning the Sentinel on changed
+    /// which arriving votes were judged and which were ignored. The aside
+    /// roll is cached per (state generation, epoch): at most one roll of
+    /// `KES_VIEW_MAX_ROLL_EPOCHS` per applied block, never one per slot.
     ///
     /// Returns the state and the epoch it stands in: `wall_epoch` when
     /// rolled, the head's epoch when the unrolled head is reported instead.
     fn sentinel_kes_state(&self, wall_epoch: u64) -> (Arc<CommittedState>, u64) {
         let head_epoch = epoch_of(self.state.slot());
         if self.live && wall_epoch.saturating_sub(head_epoch) <= KES_VIEW_MAX_ROLL_EPOCHS {
-            (self.duty_state(wall_epoch), wall_epoch.max(head_epoch))
+            let rolled = self.state.rolled_aside(wall_epoch, |st| {
+                self.tr.process_epoch(st).expect("process_epoch is infallible")
+            });
+            (rolled, wall_epoch.max(head_epoch))
         } else {
             // `rolled_to` at or below the head's epoch is the head state.
             (self.duty_state(head_epoch), head_epoch)
@@ -352,8 +369,15 @@ mod tests {
         engine.live = true;
         let head_epoch = epoch_of(engine.state.slot());
         engine.wall_slot = (head_epoch + 2) * SLOTS_PER_EPOCH;
+        let memo_before = engine.state.memo_len();
         let snap = engine.sentinel_snapshot();
         assert_eq!(snap.kes.head_state_epoch, head_epoch + 2, "rolled into the wall epoch");
+        // Review RC-04: rolled beside the memo the attestation door reads.
+        assert_eq!(engine.state.memo_len(), memo_before, "the status roll wrote no memo entry");
+        assert_eq!(engine.state.roll_distance(head_epoch + 2), 2, "votes still find nothing paid for");
+        let again = engine.sentinel_snapshot();
+        assert_eq!(again.kes.head_state_epoch, head_epoch + 2);
+        assert_eq!(engine.state.memo_len(), memo_before);
         let rolled = engine.rolled_to(head_epoch + 2);
         assert_eq!(snap.kes.bind_epoch, KeyLookup::kes_enforced_from(&*rolled));
         assert_eq!(snap.kes.validator, engine.duty_index(&rolled));

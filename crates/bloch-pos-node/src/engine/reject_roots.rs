@@ -220,34 +220,48 @@ impl Engine {
     /// (audit L1-08): the same authority state, rule and budgeted lane as
     /// `ingest_one_deferred`. Any doubt (unknown identity, a spent allowance,
     /// a branch-dependent key) is `false`, which only costs work later.
+    ///
+    /// Review RC-07: what this classifies is authorship ("a key of this
+    /// proposer signed it"), not the block's validity, so on a state that
+    /// selects the static key it also accepts the proposer's KES leaf for the
+    /// period. A state that has not yet seen a bind (a head stopped before
+    /// the bind decision, the L1-01 shape) would otherwise call every real
+    /// KES-signed descendant unauthenticated. No state is rolled for it; the
+    /// leaf is checked only when the signature has a leaf's shape.
     fn rejected_descendant_signature_verifies(&self, env: &BlockEnvelope, src: Source) -> bool {
         let epoch = epoch_of(env.header.slot);
         let judged_state = self.proposer_authority_state(&env.header.parent);
         let root = env.header.proposal_signing_root();
+        let validator = env.header.proposer_index;
+        let leaf_period = bloch_pos_committee::params::kes_period(epoch).filter(|period| {
+            bloch_pos_committee::kes::signing_mode(&*judged_state, validator, epoch)
+                == bloch_pos_committee::kes::SigningMode::Static
+                && super::kes_shaped(&*judged_state, validator, *period, &env.proposer_sig)
+        });
+        let by_either = |verifier: &dyn bloch_pos_committee::SignatureVerifier| {
+            let policy = bloch_pos_committee::PolicyVerifier::consensus(verifier, epoch);
+            leaf_period.is_some_and(|period| {
+                bloch_pos_committee::kes::verify_validator_in(
+                    &*judged_state,
+                    &policy,
+                    validator,
+                    Some(period),
+                    &root,
+                    &env.proposer_sig,
+                ) == Some(true)
+            }) || bloch_pos_committee::kes::verify_validator(&*judged_state, &policy, validator, epoch, &root, &env.proposer_sig)
+                == Some(true)
+        };
         if src.bounded_by_wall_clock() {
             let (lane, lane_cap, lane_source_cap) = src.block_verification_allowance();
             let verifier = self
                 .gossip_verifier
                 .budgeted_lane_for_source(self.wall_slot(), lane, lane_cap, src.verification_source(), lane_source_cap)
                 .with_failure_allowance(BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
-            let verified = bloch_pos_committee::kes::verify_validator(
-                &*judged_state,
-                &bloch_pos_committee::PolicyVerifier::consensus(&verifier, epoch),
-                env.header.proposer_index,
-                epoch,
-                &root,
-                &env.proposer_sig,
-            ) == Some(true);
+            let verified = by_either(&verifier);
             verified && !verifier.limited()
         } else {
-            bloch_pos_committee::kes::verify_validator(
-                &*judged_state,
-                &bloch_pos_committee::PolicyVerifier::consensus(&self.gossip_verifier, epoch),
-                env.header.proposer_index,
-                epoch,
-                &root,
-                &env.proposer_sig,
-            ) == Some(true)
+            by_either(&self.gossip_verifier)
         }
     }
 

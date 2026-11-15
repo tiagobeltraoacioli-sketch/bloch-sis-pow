@@ -689,21 +689,83 @@ fn a_duty_past_an_unseen_kes_bind_signs_the_leaf_verifiers_require() {
     assert_eq!(engine.prepare_kes_in(&rolled, Some(&rolled.entry), duty_epoch - 1, 0).unwrap(), None);
 }
 
-/// Audit L1-01, block door: past the KES gate a block on the head, in a
-/// later epoch, is authenticated against the head rolled into its epoch
-/// (what the transition judges it by); before the gate, and for a parent
-/// that is not the head, the door reads the unrolled state as before.
+/// Review RC-01: the block door rolls nothing for a header no key signed.
+///
+/// A real block's envelope, re-dated thousands of epochs past the KES gate
+/// on top of a head that lags the wall clock by as much (a node catching up),
+/// with a garbage, an empty and a leaf-shaped forged signature, each at
+/// several epochs: every one is `Ignore`d and not one epoch is rolled. The
+/// door of 179251c4 rolled the head into the header's epoch before any
+/// signature check (here: about 3,000 `process_epoch` calls per header).
 #[test]
-fn the_block_door_judges_a_post_gate_proposer_on_the_rolled_head() {
+fn an_unsigned_header_far_past_the_gate_rolls_nothing() {
+    let (mut engine, _dir) = perf_support::proposing_engine();
+    engine.propose(1);
+    let head = *engine.head_id().as_bytes();
+    let template = engine.blocks.get(&head).expect("the block just proposed").clone();
+    let far = first_slot_of_epoch(bloch_pos_committee::params::KES_ACTIVATION_EPOCH + 3_000).unwrap();
+    let _clock = validator_lifecycle::clock_at(far);
+    engine.live = false;
+    let mut leaf_shaped = kes::SIGNATURE_MAGIC.to_vec();
+    leaf_shaped.extend_from_slice(&[0; 64]);
+    let mut n = 0u64;
+    for signature in [vec![0xEE; 64], Vec::new(), leaf_shaped] {
+        for k in 0..8u64 {
+            n += 1;
+            let mut env = template.clone();
+            env.header.parent = head;
+            env.header.slot = far - n - k * SLOTS_PER_EPOCH;
+            env.proposer_sig = signature.clone();
+            let (verdict, landed) = engine.ingest_one(env, Source::Gossip(Some([0x31; 32])));
+            assert_eq!(verdict, Verdict::Ignore);
+            assert!(landed.is_none(), "never stored");
+        }
+    }
+    assert_eq!(engine.state.door_rolled_epochs(), 0, "no epoch was rolled");
+    assert_eq!(engine.state.memo_len(), 0, "and no roll was memoized");
+    assert_eq!(epoch_of(engine.state.slot()), 0, "the head did not move");
+}
+
+/// Review RC-01: the door's roll is exact, bounded, rationed and cached.
+/// Within `DOOR_FREE_ROLL_EPOCHS` it is free; a longer one takes the wall
+/// slot's single door long roll and the next is deferred until the slot
+/// changes; a repeat is served from the cache; past `MAX_EPOCH_ADVANCE` it
+/// is never run. For a parent that is not the head the roll is cached by
+/// (parent id, epoch). In every case it equals the uncached reference fold.
+#[test]
+fn the_door_roll_is_exact_bounded_rationed_and_cached() {
     let (engine, _dir) = perf_support::proposing_engine();
     let head = *engine.head_id().as_bytes();
-    let duty_epoch = bloch_pos_committee::params::KES_ACTIVATION_EPOCH + bloch_pos_committee::params::KES_BIND_DELAY_EPOCHS;
-    let judged = engine.proposer_authority_state_at(&head, duty_epoch);
-    assert!(Arc::ptr_eq(&judged, &engine.rolled_to(duty_epoch)), "the rolled head");
-    assert!(!Arc::ptr_eq(&judged, &engine.state.arc()));
-    let before_gate = bloch_pos_committee::params::KES_ACTIVATION_EPOCH - 1;
-    assert!(Arc::ptr_eq(&engine.proposer_authority_state_at(&head, before_gate), &engine.state.arc()), "unchanged before the gate");
-    assert!(Arc::ptr_eq(&engine.proposer_authority_state_at(&[0x9A; 32], duty_epoch), &engine.state.arc()), "not the head's child");
+    let base = engine.state.arc();
+    let roll = |parent: [u8; 32], is_head: bool, epoch: u64, local: bool| {
+        engine.door_roll(parent, is_head, Arc::clone(&base), epoch, local, false)
+    };
+    {
+        let _clock = validator_lifecycle::clock_at(100);
+        assert!(roll(head, true, DOOR_FREE_ROLL_EPOCHS, false).is_ok(), "free");
+        assert_eq!(engine.state.door_rolled_epochs(), DOOR_FREE_ROLL_EPOCHS);
+        let far = roll(head, true, 400, false).ok().expect("the slot's long roll");
+        assert_eq!(*far, engine.rolled_to_uncached(400), "exactly the transition's fold");
+        let spent = engine.state.door_rolled_epochs();
+        assert_eq!(spent, 400);
+        assert!(matches!(roll(head, true, 500, false), Err(DoorKes::Defer)), "one long roll per slot");
+        assert!(roll(head, true, 400, false).is_ok(), "a repeat is a memo hit");
+        assert!(roll(head, true, 500, true).is_ok(), "this node's own block is not rationed");
+        assert_eq!(engine.state.door_rolled_epochs(), spent + 100);
+    }
+    let before = engine.state.door_rolled_epochs();
+    {
+        let _clock = validator_lifecycle::clock_at(101);
+        assert!(matches!(roll(head, true, MAX_EPOCH_ADVANCE + 1, false), Err(DoorKes::Drop)), "never past the ceiling");
+        assert_eq!(engine.state.door_rolled_epochs(), before, "and nothing rolled for it");
+        let side = [0xAB; 32];
+        let rolled = roll(side, false, 450, false).ok().expect("a fresh slot's long roll");
+        assert_eq!(*rolled, engine.rolled_to_uncached(450));
+        assert!(Arc::ptr_eq(&engine.door_rolled_cached(&side, false, 450).unwrap(), &rolled), "cached by (parent, epoch)");
+        let again = roll(side, false, 450, false).ok().expect("served from the cache, not rationed");
+        assert!(Arc::ptr_eq(&again, &rolled));
+        assert!(engine.door_rolled_cached(&[0xAC; 32], false, 450).is_none(), "another parent is another key");
+    }
 }
 
 /// Drive a one-validator engine through each epoch of `epochs` (ascending):
@@ -844,6 +906,220 @@ fn two_empty_epochs_after_the_bind_decision_do_not_halt_the_chain() {
     engine.propose(vote_slot);
     assert_eq!(engine.state.slot(), vote_slot, "the KES-signed proposal crosses the bind");
     assert_eq!(engine.state.kes_enforced_from(), Some(duty_epoch));
+}
+
+/// The chain of the L1-01 end-to-end test, stopped after `last` (a live
+/// epoch before the gate): one validator, a depth-8 hybrid KES tree
+/// registered in the window, two of every three (then sixteen) epochs voted.
+fn registered_chain(last: u64) -> (Engine, perf_support::TestDir) {
+    use bloch_pos_committee::params::{ETH_PACED_LEAK_ACTIVATION_EPOCH, KES_ACTIVATION_EPOCH, KES_MIN_REGISTERED_DEPTH, KES_REGISTRATION_EPOCH};
+    let (mut engine, dir) = perf_support::proposing_engine();
+    let kes_dir = dir.0.join("kes");
+    std::fs::create_dir_all(&kes_dir).unwrap();
+    let unlock_for = || Unlock::passphrase_with("kes-rc-02-e2e-passphrase", KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 });
+    let key = crate::kes_key::KesKey::generate(0, KES_MIN_REGISTERED_DEPTH, |_| {}).unwrap();
+    key.save(&kes_dir, &unlock_for()).unwrap();
+    let tree = key.public();
+    engine.kes = Some(KesSigner::new(key, kes_dir, unlock_for()));
+    assert!(last < KES_ACTIVATION_EPOCH && last > KES_REGISTRATION_EPOCH + 1);
+    let mut schedule: BTreeSet<u64> = BTreeSet::new();
+    let mut e = 1;
+    while e < ETH_PACED_LEAK_ACTIVATION_EPOCH {
+        schedule.extend([e, e + 1]);
+        e += 3;
+    }
+    while e < last {
+        schedule.extend([e, e + 1]);
+        e += 16;
+    }
+    schedule.extend([KES_REGISTRATION_EPOCH, KES_REGISTRATION_EPOCH + 1, last - 1, last]);
+    schedule.retain(|e| *e <= last);
+    let window = live_epochs(&mut engine, schedule.range(..=KES_REGISTRATION_EPOCH).copied());
+    let domain = engine.state.admission_network_domain().unwrap_or([0; 32]);
+    let public = KesPublic::new(tree.depth, tree.root, 0);
+    let signature = engine.keys.as_ref().unwrap().sign(&kes::register_signing_root(&domain, 0, &public));
+    {
+        let _clock = validator_lifecycle::clock_at(window);
+        engine.wall_slot = window;
+        engine
+            .on_transaction(PosTransaction::KesRegister { validator: 0, depth: tree.depth, root: tree.root, signature })
+            .expect("the registration is admitted");
+    }
+    let head = live_epochs(&mut engine, schedule.range(KES_REGISTRATION_EPOCH + 1..).copied());
+    assert_eq!(epoch_of(head), last);
+    assert!(engine.state.kes_roots().contains_key(&0), "the registration is included");
+    (engine, dir)
+}
+
+/// Make `slot` the wall slot of both clocks the engine reads.
+fn wall_at(engine: &mut Engine, slot: u64) -> impl Drop {
+    engine.wall_slot = slot;
+    validator_lifecycle::clock_at(slot)
+}
+
+/// **Reviews RC-02 and RC-01, end to end at mainnet numbers.**
+///
+/// RC-02: the stall of L1-01 with two sibling heads. H1 and H2 are children
+/// of P in epoch 8619; epochs 8620 and 8621 stay empty; the first block of
+/// 8622, B, is built on H1 and signed with the KES leaf (the bind decided at
+/// the boundary into 8620 governs it). On a node whose head is H2 neither
+/// the head nor the ring holds H1's post-state, so the door of 179251c4
+/// judged B on the unrolled head H2 (static key), failed it and parked it:
+/// each side kept only the bind-crossing blocks built on its own head. B must
+/// now be admitted, judged on H1's own post-state rolled into 8622 (derived
+/// here by running H1 through the transition from P's post-state, which the
+/// ring holds), and the transition applies it on that parent.
+///
+/// RC-01, on the same lagging head (registered KES key, no bind known,
+/// thousands of epochs behind the wall clock): a header with a garbage
+/// signature, and one carrying B's real leaf signature over another header,
+/// roll nothing; a header this proposer really signed (static key) takes the
+/// wall slot's single long roll and a second one in the same slot is
+/// deferred without rolling; a header beyond `MAX_EPOCH_ADVANCE` is dropped
+/// without rolling.
+///
+/// Ignored by default only for its run time, like the L1-01 test:
+/// `cargo test --release -p bloch-pos-node --bin bloch-pos -- --ignored sibling_heads`.
+#[test]
+#[ignore = "several minutes: drives a real chain to epoch 8622"]
+fn sibling_heads_cross_the_bind_and_unsigned_headers_roll_nothing() {
+    use bloch_pos_committee::params::{KES_ACTIVATION_EPOCH, KES_BIND_DELAY_EPOCHS};
+    let gate = KES_ACTIVATION_EPOCH;
+    let bind = gate + KES_BIND_DELAY_EPOCHS;
+    let (mut engine, _dir) = registered_chain(gate - 2);
+    let p = *engine.head_id().as_bytes();
+    assert_eq!(engine.state.kes_enforced_from(), None);
+
+    // H1 and H2, siblings on P in 8619 (proposed in increasing slots, the
+    // rival taken out of the store while each is built so fork choice cannot
+    // flip between two weightless siblings), then B on H1 in 8622, with
+    // 8620 and 8621 empty.
+    let s1 = first_slot_of_epoch(gate - 1).unwrap() + 1;
+    {
+        let _w = wall_at(&mut engine, s1);
+        engine.propose(s1);
+    }
+    let h1 = *engine.head_id().as_bytes();
+    assert_ne!(h1, p, "H1 is applied");
+    let env_h1 = engine.blocks.get(&h1).unwrap().clone();
+    assert!(engine.do_reorg(p, Vec::new()), "hand H1 back");
+    engine.blocks.remove(&h1);
+    let s2 = s1 + 1;
+    {
+        let _w = wall_at(&mut engine, s2);
+        engine.propose(s2);
+    }
+    let h2 = *engine.head_id().as_bytes();
+    assert!(h2 != h1 && h2 != p, "H2 is applied");
+    let env_h2 = engine.blocks.get(&h2).unwrap().clone();
+    engine.blocks.remove(&h2);
+    engine.blocks.insert(h1, env_h1.clone());
+    assert!(engine.do_reorg(p, vec![env_h1.clone()]), "onto H1 to build B");
+    assert_eq!(*engine.head_id().as_bytes(), h1);
+    let sb = first_slot_of_epoch(bind).unwrap() + 1;
+    {
+        let _w = wall_at(&mut engine, sb);
+        engine.propose(sb);
+    }
+    let b = *engine.head_id().as_bytes();
+    assert_eq!(engine.state.slot(), sb, "the transition applies B on H1 across the bind");
+    assert_eq!(engine.state.kes_enforced_from(), Some(bind));
+    let env_b = engine.blocks.get(&b).unwrap().clone();
+    assert_eq!(env_b.header.parent, h1);
+
+    // The node of RC-02: head H2, H1 stored beside it, B not yet seen.
+    engine.blocks.insert(h2, env_h2.clone());
+    assert!(engine.do_reorg(p, vec![env_h2.clone()]), "onto H2");
+    engine.blocks.remove(&b);
+    assert_eq!(*engine.head_id().as_bytes(), h2);
+    assert!(engine.blocks.get(&h1).is_some(), "H1 is stored");
+    engine.recent_states.retain(|(id, _)| *id != h1);
+    assert!(engine.exact_parent_state(&h1).is_none(), "nothing holds H1's post-state");
+    assert!(engine.exact_parent_state(&p).is_some(), "the ring holds P's");
+    assert_eq!(engine.state.kes_enforced_from(), None, "the head H2 has not seen the bind");
+
+    // What the 179251c4 door judged B on: the unrolled head, static key.
+    let fallback = engine.proposer_authority_state(&h1);
+    assert!(Arc::ptr_eq(&fallback, &engine.state.arc()));
+    assert_eq!(kes::signing_mode(&*fallback, 0, bind), kes::SigningMode::Static);
+    assert_eq!(
+        kes::verify_validator(&*fallback, &HybridVerifier::new(), 0, bind, &env_b.header.proposal_signing_root(), &env_b.proposer_sig),
+        Some(false),
+        "under the head alone B's leaf signature fails: the partition"
+    );
+
+    // RC-02: B arrives by gossip and is admitted.
+    let rolled_before = engine.state.door_rolled_epochs();
+    {
+        let _w = wall_at(&mut engine, sb);
+        engine.live = true;
+        let (verdict, landed) = engine.ingest_one(env_b.clone(), Source::Gossip(Some([0x52; 32])));
+        assert_eq!(verdict, Verdict::Accept, "B is admitted on its own parent's rolled state");
+        assert_eq!(landed.map(|(id, _)| id), Some(b));
+    }
+    assert!(engine.blocks.get(&b).is_some() || engine.canonical.contains(&b));
+    assert!(!engine.orphans.iter().any(|(id, ..)| *id == b), "not parked");
+    assert_eq!(engine.state.door_rolled_epochs() - rolled_before, bind - (gate - 1), "one roll, H1's epoch to B's");
+    let cached = engine.state.door_cached(&h1, bind).expect("the roll is cached by (H1, 8622)");
+    assert_eq!(cached.kes_enforced_from(), Some(bind));
+
+    // RC-01 on a head that lags by thousands of epochs: H2 again, alone in
+    // the store above P, as a syncing node (wide horizon).
+    if *engine.head_id().as_bytes() != h2 {
+        assert!(engine.do_reorg(p, vec![env_h2.clone()]), "back onto H2");
+    }
+    engine.blocks.remove(&b);
+    engine.blocks.remove(&h1);
+    assert_eq!(*engine.head_id().as_bytes(), h2);
+    assert_eq!(engine.state.kes_enforced_from(), None);
+    engine.live = false;
+    let far_epoch = bind + 3_000;
+    let far = first_slot_of_epoch(far_epoch).unwrap();
+    let header_at = |slot: u64, signature: Vec<u8>, engine: &Engine| {
+        let mut env = env_b.clone();
+        env.header.parent = *engine.head_id().as_bytes();
+        env.header.slot = slot;
+        env.proposer_sig = signature;
+        env
+    };
+    let signed_at = |slot: u64, engine: &Engine| {
+        let mut env = header_at(slot, Vec::new(), engine);
+        env.proposer_sig = engine.keys.as_ref().unwrap().sign_for_epoch(epoch_of(slot), &env.header.proposal_signing_root());
+        env
+    };
+    let rolled = engine.state.door_rolled_epochs();
+    {
+        let _w = wall_at(&mut engine, far);
+        // Garbage, far ahead; and B's real leaf signature (period 0) on
+        // another header of B's epoch: leaf-shaped, but not over this root.
+        for (slot, signature) in [(far - 1, vec![0xEE; 96]), (sb + 1, env_b.proposer_sig.clone())] {
+            let env = header_at(slot, signature, &engine);
+            assert_eq!(engine.ingest_one(env, Source::Gossip(Some([0x53; 32]))).0, Verdict::Ignore);
+        }
+        assert_eq!(engine.state.door_rolled_epochs(), rolled, "no key signed them: nothing rolled");
+        assert_eq!(engine.state.memo_len(), 0);
+
+        // Really signed by the proposer (its static key): one long roll ...
+        let first = signed_at(far - 3, &engine);
+        assert_eq!(engine.ingest_one(first, Source::Gossip(Some([0x56; 32]))).0, Verdict::Ignore, "static key in a KES epoch: refused like the transition");
+        let after_one = engine.state.door_rolled_epochs();
+        assert_eq!(after_one - rolled, epoch_of(far - 3) - (gate - 1), "the slot's one long roll, from H2's epoch");
+        // ... and the second, at an epoch the memo does not hold, in the
+        // same slot, waits.
+        let second = signed_at(far - 3 - 100 * SLOTS_PER_EPOCH, &engine);
+        let second_id = *second.block_id().as_bytes();
+        assert_eq!(engine.ingest_one(second, Source::Gossip(Some([0x54; 32]))).0, Verdict::Ignore);
+        assert_eq!(engine.state.door_rolled_epochs(), after_one, "deferred, not rolled");
+        assert!(engine.orphans.iter().any(|(id, ..)| *id == second_id), "held for the next slot");
+    }
+    {
+        let beyond = first_slot_of_epoch(epoch_of(engine.state.slot()) + MAX_EPOCH_ADVANCE + 1).unwrap() + 1;
+        let _w = wall_at(&mut engine, beyond);
+        let before = engine.state.door_rolled_epochs();
+        let env = signed_at(beyond, &engine);
+        assert_eq!(engine.ingest_one(env, Source::Gossip(Some([0x55; 32]))).0, Verdict::Ignore);
+        assert_eq!(engine.state.door_rolled_epochs(), before, "past MAX_EPOCH_ADVANCE nothing is rolled");
+    }
 }
 
 /// Audit L1-06 (node-local half): past the gate and before the bind a first
