@@ -4431,7 +4431,7 @@ impl Engine {
         // before any signature work and never stored, so it never reaches
         // fork choice. `Ignore`: the peer relaying it is honest.
         if self.is_rejected_block(&id, &env.header.parent) {
-            self.refuse_rejected_block(id);
+            self.refuse_rejected_block(&env, id, src);
             return (Verdict::Ignore, None);
         }
         if env.header.slot == 0 {
@@ -8849,6 +8849,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // `--reject-block-root` / BLOCH_REJECT_BLOCK_ROOTS: read once, strictly,
     // and announced in one line so the operator sees exactly what is armed.
     let rejected_roots = reject_roots::reject_block_roots_from_env()?;
+    let rewind_confirmed = reject_roots::reject_root_rewind_confirmations_from_env()?;
+    if !rewind_confirmed.is_empty() {
+        println!(
+            "REJECT_BLOCK_ROOT: {} is set — a boot truncation for {} rejected root(s) may cut \
+             below this node's finalized checkpoint (together with --allow-finality-rewind)",
+            reject_roots::ENV_REJECT_ROOT_FINALITY_REWIND,
+            rewind_confirmed.len(),
+        );
+    }
     if rejected_roots.contains(genesis_id.as_bytes()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -8932,7 +8941,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
         finality_rewinds_refused: 0,
         parked_refused_finality: VecDeque::new(),
         finality_rewind_override: allow_finality_rewind,
-        rejected_roots: reject_roots::RejectedRoots::new(rejected_roots),
+        rejected_roots: reject_roots::RejectedRoots {
+            rewind_confirmed,
+            ..reject_roots::RejectedRoots::new(rejected_roots)
+        },
         tx_slot_index: BTreeMap::new(),
         tx_slot_index_order: VecDeque::new(),
         doppelganger_observe_until: None,
