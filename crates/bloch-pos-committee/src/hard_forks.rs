@@ -536,10 +536,14 @@ mod tests {
         assert!(may(10_060, 10_060, true, true, true));
         assert!(may(11_320, 10_060, true, true, true));
         // The compiled rule reads this build's values: the fallback is listed
-        // (agent 216) but the treasury is TBD-owner, so nothing may arm.
-        assert_eq!(crate::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY, None);
-        assert!(!l2_forced_inclusion_may_arm(10_060, 10_060, true));
+        // (agent 216) and the treasury is named (owner, 2026-11-16), so the
+        // gate MAY be armed at or after the swap. It is not: the gate itself
+        // is still inert, and a gate before the swap stays refused.
+        assert!(treasury_is_real(crate::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY));
+        assert!(l2_forced_inclusion_may_arm(10_060, 10_060, true));
+        assert!(!l2_forced_inclusion_may_arm(10_059, 10_060, true));
         assert!(l2_forced_inclusion_may_arm(M, 10_060, true));
+        assert_eq!(params::L2_FORCED_INCLUSION_EPOCH, M);
     }
 
     #[test]
