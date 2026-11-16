@@ -551,4 +551,45 @@ mod funded_l2_transactions {
         assert_eq!(node.on_transaction_from(valid, Some([0xD2; 32])), Ok(Admitted::New));
         assert_eq!(node.gossip_verifier.budget_used_at(slot), spent + 1);
     }
+
+    /// L2 audit list item B1 (review R308-3) on this release line: an L2
+    /// deposit, DA batch or withdrawal claim that nothing backs, at the
+    /// highest tip, from any number of keys and peers, takes no place in the
+    /// pool, so it cannot hold the pool against paying transactions. And item
+    /// B2: two entries of one key that spend one output hold one place, not
+    /// two. The paying transactions that follow are admitted and proposed.
+    ///
+    /// The same entries entered the pool of release 78d4921c on their
+    /// signature (see docs/L2-MEMPOOL-ADMISSION.md).
+    #[test]
+    fn r308_3_unbacked_l2_entries_at_the_highest_tip_take_no_place_in_the_pool() {
+        let _clock = validator_lifecycle::clock_at(3);
+        let funds = funds_of(2);
+        let (mut node, _dir) = engine(&funds);
+        let mut peer = 0u8;
+        for seed in 0..12u8 {
+            for tx in [
+                PosTransaction::L2Deposit(deposit(&node, 100 + seed, ABSENT, None, seed)),
+                PosTransaction::L2DataAvailability(data_availability(&node, 120 + seed, ABSENT, None)),
+                PosTransaction::L2WithdrawClaim(unpayable_claim(&node, 140 + seed)),
+            ] {
+                peer += 1;
+                assert!(refused(node.on_transaction_from(tx, Some([peer; 32]))), "seed {seed}");
+            }
+        }
+        assert_eq!(node.mempool.len(), 0, "nothing unbacked is pooled");
+
+        let point = (funds[0].txid, funds[0].vout);
+        let first = PosTransaction::L2Deposit(deposit(&node, OWNER, point, Some(funds[0].value), 1));
+        let second = PosTransaction::L2Deposit(deposit(&node, OWNER, point, Some(funds[0].value), 2));
+        assert_eq!(node.on_transaction(first.clone()), Ok(Admitted::New));
+        assert!(matches!(node.on_transaction(second), Err(Refusal::StateDependent(_))));
+        assert_eq!(node.mempool.len(), 1, "one funding output, one place");
+
+        let transfer = spend(&funds[1], 9_000, 0, node.state.next_base_fee_at(0));
+        assert_eq!(node.on_transaction(transfer.clone()), Ok(Admitted::New));
+        node.propose(3);
+        assert_eq!(node.tx_slot_index.get(&first.txid()), Some(&3));
+        assert_eq!(node.tx_slot_index.get(&transfer.txid()), Some(&3));
+    }
 }
