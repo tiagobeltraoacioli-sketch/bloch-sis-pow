@@ -1716,15 +1716,16 @@ pub mod mainnet {
     /// `codex/forced-guest-r8-20261102` 595d914 (agent 115's sparse guest with
     /// L1 forced inclusion, agent 137), built in its pinned container on two
     /// hosts: the sparse witness under the next rules with the forced prefix,
-    /// guest ELF SHA-256 `bc35e838…b048`. Its configuration `b4663ab8…a29d`
+    /// guest ELF SHA-256 `bc35e838…b048`. Its configuration `27d6ce9f…2783`
     /// (tag `BLOCH:EVM:CONFIG:4:CANCUN`) is the next rules plus forced
     /// inclusion, and is listed in [`FORCED_INCLUSION_CONFIGURATIONS`].
-    /// The configuration carries a PLACEHOLDER fee-sweep recipient, `TBD-owner`,
-    /// and the guest is a candidate, so these values are examples until
+    /// The configuration carries the owner's fee-sweep recipient
+    /// `0x775a993F09Bd80aeCF8F8c2ADe0C84158E3a0544` (bloch-l2-evm
+    /// `MAINNET_FEE_SWEEP_RECIPIENT`); these values are candidates until
     /// [`PROGRAM_NEXT_FINAL`] says otherwise.
     pub const PROGRAM_NEXT: NextProgram = NextProgram {
         identities: [
-            h32("b4663ab88607a1ebf7d1801920365fdde276889e211e097011bf48fcd0f7a29d"),
+            h32("27d6ce9f3ef204207ed089a4ba2593e4d45b9bc25242d3de32e2a3dea1a12783"),
             h32("1f744da8d3e0302cd39152e24e91071d7f0cfec7639245566a471cd6083a6b18"),
             h32("6a140f117b84dd524b3681b9447422e5281451295144b5747197d0df5db6afc9"),
             h32("00d4281e23ee13754a59b40dcc47422e55028a2534512d5d38cbe86fddb6afc9"),
@@ -1750,10 +1751,10 @@ pub mod mainnet {
     /// and publishes [`super::forced::inbox_hash`] exactly as [`PROGRAM_NEXT`]
     /// does (bloch-l2-evm `src/forced_complete.rs`; the forced list is the
     /// guest's fifth input), so its configuration is the forced next one
-    /// (`b4663ab8…`, listed) and a rollback keeps forced inclusion working.
+    /// (`27d6ce9f…`, listed) and a rollback keeps forced inclusion working.
     pub const PROGRAM_FALLBACK: NextProgram = NextProgram {
         identities: [
-            h32("b4663ab88607a1ebf7d1801920365fdde276889e211e097011bf48fcd0f7a29d"),
+            h32("27d6ce9f3ef204207ed089a4ba2593e4d45b9bc25242d3de32e2a3dea1a12783"),
             h32("d95185a60668b0d4e1da49be00d85b9c550b412f13c5155be454e72889f90bf1"),
             h32("432fa77548114c6431d3d64a09c851e8178e83b4744681fb73c3e2d368b11546"),
             h32("00865f4eeb204531918e9eb2509c851e82f1d0769d11a07ef9e1f169e8b11546"),
@@ -1770,7 +1771,7 @@ pub mod mainnet {
     /// and [`PROGRAM_FALLBACK`] both carry. [`crate::params::L2_FORCED_INCLUSION_EPOCH`]
     /// stays inert (`hard_forks::l2_forced_inclusion_may_arm`).
     pub const FORCED_INCLUSION_CONFIGURATIONS: &[[u8; 32]] =
-        &[h32("b4663ab88607a1ebf7d1801920365fdde276889e211e097011bf48fcd0f7a29d")];
+        &[h32("27d6ce9f3ef204207ed089a4ba2593e4d45b9bc25242d3de32e2a3dea1a12783")];
     /// TBD-owner: the script hash of the protocol treasury that receives every
     /// charged forced-inclusion surcharge (`super::forced::treasury`). `None`
     /// keeps forced inclusion from being enabled, and
