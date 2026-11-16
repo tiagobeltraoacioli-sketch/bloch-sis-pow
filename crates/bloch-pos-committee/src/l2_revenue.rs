@@ -35,9 +35,9 @@ pub const MAX_FEE_BPS: u64 = 30;
 /// record, never a spendable output); claims use 0 (release) and 1 (change).
 pub const TREASURY_VOUT: u32 = 2;
 
-/// The protocol treasury's L1 script hash. **TBD-owner**: `None` until the
-/// owner names it. While it is `None` the gate cannot be armed
-/// (`hard_forks::l2_revenue_may_arm`, compile-time).
+/// The protocol treasury's L1 script hash, named by the owner on 2026-11-16.
+/// While it was `None` the gate could not be armed
+/// (`hard_forks::l2_revenue_may_arm`, compile-time); it is still inert.
 /// Alias of `params::PROTOCOL_TREASURY_SCRIPT_HASH`, shared with the
 /// forced-inclusion surcharge.
 pub const TREASURY_SCRIPT_HASH: Option<[u8; 32]> = crate::params::PROTOCOL_TREASURY_SCRIPT_HASH;
@@ -167,16 +167,18 @@ mod tests {
     }
 
     #[test]
-    fn the_rule_ships_inert_with_no_treasury() {
+    fn the_rule_ships_inert_with_the_treasury_named() {
         assert_eq!(crate::params::L2_REVENUE_EPOCH, u64::MAX);
-        assert_eq!(TREASURY_SCRIPT_HASH, None, "TBD-owner");
+        assert!(TREASURY_SCRIPT_HASH.is_some(), "named by the owner, 2026-11-16");
         for epoch in [0, 7_360, 8_620, 10_000, u64::MAX - 1] {
             assert!(!active(epoch), "{epoch}");
         }
-        // A forced gate without a treasury is still off.
+        // With the gate forced open (tests only) the rule is on, and pays the treasury a test names.
         let _gate = crate::params::l2_revenue_test::open();
-        assert!(!active(0));
+        assert!(active(0));
+        assert_eq!(treasury(), TREASURY_SCRIPT_HASH);
         let _treasury = test_treasury::set([0x7e; 32]);
         assert!(active(0));
+        assert_eq!(treasury(), Some([0x7e; 32]));
     }
 }

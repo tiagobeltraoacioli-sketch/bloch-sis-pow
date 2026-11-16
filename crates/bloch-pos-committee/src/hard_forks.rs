@@ -549,7 +549,8 @@ mod tests {
         assert!(!g.armed() && !g.node_policy_only);
         assert!(!RELEASE_ARMABLE.contains(&"params::L2_REVENUE_EPOCH"));
         assert_eq!(params::L2_REVENUE_EPOCH, M);
-        assert_eq!(crate::l2_revenue::TREASURY_SCRIPT_HASH, None, "TBD-owner");
+        // The treasury is named (owner, 2026-11-16); the gate is still inert.
+        assert!(treasury_is_real(crate::l2_revenue::TREASURY_SCRIPT_HASH));
         let kes = params::HF3_KES_ENFORCE_EPOCH;
         let after = kes + L2_PROGRAM_MIN_EPOCHS_AFTER_KES + 1;
         // Inert is always coherent.
@@ -567,8 +568,20 @@ mod tests {
 
     #[test]
     fn one_protocol_treasury_pays_both_revenue_rules_and_must_be_real_to_arm() {
-        // One TBD-owner constant; both rules read it through their aliases.
-        assert_eq!(params::PROTOCOL_TREASURY_SCRIPT_HASH, None, "TBD-owner");
+        // One constant; both rules read it through their aliases. Owner input of 2026-11-16: the carried form
+        // (20-byte key hash, twelve zero bytes) of bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073.
+        let treasury = params::PROTOCOL_TREASURY_SCRIPT_HASH.expect("named by the owner");
+        assert_eq!(treasury[..20], crate::tokenomics_v4::FOUNDER_WITHDRAWAL_H160);
+        assert_eq!(treasury[20..], [0u8; 12]);
+        {
+            use sha3::{Digest, Sha3_256};
+            let checksum = Sha3_256::digest(Sha3_256::digest(&treasury[..20]));
+            assert_eq!(checksum[..4], [0x84, 0x24, 0x20, 0x73], "the checksum of the address as the owner gave it");
+        }
+        assert!(treasury_is_real(params::PROTOCOL_TREASURY_SCRIPT_HASH));
+        // Naming the treasury arms nothing.
+        assert_eq!(params::L2_REVENUE_EPOCH, u64::MAX);
+        assert_eq!(params::L2_FORCED_INCLUSION_EPOCH, u64::MAX);
         assert_eq!(crate::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY, params::PROTOCOL_TREASURY_SCRIPT_HASH);
         assert_eq!(crate::l2_revenue::TREASURY_SCRIPT_HASH, params::PROTOCOL_TREASURY_SCRIPT_HASH);
         assert!(same_treasury(None, None) && same_treasury(Some([7; 32]), Some([7; 32])));

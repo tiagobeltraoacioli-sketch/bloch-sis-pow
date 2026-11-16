@@ -2150,9 +2150,9 @@ fn l2_forced_json_reports_the_queue_and_the_next_surcharge() {
     assert_eq!(get("transfer_surcharge_sat"), Json::sat(1_000));
     assert_eq!(get("max_gas_surcharge_sat"), Json::sat(14_000));
     assert_eq!(get("drain_settlements"), Json::u(0));
-    // TBD-owner: no treasury is compiled, so forced inclusion cannot be enabled.
-    assert_eq!(get("treasury"), Json::Null);
-    assert_eq!(bloch_pos_committee::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY, None);
+    // The treasury is compiled (owner input of 2026-11-16); the gate is still inert.
+    let treasury = bloch_pos_committee::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY.expect("named");
+    assert_eq!(get("treasury"), Json::hex(&treasury));
     assert_eq!(bloch_pos_committee::params::L2_FORCED_INCLUSION_EPOCH, u64::MAX);
 }
 

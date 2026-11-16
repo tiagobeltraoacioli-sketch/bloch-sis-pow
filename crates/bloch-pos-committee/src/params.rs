@@ -2773,7 +2773,8 @@ pub(crate) fn l2_forced_inclusion_active(epoch: u64) -> bool {
 /// [`L2_NEXT_PROGRAM_EPOCH`] and stays inert while that gate is inert.
 pub const L2_REVENUE_EPOCH: u64 = L2_NEXT_PROGRAM_EPOCH;
 
-/// **TBD-owner.** The script hash of the one L1 protocol treasury. It
+/// The script hash of the one L1 protocol treasury (owner input of
+/// 2026-11-16: `bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073`). It
 /// receives every charged forced-inclusion surcharge
 /// (`l2_settlement::mainnet::FORCED_INCLUSION_TREASURY`) and every L2
 /// crossing fee (`l2_revenue::TREASURY_SCRIPT_HASH`); both names are aliases
@@ -2782,7 +2783,18 @@ pub const L2_REVENUE_EPOCH: u64 = L2_NEXT_PROGRAM_EPOCH;
 /// `hard_forks::l2_revenue_may_arm` refuse to arm their gates while it is
 /// unset or the zero hash (compile time). Revenue rule (2026-11-02): a real
 /// treasury, never a burn.
-pub const PROTOCOL_TREASURY_SCRIPT_HASH: Option<[u8; 32]> = None;
+///
+/// The address is a 20-byte key hash (`SHA3-256(pubkey)[..20]`, checksum
+/// `84242073` verified), so the script hash is its **carried** form: the 20
+/// bytes, then twelve zero bytes, which `transition::owns` opens for the
+/// holder of that key exactly as it opens a carried Genesis-3 balance (160
+/// bits of preimage resistance, the security of every carried output). It is
+/// the address of `tokenomics_v4::FOUNDER_WITHDRAWAL_H160`. Setting it arms
+/// nothing: both revenue gates stay at `u64::MAX` until the fork epoch is set.
+pub const PROTOCOL_TREASURY_SCRIPT_HASH: Option<[u8; 32]> = Some([
+    0xe9, 0x86, 0xdb, 0x51, 0x49, 0xcf, 0xf7, 0x49, 0x9b, 0x28, 0x2a, 0x04, 0x82, 0x72, 0xa0, 0x9a, 0xff, 0x0a, 0xf4, 0xff,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]);
 
 pub(crate) fn l2_revenue_active(epoch: u64) -> bool {
     #[cfg(test)]
