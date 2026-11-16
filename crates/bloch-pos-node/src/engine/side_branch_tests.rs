@@ -592,7 +592,14 @@ fn validated_side_branch_evicted_from_the_ring(
 /// A block on `parent`, parked for its proposer's authority as the door
 /// parks a block it judged on `fallback`.
 fn park_on(engine: &mut Engine, parent: [u8; 32], bump: u64, source: u8) -> [u8; 32] {
+    let proposer = engine.blocks[&parent].header.proposer_index;
+    park_on_as(engine, parent, bump, source, proposer)
+}
+
+/// [`park_on`], signed (as far as the header says) by `proposer`.
+fn park_on_as(engine: &mut Engine, parent: [u8; 32], bump: u64, source: u8, proposer: u32) -> [u8; 32] {
     let mut child = engine.blocks[&parent].clone();
+    child.header.proposer_index = proposer;
     child.header.parent = parent;
     child.header.slot += bump;
     let id = *child.block_id().as_bytes();
@@ -643,7 +650,7 @@ fn a_wanted_side_state_evicted_from_the_ring_is_recomputed_and_its_parked_block_
     assert_eq!(*engine.head_id().as_bytes(), tip, "the head did not move");
     let held = engine.exact_parent_state(&side_tip).expect("the tip's exact post-state is held again");
     assert_eq!(held.state_root(), engine.blocks[&side_tip].header.state_root, "and it is the tip's own");
-    assert!(engine.reorg_anchors.side.tips.len() <= SIDE_TIP_STATES, "the ring stays bounded");
+    assert!(engine.reorg_anchors.side.tips.len() <= SIDE_TIP_STATES + 1, "the ring stays bounded");
     // Served: nothing more is wanted, and the next turns do no work for it.
     engine.validate_side_branch_turn(900);
     engine.validate_side_branch_turn(900);
@@ -713,9 +720,11 @@ fn a_budget_parked_block_keeps_the_side_state_it_waits_on() {
     assert!(engine.reorg_anchors.side.tips.iter().any(|(id, _)| *id == side_tip));
 }
 
-/// Review RC4-03: with every entry waited on, an ordinary state is not
-/// kept, but one recomputed because the door asked for it is, in the place
-/// of the oldest entry, and the ring stays bounded.
+/// Reviews RC4-03 and RC5-04: with every entry waited on, an ordinary state
+/// is not kept, but one recomputed because the door asked for it is, in the
+/// one place reserved for it, so nothing a queued block waits on is
+/// evicted; only when that place is waited on too does a further wanted
+/// state take the oldest entry's place. The ring stays bounded.
 #[test]
 fn a_wanted_state_is_kept_even_when_every_entry_is_waited_on() {
     let (mut engine, _dir, _tip, side) = held_head_with_side_branch(2);
@@ -738,7 +747,270 @@ fn a_wanted_state_is_kept_even_when_every_entry_is_waited_on() {
     assert_eq!(after, held, "an ordinary state is not kept");
     engine.retain_side_state_as([0xAF; 32], &post, true);
     let after: Vec<[u8; 32]> = engine.reorg_anchors.side.tips.iter().map(|(id, _)| *id).collect();
-    assert_eq!(after.len(), SIDE_TIP_STATES, "bounded");
+    assert_eq!(after.len(), SIDE_TIP_STATES + 1, "one place beyond the ring");
+    assert_eq!(&after[..SIDE_TIP_STATES], &held[..], "RC5-04: nothing waited on was evicted");
     assert_eq!(after.last(), Some(&[0xAF; 32]), "the wanted one is kept");
+    // An ordinary state still finds no room.
+    engine.retain_side_state([0xAD; 32], &post);
+    assert!(!engine.reorg_anchors.side.tips.iter().any(|(id, _)| *id == [0xAD; 32]));
+    assert_eq!(engine.reorg_anchors.side.tips.len(), SIDE_TIP_STATES + 1);
+    // A second wanted state replaces the first while nothing waits on it.
+    engine.retain_side_state_as([0xB0; 32], &post, true);
+    let after: Vec<[u8; 32]> = engine.reorg_anchors.side.tips.iter().map(|(id, _)| *id).collect();
+    assert_eq!(&after[..SIDE_TIP_STATES], &held[..]);
+    assert_eq!(after.last(), Some(&[0xB0; 32]));
+    // Once that one is waited on too, the oldest entry gives way.
+    let mut waiting = engine.blocks[&side_tip].clone();
+    waiting.header.parent = [0xB0; 32];
+    waiting.header.slot += 40;
+    let id = *waiting.block_id().as_bytes();
+    engine.deferred_orphans.push_back((id, waiting, Source::Gossip(Some([0x69; 32])), None, 0));
+    engine.retain_side_state_as([0xB1; 32], &post, true);
+    let after: Vec<[u8; 32]> = engine.reorg_anchors.side.tips.iter().map(|(id, _)| *id).collect();
+    assert_eq!(after.len(), SIDE_TIP_STATES + 1, "bounded");
     assert_eq!(&after[..SIDE_TIP_STATES - 1], &held[1..], "in the oldest entry's place");
+    assert_eq!(&after[SIDE_TIP_STATES - 1..], &[[0xB0; 32], [0xB1; 32]]);
+}
+
+/// Review RC5-01, the regression: more blocks parked on the wanted parent
+/// than the recomputation queues (an attacker's signed headers, or many
+/// proposers' variants on a stalled network), all ahead of the honest block
+/// in the pool. The recomputation queues [`SIDE_PARKED_REJUDGE_PER_BLOCK`]
+/// of them per block it validates, here two (the parent and the
+/// grandparent), so not the honest one. In 6b35aa94 the request for the
+/// honest block was dropped with it, the state was then held, and nothing
+/// ever queued the honest block again. Now the request stays until the
+/// block has left the pool, and the next turns queue the rest from the held
+/// state without any further block application.
+#[test]
+fn more_blocks_parked_on_a_wanted_parent_than_one_rejudge_queues_do_not_strand_the_last() {
+    let (mut engine, _dir, tip, side) = held_head_with_side_branch(2);
+    let side_tip = side[1];
+    validated_side_branch_evicted_from_the_ring(&mut engine, &side, SIDE_TIP_STATES);
+    assert!(engine.exact_parent_state(&side_tip).is_none() && engine.exact_parent_state(&side[0]).is_none());
+    let ahead: Vec<[u8; 32]> = (0..2 * SIDE_PARKED_REJUDGE_PER_BLOCK as u64 + 1)
+        .map(|k| park_on(&mut engine, side_tip, 1 + k, 0x70 + k as u8))
+        .collect();
+    let honest = park_on(&mut engine, side_tip, 40, 0x6F);
+    engine.want_parent_state_for(honest);
+    assert!(engine.reorg_anchors.side.wanting.contains(&honest), "fixture: the door asked for its parent's state");
+
+    let slots = validate_until(&mut engine, 800, 4, &|e| {
+        e.deferred_orphans.iter().any(|(id, ..)| *id == honest)
+    });
+    assert!(slots <= 2, "queued within a slot or two ({slots})");
+    assert!(!engine.orphans.iter().any(|(id, ..)| *id == honest), "out of the waiting pool");
+    for id in &ahead {
+        assert!(engine.deferred_orphans.iter().any(|(seen, ..)| seen == id), "every block ahead of it too");
+    }
+    assert_eq!(engine.reorg_anchors.side.want_starts, 1, "one recomputation");
+    assert_eq!(engine.reorg_anchors.side.spent, side.len(), "each side block applied once, nothing more");
+    assert_eq!(*engine.head_id().as_bytes(), tip);
+    engine.validate_side_branch_turn(900);
+    assert!(engine.reorg_anchors.side.wanting.is_empty(), "served, the request is gone");
+}
+
+/// Review RC5-02: one proposer's blocks may ask for the states of at most
+/// [`SIDE_WANTED_PARENTS_PER_PROPOSER`] distinct parents; further blocks of
+/// it on those parents are still wanted, and another proposer is not
+/// affected. A block that is not parked for its proposer's authority is
+/// never wanted (review RC5-07).
+#[test]
+fn one_proposer_cannot_queue_more_than_its_share_of_recomputation_targets() {
+    let (mut engine, _dir, tip, side) = held_head_with_side_branch(3);
+    let parents = [side[0], side[1], side[2]];
+    let mine: Vec<[u8; 32]> =
+        parents.iter().enumerate().map(|(k, p)| park_on_as(&mut engine, *p, 1, 0x80 + k as u8, 0)).collect();
+    for id in &mine {
+        engine.want_parent_state_for(*id);
+    }
+    let wanting = &engine.reorg_anchors.side.wanting;
+    assert!(wanting.contains(&mine[0]) && wanting.contains(&mine[1]));
+    assert!(!wanting.contains(&mine[2]), "a third parent is refused");
+    let again = park_on_as(&mut engine, parents[1], 2, 0x84, 0);
+    engine.want_parent_state_for(again);
+    assert!(engine.reorg_anchors.side.wanting.contains(&again), "a parent already asked for is not a new target");
+    let other = park_on_as(&mut engine, parents[2], 3, 0x85, 1);
+    engine.want_parent_state_for(other);
+    assert!(engine.reorg_anchors.side.wanting.contains(&other), "another proposer has its own share");
+
+    // Not parked for authority: never wanted.
+    let mut queued = engine.blocks[&parents[2]].clone();
+    queued.header.parent = parents[2];
+    queued.header.slot += 4;
+    let queued_id = *queued.block_id().as_bytes();
+    engine.park_orphan(queued_id, queued, Source::Gossip(Some([0x86; 32])));
+    assert!(engine.orphans.iter().any(|(id, ..)| *id == queued_id), "fixture: in the pool");
+    engine.want_parent_state_for(queued_id);
+    assert!(!engine.reorg_anchors.side.wanting.contains(&queued_id), "RC5-07: not parked for its authority");
+    engine.want_parent_state_for([0x5B; 32]);
+    assert!(!engine.reorg_anchors.side.wanting.contains(&[0x5B; 32]), "nor a block that is not parked at all");
+    assert_eq!(*engine.head_id().as_bytes(), tip);
+}
+
+/// Review RC5-08: a second recomputation that needs a start in the same
+/// wall slot is refused without any work (review RC5-03: the turn closes
+/// until the slot changes) and is served in the next slot.
+#[test]
+fn a_second_recomputation_start_waits_for_the_next_slot() {
+    let (mut engine, _dir, _tip, side) = held_head_with_side_branch(2);
+    let side_tip = side[1];
+    validated_side_branch_evicted_from_the_ring(&mut engine, &side, SIDE_TIP_STATES);
+    let first = park_on(&mut engine, side_tip, 1, 0x90);
+    engine.want_parent_state_for(first);
+    for _ in 0..4 {
+        engine.validate_side_branch_turn(800);
+    }
+    assert!(engine.deferred_orphans.iter().any(|(id, ..)| *id == first), "the first is served");
+    assert_eq!(engine.reorg_anchors.side.want_starts, SIDE_WANT_STARTS_PER_SLOT);
+    let spent = engine.reorg_anchors.side.spent;
+
+    // The door judged it; its parent's state is evicted again.
+    engine.deferred_orphans.retain(|(id, ..)| *id != first);
+    let post = engine.exact_parent_state(&side_tip).expect("held after the recomputation");
+    for k in 0..=SIDE_TIP_STATES as u8 {
+        engine.retain_side_state([0xC8 + k; 32], &post);
+    }
+    assert!(engine.exact_parent_state(&side_tip).is_none() && engine.exact_parent_state(&side[0]).is_none());
+    let second = park_on(&mut engine, side_tip, 2, 0x91);
+    engine.want_parent_state_for(second);
+    for _ in 0..8 {
+        engine.validate_side_branch_turn(800);
+    }
+    assert!(engine.orphans.iter().any(|(id, ..)| *id == second), "no second start in the slot");
+    assert!(engine.reorg_anchors.side.want_closed, "closed until the slot changes");
+    assert_eq!(engine.reorg_anchors.side.spent, spent, "and no block applied for it");
+    assert_eq!(engine.reorg_anchors.side.want_starts, SIDE_WANT_STARTS_PER_SLOT);
+
+    let slots = validate_until(&mut engine, 801, 2, &|e| e.deferred_orphans.iter().any(|(id, ..)| *id == second));
+    assert_eq!(slots, 1, "served in the next slot");
+    assert!(!engine.reorg_anchors.side.want_closed);
+}
+
+/// Review RC5-08: a recomputation longer than one turn, from a canonical
+/// state below the fork point (one canonical block replayed first), resumes
+/// from its cursor turn after turn with a single start, applies every block
+/// once, and ends on the tip's own state root.
+#[test]
+fn a_long_recomputation_resumes_across_turns_from_a_canonical_start() {
+    let (mut engine, _dir, tip, side) = held_head_with_side_branch(6);
+    let side_tip = *side.last().unwrap();
+    validated_side_branch_evicted_from_the_ring(&mut engine, &side, SIDE_TIP_STATES);
+    let fork_point = *engine.chain[1].1.as_bytes();
+    engine.recent_states.retain(|(id, _)| *id != fork_point);
+    engine.reorg_anchors.pending = None;
+    engine.reorg_anchors.base = None;
+    assert!(engine.exact_parent_state(&fork_point).is_none(), "fixture: the fork point's state must be replayed");
+    let (start, ..) = engine.side_fold_canonical_start(1, &[]).unwrap_or((0, engine.state.arc(), false));
+    assert!(start < 1, "fixture: a canonical start below the fork point");
+    let child = park_on(&mut engine, side_tip, 1, 0x92);
+    engine.want_parent_state_for(child);
+
+    let mut turns = 0;
+    while engine.exact_parent_state(&side_tip).is_none() {
+        assert!(turns < 16, "the recomputation finishes");
+        engine.validate_side_branch_turn(800);
+        turns += 1;
+        let side_state = &engine.reorg_anchors.side;
+        assert!(side_state.want_starts <= SIDE_WANT_STARTS_PER_SLOT, "one start");
+        if engine.exact_parent_state(&side_tip).is_none() {
+            assert!(side_state.want_cursor.is_some(), "resumes from its cursor");
+            assert_eq!(side_state.want_target, Some(side_tip));
+        }
+    }
+    assert!(engine.deferred_orphans.iter().any(|(id, ..)| *id == child), "queued (on its grandparent's way)");
+    let applied = side.len() + 1 - start;
+    assert_eq!(turns, applied.div_ceil(SIDE_BRANCH_BLOCKS_PER_TURN), "turn after turn");
+    assert_eq!(engine.reorg_anchors.side.spent, applied, "the fork point and each side block once");
+    let held = engine.exact_parent_state(&side_tip).expect("the tip's exact post-state is held again");
+    assert_eq!(held.state_root(), engine.blocks[&side_tip].header.state_root, "and it is the tip's own");
+    assert!(engine.reorg_anchors.side.want_cursor.is_none() && engine.reorg_anchors.side.want_target.is_none());
+    assert_eq!(*engine.head_id().as_bytes(), tip);
+}
+
+/// Review RC5-08: requests nothing can serve are given up without a block
+/// application (a fork point below the finality floor, a branch deeper than
+/// [`SIDE_BRANCH_MAX_DEPTH`]) or after a local fault (a canonical block on
+/// the way that will not replay); the blocks stay parked as before.
+#[test]
+fn a_wanted_state_is_given_up_below_the_floor_past_the_depth_and_when_stuck() {
+    // Below the floor.
+    let (mut engine, _dir, _tip, side) = held_head_with_side_branch(2);
+    validated_side_branch_evicted_from_the_ring(&mut engine, &side, SIDE_TIP_STATES);
+    let child = park_on(&mut engine, side[1], 1, 0x93);
+    engine.want_parent_state_for(child);
+    engine.finalized_latch = Some((2, *engine.chain[2].1.as_bytes()));
+    let spent = engine.reorg_anchors.side.spent;
+    assert_eq!(engine.serve_wanted_side_state_turn(), Some(false));
+    assert!(engine.reorg_anchors.side.wanting.is_empty(), "given up");
+    assert!(engine.reorg_anchors.side.want_target.is_none() && engine.reorg_anchors.side.want_cursor.is_none());
+    assert_eq!(engine.reorg_anchors.side.spent, spent, "without a block application");
+    assert!(engine.orphans.iter().any(|(id, ..)| *id == child), "still parked");
+
+    // Past the depth: header-only blocks, never run.
+    let (mut engine, _dir, _tip, side) = held_head_with_side_branch(1);
+    let template = engine.blocks[&side[0]].clone();
+    let mut parent = side[0];
+    for k in 0..SIDE_BRANCH_MAX_DEPTH as u64 {
+        let mut block = template.clone();
+        block.header.parent = parent;
+        block.header.slot += 1 + k;
+        parent = *block.block_id().as_bytes();
+        engine.blocks.insert(parent, block);
+        engine.blocks.mark_validated(&parent);
+    }
+    engine.blocks.mark_validated(&side[0]);
+    let child = park_on(&mut engine, parent, 1, 0x94);
+    engine.want_parent_state_for(child);
+    let spent = engine.reorg_anchors.side.spent;
+    assert_eq!(engine.serve_wanted_side_state_turn(), Some(false));
+    assert!(engine.reorg_anchors.side.wanting.is_empty(), "given up");
+    assert_eq!(engine.reorg_anchors.side.spent, spent, "without a block application");
+    assert!(engine.orphans.iter().any(|(id, ..)| *id == child), "still parked");
+
+    // Stuck: the canonical fork point must be replayed and is not stored.
+    let (mut engine, _dir, _tip, side) = held_head_with_side_branch(2);
+    validated_side_branch_evicted_from_the_ring(&mut engine, &side, SIDE_TIP_STATES);
+    let fork_point = *engine.chain[1].1.as_bytes();
+    engine.recent_states.retain(|(id, _)| *id != fork_point);
+    engine.reorg_anchors.pending = None;
+    engine.reorg_anchors.base = None;
+    engine.blocks.remove(&fork_point);
+    let child = park_on(&mut engine, side[1], 1, 0x95);
+    engine.want_parent_state_for(child);
+    assert_eq!(engine.serve_wanted_side_state_turn(), Some(false));
+    assert!(engine.reorg_anchors.side.wanting.is_empty(), "given up on a local fault");
+    assert!(engine.reorg_anchors.side.want_target.is_none() && engine.reorg_anchors.side.want_cursor.is_none());
+    assert!(engine.orphans.iter().any(|(id, ..)| *id == child), "still parked");
+    assert!(engine.blocks.is_validated(&side[1]), "nothing is judged differently");
+}
+
+/// Review RC5-08: a block on the path that fails the transition during a
+/// recomputation is removed and remembered, as the fold does, and the
+/// request is given up: the parked block is not queued on any state.
+#[test]
+fn a_block_failing_the_transition_during_a_recomputation_is_removed_and_remembered() {
+    let (mut engine, _dir, _tip, side) = held_head_with_side_branch(2);
+    let mut bad = engine.blocks[&side[0]].clone();
+    bad.header.state_root = [0xEE; 32];
+    let bad_id = *bad.block_id().as_bytes();
+    engine.blocks.insert(bad_id, bad);
+    let mut above = engine.blocks[&side[1]].clone();
+    above.header.parent = bad_id;
+    let above_id = *above.block_id().as_bytes();
+    engine.blocks.insert(above_id, above);
+    // As if validated before (a store that went wrong, or a rule that
+    // changed under it): the recomputation judges them again regardless.
+    engine.blocks.mark_validated(&bad_id);
+    engine.blocks.mark_validated(&above_id);
+    let child = park_on(&mut engine, above_id, 1, 0x96);
+    engine.want_parent_state_for(child);
+    assert_eq!(engine.serve_wanted_side_state_turn(), Some(false));
+    assert!(!engine.blocks.contains_key(&bad_id), "removed");
+    assert!(engine.reorg_anchors.side.failed_index.contains(&bad_id), "and remembered");
+    assert!(engine.exact_parent_state(&above_id).is_none(), "no state for what is above it");
+    assert!(engine.reorg_anchors.side.wanting.is_empty(), "the request is given up");
+    assert!(engine.orphans.iter().any(|(id, ..)| *id == child), "the block is not queued");
+    let (start, ..) = engine.side_fold_canonical_start(1, &[]).unwrap_or((0, engine.state.arc(), false));
+    assert_eq!(engine.reorg_anchors.side.spent, 1 - start + 1, "the canonical replay, then the failing block");
 }

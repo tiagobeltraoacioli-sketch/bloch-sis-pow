@@ -315,8 +315,15 @@ impl<V> GossipVerifier<V> {
 
     /// Whether block `id` is held only until a spent allowance renews
     /// (review RC4-02: the side states it waits on are kept for it).
+    #[cfg(test)]
     pub(super) fn is_budget_parked(&self, id: &[u8; 32]) -> bool {
         self.budget_parked.borrow().iter().any(|(_, seen)| seen == id)
+    }
+
+    /// The ids of every block [`Self::is_budget_parked`] holds, for a caller
+    /// that asks about many blocks at once (review RC5-05).
+    pub(super) fn budget_parked_ids(&self) -> std::collections::BTreeSet<[u8; 32]> {
+        self.budget_parked.borrow().iter().map(|(_, seen)| *seen).collect()
     }
 
     /// Remove and return the ids parked in a slot before `slot`: their

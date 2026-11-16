@@ -1600,3 +1600,90 @@ fn a_bind_crossing_block_whose_validated_side_parent_left_the_ring_is_admitted_a
     }
     assert!(engine.reorg_anchors.side.wanting.is_empty(), "served, and the request is gone");
 }
+
+/// **Reviews RC5-07 and RC5-08, through the whole door (`ingest_one`), at
+/// a cheap height.** A stored, validated side-branch parent P2 whose state
+/// and whose parent's state (P1) this node does not hold, and children of
+/// it in an epoch a KES bind can govern:
+///
+/// - a header no key of the proposer signed is refused by the probe and
+///   never asks for P2's state (no recomputation for an unauthenticated
+///   header);
+/// - a header the proposer really signed passes the probe, the door asks
+///   for P2's state (`JudgeWantingParentState`), and since the static
+///   signature verifies on `fallback` the block is not parked: nothing is
+///   recorded either (RC5-07: only a block parked for its authority is);
+/// - this node's own block (no probe) whose signature does not verify on
+///   `fallback` is parked for its proposer's authority and is wanted.
+///   Serving it runs P1 through the transition, which refuses it: P1 is
+///   removed and remembered and the request is given up.
+#[test]
+fn the_door_asks_for_a_side_parent_state_only_for_a_block_it_parked_past_the_probe() {
+    use bloch_pos_committee::params::{KES_ACTIVATION_EPOCH, KES_BIND_DELAY_EPOCHS};
+    let (mut engine, _dir) = perf_support::proposing_engine();
+    engine.propose(1);
+    let head = *engine.head_id().as_bytes();
+    let template = engine.blocks.get(&head).expect("the block just proposed").clone();
+    let bind = KES_ACTIVATION_EPOCH + KES_BIND_DELAY_EPOCHS;
+    let mut p1_env = template.clone();
+    p1_env.header.parent = head;
+    p1_env.header.slot = first_slot_of_epoch(bind - 22).unwrap() + 1;
+    let p1 = *p1_env.block_id().as_bytes();
+    engine.blocks.insert(p1, p1_env);
+    let mut p2_env = template.clone();
+    p2_env.header.parent = p1;
+    p2_env.header.slot = first_slot_of_epoch(bind - 22).unwrap() + 2;
+    let p2 = *p2_env.block_id().as_bytes();
+    engine.blocks.insert(p2, p2_env);
+    engine.blocks.mark_validated(&p2);
+    assert!(engine.exact_parent_state(&p2).is_none() && engine.exact_parent_state(&p1).is_none());
+    let child = |k: u64, signature: Option<&Engine>| {
+        let mut env = template.clone();
+        env.header.parent = p2;
+        env.header.slot = first_slot_of_epoch(bind).unwrap() + 1 + k;
+        env.proposer_sig = match signature {
+            Some(engine) => engine.keys.as_ref().unwrap().sign_for_epoch(bind, &env.header.proposal_signing_root()),
+            None => vec![0xEE; 64],
+        };
+        env
+    };
+    let wall = first_slot_of_epoch(bind).unwrap() + 4;
+    let _w = wall_at(&mut engine, wall);
+
+    let unsigned = child(0, None);
+    let unsigned_id = *unsigned.block_id().as_bytes();
+    let (verdict, _) = engine.ingest_one(unsigned, Source::Gossip(Some([0xC1; 32])));
+    assert_ne!(verdict, Verdict::Accept);
+    assert!(!engine.reorg_anchors.side.wanting.contains(&unsigned_id), "no request for an unsigned header");
+    assert!(engine.reorg_anchors.side.wanting.is_empty());
+
+    let own = child(2, None);
+    let own_id = *own.block_id().as_bytes();
+    let (verdict, _) = engine.ingest_one(own, Source::Local);
+    assert_eq!(verdict, Verdict::Ignore);
+    assert!(engine.authority_parked.judged.contains_key(&own_id), "fixture: parked for its authority");
+    assert!(engine.reorg_anchors.side.wanting.contains(&own_id), "and wanted");
+
+    assert!(engine.blocks.contains_key(&p1), "fixture: P1 is stored");
+    assert_eq!(engine.serve_wanted_side_state_turn(), Some(false));
+    assert!(!engine.blocks.contains_key(&p1), "P1 failed the transition: removed");
+    assert!(engine.reorg_anchors.side.failed_index.contains(&p1), "and remembered");
+    assert!(engine.reorg_anchors.side.wanting.is_empty(), "the request is given up");
+
+    // Last: an authenticated child may be stored and weighed by fork choice.
+    let signed = child(1, Some(&engine));
+    let signed_id = *signed.block_id().as_bytes();
+    let fallback = engine.proposer_authority_state(&p2);
+    assert!(
+        matches!(
+            engine.door_kes_state(&signed, Source::Gossip(Some([0xC2; 32])), None, fallback),
+            DoorKes::JudgeWantingParentState { .. }
+        ),
+        "past the probe, the door asks"
+    );
+    let _ = engine.ingest_one(signed, Source::Gossip(Some([0xC3; 32])));
+    assert!(!engine.authority_parked.judged.contains_key(&signed_id), "fixture: authenticated, not parked");
+    assert!(!engine.reorg_anchors.side.wanting.contains(&signed_id), "RC5-07: so not wanted");
+
+    assert_eq!(*engine.head_id().as_bytes(), head, "the head did not move");
+}
