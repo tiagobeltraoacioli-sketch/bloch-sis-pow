@@ -287,6 +287,14 @@ sudo systemctl restart bloch-l2-mainnet-rpc.service
 
 F3. Lift the brake (delete `l2-brake.json` on every own node), ask the guardians to unpause the
 vault once the bridge signers see `finalized` past N+1'.
+The signed brake file carries no sequence number (review R308-11): a copy of the signed pair put back
+into a node's data directory engages the brake again on that node until its `until_epoch`. Nothing
+checks that a lifted file stays lifted. So: delete `l2-brake.json` AND `l2-brake.json.sig`; confirm
+`getmempoolinfo` → `l2_brake.state` = `off` on every own node; destroy the other copies of the signed
+pair (the signing machine, the copy tool's staging directory); and when signing (A3) choose the
+smallest `until_epoch` the incident needs rather than the 1,350-epoch maximum. The effect of a
+replayed file is bounded: this node's own proposals and mempool door only, never block validation,
+and it ends by itself at `until_epoch`.
 
 F4. Monitor: `l1_l2_identity` OK with the fallback pins, `settlement_age` normal after one proof,
 `escrow_conserved` true, followers' `active_program.elf_keccak` = fallback.
