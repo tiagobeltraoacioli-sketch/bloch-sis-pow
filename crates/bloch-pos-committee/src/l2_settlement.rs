@@ -1716,7 +1716,7 @@ pub mod mainnet {
     /// `codex/forced-guest-r8-20261102` 595d914 (agent 115's sparse guest with
     /// L1 forced inclusion, agent 137), built in its pinned container on two
     /// hosts: the sparse witness under the next rules with the forced prefix,
-    /// guest ELF SHA-256 `bc35e838…b048`. Its configuration `27d6ce9f…2783`
+    /// guest ELF SHA-256 `81813124…b6d9`. Its configuration `27d6ce9f…2783`
     /// (tag `BLOCH:EVM:CONFIG:4:CANCUN`) is the next rules plus forced
     /// inclusion, and is listed in [`FORCED_INCLUSION_CONFIGURATIONS`].
     /// The configuration carries the owner's fee-sweep recipient
@@ -1726,9 +1726,9 @@ pub mod mainnet {
     pub const PROGRAM_NEXT: NextProgram = NextProgram {
         identities: [
             h32("27d6ce9f3ef204207ed089a4ba2593e4d45b9bc25242d3de32e2a3dea1a12783"),
-            h32("1f744da8d3e0302cd39152e24e91071d7f0cfec7639245566a471cd6083a6b18"),
-            h32("6a140f117b84dd524b3681b9447422e5281451295144b5747197d0df5db6afc9"),
-            h32("00d4281e23ee13754a59b40dcc47422e55028a2534512d5d38cbe86fddb6afc9"),
+            h32("d6b33a99dc9329b2ca75aa0b4b7b3116e5334ee9edc9cb5e20491eaa926ceb74"),
+            h32("5dc306572d2df6a31f8c59c3114859500ba2af783ffaca8e473258c273d98584"),
+            h32("00bb860caeb4b7da8cfc62ce19148595017455ef0ffeb2a3a3992c6173d98584"),
         ],
         // The wrapper VK and the V3 tag are unchanged, so the policy is too.
         proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
@@ -1739,7 +1739,7 @@ pub mod mainnet {
     /// built in the pinned container of the sparse guests
     /// (`guest-fallback/build-container.sh`): the complete witness under the
     /// same rules, L1 forced inclusion included, guest ELF SHA-256
-    /// `7fd7f3c0…5b5303` (3 138 944 bytes). It replaces `3ad3a4f0…53b3`, which
+    /// `7528e26d…5b5303` (3 138 944 bytes). It replaces `3ad3a4f0…53b3`, which
     /// did not run the forced rule.
     ///
     /// It proves the next rules, which the assert below pins: the swap to the
@@ -1755,9 +1755,9 @@ pub mod mainnet {
     pub const PROGRAM_FALLBACK: NextProgram = NextProgram {
         identities: [
             h32("27d6ce9f3ef204207ed089a4ba2593e4d45b9bc25242d3de32e2a3dea1a12783"),
-            h32("d95185a60668b0d4e1da49be00d85b9c550b412f13c5155be454e72889f90bf1"),
-            h32("432fa77548114c6431d3d64a09c851e8178e83b4744681fb73c3e2d368b11546"),
-            h32("00865f4eeb204531918e9eb2509c851e82f1d0769d11a07ef9e1f169e8b11546"),
+            h32("b6d6d128b0585ec6b24cec3261ccca348ee8e7cbc3e15eb51ed5fd838ac9baf1"),
+            h32("020138086276433f0bfc354c43e493a50400999706ba3ca061ae34d4162f4765"),
+            h32("000402701189d90cfc5fe1aa643e493a50801332e1ae8f2830d71a6a162f4765"),
         ],
         proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
     };
