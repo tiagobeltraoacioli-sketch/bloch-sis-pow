@@ -9,6 +9,12 @@
       between the fleet release and the candidate, plus any --gate given.
       status: scheduled:<epoch> | inert (u64::MAX) | alias:<expr> | missing
 
+  hf-gates.py status --repo <git dir> --commit <commit> --gate NAME [--gate NAME ...]
+      Prints TSV: name, status (as above) of the named constants at one commit.
+      The value is evaluated: literals, `u64::MAX`, other constants, + - * /,
+      parentheses. `alias:<expr>` means it could not be evaluated; treat that
+      as possibly armed (review R308-10).
+
   hf-gates.py tripwires --repo <git dir> --commit <commit> --gate NAME [--gate NAME ...]
       Prints the test functions that pin one of the given gates to u64::MAX
       (`assert_eq!(<..>NAME, u64::MAX)` or `NAME == u64::MAX` in their body).
@@ -60,14 +66,78 @@ def definitions(repo, commit):
 
 
 def evaluate(value, defs, depth=0):
-    v = value.replace("_", "") if re.fullmatch(r"[0-9_]+", value) else value
-    if re.fullmatch(r"[0-9]+", v):
-        return int(v)
-    if value == "u64::MAX":
-        return U64_MAX
-    if depth < 4 and re.fullmatch(r"[A-Z0-9_]+", value) and len(defs.get(value, [])) == 1:
-        return evaluate(defs[value][0], defs, depth + 1)
-    return None
+    """The u64 a constant's right-hand side evaluates to, or None when this tool cannot tell.
+
+    Understood (review R308-10: an armed gate written as anything but a plain decimal was not seen as armed):
+    decimal and 0x literals with `_` and an optional integer suffix, `u64::MAX`, the name of another constant
+    with exactly one definition (optionally `params::`/`crate::params::` qualified), parentheses, `as u64`,
+    and + - * / between those. Anything else (function calls, shifts, other paths) is None: callers must treat
+    an unknown value as possibly armed, never as inert."""
+    if depth > 8:
+        return None
+    tokens = re.findall(r"\s*(0x[0-9a-fA-F_]+|[0-9][0-9_]*|[A-Za-z_][A-Za-z0-9_:]*|[-+*/()]|\S)", value)
+    pos = 0
+
+    def atom():
+        nonlocal pos
+        if pos >= len(tokens):
+            return None
+        tok = tokens[pos]
+        pos += 1
+        if tok == "(":
+            n = expr()
+            if n is None or pos >= len(tokens) or tokens[pos] != ")":
+                return None
+            pos += 1
+        elif re.fullmatch(r"0x[0-9a-fA-F_]+", tok):
+            n = int(tok.replace("_", ""), 16)
+        elif re.fullmatch(r"[0-9][0-9_]*", tok):
+            n = int(tok.replace("_", ""))
+            if pos < len(tokens) and re.fullmatch(r"u(8|16|32|64|128|size)", tokens[pos]):
+                pos += 1
+        elif tok in ("u64::MAX", "core::u64::MAX", "std::u64::MAX"):
+            n = U64_MAX
+        elif re.fullmatch(r"(?:(?:crate::)?params::)?[A-Z][A-Z0-9_]*", tok):
+            name = tok.rsplit("::", 1)[-1]
+            if len(defs.get(name, [])) != 1:
+                return None
+            n = evaluate(defs[name][0], defs, depth + 1)
+        else:
+            return None
+        while n is not None and pos + 1 < len(tokens) and tokens[pos] == "as":
+            if tokens[pos + 1] != "u64":
+                return None
+            pos += 2
+        return n
+
+    def term():
+        nonlocal pos
+        n = atom()
+        while n is not None and pos < len(tokens) and tokens[pos] in "*/":
+            op = tokens[pos]
+            pos += 1
+            m = atom()
+            if m is None or (op == "/" and m == 0):
+                return None
+            n = n * m if op == "*" else n // m
+        return n
+
+    def expr():
+        nonlocal pos
+        n = term()
+        while n is not None and pos < len(tokens) and tokens[pos] in "+-":
+            op = tokens[pos]
+            pos += 1
+            m = term()
+            if m is None:
+                return None
+            n = n + m if op == "+" else n - m
+        return n
+
+    n = expr()
+    if n is None or pos != len(tokens) or not 0 <= n <= U64_MAX:
+        return None
+    return n
 
 
 def status(values, defs):
@@ -81,6 +151,14 @@ def status(values, defs):
     if n == U64_MAX:
         return "inert"
     return f"scheduled:{n}"
+
+
+def gate_status(args):
+    """`status`: one line per --gate, `NAME<TAB>status`, at one commit. `inert` is printed only for a value this
+    tool evaluated to u64::MAX; a value it cannot evaluate is `alias:<expr>` and is NOT inert."""
+    defs = definitions(args.repo, args.commit)
+    for name in args.gate:
+        print(f"{name}\t{status(defs.get(name, []), defs)}")
 
 
 def discover(args):
@@ -187,6 +265,10 @@ def main():
     t.add_argument("--repo", required=True)
     t.add_argument("--commit", required=True)
     t.add_argument("--gate", action="append", required=True)
+    g = sub.add_parser("status")
+    g.add_argument("--repo", required=True)
+    g.add_argument("--commit", required=True)
+    g.add_argument("--gate", action="append", required=True)
     f = sub.add_parser("force")
     f.add_argument("--tree", required=True)
     f.add_argument("--gate", required=True)
@@ -194,7 +276,7 @@ def main():
     r = sub.add_parser("relax-order")
     r.add_argument("--tree", required=True)
     args = p.parse_args()
-    {"discover": discover, "tripwires": tripwires, "force": force, "relax-order": relax_order}[args.cmd](args)
+    {"discover": discover, "status": gate_status, "tripwires": tripwires, "force": force, "relax-order": relax_order}[args.cmd](args)
 
 
 if __name__ == "__main__":

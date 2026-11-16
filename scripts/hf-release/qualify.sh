@@ -198,11 +198,15 @@ git -C "$REPO" merge-base --is-ancestor "$BASE_COMMIT" "$COMMIT" \
 # (the rollback epoch) is drowned out. The fix: when the candidate arms either L2
 # program gate and --base-commit was left at the default, refuse with the one thing
 # the operator must pass -- the commit of the release the fleet is actually running.
+# Armed means: defined at the candidate and not evaluated to u64::MAX. The value is
+# evaluated by hf-gates.py (review R308-10: a gate armed through another constant,
+# a hex literal or an expression was not seen by the earlier plain-decimal match);
+# a value the tool cannot evaluate, or two definitions, count as armed.
 l2_gate_armed() {
-  local v
-  v="$(git -C "$REPO" show "$COMMIT:crates/bloch-pos-committee/src/params.rs" 2>/dev/null \
-       | sed -n "s/^pub const $1: u64 = \\([0-9_]*\\);$/\\1/p" | tr -d '_')"
-  [ -n "$v" ]
+  local st
+  st="$(python3 -I "$GATES_PY" status --repo "$REPO" --commit "$COMMIT" --gate "$1" | cut -f2)" \
+    || die "hf-gates.py status failed for $1"
+  case "$st" in inert|missing) return 1 ;; *) return 0 ;; esac
 }
 if [ "$BASE_COMMIT_DEFAULT" = 1 ]; then
   for g in L2_PROGRAM_ROLLBACK_EPOCH L2_NEXT_PROGRAM_EPOCH; do
