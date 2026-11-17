@@ -1851,6 +1851,58 @@ mod l2_tests {
         }
     }
 
+    /// Review R308-3P-1, the claim half, restated after the merge (agent 382,
+    /// round 18; reviewer 384 R384-REG-1). The December line tested its own
+    /// claim rule at the door (`check_claim_applicable`, test
+    /// `r308_3p_1_a_claim_consensus_applies_stays_backed`); the merged door
+    /// (`bloch-pos-node` `admission::check_l2_funded`) answers a claim with
+    /// `l2_withdraw_claim_refusal_at` alone (`None` is backed, every `Some` a
+    /// refusal). Its property is therefore this agreement with consensus, on a
+    /// payable claim and on each refusal of the fixture: what `apply` accepts
+    /// has no preflight refusal (it stays backed), and what `apply` refuses is
+    /// refused by the preflight for the same reason, leaving the state as it was.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn r308_3p_1_a_claim_consensus_applies_has_no_preflight_refusal() {
+        let (mut state, _) = funded_async_fixture();
+        let l2 = state.l2_settlement.as_mut().unwrap();
+        l2.append_deposit(crate::l2_settlement::InboxRecord {
+            height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 50_000_000, recipient: [0x42; 20],
+        })
+        .unwrap();
+        let accepted = l2.height() + 1;
+        l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&wleaves(3)), count: 3, height: accepted });
+        for _ in 0..WITHDRAW_DELAY_BLOCKS {
+            l2.advance_height().unwrap();
+        }
+        finalize_all(&mut state);
+        let fee = state.next_base_fee();
+        let good = claim_tx(&state, ([0x33; 32], 0), FUNDED, 3, 1);
+        let mut unpaid = good.clone();
+        unpaid.change.value += 1;
+        let unpaid = resign_claim(unpaid);
+        let mut absent = good.clone();
+        absent.inputs[0].txid = [0x34; 32];
+        let absent = resign_claim(absent);
+        let other_leaf = resign_claim(L2WithdrawClaim { index: 0, ..good.clone() });
+
+        assert_eq!(state.l2_withdraw_claim_refusal_at(&good, fee), None, "a payable claim has no preflight refusal");
+        let mut applied = state.clone();
+        assert!(applied.apply_transaction(&claim(&good), 0, fee, &ToyVerifier).is_ok(), "and consensus applies it");
+        assert!(applied.l2_withdraw_claim_refusal_at(&good, fee).is_some(), "and only once");
+        for tx in [&unpaid, &absent, &other_leaf] {
+            let preflight = state.l2_withdraw_claim_refusal_at(tx, fee);
+            assert!(preflight.is_some());
+            let mut refused = state.clone();
+            assert_eq!(
+                refused.apply_transaction(&claim(tx), 0, fee, &ToyVerifier),
+                Err(TxReject::L2WithdrawClaim(preflight.unwrap())),
+                "the preflight and consensus give the same reason"
+            );
+            assert_eq!(refused, state);
+        }
+    }
+
     #[test]
     #[cfg(feature = "devnet-l2-user-txs")]
     fn a_leaf_is_claimed_once_in_a_block_across_blocks_and_never_again() {

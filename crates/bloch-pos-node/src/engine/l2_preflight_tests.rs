@@ -338,6 +338,46 @@ mod funded_l2_transactions {
         assert!(node.rejected.is_empty(), "the probe refused nothing");
     }
 
+    /// Review R308-3P-1, restated on the merged door (agent 382, round 18;
+    /// reviewer 384 R384-REG-1). The December line tested its own copy of the
+    /// DA duplicate rule (`check_da_recordable`); the merge removed the copy,
+    /// and the released door (`check_l2_funded`) asks the transition's
+    /// `l2_data_availability_refusal_at`. At ADMISSION: once a batch is
+    /// recorded for an L2 block, a funded copy of it (same block, same
+    /// commitment) is refused with the door's retryable state answer, while a
+    /// batch with another commitment for the same block, funded and signed
+    /// the same way, is still admitted (consensus records it too).
+    #[test]
+    fn r308_3p_1_a_recorded_da_commitment_is_refused_at_admission() {
+        let _clock = validator_lifecycle::clock_at(3);
+        let funds = funds_of(3);
+        let (mut node, _dir) = engine(&funds);
+        let first = data_availability(&node, OWNER, (funds[0].txid, funds[0].vout), Some(funds[0].value));
+        assert_eq!(node.on_transaction(PosTransaction::L2DataAvailability(first)), Ok(Admitted::New));
+        node.propose(3);
+        assert_eq!(node.state.slot(), 3);
+        assert_eq!(da_records(&node), 1);
+
+        let copy = data_availability(&node, OWNER, (funds[1].txid, funds[1].vout), Some(funds[1].value));
+        assert_eq!(
+            node.on_transaction(PosTransaction::L2DataAvailability(copy)),
+            Err(Refusal::StateDependent(
+                "L2 data availability batch is settled, out of window, already recorded or the record set is full"
+            )),
+            "a funded copy of a recorded batch is not backed"
+        );
+
+        let mut other = data_availability(&node, OWNER, (funds[2].txid, funds[2].vout), Some(funds[2].value));
+        other.payload = batch(&[OWNER, 0xc1]);
+        other.signature = sign(&keypair(OWNER).1, &other.intent_root());
+        assert_eq!(
+            node.on_transaction(PosTransaction::L2DataAvailability(other)),
+            Ok(Admitted::New),
+            "another commitment for the recorded block is admitted"
+        );
+        assert_eq!(node.mempool.len(), 1);
+    }
+
     /// W1-1: an L2 transaction that pays for, and declares, far more bytes
     /// than it carries is refused at the door like a transfer that does, and
     /// is not selected if it is in the pool anyway.

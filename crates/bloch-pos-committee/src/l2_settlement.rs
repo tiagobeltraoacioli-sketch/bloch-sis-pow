@@ -3604,3 +3604,116 @@ mod inbox_tests {
         assert!(claims.from_local_cache().is_err(), "the claim count matches the bitmap");
     }
 }
+
+/// Agent 382 (round 18), requested by reviewer 384 for finding F382-2: the two
+/// invariants the hardened-clippy argument rests on, stated as properties over
+/// long deterministic sequences of the mutating calls, instead of argued from
+/// the code only. (1) `ClaimBitmap::claims` is the number of claimed indices
+/// across `insert`, `forget` and `forget_at_or_above`, including the floor's
+/// fully claimed words that the forget calls store again (so `claims -= ...`
+/// never underflows), and the set equals a plain model. (2) The forced queue
+/// keeps `queued == consumed + pending.len()` and `consumed >= log.len()`
+/// across `push`, `consume_due`, anchors and `requeue_logged_after` (so
+/// `consumed -= count` never underflows), and the log stays bounded.
+#[cfg(test)]
+mod r18_invariant_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// A small deterministic generator (64-bit LCG, high bits).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, bound: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % bound
+        }
+    }
+
+    #[test]
+    fn claim_bitmap_count_is_the_number_of_claimed_indices() {
+        const SPAN: u64 = 8 * 256;
+        for seed in 1..=6u64 {
+            let mut rng = Lcg(seed);
+            let mut set = withdrawal::ClaimBitmap::default();
+            let mut model = BTreeSet::new();
+            for step in 0..6_000 {
+                match rng.next(10) {
+                    // Mostly inserts, often in order, so whole words fill and the floor moves.
+                    0..=3 => {
+                        let i = rng.next(SPAN);
+                        assert_eq!(set.insert(i), model.insert(i), "seed {seed} step {step} insert {i}");
+                    }
+                    4..=5 => {
+                        let start = rng.next(SPAN / 256) * 256;
+                        for i in start..start + 256 {
+                            assert_eq!(set.insert(i), model.insert(i));
+                        }
+                    }
+                    6..=7 => {
+                        let i = rng.next(SPAN);
+                        assert_eq!(set.forget(i), model.remove(&i), "seed {seed} step {step} forget {i}");
+                    }
+                    _ => {
+                        let i = rng.next(SPAN + 1);
+                        let gone = model.split_off(&i).len() as u64;
+                        assert_eq!(set.forget_at_or_above(i), gone, "seed {seed} step {step} forget >= {i}");
+                    }
+                }
+                assert_eq!(set.claims(), model.len() as u64, "seed {seed} step {step}: claims is the count");
+                if step % 97 == 0 {
+                    let present = (0..SPAN + 256).filter(|&i| set.contains(i)).count() as u64;
+                    assert_eq!(present, set.claims(), "seed {seed} step {step}: claims is the popcount");
+                    assert!((0..SPAN + 256).all(|i| set.contains(i) == model.contains(&i)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forced_queue_counts_balance_across_consume_and_requeue() {
+        use forced::{Queue, Record, CONSUMED_LOG, MAX_GAS, MIN_GAS};
+        for seed in 1..=6u64 {
+            let mut rng = Lcg(seed);
+            let mut q = Queue::new();
+            let mut number = 0u64;
+            let mut consumed_by_calls = 0u64;
+            for step in 0..8_000u64 {
+                match rng.next(10) {
+                    0..=4 => {
+                        let record = Record {
+                            height: step,
+                            l1_txid: [(step % 251) as u8; 32],
+                            envelope_hash: [(step % 241) as u8; 32],
+                            gas_limit: MIN_GAS + rng.next(MAX_GAS - MIN_GAS + 1),
+                        };
+                        let before = q.queued;
+                        let pushed = q.push(record).is_ok();
+                        assert_eq!(q.queued, before + u64::from(pushed));
+                    }
+                    5..=7 => {
+                        number += 1;
+                        let due = q.due().len() as u64;
+                        q.consume_due(number);
+                        consumed_by_calls += due;
+                    }
+                    8 => {
+                        q.anchor = Some(rng.next(q.pending.len() as u64 + 1));
+                    }
+                    _ => {
+                        let to = number.saturating_sub(rng.next(8));
+                        let back = q.requeue_logged_after(to);
+                        consumed_by_calls -= back;
+                        number = to;
+                    }
+                }
+                assert_eq!(q.queued, q.consumed + q.pending.len() as u64, "seed {seed} step {step}: queued = consumed + pending");
+                assert!(q.consumed >= q.log.len() as u64, "seed {seed} step {step}: consumed >= log");
+                assert!(q.log.len() <= CONSUMED_LOG);
+                assert_eq!(q.consumed, consumed_by_calls);
+                if let Some(anchor) = q.anchor {
+                    assert!(anchor <= q.pending.len() as u64 + CONSUMED_LOG as u64);
+                }
+            }
+        }
+    }
+}
