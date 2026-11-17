@@ -85,3 +85,20 @@ test("sends Bearer auth when bearer=true", async () => {
   await c.getBlockCount();
   assert.equal(calls[0].init.headers["Authorization"], "Bearer secret");
 });
+
+test("L1M-18: an API key is never sent over plaintext http to a remote host", async () => {
+  const { fetch, calls } = mockFetch({ jsonrpc: "2.0", result: 1, id: 1 });
+  const remote = new BlochClient({ fetch, url: "http://rpc.example:16210", apiKey: "secret" });
+  await assert.rejects(() => remote.getBlockCount(), /refusing to send the API key/);
+  assert.equal(calls.length, 0, "no request may leave with the key");
+  for (const url of ["https://rpc.example:16210", "http://127.0.0.1:16210", "http://localhost:16210", "http://[::1]:16210"]) {
+    const c = new BlochClient({ fetch, url, apiKey: "secret" });
+    assert.equal(await c.getBlockCount(), 1, url);
+  }
+  const optedIn = new BlochClient({ fetch, url: "http://rpc.example:16210", apiKey: "secret", allowInsecureHttp: true });
+  assert.equal(await optedIn.getBlockCount(), 1);
+  assert.equal(calls[calls.length - 1].init.redirect, "error", "keyed requests must not follow redirects");
+  const keyless = new BlochClient({ fetch, url: "http://rpc.example:16210" });
+  assert.equal(await keyless.getBlockCount(), 1);
+  assert.equal(calls[calls.length - 1].init.redirect, undefined);
+});

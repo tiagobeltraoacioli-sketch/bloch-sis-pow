@@ -41,6 +41,21 @@
 //! premise — while a chain that finalized *only* thanks to a leak-shrunk
 //! denominator yields a certificate this verifier refuses. That is the safe
 //! direction for an exchange.
+//!
+//! ## Epoch ceiling of the bare verifier
+//!
+//! [`verify`] / [`verify_chain`] judge a certificate by bond weights and v1
+//! static signatures, which is the chain's premise only below the frozen
+//! finality set gate (`params::HF1_FROZEN_FINALITY_SET_EPOCH`). From that
+//! epoch on the chain measures the quorum against a frozen set whose weights
+//! disagree with the bonds in both directions, so the bare verifier refuses
+//! any certificate with a link target at or past the gate
+//! ([`Refusal::UseLcProofVerifier`]) rather than apply a rule the chain does
+//! not. The entry point for those epochs is [`lc_proof::verify`] (CLI
+//! `bloch-finality-verify`), which follows the gates.
+
+pub mod lc_proof;
+pub mod state;
 
 use bloch_pos_committee::attestation::AttestationData;
 use bloch_pos_committee::header::{BlockHeaderV4, BlockId};
@@ -61,6 +76,15 @@ pub const MAX_VOTES_PER_LINK: usize = 1 << 16;
 pub const MAX_SIG_BYTES: usize = 16 * 1024;
 pub const MAX_RECORD_BYTES: usize = 64 * 1024;
 pub const MAX_ANCESTRY: usize = 4096;
+
+/// Smallest encodings of one list entry (L1M-05): a registry record is a
+/// `u32` length, its bytes and a proof (32-byte bitmap at least); an absence
+/// is a `u32` index and a proof; a vote is validator, slot, head and a `u32`
+/// signature length.
+const MIN_PROOF_BYTES: usize = 32;
+const MIN_RECORD_ENTRY: usize = 4 + MIN_PROOF_BYTES;
+const MIN_ABSENT_ENTRY: usize = 4 + MIN_PROOF_BYTES;
+const MIN_VOTE_ENTRY: usize = 4 + 8 + 32 + 4;
 /// Default for [`TrustAnchors::max_hop_epochs`]: how far (in epochs) a
 /// certificate's target may sit past its set-source block. A registry drifts
 /// (activations, exits) with distance; the weak-subjectivity reasoning is
@@ -235,14 +259,19 @@ impl Certificate {
         }
         let checkpoint_header = r.header()?;
         let set_header = r.header()?;
-        let n = r.count(MAX_RECORDS)?;
+        // L1M-05: every list count is also bounded by the bytes left (each
+        // entry has a fixed minimum size), so a short input cannot make the
+        // decoder pre-allocate for 65 536 entries it does not contain. Valid
+        // inputs decode identically; an over-claim fails "truncated", as it
+        // would have once the reader ran out.
+        let n = r.items(MAX_RECORDS, MIN_RECORD_ENTRY)?;
         let mut records = Vec::with_capacity(n);
         for _ in 0..n {
             let len = r.count(MAX_RECORD_BYTES)?;
             let bytes = r.take(len)?.to_vec();
             records.push((bytes, r.proof()?));
         }
-        let n = r.count(MAX_RECORDS + 1)?;
+        let n = r.items(MAX_RECORDS + 1, MIN_ABSENT_ENTRY)?;
         let mut absent = Vec::with_capacity(n);
         for _ in 0..n {
             let i = r.u32()?;
@@ -253,7 +282,7 @@ impl Certificate {
             let source_root = r.a32()?;
             let target_epoch = r.u64()?;
             let target_root = r.a32()?;
-            let n = r.count(MAX_VOTES_PER_LINK)?;
+            let n = r.items(MAX_VOTES_PER_LINK, MIN_VOTE_ENTRY)?;
             let mut votes = Vec::with_capacity(n);
             for _ in 0..n {
                 let validator = r.u32()?;
@@ -267,7 +296,7 @@ impl Certificate {
         };
         let l0 = link()?;
         let l1 = link()?;
-        let n = r.count(MAX_ANCESTRY)?;
+        let n = r.items(MAX_ANCESTRY, BlockHeaderV4::ENCODED_LEN)?;
         let mut ancestry = Vec::with_capacity(n);
         for _ in 0..n {
             ancestry.push(r.header()?);
@@ -318,6 +347,15 @@ impl<'a> Rd<'a> {
         let n = self.u32()? as usize;
         if n > max {
             return Err(Refusal::Malformed("count over bound"));
+        }
+        Ok(n)
+    }
+    /// A list count bounded by `max` AND by how many `min_item`-byte entries
+    /// the remaining input could hold (L1M-05).
+    fn items(&mut self, max: usize, min_item: usize) -> Result<usize, Refusal> {
+        let n = self.count(max)?;
+        if n > self.0.len() / min_item.max(1) {
+            return Err(Refusal::Malformed("truncated"));
         }
         Ok(n)
     }
@@ -396,11 +434,27 @@ pub enum Refusal {
     BadSignature { link: usize, validator: u32 },
     InsufficientStake { link: usize, signed: u128, total: u128 },
     AncestryBroken { at: usize },
+    /// A link targets an epoch at or past the frozen finality set gate
+    /// (`params::HF1_FROZEN_FINALITY_SET_EPOCH`, reported as `gate_epoch`).
+    /// From there the chain's quorum is the frozen set's, not the bonds this
+    /// verifier counts, and votes stop being v1 static signatures: this
+    /// verifier does not judge such a certificate at all. Use
+    /// [`lc_proof::verify`] (CLI `bloch-finality-verify`).
+    UseLcProofVerifier { target_epoch: u64, gate_epoch: u64 },
 }
 
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Refusal::UseLcProofVerifier { target_epoch, gate_epoch } => write!(
+                f,
+                "UseLcProofVerifier: link target epoch {target_epoch} is at or past the frozen \
+                 finality set gate (epoch {gate_epoch}); bloch_finality_cert::verify counts bond \
+                 weights and v1 static signatures, which is not the chain's quorum rule there. \
+                 Verify with bloch_finality_cert::lc_proof::verify (CLI bloch-finality-verify)"
+            ),
+            other => write!(f, "{other:?}"),
+        }
     }
 }
 
@@ -424,6 +478,11 @@ fn id(h: &BlockHeaderV4) -> [u8; 32] {
 }
 
 /// Verify `cert` under `anchors`. Pure: no clock, no I/O, no global state.
+///
+/// Only for certificates whose link targets are both below the frozen
+/// finality set gate; at or past it this returns
+/// [`Refusal::UseLcProofVerifier`] and [`lc_proof::verify`] is the entry
+/// point (see the crate docs, "Epoch ceiling of the bare verifier").
 pub fn verify(cert: &Certificate, anchors: &TrustAnchors, sigs: &dyn SigCheck) -> Result<Verified, Refusal> {
     let [l0, l1] = &cert.links;
     let e = l0.target_epoch;
@@ -437,6 +496,16 @@ pub fn verify(cert: &Certificate, anchors: &TrustAnchors, sigs: &dyn SigCheck) -
     }
     if e.checked_add(1) != Some(l1.target_epoch) {
         return Err(Refusal::LinkShape("finalizing link is not consecutive"));
+    }
+    // Epoch ceiling. The chain counts the votes of an epoch at or past the
+    // frozen-set gate against the frozen set (`finality.rs`, keyed on the
+    // votes' target epoch), and `l1` has the later target of the two links.
+    // The gate is read from `params`, the constant the chain and `lc_proof`
+    // use, so a build with another gate moves this with it; an inert gate
+    // (`u64::MAX`) never refuses.
+    let gate = bloch_pos_committee::params::HF1_FROZEN_FINALITY_SET_EPOCH;
+    if bloch_pos_committee::params::epoch_gate_active(l1.target_epoch, gate) {
+        return Err(Refusal::UseLcProofVerifier { target_epoch: l1.target_epoch, gate_epoch: gate });
     }
     if id(&cert.checkpoint_header) != l0.target_root {
         return Err(Refusal::CheckpointMismatch);
@@ -588,7 +657,15 @@ pub fn registry_proof(
     state: &bloch_pos_committee::transition::CommittedState,
     header: BlockHeaderV4,
 ) -> Option<RegistryProof> {
-    let tree = state.state_tree();
+    registry_proof_in(&state.state_tree(), state, header)
+}
+
+/// [`registry_proof`] against an already built `tree` of `state`.
+pub(crate) fn registry_proof_in(
+    tree: &bloch_pos_committee::state_root::Smt,
+    state: &bloch_pos_committee::transition::CommittedState,
+    header: BlockHeaderV4,
+) -> Option<RegistryProof> {
     if tree.root() != header.state_root {
         return None;
     }

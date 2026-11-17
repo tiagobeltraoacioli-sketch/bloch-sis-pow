@@ -29,7 +29,7 @@ fn output(ix: &Index, op: OutPoint, u: &Utxo, height: u64) -> Json {
     ])
 }
 pub fn transaction(t: &TxRow) -> Json {
-    Json::Obj(vec![
+    let mut fields = vec![
         ("txid", Json::hex32(&t.txid)), ("block_id", Json::hex32(&t.block_id)),
         ("slot", Json::u(t.slot)), ("height", Json::u(t.height)), ("index", Json::u(t.tx_index as u64)),
         ("kind", Json::s(t.kind.name())), ("size_bytes", Json::u(t.size_bytes)),
@@ -42,7 +42,12 @@ pub fn transaction(t: &TxRow) -> Json {
             ("txid", Json::hex32(&t.txid)), ("vout", Json::u(v as u64)),
             ("value_sat", Json::sat(*value as u128)), ("script_hash", Json::hex32(sh)),
         ])).collect())),
-    ])
+    ];
+    if t.kind.is_l2() {
+        fields.push(("l2_escrow_in_sat", Json::sat(t.l2_escrow_in_sat)));
+        fields.push(("l2_escrow_out_sat", Json::sat(t.l2_escrow_out_sat)));
+    }
+    Json::Obj(fields)
 }
 /// Snapshot cursors stay valid across appends. A replaced anchor is a 409,
 /// never an offset silently interpreted against a different canonical chain.

@@ -434,6 +434,64 @@ mod l2_tests {
         assert!(state.apply_transaction(&PosTransaction::L2SettlementAsync(Box::new(original)), 0, 1, &RealProof).is_err());
         assert_eq!(state, pre);
     }
+    /// The mempool preflight gives the verdict of `apply` on a copy, and a
+    /// settlement that fails policy, source or successor never reaches the
+    /// proof verifier.
+    #[test]
+    fn async_preflight_matches_apply_and_checks_the_proof_last() {
+        struct Counting(std::cell::Cell<usize>);
+        impl SignatureVerifier for Counting {
+            fn verify_with_key(&self, _: &[u8], _: &[u8; 32], _: &[u8]) -> bool { false }
+            fn verify_l2_settlement(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8], proof: &[u8]) -> bool {
+                self.0.set(self.0.get() + 1);
+                proof == [1; 356]
+            }
+        }
+        let verifier = Counting(std::cell::Cell::new(0));
+        let agree = |l2: &crate::l2_settlement::State, tx: &Transaction| {
+            let preflight = l2.validate_async(tx, &verifier);
+            assert_eq!(preflight, l2.clone().apply(tx, [0; 32], 0, true, &verifier));
+            preflight
+        };
+        // No anchor yet: refused before the proof.
+        let (pre, mut chains) = fixture_mode(true);
+        let l2 = pre.l2_settlement().unwrap();
+        assert_eq!(agree(l2, &transaction(&pre)), Err(Reject::NotActive));
+        let t = Transition::new(ProofDouble);
+        let block = build_block(&t, &pre, 2, &[], &[], &mut chains);
+        let pre = t.apply_block(&pre, &block, &[], &[]).unwrap();
+        let l2 = pre.l2_settlement().unwrap();
+        let original = transaction(&pre);
+        for (offset, why) in [
+            (S, Reject::Policy),
+            (S + 256, Reject::Policy),
+            (S + 400, Reject::Source),
+            (S + 448, Reject::Source),
+            (S + 512, Reject::Source),
+            (S + 224, Reject::Successor),
+            (S + 264, Reject::Successor),
+        ] {
+            let mut changed = original.clone();
+            changed.statement[offset] ^= 1;
+            assert_eq!(agree(l2, &changed), Err(why), "offset {offset}");
+        }
+        let mut policy = original.clone();
+        policy.proof_policy[0] ^= 1;
+        assert_eq!(agree(l2, &policy), Err(Reject::Policy));
+        assert_eq!(verifier.0.get(), 0, "cheap refusals never reach the proof verifier");
+
+        let mut forged = original.clone();
+        forged.proof = [2; 356];
+        assert_eq!(agree(l2, &forged), Err(Reject::Proof));
+        assert_eq!(verifier.0.get(), 2, "one verification each for the preflight and for apply");
+        assert_eq!(agree(l2, &original), Ok(()));
+        // The preflight left the state as it was; apply still moves the head.
+        assert_eq!(l2, pre.l2_settlement().unwrap());
+        let mut applied = l2.clone();
+        applied.apply(&original, [0; 32], 0, true, &verifier).unwrap();
+        assert_eq!(applied.head(), Some((original.commitment(), original.statement.clone())));
+        assert!(applied.frozen_source().is_none());
+    }
 
     // ── Native L2 deposits (devnet-l2-deposits) ─────────────────────────────
 
@@ -1678,6 +1736,66 @@ mod l2_tests {
         assert!(l2.escrow_conserved());
     }
 
+    /// W1-2: the node's preflight for a block in a later epoch than the head
+    /// skips the finality test and nothing else. A matured, not yet
+    /// finalized claim that pays no fee, spends nothing it owns or names an
+    /// absent input is refused for that; the transition's own verdict on the
+    /// same state is unchanged; and with finality the two checks agree.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn the_claim_preflight_before_finality_runs_every_other_check() {
+        let (mut young, _) = funded_async_fixture();
+        let l2 = young.l2_settlement.as_mut().unwrap();
+        l2.append_deposit(crate::l2_settlement::InboxRecord {
+            height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 50_000_000, recipient: [0x42; 20],
+        })
+        .unwrap();
+        let accepted = l2.height() + 1;
+        l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&wleaves(3)), count: 3, height: accepted });
+        for _ in 0..WITHDRAW_DELAY_BLOCKS {
+            l2.advance_height().unwrap();
+        }
+        let fee = young.next_base_fee();
+        let good = claim_tx(&young, ([0x33; 32], 0), FUNDED, 3, 1);
+        let mut unpaid = good.clone();
+        unpaid.change.value += 1;
+        let unpaid = resign_claim(unpaid);
+        let mut absent = good.clone();
+        absent.inputs[0].txid = [0x34; 32];
+        let absent = resign_claim(absent);
+        let mut unowned = good.clone();
+        unowned.funding_pubkey = vec![0x5b; crate::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let unowned = resign_claim(unowned);
+        let other_leaf = resign_claim(L2WithdrawClaim { index: 0, ..good.clone() });
+
+        let cases = [
+            (&good, None),
+            (&unpaid, Some(ClaimReject::Conservation)),
+            (&absent, Some(ClaimReject::MissingInput)),
+            (&unowned, Some(ClaimReject::Ownership)),
+            // What precedes the finality test is still judged first.
+            (&other_leaf, Some(ClaimReject::Proof)),
+        ];
+        for (tx, before_finality) in &cases {
+            if *before_finality != Some(ClaimReject::Proof) {
+                assert_eq!(young.l2_withdraw_claim_refusal_at(tx, fee), Some(ClaimReject::NotFinalized));
+                // The transition is unchanged: it still stops at finality.
+                let mut state = young.clone();
+                assert_eq!(
+                    state.apply_transaction(&claim(tx), 0, fee, &ToyVerifier),
+                    Err(TxReject::L2WithdrawClaim(ClaimReject::NotFinalized))
+                );
+                assert_eq!(state, young);
+            }
+            assert_eq!(young.l2_withdraw_claim_refusal_before_finality_at(tx, fee), *before_finality);
+        }
+        finalize_all(&mut young);
+        for (tx, verdict) in &cases {
+            assert_eq!(young.l2_withdraw_claim_refusal_at(tx, fee), *verdict);
+            assert_eq!(young.l2_withdraw_claim_refusal_before_finality_at(tx, fee), *verdict);
+        }
+    }
+
     #[test]
     #[cfg(feature = "devnet-l2-user-txs")]
     fn a_leaf_is_claimed_once_in_a_block_across_blocks_and_never_again() {
@@ -1736,7 +1854,7 @@ mod l2_tests {
         );
         assert_eq!(state, pre);
         assert_eq!(
-            pre.l2_settlement().unwrap().check_claim(700771, 1, &wleaf(1).0, wleaf(1).1, &tx.siblings, false),
+            pre.l2_settlement().unwrap().check_claim(700771, 1, &wleaf(1).0, wleaf(1).1, &tx.siblings, false, false),
             Err(wd::ClaimRefusal::NotActive)
         );
     }
@@ -1823,7 +1941,7 @@ mod l2_tests {
                         let expected_ok =
                             matured && in_tree && !paid.contains(&index) && l2.escrow_sat() >= u128::from(sats) && fits;
                         let before = l2.clone();
-                        let result = l2.release_withdrawal(700771, index, &recipient, sats, &siblings, false);
+                        let result = l2.release_withdrawal(700771, index, &recipient, sats, &siblings, false, false);
                         assert_eq!(result.is_ok(), expected_ok, "seed {seed} step {step}: {result:?}");
                         if result.is_ok() {
                             paid.insert(index);
@@ -2012,7 +2130,7 @@ mod l2_tests {
 
     fn release(l2: &mut crate::l2_settlement::State, tree: &[[u8; 32]], leaves: &[([u8; 32], u64)], i: u64) -> Result<(), wd::ClaimRefusal> {
         let (r, sats) = leaves[i as usize];
-        l2.release_withdrawal(700771, i, &r, sats, &wd::proof(tree, i).unwrap(), false)
+        l2.release_withdrawal(700771, i, &r, sats, &wd::proof(tree, i).unwrap(), false, false)
     }
 
     #[test]
@@ -2098,16 +2216,16 @@ mod l2_tests {
         assert_eq!(l2.release_window().cap, 30 * BLCH as u128);
         let proof = wd::proof(&tree, 0).unwrap();
         let state = l2.clone();
-        assert_eq!(l2.release_withdrawal(700771, 0, &[1; 32], 99 * BLCH, &proof, false), Err(wd::ClaimRefusal::RateLimited));
+        assert_eq!(l2.release_withdrawal(700771, 0, &[1; 32], 99 * BLCH, &proof, false, false), Err(wd::ClaimRefusal::RateLimited));
         assert_eq!(l2, state);
         // Within the cap, no attestation is needed; afterwards the window is
         // no longer empty, so even an attested 99 BLCH waits.
         release(&mut l2, &tree, &leaves, 1).unwrap();
-        assert_eq!(l2.release_withdrawal(700771, 0, &[1; 32], 99 * BLCH, &proof, true), Err(wd::ClaimRefusal::RateLimited));
+        assert_eq!(l2.release_withdrawal(700771, 0, &[1; 32], 99 * BLCH, &proof, true, false), Err(wd::ClaimRefusal::RateLimited));
         for _ in 0..wd::RELEASE_WINDOW_BLOCKS {
             l2.advance_height().unwrap();
         }
-        l2.release_withdrawal(700771, 0, &[1; 32], 99 * BLCH, &proof, true).expect("attested first claim of a window");
+        l2.release_withdrawal(700771, 0, &[1; 32], 99 * BLCH, &proof, true, false).expect("attested first claim of a window");
         assert!(l2.escrow_conserved());
         // Without attestors nobody can lift the cap, so the first claim stays
         // exempt (otherwise it would never pay).
@@ -2116,6 +2234,100 @@ mod l2_tests {
             bare.advance_height().unwrap();
         }
         release(&mut bare, &tree, &leaves, 0).expect("no attestors: first claim exempt");
+    }
+
+    // ── Security review round 2, EXE-4
+    //    (`params::L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH`) ──
+
+    #[test]
+    fn l2_release_exemption_gate_is_inert() {
+        assert_eq!(crate::params::L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH, u64::MAX);
+        for epoch in [0, 5_850, 7_400, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::l2_release_exemption_active(epoch));
+        }
+        let _gate = crate::params::l2_release_exemption_rehearsal::open();
+        assert!(crate::params::l2_release_exemption_active(0));
+    }
+
+    /// The window rule itself, both sides of the gate, over every state a
+    /// window can be in. Inert, it is the rule it always was.
+    #[test]
+    fn the_window_exemption_survives_an_earlier_claim_only_behind_the_gate() {
+        let cap = 100 * u128::from(BLCH);
+        let window = |released: u128| wd::ReleaseWindow { window: 7, released, cap };
+        let over = 100 * BLCH + 1;
+        for released in [0, 1, cap / 2, cap - 1, cap, cap + 1, 3 * cap] {
+            let w = window(released);
+            for sats in [1, BLCH, 100 * BLCH, over, 500 * BLCH] {
+                let fits = released + u128::from(sats) <= cap;
+                // Inert: exactly the old expression.
+                assert_eq!(w.admits(sats, false, false), fits);
+                assert_eq!(w.admits(sats, true, false), fits || released == 0);
+                // Armed: a claim that is not exempt is judged as before...
+                assert_eq!(w.admits(sats, false, true), fits);
+                // ...and an exempt one passes until the window is above its cap.
+                assert_eq!(w.admits(sats, true, true), fits || released <= cap);
+            }
+        }
+        // One dust claim first: the over-cap claim waits today, pays armed.
+        let dusted = window(1);
+        assert!(!dusted.admits(over, true, false));
+        assert!(dusted.admits(over, true, true));
+        // The exemption is spent by using it: the window is then above its
+        // cap and admits nothing more, exempt or not, however small.
+        let spent = window(1 + u128::from(over));
+        for sats in [1, over] {
+            assert!(!spent.admits(sats, true, true));
+            assert!(!spent.admits(sats, false, true));
+        }
+    }
+
+    /// Through the real claim transaction: a small claim lands first in the
+    /// window, then an attested claim above the cap. Refused with the gate
+    /// inert (and the state untouched), paid with it armed; a second claim
+    /// above the cap in that window is refused either way.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn a_small_claim_no_longer_blocks_the_attested_claim_above_the_cap() {
+        // Escrow 1 000 BLCH: cap 100 BLCH per window.
+        let leaves = [([1; 32], 150 * BLCH), ([2; 32], BLCH), ([3; 32], 120 * BLCH)];
+        let tree: Vec<[u8; 32]> =
+            leaves.iter().enumerate().map(|(i, (r, sats))| wd::leaf(700771, i as u64, r, *sats)).collect();
+        let mut pre = attested_fixture(&leaves, true);
+        {
+            let l2 = pre.l2_settlement.as_mut().unwrap();
+            assert_eq!(l2.release_window().cap, 100 * u128::from(BLCH));
+            l2.release_withdrawal(700771, 1, &[2; 32], BLCH, &wd::proof(&tree, 1).unwrap(), false, false)
+                .expect("the small claim that opens the window");
+        }
+        let large = claim_of(&pre, &leaves, 0, Some(attest(&leaves, &[0, 2])));
+
+        // Inert: today's rule, and the refusal changes nothing.
+        assert_eq!(
+            try_claim(&pre, &large).map(|_| ()),
+            Err(TxReject::L2WithdrawClaim(ClaimReject::RateLimited))
+        );
+        assert_eq!(pre.l2_withdraw_claim_refusal(&large), Some(ClaimReject::RateLimited));
+
+        let _gate = crate::params::l2_release_exemption_rehearsal::open();
+        assert_eq!(pre.l2_withdraw_claim_refusal(&large), None);
+        let mut post = try_claim(&pre, &large).expect("attested claim above the cap, after a small one");
+        let l2 = post.l2_settlement.as_mut().unwrap();
+        assert!(l2.claimed().contains(0));
+        assert_eq!(l2.release_window().released, u128::from(151 * BLCH));
+        assert!(l2.escrow_conserved());
+        // The window has paid its cap plus one exempt claim, and is closed.
+        let before = l2.clone();
+        assert_eq!(
+            l2.release_withdrawal(700771, 2, &[3; 32], 120 * BLCH, &wd::proof(&tree, 2).unwrap(), true, true),
+            Err(wd::ClaimRefusal::RateLimited)
+        );
+        assert_eq!(*l2, before);
+        // An unattested claim above the cap is still refused behind the gate.
+        let unattested = pre.l2_settlement.as_ref().unwrap().check_claim(
+            700771, 2, &[3; 32], 120 * BLCH, &wd::proof(&tree, 2).unwrap(), false, true,
+        );
+        assert_eq!(unattested, Err(wd::ClaimRefusal::RateLimited));
     }
 
     #[test]
@@ -2633,6 +2845,118 @@ mod l2_tests {
         refuse(&post, &claim_of(&post, &leaves, 3, None), ClaimReject::RateLimited);
     }
 
+    // ── Proof-free preflights for the node (review EXE-1, EXE-2) ──────────
+
+    /// The deposit and DA preflights the node runs at mempool admission and
+    /// proposer selection give the transition's own verdict, for the valid
+    /// transaction and for each state refusal: never stricter than consensus.
+    #[test]
+    fn l2_deposit_and_da_preflights_give_the_transitions_verdict() {
+        use crate::transition::L2DepositReject as DepositReject;
+        let (opened, mut chains) = activated_fixture(true, [0; 32]);
+        let fee = opened.next_base_fee();
+        let deposit_verdict = |state: &CommittedState, tx: &crate::transition::L2Deposit| {
+            let preflight = state.l2_deposit_refusal_at(tx, fee);
+            assert_eq!(preflight, state.clone().apply_l2_deposit(tx, fee, &ToyVerifier).err());
+            preflight
+        };
+        let resign_deposit = |mut tx: crate::transition::L2Deposit| {
+            tx.signature = toy_sign(&tx.funding_pubkey, &tx.intent_root());
+            tx
+        };
+        let good = deposit_tx(&opened, 70 * BLCH);
+        assert_eq!(deposit_verdict(&opened, &good), None);
+        let mut missing = good.clone();
+        missing.inputs[0].txid = [0x34; 32];
+        let mut foreign = good.clone();
+        foreign.funding_pubkey = vec![0x5b; crate::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let mut tip = good.clone();
+        tip.tip_millisat_per_gas = u128::MAX;
+        let mut oversize = good.clone();
+        oversize.tx_bytes = u64::MAX;
+        let mut unpaid = good.clone();
+        unpaid.change.value += 1;
+        let mut elsewhere = good.clone();
+        elsewhere.network_domain = [0x92; 32];
+        for (tx, why) in [
+            (missing, DepositReject::MissingInput),
+            (foreign, DepositReject::Ownership),
+            (tip, DepositReject::TipAboveCeiling),
+            (oversize, DepositReject::GasCeiling),
+            (unpaid, DepositReject::Conservation),
+            (elsewhere, DepositReject::Network),
+        ] {
+            assert_eq!(deposit_verdict(&opened, &resign_deposit(tx)), Some(why));
+        }
+        // The signature is not the preflight's business.
+        let mut unsigned = good.clone();
+        unsigned.signature = vec![0; 32];
+        assert_eq!(opened.l2_deposit_refusal_at(&unsigned, fee), None);
+        assert_eq!(opened.clone().apply_l2_deposit(&unsigned, fee, &ToyVerifier), Err(DepositReject::Signature));
+
+        let da_verdict = |state: &CommittedState, tx: &L2DataAvailability| {
+            let fee = state.next_base_fee();
+            let preflight = state.l2_data_availability_refusal_at(tx, fee);
+            assert_eq!(preflight, state.clone().apply_l2_data_availability(tx, fee, &ToyVerifier).err());
+            preflight
+        };
+        let coin = ([0x33; 32], 0);
+        let payload = batch(&[&[0x02, 0xc0], b"second"]);
+        let batch_tx = da_tx(&opened, coin, FUNDED, 1, payload.clone());
+        assert_eq!(da_verdict(&opened, &batch_tx), None);
+        assert_eq!(da_verdict(&opened, &da_tx(&opened, coin, FUNDED, 0, payload.clone())), Some(DaReject::Number));
+        let beyond = 1 + da::WINDOW;
+        assert_eq!(da_verdict(&opened, &da_tx(&opened, coin, FUNDED, beyond, payload.clone())), Some(DaReject::Number));
+        let mut other_chain = batch_tx.clone();
+        other_chain.l2_chain_id += 1;
+        assert_eq!(da_verdict(&opened, &resign(other_chain)), Some(DaReject::Chain));
+        let mut unowned = batch_tx.clone();
+        unowned.funding_pubkey = vec![0x5b; crate::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        assert_eq!(da_verdict(&opened, &resign(unowned)), Some(DaReject::Ownership));
+        // Once recorded, the same batch for the same block is a duplicate.
+        let wire = PosTransaction::L2DataAvailability(batch_tx.clone());
+        let recorded = apply(&opened, crate::params::SLOTS_PER_EPOCH + 1, std::slice::from_ref(&wire), &mut chains).expect("DA applies");
+        let again = da_tx(&recorded, (wire.txid(), 0), batch_tx.change.value, 1, payload);
+        assert_eq!(da_verdict(&recorded, &again), Some(DaReject::Duplicate));
+
+        // The claim preflight at an explicit price is the existing one.
+        let claim = claim_tx(&opened, coin, FUNDED, 3, 2);
+        assert_eq!(opened.l2_withdraw_claim_refusal_at(&claim, fee), opened.l2_withdraw_claim_refusal(&claim));
+        assert!(opened.l2_withdraw_claim_refusal_at(&claim, fee).is_some());
+    }
+
+    /// The retention check for a settlement that is already pending judges it
+    /// as the next block will: it accepts one whose source the next block
+    /// pins, and refuses one the head has moved past, whatever its proof.
+    #[test]
+    fn pending_settlement_check_follows_the_head() {
+        let (pre, mut chains) = fixture_mode(true);
+        let l2 = pre.l2_settlement().unwrap();
+        assert!(l2.frozen_source().is_none());
+        let first = transaction(&pre);
+        // No source is pinned yet, so admission refuses it; the next block
+        // pins exactly this head, and the transition accepts it there.
+        assert_eq!(l2.validate_async(&first, &ProofDouble), Err(Reject::NotActive));
+        assert_eq!(l2.pending_async_refusal(&first, *pre.head.as_bytes(), pre.slot), None);
+        let wire = PosTransaction::L2SettlementAsync(Box::new(first.clone()));
+        let post = apply(&pre, 2, std::slice::from_ref(&wire), &mut chains).expect("applies in the next block");
+        // A second proof of the same statement can no longer apply.
+        let mut variant = first.clone();
+        variant.proof = [3; 356];
+        let l2 = post.l2_settlement().unwrap();
+        assert!(l2.pending_async_refusal(&variant, *post.head.as_bytes(), post.slot).is_some());
+        assert!(l2.pending_async_refusal(&first, *post.head.as_bytes(), post.slot).is_some());
+        assert!(post.clone().apply_transaction(&PosTransaction::L2SettlementAsync(Box::new(variant)), 0, 1, &ProofDouble).is_err());
+        // The successor for the new head passes, and a mismatch does not.
+        let empty = crate::l2_settlement::expected_body_commitment(&[]);
+        let next = settlement(&post, empty);
+        assert_eq!(l2.pending_async_refusal(&next, *post.head.as_bytes(), post.slot), None);
+        let mut wrong = next.clone();
+        wrong.statement[S + 264] ^= 1;
+        assert_eq!(l2.pending_async_refusal(&wrong, *post.head.as_bytes(), post.slot), Some(Reject::Successor));
+        assert!(apply(&post, 3, &[PosTransaction::L2SettlementAsync(Box::new(next))], &mut chains).is_ok());
+    }
+
     // ── Mainnet L2 policy approved 2026-10-14 ─────────────────────────────
 
     use crate::l2_settlement::mainnet;
@@ -2826,11 +3150,11 @@ mod l2_tests {
         assert_eq!((next.window, next.released, next.cap), (1, 0, sat(90)));
         // The cap is inclusive; only an exempt (attested) first claim exceeds it.
         let fresh = wd::ReleaseWindow::default().at(&limits, 0, sat(1_000));
-        assert!(fresh.admits(100 * BLCH, false));
-        assert!(!fresh.admits(100 * BLCH + 1, false));
-        assert!(fresh.admits(100 * BLCH + 1, true));
+        assert!(fresh.admits(100 * BLCH, false, false));
+        assert!(!fresh.admits(100 * BLCH + 1, false, false));
+        assert!(fresh.admits(100 * BLCH + 1, true, false));
         let after = wd::ReleaseWindow { released: 1, ..fresh };
-        assert!(!after.admits(100 * BLCH, true));
+        assert!(!after.admits(100 * BLCH, true, false));
     }
 
     /// Signatures of `signers` (indices into `keys`, signed with `signing`
@@ -3227,6 +3551,90 @@ mod l2_tests {
     }
 
 
+    /// Operator check for an externally produced mainnet settlement proof
+    /// (bloch-l2-evm `settler_v3.parse_proof_artifact` output): runs the exact
+    /// native verifier call of `L2Settlement::apply` (`bloch_l2_proof::verify`
+    /// with the pinned `mainnet::PROGRAM` policy and BN254 key) plus the
+    /// statement checks `apply` makes before it (policy, the seven identities,
+    /// chain id, first-settlement successor fields, V3 reserved fields) and,
+    /// with BLOCH_EXTERNAL_PROOF_STRICT_SOURCE=1, the source fields against the
+    /// 11-line native request taken from the live `getl2settlement`.
+    /// `BLOCH_EXTERNAL_PROOF_DIR=<dir with values, proof, request>
+    ///  cargo test -p bloch-pos-committee --lib mainnet_program_external_proof -- --ignored --nocapture`
+    #[test]
+    #[ignore = "operator check; needs BLOCH_EXTERNAL_PROOF_DIR"]
+    fn mainnet_program_external_proof() {
+        use crate::l2_settlement::{deposits_hash, mainnet, v3, MAINNET_CHAIN_ID, STATEMENT_V3_BYTES, STATEMENT_V3_TAG};
+        let dir = std::path::PathBuf::from(std::env::var("BLOCH_EXTERNAL_PROOF_DIR").expect("BLOCH_EXTERNAL_PROOF_DIR"));
+        let strict = std::env::var("BLOCH_EXTERNAL_PROOF_STRICT_SOURCE").as_deref() == Ok("1");
+        let values = std::fs::read(dir.join("values")).unwrap();
+        let proof = std::fs::read(dir.join("proof")).unwrap();
+        let request = std::fs::read_to_string(dir.join("request")).unwrap();
+        let lines: Vec<&str> = request.lines().collect();
+        assert_eq!(lines.len(), 11, "native request has 11 lines");
+        let program = mainnet::PROGRAM.expect("the mainnet program is pinned");
+        let n = |o: usize| u64::from_be_bytes(values[o..o + 8].try_into().unwrap());
+        assert_eq!(values.len(), STATEMENT_V3_BYTES);
+        assert!(values.starts_with(STATEMENT_V3_TAG));
+        assert_eq!(proof.len(), 356);
+        for (i, id) in program.identities.iter().enumerate() {
+            assert_eq!(hash_at(&values, S + i * 32), *id, "identity {i}");
+        }
+        assert_eq!(n(S + 256), MAINNET_CHAIN_ID);
+        // First settlement: zero previous, number 1, pinned L2 genesis parent/state.
+        assert_eq!(hash_at(&values, S + 224), [0; 32]);
+        assert_eq!(n(S + 264), 1);
+        assert_eq!(hash_at(&values, S + 272), program.initial_l2_parent);
+        assert_eq!(hash_at(&values, S + 304), program.initial_l2_state);
+        assert_ne!(hash_at(&values, S + 336), [0; 32]);
+        assert_ne!(hash_at(&values, S + 368), [0; 32]);
+        assert_ne!(hash_at(&values, S + 536), [0; 32]);
+        assert_ne!(hash_at(&values, S + v3::TRANSACTIONS_ROOT), [0; 32]);
+        assert_ne!(hash_at(&values, S + v3::RECEIPTS_ROOT), [0; 32]);
+        let users = n(S + v3::USER_TX_COUNT);
+        if users == 0 {
+            assert_eq!(hash_at(&values, S + v3::DA_COMMITMENT), [0; 32]);
+        }
+        let source_fields = [
+            ("block", hex::encode(hash_at(&values, S + 400)) == lines[2]),
+            ("slot", n(S + 432).to_string() == lines[3]),
+            ("height", n(S + 440).to_string() == lines[4]),
+            ("commitment", hex::encode(hash_at(&values, S + 448)) == lines[5]),
+            ("inbox_root", hex::encode(hash_at(&values, S + 480)) == lines[6]),
+            ("inbox_count", n(S + 512).to_string() == lines[8]),
+            ("consumed_start", n(S + 520).to_string() == lines[9]),
+            ("consumed_end", n(S + 528).to_string() == lines[10]),
+        ];
+        // The live source has an empty inbox: the deposits must be the empty list.
+        let empty_deposits = hash_at(&values, S + v3::DEPOSITS_HASH) == deposits_hash(&[]);
+        // The native verifier call of `L2Settlement::apply` (HybridVerifier::verify_l2_settlement).
+        let verified = bloch_l2_proof::verify(&program.proof_policy, &program.identities[6], &values, &proof);
+        let mut flipped = proof.clone();
+        flipped[12] ^= 1;
+        let mut moved = values.clone();
+        moved[S + 336] ^= 1;
+        let refused_flipped = !bloch_l2_proof::verify(&program.proof_policy, &program.identities[6], &values, &flipped);
+        let refused_moved = !bloch_l2_proof::verify(&program.proof_policy, &program.identities[6], &moved, &proof);
+        let refused_v2 = !bloch_l2_proof::verify(&bloch_l2_proof::policy_commitment(), &program.identities[6], &values, &proof);
+        println!(
+            "EXTERNAL-PROOF l2_hash={} state_root={} user_tx_count={} source={:?} empty_deposits={} verified={} refused_flipped_proof={} refused_flipped_statement={} refused_v2_policy={}",
+            hex::encode(hash_at(&values, S + 336)),
+            hex::encode(hash_at(&values, S + 368)),
+            users,
+            source_fields,
+            empty_deposits,
+            verified,
+            refused_flipped,
+            refused_moved,
+            refused_v2
+        );
+        assert!(verified && refused_flipped && refused_moved && refused_v2);
+        if strict {
+            assert!(source_fields.iter().all(|(_, ok)| *ok), "source fields differ from the native request");
+            assert!(empty_deposits, "deposits differ from the live (empty) inbox");
+        }
+    }
+
     // ── Claim finality must lie on the claim's own chain (2026-10-19) ──
     //
     // `wd::record_finalized` compares EPOCHS only, and the FFG tally counts
@@ -3456,7 +3864,7 @@ mod l2_tests {
     /// above runs below the gate).
     #[test]
     fn below_the_claim_finality_gate_nothing_is_recorded() {
-        assert_eq!(crate::params::HF1_CLAIM_FINALITY_EPOCH, u64::MAX);
+        assert_eq!(crate::params::HF1_CLAIM_FINALITY_EPOCH, 7180);
         let split_claims::Split { a, b, .. } = split_claims::split();
         for st in [&a, &b] {
             let l2 = st.l2_settlement().unwrap();
@@ -3592,7 +4000,7 @@ mod l2_tests {
     /// finality leaf, hence every state root, and the cache keep their bytes.
     #[test]
     fn below_the_own_target_gate_nothing_is_recorded() {
-        assert_eq!(crate::params::HF1_OWN_TARGET_VOTES_EPOCH, u64::MAX);
+        assert_eq!(crate::params::HF1_OWN_TARGET_VOTES_EPOCH, 7186);
         let split_claims::Split { a, b, .. } = split_claims::split();
         for st in [&a, &b] {
             assert_eq!(st.finality_engine.own_checkpoints().count(), 0);
@@ -3607,9 +4015,9 @@ mod l2_tests {
 
     #[test]
     fn native_claim_finality_gate_is_inert() {
-        assert_eq!(crate::params::HF1_CLAIM_FINALITY_EPOCH, u64::MAX);
-        for epoch in [0, 5_850, 10_000, u64::MAX - 1, u64::MAX] {
-            assert!(!crate::params::native_claim_finality_active(epoch));
+        assert_eq!(crate::params::HF1_CLAIM_FINALITY_EPOCH, 7180);
+        for epoch in [0, 5_850, 7_179, 7_180, 7_185, 7_186, 10_000, u64::MAX - 1, u64::MAX] {
+            assert_eq!(crate::params::native_claim_finality_active(epoch), epoch >= 7180);
         }
     }
 
@@ -3672,9 +4080,9 @@ mod l2_tests {
 
     #[test]
     fn hf1_own_target_votes_gate_is_inert() {
-        assert_eq!(crate::params::HF1_OWN_TARGET_VOTES_EPOCH, u64::MAX);
-        for epoch in [0, 5_850, 10_000, u64::MAX - 1, u64::MAX] {
-            assert!(!crate::params::own_target_votes_active(epoch));
+        assert_eq!(crate::params::HF1_OWN_TARGET_VOTES_EPOCH, 7186);
+        for epoch in [0, 5_850, 7_179, 7_180, 7_185, 7_186, 10_000, u64::MAX - 1, u64::MAX] {
+            assert_eq!(crate::params::own_target_votes_active(epoch), epoch >= 7186);
         }
     }
 

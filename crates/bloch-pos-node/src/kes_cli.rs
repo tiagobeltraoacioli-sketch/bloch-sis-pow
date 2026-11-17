@@ -17,10 +17,16 @@ keygen-next --dir DATA_DIR [--depth N]     validator.kes.next: an early successo
                                            (KesRotate, signed by its current leaf) after a restart;
                                            incident response only, the node renews on its own
 inspect  --dir DATA_DIR                    depth, root and the current period
-register --dir DATA_DIR --genesis FILE --out FILE [--validator INDEX]
+register --dir DATA_DIR --genesis FILE --out FILE [--validator INDEX] [--epoch EPOCH]
                                            the once-only registration tx (wire 0x17), signed by
                                            validator.key; send its hex with sendrawtransaction.
-                                           Consensus refuses it before HF3_KES_EPOCH
+                                           Consensus refuses it before HF3_KES_EPOCH.
+                                           --epoch is the epoch of the block that will include it.
+                                           From KES_REGISTER_EPOCH_BINDING_EPOCH on it is required
+                                           and the transaction is valid in that epoch only (16
+                                           minutes): sign for the current epoch, or the next one
+                                           near a boundary, send it at once, and sign again with a
+                                           new --out if the epoch passes before inclusion
 
 The key evolves inside the node: before signing in a new period it rewrites
 validator.kes with only that period's seed. Never keep copies of older files.
@@ -102,7 +108,13 @@ fn inspect(args: &[String]) -> Result<(), String> {
 }
 
 fn register(args: &[String]) -> Result<(), String> {
-    let o = options(args, &["--dir", "--genesis", "--out", "--validator"])?;
+    let o = options(args, &["--dir", "--genesis", "--out", "--validator", "--epoch"])?;
+    let epoch = match get(&o, "--epoch") {
+        Ok(text) => Some(text.parse::<u64>().map_err(|_| "--epoch must be the inclusion epoch")?),
+        Err(_) => None,
+    };
+    let binding = bloch_pos_committee::params::KES_REGISTER_EPOCH_BINDING_EPOCH;
+    let form = registration_form(epoch, binding)?;
     let dir = Path::new(get(&o, "--dir")?);
     let unlock = Unlock::from_env().map_err(|e| e.to_string())?;
     let keys = Keystore::load_with(dir, &unlock).map_err(|e| format!("validator.key: {e}"))?;
@@ -114,7 +126,13 @@ fn register(args: &[String]) -> Result<(), String> {
     };
     let public = key.public();
     let network = domain(get(&o, "--genesis")?)?;
-    let signature = keys.sign(&kes::register_signing_root(&network, validator, &public));
+    // The message consensus verifies in a block of the target epoch: the
+    // legacy one before the flag day, the epoch-bound one from it on.
+    let message = match form {
+        RegistrationForm::Legacy => kes::register_signing_root(&network, validator, &public),
+        RegistrationForm::EpochBound(epoch) => kes::register_signing_root_at(&network, validator, &public, epoch),
+    };
+    let signature = keys.sign(&message);
     let tx = PosTransaction::KesRegister { validator, depth: public.depth, root: public.root, signature };
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -123,11 +141,74 @@ fn register(args: &[String]) -> Result<(), String> {
     file.sync_all().map_err(|e| e.to_string())?;
     let opens = bloch_pos_committee::params::KES_REGISTRATION_EPOCH;
     println!(
-        "{{\"validator\":{validator},\"depth\":{},\"root\":\"{}\",\"network_domain\":\"{}\",\"registration_epoch\":{}}}",
+        "{{\"validator\":{validator},\"depth\":{},\"root\":\"{}\",\"network_domain\":\"{}\",\"registration_epoch\":{},\"valid_only_in_epoch\":{}}}",
         public.depth,
         codec::hex(&public.root),
         codec::hex(&network),
-        if opens == u64::MAX { "null".to_string() } else { opens.to_string() }
+        if opens == u64::MAX { "null".to_string() } else { opens.to_string() },
+        match form {
+            RegistrationForm::Legacy => "null".to_string(),
+            RegistrationForm::EpochBound(epoch) => epoch.to_string(),
+        }
     );
     Ok(())
+}
+
+/// Which registration message `register` signs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegistrationForm {
+    /// `kes::register_signing_root`: valid at any epoch before the flag day.
+    Legacy,
+    /// `kes::register_signing_root_v2` for this inclusion epoch only.
+    EpochBound(u64),
+}
+
+/// The form for a registration meant for `epoch`, under a build whose
+/// `KES_REGISTER_EPOCH_BINDING_EPOCH` is `binding`. While the flag day is
+/// unarmed, or the target epoch is before it, the legacy form (as before this
+/// flag existed). With the flag day armed the target epoch must be stated: a
+/// signature without it could only be the legacy one, which consensus refuses
+/// from the flag day on.
+fn registration_form(epoch: Option<u64>, binding: u64) -> Result<RegistrationForm, String> {
+    match epoch {
+        _ if binding == u64::MAX => Ok(RegistrationForm::Legacy),
+        Some(epoch) if epoch >= binding => Ok(RegistrationForm::EpochBound(epoch)),
+        Some(_) => Ok(RegistrationForm::Legacy),
+        None => Err(format!(
+            "pass --epoch (the epoch of the block that will include the registration): from epoch \
+             {binding} on the signature binds it and is valid in that epoch only"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_registration_form_follows_the_flag_day_and_the_target_epoch() {
+        // Unarmed (as shipped): the legacy form, with or without --epoch.
+        assert_eq!(bloch_pos_committee::params::KES_REGISTER_EPOCH_BINDING_EPOCH, u64::MAX);
+        assert_eq!(registration_form(None, u64::MAX), Ok(RegistrationForm::Legacy));
+        assert_eq!(registration_form(Some(7_360), u64::MAX), Ok(RegistrationForm::Legacy));
+        assert_eq!(registration_form(Some(u64::MAX), u64::MAX), Ok(RegistrationForm::Legacy));
+        // Armed: --epoch is required and selects the form of that epoch.
+        assert!(registration_form(None, 7_360).is_err());
+        assert_eq!(registration_form(Some(7_359), 7_360), Ok(RegistrationForm::Legacy));
+        assert_eq!(registration_form(Some(7_360), 7_360), Ok(RegistrationForm::EpochBound(7_360)));
+        assert_eq!(registration_form(Some(9_000), 7_360), Ok(RegistrationForm::EpochBound(9_000)));
+    }
+
+    #[test]
+    fn the_epoch_bound_form_signs_the_message_consensus_verifies() {
+        // While the flag day is unarmed the shared selector is the legacy
+        // message at every epoch, so the two arms of `register` agree.
+        let public = kes::KesPublic::new(12, [0x22; 32], 0);
+        for epoch in [0, 7_360, u64::MAX] {
+            assert_eq!(
+                kes::register_signing_root_at(&[0x11; 32], 7, &public, epoch),
+                kes::register_signing_root(&[0x11; 32], 7, &public)
+            );
+        }
+    }
 }

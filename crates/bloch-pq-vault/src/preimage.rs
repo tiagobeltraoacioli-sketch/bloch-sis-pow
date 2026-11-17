@@ -431,11 +431,14 @@ impl RecoveryContextV1 {
 /// Anyone given that preimage can reuse it; this function tracks no lifecycle. `vault_id` is any per-vault domain separator
 /// (e.g. the deposit outpoint, a UUID, or a monotonically increasing index) so one PQ
 /// key can guard many independent vaults with independent preimages.
+#[deprecated(note = "returns a plain copy of the recovery secret; use `derive_recovery_secret_zeroizing` (L1M-08)")]
 pub fn derive_recovery_secret(pq_sk: &[u8], vault_id: &[u8]) -> [u8; RECOVERY_SECRET_LEN] {
     *derive_recovery_secret_zeroizing(pq_sk, vault_id)
 }
 
-fn derive_recovery_secret_zeroizing(
+/// Same bytes as [`derive_recovery_secret`], in an owner that wipes `r` on
+/// drop (L1M-08). `r` must stay secret until the unvault reveals it.
+pub fn derive_recovery_secret_zeroizing(
     pq_sk: &[u8],
     vault_id: &[u8],
 ) -> zeroize::Zeroizing<[u8; RECOVERY_SECRET_LEN]> {
@@ -484,15 +487,41 @@ pub fn recovery_hash(r: &[u8]) -> [u8; 32] {
 }
 
 /// Convenience: derive `r` and return `(r, H(r))` in one call.
+#[deprecated(note = "returns a plain copy of the recovery secret; use `derive_recovery_zeroizing` (L1M-08)")]
 pub fn derive_recovery(pq_sk: &[u8], vault_id: &[u8]) -> ([u8; RECOVERY_SECRET_LEN], [u8; 32]) {
-    let r = derive_recovery_secret_zeroizing(pq_sk, vault_id);
-    let h = recovery_hash(r.as_ref());
+    let (r, h) = derive_recovery_zeroizing(pq_sk, vault_id);
     (*r, h)
 }
 
+/// Convenience: derive `r` (in a zeroizing owner) and `H(r)` in one call (L1M-08).
+pub fn derive_recovery_zeroizing(
+    pq_sk: &[u8],
+    vault_id: &[u8],
+) -> (zeroize::Zeroizing<[u8; RECOVERY_SECRET_LEN]>, [u8; 32]) {
+    let r = derive_recovery_secret_zeroizing(pq_sk, vault_id);
+    let h = recovery_hash(r.as_ref());
+    (r, h)
+}
+
 #[cfg(test)]
+// The KATs below pin the historical plain-array API byte-for-byte as well.
+#[allow(deprecated)]
 mod tests {
     use super::*;
+
+    /// L1M-08: the zeroizing variants return exactly the bytes of the
+    /// deprecated plain ones, in owners that wipe on drop.
+    #[test]
+    fn zeroizing_recovery_variants_match_the_deprecated_copies() {
+        use zeroize::Zeroize;
+        let (plain_r, plain_h) = derive_recovery(b"pq-secret-key-material-for-l1m08", b"vault-z");
+        let (mut r, h) = derive_recovery_zeroizing(b"pq-secret-key-material-for-l1m08", b"vault-z");
+        assert_eq!((*r, h), (plain_r, plain_h));
+        assert_eq!(*derive_recovery_secret_zeroizing(b"pq-secret-key-material-for-l1m08", b"vault-z"),
+            derive_recovery_secret(b"pq-secret-key-material-for-l1m08", b"vault-z"));
+        r.zeroize();
+        assert_eq!(*r, [0u8; RECOVERY_SECRET_LEN]);
+    }
 
     #[test]
     fn recovery_secret_internal_owner_is_exact_and_zeroizing() {

@@ -7,10 +7,21 @@ use super::*;
 // from the actual signing implementation, before touching its watermark.
 const ENVELOPE_BUDGET: usize = crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES;
 
+/// Bytes reserved for the proposer signature, which does not exist yet when
+/// the body is packed. From KES enforcement on a registered proposer signs
+/// with a `KES1` envelope (leaf key, leaf signature and Merkle path), which
+/// is about twice a static hybrid signature. Reserving only the static size
+/// let a full body exceed the gossip frame once signed (review VAL-3), so
+/// the larger of the two is reserved whatever the duty's signing mode: the
+/// difference is less than one vote.
+pub(super) fn proposer_signature_reserve() -> usize {
+    bloch_crypto::crypto::max_signature_len().max(bloch_pos_committee::kes::MAX_SIGNATURE_LEN)
+}
+
 pub(super) fn fit(header: &BlockHeaderV4, atts: &mut Vec<Attestation>, txs: &[PosTransaction]) -> bool {
     let base = BlockEnvelope {
         header: header.clone(),
-        proposer_sig: vec![0; bloch_crypto::crypto::max_signature_len()],
+        proposer_sig: vec![0; proposer_signature_reserve()],
         body: Body {
             transactions: txs.iter().map(PosTransaction::canonical_bytes).collect(),
             attestations: Vec::new(),
@@ -90,7 +101,7 @@ mod tests {
     fn proposal_wire_exact_codec_boundary_and_one_byte_overflow() {
         let (header, mut att, _) = fixture();
         let empty = BlockEnvelope { header: header.clone(),
-            proposer_sig: vec![0; bloch_crypto::crypto::max_signature_len()],
+            proposer_sig: vec![0; proposer_signature_reserve()],
             body: Body { attestations: Vec::new(), transactions: Vec::new() } };
         att.signature.clear();
         let mut encoded_att = Vec::new();
@@ -109,5 +120,28 @@ mod tests {
         let mut oversized = vec![att];
         assert!(fit(&header, &mut oversized, &[]));
         assert!(oversized.is_empty());
+    }
+
+    /// VAL-3: a body packed to the budget still fits the gossip frame when
+    /// the proposer signs with the largest KES envelope. Fails with the
+    /// static-size reservation: the signed envelope is over the budget.
+    #[test]
+    fn proposal_wire_reserves_room_for_a_kes_proposer_signature() {
+        let (header, att, _) = fixture();
+        let mut atts: Vec<_> = (0..MAX_ATTESTATIONS_PER_BLOCK).map(|i| {
+            let mut next = att.clone();
+            next.validator = i as u32;
+            next
+        }).collect();
+        let offered = atts.len();
+        assert!(fit(&header, &mut atts, &[]));
+        assert!(atts.len() < offered, "the fixture must fill the budget");
+        assert!(bloch_pos_committee::kes::MAX_SIGNATURE_LEN > bloch_crypto::crypto::max_signature_len());
+        for signature_bytes in [bloch_crypto::crypto::max_signature_len(), bloch_pos_committee::kes::MAX_SIGNATURE_LEN] {
+            let env = BlockEnvelope { header: header.clone(), proposer_sig: vec![0; signature_bytes],
+                body: Body { attestations: atts.clone(), transactions: Vec::new() } };
+            assert!(crate::codec::encode_envelope(&env).len() <= ENVELOPE_BUDGET,
+                "a {signature_bytes}-byte proposer signature must fit");
+        }
     }
 }

@@ -14,7 +14,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"sync/atomic"
 	"time"
 )
@@ -31,6 +33,10 @@ type Client struct {
 	HTTPClient *http.Client
 	Headers    map[string]string
 	id         int64
+
+	// AllowInsecureHTTP permits sending APIKey over plain http:// to a
+	// non-loopback host (L1M-18). Leave it false.
+	AllowInsecureHTTP bool
 }
 
 // New returns a Client pointed at url (empty = DefaultRPCURL) with a 30s timeout.
@@ -39,6 +45,27 @@ func New(url string) *Client {
 		url = DefaultRPCURL
 	}
 	return &Client{URL: url, HTTPClient: &http.Client{Timeout: 30 * time.Second}}
+}
+
+// checkKeyTransport refuses to send an API key over plaintext http:// to a
+// host that is not loopback (L1M-18).
+func checkKeyTransport(rawURL string, allowInsecure bool) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid RPC URL: %v", err)
+	}
+	if u.Scheme == "https" || allowInsecure || isLoopbackHost(u.Hostname()) {
+		return nil
+	}
+	return fmt.Errorf("refusing to send the API key over %s:// to non-loopback host %q; use https or set AllowInsecureHTTP", u.Scheme, u.Hostname())
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 type rpcRequest struct {
@@ -81,6 +108,9 @@ func (c *Client) Call(method string, params []interface{}, out interface{}) erro
 		req.Header.Set(k, v)
 	}
 	if c.APIKey != "" {
+		if err := checkKeyTransport(c.URL, c.AllowInsecureHTTP); err != nil {
+			return &TransportError{Method: method, Message: err.Error()}
+		}
 		if c.Bearer {
 			req.Header.Set("Authorization", "Bearer "+c.APIKey)
 		} else {
@@ -91,11 +121,23 @@ func (c *Client) Call(method string, params []interface{}, out interface{}) erro
 	if hc == nil {
 		hc = http.DefaultClient
 	}
+	if c.APIKey != "" {
+		// L1M-18: never follow a redirect with the key attached (Go only strips
+		// Authorization/Cookie on a cross-host redirect, not X-API-Key).
+		noRedirect := *hc
+		noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		hc = &noRedirect
+	}
 	resp, err := hc.Do(req)
 	if err != nil {
 		return &TransportError{Method: method, Message: fmt.Sprintf("transport error: %v", err)}
 	}
 	defer resp.Body.Close()
+	if c.APIKey != "" && resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return &TransportError{Method: method, HTTPStatus: resp.StatusCode, Message: "redirect refused: the API key is not forwarded"}
+	}
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return &TransportError{Method: method, HTTPStatus: resp.StatusCode, Message: fmt.Sprintf("read body: %v", err)}

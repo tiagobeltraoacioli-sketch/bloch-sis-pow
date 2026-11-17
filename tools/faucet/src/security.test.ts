@@ -6,12 +6,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 
-import { loadConfig } from "./config.js";
+import { loadConfig, parseTrustedProxies } from "./config.js";
 import { RpcClient, StubTransport, parseSats } from "./rpc.js";
-import { StubSigner } from "./signer.js";
+import { StubSigner, ExternalCommandSigner, parseSignerCommand } from "./signer.js";
 import { Faucet } from "./faucet.js";
 import { RateLimiter } from "./ratelimit.js";
-import { createFaucetServer } from "./server.js";
+import { createFaucetServer, clientIpFrom } from "./server.js";
 import { encodeAddress } from "./address.js";
 import { parseJsonExactIntegers, assertJsonSourceAccessAvailable, MAX_SATS } from "./sats.js";
 
@@ -178,4 +178,78 @@ test("LG-05: cross-site and form-shaped submissions cannot dispense funds", asyn
     const r = await fetch(`${base}/api/faucet`, { method: "POST", headers: { "content-type": "application/json", "sec-fetch-site": "cross-site" }, body: JSON.stringify({ address }) });
     assert.equal(r.status, 403);
   });
+});
+
+// ── L1M-02: X-Forwarded-For is read from the right, only from trusted peers ──
+
+test("L1M-02: a forged left-most XFF entry never becomes the client IP", () => {
+  const trusted = ["127.0.0.1"];
+  // nginx `$proxy_add_x_forwarded_for` appends the real peer to whatever the client sent.
+  assert.equal(clientIpFrom("127.0.0.1", "6.6.6.6, 203.0.113.7", trusted), "203.0.113.7");
+  assert.equal(clientIpFrom("127.0.0.1", "1.1.1.1, 2.2.2.2, 203.0.113.7", trusted), "203.0.113.7");
+  // IPv4-mapped peer address is normalised before the trust check.
+  assert.equal(clientIpFrom("::ffff:127.0.0.1", "9.9.9.9, 203.0.113.7", trusted), "203.0.113.7");
+  // multiple trusted hops are skipped from the right
+  assert.equal(clientIpFrom("10.0.0.2", "6.6.6.6, 203.0.113.7, 10.0.0.1", ["10.0.0.1", "10.0.0.2"]), "203.0.113.7");
+  // multiple header lines are joined in order
+  assert.equal(clientIpFrom("127.0.0.1", ["6.6.6.6", "203.0.113.7"], trusted), "203.0.113.7");
+});
+
+test("L1M-02: XFF from an untrusted peer, or a malformed chain, charges the TCP peer", () => {
+  assert.equal(clientIpFrom("198.51.100.9", "6.6.6.6", ["127.0.0.1"]), "198.51.100.9");
+  assert.equal(clientIpFrom("198.51.100.9", "6.6.6.6", []), "198.51.100.9");
+  assert.equal(clientIpFrom("127.0.0.1", undefined, ["127.0.0.1"]), "127.0.0.1");
+  assert.equal(clientIpFrom("127.0.0.1", "127.0.0.1", ["127.0.0.1"]), "127.0.0.1");
+  assert.equal(clientIpFrom("127.0.0.1", "6.6.6.6, not-an-ip", ["127.0.0.1"]), "127.0.0.1");
+});
+
+test("L1M-02: trusted-proxy list parsing fails closed and keeps the legacy switch", () => {
+  assert.deepEqual(parseTrustedProxies(undefined, undefined), []);
+  assert.deepEqual(parseTrustedProxies(" 10.0.0.1 ,::FFFF:10.0.0.2", undefined), ["10.0.0.1", "10.0.0.2"]);
+  assert.deepEqual(parseTrustedProxies(undefined, "1").sort(), ["127.0.0.1", "::1"].sort());
+  assert.throws(() => parseTrustedProxies("proxy.example", undefined));
+  assert.throws(() => parseTrustedProxies("10.0.0.0/8", undefined));
+});
+
+test("L1M-02: rotating a forged XFF through a trusted proxy cannot reset the per-IP cap", async () => {
+  const cfg = { ...baseCfg(), trustedProxies: ["127.0.0.1"] };
+  const rpc = new RpcClient(new StubTransport(cfg.fundingAddress));
+  const faucet = new Faucet(cfg, rpc, new StubSigner());
+  const limiter = new RateLimiter(cfg.perAddressWindowMs, cfg.perIpWindowMs, 1);
+  const server = createFaucetServer(cfg, faucet, limiter);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  if (addr === null || typeof addr === "string") throw new Error("expected an AddressInfo");
+  const post = (forged: string) =>
+    fetch(`http://127.0.0.1:${addr.port}/api/faucet`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-forwarded-for": `${forged}, 203.0.113.7` },
+      body: JSON.stringify({ address: encodeAddress(randomBytes(20), "testnet") }),
+    });
+  try {
+    const first = await post("1.1.1.1");
+    const second = await post("2.2.2.2");
+    assert.notEqual(first.status, 429, "first request is under the cap");
+    assert.equal(second.status, 429, "a new forged left-most XFF value must not open a new bucket");
+  } finally {
+    server.close();
+  }
+});
+
+// ── L1M-13: the external signer is executed as argv, never through a shell ──
+
+test("L1M-13: signer command parsing refuses shell syntax and accepts argv forms", () => {
+  assert.deepEqual(parseSignerCommand("bloch-wallet faucet-sign"), ["bloch-wallet", "faucet-sign"]);
+  assert.deepEqual(parseSignerCommand('["/opt/x y/signer","--a b"]'), ["/opt/x y/signer", "--a b"]);
+  for (const bad of ["signer; rm -rf /", "signer | tee x", "signer $(id)", "signer > out", "'quoted'", "[]", "[1]", "   "]) {
+    assert.throws(() => parseSignerCommand(bad), `must refuse ${JSON.stringify(bad)}`);
+  }
+});
+
+test("L1M-13: a metacharacter inside a JSON argv element is passed literally, not interpreted", async () => {
+  const signer = new ExternalCommandSigner(JSON.stringify([process.execPath, "-e",
+    "process.stdout.write(JSON.stringify({rawHex: Buffer.from(process.argv[1]).toString('hex')}))", "a;b|c"]));
+  const res = await signer.buildSignedPayment({ network: "testnet", toAddress: "", amountSats: 0, feeSats: 0,
+    changeAddress: "", fundingAddress: "", selectedUtxos: [] });
+  assert.equal(Buffer.from(res.rawHex, "hex").toString(), "a;b|c");
 });

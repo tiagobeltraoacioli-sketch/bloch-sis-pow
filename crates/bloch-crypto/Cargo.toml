@@ -86,7 +86,8 @@ pqcrypto-internals = "0.2"
 # Pinned exact like the other PQ primitives. Only the one parameter set is
 # compiled and no default features (no getrandom 0.2): opt_rand is drawn from
 # the workspace rand 0.9 RNG. Consensus acceptance is gated by
-# crypto::HF3_SLH_SUITE_EPOCH (u64::MAX = never).
+# bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH, which is ARMED (7360):
+# from that epoch this is consensus-verifier code.
 fips205   = { version = "=0.4.1", default-features = false, features = ["slh_dsa_shake_128s"] }
 # rand_core 0.6 trait only (fips205's RNG interface); no OS-RNG features.
 rand_core = { version = "0.6.4", default-features = false }

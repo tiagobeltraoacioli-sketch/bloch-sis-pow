@@ -9,15 +9,72 @@
 //! `start_period + i` (`bloch_pos_committee::kes::KesPublic::leaf_index`), and
 //! the node maps one to the other from committed state. [`KesKey::evolve_to`]
 //! writes the evolved state to disk (temp file, fsync, rename) **before** the
-//! caller signs anything with the new leaf, then replaces it in memory. Once
-//! that rename lands, no earlier seed exists anywhere this node wrote it, so
-//! nothing it holds can sign an earlier period — the long-range property.
-//! Operators must not keep older copies of this file: a backup of an earlier
-//! state is an earlier seed.
+//! caller signs anything with the new leaf, then replaces it in memory.
+//!
+//! What "erased" means (review CR-7). Once the rename lands the file NAME
+//! holds only the current seed, and the node then overwrites the replaced
+//! file's contents in place with zeros, through a descriptor it opened before
+//! the rename, and fsyncs ([`overwrite_replaced`]). On a file system that
+//! writes data in place (ext4 and XFS in their default modes) on a medium
+//! that does not remap writes, the earlier sealed seed is then gone from the
+//! blocks this node wrote it to, so the disk alone, or the disk plus the
+//! passphrase, no longer yields a seed of a past period. That is the
+//! long-range property, and it is best effort below the file system:
+//!
+//! - a copy-on-write or log-structured file system (btrfs, ZFS, APFS, F2FS),
+//!   a data-journaling mount (`data=journal`), an LVM/ZFS/cloud snapshot, or
+//!   an SSD's flash translation layer can keep the old blocks until they are
+//!   garbage-collected or trimmed; the overwrite cannot reach them;
+//! - a crash between the rename and the overwrite's fsync leaves the old
+//!   blocks released but not overwritten;
+//! - a key file the operator made read-only (0400) is still replaced, but
+//!   its old contents cannot be overwritten by this process (review V1-5;
+//!   the node says so); keep the mode the node wrote, 0600;
+//! - a backup of an earlier state is an earlier seed: operators must not
+//!   keep older copies of this file, and keep KES data dirs out of snapshots.
+//!
+//! The sealing key is not ratcheted per period, on purpose. After a restart
+//! the node has only the passphrase and the file, so whatever opens the
+//! current file must be derivable from the two; any per-period key would
+//! have to be stored wrapped under the passphrase-derived key beside the
+//! ciphertext, and someone holding the passphrase and an old ciphertext
+//! would hold the old wrapped key too. Against that attacker a ratchet
+//! reduces to erasing the old file, which is what the overwrite does;
+//! without the passphrase the sealing already protects every generation.
+//! With `--allow-plaintext-keystore` there is no sealing and the overwrite
+//! is the only protection of past seeds.
 //!
 //! Rotation (HF3): the successor tree is generated in the background and
 //! sealed as `validator.kes.next` ([`NEXT_FILE_NAME`]); once the chain makes
-//! it the key in force, [`promote_next`] swaps it in and shreds the old file.
+//! it the key in force, [`promote_next`] swaps it in and the replaced key
+//! becomes `validator.kes.retired` ([`RETIRED_FILE_NAME`]).
+//!
+//! The replaced key is NOT destroyed at the swap (review PER-1). The swap
+//! follows the head state, which is not final: if the block that carried the
+//! `KesRotate` is reorganized out, the chain names the old tree as the key
+//! in force again, and a node that had destroyed it could not sign, could
+//! not rotate again (a rotation is signed by the old tree's current leaf)
+//! and could not be rescued by the static key until the old tree expired.
+//! So the replaced key is kept until this node's finalized checkpoint
+//! reaches the successor's first epoch (the including block is then an
+//! ancestor of a finalized block, and the node does not reorganize below
+//! its finality), or until the old tree has expired, and is shredded then.
+//! If the handover is reorganized out first, [`demote_promoted`] puts it
+//! back.
+//!
+//! What forward security means while it is kept: the retired file is evolved
+//! exactly like the key in force ([`KesKey::evolve_retired_to`]: at the swap
+//! to the old tree's leaf for the handover period, then once per period), so
+//! it never holds a seed for a period before the handover and, on a node
+//! that is running and at the head, none for a period before the current
+//! one. Every seed the old key had erased stays erased. What remains on disk
+//! until finality is the old tree's seed for the current and later periods:
+//! the seed this node would hold anyway had the rotation not been included.
+//! A signature made with it is valid only on a chain that does not contain
+//! the rotation; where the rotation stands, consensus judges those periods
+//! by the successor. The cost is that a host compromised between the swap
+//! and its finality (normally two to three epochs) yields that seed as well
+//! as the successor's; before this change it yielded the successor's alone.
 //!
 //! ```text
 //! BPOSKES2 (sealed):    magic ‖ kdf id ‖ m t p ‖ salt ‖ nonce ‖ index ‖ depth ‖ root ‖ leaves  [AAD]
@@ -34,15 +91,18 @@ use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use zeroize::Zeroizing;
 
-use crate::keys::{os_random, read_keystore_file, KdfParams, Unlock, KDF_ARGON2ID};
+use crate::keys::{
+    abort_on_signer_fault, os_random, read_keystore_file, sign_verified_released, KdfParams, SignerFault, Unlock,
+    KDF_ARGON2ID,
+};
 
 const MAGIC_PLAIN: &[u8; 8] = b"BPOSKES1";
 const MAGIC_SEALED: &[u8; 8] = b"BPOSKES2";
 pub const FILE_NAME: &str = "validator.kes";
 /// The rotated-in successor, written before its `KesRotate` is submitted.
 pub const NEXT_FILE_NAME: &str = "validator.kes.next";
-/// The replaced key during a swap; shredded right after (and at startup if
-/// a crash interrupted the swap).
+/// The replaced key after a swap, kept until the handover is final (see the
+/// module doc, "Rotation").
 pub const RETIRED_FILE_NAME: &str = "validator.kes.retired";
 
 pub struct KesKey {
@@ -134,9 +194,22 @@ impl KesKey {
         dir.join(NEXT_FILE_NAME)
     }
 
-    /// Move to leaf `period`, erasing every earlier seed — on disk first,
-    /// then in memory. Refuses to go back and refuses past the last leaf.
+    /// Move to leaf `period`, erasing every earlier seed — on disk first
+    /// (new state durable under the file name, then the replaced file's
+    /// contents overwritten in place; see the module doc for what that
+    /// guarantees), then in memory. Refuses to go back and refuses past the
+    /// last leaf.
     pub fn evolve_to(&mut self, dir: &Path, unlock: &Unlock, period: u64) -> io::Result<()> {
+        self.evolve_named(dir, unlock, period, FILE_NAME)
+    }
+
+    /// [`Self::evolve_to`] for the replaced key kept as
+    /// `validator.kes.retired`: same erasure, in its own file.
+    pub fn evolve_retired_to(&mut self, dir: &Path, unlock: &Unlock, period: u64) -> io::Result<()> {
+        self.evolve_named(dir, unlock, period, RETIRED_FILE_NAME)
+    }
+
+    fn evolve_named(&mut self, dir: &Path, unlock: &Unlock, period: u64, name: &str) -> io::Result<()> {
         if period < self.period {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -162,7 +235,7 @@ impl KesKey {
             seal: std::cell::RefCell::new(self.seal.borrow().clone()),
             leaf: Default::default(),
         };
-        next.save_named(dir, unlock, FILE_NAME)?;
+        next.save_named(dir, unlock, name)?;
         *self = next;
         Ok(())
     }
@@ -170,7 +243,30 @@ impl KesKey {
     /// Sign `message` — the bound `kes::leaf_message`, never a bare consensus
     /// root — with the current period's leaf (encoded `kes::KesSignature`).
     /// The caller evolves first.
+    ///
+    /// Released through the same hardening as the static key
+    /// (`keys::sign_verified_released`, p9e finding 2): the leaf signature is
+    /// verified under the leaf public key, with the verifier the network
+    /// applies (`HybridVerifier::verify_kes_leaf`), before it leaves the
+    /// process; a signature that does not verify is withheld and signing is
+    /// retried with fresh randomness; a signer that keeps failing aborts the
+    /// process; and the latency floor applies. The leaf key is also checked
+    /// against the tree before the secret is exercised.
     pub fn sign(&self, message: &[u8; 32]) -> io::Result<Vec<u8>> {
+        match self.sign_with(message, bloch_crypto::crypto::sign_bound)? {
+            Ok(signature) => Ok(signature),
+            Err(SignerFault) => abort_on_signer_fault(self.index, "the KES leaf public key"),
+        }
+    }
+
+    /// [`Self::sign`] with an explicit leaf signer. The outer `Err` is a
+    /// condition under which the key was never exercised; the inner one is a
+    /// signer whose every attempt failed verification (nothing released).
+    fn sign_with(
+        &self,
+        message: &[u8; 32],
+        sign_fn: impl Fn(&[u8], &[u8]) -> Result<Vec<u8>, bloch_crypto::crypto::CryptoError>,
+    ) -> io::Result<Result<Vec<u8>, SignerFault>> {
         let cached = self.leaf.borrow().as_ref().filter(|(leaf, _, _)| *leaf == self.period).map(|(_, pk, sk)| (pk.clone(), Zeroizing::new(sk.to_vec())));
         let (leaf_pk, sk) = match cached {
             Some(pair) => pair,
@@ -180,12 +276,25 @@ impl KesKey {
                 (pk, sk)
             }
         };
+        let index = u32::try_from(self.period).map_err(|_| bad("KES period exceeds u32"))?;
+        // The Merkle half of `kes::verify`: the leaf key must be the tree's
+        // leaf for this period. `leaves` hash to the registered root (checked
+        // at load) and the authentication path is computed from them, so this
+        // is the same condition. A seed that does not belong to the tree is
+        // not a transient fault: refuse without signing, do not retry.
+        if self.leaves.get(self.period as usize) != Some(&kes::leaf_hash(&leaf_pk)) {
+            return Err(bad("KES leaf key does not match the tree at this period; nothing signed"));
+        }
         // Canonical, suite-bound v2 form (review F-1), matching
         // `HybridVerifier::verify_kes_leaf`.
-        let sig = bloch_crypto::crypto::sign_bound(&sk, message)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("KES leaf signing: {e:?}")))?;
-        let index = u32::try_from(self.period).map_err(|_| bad("KES period exceeds u32"))?;
-        Ok(KesSignature { index, leaf_pk, sig, path: kes::auth_path(&self.leaves, self.period as usize) }.encode())
+        let released = sign_verified_released(self.index, &sk, &leaf_pk, message, sign_fn, |pk, m, s| {
+            bloch_crypto::crypto::verify_bound(pk, m, s)
+        });
+        let sig = match released {
+            Ok(sig) => sig,
+            Err(fault) => return Ok(Err(fault)),
+        };
+        Ok(Ok(KesSignature { index, leaf_pk, sig, path: kes::auth_path(&self.leaves, self.period as usize) }.encode()))
     }
 
     fn public_header(&self, out: &mut Vec<u8>) {
@@ -256,21 +365,63 @@ impl KesKey {
         }
         fs::create_dir_all(dir)?;
         let path = dir.join(name);
-        let tmp = dir.join(format!("{name}.tmp"));
+        // Review R-10: a staging file left by a process killed mid-write
+        // holds a seed (after an evolution, one of a period that must be
+        // gone). Destroy any such leftover of this name before writing.
+        scrub_stale_staging(dir, name);
+        // Audit L1-07: an exclusive (`create_new`, 0600 from creation,
+        // never following a planted symlink) staging file under a fresh
+        // name, never the predictable `<name>.tmp` another local account
+        // could pre-create with a looser mode or point elsewhere.
+        let mut staging = crate::store::PrivateStagingFile::create_for(&path)?;
         {
             use std::io::Write;
-            #[cfg(unix)]
-            let mut f = {
-                use std::os::unix::fs::OpenOptionsExt;
-                fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?
-            };
-            #[cfg(not(unix))]
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(&out)?;
-            f.sync_all()?;
+            if let Err(e) = staging.file_mut().write_all(&out).and_then(|()| staging.file_mut().sync_all()) {
+                // Never leave a partly written seed behind: zero it, then
+                // the staging guard unlinks it.
+                scrub_stale_staging(dir, name);
+                return Err(e);
+            }
         }
-        fs::rename(&tmp, &path)?;
-        fs::File::open(dir)?.sync_all()?;
+        // The file this write replaces, if any, held open across the rename
+        // so its contents can be overwritten afterwards (review CR-7): a
+        // rename only drops the name, and the old inode's blocks would be
+        // released with an earlier seed still in them.
+        // Unix only: elsewhere an open handle can make the rename itself
+        // fail, and the atomic replace matters more than the overwrite.
+        //
+        // The node writes this file 0600. An operator who made it read-only
+        // (0400) must not thereby stop the key from evolving (review V1-5):
+        // the rename needs only the directory, and staying on an old period
+        // is worse than one inode this process cannot overwrite. That case
+        // is reported and the rename goes ahead.
+        #[cfg(unix)]
+        let replaced = match fs::OpenOptions::new().write(true).open(&path) {
+            Ok(f) => Some(f),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "KES WARNING: {} is not writable by this node ({e}); it is replaced, but its old \
+                     contents (an earlier seed) could NOT be overwritten in place. Keep the file mode 0600.",
+                    path.display()
+                );
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        #[cfg(not(unix))]
+        let replaced: Option<fs::File> = None;
+        // fsync of the file, rename, fsync of the directory. A failed
+        // rename leaves the staging file: zero it before the guard unlinks.
+        if let Err(e) = staging.publish(&path) {
+            scrub_stale_staging(dir, name);
+            return Err(e);
+        }
+        // Only now: the new state is durable under the name, so a crash
+        // during the overwrite cannot leave the node without a key.
+        if let Some(old) = replaced {
+            overwrite_replaced(old)?;
+        }
         Ok(())
     }
 
@@ -282,6 +433,11 @@ impl KesKey {
     /// `Ok(None)` iff `dir/validator.kes.next` does not exist.
     pub fn load_next(dir: &Path, unlock: &Unlock) -> io::Result<Option<KesKey>> {
         Self::load_path(&Self::next_path(dir), unlock)
+    }
+
+    /// `Ok(None)` iff `dir/validator.kes.retired` does not exist.
+    pub fn load_retired(dir: &Path, unlock: &Unlock) -> io::Result<Option<KesKey>> {
+        Self::load_path(&dir.join(RETIRED_FILE_NAME), unlock)
     }
 
     fn load_path(path: &Path, unlock: &Unlock) -> io::Result<Option<KesKey>> {
@@ -384,10 +540,36 @@ impl KesKey {
     }
 }
 
+/// Overwrite, in place, the contents of a file whose name has just been
+/// renamed over, through the descriptor opened before the rename, and fsync.
+/// Best effort against recovery from the file system, with the same limits
+/// as [`shred`]: a copy-on-write, log-structured or data-journaling file
+/// system, a snapshot, or a remapping medium (SSD) may still hold the old
+/// blocks, and a crash before the fsync leaves them released but intact.
+fn overwrite_replaced(mut old: fs::File) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut left = old.metadata()?.len();
+    old.seek(SeekFrom::Start(0))?;
+    let zeros = [0u8; 4096];
+    while left > 0 {
+        let n = left.min(zeros.len() as u64) as usize;
+        old.write_all(&zeros[..n])?;
+        left -= n as u64;
+    }
+    old.sync_all()
+}
+
 /// Overwrite `path` with zeros, fsync, and remove it. Best effort against
 /// recovery from the file system; a copy-on-write or journaled medium may
 /// still hold old blocks, which is why operators keep KES data dirs out of
 /// snapshots (docs/KES-MAINNET-READINESS.md §6).
+///
+/// A file the operator made read-only (0400; a rename keeps the mode, so a
+/// read-only `validator.kes` becomes a read-only `validator.kes.retired`)
+/// is still destroyed (review W2-3, as V1-5 for evolution): the owner's
+/// write bit is restored for the overwrite, and when even that is refused
+/// the file is unlinked without it and the node says so. Removing the name
+/// needs only the directory.
 pub fn shred(path: &Path) -> io::Result<()> {
     use std::io::Write;
     let len = match fs::metadata(path) {
@@ -395,10 +577,29 @@ pub fn shred(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    {
-        let mut f = fs::OpenOptions::new().write(true).open(path)?;
-        f.write_all(&vec![0u8; len as usize])?;
-        f.sync_all()?;
+    let open = || fs::OpenOptions::new().write(true).open(path);
+    let opened = match open() {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+            }
+            open()
+        }
+        opened => opened,
+    };
+    match opened {
+        Ok(mut f) => {
+            f.write_all(&vec![0u8; len as usize])?;
+            f.sync_all()?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => eprintln!(
+            "KES WARNING: {} is not writable by this node ({e}); it is removed, but its contents \
+             (an earlier seed) could NOT be overwritten in place. Keep the file mode 0600.",
+            path.display()
+        ),
+        Err(e) => return Err(e),
     }
     fs::remove_file(path)?;
     if let Some(dir) = path.parent() {
@@ -408,10 +609,16 @@ pub fn shred(path: &Path) -> io::Result<()> {
 }
 
 /// Make the rotation successor the key: `validator.kes` →
-/// `validator.kes.retired`, `validator.kes.next` → `validator.kes`, then
-/// shred the retired file. Each rename is atomic, so a crash leaves either
-/// the old key in place with the successor beside it, or the successor in
-/// place with a retired file that [`finish_interrupted_rotation`] shreds.
+/// `validator.kes.retired`, `validator.kes.next` → `validator.kes`. The
+/// retired file is kept (review PER-1; see the module doc) until
+/// [`shred_retired`]. Each rename is atomic, so a crash leaves either the
+/// old key in place with the successor beside it, or the successor in place
+/// with the retired file, or (between the renames) no `validator.kes`, which
+/// [`finish_interrupted_rotation`] completes. A retired file left by an
+/// earlier rotation is shredded first: one replaced key is kept, not a
+/// history. If that shred fails the swap still goes ahead (review W2-3): the
+/// rename replaces the earlier retired file's name, and a key that could not
+/// be destroyed must never keep the key in force from signing.
 pub fn promote_next(dir: &Path) -> io::Result<()> {
     let current = dir.join(FILE_NAME);
     let next = dir.join(NEXT_FILE_NAME);
@@ -420,18 +627,97 @@ pub fn promote_next(dir: &Path) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::NotFound, "no validator.kes.next to promote"));
     }
     if current.exists() {
+        if let Err(e) = shred(&retired) {
+            eprintln!(
+                "KES WARNING: could not destroy the earlier {RETIRED_FILE_NAME} ({e}); it is \
+                 replaced by name, but its contents (an older key's seed) were NOT overwritten."
+            );
+        }
         fs::rename(&current, &retired)?;
     }
     fs::rename(&next, &current)?;
-    fs::File::open(dir)?.sync_all()?;
-    shred(&retired)
+    fs::File::open(dir)?.sync_all()
 }
 
-/// Startup: a swap interrupted after its renames leaves
-/// `validator.kes.retired`; shred it. A swap interrupted between the renames
-/// leaves `validator.kes.next` and `validator.kes.retired` but no
-/// `validator.kes`: finish it.
+/// Undo [`promote_next`] after the handover was reorganized out:
+/// `validator.kes` → `validator.kes.next`, `validator.kes.retired` →
+/// `validator.kes`. A crash between the renames leaves the same files as a
+/// crash inside `promote_next`; startup completes that to the promoted
+/// layout and the node demotes again when the chain still says so.
+pub fn demote_promoted(dir: &Path) -> io::Result<()> {
+    let current = dir.join(FILE_NAME);
+    let next = dir.join(NEXT_FILE_NAME);
+    let retired = dir.join(RETIRED_FILE_NAME);
+    if !retired.exists() || !current.exists() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "no retired KES key to put back"));
+    }
+    if next.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "validator.kes.next exists; refusing to overwrite a sealed successor",
+        ));
+    }
+    fs::rename(&current, &next)?;
+    fs::rename(&retired, &current)?;
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Destroy the replaced key once its handover is final (or it has expired).
+pub fn shred_retired(dir: &Path) -> io::Result<()> {
+    shred(&dir.join(RETIRED_FILE_NAME))
+}
+
+/// Destroy every leftover staging file of `name` in `dir`
+/// (`<name>.write-<pid>-<n>.tmp`, the names `PrivateStagingFile` creates):
+/// a regular file is overwritten with zeros through a descriptor opened
+/// without following links, fsynced and unlinked; anything else under such
+/// a name (a planted symlink) is only unlinked, never written through.
+/// Best effort, with the limits of [`shred`]; failures are reported and do
+/// not stop the caller. Called at startup and around every write of `name`,
+/// which this process performs from one thread at a time, so a file found
+/// here is never a write in flight (review R-10).
+pub fn scrub_stale_staging(dir: &Path, name: &str) {
+    let prefix = format!("{name}.write-");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(text) = file_name.to_str() else { continue };
+        if !text.starts_with(&prefix) || !text.ends_with(".tmp") {
+            continue;
+        }
+        let path = entry.path();
+        let regular = fs::symlink_metadata(&path).map(|meta| meta.file_type().is_file()).unwrap_or(false);
+        if regular {
+            let mut options = fs::OpenOptions::new();
+            options.write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            if let Err(e) = options.open(&path).and_then(overwrite_replaced) {
+                eprintln!("KES WARNING: could not overwrite the leftover staging file {}: {e}", path.display());
+            }
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("KES WARNING: could not remove the leftover staging file {}: {e}", path.display()),
+        }
+    }
+}
+
+/// Startup: a swap interrupted between its renames leaves
+/// `validator.kes.next` and `validator.kes.retired` but no `validator.kes`:
+/// finish it. A `validator.kes.retired` beside `validator.kes` is the
+/// replaced key awaiting finality and is left for the node to load.
 pub fn finish_interrupted_rotation(dir: &Path) -> io::Result<()> {
+    // Review R-10: staging files a killed process left behind hold seeds.
+    for name in [FILE_NAME, NEXT_FILE_NAME, RETIRED_FILE_NAME] {
+        scrub_stale_staging(dir, name);
+    }
     let current = dir.join(FILE_NAME);
     let next = dir.join(NEXT_FILE_NAME);
     let retired = dir.join(RETIRED_FILE_NAME);
@@ -439,7 +725,7 @@ pub fn finish_interrupted_rotation(dir: &Path) -> io::Result<()> {
         fs::rename(&next, &current)?;
         fs::File::open(dir)?.sync_all()?;
     }
-    shred(&retired)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -456,6 +742,80 @@ mod tests {
 
     fn quick() -> Unlock {
         Unlock::passphrase_with("kes-test-passphrase-2026", KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 })
+    }
+
+    /// Audit L1-07: a `validator.kes.tmp` planted by another local account
+    /// (a symlink to a file it can read, or a world-readable file) is never
+    /// opened: the seed is not written through it, the symlink target is
+    /// untouched, and the key file the next boot loads is 0600.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_staging_name_is_never_written_through() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tmp("planted-staging");
+        let elsewhere = dir.join("attacker-readable");
+        fs::write(&elsewhere, b"untouched").unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&elsewhere, dir.join(format!("{FILE_NAME}.tmp"))).unwrap();
+        let next_tmp = dir.join(format!("{NEXT_FILE_NAME}.tmp"));
+        fs::write(&next_tmp, b"planted").unwrap();
+        fs::set_permissions(&next_tmp, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let key = KesKey::generate(4, 1, |_| {}).unwrap();
+        key.save(&dir, &Unlock::PlaintextOptIn).unwrap();
+        key.save_next(&dir, &Unlock::PlaintextOptIn).unwrap();
+
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"untouched", "the symlink target holds no seed");
+        assert_eq!(fs::read(&next_tmp).unwrap(), b"planted");
+        for name in [FILE_NAME, NEXT_FILE_NAME] {
+            let meta = fs::symlink_metadata(dir.join(name)).unwrap();
+            assert!(meta.file_type().is_file(), "{name} is a regular file, not the planted link");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{name}");
+        }
+        assert_eq!(
+            KesKey::load_optional(&dir, &Unlock::PlaintextOptIn).unwrap().unwrap().public().root,
+            key.public().root
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Review R-10: a staging file left by a killed writer (it holds a seed)
+    /// is zeroed and removed by the next write of that name and at startup;
+    /// a symlink planted under such a name is unlinked, never written
+    /// through; unrelated files are untouched.
+    #[cfg(unix)]
+    #[test]
+    fn leftover_staging_files_are_zeroed_and_removed() {
+        use std::os::unix::fs::symlink;
+        let dir = tmp("stale-staging");
+        let key = KesKey::generate(4, 1, |_| {}).unwrap();
+        key.save(&dir, &Unlock::PlaintextOptIn).unwrap();
+        let leftover = dir.join(format!("{FILE_NAME}.write-4242-7.tmp"));
+        fs::write(&leftover, b"a seed a killed process left behind").unwrap();
+        // A hard link lets the test read what the scrub did to the inode.
+        let witness = dir.join("witness");
+        fs::hard_link(&leftover, &witness).unwrap();
+        let elsewhere = dir.join("elsewhere");
+        fs::write(&elsewhere, b"untouched").unwrap();
+        let planted = dir.join(format!("{FILE_NAME}.write-4242-8.tmp"));
+        symlink(&elsewhere, &planted).unwrap();
+        let next_leftover = dir.join(format!("{NEXT_FILE_NAME}.write-4242-9.tmp"));
+        fs::write(&next_leftover, b"another seed").unwrap();
+
+        key.save(&dir, &Unlock::PlaintextOptIn).unwrap();
+        assert!(!leftover.exists(), "removed by the next write of that name");
+        assert!(fs::read(&witness).unwrap().iter().all(|b| *b == 0), "and zeroed first");
+        assert!(fs::symlink_metadata(&planted).is_err(), "the planted link is unlinked");
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"untouched", "and never written through");
+        assert!(next_leftover.exists(), "another name's staging is not this write's to touch");
+
+        finish_interrupted_rotation(&dir).unwrap();
+        assert!(!next_leftover.exists(), "startup scrubs every KES name");
+        let staging_left = fs::read_dir(&dir).unwrap().flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).count();
+        assert_eq!(staging_left, 0);
+        assert!(KesKey::load_optional(&dir, &Unlock::PlaintextOptIn).unwrap().is_some(), "the key itself is intact");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// HF2 x HF3 integration (review F-1): a KES leaf signature must verify
@@ -501,6 +861,42 @@ mod tests {
         assert!(inner.verify_kes_leaf(&decoded.leaf_pk, &root, &decoded.sig));
     }
 
+    /// CR-6: a KES duty signature goes through verify-before-release. A leaf
+    /// signer whose output does not verify under the leaf key releases
+    /// nothing (production then aborts), and a seed that is not the tree's is
+    /// refused before the key is exercised.
+    #[test]
+    fn a_faulted_leaf_signature_is_withheld_and_a_foreign_seed_is_never_exercised() {
+        let key = KesKey::generate(4, 1, |_| {}).unwrap();
+        let root = [0x33u8; 32];
+        let attempts = std::cell::Cell::new(0u32);
+        let faulted = |sk: &[u8], m: &[u8]| {
+            attempts.set(attempts.get() + 1);
+            let mut sig = bloch_crypto::crypto::sign_bound(sk, m)?;
+            let last = sig.len() - 1;
+            sig[last] ^= 1;
+            Ok(sig)
+        };
+        assert!(key.sign_with(&root, faulted).unwrap().is_err(), "a faulted leaf signature must be withheld");
+        assert_eq!(attempts.get(), crate::keys::SIGN_VERIFY_ATTEMPTS);
+        // A signer in the wrong form (v1) is withheld by the same check.
+        assert!(key.sign_with(&root, bloch_crypto::crypto::sign).unwrap().is_err());
+        // The honest signer is released and is what the network accepts.
+        let sig = key.sign(&root).unwrap();
+        assert!(kes::verify(&HybridVerifier::new(), &key.public(), 0, &root, &sig));
+
+        let mut foreign = KesKey::generate(4, 1, |_| {}).unwrap();
+        foreign.leaves = key.leaves.clone();
+        foreign.public = key.public;
+        let signed = std::cell::Cell::new(false);
+        let out = foreign.sign_with(&root, |sk, m| {
+            signed.set(true);
+            bloch_crypto::crypto::sign_bound(sk, m)
+        });
+        assert!(out.is_err(), "a seed outside the tree must be refused");
+        assert!(!signed.get(), "and the leaf key must not have been exercised");
+    }
+
     #[test]
     fn real_hybrid_leaves_sign_only_their_period_and_evolution_erases_the_past() {
         let dir = tmp("evolve");
@@ -532,8 +928,83 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// CR-7: evolution overwrites the replaced file's contents, not only its
+    /// name. A second hard link stands in for "the old inode's blocks": after
+    /// the evolution it must hold no byte of the earlier sealed state, for
+    /// sealed and plaintext keystores alike, and the key must still reload.
+    #[cfg(unix)]
     #[test]
-    fn the_successor_is_promoted_atomically_and_the_old_key_shredded() {
+    fn evolution_overwrites_the_replaced_file_in_place() {
+        for (name, unlock) in [("overwrite-sealed", quick()), ("overwrite-plain", Unlock::PlaintextOptIn)] {
+            let dir = tmp(name);
+            let mut key = KesKey::generate(4, 2, |_| {}).unwrap();
+            key.save(&dir, &unlock).unwrap();
+            let before = fs::read(KesKey::path(&dir)).unwrap();
+            let old_inode = dir.join("old-inode");
+            fs::hard_link(KesKey::path(&dir), &old_inode).unwrap();
+
+            key.evolve_to(&dir, &unlock, 1).unwrap();
+
+            let after = fs::read(&old_inode).unwrap();
+            assert_eq!(after.len(), before.len(), "overwritten in place, not truncated");
+            assert!(after.iter().all(|b| *b == 0), "the earlier state must be overwritten");
+            // The live file is a different inode holding only period 1.
+            let reloaded = KesKey::load_optional(&dir, &unlock).unwrap().unwrap();
+            assert_eq!(reloaded.period(), 1);
+            assert_eq!(*reloaded.seed, kes::step(&KesKey::decode(&before, &unlock).unwrap().seed));
+            // A second evolution overwrites the period-1 file the same way.
+            let mid = dir.join("mid-inode");
+            fs::hard_link(KesKey::path(&dir), &mid).unwrap();
+            key.evolve_to(&dir, &unlock, 3).unwrap();
+            assert!(fs::read(&mid).unwrap().iter().all(|b| *b == 0));
+            assert_eq!(KesKey::load_optional(&dir, &unlock).unwrap().unwrap().period(), 3);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Review V1-5: a key file the operator made read-only does not block
+    /// evolution. The new state is published by the rename (which needs the
+    /// directory only); the old inode is left as it was and that is reported.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_key_file_does_not_block_evolution() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("read-only");
+        let unlock = quick();
+        let mut key = KesKey::generate(4, 2, |_| {}).unwrap();
+        key.save(&dir, &unlock).unwrap();
+        fs::set_permissions(KesKey::path(&dir), fs::Permissions::from_mode(0o400)).unwrap();
+        if fs::OpenOptions::new().write(true).open(KesKey::path(&dir)).is_ok() {
+            // Running as root: the mode does not restrict this process.
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        key.evolve_to(&dir, &unlock, 1).unwrap();
+        assert_eq!(key.period(), 1);
+        let reloaded = KesKey::load_optional(&dir, &unlock).unwrap().unwrap();
+        assert_eq!(reloaded.period(), 1, "the evolved state is what the name holds");
+        assert_eq!(fs::metadata(KesKey::path(&dir)).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The first save has nothing to overwrite, and a failed evolution
+    /// (refused period) leaves the file untouched.
+    #[test]
+    fn a_refused_evolution_leaves_the_file_untouched() {
+        let dir = tmp("refused");
+        let unlock = quick();
+        let mut key = KesKey::generate(4, 1, |_| {}).unwrap();
+        key.save(&dir, &unlock).unwrap();
+        key.evolve_to(&dir, &unlock, 1).unwrap();
+        let bytes = fs::read(KesKey::path(&dir)).unwrap();
+        assert!(key.evolve_to(&dir, &unlock, 0).is_err());
+        assert!(key.evolve_to(&dir, &unlock, 2).is_err());
+        assert_eq!(fs::read(KesKey::path(&dir)).unwrap(), bytes);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_successor_is_promoted_atomically_and_the_old_key_kept_until_shredded() {
         let dir = tmp("promote");
         let unlock = quick();
         let old = KesKey::generate(4, 1, |_| {}).unwrap();
@@ -544,8 +1015,37 @@ mod tests {
         promote_next(&dir).unwrap();
         assert_eq!(KesKey::load_optional(&dir, &unlock).unwrap().unwrap().public(), next.public());
         assert!(KesKey::load_next(&dir, &unlock).unwrap().is_none());
-        assert!(!dir.join(RETIRED_FILE_NAME).exists(), "the old key is gone");
+        // Review PER-1: the replaced key survives the swap, still loadable,
+        // and can be put back if the handover is reorganized out.
+        assert_eq!(KesKey::load_retired(&dir, &unlock).unwrap().unwrap().public(), old.public());
         assert!(promote_next(&dir).is_err(), "nothing left to promote");
+        demote_promoted(&dir).unwrap();
+        assert_eq!(KesKey::load_optional(&dir, &unlock).unwrap().unwrap().public(), old.public());
+        assert_eq!(KesKey::load_next(&dir, &unlock).unwrap().unwrap().public(), next.public());
+        assert!(!dir.join(RETIRED_FILE_NAME).exists());
+        assert!(demote_promoted(&dir).is_err(), "nothing retired to put back");
+        // Promoted again and final: the old key is destroyed.
+        promote_next(&dir).unwrap();
+        let old_inode = dir.join("old-inode");
+        fs::hard_link(dir.join(RETIRED_FILE_NAME), &old_inode).unwrap();
+        shred_retired(&dir).unwrap();
+        assert!(!dir.join(RETIRED_FILE_NAME).exists(), "the old key is gone");
+        assert!(fs::read(&old_inode).unwrap().iter().all(|b| *b == 0), "and overwritten");
+        fs::remove_file(&old_inode).unwrap();
+        assert!(demote_promoted(&dir).is_err());
+
+        // The retired key evolves in its own file and erases as the live one.
+        let kept = tmp("retired-evolve");
+        let mut a = KesKey::generate(4, 2, |_| {}).unwrap();
+        a.save(&kept, &unlock).unwrap();
+        KesKey::generate(4, 1, |_| {}).unwrap().save_next(&kept, &unlock).unwrap();
+        promote_next(&kept).unwrap();
+        let live = fs::read(KesKey::path(&kept)).unwrap();
+        a.evolve_retired_to(&kept, &unlock, 2).unwrap();
+        assert_eq!(KesKey::load_retired(&kept, &unlock).unwrap().unwrap().period(), 2);
+        assert_eq!(fs::read(KesKey::path(&kept)).unwrap(), live, "the key in force is untouched");
+        assert!(a.evolve_retired_to(&kept, &unlock, 1).is_err(), "cannot go back");
+        let _ = fs::remove_dir_all(&kept);
 
         // A crash between the two renames: no validator.kes, a retired one
         // and the successor. Startup finishes the swap.
@@ -557,10 +1057,70 @@ mod tests {
         b.save_next(&crashed, &unlock).unwrap();
         finish_interrupted_rotation(&crashed).unwrap();
         assert_eq!(KesKey::load_optional(&crashed, &unlock).unwrap().unwrap().public(), b.public());
-        assert!(!crashed.join(RETIRED_FILE_NAME).exists());
+        assert_eq!(KesKey::load_retired(&crashed, &unlock).unwrap().unwrap().public(), a.public(), "kept, not shredded");
         assert!(!crashed.join(NEXT_FILE_NAME).exists());
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&crashed);
+    }
+
+    /// Review W2-3: a read-only (0400) key file keeps its mode through the
+    /// swap, so the retired key is read-only too. It is still destroyed
+    /// (zeroed and removed), and a retired file that is in the way of the
+    /// next swap never stops that swap.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_retired_key_is_shredded_and_never_blocks_the_next_swap() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("read-only-retired");
+        let unlock = quick();
+        let read_only = |path: PathBuf| fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+        let first = KesKey::generate(4, 1, |_| {}).unwrap();
+        first.save(&dir, &unlock).unwrap();
+        read_only(KesKey::path(&dir));
+        let second = KesKey::generate(4, 1, |_| {}).unwrap();
+        second.save_next(&dir, &unlock).unwrap();
+        promote_next(&dir).unwrap();
+        let retired = dir.join(RETIRED_FILE_NAME);
+        assert_eq!(fs::metadata(&retired).unwrap().permissions().mode() & 0o777, 0o400, "the rename kept the mode");
+
+        // Final handover: the read-only retired key is zeroed and removed.
+        let old_inode = dir.join("old-inode");
+        fs::hard_link(&retired, &old_inode).unwrap();
+        shred_retired(&dir).expect("a read-only retired key is still destroyed");
+        assert!(!retired.exists(), "the old key is gone");
+        assert!(fs::read(&old_inode).unwrap().iter().all(|b| *b == 0), "and overwritten");
+        fs::remove_file(&old_inode).unwrap();
+
+        // A read-only retired file left in place (its shred never ran) does
+        // not stop the next swap either.
+        read_only(KesKey::path(&dir));
+        let third = KesKey::generate(4, 1, |_| {}).unwrap();
+        third.save_next(&dir, &unlock).unwrap();
+        promote_next(&dir).unwrap();
+        read_only(retired.clone());
+        let fourth = KesKey::generate(4, 1, |_| {}).unwrap();
+        fourth.save_next(&dir, &unlock).unwrap();
+        promote_next(&dir).expect("a read-only retired key must not block the swap");
+        assert_eq!(KesKey::load_optional(&dir, &unlock).unwrap().unwrap().public(), fourth.public());
+        assert_eq!(KesKey::load_retired(&dir, &unlock).unwrap().unwrap().public(), third.public());
+
+        // Even a retired path that cannot be shredded at all (a directory
+        // here) only costs the overwrite: the swap is refused by the rename
+        // alone, and only when the name itself cannot be replaced.
+        let blocked = tmp("retired-unshreddable");
+        KesKey::generate(4, 1, |_| {}).unwrap().save(&blocked, &unlock).unwrap();
+        let successor = KesKey::generate(4, 1, |_| {}).unwrap();
+        successor.save_next(&blocked, &unlock).unwrap();
+        fs::create_dir(blocked.join(RETIRED_FILE_NAME)).unwrap();
+        assert!(shred(&blocked.join(RETIRED_FILE_NAME)).is_err(), "fixture: this shred fails");
+        // An empty directory is not replaceable by a file rename; the point
+        // is that the failure is the rename's, after the shred was tried
+        // and reported, and that the key in force is left as it was.
+        assert!(promote_next(&blocked).is_err());
+        assert!(KesKey::load_optional(&blocked, &unlock).unwrap().is_some(), "the key in force is untouched");
+        assert_eq!(KesKey::load_next(&blocked, &unlock).unwrap().unwrap().public(), successor.public());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&blocked);
     }
 
     #[test]

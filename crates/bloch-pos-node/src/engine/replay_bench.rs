@@ -636,7 +636,7 @@ pub(super) fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
     // Loopback, ephemeral port, no peers. Nothing in this file dials, listens
     // for, or sends anything to any network.
     let net = net::Net::Devnet(
-        net::start("127.0.0.1", 0, Vec::new(), tx, dir.to_path_buf(), head_slot.clone(), inflight)
+        net::start("127.0.0.1", 0, Vec::new(), tx, dir.to_path_buf(), head_slot.clone(), inflight, Arc::new(crate::mesh_pq::MeshSecurity::plain()))
             .expect("loopback devnet transport"),
     );
     Engine {
@@ -657,8 +657,11 @@ pub(super) fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         // empty ring means the first reorg it meets takes the `replay_to`
         // fallback — which is what a real cold boot does too.
         recent_states: VecDeque::new(),
+        kes_authorities: VecDeque::new(),
+        reorg_anchors: Default::default(),
         finality_certs: Default::default(),
         pool: BTreeMap::new(),
+        pool_authority: BTreeMap::new(),
         att_pool: AttestationPool::new(),
         held_release_roots: VecDeque::new(),
         wall_slot: 0,
@@ -692,8 +695,10 @@ pub(super) fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         ))),
         live: false,
         needs_sync: false,
+        sync_rewind: super::SyncRewindBackoff::default(),
         orphans: VecDeque::new(),
         deferred_orphans: VecDeque::new(),
+        authority_parked: super::AuthorityParked::default(),
         orphans_evicted: 0,
         orphans_admitted: 0,
         blocks_pruned: 0,
@@ -711,6 +716,7 @@ pub(super) fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         finality_rewinds_refused: 0,
         parked_refused_finality: VecDeque::new(),
         finality_rewind_override: false,
+        rejected_roots: Default::default(),
         tx_slot_index: BTreeMap::new(),
         tx_slot_index_order: VecDeque::new(),
         doppelganger_observe_until: None,

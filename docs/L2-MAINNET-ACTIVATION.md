@@ -117,8 +117,13 @@ Scheme: `bloch-pos ws-keygen` (hybrid ML-DSA-65 + Falcon-1024, enveloped
 3 749-byte public key; the `.sk` is created 0600 and never printed). Script:
 `scripts/l2-activation/generate-mainnet-attestor-keys.sh`, output
 `~/Desktop/L2-MAINNET-ATESTADORES/` (dir 0700, umask 077, refuses to
-overwrite, never reads or prints a `.sk`; optional `--age-recipient` encrypts
-each `.sk` and deletes the plaintext).
+overwrite, never reads or prints a `.sk`). With `--age-recipient` each key is
+generated in a RAM-backed staging directory (`--ram-dir`; `/dev/shm` on Linux,
+checked to be tmpfs), its `.sk` is encrypted into the output directory and the
+staged plaintext is overwritten and removed, so no plaintext secret reaches
+persistent storage. Without `--age-recipient` the script refuses unless the
+output directory is on an encrypted volume (FileVault / dm-crypt) (L1M-09).
+Regression test: `scripts/l2-activation/test-generate-mainnet-attestor-keys.sh`.
 
 ```
 cargo build --release -p bloch-pos-node

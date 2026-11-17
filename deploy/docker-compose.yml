@@ -11,6 +11,10 @@
 # throwaway container is not a pattern this project wants to publish. See
 # `docs/GENESIS4-MIGRATION-RUNBOOK.md` and `deploy/RELEASE-INTEGRITY.md`.
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# L1M-10: every published port is bound to 127.0.0.1. The nodes peer with each
+# other over the compose network; Docker's published ports bypass ufw, so a
+# 0.0.0.0 mapping exposed P2P on every host interface.
 version: "3.8"
 
 services:
@@ -23,7 +27,7 @@ services:
     container_name: bloch-node1
     ports:
       - "127.0.0.1:16210:16210"
-      - "16110:16110"
+      - "127.0.0.1:16110:16110"
     volumes:
       - node1-data:/bloch-data
     environment:
@@ -42,7 +46,7 @@ services:
     container_name: bloch-node2
     ports:
       - "127.0.0.1:16211:16210"
-      - "16111:16110"
+      - "127.0.0.1:16111:16110"
     volumes:
       - node2-data:/bloch-data
     environment:
@@ -64,7 +68,7 @@ services:
     container_name: bloch-node3
     ports:
       - "127.0.0.1:16212:16210"
-      - "16112:16110"
+      - "127.0.0.1:16112:16110"
     volumes:
       - node3-data:/bloch-data
     environment:

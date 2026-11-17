@@ -157,6 +157,29 @@ What the binary now does when it meets a block it cannot apply:
   `tests/consensus_gates.rs` fails when `params.rs` gains a
   `pub const *_EPOCH: u64` that `src/consensus.rs` does not list.
 
+- **Cannot serve balances it has not reconciled.** `bloch-indexer audit-ledger`
+  replays a log and compares every output, owner, per-script balance, output
+  list and script history with the replayed consensus state, every `--every N`
+  blocks, after every block with an L2 kind, and at the tip. It also reconciles
+  the L2 escrow and checks conservation on each L2 transaction. Its cost is
+  linear in the outputs, so `serve` does not run it.
+
+### Native L2 kinds (0x12-0x16)
+
+| Kind | Spends | Creates | Escrow field |
+| --- | --- | --- | --- |
+| `l2_settlement`, `l2_settlement_async` | nothing | nothing; fee 0 | none |
+| `l2_deposit` | funding inputs | change at vout 0 when nonzero | `l2_escrow_in_sat` |
+| `l2_data_availability` | funding inputs | change at vout 0 when nonzero | none |
+| `l2_withdraw_claim` | funding inputs | release at vout 0, change at vout 1 when nonzero | `l2_escrow_out_sat` |
+
+The escrow is L2 state, not an output: vout 1 of a deposit names the inbox record
+and `/outpoint` answers 404 for it. Replay also verifies settlement proofs, with
+the node's `bloch_l2_proof::verify`. `SignatureVerifier::verify_l2_settlement`
+defaults to `false`, so a verifier without the override halts the index at the
+first settlement. Transaction answers for L2 kinds carry both escrow fields, so
+`inputs + l2_escrow_out_sat = outputs + l2_escrow_in_sat + fee_sat`.
+
 ### Checklist for every hard fork
 
 1. Build the indexer **from the node release commit that arms the gate**, or
@@ -168,7 +191,9 @@ What the binary now does when it meets a block it cannot apply:
 3. For every new `PosTransaction` variant, decide its ledger effect in
    `index.rs`: which eUTXOs it spends (`transfer_parts`), how many outputs it
    can create (`created_output_bound`) and its stable kind name (`kind_of`, the
-   same string the node's RPC uses). Add a fixture test.
+   same string the node's RPC uses). If the variant reaches a new
+   `SignatureVerifier` method, give `ArchiveVerifier` the node's override. Add
+   a fixture test, and run `audit-ledger` on a private chain that uses it.
 4. List new gates in `src/consensus.rs`.
 5. After activation, `/status` must show `serving: true`, `halt: null` and
    the tip past the activation epoch.

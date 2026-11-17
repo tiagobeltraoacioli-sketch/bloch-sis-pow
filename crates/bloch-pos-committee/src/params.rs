@@ -1005,6 +1005,30 @@ pub mod rehearsal {
     }
 
     thread_local! {
+        static ATTESTATION_SLOT_EPOCH_BINDING_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat
+    /// [`super::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH`] as bound.
+    /// Its own switch, default CLOSED, because its inert value selects the
+    /// old rule.
+    pub fn attestation_slot_epoch_binding_forced() -> bool {
+        ATTESTATION_SLOT_EPOCH_BINDING_TL.with(|c| c.get())
+    }
+
+    /// Binds the vote slot-epoch binding for this thread until drop.
+    pub fn attestation_slot_epoch_binding_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ATTESTATION_SLOT_EPOCH_BINDING_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = ATTESTATION_SLOT_EPOCH_BINDING_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
+    thread_local! {
         static REWARDS_V2_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
     }
 
@@ -1570,7 +1594,7 @@ pub const NATIVE_SLASHING_ACTIVATION_EPOCH: u64 = HF2_SLASHING_V2_EPOCH;
 /// (`NATIVE_SLASHING_ACTIVATION_EPOCH` is an alias kept for the P5a code and
 /// tests). It is independent of `SLASHING_EVIDENCE_ACTIVATION_EPOCH` and of
 /// `PRE_ACTIVATION_OFFENCE_REFUSAL_EPOCH`, which it never moves.
-pub const HF2_SLASHING_V2_EPOCH: u64 = u64::MAX;
+pub const HF2_SLASHING_V2_EPOCH: u64 = 7270;
 
 /// Is the P5a evidence-admission policy armed at `wall_epoch`?
 pub const fn native_slashing_active(wall_epoch: u64) -> bool {
@@ -1785,6 +1809,52 @@ pub const TX_BYTES_BOUND_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// Ships INERT at `u64::MAX`; `attestation_dedup_gate_is_inert` pins the
 /// value.
 pub const ATTESTATION_DEDUP_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for **binding an in-block vote to its slot's epoch** (security
+/// review FC-3 / CR-1, 2026-11-10). ARMED at epoch 8620 (owner decision
+/// 2026-11-13): the same flag day as KES enforcement
+/// ([`HF3_KES_ENFORCE_EPOCH`]). Below the gate step 8 is byte-for-byte the
+/// rule the chain ran before it.
+///
+/// Step 8 requires `epoch_of(att.data.slot) == st.epoch` and nothing of
+/// `att.data.target_epoch` beyond `source_epoch < target_epoch`, yet
+/// `attestation::validate` chose the vote's KES signing mode
+/// (`kes::signing_mode`) by `target_epoch`, while gossip and slashing-evidence
+/// verification choose it by `epoch_of(att.data.slot)`. `signing_mode`
+/// answers `Static` for any epoch below the bind (and for a period in which
+/// the validator had no key in force), so once KES binds a vote with a
+/// current slot and an old `target_epoch` would still be block-valid under
+/// the STATIC key of a KES-registered validator — the key forward security
+/// exists to retire — and two such conflicting votes could not be proven as
+/// evidence, which judges them under KES.
+///
+/// From this epoch on (the including block's committed epoch, which step 8
+/// already pins to the vote's slot epoch):
+///
+/// 1. a block carrying a vote with `target_epoch != epoch_of(slot)` is
+///    invalid — the honest attester has always set them equal;
+/// 2. `attestation::validate` selects the KES mode by `epoch_of(slot)`, the
+///    epoch every other verifier of the same vote uses.
+///
+/// Soft fork: it only removes blocks from the valid set, but a mixed fleet
+/// still splits on the first block that carries such a vote, so arming is a
+/// flag day. It should bind no later than KES enforcement
+/// ([`HF3_KES_ENFORCE_EPOCH`]); arming it earlier is harmless to honest votes
+/// as long as the epoch is still in the FUTURE when the release ships: the
+/// chain was not checked against rule 1 so far, so a gate at or below an
+/// epoch the chain has passed can invalidate a canonical block on replay
+/// (`hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY`).
+pub const ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH: u64 = 8620;
+
+/// Is the vote slot-epoch binding active in `epoch` (the vote's slot epoch,
+/// which block validation pins to the including block's committed epoch)?
+pub fn attestation_slot_epoch_binding_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    let forced = rehearsal::attestation_slot_epoch_binding_forced();
+    #[cfg(not(test))]
+    let forced = false;
+    forced || epoch_gate_active(epoch, ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH)
+}
 
 /// Flag day for **rewards v2** (audit R1 M1 + M3 + M4, R7 M5, 2026-09-06):
 /// one constant, four rules that all change committed state and therefore
@@ -2034,12 +2104,14 @@ pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///    (`fee_market::eutxo_class_for_keys`) instead of the suite-blind
 ///    `HYBRID_VERIFY_GAS`. Below it every charge is bit-identical.
 ///
-/// MUST equal `bloch_crypto::crypto::HF3_SLH_SUITE_EPOCH` (this crate does
-/// not depend on bloch-crypto; bloch-pos-node asserts the equality at compile
-/// time): a verifier that accepts the suite while fees still price it as a
-/// hybrid sells ~1.07 M gas of CPU for 72,748. `u64::MAX` = never, even at
-/// `u64::MAX`. Ships INERT; `hf3_slh_suite_gate_is_inert` pins the value.
-pub const HF3_SLH_SUITE_EPOCH: u64 = u64::MAX;
+/// This is the ONLY HF3 constant: bloch-crypto holds none and is told the
+/// verdict (`hf3_slh_suite_active`) by its caller, so the verifier and the
+/// fee rule cannot arm apart (a verifier that accepts the suite while fees
+/// still price it as a hybrid sells ~1.07 M gas of CPU for 72,748).
+/// `u64::MAX` would mean never, even at `u64::MAX`. ARMED at 7360: from that
+/// epoch the SLH-DSA verifier is live consensus code.
+/// `hf3_slh_suite_gate_is_armed_at_7360` pins the value.
+pub const HF3_SLH_SUITE_EPOCH: u64 = 7360;
 
 /// HF3 suite id: SLH-DSA-SHAKE-128s ‖ Falcon-1024. The canonical consensus
 /// copy; bloch-pos-node pins it to `bloch_crypto::crypto::SUITE_SLHDSA128S_FALCON1024`.
@@ -2199,7 +2271,7 @@ pub const SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// line. Any rejected block in the pinned runs is a NO-GO for an epoch at or
 /// before that block (the per-epoch gate allows a later one).
 #[cfg(not(feature = "mldsa-pin-replay-qualification"))]
-pub const MLDSA_PIN_ACTIVATION_EPOCH: u64 = u64::MAX;
+pub const MLDSA_PIN_ACTIVATION_EPOCH: u64 = 7270;
 /// QUALIFICATION BUILD: all of history judged under the pinned rule.
 #[cfg(feature = "mldsa-pin-replay-qualification")]
 pub const MLDSA_PIN_ACTIVATION_EPOCH: u64 = 0;
@@ -2259,7 +2331,7 @@ pub fn mldsa_pin_active(epoch: u64) -> bool {
 /// carries the v2 verifier first. Wallets and exchanges are NOT affected.
 /// Ships INERT at `u64::MAX`; `sig_canonical_gate_is_inert` pins the value.
 /// The judged epoch is the signed message's own epoch, never a clock.
-pub const SIG_CANONICAL_ACTIVATION_EPOCH: u64 = u64::MAX;
+pub const SIG_CANONICAL_ACTIVATION_EPOCH: u64 = 7270;
 
 #[cfg(test)]
 thread_local! {
@@ -2582,6 +2654,189 @@ pub(crate) mod funded_delegation_rehearsal {
     }
 }
 
+/// Candidate ST-1 bound on funded-delegation state. `u64::MAX` means INERT.
+///
+/// Every funded position is a record in the committed delegation history, up
+/// to three leaves of the state root, and an entry of the warm-up fold
+/// (`delegation::Registry::resolve`) that every block reads. The history was
+/// append-only: a withdrawn position stayed in all three for ever, creating
+/// one costs 10 BLCH that the owner later recovers, and nothing limited how
+/// many could exist. The work of every block therefore grew with the number
+/// of positions ever created (security review ST-1). The resolver itself no
+/// longer walks every epoch (that part is not a consensus change and is not
+/// gated); this gate bounds what is left.
+///
+/// Once armed, it binds two rules together:
+///
+/// 1. **Position limits.** `FundedDelegate` refuses a new position when the
+///    committed history already holds
+///    [`crate::transition::funded_delegation::MAX_FUNDED_POSITIONS`] unpruned
+///    positions created under this gate, and from half of that limit on it
+///    requires a principal that doubles with every further 1/32 of the limit
+///    ([`crate::transition::funded_delegation::funded_position_minimum_sat`]).
+///    Behind one validator at most
+///    [`crate::transition::funded_delegation::MAX_FUNDED_POSITIONS_PER_VALIDATOR`]
+///    positions may be live (not deactivating); when they are all taken a
+///    new position enters only by displacing the smallest of them, which
+///    it must be at least
+///    [`crate::transition::funded_delegation::FUNDED_DISPLACEMENT_FACTOR`]
+///    times as large as. The displaced position is deactivated exactly as
+///    its owner's `FundedUndelegate` would and is withdrawn by its owner
+///    through the ordinary path. Positions created before the gate do not
+///    count toward the global limit (they cost 10 BLCH each and nothing
+///    limited them, so counting them would let the limit be filled in
+///    advance: security review round 2, DET-1 and V1-4) but they hold
+///    per-validator slots and can be displaced like any other.
+/// 2. **Pruning.** At each epoch boundary, fully withdrawn positions are
+///    overwritten with [`crate::delegation::Delegation::PRUNED`] and their
+///    owner and lifecycle entries are removed, provided the removal is
+///    invisible to every other position
+///    ([`crate::delegation::pruning_is_outcome_neutral`]). A pruned slot is
+///    in neither the fold nor the state root. Positions keep their indices.
+///
+/// Rule 1 changes which transactions are valid and rule 2 changes committed
+/// state, so arming needs a historical replay, mixed-fleet qualification and
+/// a coordinated epoch; there is no runtime override. Below the gate nothing
+/// is pruned, no committed record can equal the pruned constant, and every
+/// state root is what it was. It cannot precede funded delegation itself.
+/// `funded_delegation_bound_gate_is_inert` pins the inert value.
+pub const FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH,
+    FUNDED_DELEGATION_ACTIVATION_EPOCH
+));
+
+pub(crate) fn funded_delegation_bound_active(epoch: u64) -> bool {
+    funded_delegation_bound_epoch().is_some_and(|activation| epoch >= activation)
+}
+
+/// The epoch the bound took effect at, `None` while it is inert. A position
+/// whose `requested_epoch` is at or before it was created before the gate
+/// (a position created in epoch `c` requests `c + 1`).
+pub(crate) fn funded_delegation_bound_epoch() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(epoch) = funded_delegation_bound_rehearsal::epoch() {
+        return Some(epoch);
+    }
+    (FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH != u64::MAX).then_some(FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod funded_delegation_bound_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static EPOCH: Cell<Option<u64>> = const { Cell::new(None) }; }
+    pub fn epoch() -> Option<u64> { EPOCH.with(Cell::get) }
+    /// Armed from genesis.
+    pub fn open() -> impl Drop { open_at(0) }
+    /// Armed from `epoch`, so a test can build state below the gate first.
+    pub fn open_at(epoch: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore { fn drop(&mut self) { EPOCH.with(|v| v.set(self.0)); } }
+        Restore(EPOCH.with(|v| v.replace(Some(epoch))))
+    }
+}
+
+/// Security review round 2, DET-3: at most one `ValidatorCommissionUpdate`
+/// per validator per epoch. `u64::MAX` means INERT.
+///
+/// The update carries no nonce and pays no fee; its only replay protection
+/// was "the value must differ from the committed one". Once a validator had
+/// signed two values in one epoch, each message became valid again as soon as
+/// the other had been applied, any number of times in one block and from any
+/// sender: a third party chose which value stood at the end of the epoch,
+/// and a proposer had an unlimited supply of valid zero-fee transactions.
+///
+/// Once armed, an accepted update records its epoch for the validator
+/// (`CommittedState::commission_update_epochs`) and a further update for the
+/// same validator in the same epoch is refused
+/// (`FundedDelegationReject::CommissionAlreadyUpdated`). The record is
+/// committed state: one leaf per validator that has updated under the gate,
+/// keyed under the validator component with a key no validator index can
+/// produce, and one optional local-cache section. Below the gate nothing is
+/// recorded, so every state root and every cache keeps its bytes.
+///
+/// It changes which transactions are valid and it changes committed state,
+/// so arming needs a historical replay, mixed-fleet qualification and a
+/// coordinated epoch; there is no runtime override. It cannot precede funded
+/// delegation, which is what makes the message valid at all.
+/// `commission_update_limit_gate_is_inert` pins the inert value.
+pub const COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH,
+    FUNDED_DELEGATION_ACTIVATION_EPOCH
+));
+
+pub(crate) fn commission_update_limit_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if commission_update_limit_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod commission_update_limit_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+/// Security review round 2, EXE-4: the L2 release window's over-cap
+/// exemption no longer depends on being the window's first claim.
+/// `u64::MAX` means INERT.
+///
+/// A claim above the window cap is payable only if it is exempt (attested,
+/// or on a policy without attestors). Before this gate it also had to be the
+/// first claim of its window, so any earlier claim of any size, including an
+/// ordinary small one, pushed every larger withdrawal to the next window,
+/// where the same could happen again; the L2 leaf fixes the amount, so the
+/// owner cannot split it.
+///
+/// Once armed, an exempt claim may exceed the cap while the window has not
+/// released more than its cap, and that claim closes the window (released is
+/// then above the cap, so nothing else fits). No state is added: "the
+/// exemption was used" is `released > cap`. The per-window bound changes from
+/// `max(cap, one exempt claim)` to `cap + one exempt claim`; an unattested
+/// claim is still bounded by the cap on a policy with attestors.
+///
+/// It changes which claims are valid, so arming needs a historical replay,
+/// mixed-fleet qualification and a coordinated epoch; there is no runtime
+/// override. It cannot precede the L2 settlement itself.
+/// `l2_release_exemption_gate_is_inert` pins the inert value.
+pub const L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+
+pub fn l2_release_exemption_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_release_exemption_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_release_exemption_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Flag day for the native L2 settlement on a network that is already running
 /// (M8 part 2), activated on mainnet at the epoch recorded below.
 ///
@@ -2719,7 +2974,7 @@ const _: () = assert!(hf1_gates_coherent(HF1_CLAIM_FINALITY_EPOCH, HF1_FROZEN_FI
 /// that applies today is refused after it), so the whole fleet must run the
 /// new release before the epoch. `native_claim_finality_gate_is_inert` pins
 /// the inert value.
-pub const HF1_CLAIM_FINALITY_EPOCH: u64 = u64::MAX;
+pub const HF1_CLAIM_FINALITY_EPOCH: u64 = 7180;
 
 pub(crate) fn native_claim_finality_active(epoch: u64) -> bool {
     #[cfg(test)]
@@ -2778,7 +3033,7 @@ pub(crate) mod native_claim_finality_test {
 /// which is committed state, so the whole fleet must run the new release
 /// before the epoch. `hf1_own_target_votes_gate_is_inert` pins the inert
 /// value.
-pub const HF1_OWN_TARGET_VOTES_EPOCH: u64 = u64::MAX;
+pub const HF1_OWN_TARGET_VOTES_EPOCH: u64 = 7186;
 
 pub(crate) fn own_target_votes_active(epoch: u64) -> bool {
     #[cfg(test)]
@@ -2842,7 +3097,7 @@ pub(crate) mod own_target_votes_test {
 /// ARMING THIS IS A FOUNDER DECISION. It trades the leak's liveness rescue
 /// for partition safety, and the activation epoch must be reached by a
 /// finalizing chain (the first set is the duty roster at that epoch).
-pub const HF1_FROZEN_FINALITY_SET_EPOCH: u64 = u64::MAX;
+pub const HF1_FROZEN_FINALITY_SET_EPOCH: u64 = 7180;
 
 /// Absence pruning horizon of the finality set: a member with no included
 /// epoch vote for this many epochs is left out of the next handoff. 90
@@ -2910,12 +3165,12 @@ mod hf1_tests {
 
     #[test]
     fn hf1_ships_inert_as_a_whole() {
-        assert_eq!(HF1_CLAIM_FINALITY_EPOCH, u64::MAX);
-        assert_eq!(HF1_FROZEN_FINALITY_SET_EPOCH, u64::MAX);
+        assert_eq!(HF1_CLAIM_FINALITY_EPOCH, 7180);
+        assert_eq!(HF1_FROZEN_FINALITY_SET_EPOCH, 7180);
         assert!(hf1_gates_coherent(HF1_CLAIM_FINALITY_EPOCH, HF1_FROZEN_FINALITY_SET_EPOCH));
-        for epoch in [0, 5_850, 8_610, 8_616, u64::MAX - 1, u64::MAX] {
-            assert!(!native_claim_finality_active(epoch));
-            assert!(!native_finality_set_active(epoch));
+        for epoch in [0, 5_850, 7_179, 7_180, 8_610, 8_616, u64::MAX - 1, u64::MAX] {
+            assert_eq!(native_claim_finality_active(epoch), epoch >= 7180);
+            assert_eq!(native_finality_set_active(epoch), epoch >= 7180);
         }
     }
 
@@ -3058,7 +3313,7 @@ pub(crate) mod activation_queue_v2_rehearsal {
 /// This changes which epoch a queued validator activates, a committed field,
 /// so it needs historical replay and a coordinated epoch.
 /// `hf2_growth_cap_gate_is_inert` pins the inert value.
-pub const HF2_GROWTH_CAP_EPOCH: u64 = u64::MAX;
+pub const HF2_GROWTH_CAP_EPOCH: u64 = 7270;
 
 pub(crate) fn hf2_growth_cap_active(epoch: u64) -> bool {
     #[cfg(test)]
@@ -3123,7 +3378,7 @@ pub(crate) mod funded_admission_rehearsal {
 /// definition; the HF3 schedule must arm this gate at or after that one,
 /// because a rotation into suite `0x0003` is only useful once suite `0x0003`
 /// signatures verify.
-pub const HF3_PQ_MIGRATION_EPOCH: u64 = u64::MAX;
+pub const HF3_PQ_MIGRATION_EPOCH: u64 = 7360;
 
 /// Emergency flag day for a public break (or credible weakening) of BOTH
 /// lattice families in the hybrid suite. `u64::MAX` = INERT, and it can only
@@ -3305,8 +3560,9 @@ pub(crate) mod audit_recovery_test {
 
 // ── Forward-secure validator keys (KES, `crate::kes`) ───────────────────────
 //
-// Hard fork 3 (HF3). Two mainnet flag days, both unarmed (`u64::MAX`) until
-// chosen, no cargo feature anywhere (docs/KES-MAINNET-READINESS.md §7).
+// Hard fork 3 (HF3). Two mainnet flag days, both armed by the owner decision
+// of 2026-10-25 (registration 7360, enforcement 8620), no cargo feature
+// anywhere (docs/KES-MAINNET-READINESS.md §7).
 //
 // `HF3_KES_EPOCH` IS ITSELF A HARD FORK, not a soft opening: a binary without
 // this line refuses tags 0x17/0x1B as unknown, so the first block carrying a
@@ -3330,12 +3586,15 @@ pub(crate) mod audit_recovery_test {
 // component is absent while no root is registered.
 
 /// HF3: opens KES registration (wire 0x17) and rotation (`kes::ROTATE_TAG`).
-/// Unarmed.
-pub const HF3_KES_EPOCH: u64 = u64::MAX;
+/// Armed at 7360 (in force on mainnet).
+pub const HF3_KES_EPOCH: u64 = 7360;
 /// HF3 KES enforcement: proposals and votes must carry a KES leaf signature
-/// from this epoch on. Unarmed; must come at least
-/// `KES_MIN_REGISTRATION_WINDOW_EPOCHS` after `HF3_KES_EPOCH`.
-pub const HF3_KES_ENFORCE_EPOCH: u64 = u64::MAX;
+/// from this epoch on (once the registered-stake condition holds). Armed at
+/// 8620; must come at least
+/// `KES_MIN_REGISTRATION_WINDOW_EPOCHS` after `HF3_KES_EPOCH`. The follow-up
+/// gates that must cover it are tracked by
+/// `hard_forks::kes_follow_up_gates_cover_enforcement`.
+pub const HF3_KES_ENFORCE_EPOCH: u64 = 8620;
 /// Opens KES registration (wire 0x17): `HF3_KES_EPOCH`.
 pub const KES_REGISTRATION_EPOCH: u64 = HF3_KES_EPOCH;
 /// KES enforcement: `HF3_KES_ENFORCE_EPOCH`.
@@ -3392,6 +3651,89 @@ pub const KES_PERIOD_EPOCHS: u64 = 90;
 /// periods, about 11.2 years (option A). Consensus accepts any depth in
 /// `kes::MIN_DEPTH..=kes::MAX_DEPTH`; this is the operator default only.
 pub const KES_DEFAULT_DEPTH: u8 = 12;
+/// Security review CR-2 (first-key floor). ARMED at epoch 8620 (owner
+/// decision 2026-11-13), the KES enforcement flag day. From the first KES
+/// period that starts at or after this epoch:
+///
+/// * a period that precedes a validator's FIRST KES key resolves to no KES
+///   key (`kes::KesEntry::resolve`), so `kes::signing_mode` is `Static` for
+///   it, exactly as it was while the validator had not registered. Without
+///   the rule, a registration after KES binds (its key starts at the NEXT
+///   period) makes every earlier bound-era period resolve to that key, whose
+///   tree has no leaf for it: equivocation evidence for what the validator
+///   signed with its static key before registering can never verify, and the
+///   validator cannot sign for the rest of the inclusion period;
+/// * `kes::KesEntry` never prunes its oldest replaced key, so the first
+///   key's start period stays derivable from committed state (no new
+///   committed field, no encoding change).
+///
+/// Both change validity (which signatures verify; which history the 0x22
+/// state-root component keeps), so every node must run the armed build
+/// before the gate. Arm it at `HF3_KES_ENFORCE_EPOCH` (or earlier, at an
+/// epoch still in the future when the release ships): later
+/// values leave static signatures made between the bind and the gate by
+/// late registrants unprovable. It must not be armed after the first epoch
+/// at which history can have been pruned
+/// (`kes_first_key_floor_is_armed_in_time`).
+pub const KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH: u64 = 8620;
+
+/// The first-key floor is inert, or armed while no validator's key history
+/// can have been pruned yet: history exists only from enforcement on and
+/// lives `KES_KEY_HISTORY_PERIODS`, so until then the oldest key of every
+/// entry is still its first one.
+const fn kes_first_key_floor_is_armed_in_time(floor: u64, enforcement: u64) -> bool {
+    floor == u64::MAX
+        || (enforcement != u64::MAX && floor <= enforcement.saturating_add(KES_KEY_HISTORY_PERIODS * KES_PERIOD_EPOCHS))
+}
+
+const _: () = assert!(
+    kes_first_key_floor_is_armed_in_time(KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH, HF3_KES_ENFORCE_EPOCH),
+    "the KES first-key floor must be armed before key history can be pruned"
+);
+
+/// Is the first-key floor (`KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH`) in force
+/// for global KES period `period`? True when the period's first epoch is at
+/// or after the gate. A pure function of the period and the build, so the
+/// signature rule and the pruning rule switch on the same period everywhere.
+pub fn kes_first_key_floor_active(period: u64) -> bool {
+    #[cfg(test)]
+    let gate = kes_first_key_floor_rehearsal::get().unwrap_or(KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH);
+    #[cfg(not(test))]
+    let gate = KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH;
+    let s = kes_schedule();
+    if gate == u64::MAX || s.activation_epoch == u64::MAX {
+        return false;
+    }
+    match period.checked_mul(s.period_epochs).and_then(|epochs| epochs.checked_add(s.activation_epoch)) {
+        Some(first_epoch) => first_epoch >= gate,
+        // No real epoch is in such a period; stay monotonic in the period.
+        None => true,
+    }
+}
+
+/// Test-only, thread-local override of
+/// `KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH`. `cfg(test)`: it cannot exist in a
+/// shipped binary.
+#[cfg(test)]
+pub mod kes_first_key_floor_rehearsal {
+    use std::cell::Cell;
+    thread_local! {
+        static GATE: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+    pub(crate) fn get() -> Option<u64> {
+        GATE.with(|c| c.get())
+    }
+    /// Arm the floor at `epoch` on this thread until the guard drops.
+    pub fn arm(epoch: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                GATE.with(|c| c.set(self.0));
+            }
+        }
+        Restore(GATE.with(|c| c.replace(Some(epoch))))
+    }
+}
 
 
 /// Enforcement is inert, or registration is armed strictly before it.
@@ -3473,6 +3815,69 @@ pub fn kes_period(epoch: u64) -> Option<u64> {
     epoch_gate_active(epoch, s.activation_epoch).then(|| (epoch - s.activation_epoch) / s.period_epochs)
 }
 
+/// Flag day of the epoch-bound KES registration message (security review
+/// CR-5). Unarmed.
+///
+/// Before it, a `KesRegister` (wire 0x17) is authorised by the static key
+/// over `kes::register_signing_root`, which binds the network, the validator
+/// and the tree only: the signature never ages. The transition refuses a tree
+/// that is in force, pending or in the retired history, but the history is
+/// pruned after `KES_KEY_HISTORY_PERIODS`, so the registration of a
+/// long-retired tree could be rebroadcast by anyone into a later rescue
+/// window, putting back a key whose seeds the validator destroyed (or that it
+/// rotated away from because a seed leaked).
+///
+/// From it on, the static key signs `kes::register_signing_root_v2`, which
+/// also binds the inclusion epoch, and consensus verifies the signature
+/// against the epoch of the including block only (the `ExitV2` equality
+/// rule), so a registration is valid in exactly the epoch it was signed for.
+/// The wire encoding does not change: the epoch is the block's, not a field.
+///
+/// A hard fork (it changes which 0x17 transactions are valid): every node
+/// must run this code before the epoch.
+///
+/// ARM IT AT A FUTURE EPOCH ONLY, never at `HF3_KES_EPOCH` (7360) or any
+/// other epoch the chain has already passed: every `KesRegister` included
+/// since 7360 was signed in the legacy form, so a gate at or below an epoch
+/// that holds one makes that canonical block invalid on replay (each restart
+/// then fails with "durable block log failed consensus replay"; review
+/// round 2, GATE-03). The earliest safe value is a flag day ahead of the
+/// release that arms it; the latest useful one is
+/// `hard_forks::kes_register_binding_deadline(HF3_KES_ENFORCE_EPOCH)`, before
+/// any retired tree can leave the history. Registrations signed in the old
+/// form and not yet included at the gate simply stop verifying and are
+/// signed again. `hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY` carries the
+/// guard.
+pub const KES_REGISTER_EPOCH_BINDING_EPOCH: u64 = u64::MAX;
+
+/// Must a `KesRegister` included at `epoch` be signed over the epoch-bound
+/// message ([`KES_REGISTER_EPOCH_BINDING_EPOCH`])? A pure function of the
+/// epoch and the build.
+pub fn kes_register_epoch_bound(epoch: u64) -> bool {
+    #[cfg(test)]
+    if let Some(activation) = kes_register_binding_rehearsal::activation() {
+        return epoch_gate_active(epoch, activation);
+    }
+    epoch_gate_active(epoch, KES_REGISTER_EPOCH_BINDING_EPOCH)
+}
+
+/// Thread-local rehearsal activation for
+/// [`KES_REGISTER_EPOCH_BINDING_EPOCH`]. `cfg(test)` only.
+#[cfg(test)]
+pub(crate) mod kes_register_binding_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ACTIVATION: Cell<Option<u64>> = const { Cell::new(None) }; }
+    pub fn activation() -> Option<u64> { ACTIVATION.with(Cell::get) }
+    /// Arm `activation` on this thread until the guard drops (also on unwind).
+    pub fn arm(activation: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore {
+            fn drop(&mut self) { ACTIVATION.with(|c| c.set(self.0)); }
+        }
+        Restore(ACTIVATION.with(|c| c.replace(Some(activation))))
+    }
+}
+
 /// Test-only, thread-local KES schedule override. `cfg(test)`: it cannot
 /// exist in a shipped binary.
 #[cfg(test)]
@@ -3496,14 +3901,26 @@ mod kes_schedule_tests {
 
     #[test]
     fn the_mainnet_schedule_is_unarmed() {
-        assert_eq!(HF3_KES_EPOCH, u64::MAX);
-        assert_eq!(HF3_KES_ENFORCE_EPOCH, u64::MAX);
-        assert_eq!(KES_REGISTRATION_EPOCH, u64::MAX);
-        assert_eq!(KES_ACTIVATION_EPOCH, u64::MAX);
-        for epoch in [0, 4_669, 1 << 40, u64::MAX - 1, u64::MAX] {
-            assert!(!kes_registration_open(epoch));
-            assert_eq!(kes_period(epoch), None);
+        assert_eq!(HF3_KES_EPOCH, 7360);
+        assert_eq!(HF3_KES_ENFORCE_EPOCH, 8620);
+        assert_eq!(KES_REGISTRATION_EPOCH, 7360);
+        assert_eq!(KES_ACTIVATION_EPOCH, 8620);
+        for epoch in [0, 4_669, 7_359, 7_360, 8_619, 8_620, 8_709, 8_710, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert_eq!(kes_registration_open(epoch), epoch >= 7360);
+            assert_eq!(kes_period(epoch), (epoch >= 8620).then(|| (epoch - 8620) / 90));
         }
+    }
+
+    #[test]
+    fn the_epoch_bound_registration_message_is_unarmed() {
+        assert_eq!(KES_REGISTER_EPOCH_BINDING_EPOCH, u64::MAX);
+        for epoch in [0, 7_359, 7_360, 8_620, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert!(!kes_register_epoch_bound(epoch), "epoch {epoch}");
+        }
+        let _armed = kes_register_binding_rehearsal::arm(7_360);
+        assert!(!kes_register_epoch_bound(7_359));
+        assert!(kes_register_epoch_bound(7_360));
+        assert!(kes_register_epoch_bound(u64::MAX));
     }
 
     #[test]
@@ -3518,5 +3935,43 @@ mod kes_schedule_tests {
         assert_eq!(kes_period(190), Some(1));
         kes_rehearsal::set(None);
         assert_eq!(kes_period(190), None);
+    }
+
+    #[test]
+    fn the_first_key_floor_ships_with_enforcement_and_opens_by_period() {
+        // Armed 2026-11-13 at the KES enforcement flag day: in force from the
+        // first bound period on the compiled schedule.
+        assert_eq!(KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH, 8620);
+        assert_eq!(KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH, HF3_KES_ENFORCE_EPOCH);
+        for period in [0, 1, 365, 1 << 40, u64::MAX] {
+            assert!(kes_first_key_floor_active(period), "in force from period 0 on the compiled schedule");
+        }
+        kes_rehearsal::set(Some(KesSchedule { registration_epoch: 10, activation_epoch: 100, period_epochs: 90, min_depth: 1 }));
+        // Compiled gate 8620 against a schedule bound at epoch 100: period 94
+        // starts at 8560, period 95 at 8650.
+        assert!(!kes_first_key_floor_active(0), "below the compiled gate under an earlier KES schedule");
+        assert!(!kes_first_key_floor_active(94) && kes_first_key_floor_active(95));
+        {
+            let _floor = kes_first_key_floor_rehearsal::arm(100);
+            assert!(kes_first_key_floor_active(0) && kes_first_key_floor_active(7));
+            assert!(kes_first_key_floor_active(u64::MAX), "monotonic past the last real period");
+        }
+        {
+            // Mid-period: in force from the next period that starts after it.
+            let _floor = kes_first_key_floor_rehearsal::arm(191);
+            assert!(!kes_first_key_floor_active(0) && !kes_first_key_floor_active(1));
+            assert!(kes_first_key_floor_active(2));
+        }
+        {
+            let _floor = kes_first_key_floor_rehearsal::arm(u64::MAX);
+            assert!(!kes_first_key_floor_active(u64::MAX), "MAX is always the unarmed sentinel");
+        }
+        assert!(!kes_first_key_floor_active(5), "the guard restores the compiled gate");
+        kes_rehearsal::set(None);
+        assert!(kes_first_key_floor_is_armed_in_time(u64::MAX, u64::MAX));
+        assert!(kes_first_key_floor_is_armed_in_time(8_620, 8_620));
+        assert!(kes_first_key_floor_is_armed_in_time(8_620 + 365 * 90, 8_620));
+        assert!(!kes_first_key_floor_is_armed_in_time(8_620 + 365 * 90 + 1, 8_620));
+        assert!(!kes_first_key_floor_is_armed_in_time(8_620, u64::MAX));
     }
 }

@@ -516,6 +516,7 @@ fn projection(present: u32, n: u32) -> Option<u64> {
                 (v, Data { slot: first(e), head: [e as u8; 32], source_epoch: j.epoch, source_root: j.root, target_epoch: e, target_root: [e as u8; 32] })
             })
             .collect();
+        fs.record_own_checkpoint(e, [e as u8; 32]);
         fs.process_epoch(&EpochVotes { epoch: e, active_set: &set, attestations: &votes }).unwrap();
         if fs.finalized().epoch > start {
             return Some(fs.finalized().epoch - start);
@@ -526,6 +527,7 @@ fn projection(present: u32, n: u32) -> Option<u64> {
 
 #[test]
 fn projection_today_mainnet_pace_half_and_third_finalize_alone() {
+    let _today = crate::params::native_finality_set_test::arm_at(u64::MAX);
     let half = projection(2, 4).expect("1/2 finalizes alone");
     let third = projection(1, 3).expect("1/3 finalizes alone");
     let quarter = projection(1, 4);
@@ -534,6 +536,9 @@ fn projection_today_mainnet_pace_half_and_third_finalize_alone() {
     assert!((1_500..2_500).contains(&half), "{half}");
     assert!((2_200..3_500).contains(&third), "{third}");
     assert_eq!(quarter, None);
+    drop(_today);
+    assert_eq!(projection(2, 4), None, "HF1 armed at 7180: a half side never finalizes alone");
+    assert_eq!(projection(1, 3), None, "HF1 armed at 7180: a third side never finalizes alone");
 }
 
 // ── 3. Three-way split (devnet4, 2026-10-17) ──────────────────────────────

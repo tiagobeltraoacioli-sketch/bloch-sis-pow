@@ -70,6 +70,24 @@
 //! so `gossip.rs`'s verdicts have nowhere to go on this path — the engine
 //! still runs the pool, but a `Reject` costs the sender nothing here.
 //!
+//! **It is nevertheless what Genesis-4 mainnet runs** (`--transport devnet
+//! --mesh-security offer`; review W4-1), with a topology the paragraph above
+//! does not describe: a dozen validators per public address, most of them in
+//! nobody's `--peers`, each with one thing to say per sixteen-minute epoch.
+//! Every limit in this file must hold for that fleet first. A limit that
+//! reads as generous for a devnet over localhost ("an honest peer says
+//! something every few seconds", "a host lists its own nodes") has already
+//! cut honest validators off once.
+//!
+//! **`--mesh-security` (see `mesh_pq.rs`).** With `offer` or `require` a
+//! connection first runs a hybrid ML-KEM-768 + X25519 handshake in which
+//! each side proves possession of an ML-DSA-65 transport identity, and every
+//! frame below then travels as a ChaCha20-Poly1305 record instead of in the
+//! clear. That is encryption; it is authentication only when the node was
+//! told which identities to expect (`--mesh-allow`, or a pin on the dialed
+//! address, `--peers host:port=<identity>`). The default, `plain`, is this
+//! paragraph's absence: the wire is byte-for-byte what it was.
+//!
 //! Wire: `u32 LE frame length ‖ type byte ‖ payload`.
 //! Types: 0x01 block envelope, 0x02 attestation, 0x03 get-blocks{after_slot},
 //! 0x04 transaction ([`FRAME_TX`], payload = one transaction's canonical
@@ -108,6 +126,8 @@ pub const FRAME_GET_BLOCKS: u8 = 0x03;
 pub const FRAME_TX: u8 = 0x04;
 
 pub use crate::p2p::{Origin, Verdict};
+mod handshake_rate;
+mod inbound_slots;
 mod source_budget;
 pub(crate) mod rejection_log;
 pub(crate) use source_budget::Reservation as SourceReservation;
@@ -267,6 +287,15 @@ impl Net {
     /// has not judged — is one this node does not forward. The devnet mesh has
     /// no such notion and drops it.
     pub fn report(&self, origin: &Origin, verdict: Verdict) {
+        // Bloch Sentinel: count rejected/ignored per source (node-local,
+        // observe-only; a no-op unless enabled).
+        crate::sentinel::note_verdict(origin.verification_source(), verdict);
+        // The devnet mesh keeps no score, but it does remember which source
+        // addresses delivered something the engine verified (W4-1); a no-op
+        // for every origin that carries no [`DeliveryProof`].
+        if verdict == Verdict::Accept {
+            origin.note_mesh_delivery_verified();
+        }
         match self {
             Net::Devnet(_) => {}
             // On `Both` this routes only the messages that actually came from
@@ -326,7 +355,115 @@ const SYNC_FANOUT: usize = 2;
 /// One request per lease; expiration permits another connection's turn even
 /// when peers stay silent or the applied head has not moved.
 const SYNC_LEASE: Duration = Duration::from_secs(5);
-const MAX_SYNC_SERVING_WORKERS: usize = 4;
+/// Each worker is one thread and one page in memory (at most
+/// `codec::MAX_FIELD_LEN` of block bytes), so this is also the memory bound
+/// of sync serving: 64 MiB at the very worst.
+const MAX_SYNC_SERVING_WORKERS: usize = 8;
+/// Workers only the operator's own `--peers` may use. However the rest of
+/// the pool is occupied, a configured peer that restarts can still catch up
+/// from this node.
+const SYNC_SERVING_RESERVED_FOR_CONFIGURED: usize = 2;
+/// Serving workers one normalized source address may hold at once. A worker
+/// is held for as long as its page takes to write, so without this a single
+/// address with a few connections could hold every worker and leave honest
+/// peers with silence. Two, not one, so nodes that legitimately share an
+/// address (one host, one NAT) do not serialize behind each other. It is a
+/// quarter of the pool (a third of what unconfigured sources may use), so no
+/// two sources can take every worker.
+const MAX_SYNC_SERVING_PER_SOURCE: usize = 2;
+/// The share of a source that has not recently been written a whole page
+/// (see [`SYNC_SOURCE_PROVEN_FOR`]). An address this node knows nothing about
+/// gets one worker; nodes sharing that address are served one after the
+/// other until the first page completes, which a reading peer does in
+/// seconds, and side by side from then on.
+const MAX_SYNC_SERVING_PER_UNPROVEN_SOURCE: usize = 1;
+/// How long a completed page vouches for its source.
+const SYNC_SOURCE_PROVEN_FOR: Duration = Duration::from_secs(600);
+/// A page of at least this many bytes, written in full, is what proves a
+/// source reads what it asks for. An empty or tiny page fits in any socket
+/// buffer whether or not the peer reads.
+const SYNC_PROVING_PAGE_BYTES: usize = 256 * 1024;
+/// After a page to a source is cut off for falling below the minimum rate,
+/// that source is not served again for this long. Without it a source that
+/// never reads gets a new worker the moment the old one is taken away. A
+/// peer that honestly cannot read 32 KiB/s loses nothing it could have used.
+/// Connections of configured peers are exempt (see `reserve_at`).
+const SYNC_STALL_COOLDOWN: Duration = Duration::from_secs(60);
+/// Sources remembered in each of the two maps above; idle records expire.
+const MAX_SYNC_SOURCE_RECORDS: usize = 1024;
+/// Slowest sustained read rate at which a peer is still served a whole page:
+/// 32 KiB/s (256 kbit/s). A node that cannot receive this fast cannot follow
+/// the chain either, since one maximal block body alone is 512 KiB.
+const SYNC_PAGE_MIN_BYTES_PER_SEC: u64 = 32 * 1024;
+/// Fixed allowance on top of the throughput budget, covering connection
+/// latency, frame overhead and broadcasts interleaved on the same socket.
+const SYNC_PAGE_WRITE_GRACE: Duration = Duration::from_secs(15);
+/// The same allowance for a source that is not proven. Five seconds still
+/// covers a slow connection's latency many times over; it is what a peer
+/// that reads nothing at all can hold a worker for, beyond the bytes the
+/// socket buffer swallows.
+const SYNC_PAGE_WRITE_GRACE_UNPROVEN: Duration = Duration::from_secs(5);
+
+/// Whole-page deadline for one `get-blocks` answer of `page_bytes` bytes.
+///
+/// [`DEVNET_IO_TIMEOUT`] bounds a single stalled write and is renewed by any
+/// progress, so a peer reading a few bytes per minute could hold a serving
+/// worker indefinitely. This budget is total: `SYNC_PAGE_WRITE_GRACE` plus
+/// the time the page takes at `SYNC_PAGE_MIN_BYTES_PER_SEC`. A maximal page
+/// (`codec::MAX_FIELD_LEN`, 8 MiB) therefore gets 15 s + 256 s = 271 s, and a
+/// peer reading at 32 KiB/s or faster can never reach the deadline.
+#[cfg(test)]
+fn sync_page_deadline(start: Instant, page_bytes: usize) -> Instant {
+    PagePace { start, grace: SYNC_PAGE_WRITE_GRACE, bytes_per_sec: SYNC_PAGE_MIN_BYTES_PER_SEC }.deadline(page_bytes)
+}
+
+/// The deadline of every block of one page, not only of its last.
+///
+/// One deadline for the whole page lets a peer that reads nothing hold the
+/// worker for the full budget of a page it will never receive. The budget is
+/// therefore spent block by block: block `k` must be written by the time the
+/// bytes up to and including it take at the minimum rate, plus the grace. A
+/// peer that reads at the minimum rate or faster meets every one of these, by
+/// the same arithmetic as the whole-page deadline, which is the last of them.
+#[derive(Clone, Copy)]
+struct PagePace {
+    start: Instant,
+    grace: Duration,
+    bytes_per_sec: u64,
+}
+
+impl PagePace {
+    fn starting_now(proven: bool) -> Self {
+        let grace = if proven { SYNC_PAGE_WRITE_GRACE } else { SYNC_PAGE_WRITE_GRACE_UNPROVEN };
+        Self { start: Instant::now(), grace, bytes_per_sec: SYNC_PAGE_MIN_BYTES_PER_SEC }
+    }
+
+    /// When the first `bytes` bytes of the page must have been written.
+    fn deadline(&self, bytes: usize) -> Instant {
+        let millis = (bytes as u128).saturating_mul(1000).div_ceil(u128::from(self.bytes_per_sec.max(1)));
+        self.start + self.grace + Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
+    }
+}
+
+/// How one page ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageOutcome {
+    /// Every block was written; the count of block bytes.
+    Written(usize),
+    /// Cut off at a deadline: the peer was not reading fast enough.
+    Stalled,
+    /// The connection ended for another reason.
+    Closed,
+}
+
+/// The address form used for per-source accounting: an IPv4-mapped IPv6
+/// address counts as its IPv4 address, as in `connection_limit`.
+/// The per-source key for sync serving: the same rule as every other
+/// per-source limit (IPv4 by address, IPv6 by /64, IPv4-mapped as IPv4), so
+/// one IPv6 prefix cannot occupy every serving worker.
+fn normalize_source(ip: std::net::IpAddr) -> std::net::IpAddr {
+    crate::connection_limit::limit_key(ip)
+}
 
 /// Blocks in one `FRAME_GET_BLOCKS` answer.
 ///
@@ -672,7 +809,110 @@ const OUTBOUND_QUEUE_DEPTH: usize = 256;
 /// peer count for inbound connections from peers that dialed first; past it a
 /// new connection is closed immediately, before either thread is spawned.
 const MAX_INBOUND_CONNECTIONS: usize = 128;
-const MAX_INBOUND_PER_IP: usize = 32;
+/// Inbound connections one source may hold: an IPv4 address or an IPv6 /64
+/// (see [`crate::connection_limit::limit_key`]).
+///
+/// This was 32 and keyed by full address, so four IPv4 hosts, or a single
+/// IPv6 /64, could hold every slot. Twenty is sixteen nodes behind one
+/// address, which is what mainnet operators run without listing each other
+/// (review W4-1: two fleet hosts with 13 and 11 validators are in nobody's
+/// `--peers`), plus four connections of headroom: a node replaces a
+/// connection by dialing while the listener may still be counting the one it
+/// replaces. It applies whether or not the connections have said anything:
+/// a validator's only regular message is one vote per epoch, so "has proven
+/// nothing yet" describes every honest connection for up to sixteen minutes,
+/// and the pending pool that used to cap such connections at four per
+/// address refused most of an honest host. What protects the table from an
+/// address that fills its share with idle connections is no longer a timer
+/// but an order of eviction, applied only when the table is full; see
+/// [`inbound_slots`]. An address at which `n` peers are configured
+/// additionally holds up to `2n + 2` exempt connections
+/// (`inbound_slots::Standing::for_source`).
+const MAX_INBOUND_PER_SOURCE: usize = 20;
+/// How long one block or vote that the engine verified vouches for the
+/// source address that delivered it (see `inbound_slots::Slots::note_verified`).
+/// Just under four epochs: a validator that votes every epoch renews it with
+/// room for two missed or late votes, and a source that stops proving itself
+/// is an ordinary one again within the hour.
+const INBOUND_VOUCH_FOR: Duration = Duration::from_secs(3600);
+/// Sources remembered as vouched.
+const MAX_VOUCHED_SOURCES: usize = 1024;
+/// Hard ceiling on inbound connections whose worker threads are still
+/// alive. An evicted connection leaves the slot table at once but its two
+/// threads take a moment to notice; this bounds how far the real resource
+/// count can run ahead of the table under eviction churn.
+const MAX_INBOUND_LIVE: usize = MAX_INBOUND_CONNECTIONS * 2;
+
+/// Sources remembered as operator-configured (see `start`).
+const MAX_CONFIGURED_SOURCES: usize = 1024;
+
+const INBOUND_POLICY: inbound_slots::Policy = inbound_slots::Policy {
+    total: MAX_INBOUND_CONNECTIONS,
+    per_source: MAX_INBOUND_PER_SOURCE,
+    // Same horizon as the socket timeout, but measured in well-formed frames:
+    // a frame of unknown type resets the socket timer and must not reset this.
+    idle_close: DEVNET_IO_TIMEOUT,
+    vouch_for: INBOUND_VOUCH_FOR,
+    vouched_sources: MAX_VOUCHED_SOURCES,
+};
+
+type InboundSlots = Arc<Mutex<inbound_slots::Slots<TcpStream>>>;
+type InboundSlot = inbound_slots::Slot<TcpStream>;
+
+/// Travels with a block or vote read from an unconfigured inbound connection
+/// (inside its [`SourceReservation`]) so that the engine's verdict can come
+/// back to the slot table: [`Net::report`] with [`Verdict::Accept`] means the
+/// engine checked a signature by a key in the validator registry, and that
+/// vouches for the source address that delivered it.
+///
+/// This is the only evidence on this transport that an arbitrary host cannot
+/// manufacture. A frame that merely decodes costs its sender nothing; under
+/// `--mesh-security offer` without pins or an allow-list (mainnet) a
+/// completed handshake proves a key generated a moment ago. Transactions do
+/// not carry one: anybody with a funded account can have one accepted.
+#[derive(Clone)]
+pub(crate) struct DeliveryProof {
+    slots: Weak<Mutex<inbound_slots::Slots<TcpStream>>>,
+    source: std::net::IpAddr,
+}
+
+impl DeliveryProof {
+    pub(crate) fn verified(&self) {
+        if let Some(slots) = self.slots.upgrade() {
+            if let Ok(mut slots) = slots.lock() {
+                slots.note_verified(self.source, Instant::now());
+            }
+        }
+    }
+}
+
+/// For engine tests: the origin an unconfigured mesh connection from
+/// `source` attaches to a vote, and a probe that says whether the slot table
+/// behind it now vouches for that address.
+#[cfg(test)]
+pub(crate) fn test_mesh_origin(source: std::net::IpAddr) -> (Origin, impl Fn() -> bool) {
+    let slots: InboundSlots = Arc::new(Mutex::new(inbound_slots::Slots::new(INBOUND_POLICY)));
+    let budget = QueueBudget::new();
+    let guard = source_budget::Registry::reserve(
+        &budget.sources,
+        source_budget::Source::ip(source),
+        EventClass::Attestation,
+        1,
+        budget.count_cap,
+        budget.bytes_cap,
+    )
+    .expect("an empty budget admits one frame");
+    guard.set_delivery_proof(DeliveryProof { slots: Arc::downgrade(&slots), source });
+    let mut origin = Origin::none();
+    origin.set_reservation(guard);
+    (origin, move || slots.lock().unwrap().is_vouched(source))
+}
+
+impl std::fmt::Debug for DeliveryProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeliveryProof").field("source", &self.source).finish()
+    }
+}
 
 /// Socket read/write timeout for the devnet mesh (R3 M-4 / R1 A3-M2). This
 /// transport had none: a peer that stopped reading its socket could stall
@@ -681,11 +921,15 @@ const MAX_INBOUND_PER_IP: usize = 32;
 /// held its reader thread — and its slot under [`MAX_INBOUND_CONNECTIONS`] —
 /// open forever.
 ///
-/// An honest peer's connection is never idle anywhere near this long: the
-/// dialer side below re-asks for history at least every 5 seconds while it
-/// holds a sync slot, and on a live chain a block or attestation broadcast
-/// arrives far more often than that. This is a generous multiple of that
-/// cadence, not a tight bound tuned to it.
+/// An honest connection IS idle this long, routinely (review W4-1): this
+/// mesh has no relay, so a connection carries only what its two ends
+/// authored, which for a validator is one vote per sixteen-minute epoch and
+/// a block about once an hour, plus a sync poll every `2.5 s` times the
+/// number of connections the dialer holds, well over two minutes on a node
+/// that dials or is dialed by most of the fleet. Such a connection is closed
+/// here and its dialer dials again at once; nothing is lost, because
+/// broadcasts wait in the dialer's queue. What the rest of this file must
+/// guarantee is that the dial is admitted again.
 const DEVNET_IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Sustained `get-blocks` answers this transport will build per connection,
@@ -794,7 +1038,9 @@ struct Connection {
     pending_sync: Mutex<Option<(u64, Instant)>>,
     serving_sync: AtomicBool,
     _counts: (ConnCount, Option<ConnCount>),
-    _ip_permit: Option<crate::connection_limit::Permit>,
+    /// The inbound slot this connection holds; `None` on a connection this
+    /// node dialed.
+    slot: Option<InboundSlot>,
 }
 
 impl Connection {
@@ -815,18 +1061,26 @@ impl Drop for ConnectionHalf {
     fn drop(&mut self) {
         self.0.closed.store(true, Ordering::Release);
         let _ = self.0.socket.shutdown(Shutdown::Both);
+        // The table slot goes back now, not when the second worker notices:
+        // the peer's dialer redials the moment it sees the close, and that
+        // dial must not be refused for the share of the connection it
+        // replaces. The threads themselves stay counted until they are gone
+        // (`MAX_INBOUND_LIVE`).
+        if let Some(slot) = &self.0.slot {
+            slot.release();
+        }
     }
 }
 
 fn run_inbound_writer(
     rx: Receiver<SharedFrame>,
-    socket: Arc<Mutex<TcpStream>>,
+    socket: Arc<Mutex<MeshWriter>>,
     half: ConnectionHalf,
 ) {
     run_connection_writer(&rx, socket, half);
 }
 
-fn run_connection_writer(rx: &Receiver<SharedFrame>, socket: Arc<Mutex<TcpStream>>, half: ConnectionHalf) {
+fn run_connection_writer(rx: &Receiver<SharedFrame>, socket: Arc<Mutex<MeshWriter>>, half: ConnectionHalf) {
     while !half.0.closed.load(Ordering::Acquire) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(frame) => {
@@ -834,7 +1088,7 @@ fn run_connection_writer(rx: &Receiver<SharedFrame>, socket: Arc<Mutex<TcpStream
                 if half.0.closed.load(Ordering::Acquire) { return; }
                 if frame.first() == Some(&FRAME_GET_BLOCKS)
                     && !half.0.take_sync_request(frame.as_ref(), Instant::now()) { continue; }
-                if write_frame(&mut *writer, frame.as_ref()).is_err() { return; }
+                if writer.write_frame(frame.as_ref()).is_err() { return; }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -844,33 +1098,69 @@ fn run_connection_writer(rx: &Receiver<SharedFrame>, socket: Arc<Mutex<TcpStream
 
 #[derive(Clone)]
 struct SyncResponder {
-    socket: Arc<Mutex<TcpStream>>,
+    socket: Arc<Mutex<MeshWriter>>,
     data_dir: PathBuf,
     budget: Arc<Mutex<SyncBudget>>,
+    /// The connection's source is one of the operator's own `--peers`.
+    configured: bool,
 }
 
-struct SyncServingGuard(Arc<Connection>, Arc<Mutex<SyncBudget>>);
+/// Connection, budget, normalized source, whether the source is configured,
+/// and whether it was proven when the worker was reserved.
+struct SyncServingGuard(Arc<Connection>, Arc<Mutex<SyncBudget>>, std::net::IpAddr, bool, bool);
 impl Drop for SyncServingGuard {
     fn drop(&mut self) {
         self.0.serving_sync.store(false, Ordering::Release);
-        if let Ok(mut budget) = self.1.lock() { budget.serving = budget.serving.saturating_sub(1); }
+        if let Ok(mut budget) = self.1.lock() {
+            budget.serving = budget.serving.saturating_sub(1);
+            if !self.3 { budget.serving_unconfigured = budget.serving_unconfigured.saturating_sub(1); }
+            if let Some(held) = budget.serving_by_source.get_mut(&self.2) {
+                *held = held.saturating_sub(1);
+                if *held == 0 { budget.serving_by_source.remove(&self.2); }
+            }
+        }
     }
 }
 
 impl SyncResponder {
     fn reserve(&self, connection: &Arc<Connection>, ip: std::net::IpAddr, limiter: &mut GetBlocksLimiter) -> Option<SyncServingGuard> {
-        let now = Instant::now();
+        self.reserve_at(connection, ip, limiter, Instant::now())
+    }
+
+    fn reserve_at(&self, connection: &Arc<Connection>, ip: std::net::IpAddr, limiter: &mut GetBlocksLimiter, now: Instant) -> Option<SyncServingGuard> {
         if connection.closed.load(Ordering::Acquire) || !limiter.admit(now) { return None; }
         let mut budget = self.budget.lock().ok()?;
         if !budget.admit(ip, now) || budget.serving >= MAX_SYNC_SERVING_WORKERS { return None; }
+        let source = normalize_source(ip);
+        // W3-2: the cooldown is keyed by address, and the operator's own
+        // `--peers` share addresses (one host, many validators). One frozen
+        // process must not lock its siblings out of this node for a minute,
+        // least of all while that host is recovering. A configured
+        // connection is therefore never refused for the cooldown; the
+        // unproven share below still limits what its address can hold.
+        if !self.configured && budget.cooling.get(&source).is_some_and(|until| now < *until) { return None; }
+        // The workers above the reserve are for every source; the reserve is
+        // for configured ones alone.
+        if !self.configured
+            && budget.serving_unconfigured >= MAX_SYNC_SERVING_WORKERS.saturating_sub(SYNC_SERVING_RESERVED_FOR_CONFIGURED)
+        {
+            return None;
+        }
+        let proven = budget.proven.get(&source).is_some_and(|at| now.saturating_duration_since(*at) < SYNC_SOURCE_PROVEN_FOR);
+        let share = if proven { MAX_SYNC_SERVING_PER_SOURCE } else { MAX_SYNC_SERVING_PER_UNPROVEN_SOURCE };
+        if budget.serving_by_source.get(&source).is_some_and(|held| *held >= share) { return None; }
         if connection.serving_sync.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() { return None; }
         budget.serving = budget.serving.saturating_add(1);
-        Some(SyncServingGuard(connection.clone(), self.budget.clone()))
+        if !self.configured { budget.serving_unconfigured = budget.serving_unconfigured.saturating_add(1); }
+        *budget.serving_by_source.entry(source).or_default() += 1;
+        Some(SyncServingGuard(connection.clone(), self.budget.clone(), source, self.configured, proven))
     }
 
-    fn answer(&self, connection: &Arc<Connection>, ip: std::net::IpAddr, frame: Vec<u8>, limiter: &mut GetBlocksLimiter) {
-        if frame.len() != 9 { return; }
-        let Some(guard) = self.reserve(connection, ip, limiter) else { return };
+    /// True when a worker took the request. A refused request is answered
+    /// with silence and is not activity on the connection.
+    fn answer(&self, connection: &Arc<Connection>, ip: std::net::IpAddr, frame: Vec<u8>, limiter: &mut GetBlocksLimiter) -> bool {
+        if frame.len() != 9 { return false; }
+        let Some(guard) = self.reserve(connection, ip, limiter) else { return false };
         let responder = self.clone();
         // One worker per active connection, with no page queue. Keeping the
         // reader free is necessary when both peers request pages together:
@@ -878,9 +1168,11 @@ impl SyncResponder {
         thread::spawn(move || {
             let _guard = guard;
             if !_guard.0.closed.load(Ordering::Acquire) {
-                serve_get_blocks(&responder.socket, &responder.data_dir, &frame, &_guard.0);
+                let outcome = serve_get_blocks(&responder.socket, &responder.data_dir, &frame, &_guard.0, PagePace::starting_now(_guard.4));
+                if let Ok(mut budget) = _guard.1.lock() { budget.note_page(_guard.2, outcome, Instant::now()); }
             }
         });
+        true
     }
 }
 
@@ -889,7 +1181,7 @@ impl SyncResponder {
 /// still accepts writes; retaining that writer would silently lose all inbound
 /// data and keep a sync permit occupied until the process restarts.
 fn run_outbound_reader(
-    mut socket: TcpStream,
+    mut socket: MeshReader,
     events: Sender<EngineEvent>,
     budget: Arc<QueueBudget>,
     _half: ConnectionHalf,
@@ -898,11 +1190,13 @@ fn run_outbound_reader(
     let Ok(address) = socket.peer_addr() else { return };
     let mut limiter = GetBlocksLimiter::new();
     loop {
-        match read_frame(&mut socket) {
+        match socket.read_frame() {
             Ok(frame) => {
                 if frame.first() == Some(&FRAME_GET_BLOCKS) {
                     responder.answer(&_half.0, address.ip(), frame, &mut limiter);
-                } else if !decode_and_send_from_ip(&events, &budget, address.ip(), &frame) {
+                } else if !decode_and_send_from_peer(&events, &budget, address.ip(), &frame, true) {
+                    // `true`: this connection was dialled to an address the
+                    // operator configured, and it is the one sync is asked on.
                     return;
                 }
             }
@@ -1055,13 +1349,19 @@ impl SyncScheduler {
         if sent { schedule.requested_after = None; }
     }
 
-    fn start_timer(scheduler: &Arc<Self>) {
+    fn start_timer(scheduler: &Arc<Self>) -> std::io::Result<()> {
         let weak = Arc::downgrade(scheduler);
-        thread::spawn(move || loop {
+        spawn_essential("mesh-sync-timer", move || loop {
             thread::sleep(Duration::from_millis(250));
             let Some(scheduler) = weak.upgrade() else { return };
+            // `pump` gives up quietly on a poisoned lock, on every caller's
+            // thread. Here that would be a node that never asks for a block
+            // again (W4-3).
+            if scheduler.schedule.is_poisoned() {
+                panic!("mesh: the sync schedule lock is poisoned");
+            }
             scheduler.pump(Instant::now(), None);
-        });
+        })
     }
 }
 
@@ -1098,6 +1398,20 @@ fn framed_event_shape(frame: &[u8]) -> Option<(EventClass, usize)> {
     Some((class, frame.len().saturating_sub(1)))
 }
 
+/// What one inbound frame turned out to be, for the slot accounting in
+/// [`inbound_slots`].
+#[derive(Debug, PartialEq, Eq)]
+enum FrameOutcome {
+    /// A valid frame: it decoded canonically and went to the engine.
+    Delivered,
+    /// A known type, refused by the queue budget before it was decoded.
+    Shed,
+    /// Unknown type or malformed. Not activity of any kind.
+    Ignored,
+    /// The engine is gone; the caller stops its thread.
+    EngineGone,
+}
+
 /// Admit a legacy devnet frame before decoding it.
 fn decode_and_send_from_ip(
     events: &Sender<EngineEvent>,
@@ -1105,7 +1419,47 @@ fn decode_and_send_from_ip(
     ip: std::net::IpAddr,
     frame: &[u8],
 ) -> bool {
-    let Some((class, size)) = framed_event_shape(frame) else { return true };
+    decode_and_send_from_peer(events, budget, ip, frame, false)
+}
+
+/// [`decode_and_send_from_ip`]; `configured` marks blocks read from a
+/// connection this node dialled, so the engine verifies them under the
+/// allowance reserved for sync and operator-configured peers.
+fn decode_and_send_from_peer(
+    events: &Sender<EngineEvent>,
+    budget: &QueueBudget,
+    ip: std::net::IpAddr,
+    frame: &[u8],
+    configured: bool,
+) -> bool {
+    admit_frame_from_ip(events, budget, ip, frame, configured) != FrameOutcome::EngineGone
+}
+
+/// The admission core every devnet reader shares. It reports what became of
+/// the frame so the inbound slot table can tell a useful peer from an idle
+/// one; `configured` is as in [`decode_and_send_from_peer`].
+fn admit_frame_from_ip(
+    events: &Sender<EngineEvent>,
+    budget: &QueueBudget,
+    ip: std::net::IpAddr,
+    frame: &[u8],
+    configured: bool,
+) -> FrameOutcome {
+    admit_frame_with_proof(events, budget, ip, frame, configured, None)
+}
+
+/// [`admit_frame_from_ip`] for an unconfigured inbound connection: a block
+/// or vote takes `proof` along, so the engine's verdict on it can vouch for
+/// the connection's source.
+fn admit_frame_with_proof(
+    events: &Sender<EngineEvent>,
+    budget: &QueueBudget,
+    ip: std::net::IpAddr,
+    frame: &[u8],
+    configured: bool,
+    proof: Option<&DeliveryProof>,
+) -> FrameOutcome {
+    let Some((class, size)) = framed_event_shape(frame) else { return FrameOutcome::Ignored };
     let Some(source_guard) = source_budget::Registry::reserve(
         &budget.sources,
         source_budget::Source::ip(ip),
@@ -1115,33 +1469,41 @@ fn decode_and_send_from_ip(
         budget.bytes_cap,
     ) else {
         budget.shed_counter(class).fetch_add(1, Ordering::Relaxed);
-        return true;
+        return FrameOutcome::Shed;
     };
     if !budget.reserve_raw(class, size) {
         budget.shed_counter(class).fetch_add(1, Ordering::Relaxed);
-        return true;
+        return FrameOutcome::Shed;
     }
 
     let Some(mut event) = decode_event(frame) else {
         budget.release_raw(size);
-        return true;
+        return FrameOutcome::Ignored;
     };
     // All three decoders are canonical. A future permissive decoder must not
     // release a different byte charge from the one reserved before it ran.
     if class_of(&event) != class || queued_bytes(&event) != size {
         budget.release_raw(size);
-        return true;
+        return FrameOutcome::Ignored;
+    }
+    if let Some(proof) = proof.filter(|_| class != EventClass::Transaction) {
+        source_guard.set_delivery_proof(proof.clone());
     }
     match &mut event {
         NetEvent::Block(_, origin)
         | NetEvent::Attestation(_, origin)
         | NetEvent::Transaction(_, origin) => origin.set_reservation(source_guard),
     }
+    if configured {
+        if let NetEvent::Block(_, origin) = &mut event {
+            origin.mark_directed_block();
+        }
+    }
     if events.send(EngineEvent::Net(event)).is_err() {
         budget.release_raw(size);
-        return false;
+        return FrameOutcome::EngineGone;
     }
-    true
+    FrameOutcome::Delivered
 }
 
 fn send_to_engine(events: &Sender<EngineEvent>, budget: &QueueBudget, ev: NetEvent) -> bool {
@@ -1219,6 +1581,221 @@ fn write_typed_frame<W: Write>(
     writer.write_all(payload)
 }
 
+/// Write half of one mesh connection: length-prefixed plain frames, or
+/// sealed records once `--mesh-security` has completed its handshake on the
+/// socket (see `mesh_pq.rs`). Callers hand it the same `type ‖ payload` frame
+/// either way.
+pub(crate) struct MeshWriter {
+    sock: TcpStream,
+    sealer: Option<crate::mesh_pq::Sealer>,
+}
+
+impl MeshWriter {
+    #[cfg(test)]
+    pub(crate) fn plain(sock: TcpStream) -> Self {
+        MeshWriter { sock, sealer: None }
+    }
+
+    fn write_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        match &mut self.sealer {
+            None => write_frame(&mut self.sock, frame),
+            Some(sealer) => sealer.write_record(&mut self.sock, &[frame]),
+        }
+    }
+
+    /// Write a typed frame under a deadline that progress does not renew.
+    /// The steady-state write timeout is restored afterwards because
+    /// broadcasts share this socket.
+    fn write_typed_frame_until(&mut self, frame_type: u8, payload: &[u8], deadline: Instant) -> std::io::Result<()> {
+        let mut writer = DeadlineWriter { sock: &self.sock, deadline };
+        let result = match &mut self.sealer {
+            None => write_typed_frame(&mut writer, frame_type, payload),
+            Some(sealer) => sealer.write_record(&mut writer, &[&[frame_type], payload]),
+        };
+        let restored = self.sock.set_write_timeout(Some(DEVNET_IO_TIMEOUT));
+        result.and(restored)
+    }
+}
+
+/// The write twin of [`read_exact_until`]: every `write` may block only for
+/// what is left of one budget (and never longer than [`DEVNET_IO_TIMEOUT`]),
+/// so partial progress cannot renew it.
+struct DeadlineWriter<'a> {
+    sock: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl Write for DeadlineWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.deadline.checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "page deadline exceeded"))?;
+        self.sock.set_write_timeout(Some(remaining.min(DEVNET_IO_TIMEOUT)))?;
+        self.sock.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.sock.flush()
+    }
+}
+
+/// Read half of one mesh connection; the twin of [`MeshWriter`].
+pub(crate) struct MeshReader {
+    sock: TcpStream,
+    opener: Option<crate::mesh_pq::Opener>,
+}
+
+impl MeshReader {
+    fn read_frame(&mut self) -> std::io::Result<Vec<u8>> {
+        match &mut self.opener {
+            None => read_frame(&mut self.sock),
+            Some(opener) => {
+                let deadline = Instant::now().checked_add(DEVNET_IO_TIMEOUT)
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame deadline out of range"))?;
+                opener.read_record(&mut self.sock, deadline)
+            }
+        }
+    }
+
+    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.sock.peer_addr()
+    }
+}
+
+/// Split a socket that has been through the handshake step into its two
+/// halves. Restores the steady-state write timeout the handshake narrowed.
+fn split_session(sock: TcpStream, session: crate::mesh_pq::Session) -> std::io::Result<(MeshReader, MeshWriter)> {
+    sock.set_write_timeout(Some(DEVNET_IO_TIMEOUT))?;
+    let rsock = sock.try_clone()?;
+    Ok(match session {
+        crate::mesh_pq::Session::Plain => (
+            MeshReader { sock: rsock, opener: None },
+            MeshWriter { sock, sealer: None },
+        ),
+        crate::mesh_pq::Session::Sealed { sealer, opener, .. } => (
+            MeshReader { sock: rsock, opener: Some(opener) },
+            MeshWriter { sock, sealer: Some(sealer) },
+        ),
+    })
+}
+
+/// Handshake refusals, at most one line per [`REFUSAL_LOG_EVERY`]. A port on
+/// a routable address gets scanned; a scanner on a `require` node must not
+/// turn into a log flood, and one line is enough to tell an operator that a
+/// peer is misconfigured.
+const REFUSAL_LOG_EVERY: Duration = Duration::from_secs(10);
+
+fn log_refusal(direction: &str, peer: &str, e: &std::io::Error) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let now = Instant::now();
+    let Ok(mut last) = LAST.lock() else { return };
+    if last.is_some_and(|t| now.saturating_duration_since(t) < REFUSAL_LOG_EVERY) {
+        return;
+    }
+    *last = Some(now);
+    eprintln!("net: mesh handshake {direction} {peer} refused: {e}");
+}
+
+/// How long a dialer waits before it tries again an address that turned out
+/// to be this node itself.
+const SELF_DIAL_RETRY: Duration = Duration::from_secs(60);
+/// The identity-conflict line (two nodes, one `mesh_identity.bin`) is logged
+/// at most this often, and never through the slot shared with ordinary
+/// refusals: it is the one refusal an operator has to act on, and a scanner
+/// or a refused stranger must not be able to keep it off the log (W4-2).
+const IDENTITY_CONFLICT_LOG_EVERY: Duration = Duration::from_secs(60);
+
+fn log_identity_conflict(direction: &str, peer: &str, e: &std::io::Error) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let now = Instant::now();
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if last.is_some_and(|t| now.saturating_duration_since(t) < IDENTITY_CONFLICT_LOG_EVERY) {
+        return;
+    }
+    *last = Some(now);
+    eprintln!("net: mesh handshake {direction} {peer} REFUSED: {e}");
+}
+
+/// A dialer in `offer` mode met a node that closed on the handshake's first
+/// bytes — what a legacy node does when it reads `"BPQ1"` as an 827 MB
+/// frame length.
+fn closed_on_handshake(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(e.kind(), UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe)
+}
+
+/// First pause of a dialer whose peer accepted the TCP connection and then
+/// turned it away, and the ceiling the pause doubles up to (review W4-1).
+///
+/// A listener that is full, or whose share for this node's address is taken,
+/// closes the connection at accept. The dialer used to dial again at once,
+/// forever. The pause applies only after a connection that was established
+/// and then closed on this node; a peer that is down refuses the TCP
+/// connection itself and is retried on the old, shorter cadence, so
+/// reconnecting to a peer that restarts is not delayed by this. Each peer
+/// has its own dialer thread, so one peer's pause delays no other's.
+const REFUSED_DIAL_BACKOFF_MIN: Duration = Duration::from_millis(250);
+const REFUSED_DIAL_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// A session that ends sooner than this was not a working connection, and
+/// its redial is paced like a refusal.
+const SHORT_SESSION: Duration = Duration::from_secs(5);
+/// Closed handshakes in a row before an `offer` dialer tries a plain session
+/// with a peer that has completed the handshake before in this process.
+const SEALED_PEER_HANDSHAKE_RETRIES: u32 = 3;
+/// How long an `offer` dialer watches a plain fallback connection for an
+/// immediate close before it starts writing: at least this, at most
+/// [`PLAIN_PROBE_MAX`], otherwise three times what the TCP connect took.
+const PLAIN_PROBE_MIN: Duration = Duration::from_millis(250);
+const PLAIN_PROBE_MAX: Duration = Duration::from_secs(2);
+
+/// The pause between dials that were turned away; see [`REFUSED_DIAL_BACKOFF_MIN`].
+struct RefusalBackoff(Duration);
+
+impl RefusalBackoff {
+    fn new() -> Self {
+        RefusalBackoff(REFUSED_DIAL_BACKOFF_MIN)
+    }
+
+    fn reset(&mut self) {
+        self.0 = REFUSED_DIAL_BACKOFF_MIN;
+    }
+
+    /// The pause to take now. The next one is twice as long, up to the ceiling.
+    fn next(&mut self) -> Duration {
+        let pause = self.0;
+        self.0 = pause.saturating_mul(2).min(REFUSED_DIAL_BACKOFF_MAX);
+        pause
+    }
+}
+
+/// True when the peer closes or resets a freshly connected socket within
+/// `wait`, having sent nothing: what a listener does to a connection it
+/// refuses at accept. Nothing is read from the socket.
+///
+/// The plain fallback of an `offer` dialer has no handshake whose failure
+/// would show a refusal, and its writer used to start at once and drain the
+/// peer's queue, this node's vote of the epoch included, into the closed
+/// socket. With no relay on this mesh that vote was lost for that peer.
+fn closed_at_once(sock: &TcpStream, wait: Duration) -> bool {
+    if sock.set_read_timeout(Some(wait)).is_err() {
+        return false;
+    }
+    let mut probe = [0u8; 1];
+    loop {
+        match sock.peek(&mut probe) {
+            Ok(0) => return true,
+            Ok(_) => return false,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // A timeout is a peer that is still there and has nothing to say.
+            Err(e) => return closed_on_handshake(&e),
+        }
+    }
+}
+
+fn plain_probe_wait(connect_took: Duration) -> Duration {
+    connect_took.saturating_mul(3).clamp(PLAIN_PROBE_MIN, PLAIN_PROBE_MAX)
+}
+
 /// Send one block envelope to a running node and disconnect — the
 /// `FRAME_BLOCK` twin of [`send_transaction`], for the devnet equivocation
 /// injector (`devnet_tools::equivocate`). Same contract: the node judges it
@@ -1249,7 +1826,7 @@ fn read_frame_until(sock: &mut TcpStream, deadline: Instant) -> std::io::Result<
 
 /// A single frame budget covers both its length prefix and payload. `read_exact`
 /// with a fixed socket timeout would renew the budget on every partial read.
-fn read_exact_until(sock: &mut TcpStream, mut buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
+pub(crate) fn read_exact_until(sock: &mut TcpStream, mut buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
     while !buf.is_empty() {
         let remaining = deadline.checked_duration_since(Instant::now())
             .filter(|d| !d.is_zero())
@@ -1336,11 +1913,41 @@ struct SyncBudget {
     addresses: std::collections::BTreeMap<std::net::IpAddr, GetBlocksLimiter>,
     global: GetBlocksLimiter,
     serving: usize,
+    /// Workers held per normalized source; entries exist only while nonzero,
+    /// so the map never exceeds MAX_SYNC_SERVING_WORKERS entries.
+    serving_by_source: std::collections::BTreeMap<std::net::IpAddr, usize>,
+    /// Of `serving`, the workers held for sources that are not configured.
+    serving_unconfigured: usize,
+    /// Normalized source → when a whole page was last written to it.
+    proven: std::collections::BTreeMap<std::net::IpAddr, Instant>,
+    /// Normalized source → not served before this instant.
+    cooling: std::collections::BTreeMap<std::net::IpAddr, Instant>,
 }
 impl SyncBudget {
-    fn new() -> Self { Self { serving: 0, addresses: Default::default(), global: GetBlocksLimiter { tokens: 128.0, last: Instant::now(), rate: 64.0, capacity: 128.0 } } }
+    fn new() -> Self { Self { serving: 0, serving_by_source: Default::default(), serving_unconfigured: 0, proven: Default::default(), cooling: Default::default(), addresses: Default::default(), global: GetBlocksLimiter { tokens: 128.0, last: Instant::now(), rate: 64.0, capacity: 128.0 } } }
+    /// Record how a page to `source` (already normalized) ended.
+    fn note_page(&mut self, source: std::net::IpAddr, outcome: PageOutcome, now: Instant) {
+        match outcome {
+            PageOutcome::Written(bytes) if bytes >= SYNC_PROVING_PAGE_BYTES => {
+                if !self.proven.contains_key(&source) {
+                    self.proven.retain(|_, at| now.saturating_duration_since(*at) < SYNC_SOURCE_PROVEN_FOR);
+                    if self.proven.len() >= MAX_SYNC_SOURCE_RECORDS { return; }
+                }
+                self.proven.insert(source, now);
+            }
+            PageOutcome::Stalled => {
+                self.proven.remove(&source);
+                if !self.cooling.contains_key(&source) {
+                    self.cooling.retain(|_, until| now < *until);
+                    if self.cooling.len() >= MAX_SYNC_SOURCE_RECORDS { return; }
+                }
+                self.cooling.insert(source, now + SYNC_STALL_COOLDOWN);
+            }
+            PageOutcome::Written(_) | PageOutcome::Closed => {}
+        }
+    }
     fn admit(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
-        let ip = match ip { std::net::IpAddr::V6(v) => v.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip), _ => ip };
+        let ip = crate::connection_limit::limit_key(ip);
         if !self.addresses.contains_key(&ip) {
             self.addresses.retain(|_, bucket| now.saturating_duration_since(bucket.last) < Duration::from_secs(60));
             if self.addresses.len() >= 1024 { return false; }
@@ -1363,13 +1970,14 @@ impl SyncBudget {
 /// answer is hundreds of megabytes, and holding it throughout would stall every
 /// broadcast to this peer for the duration.
 fn serve_get_blocks(
-    sock: &Arc<Mutex<TcpStream>>,
+    sock: &Arc<Mutex<MeshWriter>>,
     data_dir: &PathBuf,
     frame: &[u8],
     connection: &Connection,
-) {
+    pace: PagePace,
+) -> PageOutcome {
     if frame.len() != 9 || connection.closed.load(Ordering::Acquire) {
-        return;
+        return PageOutcome::Closed;
     }
     // SyncResponder admits rate limits and the per-connection worker permit
     // before this function can touch disk.
@@ -1377,7 +1985,7 @@ fn serve_get_blocks(
     // exactly 8 bytes and the conversion cannot fail; the `else` arm keeps it
     // panic-free by construction rather than by an `unwrap`.
     let Ok(after_bytes) = frame[1..9].try_into() else {
-        return;
+        return PageOutcome::Closed;
     };
     let after = u64::from_le_bytes(after_bytes);
     // Paged at `SYNC_PAGE_BLOCKS`. This used to answer `usize::MAX` — the whole
@@ -1388,19 +1996,147 @@ fn serve_get_blocks(
     // full history still arrives; it just no longer arrives as one allocation
     // large enough to kill the receiver.
     match crate::store::Store::blocks_after(data_dir, after, SYNC_PAGE_BLOCKS) {
-        Ok(blocks) => {
-            for b in blocks {
-                let Ok(mut w) = sock.lock() else { return };
-                if connection.closed.load(Ordering::Acquire) { return; }
-                if write_typed_frame(&mut *w, FRAME_BLOCK, &b).is_err() {
-                    // A partial frame cannot be followed by more framed data.
+        // The clock of the page starts after the read from disk: the peer
+        // is not charged for this node's storage.
+        Ok(blocks) => write_sync_page(sock, &blocks, connection, PagePace { start: Instant::now(), ..pace }),
+        Err(e) => {
+            eprintln!("net: get-blocks failed: {e}");
+            PageOutcome::Closed
+        }
+    }
+}
+
+/// Write one page, giving up and closing the connection as soon as a block
+/// misses its deadline under `pace`. The caller's serving worker is therefore
+/// held for a bounded time whatever the peer does, including while a
+/// broadcast to the same slow peer holds the socket lock, and a peer that
+/// reads nothing loses it after the first block the socket buffer refuses.
+fn write_sync_page(
+    sock: &Arc<Mutex<MeshWriter>>,
+    blocks: &[Vec<u8>],
+    connection: &Connection,
+    pace: PagePace,
+) -> PageOutcome {
+    let mut written = 0usize;
+    for b in blocks {
+        let deadline = pace.deadline(written.saturating_add(b.len()));
+        let mut w = loop {
+            if connection.closed.load(Ordering::Acquire) { return PageOutcome::Closed; }
+            match sock.try_lock() {
+                Ok(w) => break w,
+                Err(std::sync::TryLockError::Poisoned(_)) => return PageOutcome::Closed,
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
                     connection.closed.store(true, Ordering::Release);
                     let _ = connection.socket.shutdown(Shutdown::Both);
-                    return;
+                    return PageOutcome::Stalled;
                 }
             }
+        };
+        if connection.closed.load(Ordering::Acquire) { return PageOutcome::Closed; }
+        if w.write_typed_frame_until(FRAME_BLOCK, b, deadline).is_err() {
+            // A partial frame cannot be followed by more framed data.
+            connection.closed.store(true, Ordering::Release);
+            let _ = connection.socket.shutdown(Shutdown::Both);
+            // Past the deadline the peer was too slow; before it, the
+            // connection broke, which is nobody's stall.
+            return if Instant::now() >= deadline { PageOutcome::Stalled } else { PageOutcome::Closed };
         }
-        Err(e) => eprintln!("net: get-blocks failed: {e}"),
+        written = written.saturating_add(b.len());
+    }
+    PageOutcome::Written(written)
+}
+
+/// Start a thread without which this node is deaf or mute on the mesh
+/// (review W4-3): the accept loop, each peer's dialer loop, the sync timer
+/// and the watchdog. It holds [`crate::EssentialThread`], so a panic on it
+/// ends the process and the supervisor restarts the node, instead of leaving
+/// a validator that keeps signing with nobody to hear it. An error here is
+/// the OS refusing the thread; [`start`] returns it and the node does not
+/// boot in that state.
+///
+/// A connection's own reader and writer are deliberately NOT started this
+/// way: a panic in one of those closes that connection and nothing else.
+fn spawn_essential(name: &'static str, body: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    thread::Builder::new().name(name.to_string()).spawn(move || {
+        let _essential = crate::EssentialThread::new(name);
+        body();
+    })?;
+    Ok(())
+}
+
+/// Failed attempts in a row to start a connection's worker thread, and the
+/// time they must span, before the watchdog ends the process (W4-3).
+///
+/// One refused thread is one refused connection: the peer dials again, or
+/// this node does. A node that cannot start any worker for a whole minute is
+/// losing its connections as they are replaced and can make no new ones; it
+/// would end up deaf and mute with its process up. Both conditions must
+/// hold, and any thread that does start clears the count, so a burst of
+/// failures during a short squeeze on the host never restarts a validator.
+const SPAWN_FAILURES_FATAL: u32 = 16;
+const SPAWN_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+
+/// When the current run of failed worker starts began, and how long it is.
+#[derive(Default)]
+struct SpawnHealth(Mutex<Option<(Instant, u32)>>);
+
+impl SpawnHealth {
+    fn run(&self) -> std::sync::MutexGuard<'_, Option<(Instant, u32)>> {
+        // Two plain fields: a panic elsewhere cannot leave them half-written.
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn started(&self) {
+        *self.run() = None;
+    }
+
+    fn failed(&self, now: Instant) {
+        let mut run = self.run();
+        *run = Some(run.map_or((now, 1), |(since, failures)| (since, failures.saturating_add(1))));
+    }
+
+    fn exhausted(&self, now: Instant) -> bool {
+        self.run().is_some_and(|(since, failures)| {
+            failures >= SPAWN_FAILURES_FATAL && now.saturating_duration_since(since) >= SPAWN_FAILURE_WINDOW
+        })
+    }
+}
+
+/// Start one connection's worker. False when the OS refused the thread; the
+/// worker's closure is dropped, which closes whatever it owned.
+fn spawn_connection(health: &SpawnHealth, name: &str, body: impl FnOnce() + Send + 'static) -> bool {
+    spawn_connection_with(health, name, body, |name, body| {
+        thread::Builder::new().name(name.to_string()).spawn(body).map(drop)
+    })
+}
+
+/// [`spawn_connection`] with the thread start spelled out, so a test can
+/// refuse it.
+fn spawn_connection_with<F: FnOnce() + Send + 'static>(
+    health: &SpawnHealth,
+    name: &str,
+    body: F,
+    spawn: impl FnOnce(&str, F) -> std::io::Result<()>,
+) -> bool {
+    match spawn(name, body) {
+        Ok(()) => {
+            health.started();
+            true
+        }
+        Err(e) => {
+            health.failed(Instant::now());
+            static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+            let now = Instant::now();
+            let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !last.is_some_and(|t| now.saturating_duration_since(t) < REFUSAL_LOG_EVERY) {
+                *last = Some(now);
+                eprintln!("net: could not start the `{name}` thread for a mesh connection ({e}); the connection is dropped");
+            }
+            false
+        }
     }
 }
 
@@ -1413,8 +2149,14 @@ fn serve_get_blocks(
 /// and no peer scoring** — `gossip.rs` is not wired here — so anything that
 /// can reach the port can feed it frames. Binding a routable address is
 /// therefore opt-in (`--listen-addr`), and when it is used the operator is
-/// responsible for restricting the port to known peers at the firewall. The
-/// production answer is the libp2p stack, not this.
+/// responsible for restricting the port to known peers at the firewall.
+///
+/// `security` changes that: under `require` with an allow-list or pinned
+/// peers only the expected ML-DSA-65 identities get a connection, and every
+/// frame is encrypted and authenticated (`mesh_pq.rs`). Under `require` with
+/// neither, frames are encrypted but any identity is accepted, so the
+/// paragraph above still holds against anything that can reach the port.
+/// Keep the firewall anyway; under `plain` that paragraph is the whole truth.
 pub fn start(
     bind_addr: &str,
     listen_port: u16,
@@ -1423,6 +2165,7 @@ pub fn start(
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
     inflight: Arc<QueueBudget>,
+    security: Arc<crate::mesh_pq::MeshSecurity>,
 ) -> std::io::Result<DevnetMesh> {
     // Inbound: accept, then per-connection: read frames; data frames go to
     // the engine; get-blocks is answered by a globally bounded serving worker.
@@ -1438,10 +2181,72 @@ pub fn start(
     // inbound flood must not have that flood count against the outbound
     // side's accounting either.
     let inbound_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let ip_limits = Arc::new(crate::connection_limit::Limits::default());
+    let slots: InboundSlots = Arc::new(Mutex::new(inbound_slots::Slots::new(INBOUND_POLICY)));
+    // Sources of the operator's own `--peers`, exempt from the inbound
+    // shares, deadlines and eviction. Literal addresses are known now; a peer
+    // given by name is learned by its dialer thread on the first connection.
+    // The value is the number of configured peers at that source: the
+    // standing is granted by address, before any handshake, so it is
+    // rationed by what the operator actually configured there.
+    let configured: Arc<Mutex<std::collections::BTreeMap<std::net::IpAddr, usize>>> = Arc::new(Mutex::new(
+        peer_addrs
+            .iter()
+            .filter_map(|addr| addr.parse::<SocketAddr>().ok())
+            .map(|addr| crate::connection_limit::limit_key(addr.ip()))
+            .fold(std::collections::BTreeMap::new(), |mut peers, source| {
+                *peers.entry(source).or_insert(0usize) += 1;
+                peers
+            }),
+    ));
     let sync_budget = Arc::new(Mutex::new(SyncBudget::new()));
+    let spawn_health = Arc::new(SpawnHealth::default());
+    {
+        // Deadlines must not wait for the next accept: a quiet listener would
+        // otherwise keep expired connections and their threads.
+        //
+        // The same tick is the mesh's watchdog (W4-3). Every lock below is
+        // taken with "if it is poisoned, do nothing" somewhere on a hot path,
+        // which is right for one connection's thread and wrong for the node:
+        // a poisoned slot table refuses every inbound connection, a poisoned
+        // source registry sheds every frame, a poisoned peer registry stops
+        // every broadcast to peers that dialed in, a poisoned serving budget
+        // answers no sync request, all silently and for good. A lock is
+        // poisoned only by a panic that held it, so this is a bug having
+        // fired, and the process ends here instead.
+        let slots = Arc::downgrade(&slots);
+        let inbound = inbound.clone();
+        let sync_budget = sync_budget.clone();
+        let configured = configured.clone();
+        let inflight = inflight.clone();
+        let spawn_health = spawn_health.clone();
+        spawn_essential("mesh-watchdog", move || loop {
+            thread::sleep(Duration::from_secs(1));
+            let Some(slots) = slots.upgrade() else { return };
+            let now = Instant::now();
+            match slots.lock() {
+                Ok(mut slots) => slots.reap(now),
+                Err(_) => panic!("mesh: the inbound slot table lock is poisoned"),
+            }
+            for (what, poisoned) in [
+                ("inbound peer registry", inbound.is_poisoned()),
+                ("sync serving budget", sync_budget.is_poisoned()),
+                ("configured source table", configured.is_poisoned()),
+                ("source admission registry", inflight.sources.is_poisoned()),
+            ] {
+                if poisoned {
+                    panic!("mesh: the {what} lock is poisoned");
+                }
+            }
+            if spawn_health.exhausted(now) {
+                panic!(
+                    "mesh: no connection thread could be started for {} s ({SPAWN_FAILURES_FATAL} or more attempts)",
+                    SPAWN_FAILURE_WINDOW.as_secs(),
+                );
+            }
+        })?;
+    }
     let sync = SyncScheduler::new(head_slot.clone(), inflight.clone());
-    SyncScheduler::start_timer(&sync);
+    SyncScheduler::start_timer(&sync)?;
     {
         let events = events.clone();
         let data_dir = data_dir.clone();
@@ -1451,25 +2256,77 @@ pub fn start(
         let inbound_live = inbound_live.clone();
         let scheduler = Arc::downgrade(&sync);
         let sync_budget = sync_budget.clone();
-        thread::spawn(move || {
+        let security = security.clone();
+        let configured = configured.clone();
+        let spawn_health = spawn_health.clone();
+        spawn_essential("mesh-accept", move || {
+            // Audit L1-04: only this loop admits, so the limiter needs no lock.
+            let mut handshake_rate = handshake_rate::HandshakeRate::new(Instant::now());
             for conn in listener.incoming() {
-                let Ok(sock) = conn else { continue };
+                let Ok(sock) = conn else {
+                    // Out of descriptors, typically, and the connection is
+                    // still waiting: not a busy loop while that lasts.
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                };
+                crate::sentinel::note_inbound_attempt(&sock);
                 // A quiet mesh may never broadcast. Prune on accept too, so
                 // connection churn cannot retain one dead sender per dial.
-                if let Ok(mut reg) = inbound.lock() {
-                    reg.retain(InboundPeer::is_open);
+                match inbound.lock() {
+                    Ok(mut reg) => reg.retain(InboundPeer::is_open),
+                    // W4-3: not "skip it": see the watchdog.
+                    Err(_) => panic!("mesh: the inbound peer registry lock is poisoned"),
                 }
                 // R3 M-4 / R1 A3-M2: past the cap, close the socket immediately
                 // — `sock` drops at the end of this iteration — before either
                 // thread below is spawned and before the socket costs this
                 // node anything beyond the accept itself.
-                if inbound_live.load(Ordering::Acquire) >= MAX_INBOUND_CONNECTIONS {
+                if inbound_live.load(Ordering::Acquire) >= MAX_INBOUND_LIVE {
                     continue;
                 }
                 let Ok(address) = sock.peer_addr() else { continue };
-                // Accommodate multiple validators per host, but one address
-                // cannot consume the global 128-connection allowance.
-                let Some(ip_permit) = ip_limits.reserve(address.ip(), MAX_INBOUND_PER_IP) else { continue };
+                let Ok(evict_handle) = sock.try_clone() else { continue };
+                let peers_here = configured
+                    .lock()
+                    .ok()
+                    .and_then(|peers| peers.get(&crate::connection_limit::limit_key(address.ip())).copied())
+                    .unwrap_or(0);
+                // Bloch Sentinel: a banned, non-configured source is closed
+                // here, before any slot or thread (a no-op unless enabled).
+                if crate::sentinel::refuse_inbound(address.ip(), peers_here > 0) {
+                    continue;
+                }
+                // This loop is the only thing that adds slots, so the count
+                // cannot grow between this read and the admission below.
+                let (held, vouched) = match slots.lock() {
+                    Ok(slots) => (slots.configured_held(address.ip()), slots.is_vouched(address.ip())),
+                    // W4-3: every later connection would be refused too.
+                    Err(_) => panic!("mesh: the inbound slot table lock is poisoned"),
+                };
+                let standing = inbound_slots::Standing::for_source(peers_here, held);
+                let is_configured = standing.is_configured();
+                // Audit L1-04: the handshake below costs an ML-KEM
+                // encapsulation and an ML-DSA-65 signature before the dialer
+                // has proven anything. Bound how fast strangers can buy it,
+                // per source and (strangers only) in total, before a slot is
+                // taken or a thread spawned. The operator's own peers are
+                // exempt, and a source the slot table vouches for is bound
+                // by its own bucket only (review R-07).
+                let dialer = if is_configured {
+                    handshake_rate::Dialer::Configured
+                } else if vouched {
+                    handshake_rate::Dialer::Vouched
+                } else {
+                    handshake_rate::Dialer::Stranger
+                };
+                if !handshake_rate.admit(address.ip(), dialer, Instant::now()) {
+                    continue;
+                }
+                // The share and, in a full table, eviction are decided here;
+                // see `inbound_slots`. A refusal drops `sock`, closing it.
+                let Some(slot) = InboundSlot::admit(&slots, address.ip(), standing, Instant::now(), evict_handle) else {
+                    continue;
+                };
                 // R3 M-4 / R1 A3-M2: bounded so a peer that stops reading or
                 // never writes cannot hold a thread and a queue open forever.
                 if sock.set_read_timeout(Some(DEVNET_IO_TIMEOUT)).is_err()
@@ -1477,59 +2334,158 @@ pub fn start(
                 {
                     continue;
                 }
-                // Reading and writing need separate handles: the reader blocks
-                // in `read_frame` for as long as the peer is quiet, and a
-                // broadcast must not wait behind it.
-                let Ok(rsock) = sock.try_clone() else { continue };
-                let Ok(shutdown_socket) = sock.try_clone() else { continue };
-                let connection = Arc::new(Connection {
-                    socket: shutdown_socket,
-                    closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
-                    _counts: (ConnCount::new(&live), Some(ConnCount::new(&inbound_live))),
-                    _ip_permit: Some(ip_permit),
-                });
-                let wsock = Arc::new(Mutex::new(sock));
-
-                // One writer thread per connection, fed by a bounded queue, so
-                // a peer that stops reading fills its own queue and is dropped
-                // from there rather than blocking this node's broadcast loop.
-                let (tx, rx) = mpsc::sync_channel::<SharedFrame>(INBOUND_QUEUE_DEPTH);
-                {
-                    let wsock = wsock.clone();
-                    let half = ConnectionHalf(connection.clone());
-                    thread::spawn(move || {
-                        run_inbound_writer(rx, wsock, half);
-                    });
-                }
-                let peer = InboundPeer { frames: tx, connection: Arc::downgrade(&connection) };
-                if let Ok(mut reg) = inbound.lock() { reg.push(peer.clone()); }
-                if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer, Instant::now()); }
-
+                // The inbound slot is taken here, before the handshake, so a
+                // flood of half-open handshakes is bounded by the table and
+                // by its source's share like any other connection. The
+                // handshake itself runs on the connection's own thread: a slow
+                // or silent dialer must not hold up the accept loop.
+                let inbound_slot = ConnCount::new(&inbound_live);
                 let events = events.clone();
                 let data_dir = data_dir.clone();
                 let inflight = inflight.clone();
-                let mut rsock = rsock;
-                // Counted from here to wherever this thread leaves. The guards
-                // are moved into the closure, so every `return` below and any
-                // unwind releases both.
-                let half = ConnectionHalf(connection);
-                let responder = SyncResponder { socket: wsock, data_dir: data_dir.clone(), budget: sync_budget.clone() };
-                thread::spawn(move || {
-                    let _half = half;
+                let inbound = inbound.clone();
+                let live = live.clone();
+                let scheduler = scheduler.clone();
+                let sync_budget = sync_budget.clone();
+                let security = security.clone();
+                let proof = (!is_configured).then(|| DeliveryProof {
+                    slots: Arc::downgrade(&slots),
+                    source: address.ip(),
+                });
+                let workers = spawn_health.clone();
+                // W4-3: a thread the OS refuses is a refused connection (the
+                // closure owns the socket and the slot, and dropping it
+                // closes one and frees the other), not a panic that ends
+                // inbound accepting for the life of the process.
+                spawn_connection(&spawn_health, "mesh-in", move || {
+                    let mut sock = sock;
+                    let session = match crate::mesh_pq::handshake_inbound(&mut sock, &security) {
+                        Ok(session) => session,
+                        Err(e) => {
+                            use crate::mesh_pq::OwnIdentity;
+                            match crate::mesh_pq::own_identity_refusal(&e) {
+                                // This node's own dial, back at its own
+                                // listener. Its dialer says so, once.
+                                Some(OwnIdentity::SelfConnection) => {}
+                                Some(OwnIdentity::SharedIdentityFile) => {
+                                    log_identity_conflict("from", &address.to_string(), &e)
+                                }
+                                None => {
+                                    log_refusal("from", &address.to_string(), &e);
+                                    // Not this node's own dial or identity:
+                                    // a failure of the remote source.
+                                    crate::sentinel::note_handshake_failure(address.ip());
+                                }
+                            }
+                            return;
+                        }
+                    };
+                    // A handshake against an allow-list or a pin vouches for
+                    // the connection. A plain session has proven nothing, and
+                    // neither has a sealed session whose peer identity was
+                    // checked against nothing (encryption only; review
+                    // CRY-7): those are vouched for by the first block or
+                    // vote from their address that the engine verifies.
+                    if session.authenticated() && !slot.mark_authenticated() {
+                        return;
+                    }
+                    let Ok(shutdown_socket) = sock.try_clone() else { return };
+                    // Reading and writing need separate handles: the reader
+                    // blocks in `read_frame` for as long as the peer is quiet,
+                    // and a broadcast must not wait behind it.
+                    let Ok((mut reader, writer)) = split_session(sock, session) else { return };
+                    let connection = Arc::new(Connection {
+                        socket: shutdown_socket,
+                        closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
+                        _counts: (ConnCount::new(&live), Some(inbound_slot)),
+                        slot: Some(slot),
+                    });
+                    let wsock = Arc::new(Mutex::new(writer));
+
+                    // One writer thread per connection, fed by a bounded queue,
+                    // so a peer that stops reading fills its own queue and is
+                    // dropped from there rather than blocking this node's
+                    // broadcast loop.
+                    let (tx, rx) = mpsc::sync_channel::<SharedFrame>(INBOUND_QUEUE_DEPTH);
+                    {
+                        let wsock = wsock.clone();
+                        let half = ConnectionHalf(connection.clone());
+                        // Without its writer this connection would take
+                        // broadcasts into a queue nobody drains.
+                        if !spawn_connection(&workers, "mesh-in-w", move || run_inbound_writer(rx, wsock, half)) {
+                            return;
+                        }
+                    }
+                    let peer = InboundPeer { frames: tx, connection: Arc::downgrade(&connection) };
+                    if let Ok(mut reg) = inbound.lock() { reg.push(peer.clone()); }
+                    // Not a sync source yet: a connection that has delivered
+                    // nothing would take a share of the sync leases and answer
+                    // none of them. It is registered on its first valid frame.
+                    // A configured source is the operator's own peer and is
+                    // asked from the start, as it always was.
+                    if is_configured {
+                        if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer.clone(), Instant::now()); }
+                    }
+
+                    // Counted from here to wherever this thread leaves. The
+                    // guards live in `_half`, so every `return` below and any
+                    // unwind releases both.
+                    let _half = ConnectionHalf(connection);
+                    let responder = SyncResponder { socket: wsock, data_dir: data_dir.clone(), budget: sync_budget, configured: is_configured };
                     // Per-connection (R3 M-4 / R1 A3-M2): see [`GetBlocksLimiter`].
                     let mut get_blocks_limiter = GetBlocksLimiter::new();
+                    // Whether the sync scheduler already knows this peer.
+                    let mut offered = is_configured;
                     loop {
-                        match read_frame(&mut rsock) {
+                        match reader.read_frame() {
                             Ok(frame) => {
                                 if frame.first() == Some(&FRAME_GET_BLOCKS) {
-                                    responder.answer(&_half.0, address.ip(), frame, &mut get_blocks_limiter);
-                                } else if !decode_and_send_from_ip(
-                                    &events,
-                                    &inflight,
-                                    address.ip(),
-                                    &frame,
-                                ) {
-                                    return;
+                                    // A request the limiter or the worker pool
+                                    // refused is not activity. One a worker
+                                    // took keeps the connection open, which a
+                                    // node that is catching up needs, but nine
+                                    // bytes are not usefulness: the connection
+                                    // stays first in line for eviction. It is
+                                    // still offered to the sync scheduler: on
+                                    // a chain that produces no blocks this is
+                                    // the only frame a dialer ever sends, and a
+                                    // listener with a short log must be able
+                                    // to ask it for history.
+                                    let well_formed = frame.len() == 9;
+                                    if responder.answer(&_half.0, address.ip(), frame, &mut get_blocks_limiter) {
+                                        let Some(slot) = _half.0.slot.as_ref() else { return };
+                                        let now = Instant::now();
+                                        if !slot.mark_requested(now) { return; }
+                                        if !offered {
+                                            offered = true;
+                                            if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer.clone(), now); }
+                                        }
+                                    } else if well_formed {
+                                        // Still a peer that is alive and
+                                        // polling: the idle deadline must not
+                                        // close it because this node's
+                                        // serving pool was busy (W4-1).
+                                        if let Some(slot) = _half.0.slot.as_ref() { slot.mark_heard(Instant::now()); }
+                                    }
+                                    continue;
+                                }
+                                let outcome = admit_frame_with_proof(&events, &inflight, address.ip(), &frame, false, proof.as_ref());
+                                let Some(slot) = _half.0.slot.as_ref() else { return };
+                                let now = Instant::now();
+                                match outcome {
+                                    FrameOutcome::EngineGone => return,
+                                    FrameOutcome::Delivered => match slot.mark_valid(now) {
+                                        // Expired or evicted while this frame was in flight.
+                                        None => return,
+                                        Some(true) if !offered => {
+                                            offered = true;
+                                            if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer.clone(), now); }
+                                        }
+                                        Some(_) => {}
+                                    },
+                                    FrameOutcome::Shed => slot.mark_heard(now),
+                                    // Unknown or malformed frames are not activity.
+                                    FrameOutcome::Ignored => {}
                                 }
                             }
                             Err(_) => return,
@@ -1537,7 +2493,7 @@ pub fn start(
                     }
                 });
             }
-        });
+        })?;
     }
 
     // Both triggers use the same scheduler. Dialers only write queued frames;
@@ -1554,50 +2510,185 @@ pub fn start(
         let events = events.clone();
         let inflight = inflight.clone();
         let live = live.clone();
-        thread::spawn(move || loop {
-            let Ok(sock) = TcpStream::connect(&addr) else {
+        let security = security.clone();
+        let configured = configured.clone();
+        // A literal address was counted when the set was built. A name is
+        // counted where it last resolved, once, for as long as it stays there.
+        let counted_at_start = addr.parse::<SocketAddr>().is_ok();
+        let spawn_health = spawn_health.clone();
+        // W4-3: with this thread gone the peer is never dialed again and its
+        // queue fills and drops in silence.
+        spawn_essential("mesh-dialer", move || {
+            #[cfg(test)]
+            if addr == tests::PANICKING_PEER {
+                panic!("intentional: a dialer thread panics");
+            }
+            let mut learned: Option<std::net::IpAddr> = None;
+            // `offer` against a legacy peer: a handshake the peer closed on
+            // sends the NEXT connection plain; when that plain session ends
+            // the handshake is tried again, so an upgraded peer is picked up
+            // on its first reconnect with no restart here.
+            let mut fallback_plain = false;
+            // W4-1. Whether this peer has completed the handshake before in
+            // this process (such a peer is not a legacy node, so a close on
+            // the handshake is a refusal or a restart, not a reason to go
+            // plain), how many handshakes in a row it closed on, and the
+            // pause before the next dial after being turned away. Frames
+            // broadcast meanwhile wait in `rx`; nothing is written until a
+            // connection is known to be open.
+            let mut sealed_before = false;
+            let mut closed_handshakes = 0u32;
+            let mut backoff = RefusalBackoff::new();
+            let mut said_self = false;
+            loop {
+            let dialing = Instant::now();
+            let Ok(mut sock) = TcpStream::connect(&addr) else {
                 thread::sleep(Duration::from_millis(300));
                 continue;
+            };
+            let connect_took = dialing.elapsed();
+            if let Ok(address) = sock.peer_addr() {
+                crate::sentinel::note_outbound(address.ip());
+            }
+            // Bounded: a name that resolves somewhere new on every dial must
+            // not grow this set for the life of the process.
+            if let (false, Ok(address), Ok(mut peers)) = (counted_at_start, sock.peer_addr(), configured.lock()) {
+                let source = crate::connection_limit::limit_key(address.ip());
+                if learned != Some(source) && (peers.contains_key(&source) || peers.len() < MAX_CONFIGURED_SOURCES) {
+                    if let Some(old) = learned.replace(source) {
+                        if let Some(count) = peers.get_mut(&old) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 { peers.remove(&old); }
+                        }
+                    }
+                    *peers.entry(source).or_insert(0) += 1;
+                }
+            }
+            let session = if fallback_plain {
+                fallback_plain = false;
+                // A legacy node keeps the connection open and waits for a
+                // frame. A listener that had no slot closed it already.
+                if closed_at_once(&sock, plain_probe_wait(connect_took)) {
+                    thread::sleep(backoff.next());
+                    continue;
+                }
+                Ok(crate::mesh_pq::Session::Plain)
+            } else {
+                crate::mesh_pq::handshake_outbound(&mut sock, &security, &addr)
+            };
+            let session = match session {
+                Ok(session) => session,
+                // Never for a pinned peer: a pin says the peer speaks the
+                // handshake, so a close here is not a legacy node, and a
+                // plain session would skip the identity check the pin asks for.
+                Err(e) if security.mode() == crate::mesh_pq::Mode::Offer
+                    && !security.is_pinned(&addr)
+                    && closed_on_handshake(&e) => {
+                    closed_handshakes = closed_handshakes.saturating_add(1);
+                    if sealed_before && closed_handshakes <= SEALED_PEER_HANDSHAKE_RETRIES {
+                        // Not a legacy node: it was turned away, or the peer
+                        // is restarting. Ask again, sealed, a little later.
+                        thread::sleep(backoff.next());
+                    } else {
+                        // A legacy node, as far as this dialer can tell, or a
+                        // peer that went back to one: the next connection is
+                        // plain, at once, as before. If that one is closed
+                        // too it was a refusal, and the probe above paces it.
+                        fallback_plain = true;
+                    }
+                    continue;
+                }
+                // W4-2: the address is this node's own, or is routed back to
+                // it. Said once, outside the shared refusal line, and tried
+                // again only rarely in case the address changes hands.
+                Err(e) if crate::mesh_pq::own_identity_refusal(&e) == Some(crate::mesh_pq::OwnIdentity::SelfConnection) => {
+                    if !said_self {
+                        said_self = true;
+                        eprintln!(
+                            "net: --peers entry {addr} is this node itself (its own address, or one routed back \
+                             to it). It is not a peer and no connection is made; remove it from --peers to stop \
+                             the attempts."
+                        );
+                    }
+                    thread::sleep(SELF_DIAL_RETRY);
+                    continue;
+                }
+                Err(e) => {
+                    if crate::mesh_pq::own_identity_refusal(&e).is_some() {
+                        log_identity_conflict("to", &addr, &e);
+                    } else {
+                        log_refusal("to", &addr, &e);
+                    }
+                    // Not a busy loop against a peer that will refuse again.
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
             };
             // Both halves own one connected lifetime. A read timeout must
             // close the writer too: otherwise it can keep sending forever
             // while no worker consumes the peer's blocks or sync replies.
-            let Ok(rsock) = sock.try_clone() else { continue };
             let Ok(shutdown_socket) = sock.try_clone() else { continue };
+            // R3 M-4 / R1 A3-M2: same bound as the inbound side — see
+            // [`DEVNET_IO_TIMEOUT`]. Best-effort; a platform that refuses the
+            // option gets an unbounded-latency socket, not a broken one.
+            let _ = sock.set_read_timeout(Some(DEVNET_IO_TIMEOUT));
+            let sealed = matches!(session, crate::mesh_pq::Session::Sealed { .. });
+            if sealed {
+                sealed_before = true;
+                closed_handshakes = 0;
+            }
+            let Ok((reader, writer)) = split_session(sock, session) else { continue };
+            let session_started = Instant::now();
             let connection = Arc::new(Connection {
                 socket: shutdown_socket,
                 closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
                 _counts: (ConnCount::new(&live), None),
-                    _ip_permit: None,
+                    slot: None,
             });
             if let Some(scheduler) = scheduler.upgrade() {
                 scheduler.register(InboundPeer { frames: tx.clone(), connection: Arc::downgrade(&connection) }, Instant::now());
             }
             let writer_half = ConnectionHalf(connection.clone());
             let reader_half = ConnectionHalf(connection);
-            let wsock = sock;
-            // R3 M-4 / R1 A3-M2: same bound as the inbound side — see
-            // [`DEVNET_IO_TIMEOUT`]. Best-effort; a platform that refuses the
-            // option gets an unbounded-latency socket, not a broken one.
-            let _ = wsock.set_read_timeout(Some(DEVNET_IO_TIMEOUT));
-            let _ = wsock.set_write_timeout(Some(DEVNET_IO_TIMEOUT));
-            let wsock = Arc::new(Mutex::new(wsock));
+            let wsock = Arc::new(Mutex::new(writer));
             // Reader half also answers reverse-direction requests, so an
             // inbound-only connection can participate in recovery.
             {
                 let events = events.clone();
                 let inflight = inflight.clone();
-                let responder = SyncResponder { socket: wsock.clone(), data_dir: data_dir.clone(), budget: sync_budget.clone() };
-                thread::spawn(move || {
-                    run_outbound_reader(rsock, events, inflight, reader_half, responder);
-                });
+                // A dialled connection goes to an address the operator configured.
+                let responder = SyncResponder { socket: wsock.clone(), data_dir: data_dir.clone(), budget: sync_budget.clone(), configured: true };
+                // W4-3: no reader, no connection. Dropping the closure drops
+                // its half and closes the socket; dial again after a pause.
+                if !spawn_connection(&spawn_health, "mesh-out-r", move || {
+                    run_outbound_reader(reader, events, inflight, reader_half, responder);
+                }) {
+                    drop(writer_half);
+                    thread::sleep(backoff.next());
+                    continue;
+                }
             }
             run_connection_writer(&rx, wsock, writer_half);
-        });
+            if session_started.elapsed() >= SHORT_SESSION {
+                backoff.reset();
+                closed_handshakes = 0;
+                // A plain session that worked: the peer is a legacy node now.
+                sealed_before = sealed;
+            } else {
+                // Admitted and closed straight away (evicted by a full
+                // listener, or the peer is going down): not a busy loop.
+                thread::sleep(backoff.next());
+            }
+            }
+        })?;
     }
 
+    sentinel_view::register(&inbound, &configured);
     Ok(DevnetMesh { listen_addr, peers, sync, inbound, live })
 }
+
+// Bloch Sentinel's window onto the mesh (node-local; see `crate::sentinel`).
+mod sentinel_view;
 
 #[cfg(test)]
 mod tests {
@@ -1617,6 +2708,9 @@ mod tests {
     }
 
     use super::*;
+
+    /// A `--peers` entry whose dialer thread panics, to show it is guarded.
+    pub(super) const PANICKING_PEER: &str = "dialer-panics.invalid:1";
 
     struct SyncTestPeer {
         peer: InboundPeer,
@@ -1641,7 +2735,7 @@ mod tests {
         let (socket, _) = listener.accept().unwrap();
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let connection = Arc::new(Connection { socket, closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
-            _counts: (ConnCount::new(&live), None), _ip_permit: None });
+            _counts: (ConnCount::new(&live), None), slot: None });
         let (frames, received) = mpsc::sync_channel(1);
         let peer = InboundPeer { frames, connection: Arc::downgrade(&connection) };
         SyncTestPeer { peer, received, connection, _remote: remote }
@@ -1853,7 +2947,7 @@ mod tests {
         let (events, received) = mpsc::channel();
         let mesh = start("127.0.0.1", 0,
             vec![silent_a.local_addr().unwrap().to_string(), silent_b.local_addr().unwrap().to_string()],
-            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
+            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(), Arc::new(crate::mesh_pq::MeshSecurity::plain())).unwrap();
         let port = mesh.listen_addr().port();
         let (mut a, _) = silent_a.accept().unwrap();
         let (mut b, _) = silent_b.accept().unwrap();
@@ -1881,7 +2975,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let (events, _received) = mpsc::channel();
         let _mesh = start("127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
-            events, dir.clone(), Arc::new(AtomicU64::new(43)), QueueBudget::new()).unwrap();
+            events, dir.clone(), Arc::new(AtomicU64::new(43)), QueueBudget::new(), Arc::new(crate::mesh_pq::MeshSecurity::plain())).unwrap();
         let (mut remote, _) = listener.accept().unwrap();
         assert_eq!(read_frame_until(&mut remote, Instant::now() + Duration::from_secs(3)).unwrap(), get_blocks_frame(43));
         write_frame(&mut remote, &get_blocks_frame(42)).unwrap();
@@ -1908,10 +3002,10 @@ mod tests {
         let (left_tx, left_rx) = mpsc::channel();
         let (right_tx, right_rx) = mpsc::channel();
         let left = start("127.0.0.1", 0, Vec::new(), left_tx, left_dir,
-            Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
+            Arc::new(AtomicU64::new(42)), QueueBudget::new(), Arc::new(crate::mesh_pq::MeshSecurity::plain())).unwrap();
         let port = left.listen_addr().port();
         let right = start("127.0.0.1", 0, vec![format!("127.0.0.1:{port}")], right_tx, right_dir,
-            Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
+            Arc::new(AtomicU64::new(42)), QueueBudget::new(), Arc::new(crate::mesh_pq::MeshSecurity::plain())).unwrap();
         for received in [left_rx, right_rx] {
             match received.recv_timeout(Duration::from_secs(8)).unwrap() {
                 EngineEvent::Net(NetEvent::Block(actual, _)) => assert_eq!(actual.body.transactions, block.body.transactions),
@@ -1924,6 +3018,93 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    /// Two real meshes, right dialling left, each holding one 4 MiB block and
+    /// asking the other for it. True when both sides received the other's
+    /// page within the timeout.
+    fn sync_across(left: crate::mesh_pq::MeshSecurity, right: crate::mesh_pq::MeshSecurity, tag: &str) -> bool {
+        sync_across_with(left, |_| right, tag)
+    }
+
+    /// [`sync_across`], with the dialing side built once it knows the address
+    /// it will dial, so it can pin it.
+    fn sync_across_with(
+        left: crate::mesh_pq::MeshSecurity,
+        right: impl FnOnce(&str) -> crate::mesh_pq::MeshSecurity,
+        tag: &str,
+    ) -> bool {
+        let base = std::env::temp_dir().join(format!("bloch-mesh-pq-{tag}-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let left_dir = base.join("left");
+        let right_dir = base.join("right");
+        let mut block = sync_test_block();
+        block.body.transactions.push(vec![0xA5; 4 * 1024 * 1024]);
+        let mut left_store = crate::store::Store::open(&left_dir, &[7; 32]).unwrap();
+        let mut right_store = crate::store::Store::open(&right_dir, &[7; 32]).unwrap();
+        left_store.append(&block).unwrap();
+        right_store.append(&block).unwrap();
+        let (left_tx, left_rx) = mpsc::channel();
+        let (right_tx, right_rx) = mpsc::channel();
+        let left_mesh = start("127.0.0.1", 0, Vec::new(), left_tx, left_dir,
+            Arc::new(AtomicU64::new(42)), QueueBudget::new(), Arc::new(left)).unwrap();
+        let port = left_mesh.listen_addr().port();
+        let dialed = format!("127.0.0.1:{port}");
+        let right = right(&dialed);
+        let right_mesh = start("127.0.0.1", 0, vec![dialed], right_tx, right_dir,
+            Arc::new(AtomicU64::new(42)), QueueBudget::new(), Arc::new(right)).unwrap();
+        let delivered = [left_rx, right_rx].into_iter().all(|received| {
+            matches!(received.recv_timeout(Duration::from_secs(8)),
+                Ok(EngineEvent::Net(NetEvent::Block(actual, _))) if actual.body.transactions == block.body.transactions)
+        });
+        drop((left_mesh, right_mesh, left_store, right_store));
+        let _ = std::fs::remove_dir_all(base);
+        delivered
+    }
+
+    #[test]
+    fn mesh_security_modes_interoperate_as_documented() {
+        use crate::mesh_pq::{MeshSecurity, Mode};
+        let net = [9; 32];
+        let pq = |mode| MeshSecurity::ephemeral(mode, net, None);
+        // Sealed end to end, including 4 MiB sync pages in both directions.
+        assert!(sync_across(pq(Mode::Require), pq(Mode::Require), "req-req"));
+        assert!(sync_across(pq(Mode::Offer), pq(Mode::Require), "offer-req"));
+        // `offer` keeps talking to legacy nodes, in either direction.
+        assert!(sync_across(pq(Mode::Offer), MeshSecurity::plain(), "offer-plain"));
+        assert!(sync_across(MeshSecurity::plain(), pq(Mode::Offer), "plain-offer"));
+        // `require` does not, in either direction, and neither does another network.
+        assert!(!sync_across(pq(Mode::Require), MeshSecurity::plain(), "req-plain"));
+        assert!(!sync_across(MeshSecurity::plain(), pq(Mode::Require), "plain-req"));
+        assert!(!sync_across(pq(Mode::Require), MeshSecurity::ephemeral(Mode::Require, [8; 32], None), "other-net"));
+    }
+
+    #[test]
+    fn mesh_allow_list_admits_only_listed_identities() {
+        use crate::mesh_pq::{MeshSecurity, Mode};
+        let net = [9; 32];
+        let member = MeshSecurity::ephemeral(Mode::Require, net, None);
+        let gate = |allowed| MeshSecurity::ephemeral(Mode::Require, net, Some(std::collections::HashSet::from([allowed])));
+        let member_id = member.identity_id().unwrap();
+        assert!(sync_across(gate(member_id), member, "allow-member"));
+        assert!(!sync_across(gate(member_id), MeshSecurity::ephemeral(Mode::Require, net, None), "allow-stranger"));
+    }
+
+    #[test]
+    fn mesh_pin_binds_the_dialed_address_to_one_identity() {
+        use crate::mesh_pq::{MeshSecurity, Mode};
+        let net = [9; 32];
+        let pq = |mode| MeshSecurity::ephemeral(mode, net, None);
+        // The dialer pins the listener's real identity: sealed sync both ways.
+        let left = pq(Mode::Require);
+        let left_id = left.identity_id().unwrap();
+        assert!(sync_across_with(left, |addr| pq(Mode::Require).with_pin(addr, left_id), "pin-match"));
+        // The listener holds another key than the pinned one: no session.
+        assert!(!sync_across_with(pq(Mode::Require), |addr| pq(Mode::Require).with_pin(addr, [0x11; 32]), "pin-mismatch"));
+        // `offer` falls back to plain for an unpinned legacy peer (asserted
+        // in `mesh_security_modes_interoperate_as_documented`), but never
+        // for a pinned one.
+        assert!(!sync_across_with(MeshSecurity::plain(), |addr| pq(Mode::Offer).with_pin(addr, [0x11; 32]), "pin-no-plain"));
+    }
+
     #[test]
     fn shared_sync_serving_cap_survives_reconnect_generations_and_closes_failed_writes() {
         let dir = std::env::temp_dir().join(format!("bloch-sync-workers-{}-{}", std::process::id(),
@@ -1931,14 +3112,17 @@ mod tests {
         let mut store = crate::store::Store::open(&dir, &[7; 32]).unwrap();
         store.append(&sync_test_block()).unwrap();
         let peers: Vec<_> = (0..=MAX_SYNC_SERVING_WORKERS).map(|_| sync_test_peer()).collect();
-        let sockets: Vec<_> = peers.iter().map(|p| Arc::new(Mutex::new(p.connection.socket.try_clone().unwrap()))).collect();
+        let sockets: Vec<_> = peers.iter().map(|p| Arc::new(Mutex::new(MeshWriter::plain(p.connection.socket.try_clone().unwrap())))).collect();
         let budget = Arc::new(Mutex::new(SyncBudget::new()));
-        let responders: Vec<_> = sockets.iter().map(|s| SyncResponder { socket: s.clone(), data_dir: dir.clone(), budget: budget.clone() }).collect();
+        // Configured, so the whole pool is theirs to fill (see the reserve test).
+        let responders: Vec<_> = sockets.iter().map(|s| SyncResponder { socket: s.clone(), data_dir: dir.clone(), budget: budget.clone(), configured: true }).collect();
         let ip = "127.0.0.1".parse().unwrap();
         // Keep the same guards the worker owns alive, modelling outstanding
         // storage work deterministically across disconnected generations.
-        let guards: Vec<_> = peers.iter().zip(&responders).take(MAX_SYNC_SERVING_WORKERS).map(|(peer, responder)| {
-            responder.reserve(&peer.connection, ip, &mut GetBlocksLimiter::new()).unwrap()
+        // Distinct sources: one source alone is capped below the global limit.
+        let guards: Vec<_> = peers.iter().zip(&responders).take(MAX_SYNC_SERVING_WORKERS).enumerate().map(|(i, (peer, responder))| {
+            let source = std::net::IpAddr::from([10, 0, 0, i as u8 + 1]);
+            responder.reserve(&peer.connection, source, &mut GetBlocksLimiter::new()).unwrap()
         }).collect();
         assert_eq!(budget.lock().unwrap().serving, MAX_SYNC_SERVING_WORKERS);
         for peer in peers.iter().take(MAX_SYNC_SERVING_WORKERS) { peer.connection.closed.store(true, Ordering::Release); }
@@ -1961,6 +3145,258 @@ mod tests {
     }
 
     #[test]
+    fn one_source_cannot_hold_every_sync_serving_worker() {
+        let peers: Vec<_> = (0..=MAX_SYNC_SERVING_PER_SOURCE + 1).map(|_| sync_test_peer()).collect();
+        let budget = Arc::new(Mutex::new(SyncBudget::new()));
+        let responders: Vec<_> = peers.iter().map(|p| SyncResponder {
+            socket: Arc::new(Mutex::new(MeshWriter::plain(p.connection.socket.try_clone().unwrap()))),
+            data_dir: std::env::temp_dir(), budget: budget.clone(), configured: false,
+        }).collect();
+        let reserve = |i: usize, ip: &str| responders[i].reserve(&peers[i].connection, ip.parse().unwrap(), &mut GetBlocksLimiter::new());
+        assert!(MAX_SYNC_SERVING_PER_SOURCE < MAX_SYNC_SERVING_WORKERS);
+        // The full share belongs to a source that has been written a page.
+        budget.lock().unwrap().note_page("192.0.2.1".parse().unwrap(), PageOutcome::Written(SYNC_PROVING_PAGE_BYTES), Instant::now());
+        let mut held: Vec<_> = (0..MAX_SYNC_SERVING_PER_SOURCE).map(|i| reserve(i, "192.0.2.1").unwrap()).collect();
+        let next = MAX_SYNC_SERVING_PER_SOURCE;
+        assert!(reserve(next, "192.0.2.1").is_none(), "one source took more than its share of workers");
+        assert!(reserve(next, "::ffff:192.0.2.1").is_none(), "the IPv4-mapped form is the same source");
+        assert_eq!(budget.lock().unwrap().serving, MAX_SYNC_SERVING_PER_SOURCE);
+        let other = reserve(next + 1, "192.0.2.2").expect("another source must still be served");
+        held.pop();
+        held.push(reserve(next, "192.0.2.1").expect("a finished worker returns its source's share"));
+        drop((held, other));
+        let budget = budget.lock().unwrap();
+        assert_eq!(budget.serving, 0);
+        assert!(budget.serving_by_source.is_empty());
+    }
+
+    /// One deadline for every block of the page, as before the pace existed.
+    fn fixed_deadline(start: Instant, after: Duration) -> PagePace {
+        PagePace { start, grace: after, bytes_per_sec: u64::MAX }
+    }
+
+    /// V2-3: two sources, each with its whole share stalled, do not leave a
+    /// third without a worker; unconfigured sources together cannot reach the
+    /// workers kept for configured peers.
+    #[test]
+    fn stalled_sources_leave_workers_for_others_and_for_configured_peers() {
+        let peers: Vec<_> = (0..MAX_SYNC_SERVING_WORKERS + 2).map(|_| sync_test_peer()).collect();
+        let budget = Arc::new(Mutex::new(SyncBudget::new()));
+        let responder = |i: usize, configured: bool| SyncResponder {
+            socket: Arc::new(Mutex::new(MeshWriter::plain(peers[i].connection.socket.try_clone().unwrap()))),
+            data_dir: std::env::temp_dir(), budget: budget.clone(), configured,
+        };
+        let now = Instant::now();
+        let reserve = |i: usize, ip: &str, configured: bool| {
+            responder(i, configured).reserve_at(&peers[i].connection, ip.parse().unwrap(), &mut GetBlocksLimiter::new(), now)
+        };
+        // Both stalling sources have earned the full share beforehand.
+        for ip in ["192.0.2.1", "192.0.2.2"] {
+            budget.lock().unwrap().note_page(ip.parse().unwrap(), PageOutcome::Written(SYNC_PROVING_PAGE_BYTES), now);
+        }
+        let mut held = vec![
+            reserve(0, "192.0.2.1", false).unwrap(), reserve(1, "192.0.2.1", false).unwrap(),
+            reserve(2, "192.0.2.2", false).unwrap(), reserve(3, "192.0.2.2", false).unwrap(),
+        ];
+        assert!(reserve(4, "192.0.2.2", false).is_none());
+        held.push(reserve(4, "192.0.2.3", false).expect("a third source is served"));
+        // A source with no completed page holds one worker, not two.
+        assert!(reserve(5, "192.0.2.3", false).is_none());
+        held.push(reserve(5, "192.0.2.4", false).unwrap());
+        assert_eq!(held.len(), MAX_SYNC_SERVING_WORKERS - SYNC_SERVING_RESERVED_FOR_CONFIGURED);
+        assert!(reserve(6, "192.0.2.5", false).is_none(), "the reserve is not for unconfigured sources");
+        for i in 0..SYNC_SERVING_RESERVED_FOR_CONFIGURED {
+            held.push(reserve(6 + i, &format!("198.51.100.{}", i + 1), true).expect("a configured peer is served from the reserve"));
+        }
+        assert_eq!(budget.lock().unwrap().serving, MAX_SYNC_SERVING_WORKERS);
+        drop(held);
+        let budget = budget.lock().unwrap();
+        assert_eq!((budget.serving, budget.serving_unconfigured), (0, 0));
+        assert!(budget.serving_by_source.is_empty());
+    }
+
+    /// V2-3: a source whose page was cut off for not reading is not handed
+    /// the next worker at once, and loses the share a completed page earned.
+    #[test]
+    fn a_stalled_source_waits_before_it_is_served_again() {
+        let peers: Vec<_> = (0..3).map(|_| sync_test_peer()).collect();
+        let budget = Arc::new(Mutex::new(SyncBudget::new()));
+        let source: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let reserve = |i: usize, now: Instant| SyncResponder {
+            socket: Arc::new(Mutex::new(MeshWriter::plain(peers[i].connection.socket.try_clone().unwrap()))),
+            data_dir: std::env::temp_dir(), budget: budget.clone(), configured: false,
+        }.reserve_at(&peers[i].connection, source, &mut GetBlocksLimiter::new(), now);
+        let t0 = Instant::now();
+        // A page too small to prove anything earns nothing; a real one does.
+        budget.lock().unwrap().note_page(source, PageOutcome::Written(SYNC_PROVING_PAGE_BYTES - 1), t0);
+        assert!(budget.lock().unwrap().proven.is_empty());
+        budget.lock().unwrap().note_page(source, PageOutcome::Written(SYNC_PROVING_PAGE_BYTES), t0);
+        // A connection that merely broke is not a stall.
+        budget.lock().unwrap().note_page(source, PageOutcome::Closed, t0);
+        drop((reserve(0, t0).unwrap(), reserve(1, t0).unwrap()));
+        budget.lock().unwrap().note_page(source, PageOutcome::Stalled, t0);
+        assert!(reserve(0, t0).is_none());
+        assert!(reserve(0, t0 + SYNC_STALL_COOLDOWN - Duration::from_millis(1)).is_none());
+        let again = reserve(0, t0 + SYNC_STALL_COOLDOWN).expect("served again after the cooldown");
+        assert!(reserve(1, t0 + SYNC_STALL_COOLDOWN).is_none(), "and with the unproven share");
+        drop(again);
+        // Another source was never affected.
+        let other = SyncResponder {
+            socket: Arc::new(Mutex::new(MeshWriter::plain(peers[2].connection.socket.try_clone().unwrap()))),
+            data_dir: std::env::temp_dir(), budget: budget.clone(), configured: false,
+        };
+        assert!(other.reserve_at(&peers[2].connection, "192.0.2.2".parse().unwrap(), &mut GetBlocksLimiter::new(), t0).is_some());
+    }
+
+    /// W3-2: the stall cooldown is per address, and configured peers share
+    /// addresses. A stalled page on one configured connection does not lock
+    /// the other configured connections of that address out; an unconfigured
+    /// connection from the same address still waits, and the address still
+    /// holds only the unproven share.
+    #[test]
+    fn a_stalled_page_does_not_lock_out_the_configured_peers_of_its_address() {
+        let peers: Vec<_> = (0..4).map(|_| sync_test_peer()).collect();
+        let budget = Arc::new(Mutex::new(SyncBudget::new()));
+        let source: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        let reserve = |i: usize, configured: bool, now: Instant| SyncResponder {
+            socket: Arc::new(Mutex::new(MeshWriter::plain(peers[i].connection.socket.try_clone().unwrap()))),
+            data_dir: std::env::temp_dir(), budget: budget.clone(), configured,
+        }.reserve_at(&peers[i].connection, source, &mut GetBlocksLimiter::new(), now);
+        let t0 = Instant::now();
+        // Configured connection 0 is served a page and stalls it.
+        drop(reserve(0, true, t0).expect("a configured peer is served"));
+        budget.lock().unwrap().note_page(source, PageOutcome::Stalled, t0);
+        assert!(budget.lock().unwrap().cooling.contains_key(&source), "the stall is still recorded");
+        // Its configured sibling at the same address is served at once...
+        let sibling = reserve(1, true, t0).expect("a configured sibling is not locked out by the cooldown");
+        // ...and so is the stalled connection itself when it asks again;
+        // what bounds the address is the unproven share of one worker.
+        assert!(reserve(0, true, t0).is_none(), "one worker for an unproven address, configured or not");
+        drop(sibling);
+        drop(reserve(0, true, t0).expect("served again without waiting out the cooldown"));
+        // An unconfigured connection from that address waits as before.
+        assert!(reserve(2, false, t0).is_none());
+        assert!(reserve(2, false, t0 + SYNC_STALL_COOLDOWN - Duration::from_millis(1)).is_none());
+        assert!(reserve(2, false, t0 + SYNC_STALL_COOLDOWN).is_some());
+        // Every stall of a configured connection renews the record for the
+        // unconfigured ones; it never accumulates for the configured.
+        budget.lock().unwrap().note_page(source, PageOutcome::Stalled, t0 + SYNC_STALL_COOLDOWN);
+        assert!(reserve(3, false, t0 + SYNC_STALL_COOLDOWN).is_none());
+        assert!(reserve(3, true, t0 + SYNC_STALL_COOLDOWN).is_some());
+    }
+
+    /// V2-3: a peer that reads nothing is cut off when the first block the
+    /// socket would not take misses its own deadline, long before the
+    /// deadline of the whole page.
+    #[test]
+    fn a_peer_that_reads_nothing_is_cut_off_long_before_the_page_deadline() {
+        let peer = sync_test_peer();
+        let socket = Arc::new(Mutex::new(MeshWriter::plain(peer.connection.socket.try_clone().unwrap())));
+        // 48 MiB at 2 MiB/s: the page as a whole has 24 s. The remote end
+        // never reads, so the socket buffers fill within the first blocks.
+        let blocks = vec![vec![0x5A; 1 << 20]; 48];
+        let pace = PagePace { start: Instant::now(), grace: Duration::from_millis(300), bytes_per_sec: 2 << 20 };
+        let whole_page = pace.deadline(48 << 20);
+        let outcome = write_sync_page(&socket, &blocks, &peer.connection, pace);
+        let finished = Instant::now();
+        assert_eq!(outcome, PageOutcome::Stalled);
+        assert!(peer.connection.closed.load(Ordering::Acquire));
+        assert!(finished + Duration::from_secs(10) < whole_page, "held for {:?} of a {:?} page budget", finished - pace.start, whole_page - pace.start);
+    }
+
+    #[test]
+    fn sync_page_deadline_implies_the_documented_minimum_throughput() {
+        let start = Instant::now();
+        assert_eq!(sync_page_deadline(start, 0), start + SYNC_PAGE_WRITE_GRACE);
+        assert_eq!(sync_page_deadline(start, crate::codec::MAX_FIELD_LEN), start + Duration::from_secs(15 + 256));
+        // The pace of a page ends at that same instant and never asks for
+        // more than the minimum rate on the way there.
+        let pace = PagePace { start, grace: SYNC_PAGE_WRITE_GRACE, bytes_per_sec: SYNC_PAGE_MIN_BYTES_PER_SEC };
+        assert_eq!(pace.deadline(crate::codec::MAX_FIELD_LEN), sync_page_deadline(start, crate::codec::MAX_FIELD_LEN));
+        assert_eq!(pace.deadline(512 * 1024), start + Duration::from_secs(15 + 16));
+        assert!(SYNC_SERVING_RESERVED_FOR_CONFIGURED + 2 * MAX_SYNC_SERVING_PER_SOURCE < MAX_SYNC_SERVING_WORKERS);
+        // Per-write stalls stay bounded as before; the page budget is separate.
+        assert!(SYNC_PAGE_WRITE_GRACE < DEVNET_IO_TIMEOUT);
+    }
+
+    #[test]
+    fn slow_page_reader_is_cut_off_at_the_deadline_and_frees_its_worker() {
+        let peer = sync_test_peer();
+        let socket = Arc::new(Mutex::new(MeshWriter::plain(peer.connection.socket.try_clone().unwrap())));
+        let budget = Arc::new(Mutex::new(SyncBudget::new()));
+        let responder = SyncResponder { socket: socket.clone(), data_dir: std::env::temp_dir(), budget: budget.clone(), configured: false };
+        let ip = "192.0.2.1".parse().unwrap();
+        let guard = responder.reserve(&peer.connection, ip, &mut GetBlocksLimiter::new()).unwrap();
+        // The peer keeps reading, far below the minimum rate. Each read is
+        // progress, which is what used to renew the write timeout forever.
+        let mut remote = peer._remote.try_clone().unwrap();
+        let reader = thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            while matches!(remote.read(&mut byte), Ok(1)) { thread::sleep(Duration::from_millis(10)); }
+        });
+        // Larger than any loopback socket buffer, so the write must block.
+        let blocks = vec![vec![0x5A; 4 << 20]; 8];
+        let started = Instant::now();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let guard = guard;
+            let outcome = write_sync_page(&socket, &blocks, &guard.0, fixed_deadline(started, Duration::from_millis(400)));
+            assert_eq!(outcome, PageOutcome::Stalled);
+            drop(guard);
+            done_tx.send(Instant::now()).unwrap();
+        });
+        let finished = done_rx.recv_timeout(Duration::from_secs(10)).expect("slow reader held its serving worker past the deadline");
+        worker.join().unwrap();
+        assert!(finished.duration_since(started) >= Duration::from_millis(400), "the page cannot have been written in full");
+        assert!(peer.connection.closed.load(Ordering::Acquire), "a page cut off mid-frame must close the connection");
+        assert_eq!(budget.lock().unwrap().serving, 0, "the worker slot was not released");
+        assert!(budget.lock().unwrap().serving_by_source.is_empty());
+        let next = sync_test_peer();
+        assert!(responder.reserve(&next.connection, ip, &mut GetBlocksLimiter::new()).is_some());
+        let _ = peer._remote.shutdown(Shutdown::Both);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn page_deadline_also_bounds_waiting_for_a_stuck_socket_writer() {
+        let peer = sync_test_peer();
+        let socket = Arc::new(Mutex::new(MeshWriter::plain(peer.connection.socket.try_clone().unwrap())));
+        // A broadcast stuck writing to the same slow peer holds this lock.
+        let stuck = socket.lock().unwrap();
+        let started = Instant::now();
+        let outcome = write_sync_page(&socket, &[vec![1; 16]], &peer.connection, fixed_deadline(started, Duration::from_millis(200)));
+        assert_eq!(outcome, PageOutcome::Stalled);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(peer.connection.closed.load(Ordering::Acquire));
+        drop(stuck);
+    }
+
+    #[test]
+    fn normal_page_reader_completes_within_the_production_deadline() {
+        let peer = sync_test_peer();
+        let socket = Arc::new(Mutex::new(MeshWriter::plain(peer.connection.socket.try_clone().unwrap())));
+        let blocks: Vec<Vec<u8>> = (0..8u8).map(|i| vec![i; 1 << 20]).collect();
+        let expected = blocks.clone();
+        let mut remote = peer._remote.try_clone().unwrap();
+        let reader = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            (0..8).map(|_| read_frame_until(&mut remote, deadline).unwrap()).collect::<Vec<_>>()
+        });
+        let page_bytes: usize = blocks.iter().map(Vec::len).sum();
+        let outcome = write_sync_page(&socket, &blocks, &peer.connection, PagePace::starting_now(false));
+        assert_eq!(outcome, PageOutcome::Written(page_bytes), "an unproven honest reader is served in full too");
+        let received = reader.join().unwrap();
+        for (frame, block) in received.iter().zip(&expected) {
+            assert_eq!(frame[0], FRAME_BLOCK);
+            assert_eq!(&frame[1..], block.as_slice());
+        }
+        assert!(!peer.connection.closed.load(Ordering::Acquire), "an honest reader must not be disconnected");
+        // Broadcasts on this socket get their steady-state timeout back.
+        assert_eq!(peer.connection.socket.write_timeout().unwrap(), Some(DEVNET_IO_TIMEOUT));
+    }
+
+    #[test]
     fn outbound_reader_failure_reconnects_and_reclaims_sync_permit() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1968,6 +3404,7 @@ mod tests {
         let mesh = start(
             "127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
             events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(),
+            Arc::new(crate::mesh_pq::MeshSecurity::plain()),
         ).unwrap();
         // More reconnects than the sync fanout: a leaked permit would leave
         // the third connection without its initial history request.
@@ -2012,7 +3449,7 @@ mod tests {
             socket: socket.try_clone().unwrap(),
             closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
             _counts: (ConnCount::new(&live), Some(ConnCount::new(&inbound_live))),
-                    _ip_permit: None,
+                    slot: None,
         });
         let reader = ConnectionHalf(connection.clone());
         let writer = ConnectionHalf(connection.clone());
@@ -2025,7 +3462,7 @@ mod tests {
         // condition that previously stranded `for frame in rx` forever.
         let (done_tx, done_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
-            run_inbound_writer(rx, Arc::new(Mutex::new(socket)), writer);
+            run_inbound_writer(rx, Arc::new(Mutex::new(MeshWriter::plain(socket))), writer);
             done_tx.send(()).unwrap();
         });
         drop(reader);
@@ -2048,7 +3485,7 @@ mod tests {
             socket: socket.try_clone().unwrap(),
             closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
             _counts: (ConnCount::new(&live), Some(ConnCount::new(&live))),
-            _ip_permit: None,
+            slot: None,
         });
         let reader = ConnectionHalf(connection.clone());
         let writer = ConnectionHalf(connection);
@@ -2400,6 +3837,25 @@ mod tests {
         ).is_some(), "decode failure must release the per-IP charge");
     }
 
+    /// Blocks read from a connection this node dialled are marked for the
+    /// verification allowance gossip cannot spend; inbound blocks are not.
+    #[test]
+    fn only_dialled_connections_mark_blocks_as_directed() {
+        let (tx, rx) = mpsc::channel::<EngineEvent>();
+        let budget = QueueBudget::with_caps(4, 1 << 20);
+        let ip = "192.0.2.46".parse().unwrap();
+        let frame = block_frame(&sync_test_block());
+        assert!(decode_and_send_from_ip(&tx, &budget, ip, &frame));
+        assert!(decode_and_send_from_peer(&tx, &budget, ip, &frame, true));
+        for directed in [false, true] {
+            let EngineEvent::Net(NetEvent::Block(_, origin)) = rx.recv().unwrap() else {
+                panic!("block event")
+            };
+            assert_eq!(origin.directed_block(), directed);
+        }
+        assert!(!Origin::none().directed_block());
+    }
+
     #[test]
     fn devnet_predecode_charge_matches_the_engine_release_charge() {
         let (tx, rx) = mpsc::channel::<EngineEvent>();
@@ -2669,6 +4125,112 @@ mod tests {
         assert!(second_rx.try_recv().is_err(), "full queue must drop, not displace or append");
     }
 
+    /// An inbound connection becomes a sync source only once it has delivered
+    /// a valid frame. Silence and frames of unknown type earn nothing.
+    #[test]
+    fn inbound_connection_is_a_sync_source_only_after_a_valid_frame() {
+        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        let data_dir = std::env::temp_dir().join(format!("bloch-net-useful-{}", std::process::id()));
+        let mesh = start(
+            "127.0.0.1",
+            0,
+            Vec::new(),
+            events,
+            data_dir,
+            Arc::new(AtomicU64::new(0)),
+            QueueBudget::new(),
+            Arc::new(crate::mesh_pq::MeshSecurity::plain()),
+        )
+        .expect("bind the devnet transport");
+        let port = mesh.listen_addr().port();
+        let sources = || mesh.sync.schedule.lock().unwrap().peers.len();
+        let wait_for = |want: usize| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while sources() != want && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            sources()
+        };
+
+        let _silent = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut noisy = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut honest = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write_frame(&mut noisy, &[0xEE, 1, 2, 3]).unwrap();
+        // Known type, wrong length: malformed, so still nothing.
+        write_frame(&mut noisy, &[FRAME_GET_BLOCKS, 1]).unwrap();
+        write_frame(&mut honest, &get_blocks_frame(0)).unwrap();
+        assert_eq!(wait_for(1), 1);
+        // All three are connected and all three receive broadcasts; only the
+        // one that delivered a valid frame is asked for blocks.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mesh.peer_count() < 3 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(mesh.peer_count(), 3);
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(sources(), 1, "silent and unknown-frame connections must not become sync sources");
+
+        write_frame(&mut noisy, &get_blocks_frame(0)).unwrap();
+        assert_eq!(wait_for(2), 2);
+    }
+
+    /// W3-3 (V2-6), through the accept loop: an address listed in `--peers`
+    /// once gets `2 * 1 + 2` exempt connections, and the next ones from it
+    /// are ordinary (here: the per-source share of an unconfigured address,
+    /// `MAX_INBOUND_PER_SOURCE`). With the accept loop treating every connection from a
+    /// listed address as configured, all of them would be kept.
+    #[test]
+    fn the_accept_loop_rations_the_configured_standing_of_a_listed_address() {
+        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        // A configured peer at 127.0.0.1 that is not running: the port was
+        // free a moment ago and nothing listens on it.
+        let absent_peer = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let mesh = start(
+            "127.0.0.1",
+            0,
+            vec![absent_peer.to_string()],
+            events,
+            std::env::temp_dir(),
+            Arc::new(AtomicU64::new(0)),
+            QueueBudget::new(),
+            Arc::new(crate::mesh_pq::MeshSecurity::plain()),
+        )
+        .expect("bind the devnet transport");
+        let port = mesh.listen_addr().port();
+        let listed_here = 1usize;
+        let exempt = 2 * listed_here + 2;
+        assert!(inbound_slots::Standing::for_source(listed_here, exempt - 1).is_configured());
+        assert!(!inbound_slots::Standing::for_source(listed_here, exempt).is_configured());
+        let kept = exempt + MAX_INBOUND_PER_SOURCE;
+        let total = kept + 6;
+        let mut conns = Vec::with_capacity(total);
+        for _ in 0..total {
+            conns.push(TcpStream::connect(("127.0.0.1", port)).expect("connect"));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mesh.peer_count() < kept && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            mesh.peer_count(),
+            kept,
+            "a listed address holds its exempt connections plus an ordinary source's share, no more"
+        );
+        // The accept loop is sequential, so the ones past both shares are
+        // the last six, and the server closed them.
+        for mut sock in conns.split_off(kept) {
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 1];
+            match sock.read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => panic!("{n} unexpected bytes from a refused connection"),
+                Err(e) => panic!("a connection past the configured standing was not closed: {e}"),
+            }
+        }
+        drop(conns);
+    }
+
     /// R3 M-4 / R1 A3-M2: the devnet listener accepts at most
     /// `MAX_INBOUND_CONNECTIONS` at once, and a connection past the cap is
     /// closed by the server immediately rather than left half-open. This
@@ -2687,6 +4249,7 @@ mod tests {
             std::env::temp_dir(),
             head_slot,
             inflight,
+            Arc::new(crate::mesh_pq::MeshSecurity::plain()),
         )
         .expect("bind the devnet transport");
         let port = mesh.listen_addr().port();
@@ -2704,7 +4267,7 @@ mod tests {
         // fixed amount, so this is fast on an idle box and still correct on
         // a loaded one.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while mesh.peer_count() < MAX_INBOUND_PER_IP && Instant::now() < deadline {
+        while mesh.peer_count() < MAX_INBOUND_PER_SOURCE && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
         // One quiet moment so the count has settled — proving it never rises
@@ -2713,8 +4276,8 @@ mod tests {
 
         assert_eq!(
             mesh.peer_count(),
-            MAX_INBOUND_PER_IP,
-            "the transport must accept no more than MAX_INBOUND_CONNECTIONS inbound connections"
+            MAX_INBOUND_PER_SOURCE,
+            "one unconfigured source that sends nothing holds its share of the table and no more"
         );
 
         // And the excess connections were actually refused, not merely
@@ -2734,5 +4297,312 @@ mod tests {
         // them at end of scope, which is a normal client-side close and
         // proves nothing was already closed from the server's side.
         drop(conns);
+    }
+
+    /// W4-1, the listener's side, on real sockets and under the mode mainnet
+    /// runs (`offer`, no pins, no allow-list): sixteen nodes behind one
+    /// address that the listener does not list all hold a connection, every
+    /// vote each of them sends reaches the engine, and connections from the
+    /// same address that say nothing get what is left of the address's share
+    /// and not one slot more. The pending pool this replaces admitted four of
+    /// the sixteen and closed the rest at accept.
+    #[test]
+    fn sixteen_unlisted_nodes_behind_one_address_all_connect_and_deliver_every_vote() {
+        use crate::mesh_pq::{MeshSecurity, Mode};
+        let (events, received) = mpsc::channel::<EngineEvent>();
+        let mesh = start(
+            "127.0.0.1", 0, Vec::new(), events, std::env::temp_dir(),
+            Arc::new(AtomicU64::new(0)), QueueBudget::new(),
+            Arc::new(MeshSecurity::ephemeral(Mode::Offer, [9; 32], None)),
+        ).expect("bind the devnet transport");
+        let port = mesh.listen_addr().port();
+        let net = Net::Devnet(mesh);
+        let Net::Devnet(mesh) = &net else { unreachable!() };
+        let vote = |validator: usize, round: u64| {
+            let mut att = sample_attestation();
+            att.validator = validator as _;
+            att.data.slot = round;
+            att_frame(&att)
+        };
+        // All sixteen connect before any of them has said anything.
+        let mut validators: Vec<TcpStream> =
+            (0..16).map(|_| TcpStream::connect(("127.0.0.1", port)).expect("connect")).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        // The engine's side: take each vote and report it verified.
+        let collect = |seen: &mut std::collections::BTreeSet<(u64, u64)>, want: usize| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while seen.len() < want && Instant::now() < deadline {
+                if let Ok(EngineEvent::Net(NetEvent::Attestation(att, origin))) = received.recv_timeout(Duration::from_millis(50)) {
+                    seen.insert((att.validator as u64, att.data.slot));
+                    net.report(&origin, Verdict::Accept);
+                }
+            }
+            seen.len()
+        };
+        for round in 0..3u64 {
+            for (validator, sock) in validators.iter_mut().enumerate() {
+                write_frame(sock, &vote(validator, round)).expect("a sibling's connection was closed");
+            }
+            let want = 16 * (round as usize + 1);
+            assert_eq!(collect(&mut seen, want), want, "round {round}: a vote was lost");
+            assert_eq!(mesh.peer_count(), 16, "round {round}");
+        }
+
+        // Sixty-four more connections from the same address, saying nothing.
+        let idle: Vec<TcpStream> = (0..64).map(|_| TcpStream::connect(("127.0.0.1", port)).expect("connect")).collect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while mesh.peer_count() < MAX_INBOUND_PER_SOURCE && Instant::now() < deadline {
+            assert!(mesh.peer_count() <= MAX_INBOUND_PER_SOURCE);
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(mesh.peer_count(), MAX_INBOUND_PER_SOURCE, "the address holds its share and no more");
+        let closed = idle
+            .iter()
+            .filter(|sock| {
+                sock.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+                matches!((&**sock).read(&mut [0u8; 1]), Ok(0))
+            })
+            .count();
+        assert_eq!(closed, 64 - (MAX_INBOUND_PER_SOURCE - 16), "the rest were closed at accept");
+        // The sixteen are untouched.
+        for (validator, sock) in validators.iter_mut().enumerate() {
+            write_frame(sock, &vote(validator, 3)).expect("a sibling's connection was closed");
+        }
+        assert_eq!(collect(&mut seen, 64), 64, "a vote was lost");
+    }
+
+    fn read_until_frame(mut next: impl FnMut() -> std::io::Result<Vec<u8>>, wanted: &[u8]) -> bool {
+        loop {
+            match next() {
+                Ok(frame) if frame == wanted => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// W4-1, the dialer's side. A listener with no slot closes a connection
+    /// at accept, which an `offer` dialer cannot tell from a legacy node
+    /// closing on the handshake. Its plain retry used to start writing at
+    /// once: the vote waiting in the queue went into the closed socket and
+    /// was gone. Now the dialer looks before it writes, pauses, and the vote
+    /// is still queued when a connection is finally admitted.
+    ///
+    /// The look is a wait of `plain_probe_wait` for the peer's close, so it
+    /// only helps when the refusal arrives inside that wait (X1-5). Here the
+    /// "listener" is this test thread; on a saturated machine it can take
+    /// longer than the wait to accept and close, and the dialer then writes
+    /// the vote, as it would to a slow real listener. The scenario is
+    /// therefore tried a few times and must succeed once: with the look
+    /// removed it never does, because the first plain retry always writes.
+    #[test]
+    fn a_dialer_turned_away_at_accept_keeps_its_queued_vote_for_the_next_connection() {
+        use crate::mesh_pq::{MeshSecurity, Mode};
+        let attempt = || -> bool {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let (events, _received) = mpsc::channel();
+            let mesh = start(
+                "127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
+                events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(),
+                Arc::new(MeshSecurity::ephemeral(Mode::Offer, [9; 32], None)),
+            ).unwrap();
+            let vote = att_frame(&sample_attestation());
+            mesh.broadcast(vote.clone());
+            // Handshake, plain retry, handshake again: all three closed at accept.
+            let started = Instant::now();
+            for _ in 0..3 {
+                drop(listener.accept().unwrap());
+            }
+            assert!(started.elapsed() >= REFUSED_DIAL_BACKOFF_MIN, "a refused dial is retried after a pause");
+            // The fourth is the second plain retry, and this time it is kept.
+            let (mut sock, _) = listener.accept().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            read_until_frame(|| read_frame_until(&mut sock, deadline), &vote)
+        };
+        assert!(
+            (0..4).any(|_| attempt()),
+            "the queued vote was written into a connection the listener had closed, in every attempt"
+        );
+    }
+
+    /// W4-1: a peer that has completed the handshake before is not a legacy
+    /// node, so being closed on the handshake by it never downgrades the
+    /// next connection to plain; the dialer asks again, sealed, after a
+    /// pause, and what it queued meanwhile arrives encrypted.
+    #[test]
+    fn a_dialer_never_falls_back_to_plain_for_a_peer_that_spoke_the_handshake() {
+        use crate::mesh_pq::{handshake_inbound, MeshSecurity, Mode, Session};
+        let net = [9; 32];
+        let ours = MeshSecurity::ephemeral(Mode::Offer, net, None);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (events, _received) = mpsc::channel();
+        let mesh = start(
+            "127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
+            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(),
+            Arc::new(MeshSecurity::ephemeral(Mode::Offer, net, None)),
+        ).unwrap();
+        // First connection: sealed, then dropped.
+        let (mut sock, _) = listener.accept().unwrap();
+        assert!(matches!(handshake_inbound(&mut sock, &ours).unwrap(), Session::Sealed { .. }));
+        drop(sock);
+        // Second: turned away at accept. The vote is broadcast while the
+        // dialer has no connection.
+        drop(listener.accept().unwrap());
+        let vote = att_frame(&sample_attestation());
+        mesh.broadcast(vote.clone());
+        // Third: the dialer must be offering the handshake again.
+        let (mut sock, _) = listener.accept().unwrap();
+        let Session::Sealed { mut opener, .. } = handshake_inbound(&mut sock, &ours).unwrap() else {
+            panic!("the dialer downgraded a peer it had a sealed session with to plain");
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(
+            read_until_frame(|| opener.read_record(&mut sock, deadline), &vote),
+            "the vote queued while the dialer was turned away did not arrive"
+        );
+    }
+
+    #[test]
+    fn refused_dials_back_off_to_a_ceiling_and_start_over_after_a_working_session() {
+        let mut backoff = RefusalBackoff::new();
+        let pauses: Vec<u64> = (0..7).map(|_| backoff.next().as_millis() as u64).collect();
+        assert_eq!(pauses, [250, 500, 1000, 2000, 4000, 5000, 5000]);
+        backoff.reset();
+        assert_eq!(backoff.next(), REFUSED_DIAL_BACKOFF_MIN);
+        assert_eq!(plain_probe_wait(Duration::from_millis(1)), PLAIN_PROBE_MIN);
+        assert_eq!(plain_probe_wait(Duration::from_millis(200)), Duration::from_millis(600));
+        assert_eq!(plain_probe_wait(Duration::from_secs(30)), PLAIN_PROBE_MAX);
+    }
+
+    fn wait_for_essential_panic(name: &str, more_than: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::essential_thread_panics(name) <= more_than && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        crate::essential_thread_panics(name) > more_than
+    }
+
+    fn poison<T: Send + 'static>(lock: Arc<Mutex<T>>) {
+        let _ = thread::spawn(move || {
+            let _held = lock.lock().unwrap();
+            panic!("intentional: poison a mesh lock");
+        })
+        .join();
+    }
+
+    /// W4-3: the accept loop, the dialer loops, the sync timer and the
+    /// watchdog hold the essential-thread guard, and a poisoned lock on
+    /// their paths is a panic there rather than a node that silently stops
+    /// accepting, asking or broadcasting. (Under test the guard records the
+    /// thread's name; in the node it aborts the process.)
+    #[test]
+    fn the_mesh_threads_a_node_cannot_lose_end_the_process_instead_of_going_quiet() {
+        let before = |name| crate::essential_thread_panics(name);
+        let (helper, timer, watchdog, accept, dialer) = (
+            before("mesh-test-essential"), before("mesh-sync-timer"), before("mesh-watchdog"),
+            before("mesh-accept"), before("mesh-dialer"),
+        );
+        spawn_essential("mesh-test-essential", || panic!("intentional: an essential mesh thread panics")).unwrap();
+        assert!(wait_for_essential_panic("mesh-test-essential", helper));
+        // A guarded thread that returns is not a panic.
+        let (done_tx, done_rx) = mpsc::channel();
+        spawn_essential("mesh-test-essential", move || done_tx.send(()).unwrap()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(before("mesh-test-essential"), helper + 1);
+
+        let (events, _received) = mpsc::channel::<EngineEvent>();
+        let mesh = start(
+            "127.0.0.1", 0, vec![PANICKING_PEER.to_string()], events, std::env::temp_dir(),
+            Arc::new(AtomicU64::new(0)), QueueBudget::new(), Arc::new(crate::mesh_pq::MeshSecurity::plain()),
+        ).expect("bind the devnet transport");
+        assert!(wait_for_essential_panic("mesh-dialer", dialer), "a dialer loop is not guarded");
+
+        // A poisoned schedule made `pump` return early, forever.
+        let scheduler = mesh.sync.clone();
+        let _ = thread::spawn(move || {
+            let _held = scheduler.schedule.lock().unwrap();
+            panic!("intentional: poison the sync schedule");
+        })
+        .join();
+        assert!(wait_for_essential_panic("mesh-sync-timer", timer), "the sync timer kept running on a poisoned schedule");
+
+        // A poisoned registry made every broadcast skip the peers that dialed in.
+        poison(mesh.inbound.clone());
+        assert!(wait_for_essential_panic("mesh-watchdog", watchdog), "nothing noticed the poisoned peer registry");
+        let _dial = TcpStream::connect(mesh.listen_addr()).unwrap();
+        assert!(wait_for_essential_panic("mesh-accept", accept), "the accept loop kept running on a poisoned registry");
+    }
+
+    /// W4-3: a connection thread the OS refuses costs that connection and
+    /// nothing else, and only a minute-long run of nothing but refusals is
+    /// reported to the watchdog as fatal.
+    #[test]
+    fn a_refused_connection_thread_drops_the_connection_and_only_a_long_run_is_fatal() {
+        struct Owned(Arc<AtomicBool>);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let health = SpawnHealth::default();
+        let released = Arc::new(AtomicBool::new(false));
+        let owned = Owned(released.clone());
+        let started = spawn_connection_with(
+            &health,
+            "mesh-test",
+            move || drop(owned),
+            |_, body| {
+                drop(body);
+                Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "no more threads"))
+            },
+        );
+        assert!(!started);
+        assert!(released.load(Ordering::Acquire), "what the worker owned (socket, slot) was released");
+        assert!(!health.exhausted(Instant::now() + Duration::from_secs(3600)), "one refusal is never fatal");
+
+        let health = SpawnHealth::default();
+        let t0 = Instant::now();
+        for _ in 0..SPAWN_FAILURES_FATAL - 1 {
+            health.failed(t0);
+        }
+        assert!(!health.exhausted(t0 + Duration::from_secs(3600)), "too few attempts to conclude anything");
+        health.failed(t0 + Duration::from_secs(5));
+        assert!(!health.exhausted(t0 + SPAWN_FAILURE_WINDOW - Duration::from_secs(1)), "a short squeeze");
+        assert!(health.exhausted(t0 + SPAWN_FAILURE_WINDOW));
+        // One worker that does start clears the run.
+        let (done_tx, done_rx) = mpsc::channel();
+        assert!(spawn_connection(&health, "mesh-test", move || done_tx.send(()).unwrap()));
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!health.exhausted(t0 + Duration::from_secs(3600)));
+    }
+
+    /// W4-2: a node whose own address is in its `--peers` (one list shared by
+    /// a whole fleet) recognises the dial that comes back to it, makes no
+    /// connection out of it, and goes on connecting to everyone else.
+    #[test]
+    fn a_node_that_lists_its_own_address_connects_to_its_other_peers_and_not_to_itself() {
+        use crate::mesh_pq::{handshake_inbound, MeshSecurity, Mode, Session};
+        let net = [9; 32];
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        // A free port for the node, so that it can be told its own address.
+        let own_port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (events, _received) = mpsc::channel();
+        let mesh = start(
+            "127.0.0.1", own_port,
+            vec![format!("127.0.0.1:{own_port}"), other.local_addr().unwrap().to_string()],
+            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(),
+            Arc::new(MeshSecurity::ephemeral(Mode::Offer, net, None)),
+        ).unwrap();
+        let (mut sock, _) = other.accept().unwrap();
+        let session = handshake_inbound(&mut sock, &MeshSecurity::ephemeral(Mode::Offer, net, None)).unwrap();
+        assert!(matches!(session, Session::Sealed { .. }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mesh.peer_count() < 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(mesh.peer_count(), 1, "the other peer, and no connection of the node to itself");
     }
 }

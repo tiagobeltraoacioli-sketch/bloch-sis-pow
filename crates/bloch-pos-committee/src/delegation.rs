@@ -47,6 +47,9 @@
 
 use crate::sample::Validator;
 use crate::tokenomics_v4::SAT_PER_BLOCH;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 /// Most of the active stake that may activate — or deactivate — in one epoch.
 ///
@@ -152,6 +155,32 @@ pub struct Delegation {
 }
 
 impl Delegation {
+    /// What a pruned position holds once
+    /// [`crate::params::FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH`] binds: a
+    /// fully withdrawn funded position is overwritten with this constant at
+    /// an epoch boundary, so the history keeps its positions (they are wire
+    /// identifiers) while the record leaves the warm-up fold (`eligible` is
+    /// false) and the state root (the transition does not commit a pruned
+    /// slot). One fixed value, so a pruned slot carries no information of
+    /// its own: the committed leaves determine the whole history.
+    ///
+    /// No admission path can produce it (both require
+    /// `amount_sat >= MIN_DELEGATION_SAT` and store `eligible: true`), so
+    /// while the gate is inert no committed record ever equals it.
+    pub const PRUNED: Delegation = Delegation {
+        delegator: 0,
+        validator: 0,
+        amount_sat: 0,
+        requested_epoch: 0,
+        deactivate_epoch: None,
+        eligible: false,
+    };
+
+    /// Whether this slot was pruned (see [`Self::PRUNED`]).
+    pub fn is_pruned(&self) -> bool {
+        *self == Self::PRUNED
+    }
+
     /// Deterministic queue order: request epoch, validator, delegator, amount.
     ///
     /// Never by position in the input slice — that was a real consensus bug in
@@ -190,8 +219,11 @@ pub enum StakeState {
 /// The resolved view of all delegations at one epoch.
 ///
 /// Built by a single deterministic pass from the full delegation list, so two
-/// nodes with identical state always agree. Nothing here reads a clock, a
-/// cache, or anything mutable.
+/// nodes with identical state always agree. Nothing here reads a clock or
+/// anything mutable. [`Registry::resolve`] does keep a node-local memo of its
+/// last result, keyed by its complete input, so a hit is by construction the
+/// value a fresh computation returns (see `RESOLVE_MEMO`).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Registry {
     epoch: u64,
     /// (validator, active stake) sorted by validator index.
@@ -204,14 +236,17 @@ pub struct Registry {
     /// aggregate stake reported a queued delegation as `Active` whenever some
     /// *other* delegation to the same validator had already been admitted —
     /// found by property test, 2026-08-11.
-    admitted: Vec<(u64, u32, u32, u128)>,
+    ///
+    /// Shared (`Arc`) only so a memo hit costs a reference count instead of a
+    /// copy of one entry per delegation; never mutated after construction.
+    admitted: Arc<Vec<(u64, u32, u32, u128)>>,
     /// Queue key -> satoshis of that delegation actually activated, sorted.
     ///
     /// Partial activation means a delegation can contribute stake without being
     /// fully admitted, so "is it active?" and "how much of it is active?" are
     /// different questions and both have callers: consensus wants the stake, a
     /// wallet wants to tell its user that 500 of their 1,000 BLCH are earning.
-    activated: Vec<((u64, u32, u32, u128), u128)>,
+    activated: Arc<Vec<((u64, u32, u32, u128), u128)>>,
 }
 
 /// [`Registry::cap_sat`]'s fixed point over an arbitrary stake vector — the
@@ -269,133 +304,338 @@ pub fn combined_cap_sat(stakes: &[u128]) -> u128 {
     }
 }
 
+/// Churn budget of epoch `e`, given the stake active at its start.
+fn epoch_budget(e: u64, total_active: u128) -> u128 {
+    // Genesis is unlimited: the rate limit exists to stop new stake
+    // from overwhelming an *existing* set, and at epoch 0 there is no
+    // set to protect. Every later epoch is rate-limited against the
+    // stake active at the start of that epoch.
+    if e == 0 {
+        u128::MAX
+    } else {
+        // FLOOR, and it is load-bearing. The rate is a fraction of the
+        // stake that is *currently* active, so during a drain the
+        // budget shrinks with the thing it is draining: the tail decays
+        // geometrically and never reaches zero. A mass exit would leave
+        // a dust remainder bonded forever — caught by
+        // `deactivation_drains_gradually_and_completes`, which ran 200
+        // epochs and still found 937,812 sat stuck.
+        //
+        // Any positive floor guarantees termination. The floor is a
+        // wall-clock quantity, not one delegation's worth: at 25 bps
+        // the proportional budget only exceeds 500,000 BLCH once the
+        // active set passes 200M BLCH, so on a young network a 10-BLCH
+        // floor would be the binding constraint and would strangle
+        // onboarding — 10 BLCH per 16 minutes is not a network, it is
+        // a queue. (Ethereum's floor is the same idea at a different
+        // unit: 4 validators per epoch.)
+        //
+        // It was `MIN_DELEGATION_SAT` while the rate was 900 bps, where
+        // the floor almost never bound. Lowering the rate 36x is what
+        // makes the floor load-bearing, so the two move together — and
+        // the 2026-08-12 split moved the floor x5 so its wall-clock
+        // value stayed put (see MIN_CHURN_SAT).
+        let rate = total_active * WARMUP_RATE_BPS / 10_000;
+        if rate > MIN_CHURN_SAT { rate } else { MIN_CHURN_SAT }
+    }
+}
+
+/// What the warm-up walk leaves behind at its last epoch.
+struct Fold {
+    /// (validator, active stake), sorted by validator, no zero entries.
+    active: Vec<(u32, u128)>,
+    total_active: u128,
+    /// Activated satoshis per queue entry, in queue order.
+    activated: Vec<u128>,
+}
+
+/// The warm-up and cool-down walk over a queue already in queue order
+/// (sorted by [`Delegation::queue_key`], every entry eligible).
+///
+/// # The rule
+///
+/// For every epoch `e` in `0..=epoch`, in order, with `budget =
+/// epoch_budget(e, total_active)` fixed at the start of the epoch:
+///
+/// 1. *Activation pass*, in queue order: an entry with `requested_epoch <= e`,
+///    not deactivated by `e` and not yet fully activated takes
+///    `min(remaining, budget - used)` while `used < budget`.
+/// 2. *Release pass*, in queue order, against the same budget counted
+///    separately: an entry deactivated by `e` that still holds activated
+///    stake gives back `min(activated, budget - released)` while
+///    `released < budget`.
+///
+/// The original statement of this rule visited every entry twice in every
+/// epoch (`for e in 0..=epoch { for d in queue {..} for d in queue {..} }`),
+/// which is O(epochs x entries) per call, on every block (security review
+/// ST-1). It is kept verbatim as `tests::resolve_reference`, and
+/// `tests::fold_matches_the_reference_*` compare the two on random inputs.
+///
+/// # Why this walk returns the same value
+///
+/// In the original, a visit to entry `i` in a pass either *acts* (changes
+/// `activated[i]`, `total_active`, `active` and the pass counter) or is
+/// skipped with no effect at all. This function performs exactly the acting
+/// visits, in the same order, with the same arithmetic, and nothing else:
+///
+/// * `warming` is, at the start of each visited epoch's activation pass, the
+///   set `{ i : requested_epoch <= e, not deactivated by e, activated[i] <
+///   amount }`. Entries enter it when `e` reaches their request epoch (the
+///   queue is sorted by request epoch, so those are a growing prefix), leave
+///   it for good when `e` reaches their deactivation epoch (a deactivated
+///   entry is never activated again) and leave it when they complete (only a
+///   release lowers `activated`, and releases only touch deactivated
+///   entries). The pass walks it in ascending queue index while
+///   `used < budget`; `used` never decreases inside a pass, so once it
+///   reaches the budget the original skips every later entry too.
+/// * `cooling` is `{ i : deactivated by e, activated[i] > 0 }`. An entry
+///   enters when `e` reaches its deactivation epoch with stake activated and
+///   leaves when it is fully released; a deactivated entry with nothing
+///   activated can never gain stake, so it never enters. Walked the same way
+///   against `released`.
+/// * An epoch in which both sets are empty changes nothing in the original:
+///   every visit is a skip, and the budget is a pure function of state that
+///   did not move. Both sets stay empty until `e` reaches the next request or
+///   deactivation epoch, so the walk jumps there. The one thing the original
+///   does in such an epoch is evaluate the budget expression, whose
+///   multiplication is overflow-checked in every profile; it is evaluated
+///   once here on entering an idle run, with the same operand, so even an
+///   unreachable overflow panics on the same inputs.
+///
+/// The cost is O(entries x log entries) for the events plus one step per
+/// epoch in which stake actually moves, instead of two full passes per epoch
+/// since genesis.
+fn fold_queue(queue: &[&Delegation], epoch: u64) -> Fold {
+    RESOLVE_FOLDS.with(|c| c.set(c.get().wrapping_add(1)));
+    let mut active: Vec<(u32, u128)> = Vec::new();
+    let mut total_active: u128 = 0;
+    // How much of each queued delegation is currently active. Partial
+    // activation is the whole point — see the loop below.
+    let mut activated: Vec<u128> = vec![0; queue.len()];
+
+    // Deactivation events in epoch order. Request events need no list of
+    // their own: the queue is sorted by request epoch first.
+    let mut deactivations: Vec<(u64, usize)> = queue
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| d.deactivate_epoch.map(|de| (de, i)))
+        .collect();
+    deactivations.sort_unstable();
+    let mut next_request = 0usize;
+    let mut next_deactivation = 0usize;
+    let mut warming: BTreeSet<usize> = BTreeSet::new();
+    let mut cooling: BTreeSet<usize> = BTreeSet::new();
+
+    let mut e = 0u64;
+    loop {
+        while let Some(d) = queue.get(next_request).filter(|d| d.requested_epoch <= e) {
+            if !d.deactivate_epoch.is_some_and(|de| de <= e) {
+                warming.insert(next_request);
+            }
+            next_request += 1;
+        }
+        while let Some((_, i)) = deactivations.get(next_deactivation).filter(|(de, _)| *de <= e) {
+            warming.remove(i);
+            if activated[*i] > 0 {
+                cooling.insert(*i);
+            }
+            next_deactivation += 1;
+        }
+
+        let budget = epoch_budget(e, total_active);
+
+        // PARTIAL ACTIVATION. A delegation larger than the epoch's budget
+        // activates in slices across several epochs instead of waiting for
+        // a budget that will never come.
+        //
+        // The previous rule let the head of the queue through whole,
+        // whatever its size, to avoid deadlocking on any delegation bigger
+        // than 9% of active stake — which on a young network is most of
+        // them. That bought liveness by selling the cap: a single large
+        // delegation activated entirely in one epoch, which is exactly the
+        // "instant activation is instant control" the limit exists to stop
+        // (adversarial review, finding F3, 2026-08-11).
+        //
+        // Slicing gives both. The queue always drains, and the 9% ceiling
+        // holds absolutely, in both directions. It is also what Solana and
+        // Ethereum do, for the same reason.
+        let mut used: u128 = 0;
+        let mut from = 0usize;
+        while used < budget {
+            let Some(&i) = warming.range(from..).next() else { break };
+            let d = queue[i];
+            let remaining = d.amount_sat - activated[i];
+            let take = remaining.min(budget - used);
+            used += take;
+            activated[i] += take;
+            total_active += take;
+            match active.binary_search_by_key(&d.validator, |(v, _)| *v) {
+                Ok(pos) => active[pos].1 += take,
+                Err(pos) => active.insert(pos, (d.validator, take)),
+            }
+            if activated[i] == d.amount_sat {
+                warming.remove(&i);
+            }
+            from = i + 1;
+        }
+
+        // Cool-down, sliced the same way and against the same budget.
+        let mut released: u128 = 0;
+        let mut from = 0usize;
+        while released < budget {
+            let Some(&i) = cooling.range(from..).next() else { break };
+            let d = queue[i];
+            let give = activated[i].min(budget - released);
+            released += give;
+            activated[i] -= give;
+            total_active -= give;
+            if let Ok(pos) = active.binary_search_by_key(&d.validator, |(v, _)| *v) {
+                active[pos].1 -= give;
+                if active[pos].1 == 0 {
+                    active.remove(pos);
+                }
+            }
+            if activated[i] == 0 {
+                cooling.remove(&i);
+            }
+            from = i + 1;
+        }
+
+        if e == epoch {
+            break;
+        }
+        if warming.is_empty() && cooling.is_empty() {
+            // Idle until the next event: see the function docs.
+            let _ = epoch_budget(e + 1, total_active);
+            let next_event = match (
+                queue.get(next_request).map(|d| d.requested_epoch),
+                deactivations.get(next_deactivation).map(|(de, _)| *de),
+            ) {
+                (Some(r), Some(de)) => Some(r.min(de)),
+                (r, de) => r.or(de),
+            };
+            match next_event {
+                Some(next) if next <= epoch => e = next,
+                _ => break,
+            }
+        } else {
+            e += 1;
+        }
+    }
+
+    Fold { active, total_active, activated }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Resolver memoisation (security review ST-1)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// `Registry::resolve` is called once per block for the roster, several times
+// at an epoch boundary and again by slashing, commission and withdrawal
+// transactions, almost always with the same delegation list and the same
+// epoch. The memo below keeps the most recent result.
+//
+// INVARIANT: a hit MUST be the value `Registry::resolve_uncached` returns for
+// the same arguments. It holds by construction: the key is the COMPLETE input
+// of a pure function — the epoch and a copy of the delegation list itself,
+// compared record by record, not a digest of it — and the stored value is a
+// previously computed result, returned verbatim. There is no state to
+// invalidate, so there is no invalidation to forget; a list that differs in
+// any record, or in order, is simply a miss. Pinned by
+// `tests::memo_hit_is_identical_to_a_fresh_computation`.
+//
+// REPLAY-SAFETY: same argument as the committee partition memo
+// (`committees.rs`, R1 M8). This is a per-thread, in-process value: never
+// committed, never serialized, never read by another node, empty after a
+// restart. Two nodes compute identical registries whether or not either one
+// hits; only wall-clock time differs, so it needs no activation gate.
+
+struct ResolveMemo {
+    epoch: u64,
+    delegations: Vec<Delegation>,
+    registry: Registry,
+}
+
+thread_local! {
+    // A single entry, for the reason the partition memo has one: block
+    // processing walks one chain on one thread, so the previous call's input
+    // is the one worth remembering, and a single slot needs no eviction
+    // policy. Its size is one copy of the delegation list plus one result.
+    static RESOLVE_MEMO: RefCell<Option<ResolveMemo>> = const { RefCell::new(None) };
+
+    /// How many times the warm-up walk itself ran on this thread.
+    /// Observability only, the same device as
+    /// `committees::partition_recomputations`: nothing branches on it and it
+    /// is never committed. It exists so a test can tell a memo hit from a
+    /// recomputation, which no output can.
+    static RESOLVE_FOLDS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The calling thread's count of warm-up walks. Observability only.
+pub fn resolve_recomputations() -> u64 {
+    RESOLVE_FOLDS.with(|c| c.get())
+}
+
+fn resolve_memo_get(delegations: &[Delegation], epoch: u64) -> Option<Registry> {
+    RESOLVE_MEMO.with(|memo| match &*memo.borrow() {
+        Some(m) if m.epoch == epoch && m.delegations.as_slice() == delegations => {
+            Some(m.registry.clone())
+        }
+        _ => None,
+    })
+}
+
+fn resolve_memo_put(delegations: &[Delegation], epoch: u64, registry: &Registry) {
+    RESOLVE_MEMO.with(|memo| {
+        *memo.borrow_mut() = Some(ResolveMemo {
+            epoch,
+            delegations: delegations.to_vec(),
+            registry: registry.clone(),
+        });
+    });
+}
+
 impl Registry {
     /// Resolve the registry at `epoch`.
     ///
-    /// Walks epochs from zero admitting delegations under the warm-up budget.
-    /// The walk is O(epochs × delegations); this is a reference implementation
-    /// and a production node would carry the activation epoch in committed
-    /// state rather than recomputing it. What matters here is that the rule is
-    /// stated once, unambiguously.
+    /// The rule is a walk over epochs from zero, admitting and releasing
+    /// delegations under the warm-up budget; it is stated once, in
+    /// `fold_queue`. A production node would carry the activation state in
+    /// committed state rather than recomputing it; until it does, the walk
+    /// skips the epochs and entries in which nothing can move, and the last
+    /// result is memoised by its full input (`RESOLVE_MEMO`).
     pub fn resolve(delegations: &[Delegation], epoch: u64) -> Registry {
+        if delegations.is_empty() {
+            return Self::resolve_uncached(delegations, epoch);
+        }
+        if let Some(hit) = resolve_memo_get(delegations, epoch) {
+            return hit;
+        }
+        let registry = Self::resolve_uncached(delegations, epoch);
+        resolve_memo_put(delegations, epoch, &registry);
+        registry
+    }
+
+    /// [`Self::resolve`] with no memo in front of it, so the memo and the
+    /// computation can each be tested against the other.
+    fn resolve_uncached(delegations: &[Delegation], epoch: u64) -> Registry {
         let mut queue: Vec<&Delegation> =
             delegations.iter().filter(|d| d.eligible && d.amount_sat >= MIN_DELEGATION_SAT).collect();
         // R1 M5 (perf, ungated, behaviour-identical): with nothing eligible
-        // to admit, every one of the `epoch + 1` iterations below finds no
-        // `d` to activate or deactivate — the loop is `for e in 0..=epoch`
-        // over a `queue` it never indexes into productively, so its ONLY
-        // effect on an empty queue is burning CPU. Skipping it changes
-        // nothing about the RESULT (every field below is what the loop
-        // would have produced from an empty `queue` and `activated`), only
-        // the cost: at today's epoch (~2,000+) this call site is walked from
-        // `duty_roster_at` on every block, and `self.delegations` is
-        // provably empty on the live chain today (`DEPOSIT_ACTIVATION_EPOCH`
-        // is `u64::MAX`, so `Delegate` — the only writer — has never
-        // applied; see that constant's docs).
+        // to admit the walk has nothing to do, and every field below is what
+        // it would have produced from an empty `queue` and `activated`.
         if queue.is_empty() {
             return Registry {
                 epoch,
                 stakes: Vec::new(),
                 total_active: 0,
-                admitted: Vec::new(),
-                activated: Vec::new(),
+                admitted: Arc::new(Vec::new()),
+                activated: Arc::new(Vec::new()),
             };
         }
         queue.sort_by_key(|d| d.queue_key());
 
-        let mut active: Vec<(u32, u128)> = Vec::new();
-        let mut total_active: u128 = 0;
-        // How much of each queued delegation is currently active. Partial
-        // activation is the whole point — see the loop below.
-        let mut activated: Vec<u128> = vec![0; queue.len()];
-
-        for e in 0..=epoch {
-            // Genesis is unlimited: the rate limit exists to stop new stake
-            // from overwhelming an *existing* set, and at epoch 0 there is no
-            // set to protect. Every later epoch is rate-limited against the
-            // stake active at the start of that epoch.
-            let budget = if e == 0 {
-                u128::MAX
-            } else {
-                // FLOOR, and it is load-bearing. The rate is a fraction of the
-                // stake that is *currently* active, so during a drain the
-                // budget shrinks with the thing it is draining: the tail decays
-                // geometrically and never reaches zero. A mass exit would leave
-                // a dust remainder bonded forever — caught by
-                // `deactivation_drains_gradually_and_completes`, which ran 200
-                // epochs and still found 937,812 sat stuck.
-                //
-                // Any positive floor guarantees termination. The floor is a
-                // wall-clock quantity, not one delegation's worth: at 25 bps
-                // the proportional budget only exceeds 500,000 BLCH once the
-                // active set passes 200M BLCH, so on a young network a 10-BLCH
-                // floor would be the binding constraint and would strangle
-                // onboarding — 10 BLCH per 16 minutes is not a network, it is
-                // a queue. (Ethereum's floor is the same idea at a different
-                // unit: 4 validators per epoch.)
-                //
-                // It was `MIN_DELEGATION_SAT` while the rate was 900 bps, where
-                // the floor almost never bound. Lowering the rate 36x is what
-                // makes the floor load-bearing, so the two move together — and
-                // the 2026-08-12 split moved the floor x5 so its wall-clock
-                // value stayed put (see MIN_CHURN_SAT).
-                let rate = total_active * WARMUP_RATE_BPS / 10_000;
-                if rate > MIN_CHURN_SAT { rate } else { MIN_CHURN_SAT }
-            };
-
-            // PARTIAL ACTIVATION. A delegation larger than the epoch's budget
-            // activates in slices across several epochs instead of waiting for
-            // a budget that will never come.
-            //
-            // The previous rule let the head of the queue through whole,
-            // whatever its size, to avoid deadlocking on any delegation bigger
-            // than 9% of active stake — which on a young network is most of
-            // them. That bought liveness by selling the cap: a single large
-            // delegation activated entirely in one epoch, which is exactly the
-            // "instant activation is instant control" the limit exists to stop
-            // (adversarial review, finding F3, 2026-08-11).
-            //
-            // Slicing gives both. The queue always drains, and the 9% ceiling
-            // holds absolutely, in both directions. It is also what Solana and
-            // Ethereum do, for the same reason.
-            let mut used: u128 = 0;
-            for (i, d) in queue.iter().enumerate() {
-                if d.requested_epoch > e || d.deactivate_epoch.is_some_and(|de| de <= e) {
-                    continue;
-                }
-                let remaining = d.amount_sat - activated[i];
-                if remaining == 0 || used >= budget {
-                    continue;
-                }
-                let take = remaining.min(budget - used);
-                used += take;
-                activated[i] += take;
-                total_active += take;
-                match active.binary_search_by_key(&d.validator, |(v, _)| *v) {
-                    Ok(pos) => active[pos].1 += take,
-                    Err(pos) => active.insert(pos, (d.validator, take)),
-                }
-            }
-
-            // Cool-down, sliced the same way and against the same budget.
-            let mut released: u128 = 0;
-            for (i, d) in queue.iter().enumerate() {
-                let Some(de) = d.deactivate_epoch else { continue };
-                if de > e || activated[i] == 0 || released >= budget {
-                    continue;
-                }
-                let give = activated[i].min(budget - released);
-                released += give;
-                activated[i] -= give;
-                total_active -= give;
-                if let Ok(pos) = active.binary_search_by_key(&d.validator, |(v, _)| *v) {
-                    active[pos].1 -= give;
-                    if active[pos].1 == 0 {
-                        active.remove(pos);
-                    }
-                }
-            }
-        }
+        let Fold { active, total_active, activated } = fold_queue(&queue, epoch);
 
         // A delegation counts as admitted only once it is FULLY activated;
         // a partially activated one is still warming up.
@@ -419,8 +659,8 @@ impl Registry {
             epoch,
             stakes: active,
             total_active,
-            admitted: admitted_keys,
-            activated: activated_map,
+            admitted: Arc::new(admitted_keys),
+            activated: Arc::new(activated_map),
         }
     }
 
@@ -610,3 +850,76 @@ pub fn apply_slash(
         })
         .collect()
 }
+
+/// Whether overwriting the delegations at `positions` with
+/// [`Delegation::PRUNED`] is invisible to every other delegation, at `epoch`
+/// and at every later epoch
+/// ([`crate::params::FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH`]).
+///
+/// [`Registry::resolve`] replays the whole history from epoch zero, so
+/// removing a record rewrites the past: stake that once queued behind it
+/// would have warmed up earlier, and the budget of every epoch it was active
+/// in would have been smaller. Removal is only safe when none of that
+/// reaches the present, which is what this checks, exactly: it runs the walk
+/// with and without the records and requires that
+///
+/// * every record that stays holds the same activated amount at `epoch` in
+///   both runs, and
+/// * every record that goes holds nothing at `epoch` and was deactivated at
+///   or before it.
+///
+/// That is sufficient for every later epoch. The walk past `epoch` depends
+/// only on the activated amounts at `epoch`, the records and their queue
+/// order. A record that holds nothing and is already deactivated is skipped
+/// by both passes from then on (it can no longer activate and has nothing to
+/// release), so it consumes no budget; removing it keeps the relative order
+/// of the rest; and anything the chain adds later (a new delegation, a
+/// deactivation) takes effect at an epoch after `epoch` and so changes
+/// neither run up to it. Two walks that agree at `epoch` therefore agree
+/// from there on.
+///
+/// In practice the two runs agree whenever the queue has been idle at least
+/// once since the removed records finished draining, and a withdrawal comes
+/// `WITHDRAWAL_DELAY_EPOCHS` after that point. When they do not agree the
+/// caller keeps the records and asks again at the next boundary.
+pub fn pruning_is_outcome_neutral(
+    delegations: &[Delegation],
+    positions: &[usize],
+    epoch: u64,
+) -> bool {
+    let mut pruned = vec![false; delegations.len()];
+    for position in positions {
+        match pruned.get_mut(*position) {
+            Some(slot) => *slot = true,
+            None => return false,
+        }
+    }
+    // The queue of `Registry::resolve`, as indices: a stable sort of the
+    // eligible records in input order.
+    let mut order: Vec<usize> = (0..delegations.len())
+        .filter(|i| delegations[*i].eligible && delegations[*i].amount_sat >= MIN_DELEGATION_SAT)
+        .collect();
+    order.sort_by_key(|i| delegations[*i].queue_key());
+    let with: Vec<&Delegation> = order.iter().map(|i| &delegations[*i]).collect();
+    let without: Vec<&Delegation> =
+        order.iter().filter(|i| !pruned[**i]).map(|i| &delegations[*i]).collect();
+    let before = fold_queue(&with, epoch);
+    let after = fold_queue(&without, epoch);
+
+    let mut kept = after.activated.iter();
+    for (slot, i) in order.iter().enumerate() {
+        if pruned[*i] {
+            let drained = before.activated[slot] == 0
+                && delegations[*i].deactivate_epoch.is_some_and(|de| de <= epoch);
+            if !drained {
+                return false;
+            }
+        } else if kept.next() != Some(&before.activated[slot]) {
+            return false;
+        }
+    }
+    before.total_active == after.total_active && before.active == after.active
+}
+
+#[cfg(test)]
+mod tests;

@@ -114,6 +114,11 @@ Two `--rpc` endpoints on **independently operated** nodes. If the tool prints a
 single-endpoint warning, stop and find a second node — this fleet has forked
 before, and a forked node answers as confidently as a correct one.
 
+If the tool aborts with `cannot establish whether slot <n> is empty`, an
+endpoint failed to answer for a slot in the boundary scan. Stop, and re-run
+when that endpoint is healthy (or with a different one). The tool refuses to
+step past such a slot because that would select an earlier block.
+
 Produces `wscheckpoint-<epoch>.bin` (154 bytes — **this is the artifact**),
 `wscheckpoint-<epoch>.json` (human view, not the artifact), and prints the
 **ws digest**: 64 hex characters.

@@ -154,6 +154,11 @@ fn spawn_node(
         .env(KEYSTORE_POLICY.0, KEYSTORE_POLICY.1)
         // Keep the host signer anchor inside this throwaway test root.
         .env("BLOCH_SIGNER_ANCHOR_DIR", dir.with_extension("signer-anchor"))
+        // The cold node boots a genesis key after genesis with no signing
+        // record and an anchor created on that boot. These keys were made by
+        // this test and have signed nowhere else, which is what the
+        // acknowledgement states (review PER-2).
+        .env("BLOCH_ACK_MISSING_SLASHING_PROTECTION", "1")
         .args([
             "run",
             "--data-dir",

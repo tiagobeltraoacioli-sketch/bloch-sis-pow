@@ -10,7 +10,7 @@
 //! ## Gate
 //!
 //! This crate holds NO activation constant. The one HF3 constant is
-//! `bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH` (`u64::MAX` = never);
+//! `bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH` (armed: 7360);
 //! consensus decides `params::hf3_slh_suite_active(epoch)` and passes the
 //! verdict in as `slh_suite_enabled`. With it `false`, [`super::verify_spend`]
 //! is literally [`super::verify`], and every context-free entry point

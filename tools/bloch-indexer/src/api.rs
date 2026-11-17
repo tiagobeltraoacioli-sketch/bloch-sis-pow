@@ -566,7 +566,8 @@ pub fn route(path: &str, query: &str, index: &Shared) -> (u16, Json) {
                         Json::s(
                             "eutxo_total_sat is the satoshi held in unspent outputs, derived by \
                              replay. It is NOT the whole money supply: staked and delegated \
-                             balances live in the validator records, not in the eUTXO set.",
+                             balances live in the validator records, and the native L2 escrow \
+                             lives in L2 state, not in the eUTXO set.",
                         ),
                     ),
                     ("count", Json::u(rows.len() as u64)),
@@ -596,23 +597,24 @@ fn shape_of(sh: &ScriptHash) -> &'static str {
 /// reference is not a person or a proven wallet owner. Exact amounts remain
 /// decimal strings; this bounded list is not a census of every holder.
 pub fn holders_json(ix: &Index, limit: usize) -> Json {
-    let mut balances: Vec<_> = ix.balance.iter().filter(|(_, amount)| **amount > 0).collect();
-    balances.sort_unstable_by(|(a_hash, a_amount), (b_hash, b_amount)|
-        b_amount.cmp(a_amount).then(a_hash.cmp(b_hash)));
-    let shown = limit.min(256).min(balances.len());
-    let rows = balances.iter().take(shown).enumerate().map(|(rank, (script_hash, balance))| {
+    // L1M-03: served from the ranking cached at the end of each sync, so a
+    // request costs O(limit) under the read lock instead of sorting the whole
+    // balance table.
+    let top = ix.holders_top();
+    let shown = limit.min(crate::index::HOLDERS_TOP_MAX).min(top.rows.len());
+    let rows = top.rows.iter().take(shown).enumerate().map(|(rank, (script_hash, balance))| {
         Json::Obj(vec![
             ("rank", Json::u(rank as u64 + 1)),
             ("script_hash", Json::hex32(script_hash)),
-            ("balance_sat", Json::sat(**balance)),
-            ("utxo_count", Json::u(ix.by_script.get(*script_hash).map(|s| s.len()).unwrap_or(0) as u64)),
+            ("balance_sat", Json::sat(*balance)),
+            ("utxo_count", Json::u(ix.by_script.get(script_hash).map(|s| s.len()).unwrap_or(0) as u64)),
         ])
     }).collect();
     let tip = ix.tip();
     Json::Obj(vec![
         ("holders", Json::Arr(rows)),
         ("returned", Json::u(shown as u64)),
-        ("total_script_hashes_with_balance", Json::u(balances.len() as u64)),
+        ("total_script_hashes_with_balance", Json::u(top.with_balance as u64)),
         ("indexed_total_sat", Json::sat(tip.eutxo_total_sat)),
         ("as_of_height", Json::u(ix.height())),
         ("as_of_slot", Json::u(tip.slot)),
@@ -719,7 +721,7 @@ fn block_json(ix: &Index, r: &BlockRow) -> Json {
 }
 
 fn tx_json(t: &TxRow) -> Json {
-    Json::Obj(vec![
+    let mut fields = vec![
         ("permalink", Json::s(format!("/tx/{}/{}", crate::hex32(&t.block_id), t.tx_index))),
         ("txid", Json::hex32(&t.txid)),
         ("block_id", Json::hex32(&t.block_id)),
@@ -760,7 +762,12 @@ fn tx_json(t: &TxRow) -> Json {
         ("declared_bytes", Json::u(t.declared_bytes)),
         ("tip_millisat_per_gas", Json::sat(t.tip_millisat_per_gas)),
         ("fee_sat", t.fee_sat.map(Json::sat).unwrap_or(Json::Null)),
-    ])
+    ];
+    if t.kind.is_l2() {
+        fields.push(("l2_escrow_in_sat", Json::sat(t.l2_escrow_in_sat)));
+        fields.push(("l2_escrow_out_sat", Json::sat(t.l2_escrow_out_sat)));
+    }
+    Json::Obj(fields)
 }
 
 fn epoch_json(r: &EpochRow) -> Json {

@@ -83,6 +83,26 @@
 //! latest-message cache would change heads. Differential tests compare both
 //! tie-break regimes against the unchanged full rebuild through insertion,
 //! replacement, removal, stake changes, missing parents and synthetic cycles.
+//!
+//! Only blocks that passed the state transition vote from their body
+//! (security review 2026-11-10, FC-1). Admission stores a block after
+//! authenticating its proposer and its body commitments, and that is all it
+//! proves: the body attestations are verified by `apply_block`, when the
+//! block is applied. A stored block that was never applied therefore adds a
+//! parent edge to the tree and no weight; `BlockInventory::mark_validated`
+//! is what the apply, reorg and boot paths call to count a body. See
+//! `engine/block_inventory.rs`.
+//!
+//! That rule alone strands a node on the wrong side of a fork whose two
+//! branches disagree on the validator set (finding V1-1): the other branch's
+//! gossip votes are judged against this node's roster and are never pooled,
+//! its body votes do not count until it is applied, and it is applied only
+//! if fork choice selects it. `Engine::validate_side_branch_turn` closes the
+//! loop without reopening FC-1: in bounded slices it runs the real
+//! transition over a stored side branch from its fork point, WITHOUT
+//! adopting it, and marks the blocks that pass. Their votes then weigh like
+//! any validated block's, and `advance` reorganises if the branch is
+//! heavier.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -465,6 +485,24 @@ pub struct Config {
     /// Port for `GET /health` + `GET /metrics`. `None` (the default — the
     /// flag is opt-in) starts no listener at all.
     pub metrics_port: Option<u16>,
+    /// Devnet transport: `--mesh-security`, `--mesh-allow`, the pins given
+    /// in `--peers`, `--mesh-require-authenticated` (see `mesh_pq.rs`).
+    /// Resolved in [`run`] once the genesis id is known, because the
+    /// handshake binds every connection to it.
+    pub mesh: MeshPlan,
+}
+
+/// The mesh security the operator asked for, before [`run`] has the genesis
+/// id to build it with.
+#[derive(Clone, Debug)]
+pub struct MeshPlan {
+    pub mode: crate::mesh_pq::Mode,
+    pub allow: Option<PathBuf>,
+    /// `--peers host:port=<identity>`: dialed address → expected identity.
+    pub pins: Vec<(String, crate::mesh_pq::PeerId)>,
+    /// `--mesh-require-authenticated`: refuse to start unless every peer
+    /// must present an expected identity.
+    pub require_authenticated: bool,
 }
 
 fn now_ms() -> u64 {
@@ -474,6 +512,33 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Why boot replay of the durable log stopped at a block of `epoch`.
+///
+/// Review round 2, GATE-03: a gate the canonical chain was never checked
+/// against, armed at an epoch the chain had already passed, fails exactly
+/// here, on every restart. Name it, so the operator is not left with a
+/// corrupt-disk diagnosis for a release mistake.
+fn replay_failure_message(epoch: u64) -> String {
+    replay_failure_message_for(bloch_pos_committee::hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY, epoch)
+}
+
+/// [`replay_failure_message`] over an explicit gate list, so the message can
+/// be tested with a gate armed in the past (the shipped list arms none
+/// below epoch 8620).
+fn replay_failure_message_for(unarmed: &[bloch_pos_committee::hard_forks::UnarmedGate], epoch: u64) -> String {
+    let mut msg =
+        String::from("durable block log failed consensus replay; refusing to serve a partial head");
+    let gates = bloch_pos_committee::hard_forks::gates_armed_at_or_below(unarmed, epoch);
+    if !gates.is_empty() {
+        let list: Vec<String> = gates.iter().map(|(name, at)| format!("{name} = {at}")).collect();
+        msg.push_str(&format!(
+            ". The failing block is in epoch {epoch}, and this build arms {} at or below it: a rule that was              not in force when the block was produced. If the log is intact, this build's gate is armed in the              past and must be re-released with a future epoch",
+            list.join(", ")
+        ));
+    }
+    msg
 }
 
 /// Whether the local committed head is stale enough that validator duties
@@ -611,6 +676,153 @@ impl DutySyncGate {
     }
 }
 
+/// Boot grace: one sync round before any duty, measured from the moment the
+/// slot loop starts (`loop_started_ms`), not from process start.
+///
+/// Review round 2, GATE-06: the grace used to be timed from engine
+/// construction, before replay. A replay longer than the grace had already
+/// used it up, and because replay refreshes `last_applied_ms` the stale-head
+/// test ([`node_is_behind`]) stayed false for the same length of time: for up
+/// to two slots a restarted validator could sign on a head hours old.
+/// Inclusive at the end so that the instant the grace ends is one at which
+/// [`node_is_behind`] already sees more than `grace_ms` without progress.
+fn in_boot_grace(now_ms: u64, loop_started_ms: u64, grace_ms: u64) -> bool {
+    now_ms.saturating_sub(loop_started_ms) <= grace_ms
+}
+
+/// Reports a step of the wall clock against the monotonic clock. It has NO
+/// effect on validator duties (review round 2, GATE-07 and W3-1).
+///
+/// Every duty is addressed by the wall slot, and the slashing-protection
+/// watermark records it durably. A host clock that jumps forward and is
+/// wrong therefore spends the watermark at a future epoch, and a KES key
+/// evolved to the future period has erased the leaves of the real one.
+///
+/// The first answer to that (GATE-07) held duties after a forward step until
+/// the chain corroborated the new time. That hold could outlive its cause:
+/// a step of 2 to about 2⅓ slots never released, and a slow loop turn was
+/// read as a step (W3-1). A hold that is certain to end has to end after a
+/// short fixed time whatever the chain says, because the common real step
+/// (a resumed or migrated host, a corrected slow clock) is a step TO the
+/// right time, often on every validator of a host at once, and with the
+/// chain itself stalled nothing can corroborate it. Such a hold covers only
+/// the turns in which [`node_is_behind`] and [`DutySyncGate`] already refuse
+/// duties: a forward step of more than two slots is, on the next turn, a
+/// head more than one slot behind the wall slot with more than two slots
+/// since the last applied block. So the hold is gone and this is a log
+/// line. What decides signing is unchanged: the stale-head gate, and behind
+/// it slashing protection, which alone prevents a second signature.
+///
+/// A step is the wall clock moving more than `tolerance_ms` further than,
+/// or short of, the monotonic clock between two samples. Both clocks must
+/// be read together ([`sample_clocks`]), so time spent in the turn is in
+/// both and is never a step. Every sample becomes the new baseline: there is
+/// no state here that could hold anything.
+#[derive(Default)]
+struct ClockStepWatch {
+    /// `(wall_ms, monotonic_ms)` of the previous sample.
+    last: Option<(u64, u64)>,
+}
+
+/// A wall-clock step, in milliseconds relative to the monotonic clock.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ClockStep {
+    Forward(u64),
+    Backward(u64),
+}
+
+impl ClockStepWatch {
+    fn observe(&mut self, wall_ms: u64, monotonic_ms: u64, tolerance_ms: u64) -> Option<ClockStep> {
+        let last = self.last.replace((wall_ms, monotonic_ms));
+        let (base_wall, base_mono) = last?;
+        // What the wall clock would read now had it advanced exactly as the
+        // monotonic clock did since the previous sample.
+        let expected_wall = base_wall.saturating_add(monotonic_ms.saturating_sub(base_mono));
+        let ahead = wall_ms.saturating_sub(expected_wall);
+        let short = expected_wall.saturating_sub(wall_ms);
+        if ahead > tolerance_ms {
+            Some(ClockStep::Forward(ahead))
+        } else if short > tolerance_ms {
+            Some(ClockStep::Backward(short))
+        } else {
+            None
+        }
+    }
+}
+
+/// The wall clock and the monotonic clock (milliseconds since `origin`),
+/// read together. W3-1: read apart, with block application between the two
+/// reads, a slow turn looked like a clock step.
+fn sample_clocks(origin: std::time::Instant) -> (u64, u64) {
+    (now_ms(), origin.elapsed().as_millis() as u64)
+}
+
+/// Longest uncached roll (in epochs) an arriving attestation may cause
+/// without further conditions: a synced node whose head is still in the
+/// previous epoch judges votes of the wall epoch and of the next one.
+/// See `Engine::attestation_roll_admitted`.
+const ATTESTATION_FREE_ROLL_EPOCHS: u64 = 2;
+
+/// Longest uncached roll (in epochs) the block door may run for one header
+/// without spending its one long roll per wall slot (review RC-01): exactly
+/// the audit L1-01 case, a parent in the epoch before the bind decision and
+/// a block in the first epoch the bind governs (two empty epochs between).
+const DOOR_FREE_ROLL_EPOCHS: u64 = bloch_pos_committee::params::KES_BIND_DELAY_EPOCHS + 1;
+
+/// Epochs of short (at most [`DOOR_FREE_ROLL_EPOCHS`]) uncached rolls the
+/// block door runs per wall slot (review RC2-01). Without it, a signed header
+/// for the head's epoch + 3 cost three `process_epoch` calls every time on a
+/// lagging head whose memo held higher epochs: the memo evicts its lowest
+/// epochs first, so the short roll's entries left it at once. Four headers'
+/// worth; a header past it is held and offered again next slot, like one
+/// past the long-roll allowance.
+const DOOR_SHORT_ROLL_EPOCHS_PER_SLOT: u64 = 4 * DOOR_FREE_ROLL_EPOCHS;
+
+/// What the KES half of the block door decided before the proposer check
+/// (audit L1-01; reviews RC-01 and RC-02). See `Engine::door_kes_state`.
+enum DoorKes {
+    /// Judge the proposer on `state`. `known` is the verdict when the door
+    /// already verified the signature on keys identical to `state`'s.
+    Judge { state: Arc<CommittedState>, known: Option<bool> },
+    /// An allowance (verification or long roll) is spent for this slot:
+    /// hold the block in the orphan pool and offer it again next slot.
+    Defer,
+    /// `Ignore` and do not keep it: the source spent its failure allowance,
+    /// or no state transition can accept the block (`EpochAdvanceTooLarge`
+    /// from its parent, or a parent the transition refuses).
+    Drop,
+    /// `Drop`, because the stored parent failed the transition on its own
+    /// parent's exact post-state (review RC2-07): remembered like a side
+    /// block the side-branch fold saw fail, so a re-offered child does not
+    /// run the parent through the transition again.
+    DropFailedParent([u8; 32]),
+}
+
+/// A verifier that accepts every KES leaf signature and nothing else. Run
+/// through `kes::verify` it answers only whether a signature has the shape
+/// of a leaf of the registered key for the period (strict decode, leaf
+/// index, path depth, Merkle path to the registered root), with no
+/// cryptography; the door uses it to decide whether a real KES verification
+/// is worth a unit of the allowance. A false answer is exact: `kes::verify`
+/// refuses that signature whatever the leaf verifier says.
+struct KesShapeOnly;
+
+impl SignatureVerifier for KesShapeOnly {
+    fn verify_with_key(&self, _: &[u8], _: &[u8; 32], _: &[u8]) -> bool {
+        false
+    }
+    fn verify_kes_leaf(&self, _: &[u8], _: &[u8; 32], _: &[u8]) -> bool {
+        true
+    }
+}
+
+/// Does `signature` have the shape of `validator`'s KES leaf for `period`
+/// under `keys` (see [`KesShapeOnly`])? No key for the period: no.
+fn kes_shaped(keys: &dyn KeyLookup, validator: u32, period: u64, signature: &[u8]) -> bool {
+    keys.kes_public(validator, period)
+        .is_some_and(|public| bloch_pos_committee::kes::verify(&KesShapeOnly, &public, period, &[0; 32], signature))
+}
+
 /// One gate for every local signing path driven by the slot loop.
 ///
 /// Keeping the decision outside `attest`/`propose` is intentional: neither
@@ -657,7 +869,8 @@ const MEMPOOL_MAX: usize = 4_096;
 /// source's worst case to 64 / 4,096 ≈ 1.6% of total mempool capacity.
 const MEMPOOL_MAX_PER_SOURCE: usize = 64;
 
-/// Expensive lifecycle authorization calls allowed for one identity in one
+/// Expensive lifecycle authorization calls allowed for one identity, as
+/// delivered by one source (audit L1-02: the pair, not the identity alone), in one
 /// wall slot. The consensus validator performs cheap state/shape checks before
 /// invoking the budgeted verifier. Two calls cover the largest transaction
 /// (four algorithm checks because every authorization is hybrid); a fresh
@@ -671,12 +884,52 @@ const LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = 2;
 /// 30 seconds; overload is retryable in the next slot.
 const LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT: usize = 256;
 
-/// New hybrid verifications allowed across block, attestation and transaction
-/// network admission in one wall slot. Consensus execution and this node's own
+/// Expensive lifecycle authorization calls one deliverer (a peer or RPC
+/// client's verification source) may trigger across all identities in one
+/// wall slot (audit L1-02). With the per-(deliverer, identity) allowance this
+/// keeps a single source from exhausting the global ceiling by cycling
+/// identities: that now takes 256 / 16 = 16 distinct sources. This node's own
+/// submissions are exempt.
+const LIFECYCLE_VERIFICATIONS_PER_DELIVERER_PER_SLOT: usize = 16;
+
+/// New hybrid verifications allowed across attestation, transaction and
+/// evidence network admission in one wall slot. Blocks draw on their own
+/// allowances below, so this traffic can never spend the units a block
+/// needs. Consensus execution and this node's own
 /// proposal are deliberately outside this node-local relay budget. At the
 /// 30-second cadence, 1,024 leaves large honest burst headroom while making
 /// unique-signature CPU finite even as the bounded transport queue drains.
+///
+/// With the two block allowances the worst case is 1,024 + 256 + 512 = 1,792
+/// units per wall slot (before the separate lifecycle allowance).
 const GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT: usize = 1_024;
+
+/// Proposer-signature verifications allowed for gossiped blocks in one wall
+/// slot, and one source's share of them. Live gossip carries about one new
+/// block per slot; the rest is headroom for forks and equivocations.
+const BLOCK_VERIFICATIONS_TOTAL_PER_SLOT: usize = 256;
+const BLOCK_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = 32;
+
+/// Proposer-signature verifications reserved for blocks from directed sync
+/// and from operator-configured peers ([`Source::Directed`]), so gossip can
+/// never starve catch-up. One source may spend one full sync page per slot,
+/// the share it had before the allowances were separated.
+const DIRECTED_BLOCK_VERIFICATIONS_TOTAL_PER_SLOT: usize = 4 * crate::p2p::MAX_SYNC_BLOCKS;
+const DIRECTED_BLOCK_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = crate::p2p::MAX_SYNC_BLOCKS;
+
+/// Units of FAILED proposer-signature verification one source may cause in
+/// one wall slot. Past it the source's blocks are ignored for the rest of
+/// the slot without verification, so invalid signatures are charged to their
+/// sender and cannot drain a shared allowance. An honest source essentially
+/// never relays an invalid signature.
+const BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT: usize = 8;
+
+/// The same rule for attestations, transactions and evidence, counted apart
+/// from blocks so invalid votes never close a source's block door. Wider
+/// than the block allowance because a peer on a branch with a different
+/// registry can relay votes this node's keys do not verify; a quarter of one
+/// source's share still leaves 32 sources, not 8, needed to spend the total.
+const GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT: usize = 32;
 
 /// Share one normalized transport source may spend from the aggregate relay
 /// verification allowance in one wall slot. Eight independent sources can
@@ -843,11 +1096,201 @@ const _: () = assert!(
 /// smallest window that buys anything at all, and this is it.
 ///
 /// Two is chosen against the reorgs that happen — depth 1, occasionally 2 —
-/// and NOT as a guess at the worst case. Everything deeper falls back to the
-/// replay from genesis this node has always done, which is what makes a small
-/// window safe rather than merely cheap: the window is an optimisation with a
-/// correct slow path underneath it, never a limit on what can be reorganised.
+/// and NOT as a guess at the worst case. Everything deeper falls back to a
+/// replay — from the nearest [`ReorgAnchors`] entry, or from genesis as this
+/// node has always done when none covers the block — which is what makes a
+/// small window safe rather than merely cheap: the window is an optimisation
+/// with a correct slow path underneath it, never a limit on what can be
+/// reorganised.
 const REORG_STATE_WINDOW: usize = 2;
+
+/// How many canonical blocks keep their KES authority (bind epoch and
+/// registered KES entries) so the gossip doors can read the FINALIZED one
+/// (`Engine::signature_failure_is_provable`, FC-4).
+///
+/// Unlike a full post-state this is small: the entry map is shared between
+/// consecutive blocks that did not change it, so a retained block costs its
+/// id and a handle. About 128 epochs; a node whose finalized checkpoint is
+/// older than that (or was not applied by this process) simply cannot prove a
+/// KES forgery and ignores instead of rejecting.
+const KES_AUTHORITY_WINDOW: usize = 4096;
+/// Canonical blocks after which the pending reorg anchor is re-taken at the
+/// head when finality has not passed it (see [`ReorgAnchors`]).
+///
+/// With finality advancing, the pending anchor is promoted within about
+/// three epochs and re-taken then, so this never fires. It exists for a
+/// finality stall, where the anchor would otherwise stay where the stall
+/// began and the replay above it would grow with the stall. Eight epochs is
+/// well above the promotion delay, so the refresh cannot starve promotion.
+const REORG_ANCHOR_REFRESH_BLOCKS: usize =
+    8 * bloch_pos_committee::params::SLOTS_PER_EPOCH as usize;
+
+/// Block applications one slot-loop turn may spend validating a stored side
+/// branch (finding V1-1, [`Engine::validate_side_branch_turn`]), so a turn
+/// never delays a duty by more than this many transitions.
+const SIDE_BRANCH_BLOCKS_PER_TURN: usize = 2;
+/// Block applications one WALL SLOT may spend on it. Canonical blocks
+/// re-executed to reach a fork point's state count like branch blocks.
+const SIDE_BRANCH_BLOCKS_PER_SLOT: usize = 16;
+/// Share of a wall slot it may occupy: once a slot has spent
+/// `slot_ms / SIDE_BRANCH_SLOT_SHARE` in it, no further block is started in
+/// that slot (the first block of a slot always may be, so slow blocks still
+/// make progress).
+const SIDE_BRANCH_SLOT_SHARE: u64 = 4;
+/// Times per wall slot the fold may start anywhere but where it last
+/// stopped, i.e. take up a different branch. Each such start may need the
+/// fork point's state rebuilt and replaces the one retained cursor state.
+const SIDE_BRANCH_STARTS_PER_SLOT: usize = 2;
+/// Blocks above its fork point up to which a side branch is validated.
+/// Sixty-four epochs of a branch carry every vote its validators cast in
+/// that time; a branch that is not the heavier one by then is left alone.
+const SIDE_BRANCH_MAX_DEPTH: usize =
+    64 * bloch_pos_committee::params::SLOTS_PER_EPOCH as usize;
+
+/// Cap on the side-branch blocks remembered as having failed the transition
+/// ([`SideValidation::failed`], review W2-5). Same order as
+/// [`MAX_PARKED_REFUSED_FINALITY`]: 32 bytes each, oldest forgotten first.
+const SIDE_BRANCH_FAILED_REMEMBERED: usize = 512;
+
+/// One retained canonical post-state: `(canonical height, block id, state)`.
+type ReorgAnchor = (usize, [u8; 32], Arc<CommittedState>);
+
+/// Two older canonical post-states a deep reorg replays from instead of from
+/// genesis (finding FC-2).
+///
+/// [`REORG_STATE_WINDOW`] covers the head and its parent. A reorg whose
+/// common ancestor is older used to re-execute the whole chain from genesis
+/// on the consensus thread, so one depth-2 reorg stalled block import, RPC
+/// and duties for a full-chain replay. These anchors bound that replay to
+/// the blocks above the nearest one.
+///
+/// - `base` is at or below the finality latch. `do_reorg` refuses any cut
+///   below the latch, so `base` is at or below every ancestor a reorg can
+///   name and never leaves the canonical chain (the operator rewind override
+///   aside, which falls back to genesis as before).
+/// - `pending` is the head's post-state as of the last promotion. It serves
+///   every ancestor at or above it, and becomes `base` once the latch
+///   reaches it; the head is then taken as the new `pending`.
+///
+/// **Memory.** This is the budget [`REORG_STATE_WINDOW`] documents, and the
+/// cost here is at most TWO further states per node, never more. Each anchor
+/// is the `Arc` of a state that was live, so it is free when taken and
+/// becomes a real copy only once later blocks have moved the ledger; in the
+/// worst case that is two unshared states (measured at 128 MB each in that
+/// doc). Tracking the justified checkpoint exactly would need a third (the
+/// finalized, the justified and the next boundary), and the justified
+/// checkpoint of the head state can move down across a reorg, which the
+/// latch cannot.
+///
+/// An anchor is used only after checking that the canonical chain still has
+/// its block id at its height, so a stale entry can cost speed and never
+/// correctness: a block's post-state is a pure function of the block and its
+/// ancestry (see [`Engine::recent_states`]).
+///
+/// After a boot that restored the state cache none of the cached prefix was
+/// applied, so both are seeded by the restore instead (PER-4): `pending`
+/// with the restored state, `base` from the anchor generation kept on disk
+/// next to the cache. See `engine/local_cache.rs`.
+#[derive(Default)]
+struct ReorgAnchors {
+    base: Option<ReorgAnchor>,
+    pending: Option<ReorgAnchor>,
+    /// Which state-cache generations on disk this process wrote, so one of
+    /// them can be kept as the anchor generation (PER-4).
+    cached: CachedGenerations,
+    /// Progress and budget of side-branch validation (V1-1).
+    side: SideValidation,
+}
+
+/// What [`Engine::validate_side_branch_turn`] keeps between turns.
+#[derive(Default)]
+struct SideValidation {
+    /// Post-state of the block the last fold stopped at, keyed by block id
+    /// like [`Engine::recent_states`]: a canonical block on the way to a
+    /// fork point, or a side-branch block that passed the transition.
+    /// Dropped when no side branch is left to validate.
+    cursor: Option<([u8; 32], Arc<CommittedState>)>,
+    /// Exact post-states of side-branch blocks this fold validated, keyed by
+    /// block id, oldest first, at most [`SIDE_TIP_STATES`] (reviews RC2-03,
+    /// RC3-01, RC3-02): the block a fold turn stopped on (a branch tip once
+    /// the branch is done), and any validated block that blocks parked for
+    /// their proposer's authority wait on (as their parent, or their
+    /// parent's parent). [`Engine::exact_parent_state`] consults them, so a
+    /// block that crosses the KES bind on a validated side branch is judged
+    /// on its parent's own state whether it arrives before or after the
+    /// fold reached that parent, and while the head does not move.
+    ///
+    /// Only states of blocks that passed the transition here enter, so no
+    /// unauthenticated header can add one. The oldest entry leaves first,
+    /// except an entry that a block queued for the door
+    /// (`deferred_orphans`) waits on, which is kept until that block has
+    /// been judged; when every entry is so held the new state is not kept.
+    /// An entry is dropped once its block is no longer stored beside the
+    /// chain (pruned, removed, or adopted: the ring then holds it).
+    tips: VecDeque<([u8; 32], Arc<CommittedState>)>,
+    /// Wall slot the three counters below belong to.
+    slot: u64,
+    /// Block applications spent in `slot`.
+    spent: usize,
+    /// Wall time spent in `slot`, in milliseconds.
+    spent_ms: u64,
+    /// Folds started in `slot` that did not resume from `cursor`.
+    starts: usize,
+    /// A start was refused in `slot`; nothing more is tried in it.
+    closed: bool,
+    /// Inventory revision and head at which the last scan found nothing to
+    /// validate, so an unchanged store is not rescanned every turn.
+    idle: Option<(u64, [u8; 32])>,
+    /// Side-branch blocks this fold ran through the transition and that
+    /// failed it (review W2-5), oldest first, at most
+    /// [`SIDE_BRANCH_FAILED_REMEMBERED`]. Such a block is removed from the
+    /// store, but admission stores it again when a peer offers it again,
+    /// and reaching its fork point's state can cost up to
+    /// [`REORG_ANCHOR_REFRESH_BLOCKS`] canonical re-executions each time. A
+    /// remembered block, and everything stored above it, is no longer a
+    /// candidate of [`Engine::side_branch_candidate`].
+    ///
+    /// Mostly this withholds the OPTIONAL validation work. It is not
+    /// consulted by fork choice or `do_reorg`. The block door also adds to
+    /// it and reads it (review RC2-07): a stored parent that failed the
+    /// transition on its own parent's exact post-state, in the door, is
+    /// remembered and removed from the store like one the fold saw fail,
+    /// and a child offered on a remembered parent is dropped (`Ignore`)
+    /// without running the parent again. Neither can refuse a block the
+    /// consensus rules accept: a block's verdict is a pure function of the
+    /// block and its ancestry, so the remembered verdict is the one a
+    /// second run would reach, and no child of a block that fails can
+    /// apply. In memory only.
+    failed: VecDeque<[u8; 32]>,
+    /// The same ids, for the lookup the candidate walk makes per block.
+    failed_index: std::collections::HashSet<[u8; 32]>,
+}
+
+impl SideValidation {
+    fn remember_failed(&mut self, id: [u8; 32]) {
+        if !self.failed_index.insert(id) {
+            return;
+        }
+        while self.failed.len() >= SIDE_BRANCH_FAILED_REMEMBERED {
+            if let Some(oldest) = self.failed.pop_front() {
+                self.failed_index.remove(&oldest);
+            }
+        }
+        self.failed.push_back(id);
+    }
+}
+
+/// The `(canonical height, block id)` of the state-cache generations this
+/// process wrote: `state.cache`, `state.cache.previous` and
+/// `state.cache.anchor.next`. `None` for a file left by an earlier run,
+/// which is never moved because its block cannot be checked against the
+/// chain without decoding it.
+#[derive(Clone, Copy, Default)]
+struct CachedGenerations {
+    current: Option<(usize, [u8; 32])>,
+    previous: Option<(usize, [u8; 32])>,
+    waiting: Option<(usize, [u8; 32])>,
+}
 
 /// Released finalized bodies after which [`return_freed_heap_to_os`] runs.
 const RELEASE_TRIM_THRESHOLD: usize = 1_024;
@@ -903,6 +1346,79 @@ const _: () = assert!(ORPHAN_BYTES_MAX >= crate::p2p::MAX_SYNC_FRAME as usize);
 /// can execute a transition, rebuild fork choice, and unlock more work, so it
 /// receives the same one-block slice as ordinary admitted blocks.
 const ORPHAN_PROMOTIONS_PER_TURN: usize = 1;
+
+/// Parked blocks the side-branch fold queues for the door again per block it
+/// validates (review RC2-03, `Engine::rejudge_parked_on`). Honest traffic
+/// has one or two children per block; the bound only stops one validated
+/// block from moving the whole pool.
+const SIDE_PARKED_REJUDGE_PER_BLOCK: usize = 8;
+
+/// Exact post-states of validated side-branch blocks kept for the block door
+/// (reviews RC3-01, RC3-02; `SideValidation::tips`). Each is a whole
+/// `CommittedState` built by the transition from its parent's state, so it
+/// shares that state's eUTXO map and costs the per-block fields plus what
+/// the side blocks changed. Four covers the two sibling tips of a stalled
+/// network with room for a branch being validated, and is a hard bound.
+const SIDE_TIP_STATES: usize = 4;
+
+/// Longest back-off between two rewinds to a floor that yielded nothing, as
+/// a power of two of the sync cadence (two slots): 2^5 cadences is 64 slots,
+/// the same two epochs one rewind window reaches back.
+const SYNC_REWIND_BACKOFF_MAX_SHIFT: u32 = 5;
+
+/// Shortest interval between two rewinds that are let through a back-off
+/// because a new cause appeared, as a power of two of the sync cadence: 2^2
+/// cadences is 8 slots. See [`SyncRewindBackoff::causes`].
+const SYNC_REWIND_NEW_CAUSE_SHIFT: u32 = 2;
+
+/// Node-local back-off for sync rewinds that yield nothing (P2P-6).
+///
+/// A "rewind" is a `get_blocks` request whose cursor is below the applied
+/// head. Its only purpose is to fetch blocks a head-forward request cannot
+/// return: ancestors of a competing branch at or below this node's own head
+/// slot. A rewind is therefore fruitful exactly when a block at or below the
+/// head slot it was issued from is stored afterwards; otherwise every block
+/// it was answered with was a duplicate, paid for by honest peers.
+///
+/// After a fruitless rewind to floor `F`, a rewind to `F` or to any higher
+/// floor (a subset of the range already shown to hold nothing new) is held
+/// back for an interval that doubles with every consecutive fruitless
+/// attempt, up to [`SYNC_REWIND_BACKOFF_MAX_SHIFT`]. A strictly lower floor
+/// is never held back: that is how a genuine page chase walks backwards
+/// towards a fork point, and it is bounded below by the finalized slot.
+/// While a rewind is held back the node still syncs forward from its head.
+/// One stored block from the rewound range clears the whole state.
+#[derive(Default)]
+struct SyncRewindBackoff {
+    /// Floor of the rewind request whose outcome is not settled yet.
+    awaiting: Option<u64>,
+    /// Blocks stored at or below this slot count as the yield of a rewind:
+    /// the applied head slot when the latest rewind was issued.
+    yield_ceiling: u64,
+    /// Consecutive rewinds that yielded nothing.
+    fruitless: u32,
+    /// Floor of the latest fruitless rewind.
+    floor: u64,
+    /// Earliest time a rewind to `floor` or above may be issued again.
+    retry_at_ms: u64,
+    /// A wanted rewind was held back; retry it once `retry_at_ms` passes.
+    deferred: bool,
+    /// Unknown parents of the authenticated orphans that were waiting when
+    /// the latest rewind was issued: what that rewind was asked to find.
+    ///
+    /// The back-off is evidence about those gaps only. Any registered
+    /// validator can sign an orphan whose parent nobody has, and so grow the
+    /// back-off to its cap; without this, a competing branch that appears
+    /// afterwards would wait out an interval earned by somebody else's
+    /// orphan. An authenticated orphan with a parent not listed here is a new
+    /// cause and is let through, at most once per
+    /// [`SYNC_REWIND_NEW_CAUSE_SHIFT`] interval, so minting new orphans buys
+    /// one rewind per 8 slots and not the unbounded rewinds the back-off
+    /// exists to stop. At most `ORPHAN_MAX` ids.
+    causes: Vec<[u8; 32]>,
+    /// Earliest time a new cause may again pass a back-off.
+    new_cause_at_ms: u64,
+}
 
 /// Distinct authenticated proposals retained per genesis validator duty.
 /// One is the protocol intent; two preserve the complete equivocation pair.
@@ -963,6 +1479,11 @@ enum Source {
     /// Arrived over the network, or was promoted out of the orphan pool
     /// after arriving over the network.
     Gossip(Option<[u8; 32]>),
+    /// Arrived over the network in answer to this node's own sync request, or
+    /// from a peer the operator configured. Untrusted exactly like
+    /// [`Source::Gossip`]; it differs only in which verification allowance
+    /// its proposer signature draws on.
+    Directed(Option<[u8; 32]>),
     /// Built by this node's own `propose`.
     Local,
 }
@@ -981,7 +1502,7 @@ impl Source {
     /// clock rule it was never meant to answer to.
     fn bounded_by_wall_clock(self) -> bool {
         match self {
-            Source::Gossip(_) => true,
+            Source::Gossip(_) | Source::Directed(_) => true,
             Source::Local => false,
         }
     }
@@ -990,8 +1511,38 @@ impl Source {
     /// fairness. Missing attribution still receives the aggregate cap.
     fn verification_source(self) -> Option<[u8; 32]> {
         match self {
-            Source::Gossip(source) => source,
+            Source::Gossip(source) | Source::Directed(source) => source,
             Source::Local => None,
+        }
+    }
+
+    /// Whether two sources draw on the same retention share (orphans,
+    /// future blocks). The share belongs to the peer, not to the road its
+    /// block took: a peer whose blocks arrive both by gossip and in answer
+    /// to this node's own sync request is still one peer, and comparing the
+    /// variants as well gave it every share twice.
+    fn same_retention_share(self, other: Source) -> bool {
+        match (self, other) {
+            (Source::Local, Source::Local) => true,
+            (Source::Local, _) | (_, Source::Local) => false,
+            _ => self.verification_source() == other.verification_source(),
+        }
+    }
+
+    /// The per-slot allowance (lane, total, one source's share) a block from
+    /// this source verifies its proposer signature under.
+    fn block_verification_allowance(self) -> (verification::VerificationLane, usize, usize) {
+        match self {
+            Source::Directed(_) => (
+                verification::VerificationLane::DirectedBlock,
+                DIRECTED_BLOCK_VERIFICATIONS_TOTAL_PER_SLOT,
+                DIRECTED_BLOCK_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+            ),
+            Source::Gossip(_) | Source::Local => (
+                verification::VerificationLane::GossipBlock,
+                BLOCK_VERIFICATIONS_TOTAL_PER_SLOT,
+                BLOCK_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+            ),
         }
     }
 }
@@ -1005,7 +1556,7 @@ fn future_retention_totals<'a>(
     incoming_source: Source,
 ) -> (usize, usize, usize) {
     retained.fold((0usize, 0usize, 0usize), |acc, (held_source, block_bytes)| {
-        let same_source = usize::from(*held_source == incoming_source);
+        let same_source = usize::from(held_source.same_retention_share(incoming_source));
         (
             acc.0.saturating_add(*block_bytes),
             acc.1.saturating_add(same_source),
@@ -1088,6 +1639,13 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Transactions whose spend witnesses selection or capacity planning
+    /// verified again (`Engine::spend_witnesses_pass_relay_policy`).
+    static RELAY_POLICY_REVERIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The spend-authority hash of this transaction's FIRST input — its "source"
 /// for [`MEMPOOL_MAX_PER_SOURCE`] (R7 M6). Lifecycle messages use their
 /// validator identity, domain-separated from spend keys. `None` remains only
@@ -1109,6 +1667,13 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
             Some(Sha3_256::digest(pk).into())
         }
         PosTransaction::FundedDeposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        // Audit L1-13: these used to have no source and escaped
+        // `MEMPOOL_MAX_PER_SOURCE`. The funding key (shared with that key's
+        // deposits) and the validator index, as their lifecycle allowance.
+        PosTransaction::FundedDelegate(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::FundedUndelegate(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::FundedDelegationWithdraw(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::ValidatorCommissionUpdate(tx) => Some(validator_lifecycle_source(tx.validator)),
         PosTransaction::ExitV2 { pubkey_hash, .. } =>
             Some(lifecycle_source_hash(b"exit", pubkey_hash)),
         PosTransaction::Withdraw { validator }
@@ -1262,8 +1827,28 @@ mod state_cell {
     /// without evidence.
     const MEMO_CAP: usize = 4;
 
+    /// Rolled parent states the block door keeps for parents that are not
+    /// the head (review RC-02). Each is a whole `CommittedState`, but it
+    /// shares its eUTXO map with the post-state it was rolled from, so the
+    /// cost is the per-epoch fields plus, for a side-branch parent, that
+    /// parent's own post-state. Two covers the case it exists for (the two
+    /// sibling heads of a stalled network) and is a hard memory bound.
+    const DOOR_CACHE_CAP: usize = 2;
+
+    /// The same for rolls of the head (review RC2-01), counted apart so the
+    /// cheap head entries never evict the expensive side-branch ones (a
+    /// side entry cost a transition and a long roll; review RC3-03).
+    const DOOR_HEAD_CACHE_CAP: usize = 2;
+
     struct Entry {
         generation: u64,
+        epoch: u64,
+        rolled: Arc<CommittedState>,
+    }
+
+    struct DoorEntry {
+        head: bool,
+        parent: [u8; 32],
         epoch: u64,
         rolled: Arc<CommittedState>,
     }
@@ -1301,6 +1886,21 @@ mod state_cell {
         /// less than these two, not on there being only one.
         generation: u64,
         memo: RefCell<Vec<Entry>>,
+        /// The wall slot whose single long-roll allowance for arriving
+        /// attestations is spent (`try_spend_long_roll`). Node-local work
+        /// scheduling; it never changes what `rolled_to` returns.
+        long_roll_slot: std::cell::Cell<Option<u64>>,
+        /// The same allowance for the block door (review RC-01).
+        door_long_roll_slot: std::cell::Cell<Option<u64>>,
+        /// `(wall slot, epochs)`: the block door's short rolls spent in that
+        /// slot (review RC2-01). See `try_spend_door_short_roll`.
+        door_short_rolls: std::cell::Cell<(Option<u64>, u64)>,
+        /// See [`StateCell::door_cached`].
+        door_rolls: RefCell<Vec<DoorEntry>>,
+        /// See [`StateCell::rolled_aside`]: `(generation, epoch, state)`.
+        aside: RefCell<Option<(u64, u64, Arc<CommittedState>)>>,
+        #[cfg(test)]
+        door_rolled: std::cell::Cell<u64>,
     }
 
     impl StateCell {
@@ -1311,7 +1911,41 @@ mod state_cell {
                 state,
                 generation: 0,
                 memo: RefCell::new(Vec::new()),
+                long_roll_slot: std::cell::Cell::new(None),
+                door_long_roll_slot: std::cell::Cell::new(None),
+                door_short_rolls: std::cell::Cell::new((None, 0)),
+                door_rolls: RefCell::new(Vec::new()),
+                aside: RefCell::new(None),
+                #[cfg(test)]
+                door_rolled: std::cell::Cell::new(0),
             }
+        }
+
+        /// How many `process_epoch` calls `rolled_to(epoch)` would run right
+        /// now: the distance from the head's epoch, or from the nearest
+        /// memoized roll of this head at or below `epoch`.
+        pub(super) fn roll_distance(&self, epoch: u64) -> u64 {
+            let base_epoch = epoch_of(self.state.slot());
+            let from = self
+                .memo
+                .borrow()
+                .iter()
+                .filter(|e| e.generation == self.generation && e.epoch <= epoch)
+                .map(|e| e.epoch)
+                .max()
+                .map_or(base_epoch, |memoized| memoized.max(base_epoch));
+            epoch.saturating_sub(from)
+        }
+
+        /// Take the one long roll per wall slot that unauthenticated input
+        /// (an arriving attestation) may cause. `false` when this slot's
+        /// allowance is already spent.
+        pub(super) fn try_spend_long_roll(&self, wall_slot: u64) -> bool {
+            if self.long_roll_slot.get() == Some(wall_slot) {
+                return false;
+            }
+            self.long_roll_slot.set(Some(wall_slot));
+            true
         }
 
         /// Publish the current state to the read handle. Called by both
@@ -1342,6 +1976,7 @@ mod state_cell {
             self.state = Arc::new(state);
             self.generation = self.generation.wrapping_add(1);
             self.memo.get_mut().clear();
+            *self.aside.get_mut() = None;
             self.publish();
         }
 
@@ -1353,6 +1988,7 @@ mod state_cell {
             self.state = state;
             self.generation = self.generation.wrapping_add(1);
             self.memo.get_mut().clear();
+            *self.aside.get_mut() = None;
             self.publish();
         }
 
@@ -1363,9 +1999,9 @@ mod state_cell {
             Arc::clone(&self.state)
         }
 
-        /// Which state this is. Test surface — the memo key's identity half,
-        /// exposed so a test can pin that it moves when the state does.
-        #[cfg(test)]
+        /// Which state this is: the memo key's identity half. It moves with
+        /// every write of the state, so a caller can tell "nothing was
+        /// written since I last looked" (V1-2), and a test can pin that.
         pub(super) fn generation(&self) -> u64 {
             self.generation
         }
@@ -1469,11 +2105,152 @@ mod state_cell {
                 // keeps the memo's population bounded by MEMO_CAP at every
                 // point of the roll rather than only between calls, so the
                 // bound does not depend on the sharing to hold.
+                //
+                // The LOWEST epoch, not the oldest entry (review RC-01): one
+                // roll pushes ascending epochs, so the two agree inside a
+                // roll, but across calls FIFO let a caller alternating a far
+                // and a near epoch evict the far entries with cheap near
+                // rolls and so make every far request a full roll again.
                 while memo.len() > MEMO_CAP {
-                    memo.remove(0);
+                    let Some(lowest) = memo
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, e)| e.epoch)
+                        .map(|(at, _)| at)
+                    else {
+                        break;
+                    };
+                    memo.remove(lowest);
                 }
             }
             cur
+        }
+
+        /// The block door's one long roll per wall slot (review RC-01), kept
+        /// apart from the attestations' allowance so neither kind of input
+        /// can starve the other. Node-local work scheduling; it never changes
+        /// what any roll returns.
+        pub(super) fn try_spend_door_long_roll(&self, wall_slot: u64) -> bool {
+            if self.door_long_roll_slot.get() == Some(wall_slot) {
+                return false;
+            }
+            self.door_long_roll_slot.set(Some(wall_slot));
+            true
+        }
+
+        /// Spend `epochs` of the block door's short-roll allowance of
+        /// `wall_slot` (review RC2-01): rolls of at most
+        /// [`super::DOOR_FREE_ROLL_EPOCHS`] epochs that need no long roll,
+        /// together at most [`super::DOOR_SHORT_ROLL_EPOCHS_PER_SLOT`] epochs
+        /// per wall slot.
+        /// `false` (nothing spent) when the request does not fit. Node-local
+        /// work scheduling; it never changes what any roll returns.
+        pub(super) fn try_spend_door_short_roll(&self, wall_slot: u64, epochs: u64) -> bool {
+            let (slot, spent) = self.door_short_rolls.get();
+            let spent = if slot == Some(wall_slot) { spent } else { 0 };
+            let total = spent.saturating_add(epochs);
+            if total > super::DOOR_SHORT_ROLL_EPOCHS_PER_SLOT {
+                return false;
+            }
+            self.door_short_rolls.set((Some(wall_slot), total));
+            true
+        }
+
+        /// A parent post-state rolled to `epoch` that the block door already
+        /// computed (reviews RC-02, RC2-01; the head's rolls are kept here
+        /// too, beside the memo).
+        ///
+        /// Keyed by the parent's block id and the epoch, and never
+        /// invalidated: a block's post-state is a pure function of the block
+        /// id (which commits to its whole ancestry), and the roll is a pure
+        /// function of that state and the epoch, so an entry can never be
+        /// stale. Bounded by [`DOOR_CACHE_CAP`] (and [`DOOR_HEAD_CACHE_CAP`] for
+        /// the head's entries); the oldest entry of the same kind leaves
+        /// first.
+        pub(super) fn door_cached(&self, parent: &[u8; 32], epoch: u64) -> Option<Arc<CommittedState>> {
+            self.door_rolls
+                .borrow()
+                .iter()
+                .find(|e| e.parent == *parent && e.epoch == epoch)
+                .map(|e| Arc::clone(&e.rolled))
+        }
+
+        /// Remember a roll for [`Self::door_cached`]. `head`: `parent` is
+        /// the head; such entries are bounded apart ([`DOOR_HEAD_CACHE_CAP`])
+        /// and only ever evict each other (review RC3-03).
+        pub(super) fn door_remember(&self, head: bool, parent: [u8; 32], epoch: u64, rolled: Arc<CommittedState>) {
+            let mut rolls = self.door_rolls.borrow_mut();
+            if rolls.iter().any(|e| e.parent == parent && e.epoch == epoch) {
+                return;
+            }
+            rolls.push(DoorEntry { head, parent, epoch, rolled });
+            let cap = if head { DOOR_HEAD_CACHE_CAP } else { DOOR_CACHE_CAP };
+            while rolls.iter().filter(|e| e.head == head).count() > cap {
+                let Some(oldest) = rolls.iter().position(|e| e.head == head) else { break };
+                rolls.remove(oldest);
+            }
+        }
+
+        /// The head rolled to `epoch` WITHOUT writing the memo (review
+        /// RC-04): for observers (the Sentinel's status) whose reads must not
+        /// change which rolls the attestation door finds already paid for. A
+        /// memo hit is read, never added to; anything else is rolled from the
+        /// furthest memoized epoch below `epoch`, the previous aside roll, or
+        /// the head, whichever is furthest along, and kept in a single
+        /// private slot keyed like the memo, dropped by every write of the
+        /// state. So the epochs rolled aside for one state never exceed the
+        /// furthest epoch asked for (review RC2-06).
+        pub(super) fn rolled_aside<F>(&self, epoch: u64, roll: F) -> Arc<CommittedState>
+        where
+            F: Fn(&CommittedState) -> CommittedState,
+        {
+            let base_epoch = epoch_of(self.state.slot());
+            if epoch <= base_epoch {
+                return Arc::clone(&self.state);
+            }
+            let (mut cur_epoch, mut cur) = {
+                let memo = self.memo.borrow();
+                if let Some(hit) = memo
+                    .iter()
+                    .find(|e| e.generation == self.generation && e.epoch == epoch)
+                {
+                    return Arc::clone(&hit.rolled);
+                }
+                memo.iter()
+                    .filter(|e| e.generation == self.generation && e.epoch > base_epoch && e.epoch < epoch)
+                    .max_by_key(|e| e.epoch)
+                    .map_or((base_epoch, Arc::clone(&self.state)), |e| (e.epoch, Arc::clone(&e.rolled)))
+            };
+            if let Some((generation, at, rolled)) = self.aside.borrow().as_ref() {
+                if *generation == self.generation && *at == epoch {
+                    return Arc::clone(rolled);
+                }
+                // Review RC2-06: continue from the previous aside roll when it
+                // is further along than the memo, so a wall epoch that moves on
+                // costs one epoch, not a roll from the memo or the head again.
+                if *generation == self.generation && *at > cur_epoch && *at < epoch {
+                    cur_epoch = *at;
+                    cur = Arc::clone(rolled);
+                }
+            }
+            while cur_epoch < epoch {
+                cur = Arc::new(roll(&cur));
+                cur_epoch = cur_epoch.saturating_add(1);
+            }
+            *self.aside.borrow_mut() = Some((self.generation, epoch, Arc::clone(&cur)));
+            cur
+        }
+
+        /// Epochs the block door rolled (test surface for review RC-01).
+        #[cfg(test)]
+        pub(super) fn door_rolled_epochs(&self) -> u64 {
+            self.door_rolled.get()
+        }
+
+        /// Count epochs the block door is about to roll (test surface).
+        pub(super) fn note_door_roll(&self, _epochs: u64) {
+            #[cfg(test)]
+            self.door_rolled.set(self.door_rolled.get().saturating_add(_epochs));
         }
     }
 
@@ -1507,15 +2284,31 @@ mod hf_replay_guard;
 
 #[cfg(test)]
 mod proposal_revalidation_tests;
+#[cfg(test)]
+mod vote_selection_tests;
+#[cfg(test)]
+mod authority_parked_tests;
 
 #[cfg(test)]
 mod ws_lifecycle_tests;
 
+#[cfg(test)]
+mod l2_async_admission_tests;
+#[cfg(test)]
+mod l2_preflight_tests;
+
 mod local_cache;
+mod finality_latch;
+mod reject_roots;
+pub(crate) use reject_roots::{parse_reject_block_root, ENV_REJECT_BLOCK_ROOTS};
+#[cfg(test)]
+mod side_branch_tests;
 mod verification;
 mod finality_cert;
 #[cfg(test)]
 mod finality_cert_tests;
+// Bloch Sentinel hooks: node-local, read-only, off by default.
+mod sentinel_hooks;
 
 struct Engine {
     manifest: Manifest,
@@ -1586,12 +2379,25 @@ struct Engine {
     /// the wrong branch". A block that leaves the canonical chain and later
     /// returns has the same post-state both times.
     recent_states: VecDeque<([u8; 32], Arc<CommittedState>)>,
+    /// The KES authority of recently applied canonical blocks, oldest first:
+    /// block id, post-state epoch, bind epoch, registered entries
+    /// ([`KES_AUTHORITY_WINDOW`]). Keyed by block id for the same reason as
+    /// `recent_states`: an entry can never describe another branch.
+    kes_authorities: VecDeque<([u8; 32], u64, Option<u64>, Arc<BTreeMap<u32, bloch_pos_committee::kes::KesEntry>>)>,
+    /// Older canonical post-states for reorgs deeper than `recent_states`.
+    reorg_anchors: ReorgAnchors,
     /// Retained checkpoint registry proofs + built certificates for
     /// `getfinalitycertificate`. RPC-only; see `engine/finality_cert.rs`.
     finality_certs: finality_cert::FinalityCertStore,
     /// Attestations available to fork choice and to the next proposal, keyed
     /// by content so duplicates collapse. This is the *aggregation* store.
     pool: BTreeMap<(u32, [u8; 32]), Attestation>,
+    /// The authority (`kes::authority_fingerprint`) under which the signature
+    /// of a `pool` entry was last verified, by the same key (review VAL-1).
+    /// The producer includes a vote only while this equals the authority the
+    /// block's pre-state names for it. An entry without a record is verified
+    /// again before it is included. Pruned to the keys of `pool`.
+    pool_authority: BTreeMap<(u32, [u8; 32]), [u8; 32]>,
     /// The *admission* gate in front of `pool`:
     /// [`AttestationPool`](bloch_pos_committee::gossip::AttestationPool) from
     /// the pure crate — dedup, the equivocation cap, slashing-pair capture,
@@ -1748,6 +2554,9 @@ struct Engine {
     /// False during boot replay: no log appends, no broadcasts, no logs.
     live: bool,
     needs_sync: bool,
+    /// Back-off for sync requests that reach below the applied head and
+    /// bring nothing back. See [`SyncRewindBackoff`].
+    sync_rewind: SyncRewindBackoff,
     last_applied_ms: u64,
     booted_ms: u64,
     /// The weak-subjectivity anchor this node booted under (epoch, root), and
@@ -1758,8 +2567,9 @@ struct Engine {
     /// A forward WS_CONFLICT is announced once, not every block.
     ws_conflict_reported: bool,
     /// Loose attestations dropped from `pool` because the block that carried
-    /// them became canonical — a removal fork choice cannot see, since it also
-    /// reads every stored block's body.
+    /// them became canonical — a removal that takes no vote away from fork
+    /// choice, since it also reads every validated block's body and the
+    /// apply that drops them is what validates that block.
     ///
     /// Monotone, and it exists only so [`Engine::forkchoice_inputs`] can tell
     /// that kind of pool shrinkage apart from the epoch `retain`, which fork
@@ -1768,14 +2578,23 @@ struct Engine {
     /// The finality latch (finding F-03): the highest finalized checkpoint
     /// this node has EVER adopted, as `(canonical height, root)`. Ratcheted
     /// forward by [`Engine::ratchet_finalized`], never lowered, and consulted
-    /// by [`Engine::cut_below_finalized_latch`] before any reorg.
+    /// by [`Engine::cut_below_finalized_latch`] before any reorg. (One
+    /// exception, review W2-1: a rewind the operator override allowed takes
+    /// the latch block off the chain, and `do_reorg` then lets the latch
+    /// fall back to the fork point.)
     ///
     /// This is deliberately NOT `self.state.finality().finalized`: that value
     /// lives in replayed state, so a reorg REPLACES it — which is exactly how
     /// the measured finalized 6 -> 4 -> 2 -> 0 rewind happened. The latch is
-    /// engine-owned and survives every state swap. In-memory only: on boot it
-    /// is rebuilt by the replay of this node's own log, which re-finalizes
-    /// the same checkpoints in the same order.
+    /// engine-owned and survives every state swap.
+    ///
+    /// It also survives a restart (finding PER-3). Boot replay rebuilds it
+    /// only as far as the LOGGED chain's own states finalize, which after a
+    /// reorg that dropped the finalizing votes is lower than what this node
+    /// had latched. The latch is therefore mirrored to `finality_latch.bin`
+    /// and reconciled with the replayed chain at boot; see
+    /// `engine/finality_latch.rs` for when it is written and what a
+    /// disagreement does.
     finalized_latch: Option<(u64, [u8; 32])>,
     /// Reorgs refused because they would have cut canonical history below
     /// the latch. A rewind an operator cannot see is a rewind that gets
@@ -1823,6 +2642,10 @@ struct Engine {
     /// so a legitimate divergence is not indistinguishable from an attack
     /// from the outside, not so it can be left on quietly.
     finality_rewind_override: bool,
+    /// Operator-rejected block roots (`--reject-block-root`), set once at
+    /// boot, and the descendants refused because of them. Node-local; see
+    /// `engine/reject_roots.rs`.
+    rejected_roots: reject_roots::RejectedRoots,
     /// Transaction id -> the slot it was included at, on the CURRENT
     /// canonical chain (R4 F-11 — `gettxstatus`). Maintained by
     /// [`Engine::note_tx_slots`] on every canonical apply (`apply_canonical`,
@@ -1862,9 +2685,10 @@ struct Engine {
     /// parent has had the longest to arrive and has not, so it is the one
     /// least likely to ever connect.
     ///
-    /// Parking sets `needs_sync`, so the gap the orphan is evidence of is
-    /// asked for over the wire. That is what makes eviction cheap: the worst
-    /// case is a round trip, never a missed branch.
+    /// Parking an AUTHENTICATED orphan sets `needs_sync`, so the gap it is
+    /// evidence of is asked for over the wire. That is what makes eviction
+    /// cheap: the worst case is a round trip, never a missed branch.
+    /// Unauthenticated entries are evicted before authenticated ones.
     orphans: VecDeque<(
         [u8; 32],
         BlockEnvelope,
@@ -1882,6 +2706,9 @@ struct Engine {
         Option<AuthenticatedBlockAdmission>,
         usize,
     )>,
+    /// Blocks in `orphans` that are parked because their proposer could not
+    /// be authenticated, with what the door judged them against (V1-2).
+    authority_parked: AuthorityParked,
     /// Orphans dropped at the cap, and orphans later connected. Counted so
     /// "the bound is holding" is a measurement rather than an inference — a
     /// pool with evictions and zero admissions is a node that is not syncing.
@@ -1902,7 +2729,7 @@ struct Engine {
     rejected_future: u64,
 }
 
-/// A fingerprint of the four values `lmd_ghost_head` reads, so `advance` can
+/// A fingerprint of the values `lmd_ghost_head` reads, so `advance` can
 /// tell whether recomputing it could possibly return anything new.
 ///
 /// Not a cache across calls — it is rebuilt from scratch inside each
@@ -1911,6 +2738,8 @@ struct Engine {
 #[derive(PartialEq, Eq)]
 struct ForkChoiceInputs {
     blocks: usize,
+    /// [`BlockInventory::vote_generation`]: which stored bodies vote.
+    votes: u64,
     pool: u64,
     justified: [u8; 32],
     validators: Vec<bloch_pos_committee::sample::Validator>,
@@ -2012,6 +2841,14 @@ impl Refusal {
 /// index that was valid when the error was raised can be stale by the time it
 /// is used. Out of range falls back to `None`, and `None` means "drop the tail
 /// and retry", which is the behaviour that keeps the node producing.
+/// How many times `propose` selects from the mempool again after the probe
+/// refused, and it dropped, one indexed transaction (review EXE-1). Each
+/// round costs one selection and one probe transition on the consensus
+/// thread, so it is small. Past it the proposer selects one last time
+/// without the L2 user transactions (review W1-1) and then keeps the
+/// reduced list.
+const PROPOSAL_RESELECTIONS_MAX: usize = 4;
+
 fn culprit_index(err: &TransitionError, len: usize) -> Option<usize> {
     match err {
         TransitionError::Transfer(i, _) | TransitionError::Transaction(i) => {
@@ -2021,6 +2858,35 @@ fn culprit_index(err: &TransitionError, len: usize) -> Option<usize> {
         _ => None,
     }
 }
+
+/// Blocks parked because the proposer signature did not verify under an
+/// authority that proves nothing (a deposit-added index, an index this
+/// registry does not hold, or a KES authority the finalized state does not
+/// fix), keyed by block id (review V1-2).
+///
+/// Such a block is not waiting for a parent, so a landing parent never
+/// releases it. It is judged again when the authority the door would use
+/// for it is no longer the one recorded here, and only then: a re-run under
+/// the same authority returns the same verdict.
+#[derive(Default)]
+struct AuthorityParked {
+    /// The state generation the entries were last compared at. The authority
+    /// is a function of the state, so nothing can have changed within one.
+    checked_generation: Option<u64>,
+    /// `None`: the registry did not hold the index. At most one entry per
+    /// parked block, so bounded by [`ORPHAN_MAX`].
+    judged: BTreeMap<[u8; 32], Option<[u8; 32]>>,
+}
+
+/// Pool votes one proposal may verify again with the real verifier because
+/// the authority they were verified under at gossip is unknown or is no
+/// longer the one the block's pre-state names (review VAL-1). The common case
+/// costs one hash per vote; this bounds the exceptional one on the consensus
+/// thread. Votes past the allowance stay pooled for a later proposal.
+const PROPOSAL_VOTE_REJUDGE_MAX: usize = 64;
+/// Votes one proposal may evict, one probe each, when the transition refuses
+/// them by index. Past it the block is built without votes (VAL-1).
+const PROPOSAL_VOTE_RETRY_MAX: usize = 8;
 
 /// Separates fresh wire input from a pool-issued, opaque authentication proof.
 /// Only the latter may use the held-replay fast path.
@@ -2503,6 +3369,28 @@ impl Engine {
         (rec.pubkey == keys.pubkey).then_some(keys.index)
     }
 
+    /// The state a duty of `epoch` is signed on: the head rolled into the
+    /// duty epoch (audit L1-01). `attest_for`, `attestation_duty_slot`,
+    /// `propose` and `submit_kes_rotation` take their `rolled` from here
+    /// and hand it to [`Self::prepare_kes`]; so does the
+    /// Sentinel's `kes` status view (`sentinel_hooks::sentinel_kes_state`),
+    /// so the status can never report a mode the signer is not using.
+    fn duty_state(&self, epoch: u64) -> Arc<CommittedState> {
+        self.rolled_to(epoch)
+    }
+
+    /// The KES signing decision for `validator` in `epoch` on a duty state
+    /// from [`Self::duty_state`]: the verifiers' own rule,
+    /// `kes::signing_mode`. The one place the signer (`prepare_kes_in`) and
+    /// the Sentinel status read the mode from.
+    fn duty_signing_mode(
+        rolled: &dyn KeyLookup,
+        validator: u32,
+        epoch: u64,
+    ) -> bloch_pos_committee::kes::SigningMode {
+        bloch_pos_committee::kes::signing_mode(rolled, validator, epoch)
+    }
+
     /// Make the KES key ready to sign for `validator` in `epoch`: `Ok(None)`
     /// before KES enforcement (the static key signs, exactly as before),
     /// `Ok(Some((period, key in force)))` once evolved — on disk first — to
@@ -2512,12 +3400,45 @@ impl Engine {
     /// in force, an erased or expired leaf, or a failed write). Promotes a
     /// rotated-in successor the chain has made the key in force. Called only
     /// once a duty is settled, so an idle validator does not evolve or log.
-    fn prepare_kes(&mut self, epoch: u64, validator: u32) -> Result<Option<(u64, bloch_pos_committee::kes::KesPublic)>, String> {
+    ///
+    /// `rolled` is the head state rolled into `epoch` (`rolled_to(epoch)`),
+    /// the very state every verifier judges the duty against: block
+    /// application rolls the parent into the block's epoch and gossip rolls
+    /// the head into the vote's. The signing mode, the key in force and the
+    /// validator's KES entry are read from it, never from the unrolled head
+    /// (audit L1-01): the bind epoch (`kes_enforced_from`) is written by
+    /// `process_epoch`, so a head that has not crossed the deciding boundary
+    /// (empty epochs at the bind) would otherwise sign statically a duty every
+    /// verifier requires a KES leaf for, and no block would cross the bind.
+    /// Only the clock-jump guard and the replaced-key settlement keep reading
+    /// the head's own period and finalized checkpoint: they protect erasure,
+    /// which must never run ahead of what the chain has actually reached.
+    fn prepare_kes(
+        &mut self,
+        rolled: &CommittedState,
+        epoch: u64,
+        validator: u32,
+    ) -> Result<Option<(u64, bloch_pos_committee::kes::KesPublic)>, String> {
+        self.prepare_kes_in(rolled, rolled.kes_roots().get(&validator), epoch, validator)
+    }
+
+    /// [`Self::prepare_kes`] over the two things it reads from the rolled
+    /// state: the verifiers' key lookup and the validator's committed KES
+    /// entry. Split out so the decision can be exercised against a view that
+    /// differs from the head (audit L1-01) without building a chain to it.
+    fn prepare_kes_in(
+        &mut self,
+        rolled: &dyn KeyLookup,
+        entry: Option<&bloch_pos_committee::kes::KesEntry>,
+        epoch: u64,
+        validator: u32,
+    ) -> Result<Option<(u64, bloch_pos_committee::kes::KesPublic)>, String> {
         use bloch_pos_committee::kes::SigningMode;
-        // The same rule every verifier runs (`kes::signing_mode`): static
-        // before KES binds on chain, and for a never-registered validator
-        // after (fallback); the KES leaf for a registered one.
-        let period = match bloch_pos_committee::kes::signing_mode(&*self.state, validator, epoch) {
+        // The same rule every verifier runs (`kes::signing_mode`), on the
+        // same state: static before KES binds on chain, and for a
+        // never-registered validator after (fallback); the KES leaf for a
+        // registered one.
+        let period = match Self::duty_signing_mode(rolled, validator, epoch) {
             SigningMode::Static => return Ok(None),
             SigningMode::FailClosed => return Err("KES enforcement state unknown".into()),
             SigningMode::Kes(period) => period,
@@ -2530,10 +3451,14 @@ impl Engine {
                 crate::kes_key::FILE_NAME
             ));
         };
-        let Some(public) = self.state.kes_public_at(validator, period) else {
+        // `CommittedState::kes_public_at`: the entry's key in force.
+        let Some(public) = entry.map(|entry| entry.in_force(period)) else {
             return Err(format!("no KES key is registered on chain for v{validator}"));
         };
         kes.adopt_successor(&public)?;
+        if let Some(entry) = entry {
+            kes.settle_replaced(entry, period, head_period, self.state.finality().finalized.epoch);
+        }
         if kes.key.index() != validator && kes.key.index() != crate::keys::AUTO_VALIDATOR_INDEX {
             return Err(format!(
                 "{} belongs to v{}, not v{validator}",
@@ -2622,6 +3547,7 @@ impl Engine {
             eprintln!("KES rotation for v{index}: {why}");
             return;
         }
+        kes.settle_replaced(&entry, period, Some(period), self.state.finality().finalized.epoch);
         let step = kes_rotation_step(
             &entry,
             period,
@@ -2644,11 +3570,15 @@ impl Engine {
     }
 
     fn submit_kes_rotation(&mut self, wall_epoch: u64, period: u64, index: u32) {
-        let in_force = match self.prepare_kes(wall_epoch, index) {
+        // `maintain_kes` runs only with the head inside `wall_epoch`, so the
+        // head state is that epoch's rolled state.
+        let rolled = self.duty_state(wall_epoch);
+        let in_force = match self.prepare_kes(&rolled, wall_epoch, index) {
             Ok(Some((p, public))) if p == period => public,
             Ok(_) => return,
             Err(why) => {
                 eprintln!("KES rotation for v{index} deferred: {why}");
+                crate::sentinel::note_kes_error("kes_rotation", index, &why);
                 return;
             }
         };
@@ -2721,7 +3651,34 @@ impl Engine {
         if self.doppelganger_halted {
             return true;
         }
+        // Review CR-8, runtime half: a key that turns out to be registered
+        // only once the node has synced far enough is refused here.
+        if let Some(refusal) = self.missing_history_refusal(self.wall_slot) {
+            static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !ANNOUNCED.swap(true, Ordering::Relaxed) {
+                eprintln!("{refusal} Duties STOPPED until restart.");
+            }
+            return true;
+        }
         matches!(self.doppelganger_observe_until, Some(until) if slot < until)
+    }
+
+    /// Review CR-8: `Some(message)` when this node's key is in the registry
+    /// with duties that began before the slot from which its slashing
+    /// protection record is known to be complete
+    /// (`SlashingProtection::settle_missing_history`), and has not exited.
+    /// `None` for a key that is not registered yet or was activated later (a
+    /// genuinely new validator), and always when a record or anchor existed.
+    fn missing_history_refusal(&self, wall_slot: u64) -> Option<String> {
+        self.slashprot.unproven_before_slot()?;
+        let index = self.duty_index(&self.state)?;
+        let record = self.state.validator_record(index)?;
+        if !self.slashprot.missing_history_blocks(record.activation_epoch)
+            || epoch_of(self.state.slot()) >= record.exit_epoch
+        {
+            return None;
+        }
+        Some(self.slashprot.missing_history_refusal(index, record.activation_epoch, wall_slot))
     }
 
     fn start_doppelganger_observation(&mut self, wall_slot: u64) {
@@ -2879,7 +3836,7 @@ impl Engine {
     /// This validator's attestation duty slot in epoch `e`, from the same
     /// snapshot, seed and roster [`Self::attest`] uses (one epoch partition).
     fn attestation_duty_slot(&mut self, e: u64) -> Option<u64> {
-        let rolled = self.rolled_to(e);
+        let rolled = self.duty_state(e);
         let index = self.duty_index(&rolled)?;
         let roster = rolled.active_validators();
         let seed = Self::seed_for(&rolled, e);
@@ -2921,7 +3878,7 @@ impl Engine {
             // a vote for it would be source==target, which is invalid.
             return;
         }
-        let rolled = self.rolled_to(e);
+        let rolled = self.duty_state(e);
         // Identity re-checked against the same snapshot that draws the
         // committee, before membership is even asked about.
         let Some(index) = self.duty_index(&rolled) else {
@@ -2976,10 +3933,11 @@ impl Engine {
         // target epoch, including after an NTP step backwards or a restart.
         //
         // KES: the vote's period is its target epoch's, which is this slot's.
-        let kes_period = match self.prepare_kes(e, index) {
+        let kes_period = match self.prepare_kes(&rolled, e, index) {
             Ok(period) => period,
             Err(why) => {
                 eprintln!("[slot {slot}] not attesting: {why}");
+                crate::sentinel::note_kes_error("attest", index, &why);
                 return;
             }
         };
@@ -3035,7 +3993,7 @@ impl Engine {
             return;
         }
         let e = epoch_of(slot);
-        let rolled = self.rolled_to(e);
+        let rolled = self.duty_state(e);
         // Same rule as `attest`: the key, not just the index, and from the
         // same snapshot the schedule is drawn from.
         let Some(index) = self.duty_index(&rolled) else {
@@ -3067,6 +4025,14 @@ impl Engine {
                 epoch_of(a.data.slot) == e
                     && a.data.slot <= slot
                     && a.data.source_epoch < a.data.target_epoch
+                    // A vote targets the epoch of its own slot, as every
+                    // honest attester's does. The gated step-8 rule (review
+                    // FC-3 / CR-1) makes any other invalid; below that gate
+                    // the transition takes the vote's signing authority from
+                    // its target epoch, which gossip never verified under
+                    // (VAL-1). Producer policy, so it does not wait for the
+                    // gate: this node simply never includes such a vote.
+                    && a.data.target_epoch == e
                     && partition
                         .get((a.data.slot % SLOTS_PER_EPOCH) as usize)
                         .is_some_and(|c| c.binary_search(&a.validator).is_ok())
@@ -3086,6 +4052,10 @@ impl Engine {
         // producers holding the same pool would cut the same way.
         atts.sort_by_key(|a| (a.data.slot, a.validator, a.data.signing_root()));
         atts.truncate(MAX_ATTESTATIONS_PER_BLOCK);
+        // VAL-1: the gossip verdict was reached on another state. Keep only
+        // votes known to verify under the authority this block's pre-state
+        // names, and evict the ones that no longer do.
+        self.retain_block_valid_votes(&mut atts, &rolled, e);
 
         // `keys.is_none()` returned at the top of `propose`, and a duty never
         // writes `keys`, so this arm is unreachable; returning without a
@@ -3150,6 +4120,10 @@ impl Engine {
         // is bounded by the selection size and terminates. If the empty
         // selection also fails, the fault is not attributable to a transaction.
         let mut txs = self.select_transactions(bloch_pos_committee::epoch_of(slot));
+        // Selections made again after an indexed drop (review EXE-1), and
+        // whether a refusal that names no transaction narrowed the list.
+        let mut reselections = 0usize;
+        let mut narrowed = false;
         // Local production policy: never sign a block our smallest supported
         // gossip transport cannot carry. Incoming consensus acceptance stays
         // unchanged, and the pool keeps omitted votes for a later proposal.
@@ -3158,6 +4132,7 @@ impl Engine {
             return;
         }
         header.attestation_root = derive::attestation_root(&atts);
+        let mut vote_retries = 0usize;
         let (post, tx_bytes) = loop {
             let tx_bytes: Vec<Vec<u8>> = txs.iter().map(PosTransaction::canonical_bytes).collect();
             header.body_root = derive::body_root(&tx_bytes);
@@ -3170,10 +4145,55 @@ impl Engine {
                 .compute_post_state(&self.state, &probe, &atts, &txs)
             {
                 Ok(p) => break (p, tx_bytes),
+                // VAL-1: a refused vote is not a transaction's fault. Evict
+                // it from the pool, so no later proposal selects it, and
+                // probe again without it. Each round removes one vote; past
+                // the allowance the block goes out without votes rather
+                // than not at all.
+                Err(TransitionError::Attestation(i)) if (i as usize) < atts.len() => {
+                    vote_retries = vote_retries.saturating_add(1);
+                    if vote_retries > PROPOSAL_VOTE_RETRY_MAX {
+                        eprintln!("[slot {slot}] the transition keeps refusing pooled votes; proposing without votes");
+                        atts.clear();
+                    } else {
+                        let bad = atts.remove(i as usize);
+                        eprintln!("[slot {slot}] evicting the vote by v{} refused by the transition", bad.validator);
+                        self.evict_pool_vote(&(bad.validator, bad.data.signing_root()));
+                    }
+                    header.attestation_root = derive::attestation_root(&atts);
+                }
                 Err(err) => {
+                    let indexed = culprit_index(&err, txs.len()).is_some();
                     if !self.drop_failed_proposal_transaction(&mut txs, &err, slot) {
                         eprintln!("[slot {slot}] produce refused with no transactions: {err:?}");
                         return;
+                    }
+                    // The refused transaction is out of the mempool and
+                    // barred. What it displaced from the selection (byte
+                    // budget, DA slots, a whole block behind a settlement) is
+                    // still pending, so select again instead of proposing the
+                    // shrunken list. Bounded: each round removed one mempool
+                    // entry, and after the limit the loop continues as it
+                    // always did. Not after an unattributed narrowing, which
+                    // removes nothing from the mempool and would be undone.
+                    //
+                    // W1-1: when the allowance is spent, one last selection
+                    // leaves out L2 deposits, DA batches and claims, the
+                    // types whose mutual exclusions inside one block the
+                    // per-transaction preflight cannot see, so ordinary
+                    // transactions still land instead of the shrunken list.
+                    // They stay pending for the next proposer.
+                    narrowed |= !indexed;
+                    if indexed && !narrowed && reselections <= PROPOSAL_RESELECTIONS_MAX {
+                        reselections += 1;
+                        let again = self.select_transactions_with(
+                            bloch_pos_committee::epoch_of(slot),
+                            reselections <= PROPOSAL_RESELECTIONS_MAX,
+                        );
+                        if proposal_wire::fit(&header, &mut atts, &again) {
+                            header.attestation_root = derive::attestation_root(&atts);
+                            txs = again;
+                        }
                     }
                 }
             }
@@ -3188,10 +4208,11 @@ impl Engine {
         // not.
         // KES: the proposal's period is its slot's epoch's. Prepared only
         // now that this node is certain to sign.
-        let kes_period = match self.prepare_kes(e, index) {
+        let kes_period = match self.prepare_kes(&rolled, e, index) {
             Ok(period) => period,
             Err(why) => {
                 eprintln!("[slot {slot}] not proposing: {why}");
+                crate::sentinel::note_kes_error("propose", index, &why);
                 return;
             }
         };
@@ -3221,6 +4242,11 @@ impl Engine {
                 return;
             }
         };
+        // VAL-1: what the refused-own-block diagnosis below needs. The votes
+        // themselves stay in the pool until a block carrying them is applied.
+        let signed = ProposalEnvelope { header: header.clone(), proposer_sig: proposer_sig.clone() };
+        let vote_keys: Vec<(u32, [u8; 32])> =
+            atts.iter().map(|a| (a.validator, a.data.signing_root())).collect();
         let env = BlockEnvelope {
             header,
             proposer_sig,
@@ -3258,6 +4284,12 @@ impl Engine {
         // The transactions go too. Keeping them would rebuild the same block
         // next slot and lose that one as well.
         if self.head_id() != id {
+            // VAL-1: a vote the real verifier refuses is evicted, and the
+            // transactions are kept. The slot is lost either way: the
+            // proposal watermark is spent, so there is no second block.
+            if self.evict_vote_refused_in_own_block(&signed, &vote_keys, &txs, slot) {
+                return;
+            }
             eprintln!(
                 "[slot {slot}] REFUSED OWN BLOCK {} — the transition did not adopt what this \
                  node just produced (h28080 class). Dropping its {} transaction(s) and \
@@ -3348,15 +4380,87 @@ impl Engine {
     /// whose missing parent is older than that head. Start a bounded window
     /// before the earliest orphan; successive pages can move that window
     /// backwards until they connect, without rewinding consensus state.
+    ///
+    /// Only orphans whose proposer signature verified move the cursor
+    /// (P2P-6). An envelope naming an identity this node cannot check is
+    /// held, but its `slot` is an unauthenticated number off the wire and
+    /// must not choose how much history honest peers are asked to resend.
     fn sync_after_slot(&self) -> u64 {
-        if !self.needs_sync && self.orphans.is_empty() { return self.state.slot(); }
-        let missing_before = self.orphans.iter()
+        let mut authenticated = self.orphans.iter()
+            .filter(|(_, _, _, authentication, _)| authentication.is_some())
+            .peekable();
+        if !self.needs_sync && authenticated.peek().is_none() { return self.state.slot(); }
+        let missing_before = authenticated
             .map(|(_, env, _, _, _)| env.header.slot.saturating_sub(1))
             .min().unwrap_or(self.state.slot()).min(self.state.slot());
         let finalized = self.state.finality().finalized.root;
         let floor = self.chain.iter().rev().find(|(_, id)| *id.as_bytes() == finalized)
             .map_or(0, |(slot, _)| *slot);
         missing_before.saturating_sub(SLOTS_PER_EPOCH.saturating_mul(2)).max(floor)
+    }
+
+    /// The cursor for the sync request being sent now, with rewinds that
+    /// keep yielding nothing backed off. See [`SyncRewindBackoff`].
+    fn sync_request_after_slot(&mut self, now_ms: u64, cadence_ms: u64) -> u64 {
+        let head = self.state.slot();
+        let max_interval = cadence_ms
+            .saturating_mul(1u64 << SYNC_REWIND_BACKOFF_MAX_SHIFT);
+        if let Some(floor) = self.sync_rewind.awaiting.take() {
+            // Still unsettled when the next request is due: nothing from
+            // the rewound range was stored. A long quiet period since the
+            // previous fruitless attempt makes this an unrelated gap, not
+            // one more step of the same streak.
+            if now_ms > self.sync_rewind.retry_at_ms.saturating_add(max_interval) {
+                self.sync_rewind.fruitless = 0;
+            }
+            self.sync_rewind.fruitless = self.sync_rewind.fruitless.saturating_add(1);
+            self.sync_rewind.floor = floor;
+            let shift = self.sync_rewind.fruitless.min(SYNC_REWIND_BACKOFF_MAX_SHIFT);
+            self.sync_rewind.retry_at_ms = now_ms
+                .saturating_add(cadence_ms.saturating_mul(1u64 << shift));
+        }
+        self.sync_rewind.deferred = false;
+        let wanted = self.sync_after_slot();
+        if wanted >= head {
+            return wanted;
+        }
+        let causes: Vec<[u8; 32]> = self.orphans.iter()
+            .filter(|(_, _, _, authentication, _)| authentication.is_some())
+            .map(|(_, env, _, _, _)| env.header.parent)
+            .collect();
+        if self.sync_rewind.fruitless > 0
+            && wanted >= self.sync_rewind.floor
+            && now_ms < self.sync_rewind.retry_at_ms
+        {
+            let new_cause = now_ms >= self.sync_rewind.new_cause_at_ms
+                && causes.iter().any(|parent| !self.sync_rewind.causes.contains(parent));
+            if !new_cause {
+                // Held back, not forgotten: sync forward now, rewind later.
+                self.sync_rewind.deferred = true;
+                return head;
+            }
+            self.sync_rewind.new_cause_at_ms = now_ms
+                .saturating_add(cadence_ms.saturating_mul(1u64 << SYNC_REWIND_NEW_CAUSE_SHIFT));
+        }
+        self.sync_rewind.causes = causes;
+        self.sync_rewind.awaiting = Some(wanted);
+        self.sync_rewind.yield_ceiling = head;
+        wanted
+    }
+
+    /// Whether a rewind that was held back may be tried again.
+    fn sync_rewind_due(&self, now_ms: u64) -> bool {
+        self.sync_rewind.deferred && now_ms >= self.sync_rewind.retry_at_ms
+    }
+
+    /// A block entered `blocks`. One at or below the head slot the latest
+    /// rewind was issued from is something only a rewind could have fetched.
+    fn note_sync_rewind_yield(&mut self, slot: u64) {
+        if (self.sync_rewind.awaiting.is_some() || self.sync_rewind.fruitless > 0)
+            && slot <= self.sync_rewind.yield_ceiling
+        {
+            self.sync_rewind = SyncRewindBackoff::default();
+        }
     }
 
     /// Ingest `env` and then everything it unblocks, discarding the verdict.
@@ -3415,6 +4519,10 @@ impl Engine {
             Source::Local,
         );
         self.blocks.insert(id, env);
+        // `apply_canonical` ran the full transition above, before the block
+        // was stored, so its own `mark_validated` found nothing to index.
+        // Replayed history votes exactly as it did when it was first applied.
+        self.blocks.mark_validated(&id);
         true
     }
 
@@ -3433,9 +4541,15 @@ impl Engine {
     }
 
     fn schedule_unblocked_orphans(&mut self, landed: [u8; 32], grew_registry: bool) {
+        // V1-2: also what was parked for its proposer's authority, once that
+        // authority is no longer the one it was refused under.
+        let rejudge = self.authority_parked_due();
         let mut i = 0;
         while i < self.orphans.len() {
-            if grew_registry || self.orphans[i].1.header.parent == landed {
+            if grew_registry
+                || self.orphans[i].1.header.parent == landed
+                || rejudge.contains(&self.orphans[i].0)
+            {
                 let Some((_, env, orphan_source, authentication, retained_bytes)) = self.orphans.remove(i) else {
                     break;
                 };
@@ -3450,6 +4564,360 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// The state the door reads a proposer's authority from: the post-state
+    /// of the block's parent when the reorg ring still retains it, which is
+    /// what the transition will judge the signature against, and otherwise
+    /// this node's head (V1-2). The ring holds canonical post-states only,
+    /// so the lookup costs a scan of [`REORG_STATE_WINDOW`] ids.
+    fn proposer_authority_state(&self, parent: &[u8; 32]) -> Arc<CommittedState> {
+        self.recent_states
+            .iter()
+            .find(|(id, _)| id == parent)
+            .map(|(_, state)| Arc::clone(state))
+            .unwrap_or_else(|| self.state.arc())
+    }
+
+    /// The post-state of `parent` when this node holds it without doing any
+    /// work: the head, a reorg-ring entry, or the side-branch validator's
+    /// cursor or one of its retained side-branch states (all keyed by block
+    /// id, so none can describe another block).
+    fn exact_parent_state(&self, parent: &[u8; 32]) -> Option<Arc<CommittedState>> {
+        if parent == self.head_id().as_bytes() {
+            return Some(self.state.arc());
+        }
+        self.recent_states
+            .iter()
+            .find(|(id, _)| id == parent)
+            .map(|(_, state)| Arc::clone(state))
+            .or_else(|| {
+                let side = &self.reorg_anchors.side;
+                side.cursor
+                    .iter()
+                    .chain(side.tips.iter())
+                    .find(|(id, _)| id == parent)
+                    .map(|(_, state)| Arc::clone(state))
+            })
+    }
+
+    /// `parent`'s post-state rolled into `epoch`, if this node already holds
+    /// it: for the head, a memo hit (read, not written); for any parent,
+    /// the head included (review RC2-01), the door's own cache.
+    fn door_rolled_cached(&self, parent: &[u8; 32], parent_is_head: bool, epoch: u64) -> Option<Arc<CommittedState>> {
+        if parent_is_head && self.state.roll_distance(epoch) == 0 {
+            return Some(self.rolled_to(epoch));
+        }
+        self.state.door_cached(parent, epoch)
+    }
+
+    /// The KES half of the block door (audit L1-01; reviews RC-01, RC-02):
+    /// which state the proposer of `env` is judged on.
+    ///
+    /// `fallback` is the state the door has always judged on
+    /// ([`Self::proposer_authority_state`]: the parent's post-state from the
+    /// reorg ring, otherwise the head). It stays the answer, exactly as in
+    /// `906336fd`, unless ALL of these hold:
+    ///
+    /// 1. the block's epoch is past the compiled KES gate;
+    /// 2. `fallback` does not know a bind epoch, so it selects the static
+    ///    key for every validator (when it knows one, rolling cannot change
+    ///    any key lookup: see below);
+    /// 3. the parent is known (an unknown parent keeps the orphan handling);
+    /// 4. the parent's own post-state, rolled into the block's epoch, CAN
+    ///    have a bind that governs the epoch: it already holds one at or
+    ///    before it, or it holds none and the epoch is at least
+    ///    `KES_BIND_DELAY_EPOCHS` past the first boundary the roll crosses
+    ///    (the earliest a bind decided by that roll takes effect);
+    /// 5. the proposer has a KES key for the period (else the static key
+    ///    signs on every state).
+    ///
+    /// Then the answer is the parent's exact post-state rolled into the
+    /// block's epoch, which is the state the transition's step 7 verifies
+    /// the proposer on, IF its signing mode for the proposer is KES; if it
+    /// is static, `fallback` (and so `906336fd`'s verdict) again.
+    ///
+    /// Why the roll can be skipped or deferred without changing a verdict:
+    /// `process_epoch` writes none of the inputs of a key lookup except the
+    /// bind epoch (static keys are written by deposits, KES entries by
+    /// transactions, the network domain at genesis), so the static-key and
+    /// the KES-leaf verdicts are the same on the parent's state and on its
+    /// roll, and only WHICH of the two applies can change.
+    ///
+    /// Cost bounds (RC-01), for gossip and sync sources:
+    ///
+    /// - nothing is rolled before a real signature check: the KES leaf
+    ///   (only if the signature has a leaf's shape for this key and period)
+    ///   and the static key, both on the budgeted lane like the rest of the
+    ///   door. If neither verifies, the verdict is `false` in both modes and
+    ///   nothing is rolled at all; an unsigned header costs what it cost in
+    ///   `906336fd` plus at most one leaf check;
+    /// - a parent more than `MAX_EPOCH_ADVANCE` epochs behind the block is
+    ///   never rolled: every transition refuses it (`EpochAdvanceTooLarge`);
+    /// - rolls of at most [`DOOR_FREE_ROLL_EPOCHS`] uncached epochs share
+    ///   [`DOOR_SHORT_ROLL_EPOCHS_PER_SLOT`] epochs per wall slot (RC2-01);
+    ///   anything longer, and deriving a side-branch parent's post-state
+    ///   (one block through the transition), takes the door's one long roll
+    ///   per wall slot; past either allowance the block is held and offered
+    ///   again next slot;
+    /// - every roll is cached by (parent id, epoch) in
+    ///   [`StateCell::door_cached`], and for the head also in the memo.
+    ///
+    /// `Source::Local` (this node's own proposal) skips the probe and the
+    /// allowance, and a block re-offered with a proof of a verification this
+    /// node already made skips the probe: in both the signature has been
+    /// checked by this node.
+    fn door_kes_state(
+        &self,
+        env: &BlockEnvelope,
+        src: Source,
+        prior: Option<&AuthenticatedBlockAdmission>,
+        fallback: Arc<CommittedState>,
+    ) -> DoorKes {
+        use bloch_pos_committee::params::{KES_ACTIVATION_EPOCH, KES_BIND_DELAY_EPOCHS};
+        let epoch = epoch_of(env.header.slot);
+        let validator = env.header.proposer_index;
+        let parent = env.header.parent;
+        let unchanged = |state: Arc<CommittedState>| DoorKes::Judge { state, known: None };
+        let Some(period) = bloch_pos_committee::params::kes_period(epoch) else {
+            return unchanged(fallback);
+        };
+        if fallback.kes_enforced_from().is_some() {
+            return unchanged(fallback);
+        }
+        let cheap = self.exact_parent_state(&parent);
+        let governed = match &cheap {
+            Some(exact) => match exact.kes_enforced_from() {
+                Some(bind) => epoch >= bind,
+                None => {
+                    epoch
+                        >= epoch_of(exact.slot())
+                            .saturating_add(1)
+                            .max(KES_ACTIVATION_EPOCH)
+                            .saturating_add(KES_BIND_DELAY_EPOCHS)
+                }
+            },
+            // A stored side-branch parent: its own bind is not known here,
+            // so any epoch a bind can govern qualifies.
+            None if self.blocks.get(&parent).is_some() => {
+                epoch >= KES_ACTIVATION_EPOCH.saturating_add(KES_BIND_DELAY_EPOCHS)
+            }
+            None => false,
+        };
+        if !governed {
+            return unchanged(fallback);
+        }
+        if cheap.as_ref().is_some_and(|exact| KeyLookup::kes_public(&**exact, validator, period).is_none()) {
+            return unchanged(fallback);
+        }
+        let parent_is_head = parent == *self.head_id().as_bytes();
+        // Mode from the rolled state; verdict as computed on identical keys.
+        let judge_on = |rolled: Arc<CommittedState>, kes: Option<bool>, fallback: Arc<CommittedState>, static_: Option<bool>| {
+            match bloch_pos_committee::kes::signing_mode(&*rolled, validator, epoch) {
+                bloch_pos_committee::kes::SigningMode::Kes(_) => DoorKes::Judge { state: rolled, known: kes },
+                _ => DoorKes::Judge { state: fallback, known: static_ },
+            }
+        };
+        if let Some(rolled) = self.door_rolled_cached(&parent, parent_is_head, epoch) {
+            return judge_on(rolled, None, fallback, None);
+        }
+
+        // The probe: no roll is paid for a header no key of this proposer
+        // signed. `keys` is the parent's exact state when held (identical
+        // keys to its roll), else `fallback` (an estimate, so its KES verdict
+        // is not reused).
+        let keys: &CommittedState = cheap.as_deref().unwrap_or(&fallback);
+        let mut kes_verdict = None;
+        let mut static_verdict = None;
+        if prior.is_none() && src.bounded_by_wall_clock() {
+            let root = env.header.proposal_signing_root();
+            let (lane, lane_cap, lane_source_cap) = src.block_verification_allowance();
+            let verifier = self
+                .gossip_verifier
+                .budgeted_lane_for_source(self.wall_slot(), lane, lane_cap, src.verification_source(), lane_source_cap)
+                .with_failure_allowance(BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
+            let policy = bloch_pos_committee::PolicyVerifier::consensus(&verifier, epoch);
+            let kes_ok = kes_shaped(keys, validator, period, &env.proposer_sig)
+                && bloch_pos_committee::kes::verify_validator_in(keys, &policy, validator, Some(period), &root, &env.proposer_sig)
+                    == Some(true);
+            if !kes_ok && !verifier.limited() {
+                static_verdict = Some(
+                    bloch_pos_committee::kes::verify_validator_in(&*fallback, &policy, validator, None, &root, &env.proposer_sig)
+                        == Some(true),
+                );
+            }
+            if verifier.limited() {
+                let failed = verifier.failure_limited();
+                drop(policy);
+                drop(verifier);
+                return if failed { DoorKes::Drop } else { DoorKes::Defer };
+            }
+            if !kes_ok && static_verdict == Some(false) {
+                // Neither key signed it: `false` in both modes, which is also
+                // `fallback`'s verdict. Nothing to roll.
+                return DoorKes::Judge { state: fallback, known: Some(false) };
+            }
+            if cheap.is_some() {
+                kes_verdict = Some(kes_ok);
+            }
+        }
+
+        // A signature of this proposer verified (or this node's own block):
+        // the parent's exact post-state, rolled into the block's epoch.
+        let local = !src.bounded_by_wall_clock();
+        let mut spent = false;
+        let exact = match cheap {
+            Some(exact) => exact,
+            None => {
+                let Some(parent_env) = self.blocks.get(&parent) else {
+                    return unchanged(fallback);
+                };
+                if self.reorg_anchors.side.failed_index.contains(&parent) {
+                    // It failed the transition here before: so would this block.
+                    return DoorKes::Drop;
+                }
+                let Some(grandparent) = self.exact_parent_state(&parent_env.header.parent) else {
+                    // Deeper than one block off a held state: as before.
+                    return unchanged(fallback);
+                };
+                if epoch_of(parent_env.header.slot).saturating_add(MAX_EPOCH_ADVANCE) < epoch {
+                    return DoorKes::Drop;
+                }
+                if !local && !self.state.try_spend_door_long_roll(self.wall_slot()) {
+                    return DoorKes::Defer;
+                }
+                spent = true;
+                match self.transition_on(&grandparent, parent_env) {
+                    Ok(post) => Arc::new(post),
+                    // The parent can never apply, so neither can this block.
+                    // A hollow (body released) or canonical parent failing
+                    // here is a local fault, not a verdict: not remembered.
+                    Err(_) if self.blocks.is_hollow(&parent) || self.canonical.contains(&parent) => {
+                        return DoorKes::Drop;
+                    }
+                    Err(_) => return DoorKes::DropFailedParent(parent),
+                }
+            }
+        };
+        match self.door_roll(parent, parent_is_head, exact, epoch, local, spent) {
+            Ok(rolled) => judge_on(rolled, kes_verdict, fallback, static_verdict),
+            Err(refused) => refused,
+        }
+    }
+
+    /// Roll `exact`, the post-state of `parent`, into `epoch` for the block
+    /// door, within the door's bounds (review RC-01): never past
+    /// `MAX_EPOCH_ADVANCE` (`Drop`: the transition refuses such a block from
+    /// this parent on every node); up to [`DOOR_FREE_ROLL_EPOCHS`] uncached
+    /// epochs on the wall slot's short-roll allowance (RC2-01), otherwise
+    /// only on the wall slot's one door long roll (`Defer` once the one it
+    /// needs is spent) unless `local` (this node's own block) or `spent`
+    /// (this header already took the long roll). The result is what the
+    /// transition rolls: the memo's `rolled_to` for the head, the same
+    /// `process_epoch` fold from `exact` for any other parent; both are
+    /// cached by parent id and epoch.
+    fn door_roll(
+        &self,
+        parent: [u8; 32],
+        parent_is_head: bool,
+        exact: Arc<CommittedState>,
+        epoch: u64,
+        local: bool,
+        spent: bool,
+    ) -> Result<Arc<CommittedState>, DoorKes> {
+        let exact_epoch = epoch_of(exact.slot());
+        if epoch.saturating_sub(exact_epoch) > MAX_EPOCH_ADVANCE {
+            return Err(DoorKes::Drop);
+        }
+        if let Some(hit) = self.door_rolled_cached(&parent, parent_is_head, epoch) {
+            return Ok(hit);
+        }
+        let distance = if parent_is_head { self.state.roll_distance(epoch) } else { epoch.saturating_sub(exact_epoch) };
+        if !spent && !local && distance > 0 {
+            // A long roll takes the slot's one long roll; a short one a share
+            // of the slot's short-roll epochs (review RC2-01).
+            let granted = if distance > DOOR_FREE_ROLL_EPOCHS {
+                self.state.try_spend_door_long_roll(self.wall_slot())
+            } else {
+                self.state.try_spend_door_short_roll(self.wall_slot(), distance)
+            };
+            if !granted {
+                return Err(DoorKes::Defer);
+            }
+        }
+        self.state.note_door_roll(distance);
+        if parent_is_head {
+            // Also in the door's cache, keyed by the head's block id (its
+            // post-state is a pure function of the id, so the entry cannot go
+            // stale): the memo evicts its lowest epochs first, and a short
+            // roll of a head whose memo holds higher epochs would otherwise
+            // be forgotten at once and paid again by the next header (RC2-01).
+            let rolled = self.rolled_to(epoch);
+            self.state.door_remember(true, parent, epoch, Arc::clone(&rolled));
+            return Ok(rolled);
+        }
+        let mut st = exact;
+        let mut at = exact_epoch;
+        while at < epoch {
+            st = Arc::new(self.tr.process_epoch(&st).expect("process_epoch is infallible"));
+            at = at.saturating_add(1);
+        }
+        self.state.door_remember(false, parent, epoch, Arc::clone(&st));
+        Ok(st)
+    }
+
+    /// Park a block whose proposer could not be authenticated under
+    /// `judged`, and remember that authority so the block is judged again
+    /// when it changes (V1-2). Unauthenticated, like every such entry.
+    fn park_unjudgeable(&mut self, id: [u8; 32], env: BlockEnvelope, src: Source, judged: Option<[u8; 32]>) {
+        self.park_orphan(id, env, src);
+        if self.orphans.back().is_some_and(|(seen, _, _, _, _)| *seen == id) {
+            self.authority_parked.judged.insert(id, judged);
+            // A record can outlive its block (evicted, or released by its
+            // parent). Never hold more records than the pool has entries.
+            if self.authority_parked.judged.len() > ORPHAN_MAX {
+                let orphans = &self.orphans;
+                self.authority_parked
+                    .judged
+                    .retain(|id, _| orphans.iter().any(|(seen, _, _, _, _)| seen == id));
+            }
+        }
+    }
+
+    /// Ids of parked blocks whose proposer authority has changed since the
+    /// door refused to judge them (V1-2). Records of blocks that left the
+    /// orphan pool are dropped in the same pass, so the map never outgrows
+    /// it. One fingerprint per recorded entry, and only when the state has
+    /// been written since the last pass.
+    fn authority_parked_due(&mut self) -> BTreeSet<[u8; 32]> {
+        let mut due = BTreeSet::new();
+        let generation = self.state.generation();
+        if self.authority_parked.judged.is_empty()
+            || self.authority_parked.checked_generation == Some(generation)
+        {
+            return due;
+        }
+        let mut waiting = BTreeMap::new();
+        for (id, env, _, _, _) in &self.orphans {
+            let Some(judged) = self.authority_parked.judged.get(id) else {
+                continue;
+            };
+            // Never rolls (review RC-01): the door records the authority on
+            // this same unrolled state (`park_authority`).
+            let now = bloch_pos_committee::kes::authority_fingerprint(
+                &*self.proposer_authority_state(&env.header.parent),
+                env.header.proposer_index,
+                epoch_of(env.header.slot),
+            );
+            if now == *judged {
+                waiting.insert(*id, *judged);
+            } else {
+                due.insert(*id);
+            }
+        }
+        self.authority_parked.judged = waiting;
+        self.authority_parked.checked_generation = Some(generation);
+        due
     }
 
     /// Promote at most one previously parked block. Its prior gossip verdict
@@ -3502,6 +4970,7 @@ impl Engine {
         scheduler: &mut DeferredWorkScheduler,
         block_scheduler: &mut DeferredBlockScheduler,
     ) -> (bool, bool, bool) {
+        self.requeue_budget_parked_blocks(slot);
         let block_ready = self.ready_future_block_pending(slot)
             || !self.deferred_orphans.is_empty();
         let held_ready = !self.held_release_roots.is_empty();
@@ -3585,6 +5054,14 @@ impl Engine {
         {
             // A child cannot make a locally finality-conflicting ancestor
             // adoptable. Do not convert it into a missing-parent sync request.
+            return (Verdict::Ignore, None);
+        }
+        // Operator-rejected roots (`--reject-block-root`): the block, or its
+        // parent, is rejected or a remembered rejected descendant. Refused
+        // before any signature work and never stored, so it never reaches
+        // fork choice. `Ignore`: the peer relaying it is honest.
+        if self.is_rejected_block(&id, &env.header.parent) {
+            self.refuse_rejected_block(&env, id, src);
             return (Verdict::Ignore, None);
         }
         if env.header.slot == 0 {
@@ -3683,7 +5160,9 @@ impl Engine {
         //
         // So:
         //   * GENESIS index (present in the manifest), signature fails
-        //     → REFUSED, and `Reject`: the genesis registry is in the manifest
+        //     → REFUSED, and `Reject` (before the KES gate; from it on only
+        //     when the finalized state fixes the authority, see FC-4 below):
+        //     the genesis registry is in the manifest
         //     every node booted from, records are append-only per index
         //     (transition step 7's note: "records never removed"), so the key
         //     this node holds at `i` is the key EVERY branch holds at `i`, and
@@ -3720,13 +5199,49 @@ impl Engine {
         // transition's own step 7), and the authority a cached proof is bound
         // to also commits to the KES key (`kes::authority_fingerprint`);
         // before it, both are exactly the static-key forms.
+        //
+        // V1-2: the registry read is the parent's post-state whenever the
+        // reorg ring still holds it (a sibling of the head, or a child of
+        // it), which is exactly the transition's; only otherwise the head.
+        //
+        // Audit L1-01 (reviews RC-01, RC-02): past the KES gate the state is
+        // the parent's exact post-state rolled into the block's epoch when,
+        // and only when, that roll makes the epoch KES-governed for this
+        // proposer while `fallback` does not; see `door_kes_state` for the
+        // conditions, the bounds and why the verdict is otherwise unchanged.
         let proposer_epoch = epoch_of(env.header.slot);
+        let fallback = self.proposer_authority_state(&env.header.parent);
+        let (judged_state, known) =
+            match self.door_kes_state(&env, src, prior_authentication.as_ref(), Arc::clone(&fallback)) {
+                DoorKes::Judge { state, known } => (state, known),
+                DoorKes::Defer => {
+                    self.park_budget_limited_block(id, env, src);
+                    return (Verdict::Ignore, None);
+                }
+                DoorKes::Drop => return (Verdict::Ignore, None),
+                DoorKes::DropFailedParent(parent) => {
+                    // As the side-branch fold does with a block that fails
+                    // the transition (it is never canonical or hollow here).
+                    self.blocks.remove(&parent);
+                    self.reorg_anchors.side.remember_failed(parent);
+                    return (Verdict::Ignore, None);
+                }
+            };
         let authority = bloch_pos_committee::kes::authority_fingerprint(
-            &*self.state,
+            &*judged_state,
             env.header.proposer_index,
             proposer_epoch,
         );
+        // A parked block is re-judged when the authority recomputed WITHOUT
+        // rolling changes (`authority_parked_due`), so its record is taken on
+        // `fallback`, the state that function reads.
+        let park_authority = if Arc::ptr_eq(&judged_state, &fallback) {
+            authority
+        } else {
+            bloch_pos_committee::kes::authority_fingerprint(&*fallback, env.header.proposer_index, proposer_epoch)
+        };
         let authenticated = match authority {
+            Some(_) if known.is_some() => known == Some(true),
             Some(authority) if src.bounded_by_wall_clock() => {
                 let proof_matches = prior_authentication
                     .as_ref()
@@ -3734,14 +5249,16 @@ impl Engine {
                 if proof_matches {
                     true
                 } else {
-                    let verifier = self.gossip_verifier.budgeted_for_source(
+                    let (lane, lane_cap, lane_source_cap) = src.block_verification_allowance();
+                    let verifier = self.gossip_verifier.budgeted_lane_for_source(
                         self.wall_slot(),
-                        GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+                        lane,
+                        lane_cap,
                         src.verification_source(),
-                        GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
-                    );
+                        lane_source_cap,
+                    ).with_failure_allowance(BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
                     let verified = bloch_pos_committee::kes::verify_validator(
-                        &*self.state,
+                        &*judged_state,
                         // HF2: the consensus signature rule of the header's own
                         // epoch, exactly what the transition applies; HF3: the
                         // KES leaf of that epoch's period once KES binds.
@@ -3753,8 +5270,15 @@ impl Engine {
                     ) == Some(true);
                     if verifier.limited() {
                         // Local overload is not proof of a forgery. Ignore so an
-                        // honest relay is not scored; sync retries from the
-                        // applied head on its ordinary timer.
+                        // honest relay is not scored. A block refused only by
+                        // the allowance is held in the bounded orphan pool and
+                        // judged when the allowance renews; a source past its
+                        // failure allowance is ignored outright.
+                        let park = !verifier.failure_limited();
+                        drop(verifier);
+                        if park {
+                            self.park_budget_limited_block(id, env, src);
+                        }
                         return (Verdict::Ignore, None);
                     }
                     verified
@@ -3764,7 +5288,7 @@ impl Engine {
                 .as_ref()
                 .is_some_and(|proof| proof.matches(&env, &authority))
                 || bloch_pos_committee::kes::verify_validator(
-                    &*self.state,
+                    &*judged_state,
                     &bloch_pos_committee::PolicyVerifier::consensus(&self.gossip_verifier, proposer_epoch),
                     env.header.proposer_index,
                     proposer_epoch,
@@ -3772,8 +5296,10 @@ impl Engine {
                     &env.proposer_sig,
                 ) == Some(true),
             None => {
-                // Unknown identity: hold it, ask for the gap, decide nothing.
-                self.park_orphan(id, env, src);
+                // Unknown identity: hold it, decide nothing. It does not
+                // ask for a gap either (P2P-6): nothing about this envelope
+                // is authenticated, so it may not steer the sync cursor.
+                self.park_unjudgeable(id, env, src, None);
                 return (Verdict::Ignore, None);
             }
         };
@@ -3782,7 +5308,20 @@ impl Engine {
                 // O04: a deposit-added identity whose key this branch may not
                 // hold. Not a verdict on the block, and not a charge on the
                 // peer — hold it and let the transition judge it in context.
-                self.park_orphan(id, env, src);
+                self.park_unjudgeable(id, env, src, park_authority);
+                return (Verdict::Ignore, None);
+            }
+            if !self.signature_failure_is_provable(
+                &*judged_state,
+                env.header.proposer_index,
+                proposer_epoch,
+            ) {
+                // FC-4: from the KES gate on, the key at a genesis index is
+                // no longer the same on every branch. This head may predate
+                // the bind or the proposer's registration and have judged a
+                // leaf signature against the static key. Unless the finalized
+                // state fixes the authority, hold it like the O04 case.
+                self.park_unjudgeable(id, env, src, park_authority);
                 return (Verdict::Ignore, None);
             }
             self.rejected_unsigned = self.rejected_unsigned.saturating_add(1);
@@ -3824,6 +5363,44 @@ impl Engine {
                 crate::codec::hex8(&id)
             ));
             return (Verdict::Reject, None);
+        }
+        // FC-1, defence in depth: a body attestation dated after its block,
+        // or outside its block's epoch, is refused before the block is stored
+        // or parked anywhere.
+        //
+        // This mirrors the transition and cannot refuse a block it would
+        // accept. Step 8 of `compute_post_state` rejects the whole block when
+        // any attestation has `epoch_of(att.data.slot) != st.epoch`, where
+        // `st` is the pre-state rolled to `epoch_of(header.slot)`, and
+        // `attestation::validate` rejects `att.data.slot > header.slot`. Both
+        // are ungated and depend on nothing but the two slots, so the verdict
+        // is the same on every branch.
+        //
+        // Body votes no longer weigh on fork choice before the block is
+        // applied (see `BlockInventory::mark_validated`), so this is not what
+        // keeps such a vote out of the head. It keeps a block that can never
+        // apply out of `blocks`, the orphan pool and the future-block pool,
+        // so it is never selected, replayed and removed, and it keeps the
+        // slot of every stored vote within its block's own epoch.
+        //
+        // `Ignore`, not `Reject`: a peer running a build without this check
+        // stores and relays such a block in good faith (its transition
+        // refuses it only if the branch is ever applied), and scoring that
+        // relay would let one proposer key turn upgraded nodes against the
+        // rest of the mesh while a fleet is being upgraded.
+        if let Some(att) = env.body.attestations.iter().find(|att| {
+            att.data.slot > env.header.slot
+                || epoch_of(att.data.slot) != epoch_of(env.header.slot)
+        }) {
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
+                "reject {}: body attestation by v{} names slot {}, outside block slot {} (epoch {})",
+                crate::codec::hex8(&id),
+                att.validator,
+                att.data.slot,
+                env.header.slot,
+                epoch_of(env.header.slot),
+            ));
+            return (Verdict::Ignore, None);
         }
         // A block carrying transactions used to be rejected here, because the
         // node had no tx codec and failing closed was the honest response. The
@@ -3884,6 +5461,7 @@ impl Engine {
         let proposer_slot = env.header.slot;
         self.observe_proposer_equivocation(&env);
         self.blocks.insert(id, env);
+        self.note_sync_rewind_yield(proposer_slot);
         self.note_own_signature(
             proposer_index,
             crate::slashprot::Published::Proposal { slot: proposer_slot },
@@ -3902,7 +5480,9 @@ impl Engine {
         (Verdict::Accept, Some((id, grew_registry)))
     }
 
-    /// Park a block whose parent is unknown, and ask the mesh for the gap.
+    /// Park a block whose parent is unknown or whose proposer this node
+    /// cannot check. Only one whose proposer signature verified
+    /// (`authentication` is `Some`) asks the mesh for the gap (P2P-6).
     ///
     /// Deduplicated by id across both waiting and ready-to-promote tails, so a
     /// mesh that hands the same orphan back on every heartbeat occupies one
@@ -3929,7 +5509,7 @@ impl Engine {
         if src.bounded_by_wall_clock()
             && self.orphans.iter()
                 .chain(self.deferred_orphans.iter())
-                .filter(|(_, _, held_source, _, _)| *held_source == src)
+                .filter(|(_, _, held_source, _, _)| held_source.same_retention_share(src))
                 .count()
                 >= ORPHANS_PER_SOURCE
         {
@@ -3943,7 +5523,7 @@ impl Engine {
         if src.bounded_by_wall_clock() {
             let source_bytes = self.orphans.iter()
                 .chain(self.deferred_orphans.iter())
-                .filter(|(_, _, held_source, _, _)| *held_source == src)
+                .filter(|(_, _, held_source, _, _)| held_source.same_retention_share(src))
                 .fold(0usize, |sum, (_, _, _, _, bytes)| sum.saturating_add(*bytes));
             if !retention_bytes_fit(source_bytes, retained_bytes, ORPHAN_BYTES_PER_SOURCE) {
                 self.orphans_evicted = self.orphans_evicted.saturating_add(1);
@@ -3985,7 +5565,20 @@ impl Engine {
         while self.orphans.len().saturating_add(self.deferred_orphans.len()) >= ORPHAN_MAX
             || !retention_bytes_fit(held_bytes, retained_bytes, ORPHAN_BYTES_MAX)
         {
-            if let Some((_, _, _, _, evicted_bytes)) = self.orphans.pop_front() {
+            // P2P-6: the oldest UNAUTHENTICATED entry leaves first, and an
+            // unauthenticated newcomer never displaces an entry whose
+            // proposer signature verified — it is dropped instead. FIFO
+            // order is unchanged within each class.
+            let victim = match self.orphans.iter()
+                .position(|(_, _, _, held, _)| held.is_none())
+            {
+                Some(unauthenticated) => Some(unauthenticated),
+                None if authentication.is_some() && !self.orphans.is_empty() => Some(0),
+                None => None,
+            };
+            if let Some((_, _, _, _, evicted_bytes)) =
+                victim.and_then(|at| self.orphans.remove(at))
+            {
                 held_bytes = held_bytes.saturating_sub(evicted_bytes);
                 self.orphans_evicted = self.orphans_evicted.saturating_add(1);
             } else {
@@ -3993,9 +5586,45 @@ impl Engine {
                 return;
             }
         }
+        let authenticated = authentication.is_some();
         self.orphans.push_back((id, env, src, authentication, retained_bytes));
-        // The gap is real and the sync loop is the thing that closes it.
-        self.needs_sync = true;
+        // The gap is real and the sync loop is the thing that closes it —
+        // but only a verified proposer signature makes it real. An
+        // unauthenticated envelope is held so it can be judged if its branch
+        // arrives; it does not get to request history on its own word.
+        if authenticated {
+            self.needs_sync = true;
+        }
+    }
+
+    /// Hold a block whose proposer signature was not checked only because
+    /// this wall slot's verification allowance was spent. It is parked
+    /// unauthenticated under the orphan pool's own count and byte shares, and
+    /// [`Self::requeue_budget_parked_blocks`] re-offers it next slot.
+    fn park_budget_limited_block(&mut self, id: [u8; 32], env: BlockEnvelope, src: Source) {
+        if self.orphans.iter().any(|(seen, _, _, _, _)| *seen == id)
+            || self.deferred_orphans.iter().any(|(seen, _, _, _, _)| *seen == id)
+        {
+            return;
+        }
+        self.park_orphan(id, env, src);
+        if self.orphans.back().is_some_and(|(seen, _, _, _, _)| *seen == id) {
+            self.gossip_verifier.note_budget_parked_block(self.wall_slot(), id, ORPHAN_MAX);
+        }
+    }
+
+    /// Move blocks parked by a spent allowance in a slot before `slot` to the
+    /// ready-to-promote tail. Promotion repeats the whole door, including the
+    /// proposer signature, under the renewed allowance.
+    fn requeue_budget_parked_blocks(&mut self, slot: u64) {
+        for id in self.gossip_verifier.take_budget_parked_blocks_before(slot) {
+            let Some(at) = self.orphans.iter().position(|(seen, _, _, _, _)| *seen == id) else {
+                continue;
+            };
+            if let Some(parked) = self.orphans.remove(at) {
+                self.deferred_orphans.push_back(parked);
+            }
+        }
     }
 
     /// Record one authenticated proposal, returning false only when gossip
@@ -4199,27 +5828,65 @@ impl Engine {
     /// `on_attestation` runs on a different event — so `apply_canonical`,
     /// `do_reorg` and the invalid-block removal only ever take entries out. A
     /// set that only loses elements is unchanged exactly when its size is.
+    /// (`do_reorg` may re-insert a released canonical body under the rewind
+    /// override; that replaces an entry already present and re-validates it,
+    /// so neither the count nor the folded votes move. The generation below
+    /// does, which costs one recompute and nothing else.)
+    ///
+    /// The third collection is the vote index: the body votes of validated
+    /// blocks. It is NOT shrink-only inside `advance` — applying a block is
+    /// exactly what starts counting its body (FC-1) — so it is compared by
+    /// the inventory's generation counter, which changes on every change to
+    /// the index. A turn that applied a block carrying attestations therefore
+    /// always recomputes the head, and it has to: those votes were not part
+    /// of the head that selected the block.
     ///
     /// `fc_covered_removals` is added back to the pool count for the one kind
     /// of shrinkage fork choice cannot observe: an attestation dropped because
     /// the block carrying it became canonical is still counted, from that
-    /// block's body. Adding the running total keeps the sum invariant across
-    /// those and lets it fall — forcing a recompute — for the epoch `retain`,
-    /// which drops attestations no stored block carries.
+    /// block's body, which the same apply marked validated. Adding the
+    /// running total keeps the sum invariant across those and lets it fall —
+    /// forcing a recompute — for the epoch `retain`, which drops attestations
+    /// no validated block carries. (Since FC-1 the apply that drops a covered
+    /// attestation also moves the vote generation, so that turn recomputes
+    /// regardless; the term is kept so the pool comparison stays exact on
+    /// its own.)
     ///
-    /// If a future edit inserts into either collection inside `advance`, this
-    /// stops being sound. That is why the invariant is written down here
+    /// If a future edit inserts into `blocks` or `pool` inside `advance`,
+    /// this stops being sound. That is why the invariant is written down here
     /// rather than assumed. The neutrality half of the claim is pinned by
     /// `an_attestation_its_block_carries_is_free_to_leave_the_pool`, which
     /// also carries the control showing the epoch `retain` is NOT neutral.
     fn forkchoice_inputs(&self) -> ForkChoiceInputs {
         ForkChoiceInputs {
             blocks: self.blocks.len(),
+            votes: self.blocks.vote_generation(),
             // A memo key over two counters; saturating like the counters are.
             pool: (self.pool.len() as u64).saturating_add(self.fc_covered_removals),
             justified: self.state.finality().justified.root,
-            validators: self.state.active_validators(),
+            validators: self.forkchoice_validators(),
         }
+    }
+
+    /// The stake vector fork choice weighs votes with: the active roster of
+    /// the CURRENT head's state.
+    ///
+    /// That makes the weights a function of which branch is canonical. Two
+    /// sibling branches on opposite sides of an epoch boundary carry
+    /// different rosters while the inactivity leak runs (the later branch has
+    /// already charged the leak for the closing epoch, the earlier one has
+    /// not), so each can prefer the other — see `advance` for what that does
+    /// and how the loop is kept from chasing it.
+    ///
+    /// Test builds may substitute the vector per head through
+    /// [`forkchoice_cycle_tests`]' thread-local hook; release builds read the
+    /// state and nothing else.
+    fn forkchoice_validators(&self) -> Vec<bloch_pos_committee::sample::Validator> {
+        #[cfg(test)]
+        if let Some(validators) = forkchoice_cycle_tests::stake_override(self.head_id().as_bytes()) {
+            return validators;
+        }
+        self.state.active_validators()
     }
 
     fn forkchoice_head(&self) -> [u8; 32] {
@@ -4227,7 +5894,7 @@ impl Engine {
         let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::ForkChoice);
         self.blocks.head(
             self.pool.values(),
-            &self.state.active_validators(),
+            &self.forkchoice_validators(),
             self.state.finality().justified.root,
             bloch_pos_committee::params::forkchoice_slot_tiebreak_active(epoch_of(self.state.slot())),
         )
@@ -4303,9 +5970,10 @@ impl Engine {
         // last iteration exists only to confirm the head stopped moving. That
         // confirmation is NOT free and it is NOT redundant: `apply_canonical`
         // advances `self.state`, which moves the justified root and can move
-        // the active validator set, and it prunes `self.pool`. All three are
-        // fork-choice inputs, so the value really can change and the loop
-        // really is the convergence.
+        // the active validator set, it prunes `self.pool`, and it is the point
+        // at which the applied block's body votes start to count (FC-1). All
+        // four are fork-choice inputs, so the value really can change and the
+        // loop really is the convergence.
         //
         // What is skippable is the case where none of them moved, and
         // `forkchoice_inputs` is what decides that. Reusing the previous
@@ -4313,6 +5981,26 @@ impl Engine {
         // function of exactly those inputs (that is why §5.5 made it a free
         // function), so equal inputs mean an equal head, bit for bit.
         let mut memo: Option<(ForkChoiceInputs, [u8; 32])> = None;
+        // Heads this call has held and then moved away from.
+        //
+        // The convergence argument above has a hole: the stake vector is read
+        // from the CURRENT head's state (`forkchoice_validators`), so it is a
+        // function of the very choice it decides. Two siblings on opposite
+        // sides of an epoch boundary carry different rosters while the
+        // inactivity leak runs, and each can prefer the other — there is then
+        // no fixed point, and this loop reorganised between the two until its
+        // bound ran out (rehearsal 2026-10-25, node 2: a bound of ~1,350
+        // reorgs on a 670-block store, over 100 of them logged before the run
+        // ended, with the engine thread — RPC and block import with it —
+        // blocked throughout, so the blocks and votes that would have broken
+        // the tie were never processed).
+        //
+        // A target this call already left is that cycle. Stop on the head
+        // held now: it is the head the latest recompute moved TO, and the
+        // next event (a block or a vote, both of which change the weights)
+        // runs fork choice again from it. Node-local — no block validity and
+        // no committed state depends on which branch this node holds.
+        let mut left: Vec<[u8; 32]> = Vec::new();
         // Bounded: every iteration either advances the canonical head or
         // deletes an invalid block, and both are finite.
         for _ in 0..=self.blocks.len().saturating_mul(2).saturating_add(2) {
@@ -4325,6 +6013,20 @@ impl Engine {
             let head = *self.head_id().as_bytes();
             if target == head {
                 return;
+            }
+            if left.contains(&target) {
+                eprintln!(
+                    "FORK CHOICE CYCLE: head {} would move back to {}, which this pass already \
+                     left — the stake vector depends on the head (epoch boundary under the leak). \
+                     Holding {} until a block or vote changes the weights.",
+                    crate::codec::hex8(&head),
+                    crate::codec::hex8(&target),
+                    crate::codec::hex8(&head),
+                );
+                return;
+            }
+            if !left.contains(&head) {
+                left.push(head);
             }
             let Some((ancestor, branch)) = self.path_to_canonical(target) else {
                 // Missing lineage: ask the mesh, and keep the chain we have
@@ -4737,9 +6439,6 @@ impl Engine {
             return Err(Refusal::PreviouslyRefused { until_slot });
         }
         admission::check_transfer(&self.state, &tx, key.len(), epoch_of(self.wall_slot()))?;
-        // Plan capacity cleanup without mutating the pool. A forged incoming
-        // signature must never evict either stale or currently paying entries.
-        let capacity = self.plan_mempool_capacity(&tx, key.len(), epoch_of(self.wall_slot()))?;
         // Refuse the shapes consensus can never apply.
         //
         // Admission used to check duplicate-and-capacity only, so anything
@@ -4785,15 +6484,41 @@ impl Engine {
             if self.mempool.values().any(|pending| matches!(pending, PosTransaction::L2SettlementAsync(_))) {
                 return Err(Refusal::Invalid("one L2 proof is already pending"));
             }
-            state.validate_async(settlement, &HybridVerifier::new())
-                .map_err(|_| Refusal::Invalid("L2 settlement policy, source, successor or proof failed"))?;
+            // The proof draws on the same per-source and per-slot allowance
+            // as every signature (`L2_PROOF_VERIFICATION_UNITS` each), and
+            // `validate_async` reaches it only after policy, source and
+            // successor matched the committed L2 state, without copying it.
+            let verifier = self.gossip_verifier.budgeted_for_source(
+                self.wall_slot(),
+                GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+                verification_source,
+                GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+            ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
+            let admission = state.validate_async(settlement, &verifier);
+            let limited = verifier.limited();
+            drop(verifier);
+            if limited {
+                return Err(Refusal::GossipVerificationLimited {
+                    until_slot: self.wall_slot().saturating_add(1),
+                });
+            }
+            if let Err(why) = admission {
+                // A proof that failed for this statement fails forever, so
+                // the same bytes are barred and cost nothing when re-offered.
+                // The other refusals depend on this node's head (a source it
+                // has not reached yet) and are cheap: they are not barred.
+                if why == bloch_pos_committee::l2_settlement::Reject::Proof {
+                    self.reject_transaction(key, self.wall_slot());
+                }
+                return Err(Refusal::Invalid("L2 settlement policy, source, successor or proof failed"));
+            }
         } else {
             let verifier = self.gossip_verifier.budgeted_for_source(
                 self.wall_slot(),
                 GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
                 verification_source,
                 GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
-            );
+            ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
             let admission = admissible_with_network_verifier(
                 &tx,
                 epoch_of(self.wall_slot()),
@@ -4809,15 +6534,26 @@ impl Engine {
             }
             admission.map_err(Refusal::Invalid)?;
         }
-        if self.funded_mempool_conflict(&tx, &capacity.stale) {
-            return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
-        }
         if let PosTransaction::SlashingEvidence(evidence) = &tx {
             if validator_lifecycle::native_slashing_admission_active(epoch_of(self.wall_slot())) {
                 self.precheck_slashing_evidence(evidence, verification_source)?;
             }
         }
-        self.validate_lifecycle_admission(&tx)?;
+        self.validate_lifecycle_admission(&tx, verification_source)?;
+        // Plan capacity cleanup without mutating the pool. A forged incoming
+        // signature must never evict either stale or currently paying entries.
+        //
+        // Only now, after every budgeted authentication of the incoming
+        // transaction above: planning walks this source's pending entries (or
+        // the whole pool under global pressure), and it used to run first, so
+        // a transaction nobody had authenticated yet bought pool-proportional
+        // work and was answered `TooManyFromSource` before its own signature
+        // was ever looked at. The plan also reserves pending inputs: see
+        // `plan_mempool_capacity`.
+        let capacity = self.plan_mempool_capacity(&tx, key.len(), epoch_of(self.wall_slot()))?;
+        if self.funded_mempool_conflict(&tx, &capacity.stale) {
+            return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
+        }
         // Commit only after every incoming admission check succeeds. Removing
         // state-dependent failures under pressure is retention, never a bar.
         for stale in &capacity.stale {
@@ -4868,8 +6604,19 @@ impl Engine {
     /// it builds a block every other node rejects — so the epoch comes from
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
+        self.select_transactions_with(epoch, true)
+    }
+
+    /// [`Self::select_transactions`]; `l2_user_txs: false` leaves out L2
+    /// deposits, DA batches and withdrawal claims (the last selection of a
+    /// proposal whose re-selection allowance is spent, review W1-1).
+    fn select_transactions_with(&self, epoch: u64, l2_user_txs: bool) -> Vec<PosTransaction> {
         // A proof reserves the whole gas budget. Never pack it with transfers.
-        if let Some(tx) = self.mempool.values().find(|tx| matches!(tx, PosTransaction::L2SettlementAsync(_))) {
+        // Only one that still matches this head (review EXE-2): admission
+        // judged it against the head of that moment, and a pending settlement
+        // the head has moved past would be refused by the probe and leave the
+        // block without the transactions it displaced.
+        if let Some(tx) = self.mempool.values().find(|tx| self.pending_settlement_applies(tx)) {
             return vec![tx.clone()];
         }
         // Admission is a historical observation, not a reservation of inputs or
@@ -4879,9 +6626,24 @@ impl Engine {
         // again, making the exact same signed transaction eligible later.
         let mut funded_context = None;
         let candidates = self.mempool.iter().filter(|(encoded, tx)| {
-            self.candidate_is_backed(tx, encoded.len(), epoch, &mut funded_context)
+            // A settlement is proposed alone (above) or not at all.
+            !matches!(tx, PosTransaction::L2SettlementAsync(_))
+                && (l2_user_txs || !matches!(tx, PosTransaction::L2Deposit(_)
+                    | PosTransaction::L2DataAvailability(_) | PosTransaction::L2WithdrawClaim(_)))
+                && self.candidate_is_backed(tx, encoded, epoch, &mut funded_context)
         }).collect();
-        Self::pack_transactions(epoch, *self.state.head().as_bytes(), candidates)
+        Self::pack_transactions_on(epoch, *self.state.head().as_bytes(), candidates, self.state.l2_settlement())
+    }
+
+    /// Whether `tx` is an asynchronous L2 settlement that passes every
+    /// proof-free check of the transition against the current head (review
+    /// EXE-2). The proof itself was verified at admission and does not
+    /// change. Node-local; no consensus effect.
+    fn pending_settlement_applies(&self, tx: &PosTransaction) -> bool {
+        let PosTransaction::L2SettlementAsync(settlement) = tx else { return false };
+        self.state.l2_settlement().is_some_and(|l2| {
+            l2.pending_async_refusal(settlement, *self.state.head().as_bytes(), self.state.slot()).is_none()
+        })
     }
 
     /// Node relay policy (HF2 sigdet): the proposer never selects a spend
@@ -4895,6 +6657,8 @@ impl Engine {
     /// `true` for transactions that carry no spend witness. Node-local; no
     /// consensus effect.
     fn spend_witnesses_pass_relay_policy(&self, tx: &PosTransaction, epoch: u64) -> bool {
+        #[cfg(test)]
+        RELAY_POLICY_REVERIFICATIONS.with(|n| n.set(n.get() + 1));
         let domain = self.state.admission_network_domain();
         let Some(root) = tx.checked_signing_root_for_network(epoch, domain.as_ref()) else {
             return !matches!(
@@ -4921,15 +6685,27 @@ impl Engine {
 
     /// Immutable signatures were checked at admission. Re-evaluate only the
     /// parent/epoch-dependent backing shared by selection and capacity policy.
-    fn candidate_is_backed(&self, tx: &PosTransaction, encoded: usize, epoch: u64,
+    /// `key` is the entry's mempool key (its canonical bytes).
+    fn candidate_is_backed(&self, tx: &PosTransaction, key: &[u8], epoch: u64,
         funded_context: &mut Option<(Arc<CommittedState>, u128)>) -> bool {
-        if admission::check_transfer(&self.state, tx, encoded, epoch).is_err() { return false; }
+        if admission::check_transfer(&self.state, tx, key.len(), epoch).is_err() { return false; }
+        // A pending settlement the head has moved past backs nothing (EXE-2).
+        if matches!(tx, PosTransaction::L2SettlementAsync(_)) { return self.pending_settlement_applies(tx); }
         // NODE RELAY POLICY (HF2 sigdet): the proposer never selects a spend
         // whose witness fails the FIPS 204 reference verifier, even if it
         // reached the mempool by a path that skipped `admissible`. Not a
         // consensus rule — the transition still judges the block it builds
         // with the base verifier.
-        if !self.spend_witnesses_pass_relay_policy(tx, epoch) { return false; }
+        //
+        // ONLY for such an entry. One that came through admission had every
+        // spend witness judged there under this same policy (base AND
+        // reference), and a signature does not change afterwards: if a later
+        // epoch signs a different root, the base rule refuses the old witness
+        // and the policy has nothing to add. Repeating that cryptography here
+        // was unbudgeted work on the consensus thread, once per pending entry
+        // per capacity plan, which any arriving transaction could trigger.
+        if !self.mempool.admission_verified(key)
+            && !self.spend_witnesses_pass_relay_policy(tx, epoch) { return false; }
         // Proposer policy (incident 2026-10-19): never include evidence for an
         // offence that predates slashing, even if it reached the mempool by a
         // path that skipped `admissible`.
@@ -4948,10 +6724,22 @@ impl Engine {
         true
     }
 
+    #[cfg(test)]
     fn pack_transactions(
         epoch: u64,
         seed: [u8; 32],
+        ordered: Vec<(&Vec<u8>, &PosTransaction)>,
+    ) -> Vec<PosTransaction> {
+        Self::pack_transactions_on(epoch, seed, ordered, None)
+    }
+
+    /// `l2` is the head's L2 state, when it has one: claims are then also
+    /// packed against its release window and escrow.
+    fn pack_transactions_on(
+        epoch: u64,
+        seed: [u8; 32],
         mut ordered: Vec<(&Vec<u8>, &PosTransaction)>,
+        l2: Option<&bloch_pos_committee::l2_settlement::State>,
     ) -> Vec<PosTransaction> {
         let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
         let mut out = Vec::new();
@@ -4970,6 +6758,21 @@ impl Engine {
         let mut reserved = BTreeSet::new();
         // Consensus caps DA batches per block; the highest tips win the slots.
         let mut da_batches = 0usize;
+        // W1-1: what L2 transactions exclude each other on inside one block,
+        // reserved the way outpoints are. The preflight judges each entry
+        // alone against the head, so two that each pass it could be selected
+        // together and the transition refuses the second: a DA batch for the
+        // same `(L2 block, commitment)` (`Duplicate`), a claim of the same
+        // leaf (`Claimed`), or claims that together exceed the release window
+        // or the escrow (`RateLimited`, `Escrow`). The higher tip keeps the
+        // place; the other stays pending. The window and escrow are followed
+        // exactly as `release_withdrawal` moves them. A deposit earlier in
+        // the block can only raise what consensus allows, so this never
+        // selects together what the transition refuses.
+        let mut da_keys = BTreeSet::new();
+        let mut claimed = BTreeSet::new();
+        let mut release = l2.map(|l2| (l2, l2.release_window(), l2.escrow_sat()));
+        let exempt_after_earlier_claims = bloch_pos_committee::params::l2_release_exemption_active(epoch);
         // F-9: consensus admits at most RESCUE_COMMITS_MAX_PER_BLOCK
         // commitments; they rank after every tipped transaction and among
         // themselves by `rescue_commit_rank`.
@@ -5022,11 +6825,30 @@ impl Engine {
             if points.iter().any(|point| reserved.contains(point)) {
                 continue;
             }
-            if matches!(tx, PosTransaction::L2DataAvailability(_)) {
+            if let PosTransaction::L2DataAvailability(batch) = tx {
                 if da_batches >= bloch_pos_committee::l2_settlement::da::MAX_PER_BLOCK {
                     continue;
                 }
+                if !da_keys.insert((batch.l2_block_number, batch.commitment())) {
+                    continue;
+                }
                 da_batches += 1;
+            }
+            if let PosTransaction::L2WithdrawClaim(claim) = tx {
+                if claimed.contains(&claim.index) {
+                    continue;
+                }
+                if let Some((l2, window, escrow)) = release.as_mut() {
+                    let sats = u128::from(claim.sats);
+                    if *escrow < sats
+                        || !window.admits(claim.sats, l2.window_exempt(claim.attestation.is_some()), exempt_after_earlier_claims)
+                    {
+                        continue;
+                    }
+                    window.released = window.released.saturating_add(sats);
+                    *escrow -= sats; // checked just above
+                }
+                claimed.insert(claim.index);
             }
             if matches!(tx, PosTransaction::RescueCommit(_)) {
                 if rescue_commits >= bloch_pos_committee::params::RESCUE_COMMITS_MAX_PER_BLOCK {
@@ -5049,6 +6871,7 @@ impl Engine {
             proposer_sig: env.proposer_sig.clone(),
         };
         let before = self.state.finality();
+        let latch_before = self.finalized_latch;
         let txs = match body_transactions(env) {
             Ok(t) => t,
             Err(e) => {
@@ -5068,6 +6891,13 @@ impl Engine {
                 self.remember_state(*id.as_bytes(), snapshot);
                 self.canonical.insert(*id.as_bytes());
                 self.chain.push((env.header.slot, id));
+                // FC-1: the transition just verified every body attestation
+                // against this block's pre-state, so from here its votes may
+                // weigh on fork choice. Before the pool drop below, which
+                // relies on the body carrying what it removes, and before the
+                // finality ratchet, which may release bodies. A no-op on the
+                // replay path, where the block is stored after this returns.
+                self.blocks.mark_validated(id.as_bytes());
                 // RPC-only: retain the registry proof of a checkpoint block
                 // when this block opened a new epoch (once per epoch).
                 self.note_checkpoint_registry();
@@ -5077,13 +6907,14 @@ impl Engine {
                 // adopted state finalizes something new. Outside `if live` on
                 // purpose — boot replay must rebuild the latch too.
                 self.ratchet_finalized();
+                self.retain_reorg_anchors();
                 // Counted, because `advance` needs to tell this shrinkage
                 // apart from the `retain` four lines down. These attestations
                 // leave the loose pool and stay visible to fork choice, which
-                // observes every stored block's body as well as the pool, and
-                // `env` is one of the stored blocks. The `retain` below drops
-                // attestations nothing else carries — that one fork choice
-                // does see.
+                // observes every validated block's body as well as the pool,
+                // and `env` was marked validated above. The `retain` below
+                // drops attestations nothing else carries — that one fork
+                // choice does see.
                 for a in &env.body.attestations {
                     if self
                         .pool
@@ -5127,6 +6958,12 @@ impl Engine {
                         );
                         eprintln!("FATAL: block log append failed: {e}");
                         std::process::exit(1);
+                    }
+                    // PER-3: the log is durable through this block, so the
+                    // checkpoint it finalized (an ancestor) is on disk. Mirror
+                    // a raised latch now, so a restart cannot rebuild it lower.
+                    if self.finalized_latch != latch_before {
+                        self.persist_finalized_latch();
                     }
                     if self.chain.len().checked_sub(1)
                         .and_then(|height| height.checked_rem(local_cache::INTERVAL)) == Some(0)
@@ -5205,10 +7042,79 @@ impl Engine {
     /// Keep a canonical block's post-state for the reorg path. Oldest out
     /// first; see [`REORG_STATE_WINDOW`] for why the window is small.
     fn remember_state(&mut self, id: [u8; 32], state: Arc<CommittedState>) {
+        self.remember_kes_authority(id, &state);
         self.recent_states.push_back((id, state));
         while self.recent_states.len() > REORG_STATE_WINDOW {
             self.recent_states.pop_front();
         }
+    }
+
+    /// Keep a canonical block's KES authority; see [`KES_AUTHORITY_WINDOW`].
+    fn remember_kes_authority(&mut self, id: [u8; 32], state: &CommittedState) {
+        if self.kes_authorities.iter().any(|(seen, ..)| *seen == id) {
+            return;
+        }
+        let entries = match self.kes_authorities.back() {
+            Some((.., last)) if **last == *state.kes_roots() => Arc::clone(last),
+            _ => Arc::new(state.kes_roots().clone()),
+        };
+        self.kes_authorities
+            .push_back((id, epoch_of(state.slot()), state.kes_enforced_from(), entries));
+        while self.kes_authorities.len() > KES_AUTHORITY_WINDOW {
+            self.kes_authorities.pop_front();
+        }
+    }
+
+    /// May a failed consensus-signature check of `validator` for `epoch`,
+    /// judged against `keys` (this node's head or its forward projection), be
+    /// charged to the relaying peer as a forgery?
+    ///
+    /// Before the KES gate: yes, as always. From it on the key in force is
+    /// registered by transactions, so a head that predates the bind or the
+    /// validator's registration judges an honest leaf signature against the
+    /// static key and fails it (FC-4). Only a verdict fixed by this node's
+    /// FINALIZED state is the same on every branch it can still adopt:
+    /// `bloch_pos_committee::kes::failure_is_attributable`.
+    fn signature_failure_is_provable(&self, keys: &dyn KeyLookup, validator: u32, epoch: u64) -> bool {
+        let finalized_root = self.state.finality().finalized.root;
+        let finalized = self
+            .kes_authorities
+            .iter()
+            .rev()
+            .find(|(id, ..)| *id == finalized_root)
+            .map(|(_, epoch, enforced_from, entries)| bloch_pos_committee::kes::FinalizedAuthority {
+                epoch: *epoch,
+                enforced_from: *enforced_from,
+                entries,
+            });
+        bloch_pos_committee::kes::failure_is_attributable(keys, finalized.as_ref(), validator, epoch)
+    }
+
+    /// May a `NotInCommittee` or `BadSignature` verdict on an attestation of
+    /// `epoch` naming `target_root` be charged to the relaying peer?
+    ///
+    /// Both verdicts are read off `rolled_to(epoch)` of this node's head. If
+    /// that head is behind the attestation (a projection, not the state of
+    /// the attestation's own epoch), on another branch than its target, or
+    /// the node is still replaying or syncing, the roster and the keys may
+    /// simply be stale, and a stale view proves nothing about the peer
+    /// (FC-4, P2P-9). A bad signature must also be one no branch would
+    /// accept ([`Self::signature_failure_is_provable`]).
+    fn attestation_fault_is_provable(
+        &self,
+        reason: bloch_pos_committee::attestation::RejectReason,
+        keys: &dyn KeyLookup,
+        validator: u32,
+        epoch: u64,
+        target_root: &[u8; 32],
+    ) -> bool {
+        use bloch_pos_committee::attestation::RejectReason;
+        self.live
+            && !self.needs_sync
+            && epoch_of(self.state.slot()) >= epoch
+            && self.canonical.contains(target_root)
+            && (reason != RejectReason::BadSignature
+                || self.signature_failure_is_provable(keys, validator, epoch))
     }
 
     /// The committed post-state of a canonical block: from the snapshot ring
@@ -5225,16 +7131,64 @@ impl Engine {
         if let Some((_, st)) = self.recent_states.iter().find(|(bid, _)| *bid == id) {
             return Arc::clone(st);
         }
-        Arc::new(self.replay_to(id))
+        // Deeper than the ring: start from the nearest retained anchor at or
+        // below the block, and from genesis only when none covers it.
+        let base = self
+            .chain
+            .iter()
+            .position(|(_, cid)| cid.as_bytes() == &id)
+            .and_then(|cut| self.reorg_anchor_at_or_below(cut));
+        match base {
+            Some((_, bid, st)) if bid == id => st,
+            base => Arc::new(self.replay_from(base, id)),
+        }
+    }
+
+    /// Maintain [`Engine::reorg_anchors`] after a canonical adoption (apply
+    /// or reorg), once the finality latch has been ratcheted. O(1).
+    fn retain_reorg_anchors(&mut self) {
+        let on_chain = |a: &ReorgAnchor| {
+            self.chain.get(a.0).is_some_and(|(_, cid)| cid.as_bytes() == &a.1)
+        };
+        let mut base = self.reorg_anchors.base.take().filter(on_chain);
+        let mut pending = self.reorg_anchors.pending.take().filter(on_chain);
+        // cannot underflow: the chain always holds genesis.
+        let head = self.chain.len().saturating_sub(1);
+        let floor = self.finalized_latch.map(|(h, _)| h);
+        if pending.as_ref().is_some_and(|p| floor.is_some_and(|f| p.0 as u64 <= f)) {
+            base = pending.take();
+        }
+        let stale = pending
+            .as_ref()
+            .is_none_or(|p| head.saturating_sub(p.0) >= REORG_ANCHOR_REFRESH_BLOCKS);
+        if stale && head > 0 {
+            // Free when taken: the live state, kept by handle.
+            pending = Some((head, *self.head_id().as_bytes(), self.state.arc()));
+        }
+        self.reorg_anchors.base = base;
+        self.reorg_anchors.pending = pending;
+    }
+
+    /// The highest retained anchor at canonical height `cut` or below that is
+    /// still on the canonical chain.
+    fn reorg_anchor_at_or_below(&self, cut: usize) -> Option<ReorgAnchor> {
+        [&self.reorg_anchors.pending, &self.reorg_anchors.base]
+            .into_iter()
+            .flatten()
+            .filter(|a| a.0 <= cut)
+            .filter(|a| self.chain.get(a.0).is_some_and(|(_, cid)| cid.as_bytes() == &a.1))
+            .max_by_key(|a| a.0)
+            .cloned()
     }
 
     /// Rebuild a canonical block's post-state from genesis, re-executing the
     /// whole prefix through the same transition.
     ///
     /// This is what `do_reorg` used to do unconditionally, kept whole. It is
-    /// now the fallback for a reorg deeper than [`REORG_STATE_WINDOW`], and
-    /// it is also the reference the snapshot path is tested against — the
-    /// slow path staying correct is what lets the fast path be small.
+    /// now the last fallback for a reorg deeper than [`REORG_STATE_WINDOW`]
+    /// that no [`ReorgAnchors`] entry covers, and it is also the reference
+    /// the snapshot paths are tested against — the slow path staying correct
+    /// is what lets the fast path be small.
     // The four `expect`s below each name a canonical-chain invariant — the
     // target is canonical, canonical blocks are stored (`prune` skips them),
     // their bodies decoded and applied when they were adopted — and there is
@@ -5242,12 +7196,26 @@ impl Engine {
     // They stay COUNTED by the hardened ratchet on purpose: a panic site with
     // a hand proof is exactly what the ratchet exists to keep in view.
     fn replay_to(&self, id: [u8; 32]) -> CommittedState {
+        self.replay_from(None, id)
+    }
+
+    /// [`Engine::replay_to`]'s fold, started from `base` (a canonical block's
+    /// retained post-state at or below the target) instead of from genesis
+    /// when one is given. The same blocks go through the same transition in
+    /// the same order above the base, and the base is the fold's own value at
+    /// that block, so the result is the genesis replay's.
+    fn replay_from(&self, base: Option<ReorgAnchor>, id: [u8; 32]) -> CommittedState {
         let cut = self
             .chain
             .iter()
             .position(|(_, cid)| cid.as_bytes() == &id)
             .expect("replay target is canonical");
-        let mut st = self.manifest.genesis_state();
+        let (start, base) = match base.filter(|a| a.0 <= cut) {
+            Some((height, _, st)) => (height, st),
+            None => (0, Arc::new(self.manifest.genesis_state())),
+        };
+        // `None` until the first block above the base has been applied.
+        let mut st: Option<CommittedState> = None;
         let apply = |st: &CommittedState, env: &BlockEnvelope| {
             let envelope = ProposalEnvelope {
                 header: env.header.clone(),
@@ -5265,7 +7233,7 @@ impl Engine {
         // work proportional to retained history without changing the fold.
         // Released (finalized) bodies are streamed back from the block log a
         // page at a time instead.
-        let mut i = 1;
+        let mut i = start + 1;
         while i <= cut {
             let id = *self.chain[i].1.as_bytes();
             if self.blocks.is_hollow(&id) {
@@ -5273,16 +7241,18 @@ impl Engine {
                 while end <= cut && self.blocks.is_hollow(self.chain[end].1.as_bytes()) {
                     end += 1;
                 }
-                self.read_logged_canonical(i, end, |env| st = apply(&st, &env))
-                    .expect("released canonical bodies are readable from the block log");
+                self.read_logged_canonical(i, end, |env| {
+                    st = Some(apply(st.as_ref().unwrap_or(&base), &env))
+                })
+                .expect("released canonical bodies are readable from the block log");
                 i = end;
             } else {
                 let env = self.blocks.get(&id).expect("canonical block stored");
-                st = apply(&st, env);
+                st = Some(apply(st.as_ref().unwrap_or(&base), env));
                 i += 1;
             }
         }
-        st
+        st.unwrap_or_else(|| Arc::unwrap_or_clone(base))
     }
 
     // ── The finality latch (finding F-03) ───────────────────────────────────
@@ -5480,11 +7450,15 @@ impl Engine {
             self.parked_refused_finality.push_back(id);
             parked_ids.insert(id);
         }
-        // Entries may have arrived before the parent was refused. Remove the
-        // entire bounded pending subtree, including reverse arrival order.
-        // Retain unrelated gaps; they still need normal synchronization.
-        let mut refused: BTreeSet<[u8; 32]> = branch.iter()
-            .map(|env| *env.block_id().as_bytes()).collect();
+        self.drop_orphan_descendants(branch.iter().map(|env| *env.block_id().as_bytes()).collect());
+    }
+
+    /// Drop every parked orphan that descends from one of `refused`.
+    ///
+    /// Entries may have arrived before the parent was refused. Remove the
+    /// entire bounded pending subtree, including reverse arrival order.
+    /// Retain unrelated gaps; they still need normal synchronization.
+    fn drop_orphan_descendants(&mut self, mut refused: BTreeSet<[u8; 32]>) {
         let mut pending: VecDeque<[u8; 32]> = refused.iter().copied().collect();
         let mut children: BTreeMap<[u8; 32], Vec<[u8; 32]>> = BTreeMap::new();
         for (id, env, _, _, _) in &self.orphans {
@@ -5549,6 +7523,9 @@ impl Engine {
             self.refuse_finality_rewind(latch, &branch);
             return false;
         }
+        // Not refused although the cut is below the latch: the operator's
+        // rewind override admitted it (review W2-1, used at the adoption).
+        let rewinds_latch = self.finalized_latch.is_some_and(|(floor, _)| (cut as u64) < floor);
 
         // Only under the operator's rewind override can the cut fall below
         // released bodies; those blocks are about to leave the canonical
@@ -5563,7 +7540,12 @@ impl Engine {
                 return false;
             }
             for env in restored {
-                self.blocks.insert(*env.block_id().as_bytes(), env);
+                let id = *env.block_id().as_bytes();
+                self.blocks.insert(id, env);
+                // Finalized canonical history: validated when it was applied.
+                // Re-inserting the full envelope dropped its vote index, so
+                // rebuild it from the restored body, as insertion used to.
+                self.blocks.mark_validated(&id);
             }
         }
 
@@ -5604,9 +7586,22 @@ impl Engine {
                         env.header.slot
                     ));
                     self.blocks.remove(env.block_id().as_bytes());
+                    // The blocks before the offender each passed the full
+                    // transition from the fork point. Their attestations are
+                    // verified, so their votes count from now on (FC-1) even
+                    // though this reorg is refused.
+                    for (id, _) in &applied {
+                        self.blocks.mark_validated(id);
+                    }
                     return false;
                 }
             }
+        }
+        // FC-1: every block of the branch passed the transition, so its body
+        // votes weigh on fork choice from here, exactly as the canonical
+        // blocks they are about to become.
+        for (id, _) in &applied {
+            self.blocks.mark_validated(id);
         }
         // R4 F-11: the OLD canonical tail is about to leave canonical
         // history (below). Any transaction it included that is NOT
@@ -5662,7 +7657,21 @@ impl Engine {
         // FURTHER than the old branch did — ratchet up if so. It may equally
         // report LESS (a fork-point state always does); the ratchet ignores
         // that, which is what keeps the latch monotone across reorgs.
+        if rewinds_latch {
+            // Review W2-1: the override rewound below the latch, so the
+            // latch block left the canonical chain. Keeping it would leave
+            // `finality_latch.bin` naming the abandoned block (the next
+            // start without the override is then refused) and would release
+            // bodies of the adopted branch as if they were finalized. The
+            // fork point is the highest block of the old finalized prefix
+            // that is still canonical: the latch falls back to it, the
+            // ratchet below raises it to whatever the adopted state
+            // finalizes, and the stored record follows once the rewrite is
+            // published (`replace_rewound_stored_latch`).
+            self.finalized_latch = (cut > 0).then_some((cut as u64, ancestor));
+        }
         self.ratchet_finalized();
+        self.retain_reorg_anchors();
         let cur_e = epoch_of(self.state.slot());
         self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
         self.revalidate_lifecycle_mempool();
@@ -5709,6 +7718,429 @@ impl Engine {
         true
     }
 
+    // ── Side-branch validation (finding V1-1) ───────────────────────────────
+
+    /// One block through the real transition on `pre`: the same call, with
+    /// the same signature-checking verifier, that `apply_canonical` and
+    /// `do_reorg` make. Nothing is adopted.
+    fn transition_on(&self, pre: &CommittedState, env: &BlockEnvelope) -> Result<CommittedState, String> {
+        let envelope = ProposalEnvelope {
+            header: env.header.clone(),
+            proposer_sig: env.proposer_sig.clone(),
+        };
+        let txs = body_transactions(env).map_err(|e| e.to_string())?;
+        self.tr
+            .apply_block(pre, &envelope, &env.body.attestations, &txs)
+            .map_err(|e| format!("{e:?}"))
+    }
+
+    /// The stored side branch to validate next: the canonical height it
+    /// forks at and its blocks, fork-point child first. `None` when every
+    /// stored block within reach has already passed the transition.
+    ///
+    /// **Which blocks.** Only blocks in `self.blocks`: admission stores a
+    /// block after its proposer signature verified and its parent is known,
+    /// so nothing unauthenticated or unconnected (the orphan and
+    /// future-block pools) is ever a candidate. Only branches fork choice
+    /// could select and a reorg could adopt: the fork point is at or above
+    /// both the finality latch and the justified checkpoint the fork-choice
+    /// walk starts from. Never below the latch. Blocks deeper than
+    /// [`SIDE_BRANCH_MAX_DEPTH`] above the fork point are not looked at.
+    ///
+    /// **Which branch first.** The tip whose path from the fork point was
+    /// signed by the most DISTINCT proposers, then the longer path, then the
+    /// lower tip id. Admission bounds how many variants one key can store
+    /// per slot, not how many slots it signs, so length alone is cheap for a
+    /// single key; a path many validators built is not. A branch the rest of
+    /// the network is on outranks anything a few keys can assemble.
+    ///
+    /// Cost: one walk of the stored non-canonical blocks above the floor,
+    /// which is what every fork-choice run already walks.
+    fn side_branch_candidate(&self) -> Option<(usize, Vec<[u8; 32]>)> {
+        let height = |root: &[u8; 32]| {
+            self.height_of(root).map_or(0, |h| usize::try_from(h).unwrap_or(usize::MAX))
+        };
+        let latch = self.finalized_latch.map_or(0, |(h, _)| usize::try_from(h).unwrap_or(usize::MAX));
+        let floor = latch.max(height(&self.state.finality().justified.root));
+        // W2-5: a block that already failed the transition here is not
+        // judged again, and nothing above it is reachable.
+        let failed = &self.reorg_anchors.side.failed_index;
+        type Rank = (usize, usize, std::cmp::Reverse<[u8; 32]>);
+        let mut best: Option<(Rank, usize, Vec<[u8; 32]>)> = None;
+        for (fork_height, (_, fork)) in self.chain.iter().enumerate().skip(floor) {
+            for child in self.blocks.children_of(fork.as_bytes()) {
+                if self.canonical.contains(child) || failed.contains(child) {
+                    continue;
+                }
+                // Depth-first below `child`. `path` is the branch from the
+                // fork point to the block being visited; `proposers` counts
+                // its signers and `unvalidated` its blocks still to judge.
+                let mut path: Vec<[u8; 32]> = Vec::new();
+                let mut proposers: HashMap<u32, usize> = HashMap::new();
+                let mut unvalidated = 0usize;
+                let mut stack: Vec<([u8; 32], usize)> = Vec::new();
+                let mut enter = Some(*child);
+                loop {
+                    if let Some(id) = enter.take() {
+                        if let Some(env) = self.blocks.get(&id) {
+                            let seen = proposers.entry(env.header.proposer_index).or_insert(0);
+                            *seen = seen.saturating_add(1);
+                        }
+                        if !self.blocks.is_validated(&id) {
+                            unvalidated = unvalidated.saturating_add(1);
+                        }
+                        path.push(id);
+                        stack.push((id, 0));
+                    }
+                    let Some(&(id, next)) = stack.last() else { break };
+                    let kids = self.blocks.children_of(&id);
+                    let within_depth = path.len() < SIDE_BRANCH_MAX_DEPTH;
+                    if let (true, Some(kid)) = (within_depth, kids.get(next)) {
+                        if let Some(top) = stack.last_mut() {
+                            top.1 = next.saturating_add(1);
+                        }
+                        if !failed.contains(kid) {
+                            enter = Some(*kid);
+                        }
+                        continue;
+                    }
+                    // Leaving `id`. It ends a branch when it has no stored
+                    // child (one that failed before counts as none), or when
+                    // the depth limit stops the walk here.
+                    if (kids.iter().all(|kid| failed.contains(kid)) || !within_depth) && unvalidated > 0 {
+                        let rank: Rank = (proposers.len(), path.len(), std::cmp::Reverse(id));
+                        if best.as_ref().is_none_or(|(held, ..)| rank > *held) {
+                            best = Some((rank, fork_height, path.clone()));
+                        }
+                    }
+                    stack.pop();
+                    path.pop();
+                    if let Some(env) = self.blocks.get(&id) {
+                        if let Some(seen) = proposers.get_mut(&env.header.proposer_index) {
+                            *seen = seen.saturating_sub(1);
+                            if *seen == 0 {
+                                proposers.remove(&env.header.proposer_index);
+                            }
+                        }
+                    }
+                    if !self.blocks.is_validated(&id) {
+                        unvalidated = unvalidated.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        best.map(|(_, fork_height, path)| (fork_height, path))
+    }
+
+    /// Validate a bounded slice of a stored side branch WITHOUT adopting it
+    /// (finding V1-1). Returns whether a block was newly validated.
+    ///
+    /// **Why.** Since FC-1 a stored block's body votes count only once the
+    /// block passed the transition, and a block is applied only if fork
+    /// choice selects its branch. A branch whose validator set differs from
+    /// this node's (a deposit activated, a validator slashed or exited on
+    /// one side only) cannot gain weight any other way either: its gossip
+    /// votes are judged against this node's roster, come out
+    /// `NotInCommittee` and are never pooled. Such a node stayed on its
+    /// branch until it was resynchronised by hand. Here the branch is run
+    /// through the transition from its fork point, so its body votes become
+    /// eligible, and `advance` then reorganises if it is the heavier one.
+    ///
+    /// **FC-1 is unchanged.** A block is marked validated only after
+    /// [`Engine::transition_on`] returned `Ok` for it on its own parent's
+    /// post-state, and that state is the fork point's canonical state (the
+    /// ring, a [`ReorgAnchors`] entry, or a replay of canonical blocks from
+    /// one) folded through the branch block by block. That is the fold
+    /// `do_reorg` runs, with the same verifier. A block that fails is
+    /// removed, exactly as a reorg removes it, and nothing above it is
+    /// reached. No vote of a block that has not passed the full transition
+    /// is ever indexed.
+    ///
+    /// **Bounds.** Nothing a peer sends can make this exceed them:
+    ///
+    /// - at most [`SIDE_BRANCH_BLOCKS_PER_TURN`] block applications per call
+    ///   and [`SIDE_BRANCH_BLOCKS_PER_SLOT`] per wall slot, canonical blocks
+    ///   replayed to reach the fork point included, and no new block once a
+    ///   slot has spent `slot_ms / SIDE_BRANCH_SLOT_SHARE` here;
+    /// - one branch per call, chosen by [`Engine::side_branch_candidate`],
+    ///   and at most [`SIDE_BRANCH_STARTS_PER_SLOT`] changes of branch per
+    ///   wall slot;
+    /// - one retained state, the cursor, which is what makes the budget
+    ///   resumable: a long branch, or a fork point far above the nearest
+    ///   anchor, is worked through over several slots instead of in one
+    ///   stall. No per-block states are kept;
+    /// - fork points at or above the finality latch only, and at most
+    ///   [`SIDE_BRANCH_MAX_DEPTH`] blocks above the fork point.
+    ///
+    /// Node-local: it changes which stored blocks this node has judged, and
+    /// through that which branch it follows. No block it refuses is one the
+    /// consensus rules accept, because the refusal IS the transition's.
+    fn validate_side_branch_turn(&mut self, wall_slot: u64) -> bool {
+        {
+            // Pruned or removed, or adopted (the ring holds canonical
+            // post-states): the retained side states of such blocks go.
+            let (blocks, canonical) = (&self.blocks, &self.canonical);
+            self.reorg_anchors
+                .side
+                .tips
+                .retain(|(id, _)| blocks.contains_key(id) && !canonical.contains(id));
+        }
+        if !self.live {
+            return false;
+        }
+        // Nothing but the canonical chain is stored (genesis is not): the
+        // common case, decided without a walk.
+        if self.blocks.len() < self.chain.len() {
+            self.reorg_anchors.side.cursor = None;
+            return false;
+        }
+        let key = (self.blocks.revision(), *self.head_id().as_bytes());
+        let slot_share_ms = self.manifest.slot_ms / SIDE_BRANCH_SLOT_SHARE;
+        {
+            let side = &mut self.reorg_anchors.side;
+            if side.slot != wall_slot {
+                side.slot = wall_slot;
+                side.spent = 0;
+                side.spent_ms = 0;
+                side.starts = 0;
+                side.closed = false;
+            }
+            if side.idle == Some(key)
+                || side.closed
+                || side.spent >= SIDE_BRANCH_BLOCKS_PER_SLOT
+                || (side.spent > 0 && side.spent_ms >= slot_share_ms)
+            {
+                return false;
+            }
+        }
+        let Some((fork_height, path)) = self.side_branch_candidate() else {
+            let side = &mut self.reorg_anchors.side;
+            side.idle = Some(key);
+            side.cursor = None;
+            return false;
+        };
+
+        // Where the fold starts. Best: where the last one stopped, on this
+        // branch. Otherwise the highest canonical state held at or below the
+        // fork point (the ring, an anchor, or the cursor left on the
+        // canonical chain by an unfinished replay), and genesis when there
+        // is none, as for a reorg.
+        let cursor = self.reorg_anchors.side.cursor.clone();
+        // (The cursor is taken on the branch only when everything up to it
+        // is still marked validated; otherwise the fold starts below and
+        // judges those blocks again.)
+        let on_path = cursor.as_ref().and_then(|(id, st)| {
+            let at = path.iter().rposition(|p| p == id)?;
+            path.iter()
+                .take(at.saturating_add(1))
+                .all(|p| self.blocks.is_validated(p))
+                .then(|| (at, Arc::clone(st)))
+        });
+        let mut start: Option<(usize, Arc<CommittedState>, bool)> = None;
+        if on_path.is_none() {
+            let mut offer = |height: Option<u64>, st: &Arc<CommittedState>, is_cursor: bool| {
+                let Some(height) = height.and_then(|h| usize::try_from(h).ok()) else { return };
+                if height <= fork_height && start.as_ref().is_none_or(|(held, ..)| height > *held) {
+                    start = Some((height, Arc::clone(st), is_cursor));
+                }
+            };
+            for (id, st) in &self.recent_states {
+                offer(self.height_of(id), st, false);
+            }
+            if let Some((height, _, st)) = self.reorg_anchor_at_or_below(fork_height) {
+                offer(Some(height as u64), &st, false);
+            }
+            if let Some((id, st)) = &cursor {
+                offer(self.height_of(id), st, true);
+            }
+        }
+        let resumed = on_path.is_some() || start.as_ref().is_some_and(|(.., is_cursor)| *is_cursor);
+        if !resumed {
+            let side = &mut self.reorg_anchors.side;
+            if side.starts >= SIDE_BRANCH_STARTS_PER_SLOT {
+                // No further branch this slot: the remaining turns return
+                // before the walk above instead of repeating it.
+                side.closed = true;
+                return false;
+            }
+            side.starts = side.starts.saturating_add(1);
+        }
+        // `next_height` is the next canonical height to replay (none once it
+        // is past the fork point), `next_side` the next block of `path`.
+        let (mut state, mut next_height, mut next_side) = match (on_path, start) {
+            (Some((at, st)), _) => (st, fork_height.saturating_add(1), at.saturating_add(1)),
+            (None, Some((height, st, _))) => (st, height.saturating_add(1), 0),
+            (None, None) => (Arc::new(self.manifest.genesis_state()), 1, 0),
+        };
+
+        let budget = SIDE_BRANCH_BLOCKS_PER_TURN
+            .min(SIDE_BRANCH_BLOCKS_PER_SLOT.saturating_sub(self.reorg_anchors.side.spent));
+        let started = std::time::Instant::now();
+        let mut done = 0usize;
+        let mut stopped_at: Option<[u8; 32]> = None;
+        let mut newly_validated = false;
+        // A canonical block that would not replay: a local fault. Nothing is
+        // retried until the store or the head changes.
+        let mut stuck = false;
+        while done < budget {
+            if next_height <= fork_height {
+                // A canonical block on the way to the fork point. It applied
+                // before, so a failure here is a local fault (a released body
+                // the log no longer serves); give the turn up, adopt nothing.
+                let Some(id) = self.chain.get(next_height).map(|(_, id)| *id.as_bytes()) else { break };
+                let replayed = if self.blocks.is_hollow(&id) {
+                    let mut post = None;
+                    self.read_logged_canonical(next_height, next_height.saturating_add(1), |env| {
+                        post = Some(self.transition_on(&state, &env));
+                    })
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| post.unwrap_or_else(|| Err("block log returned no block".into())))
+                } else {
+                    match self.blocks.get(&id) {
+                        Some(env) => self.transition_on(&state, env),
+                        None => Err("canonical block is not stored".into()),
+                    }
+                };
+                done = done.saturating_add(1);
+                match replayed {
+                    Ok(post) => {
+                        state = Arc::new(post);
+                        stopped_at = Some(id);
+                        next_height = next_height.saturating_add(1);
+                    }
+                    Err(why) => {
+                        eprintln!(
+                            "side-branch validation: canonical block {} at height {next_height} did not replay: {why}",
+                            crate::codec::hex8(&id),
+                        );
+                        stuck = true;
+                        break;
+                    }
+                }
+            } else if let Some(id) = path.get(next_side).copied() {
+                let verdict = match self.blocks.get(&id) {
+                    Some(env) => self.transition_on(&state, env),
+                    None => break,
+                };
+                done = done.saturating_add(1);
+                match verdict {
+                    Ok(post) => {
+                        // The whole of FC-1's obligation: this block passed
+                        // the full transition on its own parent's post-state.
+                        newly_validated |= !self.blocks.is_validated(&id);
+                        self.blocks.mark_validated(&id);
+                        state = Arc::new(post);
+                        self.rejudge_parked_on(id, &state);
+                        stopped_at = Some(id);
+                        next_side = next_side.saturating_add(1);
+                    }
+                    Err(why) => {
+                        crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
+                            "side-branch candidate {} invalid: {why}",
+                            crate::codec::hex8(&id),
+                        ));
+                        self.blocks.remove(&id);
+                        self.reorg_anchors.side.remember_failed(id);
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        // The side-branch block this turn stopped on keeps its state beside
+        // the cursor (RC3-01): a block offered on it after the cursor has
+        // moved on or been dropped is still judged on its parent's own state.
+        if let Some(id) = stopped_at.filter(|id| !self.canonical.contains(id) && self.blocks.is_validated(id)) {
+            self.retain_side_state(id, &state);
+        }
+        let side = &mut self.reorg_anchors.side;
+        if stuck {
+            side.idle = Some(key);
+        }
+        side.spent = side.spent.saturating_add(done);
+        side.spent_ms = side
+            .spent_ms
+            .saturating_add(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        if let Some(id) = stopped_at {
+            side.cursor = Some((id, state));
+        }
+        if newly_validated {
+            // The branch's body votes count from here. Let fork choice see
+            // them; if the branch is the heavier one this is the reorg.
+            self.advance();
+            self.prune_below_finalized();
+        }
+        newly_validated
+    }
+
+    /// The side-branch fold just validated `validated`, whose post-state is
+    /// `post` (review RC2-03). Blocks parked for their proposer's authority
+    /// whose parent, or parent's parent, is `validated` were judged on
+    /// `fallback` (the door held no exact state for their parent) and only a
+    /// head change re-judges them (`authority_parked_due`), which a stalled
+    /// network never produces. Queue them for the door again, as a head
+    /// change would, and keep `post` where the door looks for an exact
+    /// parent state ([`Self::retain_side_state`]). At most [`SIDE_PARKED_REJUDGE_PER_BLOCK`] per validated
+    /// block; each one re-runs the whole door under its own allowances (the
+    /// verification lane, the per-source failure quota, the long and short
+    /// roll allowances). Integer comparisons only when nothing is parked.
+    fn rejudge_parked_on(&mut self, validated: [u8; 32], post: &Arc<CommittedState>) {
+        if self.authority_parked.judged.is_empty() {
+            return;
+        }
+        let blocks = &self.blocks;
+        let waits = |env: &BlockEnvelope| {
+            env.header.parent == validated
+                || blocks.get(&env.header.parent).is_some_and(|parent| parent.header.parent == validated)
+        };
+        let mut moved = 0usize;
+        let mut i = 0;
+        while i < self.orphans.len() && moved < SIDE_PARKED_REJUDGE_PER_BLOCK {
+            let (id, env, ..) = &self.orphans[i];
+            if self.authority_parked.judged.contains_key(id) && waits(env) {
+                let Some(parked) = self.orphans.remove(i) else { break };
+                self.orphans_admitted = self.orphans_admitted.saturating_add(1);
+                self.deferred_orphans.push_back(parked);
+                moved = moved.saturating_add(1);
+            } else {
+                i = i.saturating_add(1);
+            }
+        }
+        let waited_on = moved > 0
+            || self.deferred_orphans.iter().any(|(_, env, ..)| env.header.parent == validated);
+        if waited_on {
+            self.retain_side_state(validated, post);
+        }
+    }
+
+    /// Keep `post`, the exact post-state of the validated side-branch block
+    /// `id`, in [`SideValidation::tips`] (reviews RC3-01, RC3-02). A repeat
+    /// moves the entry to the newest place. When the ring is full the oldest
+    /// entry that no block queued for the door waits on leaves; if every
+    /// entry is waited on, `post` is not kept (the waiting blocks are judged
+    /// within a few turns, one promotion per turn).
+    fn retain_side_state(&mut self, id: [u8; 32], post: &Arc<CommittedState>) {
+        let blocks = &self.blocks;
+        let deferred = &self.deferred_orphans;
+        let waited_on = |of: &[u8; 32]| {
+            deferred.iter().any(|(_, env, ..)| {
+                env.header.parent == *of
+                    || blocks.get(&env.header.parent).is_some_and(|parent| parent.header.parent == *of)
+            })
+        };
+        let tips = &mut self.reorg_anchors.side.tips;
+        if let Some(at) = tips.iter().position(|(held, _)| *held == id) {
+            tips.remove(at);
+        } else if tips.len() >= SIDE_TIP_STATES {
+            let Some(evict) = tips.iter().position(|(held, _)| !waited_on(held)) else {
+                return;
+            };
+            tips.remove(evict);
+        }
+        tips.push_back((id, Arc::clone(post)));
+    }
+
     // ── Attestation admission, through the pure crate's gossip policy ───────
 
     /// Run one arriving attestation through
@@ -5723,6 +8155,16 @@ impl Engine {
     /// (an attestation arriving milliseconds before the block it votes for) is
     /// precisely the one a naive implementation calls invalid.
     fn on_attestation(&mut self, att: Attestation, origin: Origin, wall_epoch: u64) {
+        // Operator-rejected roots (`--reject-block-root`): a vote whose head
+        // or target is a rejected block never reaches the fork-choice pool,
+        // and is not held waiting for a block this node will never store.
+        // Node-local and `Ignore`: the vote is not invalid.
+        if self.rejected_roots.contains(&att.data.head)
+            || self.rejected_roots.contains(&att.data.target_root)
+        {
+            self.net.report(&origin, Verdict::Ignore);
+            return;
+        }
         let e = epoch_of(att.data.slot);
         // Narrower than `gossip.rs`'s own two-epoch window, and for a reason
         // that belongs to the node, not the policy: committee membership must
@@ -5734,6 +8176,18 @@ impl Engine {
         // full 64-slot window) needs per-epoch seed/roster history, which is
         // storage work, not policy work.
         if e != wall_epoch && e != wall_epoch.saturating_add(1) {
+            self.net.report(&origin, Verdict::Ignore);
+            return;
+        }
+        // VAL-1: an honest attester always targets the epoch of its own slot
+        // (`attest_for`). Below the gated step-8 binding the transition takes
+        // the signing authority of an included vote from the signer-chosen
+        // target, while this door verifies under the slot's epoch, so a vote
+        // whose target differs can pass here and invalidate every block that
+        // carries it. It is not pooled and not relayed. `Ignore`, never
+        // `Reject`: the consensus rules still accept such a vote in a block
+        // while the gate is inert, so relaying it proves nothing about a peer.
+        if att.data.target_epoch != e {
             self.net.report(&origin, Verdict::Ignore);
             return;
         }
@@ -5779,6 +8233,43 @@ impl Engine {
         self.judge_admission(pool, AttestationAdmission::Pending(pending), epoch)
     }
 
+    /// May an arriving attestation of `epoch` make this node roll its head
+    /// forward to that epoch (review round 2, GATE-04)?
+    ///
+    /// `rolled_to` is the first work `judge_admission` does, ahead of every
+    /// check on the frame, and its cost is one `process_epoch` per epoch
+    /// between the head and the vote. The memo is per head, so a node that
+    /// is catching up (every applied block is a new head) paid that whole
+    /// distance again after each block, for votes it cannot use: its roster
+    /// is a projection of a head far behind them.
+    ///
+    /// Node-local, and it only ever turns work into `Ignore` (never a
+    /// penalty, never a block verdict):
+    ///
+    /// 1. A head more than `MAX_EPOCH_ADVANCE` epochs behind the vote cannot
+    ///    be extended into the vote's epoch by any valid block.
+    /// 2. A roll of at most [`ATTESTATION_FREE_ROLL_EPOCHS`] uncached epochs
+    ///    is the ordinary case (a synced node around an epoch boundary) and
+    ///    is always allowed; so is any roll this head already memoized.
+    /// 3. A longer roll needs a target this node holds: a vote whose target
+    ///    is unknown would only be parked, and a head that far behind does
+    ///    not reach the target while the vote is still in the window.
+    /// 4. A longer roll for a known target is what a genuinely stalled
+    ///    network needs (the head does not move, so it is rolled once and
+    ///    then served from the memo). It is allowed once per wall slot, which
+    ///    bounds what crafted frames naming an old known block can cost a
+    ///    syncing node: one long roll per slot instead of one per block.
+    fn attestation_roll_admitted(&self, epoch: u64, target_root: &[u8; 32]) -> bool {
+        if epoch.saturating_sub(epoch_of(self.state.slot())) > MAX_EPOCH_ADVANCE {
+            return false;
+        }
+        if self.state.roll_distance(epoch) <= ATTESTATION_FREE_ROLL_EPOCHS {
+            return true;
+        }
+        (self.canonical.contains(target_root) || self.blocks.contains_key(target_root))
+            && self.state.try_spend_long_roll(self.wall_slot)
+    }
+
     fn judge_admission(
         &self,
         pool: &mut AttestationPool,
@@ -5788,6 +8279,11 @@ impl Engine {
         // A forward projection cannot reconstruct a historical roster. Never
         // silently judge an older duty against the current registry.
         if epoch < epoch_of(self.state.slot()) {
+            return GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Unjudgeable);
+        }
+        // Review round 2, GATE-04: bound the roll BEFORE doing it. Nothing
+        // about the frame has been verified yet.
+        if !self.attestation_roll_admitted(epoch, &admission.attestation().data.target_root) {
             return GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Unjudgeable);
         }
         let rolled = self.rolled_to(epoch);
@@ -5825,6 +8321,7 @@ impl Engine {
         let known_root =
             |root: &[u8; 32]| self.canonical.contains(root) || self.blocks.contains_key(root);
         let target_root = admission.attestation().data.target_root;
+        let validator = admission.attestation().validator;
         let seed = match self.seed_for_attestation(&target_root, epoch) {
             Some(seed) => Some(seed),
             None if !known_root(&target_root) => None,
@@ -5861,7 +8358,7 @@ impl Engine {
             GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
             admission.verification_source(),
             GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
-        );
+        ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
         let decision = match admission {
             AttestationAdmission::Fresh { att, verification_source } => pool.process_from_source(
                 att,
@@ -5881,7 +8378,18 @@ impl Engine {
                 &*rolled,
             ),
         };
-        locally_limited_gossip_decision(decision, verifier.limited())
+        match locally_limited_gossip_decision(decision, verifier.limited()) {
+            // FC-4 / P2P-9: the pool judged membership and the signature
+            // against `rolled`. Only a view that cannot be stale may turn
+            // that into a peer penalty.
+            GossipDecision::Reject(
+                reason @ (bloch_pos_committee::attestation::RejectReason::NotInCommittee
+                | bloch_pos_committee::attestation::RejectReason::BadSignature),
+            ) if !self.attestation_fault_is_provable(reason, &*rolled, validator, epoch, &target_root) => {
+                GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Unjudgeable)
+            }
+            decision => decision,
+        }
     }
 
     fn apply_decision(&mut self, att: Attestation, decision: GossipDecision, origin: &Origin) {
@@ -5895,8 +8403,9 @@ impl Engine {
                 // sighting doppelgänger protection exists to catch.
                 self.note_own_signature(att.validator, published_attestation(&att), true);
                 self.note_possible_doppelganger(att.validator, att.data.slot);
-                self.pool
-                    .insert((att.validator, att.data.signing_root()), att);
+                let (key, slot) = ((att.validator, att.data.signing_root()), att.data.slot);
+                self.pool.insert(key, att);
+                self.note_pool_authority(key, slot);
                 self.net.report(origin, Verdict::Accept);
             }
             GossipDecision::Ignore(_) => self.net.report(origin, Verdict::Ignore),
@@ -5905,12 +8414,158 @@ impl Engine {
                 // cannot yet validate. It is replayed by `release_held` when
                 // the block lands, and relayed then.
                 self.net.report(origin, Verdict::Ignore);
+                // W4-1: its signature was verified before it was parked
+                // (`AttestationPool::hold`), and that is all the devnet mesh
+                // asks of a peer that has to prove itself. A node that hears
+                // of a block by polling sees the votes for it first.
+                origin.note_mesh_delivery_verified();
             }
             GossipDecision::Reject(reason) => {
                 crate::net::rejection_log::emit(crate::net::rejection_log::Class::Attestation, || eprintln!("attestation from v{} REJECTED: {reason:?}", att.validator));
                 self.net.report(origin, Verdict::Reject);
             }
         }
+    }
+
+    /// Record the authority a vote just accepted by the gossip pipeline was
+    /// verified under (VAL-1). `judge_admission` verified it against
+    /// `rolled_to(epoch_of(slot))` of the state this still is: nothing writes
+    /// the state between the verdict and this call.
+    fn note_pool_authority(&mut self, key: (u32, [u8; 32]), slot: u64) {
+        let epoch = epoch_of(slot);
+        let rolled = self.rolled_to(epoch);
+        match bloch_pos_committee::kes::authority_fingerprint(&*rolled, key.0, epoch) {
+            Some(authority) => self.pool_authority.insert(key, authority),
+            None => self.pool_authority.remove(&key),
+        };
+        // Pool entries leave on inclusion and at the epoch sweep; their
+        // records are dropped here, amortised, so the map stays within a
+        // constant factor of the pool on a node that never proposes.
+        if self.pool_authority.len() > self.pool.len().saturating_mul(2).saturating_add(64) {
+            let pool = &self.pool;
+            self.pool_authority.retain(|key, _| pool.contains_key(key));
+        }
+    }
+
+    /// Drop a vote the transition refuses for the block being built (VAL-1).
+    /// It stays visible to fork choice only through blocks that carry it.
+    fn evict_pool_vote(&mut self, key: &(u32, [u8; 32])) {
+        self.pool_authority.remove(key);
+        if self.pool.remove(key).is_some() {
+            // `forkchoice_inputs` keys its memo on `pool.len()` plus this
+            // counter. Two, so that neither this removal alone nor a later
+            // insertion can restore the sum and hide the change.
+            self.fc_covered_removals = self.fc_covered_removals.saturating_add(2);
+        }
+    }
+
+    /// Keep the candidate votes whose signature is known to verify under the
+    /// authority the transition will use for them in a block of epoch `e`
+    /// built on this head (VAL-1).
+    ///
+    /// Gossip accepted each vote under the authority of its slot's epoch on
+    /// the state it had then. The transition judges an included vote against
+    /// the block's pre-state: `rolled`. A KES registration, rotation or the
+    /// bind landing in between changes the key in force, and a vote that no
+    /// longer verifies makes the whole block invalid. The caller has already
+    /// required `target_epoch == e`, so the in-block authority epoch is `e`
+    /// below and above the slot-epoch binding gate.
+    ///
+    /// A vote whose recorded authority equals the current one costs one
+    /// hash. Any other is verified again with the real verifier, at most
+    /// [`PROPOSAL_VOTE_REJUDGE_MAX`] per call: it is kept and re-recorded on
+    /// success and evicted on failure. Votes past the allowance are left out
+    /// of this block and stay pooled.
+    fn retain_block_valid_votes(&mut self, atts: &mut Vec<Attestation>, rolled: &CommittedState, e: u64) {
+        let pool = &self.pool;
+        self.pool_authority.retain(|key, _| pool.contains_key(key));
+        let mut rejudged = 0usize;
+        let mut evicted = 0usize;
+        let mut kept = Vec::with_capacity(atts.len());
+        for att in atts.drain(..) {
+            let key = (att.validator, att.data.signing_root());
+            // A committee member is in `rolled`'s registry, so this is `Some`;
+            // if it were not, the transition would refuse the vote.
+            let Some(authority) = bloch_pos_committee::kes::authority_fingerprint(rolled, att.validator, e) else {
+                continue;
+            };
+            if self.pool_authority.get(&key) == Some(&authority) {
+                kept.push(att);
+                continue;
+            }
+            if rejudged >= PROPOSAL_VOTE_REJUDGE_MAX {
+                continue;
+            }
+            rejudged = rejudged.saturating_add(1);
+            // The transition's own check for an included vote (step 8).
+            let valid = bloch_pos_committee::kes::verify_validator(
+                rolled,
+                &bloch_pos_committee::PolicyVerifier::consensus(&self.verifier, e),
+                att.validator,
+                e,
+                &key.1,
+                &att.signature,
+            ) == Some(true);
+            if valid {
+                self.pool_authority.insert(key, authority);
+                kept.push(att);
+            } else {
+                self.evict_pool_vote(&key);
+                evicted = evicted.saturating_add(1);
+            }
+        }
+        if evicted > 0 {
+            eprintln!(
+                "evicted {evicted} pooled vote(s) that no longer verify under the authority of epoch {e} on this head"
+            );
+        }
+        *atts = kept;
+    }
+
+    /// This node's own block was refused by the real transition. If the
+    /// cause is one of its votes, evict that vote and report `true`: the
+    /// transactions are then not at fault and stay in the mempool (VAL-1).
+    ///
+    /// `votes` are the pool keys of the block's votes, in body order; they
+    /// are still pooled because only an applied block removes them. The
+    /// diagnosis runs the transition once more, only on this exceptional
+    /// path and only while the head is still the block's parent.
+    fn evict_vote_refused_in_own_block(
+        &mut self,
+        signed: &ProposalEnvelope,
+        votes: &[(u32, [u8; 32])],
+        txs: &[PosTransaction],
+        slot: u64,
+    ) -> bool {
+        let atts: Vec<Attestation> = votes.iter().filter_map(|key| self.pool.get(key).cloned()).collect();
+        if *self.head_id().as_bytes() != signed.header.parent || atts.len() != votes.len() {
+            // Not diagnosable. Verify every one of them again before it is
+            // selected a second time.
+            for key in votes {
+                self.pool_authority.remove(key);
+            }
+            return false;
+        }
+        let Err(TransitionError::Attestation(i)) =
+            self.tr.compute_post_state(&self.state, signed, &atts, txs)
+        else {
+            return false;
+        };
+        let Some(bad) = votes.get(i as usize) else {
+            return false;
+        };
+        // The recorded authorities promised this could not happen: trust
+        // none of them for this block's votes.
+        for key in votes {
+            self.pool_authority.remove(key);
+        }
+        self.evict_pool_vote(bad);
+        eprintln!(
+            "[slot {slot}] own block refused for its vote {i} by v{}; the vote is evicted, the \
+             transactions stay in the mempool",
+            bad.0,
+        );
+        true
     }
 
     /// A block landed: queue its authenticated waiters for bounded replay.
@@ -5953,8 +8608,9 @@ impl Engine {
                 self.note_own_signature(att.validator, published_attestation(&att), true);
                 self.note_possible_doppelganger(att.validator, att.data.slot);
                 let frame = net::att_frame(&att);
-                self.pool
-                    .insert((att.validator, att.data.signing_root()), att);
+                let (key, slot) = ((att.validator, att.data.signing_root()), att.data.slot);
+                self.pool.insert(key, att);
+                self.note_pool_authority(key, slot);
                 if self.live {
                     // Relay now: it was held, so nobody downstream got it from
                     // us. A duplicate publish is refused locally and costs
@@ -6059,6 +8715,15 @@ impl Engine {
         self.height_of(&self.state.finality().finalized.root)
     }
 
+    /// The finality line ledger reads report next to their answer: the same
+    /// two values `getblockcount` carries, derived the same way.
+    fn finality_line(&self) -> rpc::FinalityLine {
+        rpc::FinalityLine {
+            finalized_height: self.finalized_height(),
+            finalized_epoch: self.state.finality().finalized.epoch,
+        }
+    }
+
     /// The genesis block as an envelope.
     ///
     /// Genesis is synthesised from the manifest and never stored in `blocks`
@@ -6118,7 +8783,7 @@ impl Engine {
         verification_source: Option<[u8; 32]>,
     ) -> RpcResult {
         match req {
-            RpcRequest::ChainInfo => Ok(rpc::chain_info_json(
+            RpcRequest::ChainInfo => Ok(self.with_rejected_block_roots(rpc::chain_info_json(
                 &self.state,
                 &self.head_id(),
                 self.head_state_root(),
@@ -6133,7 +8798,7 @@ impl Engine {
                 // config, so it cannot disagree with what is bound.
                 self.net.transport_name(),
                 self.net.peer_counts(),
-            )),
+            ))),
 
             RpcRequest::BlockCount => Ok(self.block_count_reply()),
 
@@ -6182,13 +8847,23 @@ impl Engine {
 
             RpcRequest::ValidatorCount => Ok(rpc::validator_count_json(&self.state)),
 
-            RpcRequest::Balance(script_hash) => Ok(rpc::balance_json(&self.state, &script_hash)),
+            RpcRequest::Balance(script_hash) => Ok(rpc::with_read_point(
+                rpc::balance_json(&self.state, &script_hash),
+                &self.state,
+                self.finality_line(),
+            )),
 
-            RpcRequest::Utxos { script_hash, limit } => {
-                Ok(rpc::utxos_json(&self.state, &script_hash, limit))
-            }
+            RpcRequest::Utxos { script_hash, limit } => Ok(rpc::with_read_point(
+                rpc::utxos_json(&self.state, &script_hash, limit),
+                &self.state,
+                self.finality_line(),
+            )),
 
-            RpcRequest::TxOut { txid, vout } => Ok(rpc::txout_json(&self.state, &txid, vout)),
+            RpcRequest::TxOut { txid, vout } => Ok(rpc::with_read_point(
+                rpc::txout_json(&self.state, &txid, vout),
+                &self.state,
+                self.finality_line(),
+            )),
 
             RpcRequest::SendRawTransaction(tx) => {
                 let canonical = tx.canonical_bytes();
@@ -6314,6 +8989,14 @@ impl Engine {
             RpcRequest::FinalityCertificate { epoch, block, set_source_epoch } => {
                 self.finality_certificate(epoch, block, set_source_epoch)
             }
+
+            RpcRequest::LcProof { epoch, set_source_epoch, block } => self.lc_proof(epoch, set_source_epoch, block),
+
+            // Bloch Sentinel (node-local). The RPC backend answers it before
+            // the queue, where the caller's address is known; a request that
+            // reaches the consensus thread has no caller to check and gets
+            // the answer of a node without the Sentinel.
+            RpcRequest::SecurityStatus => Err(RpcError::method_not_found("getsecuritystatus")),
         }
     }
 }
@@ -6331,11 +9014,31 @@ pub(crate) use identity::{check_keystore_identity, check_registry_identity, Keys
 
 fn start_devnet(
     cfg: &Config,
+    genesis_id: [u8; 32],
     tx: mpsc::Sender<EngineEvent>,
     head_slot: &Arc<AtomicU64>,
     inflight: &Arc<net::QueueBudget>,
 ) -> io::Result<net::DevnetMesh> {
-    net::start(
+    let security = Arc::new(crate::mesh_pq::MeshSecurity::load(
+        cfg.mesh.mode,
+        genesis_id,
+        &cfg.data_dir,
+        cfg.mesh.allow.as_deref(),
+        &cfg.peers,
+        &cfg.mesh.pins,
+        cfg.mesh.require_authenticated,
+    )?);
+    println!("mesh security: {}", security.summary());
+    // Said twice, like the transport line: before anything binds, and again
+    // once the listener is up, so it is still on screen under the bind
+    // output. On stderr, where the other boot warnings go.
+    let warn = || {
+        for w in security.warnings() {
+            eprintln!("mesh security: WARNING {w}");
+        }
+    };
+    warn();
+    let mesh = net::start(
         &cfg.listen_addr,
         cfg.listen,
         cfg.peers.clone(),
@@ -6343,7 +9046,10 @@ fn start_devnet(
         cfg.data_dir.clone(),
         head_slot.clone(),
         inflight.clone(),
-    )
+        security.clone(),
+    )?;
+    warn();
+    Ok(mesh)
 }
 
 /// Start the libp2p stack. Called by the `Libp2p` and `Dual` arms of [`run`]
@@ -6355,6 +9061,7 @@ fn start_devnet(
 /// log says.
 fn start_libp2p(
     cfg: &Config,
+    (genesis_time_ms, slot_ms): (u64, u64),
     net_tx: mpsc::Sender<NetEvent>,
     head_slot: &Arc<AtomicU64>,
     inflight: &Arc<net::QueueBudget>,
@@ -6382,6 +9089,8 @@ fn start_libp2p(
             data_dir: cfg.data_dir.clone(),
             max_peers: cfg.max_peers,
             behind_proxy: cfg.behind_proxy,
+            genesis_time_ms,
+            slot_ms,
         },
         net_tx,
         head_slot.clone(),
@@ -6545,6 +9254,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
+    // Review round 2, GATE-02: KES enforcement armed without the follow-up
+    // rules covering it is an open exposure the operator must see at every
+    // start, until the release that arms them.
+    for open in bloch_pos_committee::hard_forks::shipped_kes_follow_up_exposures() {
+        eprintln!(
+            "WARNING: KES enforcement is armed at epoch {} and {open}. Upgrade to the release that arms this gate before that epoch.",
+            bloch_pos_committee::params::HF3_KES_ENFORCE_EPOCH,
+        );
+    }
     // A build with consensus rules armed for development networks must never
     // join a funded network: refuse anything but a BPOSMAN3 development manifest.
     #[cfg(any(feature = "devnet-randao-recommit", feature = "devnet-l2-deposits"))]
@@ -6706,6 +9424,26 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 crate::slashprot::Binding { validator_pubkey_sha3: pkh, genesis_digest: digest };
             let mut protection = SlashingProtection::open_bound(&cfg.data_dir, binding)?;
             attach_signer_anchor(&cfg.data_dir, binding, &mut protection)?;
+            // Review CR-8: settled here, before replay can create the record
+            // from on-chain evidence. Enforced once the registry is known
+            // (`Engine::missing_history_refusal`).
+            let acknowledged = parse_boot_switch(
+                crate::slashprot::ENV_ACK_MISSING,
+                std::env::var_os(crate::slashprot::ENV_ACK_MISSING),
+            )?;
+            let boot_wall_slot = now_ms().saturating_sub(manifest.genesis_time_ms) / manifest.slot_ms.max(1);
+            match protection.settle_missing_history(boot_wall_slot, acknowledged)? {
+                crate::slashprot::MissingHistory::Proven => {}
+                crate::slashprot::MissingHistory::Unproven { before_slot } => println!(
+                    "slashing protection: no record and no host signer anchor that already held \
+                     one; this key may sign only if its duties began at or after wall slot {before_slot}"
+                ),
+                crate::slashprot::MissingHistory::Acknowledged => println!(
+                    "SLASHING PROTECTION: MISSING RECORD ACKNOWLEDGED ({} is set). The operator \
+                     states this key has no signature this node does not know about.",
+                    crate::slashprot::ENV_ACK_MISSING
+                ),
+            }
             protection
         }
         None => SlashingProtection::open(&cfg.data_dir)?,
@@ -6750,6 +9488,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let tx = tx.clone();
         let inflight = inflight.clone();
         std::thread::spawn(move || {
+            // GATE-08: without this thread no network event reaches the
+            // engine; a panic here must end the process, not the thread.
+            let _essential = crate::EssentialThread::new("net-event-forwarder");
             for ev in net_rx {
                 // COUNT IT IN, exactly as `net::send_to_engine` does on the
                 // devnet path.
@@ -6799,17 +9540,17 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // is the other two, unmodified, in one process.
     let net = match cfg.transport {
         Transport::Devnet => {
-            net::Net::Devnet(start_devnet(&cfg, tx.clone(), &head_slot, &inflight)?)
+            net::Net::Devnet(start_devnet(&cfg, *genesis_id.as_bytes(), tx.clone(), &head_slot, &inflight)?)
         }
-        Transport::Libp2p => net::Net::Libp2p(start_libp2p(&cfg, net_tx, &head_slot, &inflight)?),
+        Transport::Libp2p => net::Net::Libp2p(start_libp2p(&cfg, (manifest.genesis_time_ms, manifest.slot_ms), net_tx, &head_slot, &inflight)?),
         Transport::Dual => {
             // Devnet FIRST. Binding its `TcpListener` is the cheap synchronous
             // failure — a port already in use — and a node that cannot bind
             // both must not come up holding one: half a dual node is a node
             // that looks like it is bridging two populations and is not.
             // `?` on either line aborts the whole start.
-            let mesh = start_devnet(&cfg, tx.clone(), &head_slot, &inflight)?;
-            let handle = start_libp2p(&cfg, net_tx, &head_slot, &inflight)?;
+            let mesh = start_devnet(&cfg, *genesis_id.as_bytes(), tx.clone(), &head_slot, &inflight)?;
+            let handle = start_libp2p(&cfg, (manifest.genesis_time_ms, manifest.slot_ms), net_tx, &head_slot, &inflight)?;
             net::Net::Both(mesh, handle)
         }
     };
@@ -6855,6 +9596,32 @@ pub fn run(cfg: Config) -> io::Result<()> {
              informed consent."
         );
     }
+    // `--reject-block-root` / BLOCH_REJECT_BLOCK_ROOTS: read once, strictly,
+    // and announced in one line so the operator sees exactly what is armed.
+    let rejected_roots = reject_roots::reject_block_roots_from_env()?;
+    let rewind_confirmed = reject_roots::reject_root_rewind_confirmations_from_env()?;
+    if !rewind_confirmed.is_empty() {
+        println!(
+            "REJECT_BLOCK_ROOT: {} is set — a boot truncation for {} rejected root(s) may cut \
+             below this node's finalized checkpoint (together with --allow-finality-rewind)",
+            reject_roots::ENV_REJECT_ROOT_FINALITY_REWIND,
+            rewind_confirmed.len(),
+        );
+    }
+    if rejected_roots.contains(genesis_id.as_bytes()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--reject-block-root names the genesis block, which every chain descends from",
+        ));
+    }
+    if !rejected_roots.is_empty() {
+        println!(
+            "REJECT_BLOCK_ROOT: this node will never adopt these {} block(s) or any descendant \
+             of them (node-local; no consensus rule changes): {}",
+            rejected_roots.len(),
+            rejected_roots.iter().map(crate::codec::hex32).collect::<Vec<_>>().join(", "),
+        );
+    }
 
     // Read the opt-out once, but arm observation only after replay and the
     // weak-subjectivity gate. Time spent reading disk is not live observation.
@@ -6877,8 +9644,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
         recent_states: VecDeque::new(),
+        kes_authorities: VecDeque::new(),
+        reorg_anchors: Default::default(),
         finality_certs: Default::default(),
         pool: BTreeMap::new(),
+        pool_authority: BTreeMap::new(),
         att_pool: AttestationPool::new(),
         held_release_roots: VecDeque::new(),
         wall_slot: 0,
@@ -6900,8 +9670,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
         block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
         live: false,
         needs_sync: false,
+        sync_rewind: SyncRewindBackoff::default(),
         orphans: VecDeque::new(),
         deferred_orphans: VecDeque::new(),
+        authority_parked: AuthorityParked::default(),
         orphans_evicted: 0,
         orphans_admitted: 0,
         blocks_pruned: 0,
@@ -6919,6 +9691,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
         finality_rewinds_refused: 0,
         parked_refused_finality: VecDeque::new(),
         finality_rewind_override: allow_finality_rewind,
+        rejected_roots: reject_roots::RejectedRoots {
+            rewind_confirmed,
+            ..reject_roots::RejectedRoots::new(rejected_roots)
+        },
         tx_slot_index: BTreeMap::new(),
         tx_slot_index_order: VecDeque::new(),
         doppelganger_observe_until: None,
@@ -6933,6 +9709,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // historical 0.59 s/block estimate predates the incremental eUTXO tree and
     // must not be treated as a restart SLA for this binary.
     let recovery_started = std::time::Instant::now();
+    finality_cert::announce_finality_cert_retention();
     let force_replay = parse_boot_switch(
         "BLOCH_REPLAY_FROM_GENESIS",
         std::env::var_os("BLOCH_REPLAY_FROM_GENESIS"),
@@ -6944,6 +9721,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
     if force_replay && require_cache {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "--replay-from-genesis conflicts with --require-state-cache"));
     }
+    // Before the cache restore and the replay: neither may ever apply a
+    // block of an operator-rejected branch (`engine/reject_roots.rs`).
+    engine.truncate_rejected_log(&mut logged)?;
     let skipped = if force_replay { 0 } else {
         match engine.restore_local_cache(&mut logged) {
             Ok(n) => n,
@@ -6970,9 +9750,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // committed log, and must not be judged against a wall clock the log
         // knows nothing about. See `Engine::ingest_replay`.
         let expected_id = env.block_id();
+        let replay_epoch = epoch_of(env.header.slot);
         if !engine.ingest_replay(env) || engine.state.head() != expected_id {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
-                "durable block log failed consensus replay; refusing to serve a partial head"));
+                replay_failure_message(replay_epoch)));
         }
         // Time-based, not every-N-blocks: block cost varies by an order of
         // magnitude with how many transactions a block carries, so a fixed
@@ -6995,6 +9776,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
     println!("recovery: mode={} skipped_blocks={skipped} replayed_blocks={n_logged} elapsed_ms={}",
         if skipped > 0 { "local-cache" } else { "full-replay" }, recovery_started.elapsed().as_millis());
+    // PER-3: the replayed chain is known. Take the higher of the stored and
+    // the replayed finality latch, or refuse a log the stored one contradicts.
+    engine.reconcile_finalized_latch()?;
     engine.live = true;
     if n_logged > 0 {
         println!(
@@ -7082,6 +9866,17 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
 
+    // Review CR-8, boot half: the registry is known now. A key that already
+    // had duties, with no slashing-protection record and no signer anchor,
+    // does not start. Non-retryable, so a supervisor does not loop on it.
+    // Review PER-6: the replayed head bounds "now" from below, whatever the
+    // wall clock said when the reference slot was written.
+    engine.slashprot.raise_unproven_reference(engine.state.slot())?;
+    let boot_wall_slot = now_ms().saturating_sub(engine.manifest.genesis_time_ms) / engine.manifest.slot_ms.max(1);
+    if let Some(refusal) = engine.missing_history_refusal(boot_wall_slot) {
+        return Err(crate::ws_boot::boot_refused(refusal));
+    }
+
     // ── Weak subjectivity: may the node sync at all? (§4.2) ──
     //
     // Runs AFTER replay, because the question the boot decision asks — how old
@@ -7126,8 +9921,37 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let local_at: Vec<(u64, [u8; 32])> = (0..=fin.epoch)
             .filter_map(|e| engine.own_finalized_root_at(e).map(|r| (e, r)))
             .collect();
+        // --checkpoint-sync-url is consulted only by a node that needs it: one
+        // with no finality of its own, or with finality past the freshness
+        // threshold. A running node keeps resuming from its own finality and
+        // the ws_latest it already stored; it never depends on these URLs.
+        let needs_checkpoint = !has_local_finality
+            || wall_epoch.saturating_sub(fin.epoch) >= bloch_pos_committee::ws::WS_FRESH_EPOCHS;
+        let fetched;
+        let ws_cfg = if !cfg.ws.checkpoint_sync.is_empty() && needs_checkpoint {
+            println!("checkpoint sync: fetching the finalized checkpoint from {}", cfg.ws.checkpoint_sync.join(", "));
+            if cfg.ws.checkpoint_sync.len() == 1 {
+                println!("checkpoint sync: WARNING single endpoint — this node trusts that one node's word");
+            }
+            let cp = crate::ws_tool::fetch_trusted_checkpoint(&cfg.ws.checkpoint_sync, network_id, genesis_root)
+                .map_err(|e| crate::ws_boot::boot_refused(format!("checkpoint sync failed: {e}")))?;
+            fetched = crate::ws_boot::WsConfig {
+                trusted: Some(crate::ws_boot::TrustedCheckpoint {
+                    source: crate::ws_boot::TrustedSource::Fetched(cp),
+                    block_root: cfg.ws.checkpoint_sync_pin,
+                }),
+                // Keep the build's own anchor and restart policy: a fetched
+                // checkpoint is one more input, not a different boot.
+                release_anchor: cfg.ws.release_anchor,
+                resume_sync_under_anchor: cfg.ws.resume_sync_under_anchor,
+                ..Default::default()
+            };
+            &fetched
+        } else {
+            &cfg.ws
+        };
         let outcome = crate::ws_boot::boot(
-            &cfg.ws,
+            ws_cfg,
             &cfg.data_dir,
             network_id,
             &genesis_root,
@@ -7178,6 +10002,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
     if skipped == 0 || n_logged > 0 {
         if let Err(e) = engine.write_local_cache() {
             eprintln!("state-cache: initial write failed; next restart may require full replay: {e}");
+        }
+    }
+    // PER-4: a boot that replayed the whole log holds a base reorg anchor in
+    // memory and none on disk until several cache generations have been
+    // written. Write it now, so an early second restart has one.
+    if skipped == 0 {
+        if let Err(e) = engine.seed_anchor_generation() {
+            eprintln!("state-cache: reorg anchor generation not written; a restart may come up without one: {e}");
         }
     }
 
@@ -7247,6 +10079,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut last_built: u64 = engine.state.slot();
     let mut last_sync_req: u64 = 0;
     let mut duty_sync_gate = DutySyncGate::default();
+    // GATE-06: boot grace runs from here, the end of replay and of the boot
+    // checks, not from engine construction.
+    engine.booted_ms = now_ms();
+    // GATE-07: the monotonic clock the wall clock is checked against.
+    let monotonic_origin = std::time::Instant::now();
+    let mut clock_step_watch = ClockStepWatch::default();
 
     // Metrics baseline (C-R6-2). The finality clock starts NOW: replay stamps
     // nothing (it re-finalizes the past), and a `last_finality_advance_unix`
@@ -7277,6 +10115,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
     loop {
         match engine.store.poll_rewrite() {
             Ok(true) => {
+                // PER-3: a latch raised by the reorg waited for its branch to
+                // be durable in the log; it is now.
+                engine.persist_finalized_latch();
                 if let Err(e) = engine.write_local_cache() {
                     eprintln!("state-cache: post-reorg write failed; restart may require full replay: {e}");
                 }
@@ -7289,7 +10130,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 ));
             }
         }
-        let now = now_ms();
+        let (now, monotonic_now) = sample_clocks(monotonic_origin);
         if now < genesis_ms {
             // cannot underflow: now < genesis_ms.
             #[allow(clippy::arithmetic_side_effects)]
@@ -7312,6 +10153,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
             // reads no clock of its own, so this is the only thing that bounds
             // it — without the call its `seen` map grows with uptime.
             engine.att_pool.prune(slot);
+            // Bloch Sentinel (node-local, read-only; no-op unless enabled).
+            engine.sentinel_slot_tick();
         }
         // Future blocks, promoted orphans, and held attestations already
         // reported `Ignore`; replay is local and silent. Future/orphan work
@@ -7328,6 +10171,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
             &mut deferred_work_scheduler,
             &mut deferred_block_scheduler,
         );
+        // V1-1: one bounded slice of side-branch validation. A stored branch
+        // this node cannot weigh by gossip (its validator set differs) is
+        // judged by the transition instead; at most
+        // `SIDE_BRANCH_BLOCKS_PER_TURN` block applications here.
+        engine.validate_side_branch_turn(slot);
 
         if let Some(stop) = cfg.stop_at_slot {
             if slot >= stop
@@ -7336,6 +10184,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 && !deferred_orphans_pending
             {
                 if engine.store.flush_rewrite()? {
+                    engine.persist_finalized_latch();
                     if let Err(e) = engine.write_local_cache() {
                         eprintln!("state-cache: shutdown post-reorg write failed; restart may require full replay: {e}");
                     }
@@ -7355,9 +10204,29 @@ pub fn run(cfg: Config) -> io::Result<()> {
             }
         }
 
+        // GATE-07 / W3-1: report a wall clock that stepped against the
+        // monotonic clock. A report only: nothing below reads it.
+        match clock_step_watch.observe(now, monotonic_now, two_slots_ms) {
+            Some(ClockStep::Forward(step_ms)) => eprintln!(
+                "CLOCK STEP: the wall clock jumped {step_ms} ms ahead of the monotonic clock (wall slot {slot}, \
+                 head slot {}). Validator duties are NOT held by this report. If the host was suspended or a slow \
+                 clock was corrected, nothing needs doing. If the new time is WRONG, correct the clock now: a duty \
+                 signed at a future slot spends the slashing-protection watermark there, and the validator then \
+                 refuses duties until real time reaches that slot.",
+                engine.state.slot()
+            ),
+            Some(ClockStep::Backward(step_ms)) => eprintln!(
+                "CLOCK STEP: the wall clock jumped {step_ms} ms back against the monotonic clock (wall slot {slot}, \
+                 head slot {}). Validator duties are NOT held by this report; slashing protection refuses any duty \
+                 at or below a slot already signed until the wall clock passes it.",
+                engine.state.slot()
+            ),
+            None => {}
+        }
+
         // Boot grace: give the mesh one round of sync before performing
         // duties, so a restarted proposer does not build on a stale head.
-        let in_grace = now.saturating_sub(engine.booted_ms) < two_slots_ms;
+        let in_grace = in_boot_grace(now, engine.booted_ms, two_slots_ms);
 
         // Decide freshness BEFORE any duty can roll the local state forward.
         // `rolled_to` is only a deterministic view of THIS head; it cannot
@@ -7374,7 +10243,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             engine.last_applied_ms,
             two_slots_ms,
         );
-        let sync_needed = behind || engine.needs_sync;
+        let sync_needed = behind || engine.needs_sync || engine.sync_rewind_due(now);
         let stale_head_quarantined = duty_sync_gate.update(
             behind,
             engine.state.slot(),
@@ -7401,9 +10270,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // can be cleared, so requesting sync cannot accidentally enable the
         // duties immediately below it.
         if sync_needed && now.saturating_sub(last_sync_req) > two_slots_ms {
+            let after_slot = engine.sync_request_after_slot(now, two_slots_ms);
             engine
                 .net
-                .broadcast(net::get_blocks_frame(engine.sync_after_slot()));
+                .broadcast(net::get_blocks_frame(after_slot));
             engine.needs_sync = false;
             last_sync_req = now;
         }
@@ -7493,6 +10363,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             // cheap (one more atomic store) and correct either way, since the
             // counter only ever goes up.
             NodeMetrics::set(&NODE.finality_rewinds_refused_total, engine.finality_rewinds_refused);
+            NodeMetrics::set(&NODE.rejected_blocks_total, engine.rejected_roots.refused);
             // R3 M-5: the slot-progress signal `/health` corroborates the
             // heartbeat with. `genesis_unix`/`slot_secs` are effectively
             // constants of this manifest; setting them every turn costs one
@@ -7627,11 +10498,17 @@ pub fn run(cfg: Config) -> io::Result<()> {
                             // Judge first, THEN speak. Nothing is relayed
                             // until the engine has an answer — the same
                             // contract the attestation arm below runs on.
-                            let verdict = engine.ingest_judged_from_source(
-                                env,
-                                origin.verification_source(),
-                            );
+                            let source = origin.verification_source();
+                            let sentinel_seen = sentinel_hooks::header_seen(&env, source);
+                            let verdict = if origin.directed_block() {
+                                engine.ingest_from_judged(env, Source::Directed(source))
+                            } else {
+                                engine.ingest_judged_from_source(env, source)
+                            };
                             engine.net.report(&origin, verdict);
+                            if let Some(seen) = sentinel_seen {
+                                engine.sentinel_observe_block(seen, verdict);
+                            }
                         }
                         EngineEvent::Net(NetEvent::Attestation(att, origin)) => {
                             engine.on_attestation(att, origin, wall_epoch)
@@ -7653,13 +10530,18 @@ pub fn run(cfg: Config) -> io::Result<()> {
                             engine.net.report(&origin, verdict);
                         }
                         EngineEvent::Rpc(call) => {
-                            let result = engine.serve_rpc_from(
-                                call.req,
-                                call.verification_source,
-                            );
-                            // A client that hung up between asking and being
-                            // answered is normal, not an error worth logging.
-                            let _ = call.reply.send(result);
+                            // `None`: the HTTP side gave up on this call while
+                            // it was queued and released its permit. Running
+                            // it now would be work nobody is waiting for.
+                            if let Some(started) = call.start() {
+                                let result = engine.serve_rpc_from(
+                                    started.req,
+                                    call.verification_source,
+                                );
+                                // A client that hung up between asking and being
+                                // answered is normal, not an error worth logging.
+                                let _ = call.reply.send(result);
+                            }
                         }
                     }
             }
@@ -7681,6 +10563,16 @@ pub fn run(cfg: Config) -> io::Result<()> {
 /// it can be reasoned about and tested without standing up a node. It is also
 /// what makes the divergence from longest-chain testable at all — see
 /// `forkchoice_tests::weight_beats_length` at the bottom of this file.
+///
+/// It folds the body of EVERY block in `blocks`, so the caller decides which
+/// bodies vote: pass only blocks whose attestations were verified. The node
+/// does not call this on its store (FC-1) — `BlockInventory::head` folds
+/// validated bodies only, and is tested against this function over the same
+/// blocks with the unvalidated bodies removed.
+///
+/// Test-only since FC-1, like the reference below: the binary must not carry
+/// a fork choice it can reach that counts the body of an unapplied block.
+#[cfg(test)]
 pub fn lmd_ghost_head<'a>(
     blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
     pool: impl Iterator<Item = &'a Attestation>,
@@ -7692,8 +10584,10 @@ pub fn lmd_ghost_head<'a>(
     fc.head(&tree, justified, &children)
 }
 
-/// LMD-GHOST with epoch-gated FC-05 candidate selection. The gate is inert,
-/// so production currently takes the exact [`lmd_ghost_head`] path above.
+/// LMD-GHOST with epoch-gated FC-05 candidate selection, over the same
+/// every-body fold as [`lmd_ghost_head`] and test-only for the same reason.
+/// The node applies the gate in `Engine::forkchoice_head`.
+#[cfg(test)]
 pub fn lmd_ghost_head_at_epoch<'a>(
     blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
     pool: impl Iterator<Item = &'a Attestation>,
@@ -7707,6 +10601,7 @@ pub fn lmd_ghost_head_at_epoch<'a>(
     lmd_ghost_head_with_slot_tiebreak(blocks, pool, validators, justified)
 }
 
+#[cfg(test)]
 fn lmd_ghost_head_with_slot_tiebreak<'a>(
     blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
     pool: impl Iterator<Item = &'a Attestation>,
@@ -7745,6 +10640,7 @@ pub fn lmd_ghost_head_reference<'a>(
 /// map and the sibling lists. Shared by the two entry points above so they
 /// cannot drift — a differential test whose two sides observe different
 /// message sets proves nothing.
+#[cfg(test)]
 #[allow(clippy::type_complexity)]
 fn forkchoice_store<'a>(
     blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
@@ -7921,32 +10817,146 @@ pub(crate) struct KesSigner {
     next: Option<crate::kes_key::KesKey>,
     keygen: Option<std::sync::mpsc::Receiver<io::Result<crate::kes_key::KesKey>>>,
     rotation_submitted: Option<u64>,
+    /// The key the successor replaced (`validator.kes.retired`), kept until
+    /// the handover is final (review PER-1, `kes_key` module doc).
+    retired: Option<crate::kes_key::KesKey>,
 }
 
 impl KesSigner {
     pub(crate) fn new(key: crate::kes_key::KesKey, dir: PathBuf, unlock: crate::keys::Unlock) -> Self {
-        KesSigner { key, dir, unlock, next: None, keygen: None, rotation_submitted: None }
+        KesSigner { key, dir, unlock, next: None, keygen: None, rotation_submitted: None, retired: None }
     }
 
     /// If the chain's key in force is the sealed successor, swap the files
-    /// (`kes_key::promote_next`) and sign with it from now on.
+    /// (`kes_key::promote_next`) and sign with it from now on. The replaced
+    /// key is kept as `validator.kes.retired` (review PER-1): the head state
+    /// that names the successor is not final. If a reorg removed the
+    /// rotation and the chain names the replaced tree again, swap back
+    /// (`kes_key::demote_promoted`): the successor returns to
+    /// `validator.kes.next` and is submitted again by the rotation policy.
     fn adopt_successor(&mut self, in_force: &bloch_pos_committee::kes::KesPublic) -> Result<(), String> {
-        let promote = !self.key.public().same_tree(in_force)
-            && self.next.as_ref().is_some_and(|next| next.public().same_tree(in_force));
-        if !promote {
+        if self.key.public().same_tree(in_force) {
             return Ok(());
         }
-        crate::kes_key::promote_next(&self.dir).map_err(|e| format!("KES successor swap failed: {e}"))?;
-        if let Some(next) = self.next.take() {
-            self.key = next;
+        if self.next.as_ref().is_some_and(|next| next.public().same_tree(in_force)) {
+            crate::kes_key::promote_next(&self.dir).map_err(|e| format!("KES successor swap failed: {e}"))?;
+            if let Some(next) = self.next.take() {
+                self.retired = Some(std::mem::replace(&mut self.key, next));
+            }
+            self.rotation_submitted = None;
+            println!(
+                "KES successor in force from period {}: {} replaced; the old key is kept as {} until \
+                 the handover is final",
+                in_force.start_period,
+                crate::kes_key::FILE_NAME,
+                crate::kes_key::RETIRED_FILE_NAME
+            );
+            return Ok(());
         }
-        self.rotation_submitted = None;
-        println!(
-            "KES successor in force from period {}: {} replaced, old key shredded",
-            in_force.start_period,
-            crate::kes_key::FILE_NAME
-        );
+        if self.next.is_none() && self.retired.as_ref().is_some_and(|old| old.public().same_tree(in_force)) {
+            crate::kes_key::demote_promoted(&self.dir).map_err(|e| format!("KES swap back to the replaced key failed: {e}"))?;
+            if let Some(old) = self.retired.take() {
+                self.next = Some(std::mem::replace(&mut self.key, old));
+            }
+            self.rotation_submitted = None;
+            // Review W2-2 (reported, not changed here): a successor that was
+            // in force for more than one period has erased its first leaves.
+            // Submitted again it starts at leaf 0 on chain and cannot sign
+            // until the chain reaches the leaf it holds. It is kept, because
+            // the branch that made it the key in force can still win.
+            if let Some(leaf) = self.next.as_ref().map(|next| next.period()).filter(|leaf| *leaf > 0) {
+                eprintln!(
+                    "KES WARNING: the successor put back in {} was already evolved to leaf {leaf}. \
+                     If it is rotated in again it cannot sign for its first {leaf} period(s) \
+                     after that handover. It is kept because the branch on which it was the \
+                     key in force can still win; this needs an operator's attention.",
+                    crate::kes_key::NEXT_FILE_NAME
+                );
+            }
+            println!(
+                "KES handover reorganized out: the chain names the replaced key (root {}) again; {} \
+                 restored and the successor is back in {}",
+                crate::codec::hex8(&in_force.root),
+                crate::kes_key::FILE_NAME,
+                crate::kes_key::NEXT_FILE_NAME
+            );
+        }
         Ok(())
+    }
+
+    /// Look after the replaced key while it is kept (review PER-1). Called
+    /// after [`Self::adopt_successor`] with the validator's committed entry,
+    /// the duty or wall period, the head's period and the head state's
+    /// finalized epoch.
+    ///
+    /// - Destroyed once the finalized checkpoint is at or past the first
+    ///   epoch of the successor's start period: a `KesRotate` is only valid
+    ///   in a block of an earlier period, so that block is an ancestor of
+    ///   the finalized one and this node does not reorganize below it.
+    /// - Destroyed when the finalized checkpoint is at or past the first
+    ///   epoch after the old tree's last period (expired): it could sign
+    ///   nothing on any chain this node can still follow. Judged by the
+    ///   finalized epoch like the rule above, never by the duty or wall
+    ///   period (review W2-4): erasure cannot be undone, and a clock that
+    ///   jumped forward must not destroy the key a reorg of the unfinalized
+    ///   handover would need.
+    /// - Otherwise evolved to the old tree's leaf for the period, under the
+    ///   same clock-jump rule as the key in force (review F-5), so it holds
+    ///   no seed of a past period.
+    fn settle_replaced(
+        &mut self,
+        entry: &bloch_pos_committee::kes::KesEntry,
+        period: u64,
+        head_period: Option<u64>,
+        finalized_epoch: u64,
+    ) {
+        let Some(old) = self.retired.as_mut() else {
+            return;
+        };
+        let in_force = entry.in_force(period);
+        if !self.key.public().same_tree(&in_force) {
+            return;
+        }
+        let schedule = bloch_pos_committee::params::kes_schedule();
+        let handover_epoch =
+            schedule.activation_epoch.saturating_add(in_force.start_period.saturating_mul(schedule.period_epochs));
+        let old_tree = old.public();
+        let on_chain = std::iter::once(entry.current)
+            .chain(entry.retired.iter().rev().map(|r| r.public))
+            .find(|public| public.same_tree(&old_tree));
+        let leaf = on_chain.and_then(|public| public.leaf_index(period));
+        let expired = on_chain.is_some_and(|public| {
+            finalized_epoch
+                >= schedule.activation_epoch.saturating_add(public.end_period().saturating_mul(schedule.period_epochs))
+        });
+        if finalized_epoch >= handover_epoch || expired {
+            match crate::kes_key::shred_retired(&self.dir) {
+                Ok(()) => {
+                    self.retired = None;
+                    println!(
+                        "KES handover at period {} is {}: the replaced key {} is shredded",
+                        in_force.start_period,
+                        if expired { "past the old key's expiry" } else { "final" },
+                        crate::kes_key::RETIRED_FILE_NAME
+                    );
+                }
+                Err(e) => eprintln!("KES: could not shred {} (retried): {e}", crate::kes_key::RETIRED_FILE_NAME),
+            }
+            return;
+        }
+        let (Some(public), Some(leaf)) = (on_chain, leaf) else {
+            return;
+        };
+        if leaf <= old.period() {
+            return;
+        }
+        let key_period = public.start_period.saturating_add(old.period());
+        if !kes_evolution_allowed(key_period, head_period, period, kes_period_jump_confirmed()) {
+            return;
+        }
+        if let Err(e) = old.evolve_retired_to(&self.dir, &self.unlock, leaf) {
+            eprintln!("KES: could not evolve {} to leaf {leaf} (retried): {e}", crate::kes_key::RETIRED_FILE_NAME);
+        }
     }
 
     /// Collect a finished background keygen: seal it as `validator.kes.next`.
@@ -8103,8 +11113,28 @@ fn load_kes_signer(dir: &std::path::Path, validator: bool) -> io::Result<Option<
             crate::codec::hex8(&next.public().root)
         );
     }
+    // The replaced key of a handover that was not final when the node
+    // stopped (review PER-1). It is only ever needed if that handover is
+    // reorganized out, so a file that does not load must not stop the key in
+    // force from signing.
+    let retired = match crate::kes_key::KesKey::load_retired(dir, &unlock) {
+        Ok(retired) => retired,
+        Err(e) => {
+            eprintln!("KES WARNING: {} does not load and is ignored: {e}", crate::kes_key::RETIRED_FILE_NAME);
+            None
+        }
+    };
+    if let Some(retired) = &retired {
+        println!(
+            "KES replaced key kept until its handover is final: depth {}, leaf {}, root {}",
+            retired.public().depth,
+            retired.period(),
+            crate::codec::hex8(&retired.public().root)
+        );
+    }
     let mut signer = KesSigner::new(key, dir.to_path_buf(), unlock);
     signer.next = next;
+    signer.retired = retired;
     Ok(Some(signer))
 }
 
@@ -8237,30 +11267,6 @@ fn relay_spend_reference_check(pubkey: &[u8], signing_root: &[u8; 32], signature
         || bloch_crypto::crypto::verify_pinned(pubkey, signing_root, signature)
 }
 
-/// A fresh [`HybridVerifier`] under the node relay policy, for the admission
-/// arms that verify a self-contained (budget-free) hybrid authorization.
-fn strict_relay_hybrid() -> impl SignatureVerifier {
-    struct Owned(HybridVerifier);
-    impl SignatureVerifier for Owned {
-        fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
-            self.0.verify_with_key(pk, root, sig) && bloch_crypto::crypto::verify_pinned(pk, root, sig)
-        }
-        fn verify_l2_settlement(&self, p: &[u8; 32], pr: &[u8; 32], v: &[u8], pf: &[u8]) -> bool {
-            self.0.verify_l2_settlement(p, pr, v, pf)
-        }
-        fn verify_with_key_under(&self, policy: bloch_pos_committee::SignaturePolicy, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
-            self.0.verify_with_key_under(policy, pk, root, sig) && relay_reference_check(policy, pk, root, sig)
-        }
-        fn verify_spend_at_epoch(&self, pk: &[u8], root: &[u8; 32], sig: &[u8], epoch: u64) -> bool {
-            self.0.verify_spend_at_epoch(pk, root, sig, epoch) && relay_spend_reference_check(pk, root, sig)
-        }
-        fn verify_kes_leaf(&self, leaf_pk: &[u8], message: &[u8; 32], sig: &[u8]) -> bool {
-            self.0.verify_kes_leaf(leaf_pk, message, sig)
-        }
-    }
-    Owned(HybridVerifier::new())
-}
-
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     admissible_with_verifier(tx, wall_epoch, &HybridVerifier::new())
 }
@@ -8301,38 +11307,49 @@ fn admissible_with_network_verifier(
         // Whether the network's L2 admits DA, claims and deposits is a state
         // question (the installed L2's profile), answered at the stateful door
         // by `l2_admission_refusal`; here only shape and signatures.
+        //
+        // The signatures go through the caller's `verifier` (review EXE-3):
+        // on the gossip and RPC path that is the per-source budgeted one, so
+        // each hybrid verification below draws one unit of the sender's
+        // allowance and a failure is charged to the sender, exactly as for a
+        // transfer. A version-2 claim therefore weighs one unit plus one per
+        // attestor signature. These arms used to build a private, unmetered
+        // verifier.
         PosTransaction::L2DataAvailability(batch) => {
             // Shape and payload are rechecked in consensus; refuse the
             // obviously unusable batch before the signature.
             if bloch_pos_committee::l2_settlement::da::batch_count(&batch.payload).is_none() {
                 return Err("L2 data availability payload is not one canonical batch");
             }
-            if strict_relay_hybrid().verify_with_key(&batch.funding_pubkey, &batch.intent_root(), &batch.signature) {
+            if verifier.verify_with_key(&batch.funding_pubkey, &batch.intent_root(), &batch.signature) {
                 Ok(())
             } else {
                 Err("invalid L2 data availability hybrid PQ authorization")
             }
         }
         PosTransaction::L2WithdrawClaim(claim) => {
-            // The proof, maturity, nullifier and escrow are state checks and
-            // run in consensus; refuse a malformed claim before the signature.
+            // The proof, maturity, nullifier and escrow are state checks:
+            // `admission::check_transfer` ran them (and compared the
+            // attestor set with the policy's) before this; refuse a
+            // malformed claim before the signature.
             if claim.validate_shape().is_err() {
                 return Err("L2 withdrawal claim has an invalid shape or release output");
             }
-            if !strict_relay_hybrid().verify_with_key(&claim.funding_pubkey, &claim.intent_root(), &claim.signature) {
+            if !verifier.verify_with_key(&claim.funding_pubkey, &claim.intent_root(), &claim.signature) {
                 return Err("invalid L2 withdrawal claim hybrid PQ authorization");
             }
             // The attestors sign the root the proof folds to, so their
             // signatures check here without state; only "is this the
             // policy's set" waits for consensus.
-            if !claim.verify_attestation(&strict_relay_hybrid()) {
+            if !claim.verify_attestation(verifier) {
                 return Err("invalid L2 withdrawal claim attestation");
             }
             Ok(())
         }
         PosTransaction::L2Deposit(deposit) => {
-            // State checks (inputs, ownership, conservation) run in consensus.
-            if strict_relay_hybrid().verify_with_key(&deposit.funding_pubkey, &deposit.intent_root(), &deposit.signature) {
+            // State checks (inputs, ownership, conservation) ran in
+            // `admission::check_transfer`, before this signature.
+            if verifier.verify_with_key(&deposit.funding_pubkey, &deposit.intent_root(), &deposit.signature) {
                 Ok(())
             } else {
                 Err("invalid L2 deposit hybrid PQ authorization")
@@ -9416,17 +12433,19 @@ mod forkchoice_tests {
         }
     }
 
-    /// **Why `apply_canonical` may drop an attestation from the pool without
-    /// forcing `advance` to recompute.** Fork choice observes every stored
-    /// block's body *and* the loose pool. An attestation that leaves the pool
-    /// because the block carrying it became canonical is therefore still
-    /// observed, from that block — the head cannot move.
+    /// **Why an attestation `apply_canonical` drops from the pool is not a
+    /// vote lost.** Fork choice observes every validated block's body *and*
+    /// the loose pool. An attestation that leaves the pool because the block
+    /// carrying it became canonical is therefore still observed, from that
+    /// block — the head cannot move.
     ///
     /// That is the entire justification for `fc_covered_removals` in
     /// `Engine::forkchoice_inputs`. The second half of the test is the
     /// control: an attestation no stored block carries is NOT free to drop,
     /// which is why the epoch `retain` on the next line still invalidates the
-    /// memo.
+    /// memo. (Since FC-1 the block's body starts voting at that same apply,
+    /// which `advance` detects through the vote generation; this test is
+    /// about the pure function, where the body is folded in both runs.)
     #[test]
     fn an_attestation_its_block_carries_is_free_to_leave_the_pool() {
         let g = [0x99u8; 32];
@@ -10202,7 +13221,7 @@ mod admission_authorisation {
                 panic!("suite policy must run before signature verification")
             }
         }
-        assert_eq!(bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH, u64::MAX);
+        assert_eq!(bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH, 7360);
         let (pk, sk) = bloch_crypto::crypto::slhdsa_suite::generate_keypair_from_seed(&[0x33u8; 32])
             .expect("suite-0x0003 keypair");
         let mut v1 = signed_transfer().0;
@@ -10225,7 +13244,7 @@ mod admission_authorisation {
         if let PosTransaction::TransferV2 { keys, .. } = &mut v2 {
             keys[0].signature = bloch_crypto::crypto::sign(&sk, &root2).expect("sign V2 root");
         }
-        for epoch in [0, V2_FLAG_DAY, 6_017, u64::MAX] {
+        for epoch in [0, V2_FLAG_DAY, 6_017, 7_359] {
             let err = admissible_with_verifier(&v1, epoch, &MustNotVerify)
                 .expect_err("suite 0x0003 must not enter the V1 mempool before HF3");
             assert!(err.contains("non-hybrid"), "wrong refusal: {err}");
@@ -10550,8 +13569,11 @@ mod transfer_v2_end_to_end {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+        kes_authorities: VecDeque::new(),
+        reorg_anchors: Default::default(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
+            pool_authority: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
             wall_slot: 0,
@@ -10573,8 +13595,10 @@ mod transfer_v2_end_to_end {
             block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
+            sync_rewind: SyncRewindBackoff::default(),
             orphans: VecDeque::new(),
             deferred_orphans: VecDeque::new(),
+            authority_parked: AuthorityParked::default(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
@@ -10592,6 +13616,7 @@ mod transfer_v2_end_to_end {
             finality_rewinds_refused: 0,
             parked_refused_finality: VecDeque::new(),
             finality_rewind_override: false,
+            rejected_roots: Default::default(),
             tx_slot_index: BTreeMap::new(),
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
@@ -11932,8 +14957,11 @@ mod perf_support {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+        kes_authorities: VecDeque::new(),
+        reorg_anchors: Default::default(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
+            pool_authority: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
             wall_slot: 0,
@@ -11955,8 +14983,10 @@ mod perf_support {
             block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
+            sync_rewind: SyncRewindBackoff::default(),
             orphans: VecDeque::new(),
             deferred_orphans: VecDeque::new(),
+            authority_parked: AuthorityParked::default(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
@@ -11980,6 +15010,7 @@ mod perf_support {
             finality_rewinds_refused: 0,
             parked_refused_finality: VecDeque::new(),
             finality_rewind_override: false,
+            rejected_roots: Default::default(),
             tx_slot_index: BTreeMap::new(),
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
@@ -12422,6 +15453,29 @@ mod doppelganger_tests {
         assert!(!engine.doppelganger_blocks_duties(10_064));
     }
 
+    /// W4-1: the devnet mesh learns which source addresses are honest
+    /// validators from the engine's own verdicts. A vote whose signature
+    /// was verified, accepted or parked for its block, vouches for the
+    /// address that delivered it; one the engine did not verify does not.
+    #[test]
+    fn a_verified_vote_vouches_for_the_mesh_address_that_delivered_it() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let index = engine.keys.as_ref().unwrap().index + 1;
+        let source: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        for (decision, proves) in [
+            (GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Duplicate), false),
+            (GossipDecision::Hold { missing_root: [7; 32] }, true),
+            (GossipDecision::Accept { slashing_candidate: None }, true),
+        ] {
+            let (origin, vouched) = net::test_mesh_origin(source);
+            assert!(!vouched());
+            engine.apply_decision(sample_attestation_for(index), decision, &origin);
+            assert_eq!(vouched(), proves);
+        }
+        // An origin that is not the mesh's is unaffected.
+        engine.apply_decision(sample_attestation_for(index), GossipDecision::Hold { missing_root: [7; 32] }, &Origin::none());
+    }
+
     #[test]
     fn delayed_old_duty_is_ignored_but_current_duty_halts() {
         let (mut engine, _dir) = perf_support::proposing_engine();
@@ -12565,6 +15619,48 @@ mod doppelganger_tests {
             engine.doppelganger_blocks_duties(9_999),
             "a detected duplicate must block duties indefinitely, not just until the window"
         );
+    }
+
+    /// Review CR-8: a registered key whose data dir had no slashing-protection
+    /// record and no signer anchor performs no duty; an acknowledgement, or a
+    /// key activated after the boot, is not blocked.
+    #[test]
+    fn a_registered_key_without_a_signing_record_performs_no_duty() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        assert!(engine.missing_history_refusal(0).is_none(), "fixture: unarmed");
+        let scratch = |tag: &str| {
+            perf_support::TestDir(std::env::temp_dir().join(format!("bloch-pos-cr8-{tag}-{}", std::process::id())))
+        };
+        let fresh = scratch("active");
+        let activation = engine
+            .state
+            .validator_record(engine.duty_index(&engine.state).expect("fixture: registered"))
+            .expect("record")
+            .activation_epoch;
+        let after = activation.saturating_add(3).saturating_mul(bloch_pos_committee::params::SLOTS_PER_EPOCH);
+
+        engine.slashprot = SlashingProtection::open(&fresh.0).expect("open");
+        engine.slashprot.settle_missing_history(after, false).expect("settle");
+        let refusal = engine.missing_history_refusal(after).expect("an already-active key must be refused");
+        assert!(refusal.contains("--acknowledge-missing-slashing-protection"), "{refusal}");
+        assert!(engine.doppelganger_blocks_duties(0));
+        assert!(engine.doppelganger_blocks_duties(u64::MAX));
+
+        // The same data dir, acknowledged on the next boot.
+        engine.slashprot = SlashingProtection::open(&fresh.0).expect("reopen");
+        engine.slashprot.settle_missing_history(after, true).expect("settle");
+        assert!(engine.missing_history_refusal(after).is_none());
+        assert!(!engine.doppelganger_blocks_duties(0));
+
+        // A key whose duties begin at or after the boot is a new validator.
+        let newcomer = scratch("new");
+        engine.slashprot = SlashingProtection::open(&newcomer.0).expect("open");
+        engine
+            .slashprot
+            .settle_missing_history(activation.saturating_mul(bloch_pos_committee::params::SLOTS_PER_EPOCH), false)
+            .expect("settle");
+        assert!(engine.missing_history_refusal(after).is_none());
+        assert!(!engine.doppelganger_blocks_duties(0));
     }
 
     /// No window armed (bypassed via `--no-doppelganger-check` /
@@ -13740,6 +16836,109 @@ mod reorg_state_tests {
         );
     }
 
+    /// FC-2: a reorg whose ancestor is older than the head's parent resolves
+    /// from a retained anchor, not from genesis, and lands on the state the
+    /// genesis replay computes.
+    ///
+    /// The anchors are observed two ways: by which one the selector names,
+    /// and by taking the block at height 1 out of the store, which the
+    /// genesis replay cannot do without (it would panic on the missing
+    /// block) and a replay that starts above it never reads.
+    #[test]
+    fn a_deep_reorg_replays_from_the_retained_anchor_not_from_genesis() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        for slot in 1..=3 {
+            engine.propose(slot);
+        }
+        let id_at = |engine: &Engine, h: usize| *engine.chain[h].1.as_bytes();
+        assert_eq!(
+            engine.reorg_anchors.pending.as_ref().map(|a| (a.0, a.1)),
+            Some((1, id_at(&engine, 1))),
+            "the first applied block is taken as the pending anchor"
+        );
+        assert!(engine.reorg_anchors.base.is_none(), "nothing is final yet");
+
+        // As if finality had reached height 3 (signing two epochs of votes
+        // is not what this test is about): the next adoption promotes the
+        // pending anchor and takes the head in its place.
+        engine.finalized_latch = Some((3, id_at(&engine, 3)));
+        for slot in 4..=8 {
+            engine.propose(slot);
+        }
+        assert_eq!(engine.chain.len(), 9);
+        assert_eq!(engine.reorg_anchors.base.as_ref().map(|a| a.0), Some(1));
+        assert_eq!(engine.reorg_anchors.pending.as_ref().map(|a| a.0), Some(4));
+        let start = |engine: &Engine, cut: usize| {
+            engine.reorg_anchor_at_or_below(cut).map(|a| a.0)
+        };
+        assert_eq!(start(&engine, 6), Some(4), "nearest anchor at or below the target");
+        assert_eq!(start(&engine, 3), Some(1), "below the pending anchor: the base");
+        assert_eq!(start(&engine, 0), None, "nothing covers genesis: genesis replay");
+
+        // The reference: the unchanged replay from genesis.
+        let targets = [3usize, 4, 6];
+        let expected: Vec<CommittedState> =
+            targets.iter().map(|&h| engine.replay_to(id_at(&engine, h))).collect();
+
+        let first = id_at(&engine, 1);
+        let taken = engine.blocks.remove(&first).expect("height 1 is stored");
+        for (&h, want) in targets.iter().zip(&expected) {
+            let id = id_at(&engine, h);
+            assert!(
+                !engine.recent_states.iter().any(|(bid, _)| *bid == id),
+                "height {h}: fixture — the target must be older than the head's parent"
+            );
+            let got = engine.state_at_canonical(id);
+            assert_eq!(*got, *want, "height {h}: anchored replay differs from the genesis replay");
+            assert_eq!(
+                got.state_root(),
+                engine.blocks.get(&id).expect("target is stored").header.state_root,
+                "height {h}: anchored replay differs from the committed state root"
+            );
+        }
+
+        // The reorg itself: give back everything above height 6, an ancestor
+        // two below the head's parent and above the finalized boundary.
+        let ancestor = id_at(&engine, 6);
+        assert!(engine.do_reorg(ancestor, Vec::new()), "the reorg is adopted");
+        assert_eq!(*engine.state, expected[2], "the reorg landed on a different state");
+        assert_eq!(*engine.head_id().as_bytes(), ancestor);
+        assert_eq!(
+            engine.reorg_anchors.pending.as_ref().map(|a| a.0),
+            Some(4),
+            "an anchor still on the canonical chain survives the reorg"
+        );
+
+        // An anchor above the cut has left the chain: it is dropped, never
+        // served, and the head is taken in its place.
+        engine.blocks.insert(first, taken);
+        let ancestor = id_at(&engine, 2);
+        // The latch is moved aside so this cut is allowed.
+        engine.finalized_latch = Some((2, ancestor));
+        assert!(engine.do_reorg(ancestor, Vec::new()), "the reorg is adopted");
+        assert_eq!(engine.reorg_anchors.base.as_ref().map(|a| a.0), Some(1));
+        assert_eq!(engine.reorg_anchors.pending.as_ref().map(|a| (a.0, a.1)), Some((2, ancestor)));
+    }
+
+    /// No anchor at or below the target: the genesis replay still answers,
+    /// so a node is never worse off than before the anchors existed.
+    #[test]
+    fn a_block_no_anchor_covers_still_replays_from_genesis() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        for slot in 1..=6 {
+            engine.propose(slot);
+        }
+        let target = *engine.chain[3].1.as_bytes();
+        let expected = engine.replay_to(target);
+        // An anchor that is not this chain's block at its height is ignored.
+        engine.reorg_anchors.base = None;
+        engine.reorg_anchors.pending = Some((2, [0xAB; 32], engine.state.arc()));
+        assert!(engine.reorg_anchor_at_or_below(3).is_none());
+        assert_eq!(*engine.state_at_canonical(target), expected);
+        engine.reorg_anchors.pending = None;
+        assert_eq!(*engine.state_at_canonical(target), expected);
+    }
+
     /// The deep-reorg fallback must borrow canonical bodies from the block
     /// store instead of first cloning the entire prefix into a temporary
     /// aggregate. The behavioural half above proves the borrowed fold is the
@@ -14257,8 +17456,11 @@ mod duty_view_anchor {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+        kes_authorities: VecDeque::new(),
+        reorg_anchors: Default::default(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
+            pool_authority: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
             wall_slot: 0,
@@ -14280,8 +17482,10 @@ mod duty_view_anchor {
             block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
+            sync_rewind: SyncRewindBackoff::default(),
             orphans: VecDeque::new(),
             deferred_orphans: VecDeque::new(),
+            authority_parked: AuthorityParked::default(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
@@ -14299,6 +17503,7 @@ mod duty_view_anchor {
             finality_rewinds_refused: 0,
             parked_refused_finality: VecDeque::new(),
             finality_rewind_override: false,
+            rejected_roots: Default::default(),
             tx_slot_index: BTreeMap::new(),
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
@@ -14527,8 +17732,11 @@ mod slot_horizon {
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
+        kes_authorities: VecDeque::new(),
+        reorg_anchors: Default::default(),
             finality_certs: Default::default(),
             pool: BTreeMap::new(),
+            pool_authority: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             held_release_roots: VecDeque::new(),
             wall_slot: 0,
@@ -14549,6 +17757,7 @@ mod slot_horizon {
             block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
+            sync_rewind: SyncRewindBackoff::default(),
             last_applied_ms: now_ms(),
             booted_ms: now_ms(),
             ws_anchor: None,
@@ -14559,12 +17768,14 @@ mod slot_horizon {
             finality_rewinds_refused: 0,
             parked_refused_finality: VecDeque::new(),
             finality_rewind_override: false,
+            rejected_roots: Default::default(),
             tx_slot_index: BTreeMap::new(),
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
             doppelganger_halted: false,
             orphans: VecDeque::new(),
             deferred_orphans: VecDeque::new(),
+            authority_parked: AuthorityParked::default(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
@@ -14919,6 +18130,280 @@ mod ingest_admission_tests {
         );
     }
 
+    /// An envelope naming a proposer index this node has not registered, on
+    /// a parent it has never seen. Nothing in it is authenticated.
+    fn unauthenticated_orphan(template: &BlockEnvelope, tag: u16, slot: u64) -> BlockEnvelope {
+        let mut env = template.clone();
+        env.header.proposer_index = 7;
+        env.header.slot = slot;
+        env.header.parent = [0x5C; 32];
+        env.header.parent[..2].copy_from_slice(&tag.to_le_bytes());
+        env
+    }
+
+    fn park_as_authenticated(engine: &mut Engine, env: BlockEnvelope) -> [u8; 32] {
+        let id = *env.block_id().as_bytes();
+        let proof = AuthenticatedBlockAdmission::new(&env, &[0u8; 32]);
+        engine.park_orphan_authenticated(id, env, Source::Local, Some(proof));
+        id
+    }
+
+    /// **P2P-6: an orphan nobody signed for does not steer sync.** It is
+    /// held, but it neither latches `needs_sync` nor lowers the cursor; the
+    /// same gap named by a block whose proposer signature verifies does both.
+    #[test]
+    fn only_an_authenticated_orphan_requests_sync_or_rewinds_the_cursor() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let (mut engine, _dir, template, stored) = fixture();
+        engine.needs_sync = false;
+        let head = engine.state.slot();
+        assert!(head > 0, "the fixture applied one block");
+        assert_eq!(engine.sync_after_slot(), head);
+
+        for tag in 0..4u16 {
+            let verdict = engine.ingest_judged_from_source(
+                unauthenticated_orphan(&template, tag, 1),
+                Some([tag as u8; 32]),
+            );
+            assert!(matches!(verdict, Verdict::Ignore), "held, never charged to the relay");
+        }
+        assert_eq!(engine.orphans.len(), 4, "unauthenticated orphans are still held");
+        assert_eq!(engine.blocks.len(), stored);
+        assert!(!engine.needs_sync, "an unverified envelope must not request history");
+        assert_eq!(
+            engine.sync_after_slot(),
+            head,
+            "an unverified slot number must not lower the sync cursor",
+        );
+        // Even once something else latches the request, the unverified
+        // entries add nothing to how far back it reaches.
+        engine.needs_sync = true;
+        let latched_only = engine.sync_after_slot();
+        engine.needs_sync = false;
+
+        let signed = repointed(&engine, &template, [0x9A; 32], 2);
+        engine.ingest(signed);
+        assert_eq!(engine.orphans.len(), 5);
+        assert!(engine.needs_sync, "a verified orphan is evidence of a real gap");
+        assert!(
+            engine.sync_after_slot() < head,
+            "and it rewinds the cursor below the applied head",
+        );
+        assert!(engine.sync_after_slot() <= latched_only);
+    }
+
+    /// **P2P-6: a rewind that brings nothing back is not repeated at once.**
+    /// The same floor is held back for an interval that doubles per fruitless
+    /// attempt, the node keeps syncing forward meanwhile, and one block from
+    /// the rewound range clears the back-off.
+    #[test]
+    fn repeated_fruitless_rewinds_back_off_and_a_yield_clears_them() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        const CADENCE: u64 = 1_000;
+        let head = engine.state.slot();
+        let gap = repointed(&engine, &template, [0x9A; 32], 2);
+        park_as_authenticated(&mut engine, gap);
+        let floor = engine.sync_after_slot();
+        assert!(floor < head, "the fixture's gap is a rewind");
+
+        let mut now = 100_000u64;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor, "first rewind is free");
+
+        // Nothing was stored. Count how long the same floor stays held back
+        // after each further fruitless attempt.
+        let mut held_for = Vec::new();
+        for _ in 0..3 {
+            now += CADENCE + 1;
+            assert_eq!(
+                engine.sync_request_after_slot(now, CADENCE),
+                head,
+                "a fruitless floor is not asked for again straight away; sync goes forward",
+            );
+            let held_from = now;
+            assert!(!engine.sync_rewind_due(now));
+            while engine.sync_request_after_slot(now, CADENCE) == head {
+                now += CADENCE + 1;
+            }
+            held_for.push(now - held_from);
+        }
+        assert!(
+            held_for[0] < held_for[1] && held_for[1] < held_for[2],
+            "the interval grows with every fruitless rewind: {held_for:?}",
+        );
+
+        // Held back again, and the slot loop is told when to retry.
+        now += CADENCE + 1;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), head);
+        assert!(!engine.sync_rewind_due(now));
+        assert!(engine.sync_rewind_due(engine.sync_rewind.retry_at_ms));
+
+        // A block above the head the rewind was issued from could have come
+        // from a forward request: not a yield.
+        engine.note_sync_rewind_yield(head + 1);
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), head);
+        // One at or below it could only have come from the rewind.
+        engine.note_sync_rewind_yield(head);
+        assert_eq!(
+            engine.sync_request_after_slot(now, CADENCE),
+            floor,
+            "a rewind that yielded clears the back-off",
+        );
+    }
+
+    /// **V2-8: a back-off earned by one orphan does not hold back the rewind
+    /// another branch needs**, and minting new orphans buys one rewind per
+    /// short interval, not an end to the back-off.
+    #[test]
+    fn a_new_authenticated_orphan_is_not_held_back_by_an_old_back_off() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        const CADENCE: u64 = 1_000;
+        let head = engine.state.slot();
+        let planted = repointed(&engine, &template, [0x9A; 32], 2);
+        park_as_authenticated(&mut engine, planted);
+        let floor = engine.sync_after_slot();
+        assert!(floor < head);
+
+        // Five fruitless rewinds for the planted orphan: the back-off is at
+        // its cap and the same cause stays held back.
+        let mut now = 100_000u64;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor);
+        for _ in 0..5 {
+            now += 1;
+            let _ = engine.sync_request_after_slot(now, CADENCE);
+            now = engine.sync_rewind.retry_at_ms;
+            assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor);
+        }
+        now += 1;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), head, "the old cause alone is held back");
+        let capped_until = engine.sync_rewind.retry_at_ms;
+        assert!(capped_until - now > 16 * CADENCE, "the back-off is long by now");
+
+        // A block of another branch arrives, signed, with a parent this node
+        // has never asked for: the very next request rewinds.
+        let genuine = repointed(&engine, &template, [0x9B; 32], 2);
+        park_as_authenticated(&mut engine, genuine);
+        now += CADENCE + 1;
+        assert!(now < capped_until);
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor, "a new cause rewinds at the next sync tick");
+
+        // The same two causes again: held back as before.
+        now += CADENCE + 1;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), head);
+
+        // A third parent straight away does not get another rewind until the
+        // new-cause interval has passed; then it does.
+        let minted = repointed(&engine, &template, [0x9C; 32], 2);
+        park_as_authenticated(&mut engine, minted);
+        now += 1;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), head, "new causes are rate-bound");
+        now = engine.sync_rewind.new_cause_at_ms;
+        assert!(now < engine.sync_rewind.retry_at_ms, "still inside the back-off");
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor);
+    }
+
+    /// **P2P-6: the back-off never exceeds its cap, and a lower floor is
+    /// never held back** — that is how a genuine page chase walks backwards.
+    #[test]
+    fn rewind_back_off_is_capped_and_does_not_hold_a_lower_floor() {
+        let (mut engine, _dir, _template, _stored) = fixture();
+        const CADENCE: u64 = 1_000;
+        engine.sync_rewind.fruitless = 40;
+        engine.sync_rewind.floor = 10;
+        engine.sync_rewind.awaiting = Some(10);
+        engine.sync_rewind.retry_at_ms = 50_000;
+        let _ = engine.sync_request_after_slot(50_001, CADENCE);
+        assert_eq!(
+            engine.sync_rewind.retry_at_ms,
+            50_001 + (CADENCE << SYNC_REWIND_BACKOFF_MAX_SHIFT),
+        );
+
+        let (mut engine, _dir, template, _stored) = fixture();
+        let head = engine.state.slot();
+        let gap = repointed(&engine, &template, [0x9A; 32], 2);
+        park_as_authenticated(&mut engine, gap);
+        let floor = engine.sync_after_slot();
+        assert!(floor < head);
+        engine.sync_rewind.fruitless = 3;
+        engine.sync_rewind.floor = floor + 1;
+        engine.sync_rewind.retry_at_ms = u64::MAX;
+        assert_eq!(
+            engine.sync_request_after_slot(1_000, CADENCE),
+            floor,
+            "a strictly lower floor is new ground and is asked for at once",
+        );
+    }
+
+    /// **P2P-6: unauthenticated orphans are the first to go.** They cannot
+    /// push out an orphan whose proposer signature verified, however many
+    /// sources send them.
+    #[test]
+    fn unauthenticated_orphans_are_evicted_before_authenticated_ones() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        const SIGNED: usize = 4;
+        let mut signed_ids = Vec::new();
+        for i in 0..SIGNED {
+            let mut env = template.clone();
+            env.header.parent = [0xA7; 32];
+            env.header.parent[0] = i as u8;
+            signed_ids.push(park_as_authenticated(&mut engine, env));
+        }
+        let mut unsigned_ids = Vec::new();
+        for i in 0..ORPHAN_MAX - SIGNED {
+            let env = unauthenticated_orphan(&template, i as u16, 2);
+            let id = *env.block_id().as_bytes();
+            unsigned_ids.push(id);
+            engine.park_orphan(id, env, Source::Gossip(Some([(i / ORPHANS_PER_SOURCE) as u8; 32])));
+        }
+        assert_eq!(engine.orphans.len(), ORPHAN_MAX);
+        assert_eq!(engine.orphans_evicted, 0);
+        let held = |engine: &Engine, id: &[u8; 32]| {
+            engine.orphans.iter().any(|(seen, _, _, _, _)| seen == id)
+        };
+
+        // A full pool, the four oldest entries authenticated: more
+        // unauthenticated envelopes displace only each other.
+        for i in 0..8u16 {
+            let env = unauthenticated_orphan(&template, 0x4000 + i, 2);
+            let id = *env.block_id().as_bytes();
+            engine.park_orphan(id, env, Source::Gossip(Some([0xF0; 32])));
+            assert!(held(&engine, &id));
+        }
+        assert_eq!(engine.orphans.len(), ORPHAN_MAX);
+        assert_eq!(engine.orphans_evicted, 8);
+        assert!(signed_ids.iter().all(|id| held(&engine, id)), "verified orphans stay");
+        assert!(
+            unsigned_ids[..8].iter().all(|id| !held(&engine, id))
+                && unsigned_ids[8..].iter().all(|id| held(&engine, id)),
+            "the oldest unauthenticated entries left, in FIFO order",
+        );
+
+        // A pool holding only authenticated orphans: an unauthenticated
+        // newcomer is dropped, an authenticated one evicts the oldest.
+        engine.orphans.retain(|(_, _, _, authentication, _)| authentication.is_some());
+        let mut i = 0u16;
+        while engine.orphans.len() < ORPHAN_MAX {
+            let mut env = template.clone();
+            env.header.parent = [0xB7; 32];
+            env.header.parent[..2].copy_from_slice(&i.to_le_bytes());
+            park_as_authenticated(&mut engine, env);
+            i += 1;
+        }
+        let before = engine.orphans_evicted;
+        let intruder = unauthenticated_orphan(&template, 0x7000, 2);
+        let intruder_id = *intruder.block_id().as_bytes();
+        engine.park_orphan(intruder_id, intruder, Source::Gossip(Some([0xF1; 32])));
+        assert!(!held(&engine, &intruder_id), "it is the newcomer that is dropped");
+        assert_eq!(engine.orphans_evicted, before + 1);
+        assert!(signed_ids.iter().all(|id| held(&engine, id)));
+
+        let mut env = template.clone();
+        env.header.parent = [0xC7; 32];
+        let newcomer = park_as_authenticated(&mut engine, env);
+        assert!(held(&engine, &newcomer));
+        assert!(!held(&engine, &signed_ids[0]), "authenticated work is FIFO among itself");
+        assert_eq!(engine.orphans.len(), ORPHAN_MAX);
+    }
+
     /// **A repeated orphan takes one slot, not one per delivery.** Without the
     /// dedup a full mesh re-offering the same block would evict the whole pool
     /// with copies of itself.
@@ -15129,7 +18614,16 @@ mod ingest_admission_tests {
         let incoming = orphan_with_encoded_len(&template, [0xEF; 32], first_large_bytes);
         let incoming_id = *incoming.block_id().as_bytes();
         let evicted_before = engine.orphans_evicted;
-        engine.park_orphan(incoming_id, incoming, Source::Gossip(Some([0xEF; 32])));
+        // Authenticated, because only a verified orphan requests recovery
+        // (P2P-6); the entries it displaces are all unauthenticated, so the
+        // eviction order under test is still plain FIFO.
+        let incoming_proof = AuthenticatedBlockAdmission::new(&incoming, &[0u8; 32]);
+        engine.park_orphan_authenticated(
+            incoming_id,
+            incoming,
+            Source::Gossip(Some([0xEF; 32])),
+            Some(incoming_proof),
+        );
 
         let expected_evictions = tiny_entries + 1;
         assert_eq!(
@@ -15180,6 +18674,42 @@ mod ingest_admission_tests {
         assert_eq!(engine.orphans_evicted, before + 1);
         assert_eq!(engine.orphans.len(), 1);
         assert_eq!(engine.orphans[0].0, waiting_id, "immutable deferred bytes make admission impossible, so waiting work is untouched");
+    }
+
+    /// V2-10: gossip and directed delivery are one peer's one share.
+    #[test]
+    fn a_peer_has_one_retention_share_whichever_way_its_blocks_arrive() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        let peer = [0xA1; 32];
+        let orphan = |parent: [u8; 32]| {
+            let mut env = template.clone();
+            env.header.proposer_index = 7;
+            env.header.parent = parent;
+            env.header.slot = 2;
+            env
+        };
+        for i in 0..ORPHANS_PER_SOURCE {
+            assert_eq!(engine.ingest_judged_from_source(orphan([i as u8 + 1; 32]), Some(peer)), Verdict::Ignore);
+        }
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE);
+        let evicted = engine.orphans_evicted;
+        assert_eq!(engine.ingest_from_judged(orphan([0xD1; 32]), Source::Directed(Some(peer))), Verdict::Ignore);
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE, "the directed road is not a second share");
+        assert_eq!(engine.orphans_evicted, evicted + 1);
+        assert_eq!(engine.ingest_from_judged(orphan([0xD2; 32]), Source::Directed(Some([0xB1; 32]))), Verdict::Ignore);
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE + 1, "another peer still has its own");
+
+        assert!(Source::Gossip(Some(peer)).same_retention_share(Source::Directed(Some(peer))));
+        assert!(Source::Gossip(None).same_retention_share(Source::Directed(None)));
+        assert!(!Source::Gossip(Some(peer)).same_retention_share(Source::Gossip(None)));
+        assert!(!Source::Local.same_retention_share(Source::Gossip(None)));
+        assert!(Source::Local.same_retention_share(Source::Local));
+        let bytes = 100usize;
+        let held = [(Source::Gossip(Some(peer)), bytes), (Source::Directed(Some(peer)), bytes), (Source::Gossip(None), bytes)];
+        assert_eq!(
+            future_retention_totals(held.iter().map(|(s, b)| (s, b)), Source::Directed(Some(peer))),
+            (300, 2, 200),
+        );
     }
 
     #[test]
@@ -16146,6 +19676,549 @@ mod ingest_admission_tests {
         assert_eq!(engine.rejected_unsigned, 1);
     }
 
+    /// **FC-4: from the KES gate on, a signature failure under a GENESIS
+    /// index is a forgery only if the finalized state says so.**
+    ///
+    /// This head has not bound KES and holds no KES entry for the proposer,
+    /// so it judges every proposal of a post-gate epoch against the static
+    /// key. A proposer that registered and signs with its leaf on a more
+    /// advanced head fails that check honestly. The envelope is parked and
+    /// the relaying peer is not charged. Before the fix it was `Reject`ed and
+    /// counted as unsigned.
+    #[test]
+    fn past_the_kes_gate_an_unprovable_signature_failure_is_parked_not_refused() {
+        let gate = bloch_pos_committee::params::KES_ACTIVATION_EPOCH;
+        assert!(bloch_pos_committee::params::kes_period(gate).is_some());
+        let slot = first_slot_of_epoch(gate).expect("the gate epoch has a first slot") + 2;
+        let (mut engine, _dir, template, stored) = fixture();
+        let _clock = validator_lifecycle::clock_at(slot);
+        assert_eq!(engine.state.kes_enforced_from(), None, "the head predates the bind");
+        assert!(engine.state.kes_roots().is_empty(), "and the proposer's registration");
+
+        // Stands in for the leaf signature: bytes the static key did not sign.
+        let mut leaf_signed = repointed(&engine, &template, [0x9A; 32], slot);
+        leaf_signed.proposer_sig.fill(0);
+        let verdict = engine.ingest_judged(leaf_signed.clone());
+        assert!(matches!(verdict, Verdict::Ignore), "a lagging head proves nothing: {verdict:?}");
+        assert_eq!(engine.rejected_unsigned, 0, "not counted as a forgery");
+        assert_eq!(engine.blocks.len(), stored, "not stored: it may not weigh on fork choice");
+        assert_eq!(engine.orphans.len(), 1, "parked for the head that can judge it");
+
+        // A finalized view that has not bound KES either changes nothing.
+        let finalized_root = engine.state.finality().finalized.root;
+        let finalized_state = engine.manifest.genesis_state();
+        engine.remember_kes_authority(finalized_root, &finalized_state);
+        assert!(!engine.signature_failure_is_provable(&*engine.state, template.header.proposer_index, gate));
+
+        // Before the gate the same failure is the provable forgery it always
+        // was, on the same engine.
+        assert!(engine.signature_failure_is_provable(&*engine.state, template.header.proposer_index, gate - 1));
+    }
+
+    /// The KES authority ring follows the canonical chain and shares one
+    /// entry map between blocks that did not change it.
+    #[test]
+    fn every_canonical_block_keeps_its_kes_authority() {
+        let (mut engine, _dir, _template, _stored) = fixture();
+        engine.propose(2);
+        engine.propose(3);
+        let head = *engine.head_id().as_bytes();
+        let (id, epoch, enforced_from, entries) = engine.kes_authorities.back().expect("recorded");
+        assert_eq!((*id, *epoch, *enforced_from), (head, 0, None));
+        assert!(entries.is_empty());
+        assert_eq!(engine.kes_authorities.len(), 3);
+        assert!(Arc::ptr_eq(entries, &engine.kes_authorities[0].3));
+        let state = engine.state.arc();
+        engine.remember_kes_authority(head, &state);
+        assert_eq!(engine.kes_authorities.len(), 3, "one entry per block");
+    }
+
+    /// **FC-4 / P2P-9: a vote judged against a stale view is ignored, a
+    /// provable fault is still rejected.**
+    ///
+    /// `judge` reads the roster and the keys from `rolled_to(epoch)` of this
+    /// node's head. With the head inside the vote's epoch on the vote's own
+    /// chain, and the node live and synced, a forged signature and a signer
+    /// outside the roster are faults of the sender. With the head still in
+    /// the previous epoch, or the node syncing or replaying, the very same
+    /// frames may be honest on a head this node has not reached.
+    #[test]
+    fn attestation_faults_are_scored_only_from_a_head_that_reached_the_vote() {
+        use bloch_pos_committee::attestation::RejectReason;
+        use bloch_pos_committee::gossip::IgnoreReason;
+        let vote = |engine: &Engine, validator: u32, slot: u64| {
+            let head = *engine.head_id().as_bytes();
+            let data = AttestationData {
+                slot,
+                head,
+                source_epoch: 0,
+                source_root: *engine.chain[0].1.as_bytes(),
+                target_epoch: 1,
+                target_root: head,
+            };
+            // Bytes the validator's key did not sign.
+            Attestation { data, validator, signature: vec![0u8; 16] }
+        };
+        let judge_at = |engine: &Engine, validator: u32, slot: u64| {
+            engine.judge(&mut AttestationPool::new(), vote(engine, validator, slot), 1)
+        };
+
+        // The head is in the vote's epoch, on its chain; live and synced.
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.propose(1);
+        engine.propose(32);
+        engine.wall_slot = 63;
+        engine.needs_sync = false;
+        assert_eq!(epoch_of(engine.state.slot()), 1);
+        assert!(engine.live);
+        // Validator 0's own duty slot in epoch 1, from the vote's branch.
+        let head = *engine.head_id().as_bytes();
+        let seed = engine.seed_for_attestation(&head, 1).expect("the head's branch is held");
+        let roster = engine.rolled_to(1).active_validators();
+        let duty = (32..64)
+            .find(|slot| committees::committee_for_slot(&seed, *slot, &roster).contains(&0))
+            .expect("validator 0 attests once in the epoch");
+        let judge = |engine: &Engine, validator: u32| judge_at(engine, validator, duty);
+        let forged = judge(&engine, 0);
+        assert!(matches!(forged, GossipDecision::Reject(RejectReason::BadSignature)), "{forged:?}");
+        let outsider = judge(&engine, 9_999);
+        assert!(matches!(outsider, GossipDecision::Reject(RejectReason::NotInCommittee)), "{outsider:?}");
+
+        // Not synced, or still replaying: the view may be stale.
+        engine.needs_sync = true;
+        assert!(matches!(judge(&engine, 0), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
+        assert!(matches!(judge(&engine, 9_999), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
+        engine.needs_sync = false;
+        engine.live = false;
+        assert!(matches!(judge(&engine, 0), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
+        assert!(matches!(judge(&engine, 9_999), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
+
+        // The head is still in the previous epoch: the roster and the keys
+        // are a forward projection of a head behind the vote.
+        let (mut lagging, _dir) = perf_support::proposing_engine();
+        lagging.propose(1);
+        lagging.wall_slot = 63;
+        lagging.needs_sync = false;
+        assert_eq!(epoch_of(lagging.state.slot()), 0);
+        assert!(matches!(judge(&lagging, 0), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
+        assert!(matches!(judge(&lagging, 9_999), GossipDecision::Ignore(IgnoreReason::Unjudgeable)));
+    }
+
+    /// **Review round 2, GATE-06: boot grace is timed from the end of
+    /// replay.** With a replay longer than the grace, the old timing (from
+    /// engine construction) left a window in which the node was neither in
+    /// grace nor "behind", because replay itself had refreshed
+    /// `last_applied_ms`.
+    #[test]
+    fn boot_grace_covers_the_restart_until_the_stale_head_test_takes_over() {
+        const SLOT_MS: u64 = 30_000;
+        let grace = 2 * SLOT_MS;
+        let constructed = 1_000_000;
+        // Replay took ten slots; its last block refreshed `last_applied_ms`.
+        let replay_done = constructed + 10 * SLOT_MS;
+        let last_applied = replay_done;
+        // A head hours old against the wall slot.
+        let (head_slot, wall_slot) = (100, 700);
+        // The slot loop starts at once, or after slow boot checks.
+        for loop_started in [replay_done, replay_done + 1, replay_done + 7_000] {
+            let mut now = loop_started;
+            while now <= loop_started + 4 * grace {
+                assert!(
+                    in_boot_grace(now, loop_started, grace)
+                        || node_is_behind(head_slot, wall_slot, now, last_applied, grace),
+                    "duties open on a stale head {} ms after the slot loop started",
+                    now - loop_started
+                );
+                now += 250;
+            }
+            assert!(in_boot_grace(loop_started, loop_started, grace));
+            assert!(in_boot_grace(loop_started + grace, loop_started, grace));
+            assert!(!in_boot_grace(loop_started + grace + 1, loop_started, grace));
+        }
+        // The defect: timed from construction, the first loop turn was
+        // outside the grace and the stale-head test was not yet true.
+        assert!(!in_boot_grace(replay_done, constructed, grace));
+        assert!(!node_is_behind(head_slot, wall_slot, replay_done, last_applied, grace));
+    }
+
+    /// **W3-3 (GATE-06): the slot loop starts the boot grace itself.** The
+    /// test above covers the two pure functions and passes with the fix
+    /// line removed; the loop cannot be driven from a unit test, so this
+    /// reads it: `booted_ms` is set after replay and before the first turn,
+    /// and the grace is measured from it.
+    #[test]
+    fn the_slot_loop_times_the_boot_grace_from_its_own_start() {
+        let source = include_str!("engine.rs");
+        let replay = source.find("if !engine.ingest_replay(env) || engine.state.head() != expected_id {").expect("boot replay");
+        let loop_start = source.find("    // ── The slot loop ──").expect("slot loop");
+        let stamp = source.find("    engine.booted_ms = now_ms();\n").expect("the grace is started by the slot loop");
+        let first_use = source.find("let in_grace = in_boot_grace(now, engine.booted_ms, two_slots_ms);").expect("grace read");
+        assert!(replay < loop_start && loop_start < stamp && stamp < first_use, "boot grace is not timed from the end of replay");
+        // Nothing between the stamp and the loop's first turn is a block
+        // application: the stamp is taken after the last boot work.
+        let turn = source[stamp..].find("        let (now, monotonic_now) = sample_clocks(monotonic_origin);").map(|o| stamp + o).expect("first turn");
+        assert!(!source[stamp..turn].contains("ingest_replay("), "replay runs after the grace started");
+    }
+
+    /// **W3-3 (GATE-03): the replay failure names the gate armed in the
+    /// past, and boot replay reports through that message.**
+    #[test]
+    fn a_replay_failure_names_a_gate_armed_at_or_below_the_failing_epoch() {
+        const M: u64 = u64::MAX;
+        let plain = "durable block log failed consensus replay; refusing to serve a partial head";
+        let gates: &[bloch_pos_committee::hard_forks::UnarmedGate] =
+            &[("params::A_EPOCH", M), ("params::B_EPOCH", 7_360), ("params::C_EPOCH", 9_000)];
+        // Below every armed gate: the plain diagnosis.
+        assert_eq!(replay_failure_message_for(gates, 7_359), plain);
+        // At the gate's own epoch and above: the gate is named, the inert
+        // one and the one still ahead are not.
+        for epoch in [7_360, 8_000] {
+            let msg = replay_failure_message_for(gates, epoch);
+            assert!(msg.starts_with(plain), "{msg}");
+            assert!(msg.contains("params::B_EPOCH = 7360") && msg.contains(&format!("epoch {epoch}")), "{msg}");
+            assert!(!msg.contains("A_EPOCH") && !msg.contains("C_EPOCH"), "{msg}");
+            assert!(msg.contains("re-released with a future epoch"), "{msg}");
+        }
+        // As shipped the only armed gates on the list are the two armed
+        // 2026-11-13 at 8620: plain below them, named from 8620 on.
+        assert_eq!(replay_failure_message(8_619), plain);
+        let msg = replay_failure_message(8_620);
+        assert!(msg.contains("params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH = 8620"), "{msg}");
+        assert!(msg.contains("params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH = 8620"), "{msg}");
+        assert_eq!(
+            bloch_pos_committee::hard_forks::gates_armed_at_or_below(
+                bloch_pos_committee::hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY,
+                M - 1
+            )
+            .len(),
+            2
+        );
+        // Wiring: the production message is the tested one over the
+        // canonical list, and boot replay fails with it.
+        let source = include_str!("engine.rs");
+        assert!(source.contains(
+            "    replay_failure_message_for(bloch_pos_committee::hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY, epoch)\n"
+        ));
+        let replay = source.find("if !engine.ingest_replay(env) || engine.state.head() != expected_id {").expect("boot replay");
+        let arm = &source[replay..];
+        let arm = &arm[..arm.find("\n        }\n").expect("end of the failure arm")];
+        assert!(arm.contains("replay_failure_message(replay_epoch)"), "boot replay no longer reports through the message");
+    }
+
+    /// What one clock scenario did to the step report and to the duty gates.
+    struct ClockScenario {
+        /// Steps reported, with the turn on which each was reported.
+        reports: Vec<(usize, ClockStep)>,
+        /// Whether duties were blocked, for the event turn and each later one.
+        blocked: Vec<bool>,
+    }
+
+    impl ClockScenario {
+        /// Time duties stayed blocked counting from the event turn, in ms.
+        fn blocked_from_event_ms(&self) -> u64 {
+            self.blocked.iter().take_while(|blocked| **blocked).count() as u64 * 500
+        }
+
+        /// Duties were never blocked again once they had opened.
+        fn stayed_open(&self) -> bool {
+            !self.blocked.iter().skip_while(|blocked| **blocked).any(|blocked| *blocked)
+        }
+    }
+
+    /// Simulated clocks for the clock-step tests (W3-1). The network produces
+    /// one block per slot, a third of a slot in, on TRUE time. The node's
+    /// wall clock starts `initial_wall_offset_ms` away from true time; turns
+    /// are 500 ms; on turn `EVENT_TURN` true time, the node's wall clock and
+    /// its monotonic clock advance by `event` instead (true, wall, monotonic).
+    /// The node's head is the newest block that exists and is not in its
+    /// future. The duty decision is the slot loop's own: `node_is_behind`,
+    /// `DutySyncGate` and `validator_duties_blocked`; the watch only reports.
+    fn run_clock_scenario(initial_wall_offset_ms: i64, event: (u64, i64, u64), turns_after: usize) -> ClockScenario {
+        const SLOT_MS: u64 = 30_000;
+        const TURN_MS: u64 = 500;
+        const EVENT_TURN: usize = 1_200; // twenty slots in
+        let two_slots = 2 * SLOT_MS;
+        let genesis = 1_700_000_000_000u64;
+        let slot_of = |ms: u64| (ms - genesis) / SLOT_MS;
+        let mut true_ms = genesis + 5_000 * SLOT_MS;
+        let mut wall = (true_ms as i64 + initial_wall_offset_ms) as u64;
+        let mut mono = 77u64;
+        let (mut head, mut last_applied) = (slot_of(wall).min(slot_of(true_ms)) - 1, wall);
+        let mut watch = ClockStepWatch::default();
+        let mut gate = DutySyncGate::default();
+        let mut out = ClockScenario { reports: Vec::new(), blocked: Vec::new() };
+        for turn in 0..EVENT_TURN + turns_after {
+            if turn == EVENT_TURN {
+                true_ms += event.0;
+                wall = (wall as i64 + event.1) as u64;
+                mono += event.2;
+            } else if turn > 0 {
+                true_ms += TURN_MS;
+                wall += TURN_MS;
+                mono += TURN_MS;
+            }
+            // Newest block the network has produced, capped at the node's
+            // wall slot (a block of a later slot waits as a future block).
+            let produced = slot_of(true_ms - SLOT_MS / 3);
+            let tip = produced.min(slot_of(wall));
+            if tip > head {
+                head = tip;
+                last_applied = wall;
+            }
+            if let Some(step) = watch.observe(wall, mono, two_slots) {
+                out.reports.push((turn, step));
+            }
+            let wall_slot = slot_of(wall);
+            let behind = node_is_behind(head, wall_slot, wall, last_applied, two_slots);
+            let quarantined = gate.update(behind, head, wall_slot, wall, two_slots);
+            let blocked = validator_duties_blocked(false, quarantined, false, false, false);
+            if turn < EVENT_TURN {
+                assert!(!blocked, "duties blocked before the event (turn {turn})");
+            } else {
+                out.blocked.push(blocked);
+            }
+        }
+        out
+    }
+
+    /// **Review round 2, W3-1 (and GATE-07): a clock step is reported and
+    /// never holds duties.**
+    ///
+    /// The watch has no hold, so the time it can keep a validator silent is
+    /// zero. What this test adds is the reason the hold was not needed and
+    /// could not be kept: after a step TO the right time, of any size, on a
+    /// chain that is producing blocks, the gates that do decide open duties
+    /// within two slots (here at once, since the head is fresh), including
+    /// the 2 to 2⅓ slot band the first guard never left; and after a step to
+    /// a WRONG time the stale-head gate is what refuses duties.
+    #[test]
+    fn a_clock_step_is_reported_and_never_holds_duties() {
+        const SLOT_MS: u64 = 30_000;
+        const EVENT_TURN: usize = 1_200;
+        let tol = 2 * SLOT_MS;
+        let hundred_slots = 60 * 100; // turns
+
+        // A slow clock corrected by 1.5, 2, 2.2, 2.5, 10 and 1000 slots.
+        for tenths in [15u64, 20, 22, 25, 100, 10_000] {
+            let step = tenths * SLOT_MS / 10;
+            let run = run_clock_scenario(-(step as i64), (500, 500 + step as i64, 500), hundred_slots);
+            let expected = if step > tol { vec![(EVENT_TURN, ClockStep::Forward(step))] } else { Vec::new() };
+            assert_eq!(run.reports, expected, "report for a step of {tenths}/10 slots");
+            assert!(run.blocked_from_event_ms() <= tol, "step of {tenths}/10 slots: duties blocked {} ms", run.blocked_from_event_ms());
+            assert!(run.stayed_open(), "step of {tenths}/10 slots: duties blocked again later");
+        }
+
+        // A turn that takes three slots with no clock step (a long reorg, a
+        // stalled process): both clocks moved together, so it is no step.
+        let run = run_clock_scenario(0, (3 * SLOT_MS, 3 * SLOT_MS as i64, 3 * SLOT_MS), hundred_slots);
+        assert_eq!(run.reports, Vec::new());
+        assert!(run.blocked_from_event_ms() <= tol && run.stayed_open());
+
+        // A host suspended for ten slots. The monotonic clock stood still
+        // and the wall clock was set right on resume: a real forward step
+        // to the right time, reported once, and duties resume.
+        let run = run_clock_scenario(0, (10 * SLOT_MS, 10 * SLOT_MS as i64, 0), hundred_slots);
+        assert_eq!(run.reports, vec![(EVENT_TURN, ClockStep::Forward(10 * SLOT_MS))]);
+        assert!(run.blocked_from_event_ms() <= tol && run.stayed_open());
+        // The same pause on a host whose monotonic clock counts it: no step.
+        let run = run_clock_scenario(0, (10 * SLOT_MS, 10 * SLOT_MS as i64, 10 * SLOT_MS), hundred_slots);
+        assert_eq!(run.reports, Vec::new());
+        assert!(run.blocked_from_event_ms() <= tol && run.stayed_open());
+        // A pause the two clocks saw differently (monotonic one slot, wall
+        // ten): the difference is the step.
+        let run = run_clock_scenario(0, (10 * SLOT_MS, 10 * SLOT_MS as i64, SLOT_MS), hundred_slots);
+        assert_eq!(run.reports, vec![(EVENT_TURN, ClockStep::Forward(9 * SLOT_MS))]);
+        assert!(run.blocked_from_event_ms() <= tol && run.stayed_open());
+
+        // A backward step of five slots (the clock is now slow): reported,
+        // not held. Slashing protection is what refuses a slot already
+        // signed; it is not modelled here.
+        let run = run_clock_scenario(0, (500, 500 - 5 * SLOT_MS as i64, 500), hundred_slots);
+        assert_eq!(run.reports, vec![(EVENT_TURN, ClockStep::Backward(5 * SLOT_MS))]);
+        assert_eq!(run.blocked_from_event_ms(), 0);
+        assert!(run.stayed_open());
+
+        // A forward step to a WRONG time, with the network still on true
+        // time: reported, and it is the stale-head gate, not the watch, that
+        // keeps this node from signing at the future slot for as long as
+        // blocks keep arriving.
+        for slots in [10u64, 1_000] {
+            let step = slots * SLOT_MS;
+            let run = run_clock_scenario(0, (500, 500 + step as i64, 500), hundred_slots);
+            assert_eq!(run.reports, vec![(EVENT_TURN, ClockStep::Forward(step))]);
+            println!("wrong step of {slots} slots: blocked {} ms", run.blocked_from_event_ms());
+            assert!(run.blocked_from_event_ms() >= tol, "wrong step of {slots} slots");
+        }
+    }
+
+    /// **W3-1: the watch itself.** Every sample is the next baseline, the
+    /// tolerance is exclusive, drift below it is silent, and one step is one
+    /// report however long the clock then stays where it stepped to.
+    #[test]
+    fn the_clock_step_watch_reports_each_step_once_and_keeps_no_state() {
+        let tol = 60_000u64;
+        let mut watch = ClockStepWatch::default();
+        assert_eq!(watch.observe(1_000_000, 0, tol), None, "the first sample is only a baseline");
+        // Jitter, slew, a long turn, and a step of exactly the tolerance.
+        let (mut wall, mut mono) = (1_000_000u64, 0u64);
+        for (dw, dm) in [(500, 500), (510, 500), (495, 500), (600_000, 600_000), (tol, 0), (0, tol), (500, 400)] {
+            wall += dw;
+            mono += dm;
+            assert_eq!(watch.observe(wall, mono, tol), None, "reported +{dw}/+{dm}");
+        }
+        // One millisecond over, forward and back.
+        wall += tol + 1;
+        assert_eq!(watch.observe(wall, mono, tol), Some(ClockStep::Forward(tol + 1)));
+        // The stepped clock is the baseline at once: silence from here on.
+        for _ in 0..1_000 {
+            wall += 500;
+            mono += 500;
+            assert_eq!(watch.observe(wall, mono, tol), None);
+        }
+        wall -= tol + 1;
+        assert_eq!(watch.observe(wall, mono, tol), Some(ClockStep::Backward(tol + 1)));
+        assert_eq!(watch.observe(wall + 500, mono + 500, tol), None);
+        // W3-1 part B: 70 s of block application inside a turn. The two
+        // clocks are sampled together, so both samples carry the 70 s.
+        let mut watch = ClockStepWatch::default();
+        assert_eq!(watch.observe(5_000_000, 1_000, tol), None);
+        assert_eq!(watch.observe(5_070_500, 71_500, tol), None);
+        assert_eq!(watch.observe(5_071_000, 72_000, tol), None);
+    }
+
+    /// **W3-1 / W3-3: the wiring in the slot loop.** The loop cannot be
+    /// driven from a unit test, so this reads it: both clocks come from the
+    /// one paired sample, and nothing derived from the clock watch reaches
+    /// the duty decision.
+    #[test]
+    fn the_slot_loop_samples_both_clocks_together_and_the_clock_watch_cannot_block_duties() {
+        let source = include_str!("engine.rs");
+        let start = source.find("    // ── The slot loop ──").expect("slot loop");
+        let end = source[start..]
+            .find("        // ── Metrics turn (C-R6-2)")
+            .map(|offset| start + offset)
+            .expect("end of the duty part of the turn");
+        let turn = &source[start..end];
+        assert_eq!(
+            turn.matches("let (now, monotonic_now) = sample_clocks(monotonic_origin);").count(),
+            1,
+            "the turn's wall time must come from the paired sample"
+        );
+        assert!(!turn.contains("let now = now_ms();"), "the wall clock is read apart from the monotonic clock");
+        assert_eq!(turn.matches("monotonic_origin.elapsed()").count(), 0, "a second, later monotonic read");
+        assert!(turn.contains("clock_step_watch.observe(now, monotonic_now, two_slots_ms)"));
+        let blocked = turn.find("let duties_blocked = validator_duties_blocked(").expect("duty decision");
+        let decision_end = turn[blocked..].find(";\n").map(|offset| blocked + offset).expect("end of the decision");
+        let decision = &turn[blocked..decision_end];
+        assert!(
+            !decision.contains("clock") && !decision.contains("monotonic"),
+            "the duty decision reads the clock watch: {decision}"
+        );
+        // The watch's result is consumed where it is produced (the `match`
+        // that prints it); no binding carries it further.
+        assert_eq!(turn.matches("clock_step_watch").count(), 2, "declared once, observed once");
+        assert!(turn.contains("match clock_step_watch.observe("));
+    }
+
+    /// **Review round 2, GATE-04: an arriving attestation cannot make a
+    /// lagging node roll its head across the whole gap for every block.**
+    #[test]
+    fn a_far_ahead_attestation_does_not_roll_a_lagging_head_per_block() {
+        use bloch_pos_committee::gossip::IgnoreReason;
+        let vote = |engine: &Engine, slot: u64, target_root: [u8; 32]| {
+            let data = AttestationData {
+                slot,
+                head: target_root,
+                source_epoch: 0,
+                source_root: *engine.chain[0].1.as_bytes(),
+                target_epoch: epoch_of(slot),
+                target_root,
+            };
+            Attestation { data, validator: 0, signature: vec![0u8; 16] }
+        };
+        let judge = |engine: &Engine, epoch: u64, target_root: [u8; 32]| {
+            engine.judge(&mut AttestationPool::new(), vote(engine, epoch * SLOTS_PER_EPOCH, target_root), epoch)
+        };
+        let unjudgeable = |d: &GossipDecision| matches!(d, GossipDecision::Ignore(IgnoreReason::Unjudgeable));
+
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.propose(1);
+        assert_eq!(epoch_of(engine.state.slot()), 0);
+        const WALL_EPOCH: u64 = 500;
+        engine.wall_slot = WALL_EPOCH * SLOTS_PER_EPOCH;
+
+        // Honest gossip while syncing: the target is a block this node does
+        // not hold yet. Ignored with no roll at all.
+        let d = judge(&engine, WALL_EPOCH, [0xAB; 32]);
+        assert!(unjudgeable(&d), "{d:?}");
+        assert_eq!(engine.state.memo_len(), 0, "an unknown-target vote must not roll the head");
+
+        // Beyond the consensus epoch walk nothing on this head can reach the
+        // vote's epoch: ignored with no roll, known target or not.
+        let head = *engine.head_id().as_bytes();
+        let d = judge(&engine, MAX_EPOCH_ADVANCE + 1, head);
+        assert!(unjudgeable(&d), "{d:?}");
+        assert_eq!(engine.state.memo_len(), 0);
+
+        // A known target (the stalled-network case): the long roll happens,
+        // once, and later votes of the same head are served from the memo.
+        assert_eq!(engine.state.roll_distance(WALL_EPOCH), WALL_EPOCH);
+        let _ = judge(&engine, WALL_EPOCH, head);
+        assert!(engine.state.memo_len() > 0, "a stalled head must still judge the wall epoch");
+        assert_eq!(engine.state.roll_distance(WALL_EPOCH), 0);
+        assert_eq!(engine.state.roll_distance(WALL_EPOCH + 1), 1);
+        assert!(engine.attestation_roll_admitted(WALL_EPOCH, &head));
+        assert!(engine.attestation_roll_admitted(WALL_EPOCH + 1, &head));
+
+        // Catch-up: the next applied block is a new head and empties the
+        // memo. A second long roll in the same wall slot is refused, so the
+        // cost is no longer the gap times the number of applied blocks.
+        engine.propose(2);
+        let head = *engine.head_id().as_bytes();
+        assert_eq!(engine.state.memo_len(), 0);
+        let d = judge(&engine, WALL_EPOCH, head);
+        assert!(unjudgeable(&d), "{d:?}");
+        assert_eq!(engine.state.memo_len(), 0, "the roll repeated after an applied block");
+
+        // The next wall slot has its own allowance.
+        engine.wall_slot += 1;
+        let _ = judge(&engine, WALL_EPOCH, head);
+        assert!(engine.state.memo_len() > 0);
+
+        // A synced node at an epoch boundary is never restricted: the wall
+        // epoch and the next one are within the free distance, known target
+        // or not, any number of times per slot.
+        let (mut synced, _dir) = perf_support::proposing_engine();
+        synced.propose(1);
+        synced.wall_slot = SLOTS_PER_EPOCH;
+        for _ in 0..3 {
+            assert!(synced.attestation_roll_admitted(1, &[0xAB; 32]));
+            assert!(synced.attestation_roll_admitted(2, &[0xAB; 32]));
+            synced.propose(synced.state.slot() + 1);
+        }
+    }
+
+    /// From the KES gate on, a bad vote signature needs the finalized
+    /// authority as well, exactly like a proposal.
+    #[test]
+    fn past_the_kes_gate_a_bad_vote_signature_needs_the_finalized_authority() {
+        use bloch_pos_committee::attestation::RejectReason;
+        let gate = bloch_pos_committee::params::KES_ACTIVATION_EPOCH;
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.propose(1);
+        engine.propose(32);
+        engine.needs_sync = false;
+        let head = *engine.head_id().as_bytes();
+        let state = engine.state.arc();
+        // Before the gate: provable from a head that reached the vote.
+        assert!(engine.attestation_fault_is_provable(RejectReason::BadSignature, &*state, 0, 1, &head));
+        assert!(!engine.attestation_fault_is_provable(RejectReason::BadSignature, &*state, 0, 1, &[0x9A; 32]),
+            "a target this chain does not contain");
+        // Past it, with a head that has not bound KES: never.
+        assert!(!engine.signature_failure_is_provable(&*state, 0, gate));
+        assert!(!engine.attestation_fault_is_provable(RejectReason::BadSignature, &*state, 0, gate, &head));
+    }
+
     #[test]
     fn rejection_logging_burst_preserves_every_forgery_verdict_and_counter() {
         let (mut engine, _dir, template, stored) = fixture();
@@ -16365,6 +20438,220 @@ mod ingest_admission_tests {
         assert_eq!(*engine.head_id().as_bytes(), *child.block_id().as_bytes());
     }
 
+    /// One proposed block, handed back so it can arrive over the network.
+    fn undelivered_block(slot: u64) -> (Engine, perf_support::TestDir, BlockEnvelope) {
+        let (mut engine, dir) = perf_support::proposing_engine();
+        let genesis = *engine.head_id().as_bytes();
+        engine.propose(slot);
+        let block = engine.blocks[engine.head_id().as_bytes()].clone();
+        assert!(engine.do_reorg(genesis, Vec::new()));
+        engine.blocks.remove(block.block_id().as_bytes()).expect("stored block");
+        (engine, dir, block)
+    }
+
+    /// Spend `lane` completely at `slot`: as many sources as it takes each
+    /// spend their whole share on distinct input (no failure allowance is
+    /// applied, so every unit is really spent).
+    fn spend_lane(
+        engine: &Engine,
+        slot: u64,
+        lane: verification::VerificationLane,
+        cap: usize,
+        source_cap: usize,
+    ) {
+        let mut n = 0u64;
+        while engine.gossip_verifier.lane_used_at(slot, lane) < cap {
+            let mut source = [0x5Au8; 32];
+            source[..8].copy_from_slice(&(n / source_cap as u64).to_le_bytes());
+            let mut root = [0u8; 32];
+            root[..8].copy_from_slice(&n.to_le_bytes());
+            root[31] = lane as u8;
+            let verifier = engine.gossip_verifier
+                .budgeted_lane_for_source(slot, lane, cap, Some(source), source_cap);
+            assert!(!verifier.verify_with_key(b"malformed", &root, b"malformed"));
+            assert!(!verifier.limited());
+            n = n.saturating_add(1);
+        }
+    }
+
+    /// P2P-3: attestations and transactions spending their whole allowance
+    /// must not stop a block from being verified in the same wall slot.
+    #[test]
+    fn spent_relay_allowance_does_not_stop_a_block_in_the_same_slot() {
+        let _clock = validator_lifecycle::clock_at(4);
+        let (mut engine, _dir, block) = undelivered_block(1);
+        spend_lane(
+            &engine,
+            4,
+            verification::VerificationLane::Relay,
+            GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+            GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+        );
+        let spent = engine.gossip_verifier.budgeted_for_source(
+            4,
+            GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+            Some([0xE1; 32]),
+            GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+        );
+        assert!(!spent.verify_with_key(b"malformed", &[0xE1; 32], b"malformed"));
+        assert!(spent.limited(), "the attestation and transaction allowance is spent");
+        drop(spent);
+
+        assert_eq!(
+            engine.ingest_judged_from_source(block.clone(), Some([0xE2; 32])),
+            Verdict::Accept,
+        );
+        assert_eq!(*engine.head_id().as_bytes(), *block.block_id().as_bytes());
+        assert_eq!(
+            engine.gossip_verifier.lane_used_at(4, verification::VerificationLane::GossipBlock),
+            1,
+        );
+        // The worst case stays finite and of the same order as before.
+        assert_eq!(
+            GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT
+                + BLOCK_VERIFICATIONS_TOTAL_PER_SLOT
+                + DIRECTED_BLOCK_VERIFICATIONS_TOTAL_PER_SLOT,
+            1_792,
+        );
+    }
+
+    /// P2P-3: gossiped blocks cannot spend the allowance reserved for
+    /// directed sync and operator-configured peers.
+    #[test]
+    fn spent_gossip_block_allowance_does_not_stop_a_directed_block() {
+        let _clock = validator_lifecycle::clock_at(4);
+        let (mut engine, _dir, block) = undelivered_block(1);
+        spend_lane(
+            &engine,
+            4,
+            verification::VerificationLane::GossipBlock,
+            BLOCK_VERIFICATIONS_TOTAL_PER_SLOT,
+            BLOCK_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+        );
+        assert_eq!(
+            engine.ingest_from_judged(block.clone(), Source::Directed(Some([0xE3; 32]))),
+            Verdict::Accept,
+        );
+        assert_eq!(*engine.head_id().as_bytes(), *block.block_id().as_bytes());
+        assert!(engine.orphans.is_empty());
+    }
+
+    /// P2P-3: forgeries are charged to the source that sent them. Past its
+    /// failure allowance the source is ignored without verification, without
+    /// spending a shared unit and without occupying the orphan pool; another
+    /// source is judged normally in the same slot.
+    #[test]
+    fn source_past_its_block_failure_allowance_is_ignored_unverified() {
+        let _clock = validator_lifecycle::clock_at(4);
+        let (mut engine, _dir, block) = undelivered_block(1);
+        let noisy = [0xE4; 32];
+        let lane = verification::VerificationLane::GossipBlock;
+        let forged = |n: usize| {
+            let mut forged = block.clone();
+            forged.proposer_sig.fill(0);
+            forged.proposer_sig[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            forged
+        };
+        for n in 0..BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT {
+            assert_eq!(
+                engine.ingest_judged_from_source(forged(n), Some(noisy)),
+                Verdict::Reject,
+            );
+        }
+        assert_eq!(
+            engine.gossip_verifier.lane_used_at(4, lane),
+            BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT,
+        );
+        let rejected = engine.rejected_unsigned;
+
+        engine.gossip_verifier.set_panic_on_verification(true);
+        for n in 100..140 {
+            assert_eq!(
+                engine.ingest_judged_from_source(forged(n), Some(noisy)),
+                Verdict::Ignore,
+            );
+        }
+        // Even its valid block waits for the next slot.
+        assert_eq!(
+            engine.ingest_judged_from_source(block.clone(), Some(noisy)),
+            Verdict::Ignore,
+        );
+        engine.gossip_verifier.set_panic_on_verification(false);
+        assert_eq!(
+            engine.gossip_verifier.lane_used_at(4, lane),
+            BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT,
+            "an ignored source spends no shared unit",
+        );
+        assert_eq!(engine.rejected_unsigned, rejected);
+        assert!(engine.orphans.is_empty(), "and is not parked");
+        assert!(engine.deferred_orphans.is_empty());
+
+        assert_eq!(
+            engine.ingest_judged_from_source(block.clone(), Some([0xE5; 32])),
+            Verdict::Accept,
+        );
+        assert_eq!(*engine.head_id().as_bytes(), *block.block_id().as_bytes());
+    }
+
+    /// P2P-3: a block refused only by the spent allowance is parked, not
+    /// dropped, stays parked for the rest of that slot, and is judged and
+    /// admitted when the next slot renews the allowance.
+    #[test]
+    fn budget_limited_block_is_parked_and_admitted_at_the_next_slot() {
+        let clock = validator_lifecycle::clock_at(4);
+        let (mut engine, _dir, block) = undelivered_block(1);
+        let genesis = *engine.head_id().as_bytes();
+        let id = *block.block_id().as_bytes();
+        let source = [0xE6; 32];
+        spend_lane(
+            &engine,
+            4,
+            verification::VerificationLane::GossipBlock,
+            BLOCK_VERIFICATIONS_TOTAL_PER_SLOT,
+            BLOCK_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+        );
+
+        assert_eq!(
+            engine.ingest_judged_from_source(block.clone(), Some(source)),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.orphans.len(), 1, "held, not dropped");
+        assert_eq!(engine.orphans[0].0, id);
+        assert_eq!(engine.orphans[0].2, Source::Gossip(Some(source)));
+        assert!(engine.orphans[0].3.is_none(), "and still unauthenticated");
+        assert!(!engine.blocks.contains_key(&id));
+        // A repeat is recognised without another park.
+        assert_eq!(
+            engine.ingest_judged_from_source(block.clone(), Some([0xE7; 32])),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.orphans.len(), 1);
+
+        let mut scheduler = DeferredWorkScheduler::default();
+        let mut block_scheduler = DeferredBlockScheduler::default();
+        assert_eq!(
+            engine.release_deferred_work_turn(4, &mut scheduler, &mut block_scheduler),
+            (false, false, false),
+            "the same slot has no allowance to judge it with",
+        );
+        assert_eq!(engine.orphans.len(), 1);
+        assert_eq!(*engine.head_id().as_bytes(), genesis);
+
+        drop(clock);
+        let _clock = validator_lifecycle::clock_at(5);
+        let (future_pending, orphans_pending, _) =
+            engine.release_deferred_work_turn(5, &mut scheduler, &mut block_scheduler);
+        assert!(!future_pending && !orphans_pending);
+        assert!(engine.orphans.is_empty());
+        assert!(engine.deferred_orphans.is_empty());
+        assert_eq!(*engine.head_id().as_bytes(), id, "admitted at the next slot");
+        assert_eq!(
+            engine.gossip_verifier.lane_used_at(5, verification::VerificationLane::GossipBlock),
+            1,
+            "its proposer signature was verified under the renewed allowance",
+        );
+    }
+
     #[test]
     fn deferred_block_registry_key_change_reverifies_and_fails_closed() {
         let clock = validator_lifecycle::clock_at(1);
@@ -16394,7 +20681,11 @@ mod ingest_admission_tests {
 
         // Replace only the local registry projection. The queued proof is
         // still bound to the old key and therefore cannot authorize release.
+        // The reorg ring would still name the parent's real post-state, and
+        // the door reads the proposer's authority from it when it can
+        // (V1-2); drop it so the swapped projection is what is consulted.
         engine.state.set_arc(other_registry.state.arc());
+        engine.recent_states.clear();
         let rejected_before = engine.rejected_unsigned;
 
         drop(clock);
@@ -16689,6 +20980,101 @@ mod ingest_admission_tests {
         assert_eq!(engine.forkchoice_head(), chosen_head);
         assert_eq!(engine.blocks_pruned - before_blocks, 3);
         assert_eq!(engine.orphans_evicted - before_orphans, 4);
+    }
+
+    /// A copy of `template` under `parent` at `slot`, carrying one body
+    /// attestation dated `att_slot`, with the header commitment and the
+    /// proposer signature redone so the attestation's slot is the only thing
+    /// the door can hold against it.
+    fn carrying_vote_dated(
+        engine: &Engine,
+        template: &BlockEnvelope,
+        parent: [u8; 32],
+        slot: u64,
+        att_slot: u64,
+    ) -> BlockEnvelope {
+        let mut env = template.clone();
+        env.header.parent = parent;
+        env.header.slot = slot;
+        env.body.attestations = vec![Attestation {
+            data: AttestationData {
+                slot: att_slot,
+                head: parent,
+                source_epoch: 0,
+                source_root: [0; 32],
+                target_epoch: epoch_of(att_slot).max(1),
+                target_root: parent,
+            },
+            validator: 0,
+            signature: vec![0xA5; 64],
+        }];
+        env.header.attestation_root = derive::attestation_root(&env.body.attestations);
+        env.proposer_sig = engine
+            .keys
+            .as_ref()
+            .expect("the proposing fixture holds a keystore")
+            .sign(&env.header.proposal_signing_root());
+        env
+    }
+
+    /// **FC-1 (c): a body attestation dated after its block, or outside its
+    /// block's epoch, keeps the whole block out of every retention pool.**
+    ///
+    /// The transition rejects such a block on every branch (step 8: the vote's
+    /// epoch must be the block's epoch; `attestation::validate`: the vote's
+    /// slot must not exceed the block's slot), so nothing the transition
+    /// would accept is refused here. The control is the same block with the
+    /// vote dated at the block's own slot: it passes the door.
+    #[test]
+    fn a_body_attestation_outside_its_blocks_slot_range_is_refused_before_storage() {
+        let _clock = validator_lifecycle::clock_at(2 * SLOTS_PER_EPOCH);
+        let (mut engine, _dir, template, stored) = fixture();
+        let head = *engine.head_id().as_bytes();
+        let next_epoch = SLOTS_PER_EPOCH + 1;
+
+        let refused = [
+            // Dated one slot after the block that carries it.
+            carrying_vote_dated(&engine, &template, head, 2, 3),
+            // Dated at the far end of the slot space.
+            carrying_vote_dated(&engine, &template, head, 3, u64::MAX),
+            // An earlier slot, but of the epoch before the block's.
+            carrying_vote_dated(&engine, &template, head, next_epoch, SLOTS_PER_EPOCH - 1),
+            // Unknown parent: must not be parked as an orphan either.
+            carrying_vote_dated(&engine, &template, [0x9A; 32], 4, 5),
+            // Not yet due: must not be parked as a future block either.
+            carrying_vote_dated(&engine, &template, head, 2 * SLOTS_PER_EPOCH + 1, u64::MAX),
+        ];
+        for env in refused {
+            let id = *env.block_id().as_bytes();
+            let (slot, att_slot) = (env.header.slot, env.body.attestations[0].data.slot);
+            assert_eq!(
+                engine.ingest_judged(env),
+                Verdict::Ignore,
+                "block at slot {slot} carrying a vote dated {att_slot}: refused, and no \
+                 peer is charged for relaying it"
+            );
+            assert!(!engine.blocks.contains_key(&id), "slot {slot}/{att_slot}: stored");
+            assert_eq!(engine.blocks.len(), stored, "slot {slot}/{att_slot}: store changed");
+            assert!(engine.orphans.is_empty(), "slot {slot}/{att_slot}: parked as an orphan");
+            assert!(engine.deferred_orphans.is_empty());
+            assert!(engine.future_blocks.is_empty(), "slot {slot}/{att_slot}: parked as future");
+            assert_eq!(*engine.head_id().as_bytes(), head, "the head must not move");
+        }
+
+        // Control: the same shape with the vote dated at its block's slot is
+        // within the transition's range and passes the door.
+        let in_range = carrying_vote_dated(&engine, &template, head, 5, 5);
+        assert_eq!(
+            engine.ingest_judged(in_range),
+            Verdict::Accept,
+            "a vote dated at its own block's slot is not what this refusal is about"
+        );
+        let boundary = carrying_vote_dated(&engine, &template, head, next_epoch, SLOTS_PER_EPOCH);
+        assert_eq!(
+            engine.ingest_judged(boundary),
+            Verdict::Accept,
+            "the first slot of the block's own epoch is in range"
+        );
     }
 
     /// **Pruning is finality-shaped, not slot-shaped.** With nothing finalized
@@ -17731,3 +22117,321 @@ mod l2_admission_tests {
 #[cfg(test)]
 #[path = "engine/kes_tests.rs"]
 mod kes_tests;
+
+/// Fork choice whose stake vector depends on which branch is canonical.
+///
+/// Rehearsal 2026-10-25 (`hf-run`, node 2): after the inactivity leak, two
+/// siblings of block 0fc9991f (slot 870) were held up by one 40k-stake vote
+/// each — slot 871 (epoch 27) and the branch 872/877/901 (901 is epoch 28).
+/// On the epoch-27 state the stakes tied and the larger root (the 872 side)
+/// won; on the epoch-28 state the leak had just charged the 872 side's voter,
+/// whose epoch-27 vote that branch never included, and the 871 side won.
+/// `advance` recomputed the head after every reorg, so it reorganised between
+/// the two for as long as its bound (two per stored block, ~1,350 on a
+/// 670-block store) allowed — over 100 reorgs logged before the run ended,
+/// with the engine thread (and so RPC and block import) blocked throughout.
+///
+/// The hook below substitutes the vector per head so the shape can be built
+/// from two ordinary sibling blocks instead of five epochs of leak.
+#[cfg(test)]
+mod forkchoice_cycle_tests {
+    use super::forkchoice_tests::attest;
+    use super::*;
+    use bloch_pos_committee::sample::Validator;
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn Fn(&[u8; 32]) -> Option<Vec<Validator>>>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
+        static SEEN: RefCell<Vec<[u8; 32]>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Read by `Engine::forkchoice_validators` in test builds only.
+    pub(super) fn stake_override(head: &[u8; 32]) -> Option<Vec<Validator>> {
+        HOOK.with(|hook| {
+            let hook = hook.borrow();
+            let f = hook.as_ref()?;
+            SEEN.with(|seen| seen.borrow_mut().push(*head));
+            f(head)
+        })
+    }
+
+    /// Installs the hook for one test and removes it on drop, panics included.
+    struct Installed;
+
+    impl Installed {
+        fn new(f: impl Fn(&[u8; 32]) -> Option<Vec<Validator>> + 'static) -> Self {
+            HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+            SEEN.with(|seen| seen.borrow_mut().clear());
+            Installed
+        }
+
+        /// How many times the canonical head changed while fork choice ran.
+        fn head_changes(&self) -> usize {
+            SEEN.with(|seen| {
+                let seen = seen.borrow();
+                seen.windows(2).filter(|w| w[0] != w[1]).count()
+            })
+        }
+    }
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            HOOK.with(|hook| *hook.borrow_mut() = None);
+            SEEN.with(|seen| seen.borrow_mut().clear());
+        }
+    }
+
+    fn stakes(v0: u64, v1: u64) -> Vec<Validator> {
+        vec![
+            Validator { index: 0, effective_stake: v0 },
+            Validator { index: 1, effective_stake: v1 },
+        ]
+    }
+
+    /// The canonical tip and a stored sibling-branch block, each held up by
+    /// one vote: validator 0 for the tip, validator 1 for the rival.
+    fn two_branches() -> (Engine, perf_support::TestDir, [u8; 32], [u8; 32]) {
+        let (mut engine, dir, _fork_point, rival) = reorg_state_tests::forked(1);
+        let tip = *engine.head_id().as_bytes();
+        let rival = *rival.block_id().as_bytes();
+        assert_ne!(tip, rival, "fixture: the rival must not be the canonical tip");
+        for att in [attest(0, 3, tip), attest(1, 3, rival)] {
+            engine.pool.insert((att.validator, att.data.signing_root()), att);
+        }
+        (engine, dir, tip, rival)
+    }
+
+    /// Each branch's own stake vector prefers the other branch. There is no
+    /// fixed point; `advance` must notice that it is back where it started
+    /// and stop instead of reorganising until its bound runs out.
+    #[test]
+    fn a_head_dependent_stake_vector_does_not_trap_advance_in_a_reorg_loop() {
+        let (mut engine, _dir, tip, rival) = two_branches();
+        let hook = Installed::new(move |head| {
+            if *head == tip {
+                Some(stakes(99, 100)) // on the tip's state the rival's voter weighs more
+            } else if *head == rival {
+                Some(stakes(100, 99)) // and on the rival's state the tip's voter does
+            } else {
+                None
+            }
+        });
+
+        engine.advance();
+
+        let changes = hook.head_changes();
+        let head = *engine.head_id().as_bytes();
+        assert!(
+            head == tip || head == rival,
+            "advance must end on one of the two branches"
+        );
+        assert!(
+            changes <= 1,
+            "fork choice flipped the head {changes} times inside one advance call; \
+             a head it already left must end the loop, not restart the reorg"
+        );
+    }
+
+    /// Control: when the stake vector does NOT depend on the head, the loop
+    /// still reorganises to the heavier branch and settles there.
+    #[test]
+    fn a_head_independent_stake_vector_still_reorganises_to_the_heavier_branch() {
+        let (mut engine, _dir, _tip, rival) = two_branches();
+        let hook = Installed::new(|_| Some(stakes(99, 100)));
+
+        engine.advance();
+
+        assert_eq!(*engine.head_id().as_bytes(), rival, "the rival carries more stake");
+        assert_eq!(hook.head_changes(), 1, "exactly one reorg, onto the rival");
+    }
+}
+
+/// FC-1 (security review 2026-11-10): body votes weigh on fork choice only
+/// for blocks that passed the state transition.
+///
+/// The inventory-level properties are pinned in `block_inventory.rs`. These
+/// drive the same claims through the engine's real paths: admission, apply,
+/// reorg, boot replay and the restart cache.
+#[cfg(test)]
+mod validated_vote_tests {
+    use super::*;
+
+    /// The pre-fix head: the full rebuild folding the body of EVERY stored
+    /// block. Equal to the node's head exactly when every stored body that
+    /// carries votes was validated (and none was released).
+    fn head_folding_every_stored_body(engine: &Engine) -> [u8; 32] {
+        lmd_ghost_head(
+            &engine.blocks,
+            engine.pool.values(),
+            &engine.forkchoice_validators(),
+            engine.state.finality().justified.root,
+        )
+    }
+
+    fn vote(validator: u32, slot: u64, head: [u8; 32]) -> Attestation {
+        Attestation {
+            validator,
+            data: AttestationData {
+                slot,
+                head,
+                source_epoch: 0,
+                source_root: [0u8; 32],
+                target_epoch: 1,
+                target_root: head,
+            },
+            signature: vec![0xA5; 64],
+        }
+    }
+
+    /// (a) A block stored on a side branch carries a vote, in the only
+    /// validator's name, that the transition would refuse (the signature is
+    /// not that validator's). It is stored — admission cannot judge it — and
+    /// the head stays where the signature-checked pool puts it.
+    #[test]
+    fn a_stored_unapplied_blocks_body_votes_do_not_move_the_head() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let (mut engine, _dir, _fork_point, rival) = reorg_state_tests::forked(1);
+        let tip = *engine.head_id().as_bytes();
+        let rival_id = *rival.block_id().as_bytes();
+        assert_ne!(tip, rival_id, "fixture: the rival is a sibling of the tip");
+
+        // The validator's own vote for the canonical tip, as the pool holds
+        // it after gossip admission.
+        let honest = vote(0, 3, tip);
+        engine.pool.insert((honest.validator, honest.data.signing_root()), honest);
+        assert_eq!(engine.forkchoice_head(), tip);
+
+        // A child of the rival whose body claims a later vote by the same
+        // validator for the rival's branch.
+        let mut carrier = rival.clone();
+        carrier.header.parent = rival_id;
+        carrier.header.slot = 4;
+        carrier.body.attestations = vec![vote(0, 4, rival_id)];
+        carrier.header.attestation_root = derive::attestation_root(&carrier.body.attestations);
+        carrier.proposer_sig = engine
+            .keys
+            .as_ref()
+            .expect("the proposing fixture holds a keystore")
+            .sign(&carrier.header.proposal_signing_root());
+        let carrier_id = *carrier.block_id().as_bytes();
+
+        assert_eq!(
+            engine.ingest_judged(carrier),
+            Verdict::Accept,
+            "fixture: the block passes admission and is stored"
+        );
+        assert!(engine.blocks.contains_key(&carrier_id), "stored, and never selected");
+        assert!(engine.blocks.contains_key(&rival_id));
+        assert!(
+            !engine.blocks.has_indexed_votes(&carrier_id),
+            "a stored block's body votes are not indexed before it is applied"
+        );
+        assert_eq!(engine.forkchoice_head(), tip, "unverified body votes moved the head");
+        assert_eq!(*engine.head_id().as_bytes(), tip, "and the canonical chain with it");
+        // Fixture guard: this is a case the old rule decided differently. A
+        // fold over every stored body retains the carried vote as the
+        // validator's latest message and walks to the carrier.
+        assert_eq!(
+            head_folding_every_stored_body(&engine),
+            carrier_id,
+            "fixture: the carried vote must be one the old fold would have counted"
+        );
+    }
+
+    /// (b) Validated history votes exactly as it did before: through live
+    /// apply, after being reorganised away, through boot replay and through
+    /// the restart cache, the head is the one the full rebuild over every
+    /// stored body selects.
+    #[test]
+    fn validated_blocks_vote_exactly_as_the_full_rebuild_counted_them() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.live = false;
+        // Epoch 0 carries no votes (its checkpoint is genesis). Run through
+        // epoch 1, stopping before its last block closes anything.
+        let last = 2 * SLOTS_PER_EPOCH - 1;
+        for slot in 1..=last {
+            engine.attest(slot);
+            engine.propose(slot);
+        }
+        assert_eq!(engine.state.slot(), last, "fixture: every proposal was adopted");
+        assert!(engine.finalized_latch.is_none(), "fixture: no body was released");
+        let logged: Vec<BlockEnvelope> = engine.chain[1..]
+            .iter()
+            .map(|(_, id)| engine.blocks[id.as_bytes()].clone())
+            .collect();
+        let carriers: Vec<[u8; 32]> = logged
+            .iter()
+            .filter(|env| !env.body.attestations.is_empty())
+            .map(|env| *env.block_id().as_bytes())
+            .collect();
+        assert!(!carriers.is_empty(), "fixture: some canonical block carries a vote");
+        let head = *engine.head_id().as_bytes();
+
+        let check = |engine: &Engine, path: &str| {
+            for id in &carriers {
+                assert!(engine.blocks.contains_key(id), "{path}: carrier missing");
+                assert!(engine.blocks.has_indexed_votes(id), "{path}: validated votes not indexed");
+            }
+            assert_eq!(
+                engine.forkchoice_head(),
+                head_folding_every_stored_body(engine),
+                "{path}: validated history must vote exactly as the full rebuild"
+            );
+        };
+        check(&engine, "live apply");
+        assert_eq!(engine.forkchoice_head(), head);
+
+        // Validated, then reorganised away: give back everything from the
+        // first carrier up. The blocks stay stored and keep voting.
+        let first_carrier = engine
+            .chain
+            .iter()
+            .position(|(_, id)| id.as_bytes() == &carriers[0])
+            .expect("the carrier is canonical");
+        let ancestor = *engine.chain[first_carrier - 1].1.as_bytes();
+        assert!(engine.do_reorg(ancestor, Vec::new()), "handing blocks back must succeed");
+        assert!(!engine.canonical.contains(&carriers[0]));
+        check(&engine, "reorganised away");
+        // And adopted again through a real reorg onto the same branch.
+        let branch = logged[first_carrier - 1..].to_vec();
+        assert!(engine.do_reorg(ancestor, branch), "the branch is valid");
+        assert_eq!(*engine.head_id().as_bytes(), head);
+        check(&engine, "re-adopted by reorg");
+
+        let reset = |engine: &mut Engine| {
+            let genesis = engine.manifest.genesis_id();
+            engine.state = StateCell::new(engine.manifest.genesis_state());
+            engine.chain = vec![(0, genesis)];
+            engine.canonical = BTreeSet::from([*genesis.as_bytes()]);
+            engine.blocks.clear();
+            engine.pool.clear();
+            engine.recent_states.clear();
+            engine.tx_slot_index.clear();
+            engine.tx_slot_index_order.clear();
+            engine.finalized_latch = None;
+        };
+
+        // Boot replay of the canonical log.
+        reset(&mut engine);
+        for env in logged.clone() {
+            assert!(engine.ingest_replay(env), "replay of validated history");
+        }
+        assert_eq!(*engine.head_id().as_bytes(), head);
+        check(&engine, "boot replay");
+
+        // Restart cache: the prefix is restored without re-running the
+        // transition, and must vote as the replayed prefix does.
+        engine.store.rewrite(&logged).expect("publish the log");
+        engine.write_local_cache().expect("write the restart cache");
+        reset(&mut engine);
+        let mut tail = logged.clone();
+        assert_eq!(
+            engine.restore_local_cache(&mut tail).expect("the cache restores"),
+            logged.len()
+        );
+        assert_eq!(*engine.head_id().as_bytes(), head);
+        check(&engine, "restart cache");
+    }
+}

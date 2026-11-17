@@ -11,6 +11,7 @@
 //! test vectors for `crates/bloch-finality-cert/tests/`.
 
 use super::*;
+use bloch_finality_cert::lc_proof;
 use bloch_finality_cert::{size_report, verify, verify_chain, Certificate, HybridSigCheck, Refusal, TrustAnchors};
 
 fn cert_of(engine: &mut Engine, epoch: Option<u64>, block: Option<[u8; 32]>, src: Option<u64>) -> (Json, Certificate) {
@@ -108,6 +109,46 @@ fn real_chain_certificates_verify_chain_and_refuse_forgeries() {
     );
     let _ = jl;
 
+    // getlcproof: the same certificate as a BLCLMP01 proof, on this chain's
+    // pre-HF1 state (no frozen set, KES registration closed).
+    let lc_of = |engine: &mut Engine, epoch: Option<u64>, src: Option<u64>, block: Option<[u8; 32]>| {
+        let j = engine
+            .serve_rpc(RpcRequest::LcProof { epoch, set_source_epoch: src, block })
+            .unwrap_or_else(|e| panic!("lc proof e{epoch:?}: {e:?}"));
+        assert_eq!(j.get("format").and_then(|f| f.as_str()), Some("BLCLMP01"));
+        let hex = j.get("proof").and_then(|p| p.as_str()).expect("proof hex").to_string();
+        let bytes = bloch_finality_cert::from_hex(&hex).expect("hex");
+        let p = lc_proof::MainnetProof::decode(&bytes).expect("decodes");
+        assert_eq!(p.encode(), bytes, "canonical round trip");
+        (j, p)
+    };
+    let (lj2, l2) = lc_of(&mut engine, Some(2), None, None);
+    let (_, l3) = lc_of(&mut engine, Some(3), None, None);
+    let (lj4, l4) = lc_of(&mut engine, None, None, Some(block_in_e2));
+    assert_eq!(l2.cert, c2, "same certificate as getfinalitycertificate");
+    assert_eq!(l4.cert, c4);
+    assert_eq!(lj2.get("weights").and_then(|w| w.as_str()), Some("bond"));
+    assert_eq!(lj4.get("kes").map(|k| k.to_string()), Some("null".to_string()));
+    assert!(l2.finality_set.is_none() && l2.kes.is_none(), "no extension below the gates");
+    let cfg = lc_proof::Config::mainnet();
+    let sigs = lc_proof::HybridConsensusVerifier;
+    let mut trusted: BTreeSet<[u8; 32]> = [anchor].into_iter().collect();
+    let lc_ok = lc_proof::verify_chain(&[l2, l3, l4], &mut trusted, &cfg, &sigs)
+        .unwrap_or_else(|(i, e)| panic!("proof {i}: {e:?}"));
+    for (a, b) in ok.iter().zip(&lc_ok) {
+        assert_eq!((a.epoch, a.root, a.votes, a.stake), (b.epoch, b.root, b.votes, b.stake), "same verdict");
+    }
+    // A cached reply, and an RPC error for what this node cannot prove.
+    assert_eq!(lc_of(&mut engine, Some(2), None, None).0.to_string(), lj2.to_string());
+    assert!(engine.serve_rpc(RpcRequest::LcProof { epoch: Some(fin + 1), set_source_epoch: None, block: None }).is_err());
+    // The accessor the extension relies on commits exactly what the root does.
+    let tree = engine.state.state_tree();
+    assert_eq!(
+        tree.get(&bloch_pos_committee::state_root::finality_leaf_key()),
+        Some(bloch_pos_committee::state_root::leaf_value_hash(&engine.state.committed_finality_record().committed_bytes())),
+        "committed_finality_record must be the leaf the state root holds"
+    );
+
     if let Ok(dir) = std::env::var("BLOCH_FINCERT_VECTORS") {
         let d = std::path::Path::new(&dir);
         std::fs::create_dir_all(d).unwrap();
@@ -117,4 +158,109 @@ fn real_chain_certificates_verify_chain_and_refuse_forgeries() {
         std::fs::write(d.join("cert_e4_ancestry.bin"), c4.encode()).unwrap();
         std::fs::write(d.join("ancestry_block.hex"), bloch_finality_cert::to_hex(&block_in_e2)).unwrap();
     }
+}
+
+#[test]
+fn the_retention_setting_is_parsed_without_refusing_to_start() {
+    use super::finality_cert::parse_cert_epochs;
+    assert_eq!(parse_cert_epochs(None), (16, None), "default");
+    assert_eq!(parse_cert_epochs(Some("0")), (0, None), "0 disables");
+    assert_eq!(parse_cert_epochs(Some("300")), (300, None), "the prover's value");
+    assert_eq!(parse_cert_epochs(Some(" 300\n")), (300, None), "whitespace from an env file");
+    assert_eq!(parse_cert_epochs(Some("4096")), (4096, None), "the limit itself");
+    let (n, why) = parse_cert_epochs(Some("5000"));
+    assert_eq!(n, 4096, "above the limit is capped");
+    assert!(why.is_some_and(|w| w.contains("above the limit")));
+    for bad in ["300x", "", "-1", "3e2"] {
+        let (n, why) = parse_cert_epochs(Some(bad));
+        assert_eq!(n, 16, "{bad:?} falls back to the default");
+        assert!(why.is_some_and(|w| w.contains("not a number")), "{bad:?} must be reported");
+    }
+}
+
+/// V2-2: a request this node can never answer, and a repeated request it
+/// already refused, must not read blocks back on the consensus thread; and
+/// the assemblies one slot can be made to do are bounded.
+#[test]
+fn refused_certificate_requests_read_no_blocks() {
+    let n = 4;
+    let (mut engine, _dir, others) = perf_support::proposing_engine_n(&[], n);
+    let mut vals: Vec<(Option<Keystore>, SlashingProtection)> = Vec::new();
+    let first = engine.keys.take();
+    for (i, k) in std::iter::once(first.expect("validator 0")).chain(others).enumerate() {
+        let d = _dir.0.join(format!("sp{i}"));
+        std::fs::create_dir_all(&d).unwrap();
+        vals.push((Some(k), SlashingProtection::open(&d).expect("slashprot")));
+    }
+    let as_each = |engine: &mut Engine, vals: &mut Vec<(Option<Keystore>, SlashingProtection)>, f: &dyn Fn(&mut Engine)| {
+        for v in vals.iter_mut() {
+            std::mem::swap(&mut engine.keys, &mut v.0);
+            std::mem::swap(&mut engine.slashprot, &mut v.1);
+            f(engine);
+            std::mem::swap(&mut engine.keys, &mut v.0);
+            std::mem::swap(&mut engine.slashprot, &mut v.1);
+        }
+    };
+    for slot in 1..=(9 * SLOTS_PER_EPOCH) {
+        as_each(&mut engine, &mut vals, &|e: &mut Engine| e.attest(slot));
+        as_each(&mut engine, &mut vals, &|e: &mut Engine| e.propose(slot));
+        if engine.state.finality().finalized.epoch >= 5 {
+            break;
+        }
+    }
+    assert!(engine.state.finality().finalized.epoch >= 5);
+    let ask = |engine: &mut Engine, epoch: u64, src: Option<u64>| {
+        engine.serve_rpc(RpcRequest::FinalityCertificate { epoch: Some(epoch), block: None, set_source_epoch: src })
+    };
+    let scans = |engine: &Engine| engine.finality_certs.vote_scans;
+
+    // A certificate this node can build costs two scans, once.
+    ask(&mut engine, 4, None).expect("epoch 4");
+    assert_eq!(scans(&engine), 2);
+    ask(&mut engine, 4, None).expect("epoch 4 again");
+    assert_eq!(scans(&engine), 2, "a repeated request is answered from the cache");
+
+    // The ring has moved on: the proofs of the checkpoints of epochs 1 to 3
+    // are gone, as on a node whose retention window is past them.
+    let keep: Vec<[u8; 32]> = (4..=6).map(|e| engine.checkpoint_root(e)).collect();
+    engine.finality_certs.registry.retain(|(id, _)| keep.contains(id));
+    engine.finality_certs.extensions.retain(|(id, _)| keep.contains(id));
+    assert!(!engine.finality_certs.registry.is_empty());
+    for (epoch, src) in [(2, None), (3, None), (3, Some(1)), (4, Some(2)), (5, Some(3))] {
+        let err = ask(&mut engine, epoch, src).unwrap_err();
+        assert_eq!(err.code, rpc::NODE_UNAVAILABLE, "{err:?}");
+        assert_eq!(scans(&engine), 2, "epoch {epoch} from {src:?} is refused before any block is read");
+    }
+    let err = engine.serve_rpc(RpcRequest::LcProof { epoch: Some(2), set_source_epoch: None, block: None }).unwrap_err();
+    assert_eq!(err.code, rpc::NODE_UNAVAILABLE);
+    assert_eq!(scans(&engine), 2);
+
+    // The per-slot bound: once it is spent, a request that would need the
+    // log is told to retry (and that answer is not remembered), while a
+    // cached one is still answered.
+    engine.finality_certs.builds = (engine.wall_slot(), u32::MAX);
+    let busy = ask(&mut engine, 5, None).unwrap_err();
+    assert!(busy.message.contains("per slot"), "{busy:?}");
+    assert_eq!(scans(&engine), 2);
+    ask(&mut engine, 4, None).expect("cached epoch 4");
+    engine.finality_certs.builds = (engine.wall_slot(), 0);
+    ask(&mut engine, 5, None).expect("epoch 5 in a later slot");
+    assert_eq!(scans(&engine), 4);
+
+    // A refusal that can only be decided after the scan (epoch 5 passes the
+    // window check, but the proof of its justifying source, the checkpoint
+    // of epoch 4, is now dropped too) is decided once.
+    let gone = engine.checkpoint_root(4);
+    engine.finality_certs.registry.retain(|(id, _)| *id != gone);
+    engine.finality_certs.extensions.retain(|(id, _)| *id != gone);
+    assert!(!engine.finality_certs.registry.is_empty());
+    engine.finality_certs.cache.clear();
+    engine.finality_certs.default_source.clear();
+    let first = ask(&mut engine, 5, None).unwrap_err();
+    let after_first = scans(&engine);
+    assert!(after_first > 4, "the first such request had to look");
+    for _ in 0..3 {
+        assert_eq!(ask(&mut engine, 5, None).unwrap_err(), first);
+    }
+    assert_eq!(scans(&engine), after_first, "a repeated failing request reads no blocks");
 }

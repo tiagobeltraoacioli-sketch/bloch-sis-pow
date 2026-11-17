@@ -17,11 +17,14 @@ pub(super) enum Source {
 }
 
 impl Source {
+    /// Keyed exactly like the inbound connection slots
+    /// (`connection_limit::limit_key`): an IPv4 address (IPv4-mapped IPv6
+    /// folded into it), or the /64 of an IPv6 address. Audit L1-03: keyed by
+    /// the full /128, one host holding a /64 opened its 20 connections from
+    /// 20 addresses and bought 20 independent backlog and verification
+    /// budgets.
     pub(super) fn ip(ip: IpAddr) -> Self {
-        Self::Ip(match ip {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
-            _ => ip,
-        })
+        Self::Ip(crate::connection_limit::limit_key(ip))
     }
 
     fn verification_key(&self) -> [u8; 32] {
@@ -70,6 +73,9 @@ pub(crate) struct Reservation {
     registry: Arc<Mutex<Registry>>,
     source: Source,
     bytes: usize,
+    /// Set for a block or vote read from an unconfigured devnet-mesh
+    /// connection; see [`super::DeliveryProof`].
+    delivery_proof: std::sync::OnceLock<super::DeliveryProof>,
 }
 
 impl Reservation {
@@ -84,6 +90,17 @@ impl Reservation {
     /// the guarded event reaches later queue accounting.
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    pub(super) fn set_delivery_proof(&self, proof: super::DeliveryProof) {
+        let _ = self.delivery_proof.set(proof);
+    }
+
+    /// The engine verified the message this reservation was made for.
+    pub(crate) fn delivery_verified(&self) {
+        if let Some(proof) = self.delivery_proof.get() {
+            proof.verified();
+        }
     }
 }
 
@@ -107,7 +124,7 @@ impl Registry {
         usage.bytes = source_bytes;
         state.total.count = state.total.count.saturating_add(1);
         state.total.bytes = total_bytes;
-        Some(Arc::new(Reservation { registry: registry.clone(), source, bytes }))
+        Some(Arc::new(Reservation { registry: registry.clone(), source, bytes, delivery_proof: std::sync::OnceLock::new() }))
     }
 }
 
@@ -243,6 +260,31 @@ mod tests {
         assert!(reserve(&registry, Source::Peer(vec![5]), EventClass::Block, 1).is_none());
         drop(all);
         assert_eq!(registry.lock().unwrap().total.bytes, 0);
+    }
+
+    /// Audit L1-03: every address of one IPv6 /64 is one source, for the
+    /// backlog reservation and the verification identity alike; another /64
+    /// is another source.
+    #[test]
+    fn ipv6_sources_share_one_budget_per_64() {
+        let a = Source::ip("2001:db8:1:2::1".parse().unwrap());
+        let b = Source::ip("2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap());
+        let other = Source::ip("2001:db8:1:3::1".parse().unwrap());
+        assert_eq!(a, b);
+        assert_eq!(a.verification_key(), b.verification_key());
+        assert_ne!(a.verification_key(), other.verification_key());
+        assert_eq!(
+            verification_source_for_ip("2001:db8:1:2::1".parse().unwrap()),
+            verification_source_for_ip("2001:db8:1:2::abcd".parse().unwrap()),
+        );
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let mut held = Vec::new();
+        while let Some(guard) = reserve(&registry, a.clone(), EventClass::Block, 1) {
+            held.push(guard);
+            assert!(held.len() <= SOURCE_EVENTS, "one /64 is capped like one address");
+        }
+        assert!(reserve(&registry, b.clone(), EventClass::Block, 1).is_none(), "a sibling address shares the cap");
+        assert!(reserve(&registry, other, EventClass::Block, 1).is_some(), "another /64 does not");
     }
 
     #[test]

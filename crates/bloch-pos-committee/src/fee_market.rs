@@ -1182,17 +1182,20 @@ mod tests {
 
     #[test]
     fn hf3_fee_gate_ships_inert_and_is_bit_identical_below_it() {
-        assert_eq!(crate::params::HF3_SLH_SUITE_EPOCH, u64::MAX);
+        assert_eq!(crate::params::HF3_SLH_SUITE_EPOCH, 7360);
         let slh_f = slh_key();
         let hyb = enveloped(0x0001, 3745);
         let unknown = enveloped(0x0004, 1984);
         let keys: [&[u8]; 3] = [&slh_f, &unknown, &hyb];
-        for epoch in [0, 1, 6_017, u64::MAX - 1, u64::MAX] {
+        for epoch in [0, 1, 6_017, 7_359] {
             assert!(!per_suite_verify_gas_active(epoch));
             assert_eq!(eutxo_class_for_keys(epoch, keys), TxClass::Eutxo { inputs: 3 });
             for k in keys {
                 assert_eq!(verify_cost_units_at(k, epoch), 1, "gossip budget unchanged below HF3");
             }
+        }
+        for epoch in [7_360, u64::MAX - 1, u64::MAX] {
+            assert!(per_suite_verify_gas_active(epoch));
         }
         // u64::MAX is "never" even when the epoch is u64::MAX itself.
         assert!(!per_suite_verify_gas_active_under(u64::MAX, u64::MAX));

@@ -158,7 +158,7 @@ mod kes_rules {
         // refused exactly as the previous release refused the unknown tag,
         // in consensus and at the relay.
         let (_t, g, _chains) = setup_with(4, ToyVerifier, &[]);
-        for epoch in [0, 1, 4_669, 1 << 32] {
+        for epoch in [0, 1, 4_669, 7_359] {
             let mut st = g.clone();
             st.epoch = epoch;
             let root_before = st.state_root();
@@ -702,7 +702,7 @@ mod kes_rules {
         st.kes.insert(1, toy_kes_public(1).into());
         let tx = rotate(&st, 1, 0, &toy_kes_public(1), &tree(1).0, &tree_from(0x51, DEPTH));
         // Compiled schedule: refused as the old binary refused the unknown tag.
-        for epoch in [0, 4_669, 1 << 32] {
+        for epoch in [0, 4_669, 7_359] {
             st.epoch = epoch;
             let root_before = st.state_root();
             assert_eq!(apply(&mut st, &tx), Err(TxReject::StakingNotActive), "epoch {epoch}");
@@ -1131,6 +1131,59 @@ mod kes_rules {
         assert_eq!(st.kes_enforced_from(), Some(bind));
     }
 
+    /// The mainnet schedule's numbers (registration e7360, gate e8620, 90-epoch
+    /// periods) with 9 of 10 equal validators registered: exactly 9000 bps.
+    /// Decided at the boundary into e8620, in force from e8622, first period
+    /// handover at e8710, which counts from the gate and so is bind + 88.
+    #[test]
+    fn mainnet_numbers_first_governed_epoch_is_8622_at_exactly_9000_bps() {
+        let _armed = Armed::at(7_360, 8_620, 90);
+        let (_t, g, _chains) = setup_with(10, ToyVerifier, &[]);
+        let mut st = g.clone();
+        st.epoch = 8_618;
+        for v in 0..9 {
+            let tx = register(&st, v, toy_kes_public(v));
+            apply(&mut st, &tx).unwrap();
+        }
+        st = st.close_epoch();
+        assert_eq!(st.epoch, 8_619);
+        assert_eq!(st.kes_enforced_from(), None, "a boundary before the gate decides nothing");
+        st = st.close_epoch();
+        assert_eq!(st.epoch, 8_620);
+        assert_eq!(st.kes_registered_stake_bps(8_620), 9_000);
+        assert_eq!(st.kes_enforced_from(), Some(8_622));
+        assert!(!crate::kes::is_bound(&view(&st), 8_621));
+        assert!(crate::kes::is_bound(&view(&st), 8_622));
+        assert_eq!(crate::kes::signing_mode(&view(&st), 0, 8_621), crate::kes::SigningMode::Static);
+        assert_eq!(crate::kes::signing_mode(&view(&st), 0, 8_622), crate::kes::SigningMode::Kes(0));
+        assert_eq!(crate::kes::signing_mode(&view(&st), 9, 8_622), crate::kes::SigningMode::Static, "static-key fallback");
+        assert_eq!(crate::params::kes_period(8_709), Some(0));
+        assert_eq!(crate::params::kes_period(8_710), Some(1));
+    }
+
+    /// Below 9000 bps at the first boundary nothing binds; the first later
+    /// boundary at the threshold decides, and the bind moves with it.
+    #[test]
+    fn mainnet_numbers_below_threshold_at_the_gate_moves_the_bind() {
+        let _armed = Armed::at(7_360, 8_620, 90);
+        let (_t, g, _chains) = setup_with(10, ToyVerifier, &[]);
+        let mut st = g.clone();
+        st.epoch = 8_619;
+        for v in 0..8 {
+            let tx = register(&st, v, toy_kes_public(v));
+            apply(&mut st, &tx).unwrap();
+        }
+        st = st.close_epoch();
+        assert_eq!(st.epoch, 8_620);
+        assert_eq!(st.kes_registered_stake_bps(8_620), 8_000);
+        assert_eq!(st.kes_enforced_from(), None);
+        let tx = register(&st, 8, toy_kes_public(8));
+        apply(&mut st, &tx).unwrap();
+        st = st.close_epoch();
+        assert_eq!(st.kes_enforced_from(), Some(8_623));
+        assert_eq!(crate::params::kes_period(8_623), Some(0));
+    }
+
     #[test]
     fn after_binding_an_unregistered_validator_falls_back_to_its_static_key() {
         let _armed = Armed::enforcing(2, 1);
@@ -1195,6 +1248,129 @@ mod kes_rules {
         st.epoch = 2 + 18;
         let again = register(&st, 1, public_of(&tree_from(0xA2, DEPTH)));
         assert_eq!(apply(&mut st, &again), Err(TxReject::StakingRule));
+    }
+
+    // ── Security review CR-5: the epoch-bound registration message ────────
+
+    /// A registration signed over the epoch-bound message for `epoch`.
+    fn register_for(st: &CommittedState, v: u32, public: KesPublic, epoch: u64) -> PosTransaction {
+        let domain = st.admission_network_domain.unwrap_or([0; 32]);
+        let pk = crate::attestation::KeyLookup::pubkey(st, v).expect("registered validator").to_vec();
+        PosTransaction::KesRegister {
+            validator: v,
+            depth: public.depth,
+            root: public.root,
+            signature: toy_sign(&pk, &kes::register_signing_root_v2(&domain, v, epoch, &public)),
+        }
+    }
+
+    #[test]
+    fn from_the_flag_day_a_registration_is_valid_only_in_the_epoch_it_was_signed_for() {
+        let _armed = Armed::at(0, u64::MAX, 90);
+        let _bound = crate::params::kes_register_binding_rehearsal::arm(20);
+        let (_t, g, _chains) = setup_with(4, ToyVerifier, &[]);
+        let mut st = g.clone();
+        // Before the flag day: the legacy message, and only it.
+        st.epoch = 19;
+        let early = register_for(&st, 1, toy_kes_public(1), 19);
+        assert_eq!(relay_check(&st, &early), Err(TxReject::StakingRule));
+        assert_eq!(apply(&mut st, &early), Err(TxReject::StakingRule), "the new form is not valid early");
+        let legacy = register(&st, 1, toy_kes_public(1));
+        assert_eq!(relay_check(&st, &legacy), Ok(()));
+        assert_eq!(apply(&mut st.clone(), &legacy), Ok(()), "the legacy form still is");
+        // From it on: the legacy signature no longer verifies...
+        st.epoch = 20;
+        assert_eq!(relay_check(&st, &legacy), Err(TxReject::StakingRule));
+        assert_eq!(apply(&mut st, &legacy), Err(TxReject::StakingRule), "legacy form after the flag day");
+        // ...and a bound one verifies in its own epoch only.
+        let fresh = register_for(&st, 1, toy_kes_public(1), 20);
+        let root_before = st.state_root();
+        for wrong in [19, 21, 22, 500] {
+            let mut other = st.clone();
+            other.epoch = wrong;
+            assert_eq!(relay_check(&other, &fresh), Err(TxReject::StakingRule), "epoch {wrong}");
+            assert_eq!(apply(&mut other, &fresh), Err(TxReject::StakingRule), "epoch {wrong}");
+            assert!(other.kes_roots().is_empty());
+        }
+        assert_eq!(st.state_root(), root_before);
+        assert_eq!(relay_check(&st, &fresh), Ok(()));
+        assert_eq!(apply(&mut st, &fresh), Ok(()), "a fresh registration in its epoch");
+        assert_eq!(st.kes_public(1), Some(toy_kes_public(1)));
+        // The wire form is the same one: the epoch is the block's, not a field.
+        assert_eq!(fresh.canonical_bytes().len(), legacy.canonical_bytes().len());
+    }
+
+    #[test]
+    fn a_retired_tree_pruned_from_the_history_cannot_be_registered_again_by_replay() {
+        // One-epoch periods, enforcement from epoch 2, bound on chain.
+        let _armed = Armed::enforcing(2, 1);
+        let _bound = crate::params::kes_register_binding_rehearsal::arm(0);
+        let (_t, g, _chains) = setup_with(4, ToyVerifier, &[]);
+        let mut st = bound(g.clone());
+        // Tree A is registered at epoch 5 (period 3; starts at period 4).
+        st.epoch = 5;
+        let tree_a = public_of(&tree_from(0xA1, DEPTH));
+        let original = register_for(&st, 1, tree_a, 5);
+        apply(&mut st, &original).unwrap();
+        assert_eq!(st.kes_roots()[&1].current.root, tree_a.root);
+        // Much later the validator is on tree C, A has left the pruned
+        // history, and C has expired with no successor: the rescue is open.
+        let tree_c = KesPublic::new(DEPTH, public_of(&tree_from(0xC3, DEPTH)).root, 1_000);
+        st.kes.insert(1, tree_c.into());
+        st.epoch = 2 + 1_000 + 16;
+        assert!(st.kes_rescue_open(1));
+        assert!(st.kes[&1].retired.is_empty(), "A is no longer in the history");
+        // The captured registration of A does not verify in this epoch.
+        let before = st.kes_roots()[&1].clone();
+        let root_before = st.state_root();
+        assert_eq!(relay_check(&st, &original), Err(TxReject::StakingRule));
+        assert_eq!(apply(&mut st, &original), Err(TxReject::StakingRule), "replayed registration");
+        assert_eq!(st.kes_roots()[&1], before);
+        assert_eq!(st.state_root(), root_before);
+        // The validator's own rescue, signed for this epoch, is accepted.
+        let tree_d = public_of(&tree_from(0xD4, DEPTH));
+        let rescue = register_for(&st, 1, tree_d, st.epoch);
+        assert_eq!(relay_check(&st, &rescue), Ok(()));
+        apply(&mut st, &rescue).unwrap();
+        assert_eq!(st.kes_roots()[&1].current.root, tree_d.root);
+        // And that rescue is itself dead one epoch on.
+        let mut later = st.clone();
+        later.kes.insert(1, tree_c.into());
+        later.epoch += 1;
+        assert_eq!(apply(&mut later, &rescue), Err(TxReject::StakingRule));
+    }
+
+    #[test]
+    fn with_the_flag_day_unarmed_the_registration_message_and_wire_form_are_the_legacy_ones() {
+        assert_eq!(crate::params::KES_REGISTER_EPOCH_BINDING_EPOCH, u64::MAX);
+        let _armed = Armed::at(0, u64::MAX, 90);
+        let (_t, g, _chains) = setup_with(4, ToyVerifier, &[]);
+        let public = toy_kes_public(1);
+        // The wire form, byte for byte: tag, validator LE, depth, root,
+        // u32 LE signature length, signature.
+        let fixed = PosTransaction::KesRegister { validator: 0x0102_0304, depth: 12, root: [0xAB; 32], signature: vec![0xCD; 3] };
+        let mut expected = vec![0x17, 0x04, 0x03, 0x02, 0x01, 12];
+        expected.extend_from_slice(&[0xAB; 32]);
+        expected.extend_from_slice(&[3, 0, 0, 0, 0xCD, 0xCD, 0xCD]);
+        assert_eq!(fixed.canonical_bytes(), expected);
+        assert_eq!(PosTransaction::from_canonical_bytes(&expected).unwrap(), fixed);
+        // One legacy-signed registration is valid at every epoch (today's
+        // rule, unchanged), and the epoch-bound form at none.
+        let legacy = register(&g, 1, public);
+        let mut roots = Vec::new();
+        for epoch in [0, 1, 7_360, 8_620, 1 << 40] {
+            let mut st = g.clone();
+            st.epoch = epoch;
+            assert_eq!(relay_check(&st, &legacy), Ok(()), "epoch {epoch}");
+            assert_eq!(apply(&mut st, &legacy), Ok(()), "epoch {epoch}");
+            assert_eq!(st.kes_public(1), Some(public));
+            roots.push(st.kes_roots()[&1].committed_bytes());
+            let mut other = g.clone();
+            other.epoch = epoch;
+            let bound_form = register_for(&other, 1, public, epoch);
+            assert_eq!(apply(&mut other, &bound_form), Err(TxReject::StakingRule), "epoch {epoch}");
+        }
+        assert!(roots.windows(2).all(|w| w[0] == w[1]), "the committed entry does not depend on the epoch");
     }
 
     #[test]
@@ -1303,5 +1479,339 @@ mod kes_rules {
             .process(&pair, 4, 0, &dels, 1_000_000, 0, &ToyVerifier, &view(&st))
             .map(|_| ());
         assert_eq!(outcome, Ok(()), "two rotations made a provable period-1 equivocation unprovable");
+    }
+
+    // ── Review FC-3 / CR-1: one epoch selects a vote's signing mode ───────
+
+    /// Armed 2026-11-13 (owner decision) on the KES enforcement flag day: it
+    /// tightens body validity (a vote whose target is not its slot's epoch
+    /// goes from accepted to refused), so it may bind no later than
+    /// enforcement and only at an epoch still in the future when it ships.
+    #[test]
+    fn the_vote_slot_epoch_binding_gate_binds_with_kes_enforcement() {
+        assert_eq!(crate::params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH, 8620);
+        assert_eq!(crate::params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH, crate::params::HF3_KES_ENFORCE_EPOCH);
+        for e in [0u64, 1, 8_210, 8_619] {
+            assert!(!crate::params::attestation_slot_epoch_binding_active(e), "epoch {e} must be below");
+        }
+        for e in [8_620u64, 8_621, 100_000, u64::MAX - 1, u64::MAX] {
+            assert!(crate::params::attestation_slot_epoch_binding_active(e), "epoch {e} must be bound");
+        }
+    }
+
+    const OLD_TARGET_EPOCH: u64 = 1; // below `Armed::enforcing(2, 1)`: static mode
+    const VOTE_EPOCH: u64 = 3; // period 3 - 2 = 1
+
+    /// KES bound, every validator registered, and a committee seat in
+    /// `VOTE_EPOCH`: `(transition, parent state, chains, vote slot, member)`.
+    /// The caller holds `Armed::enforcing(2, 1)`.
+    fn bound_fixture() -> (Transition<ToyVerifier>, CommittedState, Vec<RandaoChain>, u64, u32) {
+        let (t, g, chains) = setup_with(4, ToyVerifier, &[]);
+        let mut pre = bound(g);
+        for v in 0..4 {
+            pre.kes.insert(v, toy_kes_public(v).into());
+        }
+        let mut ctx = pre.clone();
+        while ctx.epoch < VOTE_EPOCH {
+            ctx = ctx.close_epoch();
+        }
+        let (slot, member) = a_committee_seat(&ctx);
+        assert_eq!(crate::epoch_of(slot), VOTE_EPOCH);
+        (t, pre, chains, slot, member)
+    }
+
+    /// A vote in `slot` whose target is the old, pre-enforcement epoch.
+    fn old_target_vote(st: &CommittedState, v: u32, slot: u64, signature: impl Fn(&[u8; 32]) -> Vec<u8>) -> Attestation {
+        let mut att = vote(st, v, slot, 0xA7, |_| Vec::new());
+        att.data.source_epoch = 0;
+        att.data.target_epoch = OLD_TARGET_EPOCH;
+        att.signature = signature(&att.data.signing_root());
+        att
+    }
+
+    #[test]
+    fn with_the_binding_armed_a_static_key_vote_with_an_old_target_is_refused_in_a_block() {
+        let _armed = Armed::enforcing(2, 1);
+        let (t, pre, mut chains, slot, member) = bound_fixture();
+        let block_slot = VOTE_EPOCH * 32 + 31;
+        let stale = old_target_vote(&pre, member, slot, |r| toy_sign(&[member as u8; 8], r));
+        // Gate inert: exactly today's rule. The static key of a KES-registered
+        // validator still makes this vote block-valid after the bind, because
+        // its old target selects the static mode (`build_block` applies it).
+        let env = build_block(&t, &pre, block_slot, std::slice::from_ref(&stale), &[], &mut chains);
+        assert!(t.compute_post_state(&pre, &env, std::slice::from_ref(&stale), &[]).is_ok(), "inert: unchanged");
+        // Armed: the same block is refused at step 8, naming the vote.
+        let _gate = crate::params::rehearsal::attestation_slot_epoch_binding_guard();
+        assert_eq!(
+            t.compute_post_state(&pre, &env, std::slice::from_ref(&stale), &[]).map(|_| ()),
+            Err(TransitionError::Attestation(0)),
+        );
+        // And so is one whose old target carries a genuine KES leaf: the
+        // target itself must be the slot's epoch.
+        let (t, pre, mut chains, slot, member) = bound_fixture();
+        let leaf = old_target_vote(&pre, member, slot, |r| honest_own(&pre, member, 1, r));
+        let honest_vote = vote(&pre, member, slot, 0xA7, |r| honest_own(&pre, member, 1, r));
+        let env = build_block(&t, &pre, block_slot, std::slice::from_ref(&honest_vote), &[], &mut chains);
+        assert!(
+            t.compute_post_state(&pre, &env, std::slice::from_ref(&honest_vote), &[]).is_ok(),
+            "armed: the honest vote (target == slot epoch, KES leaf) still applies"
+        );
+        let mut swapped = env;
+        swapped.header.attestation_root = crate::derive::attestation_root(std::slice::from_ref(&leaf));
+        swapped.proposer_sig = honest_own(&pre, swapped.header.proposer_index, 1, &swapped.header.proposal_signing_root());
+        assert_eq!(
+            t.compute_post_state(&pre, &swapped, std::slice::from_ref(&leaf), &[]).map(|_| ()),
+            Err(TransitionError::Attestation(0)),
+        );
+    }
+
+    #[test]
+    fn with_the_binding_inert_the_honest_vote_and_block_are_unchanged() {
+        let _armed = Armed::enforcing(2, 1);
+        let build = || {
+            let (t, pre, mut chains, slot, member) = bound_fixture();
+            let honest_vote = vote(&pre, member, slot, 0xA7, |r| honest_own(&pre, member, 1, r));
+            let env = build_block(&t, &pre, VOTE_EPOCH * 32 + 31, std::slice::from_ref(&honest_vote), &[], &mut chains);
+            let post = t.compute_post_state(&pre, &env, std::slice::from_ref(&honest_vote), &[]).expect("applies");
+            (env.header.id(), post.state_root())
+        };
+        let inert = build();
+        let _gate = crate::params::rehearsal::attestation_slot_epoch_binding_guard();
+        assert_eq!(build(), inert, "an honest chain is the same block and state on both sides of the gate");
+    }
+
+    #[test]
+    fn block_validation_and_evidence_agree_on_the_signing_mode_once_the_binding_is_armed() {
+        let _armed = Armed::enforcing(2, 1);
+        let (_t, pre, _chains, slot, member) = bound_fixture();
+        let by_static = old_target_vote(&pre, member, slot, |r| toy_sign(&[member as u8; 8], r));
+        let by_leaf = old_target_vote(&pre, member, slot, |r| honest_own(&pre, member, 1, r));
+        let block = |att: &Attestation| crate::attestation::validate(att, &[member], slot, &ToyVerifier, &view(&pre)).is_ok();
+        let evidence = |att: &Attestation| {
+            crate::slashing::verify_offender_signature(
+                &view(&pre),
+                &ToyVerifier,
+                member,
+                crate::epoch_of(att.data.slot),
+                &att.data.signing_root(),
+                &att.signature,
+            ) == Some(true)
+        };
+        // Evidence verification always judged by the slot's epoch: KES.
+        assert!(!evidence(&by_static) && evidence(&by_leaf));
+        // Gate inert: block validation still reads the target (the finding).
+        assert!(block(&by_static) && !block(&by_leaf), "inert: unchanged");
+        // Armed: both judge the same vote under the same key.
+        let _gate = crate::params::rehearsal::attestation_slot_epoch_binding_guard();
+        for att in [&by_static, &by_leaf] {
+            assert_eq!(block(att), evidence(att));
+        }
+        assert!(!block(&by_static), "the static key signs nothing for a KES-bound validator");
+        // A conflicting pair that block validation would count is provable.
+        let mut second = by_leaf.clone();
+        second.data.head = [0xB8; 32];
+        second.signature = honest_own(&pre, member, 1, &second.data.signing_root());
+        assert!(block(&second));
+        let dels: [crate::delegation::Delegation; 0] = [];
+        let pair = crate::slashing::SlashingEvidence { first: by_leaf, second };
+        assert!(crate::slashing::SlashingState::new()
+            .process(&pair, VOTE_EPOCH + 1, 0, &dels, 1_000_000, 0, &ToyVerifier, &view(&pre))
+            .is_ok());
+    }
+
+    // ── Security review CR-2: the first-key floor ─────────────────────────
+
+    /// Validator 3, unregistered after the bind, double-votes with its
+    /// static key in period 3 (epoch 5 under `Armed::enforcing(2, 1)`), then
+    /// registers in the same period (its key starts at period 4). Returns
+    /// the state after the registration and the evidence.
+    fn late_registrant_with_static_evidence() -> (CommittedState, crate::slashing::SlashingEvidence) {
+        let (_t, g, _chains) = setup_with(4, ToyVerifier, &[]);
+        let mut st = bound(g);
+        st.epoch = 5;
+        let slot = 5 * 32 + 1;
+        let first = vote(&st, 3, slot, 0xAA, |r| toy_sign(&[3u8; 8], r));
+        let second = vote(&st, 3, slot, 0xBB, |r| toy_sign(&[3u8; 8], r));
+        let pair = crate::slashing::SlashingEvidence { first, second };
+        let dels: [crate::delegation::Delegation; 0] = [];
+        assert!(
+            crate::slashing::SlashingState::new().process(&pair, 5, 0, &dels, 1_000_000, 0, &ToyVerifier, &view(&st)).is_ok(),
+            "control: provable while the validator is unregistered"
+        );
+        let tx = register(&st, 3, toy_kes_public(3));
+        apply(&mut st, &tx).expect("late registration");
+        assert_eq!(st.kes_roots()[&3].current.start_period, 4);
+        (st, pair)
+    }
+
+    fn evidence_outcome(st: &CommittedState, pair: &crate::slashing::SlashingEvidence) -> Result<(), crate::slashing::EvidenceError> {
+        let dels: [crate::delegation::Delegation; 0] = [];
+        crate::slashing::SlashingState::new().process(pair, st.epoch, 0, &dels, 1_000_000, 0, &ToyVerifier, &view(st)).map(|_| ())
+    }
+
+    #[test]
+    fn cr2_static_signatures_from_before_a_late_registration_stay_provable() {
+        let _armed = Armed::enforcing(2, 1); // period == epoch - 2
+        let _floor = crate::params::kes_first_key_floor_rehearsal::arm(2);
+        let (mut st, pair) = late_registrant_with_static_evidence();
+        let public = st.kes_roots()[&3].current;
+        let pks = tree(3).0;
+        // Periods before the first key: no KES key, the static key's rule.
+        for epoch in 2..=5 {
+            assert_eq!(kes::signing_mode(&view(&st), 3, epoch), kes::SigningMode::Static, "epoch {epoch}");
+            assert_eq!(kes::signing_mode(&st, 3, epoch), kes::SigningMode::Static, "whole-state lookup, epoch {epoch}");
+        }
+        assert_eq!(crate::attestation::KeyLookup::kes_public(&st, 3, 3), None);
+        assert_eq!(evidence_outcome(&st, &pair), Ok(()), "the registration must not erase the static-key offence");
+        // The node pre-check and consensus agree.
+        let ev = SlashingEvidence::AttestationOffence { first: pair.first.clone(), second: pair.second.clone() };
+        let pre = st.precheck_slashing_evidence(&ev).expect("structure and context pass");
+        assert_eq!(st.verify_precheck_signatures(&pre, &ToyVerifier), Some(true));
+        // The honest operator keeps signing statically for the rest of the
+        // inclusion period; the new tree's leaves do not sign it.
+        let slot = 5 * 32 + 2;
+        let rest = vote(&st, 3, slot, 0xC1, |r| toy_sign(&[3u8; 8], r));
+        assert_eq!(crate::attestation::validate(&rest, &[3], slot, &ToyVerifier, &view(&st)), Ok(()));
+        assert!(!vote_verifies(&st, 3, 5, &public, &pks, 3), "no leaf signs a period before the key starts");
+        // Still provable, and still static, many periods later.
+        st.epoch = 15;
+        assert_eq!(evidence_outcome(&st, &pair), Ok(()));
+        assert_eq!(kes::signing_mode(&view(&st), 3, 5), kes::SigningMode::Static);
+    }
+
+    #[test]
+    fn cr2_the_signing_mode_from_the_first_kes_period_on_is_unchanged() {
+        let _armed = Armed::enforcing(2, 1);
+        let modes = |st: &CommittedState, v: u32| (2..40u64).map(|e| kes::signing_mode(&view(st), v, e)).collect::<Vec<_>>();
+        let fingerprints = |st: &CommittedState, v: u32| (2..40u64).map(|e| kes::authority_fingerprint(&view(st), v, e)).collect::<Vec<_>>();
+        let (inert, _) = late_registrant_with_static_evidence();
+        let _floor = crate::params::kes_first_key_floor_rehearsal::arm(2);
+        let (mut st, _) = late_registrant_with_static_evidence();
+        assert_eq!(st.state_root(), inert.state_root(), "a registration commits the same state under either rule");
+        let public = st.kes_roots()[&3].current;
+        let pks = tree(3).0;
+        // Late registrant: KES from its first period (4, epoch 6) on, to and
+        // past the tree's expiry, exactly as without the floor.
+        for epoch in 6..40u64 {
+            assert_eq!(kes::signing_mode(&view(&st), 3, epoch), kes::SigningMode::Kes(epoch - 2), "epoch {epoch}");
+        }
+        st.epoch = 6;
+        assert!(vote_verifies(&st, 3, 6, &public, &pks, 4));
+        let static_vote = vote(&st, 3, 6 * 32 + 1, 0xC2, |r| toy_sign(&[3u8; 8], r));
+        assert_eq!(
+            crate::attestation::validate(&static_vote, &[3], 6 * 32 + 1, &ToyVerifier, &view(&st)),
+            Err(crate::attestation::RejectReason::BadSignature),
+            "the static key signs nothing from the first KES period on"
+        );
+        // A validator registered before the bind (start 0) and one that
+        // never registered: every mode and fingerprint as without the floor.
+        st.kes.insert(1, toy_kes_public(1).into());
+        let mut without = inert.clone();
+        without.kes.insert(1, toy_kes_public(1).into());
+        let (with_modes, with_prints) = ((modes(&st, 1), modes(&st, 2)), (fingerprints(&st, 1), fingerprints(&st, 2)));
+        drop(_floor);
+        assert_eq!(with_modes, (modes(&without, 1), modes(&without, 2)));
+        assert_eq!(with_prints, (fingerprints(&without, 1), fingerprints(&without, 2)));
+        assert_eq!(modes(&st, 3)[4..], modes(&inert, 3)[4..], "late registrant from epoch 6 on");
+    }
+
+    #[test]
+    fn cr2_a_gap_after_the_first_key_never_falls_back_to_the_static_key() {
+        // Between an expired key and its rescue the validator WAS registered:
+        // the floor must not turn those periods static (a static key stolen
+        // later could sign for the past).
+        let _armed = Armed::enforcing(2, 1);
+        let _floor = crate::params::kes_first_key_floor_rehearsal::arm(2);
+        let (mut st, _) = late_registrant_with_static_evidence(); // v3: periods 4..20
+        st.epoch = 2 + 21;
+        assert!(st.kes_rescue_open(3));
+        let fresh = public_of(&tree_from(0xA3, DEPTH));
+        let tx = register(&st, 3, fresh);
+        apply(&mut st, &tx).expect("rescue");
+        let entry = st.kes_roots()[&3].clone();
+        assert_eq!((entry.current.start_period, entry.first_start_period()), (23, 4));
+        for period in [20u64, 21, 22] {
+            assert_eq!(kes::signing_mode(&view(&st), 3, 2 + period), kes::SigningMode::Kes(period), "gap period {period}");
+            let slot = (2 + period) * 32 + 1;
+            let att = vote(&st, 3, slot, 0xD0, |r| toy_sign(&[3u8; 8], r));
+            assert_eq!(
+                crate::attestation::validate(&att, &[3], slot, &ToyVerifier, &view(&st)),
+                Err(crate::attestation::RejectReason::BadSignature),
+                "gap period {period}"
+            );
+        }
+        assert_eq!(kes::signing_mode(&view(&st), 3, 5), kes::SigningMode::Static, "before the first key: still static");
+    }
+
+    #[test]
+    fn cr2_below_the_gate_nothing_changes() {
+        let _armed = Armed::enforcing(2, 1);
+        // The compiled gate (8620) is far above every period this test reads
+        // under the rehearsal schedule, so below it the pre-floor rule holds.
+        assert!(crate::params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH > 40);
+        assert!(!crate::params::kes_first_key_floor_active(40));
+        let (st, pair) = late_registrant_with_static_evidence();
+        let entry = st.kes_roots()[&3].clone();
+        // Today's rule: every bound period of a registered validator is KES,
+        // judged against the current key even before it starts.
+        for epoch in 2..40u64 {
+            assert_eq!(kes::signing_mode(&view(&st), 3, epoch), kes::SigningMode::Kes(epoch - 2), "epoch {epoch}");
+            assert_eq!(entry.resolve(epoch - 2), Some(entry.in_force(epoch - 2)));
+            assert_eq!(crate::attestation::KeyLookup::kes_public(&st, 3, epoch - 2), Some(entry.in_force(epoch - 2)));
+        }
+        assert_eq!(evidence_outcome(&st, &pair), Err(crate::slashing::EvidenceError::BadSignature), "today's (unfixed) verdict");
+        let slot = 5 * 32 + 2;
+        let rest = vote(&st, 3, slot, 0xC1, |r| toy_sign(&[3u8; 8], r));
+        assert_eq!(
+            crate::attestation::validate(&rest, &[3], slot, &ToyVerifier, &view(&st)),
+            Err(crate::attestation::RejectReason::BadSignature)
+        );
+        // An armed gate governs only the periods that start at or after it.
+        let _floor = crate::params::kes_first_key_floor_rehearsal::arm(6);
+        assert_eq!(kes::signing_mode(&view(&st), 3, 5), kes::SigningMode::Kes(3), "period 3 precedes the gate");
+        assert_eq!(evidence_outcome(&st, &pair), Err(crate::slashing::EvidenceError::BadSignature));
+    }
+
+    #[test]
+    fn cr2_rotations_and_pruning_keep_the_first_key_and_the_static_era() {
+        let _armed = Armed::enforcing(2, 1);
+        let horizon = crate::params::KES_KEY_HISTORY_PERIODS;
+        let rotate_twice = |st: &mut CommittedState| {
+            // Period 4: K0 -> K1 (from 5). Period 5: K1 -> K2 (from 6).
+            let k0 = st.kes_roots()[&3].current;
+            let k1_pks = tree_from(0x81, DEPTH);
+            st.epoch = 6;
+            let r1 = rotate(st, 3, 4, &k0, &tree(3).0, &k1_pks);
+            apply(st, &r1).expect("first rotation");
+            st.epoch = 7;
+            let k1 = { let p = public_of(&k1_pks); KesPublic::new(p.depth, p.root, 5) };
+            let r2 = rotate(st, 3, 5, &k1, &k1_pks, &tree_from(0x82, DEPTH));
+            apply(st, &r2).expect("second rotation");
+        };
+        let (mut inert, _) = late_registrant_with_static_evidence();
+        rotate_twice(&mut inert);
+        let inert_entry = inert.kes_roots()[&3].clone();
+        assert!(inert_entry.settled(6 + horizon + 1).retired.is_empty(), "today: all history pruned");
+
+        let _floor = crate::params::kes_first_key_floor_rehearsal::arm(2);
+        let (mut st, pair) = late_registrant_with_static_evidence();
+        rotate_twice(&mut st);
+        let entry = st.kes_roots()[&3].clone();
+        assert_eq!(entry, inert_entry, "inside the horizon the committed entry is the same under either rule");
+        assert_eq!(evidence_outcome(&st, &pair), Ok(()), "rotations do not erase the static-key offence");
+        // Past the horizon the first key (K0, periods 4..5) is kept; K1 goes.
+        let far = entry.settled(6 + horizon + 1);
+        assert_eq!(far.retired.len(), 1);
+        assert_eq!(far.retired[0].public.start_period, 4);
+        assert_eq!(far.first_start_period(), 4, "pruning cannot move the first-key floor");
+        assert_eq!(far.resolve(3), None, "before the first key: static");
+        assert_eq!(far.resolve(4), Some(far.retired[0].public));
+        assert_eq!(far.resolve(5), Some(far.current), "pruned history between keys fails closed, never static");
+        assert_eq!(far.current.leaf_index(5), None);
+        st.kes.insert(3, far);
+        st.epoch = 2 + 6 + horizon + 1;
+        assert_eq!(kes::signing_mode(&view(&st), 3, 5), kes::SigningMode::Static);
+        assert_eq!(kes::signing_mode(&view(&st), 3, 7), kes::SigningMode::Kes(5));
+        assert_eq!(evidence_outcome(&st, &pair), Ok(()), "still provable after the history is pruned");
     }
 }
