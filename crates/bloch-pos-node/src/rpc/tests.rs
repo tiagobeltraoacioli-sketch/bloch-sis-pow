@@ -2584,6 +2584,112 @@ fn rpc2_trusted_proxy_connections_are_limited_per_forwarded_client() {
     drop(held);
 }
 
+/// `getl2settlement.forced` (candidate): the queue's fields, the due records
+/// and the next surcharge. The field is absent while the gate is inert, so
+/// `l2_settlement_json` keeps its exact keys on every network today.
+#[test]
+fn l2_forced_json_reports_the_queue_and_the_next_surcharge() {
+    use bloch_pos_committee::l2_settlement::forced;
+    let queue = forced::Queue::default();
+    let Json::Obj(fields) = l2_forced_json(&queue) else { panic!("not an object") };
+    let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        [
+            "queued", "consumed", "pending", "pending_weight", "max_pending_weight", "root", "due", "due_hash",
+            "next_surcharge_sat", "transfer_surcharge_sat", "max_gas_surcharge_sat", "drain_settlements", "treasury",
+        ]
+    );
+    let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
+    assert_eq!(get("due"), Json::Arr(vec![]));
+    assert_eq!(get("due_hash"), Json::hex(&forced::hash(&[])));
+    assert_eq!(get("next_surcharge_sat"), Json::sat(1_000));
+    assert_eq!(get("transfer_surcharge_sat"), Json::sat(1_000));
+    assert_eq!(get("max_gas_surcharge_sat"), Json::sat(14_000));
+    assert_eq!(get("drain_settlements"), Json::u(0));
+    // The treasury is compiled (owner input of 2026-11-16); the gate is still inert.
+    let treasury = bloch_pos_committee::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY.expect("named");
+    assert_eq!(get("treasury"), Json::hex(&treasury));
+    assert_eq!(bloch_pos_committee::params::L2_FORCED_INCLUSION_EPOCH, u64::MAX);
+}
+
+/// Each due record carries its L2 envelope, read from its L1 block, in the
+/// exact shape producers and settlers consume; bytes that do not hash to the
+/// record, or an unreadable block, give `null`.
+#[test]
+fn l2_forced_due_records_carry_their_envelope() {
+    use bloch_pos_committee::l2_settlement::forced;
+    use sha3::{Digest, Keccak256};
+    let envelope = vec![0x02, 0xf8, 0x6c, 0x01];
+    let record = forced::Record {
+        height: 9,
+        l1_txid: [0x1c; 32],
+        envelope_hash: Keccak256::digest(&envelope).into(),
+        gas_limit: 21_000,
+    };
+    let lookup = |height: u64, txid: &[u8; 32]| (height == 9 && *txid == [0x1c; 32]).then(|| envelope.clone());
+    let json = l2_forced_record_json(&record, &lookup);
+    let Json::Obj(fields) = &json else { panic!("not an object") };
+    let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, ["height", "l1_txid", "envelope_hash", "gas_limit", "envelope"]);
+    let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
+    assert_eq!(get("height"), Json::u(9));
+    assert_eq!(get("envelope"), Json::s("02f86c01".to_string()));
+    // Not found, or bytes of another envelope: null.
+    let missing = l2_forced_record_json(&record, &|_, _| None);
+    let wrong = l2_forced_record_json(&record, &|_, _| Some(vec![0x02]));
+    for json in [missing, wrong] {
+        let Json::Obj(fields) = json else { panic!("not an object") };
+        assert_eq!(fields.iter().find(|(n, _)| n == "envelope").map(|(_, v)| v.clone()), Some(Json::Null));
+    }
+}
+
+/// `getl2settlement.head_resets` (review R308-2P-3, R308-2P-4): a compiled
+/// head reset that would not apply says so, with the reason and the leaf
+/// indices behind it, and the node's line at the gate tells a refused reset
+/// from an applied one.
+#[test]
+fn head_reset_json_and_log_line_name_a_refused_reset() {
+    use bloch_pos_committee::l2_settlement::{HeadResetRefusal, HeadResetReport};
+    let field = |json: &Json, key: &str| json.get(key).cloned().unwrap_or_else(|| panic!("no {key}"));
+    let refused = HeadResetReport {
+        gate: HeadResetReport::NEXT_PROGRAM,
+        number: 41,
+        forfeit: false,
+        pending: true,
+        refusal: Some(HeadResetRefusal::PaidBeyondTarget { at_or_above_count: false, against_tail: vec![7, 9] }),
+    };
+    let json = head_reset_json(&refused);
+    let Json::Obj(fields) = &json else { panic!("not an object") };
+    let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, ["gate", "number", "forfeit", "pending", "would_apply", "refusal",
+        "claimed_at_or_above_target_count", "paid_against_tail_count", "paid_against_tail"]);
+    assert_eq!(field(&json, "gate"), Json::s("next_program"));
+    assert_eq!(field(&json, "number"), Json::u(41));
+    assert_eq!(field(&json, "pending"), Json::Bool(true));
+    assert_eq!(field(&json, "would_apply"), Json::Bool(false));
+    assert_eq!(field(&json, "refusal"), Json::s("paid_beyond_target"));
+    assert_eq!(field(&json, "paid_against_tail_count"), Json::u(2));
+    assert_eq!(field(&json, "paid_against_tail"), Json::Arr(vec![Json::u(7), Json::u(9)]));
+    let line = head_reset_log_line(&refused, 1_234);
+    assert!(line.starts_with("CRITICAL: L2 head reset REFUSED at slot 1234"), "{line}");
+    assert!(line.contains("did NOT move back to L2 block 41 (plain form)") && line.contains("reason: paid_beyond_target"), "{line}");
+    assert!(line.contains("leaves paid against the tail: 2 (first indices [7, 9])"), "{line}");
+
+    // Applied: no refusal, no alarm.
+    let applied = HeadResetReport { gate: HeadResetReport::ROLLBACK, number: 41, forfeit: true, pending: false, refusal: None };
+    let json = head_reset_json(&applied);
+    assert_eq!(field(&json, "would_apply"), Json::Bool(true));
+    assert_eq!(field(&json, "refusal"), Json::Null);
+    assert_eq!(field(&json, "paid_against_tail"), Json::Arr(Vec::new()));
+    let line = head_reset_log_line(&applied, 9);
+    assert!(line.starts_with("L2 head reset APPLIED at slot 9 with the rollback program change") && !line.contains("CRITICAL"), "{line}");
+    // Another reason carries no leaf detail.
+    let other = HeadResetReport { refusal: Some(HeadResetRefusal::ForcedLog), ..refused };
+    assert_eq!(field(&head_reset_json(&other), "refusal"), Json::s("forced_log"));
+    assert!(head_reset_log_line(&other, 1).ends_with("reason: forced_log"));
+}
+
 /// Review RC-05: `getsecuritystatus` is answered only to a DIRECT loopback
 /// caller. A request carrying any forwarding header, or arriving from a
 /// declared trusted proxy, is refused with the plain "method not found" even

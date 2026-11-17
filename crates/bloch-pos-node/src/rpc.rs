@@ -2901,6 +2901,7 @@ impl PreparedSubmission {
             PosTransaction::L2Deposit(_) => "l2_deposit",
             PosTransaction::L2DataAvailability(_) => "l2_data_availability",
             PosTransaction::L2WithdrawClaim(_) => "l2_withdraw_claim",
+            PosTransaction::L2ForcedTransaction(_) => "l2_forced_transaction",
             PosTransaction::WithdrawalCredentialRotation(_) => "withdrawal_credential_rotation",
             PosTransaction::RescueCommit(_) => "pq_rescue_commit",
             PosTransaction::RescueReveal(_) => "pq_rescue_reveal",
@@ -3632,7 +3633,71 @@ pub fn kes_json(state: &bloch_pos_committee::transition::CommittedState) -> Json
     ])
 }
 
+/// One entry of `getl2settlement.head_resets`.
+pub fn head_reset_json(report: &bloch_pos_committee::l2_settlement::HeadResetReport) -> Json {
+    use bloch_pos_committee::l2_settlement::HeadResetRefusal;
+    let (at_or_above_count, against_tail) = match &report.refusal {
+        Some(HeadResetRefusal::PaidBeyondTarget { at_or_above_count, against_tail }) => (*at_or_above_count, against_tail.as_slice()),
+        _ => (false, &[][..]),
+    };
+    Json::obj(vec![
+        ("gate", Json::s(report.gate.to_string())),
+        ("number", Json::u(report.number)),
+        ("forfeit", Json::Bool(report.forfeit)),
+        ("pending", Json::Bool(report.pending)),
+        ("would_apply", Json::Bool(report.refusal.is_none())),
+        ("refusal", report.refusal.as_ref().map_or(Json::Null, |why| Json::s(why.name().to_string()))),
+        // `paid_beyond_target` only: a claim at an index the target does not
+        // have, and the leaf indices paid against a record above the target
+        // (at most 64 listed; `paid_against_tail_count` is the whole number).
+        ("claimed_at_or_above_target_count", Json::Bool(at_or_above_count)),
+        ("paid_against_tail_count", Json::u(against_tail.len() as u64)),
+        ("paid_against_tail", Json::Arr(against_tail.iter().take(64).map(|index| Json::u(*index)).collect())),
+    ])
+}
+
+/// The node's log line when a block moved the L2 program and a compiled
+/// head reset ran with it (review R308-2P-4): a refused reset is not silent.
+pub fn head_reset_log_line(report: &bloch_pos_committee::l2_settlement::HeadResetReport, slot: u64) -> String {
+    use bloch_pos_committee::l2_settlement::HeadResetRefusal;
+    let form = if report.forfeit { "forfeit" } else { "plain" };
+    match &report.refusal {
+        None => format!(
+            "L2 head reset APPLIED at slot {slot} with the {} program change: head moved back to L2 block {} ({form} form)",
+            report.gate, report.number
+        ),
+        Some(why) => {
+            let detail = match why {
+                HeadResetRefusal::PaidBeyondTarget { at_or_above_count, against_tail } => format!(
+                    "; claim at or above the target's leaf count: {at_or_above_count}; leaves paid against the tail: {} (first indices {:?})",
+                    against_tail.len(),
+                    &against_tail[..against_tail.len().min(16)]
+                ),
+                _ => String::new(),
+            };
+            format!(
+                "CRITICAL: L2 head reset REFUSED at slot {slot} with the {} program change: the program moved and the settled head did NOT \
+                 move back to L2 block {} ({form} form); reason: {}{detail}",
+                report.gate, report.number, why.name()
+            )
+        }
+    }
+}
+
 pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedState) -> Json {
+    l2_settlement_json_with(state, &|_, _| None)
+}
+
+/// A forced record's L2 envelope, read from the L1 block at `height` holding
+/// the transaction `txid`; `None` when that block is not readable here.
+pub type ForcedEnvelopeLookup<'a> = dyn Fn(u64, &[u8; 32]) -> Option<Vec<u8>> + 'a;
+
+/// [`l2_settlement_json`], with each due forced record's envelope read
+/// through `envelope` (the engine reads its canonical blocks).
+pub fn l2_settlement_json_with(
+    state: &bloch_pos_committee::transition::CommittedState,
+    envelope: &ForcedEnvelopeLookup<'_>,
+) -> Json {
     let Some(l2) = state.l2_settlement() else { return Json::Null; };
     let policy = l2.policy();
     let source = l2.frozen_source().map_or(Json::Null, |source| Json::obj(vec![
@@ -3653,10 +3718,26 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
             crate::codec::hex32(&source.block), source.slot, source.height,
             crate::codec::hex32(&source.commitment), crate::codec::hex32(&source.inbox_root)))),
     ]));
-    Json::obj(vec![
+    let mut out = Json::obj(vec![
         ("asynchronous", Json::Bool(l2.asynchronous())), ("native_height", Json::u(l2.height())),
         ("network", Json::hex(&policy.identities[0])), ("genesis", Json::hex(&policy.identities[1])),
         ("chain_id", Json::u(policy.chain_id)), ("source", source),
+        // The program a settlement must prove now. It changes only at the
+        // compiled gate (`params::L2_NEXT_PROGRAM_EPOCH`).
+        ("program", Json::obj(vec![
+            ("configuration", Json::hex(&policy.identities[3])), ("elf_keccak", Json::hex(&policy.identities[4])),
+            ("vkey_koalabear", Json::hex(&policy.identities[5])), ("vkey_bn254", Json::hex(&policy.identities[6])),
+            ("proof_policy", Json::hex(&policy.proof_policy)),
+        ])),
+        // The compiled program changes still ahead of this L2, in order: empty
+        // while the gates are inert. A settler stops starting proofs that cannot
+        // land before the first entry; `program` above moves only at the gate.
+        ("program_schedule", Json::Arr(l2.program_schedule().iter().map(|(epoch, next)| Json::obj(vec![
+            ("epoch", Json::u(*epoch)),
+            ("configuration", Json::hex(&next.identities[0])), ("elf_keccak", Json::hex(&next.identities[1])),
+            ("vkey_koalabear", Json::hex(&next.identities[2])), ("vkey_bn254", Json::hex(&next.identities[3])),
+            ("proof_policy", Json::hex(&next.proof_policy)),
+        ])).collect())),
         // What this L2 admits, fixed at installation: a development genesis
         // follows the node's devnet features; the running-network flag day
         // ("activated") admits everything on every build.
@@ -3669,6 +3750,26 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
             ("count", Json::u(l2.inbox().len() as u64)), ("consumed", Json::u(l2.consumed())),
             ("escrow_sat", Json::s(l2.escrow_sat().to_string())),
         ])),
+        // DA slots of the next block on this head: the registered key owns
+        // `reserved_per_block` of them once `params::L2_DA_RESERVED_SLOT_EPOCH`
+        // binds (`reserved_key` is then non-null). A settler whose funding key
+        // hash equals `reserved_key` cannot be crowded out by other DA.
+        ("data_availability_slots", {
+            use bloch_pos_committee::l2_settlement::da;
+            let reserved = da::reserved_key_at(epoch_of(state.slot()));
+            Json::obj(vec![
+                ("per_block", Json::u(da::MAX_PER_BLOCK as u64)),
+                ("open_per_block", Json::u(if reserved.is_some() { da::OPEN_PER_BLOCK } else { da::MAX_PER_BLOCK } as u64)),
+                ("reserved_per_block", Json::u(if reserved.is_some() { da::RESERVED_PER_BLOCK as u64 } else { 0 })),
+                ("reserved_key", reserved.as_ref().map_or(Json::Null, |k| Json::hex(k))),
+                ("reserved_slot_epoch", if bloch_pos_committee::params::L2_DA_RESERVED_SLOT_EPOCH == u64::MAX {
+                    Json::Null
+                } else {
+                    Json::u(bloch_pos_committee::params::L2_DA_RESERVED_SLOT_EPOCH)
+                }),
+                ("registered_key", da::registered_key().as_ref().map_or(Json::Null, |k| Json::hex(k))),
+            ])
+        }),
         // Retained L1 data-availability records (M3), oldest first.
         ("data_availability", Json::Arr(l2.data_availability().iter().map(|r| Json::obj(vec![
             ("l2_number", Json::u(r.l2_number)), ("commitment", Json::hex(&r.commitment)),
@@ -3764,5 +3865,79 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
         ("accepted", l2.head().map_or(Json::Null, |(commitment, statement)| Json::obj(vec![
             ("commitment", Json::hex(&commitment)), ("statement", Json::s(crate::codec::hex(&statement))),
         ]))),
+    ]);
+    // L1 forced inclusion (candidate): present only once the queue is enabled,
+    // so the response keeps its exact fields while the gate is inert.
+    if let (Json::Obj(fields), Some(queue)) = (&mut out, l2.forced_queue()) {
+        fields.push(("forced".to_string(), l2_forced_json_with(queue, envelope)));
+    }
+    // The compiled head resets (one may ship with the swap, one with the
+    // rollback) and whether each would apply to this state NOW. Present only
+    // when the release compiles a reset, so the response keeps its exact
+    // fields otherwise. A refused reset leaves the head where it is while the
+    // program still moves, so read this before the gate: `would_apply: false`
+    // with `pending: true` means the gate will not move the head. After its
+    // gate (`pending: false`) an entry is only what a second run would do;
+    // the node logs the outcome at the gate (`head_reset_log_line`).
+    let resets = l2.head_reset_reports();
+    if let (Json::Obj(fields), false) = (&mut out, resets.is_empty()) {
+        fields.push(("head_resets".to_string(), Json::Arr(resets.iter().map(head_reset_json).collect())));
+    }
+    out
+}
+
+/// `getl2settlement.forced`: the queue, and the records the next settlement
+/// must consume, in order (`due`), with the `deposits_hash` slot they need.
+#[cfg(test)]
+pub(crate) fn l2_forced_json(queue: &bloch_pos_committee::l2_settlement::forced::Queue) -> Json {
+    l2_forced_json_with(queue, &|_, _| None)
+}
+
+/// One due record. `envelope` is the signed L2 envelope (hex) read from its
+/// L1 transaction, which a producer, settler or rebuilder needs to run it; it
+/// is `null` when the block is not readable here or the bytes do not hash to
+/// the record (never trusted: the guest checks the hash again).
+pub(crate) fn l2_forced_record_json(
+    r: &bloch_pos_committee::l2_settlement::forced::Record,
+    envelope: &ForcedEnvelopeLookup<'_>,
+) -> Json {
+    use sha3::{Digest, Keccak256};
+    let bytes = envelope(r.height, &r.l1_txid)
+        .filter(|bytes| <[u8; 32]>::from(Keccak256::digest(bytes)) == r.envelope_hash);
+    Json::obj(vec![
+        ("height", Json::u(r.height)), ("l1_txid", Json::hex(&r.l1_txid)),
+        ("envelope_hash", Json::hex(&r.envelope_hash)), ("gas_limit", Json::u(r.gas_limit)),
+        ("envelope", bytes.map_or(Json::Null, |b| Json::s(crate::codec::hex(&b)))),
+    ])
+}
+
+pub(crate) fn l2_forced_json_with(
+    queue: &bloch_pos_committee::l2_settlement::forced::Queue,
+    envelope: &ForcedEnvelopeLookup<'_>,
+) -> Json {
+    use bloch_pos_committee::l2_settlement::forced;
+    let record = |r: &forced::Record| l2_forced_record_json(r, envelope);
+    let pending = queue.pending().len() as u64;
+    let weight = queue.pending_weight();
+    Json::obj(vec![
+        ("queued", Json::u(queue.queued())), ("consumed", Json::u(queue.consumed())),
+        ("pending", Json::u(pending)), ("pending_weight", Json::u(weight)),
+        ("max_pending_weight", Json::u(forced::MAX_PENDING_WEIGHT)), ("root", Json::hex(&queue.root())),
+        ("due", Json::Arr(queue.due().iter().map(record).collect())),
+        ("due_hash", Json::hex(&forced::hash(queue.due()))),
+        // What the next weight unit (a transfer that closes no group) pays on
+        // top of its fee; null when full. Each unit is priced at its own
+        // position, and a record also pays for the room it leaves in the group
+        // it closes: `transfer_surcharge_sat` and `max_gas_surcharge_sat` are
+        // the exact charges now for 21k and 300k of declared gas. Wallets sign
+        // a maximum (`bloch-pos l2-forced prepare --pending-weight`) and get the
+        // rest back; the charge goes to the protocol treasury.
+        ("next_surcharge_sat", forced::surcharge_sat(weight, 1).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
+        ("transfer_surcharge_sat", queue.surcharge_for(forced::MIN_GAS).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
+        ("max_gas_surcharge_sat", queue.surcharge_for(forced::MAX_GAS).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
+        // A record ending at position p is consumed by the ceil(p / 14)-th
+        // settlement anchored after it: the bound for a record queued now.
+        ("drain_settlements", Json::u(weight.div_ceil(forced::UNITS_PER_SETTLEMENT))),
+        ("treasury", forced::treasury().map_or(Json::Null, |t| Json::hex(&t))),
     ])
 }

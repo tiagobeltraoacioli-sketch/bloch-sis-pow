@@ -1288,6 +1288,61 @@ mod l2_tests {
         assert!(l2.committed_bytes().len() <= pre.l2_settlement().unwrap().committed_bytes().len() + 26 + 8 + 48 * da::MAX_RECORDS);
     }
 
+    /// Review R308-3P-1, restated after the merge onto the released node
+    /// (agent 382). The December line tested its own copy of the DA number
+    /// and duplicate rule (`admission::check_da_recordable`, test
+    /// `r308_3p_1_a_da_batch_repeating_a_recorded_commitment_is_not_backed`).
+    /// The merged mempool door has no copy: it asks
+    /// `l2_data_availability_refusal_at`, which calls this one function, the
+    /// same that `record_data_availability` (consensus) calls. Every case of
+    /// the removed test is asserted here on that function, with a settled
+    /// mark above zero: the settled block and anything beyond the window are
+    /// refused, the window's first and last blocks pass, the window's end
+    /// saturates, a recorded (number, commitment) is a duplicate, and a
+    /// recorded block or commitment is still open to another pairing.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn r308_3p_1_the_da_rule_the_door_shares_with_consensus() {
+        let (pre, _) = funded_async_fixture();
+        let chain = 700771;
+        let at_settled = |settled: u64| {
+            let mut l2 = pre.l2_settlement().unwrap().clone();
+            let mut statement = vec![0u8; S + 272];
+            statement[S + 264..S + 272].copy_from_slice(&settled.to_be_bytes());
+            l2.set_head_for_test([0x5e; 32], statement, 0);
+            assert_eq!(l2.settled_number(), settled);
+            l2
+        };
+        let settled = 10u64;
+        let mut l2 = at_settled(settled);
+        for (l2_number, commitment) in [(12u64, [0xa1u8; 32]), (13, [0xa2; 32])] {
+            l2.insert_da_record(da::Record { l2_number, commitment, height: 5 });
+        }
+        let check = |number: u64, commitment: [u8; 32]| l2.check_data_availability(chain, number, &commitment).map(|_| ());
+        assert_eq!(check(settled, [1; 32]), Err(da::Refusal::Number), "the settled block");
+        assert_eq!(check(settled + 1, [1; 32]), Ok(()), "the first unsettled block");
+        assert_eq!(check(settled + da::WINDOW, [1; 32]), Ok(()), "the last block of the window");
+        assert_eq!(check(settled + da::WINDOW + 1, [1; 32]), Err(da::Refusal::Number), "one beyond the window");
+        assert_eq!(check(u64::MAX, [1; 32]), Err(da::Refusal::Number), "far beyond the window");
+        assert_eq!(check(12, [0xa1; 32]), Err(da::Refusal::Duplicate), "the recorded commitment of block 12, again");
+        assert_eq!(check(12, [0xa3; 32]), Ok(()), "another commitment for a recorded block is recorded too");
+        assert_eq!(check(14, [0xa1; 32]), Ok(()), "a recorded commitment under another block number is not a repeat");
+        assert_eq!(check(13, [0xa1; 32]), Ok(()), "block 13 holds another commitment");
+        assert_eq!(l2.check_data_availability(chain + 1, settled + 1, &[1; 32]).map(|_| ()), Err(da::Refusal::Chain));
+        let high = at_settled(u64::MAX - 1);
+        assert_eq!(
+            high.check_data_availability(chain, u64::MAX, &[1; 32]).map(|_| ()),
+            Ok(()),
+            "the window's end saturates"
+        );
+        // Consensus and the check agree: what the check passes, recording
+        // accepts, and the repeat is then refused by both.
+        let mut recording = l2.clone();
+        assert_eq!(recording.record_data_availability(chain, 14, [0xa1; 32]), Ok(()));
+        assert_eq!(recording.check_data_availability(chain, 14, &[0xa1; 32]).map(|_| ()), Err(da::Refusal::Duplicate));
+        assert_eq!(recording.record_data_availability(chain, 14, [0xa1; 32]), Err(da::Refusal::Duplicate));
+    }
+
     // ── M4: withdrawal root and count ──
 
     /// A V3 successor of the accepted head of `l2` (or the first settlement),
@@ -1793,6 +1848,58 @@ mod l2_tests {
         for (tx, verdict) in &cases {
             assert_eq!(young.l2_withdraw_claim_refusal_at(tx, fee), *verdict);
             assert_eq!(young.l2_withdraw_claim_refusal_before_finality_at(tx, fee), *verdict);
+        }
+    }
+
+    /// Review R308-3P-1, the claim half, restated after the merge (agent 382,
+    /// round 18; reviewer 384 R384-REG-1). The December line tested its own
+    /// claim rule at the door (`check_claim_applicable`, test
+    /// `r308_3p_1_a_claim_consensus_applies_stays_backed`); the merged door
+    /// (`bloch-pos-node` `admission::check_l2_funded`) answers a claim with
+    /// `l2_withdraw_claim_refusal_at` alone (`None` is backed, every `Some` a
+    /// refusal). Its property is therefore this agreement with consensus, on a
+    /// payable claim and on each refusal of the fixture: what `apply` accepts
+    /// has no preflight refusal (it stays backed), and what `apply` refuses is
+    /// refused by the preflight for the same reason, leaving the state as it was.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn r308_3p_1_a_claim_consensus_applies_has_no_preflight_refusal() {
+        let (mut state, _) = funded_async_fixture();
+        let l2 = state.l2_settlement.as_mut().unwrap();
+        l2.append_deposit(crate::l2_settlement::InboxRecord {
+            height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 50_000_000, recipient: [0x42; 20],
+        })
+        .unwrap();
+        let accepted = l2.height() + 1;
+        l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&wleaves(3)), count: 3, height: accepted });
+        for _ in 0..WITHDRAW_DELAY_BLOCKS {
+            l2.advance_height().unwrap();
+        }
+        finalize_all(&mut state);
+        let fee = state.next_base_fee();
+        let good = claim_tx(&state, ([0x33; 32], 0), FUNDED, 3, 1);
+        let mut unpaid = good.clone();
+        unpaid.change.value += 1;
+        let unpaid = resign_claim(unpaid);
+        let mut absent = good.clone();
+        absent.inputs[0].txid = [0x34; 32];
+        let absent = resign_claim(absent);
+        let other_leaf = resign_claim(L2WithdrawClaim { index: 0, ..good.clone() });
+
+        assert_eq!(state.l2_withdraw_claim_refusal_at(&good, fee), None, "a payable claim has no preflight refusal");
+        let mut applied = state.clone();
+        assert!(applied.apply_transaction(&claim(&good), 0, fee, &ToyVerifier).is_ok(), "and consensus applies it");
+        assert!(applied.l2_withdraw_claim_refusal_at(&good, fee).is_some(), "and only once");
+        for tx in [&unpaid, &absent, &other_leaf] {
+            let preflight = state.l2_withdraw_claim_refusal_at(tx, fee);
+            assert!(preflight.is_some());
+            let mut refused = state.clone();
+            assert_eq!(
+                refused.apply_transaction(&claim(tx), 0, fee, &ToyVerifier),
+                Err(TxReject::L2WithdrawClaim(preflight.unwrap())),
+                "the preflight and consensus give the same reason"
+            );
+            assert_eq!(refused, state);
         }
     }
 
@@ -3155,6 +3262,1327 @@ mod l2_tests {
         assert!(fresh.admits(100 * BLCH + 1, true, false));
         let after = wd::ReleaseWindow { released: 1, ..fresh };
         assert!(!after.admits(100 * BLCH, true, false));
+        // The next program: one exemption per window, whatever came first.
+        assert!(after.admits(100 * BLCH, true, true));
+        assert!(!after.admits(100 * BLCH, false, true));
+        let full = wd::ReleaseWindow { released: sat(100), ..fresh };
+        assert!(full.admits(200 * BLCH, true, true), "claims filling the cap do not spend the exemption");
+        assert!(!full.admits(1, false, true));
+        let spent = wd::ReleaseWindow { released: sat(100) + 1, ..fresh };
+        assert!(!spent.admits(1, true, true), "one exemption per window");
+        assert!(!spent.admits(1, false, true));
+    }
+
+    // ── The next L2 program (candidate; the gate stays the sentinel) ──
+
+    fn mainnet_l2_state() -> crate::l2_settlement::State {
+        crate::l2_settlement::State::activated(mainnet::activation().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn next_program_gate_is_inert_and_chooses_no_epoch() {
+        // Inert in the candidate; an armed release acts from its epoch exactly.
+        let gate = crate::params::L2_NEXT_PROGRAM_EPOCH;
+        for epoch in [0, 5_850, 8_620, gate.saturating_sub(1), gate, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert_eq!(crate::params::l2_next_program_active(epoch), gate != u64::MAX && epoch >= gate, "{epoch}");
+        }
+        let (pinned, next) = (mainnet::PROGRAM.unwrap(), mainnet::PROGRAM_NEXT);
+        assert_eq!(next.proof_policy, pinned.proof_policy, "the circuits and the tag stay");
+        for (a, b) in next.identities.iter().zip(&pinned.identities[3..7]) {
+            assert_ne!(a, b);
+        }
+    }
+
+    #[test]
+    fn next_program_replaces_only_the_program_at_the_gate_and_only_on_mainnet() {
+        let (mut pre, _) = fixture();
+        let other = pre.l2_settlement().unwrap().clone();
+        // Below the gate nothing moves on an epoch boundary.
+        pre.l2_settlement = Some(mainnet_l2_state());
+        let below = pre.close_epoch();
+        let before = pre.l2_settlement().unwrap().clone();
+        assert_eq!(below.l2_settlement().unwrap().policy(), before.policy());
+        assert!(!below.l2_settlement().unwrap().next_program_active());
+
+        let _gate = crate::params::l2_next_program_test::open();
+        let crossed = pre.close_epoch();
+        let after = crossed.l2_settlement().unwrap();
+        let (old, new) = (before.policy(), after.policy());
+        assert_eq!(new.identities[..3], old.identities[..3]);
+        assert_eq!(new.identities[3..7], mainnet::PROGRAM_NEXT.identities);
+        assert_eq!(new.proof_policy, old.proof_policy);
+        assert_eq!(new.chain_id, old.chain_id);
+        assert_eq!(new.initial_l2_parent, old.initial_l2_parent);
+        assert_eq!(new.initial_l2_state, old.initial_l2_state);
+        assert_eq!(new.attestor_set, old.attestor_set);
+        assert_eq!(after.limits(), before.limits());
+        assert!(after.next_program_active());
+        assert_ne!(crossed.state_root(), below.state_root(), "the policy is committed");
+        // A later boundary keeps the same program.
+        assert_eq!(crossed.close_epoch().l2_settlement().unwrap().policy(), new);
+
+        // An L2 on any other policy is left alone.
+        pre.l2_settlement = Some(other.clone());
+        assert_eq!(pre.close_epoch().l2_settlement().unwrap().policy(), other.policy());
+    }
+
+    #[test]
+    fn settlements_follow_the_program_across_the_swap() {
+        let (pre, mut chains) = fixture();
+        let t = Transition::new(ProofDouble);
+
+        // One settlement under the old program.
+        let old_tx = PosTransaction::L2Settlement(Box::new(transaction(&pre)));
+        let block = build_block(&t, &pre, 2, &[], std::slice::from_ref(&old_tx), &mut chains);
+        let settled = t.apply_block(&pre, &block, &[], std::slice::from_ref(&old_tx)).unwrap();
+        let head = settled.l2_settlement().unwrap().head().unwrap();
+
+        // The swap keeps the head; what was proved for the old program is refused.
+        // A second identical fixture, because building a block spends its RANDAO chains.
+        let (mut swapped, mut chains) = fixture();
+        assert_eq!(swapped.state_root(), pre.state_root());
+        let mut l2 = swapped.l2_settlement().unwrap().clone();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        swapped.l2_settlement = Some(l2);
+        assert!(t.apply_block(&swapped, &block, &[], std::slice::from_ref(&old_tx)).is_err());
+        let mut state = swapped.l2_settlement().unwrap().clone();
+        let PosTransaction::L2Settlement(old) = &old_tx else { unreachable!() };
+        assert_eq!(state.apply(old, *swapped.head.as_bytes(), swapped.slot, false, &ProofDouble), Err(crate::l2_settlement::Reject::Policy));
+
+        // The same block under the new identities settles, as the successor rule sees it.
+        let new_tx = PosTransaction::L2Settlement(Box::new(transaction(&swapped)));
+        let block = build_block(&t, &swapped, 2, &[], std::slice::from_ref(&new_tx), &mut chains);
+        let next = t.apply_block(&swapped, &block, &[], std::slice::from_ref(&new_tx)).unwrap();
+        let new_head = next.l2_settlement().unwrap().head().unwrap();
+        assert_ne!(new_head.0, head.0);
+        assert_eq!(next.l2_settlement().unwrap().settled_number(), 1);
+    }
+
+    // ── The sparse guest: the swap, what is in flight across it, the rollback ──
+
+    /// The flag day of a rehearsal network that holds the mainnet program: the
+    /// gates act on it, and the funded depositor and the L2 are real.
+    fn swap_fixture() -> (CommittedState, Vec<RandaoChain>) {
+        let (pre, mut policy, mut chains) = funded_running_without_l2();
+        let pinned = mainnet::PROGRAM.unwrap();
+        policy.identities[2..7].copy_from_slice(&pinned.identities[2..7]);
+        policy.proof_policy = pinned.proof_policy;
+        let _gate = crate::params::l2_settlement_rehearsal::open();
+        let _policy = crate::l2_settlement::activation_rehearsal::set(activation(policy, true));
+        let opened = apply(&pre, crate::params::SLOTS_PER_EPOCH, &[], &mut chains).unwrap();
+        (opened, chains)
+    }
+
+    fn program_of(state: &crate::l2_settlement::State) -> [[u8; 32]; 4] {
+        state.policy().identities[3..7].try_into().unwrap()
+    }
+
+    #[test]
+    fn the_rollback_gate_is_inert_and_the_fallback_proves_the_same_rules() {
+        // Inert in the candidate; the emergency release (arm.py) sets the epoch and,
+        // only with it, an optional head reset.
+        let gate = crate::params::L2_PROGRAM_ROLLBACK_EPOCH;
+        for epoch in [0, 8_620, gate.saturating_sub(1), gate, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert_eq!(crate::params::l2_program_rollback_active(epoch), gate != u64::MAX && epoch >= gate, "{epoch}");
+        }
+        if gate == u64::MAX {
+            assert_eq!(mainnet::ROLLBACK_HEAD_RESET, None);
+        } else {
+            assert!(gate > crate::params::L2_NEXT_PROGRAM_EPOCH && crate::params::L2_NEXT_PROGRAM_EPOCH != u64::MAX);
+        }
+        let (next, fallback, pinned) = (mainnet::PROGRAM_NEXT, mainnet::PROGRAM_FALLBACK, mainnet::PROGRAM.unwrap());
+        // Same rules, or the next rules without forced inclusion only: the next
+        // configuration is then listed for forced inclusion and the fallback's
+        // is not (no rollback can then be armed with forced inclusion).
+        let forced_only = mainnet::FORCED_INCLUSION_CONFIGURATIONS.contains(&next.identities[0])
+            && !mainnet::FORCED_INCLUSION_CONFIGURATIONS.contains(&fallback.identities[0]);
+        assert!(next.identities[0] == fallback.identities[0] || forced_only, "same rules");
+        assert_eq!(next.proof_policy, fallback.proof_policy);
+        for i in 1..4 {
+            assert_ne!(next.identities[i], fallback.identities[i], "another guest");
+        }
+        assert_ne!(fallback.identities[0], pinned.identities[3], "the next rules are one-way");
+    }
+
+    #[test]
+    fn the_schedule_is_empty_while_inert_and_names_only_what_is_ahead() {
+        let mut l2 = mainnet_l2_state();
+        let (next_e, back_e) = (crate::params::L2_NEXT_PROGRAM_EPOCH, crate::params::L2_PROGRAM_ROLLBACK_EPOCH);
+        assert_eq!(l2.program_schedule(), l2.program_schedule_for_test(next_e, back_e));
+        assert_eq!(l2.program_schedule().is_empty(), next_e == u64::MAX && back_e == u64::MAX);
+        assert!(l2.program_schedule_for_test(u64::MAX, u64::MAX).is_empty());
+        let both = [(10_000, mainnet::PROGRAM_NEXT), (10_500, mainnet::PROGRAM_FALLBACK)];
+        assert_eq!(l2.program_schedule_for_test(10_000, 10_500), both);
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        assert_eq!(l2.program_schedule_for_test(10_000, 10_500), both[1..]);
+        assert!(l2.program_schedule_for_test(10_000, u64::MAX).is_empty());
+        l2.replace_program_for_test(&mainnet::PROGRAM_FALLBACK);
+        assert!(l2.program_schedule_for_test(10_000, 10_500).is_empty());
+        // Any other L2 hears nothing.
+        let (other, _) = fixture();
+        assert!(other.l2_settlement().unwrap().program_schedule_for_test(10_000, 10_500).is_empty());
+    }
+
+    #[test]
+    fn the_rollback_acts_only_on_the_swapped_program_and_only_once() {
+        let (mut pre, _) = fixture();
+        let other = pre.l2_settlement().unwrap().clone();
+        pre.l2_settlement = Some(mainnet_l2_state());
+
+        // Armed before any swap happened it leaves the activated program alone.
+        {
+            let _rollback = crate::params::l2_next_program_test::open_rollback();
+            assert_eq!(pre.close_epoch().l2_settlement().unwrap().policy(), pre.l2_settlement().unwrap().policy());
+        }
+        let _gate = crate::params::l2_next_program_test::open();
+        let swapped = pre.close_epoch();
+        assert_eq!(program_of(swapped.l2_settlement().unwrap()), mainnet::PROGRAM_NEXT.identities);
+
+        let stayed = swapped.close_epoch();
+        let _rollback = crate::params::l2_next_program_test::open_rollback();
+        let back = swapped.close_epoch();
+        let l2 = back.l2_settlement().unwrap();
+        assert_eq!(program_of(l2), mainnet::PROGRAM_FALLBACK.identities);
+        let (old, new) = (swapped.l2_settlement().unwrap().policy(), l2.policy());
+        assert_eq!(new.identities[..3], old.identities[..3]);
+        // The rules stay: the configuration is the fallback's, which is the next
+        // one (or the next one without forced inclusion, see above).
+        assert_eq!(new.identities[3], mainnet::PROGRAM_FALLBACK.identities[0]);
+        assert!(old.identities[3] == new.identities[3] || mainnet::FORCED_INCLUSION_CONFIGURATIONS.contains(&old.identities[3]));
+        assert!(l2.next_program_active(), "the rules stay");
+        assert_eq!(
+            (new.proof_policy, new.chain_id, new.initial_l2_parent, new.initial_l2_state, new.attestor_set),
+            (old.proof_policy, old.chain_id, old.initial_l2_parent, old.initial_l2_state, old.attestor_set),
+        );
+        assert_ne!(back.state_root(), stayed.state_root(), "the policy is committed");
+
+        // Both gates stay open and neither moves it again.
+        assert_eq!(back.close_epoch().l2_settlement().unwrap().policy(), new);
+        // Open together on an unswapped L2 they run in the one order.
+        assert_eq!(program_of(pre.close_epoch().l2_settlement().unwrap()), mainnet::PROGRAM_FALLBACK.identities);
+        // Any other L2 is left alone.
+        pre.l2_settlement = Some(other.clone());
+        assert_eq!(pre.close_epoch().l2_settlement().unwrap().policy(), other.policy());
+    }
+
+    /// Settlement N under the activated program; a proof of N+1 in flight when
+    /// the gate passes; N+1 under the sparse guest; then the same at a rollback.
+    #[test]
+    fn what_is_in_flight_crosses_the_swap_and_the_rollback() {
+        let (opened, mut chains) = swap_fixture();
+        let deposit = deposit_tx(&opened, 7_000_000_000);
+        let s1 = apply(&opened, 33, &[PosTransaction::L2Deposit(deposit)], &mut chains).unwrap();
+        let empty = crate::l2_settlement::expected_body_commitment(&[]);
+
+        // N: settled under the activated program, with withdrawals.
+        let leaves = wleaves(3);
+        let with_tree = |mut tx: Transaction| {
+            tx.statement[S + v3::WITHDRAWAL_ROOT..S + v3::WITHDRAWAL_ROOT + 32].copy_from_slice(&wd::root(&leaves));
+            tx.statement[S + v3::WITHDRAWAL_COUNT..S + v3::WITHDRAWAL_COUNT + 8].copy_from_slice(&3u64.to_be_bytes());
+            tx
+        };
+        let first = with_tree(to_v3(settlement(&s1, empty), no_deposits(), 0));
+        let s2 = apply(&s1, 34, &[PosTransaction::L2SettlementAsync(Box::new(first))], &mut chains).unwrap();
+        let (head_n, _) = s2.l2_settlement().unwrap().head().unwrap();
+        let s3 = apply(&s2, 35, &[], &mut chains).unwrap();
+
+        // N+1: proved under the activated program against the frozen source, with
+        // its data-availability record in place, not landed when the gate passes.
+        let record = s3.l2_settlement().unwrap().inbox()[0];
+        let minted = crate::l2_settlement::deposits_hash(&[record]);
+        let in_flight = with_tree(to_v3(settlement(&s3, empty), minted, 0));
+        let mut s3 = s3;
+        let da = crate::l2_settlement::da::Record { l2_number: 2, commitment: [0xd8; 32], height: s3.l2_settlement().unwrap().height() };
+        s3.l2_settlement.as_mut().unwrap().insert_da_record(da);
+        let parent = *s3.head.as_bytes();
+        let before = s3.l2_settlement().unwrap().clone();
+        assert_eq!(before.validate_async(&in_flight, &ProofDouble), Ok(()), "valid below the gate");
+        assert!(!before.names_another_program(&in_flight));
+
+        let swapped = {
+            let _gate = crate::params::l2_next_program_test::open();
+            apply(&s3, 2 * crate::params::SLOTS_PER_EPOCH, &[], &mut chains).unwrap()
+        };
+        let l2 = swapped.l2_settlement().unwrap();
+        assert_eq!(program_of(l2), mainnet::PROGRAM_NEXT.identities);
+        // Head, source, inbox cursor, DA, withdrawal roots and escrow stay.
+        assert_eq!(l2.head(), before.head());
+        assert_eq!(l2.frozen_source(), before.frozen_source());
+        assert_eq!(l2.consumed(), before.consumed());
+        assert_eq!(l2.data_availability().iter().filter(|r| r.l2_number == 2).count(), 1);
+        assert_eq!(l2.withdrawal_roots(), before.withdrawal_roots());
+        assert_eq!(l2.escrow_sat(), before.escrow_sat());
+        assert!(l2.next_program_active());
+
+        // The proof in flight is dead, by its pin and before any proof check.
+        assert!(l2.names_another_program(&in_flight));
+        assert_eq!(l2.validate_async(&in_flight, &ProofDouble), Err(Reject::Policy));
+        let mut copy = l2.clone();
+        assert_eq!(copy.apply(&in_flight, parent, 35, true, &ProofDouble), Err(Reject::Policy));
+        assert_eq!(&copy, l2, "a refusal changes nothing");
+
+        // The rebuilt proof differs from it in the four program pins only.
+        let rebuilt = with_tree(to_v3(settlement(&swapped, empty), minted, 0));
+        assert!(!l2.names_another_program(&rebuilt));
+        let moved: Vec<usize> = (0..in_flight.statement.len()).filter(|i| in_flight.statement[*i] != rebuilt.statement[*i]).collect();
+        assert!(moved.iter().all(|i| (S + 96..S + 224).contains(i)), "only identities 3 to 6 move: {moved:?}");
+        let s4 = {
+            let _gate = crate::params::l2_next_program_test::open();
+            apply(&swapped, 65, &[PosTransaction::L2SettlementAsync(Box::new(rebuilt))], &mut chains).unwrap()
+        };
+        let l2 = s4.l2_settlement().unwrap();
+        assert_eq!(l2.settled_number(), 2);
+        let (head_n1, statement) = l2.head().unwrap();
+        assert_eq!(statement[S + 224..S + 256], head_n, "the commitment chain runs across the swap");
+        assert!(l2.data_availability().iter().all(|r| r.l2_number > 2), "the settled block's record goes");
+        assert_eq!(l2.consumed(), 1, "the deposit minted once");
+
+        // The rollback: a proof of the sparse guest in flight dies the same way.
+        let s5 = {
+            let _gate = crate::params::l2_next_program_test::open();
+            apply(&s4, 66, &[], &mut chains).unwrap()
+        };
+        let sparse = with_tree(to_v3(settlement(&s5, empty), no_deposits(), 0));
+        let back = {
+            let _gate = crate::params::l2_next_program_test::open();
+            let _rollback = crate::params::l2_next_program_test::open_rollback();
+            apply(&s5, 3 * crate::params::SLOTS_PER_EPOCH, &[], &mut chains).unwrap()
+        };
+        let l2 = back.l2_settlement().unwrap();
+        assert_eq!(program_of(l2), mainnet::PROGRAM_FALLBACK.identities);
+        assert_eq!(l2.validate_async(&sparse, &ProofDouble), Err(Reject::Policy));
+        let complete = with_tree(to_v3(settlement(&back, empty), no_deposits(), 0));
+        let s6 = {
+            let _gate = crate::params::l2_next_program_test::open();
+            let _rollback = crate::params::l2_next_program_test::open_rollback();
+            apply(&back, 97, &[PosTransaction::L2SettlementAsync(Box::new(complete))], &mut chains).unwrap()
+        };
+        let l2 = s6.l2_settlement().unwrap();
+        assert_eq!(l2.settled_number(), 3);
+        assert_eq!(l2.head().unwrap().1[S + 224..S + 256], head_n1);
+        assert_eq!(l2.withdrawal_head().1, 3, "the tree of the first program is still the tree");
+        assert!(l2.next_program_active(), "a rollback keeps the rules");
+        assert!(l2.escrow_conserved());
+    }
+
+    /// The boundary rolls before a block's transactions, so already the first
+    /// block of the new epoch refuses the old program and takes the new one.
+    #[test]
+    fn the_first_block_past_the_gate_takes_only_the_new_program() {
+        let (opened, mut chains) = swap_fixture();
+        let s1 = apply(&opened, 33, &[], &mut chains).unwrap();
+        let empty = crate::l2_settlement::expected_body_commitment(&[]);
+        let old = to_v3(settlement(&s1, empty), no_deposits(), 0);
+        let mut new = old.clone();
+        for (i, id) in mainnet::PROGRAM_NEXT.identities.iter().enumerate() {
+            new.statement[S + (3 + i) * 32..S + (4 + i) * 32].copy_from_slice(id);
+        }
+        let (old, new) = (PosTransaction::L2SettlementAsync(Box::new(old)), PosTransaction::L2SettlementAsync(Box::new(new)));
+        let _gate = crate::params::l2_next_program_test::open();
+        let post = refuse_then_apply(&s1, 2 * crate::params::SLOTS_PER_EPOCH, &[old], 0, &[new], &mut chains);
+        let l2 = post.l2_settlement().unwrap();
+        assert_eq!(l2.settled_number(), 1);
+        assert_eq!(program_of(l2), mainnet::PROGRAM_NEXT.identities);
+    }
+
+    /// A claim, and an attestation signed before the gate, spend across it: the
+    /// attestors sign a withdrawal root and no program, and the proof is a Merkle
+    /// path to a record the swap keeps.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn a_claim_signed_before_the_gate_applies_after_the_swap_and_the_rollback() {
+        let leaves = [([1; 32], 150 * BLCH), ([2; 32], 5 * BLCH)];
+        let pre = attested_fixture(&leaves, true);
+        let tx = claim_of(&pre, &leaves, 0, Some(attest(&leaves, &[0, 1])));
+        for program in [None, Some(mainnet::PROGRAM_NEXT), Some(mainnet::PROGRAM_FALLBACK)] {
+            let mut state = pre.clone();
+            if let Some(program) = &program {
+                state.l2_settlement.as_mut().unwrap().replace_program_for_test(program);
+            }
+            assert_eq!(state.l2_withdraw_claim_refusal(&tx), None);
+            let post = try_claim(&state, &tx).expect("the claim applies");
+            let l2 = post.l2_settlement().unwrap();
+            assert_eq!(l2.released_sat(), u128::from(150 * BLCH));
+            assert!(l2.claimed().contains(0) && l2.escrow_conserved());
+        }
+    }
+
+    /// The gate never refuses a claim the old rule admitted, so nothing admitted
+    /// to a mempool below the gate turns invalid at it. The reverse does not hold,
+    /// which is why a rollback keeps the next rule.
+    #[test]
+    fn the_next_release_rule_only_adds_to_the_old_one() {
+        let mut widened = false;
+        for cap in [0u128, 1, 10, 1_000] {
+            for released in [0u128, 1, 9, 10, 11, 1_000, 1_001] {
+                for sats in [0u64, 1, 10, 11, 1_000, 5_000] {
+                    for exempt in [false, true] {
+                        let window = wd::ReleaseWindow { window: 1, released, cap };
+                        let (old, new) = (window.admits(sats, exempt, false), window.admits(sats, exempt, true));
+                        assert!(!old || new, "{released} {cap} {sats} {exempt}");
+                        widened |= new && !old;
+                    }
+                }
+            }
+        }
+        assert!(widened);
+    }
+
+    #[test]
+    fn the_release_rule_stays_after_a_rollback() {
+        let mut l2 = mainnet_l2_state();
+        assert!(!l2.next_program_active());
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        assert!(l2.next_program_active());
+        l2.replace_program_for_test(&mainnet::PROGRAM_FALLBACK);
+        assert!(l2.next_program_active());
+    }
+
+    #[test]
+    fn a_rollback_with_a_reset_moves_the_head_and_a_refused_reset_still_moves_the_program() {
+        let mut l2 = state_with_bad_tail();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)), forfeit: false };
+
+        let mut applied = l2.clone();
+        applied.install_fallback_with_for_test(&reset);
+        assert_eq!(program_of(&applied), mainnet::PROGRAM_FALLBACK.identities);
+        assert_eq!((applied.settled_number(), applied.consumed()), (3, 3));
+        assert!(applied.next_program_active() && applied.escrow_conserved());
+
+        // A leaf only the discarded tail published was paid: the head stays.
+        let mut refused = l2.clone();
+        refused.claimed_insert_for_test(4);
+        refused.install_fallback_with_for_test(&reset);
+        assert_eq!(program_of(&refused), mainnet::PROGRAM_FALLBACK.identities);
+        assert_eq!(refused.settled_number(), 7);
+
+        // On any other program it does neither.
+        let mut activated = state_with_bad_tail();
+        activated.install_fallback_with_for_test(&reset);
+        assert_eq!(activated, state_with_bad_tail());
+    }
+
+    /// A real proof of the fallback guest against its pin, with
+    /// BLOCH_FALLBACK_VALUES and BLOCH_FALLBACK_PROOF naming settler-format files.
+    #[test]
+    #[ignore = "needs a real proof of the fallback program"]
+    fn fallback_program_real_groth16_passes_the_native_verifier() {
+        let values = std::fs::read(std::env::var_os("BLOCH_FALLBACK_VALUES").unwrap()).unwrap();
+        let proof = std::fs::read(std::env::var_os("BLOCH_FALLBACK_PROOF").unwrap()).unwrap();
+        let fallback = mainnet::PROGRAM_FALLBACK;
+        assert!(bloch_l2_proof::verify(&fallback.proof_policy, &fallback.identities[3], &values, &proof));
+        assert!(!bloch_l2_proof::verify(&fallback.proof_policy, &mainnet::PROGRAM_NEXT.identities[3], &values, &proof));
+    }
+
+    // ── The optional head reset (owner decision; `mainnet::HEAD_RESET` is `None`) ──
+
+    #[test]
+    fn head_reset_ships_absent() {
+        assert_eq!(mainnet::HEAD_RESET, None);
+        let (mut pre, _) = fixture();
+        let mut l2 = mainnet_l2_state();
+        l2.set_head_for_test([9; 32], statement_at(&l2, 5, [0xaa; 32], 2), 0);
+        pre.l2_settlement = Some(l2);
+        let _gate = crate::params::l2_next_program_test::open();
+        let crossed = pre.close_epoch();
+        let after = crossed.l2_settlement().unwrap();
+        assert!(after.next_program_active());
+        assert_eq!(after.settled_number(), 5, "without the option the swap keeps the head");
+    }
+
+    /// A V3 statement of `state`'s network for block `number`, withdrawal count `count`.
+    fn statement_at(state: &crate::l2_settlement::State, number: u64, root: [u8; 32], count: u64) -> Vec<u8> {
+        use crate::l2_settlement::{v3, STATEMENT_TAG, STATEMENT_V3_BYTES, STATEMENT_V3_TAG};
+        let tag = STATEMENT_TAG.len();
+        let mut s = vec![0u8; STATEMENT_V3_BYTES];
+        s[..tag].copy_from_slice(STATEMENT_V3_TAG);
+        for (i, id) in state.policy().identities.iter().enumerate() {
+            s[tag + i * 32..tag + (i + 1) * 32].copy_from_slice(id);
+        }
+        s[tag + 264..tag + 272].copy_from_slice(&number.to_be_bytes());
+        s[tag + 528..tag + 536].copy_from_slice(&number.to_be_bytes());
+        s[tag + 336..tag + 368].copy_from_slice(&[number as u8; 32]);
+        s[tag + 368..tag + 400].copy_from_slice(&[number as u8 ^ 0xff; 32]);
+        s[tag + v3::WITHDRAWAL_ROOT..tag + v3::WITHDRAWAL_ROOT + 32].copy_from_slice(&root);
+        s[tag + v3::WITHDRAWAL_COUNT..tag + v3::WITHDRAWAL_COUNT + 8].copy_from_slice(&count.to_be_bytes());
+        s
+    }
+
+    fn leaked_hex(bytes: &[u8]) -> &'static str {
+        Box::leak(bytes.iter().map(|b| format!("{b:02x}")).collect::<String>().into_boxed_str())
+    }
+
+    /// An L2 at block 7 with 8 inbox records consumed and withdrawal records at 2 and 6.
+    fn state_with_bad_tail() -> crate::l2_settlement::State {
+        let mut l2 = mainnet_l2_state();
+        for i in 0..8u32 {
+            l2.append_deposit(crate::l2_settlement::InboxRecord {
+                height: 1, tx_index: i, txid: [0x77; 32], vout: 1, sats: 10 * BLCH, recipient: [0x42; 20],
+            })
+            .unwrap();
+        }
+        l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: [0xaa; 32], count: 2, height: 1 });
+        l2.insert_withdrawal_record(wd::Record { l2_number: 6, root: [0xbb; 32], count: 5, height: 2 });
+        let bad = statement_at(&l2, 7, [0xbb; 32], 5);
+        l2.set_head_for_test([7; 32], bad, 7);
+        l2
+    }
+
+    #[test]
+    fn head_reset_to_a_settled_block_keeps_its_tree_and_rewinds_the_inbox() {
+        let mut l2 = state_with_bad_tail();
+        let escrow = l2.escrow_sat();
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)), forfeit: false };
+        assert!(l2.reset_head(&reset));
+        assert_eq!(l2.head().unwrap(), ([3; 32], keep));
+        assert_eq!(l2.settled_number(), 3);
+        assert_eq!(l2.consumed(), 3, "records 3..8 mint again on the new chain");
+        assert_eq!(l2.withdrawal_head(), ([0xaa; 32], 2));
+        assert_eq!(l2.withdrawal_roots().iter().map(|r| r.l2_number).collect::<Vec<_>>(), [2]);
+        assert_eq!(l2.escrow_sat(), escrow);
+        assert!(l2.escrow_conserved());
+        assert!(!l2.reset_head(&reset), "the head is no longer above the target");
+    }
+
+    #[test]
+    fn head_reset_to_the_genesis_clears_the_head() {
+        let mut l2 = state_with_bad_tail();
+        assert!(l2.reset_head(&mainnet::HeadReset { number: 0, commitment: [0; 32], statement: None, forfeit: false }));
+        assert_eq!(l2.head(), None);
+        assert_eq!((l2.settled_number(), l2.consumed()), (0, 0));
+        assert!(l2.withdrawal_roots().is_empty());
+    }
+
+    #[test]
+    fn head_reset_refuses_to_forget_a_paid_leaf() {
+        let mut l2 = state_with_bad_tail();
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let reset = mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(&keep)), forfeit: false };
+        // Leaf 1 is inside the target's tree: paid, and still published after the reset.
+        let mut inside = l2.clone();
+        inside.claimed_insert_for_test(1);
+        assert!(inside.reset_head(&reset));
+        // Leaf 4 only exists in the discarded tail: the reset must not apply.
+        l2.claimed_insert_for_test(4);
+        let before = l2.clone();
+        assert!(!l2.reset_head(&reset));
+        assert_eq!(l2, before);
+    }
+
+    #[test]
+    fn head_reset_refuses_a_malformed_or_foreign_statement() {
+        let l2 = state_with_bad_tail();
+        let good = statement_at(&l2, 3, [0xaa; 32], 2);
+        let refused = |statement: Option<&'static str>, number: u64| {
+            let mut copy = l2.clone();
+            let before = copy.clone();
+            assert!(!copy.reset_head(&mainnet::HeadReset { number, commitment: [3; 32], statement, forfeit: false }));
+            assert_eq!(copy, before);
+        };
+        refused(None, 3);
+        refused(Some("00ff"), 3);
+        refused(Some(leaked_hex(&good)), 4);
+        let mut other_network = good.clone();
+        other_network[crate::l2_settlement::STATEMENT_TAG.len()] ^= 1;
+        refused(Some(leaked_hex(&other_network)), 3);
+        // At or below the target there is nothing to reset.
+        refused(Some(leaked_hex(&statement_at(&l2, 7, [0xbb; 32], 5))), 7);
+    }
+
+    // ── G2 forfeit reset (agent 222; inert: ROLLBACK_HEAD_RESET ships None) ──
+
+    fn bitmap_consistent(b: &wd::ClaimBitmap) -> bool {
+        let stored: u64 = b.words().map(|(_, bits)| bits.iter().map(|x| u64::from(x.count_ones())).sum::<u64>()).sum();
+        b.words().all(|(w, bits)| w >= b.floor() && *bits != [0; 32]) && b.floor() * 256 + stored == b.claims()
+    }
+
+    #[test]
+    fn claim_bitmap_forgets_from_an_index_through_the_floor() {
+        let mut b = wd::ClaimBitmap::default();
+        for i in 0..600 {
+            assert!(b.insert(i));
+        }
+        assert_eq!((b.floor(), b.stored_words(), b.claims()), (2, 1, 600));
+        // Above everything: nothing to forget.
+        assert_eq!(b.forget_at_or_above(600), 0);
+        assert_eq!(b.claims(), 600);
+        // From inside a fully claimed word: the floor comes back down.
+        assert_eq!(b.forget_at_or_above(300), 300);
+        assert!(b.contains(299) && !b.contains(300) && !b.contains(511) && !b.contains(599));
+        assert_eq!((b.floor(), b.stored_words(), b.claims()), (1, 1, 300));
+        assert!(bitmap_consistent(&b));
+        assert!(!b.any_at_or_above(300) && b.any_at_or_above(299));
+        // The forgotten indices can be claimed once more, and only once.
+        assert!(b.insert(300) && !b.insert(300));
+        assert_eq!(b.claims(), 301);
+        // On a word boundary, and from zero.
+        assert_eq!(b.forget_at_or_above(256), 45);
+        assert_eq!((b.floor(), b.stored_words(), b.claims()), (1, 0, 256));
+        assert!(bitmap_consistent(&b));
+        assert_eq!(b.forget_at_or_above(0), 256);
+        assert_eq!((b.floor(), b.stored_words(), b.claims()), (0, 0, 0));
+        // Sparse claims far above the floor.
+        let mut s = wd::ClaimBitmap::default();
+        for i in [3u64, 700, 70_000, 1 << 31] {
+            s.insert(i);
+        }
+        assert_eq!(s.forget_at_or_above(701), 2);
+        assert!(s.contains(3) && s.contains(700) && !s.contains(70_000) && !s.contains(1 << 31));
+        assert!(bitmap_consistent(&s));
+    }
+
+    fn forfeit_reset(keep: &[u8]) -> mainnet::HeadReset {
+        mainnet::HeadReset { number: 3, commitment: [3; 32], statement: Some(leaked_hex(keep)), forfeit: true }
+    }
+
+    #[test]
+    fn a_forfeit_reset_applies_over_paid_tail_leaves_and_forgets_only_them() {
+        let mut l2 = state_with_bad_tail();
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        // Leaf 1 (inside the target's tree) and leaves 2 and 4 (only in the tail) were paid.
+        for i in [1, 2, 4] {
+            l2.claimed_insert_for_test(i);
+        }
+        let plain = mainnet::HeadReset { forfeit: false, ..forfeit_reset(&keep) };
+        let before = l2.clone();
+        assert!(!l2.reset_head(&plain), "the plain form still refuses");
+        assert_eq!(l2, before);
+        assert!(l2.reset_head(&forfeit_reset(&keep)));
+        assert_eq!((l2.settled_number(), l2.consumed()), (3, 3));
+        assert_eq!(l2.withdrawal_head(), ([0xaa; 32], 2));
+        assert_eq!(l2.withdrawal_roots().iter().map(|r| r.l2_number).collect::<Vec<_>>(), [2], "the tail's roots stop paying");
+        let claimed = l2.claimed();
+        assert!(claimed.contains(1) && !claimed.contains(2) && !claimed.contains(4));
+        assert_eq!(claimed.claims(), 1);
+        assert!(!claimed.any_at_or_above(2) && bitmap_consistent(claimed));
+        assert_eq!(l2.escrow_sat(), before.escrow_sat(), "what the tail released stays released");
+        assert!(l2.escrow_conserved());
+        assert!(!l2.reset_head(&forfeit_reset(&keep)), "it runs once: the head is no longer above the target");
+    }
+
+    #[test]
+    fn a_forfeit_reset_without_paid_tail_leaves_is_the_plain_reset() {
+        let l2 = state_with_bad_tail();
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let (mut plain, mut forfeit) = (l2.clone(), l2.clone());
+        assert!(plain.reset_head(&mainnet::HeadReset { forfeit: false, ..forfeit_reset(&keep) }));
+        assert!(forfeit.reset_head(&forfeit_reset(&keep)));
+        assert_eq!(plain, forfeit);
+        // Malformed or foreign statements are refused in the forfeit form too.
+        let mut copy = l2.clone();
+        let other = statement_at(&l2, 4, [0xaa; 32], 2);
+        assert!(!copy.reset_head(&mainnet::HeadReset { number: 3, ..forfeit_reset(&other) }));
+        assert_eq!(copy, l2);
+    }
+
+    /// Retention pruned the target's record long before the gate (a 4-day lead
+    /// against 2 880 retained blocks): the reset records the target's root again,
+    /// so honest leaves pay one delay after the gate instead of never.
+    #[test]
+    fn a_reset_republishes_the_target_root_when_retention_pruned_it() {
+        let mut l2 = mainnet_l2_state();
+        for i in 0..8u32 {
+            l2.append_deposit(crate::l2_settlement::InboxRecord {
+                height: 1, tx_index: i, txid: [0x77; 32], vout: 1, sats: 10 * BLCH, recipient: [0x42; 20],
+            })
+            .unwrap();
+        }
+        l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: [0xaa; 32], count: 2, height: 1 });
+        l2.insert_withdrawal_record(wd::Record { l2_number: 6, root: [0xbb; 32], count: 5, height: 2 });
+        let retention = mainnet::LIMITS.retention_blocks;
+        while l2.height() < 2 + retention + 10 {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(l2.withdrawal_roots().iter().map(|r| r.l2_number).collect::<Vec<_>>(), [6], "only the newest old record is kept");
+        l2.set_head_for_test([7; 32], statement_at(&l2, 7, [0xbb; 32], 5), 7);
+        l2.claimed_insert_for_test(4);
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let now = l2.height();
+        assert!(l2.reset_head(&forfeit_reset(&keep)));
+        assert_eq!(l2.withdrawal_roots(), &[wd::Record { l2_number: 3, root: [0xaa; 32], count: 2, height: now }]);
+        assert_eq!(l2.matured_withdrawals(), None, "a new delay starts at the gate");
+        for _ in 0..mainnet::LIMITS.delay_blocks {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(l2.matured_count(), 2);
+        // The genesis target publishes nothing to keep.
+        let mut genesis = mainnet_l2_state();
+        genesis.insert_withdrawal_record(wd::Record { l2_number: 6, root: [0xbb; 32], count: 5, height: 1 });
+        genesis.set_head_for_test([7; 32], statement_at(&genesis, 7, [0xbb; 32], 5), 0);
+        genesis.claimed_insert_for_test(0);
+        assert!(genesis.reset_head(&mainnet::HeadReset { number: 0, commitment: [0; 32], statement: None, forfeit: true }));
+        assert!(genesis.withdrawal_roots().is_empty() && genesis.claimed().claims() == 0);
+    }
+
+    /// The reset records the target's root again, so a reset whose tree
+    /// contradicts what L1 accepted is refused in both forms.
+    #[test]
+    fn a_reset_whose_tree_contradicts_the_retained_records_is_refused() {
+        let l2 = state_with_bad_tail();
+        for forfeit in [false, true] {
+            let refused = |root: [u8; 32], count: u64, number: u64| {
+                let mut copy = l2.clone();
+                let keep = statement_at(&l2, number, root, count);
+                let reset = mainnet::HeadReset { number, commitment: [3; 32], statement: Some(leaked_hex(&keep)), forfeit };
+                assert!(!copy.reset_head(&reset), "{root:?} {count} {number}");
+                assert_eq!(copy, l2);
+            };
+            refused([0xcc; 32], 2, 3); // another root at the retained count 2
+            refused([0xcc; 32], 1, 3); // fewer leaves than a retained record at or below N
+            refused([0xcc; 32], 6, 6); // more leaves than the head's tree
+        }
+    }
+
+    /// Every claim forgotten while sats stay released: the claim section stays
+    /// committed, so the release accounting is still bound by the state root.
+    #[test]
+    fn a_forfeit_that_forgets_every_claim_keeps_the_release_accounting_committed() {
+        let mut l2 = state_with_bad_tail();
+        l2.claimed_insert_for_test(4);
+        l2.released_for_test(10 * BLCH);
+        let marker: &[u8] = b"BLOCH:NATIVE:L2:CLAIM-STATE:1";
+        assert!(l2.committed_bytes().windows(marker.len()).any(|w| w == marker));
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        assert!(l2.reset_head(&forfeit_reset(&keep)));
+        assert_eq!(l2.claimed().claims(), 0);
+        assert!(l2.committed_bytes().windows(marker.len()).any(|w| w == marker));
+        let mut other = l2.clone();
+        other.released_for_test(1);
+        assert_ne!(l2.committed_bytes(), other.committed_bytes());
+    }
+
+    #[test]
+    fn a_forfeit_rollback_moves_the_head_where_the_plain_one_could_not() {
+        let mut l2 = state_with_bad_tail();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        l2.claimed_insert_for_test(4);
+        let keep = statement_at(&l2, 3, [0xaa; 32], 2);
+        let mut plain = l2.clone();
+        plain.install_fallback_with_for_test(&mainnet::HeadReset { forfeit: false, ..forfeit_reset(&keep) });
+        assert_eq!((program_of(&plain), plain.settled_number()), (mainnet::PROGRAM_FALLBACK.identities, 7));
+        let mut forfeit = l2.clone();
+        forfeit.install_fallback_with_for_test(&forfeit_reset(&keep));
+        assert_eq!((program_of(&forfeit), forfeit.settled_number()), (mainnet::PROGRAM_FALLBACK.identities, 3));
+        assert!(!forfeit.claimed().contains(4) && forfeit.escrow_conserved());
+    }
+
+    #[test]
+    fn the_forfeit_form_ships_unused() {
+        assert_eq!(mainnet::HEAD_RESET, None);
+        // Only an emergency release armed through the kit (arm.py) fills it.
+        if crate::params::L2_PROGRAM_ROLLBACK_EPOCH == u64::MAX {
+            assert_eq!(mainnet::ROLLBACK_HEAD_RESET, None);
+        }
+    }
+
+    /// End to end on a development L2: a forged root pays one small claim, the
+    /// forfeit reset forgets it, the forged proof no longer folds to a retained
+    /// root, and the new chain's own leaf at the same index is claimable.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn after_a_forfeit_reset_the_forged_leaf_is_dead_and_its_index_pays_the_new_chain() {
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let mut pre = attested_fixture(&honest, true);
+        let forged = [honest[0], honest[1], ([0xee; 32], 9 * BLCH)];
+        let tree = |leaves: &[([u8; 32], u64)]| -> Vec<[u8; 32]> {
+            leaves.iter().enumerate().map(|(i, (r, s))| wd::leaf(700771, i as u64, r, *s)).collect()
+        };
+        {
+            let l2 = pre.l2_settlement.as_mut().unwrap();
+            l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: wd::root(&tree(&forged)), count: 3, height: 2 });
+            let bad = statement_at(l2, 2, wd::root(&tree(&forged)), 3);
+            l2.set_head_for_test([2; 32], bad, 1);
+        }
+        let post = try_claim(&pre, &claim_of(&pre, &forged, 2, None)).expect("the forged small claim pays");
+        let mut l2 = post.l2_settlement().unwrap().clone();
+        assert!(l2.claimed().contains(2));
+        assert_eq!(l2.released_sat(), u128::from(9 * BLCH));
+        let keep = statement_at(&l2, 1, wd::root(&tree(&honest)), 2);
+        let reset = mainnet::HeadReset { number: 1, commitment: [1; 32], statement: Some(leaked_hex(&keep)), forfeit: true };
+        assert!(!l2.clone().reset_head(&mainnet::HeadReset { forfeit: false, ..reset }));
+        assert!(l2.reset_head(&reset));
+        assert!(!l2.claimed().contains(2) && l2.escrow_conserved());
+        assert_eq!(l2.released_sat(), u128::from(9 * BLCH), "the forfeit: released and gone");
+        let (r, s) = forged[2];
+        let siblings = wd::proof(&tree(&forged), 2).unwrap();
+        assert_eq!(l2.check_claim(700771, 2, &r, s, &siblings, false, false), Err(wd::ClaimRefusal::Proof));
+        // The honest leaves of the target still pay.
+        let (r0, s0) = honest[0];
+        assert!(l2.check_claim(700771, 0, &r0, s0, &wd::proof(&tree(&honest), 0).unwrap(), false, false).is_ok());
+        // The new chain publishes its own leaf 2; once matured it pays.
+        let new = [honest[0], honest[1], ([0x55; 32], 3 * BLCH)];
+        let at = l2.height() + 1;
+        l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: wd::root(&tree(&new)), count: 3, height: at });
+        for _ in 0..wd::WITHDRAW_DELAY_BLOCKS + 1 {
+            l2.advance_height().unwrap();
+        }
+        let (r2, s2) = new[2];
+        assert!(l2.check_claim(700771, 2, &r2, s2, &wd::proof(&tree(&new), 2).unwrap(), false, false).is_ok());
+    }
+
+    /// Review R308-7 (agent 308, round 15). The reset tells "a leaf the target
+    /// did not publish was paid" by index alone (`any_at_or_above(count)`).
+    /// Nothing on L1 checks that a tail root extends the target's tree
+    /// (`check_successor` compares counts and root equality only), and the
+    /// reset exists for a guest that settled what the rules do not give: such
+    /// a tail can rewrite a leaf BELOW the target's count. Here the forged
+    /// tree replaces the honest unclaimed leaf 1 (5 BLCH) by 9 BLCH to the
+    /// attacker and that leaf is paid. Expected: the plain reset refuses, as
+    /// its contract says, and after the forfeit reset the honest leaf 1 of the
+    /// kept target root is claimable.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn r308_7_a_forged_leaf_below_the_target_count_is_seen_by_the_reset() {
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let mut pre = attested_fixture(&honest, true);
+        let forged = [honest[0], ([0xee; 32], 9 * BLCH), ([3; 32], 5 * BLCH)];
+        let tree = |leaves: &[([u8; 32], u64)]| -> Vec<[u8; 32]> {
+            leaves.iter().enumerate().map(|(i, (r, s))| wd::leaf(700771, i as u64, r, *s)).collect()
+        };
+        {
+            let l2 = pre.l2_settlement.as_mut().unwrap();
+            // Added with the fix (agent 311): the tail of a rollback reset is
+            // settled by the next program, and paid leaves are recorded from
+            // the swap on, so that states below the gate keep their bytes.
+            l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+            l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: wd::root(&tree(&forged)), count: 3, height: 2 });
+            let bad = statement_at(l2, 2, wd::root(&tree(&forged)), 3);
+            l2.set_head_for_test([2; 32], bad, 1);
+        }
+        let post = try_claim(&pre, &claim_of(&pre, &forged, 1, None)).expect("the forged claim at an index below the target count pays");
+        let mut l2 = post.l2_settlement().unwrap().clone();
+        assert!(l2.claimed().contains(1));
+        assert_eq!(l2.released_sat(), u128::from(9 * BLCH));
+        let keep = statement_at(&l2, 1, wd::root(&tree(&honest)), 2);
+        let reset = mainnet::HeadReset { number: 1, commitment: [1; 32], statement: Some(leaked_hex(&keep)), forfeit: true };
+        let plain_applied = l2.clone().reset_head(&mainnet::HeadReset { forfeit: false, ..reset });
+        assert!(l2.reset_head(&reset));
+        let (r1, s1) = honest[1];
+        let honest_claim = l2.check_claim(700771, 1, &r1, s1, &wd::proof(&tree(&honest), 1).unwrap(), false, false);
+        assert!(
+            !plain_applied && honest_claim.is_ok(),
+            "plain reset applied over a paid forged leaf: {plain_applied}; honest leaf 1 of the kept root after the forfeit reset: {honest_claim:?}"
+        );
+    }
+
+    /// A mainnet L2 under the next program with 1 000 BLCH escrowed: the tree
+    /// of `honest` recorded at L2 block 1, the tree of `tail` at block 2 (the
+    /// head), both matured for small claims. Returns the chain id too.
+    fn next_program_with_tail(honest: &[([u8; 32], u64)], tail: &[([u8; 32], u64)]) -> (crate::l2_settlement::State, u64) {
+        let mut l2 = mainnet_l2_state();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        put_tail(&mut l2, honest, tail);
+        let chain = l2.policy().chain_id;
+        (l2, chain)
+    }
+
+    fn leaves_of(chain: u64, leaves: &[([u8; 32], u64)]) -> Vec<[u8; 32]> {
+        leaves.iter().enumerate().map(|(i, (r, s))| wd::leaf(chain, i as u64, r, *s)).collect()
+    }
+
+    fn put_tail(l2: &mut crate::l2_settlement::State, honest: &[([u8; 32], u64)], tail: &[([u8; 32], u64)]) {
+        let chain = l2.policy().chain_id;
+        l2.append_deposit(crate::l2_settlement::InboxRecord {
+            height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 1_000 * BLCH, recipient: [0x42; 20],
+        })
+        .unwrap();
+        let at = l2.height();
+        let (good, bad) = (wd::root(&leaves_of(chain, honest)), wd::root(&leaves_of(chain, tail)));
+        l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: good, count: honest.len() as u64, height: at });
+        l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: bad, count: tail.len() as u64, height: at });
+        let head = statement_at(l2, 2, bad, tail.len() as u64);
+        l2.set_head_for_test([2; 32], head, 1);
+        for _ in 0..mainnet::LIMITS.delay_blocks {
+            l2.advance_height().unwrap();
+        }
+    }
+
+    fn pay(l2: &mut crate::l2_settlement::State, chain: u64, leaves: &[([u8; 32], u64)], i: u64) -> Result<(), wd::ClaimRefusal> {
+        let (r, sats) = leaves[i as usize];
+        l2.release_withdrawal(chain, i, &r, sats, &wd::proof(&leaves_of(chain, leaves), i).unwrap(), false, false)
+    }
+
+    fn reset_to_block_1(l2: &crate::l2_settlement::State, chain: u64, honest: &[([u8; 32], u64)], forfeit: bool) -> mainnet::HeadReset {
+        let keep = statement_at(l2, 1, wd::root(&leaves_of(chain, honest)), honest.len() as u64);
+        mainnet::HeadReset { number: 1, commitment: [1; 32], statement: Some(leaked_hex(&keep)), forfeit }
+    }
+
+    /// R308-7, state level and on every build. The tail rewrote leaf 1 and
+    /// kept leaf 0. A claim proven against the tail's root is seen by the
+    /// reset at any index: the plain form refuses, the forfeit form frees the
+    /// index for the target's own leaf, and no leaf is paid twice.
+    #[test]
+    fn r308_7_a_forfeit_reset_frees_a_rewritten_index_and_pays_no_leaf_twice() {
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let forged = [honest[0], ([0xee; 32], 9 * BLCH), ([3; 32], 5 * BLCH)];
+        let (mut l2, chain) = next_program_with_tail(&honest, &forged);
+        // Leaf 0 (the same leaf in both trees) and the forged leaf 1, both
+        // proven against the tail's root.
+        pay(&mut l2, chain, &forged, 0).expect("leaf 0 against the tail root");
+        pay(&mut l2, chain, &forged, 1).expect("the forged leaf 1");
+        assert_eq!(l2.paid_leaves().len(), 2);
+        assert_eq!(l2.paid_leaves().proven_above(1), [0, 1]);
+        assert_eq!(l2.paid_leaves().proven_above(2), [] as [u64; 0]);
+        let released = l2.released_sat();
+        assert_eq!(released, u128::from(14 * BLCH));
+
+        let before = l2.clone();
+        assert!(!l2.reset_head(&reset_to_block_1(&l2, chain, &honest, false)), "the plain form refuses");
+        assert_eq!(l2, before);
+        assert!(l2.reset_head(&reset_to_block_1(&l2, chain, &honest, true)));
+        assert_eq!(l2.settled_number(), 1);
+        assert_eq!(l2.withdrawal_roots().iter().map(|r| r.l2_number).collect::<Vec<_>>(), [1]);
+        assert!(!l2.claimed().contains(0) && !l2.claimed().contains(1));
+        assert_eq!(l2.claimed().claims(), 0);
+        assert!(bitmap_consistent(l2.claimed()) && l2.escrow_conserved());
+        assert_eq!(l2.released_sat(), released, "what the tail released stays released");
+        // The record of what was paid stays, with the mark of the dropped tail after it.
+        assert_eq!(l2.paid_leaves().len(), before.paid_leaves().len() + 1);
+        assert_ne!(l2.paid_leaves().root(), before.paid_leaves().root());
+        for i in 0..2 {
+            let (r, sats) = forged[i as usize];
+            assert!(l2.paid_leaves().contains(i, &wd::leaf(chain, i, &r, sats)));
+        }
+        assert!(l2.paid_leaves().proven_above(1).is_empty(), "the dropped tail's claims are no tail claims any more");
+
+        // Leaf 0 was paid: the same leaf is refused on the kept root.
+        assert_eq!(pay(&mut l2, chain, &honest, 0), Err(wd::ClaimRefusal::Claimed));
+        // The forged leaf proves against no retained root any more.
+        assert_eq!(pay(&mut l2, chain, &forged, 1), Err(wd::ClaimRefusal::Proof));
+        // The target's own leaf 1 is paid, once.
+        pay(&mut l2, chain, &honest, 1).expect("the honest owner of leaf 1");
+        assert_eq!(pay(&mut l2, chain, &honest, 1), Err(wd::ClaimRefusal::Claimed));
+        assert_eq!(l2.released_sat(), released + u128::from(5 * BLCH));
+        assert!(l2.claimed().contains(1) && !l2.claimed().contains(0) && l2.escrow_conserved());
+        // The rebuilt chain publishes the paid leaf 0 again: still refused.
+        let rebuilt = [honest[0], honest[1], ([4; 32], BLCH)];
+        let at = l2.height() + 1;
+        l2.insert_withdrawal_record(wd::Record { l2_number: 2, root: wd::root(&leaves_of(chain, &rebuilt)), count: 3, height: at });
+        for _ in 0..mainnet::LIMITS.delay_blocks + 1 {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(pay(&mut l2, chain, &rebuilt, 0), Err(wd::ClaimRefusal::Claimed));
+        pay(&mut l2, chain, &rebuilt, 2).expect("a new leaf of the rebuilt chain");
+    }
+
+    /// R308-7, the other side of the rule: a claim proven against the
+    /// target's own record (or an older one) is not a tail claim, so the
+    /// plain reset still applies and nothing is forgotten; and below the
+    /// swap nothing is recorded, the state keeps its bytes and the index
+    /// rule alone decides, as before.
+    #[test]
+    fn r308_7_claims_against_the_target_do_not_stop_a_plain_reset_and_nothing_is_recorded_before_the_swap() {
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let forged = [honest[0], ([0xee; 32], 9 * BLCH), ([3; 32], 5 * BLCH)];
+        let (mut l2, chain) = next_program_with_tail(&honest, &forged);
+        pay(&mut l2, chain, &honest, 0).expect("leaf 0 against the target's root");
+        assert_eq!(l2.paid_leaves().len(), 1);
+        assert!(l2.paid_leaves().proven_above(1).is_empty());
+        let (mut plain, mut forfeit) = (l2.clone(), l2.clone());
+        assert!(plain.reset_head(&reset_to_block_1(&l2, chain, &honest, false)));
+        assert!(forfeit.reset_head(&reset_to_block_1(&l2, chain, &honest, true)));
+        assert_eq!(plain, forfeit);
+        assert!(plain.claimed().contains(0) && plain.claimed().claims() == 1);
+
+        // The same claims under the program the activation pinned.
+        let mut old = mainnet_l2_state();
+        put_tail(&mut old, &honest, &forged);
+        let untouched = old.committed_bytes();
+        pay(&mut old, chain, &forged, 0).unwrap();
+        pay(&mut old, chain, &forged, 1).unwrap();
+        assert!(old.paid_leaves().is_empty());
+        let marker: &[u8] = b"BLOCH:NATIVE:L2:PAID-LEAVES:1";
+        let has_marker = |bytes: &[u8]| bytes.windows(marker.len()).any(|w| w == marker);
+        assert!(!has_marker(&untouched) && !has_marker(&old.committed_bytes()));
+        assert!(old.clone().reset_head(&reset_to_block_1(&old, chain, &honest, false)), "by index alone, as before the swap");
+
+        // Under the next program the section is committed with the first claim
+        // and binds index, leaf and record.
+        let (fresh, _) = next_program_with_tail(&honest, &forged);
+        assert!(!has_marker(&fresh.committed_bytes()));
+        let (mut a, mut b, mut c) = (fresh.clone(), fresh.clone(), fresh.clone());
+        pay(&mut a, chain, &forged, 0).unwrap();
+        pay(&mut b, chain, &honest, 0).unwrap();
+        pay(&mut c, chain, &forged, 0).unwrap();
+        assert!(has_marker(&a.committed_bytes()));
+        assert_ne!(a.committed_bytes(), b.committed_bytes(), "the record a claim proved against is committed");
+        assert_eq!(a.committed_bytes(), c.committed_bytes());
+        assert_ne!(a.paid_leaves().root(), [0; 32]);
+    }
+
+    #[test]
+    fn claim_bitmap_forgets_one_index_through_the_floor() {
+        let mut b = wd::ClaimBitmap::default();
+        for i in 0..600 {
+            assert!(b.insert(i));
+        }
+        assert_eq!(b.floor(), 2);
+        assert!(b.forget(300) && !b.forget(300) && !b.forget(700));
+        assert_eq!((b.floor(), b.claims()), (1, 599));
+        assert!(!b.contains(300) && b.contains(299) && b.contains(301) && b.contains(599) && bitmap_consistent(&b));
+        assert!(b.forget(5));
+        assert_eq!((b.floor(), b.claims()), (0, 598));
+        assert!(bitmap_consistent(&b));
+        // Claimed again, the words fold back under the floor.
+        assert!(b.insert(5) && b.insert(300));
+        assert_eq!((b.floor(), b.claims()), (2, 600));
+        assert!(bitmap_consistent(&b));
+        let mut one = wd::ClaimBitmap::default();
+        one.insert(9);
+        assert!(one.forget(9));
+        assert_eq!(one, wd::ClaimBitmap::default());
+    }
+
+    /// The restart cache carries the paid leaves in their own section, after
+    /// the forced queue's, and only once there is one.
+    #[test]
+    #[cfg(feature = "local-state-cache")]
+    fn local_cache_carries_the_paid_leaves() {
+        let (mut state, _) = activated_fixture(true, [0; 32]);
+        let marker: &[u8] = b"BPOSST01:L2PL:v1";
+        let (_, bytes, _) = local_cache_round_trip(&state);
+        assert!(!bytes.windows(marker.len()).any(|w| w == marker));
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let forged = [honest[0], ([0xee; 32], 9 * BLCH), ([3; 32], 5 * BLCH)];
+        let l2 = state.l2_settlement.as_mut().unwrap();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        put_tail(l2, &honest, &forged);
+        let chain = l2.policy().chain_id;
+        pay(l2, chain, &forged, 1).unwrap();
+        pay(l2, chain, &honest, 0).unwrap();
+        let (restored, bytes, header) = local_cache_round_trip(&state);
+        assert!(bytes.windows(marker.len()).any(|w| w == marker));
+        assert_eq!(restored.l2_settlement().unwrap().paid_leaves().proven_above(1), [1]);
+        // A cache that lost the section does not restore to this state root.
+        let at = bytes.windows(marker.len()).position(|w| w == marker).unwrap();
+        assert!(CommittedState::decode_local_cache(&bytes[..at], &header).is_err());
+    }
+
+    /// Review R308-2P-3 (agent 308, second pass). After 92762a10 a plain
+    /// reset (`forfeit: false`) refuses as soon as ANY claim was proven
+    /// against a record above the target, whatever leaf it paid. Here the
+    /// tail is an honest extension of the target's tree and the only claim is
+    /// the target's own leaf 0, proven against the newer root as any wallet
+    /// would. L1 holds roots, not leaves, so it cannot tell that leaf from a
+    /// forged one and the plain form still refuses; the reviewer's test
+    /// asked that it apply. What changed with the fix is that the refusal is
+    /// no longer silent: it is readable before the gate (`head_reset_refusal`,
+    /// `head_reset_reports`: `getl2settlement.head_resets`) with the indices
+    /// that cause it, and reported when the program moves
+    /// (`head_reset_at_program_change`: the node's log). The forfeit form
+    /// applies.
+    #[test]
+    fn r308_2p_3_one_honest_claim_against_a_newer_root_refuses_the_plain_reset_and_says_so() {
+        use crate::l2_settlement::{HeadResetRefusal, HeadResetReport};
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let extended = [honest[0], honest[1], ([3; 32], 5 * BLCH)];
+        let (mut l2, chain) = next_program_with_tail(&honest, &extended);
+        let plain = reset_to_block_1(&l2, chain, &honest, false);
+        let forfeit = mainnet::HeadReset { forfeit: true, ..plain };
+        // Before the claim both forms apply, and the reports say so.
+        assert_eq!(l2.head_reset_refusal(&plain), None);
+        assert!(l2.clone().reset_head(&plain));
+        pay(&mut l2, chain, &extended, 0).expect("the target's own leaf 0, proven against the newer root");
+
+        let why = HeadResetRefusal::PaidBeyondTarget { at_or_above_count: false, against_tail: vec![0] };
+        assert_eq!(l2.head_reset_refusal(&plain), Some(why.clone()));
+        assert_eq!(why.name(), "paid_beyond_target");
+        assert_eq!(l2.head_reset_refusal(&forfeit), None);
+        // Read ahead of the gate: this L2 holds the next program, so the
+        // swap is behind it and the rollback ahead.
+        let reports = l2.head_reset_reports_for_test(Some(&forfeit), Some(&plain));
+        assert_eq!(reports, [
+            HeadResetReport { gate: HeadResetReport::NEXT_PROGRAM, number: 1, forfeit: true, pending: false, refusal: None },
+            HeadResetReport { gate: HeadResetReport::ROLLBACK, number: 1, forfeit: false, pending: true, refusal: Some(why.clone()) },
+        ]);
+        assert!(l2.head_reset_reports_for_test(None, None).is_empty(), "no compiled reset, nothing to report");
+        assert!(l2.head_reset_reports().is_empty(), "this release ships no reset");
+
+        // At the gate: the program moves, the head stays, and the change is reported with its reason.
+        let before = l2.clone();
+        let mut refused = l2.clone();
+        refused.install_fallback_with_for_test(&plain);
+        assert_eq!(refused.policy().identities[3..7], mainnet::PROGRAM_FALLBACK.identities);
+        assert_eq!(refused.settled_number(), 2, "the head stays on the tail");
+        assert_eq!(
+            refused.head_reset_at_program_change_for_test(&before, None, Some(&plain)),
+            Some(HeadResetReport { gate: HeadResetReport::ROLLBACK, number: 1, forfeit: false, pending: false, refusal: Some(why) })
+        );
+        assert_eq!(refused.head_reset_at_program_change_for_test(&before, None, None), None, "no reset compiled for the gate");
+        assert_eq!(before.head_reset_at_program_change_for_test(&before, None, Some(&plain)), None, "the program did not move");
+        // The forfeit form applies and is reported as applied.
+        let mut applied = l2.clone();
+        applied.install_fallback_with_for_test(&forfeit);
+        assert_eq!(applied.settled_number(), 1);
+        assert_eq!(
+            applied.head_reset_at_program_change_for_test(&before, None, Some(&forfeit)),
+            Some(HeadResetReport { gate: HeadResetReport::ROLLBACK, number: 1, forfeit: true, pending: false, refusal: None })
+        );
+        // The plain form itself is unchanged: still refused, state untouched.
+        assert!(!l2.reset_head(&plain));
+        assert_eq!(l2, before);
+    }
+
+    /// R308-2P-4: every way a reset is refused has a name, and the read-only
+    /// check agrees with the reset itself.
+    #[test]
+    fn r308_2p_4_every_refused_reset_names_its_reason() {
+        use crate::l2_settlement::HeadResetRefusal as R;
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let extended = [honest[0], honest[1], ([3; 32], 5 * BLCH)];
+        let (l2, chain) = next_program_with_tail(&honest, &extended);
+        let plain = reset_to_block_1(&l2, chain, &honest, false);
+        let refused = |l2: &crate::l2_settlement::State, reset: &mainnet::HeadReset, why: R| {
+            assert_eq!(l2.head_reset_refusal(reset), Some(why.clone()), "{}", why.name());
+            let mut after = l2.clone();
+            assert!(!after.reset_head(reset) && after == *l2, "{}", why.name());
+        };
+        refused(&l2, &mainnet::HeadReset { number: 2, ..plain }, R::HeadNotAbove);
+        refused(&l2, &mainnet::HeadReset { statement: None, ..plain }, R::Statement);
+        refused(&l2, &mainnet::HeadReset { statement: Some("zz"), ..plain }, R::Statement);
+        // A target tree with more leaves than the head's.
+        let more = [honest[0], honest[1], ([3; 32], 5 * BLCH), ([4; 32], BLCH)];
+        refused(&l2, &reset_to_block_1(&l2, chain, &more, false), R::Tree);
+        // A claim at an index the target does not have.
+        let mut beyond = l2.clone();
+        beyond.claimed_insert_for_test(2);
+        refused(&beyond, &plain, R::PaidBeyondTarget { at_or_above_count: true, against_tail: Vec::new() });
+        assert_eq!(beyond.head_reset_refusal(&mainnet::HeadReset { forfeit: true, ..plain }), None);
+        let names: std::collections::BTreeSet<_> =
+            [R::HeadNotAbove, R::Statement, R::Tree, R::PaidBeyondTarget { at_or_above_count: false, against_tail: Vec::new() }, R::Inbox, R::ForcedLog]
+                .iter().map(R::name).collect();
+        assert_eq!(names.len(), 6);
+        assert_eq!(l2.head_reset_refusal(&plain), None);
+        assert!(l2.clone().reset_head(&plain));
+    }
+
+    /// R308-2P-5: after a forfeit reset the dropped tail's paid leaves keep
+    /// their L2 numbers, which the rebuilt chain uses again. They must not
+    /// refuse a later plain reset (before the fix they did, for ever), they
+    /// stay paid, and a claim against the REBUILT tail still refuses it.
+    #[test]
+    fn r308_2p_5_a_dropped_tails_claims_do_not_refuse_a_later_plain_reset() {
+        use crate::l2_settlement::HeadResetRefusal as R;
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let forged = [honest[0], ([0xee; 32], 9 * BLCH), ([3; 32], 5 * BLCH)];
+        let (mut l2, chain) = next_program_with_tail(&honest, &forged);
+        pay(&mut l2, chain, &forged, 1).expect("the forged leaf 1, against the tail");
+        let plain = reset_to_block_1(&l2, chain, &honest, false);
+        let forfeit = mainnet::HeadReset { forfeit: true, ..plain };
+        assert_eq!(l2.paid_leaves().proven_above(1), [1]);
+        let unmarked = l2.committed_bytes();
+        assert!(l2.reset_head(&forfeit));
+        assert_ne!(l2.committed_bytes(), unmarked);
+        assert_eq!(l2.paid_leaves().len(), 2, "the paid leaf and the mark of the dropped tail");
+        assert!(l2.paid_leaves().proven_above(1).is_empty() && l2.paid_leaves().proven_above(0).is_empty());
+        assert!(l2.paid_leaves().contains(1, &wd::leaf(chain, 1, &forged[1].0, forged[1].1)), "it stays a paid leaf");
+        assert!(!l2.paid_leaves().contains(wd::PaidLeaves::DROPPED_TAIL, &[0; 32]), "the mark is not a leaf");
+
+        // The rebuilt chain settles block 2 again, with another tree.
+        let rebuilt = [honest[0], honest[1], ([4; 32], BLCH)];
+        let root = wd::root(&leaves_of(chain, &rebuilt));
+        let at = l2.height() + 1;
+        l2.insert_withdrawal_record(wd::Record { l2_number: 2, root, count: 3, height: at });
+        let head = statement_at(&l2, 2, root, 3);
+        l2.set_head_for_test([2; 32], head, 1);
+        for _ in 0..mainnet::LIMITS.delay_blocks + 1 {
+            l2.advance_height().unwrap();
+        }
+        assert_eq!(l2.settled_number(), 2);
+        // A later plain reset to block 1: the stale entry does not refuse it.
+        assert_eq!(l2.head_reset_refusal(&plain), None);
+        let mut again = l2.clone();
+        assert!(again.reset_head(&plain));
+        assert_eq!(again.paid_leaves(), l2.paid_leaves(), "a plain reset marks nothing");
+        // A claim against the rebuilt tail is a tail claim like any other.
+        pay(&mut l2, chain, &rebuilt, 2).expect("a new leaf of the rebuilt chain");
+        assert_eq!(l2.paid_leaves().proven_above(1), [2]);
+        assert_eq!(l2.head_reset_refusal(&plain), Some(R::PaidBeyondTarget { at_or_above_count: true, against_tail: vec![2] }));
+        // A second forfeit reset marks again, and only what it dropped.
+        assert!(l2.reset_head(&forfeit));
+        assert_eq!(l2.paid_leaves().len(), 4);
+        assert!(l2.paid_leaves().proven_above(0).is_empty());
+        // A forfeit reset with no claim proven against its tail marks nothing.
+        let (mut quiet, _) = next_program_with_tail(&honest, &forged);
+        pay(&mut quiet, chain, &honest, 0).expect("against the target's own root");
+        let paid = quiet.paid_leaves().clone();
+        assert!(quiet.reset_head(&forfeit));
+        assert_eq!(*quiet.paid_leaves(), paid);
+    }
+
+    /// Review R308-2P-1 (agent 308, second pass). The state root commits the
+    /// paid leaves as a length and a running root only, and the cache check
+    /// (`PaidLeaves::consistent`) compares counts: the entries themselves are
+    /// bound to nothing on a restore (the map keeps claim order per index
+    /// only, so the running root cannot be folded again). Every other L2
+    /// section is either committed in full (claim bitmap, forced queue) or
+    /// folded again on restore (inbox). A cache whose paid leaf differs in
+    /// one byte restores to the same state root, and that node then judges
+    /// claims and head resets differently from the rest.
+    /// Expected: a cache with an altered paid-leaf entry does not restore.
+    #[test]
+    #[cfg(all(feature = "local-state-cache", feature = "devnet-l2-user-txs"))]
+    fn r308_2p_1_an_altered_paid_leaf_entry_does_not_restore_from_the_cache() {
+        let (mut state, _) = activated_fixture(true, [0; 32]);
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let forged = [honest[0], ([0xee; 32], 9 * BLCH), ([3; 32], 5 * BLCH)];
+        let l2 = state.l2_settlement.as_mut().unwrap();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        put_tail(l2, &honest, &forged);
+        let chain = l2.policy().chain_id;
+        pay(l2, chain, &forged, 1).unwrap();
+        let (_, mut bytes, header) = local_cache_round_trip(&state);
+        let leaf = wd::leaf(chain, 1, &forged[1].0, forged[1].1);
+        let marker: &[u8] = b"BPOSST01:L2PL:v1";
+        let section = bytes.windows(marker.len()).position(|w| w == marker).unwrap();
+        let at = section + bytes[section..].windows(32).position(|w| w == leaf).expect("the paid leaf is in its section");
+        bytes[at] ^= 1;
+        let restored = CommittedState::decode_local_cache(&bytes, &header);
+        assert!(
+            restored.is_err(),
+            "restored with another paid leaf: the forged leaf 1 reads as paid = {}",
+            restored.unwrap().l2_settlement().unwrap().paid_leaves().contains(1, &leaf)
+        );
+    }
+
+    /// R308-2P-1, the rest of the rule: the entries restore only as they
+    /// were recorded. Another L2 number, two entries in the other order, a
+    /// missing entry and the mark of a dropped tail altered each refuse; the
+    /// untouched cache restores to an equal state, mark included.
+    #[test]
+    #[cfg(all(feature = "local-state-cache", feature = "devnet-l2-user-txs"))]
+    fn r308_2p_1_paid_leaf_entries_restore_only_in_order_and_unaltered() {
+        let (mut state, _) = activated_fixture(true, [0; 32]);
+        let honest = [([1; 32], 5 * BLCH), ([2; 32], 5 * BLCH)];
+        let forged = [honest[0], ([0xee; 32], 9 * BLCH), ([3; 32], 5 * BLCH)];
+        let l2 = state.l2_settlement.as_mut().unwrap();
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        put_tail(l2, &honest, &forged);
+        let chain = l2.policy().chain_id;
+        pay(l2, chain, &forged, 1).unwrap();
+        pay(l2, chain, &honest, 0).unwrap();
+        // `local_cache_round_trip` asserts that the untouched cache restores to an equal state.
+        let (_, bytes, header) = local_cache_round_trip(&state);
+        let first = wd::leaf(chain, 1, &forged[1].0, forged[1].1);
+        let second = wd::leaf(chain, 0, &honest[0].0, honest[0].1);
+        let marker: &[u8] = b"BPOSST01:L2PL:v1";
+        let section = bytes.windows(marker.len()).position(|w| w == marker).unwrap();
+        let find = |leaf: &[u8; 32]| section + bytes[section..].windows(32).position(|w| w == leaf).expect("the paid leaf is in its section");
+        let (a, b) = (find(&first), find(&second));
+        // An entry is `index, leaf, L2 number`, one byte each side of the leaf here.
+        assert_eq!((bytes[a - 1], bytes[a + 32], bytes[b - 1], bytes[b + 32], b), (1, 2, 0, 1, a + 34));
+        let refuses = |bytes: &[u8], what: &str| assert!(CommittedState::decode_local_cache(bytes, &header).is_err(), "restored with {what}");
+        let mut number = bytes.clone();
+        number[a + 32] = 1;
+        refuses(&number, "another L2 number");
+        let mut index = bytes.clone();
+        index[b - 1] = 2;
+        refuses(&index, "another leaf index");
+        let mut swapped = bytes.clone();
+        swapped[a - 1..a + 33].copy_from_slice(&bytes[b - 1..b + 33]);
+        swapped[b - 1..b + 33].copy_from_slice(&bytes[a - 1..a + 33]);
+        refuses(&swapped, "the entries in another order");
+        let mut missing = bytes.clone();
+        missing.drain(b - 1..b + 33);
+        assert_eq!(missing[a - 2], 2, "the entry count");
+        missing[a - 2] = 1;
+        refuses(&missing, "an entry missing");
+
+        // With the mark of a dropped tail: restores equal, and the mark is bound too.
+        let l2 = state.l2_settlement.as_mut().unwrap();
+        let reset = reset_to_block_1(l2, chain, &honest, true);
+        assert!(l2.reset_head(&reset));
+        assert_eq!(l2.paid_leaves().len(), 3);
+        let (restored, bytes, header) = local_cache_round_trip(&state);
+        assert!(restored.l2_settlement().unwrap().paid_leaves().proven_above(1).is_empty());
+        let section = bytes.windows(marker.len()).position(|w| w == marker).unwrap();
+        let at = section + bytes[section..].windows(32).position(|w| w == second).unwrap() + 33;
+        // The mark: the index `u64::MAX` (nine bytes), a zero leaf, the kept number 1.
+        assert_eq!((&bytes[at..at + 9], &bytes[at + 9..at + 41], bytes[at + 41]), (&[0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff][..], &[0u8; 32][..], 1));
+        let mut unmarked = bytes.clone();
+        unmarked[at + 41] = 0;
+        assert!(CommittedState::decode_local_cache(&unmarked, &header).is_err(), "restored with the mark moved");
+    }
+
+    #[test]
+    fn a_reset_head_takes_the_next_settlement_under_the_new_program() {
+        let (pre, mut chains) = fixture();
+        let t = Transition::new(ProofDouble);
+        // Block 1 settles, then the head goes back to the genesis.
+        let first = PosTransaction::L2Settlement(Box::new(transaction(&pre)));
+        let block = build_block(&t, &pre, 2, &[], std::slice::from_ref(&first), &mut chains);
+        let mut settled = t.apply_block(&pre, &block, &[], std::slice::from_ref(&first)).unwrap();
+        let mut l2 = settled.l2_settlement().unwrap().clone();
+        assert_eq!(l2.settled_number(), 1);
+        assert!(l2.reset_head(&mainnet::HeadReset { number: 0, commitment: [0; 32], statement: None, forfeit: false }));
+        l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        settled.l2_settlement = Some(l2);
+        // The successor of the genesis is accepted again, and only it.
+        let again = PosTransaction::L2Settlement(Box::new(transaction(&settled)));
+        let block = build_block(&t, &settled, 3, &[], std::slice::from_ref(&again), &mut chains);
+        let next = t.apply_block(&settled, &block, &[], std::slice::from_ref(&again)).unwrap();
+        assert_eq!(next.l2_settlement().unwrap().settled_number(), 1);
+    }
+
+    /// A real proof of the candidate program against the native verifier, with
+    /// BLOCH_NEXT_VALUES and BLOCH_NEXT_PROOF naming the settler-format files.
+    /// The statement is a synthetic empty block; L1 would refuse its source.
+    #[test]
+    #[ignore = "needs a real proof of the candidate program"]
+    fn next_program_real_groth16_passes_the_native_verifier() {
+        let values = std::fs::read(std::env::var_os("BLOCH_NEXT_VALUES").unwrap()).unwrap();
+        let proof = std::fs::read(std::env::var_os("BLOCH_NEXT_PROOF").unwrap()).unwrap();
+        let next = mainnet::PROGRAM_NEXT;
+        let key = next.identities[3];
+        assert!(bloch_l2_proof::verify(&next.proof_policy, &key, &values, &proof));
+        let old = mainnet::PROGRAM.unwrap();
+        assert!(!bloch_l2_proof::verify(&old.proof_policy, &old.identities[6], &values, &proof));
+        let mut flipped = proof.clone();
+        flipped[100] ^= 1;
+        assert!(!bloch_l2_proof::verify(&next.proof_policy, &key, &values, &flipped));
+        let mut changed = values.clone();
+        changed[700] ^= 1;
+        assert!(!bloch_l2_proof::verify(&next.proof_policy, &key, &changed, &proof));
+    }
+
+    #[test]
+    fn the_release_rule_follows_the_program() {
+        let leaves = [([1; 32], 1_000_000), ([2; 32], 200 * BLCH), ([3; 32], 300 * BLCH)];
+        let tree: Vec<[u8; 32]> =
+            leaves.iter().enumerate().map(|(i, (r, sats))| wd::leaf(mainnet::activation().unwrap().policy.chain_id, i as u64, r, *sats)).collect();
+        let chain = mainnet::activation().unwrap().policy.chain_id;
+        let build = || {
+            let mut l2 = mainnet_l2_state();
+            l2.append_deposit(crate::l2_settlement::InboxRecord {
+                height: 1, tx_index: 0, txid: [0x77; 32], vout: 1, sats: 1_000 * BLCH, recipient: [0x42; 20],
+            })
+            .unwrap();
+            l2.insert_withdrawal_record(wd::Record { l2_number: 1, root: wd::root(&tree), count: 3, height: 1 });
+            for _ in 0..(2 * mainnet::LIMITS.release_window_blocks) {
+                l2.advance_height().unwrap();
+            }
+            l2
+        };
+        let claim = |l2: &mut crate::l2_settlement::State, i: usize, attested: bool| {
+            l2.release_withdrawal(chain, i as u64, &leaves[i].0, leaves[i].1, &wd::proof(&tree, i as u64).unwrap(), attested, false)
+        };
+
+        // The activated program: a 0.01 BLCH claim first delays the attested one.
+        let mut old = build();
+        claim(&mut old, 0, false).unwrap();
+        assert_eq!(claim(&mut old, 1, true), Err(wd::ClaimRefusal::RateLimited));
+
+        // The next program: it passes, and it spends the window's one exemption.
+        let mut new = build();
+        new.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+        assert!(new.next_program_active());
+        claim(&mut new, 0, false).unwrap();
+        claim(&mut new, 1, true).unwrap();
+        assert_eq!(claim(&mut new, 2, true), Err(wd::ClaimRefusal::RateLimited));
+        assert!(new.escrow_conserved());
     }
 
     /// Signatures of `signers` (indices into `keys`, signed with `signing`
@@ -4155,9 +5583,405 @@ mod l2_tests {
         assert!(CommittedState::decode_local_cache(&swapped, &header).is_err());
     }
 
+    // ── Reserved DA slot (params::L2_DA_RESERVED_SLOT_EPOCH) ────────────────
+    //
+    // Agent 78's crowd-out: third parties fill all `da::MAX_PER_BLOCK` DA slots
+    // at tip 0, so the settler's batch never lands and no user-transaction
+    // block settles. Past the gate one slot is the registered key's.
+
+    fn slot_key(byte: u8) -> Vec<u8> {
+        vec![byte; crate::transition::funded::ADMISSION_PQ_KEY_BYTES]
+    }
+
+    /// `funded_async_fixture` with one `FUNDED` coin per key, at txid
+    /// `[0x60 + i; 32]`, plus one empty block that anchors the source.
+    fn slot_fixture(keys: &[Vec<u8>]) -> (CommittedState, Vec<RandaoChain>) {
+        let coins: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| crate::state_root::EutxoEntry {
+                txid: [0x60 + i as u8; 32],
+                vout: 0,
+                value: FUNDED,
+                script_hash: script_of(key),
+            })
+            .collect();
+        let (_, mut genesis, mut chains) = setup_with(4, ToyVerifier, &coins);
+        let identities = std::array::from_fn(|i| hash_at(TEMPLATE, S + i * 32));
+        let mut policy = Policy {
+            identities,
+            proof_policy: bloch_l2_proof::policy_commitment(),
+            chain_id: 700771,
+            initial_l2_parent: hash_at(TEMPLATE, S + 272),
+            initial_l2_state: hash_at(TEMPLATE, S + 304),
+            attestor_set: [0; 32],
+        };
+        policy.identities[0] = [0x91; 32];
+        policy.identities[1] = *genesis.head.as_bytes();
+        genesis.admission_network_domain = Some(policy.identities[0]);
+        genesis = genesis.configure_l2_genesis_async(policy).unwrap();
+        let t = Transition::new(ToyVerifier);
+        let first = build_block(&t, &genesis, 1, &[], &[], &mut chains);
+        let s1 = t.apply_block(&genesis, &first, &[], &[]).unwrap();
+        let s2 = apply(&s1, 2, &[], &mut chains).unwrap();
+        (s2, chains)
+    }
+
+    /// Signed DA transactions, one per `(key index, l2 number, payload)`,
+    /// each key spending its own coin and then its own change, so they can
+    /// all go in one block on `pre`.
+    fn slot_batches(pre: &CommittedState, keys: &[Vec<u8>], plan: &[(usize, u64, Vec<u8>)]) -> Vec<PosTransaction> {
+        let mut coins: Vec<(([u8; 32], u32), u64)> =
+            (0..keys.len()).map(|i| (([0x60 + i as u8; 32], 0), FUNDED)).collect();
+        let fee = pre.next_base_fee();
+        let mut scratch = pre.clone();
+        let mut out = Vec::new();
+        for (who, number, payload) in plan {
+            let key = &keys[*who];
+            let (outpoint, value) = coins[*who];
+            let mut tx = L2DataAvailability {
+                network_domain: [0x91; 32],
+                funding_pubkey: key.clone(),
+                inputs: vec![crate::transition::FundingInput { txid: outpoint.0, vout: outpoint.1 }],
+                l2_chain_id: 700771,
+                l2_block_number: *number,
+                payload: payload.clone(),
+                change: TransferOutput { value: 0, script_hash: script_of(key) },
+                tx_bytes: 0,
+                tip_millisat_per_gas: 0,
+                signature: vec![0; 32],
+            };
+            tx.tx_bytes = tx.canonical_bytes().len() as u64;
+            let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, tx.tx_bytes, fee, 0);
+            tx.change.value = (u128::from(value) - charge.base_fee_sat - charge.priority_fee_sat) as u64;
+            tx.signature = toy_sign(key, &tx.intent_root());
+            let wire = PosTransaction::L2DataAvailability(tx.clone());
+            scratch.apply_transaction(&wire, 0, fee, &ToyVerifier).expect("each batch is valid on its own");
+            coins[*who] = ((wire.txid(), 0), tx.change.value);
+            out.push(wire);
+        }
+        out
+    }
+
+    /// Junk for an unsettled number, as the attack sends: canonical, unrelated.
+    fn junk(i: u8) -> Vec<u8> {
+        batch(&[&[0xd0, i]])
+    }
+
+    #[test]
+    fn the_reserved_da_slot_is_inert_and_registers_no_key() {
+        assert_eq!(crate::params::L2_DA_RESERVED_SLOT_EPOCH, u64::MAX);
+        assert_eq!(da::REGISTERED_KEY, crate::l2_settlement::mainnet::DA_RESERVED_KEY);
+        for epoch in [0, 5_850, 7_360, 10_060, u64::MAX - 1] {
+            assert_eq!(da::reserved_key_at(epoch), None, "{epoch}");
+        }
+        // Inert: four DA from anyone, as today.
+        let any = slot_key(0x01);
+        let keys = [any.as_slice(); 4];
+        assert!(da::block_admits(10_060, keys));
+        assert!(!da::block_admits(10_060, [any.as_slice(); 5]));
+        // Gate forced but no key registered: still the old rule.
+        let _gate = crate::params::l2_da_reserved_slot_test::open(None);
+        assert_eq!(da::reserved_key_at(10_060), None);
+        assert!(da::block_admits(10_060, [any.as_slice(); 4]));
+    }
+
+    /// Every block the new rule admits, the old rule admits: the gate is a
+    /// soft fork, and a non-upgraded validator follows an upgraded proposer.
+    #[test]
+    fn the_reserved_slot_only_refuses_blocks_the_old_rule_admitted() {
+        let own = slot_key(0xee);
+        let other = slot_key(0x01);
+        let _gate = crate::params::l2_da_reserved_slot_test::open(Some(da::funder(&own)));
+        let mut refused_by_new_only = 0;
+        for n_own in 0..=6usize {
+            for n_other in 0..=6usize {
+                let keys: Vec<&[u8]> = std::iter::repeat_n(own.as_slice(), n_own)
+                    .chain(std::iter::repeat_n(other.as_slice(), n_other))
+                    .collect();
+                let new = da::block_admits(7, keys.iter().copied());
+                let old = n_own + n_other <= da::MAX_PER_BLOCK;
+                assert!(!new || old, "{n_own} own, {n_other} other");
+                assert_eq!(new, old && n_other <= da::OPEN_PER_BLOCK, "{n_own} own, {n_other} other");
+                refused_by_new_only += usize::from(old && !new);
+            }
+        }
+        // Exactly the blocks with four third-party batches.
+        assert_eq!(refused_by_new_only, 1);
+    }
+
+    /// The post-state of one block at slot 3 on a fresh `slot_fixture`,
+    /// carrying `plan`. Built by hand (as `more_than_four_da_batches_in_one_block_are_refused`
+    /// does), because `build_block` panics on a block the transition refuses.
+    fn slot_attempt(keys: &[Vec<u8>], plan: &[(usize, u64, Vec<u8>)]) -> Result<CommittedState, TransitionError> {
+        let (pre, mut chains) = slot_fixture(keys);
+        let txs = slot_batches(&pre, keys, plan);
+        let t = Transition::new(ProofDouble);
+        let mut block = build_block(&t, &pre, 3, &[], &[], &mut chains);
+        block.header.body_root =
+            crate::derive::body_root(&txs.iter().map(PosTransaction::canonical_bytes).collect::<Vec<_>>());
+        let pk = crate::attestation::KeyLookup::pubkey(&pre, block.header.proposer_index).unwrap();
+        block.proposer_sig = toy_sign(pk, &block.header.proposal_signing_root());
+        t.compute_post_state(&pre, &block, &[], &txs)
+    }
+
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn past_the_gate_three_slots_are_open_and_one_is_the_registered_keys() {
+        let keys = vec![slot_key(0x01), slot_key(0xee)];
+        let four_junk: Vec<_> = (0..4u8).map(|i| (0, 1 + u64::from(i % 2), junk(i))).collect();
+        // Below the gate the attack block is valid: a proposer may fill every slot.
+        assert!(slot_attempt(&keys, &four_junk).is_ok());
+
+        let _gate = crate::params::l2_da_reserved_slot_test::open(Some(da::funder(&keys[1])));
+        assert_eq!(
+            slot_attempt(&keys, &four_junk).err(),
+            Some(TransitionError::BlockGasLimitExceeded),
+            "four third-party batches are refused past the gate"
+        );
+        assert!(slot_attempt(&keys, &four_junk[..3]).is_ok(), "three are fine");
+        let payload = batch(&[&[0x02, 0xc0], b"user tx"]);
+        let mixed = [(0, 1, junk(0)), (0, 2, junk(1)), (0, 1, junk(2)), (1, 1, payload.clone())];
+        assert!(slot_attempt(&keys, &mixed).is_ok(), "three others and the registered key");
+        let mut five = mixed.to_vec();
+        five.push((1, 2, junk(9)));
+        assert_eq!(slot_attempt(&keys, &five).err(), Some(TransitionError::BlockGasLimitExceeded), "the total cap stays 4");
+        let own_only: Vec<_> = (0..4u8).map(|i| (1, 1 + u64::from(i), junk(i))).collect();
+        assert!(slot_attempt(&keys, &own_only).is_ok(), "the registered key may use the open slots too");
+    }
+
+    /// The crowd-out end to end on the transition: under attack, the block
+    /// that carries the settler's batch is valid only with at most three
+    /// junk batches, and the next block settles the user-transaction block.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn under_a_da_flood_the_registered_keys_batch_lands_and_its_block_settles() {
+        let keys = vec![slot_key(0x01), slot_key(0x02), slot_key(0x03), slot_key(0xee)];
+        let (pre, mut chains) = slot_fixture(&keys);
+        let _gate = crate::params::l2_da_reserved_slot_test::open(Some(da::funder(&keys[3])));
+        let payload = batch(&[&[0x02, 0xc0], b"user tx"]);
+        let commitment = da::commitment(700771, 1, &payload);
+        let block = slot_batches(&pre, &keys, &[(0, 1, junk(0)), (1, 1, junk(1)), (2, 2, junk(2)), (3, 1, payload.clone())]);
+        let s3 = apply(&pre, 3, &block, &mut chains).expect("three junk batches and the settler's");
+        let records = s3.l2_settlement().unwrap().data_availability().to_vec();
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().any(|r| r.l2_number == 1 && r.commitment == commitment));
+        let settle = PosTransaction::L2SettlementAsync(Box::new(v3_with_da(&s3, commitment)));
+        let s4 = apply(&s3, 4, std::slice::from_ref(&settle), &mut chains).expect("settles with the settler's DA");
+        assert_eq!(s4.l2_settlement().unwrap().settled_number(), 1);
+    }
+
+    /// The gate moves no committed byte: the same block gives the same state
+    /// root on either side of it (history replays unchanged).
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn the_reserved_slot_changes_no_state_byte() {
+        let keys = vec![slot_key(0x01), slot_key(0xee)];
+        let plan = [(0, 1, junk(0)), (1, 1, junk(1))];
+        let before = slot_attempt(&keys, &plan).unwrap();
+        let _gate = crate::params::l2_da_reserved_slot_test::open(Some(da::funder(&keys[1])));
+        let after = slot_attempt(&keys, &plan).unwrap();
+        assert_eq!(before.state_root(), after.state_root());
+        assert_eq!(before, after);
+    }
+
     // Adversarial multi-branch FFG suite (p2b).
     mod ffg_branch_tests {
         use super::*;
         include!("ffg_branch_tests.rs");
     }
+
+    include!("l2_forced_tests.rs");
+    // ── G2 reset crossing (agent 221): a forged settlement after the swap, the
+    // escrow it drains per window, and the head-reset that recovers or refuses.
+    // Models tabletop finding G-2 (169) in real consensus code (no proof needed:
+    // a forged block is settled with a test-only head hook, never in release code).
+    mod reset_crossing_g2 {
+        use super::*;
+        use crate::l2_settlement::InboxRecord;
+
+        const KEEP: u64 = 10; // the last honest block N
+        const FORGED: u64 = 11; // N+1, the forged block the rules do not give
+
+        /// A swapped-era L2 with escrow `escrow_blch`, an honest withdrawal tree of
+        /// `count_keep` leaves at block N, and a forged tree of `count_keep + count_forged`
+        /// leaves settled as the head at N+1. Returns the state and every leaf.
+        fn forged_l2(escrow_blch: u64, count_keep: u64, count_forged: u64, sats_each: u64) -> (crate::l2_settlement::State, Vec<[u8; 32]>) {
+            let mut l2 = mainnet_l2_state();
+            l2.replace_program_for_test(&mainnet::PROGRAM_NEXT);
+            let chain = l2.policy().chain_id;
+            l2.append_deposit(InboxRecord { height: 1, tx_index: 0, txid: [0x77; 32], vout: 0, sats: escrow_blch * BLCH, recipient: [0x42; 20] })
+                .unwrap();
+            let recip = [0x42u8; 32];
+            let total = count_keep + count_forged;
+            let sats = sats_each * BLCH;
+            let leaves: Vec<[u8; 32]> = (0..total).map(|i| wd::leaf(chain, i, &recip, sats)).collect();
+            let honest_root = wd::root(&leaves[..count_keep as usize]);
+            let forged_root = wd::root(&leaves);
+            l2.insert_withdrawal_record(wd::Record { l2_number: KEEP, root: honest_root, count: count_keep, height: 1 });
+            l2.insert_withdrawal_record(wd::Record { l2_number: FORGED, root: forged_root, count: total, height: 2 });
+            l2.set_head_for_test([FORGED as u8; 32], statement_at(&l2, FORGED, forged_root, total), 1);
+            for _ in 0..200 {
+                l2.advance_height().unwrap();
+            }
+            (l2, leaves)
+        }
+
+        /// The reset target's statement: the honest tree at N, consumed rewound to 1
+        /// (we deposited one escrow record, so the field must be <= inbox length).
+        fn keep_statement(l2: &crate::l2_settlement::State, root: [u8; 32], count: u64) -> Vec<u8> {
+            let mut keep = statement_at(l2, KEEP, root, count);
+            keep[S + 528..S + 536].copy_from_slice(&1u64.to_be_bytes());
+            keep
+        }
+
+        fn try_small_claim(l2: &mut crate::l2_settlement::State, leaves: &[[u8; 32]], index: u64, sats: u64) -> Result<(), wd::ClaimRefusal> {
+            let chain = l2.policy().chain_id;
+            let siblings = wd::proof(leaves, index).unwrap();
+            l2.release_withdrawal(chain, index, &[0x42u8; 32], sats, &siblings, false, false)
+        }
+
+        /// The release rule bounds a non-attested drain to about 10% of the escrow per
+        /// aligned 2,880-block window; the escrow compounds, so k windows lose
+        /// 1 - 0.9^k. This is the pure consensus rule (ReleaseWindow), and it reproduces
+        /// the tabletop figures exactly.
+        #[test]
+        fn the_window_rule_compounds_to_the_tabletop_drain_figures() {
+            let e0 = 10_000u128 * u128::from(BLCH);
+            let mut percent = vec![];
+            for k in [4u64, 5, 6, 10, 30] {
+                let mut escrow = e0;
+                for w in 0..k {
+                    let window = wd::ReleaseWindow::default().at(&mainnet::LIMITS, w * mainnet::LIMITS.release_window_blocks + 1, escrow);
+                    escrow -= window.cap; // an attacker reaches the cap with small non-exempt claims
+                }
+                let drained = ((e0 - escrow) * 10_000 / e0) as f64 / 100.0;
+                percent.push((k, drained));
+            }
+            eprintln!("G2 window drain, % of escrow: {percent:?}");
+            // 1 - 0.9^k, within integer-sat rounding.
+            let want = [(4u64, 34.3), (5, 40.9), (6, 46.8), (10, 65.1), (30, 95.7)];
+            for ((k, got), (wk, wv)) in percent.iter().zip(want) {
+                assert_eq!(*k, wk);
+                assert!((got - wv).abs() < 0.2, "k={k}: drain {got}% not ~{wv}%");
+            }
+        }
+
+        /// The same bound through real claims: a forged settlement after the swap lets
+        /// an attacker claim forged leaves, and the escrow falls about 10% per window.
+        #[test]
+        fn a_forged_settlement_drains_about_ten_percent_per_window_through_real_claims() {
+            let e = 10_000u64;
+            let sats = 50 * BLCH; // below large_claim_sat (100 BLCH): no attestation needed
+            let (mut l2, leaves) = forged_l2(e, 4, 400, 50);
+            let start = l2.escrow_sat();
+            assert_eq!(start, u128::from(e) * u128::from(BLCH));
+            let mut idx = 4u64; // the first forged leaf (index >= honest count)
+            let mut per_window = vec![];
+            for _ in 0..5u64 {
+                let before = l2.escrow_sat();
+                let mut drained = 0u128;
+                loop {
+                    match try_small_claim(&mut l2, &leaves, idx, sats) {
+                        Ok(()) => {
+                            drained += u128::from(sats);
+                            idx += 1;
+                        }
+                        Err(wd::ClaimRefusal::RateLimited) => break,
+                        Err(other) => panic!("unexpected refusal {other:?} at leaf {idx}"),
+                    }
+                }
+                let cap = (before * u128::from(mainnet::LIMITS.release_window_bps) / 10_000).max(u128::from(mainnet::LIMITS.release_floor_sat));
+                assert!(drained <= cap && cap - drained < u128::from(sats), "window drain {drained} vs cap {cap}");
+                assert!(l2.escrow_conserved());
+                per_window.push(drained / u128::from(BLCH));
+                for _ in 0..mainnet::LIMITS.release_window_blocks {
+                    l2.advance_height().unwrap();
+                }
+            }
+            let total: u128 = per_window.iter().sum();
+            eprintln!("G2 real-claim drain per window (BLCH): {per_window:?}; total {total} of {e} ({:.1}%)", total as f64 / e as f64 * 100.0);
+            // ~1 - 0.9^5 = 41%, a little less at 50-BLCH granularity.
+            assert!((0.37..0.41).contains(&(total as f64 / e as f64)));
+        }
+
+        /// The honest recovery: a reset to N applied before any forged leaf is claimed
+        /// drops the forged records and keeps the honest ones, so honest leaves pay and
+        /// forged leaves no longer prove. This is the clean reset-crossing verdict.
+        #[test]
+        fn a_reset_before_any_forged_claim_recovers_cleanly() {
+            let sats = 50 * BLCH;
+            let (mut l2, leaves) = forged_l2(10_000, 4, 8, 50);
+            let chain = l2.policy().chain_id;
+            let recip = [0x42u8; 32];
+            // Before the reset both an honest leaf (0) and a forged leaf (4) are claimable.
+            assert!(l2.check_claim(chain, 0, &recip, sats, &wd::proof(&leaves, 0).unwrap(), false, false).is_ok());
+            assert!(l2.check_claim(chain, 4, &recip, sats, &wd::proof(&leaves, 4).unwrap(), false, false).is_ok());
+
+            let honest_root = wd::root(&leaves[..4]);
+            let keep = keep_statement(&l2, honest_root, 4);
+            let reset = mainnet::HeadReset { number: KEEP, commitment: [KEEP as u8; 32], statement: Some(leaked_hex(&keep)), forfeit: false };
+            let escrow = l2.escrow_sat();
+            assert!(l2.reset_head(&reset), "no forged leaf claimed yet, so the reset applies");
+
+            assert_eq!(l2.settled_number(), KEEP);
+            assert_eq!(l2.withdrawal_head(), (honest_root, 4));
+            assert_eq!(l2.withdrawal_roots().iter().map(|r| r.l2_number).collect::<Vec<_>>(), [KEEP]);
+            assert_eq!(l2.escrow_sat(), escrow, "the reset keeps the escrow");
+            assert!(l2.escrow_conserved());
+            // Operational finding: after the reset only the honest (prefix) root survives,
+            // so a proof cut against the forged tree is stale and must be regenerated against
+            // the honest root. A cached forged-era proof of an honest leaf no longer folds.
+            let honest_proof = wd::proof(&leaves[..4], 0).unwrap();
+            let stale_forged_proof = wd::proof(&leaves, 0).unwrap();
+            assert_eq!(l2.check_claim(chain, 0, &recip, sats, &stale_forged_proof, false, false), Err(wd::ClaimRefusal::Proof),
+                       "a forged-era proof of an honest leaf is stale after the reset");
+            assert!(l2.check_claim(chain, 0, &recip, sats, &honest_proof, false, false).is_ok(),
+                    "a proof regenerated against the honest root pays");
+            // The forged leaf's root is gone entirely: no proof can revive it.
+            assert_eq!(l2.check_claim(chain, 4, &recip, sats, &wd::proof(&leaves, 4).unwrap(), false, false), Err(wd::ClaimRefusal::Proof));
+            assert!(l2.release_withdrawal(chain, 0, &recip, sats, &honest_proof, false, false).is_ok());
+            assert_eq!(l2.escrow_sat(), escrow - u128::from(sats));
+        }
+
+        /// G-2: one forged claim before R makes the reset refuse, and the program still
+        /// rolls back. The forged record then stays the newest, so the escrow keeps
+        /// draining after R — exactly the unrecoverable case the runbook warns of.
+        #[test]
+        fn a_forged_claim_before_r_makes_the_reset_refuse_and_the_drain_continue() {
+            let sats = 50 * BLCH;
+            let (mut l2, leaves) = forged_l2(10_000, 4, 8, 50);
+            let chain = l2.policy().chain_id;
+            // The attacker claims one forged leaf (index 4 >= honest count 4).
+            assert!(try_small_claim(&mut l2, &leaves, 4, sats).is_ok());
+
+            let honest_root = wd::root(&leaves[..4]);
+            let keep = keep_statement(&l2, honest_root, 4);
+            let reset = mainnet::HeadReset { number: KEEP, commitment: [KEEP as u8; 32], statement: Some(leaked_hex(&keep)), forfeit: false };
+            let before = l2.clone();
+            assert!(!l2.reset_head(&reset), "a leaf beyond N's tree was paid: the reset must refuse");
+            assert_eq!(l2, before, "a refused reset changes nothing");
+
+            // The rollback still moves the program (the guest misbehaved), head unchanged.
+            l2.install_fallback_with_for_test(&reset);
+            assert_eq!(program_of(&l2), mainnet::PROGRAM_FALLBACK.identities);
+            assert_eq!(l2.settled_number(), FORGED, "the head stays on the forged block");
+            // And the escrow keeps draining: the next forged leaf still pays.
+            assert!(try_small_claim(&mut l2, &leaves, 5, sats).is_ok());
+        }
+
+        /// The attacker cannot use the once-per-window exemption: the mainnet policy has
+        /// an attestor set, so an unattested claim is never exempt. This is what bounds
+        /// the drain to the cap rather than the whole escrow at once.
+        #[test]
+        fn an_unattested_forged_claim_is_never_window_exempt() {
+            let l2 = mainnet_l2_state();
+            assert!(l2.policy().attestor_set != [0; 32]);
+            assert!(!l2.window_exempt(false), "no attestation: not exempt");
+            assert!(l2.window_exempt(true), "a real attestation would be exempt");
+        }
+    }
+
+    include!("l2_revenue_tests.rs");
+    include!("l2_forced_review_tests.rs");
 }

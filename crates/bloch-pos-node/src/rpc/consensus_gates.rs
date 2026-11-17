@@ -46,6 +46,11 @@ const HARD_FORK_KEYS: &[(&str, Option<&str>)] = &[
     ("params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH", Some("hf3_kes_vote_slot_epoch_binding")),
     ("params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH", Some("hf3_kes_first_key_floor")),
     ("params::KES_REGISTER_EPOCH_BINDING_EPOCH", Some("hf3_kes_register_epoch_binding")),
+    ("params::L2_NEXT_PROGRAM_EPOCH", Some("l2_next_program")),
+    ("params::L2_PROGRAM_ROLLBACK_EPOCH", Some("l2_program_rollback")),
+    ("params::L2_DA_RESERVED_SLOT_EPOCH", Some("l2_da_reserved_slot")),
+    ("params::L2_FORCED_INCLUSION_EPOCH", Some("l2_forced_inclusion")),
+    ("params::L2_REVENUE_EPOCH", Some("l2_revenue")),
 ];
 
 /// The RPC key for a gate. A gate added to `HARD_FORK_GATES` by a later
@@ -195,6 +200,11 @@ mod tests {
             "hf3_kes_vote_slot_epoch_binding",
             "hf3_kes_first_key_floor",
             "hf3_kes_register_epoch_binding",
+            "l2_next_program",
+            "l2_program_rollback",
+            "l2_da_reserved_slot",
+            "l2_forced_inclusion",
+            "l2_revenue",
         ];
         let Json::Obj(fields) = &v else { panic!("not an object") };
         assert_eq!(fields.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), expected);
