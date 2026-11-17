@@ -13,7 +13,8 @@
 //! user named). Nothing about the claim is authorized by its recipient: the
 //! L2 withdrawal itself is the authorization, so anyone may relay it.
 //!
-//! **Fee rule.** The recipient always receives exactly `sats`. The fee is
+//! **Fee rule.** The recipient receives exactly `sats` (less the L2 protocol
+//! fee from `params::L2_REVENUE_EPOCH`, see Outputs). The eUTXO fee is
 //! paid by the relayer's own funding inputs (one hybrid PQ funding key, like
 //! the deposit and DA transactions) at the ordinary eUTXO gas price, with the
 //! rest returned as change. A relayer therefore cannot burn any of the
@@ -24,7 +25,9 @@
 //!
 //! **Outputs.** vout 0: the release (`sats` to `l1_recipient`, also carried
 //! explicitly in `release` and required to match); vout 1: change (absent
-//! when zero).
+//! when zero). From `params::L2_REVENUE_EPOCH` (inert) the release is `sats`
+//! less the L2 protocol fee (`crate::l2_revenue::claim_fee_sat`) and vout 2
+//! pays that fee to the treasury; the escrow still drops by `sats`.
 //!
 //! **Versioned body.** The byte after the tag is the claim version. Version 1
 //! carries no attestation. Version 2 (M6) appends the attestor set (threshold,
@@ -365,7 +368,11 @@ impl L2WithdrawClaim {
         if self.sats < super::l2_deposit::MIN_L2_DEPOSIT_SAT {
             return Err(R::Amount);
         }
-        if self.release.value != self.sats || self.release.script_hash != self.l1_recipient {
+        // Either the whole leaf, or the leaf less the L2 protocol fee (from
+        // `params::L2_REVENUE_EPOCH`); the state check pins which one.
+        if (self.release.value != self.sats && self.release.value != crate::l2_revenue::claim_net_sat(self.sats))
+            || self.release.script_hash != self.l1_recipient
+        {
             return Err(R::ReleaseOutput);
         }
         if self.tx_bytes < self.canonical_bytes().len() as u64 {
@@ -461,6 +468,9 @@ impl CommittedState {
             return Err(R::NotActive);
         }
         tx.validate_shape()?;
+        if tx.release.value != self.l2_claim_release_sat(tx.sats) {
+            return Err(R::ReleaseOutput);
+        }
         if self.admission_network_domain != Some(tx.network_domain) {
             return Err(R::Network);
         }
@@ -510,10 +520,29 @@ impl CommittedState {
             return Err(R::Conservation);
         }
         let txid = PosTransaction::L2WithdrawClaim(tx.clone()).txid();
-        if self.eutxos.contains_key(&(txid, RELEASE_VOUT)) || self.eutxos.contains_key(&(txid, CHANGE_VOUT)) {
+        if self.eutxos.contains_key(&(txid, RELEASE_VOUT))
+            || self.eutxos.contains_key(&(txid, CHANGE_VOUT))
+            || (self.l2_claim_protocol_fee(tx.sats).is_some()
+                && self.eutxos.contains_key(&(txid, crate::l2_revenue::TREASURY_VOUT)))
+        {
             return Err(R::OutputCollision);
         }
         Ok(charge)
+    }
+
+    /// The L2 protocol fee a claim of `sats` pays in the next block on this
+    /// state, and the treasury it goes to; `None` before
+    /// `params::L2_REVENUE_EPOCH`.
+    pub fn l2_claim_protocol_fee(&self, sats: u64) -> Option<(u64, [u8; 32])> {
+        if !crate::l2_revenue::active(self.epoch) {
+            return None;
+        }
+        crate::l2_revenue::treasury().map(|t| (crate::l2_revenue::claim_fee_sat(sats), t))
+    }
+
+    /// What the release output of a claim of `sats` must hold on this state.
+    pub fn l2_claim_release_sat(&self, sats: u64) -> u64 {
+        sats - self.l2_claim_protocol_fee(sats).map_or(0, |(fee, _)| fee)
     }
 
     pub(super) fn apply_l2_withdraw_claim(
@@ -541,12 +570,24 @@ impl CommittedState {
         for input in &tx.inputs {
             self.eutxos.remove(&(input.txid, input.vout));
         }
+        // The escrow released exactly `sats`; the recipient receives it less
+        // the protocol fee (checked equal to `release.value` above), and the
+        // fee is its own output: the sum is `sats`.
+        let protocol_fee = self.l2_claim_protocol_fee(tx.sats);
         self.eutxos.insert(EutxoEntry {
             txid,
             vout: RELEASE_VOUT,
-            value: tx.sats,
+            value: tx.release.value,
             script_hash: tx.l1_recipient,
         });
+        if let Some((fee, treasury)) = protocol_fee {
+            self.eutxos.insert(EutxoEntry {
+                txid,
+                vout: crate::l2_revenue::TREASURY_VOUT,
+                value: fee,
+                script_hash: treasury,
+            });
+        }
         if tx.change.value > 0 {
             self.eutxos.insert(EutxoEntry {
                 txid,

@@ -125,4 +125,26 @@ mod v3_tests {
         relabelled[..STATEMENT_TAG.len()].copy_from_slice(STATEMENT_TAG);
         assert!(!verify(&policy_commitment_v3(), &program, &relabelled, &proof));
     }
+
+    /// A real proof of a candidate guest whose statement carries placeholder
+    /// identities (a benchmark's): the Groth16 check alone, under the key in
+    /// BLOCH_RAW_KEY, with BLOCH_RAW_VALUES and BLOCH_RAW_PROOF in settler format.
+    /// `verify` itself refuses such a statement, since identity 6 is not the key.
+    #[test]
+    #[ignore = "needs a real proof file"]
+    fn a_real_proof_commits_the_given_program_key() {
+        let values = std::fs::read(std::env::var_os("BLOCH_RAW_VALUES").unwrap()).unwrap();
+        let proof = std::fs::read(std::env::var_os("BLOCH_RAW_PROOF").unwrap()).unwrap();
+        let key = std::env::var("BLOCH_RAW_KEY").unwrap();
+        assert_eq!(proof[..4], Sha256::digest(*GROTH16_VK_BYTES)[..4]);
+        assert!(Groth16Verifier::verify(&proof, &values, &format!("0x{key}"), &GROTH16_VK_BYTES).is_ok());
+        let mut other = key.into_bytes();
+        other[63] = if other[63] == b'0' { b'1' } else { b'0' };
+        let other = String::from_utf8(other).unwrap();
+        assert!(Groth16Verifier::verify(&proof, &values, &format!("0x{other}"), &GROTH16_VK_BYTES).is_err());
+        let mut changed = values.clone();
+        changed[700] ^= 1;
+        assert!(Groth16Verifier::verify(&proof, &changed, &format!("0x{other}"), &GROTH16_VK_BYTES).is_err());
+        assert!(Groth16Verifier::verify(&proof, &changed, &format!("0x{}", std::env::var("BLOCH_RAW_KEY").unwrap()), &GROTH16_VK_BYTES).is_err());
+    }
 }

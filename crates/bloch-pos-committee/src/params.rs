@@ -2984,6 +2984,194 @@ pub(crate) fn native_claim_finality_active(epoch: u64) -> bool {
     epoch_gate_active(epoch, HF1_CLAIM_FINALITY_EPOCH)
 }
 
+/// CANDIDATE, not scheduled: the epoch boundary that replaces the mainnet L2
+/// program with `l2_settlement::mainnet::PROGRAM_NEXT` (sparse witness,
+/// timestamp and prevrandao bound in the guest, fee-vault sweep, and the release
+/// rule of `ReleaseWindow::admits`). `u64::MAX` means INERT. No epoch has been
+/// chosen. Its ordering rule is `hard_forks::l2_program_schedule_coherent`.
+pub const L2_NEXT_PROGRAM_EPOCH: u64 = u64::MAX;
+/// The boundary that rolls that program back to
+/// `l2_settlement::mainnet::PROGRAM_FALLBACK`, the same rules under the complete
+/// witness. `u64::MAX` means INERT, and a release that swaps the program ships it
+/// so. Only an emergency release moves it: L1 cannot tell a misbehaving guest by
+/// itself, and there is no key and no runtime input.
+pub const L2_PROGRAM_ROLLBACK_EPOCH: u64 = u64::MAX;
+
+/// CANDIDATE, not scheduled: the epoch boundary that enables L1 forced
+/// inclusion of L2 transactions (`l2_settlement::forced`, wire 0x1C) on an L2
+/// whose program implements it. `u64::MAX` means INERT. It cannot be armed while
+/// `l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS` is empty, nor
+/// before `L2_NEXT_PROGRAM_EPOCH` (`hard_forks::l2_forced_inclusion_may_arm`).
+/// It rides with the program swap: the guest that implements it is the next
+/// program, so the two gates are one boundary (the swap runs first in
+/// `close_epoch`). A rehearsal forced build may still set a literal epoch.
+pub const L2_FORCED_INCLUSION_EPOCH: u64 = L2_NEXT_PROGRAM_EPOCH;
+
+pub(crate) fn l2_forced_inclusion_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_forced_inclusion_test::forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_FORCED_INCLUSION_EPOCH)
+}
+
+/// CANDIDATE, not scheduled: the epoch from which L1 charges the L2 protocol
+/// fee (`l2_revenue`): a fee on every L2 deposit (0x14), paid from the
+/// depositor's inputs, and a fee on every withdrawal claim (0x16), taken from
+/// the release. Both go to one compiled treasury output; nothing is burned.
+/// `u64::MAX` means INERT. It cannot be armed while
+/// `l2_revenue::TREASURY_SCRIPT_HASH` is `None`, nor at or before the first KES
+/// period (`hard_forks::l2_revenue_may_arm`). It changes no L2 rule.
+///
+/// It rides with the program swap (coordinator, round 11): the fee starts at
+/// the same boundary as the next L2 rules, so it is an alias of
+/// [`L2_NEXT_PROGRAM_EPOCH`] and stays inert while that gate is inert.
+pub const L2_REVENUE_EPOCH: u64 = L2_NEXT_PROGRAM_EPOCH;
+
+/// The script hash of the one L1 protocol treasury (owner input of
+/// 2026-11-16: `bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073`). It
+/// receives every charged forced-inclusion surcharge
+/// (`l2_settlement::mainnet::FORCED_INCLUSION_TREASURY`) and every L2
+/// crossing fee (`l2_revenue::TREASURY_SCRIPT_HASH`); both names are aliases
+/// of this constant, so the two revenue streams cannot be configured apart.
+/// `None` keeps both rules off: `hard_forks::l2_forced_inclusion_may_arm` and
+/// `hard_forks::l2_revenue_may_arm` refuse to arm their gates while it is
+/// unset or the zero hash (compile time). Revenue rule (2026-11-02): a real
+/// treasury, never a burn.
+///
+/// The address is a 20-byte key hash (`SHA3-256(pubkey)[..20]`, checksum
+/// `84242073` verified), so the script hash is its **carried** form: the 20
+/// bytes, then twelve zero bytes, which `transition::owns` opens for the
+/// holder of that key exactly as it opens a carried Genesis-3 balance (160
+/// bits of preimage resistance, the security of every carried output). It is
+/// the address of `tokenomics_v4::FOUNDER_WITHDRAWAL_H160`. Setting it arms
+/// nothing: both revenue gates stay at `u64::MAX` until the fork epoch is set.
+pub const PROTOCOL_TREASURY_SCRIPT_HASH: Option<[u8; 32]> = Some([
+    0xe9, 0x86, 0xdb, 0x51, 0x49, 0xcf, 0xf7, 0x49, 0x9b, 0x28, 0x2a, 0x04, 0x82, 0x72, 0xa0, 0x9a, 0xff, 0x0a, 0xf4, 0xff,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]);
+
+pub(crate) fn l2_revenue_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_revenue_test::forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_REVENUE_EPOCH)
+}
+
+/// Public view for tooling (the offline CLIs): whether a block in `epoch`
+/// charges the L2 protocol fee on this build.
+pub fn l2_revenue_active_at(epoch: u64) -> bool {
+    l2_revenue_active(epoch)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_revenue_test {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod l2_forced_inclusion_test {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+pub(crate) fn l2_next_program_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_next_program_test::forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_NEXT_PROGRAM_EPOCH)
+}
+
+pub(crate) fn l2_program_rollback_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_next_program_test::rollback_forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_PROGRAM_ROLLBACK_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_next_program_test {
+    use std::cell::Cell;
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static ROLLBACK: Cell<bool> = const { Cell::new(false) };
+    }
+    pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn rollback_forced() -> bool { ROLLBACK.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+    pub fn open_rollback() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ROLLBACK.with(|v| v.set(self.0)); } }
+        Restore(ROLLBACK.with(|v| v.replace(true)))
+    }
+}
+
+/// CANDIDATE, not scheduled: the epoch from which one of the
+/// `l2_settlement::da::MAX_PER_BLOCK` DA slots of every block is reserved
+/// for the L2's registered DA funding key (`l2_settlement::da::reserved_key`).
+/// `u64::MAX` means INERT. No epoch has been chosen.
+///
+/// From the first block of this epoch, a block may carry at most
+/// `da::OPEN_PER_BLOCK` (3) DA transactions funded by any other key; the
+/// total cap of `da::MAX_PER_BLOCK` (4) is unchanged. Without it, four
+/// third-party DA transactions per block at tip 0 take every slot for about
+/// 0.012 BLCH an hour (the tip tie-break is the canonical bytes, which start
+/// with the funding key), and no user-transaction block can settle while
+/// they do. The rule only refuses blocks the old rule accepted, so it is a
+/// soft fork: no committed byte changes at the gate, and history replays
+/// unchanged. Arming needs the registered key (`hard_forks`).
+pub const L2_DA_RESERVED_SLOT_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn l2_da_reserved_slot_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_da_reserved_slot_test::forced() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_DA_RESERVED_SLOT_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_da_reserved_slot_test {
+    use std::cell::Cell;
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static KEY: Cell<Option<[u8; 32]>> = const { Cell::new(None) };
+    }
+    pub fn forced() -> bool { ENABLED.with(Cell::get) }
+    pub fn key() -> Option<[u8; 32]> { KEY.with(Cell::get) }
+    /// Arms the gate and registers `key` (a funding-key hash) on this thread.
+    pub fn open(key: Option<[u8; 32]>) -> impl Drop {
+        struct Restore(bool, Option<[u8; 32]>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ENABLED.with(|v| v.set(self.0));
+                KEY.with(|v| v.set(self.1));
+            }
+        }
+        Restore(ENABLED.with(|v| v.replace(true)), KEY.with(|v| v.replace(key)))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod native_claim_finality_test {
     use std::cell::Cell;

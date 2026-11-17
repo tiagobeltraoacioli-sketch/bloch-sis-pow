@@ -490,6 +490,9 @@ pub struct Config {
     /// Resolved in [`run`] once the genesis id is known, because the
     /// handshake binds every connection to it.
     pub mesh: MeshPlan,
+    /// `--l2-brake-key`: the public key that signs the node-local L2 brake
+    /// file (`l2_brake.rs`). `None`: the brake is disabled and never read.
+    pub l2_brake_key: Option<PathBuf>,
 }
 
 /// The mesh security the operator asked for, before [`run`] has the genesis
@@ -1528,6 +1531,7 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
         PosTransaction::L2Deposit(tx) => tx.tip_millisat_per_gas,
         PosTransaction::L2DataAvailability(tx) => tx.tip_millisat_per_gas,
         PosTransaction::L2WithdrawClaim(tx) => tx.tip_millisat_per_gas,
+        PosTransaction::L2ForcedTransaction(tx) => tx.tip_millisat_per_gas,
         PosTransaction::RescueReveal(tx) => tx.tip_millisat_per_gas,
         _ => 0,
     }
@@ -1538,6 +1542,58 @@ thread_local! {
     /// Transactions whose spend witnesses selection or capacity planning
     /// verified again (`Engine::spend_witnesses_pass_relay_policy`).
     static RELAY_POLICY_REVERIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The funding-key hash that owns the reserved DA slot in a block of `epoch`
+/// (`da::reserved_key_at`: `None` while `L2_DA_RESERVED_SLOT_EPOCH` is inert).
+/// Tests set it with `da_reserved_test::open`.
+fn da_reserved_key(epoch: u64) -> Option<[u8; 32]> {
+    #[cfg(test)]
+    if let Some(key) = da_reserved_test::key() {
+        return Some(key);
+    }
+    bloch_pos_committee::l2_settlement::da::reserved_key_at(epoch)
+}
+
+/// A DA batch funded by the `reserved` key.
+fn is_reserved_da(tx: &PosTransaction, reserved: Option<[u8; 32]>) -> bool {
+    match (tx, reserved) {
+        (PosTransaction::L2DataAvailability(batch), Some(key)) =>
+            bloch_pos_committee::l2_settlement::da::funder(&batch.funding_pubkey) == key,
+        _ => false,
+    }
+}
+
+/// The pool-mechanics tests of the fork (reserved room, displacement by the
+/// registered DA key) fill a pool with entries of the three released L2 kinds
+/// on an engine that has no L2 installed. The released door
+/// (`admission::check_l2_funded`) calls such an entry unbacked, which is
+/// right and is tested where that door is tested (`l2_preflight_tests`), but
+/// it would empty those fixtures. While the guard of `open` lives, the
+/// calling thread's backing check passes the three kinds on a state WITHOUT
+/// an installed L2. Test builds only; a state with an L2 is always judged.
+#[cfg(test)]
+pub(crate) mod l2_filler_test {
+    use std::cell::Cell;
+    thread_local! { static OPEN: Cell<bool> = const { Cell::new(false) }; }
+    pub fn is_open() -> bool { OPEN.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { OPEN.with(|v| v.set(self.0)); } }
+        Restore(OPEN.with(|v| v.replace(true)))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod da_reserved_test {
+    use std::cell::Cell;
+    thread_local! { static KEY: Cell<Option<[u8; 32]>> = const { Cell::new(None) }; }
+    pub fn key() -> Option<[u8; 32]> { KEY.with(Cell::get) }
+    pub fn open(key: [u8; 32]) -> impl Drop {
+        struct Restore(Option<[u8; 32]>);
+        impl Drop for Restore { fn drop(&mut self) { KEY.with(|v| v.set(self.0)); } }
+        Restore(KEY.with(|v| v.replace(Some(key))))
+    }
 }
 
 /// The spend-authority hash of this transaction's FIRST input — its "source"
@@ -1578,6 +1634,7 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
         PosTransaction::L2Deposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::L2DataAvailability(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::L2WithdrawClaim(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::L2ForcedTransaction(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::RescueReveal(tx) => Some(Sha3_256::digest(&tx.pubkey).into()),
         PosTransaction::WithdrawalCredentialRotation(tx) => Some(validator_lifecycle_source(tx.validator)),
         // F-9: a rescue commitment is free and names no key, so every one
@@ -2190,6 +2247,9 @@ struct Engine {
     /// a mempool under fee pressure and a mempool simply not receiving
     /// transactions both look like "it got smaller" without this.
     mempool_evicted_low_fee: u64,
+    /// Node-local L2 brake (`l2_brake.rs`): which L2 claims and settlements
+    /// this node leaves out of its blocks and its mempool. Not consensus.
+    l2_brake: crate::l2_brake::BrakeCell,
     /// Transactions the proposer's drop loop refused, keyed exactly like
     /// [`Self::mempool`] and mapping to `(slot the bar lifts at, times it has
     /// barred a re-offer)`.
@@ -5407,6 +5467,7 @@ impl Engine {
             PosTransaction::L2Deposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::L2DataAvailability(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::L2WithdrawClaim(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::L2ForcedTransaction(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::RescueReveal(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             _ => None,
         }
@@ -5802,9 +5863,14 @@ impl Engine {
         if let Some(why) = l2_admission_refusal(&tx, self.state.l2_settlement()) {
             return Err(Refusal::Invalid(why));
         }
+        // Node-local L2 brake: retry later, never invalid, so no peer is
+        // penalized and the same bytes are admitted once the brake lifts.
+        if self.l2_brake_holds(&tx, self.wall_slot(), epoch_of(self.wall_slot())) {
+            return Err(Refusal::StateDependent("held by this node's L2 brake (node-local; retry later or elsewhere)"));
+        }
         if let PosTransaction::L2SettlementAsync(settlement) = &tx {
             let state = self.state.l2_settlement().ok_or(Refusal::Invalid("L2 settlement is not configured"))?;
-            if self.mempool.values().any(|pending| matches!(pending, PosTransaction::L2SettlementAsync(_))) {
+            if self.mempool.values().any(|pending| l2_proof_holds_the_slot(pending, state)) {
                 return Err(Refusal::Invalid("one L2 proof is already pending"));
             }
             // The proof draws on the same per-source and per-slot allowance
@@ -5835,6 +5901,10 @@ impl Engine {
                 }
                 return Err(Refusal::Invalid("L2 settlement policy, source, successor or proof failed"));
             }
+            // A proof of the replaced program can never settle, and left alone it
+            // would refuse the program's new proof until the TTL. Removed only now
+            // that the proof taking its place has passed.
+            self.mempool.retain(|_, pending| !matches!(pending, PosTransaction::L2SettlementAsync(_)));
         } else {
             let verifier = self.gossip_verifier.budgeted_for_source(
                 self.wall_slot(),
@@ -5884,6 +5954,12 @@ impl Engine {
             self.mempool_admitted_at.remove(stale);
             self.mempool_suspect.remove(stale);
         }
+        for displaced in &capacity.displaced {
+            self.mempool.remove(displaced);
+            self.mempool_admitted_at.remove(displaced);
+            self.mempool_suspect.remove(displaced);
+            self.mempool_evicted_low_fee = self.mempool_evicted_low_fee.saturating_add(1);
+        }
         if let Some(lowest_key) = capacity.lower_fee {
             self.mempool.remove(&lowest_key);
             self.mempool_admitted_at.remove(&lowest_key);
@@ -5904,6 +5980,20 @@ impl Engine {
         self.mempool.insert_with_txid(key, tx, txid);
         self.net.broadcast_transaction(broadcast);
         Ok((Admitted::New, prepared))
+    }
+
+    /// Whether the node-local L2 brake holds `tx` (refreshing the brake file
+    /// at most once per slot). Only L2 claims and settlements can be held.
+    fn l2_brake_holds(&self, tx: &PosTransaction, slot: u64, epoch: u64) -> bool {
+        if !matches!(
+            tx,
+            PosTransaction::L2WithdrawClaim(_) | PosTransaction::L2SettlementAsync(_) | PosTransaction::L2Settlement(_)
+        ) {
+            return false;
+        }
+        let chain = self.state.l2_settlement().map(|l2| l2.policy().chain_id);
+        self.l2_brake.refresh(slot, epoch, self.state.admission_network_domain(), chain);
+        self.l2_brake.holds(tx, epoch)
     }
 
     /// Transactions for the block this node is about to propose.
@@ -5934,12 +6024,21 @@ impl Engine {
     /// deposits, DA batches and withdrawal claims (the last selection of a
     /// proposal whose re-selection allowance is spent, review W1-1).
     fn select_transactions_with(&self, epoch: u64, l2_user_txs: bool) -> Vec<PosTransaction> {
+        // Node-local L2 brake: held claims and settlements are not proposed
+        // here. Blocks from other proposers that carry them validate as always.
+        let slot = self.wall_slot();
+        let braked = |tx: &PosTransaction| self.l2_brake_holds(tx, slot, epoch);
         // A proof reserves the whole gas budget. Never pack it with transfers.
         // Only one that still matches this head (review EXE-2): admission
         // judged it against the head of that moment, and a pending settlement
         // the head has moved past would be refused by the probe and leave the
-        // block without the transactions it displaced.
-        if let Some(tx) = self.mempool.values().find(|tx| self.pending_settlement_applies(tx)) {
+        // block without the transactions it displaced. A proof of a program
+        // the L2 no longer holds fails the same check (`live_l2_proof` names
+        // that case), and a proof this node's brake holds is not proposed.
+        if let Some(tx) = live_l2_proof(
+            self.mempool.values().filter(|tx| !braked(tx) && self.pending_settlement_applies(tx)),
+            self.state.l2_settlement(),
+        ) {
             return vec![tx.clone()];
         }
         // Admission is a historical observation, not a reservation of inputs or
@@ -5949,10 +6048,15 @@ impl Engine {
         // again, making the exact same signed transaction eligible later.
         let mut funded_context = None;
         let candidates = self.mempool.iter().filter(|(encoded, tx)| {
-            // A settlement is proposed alone (above) or not at all.
+            // A settlement is proposed alone (above) or not at all. The
+            // forced envelope is an L2 user transaction like the other three:
+            // its backing is judged against the head too, so the last
+            // selection of a proposal leaves it out with them.
             !matches!(tx, PosTransaction::L2SettlementAsync(_))
                 && (l2_user_txs || !matches!(tx, PosTransaction::L2Deposit(_)
-                    | PosTransaction::L2DataAvailability(_) | PosTransaction::L2WithdrawClaim(_)))
+                    | PosTransaction::L2DataAvailability(_) | PosTransaction::L2WithdrawClaim(_)
+                    | PosTransaction::L2ForcedTransaction(_)))
+                && !braked(tx)
                 && self.candidate_is_backed(tx, encoded, epoch, &mut funded_context)
         }).collect();
         Self::pack_transactions_on(epoch, *self.state.head().as_bytes(), candidates, self.state.l2_settlement())
@@ -6061,8 +6165,20 @@ impl Engine {
     fn pack_transactions_on(
         epoch: u64,
         seed: [u8; 32],
+        ordered: Vec<(&Vec<u8>, &PosTransaction)>,
+        l2: Option<&bloch_pos_committee::l2_settlement::State>,
+    ) -> Vec<PosTransaction> {
+        Self::pack_transactions_with(epoch, seed, ordered, l2, da_reserved_key(epoch))
+    }
+
+    /// [`Self::pack_transactions_on`] with the reserved DA key given, so the
+    /// rule is testable without arming the compiled gate.
+    fn pack_transactions_with(
+        epoch: u64,
+        seed: [u8; 32],
         mut ordered: Vec<(&Vec<u8>, &PosTransaction)>,
         l2: Option<&bloch_pos_committee::l2_settlement::State>,
+        da_reserved: Option<[u8; 32]>,
     ) -> Vec<PosTransaction> {
         let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
         let mut out = Vec::new();
@@ -6080,6 +6196,9 @@ impl Engine {
         // interchangeable by construction.
         let mut reserved = BTreeSet::new();
         // Consensus caps DA batches per block; the highest tips win the slots.
+        // Past `params::L2_DA_RESERVED_SLOT_EPOCH` only the registered key may
+        // take the last one (`da::block_admits`): other keys stop at
+        // `da::OPEN_PER_BLOCK`, whatever their tip or bytes.
         let mut da_batches = 0usize;
         // W1-1: what L2 transactions exclude each other on inside one block,
         // reserved the way outpoints are. The preflight judges each entry
@@ -6095,7 +6214,13 @@ impl Engine {
         let mut da_keys = BTreeSet::new();
         let mut claimed = BTreeSet::new();
         let mut release = l2.map(|l2| (l2, l2.release_window(), l2.escrow_sat()));
-        let exempt_after_earlier_claims = bloch_pos_committee::params::l2_release_exemption_active(epoch);
+        // Either gate switches the one-exemption-per-window rule on
+        // (`ReleaseWindow::admits`): the release's epoch gate or the next
+        // L2 program. Both are inert.
+        let exempt_after_earlier_claims = bloch_pos_committee::params::l2_release_exemption_active(epoch)
+            || l2.is_some_and(|l2| l2.next_program_active());
+        let mut da_open = 0usize;
+        let mut forced_txs = 0usize;
         // F-9: consensus admits at most RESCUE_COMMITS_MAX_PER_BLOCK
         // commitments; they rank after every tipped transaction and among
         // themselves by `rescue_commit_rank`.
@@ -6137,6 +6262,7 @@ impl Engine {
                 PosTransaction::L2Deposit(tx) => tx.tx_bytes,
                 PosTransaction::L2DataAvailability(tx) => tx.tx_bytes,
                 PosTransaction::L2WithdrawClaim(tx) => tx.tx_bytes,
+                PosTransaction::L2ForcedTransaction(tx) => tx.tx_bytes,
                 PosTransaction::RescueReveal(tx) => tx.tx_bytes,
                 _ => 0,
             };
@@ -6149,13 +6275,25 @@ impl Engine {
                 continue;
             }
             if let PosTransaction::L2DataAvailability(batch) = tx {
-                if da_batches >= bloch_pos_committee::l2_settlement::da::MAX_PER_BLOCK {
+                use bloch_pos_committee::l2_settlement::da;
+                if da_batches >= da::MAX_PER_BLOCK {
+                    continue;
+                }
+                let open = !is_reserved_da(tx, da_reserved);
+                if da_reserved.is_some() && open && da_open >= da::OPEN_PER_BLOCK {
                     continue;
                 }
                 if !da_keys.insert((batch.l2_block_number, batch.commitment())) {
                     continue;
                 }
                 da_batches += 1;
+                da_open += usize::from(open);
+            }
+            if matches!(tx, PosTransaction::L2ForcedTransaction(_)) {
+                if forced_txs >= bloch_pos_committee::l2_settlement::forced::MAX_PER_BLOCK {
+                    continue;
+                }
+                forced_txs += 1;
             }
             if let PosTransaction::L2WithdrawClaim(claim) = tx {
                 if claimed.contains(&claim.index) {
@@ -6207,6 +6345,13 @@ impl Engine {
             .apply_block(&self.state, &envelope, &env.body.attestations, &txs)
         {
             Ok(post) => {
+                // A compiled L2 head reset that ran with a program change in
+                // this block is logged, applied or refused (node log only).
+                if let (Some(was), Some(now)) = (self.state.l2_settlement(), post.l2_settlement()) {
+                    if let Some(report) = now.head_reset_at_program_change(was) {
+                        eprintln!("{}", rpc::head_reset_log_line(&report, env.header.slot));
+                    }
+                }
                 self.state.set(post);
                 // Snapshot for the reorg path. Free: this is the state that
                 // was just built, kept by handle, not copied.
@@ -8002,6 +8147,31 @@ impl Engine {
         self.blocks.get(id).map(Cow::Borrowed)
     }
 
+    /// The L2 envelope of the forced transaction `txid` in the canonical block
+    /// at native `height` (`getl2settlement.forced.due[].envelope`).
+    /// The envelope of the forced record queued at L2-registry `height` with `txid`.
+    /// A record's height counts the blocks applied since the L2 registry was installed
+    /// (as `InboxRecord::height` does), which equals the chain height only on a network
+    /// with the L2 at genesis, so the canonical index is `height` plus the registry's
+    /// offset (head height minus the committed L2 height). Neighbouring blocks are also
+    /// tried; a miss is `None`, never a guess.
+    fn forced_envelope(&self, height: u64, txid: &[u8; 32]) -> Option<Vec<u8>> {
+        let l2_height = self.state.l2_settlement()?.height();
+        let offset = self.head_height().checked_sub(l2_height)?;
+        let index = height.checked_add(offset)?;
+        [index, index.wrapping_sub(1), index + 1, height].into_iter().find_map(|at| {
+            let (_, id) = self.chain.get(usize::try_from(at).ok()?)?;
+            let env = self.envelope_by_id(id.as_bytes())?;
+            body_transactions(&env).ok()?.into_iter().find_map(|tx| {
+                let id = tx.txid();
+                match tx {
+                    PosTransaction::L2ForcedTransaction(forced) if id == *txid => Some(forced.envelope),
+                    _ => None,
+                }
+            })
+        })
+    }
+
     fn block_reply(&self, env: &BlockEnvelope) -> Json {
         let id = *env.block_id().as_bytes();
         let canonical = self.canonical.contains(&id);
@@ -8203,23 +8373,34 @@ impl Engine {
 
             // Identity of the binary, not of the chain: no state read, no
             // lock taken, constant cost at any height.
-            RpcRequest::L2Settlement => Ok(rpc::l2_settlement_json(&self.state)),
+            // Reads at most the blocks of the due forced records, and only
+            // once forced inclusion is enabled.
+            RpcRequest::L2Settlement => Ok(rpc::l2_settlement_json_with(&self.state, &|height, txid| {
+                self.forced_envelope(height, txid)
+            })),
             RpcRequest::Kes => Ok(rpc::kes_json(&self.state)),
             RpcRequest::BlockRaw(id) => {
                 let env = self.envelope_by_id(&id).ok_or_else(|| RpcError::new(rpc::BLOCK_NOT_FOUND, "unknown block"))?;
                 Ok(rpc::Json::s(crate::codec::hex(&crate::codec::encode_envelope(&env))))
             }
             RpcRequest::BuildInfo => Ok(rpc::build_info_json()),
-            RpcRequest::MempoolInfo => Ok(rpc::mempool_info_json(
-                self.mempool.len(),
-                MEMPOOL_MAX,
-                self.mempool.bytes(),
-                self.state.next_base_fee(),
-                self.rejected.len(),
-                self.rejected_hits,
-                self.mempool_expired,
-                self.mempool_evicted_low_fee,
-            )),
+            RpcRequest::MempoolInfo => {
+                let mut info = rpc::mempool_info_json(
+                    self.mempool.len(),
+                    MEMPOOL_MAX,
+                    self.mempool.bytes(),
+                    self.state.next_base_fee(),
+                    self.rejected.len(),
+                    self.rejected_hits,
+                    self.mempool_expired,
+                    self.mempool_evicted_low_fee,
+                );
+                // Node-local, so operators can confirm every own node is braked.
+                if let rpc::Json::Obj(fields) = &mut info {
+                    fields.push(("l2_brake".to_string(), self.l2_brake.json(epoch_of(self.wall_slot()))));
+                }
+                Ok(info)
+            }
 
             // R4 F-11.
             RpcRequest::Validators => Ok(rpc::validator_registry_json(&self.state)),
@@ -8856,6 +9037,20 @@ pub fn run(cfg: Config) -> io::Result<()> {
     )?;
 
     let kes = load_kes_signer(&cfg.data_dir, keys.is_some())?;
+    // Node-local L2 brake: strict when asked for, absent otherwise.
+    let l2_brake = match &cfg.l2_brake_key {
+        None => crate::l2_brake::BrakeCell::disabled(),
+        Some(path) => {
+            let key = crate::l2_brake::BrakeCell::read_key(path)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("--l2-brake-key: {e}")))?;
+            println!(
+                "L2 BRAKE: enabled; {} in the data dir is honoured when signed by {} (node-local, not consensus)",
+                crate::l2_brake::FILE,
+                path.display()
+            );
+            crate::l2_brake::BrakeCell::new(Some(cfg.data_dir.clone()), Some(key))
+        }
+    };
     let mut engine = Engine {
         state: StateCell::new(genesis_state),
         tr: Transition::new(verifier.clone()),
@@ -8882,6 +9077,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         mempool_admitted_at: BTreeMap::new(),
         mempool_expired: 0,
         mempool_evicted_low_fee: 0,
+        l2_brake,
         rejected: BTreeMap::new(),
         rejected_bytes: 0,
         rejected_expiry_hint: None,
@@ -10005,6 +10201,25 @@ fn declared_size_bound(tx: &PosTransaction, declared: u64) -> Result<(), &'stati
 #[cfg(feature = "l2-activation-rehearsal")]
 const GENESIS4_MAINNET_NETWORK_DIGEST: &str = "f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966";
 
+/// Whether `pending` is a settlement proof that may still land on `l2`. A proof
+/// of a program the L2 no longer holds may not: it keeps no proof slot and no
+/// proposer picks it, so a program swap costs no block and delays no new proof.
+pub(crate) fn l2_proof_holds_the_slot(
+    pending: &PosTransaction,
+    l2: &bloch_pos_committee::l2_settlement::State,
+) -> bool {
+    matches!(pending, PosTransaction::L2SettlementAsync(settlement) if !l2.names_another_program(settlement))
+}
+
+/// The settlement proof a proposer picks: the first that may still land.
+fn live_l2_proof<'a>(
+    mut pending: impl Iterator<Item = &'a PosTransaction>,
+    l2: Option<&bloch_pos_committee::l2_settlement::State>,
+) -> Option<&'a PosTransaction> {
+    let l2 = l2?;
+    pending.find(|tx| l2_proof_holds_the_slot(tx, l2))
+}
+
 pub(crate) fn l2_admission_refusal(
     tx: &PosTransaction,
     l2: Option<&bloch_pos_committee::l2_settlement::State>,
@@ -10017,6 +10232,9 @@ pub(crate) fn l2_admission_refusal(
         PosTransaction::L2WithdrawClaim(_) if !user_transactions => Some("L2 withdrawal claims are not active on this network"),
         PosTransaction::L2Deposit(_) if !l2.is_some_and(|l2| l2.deposits_enabled()) => {
             Some("native L2 deposits are not active on this network")
+        }
+        PosTransaction::L2ForcedTransaction(_) if !l2.is_some_and(|l2| l2.forced_queue().is_some()) => {
+            Some("L2 forced inclusion is not active on this network")
         }
         _ => None,
     }
@@ -10569,6 +10787,14 @@ fn admissible_with_network_verifier(
                 Ok(())
             } else {
                 Err("invalid L2 deposit hybrid PQ authorization")
+            }
+        }
+        PosTransaction::L2ForcedTransaction(forced) => {
+            // Queue state, fees and the surcharge run in consensus.
+            if verifier.verify_with_key(&forced.funding_pubkey, &forced.intent_root(), &forced.signature) {
+                Ok(())
+            } else {
+                Err("invalid L2 forced transaction hybrid PQ authorization")
             }
         }
         PosTransaction::FundedDeposit(deposit) => {
@@ -12720,6 +12946,16 @@ mod transfer_v2_end_to_end {
     /// at least that
     /// (+2 slots of margin so the epoch cannot regress mid-test).
     fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
+        engine_at_wall_epoch_on(None, epochs_past, entries)
+    }
+
+    /// The network domain the L2 fixtures of this module are signed for.
+    const L2_TEST_NETWORK: [u8; 32] = [0x91; 32];
+    /// The L2 chain id the L2 fixtures of this module name.
+    const L2_TEST_CHAIN: u64 = 700_770;
+
+    /// [`engine_at_wall_epoch`] with the committed state bound to `network`.
+    fn engine_at_wall_epoch_on(network: Option<[u8; 32]>, epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
         let slot_ms = 500u64;
         let back_ms = epochs_past
             .saturating_mul(SLOTS_PER_EPOCH)
@@ -12740,22 +12976,18 @@ mod transfer_v2_end_to_end {
         // `CommittedState::genesis` directly rather than
         // `manifest.genesis_state()`: the opening balances are the test's
         // fixture, not a carryover snapshot with a commitment to honour.
-        let state = CommittedState::genesis(
-            genesis_id,
-            GENESIS_MIX,
-            &[],
-            &[],
-            [0u8; 32],
-            [0u8; 32],
-            [0u8; 32],
-            EvmCommitment {
-                account_root: [0u8; 32],
-                receipts_root: [0u8; 32],
-                gas_used: 0,
-                base_fee_per_gas: 0,
-            },
-            entries,
-        );
+        let evm = EvmCommitment {
+            account_root: [0u8; 32],
+            receipts_root: [0u8; 32],
+            gas_used: 0,
+            base_fee_per_gas: 0,
+        };
+        let state = match network {
+            None => CommittedState::genesis(genesis_id, GENESIS_MIX, &[], &[], [0u8; 32], [0u8; 32], [0u8; 32], evm, entries),
+            Some(network) => CommittedState::genesis_with_network_domain(
+                network, genesis_id, GENESIS_MIX, &[], &[], [0u8; 32], [0u8; 32], [0u8; 32], evm, entries,
+            ),
+        };
         // Unique throwaway data dir per engine — two engines in one test
         // must never share a store.
         static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -12798,6 +13030,7 @@ mod transfer_v2_end_to_end {
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
+            l2_brake: crate::l2_brake::BrakeCell::disabled(),
             rejected: BTreeMap::new(),
             rejected_bytes: 0,
             rejected_expiry_hint: None,
@@ -13139,6 +13372,803 @@ mod transfer_v2_end_to_end {
         let first_commit = selected.iter().position(|tx| matches!(tx, PosTransaction::RescueCommit(_))).unwrap();
         assert!(selected[..first_commit].iter().all(|tx| matches!(tx, PosTransaction::Transfer { .. })));
         assert_eq!(first_commit, 10, "commitments rank after zero-tip transfers");
+    }
+
+    fn da_batch(key_byte: u8, number: u64, tip: u128) -> PosTransaction {
+        use bloch_pos_committee::transition::{FundingInput, L2DataAvailability};
+        let key = vec![key_byte; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        PosTransaction::L2DataAvailability(L2DataAvailability {
+            network_domain: [0x91; 32],
+            funding_pubkey: key,
+            inputs: vec![FundingInput { txid: [key_byte; 32], vout: number as u32 }],
+            l2_chain_id: 700_770,
+            l2_block_number: number,
+            payload: vec![0, 0, 0, 1, 0, 0, 0, 1, key_byte],
+            change: TransferOutput { value: 1, script_hash: [key_byte; 32] },
+            tx_bytes: 2_000,
+            tip_millisat_per_gas: tip,
+            signature: vec![9; 64],
+        })
+    }
+
+    /// Agent 78's crowd-out, proposer side: eight third-party DA batches at
+    /// tip 0 whose funding keys sort below the settler's take all four slots
+    /// under the old rule. With the settler's key registered, the proposer
+    /// gives the others at most `OPEN_PER_BLOCK` slots and the settler its
+    /// batch, and a higher tip from the others does not buy the last slot.
+    #[test]
+    fn a_zero_tip_da_flood_cannot_take_the_registered_keys_slot() {
+        use bloch_pos_committee::l2_settlement::da;
+        let epoch = V2_FLAG_DAY + 1;
+        let settler_key = vec![0xee; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let settler = da::funder(&settler_key);
+        for tip in [0u128, 1_000] {
+            let mut node = engine_at_wall_epoch(epoch, &[]);
+            for k in 0..8u8 {
+                let tx = da_batch(0x10 + k, 2, tip);
+                node.mempool.insert(tx.canonical_bytes(), tx);
+            }
+            let own = da_batch(0xee, 1, 0);
+            node.mempool.insert(own.canonical_bytes(), own.clone());
+            let is_own = |tx: &PosTransaction| matches!(tx, PosTransaction::L2DataAvailability(d) if da::funder(&d.funding_pubkey) == settler);
+            let das = |sel: &[PosTransaction]| sel.iter().filter(|tx| matches!(tx, PosTransaction::L2DataAvailability(_))).count();
+
+            let old = Engine::pack_transactions_with(epoch, [0x11; 32], node.mempool.iter().collect(), None, None);
+            assert_eq!(das(&old), da::MAX_PER_BLOCK);
+            assert!(!old.iter().any(is_own), "old rule, tip {tip}: the settler is crowded out");
+
+            let new = Engine::pack_transactions_with(epoch, [0x11; 32], node.mempool.iter().collect(), None, Some(settler));
+            assert_eq!(das(&new), da::MAX_PER_BLOCK);
+            assert_eq!(new.iter().filter(|tx| is_own(tx)).count(), 1, "tip {tip}: the settler's batch is selected");
+            assert_eq!(das(&new) - 1, da::OPEN_PER_BLOCK);
+            // What the proposer builds is what consensus admits.
+            let keys = |sel: &[PosTransaction]| sel.iter().filter_map(|tx| match tx {
+                PosTransaction::L2DataAvailability(d) => Some(d.funding_pubkey.clone()),
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert!(da::block_admits(epoch, keys(&new).iter().map(Vec::as_slice)));
+        }
+        // The registered key may also use the open slots.
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+        for n in 1..=6u64 {
+            let tx = da_batch(0xee, n, 0);
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        let only_own = Engine::pack_transactions_with(epoch, [0x11; 32], node.mempool.iter().collect(), None, Some(settler));
+        assert_eq!(only_own.len(), da::MAX_PER_BLOCK);
+    }
+
+    /// The mempool side of the reserved DA slot: a pool full of valid tip-0
+    /// DA from other keys refuses the settler's tip-0 batch under the old
+    /// rule, and admits it past the gate by displacing one of them.
+    #[test]
+    fn a_full_mempool_of_da_cannot_keep_out_the_registered_keys_batch() {
+        let _fillers = l2_filler_test::open();
+        use bloch_pos_committee::l2_settlement::da;
+        let epoch = V2_FLAG_DAY + 1;
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+        let mut filled = 0;
+        'fill: for k in 0..80u8 {
+            for n in 1..=64u64 {
+                if filled == MEMPOOL_MAX { break 'fill; }
+                let tx = da_batch(0x10 + k, n, 0);
+                node.mempool.insert(tx.canonical_bytes(), tx);
+                filled += 1;
+            }
+        }
+        assert_eq!(node.mempool.len(), MEMPOOL_MAX);
+        let own = da_batch(0xee, 1, 0);
+        let other = da_batch(0x05, 1, 0);
+        let len = own.canonical_bytes().len();
+        assert!(matches!(node.plan_mempool_capacity(&own, len, epoch), Err(Refusal::AtCapacity)), "old rule: crowded out of the pool");
+        let settler_key = vec![0xee; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let _reserved = da_reserved_test::open(da::funder(&settler_key));
+        let plan = node.plan_mempool_capacity(&own, len, epoch).expect("the registered key is admitted");
+        assert_eq!(plan.displaced.len(), 1);
+        assert!(!plan.displaced.contains(&own.canonical_bytes()));
+        assert!(matches!(node.plan_mempool_capacity(&other, len, epoch), Err(Refusal::AtCapacity)), "others still are not");
+    }
+
+    fn forced_envelope_tx(key_byte: u8, number: u32, tip: u128) -> PosTransaction {
+        use bloch_pos_committee::transition::{FundingInput, L2ForcedTransaction};
+        let key = vec![key_byte; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let mut forced = L2ForcedTransaction {
+            network_domain: [0x91; 32],
+            funding_pubkey: key,
+            inputs: vec![FundingInput { txid: [key_byte; 32], vout: number }],
+            l2_chain_id: 700_770,
+            gas_limit: 21_000,
+            max_surcharge_sat: 1_000,
+            envelope: vec![0x02, key_byte, number as u8, (number >> 8) as u8],
+            change: TransferOutput { value: 1, script_hash: [key_byte; 32] },
+            tx_bytes: 0,
+            tip_millisat_per_gas: tip,
+            signature: vec![9; 64],
+        };
+        // Declared size is the encoded size (a fixed-width field).
+        forced.tx_bytes = forced.canonical_bytes().len() as u64;
+        PosTransaction::L2ForcedTransaction(forced)
+    }
+
+    /// The committed output that backs a one-input L2 transaction exactly at
+    /// `base_fee` (what `admission::check_l2_funding` asks for).
+    fn l2_backing(base_fee: u128, tx: &PosTransaction, deposit_fee: u64) -> EutxoEntry {
+        let (key, input, bytes, tip, owed) = match tx {
+            PosTransaction::L2ForcedTransaction(t) => (&t.funding_pubkey, &t.inputs[0], t.tx_bytes, t.tip_millisat_per_gas,
+                t.change.value + t.max_surcharge_sat),
+            PosTransaction::L2DataAvailability(t) => (&t.funding_pubkey, &t.inputs[0], t.tx_bytes, t.tip_millisat_per_gas, t.change.value),
+            PosTransaction::L2Deposit(t) => (&t.funding_pubkey, &t.inputs[0], t.tx_bytes, t.tip_millisat_per_gas,
+                t.change.value + t.amount_sat + deposit_fee),
+            PosTransaction::L2WithdrawClaim(t) => (&t.funding_pubkey, &t.inputs[0], t.tx_bytes, t.tip_millisat_per_gas, t.change.value),
+            other => panic!("not a funded L2 fixture: {other:?}"),
+        };
+        let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, bytes, base_fee, tip);
+        let value = u128::from(owed) + charge.base_fee_sat + charge.priority_fee_sat;
+        EutxoEntry { txid: input.txid, vout: input.vout, value: u64::try_from(value).unwrap(), script_hash: Sha3_256::digest(key).into() }
+    }
+
+    /// An engine whose committed state backs every transaction of `backed`.
+    fn engine_backing(epoch: u64, backed: &[PosTransaction]) -> Engine {
+        let base_fee = engine_at_wall_epoch(epoch, &[]).state.next_base_fee_at(epoch);
+        let entries: Vec<_> = backed.iter().map(|tx| l2_backing(base_fee, tx, 0)).collect();
+        engine_at_wall_epoch_on(Some(L2_TEST_NETWORK), epoch, &entries)
+    }
+
+    /// [`engine_backing`] with an L2 of chain `L2_TEST_CHAIN` installed at
+    /// genesis, so the chain id and the settled mark are there to compare.
+    fn engine_backing_with_l2(epoch: u64, backed: &[PosTransaction]) -> Engine {
+        engine_backing_with_l2_as(epoch, backed, false)
+    }
+
+    /// The same; `asynchronous` installs the L2 in the asynchronous form,
+    /// the one that takes withdrawal claims.
+    fn engine_backing_with_l2_as(epoch: u64, backed: &[PosTransaction], asynchronous: bool) -> Engine {
+        use bloch_pos_committee::l2_settlement::Policy;
+        let mut node = engine_backing(epoch, backed);
+        let genesis = *node.chain[0].1.as_bytes();
+        let policy = Policy {
+            identities: std::array::from_fn(|i| match i {
+                0 => L2_TEST_NETWORK,
+                1 => genesis,
+                _ => [i as u8 + 1; 32],
+            }),
+            proof_policy: [0x0b; 32],
+            chain_id: L2_TEST_CHAIN,
+            initial_l2_parent: [0x0c; 32],
+            initial_l2_state: [0x0d; 32],
+            attestor_set: [0; 32],
+        };
+        let state = (*node.state).clone();
+        let state = if asynchronous { state.configure_l2_genesis_async(policy) } else { state.configure_l2_genesis(policy) };
+        node.state.set(state.expect("an L2 at genesis"));
+        node
+    }
+
+    fn is_forced(tx: &PosTransaction) -> bool { matches!(tx, PosTransaction::L2ForcedTransaction(_)) }
+
+    /// A full pool: `forced` backed tip-0 forced envelopes (wire 0x1C) and
+    /// third-party DA batches at tip 1 for the rest.
+    fn pool_with_forced_and_da(epoch: u64, forced: usize) -> Engine {
+        let envelopes: Vec<_> = (0..forced)
+            .map(|i| forced_envelope_tx(0x30 + (i / MEMPOOL_MAX_PER_SOURCE) as u8, i as u32, 0))
+            .collect();
+        let mut node = engine_backing(epoch, &envelopes);
+        for tx in envelopes {
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        let mut filled = forced;
+        'fill: for k in 0..80u8 {
+            for n in 1..=64u64 {
+                if filled == MEMPOOL_MAX { break 'fill; }
+                let tx = da_batch(0x90 + k, n, 1);
+                node.mempool.insert(tx.canonical_bytes(), tx);
+                filled += 1;
+            }
+        }
+        assert_eq!(node.mempool.len(), MEMPOOL_MAX);
+        node
+    }
+
+    /// Open item of 143/215: past the DA-slot gate, the registered key's
+    /// batch displaced the lowest-tip entries whatever their kind, so tip-0
+    /// forced envelopes (which pay the depth-priced surcharge, not a tip) went
+    /// first. A DA batch must never displace a forced envelope while any
+    /// other entry can make room.
+    #[test]
+    fn a_registered_da_batch_never_displaces_forced_envelopes() {
+        let _fillers = l2_filler_test::open();
+        use bloch_pos_committee::l2_settlement::da;
+        let epoch = V2_FLAG_DAY + 1;
+        let node = pool_with_forced_and_da(epoch, 16);
+        let own = da_batch(0xee, 1, 0);
+        let len = own.canonical_bytes().len();
+        let settler_key = vec![0xee; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let _reserved = da_reserved_test::open(da::funder(&settler_key));
+        let plan = node.plan_mempool_capacity(&own, len, epoch).expect("the registered key is admitted");
+        assert_eq!(plan.displaced.len(), 1);
+        for key in &plan.displaced {
+            assert!(!is_forced(&node.mempool.values().find(|tx| tx.canonical_bytes() == *key).unwrap().clone()),
+                "a forced envelope was displaced by a DA batch");
+        }
+    }
+
+    /// The lower-fee path at capacity: a higher-tip DA batch (any key) takes
+    /// the place of the lowest-tip entry, but never of a forced envelope in
+    /// the reserved room.
+    #[test]
+    fn a_higher_tip_da_batch_never_evicts_a_forced_envelope() {
+        let _fillers = l2_filler_test::open();
+        let epoch = V2_FLAG_DAY + 1;
+        let node = pool_with_forced_and_da(epoch, 16);
+        let other = da_batch(0x05, 1, 2);
+        let plan = node.plan_mempool_capacity(&other, other.canonical_bytes().len(), epoch)
+            .expect("a higher tip is admitted at capacity");
+        let evicted = plan.lower_fee.expect("one entry makes room");
+        let evicted = node.mempool.values().find(|tx| tx.canonical_bytes() == evicted).unwrap().clone();
+        assert!(!is_forced(&evicted), "a forced envelope was evicted for a DA batch");
+        assert_eq!(tx_tip_rate(&evicted), 1);
+    }
+
+    /// The reserved room is bounded: beyond `MEMPOOL_FORCED_RESERVED` pooled
+    /// forced envelopes, a higher-tip entry of another kind evicts the
+    /// lowest-tip one as before (so forced envelopes cannot hold the pool),
+    /// while a DA batch still never does.
+    #[test]
+    fn beyond_the_reserved_room_forced_envelopes_compete_by_tip_except_against_da() {
+        let _fillers = l2_filler_test::open();
+        use super::admission::MEMPOOL_FORCED_RESERVED;
+        let epoch = V2_FLAG_DAY + 1;
+        let lowest = |node: &Engine, key: Vec<u8>| node.mempool.values().find(|tx| tx.canonical_bytes() == key).unwrap().clone();
+        let transfer = |tip| match zero_tip_transfer(7) {
+            PosTransaction::Transfer { inputs, outputs, tx_bytes, .. } =>
+                PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas: tip },
+            other => other,
+        };
+
+        let inside = pool_with_forced_and_da(epoch, MEMPOOL_FORCED_RESERVED);
+        let tx = transfer(2);
+        let plan = inside.plan_mempool_capacity(&tx, tx.canonical_bytes().len(), epoch).expect("a higher tip is admitted");
+        assert!(!is_forced(&lowest(&inside, plan.lower_fee.expect("one entry makes room"))), "inside the room");
+
+        let beyond = pool_with_forced_and_da(epoch, MEMPOOL_FORCED_RESERVED + 1);
+        let plan = beyond.plan_mempool_capacity(&tx, tx.canonical_bytes().len(), epoch).expect("a higher tip is admitted");
+        assert!(is_forced(&lowest(&beyond, plan.lower_fee.expect("one entry makes room"))), "beyond the room: by tip");
+        let batch = da_batch(0x05, 1, 2);
+        let plan = beyond.plan_mempool_capacity(&batch, batch.canonical_bytes().len(), epoch).expect("a higher tip is admitted");
+        assert!(!is_forced(&lowest(&beyond, plan.lower_fee.expect("one entry makes room"))), "never for a DA batch");
+
+        // A pool of forced envelopes only: a DA batch finds no room at all,
+        // and a forced envelope with a higher tip still replaces the lowest.
+        let envelopes: Vec<_> = (0..MEMPOOL_MAX)
+            .map(|i| forced_envelope_tx(0x30 + (i / MEMPOOL_MAX_PER_SOURCE) as u8, i as u32, 0))
+            .collect();
+        let mut full = engine_backing(epoch, &envelopes);
+        for tx in envelopes {
+            full.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        assert!(matches!(full.plan_mempool_capacity(&batch, batch.canonical_bytes().len(), epoch), Err(Refusal::AtCapacity)));
+        let paying = forced_envelope_tx(0xa0, 1, 1);
+        let plan = full.plan_mempool_capacity(&paying, paying.canonical_bytes().len(), epoch).expect("forced against forced: by tip");
+        assert!(is_forced(&lowest(&full, plan.lower_fee.expect("one entry makes room"))));
+    }
+
+    /// Review R308-1 (agent 308, round 15). c05c62e3 took forced envelopes
+    /// out of what the registered DA key may displace, without a bound. A
+    /// forced envelope enters the pool on its signature alone (`admissible`
+    /// checks nothing else; inputs, surcharge and queue state are consensus
+    /// checks), so a pool can be filled with them at no cost, and then the
+    /// registered key's batch finds no room: the reserved DA slot serves
+    /// nobody again, which is what the displacement rule exists to prevent.
+    /// Expected: the registered key is admitted, displacing a forced envelope
+    /// outside the reserved room.
+    #[test]
+    fn r308_1_a_pool_of_forced_envelopes_cannot_keep_out_the_registered_da_key() {
+        use bloch_pos_committee::l2_settlement::da;
+        let epoch = V2_FLAG_DAY + 1;
+        let mut full = engine_at_wall_epoch(epoch, &[]);
+        for i in 0..MEMPOOL_MAX {
+            // Unfunded inputs, any tip: nothing at admission looks at either.
+            let tx = forced_envelope_tx(0x30 + (i / MEMPOOL_MAX_PER_SOURCE) as u8, i as u32, u128::MAX);
+            full.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        assert_eq!(full.mempool.len(), MEMPOOL_MAX);
+        let own = da_batch(0xee, 1, 0);
+        let settler_key = vec![0xee; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let _reserved = da_reserved_test::open(da::funder(&settler_key));
+        let plan = full.plan_mempool_capacity(&own, own.canonical_bytes().len(), epoch);
+        assert!(plan.is_ok(), "the registered DA key is locked out of a pool of forced envelopes");
+    }
+
+    /// Review R308-2 (agent 308, round 15). The reserved room protects a
+    /// forced envelope that is already pooled; it gives an arriving one no
+    /// place. A pool kept full of cheap entries of another kind (here tip-1
+    /// DA batches, admitted on a signature alone like every L2 kind) still
+    /// refuses a tip-0 forced envelope, so the censorship c05c62e3 names in
+    /// its message ("a pool kept full of cheap entries censored the forced
+    /// path") is still there at admission.
+    /// Expected: while fewer than MEMPOOL_FORCED_RESERVED forced envelopes
+    /// are pooled, an arriving one takes the place of the lowest-tip entry of
+    /// another kind.
+    #[test]
+    fn r308_2_a_forced_envelope_enters_a_pool_kept_full_of_cheap_entries() {
+        let epoch = V2_FLAG_DAY + 1;
+        let node = pool_with_forced_and_da(epoch, 0);
+        let forced = forced_envelope_tx(0x30, 1, 0);
+        let plan = node.plan_mempool_capacity(&forced, forced.canonical_bytes().len(), epoch);
+        assert!(plan.is_ok(), "a tip-0 forced envelope finds no room in a pool full of tip-1 entries");
+    }
+
+    /// R308-1, the bound: in a pool of backed forced envelopes the registered
+    /// DA key displaces exactly one, from outside the reserved room, lowest
+    /// tip first; the room is the best `MEMPOOL_FORCED_RESERVED` by tip. And
+    /// while any entry of another kind can make room, no forced envelope
+    /// does.
+    #[test]
+    fn r308_1_the_registered_da_key_displaces_forced_envelopes_only_outside_the_room() {
+        let _fillers = l2_filler_test::open();
+        use super::admission::MEMPOOL_FORCED_RESERVED;
+        use bloch_pos_committee::l2_settlement::da;
+        let epoch = V2_FLAG_DAY + 1;
+        // Tips 0, 1, 2 in turn: far more than the room holds at tip 2.
+        let envelopes: Vec<_> = (0..MEMPOOL_MAX)
+            .map(|i| forced_envelope_tx(0x30 + (i / MEMPOOL_MAX_PER_SOURCE) as u8, i as u32, (i % 3) as u128))
+            .collect();
+        let mut full = engine_backing(epoch, &envelopes);
+        for tx in envelopes {
+            full.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        let room = full.forced_room(&BTreeSet::new(), epoch);
+        assert_eq!(room.len(), MEMPOOL_FORCED_RESERVED);
+        assert!(room.iter().all(|key| tx_tip_rate(&full.mempool[key]) == 2), "the room is the best by tip");
+        let own = da_batch(0xee, 1, 0);
+        let settler_key = vec![0xee; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let _reserved = da_reserved_test::open(da::funder(&settler_key));
+        let plan = full.plan_mempool_capacity(&own, own.canonical_bytes().len(), epoch).expect("the registered key is admitted");
+        assert_eq!(plan.displaced.len(), 1);
+        assert!(!room.contains(&plan.displaced[0]), "the reserved room is not displaced");
+        assert_eq!(tx_tip_rate(&full.mempool[&plan.displaced[0]]), 0, "lowest tip first");
+        assert!(plan.lower_fee.is_none() && plan.stale.is_empty());
+
+        // Forced envelopes beyond the room next to entries of another kind.
+        let node = pool_with_forced_and_da(epoch, MEMPOOL_FORCED_RESERVED + 8);
+        let plan = node.plan_mempool_capacity(&own, own.canonical_bytes().len(), epoch).expect("admitted");
+        assert_eq!(plan.displaced.len(), 1);
+        assert!(!is_forced(&node.mempool[&plan.displaced[0]]), "another kind makes room before any forced envelope");
+    }
+
+    /// R308-1/R308-3: a forced envelope that is not backed, or that re-spends
+    /// an output a better-ranked one spends, holds no place in the room.
+    #[test]
+    fn r308_1_unbacked_and_conflicting_forced_envelopes_hold_no_room() {
+        let epoch = V2_FLAG_DAY + 1;
+        let backed: Vec<_> = (0..4).map(|i| forced_envelope_tx(0x30, i, 0)).collect();
+        let mut node = engine_backing(epoch, &backed);
+        // Not backed: inputs no state holds, at a tip no block could carry.
+        for i in 0..8 {
+            let tx = forced_envelope_tx(0x40, i, u128::MAX);
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        // Backed, but three more envelopes spend the output of `backed[0]`.
+        for n in 1..=3u8 {
+            let mut tx = backed[0].clone();
+            if let PosTransaction::L2ForcedTransaction(f) = &mut tx { f.change.script_hash = [n; 32]; }
+            node.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        for tx in &backed {
+            node.mempool.insert(tx.canonical_bytes(), tx.clone());
+        }
+        let room = node.forced_room(&BTreeSet::new(), epoch);
+        let spent: BTreeSet<_> = room.iter().map(|key| match &node.mempool[key] {
+            PosTransaction::L2ForcedTransaction(f) => (f.inputs[0].txid, f.inputs[0].vout),
+            other => panic!("{other:?}"),
+        }).collect();
+        assert_eq!(room.len(), 4, "one place per backed output");
+        assert_eq!(spent.len(), 4);
+        assert!(spent.iter().all(|(txid, _)| *txid == [0x30; 32]));
+        // What `stale` names holds no room either.
+        let stale: BTreeSet<_> = [backed[1].canonical_bytes()].into();
+        assert_eq!(node.forced_room(&stale, epoch).len(), 3);
+    }
+
+    /// R308-2, the bounds: the place an arriving forced envelope takes is
+    /// the lowest-tip entry of another kind and never the registered DA
+    /// key's; once the room holds `MEMPOOL_FORCED_RESERVED` backed envelopes
+    /// an arriving one competes by tip again; and pooled envelopes that are
+    /// not backed do not close the room.
+    #[test]
+    fn r308_2_the_room_is_bounded_and_only_backed_envelopes_fill_it() {
+        let _fillers = l2_filler_test::open();
+        use super::admission::MEMPOOL_FORCED_RESERVED;
+        use bloch_pos_committee::l2_settlement::da;
+        let epoch = V2_FLAG_DAY + 1;
+        let forced = forced_envelope_tx(0x20, 1, 0);
+        let len = forced.canonical_bytes().len();
+
+        let mut node = pool_with_forced_and_da(epoch, MEMPOOL_FORCED_RESERVED - 1);
+        // One third-party batch at tip 0 and the registered key's at tip 0.
+        let cheap = da_batch(0x05, 1, 0);
+        let own = da_batch(0xee, 1, 0);
+        for tx in [&cheap, &own] {
+            let evict = node.mempool.iter().find(|(_, tx)| !is_forced(tx) && tx_tip_rate(tx) == 1).map(|(key, _)| key.clone()).unwrap();
+            node.mempool.remove(&evict);
+            node.mempool.insert(tx.canonical_bytes(), tx.clone());
+        }
+        assert_eq!(node.mempool.len(), MEMPOOL_MAX);
+        let settler_key = vec![0xee; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let _reserved = da_reserved_test::open(da::funder(&settler_key));
+        let plan = node.plan_mempool_capacity(&forced, len, epoch).expect("the room has a place left");
+        assert!(plan.displaced == vec![cheap.canonical_bytes()], "the lowest tip of another kind, not the registered key's");
+        assert!(plan.lower_fee.is_none());
+
+        let full_room = pool_with_forced_and_da(epoch, MEMPOOL_FORCED_RESERVED);
+        assert!(matches!(full_room.plan_mempool_capacity(&forced, len, epoch), Err(Refusal::AtCapacity)),
+            "a full room: a tip-0 envelope does not displace tip-1 entries");
+        let paying = forced_envelope_tx(0x20, 2, 2);
+        let plan = full_room.plan_mempool_capacity(&paying, paying.canonical_bytes().len(), epoch).expect("by tip");
+        assert!(plan.displaced.is_empty() && plan.lower_fee.is_some());
+
+        // The same number of pooled envelopes, none backed: the room is open.
+        let mut unbacked = engine_at_wall_epoch(epoch, &[]);
+        for i in 0..MEMPOOL_FORCED_RESERVED {
+            let tx = forced_envelope_tx(0x30, i as u32, 0);
+            unbacked.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        'fill: for k in 0..80u8 {
+            for n in 1..=64u64 {
+                if unbacked.mempool.len() == MEMPOOL_MAX { break 'fill; }
+                let tx = da_batch(0x90 + k, n, 1);
+                unbacked.mempool.insert(tx.canonical_bytes(), tx);
+            }
+        }
+        let plan = unbacked.plan_mempool_capacity(&forced, len, epoch).expect("unbacked envelopes hold no room");
+        assert_eq!(plan.displaced.len(), 1);
+        assert!(!is_forced(&unbacked.mempool[&plan.displaced[0]]));
+
+        // A source at its cap gets no place from the room.
+        let mut capped = pool_with_forced_and_da(epoch, MEMPOOL_MAX_PER_SOURCE - 1);
+        let last = forced_envelope_tx(0x30, 9_000, 0);
+        let evict = capped.mempool.iter().find(|(_, tx)| !is_forced(tx)).map(|(key, _)| key.clone()).unwrap();
+        capped.mempool.remove(&evict);
+        capped.mempool.insert(last.canonical_bytes(), last);
+        let one_more = forced_envelope_tx(0x30, 9_001, 0);
+        assert!(matches!(capped.plan_mempool_capacity(&one_more, one_more.canonical_bytes().len(), epoch), Err(Refusal::TooManyFromSource)));
+    }
+
+    /// R308-3: a forced envelope is backed only with a tip inside the
+    /// consensus ceiling, a declared size that covers its encoding, funding
+    /// inputs present in committed state and owned by its key, and value
+    /// conserved at the current base fee. Each refusal is shown against the
+    /// same transaction passing. The deposit, the DA batch and the claim are
+    /// judged by the released door (`admission::check_l2_funded`); their
+    /// cases of this review item are in `l2_preflight_tests`.
+    #[test]
+    fn r308_3_l2_kinds_are_backed_before_they_enter_the_pool() {
+        use super::admission::check_l2_funding;
+        use bloch_pos_committee::transition::FundingInput;
+        let epoch = V2_FLAG_DAY + 1;
+        let tx = forced_envelope_tx(0x53, 1, 3);
+
+        let blank = engine_at_wall_epoch_on(Some(L2_TEST_NETWORK), epoch, &[]);
+        let base_fee = blank.state.next_base_fee_at(epoch);
+        let node = engine_at_wall_epoch_on(Some(L2_TEST_NETWORK), epoch, &[l2_backing(base_fee, &tx, 0)]);
+        let check = |node: &Engine, tx: &PosTransaction| check_l2_funding(&node.state, None, tx, tx.canonical_bytes().len(), epoch);
+        let with = |tx: &PosTransaction, edit: &dyn Fn(&mut u128, &mut u64, &mut Vec<FundingInput>, &mut Vec<u8>, &mut u64)| {
+            let mut tx = tx.clone();
+            match &mut tx {
+                PosTransaction::L2ForcedTransaction(t) => edit(&mut t.tip_millisat_per_gas, &mut t.tx_bytes, &mut t.inputs, &mut t.funding_pubkey, &mut t.change.value),
+                other => panic!("{other:?}"),
+            }
+            tx
+        };
+        let tx = &tx;
+        assert!(check(&node, tx).is_ok(), "backed: {tx:?}");
+        assert!(matches!(check(&blank, tx), Err(Refusal::StateDependent(_))), "no such output in state");
+        for tip in [fee_market::MAX_TIP_MILLISAT_PER_GAS + 1, u128::MAX] {
+            let over = with(tx, &|t, _, _, _, _| *t = tip);
+            assert!(matches!(check(&node, &over), Err(Refusal::Invalid(_))), "tip above the ceiling");
+        }
+        // The ceiling itself is priced without overflow and is not paid for.
+        let at = with(tx, &|t, _, _, _, _| *t = fee_market::MAX_TIP_MILLISAT_PER_GAS);
+        assert!(matches!(check(&node, &at), Err(Refusal::StateDependent(_))), "a tip the inputs do not pay");
+        let short = with(tx, &|_, bytes, _, _, _| *bytes -= 1);
+        assert!(matches!(check(&node, &short), Err(Refusal::Invalid(_))), "underdeclared size");
+        let huge = with(tx, &|_, bytes, _, _, _| *bytes = u64::MAX);
+        assert!(matches!(check(&node, &huge), Err(Refusal::Invalid(_))), "beyond the block byte budget");
+        let absent = with(tx, &|_, _, inputs, _, _| inputs[0].vout += 1);
+        assert!(matches!(check(&node, &absent), Err(Refusal::StateDependent(_))), "absent input");
+        let twice = with(tx, &|_, _, inputs, _, _| inputs.push(inputs[0].clone()));
+        assert!(check(&node, &twice).is_err(), "repeated input");
+        let foreign = with(tx, &|_, _, _, key, _| key[0] ^= 1);
+        assert!(matches!(check(&node, &foreign), Err(Refusal::Invalid(_))), "another key's output");
+        for delta in [1u64, u64::MAX] {
+            let unbalanced = with(tx, &|_, _, _, _, change| *change = change.wrapping_add(delta));
+            assert!(matches!(check(&node, &unbalanced), Err(Refusal::StateDependent(_))), "value not conserved");
+        }
+        // `check_transfer` leaves a forced envelope this network's L2 does not
+        // admit to `l2_admission_refusal` (no L2 here).
+        assert!(super::admission::check_transfer(&blank.state, tx, tx.canonical_bytes().len(), epoch).is_ok());
+        assert!(l2_admission_refusal(tx, blank.state.l2_settlement()).is_some());
+    }
+
+    /// R308-3, forced envelopes: `max_surcharge_sat` must reach the current
+    /// entry price of the queue, and the gas limit must be one consensus
+    /// accepts; without a queue (forced inclusion not enabled) neither is
+    /// asked here.
+    #[test]
+    fn r308_3_a_forced_envelope_must_offer_the_current_entry_surcharge() {
+        use super::admission::check_l2_funding;
+        use bloch_pos_committee::l2_settlement::forced;
+        let epoch = V2_FLAG_DAY + 1;
+        let queue = forced::Queue::default();
+        let price = queue.surcharge_for(forced::MIN_GAS).expect("an empty queue has room");
+        assert!(price > 0);
+        let offer = |max: u64, gas: u64| {
+            let mut tx = forced_envelope_tx(0x53, 1, 0);
+            if let PosTransaction::L2ForcedTransaction(f) = &mut tx { f.max_surcharge_sat = max; f.gas_limit = gas; }
+            tx
+        };
+        let exact = offer(price, forced::MIN_GAS);
+        let below = offer(price - 1, forced::MIN_GAS);
+        let node = engine_backing(epoch, &[exact.clone()]);
+        let low = engine_backing(epoch, &[below.clone()]);
+        let check = |node: &Engine, queue, tx: &PosTransaction| check_l2_funding(&node.state, queue, tx, tx.canonical_bytes().len(), epoch);
+        assert!(check(&node, Some(&queue), &exact).is_ok());
+        assert!(check(&low, None, &below).is_ok(), "funded as declared");
+        assert!(matches!(check(&low, Some(&queue), &below), Err(Refusal::StateDependent(_))), "below the entry price");
+        for gas in [forced::MIN_GAS - 1, forced::MAX_GAS + 1, 0, u64::MAX] {
+            let tx = offer(price, gas);
+            assert!(matches!(check(&node, Some(&queue), &tx), Err(Refusal::Invalid(_))), "gas limit {gas}");
+            assert!(matches!(check(&node, None, &tx), Err(Refusal::Invalid(_))), "gas limit {gas}");
+        }
+    }
+
+    /// Review R308-2P-2 (agent 308, second pass). `check_l2_funding` mirrors
+    /// the funding half of what consensus checks and calls the result
+    /// "backed", but it never looks at the fields that decide whether the
+    /// transaction can apply on THIS network at all: `network_domain`
+    /// (consensus `Network`), a forced envelope's `l2_chain_id` (consensus
+    /// `Chain`), nor the shape (`validate_shape`: input order, envelope
+    /// size). An envelope for another chain is therefore backed for ever, is
+    /// never included, never spends its output, holds a place in the
+    /// reserved room (`forced_room`), and its arrival displaces entries of
+    /// other kinds "whatever their tip". 64 outputs that are never spent
+    /// close the room to honest envelopes (R308-2 again), and input-sharing
+    /// copies at the tip ceiling evict and keep out paying transfers.
+    /// Two envelopes that differ only in chain and network cannot both be
+    /// applicable to one network. Expected: at most one is backed, and only
+    /// that one holds room.
+    #[test]
+    fn r308_2p_2_an_envelope_for_another_network_or_chain_is_not_backed_and_holds_no_room() {
+        use super::admission::check_l2_funding;
+        let epoch = V2_FLAG_DAY + 1;
+        let here = forced_envelope_tx(0x30, 0, 0);
+        let mut elsewhere = forced_envelope_tx(0x31, 0, 0);
+        if let PosTransaction::L2ForcedTransaction(f) = &mut elsewhere {
+            f.l2_chain_id = 1;
+            f.network_domain = [0xde; 32];
+        }
+        let mut node = engine_backing(epoch, &[here.clone(), elsewhere.clone()]);
+        let backed = |node: &Engine, tx: &PosTransaction| check_l2_funding(&node.state, None, tx, tx.canonical_bytes().len(), epoch).is_ok();
+        let both = backed(&node, &here) && backed(&node, &elsewhere);
+        for tx in [&here, &elsewhere] {
+            node.mempool.insert(tx.canonical_bytes(), tx.clone());
+        }
+        let room = node.forced_room(&BTreeSet::new(), epoch).len();
+        assert!(
+            !both && room <= 1,
+            "envelopes for two different networks and L2 chains are both backed ({both}) and hold {room} places of the reserved room"
+        );
+    }
+
+    /// R308-2P-2, each rule alone: an L2 deposit, DA batch or forced envelope
+    /// is applicable only when signed for this network, naming this L2 chain
+    /// (the kinds that carry a chain id) and of a shape consensus accepts.
+    /// Each refusal is shown against the same transaction passing.
+    #[test]
+    fn r308_2p_2_network_chain_and_shape_each_refuse_alone() {
+        use super::admission::check_l2_applicable;
+        use bloch_pos_committee::transition::{FundingInput, L2Deposit};
+        let mut deposit = L2Deposit {
+            network_domain: L2_TEST_NETWORK,
+            funding_pubkey: vec![0x51; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES],
+            inputs: vec![FundingInput { txid: [0x51; 32], vout: 0 }],
+            // The least consensus accepts (`MIN_L2_DEPOSIT_SAT`).
+            amount_sat: 1_000_000,
+            recipient: [7; 20],
+            change: TransferOutput { value: 1, script_hash: [0x51; 32] },
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+            signature: vec![9; 64],
+        };
+        deposit.tx_bytes = deposit.canonical_bytes().len() as u64;
+        let mut batch = da_batch(0x52, 1, 0);
+        if let PosTransaction::L2DataAvailability(b) = &mut batch { b.tx_bytes = b.canonical_bytes().len() as u64; }
+        let txs = [PosTransaction::L2Deposit(deposit), batch, forced_envelope_tx(0x53, 1, 0)];
+        let here = |tx: &PosTransaction| check_l2_applicable(Some(L2_TEST_NETWORK), Some(L2_TEST_CHAIN), tx);
+        let invalid = |verdict: Result<(), Refusal>| matches!(verdict, Err(Refusal::Invalid(_)));
+        for tx in &txs {
+            assert!(here(tx).is_ok(), "applicable here: {tx:?}");
+            // Another network, and a state bound to no network at all.
+            assert!(invalid(check_l2_applicable(Some([0xde; 32]), Some(L2_TEST_CHAIN), tx)), "another network");
+            assert!(invalid(check_l2_applicable(None, Some(L2_TEST_CHAIN), tx)), "no network domain");
+            // Another chain: only the kinds that name one.
+            let elsewhere = check_l2_applicable(Some(L2_TEST_NETWORK), Some(L2_TEST_CHAIN + 1), tx);
+            assert_eq!(invalid(elsewhere), !matches!(tx, PosTransaction::L2Deposit(_)), "another L2 chain: {tx:?}");
+            // No L2 installed: no chain to compare (the kind is refused by `l2_admission_refusal`).
+            assert!(check_l2_applicable(Some(L2_TEST_NETWORK), None, tx).is_ok());
+            // Shape: funding inputs out of order.
+            let mut unordered = tx.clone();
+            match &mut unordered {
+                PosTransaction::L2Deposit(t) => t.inputs.insert(0, FundingInput { txid: [0xff; 32], vout: 0 }),
+                PosTransaction::L2DataAvailability(t) => t.inputs.insert(0, FundingInput { txid: [0xff; 32], vout: 0 }),
+                PosTransaction::L2ForcedTransaction(t) => t.inputs.insert(0, FundingInput { txid: [0xff; 32], vout: 0 }),
+                other => panic!("{other:?}"),
+            }
+            assert!(invalid(here(&unordered)), "funding inputs out of order");
+        }
+        // Shape, per kind: a zero recipient, a payload that is not one batch, an empty envelope.
+        let mut shapeless = txs.clone();
+        if let PosTransaction::L2Deposit(t) = &mut shapeless[0] { t.recipient = [0; 20]; }
+        if let PosTransaction::L2DataAvailability(t) = &mut shapeless[1] { t.payload.clear(); }
+        if let PosTransaction::L2ForcedTransaction(t) = &mut shapeless[2] { t.envelope.clear(); }
+        for tx in &shapeless {
+            assert!(invalid(here(tx)), "shape: {tx:?}");
+        }
+    }
+
+    /// R308-2P-2 against a state with an L2 installed: `check_l2_funding`
+    /// takes the chain id from the L2 policy. (A DA batch at or below the
+    /// settled mark is refused by the released door, from the transition's
+    /// own check.)
+    #[test]
+    fn r308_2p_2_backing_reads_the_chain_and_the_settled_mark_of_the_installed_l2() {
+        use super::admission::check_l2_funding;
+        let epoch = V2_FLAG_DAY + 1;
+        let envelope = forced_envelope_tx(0x30, 0, 0);
+        let mut other_chain = forced_envelope_tx(0x31, 0, 0);
+        if let PosTransaction::L2ForcedTransaction(f) = &mut other_chain { f.l2_chain_id = L2_TEST_CHAIN + 1; }
+        let txs = [envelope.clone(), other_chain.clone()];
+        let node = engine_backing_with_l2(epoch, &txs);
+        let l2 = node.state.l2_settlement().expect("installed");
+        assert_eq!((l2.policy().chain_id, l2.settled_number()), (L2_TEST_CHAIN, 0));
+        let check = |node: &Engine, tx: &PosTransaction| check_l2_funding(&node.state, None, tx, tx.canonical_bytes().len(), epoch);
+        assert!(check(&node, &envelope).is_ok());
+        assert!(matches!(check(&node, &other_chain), Err(Refusal::Invalid(_))), "an envelope for another L2 chain");
+        // Without an installed L2 it is funded and nothing else is compared.
+        let bare = engine_backing(epoch, &txs);
+        assert!(check(&bare, &other_chain).is_ok());
+    }
+
+    /// R308-2P-2 in the pool: a copy that re-spends the output of a pooled
+    /// envelope displaces nothing (one displacement per funding output),
+    /// while an envelope spending an output of its own still takes a place;
+    /// and a pooled envelope signed for another network is not backed and
+    /// holds no room (`candidate_is_backed` drops it as stale under capacity
+    /// pressure wherever forced inclusion is active).
+    #[test]
+    fn r308_2p_2_foreign_envelopes_hold_no_room_and_respending_copies_displace_nothing() {
+        let _fillers = l2_filler_test::open();
+        use super::admission::check_l2_funding;
+        let epoch = V2_FLAG_DAY + 1;
+        let mut node = pool_with_forced_and_da(epoch, 1);
+        let pooled = forced_envelope_tx(0x30, 0, 0);
+        assert!(node.mempool.contains_key(&pooled.canonical_bytes()));
+        assert_eq!(node.forced_room(&BTreeSet::new(), epoch).len(), 1);
+        let mut copy = pooled.clone();
+        if let PosTransaction::L2ForcedTransaction(f) = &mut copy { f.change.script_hash = [0x77; 32]; }
+        // The released input reservation (`plan_input_conflicts`) answers first:
+        // the pooled envelope holds the output, so the copy is refused outright.
+        assert_eq!(
+            node.plan_mempool_capacity(&copy, copy.canonical_bytes().len(), epoch).err(),
+            Some(Refusal::StateDependent("transaction spends an input that a pending transaction already spends")),
+            "a copy re-spending a pooled envelope's output displaces nothing"
+        );
+        let fresh = forced_envelope_tx(0x20, 1, 0);
+        let plan = node.plan_mempool_capacity(&fresh, fresh.canonical_bytes().len(), epoch).expect("an output of its own");
+        assert_eq!(plan.displaced.len(), 1);
+
+        // The pooled envelope is now one signed for another network.
+        node.mempool.remove(&pooled.canonical_bytes());
+        let mut foreign = pooled.clone();
+        if let PosTransaction::L2ForcedTransaction(f) = &mut foreign { f.network_domain = [0xde; 32]; }
+        node.mempool.insert(foreign.canonical_bytes(), foreign.clone());
+        assert_eq!(node.mempool.len(), MEMPOOL_MAX);
+        assert!(matches!(check_l2_funding(&node.state, None, &foreign, foreign.canonical_bytes().len(), epoch), Err(Refusal::Invalid(_))));
+        assert!(node.forced_room(&BTreeSet::new(), epoch).is_empty(), "it holds no room");
+    }
+
+    /// Review R308-3P-1 (agent 308, third pass). edd4cf8c mirrors the lower
+    /// bound of consensus' DA number rule (`l2_number <= settled` is refused)
+    /// but not the upper one: `record_data_availability` also refuses
+    /// `l2_number > settled + da::WINDOW` (64), a commitment already recorded
+    /// and a full record list. A funded DA batch naming a block beyond the
+    /// window is therefore backed, is never included, never spends its
+    /// output, and sits in the pool at the ceiling tip: what is left of
+    /// R308-3 for the DA kind (64 keys, one output each, 64 batches per key).
+    /// Expected: a batch consensus refuses for its number is not backed.
+    #[cfg(feature = "devnet-l2-user-txs")]
+    #[test]
+    fn r308_3p_1_a_da_batch_beyond_the_window_is_not_backed() {
+        use super::admission::check_l2_funding;
+        use bloch_pos_committee::l2_settlement::da;
+        let epoch = V2_FLAG_DAY + 1;
+        let mut inside = da_batch(0x32, da::WINDOW, 0);
+        let mut beyond = da_batch(0x33, da::WINDOW + 1, 0);
+        for tx in [&mut inside, &mut beyond] {
+            if let PosTransaction::L2DataAvailability(b) = tx { b.tx_bytes = b.canonical_bytes().len() as u64; }
+        }
+        let node = engine_backing_with_l2(epoch, &[inside.clone(), beyond.clone()]);
+        assert_eq!(node.state.l2_settlement().expect("installed").settled_number(), 0);
+        let check = |tx: &PosTransaction| check_l2_funding(&node.state, None, tx, tx.canonical_bytes().len(), epoch);
+        assert!(check(&inside).is_ok(), "the last block of the window is backed");
+        assert!(check(&beyond).is_err(), "a batch for block settled + WINDOW + 1 is backed although consensus refuses its number");
+    }
+
+    /// A funded, well-formed withdrawal claim of leaf `index` for the test L2,
+    /// with an all-zero proof (it folds to no root a settlement recorded).
+    fn withdraw_claim(key_byte: u8, index: u64, release_sat: u64) -> PosTransaction {
+        use bloch_pos_committee::transition::{FundingInput, L2WithdrawClaim};
+        let mut claim = L2WithdrawClaim {
+            network_domain: L2_TEST_NETWORK,
+            funding_pubkey: vec![key_byte; bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES],
+            inputs: vec![FundingInput { txid: [key_byte; 32], vout: 0 }],
+            l2_chain_id: L2_TEST_CHAIN,
+            index,
+            l1_recipient: [0x77; 32],
+            // The least consensus accepts (`MIN_L2_DEPOSIT_SAT`).
+            sats: 1_000_000,
+            siblings: [[0; 32]; bloch_pos_committee::l2_settlement::withdrawal::TREE_DEPTH],
+            release: TransferOutput { value: release_sat, script_hash: [0x77; 32] },
+            change: TransferOutput { value: 1, script_hash: [key_byte; 32] },
+            tx_bytes: 0,
+            tip_millisat_per_gas: 3,
+            attestation: None,
+            signature: vec![9; 64],
+        };
+        claim.tx_bytes = claim.canonical_bytes().len() as u64;
+        PosTransaction::L2WithdrawClaim(claim)
+    }
+
+    /// R308-3P-1, the claim part. A withdrawal claim that is funded exactly
+    /// but that consensus refuses on state (here: no
+    /// withdrawal root is recorded, so its proof folds to nothing retained;
+    /// without user transactions consensus refuses every claim) was backed:
+    /// never included, never spending its input, outbid by no transfer.
+    /// Expected: it is not backed, and the refusal is retryable. The funding
+    /// itself is shown sound: the same claim with one sat more of change is
+    /// refused for conservation, before the state question is asked.
+    #[test]
+    fn r308_3p_1_a_claim_consensus_refuses_on_state_is_not_backed() {
+        use super::admission::check_l2_funding;
+        use bloch_pos_committee::transition::L2WithdrawClaimReject as R;
+        let epoch = V2_FLAG_DAY + 1;
+        let blank = engine_at_wall_epoch_on(Some(L2_TEST_NETWORK), epoch, &[]);
+        let claim = withdraw_claim(0x61, 0, blank.state.l2_claim_release_sat(1_000_000));
+        let PosTransaction::L2WithdrawClaim(inner) = &claim else { unreachable!() };
+        assert!(inner.validate_shape().is_ok(), "the fixture is a claim consensus can read");
+        let node = engine_backing_with_l2_as(epoch, std::slice::from_ref(&claim), true);
+        let check = |tx: &PosTransaction| check_l2_funding(&node.state, None, tx, tx.canonical_bytes().len(), epoch);
+
+        // The released door answers with the transition's own check, in the
+        // transition's order (the claim before the funding).
+        let refusal = node.state.l2_withdraw_claim_refusal(inner);
+        if bloch_pos_committee::l2_settlement::USER_TRANSACTIONS_ENABLED {
+            assert_eq!(refusal, Some(R::Proof), "funded and well formed: consensus refuses it for its proof only");
+            assert_eq!(
+                check(&claim),
+                Err(Refusal::StateDependent(
+                    "L2 withdrawal claim does not prove an unclaimed leaf of a withdrawal root this node retains"
+                )),
+                "a funded claim against no retained root is backed although consensus refuses it"
+            );
+        } else {
+            assert_eq!(refusal, Some(R::NotActive));
+            assert_eq!(
+                check(&claim),
+                Err(Refusal::Invalid("L2 withdrawal claims are not active on this network")),
+                "a funded claim consensus refuses is backed"
+            );
+        }
     }
 
     /// F-9: which commitments win the scarce slots is re-drawn from the
@@ -14186,6 +15216,7 @@ mod perf_support {
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
+            l2_brake: crate::l2_brake::BrakeCell::disabled(),
             rejected: BTreeMap::new(),
             rejected_bytes: 0,
             rejected_expiry_hint: None,
@@ -16685,6 +17716,7 @@ mod duty_view_anchor {
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
+            l2_brake: crate::l2_brake::BrakeCell::disabled(),
             rejected: BTreeMap::new(),
             rejected_bytes: 0,
             rejected_expiry_hint: None,
@@ -16961,6 +17993,7 @@ mod slot_horizon {
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
+            l2_brake: crate::l2_brake::BrakeCell::disabled(),
             rejected: BTreeMap::new(),
             rejected_bytes: 0,
             rejected_expiry_hint: None,
@@ -21306,6 +22339,43 @@ mod l2_admission_tests {
         ]
     }
 
+    /// A settlement proof whose statement names `configuration` as its program.
+    fn proof_of(policy: &Policy, configuration: [u8; 32], number: u8) -> PosTransaction {
+        use bloch_pos_committee::l2_settlement::{Transaction, STATEMENT_TAG, STATEMENT_V3_BYTES, STATEMENT_V3_TAG};
+        let tag = STATEMENT_TAG.len();
+        let mut statement = vec![number; STATEMENT_V3_BYTES];
+        statement[..tag].copy_from_slice(STATEMENT_V3_TAG);
+        for (i, id) in policy.identities.iter().enumerate() {
+            statement[tag + i * 32..tag + (i + 1) * 32].copy_from_slice(id);
+        }
+        statement[tag + 96..tag + 128].copy_from_slice(&configuration);
+        PosTransaction::L2SettlementAsync(Box::new(Transaction { proof_policy: policy.proof_policy, statement, proof: [1; 356] }))
+    }
+
+    /// Only a proof of the program the L2 holds keeps the one proof slot.
+    #[test]
+    fn a_proof_of_a_replaced_program_holds_no_slot() {
+        let limits = withdrawal::Limits::DEVELOPMENT;
+        let l2 = State::activated(Activation { policy: policy(), asynchronous: true, limits }).unwrap();
+        assert!(l2_proof_holds_the_slot(&proof_of(&policy(), policy().identities[3], 1), &l2));
+        assert!(!l2_proof_holds_the_slot(&proof_of(&policy(), [0xee; 32], 1), &l2));
+        for tx in txs() {
+            assert!(!l2_proof_holds_the_slot(&tx, &l2), "{tx:?}");
+        }
+    }
+
+    /// No proposer picks a dead proof, and a live proof is still found behind one.
+    #[test]
+    fn the_proposer_skips_a_proof_of_a_replaced_program() {
+        let limits = withdrawal::Limits::DEVELOPMENT;
+        let l2 = State::activated(Activation { policy: policy(), asynchronous: true, limits }).unwrap();
+        let dead = proof_of(&policy(), [0xee; 32], 1);
+        let live = proof_of(&policy(), policy().identities[3], 2);
+        assert_eq!(live_l2_proof([&dead].into_iter(), Some(&l2)), None);
+        assert_eq!(live_l2_proof([&dead, &live].into_iter(), Some(&l2)), Some(&live));
+        assert_eq!(live_l2_proof([&live].into_iter(), None), None);
+    }
+
     /// The mempool's L2 door reads the installed L2's profile, not the build:
     /// no L2 (a running network before its flag day) refuses on every
     /// build; an activated L2 admits on every build, a mainnet build included.
@@ -21649,5 +22719,117 @@ mod validated_vote_tests {
         );
         assert_eq!(*engine.head_id().as_bytes(), head);
         check(&engine, "restart cache");
+    }
+}
+
+/// The node-local L2 brake inside the engine (agent 222): the mempool door
+/// refuses held transactions as retry-later and the proposer leaves them out;
+/// nothing else changes.
+#[cfg(test)]
+mod l2_brake_engine_tests {
+    use super::*;
+    use bloch_pos_committee::l2_settlement::{Transaction, STATEMENT_TAG, STATEMENT_V3_BYTES, STATEMENT_V3_TAG};
+
+    /// An engine whose genesis installs a development L2 (chain 700771), and a
+    /// brake directory with a fresh brake key.
+    fn engine_with_l2(dir_tag: &str) -> (Engine, PathBuf, Vec<u8>) {
+        let mut engine = super::slot_horizon::engine_at_wall_slot(64);
+        engine.manifest.format = crate::genesis::ManifestFormat::V3L2Async(crate::genesis::L2Config {
+            identities: [[3; 32]; 5],
+            proof_policy: bloch_l2_proof::policy_commitment(),
+            chain_id: 700_771,
+            initial_l2_parent: [4; 32],
+            initial_l2_state: [5; 32],
+            attestor_set: [0; 32],
+        });
+        engine.manifest.pre_state_root = std::sync::OnceLock::new();
+        engine.state = StateCell::new(engine.manifest.genesis_state());
+        assert!(engine.state.l2_settlement().is_some() && engine.state.admission_network_domain().is_some());
+        let dir = std::env::temp_dir().join(format!("a222-engine-brake-{dir_tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        engine.l2_brake = crate::l2_brake::BrakeCell::new(Some(dir.clone()), Some(pk));
+        (engine, dir, sk)
+    }
+
+    fn engage(engine: &Engine, dir: &std::path::Path, sk: &[u8], settlements: bool) {
+        let until = epoch_of(engine.wall_slot()) + 10;
+        let body = format!(
+            r#"{{"version":1,"chain_id":700771,"claims_from_leaf_index":0,"settlements":{settlements},"until_epoch":{until},"reason":"engine test"}}"#
+        );
+        let network = engine.state.admission_network_domain().unwrap();
+        let sig = bloch_crypto::crypto::sign_fitting(sk, &crate::l2_brake::digest(&network, body.as_bytes()), usize::MAX).unwrap();
+        std::fs::write(dir.join(crate::l2_brake::FILE), body).unwrap();
+        std::fs::write(dir.join(crate::l2_brake::SIG_FILE), crate::codec::hex(&sig)).unwrap();
+    }
+
+    /// A proof of the installed program (fake proof bytes: never verified here).
+    fn proof(engine: &Engine) -> PosTransaction {
+        let policy = engine.state.l2_settlement().unwrap().policy().clone();
+        let tag = STATEMENT_TAG.len();
+        let mut statement = vec![1; STATEMENT_V3_BYTES];
+        statement[..tag].copy_from_slice(STATEMENT_V3_TAG);
+        for (i, id) in policy.identities.iter().enumerate() {
+            statement[tag + i * 32..tag + (i + 1) * 32].copy_from_slice(id);
+        }
+        PosTransaction::L2SettlementAsync(Box::new(Transaction { proof_policy: policy.proof_policy, statement, proof: [1; 356] }))
+    }
+
+    #[test]
+    fn the_door_refuses_a_held_settlement_as_retry_later_and_only_while_held() {
+        let (mut engine, dir, sk) = engine_with_l2("door");
+        let tx = proof(&engine);
+        // Off: the proof is judged on its merits (a fake proof is invalid).
+        assert!(matches!(engine.on_transaction(tx.clone()), Err(Refusal::Invalid(_))));
+        engage(&engine, &dir, &sk, true);
+        engine.l2_brake = crate::l2_brake::BrakeCell::new(Some(dir.clone()), None);
+        // A cell without a key never reads the file: still judged on its merits.
+        assert!(matches!(engine.on_transaction(tx.clone()), Err(Refusal::Invalid(_))));
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        engine.l2_brake = crate::l2_brake::BrakeCell::new(Some(dir.clone()), Some(pk));
+        engage(&engine, &dir, &sk, true);
+        assert!(matches!(engine.on_transaction(tx.clone()), Err(Refusal::StateDependent(_))));
+        assert!(engine.mempool.len() == 0 && engine.rejected.is_empty(), "held, not admitted and not barred");
+        let info = engine.l2_brake.json(epoch_of(engine.wall_slot()));
+        assert_eq!(info.get("active"), Some(&rpc::Json::Bool(true)));
+        // Claims only (settlements false): the proof is judged on its merits again.
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        engine.l2_brake = crate::l2_brake::BrakeCell::new(Some(dir.clone()), Some(pk));
+        engage(&engine, &dir, &sk, false);
+        assert!(matches!(engine.on_transaction(tx), Err(Refusal::Invalid(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The proposer takes only a settlement that still matches the head
+    /// (review EXE-2), so this runs on the released fixture of that rule: an
+    /// engine with a frozen source and a settlement made for it.
+    #[test]
+    fn the_proposer_leaves_a_held_settlement_out_and_takes_it_once_lifted() {
+        use super::l2_async_admission_tests::{engine_with_frozen_source_funded, settlement, wire};
+        let _clock = validator_lifecycle::clock_at(3);
+        let (mut engine, _data) = engine_with_frozen_source_funded(&[]);
+        let dir = std::env::temp_dir().join(format!("a222-engine-brake-propose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        engine.l2_brake = crate::l2_brake::BrakeCell::new(Some(dir.clone()), Some(pk));
+        let tx = wire(settlement(&engine, [2; 356]));
+        let key = tx.canonical_bytes();
+        let txid = tx.txid();
+        engine.mempool.insert_with_txid(key, tx.clone(), txid);
+        let epoch = epoch_of(engine.wall_slot());
+        assert_eq!(engine.select_transactions(epoch), vec![tx.clone()], "unbraked: the proof is proposed alone");
+        engage(&engine, &dir, &sk, true);
+        // The file is re-read at most once per slot (unit-tested in l2_brake with
+        // fixed slots); here the wall clock moves, so force the next slot's read.
+        engine.l2_brake.refresh(engine.wall_slot() + 1, epoch, engine.state.admission_network_domain(), Some(700_771));
+        assert!(!engine.select_transactions(epoch).contains(&tx), "braked: not proposed");
+        assert_eq!(engine.mempool.len(), 1, "kept in the mempool, not dropped or barred");
+        // Lifted by deleting the file: the next slot's refresh sees it gone.
+        std::fs::remove_file(dir.join(crate::l2_brake::FILE)).unwrap();
+        engine.l2_brake.refresh(engine.wall_slot() + 1, epoch, engine.state.admission_network_domain(), Some(700_771));
+        assert_eq!(engine.select_transactions(epoch), vec![tx]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

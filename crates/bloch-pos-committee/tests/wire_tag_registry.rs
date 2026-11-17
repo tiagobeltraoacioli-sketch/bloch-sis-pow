@@ -374,6 +374,11 @@ const TX_TAGS: &[(u8, Status)] = &[
     // are the PQ migration's). Refused by consensus before
     // params::HF3_KES_EPOCH (u64::MAX).
     (0x1B, Status::Released { name: "KesRotate", rivals: NO_RIVALS }),
+    // CANDIDATE L1 forced inclusion of one L2 transaction
+    // (codex/forced-inclusion-r7-20261102). 0x1C was `tx::NEXT_FREE` in
+    // wire_alloc on 2026-11-02. Refused by consensus with `NotActive` while
+    // params::L2_FORCED_INCLUSION_EPOCH is u64::MAX.
+    (0x1C, Status::Released { name: "L2ForcedTransaction", rivals: NO_RIVALS }),
 ];
 
 /// Three lineages that all intend the SAME flag day disagree on all three
@@ -581,6 +586,7 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         PosTransaction::RescueCommit(_) => 0x19,
         PosTransaction::RescueReveal(_) => 0x1A,
         PosTransaction::KesRotate { .. } => 0x1B,
+        PosTransaction::L2ForcedTransaction(_) => 0x1C,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }
@@ -1183,6 +1189,7 @@ fn l2_transaction_tags_do_not_overlap_the_mainnet_tag_set() {
             (0x14, "L2Deposit"),
             (0x15, "L2DataAvailability"),
             (0x16, "L2WithdrawClaim"),
+            (0x1C, "L2ForcedTransaction"),
         ],
         "the L2 rows of the registry changed"
     );
