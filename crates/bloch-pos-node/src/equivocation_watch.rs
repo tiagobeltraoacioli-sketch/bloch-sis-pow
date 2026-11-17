@@ -165,7 +165,7 @@ pub(crate) fn normalize_addr(s: &str) -> String {
 
 #[derive(Debug)]
 #[allow(dead_code)] // fields are reported through Debug
-enum RpcErr {
+pub(crate) enum RpcErr {
     /// The node answered with a JSON-RPC error object.
     Node(i64, String),
     Transport(String),
@@ -178,7 +178,9 @@ enum RpcErr {
 /// envelope. An endpoint cannot make the watcher buffer past this.
 const MAX_RPC_RESPONSE_BYTES: usize = 2 * crate::p2p::MAX_GOSSIP_BYTES + 64 * 1024;
 
-fn rpc_call(addr: &str, method: &str, params: Vec<Json>) -> Result<Json, RpcErr> {
+/// Also the read path of `treasury-collect observe` (one client, one set of
+/// bounds, one error shape).
+pub(crate) fn rpc_call(addr: &str, method: &str, params: Vec<Json>) -> Result<Json, RpcErr> {
     let request = Json::obj(vec![
         ("jsonrpc", Json::s("2.0")),
         ("id", Json::u(1)),
@@ -222,7 +224,7 @@ fn rpc_call(addr: &str, method: &str, params: Vec<Json>) -> Result<Json, RpcErr>
     json.get("result").cloned().ok_or_else(|| t(format!("{method}: no result")))
 }
 
-fn with_retry<T>(mut f: impl FnMut() -> Result<T, RpcErr>) -> Result<T, RpcErr> {
+pub(crate) fn with_retry<T>(mut f: impl FnMut() -> Result<T, RpcErr>) -> Result<T, RpcErr> {
     let mut last = None;
     for attempt in 0..3u64 {
         match f() {

@@ -139,6 +139,8 @@ mod admission;
 mod proposal_wire;
 #[cfg(test)]
 mod devnet_tools_tests;
+#[cfg(test)]
+mod treasury_collect_tests;
 
 use crate::genesis::Manifest;
 #[cfg(test)]

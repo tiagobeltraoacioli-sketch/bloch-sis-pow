@@ -66,6 +66,8 @@ mod slashprot;
 mod signer_anchor;
 mod slashing_cli;
 mod store;
+mod treasury_collect;
+mod treasury_spend;
 mod ws_boot;
 #[cfg(feature = "ws-release-anchor")]
 mod ws_release_anchor;
@@ -423,6 +425,14 @@ fn main() {
                 exit(2);
             }
         }
+        // L1 protocol-treasury collection: two-endpoint observation and an
+        // UNSIGNED draft. Never opens a key, never broadcasts.
+        Some("treasury-collect") => {
+            if let Err(error) = treasury_collect::run(&args[1..]) {
+                eprintln!("treasury-collect: {error}");
+                exit(2);
+            }
+        }
         Some("run") => run_cmd(&args[1..]),
         Some(
             cmd @ ("ws-keygen" | "ws-signer-set" | "ws-checkpoint" | "ws-sign" | "ws-envelope"
@@ -500,6 +510,11 @@ fn print_help() {
                tooling): one witness key, one output, priced exactly as\n\
                consensus prices it at inclusion. Writes hex for\n\
                sendrawtransaction; never broadcasts.\n\
+           bloch-pos treasury-collect --help\n\
+               List the L1 protocol treasury's unspent outputs from TWO\n\
+               endpoints and build an UNSIGNED consolidation or payment for\n\
+               the owner to inspect and sign offline. Never signs, never\n\
+               broadcasts.\n\
            bloch-pos devnet-equivocate --help\n\
                DEVNET ONLY. Re-sign a block this keystore proposed with one\n\
                state_root byte flipped and send it to a running node, to\n\
