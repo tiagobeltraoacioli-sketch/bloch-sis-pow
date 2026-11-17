@@ -84,3 +84,30 @@ its checks with the transition and cannot drift from consensus), and bring from 
 counterpart here: the forced-envelope arm (price of entry, gas range), the reserved room, the DA key
 displacement, and their tests. The L2 line's tests for R308-3, R308-2P-2 and R308-3P-1 should then pass
 against the merged door unchanged, or be adapted where a refusal text differs.
+
+## The merge (round 17, `codex/native-l2-dec-merge-r17-20261117`)
+
+The December L2 line is merged onto release `906336fd` as recommended above. On the merged line:
+
+- `engine/admission.rs` `check_l2_funded` (the release's) is the only door of the deposit (0x14), the DA
+  batch (0x15) and the withdrawal claim (0x16), at admission and whenever a pooled entry is judged again
+  (`candidate_is_backed`). The L2 line's mirror for these three kinds (`check_da_recordable`,
+  `check_claim_applicable` and the three arms of `check_l2_funding`) is gone.
+- `check_l2_funding` remains for the forced envelope (0x1C) alone, with `check_l2_applicable`: there is no
+  transition check function for that kind to share yet, so it is still a mirror of
+  `apply_l2_forced_transaction`. Given one of the three other kinds it answers with `check_l2_funded`.
+- The forced envelope's signature is verified by the budgeted verifier of the admission call, like the
+  deposit's (the L2 line used a verifier constructor the release removed).
+- The release's input reservation (`plan_input_conflicts`) runs before the fork's reserved room and the
+  registered DA key's displacement: a forced envelope that re-spends the output of a pooled, backed envelope
+  is refused there and never reaches the displacement rules.
+- The last selection of a proposal (review W1-1) leaves out forced envelopes together with the three other
+  L2 user kinds.
+- Tests: the L2 line's pool-mechanics tests fill a pool with DA batches on an engine without an L2; they
+  open a test-only switch (`l2_filler_test`) so that the released door does not empty the fixture. The L2
+  line's tests of its own mirror are adapted to the released door, reduced to the forced envelope, or
+  removed with the helper they tested; the three kinds' cases of review R308-3 are in
+  `engine/l2_preflight_tests.rs`.
+
+Not done, for the next change of the forced envelope: a `l2_forced_refusal_at` in the committee crate, shared
+with the transition, so that the fourth kind has the same kind of door as the other three.
