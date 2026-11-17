@@ -4160,4 +4160,8 @@ mod l2_tests {
         use super::*;
         include!("ffg_branch_tests.rs");
     }
+    mod isolation_fuzz_tests {
+        use super::*;
+        include!("l2_isolation_fuzz_tests.rs");
+    }
 }

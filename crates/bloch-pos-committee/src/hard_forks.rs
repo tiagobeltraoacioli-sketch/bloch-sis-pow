@@ -410,6 +410,7 @@ pub const GATES_UNARMED_IN_CANONICAL_HISTORY: &[UnarmedGate] = &[
     unarmed!(params::KES_REGISTER_EPOCH_BINDING_EPOCH),
     unarmed!(params::COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH),
     unarmed!(params::L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH),
+    unarmed!(params::L2_FAULT_ISOLATION_ACTIVATION_EPOCH),
 ];
 
 /// The gates of `gates` armed at or below `epoch`, in list order.
