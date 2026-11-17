@@ -1,5 +1,8 @@
 # Bloch Protocol
 
+
+**Branches pushed on 2026-11-17** (which line is what, audited, reviewed or work in progress, and how to verify it): [BRANCHES.md](BRANCHES.md).
+
 > A post-quantum Layer 1. Hybrid lattice signatures on every consensus path.
 > Running **proof of stake** — Genesis-4, live since 2026-08-13.
 
