@@ -111,3 +111,22 @@ The December L2 line is merged onto release `906336fd` as recommended above. On 
 
 Not done, for the next change of the forced envelope: a `l2_forced_refusal_at` in the committee crate, shared
 with the transition, so that the fourth kind has the same kind of door as the other three.
+
+## Up to date with `main` (round 18)
+
+The merged line then took bloch-sis-pow `main` `857a10ac` (the deployed node release `0067547f` = `906336fd` + 49
+node commits) by a merge commit, `f596fb78`; nothing published was rewritten. Of the files both sides changed
+since `906336fd`, only `bloch-pos-node/src/rpc/tests.rs` conflicted (both appended tests; both kept); the door
+described above is unchanged by it: `0067547f`'s admission changes (source budgets for funded delegation and
+commission updates, the lifecycle verification charge, the KES registration born expired) touch other kinds.
+
+Restated tests (round 18): the DA window and duplicate cases of the removed
+`r308_3p_1_a_da_batch_repeating_a_recorded_commitment_is_not_backed` are asserted on
+`l2_settlement::State::check_data_availability`, the one function the door (through
+`l2_data_availability_refusal_at`) and consensus (`record_data_availability`) both call
+(`transition/l2_settlement_tests.rs`, `r308_3p_1_the_da_rule_the_door_shares_with_consensus`, with the L2
+features). The removed claim-mapping test (`r308_3p_1_a_claim_consensus_applies_stays_backed`) has no
+function to be restated on: the released door maps the claim refusals inline. One difference of that mapping
+from the December line's is recorded for review: `ReleaseOutput`, `Attestation` and `AttestationRequired` are
+answered `Invalid`, not retryable; for `ReleaseOutput` that matters only at the first epoch of an armed L2
+revenue gate (the release output is judged on the head state's epoch).
