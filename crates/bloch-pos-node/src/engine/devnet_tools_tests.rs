@@ -51,7 +51,8 @@ fn drive_one_attested_block(engine: &mut Engine, epoch: u64) {
 /// in, where a valid vote spares it (finality.rs, "cast a valid vote —
 /// spared"). Epoch 0 gets a plain block at slot 1: nobody attests in epoch 0
 /// (genesis is justified by definition, `attest` returns).
-fn drive_to_epoch(engine: &mut Engine, target: u64) {
+/// Shared with `treasury_collect_tests.rs` (same flag-day cadence).
+pub(super) fn drive_to_epoch(engine: &mut Engine, target: u64) {
     {
         let _clock = super::validator_lifecycle::clock_at(1);
         engine.wall_slot = 1;
