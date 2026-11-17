@@ -650,6 +650,7 @@ fn print_help() {
                          [--mesh-security plain|offer|require]\n\
                          [--mesh-allow <file>]\n\
                          [--mesh-require-authenticated]\n\
+                         [--mesh-plain-allow <file>]\n\
                Post-quantum mesh security (default plain = unchanged wire):\n\
                hybrid ML-KEM-768 + X25519 key exchange, ML-DSA-65 transport\n\
                identities, ChaCha20-Poly1305 records. The handshake proves\n\
@@ -683,6 +684,13 @@ fn print_help() {
                           or listed identities.\n\
                --mesh-require-authenticated refuses to start unless the mode\n\
                is require with an allow-list or pins, instead of warning.\n\
+               --mesh-plain-allow <file> (with require): one IP address per\n\
+               line; peers at those addresses are treated as under offer\n\
+               (handshake first, plain accepted), everybody else as under\n\
+               require. A staging aid for peers that upgrade later, not a\n\
+               security setting: nothing is guaranteed on those sessions.\n\
+               Accepted and without effect under offer.\n\
+               See docs/operations/MESH-SECURITY-REQUIRE-MIGRATION.md.\n\
                Roll out plain -> offer -> require, one node at a time, then\n\
                add identities and --mesh-require-authenticated.\n\
          \n\
@@ -1817,7 +1825,7 @@ pub(crate) fn decide_transport(args: &[String]) -> Result<TransportPlan, String>
         }
     }
     if !runs_devnet {
-        for f in ["--listen", "--listen-addr", "--peers", "--mesh-security", "--mesh-allow", "--mesh-require-authenticated"] {
+        for f in ["--listen", "--listen-addr", "--peers", "--mesh-security", "--mesh-allow", "--mesh-require-authenticated", "--mesh-plain-allow"] {
             if present(f) {
                 contradictions.push(f.to_string());
             }
@@ -2120,7 +2128,16 @@ fn run_cmd(args: &[String]) {
         allow: arg_value(args, "--mesh-allow").map(PathBuf::from),
         pins: peer_pins,
         require_authenticated: args.iter().any(|a| a == "--mesh-require-authenticated"),
+        plain_allow: arg_value(args, "--mesh-plain-allow").map(PathBuf::from),
     };
+    if mesh.plain_allow.is_some() && mesh.mode == mesh_pq::Mode::Plain {
+        eprintln!("run: --mesh-plain-allow needs --mesh-security require (or offer, where it has no effect)");
+        exit(2);
+    }
+    if mesh.plain_allow.is_some() && mesh.require_authenticated {
+        eprintln!("run: --mesh-plain-allow cannot be combined with --mesh-require-authenticated");
+        exit(2);
+    }
     if mesh.allow.is_some() && mesh.mode == mesh_pq::Mode::Plain {
         eprintln!("run: --mesh-allow needs --mesh-security offer or require");
         exit(2);

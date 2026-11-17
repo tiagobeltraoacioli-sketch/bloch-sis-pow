@@ -503,6 +503,9 @@ pub struct MeshPlan {
     /// `--mesh-require-authenticated`: refuse to start unless every peer
     /// must present an expected identity.
     pub require_authenticated: bool,
+    /// `--mesh-plain-allow`: IP addresses whose peers may still connect in
+    /// plain under `require` (staged migration).
+    pub plain_allow: Option<PathBuf>,
 }
 
 fn now_ms() -> u64 {
@@ -9507,7 +9510,7 @@ fn start_devnet(
     head_slot: &Arc<AtomicU64>,
     inflight: &Arc<net::QueueBudget>,
 ) -> io::Result<net::DevnetMesh> {
-    let security = Arc::new(crate::mesh_pq::MeshSecurity::load(
+    let security = crate::mesh_pq::MeshSecurity::load(
         cfg.mesh.mode,
         genesis_id,
         &cfg.data_dir,
@@ -9515,7 +9518,19 @@ fn start_devnet(
         &cfg.peers,
         &cfg.mesh.pins,
         cfg.mesh.require_authenticated,
-    )?);
+    )?;
+    let security = Arc::new(match cfg.mesh.plain_allow.as_deref() {
+        Some(path) => security.with_plain_allow_file(path, cfg.mesh.require_authenticated)?,
+        None => security,
+    });
+    crate::metrics::NodeMetrics::set(
+        &crate::metrics::NODE.mesh_security_mode,
+        match security.mode() {
+            crate::mesh_pq::Mode::Plain => 0,
+            crate::mesh_pq::Mode::Offer => 1,
+            crate::mesh_pq::Mode::Require => 2,
+        },
+    );
     println!("mesh security: {}", security.summary());
     // Said twice, like the transport line: before anything binds, and again
     // once the listener is up, so it is still on screen under the bind

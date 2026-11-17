@@ -1696,6 +1696,95 @@ fn log_refusal(direction: &str, peer: &str, e: &std::io::Error) {
     eprintln!("net: mesh handshake {direction} {peer} refused: {e}");
 }
 
+/// One mesh session in the `bloch_pos_mesh_*_sessions` gauges, from the
+/// moment it is counted until this guard is dropped.
+struct SessionGauge(&'static AtomicU64);
+
+impl SessionGauge {
+    fn open(live: &'static AtomicU64, total: &'static AtomicU64) -> Self {
+        live.fetch_add(1, Ordering::Relaxed);
+        total.fetch_add(1, Ordering::Relaxed);
+        SessionGauge(live)
+    }
+
+    fn sealed() -> Self {
+        Self::open(&crate::metrics::NODE.mesh_sealed_sessions, &crate::metrics::NODE.mesh_sealed_sessions_total)
+    }
+
+    fn plain_outbound() -> Self {
+        Self::open(
+            &crate::metrics::NODE.mesh_plain_sessions_outbound,
+            &crate::metrics::NODE.mesh_plain_sessions_outbound_total,
+        )
+    }
+
+    fn plain_inbound() -> Self {
+        Self::open(
+            &crate::metrics::NODE.mesh_plain_sessions_inbound,
+            &crate::metrics::NODE.mesh_plain_sessions_inbound_total,
+        )
+    }
+}
+
+impl Drop for SessionGauge {
+    fn drop(&mut self) {
+        // Saturating: a test that resets the registry must not wrap a gauge.
+        let _ = self.0.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| Some(live.saturating_sub(1)));
+    }
+}
+
+/// The migration lines an operator reads to decide when `require` is safe:
+/// which peers still run plain, and which excepted addresses no longer need
+/// their exception. At most one line per peer per [`MIGRATION_LOG_EVERY`],
+/// and a bounded number of peers, so reconnects and strangers cannot flood
+/// the log or grow the table.
+const MIGRATION_LOG_EVERY: Duration = Duration::from_secs(600);
+const MIGRATION_LOG_PEERS: usize = 256;
+
+fn migration_log_due(key: String) -> bool {
+    static LAST: Mutex<Option<std::collections::HashMap<String, Instant>>> = Mutex::new(None);
+    let now = Instant::now();
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let last = last.get_or_insert_with(std::collections::HashMap::new);
+    if last.get(&key).is_some_and(|t| now.saturating_duration_since(*t) < MIGRATION_LOG_EVERY) {
+        return false;
+    }
+    if last.len() >= MIGRATION_LOG_PEERS && !last.contains_key(&key) {
+        last.retain(|_, t| now.saturating_duration_since(*t) < MIGRATION_LOG_EVERY);
+        if last.len() >= MIGRATION_LOG_PEERS {
+            return false;
+        }
+    }
+    last.insert(key, now);
+    true
+}
+
+/// A session with `peer` runs in plain although this node offers the
+/// handshake. Not said by a `plain` node: it never offered anything.
+fn log_plain_session(security: &crate::mesh_pq::MeshSecurity, direction: &str, peer: &str, ip: Option<std::net::IpAddr>) {
+    use crate::mesh_pq::Mode;
+    let why = match security.mode() {
+        Mode::Plain => return,
+        Mode::Offer => "accepted because this node runs --mesh-security offer; `require` would refuse this peer",
+        Mode::Require => "accepted only because its address is listed in --mesh-plain-allow",
+    };
+    if migration_log_due(format!("plain {direction} {peer}")) {
+        let at = ip.map(|ip| format!(" (address {ip})")).unwrap_or_default();
+        eprintln!("net: mesh session {direction} {peer}{at} is PLAIN, not encrypted: the peer did not complete the post-quantum handshake; {why}");
+    }
+}
+
+/// A sealed session with a peer whose address is still excepted.
+fn log_exception_unused(security: &crate::mesh_pq::MeshSecurity, direction: &str, ip: Option<std::net::IpAddr>) {
+    let Some(ip) = ip.filter(|ip| security.is_plain_exception(Some(*ip))) else { return };
+    if migration_log_due(format!("sealed {ip}")) {
+        eprintln!(
+            "net: mesh session {direction} {ip} is sealed although {ip} is listed in --mesh-plain-allow: \
+             that peer speaks the handshake now; remove the address from the list once every node at it does"
+        );
+    }
+}
+
 /// How long a dialer waits before it tries again an address that turned out
 /// to be this node itself.
 const SELF_DIAL_RETRY: Duration = Duration::from_secs(60);
@@ -2371,6 +2460,9 @@ pub fn start(
                                     log_identity_conflict("from", &address.to_string(), &e)
                                 }
                                 None => {
+                                    if crate::mesh_pq::plain_peer_refusal(&e) {
+                                        crate::metrics::NodeMetrics::inc(&crate::metrics::NODE.mesh_plain_refused_total);
+                                    }
                                     log_refusal("from", &address.to_string(), &e);
                                     // Not this node's own dial or identity:
                                     // a failure of the remote source.
@@ -2389,6 +2481,16 @@ pub fn start(
                     if session.authenticated() && !slot.mark_authenticated() {
                         return;
                     }
+                    // Counted until this thread leaves. A plain session is
+                    // counted on its first well-formed frame instead: the
+                    // listener cannot tell a legacy peer from a port scan
+                    // before that.
+                    let session_is_plain = matches!(session, crate::mesh_pq::Session::Plain);
+                    let _sealed_session = (!session_is_plain).then(|| {
+                        log_exception_unused(&security, "from", Some(address.ip()));
+                        SessionGauge::sealed()
+                    });
+                    let mut plain_session: Option<SessionGauge> = None;
                     let Ok(shutdown_socket) = sock.try_clone() else { return };
                     // Reading and writing need separate handles: the reader
                     // blocks in `read_frame` for as long as the peer is quiet,
@@ -2439,6 +2541,10 @@ pub fn start(
                     loop {
                         match reader.read_frame() {
                             Ok(frame) => {
+                                if session_is_plain && plain_session.is_none() {
+                                    plain_session = Some(SessionGauge::plain_inbound());
+                                    log_plain_session(&security, "from", &address.ip().to_string(), None);
+                                }
                                 if frame.first() == Some(&FRAME_GET_BLOCKS) {
                                     // A request the limiter or the worker pool
                                     // refused is not activity. One a worker
@@ -2564,8 +2670,13 @@ pub fn start(
                     *peers.entry(source).or_insert(0) += 1;
                 }
             }
-            let session = if fallback_plain {
-                fallback_plain = false;
+            let peer_ip = sock.peer_addr().ok().map(|address| address.ip());
+            // Under `require` a plain session exists only for an address in
+            // --mesh-plain-allow, and the name dialed may resolve somewhere
+            // else on this attempt than on the one that asked for the
+            // fallback.
+            let use_plain = std::mem::take(&mut fallback_plain) && security.accepts_plain(peer_ip);
+            let session = if use_plain {
                 // A legacy node keeps the connection open and waits for a
                 // frame. A listener that had no slot closed it already.
                 if closed_at_once(&sock, plain_probe_wait(connect_took)) {
@@ -2581,7 +2692,9 @@ pub fn start(
                 // Never for a pinned peer: a pin says the peer speaks the
                 // handshake, so a close here is not a legacy node, and a
                 // plain session would skip the identity check the pin asks for.
-                Err(e) if security.mode() == crate::mesh_pq::Mode::Offer
+                // `offer`, or `require` with this address excepted.
+                Err(e) if security.mode() != crate::mesh_pq::Mode::Plain
+                    && security.accepts_plain(peer_ip)
                     && !security.is_pinned(&addr)
                     && closed_on_handshake(&e) => {
                     closed_handshakes = closed_handshakes.saturating_add(1);
@@ -2617,6 +2730,11 @@ pub fn start(
                     if crate::mesh_pq::own_identity_refusal(&e).is_some() {
                         log_identity_conflict("to", &addr, &e);
                     } else {
+                        // What a legacy peer does to the handshake, with no
+                        // plain fallback allowed for it.
+                        if closed_on_handshake(&e) && !security.is_pinned(&addr) {
+                            crate::metrics::NodeMetrics::inc(&crate::metrics::NODE.mesh_plain_refused_total);
+                        }
                         log_refusal("to", &addr, &e);
                     }
                     // Not a busy loop against a peer that will refuse again.
@@ -2637,6 +2755,14 @@ pub fn start(
                 sealed_before = true;
                 closed_handshakes = 0;
             }
+            // Counted until this connection's writer returns below.
+            let _session_gauge = if sealed {
+                log_exception_unused(&security, "to", peer_ip);
+                SessionGauge::sealed()
+            } else {
+                log_plain_session(&security, "to", &addr, peer_ip);
+                SessionGauge::plain_outbound()
+            };
             let Ok((reader, writer)) = split_session(sock, session) else { continue };
             let session_started = Instant::now();
             let connection = Arc::new(Connection {
@@ -3086,6 +3212,40 @@ mod tests {
         let member_id = member.identity_id().unwrap();
         assert!(sync_across(gate(member_id), member, "allow-member"));
         assert!(!sync_across(gate(member_id), MeshSecurity::ephemeral(Mode::Require, net, None), "allow-stranger"));
+    }
+
+    #[test]
+    fn require_with_a_plain_exception_keeps_a_listed_legacy_peer_and_no_other() {
+        use crate::mesh_pq::{MeshSecurity, Mode};
+        use crate::metrics::NODE;
+        let net = [9; 32];
+        let require = || MeshSecurity::ephemeral(Mode::Require, net, None);
+        let here: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let elsewhere: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let count = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+
+        // A legacy peer at an excepted address stays connected, whether it
+        // dials or is dialed, and the plain sessions are counted.
+        let (plain_in, plain_out) = (count(&NODE.mesh_plain_sessions_inbound_total), count(&NODE.mesh_plain_sessions_outbound_total));
+        assert!(sync_across(require().with_plain_allow_ip(here), MeshSecurity::plain(), "req-except-in"));
+        assert!(count(&NODE.mesh_plain_sessions_inbound_total) > plain_in);
+        assert!(sync_across(MeshSecurity::plain(), require().with_plain_allow_ip(here), "req-except-out"));
+        assert!(count(&NODE.mesh_plain_sessions_outbound_total) > plain_out);
+
+        // An exception for another address changes nothing here: refused in
+        // both directions, and the refusals are counted.
+        let refused = count(&NODE.mesh_plain_refused_total);
+        assert!(!sync_across(require().with_plain_allow_ip(elsewhere), MeshSecurity::plain(), "req-other-in"));
+        assert!(count(&NODE.mesh_plain_refused_total) > refused);
+        let refused = count(&NODE.mesh_plain_refused_total);
+        assert!(!sync_across(MeshSecurity::plain(), require().with_plain_allow_ip(elsewhere), "req-other-out"));
+        assert!(count(&NODE.mesh_plain_refused_total) > refused);
+
+        // Upgraded peers are sealed with an excepting node as with any other.
+        let sealed = count(&NODE.mesh_sealed_sessions_total);
+        assert!(sync_across(require().with_plain_allow_ip(here), require(), "req-except-sealed"));
+        assert!(sync_across(require().with_plain_allow_ip(here), MeshSecurity::ephemeral(Mode::Offer, net, None), "req-except-offer"));
+        assert!(count(&NODE.mesh_sealed_sessions_total) >= sealed + 4);
     }
 
     #[test]
