@@ -134,14 +134,20 @@ fn run() -> Result<(), String> {
     ];
     let mut a = BTreeMap::new();
     for pair in args.chunks_exact(2) {
-        if !allowed.contains(&pair[0].as_str()) || a.insert(pair[0].as_str(), pair[1].as_str()).is_some() {
+        if !allowed.contains(&pair[0].as_str())
+            || a.insert(pair[0].as_str(), pair[1].as_str()).is_some()
+        {
             return Err("Unknown or duplicate option".into());
         }
     }
     if a.len() != allowed.len() {
         return Err("Missing options (all eight are required)".into());
     }
-    let get = |name: &str| a.get(name).copied().ok_or_else(|| format!("Missing {name}"));
+    let get = |name: &str| {
+        a.get(name)
+            .copied()
+            .ok_or_else(|| format!("Missing {name}"))
+    };
     let out = get("--out")?;
     if std::fs::symlink_metadata(out).is_ok() {
         return Err("Output exists".into());
@@ -194,7 +200,11 @@ mod tests {
     fn legacy(seed: u8) -> Keypair {
         let (pk, sk) = crypto::generate_keypair_from_seed(&[seed; 32]).unwrap();
         let raw = pk[4..].to_vec();
-        Keypair { private_key: sk[4..].to_vec(), public_key: raw.clone(), address: crypto::address_from_pubkey(&raw, false) }
+        Keypair {
+            private_key: sk[4..].to_vec(),
+            public_key: raw.clone(),
+            address: crypto::address_from_pubkey(&raw, false),
+        }
     }
     fn carried(raw: &[u8]) -> [u8; 32] {
         let h: [u8; 32] = Sha3_256::digest(raw).into();
@@ -210,16 +220,44 @@ mod tests {
             epoch: 9_000,
             base_fee: 10,
             endpoints: vec![
-                EndpointRead { addr: "a:1".into(), head_slot: 288_000, head_block: [1; 32], finalized_epoch: 8_998, finalized_root: [2; 32] },
-                EndpointRead { addr: "b:1".into(), head_slot: 288_000, head_block: [1; 32], finalized_epoch: 8_998, finalized_root: [2; 32] },
+                EndpointRead {
+                    addr: "a:1".into(),
+                    head_slot: 288_000,
+                    head_block: [1; 32],
+                    finalized_epoch: 8_998,
+                    finalized_root: [2; 32],
+                },
+                EndpointRead {
+                    addr: "b:1".into(),
+                    head_slot: 288_000,
+                    head_block: [1; 32],
+                    finalized_epoch: 8_998,
+                    finalized_root: [2; 32],
+                },
             ],
             page_total: 2,
             utxos: vec![
-                EutxoEntry { txid: [5; 32], vout: 2, value: 150_000, script_hash: t },
-                EutxoEntry { txid: [6; 32], vout: 2, value: 25_000, script_hash: t },
+                EutxoEntry {
+                    txid: [5; 32],
+                    vout: 2,
+                    value: 150_000,
+                    script_hash: t,
+                },
+                EutxoEntry {
+                    txid: [6; 32],
+                    vout: 2,
+                    value: 25_000,
+                    script_hash: t,
+                },
             ],
         };
-        let intent = Intent { pay: vec![], change_to: t, tip: 0, max_fee_sat: 10_000, max_inputs: 1_000 };
+        let intent = Intent {
+            pay: vec![],
+            change_to: t,
+            tip: 0,
+            max_fee_sat: 10_000,
+            max_inputs: 1_000,
+        };
         let plan = build_plan(&obs, &BTreeSet::new(), &key.public_key, &intent).unwrap();
         (obs, plan.tx, plan.signing_root)
     }
@@ -231,7 +269,13 @@ mod tests {
         let none = BTreeSet::new();
         for n in 0..4 {
             let mut bad = tx.clone();
-            if let PosTransaction::TransferV2 { outputs, tip_millisat_per_gas, inputs, .. } = &mut bad {
+            if let PosTransaction::TransferV2 {
+                outputs,
+                tip_millisat_per_gas,
+                inputs,
+                ..
+            } = &mut bad
+            {
                 match n {
                     0 => outputs[0].value -= 1,
                     1 => outputs[0].script_hash[0] ^= 1,
@@ -239,13 +283,27 @@ mod tests {
                     _ => inputs[0].vout = 3,
                 }
             }
-            assert!(sign_checked(&mut bad, &obs, &none, &root, 10_000, || panic!("must not unlock")).is_err(), "case {n}");
+            assert!(
+                sign_checked(&mut bad, &obs, &none, &root, 10_000, || panic!(
+                    "must not unlock"
+                ))
+                .is_err(),
+                "case {n}"
+            );
         }
         let mut same = tx.clone();
-        assert!(sign_checked(&mut same, &obs, &none, &[0; 32], 10_000, || panic!("must not unlock")).is_err());
+        assert!(
+            sign_checked(&mut same, &obs, &none, &[0; 32], 10_000, || panic!(
+                "must not unlock"
+            ))
+            .is_err()
+        );
         // A fee cap below the exact fee: refused before unlock.
         let mut same = tx.clone();
-        assert!(sign_checked(&mut same, &obs, &none, &root, 1, || panic!("must not unlock")).is_err());
+        assert!(sign_checked(&mut same, &obs, &none, &root, 1, || panic!(
+            "must not unlock"
+        ))
+        .is_err());
     }
 
     #[test]
@@ -260,7 +318,12 @@ mod tests {
         assert!(shown.contains("Signature present: true"));
         assert_eq!(good.txid(), tx.txid());
         // Already signed: refused before unlock.
-        assert!(sign_checked(&mut good.clone(), &obs, &none, &root, 10_000, || panic!("must not unlock")).is_err());
+        assert!(
+            sign_checked(&mut good.clone(), &obs, &none, &root, 10_000, || panic!(
+                "must not unlock"
+            ))
+            .is_err()
+        );
         // A flipped signature byte fails the post-signature inspection.
         if let PosTransaction::TransferV2 { keys, .. } = &mut good {
             keys[0].signature[40] ^= 1;
@@ -276,7 +339,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
         let wallet = dir.join("wallet.json");
-        key.save_encrypted(&wallet, "disposable test wallet passphrase").unwrap();
+        key.save_encrypted(&wallet, "disposable test wallet passphrase")
+            .unwrap();
         let pass = dir.join("pass");
         std::fs::write(&pass, "disposable test wallet passphrase").unwrap();
         #[cfg(unix)]
@@ -286,7 +350,9 @@ mod tests {
         }
         let mut t1 = tx.clone();
         let p = |x: &std::path::Path| x.to_str().unwrap().to_owned();
-        let r = sign_checked(&mut t1, &obs, &BTreeSet::new(), &root, 10_000, || unlock_wallet(&p(&wallet), &p(&pass)));
+        let r = sign_checked(&mut t1, &obs, &BTreeSet::new(), &root, 10_000, || {
+            unlock_wallet(&p(&wallet), &p(&pass))
+        });
         #[cfg(unix)]
         assert!(r.unwrap_err().contains("owner-only"));
         #[cfg(unix)]
@@ -295,7 +361,10 @@ mod tests {
             std::fs::set_permissions(&pass, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         let mut t2 = tx.clone();
-        sign_checked(&mut t2, &obs, &BTreeSet::new(), &root, 10_000, || unlock_wallet(&p(&wallet), &p(&pass))).unwrap();
+        sign_checked(&mut t2, &obs, &BTreeSet::new(), &root, 10_000, || {
+            unlock_wallet(&p(&wallet), &p(&pass))
+        })
+        .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

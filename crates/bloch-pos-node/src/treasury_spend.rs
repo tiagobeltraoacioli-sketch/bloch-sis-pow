@@ -121,7 +121,9 @@ pub fn parse_destination(text: &str) -> Result<[u8; 32], String> {
     let script = if let Some(body) = text.strip_prefix(bloch_crypto::core::MAINNET_PREFIX) {
         let raw = codec::unhex(body).map_err(|e| format!("address {text}: {e}"))?;
         if raw.len() != 24 {
-            return Err(format!("address {text}: expected 20 bytes and a 4-byte checksum"));
+            return Err(format!(
+                "address {text}: expected 20 bytes and a 4-byte checksum"
+            ));
         }
         let mut h = [0u8; 20];
         h.copy_from_slice(&raw[..20]);
@@ -132,11 +134,14 @@ pub fn parse_destination(text: &str) -> Result<[u8; 32], String> {
         s[..20].copy_from_slice(&h);
         s
     } else if text.starts_with(bloch_crypto::core::TESTNET_PREFIX) {
-        return Err(format!("address {text}: a testnet address is not a mainnet destination"));
+        return Err(format!(
+            "address {text}: a testnet address is not a mainnet destination"
+        ));
     } else {
         let raw = codec::unhex(text).map_err(|e| format!("script {text}: {e}"))?;
-        raw.try_into()
-            .map_err(|_| format!("script {text}: expected 32 bytes (64 hex digits) or a bloch1q address"))?
+        raw.try_into().map_err(|_| {
+            format!("script {text}: expected 32 bytes (64 hex digits) or a bloch1q address")
+        })?
     };
     if script == [0u8; 32] {
         return Err("the zero script is not a destination (nobody can spend it)".into());
@@ -175,12 +180,16 @@ pub struct Observation {
 fn field<'a>(line: &'a str, name: &str) -> Result<Vec<&'a str>, String> {
     let mut parts = line.split(' ');
     if parts.next() != Some(name) {
-        return Err(format!("observation: expected `{name}` line, found {line:?}"));
+        return Err(format!(
+            "observation: expected `{name}` line, found {line:?}"
+        ));
     }
     Ok(parts.collect())
 }
 fn h32(text: &str) -> Result<[u8; 32], String> {
-    codec::unhex(text)?.try_into().map_err(|_| format!("expected 32 bytes: {text}"))
+    codec::unhex(text)?
+        .try_into()
+        .map_err(|_| format!("expected 32 bytes: {text}"))
 }
 fn num<T: std::str::FromStr>(text: &str) -> Result<T, String> {
     if text.is_empty() || (text.len() > 1 && text.starts_with('0')) || text.starts_with('+') {
@@ -197,7 +206,10 @@ impl Observation {
         out.push_str(OBSERVATION_MAGIC);
         out.push('\n');
         out.push_str(&format!("treasury {}\n", codec::hex32(&self.treasury)));
-        out.push_str(&format!("genesis-sha3 {}\n", codec::hex32(&self.genesis_sha3)));
+        out.push_str(&format!(
+            "genesis-sha3 {}\n",
+            codec::hex32(&self.genesis_sha3)
+        ));
         out.push_str(&format!("epoch {}\n", self.epoch));
         out.push_str(&format!("base-fee {}\n", self.base_fee));
         out.push_str(&format!("endpoints {}\n", self.endpoints.len()));
@@ -233,12 +245,17 @@ impl Observation {
         let all: Vec<&str> = text.split('\n').collect();
         let mut at = 0usize;
         let mut next = || -> Result<&str, String> {
-            let line = all.get(at).copied().ok_or_else(|| "observation: truncated".to_string())?;
+            let line = all
+                .get(at)
+                .copied()
+                .ok_or_else(|| "observation: truncated".to_string())?;
             at = at.saturating_add(1);
             Ok(line)
         };
         if next()? != OBSERVATION_MAGIC {
-            return Err(format!("observation: first line must be `{OBSERVATION_MAGIC}`"));
+            return Err(format!(
+                "observation: first line must be `{OBSERVATION_MAGIC}`"
+            ));
         }
         let one = |l: &str, name: &str| -> Result<String, String> {
             let v = field(l, name)?;
@@ -296,7 +313,15 @@ impl Observation {
         if next()? != "end" || next()? != "" || next().is_ok() {
             return Err("observation: must end with one `end` line".into());
         }
-        let obs = Observation { treasury, genesis_sha3, epoch, base_fee, endpoints, page_total, utxos };
+        let obs = Observation {
+            treasury,
+            genesis_sha3,
+            epoch,
+            base_fee,
+            endpoints,
+            page_total,
+            utxos,
+        };
         obs.check_agreement()?;
         Ok(obs)
     }
@@ -385,7 +410,9 @@ pub struct Plan {
 /// `ScriptMismatch`. Said in the refusal so the owner exports the right form.
 pub fn check_owner_key(pubkey: &[u8], treasury: &[u8; 32], epoch: u64) -> Result<(), String> {
     if !bloch_crypto::crypto::is_spend_public_key_admissible(pubkey, hf3_slh_suite_active(epoch)) {
-        return Err("wrong key: not a live hybrid spend public key (ML-DSA-65 and Falcon-1024)".into());
+        return Err(
+            "wrong key: not a live hybrid spend public key (ML-DSA-65 and Falcon-1024)".into(),
+        );
     }
     let hash: [u8; 32] = Sha3_256::digest(pubkey).into();
     if !key_opens(&hash, treasury) {
@@ -427,7 +454,13 @@ pub fn reserved_tx_bytes(tx: &PosTransaction) -> Result<u64, String> {
         .ok_or_else(|| "size overflow".to_string())
 }
 
-fn price(pubkey: &[u8], tx_bytes: u64, base_fee: u128, tip: u128, epoch: u64) -> Result<(TxCharge, u64), String> {
+fn price(
+    pubkey: &[u8],
+    tx_bytes: u64,
+    base_fee: u128,
+    tip: u128,
+    epoch: u64,
+) -> Result<(TxCharge, u64), String> {
     if tip > fee_market::MAX_TIP_MILLISAT_PER_GAS {
         return Err("tip exceeds the consensus maximum".into());
     }
@@ -532,7 +565,12 @@ pub fn build_plan(
         if protected.contains(&(u.txid, u.vout)) {
             excluded.push((u, Exclusion::GenesisAllocation));
         } else if u.value <= marginal {
-            excluded.push((u, Exclusion::Uneconomic { marginal_fee_sat: marginal }));
+            excluded.push((
+                u,
+                Exclusion::Uneconomic {
+                    marginal_fee_sat: marginal,
+                },
+            ));
         } else if inputs.len() >= intent.max_inputs {
             excluded.push((u, Exclusion::InputCap));
         } else {
@@ -548,12 +586,22 @@ pub fn build_plan(
     // Size depends on the output COUNT only (values are fixed-width), so
     // draft with a change output of 1 sat, measure, price, then fill it.
     let mut outputs = intent.pay.clone();
-    outputs.push(TransferOutput { value: 1, script_hash: intent.change_to });
+    outputs.push(TransferOutput {
+        value: 1,
+        script_hash: intent.change_to,
+    });
     let mut tx = PosTransaction::TransferV2 {
-        keys: vec![WitnessKey { pubkey: pubkey.to_vec(), signature: Vec::new() }],
+        keys: vec![WitnessKey {
+            pubkey: pubkey.to_vec(),
+            signature: Vec::new(),
+        }],
         inputs: inputs
             .iter()
-            .map(|u| TransferInputV2 { txid: u.txid, vout: u.vout, key_index: 0 })
+            .map(|u| TransferInputV2 {
+                txid: u.txid,
+                vout: u.vout,
+                key_index: 0,
+            })
             .collect(),
         outputs,
         tx_bytes: 0,
@@ -575,20 +623,35 @@ pub fn build_plan(
         );
     }
     if fee > intent.max_fee_sat {
-        return Err(format!("the exact fee {fee} sat exceeds --max-fee {} sat", intent.max_fee_sat));
+        return Err(format!(
+            "the exact fee {fee} sat exceeds --max-fee {} sat",
+            intent.max_fee_sat
+        ));
     }
     if reserved > MAX_DRAFT_TX_BYTES {
         return Err(format!("declared size {reserved} exceeds the draft cap {MAX_DRAFT_TX_BYTES}; lower --max-inputs"));
     }
-    if let PosTransaction::TransferV2 { tx_bytes, outputs, .. } = &mut tx {
+    if let PosTransaction::TransferV2 {
+        tx_bytes, outputs, ..
+    } = &mut tx
+    {
         *tx_bytes = reserved;
         let last = outputs.last_mut().ok_or("missing change output")?;
-        last.value = u64::try_from(change).map_err(|_| "change does not fit one output".to_string())?;
+        last.value =
+            u64::try_from(change).map_err(|_| "change does not fit one output".to_string())?;
         check_output(last, "change")?;
     }
     let root = signing_root(&tx, obs.epoch)?;
     let txid = tx.txid();
-    let plan = Plan { tx, inputs, excluded, fee_sat: fee, input_sum_sat: input_sum, signing_root: root, txid };
+    let plan = Plan {
+        tx,
+        inputs,
+        excluded,
+        fee_sat: fee,
+        input_sum_sat: input_sum,
+        signing_root: root,
+        txid,
+    };
     // The draft must pass the same inspection the signer runs.
     inspect(obs, protected, &plan.tx, intent.max_fee_sat)?;
     Ok(plan)
@@ -621,7 +684,14 @@ pub fn inspect(
 ) -> Result<Inspection, String> {
     obs.check_agreement()?;
     check_epoch(obs.epoch)?;
-    let PosTransaction::TransferV2 { keys, inputs, outputs, tx_bytes, tip_millisat_per_gas } = tx else {
+    let PosTransaction::TransferV2 {
+        keys,
+        inputs,
+        outputs,
+        tx_bytes,
+        tip_millisat_per_gas,
+    } = tx
+    else {
         return Err("expected a TransferV2 (wire tag 0x06)".into());
     };
     let [key] = keys.as_slice() else {
@@ -659,7 +729,11 @@ pub fn inspect(
             ));
         };
         if u.script_hash != obs.treasury {
-            return Err(format!("foreign output {}:{} as an input", codec::hex32(&i.txid), i.vout));
+            return Err(format!(
+                "foreign output {}:{} as an input",
+                codec::hex32(&i.txid),
+                i.vout
+            ));
         }
         spent.push((*u).clone());
     }
@@ -672,7 +746,13 @@ pub fn inspect(
     if *tx_bytes > MAX_DRAFT_TX_BYTES {
         return Err("declared size above the draft cap".into());
     }
-    let (charge, fee) = price(&key.pubkey, *tx_bytes, obs.base_fee, *tip_millisat_per_gas, obs.epoch)?;
+    let (charge, fee) = price(
+        &key.pubkey,
+        *tx_bytes,
+        obs.base_fee,
+        *tip_millisat_per_gas,
+        obs.epoch,
+    )?;
     let input_sum: u128 = spent.iter().map(|u| u128::from(u.value)).sum();
     let output_sum: u128 = outputs.iter().map(|o| u128::from(o.value)).sum();
     if output_sum.checked_add(u128::from(fee)) != Some(input_sum) {
@@ -681,7 +761,9 @@ pub fn inspect(
         ));
     }
     if fee > max_fee_sat {
-        return Err(format!("the exact fee {fee} sat exceeds --max-fee {max_fee_sat} sat"));
+        return Err(format!(
+            "the exact fee {fee} sat exceeds --max-fee {max_fee_sat} sat"
+        ));
     }
     let root = signing_root(tx, obs.epoch)?;
     let signed = !key.signature.is_empty();
@@ -694,7 +776,9 @@ pub fn inspect(
                 hf3_slh_suite_active(obs.epoch),
             ))
     {
-        return Err("the signature does not verify over the signing root (consensus spend verifier)".into());
+        return Err(
+            "the signature does not verify over the signing root (consensus spend verifier)".into(),
+        );
     }
     Ok(Inspection {
         inputs: spent,
@@ -712,7 +796,9 @@ pub fn inspect(
 }
 
 fn label(script: &[u8; 32], treasury: &[u8; 32]) -> String {
-    let addr = carried_address(script).map(|a| format!(" ({a})")).unwrap_or_default();
+    let addr = carried_address(script)
+        .map(|a| format!(" ({a})"))
+        .unwrap_or_default();
     if script == treasury {
         format!("{}{addr} = THE TREASURY ITSELF", codec::hex32(script))
     } else {
@@ -724,8 +810,14 @@ fn label(script: &[u8; 32], treasury: &[u8; 32]) -> String {
 /// parts, the root and the txid. No field is elided.
 pub fn render(obs: &Observation, i: &Inspection) -> String {
     let mut s = String::new();
-    s.push_str(&format!("Treasury script: {}\n", label(&obs.treasury, &obs.treasury)));
-    s.push_str(&format!("Observation SHA3-256: {}\n", codec::hex32(&obs.digest())));
+    s.push_str(&format!(
+        "Treasury script: {}\n",
+        label(&obs.treasury, &obs.treasury)
+    ));
+    s.push_str(&format!(
+        "Observation SHA3-256: {}\n",
+        codec::hex32(&obs.digest())
+    ));
     for e in &obs.endpoints {
         s.push_str(&format!(
             "Endpoint {}: head slot {} block {}, finalized epoch {} root {}\n",
@@ -736,13 +828,28 @@ pub fn render(obs: &Observation, i: &Inspection) -> String {
             codec::hex32(&e.finalized_root)
         ));
     }
-    s.push_str(&format!("Inputs ({}), each owned by the treasury script:\n", i.inputs.len()));
+    s.push_str(&format!(
+        "Inputs ({}), each owned by the treasury script:\n",
+        i.inputs.len()
+    ));
     for u in &i.inputs {
-        s.push_str(&format!("  in  {}:{}  {} sat\n", codec::hex32(&u.txid), u.vout, u.value));
+        s.push_str(&format!(
+            "  in  {}:{}  {} sat\n",
+            codec::hex32(&u.txid),
+            u.vout,
+            u.value
+        ));
     }
-    s.push_str(&format!("Outputs ({}), in order (position = vout):\n", i.outputs.len()));
+    s.push_str(&format!(
+        "Outputs ({}), in order (position = vout):\n",
+        i.outputs.len()
+    ));
     for (n, o) in i.outputs.iter().enumerate() {
-        s.push_str(&format!("  out {n}  {} sat  to {}\n", o.value, label(&o.script_hash, &obs.treasury)));
+        s.push_str(&format!(
+            "  out {n}  {} sat  to {}\n",
+            o.value,
+            label(&o.script_hash, &obs.treasury)
+        ));
     }
     s.push_str(&format!(
         "Input total: {} sat\nOutput total: {} sat\nExact fee: {} sat (base {} sat + priority {} sat; gas {} at base fee {} + tip {} millisat/gas)\n",
@@ -781,8 +888,20 @@ mod tests {
             epoch: 9_000,
             base_fee: 10,
             endpoints: vec![
-                EndpointRead { addr: "127.0.0.1:1".into(), head_slot: 288_000, head_block: [1; 32], finalized_epoch: 8_998, finalized_root: [2; 32] },
-                EndpointRead { addr: "127.0.0.1:2".into(), head_slot: 288_001, head_block: [3; 32], finalized_epoch: 8_998, finalized_root: [2; 32] },
+                EndpointRead {
+                    addr: "127.0.0.1:1".into(),
+                    head_slot: 288_000,
+                    head_block: [1; 32],
+                    finalized_epoch: 8_998,
+                    finalized_root: [2; 32],
+                },
+                EndpointRead {
+                    addr: "127.0.0.1:2".into(),
+                    head_slot: 288_001,
+                    head_block: [3; 32],
+                    finalized_epoch: 8_998,
+                    finalized_root: [2; 32],
+                },
             ],
             page_total: utxos.len() as u64,
             utxos,
@@ -797,16 +916,23 @@ mod tests {
             carried_address(&s).as_deref(),
             Some("bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073")
         );
-        assert_eq!(parse_destination("bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073").unwrap(), s);
+        assert_eq!(
+            parse_destination("bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073").unwrap(),
+            s
+        );
     }
 
     #[test]
     fn destinations_refuse_bad_checksums_testnet_zero_and_short_scripts() {
-        assert!(parse_destination("bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242074")
-            .unwrap_err()
-            .contains("checksum"));
+        assert!(
+            parse_destination("bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242074")
+                .unwrap_err()
+                .contains("checksum")
+        );
         assert!(parse_destination(&format!("bloch1t{}", "00".repeat(24))).is_err());
-        assert!(parse_destination(&"00".repeat(32)).unwrap_err().contains("zero script"));
+        assert!(parse_destination(&"00".repeat(32))
+            .unwrap_err()
+            .contains("zero script"));
         assert!(parse_destination(&"11".repeat(31)).is_err());
         assert_eq!(parse_destination(&"11".repeat(32)).unwrap(), [0x11; 32]);
     }
@@ -829,25 +955,47 @@ mod tests {
     #[test]
     fn observation_round_trips_and_parse_is_strict() {
         let t = compiled_treasury_script();
-        let o = obs(vec![EutxoEntry { txid: [9; 32], vout: 2, value: 5_000, script_hash: t }], t);
+        let o = obs(
+            vec![EutxoEntry {
+                txid: [9; 32],
+                vout: 2,
+                value: 5_000,
+                script_hash: t,
+            }],
+            t,
+        );
         let text = o.encode();
         assert_eq!(Observation::parse(&text).unwrap(), o);
         // Every one of these edits must be refused.
         let cases = [
-            text.replace("bloch-treasury-observation v1", "bloch-treasury-observation v2"),
+            text.replace(
+                "bloch-treasury-observation v1",
+                "bloch-treasury-observation v2",
+            ),
             text.replace("utxos 1", "utxos 2"),
             text.replace("\nend\n", "\n"),
             format!("{text}extra\n"),
             text.replace("epoch 9000", "epoch 09000"),
             text.replace("endpoints 2", "endpoints 1"),
             text.replace("127.0.0.1:2", "127.0.0.1:1"),
-            text.replace(&format!("{} 8998", "03".repeat(32)), &format!("{} 8997", "03".repeat(32))),
+            text.replace(
+                &format!("{} 8998", "03".repeat(32)),
+                &format!("{} 8997", "03".repeat(32)),
+            ),
             text.replace("base-fee 10", "base-fee 0"),
         ];
         for (n, bad) in cases.iter().enumerate() {
             assert!(Observation::parse(bad).is_err(), "case {n} must be refused");
         }
-        let dup = text.replace("end\n", &format!("utxo {} 2 5000 {}\nend\n", "09".repeat(32), codec::hex32(&t)))
+        let dup = text
+            .replace(
+                "end\n",
+                &format!(
+                    "utxo {} 2 5000 {}\nend\n",
+                    "09".repeat(32),
+                    codec::hex32(&t)
+                ),
+            )
             .replace("utxos 1", "utxos 2");
         assert!(Observation::parse(&dup).unwrap_err().contains("duplicate"));
     }
@@ -873,13 +1021,22 @@ mod tests {
                 })
                 .collect();
             let o = obs(utxos, t);
-            let intent = Intent { pay: vec![], change_to: t, tip: 0, max_fee_sat: 1_000_000, max_inputs: MAX_INPUTS };
+            let intent = Intent {
+                pay: vec![],
+                change_to: t,
+                tip: 0,
+                max_fee_sat: 1_000_000,
+                max_inputs: MAX_INPUTS,
+            };
             let plan = build_plan(&o, &BTreeSet::new(), &raw, &intent).unwrap();
             let bytes = match &plan.tx {
                 PosTransaction::TransferV2 { tx_bytes, .. } => *tx_bytes,
                 _ => unreachable!(),
             };
-            println!("TREASURY_FEE_MEASURE inputs {n} declared_bytes {bytes} fee_sat {}", plan.fee_sat);
+            println!(
+                "TREASURY_FEE_MEASURE inputs {n} declared_bytes {bytes} fee_sat {}",
+                plan.fee_sat
+            );
             assert!(plan.fee_sat > last);
             assert!(bytes <= MAX_DRAFT_TX_BYTES);
             last = plan.fee_sat;
