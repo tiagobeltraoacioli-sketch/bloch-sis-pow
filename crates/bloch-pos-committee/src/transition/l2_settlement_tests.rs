@@ -1288,6 +1288,61 @@ mod l2_tests {
         assert!(l2.committed_bytes().len() <= pre.l2_settlement().unwrap().committed_bytes().len() + 26 + 8 + 48 * da::MAX_RECORDS);
     }
 
+    /// Review R308-3P-1, restated after the merge onto the released node
+    /// (agent 382). The December line tested its own copy of the DA number
+    /// and duplicate rule (`admission::check_da_recordable`, test
+    /// `r308_3p_1_a_da_batch_repeating_a_recorded_commitment_is_not_backed`).
+    /// The merged mempool door has no copy: it asks
+    /// `l2_data_availability_refusal_at`, which calls this one function, the
+    /// same that `record_data_availability` (consensus) calls. Every case of
+    /// the removed test is asserted here on that function, with a settled
+    /// mark above zero: the settled block and anything beyond the window are
+    /// refused, the window's first and last blocks pass, the window's end
+    /// saturates, a recorded (number, commitment) is a duplicate, and a
+    /// recorded block or commitment is still open to another pairing.
+    #[test]
+    #[cfg(feature = "devnet-l2-user-txs")]
+    fn r308_3p_1_the_da_rule_the_door_shares_with_consensus() {
+        let (pre, _) = funded_async_fixture();
+        let chain = 700771;
+        let at_settled = |settled: u64| {
+            let mut l2 = pre.l2_settlement().unwrap().clone();
+            let mut statement = vec![0u8; S + 272];
+            statement[S + 264..S + 272].copy_from_slice(&settled.to_be_bytes());
+            l2.set_head_for_test([0x5e; 32], statement, 0);
+            assert_eq!(l2.settled_number(), settled);
+            l2
+        };
+        let settled = 10u64;
+        let mut l2 = at_settled(settled);
+        for (l2_number, commitment) in [(12u64, [0xa1u8; 32]), (13, [0xa2; 32])] {
+            l2.insert_da_record(da::Record { l2_number, commitment, height: 5 });
+        }
+        let check = |number: u64, commitment: [u8; 32]| l2.check_data_availability(chain, number, &commitment).map(|_| ());
+        assert_eq!(check(settled, [1; 32]), Err(da::Refusal::Number), "the settled block");
+        assert_eq!(check(settled + 1, [1; 32]), Ok(()), "the first unsettled block");
+        assert_eq!(check(settled + da::WINDOW, [1; 32]), Ok(()), "the last block of the window");
+        assert_eq!(check(settled + da::WINDOW + 1, [1; 32]), Err(da::Refusal::Number), "one beyond the window");
+        assert_eq!(check(u64::MAX, [1; 32]), Err(da::Refusal::Number), "far beyond the window");
+        assert_eq!(check(12, [0xa1; 32]), Err(da::Refusal::Duplicate), "the recorded commitment of block 12, again");
+        assert_eq!(check(12, [0xa3; 32]), Ok(()), "another commitment for a recorded block is recorded too");
+        assert_eq!(check(14, [0xa1; 32]), Ok(()), "a recorded commitment under another block number is not a repeat");
+        assert_eq!(check(13, [0xa1; 32]), Ok(()), "block 13 holds another commitment");
+        assert_eq!(l2.check_data_availability(chain + 1, settled + 1, &[1; 32]).map(|_| ()), Err(da::Refusal::Chain));
+        let high = at_settled(u64::MAX - 1);
+        assert_eq!(
+            high.check_data_availability(chain, u64::MAX, &[1; 32]).map(|_| ()),
+            Ok(()),
+            "the window's end saturates"
+        );
+        // Consensus and the check agree: what the check passes, recording
+        // accepts, and the repeat is then refused by both.
+        let mut recording = l2.clone();
+        assert_eq!(recording.record_data_availability(chain, 14, [0xa1; 32]), Ok(()));
+        assert_eq!(recording.check_data_availability(chain, 14, &[0xa1; 32]).map(|_| ()), Err(da::Refusal::Duplicate));
+        assert_eq!(recording.record_data_availability(chain, 14, [0xa1; 32]), Err(da::Refusal::Duplicate));
+    }
+
     // ── M4: withdrawal root and count ──
 
     /// A V3 successor of the accepted head of `l2` (or the first settlement),
