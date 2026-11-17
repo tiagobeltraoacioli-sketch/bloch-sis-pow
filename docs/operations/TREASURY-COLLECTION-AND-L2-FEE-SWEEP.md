@@ -58,10 +58,19 @@ Refusals (each tested; see "Evidence"):
 declared byte. At the floor base fee (10 millisat/gas) and no tip, the exact
 fee of a consolidation is printed by
 `treasury_spend::tests::consolidation_fee_by_input_count_at_the_floor`
-(`TREASURY_FEE_MEASURE` lines; numbers in the pull request and in agent 386's
-report). Agent 335 measured about 2,131 sat to move one output alone and about
-6 sat per further input; small outputs are therefore worth collecting only in
-batches. A draft is valid only at the base fee it was built for (exact
+(`TREASURY_FEE_MEASURE` lines, epoch 9000, raw hybrid key):
+
+| Inputs | Declared bytes | Exact fee (sat) | Fee per input (sat) |
+|---|---|---|---|
+| 1 | 8,463 | 2,132 | 2,132 |
+| 10 | 8,823 | 2,190 | 219 |
+| 100 | 12,423 | 2,766 | 27.7 |
+| 1,000 | 48,423 | 8,526 | 8.5 |
+
+This agrees with agent 335's independent measurement (about 2,131 sat for one
+output, about 6.4 sat per further input). The smallest forced-inclusion
+surcharge output (1,000 sat) loses about 0.85% to fees in a full 1,000-input
+draft and more than all of itself alone: collect in full pages. A draft is valid only at the base fee it was built for (exact
 conservation): if the next block's base fee differs, the transaction is refused
 (never a loss): observe and prepare again.
 
@@ -80,8 +89,13 @@ conservation): if the next block's base fee differs, the transaction is refused
 
 ### Owner commands
 
-On an online machine with this repository built (`cargo +1.94.1 build --locked
--p bloch-pos-node --release`), two independent nodes `NODE_A` and `NODE_B`:
+Build once, on both machines, from the same commit of this repository:
+
+```sh
+cargo +1.94.1 build --locked --release -p bloch-pos-node --bin bloch-pos --example sign-treasury-spend
+```
+
+On the online machine, with two independent nodes `NODE_A` and `NODE_B`:
 
 ```sh
 ./target/release/bloch-pos treasury-collect observe --rpc NODE_A:8080 --rpc NODE_B:8080 --genesis genesis/mainnet.manifest --out treasury-observation.txt

@@ -160,8 +160,8 @@ pub struct Observation {
     pub treasury: [u8; 32],
     /// SHA3-256 of the genesis manifest file the observer was given.
     pub genesis_sha3: [u8; 32],
-    /// Epoch of the later head of the two endpoints: the inclusion epoch the
-    /// draft is priced and signed for.
+    /// The inclusion epoch the draft is priced and signed for: the later of
+    /// the two endpoints' wall-clock epochs (`getchaininfo.wall_slot`).
     pub epoch: u64,
     /// `next_base_fee_millisat_per_gas`, equal on both endpoints.
     pub base_fee: u128,

@@ -156,7 +156,7 @@ pub struct EndpointSnapshot {
     pub utxos: Vec<EutxoEntry>,
 }
 
-/// `getchaininfo` -> the read point. Refuses a node that cannot place its
+/// `getchaininfo` -> the read point and the inclusion epoch (wall clock). Refuses a node that cannot place its
 /// finalized checkpoint on its own chain (`finalized_height: null`, the
 /// documented "halt" signal for integrators).
 pub fn parse_chain_info(addr: &str, j: &Json) -> Result<(EndpointRead, u64), String> {
@@ -165,6 +165,9 @@ pub fn parse_chain_info(addr: &str, j: &Json) -> Result<(EndpointRead, u64), Str
     }
     let fin = j.get("finalized").ok_or_else(|| format!("{addr}: getchaininfo without `finalized`"))?;
     let head_slot = u64_of(j.get("slot"), "getchaininfo.slot")?;
+    // The inclusion epoch is the NEXT block's, which follows the wall clock,
+    // not the head (a head can sit in an earlier epoch after empty slots).
+    let wall_slot = u64_of(j.get("wall_slot"), "getchaininfo.wall_slot")?;
     Ok((
         EndpointRead {
             addr: addr.to_string(),
@@ -173,7 +176,7 @@ pub fn parse_chain_info(addr: &str, j: &Json) -> Result<(EndpointRead, u64), Str
             finalized_epoch: u64_of(fin.get("epoch"), "getchaininfo.finalized.epoch")?,
             finalized_root: h32(fin.get("root"), "getchaininfo.finalized.root")?,
         },
-        head_slot / SLOTS_PER_EPOCH,
+        wall_slot.max(head_slot) / SLOTS_PER_EPOCH,
     ))
 }
 
@@ -602,7 +605,7 @@ mod tests {
     #[test]
     fn chain_info_with_a_null_finalized_height_is_a_halt() {
         let j = crate::rpc::parse_json(
-            r#"{"block_id":"0101010101010101010101010101010101010101010101010101010101010101","slot":5,"finalized_height":null,"finalized":{"epoch":0,"root":"0202020202020202020202020202020202020202020202020202020202020202"}}"#,
+            r#"{"block_id":"0101010101010101010101010101010101010101010101010101010101010101","slot":5,"wall_slot":5,"finalized_height":null,"finalized":{"epoch":0,"root":"0202020202020202020202020202020202020202020202020202020202020202"}}"#,
         )
         .unwrap();
         assert!(parse_chain_info("x:1", &j).unwrap_err().contains("halt"));
