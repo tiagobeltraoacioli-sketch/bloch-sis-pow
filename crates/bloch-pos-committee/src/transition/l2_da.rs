@@ -211,12 +211,45 @@ impl L2DataAvailability {
     }
 }
 
+fn da_refusal(e: da::Refusal) -> L2DataAvailabilityReject {
+    use L2DataAvailabilityReject as R;
+    match e {
+        da::Refusal::NotActive => R::NotActive,
+        da::Refusal::Chain => R::Chain,
+        da::Refusal::Number => R::Number,
+        da::Refusal::Duplicate => R::Duplicate,
+        da::Refusal::Full => R::Full,
+    }
+}
+
 impl CommittedState {
-    pub(super) fn apply_l2_data_availability(
-        &mut self,
+    /// Why this state would refuse `tx` in the next block at `base_fee`,
+    /// checking everything except the signature. Node-local preflight
+    /// (mempool admission, proposer selection): it shares
+    /// [`Self::check_l2_data_availability`] and the record check with the
+    /// transition, so it refuses nothing the transition would accept in this
+    /// state.
+    pub fn l2_data_availability_refusal_at(
+        &self,
         tx: &L2DataAvailability,
         base_fee: u128,
-        verifier: &dyn SignatureVerifier,
+    ) -> Option<L2DataAvailabilityReject> {
+        use L2DataAvailabilityReject as R;
+        if let Err(why) = self.check_l2_data_availability(tx, base_fee) {
+            return Some(why);
+        }
+        let Some(l2) = self.l2_settlement.as_ref() else { return Some(R::NotActive) };
+        l2.check_data_availability(tx.l2_chain_id, tx.l2_block_number, &tx.commitment())
+            .err()
+            .map(da_refusal)
+    }
+
+    /// The state checks of [`Self::apply_l2_data_availability`], in its
+    /// order, up to (not including) the signature.
+    fn check_l2_data_availability(
+        &self,
+        tx: &L2DataAvailability,
+        base_fee: u128,
     ) -> Result<fee_market::TxCharge, L2DataAvailabilityReject> {
         use L2DataAvailabilityReject as R;
         if !self.l2_settlement.as_ref().is_some_and(|l2| l2.user_transactions()) {
@@ -258,6 +291,18 @@ impl CommittedState {
         if self.eutxos.contains_key(&(txid, 0)) {
             return Err(R::OutputCollision);
         }
+        Ok(charge)
+    }
+
+    pub(super) fn apply_l2_data_availability(
+        &mut self,
+        tx: &L2DataAvailability,
+        base_fee: u128,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<fee_market::TxCharge, L2DataAvailabilityReject> {
+        use L2DataAvailabilityReject as R;
+        let charge = self.check_l2_data_availability(tx, base_fee)?;
+        let txid = PosTransaction::L2DataAvailability(tx.clone()).txid();
         // Expensive check last.
         if !verifier.verify_with_key(&tx.funding_pubkey, &tx.intent_root(), &tx.signature) {
             return Err(R::Signature);
@@ -265,13 +310,7 @@ impl CommittedState {
         let l2 = self.l2_settlement.as_mut().ok_or(R::NotActive)?;
         // The record is the last fallible step; spendable-set edits follow it.
         l2.record_data_availability(tx.l2_chain_id, tx.l2_block_number, tx.commitment())
-            .map_err(|e| match e {
-                da::Refusal::NotActive => R::NotActive,
-                da::Refusal::Chain => R::Chain,
-                da::Refusal::Number => R::Number,
-                da::Refusal::Duplicate => R::Duplicate,
-                da::Refusal::Full => R::Full,
-            })?;
+            .map_err(da_refusal)?;
         for input in &tx.inputs {
             self.eutxos.remove(&(input.txid, input.vout));
         }

@@ -326,6 +326,28 @@ pub(crate) fn insert_kes_roots(tree: &mut Smt, roots: &BTreeMap<u32, crate::kes:
 /// this tree; reserved).
 const TAG_PQ_RESCUE_COMMIT: u8 = crate::wire_alloc::state::PQ_RESCUE_COMMIT;
 
+/// `ValidatorCommissionUpdate` epochs of the current epoch
+/// (`CommittedState::commission_update_epochs`, security review round 2
+/// DET-3), one leaf per validator, value = the epoch (u64 LE). The map is
+/// empty (zero leaves) below `COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH`
+/// and at the start of every epoch, so every historical root is unchanged.
+///
+/// It takes no component tag of its own (the state-tag table is frozen,
+/// [`crate::wire_alloc`]): the leaves live under `TAG_VALIDATOR` with a key
+/// of this prefix followed by the 4-byte index. A validator record's key is
+/// the 4-byte index alone, so the two can never be the same key preimage;
+/// `TAG_KES_ROOT` separates its bind-epoch leaf from its entries the same
+/// way.
+const COMMISSION_UPDATE_KEY_PREFIX: &[u8] = b"commission-update-epoch:";
+
+pub(crate) fn insert_commission_update_epochs(tree: &mut Smt, epochs: &BTreeMap<u32, u64>) {
+    for (validator, epoch) in epochs {
+        let mut key = COMMISSION_UPDATE_KEY_PREFIX.to_vec();
+        key.extend_from_slice(&validator.to_le_bytes());
+        tree.insert(derive_key(TAG_VALIDATOR, &key), hash_value(&epoch.to_le_bytes()));
+    }
+}
+
 pub(crate) fn insert_pq_rescue_commits(
     tree: &mut Smt,
     commits: &std::collections::BTreeMap<[u8; 32], u64>,
@@ -1232,6 +1254,26 @@ pub fn leaf_value_hash(serialized: &[u8]) -> [u8; 32] {
     hash_value(serialized)
 }
 
+/// Tree key of the finality leaf (component `TAG_FINALITY`, 0x09): the one
+/// leaf holding [`FinalityRecord`], including the HF1 frozen finality set.
+/// Read-only accessor for light clients and state-proof RPCs; the state root
+/// uses the same definition.
+pub fn finality_leaf_key() -> [u8; 32] {
+    derive_key(TAG_FINALITY, &[])
+}
+
+/// Tree key of `validator`'s KES entry (component `TAG_KES_ROOT`, 0x22).
+/// Read-only accessor; see [`insert_kes_roots`].
+pub fn kes_leaf_key(validator: u32) -> [u8; 32] {
+    derive_key(TAG_KES_ROOT, &validator.to_le_bytes())
+}
+
+/// Tree key of the KES enforcement bind epoch (component `TAG_KES_ROOT`,
+/// entry key `b"enforced"`). Read-only accessor; see [`insert_kes_roots`].
+pub fn kes_enforced_leaf_key() -> [u8; 32] {
+    derive_key(TAG_KES_ROOT, b"enforced")
+}
+
 // -- Committed state components ---------------------------------------------
 //
 // Serialization here is canonical by construction: fixed field order, fixed
@@ -1590,6 +1632,13 @@ impl FinalitySetRecord {
 }
 
 impl FinalityRecord {
+    /// The committed bytes of the finality leaf (the value
+    /// [`finality_leaf_key`] commits, hashed with [`leaf_value_hash`]).
+    /// Read-only accessor for light clients and state-proof RPCs.
+    pub fn committed_bytes(&self) -> Vec<u8> {
+        self.serialize()
+    }
+
     fn serialize(&self) -> Vec<u8> {
         // Canonicalise here, not in the builder: the committed bytes must be
         // a function of the *content*, whichever order a caller assembled the

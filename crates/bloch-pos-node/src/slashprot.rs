@@ -83,6 +83,16 @@ use sha3::digest::{ExtendableOutput, Update, XofReader};
 /// File name inside the data dir.
 pub const FILE_NAME: &str = "slashing_protection.bin";
 
+/// Marker beside the record: this data dir booted a validator key with no
+/// record and no host signer anchor, so nothing here says what the key signed
+/// before wall slot `<decimal in the file>`. See
+/// [`SlashingProtection::settle_missing_history`].
+pub const UNPROVEN_FILE_NAME: &str = "slashing_protection.unproven";
+
+/// `--acknowledge-missing-slashing-protection`: the operator states that the
+/// key has no signature this node does not know about.
+pub const ENV_ACK_MISSING: &str = "BLOCH_ACK_MISSING_SLASHING_PROTECTION";
+
 /// Unbound record: what every fleet node wrote before the binding existed.
 const MAGIC_V1: &[u8; 8] = b"BPOSSLP1";
 const VERSION_V1: u32 = 1;
@@ -218,6 +228,34 @@ pub struct SlashingProtection {
     mirror: Option<PathBuf>,
     /// Holds the host-level key lock for as long as this record can sign.
     anchor: Option<crate::signer_anchor::SignerAnchor>,
+    /// There was no record file when this was opened: the watermarks are
+    /// empty because nothing is known, not because nothing was signed.
+    opened_without_record: bool,
+    /// Review CR-8: `Some(slot)` while nothing in this data dir or on this
+    /// host says what the key signed before wall slot `slot`. A key whose
+    /// duties began before that slot must not sign.
+    unproven_before_slot: Option<u64>,
+    /// The anchor record already existed when this boot attached it. An
+    /// anchor created on this boot holds no history and vouches for nothing
+    /// (review PER-2).
+    anchor_preexisting: bool,
+    /// The reference slot above was taken from this boot's wall clock, which
+    /// the chain has not confirmed yet (review PER-6).
+    reference_from_wall_clock: bool,
+}
+
+/// What [`SlashingProtection::settle_missing_history`] decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissingHistory {
+    /// A record existed (or a host anchor that predates this boot vouches
+    /// for a fresh data dir).
+    Proven,
+    /// No record and no anchor that predates this boot: duties of a key that was active before `slot`
+    /// are refused until the operator supplies a record, a floor, or an
+    /// acknowledgement.
+    Unproven { before_slot: u64 },
+    /// The operator acknowledged the missing record; the marker was removed.
+    Acknowledged,
 }
 
 /// What [`SlashingProtection::attach_anchor`] found when it compared the
@@ -296,7 +334,23 @@ fn merge_bound(dir: &Path, binding: Binding, incoming: Watermarks, incoming_reco
     };
     let recommit = merge_recommit(protection.recommit, incoming_recommit)?;
     protection.write_record(merged, recommit)?;
+    // An imported record or an operator floor is the history the marker
+    // said was missing (review CR-8).
+    remove_unproven_marker(&protection.unproven_marker_path())?;
     Ok(merged)
+}
+
+fn remove_unproven_marker(marker: &Path) -> io::Result<()> {
+    match fs::remove_file(marker) {
+        Ok(()) => {
+            if let Some(dir) = marker.parent() {
+                fs::File::open(dir)?.sync_all()?;
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 impl SlashingProtection {
@@ -306,8 +360,10 @@ impl SlashingProtection {
     /// [`SlashingProtection::open_bound`]. A bound file opened this way keeps
     /// its binding on every write, so this path can never *strip* one.
     ///
-    /// A missing file is a fresh validator: all watermarks `None`. A file
-    /// that does not decode is an error, never a reset.
+    /// A missing file yields empty watermarks. Whether that is a fresh
+    /// validator or a lost record is decided by
+    /// [`SlashingProtection::settle_missing_history`] at boot. A file that
+    /// does not decode is an error, never a reset.
     pub fn open(dir: &Path) -> io::Result<SlashingProtection> {
         Self::open_with(dir, None)
     }
@@ -321,7 +377,8 @@ impl SlashingProtection {
     ///   next commit; the upgrade is announced on stdout. Nothing about the
     ///   watermarks themselves changes, so the fleet's existing files keep
     ///   protecting exactly what they protected.
-    /// - No file → fresh watermarks, bound on first commit.
+    /// - No file → empty watermarks, bound on first commit (and see
+    ///   [`SlashingProtection::settle_missing_history`]).
     pub fn open_bound(dir: &Path, binding: Binding) -> io::Result<SlashingProtection> {
         Self::open_with(dir, Some(binding))
     }
@@ -336,6 +393,7 @@ impl SlashingProtection {
             fs::File::open(&path)?.take(MAX_RECORD_LEN.saturating_add(1) as u64).read_to_end(&mut bytes)?;
             Ok(bytes)
         };
+        let mut opened_without_record = false;
         let (wm, on_disk, recommit) = match read_record() {
             Ok(bytes) => decode_record(&bytes).ok_or_else(|| {
                 io::Error::new(
@@ -348,7 +406,10 @@ impl SlashingProtection {
                     ),
                 )
             })?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (Watermarks::default(), None, None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                opened_without_record = true;
+                (Watermarks::default(), None, None)
+            }
             Err(e) => return Err(e),
         };
         let binding = match (on_disk, want) {
@@ -393,7 +454,191 @@ impl SlashingProtection {
             }
             (None, None) => None,
         };
-        Ok(SlashingProtection { path, wm, binding, recommit, mirror: None, anchor: None })
+        Ok(SlashingProtection {
+            path, wm, binding, recommit, mirror: None, anchor: None,
+            opened_without_record, unproven_before_slot: None,
+            anchor_preexisting: false, reference_from_wall_clock: false,
+        })
+    }
+
+    fn unproven_marker_path(&self) -> PathBuf {
+        self.path.with_file_name(UNPROVEN_FILE_NAME)
+    }
+
+    /// The copy of the marker beside the anchor record. It keeps "unproven"
+    /// true when the data dir (and its marker) is wiped after an unproven
+    /// boot; without it the anchor that boot created would vouch next time.
+    fn anchor_marker_path(&self) -> Option<PathBuf> {
+        self.anchor.as_ref().map(|a| a.dir().join(UNPROVEN_FILE_NAME))
+    }
+
+    /// Decide, once per boot and BEFORE replay, whether this node knows what
+    /// its key has signed (review CR-8). Call after [`Self::attach_anchor`].
+    ///
+    /// A missing record used to mean "fresh validator". It also describes a
+    /// data dir that lost its record (restored without it, wiped for a
+    /// resync, key copied to a new directory) for a key that has been signing
+    /// for months, and the watermarks are equally empty in both cases. The
+    /// host signer anchor tells the two apart on one host, provided it held
+    /// this key's record BEFORE this boot; an anchor created on this boot is
+    /// the new-host case and says nothing (review PER-2). So when there is no
+    /// record and no such anchor, the wall slot of this boot is written to a marker file and kept in
+    /// [`Self::unproven_before_slot`]: a key whose duties began before that
+    /// slot is refused ([`Self::missing_history_blocks`]); a key activated at
+    /// or after it has signed nothing this record did not see, and starts
+    /// without ceremony.
+    ///
+    /// The marker, not the absence of the record, carries the state across
+    /// restarts: replay raises the record to the key's on-chain signatures
+    /// (which creates the file), and that evidence does not cover votes that
+    /// were signed and never included. It is removed by an import or a floor
+    /// (`slashing-protection import|set-floor`) or by `acknowledged`. A copy
+    /// is kept beside the anchor record when one is attached, so wiping the
+    /// data dir after an unproven boot does not turn the anchor that boot
+    /// created into proof.
+    pub fn settle_missing_history(&mut self, boot_wall_slot: u64, acknowledged: bool) -> io::Result<MissingHistory> {
+        let read_marker = |marker: &Path| -> io::Result<Option<u64>> {
+            match fs::read(marker) {
+                // An unreadable marker still says "unproven"; be conservative
+                // about since when.
+                Ok(bytes) => Ok(Some(
+                    std::str::from_utf8(&bytes).ok().and_then(|t| t.trim().parse::<u64>().ok()).unwrap_or(u64::MAX),
+                )),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            }
+        };
+        let marker = self.unproven_marker_path();
+        let anchor_marker = self.anchor_marker_path();
+        let in_data_dir = read_marker(&marker)?;
+        // The anchor's copy only matters while the data dir has no record of
+        // its own: a record with no marker beside it is a known history (it
+        // was there all along, or was imported or floored).
+        let anchor_copy = match &anchor_marker {
+            Some(path) => read_marker(path)?,
+            None => None,
+        };
+        let in_anchor = if self.opened_without_record { anchor_copy } else { None };
+        let recorded = in_data_dir.max(in_anchor);
+        // A fresh data dir under a host anchor that ALREADY held this key's
+        // record is what the anchor is for: a key this host already ran is
+        // caught by `attach_anchor`. An anchor created on this boot is as
+        // empty as the missing record and proves nothing (review PER-2): that
+        // is a key copied to a new host.
+        let vouched = recorded.is_none() && self.anchor.is_some() && self.anchor_preexisting;
+        if recorded.is_none() && (!self.opened_without_record || vouched) {
+            if !self.opened_without_record {
+                if let Some(path) = &anchor_marker {
+                    remove_unproven_marker(path)?;
+                }
+            }
+            self.unproven_before_slot = None;
+            return Ok(MissingHistory::Proven);
+        }
+        if acknowledged {
+            remove_unproven_marker(&marker)?;
+            if let Some(path) = &anchor_marker {
+                remove_unproven_marker(path)?;
+            }
+            self.unproven_before_slot = None;
+            return Ok(MissingHistory::Acknowledged);
+        }
+        let before_slot = match recorded {
+            Some(slot) if !self.opened_without_record => slot,
+            // Only the data dir was lost: the anchor predates this boot and
+            // has mirrored every signature since its own marker was written.
+            Some(slot) if in_data_dir.is_none() && self.anchor_preexisting => slot,
+            // The record went missing (again) now: nothing before THIS boot
+            // is known either.
+            Some(slot) => {
+                self.reference_from_wall_clock = true;
+                slot.max(boot_wall_slot)
+            }
+            None => {
+                self.reference_from_wall_clock = true;
+                boot_wall_slot
+            }
+        };
+        self.write_unproven_markers(before_slot, in_data_dir, anchor_copy)?;
+        self.unproven_before_slot = Some(before_slot);
+        Ok(MissingHistory::Unproven { before_slot })
+    }
+
+    fn write_unproven_markers(&self, before_slot: u64, in_data_dir: Option<u64>, in_anchor: Option<u64>) -> io::Result<()> {
+        let text = before_slot.to_string();
+        if in_data_dir != Some(before_slot) {
+            crate::store::atomic_private_write(&self.unproven_marker_path(), text.as_bytes())?;
+        }
+        if let Some(path) = self.anchor_marker_path() {
+            if in_anchor != Some(before_slot) {
+                crate::store::atomic_private_write(&path, text.as_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Review PER-6: the reference slot written by
+    /// [`Self::settle_missing_history`] on this boot came from the wall clock
+    /// alone. A clock at or before genesis (no RTC before NTP, a stepped
+    /// clock) makes it 0, which refuses nobody, and the marker would keep
+    /// that value for good. Call after replay with the slot of the replayed
+    /// head (0 for an empty log, which changes nothing): the chain this node already holds is a lower bound on
+    /// "now" that the clock cannot lower. Only raises, and only on the boot
+    /// that set the reference; a reference kept from an earlier boot is left
+    /// alone, so a validator activated since then is not refused.
+    pub fn raise_unproven_reference(&mut self, chain_slot: u64) -> io::Result<()> {
+        let Some(before) = self.unproven_before_slot else { return Ok(()) };
+        if !self.reference_from_wall_clock || chain_slot <= before {
+            return Ok(());
+        }
+        self.write_unproven_markers(chain_slot, Some(before), Some(before))?;
+        self.unproven_before_slot = Some(chain_slot);
+        Ok(())
+    }
+
+    /// `Some(slot)` while this node cannot say what its key signed before
+    /// wall slot `slot` ([`Self::settle_missing_history`]).
+    pub fn unproven_before_slot(&self) -> Option<u64> {
+        self.unproven_before_slot
+    }
+
+    /// Must a validator whose duties began at `activation_epoch` be refused?
+    /// True when its first duty slot lies before the slot from which this
+    /// record is known to be complete.
+    pub fn missing_history_blocks(&self, activation_epoch: u64) -> bool {
+        self.unproven_before_slot.is_some_and(|before| {
+            activation_epoch.saturating_mul(bloch_pos_committee::params::SLOTS_PER_EPOCH) < before
+        })
+    }
+
+    /// The refusal, saying exactly what to do.
+    pub fn missing_history_refusal(&self, validator: u32, activation_epoch: u64, wall_slot: u64) -> String {
+        let dir = self.path.parent().map(|d| d.display().to_string()).unwrap_or_default();
+        let (key, network) = match self.binding {
+            Some(b) => (crate::codec::hex(&b.validator_pubkey_sha3), crate::codec::hex(&b.genesis_digest)),
+            None => ("<validator pubkey sha3>".into(), "<genesis digest>".into()),
+        };
+        format!(
+            "SLASHING PROTECTION MISSING: validator {validator} has had duties on chain since epoch \
+             {activation_epoch}, but this data dir had no {FILE_NAME} when it first booted this key \
+             (wall slot {}) and no host signer anchor that already held this key's record was in \
+             use. This node cannot know which duties \
+             the key has already signed, so it REFUSES TO SIGN. First stop and fence every other \
+             instance of this key. Then do ONE of: \
+             (1) restore the key's record: on the previous data dir run `bloch-pos slashing-protection \
+             export --data-dir <old dir> --validator-pubkey-sha3 {key} --genesis-digest {network} --out \
+             record.bin`, then here `bloch-pos slashing-protection import --data-dir {dir} \
+             --validator-pubkey-sha3 {key} --genesis-digest {network} --in record.bin`; \
+             (2) if the record is lost, set a floor above anything the key can have signed (the wall \
+             slot is now {wall_slot}): `bloch-pos slashing-protection set-floor --data-dir {dir} \
+             --validator-pubkey-sha3 {key} --genesis-digest {network} --min-slot {}`; \
+             (3) only if this key has never signed anywhere else, restart with \
+             --acknowledge-missing-slashing-protection (or {ENV_ACK_MISSING}=1). \
+             To have a lost or rolled-back record detected on this host from now on, give the service \
+             a writable --signer-anchor-dir.",
+            self.unproven_before_slot.unwrap_or(0),
+            wall_slot.saturating_add(1),
+        )
     }
 
     /// The identity the file is bound to (or will be bound to on the next
@@ -540,6 +785,7 @@ impl SlashingProtection {
     /// writes, and the data-dir record is the one written first.
     pub fn attach_anchor(&mut self, anchor: crate::signer_anchor::SignerAnchor, accept_rollback: bool) -> io::Result<AnchorCheck> {
         let check = self.attach_anchor_path(&anchor.record_path(), accept_rollback)?;
+        self.anchor_preexisting = check != AnchorCheck::Adopted;
         self.anchor = Some(anchor);
         Ok(check)
     }
@@ -972,6 +1218,273 @@ mod tests {
             let b = Binding { validator_pubkey_sha3: [0xAB; 32], genesis_digest: [0xCD; 32] };
             assert_eq!(decode(&encode(&wm, Some(&b))), Some((wm, Some(b))));
         }
+    }
+
+    // ----- review CR-8: a missing record is not proof of a fresh validator -----
+
+    const EPOCH: u64 = bloch_pos_committee::params::SLOTS_PER_EPOCH;
+
+    /// No record and no anchor: a key that was active before this boot is
+    /// refused, a key activated at or after it is not, and the decision
+    /// survives the record being created from on-chain evidence and a restart.
+    #[test]
+    fn a_missing_record_without_an_anchor_refuses_a_key_that_was_already_active() {
+        let d = dir("cr8-unproven");
+        let boot = 100 * EPOCH + 5;
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        assert_eq!(sp.unproven_before_slot(), None, "inert until the boot settles it");
+        assert!(!sp.missing_history_blocks(0));
+        assert_eq!(sp.settle_missing_history(boot, false).unwrap(), MissingHistory::Unproven { before_slot: boot });
+        assert!(sp.missing_history_blocks(0), "a genesis validator has signed before");
+        assert!(sp.missing_history_blocks(100), "epoch 100 began before the boot slot");
+        assert!(!sp.missing_history_blocks(101), "activated after this boot: genuinely new");
+        assert!(!sp.missing_history_blocks(u64::MAX));
+        let message = sp.missing_history_refusal(7, 3, boot + 9);
+        for needle in [
+            "--acknowledge-missing-slashing-protection",
+            "slashing-protection import",
+            "set-floor",
+            &format!("--min-slot {}", boot + 10),
+            &crate::codec::hex(&KEY_A.validator_pubkey_sha3),
+            "--signer-anchor-dir",
+        ] {
+            assert!(message.contains(needle), "refusal must name {needle}: {message}");
+        }
+
+        // Replay raises the record to what the chain shows: the file now
+        // exists, and that must not look like a known history on restart.
+        sp.raise_to_published(Published::Attestation { slot: 40, source_epoch: 0, target_epoch: 1 }).unwrap();
+        assert!(d.0.join(FILE_NAME).exists());
+        drop(sp);
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        assert_eq!(
+            sp.settle_missing_history(boot + 1_000, false).unwrap(),
+            MissingHistory::Unproven { before_slot: boot },
+            "the first unproven boot stays the reference"
+        );
+        assert!(sp.missing_history_blocks(100));
+    }
+
+    /// A pre-genesis boot of a fresh validator (wall slot 0) blocks nothing.
+    #[test]
+    fn a_fresh_validator_booting_at_genesis_is_not_refused() {
+        let d = dir("cr8-genesis");
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        assert_eq!(sp.settle_missing_history(0, false).unwrap(), MissingHistory::Unproven { before_slot: 0 });
+        assert!(!sp.missing_history_blocks(0));
+    }
+
+    /// An existing record is a known history: nothing changes for a
+    /// validator that upgrades with its record in place.
+    #[test]
+    fn an_existing_record_is_never_treated_as_unproven() {
+        let d = dir("cr8-existing");
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        sp.guard_proposal(9, || ()).unwrap();
+        drop(sp);
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        assert_eq!(sp.settle_missing_history(1_000_000, false).unwrap(), MissingHistory::Proven);
+        assert!(!sp.missing_history_blocks(0));
+        assert!(!d.0.join(UNPROVEN_FILE_NAME).exists());
+    }
+
+    /// The three ways out: acknowledgement, a floor, an imported record.
+    #[test]
+    fn an_acknowledgement_a_floor_or_an_import_clears_the_refusal() {
+        // Acknowledgement: one boot, marker removed.
+        let d = dir("cr8-ack");
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        sp.settle_missing_history(500, false).unwrap();
+        assert!(d.0.join(UNPROVEN_FILE_NAME).exists());
+        drop(sp);
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        assert_eq!(sp.settle_missing_history(600, true).unwrap(), MissingHistory::Acknowledged);
+        assert!(!sp.missing_history_blocks(0));
+        assert!(!d.0.join(UNPROVEN_FILE_NAME).exists());
+
+        // Floor.
+        let d = dir("cr8-floor");
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        sp.settle_missing_history(500, false).unwrap();
+        drop(sp);
+        initialize_floor(&d.0, KEY_A, 501).unwrap();
+        assert!(!d.0.join(UNPROVEN_FILE_NAME).exists());
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        assert_eq!(sp.settle_missing_history(700, false).unwrap(), MissingHistory::Proven);
+        assert!(!sp.missing_history_blocks(0));
+        assert!(sp.guard_proposal(500, || ()).is_err(), "and the floor itself holds");
+
+        // Import.
+        let source = dir("cr8-import-src");
+        let mut old = SlashingProtection::open_bound(&source.0, KEY_A).unwrap();
+        old.guard_proposal(77, || ()).unwrap();
+        drop(old);
+        let backup = export_bound(&source.0, KEY_A).unwrap();
+        let d = dir("cr8-import");
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        sp.settle_missing_history(500, false).unwrap();
+        drop(sp);
+        import_bound(&d.0, KEY_A, &backup).unwrap();
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        assert_eq!(sp.settle_missing_history(700, false).unwrap(), MissingHistory::Proven);
+    }
+
+    /// A host anchor that already held this key's record vouches for a
+    /// fresh data dir (it would have refused a key this host already ran).
+    /// An anchor created on this very boot does not (review PER-2): that is
+    /// a key copied to a new host. It does not lift a refusal that was
+    /// already recorded; and losing the record again moves the reference
+    /// slot forward.
+    #[test]
+    fn an_anchor_vouches_only_for_a_fresh_data_dir_and_a_second_loss_moves_the_reference() {
+        // The anchor already holds a record from an earlier data dir.
+        let root = dir("cr8-anchor-root");
+        let old = dir("cr8-anchor-old");
+        let mut sp = SlashingProtection::open_bound(&old.0, KEY_A).unwrap();
+        sp.guard_proposal(9, || ()).unwrap();
+        drop(sp);
+        let mut sp = SlashingProtection::open_bound(&old.0, KEY_A).unwrap();
+        let held = crate::signer_anchor::SignerAnchor::acquire(&root.0, &KEY_A).unwrap();
+        assert_eq!(sp.attach_anchor(held, false).unwrap(), AnchorCheck::Adopted);
+        assert_eq!(sp.settle_missing_history(800, false).unwrap(), MissingHistory::Proven, "a record existed");
+        drop(sp);
+        let d = dir("cr8-anchor");
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        let held = crate::signer_anchor::SignerAnchor::acquire(&root.0, &KEY_A).unwrap();
+        assert_eq!(sp.attach_anchor(held, true).unwrap(), AnchorCheck::DataDirRolledForward);
+        assert_eq!(sp.settle_missing_history(900, false).unwrap(), MissingHistory::Proven);
+        assert!(!d.0.join(UNPROVEN_FILE_NAME).exists());
+        assert!(sp.guard_proposal(9, || ()).is_err(), "and the anchor's history holds");
+        drop(sp);
+
+        let d = dir("cr8-anchor-late");
+        let root = dir("cr8-anchor-late-root");
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        sp.settle_missing_history(900, false).unwrap();
+        drop(sp);
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        let held = crate::signer_anchor::SignerAnchor::acquire(&root.0, &KEY_A).unwrap();
+        sp.attach_anchor(held, false).unwrap();
+        assert_eq!(
+            sp.settle_missing_history(2_000, false).unwrap(),
+            MissingHistory::Unproven { before_slot: 2_000 },
+            "still no record, so nothing before this boot is known either"
+        );
+        assert!(sp.missing_history_blocks(0));
+
+        // A corrupt marker is conservative: everything is refused.
+        fs::write(d.0.join(UNPROVEN_FILE_NAME), b"not a slot").unwrap();
+        sp.guard_proposal(3_000, || ()).unwrap();
+        drop(sp);
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        assert_eq!(sp.settle_missing_history(4_000, false).unwrap(), MissingHistory::Unproven { before_slot: u64::MAX });
+        assert!(sp.missing_history_blocks(u64::MAX / EPOCH - 1));
+    }
+
+    /// Review PER-2: no record in the data dir and an anchor that did not
+    /// exist before this boot is the host-migration case. The anchor created
+    /// now is not proof; the key is refused exactly as with no anchor, and
+    /// wiping the data dir afterwards does not turn that anchor into proof.
+    #[test]
+    fn an_anchor_created_on_this_boot_does_not_vouch_for_a_missing_record() {
+        let d = dir("per2-adopted");
+        let root = dir("per2-adopted-root");
+        let boot = 100 * EPOCH + 5;
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        let held = crate::signer_anchor::SignerAnchor::acquire(&root.0, &KEY_A).unwrap();
+        let anchor_dir = held.dir().to_path_buf();
+        assert_eq!(sp.attach_anchor(held, false).unwrap(), AnchorCheck::Adopted);
+        assert_eq!(sp.settle_missing_history(boot, false).unwrap(), MissingHistory::Unproven { before_slot: boot });
+        assert!(sp.missing_history_blocks(100), "a key active before this boot is refused");
+        assert!(!sp.missing_history_blocks(101), "a key activated after it is a new validator");
+        assert!(d.0.join(UNPROVEN_FILE_NAME).exists());
+        assert!(anchor_dir.join(UNPROVEN_FILE_NAME).exists());
+        // Replay raises the record (and the anchor) to on-chain signatures.
+        sp.raise_to_published(Published::Attestation { slot: 40, source_epoch: 0, target_epoch: 1 }).unwrap();
+        drop(sp);
+
+        // The data dir is wiped; the anchor now predates the boot, but it was
+        // created by the unproven boot and still says so.
+        let d2 = dir("per2-adopted-wiped");
+        let mut sp = SlashingProtection::open_bound(&d2.0, KEY_A).unwrap();
+        let held = crate::signer_anchor::SignerAnchor::acquire(&root.0, &KEY_A).unwrap();
+        assert_eq!(sp.attach_anchor(held, true).unwrap(), AnchorCheck::DataDirRolledForward);
+        assert_eq!(
+            sp.settle_missing_history(boot + 1_000, false).unwrap(),
+            MissingHistory::Unproven { before_slot: boot },
+            "the anchor has mirrored every signature since its marker"
+        );
+        assert!(sp.missing_history_blocks(100));
+        drop(sp);
+
+        // An acknowledgement clears both copies.
+        let mut sp = SlashingProtection::open_bound(&d2.0, KEY_A).unwrap();
+        let held = crate::signer_anchor::SignerAnchor::acquire(&root.0, &KEY_A).unwrap();
+        sp.attach_anchor(held, false).unwrap();
+        assert_eq!(sp.settle_missing_history(boot + 2_000, true).unwrap(), MissingHistory::Acknowledged);
+        assert!(!d2.0.join(UNPROVEN_FILE_NAME).exists());
+        assert!(!anchor_dir.join(UNPROVEN_FILE_NAME).exists());
+        drop(sp);
+
+        // An import into the data dir is the missing history: the next boot
+        // is proven and drops the anchor's copy of the marker.
+        let d3 = dir("per2-import");
+        let root3 = dir("per2-import-root");
+        let mut sp = SlashingProtection::open_bound(&d3.0, KEY_A).unwrap();
+        let held = crate::signer_anchor::SignerAnchor::acquire(&root3.0, &KEY_A).unwrap();
+        let anchor_dir3 = held.dir().to_path_buf();
+        sp.attach_anchor(held, false).unwrap();
+        sp.settle_missing_history(boot, false).unwrap();
+        drop(sp);
+        initialize_floor(&d3.0, KEY_A, boot + 1).unwrap();
+        let mut sp = SlashingProtection::open_bound(&d3.0, KEY_A).unwrap();
+        let held = crate::signer_anchor::SignerAnchor::acquire(&root3.0, &KEY_A).unwrap();
+        assert_eq!(sp.attach_anchor(held, false).unwrap(), AnchorCheck::AnchorRaised);
+        assert_eq!(sp.settle_missing_history(boot + 50, false).unwrap(), MissingHistory::Proven);
+        assert!(!anchor_dir3.join(UNPROVEN_FILE_NAME).exists());
+    }
+
+    /// Review PER-6: a boot whose clock reads at or before genesis writes
+    /// reference slot 0, which refuses nobody. The replayed chain is a lower
+    /// bound on "now"; the reference is raised to it on that boot, durably,
+    /// and a reference kept from an earlier boot is not moved.
+    #[test]
+    fn a_wall_clock_behind_the_chain_does_not_disarm_the_refusal() {
+        let d = dir("per6-clock");
+        let head_slot = 50 * EPOCH + 3;
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        assert_eq!(sp.settle_missing_history(0, false).unwrap(), MissingHistory::Unproven { before_slot: 0 });
+        assert!(!sp.missing_history_blocks(0), "fixture: slot 0 refuses nobody");
+        sp.raise_unproven_reference(head_slot + 1).unwrap();
+        assert_eq!(sp.unproven_before_slot(), Some(head_slot + 1));
+        assert!(sp.missing_history_blocks(50), "a validator active below the replayed head is refused");
+        assert!(!sp.missing_history_blocks(51));
+        sp.raise_unproven_reference(7).unwrap();
+        assert_eq!(sp.unproven_before_slot(), Some(head_slot + 1), "never lowered");
+        sp.raise_to_published(Published::Attestation { slot: 40, source_epoch: 0, target_epoch: 1 }).unwrap();
+        drop(sp);
+
+        // Next boot: the raised value is what was stored, and a longer chain
+        // does not move a reference this boot did not set.
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        assert_eq!(
+            sp.settle_missing_history(90 * EPOCH, false).unwrap(),
+            MissingHistory::Unproven { before_slot: head_slot + 1 }
+        );
+        sp.raise_unproven_reference(80 * EPOCH).unwrap();
+        assert_eq!(sp.unproven_before_slot(), Some(head_slot + 1));
+        assert!(!sp.missing_history_blocks(60), "a validator activated since the first boot is not refused");
+
+        // A proven record is never touched.
+        let d = dir("per6-proven");
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        sp.guard_proposal(9, || ()).unwrap();
+        drop(sp);
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        sp.settle_missing_history(0, false).unwrap();
+        sp.raise_unproven_reference(1_000).unwrap();
+        assert_eq!(sp.unproven_before_slot(), None);
+        assert!(!d.0.join(UNPROVEN_FILE_NAME).exists());
     }
 
     // ----- audit round 3, M-8: the watermark file is bound to an identity -----

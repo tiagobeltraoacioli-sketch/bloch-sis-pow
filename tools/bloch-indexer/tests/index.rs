@@ -633,6 +633,63 @@ fn holder_page_ranks_exact_positive_script_balances_without_inventing_owners() {
     assert!(!page.contains("owner"));
 }
 
+/// L1M-03: `/holders` is served from a ranking computed once per index change,
+/// never by sorting the whole balance table per request. The cached top-256
+/// equals the naive full sort (ties broken by script hash), and a sync that
+/// moves balances (apply and reorg rollback) refreshes it.
+#[test]
+fn holder_ranking_is_cached_per_sync_and_matches_a_full_sort() {
+    fn sh(i: u32) -> [u8; 32] { let mut a = [0u8; 32]; a[..4].copy_from_slice(&i.to_be_bytes()); a[31] = 0x5A; a }
+    let genesis = h32(1);
+    // 600 holders, with deliberate ties so the hash tie-break is exercised.
+    let opening: Vec<_> = (0..600u32).map(|i| (
+        OutPoint { txid: sh(i), vout: 0 },
+        Utxo { value_sat: 1_000 + (i as u64 % 97) * 10, script_hash: sh(i), created_height: 0 },
+    )).collect();
+    let naive = |ix: &Index| {
+        let mut v: Vec<_> = ix.balance.iter().filter(|(_, a)| **a > 0).map(|(k, a)| (*k, *a)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v.truncate(bloch_indexer::index::HOLDERS_TOP_MAX);
+        v
+    };
+    let d = tmpdir("holders-cache"); let p = d.join("blocks.log");
+    let mut ix = Index::new(genesis, opening.clone(), 64);
+    assert!(ix.holders_top_is_cached(), "a fresh index serves holders from the cache");
+    assert_eq!(ix.holders_top().rows, naive(&ix));
+    assert_eq!(ix.holders_top().with_balance, 600);
+
+    // A block that makes a brand-new top holder out of the smallest one.
+    let whale = h32(0xEE);
+    let block = envelope(header(1, genesis, 0, 3), vec![transfer(vec![(sh(0), 0)], vec![(5_000_000, whale)])], vec![]);
+    write_log(&p, &[block]);
+    let mut reader = LogReader::open(&p).unwrap();
+    ix.sync(&mut reader).unwrap();
+    assert!(ix.holders_top_is_cached(), "sync refreshes the cache");
+    assert_eq!(ix.holders_top().rows, naive(&ix));
+    let page = bloch_indexer::api::holders_json(&ix, 256).to_string();
+    assert!(page.contains(&bloch_indexer::hex32(&whale)));
+    assert!(page.contains("\"returned\":256"));
+    assert!(page.contains("\"total_script_hashes_with_balance\":600"));
+
+    // The startup undo/replay qualification leaves the cache built (R-17).
+    ix.verify_undo_roundtrip(&mut reader, 1).unwrap();
+    assert!(ix.holders_top_is_cached(), "startup qualification must rebuild the holders cache");
+    assert_eq!(ix.holders_top().rows, naive(&ix));
+
+    // Reorg back to genesis: the cache follows the rollback.
+    write_log(&p, &[]); reader.reopen().unwrap(); ix.sync(&mut reader).unwrap();
+    assert!(ix.holders_top_is_cached());
+    assert_eq!(ix.holders_top().rows, naive(&Index::new(genesis, opening, 64)));
+    assert!(!bloch_indexer::api::holders_json(&ix, 256).to_string().contains(&bloch_indexer::hex32(&whale)));
+
+    // A direct apply (no sync) invalidates the cache; the read path still answers correctly.
+    let block2 = envelope(header(1, genesis, 0, 4), vec![transfer(vec![(sh(1), 0)], vec![(1_010, whale)])], vec![]);
+    ix.apply(&block2, 0);
+    assert!(!ix.holders_top_is_cached());
+    assert_eq!(ix.holders_top().rows, naive(&ix));
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 #[test]
 fn holder_route_rejects_stale_or_failed_index_snapshots() {
     use std::sync::{Arc, RwLock};

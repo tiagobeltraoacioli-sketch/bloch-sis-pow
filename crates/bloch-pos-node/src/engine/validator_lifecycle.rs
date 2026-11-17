@@ -94,9 +94,16 @@ pub(super) fn kes_register_conflict(
     if let PosTransaction::KesRotate { validator, .. } = tx {
         return kes_rotate_conflict(state, mempool, *validator);
     }
-    let PosTransaction::KesRegister { validator, .. } = tx else {
+    let PosTransaction::KesRegister { validator, depth, .. } = tx else {
         return Ok(());
     };
+    if kes_registration_born_expired(state, epoch_of(state.slot()), *depth) {
+        return Err(Refusal::Invalid(
+            "KES registration would start already expired: before KES binds a first key \
+             starts at period 0, and a tree of this depth does not reach the current period; \
+             register a deeper tree",
+        ));
+    }
     // Mirrors consensus (`check_kes_register`): an existing key refuses a
     // re-registration unless it is an expired key's static-key rescue.
     if state.kes_public(*validator).is_some() && !state.kes_rescue_open(*validator) {
@@ -122,6 +129,8 @@ struct LifecycleAdmissionVerifier<'a, V> {
     inner: &'a verification::GossipVerifier<V>,
     mempool: std::cell::RefCell<&'a mut admission::Mempool>,
     source: Option<[u8; 32]>,
+    /// Who delivered the transaction (audit L1-02); `None` for this node.
+    deliverer: Option<[u8; 32]>,
     wall_slot: u64,
     limited: std::cell::Cell<bool>,
 }
@@ -149,7 +158,7 @@ impl<V: SignatureVerifier> SignatureVerifier for LifecycleAdmissionVerifier<'_, 
             return false;
         }
         if let Some(source) = self.source {
-            if !self.mempool.borrow_mut().reserve_lifecycle_verification(source, self.wall_slot) {
+            if !self.mempool.borrow_mut().reserve_lifecycle_verification(self.deliverer, source, self.wall_slot) {
                 self.limited.set(true);
                 return false;
             }
@@ -173,7 +182,7 @@ impl<V: SignatureVerifier> SignatureVerifier for LifecycleAdmissionVerifier<'_, 
             return false;
         }
         if let Some(source) = self.source {
-            if !self.mempool.borrow_mut().reserve_lifecycle_verification(source, self.wall_slot) {
+            if !self.mempool.borrow_mut().reserve_lifecycle_verification(self.deliverer, source, self.wall_slot) {
                 self.limited.set(true);
                 return false;
             }
@@ -193,7 +202,7 @@ impl<V: SignatureVerifier> SignatureVerifier for LifecycleAdmissionVerifier<'_, 
             return false;
         }
         if let Some(source) = self.source {
-            if !self.mempool.borrow_mut().reserve_lifecycle_verification(source, self.wall_slot) {
+            if !self.mempool.borrow_mut().reserve_lifecycle_verification(self.deliverer, source, self.wall_slot) {
                 self.limited.set(true);
                 return false;
             }
@@ -223,7 +232,7 @@ mod verification_budget_tests {
         {
             let verifier = LifecycleAdmissionVerifier {
                 inner: &inner, mempool: std::cell::RefCell::new(&mut mempool),
-                source: Some(source), wall_slot: 10, limited: std::cell::Cell::new(false),
+                source: Some(source), deliverer: Some([0x0a; 32]), wall_slot: 10, limited: std::cell::Cell::new(false),
             };
             assert!(!verifier.verify_with_key(&[], &[0; 32], &[1]));
             // An exact replay hits the failure cache and consumes no budget.
@@ -235,7 +244,7 @@ mod verification_budget_tests {
         assert_eq!(calls.get(), LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT);
         let verifier = LifecycleAdmissionVerifier {
             inner: &inner, mempool: std::cell::RefCell::new(&mut mempool),
-            source: Some(source), wall_slot: 11, limited: std::cell::Cell::new(false),
+            source: Some(source), deliverer: Some([0x0a; 32]), wall_slot: 11, limited: std::cell::Cell::new(false),
         };
         assert!(!verifier.verify_with_key(&[], &[0; 32], &[4]));
         assert_eq!(calls.get(), LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT + 1);
@@ -272,8 +281,74 @@ fn kes_rotate_conflict(
     Ok(())
 }
 
+/// Audit L1-06 (node-local half): consensus gives a FIRST registration
+/// included past the KES gate but before the bind `start_period = 0`
+/// (`check_kes_register`), so once the bind is late enough a tree of `depth`
+/// is born expired and its validator would go silent at the bind until a
+/// rescue. The relay door refuses such a registration (the registering node's
+/// own included); block validity is unchanged. A rescue (an entry already
+/// exists) starts later and is judged by consensus alone. `epoch` is the
+/// state's open epoch (the head's, at the door).
+pub(super) fn kes_registration_born_expired(state: &CommittedState, epoch: u64, depth: u8) -> bool {
+    let Some(period) = params::kes_period(epoch) else {
+        return false;
+    };
+    let bound = state.kes_enforced_from().is_some_and(|from| epoch >= from);
+    if bound {
+        return false;
+    }
+    let lifetime = 1u64.checked_shl(u32::from(depth)).unwrap_or(u64::MAX);
+    lifetime <= period
+}
+
+/// Message for a lifecycle transaction refused only because the committed
+/// head has not reached the flag day the wall clock has. Served as
+/// `TX_REFUSED_RETRYABLE` (-32009), never as the terminal -32008.
+pub(super) const FLAG_DAY_AHEAD_OF_HEAD: &str =
+    "the flag day for this transaction format has opened by the wall clock, but this \
+     node's committed head is still in an earlier epoch, so the transaction could only be \
+     judged against pre-flag-day state. The bytes were not judged invalid: resubmit the \
+     same bytes once a block of the opening epoch exists (from `error.data.until_slot` on)";
+
+/// Gate of a lifecycle format whose door check (`admissible`) reads the
+/// wall-clock epoch while `validate_lifecycle_transaction` reads the
+/// committed head's epoch. `None` for formats without such a split.
+fn lifecycle_flag_day_open(tx: &PosTransaction, epoch: u64) -> Option<bool> {
+    match tx {
+        PosTransaction::KesRegister { .. } | PosTransaction::KesRotate { .. } => {
+            Some(params::kes_registration_open(epoch))
+        }
+        PosTransaction::WithdrawalCredentialRotation(_) => {
+            Some(params::epoch_gate_active(epoch, params::HF3_PQ_MIGRATION_EPOCH))
+        }
+        PosTransaction::RescueCommit(_) | PosTransaction::RescueReveal(_) => Some(
+            params::epoch_gate_active(epoch, params::LATTICE_EMERGENCY_ACTIVATION_EPOCH),
+        ),
+        _ => None,
+    }
+}
+
+/// True when `tx`'s flag day is open at the wall-clock epoch but not at the
+/// committed head's epoch. That happens in the first slots of the opening
+/// epoch, before its first block exists (agent 83, net K: head at slot 1151,
+/// wall slot 1152; the same bytes were accepted once the head reached 1152).
+/// The refusal is then a fact about this node's head, which the next block
+/// changes, not about the bytes.
+pub(super) fn flag_day_opened_after_head(tx: &PosTransaction, head_epoch: u64, wall_epoch: u64) -> bool {
+    head_epoch < wall_epoch
+        && lifecycle_flag_day_open(tx, wall_epoch) == Some(true)
+        && lifecycle_flag_day_open(tx, head_epoch) == Some(false)
+}
+
 impl Engine {
-    pub(super) fn validate_lifecycle_admission(&mut self, tx: &PosTransaction) -> Result<(), Refusal> {
+    /// `deliverer` is the peer or RPC client that handed this node `tx`
+    /// (`None` for this node's own submissions); the verification allowance
+    /// is charged to it, per identity (audit L1-02).
+    pub(super) fn validate_lifecycle_admission(
+        &mut self,
+        tx: &PosTransaction,
+        deliverer: Option<[u8; 32]>,
+    ) -> Result<(), Refusal> {
         if !is_lifecycle(tx) {
             return Ok(());
         }
@@ -286,7 +361,7 @@ impl Engine {
         let verifier = LifecycleAdmissionVerifier {
             inner: &self.gossip_verifier,
             mempool: std::cell::RefCell::new(&mut self.mempool),
-            source, wall_slot, limited: std::cell::Cell::new(false),
+            source, deliverer, wall_slot, limited: std::cell::Cell::new(false),
         };
         // HF2 scope: no relay signature policy. Lifecycle transactions are
         // judged under the committee's TRANSACTION rule (v1 forms always
@@ -298,7 +373,15 @@ impl Engine {
                 until_slot: wall_slot.saturating_add(1),
             });
         }
-        verdict.map_err(|_| Refusal::Invalid("lifecycle transaction fails committed-state validation"))
+        let head_epoch = epoch_of(self.state.slot());
+        let wall_epoch = epoch_of(wall_slot);
+        verdict.map_err(|_| {
+            if flag_day_opened_after_head(tx, head_epoch, wall_epoch) {
+                Refusal::StateDependent(FLAG_DAY_AHEAD_OF_HEAD)
+            } else {
+                Refusal::Invalid("lifecycle transaction fails committed-state validation")
+            }
+        })
     }
 
     fn lifecycle_verification_source(&self, tx: &PosTransaction) -> Option<[u8; 32]> {
@@ -380,7 +463,7 @@ impl Engine {
                     GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
                     source,
                     GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
-                );
+                ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
                 let signed = self.state.verify_precheck_signatures(&pre, &verifier);
                 if verifier.limited() {
                     return Err(Refusal::GossipVerificationLimited {
@@ -451,9 +534,23 @@ impl Engine {
         let total = state.active_validators().iter().map(|v| u128::from(v.effective_stake)).sum();
         let fee = state.next_base_fee();
         let included = &self.tx_slot_index;
+        // Review EXE-2: a pending settlement is judged against the head once,
+        // at admission. One the head has moved past (another settlement of
+        // the same anchor was included, or a reorg changed the anchor) can
+        // never apply, and while it stayed it refused every newer proof
+        // ("one L2 proof is already pending") and was the whole selection of
+        // this node's next proposal. Proof-free: the proof does not change.
+        let (head, head_slot) = (*state.head().as_bytes(), state.slot());
+        let settlement_applies = |tx: &PosTransaction| match tx {
+            PosTransaction::L2SettlementAsync(settlement) => state.l2_settlement().is_some_and(|l2| {
+                l2.pending_async_refusal(settlement, head, head_slot).is_none()
+            }),
+            _ => true,
+        };
         self.mempool.retain(|_, tx| {
             // Also covers winning-branch transactions on the reorg path.
             !included.contains_key(&tx.txid())
+                && settlement_applies(tx)
                 && (!is_lifecycle(tx)
                     || state
                         .validate_lifecycle_transaction(tx, total, fee, &ProbeVerifier)
@@ -694,7 +791,7 @@ mod p5a_evidence_admission_tests {
         // Validator 0's own lifecycle allowance for this slot is intact.
         let accused = validator_lifecycle_source(0);
         for _ in 0..LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT {
-            assert!(engine.mempool.reserve_lifecycle_verification(accused, GATE_SLOT));
+            assert!(engine.mempool.reserve_lifecycle_verification(None, accused, GATE_SLOT));
         }
     }
 

@@ -93,6 +93,14 @@ Falcon-1024 || ML-DSA-65 signing — see `signer.py` for the `Signer` seam and
 bring your own tx-builder. When the node runs with write-auth enabled and you
 call from a non-local IP, pass `api_key=...` (or `bearer=True`).
 
+**API key transport (breaking change, L1M-18).** With `api_key` set, the client
+refuses to call an `http://` URL whose host is not loopback (`127.0.0.0/8`,
+`::1`, `localhost`) and raises `BlochTransportError` before any request is
+made, because the key would cross the network in the clear. Use `https://`.
+If you knowingly run plaintext over a private link (VPN, WireGuard), pass
+`allow_insecure_http=True`. A request carrying the key never follows an HTTP
+redirect. Key-less reads are unaffected.
+
 ## Regenerating
 
 ```bash

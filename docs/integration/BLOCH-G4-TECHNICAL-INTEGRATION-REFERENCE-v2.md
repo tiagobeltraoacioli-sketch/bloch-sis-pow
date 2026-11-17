@@ -264,6 +264,24 @@ three in-rules cuts). Since 2026-09-05 (finding F-03), an engine-level
   `BLOCH_ALLOW_FINALITY_REWIND=1` lifts the latch, loudly logging every
   instance by name (`engine.rs:3357-3369,4626-4638`). Not recommended for an
   exchange's own observer node.
+- The latch **survives a restart**: it is mirrored to `finality_latch.bin` in
+  the data directory (only ever raised) and compared with the replayed block
+  log at boot. If the log does not hold the recorded checkpoint at its
+  height, the node refuses to start and names the checkpoint; the override
+  above discards the record instead (`engine/finality_latch.rs`).
+  - A record that cannot be read or decoded is refused the same way (exit
+    status 78, not retried by a supervisor). The message prints the full path.
+    The remedy is to remove that one file (`rm <data-dir>/finality_latch.bin`)
+    and start again with the same flags; the node then writes a new record
+    from the checkpoint its block log finalizes. Starting once with
+    `--allow-finality-rewind` also discards it, but lifts the latch for that
+    whole run.
+  - A deliberate resync from an empty or replaced block log needs the same:
+    remove `finality_latch.bin` together with the log, or start once with the
+    override.
+  - After a rewind the override allowed, the record is rewritten to match the
+    chain the node is then on (or removed if that chain has finalized
+    nothing), so the override can be taken out again before the next restart.
 
 <div class="warn">
 
@@ -1293,9 +1311,9 @@ Every method in the frozen registry (`method_registry.rs`, `tests/rpc_method_reg
 | `getvalidator` | `index` (u32; pos 0) | `index, pubkey_hash (64-hex, SHA3-256 of the raw pubkey — NOT the pubkey itself), pubkey_bytes (u64, LENGTH of the stored pubkey, not the key material), state (slashed\|exited\|exiting\|queued\|active), own_stake_sat (string), effective_stake_sat (string\|null — null means "not in the sampled set this epoch", distinct from zero), commission_bps (STRING), randao_commitment (64-hex), slashed (bool), activation_epoch/exit_epoch/withdrawable_epoch (u64\|null, null = "never")` | `-32001 VALIDATOR_NOT_FOUND` if index unknown |
 | `getvalidatorcount` | none | `total, active, total_active_stake_sat (string)` | |
 | `getvalidators` | none | Array, one entry per registered index: `index, pubkey_hash, status, effective_stake_sat (string\|null), commission_bps` — **a PLAIN JSON NUMBER here**, not the string `getvalidator` uses for the same-named field | **Missing from edition 1 entirely.** Whole registry in one call, no pagination (bounded in practice by the 64-validator ceiling). |
-| `getbalance` | `script_hash` (64-hex; pos 0) | `script_hash, balance_sat (string), utxo_count (u64)` | |
-| `gettxout` | `txid` (64-hex; pos 0), `vout` (u32; pos 1, **optional, defaults to 0**) | `txid, vout, unspent (bool), utxo (object\|null — the IDENTICAL 4-field object one `getutxos` entry is: `txid, vout, value_sat, script_hash` — see the note below), at_slot (u64 — the HEAD SLOT THIS NODE ANSWERED FROM, not the output's creation slot — see §11)` | |
-| `getutxos` / `listunspent` (aliases, one implementation) | `script_hash` (64-hex; pos 0), `limit` (u32; pos 1, **not** "page" or "offset" — optional, default 100, **clamped** 1..=1,000) | `script_hash, total (u64), returned (u64), truncated (bool), utxos[{txid, vout, value_sat (string), script_hash}]` | **No third parameter of any kind is read** — see §10.4. |
+| `getbalance` | `script_hash` (64-hex; pos 0) | `script_hash, balance_sat (string), utxo_count (u64)` | From the 2026-11-10 change also `at_slot, finalized_height (u64\|null), finalized_epoch` — see the note below the table. |
+| `gettxout` | `txid` (64-hex; pos 0), `vout` (u32; pos 1, **optional, defaults to 0**) | `txid, vout, unspent (bool), utxo (object\|null — the IDENTICAL 4-field object one `getutxos` entry is: `txid, vout, value_sat, script_hash` — see the note below), at_slot (u64 — the HEAD SLOT THIS NODE ANSWERED FROM, not the output's creation slot — see §11)` | From the 2026-11-10 change also `finalized_height (u64\|null), finalized_epoch`. |
+| `getutxos` / `listunspent` (aliases, one implementation) | `script_hash` (64-hex; pos 0), `limit` (u32; pos 1, **not** "page" or "offset" — optional, default 100, **clamped** 1..=1,000) | `script_hash, total (u64), returned (u64), truncated (bool), utxos[{txid, vout, value_sat (string), script_hash}]` | **No third parameter of any kind is read** — see §10.4. From the 2026-11-10 change also `at_slot, finalized_height (u64\|null), finalized_epoch`. |
 | `sendrawtransaction` | `hex` (string, canonical tx bytes; pos 0) | See §10.5 | The only write method |
 | `getmempoolinfo` | none | `size, max (=4096), bytes, next_base_fee_millisat_per_gas (string), barred, barred_hits, expired, evicted_low_fee` | **8 fields, not 4** — see the warning below |
 | `gettxstatus` | `txid` (64-hex; pos 0) | `{"status": "pending"\|"included"\|"justified"\|"finalized"\|"unknown"}` | **Missing from edition 1 entirely; see the caveat in §10.6 before using its `"finalized"` value for crediting.** |
@@ -1312,6 +1330,17 @@ information is prose-only (§2.8/§2.9), and this document, `SECURITY.md`, and
 the in-repo integration guide are where it lives.
 
 <div class="note">
+
+**`getbalance`, `getutxos`/`listunspent` and `gettxout` answer from the
+unfinalized head state.** From the 2026-11-10 change each reply states where
+it was read and where finality stands, as additional top-level fields (no
+existing field was renamed or removed): `at_slot` (the slot of the head state
+the answer came from), and `finalized_height` / `finalized_epoch` (this
+node's finality line, the same values and representation as `getblockcount`,
+`finalized_height: null` included). The `finalized_*` fields are the node's,
+not a statement about the outputs in the reply: an output is final only when
+its block is at or below the finalized checkpoint (`gettxstatus` =
+`finalized`, or the block's `"finalized": true`).
 
 **`gettxout`'s `utxo` object is byte-for-byte the same 4-field shape a
 `getutxos` entry is** — `{txid, vout, value_sat, script_hash}`, built by the
@@ -1365,6 +1394,29 @@ does not fail visibly: it finds no peers, builds its own fork, and still
 answers `getchaininfo` with a plausible height and a moving, `"finalized"`
 epoch. **Poll `transport.peers`, not just `behind_by_slots`, to detect "alone
 on my own fork."**
+
+Two additive fields (2026-10-25, node-only, no consensus change) report the
+activation gates compiled into the answering binary:
+
+- `signature_suites`: array of `{suite: "0x0001"|"0x0002"|"0x0003", name,
+  activation_epoch: u64|null, active: bool, spend_allowed: bool}`.
+  `0x0001` (ML-DSA-65+Falcon-1024) is the live hybrid. `0x0002` (ML-DSA-65)
+  is known to the verifier but every new spend authorised by it is refused at
+  admission (`spend_allowed: false`, ungated). `0x0003`
+  (SLH-DSA-SHAKE-128s+Falcon-1024) opens at `HF3_SLH_SUITE_EPOCH`. Lattice
+  suites report `spend_allowed: false` from the lattice-emergency epoch.
+- `hard_forks`: object keyed `hf1_claim_finality`, `hf1_frozen_set`,
+  `hf1_own_target`, `hf2_slashing_v2`, `hf2_growth_cap`, `hf2_sig_canonical`,
+  `hf2_mldsa_pin`, `hf3_kes_registration`, `hf3_kes_enforce`, `hf3_slh`,
+  `hf3_pq_migration`, `hf3_lattice_emergency`; each `{activation_epoch:
+  u64|null, active: bool}`, taken from the consensus crate's
+  `HARD_FORK_GATES`.
+
+`activation_epoch: null` means the gate is inert (`u64::MAX`). `active` is
+evaluated at the head epoch, `spend_allowed` at the wall epoch (what mempool
+admission reads). These fields describe the answering binary, so two nodes on
+different releases legitimately differ here; do not compare them for
+corroboration — compare the finality checkpoints.
 
 ### 10.4 `getutxos`/`listunspent` — the correct enumeration pattern (edition 1's is wrong)
 

@@ -58,14 +58,18 @@ mod keys;
 mod kes_key;
 mod kes_cli;
 mod metrics;
+mod mesh_pq;
 mod net;
 mod p2p;
 mod rpc;
+mod sentinel;
 mod slashprot;
 mod signer_anchor;
 mod slashing_cli;
 mod store;
 mod ws_boot;
+#[cfg(feature = "ws-release-anchor")]
+mod ws_release_anchor;
 mod validator_deposit;
 mod validator_lifecycle;
 mod validator_payout;
@@ -107,8 +111,9 @@ fn plaintext_opt_in_flag(args: &[String]) -> bool {
         return false;
     }
     let switches = ["--allow-finality-rewind", "--no-doppelganger-check", "--replay-from-genesis",
-        "--no-signer-anchor", "--accept-signing-rollback",
-        "--require-state-cache", "--behind-proxy", "--bind-genesis"];
+        "--no-signer-anchor", "--accept-signing-rollback", "--acknowledge-missing-slashing-protection",
+        "--require-state-cache", "--behind-proxy", "--bind-genesis",
+        "--mesh-require-authenticated"];
     let mut rest = args.iter().skip(1);
     while let Some(arg) = rest.next() {
         if arg == "--" { break; }
@@ -118,6 +123,129 @@ fn plaintext_opt_in_flag(args: &[String]) -> bool {
         }
     }
     false
+}
+
+/// Marks a thread the node cannot run without (review round 2, GATE-08).
+///
+/// The consensus loop is the main thread, so a panic there ends the process
+/// and the supervisor restarts it. A panic on any other thread ends only
+/// that thread: with the libp2p thread gone the engine kept running with no
+/// network, a frozen peer count and, after each quiet window, validator
+/// duties on its own head. Hold one of these for the life of such a thread;
+/// if the thread unwinds from a panic, the process aborts.
+///
+/// Deliberately not `panic = "abort"` in the release profile. That would
+/// also turn a panic on a thread the node CAN lose (one RPC connection, the
+/// metrics server, one devnet peer reader) from a dropped connection into a
+/// dead validator and a full replay, which makes any such panic a remote
+/// crash; and the test profile ignores the setting, so the tested behaviour
+/// and the shipped one would differ. A guard names exactly the threads whose
+/// loss is fatal and leaves the others as they are.
+pub(crate) struct EssentialThread {
+    name: &'static str,
+    on_panic: fn(&'static str),
+}
+
+impl EssentialThread {
+    pub(crate) fn new(name: &'static str) -> Self {
+        Self { name, on_panic: abort_for_essential_thread }
+    }
+
+    #[cfg(test)]
+    fn with(name: &'static str, on_panic: fn(&'static str)) -> Self {
+        Self { name, on_panic }
+    }
+}
+
+impl Drop for EssentialThread {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            (self.on_panic)(self.name);
+        }
+    }
+}
+
+fn abort_for_essential_thread(name: &'static str) {
+    eprintln!(
+        "FATAL: essential thread `{name}` panicked; aborting the process so the supervisor restarts the node \
+         instead of leaving it running without that thread"
+    );
+    // In-process test swarms share the test binary; killing it would hide
+    // the panic message of the test that caused it. The name is recorded
+    // instead, so a test can assert that a given thread is guarded.
+    #[cfg(test)]
+    ESSENTIAL_THREAD_PANICS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(name);
+    #[cfg(not(test))]
+    std::process::abort();
+}
+
+#[cfg(test)]
+static ESSENTIAL_THREAD_PANICS: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+
+/// How many guarded threads named `name` have panicked in this test binary.
+#[cfg(test)]
+pub(crate) fn essential_thread_panics(name: &str) -> usize {
+    ESSENTIAL_THREAD_PANICS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().filter(|n| **n == name).count()
+}
+
+#[cfg(test)]
+mod essential_thread_tests {
+    use super::EssentialThread;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static PANICKED: AtomicUsize = AtomicUsize::new(0);
+
+    fn record(name: &'static str) {
+        assert_eq!(name, "test-essential");
+        PANICKED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn an_essential_thread_that_panics_runs_the_fatal_action() {
+        // A clean exit is not fatal.
+        std::thread::spawn(|| {
+            let _essential = EssentialThread::with("test-essential", record);
+        })
+        .join()
+        .expect("clean exit");
+        assert_eq!(PANICKED.load(Ordering::SeqCst), 0);
+        // A panic is, and the action runs on the panicking thread before it
+        // is gone.
+        let joined = std::thread::spawn(|| {
+            let _essential = EssentialThread::with("test-essential", record);
+            panic!("intentional: essential thread panic");
+        })
+        .join();
+        assert!(joined.is_err());
+        assert_eq!(PANICKED.load(Ordering::SeqCst), 1);
+    }
+
+    /// W3-3 (GATE-08): the test above covers the drop guard with an injected
+    /// action. A panic cannot be injected into the swarm thread or the event
+    /// forwarder, and the abort is compiled out of the test binary, so this
+    /// reads the three places the fix lives in: both threads hold the guard
+    /// from their first statement, and the production action aborts.
+    #[test]
+    fn both_essential_threads_hold_the_guard_and_the_production_action_aborts() {
+        let p2p = include_str!("p2p.rs");
+        let spawn = p2p.find("std::thread::Builder::new().name(\"bloch-p2p\".into()).spawn(move || {").expect("swarm thread");
+        let guard = p2p.find("let _essential = crate::EssentialThread::new(\"bloch-p2p\");").expect("swarm thread guard");
+        let runtime = p2p[spawn..].find("tokio::runtime::Builder::new_current_thread()").map(|o| spawn + o).expect("swarm runtime");
+        assert!(spawn < guard && guard < runtime, "the swarm thread must hold the guard before it builds its runtime");
+
+        let engine = include_str!("engine.rs");
+        let guard = engine.find("let _essential = crate::EssentialThread::new(\"net-event-forwarder\");").expect("forwarder guard");
+        let work = engine[guard..].find("for ev in net_rx {").expect("forwarder loop after the guard");
+        assert!(work < 200, "the forwarder must hold the guard right before its loop");
+        let spawn = engine[..guard].rfind("std::thread::spawn(move || {").expect("forwarder thread");
+        assert!(!engine[spawn..guard].contains("net_rx"), "the forwarder reads events before it holds the guard");
+
+        let main = include_str!("main.rs");
+        assert!(main.contains("Self { name, on_panic: abort_for_essential_thread }"));
+        let action = main.find("fn abort_for_essential_thread(name: &'static str) {").expect("fatal action");
+        let body = &main[action..action + main[action..].find("\n}\n").expect("end of the action")];
+        assert!(body.contains("    #[cfg(not(test))]\n    std::process::abort();"), "the production action must abort");
+    }
 }
 
 fn main() {
@@ -392,12 +520,16 @@ fn print_help() {
                spending key. No acknowledgement: confirmation is seeing\n\
                it in a block.\n\
            bloch-pos ws-checkpoint --genesis <manifest> --rpc <a>[,<b>...]\n\
-                                   --epoch <E> --signer-set-id <n>\n\
+                                   --epoch <E> (--signer-set-id <n> | --operator-trusted | --release-anchor)\n\
                                    --out <prefix> [--publication-dir <0700 registry>]\n\
+                                   [--allow-single-rpc]\n\
                Derive the weak-subjectivity checkpoint for a FINALIZED\n\
                epoch from running nodes (all --rpc endpoints must agree),\n\
                writing <prefix>.bin (154 canonical bytes) + <prefix>.json\n\
                and printing the ws digest the signers sign.\n\
+               --release-anchor refuses fewer than two --rpc endpoints;\n\
+               --allow-single-rpc overrides that, only to re-derive an\n\
+               already published anchor against one node of your own.\n\
            bloch-pos slashing-protection <export|import|set-floor|retire>\n\
                --data-dir <dir> --validator-pubkey-sha3 <hex32>\n\
                --genesis-digest <hex32> [--signer-anchor-dir <dir>]\n\
@@ -408,11 +540,17 @@ fn print_help() {
                from booting on this host again (after a migration export).\n\
            bloch-pos run ... [--signer-anchor-dir <dir>] [--no-signer-anchor]\n\
                              [--accept-signing-rollback]\n\
+                             [--acknowledge-missing-slashing-protection]\n\
                Signer anchor (default $HOME/.bloch-signer): one lock per\n\
                validator key on this host, and a refusal to sign from a data\n\
                dir older than the key's last signature. An unwritable\n\
                default (systemd ProtectHome=, missing HOME) only warns;\n\
                an explicit --signer-anchor-dir must be usable.\n\
+               A key that already had duties on chain, in a data dir with\n\
+               no slashing_protection.bin and no usable anchor, refuses to\n\
+               sign: import the record, set a floor (slashing-protection\n\
+               import|set-floor), or acknowledge that the key has signed\n\
+               nothing else. A key not yet active starts as before.\n\
            bloch-pos watch-equivocation --rpc HOST:PORT [--rpc ...] --state FILE --out EVIDENCE.jsonl\n\
                [--from-slot N] [--to-slot N] [--window-epochs 256]   (read-only double/surround vote detector)\n\
            bloch-pos ws-keygen --out <prefix>\n\
@@ -503,12 +641,50 @@ fn print_help() {
          \n\
              devnet transport:\n\
                          --listen <port> [--listen-addr <ip>]\n\
-                         --peers <host:port,...>\n\
+                         --peers <host:port[=<mesh identity>],...>\n\
                --listen-addr binds the mesh listener somewhere other than\n\
                127.0.0.1, which is what a devnet spread across hosts needs.\n\
                This transport has no authentication and no admission\n\
                control, so a routable bind MUST be firewalled to the known\n\
                peer addresses.\n\
+                         [--mesh-security plain|offer|require]\n\
+                         [--mesh-allow <file>]\n\
+                         [--mesh-require-authenticated]\n\
+               Post-quantum mesh security (default plain = unchanged wire):\n\
+               hybrid ML-KEM-768 + X25519 key exchange, ML-DSA-65 transport\n\
+               identities, ChaCha20-Poly1305 records. The handshake proves\n\
+               which key a peer holds; a peer is AUTHENTICATED only if this\n\
+               node was told which identity to expect. The node's identity\n\
+               (64 hex digits) is printed at startup (`mesh security:`).\n\
+               Give the other nodes' identities either way, or both:\n\
+                 --mesh-allow <file>   one identity per line; any listed\n\
+                                       identity is accepted on any connection.\n\
+                 --peers host:port=<identity>   pin: that address is accepted\n\
+                                       under exactly that identity. Pinned\n\
+                                       identities are also admitted inbound.\n\
+                                       Without --mesh-allow, pin every peer.\n\
+               What each mode guarantees:\n\
+                 plain    nothing: no encryption, no authentication.\n\
+                 offer    a migration state. Seals connections to upgraded\n\
+                          peers, still talks plain to legacy ones; an active\n\
+                          attacker can force plain, so nothing is guaranteed\n\
+                          against one. A pinned peer is never dialed plain.\n\
+                 require, no --mesh-allow and no pins\n\
+                          ENCRYPTION ONLY. Stops a passive observer; ANY\n\
+                          identity is accepted, so a party on the path or\n\
+                          able to reach the port can pose as a peer. The\n\
+                          node warns at every boot.\n\
+                 require + --mesh-allow\n\
+                          authenticated against the closed set of listed\n\
+                          identities, in both directions.\n\
+                 require + pins\n\
+                          authenticated per peer: each dialed address under\n\
+                          exactly its pinned identity; inbound only pinned\n\
+                          or listed identities.\n\
+               --mesh-require-authenticated refuses to start unless the mode\n\
+               is require with an allow-list or pins, instead of warning.\n\
+               Roll out plain -> offer -> require, one node at a time, then\n\
+               add identities and --mesh-require-authenticated.\n\
          \n\
              libp2p transport:\n\
                          [--p2p-listen <multiaddr>[,...]] (default\n\
@@ -523,8 +699,15 @@ fn print_help() {
          \n\
                          [--stop-at-slot <n>]\n\
                          [--replay-from-genesis | --require-state-cache] [--max-replay-blocks <n>]\n\
+                         [--reject-block-root <block-id-hex64>]... (or\n\
+                          BLOCH_REJECT_BLOCK_ROOTS=<hex64>[,...]): never adopt\n\
+                          that block or any descendant; node-local; a logged\n\
+                          chain holding it is truncated to its parent at boot\n\
                          [--ws-checkpoint <file> --ws-signer-set <file>\n\
                           --ws-signer-set-sha3 <independently-verified-hex32>]\n\
+                         [--checkpoint-sync-url <host:port>[,<host:port>...]]\n\
+                         [--ws-trusted-checkpoint <cp.bin>]\n\
+                         [--ws-trusted-root <independently-compared-hex32>]\n\
                          [--carryover <snapshot.tsv>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
                data persists in <dir>; a compatible local state cache skips its replay prefix.\n\
@@ -535,6 +718,7 @@ fn print_help() {
                total — before a single balance is admitted. A devnet\n\
                manifest commits to none and the flag is then refused.\n\
                          [--rpc-bind <ip>] [--rpc-port <n>|off]\n\
+                         [--rpc-trusted-proxy <ip[,ip...]>]\n\
                          [--metrics-bind <ip>] [--metrics-port <n>] [--allow-public-metrics]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
                data persists in <dir>; a compatible local state cache skips its replay prefix.\n\
@@ -553,6 +737,9 @@ fn print_help() {
                unauthenticated. A non-loopback bind is refused unless\n\
                --allow-public-metrics explicitly acknowledges the exposure;\n\
                that flag adds no authentication, so firewall it like RPC.\n\
+               Requests must carry a Host naming loopback, the bound\n\
+               address (on 0.0.0.0/::, the IP the scraper connected to) or\n\
+               a name in BLOCH_RPC_HOST_ALLOWLIST; others get 403.\n\
                  Methods: getbuildinfo, getchaininfo, getblockcount,\n\
                  getblockbyslot, getblockbyid, getvalidator,\n\
                  getvalidatorcount, getbalance, gettxout, getutxos (alias\n\
@@ -575,12 +762,40 @@ fn print_help() {
                port to the clients that are meant to reach it; anything that\n\
                can open a socket to it can read the node's entire state and\n\
                submit transactions.\n\
+               \n\
+               What the RPC does bound is concurrency, per source address:\n\
+               64 connections in all, 8 per source, 16 calls queued for the\n\
+               consensus thread per source. The source is the TCP peer, so\n\
+               behind a reverse proxy or tunnel (nginx, cloudflared, socat)\n\
+               EVERY caller is the proxy's address and shares one bucket —\n\
+               limit per client at the proxy. --rpc-trusted-proxy (or\n\
+               BLOCH_RPC_TRUSTED_PROXIES) names the proxy's own address(es),\n\
+               e.g. 127.0.0.1; only connections from those addresses then\n\
+               have their source taken from X-Forwarded-For (the right-most\n\
+               entry that is not itself a listed proxy). Default: none, and\n\
+               forwarded headers are ignored. List only addresses from\n\
+               which nothing but your proxy can connect.\n\
                A node started with an EMPTY data dir syncs from genesis: it\n\
                downloads every block from peers and validates each one\n\
                itself. No datadir is ever donated. While the chain is\n\
                younger than the weak-subjectivity period that needs no\n\
                checkpoint at all; past it, a fresh node requires\n\
                --ws-checkpoint and says so rather than syncing blindly.\n\
+               Release builds (--features ws-release-anchor, shown as\n\
+               +ws-release-anchor in --version) bake a recent finalized\n\
+               checkpoint into the binary and resume a checkpoint sync\n\
+               after a restart; such a node needs no flag at all.\n\
+               PROTOTYPE (built only with --features ws-auto-checkpoint,\n\
+               refused by release builds): the three unsigned flags below.\n\
+               --checkpoint-sync-url is the easy way in (the Ethereum model):\n\
+               a new node asks those RPCs for their latest finalized\n\
+               checkpoint, requires them all to agree, and syncs under it.\n\
+               No files, no signatures; you trust the nodes you named.\n\
+               It is consulted ONLY when this node lacks fresh finality of\n\
+               its own, so running nodes are unaffected by it.\n\
+               --ws-trusted-checkpoint is the offline variant: the file\n\
+               `ws-checkpoint --operator-trusted` writes. --ws-trusted-root\n\
+               (optional) pins the block root you compared on the explorer.\n\
                --ws-checkpoint supplies a signed weak-subjectivity\n\
                checkpoint envelope (BLOCH-WEAK-SUBJECTIVITY.md §4.1). A node\n\
                with neither a fresh checkpoint nor fresh finality of its own\n\
@@ -810,28 +1025,59 @@ fn arg_after(args: &[String], i: usize) -> Option<&String> {
 /// reason. This parser intentionally needs to know only which run flags do not
 /// consume a following value; every other `--flag` consumes one token here.
 fn run_switch(args: &[String], name: &str) -> bool {
-    const SWITCHES: &[&str] = &[
-        "--allow-finality-rewind",
-        "--allow-plaintext-keystore",
-        "--allow-public-metrics",
-        "--behind-proxy",
-        "--bind-genesis",
-        "--no-doppelganger-check",
-        "--no-signer-anchor",
-        "--accept-signing-rollback",
-        "--replay-from-genesis",
-        "--require-state-cache",
-    ];
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         if arg == "--" { break; }
         if arg == name { return true; }
-        if arg.starts_with("--") && !SWITCHES.contains(&arg.as_str()) && !arg.contains('=') {
+        if arg.starts_with("--") && !RUN_SWITCHES.contains(&arg.as_str()) && !arg.contains('=') {
             rest.next();
         }
     }
     false
 }
+
+/// Every value of the repeatable `--reject-block-root <hex>` run option, each
+/// checked to be exactly a 64-hex-digit block id. Walks argv the way
+/// [`run_switch`] does, so a token that is another option's value is data.
+fn reject_block_root_args(args: &[String]) -> Result<Vec<String>, String> {
+    let mut roots = Vec::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--" { break; }
+        if arg == "--reject-block-root" {
+            let value = rest.next().ok_or("--reject-block-root needs a 64-hex-digit block id")?;
+            engine::parse_reject_block_root(value)?;
+            roots.push(value.clone());
+        } else if let Some(value) = arg.strip_prefix("--reject-block-root=") {
+            // Audit L1-11: the `=` form used to be skipped as an unknown
+            // `--flag=value` token, so the node booted with no root armed.
+            // A safety control operated during a split is never ignored.
+            engine::parse_reject_block_root(value)?;
+            roots.push(value.to_string());
+        } else if arg.starts_with("--") && !RUN_SWITCHES.contains(&arg.as_str()) && !arg.contains('=') {
+            rest.next();
+        }
+    }
+    Ok(roots)
+}
+
+/// The run flags that do not consume a following value.
+const RUN_SWITCHES: &[&str] = &[
+    "--allow-finality-rewind",
+    "--allow-plaintext-keystore",
+    "--allow-public-metrics",
+    "--behind-proxy",
+    "--bind-genesis",
+    "--mesh-require-authenticated",
+    "--no-doppelganger-check",
+    "--no-signer-anchor",
+    "--accept-signing-rollback",
+    "--acknowledge-missing-slashing-protection",
+    "--replay-from-genesis",
+    "--require-state-cache",
+    "--security-status",
+    "--security-status-remote",
+];
 
 /// Validate the metrics listener's exposure posture before the engine starts.
 /// Metrics are intentionally unauthenticated; an explicit flag acknowledges a
@@ -1571,7 +1817,7 @@ pub(crate) fn decide_transport(args: &[String]) -> Result<TransportPlan, String>
         }
     }
     if !runs_devnet {
-        for f in ["--listen", "--listen-addr", "--peers"] {
+        for f in ["--listen", "--listen-addr", "--peers", "--mesh-security", "--mesh-allow", "--mesh-require-authenticated"] {
             if present(f) {
                 contradictions.push(f.to_string());
             }
@@ -1725,6 +1971,12 @@ fn run_cmd(args: &[String]) {
     if let Some(value) = arg_value(args, "--signer-anchor-dir") {
         unsafe { std::env::set_var(signer_anchor::ENV_DIR, value) };
     }
+    // Review CR-8: a registered key with no slashing-protection record and no
+    // signer anchor refuses to sign unless the operator says the key has
+    // signed nothing this node does not know about.
+    if run_switch(args, "--acknowledge-missing-slashing-protection") {
+        unsafe { std::env::set_var(slashprot::ENV_ACK_MISSING, "1") };
+    }
     if let Some(value) = arg_value(args, "--max-replay-blocks") {
         if value.parse::<usize>().is_err() {
             eprintln!("run: --max-replay-blocks must be a non-negative integer"); exit(2);
@@ -1736,6 +1988,24 @@ fn run_cmd(args: &[String]) {
     }
     if args.iter().any(|a| a == "--require-state-cache") {
         unsafe { std::env::set_var("BLOCH_REQUIRE_STATE_CACHE", "1") };
+    }
+    // Incident 2026-11-12: `--reject-block-root <hex>` (repeatable) is sugar
+    // over BLOCH_REJECT_BLOCK_ROOTS, folded into it so the engine reads one
+    // source; see `engine/reject_roots.rs`. Malformed input stops here.
+    match reject_block_root_args(args) {
+        Ok(roots) if roots.is_empty() => {}
+        Ok(mut roots) => {
+            if let Ok(existing) = std::env::var(engine::ENV_REJECT_BLOCK_ROOTS) {
+                if !existing.trim().is_empty() {
+                    roots.insert(0, existing);
+                }
+            }
+            unsafe { std::env::set_var(engine::ENV_REJECT_BLOCK_ROOTS, roots.join(",")) };
+        }
+        Err(e) => {
+            eprintln!("run: {e}");
+            exit(2);
+        }
     }
     // The transport is decided by a pure function (`decide_transport`) and
     // then ANNOUNCED. Nothing below re-derives it, and nothing silently drops
@@ -1794,6 +2064,23 @@ fn run_cmd(args: &[String]) {
         },
     };
 
+    // Trusted reverse proxies for RPC source attribution. Sugar over the env
+    // var `rpc::serve` reads, like the operator flags above (same SAFETY
+    // note: still single-threaded here). Validated now, so a typo is a
+    // refusal at startup with the flag's name on it.
+    if let Some(value) = arg_value(args, "--rpc-trusted-proxy") {
+        if let Err(why) = rpc::TrustedProxies::parse(&value) {
+            eprintln!("run: --rpc-trusted-proxy: {why}");
+            exit(2);
+        }
+        unsafe { std::env::set_var(rpc::RPC_TRUSTED_PROXIES_ENV, value) };
+    } else if let Ok(value) = std::env::var(rpc::RPC_TRUSTED_PROXIES_ENV) {
+        if let Err(why) = rpc::TrustedProxies::parse(&value) {
+            eprintln!("run: {}: {why}", rpc::RPC_TRUSTED_PROXIES_ENV);
+            exit(2);
+        }
+    }
+
     // Metrics/health (audit C-R6-2). OPT-IN: no flag, no listener, so an
     // unflagged fleet binary behaves byte-for-byte as before. Same refusal
     // rule as --rpc-port: a malformed port stops the boot rather than
@@ -1815,6 +2102,46 @@ fn run_cmd(args: &[String]) {
         exit(2);
     });
 
+    // `--peers host:port=<identity>` pins the mesh identity expected at that
+    // address; the dialer gets the bare address and the pin travels with the
+    // mesh security plan. An entry without `=` is unchanged.
+    let (peers, peer_pins) = mesh_pq::split_peer_pins(&csv("--peers")).unwrap_or_else(|error| {
+        eprintln!("run: {error}");
+        exit(2);
+    });
+    let mesh = engine::MeshPlan {
+        mode: match arg_value(args, "--mesh-security") {
+            None => mesh_pq::Mode::Plain,
+            Some(s) => mesh_pq::Mode::parse(&s).unwrap_or_else(|error| {
+                eprintln!("run: {error}");
+                exit(2);
+            }),
+        },
+        allow: arg_value(args, "--mesh-allow").map(PathBuf::from),
+        pins: peer_pins,
+        require_authenticated: args.iter().any(|a| a == "--mesh-require-authenticated"),
+    };
+    if mesh.allow.is_some() && mesh.mode == mesh_pq::Mode::Plain {
+        eprintln!("run: --mesh-allow needs --mesh-security offer or require");
+        exit(2);
+    }
+    if !mesh.pins.is_empty() && mesh.mode == mesh_pq::Mode::Plain {
+        eprintln!("run: a pinned --peers entry (host:port=<identity>) needs --mesh-security offer or require");
+        exit(2);
+    }
+    if mesh.require_authenticated && mesh.mode != mesh_pq::Mode::Require {
+        eprintln!("run: --mesh-require-authenticated needs --mesh-security require");
+        exit(2);
+    }
+    // Bloch Sentinel hooks (docs/SENTINEL-HOOKS.md): node-local, OFF unless
+    // one of these flags is given. Started here, before the engine, so a bad
+    // flag, path or socket stops the boot.
+    let sentinel_rpc_bind = rpc_port.map(|_| arg_value(args, "--rpc-bind").unwrap_or_else(|| "127.0.0.1".to_string()));
+    let sentinel_cfg = sentinel::Config::from_args(args, peers.clone(), csv("--p2p-peer"), sentinel_rpc_bind.as_deref());
+    if let Err(e) = sentinel_cfg.and_then(sentinel::start) {
+        eprintln!("run: {e}");
+        exit(2);
+    }
     let cfg = engine::Config {
         data_dir: PathBuf::from(data_dir),
         genesis_path: PathBuf::from(genesis_path),
@@ -1823,7 +2150,7 @@ fn run_cmd(args: &[String]) {
         // Loopback unless asked otherwise: the devnet transport authenticates
         // nothing, so a routable bind is a deliberate act plus a firewall.
         listen_addr: arg_value(args, "--listen-addr").unwrap_or_else(|| "127.0.0.1".to_string()),
-        peers: csv("--peers"),
+        peers,
         p2p_listen,
         p2p_peers: csv("--p2p-peer"),
         max_peers: arg_value(args, "--max-peers")
@@ -1845,6 +2172,7 @@ fn run_cmd(args: &[String]) {
         // status for anyone who can reach it.
         metrics_bind,
         metrics_port,
+        mesh,
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");
@@ -2145,6 +2473,55 @@ mod plaintext_flag_tests {
         assert!(!super::plaintext_opt_in_flag(&args(&["run", "--data-dir", "--allow-plaintext-keystore"])));
         assert!(!super::plaintext_opt_in_flag(&args(&["run", "--", "--allow-plaintext-keystore"])));
         assert!(!super::plaintext_opt_in_flag(&args(&["slashing-protection", "--allow-plaintext-keystore"])));
+    }
+}
+
+#[cfg(test)]
+mod reject_block_root_flag_tests {
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn repeatable_and_strict() {
+        let a = "ab".repeat(32);
+        let b = "CD".repeat(32);
+        assert_eq!(super::reject_block_root_args(&args(&["run"])).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            super::reject_block_root_args(&args(&[
+                "run", "--reject-block-root", &a, "--allow-finality-rewind", "--reject-block-root", &b,
+            ])).unwrap(),
+            vec![a.clone(), b.clone()],
+        );
+        // A token that is another option's value is data, not the flag.
+        assert!(super::reject_block_root_args(&args(&["run", "--data-dir", "--reject-block-root"])).unwrap().is_empty());
+        assert!(super::reject_block_root_args(&args(&["run", "--", "--reject-block-root", "zz"])).unwrap().is_empty());
+        for bad in [&["run", "--reject-block-root"][..], &["run", "--reject-block-root", "abc"][..]] {
+            assert!(super::reject_block_root_args(&args(bad)).is_err(), "{bad:?}");
+        }
+        let short = "ab".repeat(31);
+        assert!(super::reject_block_root_args(&args(&["run", "--reject-block-root", &short])).is_err());
+    }
+
+    /// Audit L1-11: `--reject-block-root=<hex>` arms the root (it used to be
+    /// skipped in silence), strictly, and mixes with the spaced form.
+    #[test]
+    fn the_equals_form_is_honoured_and_strict() {
+        let a = "ab".repeat(32);
+        let b = "CD".repeat(32);
+        assert_eq!(
+            super::reject_block_root_args(&args(&["run", &format!("--reject-block-root={a}")])).unwrap(),
+            vec![a.clone()],
+        );
+        assert_eq!(
+            super::reject_block_root_args(&args(&[
+                "run", &format!("--reject-block-root={a}"), "--reject-block-root", &b,
+            ])).unwrap(),
+            vec![a.clone(), b.clone()],
+        );
+        for bad in ["--reject-block-root=", "--reject-block-root=zz", "--reject-block-root=0xab"] {
+            assert!(super::reject_block_root_args(&args(&["run", bad])).is_err(), "{bad}");
+        }
     }
 }
 

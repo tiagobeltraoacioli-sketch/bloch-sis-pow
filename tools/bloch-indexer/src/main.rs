@@ -7,6 +7,7 @@
 //! bloch-indexer serve   --log L --manifest M --carryover C [--bind 127.0.0.1:8090] [--poll-ms 5000]
 //! bloch-indexer verify-reorg --log L --manifest M --carryover C [--depth 13]
 //! bloch-indexer compare --log L --manifest M --carryover C [--archival 139.180.166.5:8080] [--sample 64]
+//! bloch-indexer audit-ledger --log L --manifest M --carryover C [--every N] [--require-l2-kinds]
 //! bloch-indexer gates
 //! ```
 //!
@@ -40,6 +41,8 @@ struct Args {
     depth: usize,
     undo_depth: usize,
     ledger_check: bool,
+    every: u64,
+    require_l2_kinds: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -55,6 +58,8 @@ fn parse_args() -> Result<Args, String> {
         depth: 13,
         undo_depth: DEFAULT_UNDO_DEPTH,
         ledger_check: true,
+        every: 1,
+        require_l2_kinds: false,
     };
     let mut it = std::env::args().skip(1);
     a.cmd = it.next().ok_or_else(usage)?;
@@ -71,6 +76,8 @@ fn parse_args() -> Result<Args, String> {
             "--depth" => a.depth = val()?.parse().map_err(|_| "bad --depth")?,
             "--undo-depth" => a.undo_depth = val()?.parse().map_err(|_| "bad --undo-depth")?,
             "--no-ledger-check" => a.ledger_check = false,
+            "--every" => a.every = val()?.parse().map_err(|_| "bad --every")?,
+            "--require-l2-kinds" => a.require_l2_kinds = true,
             other => return Err(format!("unknown flag {other}\n{}", usage())),
         }
     }
@@ -78,9 +85,9 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn usage() -> String {
-    "usage: bloch-indexer <build|serve|verify-reorg|compare> --log L --manifest M --carryover C \
+    "usage: bloch-indexer <build|serve|verify-reorg|compare|audit-ledger> --log L --manifest M --carryover C \
      [--bind ADDR] [--archival HOST:PORT] [--poll-ms N] [--sample N] [--depth N] [--undo-depth N] \
-     [--no-ledger-check]\n       bloch-indexer gates"
+     [--no-ledger-check] [--every N] [--require-l2-kinds]\n       bloch-indexer gates"
         .to_string()
 }
 
@@ -109,6 +116,14 @@ fn run() -> Result<(), String> {
         "serve" => serve(&a),
         "verify-reorg" => verify_reorg(&a),
         "compare" => compare(&a),
+        "audit-ledger" => {
+            let report = bloch_indexer::audit::audit_log(&a.log, &a.manifest, &a.carryover, a.every)?;
+            print!("{}", report.describe());
+            if a.require_l2_kinds {
+                report.require_all_l2_kinds()?;
+            }
+            Ok(())
+        }
         other => Err(format!("unknown command {other}\n{}", usage())),
     }
 }
@@ -425,6 +440,8 @@ fn clone_args(a: &Args) -> Args {
         depth: a.depth,
         undo_depth: a.undo_depth,
         ledger_check: a.ledger_check,
+        every: a.every,
+        require_l2_kinds: a.require_l2_kinds,
     }
 }
 

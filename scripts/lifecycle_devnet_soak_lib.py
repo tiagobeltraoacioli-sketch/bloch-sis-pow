@@ -337,6 +337,7 @@ class Relay:
 
     def __init__(self, listen_port: int, target_port: int, host: str = "127.0.0.1") -> None:
         self.listen_port, self.target_port, self.host = listen_port, target_port, host
+        self.source: str | None = None
         self.forwarded_bytes = 0
         self.connections_accepted = 0
         self._lock = threading.Lock()
@@ -390,7 +391,8 @@ class Relay:
                 client.close()
                 continue
             try:
-                upstream = socket.create_connection((self.host, self.target_port), timeout=2.0)
+                upstream = socket.create_connection((self.host, self.target_port), timeout=2.0,
+                                                    source_address=(self.source, 0) if self.source else None)
             except OSError:
                 client.close()
                 continue

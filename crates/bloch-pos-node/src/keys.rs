@@ -924,31 +924,10 @@ impl Keystore {
         sign_fn: impl Fn(&[u8], &[u8]) -> Result<Vec<u8>, bloch_crypto::crypto::CryptoError>,
         verify_fn: impl Fn(&[u8], &[u8], &[u8]) -> bool,
     ) -> Vec<u8> {
-        let started = std::time::Instant::now();
-        for _attempt in 0..SIGN_VERIFY_ATTEMPTS {
-            match bloch_crypto::crypto::hardening::sign_verified_with(
-                &sign_fn,
-                &verify_fn,
-                &self.secret,
-                &self.pubkey,
-                signing_root,
-            ) {
-                Ok(signature) => {
-                    pad_signing_latency(started, signing_latency_floor());
-                    return signature;
-                }
-                Err(e) => eprintln!("SIGNER FAULT (validator {}): {e}", self.index),
-            }
+        match sign_verified_released(self.index, &self.secret, &self.pubkey, signing_root, sign_fn, verify_fn) {
+            Ok(signature) => signature,
+            Err(SignerFault) => abort_on_signer_fault(self.index, "the keystore's own public key"),
         }
-        eprintln!(
-            "SIGNER FAULT (validator {}): {SIGN_VERIFY_ATTEMPTS} consecutive signatures failed \
-             verification under the keystore's own public key. Aborting so that no faulty \
-             signature is ever released; on restart the signer self-test runs before any \
-             signing. Check the host for hardware faults and the keystore for a pubkey/secret \
-             mismatch (p9e finding 2, docs/CRYPTO-AUDIT-STATUS-20261020.md).",
-            self.index
-        );
-        std::process::abort()
     }
 
     /// Power-on checks for a host about to sign with this keystore
@@ -971,15 +950,100 @@ impl Keystore {
     /// (`max_len`) is below the maximum hybrid signature length — e.g.
     /// `funded::ADMISSION_PQ_SIGNATURE_MAX`. Falcon-1024 signatures are
     /// variable length, so this re-signs with fresh randomness until the
-    /// encoding fits ([`bloch_crypto::crypto::sign_fitting`]). An `Err` means
-    /// no attempt fit within the retry budget; nothing is emitted then.
+    /// encoding fits (the retry budget of
+    /// [`bloch_crypto::crypto::sign_fitting`]). An `Err` means no attempt fit
+    /// within the retry budget; nothing is emitted then.
+    ///
+    /// Every draw goes through the same verify-before-release path as
+    /// [`Self::sign`] (review CRY-6): this is the validator's static key, and
+    /// a faulted hybrid signature must not leave the keystore through this
+    /// entry point either. A signer that keeps faulting aborts the process.
     pub fn sign_fitting(&self, signing_root: &[u8; 32], max_len: usize) -> Result<Vec<u8>, String> {
-        bloch_crypto::crypto::sign_fitting(&self.secret, signing_root, max_len)
-            .map_err(|e| format!("signing failed: {e}"))
+        match sign_fitting_released(self.index, &self.secret, &self.pubkey, signing_root, max_len, bloch_crypto::crypto::sign) {
+            Ok(outcome) => outcome,
+            Err(SignerFault) => abort_on_signer_fault(self.index, "this keystore's public key"),
+        }
     }
 }
 
-/// Signing attempts before [`Keystore::sign`] gives up and aborts.
+/// [`Keystore::sign_fitting`] with an explicit signer. Each draw is released
+/// by [`sign_verified_released`] and then kept only if it fits `max_len`; an
+/// oversized draw is a valid signature that is discarded, not emitted. The
+/// outer `Err` is a signer whose draws do not verify (nothing released).
+pub(crate) fn sign_fitting_released(
+    validator: u32,
+    secret: &[u8],
+    pubkey: &[u8],
+    signing_root: &[u8; 32],
+    max_len: usize,
+    sign_fn: impl Fn(&[u8], &[u8]) -> Result<Vec<u8>, bloch_crypto::crypto::CryptoError>,
+) -> Result<Result<Vec<u8>, String>, SignerFault> {
+    use bloch_crypto::crypto::SIGN_FITTING_MAX_ATTEMPTS;
+    let mut last_len = 0usize;
+    for _ in 0..SIGN_FITTING_MAX_ATTEMPTS {
+        let signature =
+            sign_verified_released(validator, secret, pubkey, signing_root, &sign_fn, bloch_crypto::crypto::verify)?;
+        if signature.len() <= max_len {
+            return Ok(Ok(signature));
+        }
+        last_len = signature.len();
+    }
+    Ok(Err(format!(
+        "signing failed: no signature within {max_len} bytes after {SIGN_FITTING_MAX_ATTEMPTS} attempts \
+         (last attempt was {last_len} bytes)"
+    )))
+}
+
+/// Every attempt of [`sign_verified_released`] produced a signature that did
+/// not verify. Nothing was released.
+#[derive(Debug)]
+pub(crate) struct SignerFault;
+
+/// The verify-before-release loop shared by the static key
+/// ([`Keystore::sign`]) and the forward-secure leaf key
+/// (`kes_key::KesKey::sign`): sign with `sign_fn`, return the signature only
+/// if `verify_fn` accepts it under `pubkey`, retry with fresh randomness up to
+/// [`SIGN_VERIFY_ATTEMPTS`] times, and apply the latency floor
+/// ([`SIGN_LATENCY_FLOOR_ENV`]) to a released signature. `Err` means no
+/// signature left this function; production callers then abort
+/// ([`abort_on_signer_fault`]).
+pub(crate) fn sign_verified_released(
+    validator: u32,
+    secret: &[u8],
+    pubkey: &[u8],
+    message: &[u8; 32],
+    sign_fn: impl Fn(&[u8], &[u8]) -> Result<Vec<u8>, bloch_crypto::crypto::CryptoError>,
+    verify_fn: impl Fn(&[u8], &[u8], &[u8]) -> bool,
+) -> Result<Vec<u8>, SignerFault> {
+    let started = std::time::Instant::now();
+    for _attempt in 0..SIGN_VERIFY_ATTEMPTS {
+        match bloch_crypto::crypto::hardening::sign_verified_with(&sign_fn, &verify_fn, secret, pubkey, message) {
+            Ok(signature) => {
+                pad_signing_latency(started, signing_latency_floor());
+                return Ok(signature);
+            }
+            Err(e) => eprintln!("SIGNER FAULT (validator {validator}): {e}"),
+        }
+    }
+    Err(SignerFault)
+}
+
+/// The signer keeps producing signatures that do not verify under `key`
+/// (hardware fault, or public and secret halves that disagree): abort rather
+/// than keep exercising the key. A restart runs the power-on self-test
+/// (`prepare_signing_host`) before signing again.
+pub(crate) fn abort_on_signer_fault(validator: u32, key: &str) -> ! {
+    eprintln!(
+        "SIGNER FAULT (validator {validator}): {SIGN_VERIFY_ATTEMPTS} consecutive signatures failed \
+         verification under {key}. Aborting so that no faulty \
+         signature is ever released; on restart the signer self-test runs before any \
+         signing. Check the host for hardware faults and the keystore for a pubkey/secret \
+         mismatch (p9e finding 2, docs/CRYPTO-AUDIT-STATUS-20261020.md)."
+    );
+    std::process::abort()
+}
+
+/// Signing attempts before [`sign_verified_released`] gives up (callers abort).
 pub const SIGN_VERIFY_ATTEMPTS: u32 = 3;
 
 /// Opt-in for signing on an architecture outside
@@ -1647,7 +1711,7 @@ mod tests {
                 + bloch_crypto::crypto::slhdsa_suite::slhdsa_suite_pubkey_body_len()
         );
         assert_eq!(p::SLHDSA_FALCON_MAX_ENVELOPED_SIG_LEN, bloch_crypto::crypto::max_slhdsa_suite_signature_len());
-        assert_eq!(p::HF3_SLH_SUITE_EPOCH, u64::MAX, "HF3 ships inert");
+        assert_eq!(p::HF3_SLH_SUITE_EPOCH, 7360, "HF3 armed at the notice epoch");
     }
 
     #[test]
@@ -2582,6 +2646,52 @@ mod signer_hardening_tests {
             assert!(bloch_crypto::crypto::verify(&ks.pubkey, &root, &sig));
         }
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A signer whose output never verifies releases nothing, after exactly
+    /// `SIGN_VERIFY_ATTEMPTS` attempts (the caller then aborts).
+    #[test]
+    fn a_signer_that_keeps_faulting_releases_nothing() {
+        let (pubkey, secret) = bloch_crypto::crypto::generate_keypair();
+        let attempts = std::cell::Cell::new(0u32);
+        let faulted = |sk: &[u8], m: &[u8]| {
+            attempts.set(attempts.get() + 1);
+            let mut sig = bloch_crypto::crypto::sign(sk, m)?;
+            let last = sig.len() - 1;
+            sig[last] ^= 1;
+            Ok(sig)
+        };
+        let out = sign_verified_released(1, &secret, &pubkey, &[7u8; 32], faulted, bloch_crypto::crypto::verify);
+        assert!(out.is_err(), "a faulted signature must be withheld");
+        assert_eq!(attempts.get(), SIGN_VERIFY_ATTEMPTS);
+    }
+
+    /// Review CRY-6: `sign_fitting` is a release path of the static key like
+    /// any other. A signer whose draws do not verify releases nothing, after
+    /// `SIGN_VERIFY_ATTEMPTS` attempts and not the 64 of the fitting budget
+    /// (production then aborts); a healthy signer's result fits and verifies.
+    #[test]
+    fn sign_fitting_withholds_a_faulted_signature() {
+        use bloch_pos_committee::transition::funded::ADMISSION_PQ_SIGNATURE_MAX;
+        let (pubkey, secret) = bloch_crypto::crypto::generate_keypair();
+        let root = [9u8; 32];
+        let attempts = std::cell::Cell::new(0u32);
+        let faulted = |sk: &[u8], m: &[u8]| {
+            attempts.set(attempts.get() + 1);
+            let mut sig = bloch_crypto::crypto::sign(sk, m)?;
+            let last = sig.len() - 1;
+            sig[last] ^= 1;
+            Ok(sig)
+        };
+        let out = sign_fitting_released(1, &secret, &pubkey, &root, usize::MAX, faulted);
+        assert!(out.is_err(), "a faulted signature must be withheld even though it fits");
+        assert_eq!(attempts.get(), SIGN_VERIFY_ATTEMPTS);
+
+        let sig = sign_fitting_released(1, &secret, &pubkey, &root, ADMISSION_PQ_SIGNATURE_MAX, bloch_crypto::crypto::sign)
+            .expect("no fault")
+            .expect("fits");
+        assert!(sig.len() <= ADMISSION_PQ_SIGNATURE_MAX);
+        assert!(bloch_crypto::crypto::verify(&pubkey, &root, &sig));
     }
 
     #[test]

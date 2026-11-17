@@ -3,6 +3,8 @@
 // All values come from the environment (see .env.example). No secrets are
 // hardcoded; the signing key lives entirely behind FAUCET_SIGNER_CMD.
 
+import { isIP } from "node:net";
+
 function envStr(name: string, fallback: string): string {
   const v = process.env[name];
   return v === undefined || v === "" ? fallback : v;
@@ -13,6 +15,36 @@ function envInt(name: string, fallback: number): number {
   if (v === undefined || v === "") return fallback;
   const n = Number(v);
   return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+
+/** Normalise an IP literal for comparison: strip an IPv4-mapped IPv6 prefix. */
+export function normalizeIp(ip: string): string {
+  const t = ip.trim();
+  const m = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(t);
+  return (m ? m[1]! : t).toLowerCase();
+}
+
+/**
+ * L1M-02: the set of TCP peers allowed to name the client in X-Forwarded-For.
+ * `FAUCET_TRUSTED_PROXIES` is a comma-separated list of IP literals (no
+ * hostnames, no CIDR); a malformed entry refuses to start. The historical
+ * `FAUCET_TRUST_PROXY=1` switch is kept as a shorthand for "the proxy is on
+ * loopback" (127.0.0.1 and ::1). Neither set → XFF is ignored entirely.
+ */
+export function parseTrustedProxies(list: string | undefined, legacyTrustProxy: string | undefined): string[] {
+  const out = new Set<string>();
+  if (list !== undefined && list.trim() !== "") {
+    for (const raw of list.split(",")) {
+      const ip = normalizeIp(raw);
+      if (isIP(ip) === 0) throw new Error(`FAUCET_TRUSTED_PROXIES: not an IP literal: ${JSON.stringify(raw.trim())}`);
+      out.add(ip);
+    }
+  }
+  if (legacyTrustProxy === "1") {
+    out.add("127.0.0.1");
+    out.add("::1");
+  }
+  return [...out];
 }
 
 function envBool(name: string, fallback: boolean): boolean {
@@ -35,6 +67,8 @@ export interface FaucetConfig {
   perAddressWindowMs: number;
   perIpWindowMs: number;
   perIpMax: number;
+  /** Normalised IP literals of reverse proxies whose X-Forwarded-For is honoured. */
+  trustedProxies: string[];
 }
 
 export function loadConfig(): FaucetConfig {
@@ -53,5 +87,6 @@ export function loadConfig(): FaucetConfig {
     perAddressWindowMs: envInt("FAUCET_PER_ADDRESS_WINDOW_MS", 86_400_000),
     perIpWindowMs: envInt("FAUCET_PER_IP_WINDOW_MS", 3_600_000),
     perIpMax: envInt("FAUCET_PER_IP_MAX", 5),
+    trustedProxies: parseTrustedProxies(process.env["FAUCET_TRUSTED_PROXIES"], process.env["FAUCET_TRUST_PROXY"]),
   };
 }

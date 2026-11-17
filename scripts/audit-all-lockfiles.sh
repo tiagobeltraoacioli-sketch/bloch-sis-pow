@@ -51,6 +51,12 @@ LOCKFILES=(
   spikes/prover-cost/rv32h/Cargo.lock
   spikes/prover-cost/rv32k/Cargo.lock
   tools/bloch-devkit/templates/svm/Cargo.lock # generated SVM project template
+  # Added 2026-11-15 (L1M-17): committed since ae67e009/0a17c4c3 (2026-10-20)
+  # but never listed, so step 1 below failed the job on its own.
+  audit/pq-conformance/Cargo.lock             # PQ conformance harness (offline)
+  crates/bloch-crypto/fuzz/Cargo.lock         # bloch-crypto fuzz targets
+  spikes/slhdsa-verify-cost/Cargo.lock        # SLH-DSA verify-cost spike
+  spikes/slhdsa-verify-cost/rv32s/Cargo.lock  # its SP1 guest workspace
 )
 
 # 1) No committed lockfile may be missing from the list above.

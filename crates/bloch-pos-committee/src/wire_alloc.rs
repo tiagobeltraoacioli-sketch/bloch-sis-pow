@@ -116,8 +116,12 @@ pub mod local_cache {
     pub const FINALITY_SET: &[u8; 16] = b"BPOSST01:FSET:v1";
     /// HF1 own-target checkpoints (p2a).
     pub const OWN_CHECKPOINTS: &[u8; 16] = b"BPOSST01:FFGO:v1";
+    /// Commission-update epochs of the current epoch (security review round
+    /// 2 DET-3, `COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH`).
+    pub const COMMISSION_UPDATES: &[u8; 16] = b"BPOSST01:COMU:v1";
     /// Fixed merge/parse order.
-    pub const ORDER: [&[u8; 16]; 6] = [L2, L2_CHECKPOINTS, KES, PQ, FINALITY_SET, OWN_CHECKPOINTS];
+    pub const ORDER: [&[u8; 16]; 7] =
+        [L2, L2_CHECKPOINTS, KES, PQ, FINALITY_SET, OWN_CHECKPOINTS, COMMISSION_UPDATES];
 }
 
 /// Trailing extensions of the finality leaf (state tag `0x09`). Absent while

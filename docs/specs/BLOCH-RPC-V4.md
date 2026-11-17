@@ -254,6 +254,26 @@ types (`DepositTx` with suite-tagged pubkey + proof-of-possession, `ExitTx`,
 `estimatefee`, `estimatefeeadvanced`, `getpeerinfo`, `getpeers`,
 `getattestation` (TEE — see §5), and the feature-gated `euvm_*` trio.
 
+**Ledger reads state their read point (2026-11-10).** In `bloch-pos`,
+`getbalance`, `getutxos` / `listunspent` and `gettxout` answer from the
+**unfinalized head state**, so by R1 they must not look like a settled answer.
+Each reply carries, in addition to its existing fields (none renamed or
+removed):
+
+- `at_slot` — the slot of the head state the answer was read from (already
+  present on `gettxout`).
+- `finalized_height` (integer or `null`) and `finalized_epoch` — the node's
+  finality line, with the names and representation `getblockcount` uses;
+  `null` means the node cannot place the finalized checkpoint on its own
+  canonical chain.
+
+The finality line is the node's, not a property of the outputs returned: an
+output is final only when its containing block is at or below the finalized
+checkpoint (`gettxstatus`, or the block's `finalized`). On the path that
+serves these reads without the consensus thread the line is taken whole from
+the published `getblockcount` answer, which is published just after the
+state; it can therefore be one block apart from `at_slot`.
+
 ---
 
 ## 4. New — staking, delegation, commission, finality
@@ -345,6 +365,88 @@ no consensus rule, state-root component or wire message changed.
 - Size (measured, 106 validators, full participation): see
   `crates/bloch-finality-cert/tests/vectors/README` (1.42 MB full, 1.10 MB with a
   minimal 2/3 vote subset; registry 0.44 MB, each vote 4,637 B).
+
+
+### 4.5b `getlcproof [epoch | "latest", set_source_epoch?, block?]` (2026-10-30)
+
+The certificate of section 4.5a with the state proofs needed to judge it under
+the consensus rule of its epoch. Same trust model: the client trusts one block
+id, and each verified checkpoint becomes trusted for the next. Implemented in
+`crates/bloch-pos-node/src/engine/finality_cert.rs`, with format and verifier in
+`crates/bloch-finality-cert/src/lc_proof.rs` (CLI `bloch-finality-verify`).
+RPC/library only: no consensus rule, state-root component or wire message
+changed.
+
+`proof` (hex, format `BLCLMP01`), little-endian:
+`"BLCLMP01" ‖ u32 len ‖ BLOCHFC1 certificate`, then
+`u8 has_set` `[ u32 len ‖ finality leaf ‖ PROOF ]`, then
+`u8 has_kes` `[ u8 has_bind [u64 bind epoch] ‖ PROOF ‖ u32 n ‖ n × (u32 validator ‖ u8 has_entry [u32 len ‖ KES entry] ‖ PROOF) ]`,
+where `PROOF` is `bitmap[32] ‖ u16 count ‖ count × sibling[32]`. Every proof is
+against the state root of the certificate's set-source block.
+
+- **Finality leaf (component 0x09), from HF1 (e7180).** Votes weigh the frozen
+  finality set, the chain's own weights, instead of own bond. If the leaf carries
+  a `pending` set, each link must reach two thirds of both sets. `weights` says
+  which rule applies. The leaf is mandatory from a set source in e7180 on, so a
+  prover cannot choose the rule by omitting it, and a bare `BLOCHFC1` certificate
+  is refused there. An epoch's fold runs at its closing boundary, so a set source
+  in e7180 itself commits no set yet: its proven leaf without a set means bond.
+- **KES (component 0x22), once registration opens (e7360).** The bind epoch, or
+  proof that it is absent, and for each voter its entry, or proof that it has
+  none (static-key fallback). Past `KES_ACTIVATION_EPOCH` (e8620) a proof without
+  this section is refused, and that includes any bare `BLOCHFC1` certificate.
+- Reply fields: `epoch`, `root`, `checkpoint_slot`, `set_source_epoch`,
+  `set_source_root`, `justifying_source_epoch`, `votes`, `weights`
+  (`bond`/`frozen`), `kes` (`null`, or `enforced_from`, `entries`, `absent`),
+  `ancestry`, `bytes`, `format`, `proof`.
+- Votes the set source cannot judge (validator unknown to it, or not active at
+  the link's target) are left out. They weigh nothing under that set, and the
+  verifier would otherwise refuse the whole proof. A set source far behind the
+  target can still fail closed: a KES key registered or rotated after it does
+  not verify. Keep hops short, as the default set source does.
+- The bind crossing: the last checkpoint before the bind has a set source that
+  cannot commit the bind, while its finalizing link is already KES-signed. For a
+  bind strictly after `epoch`, the bind leaf is proven against the checkpoint's
+  own state root, which the justifying link (static keys, checked first) backs.
+  A hop cannot skip the bind: from a set source before it, later checkpoints are
+  refused, so a client takes the crossing checkpoint first.
+- `epoch <= finalized` does not mean finalized directly. A checkpoint that
+  became final only as an ancestor of a later one can be served with votes below
+  two thirds on its finalizing link, and the verifier refuses it, correctly.
+  Example from a private chain: three of seven validators stopped in e31, e30 was
+  never finalized directly, and it became final as an ancestor of e38. The client
+  asks for the next directly finalized checkpoint from the same set source
+  (`getlcproof [38, 29]`).
+- Operator requirement: that recovery needs the set source retained. A prover's
+  follower must run with `BLOCH_FINALITY_CERT_EPOCHS` of at least 300, because
+  the default of 16 epochs is about 4.3 hours and the hop bound is 256 epochs.
+  The setting is an environment variable, capped at 4096. An invalid value falls
+  back to 16 with a warning, and the node logs the retention it uses at boot.
+  The ring is not persisted. A boot from the state cache rebuilds it only from
+  blocks applied in that boot. Measured on a mainnet log copy: with no tail to
+  replay, every set source before the boot answers `-32004`, the previous epoch
+  included. A client that trusts only checkpoints from before the boot cannot
+  advance from that node, so a prover's follower must boot with
+  `--replay-from-genesis`.
+- The hop bound counts from the epoch of the set source's block, which is the
+  last block before its checkpoint epoch's boundary. Measured at e6594: a set
+  source 255 checkpoints back verifies, and one 256 back is refused with
+  `SetSourceDistance`.
+- Node: the extensions are computed once per epoch boundary from the same state
+  tree as the registry proof and retained for the same
+  `BLOCH_FINALITY_CERT_EPOCHS` checkpoints. KES proofs cost nothing before
+  e7360. Bytes that do not match the tree's leaf are never served.
+
+`bloch-finality-verify` reads either format and applies each vote's epoch
+policy, with the certificate alone accepted only below e7180. The library's
+bare certificate verifier (`bloch_finality_cert::verify` / `verify_chain`,
+bond weights and v1 static signatures) enforces that ceiling itself since
+2026-11-10: it refuses a certificate with a link target at or past
+`params::HF1_FROZEN_FINALITY_SET_EPOCH` with `UseLcProofVerifier`, so the
+highest checkpoint it accepts is e7178 (finalizing link target e7179).
+Integrators call `lc_proof::verify` (the entry point the CLI uses). The earlier
+verifier checked the v1 form only, so it refuses every certificate whose votes
+are in the bound form, from HF2 (e7270).
 
 ### 4.6 Open — vesting-lock visibility (`getvestingstatus`)
 

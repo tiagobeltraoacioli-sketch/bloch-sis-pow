@@ -52,6 +52,15 @@ Examples (append to the existing `bloch-pos run` configuration):
 --replay-from-genesis
 ```
 
+The data directory also holds `finality_latch.bin`, the highest checkpoint this
+node finalized. It must stay with the block log it was written for. A start whose
+block log does not contain that checkpoint (a log that was deleted, truncated or
+replaced), or whose `finality_latch.bin` is damaged, is refused with exit status
+78 and a message that names the file. For a deliberate resync from an empty log,
+or a damaged record, remove `<data-dir>/finality_latch.bin` and start again with
+the same flags; `--allow-finality-rewind` (`BLOCH_ALLOW_FINALITY_REWIND=1`) for
+one start has the same effect but also lifts the finality latch for that run.
+
 The second option is an explicit diagnostic/recovery run, on an isolated observer.
 It conflicts with `--require-state-cache`. Without strict mode, invalid/missing
 caches fall back to full replay and clearly log the reason. Cache write failures

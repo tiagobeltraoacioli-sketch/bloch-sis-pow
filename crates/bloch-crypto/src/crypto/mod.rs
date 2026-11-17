@@ -48,7 +48,7 @@ pub const SUITE_MLDSA65_ONLY: u16 = 0x0002;
 // HF3 optional suite 0x0003: SLH-DSA-SHAKE-128s ‖ Falcon-1024. Accepted by
 // consensus only through `verify_spend` with the caller's HF3 gate open
 // (the one constant is bloch_pos_committee::params::HF3_SLH_SUITE_EPOCH,
-// u64::MAX = never); see `slhdsa_suite`.
+// armed at 7360); see `slhdsa_suite`.
 pub mod slhdsa_suite;
 pub use slhdsa_suite::{
     is_slhdsa_hybrid_public_key, is_spend_public_key_admissible, max_slhdsa_suite_signature_len,

@@ -583,7 +583,9 @@ pub enum PosTransaction {
     /// 0x17). Refused before [`crate::params::KES_REGISTRATION_EPOCH`].
     /// Authorised by the validator's registered static key over
     /// [`crate::kes::register_signing_root`] (network domain, index, depth,
-    /// root). From [`crate::params::KES_ACTIVATION_EPOCH`] on, the
+    /// root); from [`crate::params::KES_REGISTER_EPOCH_BINDING_EPOCH`] on,
+    /// over [`crate::kes::register_signing_root_v2`], which also binds the
+    /// inclusion epoch (same wire form, valid only in that epoch). From [`crate::params::KES_ACTIVATION_EPOCH`] on, the
     /// validator's proposals and votes verify only under this root.
     KesRegister {
         validator: u32,
@@ -1894,6 +1896,13 @@ pub struct CommittedState {
     /// behind that gate), and an empty map adds no state-root leaf and no
     /// local-cache section, so every historical root and cache is unchanged.
     pq_rescue_commits: BTreeMap<[u8; 32], u64>,
+    /// Validator → the epoch of its `ValidatorCommissionUpdate` in the
+    /// current epoch (security review round 2, DET-3). Written only behind
+    /// `params::COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH` and emptied at
+    /// every epoch boundary, so it is EMPTY on every state below the gate
+    /// and at the start of every epoch. An empty map adds no state-root
+    /// leaf and no local-cache section.
+    commission_update_epochs: BTreeMap<u32, u64>,
     /// Forward-secure validator keys (`crate::kes`): registered once by wire
     /// 0x17, replaced only by a leaf-signed `KesRotate`. Each entry is the key
     /// in force and at most one successor (`crate::kes::KesEntry`). Committed
@@ -2006,7 +2015,7 @@ impl crate::attestation::KeyLookup for CommittedState {
         self.validators.pubkey(validator)
     }
     fn kes_public(&self, validator: u32, period: u64) -> Option<crate::kes::KesPublic> {
-        self.kes.get(&validator).map(|entry| entry.in_force(period))
+        self.kes.get(&validator).and_then(|entry| entry.resolve(period))
     }
     fn kes_network_domain(&self) -> Option<[u8; 32]> {
         Some(self.admission_network_domain.unwrap_or([0; 32]))
@@ -2036,7 +2045,7 @@ impl crate::attestation::KeyLookup for RegistryView<'_> {
         self.validators.pubkey(validator)
     }
     fn kes_public(&self, validator: u32, period: u64) -> Option<crate::kes::KesPublic> {
-        self.kes.get(&validator).map(|entry| entry.in_force(period))
+        self.kes.get(&validator).and_then(|entry| entry.resolve(period))
     }
     fn kes_network_domain(&self) -> Option<[u8; 32]> {
         Some(self.network_domain.unwrap_or([0; 32]))
@@ -2516,6 +2525,7 @@ impl CommittedState {
             evm,
             l2_settlement: None,
             pq_rescue_commits: BTreeMap::new(),
+            commission_update_epochs: BTreeMap::new(),
             kes: BTreeMap::new(),
             kes_enforced_from: None,
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
@@ -2975,6 +2985,41 @@ impl CommittedState {
         self.committed_validators()
     }
 
+    /// The finality leaf as [`Self::state_tree`] commits it, for proof
+    /// producers (`getlcproof`). Read-only. It deliberately repeats the
+    /// construction in `compute_tree` instead of sharing it, so that adding
+    /// this accessor leaves the root computation's source untouched; the only
+    /// caller checks these bytes against the tree's own leaf and serves no
+    /// proof on a mismatch, so a drift can only ever be an RPC error.
+    pub fn committed_finality_record(&self) -> FinalityRecord {
+        let cp = |c: finality::Checkpoint| CheckpointRecord { epoch: c.epoch, root: c.root };
+        FinalityRecord {
+            justified: self.finality_engine.justified_checkpoints().map(cp).collect(),
+            current_justified: cp(self.finality_engine.current_justified()),
+            previous_justified: CheckpointRecord {
+                epoch: self.previous_justified.epoch,
+                root: self.previous_justified.root,
+            },
+            finalized: cp(self.finality_engine.finalized()),
+            leaked: self
+                .finality_engine
+                .leaked_stakes()
+                .map(|(validator, leaked_sat)| LeakRecord { validator, leaked_sat })
+                .collect(),
+            next_epoch: self.finality_engine.next_epoch(),
+            finality_set: self.finality_engine.finality_set().map(|fs| {
+                let pairs = |m: &BTreeMap<u32, u64>| m.iter().map(|(v, x)| (*v, *x)).collect();
+                crate::state_root::FinalitySetRecord {
+                    current_epoch: fs.current.epoch,
+                    current: pairs(&fs.current.members),
+                    pending: fs.pending.as_ref().map(|p| (p.epoch, pairs(&p.members))),
+                    last_seen: pairs(&fs.last_seen),
+                }
+            }),
+            own_checkpoints: self.finality_engine.own_checkpoints().map(cp).collect(),
+        }
+    }
+
     fn committed_validators(&self) -> Vec<CommittedValidatorRecord> {
         self
             .validators
@@ -3106,10 +3151,18 @@ impl CommittedState {
             .collect();
         // Positionally keyed: the history's append order is chain order (see
         // DelegationRecord docs for why content cannot key duplicates).
+        //
+        // A pruned slot (`FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH`) is not
+        // committed: it holds the one fixed tombstone, so the leaves of the
+        // records that remain already determine it (see
+        // `prune_withdrawn_funded_delegations`). No record can equal the
+        // tombstone below that gate, so this filter passes everything and
+        // every root is unchanged while the gate is inert.
         let delegations: Vec<DelegationRecord> = self
             .delegations
             .iter()
             .enumerate()
+            .filter(|(_, d)| !d.is_pruned())
             .map(|(position, d)| DelegationRecord {
                 position: position as u64,
                 delegator: d.delegator,
@@ -3250,6 +3303,7 @@ impl CommittedState {
             crate::state_root::insert_kes_roots(&mut tree, &self.kes, self.kes_enforced_from);
         }
         crate::state_root::insert_pq_rescue_commits(&mut tree, &self.pq_rescue_commits);
+        crate::state_root::insert_commission_update_epochs(&mut tree, &self.commission_update_epochs);
         tree
     }
 
@@ -4277,8 +4331,10 @@ impl CommittedState {
     /// this state and without mutating it (consensus and mempool share it):
     /// refused for an unknown, slashed or exited validator, an out-of-range
     /// depth, a validator that already has a key, or a signature that is not
-    /// the registered static key's over [`crate::kes::register_signing_root`].
-    /// The one hybrid verification runs last.
+    /// the registered static key's over
+    /// [`crate::kes::register_signing_root_at`] for this state's epoch (from
+    /// [`crate::params::KES_REGISTER_EPOCH_BINDING_EPOCH`] on, a registration
+    /// signed for any other epoch). The one hybrid verification runs last.
     pub(crate) fn check_kes_register(
         &self,
         validator: u32,
@@ -4326,7 +4382,13 @@ impl CommittedState {
         }
         let public = crate::kes::KesPublic::new(depth, *root, start_period);
         let domain = self.admission_network_domain.unwrap_or([0; 32]);
-        let message = crate::kes::register_signing_root(&domain, validator, &public);
+        // The message of THIS state's epoch (security review CR-5): from
+        // `KES_REGISTER_EPOCH_BINDING_EPOCH` on it binds the inclusion epoch,
+        // so a registration verifies only in the epoch it was signed for and
+        // one captured from the chain cannot be rebroadcast into a later
+        // rescue window once its tree has left the pruned history. Before the
+        // flag day it is the legacy message, byte for byte.
+        let message = crate::kes::register_signing_root_at(&domain, validator, &public, self.epoch);
         if !verifier.verify_with_key(&rec.pubkey, &message, signature) {
             return Err(TxReject::StakingRule);
         }
@@ -6136,6 +6198,9 @@ impl CommittedState {
         st.epoch = next_epoch;
         // Rescue commitments past their TTL (no-op on the empty pre-gate map).
         st.prune_pq_rescue_commits(next_epoch);
+        // DET-3: the one-update-per-epoch record only speaks about the epoch
+        // that just closed (no-op on the empty pre-gate map).
+        st.commission_update_epochs.clear();
         // HF3 KES: enforcement is decided at the first boundary past the
         // compiled gate where registered keys cover the stake threshold
         // (review F-2), and takes effect `KES_BIND_DELAY_EPOCHS` later, so a
@@ -6212,6 +6277,12 @@ impl CommittedState {
             for (position, inactive_since) in newly_inactive {
                 st.funded_delegation_lifecycle.insert(position, (inactive_since, false));
             }
+        }
+        // Security review ST-1: fully withdrawn positions leave the fold and
+        // the root, so neither grows with the positions ever created. Inert
+        // below its gate: nothing is pruned and the state is untouched.
+        if crate::params::funded_delegation_bound_active(next_epoch) {
+            st.prune_withdrawn_funded_delegations(next_epoch);
         }
         st.pending_votes.clear();
         let roster_next = st.consensus_roster_at(next_epoch);
@@ -6747,6 +6818,7 @@ impl<V: SignatureVerifier> Transition<V> {
         //    here would reject bodies an older producer can legitimately
         //    build.
         let dedup_active = CommittedState::attestation_dedup_active(st.epoch);
+        let slot_epoch_binding_active = crate::params::attestation_slot_epoch_binding_active(st.epoch);
         let mut seen: BTreeSet<(u32, [u8; 32])> = BTreeSet::new();
         // Verdict-preserving replay suppression below the flag day. The live
         // rule still ACCEPTS a repeated pair, so it cannot use the gated
@@ -6763,6 +6835,13 @@ impl<V: SignatureVerifier> Transition<V> {
         for (i, att) in attestations.iter().enumerate() {
             let reject = TransitionError::Attestation(i as u32);
             if crate::epoch_of(att.data.slot) != st.epoch {
+                return Err(reject);
+            }
+            // Review FC-3 / CR-1 (gated, inert as shipped): a vote targets
+            // the epoch of its own slot, as the honest attester always has.
+            // Without it the signer-chosen target could select another KES
+            // signing mode than the slot epoch every other verifier uses.
+            if slot_epoch_binding_active && att.data.target_epoch != st.epoch {
                 return Err(reject);
             }
             let signing_root = att.data.signing_root();
@@ -8605,12 +8684,12 @@ mod tests {
     /// TRIPWIRE. Arming is a founder decision and a wallet-facing flag day.
     #[test]
     fn sig_canonical_gate_is_inert() {
-        assert_eq!(crate::params::SIG_CANONICAL_ACTIVATION_EPOCH, u64::MAX);
-        for epoch in [0, 4_669, u64::MAX - 1, u64::MAX] {
-            assert!(!crate::params::sig_canonical_active(epoch));
+        assert_eq!(crate::params::SIG_CANONICAL_ACTIVATION_EPOCH, 7270);
+        for epoch in [0, 4_669, 7_269, 7_270, u64::MAX - 1, u64::MAX] {
+            assert_eq!(crate::params::sig_canonical_active(epoch), epoch >= 7270);
             assert_eq!(
                 crate::attestation::SignaturePolicy::consensus(epoch),
-                crate::attestation::SignaturePolicy::Compatible
+                if epoch >= 7270 { crate::attestation::SignaturePolicy::Bound } else { crate::attestation::SignaturePolicy::Compatible }
             );
         }
     }
@@ -8690,9 +8769,9 @@ mod tests {
     #[cfg(not(feature = "mldsa-pin-replay-qualification"))]
     fn mldsa_pin_gate_is_inert() {
         use crate::attestation::SignaturePolicy::*;
-        assert_eq!(crate::params::MLDSA_PIN_ACTIVATION_EPOCH, u64::MAX);
-        for epoch in [0, 4_669, u64::MAX - 1, u64::MAX] {
-            assert!(!crate::params::mldsa_pin_active(epoch));
+        assert_eq!(crate::params::MLDSA_PIN_ACTIVATION_EPOCH, 7270);
+        for epoch in [0, 4_669, 7_269, 7_270, u64::MAX - 1, u64::MAX] {
+            assert_eq!(crate::params::mldsa_pin_active(epoch), epoch >= 7270);
         }
         // Gate table: (pin, canonical) -> consensus policy.
         assert_eq!(crate::attestation::SignaturePolicy::consensus(7), Compatible);
@@ -13509,14 +13588,14 @@ mod tests {
             tx
         }
 
-        /// TRIPWIRE: HF3 ships inert. Arming it is a release decision taken
-        /// together with `bloch_crypto::crypto::HF3_SLH_SUITE_EPOCH`.
+        /// TRIPWIRE: HF3 is armed at epoch 7360. Moving it is a release
+        /// decision; `params::HF3_SLH_SUITE_EPOCH` is the only constant.
         #[test]
-        fn hf3_slh_suite_gate_is_inert() {
-            assert_eq!(crate::params::HF3_SLH_SUITE_EPOCH, u64::MAX);
-            for e in [0, 1, 6_017, u64::MAX - 1, u64::MAX] {
-                assert!(!crate::params::hf3_slh_suite_active(e));
-                assert!(!fee_market::per_suite_verify_gas_active(e));
+        fn hf3_slh_suite_gate_is_armed_at_7360() {
+            assert_eq!(crate::params::HF3_SLH_SUITE_EPOCH, 7360);
+            for e in [0, 1, 6_017, 7_359, 7_360, u64::MAX - 1, u64::MAX] {
+                assert_eq!(crate::params::hf3_slh_suite_active(e), e >= 7360);
+                assert_eq!(fee_market::per_suite_verify_gas_active(e), e >= 7360);
             }
         }
 
@@ -14846,7 +14925,7 @@ mod tests {
 
     #[test]
     fn hf2_slashing_v2_gate_ships_inert() {
-        assert_eq!(crate::params::HF2_SLASHING_V2_EPOCH, u64::MAX);
+        assert_eq!(crate::params::HF2_SLASHING_V2_EPOCH, 7270);
         assert_eq!(
             crate::params::NATIVE_SLASHING_ACTIVATION_EPOCH,
             crate::params::HF2_SLASHING_V2_EPOCH,
@@ -14857,8 +14936,8 @@ mod tests {
             crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH,
             "HF2 never moves the pre-activation offence refusal",
         );
-        for epoch in [0, 2_884, 100_000, u64::MAX - 1] {
-            assert!(!crate::params::native_slashing_active(epoch));
+        for epoch in [0, 2_884, 7_269, 7_270, 100_000, u64::MAX - 1] {
+            assert_eq!(crate::params::native_slashing_active(epoch), epoch >= 7270);
         }
     }
 

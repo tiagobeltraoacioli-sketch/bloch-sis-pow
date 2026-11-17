@@ -52,6 +52,14 @@ also carries `--allow-public-metrics`. That flag is an exposure acknowledgement,
 not authentication: a deliberately routable endpoint still needs a firewall
 and must not be treated as safe for the public internet.
 
+Both endpoints check the request's `Host` header with the JSON-RPC
+listener's rule and answer `403` otherwise. Accepted: `127.0.0.1`,
+`localhost`, `::1`; the literal `--metrics-bind` address; on a wildcard bind
+(`0.0.0.0` or `::`), the IP address the scraper connected to; and any name
+in the comma-separated `BLOCH_RPC_HOST_ALLOWLIST` environment variable. A
+scraper that reaches a public endpoint through a DNS name must have that name
+on the allowlist.
+
 ## Additional exported signals and alert coverage
 
 The current exporter includes `bloch_pos_finality_rewinds_refused_total`,

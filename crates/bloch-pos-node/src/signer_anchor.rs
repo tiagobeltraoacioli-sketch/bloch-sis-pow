@@ -34,7 +34,12 @@
 //!   limited to the data dir) make `$HOME` read-only or invisible, and some
 //!   units run without `HOME` at all. In those cases the default anchor is
 //!   reported UNAVAILABLE, loudly, and the node boots exactly as it did
-//!   before the anchor existed (data-dir record + data-dir lock only).
+//!   before the anchor existed (data-dir record + data-dir lock only), with
+//!   one exception: a data dir that has no record either, for a key that
+//!   already had duties on chain, refuses to sign
+//!   (`SlashingProtection::settle_missing_history`, review CR-8). The same
+//!   refusal applies when the anchor is usable but was created on this very
+//!   boot: an empty new anchor is not a history (review PER-2).
 //!   A held lock (second signer), a retirement marker, a corrupt or foreign
 //!   record, or a rolled-back data dir stay fatal in both modes.
 //!

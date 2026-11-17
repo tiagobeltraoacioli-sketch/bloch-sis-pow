@@ -19,6 +19,12 @@
       Rewrites every single-line definition of NAME under <tree>/crates to N.
       QUALIFICATION ONLY: the result must never be released. Fails if the
       gate has no single-line definition.
+
+  hf-gates.py relax-order --tree <exported source dir>
+      Makes the compile-time gate ordering rules always true, so one gate can
+      be forced alone even when the release rules tie it to another gate.
+      QUALIFICATION ONLY: the result must never be released. Fails if any rule
+      is not found exactly once.
 """
 import argparse
 import os
@@ -113,6 +119,38 @@ def force(args):
         print(h)
 
 
+ORDER_RULES = {
+    "crates/bloch-pos-committee/src/params.rs": (
+        "hf1_gates_coherent",
+        "gate_is_inert_or_not_before",
+        "kes_registration_precedes_enforcement",
+        "kes_registration_window_is_long_enough",
+    ),
+    "crates/bloch-pos-committee/src/hard_forks.rs": ("hard_fork_schedule_coherent",),
+}
+
+
+def relax_order(args):
+    for rel, names in ORDER_RULES.items():
+        path = os.path.join(args.tree, rel)
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        for name in names:
+            heads = list(re.finditer(r"const fn " + name + r"\s*\([^)]*\)\s*->\s*bool\s*\{", src))
+            if len(heads) != 1:
+                sys.exit(f"hf-gates: expected one definition of {name} in {rel}, found {len(heads)}")
+            start = heads[0].end()
+            depth, i = 1, start
+            while depth:
+                depth += {"{": 1, "}": -1}.get(src[i], 0)
+                i += 1
+            body = src[start:i - 1]
+            src = f"{src[:start]} true || {{{body}}} {src[i - 1:]}"
+            print(f"{rel}: {name} relaxed")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(src)
+
+
 def tripwires(args):
     names = set()
     for gate in args.gate:
@@ -150,8 +188,10 @@ def main():
     f.add_argument("--tree", required=True)
     f.add_argument("--gate", required=True)
     f.add_argument("--epoch", required=True, type=int)
+    r = sub.add_parser("relax-order")
+    r.add_argument("--tree", required=True)
     args = p.parse_args()
-    {"discover": discover, "tripwires": tripwires, "force": force}[args.cmd](args)
+    {"discover": discover, "tripwires": tripwires, "force": force, "relax-order": relax_order}[args.cmd](args)
 
 
 if __name__ == "__main__":

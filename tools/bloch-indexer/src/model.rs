@@ -138,7 +138,8 @@ pub enum TxKind {
     L2Settlement,
     L2SettlementAsync,
     /// Native L2 bridge (0x14-0x16). Their funding inputs and change/release
-    /// outputs are indexed like a transfer's; escrowed amounts are L2 state.
+    /// outputs are indexed like a transfer's; escrowed amounts are L2 state,
+    /// recorded in `TxRow::l2_escrow_in_sat` and `TxRow::l2_escrow_out_sat`.
     L2Deposit,
     L2DataAvailability,
     L2WithdrawClaim,
@@ -179,6 +180,11 @@ pub enum TxKind {
 }
 
 impl TxKind {
+    /// A native L2 kind, whose answers also carry the escrow movement.
+    pub fn is_l2(&self) -> bool {
+        matches!(self, TxKind::L2Settlement | TxKind::L2SettlementAsync | TxKind::L2Deposit
+            | TxKind::L2DataAvailability | TxKind::L2WithdrawClaim)
+    }
     pub fn name(&self) -> String {
         match self {
             TxKind::L2Settlement => "l2_settlement".into(),
@@ -224,10 +230,17 @@ pub struct TxRow {
     pub input_values: Vec<Utxo>,
     pub size_bytes: u64,
     pub stake_sat: u128,
+    /// Sat this transaction moved from its inputs into the native L2 escrow
+    /// (`L2Deposit::amount_sat`). Not an output: it stays in L2 state.
+    pub l2_escrow_in_sat: u128,
+    /// Sat this transaction released from the native L2 escrow into output 0
+    /// (`L2WithdrawClaim::sats`). That output has no matching input.
+    pub l2_escrow_out_sat: u128,
     pub outputs: Vec<(u64, ScriptHash)>,
     pub declared_bytes: u64,
     pub tip_millisat_per_gas: u128,
-    /// `inputs - outputs` for transfers; `None` when the index could not value
+    /// The consensus receipt's fee under replay; without replay, `inputs +
+    /// l2_escrow_out - outputs - stake - l2_escrow_in`. `None` when the index could not value
     /// every input (a spend of an output it never saw — which can only happen
     /// if the index was started from a truncated log).
     pub fee_sat: Option<u128>,

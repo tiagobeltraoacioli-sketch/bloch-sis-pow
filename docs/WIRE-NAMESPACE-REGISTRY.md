@@ -957,10 +957,17 @@ on any ref, so it moves to `0x1B`; no implemented byte is re-pointed.
 | local cache | `BPOSST01:PQ:v1\0\0` | PQ rescue commitments | — | this branch |
 | local cache | `BPOSST01:FSET:v1` | frozen finality set | — | HF1 (p1a) |
 | local cache | `BPOSST01:FFGO:v1` | own-target checkpoints | — | HF1 (p2a) |
+| local cache | `BPOSST01:COMU:v1` | commission-update epochs of the current epoch (absent while empty) | `COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH` (inert) | `codex/r2fix-f5-20261110` (DET-3) |
 | finality leaf ext. | `BLOCH-FFG-FSETv1`, then `BLOCH:FINALITY:OWN-CHECKPOINTS:1` | HF1 | — | p1a / p2a |
 
 Local-cache sections are parsed by sequential prefix stripping; the merge
-order is the table order (L2, L2CP, KES, PQ, FSET, FFGO).
+order is the table order (L2, L2CP, KES, PQ, FSET, FFGO, COMU).
+
+No state tag is allocated for the commission-update epochs (DET-3): they are
+leaves under `TAG_VALIDATOR` (`0x02`) whose key preimage is
+`"commission-update-epoch:" ‖ u32 LE index`, which a validator record's
+4-byte key preimage can never equal. None exists below the gate or at the
+start of an epoch.
 
 Sweep (2026-10-20): all 371 `refs/heads` + `refs/remotes` tips; every
 `*_TAG: u8` / `TAG_*: u8` constant under `crates/` and every arm of the

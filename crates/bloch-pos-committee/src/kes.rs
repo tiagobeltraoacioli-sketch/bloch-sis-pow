@@ -61,6 +61,7 @@ const DS_LEAF: &[u8] = b"BLOCH-KES-v1/leaf";
 const DS_PK: &[u8] = b"BLOCH-KES-v1/pk";
 const DS_NODE: &[u8] = b"BLOCH-KES-v1/node";
 const DS_REGISTER: &[u8] = b"BLOCH-KES-v1/register";
+const DS_REGISTER_V2: &[u8] = b"BLOCH-KES-v2/register";
 const DS_SIGN: &[u8] = b"BLOCH-KES-v2/sign";
 const DS_AUTHORITY: &[u8] = b"BLOCH-KES-v1/authority";
 const DS_ROTATE: &[u8] = b"BLOCH-KES-v1/rotate";
@@ -264,6 +265,37 @@ impl KesEntry {
             .unwrap_or(self.current)
     }
 
+    /// The global period the validator's FIRST KES key started at: the
+    /// earliest start among the replaced keys and the key in force. Sound
+    /// because [`Self::prune`] keeps the oldest replaced key from
+    /// [`crate::params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH`] on, and no
+    /// history can have been pruned before that gate (it is armed, by a
+    /// compile-time rule, before any history can be old enough).
+    pub fn first_start_period(&self) -> u64 {
+        self.retired.iter().map(|r| r.public.start_period).fold(self.current.start_period, u64::min)
+    }
+
+    /// The key consensus judges a signature of global period `period` by:
+    /// [`Self::in_force`], except that, once the first-key floor is in force
+    /// for `period` (security review CR-2), a period that precedes the
+    /// validator's first KES key has NO key. The validator was not
+    /// registered then and signed with its static key
+    /// ([`signing_mode`] is `Static` for it), so what it signed stays
+    /// provable after it registers.
+    ///
+    /// Only that case changes. A period at or after the first key that no
+    /// key covers (between an expired key and its rescue, or history pruned
+    /// between keys) still resolves to the current key, whose leaf bounds
+    /// refuse it: the validator was KES-registered then, and falling back
+    /// to the static key there would let a static key stolen later sign for
+    /// the past.
+    pub fn resolve(&self, period: u64) -> Option<KesPublic> {
+        if crate::params::kes_first_key_floor_active(period) && period < self.first_start_period() {
+            return None;
+        }
+        Some(self.in_force(period))
+    }
+
     /// The same entry with a successor that is already in force at `period`
     /// promoted; the replaced key moves to the history (covering up to the
     /// successor's start) and history older than
@@ -302,10 +334,18 @@ impl KesEntry {
     }
 
     /// Drop history whose last covered period is more than
-    /// `KES_KEY_HISTORY_PERIODS` before `period`.
+    /// `KES_KEY_HISTORY_PERIODS` before `period`. Once the first-key floor
+    /// is in force at `period`, the oldest replaced key is never dropped:
+    /// it is the validator's first key, and its start period is what
+    /// [`Self::first_start_period`] derives (49 bytes per validator, once).
     fn prune(&mut self, period: u64) {
         let keep_from = period.saturating_sub(crate::params::KES_KEY_HISTORY_PERIODS);
-        self.retired.retain(|r| r.end_period > keep_from);
+        let keep_first = crate::params::kes_first_key_floor_active(period);
+        let mut oldest = true;
+        self.retired.retain(|r| {
+            let first = std::mem::take(&mut oldest);
+            (first && keep_first) || r.end_period > keep_from
+        });
     }
 
     /// The rotation waiting for a later period than `period`, if any.
@@ -430,6 +470,31 @@ pub fn register_signing_root(network_domain: &[u8; 32], validator: u32, public: 
     h(&[DS_REGISTER, network_domain, &validator.to_le_bytes(), &[public.depth], &public.root])
 }
 
+/// The epoch-bound registration root (security review CR-5), in force from
+/// `params::KES_REGISTER_EPOCH_BINDING_EPOCH`: [`register_signing_root`]'s
+/// fields under a new domain tag, plus the epoch of the block that includes
+/// the registration. Consensus verifies against the including block's epoch
+/// only, so the signature is valid in exactly that epoch and a captured
+/// registration cannot be rebroadcast later (after its tree left the retired
+/// history) to put a destroyed or leaked key back in force. The distinct tag
+/// keeps the two forms from ever being taken for each other.
+pub fn register_signing_root_v2(network_domain: &[u8; 32], validator: u32, epoch: u64, public: &KesPublic) -> [u8; 32] {
+    h(&[DS_REGISTER_V2, network_domain, &validator.to_le_bytes(), &epoch.to_le_bytes(), &[public.depth], &public.root])
+}
+
+/// The registration message consensus verifies in a block of `epoch`, and so
+/// the one tooling must sign for a registration meant for that epoch:
+/// [`register_signing_root`] before the flag day,
+/// [`register_signing_root_v2`] from it on. The one rule the transition and
+/// `bloch-pos kes register` share.
+pub fn register_signing_root_at(network_domain: &[u8; 32], validator: u32, public: &KesPublic, epoch: u64) -> [u8; 32] {
+    if crate::params::kes_register_epoch_bound(epoch) {
+        register_signing_root_v2(network_domain, validator, epoch, public)
+    } else {
+        register_signing_root(network_domain, validator, public)
+    }
+}
+
 /// The root the CURRENT leaf of `validator`'s key in force signs (through
 /// [`leaf_message`]) to rotate to `new_depth ‖ new_root` in global period
 /// `period`. Bound to the network, validator, period and new tree; a
@@ -475,7 +540,9 @@ pub fn leaf_message(
 pub enum SigningMode {
     /// The registered static key: before the compiled gate, before KES binds
     /// on chain (`kes_enforced_from`), or — after it binds — for a validator
-    /// that never registered a KES key (static-key fallback, review F-2).
+    /// that never registered a KES key (static-key fallback, review F-2) or,
+    /// from the first-key floor on, for a period before its first KES key
+    /// ([`KesEntry::resolve`]).
     Static,
     /// The KES leaf of this global period under the key in force.
     Kes(u64),
@@ -521,6 +588,8 @@ pub fn signing_mode(keys: &dyn KeyLookup, validator: u32, epoch: u64) -> Signing
 /// not as a peer fault, unless the validator's entry
 /// (`CommittedState::kes_roots`) is identical in this node's finalized
 /// state. Static-key failures keep their existing attribution.
+/// [`failure_is_attributable`] is that rule; every relay door asks it
+/// before it charges a peer for a failure here.
 ///
 /// Rules: the static hybrid key,
 /// exactly as before, until KES binds (and for never-registered validators
@@ -602,6 +671,78 @@ pub fn authority_fingerprint(keys: &dyn KeyLookup, validator: u32, epoch: u64) -
         &domain.unwrap_or([0; 32]),
         &period.to_le_bytes(),
     ]))
+}
+
+/// The KES authority of a node's FINALIZED state: what every branch this
+/// node can still adopt has in common. Borrowed, so a relay can keep one
+/// shared map per finalized block.
+#[derive(Clone, Copy, Debug)]
+pub struct FinalizedAuthority<'a> {
+    /// The epoch of the finalized post-state. Every later registration or
+    /// rotation is applied in this epoch or after it.
+    pub epoch: u64,
+    /// `CommittedState::kes_enforced_from` of that state.
+    pub enforced_from: Option<u64>,
+    /// `CommittedState::kes_roots` of that state.
+    pub entries: &'a std::collections::BTreeMap<u32, KesEntry>,
+}
+
+/// May a relay treat a failed [`verify_validator`] of `validator`'s signature
+/// for `epoch`, judged against `keys`, as a provable forgery (a peer fault)?
+///
+/// Before the compiled KES gate: always, the static key signs and its
+/// failures keep their existing attribution. From the gate on, only when the
+/// verdict cannot differ on another branch or on a more advanced head, i.e.
+/// when the authority `keys` resolved is the one `finalized` fixes:
+///
+///   * the bind epoch is committed in the finalized state (it is set once)
+///     and `keys` reports the same one. A head that predates the bind selects
+///     the static key for a validator that already signs with its leaf;
+///   * `epoch` is before that bind (the static key signs on every branch), or
+///   * the validator has a KES entry in the finalized state, no later
+///     transaction can change which key is in force for `epoch`'s period,
+///     and `keys` resolves that same key. A registration takes effect in the
+///     period after the one that includes it (two periods for a rescue) and
+///     a rotation in the period after it, both counted from the finalized
+///     epoch at the earliest; while a rotation is pending no other is
+///     admitted, so the settled range extends to the pending key's start.
+///     A validator WITHOUT a finalized entry may have registered on a branch
+///     or a block this node has not applied: never attributable.
+///
+/// `finalized` is `None` when the caller does not hold its finalized state's
+/// KES view; nothing past the gate is attributable then. Node-local relay
+/// policy only: block and vote validity stay with the transition.
+pub fn failure_is_attributable(
+    keys: &dyn KeyLookup,
+    finalized: Option<&FinalizedAuthority<'_>>,
+    validator: u32,
+    epoch: u64,
+) -> bool {
+    let Some(period) = crate::params::kes_period(epoch) else {
+        return true;
+    };
+    let Some(finalized) = finalized else {
+        return false;
+    };
+    let Some(bound) = finalized.enforced_from else {
+        return false;
+    };
+    if keys.kes_enforced_from() != Some(Some(bound)) {
+        return false;
+    }
+    if epoch < bound {
+        return true;
+    }
+    let Some(entry) = finalized.entries.get(&validator) else {
+        return false;
+    };
+    let finalized_period = crate::params::kes_period(finalized.epoch).unwrap_or(0);
+    let settled_through = entry.pending_at(finalized_period).map_or(finalized_period, |next| next.start_period);
+    // Audit L1-17: `resolve`, the rule consensus judges by, not `in_force`:
+    // from the first-key floor on, a period before the validator's first
+    // KES key has no key (the static key signs it), and that is as settled
+    // by the finalized entry as any later period.
+    period <= settled_through && keys.kes_public(validator, period) == entry.resolve(period)
 }
 
 #[cfg(test)]
@@ -793,6 +934,66 @@ mod tests {
         assert_ne!(base, register_signing_root(&[1; 32], 4, &k));
         assert_ne!(base, register_signing_root(&[1; 32], 3, &KesPublic::new(11, [5; 32], 0)));
     }
+
+    /// The pre-flag-day registration message, pinned byte for byte: SHA3-256
+    /// of `"BLOCH-KES-v1/register" ‖ domain ‖ validator LE ‖ depth ‖ root`.
+    /// It must never change (signatures over it are on chain).
+    #[test]
+    fn the_legacy_registration_root_is_pinned() {
+        let k = KesPublic::new(12, [0x22; 32], 0);
+        let mut preimage = b"BLOCH-KES-v1/register".to_vec();
+        preimage.extend_from_slice(&[0x11; 32]);
+        preimage.extend_from_slice(&7u32.to_le_bytes());
+        preimage.push(12);
+        preimage.extend_from_slice(&[0x22; 32]);
+        let expected: [u8; 32] = Sha3_256::digest(&preimage).into();
+        assert_eq!(register_signing_root(&[0x11; 32], 7, &k), expected);
+        assert_eq!(hex(&expected), LEGACY_REGISTER_ROOT_VECTOR);
+        // The start period was never part of it.
+        assert_eq!(register_signing_root(&[0x11; 32], 7, &KesPublic::new(12, [0x22; 32], 9)), expected);
+        // While the flag day is unarmed, every epoch selects this form.
+        for epoch in [0, 7_360, 8_620, u64::MAX] {
+            assert_eq!(register_signing_root_at(&[0x11; 32], 7, &k, epoch), expected, "epoch {epoch}");
+        }
+    }
+
+    #[test]
+    fn the_epoch_bound_registration_root_binds_every_field_and_its_own_domain() {
+        let k = KesPublic::new(12, [0x22; 32], 0);
+        let base = register_signing_root_v2(&[0x11; 32], 7, 7_360, &k);
+        let mut preimage = b"BLOCH-KES-v2/register".to_vec();
+        preimage.extend_from_slice(&[0x11; 32]);
+        preimage.extend_from_slice(&7u32.to_le_bytes());
+        preimage.extend_from_slice(&7_360u64.to_le_bytes());
+        preimage.push(12);
+        preimage.extend_from_slice(&[0x22; 32]);
+        let expected: [u8; 32] = Sha3_256::digest(&preimage).into();
+        assert_eq!(base, expected);
+        assert_eq!(hex(&base), EPOCH_BOUND_REGISTER_ROOT_VECTOR);
+        assert_ne!(base, register_signing_root(&[0x11; 32], 7, &k), "never the legacy message");
+        assert_ne!(base, register_signing_root_v2(&[0x11; 32], 7, 7_361, &k), "the epoch");
+        assert_ne!(base, register_signing_root_v2(&[0x12; 32], 7, 7_360, &k), "the network");
+        assert_ne!(base, register_signing_root_v2(&[0x11; 32], 8, 7_360, &k), "the validator");
+        assert_ne!(base, register_signing_root_v2(&[0x11; 32], 7, 7_360, &KesPublic::new(11, [0x22; 32], 0)), "the depth");
+        assert_ne!(base, register_signing_root_v2(&[0x11; 32], 7, 7_360, &KesPublic::new(12, [0x23; 32], 0)), "the tree");
+        assert_ne!(base, rotate_signing_root(&[0x11; 32], 7, 7_360, 12, &[0x22; 32]), "never a rotation message");
+    }
+
+    #[test]
+    fn the_flag_day_selects_the_registration_message_by_inclusion_epoch() {
+        let _armed = crate::params::kes_register_binding_rehearsal::arm(100);
+        let k = KesPublic::new(12, [0x22; 32], 0);
+        assert_eq!(register_signing_root_at(&[1; 32], 7, &k, 99), register_signing_root(&[1; 32], 7, &k));
+        assert_eq!(register_signing_root_at(&[1; 32], 7, &k, 100), register_signing_root_v2(&[1; 32], 7, 100, &k));
+        assert_eq!(register_signing_root_at(&[1; 32], 7, &k, 101), register_signing_root_v2(&[1; 32], 7, 101, &k));
+    }
+
+    const LEGACY_REGISTER_ROOT_VECTOR: &str = "3d4ae40a237e92a94bd01d64621a4e0c1dc9343f75213bc7787ad1908bdc44f9";
+    const EPOCH_BOUND_REGISTER_ROOT_VECTOR: &str = "3d2c96375c269edca93fb4901e3584a4504fac2952aa1001090d6427127f1fa5";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
 }
 
 #[cfg(test)]
@@ -812,8 +1013,17 @@ mod history_tests {
         // The old keys' leaves past their range are never selected.
         assert_eq!(e.in_force(5), k2, "k0's leaf 5 exists, but k0 does not cover period 5");
         let horizon = crate::params::KES_KEY_HISTORY_PERIODS;
-        assert_eq!(e.settled(2 + horizon).retired.len(), 1, "k0 (ends at 2) pruned past the horizon");
-        assert!(e.settled(3 + horizon).retired.is_empty());
+        // As shipped (first-key floor armed with enforcement, so in force
+        // from period 0): the first key is never pruned; later ones are.
+        assert_eq!(e.settled(2 + horizon).retired.len(), 2, "k0 is the first key: kept past the horizon");
+        assert_eq!(e.settled(3 + horizon).retired, vec![RetiredKes { public: k0, end_period: 2 }], "k1 pruned");
+        assert_eq!(e.settled(3 + horizon).first_start_period(), 0);
+        {
+            // The rule below the floor: plain horizon pruning.
+            let _inert = crate::params::kes_first_key_floor_rehearsal::arm(u64::MAX);
+            assert_eq!(e.settled(2 + horizon).retired.len(), 1, "k0 (ends at 2) pruned past the horizon");
+            assert!(e.settled(3 + horizon).retired.is_empty());
+        }
         // Committed bytes carry the history after a tag no key starts with.
         let bytes = e.committed_bytes();
         assert_eq!(bytes[41], RETIRED_SECTION_TAG);
@@ -831,5 +1041,229 @@ mod history_tests {
         assert_eq!(e.in_force(3), old);
         assert_eq!(e.in_force(4), fresh, "nothing covers 4..6: the fresh key, whose leaves refuse it");
         assert_eq!(fresh.leaf_index(4), None);
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+    use crate::params::{kes_rehearsal, KesSchedule};
+    use std::collections::BTreeMap;
+
+    struct ToyVerifier;
+    impl SignatureVerifier for ToyVerifier {
+        fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+            signature == h(&[pubkey, root])
+        }
+    }
+
+    /// What committed state answers with: validator 4's static key, the KES
+    /// entries and the bind epoch of one state.
+    struct View {
+        entries: BTreeMap<u32, KesEntry>,
+        enforced_from: Option<u64>,
+    }
+
+    const STATIC_KEY: &[u8] = b"static-key-of-validator-4";
+    const DOMAIN: [u8; 32] = [0xD7; 32];
+
+    impl KeyLookup for View {
+        fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+            (validator == 4).then_some(STATIC_KEY)
+        }
+        fn kes_public(&self, validator: u32, period: u64) -> Option<KesPublic> {
+            self.entries.get(&validator).map(|entry| entry.in_force(period))
+        }
+        fn kes_network_domain(&self) -> Option<[u8; 32]> {
+            Some(DOMAIN)
+        }
+        fn kes_enforced_from(&self) -> Option<Option<u64>> {
+            Some(self.enforced_from)
+        }
+    }
+
+    impl View {
+        fn finalized(&self, epoch: u64) -> FinalizedAuthority<'_> {
+            FinalizedAuthority { epoch, enforced_from: self.enforced_from, entries: &self.entries }
+        }
+    }
+
+    /// A depth-3 toy tree and validator 4's leaf signature of `period` over
+    /// `root`, bound exactly as the duty signer binds it.
+    fn kes_key_and_signature(seed: u8, period: u64, root: &[u8; 32]) -> (KesPublic, Vec<u8>) {
+        let mut state = [seed; 32];
+        let mut pks = Vec::new();
+        for _ in 0..8 {
+            pks.push(leaf_seed(&state).to_vec());
+            state = step(&state);
+        }
+        let leaves: Vec<[u8; 32]> = pks.iter().map(|pk| leaf_hash(pk)).collect();
+        let public = KesPublic::new(3, merkle_root(&leaves), 0);
+        let message = bound_signing_root(&DOMAIN, 4, &public, period, root);
+        let leaf = period as usize;
+        let signature = KesSignature {
+            index: leaf as u32,
+            leaf_pk: pks[leaf].clone(),
+            sig: h(&[&pks[leaf], &message]).to_vec(),
+            path: auth_path(&leaves, leaf),
+        }
+        .encode();
+        (public, signature)
+    }
+
+    struct Rehearsal;
+    impl Rehearsal {
+        /// Gate at epoch 100, 90-epoch periods.
+        fn arm() -> Self {
+            kes_rehearsal::set(Some(KesSchedule { registration_epoch: 10, activation_epoch: 100, period_epochs: 90, min_depth: 1 }));
+            Rehearsal
+        }
+    }
+    impl Drop for Rehearsal {
+        fn drop(&mut self) {
+            kes_rehearsal::set(None);
+        }
+    }
+
+    /// FC-4: a head that predates the validator's KES registration (or the
+    /// bind) selects the static key, so the validator's honest leaf signature
+    /// fails there. That failure is not attributable, whether or not the
+    /// node holds a finalized view.
+    #[test]
+    fn a_kes_signature_failing_against_a_head_that_predates_the_registration_is_not_attributable() {
+        let _armed = Rehearsal::arm();
+        let root = [0x42; 32];
+        let epoch = 130; // period 0
+        let (public, signature) = kes_key_and_signature(7, 0, &root);
+        let ahead = View { entries: BTreeMap::from([(4, public.into())]), enforced_from: Some(104) };
+        assert_eq!(verify_validator(&ahead, &ToyVerifier, 4, epoch, &root, &signature), Some(true), "honest on its own branch");
+
+        // The lagging head: bound, but validator 4 has not registered yet.
+        let lagging = View { entries: BTreeMap::new(), enforced_from: Some(104) };
+        assert_eq!(signing_mode(&lagging, 4, epoch), SigningMode::Static);
+        assert_eq!(verify_validator(&lagging, &ToyVerifier, 4, epoch, &root, &signature), Some(false));
+        assert!(!failure_is_attributable(&lagging, Some(&lagging.finalized(120)), 4, epoch));
+        assert!(!failure_is_attributable(&lagging, None, 4, epoch));
+
+        // The head that predates the bind itself.
+        let unbound = View { entries: BTreeMap::new(), enforced_from: None };
+        assert_eq!(verify_validator(&unbound, &ToyVerifier, 4, epoch, &root, &signature), Some(false));
+        assert!(!failure_is_attributable(&unbound, Some(&unbound.finalized(120)), 4, epoch));
+        // A head that bound after a finalized state that had not.
+        assert!(!failure_is_attributable(&lagging, Some(&unbound.finalized(101)), 4, epoch));
+    }
+
+    /// A signature that fails against the key the FINALIZED state fixes for
+    /// the period is a forgery on every branch: still attributable.
+    #[test]
+    fn a_forgery_against_the_finalized_authority_stays_attributable() {
+        let _armed = Rehearsal::arm();
+        let root = [0x42; 32];
+        let epoch = 130;
+        let (public, signature) = kes_key_and_signature(7, 0, &root);
+        let state = View { entries: BTreeMap::from([(4, public.into())]), enforced_from: Some(104) };
+        let finalized = state.finalized(120);
+        assert_eq!(verify_validator(&state, &ToyVerifier, 4, epoch, &root, &signature), Some(true));
+
+        let mut forged = KesSignature::decode(&signature).unwrap();
+        forged.sig[0] ^= 1;
+        assert_eq!(verify_validator(&state, &ToyVerifier, 4, epoch, &root, &forged.encode()), Some(false));
+        assert!(failure_is_attributable(&state, Some(&finalized), 4, epoch));
+        // Another tree's leaf, and the static key after the bind: forgeries too.
+        let (_, foreign) = kes_key_and_signature(8, 0, &root);
+        assert_eq!(verify_validator(&state, &ToyVerifier, 4, epoch, &root, &foreign), Some(false));
+        let static_signature = h(&[STATIC_KEY, &root]);
+        assert_eq!(verify_validator(&state, &ToyVerifier, 4, epoch, &root, &static_signature), Some(false));
+        assert!(failure_is_attributable(&state, Some(&finalized), 4, epoch));
+    }
+
+    /// Audit L1-17: a validator that registered late, judged for a period
+    /// before its first key once the first-key floor is in force. Every
+    /// branch from the finalized state signs that period with the static
+    /// key, so a forged static signature is attributable (it used to be
+    /// compared against `in_force`, which never matches the floor's `None`).
+    #[test]
+    fn a_static_forgery_before_a_late_registrants_first_key_is_attributable() {
+        struct Resolving(BTreeMap<u32, KesEntry>);
+        impl KeyLookup for Resolving {
+            fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+                (validator == 4).then_some(STATIC_KEY)
+            }
+            fn kes_public(&self, validator: u32, period: u64) -> Option<KesPublic> {
+                self.0.get(&validator).and_then(|entry| entry.resolve(period))
+            }
+            fn kes_network_domain(&self) -> Option<[u8; 32]> {
+                Some(DOMAIN)
+            }
+            fn kes_enforced_from(&self) -> Option<Option<u64>> {
+                Some(Some(104))
+            }
+        }
+        let _armed = Rehearsal::arm();
+        let _floor = crate::params::kes_first_key_floor_rehearsal::arm(100);
+        let root = [0x42; 32];
+        let (tree, _) = kes_key_and_signature(7, 0, &root);
+        let late = KesPublic::new(tree.depth, tree.root, 5);
+        let entries = BTreeMap::from([(4, KesEntry::from(late))]);
+        let head = Resolving(entries.clone());
+        let finalized = FinalizedAuthority { epoch: 100 + 4 * 90 + 5, enforced_from: Some(104), entries: &entries };
+        let epoch = 100 + 2 * 90 + 10; // period 2, before the first key's start
+        assert_eq!(signing_mode(&head, 4, epoch), SigningMode::Static);
+        let forged_static = h(&[b"not-the-static-key".as_slice(), &root]);
+        assert_eq!(verify_validator(&head, &ToyVerifier, 4, epoch, &root, &forged_static), Some(false));
+        assert!(failure_is_attributable(&head, Some(&finalized), 4, epoch));
+        // From the first key's period on, the leaf rule is unchanged.
+        let in_key = 100 + 5 * 90 + 1;
+        let finalized_later = FinalizedAuthority { epoch: in_key, enforced_from: Some(104), entries: &entries };
+        assert!(failure_is_attributable(&head, Some(&finalized_later), 4, in_key));
+    }
+
+    #[test]
+    fn static_key_failures_keep_their_attribution_where_every_branch_uses_the_static_key() {
+        let _armed = Rehearsal::arm();
+        let empty = View { entries: BTreeMap::new(), enforced_from: None };
+        // Before the compiled gate nothing changes, with or without a view.
+        assert!(failure_is_attributable(&empty, None, 4, 99));
+        assert!(failure_is_attributable(&empty, Some(&empty.finalized(50)), 4, 99));
+        // Past the gate, before a bind epoch that is already finalized.
+        let bound = View { entries: BTreeMap::new(), enforced_from: Some(104) };
+        assert!(failure_is_attributable(&bound, Some(&bound.finalized(102)), 4, 103));
+        assert!(!failure_is_attributable(&bound, Some(&bound.finalized(102)), 4, 104), "may have registered since");
+    }
+
+    /// The key a period resolves to must be beyond the reach of any
+    /// transaction after the finalized state.
+    #[test]
+    fn a_period_a_later_rotation_or_rescue_can_still_change_is_not_attributable() {
+        let _armed = Rehearsal::arm();
+        let k0 = KesPublic::new(3, [1; 32], 0);
+        let k1 = KesPublic::new(3, [2; 32], 2);
+        let state = View { entries: BTreeMap::from([(4, k0.into())]), enforced_from: Some(104) };
+        // Finalized in period 0 (epoch 120): a rotation in period 0 on some
+        // branch puts another key in force from period 1 (epoch 190).
+        assert!(failure_is_attributable(&state, Some(&state.finalized(120)), 4, 189));
+        assert!(!failure_is_attributable(&state, Some(&state.finalized(120)), 4, 190));
+        assert!(failure_is_attributable(&state, Some(&state.finalized(190)), 4, 190));
+
+        // A rotation pending in the finalized state blocks any other until
+        // its own start: settled through period 2, not period 3.
+        let pending = View { entries: BTreeMap::from([(4, KesEntry { next: Some(k1), ..k0.into() })]), enforced_from: Some(104) };
+        let finalized = pending.finalized(120);
+        assert!(failure_is_attributable(&pending, Some(&finalized), 4, 190));
+        assert!(failure_is_attributable(&pending, Some(&finalized), 4, 280));
+        assert!(!failure_is_attributable(&pending, Some(&finalized), 4, 370));
+
+        // The head resolved a different key than the finalized one for the
+        // period (it applied a rescue the finalized state lacks).
+        let rescued = View { entries: BTreeMap::from([(4, KesEntry::from(KesPublic::new(3, [9; 32], 0)))]), enforced_from: Some(104) };
+        assert!(!failure_is_attributable(&rescued, Some(&state.finalized(120)), 4, 130));
+        // A lookup that cannot say whether KES binds proves nothing.
+        struct Opaque;
+        impl KeyLookup for Opaque {
+            fn pubkey(&self, _validator: u32) -> Option<&[u8]> {
+                Some(STATIC_KEY)
+            }
+        }
+        assert!(!failure_is_attributable(&Opaque, Some(&state.finalized(120)), 4, 130));
     }
 }

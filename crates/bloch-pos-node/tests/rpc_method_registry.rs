@@ -120,6 +120,10 @@ const ROUTED: &[(&str, &str)] = &[
     ("gettxstatus", "TxStatus"),
     // Freeze bump (2026-10-19): finality certificates, a new variant.
     ("getfinalitycertificate", "FinalityCertificate"),
+    // Freeze bump (2026-10-30): light-client proofs, a new variant.
+    ("getlcproof", "LcProof"),
+    // Freeze bump (2026-11-14): Bloch Sentinel node-local status, a new variant.
+    ("getsecuritystatus", "SecurityStatus"),
 ];
 
 /// Names that are routed and answer with a REFUSAL rather than a variant.

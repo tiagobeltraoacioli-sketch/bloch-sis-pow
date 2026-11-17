@@ -117,7 +117,9 @@
 //!   length of the chain.
 //! - **What one peer may make this node do is bounded on the serving side
 //!   too**, by [`SYNC_ANSWERS_PER_SEC`]/[`SYNC_ANSWER_BURST`] and
-//!   [`MAX_INFLIGHT_SYNC_PER_PEER`]. Capping the SIZE of an answer
+//!   [`MAX_INFLIGHT_SYNC_PER_PEER`] (held until the answer is WRITTEN, not
+//!   merely built) and, across all peers, by
+//!   [`MAX_PENDING_SYNC_RESPONSE_BYTES`]. Capping the SIZE of an answer
 //!   ([`MAX_SYNC_BLOCKS`], [`MAX_SYNC_FRAME`]) never bounded their NUMBER:
 //!   before those limits a peer could ask again as fast as it liked, on up to
 //!   [`MAX_CONCURRENT_SYNC_STREAMS`] substreams, and each eight-byte question
@@ -193,8 +195,9 @@
 //!   outgoing sync also shares one request window across all three callers.
 
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender as EngineSender;
@@ -208,7 +211,7 @@ use libp2p::gossipsub::{
     PeerScoreThresholds, TopicScoreParams, ValidationMode,
 };
 use libp2p::request_response::{self, Codec as RrCodec, Config as RrConfig, ProtocolSupport};
-use libp2p::swarm::SwarmEvent;
+use libp2p::swarm::{ConnectionId, SwarmEvent};
 use libp2p::{identify, identity, noise, yamux, PeerId, StreamProtocol, SwarmBuilder};
 
 /// Re-exported so the composition root can parse `--p2p-listen`/`--p2p-peer`
@@ -369,8 +372,17 @@ const MAX_DIALED_ADDRS: usize = 512;
 //   * the **token bucket** bounds the RATE — how many questions a peer may
 //     have answered per second, averaged, with a burst for the honest case;
 //   * the **in-flight cap** bounds the CONCURRENCY — how many answers this
-//     node is building for one peer at one instant, which is what actually
-//     consumes blocking-pool threads and memory.
+//     node is building OR STILL WRITING for one peer at one instant, which is
+//     what actually consumes blocking-pool threads and memory. The slot is
+//     held until libp2p reports the answer sent or failed: a built answer
+//     waits in the inbound stream task for as long as the peer does not read
+//     it (up to the request timeout), so a slot that came back when the build
+//     finished bounded only the disk read and let a peer that asks without
+//     reading pile up one multi-megabyte answer per admitted request.
+//
+// A third, global limit backs the per-peer one: [`MAX_PENDING_SYNC_RESPONSE_BYTES`]
+// bounds the answer bytes outstanding across ALL peers, because the per-peer
+// cap multiplies by however many identities connect.
 //
 // A refused request is answered with an empty page rather than dropped. The
 // channel exists either way; an empty answer costs no disk and tells a
@@ -390,10 +402,53 @@ pub const SYNC_ANSWERS_PER_SEC: f64 = 8.0;
 /// letting a burst be a strategy.
 pub const SYNC_ANSWER_BURST: f64 = 32.0;
 
-/// Answers being built for ONE peer at one instant. Two, not one: a peer may
-/// legitimately have its reconnect request and its page-chase request open at
-/// the same moment. Anything past that is not a sync pattern.
+/// Answers being built or awaiting write for ONE peer at one instant. Two,
+/// not one: a peer may legitimately have its reconnect request and its
+/// page-chase request open at the same moment, and its next question can
+/// arrive before this node has processed `ResponseSent` for the previous
+/// one. Anything past that is not a sync pattern.
 pub const MAX_INFLIGHT_SYNC_PER_PEER: usize = 2;
+
+/// Answer bytes this node will have outstanding — being built, or built and
+/// not yet written to the peer — across ALL peers.
+///
+/// An admitted request reserves a whole [`MAX_SYNC_FRAME`] up front (its size
+/// is unknown until the log is read), the reservation shrinks to the real
+/// size once the answer is built, and it is returned when libp2p reports the
+/// answer sent or failed. So this is a hard ceiling, not a high-water mark
+/// checked after the fact: sixteen worst-case answers, 128 MiB. Honest sync
+/// is far below it — a tip page is a few kilobytes and is written in
+/// milliseconds — while peers that request and do not read can pin at most
+/// this much for one request timeout. Past it, new requests are refused with
+/// the same empty page as any other refusal.
+pub const MAX_PENDING_SYNC_RESPONSE_BYTES: u64 = 16 * MAX_SYNC_FRAME;
+
+/// One source address's share of [`MAX_PENDING_SYNC_RESPONSE_BYTES`].
+///
+/// Peer ids are free to mint, so the per-peer in-flight cap alone lets one
+/// host under eight identities reserve the whole ceiling and keep every other
+/// peer refused. Four worst-case answers is two peers each with a full
+/// [`MAX_INFLIGHT_SYNC_PER_PEER`]: nodes behind one address that sync from
+/// genesis together are served two full pages at a time each for two of
+/// them, and the others are answered as soon as one of those is written.
+/// Near the tip the limit is not felt: a built answer is charged at its real
+/// size, a few kilobytes.
+pub const MAX_PENDING_SYNC_SOURCE_BYTES: u64 = 4 * MAX_SYNC_FRAME;
+
+/// What every source that is not one of the operator's own peers may hold of
+/// [`MAX_PENDING_SYNC_RESPONSE_BYTES`] together. The remaining quarter is
+/// only ever reserved by configured or dialled peers, so however the rest is
+/// occupied, a configured peer that restarts is still answered.
+pub const MAX_PENDING_SYNC_UNCONFIGURED_BYTES: u64 = 12 * MAX_SYNC_FRAME;
+
+/// After an answer to a source times out unread, that source is refused for
+/// this long: one request timeout, the time its answer was held for. Without
+/// it the same source asks again at once and the bytes are never free. A
+/// peer that reads its answers never sees this.
+pub const SYNC_UNREAD_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Sources remembered as cooling down; expired records are dropped first.
+const MAX_COOLING_SYNC_SOURCES: usize = 1024;
 
 const _: () = assert!(
     MAX_INFLIGHT_SYNC_PER_PEER < MAX_CONCURRENT_SYNC_STREAMS,
@@ -406,8 +461,15 @@ const _: () = assert!(
 pub enum SyncRefusal {
     /// Over [`SYNC_ANSWERS_PER_SEC`] once the burst is spent.
     RateLimited,
-    /// Already [`MAX_INFLIGHT_SYNC_PER_PEER`] answers being built.
+    /// Already [`MAX_INFLIGHT_SYNC_PER_PEER`] answers being built or written.
     TooManyInFlight,
+    /// [`MAX_PENDING_SYNC_RESPONSE_BYTES`] of answers are already outstanding
+    /// across all peers.
+    ResponseBacklog,
+    /// The peer's source address holds its share of the outstanding answers
+    /// ([`MAX_PENDING_SYNC_SOURCE_BYTES`]), or an answer to it timed out
+    /// unread less than [`SYNC_UNREAD_COOLDOWN`] ago.
+    SourceBacklog,
 }
 
 #[derive(Debug)]
@@ -439,14 +501,20 @@ struct PeerSync {
 /// eyes.
 ///
 /// It is also the accounting token. Exactly one permit exists per occupied
-/// in-flight slot, it is moved into the blocking task and handed back to the
-/// swarm loop with the answer, and [`SyncLimiter::release`] consumes it — so a
-/// slot cannot be released twice, and a refused request (which holds no
-/// permit) cannot release one at all.
+/// in-flight slot, it is moved into the blocking task, handed back to the
+/// swarm loop with the answer, parked under the inbound request id while the
+/// answer is written, and [`SyncLimiter::release`] consumes it — so a slot
+/// cannot be released twice, and a refused request (which holds no permit)
+/// cannot release one at all.
 #[derive(Debug)]
 #[must_use = "dropping a permit without SyncLimiter::release leaks the peer's in-flight slot"]
 pub struct SyncPermit {
     peer: PeerId,
+    /// This answer's share of [`SyncLimiter::reserved_bytes`].
+    reserved: u64,
+    /// The source address the bytes are charged to; `None` for one of the
+    /// operator's own peers, which has no per-source share.
+    source: Option<IpAddr>,
 }
 
 /// Per-peer admission for `get-blocks`: a token bucket and an in-flight cap.
@@ -456,13 +524,30 @@ pub struct SyncPermit {
 #[derive(Debug, Default)]
 pub struct SyncLimiter {
     peers: HashMap<PeerId, PeerSync>,
+    /// Sum of `SyncPermit::reserved` over every live permit; bounded by
+    /// [`MAX_PENDING_SYNC_RESPONSE_BYTES`].
+    reserved: u64,
+    /// The part of `reserved` held per unconfigured source address; entries
+    /// exist only while nonzero. Their sum is bounded by
+    /// [`MAX_PENDING_SYNC_UNCONFIGURED_BYTES`].
+    reserved_by_source: HashMap<IpAddr, u64>,
+    /// Source address → refused until; see [`SYNC_UNREAD_COOLDOWN`].
+    cooling: HashMap<IpAddr, Instant>,
 }
 
 impl SyncLimiter {
     /// Admit one request, or say why not. The [`SyncPermit`] returned on `Ok`
     /// holds the peer's in-flight slot until it is handed to
     /// [`SyncLimiter::release`].
+    #[cfg(test)]
     pub fn begin(&mut self, peer: PeerId, now: Instant) -> Result<SyncPermit, SyncRefusal> {
+        self.begin_from(peer, None, now)
+    }
+
+    /// [`Self::begin`] for a peer reached over an inbound connection from
+    /// `source` that is not one of the operator's own peers. `None` is a
+    /// configured or dialled peer: it answers to the global ceiling only.
+    pub fn begin_from(&mut self, peer: PeerId, source: Option<IpAddr>, now: Instant) -> Result<SyncPermit, SyncRefusal> {
         let e = self.peers.entry(peer).or_insert(PeerSync {
             tokens: SYNC_ANSWER_BURST,
             last: now,
@@ -480,6 +565,26 @@ impl SyncLimiter {
         if e.inflight >= MAX_INFLIGHT_SYNC_PER_PEER {
             return Err(SyncRefusal::TooManyInFlight);
         }
+        // Likewise before a token is spent: the backlog is everybody's, and a
+        // peer refused for it has cost this node nothing. The size of the
+        // answer is not known yet, so the worst case is what must fit.
+        if self.reserved.saturating_add(MAX_SYNC_FRAME) > MAX_PENDING_SYNC_RESPONSE_BYTES {
+            return Err(SyncRefusal::ResponseBacklog);
+        }
+        // And the same for the two shares inside that ceiling.
+        if let Some(source) = source {
+            if self.cooling.get(&source).is_some_and(|until| now < *until) {
+                return Err(SyncRefusal::SourceBacklog);
+            }
+            let held = self.reserved_by_source.get(&source).copied().unwrap_or(0);
+            if held.saturating_add(MAX_SYNC_FRAME) > MAX_PENDING_SYNC_SOURCE_BYTES {
+                return Err(SyncRefusal::SourceBacklog);
+            }
+            let unconfigured = self.reserved_by_source.values().fold(0u64, |sum, b| sum.saturating_add(*b));
+            if unconfigured.saturating_add(MAX_SYNC_FRAME) > MAX_PENDING_SYNC_UNCONFIGURED_BYTES {
+                return Err(SyncRefusal::ResponseBacklog);
+            }
+        }
         if e.tokens < 1.0 {
             return Err(SyncRefusal::RateLimited);
         }
@@ -489,10 +594,55 @@ impl SyncLimiter {
         // below that cap here — saturating is the intended semantics for a
         // counter regardless.
         e.inflight = e.inflight.saturating_add(1);
-        Ok(SyncPermit { peer })
+        self.reserved = self.reserved.saturating_add(MAX_SYNC_FRAME);
+        if let Some(source) = source {
+            let held = self.reserved_by_source.entry(source).or_insert(0);
+            *held = held.saturating_add(MAX_SYNC_FRAME);
+        }
+        Ok(SyncPermit { peer, reserved: MAX_SYNC_FRAME, source })
     }
 
-    /// One answer finished (or failed): give the slot back.
+    /// Give `bytes` of a permit's reservation back to its source's share.
+    fn unreserve_source(&mut self, source: Option<IpAddr>, bytes: u64) {
+        let Some(source) = source else { return };
+        if let Some(held) = self.reserved_by_source.get_mut(&source) {
+            *held = held.saturating_sub(bytes);
+            if *held == 0 {
+                self.reserved_by_source.remove(&source);
+            }
+        }
+    }
+
+    /// The answer this permit covers was handed to libp2p and timed out
+    /// without being read. Charged to the source address, not the peer id:
+    /// a new id costs nothing. Call before [`Self::release`].
+    pub fn note_unread(&mut self, permit: &SyncPermit, now: Instant) {
+        let Some(source) = permit.source else { return };
+        if !self.cooling.contains_key(&source) {
+            self.cooling.retain(|_, until| now < *until);
+            if self.cooling.len() >= MAX_COOLING_SYNC_SOURCES {
+                return;
+            }
+        }
+        self.cooling.insert(source, now + SYNC_UNREAD_COOLDOWN);
+    }
+
+    /// The answer is built: shrink the permit's worst-case reservation to the
+    /// bytes actually waiting to be written. Never grows it — admission was
+    /// decided against the worst case.
+    pub fn settle(&mut self, permit: &mut SyncPermit, actual: u64) {
+        let keep = actual.min(permit.reserved);
+        self.reserved = self.reserved.saturating_sub(permit.reserved.saturating_sub(keep));
+        self.unreserve_source(permit.source, permit.reserved.saturating_sub(keep));
+        permit.reserved = keep;
+    }
+
+    /// Answer bytes currently reserved across all peers.
+    pub fn reserved_bytes(&self) -> u64 {
+        self.reserved
+    }
+
+    /// One answer was written (or failed): give the slot and its bytes back.
     ///
     /// Takes the permit **by value** on purpose. The first cut of this fix
     /// released by `PeerId` from the response channel, which every answer
@@ -502,6 +652,8 @@ impl SyncLimiter {
     /// the defence paid the attacker. Only a permit can be released now, and
     /// a refusal never gets one.
     pub fn release(&mut self, permit: SyncPermit) {
+        self.reserved = self.reserved.saturating_sub(permit.reserved);
+        self.unreserve_source(permit.source, permit.reserved);
         let mut remove = false;
         if let Some(e) = self.peers.get_mut(&permit.peer) {
             e.inflight = e.inflight.saturating_sub(1);
@@ -561,6 +713,10 @@ pub struct Origin {
     /// sync responses, which have no gossipsub message id.
     block_hint: Option<(PeerId, u64)>,
     reservation: Option<Arc<crate::net::SourceReservation>>,
+    /// The block answers this node's own sync request or came from a peer
+    /// the operator configured. Node-local scheduling only: such a block is
+    /// verified under the allowance gossip cannot spend, never trusted more.
+    directed_block: bool,
 }
 
 impl Origin {
@@ -573,6 +729,24 @@ impl Origin {
     /// its authenticated peer id through the same reservation type.
     pub(crate) fn verification_source(&self) -> Option<[u8; 32]> {
         self.reservation.as_ref().map(|guard| guard.verification_source())
+    }
+
+    /// See the `directed_block` field.
+    pub(crate) fn directed_block(&self) -> bool {
+        self.directed_block
+    }
+
+    pub(crate) fn mark_directed_block(&mut self) {
+        self.directed_block = true;
+    }
+
+    /// The engine accepted this message after verifying it. Tells the devnet
+    /// mesh, which uses it to tell a peer that proved itself from one that
+    /// merely connected (`net::DeliveryProof`); a no-op for every other origin.
+    pub(crate) fn note_mesh_delivery_verified(&self) {
+        if let Some(reservation) = &self.reservation {
+            reservation.delivery_verified();
+        }
     }
 
     /// Exact wire charge retained by the transport reservation after
@@ -588,6 +762,7 @@ impl Origin {
             inner: None,
             block_hint: None,
             reservation: None,
+            directed_block: false,
         }
     }
 
@@ -597,6 +772,7 @@ impl Origin {
             inner: None,
             block_hint: Some((peer, slot)),
             reservation: None,
+            directed_block: true,
         }
     }
 }
@@ -994,21 +1170,169 @@ pub fn peer_score_thresholds() -> PeerScoreThresholds {
     }
 }
 
+/// Wall-clock epoch from which the gossipsub message id binds the topic.
+///
+/// The id used to be a hash of the payload alone. Gossipsub's duplicate cache
+/// and its per-message score record are keyed by that id and are consulted
+/// before the topic or the subscription is looked at, so bytes first seen on
+/// one topic decided the fate of the same bytes on every other topic: a block
+/// replayed on the transaction topic fails to decode there, is recorded as
+/// invalid, and the honest copy on the block topic is then dropped as a
+/// duplicate while its forwarder takes the invalid-message penalty.
+///
+/// **This is node-local policy, not consensus**, but it cannot be switched node
+/// by node: ids travel between peers in IHAVE/IWANT/IDONTWANT. Two peers with
+/// different id functions never recognise each other's advertisements, so the
+/// receiver asks (IWANT) for everything, gets messages whose locally computed
+/// id differs from the one it asked for, never resolves the promise, and
+/// charges the sender a broken-promise behaviour penalty (P7, weight -10,
+/// squared) for every advertised message. A handful per minute crosses
+/// `gossip_threshold`; the two populations stop gossiping to each other and
+/// prune each other from their meshes. Hence a wall-clock gate: every upgraded
+/// node changes function at the same instant, with no restart in between.
+///
+/// `u64::MAX` is inert: ids are byte-identical to the payload-only ones. Set
+/// it in a release only once the whole fleet runs a build that has this
+/// gate. On a funded network the value is this constant and nothing else
+/// (review round 2, GATE-09): it is part of the binary, so two nodes of one
+/// release cannot disagree on it.
+pub const GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Boot-time override of [`GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH`]: a decimal
+/// epoch number. Every node of a network must carry the same value. Anything
+/// that is not a decimal `u64` refuses to start the transport — a typo must
+/// not silently leave one node on the other id function.
+///
+/// DEVELOPMENT AND QUALIFICATION BUILDS ONLY
+/// ([`GOSSIP_TOPIC_MSG_ID_EPOCH_OVERRIDE_ALLOWED`]), where rehearsing the
+/// switch without a rebuild is the point. Any other build refuses to start
+/// the transport when the variable is set: a per-node value that peers
+/// cannot see partitions the mesh, and it is not in the build identity.
+pub const GOSSIP_TOPIC_MSG_ID_EPOCH_ENV: &str = "BLOCH_GOSSIP_TOPIC_MSG_ID_EPOCH";
+
+/// Whether this build honours [`GOSSIP_TOPIC_MSG_ID_EPOCH_ENV`]: only builds
+/// that already refuse funded manifests (`engine::run`) and carry their
+/// features in `BLOCH_BUILD_VERSION`.
+pub const GOSSIP_TOPIC_MSG_ID_EPOCH_OVERRIDE_ALLOWED: bool = cfg!(any(
+    feature = "devnet-randao-recommit",
+    feature = "devnet-l2-deposits",
+    feature = "l2-activation-rehearsal",
+));
+
+/// Domain tag of the topic-bound message id. Fixed length, so it needs no
+/// length prefix of its own.
+const TOPIC_MSG_ID_TAG: &[u8] = b"bloch-g4/gossip-message-id/v2";
+
+/// The payload-only message id every node computed before the gate.
+fn legacy_message_id(data: &[u8]) -> MessageId {
+    use sha3::{Digest, Sha3_256};
+    let d = Sha3_256::digest(data);
+    MessageId::from(&d[..16])
+}
+
+/// The topic-bound message id: SHA3-256 over the domain tag, the topic hash
+/// (length-prefixed, so no topic/payload split is ambiguous) and the payload,
+/// truncated like the legacy one.
+fn topic_bound_message_id(topic: &gossipsub::TopicHash, data: &[u8]) -> MessageId {
+    use sha3::{Digest, Sha3_256};
+    let topic = topic.as_str().as_bytes();
+    let mut h = Sha3_256::new();
+    h.update(TOPIC_MSG_ID_TAG);
+    h.update((topic.len() as u64).to_le_bytes());
+    h.update(topic);
+    h.update(data);
+    let d = h.finalize();
+    MessageId::from(&d[..16])
+}
+
+/// When the message id changes function, as a wall-clock instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageIdSchedule {
+    /// Unix milliseconds of the first slot of the activation epoch; `None`
+    /// while the gate is inert (or the instant is not representable).
+    topic_bound_from_ms: Option<u64>,
+}
+
+impl MessageIdSchedule {
+    /// Payload-only ids forever: today's behaviour.
+    pub const INERT: Self = Self { topic_bound_from_ms: None };
+
+    /// The schedule of a network with this genesis and cadence.
+    pub fn new(genesis_time_ms: u64, slot_ms: u64, activation_epoch: u64) -> Self {
+        if activation_epoch == u64::MAX {
+            return Self::INERT;
+        }
+        let topic_bound_from_ms = activation_epoch
+            .checked_mul(bloch_pos_committee::SLOTS_PER_EPOCH)
+            .and_then(|slots| slots.checked_mul(slot_ms))
+            .and_then(|offset| genesis_time_ms.checked_add(offset));
+        Self { topic_bound_from_ms }
+    }
+
+    fn topic_bound_at(&self, now_ms: u64) -> bool {
+        self.topic_bound_from_ms.is_some_and(|from| now_ms >= from)
+    }
+
+    /// The id of `m` for a node whose clock reads `now_ms`.
+    fn message_id_at(&self, now_ms: u64, m: &gossipsub::Message) -> MessageId {
+        if self.topic_bound_at(now_ms) {
+            topic_bound_message_id(&m.topic, &m.data)
+        } else {
+            legacy_message_id(&m.data)
+        }
+    }
+
+    fn message_id(&self, m: &gossipsub::Message) -> MessageId {
+        // The inert schedule never reads the clock.
+        let now_ms = match self.topic_bound_from_ms {
+            None => 0,
+            Some(_) => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
+        };
+        self.message_id_at(now_ms, m)
+    }
+}
+
+/// The activation epoch this boot uses: the override if one is set, else the
+/// built-in constant.
+fn topic_msg_id_activation_epoch(raw: Option<&std::ffi::OsStr>) -> Result<u64, String> {
+    topic_msg_id_activation_epoch_for(raw, GOSSIP_TOPIC_MSG_ID_EPOCH_OVERRIDE_ALLOWED)
+}
+
+fn topic_msg_id_activation_epoch_for(
+    raw: Option<&std::ffi::OsStr>,
+    override_allowed: bool,
+) -> Result<u64, String> {
+    match raw {
+        None => Ok(GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH),
+        Some(raw) if !override_allowed => Err(format!(
+            "{GOSSIP_TOPIC_MSG_ID_EPOCH_ENV}={raw:?} is set, but only development and qualification builds \
+             honour it. In this build the gossip message-id epoch is compiled in; unset the variable"
+        )),
+        Some(raw) => raw
+            .to_str()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| {
+                format!("{GOSSIP_TOPIC_MSG_ID_EPOCH_ENV}={raw:?} is not a decimal epoch number")
+            }),
+    }
+}
+
 /// The gossipsub config.
 ///
 /// `validate_messages()` is the switch that makes `gossip.rs` load-bearing:
 /// with it on, gossipsub relays nothing until the node reports a verdict, so
 /// this node never forwards an attestation it has not judged.
-pub fn gossipsub_config() -> Result<gossipsub::Config, String> {
-    // Message id = SHA3-256 of the payload, truncated. Deterministic across
+pub fn gossipsub_config(schedule: MessageIdSchedule) -> Result<gossipsub::Config, String> {
+    // Message id = truncated SHA3-256, of the payload alone until `schedule`
+    // activates and of tag ‖ topic ‖ payload after (see
+    // [`GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH`]). Deterministic across
     // toolchains (the default hasher is not — two nodes on different Rust
     // versions computed different ids and broke dedup), and sha3 is already
     // this tree's only hash.
-    let msg_id_fn = |m: &gossipsub::Message| {
-        use sha3::{Digest, Sha3_256};
-        let d = Sha3_256::digest(&m.data);
-        MessageId::from(&d[..16])
-    };
+    let msg_id_fn = move |m: &gossipsub::Message| schedule.message_id(m);
     gossipsub::ConfigBuilder::default()
         .protocol_id_prefix(GOSSIP_PROTOCOL_PREFIX)
         .heartbeat_interval(Duration::from_secs(1))
@@ -1103,6 +1427,10 @@ pub struct Config {
     pub max_peers: usize,
     /// Zero the IP-colocation penalty (see [`peer_score_params`]).
     pub behind_proxy: bool,
+    /// The manifest's genesis time and slot cadence. Only used to turn
+    /// [`GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH`] into a wall-clock instant.
+    pub genesis_time_ms: u64,
+    pub slot_ms: u64,
 }
 
 /// Load, or create, this node's libp2p transport identity.
@@ -1151,6 +1479,9 @@ pub fn start(
     let peers_live_swarm = peers_live.clone();
 
     std::thread::Builder::new().name("bloch-p2p".into()).spawn(move || {
+        // GATE-08: a panic in the swarm (libp2p internals, an overflow check)
+        // must end the process, not leave a validator running with no network.
+        let _essential = crate::EssentialThread::new("bloch-p2p");
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
             Err(e) => {
@@ -1196,7 +1527,14 @@ fn build_swarm(
     keypair: &identity::Keypair,
     cfg: &Config,
 ) -> io::Result<(Swarm, Vec<ListenerId>)> {
-    let gs_cfg = gossipsub_config().map_err(io::Error::other)?;
+    let msg_id_epoch =
+        topic_msg_id_activation_epoch(std::env::var_os(GOSSIP_TOPIC_MSG_ID_EPOCH_ENV).as_deref())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    if msg_id_epoch != u64::MAX {
+        println!("p2p: topic-bound gossip message ids from epoch {msg_id_epoch}");
+    }
+    let schedule = MessageIdSchedule::new(cfg.genesis_time_ms, cfg.slot_ms, msg_id_epoch);
+    let gs_cfg = gossipsub_config(schedule).map_err(io::Error::other)?;
     let mut gs = gossipsub::Behaviour::new(MessageAuthenticity::Signed(keypair.clone()), gs_cfg)
         .map_err(|e| io::Error::other(format!("gossipsub: {e}")))?;
     if let Err(e) = gs.with_peer_score(peer_score_params(cfg.behind_proxy), peer_score_thresholds()) {
@@ -1221,6 +1559,7 @@ fn build_swarm(
             let limits = libp2p::connection_limits::ConnectionLimits::default()
                 .with_max_established(Some(max_peers.saturating_mul(2)))
                 .with_max_established_incoming(Some(max_peers))
+                .with_max_established_per_peer(Some(MAX_CONNECTIONS_PER_PEER))
                 .with_max_pending_incoming(Some(max_peers))
                 .with_max_pending_outgoing(Some(max_peers.max(1)));
             G4Behaviour {
@@ -1303,6 +1642,9 @@ struct Loop {
     /// Per-peer admission for the `get-blocks` requests this node ANSWERS.
     /// See [`SyncLimiter`].
     sync_limiter: SyncLimiter,
+    /// Permits of answers handed to libp2p and not yet reported sent or
+    /// failed, by inbound request id. See [`deliver_sync_answer`].
+    sync_awaiting_write: HashMap<request_response::InboundRequestId, SyncPermit>,
     topics: Topics,
     /// Distinct peers with at least one connection up right now, shared with
     /// [`Handle::peer_count`] so the RPC can read it without touching the
@@ -1310,6 +1652,109 @@ struct Loop {
     /// `num_established` boundaries, so a peer holding the usual two
     /// connections (both sides dialled) counts once.
     peers_live: Arc<AtomicUsize>,
+    /// Per-source share of inbound connections. See [`InboundSources`].
+    inbound_sources: InboundSources,
+}
+
+/// Connections one peer id may hold, both directions together, enforced by
+/// `connection_limits`. An honest pair holds two when both sides dial; four
+/// leaves room for a simultaneous-dial race and for a reconnect that overlaps
+/// the connection it replaces. Without it one identity could take every
+/// inbound slot by itself.
+const MAX_CONNECTIONS_PER_PEER: u32 = 4;
+
+/// Share of the inbound connection ceiling (`max_peers`) one source may hold:
+/// an IPv4 address or an IPv6 /64, see [`crate::connection_limit::limit_key`].
+///
+/// One eighth, so 8 at the default `--max-peers 64`, and never below 2 so a
+/// peer can still replace its own connection on a small node. Peer ids are
+/// free to mint, so the per-peer limit alone leaves one host able to hold
+/// every inbound slot under as many identities as it likes; this binds the
+/// host. Gossipsub already graylists the sixth peer on one address (see
+/// [`peer_score_params`]), so an honest deployment does not come near it.
+fn inbound_share_per_source(max_peers: usize) -> usize {
+    (max_peers / 8).max(2)
+}
+
+/// Per-source accounting of established inbound connections.
+///
+/// `connection_limits` in this libp2p release counts per peer and in total
+/// but not per address, so the share is checked when a connection is
+/// established and a connection past it is closed at once.
+struct InboundSources {
+    /// `None` behind a proxy, where every inbound peer has the proxy's
+    /// address and a per-source share would refuse the whole network.
+    share: Option<usize>,
+    /// The operator's own `--p2p-peer` entries, by address and by peer id
+    /// where the entry carries one. These are never refused and never count
+    /// against a share.
+    configured_sources: HashSet<IpAddr>,
+    configured_peers: HashSet<PeerId>,
+    by_connection: HashMap<ConnectionId, IpAddr>,
+    held: HashMap<IpAddr, usize>,
+}
+
+/// The source a remote multiaddr is charged to, if it names an IP address.
+fn source_of(addr: &Multiaddr) -> Option<IpAddr> {
+    addr.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+        libp2p::multiaddr::Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+        _ => None,
+    })
+    .map(crate::connection_limit::limit_key)
+}
+
+impl InboundSources {
+    fn new<'a>(configured: impl Iterator<Item = &'a Multiaddr>, max_peers: usize, behind_proxy: bool) -> Self {
+        let mut sources = InboundSources {
+            share: (!behind_proxy).then(|| inbound_share_per_source(max_peers)),
+            configured_sources: HashSet::new(),
+            configured_peers: HashSet::new(),
+            by_connection: HashMap::new(),
+            held: HashMap::new(),
+        };
+        for addr in configured {
+            sources.configured_sources.extend(source_of(addr));
+            sources.configured_peers.extend(peer_id_of(addr));
+        }
+        sources
+    }
+
+    /// Record one established inbound connection. False means the source is
+    /// at its share and the caller must close the connection; nothing is
+    /// recorded for it. `dialed` is true when this node reached the same peer
+    /// id by dialling a configured address.
+    fn admit(&mut self, connection: ConnectionId, peer: &PeerId, remote: &Multiaddr, dialed: bool) -> bool {
+        let Some(share) = self.share else { return true };
+        let Some(source) = source_of(remote) else { return true };
+        if dialed || self.configured_peers.contains(peer) || self.configured_sources.contains(&source) {
+            return true;
+        }
+        let held = self.held.get(&source).copied().unwrap_or(0);
+        if held >= share {
+            return false;
+        }
+        self.held.insert(source, held.saturating_add(1));
+        self.by_connection.insert(connection, source);
+        true
+    }
+
+    /// The source an inbound connection is charged to. `None` for a
+    /// connection this node dialled, one from a configured peer or source,
+    /// and every connection behind a proxy: those have no per-source share.
+    fn charged_source(&self, connection: &ConnectionId) -> Option<IpAddr> {
+        self.by_connection.get(connection).copied()
+    }
+
+    fn release(&mut self, connection: &ConnectionId) {
+        let Some(source) = self.by_connection.remove(connection) else { return };
+        if let Some(held) = self.held.get_mut(&source) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                self.held.remove(&source);
+            }
+        }
+    }
 }
 
 /// Per-peer sync-chase budget (R1 A3-M3). See [`MAX_PAGES_WITHOUT_PROGRESS`].
@@ -1444,6 +1889,14 @@ impl Loop {
         }
     }
 
+    /// Whether `peer` is one this node dialled. The only addresses this node
+    /// dials are the operator's configured peers, so a dialled connection is
+    /// how a configured peer is recognised; the entry goes when the peer's
+    /// last connection closes ([`Self::forget_peer`]).
+    fn is_configured_peer(&self, peer: &PeerId) -> bool {
+        self.dialed.values().any(|dialed| dialed == peer)
+    }
+
     /// A peer's last connection just closed: drop everything keyed by its
     /// identity so churn cannot grow any of these past the connected-peer
     /// count (R1 A3-M3, R1 A3-M5, R3 M-7's counterpart for the pull side).
@@ -1488,12 +1941,18 @@ async fn run_swarm(
         dialed: HashMap::new(),
         dialed_order: VecDeque::new(),
         sync_limiter: SyncLimiter::default(),
+        sync_awaiting_write: HashMap::new(),
         topics: Topics {
             blocks: IdentTopic::new(TOPIC_BLOCKS),
             attestations: IdentTopic::new(TOPIC_ATTESTATIONS),
             txs: IdentTopic::new(TOPIC_TXS),
         },
         peers_live,
+        inbound_sources: InboundSources::new(
+            cfg.peers.iter().filter(|a| !cfg.listen.contains(a)),
+            cfg.max_peers,
+            cfg.behind_proxy,
+        ),
     };
 
     // `listen_on` only queues a bind. Keep processing every swarm event while
@@ -1528,7 +1987,7 @@ async fn run_swarm(
     // here to be written to the substream — the swarm loop must never sit in
     // a file read while blocks and attestations wait behind it.
     let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<(
-        Option<SyncPermit>,
+        Option<(request_response::InboundRequestId, SyncPermit)>,
         request_response::ResponseChannel<SyncResponse>,
         SyncResponse,
     )>();
@@ -1596,15 +2055,7 @@ async fn run_swarm(
                 }
             }
             Some((permit, channel, resp)) = resp_rx.recv() => {
-                // The answer is built: release the in-flight slot whether or
-                // not the write succeeds, or a peer that hangs up mid-answer
-                // would leak its own budget away. `None` is a REFUSED request
-                // riding the same channel — it never took a slot, so it must
-                // not give one back.
-                if let Some(permit) = permit {
-                    st.sync_limiter.release(permit);
-                }
-                let _ = swarm.behaviour_mut().sync.send_response(channel, resp);
+                deliver_sync_answer(&mut swarm, &mut st, permit, channel, resp);
             }
             _ = redial.tick() => {
                 let connected: Vec<PeerId> = swarm.connected_peers().copied().collect();
@@ -1813,7 +2264,7 @@ fn handle_swarm_event(
     swarm: &mut Swarm,
     st: &mut Loop,
     resp_tx: &tokio::sync::mpsc::UnboundedSender<(
-        Option<SyncPermit>,
+        Option<(request_response::InboundRequestId, SyncPermit)>,
         request_response::ResponseChannel<SyncResponse>,
         SyncResponse,
     )>,
@@ -1823,10 +2274,30 @@ fn handle_swarm_event(
         SwarmEvent::NewListenAddr { address, .. } => {
             println!("p2p: listening on {address}");
         }
-        SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, num_established, .. } => {
+        SwarmEvent::ConnectionEstablished { peer_id, connection_id, ref endpoint, num_established, .. } => {
             connection_diagnostic(|| println!("p2p: connected {peer_id}"));
             if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
                 st.note_dialed(address.clone(), peer_id);
+            }
+            if let libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } = endpoint {
+                // Every dial this node makes is to a configured address, so a
+                // peer id in `dialed` is one of the operator's own peers.
+                let dialed = st.dialed.values().any(|p| *p == peer_id);
+                if !st.inbound_sources.admit(connection_id, &peer_id, send_back_addr, dialed) {
+                    // Closed, not skipped: the bookkeeping below still runs so
+                    // that `ConnectionClosed` undoes exactly what was done.
+                    trace(|| format!("inbound {send_back_addr} refused: source at its share"));
+                    let _ = swarm.close_connection(connection_id);
+                } else if let Some(ip) = send_back_addr.iter().find_map(|p| match p {
+                    libp2p::multiaddr::Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+                    libp2p::multiaddr::Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+                    _ => None,
+                }) {
+                    // Bloch Sentinel ban (node-local; a no-op unless enabled).
+                    if crate::sentinel::refuse_inbound_libp2p(ip, dialed) {
+                        let _ = swarm.close_connection(connection_id);
+                    }
+                }
             }
             // DO NOT call `gossipsub.add_explicit_peer()` here — see this
             // module's header. An explicit peer is excluded from mesh
@@ -1862,7 +2333,8 @@ fn handle_swarm_event(
                 request_peer_blocks(swarm, st, peer_id, after);
             }
         }
-        SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
+        SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, cause, .. } => {
+            st.inbound_sources.release(&connection_id);
             if num_established == 0 {
                 // Last connection to this peer gone: symmetric with the
                 // `== 1` increment above. `saturating` in effect, via
@@ -1927,11 +2399,12 @@ fn handle_swarm_event(
         }
         SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::Message {
             peer,
+            connection_id,
             message,
-            ..
         })) => match message {
-            request_response::Message::Request { request, channel, .. } => {
-                serve_sync(st, resp_tx.clone(), peer, request, channel);
+            request_response::Message::Request { request_id, request, channel } => {
+                let source = st.inbound_sources.charged_source(&connection_id);
+                serve_sync(st, resp_tx.clone(), peer, source, request_id, request, channel);
             }
             request_response::Message::Response { request_id, response } => {
                 // Ignore an old connection generation without releasing a
@@ -1987,6 +2460,30 @@ fn handle_swarm_event(
             // node. Nothing to fall back to — deliberately: Genesis-3
             // compatibility is not a goal, it is the thing the prefix prevents.
             crate::net::rejection_log::emit(crate::net::rejection_log::Class::Sync, || eprintln!("p2p: sync request to {peer} failed: {error}"));
+        }
+        // The two ways an answer handed to libp2p ends. Either one returns the
+        // in-flight slot and the reserved bytes; see `deliver_sync_answer`.
+        SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::ResponseSent {
+            request_id,
+            ..
+        })) => {
+            finish_sync_answer(&mut st.sync_awaiting_write, &mut st.sync_limiter, &request_id);
+        }
+        SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::InboundFailure {
+            peer,
+            request_id,
+            error,
+            ..
+        })) => {
+            // An answer that was handed over and never read is the one
+            // failure the peer's source is charged for.
+            if matches!(error, request_response::InboundFailure::Timeout) {
+                if let Some(permit) = st.sync_awaiting_write.get(&request_id) {
+                    st.sync_limiter.note_unread(permit, Instant::now());
+                }
+            }
+            finish_sync_answer(&mut st.sync_awaiting_write, &mut st.sync_limiter, &request_id);
+            trace(|| format!("sync answer to {peer} not delivered: {error}"));
         }
         _ => {}
     }
@@ -2060,6 +2557,7 @@ fn on_gossip(
                     inner: Some((message_id.clone(), source)),
                     block_hint: Some((source, slot)),
                     reservation: None,
+                    directed_block: st.is_configured_peer(&source),
                 };
                 let mut event = NetEvent::Block(env, origin);
                 if crate::net::queued_bytes(&event) != message.data.len() {
@@ -2091,6 +2589,7 @@ fn on_gossip(
                     inner: Some((message_id.clone(), source)),
                     block_hint: None,
                     reservation: None,
+                    directed_block: false,
                 };
                 let mut event = NetEvent::Attestation(att, origin);
                 if crate::net::queued_bytes(&event) != message.data.len() {
@@ -2118,6 +2617,7 @@ fn on_gossip(
                     inner: Some((message_id.clone(), source)),
                     block_hint: None,
                     reservation: None,
+                    directed_block: false,
                 };
                 let mut event = NetEvent::Transaction(tx, origin);
                 if crate::net::queued_bytes(&event) != message.data.len() {
@@ -2193,11 +2693,13 @@ fn has_source_reservation(ev: &NetEvent) -> bool {
 fn serve_sync(
     st: &mut Loop,
     resp_tx: tokio::sync::mpsc::UnboundedSender<(
-        Option<SyncPermit>,
+        Option<(request_response::InboundRequestId, SyncPermit)>,
         request_response::ResponseChannel<SyncResponse>,
         SyncResponse,
     )>,
     peer: PeerId,
+    source: Option<IpAddr>,
+    request_id: request_response::InboundRequestId,
     request: SyncRequest,
     channel: request_response::ResponseChannel<SyncResponse>,
 ) {
@@ -2207,11 +2709,11 @@ fn serve_sync(
     // hash lookup, not a disk read and a pool thread. The permit it mints is
     // what `read_sync_page` demands, so this check cannot be edited away
     // without the serving path ceasing to compile.
-    let permit = match st.sync_limiter.begin(peer, Instant::now()) {
+    let permit = match st.sync_limiter.begin_from(peer, source, Instant::now()) {
         Ok(permit) => permit,
         Err(why) => {
             let (permit, answer) = refusal_answer(peer, why);
-            let _ = resp_tx.send((permit, channel, answer));
+            let _ = resp_tx.send((permit.map(|p| (request_id, p)), channel, answer));
             return;
         }
     };
@@ -2219,8 +2721,96 @@ fn serve_sync(
     let limit = (limit as usize).min(MAX_SYNC_BLOCKS);
     tokio::task::spawn_blocking(move || {
         let envelopes = read_sync_page(&dir, &permit, after_slot, limit);
-        let _ = resp_tx.send((Some(permit), channel, SyncResponse::Blocks { envelopes }));
+        let _ = resp_tx.send((
+            Some((request_id, permit)),
+            channel,
+            SyncResponse::Blocks { envelopes },
+        ));
     });
+}
+
+/// Bytes a built answer holds in memory until it is written: the envelopes
+/// plus the `Vec` header of each.
+fn sync_response_bytes(resp: &SyncResponse) -> u64 {
+    let SyncResponse::Blocks { envelopes } = resp;
+    envelopes.iter().fold(0u64, |sum, e| {
+        sum.saturating_add((e.len() as u64).saturating_add(std::mem::size_of::<Vec<u8>>() as u64))
+    })
+}
+
+/// Hand a built answer to libp2p, keeping its permit until the write ends.
+///
+/// The permit used to be released here, as soon as the answer was BUILT. But
+/// libp2p then holds the answer (up to [`MAX_SYNC_FRAME`]) in the inbound
+/// stream task until the peer reads it or the request timeout fires, so the
+/// in-flight cap covered the disk read only: a peer that asked at the allowed
+/// rate and never read made this node hold one answer per admitted request.
+/// Now the permit is parked under the inbound request id and released by
+/// [`finish_sync_answer`] on `ResponseSent` or `InboundFailure`.
+///
+/// Every exit releases exactly once, so a peer that hangs up mid-answer still
+/// cannot leak its own budget away (the property the early release was there
+/// for):
+///
+/// * the request already failed while the answer was being built (timeout,
+///   connection closed) — libp2p has emitted its one event for it and will
+///   emit no other, which is what `is_pending_inbound` reports: release now;
+/// * `send_response` returns `Err` (the stream task is already gone):
+///   release now — the event for it, if still queued, finds nothing parked;
+/// * otherwise libp2p still tracks the request and owes exactly one of
+///   `ResponseSent` / `InboundFailure` (the latter also on connection close).
+///
+/// `None` is a REFUSED request riding the same channel — it never took a
+/// slot, so it must not give one back.
+fn deliver_sync_answer(
+    swarm: &mut Swarm,
+    st: &mut Loop,
+    permit: Option<(request_response::InboundRequestId, SyncPermit)>,
+    channel: request_response::ResponseChannel<SyncResponse>,
+    resp: SyncResponse,
+) {
+    let Some((request_id, mut permit)) = permit else {
+        let _ = swarm.behaviour_mut().sync.send_response(channel, resp);
+        return;
+    };
+    st.sync_limiter.settle(&mut permit, sync_response_bytes(&resp));
+    let sync = &mut swarm.behaviour_mut().sync;
+    if sync.is_pending_inbound(&permit.peer, &request_id)
+        && sync.send_response(channel, resp).is_ok()
+    {
+        hold_sync_permit(&mut st.sync_awaiting_write, &mut st.sync_limiter, request_id, permit);
+    } else {
+        st.sync_limiter.release(permit);
+    }
+}
+
+/// Park the permit of an answer that is being written. Generic over the key
+/// only so the tests can drive it: an `InboundRequestId` cannot be built
+/// outside libp2p.
+fn hold_sync_permit<K: std::hash::Hash + Eq>(
+    awaiting: &mut HashMap<K, SyncPermit>,
+    limiter: &mut SyncLimiter,
+    id: K,
+    permit: SyncPermit,
+) {
+    // Ids are unique per behaviour, so nothing is ever displaced; if one
+    // were, releasing it is what keeps the accounting exact.
+    if let Some(displaced) = awaiting.insert(id, permit) {
+        limiter.release(displaced);
+    }
+}
+
+/// The answer for `id` was sent or failed: release its permit, once. An id
+/// with nothing parked is a refusal, or an answer already released by
+/// [`deliver_sync_answer`], and frees nothing.
+fn finish_sync_answer<K: std::hash::Hash + Eq>(
+    awaiting: &mut HashMap<K, SyncPermit>,
+    limiter: &mut SyncLimiter,
+    id: &K,
+) {
+    if let Some(permit) = awaiting.remove(id) {
+        limiter.release(permit);
+    }
 }
 
 /// What a REFUSED `get-blocks` is answered with: an empty page and **no
@@ -2228,8 +2818,8 @@ fn serve_sync(
 ///
 /// The `None` is the whole point and is why this is a function rather than two
 /// inline lines. Refusals ride the same response channel as real answers, and
-/// the swarm loop releases an in-flight slot for whatever comes back down it —
-/// so a refusal that carried a releasable token would hand the flooder a slot
+/// the swarm loop parks and later releases an in-flight slot for whatever
+/// permit comes back down it — so a refusal that carried a releasable token would hand the flooder a slot
 /// per refusal it provoked, and the in-flight cap it had just tripped would
 /// stop binding. Pinned by `refused_requests_do_not_free_in_flight_slots`.
 fn refusal_answer(peer: PeerId, why: SyncRefusal) -> (Option<SyncPermit>, SyncResponse) {
@@ -2709,6 +3299,252 @@ mod tests {
         assert_eq!(lim.tracked(), 0, "a disconnected peer's bucket is never released");
     }
 
+    #[test]
+    fn the_swarm_loop_charges_sync_answers_to_the_connection_source() {
+        // W3-3 (V2-4): the limiter test below passes if the swarm loop
+        // hands it no source. `serve_sync` needs a libp2p `ResponseChannel`,
+        // which only a live swarm can make, so this reads the three call
+        // sites the fix depends on.
+        let source = include_str!("p2p.rs");
+        let start = source.find("fn handle_swarm_event(").expect("swarm event handler");
+        let end = source[start..].find("\nfn serve_sync(").map(|o| start + o).expect("serve_sync");
+        let handler = &source[start..end];
+        let request = handler.find("request_response::Message::Request { request_id, request, channel } => {").expect("request arm");
+        let arm = &handler[request..];
+        let arm = &arm[..arm.find("request_response::Message::Response").expect("end of the request arm")];
+        assert!(arm.contains("let source = st.inbound_sources.charged_source(&connection_id);"), "{arm}");
+        assert!(arm.contains("serve_sync(st, resp_tx.clone(), peer, source, request_id, request, channel);"), "{arm}");
+        let timeout = handler.find("if matches!(error, request_response::InboundFailure::Timeout) {").expect("unread answer");
+        let arm = &handler[timeout..];
+        let arm = &arm[..arm.find("finish_sync_answer(").expect("end of the timeout arm")];
+        assert!(arm.contains("st.sync_limiter.note_unread(permit, Instant::now());"), "{arm}");
+        let serve = &source[end..];
+        let serve = &serve[..serve.find("\n}\n").expect("end of serve_sync")];
+        assert!(serve.contains("st.sync_limiter.begin_from(peer, source, Instant::now())"), "serve_sync must admit by source");
+    }
+
+    /// P2P-1: the in-flight slot is held until the answer is WRITTEN or has
+    /// FAILED, not until it is built. Before this, the swarm loop released
+    /// the permit and then handed the answer to libp2p, where it waits for
+    /// the peer to read it — so a peer that asked and never read held no
+    /// slot while this node held its multi-megabyte answers.
+    ///
+    /// V2-4: eight identities on one address, each with two answers nobody
+    /// reads, hold that address's share and no more: a peer on another
+    /// address and a configured peer are still served, and the address is
+    /// not answered again while an unread answer is being paid for.
+    #[test]
+    fn one_source_address_cannot_reserve_every_pending_sync_answer() {
+        let mut lim = SyncLimiter::default();
+        let t0 = Instant::now();
+        let host: IpAddr = "192.0.2.1".parse().unwrap();
+        let mut held = Vec::new();
+        let mut refused = 0;
+        for _ in 0..8 {
+            let peer = PeerId::random();
+            for _ in 0..MAX_INFLIGHT_SYNC_PER_PEER {
+                match lim.begin_from(peer, Some(host), t0) {
+                    Ok(permit) => held.push(permit),
+                    Err(why) => {
+                        assert_eq!(why, SyncRefusal::SourceBacklog);
+                        refused += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(lim.reserved_bytes(), MAX_PENDING_SYNC_SOURCE_BYTES);
+        assert_eq!((held.len(), refused), (4, 12));
+        let other = lim.begin_from(PeerId::random(), Some("192.0.2.2".parse().unwrap()), t0)
+            .expect("a peer on another address is served");
+
+        // Unconfigured sources together stop short of the ceiling ...
+        let mut more = Vec::new();
+        for n in 3..=4u8 {
+            for _ in 0..2 {
+                let peer = PeerId::random();
+                for _ in 0..MAX_INFLIGHT_SYNC_PER_PEER {
+                    if let Ok(permit) = lim.begin_from(peer, Some(IpAddr::from([192, 0, 2, n])), t0) {
+                        more.push(permit);
+                    }
+                }
+            }
+        }
+        assert_eq!(lim.reserved_bytes(), MAX_PENDING_SYNC_UNCONFIGURED_BYTES);
+        assert_eq!(
+            lim.begin_from(PeerId::random(), Some("192.0.2.9".parse().unwrap()), t0).err(),
+            Some(SyncRefusal::ResponseBacklog)
+        );
+        // ... and what is left is a configured peer's.
+        let configured = lim.begin(PeerId::random(), t0).expect("a configured peer is served");
+
+        // A built answer is charged at its real size, so honest peers near
+        // the tip do not hold their address's share.
+        assert_eq!(lim.begin_from(PeerId::random(), Some(host), t0).err(), Some(SyncRefusal::SourceBacklog));
+        let mut first = held.remove(0);
+        lim.settle(&mut first, 4096);
+        lim.settle(&mut held[0], 4096);
+        held.push(lim.begin_from(PeerId::random(), Some(host), t0).expect("the share is in bytes actually held"));
+
+        // The answer times out unread: the address waits out the cooldown.
+        lim.note_unread(&first, t0);
+        lim.release(first);
+        let peer = PeerId::random();
+        assert_eq!(lim.begin_from(peer, Some(host), t0).err(), Some(SyncRefusal::SourceBacklog));
+        for permit in held {
+            lim.release(permit);
+        }
+        assert_eq!(lim.begin_from(peer, Some(host), t0 + SYNC_UNREAD_COOLDOWN - Duration::from_millis(1)).err(), Some(SyncRefusal::SourceBacklog));
+        let again = lim.begin_from(peer, Some(host), t0 + SYNC_UNREAD_COOLDOWN).expect("served after the cooldown");
+        for permit in more.into_iter().chain([other, configured, again]) {
+            lim.release(permit);
+        }
+        assert_eq!(lim.reserved_bytes(), 0);
+        assert!(lim.reserved_by_source.is_empty(), "every byte went back to its source");
+    }
+
+    /// Driven through the same `hold_sync_permit` / `finish_sync_answer` the
+    /// swarm loop calls, keyed by a plain integer because an
+    /// `InboundRequestId` cannot be constructed outside libp2p.
+    #[test]
+    fn sync_permit_is_held_until_the_answer_is_sent_or_fails() {
+        let mut lim = SyncLimiter::default();
+        let mut awaiting: HashMap<u64, SyncPermit> = HashMap::new();
+        let peer = PeerId::random();
+        let t0 = Instant::now();
+
+        // Two answers built and handed to libp2p; the peer reads neither.
+        for id in 0..MAX_INFLIGHT_SYNC_PER_PEER as u64 {
+            let mut permit = lim.begin(peer, t0).expect("under the cap");
+            lim.settle(&mut permit, 4 * 1024 * 1024);
+            hold_sync_permit(&mut awaiting, &mut lim, id, permit);
+        }
+        assert_eq!(
+            lim.begin(peer, t0).err(),
+            Some(SyncRefusal::TooManyInFlight),
+            "a built but unwritten answer no longer held its in-flight slot"
+        );
+        assert_eq!(lim.reserved_bytes(), 2 * 4 * 1024 * 1024);
+
+        // An event for some other request (a refusal's `ResponseSent`, or a
+        // failure that raced the build) frees nothing.
+        finish_sync_answer(&mut awaiting, &mut lim, &999);
+        assert_eq!(lim.begin(peer, t0).err(), Some(SyncRefusal::TooManyInFlight));
+
+        // `ResponseSent` for the first: exactly one slot comes back.
+        finish_sync_answer(&mut awaiting, &mut lim, &0);
+        let permit = lim.begin(peer, t0).expect("a sent answer must free its slot");
+        assert_eq!(lim.begin(peer, t0).err(), Some(SyncRefusal::TooManyInFlight));
+        lim.release(permit);
+
+        // A duplicate event for the same request must not free a second slot.
+        finish_sync_answer(&mut awaiting, &mut lim, &0);
+        let permit = lim.begin(peer, t0).expect("one slot is free");
+        assert_eq!(
+            lim.begin(peer, t0).err(),
+            Some(SyncRefusal::TooManyInFlight),
+            "one answer released two slots"
+        );
+        lim.release(permit);
+
+        // `InboundFailure` (timeout, reset, connection closed) for the second
+        // frees the other, and nothing is left behind.
+        finish_sync_answer(&mut awaiting, &mut lim, &1);
+        assert!(awaiting.is_empty());
+        assert_eq!(lim.reserved_bytes(), 0, "a failed answer leaked its reserved bytes");
+        let a = lim.begin(peer, t0).expect("both slots are back");
+        let b = lim.begin(peer, t0).expect("both slots are back");
+        lim.release(a);
+        lim.release(b);
+    }
+
+    /// P2P-1: no leak when the peer disconnects with an answer unwritten. The
+    /// one `forget` runs with the permit still parked; the connection-closed
+    /// `InboundFailure` then releases it and that finishes the removal, in
+    /// either order of the two events.
+    #[test]
+    fn sync_permit_awaiting_write_is_not_leaked_by_a_disconnect() {
+        for forget_first in [true, false] {
+            let mut lim = SyncLimiter::default();
+            let mut awaiting: HashMap<u64, SyncPermit> = HashMap::new();
+            let peer = PeerId::random();
+            let mut permit = lim.begin(peer, Instant::now()).expect("first request");
+            lim.settle(&mut permit, 1024);
+            hold_sync_permit(&mut awaiting, &mut lim, 7, permit);
+
+            if forget_first {
+                lim.forget(&peer);
+                assert_eq!(lim.tracked(), 1, "the slot must survive until the answer fails");
+                finish_sync_answer(&mut awaiting, &mut lim, &7);
+            } else {
+                finish_sync_answer(&mut awaiting, &mut lim, &7);
+                lim.forget(&peer);
+            }
+            assert!(awaiting.is_empty());
+            assert_eq!(lim.tracked(), 0, "a peer that hung up mid-answer leaked its bucket");
+            assert_eq!(lim.reserved_bytes(), 0, "a peer that hung up mid-answer leaked bytes");
+        }
+    }
+
+    /// P2P-1: the per-peer cap multiplies by the number of identities, so the
+    /// answer bytes outstanding are also bounded across ALL peers. Admission
+    /// reserves the worst case, so the bound holds before anything is built.
+    #[test]
+    fn sync_limiter_refuses_past_the_global_response_byte_cap() {
+        let mut lim = SyncLimiter::default();
+        let t0 = Instant::now();
+        let worst_case = (MAX_PENDING_SYNC_RESPONSE_BYTES / MAX_SYNC_FRAME) as usize;
+        assert!(worst_case >= MAX_INFLIGHT_SYNC_PER_PEER, "one honest peer must fit");
+
+        // Each from a different peer: no per-peer limit is in play.
+        let mut open: Vec<SyncPermit> = (0..worst_case)
+            .map(|i| match lim.begin(PeerId::random(), t0) {
+                Ok(permit) => permit,
+                Err(why) => panic!("answer {i} refused under the byte cap: {why:?}"),
+            })
+            .collect();
+        assert_eq!(lim.reserved_bytes(), MAX_PENDING_SYNC_RESPONSE_BYTES);
+
+        let late = PeerId::random();
+        assert_eq!(
+            lim.begin(late, t0).err(),
+            Some(SyncRefusal::ResponseBacklog),
+            "a request was admitted past MAX_PENDING_SYNC_RESPONSE_BYTES"
+        );
+
+        // A built answer counts for what it weighs, never for more than the
+        // worst case it was admitted against.
+        lim.settle(&mut open[0], MAX_SYNC_FRAME * 4);
+        assert_eq!(lim.reserved_bytes(), MAX_PENDING_SYNC_RESPONSE_BYTES);
+        assert_eq!(lim.begin(late, t0).err(), Some(SyncRefusal::ResponseBacklog));
+        lim.settle(&mut open[0], 0);
+        let permit = lim.begin(late, t0).expect("an empty answer must free its reservation");
+        assert_eq!(lim.begin(PeerId::random(), t0).err(), Some(SyncRefusal::ResponseBacklog));
+
+        // The refusals spent no token: the backlog is not the asker's doing.
+        // `late` was refused twice and admitted once, so the rest of its
+        // burst is intact.
+        lim.release(permit);
+        for _ in 1..(SYNC_ANSWER_BURST as usize) {
+            let permit = lim.begin(late, t0).expect("a backlog refusal cost the peer its burst");
+            lim.release(permit);
+        }
+        assert_eq!(lim.begin(late, t0).err(), Some(SyncRefusal::RateLimited));
+
+        for permit in open.drain(..) {
+            lim.release(permit);
+        }
+        assert_eq!(lim.reserved_bytes(), 0, "released answers left bytes reserved");
+    }
+
+    #[test]
+    fn sync_response_bytes_counts_every_envelope() {
+        let empty = SyncResponse::Blocks { envelopes: Vec::new() };
+        assert_eq!(sync_response_bytes(&empty), 0);
+        let page = SyncResponse::Blocks { envelopes: vec![vec![0u8; 1000], vec![0u8; 24]] };
+        let header = std::mem::size_of::<Vec<u8>>() as u64;
+        assert_eq!(sync_response_bytes(&page), 1024 + 2 * header);
+    }
+
     /// R3 M-7: production calls `forget` exactly ONCE per peer, from
     /// `ConnectionClosed` — there is no second disconnect event to retry a
     /// deferred removal the way the test above does. This is the shape that
@@ -2780,12 +3616,74 @@ mod tests {
             dialed: HashMap::new(),
             dialed_order: VecDeque::new(),
             sync_limiter: SyncLimiter::default(),
+            sync_awaiting_write: HashMap::new(),
             topics: Topics {
                 blocks: IdentTopic::new(TOPIC_BLOCKS),
                 attestations: IdentTopic::new(TOPIC_ATTESTATIONS),
                 txs: IdentTopic::new(TOPIC_TXS),
             },
             peers_live: Arc::new(AtomicUsize::new(0)),
+            inbound_sources: InboundSources::new(std::iter::empty(), 8, true),
+        }
+    }
+
+    /// One source holds only its share of the inbound slots, whatever peer
+    /// ids it presents and whichever addresses of its /64 it uses; closing a
+    /// connection gives the slot back.
+    #[test]
+    fn inbound_share_binds_a_source_not_a_peer_id() {
+        assert_eq!(inbound_share_per_source(64), 8);
+        assert_eq!(inbound_share_per_source(4), 2);
+        let addr = |text: &str| text.parse::<Multiaddr>().unwrap();
+        let mut sources = InboundSources::new(std::iter::empty(), 16, false);
+        let id = ConnectionId::new_unchecked;
+        assert!(sources.admit(id(1), &PeerId::random(), &addr("/ip6/2001:db8:1:2::1/tcp/4001"), false));
+        assert!(sources.admit(id(2), &PeerId::random(), &addr("/ip6/2001:db8:1:2:ffff::2/tcp/4002"), false));
+        assert!(!sources.admit(id(3), &PeerId::random(), &addr("/ip6/2001:db8:1:2:abcd::3/tcp/4003"), false));
+        assert!(sources.admit(id(4), &PeerId::random(), &addr("/ip6/2001:db8:1:3::1/tcp/4001"), false));
+        assert!(sources.admit(id(5), &PeerId::random(), &addr("/ip4/192.0.2.7/tcp/1"), false));
+        assert!(sources.admit(id(6), &PeerId::random(), &addr("/ip6/::ffff:192.0.2.7/tcp/2"), false));
+        assert!(!sources.admit(id(7), &PeerId::random(), &addr("/ip4/192.0.2.7/tcp/3"), false));
+        // A refused connection holds nothing, so closing it releases nothing.
+        sources.release(&id(7));
+        assert!(!sources.admit(id(8), &PeerId::random(), &addr("/ip4/192.0.2.7/tcp/4"), false));
+        sources.release(&id(5));
+        assert!(sources.admit(id(9), &PeerId::random(), &addr("/ip4/192.0.2.7/tcp/5"), false));
+        sources.release(&id(1));
+        sources.release(&id(2));
+        sources.release(&id(4));
+        sources.release(&id(6));
+        sources.release(&id(9));
+        assert!(sources.held.is_empty() && sources.by_connection.is_empty());
+    }
+
+    /// Operator-configured peers are recognised by address, by the peer id
+    /// in their multiaddr, or by having been dialled, and are never refused
+    /// nor charged; behind a proxy the share is off altogether.
+    #[test]
+    fn inbound_share_exempts_configured_peers_and_proxied_nodes() {
+        let addr = |text: &str| text.parse::<Multiaddr>().unwrap();
+        let known = PeerId::random();
+        let configured = [
+            addr("/ip4/198.51.100.9/tcp/16400"),
+            addr(&format!("/dns4/validator.example/tcp/16400/p2p/{known}")),
+        ];
+        let mut sources = InboundSources::new(configured.iter(), 16, false);
+        let id = ConnectionId::new_unchecked;
+        for n in 0..10 {
+            assert!(sources.admit(id(n), &PeerId::random(), &addr("/ip4/198.51.100.9/tcp/1"), false));
+            assert!(sources.admit(id(100 + n), &known, &addr("/ip4/203.0.113.1/tcp/1"), false));
+            assert!(sources.admit(id(200 + n), &PeerId::random(), &addr("/ip4/203.0.113.2/tcp/1"), true));
+        }
+        assert!(sources.held.is_empty(), "configured peers do not use up a share");
+        // The same address is still limited for everyone else.
+        assert!(sources.admit(id(300), &PeerId::random(), &addr("/ip4/203.0.113.1/tcp/1"), false));
+        assert!(sources.admit(id(301), &PeerId::random(), &addr("/ip4/203.0.113.1/tcp/1"), false));
+        assert!(!sources.admit(id(302), &PeerId::random(), &addr("/ip4/203.0.113.1/tcp/1"), false));
+
+        let mut proxied = InboundSources::new(std::iter::empty(), 16, true);
+        for n in 0..40 {
+            assert!(proxied.admit(id(n), &PeerId::random(), &addr("/ip4/10.0.0.1/tcp/1"), false));
         }
     }
 
@@ -2794,7 +3692,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _enter = runtime.enter();
         let key = identity::Keypair::generate_ed25519();
-        let cfg = Config { listen: Vec::new(), peers: Vec::new(), data_dir: PathBuf::new(), max_peers: 8, behind_proxy: true };
+        let cfg = Config { listen: Vec::new(), peers: Vec::new(), data_dir: PathBuf::new(), max_peers: 8, behind_proxy: true, genesis_time_ms: 0, slot_ms: 1_000 };
         let (mut swarm, _) = build_swarm(&key, &cfg).unwrap();
         let mut state = test_loop();
         let peer = PeerId::random();
@@ -3096,7 +3994,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _enter = runtime.enter();
         let key = identity::Keypair::generate_ed25519();
-        let cfg = Config { listen: Vec::new(), peers: Vec::new(), data_dir: PathBuf::new(), max_peers: 8, behind_proxy: true };
+        let cfg = Config { listen: Vec::new(), peers: Vec::new(), data_dir: PathBuf::new(), max_peers: 8, behind_proxy: true, genesis_time_ms: 0, slot_ms: 1_000 };
         let (mut swarm, _) = build_swarm(&key, &cfg).unwrap();
         let mut st = test_loop();
         let peer = PeerId::random();
@@ -3194,6 +4092,7 @@ mod tests {
                 inner: None,
                 block_hint: None,
                 reservation: Some(guard),
+                directed_block: false,
             },
         );
         assert_eq!(
@@ -3502,6 +4401,115 @@ mod tests {
         assert!(REGOSSIP_SUPPRESS_TTL >= DUPLICATE_CACHE_TIME);
     }
 
+    const MSG_ID_VECTOR: &[u8] = b"bloch p2p4 message id vector";
+
+    fn msg_on(topic: &str) -> gossipsub::Message {
+        gossipsub::Message {
+            source: None,
+            data: MSG_ID_VECTOR.to_vec(),
+            sequence_number: None,
+            topic: IdentTopic::new(topic).hash(),
+        }
+    }
+
+    fn id_hex(id: &MessageId) -> String {
+        crate::codec::hex(&id.0)
+    }
+
+    /// The shipped gate is inert, and an inert gate computes exactly the id
+    /// every deployed node computes: SHA3-256 of the payload, first 16 bytes,
+    /// whatever the topic and whatever the clock. The vector was produced
+    /// outside this crate.
+    #[test]
+    fn inert_message_id_is_the_legacy_payload_hash() {
+        assert_eq!(GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH, u64::MAX, "the gate ships inert");
+        assert_eq!(topic_msg_id_activation_epoch(None), Ok(u64::MAX));
+        let inert = MessageIdSchedule::new(1_700_000_000_000, 30_000, u64::MAX);
+        assert_eq!(inert, MessageIdSchedule::INERT);
+        for now_ms in [0, 1_700_000_000_000, u64::MAX] {
+            for topic in [TOPIC_BLOCKS, TOPIC_ATTESTATIONS, TOPIC_TXS] {
+                assert_eq!(
+                    id_hex(&inert.message_id_at(now_ms, &msg_on(topic))),
+                    "f28240f18615e38e81ffc059b7ccfd8e",
+                );
+            }
+        }
+        // And through the config gossipsub is actually given.
+        let cfg = gossipsub_config(MessageIdSchedule::INERT).expect("config builds");
+        assert_eq!(id_hex(&cfg.message_id(&msg_on(TOPIC_TXS))), "f28240f18615e38e81ffc059b7ccfd8e");
+    }
+
+    /// Once active, the same bytes on two topics are two messages: a payload
+    /// seen (and rejected) on the wrong topic no longer occupies the id of
+    /// the honest copy on the right one. Fixed vectors pin the function
+    /// across toolchains and releases.
+    #[test]
+    fn topic_bound_message_id_separates_topics_and_is_stable() {
+        let active = MessageIdSchedule::new(0, 1_000, 0);
+        let blocks = active.message_id_at(0, &msg_on(TOPIC_BLOCKS));
+        let txs = active.message_id_at(0, &msg_on(TOPIC_TXS));
+        assert_ne!(blocks, txs, "one payload on two topics must not share an id");
+        assert_eq!(id_hex(&blocks), "b4c07af1606bd6173250e7293167fea9");
+        assert_eq!(id_hex(&txs), "a0a95baeeb5d243128d304319a8d0345");
+        assert_ne!(blocks, legacy_message_id(MSG_ID_VECTOR));
+        assert_eq!(blocks, active.message_id_at(u64::MAX, &msg_on(TOPIC_BLOCKS)), "deterministic");
+        // The live closure, with the activation instant long past.
+        let cfg = gossipsub_config(active).expect("config builds");
+        assert_eq!(cfg.message_id(&msg_on(TOPIC_BLOCKS)), blocks);
+        assert_eq!(cfg.message_id(&msg_on(TOPIC_TXS)), txs);
+    }
+
+    /// The switch is the first millisecond of the activation epoch, on every
+    /// node alike; an instant that does not fit in a `u64` never arrives.
+    #[test]
+    fn message_id_switches_exactly_at_the_activation_epoch() {
+        let (genesis, slot_ms, epoch) = (1_000_000u64, 30_000u64, 7u64);
+        let at = genesis + epoch * bloch_pos_committee::SLOTS_PER_EPOCH * slot_ms;
+        let schedule = MessageIdSchedule::new(genesis, slot_ms, epoch);
+        let m = msg_on(TOPIC_BLOCKS);
+        assert_eq!(schedule.message_id_at(at - 1, &m), legacy_message_id(MSG_ID_VECTOR));
+        assert_eq!(schedule.message_id_at(at, &m), topic_bound_message_id(&m.topic, MSG_ID_VECTOR));
+        assert_eq!(MessageIdSchedule::new(genesis, slot_ms, u64::MAX - 1), MessageIdSchedule::INERT);
+    }
+
+    /// The override is a decimal epoch or a refusal to start — never a silent
+    /// fallback that leaves one node on the other id function.
+    #[test]
+    fn message_id_epoch_override_is_strict() {
+        use std::ffi::OsStr;
+        assert_eq!(topic_msg_id_activation_epoch_for(Some(OsStr::new("7400")), true), Ok(7400));
+        assert_eq!(topic_msg_id_activation_epoch_for(Some(OsStr::new("0")), true), Ok(0));
+        for bad in ["", "+7", "7400 ", "0x10", "epoch", "18446744073709551616"] {
+            assert!(topic_msg_id_activation_epoch_for(Some(OsStr::new(bad)), true).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Review round 2, GATE-09: outside development builds the epoch is the
+    /// compiled constant; a set override refuses to start instead of putting
+    /// one node on an id function its peers cannot see.
+    #[test]
+    fn message_id_epoch_override_is_refused_outside_development_builds() {
+        use std::ffi::OsStr;
+        assert_eq!(topic_msg_id_activation_epoch_for(None, false), Ok(GOSSIP_TOPIC_MSG_ID_ACTIVATION_EPOCH));
+        for value in ["7400", "0", "18446744073709551615", "", "epoch"] {
+            let err = topic_msg_id_activation_epoch_for(Some(OsStr::new(value)), false).unwrap_err();
+            assert!(err.contains(GOSSIP_TOPIC_MSG_ID_EPOCH_ENV) && err.contains("unset"), "{err}");
+        }
+        // The shipped default build is not a development build.
+        assert_eq!(
+            GOSSIP_TOPIC_MSG_ID_EPOCH_OVERRIDE_ALLOWED,
+            cfg!(any(
+                feature = "devnet-randao-recommit",
+                feature = "devnet-l2-deposits",
+                feature = "l2-activation-rehearsal"
+            ))
+        );
+        assert_eq!(
+            topic_msg_id_activation_epoch(Some(OsStr::new("7400"))).is_ok(),
+            GOSSIP_TOPIC_MSG_ID_EPOCH_OVERRIDE_ALLOWED
+        );
+    }
+
     /// A Genesis-4 node must not be able to talk to a Genesis-3 one. The
     /// Genesis-3 values are hard-coded here on purpose: this test fails if
     /// someone ever "simplifies" a prefix back to the default.
@@ -3523,7 +4531,7 @@ mod tests {
         );
         assert_ne!(GOSSIP_PROTOCOL_PREFIX, "/meshsub", "that is the default Genesis-3 speaks");
 
-        let cfg = gossipsub_config().expect("config builds");
+        let cfg = gossipsub_config(MessageIdSchedule::INERT).expect("config builds");
         assert!(cfg.validate_messages(), "gossip.rs cannot gate relay without validate_messages");
         assert_eq!(cfg.duplicate_cache_time(), DUPLICATE_CACHE_TIME);
         assert!(
@@ -3624,6 +4632,8 @@ mod tests {
                 data_dir: dir,
                 max_peers: 1,
                 behind_proxy: true,
+                genesis_time_ms: 0,
+                slot_ms: 1_000,
             },
             events,
             Arc::new(AtomicU64::new(0)),
@@ -3676,6 +4686,8 @@ mod tests {
                 // and because a test that grows two more nodes would otherwise
                 // graylist itself with nothing in the output to say so.
                 behind_proxy: true,
+                genesis_time_ms: 0,
+                slot_ms: 1_000,
             },
             tx,
             head.clone(),
