@@ -1639,3 +1639,271 @@ fn measure_state_root_with_many_funded_positions() {
         println!("{n:>9} | {root:>10.3?} | {boundary:>14.3?} | {roster:>10.3?}");
     }
 }
+
+// ── Delegation growth cap ───────────────────────────────────────────────────
+// (`params::FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH`)
+
+use crate::params::funded_delegation_growth_cap_rehearsal as growth_cap_rehearsal;
+
+/// Honest weight of the scenario: the epoch-6090 mainnet figure quoted on
+/// `params::HF2_GROWTH_CAP_EPOCH`.
+const GROWTH_HONEST_BLCH: u128 = 204_660_000;
+/// The validator the attacker controls: one minimum bond.
+const GROWTH_ATTACKER: u32 = 7;
+
+/// Seven honest validators holding 204.66M BLCH of own stake between them
+/// and one attacker validator at the 25,000 BLCH minimum.
+fn growth_scenario() -> CommittedState {
+    let (mut state, _) = fixture();
+    let honest = GROWTH_HONEST_BLCH * tokenomics_v4::SAT_PER_BLOCH / 7;
+    for (index, record) in state.validators.iter_mut() {
+        record.staked_sat = if *index == GROWTH_ATTACKER { staking::MIN_DEPOSIT_SAT } else { honest };
+    }
+    state
+}
+
+/// The attacker's share of consensus weight, in basis points, as the duty
+/// roster (what finality and the committees weigh) has it.
+fn attacker_share_bps(state: &CommittedState) -> u128 {
+    let roster = state.duty_roster_at(state.epoch);
+    let total: u128 = roster.iter().map(|v| u128::from(v.effective_stake)).sum();
+    let attacker: u128 = roster
+        .iter()
+        .filter(|v| v.index == GROWTH_ATTACKER)
+        .map(|v| u128::from(v.effective_stake))
+        .sum();
+    attacker * 10_000 / total
+}
+
+/// One `FundedDelegate` of the 500M BLCH per-validator ceiling to the
+/// attacker's validator, through the real transaction, then real epoch
+/// boundaries until the attacker holds two thirds. Returns the epochs from
+/// the transaction to one third and to two thirds.
+fn epochs_for_the_attacker(mut state: CommittedState) -> (u64, u64) {
+    let tx = provision_delegation(
+        &mut state,
+        0xa7,
+        GROWTH_ATTACKER,
+        funded_delegation::MAX_FUNDED_DELEGATION_PER_VALIDATOR_SAT,
+    );
+    state
+        .apply_funded_delegate(&tx, fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS, &AuthVerifier)
+        .unwrap();
+    let start = state.epoch;
+    let mut third = None;
+    loop {
+        state = state.close_epoch();
+        let share = attacker_share_bps(&state);
+        if third.is_none() && share >= 3_334 {
+            third = Some(state.epoch - start);
+        }
+        if share >= 6_667 {
+            return (third.unwrap(), state.epoch - start);
+        }
+        assert!(state.epoch - start < 5_000, "share {share} bps after 5,000 epochs");
+    }
+}
+
+#[test]
+fn funded_delegation_growth_cap_gate_is_inert() {
+    assert_eq!(crate::params::FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH, u64::MAX);
+    assert_eq!(crate::params::funded_delegation_growth_cap_epoch(), None);
+    let _cap = growth_cap_rehearsal::open_at(9);
+    assert_eq!(crate::params::funded_delegation_growth_cap_epoch(), Some(9));
+}
+
+/// THE BYPASS, as the chain stands (gate inert). The own-stake cap of hard
+/// fork 2 is sized for about 19 days to two thirds (`71 x 24 = 1,704`
+/// epochs). One minimum-bond validator and one funded delegation get there
+/// in well under half of that.
+#[test]
+fn growth_cap_bypass_through_funded_delegation_today() {
+    let _gate = funded_delegation_rehearsal::open();
+    let _hf2 = crate::params::hf2_growth_cap_rehearsal::open();
+    let (third, two_thirds) = epochs_for_the_attacker(growth_scenario());
+    println!(
+        "today: one third after {third} epochs ({:.1} days), two thirds after {two_thirds} epochs ({:.1} days)",
+        third as f64 / 90.0,
+        two_thirds as f64 / 90.0
+    );
+    // 500,000 BLCH per epoch until 200M BLCH are active, then 25 bps of the
+    // delegated stake per epoch: 2.3 days and 7.6 days.
+    assert!((200..=210).contains(&third), "{third}");
+    assert!((680..=695).contains(&two_thirds), "{two_thirds}");
+    assert!(two_thirds * 2 < 71 * staking::GROWTH_WINDOW_EPOCHS);
+}
+
+/// The same attack with the gate armed: both thresholds take about twice as
+/// long at the shipped (middle) constants.
+#[test]
+fn growth_cap_armed_slows_the_delegation_path() {
+    let _gate = funded_delegation_rehearsal::open();
+    let _hf2 = crate::params::hf2_growth_cap_rehearsal::open();
+    let state = growth_scenario();
+    let _cap = growth_cap_rehearsal::open_at(state.epoch);
+    let (third, two_thirds) = epochs_for_the_attacker(state);
+    println!(
+        "armed: one third after {third} epochs ({:.1} days), two thirds after {two_thirds} epochs ({:.1} days)",
+        third as f64 / 90.0,
+        two_thirds as f64 / 90.0
+    );
+    // 250,000 BLCH per epoch until 192M BLCH are active, then 1/768 of the
+    // delegated stake per epoch: 4.6 days and 15 days.
+    assert!((405..=415).contains(&third), "{third}");
+    assert!((1_340..=1_360).contains(&two_thirds), "{two_thirds}");
+}
+
+/// Filling the queue before the flag day buys nothing: the cap is on
+/// activation, so stake requested below the gate warms up under the capped
+/// budget from the gate epoch on.
+#[test]
+fn growth_cap_covers_stake_queued_before_the_gate() {
+    let _gate = funded_delegation_rehearsal::open();
+    let mut state = growth_scenario();
+    let gate_epoch = state.epoch + 6;
+    let _cap = growth_cap_rehearsal::open_at(gate_epoch);
+    let tx = provision_delegation(
+        &mut state,
+        0xa7,
+        GROWTH_ATTACKER,
+        funded_delegation::MAX_FUNDED_DELEGATION_PER_VALIDATOR_SAT,
+    );
+    state
+        .apply_funded_delegate(&tx, fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS, &AuthVerifier)
+        .unwrap();
+    let position = *state.delegations.last().unwrap();
+    assert!(position.requested_epoch < gate_epoch);
+    let active = |state: &CommittedState| {
+        delegation::Registry::resolve(&state.delegations, state.epoch).activated_sat(&position)
+    };
+    let mut previous = 0u128;
+    while state.epoch < gate_epoch + 10 {
+        state = state.close_epoch();
+        let now = active(&state);
+        let step = now - previous;
+        if state.epoch < position.requested_epoch {
+            assert_eq!(step, 0);
+        } else if state.epoch < gate_epoch {
+            assert_eq!(step, delegation::MIN_CHURN_SAT, "epoch {}", state.epoch);
+        } else {
+            assert_eq!(step, delegation::GROWTH_CAP_WARMUP_FLOOR_SAT, "epoch {}", state.epoch);
+        }
+        previous = now;
+    }
+}
+
+/// With the gate inert, and with it armed at an epoch not yet reached, every
+/// boundary produces the state root it produces today; the first root that
+/// differs is the gate epoch's.
+#[test]
+fn growth_cap_changes_no_root_below_its_gate() {
+    let _gate = funded_delegation_rehearsal::open();
+    let mut today = growth_scenario();
+    let tx = provision_delegation(&mut today, 0xa7, GROWTH_ATTACKER, 30_000_000 * tokenomics_v4::SAT_PER_BLOCH);
+    today
+        .apply_funded_delegate(&tx, fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS, &AuthVerifier)
+        .unwrap();
+    let gate_epoch = today.epoch + 12;
+    let mut armed = today.clone();
+    for _ in 0..20 {
+        today = today.close_epoch();
+        {
+            let _cap = growth_cap_rehearsal::open_at(gate_epoch);
+            armed = armed.close_epoch();
+        }
+        if today.epoch < gate_epoch {
+            assert_eq!(armed, today, "epoch {}", today.epoch);
+            assert_eq!(armed.state_root(), today.state_root(), "epoch {}", today.epoch);
+        }
+    }
+    let roster = |state: &CommittedState| state.duty_roster_at(state.epoch);
+    assert_eq!(roster(&armed), roster(&today), "read without the rehearsal, the rosters agree");
+    let _cap = growth_cap_rehearsal::open_at(gate_epoch);
+    assert_ne!(roster(&armed), roster(&today));
+}
+
+/// Withdrawal is never slower under the cap. The same position leaves in
+/// the same epochs and pays out the same output with the gate inert and
+/// with it armed, while a large queue is waiting to enter.
+#[test]
+fn growth_cap_never_delays_exit_or_withdrawal() {
+    let _gate = funded_delegation_rehearsal::open();
+    let run = |armed: bool| {
+        let (mut state, first) = fixture();
+        let _cap = armed.then(|| growth_cap_rehearsal::open_at(state.epoch));
+        let base_fee = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        state.apply_funded_delegate(&first, base_fee, &AuthVerifier).unwrap();
+        // 300M BLCH queued behind it, so the activation budget is contended
+        // for the whole run.
+        let whale = provision_delegation(&mut state, 0x43, 1, 300_000_000 * tokenomics_v4::SAT_PER_BLOCH);
+        state.apply_funded_delegate(&whale, base_fee, &AuthVerifier).unwrap();
+        for _ in 0..3 {
+            state = state.close_epoch();
+        }
+        let state = withdraw_through_the_lifecycle(state, &first, 0);
+        let inactive_since = state.funded_delegation_lifecycle[&0].0;
+        let paid: Vec<_> = state
+            .eutxos
+            .values()
+            .filter(|utxo| utxo.script_hash == [0x92; 32])
+            .map(|utxo| utxo.value)
+            .collect();
+        (state.epoch, inactive_since, paid)
+    };
+    let (today, capped) = (run(false), run(true));
+    assert_eq!(capped, today);
+    assert_eq!(today.2.len(), 1, "exactly one payout");
+}
+
+/// A position that the capped queue has not reached yet is not held: its
+/// owner deactivates it, it becomes inactive after the ordinary cool-down
+/// (it has nothing to drain) and the full principal is withdrawn after the
+/// ordinary delay.
+#[test]
+fn a_position_still_queued_under_the_cap_can_always_be_withdrawn() {
+    let _gate = funded_delegation_rehearsal::open();
+    let (mut state, _) = fixture();
+    let _cap = growth_cap_rehearsal::open_at(state.epoch);
+    let base_fee = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+    // Position 0: 400M BLCH ahead in the queue (1,600 epochs at the floor).
+    let whale = provision_delegation(&mut state, 0x43, 1, 400_000_000 * tokenomics_v4::SAT_PER_BLOCH);
+    state.apply_funded_delegate(&whale, base_fee, &AuthVerifier).unwrap();
+    state = state.close_epoch();
+    // Position 1: an ordinary delegator behind it.
+    let amount = 5_000 * tokenomics_v4::SAT_PER_BLOCH;
+    let small = provision_delegation(&mut state, 0x44, 2, amount);
+    state.apply_funded_delegate(&small, base_fee, &AuthVerifier).unwrap();
+    for _ in 0..5 {
+        state = state.close_epoch();
+    }
+    let record = state.delegations[1];
+    assert_eq!(
+        delegation::Registry::resolve(&state.delegations, state.epoch).activated_sat(&record),
+        0,
+        "still queued behind the whale"
+    );
+
+    assert_eq!(record.delegator, 1);
+    let exit = signed_undelegate(&state, &small, 1);
+    state.apply_funded_undelegate(&exit, &AuthVerifier).unwrap();
+    let deactivated = state.delegations[1].deactivate_epoch.unwrap();
+    while state.funded_delegation_lifecycle[&1].0 == u64::MAX {
+        state = state.close_epoch();
+    }
+    assert_eq!(state.funded_delegation_lifecycle[&1].0, deactivated + delegation::COOLDOWN_EPOCHS);
+    let mature = state.funded_delegation_lifecycle[&1].0 + staking::WITHDRAWAL_DELAY_EPOCHS;
+    while state.epoch < mature {
+        state = state.close_epoch();
+    }
+    let withdrawal = signed_withdrawal(&state, &small, 1);
+    let charge = state
+        .apply_funded_delegation_withdrawal(&withdrawal, base_fee, &AuthVerifier)
+        .unwrap();
+    let paid: Vec<u128> = state
+        .eutxos
+        .values()
+        .filter(|utxo| utxo.script_hash == [0x92; 32])
+        .map(|utxo| u128::from(utxo.value))
+        .collect();
+    assert_eq!(paid, vec![amount - charge.base_fee_sat], "the whole principal, less the fee");
+}
