@@ -15,6 +15,11 @@ pub(super) struct Mempool {
     spends: BTreeMap<([u8; 32], u32), usize>,
     /// Keys inserted by [`Self::insert`], i.e. not through admission.
     unverified: BTreeSet<Vec<u8>>,
+    /// Transfers that admission authenticated under the LEGACY signing root
+    /// while enforcement of the network-bound root is scheduled (GIP-0002).
+    /// They stop being valid at the enforcement epoch, and selection leaves
+    /// them out from there. Empty while enforcement is unscheduled.
+    legacy_spend_root: BTreeSet<Vec<u8>>,
     bytes: usize,
     lifecycle_verification_slot: Option<u64>,
     lifecycle_verifications_total: usize,
@@ -69,6 +74,17 @@ impl Mempool {
     /// which authenticates a transaction before it inserts it.
     pub(super) fn admission_verified(&self, key: &[u8]) -> bool {
         !self.unverified.contains(key)
+    }
+    /// Record that the entry under `key` was authenticated under the legacy
+    /// transfer signing root (see the field). No effect on a missing key.
+    pub(super) fn mark_legacy_spend_root(&mut self, key: &[u8]) {
+        if self.entries.contains_key(key) {
+            self.legacy_spend_root.insert(key.to_vec());
+        }
+    }
+    /// Whether admission authenticated the entry under the legacy root.
+    pub(super) fn signed_over_legacy_root(&self, key: &[u8]) -> bool {
+        self.legacy_spend_root.contains(key)
     }
     /// Reserve one expensive lifecycle authorization call for `identity`
     /// (the validator, funding key or rescue key the transaction speaks for)
@@ -164,6 +180,7 @@ impl Mempool {
             decrement(&mut self.spends, point);
         }
         self.unverified.remove(key);
+        self.legacy_spend_root.remove(key);
         Some(tx)
     }
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&Vec<u8>, &PosTransaction) -> bool) {
@@ -582,7 +599,7 @@ impl Engine {
     /// `funded_mempool_conflict`, which also reserves the validator key.
     fn plan_input_conflicts(&self, incoming: &PosTransaction, epoch: u64,
         funded_context: &mut Option<(Arc<CommittedState>, u128)>) -> Result<BTreeSet<Vec<u8>>, Refusal> {
-        let funded = |tx: &PosTransaction| matches!(tx, PosTransaction::FundedDeposit(_) | PosTransaction::FundedDelegate(_));
+        let funded = |tx: &PosTransaction| matches!(tx, PosTransaction::FundedDeposit(_) | PosTransaction::FundedDelegate(_) | PosTransaction::FundedDelegateV2(_));
         let mut stale = BTreeSet::new();
         let points = Self::spent_outpoints(incoming).unwrap_or_default();
         // The common case costs one index lookup per input and no pool walk.

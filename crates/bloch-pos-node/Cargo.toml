@@ -60,6 +60,10 @@ devnet-l2-deposits = ["bloch-pos-committee/devnet-l2-deposits"]
 devnet-l2-user-txs = ["devnet-l2-deposits", "bloch-pos-committee/devnet-l2-user-txs"]
 # QUALIFICATION BUILDS ONLY; see bloch-pos-committee. Refuses funded manifests.
 l2-activation-rehearsal = ["bloch-pos-committee/l2-activation-rehearsal"]
+# REHEARSAL BUILDS ONLY (GIP-0002); see bloch-pos-committee. Arms both
+# dual-acceptance windows at BLOCH_WALLET_CONSENSUS_ACCEPT_EPOCH /
+# BLOCH_WALLET_CONSENSUS_ENFORCE_EPOCH. Refuses funded manifests.
+wallet-consensus-rehearsal = ["bloch-pos-committee/wallet-consensus-rehearsal"]
 # QUALIFICATION BUILDS ONLY; the rehearsal with the mainnet policy values.
 l2-activation-rehearsal-mainnet-policy = ["l2-activation-rehearsal", "bloch-pos-committee/l2-activation-rehearsal-mainnet-policy"]
 # QUALIFICATION BUILDS ONLY; see bloch-pos-committee (full-history replay

@@ -8,7 +8,7 @@ use crate::{
 };
 use bloch_pos_committee::attestation::SignatureVerifier;
 use bloch_pos_committee::transition::{
-    funded, FundedDelegate, FundedDelegationWithdraw, FundedUndelegate, FundingInput, PosTransaction,
+    funded, FundedDelegate, FundedDelegateV2, FundedDelegationWithdraw, FundedUndelegate, FundingInput, PosTransaction,
     TransferOutput, ValidatorCommissionUpdate,
 };
 use sha3::{Digest, Sha3_256};
@@ -22,6 +22,7 @@ use std::{
 const HELP: &str = "Offline funded delegation; never broadcasts.
 prepare-delegate --genesis FILE --pubkey FILE --validator-hash HEX32 --amount SAT
   --input TXID:VOUT:SAT [--input ...] --change HEX32 --max-base-fee RATE --tip RATE --expiry EPOCH --out NEW_FILE
+  [--max-commission BPS]
 prepare-commission --genesis FILE --validator INDEX --commission BPS --epoch EPOCH --out NEW_FILE
 prepare-undelegate --genesis FILE --pubkey FILE --delegator ID --position INDEX --epoch EPOCH --out NEW_FILE
 prepare-withdraw --genesis FILE --pubkey FILE --delegator ID --position INDEX --epoch EPOCH
@@ -34,6 +35,10 @@ Inspect the complete intent and independently check the validator index/key befo
 Signing requires the exact inspected root and trusted genesis. A signed commission inspection
 requires the validator public key. Funding values are estimates, checked against actual UTXOs
 by consensus. Keep passphrases out of command arguments; use the existing sealed-keystore workflow.
+--max-commission writes the capped request (tag 0x1C, GIP-0002): consensus admits it only while
+the validator's commission is at most BPS. Use it once getchaininfo reports
+transaction_rules.delegation_commission_cap.accepted = true; before that the network refuses the
+tag, and once .required = true the request without a cap (tag 0x0E) is refused instead.
 Activation and submission are separate. This command neither arms a gate nor submits a transaction.";
 
 struct Args(BTreeMap<String, Vec<String>>);
@@ -101,6 +106,7 @@ fn read_tx(path: &str) -> Result<PosTransaction, String> {
 fn shape(tx: &PosTransaction) -> Result<(), String> {
     let result = match tx {
         PosTransaction::FundedDelegate(t) => t.validate_shape(),
+        PosTransaction::FundedDelegateV2(t) => t.validate_shape(),
         PosTransaction::FundedUndelegate(t) => t.validate_shape(),
         PosTransaction::FundedDelegationWithdraw(t) => t.validate_shape(),
         PosTransaction::ValidatorCommissionUpdate(t) => t.validate_shape(),
@@ -114,6 +120,9 @@ fn identity(tx: &PosTransaction) -> ([u8; 32], [u8; 32], &[u8]) {
     match tx {
         PosTransaction::FundedDelegate(t) => {
             (t.network_domain, t.signing_root(), &t.funding_signature)
+        }
+        PosTransaction::FundedDelegateV2(t) => {
+            (t.request.network_domain, t.signing_root(), &t.request.funding_signature)
         }
         PosTransaction::FundedUndelegate(t) => (t.network_domain, t.signing_root(), &t.signature),
         PosTransaction::FundedDelegationWithdraw(t) => {
@@ -132,6 +141,9 @@ fn authorization(tx: &PosTransaction, commission_key: Option<&[u8]>) -> Result<(
     let verifier = HybridVerifier::new();
     match tx {
         PosTransaction::FundedDelegate(t) => t
+            .verify_authorization(&verifier)
+            .map_err(|e| format!("authorization: {e:?}")),
+        PosTransaction::FundedDelegateV2(t) => t
             .verify_authorization(&verifier)
             .map_err(|e| format!("authorization: {e:?}")),
         PosTransaction::FundedUndelegate(t) => t
@@ -160,8 +172,20 @@ fn inspect(tx: &PosTransaction, commission_key: Option<&[u8]>) -> Result<Json, S
         ("txid", Json::hex(&tx.txid())),
         ("signed", Json::Bool(!sig.is_empty())),
     ];
+    let (delegate, max_commission_bps) = match tx {
+        PosTransaction::FundedDelegate(t) => (Some(t), None),
+        PosTransaction::FundedDelegateV2(t) => (Some(&t.request), Some(t.max_commission_bps)),
+        _ => (None, None),
+    };
+    if let Some(cap) = max_commission_bps {
+        // Only the capped request (tag 0x1C) has this field; its absence is
+        // how a reviewer sees that a request does not pin the commission.
+        fields.push(("max_commission_bps", Json::sat(cap)));
+    }
     match tx {
-        PosTransaction::FundedDelegate(t) => fields.extend(vec![
+        PosTransaction::FundedDelegate(_) | PosTransaction::FundedDelegateV2(_) => {
+            let t = delegate.ok_or("delegation intent")?;
+            fields.extend(vec![
             ("kind", Json::s("delegate")),
             (
                 "funding_pubkey_hash",
@@ -196,7 +220,8 @@ fn inspect(tx: &PosTransaction, commission_key: Option<&[u8]>) -> Result<Json, S
                         .collect(),
                 ),
             ),
-        ]),
+        ])
+        }
         PosTransaction::ValidatorCommissionUpdate(t) => fields.extend(vec![
             ("kind", Json::s("commission")),
             ("validator", Json::u(t.validator.into())),
@@ -260,6 +285,7 @@ fn prepare(command: &str, args: &[String]) -> Result<(), String> {
             "--tip",
             "--expiry",
             "--out",
+            "--max-commission",
         ],
         "prepare-commission" => &[
             "--genesis",
@@ -328,7 +354,18 @@ fn prepare(command: &str, args: &[String]) -> Result<(), String> {
                 tx_bytes: 0,
                 funding_signature: Vec::new(),
             };
-            t.tx_bytes = t.reserved_tx_bytes();
+            // The capped form reserves 16 more bytes, so its fee budget and
+            // change differ: size the form that will be signed.
+            let max_commission_bps: Option<u128> = match a.0.get("--max-commission") {
+                Some(_) => Some(a.number("--max-commission")?),
+                None => None,
+            };
+            t.tx_bytes = match max_commission_bps {
+                Some(max_commission_bps) => {
+                    FundedDelegateV2 { request: t.clone(), max_commission_bps }.reserved_tx_bytes()
+                }
+                None => t.reserved_tx_bytes(),
+            };
             let budget = t.charge(t.max_base_fee_millisat_per_gas);
             t.change.value = total
                 .checked_sub(t.amount_sat)
@@ -337,7 +374,12 @@ fn prepare(command: &str, args: &[String]) -> Result<(), String> {
                 .ok_or("insufficient funding")?
                 .try_into()
                 .map_err(|_| "change exceeds u64")?;
-            PosTransaction::FundedDelegate(t)
+            match max_commission_bps {
+                Some(max_commission_bps) => {
+                    PosTransaction::FundedDelegateV2(FundedDelegateV2 { request: t, max_commission_bps })
+                }
+                None => PosTransaction::FundedDelegate(t),
+            }
         }
         "prepare-commission" => {
             PosTransaction::ValidatorCommissionUpdate(ValidatorCommissionUpdate {
@@ -391,10 +433,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
             if network!=domain(a.get("--genesis")?)? {return Err("intent belongs to another genesis manifest".into());}
             if root!=a.hash("--expected-root")? {return Err("intent differs from the reviewed signing root".into());}
             let keys=Keystore::load(Path::new(a.get("--dir")?)).map_err(|e|e.to_string())?;
-            let expected=match &tx {PosTransaction::FundedDelegate(t)=>Some(&t.funding_pubkey),PosTransaction::FundedUndelegate(t)=>Some(&t.funding_pubkey),PosTransaction::FundedDelegationWithdraw(t)=>Some(&t.funding_pubkey),_=>None};
+            let expected=match &tx {PosTransaction::FundedDelegate(t)=>Some(&t.funding_pubkey),PosTransaction::FundedDelegateV2(t)=>Some(&t.request.funding_pubkey),PosTransaction::FundedUndelegate(t)=>Some(&t.funding_pubkey),PosTransaction::FundedDelegationWithdraw(t)=>Some(&t.funding_pubkey),_=>None};
             if expected.is_some_and(|key|key!=&keys.pubkey){return Err("keystore is not the intent owner".into());}
             let signed=keys.sign_fitting(&root,funded::ADMISSION_PQ_SIGNATURE_MAX)?;
-            match &mut tx {PosTransaction::FundedDelegate(t)=>t.funding_signature=signed,PosTransaction::FundedUndelegate(t)=>t.signature=signed,PosTransaction::FundedDelegationWithdraw(t)=>t.signature=signed,PosTransaction::ValidatorCommissionUpdate(t)=>t.signature=signed,_=>unreachable!()}
+            match &mut tx {PosTransaction::FundedDelegate(t)=>t.funding_signature=signed,PosTransaction::FundedDelegateV2(t)=>t.request.funding_signature=signed,PosTransaction::FundedUndelegate(t)=>t.signature=signed,PosTransaction::FundedDelegationWithdraw(t)=>t.signature=signed,PosTransaction::ValidatorCommissionUpdate(t)=>t.signature=signed,_=>unreachable!()}
             let info=inspect(&tx,Some(&keys.pubkey))?;write_tx(a.get("--out")?,&tx)?;println!("{}", info.to_string());Ok(())
         },
         _=>Err("expected prepare-delegate, prepare-commission, prepare-undelegate, prepare-withdraw, inspect or sign".into()),

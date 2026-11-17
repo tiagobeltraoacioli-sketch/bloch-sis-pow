@@ -14,6 +14,11 @@
 //!   `is_spend_public_key_admissible`) and consensus (`verify_spend`,
 //!   lattice-emergency freeze) actually read.
 //!
+//! * `transaction_rules` reports the two GIP-0002 dual-acceptance windows
+//!   (network-bound transfer signing, the delegation commission cap) from the
+//!   schedule consensus reads, evaluated at the wall epoch: `accepted` says
+//!   the new form is valid now, `required` that the old one is refused now.
+//!
 //! `activation_epoch` is `null` for a gate at `u64::MAX` (inert). `active`
 //! is evaluated at the head epoch (the epoch of the head block's slot), the
 //! epoch consensus applies to the next block on this head. `spend_allowed`
@@ -139,6 +144,63 @@ pub(super) fn signature_suites_json(head_epoch: u64, wall_epoch: u64) -> Json {
     )
 }
 
+/// `transaction_rules` for an explicit pair of schedules.
+///
+/// A wallet signs the new form of a transaction exactly when its rule's
+/// `accepted` is `true`, and the old form otherwise. `required` is
+/// informational: from then on the old form is refused.
+pub(super) fn transaction_rules_json_from(
+    sighash: params::DualAcceptanceGate,
+    commission_cap: params::DualAcceptanceGate,
+    wall_epoch: u64,
+) -> Json {
+    let window = |gate: params::DualAcceptanceGate, mut extra: Vec<(&'static str, Json)>| {
+        let mut fields = vec![
+            ("accept_epoch", activation(gate.accept_epoch)),
+            ("enforce_epoch", activation(gate.enforce_epoch)),
+            ("accepted", Json::Bool(gate.accepted(wall_epoch))),
+            ("required", Json::Bool(gate.enforced(wall_epoch))),
+        ];
+        fields.append(&mut extra);
+        Json::obj(fields)
+    };
+    Json::obj(vec![
+        (
+            "transfer_network_binding",
+            window(
+                sighash,
+                vec![
+                    // SHA3-256(domain_tag ‖ network_domain ‖ spend root).
+                    ("domain_tag", Json::s(crate::codec::hex(&params::DS_SPEND2))),
+                ],
+            ),
+        ),
+        (
+            "delegation_commission_cap",
+            window(
+                commission_cap,
+                vec![
+                    ("legacy_tag", Json::s("0x0e")),
+                    ("capped_tag", Json::s("0x1c")),
+                    (
+                        "max_commission_bps_limit",
+                        Json::u(u64::try_from(bloch_pos_committee::rewards::MAX_COMMISSION_BPS).unwrap_or(u64::MAX)),
+                    ),
+                ],
+            ),
+        ),
+    ])
+}
+
+/// `transaction_rules` for this binary.
+pub(super) fn transaction_rules_json(wall_epoch: u64) -> Json {
+    transaction_rules_json_from(
+        params::sighash_network_binding_gate(),
+        params::delegation_commission_cap_gate(),
+        wall_epoch,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +214,52 @@ mod tests {
             Json::Arr(a) => a,
             other => panic!("not an array: {other:?}"),
         }
+    }
+
+    #[test]
+    fn transaction_rules_are_inert_in_this_build() {
+        for wall in [0, 7_360, u64::MAX - 1, u64::MAX] {
+            let v = transaction_rules_json(wall);
+            for rule in ["transfer_network_binding", "delegation_commission_cap"] {
+                let r = field(&v, rule);
+                assert_eq!(field(r, "accept_epoch"), &Json::Null, "{rule}");
+                assert_eq!(field(r, "enforce_epoch"), &Json::Null, "{rule}");
+                assert_eq!(field(r, "accepted"), &Json::Bool(false), "{rule}");
+                assert_eq!(field(r, "required"), &Json::Bool(false), "{rule}");
+            }
+        }
+    }
+
+    #[test]
+    fn transaction_rules_flip_at_each_end_of_their_window() {
+        let sighash = params::DualAcceptanceGate { accept_epoch: 9_000, enforce_epoch: 9_630 };
+        let cap = params::DualAcceptanceGate { accept_epoch: 9_100, enforce_epoch: u64::MAX };
+        let at = |wall| transaction_rules_json_from(sighash, cap, wall);
+        let flags = |v: &Json, rule: &str| {
+            let r = field(v, rule);
+            (field(r, "accepted").clone(), field(r, "required").clone())
+        };
+        let (no, yes) = (Json::Bool(false), Json::Bool(true));
+        assert_eq!(flags(&at(8_999), "transfer_network_binding"), (no.clone(), no.clone()));
+        assert_eq!(flags(&at(9_000), "transfer_network_binding"), (yes.clone(), no.clone()));
+        assert_eq!(flags(&at(9_629), "transfer_network_binding"), (yes.clone(), no.clone()));
+        assert_eq!(flags(&at(9_630), "transfer_network_binding"), (yes.clone(), yes.clone()));
+        assert_eq!(flags(&at(9_099), "delegation_commission_cap"), (no.clone(), no.clone()));
+        assert_eq!(flags(&at(9_100), "delegation_commission_cap"), (yes.clone(), no.clone()));
+        // Enforcement unscheduled: accepted, never required.
+        assert_eq!(flags(&at(u64::MAX), "delegation_commission_cap"), (yes, no));
+        let v = at(9_000);
+        let transfer = field(&v, "transfer_network_binding");
+        assert_eq!(field(transfer, "accept_epoch").as_u64(), Some(9_000));
+        assert_eq!(field(transfer, "enforce_epoch").as_u64(), Some(9_630));
+        assert_eq!(
+            field(transfer, "domain_tag").as_str(),
+            Some(crate::codec::hex(&params::DS_SPEND2).as_str())
+        );
+        let delegation = field(&v, "delegation_commission_cap");
+        assert_eq!(field(delegation, "enforce_epoch"), &Json::Null);
+        assert_eq!(field(delegation, "capped_tag").as_str(), Some("0x1c"));
+        assert_eq!(field(delegation, "max_commission_bps_limit").as_u64(), Some(10_000));
     }
 
     #[test]

@@ -2700,6 +2700,14 @@ pub fn chain_info_json(
         // `rpc/consensus_gates.rs` for which epoch each flag is read at.
         ("signature_suites", consensus_gates::signature_suites_json(epoch_of(slot), epoch_of(wall_slot))),
         ("hard_forks", consensus_gates::hard_forks_json(epoch_of(slot))),
+        // Additive (GIP-0002), node-only: what a wallet needs to choose the
+        // form it signs. `network_domain` is the committed genesis-manifest
+        // digest, the value the network-bound transfer root and every
+        // lifecycle intent bind (`null` on a state without one).
+        // `transaction_rules` reports the two dual-acceptance windows at the
+        // wall epoch, the epoch a transaction submitted now is judged in.
+        ("network_domain", state.admission_network_domain().map_or(Json::Null, |v| Json::hex(&v))),
+        ("transaction_rules", consensus_gates::transaction_rules_json(epoch_of(wall_slot))),
     ])
 }
 
@@ -2878,6 +2886,7 @@ impl PreparedSubmission {
             PosTransaction::Deposit { .. } => "deposit",
             PosTransaction::FundedDeposit(_) => "funded_deposit",
             PosTransaction::FundedDelegate(_) => "funded_delegate",
+            PosTransaction::FundedDelegateV2(_) => "funded_delegate_v2",
             PosTransaction::FundedUndelegate(_) => "funded_undelegate",
             PosTransaction::FundedDelegationWithdraw(_) => "funded_delegation_withdraw",
             PosTransaction::ValidatorCommissionUpdate(_) => "validator_commission_update",

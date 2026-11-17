@@ -141,6 +141,23 @@ pending delegation position. A decrease remains permitted while delegations
 exist. This prevents an operator from raising the rate after a delegator has
 committed stake.
 
+### `FundedDelegateV2` (GIP-0002, unarmed)
+
+Tag `0x1C` is `FundedDelegate` with `max_commission_bps` appended to the
+signed intent, under the domain `BLOCH:DELEGATION:FUND:V2`. Consensus admits
+it only while the validator's committed commission is at most that value
+(`CommissionAboveCap` otherwise, with nothing spent), which closes the race
+between a delegator's signature and a commission increase made before the
+request is included. The position it creates is the one `0x0E` creates; the
+cap is not stored, because a commission cannot rise while a delegation
+exists.
+
+It is gated by `DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH` (tag `0x1C` valid
+from it) and `DELEGATION_COMMISSION_CAP_ENFORCE_EPOCH` (tag `0x0E` refused
+from it), both `u64::MAX`. Format, rules, migration and the activation
+recommendation are in `gips/GIP-0002.md`. Offline:
+`funded-delegation prepare-delegate --max-commission BPS`.
+
 ## Activation and rollout
 
 The implementation initially ships with the funded-delegation activation

@@ -247,6 +247,7 @@ impl CommittedState {
                 self.check_kes_rotate(*validator, *period, *depth, root, signature, verifier).map(|_| ())
             }
             PosTransaction::FundedDelegate(_)
+            | PosTransaction::FundedDelegateV2(_)
             | PosTransaction::FundedUndelegate(_)
             | PosTransaction::FundedDelegationWithdraw(_)
             | PosTransaction::ValidatorCommissionUpdate(_)

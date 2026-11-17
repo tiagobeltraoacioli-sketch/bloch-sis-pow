@@ -66,7 +66,7 @@ pub const TRANSFER_V2_HELP: &str = "Offline TransferV2 builder and signer (devne
 transfer-v2 --dir KEYSTORE_DIR --input TXID:VOUT:SAT [--input ...]
             --to SCRIPT_HASH_HEX64 --base-fee MILLISAT_PER_GAS
             --tip MILLISAT_PER_GAS [--genesis FILE] [--epoch EPOCH]
-            --out NEW_FILE
+            [--network-bound] --out NEW_FILE
 
 Builds one TransferV2 (wire tag 0x06): ONE witness key (the keystore's
 suite-enveloped public key), every --input spent through it (key_index 0),
@@ -81,6 +81,12 @@ transaction (ValueNotConserved), and it must then be rebuilt.
 --epoch is the epoch of the including block and feeds checked_signing_root:
 it changes the signing root only once SIGHASH_NETWORK_BINDING arms
 (inert at u64::MAX in this build). Default 0.
+--network-bound yes (GIP-0002) signs the network-bound root instead:
+DS_SPEND2 over the digest of the --genesis manifest (required with it) and
+the spend root. Use it once getchaininfo reports
+transaction_rules.transfer_network_binding.accepted = true; before that the
+network refuses the signature. The transaction bytes and its id do not
+depend on which root is signed.
 --genesis is optional: when given, every --input that is one of the
 manifest's genesis allocations is checked against it (value and owner).
 Outputs below the mempool dust floor are refused. Transaction files contain
@@ -324,6 +330,21 @@ pub fn build_transfer_v2(
     tip_millisat_per_gas: u128,
     epoch: u64,
 ) -> Result<TransferV2Plan, String> {
+    build_transfer_v2_for_network(keys, inputs, to, base_fee_millisat_per_gas, tip_millisat_per_gas, epoch, None)
+}
+
+/// [`build_transfer_v2`], signing the network-bound root of GIP-0002 when
+/// `network_domain` (the genesis-manifest digest) is given. With `None` the
+/// root is `checked_signing_root(epoch)`, as before.
+pub fn build_transfer_v2_for_network(
+    keys: &Keystore,
+    inputs: &[SpendInput],
+    to: [u8; 32],
+    base_fee_millisat_per_gas: u128,
+    tip_millisat_per_gas: u128,
+    epoch: u64,
+    network_domain: Option<[u8; 32]>,
+) -> Result<TransferV2Plan, String> {
     if inputs.is_empty() {
         return Err("at least one --input is required".into());
     }
@@ -397,7 +418,10 @@ pub fn build_transfer_v2(
         *tx_bytes = reserved;
         outputs[0].value = paid_sat;
     }
-    let signing_root = tx.checked_signing_root(epoch);
+    let signing_root = match network_domain {
+        Some(domain) => tx.network_bound_signing_root(&domain),
+        None => tx.checked_signing_root(epoch),
+    };
     let signature = keys.sign_fitting(&signing_root, ADMISSION_PQ_SIGNATURE_MAX)?;
     if let PosTransaction::TransferV2 { keys, .. } = &mut tx {
         keys[0].signature = signature;
@@ -419,8 +443,17 @@ pub fn build_transfer_v2(
     // The node's own mempool door, at the flag-day epoch: dust, table
     // discipline, price bounds, declared size and the signature, judged by
     // the code a node runs — not a re-statement of it.
-    crate::engine::admissible(&tx, TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH)
-        .map_err(|reason| format!("a node's mempool would refuse this transfer: {reason}"))?;
+    //
+    // A network-bound signature (GIP-0002) is judged the way a node judges
+    // it once that root is accepted on `network_domain`; a node running an
+    // earlier epoch, or another network, refuses it.
+    match network_domain {
+        None => crate::engine::admissible(&tx, TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH),
+        Some(domain) => {
+            crate::engine::admissible_network_bound(&tx, TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH, &domain)
+        }
+    }
+    .map_err(|reason| format!("a node's mempool would refuse this transfer: {reason}"))?;
     Ok(TransferV2Plan { tx, charge, spent_sat, fee_sat, paid_sat, signing_root })
 }
 
@@ -469,7 +502,7 @@ pub fn transfer_v2(args: &[String]) -> Result<(), String> {
     }
     let a = Flags::parse(
         args,
-        &["--genesis", "--dir", "--input", "--to", "--base-fee", "--tip", "--epoch", "--out"],
+        &["--genesis", "--dir", "--input", "--to", "--base-fee", "--tip", "--epoch", "--network-bound", "--out"],
         &["--input"],
     )?;
     let out = a.get("--out")?;
@@ -486,11 +519,26 @@ pub fn transfer_v2(args: &[String]) -> Result<(), String> {
         None => 0,
     };
     let keys = Keystore::load(Path::new(a.get("--dir")?)).map_err(error)?;
+    let network_bound = match a.optional("--network-bound") {
+        None | Some("no") => false,
+        Some("yes") => true,
+        Some(_) => return Err("--network-bound takes yes or no".into()),
+    };
+    let mut network_domain = None;
     if let Some(path) = a.optional("--genesis") {
-        let (manifest, _) = Manifest::load(Path::new(path)).map_err(error)?;
+        let (manifest, digest) = Manifest::load(Path::new(path)).map_err(error)?;
         check_inputs_against_manifest(&manifest, &inputs, &keys)?;
+        network_domain = Some(digest);
     }
-    let plan = build_transfer_v2(&keys, &inputs, to, base_fee, tip, epoch)?;
+    let network_domain = match (network_bound, network_domain) {
+        (false, _) => None,
+        (true, Some(domain)) => Some(domain),
+        (true, None) => return Err("--network-bound needs --genesis: the root binds that manifest's digest".into()),
+    };
+    let plan = build_transfer_v2_for_network(&keys, &inputs, to, base_fee, tip, epoch, network_domain)?;
+    if let Some(domain) = network_domain {
+        println!("Network domain: {} (network-bound signing root)", codec::hex32(&domain));
+    }
     let owner: [u8; 32] = Sha3_256::digest(&keys.pubkey).into();
     println!("Witness key hash: {}", codec::hex32(&owner));
     for i in &inputs {
@@ -751,7 +799,10 @@ mod tests {
         assert_eq!(MANIFEST_ALLOCATION_CAP, 64);
         assert_eq!(MIN_TRANSFER_OUTPUT_SAT, 1_000);
         assert_eq!(V2_FLAG_DAY, 800);
+        #[cfg(not(feature = "wallet-consensus-rehearsal"))]
         assert_eq!(SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH, u64::MAX);
+        #[cfg(feature = "wallet-consensus-rehearsal")]
+        let _ = SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH;
         // The cap mirrors `Manifest::decode`: one over it does not decode.
         let dir = TempDir::new();
         let ks = keystore(&dir.path("v0"), 0);
@@ -889,6 +940,35 @@ mod tests {
         );
         // Duplicate spend points are refused before any signing.
         assert!(build_transfer_v2(&funder, &[input.clone(), input], dest, 10, 5, 0).is_err());
+    }
+
+    /// GIP-0002 (WT-03): with a network domain the builder signs the
+    /// network-bound root. Only the witness changes: the transaction bytes
+    /// outside it, its id and its fee are those of the legacy-signed build.
+    #[test]
+    fn transfer_v2_builder_signs_the_network_bound_root_on_request() {
+        let dir = TempDir::new();
+        let funder = keystore(&dir.path("funder"), crate::keys::AUTO_VALIDATOR_INDEX);
+        let input = SpendInput { txid: [0x33; 32], vout: 0, value_sat: 50_000_000 };
+        let legacy = build_transfer_v2_for_network(&funder, &[input.clone()], [1; 32], 10, 5, 0, None).unwrap();
+        let bound = build_transfer_v2_for_network(&funder, &[input.clone()], [1; 32], 10, 5, 0, Some([0xA1; 32])).unwrap();
+        let elsewhere = build_transfer_v2_for_network(&funder, &[input], [1; 32], 10, 5, 0, Some([0xB2; 32])).unwrap();
+        assert_eq!(legacy.signing_root, legacy.tx.spend_signing_root());
+        assert_eq!(bound.signing_root, bound.tx.network_bound_signing_root(&[0xA1; 32]));
+        assert_ne!(bound.signing_root, legacy.signing_root);
+        assert_ne!(bound.signing_root, elsewhere.signing_root);
+        assert_eq!(bound.tx.txid(), legacy.tx.txid());
+        assert_eq!((bound.fee_sat, bound.paid_sat), (legacy.fee_sat, legacy.paid_sat));
+        let PosTransaction::TransferV2 { keys, .. } = &bound.tx else { panic!("TransferV2 expected") };
+        assert!(bloch_crypto::crypto::verify(&funder.pubkey, &bound.signing_root, &keys[0].signature));
+        assert!(!bloch_crypto::crypto::verify(&funder.pubkey, &legacy.signing_root, &keys[0].signature));
+        // This build arms nothing, so its mempool door takes the legacy
+        // signature and refuses the bound one.
+        #[cfg(not(feature = "wallet-consensus-rehearsal"))]
+        {
+            assert!(crate::engine::admissible(&legacy.tx, V2_FLAG_DAY).is_ok());
+            assert!(crate::engine::admissible(&bound.tx, V2_FLAG_DAY).is_err());
+        }
     }
 
     #[test]

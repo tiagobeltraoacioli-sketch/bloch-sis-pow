@@ -1639,3 +1639,322 @@ fn measure_state_root_with_many_funded_positions() {
         println!("{n:>9} | {root:>10.3?} | {boundary:>14.3?} | {roster:>10.3?}");
     }
 }
+
+// GIP-0002, WT-04: the signed commission cap (`FundedDelegateV2`, tag 0x1C)
+// behind `params::DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH` and
+// `params::DELEGATION_COMMISSION_CAP_ENFORCE_EPOCH`.
+
+use crate::params::wallet_consensus_rehearsal;
+
+const CAP_ACCEPT: u64 = 10;
+const CAP_ENFORCE: u64 = 20;
+const BASE_FEE: u128 = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+
+/// The capped form of `v1`'s fields spending `input`, signed.
+fn capped_delegate(v1: &FundedDelegate, input: FundingInput, max_commission_bps: u128) -> FundedDelegateV2 {
+    let mut tx = FundedDelegateV2 { request: v1.clone(), max_commission_bps };
+    tx.request.inputs = vec![input];
+    tx.request.funding_signature = Vec::new();
+    tx.request.tx_bytes = tx.reserved_tx_bytes();
+    tx.request.funding_signature = auth_sign(&tx.request.funding_pubkey, &tx.signing_root());
+    tx
+}
+
+/// A state at `epoch` holding one coin for a capless request and one for
+/// its capped twin (same owner, same validator, cap `max_commission_bps`).
+fn cap_fixture(epoch: u64, max_commission_bps: u128) -> (CommittedState, FundedDelegate, FundedDelegateV2) {
+    let v1 = funded_delegate(FundingInput { txid: [0x31; 32], vout: 0 });
+    let v2 = capped_delegate(&v1, FundingInput { txid: [0x32; 32], vout: 0 }, max_commission_bps);
+    let owner: [u8; 32] = Sha3_256::digest(&v1.funding_pubkey).into();
+    let coin = |input: &FundingInput, value: u128| crate::state_root::EutxoEntry {
+        txid: input.txid,
+        vout: input.vout,
+        value: value.try_into().unwrap(),
+        script_hash: owner,
+    };
+    let opening = [
+        coin(&v1.inputs[0], v1.required_funding_sat().unwrap()),
+        coin(&v2.request.inputs[0], v2.required_funding_sat().unwrap()),
+    ];
+    let (_, mut state, _) = setup_with(8, AuthVerifier, &opening);
+    state.admission_network_domain = Some(v1.network_domain);
+    state.epoch = epoch;
+    (state, v1, v2)
+}
+
+fn apply_v1(state: &CommittedState, tx: &FundedDelegate) -> Result<CommittedState, FundedDelegationReject> {
+    let mut next = state.clone();
+    next.apply_funded_delegate(tx, BASE_FEE, &AuthVerifier).map(|_| next)
+}
+
+fn apply_v2(state: &CommittedState, tx: &FundedDelegateV2) -> Result<CommittedState, FundedDelegationReject> {
+    let mut next = state.clone();
+    next.apply_funded_delegate_v2(tx, BASE_FEE, &AuthVerifier).map(|_| next)
+}
+
+/// TRIPWIRE. Both ends of the window ship `u64::MAX`; arming is an owner
+/// decision (GIP-0002).
+#[cfg(not(feature = "wallet-consensus-rehearsal"))]
+#[test]
+fn delegation_commission_cap_window_is_inert() {
+    use crate::params::DualAcceptanceGate;
+    assert_eq!(crate::params::DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH, u64::MAX);
+    assert_eq!(crate::params::DELEGATION_COMMISSION_CAP_ENFORCE_EPOCH, u64::MAX);
+    assert_eq!(crate::params::DELEGATION_COMMISSION_CAP_GATE, DualAcceptanceGate::INERT);
+    assert_eq!(crate::params::delegation_commission_cap_gate(), DualAcceptanceGate::INERT);
+}
+
+/// With the window unset the capped tag is refused at every epoch without
+/// touching state, and the capless request is admitted exactly as it is
+/// with the window armed but not yet reached: same post-state root.
+#[test]
+fn with_the_cap_window_unset_only_the_capless_request_is_valid() {
+    let _gate = funded_delegation_rehearsal::open();
+    for epoch in [0, 5, CAP_ENFORCE + 5] {
+        let (state, v1, v2) = cap_fixture(epoch, 10_000);
+        assert_eq!(apply_v2(&state, &v2).unwrap_err(), FundedDelegationReject::CommissionCapNotActive);
+        let unset = apply_v1(&state, &v1).unwrap();
+        let _armed_later = wallet_consensus_rehearsal::arm_commission_cap(epoch + 1, epoch + 91);
+        let before_window = apply_v1(&state, &v1).unwrap();
+        assert_eq!(unset.state_root(), before_window.state_root());
+        assert_eq!(unset, before_window);
+    }
+}
+
+/// The capless wire form is frozen: tag 0x0E, the V1 domain, and exactly
+/// the field sequence below, re-encoded here independently of the encoder.
+#[test]
+fn the_capless_request_keeps_its_bytes_and_its_signing_root() {
+    let tx = funded_delegate(FundingInput { txid: [0x31; 32], vout: 7 });
+    let mut intent = vec![0x0e];
+    intent.extend_from_slice(&tx.network_domain);
+    intent.extend_from_slice(&tx.valid_until_epoch.to_le_bytes());
+    intent.extend_from_slice(&(tx.funding_pubkey.len() as u32).to_le_bytes());
+    intent.extend_from_slice(&tx.funding_pubkey);
+    intent.extend_from_slice(&1u32.to_le_bytes());
+    intent.extend_from_slice(&[0x31; 32]);
+    intent.extend_from_slice(&7u32.to_le_bytes());
+    intent.extend_from_slice(&tx.validator_pubkey_hash);
+    intent.extend_from_slice(&tx.amount_sat.to_le_bytes());
+    intent.extend_from_slice(&tx.change.value.to_le_bytes());
+    intent.extend_from_slice(&tx.change.script_hash);
+    intent.extend_from_slice(&tx.max_base_fee_millisat_per_gas.to_le_bytes());
+    intent.extend_from_slice(&tx.tip_millisat_per_gas.to_le_bytes());
+    intent.extend_from_slice(&tx.tx_bytes.to_le_bytes());
+    let mut root = Sha3_256::new();
+    root.update(b"BLOCH:DELEGATION:FUND:V1");
+    root.update(&intent);
+    let root: [u8; 32] = root.finalize().into();
+    assert_eq!(tx.signing_root(), root);
+    assert_eq!(tx.reserved_tx_bytes(), intent.len() as u64 + 4 + ADMISSION_PQ_SIGNATURE_MAX as u64);
+    let mut wire = intent.clone();
+    wire.extend_from_slice(&(tx.funding_signature.len() as u32).to_le_bytes());
+    wire.extend_from_slice(&tx.funding_signature);
+    assert_eq!(PosTransaction::FundedDelegate(tx.clone()).canonical_bytes(), wire);
+    assert_eq!(PosTransaction::from_canonical_bytes(&wire).unwrap(), PosTransaction::FundedDelegate(tx.clone()));
+
+    // The capped form: tag 0x1C, the same fields, the cap, the V2 domain.
+    let v2 = capped_delegate(&tx, FundingInput { txid: [0x31; 32], vout: 7 }, 750);
+    let mut intent_v2 = intent.clone();
+    intent_v2[0] = 0x1c;
+    let tail = intent_v2.len() - 8;
+    intent_v2[tail..].copy_from_slice(&v2.request.tx_bytes.to_le_bytes());
+    intent_v2.extend_from_slice(&750u128.to_le_bytes());
+    assert_eq!(v2.request.tx_bytes, tx.tx_bytes + 16);
+    let mut root_v2 = Sha3_256::new();
+    root_v2.update(b"BLOCH:DELEGATION:FUND:V2");
+    root_v2.update(&intent_v2);
+    let root_v2: [u8; 32] = root_v2.finalize().into();
+    assert_eq!(v2.signing_root(), root_v2);
+    let mut wire_v2 = intent_v2;
+    wire_v2.extend_from_slice(&(v2.request.funding_signature.len() as u32).to_le_bytes());
+    wire_v2.extend_from_slice(&v2.request.funding_signature);
+    let encoded = PosTransaction::FundedDelegateV2(v2.clone());
+    assert_eq!(encoded.canonical_bytes(), wire_v2);
+    assert_eq!(PosTransaction::from_canonical_bytes(&wire_v2).unwrap(), encoded);
+    assert_ne!(encoded.txid(), PosTransaction::FundedDelegate(tx).txid());
+    // Every strict prefix is refused, never mis-decoded.
+    for cut in [1, 33, wire_v2.len() - v2.request.funding_signature.len() - 5, wire_v2.len() - 1] {
+        assert!(PosTransaction::from_canonical_bytes(&wire_v2[..cut]).is_err(), "prefix {cut}");
+    }
+}
+
+/// The window, epoch by epoch: one before acceptance, at it, the last
+/// before enforcement, at it, after.
+#[test]
+fn each_delegation_form_is_valid_exactly_inside_its_side_of_the_window() {
+    let _gate = funded_delegation_rehearsal::open();
+    let _armed = wallet_consensus_rehearsal::arm_commission_cap(CAP_ACCEPT, CAP_ENFORCE);
+    for (epoch, v1_verdict, v2_verdict) in [
+        (CAP_ACCEPT - 1, None, Some(FundedDelegationReject::CommissionCapNotActive)),
+        (CAP_ACCEPT, None, None),
+        (CAP_ENFORCE - 1, None, None),
+        (CAP_ENFORCE, Some(FundedDelegationReject::CommissionCapRequired), None),
+        (CAP_ENFORCE + 1, Some(FundedDelegationReject::CommissionCapRequired), None),
+    ] {
+        let (state, v1, v2) = cap_fixture(epoch, 500);
+        assert_eq!(apply_v1(&state, &v1).err(), v1_verdict, "capless at epoch {epoch}");
+        assert_eq!(apply_v2(&state, &v2).err(), v2_verdict, "capped at epoch {epoch}");
+        // Through the dispatcher too, with the same verdicts.
+        let total = state.total_active_stake_sat();
+        for (tx, verdict) in [
+            (PosTransaction::FundedDelegate(v1.clone()), v1_verdict),
+            (PosTransaction::FundedDelegateV2(v2.clone()), v2_verdict),
+        ] {
+            let got = state.clone().apply_transaction(&tx, total, BASE_FEE, &AuthVerifier).err();
+            assert_eq!(got, verdict.map(TxReject::FundedDelegation), "{tx:?} at epoch {epoch}");
+        }
+        // A refusal leaves the state as it was.
+        let mut untouched = state.clone();
+        let _ = untouched.apply_funded_delegate(&v1, BASE_FEE, &AuthVerifier);
+        if v1_verdict.is_some() {
+            assert_eq!(untouched, state);
+        }
+    }
+}
+
+/// Both forms create the same position: the cap is checked at admission and
+/// leaves nothing in state, so the state root has no new component.
+#[test]
+fn a_capped_request_creates_the_position_a_capless_one_creates() {
+    let _gate = funded_delegation_rehearsal::open();
+    let _armed = wallet_consensus_rehearsal::arm_commission_cap(CAP_ACCEPT, CAP_ENFORCE);
+    let (state, v1, v2) = cap_fixture(CAP_ACCEPT, 500);
+    let with_v1 = apply_v1(&state, &v1).unwrap();
+    let with_v2 = apply_v2(&state, &v2).unwrap();
+    assert_eq!(with_v1.delegations, with_v2.delegations);
+    assert_eq!(with_v1.funded_delegation_owners, with_v2.funded_delegation_owners);
+    let position = with_v2.delegations.last().unwrap();
+    assert_eq!(position.amount_sat, v2.request.amount_sat);
+    assert_eq!(position.requested_epoch, CAP_ACCEPT + 1);
+    // The funding coin is spent and the change exists under the V2 txid.
+    assert!(with_v2.utxo(&v2.request.inputs[0].txid, 0).is_none());
+    let change = with_v2.utxo(&PosTransaction::FundedDelegateV2(v2.clone()).txid(), 0).unwrap();
+    assert_eq!(change.script_hash, v2.request.change.script_hash);
+}
+
+/// **WT-04, the griefing.** The delegator reads a 5% commission and signs.
+/// The validator, with nothing delegated to it yet, raises its commission
+/// to 100% before the request lands.
+#[test]
+fn a_commission_raised_before_admission_does_not_bind_a_capped_request() {
+    let _gate = funded_delegation_rehearsal::open();
+    let _armed = wallet_consensus_rehearsal::arm_commission_cap(CAP_ACCEPT, CAP_ENFORCE);
+    let (mut state, v1, v2) = cap_fixture(CAP_ACCEPT, 500);
+    assert_eq!(state.validators[&0].commission_bps, 500);
+
+    // The raise is valid: no delegation targets the validator.
+    let raise = commission_update(&state, 10_000);
+    state.apply_validator_commission_update(&raise, &AuthVerifier).unwrap();
+    assert_eq!(state.validators[&0].commission_bps, 10_000);
+
+    // The capless request is admitted at 100%: the defect, still reachable
+    // until enforcement.
+    let trapped = apply_v1(&state, &v1).unwrap();
+    assert_eq!(trapped.delegations.len(), 1);
+    assert_eq!(trapped.validators[&0].commission_bps, 10_000);
+
+    // The capped request is refused, and nothing was spent: the coin is
+    // there and no position exists.
+    assert_eq!(apply_v2(&state, &v2).unwrap_err(), FundedDelegationReject::CommissionAboveCap);
+    let mut refused = state.clone();
+    let _ = refused.apply_funded_delegate_v2(&v2, BASE_FEE, &AuthVerifier);
+    assert_eq!(refused, state);
+    assert!(state.utxo(&v2.request.inputs[0].txid, 0).is_some());
+
+    // The cap is inclusive, and one basis point above it is refused.
+    for (commission, admitted) in [(500, true), (501, false), (0, true), (10_000, false)] {
+        let mut at = state.clone();
+        at.validators.get_mut(&0).unwrap().commission_bps = commission;
+        assert_eq!(apply_v2(&at, &v2).is_ok(), admitted, "commission {commission} against a cap of 500");
+    }
+}
+
+/// Once the capped request is admitted the commission cannot rise: in the
+/// same epoch, while the position is still queued, and afterwards. So the
+/// signed value bounds the rate for the life of the position.
+#[test]
+fn after_admission_the_commission_cannot_rise_above_the_signed_cap() {
+    let _gate = funded_delegation_rehearsal::open();
+    let _armed = wallet_consensus_rehearsal::arm_commission_cap(CAP_ACCEPT, CAP_ENFORCE);
+    let (state, _v1, v2) = cap_fixture(CAP_ACCEPT, 500);
+    let mut state = apply_v2(&state, &v2).unwrap();
+    for epoch in [CAP_ACCEPT, CAP_ACCEPT + 1, CAP_ACCEPT + 40] {
+        state.epoch = epoch;
+        let before = state.clone();
+        for commission in [501, 10_000] {
+            let raise = commission_update(&state, commission);
+            assert_eq!(
+                state.apply_validator_commission_update(&raise, &AuthVerifier),
+                Err(FundedDelegationReject::CommissionIncreaseWithDelegations),
+                "raise to {commission} at epoch {epoch}"
+            );
+        }
+        assert_eq!(state, before);
+    }
+    // Lowering stays possible.
+    let lower = commission_update(&state, 400);
+    state.apply_validator_commission_update(&lower, &AuthVerifier).unwrap();
+    assert_eq!(state.validators[&0].commission_bps, 400);
+}
+
+/// Negative cases: the cap is inside the signature, the two forms do not
+/// authorise each other, and a malformed capped request is refused before
+/// anything is read from state.
+#[test]
+fn a_capped_request_cannot_be_altered_downgraded_or_malformed() {
+    let _gate = funded_delegation_rehearsal::open();
+    let _armed = wallet_consensus_rehearsal::arm_commission_cap(CAP_ACCEPT, CAP_ENFORCE);
+    let (state, v1, v2) = cap_fixture(CAP_ACCEPT, 500);
+    use FundedDelegationReject as R;
+
+    // Raising the cap after signing (what a validator would want).
+    let mut raised = v2.clone();
+    raised.max_commission_bps = 10_000;
+    assert_eq!(apply_v2(&state, &raised).unwrap_err(), R::Signature);
+
+    // A cap above 100% is not a cap.
+    let mut absurd = capped_delegate(&v1, v2.request.inputs[0].clone(), 10_001);
+    assert_eq!(absurd.validate_shape(), Err(R::Shape));
+    assert_eq!(apply_v2(&state, &absurd).unwrap_err(), R::Shape);
+    absurd.max_commission_bps = u128::MAX;
+    assert_eq!(apply_v2(&state, &absurd).unwrap_err(), R::Shape);
+
+    // Stripping the cap: the capped signature under the capless form, with
+    // the capless form's own byte reservation so only the signature decides.
+    let mut stripped = v2.request.clone();
+    stripped.tx_bytes = stripped.reserved_tx_bytes();
+    assert_ne!(stripped.signing_root(), v2.signing_root());
+    assert!(matches!(apply_v1(&state, &stripped).unwrap_err(), R::Signature | R::Conservation));
+    stripped.funding_signature = v2.request.funding_signature.clone();
+    assert_ne!(
+        PosTransaction::FundedDelegate(stripped.clone()).spend_signing_root(),
+        PosTransaction::FundedDelegateV2(v2.clone()).spend_signing_root()
+    );
+    // Adding a cap to a capless signature.
+    let mut grafted = FundedDelegateV2 { request: v1.clone(), max_commission_bps: 500 };
+    assert_eq!(apply_v2(&state, &grafted).unwrap_err(), R::Shape, "capless byte reservation");
+    grafted.request.tx_bytes = grafted.reserved_tx_bytes();
+    assert!(matches!(apply_v2(&state, &grafted).unwrap_err(), R::Signature | R::Conservation));
+
+    // The capless reservation under the capped tag is a shape error.
+    let mut short = v2.clone();
+    short.request.tx_bytes -= 16;
+    assert_eq!(short.validate_shape(), Err(R::Shape));
+
+    // Another network, an expired request, an unknown validator.
+    let mut elsewhere = state.clone();
+    elsewhere.admission_network_domain = Some([0x92; 32]);
+    assert_eq!(apply_v2(&elsewhere, &v2).unwrap_err(), R::Network);
+    let mut late = state.clone();
+    late.epoch = v2.request.valid_until_epoch + 1;
+    assert_eq!(apply_v2(&late, &v2).unwrap_err(), R::Expired);
+    let mut nobody = v2.clone();
+    nobody.request.validator_pubkey_hash = [0x77; 32];
+    nobody.request.funding_signature = auth_sign(&nobody.request.funding_pubkey, &nobody.signing_root());
+    assert_eq!(apply_v2(&state, &nobody).unwrap_err(), R::Validator);
+
+    // Funded delegation itself not active: refused before the cap gate.
+    drop(_gate);
+    assert_eq!(apply_v2(&state, &v2).unwrap_err(), R::NotActive);
+}

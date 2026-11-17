@@ -99,6 +99,8 @@ pub(super) struct BudgetedVerifier<'a, V> {
     source_cap: usize,
     lane: VerificationLane,
     failure_cap: usize,
+    /// `false` for a trial verifier ([`Self::without_failure_charge`]).
+    charge_failures: bool,
     limited: Cell<bool>,
     failure_limited: Cell<bool>,
 }
@@ -195,6 +197,7 @@ impl<V> GossipVerifier<V> {
             source_cap: usize::MAX,
             lane: VerificationLane::Relay,
             failure_cap: usize::MAX,
+            charge_failures: true,
             limited: Cell::new(false),
             failure_limited: Cell::new(false),
         }
@@ -227,6 +230,7 @@ impl<V> GossipVerifier<V> {
             source_cap,
             lane,
             failure_cap: usize::MAX,
+            charge_failures: true,
             limited: Cell::new(false),
             failure_limited: Cell::new(false),
         }
@@ -378,6 +382,18 @@ impl<'a, V> BudgetedVerifier<'a, V> {
         self
     }
 
+    /// A verifier for a TRIAL whose failure says nothing against its sender
+    /// (GIP-0002: which of two accepted signing roots a transfer's first
+    /// witness was made over). It reserves units like any verification and
+    /// is refused once the source has spent its failure allowance, but a
+    /// failed trial is not charged to the source: the sender is charged by
+    /// the verification that follows it if the witness is valid under
+    /// neither root.
+    pub(super) fn without_failure_charge(mut self) -> BudgetedVerifier<'a, V> {
+        self.charge_failures = false;
+        self
+    }
+
     /// Whether a verification was refused because this source spent its
     /// failure allowance (implies [`Self::limited`]), as opposed to a spent
     /// unit allowance.
@@ -401,7 +417,7 @@ impl<'a, V> BudgetedVerifier<'a, V> {
 
     /// Pass a real verification's result through, charging a failure.
     fn settle(&self, verified: bool, units: usize) -> bool {
-        if !verified {
+        if !verified && self.charge_failures {
             self.owner.note_source_failure(self.slot, self.lane, self.source, units);
         }
         verified

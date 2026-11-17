@@ -29,7 +29,7 @@ sign --tx HEX_FILE --dir KEYSTORE_DIR --expected-root HEX32 --out NEW_FILE COMMO
 COMMON_OPTIONS:
   --validator INDEX --input-value SAT --withdrawal-script HEX32
   --destination HEX32 --base-fee MILLISAT_PER_GAS --epoch INCLUSION_EPOCH
-  --max-fee SAT
+  --max-fee SAT [--network-domain HEX32]
 prepare also requires --tip MILLISAT_PER_GAS.
 
 Spends exactly the selected validator's Withdraw output 0 into one destination,
@@ -42,6 +42,10 @@ Input values, base fee and inclusion epoch are operator observations, not proofs
 If the base fee changes, prepare and sign again: TransferV2 has exact conservation,
 not a fee-budget refund. The epoch selects the signing rules; it is NOT an expiry.
 The current network-binding gate is unarmed: use distinct keys across networks.
+--network-domain (GIP-0002) signs and checks the network-bound root for the network
+whose getchaininfo.network_domain is HEX32. Use it once getchaininfo reports
+transaction_rules.transfer_network_binding.accepted = true; pass the same value to
+prepare, inspect and sign.
 This command creates no keys, changes no consensus parameters and sends nothing.";
 
 const COMMON: &[&str] = &[
@@ -52,6 +56,7 @@ const COMMON: &[&str] = &[
     "--base-fee",
     "--epoch",
     "--max-fee",
+    "--network-domain",
 ];
 const MAX_TEXT_BYTES: u64 = 32_768;
 
@@ -99,8 +104,18 @@ struct Observation {
     base_fee: u128,
     epoch: u64,
     max_fee: u64,
+    /// GIP-0002: sign the network-bound root for this network domain.
+    network_domain: Option<[u8; 32]>,
 }
 impl Observation {
+    /// The root the payout is signed over: the network-bound root when a
+    /// network domain was given, otherwise `checked_signing_root(epoch)`.
+    fn signing_root(&self, tx: &PosTransaction) -> [u8; 32] {
+        match &self.network_domain {
+            Some(domain) => tx.network_bound_signing_root(domain),
+            None => tx.checked_signing_root(self.epoch),
+        }
+    }
     fn read(a: &Args) -> Result<Self, String> {
         let observation = Self {
             validator: a.number("--validator")?,
@@ -110,6 +125,10 @@ impl Observation {
             base_fee: a.number("--base-fee")?,
             epoch: a.number("--epoch")?,
             max_fee: a.number("--max-fee")?,
+            network_domain: match a.0.get("--network-domain") {
+                Some(_) => Some(a.hash("--network-domain")?),
+                None => None,
+            },
         };
         if observation.value == 0
             || observation.validator == u32::MAX
@@ -265,7 +284,7 @@ fn inspect(tx: &PosTransaction, o: &Observation) -> Result<(), String> {
     if Some(outputs[0].value) != o.value.checked_sub(total_fee) {
         return Err("observed payout value, output and exact fee do not conserve".into());
     }
-    let root = tx.checked_signing_root(o.epoch);
+    let root = o.signing_root(tx);
     let signature = &keys[0].signature;
     if !signature.is_empty()
         && (signature.len() > ADMISSION_PQ_SIGNATURE_MAX
@@ -336,7 +355,7 @@ fn sign(args: &[String]) -> Result<(), String> {
     let expected = a.hash("--expected-root")?;
     let mut tx = read_tx(a.get("--tx")?)?;
     inspect(&tx, &o)?;
-    let root = tx.checked_signing_root(o.epoch);
+    let root = o.signing_root(&tx);
     if root != expected {
         return Err("signing root does not match the independently approved intent".into());
     }
@@ -402,6 +421,7 @@ mod audit_signature_policy_tests {
             base_fee: 10,
             epoch: 5000,
             max_fee: 1_000_000,
+            network_domain: None,
         };
         let mut tx = PosTransaction::TransferV2 {
             keys: vec![WitnessKey { pubkey: pubkey.clone(), signature: vec![] }],

@@ -51,7 +51,7 @@ writing the constant.**
 
 | # | Namespace | Dispatch | Diagnostic on duplicate | Next free |
 | --- | --- | --- | --- | --- |
-| §1 | Transaction tags | `match` on `u8` literal | warning, same-`match` only — **and never across branches** | **`0x1C`** (`0x07`–`0x09` tombstoned; `0x17`–`0x1B` HF3) |
+| §1 | Transaction tags | `match` on `u8` literal | warning, same-`match` only — **and never across branches** | **`0x1D`** (`0x07`–`0x09` tombstoned; `0x17`–`0x1B` HF3; `0x1C` GIP-0002) |
 | §1a | Slashing-evidence kinds (nested in `0x05`) | `match`, has catch-all | warning, same-`match` only | **`0x03`** |
 | §2 | Frame bytes | `match` by *reference* + runtime `==` | **NONE** | **`0x09`** |
 | §3a | Sync **request** tags | `match` | none in practice | **`0x04`** |
@@ -143,9 +143,10 @@ has drifted to ~1008 in the deeper worktrees).
 | `0x19` | `RescueCommit` | **HF3, assigned, unarmed** — PQ rescue, gate `LATTICE_EMERGENCY_ACTIVATION_EPOCH` (≥ `HF3_PQ_MIGRATION_EPOCH`) | pq-migration | `wire_alloc.rs` |
 | `0x1A` | `RescueReveal` | **HF3, assigned, unarmed** — PQ rescue, gate `LATTICE_EMERGENCY_ACTIVATION_EPOCH` (≥ `HF3_PQ_MIGRATION_EPOCH`) | pq-migration | `wire_alloc.rs` |
 | `0x1B` | `KesRotate` | **HF3, implemented on this line, unarmed** — KES leaf-authorised rotation (p8b proposal, moved from `0x18`); refused before `HF3_KES_EPOCH` | consensus | `wire_alloc.rs`, `wire_tag_registry.rs` |
-| `0x1C`–`0xFF` | free | — | — | — |
+| `0x1C` | `FundedDelegateV2` | **GIP-0002 (WT-04), implemented on `codex/wallet-consensus-20261117`, unarmed** — funded delegation whose signed intent carries `max_commission_bps`; refused before `DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH` (u64::MAX). The first block carrying it forks every node without this code | consensus | `wire_alloc.rs`, `wire_tag_registry.rs` |
+| `0x1D`–`0xFF` | free | — | — | — |
 
-**Next free transaction tag: `0x1C`.** (`0x17`–`0x1B` are the HF3
+**Next free transaction tag: `0x1D`.** (`0x17`–`0x1B` are the HF3
 allocation of 2026-10-20, see the last section.) (`0x07`–`0x09` remain reserved and
 contested; `0x0E`–`0x11` are assigned to the funded-delegation lifecycle;
 `0x12`–`0x16` to the native L2 bridge, renumbered past `0x0E`–`0x11` on
@@ -945,7 +946,8 @@ on any ref, so it moves to `0x1B`; no implemented byte is re-pointed.
 | tx | `0x19` | `RescueCommit` | `LATTICE_EMERGENCY_ACTIVATION_EPOCH` (≥ `HF3_PQ_MIGRATION_EPOCH`) | `codex/hf3-tags-20261020` |
 | tx | `0x1A` | `RescueReveal` | `LATTICE_EMERGENCY_ACTIVATION_EPOCH` (≥ `HF3_PQ_MIGRATION_EPOCH`) | `codex/hf3-tags-20261020` |
 | tx | `0x1B` | `KesRotate` | KES gate | `codex/hf3-kes-20261020` (design: p8b) |
-| tx | `0x1C`+ | free | — | — |
+| tx | `0x1C` | `FundedDelegateV2` (allocated 2026-11-17, after this ruling) | `DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH` | `codex/wallet-consensus-20261117` (GIP-0002) |
+| tx | `0x1D`+ | free | — | — |
 | state | `0x01`–`0x21` | released set (`STATE_COMPONENT_TAGS`) | — | mainnet |
 | state | `0x22` | `TAG_KES_ROOT` | KES gate | `codex/hf3-kes-20261020` |
 | state | `0x23` | `TAG_LC_ROSTER` | LC | `codex/bloch-lc-20261014` (devnet4) |

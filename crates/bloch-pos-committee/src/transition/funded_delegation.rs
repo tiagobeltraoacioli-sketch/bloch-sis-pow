@@ -9,6 +9,10 @@ pub const FUNDED_DELEGATE_TAG: u8 = 0x0e;
 pub const FUNDED_UNDELEGATE_TAG: u8 = 0x0f;
 pub const FUNDED_DELEGATION_WITHDRAW_TAG: u8 = 0x10;
 pub const VALIDATOR_COMMISSION_UPDATE_TAG: u8 = 0x11;
+/// `FundedDelegateV2`: a funded delegation that pins the validator's
+/// commission (GIP-0002, WT-04). Refused below
+/// [`crate::params::DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH`].
+pub const FUNDED_DELEGATE_V2_TAG: u8 = 0x1c;
 
 /// Maximum total delegated principal accepted by one validator. Pending,
 /// active, cooling-down, and withdrawable positions reserve this capacity
@@ -117,6 +121,7 @@ const KEY_BYTES: usize = funded::ADMISSION_PQ_KEY_BYTES;
 const SIGNATURE_MAX: usize = funded::ADMISSION_PQ_SIGNATURE_MAX;
 const HYBRID_HEADER: [u8; 4] = [0xb1, 0x0c, 1, 0];
 const DELEGATE_DOMAIN: &[u8] = b"BLOCH:DELEGATION:FUND:V1";
+const DELEGATE_V2_DOMAIN: &[u8] = b"BLOCH:DELEGATION:FUND:V2";
 const UNDELEGATE_DOMAIN: &[u8] = b"BLOCH:DELEGATION:DEACTIVATE:V1";
 const WITHDRAW_DOMAIN: &[u8] = b"BLOCH:DELEGATION:WITHDRAW:V1";
 const COMMISSION_DOMAIN: &[u8] = b"BLOCH:VALIDATOR:COMMISSION:V1";
@@ -135,6 +140,25 @@ pub struct FundedDelegate {
     pub tip_millisat_per_gas: u128,
     pub tx_bytes: u64,
     pub funding_signature: Vec<u8>,
+}
+
+/// A funded delegation whose signed intent names the highest commission the
+/// delegator accepts from the validator (GIP-0002, WT-04).
+///
+/// The fields of `request` mean what they mean in [`FundedDelegate`]. The
+/// intent is the same field sequence under tag [`FUNDED_DELEGATE_V2_TAG`]
+/// with `max_commission_bps` appended, hashed under its own domain, so a
+/// signature for one form never authorises the other and the commission cap
+/// cannot be removed from or added to a signed request.
+///
+/// `request.tx_bytes` must equal [`Self::reserved_tx_bytes`], which is 16
+/// bytes above the capless form's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FundedDelegateV2 {
+    pub request: FundedDelegate,
+    /// Highest validator commission, in basis points, at which this request
+    /// may be admitted. At most [`rewards::MAX_COMMISSION_BPS`].
+    pub max_commission_bps: u128,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,6 +225,16 @@ pub enum FundedDelegationReject {
     /// The position-count limits of
     /// [`crate::params::FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH`].
     PositionLimit,
+    /// A `FundedDelegateV2` below
+    /// [`crate::params::DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH`].
+    CommissionCapNotActive,
+    /// A `FundedDelegate` without a commission cap at or above
+    /// [`crate::params::DELEGATION_COMMISSION_CAP_ENFORCE_EPOCH`].
+    CommissionCapRequired,
+    /// The validator's committed commission is above the request's signed
+    /// `max_commission_bps`. Nothing was spent; the request may be signed
+    /// again with the new terms, or not at all.
+    CommissionAboveCap,
 }
 
 fn put_bytes(out: &mut Vec<u8>, value: &[u8]) {
@@ -235,7 +269,13 @@ fn signature_has_shape(signature: &[u8]) -> bool {
 
 impl FundedDelegate {
     fn intent_bytes(&self) -> Vec<u8> {
-        let mut out = vec![FUNDED_DELEGATE_TAG];
+        self.intent_bytes_tagged(FUNDED_DELEGATE_TAG)
+    }
+
+    /// The intent fields under `tag`. Tag `0x0E` is the frozen V1 intent;
+    /// [`FundedDelegateV2`] appends its cap to the `0x1C` form.
+    fn intent_bytes_tagged(&self, tag: u8) -> Vec<u8> {
+        let mut out = vec![tag];
         out.extend_from_slice(&self.network_domain);
         out.extend_from_slice(&self.valid_until_epoch.to_le_bytes());
         put_bytes(&mut out, &self.funding_pubkey);
@@ -288,12 +328,20 @@ impl FundedDelegate {
     }
 
     pub(super) fn decode(r: &mut TxReader<'_>) -> Result<Self, TxDecodeError> {
+        let mut tx = Self::decode_intent(r, FUNDED_DELEGATE_TAG)?;
+        tx.funding_signature = bounded(r, SIGNATURE_MAX, FUNDED_DELEGATE_TAG)?;
+        Ok(tx)
+    }
+
+    /// The intent fields after the tag byte, with an empty signature. `tag`
+    /// only names the form in a decode error.
+    fn decode_intent(r: &mut TxReader<'_>, tag: u8) -> Result<Self, TxDecodeError> {
         let network_domain = r.h32()?;
         let valid_until_epoch = r.u64()?;
-        let funding_pubkey = bounded(r, KEY_BYTES, FUNDED_DELEGATE_TAG)?;
+        let funding_pubkey = bounded(r, KEY_BYTES, tag)?;
         let count = r.u32()? as usize;
         if count > funded::MAX_FUNDING_INPUTS {
-            return Err(TxDecodeError::NotCanonical(FUNDED_DELEGATE_TAG));
+            return Err(TxDecodeError::NotCanonical(tag));
         }
         let mut inputs = Vec::new();
         for _ in 0..count {
@@ -316,12 +364,18 @@ impl FundedDelegate {
             max_base_fee_millisat_per_gas: r.u128()?,
             tip_millisat_per_gas: r.u128()?,
             tx_bytes: r.u64()?,
-            funding_signature: bounded(r, SIGNATURE_MAX, FUNDED_DELEGATE_TAG)?,
+            funding_signature: Vec::new(),
         })
     }
 
     /// Accepts unsigned drafts; consensus authorization is a separate check.
     pub fn validate_shape(&self) -> Result<(), FundedDelegationReject> {
+        self.validate_shape_reserving(self.reserved_tx_bytes())
+    }
+
+    /// [`Self::validate_shape`] against the byte reservation of the wire
+    /// form that carries these fields.
+    fn validate_shape_reserving(&self, reserved_tx_bytes: u64) -> Result<(), FundedDelegationReject> {
         if !key_has_shape(&self.funding_pubkey)
             || self.inputs.is_empty()
             || self.inputs.len() > funded::MAX_FUNDING_INPUTS
@@ -334,7 +388,7 @@ impl FundedDelegate {
                 ..=fee_market::MAX_BASE_FEE_MILLISAT_PER_GAS)
                 .contains(&self.max_base_fee_millisat_per_gas)
             || self.tip_millisat_per_gas > fee_market::MAX_TIP_MILLISAT_PER_GAS
-            || self.tx_bytes != self.reserved_tx_bytes()
+            || self.tx_bytes != reserved_tx_bytes
             || fee_market::intrinsic_gas(DELEGATE_CLASS, self.tx_bytes) > fee_market::MAX_TX_GAS
             || self.funding_signature.len() > SIGNATURE_MAX
         {
@@ -348,16 +402,76 @@ impl FundedDelegate {
         verifier: &dyn SignatureVerifier,
     ) -> Result<(), FundedDelegationReject> {
         self.validate_shape()?;
+        self.verify_signature_over(&self.signing_root(), verifier)
+    }
+
+    fn verify_signature_over(
+        &self,
+        signing_root: &[u8; 32],
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<(), FundedDelegationReject> {
         if !signature_has_shape(&self.funding_signature)
-            || !verifier.verify_with_key(
-                &self.funding_pubkey,
-                &self.signing_root(),
-                &self.funding_signature,
-            )
+            || !verifier.verify_with_key(&self.funding_pubkey, signing_root, &self.funding_signature)
         {
             return Err(FundedDelegationReject::Signature);
         }
         Ok(())
+    }
+}
+
+impl FundedDelegateV2 {
+    fn intent_bytes(&self) -> Vec<u8> {
+        let mut out = self.request.intent_bytes_tagged(FUNDED_DELEGATE_V2_TAG);
+        out.extend_from_slice(&self.max_commission_bps.to_le_bytes());
+        out
+    }
+
+    /// `SHA3-256("BLOCH:DELEGATION:FUND:V2" ‖ intent)`.
+    pub fn signing_root(&self) -> [u8; 32] {
+        role_root(DELEGATE_V2_DOMAIN, &self.intent_bytes())
+    }
+
+    pub fn reserved_tx_bytes(&self) -> u64 {
+        (self.intent_bytes().len() as u64)
+            .saturating_add(4)
+            .saturating_add(SIGNATURE_MAX as u64)
+    }
+
+    pub fn charge(&self, base_fee: u128) -> fee_market::TxCharge {
+        self.request.charge(base_fee)
+    }
+
+    pub fn required_funding_sat(&self) -> Option<u128> {
+        self.request.required_funding_sat()
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = self.intent_bytes();
+        put_bytes(&mut out, &self.request.funding_signature);
+        out
+    }
+
+    pub(super) fn decode(r: &mut TxReader<'_>) -> Result<Self, TxDecodeError> {
+        let mut request = FundedDelegate::decode_intent(r, FUNDED_DELEGATE_V2_TAG)?;
+        let max_commission_bps = r.u128()?;
+        request.funding_signature = bounded(r, SIGNATURE_MAX, FUNDED_DELEGATE_V2_TAG)?;
+        Ok(Self { request, max_commission_bps })
+    }
+
+    /// Accepts unsigned drafts; consensus authorization is a separate check.
+    pub fn validate_shape(&self) -> Result<(), FundedDelegationReject> {
+        if self.max_commission_bps > rewards::MAX_COMMISSION_BPS {
+            return Err(FundedDelegationReject::Shape);
+        }
+        self.request.validate_shape_reserving(self.reserved_tx_bytes())
+    }
+
+    pub fn verify_authorization(
+        &self,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<(), FundedDelegationReject> {
+        self.validate_shape()?;
+        self.request.verify_signature_over(&self.signing_root(), verifier)
     }
 }
 
@@ -577,6 +691,8 @@ impl CommittedState {
         }
     }
 
+    /// `FundedDelegate` (tag `0x0E`): valid until the commission cap is
+    /// required ([`crate::params::DELEGATION_COMMISSION_CAP_ENFORCE_EPOCH`]).
     pub(super) fn apply_funded_delegate(
         &mut self,
         tx: &FundedDelegate,
@@ -587,7 +703,56 @@ impl CommittedState {
         if !crate::params::funded_delegation_active(self.epoch) {
             return Err(R::NotActive);
         }
+        if crate::params::delegation_commission_cap_gate().enforced(self.epoch) {
+            return Err(R::CommissionCapRequired);
+        }
         tx.validate_shape()?;
+        let txid = PosTransaction::FundedDelegate(tx.clone()).txid();
+        self.admit_funded_delegation(tx, None, tx.signing_root(), txid, base_fee, verifier)
+    }
+
+    /// `FundedDelegateV2` (tag `0x1C`): valid from
+    /// [`crate::params::DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH`], and refused
+    /// while the validator's committed commission is above the signed cap.
+    pub(super) fn apply_funded_delegate_v2(
+        &mut self,
+        tx: &FundedDelegateV2,
+        base_fee: u128,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<fee_market::TxCharge, FundedDelegationReject> {
+        use FundedDelegationReject as R;
+        if !crate::params::funded_delegation_active(self.epoch) {
+            return Err(R::NotActive);
+        }
+        if !crate::params::delegation_commission_cap_gate().accepted(self.epoch) {
+            return Err(R::CommissionCapNotActive);
+        }
+        tx.validate_shape()?;
+        let txid = PosTransaction::FundedDelegateV2(tx.clone()).txid();
+        self.admit_funded_delegation(
+            &tx.request,
+            Some(tx.max_commission_bps),
+            tx.signing_root(),
+            txid,
+            base_fee,
+            verifier,
+        )
+    }
+
+    /// The admission both delegation forms share. `tx` has passed its form's
+    /// shape check; `signing_root` and `txid` are that form's. With
+    /// `max_commission_bps: None` (tag `0x0E`) every check, its order and
+    /// every state write are those of the rule before GIP-0002.
+    fn admit_funded_delegation(
+        &mut self,
+        tx: &FundedDelegate,
+        max_commission_bps: Option<u128>,
+        signing_root: [u8; 32],
+        txid: [u8; 32],
+        base_fee: u128,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<fee_market::TxCharge, FundedDelegationReject> {
+        use FundedDelegationReject as R;
         if self.admission_network_domain != Some(tx.network_domain) {
             return Err(R::Network);
         }
@@ -600,6 +765,14 @@ impl CommittedState {
         let record = self.validators.get(&validator).ok_or(R::Validator)?;
         if record.slashed || record.exit_epoch != u64::MAX || record.activation_epoch > self.epoch {
             return Err(R::Validator);
+        }
+        // GIP-0002 (WT-04): the commission this block would bond the
+        // delegator at must not exceed what it signed. Judged against the
+        // committed record, the value rewards are paid under; from this
+        // block on the validator cannot raise it while the position exists
+        // (`CommissionIncreaseWithDelegations`).
+        if max_commission_bps.is_some_and(|cap| record.commission_bps > cap) {
+            return Err(R::CommissionAboveCap);
         }
         let reserved = self.delegations.iter().enumerate()
             .filter(|(position, delegation)| {
@@ -689,7 +862,6 @@ impl CommittedState {
             .checked_add(refund)
             .ok_or(R::Arithmetic)?;
         let change = u64::try_from(change).map_err(|_| R::Arithmetic)?;
-        let txid = PosTransaction::FundedDelegate(tx.clone()).txid();
         if self.eutxos.contains_key(&(txid, 0)) {
             return Err(R::OutputCollision);
         }
@@ -707,7 +879,7 @@ impl CommittedState {
             Some(index) => Some((index, u32::try_from(index).map_err(|_| R::Arithmetic)?)),
             None => None,
         };
-        tx.verify_authorization(verifier)?;
+        tx.verify_signature_over(&signing_root, verifier)?;
 
         // The displaced position starts deactivating exactly as its owner's
         // `FundedUndelegate` would in this epoch (`requested_epoch` is the

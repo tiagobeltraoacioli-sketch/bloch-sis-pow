@@ -374,6 +374,11 @@ const TX_TAGS: &[(u8, Status)] = &[
     // are the PQ migration's). Refused by consensus before
     // params::HF3_KES_EPOCH (u64::MAX).
     (0x1B, Status::Released { name: "KesRotate", rivals: NO_RIVALS }),
+    // GIP-0002 (WT-04): funded delegation with a signed commission cap. The
+    // first byte after the HF3 allocation (wire_alloc::tx::FUNDED_DELEGATE_V2).
+    // Refused by consensus before
+    // params::DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH (u64::MAX).
+    (0x1C, Status::Released { name: "FundedDelegateV2", rivals: NO_RIVALS }),
 ];
 
 /// Three lineages that all intend the SAME flag day disagree on all three
@@ -581,6 +586,7 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         PosTransaction::RescueCommit(_) => 0x19,
         PosTransaction::RescueReveal(_) => 0x1A,
         PosTransaction::KesRotate { .. } => 0x1B,
+        PosTransaction::FundedDelegateV2(_) => 0x1C,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }

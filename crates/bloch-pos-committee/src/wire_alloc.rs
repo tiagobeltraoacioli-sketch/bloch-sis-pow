@@ -79,8 +79,11 @@ pub mod tx {
     /// HF3: KES leaf-authorised rotation (p8b proposal, moved from 0x18).
     pub const KES_ROTATE: u8 = 0x1B;
 
+    /// GIP-0002: funded delegation with a signed commission cap.
+    pub const FUNDED_DELEGATE_V2: u8 = 0x1C;
+
     /// Next unallocated transaction tag.
-    pub const NEXT_FREE: u8 = 0x1C;
+    pub const NEXT_FREE: u8 = 0x1D;
 }
 
 /// State-root component tags — key prefix in the state SMT.
@@ -209,6 +212,14 @@ pub const TX_TABLE: &[Row] = &[
         name: "KesRotate",
         status: Status::Pending { gate: "HF3_KES_EPOCH", branch: "codex/hf3-kes-20261020" },
     },
+    Row {
+        tag: tx::FUNDED_DELEGATE_V2,
+        name: "FundedDelegateV2",
+        status: Status::Pending {
+            gate: "DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH",
+            branch: "codex/wallet-consensus-20261117",
+        },
+    },
 ];
 
 /// State-root tags allocated beyond the mainnet range, ascending.
@@ -232,7 +243,7 @@ mod tests {
             TX_TABLE.iter().filter(|r| r.status != Status::Tombstoned).map(|r| r.name).collect();
         assert_eq!(names.len(), TX_TABLE.len() - 3, "a name is allocated twice");
         assert_eq!(TX_TABLE.last().unwrap().tag + 1, tx::NEXT_FREE);
-        assert_eq!(TX_TABLE.len(), 0x1B, "0x01..=0x1B allocated without gaps");
+        assert_eq!(TX_TABLE.len(), 0x1C, "0x01..=0x1C allocated without gaps");
     }
 
     /// The 2026-10-20 ruling, pinned byte by byte. Changing any line here
@@ -244,7 +255,10 @@ mod tests {
         assert_eq!(tx::RESCUE_COMMIT, 0x19);
         assert_eq!(tx::RESCUE_REVEAL, 0x1A);
         assert_eq!(tx::KES_ROTATE, 0x1B);
-        assert_eq!(tx::NEXT_FREE, 0x1C);
+        // 0x1C was the first free byte of that ruling; GIP-0002 took it
+        // for FundedDelegateV2 (2026-11-17).
+        assert_eq!(tx::FUNDED_DELEGATE_V2, 0x1C);
+        assert_eq!(tx::NEXT_FREE, 0x1D);
         assert_eq!(state::KES_ROOT, 0x22);
         assert_eq!(state::LC_ROSTER, 0x23);
         assert_eq!(state::PQ_RESCUE_COMMIT, 0x24);
@@ -264,6 +278,7 @@ mod tests {
         use crate::transition::{funded, funded_delegation, l2_claim, l2_da, l2_deposit};
         assert_eq!(funded::FUNDED_DEPOSIT_TAG, tx::FUNDED_DEPOSIT);
         assert_eq!(funded_delegation::FUNDED_DELEGATE_TAG, tx::FUNDED_DELEGATE);
+        assert_eq!(funded_delegation::FUNDED_DELEGATE_V2_TAG, tx::FUNDED_DELEGATE_V2);
         assert_eq!(funded_delegation::FUNDED_UNDELEGATE_TAG, tx::FUNDED_UNDELEGATE);
         assert_eq!(funded_delegation::FUNDED_DELEGATION_WITHDRAW_TAG, tx::FUNDED_DELEGATION_WITHDRAW);
         assert_eq!(funded_delegation::VALIDATOR_COMMISSION_UPDATE_TAG, tx::VALIDATOR_COMMISSION_UPDATE);

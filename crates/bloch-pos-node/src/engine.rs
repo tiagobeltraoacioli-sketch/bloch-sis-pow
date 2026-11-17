@@ -126,7 +126,7 @@ use bloch_pos_committee::params::{
     MAX_ATTESTATIONS_PER_BLOCK, MAX_EPOCH_ADVANCE, SLOTS_PER_EPOCH,
 };
 use bloch_pos_committee::schedule::first_slot_of_epoch;
-use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
+use bloch_pos_committee::transition::{CommittedState, PosTransaction, SpendRootKind, SpendSigningRoots, Transition};
 use bloch_pos_committee::interfaces::TransitionError;
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 use sha3::{Digest, Sha3_256};
@@ -1763,6 +1763,7 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
         // `MEMPOOL_MAX_PER_SOURCE`. The funding key (shared with that key's
         // deposits) and the validator index, as their lifecycle allowance.
         PosTransaction::FundedDelegate(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::FundedDelegateV2(tx) => Some(Sha3_256::digest(&tx.request.funding_pubkey).into()),
         PosTransaction::FundedUndelegate(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::FundedDelegationWithdraw(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         PosTransaction::ValidatorCommissionUpdate(tx) => Some(validator_lifecycle_source(tx.validator)),
@@ -6202,6 +6203,7 @@ impl Engine {
             }
             PosTransaction::FundedDeposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::FundedDelegate(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
+            PosTransaction::FundedDelegateV2(tx) => Some(tx.request.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::L2Deposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::L2DataAvailability(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             PosTransaction::L2WithdrawClaim(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
@@ -6600,6 +6602,9 @@ impl Engine {
         if let Some(why) = l2_admission_refusal(&tx, self.state.l2_settlement()) {
             return Err(Refusal::Invalid(why));
         }
+        // Whether admission authenticated a transfer under the legacy root
+        // while the network-bound root is scheduled to be enforced.
+        let mut legacy_spend_root = false;
         if let PosTransaction::L2SettlementAsync(settlement) = &tx {
             let state = self.state.l2_settlement().ok_or(Refusal::Invalid("L2 settlement is not configured"))?;
             if self.mempool.values().any(|pending| matches!(pending, PosTransaction::L2SettlementAsync(_))) {
@@ -6640,20 +6645,38 @@ impl Engine {
                 verification_source,
                 GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
             ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
-            let admission = admissible_with_network_verifier(
+            // GIP-0002: inside the dual-acceptance window the first witness
+            // of a transfer is tried under the network-bound root before the
+            // legacy one. That trial draws on the same allowances, but its
+            // failure is not charged: a transfer signed over the legacy root
+            // is still honest input there. Outside the window it is unused.
+            let trial = self.gossip_verifier.budgeted_for_source(
+                self.wall_slot(),
+                GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+                verification_source,
+                GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+            ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT)
+                .without_failure_charge();
+            let schedule = WalletConsensusSchedule::compiled();
+            let admission = admissible_under(
                 &tx,
                 epoch_of(self.wall_slot()),
                 self.state.admission_network_domain().as_ref(),
                 &verifier,
+                &trial,
+                &schedule,
             );
-            let limited = verifier.limited();
+            let limited = verifier.limited() || trial.limited();
             drop(verifier);
+            drop(trial);
             if limited {
                 return Err(Refusal::GossipVerificationLimited {
                     until_slot: self.wall_slot().saturating_add(1),
                 });
             }
-            admission.map_err(Refusal::Invalid)?;
+            let spend_root = admission.map_err(Refusal::Invalid)?;
+            legacy_spend_root = schedule.sighash.enforce_epoch != u64::MAX
+                && spend_root == Some(SpendRootKind::Legacy);
         }
         if let PosTransaction::SlashingEvidence(evidence) = &tx {
             if validator_lifecycle::native_slashing_admission_active(epoch_of(self.wall_slot())) {
@@ -6699,7 +6722,12 @@ impl Engine {
         // expire transactions it never had a chance to include.
         self.mempool_admitted_at
             .insert(key.clone(), self.head_slot_now());
-        self.mempool.insert_with_txid(key, tx, txid);
+        if legacy_spend_root {
+            self.mempool.insert_with_txid(key.clone(), tx, txid);
+            self.mempool.mark_legacy_spend_root(&key);
+        } else {
+            self.mempool.insert_with_txid(key, tx, txid);
+        }
         self.net.broadcast_transaction(broadcast);
         Ok((Admitted::New, prepared))
     }
@@ -6781,17 +6809,20 @@ impl Engine {
         #[cfg(test)]
         RELAY_POLICY_REVERIFICATIONS.with(|n| n.set(n.get() + 1));
         let domain = self.state.admission_network_domain();
-        let Some(root) = tx.checked_signing_root_for_network(epoch, domain.as_ref()) else {
+        let Some(roots) = tx.spend_signing_roots_for_network(epoch, domain.as_ref()) else {
             return !matches!(
                 tx,
                 PosTransaction::Transfer { .. } | PosTransaction::TransferV2 { .. }
             );
         };
         // A witness is relay-unsafe iff the base rule accepts it and the
-        // reference rule does not.
+        // reference rule does not, under a root consensus accepts at
+        // `epoch` (one root outside the GIP-0002 window, two inside it).
         let relay_unsafe = |pk: &[u8], sig: &[u8]| {
-            bloch_crypto::crypto::verify(pk, &root, sig)
-                && !bloch_crypto::crypto::verify_pinned(pk, &root, sig)
+            std::iter::once(&roots.preferred).chain(roots.fallback.as_ref()).any(|root| {
+                bloch_crypto::crypto::verify(pk, root, sig)
+                    && !bloch_crypto::crypto::verify_pinned(pk, root, sig)
+            })
         };
         match tx {
             PosTransaction::Transfer { inputs, .. } => {
@@ -6810,6 +6841,18 @@ impl Engine {
     fn candidate_is_backed(&self, tx: &PosTransaction, key: &[u8], epoch: u64,
         funded_context: &mut Option<(Arc<CommittedState>, u128)>) -> bool {
         if admission::check_transfer(&self.state, tx, key.len(), epoch).is_err() { return false; }
+        // GIP-0002: an entry admitted on one side of a boundary of the two
+        // dual-acceptance windows is not valid on the other side. No
+        // cryptography: the delegation form is in the entry, and admission
+        // recorded which root a transfer was signed over.
+        if wallet_rules_refuse_selection(
+            tx,
+            self.mempool.signed_over_legacy_root(key),
+            epoch,
+            &WalletConsensusSchedule::compiled(),
+        ) {
+            return false;
+        }
         // A pending settlement the head has moved past backs nothing (EXE-2).
         if matches!(tx, PosTransaction::L2SettlementAsync(_)) { return self.pending_settlement_applies(tx); }
         // NODE RELAY POLICY (HF2 sigdet): the proposer never selects a spend
@@ -9776,6 +9819,20 @@ pub fn run(cfg: Config) -> io::Result<()> {
         println!("L2 ACTIVATION REHEARSAL BUILD: {}", env!("BLOCH_BUILD_VERSION"));
     }
 
+    // A GIP-0002 rehearsal build arms network-bound transfer signing and the
+    // delegation commission cap at compile-time epochs: it must never run a
+    // funded network.
+    #[cfg(feature = "wallet-consensus-rehearsal")]
+    {
+        if crate::codec::hex32(&digest) == GENESIS4_MAINNET_NETWORK_DIGEST || manifest.carryover.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "this is a wallet-consensus (GIP-0002) rehearsal build; it refuses the Genesis-4 mainnet manifest and any funded (carryover) manifest",
+            ));
+        }
+        println!("WALLET CONSENSUS REHEARSAL BUILD: {}", env!("BLOCH_BUILD_VERSION"));
+    }
+
     // The opening ledger, before anything else touches the manifest. A
     // manifest that commits to a carryover is not usable until the snapshot
     // is in hand, and a snapshot offered to a manifest that commits to none
@@ -11755,6 +11812,20 @@ fn relay_spend_reference_check(pubkey: &[u8], signing_root: &[u8; 32], signature
         || bloch_crypto::crypto::verify_pinned(pubkey, signing_root, signature)
 }
 
+/// [`admissible`] for a transfer signed over the network-bound root of
+/// `network_domain`, as a node judges it once only that root is accepted
+/// (GIP-0002). For offline builders that sign that root; no node uses it.
+pub(crate) fn admissible_network_bound(
+    tx: &PosTransaction,
+    wall_epoch: u64,
+    network_domain: &[u8; 32],
+) -> Result<(), &'static str> {
+    let enforced = bloch_pos_committee::params::DualAcceptanceGate { accept_epoch: 0, enforce_epoch: 0 };
+    let schedule = WalletConsensusSchedule { sighash: enforced, ..WalletConsensusSchedule::compiled() };
+    let verifier = HybridVerifier::new();
+    admissible_under(tx, wall_epoch, Some(network_domain), &verifier, &verifier, &schedule).map(|_| ())
+}
+
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     admissible_with_verifier(tx, wall_epoch, &HybridVerifier::new())
 }
@@ -11786,10 +11857,105 @@ fn admissible_with_network_verifier(
     network_domain: Option<&[u8; 32]>,
     verifier: &dyn SignatureVerifier,
 ) -> Result<(), &'static str> {
+    admissible_under(tx, wall_epoch, network_domain, verifier, verifier, &WalletConsensusSchedule::compiled())
+        .map(|_| ())
+}
+
+/// The two GIP-0002 dual-acceptance schedules, as node policy reads them
+/// (admission, selection, `getchaininfo`). A value rather than a read of the
+/// constants at each site, so the windows and their boundaries can be tested
+/// in this crate without arming anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WalletConsensusSchedule {
+    /// Network-bound transfer signing (WT-03).
+    pub(crate) sighash: bloch_pos_committee::params::DualAcceptanceGate,
+    /// Signed commission cap on funded delegations (WT-04).
+    pub(crate) commission_cap: bloch_pos_committee::params::DualAcceptanceGate,
+}
+
+impl WalletConsensusSchedule {
+    /// The schedule consensus in this binary enforces.
+    pub(crate) fn compiled() -> Self {
+        Self {
+            sighash: bloch_pos_committee::params::sighash_network_binding_gate(),
+            commission_cap: bloch_pos_committee::params::delegation_commission_cap_gate(),
+        }
+    }
+}
+
+/// Whether the proposer must leave `tx` out of a block of `epoch` because of
+/// a GIP-0002 boundary. `legacy_root`: admission authenticated the transfer
+/// under the legacy signing root.
+fn wallet_rules_refuse_selection(
+    tx: &PosTransaction,
+    legacy_root: bool,
+    epoch: u64,
+    schedule: &WalletConsensusSchedule,
+) -> bool {
+    match tx {
+        PosTransaction::Transfer { .. } | PosTransaction::TransferV2 { .. } => {
+            legacy_root && schedule.sighash.enforced(epoch)
+        }
+        PosTransaction::FundedDelegate(_) => schedule.commission_cap.enforced(epoch),
+        PosTransaction::FundedDelegateV2(_) => !schedule.commission_cap.accepted(epoch),
+        _ => false,
+    }
+}
+
+/// Authenticate a transfer's witnesses at the mempool door under the roots
+/// consensus accepts at `wall_epoch` (the mirror of
+/// `SpendSigningRoots::authorize`). `trial` is used only inside the
+/// dual-acceptance window, for the first witness under the preferred root.
+fn admission_spend_witnesses_authorize<'a>(
+    verifier: &dyn SignatureVerifier,
+    trial: &dyn SignatureVerifier,
+    wall_epoch: u64,
+    roots: &SpendSigningRoots,
+    witnesses: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+) -> Option<SpendRootKind> {
+    let mut first = true;
+    roots.authorize(witnesses, |pubkey, root, signature| {
+        // Only the first witness can be asked about two roots, and only its
+        // first question (the preferred root, with a fallback behind it) is
+        // a trial.
+        let is_trial = std::mem::take(&mut first) && roots.fallback.is_some() && *root == roots.preferred;
+        let verifier = if is_trial { trial } else { verifier };
+        admission_spend_witness_verifies(verifier, wall_epoch, pubkey, root, signature)
+    })
+}
+
+/// [`admissible`] under an explicit GIP-0002 `schedule`. For a transfer it
+/// returns the signing root its witnesses authorise under.
+fn admissible_under(
+    tx: &PosTransaction,
+    wall_epoch: u64,
+    network_domain: Option<&[u8; 32]>,
+    verifier: &dyn SignatureVerifier,
+    trial: &dyn SignatureVerifier,
+    schedule: &WalletConsensusSchedule,
+) -> Result<Option<SpendRootKind>, &'static str> {
     // NODE RELAY POLICY (HF2 sigdet): every signature checked below must also
     // pass the FIPS 204 reference verifier. Not a consensus rule.
     let strict = StrictRelayVerifier::new(verifier);
     let verifier: &dyn SignatureVerifier = &strict;
+    let strict_trial = StrictRelayVerifier::new(trial);
+    let trial: &dyn SignatureVerifier = &strict_trial;
+    let mut spend_root = None;
+    admissible_arms(tx, wall_epoch, network_domain, verifier, trial, schedule, &mut spend_root)?;
+    Ok(spend_root)
+}
+
+/// The per-type rules of [`admissible_under`]. A transfer arm records the
+/// root its witnesses authorise under in `spend_root`.
+fn admissible_arms(
+    tx: &PosTransaction,
+    wall_epoch: u64,
+    network_domain: Option<&[u8; 32]>,
+    verifier: &dyn SignatureVerifier,
+    trial: &dyn SignatureVerifier,
+    schedule: &WalletConsensusSchedule,
+    spend_root: &mut Option<SpendRootKind>,
+) -> Result<(), &'static str> {
     match tx {
         PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_) => Err("native L2 settlement is not enabled by a shipping genesis manifest"),
         // Whether the network's L2 admits DA, claims and deposits is a state
@@ -11862,7 +12028,27 @@ fn admissible_with_network_verifier(
             ) {
                 return Err("funded delegation (tag 0x0E) is not active");
             }
+            // GIP-0002 (WT-04): once the signed commission cap is required
+            // consensus refuses the capless form; do not relay it.
+            if schedule.commission_cap.enforced(wall_epoch) {
+                return Err("funded delegation without a commission cap (tag 0x0E) is no longer accepted; sign the capped form (tag 0x1C)");
+            }
             if wall_epoch > delegate.valid_until_epoch {
+                return Err("funded delegation has expired");
+            }
+            delegate
+                .validate_shape()
+                .map_err(|_| "invalid funded delegation shape")
+        }
+        PosTransaction::FundedDelegateV2(delegate) => {
+            if !bloch_pos_committee::params::epoch_gate_active(
+                wall_epoch,
+                bloch_pos_committee::params::FUNDED_DELEGATION_ACTIVATION_EPOCH,
+            ) || !schedule.commission_cap.accepted(wall_epoch)
+            {
+                return Err("funded delegation with a commission cap (tag 0x1C) is not active");
+            }
+            if wall_epoch > delegate.request.valid_until_epoch {
                 return Err("funded delegation has expired");
             }
             delegate
@@ -12054,14 +12240,18 @@ fn admissible_with_network_verifier(
             // Refusing at the mempool door is what stops it PROPAGATING. The
             // signature is the expensive check and it is deliberately last, after
             // the two free ones above.
-            let signing_root = tx
-                .checked_signing_root_for_network(wall_epoch, network_domain)
+            let roots = SpendSigningRoots::for_schedule(tx.spend_signing_root(), schedule.sighash, wall_epoch, network_domain)
                 .ok_or("network-bound spend gate requires a committed genesis domain")?;
-            for i in inputs {
-                if !admission_spend_witness_verifies(verifier, wall_epoch, &i.pubkey, &signing_root, &i.signature) {
-                    return Err("transfer carries a signature that does not verify");
-                }
-            }
+            *spend_root = Some(
+                admission_spend_witnesses_authorize(
+                    verifier,
+                    trial,
+                    wall_epoch,
+                    &roots,
+                    inputs.iter().map(|i| (i.pubkey.as_slice(), i.signature.as_slice())),
+                )
+                .ok_or("transfer carries a signature that does not verify")?,
+            );
             Ok(())
         }
         // TransferV2 (tag 0x06): admitted from its flag day, refused before
@@ -12216,14 +12406,18 @@ fn admissible_with_network_verifier(
             // per key authorises all of that key's inputs. Admitting an
             // unverified table would hand an attacker free propagation of
             // garbage that every proposer then pays to drop.
-            let signing_root = tx
-                .checked_signing_root_for_network(wall_epoch, network_domain)
+            let roots = SpendSigningRoots::for_schedule(tx.spend_signing_root(), schedule.sighash, wall_epoch, network_domain)
                 .ok_or("network-bound spend gate requires a committed genesis domain")?;
-            for k in keys {
-                if !admission_spend_witness_verifies(verifier, wall_epoch, &k.pubkey, &signing_root, &k.signature) {
-                    return Err("transfer carries a signature that does not verify");
-                }
-            }
+            *spend_root = Some(
+                admission_spend_witnesses_authorize(
+                    verifier,
+                    trial,
+                    wall_epoch,
+                    &roots,
+                    keys.iter().map(|k| (k.pubkey.as_slice(), k.signature.as_slice())),
+                )
+                .ok_or("transfer carries a signature that does not verify")?,
+            );
             Ok(())
         }
         // Exit is UNAUTHENTICATED: its arm in transition.rs checks registry
@@ -22923,3 +23117,7 @@ mod validated_vote_tests {
         check(&engine, "restart cache");
     }
 }
+
+#[cfg(test)]
+#[path = "engine/wallet_consensus_tests.rs"]
+mod wallet_consensus_tests;

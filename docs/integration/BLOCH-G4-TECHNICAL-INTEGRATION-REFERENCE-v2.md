@@ -565,6 +565,18 @@ is ever armed, it requires advance, published coordination with every wallet
 implementation (including the WASM library, OPERATOR-ASSERTED, §6), not only a
 node-fleet rebuild.
 
+**Update, 2026-11-17 (GIP-0002, still inert).** The gate above is now the
+ENFORCEMENT end of a dual-acceptance window. A second constant,
+`SIGHASH_NETWORK_BINDING_ACCEPT_EPOCH` (also `u64::MAX`), opens the window:
+from it a transfer may be signed over either root, and only from the gate
+above is the old root refused. The window is the grace period this section
+says the code lacked; a build cannot arm enforcement less than 90 epochs
+after acceptance. A signer reads `getchaininfo.transaction_rules
+.transfer_network_binding.accepted` and `getchaininfo.network_domain` and
+signs the bound root once `accepted` is true. Pre-signed, unbroadcast
+transfers still become invalid at the enforcement epoch. See
+`gips/GIP-0002.md`.
+
 ---
 
 ## 4. Cryptographic standards

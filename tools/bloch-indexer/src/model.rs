@@ -147,6 +147,9 @@ pub enum TxKind {
     TransferV2,
     FundedDeposit,
     FundedDelegate,
+    /// GIP-0002 (0x1C): a funded delegation with a signed commission cap.
+    /// Same ledger effect as `FundedDelegate`.
+    FundedDelegateV2,
     FundedUndelegate,
     FundedDelegationWithdraw,
     ValidatorCommissionUpdate,
@@ -196,6 +199,7 @@ impl TxKind {
             TxKind::TransferV2 => "transfer_v2".into(),
             TxKind::FundedDeposit => "funded_deposit".into(),
             TxKind::FundedDelegate => "funded_delegate".into(),
+            TxKind::FundedDelegateV2 => "funded_delegate_v2".into(),
             TxKind::FundedUndelegate => "funded_undelegate".into(),
             TxKind::FundedDelegationWithdraw => "funded_delegation_withdraw".into(),
             TxKind::ValidatorCommissionUpdate => "validator_commission_update".into(),

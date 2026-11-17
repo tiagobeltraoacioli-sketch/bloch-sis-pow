@@ -134,7 +134,7 @@ pub mod evidence_admission;
 pub use evidence_admission::{EvidencePrecheck, EvidencePrecheckError, SignedMessage};
 pub use funded::{FundedDeposit, FundedDepositReject, FundingInput};
 pub use funded_delegation::{
-    FundedDelegate, FundedDelegationReject, FundedDelegationWithdraw, FundedUndelegate,
+    FundedDelegate, FundedDelegateV2, FundedDelegationReject, FundedDelegationWithdraw, FundedUndelegate,
     ValidatorCommissionUpdate,
 };
 pub mod l2_deposit;
@@ -314,6 +314,10 @@ pub enum PosTransaction {
     /// PQ-authorized, UTXO-funded delegation to an existing validator (wire
     /// 0x0E). Consensus-invalid while the funded-delegation gate is inert.
     FundedDelegate(FundedDelegate),
+    /// A funded delegation that pins the validator's commission (wire 0x1C;
+    /// GIP-0002). Consensus-invalid below
+    /// `params::DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH`.
+    FundedDelegateV2(FundedDelegateV2),
     /// Owner-authorized start of a funded position's cool-down (wire 0x0F).
     FundedUndelegate(FundedUndelegate),
     /// Owner-authorized payout of a fully inactive funded position (wire 0x10).
@@ -737,6 +741,7 @@ impl PosTransaction {
             }
             PosTransaction::FundedDeposit(tx) => return tx.intent_root(),
             PosTransaction::FundedDelegate(tx) => return tx.signing_root(),
+            PosTransaction::FundedDelegateV2(tx) => return tx.signing_root(),
             PosTransaction::FundedUndelegate(tx) => return tx.signing_root(),
             PosTransaction::FundedDelegationWithdraw(tx) => return tx.signing_root(),
             PosTransaction::ValidatorCommissionUpdate(tx) => return tx.signing_root(),
@@ -855,6 +860,41 @@ impl PosTransaction {
         network_domain.map(|domain| Self::fold_network_binding(base, *domain))
     }
 
+    /// The network-bound signing root of this transfer on the network whose
+    /// committed genesis-manifest digest is `network_domain`
+    /// (`getchaininfo.network_domain`):
+    /// `SHA3-256(DS_SPEND2 ‖ network_domain ‖ spend_signing_root)`.
+    ///
+    /// Signer side, and independent of any gate: a wallet signs this root
+    /// from the acceptance epoch of GIP-0002 on, and
+    /// [`Self::spend_signing_root`] before it.
+    pub fn network_bound_signing_root(&self, network_domain: &[u8; 32]) -> [u8; 32] {
+        Self::fold_network_binding(self.spend_signing_root(), *network_domain)
+    }
+
+    /// Every root under which this transfer's witnesses may authorise it in
+    /// a block of `epoch` (GIP-0002, WT-03): the consensus rule behind the
+    /// dual-acceptance window of
+    /// [`crate::params::SIGHASH_NETWORK_BINDING_ACCEPT_EPOCH`].
+    ///
+    /// - below the window: the legacy root alone, even for a state without
+    ///   a domain (historical replay is byte-identical);
+    /// - inside it: the bound root preferred, the legacy root as the
+    ///   fallback; a state without a domain has the legacy root alone;
+    /// - from enforcement: the bound root alone, `None` without a domain.
+    pub fn spend_signing_roots_for_network(
+        &self,
+        epoch: u64,
+        network_domain: Option<&[u8; 32]>,
+    ) -> Option<SpendSigningRoots> {
+        SpendSigningRoots::for_schedule(
+            self.spend_signing_root(),
+            crate::params::sighash_network_binding_gate(),
+            epoch,
+            network_domain,
+        )
+    }
+
     /// The canonical wire encoding of a consensus transaction — the bytes the
     /// header's `body_root` is a Merkle root over.
     ///
@@ -913,6 +953,7 @@ impl PosTransaction {
             PosTransaction::L2SettlementAsync(tx) => return tx.encode_async(),
             PosTransaction::FundedDeposit(tx) => return tx.canonical_bytes(),
             PosTransaction::FundedDelegate(tx) => return tx.canonical_bytes(),
+            PosTransaction::FundedDelegateV2(tx) => return tx.canonical_bytes(),
             PosTransaction::FundedUndelegate(tx) => return tx.canonical_bytes(),
             PosTransaction::FundedDelegationWithdraw(tx) => return tx.canonical_bytes(),
             PosTransaction::ValidatorCommissionUpdate(tx) => return tx.canonical_bytes(),
@@ -1137,6 +1178,8 @@ impl PosTransaction {
             funded::FUNDED_DEPOSIT_TAG => PosTransaction::FundedDeposit(FundedDeposit::decode(&mut r)?),
             funded_delegation::FUNDED_DELEGATE_TAG =>
                 PosTransaction::FundedDelegate(FundedDelegate::decode(&mut r)?),
+            funded_delegation::FUNDED_DELEGATE_V2_TAG =>
+                PosTransaction::FundedDelegateV2(FundedDelegateV2::decode(&mut r)?),
             funded_delegation::FUNDED_UNDELEGATE_TAG =>
                 PosTransaction::FundedUndelegate(FundedUndelegate::decode(&mut r)?),
             funded_delegation::FUNDED_DELEGATION_WITHDRAW_TAG =>
@@ -2420,6 +2463,98 @@ fn owns(key_hash: &[u8; 32], script_hash: &[u8; 32]) -> bool {
         return true;
     }
     script_hash[20..] == [0u8; 12] && key_hash[..20] == script_hash[..20]
+}
+
+/// Which signing root a transfer's witnesses were made over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpendRootKind {
+    /// `spend_signing_root`: the `DS_SPEND` root, identical on every network.
+    Legacy,
+    /// `DS_SPEND2 ‖ network domain ‖ spend_signing_root`.
+    NetworkBound,
+}
+
+/// The roots a transfer may be authorised under in one epoch (GIP-0002).
+///
+/// A transfer is authorised under exactly one root. The root is chosen by
+/// the transfer's FIRST witness: `preferred` if that witness verifies under
+/// it, otherwise `fallback` when there is one. Every witness must then
+/// verify under the chosen root. One extra verification per transfer at
+/// most, and none at all outside the window (`fallback` is `None`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpendSigningRoots {
+    pub preferred: [u8; 32],
+    pub preferred_kind: SpendRootKind,
+    /// The legacy root, inside the dual-acceptance window only.
+    pub fallback: Option<[u8; 32]>,
+}
+
+impl SpendSigningRoots {
+    /// The legacy root alone.
+    pub const fn legacy(root: [u8; 32]) -> Self {
+        Self { preferred: root, preferred_kind: SpendRootKind::Legacy, fallback: None }
+    }
+
+    /// The roots of a transfer whose witness-free root is `base`, under
+    /// `gate` in `epoch` on the network `network_domain`. Pure: the node
+    /// calls it with the schedule its admission policy reads.
+    pub fn for_schedule(
+        base: [u8; 32],
+        gate: crate::params::DualAcceptanceGate,
+        epoch: u64,
+        network_domain: Option<&[u8; 32]>,
+    ) -> Option<Self> {
+        if !gate.accepted(epoch) {
+            return Some(Self::legacy(base));
+        }
+        let bound = network_domain.map(|domain| PosTransaction::fold_network_binding(base, *domain));
+        if gate.enforced(epoch) {
+            return bound.map(|root| Self {
+                preferred: root,
+                preferred_kind: SpendRootKind::NetworkBound,
+                fallback: None,
+            });
+        }
+        Some(match bound {
+            Some(root) => Self {
+                preferred: root,
+                preferred_kind: SpendRootKind::NetworkBound,
+                fallback: Some(base),
+            },
+            None => Self::legacy(base),
+        })
+    }
+
+    /// Judge `witnesses` (`(public key, signature)` in transaction order)
+    /// with `verify`, returning the root kind they authorise under.
+    ///
+    /// Outside the window this is one `verify` call per witness against the
+    /// single root, in order, stopping at the first failure: the exact call
+    /// sequence of the rule before GIP-0002.
+    pub fn authorize<'a>(
+        &self,
+        witnesses: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+        mut verify: impl FnMut(&[u8], &[u8; 32], &[u8]) -> bool,
+    ) -> Option<SpendRootKind> {
+        let mut witnesses = witnesses.into_iter();
+        let Some((pubkey, signature)) = witnesses.next() else {
+            return Some(self.preferred_kind);
+        };
+        let (root, kind) = if verify(pubkey, &self.preferred, signature) {
+            (self.preferred, self.preferred_kind)
+        } else {
+            match self.fallback {
+                Some(legacy) if verify(pubkey, &legacy, signature) => (legacy, SpendRootKind::Legacy),
+                _ => return None,
+            }
+        };
+        for (pubkey, signature) in witnesses {
+            if !verify(pubkey, &root, signature) {
+                return None;
+            }
+        }
+        Some(kind)
+    }
 }
 
 impl CommittedState {
@@ -3788,15 +3923,7 @@ impl CommittedState {
     /// and the rehearsal switch exists so the bound fold's tests are not
     /// dead code until the founder arms it.
     fn sighash_network_binding_active(epoch: u64) -> bool {
-        #[cfg(test)]
-        let forced = crate::params::rehearsal::sighash_network_binding_gate_forced_open();
-        #[cfg(not(test))]
-        let forced = false;
-        forced
-            || crate::params::epoch_gate_active(
-                epoch,
-                crate::params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH,
-            )
+        crate::params::sighash_network_binding_gate().enforced(epoch)
     }
 
     fn apply_transaction(
@@ -3834,6 +3961,9 @@ impl CommittedState {
                 .map_err(TxReject::FundedDeposit),
             PosTransaction::FundedDelegate(delegate) => self
                 .apply_funded_delegate(delegate, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::FundedDelegation),
+            PosTransaction::FundedDelegateV2(delegate) => self
+                .apply_funded_delegate_v2(delegate, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::FundedDelegation),
             PosTransaction::FundedUndelegate(undelegate) => self
                 .apply_funded_undelegate(undelegate, verifier)
@@ -4788,14 +4918,19 @@ impl CommittedState {
         // `spend_signing_root`). Below `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH`
         // (A2-3 / R7 M2) the network-aware helper returns exactly that root;
         // see its docs for what changes once the gate arms.
-        let signing_root = tx
-            .checked_signing_root_for_network(self.epoch, self.admission_network_domain.as_ref())
+        // Between the acceptance and enforcement epochs of GIP-0002 the
+        // transfer may instead be signed over the legacy root; the first
+        // witness decides which (`SpendSigningRoots::authorize`).
+        let roots = tx
+            .spend_signing_roots_for_network(self.epoch, self.admission_network_domain.as_ref())
             .ok_or(TransferReject::MissingNetworkBinding)?;
-        for i in inputs {
-            if !Self::spend_witness_verifies(verifier, self.epoch, &i.pubkey, &signing_root, &i.signature) {
-                return Err(TransferReject::BadSignature);
-            }
-        }
+        let epoch = self.epoch;
+        roots
+            .authorize(
+                inputs.iter().map(|i| (i.pubkey.as_slice(), i.signature.as_slice())),
+                |pubkey, root, signature| Self::spend_witness_verifies(verifier, epoch, pubkey, root, signature),
+            )
+            .ok_or(TransferReject::BadSignature)?;
 
         // ── Apply ───────────────────────────────────────────────────────────
         //
@@ -5100,20 +5235,22 @@ impl CommittedState {
         // input would get. Same network-aware root as V1 — one fold,
         // shared by both callers, so the two formats cannot drift into
         // different network-binding rules once the gate arms (A2-3 / R7 M2).
-        let signing_root = match context.as_ref() {
-            Some(joint) => joint.authorization,
+        let roots = match context.as_ref() {
+            Some(joint) => SpendSigningRoots::legacy(joint.authorization),
             None => tx
-                .checked_signing_root_for_network(
+                .spend_signing_roots_for_network(
                     self.epoch,
                     self.admission_network_domain.as_ref(),
                 )
                 .ok_or(TransferReject::MissingNetworkBinding)?,
         };
-        for k in keys {
-            if !Self::spend_witness_verifies(verifier, self.epoch, &k.pubkey, &signing_root, &k.signature) {
-                return Err(TransferReject::BadSignature);
-            }
-        }
+        let epoch = self.epoch;
+        roots
+            .authorize(
+                keys.iter().map(|k| (k.pubkey.as_slice(), k.signature.as_slice())),
+                |pubkey, root, signature| Self::spend_witness_verifies(verifier, epoch, pubkey, root, signature),
+            )
+            .ok_or(TransferReject::BadSignature)?;
 
         Ok(ValidatedTransferV2 { state: self, inputs, outputs, txid, charge })
     }
@@ -7535,6 +7672,7 @@ mod tx_codec_tests {
 mod tests {
     include!("transition/l2_settlement_tests.rs");
     include!("transition/kes_tests.rs");
+    include!("transition/wallet_consensus_tests.rs");
     use super::*;
     mod validator_lifecycle {
         use super::*;
@@ -10916,6 +11054,7 @@ mod tests {
     /// is checked against, invalidating any pre-signed transaction nobody
     /// has broadcast yet. Whoever arms it deletes this test first, and
     /// reads the constant's docs while doing so.
+    #[cfg(not(feature = "wallet-consensus-rehearsal"))]
     #[test]
     fn sighash_network_binding_gate_is_inert() {
         assert_eq!(
@@ -16295,6 +16434,7 @@ mod tests {
             // Funded delegation moves existing UTXO value through a bonded
             // position and back; its lifecycle never edits the issuance cap.
             PosTransaction::FundedDelegate(_)
+            | PosTransaction::FundedDelegateV2(_)
             | PosTransaction::FundedUndelegate(_)
             | PosTransaction::FundedDelegationWithdraw(_)
             | PosTransaction::ValidatorCommissionUpdate(_) => {}

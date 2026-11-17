@@ -587,6 +587,14 @@ fn main() {
     } else if std::env::var_os("CARGO_FEATURE_WS_RELEASE_ANCHOR").is_some() {
         devnet.push_str("+ws-release-anchor");
     }
+    // GIP-0002 rehearsal: both epochs are consensus constants of the build.
+    if std::env::var_os("CARGO_FEATURE_WALLET_CONSENSUS_REHEARSAL").is_some() {
+        let accept = std::env::var("BLOCH_WALLET_CONSENSUS_ACCEPT_EPOCH").unwrap_or_default();
+        let enforce = std::env::var("BLOCH_WALLET_CONSENSUS_ENFORCE_EPOCH").unwrap_or_default();
+        devnet.push_str(&format!("+wallet-consensus-rehearsal-a{accept}-e{enforce}"));
+    }
+    println!("cargo:rerun-if-env-changed=BLOCH_WALLET_CONSENSUS_ACCEPT_EPOCH");
+    println!("cargo:rerun-if-env-changed=BLOCH_WALLET_CONSENSUS_ENFORCE_EPOCH");
     println!("cargo:rerun-if-env-changed=BLOCH_L2_REHEARSAL_ACTIVATION_EPOCH");
     println!("cargo:rustc-env=BLOCH_BUILD_VERSION={pkg} ({commit}{dirty}){devnet}");
 

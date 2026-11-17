@@ -286,6 +286,21 @@ fn getchaininfo_reports_slot_epoch_head_root_and_both_checkpoints() {
     let e = bloch_pos_committee::params::HF1_CLAIM_FINALITY_EPOCH;
     assert_eq!(claim.get("activation_epoch"), Some(&if e == u64::MAX { Json::Null } else { Json::u(e) }));
     assert_eq!(claim.get("active"), Some(&Json::Bool(e == 0)));
+
+    // Additive fields (GIP-0002): the network domain a signer binds, and the
+    // two dual-acceptance windows, both unset in this build.
+    assert_eq!(
+        v.get("network_domain"),
+        Some(&st.admission_network_domain().map_or(Json::Null, |d| Json::hex(&d)))
+    );
+    let rules = v.get("transaction_rules").expect("transaction_rules");
+    for rule in ["transfer_network_binding", "delegation_commission_cap"] {
+        let r = rules.get(rule).unwrap_or_else(|| panic!("{rule}"));
+        assert_eq!(r.get("accept_epoch"), Some(&Json::Null));
+        assert_eq!(r.get("enforce_epoch"), Some(&Json::Null));
+        assert_eq!(r.get("accepted"), Some(&Json::Bool(false)));
+        assert_eq!(r.get("required"), Some(&Json::Bool(false)));
+    }
 }
 
 #[test]

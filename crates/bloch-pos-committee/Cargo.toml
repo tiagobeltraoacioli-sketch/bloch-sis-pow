@@ -38,6 +38,12 @@ devnet-l2-user-txs = ["devnet-l2-deposits"]
 # running network. The node refuses the Genesis-4 mainnet manifest and any
 # manifest with a carryover. Never ship it.
 l2-activation-rehearsal = []
+# REHEARSAL BUILDS ONLY (GIP-0002: network-bound transfer signing and the
+# delegation commission cap). Arms both dual-acceptance windows at the
+# compile-time values of BLOCH_WALLET_CONSENSUS_ACCEPT_EPOCH and
+# BLOCH_WALLET_CONSENSUS_ENFORCE_EPOCH. The node refuses the Genesis-4
+# mainnet manifest and any manifest with a carryover. Never ship it.
+wallet-consensus-rehearsal = []
 # QUALIFICATION BUILDS ONLY: the rehearsal above, installing the approved
 # mainnet policy values (chain id 700770, async, mainnet limits, attestor set)
 # instead of the development ones. Final qualification only. Never ship it.

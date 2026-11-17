@@ -578,6 +578,7 @@ impl Index {
                 stake_sat: match tx {
                     PosTransaction::FundedDeposit(d) => d.amount_sat,
                     PosTransaction::FundedDelegate(d) => d.amount_sat,
+                    PosTransaction::FundedDelegateV2(d) => d.request.amount_sat,
                     _ => 0,
                 },
                 l2_escrow_in_sat: match tx {
@@ -957,6 +958,7 @@ fn kind_of(tx: &PosTransaction) -> TxKind {
         PosTransaction::Delegate { .. } => TxKind::Delegate,
         PosTransaction::FundedDeposit(_) => TxKind::FundedDeposit,
         PosTransaction::FundedDelegate(_) => TxKind::FundedDelegate,
+        PosTransaction::FundedDelegateV2(_) => TxKind::FundedDelegateV2,
         PosTransaction::FundedUndelegate(_) => TxKind::FundedUndelegate,
         PosTransaction::FundedDelegationWithdraw(_) => TxKind::FundedDelegationWithdraw,
         PosTransaction::ValidatorCommissionUpdate(_) => TxKind::ValidatorCommissionUpdate,
@@ -1002,6 +1004,15 @@ fn transfer_parts(tx: &PosTransaction) -> (Vec<OutPoint>, Vec<(u64, ScriptHash)>
             d.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
             vec![(d.change.value, d.change.script_hash)], d.tx_bytes, d.tip_millisat_per_gas,
         ),
+        // GIP-0002 (0x1C): the same spend and change as 0x0E; the signed
+        // commission cap has no ledger effect.
+        PosTransaction::FundedDelegateV2(v2) => {
+            let d = &v2.request;
+            (
+                d.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
+                vec![(d.change.value, d.change.script_hash)], d.tx_bytes, d.tip_millisat_per_gas,
+            )
+        }
         // Native L2 bridge transactions spend funding UTXOs and create
         // eUTXOs like a transfer does. The escrowed deposit amount leaves the
         // spendable set (it is L2 inbox state, not an output). Replay
@@ -1070,6 +1081,7 @@ fn created_output_bound(tx: &PosTransaction) -> usize {
         PosTransaction::Transfer { outputs, .. } | PosTransaction::TransferV2 { outputs, .. } => outputs.len(),
         PosTransaction::FundedDeposit(_)
         | PosTransaction::FundedDelegate(_)
+        | PosTransaction::FundedDelegateV2(_)
         | PosTransaction::FundedDelegationWithdraw(_)
         | PosTransaction::Withdraw { .. } => 1,
         // Native L2 bridge: change at vout 0 (deposit, DA); release at vout 0

@@ -2226,7 +2226,253 @@ pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = 2_884;
 /// carrying the new fold first), plus a wallet-facing announcement the
 /// others do not need. Ships INERT at `u64::MAX`;
 /// `sighash_network_binding_gate_is_inert` pins the value.
+///
+/// # Enforcement end of a dual-acceptance window (GIP-0002, WT-03)
+///
+/// This constant is the ENFORCEMENT epoch: from it only the network-bound
+/// root authorises a transfer. [`SIGHASH_NETWORK_BINDING_ACCEPT_EPOCH`]
+/// opens the window before it, in which both roots are accepted, so wallets
+/// and exchanges can move to the bound root before the legacy one is
+/// refused. [`SIGHASH_NETWORK_BINDING_GATE`] is the pair consensus reads.
+#[cfg(not(feature = "wallet-consensus-rehearsal"))]
 pub const SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// Rehearsal builds (`wallet-consensus-rehearsal`) only: the compile-time
+/// enforcement epoch. Such a build refuses funded manifests.
+#[cfg(feature = "wallet-consensus-rehearsal")]
+pub const SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH: u64 =
+    parse_wallet_consensus_epoch(env!("BLOCH_WALLET_CONSENSUS_ENFORCE_EPOCH"));
+
+/// First epoch at which a transfer signed over the network-bound root
+/// (`DS_SPEND2 ‖ genesis-manifest digest ‖ spend root`) is ACCEPTED, next to
+/// the legacy root (GIP-0002, WT-03). `u64::MAX` = INERT.
+///
+/// # What the window is
+///
+/// With `A` this epoch and `E` [`SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH`]:
+///
+/// - `epoch < A`: only the legacy `DS_SPEND` root authorises a transfer,
+///   judged exactly as every release so far (same root, same verifier
+///   calls, in the same order);
+/// - `A <= epoch < E`: a transfer is authorised under ONE root, chosen by
+///   its first witness: the bound root if that witness verifies under it,
+///   otherwise the legacy root. Every witness must verify under that root.
+///   A state without a committed network domain accepts the legacy root
+///   only;
+/// - `epoch >= E`: only the bound root; a state without a network domain
+///   refuses every transfer (`TransferReject::MissingNetworkBinding`).
+///
+/// A transfer signed over the bound root is not valid on any other network
+/// from `A` on, whatever that network runs: a network with another genesis
+/// manifest derives another bound root, and a network that never arms the
+/// gate checks the legacy root. A transfer signed over the legacy root stays
+/// replayable until `E` on this network.
+///
+/// The root is a property of the witness, not of the encoding: tags `0x01`
+/// and `0x06` keep their bytes, and `txid` is still taken over the
+/// witness-free spend root, so an output key does not depend on which root
+/// was signed.
+///
+/// The gate reads `CommittedState::epoch` (the judged block's own epoch).
+/// Arming is an owner decision and a wallet-facing announcement; see
+/// `gips/GIP-0002.md`. `sighash_network_binding_window_is_inert` pins the
+/// value.
+#[cfg(not(feature = "wallet-consensus-rehearsal"))]
+pub const SIGHASH_NETWORK_BINDING_ACCEPT_EPOCH: u64 = u64::MAX;
+/// Rehearsal builds (`wallet-consensus-rehearsal`) only.
+#[cfg(feature = "wallet-consensus-rehearsal")]
+pub const SIGHASH_NETWORK_BINDING_ACCEPT_EPOCH: u64 =
+    parse_wallet_consensus_epoch(env!("BLOCH_WALLET_CONSENSUS_ACCEPT_EPOCH"));
+
+/// A rule introduced through a dual-acceptance window: the new form is
+/// accepted from `accept_epoch`, the old form is refused from
+/// `enforce_epoch`. `u64::MAX` in either field is "never", also at epoch
+/// `u64::MAX` (the sentinel rule of [`epoch_gate_active`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DualAcceptanceGate {
+    pub accept_epoch: u64,
+    pub enforce_epoch: u64,
+}
+
+impl DualAcceptanceGate {
+    /// Both ends inert: only the old form, forever.
+    pub const INERT: Self = Self { accept_epoch: u64::MAX, enforce_epoch: u64::MAX };
+
+    /// Whether the new form is valid in `epoch`. Enforcement implies it, so
+    /// a schedule can never require a form it does not accept.
+    pub const fn accepted(&self, epoch: u64) -> bool {
+        epoch_gate_active(epoch, self.accept_epoch) || self.enforced(epoch)
+    }
+
+    /// Whether the old form is refused in `epoch`.
+    pub const fn enforced(&self, epoch: u64) -> bool {
+        epoch_gate_active(epoch, self.enforce_epoch)
+    }
+
+    /// Enforcement is inert, or acceptance is armed at least `window` epochs
+    /// before it.
+    pub const fn coherent(&self, window: u64) -> bool {
+        self.enforce_epoch == u64::MAX
+            || (self.accept_epoch != u64::MAX
+                && self.accept_epoch.saturating_add(window) <= self.enforce_epoch)
+    }
+}
+
+/// Shortest dual-acceptance window a release may ship: 90 epochs, one day at
+/// 16 minutes per epoch. It is a floor against arming both ends at once by
+/// mistake, not the recommended length (GIP-0002 recommends 630 epochs, one
+/// week).
+pub const DUAL_ACCEPTANCE_MIN_EPOCHS: u64 = 90;
+
+/// The network-bound transfer signing schedule this binary was built with.
+pub const SIGHASH_NETWORK_BINDING_GATE: DualAcceptanceGate = DualAcceptanceGate {
+    accept_epoch: SIGHASH_NETWORK_BINDING_ACCEPT_EPOCH,
+    enforce_epoch: SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH,
+};
+
+#[cfg(not(feature = "wallet-consensus-rehearsal"))]
+const _: () = assert!(
+    SIGHASH_NETWORK_BINDING_GATE.coherent(DUAL_ACCEPTANCE_MIN_EPOCHS),
+    "network-bound transfer signing must be accepted at least DUAL_ACCEPTANCE_MIN_EPOCHS before it is enforced"
+);
+#[cfg(feature = "wallet-consensus-rehearsal")]
+const _: () = assert!(SIGHASH_NETWORK_BINDING_GATE.coherent(1));
+
+/// The schedule consensus reads for network-bound transfer signing. Test
+/// builds may arm a rehearsal schedule on the current thread
+/// ([`wallet_consensus_rehearsal`]); shipped binaries cannot.
+pub fn sighash_network_binding_gate() -> DualAcceptanceGate {
+    #[cfg(test)]
+    {
+        if rehearsal::sighash_network_binding_gate_forced_open() {
+            return DualAcceptanceGate { accept_epoch: 0, enforce_epoch: 0 };
+        }
+        if let Some(gate) = wallet_consensus_rehearsal::sighash() {
+            return gate;
+        }
+    }
+    SIGHASH_NETWORK_BINDING_GATE
+}
+
+/// First epoch at which a funded delegation that pins the validator's
+/// commission (`FundedDelegateV2`, tag `0x1C`) is ACCEPTED (GIP-0002,
+/// WT-04). `u64::MAX` = INERT: the tag is refused, exactly as a binary that
+/// does not decode it refuses it.
+///
+/// # The defect
+///
+/// `FundedDelegate` (tag `0x0E`) names a validator and an amount and nothing
+/// about its terms. A validator with no delegation behind it may raise its
+/// commission at any time, so it can raise it to 100% between the moment a
+/// delegator signs and the block that admits the request. From admission on
+/// the raise is refused (`CommissionIncreaseWithDelegations`), but by then
+/// the delegator is bonded at the new rate and leaving takes the cool-down
+/// and the withdrawal delay.
+///
+/// # The rule
+///
+/// `FundedDelegateV2` carries `max_commission_bps` inside the signed intent.
+/// Admission refuses it (`CommissionAboveCap`) when the validator's committed
+/// commission is above that value in the block that would admit it; nothing
+/// is spent and the request can be re-signed. The commission then cannot
+/// rise while the position exists (the existing rule), so the signed value
+/// bounds the rate for the whole life of the position.
+///
+/// With `A` this epoch and `E` [`DELEGATION_COMMISSION_CAP_ENFORCE_EPOCH`]:
+/// below `A` only `0x0E` is valid; in `[A, E)` both; from `E` only `0x1C`
+/// (`0x0E` is refused with `CommissionCapRequired`). Positions created by
+/// `0x0E` are not touched at either epoch.
+///
+/// Arming is an owner decision; see `gips/GIP-0002.md`.
+/// `delegation_commission_cap_window_is_inert` pins the value.
+#[cfg(not(feature = "wallet-consensus-rehearsal"))]
+pub const DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH: u64 = u64::MAX;
+/// Rehearsal builds (`wallet-consensus-rehearsal`) only.
+#[cfg(feature = "wallet-consensus-rehearsal")]
+pub const DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH: u64 =
+    parse_wallet_consensus_epoch(env!("BLOCH_WALLET_CONSENSUS_ACCEPT_EPOCH"));
+
+/// First epoch at which a funded delegation WITHOUT a signed commission cap
+/// (`FundedDelegate`, tag `0x0E`) is refused (GIP-0002, WT-04).
+/// `u64::MAX` = INERT. See [`DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH`].
+#[cfg(not(feature = "wallet-consensus-rehearsal"))]
+pub const DELEGATION_COMMISSION_CAP_ENFORCE_EPOCH: u64 = u64::MAX;
+/// Rehearsal builds (`wallet-consensus-rehearsal`) only.
+#[cfg(feature = "wallet-consensus-rehearsal")]
+pub const DELEGATION_COMMISSION_CAP_ENFORCE_EPOCH: u64 =
+    parse_wallet_consensus_epoch(env!("BLOCH_WALLET_CONSENSUS_ENFORCE_EPOCH"));
+
+/// The delegation commission-cap schedule this binary was built with.
+pub const DELEGATION_COMMISSION_CAP_GATE: DualAcceptanceGate = DualAcceptanceGate {
+    accept_epoch: DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH,
+    enforce_epoch: DELEGATION_COMMISSION_CAP_ENFORCE_EPOCH,
+};
+
+#[cfg(not(feature = "wallet-consensus-rehearsal"))]
+const _: () = assert!(
+    DELEGATION_COMMISSION_CAP_GATE.coherent(DUAL_ACCEPTANCE_MIN_EPOCHS),
+    "the delegation commission cap must be accepted at least DUAL_ACCEPTANCE_MIN_EPOCHS before it is required"
+);
+#[cfg(feature = "wallet-consensus-rehearsal")]
+const _: () = assert!(DELEGATION_COMMISSION_CAP_GATE.coherent(1));
+// The capped request is a funded delegation: it cannot precede the feature.
+#[cfg(not(feature = "wallet-consensus-rehearsal"))]
+const _: () = assert!(gate_is_inert_or_not_before(
+    DELEGATION_COMMISSION_CAP_ACCEPT_EPOCH,
+    FUNDED_DELEGATION_ACTIVATION_EPOCH
+));
+
+/// The schedule consensus reads for the delegation commission cap. Test
+/// builds may arm a rehearsal schedule on the current thread.
+pub fn delegation_commission_cap_gate() -> DualAcceptanceGate {
+    #[cfg(test)]
+    if let Some(gate) = wallet_consensus_rehearsal::commission_cap() {
+        return gate;
+    }
+    DELEGATION_COMMISSION_CAP_GATE
+}
+
+/// Thread-local rehearsal schedules for the two GIP-0002 gates, so tests can
+/// drive the window and its two boundaries at small epochs. `cfg(test)` only.
+#[cfg(test)]
+pub(crate) mod wallet_consensus_rehearsal {
+    use super::DualAcceptanceGate;
+    use std::cell::Cell;
+    thread_local! {
+        static SIGHASH: Cell<Option<DualAcceptanceGate>> = const { Cell::new(None) };
+        static COMMISSION_CAP: Cell<Option<DualAcceptanceGate>> = const { Cell::new(None) };
+    }
+    pub fn sighash() -> Option<DualAcceptanceGate> { SIGHASH.with(Cell::get) }
+    pub fn commission_cap() -> Option<DualAcceptanceGate> { COMMISSION_CAP.with(Cell::get) }
+    /// Arm the transfer-signing schedule on this thread until the guard
+    /// drops (also on unwind).
+    pub fn arm_sighash(accept_epoch: u64, enforce_epoch: u64) -> impl Drop {
+        struct Restore(Option<DualAcceptanceGate>);
+        impl Drop for Restore { fn drop(&mut self) { SIGHASH.with(|c| c.set(self.0)); } }
+        Restore(SIGHASH.with(|c| c.replace(Some(DualAcceptanceGate { accept_epoch, enforce_epoch }))))
+    }
+    /// Arm the commission-cap schedule on this thread until the guard drops.
+    pub fn arm_commission_cap(accept_epoch: u64, enforce_epoch: u64) -> impl Drop {
+        struct Restore(Option<DualAcceptanceGate>);
+        impl Drop for Restore { fn drop(&mut self) { COMMISSION_CAP.with(|c| c.set(self.0)); } }
+        Restore(COMMISSION_CAP.with(|c| c.replace(Some(DualAcceptanceGate { accept_epoch, enforce_epoch }))))
+    }
+}
+
+/// Parse a rehearsal epoch given at compile time (decimal, `1..u64::MAX`).
+#[cfg(feature = "wallet-consensus-rehearsal")]
+const fn parse_wallet_consensus_epoch(text: &str) -> u64 {
+    let bytes = text.as_bytes();
+    assert!(!bytes.is_empty(), "BLOCH_WALLET_CONSENSUS_*_EPOCH is empty");
+    let mut value: u64 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        assert!(bytes[i].is_ascii_digit(), "BLOCH_WALLET_CONSENSUS_*_EPOCH must be decimal");
+        value = value * 10 + (bytes[i] - b'0') as u64;
+        i += 1;
+    }
+    assert!(value >= 1 && value < u64::MAX, "rehearsal epoch out of range");
+    value
+}
 
 /// Flag day for the platform-independent ML-DSA-65 verification rule
 /// (HF2 sigdet; audit e9b52781 MED "ML-DSA verify backend CPU-dependent").
