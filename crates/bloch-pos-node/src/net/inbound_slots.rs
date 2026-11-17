@@ -413,7 +413,8 @@ impl<H: Close> Slots<H> {
         self.entries.len()
     }
 
-    #[cfg(test)]
+    /// Is `ip`'s source currently vouched for? Also asked at accept by the
+    /// handshake rate limiter (`handshake_rate`, review R-07).
     pub(super) fn is_vouched(&self, ip: IpAddr) -> bool {
         self.source_vouched(crate::connection_limit::limit_key(ip), Instant::now())
     }

@@ -126,6 +126,7 @@ pub const FRAME_GET_BLOCKS: u8 = 0x03;
 pub const FRAME_TX: u8 = 0x04;
 
 pub use crate::p2p::{Origin, Verdict};
+mod handshake_rate;
 mod inbound_slots;
 mod source_budget;
 pub(crate) mod rejection_log;
@@ -286,6 +287,9 @@ impl Net {
     /// has not judged — is one this node does not forward. The devnet mesh has
     /// no such notion and drops it.
     pub fn report(&self, origin: &Origin, verdict: Verdict) {
+        // Bloch Sentinel: count rejected/ignored per source (node-local,
+        // observe-only; a no-op unless enabled).
+        crate::sentinel::note_verdict(origin.verification_source(), verdict);
         // The devnet mesh keeps no score, but it does remember which source
         // addresses delivered something the engine verified (W4-1); a no-op
         // for every origin that carries no [`DeliveryProof`].
@@ -2256,6 +2260,8 @@ pub fn start(
         let configured = configured.clone();
         let spawn_health = spawn_health.clone();
         spawn_essential("mesh-accept", move || {
+            // Audit L1-04: only this loop admits, so the limiter needs no lock.
+            let mut handshake_rate = handshake_rate::HandshakeRate::new(Instant::now());
             for conn in listener.incoming() {
                 let Ok(sock) = conn else {
                     // Out of descriptors, typically, and the connection is
@@ -2263,6 +2269,7 @@ pub fn start(
                     thread::sleep(Duration::from_millis(50));
                     continue;
                 };
+                crate::sentinel::note_inbound_attempt(&sock);
                 // A quiet mesh may never broadcast. Prune on accept too, so
                 // connection churn cannot retain one dead sender per dial.
                 match inbound.lock() {
@@ -2284,15 +2291,37 @@ pub fn start(
                     .ok()
                     .and_then(|peers| peers.get(&crate::connection_limit::limit_key(address.ip())).copied())
                     .unwrap_or(0);
+                // Bloch Sentinel: a banned, non-configured source is closed
+                // here, before any slot or thread (a no-op unless enabled).
+                if crate::sentinel::refuse_inbound(address.ip(), peers_here > 0) {
+                    continue;
+                }
                 // This loop is the only thing that adds slots, so the count
                 // cannot grow between this read and the admission below.
-                let held = match slots.lock() {
-                    Ok(slots) => slots.configured_held(address.ip()),
+                let (held, vouched) = match slots.lock() {
+                    Ok(slots) => (slots.configured_held(address.ip()), slots.is_vouched(address.ip())),
                     // W4-3: every later connection would be refused too.
                     Err(_) => panic!("mesh: the inbound slot table lock is poisoned"),
                 };
                 let standing = inbound_slots::Standing::for_source(peers_here, held);
                 let is_configured = standing.is_configured();
+                // Audit L1-04: the handshake below costs an ML-KEM
+                // encapsulation and an ML-DSA-65 signature before the dialer
+                // has proven anything. Bound how fast strangers can buy it,
+                // per source and (strangers only) in total, before a slot is
+                // taken or a thread spawned. The operator's own peers are
+                // exempt, and a source the slot table vouches for is bound
+                // by its own bucket only (review R-07).
+                let dialer = if is_configured {
+                    handshake_rate::Dialer::Configured
+                } else if vouched {
+                    handshake_rate::Dialer::Vouched
+                } else {
+                    handshake_rate::Dialer::Stranger
+                };
+                if !handshake_rate.admit(address.ip(), dialer, Instant::now()) {
+                    continue;
+                }
                 // The share and, in a full table, eviction are decided here;
                 // see `inbound_slots`. A refusal drops `sock`, closing it.
                 let Some(slot) = InboundSlot::admit(&slots, address.ip(), standing, Instant::now(), evict_handle) else {
@@ -2341,7 +2370,12 @@ pub fn start(
                                 Some(OwnIdentity::SharedIdentityFile) => {
                                     log_identity_conflict("from", &address.to_string(), &e)
                                 }
-                                None => log_refusal("from", &address.to_string(), &e),
+                                None => {
+                                    log_refusal("from", &address.to_string(), &e);
+                                    // Not this node's own dial or identity:
+                                    // a failure of the remote source.
+                                    crate::sentinel::note_handshake_failure(address.ip());
+                                }
                             }
                             return;
                         }
@@ -2513,6 +2547,9 @@ pub fn start(
                 continue;
             };
             let connect_took = dialing.elapsed();
+            if let Ok(address) = sock.peer_addr() {
+                crate::sentinel::note_outbound(address.ip());
+            }
             // Bounded: a name that resolves somewhere new on every dial must
             // not grow this set for the life of the process.
             if let (false, Ok(address), Ok(mut peers)) = (counted_at_start, sock.peer_addr(), configured.lock()) {
@@ -2646,8 +2683,12 @@ pub fn start(
         })?;
     }
 
+    sentinel_view::register(&inbound, &configured);
     Ok(DevnetMesh { listen_addr, peers, sync, inbound, live })
 }
+
+// Bloch Sentinel's window onto the mesh (node-local; see `crate::sentinel`).
+mod sentinel_view;
 
 #[cfg(test)]
 mod tests {

@@ -64,6 +64,7 @@ mod mesh_pq;
 mod net;
 mod p2p;
 mod rpc;
+mod sentinel;
 mod slashprot;
 mod signer_anchor;
 mod slashing_cli;
@@ -1067,6 +1068,12 @@ fn reject_block_root_args(args: &[String]) -> Result<Vec<String>, String> {
             let value = rest.next().ok_or("--reject-block-root needs a 64-hex-digit block id")?;
             engine::parse_reject_block_root(value)?;
             roots.push(value.clone());
+        } else if let Some(value) = arg.strip_prefix("--reject-block-root=") {
+            // Audit L1-11: the `=` form used to be skipped as an unknown
+            // `--flag=value` token, so the node booted with no root armed.
+            // A safety control operated during a split is never ignored.
+            engine::parse_reject_block_root(value)?;
+            roots.push(value.to_string());
         } else if arg.starts_with("--") && !RUN_SWITCHES.contains(&arg.as_str()) && !arg.contains('=') {
             rest.next();
         }
@@ -1088,6 +1095,8 @@ const RUN_SWITCHES: &[&str] = &[
     "--acknowledge-missing-slashing-protection",
     "--replay-from-genesis",
     "--require-state-cache",
+    "--security-status",
+    "--security-status-remote",
 ];
 
 /// Validate the metrics listener's exposure posture before the engine starts.
@@ -2144,6 +2153,15 @@ fn run_cmd(args: &[String]) {
         eprintln!("run: --mesh-require-authenticated needs --mesh-security require");
         exit(2);
     }
+    // Bloch Sentinel hooks (docs/SENTINEL-HOOKS.md): node-local, OFF unless
+    // one of these flags is given. Started here, before the engine, so a bad
+    // flag, path or socket stops the boot.
+    let sentinel_rpc_bind = rpc_port.map(|_| arg_value(args, "--rpc-bind").unwrap_or_else(|| "127.0.0.1".to_string()));
+    let sentinel_cfg = sentinel::Config::from_args(args, peers.clone(), csv("--p2p-peer"), sentinel_rpc_bind.as_deref());
+    if let Err(e) = sentinel_cfg.and_then(sentinel::start) {
+        eprintln!("run: {e}");
+        exit(2);
+    }
     let cfg = engine::Config {
         data_dir: PathBuf::from(data_dir),
         genesis_path: PathBuf::from(genesis_path),
@@ -2505,6 +2523,27 @@ mod reject_block_root_flag_tests {
         }
         let short = "ab".repeat(31);
         assert!(super::reject_block_root_args(&args(&["run", "--reject-block-root", &short])).is_err());
+    }
+
+    /// Audit L1-11: `--reject-block-root=<hex>` arms the root (it used to be
+    /// skipped in silence), strictly, and mixes with the spaced form.
+    #[test]
+    fn the_equals_form_is_honoured_and_strict() {
+        let a = "ab".repeat(32);
+        let b = "CD".repeat(32);
+        assert_eq!(
+            super::reject_block_root_args(&args(&["run", &format!("--reject-block-root={a}")])).unwrap(),
+            vec![a.clone()],
+        );
+        assert_eq!(
+            super::reject_block_root_args(&args(&[
+                "run", &format!("--reject-block-root={a}"), "--reject-block-root", &b,
+            ])).unwrap(),
+            vec![a.clone(), b.clone()],
+        );
+        for bad in ["--reject-block-root=", "--reject-block-root=zz", "--reject-block-root=0xab"] {
+            assert!(super::reject_block_root_args(&args(&["run", bad])).is_err(), "{bad}");
+        }
     }
 }
 

@@ -2689,3 +2689,76 @@ fn head_reset_json_and_log_line_name_a_refused_reset() {
     assert_eq!(field(&head_reset_json(&other), "refusal"), Json::s("forced_log"));
     assert!(head_reset_log_line(&other, 1).ends_with("reason: forced_log"));
 }
+
+/// Review RC-05: `getsecuritystatus` is answered only to a DIRECT loopback
+/// caller. A request carrying any forwarding header, or arriving from a
+/// declared trusted proxy, is refused with the plain "method not found" even
+/// when its TCP peer (or the address the proxy forwarded) is loopback,
+/// unless the operator gave `--security-status-remote`.
+#[test]
+fn a_status_request_through_any_proxy_is_refused() {
+    use crate::sentinel::{test_sentinel, with_test_sentinel, Config};
+    for relay in ["X-Forwarded-For", "forwarded", "X-REAL-IP", "Via", "x-forwarded-proto", "CF-Connecting-IP"] {
+        assert!(is_relay_header(relay), "{relay}");
+    }
+    for plain in ["Host", "Content-Type", "Origin", "User-Agent", "X-Forwarded"] {
+        assert!(!is_relay_header(plain), "{plain}");
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let backend = EngineBackend::new(tx);
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"getsecuritystatus","params":[]}"#;
+    let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+    let not_found = envelope(Json::Num("1".into()), Err(RpcError::method_not_found("getsecuritystatus")));
+    let local = test_sentinel(Config { status: true, ..Default::default() });
+    with_test_sentinel(local, || {
+        let direct = handle_body_from(body, &backend, Some((loopback, &|| false, false)));
+        assert!(direct.contains("\"result\""), "a direct loopback caller is answered: {direct}");
+        let relayed = handle_body_from(body, &backend, Some((loopback, &|| false, true)));
+        assert_eq!(relayed, not_found, "a relayed loopback caller is not");
+        assert_eq!(security_status_for_relayed(), Err(RpcError::method_not_found("getsecuritystatus")));
+    });
+    let remote = test_sentinel(Config { status: true, allow_remote_status: true, ..Default::default() });
+    with_test_sentinel(remote, || {
+        let relayed = handle_body_from(body, &backend, Some((loopback, &|| false, true)));
+        assert!(relayed.contains("\"result\""), "the operator opted in: {relayed}");
+    });
+    // Sentinel off: the same answer as a node that never had it.
+    assert_eq!(security_status_for_relayed(), Err(RpcError::method_not_found("getsecuritystatus")));
+    assert!(rx.try_recv().is_err(), "nothing was queued for the consensus thread");
+}
+
+/// The header scan reports a forwarding header to `on_head`, and only then.
+#[test]
+fn the_request_head_reports_forwarding_headers() {
+    let read = |extra: &str| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"getblockcount"}"#;
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+            addr.port(),
+            body.len()
+        );
+        let writer = std::thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.write_all(request.as_bytes()).unwrap();
+            client
+        });
+        let (mut sock, _) = listener.accept().unwrap();
+        let hosts = HostPolicy::with_extra("127.0.0.1", None);
+        let mut seen = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let out = read_request_attributed(&mut sock, &hosts, deadline, &mut |_, relayed| {
+            seen = Some(relayed);
+            Ok(())
+        });
+        drop(writer.join());
+        assert!(out.is_ok(), "the request is read");
+        seen.expect("on_head ran")
+    };
+    assert!(!read(""), "no forwarding header");
+    assert!(read("Via: 1.1 proxy\r\n"));
+    assert!(read("Forwarded: for=127.0.0.1\r\n"));
+    assert!(read("X-Forwarded-For: 127.0.0.1\r\n"));
+}

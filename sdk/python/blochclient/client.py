@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import socket
+import urllib.parse
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Union
@@ -32,6 +34,38 @@ def _trim_optionals(pairs: List[Any]) -> List[Any]:
     return [v for v, _ in items]
 
 
+def _check_key_transport(url: str, allow_insecure_http: bool, method: str) -> None:
+    """L1M-18: refuse to send an API key over plaintext http:// to a host that
+    is not loopback (it would cross the network in the clear)."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme == "https" or allow_insecure_http:
+        return
+    host = (parts.hostname or "").lower()
+    if host == "localhost":
+        return
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return
+    except ValueError:
+        pass
+    raise BlochTransportError(
+        f"refusing to send the API key over {parts.scheme or '?'}:// to non-loopback host "
+        f"{host!r}; use https:// or pass allow_insecure_http=True",
+        method=method,
+    )
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """L1M-18: a request that carries the API key never follows a redirect
+    (urllib would resend the key header, e.g. on an https -> http downgrade)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 class BlochClient:
     """A typed client for the Bloch JSON-RPC surface.
 
@@ -48,8 +82,10 @@ class BlochClient:
         bearer: bool = False,
         timeout: float = 30.0,
         headers: Optional[Dict[str, str]] = None,
+        allow_insecure_http: bool = False,
     ) -> None:
         self.url = url
+        self.allow_insecure_http = allow_insecure_http
         self.api_key = api_key
         self.bearer = bearer
         self.timeout = timeout
@@ -64,6 +100,7 @@ class BlochClient:
         headers = {"Content-Type": "application/json"}
         headers.update(self.static_headers)
         if self.api_key is not None:
+            _check_key_transport(self.url, self.allow_insecure_http, method)
             if self.bearer:
                 headers["Authorization"] = f"Bearer {self.api_key}"
             else:
@@ -72,7 +109,8 @@ class BlochClient:
         status = 0
         raw = b""
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            opener = _NO_REDIRECT_OPENER.open if self.api_key is not None else urllib.request.urlopen
+            with opener(req, timeout=self.timeout) as resp:
                 status = getattr(resp, "status", resp.getcode())
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
@@ -86,6 +124,12 @@ class BlochClient:
             raise BlochTransportError(
                 f"RPC transport error calling {method}: {exc}", method=method
             ) from exc
+        if self.api_key is not None and 300 <= status < 400:
+            raise BlochTransportError(
+                f"RPC {method}: redirect refused (HTTP {status}); the API key is not forwarded",
+                method=method,
+                http_status=status,
+            )
         try:
             parsed = json.loads(raw.decode("utf-8")) if raw else None
         except (ValueError, UnicodeDecodeError) as exc:

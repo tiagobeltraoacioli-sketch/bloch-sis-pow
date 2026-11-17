@@ -31,6 +31,18 @@ ignore = [
     "RUSTSEC-2026-0166", # pqcrypto-mldsa   unmaintained (PQClean archived)
     "RUSTSEC-2026-0162", # pqcrypto-traits  unmaintained (PQClean archived)
     "RUSTSEC-2024-0381", # pqcrypto-kyber   superseded by pqcrypto-mlkem (transitive)
+    "RUSTSEC-2026-0161", # pqcrypto-mlkem 0.1.1 unmaintained (PQClean archived) —
+                         # EXCEPTION added 2026-11-14 (finding L1M-06), re-review
+                         # by 2027-02-14. informational=unmaintained, patched=[]:
+                         # no fixed release exists. Used only by the optional
+                         # hybrid mesh transport (bloch-pos-node src/mesh_pq.rs,
+                         # `--mesh-security offer|require`, default `plain`),
+                         # where ML-KEM-768 is combined with X25519 under HKDF,
+                         # so a KEM defect alone does not expose session keys;
+                         # never a consensus input. Same disposition as the
+                         # pqcrypto-mldsa/falcon wrappers above. REMOVE by
+                         # migrating to the RustCrypto `ml-kem` crate (not
+                         # available offline on 2026-11-14) after a KAT review.
     # ── Transitive, no first-party call path ──────────────────────────────
     "RUSTSEC-2025-0141", # bincode 1.3.3 unmaintained — first-party restart cache;
                          # checksummed, build-bound and validated on restore.
@@ -86,6 +98,49 @@ ignore = [
     # Documented as an OPEN finding in SECURITY_TOOLING.md — accepted, not dismissed.
     "RUSTSEC-2026-0118", # hickory-proto NSEC3 closest-encloser unbounded loop (DoS)
     "RUSTSEC-2026-0119", # hickory-proto O(n^2) name compression CPU exhaustion (DoS)
+    # ── EXCEPTIONS added 2026-11-15 (L1M-17, node release candidate after
+    # 84040ce0), re-review by 2027-02-14. Same entries and rationale as
+    # .cargo/audit.toml (that file carries the per-id notes) and
+    # osv-scanner.toml. The same pass FIXED by in-semver Cargo.lock bumps what
+    # reaches bloch-pos and has a compatible patch: libp2p-gossipsub 0.49.5
+    # (RUSTSEC-2026-0536), tokio 1.53.3 (RUSTSEC-2026-0386), rustix 1.1.6.
+    #
+    # (A) Compiled into bloch-pos but NOT reachable on the mainnet
+    # configuration: the libp2p swarm (gossipsub, libp2p-dns/hickory) is built
+    # only under `--transport libp2p|dual`; the default and the whole fleet run
+    # `--transport devnet`. MUST be fixed before any production unit runs
+    # libp2p or dual. gossipsub -0534 is fixed only in 0.50.1 (libp2p 0.57,
+    # breaking) — fix path is a vendored backport of rust-libp2p#6707, like
+    # crates/libp2p-yamux. hickory: fix is >= 0.26.2, libp2p-dns 0.44 pins 0.25;
+    # the node resolves only operator-written /dns* --p2p-peer addresses,
+    # hickory is built without DNSSEC features (eight of these are DNSSEC-only)
+    # and the text/zone-file parsers are not on the wire path.
+    "RUSTSEC-2026-0534", # libp2p-gossipsub PRUNE unknown-topic backoff state
+    "RUSTSEC-2026-0487", # hickory-proto SVCB alpn text-parse panic
+    "RUSTSEC-2026-0489", # hickory-proto SVCB quote text-parse panic
+    "RUSTSEC-2026-0490", # hickory-proto zone-file lexer panic
+    "RUSTSEC-2026-0491", # hickory-proto header record-count memory amplification
+    "RUSTSEC-2026-0504", # hickory-proto DNSSEC NSEC3 comparison
+    "RUSTSEC-2026-0505", # hickory-proto DNSSEC NSEC3 owner names
+    "RUSTSEC-2026-0511", # hickory-proto DNSSEC NXDOMAIN empty non-terminal
+    "RUSTSEC-2026-0512", # hickory-proto DNSSEC unrelated signed RRset
+    "RUSTSEC-2026-0530", # hickory-proto DNSSEC parent-side NSEC at zone cut
+    "RUSTSEC-2026-0531", # hickory-proto DNSSEC child-side NSEC/NSEC3 for DS
+    "RUSTSEC-2026-0532", # hickory-proto DNSSEC parent-side NSEC3 at zone cut
+    "RUSTSEC-2026-0514", # hickory-resolver lookup() hides DNSSEC failures
+    # (B) NOT in the bloch-pos dependency graph (`cargo tree -p bloch-pos-node
+    # --features ws-release-anchor --target x86_64-unknown-linux-gnu -e
+    # normal,build`): legacy Genesis-3 node, reqwest TLS in tools. In-semver
+    # patches exist; bumping them is deferred so the release lockfile delta
+    # stays minimal.
+    "RUSTSEC-2026-0346", # rustls session Debug exposes secrets   (>=0.23.46)
+    "RUSTSEC-2026-0347", # rustls ECH rejection buffered data     (>=0.23.46)
+    "RUSTSEC-2026-0348", # rustls Brotli cert decompression       (>=0.23.46)
+    "RUSTSEC-2026-0349", # rustls ServerHello key-share downgrade (>=0.23.46)
+    "RUSTSEC-2026-0382", # rustls-webpki distrusted intermediates (>=0.103.16)
+    "RUSTSEC-2026-0381", # webpki-roots distrusted emSign roots   (>=1.0.10)
+    "RUSTSEC-2026-0410", # zstd-sys wasm allocator shim (legacy rocksdb, not wasm)
+    "RUSTSEC-2026-0418", # libz-sys build-script env leak (build host only)
 ]
 
 [bans]
@@ -131,6 +186,11 @@ skip = [
     { crate = "bitcoin_hashes@=0.13.1" },
     { crate = "block-buffer@=0.9.0" },
     { crate = "block-buffer@=0.10.4" },
+    # L1M-06 (2026-11-14): cpufeatures 0.2 (RustCrypto aes/sha2/... ) vs 0.3
+    # (blake3 1.8.5 via sp1-verifier 6.8.0 -> bloch-l2-proof); CPU feature
+    # detection only, no shared surface. Unifying means moving blake3 under the
+    # consensus-pinned SP1 verifier, which is not a cargo update.
+    { crate = "cpufeatures@=0.2.17" },
     { crate = "digest@=0.9.0" },
     { crate = "digest@=0.10.7" },
     { crate = "getrandom@=0.2.17" },
@@ -139,6 +199,9 @@ skip = [
     { crate = "hashbrown@=0.15.5" },
     { crate = "hashlink@=0.9.1" },
     { crate = "hex-conservative@=0.1.2" },
+    # L1M-06 (2026-11-14): itertools 0.12 (bindgen 0.69, rocksdb build of the
+    # frozen Genesis-3 node) vs 0.13 (bindgen 0.72, zstd-sys); build scripts only.
+    { crate = "itertools@=0.12.1" },
     { crate = "r-efi@=5.3.0" },
     { crate = "rand@=0.8.6" },
     { crate = "rand@=0.9.4" },
@@ -152,6 +215,9 @@ skip = [
     { crate = "secp256k1-sys@=0.10.1" },
     { crate = "sha2@=0.9.9" },
     { crate = "socket2@=0.5.10" },
+    # L1M-06 (2026-11-14): syn 2 (ecosystem) vs syn 3 (bytemuck_derive 1.12 via
+    # substrate-bn-succinct-rs -> sp1-verifier 6.8.0); proc-macros, compile time only.
+    { crate = "syn@=2.0.117" },
     { crate = "thiserror@=1.0.69" },
     { crate = "thiserror-impl@=1.0.69" },
     { crate = "unsigned-varint@=0.7.2" },
@@ -232,6 +298,18 @@ name = "bloch-btc-wallet"
 allow = ["AGPL-3.0-or-later"]
 [[licenses.exceptions]]
 name = "bloch-pq-vault"
+allow = ["AGPL-3.0-or-later"]
+
+# L1M-06 (2026-11-14): first-party AGPL members that were missing, which made
+# `cargo deny check licenses` fail on HEAD.
+[[licenses.exceptions]]
+name = "bloch-finality-cert"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "bloch-l2-proof"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "bloch-mldsa-clean"
 allow = ["AGPL-3.0-or-later"]
 
 # Genesis-3, proof of work — closed, kept buildable for audit.

@@ -2,6 +2,13 @@
 
 # Running your own Bloch Genesis-4 node
 
+**September 26 update:** use the [current public observer guide](PUBLIC-OBSERVER-2026-09-26.md)
+and [epoch-3328 checkpoint package](../checkpoints/epoch-3328/README.md) for a new
+installation. The envelope is signed and fresh at publication, with independent
+custody explicitly unverified. It expires for initial synchronization at epoch
+5344, October 12 at 06:35:19 UTC. The September 1/6 measurements and unsigned
+checkpoint status below are historical; they are not current bootstrap steps.
+
 For an exchange, custodian, or anyone who needs their **own** validated view of
 the chain rather than someone else's RPC endpoint. Everything below was run
 end to end against the live chain on 2026-09-01; where a step has a limit or a

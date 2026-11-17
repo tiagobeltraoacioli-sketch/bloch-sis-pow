@@ -76,6 +76,15 @@ pub const MAX_VOTES_PER_LINK: usize = 1 << 16;
 pub const MAX_SIG_BYTES: usize = 16 * 1024;
 pub const MAX_RECORD_BYTES: usize = 64 * 1024;
 pub const MAX_ANCESTRY: usize = 4096;
+
+/// Smallest encodings of one list entry (L1M-05): a registry record is a
+/// `u32` length, its bytes and a proof (32-byte bitmap at least); an absence
+/// is a `u32` index and a proof; a vote is validator, slot, head and a `u32`
+/// signature length.
+const MIN_PROOF_BYTES: usize = 32;
+const MIN_RECORD_ENTRY: usize = 4 + MIN_PROOF_BYTES;
+const MIN_ABSENT_ENTRY: usize = 4 + MIN_PROOF_BYTES;
+const MIN_VOTE_ENTRY: usize = 4 + 8 + 32 + 4;
 /// Default for [`TrustAnchors::max_hop_epochs`]: how far (in epochs) a
 /// certificate's target may sit past its set-source block. A registry drifts
 /// (activations, exits) with distance; the weak-subjectivity reasoning is
@@ -250,14 +259,19 @@ impl Certificate {
         }
         let checkpoint_header = r.header()?;
         let set_header = r.header()?;
-        let n = r.count(MAX_RECORDS)?;
+        // L1M-05: every list count is also bounded by the bytes left (each
+        // entry has a fixed minimum size), so a short input cannot make the
+        // decoder pre-allocate for 65 536 entries it does not contain. Valid
+        // inputs decode identically; an over-claim fails "truncated", as it
+        // would have once the reader ran out.
+        let n = r.items(MAX_RECORDS, MIN_RECORD_ENTRY)?;
         let mut records = Vec::with_capacity(n);
         for _ in 0..n {
             let len = r.count(MAX_RECORD_BYTES)?;
             let bytes = r.take(len)?.to_vec();
             records.push((bytes, r.proof()?));
         }
-        let n = r.count(MAX_RECORDS + 1)?;
+        let n = r.items(MAX_RECORDS + 1, MIN_ABSENT_ENTRY)?;
         let mut absent = Vec::with_capacity(n);
         for _ in 0..n {
             let i = r.u32()?;
@@ -268,7 +282,7 @@ impl Certificate {
             let source_root = r.a32()?;
             let target_epoch = r.u64()?;
             let target_root = r.a32()?;
-            let n = r.count(MAX_VOTES_PER_LINK)?;
+            let n = r.items(MAX_VOTES_PER_LINK, MIN_VOTE_ENTRY)?;
             let mut votes = Vec::with_capacity(n);
             for _ in 0..n {
                 let validator = r.u32()?;
@@ -282,7 +296,7 @@ impl Certificate {
         };
         let l0 = link()?;
         let l1 = link()?;
-        let n = r.count(MAX_ANCESTRY)?;
+        let n = r.items(MAX_ANCESTRY, BlockHeaderV4::ENCODED_LEN)?;
         let mut ancestry = Vec::with_capacity(n);
         for _ in 0..n {
             ancestry.push(r.header()?);
@@ -333,6 +347,15 @@ impl<'a> Rd<'a> {
         let n = self.u32()? as usize;
         if n > max {
             return Err(Refusal::Malformed("count over bound"));
+        }
+        Ok(n)
+    }
+    /// A list count bounded by `max` AND by how many `min_item`-byte entries
+    /// the remaining input could hold (L1M-05).
+    fn items(&mut self, max: usize, min_item: usize) -> Result<usize, Refusal> {
+        let n = self.count(max)?;
+        if n > self.0.len() / min_item.max(1) {
+            return Err(Refusal::Malformed("truncated"));
         }
         Ok(n)
     }

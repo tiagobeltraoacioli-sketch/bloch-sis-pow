@@ -110,6 +110,14 @@ Falcon-1024 || ML-DSA-65 signing — see `signer.go` for the `Signer` seam and
 bring your own tx-builder. For write-auth on a non-local node, set
 `client.APIKey` (and optionally `client.Bearer = true`).
 
+**API key transport (breaking change, L1M-18).** With `client.APIKey` set, the
+client refuses to call an `http://` URL whose host is not loopback
+(`127.0.0.0/8`, `::1`, `localhost`) and returns a `*TransportError` before any
+request is made, because the key would cross the network in the clear. Use
+`https://`. If you knowingly run plaintext over a private link (VPN,
+WireGuard), set `client.AllowInsecureHTTP = true`. A request carrying the key
+never follows an HTTP redirect. Key-less reads are unaffected.
+
 ## Regenerating
 
 ```bash

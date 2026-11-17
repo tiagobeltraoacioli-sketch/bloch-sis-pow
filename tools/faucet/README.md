@@ -85,10 +85,30 @@ Copy `.env.example` to `.env` and edit. Key vars:
 | `FAUCET_CHANGE_ADDRESS` | change address (default = funding) |
 | `FAUCET_AMOUNT_SATS` | drip amount in sat (default `100000000` = 1 test BLCH) |
 | `FAUCET_FEE_SATS` | flat fee in sat |
-| `FAUCET_SIGNER_CMD` | external signer command (see above) |
+| `FAUCET_SIGNER_CMD` | external signer command (see above); executed without a shell — plain words or a JSON argv array (`["/usr/local/bin/bloch-wallet","faucet-sign"]`); shell syntax is refused |
 | `FAUCET_DRY_RUN` | `true` (default) uses stub RPC + stub signer, **never broadcasts** |
 | `FAUCET_PER_ADDRESS_WINDOW_MS` | per-address cooldown (default 24h) |
 | `FAUCET_PER_IP_WINDOW_MS` / `FAUCET_PER_IP_MAX` | per-IP window + cap |
+| `FAUCET_TRUSTED_PROXIES` | comma-separated IP literals of your reverse proxies (see below); unset = `X-Forwarded-For` ignored |
+| `FAUCET_TRUST_PROXY` | legacy: `1` = trust a proxy on loopback (`127.0.0.1`, `::1`) |
+
+### Per-IP limit behind a reverse proxy (L1M-02)
+
+By default the faucet keys the per-IP limit on the TCP peer and ignores every
+forwarded header. Behind a proxy, list the proxy's address(es) in
+`FAUCET_TRUSTED_PROXIES`. Only for connections from a listed peer, the faucet
+reads `X-Forwarded-For` **from the right**, skips listed proxies, and uses the
+first other entry; the left-most entry (client-supplied) is never used. A
+missing header or a non-IP entry charges the proxy's own address.
+
+The proxy MUST append, not pass through, the header. nginx:
+
+```nginx
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+```
+
+List every proxy hop you operate, and only addresses nothing hostile can
+connect from.
 
 ## Build & run
 

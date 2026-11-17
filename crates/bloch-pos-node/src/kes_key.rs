@@ -365,18 +365,23 @@ impl KesKey {
         }
         fs::create_dir_all(dir)?;
         let path = dir.join(name);
-        let tmp = dir.join(format!("{name}.tmp"));
+        // Review R-10: a staging file left by a process killed mid-write
+        // holds a seed (after an evolution, one of a period that must be
+        // gone). Destroy any such leftover of this name before writing.
+        scrub_stale_staging(dir, name);
+        // Audit L1-07: an exclusive (`create_new`, 0600 from creation,
+        // never following a planted symlink) staging file under a fresh
+        // name, never the predictable `<name>.tmp` another local account
+        // could pre-create with a looser mode or point elsewhere.
+        let mut staging = crate::store::PrivateStagingFile::create_for(&path)?;
         {
             use std::io::Write;
-            #[cfg(unix)]
-            let mut f = {
-                use std::os::unix::fs::OpenOptionsExt;
-                fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?
-            };
-            #[cfg(not(unix))]
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(&out)?;
-            f.sync_all()?;
+            if let Err(e) = staging.file_mut().write_all(&out).and_then(|()| staging.file_mut().sync_all()) {
+                // Never leave a partly written seed behind: zero it, then
+                // the staging guard unlinks it.
+                scrub_stale_staging(dir, name);
+                return Err(e);
+            }
         }
         // The file this write replaces, if any, held open across the rename
         // so its contents can be overwritten afterwards (review CR-7): a
@@ -406,8 +411,12 @@ impl KesKey {
         };
         #[cfg(not(unix))]
         let replaced: Option<fs::File> = None;
-        fs::rename(&tmp, &path)?;
-        fs::File::open(dir)?.sync_all()?;
+        // fsync of the file, rename, fsync of the directory. A failed
+        // rename leaves the staging file: zero it before the guard unlinks.
+        if let Err(e) = staging.publish(&path) {
+            scrub_stale_staging(dir, name);
+            return Err(e);
+        }
         // Only now: the new state is durable under the name, so a crash
         // during the overwrite cannot leave the node without a key.
         if let Some(old) = replaced {
@@ -658,11 +667,57 @@ pub fn shred_retired(dir: &Path) -> io::Result<()> {
     shred(&dir.join(RETIRED_FILE_NAME))
 }
 
+/// Destroy every leftover staging file of `name` in `dir`
+/// (`<name>.write-<pid>-<n>.tmp`, the names `PrivateStagingFile` creates):
+/// a regular file is overwritten with zeros through a descriptor opened
+/// without following links, fsynced and unlinked; anything else under such
+/// a name (a planted symlink) is only unlinked, never written through.
+/// Best effort, with the limits of [`shred`]; failures are reported and do
+/// not stop the caller. Called at startup and around every write of `name`,
+/// which this process performs from one thread at a time, so a file found
+/// here is never a write in flight (review R-10).
+pub fn scrub_stale_staging(dir: &Path, name: &str) {
+    let prefix = format!("{name}.write-");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(text) = file_name.to_str() else { continue };
+        if !text.starts_with(&prefix) || !text.ends_with(".tmp") {
+            continue;
+        }
+        let path = entry.path();
+        let regular = fs::symlink_metadata(&path).map(|meta| meta.file_type().is_file()).unwrap_or(false);
+        if regular {
+            let mut options = fs::OpenOptions::new();
+            options.write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            if let Err(e) = options.open(&path).and_then(overwrite_replaced) {
+                eprintln!("KES WARNING: could not overwrite the leftover staging file {}: {e}", path.display());
+            }
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("KES WARNING: could not remove the leftover staging file {}: {e}", path.display()),
+        }
+    }
+}
+
 /// Startup: a swap interrupted between its renames leaves
 /// `validator.kes.next` and `validator.kes.retired` but no `validator.kes`:
 /// finish it. A `validator.kes.retired` beside `validator.kes` is the
 /// replaced key awaiting finality and is left for the node to load.
 pub fn finish_interrupted_rotation(dir: &Path) -> io::Result<()> {
+    // Review R-10: staging files a killed process left behind hold seeds.
+    for name in [FILE_NAME, NEXT_FILE_NAME, RETIRED_FILE_NAME] {
+        scrub_stale_staging(dir, name);
+    }
     let current = dir.join(FILE_NAME);
     let next = dir.join(NEXT_FILE_NAME);
     let retired = dir.join(RETIRED_FILE_NAME);
@@ -687,6 +742,80 @@ mod tests {
 
     fn quick() -> Unlock {
         Unlock::passphrase_with("kes-test-passphrase-2026", KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 })
+    }
+
+    /// Audit L1-07: a `validator.kes.tmp` planted by another local account
+    /// (a symlink to a file it can read, or a world-readable file) is never
+    /// opened: the seed is not written through it, the symlink target is
+    /// untouched, and the key file the next boot loads is 0600.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_staging_name_is_never_written_through() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tmp("planted-staging");
+        let elsewhere = dir.join("attacker-readable");
+        fs::write(&elsewhere, b"untouched").unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&elsewhere, dir.join(format!("{FILE_NAME}.tmp"))).unwrap();
+        let next_tmp = dir.join(format!("{NEXT_FILE_NAME}.tmp"));
+        fs::write(&next_tmp, b"planted").unwrap();
+        fs::set_permissions(&next_tmp, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let key = KesKey::generate(4, 1, |_| {}).unwrap();
+        key.save(&dir, &Unlock::PlaintextOptIn).unwrap();
+        key.save_next(&dir, &Unlock::PlaintextOptIn).unwrap();
+
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"untouched", "the symlink target holds no seed");
+        assert_eq!(fs::read(&next_tmp).unwrap(), b"planted");
+        for name in [FILE_NAME, NEXT_FILE_NAME] {
+            let meta = fs::symlink_metadata(dir.join(name)).unwrap();
+            assert!(meta.file_type().is_file(), "{name} is a regular file, not the planted link");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{name}");
+        }
+        assert_eq!(
+            KesKey::load_optional(&dir, &Unlock::PlaintextOptIn).unwrap().unwrap().public().root,
+            key.public().root
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Review R-10: a staging file left by a killed writer (it holds a seed)
+    /// is zeroed and removed by the next write of that name and at startup;
+    /// a symlink planted under such a name is unlinked, never written
+    /// through; unrelated files are untouched.
+    #[cfg(unix)]
+    #[test]
+    fn leftover_staging_files_are_zeroed_and_removed() {
+        use std::os::unix::fs::symlink;
+        let dir = tmp("stale-staging");
+        let key = KesKey::generate(4, 1, |_| {}).unwrap();
+        key.save(&dir, &Unlock::PlaintextOptIn).unwrap();
+        let leftover = dir.join(format!("{FILE_NAME}.write-4242-7.tmp"));
+        fs::write(&leftover, b"a seed a killed process left behind").unwrap();
+        // A hard link lets the test read what the scrub did to the inode.
+        let witness = dir.join("witness");
+        fs::hard_link(&leftover, &witness).unwrap();
+        let elsewhere = dir.join("elsewhere");
+        fs::write(&elsewhere, b"untouched").unwrap();
+        let planted = dir.join(format!("{FILE_NAME}.write-4242-8.tmp"));
+        symlink(&elsewhere, &planted).unwrap();
+        let next_leftover = dir.join(format!("{NEXT_FILE_NAME}.write-4242-9.tmp"));
+        fs::write(&next_leftover, b"another seed").unwrap();
+
+        key.save(&dir, &Unlock::PlaintextOptIn).unwrap();
+        assert!(!leftover.exists(), "removed by the next write of that name");
+        assert!(fs::read(&witness).unwrap().iter().all(|b| *b == 0), "and zeroed first");
+        assert!(fs::symlink_metadata(&planted).is_err(), "the planted link is unlinked");
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"untouched", "and never written through");
+        assert!(next_leftover.exists(), "another name's staging is not this write's to touch");
+
+        finish_interrupted_rotation(&dir).unwrap();
+        assert!(!next_leftover.exists(), "startup scrubs every KES name");
+        let staging_left = fs::read_dir(&dir).unwrap().flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).count();
+        assert_eq!(staging_left, 0);
+        assert!(KesKey::load_optional(&dir, &Unlock::PlaintextOptIn).unwrap().is_some(), "the key itself is intact");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// HF2 x HF3 integration (review F-1): a KES leaf signature must verify

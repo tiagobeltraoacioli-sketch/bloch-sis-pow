@@ -138,6 +138,20 @@ impl Halt {
     }
 }
 
+/// Largest holder page `/holders` serves (and the size of its cached ranking).
+pub const HOLDERS_TOP_MAX: usize = 256;
+
+/// L1M-03: the top-[`HOLDERS_TOP_MAX`] positive script balances, ranked by
+/// (balance desc, script hash asc). Computed once per index change (end of
+/// [`Index::sync`], under the writer's lock) instead of sorting the whole
+/// balance table on every `/holders` request under the read lock.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HoldersTop {
+    pub rows: Vec<(ScriptHash, u128)>,
+    /// Number of script hashes with a positive balance (not just the shown ones).
+    pub with_balance: usize,
+}
+
 /// The whole index.
 pub struct Index {
     /// The node's selected chain as the index has applied it. `chain[0]` is
@@ -188,9 +202,47 @@ pub struct Index {
     /// switched off only if the opening ledgers already disagree, or by the
     /// operator (`--no-ledger-check`).
     pub ledger_check: bool,
+    /// Cached holder ranking; `None` whenever a balance may have changed since
+    /// it was computed (cleared by `try_apply`/`rollback_to`).
+    holders_top: Option<HoldersTop>,
 }
 
 impl Index {
+    /// Rank the positive balances in O(n) selection + O(k log k) sort, k = 256.
+    pub fn compute_holders_top(&self) -> HoldersTop {
+        let mut all: Vec<(ScriptHash, u128)> =
+            self.balance.iter().filter(|(_, v)| **v > 0).map(|(k, v)| (*k, *v)).collect();
+        let with_balance = all.len();
+        let order = |a: &(ScriptHash, u128), b: &(ScriptHash, u128)| b.1.cmp(&a.1).then(a.0.cmp(&b.0));
+        if all.len() > HOLDERS_TOP_MAX {
+            all.select_nth_unstable_by(HOLDERS_TOP_MAX - 1, order);
+            all.truncate(HOLDERS_TOP_MAX);
+        }
+        all.sort_unstable_by(order);
+        HoldersTop { rows: all, with_balance }
+    }
+
+    /// Recompute the cached ranking if anything invalidated it.
+    pub fn refresh_holders_top(&mut self) {
+        if self.holders_top.is_none() {
+            self.holders_top = Some(self.compute_holders_top());
+        }
+    }
+
+    /// The holder ranking: the cached copy when it is current, otherwise a
+    /// fresh computation (paths that mutate the index without `sync`).
+    pub fn holders_top(&self) -> std::borrow::Cow<'_, HoldersTop> {
+        match &self.holders_top {
+            Some(top) => std::borrow::Cow::Borrowed(top),
+            None => std::borrow::Cow::Owned(self.compute_holders_top()),
+        }
+    }
+
+    /// True when `/holders` will be served from the cache (no per-request sort).
+    pub fn holders_top_is_cached(&self) -> bool {
+        self.holders_top.is_some()
+    }
+
     /// A new index seeded with genesis: the block at height 0 and the opening
     /// ledger it commits to.
     ///
@@ -226,6 +278,7 @@ impl Index {
             sync_error: None,
             halted: None,
             ledger_check: true,
+            holders_top: None,
         };
         for (op, u) in genesis_outputs {
             ix.eutxo_total_sat += u.value_sat as u128;
@@ -262,6 +315,7 @@ impl Index {
             eutxo_count: count,
         });
         ix.tx_starts.push(0);
+        ix.refresh_holders_top();
         ix
     }
 
@@ -284,6 +338,9 @@ impl Index {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "undo/replay roundtrip changed indexed data"));
         }
         self.stats = stats;
+        // The rollback/replay above invalidated the holders cache; rebuild it
+        // here so the first /holders requests after a restart are not O(n).
+        self.refresh_holders_top();
         eprintln!("verified rollback/replay of {depth} archival blocks; all ledger tables unchanged");
         Ok(())
     }
@@ -314,6 +371,13 @@ impl Index {
     ///
     /// Returns `(applied, rolled_back)`.
     pub fn sync(&mut self, reader: &mut LogReader) -> io::Result<(u64, u64)> {
+        let result = self.sync_inner(reader);
+        // Also on error: a halted index keeps serving its applied prefix.
+        self.refresh_holders_top();
+        result
+    }
+
+    fn sync_inner(&mut self, reader: &mut LogReader) -> io::Result<(u64, u64)> {
         // The log's `i`th frame is the block at height `i+1`, because genesis
         // is not in the log.
         let frames = reader.frames().to_vec();
@@ -406,6 +470,7 @@ impl Index {
     }
 
     pub fn try_apply(&mut self, env: &BlockEnvelope, frame_len: u32) -> io::Result<()> {
+        self.holders_top = None;
         let decoded: Vec<PosTransaction> = env.body.transactions.iter()
             .map(|raw| PosTransaction::from_canonical_bytes(raw)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("transaction decode: {e:?}"))))
@@ -764,6 +829,7 @@ impl Index {
 
     /// Undo every applied block above `height`, newest-first.
     fn rollback_to(&mut self, height: u64) {
+        self.holders_top = None;
         while self.height() > height {
             let undo = self.undo.pop().expect("journal reaches the fork; sync checked the floor");
             let row = self.chain.pop().expect("never pops genesis");

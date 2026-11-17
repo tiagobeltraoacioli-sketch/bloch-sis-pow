@@ -106,6 +106,8 @@ struct World {
     bind_in_checkpoint: bool,
     /// The finality leaf commits no frozen set yet.
     no_set_in_leaf: bool,
+    /// The set source's block is in epoch E - src_back (default 2).
+    src_back: u64,
 }
 
 struct Built {
@@ -205,7 +207,7 @@ fn build(w: &World, voters: &[(u32, Sig)], with_set: bool, with_kes: bool) -> Bu
     let mut cp_smt = Smt::new();
     cp_smt.insert(kes_enforced_leaf_key(), leaf_value_hash(&w.enforced.unwrap_or(0).to_le_bytes()));
     let e = w.epoch;
-    let src = header((e - 1) * SLOTS_PER_EPOCH - 1, [9; 32], smt.root());
+    let src = header((e + 1 - w.src_back) * SLOTS_PER_EPOCH - 1, [9; 32], smt.root());
     let src_id = *BlockId::of(&src).as_bytes();
     let cp = header(e * SLOTS_PER_EPOCH - 1, src_id, if w.bind_in_checkpoint { cp_smt.root() } else { [0xAB; 32] });
     let cp_id = *BlockId::of(&cp).as_bytes();
@@ -280,6 +282,7 @@ fn kes_world(epoch: u64) -> World {
         epoch,
         bind_in_checkpoint: false,
         no_set_in_leaf: false,
+        src_back: 2,
     }
 }
 
@@ -427,6 +430,46 @@ fn only_the_gate_epochs_set_source_may_prove_a_leaf_without_a_set() {
     let mut w = world(gate + 3);
     w.no_set_in_leaf = true;
     assert!(matches!(run(&build(&w, &voters, true, false)).unwrap_err(), Refusal::FinalitySet(_)));
+}
+
+/// L1M-04: a set source at or before the gate commits no frozen set, so bond
+/// weights are allowed for post-gate targets only while crossing the gate
+/// (E <= gate + FROZEN_GATE_BOND_CROSSING_EPOCHS), not for the whole hop
+/// window. Pre-fix, E = gate + 200 from a pre-gate set source was accepted
+/// under bond weights.
+#[test]
+fn bond_weights_past_the_gate_are_only_a_crossing_allowance() {
+    let voters: Vec<(u32, Sig)> = (0..4).map(|v| (v, Sig::StaticV1)).collect();
+    let gate = params::HF1_FROZEN_FINALITY_SET_EPOCH;
+    let window = ffg::FROZEN_GATE_BOND_CROSSING_EPOCHS;
+    let world = |epoch: u64, src_epoch: u64| {
+        let mut w = kes_world(epoch);
+        w.kes = vec![];
+        w.enforced = None;
+        w.src_back = epoch - src_epoch;
+        w
+    };
+    // Set source in the last pre-gate epoch: the crossing window accepts bond...
+    for e in [gate + 1, gate + 2, gate + window] {
+        assert_eq!(run(&build(&world(e, gate - 1), &voters, false, false)).unwrap().weights, Weights::Bond, "E = {e}");
+    }
+    // ...and refuses it beyond, even though the hop bound (256) would allow it.
+    for e in [gate + window + 1, gate + 200] {
+        assert_eq!(
+            run(&build(&world(e, gate - 1), &voters, false, false)).unwrap_err(),
+            Refusal::FinalitySet("bond weights refused past the frozen-set crossing window"),
+            "E = {e}"
+        );
+    }
+    // Same for a gate-epoch set source proving a set-less leaf.
+    let mut w = world(gate + window + 1, gate);
+    w.no_set_in_leaf = true;
+    assert!(matches!(run(&build(&w, &voters, true, false)).unwrap_err(), Refusal::FinalitySet(_)));
+    let mut w = world(gate + window, gate);
+    w.no_set_in_leaf = true;
+    assert_eq!(run(&build(&w, &voters, true, false)).unwrap().weights, Weights::Bond);
+    // Below the gate nothing changes: a far set source still uses bond.
+    assert_eq!(run(&build(&world(gate - 1, gate - 200), &voters, false, false)).unwrap().weights, Weights::Bond);
 }
 
 #[test]
