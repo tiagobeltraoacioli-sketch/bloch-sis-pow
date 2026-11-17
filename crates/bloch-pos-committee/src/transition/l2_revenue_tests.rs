@@ -179,3 +179,101 @@
         assert_eq!(l2_revenue::claim_fee_sat(5_000 * BLCH), l2_revenue::FEE_CAP_SAT);
         assert_eq!(l2_revenue::claim_net_sat(5_000 * BLCH), 5_000 * BLCH - BLCH);
     }
+
+    // ── Review r17 (agent 335): a spend FROM a treasury output ────────────
+    //
+    // `params::PROTOCOL_TREASURY_SCRIPT_HASH` is a key hash in the carried form
+    // (20 bytes of `SHA3-256(pubkey)`, twelve zero bytes). Nothing in the tree
+    // spent an output the fee rules create at such a script. This does, with a
+    // stand-in key in the same form: the fee output of a deposit is an ordinary
+    // eUTXO that the holder of the key moves with a plain transfer, and that
+    // nobody else moves.
+
+    fn r335_carried(pubkey: &[u8]) -> [u8; 32] {
+        let full = script_of(pubkey);
+        let mut out = [0u8; 32];
+        out[..20].copy_from_slice(&full[..20]);
+        out
+    }
+
+    #[test]
+    fn r335_a_treasury_output_in_the_carried_form_is_spent_by_its_key_and_by_no_other() {
+        let (pre, _) = activated_fixture(true, [0; 32]);
+        let _gate = crate::params::l2_revenue_test::open();
+        let key = vec![0x7e; crate::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let treasury = r335_carried(&key);
+        // The compiled treasury has exactly this shape.
+        let compiled = crate::params::PROTOCOL_TREASURY_SCRIPT_HASH.expect("named");
+        assert_eq!(compiled[20..], [0u8; 12]);
+        assert_eq!(treasury[20..], [0u8; 12]);
+        assert_ne!(treasury[..20], [0u8; 20]);
+        let _treasury = l2_revenue::test_treasury::set(treasury);
+
+        let amount = 7_000_000_000;
+        let fee = l2_revenue::deposit_fee_sat(amount);
+        let wire = PosTransaction::L2Deposit(deposit_paying(&pre, amount, fee));
+        let mut post = pre.clone();
+        post.apply_transaction(&wire, 0, pre.next_base_fee(), &ToyVerifier).expect("fee-paying deposit applies");
+        let out = post.eutxos.get(&(wire.txid(), TREASURY_VOUT)).expect("treasury output").clone();
+        assert_eq!((out.value, out.script_hash), (fee, treasury));
+        let price = post.next_base_fee();
+
+        // Another key: refused before any signature is looked at, state untouched.
+        let thief = vec![0x7f; crate::transition::funded::ADMISSION_PQ_KEY_BYTES];
+        let steal = transfer_spending(std::slice::from_ref(&out), &thief, script_of(&thief), 0, 0, price);
+        let mut state = post.clone();
+        assert_eq!(
+            state.apply_transaction(&steal, 0, price, &ToyVerifier).map(|_| ()),
+            Err(TxReject::Transfer(TransferReject::ScriptMismatch))
+        );
+        assert_eq!(state, post);
+
+        // The right key with somebody else's signature: refused.
+        let mut forged = transfer_spending(std::slice::from_ref(&out), &key, script_of(&thief), 0, 0, price);
+        let root = forged.spend_signing_root();
+        if let PosTransaction::Transfer { inputs, .. } = &mut forged {
+            inputs[0].signature = toy_sign(&thief, &root);
+        }
+        let mut state = post.clone();
+        assert_eq!(
+            state.apply_transaction(&forged, 0, price, &ToyVerifier).map(|_| ()),
+            Err(TxReject::Transfer(TransferReject::BadSignature))
+        );
+        assert_eq!(state, post);
+
+        // The holder of the key moves it to a native (32-byte) script of its choice.
+        let destination = script_of(b"the treasury's next address");
+        let spend = transfer_spending(std::slice::from_ref(&out), &key, destination, 0, 0, price);
+        let supply = post.accounted_supply_sat();
+        let mut state = post.clone();
+        state.apply_transaction(&spend, 0, price, &ToyVerifier).expect("the treasury key spends the treasury output");
+        assert!(state.eutxos.get(&(wire.txid(), TREASURY_VOUT)).is_none());
+        let moved = state.eutxos.get(&(spend.txid(), 0)).expect("the moved output");
+        assert_eq!(moved.script_hash, destination);
+        // Only the transfer's own fee left the supply.
+        assert_eq!(supply - state.accounted_supply_sat(), u128::from(fee - moved.value));
+        assert!(moved.value > fee / 2, "a 0.035 BLCH fee output is worth moving: {} of {fee}", moved.value);
+        // A second spend of the same output: gone.
+        assert!(state.apply_transaction(&spend, 0, state.next_base_fee(), &ToyVerifier).is_err());
+    }
+
+    /// The smallest outputs the two rules create (the crossing-fee floor, 5,000 sat, and the forced-inclusion
+    /// surcharge of a plain transfer, 1,000 sat at an empty queue) against the fee of moving ONE output alone
+    /// with a real hybrid key and signature at the minimum base fee, and the marginal fee of one more input
+    /// under the same key (TransferV2 shares the witness): a measurement for the documents, printed.
+    #[test]
+    fn r335_what_it_costs_to_move_the_smallest_treasury_outputs() {
+        let key_bytes = crate::transition::funded::ADMISSION_PQ_KEY_BYTES as u64;
+        let bytes_one = key_bytes + fee_market::HYBRID_SIG_BYTES + 36 + 40 + 40;
+        let floor = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        let one = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, bytes_one, floor, 0);
+        let more = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, bytes_one + 40, floor, 0);
+        let alone = one.base_fee_sat + one.priority_fee_sat;
+        let marginal = more.base_fee_sat + more.priority_fee_sat - alone;
+        eprintln!(
+            "r335: one treasury output alone costs {alone} sat to move at the minimum base fee; one more input under \
+             the same key about {marginal} sat; crossing-fee floor {} sat; smallest forced surcharge 1000 sat",
+            l2_revenue::FEE_FLOOR_SAT
+        );
+        assert!(alone > 0 && marginal < alone);
+    }
