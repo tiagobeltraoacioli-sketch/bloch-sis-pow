@@ -3410,6 +3410,30 @@ pub const HF3_PQ_MIGRATION_EPOCH: u64 = 7360;
 /// - the commit-reveal rescue (wire `0x19`/`0x1A`) becomes valid.
 pub const LATTICE_EMERGENCY_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+// Review CRY-1 (round 2; CR-3 of round 1), OPEN: the rescue this gate turns
+// on must not be armed as written. A reveal is valid only if it sweeps
+// EVERY output at the key's scripts (`PqMigrationReject::IncompleteSweep`),
+// and anyone can pay dust to those scripts. So, with the gate armed:
+//
+// * each dust output that lands before a reveal executes voids it;
+// * about 14,000 dust outputs make every reveal larger than a block, which
+//   locks the coins for good (transfers are frozen, no reveal fits);
+// * an attacker who reads the key from the victim's first reveal commits its
+//   own destination, keeps the victim's reveals void with dust for the
+//   commitment delay, and sweeps everything with a forged signature.
+//
+// Also open: the lattice spend freeze covers `Transfer`/`TransferV2` only;
+// funded deposits and delegations and the L2 spend types still accept a
+// lattice funding key. The fix (first matured commitment binds the key's
+// destination and tip; a reveal may sweep any subset) and the freeze of the
+// other spend types are specified in the round-2 report and are NOT
+// implemented. An emergency release must do both before it deletes this
+// assertion.
+const _: () = assert!(
+    LATTICE_EMERGENCY_ACTIVATION_EPOCH == u64::MAX,
+    "the lattice-emergency rescue is blockable and redirectable as written: fix review CRY-1 before arming"
+);
+
 /// Epochs a rescue commitment must age before a reveal may cite it (~1 day at
 /// 16-minute epochs). An attacker who learns a public key from a pending
 /// reveal must commit AFTER the owner and then wait this long, so the owner's
