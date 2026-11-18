@@ -59,9 +59,34 @@ class MixedRehearsal(_base.Rehearsal):
         self.metrics_base = args.port_base + 200
         self.binaries = {}
         self.plain_allow_file = self.out / "mesh-plain-allow.txt"
+        self.start_in = args.start_in
+        # The run keeps its signer anchors to itself instead of adding
+        # throwaway keys to the operator's ~/.bloch-signer.
+        self.env["BLOCH_SIGNER_ANCHOR_DIR"] = str(self.out / "signer-anchor")
+
+    def setup(self):
+        self.out.mkdir(parents=True, exist_ok=False)
+        (self.out / "signer-anchor").mkdir(mode=0o700)
+        keydirs = []
+        for i in range(N_VALIDATORS):
+            d = self.node_dir(i)
+            d.mkdir(parents=True)
+            subprocess.run([self.released, "keygen", "--allow-plaintext-keystore", "--dir", str(d), "--index", str(i)],
+                           check=True, env=self.env, capture_output=True)
+            keydirs.append(str(d))
+        self.genesis = self.out / "genesis.blg"
+        # Every node must be running before the first slot: a validator that
+        # boots after its duties began refuses to sign without a protection
+        # record.
+        subprocess.run([self.released, "genesis", "--keys", ",".join(keydirs), "--out", str(self.genesis),
+                        "--slot-ms", str(self.slot_ms), "--start-in", str(self.start_in)],
+                       check=True, env=self.env, capture_output=True)
+        self.validators = list(range(N_VALIDATORS))
+        self.observer = N_VALIDATORS
+        self.members = self.validators + [self.observer]
 
     # ── nodes ────────────────────────────────────────────────────────────
-    def start(self, i, mode, members, binary=None, plain_allow=False):
+    def start(self, i, mode, members, binary=None, plain_allow=False, wait=True):
         binary = binary or self.released
         d = self.node_dir(i)
         d.mkdir(parents=True, exist_ok=True)
@@ -81,8 +106,12 @@ class MixedRehearsal(_base.Rehearsal):
         self.procs[i] = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=self.env)
         self.modes[i] = mode
         self.binaries[i] = binary
-        if not self.wait(f"node{i} RPC", lambda: self.info(i), 90):
-            raise SystemExit(f"node{i} did not come up; see {d / 'node.log'}")
+        if wait:
+            self.wait_up(i)
+
+    def wait_up(self, i, timeout=90):
+        if not self.wait(f"node{i} RPC", lambda: self.info(i), timeout):
+            raise SystemExit(f"node{i} did not come up; see {self.node_dir(i) / 'node.log'}")
 
     def metrics(self, i):
         try:
@@ -135,8 +164,11 @@ class MixedRehearsal(_base.Rehearsal):
         peers = len(self.members) - 1
 
         # phase 0
+        # Started together and awaited together: the RPC answers from slot 0.
         for i in self.members:
-            self.start(i, "offer", self.members)
+            self.start(i, "offer", self.members, wait=False)
+        for i in self.members:
+            self.wait_up(i, timeout=self.start_in + 90)
         self.log("phase 0: everyone on the released binary, offer")
         self.wait_finality_advances(self.validators, 2, "phase 0 (released, offer)")
 
@@ -243,6 +275,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--slot-ms", type=int, default=500)
     ap.add_argument("--port-base", type=int, default=23700)
+    ap.add_argument("--start-in", type=int, default=45,
+                    help="seconds from genesis creation to slot 0; all five nodes must be running by then")
     r = MixedRehearsal(ap.parse_args())
     try:
         r.run()
