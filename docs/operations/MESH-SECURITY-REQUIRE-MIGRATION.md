@@ -10,6 +10,38 @@ which connections a node accepts, never what a valid block or state is, so it
 needs no activation epoch and no coordination of a flag day. The cost of a
 mistake is connectivity (a node cut off from peers), not a consensus fault.
 
+## The release changes nothing on the wire under `offer`
+
+The fleet is upgraded in waves and external validators upgrade later, so a
+node of this build runs next to released nodes (`0067547f`) for a long time,
+with the argv it has today (`--transport devnet --mesh-security offer`).
+
+- The handshake is still version 1 with the same two messages, the same two
+  sealed identity records and the same record layer. Nothing was added to it
+  and nothing is negotiated. `require`, `--mesh-plain-allow`, the metrics and
+  the log lines are all decisions a node takes locally about a connection.
+- Under `offer` (and `plain`) a node of this build accepts and refuses exactly
+  the connections the released node does, and sends the same bytes. What an
+  operator sees that is new: the `bloch_pos_mesh_*` metrics, and the
+  `is PLAIN` log line for a peer that did not complete the handshake.
+- `mesh_identity.bin` and the data dir are untouched by this change, in both
+  directions of a binary swap.
+
+How that is checked:
+
+- Unit tests put the released handshake and record layer, kept verbatim in
+  `crates/bloch-pos-node/src/mesh_pq/released_0067547f.rs`, on the other end
+  of a socket from this build: `offer_seals_with_a_released_node_in_both_directions_and_frames_cross`,
+  `offer_and_a_released_node_fall_back_to_plain_exactly_as_two_released_nodes_do`,
+  `offer_puts_on_the_wire_what_the_released_node_puts_there` (`mesh_pq.rs`),
+  `an_offer_node_and_a_released_offer_node_run_sealed_whoever_dials` and
+  `an_offer_node_speaks_the_legacy_wire_to_a_released_plain_node` (`net.rs`).
+- `scripts/mesh-pq-mixed-version-rehearsal.py --released-bin <0067547f build>
+  --bin <this build> --out <dir>` runs both binaries in one local devnet: a
+  rolling upgrade with the argv unchanged, then every step of this note, then
+  the rollback of the mode and of the binary. Run it against each release
+  candidate before step 1 below.
+
 ## What the modes do
 
 | Mode | Dials | Accepts | Against an active attacker |
@@ -114,6 +146,15 @@ moved over the observation window, and no `is PLAIN` line names a validator.
 
 Notes:
 
+- An `offer` dialer that is turned away by a peer several times in a row
+  (the peer is full, or restarting) tries one plain connection, as it does
+  today. A `require` peer refuses that connection, counts it in
+  `bloch_pos_mesh_plain_refused_total` and, with Sentinel hooks, reports a
+  handshake failure for the dialer's address; the dialer then goes back to
+  the handshake. Votes the dialer wrote into that one plain connection are
+  lost for that peer. While the fleet is mixed, a refusal that names an
+  owner address is this, not a misconfigured node, and it ends when that
+  dialer is on `require` too (step 4).
 - `submit-tx` and the equivocation injector speak plain frames. A `require`
   node refuses them unless their source address is listed. Submit through the
   JSON-RPC.

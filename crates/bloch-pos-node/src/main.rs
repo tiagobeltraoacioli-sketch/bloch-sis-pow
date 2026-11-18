@@ -2130,6 +2130,12 @@ fn run_cmd(args: &[String]) {
         require_authenticated: args.iter().any(|a| a == "--mesh-require-authenticated"),
         plain_allow: arg_value(args, "--mesh-plain-allow").map(PathBuf::from),
     };
+    // Given last with no value it would be dropped in silence, and a
+    // `require` node would then cut off the peers the list was meant to keep.
+    if mesh.plain_allow.is_none() && args.iter().any(|a| a == "--mesh-plain-allow") {
+        eprintln!("run: --mesh-plain-allow needs a file (one IP address per line)");
+        exit(2);
+    }
     if mesh.plain_allow.is_some() && mesh.mode == mesh_pq::Mode::Plain {
         eprintln!("run: --mesh-plain-allow needs --mesh-security require (or offer, where it has no effect)");
         exit(2);

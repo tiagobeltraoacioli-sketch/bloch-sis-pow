@@ -3248,6 +3248,121 @@ mod tests {
         assert!(count(&NODE.mesh_sealed_sessions_total) >= sealed + 4);
     }
 
+    /// The release property of `--mesh-security offer`: a node of this
+    /// build, started with today's argv, runs a sealed session with a
+    /// released (`0067547f`) `offer` node whichever of the two dials, and
+    /// votes cross it in both directions. The released end is that commit's
+    /// handshake and record layer, verbatim (`mesh_pq::released_0067547f`),
+    /// on a bare socket.
+    #[test]
+    fn an_offer_node_and_a_released_offer_node_run_sealed_whoever_dials() {
+        use crate::mesh_pq::released_0067547f as released;
+        use crate::mesh_pq::{MeshSecurity, Mode};
+        let net = [9; 32];
+        let ours = || Arc::new(MeshSecurity::ephemeral(Mode::Offer, net, None));
+        let theirs = released::MeshSecurity::ephemeral(released::Mode::Offer, net, None);
+        let vote = |slot: u64| {
+            let mut att = sample_attestation();
+            att.data.slot = slot;
+            att_frame(&att)
+        };
+        let engine_gets = |received: &Receiver<EngineEvent>, slot: u64| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if let Ok(EngineEvent::Net(NetEvent::Attestation(att, _))) = received.recv_timeout(Duration::from_millis(50)) {
+                    if att.data.slot == slot {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        let sealed_before = crate::metrics::NODE.mesh_sealed_sessions_total.load(Ordering::Relaxed);
+
+        // This build dials; the released node listens.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (events, received) = mpsc::channel();
+        let mesh = start(
+            "127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
+            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(), ours(),
+        ).unwrap();
+        let (mut sock, _) = listener.accept().unwrap();
+        let released::Session::Sealed { mut sealer, mut opener, .. } = released::handshake_inbound(&mut sock, &theirs).unwrap() else {
+            panic!("a released offer listener did not get a sealed session from this build's dialer");
+        };
+        mesh.broadcast(vote(11));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(read_until_frame(|| opener.read_record(&mut sock, deadline), &vote(11)), "this build's vote did not reach the released node");
+        sealer.write_record(&mut sock, &[&vote(12)]).unwrap();
+        assert!(engine_gets(&received, 12), "the released node's vote did not reach this build's engine");
+        drop((sock, mesh));
+
+        // The released node dials; this build listens.
+        let (events, received) = mpsc::channel();
+        let mesh = start(
+            "127.0.0.1", 0, Vec::new(), events, std::env::temp_dir(),
+            Arc::new(AtomicU64::new(42)), QueueBudget::new(), ours(),
+        ).unwrap();
+        let addr = mesh.listen_addr();
+        let mut sock = TcpStream::connect(addr).unwrap();
+        let released::Session::Sealed { mut sealer, mut opener, .. } = released::handshake_outbound(&mut sock, &theirs, &addr.to_string()).unwrap() else {
+            panic!("a released offer dialer did not get a sealed session from this build's listener");
+        };
+        sealer.write_record(&mut sock, &[&vote(13)]).unwrap();
+        assert!(engine_gets(&received, 13), "the released node's vote did not reach this build's engine");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while mesh.peer_count() < 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        mesh.broadcast(vote(14));
+        assert!(read_until_frame(|| opener.read_record(&mut sock, deadline), &vote(14)), "this build's vote did not reach the released node");
+        assert!(crate::metrics::NODE.mesh_sealed_sessions_total.load(Ordering::Relaxed) >= sealed_before + 2);
+    }
+
+    /// The other half of `offer`: against a released node that does not
+    /// speak the handshake (`plain`, or a build from before it existed) this
+    /// build's dialer sends the handshake once, is closed on, and then runs
+    /// the legacy wire: `u32` length, type, payload, nothing before it.
+    #[test]
+    fn an_offer_node_speaks_the_legacy_wire_to_a_released_plain_node() {
+        use crate::mesh_pq::{MeshSecurity, Mode};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (events, _received) = mpsc::channel();
+        let mesh = start(
+            "127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
+            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(),
+            Arc::new(MeshSecurity::ephemeral(Mode::Offer, [9; 32], None)),
+        ).unwrap();
+        // What a legacy node does with the first connection: it reads the
+        // magic as a frame length above its limit and closes.
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut first = [0u8; 4];
+        sock.read_exact(&mut first).unwrap();
+        assert_eq!(first, crate::mesh_pq::MAGIC);
+        assert!(u32::from_le_bytes(first) as usize > crate::codec::MAX_FIELD_LEN);
+        drop(sock);
+        // The next connection is plain from its first byte.
+        let vote = att_frame(&sample_attestation());
+        mesh.broadcast(vote.clone());
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut seen = false;
+        for _ in 0..16 {
+            let mut len = [0u8; 4];
+            sock.read_exact(&mut len).unwrap();
+            assert_ne!(len, crate::mesh_pq::MAGIC, "the plain retry started with the handshake");
+            let len = u32::from_le_bytes(len) as usize;
+            assert!(len > 0 && len <= crate::codec::MAX_FIELD_LEN, "not a legacy frame: length {len}");
+            let mut frame = vec![0u8; len];
+            sock.read_exact(&mut frame).unwrap();
+            if frame == vote {
+                seen = true;
+                break;
+            }
+        }
+        assert!(seen, "the vote did not arrive as a legacy frame");
+    }
+
     #[test]
     fn mesh_pin_binds_the_dialed_address_to_one_identity() {
         use crate::mesh_pq::{MeshSecurity, Mode};
