@@ -1816,10 +1816,25 @@ fn growth_cap_changes_no_root_below_its_gate() {
             assert_eq!(armed.state_root(), today.state_root(), "epoch {}", today.epoch);
         }
     }
+    // Past the gate the two runs differ in what the walk activates. The walk
+    // is a function of the committed history and the rule, so each roster is
+    // read under the rule its run was produced with.
     let roster = |state: &CommittedState| state.duty_roster_at(state.epoch);
-    assert_eq!(roster(&armed), roster(&today), "read without the rehearsal, the rosters agree");
+    let delegated = |state: &CommittedState| {
+        let attacker = roster(state).into_iter().find(|v| v.index == GROWTH_ATTACKER).unwrap();
+        u128::from(attacker.effective_stake) - staking::MIN_DEPOSIT_SAT
+    };
+    let (roster_today, delegated_today) = (roster(&today), delegated(&today));
+    assert_eq!(roster(&armed), roster_today, "read without the rehearsal, the rosters agree");
     let _cap = growth_cap_rehearsal::open_at(gate_epoch);
-    assert_ne!(roster(&armed), roster(&today));
+    assert_ne!(roster(&armed), roster_today);
+    // 30M BLCH requested 20 epochs ago: 20 slices of 500,000 BLCH today;
+    // 11 of them below the gate and 9 of 250,000 BLCH from it on when armed.
+    assert_eq!(delegated_today, 20 * delegation::MIN_CHURN_SAT);
+    assert_eq!(
+        delegated(&armed),
+        11 * delegation::MIN_CHURN_SAT + 9 * delegation::GROWTH_CAP_WARMUP_FLOOR_SAT
+    );
 }
 
 /// Withdrawal is never slower under the cap. The same position leaves in

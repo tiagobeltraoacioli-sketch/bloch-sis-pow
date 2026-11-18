@@ -864,7 +864,8 @@ fn an_inert_or_future_growth_cap_changes_nothing() {
     let mut rng = Rng::new(0x6A0B_CA90);
     for trial in 0..600u32 {
         let shape = rng.below(SHAPES);
-        let ds = random_history(&mut rng, shape, 1 + rng.below(30) as usize);
+        let n = 1 + rng.below(30) as usize;
+        let ds = random_history(&mut rng, shape, n);
         let epoch = rng.below(last_event(&ds) + 60);
         let old = resolve_reference(&ds, epoch);
         let context = format!("trial {trial}, shape {shape}, epoch {epoch}");
@@ -888,10 +889,13 @@ fn an_inert_or_future_growth_cap_changes_nothing() {
 fn capped_fold_matches_a_naive_capped_walk() {
     let mut rng = Rng::new(0x6A0B_CA91);
     let mut capped_runs = 0u32;
+    let mut compared_records = 0u32;
     for trial in 0..1_200u32 {
         let shape = rng.below(SHAPES);
-        let ds = random_history(&mut rng, shape, 1 + rng.below(30) as usize);
-        let epoch = rng.below(last_event(&ds) + [3, 60, 900][rng.below(3) as usize]);
+        let n = 1 + rng.below(30) as usize;
+        let ds = random_history(&mut rng, shape, n);
+        let horizon = [3, 60, 900][rng.below(3) as usize];
+        let epoch = rng.below(last_event(&ds) + horizon);
         let rule = WarmupRule {
             gate: Some(rng.below(epoch + 3)),
             div: [400, 768, 1_536, 7][rng.below(4) as usize],
@@ -899,24 +903,27 @@ fn capped_fold_matches_a_naive_capped_walk() {
         };
         let registry = Registry::resolve_with_rule(&ds, epoch, &rule);
         let want = capped_reference(&ds, epoch, &rule);
+        let in_fold = |d: &Delegation| d.eligible && d.amount_sat >= MIN_DELEGATION_SAT;
         let mut total = 0u128;
-        for (d, want) in ds.iter().zip(&want) {
-            // Records that tie on the whole queue key are interchangeable;
-            // compare them as a group.
-            let twins: u128 = ds.iter().zip(&want).filter(|(o, _)| o.queue_key() == d.queue_key()
-                && o.eligible && o.amount_sat >= MIN_DELEGATION_SAT).map(|(_, w)| *w).sum();
-            let n = ds.iter().filter(|o| o.queue_key() == d.queue_key()
-                && o.eligible && o.amount_sat >= MIN_DELEGATION_SAT).count();
-            if n == 1 && d.eligible {
-                assert_eq!(registry.activated_sat(d), *want, "trial {trial}, epoch {epoch}, {rule:?}");
+        let mut compared = 0u32;
+        for (d, expected) in ds.iter().zip(want.iter()) {
+            total += *expected;
+            // Records that tie on the whole queue key are interchangeable
+            // (which of them takes a slice first is not observable), so the
+            // per-record amount is compared only where the key is unique;
+            // the sum below covers the rest.
+            let twins = ds.iter().filter(|o| in_fold(o) && o.queue_key() == d.queue_key()).count();
+            if in_fold(d) && twins == 1 {
+                assert_eq!(registry.activated_sat(d), *expected, "trial {trial}, epoch {epoch}, {rule:?}");
+                compared += 1;
             }
-            let _ = twins;
-            total += *want;
         }
+        compared_records += compared;
         assert_eq!(registry.total_active(), total, "trial {trial}, epoch {epoch}, {rule:?}");
         capped_runs += u32::from(registry != Registry::resolve_with_rule(&ds, epoch, &WarmupRule::LEGACY));
     }
     assert!(capped_runs > 100, "only {capped_runs} histories were changed by the cap");
+    assert!(compared_records > 5_000, "only {compared_records} records compared one by one");
 }
 
 /// The gate epoch itself is the first capped epoch; the epoch before it is
@@ -1019,6 +1026,10 @@ const EPOCHS_PER_DAY: f64 = 90.0;
 
 /// Epochs from the attacker's request until its ACTIVE stake first reaches
 /// one third and two thirds of the total, `(to_third, to_two_thirds)`.
+/// The request is made in the epoch before `START` and takes its first slice
+/// at `START`, as a `FundedDelegate` does on the real transition, so the
+/// counts are the ones `transition::funded_delegation::tests::growth_cap_*`
+/// measure through real epoch boundaries.
 ///
 /// `honest_delegated` of the honest weight is delegated stake (active since
 /// genesis); the rest is own stake. The attacker delegates far more than it
@@ -1059,10 +1070,10 @@ fn epochs_to_thresholds(rule: WarmupRule, honest_delegated: u128, own_path: bool
         }
         let attacker = attacker_at(epoch, own);
         if third.is_none() && 2 * attacker >= MODEL_WEIGHT {
-            third = Some(epoch - START);
+            third = Some(epoch - START + 1);
         }
         if attacker >= 2 * MODEL_WEIGHT {
-            two_thirds = Some(epoch - START);
+            two_thirds = Some(epoch - START + 1);
         }
     }
     (third.unwrap(), two_thirds.unwrap())
@@ -1118,11 +1129,11 @@ fn growth_cap_options_table() {
     let at = |option: usize, case: usize| rows[option].0[case];
     // Today: the figures on `HF2_GROWTH_CAP_EPOCH` (7.6 and about 5 days).
     assert_eq!(at(0, 0), (205, 687));
-    assert_eq!(at(0, 2), (163, 441));
+    assert_eq!(at(0, 2), (163, 440));
     // Shipped: one third takes twice as long as today, two thirds about
     // twice; strict doubles again.
     assert_eq!(at(1, 0), (410, 1_350));
-    assert_eq!(at(2, 0), (819, 2_699));
+    assert_eq!(at(2, 0), (819, 2_700));
     // Every option is ordered in every case.
     for case in 0..4 {
         assert!(at(0, case).0 < at(1, case).0 && at(1, case).0 < at(2, case).0);
@@ -1132,4 +1143,75 @@ fn growth_cap_options_table() {
     assert_eq!(rows[0].1, vec![1, 1, 2, 20]);
     assert_eq!(rows[1].1, vec![1, 1, 4, 40]);
     assert_eq!(rows[2].1, vec![1, 1, 8, 80]);
+}
+
+/// The pruning check of `FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH` reads the
+/// same rule as the resolver, so the two gates compose: with the growth cap
+/// armed before, at or after the pruning epoch, a pruning the check accepts
+/// is still invisible at that epoch and at every later one, and the pruned
+/// list still resolves to the two-passes-per-epoch statement of the capped
+/// rule.
+#[test]
+fn a_neutral_pruning_stays_invisible_under_the_growth_cap() {
+    let mut rng = Rng::new(0x6A0B_CA92);
+    let (mut neutral, mut refused, mut capped) = (0u32, 0u32, 0u32);
+    for trial in 0..500u32 {
+        let shape = 1 + rng.below(3);
+        let n = 2 + rng.below(30) as usize;
+        let ds = random_history(&mut rng, shape, n);
+        let at = rng.below(last_event(&ds) + 200);
+        let gate = rng.below(at + 40);
+        let _cap = crate::params::funded_delegation_growth_cap_rehearsal::open_at(gate);
+        let rule = WarmupRule::consensus();
+        assert_eq!(rule, middle_rule(gate));
+        let now = Registry::resolve_uncached(&ds, at);
+        let positions: Vec<usize> = (0..ds.len())
+            .filter(|i| {
+                let d = &ds[*i];
+                d.eligible
+                    && d.amount_sat >= MIN_DELEGATION_SAT
+                    && d.deactivate_epoch.is_some_and(|de| de <= at)
+                    && now.activated_sat(d) == 0
+                    && rng.below(3) != 0
+            })
+            .collect();
+        if positions.is_empty() {
+            continue;
+        }
+        if !pruning_is_outcome_neutral(&ds, &positions, at) {
+            refused += 1;
+            continue;
+        }
+        neutral += 1;
+
+        let mut full = ds.clone();
+        for d in full.iter_mut() {
+            if d.deactivate_epoch.is_none() && rng.below(3) == 0 {
+                d.deactivate_epoch = Some(at + 1 + rng.below(40));
+            }
+        }
+        for k in 0..rng.below(6) as u32 {
+            let mut d = random_history(&mut rng, shape, 1)[0];
+            d.delegator = 50_000 + k;
+            d.requested_epoch = at + 1 + rng.below(30);
+            d.deactivate_epoch = (rng.below(2) == 0).then(|| d.requested_epoch + rng.below(50));
+            full.push(d);
+        }
+        let cut = pruned(&full, &positions);
+        for epoch in (at..at + 120).chain([at + 400, at + 3_000]) {
+            assert_eq!(
+                Registry::resolve_uncached(&cut, epoch),
+                Registry::resolve_uncached(&full, epoch),
+                "trial {trial}, pruned at {at}, gate {gate}, epoch {epoch}"
+            );
+        }
+        let want: u128 = capped_reference(&full, at + 7, &rule).iter().sum();
+        assert_eq!(Registry::resolve_uncached(&cut, at + 7).total_active(), want, "trial {trial}");
+        capped += u32::from(
+            Registry::resolve_uncached(&full, at + 60) != Registry::resolve_with_rule(&full, at + 60, &WarmupRule::LEGACY),
+        );
+    }
+    assert!(neutral > 100, "only {neutral} neutral prunings exercised");
+    assert!(refused > 5, "only {refused} refusals exercised");
+    assert!(capped > 20, "only {capped} of the histories were changed by the cap");
 }
