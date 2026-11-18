@@ -2392,6 +2392,21 @@ pub fn sig_canonical_active(epoch: u64) -> bool {
 /// of those consumers and mixed-version behavior.
 pub const VALIDATOR_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+// Review CRY-3 (round 2): this constant has NO reader. No signer, block or
+// vote validation, gossip door, fork-choice admission, slashing-evidence
+// check or light-client verifier selects the network-bound roots
+// (`AttestationData::network_bound_signing_root`,
+// `BlockHeaderV4::network_bound_proposal_signing_root`), and the exit and
+// RANDAO re-commit roots have no network-bound form at all. A build that set
+// it to an epoch would compile, ship and bind nothing, while reporting the
+// gate as armed. Until the rule is written and wired at every one of those
+// call sites, an armed value is a build error. The commit that wires it
+// removes this assertion.
+const _: () = assert!(
+    VALIDATOR_NETWORK_BINDING_ACTIVATION_EPOCH == u64::MAX,
+    "VALIDATOR_NETWORK_BINDING_ACTIVATION_EPOCH has no reader: arming it binds nothing (review CRY-3)"
+);
+
 /// One shipped domain separator and the preimage shapes that use it.
 ///
 /// `preimage_shapes` is an audit registry, not an encoding layer. Some frozen
