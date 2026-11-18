@@ -111,6 +111,19 @@ struct World {
     src_back: u64,
     /// Serve the checkpoint's own bind proof when the set source has none.
     second_proof: bool,
+    /// Validators of `kes` whose FIRST key starts in the KES period after
+    /// the finalizing link's target (registered after the bind, in the
+    /// targets' period): they still sign with their static key.
+    late_first_key: Vec<u32>,
+}
+
+/// The committed KES entry of validator `v` in world `w`.
+fn kes_entry(w: &World, v: u32) -> KesEntry {
+    let (mut public, _) = kes_public(v);
+    if w.late_first_key.contains(&v) {
+        public.start_period = params::kes_period(w.epoch + 1).map_or(0, |p| p + 1);
+    }
+    KesEntry::from(public)
 }
 
 struct Built {
@@ -128,7 +141,7 @@ fn state_smt(w: &World) -> Smt {
     }
     smt.insert(finality_leaf_key(), leaf_value_hash(&finality_record(w).committed_bytes()));
     for v in &w.kes {
-        smt.insert(kes_leaf_key(*v), leaf_value_hash(&KesEntry::from(kes_public(*v).0).committed_bytes()));
+        smt.insert(kes_leaf_key(*v), leaf_value_hash(&kes_entry(w, *v).committed_bytes()));
     }
     if let Some(b) = w.enforced.filter(|_| !w.bind_in_checkpoint) {
         smt.insert(kes_enforced_leaf_key(), leaf_value_hash(&b.to_le_bytes()));
@@ -150,6 +163,7 @@ fn next_world(w: &World) -> World {
         no_set_in_leaf: w.no_set_in_leaf,
         src_back: 2,
         second_proof: w.second_proof,
+        late_first_key: w.late_first_key.clone(),
     }
 }
 
@@ -198,7 +212,8 @@ fn sign_vote(v: u32, data: &AttestationData, how: Sig, w: &World) -> Vec<u8> {
     let (_, sk) = &kp(v, 0);
     let kes_bound = params::kes_period(data.target_epoch).is_some()
         && w.enforced.is_some_and(|b| data.target_epoch >= b)
-        && w.kes.contains(&v);
+        && w.kes.contains(&v)
+        && !w.late_first_key.contains(&v);
     match how {
         Sig::StaticV1 => bloch_crypto::crypto::sign(sk, &root).unwrap(),
         Sig::StaticBound => bloch_crypto::crypto::sign_bound(sk, &root).unwrap(),
@@ -236,7 +251,7 @@ fn build_on(w: &World, voters: &[(u32, Sig)], with_set: bool, with_kes: bool, on
     let n = w.bond.len() as u32;
     let records: Vec<ValidatorRecord> = (0..n).map(|v| record(v, w.bond[v as usize])).collect();
     let fin = finality_record(w).committed_bytes();
-    let entries: BTreeMap<u32, KesEntry> = w.kes.iter().map(|v| (*v, KesEntry::from(kes_public(*v).0))).collect();
+    let entries: BTreeMap<u32, KesEntry> = w.kes.iter().map(|v| (*v, kes_entry(w, *v))).collect();
     // The checkpoint's own state: the next epoch's, which commits the bind
     // from the checkpoint on when the set source did not.
     let cp_smt = state_smt(&next_world(w));
@@ -331,6 +346,7 @@ fn kes_world(epoch: u64) -> World {
         no_set_in_leaf: false,
         src_back: 2,
         second_proof: true,
+        late_first_key: vec![],
     }
 }
 
@@ -887,6 +903,39 @@ fn a_voters_absence_at_the_set_source_must_be_fresh() {
     );
     unregistered.epoch = start + period - 2;
     assert_eq!(run(&build(&unregistered, &ALL, true, true)).expect("same period").kes_votes, 0);
+}
+
+/// Audit L1-05 (first-key floor, security review CR-2, in force on mainnet
+/// from epoch 8620). A validator that registers its first KES key after the
+/// bind signs with its static key until that key starts, in the period after
+/// its inclusion, although its entry is already committed. Consensus judges
+/// such a vote by `KesEntry::resolve` (no key before the first one), and so
+/// does this verifier. A verifier that still looks the key up with
+/// `KesEntry::in_force` (every SP1 step guest built before CR-2, e.g. the
+/// ELF pinned as vkey 0x00bcf592...) selects the not yet started key for the
+/// same vote and refuses the whole proof: a rebuilt guest must pass this
+/// test's rule.
+#[test]
+fn a_static_vote_before_the_voters_first_kes_key_verifies() {
+    let mut w = kes_world(params::KES_ACTIVATION_EPOCH + 40);
+    w.late_first_key = vec![2];
+    let period = params::kes_period(w.epoch + 1).unwrap();
+    let entry = kes_entry(&w, 2);
+    assert_eq!(entry.first_start_period(), period + 1);
+    assert_eq!(entry.resolve(period), None, "the rule consensus judges by: no key yet, the static key signs");
+    assert_eq!(entry.in_force(period), entry.current, "the pre-CR-2 lookup: a key whose leaf bounds refuse the period");
+    // Validator 2 votes with its static key on both links, as on chain.
+    let v = run(&build(&w, &ALL, true, true)).expect("static vote before the first KES key");
+    assert_eq!(v.stake, [(100, 100), (100, 100)]);
+    // Its entry is proven, not its absence, so the builder keeps the vote.
+    let mut kept = build(&w, &ALL, true, true);
+    let kes = kept.proof.kes.clone().unwrap();
+    ffg::retain_fresh_static_votes(&mut kept.proof.cert, &kes);
+    assert!(kept.proof.cert.links.iter().all(|l| l.votes.len() == 4));
+    // The floor moves nothing for a key that has started: a static
+    // signature from validator 1 is still refused.
+    let voters = [(0, Sig::Proper), (1, Sig::StaticBound), (2, Sig::Proper), (3, Sig::Proper)];
+    assert_eq!(run(&build(&w, &voters, true, true)).unwrap_err(), Refusal::BadSignature(1));
 }
 
 /// Three steps, each standing on the one before; afterwards only the newest
