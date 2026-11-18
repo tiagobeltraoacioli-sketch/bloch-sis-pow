@@ -50,18 +50,36 @@ def is_gate_name(name):
         or re.match(r"L2_[A-Z0-9_]+_EPOCH$", name) is not None)
 
 
+# A `const NAME: u64 = value;` item as rustfmt may write it: any visibility (or none), and the value on the
+# following lines (review R384-1: a definition wrapped after `=`, as L2_SETTLEMENT_ACTIVATION_EPOCH is, or one
+# without `pub`, was not read at all, so an armed gate written that way was reported `missing`).
+ITEM = re.compile(r"^[ \t]*(?:pub(?:\([a-z_: ]+\))?[ \t]+)?const[ \t]+([A-Z0-9_]+)\s*:\s*u64\s*=([^;]*);", re.M)
+
+
+def items(text):
+    """Every u64 constant item of one source text: (name, value with comments and line breaks removed)."""
+    out = []
+    for m in ITEM.finditer(text):
+        value = " ".join(re.sub(r"//.*", "", line).strip() for line in m.group(2).split("\n"))
+        out.append((m.group(1), " ".join(value.split())))
+    return out
+
+
 def definitions(repo, commit):
-    out = subprocess.run(
-        ["git", "-C", repo, "grep", "-hE", r"^\s*pub(\([a-z]+\))? +const +[A-Z0-9_]+ *: *u64 *=", commit, "--", "crates/*.rs"],
+    files = subprocess.run(
+        ["git", "-C", repo, "grep", "-lE", r"const +[A-Z0-9_]+ *: *u64", commit, "--", "crates/*.rs"],
         check=False, capture_output=True, text=True,
     )
-    if out.returncode not in (0, 1):
-        sys.exit(f"hf-gates: git grep failed at {commit}: {out.stderr.strip()}")
+    if files.returncode not in (0, 1):
+        sys.exit(f"hf-gates: git grep failed at {commit}: {files.stderr.strip()}")
     defs = {}
-    for line in out.stdout.splitlines():
-        m = DEF.match(line)
-        if m:
-            defs.setdefault(m.group(2), []).append(m.group(4).strip())
+    for name in files.stdout.splitlines():
+        # `git grep -l <commit>` prints <commit>:<path>.
+        text = subprocess.run(["git", "-C", repo, "show", name], check=False, capture_output=True, text=True)
+        if text.returncode != 0:
+            sys.exit(f"hf-gates: cannot read {name}: {text.stderr.strip()}")
+        for const, value in items(text.stdout):
+            defs.setdefault(const, []).append(value)
     return defs
 
 

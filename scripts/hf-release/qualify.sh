@@ -206,7 +206,18 @@ l2_gate_armed() {
   local st
   st="$(python3 -I "$GATES_PY" status --repo "$REPO" --commit "$COMMIT" --gate "$1" | cut -f2)" \
     || die "hf-gates.py status failed for $1"
-  case "$st" in inert|missing) return 1 ;; *) return 0 ;; esac
+  case "$st" in
+    inert) return 1 ;;
+    missing)
+      # Not defined at the candidate. That is "not armed" only when the base does not define the gate either
+      # (a release without the L2 program gates). A gate the base defines and the candidate no longer does is a
+      # change to review, not an inert gate (review R384-1): it counts as armed.
+      st="$(python3 -I "$GATES_PY" status --repo "$REPO" --commit "$BASE_COMMIT" --gate "$1" | cut -f2)" \
+        || die "hf-gates.py status failed for $1 at the base"
+      [ "$st" = missing ] && return 1
+      return 0 ;;
+    *) return 0 ;;
+  esac
 }
 if [ "$BASE_COMMIT_DEFAULT" = 1 ]; then
   for g in L2_PROGRAM_ROLLBACK_EPOCH L2_NEXT_PROGRAM_EPOCH; do
