@@ -1373,6 +1373,171 @@ mod kes_rules {
         assert!(roots.windows(2).all(|w| w[0] == w[1]), "the committed entry does not depend on the epoch");
     }
 
+    // ── CR-5, round 19: arming the flag day at a FUTURE epoch ─────────────
+    //
+    // The gate may only ever be armed ahead of the chain (`params` doc,
+    // GATE-03). These pin what that does to registrations that are already
+    // on chain in the legacy form, and what stays exposed while it is inert.
+
+    /// A registration included before the flag day is judged once, in its
+    /// own block, under the legacy message. Arming the gate at a later epoch
+    /// neither re-judges it nor changes one committed byte: the entry stays
+    /// in force across the flag day, its leaves verify, and it can rotate.
+    /// Only registrations INCLUDED from the flag day on need the bound form.
+    #[test]
+    fn arming_the_flag_day_at_a_future_epoch_keeps_registrations_already_on_chain() {
+        const GATE: u64 = 10;
+        // One-epoch periods, enforcement from epoch 2, the first-key floor
+        // armed with it (as on mainnet: both 8620).
+        let _armed = Armed::enforcing(2, 1);
+        let _floor = crate::params::kes_first_key_floor_rehearsal::arm(2);
+        let (_t, g, _chains) = setup_with(4, ToyVerifier, &[]);
+        // The history: v1 registers at epoch 5, before KES binds.
+        let history = |st: &mut CommittedState| {
+            st.epoch = 5;
+            let tx = register(st, 1, toy_kes_public(1));
+            assert_eq!(relay_check(st, &tx), Ok(()));
+            apply(st, &tx).expect("a legacy registration before the flag day");
+            tx
+        };
+        let mut inert = g.clone();
+        let legacy = history(&mut inert);
+        // The same history under a binary that arms the gate at epoch 10.
+        let _bound = crate::params::kes_register_binding_rehearsal::arm(GATE);
+        let mut st = g.clone();
+        assert_eq!(history(&mut st), legacy, "the signed bytes are the legacy ones before the flag day");
+        assert_eq!(st.state_root(), inert.state_root(), "replay of pre-gate history is byte-identical");
+        assert_eq!(st.kes_roots(), inert.kes_roots());
+        // KES binds; the chain then crosses the flag day.
+        st.kes_enforced_from = Some(7);
+        let entry = st.kes_roots()[&1].clone();
+        assert_eq!(entry.current, toy_kes_public(1));
+        for epoch in [GATE - 1, GATE, GATE + 1, 2 + 15] {
+            st.epoch = epoch;
+            assert_eq!(st.kes_roots()[&1], entry, "epoch {epoch}: the committed entry is untouched");
+            assert_eq!(st.kes_public(1), Some(toy_kes_public(1)), "epoch {epoch}");
+            assert!(vote_verifies(&st, 1, epoch, &toy_kes_public(1), &tree(1).0, epoch - 2), "epoch {epoch}");
+        }
+        // Its own replay stays refused (a key is in force), in either form.
+        st.epoch = GATE + 1;
+        assert_eq!(apply(&mut st.clone(), &legacy), Err(TxReject::StakingRule));
+        assert_eq!(apply(&mut st.clone(), &register_for(&st, 1, toy_kes_public(1), st.epoch)), Err(TxReject::StakingRule));
+        // Rotation is signed by the leaf, not by the registration form.
+        let successor = tree_from(0xB7, DEPTH);
+        let rotation = rotate(&st, 1, GATE + 1 - 2, &toy_kes_public(1), &tree(1).0, &successor);
+        let mut rotated = st.clone();
+        apply(&mut rotated, &rotation).expect("a legacy-registered key rotates after the flag day");
+        assert_eq!(rotated.kes_roots()[&1].next.map(|next| next.root), Some(public_of(&successor).root));
+        // A validator that registers only now needs the bound form.
+        let late_legacy = register(&st, 2, toy_kes_public(2));
+        assert_eq!(relay_check(&st, &late_legacy), Err(TxReject::StakingRule));
+        assert_eq!(apply(&mut st.clone(), &late_legacy), Err(TxReject::StakingRule), "legacy form signed too late");
+        let late = register_for(&st, 2, toy_kes_public(2), st.epoch);
+        assert_eq!(relay_check(&st, &late), Ok(()));
+        apply(&mut st, &late).expect("the bound form in its epoch");
+        assert_eq!(st.kes_roots()[&2].current.start_period, (GATE + 1 - 2) + 1, "after the bind: the next period");
+        assert_eq!(st.kes_roots()[&1], entry, "and v1's entry is still the one from epoch 5");
+    }
+
+    /// The same statement for a whole block: a block that carries a legacy
+    /// registration replays to the same post-state under a build that arms
+    /// the flag day above the block's epoch, and is INVALID under a build
+    /// that arms it at or below (why a past epoch can never be chosen:
+    /// every restart would fail the durable-log replay there).
+    #[test]
+    fn a_block_with_a_legacy_registration_replays_under_a_future_flag_day_only() {
+        let (t, g, mut chains) = setup_with(4, ToyVerifier, &[]);
+        let tx = register(&g, 2, toy_kes_public(2));
+        let txs = std::slice::from_ref(&tx);
+        let _armed = Armed::at(0, u64::MAX, 90);
+        let env = build_block(&t, &g, 1, &[], txs, &mut chains);
+        let inert = t.compute_post_state(&g, &env, &[], txs).expect("inert flag day");
+        let block_epoch = inert.epoch;
+        for future in [block_epoch + 1, block_epoch + 1_000, u64::MAX - 1] {
+            let _future = crate::params::kes_register_binding_rehearsal::arm(future);
+            let post = t.compute_post_state(&g, &env, &[], txs).expect("flag day above the block");
+            assert_eq!(post.state_root(), inert.state_root(), "gate {future}");
+            assert_eq!(post.kes_roots(), inert.kes_roots(), "gate {future}");
+        }
+        let _past = crate::params::kes_register_binding_rehearsal::arm(block_epoch);
+        assert_eq!(t.compute_post_state(&g, &env, &[], txs).unwrap_err(), TransitionError::Transaction(0));
+    }
+
+    /// What is and is not exposed while the flag day is inert, with the
+    /// first-key floor in force (mainnet since 8620):
+    ///
+    /// * a validator's FIRST registration can never be replayed on its chain:
+    ///   its tree is the key in force or the oldest history entry, which the
+    ///   floor never prunes, and a tree found there is refused;
+    /// * a registration that was signed but never included stays valid for
+    ///   ever and is accepted from anyone in the validator's next rescue
+    ///   window (and, for a validator with no key yet, at once);
+    /// * a RESCUE registration is replayable once its tree has left the
+    ///   pruned history and a rescue window is open again.
+    ///
+    /// The last two are what `KES_REGISTER_EPOCH_BINDING_EPOCH` closes; each
+    /// is shown refused with the gate rehearsed armed.
+    #[test]
+    fn while_the_flag_day_is_inert_only_a_first_registration_is_safe_from_replay() {
+        let _armed = Armed::enforcing(2, 1);
+        let _floor = crate::params::kes_first_key_floor_rehearsal::arm(2);
+        let horizon = crate::params::KES_KEY_HISTORY_PERIODS;
+        let refused_when_armed = |st: &CommittedState, tx: &PosTransaction| {
+            let _bound = crate::params::kes_register_binding_rehearsal::arm(0);
+            assert_eq!(relay_check(st, tx), Err(TxReject::StakingRule));
+            assert_eq!(apply(&mut st.clone(), tx), Err(TxReject::StakingRule));
+        };
+        let (_t, g, _chains) = setup_with(4, ToyVerifier, &[]);
+        let mut st = g.clone();
+        // Epoch 5, before the bind: v1 signs for tree X, never sends it, and
+        // registers tree A instead (periods 0..16).
+        st.epoch = 5;
+        let tree_a = public_of(&tree_from(0xA1, DEPTH));
+        let tree_x = public_of(&tree_from(0xE7, DEPTH));
+        let unsent = register(&st, 1, tree_x);
+        let first = register(&st, 1, tree_a);
+        apply(&mut st, &first).unwrap();
+        assert_eq!(apply(&mut st.clone(), &unsent), Err(TxReject::StakingRule), "once only while A is live");
+        st.kes_enforced_from = Some(7);
+        // Period 16: A has expired, the rescue window is open.
+        st.epoch = 2 + 16;
+        assert!(st.kes_rescue_open(1));
+        assert_eq!(apply(&mut st.clone(), &first), Err(TxReject::StakingRule), "A is the key in force");
+        // EXPOSED: anyone holding the never-included signature installs X.
+        let mut hijacked = st.clone();
+        assert_eq!(relay_check(&hijacked, &unsent), Ok(()));
+        assert_eq!(apply(&mut hijacked, &unsent), Ok(()));
+        assert_eq!(hijacked.kes_roots()[&1].current.root, tree_x.root);
+        refused_when_armed(&st, &unsent);
+        // The validator's own rescue: tree B, periods 18..34.
+        let tree_b = public_of(&tree_from(0xB2, DEPTH));
+        let rescue_b = register(&st, 1, tree_b);
+        apply(&mut st, &rescue_b).unwrap();
+        assert_eq!(st.kes[&1].retired.iter().map(|r| r.public.root).collect::<Vec<_>>(), [tree_a.root]);
+        // Long after B expired, a second rescue (tree C) prunes B from the
+        // history; A, the first key, stays.
+        let far = 34 + horizon + 1;
+        st.epoch = 2 + far;
+        assert!(st.kes_rescue_open(1));
+        assert_eq!(apply(&mut st.clone(), &first), Err(TxReject::StakingRule), "A is in the history");
+        assert_eq!(apply(&mut st.clone(), &rescue_b), Err(TxReject::StakingRule), "B is the key in force");
+        let rescue_c = register(&st, 1, public_of(&tree_from(0xC3, DEPTH)));
+        apply(&mut st, &rescue_c).unwrap();
+        assert_eq!(st.kes[&1].retired.iter().map(|r| r.public.root).collect::<Vec<_>>(), [tree_a.root], "B is pruned, A never");
+        // C expires in turn: the next rescue window.
+        st.epoch = 2 + far + crate::params::KES_RESCUE_DELAY_PERIODS + 16;
+        assert!(st.kes_rescue_open(1));
+        // SAFE: the first registration is refused for ever.
+        assert_eq!(relay_check(&st, &first), Err(TxReject::StakingRule));
+        assert_eq!(apply(&mut st.clone(), &first), Err(TxReject::StakingRule), "the first key is never pruned");
+        // EXPOSED: the old rescue registration puts B back in force.
+        let mut replayed = st.clone();
+        assert_eq!(relay_check(&replayed, &rescue_b), Ok(()));
+        assert_eq!(apply(&mut replayed, &rescue_b), Ok(()));
+        assert_eq!(replayed.kes_roots()[&1].current.root, tree_b.root);
+        refused_when_armed(&st, &rescue_b);
+    }
+
     #[test]
     fn the_shipped_schedule_refuses_trees_shallower_than_the_floor() {
         assert_eq!(crate::params::kes_schedule().min_depth, crate::params::KES_MIN_REGISTERED_DEPTH);

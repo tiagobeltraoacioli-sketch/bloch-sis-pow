@@ -42,6 +42,9 @@ Input values, base fee and inclusion epoch are operator observations, not proofs
 If the base fee changes, prepare and sign again: TransferV2 has exact conservation,
 not a fee-budget refund. The epoch selects the signing rules; it is NOT an expiry.
 The current network-binding gate is unarmed: use distinct keys across networks.
+--network-domain HEX32 (getvalidatoradmission.network_domain) is optional while
+it is unarmed and changes nothing; from the gate on it is required and must be
+repeated on prepare, inspect and sign.
 This command creates no keys, changes no consensus parameters and sends nothing.";
 
 const COMMON: &[&str] = &[
@@ -52,6 +55,7 @@ const COMMON: &[&str] = &[
     "--base-fee",
     "--epoch",
     "--max-fee",
+    "--network-domain",
 ];
 const MAX_TEXT_BYTES: u64 = 32_768;
 
@@ -99,8 +103,19 @@ struct Observation {
     base_fee: u128,
     epoch: u64,
     max_fee: u64,
+    /// The genesis-manifest digest of the network the payout is for
+    /// (`getvalidatoradmission.network_domain`). Optional while the
+    /// network-binding gate is inert; required from it on (review CRY-4).
+    network_domain: Option<[u8; 32]>,
 }
 impl Observation {
+    /// The root consensus verifies this payout's witness against at the
+    /// inclusion epoch: the committed-domain fold, not the legacy label.
+    fn signing_root(&self, tx: &PosTransaction) -> Result<[u8; 32], String> {
+        crate::devnet_tools::network_spend_signing_root(tx, self.epoch, self.network_domain.as_ref())
+            .map_err(|e| format!("{e}: pass --network-domain HEX32"))
+    }
+
     fn read(a: &Args) -> Result<Self, String> {
         let observation = Self {
             validator: a.number("--validator")?,
@@ -110,6 +125,10 @@ impl Observation {
             base_fee: a.number("--base-fee")?,
             epoch: a.number("--epoch")?,
             max_fee: a.number("--max-fee")?,
+            network_domain: match a.0.contains_key("--network-domain") {
+                true => Some(a.hash("--network-domain")?),
+                false => None,
+            },
         };
         if observation.value == 0
             || observation.validator == u32::MAX
@@ -265,7 +284,7 @@ fn inspect(tx: &PosTransaction, o: &Observation) -> Result<(), String> {
     if Some(outputs[0].value) != o.value.checked_sub(total_fee) {
         return Err("observed payout value, output and exact fee do not conserve".into());
     }
-    let root = tx.checked_signing_root(o.epoch);
+    let root = o.signing_root(tx)?;
     let signature = &keys[0].signature;
     if !signature.is_empty()
         && (signature.len() > ADMISSION_PQ_SIGNATURE_MAX
@@ -336,7 +355,7 @@ fn sign(args: &[String]) -> Result<(), String> {
     let expected = a.hash("--expected-root")?;
     let mut tx = read_tx(a.get("--tx")?)?;
     inspect(&tx, &o)?;
-    let root = tx.checked_signing_root(o.epoch);
+    let root = o.signing_root(&tx)?;
     if root != expected {
         return Err("signing root does not match the independently approved intent".into());
     }
@@ -402,6 +421,7 @@ mod audit_signature_policy_tests {
             base_fee: 10,
             epoch: 5000,
             max_fee: 1_000_000,
+            network_domain: None,
         };
         let mut tx = PosTransaction::TransferV2 {
             keys: vec![WitnessKey { pubkey: pubkey.clone(), signature: vec![] }],
@@ -418,6 +438,13 @@ mod audit_signature_policy_tests {
         }
         let root = tx.checked_signing_root(o.epoch);
         assert_eq!(codec::hex(&root), ROOT_HEX);
+        // Review CRY-4: the tool now signs the root consensus verifies. While
+        // the network-binding gate is inert that is this same pinned root,
+        // whether or not the operator names the network.
+        assert_eq!(o.signing_root(&tx), Ok(root));
+        let named = Observation { network_domain: Some([0xD4; 32]), ..o };
+        assert_eq!(named.signing_root(&tx), Ok(root));
+        let o = Observation { network_domain: None, ..named };
 
         let mut h = Sha3_256::new();
         h.update(b"bloch/validator-payout/cr10/signing-rng/v1");

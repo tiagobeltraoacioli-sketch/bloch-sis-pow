@@ -78,11 +78,13 @@ spent == created + fee with the fee priced at the INCLUDING block's base fee
 will use — getvalidatoradmission.next_base_fee_millisat_per_gas — and
 submit at once: a base-fee move between build and inclusion invalidates the
 transaction (ValueNotConserved), and it must then be rebuilt.
---epoch is the epoch of the including block and feeds checked_signing_root:
-it changes the signing root only once SIGHASH_NETWORK_BINDING arms
+--epoch is the epoch of the including block and selects the signing root:
+it changes the root only once SIGHASH_NETWORK_BINDING arms
 (inert at u64::MAX in this build). Default 0.
---genesis is optional: when given, every --input that is one of the
-manifest's genesis allocations is checked against it (value and owner).
+--genesis is optional while that gate is inert: when given, every --input
+that is one of the manifest's genesis allocations is checked against it
+(value and owner), and its digest names the network the signature binds
+from the gate on (it is then required).
 Outputs below the mempool dust floor are refused. Transaction files contain
 hex of the canonical bytes; submit with sendrawtransaction. Consensus and
 the mempool accept the format only from
@@ -324,6 +326,43 @@ pub fn build_transfer_v2(
     tip_millisat_per_gas: u128,
     epoch: u64,
 ) -> Result<TransferV2Plan, String> {
+    build_transfer_v2_on(keys, inputs, to, base_fee_millisat_per_gas, tip_millisat_per_gas, epoch, None)
+}
+
+/// The spend signing root consensus verifies for `tx` in a block of `epoch`
+/// on the network whose genesis-manifest digest is `network_domain`
+/// (`PosTransaction::checked_signing_root_for_network`, the function the
+/// transition and the mempool door call). Review CRY-4: the in-tree signers
+/// used the legacy label fold, which consensus stops accepting at
+/// `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH`. Below that gate the domain
+/// plays no part and the root is the historical one, with or without it; from
+/// the gate on a signer that cannot name its network refuses instead of
+/// producing a signature no node accepts.
+pub(crate) fn network_spend_signing_root(
+    tx: &PosTransaction,
+    epoch: u64,
+    network_domain: Option<&[u8; 32]>,
+) -> Result<[u8; 32], String> {
+    tx.checked_signing_root_for_network(epoch, network_domain).ok_or_else(|| {
+        format!(
+            "at epoch {epoch} the spend signing root binds the network (gate epoch {}): name the network \
+             (the genesis manifest, or the node's getvalidatoradmission.network_domain)",
+            bloch_pos_committee::params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH
+        )
+    })
+}
+
+/// [`build_transfer_v2`] for a named network: `network_domain` is the
+/// genesis-manifest digest the chain commits (review CRY-4).
+pub fn build_transfer_v2_on(
+    keys: &Keystore,
+    inputs: &[SpendInput],
+    to: [u8; 32],
+    base_fee_millisat_per_gas: u128,
+    tip_millisat_per_gas: u128,
+    epoch: u64,
+    network_domain: Option<&[u8; 32]>,
+) -> Result<TransferV2Plan, String> {
     if inputs.is_empty() {
         return Err("at least one --input is required".into());
     }
@@ -397,7 +436,7 @@ pub fn build_transfer_v2(
         *tx_bytes = reserved;
         outputs[0].value = paid_sat;
     }
-    let signing_root = tx.checked_signing_root(epoch);
+    let signing_root = network_spend_signing_root(&tx, epoch, network_domain)?;
     let signature = keys.sign_fitting(&signing_root, ADMISSION_PQ_SIGNATURE_MAX)?;
     if let PosTransaction::TransferV2 { keys, .. } = &mut tx {
         keys[0].signature = signature;
@@ -486,11 +525,15 @@ pub fn transfer_v2(args: &[String]) -> Result<(), String> {
         None => 0,
     };
     let keys = Keystore::load(Path::new(a.get("--dir")?)).map_err(error)?;
+    // The manifest, when given, also names the network the signature is for
+    // (review CRY-4): its digest is the domain the chain commits.
+    let mut network_domain: Option<[u8; 32]> = None;
     if let Some(path) = a.optional("--genesis") {
         let (manifest, _) = Manifest::load(Path::new(path)).map_err(error)?;
         check_inputs_against_manifest(&manifest, &inputs, &keys)?;
+        network_domain = Some(Sha3_256::digest(manifest.encode()).into());
     }
-    let plan = build_transfer_v2(&keys, &inputs, to, base_fee, tip, epoch)?;
+    let plan = build_transfer_v2_on(&keys, &inputs, to, base_fee, tip, epoch, network_domain.as_ref())?;
     let owner: [u8; 32] = Sha3_256::digest(&keys.pubkey).into();
     println!("Witness key hash: {}", codec::hex32(&owner));
     for i in &inputs {
@@ -877,6 +920,13 @@ mod tests {
         assert!(*tx_bytes - encoded <= fee_market::TX_BYTES_DECLARE_SLACK);
         // Signed over the root consensus checks at this epoch.
         assert_eq!(plan.signing_root, plan.tx.checked_signing_root(0));
+        // Review CRY-4: the signer now takes the root consensus verifies
+        // (the committed-domain fold). While the gate is inert that is the
+        // same root, with or without a named network.
+        assert_eq!(network_spend_signing_root(&plan.tx, 0, None), Ok(plan.signing_root));
+        assert_eq!(network_spend_signing_root(&plan.tx, u64::MAX - 1, Some(&[0xD4; 32])), Ok(plan.signing_root));
+        let named = build_transfer_v2_on(&funder, &[input.clone()], dest, 10, 5, 0, Some(&[0xD4; 32])).unwrap();
+        assert_eq!(named.signing_root, plan.signing_root);
         assert_eq!(plan.signing_root, plan.tx.spend_signing_root());
         assert!(bloch_crypto::crypto::verify(&funder.pubkey, &plan.signing_root, &keys[0].signature));
         // The node's door: refused before the flag day, admitted from it on.
