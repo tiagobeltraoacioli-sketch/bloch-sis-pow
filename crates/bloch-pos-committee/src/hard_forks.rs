@@ -386,6 +386,12 @@ macro_rules! unarmed {
 /// release anchor is re-baked at an epoch above the gate, at which point the
 /// rule is part of the anchored history.
 /// `every_inert_gate_in_params_is_listed_as_unarmed` keeps the list complete.
+///
+/// Removed under that rule when the anchor was re-baked at epoch 8742:
+/// `ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH` and
+/// `KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH`, both armed at 8620. Mainnet has
+/// produced and finalized its blocks under them since then, and the release
+/// qualification replays that history with both in force.
 pub const GATES_UNARMED_IN_CANONICAL_HISTORY: &[UnarmedGate] = &[
     unarmed!(params::ANCESTRY_SEED_ACTIVATION_EPOCH),
     unarmed!(params::DEPOSIT_ACTIVATION_EPOCH),
@@ -394,7 +400,6 @@ pub const GATES_UNARMED_IN_CANONICAL_HISTORY: &[UnarmedGate] = &[
     unarmed!(params::DUST_RULE_ACTIVATION_EPOCH),
     unarmed!(params::TX_BYTES_BOUND_ACTIVATION_EPOCH),
     unarmed!(params::ATTESTATION_DEDUP_ACTIVATION_EPOCH),
-    unarmed!(params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH),
     unarmed!(params::REWARDS_V2_ACTIVATION_EPOCH),
     unarmed!(params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH),
     unarmed!(params::FORKCHOICE_SLOT_TIEBREAK_ACTIVATION_EPOCH),
@@ -407,7 +412,6 @@ pub const GATES_UNARMED_IN_CANONICAL_HISTORY: &[UnarmedGate] = &[
     unarmed!(params::ACTIVATION_QUEUE_V2_ACTIVATION_EPOCH),
     unarmed!(params::LATTICE_EMERGENCY_ACTIVATION_EPOCH),
     unarmed!(params::DUTY_ROSTER_RECOVERY_ACTIVATION_EPOCH),
-    unarmed!(params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH),
     unarmed!(params::KES_REGISTER_EPOCH_BINDING_EPOCH),
     unarmed!(params::COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH),
     unarmed!(params::L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH),
@@ -586,16 +590,18 @@ mod tests {
         assert!(err.contains("epoch 7400") && !err.contains("A_EPOCH"), "{err}");
         // Inert gates never trip, whatever the anchor.
         assert!(check_gates_above_anchored_history(&[("params::A_EPOCH", M)], M).is_ok());
-        // As shipped, the gates armed 2026-11-13 (8620) are above anchored
-        // and current history (mainnet ~8210), and nothing else is armed.
-        assert!(check_gates_above_anchored_history(GATES_UNARMED_IN_CANONICAL_HISTORY, 8_619).is_ok());
-        assert_eq!(
-            gates_armed_at_or_below(GATES_UNARMED_IN_CANONICAL_HISTORY, M - 1),
-            [
-                ("params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH", 8_620),
-                ("params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH", 8_620),
-            ]
-        );
+        // As shipped: the two gates armed at 8620 left the list when the
+        // release anchor was re-baked at epoch 8742 (the list's maintenance
+        // rule), so no listed gate is armed and any anchor passes.
+        assert!(check_gates_above_anchored_history(GATES_UNARMED_IN_CANONICAL_HISTORY, 8_742).is_ok());
+        assert_eq!(gates_armed_at_or_below(GATES_UNARMED_IN_CANONICAL_HISTORY, M - 1), []);
+        for gone in ["params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH", "params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH"] {
+            assert!(GATES_UNARMED_IN_CANONICAL_HISTORY.iter().all(|(name, _)| *name != gone), "{gone}");
+        }
+        // The rule itself still refuses them below the epoch they were armed at.
+        let armed_8620: &[UnarmedGate] = &[("params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH", 8_620)];
+        assert!(check_gates_above_anchored_history(armed_8620, 8_619).is_ok());
+        assert!(check_gates_above_anchored_history(armed_8620, 8_742).is_err());
     }
 
     /// The list is complete: every `*_EPOCH` gate that `params.rs` ships at
