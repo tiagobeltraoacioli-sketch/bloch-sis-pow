@@ -60,3 +60,9 @@ test('the canonical dossier URL serves the same PDF asset on all hosts',async()=
     assert.match(response.headers.get('content-disposition'),/^inline;/);
   }
 });
+
+test('the page policy allows only the privacy-enhanced YouTube player to be framed',async()=>{
+  const page=await handlePosternLabs({request:new Request('https://posternlabs.com/'),env:{ASSETS:assets}});
+  assert.match(page.headers.get('content-security-policy'),/frame-src https:\/\/www\.youtube-nocookie\.com;/);
+  assert.equal(page.headers.get('referrer-policy'),'strict-origin-when-cross-origin');
+});

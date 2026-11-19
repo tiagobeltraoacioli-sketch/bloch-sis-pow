@@ -1,0 +1,16 @@
+.site-music{position:fixed;z-index:60;left:var(--pad,24px);bottom:18px;display:grid;gap:10px;max-width:calc(100vw - 2*var(--pad,24px));padding:6px 14px 6px 6px;border:1px solid var(--line-bright,#40503f);border-radius:28px;background:#050706e8;backdrop-filter:blur(18px);color:var(--paper,#f3f5ef);box-shadow:0 12px 40px #0008}
+.site-music.is-open{padding:10px;border-radius:14px}
+.site-music-bar{display:flex;align-items:center;gap:11px;min-width:0}
+.site-music-toggle{position:relative;display:grid;place-items:center;flex:none;width:34px;height:34px;padding:0;border:0;border-radius:50%;background:var(--lime,#baff28);color:#071006;cursor:pointer}
+.site-music-toggle:before{content:"";width:0;height:0;margin-left:3px;border-style:solid;border-width:7px 0 7px 12px;border-color:transparent transparent transparent currentColor}
+.site-music-toggle[hidden],.site-music-close[hidden],.site-music-frame[hidden],.site-music-link[hidden]{display:none}
+.site-music-close{flex:none;margin-left:auto;width:32px;height:32px;padding:0;border:1px solid var(--line-bright,#40503f);border-radius:50%;background:transparent;color:var(--paper,#f3f5ef);font-size:1.1rem;line-height:1;cursor:pointer}
+.site-music-toggle:focus-visible,.site-music-close:focus-visible,.site-music-link:focus-visible{outline:2px solid var(--paper,#f3f5ef);outline-offset:3px}
+.site-music-meta{display:grid;gap:4px;min-width:0}
+.site-music-meta strong{overflow:hidden;font-size:.8rem;font-weight:600;letter-spacing:-.01em;white-space:nowrap;text-overflow:ellipsis}
+.site-music-meta small{color:var(--muted,#9da79e);font:600 .58rem/1 var(--mono,monospace);text-transform:uppercase;letter-spacing:.1em}
+.site-music-frame{width:min(356px,calc(100vw - 54px));min-width:200px;aspect-ratio:16/9;min-height:200px}
+.site-music-frame iframe{display:block;width:100%;height:100%;border:0;border-radius:8px}
+.site-music-link{color:var(--lime,#baff28);font:600 .62rem/1 var(--mono,monospace);text-transform:uppercase;letter-spacing:.1em;text-decoration:none}
+.site-music-link:hover{text-decoration:underline}
+@media(max-width:720px){.site-music{left:16px;bottom:16px;max-width:calc(100vw - 32px)}.site-music:not(.is-open){padding:6px}.site-music:not(.is-open) .site-music-meta{display:none}.site-music-toggle{width:44px;height:44px}}
