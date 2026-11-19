@@ -118,6 +118,8 @@ pub mod forkchoice;
 pub mod gossip;
 pub mod header;
 pub mod interfaces;
+// Fault boundary between the L1 core and the L2 / bridge handlers.
+pub mod isolation;
 pub mod kes;
 pub mod params;
 // Instrumentation only, and compiled out unless `perf-timing` is on — see

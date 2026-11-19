@@ -235,13 +235,16 @@ impl CommittedState {
         base_fee: u128,
     ) -> Option<L2DataAvailabilityReject> {
         use L2DataAvailabilityReject as R;
-        if let Err(why) = self.check_l2_data_availability(tx, base_fee) {
-            return Some(why);
-        }
-        let Some(l2) = self.l2_settlement.as_ref() else { return Some(R::NotActive) };
-        l2.check_data_availability(tx.l2_chain_id, tx.l2_block_number, &tx.commitment())
-            .err()
-            .map(da_refusal)
+        // Node-local fault boundary (`crate::isolation`): a fault is a refusal.
+        crate::isolation::contain_refusal(R::Arithmetic, || {
+            if let Err(why) = self.check_l2_data_availability(tx, base_fee) {
+                return Some(why);
+            }
+            let Some(l2) = self.l2_settlement.as_ref() else { return Some(R::NotActive) };
+            l2.check_data_availability(tx.l2_chain_id, tx.l2_block_number, &tx.commitment())
+                .err()
+                .map(da_refusal)
+        })
     }
 
     /// The state checks of [`Self::apply_l2_data_availability`], in its

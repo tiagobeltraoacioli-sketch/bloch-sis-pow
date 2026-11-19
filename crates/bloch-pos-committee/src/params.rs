@@ -2936,6 +2936,51 @@ pub(crate) mod l2_release_exemption_rehearsal {
     }
 }
 
+/// Fault isolation of the L2 / bridge / settlement handlers inside the block
+/// transition ([`crate::isolation`]). `u64::MAX` means INERT.
+///
+/// Before this gate a panic in the handler of an L2 settlement, deposit,
+/// data-availability or withdrawal-claim transaction unwinds the block
+/// transition: every node that judges the block stops on it. Once armed, the
+/// handler runs behind [`crate::isolation::contain`] and a fault refuses the
+/// transaction, so the block is invalid (`TransitionError::Transaction(i)`)
+/// like any block carrying an invalid transaction.
+///
+/// No block that any node has ever accepted changes verdict: a block whose
+/// transition panics was never adopted by anybody. What changes is the
+/// outcome for such a block on a mixed fleet (old nodes stop, new nodes
+/// refuse it and follow another block) and what a node does on a fault that
+/// is local to it (it refuses a block the rest of the network accepts instead
+/// of stopping). That is why it sits behind a gate the owner arms rather than
+/// shipping live; it cannot precede the L2 settlement itself.
+/// `l2_fault_isolation_gate_is_inert` pins the inert value.
+pub const L2_FAULT_ISOLATION_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_FAULT_ISOLATION_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+
+pub fn l2_fault_isolation_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_fault_isolation_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_FAULT_ISOLATION_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_fault_isolation_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Flag day for the native L2 settlement on a network that is already running
 /// (M8 part 2), activated on mainnet at the epoch recorded below.
 ///

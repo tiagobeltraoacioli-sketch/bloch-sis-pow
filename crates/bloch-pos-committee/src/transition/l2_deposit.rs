@@ -170,15 +170,18 @@ impl CommittedState {
     /// the transition would accept in this state.
     pub fn l2_deposit_refusal_at(&self, tx: &L2Deposit, base_fee: u128) -> Option<L2DepositReject> {
         use L2DepositReject as R;
-        if let Err(why) = self.check_l2_deposit(tx, base_fee) {
-            return Some(why);
-        }
-        // The fallible steps that follow the signature in `apply_l2_deposit`.
-        let Some(l2) = self.l2_settlement.as_ref() else { return Some(R::NotActive) };
-        if l2.height().checked_add(1).is_none() {
-            return Some(R::Arithmetic);
-        }
-        (!l2.can_append_deposit(tx.amount_sat)).then_some(R::Inbox)
+        // Node-local fault boundary (`crate::isolation`): a fault is a refusal.
+        crate::isolation::contain_refusal(R::Arithmetic, || {
+            if let Err(why) = self.check_l2_deposit(tx, base_fee) {
+                return Some(why);
+            }
+            // The fallible steps that follow the signature in `apply_l2_deposit`.
+            let Some(l2) = self.l2_settlement.as_ref() else { return Some(R::NotActive) };
+            if l2.height().checked_add(1).is_none() {
+                return Some(R::Arithmetic);
+            }
+            (!l2.can_append_deposit(tx.amount_sat)).then_some(R::Inbox)
+        })
     }
 
     /// The state checks of [`Self::apply_l2_deposit`], in its order, up to

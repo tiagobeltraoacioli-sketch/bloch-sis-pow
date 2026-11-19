@@ -2020,12 +2020,17 @@ impl State {
     /// [`Self::validate_async`] it judges a state with no pinned source the
     /// way the next block's transition will (it pins `head` first), so a
     /// settlement is never dropped for an anchor the next block provides.
+    ///
+    /// Behind the node-local fault boundary (`crate::isolation`): a fault is
+    /// a refusal ([`Reject::Height`], the reason of an internal limit).
     pub fn pending_async_refusal(&self, tx: &Transaction, head: [u8; 32], head_slot: u64) -> Option<Reject> {
-        match self.check_against_source(tx, head, head_slot, true) {
-            Err(why) => Some(why),
-            Ok((_, _, Some(_))) if self.withdrawals.len() >= self.profile.limits.max_records() => Some(Reject::Limit),
-            Ok(_) => None,
-        }
+        crate::isolation::contain_refusal(Reject::Height, || {
+            match self.check_against_source(tx, head, head_slot, true) {
+                Err(why) => Some(why),
+                Ok((_, _, Some(_))) if self.withdrawals.len() >= self.profile.limits.max_records() => Some(Reject::Limit),
+                Ok(_) => None,
+            }
+        })
     }
 
     /// Mempool preflight shares the transition checks and never mutates state.
@@ -2036,7 +2041,15 @@ impl State {
     /// verification. `verifier` is therefore reached only by a settlement
     /// whose policy, source, successor and body already match this state, so
     /// a caller can meter it.
+    ///
+    /// Behind the node-local fault boundary (`crate::isolation`), the proof
+    /// verification included: a fault is a refusal ([`Reject::Height`], not
+    /// [`Reject::Proof`], so the caller does not conclude the proof is bad).
     pub fn validate_async(&self, tx: &Transaction, verifier: &dyn crate::attestation::SignatureVerifier) -> Result<(), Reject> {
+        crate::isolation::contain(|| self.validate_async_unguarded(tx, verifier)).unwrap_or(Err(Reject::Height))
+    }
+
+    fn validate_async_unguarded(&self, tx: &Transaction, verifier: &dyn crate::attestation::SignatureVerifier) -> Result<(), Reject> {
         let (_, _, new_withdrawals) = self.check_before_proof(tx, [0; 32], 0, true)?;
         if new_withdrawals.is_some() && self.withdrawals.len() >= self.profile.limits.max_records() {
             return Err(Reject::Limit);
