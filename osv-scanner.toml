@@ -283,6 +283,26 @@ ignoreUntil = 2027-02-14
 reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
 
 [[IgnoredVulns]]
+id = "RUSTSEC-2026-0549"   # hickory DNSSEC NSEC3 NODATA at zone apex
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56); patched = [] for hickory-proto, the fix lives in hickory-net 0.26.2. DNSSEC validator only, and hickory-proto is built without DNSSEC features (features: futures-io, mdns, socket2, std, tokio), so the affected code is not compiled. The libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Added 2026-11-18 (L1 round 19); mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0550"   # hickory DNSSEC unsigned NSEC/NSEC3 in a proof
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56); patched = [] for hickory-proto, the fix lives in hickory-net 0.26.2. DNSSEC validator only, and hickory-proto is built without DNSSEC features (features: futures-io, mdns, socket2, std, tokio), so the affected code is not compiled. The libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Added 2026-11-18 (L1 round 19); mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0551"   # hickory DNSSEC records of another DNS class
+ignoreUntil = 2027-02-14
+reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56); patched = [] for hickory-proto, the fix lives in hickory-net 0.26.2. DNSSEC validator only, and hickory-proto is built without DNSSEC features (features: futures-io, mdns, socket2, std, tokio), so the affected code is not compiled. The libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Added 2026-11-18 (L1 round 19); mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"   # chrono unmaintained (all versions)
+ignoreUntil = 2027-02-14
+reason = "informational = unmaintained, patched = []: nothing to bump to. First-party use is Utc::now().to_rfc3339() for wallet-file created_at in bloch-crypto and the frozen Genesis-3 node; never a consensus input, no parsing of untrusted date strings. Added 2026-11-18 (L1 round 19); mirrors audit.toml/deny.toml; re-review 2027-02-14."
+
+[[IgnoredVulns]]
 id = "GHSA-6f2x-v7q7-m7m5"   # hickory-resolver follows irrelevant CNAME records (GHSA-only)
 ignoreUntil = 2027-02-14
 reason = "hickory 0.25.2 pinned by libp2p-dns 0.44 (libp2p 0.56), fix >= 0.26.2. Resolves only operator-written /dns* --p2p-peer addresses, built without DNSSEC features. Compiled into bloch-pos but not reachable on the mainnet configuration: the libp2p swarm is built only under --transport libp2p|dual and the fleet runs --transport devnet. Must be fixed before any production unit runs libp2p or dual. Mirrors audit.toml/deny.toml; re-review 2027-02-14."
