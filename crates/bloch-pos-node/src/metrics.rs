@@ -294,6 +294,23 @@ pub struct NodeMetrics {
     /// Transactions shed at admission (re-broadcast by their wallets). The
     /// first class to be shed under pressure, by policy.
     pub net_shed_transactions_total: AtomicU64,
+    /// `--mesh-security` of this node: 0 plain, 1 offer, 2 require.
+    pub mesh_security_mode: AtomicU64,
+    /// Devnet-mesh sessions open now that run sealed (post-quantum
+    /// handshake completed), both directions.
+    pub mesh_sealed_sessions: AtomicU64,
+    /// Sealed sessions established since start.
+    pub mesh_sealed_sessions_total: AtomicU64,
+    /// Plain sessions open now to an address this node dialed (`--peers`).
+    pub mesh_plain_sessions_outbound: AtomicU64,
+    pub mesh_plain_sessions_outbound_total: AtomicU64,
+    /// Plain inbound sessions open now that delivered at least one
+    /// well-formed frame (a port scan is not a session).
+    pub mesh_plain_sessions_inbound: AtomicU64,
+    pub mesh_plain_sessions_inbound_total: AtomicU64,
+    /// Connections a `require` node refused because the peer did not speak
+    /// the handshake, in either direction.
+    pub mesh_plain_refused_total: AtomicU64,
 }
 
 impl NodeMetrics {
@@ -339,6 +356,14 @@ impl NodeMetrics {
             net_shed_blocks_total: AtomicU64::new(0),
             net_shed_attestations_total: AtomicU64::new(0),
             net_shed_transactions_total: AtomicU64::new(0),
+            mesh_security_mode: AtomicU64::new(0),
+            mesh_sealed_sessions: AtomicU64::new(0),
+            mesh_sealed_sessions_total: AtomicU64::new(0),
+            mesh_plain_sessions_outbound: AtomicU64::new(0),
+            mesh_plain_sessions_outbound_total: AtomicU64::new(0),
+            mesh_plain_sessions_inbound: AtomicU64::new(0),
+            mesh_plain_sessions_inbound_total: AtomicU64::new(0),
+            mesh_plain_refused_total: AtomicU64::new(0),
         }
     }
 
@@ -603,6 +628,54 @@ impl NodeMetrics {
             "counter",
             "Transactions shed at queue admission because the budget was full (recoverable: re-broadcast); shed first by policy",
             self.get(&self.net_shed_transactions_total),
+        );
+        series(
+            "bloch_pos_mesh_security_mode",
+            "gauge",
+            "--mesh-security of this node: 0 plain, 1 offer, 2 require",
+            self.get(&self.mesh_security_mode),
+        );
+        series(
+            "bloch_pos_mesh_sealed_sessions",
+            "gauge",
+            "Devnet-mesh sessions open now that completed the post-quantum handshake (both directions)",
+            self.get(&self.mesh_sealed_sessions),
+        );
+        series(
+            "bloch_pos_mesh_sealed_sessions_total",
+            "counter",
+            "Devnet-mesh sessions that completed the post-quantum handshake since start",
+            self.get(&self.mesh_sealed_sessions_total),
+        );
+        series(
+            "bloch_pos_mesh_plain_sessions_outbound",
+            "gauge",
+            "Plain (unencrypted) sessions open now to a --peers address; 0 on every node before a peer loses its plain access",
+            self.get(&self.mesh_plain_sessions_outbound),
+        );
+        series(
+            "bloch_pos_mesh_plain_sessions_outbound_total",
+            "counter",
+            "Plain sessions established to a --peers address since start",
+            self.get(&self.mesh_plain_sessions_outbound_total),
+        );
+        series(
+            "bloch_pos_mesh_plain_sessions_inbound",
+            "gauge",
+            "Plain inbound sessions open now that delivered at least one well-formed frame",
+            self.get(&self.mesh_plain_sessions_inbound),
+        );
+        series(
+            "bloch_pos_mesh_plain_sessions_inbound_total",
+            "counter",
+            "Plain inbound sessions that delivered at least one well-formed frame since start",
+            self.get(&self.mesh_plain_sessions_inbound_total),
+        );
+        series(
+            "bloch_pos_mesh_plain_refused_total",
+            "counter",
+            "Connections refused under --mesh-security require because the peer did not speak the handshake",
+            self.get(&self.mesh_plain_refused_total),
         );
         out
     }
@@ -1003,6 +1076,14 @@ mod tests {
             "bloch_pos_net_shed_blocks_total",
             "bloch_pos_net_shed_attestations_total",
             "bloch_pos_net_shed_transactions_total",
+            "bloch_pos_mesh_security_mode",
+            "bloch_pos_mesh_sealed_sessions",
+            "bloch_pos_mesh_sealed_sessions_total",
+            "bloch_pos_mesh_plain_sessions_outbound",
+            "bloch_pos_mesh_plain_sessions_outbound_total",
+            "bloch_pos_mesh_plain_sessions_inbound",
+            "bloch_pos_mesh_plain_sessions_inbound_total",
+            "bloch_pos_mesh_plain_refused_total",
             "bloch_pos_rejection_logs_suppressed_total",
         ] {
             assert!(text.contains(name), "missing series {name}");
