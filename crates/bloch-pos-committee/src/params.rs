@@ -2752,6 +2752,90 @@ pub(crate) mod funded_delegation_bound_rehearsal {
     }
 }
 
+/// Candidate growth cap on DELEGATED stake activation. `u64::MAX` means
+/// INERT.
+///
+/// [`HF2_GROWTH_CAP_EPOCH`] bounds how fast new OWN stake activates
+/// (`max(W/64, MIN_DEPOSIT)` per 24-epoch window). It does not cover
+/// delegation, which warms up under its own budget,
+/// `max(25 bps of active delegated stake, 500,000 BLCH)` per epoch
+/// (`delegation::Registry::resolve`), and one active validator accepts up to
+/// 500M BLCH of funded delegation. A newcomer with the coins and one
+/// minimum-bond validator therefore reaches one third of the weight in about
+/// 2.3 days and two thirds in 4.9 to 7.6 days at the epoch-6090 weight
+/// (204.66M BLCH), against the 19 days the own-stake cap is sized for
+/// (`transition::funded_delegation::tests::growth_cap_*` reproduce the
+/// figures on the real transition).
+///
+/// Once armed, the ACTIVATION pass of the warm-up walk uses, from this epoch
+/// on, the budget
+/// `max(active delegated / GROWTH_CAP_WARMUP_DIV, GROWTH_CAP_WARMUP_FLOOR_SAT)`
+/// per epoch ([`crate::delegation::GROWTH_CAP_WARMUP_DIV`],
+/// [`crate::delegation::GROWTH_CAP_WARMUP_FLOOR_SAT`]: the only two economic
+/// parameters, both in `delegation.rs`), never more than today's budget.
+/// What it does and does not change:
+///
+/// * Stake already queued when the gate binds is covered: the cap is on
+///   activation, not on admission, so filling the queue before the flag day
+///   buys nothing.
+/// * No delegation is refused or displaced and no minimum changes. A
+///   delegation waits longer in the warm-up queue; that is the whole effect
+///   on a delegator.
+/// * The RELEASE pass keeps today's budget. Deactivation, cool-down and
+///   withdrawal are exactly as fast as before, so the rule cannot hold any
+///   position in.
+/// * Epochs below the gate keep the old budget inside the walk, so every
+///   historical registry, roster and state root is unchanged.
+///
+/// Limits, stated plainly. The budget is measured against delegated stake
+/// and an absolute floor, not against the whole active weight (the walk
+/// cannot see own stake), so the floor has to be re-sized if the weight
+/// moves far from what it was sized against. The delegation budget and the
+/// own-stake budget are separate, so both paths together are faster than
+/// either alone. And a rate limit buys time and visibility, not prevention.
+///
+/// It changes the activated amount of queued delegations, which feeds the
+/// roster, rewards and the state root, so arming needs a historical replay,
+/// mixed-fleet qualification and a coordinated epoch; there is no runtime
+/// override. It cannot precede funded delegation or the own-stake cap.
+/// `funded_delegation_growth_cap_gate_is_inert` pins the inert value.
+pub const FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH,
+    FUNDED_DELEGATION_ACTIVATION_EPOCH
+));
+const _: () = assert!(gate_is_inert_or_not_before(
+    FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH,
+    HF2_GROWTH_CAP_EPOCH
+));
+
+/// The epoch the delegation growth cap takes effect at, `None` while it is
+/// inert. The warm-up walk needs the epoch itself, not a yes/no for one
+/// epoch: it replays every epoch since genesis and applies the cap only to
+/// those at or above this one.
+pub(crate) fn funded_delegation_growth_cap_epoch() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(epoch) = funded_delegation_growth_cap_rehearsal::epoch() {
+        return Some(epoch);
+    }
+    (FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH != u64::MAX)
+        .then_some(FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod funded_delegation_growth_cap_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static EPOCH: Cell<Option<u64>> = const { Cell::new(None) }; }
+    pub fn epoch() -> Option<u64> { EPOCH.with(Cell::get) }
+    /// Armed from `epoch`, so a test can build state below the gate first.
+    pub fn open_at(epoch: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore { fn drop(&mut self) { EPOCH.with(|v| v.set(self.0)); } }
+        Restore(EPOCH.with(|v| v.replace(Some(epoch))))
+    }
+}
+
 /// Security review round 2, DET-3: at most one `ValidatorCommissionUpdate`
 /// per validator per epoch. `u64::MAX` means INERT.
 ///
@@ -3315,6 +3399,8 @@ pub(crate) mod activation_queue_v2_rehearsal {
 /// 7.6 days to 2/3 at the epoch-6090 weight (204.66M BLCH), 4 to 6 days with
 /// both paths combined. The cap removes the hours-scale own-stake path; it
 /// does not by itself deliver the ~19-day figure.
+/// [`FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH`] (inert) is the candidate
+/// rule for the delegation path.
 ///
 /// Onboarding: the `validator-join` wizard deposits the 25,000 BLCH minimum.
 /// The churn limit admits at most `4 x 24 = 96` activations per window, i.e.

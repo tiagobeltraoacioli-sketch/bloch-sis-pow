@@ -724,3 +724,112 @@ neutrality check, and the root can keep the delegation leaves incrementally
 as it already does for the eUTXO set. It changes committed state and the
 state root for every delegation, so it needs its own gate, migration and
 replay qualification, and is left as follow-up work.
+
+## Delegation growth cap
+
+Status: implemented and INERT:
+`FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH = u64::MAX`. The economic
+parameters are a protocol-economics choice that belongs to the owner; the
+shipped values are the middle option of the table below and can be changed
+while the gate is inert.
+
+### The problem
+
+`HF2_GROWTH_CAP_EPOCH` limits how fast new OWN stake activates
+(`max(W/64, 25,000 BLCH)` per 24-epoch window, sized for about 19 days to two
+thirds). Delegated stake does not pass through that budget. It warms up under
+its own, `max(25 bps of active delegated stake, 500,000 BLCH)` per 16-minute
+epoch, and one active validator accepts up to 500,000,000 BLCH of funded
+delegation. One minimum-bond validator and one `FundedDelegate` therefore
+reach one third of the weight in 205 epochs (2.3 days) and two thirds in 687
+epochs (7.6 days) at the epoch-6090 weight of 204.66M BLCH
+(`growth_cap_bypass_through_funded_delegation_today`, on the real
+transition).
+
+### The rule
+
+From the gate epoch on, the ACTIVATION pass of the warm-up walk uses
+
+```
+min( max(active delegated / GROWTH_CAP_WARMUP_DIV, GROWTH_CAP_WARMUP_FLOOR_SAT),
+     today's budget )
+```
+
+per epoch. The two constants are in `delegation.rs` and are the only
+economic parameters; the rule that reads them is `WarmupRule`.
+
+* It is a limit on activation, not on admission. Stake queued before the gate
+  warms up under the capped budget from the gate epoch on, so filling the
+  queue in advance buys nothing.
+* No delegation is refused or displaced, and no minimum changes. The whole
+  effect on a delegator is a longer wait in the warm-up queue (during which
+  the position does not earn).
+* The RELEASE pass keeps today's budget in every epoch. Deactivation,
+  cool-down and withdrawal are exactly as fast as today, and a position the
+  capped queue has not reached can be deactivated and withdrawn after the
+  ordinary cool-down and delay.
+* The walk replays history, so the gate epoch is an input of the walk: epochs
+  below it keep the budget they always had. No committed field is added,
+  removed or reordered, inert or armed; the rule changes only what the walk
+  derives from the committed delegation history.
+
+### Options
+
+Computed on the real walk by `delegation::tests::growth_cap_options_table`
+(which pins the delegation-only figures of the first column pair) at an
+honest weight of 204.66M BLCH, 90 epochs per day. "All own" and "all
+delegated" are the two extremes of how the honest weight is held; today's
+mainnet is close to "all own". "Both paths" adds own stake activated as fast
+as the hard fork 2 cap allows.
+
+| | Permissive (today) | Middle (shipped) | Strict |
+| --- | ---: | ---: | ---: |
+| `GROWTH_CAP_WARMUP_DIV` | 400 (25 bps) | 768 | 1,536 |
+| `GROWTH_CAP_WARMUP_FLOOR_SAT` per epoch | 500,000 BLCH | 250,000 BLCH | 125,000 BLCH |
+| To 1/3, delegation only, honest all own | 205 epochs (2.3 d) | 410 (4.6 d) | 819 (9.1 d) |
+| To 2/3, delegation only, honest all own | 687 (7.6 d) | 1,350 (15.0 d) | 2,700 (30.0 d) |
+| To 1/3, both paths, honest all own | 157 (1.7 d) | 251 (2.8 d) | 361 (4.0 d) |
+| To 2/3, both paths, honest all own | 529 (5.9 d) | 817 (9.1 d) | 1,105 (12.3 d) |
+| To 1/3, delegation only, honest all delegated | 163 (1.8 d) | 312 (3.5 d) | 623 (6.9 d) |
+| To 2/3, delegation only, honest all delegated | 440 (4.9 d) | 845 (9.4 d) | 1,689 (18.8 d) |
+| To 1/3, both paths, honest all delegated | 136 (1.5 d) | 217 (2.4 d) | 337 (3.7 d) |
+| To 2/3, both paths, honest all delegated | 379 (4.2 d) | 625 (6.9 d) | 961 (10.7 d) |
+| Delegations refused or displaced | none | none | none |
+| Minimum delegation | 10 BLCH | 10 BLCH | 10 BLCH |
+| Warm-up of 10 / 100k / 1M / 10M BLCH, empty queue | 1 / 1 / 2 / 20 epochs | 1 / 1 / 4 / 40 | 1 / 1 / 8 / 80 |
+| Exit and withdrawal | today's | today's | today's |
+
+Strict is parity with the own-stake cap (`1/64` of the delegated stake per
+24-epoch window, and a floor of about `W/64` per window at 204.66M BLCH).
+Middle is half-way in rate terms: the budget is half of today's and twice the
+strict one.
+
+### Limits
+
+* The budget is measured against delegated stake and an absolute floor, not
+  against the whole active weight: the walk is a function of the delegation
+  history and cannot see own stake. The floor is the binding term while less
+  than `DIV x FLOOR` (192M BLCH at the shipped values) is delegated, which is
+  where the chain is, and has to be re-sized if the active weight moves far
+  from the 200M BLCH it was sized against.
+* The delegation budget and the own-stake budget are separate, so an attacker
+  using both is faster than either alone (the "both paths" rows). No option
+  here restores the 19-day figure by itself; that needs one shared budget,
+  which means the walk must see the active weight (the incremental resolver
+  of "Not done here").
+* The queue is first-come, first-served. A large position at the head delays
+  everything behind it for longer than today (a 100M BLCH position occupies
+  the floor budget for 400 epochs, 4.4 days, against 200 today). Positions
+  behind it can still leave at any time.
+* A rate limit buys time and visibility, not prevention.
+* The walk replays each epoch in which stake moves, on every uncached
+  resolve. Slower activation means more such epochs for the same history (at
+  most twice as many at the shipped values).
+
+### Arming
+
+As for every consensus gate here: a historical replay of mainnet with the
+armed build, mixed-version qualification across the boundary, a coordinated
+epoch for the whole validating fleet, and an indexer built from the same
+release. There is no runtime override. The gate cannot precede funded
+delegation or the own-stake cap (compile-time assertions in `params.rs`).

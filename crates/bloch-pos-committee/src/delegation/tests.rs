@@ -798,3 +798,420 @@ fn a_neutral_pruning_stays_invisible_under_any_later_history() {
     assert!(neutral > 100, "only {neutral} neutral prunings exercised");
     assert!(refused > 5, "only {refused} refusals exercised");
 }
+
+// ═══ 5. GROWTH CAP (FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH) ══════════
+
+/// The capped rule stated the slow way: every entry visited twice in every
+/// epoch since genesis, the activation pass against the capped budget from
+/// `rule.gate` on, the release pass against the budget it always had.
+/// Written independently of `fold_queue` and of
+/// `WarmupRule::activation_budget`.
+fn capped_reference(delegations: &[Delegation], epoch: u64, rule: &WarmupRule) -> Vec<u128> {
+    let mut order: Vec<usize> = (0..delegations.len())
+        .filter(|i| delegations[*i].eligible && delegations[*i].amount_sat >= MIN_DELEGATION_SAT)
+        .collect();
+    order.sort_by_key(|i| delegations[*i].queue_key());
+    let mut activated = vec![0u128; delegations.len()];
+    let mut total_active = 0u128;
+    for e in 0..=epoch {
+        let release = if e == 0 {
+            u128::MAX
+        } else {
+            (total_active * WARMUP_RATE_BPS / 10_000).max(MIN_CHURN_SAT)
+        };
+        let warm = match rule.gate {
+            Some(gate) if e >= gate && e != 0 => {
+                (total_active / rule.div).max(rule.floor_sat).min(release)
+            }
+            _ => release,
+        };
+        let mut used = 0u128;
+        for &i in &order {
+            let d = &delegations[i];
+            if d.requested_epoch > e || d.deactivate_epoch.is_some_and(|de| de <= e) {
+                continue;
+            }
+            let take = (d.amount_sat - activated[i]).min(warm - used);
+            used += take;
+            activated[i] += take;
+            total_active += take;
+        }
+        let mut released = 0u128;
+        for &i in &order {
+            let d = &delegations[i];
+            if !d.deactivate_epoch.is_some_and(|de| de <= e) {
+                continue;
+            }
+            let give = activated[i].min(release - released);
+            released += give;
+            activated[i] -= give;
+            total_active -= give;
+        }
+    }
+    activated
+}
+
+fn middle_rule(gate: u64) -> WarmupRule {
+    WarmupRule { gate: Some(gate), div: GROWTH_CAP_WARMUP_DIV, floor_sat: GROWTH_CAP_WARMUP_FLOOR_SAT }
+}
+
+/// The inert rule is the old rule, and a gate that has not been reached is
+/// the inert rule: on random histories the walk returns the pre-ST-1
+/// reference value in both cases.
+#[test]
+fn an_inert_or_future_growth_cap_changes_nothing() {
+    assert_eq!(WarmupRule::consensus(), WarmupRule::LEGACY);
+    let mut rng = Rng::new(0x6A0B_CA90);
+    for trial in 0..600u32 {
+        let shape = rng.below(SHAPES);
+        let n = 1 + rng.below(30) as usize;
+        let ds = random_history(&mut rng, shape, n);
+        let epoch = rng.below(last_event(&ds) + 60);
+        let old = resolve_reference(&ds, epoch);
+        let context = format!("trial {trial}, shape {shape}, epoch {epoch}");
+        assert_same_view(&Registry::resolve_with_rule(&ds, epoch, &WarmupRule::LEGACY), &old, &ds, &context);
+        // A gate strictly above the resolved epoch, down to the very next one.
+        for gate in [epoch + 1, epoch + 1 + rng.below(500), u64::MAX] {
+            assert_same_view(&Registry::resolve_with_rule(&ds, epoch, &middle_rule(gate)), &old, &ds, &context);
+        }
+        // Constants that are not below today's are no cap at all.
+        let loose = WarmupRule { gate: Some(rng.below(epoch + 1)), div: 400, floor_sat: MIN_CHURN_SAT };
+        assert_same_view(&Registry::resolve_with_rule(&ds, epoch, &loose), &old, &ds, &context);
+        let looser = WarmupRule { gate: Some(0), div: 1, floor_sat: u128::MAX };
+        assert_same_view(&Registry::resolve_with_rule(&ds, epoch, &looser), &old, &ds, &context);
+    }
+}
+
+/// The skipping walk against the two-passes-per-epoch statement of the
+/// capped rule, with gates before, inside and after the history and with
+/// several parameter choices.
+#[test]
+fn capped_fold_matches_a_naive_capped_walk() {
+    let mut rng = Rng::new(0x6A0B_CA91);
+    let mut capped_runs = 0u32;
+    let mut compared_records = 0u32;
+    for trial in 0..1_200u32 {
+        let shape = rng.below(SHAPES);
+        let n = 1 + rng.below(30) as usize;
+        let ds = random_history(&mut rng, shape, n);
+        let horizon = [3, 60, 900][rng.below(3) as usize];
+        let epoch = rng.below(last_event(&ds) + horizon);
+        let rule = WarmupRule {
+            gate: Some(rng.below(epoch + 3)),
+            div: [400, 768, 1_536, 7][rng.below(4) as usize],
+            floor_sat: [MIN_CHURN_SAT, MIN_CHURN_SAT / 2, MIN_CHURN_SAT / 4, 1][rng.below(4) as usize],
+        };
+        let registry = Registry::resolve_with_rule(&ds, epoch, &rule);
+        let want = capped_reference(&ds, epoch, &rule);
+        let in_fold = |d: &Delegation| d.eligible && d.amount_sat >= MIN_DELEGATION_SAT;
+        let mut total = 0u128;
+        let mut compared = 0u32;
+        for (d, expected) in ds.iter().zip(want.iter()) {
+            total += *expected;
+            // Records that tie on the whole queue key are interchangeable
+            // (which of them takes a slice first is not observable), so the
+            // per-record amount is compared only where the key is unique;
+            // the sum below covers the rest.
+            let twins = ds.iter().filter(|o| in_fold(o) && o.queue_key() == d.queue_key()).count();
+            if in_fold(d) && twins == 1 {
+                assert_eq!(registry.activated_sat(d), *expected, "trial {trial}, epoch {epoch}, {rule:?}");
+                compared += 1;
+            }
+        }
+        compared_records += compared;
+        assert_eq!(registry.total_active(), total, "trial {trial}, epoch {epoch}, {rule:?}");
+        capped_runs += u32::from(registry != Registry::resolve_with_rule(&ds, epoch, &WarmupRule::LEGACY));
+    }
+    assert!(capped_runs > 100, "only {capped_runs} histories were changed by the cap");
+    assert!(compared_records > 5_000, "only {compared_records} records compared one by one");
+}
+
+/// The gate epoch itself is the first capped epoch; the epoch before it is
+/// the last with today's budget.
+#[test]
+fn the_cap_binds_exactly_at_its_gate_epoch() {
+    const GATE: u64 = 10;
+    let whale = position(1, 100_000_000, 5);
+    let at = |epoch| Registry::resolve_with_rule(&[whale], epoch, &middle_rule(GATE)).total_active();
+    // Epochs 5..=9: 500,000 BLCH each.
+    assert_eq!(at(GATE - 1), 5 * MIN_CHURN_SAT);
+    assert_eq!(at(GATE - 1), Registry::resolve_with_rule(&[whale], GATE - 1, &WarmupRule::LEGACY).total_active());
+    // Epoch 10 on: the floor, 250,000 BLCH each.
+    assert_eq!(at(GATE), 5 * MIN_CHURN_SAT + GROWTH_CAP_WARMUP_FLOOR_SAT);
+    assert_eq!(at(GATE + 7), 5 * MIN_CHURN_SAT + 8 * GROWTH_CAP_WARMUP_FLOOR_SAT);
+}
+
+/// The proportional term replaces the floor exactly when
+/// `active / DIV` exceeds it, and the capped budget never exceeds today's.
+#[test]
+fn the_capped_budget_at_its_limits() {
+    let rule = middle_rule(1);
+    let crossover = GROWTH_CAP_WARMUP_DIV * GROWTH_CAP_WARMUP_FLOOR_SAT;
+    assert_eq!(crossover, 192_000_000 * BLCH);
+    let legacy = |active| epoch_budget(1, active);
+    // At and below the crossover the floor binds; one divisor above it the
+    // proportional term is one satoshi larger.
+    for active in [0, 1, crossover - 1, crossover, crossover + GROWTH_CAP_WARMUP_DIV - 1] {
+        assert_eq!(rule.activation_budget(1, active, legacy(active)), GROWTH_CAP_WARMUP_FLOOR_SAT);
+    }
+    assert_eq!(
+        rule.activation_budget(1, crossover + GROWTH_CAP_WARMUP_DIV, legacy(crossover + GROWTH_CAP_WARMUP_DIV)),
+        GROWTH_CAP_WARMUP_FLOOR_SAT + 1
+    );
+    // Never above today's budget, for any amount of active stake up to the
+    // whole supply and for any constants.
+    let supply = crate::tokenomics_v4::TOTAL_SUPPLY_SAT;
+    for active in [0, BLCH, crossover, 10 * crossover, supply] {
+        for (div, floor_sat) in [(768, GROWTH_CAP_WARMUP_FLOOR_SAT), (1, 0), (1, u128::MAX), (u128::MAX, 0)] {
+            let rule = WarmupRule { gate: Some(1), div, floor_sat };
+            assert!(rule.activation_budget(1, active, legacy(active)) <= legacy(active));
+        }
+    }
+    // Below the gate and at genesis: today's budget, untouched.
+    assert_eq!(middle_rule(5).activation_budget(4, crossover, legacy(crossover)), legacy(crossover));
+    assert_eq!(middle_rule(0).activation_budget(0, 0, u128::MAX), u128::MAX);
+    // A zero floor still drains a queue only through the proportional term;
+    // the shipped floor is positive, so a queue always moves.
+    assert!(GROWTH_CAP_WARMUP_FLOOR_SAT >= MIN_DELEGATION_SAT);
+}
+
+/// Release is not capped: stake that is leaving drains at exactly today's
+/// speed, whether or not the cap is armed and whatever is queued to enter.
+#[test]
+fn the_cap_never_slows_release() {
+    const GATE: u64 = 3;
+    // 40M BLCH active from genesis, deactivated after the gate, with 300M
+    // BLCH queued behind it trying to enter.
+    let mut leaving = position(1, 40_000_000, 0);
+    leaving.deactivate_epoch = Some(GATE + 2);
+    let entering = position(2, 300_000_000, GATE + 1);
+    let alone = [leaving];
+    let crowded = [leaving, entering];
+    let mut drained_at = None;
+    for epoch in 0..200 {
+        let legacy = Registry::resolve_with_rule(&alone, epoch, &WarmupRule::LEGACY).activated_sat(&leaving);
+        for ds in [&alone[..], &crowded[..]] {
+            for rule in [middle_rule(GATE), WarmupRule { gate: Some(GATE), div: 1_536, floor_sat: 1 }] {
+                assert_eq!(Registry::resolve_with_rule(ds, epoch, &rule).activated_sat(&leaving), legacy, "epoch {epoch}");
+            }
+        }
+        if legacy == 0 && drained_at.is_none() {
+            drained_at = Some(epoch);
+        }
+    }
+    // 40M at 500,000 BLCH per epoch: 80 epochs from the deactivation epoch.
+    assert_eq!(drained_at, Some(GATE + 2 + 79));
+
+    // A position that never got any budget leaves at once: nothing to drain.
+    let mut stuck = position(3, 1_000, GATE + 1);
+    stuck.requested_epoch = GATE + 2;
+    stuck.deactivate_epoch = Some(GATE + 4);
+    let ds = [entering, stuck];
+    for epoch in GATE + 4..GATE + 50 {
+        let r = Registry::resolve_with_rule(&ds, epoch, &middle_rule(GATE));
+        assert_eq!(r.activated_sat(&stuck), 0);
+        assert_eq!(
+            r.state_of(&stuck),
+            if epoch >= GATE + 4 + COOLDOWN_EPOCHS { StakeState::Inactive } else { StakeState::Deactivating }
+        );
+    }
+}
+
+// ── The three options, computed on the real walk ────────────────────────────
+
+/// Honest weight the options are compared at: the epoch-6090 figure quoted
+/// on `params::HF2_GROWTH_CAP_EPOCH`.
+const MODEL_WEIGHT: u128 = 204_660_000 * BLCH;
+const EPOCHS_PER_DAY: f64 = 90.0;
+
+/// Epochs from the attacker's request until its ACTIVE stake first reaches
+/// one third and two thirds of the total, `(to_third, to_two_thirds)`.
+/// The request is made in the epoch before `START` and takes its first slice
+/// at `START`, as a `FundedDelegate` does on the real transition, so the
+/// counts are the ones `transition::funded_delegation::tests::growth_cap_*`
+/// measure through real epoch boundaries.
+///
+/// `honest_delegated` of the honest weight is delegated stake (active since
+/// genesis); the rest is own stake. The attacker delegates far more than it
+/// needs, to validators it controls. With `own_path` it also activates own
+/// stake as fast as the HF2 cap allows: `staking::growth_budget_sat(W)` per
+/// `GROWTH_WINDOW_EPOCHS`, an upper bound on what FIFO admission lets
+/// through. The delegated side is the real walk under `rule`.
+fn epochs_to_thresholds(rule: WarmupRule, honest_delegated: u128, own_path: bool) -> (u64, u64) {
+    const START: u64 = 100;
+    let mut ds = Vec::new();
+    if honest_delegated > 0 {
+        ds.push(Delegation {
+            delegator: 0, validator: 0, amount_sat: honest_delegated,
+            requested_epoch: 0, deactivate_epoch: None, eligible: true,
+        });
+    }
+    // Four validators' worth of the 500M BLCH per-validator ceiling.
+    for k in 1..=4u32 {
+        ds.push(Delegation {
+            delegator: k, validator: k, amount_sat: 500_000_000 * BLCH,
+            requested_epoch: START, deactivate_epoch: None, eligible: true,
+        });
+    }
+    let rule = WarmupRule { gate: rule.gate.map(|_| START), ..rule };
+    let mut own = 0u128;
+    let (mut third, mut two_thirds) = (None, None);
+    // Coarse steps, then the exact epoch: the walk is monotone here.
+    let attacker_at = |epoch: u64, own: u128| {
+        Registry::resolve_with_rule(&ds, epoch, &rule).total_active() - honest_delegated + own
+    };
+    let mut epoch = START;
+    while two_thirds.is_none() {
+        epoch += 1;
+        assert!(epoch < START + 20_000);
+        if own_path && (epoch - START) % crate::staking::GROWTH_WINDOW_EPOCHS == 0 {
+            let w = MODEL_WEIGHT + attacker_at(epoch - 1, own);
+            own += crate::staking::growth_budget_sat(w);
+        }
+        let attacker = attacker_at(epoch, own);
+        if third.is_none() && 2 * attacker >= MODEL_WEIGHT {
+            third = Some(epoch - START + 1);
+        }
+        if attacker >= 2 * MODEL_WEIGHT {
+            two_thirds = Some(epoch - START + 1);
+        }
+    }
+    (third.unwrap(), two_thirds.unwrap())
+}
+
+/// Epochs for one honest delegation of `amount` to be fully active when the
+/// queue is otherwise empty and little delegated stake is active.
+fn epochs_to_warm_up(rule: WarmupRule, amount: u128) -> u64 {
+    const START: u64 = 100;
+    let d = Delegation {
+        delegator: 1, validator: 1, amount_sat: amount,
+        requested_epoch: START, deactivate_epoch: None, eligible: true,
+    };
+    let rule = WarmupRule { gate: rule.gate.map(|_| START), ..rule };
+    (START..).find(|e| Registry::resolve_with_rule(&[d], *e, &rule).activated_sat(&d) == amount).unwrap() - START + 1
+}
+
+const OPTIONS: [(&str, WarmupRule); 3] = [
+    ("permissive (today)", WarmupRule { gate: None, div: 400, floor_sat: 500_000 * BLCH }),
+    ("middle (shipped)", WarmupRule { gate: Some(0), div: 768, floor_sat: 250_000 * BLCH }),
+    ("strict", WarmupRule { gate: Some(0), div: 1_536, floor_sat: 125_000 * BLCH }),
+];
+
+/// The table of the report and of the spec, computed, with the figures the
+/// documentation quotes pinned so they cannot drift from the code.
+#[test]
+fn growth_cap_options_table() {
+    assert_eq!((OPTIONS[1].1.div, OPTIONS[1].1.floor_sat), (GROWTH_CAP_WARMUP_DIV, GROWTH_CAP_WARMUP_FLOOR_SAT));
+    let days = |epochs: u64| epochs as f64 / EPOCHS_PER_DAY;
+    let mut rows = Vec::new();
+    println!("honest weight {} BLCH; epochs (days)", MODEL_WEIGHT / BLCH);
+    println!("option | delegated share of honest weight | path | to 1/3 | to 2/3");
+    for (name, rule) in OPTIONS {
+        let mut row = Vec::new();
+        for (label, honest_delegated) in [("0%", 0), ("100%", MODEL_WEIGHT)] {
+            for own_path in [false, true] {
+                let (third, two_thirds) = epochs_to_thresholds(rule, honest_delegated, own_path);
+                println!(
+                    "{name} | {label} | {} | {third} ({:.1} d) | {two_thirds} ({:.1} d)",
+                    if own_path { "delegation + own stake" } else { "delegation only" },
+                    days(third), days(two_thirds),
+                );
+                row.push((third, two_thirds));
+            }
+        }
+        let waits: Vec<u64> = [10, 100_000, 1_000_000, 10_000_000]
+            .iter().map(|blch| epochs_to_warm_up(rule, blch * BLCH)).collect();
+        println!("{name} | warm-up of 10 / 100k / 1M / 10M BLCH on an empty queue: {waits:?} epochs");
+        rows.push((row, waits));
+    }
+    // [option][0: none delegated, delegation only; 1: none, both paths;
+    //          2: all delegated, delegation only; 3: all, both paths]
+    let at = |option: usize, case: usize| rows[option].0[case];
+    // Today: the figures on `HF2_GROWTH_CAP_EPOCH` (7.6 and about 5 days).
+    assert_eq!(at(0, 0), (205, 687));
+    assert_eq!(at(0, 2), (163, 440));
+    // Shipped: one third takes twice as long as today, two thirds about
+    // twice; strict doubles again.
+    assert_eq!(at(1, 0), (410, 1_350));
+    assert_eq!(at(2, 0), (819, 2_700));
+    // Every option is ordered in every case.
+    for case in 0..4 {
+        assert!(at(0, case).0 < at(1, case).0 && at(1, case).0 < at(2, case).0);
+        assert!(at(0, case).1 < at(1, case).1 && at(1, case).1 < at(2, case).1);
+    }
+    // Effect on a delegator: waiting time only.
+    assert_eq!(rows[0].1, vec![1, 1, 2, 20]);
+    assert_eq!(rows[1].1, vec![1, 1, 4, 40]);
+    assert_eq!(rows[2].1, vec![1, 1, 8, 80]);
+}
+
+/// The pruning check of `FUNDED_DELEGATION_BOUND_ACTIVATION_EPOCH` reads the
+/// same rule as the resolver, so the two gates compose: with the growth cap
+/// armed before, at or after the pruning epoch, a pruning the check accepts
+/// is still invisible at that epoch and at every later one, and the pruned
+/// list still resolves to the two-passes-per-epoch statement of the capped
+/// rule.
+#[test]
+fn a_neutral_pruning_stays_invisible_under_the_growth_cap() {
+    let mut rng = Rng::new(0x6A0B_CA92);
+    let (mut neutral, mut refused, mut capped) = (0u32, 0u32, 0u32);
+    for trial in 0..500u32 {
+        let shape = 1 + rng.below(3);
+        let n = 2 + rng.below(30) as usize;
+        let ds = random_history(&mut rng, shape, n);
+        let at = rng.below(last_event(&ds) + 200);
+        let gate = rng.below(at + 40);
+        let _cap = crate::params::funded_delegation_growth_cap_rehearsal::open_at(gate);
+        let rule = WarmupRule::consensus();
+        assert_eq!(rule, middle_rule(gate));
+        let now = Registry::resolve_uncached(&ds, at);
+        let positions: Vec<usize> = (0..ds.len())
+            .filter(|i| {
+                let d = &ds[*i];
+                d.eligible
+                    && d.amount_sat >= MIN_DELEGATION_SAT
+                    && d.deactivate_epoch.is_some_and(|de| de <= at)
+                    && now.activated_sat(d) == 0
+                    && rng.below(3) != 0
+            })
+            .collect();
+        if positions.is_empty() {
+            continue;
+        }
+        if !pruning_is_outcome_neutral(&ds, &positions, at) {
+            refused += 1;
+            continue;
+        }
+        neutral += 1;
+
+        let mut full = ds.clone();
+        for d in full.iter_mut() {
+            if d.deactivate_epoch.is_none() && rng.below(3) == 0 {
+                d.deactivate_epoch = Some(at + 1 + rng.below(40));
+            }
+        }
+        for k in 0..rng.below(6) as u32 {
+            let mut d = random_history(&mut rng, shape, 1)[0];
+            d.delegator = 50_000 + k;
+            d.requested_epoch = at + 1 + rng.below(30);
+            d.deactivate_epoch = (rng.below(2) == 0).then(|| d.requested_epoch + rng.below(50));
+            full.push(d);
+        }
+        let cut = pruned(&full, &positions);
+        for epoch in (at..at + 120).chain([at + 400, at + 3_000]) {
+            assert_eq!(
+                Registry::resolve_uncached(&cut, epoch),
+                Registry::resolve_uncached(&full, epoch),
+                "trial {trial}, pruned at {at}, gate {gate}, epoch {epoch}"
+            );
+        }
+        let want: u128 = capped_reference(&full, at + 7, &rule).iter().sum();
+        assert_eq!(Registry::resolve_uncached(&cut, at + 7).total_active(), want, "trial {trial}");
+        capped += u32::from(
+            Registry::resolve_uncached(&full, at + 60) != Registry::resolve_with_rule(&full, at + 60, &WarmupRule::LEGACY),
+        );
+    }
+    assert!(neutral > 100, "only {neutral} neutral prunings exercised");
+    assert!(refused > 5, "only {refused} refusals exercised");
+    assert!(capped > 20, "only {capped} of the histories were changed by the cap");
+}
