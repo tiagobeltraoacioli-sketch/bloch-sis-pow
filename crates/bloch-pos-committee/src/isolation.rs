@@ -14,8 +14,16 @@
 //! `None`, which the caller maps to the refusal it already has for an invalid
 //! transaction. It is used in two places with different standing:
 //!
-//! * **Mempool / relay preflight (node-local, always on).** A preflight that
-//!   faults refuses the transaction. Nothing about block validity changes.
+//! * **Mempool / relay preflight (node-local, always on).** The preflight
+//!   entry points the node calls at the mempool door and at proposer
+//!   selection (`CommittedState::l2_deposit_refusal_at`,
+//!   `l2_data_availability_refusal_at`, the `l2_withdraw_claim_refusal*`
+//!   family, `l2_settlement::State::validate_async` and
+//!   `pending_async_refusal`) run behind [`contain_refusal`]: a preflight that
+//!   faults refuses the transaction. None of them is called by the block
+//!   transition, so nothing about block validity changes. Without it, one
+//!   gossiped transaction that faults a handler stops every node that
+//!   receives it (the preflight runs on the consensus thread).
 //! * **Block transition (consensus surface, gated by
 //!   [`crate::params::L2_FAULT_ISOLATION_ACTIVATION_EPOCH`], inert).** A
 //!   transaction of [`is_non_l1`] whose handler faults is refused like any
@@ -40,14 +48,34 @@ static CONTAINED_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// transaction types whose handlers serve the L2 rather than the L1 ledger
 /// and validator set. The set the block-transition boundary applies to.
 pub fn is_non_l1(tx: &PosTransaction) -> bool {
-    matches!(
-        tx,
+    // Exhaustive on purpose: a new transaction type does not compile until
+    // it is put on one side of the boundary.
+    match tx {
         PosTransaction::L2Settlement(_)
-            | PosTransaction::L2SettlementAsync(_)
-            | PosTransaction::L2Deposit(_)
-            | PosTransaction::L2DataAvailability(_)
-            | PosTransaction::L2WithdrawClaim(_)
-    )
+        | PosTransaction::L2SettlementAsync(_)
+        | PosTransaction::L2Deposit(_)
+        | PosTransaction::L2DataAvailability(_)
+        | PosTransaction::L2WithdrawClaim(_) => true,
+        PosTransaction::Transfer { .. }
+        | PosTransaction::TransferV2 { .. }
+        | PosTransaction::Deposit { .. }
+        | PosTransaction::Exit { .. }
+        | PosTransaction::ExitV2 { .. }
+        | PosTransaction::Withdraw { .. }
+        | PosTransaction::Delegate { .. }
+        | PosTransaction::RandaoRecommit { .. }
+        | PosTransaction::KesRegister { .. }
+        | PosTransaction::KesRotate { .. }
+        | PosTransaction::SlashingEvidence(_)
+        | PosTransaction::FundedDeposit(_)
+        | PosTransaction::FundedDelegate(_)
+        | PosTransaction::FundedUndelegate(_)
+        | PosTransaction::FundedDelegationWithdraw(_)
+        | PosTransaction::ValidatorCommissionUpdate(_)
+        | PosTransaction::WithdrawalCredentialRotation(_)
+        | PosTransaction::RescueCommit(_)
+        | PosTransaction::RescueReveal(_) => false,
+    }
 }
 
 /// Run `f`; `None` if it panicked. The fault is counted and its payload is
@@ -66,6 +94,14 @@ pub fn contain<T>(f: impl FnOnce() -> T) -> Option<T> {
             None
         }
     }
+}
+
+/// The node-local preflight boundary: `f` answers why a transaction would be
+/// refused (`None`: it would be taken); a fault in it is a refusal with the
+/// reason `fault`. Only for functions that borrow the state immutably and are
+/// not part of the block transition.
+pub fn contain_refusal<R>(fault: R, f: impl FnOnce() -> Option<R>) -> Option<R> {
+    contain(f).unwrap_or(Some(fault))
 }
 
 /// Faults contained by this process since it started. Any value above zero
@@ -91,5 +127,23 @@ mod tests {
         });
         assert_eq!(faulted, None);
         assert!(contained_faults() > before);
+    }
+
+    #[test]
+    fn a_faulting_preflight_is_a_refusal() {
+        #[derive(Debug, PartialEq)]
+        enum Why {
+            Rule,
+            Fault,
+        }
+        assert_eq!(contain_refusal(Why::Fault, || None), None);
+        assert_eq!(contain_refusal(Why::Fault, || Some(Why::Rule)), Some(Why::Rule));
+        let before = contained_faults();
+        let zero = std::hint::black_box(0u64);
+        assert_eq!(contain_refusal(Why::Fault, || (1 / zero == 1).then_some(Why::Rule)), Some(Why::Fault));
+        // Checked arithmetic is on in every profile (workspace `overflow-checks`).
+        let top = std::hint::black_box(u64::MAX);
+        assert_eq!(contain_refusal(Why::Fault, || (top + 1 == 0).then_some(Why::Rule)), Some(Why::Fault));
+        assert!(contained_faults() >= before + 2);
     }
 }
