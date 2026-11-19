@@ -44,17 +44,20 @@ The unsigned operator inputs (`--checkpoint-sync-url`,
 `--ws-trusted-checkpoint`, `--ws-trusted-root`) are a separate prototype
 feature, `ws-auto-checkpoint`. Release builds refuse them.
 
-## Validity of the anchor in release A2
+## Validity of the baked anchor
 
 | Item | Value |
 |---|---|
-| Baked epoch E | 7306 (minted 2026-11-03 02:21 UTC, the newest finalized epoch then) |
-| Boundary block | slot 233791, `c2afdb5e523016b6c797ff509ae723d577dab182956fafe15ff4b9aa60fb55c3` |
-| State root | `2905fe3fa97d31fc408f13c57b71e6e165b018cb5485bd22e5d3bb06b3ea44c2` |
-| `issued_at` | 1793672494 |
-| 154-byte file SHA-256 | `86f23350517773156318016bc06cf659e340b37de57692d2c39493efaee9f343` |
-| ws digest | `80e8b1d55e73f28d789cb74159fec2b298c0093cfee5572810a19c6587126f20` |
-| Fresh installs refused from | wall epoch E + 2016 = 9322, 2026-11-25 11:23 UTC |
+| Baked epoch E | 8742 (minted 2026-11-19 01:18 UTC, the newest finalized epoch then) |
+| Boundary block | slot 279743, `7f13dd9b095e0574c67703feae3da23f0e55ea3127e6a51e725a5eaaf7e627ff` |
+| State root | `3d7355dd56464a8903ee0d04b4b112aa28fb525980c9c3e78ceca2b71c98aa33` |
+| `issued_at` | 1795051114 |
+| 154-byte file SHA-256 | `211345ae007638e1ebdb5fa980cb25b690d08d828837527703911e77fb8005b6` |
+| ws digest | `2ef30305353651887ae8a7b81b57d9f2428f13935126294709f8afda2919546c` |
+| Fresh installs refused from | wall epoch E + 2016 = 10758, 2026-12-11 10:19 UTC |
+
+The previous anchor (release A2, epoch 7306, minted 2026-11-03) is refused by
+fresh installs from wall epoch 9322, 2026-11-25 11:23 UTC.
  A node that has synced
 once keeps running on its own finality after that date; only new installs,
 and nodes offline for more than 2016 epochs, need a newer anchor.
