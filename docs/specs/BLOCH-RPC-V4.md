@@ -384,6 +384,14 @@ changed.
 where `PROOF` is `bitmap[32] ‖ u16 count ‖ count × sibling[32]`. Every proof is
 against the state root of the certificate's set-source block.
 
+Format `BLCLMP02` (2026-11-10, security review CRY-2 / FC-5) is the same with
+the magic `"BLCLMP02"` and, appended inside the KES section after the
+entries, `u8 has_bind [u64 bind epoch] ‖ PROOF`: the bind leaf, or its
+absence, against the **checkpoint header's** state root. A proof is `02`
+exactly when it carries that second proof; the node attaches it when the set
+source proves the bind absent and `epoch + 1` is at or past
+`KES_ACTIVATION_EPOCH`, so every proof before that keeps the `01` bytes.
+
 - **Finality leaf (component 0x09), from HF1 (e7180).** Votes weigh the frozen
   finality set, the chain's own weights, instead of own bond. If the leaf carries
   a `pending` set, each link must reach two thirds of both sets. `weights` says
@@ -404,12 +412,33 @@ against the state root of the certificate's set-source block.
   verifier would otherwise refuse the whole proof. A set source far behind the
   target can still fail closed: a KES key registered or rotated after it does
   not verify. Keep hops short, as the default set source does.
-- The bind crossing: the last checkpoint before the bind has a set source that
-  cannot commit the bind, while its finalizing link is already KES-signed. For a
-  bind strictly after `epoch`, the bind leaf is proven against the checkpoint's
-  own state root, which the justifying link (static keys, checked first) backs.
-  A hop cannot skip the bind: from a set source before it, later checkpoints are
-  refused, so a client takes the crossing checkpoint first.
+- KES freshness (2026-11-10, CRY-2 / FC-5). The set source can be far older
+  than the target, and what is absent from an old state may exist later:
+  - "No bind" in a state of epoch `s` is accepted only for link targets
+    `<= s + KES_BIND_DELAY_EPOCHS` (2). The first slot of the KES section is
+    proven against the set source only. The finalizing link, whose target the
+    set source cannot reach, takes the bind or its absence from the
+    checkpoint's own state root (the second proof, `BLCLMP02`), which the
+    justifying link (checked first, quorum included) backs.
+  - Consequence: from `KES_ACTIVATION_EPOCH` until the chain binds, a set
+    source must be the checkpoint right before the target (the default), so a
+    client steps once per epoch; if the checkpoint block of an epoch is more
+    than one epoch older than the epoch, that step cannot be proven and the
+    client waits for a nearer source. Once a set source commits the bind the
+    256-epoch hop is back.
+  - A voter with no KES entry at the set source verifies under its static
+    key past the bind only if the set source is itself bound and in the
+    target's KES period. Otherwise the proof is refused
+    (`voter absence too old`); the node leaves such votes out
+    (`lc_proof::retain_fresh_static_votes`), and when the quorum does not
+    hold without them the client asks again from a nearer set source.
+  - A client keeps only its newest verified checkpoint as a set source and
+    refuses a target at or before it (`lc_proof::verify_next`, used by
+    `verify_chain` and the CLI), so it passes `set_source_epoch` = its last
+    verified epoch.
+  - This is a verifier rule, not a block-validity rule. It takes effect in
+    each verifier when it is rebuilt: `bloch-finality-verify`, and the SP1
+    step program together with its verification key.
 - `epoch <= finalized` does not mean finalized directly. A checkpoint that
   became final only as an ancestor of a later one can be served with votes below
   two thirds on its finalizing link, and the verifier refuses it, correctly.
