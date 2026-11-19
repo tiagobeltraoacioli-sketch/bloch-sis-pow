@@ -1014,3 +1014,197 @@ fn a_block_failing_the_transition_during_a_recomputation_is_removed_and_remember
     let (start, ..) = engine.side_fold_canonical_start(1, &[]).unwrap_or((0, engine.state.arc(), false));
     assert_eq!(engine.reorg_anchors.side.spent, 1 - start + 1, "the canonical replay, then the failing block");
 }
+
+// ---------------------------------------------------------------------------
+// Independent review of 6b35aa94 (RC4) and 4f95205c (RC5), round L1R18.
+// Each test below states a property the two commits are meant to give and
+// FAILS on 4f95205c (verified by running them there, 2026-11-18).
+//
+// - L1R18-RC-03 (two tests, the second through the real door) is fixed in
+//   `Engine::rejudge_parked_on`; those tests run and pass.
+// - L1R18-RC-01 and L1R18-RC-02 are NOT fixed (neither fix is small); their
+//   tests are `#[ignore]`d so the suite stays green and still fail when run
+//   with `--ignored`. Remove the attribute together with the fix.
+// ---------------------------------------------------------------------------
+
+/// Review L1R18-RC-01 (the RC5-01 defect, on the path RC5 did not touch).
+///
+/// RC5-01 keeps a block wanted until it is queued, but only a block the door
+/// flagged (`JudgeWantingParentState`: its parent was ALREADY validated and
+/// its state evicted). A block parked while its side-branch parent was still
+/// unvalidated is never flagged; it relies on the single
+/// `rejudge_parked_on` call the fold makes when it validates the parent (and
+/// the parent's child), which moves at most
+/// [`SIDE_PARKED_REJUDGE_PER_BLOCK`] blocks in pool order. Anything parked
+/// ahead of the honest block beyond that cap (unauthenticated headers are
+/// parked for authority too: an unknown or deposit-added index needs no
+/// signature) strands it exactly as in RC5-01: the parent is validated, so
+/// it is no longer a fold candidate, the head does not move, and nothing
+/// queues the block again.
+#[test]
+#[ignore = "open finding L1R18-RC-01 (also present in 0067547f): fails until fixed"]
+fn l1r18_a_block_parked_on_an_unvalidated_side_tip_behind_more_than_the_rejudge_cap_is_still_queued() {
+    let (mut engine, _dir, tip, side) = held_head_with_side_branch(2);
+    let side_tip = side[1];
+    assert!(!engine.blocks.is_validated(&side_tip), "fixture: the fold has not reached the tip yet");
+    // Two validations move blocks parked on the tip: the tip's parent (as
+    // their parent's parent) and the tip itself.
+    let ahead: Vec<[u8; 32]> = (0..2 * SIDE_PARKED_REJUDGE_PER_BLOCK as u64)
+        .map(|k| park_on(&mut engine, side_tip, 1 + k, 0x70 + k as u8))
+        .collect();
+    let honest = park_on(&mut engine, side_tip, 40, 0x6F);
+    assert!(!engine.reorg_anchors.side.wanting.contains(&honest), "fixture: parked before validation, not wanted");
+
+    validate_until(&mut engine, 500, 16, &|e| side.iter().all(|id| e.blocks.is_validated(id)));
+    for id in &ahead {
+        assert!(engine.deferred_orphans.iter().any(|(seen, ..)| seen == id), "fixture: the blocks ahead are queued");
+    }
+    // The door judges what was queued; the head never moves. Give the fold
+    // every chance to queue the honest block.
+    let mut queued = false;
+    for slot in 600..632 {
+        for _ in 0..2 * SIDE_BRANCH_BLOCKS_PER_SLOT {
+            engine.validate_side_branch_turn(slot);
+            queued |= engine.deferred_orphans.iter().any(|(id, ..)| *id == honest);
+        }
+        engine.deferred_orphans.retain(|(id, ..)| *id == honest);
+    }
+    assert_eq!(*engine.head_id().as_bytes(), tip, "the head did not move");
+    assert!(engine.exact_parent_state(&side_tip).is_some(), "its parent's exact state is even held");
+    assert!(queued, "the honest block is stranded in the orphan pool: nothing queues it for the door again");
+}
+
+/// Review L1R18-RC-02: the per-proposer share of recomputation targets
+/// (RC5-02) refuses a third parent, and the refusal is final: the request is
+/// made only at the door, the pool deduplicates a re-offered envelope, and
+/// nothing asks again once the proposer's first two requests were served.
+/// The refused block is stranded although the share is free again.
+#[test]
+#[ignore = "open finding L1R18-RC-02: fails until fixed"]
+fn l1r18_a_request_refused_by_the_per_proposer_share_is_made_again_once_the_share_is_free() {
+    let (mut engine, _dir, tip, side) = held_head_with_side_branch(6);
+    validated_side_branch_evicted_from_the_ring(&mut engine, &side, SIDE_TIP_STATES);
+    // Three parents no recomputation for another one passes by.
+    let parents = [side[0], side[2], side[5]];
+    for id in &side {
+        assert!(engine.exact_parent_state(id).is_none(), "fixture: no side state is held");
+    }
+    let mine: Vec<[u8; 32]> =
+        parents.iter().enumerate().map(|(k, p)| park_on_as(&mut engine, *p, 1, 0xA0 + k as u8, 0)).collect();
+    for id in &mine {
+        engine.want_parent_state_for(*id);
+    }
+    assert!(!engine.reorg_anchors.side.wanting.contains(&mine[2]), "fixture: the third parent is refused");
+
+    let mut queued: BTreeSet<[u8; 32]> = BTreeSet::new();
+    for slot in 800..832 {
+        for _ in 0..2 * SIDE_BRANCH_BLOCKS_PER_SLOT {
+            engine.validate_side_branch_turn(slot);
+            queued.extend(engine.deferred_orphans.iter().map(|(id, ..)| *id));
+        }
+        // The door judges what was queued.
+        engine.deferred_orphans.clear();
+    }
+    assert_eq!(*engine.head_id().as_bytes(), tip);
+    assert!(queued.contains(&mine[0]) && queued.contains(&mine[1]), "the first two requests are served");
+    assert!(engine.reorg_anchors.side.wanting.is_empty(), "the proposer's share is free again");
+    assert!(queued.contains(&mine[2]), "the refused block is stranded: nothing asks for its parent's state again");
+}
+
+/// Review L1R18-RC-03: a wanted block stays wanted until it has LEFT the
+/// orphan pool at the start of a serving turn (RC5-01). A block the door
+/// judges on the recomputed state and parks again (the state says static
+/// mode: before the bind, or the failure is not provable) is back in the
+/// pool before the next serving turn looks, so it is still wanted, its
+/// parent's state is held, and it is queued for the door again: once per
+/// engine turn, for as long as the state is held, each time through the
+/// whole door (a hybrid signature verification on the source's lane).
+#[test]
+fn l1r18_a_wanted_block_the_door_parks_again_is_not_queued_on_every_turn() {
+    let (mut engine, _dir, _tip, side) = held_head_with_side_branch(2);
+    let side_tip = side[1];
+    validated_side_branch_evicted_from_the_ring(&mut engine, &side, SIDE_TIP_STATES);
+    let child = park_on(&mut engine, side_tip, 1, 0x64);
+    engine.want_parent_state_for(child);
+    validate_until(&mut engine, 800, 16, &|e| {
+        e.deferred_orphans.iter().any(|(id, ..)| *id == child) && e.exact_parent_state(&side_tip).is_some()
+    });
+
+    // The engine loop: one promotion (the door), then one validation turn.
+    let mut judged = 0usize;
+    for slot in 900..904 {
+        for _ in 0..8 {
+            if let Some(at) = engine.deferred_orphans.iter().position(|(id, ..)| *id == child) {
+                let (id, env, src, ..) = engine.deferred_orphans.remove(at).expect("queued");
+                // Judged on its parent's exact state; still not judgeable
+                // (the door does not ask for the state again: it is held).
+                let under = bloch_pos_committee::kes::authority_fingerprint(
+                    &*engine.proposer_authority_state(&side_tip),
+                    env.header.proposer_index,
+                    epoch_of(env.header.slot),
+                );
+                engine.park_unjudgeable(id, env, src, under);
+                judged += 1;
+            }
+            engine.validate_side_branch_turn(slot);
+        }
+    }
+    assert!(engine.exact_parent_state(&side_tip).is_some(), "the state was held throughout");
+    assert_eq!(judged, 1, "judged once on the recomputed state; nothing changed since, so not again");
+}
+
+/// Review L1R18-RC-03 through the real door (`ingest_one`,
+/// `release_orphan_turn`), no step simulated. A block on a validated side
+/// tip whose state was evicted is judged on `fallback`, parked for its
+/// proposer's authority and wanted; the fold recomputes the tip's state and
+/// queues the block; the door judges it on that state and parks it again
+/// (the state selects the static key and the signature is not the static
+/// key's). On 4f95205c the block was then back in the pool before the next
+/// serving turn looked, so it was still wanted and its parent's state held:
+/// it was queued and judged again on every engine turn, 64 times in the 64
+/// turns below instead of once.
+///
+/// The block is this node's own (`Source::Local`) only so that the test
+/// needs no KES fixture: a gossiped block reaches the same state when its
+/// signature is a valid KES leaf of a registered key while the parent's
+/// state selects the static key, and then every repetition costs hybrid
+/// verifications on its relay's lane.
+#[test]
+fn l1r18_through_the_door_a_wanted_block_parked_again_is_judged_once_not_on_every_turn() {
+    use bloch_pos_committee::params::{KES_ACTIVATION_EPOCH, KES_BIND_DELAY_EPOCHS};
+    let (mut engine, _dir, tip, side) = held_head_with_side_branch(2);
+    let side_tip = side[1];
+    validated_side_branch_evicted_from_the_ring(&mut engine, &side, SIDE_TIP_STATES);
+    let mut child = engine.blocks[&side_tip].clone();
+    child.header.parent = side_tip;
+    child.header.slot = first_slot_of_epoch(KES_ACTIVATION_EPOCH + KES_BIND_DELAY_EPOCHS).unwrap() + 1;
+    child.proposer_sig = vec![0xEE; 64];
+    let id = *child.block_id().as_bytes();
+    let wall = child.header.slot + 2;
+    engine.wall_slot = wall;
+    let _clock = validator_lifecycle::clock_at(wall);
+    // Drop the fixture's stand-in ring entries, so nothing of the branch is held.
+    engine.validate_side_branch_turn(wall - 1);
+    assert!(engine.exact_parent_state(&side_tip).is_none() && engine.exact_parent_state(&side[0]).is_none());
+
+    let (verdict, landed) = engine.ingest_one(child, Source::Local);
+    assert_eq!(verdict, Verdict::Ignore);
+    assert!(landed.is_none());
+    assert!(engine.authority_parked.judged.contains_key(&id), "fixture: parked for its proposer's authority");
+    assert!(engine.reorg_anchors.side.wanting.contains(&id), "fixture: the door asked for its parent's state");
+
+    // The engine loop: one promotion (the door), then one validation turn.
+    let mut judged = 0usize;
+    for _ in 0..64 {
+        if engine.deferred_orphans.front().is_some_and(|(queued, ..)| *queued == id) {
+            judged += 1;
+        }
+        engine.release_orphan_turn();
+        engine.validate_side_branch_turn(wall);
+    }
+    assert_eq!(*engine.head_id().as_bytes(), tip, "the head did not move");
+    assert!(engine.exact_parent_state(&side_tip).is_some(), "the tip's state was recomputed and is held");
+    assert_eq!(judged, 1, "judged once on the recomputed state; nothing changed since, so not again");
+    assert!(engine.orphans.iter().any(|(seen, ..)| *seen == id), "the door parked the block again");
+    assert!(engine.reorg_anchors.side.wanting.is_empty(), "and it is no longer wanted");
+}

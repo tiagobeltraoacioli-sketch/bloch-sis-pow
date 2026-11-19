@@ -1279,11 +1279,13 @@ struct SideValidation {
     /// parent, so the recomputation re-runs blocks that already passed the
     /// transition; and at most [`SIDE_WANTED_PARENTS_PER_PROPOSER`]
     /// distinct parents per proposer (review RC5-02). An entry stays until
-    /// its block leaves the orphan pool (review RC5-01: the blocks parked
-    /// on one parent are queued [`SIDE_PARKED_REJUDGE_PER_BLOCK`] at a
-    /// time, so one recomputation does not serve them all) or nothing can
-    /// be recomputed for it, so it is bounded by [`ORPHAN_MAX`] (plus the
-    /// one being added).
+    /// its block is queued for the door or otherwise leaves the orphan pool
+    /// (review RC5-01: the blocks parked on one parent are queued
+    /// [`SIDE_PARKED_REJUDGE_PER_BLOCK`] at a time, so one recomputation
+    /// does not serve them all; review L1R18-RC-03: removed when queued,
+    /// not when next seen outside the pool, so a block the door parks again
+    /// is not queued on every turn) or nothing can be recomputed for it, so
+    /// it is bounded by [`ORPHAN_MAX`] (plus the one being added).
     wanting: BTreeSet<[u8; 32]>,
     /// Where the last recomputation for `wanting` stopped, keyed by block id
     /// like `cursor`, so a recomputation longer than one turn resumes
@@ -8549,6 +8551,10 @@ impl Engine {
             let (id, env, ..) = &self.orphans[i];
             if self.authority_parked.judged.contains_key(id) && waits(env) {
                 let Some(parked) = self.orphans.remove(i) else { break };
+                // Review L1R18-RC-03: queued, so no longer wanted. The door
+                // asks again if it still misses the state; a block it parks
+                // again on a state it holds is not queued turn after turn.
+                self.reorg_anchors.side.wanting.remove(&parked.0);
                 self.orphans_admitted = self.orphans_admitted.saturating_add(1);
                 self.deferred_orphans.push_back(parked);
                 moved = moved.saturating_add(1);
