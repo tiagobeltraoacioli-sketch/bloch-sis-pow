@@ -345,6 +345,13 @@ fn more_than_128_inputs_none_or_a_duplicate_are_refused() {
     assert_eq!(tx.inputs.len(), MAX_DEPOSIT_INPUTS);
     assert!(tx.inputs.windows(2).all(|w| w[0] < w[1]));
     assert!(crypto::verify(&tx.funding_pubkey, &tx.intent_root(), &tx.signature));
+    // The largest deposit still passes the node's relay bounds: inside the
+    // block byte budget, the gas ceiling and the over-declaration slack.
+    let encoded = PosTransaction::L2Deposit(tx.clone()).canonical_bytes().len() as u64;
+    assert!(encoded.max(tx.tx_bytes) <= fee_market::max_block_tx_bytes(0).min(fee_market::max_block_tx_bytes(u64::MAX)));
+    assert!(tx.tx_bytes <= encoded + fee_market::TX_BYTES_DECLARE_SLACK);
+    let class = fee_market::TxClass::Eutxo { inputs: MAX_DEPOSIT_INPUTS as u32 };
+    assert!(fee_market::intrinsic_gas(class, tx.tx_bytes) <= fee_market::MAX_TX_GAS);
 }
 
 #[test]

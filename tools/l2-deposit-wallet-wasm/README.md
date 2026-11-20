@@ -94,9 +94,13 @@ rustup target add wasm32-wasip1 --toolchain 1.94.1
 WASI_SDK_ROOT=/path/to/wasi-sdk-33.0 sh tools/l2-deposit-wallet-wasm/build-wasi.sh
 ```
 
-The artifact is `target/wasm32-wasip1/release/bloch_l2_deposit_wallet_wasm.wasm`.
-The build is deterministic for a fixed source and Cargo home path; the paths
-are embedded in panic strings, so another path gives other bytes.
+The artifact is `target/wasm32-wasip1/release/bloch_l2_deposit_wallet_wasm.wasm`
+(`$CARGO_TARGET_DIR` is honoured). The build is deterministic: clean builds in
+the source worktree, in another target directory and from a `git archive` at
+another path are byte-identical. Workspace paths are embedded relative to the
+workspace root; the crates.io registry path under `CARGO_HOME` is embedded in
+panic strings, so a different `CARGO_HOME` is expected to give other bytes
+(as for the delegation signer).
 
 ## Tests
 
