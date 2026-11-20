@@ -1,0 +1,26 @@
+[package]
+name = "bloch-l2-deposit-wallet-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
+description = "Local wallet signer for the native L1 -> L2 deposit (wire 0x14). Typed review and sign only; no networking, no digest signing, no key export."
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+# TESTS ONLY. Lets the state-level acceptance test install a development L2
+# whose profile admits deposits (the committee's `devnet-l2-deposits`), so the
+# node's own preflight (`CommittedState::l2_deposit_refusal_at`, the function
+# the mempool door and the transition share) can judge a signed deposit.
+# Never enable it for the WASM artifact: build-wasi.sh builds without features.
+state-acceptance = ["bloch-pos-committee/devnet-l2-deposits"]
+
+[dependencies]
+bloch-pos-committee = { path = "../../crates/bloch-pos-committee" }
+bloch-crypto = { path = "../../crates/bloch-crypto", default-features = false }
+sha3 = "0.10"
+zeroize = "1"
+hex = "0.4"
+serde_json = "1"

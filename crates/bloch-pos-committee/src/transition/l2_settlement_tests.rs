@@ -668,6 +668,121 @@ mod l2_tests {
         assert_eq!(state, pre);
     }
 
+    // ── A deposit signed by the wallet signer (tools/l2-deposit-wallet-wasm) ──
+
+    /// Real hybrid verification for hybrid keys (the depositor); the toy rule
+    /// for this fixture's eight-byte validator keys.
+    struct WalletVerifier;
+    impl SignatureVerifier for WalletVerifier {
+        fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+            if pk.len() == crate::transition::funded::ADMISSION_PQ_KEY_BYTES {
+                bloch_crypto::crypto::verify(pk, root, sig)
+            } else {
+                ToyVerifier.verify_with_key(pk, root, sig)
+            }
+        }
+    }
+
+    /// The signer's public fixture (one `open_mnemonic -> review -> sign` run
+    /// with the published BIP39 test mnemonic, bound to the mainnet domain) is
+    /// applied by the real transition, in a block, with the real hybrid
+    /// verifier: inputs spent, change created for the owner, the escrow
+    /// record appended for the EVM recipient. Any drift between the signer
+    /// and this state transition fails here.
+    #[test]
+    #[cfg(feature = "devnet-l2-deposits")]
+    fn a_deposit_signed_by_the_wallet_signer_is_applied_by_the_transition() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tools/l2-deposit-wallet-wasm/fixtures/l2-deposit-fixture.json"
+        ))
+        .unwrap();
+        let text = |v: &serde_json::Value| v.as_str().unwrap().to_owned();
+        let h32 = |v: &serde_json::Value| -> [u8; 32] { hex::decode(text(v)).unwrap().try_into().unwrap() };
+        let domain = h32(&fixture["domainHex"]);
+        let owner = h32(&fixture["ownerHashHex"]);
+        let request = &fixture["steps"][1]["request"]["args"];
+        let review = &fixture["steps"][1]["response"]["result"];
+        let signed = &fixture["steps"][2]["response"]["result"];
+        let wire = PosTransaction::from_canonical_bytes(&hex::decode(text(&signed["transactionHex"])).unwrap()).unwrap();
+        let PosTransaction::L2Deposit(tx) = wire.clone() else { panic!("expected wire 0x14") };
+        assert_eq!(wire.canonical_bytes()[0], crate::transition::l2_deposit::L2_DEPOSIT_TAG);
+        assert_eq!(hex::encode(wire.txid()), text(&signed["txid"]));
+        assert_eq!(tx.network_domain, domain);
+        assert_eq!(script_of(&tx.funding_pubkey), owner);
+
+        // The state holds exactly the outputs the request named, owned by the key.
+        let coins: Vec<crate::state_root::EutxoEntry> = request["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| crate::state_root::EutxoEntry {
+                txid: h32(&row["txidHex"]),
+                vout: row["vout"].as_u64().unwrap() as u32,
+                value: text(&row["valueSat"]).parse().unwrap(),
+                script_hash: owner,
+            })
+            .collect();
+        let (_, mut genesis, mut chains) = setup_with(4, ToyVerifier, &coins);
+        let mut policy = Policy {
+            identities: std::array::from_fn(|i| hash_at(TEMPLATE, S + i * 32)),
+            proof_policy: bloch_l2_proof::policy_commitment(),
+            chain_id: 700770,
+            initial_l2_parent: hash_at(TEMPLATE, S + 272),
+            initial_l2_state: hash_at(TEMPLATE, S + 304),
+            attestor_set: [0; 32],
+        };
+        policy.identities[0] = domain;
+        policy.identities[1] = *genesis.head.as_bytes();
+        genesis.admission_network_domain = Some(domain);
+        genesis = genesis.configure_l2_genesis_async(policy).unwrap();
+        let t = Transition::new(WalletVerifier);
+        let first = build_block(&t, &genesis, 1, &[], &[], &mut chains);
+        let pre = t.apply_block(&genesis, &first, &[], &[]).unwrap();
+        assert_eq!(pre.next_base_fee().to_string(), text(&request["baseFeeMillisatPerGas"]));
+        assert_eq!(pre.l2_deposit_refusal_at(&tx, pre.next_base_fee()), None);
+
+        let supply = pre.accounted_supply_sat();
+        let block = build_block(&t, &pre, 2, &[], std::slice::from_ref(&wire), &mut chains);
+        let post = t
+            .apply_block(&pre, &block, &[], std::slice::from_ref(&wire))
+            .expect("the transition applies the wallet signer's deposit");
+        let l2 = post.l2_settlement().unwrap();
+        assert_eq!(l2.inbox().len(), 1);
+        let record = l2.inbox()[0];
+        assert_eq!(record.sats.to_string(), text(&review["amountSat"]));
+        assert_eq!(hex::encode(record.recipient), text(&review["recipientHex"]));
+        assert_eq!((record.txid, record.vout, record.tx_index), (wire.txid(), crate::transition::l2_deposit::ESCROW_VOUT, 0));
+        assert_eq!(l2.escrow_sat(), u128::from(tx.amount_sat));
+        assert!(l2.escrow_conserved());
+        for coin in &coins {
+            assert!(post.eutxos.get(&(coin.txid, coin.vout)).is_none(), "input spent");
+        }
+        let change = post.eutxos.get(&(wire.txid(), 0)).expect("change output");
+        assert_eq!(change.value.to_string(), text(&review["changeSat"]));
+        assert_eq!(change.script_hash, owner);
+        // Only the reviewed fee leaves the accounted supply.
+        let fee: u128 = text(&review["feeSat"]).parse().unwrap();
+        assert!(supply >= post.accounted_supply_sat() && supply - post.accounted_supply_sat() <= fee);
+        let total: u128 = coins.iter().map(|c| u128::from(c.value)).sum();
+        assert_eq!(total, u128::from(tx.amount_sat) + u128::from(change.value) + fee, "exact conservation");
+
+        // The signature is what authorises it: one flipped bit is refused
+        // by the transition and leaves the state untouched.
+        let mut forged = tx.clone();
+        let last = forged.signature.len() - 1;
+        forged.signature[last] ^= 1;
+        let mut state = pre.clone();
+        assert_eq!(
+            state.apply_transaction(&PosTransaction::L2Deposit(forged), 0, pre.next_base_fee(), &WalletVerifier),
+            Err(TxReject::L2Deposit(crate::transition::L2DepositReject::Signature)),
+        );
+        assert_eq!(state, pre);
+        // And it cannot be applied twice.
+        let mut replay = post.clone();
+        assert!(replay.apply_transaction(&wire, 0, post.next_base_fee(), &WalletVerifier).is_err());
+        assert_eq!(replay, post);
+    }
+
     // ── Settlement V3: user transactions, deposits bound by deposits_hash ──
 
     use crate::l2_settlement::{v3, STATEMENT_V3_BYTES, STATEMENT_V3_TAG, TRANSACTION_V3_BYTES};

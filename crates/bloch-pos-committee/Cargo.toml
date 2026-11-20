@@ -55,6 +55,9 @@ sha3 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 bloch-l2-proof = { path = "../bloch-l2-proof" }
+# Real hybrid verification for the wallet-signer deposit fixture
+# (tools/l2-deposit-wallet-wasm); tests only, never in the consensus build.
+bloch-crypto = { path = "../bloch-crypto", default-features = false }
 hex = "0.4"
 serde_json = "1.0"
 
