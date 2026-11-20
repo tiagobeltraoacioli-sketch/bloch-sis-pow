@@ -20,6 +20,10 @@ state-acceptance = ["bloch-pos-committee/devnet-l2-deposits"]
 [dependencies]
 bloch-pos-committee = { path = "../../crates/bloch-pos-committee" }
 bloch-crypto = { path = "../../crates/bloch-crypto", default-features = false }
+# The workspace patches this to the vendored fork (crates/pqcrypto-internals),
+# the same instance bloch-crypto uses; called only to overwrite the seeded RNG
+# slot after key derivation (review R503-2).
+pqcrypto-internals = "0.2"
 sha3 = "0.10"
 zeroize = "1"
 hex = "0.4"

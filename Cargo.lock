@@ -1579,6 +1579,7 @@ dependencies = [
  "bloch-crypto",
  "bloch-pos-committee",
  "hex",
+ "pqcrypto-internals",
  "serde_json",
  "sha3 0.10.9",
  "zeroize",

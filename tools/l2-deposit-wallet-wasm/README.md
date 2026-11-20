@@ -53,14 +53,82 @@ Exports `memory`, `nw_alloc`, `nw_free`, `nw_call`. A request is
 - At most 128 inputs, strictly ordered, unique; the tip at or below
   `MAX_TIP_MILLISAT_PER_GAS`; the base fee inside the protocol range; the gas
   ceiling.
+- Its own fee ceilings, in `review` and in `sign` (see below): the tip may not
+  exceed the base fee (`tip above base fee`) and the whole fee may not exceed
+  0.1 BLCH (`fee above signer ceiling`).
 - `review` stores a single-use fingerprint of the whole witness-free
   transaction and its pricing context. `sign` consumes it, rebuilds the
   transaction from its own arguments and refuses any difference. `cancel`,
-  `lock`, a new `review` and any failed call invalidate it; `lock` zeroizes
-  the secret.
+  `lock`, a new `review` and any failed call invalidate it; `lock` drops and
+  zeroizes the session's secret key (see "Secret material in memory").
 - The signature is drawn until it fits the admission bound
   (`crypto::sign_fitting`), verified before it is released, and the signed
   bytes must decode back to the same transaction with the node's decoder.
+
+## Fee ceilings
+
+The fee is the one value of a deposit that goes to neither the owner nor the
+recipient, so the signer bounds it without trusting the page:
+
+1. `tipMillisatPerGas <= baseFeeMillisatPerGas` (`MAX_TIP_PER_BASE_FEE = 1`).
+   The base fee is checked by the network: consensus requires exact
+   conservation at the including block's base fee, so a wrong one is refused
+   there. The tip is checked by nobody. With this rule the fee is at most
+   twice what the network itself charges.
+2. `feeSat <= 10,000,000` (`MAX_FEE_SAT`, 0.1 BLCH), base plus priority at the
+   worst-case size, whatever prices are reported. This bounds the loss even
+   if a deposit signed at an inflated base fee later meets a block priced
+   there (a signed deposit does not expire).
+
+What the second rule costs a legitimate deposit, with no tip (the test
+`the_fee_ceiling_leaves_room_for_congestion` pins this table). The base fee
+moves at most 1/8 per block, so the last column is the number of consecutive
+completely full blocks needed, from the floor, to pass that price:
+
+| Inputs | Fee at the floor (10) | Highest base fee still signed | Multiple of the floor | Full blocks |
+|---|---|---|---|---|
+| 1 | 2,140 sat | 46,731 | 4,673 | 76 |
+| 2 | 2,874 sat | 34,805 | 3,480 | 73 |
+| 8 | 7,273 sat | 13,750 | 1,375 | 65 |
+| 16 | 13,139 sat | 7,611 | 761 | 60 |
+| 32 | 24,871 sat | 4,020 | 402 | 55 |
+| 64 | 48,334 sat | 2,068 | 206 | 49 |
+| 128 | 95,262 sat | 1,049 | 104 | 44 |
+
+Above those prices the signer refuses and nothing is signed; the owner can
+deposit from fewer outputs or wait. Mainnet has been at the floor. Raising
+the ceiling is a new build of the signer.
+
+## Secret material in memory
+
+While a session is open the secret key is in the module's memory; that is
+what a session is. After every `nw_call` the WASM artifact:
+
+- has wiped every heap block that was freed (a zeroing global allocator; the
+  shared crypto crates free copies of key material without clearing them);
+- overwrites the stack below the entry point (896 KiB of the 1 MiB stack),
+  where the signature code leaves parts of the key in dead frames;
+- overwrites the seeded-RNG slot of `pqcrypto-internals`, which keeps the
+  ChaCha20 state keyed with the account seed after key derivation.
+
+Measured on the built artifact by scanning its linear memory
+(`review/adversarial-503.mjs`, section 6) after `lock`, after a refused
+`open_keypair` and after a refused `open_mnemonic`: no 16-byte window of the
+secret key, no key seed, no seed tail, no hex text of the secret and no
+mnemonic text remain. Before these measures 1,008 bytes of the Falcon secret
+key and the 32-byte key seed remained.
+
+Limits, stated plainly:
+
+- The scan looks for the raw encodings listed above. Values derived from the
+  key in another form are not searched for; they lived in freed heap or dead
+  stack, which are wiped, but that is by construction, not by measurement.
+- A trap (for example a failing `random_get`) ends the call before any wipe.
+- Request and reply text passes through the host's own memory, which this
+  module cannot clear.
+
+The wallet must therefore still terminate the worker (discard the instance)
+after each operation and must not rely on `lock` alone.
 
 ## What the signer cannot know
 
@@ -95,12 +163,14 @@ WASI_SDK_ROOT=/path/to/wasi-sdk-33.0 sh tools/l2-deposit-wallet-wasm/build-wasi.
 ```
 
 The artifact is `target/wasm32-wasip1/release/bloch_l2_deposit_wallet_wasm.wasm`
-(`$CARGO_TARGET_DIR` is honoured). The build is deterministic: clean builds in
-the source worktree, in another target directory and from a `git archive` at
-another path are byte-identical. Workspace paths are embedded relative to the
-workspace root; the crates.io registry path under `CARGO_HOME` is embedded in
-panic strings, so a different `CARGO_HOME` is expected to give other bytes
-(as for the delegation signer).
+(`$CARGO_TARGET_DIR` is honoured). `build-wasi.sh` maps the build machine's
+paths to fixed names (`--remap-path-prefix`: `$CARGO_HOME` to `/cargo`, the
+workspace root to `/bloch-sis-pow`) and fails if the artifact still contains
+`/Users/`, `/home/`, the Cargo home or the source root. The artifact
+therefore carries no account name, and the bytes do not depend on the source
+path, the target directory or `CARGO_HOME`; see the report of 2026-11-20 for
+the builds that were compared. Ambient `RUSTFLAGS` are replaced by the
+script's own.
 
 ## Tests
 
@@ -110,6 +180,12 @@ cargo test --locked --offline -p bloch-l2-deposit-wallet-wasm --features state-a
 cargo test --locked --offline -p bloch-pos-committee --lib --features devnet-l2-deposits wallet_signer
 ```
 
+- `tests/review_503.rs`, `review/adversarial-503.mjs` and
+  `review/mutation-503.py` are the independent review's reproductions
+  (2026-11-20): an adversarial run against the built WASM through the real
+  ABI (fee ceilings, boundary abuse, zero-entropy host, memory scan), the
+  node's verdict on every transaction that run released, and a mutation run
+  over `src/lib.rs`.
 - The first runs the known-answer test (decode with
   `PosTransaction::from_canonical_bytes`, the node's txid, the real hybrid
   signature under `bloch_crypto::crypto::verify`, field by field against the

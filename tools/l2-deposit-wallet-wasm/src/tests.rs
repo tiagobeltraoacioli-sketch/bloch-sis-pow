@@ -184,11 +184,11 @@ fn review_and_sign_produce_the_transaction_the_node_cli_prepares() {
 #[test]
 fn the_tip_is_priced_and_signed() {
     open();
-    let args = set(&deposit_args(), "tipMillisatPerGas", json!("25"));
+    let args = set(&deposit_args(), "tipMillisatPerGas", json!("7"));
     let (review, signed) = review_and_sign(&args);
     let tx = decode(&signed);
-    assert_eq!(tx.tip_millisat_per_gas, 25);
-    let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 2 }, tx.tx_bytes, 10, 25);
+    assert_eq!(tx.tip_millisat_per_gas, 7);
+    let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 2 }, tx.tx_bytes, 10, 7);
     assert!(charge.priority_fee_sat > 0);
     assert_eq!(review["priorityFeeSat"], charge.priority_fee_sat.to_string());
     assert_eq!(review["baseFeeSat"], charge.base_fee_sat.to_string());
@@ -366,8 +366,245 @@ fn a_tip_above_the_protocol_ceiling_or_a_base_fee_out_of_range_is_refused() {
     refused("baseFeeMillisatPerGas", (fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS - 1).to_string().into(), "invalid fee");
     refused("baseFeeMillisatPerGas", (fee_market::MAX_BASE_FEE_MILLISAT_PER_GAS + 1).to_string().into(), "invalid fee");
     refused("baseFeeMillisatPerGas", json!(10), "missing string");
-    // The ceiling itself is a valid tip; these inputs cannot pay it.
-    refused("tipMillisatPerGas", fee_market::MAX_TIP_MILLISAT_PER_GAS.to_string().into(), "inputs do not cover the amount plus fee");
+    // The protocol ceiling itself is far above anything the signer's own
+    // rule allows.
+    refused("tipMillisatPerGas", fee_market::MAX_TIP_MILLISAT_PER_GAS.to_string().into(), "tip above base fee");
+}
+
+// ── The signer's own fee ceilings (review R503-1) ───────────────────────────
+
+/// Fee of a deposit from `inputs` outputs at `base_fee` and `tip`, as the
+/// node charges it for the size this signer declares.
+fn fee_of(inputs: usize, base_fee: u128, tip: u128) -> u128 {
+    let rows: Vec<([u8; 32], u32, u64)> = (0..inputs).map(|i| ([0x34; 32], i as u32, u64::MAX / 256)).collect();
+    let tx = cli_prepare(&v1().0, &rows, 1_000_000_000, [0x42; 20], fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS, 0);
+    let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: inputs as u32 }, tx.tx_bytes, base_fee, tip);
+    charge.base_fee_sat + charge.priority_fee_sat
+}
+/// The highest base fee at which a deposit from `inputs` outputs, with no
+/// tip, still fits under the signer's fee ceiling.
+fn highest_base_fee_under_the_ceiling(inputs: usize) -> u128 {
+    let (mut low, mut high) = (fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS, 1u128 << 40);
+    assert!(fee_of(inputs, low, 0) <= MAX_FEE_SAT && fee_of(inputs, high, 0) > MAX_FEE_SAT);
+    while high - low > 1 {
+        let mid = (low + high) / 2;
+        if fee_of(inputs, mid, 0) <= MAX_FEE_SAT {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
+/// The exact request of review R503-1: 15 BLCH of inputs, 0.01 BLCH
+/// deposited, and a tip that turns the rest (14.99 BLCH) into fee.
+#[test]
+fn a_tip_that_would_drain_the_inputs_is_refused() {
+    open();
+    let mut drain = set(&deposit_args(), "amountSat", "1000000".into());
+    drain = set(&drain, "tipMillisatPerGas", "5217314".into());
+    assert_eq!(call("review", drain.clone()), Err("tip above base fee"));
+    // Nothing is pending afterwards, so nothing can be signed.
+    let mut signing = drain.clone();
+    signing["reviewId"] = "00".repeat(32).into();
+    assert_eq!(call("sign", signing), Err("review required"));
+    // Reviewed honestly, then signed with the draining tip: refused as well.
+    let honest = set(&drain, "tipMillisatPerGas", "0".into());
+    let review = call("review", honest).unwrap();
+    assert_eq!(review["feeSat"], "2874");
+    assert_eq!(call("sign", with_review(&drain, &review)), Err("tip above base fee"));
+}
+
+#[test]
+fn the_tip_may_not_exceed_the_base_fee() {
+    open();
+    assert_eq!(MAX_TIP_PER_BASE_FEE, 1);
+    refused("tipMillisatPerGas", "11".into(), "tip above base fee");
+    refused("tipMillisatPerGas", "1000".into(), "tip above base fee");
+    // Equal to the base fee is the most the signer accepts: the fee doubles.
+    let plain: u128 = call("review", deposit_args()).unwrap()["feeSat"].as_str().unwrap().parse().unwrap();
+    let equal = call("review", set(&deposit_args(), "tipMillisatPerGas", "10".into())).unwrap();
+    assert_eq!(equal["feeSat"], (2 * plain).to_string());
+    assert_eq!(equal["priorityFeeSat"], equal["baseFeeSat"]);
+    // The rule follows the base fee the request is priced at.
+    let mut higher = set(&deposit_args(), "baseFeeMillisatPerGas", "500".into());
+    higher = set(&higher, "tipMillisatPerGas", "500".into());
+    assert!(call("review", higher.clone()).is_ok());
+    assert_eq!(call("review", set(&higher, "tipMillisatPerGas", "501".into())), Err("tip above base fee"));
+}
+
+#[test]
+fn a_fee_above_the_signer_ceiling_is_refused_whatever_the_prices() {
+    open();
+    assert_eq!(MAX_FEE_SAT, 10_000_000, "0.1 BLCH");
+    // With no tip: the last base fee under the ceiling signs, the next is refused.
+    let last = highest_base_fee_under_the_ceiling(2);
+    let under = set(&deposit_args(), "baseFeeMillisatPerGas", last.to_string().into());
+    let (review, signed) = review_and_sign(&under);
+    let fee: u128 = review["feeSat"].as_str().unwrap().parse().unwrap();
+    assert!(fee <= MAX_FEE_SAT && fee == fee_of(2, last, 0));
+    assert_eq!(u128::from(decode(&signed).change.value) + fee + 1_000_000_000, 1_500_000_000);
+    refused("baseFeeMillisatPerGas", (last + 1).to_string().into(), "fee above signer ceiling");
+    // A tip inside the tip rule cannot pass the ceiling either.
+    let mut both = set(&deposit_args(), "baseFeeMillisatPerGas", last.to_string().into());
+    both = set(&both, "tipMillisatPerGas", last.to_string().into());
+    assert_eq!(call("review", both), Err("fee above signer ceiling"));
+    // The ceiling is judged before the inputs: a page cannot learn to pass it
+    // by naming richer outputs.
+    let mut rich = set(&deposit_args(), "baseFeeMillisatPerGas", (last + 1).to_string().into());
+    rich = set(&rich, "inputs.0.valueSat", "900000000000".into());
+    assert_eq!(call("review", rich), Err("fee above signer ceiling"));
+    // Reviewed under the ceiling, signed above it.
+    let review = call("review", under.clone()).unwrap();
+    let above = set(&under, "baseFeeMillisatPerGas", (last + 1).to_string().into());
+    assert_eq!(call("sign", with_review(&above, &review)), Err("fee above signer ceiling"));
+    assert_eq!(call("sign", with_review(&under, &review)), Err("review required"));
+}
+
+/// What the 0.1 BLCH ceiling costs a legitimate deposit. The base fee moves
+/// at most 1/8 per block (`BASE_FEE_CHANGE_DENOMINATOR`), so from the floor
+/// it needs N consecutive completely full blocks to reach a price.
+#[test]
+fn the_fee_ceiling_leaves_room_for_congestion() {
+    let floor = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+    assert_eq!(fee_market::BASE_FEE_CHANGE_DENOMINATOR, 8);
+    assert_eq!(fee_of(2, floor, 0), 2_874);
+    assert_eq!(fee_of(MAX_DEPOSIT_INPUTS, floor, 0), 95_262);
+    let full_blocks_to_reach = |price: u128| {
+        let (mut fee, mut blocks) = (floor, 0u32);
+        while fee <= price {
+            fee += (fee / 8).max(1);
+            blocks += 1;
+        }
+        blocks
+    };
+    let mut table = Vec::new();
+    for inputs in [1, 2, 8, 16, 32, 64, MAX_DEPOSIT_INPUTS] {
+        let last = highest_base_fee_under_the_ceiling(inputs);
+        table.push((inputs, fee_of(inputs, floor, 0), last, last / floor, full_blocks_to_reach(last)));
+    }
+    println!("inputs, fee at the floor (sat), highest base fee under the ceiling (millisat/gas), multiple of the floor, full blocks from the floor to exceed it");
+    for row in &table {
+        println!("{row:?}");
+    }
+    assert_eq!(
+        table,
+        EXPECTED_CEILING_TABLE,
+        "the fee market or the ceiling changed: re-read the reasoning at MAX_FEE_SAT"
+    );
+    // The largest deposit keeps two orders of magnitude of congestion.
+    assert!(table.last().unwrap().3 >= 100);
+    // At the protocol's own ceilings the fee is not payable by anyone: the
+    // signer's ceiling refuses nothing there that could have been included.
+    let supply_sat = fee_market::MAX_BASE_FEE_MILLISAT_PER_GAS / fee_market::MILLISAT_PER_SAT;
+    assert!(fee_of(1, fee_market::MAX_BASE_FEE_MILLISAT_PER_GAS, 0) > supply_sat);
+    assert!(fee_of(1, floor, fee_market::MAX_TIP_MILLISAT_PER_GAS) > supply_sat);
+}
+const EXPECTED_CEILING_TABLE: [(usize, u128, u128, u128, u32); 7] = [
+    (1, 2_140, 46_731, 4_673, 76),
+    (2, 2_874, 34_805, 3_480, 73),
+    (8, 7_273, 13_750, 1_375, 65),
+    (16, 13_139, 7_611, 761, 60),
+    (32, 24_871, 4_020, 402, 55),
+    (64, 48_334, 2_068, 206, 49),
+    (128, 95_262, 1_049, 104, 44),
+];
+
+// ── Review R503-6: behaviours no earlier test pinned ────────────────────────
+
+/// Hex is lowercase everywhere except the recipient (mutant M7).
+#[test]
+fn upper_case_hex_is_refused_outside_the_recipient() {
+    let public = hex::encode(&v1().0);
+    let upper_key = set(&open_args(), "publicKeyHex", public.to_uppercase().into());
+    assert_eq!(call("open_mnemonic", upper_key), Err("invalid hex"));
+    let mut keypair = open_args();
+    keypair["secretKeyHex"] = hex::encode(&v1().1).to_uppercase().into();
+    assert_eq!(call("open_keypair", keypair), Err("invalid hex"));
+    assert_eq!(call("open_mnemonic", set(&open_args(), "domainHex", DOMAIN.to_uppercase().into())), Err("wrong network"));
+    open();
+    refused("inputs.0.txidHex", "AB".repeat(32).into(), "invalid hex");
+    refused("inputs.0.txidHex", format!("{}A", "3".repeat(63)).into(), "invalid hex");
+    refused("inputs.0.scriptHashHex", hex::encode(digest(&v1().0)).to_uppercase().into(), "invalid hex");
+    // An upper-case spelling of the right fingerprint does not sign.
+    let args = deposit_args();
+    let review = call("review", args.clone()).unwrap();
+    let id = review["reviewId"].as_str().unwrap();
+    assert_ne!(id, id.to_uppercase(), "this fingerprint has letters");
+    let mut signing = args.clone();
+    signing["reviewId"] = id.to_uppercase().into();
+    assert_eq!(call("sign", signing), Err("invalid hex"));
+    assert_eq!(call("sign", with_review(&args, &review)), Err("review required"));
+}
+
+/// Drive `nw_call` itself with `bytes` (or with a pointer that names no
+/// buffer) and return the reply; the reply buffer is found as the one still
+/// allocated, because the packed pointer is 32 bits (the ABI is wasm32).
+fn through_nw_call(bytes: Option<&[u8]>) -> Value {
+    let (ptr, len) = match bytes {
+        Some(bytes) => {
+            let ptr = nw_alloc(bytes.len() as u32);
+            assert_ne!(ptr, 0);
+            BUFFERS.with(|b| b.borrow_mut().get_mut(&ptr).unwrap().copy_from_slice(bytes));
+            (ptr, bytes.len() as u32)
+        }
+        None => (12345, 7),
+    };
+    let packed = nw_call(ptr, len);
+    nw_free(ptr, len);
+    let (out, reply) = BUFFERS.with(|b| {
+        let map = b.borrow();
+        assert_eq!(map.len(), 1);
+        let (out, bytes) = map.iter().next().unwrap();
+        assert_eq!(bytes.len(), packed as u32 as usize);
+        (*out, serde_json::from_slice(bytes).unwrap())
+    });
+    nw_free(out, packed as u32);
+    assert!(BUFFERS.with(|b| b.borrow().is_empty()));
+    reply
+}
+
+/// A request that never reaches `dispatch` (no such buffer, not JSON) still
+/// withdraws the pending review (mutant M8).
+#[test]
+fn a_bad_buffer_or_bad_json_through_nw_call_invalidates_the_pending_review() {
+    open();
+    let args = deposit_args();
+    let request = |method: &str, args: &Value| serde_json::to_vec(&json!({"method": method, "args": args})).unwrap();
+    for garbage in [None, Some(&b"{not json"[..]), Some(&b"\xff\xfe"[..]), Some(&b"[1,2"[..])] {
+        let review = through_nw_call(Some(&request("review", &args)));
+        assert_eq!(review["ok"], true);
+        let refused = through_nw_call(garbage);
+        assert_eq!(refused["ok"], false);
+        assert_eq!(refused["error"], if garbage.is_none() { "invalid buffer" } else { "invalid JSON" });
+        let signed = through_nw_call(Some(&request("sign", &with_review(&args, &review["result"]))));
+        assert_eq!(signed, json!({"ok": false, "error": "review required"}), "{garbage:?}");
+    }
+    // The same sequence without the garbage signs: the refusal above is the
+    // garbage's doing.
+    let review = through_nw_call(Some(&request("review", &args)));
+    let signed = through_nw_call(Some(&request("sign", &with_review(&args, &review["result"]))));
+    assert_eq!(signed["ok"], true);
+}
+
+/// The fingerprint binds each input's value, not only their sum (mutant M1):
+/// the same outpoints with the same total, valued differently, are another
+/// review.
+#[test]
+fn the_review_binds_each_input_value_not_only_the_total() {
+    open();
+    let args = deposit_args();
+    let mut shifted = set(&args, "inputs.0.valueSat", "800000000".into());
+    shifted = set(&shifted, "inputs.1.valueSat", "700000000".into());
+    let first = call("review", args.clone()).unwrap();
+    let second = call("review", shifted.clone()).unwrap();
+    for field in ["txid", "feeSat", "changeSat", "totalInputSat"] {
+        assert_eq!(first[field], second[field], "{field}: the transaction itself is the same");
+    }
+    assert_ne!(first["reviewId"], second["reviewId"]);
+    let review = call("review", args.clone()).unwrap();
+    assert_eq!(call("sign", with_review(&shifted, &review)), Err("review changed"));
 }
 
 #[test]
@@ -693,13 +930,15 @@ mod state {
         assert_eq!(state.l2_deposit_refusal_at(&unsigned, base_fee), Some(R::Shape));
     }
 
-    /// What the December line does once `params::L2_REVENUE_EPOCH` is armed:
-    /// it adds `l2_revenue::deposit_fee_sat(amount)` to the required inputs,
-    /// so a deposit built by this signer is short by exactly that fee and is
-    /// refused with `Conservation`. Here the same shortfall is produced with
-    /// an input one protocol fee poorer (5 bps, floor 5,000 sat, cap 1 BLCH).
+    /// On TODAY's rules (this commit): a deposit whose inputs are short by
+    /// the amount the December protocol fee would be (5 bps, floor 5,000 sat,
+    /// cap 1 BLCH) is refused with `Conservation`. This shows only that a
+    /// shortfall of that size is a clean conservation refusal here. It does
+    /// NOT run the December line and would pass whatever that code does; that
+    /// line's own test (`an_active_gate_charges_the_deposit_from_the_inputs_
+    /// and_mints_the_whole_amount`, run by review 503) is the evidence there.
     #[test]
-    fn a_deposit_without_the_future_protocol_fee_would_fail_conservation() {
+    fn inputs_short_by_a_protocol_fee_sized_amount_fail_conservation_on_todays_rules() {
         open();
         let (_, signed) = review_and_sign(&deposit_args());
         let tx = decode(&signed);

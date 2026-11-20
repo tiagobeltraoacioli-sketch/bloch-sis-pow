@@ -42,6 +42,26 @@ const REVIEW_KEYS: &[&str] =
 const SIGN_ONLY_KEYS: &[&str] = &["reviewId", "feeSat", "changeSat"];
 const INPUT_KEYS: &[&str] = &["txidHex", "vout", "valueSat", "scriptHashHex"];
 
+/// Signer-side fee ceilings (review R503-1). The fee is the one value of a
+/// deposit that goes to neither the owner nor the recipient, and the tip is
+/// the one price the page alone decides, so the signer bounds both itself.
+///
+/// 1. The tip may not exceed the base fee. The base fee the page reports is
+///    checked by the network (consensus requires exact conservation at the
+///    including block's base fee), the tip is not; with this rule the fee is
+///    at most twice what the network itself charges.
+pub const MAX_TIP_PER_BASE_FEE: u128 = 1;
+/// 2. The whole fee (base + priority, at the worst-case size) may not exceed
+///    0.1 BLCH, whatever prices the page reports. At the floor price a
+///    2-input deposit pays 2,874 sat and the largest one (128 inputs) 95,262
+///    sat; with no tip the ceiling is first reached by the largest deposit
+///    above 104 times the floor price (at least 44 consecutive full blocks
+///    from the floor, the base fee moving 1/8 per block) and by a 2-input
+///    one above 3,480 times (`the_fee_ceiling_leaves_room_for_congestion`
+///    computes the table). Past that the signer refuses, nothing is signed,
+///    and the owner can deposit from fewer outputs or wait.
+pub const MAX_FEE_SAT: u128 = 10_000_000;
+
 type Result<T> = std::result::Result<T, &'static str>;
 
 fn string<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
@@ -199,6 +219,9 @@ impl Session {
         if tip > fee_market::MAX_TIP_MILLISAT_PER_GAS {
             return Err("tip above ceiling");
         }
+        if tip > base_fee.saturating_mul(MAX_TIP_PER_BASE_FEE) {
+            return Err("tip above base fee");
+        }
 
         let mut tx = L2Deposit {
             network_domain,
@@ -221,6 +244,9 @@ impl Session {
         let charge = fee_market::charge(class, tx.tx_bytes, base_fee, tip);
         let fee =
             charge.base_fee_sat.checked_add(charge.priority_fee_sat).ok_or("fee overflow")?;
+        if fee > MAX_FEE_SAT {
+            return Err("fee above signer ceiling");
+        }
         // Exact conservation: inputs = amount + change + fee.
         let change = total
             .checked_sub(u128::from(amount_sat))
@@ -312,6 +338,55 @@ impl Session {
         }))
     }
 }
+
+/// Freed heap memory is wiped before it returns to the allocator (review
+/// R503-2): the shared crypto crates free copies of key material (the seeded
+/// RNG state, temporary key encodings) without clearing them. `realloc` is
+/// deliberately the default (allocate, copy, free), so the old block of a
+/// grown buffer is wiped too. WASM artifact only.
+#[cfg(target_arch = "wasm32")]
+mod wiping {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    pub struct Wiping;
+    // SAFETY: every call is forwarded to `System` with the caller's own
+    // layout; `dealloc` first writes zeros over exactly `layout.size()`
+    // bytes of the block the caller owns and is giving up.
+    unsafe impl GlobalAlloc for Wiping {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            System.alloc(layout)
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            System.alloc_zeroed(layout)
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            for i in 0..layout.size() {
+                core::ptr::write_volatile(ptr.add(i), 0);
+            }
+            System.dealloc(ptr, layout)
+        }
+    }
+    #[global_allocator]
+    static ALLOCATOR: Wiping = Wiping;
+}
+
+/// Bytes of stack overwritten after every call. The module's stack is 1 MiB
+/// (the linker default for this target) and `nw_call` is entered by the host
+/// near its top; the signature schemes keep key-dependent temporaries up to
+/// a few hundred KiB below that.
+#[cfg(target_arch = "wasm32")]
+const STACK_SCRUB_BYTES: usize = 896 * 1024;
+
+/// Overwrite the stack region the finished call used (review R503-2): the
+/// signature code leaves parts of the secret key in dead stack frames.
+#[cfg(target_arch = "wasm32")]
+#[inline(never)]
+fn scrub_stack() {
+    let mut frame = [0u8; STACK_SCRUB_BYTES];
+    frame.zeroize();
+    core::hint::black_box(&frame);
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn scrub_stack() {}
 
 thread_local! {
     static SESSION: RefCell<Option<Session>> = const {RefCell::new(None)};
@@ -425,6 +500,19 @@ pub extern "C" fn nw_free(ptr: usize, len: u32) {
 }
 #[no_mangle]
 pub extern "C" fn nw_call(ptr: usize, len: u32) -> u64 {
+    let packed = call(ptr, len);
+    // Seeded key derivation leaves its ChaCha20 state (keyed with the account
+    // seed) in the spare capacity of the shared crate's RNG stack. Entering
+    // one scope with a public all-zero seed writes a fresh state over that
+    // slot; nothing draws from it.
+    pqcrypto_internals::with_seeded_rng_scope(&[0u8; 32], || ());
+    // After the call's own frames are gone, and after every call: an open,
+    // a signature and a refusal all leave key-dependent stack behind.
+    scrub_stack();
+    packed
+}
+#[inline(never)]
+fn call(ptr: usize, len: u32) -> u64 {
     let request = BUFFERS.with(|b| {
         let map = b.borrow();
         let bytes = map.get(&ptr).filter(|v| v.len() == len as usize).ok_or("invalid buffer")?;

@@ -314,7 +314,7 @@ const withId = (args, review) => ({ ...clone(args), reviewId: review.reviewId })
     else if (pick === 3) a.inputs[randomInt(2)].vout = 2 + randomInt(1000);
     else if (pick === 4) a.inputs[randomInt(2)].valueSat = String(700000000 + randomInt(100000000));
     else if (pick === 5) a.baseFeeMillisatPerGas = String(11 + randomInt(1000));
-    else if (pick === 6) a.tipMillisatPerGas = String(1 + randomInt(1000));
+    else if (pick === 6) a.tipMillisatPerGas = String(1 + randomInt(1000)); // above 10: now `tip above base fee`; 1..10: `review changed`
     else a.reviewId = flip(a.reviewId);
     const reply = h.call('sign', a);
     if (err(reply)) refused += 1; else console.log(`FAIL randomised difference signed: ${JSON.stringify(a).slice(0, 300)}`);
@@ -393,23 +393,51 @@ const withId = (args, review) => ({ ...clone(args), reviewId: review.reviewId })
   console.log('parse table:'); for (const [k, v] of table) console.log(`  ${k} -> ${v}`);
 }
 
-// ── 3. Fee is whatever the page asks for (no signer-side ceiling) ───────────
+// ── 3. The signer's own fee ceilings (R503-1; the first pass had none) ──────
+// Second pass (2026-11-20): the request that drained 14.99 BLCH into fee on
+// the first artifact must now be refused in `review` and in `sign`.
 {
   const h = host();
   h.call('open_mnemonic', openV1);
   const a = base(); a.amountSat = '1000000'; a.tipMillisatPerGas = '1000';
+  check(err(h.call('review', a), 'tip above base fee'), 'tip 1000 at base fee 10 is refused');
+  a.tipMillisatPerGas = '5217314';
   let r = h.call('review', a);
-  const gas = BigInt(r.result.priorityFeeSat); // tip 1000 millisat/gas = 1 sat/gas
-  const room = 1500000000n - 1000000n - BigInt(r.result.baseFeeSat);
-  a.tipMillisatPerGas = (room * 1000n / gas).toString();
-  r = h.call('review', a);
-  check(r.ok === true, 'fee-draining tip is reviewed');
-  if (r.ok) {
-    note(`fee drain: deposit ${r.result.amountSat} sat from ${r.result.totalInputSat} sat with tip ${a.tipMillisatPerGas} millisat/gas -> feeSat ${r.result.feeSat}, changeSat ${r.result.changeSat} (gas ${gas})`);
-    const s = h.call('sign', withId(a, r.result));
-    check(s.ok === true, 'fee-draining tip is signed');
-    if (s.ok) judge('fee drain', V1, a, r.result, s.result);
+  check(err(r, 'tip above base fee'), 'R503-1 exact input (tip 5217314) is refused in review', JSON.stringify(r).slice(0, 200));
+  note(`fee drain (R503-1 input): review -> ${JSON.stringify(r)}`);
+  const honest = { ...a, tipMillisatPerGas: '0' };
+  r = h.call('review', honest);
+  check(r.ok === true && r.result.feeSat === '2874', 'the same deposit without the tip pays 2874 sat');
+  check(err(h.call('sign', withId(a, r.result)), 'tip above base fee'), 'R503-1 exact input is refused in sign after an honest review');
+  check(err(h.call('sign', withId(honest, r.result)), 'review required'), 'and that attempt consumed the review');
+  // The most the tip rule allows: tip = base fee, the fee doubles.
+  const equal = { ...honest, tipMillisatPerGas: '10' };
+  r = h.call('review', equal);
+  check(r.ok === true && r.result.feeSat === '5748', 'tip = base fee is the maximum: fee doubles', JSON.stringify(r).slice(0, 200));
+  if (r.ok) { const s = h.call('sign', withId(equal, r.result)); check(s.ok === true, 'tip = base fee signs'); if (s.ok) judge('tip equal to base fee', V1, equal, r.result, s.result); }
+  check(err(h.call('review', { ...honest, tipMillisatPerGas: '11' }), 'tip above base fee'), 'tip = base fee + 1 is refused');
+  // The absolute ceiling (0.1 BLCH), whatever prices are reported.
+  const under = { ...base(), baseFeeMillisatPerGas: '34805' };
+  r = h.call('review', under);
+  check(r.ok === true && BigInt(r.result.feeSat) <= 10000000n, 'base fee 34805 (2 inputs) is the last under the ceiling', JSON.stringify(r).slice(0, 200));
+  note(`fee ceiling: 2 inputs at base fee 34805 -> feeSat ${r.ok ? r.result.feeSat : r.error}`);
+  check(err(h.call('review', { ...base(), baseFeeMillisatPerGas: '34806' }), 'fee above signer ceiling'), 'base fee 34806 is refused by the ceiling');
+  check(err(h.call('review', { ...base(), baseFeeMillisatPerGas: '34805', tipMillisatPerGas: '34805' }), 'fee above signer ceiling'), 'an allowed tip cannot pass the ceiling');
+  const rich = base(); rich.baseFeeMillisatPerGas = '1000000'; rich.inputs[0].valueSat = '900000000000000';
+  check(err(h.call('review', rich), 'fee above signer ceiling'), 'richer inputs do not lift the ceiling');
+  // Random prices: nothing is ever reviewed with a fee above 0.1 BLCH or a tip above the base fee.
+  let over = 0; let reviewed = 0;
+  for (let k = 0; k < 400; k += 1) {
+    const q = base();
+    const b = 10 + randomInt(k % 2 ? 100000 : 2000000000);
+    q.baseFeeMillisatPerGas = String(b);
+    q.tipMillisatPerGas = String(randomInt(2) ? randomInt(b * 2) : 0);
+    q.inputs[0].valueSat = '900000000000000';
+    const x = h.call('review', q);
+    if (x.ok) { reviewed += 1; if (BigInt(x.result.feeSat) > 10000000n || BigInt(q.tipMillisatPerGas) > BigInt(b)) over += 1; }
   }
+  check(over === 0, `random prices: ${reviewed}/400 reviewed, none above the ceilings`);
+  note(`random prices: ${reviewed}/400 reviewed, ${over} above the signer ceilings`);
 }
 
 // ── 4. The nw_alloc / nw_free / nw_call boundary ────────────────────────────
@@ -570,6 +598,14 @@ function scan(memory, needles) {
   h.call('open_mnemonic', { ...openV1, domainHex: '00' + DOMAIN.slice(2) });
   results.wrongNetwork = report('mnemonic: refused open (wrong network)', h.memory());
   note(`residue summary ${JSON.stringify(results)}`);
+  // Second pass (R503-2): the signer now wipes freed heap, scrubs the stack
+  // after every call and overwrites the seeded RNG slot. Nothing the scanner
+  // looks for (16-byte windows of the secret key, the key seed, the seed
+  // tail, the secret as hex text, the phrase) may remain after lock or after
+  // a refused open.
+  for (const [name, found] of Object.entries(results)) {
+    check(found.bytes === 0 && found.hex === 0 && found.phrase === 0 && found.seed === 0, `no secret residue: ${name}`, JSON.stringify(found));
+  }
 }
 
 if (signedOut) writeFileSync(signedOut, JSON.stringify(released));
