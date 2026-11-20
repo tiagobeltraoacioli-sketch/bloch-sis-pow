@@ -26,6 +26,13 @@ fn v2() -> &'static (Vec<u8>, Vec<u8>) {
     static KEY: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
     KEY.get_or_init(|| derive(SeedVersion::V2Bip39Sha512))
 }
+/// `hash160 || 12 zero bytes`, written independently of the signer: the
+/// 20 bytes are the ones `bloch-crypto`'s address code derives.
+fn address_form(key_hash: &[u8; 32]) -> [u8; 32] {
+    let mut script = [0u8; 32];
+    script[..20].copy_from_slice(&key_hash[..20]);
+    script
+}
 fn call(method: &str, args: Value) -> Result<Value> {
     dispatch(json!({"method": method, "args": args}))
 }
@@ -87,6 +94,9 @@ fn cli_prepare(public: &[u8], inputs: &[([u8; 32], u32, u64)], amount_sat: u64, 
     let total: u128 = inputs.iter().map(|(_, _, sats)| u128::from(*sats)).sum();
     funding.sort();
     let owner: [u8; 32] = Sha3_256::digest(public).into();
+    // The one deliberate difference from the CLI, which pays change to the
+    // full key hash: the wallet's change takes the address form.
+    let owner = address_form(&owner);
     let mut tx = L2Deposit {
         network_domain: hex::decode(DOMAIN).unwrap().try_into().unwrap(),
         funding_pubkey: public.to_vec(),
@@ -158,7 +168,19 @@ fn review_and_sign_produce_the_transaction_the_node_cli_prepares() {
     unsigned.signature = Vec::new();
     assert_eq!(unsigned, expected);
     assert_eq!(tx.inputs[0].txid, [0x12; 32], "inputs are sorted");
-    assert_eq!(tx.change.script_hash, digest(&v1().0), "change returns to the owner");
+    // Change returns to the owner in the ADDRESS form: the hash160 that the
+    // account's bloch1q address encodes (bloch-crypto's own derivation),
+    // then twelve zero bytes; the node's rule opens it for this key.
+    let address = bloch_crypto::address::Address::from_pubkey(&v1().0, bloch_crypto::address::Network::Mainnet);
+    assert!(address.to_string().starts_with("bloch1q"));
+    assert_eq!(&tx.change.script_hash[..20], address.hash_bytes());
+    assert_eq!(tx.change.script_hash[20..], [0u8; 12]);
+    assert_eq!(tx.change.script_hash, address_form(&digest(&v1().0)));
+    assert_ne!(tx.change.script_hash, digest(&v1().0), "not the full key hash");
+    assert!(owns(&digest(&v1().0), &tx.change.script_hash));
+    assert!(!owns(&digest(&v2().0), &tx.change.script_hash));
+    assert_eq!(signed["changeScriptHashHex"], hex::encode(tx.change.script_hash));
+    assert_eq!(review["changeScriptHashHex"], signed["changeScriptHashHex"]);
     assert!(tx.tx_bytes >= wire.canonical_bytes().len() as u64, "declared size covers the encoding");
     assert!(
         tx.tx_bytes <= wire.canonical_bytes().len() as u64 + fee_market::TX_BYTES_DECLARE_SLACK,
@@ -178,7 +200,8 @@ fn review_and_sign_produce_the_transaction_the_node_cli_prepares() {
     assert_eq!(review["txBytes"], tx.tx_bytes.to_string());
     assert_eq!(review["inputCount"], 2);
     assert_eq!(review["domainHex"], DOMAIN);
-    assert_eq!(review["changeScriptHashHex"], hex::encode(digest(&v1().0)));
+    assert_eq!(review["changeScriptHashHex"], hex::encode(address_form(&digest(&v1().0))));
+    assert_eq!(review["ownerHashHex"], hex::encode(digest(&v1().0)));
 }
 
 #[test]
@@ -908,10 +931,20 @@ mod state {
         assert_eq!(state.l2_deposit_refusal_at(&tx, base_fee), None);
         assert!(crypto::verify(&tx.funding_pubkey, &tx.intent_root(), &tx.signature));
 
-        // Carried outputs (20-byte key hash, twelve zero bytes) are spendable too.
-        let mut carried = [0u8; 32];
-        carried[..20].copy_from_slice(&owner[..20]);
+        // The change pays the address form, whatever form the inputs have.
+        let carried = address_form(&owner);
+        assert_eq!(tx.change.script_hash, carried);
+        // Inputs held under the address form (20-byte key hash, twelve zero
+        // bytes) are spendable too, and so is a mix of both forms.
         assert_eq!(committed(mainnet(), &coins(carried)).l2_deposit_refusal_at(&tx, base_fee), None);
+        let mut mixed = coins(owner);
+        mixed[1].script_hash = carried;
+        assert_eq!(committed(mainnet(), &mixed).l2_deposit_refusal_at(&tx, base_fee), None);
+        // The address form of ANOTHER key opens nothing.
+        assert_eq!(
+            committed(mainnet(), &coins(address_form(&digest(&v2().0)))).l2_deposit_refusal_at(&tx, base_fee),
+            Some(L2DepositReject::Ownership)
+        );
 
         // The same check is not vacuous: each wrong context is refused by name.
         use L2DepositReject as R;
@@ -1020,7 +1053,7 @@ fn the_committed_fixture_is_what_the_signer_and_the_node_agree_on() {
     assert_eq!(run(1), steps[1]["response"]);
     let fresh = run(2);
     let recorded = &steps[2]["response"]["result"];
-    for field in ["txid", "feeSat", "changeSat"] {
+    for field in ["txid", "feeSat", "changeSat", "changeScriptHashHex"] {
         assert_eq!(fresh["result"][field], recorded[field], "{field}");
     }
     assert_eq!(run(3), steps[3]["response"]);

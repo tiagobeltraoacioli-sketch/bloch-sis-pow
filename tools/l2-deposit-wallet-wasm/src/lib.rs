@@ -5,7 +5,8 @@
 //! transaction with the node's own consensus types (`L2Deposit`,
 //! `fee_market::charge`), shows what it built (`review`) and signs exactly
 //! that (`sign`). It has no networking, signs no caller-supplied digest,
-//! never exports a key, and pays change only to the session's own key.
+//! never exports a key, and pays change only to the session's own key (in
+//! the address form, the one the web wallet's balance and Send use).
 //!
 //! Modelled on `tools/delegation-wallet-wasm` (commit 46e2f4d2): the same
 //! `nw_alloc` / `nw_free` / `nw_call` ABI, the same account opening rules
@@ -125,6 +126,18 @@ fn owns(key_hash: &[u8; 32], script_hash: &[u8; 32]) -> bool {
     key_hash == script_hash || script_hash[20..] == [0u8; 12] && key_hash[..20] == script_hash[..20]
 }
 
+/// The ADDRESS form of an owner's script hash: the first 20 bytes of
+/// SHA3-256(public key), which is what a `bloch1q...` address encodes
+/// (`bloch_crypto::address::Address::from_pubkey`), followed by twelve zero
+/// bytes. It is the carried arm of the node's ownership rule, the form the
+/// web wallet's balance view and ordinary Send index by, and so the form the
+/// change of a deposit must take to stay visible and spendable there.
+fn address_script(key_hash: &[u8; 32]) -> [u8; 32] {
+    let mut script = [0u8; 32];
+    script[..20].copy_from_slice(&key_hash[..20]);
+    script
+}
+
 struct Built {
     tx: L2Deposit,
     review: Value,
@@ -229,8 +242,9 @@ impl Session {
             inputs: funding.iter().map(|(input, _)| input.clone()).collect(),
             amount_sat,
             recipient,
-            // Change returns to the session's own key hash; no argument can move it.
-            change: TransferOutput { value: 0, script_hash: owner },
+            // Change returns to the session's own key, in the address form,
+            // computed here from the opened public key; no argument can move it.
+            change: TransferOutput { value: 0, script_hash: address_script(&owner) },
             tx_bytes: 0,
             tip_millisat_per_gas: tip,
             signature: Vec::new(),
@@ -303,6 +317,13 @@ impl Session {
         // Consumed before anything else: one review authorises one attempt.
         let expected = self.pending.take().ok_or("review required")?;
         let Built { mut tx, id, fee, .. } = self.build(args, true)?;
+        // What is about to be signed pays its change to this key's address
+        // form, which this key opens under the node's rule.
+        let owner = digest(&self.public);
+        if tx.change.script_hash != address_script(&owner) || !owns(&owner, &tx.change.script_hash) {
+            return Err("invalid deposit");
+        }
+        let change_script = hex::encode(tx.change.script_hash);
         if hash(args, "reviewId")? != expected || id != expected {
             return Err("review changed");
         }
@@ -335,6 +356,7 @@ impl Session {
             "txid": hex::encode(wire.txid()),
             "feeSat": fee_sat,
             "changeSat": change_sat,
+            "changeScriptHashHex": change_script,
         }))
     }
 }

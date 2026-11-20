@@ -25,7 +25,7 @@ Exports `memory`, `nw_alloc`, `nw_free`, `nw_call`. A request is
 | `open_keypair` | `domainHex`, `publicKeyHex`, `secretKeyHex` | `publicKeyHex`, `ownerHashHex`, `domainHex` |
 | `open_mnemonic` | `domainHex`, `publicKeyHex`, `mnemonic` | the same |
 | `review` | `recipientHex`, `amountSat`, `inputs`, `baseFeeMillisatPerGas`, `tipMillisatPerGas` | `recipientHex`, `amountSat`, `feeSat`, `changeSat`, `txBytes`, `inputCount`, `reviewId`, and `baseFeeSat`, `priorityFeeSat`, `totalInputSat`, `baseFeeMillisatPerGas`, `tipMillisatPerGas`, `ownerHashHex`, `changeScriptHashHex`, `domainHex`, `txid` |
-| `sign` | the `review` arguments, `reviewId`, optionally `feeSat` and `changeSat` | `transactionHex`, `txid`, `feeSat`, `changeSat` |
+| `sign` | the `review` arguments, `reviewId`, optionally `feeSat` and `changeSat` | `transactionHex`, `txid`, `feeSat`, `changeSat`, `changeScriptHashHex` |
 | `cancel` | none | `cancelled` |
 | `lock` | none | `locked` |
 
@@ -44,8 +44,13 @@ Exports `memory`, `nw_alloc`, `nw_free`, `nw_call`. A request is
 
 - The network domain is pinned in the code (`DOMAIN`); a test recomputes it
   from `genesis/mainnet.manifest`.
-- Change goes only to SHA3-256 of the session's public key. No argument names
-  a change destination, a key or a domain.
+- Change goes only to the session's own key, in the ADDRESS form of its
+  script hash: the first 20 bytes of SHA3-256(public key), which is what the
+  account's `bloch1q...` address encodes, followed by twelve zero bytes. The
+  signer computes it from the opened public key; no argument names a change
+  destination, a key or a domain. `review` and `sign` state it
+  (`changeScriptHashHex`) and the review fingerprint covers it. See "Change
+  form" below.
 - `MIN_L2_DEPOSIT_SAT <= amount <= MAX_L2_DEPOSIT_SAT`.
 - Exact conservation: `inputs = amount + change + fee`, where the fee is
   `fee_market::charge` at the declared size, which reserves the worst-case
@@ -64,6 +69,28 @@ Exports `memory`, `nw_alloc`, `nw_free`, `nw_call`. A request is
 - The signature is drawn until it fits the admission bound
   (`crypto::sign_fitting`), verified before it is released, and the signed
   bytes must decode back to the same transaction with the node's decoder.
+
+## Change form
+
+The node opens an output for a key under two forms (`transition::owns`): the
+full 32-byte SHA3-256 of the public key, or the address form (its first 20
+bytes and twelve zero bytes). Consensus puts no rule on which one a deposit's
+change uses (`apply_l2_deposit` inserts `tx.change.script_hash` as given). The
+web wallet's balance view and ordinary Send index only the address form, so
+change under the full hash would still belong to the key but would vanish
+from the wallet. This signer therefore always pays change to the address
+form; there is no option. The node CLI (`l2-deposit prepare`) pays the full
+hash; that is the one field where this signer's transaction differs from the
+CLI's.
+
+Inputs may be held under either form or a mix: the signer only names
+outpoints, and the node accepts both for this key. The committee test spends
+one input of each form, checks that the change lands under the address form,
+and then spends that change with an ordinary transfer signed by the same key.
+
+An address-form output is protected by 160 bits of preimage resistance, not
+256 (the node's own note at `owns`); it is the protection every balance held
+at a `bloch1q...` address already has.
 
 ## Fee ceilings
 

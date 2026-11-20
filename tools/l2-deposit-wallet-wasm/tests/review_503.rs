@@ -73,7 +73,13 @@ fn r503_wasm_signed_transactions_are_what_the_node_accepts() {
         assert_eq!(hex::encode(tx.network_domain), MAINNET_DOMAIN, "{label}");
         assert_eq!(hex::encode(&tx.funding_pubkey), text(&case["publicKeyHex"]), "{label}");
         let owner: [u8; 32] = Sha3_256::digest(&tx.funding_pubkey).into();
-        assert_eq!(tx.change.script_hash, owner, "{label}: change to the owner only");
+        // Second pass: change goes to the owner's ADDRESS form (hash160 and
+        // twelve zero bytes), the form the web wallet indexes by.
+        let mut address_form = [0u8; 32];
+        address_form[..20].copy_from_slice(&owner[..20]);
+        assert_eq!(tx.change.script_hash, address_form, "{label}: change to the owner's address form only");
+        assert_eq!(hex::encode(address_form), text(&review["changeScriptHashHex"]), "{label}");
+        assert_eq!(hex::encode(address_form), text(&signed["changeScriptHashHex"]), "{label}");
         assert_eq!(hex::encode(tx.recipient), text(&review["recipientHex"]), "{label}");
         assert_eq!(tx.amount_sat.to_string(), text(&review["amountSat"]), "{label}");
         assert_eq!(tx.change.value.to_string(), text(&review["changeSat"]), "{label}");

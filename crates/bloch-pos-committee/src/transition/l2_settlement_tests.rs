@@ -686,9 +686,12 @@ mod l2_tests {
     /// The signer's public fixture (one `open_mnemonic -> review -> sign` run
     /// with the published BIP39 test mnemonic, bound to the mainnet domain) is
     /// applied by the real transition, in a block, with the real hybrid
-    /// verifier: inputs spent, change created for the owner, the escrow
-    /// record appended for the EVM recipient. Any drift between the signer
-    /// and this state transition fails here.
+    /// verifier: inputs spent (one held under the full key hash, one under
+    /// the address form), change created for the owner under the ADDRESS
+    /// form (`hash160 || 12 zero bytes`, what the web wallet indexes by), the
+    /// escrow record appended for the EVM recipient. An ordinary transfer
+    /// signed by the same key then spends that change. Any drift between the
+    /// signer and this state transition fails here.
     #[test]
     #[cfg(feature = "devnet-l2-deposits")]
     fn a_deposit_signed_by_the_wallet_signer_is_applied_by_the_transition() {
@@ -718,18 +721,29 @@ mod l2_tests {
         );
         assert!(bloch_crypto::crypto::verify_pinned(&tx.funding_pubkey, &tx.intent_root(), &tx.signature));
 
-        // The state holds exactly the outputs the request named, owned by the key.
+        // The address form of the owner: its first 20 bytes, twelve zeros.
+        let mut address_form = [0u8; 32];
+        address_form[..20].copy_from_slice(&owner[..20]);
+        assert_eq!(tx.change.script_hash, address_form, "change pays the address form");
+        assert_eq!(hex::encode(address_form), text(&review["changeScriptHashHex"]));
+        assert_eq!(hex::encode(address_form), text(&signed["changeScriptHashHex"]));
+
+        // The state holds exactly the outputs the request named, owned by the
+        // key: the first under the full key hash, the others under the
+        // address form. The deposit spends both.
         let coins: Vec<crate::state_root::EutxoEntry> = request["inputs"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|row| crate::state_root::EutxoEntry {
+            .enumerate()
+            .map(|(i, row)| crate::state_root::EutxoEntry {
                 txid: h32(&row["txidHex"]),
                 vout: row["vout"].as_u64().unwrap() as u32,
                 value: text(&row["valueSat"]).parse().unwrap(),
-                script_hash: owner,
+                script_hash: if i == 0 { owner } else { address_form },
             })
             .collect();
+        assert!(coins.len() >= 2, "the fixture spends both forms");
         let (_, mut genesis, mut chains) = setup_with(4, ToyVerifier, &coins);
         let mut policy = Policy {
             identities: std::array::from_fn(|i| hash_at(TEMPLATE, S + i * 32)),
@@ -767,7 +781,9 @@ mod l2_tests {
         }
         let change = post.eutxos.get(&(wire.txid(), 0)).expect("change output");
         assert_eq!(change.value.to_string(), text(&review["changeSat"]));
-        assert_eq!(change.script_hash, owner);
+        assert_eq!(change.script_hash, address_form, "the change output lands under the address form");
+        assert_ne!(change.script_hash, owner);
+        assert!(owns(&owner, &change.script_hash));
         // Only the reviewed fee leaves the accounted supply.
         let fee: u128 = text(&review["feeSat"]).parse().unwrap();
         assert!(supply >= post.accounted_supply_sat() && supply - post.accounted_supply_sat() <= fee);
@@ -789,6 +805,43 @@ mod l2_tests {
         let mut replay = post.clone();
         assert!(replay.apply_transaction(&wire, 0, post.next_base_fee(), &WalletVerifier).is_err());
         assert_eq!(replay, post);
+
+        // The change is an ordinary output of this key: a plain transfer,
+        // really signed by the fixture's (public, disposable) key, spends it
+        // in the next block.
+        use bloch_crypto::wallet::seed::{SeedPhrase, SeedVersion};
+        let seed = SeedPhrase::parse(&text(&fixture["publicFixtureMnemonic"]))
+            .unwrap()
+            .to_seed_bytes_versioned(SeedVersion::V1LegacyPbkdf2Sha256, "")
+            .unwrap();
+        let (public, secret) = bloch_crypto::crypto::generate_keypair_from_seed(&seed[..32]).unwrap();
+        assert_eq!(public, tx.funding_pubkey);
+        let change_entry = change.clone();
+        let mut spend = transfer_spending(std::slice::from_ref(&change_entry), &public, [0xC4; 32], 20_000, 0, post.next_base_fee());
+        let root = spend.spend_signing_root();
+        if let PosTransaction::Transfer { inputs, .. } = &mut spend {
+            for input in inputs.iter_mut() {
+                input.signature = bloch_crypto::crypto::sign(&secret, &root).unwrap();
+            }
+        }
+        let block = build_block(&t, &post, 3, &[], std::slice::from_ref(&spend), &mut chains);
+        let after = t
+            .apply_block(&post, &block, &[], std::slice::from_ref(&spend))
+            .expect("an ordinary transfer spends the deposit's change");
+        assert!(after.eutxos.get(&(wire.txid(), 0)).is_none(), "change spent");
+        assert!(after.eutxos.get(&(spend.txid(), 0)).is_some_and(|o| o.script_hash == [0xC4; 32]));
+        // Another key cannot.
+        let (other, other_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&[0x5c; 32]).unwrap();
+        let mut theft = transfer_spending(std::slice::from_ref(&change_entry), &other, [0xC5; 32], 20_000, 0, post.next_base_fee());
+        let root = theft.spend_signing_root();
+        if let PosTransaction::Transfer { inputs, .. } = &mut theft {
+            for input in inputs.iter_mut() {
+                input.signature = bloch_crypto::crypto::sign(&other_secret, &root).unwrap();
+            }
+        }
+        let mut state = post.clone();
+        assert!(state.apply_transaction(&theft, 0, post.next_base_fee(), &WalletVerifier).is_err());
+        assert_eq!(state, post);
     }
 
     // ── Settlement V3: user transactions, deposits bound by deposits_hash ──

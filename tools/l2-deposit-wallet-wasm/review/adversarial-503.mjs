@@ -119,7 +119,10 @@ function judge(label, publicKeyHex, args, review, signed) {
   check(tx.tag === 0x14, `${label}: tag`);
   check(tx.domain === DOMAIN, `${label}: domain`);
   check(hex(tx.pubkey) === publicKeyHex, `${label}: funding key`);
-  check(tx.changeScript === owner, `${label}: change script is the owner`, tx.changeScript);
+  // Second pass: the owner's ADDRESS form (hash160 + 12 zero bytes), stated in both replies.
+  const addressForm = owner.slice(0, 40) + '0'.repeat(24);
+  check(tx.changeScript === addressForm, `${label}: change script is the owner's address form`, tx.changeScript);
+  check(review.changeScriptHashHex === addressForm && signed.changeScriptHashHex === addressForm, `${label}: both replies state the change script`);
   check(tx.recipient === review.recipientHex && tx.recipient === args.recipientHex.toLowerCase(), `${label}: recipient`);
   check(tx.amount.toString() === review.amountSat && review.amountSat === args.amountSat, `${label}: amount`);
   check(tx.changeValue.toString() === review.changeSat, `${label}: change value`);
