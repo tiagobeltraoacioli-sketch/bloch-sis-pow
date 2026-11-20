@@ -136,6 +136,10 @@ fn review_and_sign_produce_the_transaction_the_node_cli_prepares() {
 
     // The signature is a real hybrid signature over the node's signing root.
     assert!(crypto::verify(&tx.funding_pubkey, &tx.intent_root(), &tx.signature));
+    // Mainnet judges transaction witnesses with the pinned FIPS 204 ML-DSA
+    // verifier since MLDSA_PIN_ACTIVATION_EPOCH (`SignaturePolicy::transaction`
+    // -> CompatiblePinned -> `verify_pinned`).
+    assert!(crypto::verify_pinned(&tx.funding_pubkey, &tx.intent_root(), &tx.signature));
     assert!(!tx.signature.is_empty() && tx.signature.len() <= ADMISSION_PQ_SIGNATURE_MAX);
     let mut other = tx.clone();
     other.amount_sat += 1;
@@ -789,6 +793,7 @@ fn the_committed_fixture_is_what_the_signer_and_the_node_agree_on() {
         assert_eq!(signed["txid"], hex::encode(wire.txid()));
         assert_eq!(signed["txid"], recorded["txid"]);
         assert!(crypto::verify(&tx.funding_pubkey, &tx.intent_root(), &tx.signature));
+        assert!(crypto::verify_pinned(&tx.funding_pubkey, &tx.intent_root(), &tx.signature));
         let unsigned = fixture["unsignedTransactionHex"].as_str().unwrap();
         let text = signed["transactionHex"].as_str().unwrap();
         assert!(text.starts_with(unsigned));

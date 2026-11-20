@@ -709,6 +709,14 @@ mod l2_tests {
         assert_eq!(hex::encode(wire.txid()), text(&signed["txid"]));
         assert_eq!(tx.network_domain, domain);
         assert_eq!(script_of(&tx.funding_pubkey), owner);
+        // This fixture state is at epoch 0 (the compatible rule). Mainnet is
+        // past MLDSA_PIN_ACTIVATION_EPOCH, where a transaction witness is
+        // judged by the pinned FIPS 204 verifier; the signature passes it too.
+        assert_eq!(
+            crate::attestation::SignaturePolicy::transaction(crate::params::MLDSA_PIN_ACTIVATION_EPOCH),
+            crate::attestation::SignaturePolicy::CompatiblePinned,
+        );
+        assert!(bloch_crypto::crypto::verify_pinned(&tx.funding_pubkey, &tx.intent_root(), &tx.signature));
 
         // The state holds exactly the outputs the request named, owned by the key.
         let coins: Vec<crate::state_root::EutxoEntry> = request["inputs"]
