@@ -2392,6 +2392,21 @@ pub fn sig_canonical_active(epoch: u64) -> bool {
 /// of those consumers and mixed-version behavior.
 pub const VALIDATOR_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+// Review CRY-3 (round 2): this constant has NO reader. No signer, block or
+// vote validation, gossip door, fork-choice admission, slashing-evidence
+// check or light-client verifier selects the network-bound roots
+// (`AttestationData::network_bound_signing_root`,
+// `BlockHeaderV4::network_bound_proposal_signing_root`), and the exit and
+// RANDAO re-commit roots have no network-bound form at all. A build that set
+// it to an epoch would compile, ship and bind nothing, while reporting the
+// gate as armed. Until the rule is written and wired at every one of those
+// call sites, an armed value is a build error. The commit that wires it
+// removes this assertion.
+const _: () = assert!(
+    VALIDATOR_NETWORK_BINDING_ACTIVATION_EPOCH == u64::MAX,
+    "VALIDATOR_NETWORK_BINDING_ACTIVATION_EPOCH has no reader: arming it binds nothing (review CRY-3)"
+);
+
 /// One shipped domain separator and the preimage shapes that use it.
 ///
 /// `preimage_shapes` is an audit registry, not an encoding layer. Some frozen
@@ -2737,6 +2752,90 @@ pub(crate) mod funded_delegation_bound_rehearsal {
     }
 }
 
+/// Candidate growth cap on DELEGATED stake activation. `u64::MAX` means
+/// INERT.
+///
+/// [`HF2_GROWTH_CAP_EPOCH`] bounds how fast new OWN stake activates
+/// (`max(W/64, MIN_DEPOSIT)` per 24-epoch window). It does not cover
+/// delegation, which warms up under its own budget,
+/// `max(25 bps of active delegated stake, 500,000 BLCH)` per epoch
+/// (`delegation::Registry::resolve`), and one active validator accepts up to
+/// 500M BLCH of funded delegation. A newcomer with the coins and one
+/// minimum-bond validator therefore reaches one third of the weight in about
+/// 2.3 days and two thirds in 4.9 to 7.6 days at the epoch-6090 weight
+/// (204.66M BLCH), against the 19 days the own-stake cap is sized for
+/// (`transition::funded_delegation::tests::growth_cap_*` reproduce the
+/// figures on the real transition).
+///
+/// Once armed, the ACTIVATION pass of the warm-up walk uses, from this epoch
+/// on, the budget
+/// `max(active delegated / GROWTH_CAP_WARMUP_DIV, GROWTH_CAP_WARMUP_FLOOR_SAT)`
+/// per epoch ([`crate::delegation::GROWTH_CAP_WARMUP_DIV`],
+/// [`crate::delegation::GROWTH_CAP_WARMUP_FLOOR_SAT`]: the only two economic
+/// parameters, both in `delegation.rs`), never more than today's budget.
+/// What it does and does not change:
+///
+/// * Stake already queued when the gate binds is covered: the cap is on
+///   activation, not on admission, so filling the queue before the flag day
+///   buys nothing.
+/// * No delegation is refused or displaced and no minimum changes. A
+///   delegation waits longer in the warm-up queue; that is the whole effect
+///   on a delegator.
+/// * The RELEASE pass keeps today's budget. Deactivation, cool-down and
+///   withdrawal are exactly as fast as before, so the rule cannot hold any
+///   position in.
+/// * Epochs below the gate keep the old budget inside the walk, so every
+///   historical registry, roster and state root is unchanged.
+///
+/// Limits, stated plainly. The budget is measured against delegated stake
+/// and an absolute floor, not against the whole active weight (the walk
+/// cannot see own stake), so the floor has to be re-sized if the weight
+/// moves far from what it was sized against. The delegation budget and the
+/// own-stake budget are separate, so both paths together are faster than
+/// either alone. And a rate limit buys time and visibility, not prevention.
+///
+/// It changes the activated amount of queued delegations, which feeds the
+/// roster, rewards and the state root, so arming needs a historical replay,
+/// mixed-fleet qualification and a coordinated epoch; there is no runtime
+/// override. It cannot precede funded delegation or the own-stake cap.
+/// `funded_delegation_growth_cap_gate_is_inert` pins the inert value.
+pub const FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH,
+    FUNDED_DELEGATION_ACTIVATION_EPOCH
+));
+const _: () = assert!(gate_is_inert_or_not_before(
+    FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH,
+    HF2_GROWTH_CAP_EPOCH
+));
+
+/// The epoch the delegation growth cap takes effect at, `None` while it is
+/// inert. The warm-up walk needs the epoch itself, not a yes/no for one
+/// epoch: it replays every epoch since genesis and applies the cap only to
+/// those at or above this one.
+pub(crate) fn funded_delegation_growth_cap_epoch() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(epoch) = funded_delegation_growth_cap_rehearsal::epoch() {
+        return Some(epoch);
+    }
+    (FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH != u64::MAX)
+        .then_some(FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod funded_delegation_growth_cap_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static EPOCH: Cell<Option<u64>> = const { Cell::new(None) }; }
+    pub fn epoch() -> Option<u64> { EPOCH.with(Cell::get) }
+    /// Armed from `epoch`, so a test can build state below the gate first.
+    pub fn open_at(epoch: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore { fn drop(&mut self) { EPOCH.with(|v| v.set(self.0)); } }
+        Restore(EPOCH.with(|v| v.replace(Some(epoch))))
+    }
+}
+
 /// Security review round 2, DET-3: at most one `ValidatorCommissionUpdate`
 /// per validator per epoch. `u64::MAX` means INERT.
 ///
@@ -2827,6 +2926,51 @@ pub fn l2_release_exemption_active(epoch: u64) -> bool {
 
 #[cfg(test)]
 pub(crate) mod l2_release_exemption_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+/// Fault isolation of the L2 / bridge / settlement handlers inside the block
+/// transition ([`crate::isolation`]). `u64::MAX` means INERT.
+///
+/// Before this gate a panic in the handler of an L2 settlement, deposit,
+/// data-availability or withdrawal-claim transaction unwinds the block
+/// transition: every node that judges the block stops on it. Once armed, the
+/// handler runs behind [`crate::isolation::contain`] and a fault refuses the
+/// transaction, so the block is invalid (`TransitionError::Transaction(i)`)
+/// like any block carrying an invalid transaction.
+///
+/// No block that any node has ever accepted changes verdict: a block whose
+/// transition panics was never adopted by anybody. What changes is the
+/// outcome for such a block on a mixed fleet (old nodes stop, new nodes
+/// refuse it and follow another block) and what a node does on a fault that
+/// is local to it (it refuses a block the rest of the network accepts instead
+/// of stopping). That is why it sits behind a gate the owner arms rather than
+/// shipping live; it cannot precede the L2 settlement itself.
+/// `l2_fault_isolation_gate_is_inert` pins the inert value.
+pub const L2_FAULT_ISOLATION_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_FAULT_ISOLATION_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+
+pub fn l2_fault_isolation_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_fault_isolation_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_FAULT_ISOLATION_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_fault_isolation_rehearsal {
     use std::cell::Cell;
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
     pub fn enabled() -> bool { ENABLED.with(Cell::get) }
@@ -3488,6 +3632,8 @@ pub(crate) mod activation_queue_v2_rehearsal {
 /// 7.6 days to 2/3 at the epoch-6090 weight (204.66M BLCH), 4 to 6 days with
 /// both paths combined. The cap removes the hours-scale own-stake path; it
 /// does not by itself deliver the ~19-day figure.
+/// [`FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH`] (inert) is the candidate
+/// rule for the delegation path.
 ///
 /// Onboarding: the `validator-join` wizard deposits the 25,000 BLCH minimum.
 /// The churn limit admits at most `4 x 24 = 96` activations per window, i.e.
@@ -3582,6 +3728,30 @@ pub const HF3_PQ_MIGRATION_EPOCH: u64 = 7360;
 ///   finalized commitment;
 /// - the commit-reveal rescue (wire `0x19`/`0x1A`) becomes valid.
 pub const LATTICE_EMERGENCY_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+// Review CRY-1 (round 2; CR-3 of round 1), OPEN: the rescue this gate turns
+// on must not be armed as written. A reveal is valid only if it sweeps
+// EVERY output at the key's scripts (`PqMigrationReject::IncompleteSweep`),
+// and anyone can pay dust to those scripts. So, with the gate armed:
+//
+// * each dust output that lands before a reveal executes voids it;
+// * about 14,000 dust outputs make every reveal larger than a block, which
+//   locks the coins for good (transfers are frozen, no reveal fits);
+// * an attacker who reads the key from the victim's first reveal commits its
+//   own destination, keeps the victim's reveals void with dust for the
+//   commitment delay, and sweeps everything with a forged signature.
+//
+// Also open: the lattice spend freeze covers `Transfer`/`TransferV2` only;
+// funded deposits and delegations and the L2 spend types still accept a
+// lattice funding key. The fix (first matured commitment binds the key's
+// destination and tip; a reveal may sweep any subset) and the freeze of the
+// other spend types are specified in the round-2 report and are NOT
+// implemented. An emergency release must do both before it deletes this
+// assertion.
+const _: () = assert!(
+    LATTICE_EMERGENCY_ACTIVATION_EPOCH == u64::MAX,
+    "the lattice-emergency rescue is blockable and redirectable as written: fix review CRY-1 before arming"
+);
 
 /// Epochs a rescue commitment must age before a reveal may cite it (~1 day at
 /// 16-minute epochs). An attacker who learns a public key from a pending

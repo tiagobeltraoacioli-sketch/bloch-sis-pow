@@ -116,6 +116,32 @@
 //!   accepted only under exactly its pinned id; inbound connections only
 //!   under a pinned or listed id.
 //!
+//! - `require` with `--mesh-plain-allow <file>` (staged migration): the file
+//!   lists IP addresses, and a peer at one of them is treated exactly as
+//!   `offer` treats every peer: the handshake is tried first and a plain
+//!   session is accepted when that peer does not speak it. Every other
+//!   address gets `require`. The exception is keyed by address because a
+//!   plain peer has no identity to key it by; it therefore protects nothing
+//!   on the path to a listed address (an active attacker there can strip
+//!   the handshake, as under `offer`), and it is refused together with
+//!   `--mesh-require-authenticated`. It exists so that the operator's own
+//!   nodes can stop accepting plain sessions from everybody while peers
+//!   that upgrade on their own schedule stay connected; see
+//!   `docs/operations/MESH-SECURITY-REQUIRE-MIGRATION.md`.
+//!
+//! ## Downgrade resistance
+//!
+//! There is no negotiation an attacker could steer: one handshake version,
+//! one suite, and under `require` no plain path at all. Removing or
+//! replacing the dialer's `msg1` (stripping the offer) leaves a `require`
+//! listener with bytes that are not a handshake, and it closes; a `require`
+//! dialer that gets no valid `msg2` never falls back. Any change to `msg1`
+//! or `msg2` in flight changes the transcript hash on one side only, so the
+//! two sides derive different keys and the first sealed record fails to
+//! open. What `require` alone does not stop is a party that completes a
+//! full handshake with each side under its own keys; that takes pins or an
+//! allow-list, as described above.
+//!
 //! Rollout: every node `plain → offer`, one at a time; when every peer of a
 //! node is upgraded its connections are already sealed; then
 //! `offer → require`, again one at a time; then add pins and/or an
@@ -135,7 +161,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -149,6 +175,22 @@ use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SharedSecret as _};
 use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
 use sha3::{Digest, Sha3_256};
 use zeroize::Zeroizing;
+
+/// The handshake and record layer of the released node (`0067547f`, what the
+/// fleet and the external validators run), kept verbatim so the tests below
+/// can put this module on one end of a socket and the released code on the
+/// other. It is the file `mesh_pq.rs` of that commit up to its test module:
+///
+/// ```text
+/// git show 0067547f:crates/bloch-pos-node/src/mesh_pq.rs | sed -n '1,1026p' \
+///   | diff - crates/bloch-pos-node/src/mesh_pq/released_0067547f.rs
+/// ```
+///
+/// Never edit it. When a later release changes the wire, add that release
+/// next to it instead.
+#[cfg(test)]
+#[allow(dead_code, unused_imports, clippy::all)]
+pub(crate) mod released_0067547f;
 
 /// First four bytes of a handshake. Read as a legacy length prefix this is
 /// 0x3151_5042 = 827,412,546, which every legacy node refuses.
@@ -237,6 +279,9 @@ pub struct MeshSecurity {
     /// Where the identity was loaded from, for the messages that tell an
     /// operator what to do with that file.
     identity_path: Option<PathBuf>,
+    /// `--mesh-plain-allow`: addresses whose peers may still use a plain
+    /// session under `require`. Empty unless the operator listed some.
+    plain_allow: HashSet<IpAddr>,
     /// Nonces of the handshakes this node is in the middle of, on either
     /// side. A peer that presents this node's own identity is this node
     /// itself exactly when the nonce it sent is one of these; otherwise it
@@ -338,6 +383,7 @@ impl MeshSecurity {
             allow: None,
             pins: HashMap::new(),
             identity_path: None,
+            plain_allow: HashSet::new(),
             live_nonces: Mutex::new(HashSet::new()),
         }
     }
@@ -406,8 +452,57 @@ impl MeshSecurity {
             allow,
             pins,
             identity_path: Some(identity_path),
+            plain_allow: HashSet::new(),
             live_nonces: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Add the `--mesh-plain-allow` exceptions read from `path`: one IP
+    /// address per line, `#` starts a comment. Only meaningful under
+    /// `require`. Under `offer` every peer already has the exception, so
+    /// the list is read, checked and has no effect: a rollback from
+    /// `require` to `offer` is then a change of one word in the argv and
+    /// cannot fail on a flag left behind. Refused under `plain`, and
+    /// together with `--mesh-require-authenticated`, which promises that no
+    /// peer connects without an expected identity.
+    pub fn with_plain_allow_file(mut self, path: &Path, require_authenticated: bool) -> io::Result<Self> {
+        let refuse = |why: &str| Err(io::Error::new(io::ErrorKind::InvalidInput, why.to_string()));
+        if self.mode == Mode::Plain {
+            return refuse("--mesh-plain-allow needs --mesh-security require (or offer, where it has no effect)");
+        }
+        if require_authenticated {
+            return refuse(
+                "--mesh-plain-allow cannot be combined with --mesh-require-authenticated: a peer on a \
+                 plain session presents no identity",
+            );
+        }
+        let text = std::fs::read_to_string(path)?;
+        self.plain_allow = parse_plain_allow(&text)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))?;
+        Ok(self)
+    }
+
+    /// Add one plain-session exception, for tests.
+    #[cfg(test)]
+    pub fn with_plain_allow_ip(mut self, ip: IpAddr) -> Self {
+        self.plain_allow.insert(canonical_ip(ip));
+        self
+    }
+
+    /// True when a peer at `ip` is one of the `--mesh-plain-allow`
+    /// exceptions of a `require` node.
+    pub fn is_plain_exception(&self, ip: Option<IpAddr>) -> bool {
+        self.mode == Mode::Require && ip.is_some_and(|ip| self.plain_allow.contains(&canonical_ip(ip)))
+    }
+
+    /// True when this node may run a plain session with a peer at `ip`:
+    /// always under `plain` and `offer`, and under `require` only for a
+    /// listed exception. An unknown address is never an exception.
+    pub fn accepts_plain(&self, ip: Option<IpAddr>) -> bool {
+        match self.mode {
+            Mode::Plain | Mode::Offer => true,
+            Mode::Require => self.is_plain_exception(ip),
+        }
     }
 
     /// An in-memory identity, for tests.
@@ -422,6 +517,7 @@ impl MeshSecurity {
             allow,
             pins: HashMap::new(),
             identity_path: None,
+            plain_allow: HashSet::new(),
             live_nonces: Mutex::new(HashSet::new()),
         }
     }
@@ -460,6 +556,18 @@ impl MeshSecurity {
                     .to_string(),
             );
         }
+        if self.mode == Mode::Require && !self.plain_allow.is_empty() {
+            let mut listed: Vec<String> = self.plain_allow.iter().map(IpAddr::to_string).collect();
+            listed.sort();
+            out.push(format!(
+                "MIGRATION STATE: --mesh-plain-allow lets {} address(es) keep PLAIN sessions ({}). Traffic \
+                 with them is neither encrypted nor authenticated, and an active attacker on the path to \
+                 them can force plain. Remove each address once its peer completes the handshake (the \
+                 node logs it), and the flag once the list is empty.",
+                listed.len(),
+                listed.join(", "),
+            ));
+        }
         out
     }
 
@@ -479,7 +587,7 @@ impl MeshSecurity {
                 "plain (no authentication, no encryption)".to_string()
             }
             (Some(id), mode) => format!(
-                "{} (ML-KEM-768+X25519, ML-DSA-65 identity {}{}{}{})",
+                "{} (ML-KEM-768+X25519, ML-DSA-65 identity {}{}{}{}{})",
                 mode.name(),
                 crate::codec::hex(&id.id),
                 match &self.allow {
@@ -494,6 +602,11 @@ impl MeshSecurity {
                     (Mode::Require, false) => "; ENCRYPTION ONLY: no allow-list, no pins, peers not authenticated",
                     (Mode::Require, true) => "; peers authenticated",
                     _ => "; migration state: plain connections still accepted, peers not authenticated",
+                },
+                match (mode, self.plain_allow.len()) {
+                    (_, 0) => String::new(),
+                    (Mode::Require, n) => format!("; {n} address(es) excepted by --mesh-plain-allow may still connect in plain"),
+                    _ => "; --mesh-plain-allow has no effect under offer".to_string(),
                 },
             ),
         }
@@ -667,6 +780,53 @@ fn parse_allow_list(text: &str) -> Result<HashSet<PeerId>, String> {
         return Err("allow-list is empty; it would refuse every peer".to_string());
     }
     Ok(out)
+}
+
+/// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is the same host as `a.b.c.d`: a
+/// dual-stack listener reports the former for a peer listed as the latter.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// One IP address per line; `#` starts a comment. Addresses only: a name
+/// would have to be resolved, and an inbound connection has no name.
+fn parse_plain_allow(text: &str) -> Result<HashSet<IpAddr>, String> {
+    let mut out = HashSet::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let ip: IpAddr = line
+            .parse()
+            .map_err(|_| format!("line {}: `{line}` is not an IP address (no port, no host name, no prefix length)", n + 1))?;
+        out.insert(canonical_ip(ip));
+    }
+    if out.is_empty() {
+        return Err("no address listed; remove --mesh-plain-allow instead of passing an empty list".to_string());
+    }
+    Ok(out)
+}
+
+/// A `require` node turned away a peer that did not speak the handshake.
+#[derive(Debug)]
+struct PlainPeerRefused;
+
+impl fmt::Display for PlainPeerRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("mesh: peer did not start the post-quantum handshake (mesh-security require)")
+    }
+}
+
+impl std::error::Error for PlainPeerRefused {}
+
+/// True when a handshake error is a `require` listener refusing a peer that
+/// did not start the handshake (a legacy or plain peer, or a stripped offer).
+pub fn plain_peer_refusal(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<PlainPeerRefused>())
 }
 
 // ── Record layer ────────────────────────────────────────────────────────────
@@ -951,26 +1111,21 @@ fn sniff(sock: &mut TcpStream, deadline: Instant) -> io::Result<Option<[u8; 4]>>
 
 /// Run the responder side on an accepted socket. `Plain` mode returns
 /// `Session::Plain` without touching the socket; `offer` lets a legacy
-/// dialer through as `Session::Plain`; `require` refuses it.
+/// dialer through as `Session::Plain`; `require` refuses it unless its
+/// address is a `--mesh-plain-allow` exception.
 pub fn handshake_inbound(sock: &mut TcpStream, sec: &MeshSecurity) -> io::Result<Session> {
     if sec.mode == Mode::Plain {
         return Ok(Session::Plain);
     }
     let me = sec.identity()?;
     let deadline = handshake_deadline()?;
-    let sniff_deadline = match sec.mode {
-        Mode::Offer => Instant::now() + SNIFF_TIMEOUT,
-        _ => deadline,
-    };
+    // `offer`, or a `require` node whose operator excepted this address.
+    let plain_ok = sec.accepts_plain(sock.peer_addr().ok().map(|address| address.ip()));
+    let sniff_deadline = if plain_ok { Instant::now() + SNIFF_TIMEOUT } else { deadline };
     match sniff(sock, sniff_deadline)? {
         Some(first) if first == MAGIC => {}
-        _ if sec.mode == Mode::Offer => return Ok(Session::Plain),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "mesh: peer did not start the post-quantum handshake (mesh-security require)",
-            ))
-        }
+        _ if plain_ok => return Ok(Session::Plain),
+        _ => return Err(io::Error::new(io::ErrorKind::PermissionDenied, PlainPeerRefused)),
     }
 
     let mut msg1 = vec![0u8; msg1_len()];
@@ -1452,5 +1607,492 @@ mod tests {
         let other = crate::codec::hex(&[0xce; 32]);
         assert!(split_peer_pins(&[format!("a:1={hex}"), format!("a:1={other}")]).is_err());
         assert!(split_peer_pins(&[format!("a:1={hex}"), format!("a:1={hex}")]).is_ok());
+    }
+
+    // ── `require`: downgrade resistance and the staged-migration exception ──
+
+    /// Which byte of which direction an on-path party changes.
+    #[derive(Clone, Copy)]
+    enum Flip {
+        Nothing,
+        ToListener(usize),
+        ToDialer(usize),
+    }
+
+    /// [`pair`], with a party on the path that relays every byte and flips
+    /// one bit of the chosen byte.
+    fn pair_through_relay(
+        client: Arc<MeshSecurity>,
+        server: Arc<MeshSecurity>,
+        flip: Flip,
+    ) -> (io::Result<(Session, TcpStream)>, io::Result<(Session, TcpStream)>) {
+        use std::io::Read;
+        use std::net::Shutdown;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            handshake_inbound(&mut s, &server).map(|x| (x, s))
+        });
+        fn pump(mut from: TcpStream, mut to: TcpStream, flip: Option<usize>) -> std::thread::JoinHandle<()> {
+            std::thread::spawn(move || {
+                let mut seen = 0usize;
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = match from.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    if let Some(at) = flip.filter(|at| (seen..seen + n).contains(at)) {
+                        buf[at - seen] ^= 1;
+                    }
+                    seen += n;
+                    if to.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                let _ = to.shutdown(Shutdown::Both);
+                let _ = from.shutdown(Shutdown::Both);
+            })
+        }
+        let on_path = std::thread::spawn(move || {
+            let (down, _) = relay.accept().unwrap();
+            let up = TcpStream::connect(target).unwrap();
+            let (to_listener, to_dialer) = match flip {
+                Flip::Nothing => (None, None),
+                Flip::ToListener(at) => (Some(at), None),
+                Flip::ToDialer(at) => (None, Some(at)),
+            };
+            let a = pump(down.try_clone().unwrap(), up.try_clone().unwrap(), to_listener);
+            let b = pump(up, down, to_dialer);
+            a.join().unwrap();
+            b.join().unwrap();
+        });
+        let dialed = relay_addr.to_string();
+        let mut c = TcpStream::connect(relay_addr).unwrap();
+        let cli = handshake_outbound(&mut c, &client, &dialed).map(|x| (x, c));
+        let srv = srv.join().unwrap();
+        // Both ends are done; closing them is what stops the relay.
+        let out = (cli, srv);
+        if out.0.is_err() || out.1.is_err() {
+            on_path.join().unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn a_modified_handshake_is_detected_and_never_becomes_a_session() {
+        let node = || Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
+        // Control: the relay itself changes nothing about the outcome.
+        let (cli, srv) = pair_through_relay(node(), node(), Flip::Nothing);
+        assert!(matches!(cli, Ok((Session::Sealed { .. }, _))) && matches!(srv, Ok((Session::Sealed { .. }, _))));
+
+        let x25519_i = 37;
+        let mlkem_ek = 37 + X25519_LEN + 100;
+        let nonce_i = msg1_len() - 1;
+        let x25519_r = 5;
+        let mlkem_ct = 5 + X25519_LEN + 100;
+        let nonce_r = msg2_len() - 1;
+        let responder_auth = msg2_len() + 4 + 10;
+        let initiator_auth = msg1_len() + 4 + 10;
+        for (what, flip) in [
+            ("magic", Flip::ToListener(0)),
+            ("version", Flip::ToListener(4)),
+            ("network", Flip::ToListener(5)),
+            ("initiator x25519 key", Flip::ToListener(x25519_i)),
+            ("ML-KEM encapsulation key", Flip::ToListener(mlkem_ek)),
+            ("initiator nonce", Flip::ToListener(nonce_i)),
+            ("initiator identity record", Flip::ToListener(initiator_auth)),
+            ("reply magic", Flip::ToDialer(0)),
+            ("reply version", Flip::ToDialer(4)),
+            ("responder x25519 key", Flip::ToDialer(x25519_r)),
+            ("ML-KEM ciphertext", Flip::ToDialer(mlkem_ct)),
+            ("responder nonce", Flip::ToDialer(nonce_r)),
+            ("responder identity record", Flip::ToDialer(responder_auth)),
+        ] {
+            let (cli, srv) = pair_through_relay(node(), node(), flip);
+            // The listener is the side that would act on the session, so it
+            // must refuse every one of these. The dialer finishes before the
+            // listener has read its identity record, so that one change is
+            // the listener's alone to catch.
+            assert!(srv.is_err(), "listener accepted a handshake with a modified {what}");
+            if !matches!(flip, Flip::ToListener(at) if at == initiator_auth) {
+                assert!(cli.is_err(), "dialer accepted a handshake with a modified {what}");
+            }
+        }
+    }
+
+    /// An on-path party that strips the offer: it swallows the dialer's
+    /// `msg1`, shows the listener a legacy frame instead, and closes on the
+    /// dialer the way a legacy node closes on `"BPQ1"`.
+    fn strip_the_offer(
+        client: Arc<MeshSecurity>,
+        server: Arc<MeshSecurity>,
+    ) -> (io::Result<Session>, io::Result<Session>) {
+        use std::io::Read;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            handshake_inbound(&mut s, &server)
+        });
+        let on_path = std::thread::spawn(move || {
+            let (mut down, _) = relay.accept().unwrap();
+            let mut up = TcpStream::connect(target).unwrap();
+            let mut offer = vec![0u8; msg1_len()];
+            down.read_exact(&mut offer).unwrap();
+            assert_eq!(offer[..4], MAGIC);
+            drop(down);
+            // A legacy frame: length 9, get-blocks after slot 0.
+            up.write_all(&9u32.to_le_bytes()).unwrap();
+            up.write_all(&[0x03, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            up
+        });
+        let mut c = TcpStream::connect(relay_addr).unwrap();
+        let cli = handshake_outbound(&mut c, &client, &relay_addr.to_string());
+        let srv = srv.join().unwrap();
+        drop(on_path.join().unwrap());
+        (cli, srv)
+    }
+
+    #[test]
+    fn a_stripped_offer_is_refused_by_require_on_both_ends() {
+        let node = |mode| Arc::new(MeshSecurity::ephemeral(mode, NET, None));
+        let (cli, srv) = strip_the_offer(node(Mode::Require), node(Mode::Require));
+        // The dialer gets no session of any kind out of the handshake (and
+        // `net.rs` gives a `require` dialer no plain fallback).
+        assert!(cli.is_err());
+        // The listener names the refusal for what it is.
+        let refusal = srv.err().expect("a require listener accepted a stripped offer");
+        assert!(plain_peer_refusal(&refusal), "{refusal}");
+        assert_eq!(refusal.kind(), io::ErrorKind::PermissionDenied);
+
+        // `offer` is unchanged: the same attack still yields a plain session
+        // on the listener. That is the documented weakness of the migration
+        // state, and the reason the fleet moves to `require`.
+        let (cli, srv) = strip_the_offer(node(Mode::Offer), node(Mode::Offer));
+        assert!(cli.is_err());
+        assert!(matches!(srv, Ok(Session::Plain)));
+    }
+
+    fn legacy_dial(sec: Arc<MeshSecurity>) -> io::Result<Session> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            handshake_inbound(&mut s, &sec)
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.write_all(&9u32.to_le_bytes()).unwrap();
+        c.write_all(&[0x03, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        srv.join().unwrap()
+    }
+
+    #[test]
+    fn plain_exception_admits_a_legacy_peer_only_from_a_listed_address() {
+        let require = || MeshSecurity::ephemeral(Mode::Require, NET, None);
+        let here: IpAddr = "127.0.0.1".parse().unwrap();
+        let elsewhere: IpAddr = "192.0.2.7".parse().unwrap();
+
+        // Listed address: plain is accepted, as under `offer`.
+        assert!(matches!(legacy_dial(Arc::new(require().with_plain_allow_ip(here))), Ok(Session::Plain)));
+        // The exception is for that address alone.
+        let refusal = legacy_dial(Arc::new(require().with_plain_allow_ip(elsewhere))).err().unwrap();
+        assert!(plain_peer_refusal(&refusal));
+        // No exception: `require` as before.
+        assert!(plain_peer_refusal(&legacy_dial(Arc::new(require())).err().unwrap()));
+
+        // An excepted address that does speak the handshake is sealed.
+        let (cli, srv) = pair(Arc::new(require()), Arc::new(require().with_plain_allow_ip(here)));
+        assert!(matches!(cli, Ok((Session::Sealed { .. }, _))) && matches!(srv, Ok((Session::Sealed { .. }, _))));
+
+        // What the dialer in `net.rs` asks before a plain fallback.
+        let excepted = require().with_plain_allow_ip(here);
+        assert!(excepted.accepts_plain(Some(here)));
+        assert!(excepted.accepts_plain(Some("::ffff:127.0.0.1".parse().unwrap())));
+        assert!(!excepted.accepts_plain(Some(elsewhere)));
+        assert!(!excepted.accepts_plain(None));
+        assert!(!require().accepts_plain(Some(here)));
+        assert!(MeshSecurity::ephemeral(Mode::Offer, NET, None).accepts_plain(None));
+        assert!(!MeshSecurity::ephemeral(Mode::Offer, NET, None).is_plain_exception(Some(here)));
+        assert!(excepted.warnings().iter().any(|w| w.contains("--mesh-plain-allow") && w.contains("127.0.0.1")));
+        assert!(excepted.summary().contains("--mesh-plain-allow"));
+        assert!(!require().summary().contains("--mesh-plain-allow"));
+    }
+
+    #[test]
+    fn plain_allow_file_is_parsed_strictly_and_only_valid_under_require() {
+        let parsed = parse_plain_allow("# externals\n203.0.113.9  # validator A\n\n2001:db8::1\n::ffff:198.51.100.4\n").unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(parsed, HashSet::from([ip("203.0.113.9"), ip("2001:db8::1"), ip("198.51.100.4")]));
+        for bad in ["", "# nothing\n", "203.0.113.9:9000\n", "node.example\n", "203.0.113.0/24\n"] {
+            assert!(parse_plain_allow(bad).is_err(), "{bad:?}");
+        }
+
+        let dir = std::env::temp_dir().join(format!("bloch-mesh-plain-allow-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("plain-allow.txt");
+        std::fs::write(&file, "203.0.113.9\n").unwrap();
+        let require = || MeshSecurity::ephemeral(Mode::Require, NET, None);
+        let loaded = require().with_plain_allow_file(&file, false).unwrap();
+        assert!(loaded.accepts_plain(Some(ip("203.0.113.9"))));
+        // Under `offer` the list is accepted and changes nothing (rollback
+        // keeps the flag); never under `plain` or with
+        // --mesh-require-authenticated.
+        let offer = MeshSecurity::ephemeral(Mode::Offer, NET, None).with_plain_allow_file(&file, false).unwrap();
+        assert!(offer.accepts_plain(Some(ip("192.0.2.1"))) && !offer.is_plain_exception(Some(ip("203.0.113.9"))));
+        assert!(offer.warnings().is_empty());
+        assert!(offer.summary().contains("no effect under offer"));
+        assert!(MeshSecurity::plain().with_plain_allow_file(&file, false).is_err());
+        assert!(require().with_plain_allow_file(&file, true).is_err());
+        assert!(require().with_plain_allow_file(&dir.join("missing.txt"), false).is_err());
+        std::fs::write(&file, "not-an-address\n").unwrap();
+        assert!(require().with_plain_allow_file(&file, false).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // ── Interoperability with the released node (`0067547f`) ────────────────
+    //
+    // The fleet is upgraded in waves and external validators upgrade later,
+    // so a node of this build started with today's argv (`--mesh-security
+    // offer`) spends weeks next to released nodes. `released` is their
+    // handshake, verbatim.
+
+    use super::released_0067547f as released;
+
+    /// The released end of these tests is the released file, not a copy
+    /// that drifted: SHA3-256 of
+    /// `git show 0067547f:crates/bloch-pos-node/src/mesh_pq.rs | sed -n '1,1026p'`.
+    #[test]
+    fn the_released_handshake_under_test_is_the_released_source() {
+        let digest = Sha3_256::digest(include_bytes!("mesh_pq/released_0067547f.rs"));
+        assert_eq!(crate::codec::hex(&digest), "aafcb2ebddc326f9fd25b9092678e5fae5f74cac79384c4064b78e75197dbecd");
+    }
+
+    /// One connection: `dial` runs on the connecting socket, `listen` on the
+    /// accepted one.
+    fn across<C, S>(
+        dial: impl FnOnce(&mut TcpStream, &str) -> io::Result<C>,
+        listen: impl FnOnce(&mut TcpStream) -> io::Result<S> + Send + 'static,
+    ) -> (io::Result<(C, TcpStream)>, io::Result<(S, TcpStream)>)
+    where
+        S: Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            listen(&mut s).map(|x| (x, s))
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        let cli = dial(&mut c, &addr.to_string()).map(|x| (x, c));
+        (cli, srv.join().unwrap())
+    }
+
+    fn released_mode(mode: Mode) -> released::Mode {
+        match mode {
+            Mode::Plain => released::Mode::Plain,
+            Mode::Offer => released::Mode::Offer,
+            Mode::Require => released::Mode::Require,
+        }
+    }
+
+    #[test]
+    fn offer_seals_with_a_released_node_in_both_directions_and_frames_cross() {
+        let frame_out = [0x02u8, 1, 2, 3, 4, 5];
+        let frame_back = vec![0x01u8; 70_000];
+        // A released peer runs `offer` today; some will move to `require`
+        // before others upgrade at all.
+        for theirs in [Mode::Offer, Mode::Require] {
+            // This build dials, the released node listens.
+            let ours = Arc::new(MeshSecurity::ephemeral(Mode::Offer, NET, None));
+            let peer = Arc::new(released::MeshSecurity::ephemeral(released_mode(theirs), NET, None));
+            let (ours_id, peer_id) = (ours.identity_id().unwrap(), peer.identity_id().unwrap());
+            let (cli, srv) = across(
+                { let ours = ours.clone(); move |sock, dialed| handshake_outbound(sock, &ours, dialed) },
+                { let peer = peer.clone(); move |sock| released::handshake_inbound(sock, &peer) },
+            );
+            let (Session::Sealed { sealer: mut cs, opener: mut co, peer: cp, .. }, mut csock) = cli.unwrap() else {
+                panic!("this build, dialing a released {theirs:?} node, did not seal")
+            };
+            let (released::Session::Sealed { sealer: mut ss, opener: mut so, peer: sp, .. }, mut ssock) = srv.unwrap() else {
+                panic!("a released {theirs:?} listener did not seal with this build")
+            };
+            assert_eq!((cp, sp), (peer_id, ours_id));
+            cs.write_record(&mut csock, &[&frame_out]).unwrap();
+            assert_eq!(so.read_record(&mut ssock, far()).unwrap(), frame_out);
+            ss.write_record(&mut ssock, &[&frame_back[..1], &frame_back[1..]]).unwrap();
+            assert_eq!(co.read_record(&mut csock, far()).unwrap(), frame_back);
+
+            // The released node dials, this build listens.
+            let (cli, srv) = across(
+                { let peer = peer.clone(); move |sock, dialed| released::handshake_outbound(sock, &peer, dialed) },
+                { let ours = ours.clone(); move |sock| handshake_inbound(sock, &ours) },
+            );
+            let (released::Session::Sealed { sealer: mut cs, opener: mut co, peer: cp, .. }, mut csock) = cli.unwrap() else {
+                panic!("a released {theirs:?} dialer did not seal with this build")
+            };
+            let (Session::Sealed { sealer: mut ss, opener: mut so, peer: sp, .. }, mut ssock) = srv.unwrap() else {
+                panic!("this build, dialed by a released {theirs:?} node, did not seal")
+            };
+            assert_eq!((cp, sp), (ours_id, peer_id));
+            cs.write_record(&mut csock, &[&frame_out]).unwrap();
+            assert_eq!(so.read_record(&mut ssock, far()).unwrap(), frame_out);
+            ss.write_record(&mut ssock, &[&frame_back]).unwrap();
+            assert_eq!(co.read_record(&mut csock, far()).unwrap(), frame_back);
+        }
+    }
+
+    #[test]
+    fn offer_and_a_released_node_fall_back_to_plain_exactly_as_two_released_nodes_do() {
+        use std::io::Read;
+        let legacy_frame = [9u8, 0, 0, 0, 0x03, 0, 0, 0, 0, 0, 0, 0, 0];
+        // A released `plain` node dials: it sends a legacy frame and nothing
+        // else. This build in `offer` takes it as a plain session and has
+        // consumed none of its bytes.
+        let ours = Arc::new(MeshSecurity::ephemeral(Mode::Offer, NET, None));
+        let (cli, srv) = across(
+            move |sock, dialed| {
+                let session = released::handshake_outbound(sock, &released::MeshSecurity::plain(), dialed)?;
+                assert!(matches!(session, released::Session::Plain));
+                sock.write_all(&legacy_frame)
+            },
+            move |sock| handshake_inbound(sock, &ours),
+        );
+        cli.unwrap();
+        let (session, mut sock) = srv.unwrap();
+        assert!(matches!(session, Session::Plain));
+        let mut got = [0u8; 13];
+        sock.read_exact(&mut got).unwrap();
+        assert_eq!(got, legacy_frame);
+
+        // This build dials a released `plain` node: the first four bytes it
+        // sends are the magic, which that node reads as a frame length it
+        // refuses, and it closes. The dialer sees the close as the kind of
+        // error `net.rs` turns into a plain retry; the released `offer`
+        // dialer gets the same kind from the same listener.
+        let closes_on_the_magic = |sock: &mut TcpStream| -> io::Result<()> {
+            assert!(matches!(released::handshake_inbound(sock, &released::MeshSecurity::plain())?, released::Session::Plain));
+            let mut len = [0u8; 4];
+            sock.read_exact(&mut len)?;
+            assert_eq!(len, released::MAGIC);
+            assert!(u32::from_le_bytes(len) as usize > crate::codec::MAX_FIELD_LEN);
+            sock.shutdown(std::net::Shutdown::Both)
+        };
+        let ours = MeshSecurity::ephemeral(Mode::Offer, NET, None);
+        let (cli, srv) = across(move |sock, dialed| handshake_outbound(sock, &ours, dialed), closes_on_the_magic);
+        let theirs = released::MeshSecurity::ephemeral(released::Mode::Offer, NET, None);
+        let (released_cli, released_srv) = across(move |sock, dialed| released::handshake_outbound(sock, &theirs, dialed), closes_on_the_magic);
+        assert!(srv.is_ok() && released_srv.is_ok());
+        let (ours, theirs) = (cli.err().expect("no session"), released_cli.err().expect("no session"));
+        let closed = |e: &io::Error| matches!(e.kind(),
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe);
+        assert!(closed(&ours) && closed(&theirs), "{ours} / {theirs}");
+    }
+
+    /// Everything the two ends of one handshake put on the wire, by
+    /// direction, taken by a relay that changes nothing.
+    fn recorded<C, S>(
+        dial: impl FnOnce(&mut TcpStream, &str) -> io::Result<C>,
+        listen: impl FnOnce(&mut TcpStream) -> io::Result<S> + Send + 'static,
+    ) -> (Vec<u8>, Vec<u8>)
+    where
+        S: Send + 'static,
+    {
+        use std::io::Read;
+        use std::net::Shutdown;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            listen(&mut s).map(|x| (x, s))
+        });
+        fn pump(mut from: TcpStream, mut to: TcpStream) -> std::thread::JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = match from.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    seen.extend_from_slice(&buf[..n]);
+                    if to.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                let _ = to.shutdown(Shutdown::Both);
+                let _ = from.shutdown(Shutdown::Both);
+                seen
+            })
+        }
+        let on_path = std::thread::spawn(move || {
+            let (down, _) = relay.accept().unwrap();
+            let up = TcpStream::connect(target).unwrap();
+            let to_listener = pump(down.try_clone().unwrap(), up.try_clone().unwrap());
+            let to_dialer = pump(up, down);
+            (to_listener.join().unwrap(), to_dialer.join().unwrap())
+        });
+        let mut c = TcpStream::connect(relay_addr).unwrap();
+        let cli = dial(&mut c, &relay_addr.to_string());
+        let srv = srv.join().unwrap();
+        assert!(cli.is_ok() && srv.is_ok(), "the handshake under record did not complete");
+        // Both ends are done with the handshake; closing them stops the relay.
+        drop((c, srv));
+        on_path.join().unwrap()
+    }
+
+    #[test]
+    fn offer_puts_on_the_wire_what_the_released_node_puts_there() {
+        let ours = || Arc::new(MeshSecurity::ephemeral(Mode::Offer, NET, None));
+        let theirs = || Arc::new(released::MeshSecurity::ephemeral(released::Mode::Offer, NET, None));
+        let ours_dials = |sec: Arc<MeshSecurity>| move |sock: &mut TcpStream, dialed: &str| handshake_outbound(sock, &sec, dialed);
+        let ours_listens = |sec: Arc<MeshSecurity>| move |sock: &mut TcpStream| handshake_inbound(sock, &sec);
+        let theirs_dial = |sec: Arc<released::MeshSecurity>| move |sock: &mut TcpStream, dialed: &str| released::handshake_outbound(sock, &sec, dialed);
+        let theirs_listen = |sec: Arc<released::MeshSecurity>| move |sock: &mut TcpStream| released::handshake_inbound(sock, &sec);
+
+        let reference = recorded(theirs_dial(theirs()), theirs_listen(theirs()));
+        let runs = [
+            ("released to released, again", recorded(theirs_dial(theirs()), theirs_listen(theirs()))),
+            ("this build to released", recorded(ours_dials(ours()), theirs_listen(theirs()))),
+            ("released to this build", recorded(theirs_dial(theirs()), ours_listens(ours()))),
+            ("this build to this build", recorded(ours_dials(ours()), ours_listens(ours()))),
+        ];
+        // The dialer sends msg1 and one sealed identity record, the listener
+        // msg2 and one sealed identity record, and neither sends anything
+        // else. Keys, nonces, ciphertexts and signatures are fresh on every
+        // handshake, the second released run included; what a build decides
+        // is the layout, the lengths and the fixed fields, and those are
+        // compared byte for byte.
+        let record = 4 + auth_len() + TAG_LEN;
+        assert_eq!((reference.0.len(), reference.1.len()), (msg1_len() + record, msg2_len() + record));
+        let fixed = |(to_listener, to_dialer): &(Vec<u8>, Vec<u8>)| {
+            (
+                to_listener.len(),
+                to_dialer.len(),
+                // "BPQ1", version, genesis id.
+                to_listener[..37].to_vec(),
+                // "BPQ1", version.
+                to_dialer[..5].to_vec(),
+                // Length prefixes of the two sealed identity records.
+                to_listener[msg1_len()..msg1_len() + 4].to_vec(),
+                to_dialer[msg2_len()..msg2_len() + 4].to_vec(),
+            )
+        };
+        for (what, run) in &runs {
+            assert_eq!(fixed(run), fixed(&reference), "{what}");
+        }
+        let mut expected = MAGIC.to_vec();
+        expected.push(VERSION);
+        expected.extend_from_slice(&NET);
+        assert_eq!(reference.0[..37], expected[..]);
+        assert_eq!(reference.0[msg1_len()..msg1_len() + 4], ((auth_len() + TAG_LEN) as u32).to_le_bytes());
     }
 }

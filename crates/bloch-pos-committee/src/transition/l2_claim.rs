@@ -425,14 +425,14 @@ impl CommittedState {
     /// logs and tooling: the block transition reports a refused claim only as
     /// the frozen `TransitionError::Transaction(i)`, which names no reason.
     pub fn l2_withdraw_claim_refusal(&self, tx: &L2WithdrawClaim) -> Option<L2WithdrawClaimReject> {
-        self.check_l2_withdraw_claim(tx, self.next_base_fee()).err()
+        self.l2_withdraw_claim_preflight(tx, self.next_base_fee(), true)
     }
 
     /// [`Self::l2_withdraw_claim_refusal`] at an explicit `base_fee` (the
     /// price of the block being built). Node-local preflight (mempool
     /// admission, proposer selection); the same checks the transition runs.
     pub fn l2_withdraw_claim_refusal_at(&self, tx: &L2WithdrawClaim, base_fee: u128) -> Option<L2WithdrawClaimReject> {
-        self.check_l2_withdraw_claim(tx, base_fee).err()
+        self.l2_withdraw_claim_preflight(tx, base_fee, true)
     }
 
     /// [`Self::l2_withdraw_claim_refusal_at`] without the finality test and
@@ -442,7 +442,16 @@ impl CommittedState {
     /// funding, conservation and outputs are judged as the transition will.
     /// Never returns `NotFinalized`. Not used by the transition.
     pub fn l2_withdraw_claim_refusal_before_finality_at(&self, tx: &L2WithdrawClaim, base_fee: u128) -> Option<L2WithdrawClaimReject> {
-        self.check_l2_withdraw_claim_with(tx, base_fee, false).err()
+        self.l2_withdraw_claim_preflight(tx, base_fee, false)
+    }
+
+    /// The node-local preflights above, behind the fault boundary
+    /// (`crate::isolation`): a fault is a refusal. Never used by the
+    /// transition, which calls [`Self::check_l2_withdraw_claim`] directly.
+    fn l2_withdraw_claim_preflight(&self, tx: &L2WithdrawClaim, base_fee: u128, finality: bool) -> Option<L2WithdrawClaimReject> {
+        crate::isolation::contain_refusal(L2WithdrawClaimReject::Arithmetic, || {
+            self.check_l2_withdraw_claim_with(tx, base_fee, finality).err()
+        })
     }
 
     /// The state checks of [`Self::apply_l2_withdraw_claim`], in its order,

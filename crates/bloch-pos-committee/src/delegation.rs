@@ -120,6 +120,118 @@ pub const MIN_DELEGATION_SAT: u128 = 10 * SAT_PER_BLOCH;
 /// network can still onboard at a usable rate.
 pub const MIN_CHURN_SAT: u128 = 500_000 * SAT_PER_BLOCH;
 
+// ────────────────────────────────────────────────────────────────────────────
+// Delegation growth cap (`params::FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH`)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// ALL the economic parameters of the delegation growth cap are the two
+// constants below. The rule that reads them is [`WarmupRule`]; changing a
+// value here changes no logic. Both are protocol-economics choices and
+// belong to the owner; the shipped values are the middle option of the
+// three documented in `docs/specs/BLOCH-FUNDED-DELEGATION.md` ("Delegation
+// growth cap").
+
+/// Divisor of the proportional ACTIVATION budget once the delegation growth
+/// cap binds: at most `active delegated stake / GROWTH_CAP_WARMUP_DIV` may
+/// warm up per epoch (when that exceeds [`GROWTH_CAP_WARMUP_FLOOR_SAT`]).
+///
+/// Reference points, per 16-minute epoch:
+///
+/// | Value | Meaning |
+/// | ---: | --- |
+/// | 400 | today's rule ([`WARMUP_RATE_BPS`] = 25 bps): the permissive end |
+/// | **768** | **shipped: `1/32` per 24-epoch window, twice the own-stake cap** |
+/// | 1,536 | `1/64` per 24-epoch window, parity with `staking::GROWTH_DIV`: the strict end |
+///
+/// 768 is `32 x staking::GROWTH_WINDOW_EPOCHS`: delegated stake may grow by
+/// 1/32 of itself per 6.4-hour window, where own stake may grow by 1/64 of
+/// the active weight. A larger divisor is stricter. Values below 400 have no
+/// effect: the activation budget is never larger than the budget the release
+/// side keeps (see [`WarmupRule::activation_budget`]).
+pub const GROWTH_CAP_WARMUP_DIV: u128 = 768;
+
+/// Floor under the per-epoch ACTIVATION budget once the delegation growth
+/// cap binds. It is the binding term while active delegated stake is below
+/// `GROWTH_CAP_WARMUP_DIV x GROWTH_CAP_WARMUP_FLOOR_SAT` (192M BLCH at the
+/// shipped values), which is where the chain is today, so this constant, not
+/// the divisor, sets how fast a newcomer reaches one third.
+///
+/// Reference points, per 16-minute epoch (and per 24-epoch window):
+///
+/// | Value | Meaning |
+/// | ---: | --- |
+/// | 500,000 BLCH (12M) | today's rule ([`MIN_CHURN_SAT`]): the permissive end |
+/// | **250,000 BLCH (6M)** | **shipped: half of today's** |
+/// | 125,000 BLCH (3M) | about `W/64` per window at the epoch-6090 weight (204.66M BLCH): the strict end |
+///
+/// It is an absolute amount, not a share of the active weight: the warm-up
+/// walk is a pure function of the delegation history and cannot see own
+/// stake. If the active weight moves far from the 200M BLCH it was sized
+/// against, re-size it (smaller weight: lower it to keep the same days to
+/// one third; larger weight: raising it costs no security). Values above
+/// 500,000 BLCH have no effect, for the reason given on the divisor.
+pub const GROWTH_CAP_WARMUP_FLOOR_SAT: u128 = 250_000 * SAT_PER_BLOCH;
+
+const _: () = assert!(GROWTH_CAP_WARMUP_DIV > 0);
+
+/// Which activation budget the warm-up walk applies from which epoch.
+///
+/// The walk replays the delegation history from epoch zero on every call, so
+/// a rule that changes at an epoch has to be an input of the walk: epochs
+/// below `gate` keep the budget they always had, which is what keeps every
+/// historical registry (and so every historical roster and state root)
+/// unchanged. `gate: None` is the rule as it stood before the growth cap and
+/// takes no new code path.
+///
+/// Only ACTIVATION is touched. Release (cool-down) keeps
+/// `epoch_budget` in every epoch, so a position leaves exactly as fast as it
+/// does today and no stake can be held in by this rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WarmupRule {
+    /// First epoch whose activation pass uses the capped budget.
+    pub gate: Option<u64>,
+    /// [`GROWTH_CAP_WARMUP_DIV`] in consensus.
+    pub div: u128,
+    /// [`GROWTH_CAP_WARMUP_FLOOR_SAT`] in consensus.
+    pub floor_sat: u128,
+}
+
+impl WarmupRule {
+    /// The rule before the growth cap: one budget for both passes.
+    #[cfg(test)]
+    pub(crate) const LEGACY: WarmupRule =
+        WarmupRule { gate: None, div: GROWTH_CAP_WARMUP_DIV, floor_sat: GROWTH_CAP_WARMUP_FLOOR_SAT };
+
+    /// The rule consensus applies: the shipped constants behind
+    /// [`crate::params::FUNDED_DELEGATION_GROWTH_CAP_ACTIVATION_EPOCH`].
+    pub(crate) fn consensus() -> WarmupRule {
+        WarmupRule {
+            gate: crate::params::funded_delegation_growth_cap_epoch(),
+            div: GROWTH_CAP_WARMUP_DIV,
+            floor_sat: GROWTH_CAP_WARMUP_FLOOR_SAT,
+        }
+    }
+
+    /// Activation budget of epoch `e`, given the delegated stake active at
+    /// its start and `legacy`, the budget [`epoch_budget`] gives the same
+    /// epoch (which the release pass keeps).
+    ///
+    /// Below the gate, and at epoch 0 (genesis is unlimited, there is no set
+    /// to protect), it is `legacy`. From the gate on it is
+    /// `max(total_active / div, floor_sat)`, and never more than `legacy`:
+    /// the cap can only slow activation, whatever the constants are set to.
+    fn activation_budget(&self, e: u64, total_active: u128, legacy: u128) -> u128 {
+        match self.gate {
+            Some(gate) if e >= gate && e != 0 => {
+                let rate = div_or_zero(total_active, self.div);
+                let capped = if rate > self.floor_sat { rate } else { self.floor_sat };
+                if capped < legacy { capped } else { legacy }
+            }
+            _ => legacy,
+        }
+    }
+}
+
 /// Per-validator cap as a share of total active stake (§4.1: 1%).
 pub const MAX_VALIDATOR_STAKE_BPS: u128 = 100;
 
@@ -402,10 +514,21 @@ struct Fold {
 ///   once here on entering an idle run, with the same operand, so even an
 ///   unreachable overflow panics on the same inputs.
 ///
+/// # The growth cap
+///
+/// From `rule.gate` on, step 1 runs against
+/// [`WarmupRule::activation_budget`] instead of `budget`; step 2 is
+/// unchanged. Nothing in the argument above depends on the two passes
+/// sharing a number: each pass still walks its set in queue order against a
+/// budget fixed at the start of the epoch, and an epoch with both sets empty
+/// still changes nothing. `tests::capped_fold_matches_a_naive_capped_walk`
+/// compares this walk with a two-passes-per-epoch statement of the capped
+/// rule.
+///
 /// The cost is O(entries x log entries) for the events plus one step per
 /// epoch in which stake actually moves, instead of two full passes per epoch
 /// since genesis.
-fn fold_queue(queue: &[&Delegation], epoch: u64) -> Fold {
+fn fold_queue(queue: &[&Delegation], epoch: u64, rule: &WarmupRule) -> Fold {
     RESOLVE_FOLDS.with(|c| c.set(c.get().wrapping_add(1)));
     let mut active: Vec<(u32, u128)> = Vec::new();
     let mut total_active: u128 = 0;
@@ -443,6 +566,10 @@ fn fold_queue(queue: &[&Delegation], epoch: u64) -> Fold {
         }
 
         let budget = epoch_budget(e, total_active);
+        // Delegation growth cap: from its gate on, the activation pass has
+        // its own, smaller budget. The release pass below keeps `budget`.
+        // With `rule.gate == None` this is `budget` itself.
+        let warm_budget = rule.activation_budget(e, total_active, budget);
 
         // PARTIAL ACTIVATION. A delegation larger than the epoch's budget
         // activates in slices across several epochs instead of waiting for
@@ -461,11 +588,11 @@ fn fold_queue(queue: &[&Delegation], epoch: u64) -> Fold {
         // Ethereum do, for the same reason.
         let mut used: u128 = 0;
         let mut from = 0usize;
-        while used < budget {
+        while used < warm_budget {
             let Some(&i) = warming.range(from..).next() else { break };
             let d = queue[i];
             let remaining = d.amount_sat - activated[i];
-            let take = remaining.min(budget - used);
+            let take = remaining.min(warm_budget - used);
             used += take;
             activated[i] += take;
             total_active += take;
@@ -552,6 +679,9 @@ fn fold_queue(queue: &[&Delegation], epoch: u64) -> Fold {
 
 struct ResolveMemo {
     epoch: u64,
+    /// Part of the complete input: the rule is a build constant in
+    /// production, but a test may open and close its gate on one thread.
+    rule: WarmupRule,
     delegations: Vec<Delegation>,
     registry: Registry,
 }
@@ -576,19 +706,20 @@ pub fn resolve_recomputations() -> u64 {
     RESOLVE_FOLDS.with(|c| c.get())
 }
 
-fn resolve_memo_get(delegations: &[Delegation], epoch: u64) -> Option<Registry> {
+fn resolve_memo_get(delegations: &[Delegation], epoch: u64, rule: &WarmupRule) -> Option<Registry> {
     RESOLVE_MEMO.with(|memo| match &*memo.borrow() {
-        Some(m) if m.epoch == epoch && m.delegations.as_slice() == delegations => {
+        Some(m) if m.epoch == epoch && m.rule == *rule && m.delegations.as_slice() == delegations => {
             Some(m.registry.clone())
         }
         _ => None,
     })
 }
 
-fn resolve_memo_put(delegations: &[Delegation], epoch: u64, registry: &Registry) {
+fn resolve_memo_put(delegations: &[Delegation], epoch: u64, rule: &WarmupRule, registry: &Registry) {
     RESOLVE_MEMO.with(|memo| {
         *memo.borrow_mut() = Some(ResolveMemo {
             epoch,
+            rule: *rule,
             delegations: delegations.to_vec(),
             registry: registry.clone(),
         });
@@ -608,17 +739,25 @@ impl Registry {
         if delegations.is_empty() {
             return Self::resolve_uncached(delegations, epoch);
         }
-        if let Some(hit) = resolve_memo_get(delegations, epoch) {
+        let rule = WarmupRule::consensus();
+        if let Some(hit) = resolve_memo_get(delegations, epoch, &rule) {
             return hit;
         }
-        let registry = Self::resolve_uncached(delegations, epoch);
-        resolve_memo_put(delegations, epoch, &registry);
+        let registry = Self::resolve_with_rule(delegations, epoch, &rule);
+        resolve_memo_put(delegations, epoch, &rule, &registry);
         registry
     }
 
     /// [`Self::resolve`] with no memo in front of it, so the memo and the
     /// computation can each be tested against the other.
     fn resolve_uncached(delegations: &[Delegation], epoch: u64) -> Registry {
+        Self::resolve_with_rule(delegations, epoch, &WarmupRule::consensus())
+    }
+
+    /// The computation under an explicit [`WarmupRule`]. Consensus always
+    /// passes [`WarmupRule::consensus`]; tests pass other rules to compare
+    /// parameter choices on the real walk.
+    pub(crate) fn resolve_with_rule(delegations: &[Delegation], epoch: u64, rule: &WarmupRule) -> Registry {
         let mut queue: Vec<&Delegation> =
             delegations.iter().filter(|d| d.eligible && d.amount_sat >= MIN_DELEGATION_SAT).collect();
         // R1 M5 (perf, ungated, behaviour-identical): with nothing eligible
@@ -635,7 +774,7 @@ impl Registry {
         }
         queue.sort_by_key(|d| d.queue_key());
 
-        let Fold { active, total_active, activated } = fold_queue(&queue, epoch);
+        let Fold { active, total_active, activated } = fold_queue(&queue, epoch, rule);
 
         // A delegation counts as admitted only once it is FULLY activated;
         // a partially activated one is still warming up.
@@ -903,8 +1042,9 @@ pub fn pruning_is_outcome_neutral(
     let with: Vec<&Delegation> = order.iter().map(|i| &delegations[*i]).collect();
     let without: Vec<&Delegation> =
         order.iter().filter(|i| !pruned[**i]).map(|i| &delegations[*i]).collect();
-    let before = fold_queue(&with, epoch);
-    let after = fold_queue(&without, epoch);
+    let rule = WarmupRule::consensus();
+    let before = fold_queue(&with, epoch, &rule);
+    let after = fold_queue(&without, epoch, &rule);
 
     let mut kept = after.activated.iter();
     for (slot, i) in order.iter().enumerate() {

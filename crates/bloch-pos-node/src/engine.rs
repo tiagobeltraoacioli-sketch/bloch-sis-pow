@@ -506,6 +506,9 @@ pub struct MeshPlan {
     /// `--mesh-require-authenticated`: refuse to start unless every peer
     /// must present an expected identity.
     pub require_authenticated: bool,
+    /// `--mesh-plain-allow`: IP addresses whose peers may still connect in
+    /// plain under `require` (staged migration).
+    pub plain_allow: Option<PathBuf>,
 }
 
 fn now_ms() -> u64 {
@@ -528,8 +531,7 @@ fn replay_failure_message(epoch: u64) -> String {
 }
 
 /// [`replay_failure_message`] over an explicit gate list, so the message can
-/// be tested with a gate armed in the past (the shipped list arms none
-/// below epoch 8620).
+/// be tested with a gate armed in the past (the shipped list arms none).
 fn replay_failure_message_for(unarmed: &[bloch_pos_committee::hard_forks::UnarmedGate], epoch: u64) -> String {
     let mut msg =
         String::from("durable block log failed consensus replay; refusing to serve a partial head");
@@ -799,6 +801,15 @@ enum DoorKes {
     /// block the side-branch fold saw fail, so a re-offered child does not
     /// run the parent through the transition again.
     DropFailedParent([u8; 32]),
+    /// Judge on `state` (always `fallback`, exactly as `Judge` with
+    /// `known: None`), and if the block is parked for its proposer's
+    /// authority, have the side-branch fold recompute the exact post-state
+    /// of its parent and queue it for the door again (review RC4-01). Only
+    /// returned past the probe (a signature of the proposer verified, or a
+    /// proof of one, or this node's own block), for a stored, validated,
+    /// non-canonical parent whose post-state and whose own parent's
+    /// post-state this node no longer holds.
+    JudgeWantingParentState { state: Arc<CommittedState> },
 }
 
 /// A verifier that accepts every KES leaf signature and nothing else. Run
@@ -1205,6 +1216,22 @@ struct ReorgAnchors {
     side: SideValidation,
 }
 
+/// Where one slice of the side-branch fold stopped
+/// ([`Engine::fold_side_path`]).
+struct SideFold {
+    /// Post-state of `stopped_at` (or the start state if nothing applied).
+    state: Arc<CommittedState>,
+    /// The last block that applied: canonical (on the way to the fork
+    /// point) or a side block that passed the transition.
+    stopped_at: Option<[u8; 32]>,
+    /// A side block was marked validated for the first time.
+    newly_validated: bool,
+    /// A canonical block would not replay (a local fault).
+    stuck: bool,
+    /// Block applications spent.
+    done: usize,
+}
+
 /// What [`Engine::validate_side_branch_turn`] keeps between turns.
 #[derive(Default)]
 struct SideValidation {
@@ -1214,8 +1241,8 @@ struct SideValidation {
     /// Dropped when no side branch is left to validate.
     cursor: Option<([u8; 32], Arc<CommittedState>)>,
     /// Exact post-states of side-branch blocks this fold validated, keyed by
-    /// block id, oldest first, at most [`SIDE_TIP_STATES`] (reviews RC2-03,
-    /// RC3-01, RC3-02): the block a fold turn stopped on (a branch tip once
+    /// block id, oldest first, at most [`SIDE_TIP_STATES`] plus one wanted
+    /// state (reviews RC2-03, RC3-01, RC3-02, RC5-04): the block a fold turn stopped on (a branch tip once
     /// the branch is done), and any validated block that blocks parked for
     /// their proposer's authority wait on (as their parent, or their
     /// parent's parent). [`Engine::exact_parent_state`] consults them, so a
@@ -1226,11 +1253,65 @@ struct SideValidation {
     /// Only states of blocks that passed the transition here enter, so no
     /// unauthenticated header can add one. The oldest entry leaves first,
     /// except an entry that a block queued for the door
-    /// (`deferred_orphans`) waits on, which is kept until that block has
-    /// been judged; when every entry is so held the new state is not kept.
+    /// (`deferred_orphans`), or held in the orphan pool only until a spent
+    /// allowance renews (review RC4-02), waits on, which is kept until that
+    /// block has been judged; when every entry is so held the new state is
+    /// not kept, unless it is one the door asked for (`wanting`), which
+    /// then takes one place reserved for it beyond [`SIDE_TIP_STATES`]
+    /// (review RC5-04), and only when that place is taken too the oldest
+    /// place (review RC4-03). Neither loss is permanent: a state the door
+    /// needs again and no longer finds is recomputed on demand (review
+    /// RC4-01).
     /// An entry is dropped once its block is no longer stored beside the
     /// chain (pruned, removed, or adopted: the ring then holds it).
     tips: VecDeque<([u8; 32], Arc<CommittedState>)>,
+    /// Blocks parked for their proposer's authority after the door judged
+    /// them on `fallback` because it held the exact post-state of neither
+    /// their parent nor their parent's parent, although the parent is a
+    /// stored side-branch block this fold already validated (review RC4-01,
+    /// `DoorKes::JudgeWantingParentState`). Such a parent is no longer a
+    /// candidate of [`Engine::side_branch_candidate`], so without this its
+    /// state would never be recomputed and the block, if it crosses the KES
+    /// bind, would stay parked for as long as the head does not move.
+    /// [`Engine::serve_wanted_side_state_turn`] recomputes the parent's
+    /// exact post-state from the nearest exact ancestor and queues these
+    /// blocks for the door again.
+    ///
+    /// Only the door adds to it, only past its probe (a signature of the
+    /// proposer verified on this node), so no unauthenticated header can
+    /// cause a recomputation, and only once the block is actually parked
+    /// for its proposer's authority (review RC5-07); only for a validated
+    /// parent, so the recomputation re-runs blocks that already passed the
+    /// transition; and at most [`SIDE_WANTED_PARENTS_PER_PROPOSER`]
+    /// distinct parents per proposer (review RC5-02). An entry stays until
+    /// its block is queued for the door or otherwise leaves the orphan pool
+    /// (review RC5-01: the blocks parked on one parent are queued
+    /// [`SIDE_PARKED_REJUDGE_PER_BLOCK`] at a time, so one recomputation
+    /// does not serve them all; review L1R18-RC-03: removed when queued,
+    /// not when next seen outside the pool, so a block the door parks again
+    /// is not queued on every turn) or nothing can be recomputed for it, so
+    /// it is bounded by [`ORPHAN_MAX`] (plus the one being added).
+    wanting: BTreeSet<[u8; 32]>,
+    /// Where the last recomputation for `wanting` stopped, keyed by block id
+    /// like `cursor`, so a recomputation longer than one turn resumes
+    /// instead of starting again, and does not disturb `cursor`. Dropped
+    /// once nothing is wanted, and whenever `want_target` changes (review
+    /// RC5-06). One state more than `cursor` and `tips`.
+    want_cursor: Option<([u8; 32], Arc<CommittedState>)>,
+    /// The block whose state the recomputation under way is for; it is
+    /// finished before another is taken up.
+    want_target: Option<[u8; 32]>,
+    /// Recomputations for `wanting` started in `slot` that did not resume
+    /// from `want_cursor` or a held side state; at most
+    /// [`SIDE_WANT_STARTS_PER_SLOT`].
+    want_starts: usize,
+    /// Set when a turn found that the next recomputation needs a start and
+    /// `want_starts` is spent: no turn does work for `wanting` again until
+    /// the wall slot changes (review RC5-03, as `closed` for the fold).
+    want_closed: bool,
+    /// Whether the next turn with work of both kinds goes to `wanting`
+    /// (turns alternate, so neither kind can starve the other).
+    want_turn: bool,
     /// Wall slot the three counters below belong to.
     slot: u64,
     /// Block applications spent in `slot`.
@@ -1361,8 +1442,23 @@ const SIDE_PARKED_REJUDGE_PER_BLOCK: usize = 8;
 /// `CommittedState` built by the transition from its parent's state, so it
 /// shares that state's eUTXO map and costs the per-block fields plus what
 /// the side blocks changed. Four covers the two sibling tips of a stalled
-/// network with room for a branch being validated, and is a hard bound.
+/// network with room for a branch being validated. A hard bound, plus one
+/// place reserved for a state recomputed because the door asked for it
+/// (review RC5-04, `Engine::retain_side_state_as`).
 const SIDE_TIP_STATES: usize = 4;
+
+/// Recomputations of a wanted side-branch state (review RC4-01,
+/// `SideValidation::wanting`) that may start per wall slot from a canonical
+/// state instead of resuming. The block applications themselves come out of
+/// the fold's own per-turn and per-slot budgets.
+const SIDE_WANT_STARTS_PER_SLOT: usize = 1;
+
+/// Distinct parents whose state blocks of one proposer may have asked to
+/// recompute at a time (review RC5-02, `SideValidation::wanting`). The
+/// proposer index is authenticated by the door's probe, so one key cannot
+/// queue more recomputation targets than this; an honest proposer has one
+/// block per slot and needs one.
+const SIDE_WANTED_PARENTS_PER_PROPOSER: usize = 2;
 
 /// Longest back-off between two rewinds to a floor that yielded nothing, as
 /// a power of two of the sync cadence (two slots): 2^5 cadences is 64 slots,
@@ -4641,8 +4737,9 @@ impl Engine {
 
     /// The post-state of `parent` when this node holds it without doing any
     /// work: the head, a reorg-ring entry, or the side-branch validator's
-    /// cursor or one of its retained side-branch states (all keyed by block
-    /// id, so none can describe another block).
+    /// cursor, one of its retained side-branch states or the cursor of its
+    /// on-demand recomputation (all keyed by block id, so none can describe
+    /// another block).
     fn exact_parent_state(&self, parent: &[u8; 32]) -> Option<Arc<CommittedState>> {
         if parent == self.head_id().as_bytes() {
             return Some(self.state.arc());
@@ -4656,6 +4753,7 @@ impl Engine {
                 side.cursor
                     .iter()
                     .chain(side.tips.iter())
+                    .chain(side.want_cursor.iter())
                     .find(|(id, _)| id == parent)
                     .map(|(_, state)| Arc::clone(state))
             })
@@ -4837,7 +4935,18 @@ impl Engine {
                     return DoorKes::Drop;
                 }
                 let Some(grandparent) = self.exact_parent_state(&parent_env.header.parent) else {
-                    // Deeper than one block off a held state: as before.
+                    // Deeper than one block off a held state: judged on
+                    // `fallback`, as before. A parent the fold already
+                    // validated is no longer a fold candidate, so nothing
+                    // would ever bring its state back (review RC4-01): ask
+                    // for it. Past the probe, so a signature of this
+                    // proposer verified; nothing unauthenticated gets here.
+                    if self.blocks.is_validated(&parent)
+                        && !self.canonical.contains(&parent)
+                        && !self.blocks.is_hollow(&parent)
+                    {
+                        return DoorKes::JudgeWantingParentState { state: fallback };
+                    }
                     return unchanged(fallback);
                 };
                 if epoch_of(parent_env.header.slot).saturating_add(MAX_EPOCH_ADVANCE) < epoch {
@@ -5271,9 +5380,16 @@ impl Engine {
         // conditions, the bounds and why the verdict is otherwise unchanged.
         let proposer_epoch = epoch_of(env.header.slot);
         let fallback = self.proposer_authority_state(&env.header.parent);
+        // Review RC5-07: the parent's state is asked for only once the block
+        // is actually parked for its proposer's authority (below).
+        let mut wants_parent_state = false;
         let (judged_state, known) =
             match self.door_kes_state(&env, src, prior_authentication.as_ref(), Arc::clone(&fallback)) {
                 DoorKes::Judge { state, known } => (state, known),
+                DoorKes::JudgeWantingParentState { state } => {
+                    wants_parent_state = true;
+                    (state, None)
+                }
                 DoorKes::Defer => {
                     self.park_budget_limited_block(id, env, src);
                     return (Verdict::Ignore, None);
@@ -5360,6 +5476,9 @@ impl Engine {
                 // ask for a gap either (P2P-6): nothing about this envelope
                 // is authenticated, so it may not steer the sync cursor.
                 self.park_unjudgeable(id, env, src, None);
+                if wants_parent_state {
+                    self.want_parent_state_for(id);
+                }
                 return (Verdict::Ignore, None);
             }
         };
@@ -5369,6 +5488,9 @@ impl Engine {
                 // hold. Not a verdict on the block, and not a charge on the
                 // peer — hold it and let the transition judge it in context.
                 self.park_unjudgeable(id, env, src, park_authority);
+                if wants_parent_state {
+                    self.want_parent_state_for(id);
+                }
                 return (Verdict::Ignore, None);
             }
             if !self.signature_failure_is_provable(
@@ -5382,6 +5504,9 @@ impl Engine {
                 // leaf signature against the static key. Unless the finalized
                 // state fixes the authority, hold it like the O04 case.
                 self.park_unjudgeable(id, env, src, park_authority);
+                if wants_parent_state {
+                    self.want_parent_state_for(id);
+                }
                 return (Verdict::Ignore, None);
             }
             self.rejected_unsigned = self.rejected_unsigned.saturating_add(1);
@@ -8013,7 +8138,12 @@ impl Engine {
     /// - one retained state, the cursor, which is what makes the budget
     ///   resumable: a long branch, or a fork point far above the nearest
     ///   anchor, is worked through over several slots instead of in one
-    ///   stall. No per-block states are kept;
+    ///   stall. Besides it, at most [`SIDE_TIP_STATES`] (plus one wanted)
+    ///   retained side states for the block door (`SideValidation::tips`) and the cursor of an
+    ///   on-demand recomputation (`SideValidation::want_cursor`);
+    /// - turns that recompute a state the door asked for (review RC4-01,
+    ///   [`Engine::serve_wanted_side_state_turn`]) alternate with the fold's
+    ///   own and share every budget above;
     /// - fork points at or above the finality latch only, and at most
     ///   [`SIDE_BRANCH_MAX_DEPTH`] blocks above the fork point.
     ///
@@ -8037,26 +8167,44 @@ impl Engine {
         // common case, decided without a walk.
         if self.blocks.len() < self.chain.len() {
             self.reorg_anchors.side.cursor = None;
+            self.reorg_anchors.side.want_cursor = None;
             return false;
         }
         let key = (self.blocks.revision(), *self.head_id().as_bytes());
         let slot_share_ms = self.manifest.slot_ms / SIDE_BRANCH_SLOT_SHARE;
-        {
+        let fold_idle = {
             let side = &mut self.reorg_anchors.side;
             if side.slot != wall_slot {
                 side.slot = wall_slot;
                 side.spent = 0;
                 side.spent_ms = 0;
                 side.starts = 0;
+                side.want_starts = 0;
+                side.want_closed = false;
                 side.closed = false;
             }
-            if side.idle == Some(key)
-                || side.closed
-                || side.spent >= SIDE_BRANCH_BLOCKS_PER_SLOT
-                || (side.spent > 0 && side.spent_ms >= slot_share_ms)
-            {
+            if side.spent >= SIDE_BRANCH_BLOCKS_PER_SLOT || (side.spent > 0 && side.spent_ms >= slot_share_ms) {
                 return false;
             }
+            side.idle == Some(key) || side.closed
+        };
+        // Review RC4-01: a state the door asked for. Turns alternate with
+        // the fold below when both have work; same budgets. Nothing until
+        // the next wall slot once its starts are spent (review RC5-03).
+        if self.reorg_anchors.side.wanting.is_empty() && self.reorg_anchors.side.want_target.is_none() {
+            self.reorg_anchors.side.want_cursor = None;
+        } else if !self.reorg_anchors.side.want_closed {
+            let side = &mut self.reorg_anchors.side;
+            let serve = side.want_turn || fold_idle;
+            side.want_turn = !serve;
+            if serve {
+                if let Some(newly_validated) = self.serve_wanted_side_state_turn() {
+                    return newly_validated;
+                }
+            }
+        }
+        if fold_idle {
+            return false;
         }
         let Some((fork_height, path)) = self.side_branch_candidate() else {
             let side = &mut self.reorg_anchors.side;
@@ -8074,31 +8222,12 @@ impl Engine {
         // (The cursor is taken on the branch only when everything up to it
         // is still marked validated; otherwise the fold starts below and
         // judges those blocks again.)
-        let on_path = cursor.as_ref().and_then(|(id, st)| {
-            let at = path.iter().rposition(|p| p == id)?;
-            path.iter()
-                .take(at.saturating_add(1))
-                .all(|p| self.blocks.is_validated(p))
-                .then(|| (at, Arc::clone(st)))
-        });
-        let mut start: Option<(usize, Arc<CommittedState>, bool)> = None;
-        if on_path.is_none() {
-            let mut offer = |height: Option<u64>, st: &Arc<CommittedState>, is_cursor: bool| {
-                let Some(height) = height.and_then(|h| usize::try_from(h).ok()) else { return };
-                if height <= fork_height && start.as_ref().is_none_or(|(held, ..)| height > *held) {
-                    start = Some((height, Arc::clone(st), is_cursor));
-                }
-            };
-            for (id, st) in &self.recent_states {
-                offer(self.height_of(id), st, false);
-            }
-            if let Some((height, _, st)) = self.reorg_anchor_at_or_below(fork_height) {
-                offer(Some(height as u64), &st, false);
-            }
-            if let Some((id, st)) = &cursor {
-                offer(self.height_of(id), st, true);
-            }
-        }
+        let on_path = self.side_cursor_on_path(cursor.as_ref(), &path);
+        let start = if on_path.is_none() {
+            self.side_fold_canonical_start(fork_height, &[(cursor.as_ref(), true)])
+        } else {
+            None
+        };
         let resumed = on_path.is_some() || start.as_ref().is_some_and(|(.., is_cursor)| *is_cursor);
         if !resumed {
             let side = &mut self.reorg_anchors.side;
@@ -8112,7 +8241,7 @@ impl Engine {
         }
         // `next_height` is the next canonical height to replay (none once it
         // is past the fork point), `next_side` the next block of `path`.
-        let (mut state, mut next_height, mut next_side) = match (on_path, start) {
+        let (state, next_height, next_side) = match (on_path, start) {
             (Some((at, st)), _) => (st, fork_height.saturating_add(1), at.saturating_add(1)),
             (None, Some((height, st, _))) => (st, height.saturating_add(1), 0),
             (None, None) => (Arc::new(self.manifest.genesis_state()), 1, 0),
@@ -8121,6 +8250,96 @@ impl Engine {
         let budget = SIDE_BRANCH_BLOCKS_PER_TURN
             .min(SIDE_BRANCH_BLOCKS_PER_SLOT.saturating_sub(self.reorg_anchors.side.spent));
         let started = std::time::Instant::now();
+        let SideFold { state, stopped_at, newly_validated, stuck, done } =
+            self.fold_side_path(fork_height, &path, state, next_height, next_side, budget);
+        // The side-branch block this turn stopped on keeps its state beside
+        // the cursor (RC3-01): a block offered on it after the cursor has
+        // moved on or been dropped is still judged on its parent's own state.
+        if let Some(id) = stopped_at.filter(|id| !self.canonical.contains(id) && self.blocks.is_validated(id)) {
+            self.retain_side_state(id, &state);
+        }
+        let side = &mut self.reorg_anchors.side;
+        if stuck {
+            side.idle = Some(key);
+        }
+        side.spent = side.spent.saturating_add(done);
+        side.spent_ms = side
+            .spent_ms
+            .saturating_add(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        if let Some(id) = stopped_at {
+            side.cursor = Some((id, state));
+        }
+        if newly_validated {
+            // The branch's body votes count from here. Let fork choice see
+            // them; if the branch is the heavier one this is the reorg.
+            self.advance();
+            self.prune_below_finalized();
+        }
+        newly_validated
+    }
+
+    /// `cursor` as a place to resume a fold of `path` from: its index in
+    /// `path` and its state, when it is a block of `path` and everything up
+    /// to it is still marked validated.
+    fn side_cursor_on_path(
+        &self,
+        cursor: Option<&([u8; 32], Arc<CommittedState>)>,
+        path: &[[u8; 32]],
+    ) -> Option<(usize, Arc<CommittedState>)> {
+        let (id, st) = cursor?;
+        let at = path.iter().rposition(|p| p == id)?;
+        path.iter()
+            .take(at.saturating_add(1))
+            .all(|p| self.blocks.is_validated(p))
+            .then(|| (at, Arc::clone(st)))
+    }
+
+    /// The highest canonical post-state held at or below `fork_height`: the
+    /// reorg ring, a reorg anchor, or one of `cursors` (a state the fold left
+    /// on the canonical chain; the flag says whether starting from it counts
+    /// as resuming). `(height, state, resumed)`; `None` means genesis.
+    fn side_fold_canonical_start(
+        &self,
+        fork_height: usize,
+        cursors: &[(Option<&([u8; 32], Arc<CommittedState>)>, bool)],
+    ) -> Option<(usize, Arc<CommittedState>, bool)> {
+        let mut start: Option<(usize, Arc<CommittedState>, bool)> = None;
+        let mut offer = |height: Option<u64>, st: &Arc<CommittedState>, is_cursor: bool| {
+            let Some(height) = height.and_then(|h| usize::try_from(h).ok()) else { return };
+            if height <= fork_height && start.as_ref().is_none_or(|(held, ..)| height > *held) {
+                start = Some((height, Arc::clone(st), is_cursor));
+            }
+        };
+        for (id, st) in &self.recent_states {
+            offer(self.height_of(id), st, false);
+        }
+        if let Some((height, _, st)) = self.reorg_anchor_at_or_below(fork_height) {
+            offer(Some(height as u64), &st, false);
+        }
+        for (cursor, is_cursor) in cursors {
+            // `height_of` is `None` off the canonical chain.
+            if let Some((id, st)) = cursor {
+                offer(self.height_of(id), st, *is_cursor);
+            }
+        }
+        start
+    }
+
+    /// Run at most `budget` block applications of the side-branch fold of
+    /// `path` (fork point at `fork_height`), from `state`: canonical blocks
+    /// from `next_height` up to the fork point, then `path` from
+    /// `next_side`. Every side block that passes is marked validated and
+    /// the blocks parked on it are judged again ([`Self::rejudge_parked_on`]);
+    /// one that fails is removed and remembered, and the fold stops there.
+    fn fold_side_path(
+        &mut self,
+        fork_height: usize,
+        path: &[[u8; 32]],
+        mut state: Arc<CommittedState>,
+        mut next_height: usize,
+        mut next_side: usize,
+        budget: usize,
+    ) -> SideFold {
         let mut done = 0usize;
         let mut stopped_at: Option<[u8; 32]> = None;
         let mut newly_validated = false;
@@ -8193,30 +8412,264 @@ impl Engine {
                 break;
             }
         }
-        // The side-branch block this turn stopped on keeps its state beside
-        // the cursor (RC3-01): a block offered on it after the cursor has
-        // moved on or been dropped is still judged on its parent's own state.
-        if let Some(id) = stopped_at.filter(|id| !self.canonical.contains(id) && self.blocks.is_validated(id)) {
-            self.retain_side_state(id, &state);
+        SideFold { state, stopped_at, newly_validated, stuck, done }
+    }
+
+    /// Record that the door judged the block `id` on `fallback` although its
+    /// parent is a stored side-branch block this node validated, because it
+    /// held the exact post-state of neither that parent nor its parent
+    /// (review RC4-01, `DoorKes::JudgeWantingParentState`), and then parked
+    /// it for its proposer's authority: the fold recomputes the parent's
+    /// state and queues the block for the door again
+    /// ([`Self::serve_wanted_side_state_turn`]).
+    ///
+    /// Nothing is recorded for a block not so parked (review RC5-07), nor
+    /// for a new parent once blocks of the same proposer already wait on
+    /// [`SIDE_WANTED_PARENTS_PER_PROPOSER`] others (review RC5-02).
+    fn want_parent_state_for(&mut self, id: [u8; 32]) {
+        if !self.authority_parked.judged.contains_key(&id) {
+            return;
+        }
+        let Some((proposer, parent)) = self
+            .orphans
+            .iter()
+            .rev()
+            .find(|(seen, ..)| *seen == id)
+            .map(|(_, env, ..)| (env.header.proposer_index, env.header.parent))
+        else {
+            return;
+        };
+        let mut parents: Vec<[u8; 32]> = Vec::new();
+        for (seen, env, ..) in &self.orphans {
+            if env.header.proposer_index == proposer
+                && !parents.contains(&env.header.parent)
+                && self.reorg_anchors.side.wanting.contains(seen)
+            {
+                parents.push(env.header.parent);
+            }
+        }
+        if !parents.contains(&parent) && parents.len() >= SIDE_WANTED_PARENTS_PER_PROPOSER {
+            return;
+        }
+        let wanting = &mut self.reorg_anchors.side.wanting;
+        if wanting.len() >= ORPHAN_MAX {
+            let orphans = &self.orphans;
+            wanting.retain(|held| orphans.iter().any(|(seen, ..)| seen == held));
+        }
+        if wanting.len() <= ORPHAN_MAX {
+            wanting.insert(id);
+        }
+    }
+
+    /// One turn of on-demand recomputation (review RC4-01): bring back the
+    /// exact post-state of a stored, validated side-branch block that a
+    /// block in `SideValidation::wanting` is parked on, and queue that block
+    /// for the door again. `None` when nothing needed recomputing, or the
+    /// next recomputation needs a start this slot has no more of (the turn
+    /// is then the fold's); otherwise whether a block was newly validated.
+    ///
+    /// - A wanted parent whose state, or whose own parent's state, is held
+    ///   again by now (the fold or another recomputation reached it) costs
+    ///   no transition: the blocks parked on it are queued, at most
+    ///   [`SIDE_PARKED_REJUDGE_PER_BLOCK`] per held state and turn, and a
+    ///   wanted block stays wanted until it has been queued (review RC5-01).
+    /// - Otherwise the parent's branch is folded from the nearest exact
+    ///   ancestor: where the last recomputation stopped on it, a retained
+    ///   side state, or the highest canonical state held at or below its
+    ///   fork point (as the fold starts), under the fold's per-turn and
+    ///   per-slot budgets, and at most [`SIDE_WANT_STARTS_PER_SLOT`] starts
+    ///   that do not resume. Only fork points the fold itself would take
+    ///   (at or above the finality latch and the justified checkpoint) and
+    ///   branches within [`SIDE_BRANCH_MAX_DEPTH`].
+    /// - Once the fold reaches the parent its state is kept in
+    ///   `SideValidation::tips`, in the place reserved for it if every entry
+    ///   is held (reviews RC4-03, RC5-04), and the blocks parked on it are
+    ///   queued for the door by [`Self::rejudge_parked_on`] on the way and
+    ///   in the following turns.
+    ///
+    /// Every block it runs already passed the transition here, and the
+    /// state it produces is the transition's on the parent's own pre-state,
+    /// the same value the fold produced the first time: nothing is judged
+    /// differently, only judged again.
+    fn serve_wanted_side_state_turn(&mut self) -> Option<bool> {
+        {
+            let orphans = &self.orphans;
+            let wanting = &mut self.reorg_anchors.side.wanting;
+            wanting.retain(|held| orphans.iter().any(|(seen, ..)| seen == held));
+        }
+        let qualifies = |engine: &Self, parent: &[u8; 32]| {
+            engine.blocks.get(parent).is_some()
+                && engine.blocks.is_validated(parent)
+                && !engine.canonical.contains(parent)
+                && !engine.blocks.is_hollow(parent)
+                && !engine.reorg_anchors.side.failed_index.contains(parent)
+        };
+        // A recomputation under way is finished first, even once the block
+        // that asked for it has been queued (on its grandparent's state):
+        // the door then finds its parent's own state, and the work done so
+        // far is not wasted.
+        let mut target = self
+            .reorg_anchors
+            .side
+            .want_target
+            .filter(|t| qualifies(self, t) && self.exact_parent_state(t).is_none());
+        if target.is_none() {
+            // The target changes (or there is none): a cursor left by
+            // another one is not resumed from (review RC5-06).
+            self.reorg_anchors.side.want_target = None;
+            self.reorg_anchors.side.want_cursor = None;
+            if self.reorg_anchors.side.wanting.is_empty() {
+                return None;
+            }
+            let flagged: Vec<([u8; 32], [u8; 32])> = self
+                .orphans
+                .iter()
+                .filter(|(id, ..)| self.reorg_anchors.side.wanting.contains(id))
+                .map(|(id, env, ..)| (*id, env.header.parent))
+                .collect();
+            // States the blocks parked on were queued from in this turn.
+            let mut rejudged: Vec<[u8; 32]> = Vec::new();
+            for (child, parent) in flagged {
+                if !qualifies(self, &parent) || !self.authority_parked.judged.contains_key(&child) {
+                    // Adopted (a head change re-judges it), gone (the orphan
+                    // handling), not yet validated (the fold re-judges it
+                    // when it gets there), or failed: nothing to recompute.
+                    // Or no longer parked for its proposer's authority, so
+                    // nothing here would queue it.
+                    self.reorg_anchors.side.wanting.remove(&child);
+                    continue;
+                }
+                let grandparent = self.blocks.get(&parent).map(|env| env.header.parent);
+                // Its parent's state, or its grandparent's, from which the
+                // door derives the parent (one transition, on its long-roll
+                // allowance).
+                let held = self
+                    .exact_parent_state(&parent)
+                    .map(|held| (parent, held))
+                    .or_else(|| grandparent.and_then(|g| self.exact_parent_state(&g).map(|held| (g, held))));
+                if let Some((on, held)) = held {
+                    // Review RC5-01: at most SIDE_PARKED_REJUDGE_PER_BLOCK
+                    // blocks are queued per call, so `child` may not be one
+                    // of them; it stays wanted until it leaves the orphan
+                    // pool, and the next turn queues the next ones.
+                    if !rejudged.contains(&on) {
+                        rejudged.push(on);
+                        self.rejudge_parked_on(on, &held);
+                    }
+                    continue;
+                }
+                target = Some(parent);
+                break;
+            }
+        }
+        let target = target?;
+        self.reorg_anchors.side.want_target = Some(target);
+        // Done with `target`: its state is held, or nothing will bring it
+        // back. Only in the second case are the blocks waiting on it no
+        // longer wanted (review RC5-01: in the first, the next turns queue
+        // those that `rejudge_parked_on` has not queued yet).
+        let release = |engine: &mut Self, give_up: bool| {
+            let orphans = &engine.orphans;
+            let side = &mut engine.reorg_anchors.side;
+            if give_up {
+                side.wanting.retain(|held| {
+                    !orphans.iter().any(|(seen, env, ..)| seen == held && env.header.parent == target)
+                });
+            }
+            side.want_target = None;
+            side.want_cursor = None;
+        };
+
+        // The branch from its canonical fork point up to `target`.
+        let mut path = vec![target];
+        let mut below = self.blocks.get(&target).map(|env| env.header.parent);
+        let fork = loop {
+            let Some(id) = below else { break None };
+            if self.canonical.contains(&id) {
+                break Some(id);
+            }
+            if path.len() >= SIDE_BRANCH_MAX_DEPTH || self.reorg_anchors.side.failed_index.contains(&id) {
+                break None;
+            }
+            let Some(env) = self.blocks.get(&id) else { break None };
+            below = Some(env.header.parent);
+            path.push(id);
+        };
+        path.reverse();
+        let height = |root: &[u8; 32]| self.height_of(root).and_then(|h| usize::try_from(h).ok());
+        let latch = self.finalized_latch.map_or(0, |(h, _)| usize::try_from(h).unwrap_or(usize::MAX));
+        let floor = latch.max(height(&self.state.finality().justified.root).unwrap_or(0));
+        let Some(fork_height) = fork.and_then(|f| height(&f)).filter(|h| *h >= floor) else {
+            // Not a branch the fold would take either: nothing to do for it.
+            release(self, true);
+            return Some(false);
+        };
+
+        // From the nearest exact ancestor.
+        let want_cursor = self.reorg_anchors.side.want_cursor.clone();
+        let mut resumed = true;
+        let (state, next_height, next_side) = if let Some((at, st)) =
+            self.side_cursor_on_path(want_cursor.as_ref(), &path)
+        {
+            (st, fork_height.saturating_add(1), at.saturating_add(1))
+        } else if let Some((at, st)) = path
+            .iter()
+            .enumerate()
+            .rev()
+            .skip(1)
+            .find_map(|(at, id)| self.exact_parent_state(id).map(|st| (at, st)))
+        {
+            (st, fork_height.saturating_add(1), at.saturating_add(1))
+        } else {
+            let cursor = self.reorg_anchors.side.cursor.clone();
+            let start = self.side_fold_canonical_start(
+                fork_height,
+                &[(want_cursor.as_ref(), true), (cursor.as_ref(), false)],
+            );
+            resumed = start.as_ref().is_some_and(|(.., is_cursor)| *is_cursor);
+            match start {
+                Some((height, st, _)) => (st, height.saturating_add(1), 0),
+                None => (Arc::new(self.manifest.genesis_state()), 1, 0),
+            }
+        };
+        if !resumed {
+            let side = &mut self.reorg_anchors.side;
+            if side.want_starts >= SIDE_WANT_STARTS_PER_SLOT {
+                // Not before the next wall slot (review RC5-03).
+                side.want_closed = true;
+                return None;
+            }
+            side.want_starts = side.want_starts.saturating_add(1);
+        }
+
+        let budget = SIDE_BRANCH_BLOCKS_PER_TURN
+            .min(SIDE_BRANCH_BLOCKS_PER_SLOT.saturating_sub(self.reorg_anchors.side.spent));
+        let started = std::time::Instant::now();
+        let SideFold { state, stopped_at, newly_validated, stuck, done } =
+            self.fold_side_path(fork_height, &path, state, next_height, next_side, budget);
+        if stopped_at == Some(target) {
+            // Recomputed: kept for the door (RC4-03, RC5-04: even if every
+            // entry is held), and what was parked on it is queued on the way
+            // and in the next turns.
+            self.retain_side_state_as(target, &state, true);
+            release(self, false);
+        } else if stuck || stopped_at.is_none() {
+            // A local fault or a removed block: give this one up (the
+            // block's parent is no longer what it was asked for).
+            release(self, true);
+        } else if let Some(id) = stopped_at {
+            self.reorg_anchors.side.want_cursor = Some((id, state));
         }
         let side = &mut self.reorg_anchors.side;
-        if stuck {
-            side.idle = Some(key);
-        }
         side.spent = side.spent.saturating_add(done);
         side.spent_ms = side
             .spent_ms
             .saturating_add(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-        if let Some(id) = stopped_at {
-            side.cursor = Some((id, state));
-        }
         if newly_validated {
-            // The branch's body votes count from here. Let fork choice see
-            // them; if the branch is the heavier one this is the reorg.
             self.advance();
             self.prune_below_finalized();
         }
-        newly_validated
+        Some(newly_validated)
     }
 
     /// The side-branch fold just validated `validated`, whose post-state is
@@ -8245,6 +8698,10 @@ impl Engine {
             let (id, env, ..) = &self.orphans[i];
             if self.authority_parked.judged.contains_key(id) && waits(env) {
                 let Some(parked) = self.orphans.remove(i) else { break };
+                // Review L1R18-RC-03: queued, so no longer wanted. The door
+                // asks again if it still misses the state; a block it parks
+                // again on a state it holds is not queued turn after turn.
+                self.reorg_anchors.side.wanting.remove(&parked.0);
                 self.orphans_admitted = self.orphans_admitted.saturating_add(1);
                 self.deferred_orphans.push_back(parked);
                 moved = moved.saturating_add(1);
@@ -8262,26 +8719,65 @@ impl Engine {
     /// Keep `post`, the exact post-state of the validated side-branch block
     /// `id`, in [`SideValidation::tips`] (reviews RC3-01, RC3-02). A repeat
     /// moves the entry to the newest place. When the ring is full the oldest
-    /// entry that no block queued for the door waits on leaves; if every
-    /// entry is waited on, `post` is not kept (the waiting blocks are judged
-    /// within a few turns, one promotion per turn).
+    /// entry that no block waits on leaves: a block waits on an entry when
+    /// it is queued for the door (`deferred_orphans`) or held in the orphan
+    /// pool only until a spent allowance renews (review RC4-02), with the
+    /// entry as its parent or its parent's parent. If every entry is waited
+    /// on, `post` is not kept (the waiting blocks are judged within a few
+    /// turns, one promotion per turn); a state the door then misses is
+    /// recomputed on demand (review RC4-03).
     fn retain_side_state(&mut self, id: [u8; 32], post: &Arc<CommittedState>) {
-        let blocks = &self.blocks;
-        let deferred = &self.deferred_orphans;
-        let waited_on = |of: &[u8; 32]| {
-            deferred.iter().any(|(_, env, ..)| {
-                env.header.parent == *of
-                    || blocks.get(&env.header.parent).is_some_and(|parent| parent.header.parent == *of)
-            })
-        };
+        self.retain_side_state_as(id, post, false);
+    }
+
+    /// [`Self::retain_side_state`]; with `wanted` (a state recomputed
+    /// because the door asked for it) `post` is kept even when every entry
+    /// is waited on: in one place reserved for it beyond
+    /// [`SIDE_TIP_STATES`] (review RC5-04), so a state a queued block waits
+    /// on is not evicted for it, and only when that place is taken too in
+    /// the place of the oldest entry (review RC4-03). The ring holds at most
+    /// `SIDE_TIP_STATES + 1` entries, the last only for a wanted state; the
+    /// blocks that waited on an evicted entry are judged on it again by the
+    /// same on-demand recomputation if the door misses it.
+    fn retain_side_state_as(&mut self, id: [u8; 32], post: &Arc<CommittedState>, wanted: bool) {
         let tips = &mut self.reorg_anchors.side.tips;
         if let Some(at) = tips.iter().position(|(held, _)| *held == id) {
             tips.remove(at);
-        } else if tips.len() >= SIDE_TIP_STATES {
-            let Some(evict) = tips.iter().position(|(held, _)| !waited_on(held)) else {
-                return;
-            };
-            tips.remove(evict);
+            tips.push_back((id, Arc::clone(post)));
+            return;
+        }
+        let room = if wanted { SIDE_TIP_STATES.saturating_add(1) } else { SIDE_TIP_STATES };
+        if tips.len() < room {
+            tips.push_back((id, Arc::clone(post)));
+            return;
+        }
+        let blocks = &self.blocks;
+        let waits_on = |env: &BlockEnvelope, of: &[u8; 32]| {
+            env.header.parent == *of
+                || blocks.get(&env.header.parent).is_some_and(|parent| parent.header.parent == *of)
+        };
+        let deferred = &self.deferred_orphans;
+        let orphans = &self.orphans;
+        // One pass over the budget-parked ids per call, not one per orphan
+        // and entry (review RC5-05).
+        let budget_parked = self.gossip_verifier.budget_parked_ids();
+        let waited_on = |of: &[u8; 32]| {
+            deferred.iter().any(|(_, env, ..)| waits_on(env, of))
+                || orphans
+                    .iter()
+                    .any(|(seen, env, ..)| budget_parked.contains(seen) && waits_on(env, of))
+        };
+        // Oldest first, and nothing is evicted unless `post` then fits.
+        let need = tips.len().saturating_add(1).saturating_sub(room);
+        let free: Vec<usize> = (0..tips.len()).filter(|at| !waited_on(&tips[*at].0)).take(need).collect();
+        if free.len() < need && !wanted {
+            return;
+        }
+        for at in free.into_iter().rev() {
+            tips.remove(at);
+        }
+        while tips.len() >= room {
+            tips.pop_front();
         }
         tips.push_back((id, Arc::clone(post)));
     }
@@ -9200,7 +9696,7 @@ fn start_devnet(
     head_slot: &Arc<AtomicU64>,
     inflight: &Arc<net::QueueBudget>,
 ) -> io::Result<net::DevnetMesh> {
-    let security = Arc::new(crate::mesh_pq::MeshSecurity::load(
+    let security = crate::mesh_pq::MeshSecurity::load(
         cfg.mesh.mode,
         genesis_id,
         &cfg.data_dir,
@@ -9208,7 +9704,19 @@ fn start_devnet(
         &cfg.peers,
         &cfg.mesh.pins,
         cfg.mesh.require_authenticated,
-    )?);
+    )?;
+    let security = Arc::new(match cfg.mesh.plain_allow.as_deref() {
+        Some(path) => security.with_plain_allow_file(path, cfg.mesh.require_authenticated)?,
+        None => security,
+    });
+    crate::metrics::NodeMetrics::set(
+        &crate::metrics::NODE.mesh_security_mode,
+        match security.mode() {
+            crate::mesh_pq::Mode::Plain => 0,
+            crate::mesh_pq::Mode::Offer => 1,
+            crate::mesh_pq::Mode::Require => 2,
+        },
+    );
     println!("mesh security: {}", security.summary());
     // Said twice, like the transport line: before anything binds, and again
     // once the listener is up, so it is still on screen under the bind
@@ -20912,19 +21420,18 @@ mod ingest_admission_tests {
             assert!(!msg.contains("A_EPOCH") && !msg.contains("C_EPOCH"), "{msg}");
             assert!(msg.contains("re-released with a future epoch"), "{msg}");
         }
-        // As shipped the only armed gates on the list are the two armed
-        // 2026-11-13 at 8620: plain below them, named from 8620 on.
-        assert_eq!(replay_failure_message(8_619), plain);
-        let msg = replay_failure_message(8_620);
-        assert!(msg.contains("params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH = 8620"), "{msg}");
-        assert!(msg.contains("params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH = 8620"), "{msg}");
-        assert_eq!(
+        // As shipped no listed gate is armed: the two armed 2026-11-13 at
+        // 8620 left the list when the release anchor was re-baked at epoch
+        // 8742, so the message is the plain one at every epoch.
+        for epoch in [8_619, 8_620, 8_742, M - 1] {
+            assert_eq!(replay_failure_message(epoch), plain, "{epoch}");
+        }
+        assert!(
             bloch_pos_committee::hard_forks::gates_armed_at_or_below(
                 bloch_pos_committee::hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY,
                 M - 1
             )
-            .len(),
-            2
+            .is_empty()
         );
         // Wiring: the production message is the tested one over the
         // canonical list, and boot replay fails with it.

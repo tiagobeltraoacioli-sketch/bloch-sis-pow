@@ -5984,4 +5984,8 @@ mod l2_tests {
 
     include!("l2_revenue_tests.rs");
     include!("l2_forced_review_tests.rs");
+    mod isolation_fuzz_tests {
+        use super::*;
+        include!("l2_isolation_fuzz_tests.rs");
+    }
 }

@@ -664,6 +664,7 @@ fn print_help() {
                          [--mesh-security plain|offer|require]\n\
                          [--mesh-allow <file>]\n\
                          [--mesh-require-authenticated]\n\
+                         [--mesh-plain-allow <file>]\n\
                Post-quantum mesh security (default plain = unchanged wire):\n\
                hybrid ML-KEM-768 + X25519 key exchange, ML-DSA-65 transport\n\
                identities, ChaCha20-Poly1305 records. The handshake proves\n\
@@ -697,6 +698,13 @@ fn print_help() {
                           or listed identities.\n\
                --mesh-require-authenticated refuses to start unless the mode\n\
                is require with an allow-list or pins, instead of warning.\n\
+               --mesh-plain-allow <file> (with require): one IP address per\n\
+               line; peers at those addresses are treated as under offer\n\
+               (handshake first, plain accepted), everybody else as under\n\
+               require. A staging aid for peers that upgrade later, not a\n\
+               security setting: nothing is guaranteed on those sessions.\n\
+               Accepted and without effect under offer.\n\
+               See docs/operations/MESH-SECURITY-REQUIRE-MIGRATION.md.\n\
                Roll out plain -> offer -> require, one node at a time, then\n\
                add identities and --mesh-require-authenticated.\n\
          \n\
@@ -830,7 +838,8 @@ fn print_help() {
 }
 
 /// `submit-tx --to <host:port> --spend <txid-hex>:<vout> --pubkey <hex>
-///  --pay <script-hash-hex>:<sat> [--signature <hex>] [--tx-bytes n] [--tip n]`
+///  --pay <script-hash-hex>:<sat> [--signature <hex>] [--tx-bytes n] [--tip n]
+///  [--epoch n [--network-domain <hex32>]]`
 ///
 /// Builds one `Transfer` and hands it to a node, which gossips it onward.
 /// Transfer is the only variant this emits on purpose: `Deposit` and
@@ -973,7 +982,34 @@ fn submit_tx(args: &[String]) {
         // not depend on the signatures — which is exactly why it can be shown
         // before they exist — but it DOES depend on every other field, so the
         // same flags must be repeated verbatim on the signed run.
-        println!("{}", codec::hex(&tx.spend_signing_root()));
+        //
+        // Review CRY-4: the root consensus verifies depends on the inclusion
+        // epoch once SIGHASH_NETWORK_BINDING arms (it then folds in the
+        // network's genesis-manifest digest). Without --epoch this prints the
+        // base root, as it always did; with --epoch N it prints the root a
+        // block of epoch N is judged by, which from the gate on needs
+        // --network-domain HEX32 (getvalidatoradmission.network_domain).
+        let root = match arg_value(args, "--epoch") {
+            None => tx.spend_signing_root(),
+            Some(text) => {
+                let Ok(epoch) = text.parse::<u64>() else {
+                    bail(format!("--epoch {text}: expected the inclusion epoch"))
+                };
+                let domain: Option<[u8; 32]> = match arg_value(args, "--network-domain").as_deref().map(codec::unhex) {
+                    None => None,
+                    Some(Ok(bytes)) => match bytes.try_into() {
+                        Ok(domain) => Some(domain),
+                        Err(_) => bail("--network-domain needs 32 bytes".into()),
+                    },
+                    Some(Err(e)) => bail(format!("--network-domain: {e}")),
+                };
+                match devnet_tools::network_spend_signing_root(&tx, epoch, domain.as_ref()) {
+                    Ok(root) => root,
+                    Err(e) => bail(e),
+                }
+            }
+        };
+        println!("{}", codec::hex(&root));
         eprintln!(
             "submit-tx: no --signature given; the line above is the signing root.\n\
              Sign it with the key whose SHA3-256 the spent outputs commit to, then\n\
@@ -1837,7 +1873,7 @@ pub(crate) fn decide_transport(args: &[String]) -> Result<TransportPlan, String>
         }
     }
     if !runs_devnet {
-        for f in ["--listen", "--listen-addr", "--peers", "--mesh-security", "--mesh-allow", "--mesh-require-authenticated"] {
+        for f in ["--listen", "--listen-addr", "--peers", "--mesh-security", "--mesh-allow", "--mesh-require-authenticated", "--mesh-plain-allow"] {
             if present(f) {
                 contradictions.push(f.to_string());
             }
@@ -2140,7 +2176,22 @@ fn run_cmd(args: &[String]) {
         allow: arg_value(args, "--mesh-allow").map(PathBuf::from),
         pins: peer_pins,
         require_authenticated: args.iter().any(|a| a == "--mesh-require-authenticated"),
+        plain_allow: arg_value(args, "--mesh-plain-allow").map(PathBuf::from),
     };
+    // Given last with no value it would be dropped in silence, and a
+    // `require` node would then cut off the peers the list was meant to keep.
+    if mesh.plain_allow.is_none() && args.iter().any(|a| a == "--mesh-plain-allow") {
+        eprintln!("run: --mesh-plain-allow needs a file (one IP address per line)");
+        exit(2);
+    }
+    if mesh.plain_allow.is_some() && mesh.mode == mesh_pq::Mode::Plain {
+        eprintln!("run: --mesh-plain-allow needs --mesh-security require (or offer, where it has no effect)");
+        exit(2);
+    }
+    if mesh.plain_allow.is_some() && mesh.require_authenticated {
+        eprintln!("run: --mesh-plain-allow cannot be combined with --mesh-require-authenticated");
+        exit(2);
+    }
     if mesh.allow.is_some() && mesh.mode == mesh_pq::Mode::Plain {
         eprintln!("run: --mesh-allow needs --mesh-security offer or require");
         exit(2);

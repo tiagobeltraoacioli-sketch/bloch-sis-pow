@@ -34,8 +34,8 @@ ignore = [
     "RUSTSEC-2026-0161", # pqcrypto-mlkem 0.1.1 unmaintained (PQClean archived) —
                          # EXCEPTION added 2026-11-14 (finding L1M-06), re-review
                          # by 2027-02-14. informational=unmaintained, patched=[]:
-                         # no fixed release exists. Used only by the optional
-                         # hybrid mesh transport (bloch-pos-node src/mesh_pq.rs,
+                         # no fixed release exists. Used only by the hybrid
+                         # mesh transport (bloch-pos-node src/mesh_pq.rs,
                          # `--mesh-security offer|require`, default `plain`),
                          # where ML-KEM-768 is combined with X25519 under HKDF,
                          # so a KEM defect alone does not expose session keys;
@@ -43,12 +43,28 @@ ignore = [
                          # pqcrypto-mldsa/falcon wrappers above. REMOVE by
                          # migrating to the RustCrypto `ml-kem` crate (not
                          # available offline on 2026-11-14) after a KAT review.
+                         # Reviewed again 2026-11-18 (L1 round 19): the
+                         # mainnet fleet runs `--mesh-security offer`, so this
+                         # code IS live on mainnet (transport only). Version
+                         # and checksum are unchanged in Cargo.lock; replacing
+                         # the KEM needs a cross-version handshake proof first
+                         # because the fleet upgrades in waves.
     # ── Transitive, no first-party call path ──────────────────────────────
     "RUSTSEC-2025-0141", # bincode 1.3.3 unmaintained — first-party restart cache;
                          # checksummed, build-bound and validated on restore.
                          # Accepted maintenance risk, not unreachable code.
     "RUSTSEC-2024-0436", # paste unmaintained — transitive proc-macro helper,
                          # compile-time only, no runtime attack surface.
+    "RUSTSEC-2026-0543", # chrono 0.4.44 unmaintained — EXCEPTION added 2026-11-18
+                         # (L1 round 19), re-review by 2027-02-14.
+                         # informational=unmaintained, patched=[]: every version
+                         # is flagged, there is nothing to bump to. First-party
+                         # use is `chrono::Utc::now().to_rfc3339()` for the
+                         # `created_at` field of wallet files (bloch-crypto
+                         # wallet/, hd_wallet/) plus the frozen Genesis-3 node;
+                         # never a consensus input and no parsing of untrusted
+                         # date strings. REMOVE by moving those four call sites
+                         # to `time` (already in Cargo.lock) in a wallet change.
     "RUSTSEC-2026-0163", # pqcrypto-internals unmaintained (PQClean archived) —
                          # same disposition as the pqcrypto-* wrappers above; it
                          # is the VENDORED crate (crates/pqcrypto-internals),
@@ -128,19 +144,26 @@ ignore = [
     "RUSTSEC-2026-0531", # hickory-proto DNSSEC child-side NSEC/NSEC3 for DS
     "RUSTSEC-2026-0532", # hickory-proto DNSSEC parent-side NSEC3 at zone cut
     "RUSTSEC-2026-0514", # hickory-resolver lookup() hides DNSSEC failures
-    # (B) NOT in the bloch-pos dependency graph (`cargo tree -p bloch-pos-node
-    # --features ws-release-anchor --target x86_64-unknown-linux-gnu -e
-    # normal,build`): legacy Genesis-3 node, reqwest TLS in tools. In-semver
-    # patches exist; bumping them is deferred so the release lockfile delta
-    # stays minimal.
-    "RUSTSEC-2026-0346", # rustls session Debug exposes secrets   (>=0.23.46)
-    "RUSTSEC-2026-0347", # rustls ECH rejection buffered data     (>=0.23.46)
-    "RUSTSEC-2026-0348", # rustls Brotli cert decompression       (>=0.23.46)
-    "RUSTSEC-2026-0349", # rustls ServerHello key-share downgrade (>=0.23.46)
-    "RUSTSEC-2026-0382", # rustls-webpki distrusted intermediates (>=0.103.16)
-    "RUSTSEC-2026-0381", # webpki-roots distrusted emSign roots   (>=1.0.10)
-    "RUSTSEC-2026-0410", # zstd-sys wasm allocator shim (legacy rocksdb, not wasm)
-    "RUSTSEC-2026-0418", # libz-sys build-script env leak (build host only)
+    # Added 2026-11-18 (L1 round 19; published in advisory-db after the
+    # 2026-11-15 pass), re-review by 2027-02-14. Same disposition as the eight
+    # DNSSEC entries above: patched = [] for hickory-proto, the fix lives in
+    # hickory-net 0.26.2, and hickory-proto is resolved with features
+    # [futures-io, mdns, socket2, std, tokio] only (`cargo metadata`), so the
+    # DNSSEC validator these three advisories are about is not compiled.
+    "RUSTSEC-2026-0549", # hickory-proto DNSSEC NSEC3 NODATA at zone apex
+    "RUSTSEC-2026-0550", # hickory-proto DNSSEC unsigned NSEC/NSEC3 in a proof
+    "RUSTSEC-2026-0551", # hickory-proto DNSSEC records of another DNS class
+    # (B) FIXED 2026-11-18 (L1 round 19) by in-semver Cargo.lock bumps, so the
+    # eight ignores that stood here are gone and a regression fails this gate
+    # again: rustls 0.23.46 (RUSTSEC-2026-0346..0349), rustls-webpki 0.103.16
+    # (-0382), webpki-roots 1.0.10 (-0381), zstd-sys 2.1.2 (-0410), libz-sys
+    # 1.1.33 (-0418 and the newer -0544), plus quinn-proto 0.11.19 and quinn-udp
+    # 0.5.16. None of these crates is in the bloch-pos dependency graph (`cargo
+    # tree -p bloch-pos-node --features ws-release-anchor --target
+    # x86_64-unknown-linux-gnu -e normal,build` is identical before and after);
+    # they belong to the legacy Genesis-3 node and reqwest TLS in tools.
+    # .cargo/audit.toml keeps its entries because it also governs the
+    # separately locked workspaces that still carry the old versions.
 ]
 
 [bans]
@@ -181,7 +204,6 @@ allow-wildcard-paths = true # path deps in the workspace are fine
 #     1/2, itertools, hashbrown, ...) with no network- or crypto-facing
 #     surface shared between the copies.
 skip = [
-    { crate = "bindgen@=0.69.5" },
     { crate = "bincode@=1.3.3" },
     { crate = "bitcoin_hashes@=0.13.1" },
     { crate = "block-buffer@=0.9.0" },
@@ -199,16 +221,16 @@ skip = [
     { crate = "hashbrown@=0.15.5" },
     { crate = "hashlink@=0.9.1" },
     { crate = "hex-conservative@=0.1.2" },
-    # L1M-06 (2026-11-14): itertools 0.12 (bindgen 0.69, rocksdb build of the
-    # frozen Genesis-3 node) vs 0.13 (bindgen 0.72, zstd-sys); build scripts only.
-    { crate = "itertools@=0.12.1" },
+    # 2026-11-18 (L1 round 19): zstd-sys 2.1.2 no longer builds with bindgen,
+    # so bindgen 0.72.1 left Cargo.lock and cargo-deny reported the skips for
+    # bindgen@0.69.5, itertools@0.12.1 and rustc-hash@1.1.0 as unnecessary;
+    # removed as the review note above asks.
     { crate = "r-efi@=5.3.0" },
     { crate = "rand@=0.8.6" },
     { crate = "rand@=0.9.4" },
     { crate = "rand_chacha@=0.3.1" },
     { crate = "rand_core@=0.6.4" },
     { crate = "rand_core@=0.9.5" },
-    { crate = "rustc-hash@=1.1.0" },
     { crate = "secp256k1@=0.28.2" },
     { crate = "secp256k1@=0.29.1" },
     { crate = "secp256k1-sys@=0.9.2" },

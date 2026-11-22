@@ -1407,6 +1407,11 @@ pub enum TxReject {
     /// test that cannot tell them apart is not testing the gate. Still
     /// surfaces as the frozen `TransitionError::Transaction(i)`.
     EvidenceNotActive,
+    /// The handler of an L2 / bridge / settlement transaction panicked and
+    /// the fault was contained ([`crate::isolation`]). Only behind
+    /// [`crate::params::L2_FAULT_ISOLATION_ACTIVATION_EPOCH`]. Surfaces as
+    /// the frozen `TransitionError::Transaction(i)`.
+    ContainedFault,
 }
 
 /// Little-endian reader mirroring the encoder's field order and widths.
@@ -7056,6 +7061,20 @@ impl<V: SignatureVerifier> Transition<V> {
                         CommittedState::staking_tx_charge(st.epoch, 2, tx.canonical_bytes().len())
                     })
                     .map_err(|()| TxReject::StakingRule),
+                // Fault boundary (`crate::isolation`), INERT below
+                // `params::L2_FAULT_ISOLATION_ACTIVATION_EPOCH`: a panic in an
+                // L2 / bridge / settlement handler refuses the transaction
+                // (and with it the block) instead of unwinding the transition.
+                // `st` is dropped with the error below, so a half-applied
+                // handler leaves nothing behind.
+                _ if crate::params::l2_fault_isolation_active(block_epoch)
+                    && crate::isolation::is_non_l1(tx) =>
+                {
+                    crate::isolation::contain(|| {
+                        st.apply_transaction(tx, total_active, base_fee, &self.verifier)
+                    })
+                    .unwrap_or(Err(TxReject::ContainedFault))
+                }
                 // Unwrapped: `apply_transaction` applies the TRANSACTION rule
                 // itself; the block's consensus rule must not reach a wallet
                 // signature (HF2 scope).
