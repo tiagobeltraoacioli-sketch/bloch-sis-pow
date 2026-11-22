@@ -143,6 +143,11 @@ pub enum TxKind {
     L2Deposit,
     L2DataAvailability,
     L2WithdrawClaim,
+    /// December L2 line forced transaction (0x1C, gated by
+    /// `L2_FORCED_INCLUSION_EPOCH`): spends funding inputs and creates up to
+    /// three outputs (change at vout 0, surcharge refund at 1, treasury
+    /// surcharge at 2) whose values only consensus knows.
+    L2ForcedTransaction,
     Transfer,
     TransferV2,
     FundedDeposit,
@@ -183,7 +188,7 @@ impl TxKind {
     /// A native L2 kind, whose answers also carry the escrow movement.
     pub fn is_l2(&self) -> bool {
         matches!(self, TxKind::L2Settlement | TxKind::L2SettlementAsync | TxKind::L2Deposit
-            | TxKind::L2DataAvailability | TxKind::L2WithdrawClaim)
+            | TxKind::L2DataAvailability | TxKind::L2WithdrawClaim | TxKind::L2ForcedTransaction)
     }
     pub fn name(&self) -> String {
         match self {
@@ -192,6 +197,7 @@ impl TxKind {
             TxKind::L2Deposit => "l2_deposit".into(),
             TxKind::L2DataAvailability => "l2_data_availability".into(),
             TxKind::L2WithdrawClaim => "l2_withdraw_claim".into(),
+            TxKind::L2ForcedTransaction => "l2_forced_transaction".into(),
             TxKind::Transfer => "transfer".into(),
             TxKind::TransferV2 => "transfer_v2".into(),
             TxKind::FundedDeposit => "funded_deposit".into(),
