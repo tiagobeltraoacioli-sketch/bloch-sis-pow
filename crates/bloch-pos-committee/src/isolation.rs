@@ -3,7 +3,8 @@
 //! handlers that share its state transition.
 //!
 //! The L2 settlement (0x12, 0x13), L2 deposit (0x14), L2 data availability
-//! (0x15) and L2 withdrawal claim (0x16) handlers run inside
+//! (0x15), L2 withdrawal claim (0x16) and, on the December L2 line, L2
+//! forced transaction (0x1C, gated by `L2_FORCED_INCLUSION_EPOCH`) handlers run inside
 //! `Transition::compute_post_state`, next to transfers and staking. A panic
 //! in one of them (a slice out of range, an `unwrap`, an arithmetic overflow:
 //! the release profile keeps `overflow-checks`) unwinds the thread that
@@ -55,7 +56,8 @@ pub fn is_non_l1(tx: &PosTransaction) -> bool {
         | PosTransaction::L2SettlementAsync(_)
         | PosTransaction::L2Deposit(_)
         | PosTransaction::L2DataAvailability(_)
-        | PosTransaction::L2WithdrawClaim(_) => true,
+        | PosTransaction::L2WithdrawClaim(_)
+        | PosTransaction::L2ForcedTransaction(_) => true,
         PosTransaction::Transfer { .. }
         | PosTransaction::TransferV2 { .. }
         | PosTransaction::Deposit { .. }
