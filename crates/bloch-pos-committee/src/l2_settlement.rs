@@ -1920,6 +1920,20 @@ impl State {
     pub fn deposited_sat(&self) -> u128 {
         self.inbox.iter().map(|r| u128::from(r.sats)).sum()
     }
+    /// Satoshis ever escrowed by deposits, in O(1): what is in escrow plus
+    /// what claims released (equal to [`Self::deposited_sat`] by the
+    /// conservation invariant). This is the figure the L2's cumulative mint
+    /// counter converges to as the inbox is consumed.
+    pub fn cumulative_deposited_sat(&self) -> u128 {
+        self.escrow_sat.saturating_add(self.released_sat)
+    }
+    /// Whether a deposit of `sats` keeps the lifetime deposit total within
+    /// `cap_sat` (audit L1X-03; binds only behind
+    /// `params::L2_CUMULATIVE_DEPOSIT_CAP_ACTIVATION_EPOCH`, which the
+    /// caller judges).
+    pub fn deposit_within_mint_cap(&self, sats: u64, cap_sat: u128) -> bool {
+        self.cumulative_deposited_sat().checked_add(u128::from(sats)).is_some_and(|total| total <= cap_sat)
+    }
     /// The bridge conservation invariant: escrow equals deposits minus claims.
     pub fn escrow_conserved(&self) -> bool {
         self.deposited_sat().checked_sub(self.released_sat) == Some(self.escrow_sat)

@@ -210,6 +210,17 @@ impl CommittedState {
         {
             return Err(R::Inbox);
         }
+        // L1X-03 (gated): the L2 can never mint a record past its
+        // cumulative mint cap, and every settlement must consume the next
+        // record, so such a deposit would stop the L2 for good.
+        if crate::params::l2_cumulative_deposit_cap_active(self.epoch)
+            && !self
+                .l2_settlement
+                .as_ref()
+                .is_some_and(|l2| l2.deposit_within_mint_cap(tx.amount_sat, u128::from(MAX_L2_DEPOSIT_SAT)))
+        {
+            return Err(R::Inbox);
+        }
         if tx.tip_millisat_per_gas > fee_market::MAX_TIP_MILLISAT_PER_GAS {
             return Err(R::TipAboveCeiling);
         }

@@ -3050,6 +3050,53 @@ pub(crate) mod l2_attested_release_lane_rehearsal {
     }
 }
 
+/// AUDIT-L1L2-20261123 L1X-03: the L1 refuses a deposit that would take the
+/// lifetime deposit total above the L2's cumulative mint cap. `u64::MAX`
+/// means INERT.
+///
+/// The L2 keeps a counter of everything it ever minted and refuses a deposit
+/// mint that would take it above `ChainSpec::max_l1_sats`
+/// (`transition::l2_deposit::MAX_L2_DEPOSIT_SAT` here); withdrawals free no
+/// room under it. The L1 bounded each deposit but not their sum, and every
+/// settlement must consume the next pending inbox records, so the first
+/// deposit past the cap could never be settled and nothing after it either:
+/// the L2 would stop for good. Once armed, such a deposit is refused on L1
+/// (`L2DepositReject::Inbox`, nothing escrowed): deposits close when the
+/// lifetime volume reaches the cap, and the L2 keeps settling and paying
+/// withdrawals. Lifting the lifetime limit itself needs the L2 to count net
+/// supply, i.e. a new guest program and proof policy.
+///
+/// It changes which transactions are valid, so arming needs a historical
+/// replay, mixed-fleet qualification and a coordinated epoch. It cannot
+/// precede the L2 itself. `l1x03_the_cumulative_cap_gate_is_inert` pins the
+/// inert value.
+pub const L2_CUMULATIVE_DEPOSIT_CAP_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_CUMULATIVE_DEPOSIT_CAP_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+
+pub fn l2_cumulative_deposit_cap_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_cumulative_deposit_cap_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_CUMULATIVE_DEPOSIT_CAP_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_cumulative_deposit_cap_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Fault isolation of the L2 / bridge / settlement handlers inside the block
 /// transition ([`crate::isolation`]). `u64::MAX` means INERT.
 ///
