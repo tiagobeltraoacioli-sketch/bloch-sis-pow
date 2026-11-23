@@ -13,6 +13,10 @@ const L2_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2;
 /// checkpoint roots (`params::HF1_CLAIM_FINALITY_EPOCH`).
 /// Written only when non-empty, so every earlier cache keeps its bytes.
 const L2_CHECKPOINT_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2_CHECKPOINTS;
+/// Marks the optional section after it holding the L2 settler set
+/// (`params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`). Written only when
+/// a set is installed, so every earlier cache keeps its bytes.
+const L2_SETTLER_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2_SETTLERS;
 /// Marks the optional trailing post-quantum rescue-commitment section. Written
 /// only when the map is non-empty (never before the emergency gate).
 const PQ_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::PQ;
@@ -235,6 +239,14 @@ impl CommittedState {
                     return Err(error.to_string());
                 }
             }
+            if !l2.settlers().is_empty() {
+                bytes.extend_from_slice(L2_SETTLER_SECTION);
+                if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
+                    .serialize_into(&mut *bytes, l2.settlers()) {
+                    bytes.truncate(original_len);
+                    return Err(error.to_string());
+                }
+            }
             if bytes.len() - original_len > LIMIT as usize {
                 bytes.truncate(original_len);
                 return Err("local cache payload exceeds its limit".into());
@@ -399,6 +411,15 @@ impl CommittedState {
                 }
                 l2.restore_checkpoint_roots(roots);
                 section = roots_section;
+            }
+            if let Some(mut settler_section) = section.strip_prefix(L2_SETTLER_SECTION.as_slice()) {
+                let keys: Vec<Vec<u8>> = bincode::DefaultOptions::new().with_limit(LIMIT)
+                    .deserialize_from(&mut settler_section).map_err(|e| e.to_string())?;
+                if keys.is_empty() {
+                    return Err("empty cached L2 settler section".into());
+                }
+                l2.restore_settlers(keys);
+                section = settler_section;
             }
             l2_settlement = Some(l2.from_local_cache()?);
             rest = section;

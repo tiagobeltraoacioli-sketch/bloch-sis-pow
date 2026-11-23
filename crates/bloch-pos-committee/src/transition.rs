@@ -3863,7 +3863,7 @@ impl CommittedState {
                 // Protocol-only empty-inbox transaction: no synthetic fee credit.
                 // One verification reserves the complete block gas budget.
                 Ok(fee_market::TxCharge { gas: fee_market::BLOCK_GAS_LIMIT,
-                    tx_bytes: (1 + 32 + settlement.statement.len() + crate::l2_settlement::PROOF_BYTES) as u64,
+                    tx_bytes: settlement.wire_len() as u64,
                     base_fee_sat: 0, priority_fee_sat: 0 })
             }
             PosTransaction::Withdraw { validator } => self.apply_withdrawal(*validator, tx),
@@ -6265,6 +6265,19 @@ impl CommittedState {
                 // it never reaches consensus.
                 if let Ok(state) = crate::l2_settlement::State::activated(activation) {
                     st.l2_settlement = Some(state);
+                }
+            }
+        }
+        // Audit L2N-01 (gated): an installed L2 without a settler set
+        // installs the pinned one; from then on its settlements need a
+        // registered settler's authorization. Inert while
+        // `L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH` is the sentinel.
+        if crate::params::l2_settler_authorization_active(next_epoch) {
+            if let Some(l2) = st.l2_settlement.as_mut() {
+                if l2.settlers().is_empty() {
+                    if let Some(keys) = crate::l2_settlement::settler_set_for(l2.policy()) {
+                        l2.install_settlers(keys);
+                    }
                 }
             }
         }

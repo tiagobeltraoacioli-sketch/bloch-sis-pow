@@ -105,6 +105,9 @@ pub mod local_cache {
     pub const L2: &[u8; 16] = b"BPOSST01:L2:v1\0\0";
     /// Pending: `codex/native-claim-finality-20261019` (L2 checkpoint roots).
     pub const L2_CHECKPOINTS: &[u8; 16] = b"BPOSST01:L2CP:v1";
+    /// L2 settler set (audit L2N-01,
+    /// `L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`), after the L2 sections.
+    pub const L2_SETTLERS: &[u8; 16] = b"BPOSST01:L2ST:v1";
     /// HF3 KES (`v2`: entries with start periods and the enforcement bind
     /// epoch; the devnet lineage's `v1` section is not accepted).
     /// `v3` adds the retired-key history (review R-1); `v1`/`v2` sections
@@ -123,8 +126,8 @@ pub mod local_cache {
     /// `CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH`).
     pub const CREDENTIAL_ROTATIONS: &[u8; 16] = b"BPOSST01:CROT:v1";
     /// Fixed merge/parse order.
-    pub const ORDER: [&[u8; 16]; 8] =
-        [L2, L2_CHECKPOINTS, KES, PQ, FINALITY_SET, OWN_CHECKPOINTS, COMMISSION_UPDATES, CREDENTIAL_ROTATIONS];
+    pub const ORDER: [&[u8; 16]; 9] =
+        [L2, L2_CHECKPOINTS, L2_SETTLERS, KES, PQ, FINALITY_SET, OWN_CHECKPOINTS, COMMISSION_UPDATES, CREDENTIAL_ROTATIONS];
 }
 
 /// Trailing extensions of the finality leaf (state tag `0x09`). Absent while

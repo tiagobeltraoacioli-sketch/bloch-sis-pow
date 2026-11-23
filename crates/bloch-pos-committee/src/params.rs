@@ -3038,6 +3038,62 @@ pub(crate) mod l2_deposit_inflow_bound_rehearsal {
     }
 }
 
+/// AUDIT-L1L2-20261123 L2N-01, the L1 stop-gap: L2 settlements only from a
+/// registered settler key. `u64::MAX` means INERT.
+///
+/// The settlement statement binds neither the L2 block's `timestamp` nor
+/// its `prevrandao`, nothing publishes them, and settlement is
+/// permissionless: one outside proof leaves an L2 head whose state nobody
+/// else can rebuild or extend. The proper fix is a new guest program and
+/// proof policy that derive both values from L1 data; until it ships, this
+/// gate removes the outsider.
+///
+/// At the first epoch boundary whose new epoch is `>=` this value an
+/// installed L2 with no settler set installs
+/// `l2_settlement::settler_set_for` (the set pinned in
+/// `l2_settlement::mainnet::SETTLER_SET`). From then on a settlement is
+/// valid only with an `l2_settlement::settler::Authorization` signed by a
+/// registered key; see that module for registration, rotation and what the
+/// loss of every key means. Before the set is installed nothing changes,
+/// and a settlement carrying an authorization is refused.
+///
+/// Trade-off, for the owner: liveness of the L2 then depends on the settler
+/// keys. Arming cannot precede the L2 itself and needs the set pinned
+/// (asserted below), the settler software signing its settlements, a
+/// historical replay, mixed-fleet qualification and a coordinated epoch.
+/// `l2n01_the_settler_gate_is_inert_and_unset` pins the inert value.
+pub const L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+// An armed gate without a pinned set would install nothing and protect
+// nothing.
+const _: () = assert!(
+    L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH == u64::MAX || crate::l2_settlement::mainnet::SETTLER_SET.is_some()
+);
+
+pub(crate) fn l2_settler_authorization_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_settler_authorization_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_settler_authorization_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Flag day for the native L2 settlement on a network that is already running
 /// (M8 part 2), activated on mainnet at the epoch recorded below.
 ///

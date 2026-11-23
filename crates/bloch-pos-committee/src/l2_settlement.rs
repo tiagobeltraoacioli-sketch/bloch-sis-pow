@@ -735,6 +735,131 @@ pub mod withdrawal {
     }
 }
 
+/// Settler authorization (AUDIT-L1L2-20261123 L2N-01, the L1 stop-gap).
+///
+/// The settlement statement binds neither the L2 block's `timestamp` nor its
+/// `prevrandao`, and settlement is permissionless, so one outside proof can
+/// leave an L2 head whose state nobody else can rebuild. Behind
+/// `params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH` an L2 that has a
+/// settler set installed accepts a settlement only with an
+/// [`Authorization`]: a signature of one registered settler key over that
+/// exact settlement. It removes the outsider; it keeps the single-sequencer
+/// trust the L2 already has (a registered key can still misbehave).
+///
+/// * Registration: the set (1 to [`MAX_KEYS`] hybrid keys: the settler's
+///   key and offline standby keys) is pinned in the release that arms the
+///   gate ([`super::mainnet::SETTLER_SET`]) and installed at the gate's
+///   first epoch boundary. No admin key and no on-chain vote.
+/// * Rotation: an authorized settlement may carry the next set; the
+///   signature covers it and the set is replaced when the settlement is
+///   accepted. Any registered key can rotate, so a standby key replaces a
+///   lost or exposed settler key with one (possibly empty) settlement.
+/// * Loss of every registered key: no settlement is valid until an L1
+///   release installs a new set at a new flag day. The L2 state stays
+///   reconstructible and deposits stay in escrow; nothing lapses to
+///   permissionless on a timer, because the timer would reopen the attack
+///   exactly when the settler is down.
+pub mod settler {
+    use crate::transition::funded::{ADMISSION_PQ_KEY_BYTES, ADMISSION_PQ_SIGNATURE_MAX};
+    use sha3::{Digest, Sha3_256};
+
+    /// Registered keys: the settler's and up to two standby keys.
+    pub const MAX_KEYS: usize = 3;
+    pub const AUTHORIZATION_DOMAIN: &[u8] = b"BLOCH:L2:SETTLER-AUTH:1";
+    pub const SET_DOMAIN: &[u8] = b"BLOCH:L2:SETTLER-SET:1";
+    /// Largest encoded [`Authorization`].
+    pub const MAX_AUTHORIZATION_BYTES: usize = 1 + 4 + ADMISSION_PQ_SIGNATURE_MAX + 1 + MAX_KEYS * ADMISSION_PQ_KEY_BYTES;
+
+    /// The trailer of an authorized settlement transaction:
+    /// `signer (u8) || signature length (u32 LE) || signature ||
+    /// next-set key count (u8, 0 = keep the set) || keys`.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Authorization {
+        /// Index of the signing key in the registered set.
+        pub signer: u8,
+        pub signature: Vec<u8>,
+        /// The set that replaces the registered one when this settlement is
+        /// accepted; `None` keeps it.
+        pub next_set: Option<Vec<Vec<u8>>>,
+    }
+
+    /// 1 to [`MAX_KEYS`] distinct keys of the enveloped hybrid size.
+    pub fn valid_set(keys: &[Vec<u8>]) -> bool {
+        !keys.is_empty()
+            && keys.len() <= MAX_KEYS
+            && keys.iter().all(|k| k.len() == ADMISSION_PQ_KEY_BYTES)
+            && keys.iter().enumerate().all(|(i, k)| !keys[..i].contains(k))
+    }
+
+    /// `SHA3-256(SET_DOMAIN || count || keys)`, in set order.
+    pub fn set_hash(keys: &[Vec<u8>]) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(SET_DOMAIN);
+        h.update([keys.len() as u8]);
+        for key in keys {
+            h.update(key);
+        }
+        h.finalize().into()
+    }
+
+    /// What the settler signs: `SHA3-256(AUTHORIZATION_DOMAIN ||
+    /// network_domain || chain_id (u64 BE) || settlement commitment ||
+    /// next-set hash or 32 zero bytes)`. The commitment covers the proof
+    /// policy, the statement (hence the previous head and the source anchor:
+    /// it is valid at one head only) and the proof bytes, so nobody can
+    /// re-randomize an authorized proof.
+    pub fn digest(network_domain: &[u8; 32], chain_id: u64, commitment: &[u8; 32], next_set: Option<&[Vec<u8>]>) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(AUTHORIZATION_DOMAIN);
+        h.update(network_domain);
+        h.update(chain_id.to_be_bytes());
+        h.update(commitment);
+        h.update(next_set.map_or([0; 32], set_hash));
+        h.finalize().into()
+    }
+
+    impl Authorization {
+        pub fn encode(&self, out: &mut Vec<u8>) {
+            out.push(self.signer);
+            out.extend_from_slice(&(self.signature.len() as u32).to_le_bytes());
+            out.extend_from_slice(&self.signature);
+            match &self.next_set {
+                None => out.push(0),
+                Some(keys) => {
+                    out.push(keys.len() as u8);
+                    for key in keys {
+                        out.extend_from_slice(key);
+                    }
+                }
+            }
+        }
+        pub fn encoded_len(&self) -> usize {
+            1 + 4 + self.signature.len() + 1 + self.next_set.as_ref().map_or(0, |keys| keys.iter().map(Vec::len).sum())
+        }
+        /// Exact decoding: every byte is consumed and every bound holds, so
+        /// one authorization has one encoding.
+        pub fn decode(bytes: &[u8]) -> Option<Self> {
+            let (&signer, rest) = bytes.split_first()?;
+            let len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+            if len == 0 || len > ADMISSION_PQ_SIGNATURE_MAX {
+                return None;
+            }
+            let rest = &rest[4..];
+            let signature = rest.get(..len)?.to_vec();
+            let (&count, rest) = rest[len..].split_first()?;
+            let count = usize::from(count);
+            if count > MAX_KEYS || rest.len() != count * ADMISSION_PQ_KEY_BYTES {
+                return None;
+            }
+            let next_set = (count != 0).then(|| rest.chunks(ADMISSION_PQ_KEY_BYTES).map(<[u8]>::to_vec).collect::<Vec<_>>());
+            if usize::from(signer) >= MAX_KEYS || next_set.as_ref().is_some_and(|keys| !valid_set(keys)) {
+                return None;
+            }
+            Some(Self { signer, signature, next_set })
+        }
+    }
+}
+
 /// Records one settlement must consume, when pending: min(pending, this).
 pub const MAX_INBOX_PER_SETTLEMENT: u64 = 64;
 /// L2 deposits per native block once
@@ -863,6 +988,14 @@ pub struct Transaction {
     pub proof_policy: [u8; 32],
     pub statement: Vec<u8>,
     pub proof: [u8; PROOF_BYTES],
+    /// Settler authorization (audit L2N-01), a trailer after the proof of a
+    /// V3 settlement. `None` is the wire form every settlement has had so
+    /// far. Consensus accepts `Some` only on an L2 with a settler set
+    /// installed, i.e. behind
+    /// `params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`; before that a
+    /// transaction with a trailer is refused like one an older node cannot
+    /// decode.
+    pub authorization: Option<settler::Authorization>,
 }
 impl Transaction {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
@@ -872,9 +1005,13 @@ impl Transaction {
         Self::decode_tag(bytes, ASYNC_WIRE_TAG)
     }
     fn decode_tag(bytes: &[u8], tag: u8) -> Option<Self> {
-        let statement_bytes = match bytes.len() {
-            TRANSACTION_BYTES => STATEMENT_BYTES,
-            TRANSACTION_V3_BYTES => STATEMENT_V3_BYTES,
+        let (statement_bytes, trailer) = match bytes.len() {
+            TRANSACTION_BYTES => (STATEMENT_BYTES, None),
+            TRANSACTION_V3_BYTES => (STATEMENT_V3_BYTES, None),
+            // A V3 settlement followed by a settler authorization.
+            n if n > TRANSACTION_V3_BYTES && n <= TRANSACTION_V3_BYTES + settler::MAX_AUTHORIZATION_BYTES => {
+                (STATEMENT_V3_BYTES, Some(&bytes[TRANSACTION_V3_BYTES..]))
+            }
             _ => return None,
         };
         if bytes[0] != tag {
@@ -882,10 +1019,15 @@ impl Transaction {
         }
         let statement = &bytes[33..33 + statement_bytes];
         StatementVersion::of(statement)?;
+        let authorization = match trailer {
+            None => None,
+            Some(trailer) => Some(settler::Authorization::decode(trailer)?),
+        };
         Some(Self {
             proof_policy: bytes[1..33].try_into().ok()?,
             statement: statement.to_vec(),
-            proof: bytes[33 + statement_bytes..].try_into().ok()?,
+            proof: bytes[33 + statement_bytes..33 + statement_bytes + PROOF_BYTES].try_into().ok()?,
+            authorization,
         })
     }
     /// The statement version, or `None` for a malformed in-memory value.
@@ -899,12 +1041,19 @@ impl Transaction {
         self.encode_tag(ASYNC_WIRE_TAG)
     }
     fn encode_tag(&self, tag: u8) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(1 + 32 + self.statement.len() + PROOF_BYTES);
+        let mut bytes = Vec::with_capacity(self.wire_len());
         bytes.push(tag);
         bytes.extend_from_slice(&self.proof_policy);
         bytes.extend_from_slice(&self.statement);
         bytes.extend_from_slice(&self.proof);
+        if let Some(authorization) = &self.authorization {
+            authorization.encode(&mut bytes);
+        }
         bytes
+    }
+    /// Length of the canonical encoding (tag included).
+    pub fn wire_len(&self) -> usize {
+        1 + 32 + self.statement.len() + PROOF_BYTES + self.authorization.as_ref().map_or(0, settler::Authorization::encoded_len)
     }
     // Preserve the existing L2 kernel's settlement-chain commitment: the native
     // wire discriminator is separate from the experimental kernel framing.
@@ -930,6 +1079,32 @@ fn h(bytes: &[u8], offset: usize) -> [u8; 32] {
 }
 fn n(bytes: &[u8], offset: usize) -> u64 {
     u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+/// The settler set a network installs at the first epoch boundary behind
+/// `params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH` (audit L2N-01): the
+/// pinned mainnet set for the mainnet L2, nothing for any other policy.
+pub fn settler_set_for(policy: &Policy) -> Option<Vec<Vec<u8>>> {
+    #[cfg(test)]
+    if let Some(keys) = settler_rehearsal::keys() {
+        return Some(keys);
+    }
+    if policy.chain_id != MAINNET_CHAIN_ID {
+        return None;
+    }
+    mainnet::settler_keys(mainnet::SETTLER_SET?)
+}
+
+#[cfg(test)]
+pub(crate) mod settler_rehearsal {
+    use std::cell::RefCell;
+    thread_local! { static KEYS: RefCell<Option<Vec<Vec<u8>>>> = const { RefCell::new(None) }; }
+    pub fn keys() -> Option<Vec<Vec<u8>>> { KEYS.with(|k| k.borrow().clone()) }
+    pub fn set(keys: Vec<Vec<u8>>) -> impl Drop {
+        struct Restore(Option<Vec<Vec<u8>>>);
+        impl Drop for Restore { fn drop(&mut self) { KEYS.with(|k| *k.borrow_mut() = self.0.take()); } }
+        Restore(KEYS.with(|k| k.borrow_mut().replace(keys)))
+    }
 }
 
 /// What a running network installs at the L2 flag day
@@ -1092,6 +1267,20 @@ pub mod mainnet {
         initial_l2_parent: h32("632e45ae778da371a88dc1ae430193aa77eabb67a11de18e84fea7d20d11f468"),
         initial_l2_state: h32("2ad7e807ac2ea14e2f423572fcb9e0f168de4cb26b5bbbd2711caf34cb05c05d"),
     });
+
+    /// The settler set of the mainnet L2 (audit L2N-01), SET ONCE in the
+    /// release that arms `params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`:
+    /// one enveloped hybrid public key in hex per line, 1 to
+    /// `settler::MAX_KEYS` lines, the settler's key first, standby keys
+    /// after it. `None` = UNSET: the gate cannot be armed
+    /// (`params` asserts it at compile time).
+    pub const SETTLER_SET: Option<&str> = None;
+
+    /// The keys of a settler set text, or `None` if it is not a valid set.
+    pub fn settler_keys(text: &str) -> Option<Vec<Vec<u8>>> {
+        let keys = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(unhex).collect::<Option<Vec<_>>>()?;
+        super::settler::valid_set(&keys).then_some(keys)
+    }
 
     /// Why the mainnet activation cannot be built yet.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1385,6 +1574,13 @@ pub struct State {
     /// cached bytes of this struct do not change.
     #[cfg_attr(feature = "local-state-cache", serde(skip))]
     checkpoint_roots: std::collections::BTreeMap<u64, [u8; 32]>,
+    /// Registered settler keys (audit L2N-01; see [`settler`]). Empty until
+    /// installed behind `params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`:
+    /// while empty, settlement is permissionless as before and the committed
+    /// bytes are unchanged. Committed (after the checkpoint roots, absent
+    /// while empty); the local cache carries it in its own trailing section.
+    #[cfg_attr(feature = "local-state-cache", serde(skip))]
+    settlers: Vec<Vec<u8>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -1411,6 +1607,10 @@ pub enum Reject {
     /// L1 data-availability record (same L2 block number) included in a
     /// strictly earlier native block and still retained.
     DataUnavailable,
+    /// The settler rule (audit L2N-01): an authorization on an L2 without a
+    /// settler set, or, with one, a settlement without an authorization
+    /// signed by a registered key over this exact settlement.
+    Settler,
 }
 
 /// Whether an L2 from a development genesis manifest admits user
@@ -1440,6 +1640,7 @@ impl State {
             release_window: withdrawal::ReleaseWindow::default(),
             profile: Profile::development(),
             checkpoint_roots: std::collections::BTreeMap::new(),
+            settlers: Vec::new(),
         })
     }
     pub(crate) fn genesis_async(policy: Policy) -> Result<Self, Reject> {
@@ -1456,6 +1657,23 @@ impl State {
         state.asynchronous = activation.asynchronous;
         state.profile = Profile::activated(activation.limits);
         Ok(state)
+    }
+    /// The registered settler keys; empty = settlement is permissionless.
+    pub fn settlers(&self) -> &[Vec<u8>] {
+        &self.settlers
+    }
+    /// Install the settler set at the flag day (the transition, once, while
+    /// none is installed). An invalid set installs nothing.
+    pub(crate) fn install_settlers(&mut self, keys: Vec<Vec<u8>>) {
+        if self.settlers.is_empty() && settler::valid_set(&keys) {
+            self.settlers = keys;
+        }
+    }
+    /// Local-cache restore only; the state root check that follows the
+    /// restore authenticates what is put back.
+    #[cfg(feature = "local-state-cache")]
+    pub(crate) fn restore_settlers(&mut self, keys: Vec<Vec<u8>>) {
+        self.settlers = keys;
     }
     pub fn asynchronous(&self) -> bool { self.asynchronous }
     pub fn profile(&self) -> &Profile { &self.profile }
@@ -1864,6 +2082,16 @@ impl State {
                 out.extend_from_slice(root);
             }
         }
+        // Absent while empty: no set exists below
+        // L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH, so earlier states keep
+        // their bytes. The keys have a fixed length.
+        if !self.settlers.is_empty() {
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:SETTLERS:1");
+            out.push(self.settlers.len() as u8);
+            for key in &self.settlers {
+                out.extend_from_slice(key);
+            }
+        }
         out
     }
     /// Only the transition can supply the native parent. No expected statement
@@ -1877,6 +2105,8 @@ impl State {
         verifier: &dyn crate::attestation::SignatureVerifier,
     ) -> Result<(), Reject> {
         let (end, number, new_withdrawals) = self.check_before_proof(tx, parent, slot, asynchronous)?;
+        // Before the proof: an outsider cannot make this node verify one.
+        let next_settlers = self.check_authorization(tx, Some(verifier))?;
         let s = tx.statement.as_slice();
         if !verifier.verify_l2_settlement(
             &self.policy.proof_policy,
@@ -1895,6 +2125,9 @@ impl State {
         self.head = Some((tx.commitment(), s.to_vec()));
         self.source_anchor = None;
         self.consumed = end;
+        if let Some(keys) = next_settlers {
+            self.settlers = keys;
+        }
         // Records for settled blocks can never be used again.
         self.da.retain(|r| r.l2_number > number);
         Ok(())
@@ -2042,6 +2275,41 @@ impl State {
         Ok((end, number, new_withdrawals))
     }
 
+    /// The settler rule (audit L2N-01). Without a registered set a
+    /// settlement carries no authorization (the rule is not in force; a
+    /// trailer is refused, as a node that cannot decode it refuses it). With
+    /// one, the settlement must carry an authorization signed by a
+    /// registered key over this exact settlement and its next set, if any.
+    /// `verifier: None` checks everything but the signature (retention of a
+    /// settlement admission already verified). Returns the set to install.
+    fn check_authorization(
+        &self,
+        tx: &Transaction,
+        verifier: Option<&dyn crate::attestation::SignatureVerifier>,
+    ) -> Result<Option<Vec<Vec<u8>>>, Reject> {
+        let authorization = match (&tx.authorization, self.settlers.is_empty()) {
+            (None, true) => return Ok(None),
+            (Some(_), true) | (None, false) => return Err(Reject::Settler),
+            (Some(authorization), false) => authorization,
+        };
+        let key = self.settlers.get(usize::from(authorization.signer)).ok_or(Reject::Settler)?;
+        if authorization.next_set.as_ref().is_some_and(|keys| !settler::valid_set(keys)) {
+            return Err(Reject::Settler);
+        }
+        if let Some(verifier) = verifier {
+            let digest = settler::digest(
+                &self.policy.identities[0],
+                self.policy.chain_id,
+                &tx.commitment(),
+                authorization.next_set.as_deref(),
+            );
+            if !verifier.verify_with_key(key, &digest, &authorization.signature) {
+                return Err(Reject::Settler);
+            }
+        }
+        Ok(authorization.next_set.clone())
+    }
+
     /// Whether an asynchronous settlement could still apply in the block
     /// after `head` (this state's head block, at `head_slot`): every check
     /// of [`Self::apply`] that needs no proof, the record limit included.
@@ -2058,6 +2326,7 @@ impl State {
         crate::isolation::contain_refusal(Reject::Height, || {
             match self.check_against_source(tx, head, head_slot, true) {
                 Err(why) => Some(why),
+                Ok(_) if self.check_authorization(tx, None).is_err() => Some(Reject::Settler),
                 Ok((_, _, Some(_))) if self.withdrawals.len() >= self.profile.limits.max_records() => Some(Reject::Limit),
                 Ok(_) => None,
             }
@@ -2085,6 +2354,7 @@ impl State {
         if new_withdrawals.is_some() && self.withdrawals.len() >= self.profile.limits.max_records() {
             return Err(Reject::Limit);
         }
+        self.check_authorization(tx, Some(verifier))?;
         if !verifier.verify_l2_settlement(
             &self.policy.proof_policy,
             &self.policy.identities[6],
@@ -2121,6 +2391,9 @@ impl State {
         }
         if self.consumed > self.inbox.len() as u64 {
             return Err("cached L2 inbox cursor is past the inbox".into());
+        }
+        if !self.settlers.is_empty() && !settler::valid_set(&self.settlers) {
+            return Err("cached L2 settler set is not a valid set".into());
         }
         if deposited.checked_sub(self.released_sat) != Some(self.escrow_sat) {
             return Err("cached L2 escrow does not match deposits and releases".into());

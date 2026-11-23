@@ -74,6 +74,7 @@ mod l2_tests {
             proof_policy: state.policy().proof_policy,
             statement,
             proof: [1; 356],
+            authorization: None,
         }
     }
     #[test]
@@ -204,6 +205,7 @@ mod l2_tests {
             proof_policy: bloch_l2_proof::policy_commitment(),
             statement: values.to_vec(),
             proof: *proof,
+            authorization: None,
         };
         assert_eq!(
             state.apply_transaction(
@@ -231,6 +233,7 @@ mod l2_tests {
             proof_policy: pre.l2_settlement().unwrap().policy().proof_policy,
             statement: statement.clone(),
             proof,
+            authorization: None,
         };
         let tx = PosTransaction::L2Settlement(Box::new(settlement.clone()));
         assert_eq!(
@@ -1301,7 +1304,7 @@ mod l2_tests {
     ) -> Transaction {
         let source = l2.source(parent, slot);
         let mut tx = to_v3(
-            Transaction { proof_policy: l2.policy().proof_policy, statement: TEMPLATE.to_vec(), proof: [1; 356] },
+            Transaction { proof_policy: l2.policy().proof_policy, statement: TEMPLATE.to_vec(), proof: [1; 356], authorization: None },
             no_deposits(),
             0,
         );
@@ -3516,7 +3519,7 @@ mod l2_tests {
         assert_eq!(hash_at(values, S + 400), source.block);
         assert_eq!(hash_at(values, S + 448), source.commitment);
 
-        let settlement = Transaction { proof_policy: program.proof_policy, statement: values.to_vec(), proof };
+        let settlement = Transaction { proof_policy: program.proof_policy, statement: values.to_vec(), proof, authorization: None };
         let tx = PosTransaction::L2SettlementAsync(Box::new(settlement.clone()));
         assert_eq!(PosTransaction::from_canonical_bytes(&tx.canonical_bytes()).unwrap(), tx);
         let transition = Transition::new(RealProof);
@@ -4171,5 +4174,6 @@ mod l2_tests {
         include!("audit_20261123_fixtures.rs");
         include!("audit_20261123_l1x02_tests.rs");
         include!("audit_20261123_l1s02_tests.rs");
+        include!("audit_20261123_l2n01_tests.rs");
     }
 }
